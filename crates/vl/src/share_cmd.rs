@@ -12,10 +12,13 @@
 //!   (`--confirm`), one with a join under an invite for them, or one vouched
 //!   for by one of these. A device a ring once held and revoked counts only
 //!   if a ring holds it again or the sharer compares it again.
-//! * **Updates:** the sharing device's background pass seals a new version
-//!   when its copy of the file changes, or when the recipient's confirmed
-//!   devices change (a new one is added; a removed one is left out of every
-//!   later version). Unsharing stops every later version; it cannot take
+//! * **Updates are explicit:** a new version of the content is sealed only
+//!   when the sharer runs `vl secret share` again ("send what I have now").
+//!   The background pass of the clone that shared it only seals **the same
+//!   content again** for the recipient's current confirmed devices (a device
+//!   they add receives it; a removed one is left out of every later
+//!   version), taken from the sharer's own signed last version, never from
+//!   the working copy. Unsharing stops every later version; it cannot take
 //!   back what the recipient already received.
 //! * **Delivery:** the recipient's `vl pull`, `vl secret shares` and
 //!   background pass write the file at its path, where it stays on their
@@ -50,14 +53,13 @@ pub const SHARES_SCHEMA: &str = "veil.secret.shares/1";
 /// Device-local memory of this clone's shares (`docs/HUB.md` §13.13): what
 /// it received (the last version written here of each (sharer, path), and
 /// the newest genuine version seen, written or not), and **the shares this
-/// clone made**, which are the only ones its background pass keeps up to
-/// date (BUG-1060, BUG-1063). Records are ciphertext for this device;
-/// contents only as keyed hashes.
+/// clone made**, which are the only ones its background pass touches
+/// (BUG-1060, BUG-1063). Records are ciphertext for this device. Every
+/// change is made under [`with_state`]'s lock (BUG-1066).
 const STATE_FILE: &str = ".veil/local/secret-shares.json";
+const STATE_LOCK: &str = ".veil/local/secret-shares.lock";
 /// Where a received copy goes when this device would now record it.
 const HELD_DIR: &str = ".veil/local/secret-shares-held";
-/// The most content hashes kept per share made here.
-const MAX_SEALED: usize = 256;
 
 #[derive(Default, Serialize, Deserialize)]
 struct State {
@@ -76,19 +78,6 @@ struct Made {
     id: String,
     /// The last version this clone sealed.
     version: u64,
-    /// Keyed hashes of every content it sealed, oldest first; the last is
-    /// the current version's.
-    sealed: Vec<String>,
-    /// The workspace whose files it follows, and the revisions its working
-    /// copy was on when the last content was sealed.
-    workspace: String,
-    base: Vec<Base>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct Base {
-    snapshot: String,
-    change: String,
 }
 
 fn state_key(sharer: &str, path: &str) -> String {
@@ -99,6 +88,8 @@ fn made_key(path: &str, recipient: &str) -> String {
     format!("{path}\u{0}{recipient}")
 }
 
+/// The record as it is now (no lock: for deciding what to try; every change
+/// goes through [`with_state`]).
 fn load_state(ctx: &Ctx) -> State {
     VPath::new(STATE_FILE)
         .ok()
@@ -107,67 +98,29 @@ fn load_state(ctx: &Ctx) -> State {
         .unwrap_or_default()
 }
 
-fn save_state(ctx: &Ctx, st: &State) -> Result<()> {
-    ctx.fs.write(&VPath::new(STATE_FILE)?, &serde_json::to_vec(st)?)?;
-    Ok(())
-}
-
-/// A keyed hash of a content this clone sealed (key derived from the
-/// device-local vault key, so the file reveals nothing and allows no
-/// guessing of a secret).
-fn content_hash(ctx: &Ctx, identity: &veil_core::Identity, content: &[u8]) -> String {
-    let key = blake3::derive_key(veil_core::crypto::domains::HUB_SHARE_HISTORY, &identity.local_key(ctx.repo.repo_id()));
-    blake3::keyed_hash(&key, content).to_hex().to_string()
-}
-
-/// The revisions the working copy of `ws` is on now (the view read
-/// afresh: a background pass's own view is as old as the pass).
-fn fresh_bases(ctx: &mut Ctx, ws: &str) -> Vec<Base> {
-    let _ = ctx.repo.reload();
-    bases(ctx, ws)
-}
-
-/// The revisions the working copy of `ws` is on, in this process's view.
-fn bases(ctx: &Ctx, ws: &str) -> Vec<Base> {
-    let Some(wc) = ctx.repo.view().workspaces.get(ws).map(|w| w.wc) else { return vec![] };
-    let Ok(snap) = ctx.repo.snapshot(&wc) else { return vec![] };
-    snap.parents
-        .iter()
-        .filter_map(|p| ctx.repo.snapshot(p).ok().map(|s| Base { snapshot: p.to_string(), change: hex::encode(s.change_id.0) }))
-        .collect()
-}
-
-/// Is the working copy of `made.workspace` on (a descendant of) every
-/// revision the last content was sealed on? By change identity too, so a
-/// rewritten revision (described, rebased) still counts. Checking out an
-/// older revision does not.
-fn forward(ctx: &Ctx, made: &Made, now: &[Base]) -> bool {
-    if now.is_empty() {
-        return made.base.is_empty();
+/// Change the record: under an exclusive lock of this clone's record (held
+/// for no network call), read it afresh, let `f` apply this command's own
+/// change to what is there now, and write it back (atomically). `f` never
+/// re-inserts an entry another command removed, nor an older version.
+fn with_state<T>(ctx: &Ctx, f: impl FnOnce(&mut State) -> T) -> Result<T> {
+    let lock_path = ctx.root.join(STATE_LOCK);
+    if let Some(dir) = lock_path.parent() {
+        std::fs::create_dir_all(dir)?;
     }
-    made.base.iter().all(|b| {
-        let Ok(id) = veil_core::ObjectId::from_hex(&b.snapshot) else { return false };
-        now.iter().any(|n| {
-            let Ok(nid) = veil_core::ObjectId::from_hex(&n.snapshot) else { return false };
-            if ctx.repo.is_ancestor(&id, &nid).unwrap_or(false) {
-                return true;
-            }
-            // The same change, rewritten, among the newest ancestors.
-            let mut stack = vec![nid];
-            let mut seen = std::collections::HashSet::new();
-            while let Some(x) = stack.pop() {
-                if seen.len() > 10_000 || !seen.insert(x) {
-                    continue;
-                }
-                let Ok(Some(sn)) = ctx.repo.snapshot_opt(&x) else { continue };
-                if hex::encode(sn.change_id.0) == b.change {
-                    return true;
-                }
-                stack.extend(sn.parents.iter().copied());
-            }
-            false
-        })
-    })
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: a valid descriptor; released when `lock` is closed.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            bail!("locking {}: {}", lock_path.display(), std::io::Error::last_os_error());
+        }
+    }
+    let mut st = load_state(ctx);
+    let out = f(&mut st);
+    ctx.fs.write(&VPath::new(STATE_FILE)?, &serde_json::to_vec(&st)?)?;
+    drop(lock);
+    Ok(out)
 }
 
 /// Does this clone take part in shares (it made or received one)? Then the
@@ -279,10 +232,6 @@ pub fn share(ctx: &mut Ctx, path: &str, with: &str, confirm: &[String], json: bo
     let mut ids: Vec<String> = devices.iter().map(|(m, _)| m.clone()).collect();
     ids.push(identity.public_hex());
     let mut version = 0;
-    // This clone becomes the share's source before anything is sent: a
-    // background pass never updates a share it does not record.
-    let key = made_key(vp.as_str(), with);
-    let hash = content_hash(ctx, &identity, &content);
     for attempt in 0..8u64 {
         let expect = find(&client.shares()?, &me, vp.as_str(), with).map_or(0, |s| s.version);
         let target = ShareTarget {
@@ -302,24 +251,13 @@ pub fn share(ctx: &mut Ctx, path: &str, with: &str, confirm: &[String], json: bo
             Err(why) => bail!("the share kept changing on the server: {why}"),
         }
     }
-    let mut st = load_state(ctx);
-    let mut sealed = st.made.remove(&key).map(|m| m.sealed).unwrap_or_default();
-    if sealed.last() != Some(&hash) {
-        sealed.push(hash);
-    }
-    let excess = sealed.len().saturating_sub(MAX_SEALED);
-    sealed.drain(..excess);
-    st.made.insert(
-        key,
-        Made {
-            id: veil_core::secret_share::share_id(&project, vp.as_str(), &me, with),
-            version,
-            sealed,
-            workspace: ctx.ws.clone(),
-            base: bases(ctx, &ctx.ws),
-        },
-    );
-    save_state(ctx, &st)?;
+    // This clone is now the share's source (any other clone of the person's
+    // sees the version move on and stops).
+    let id = veil_core::secret_share::share_id(&project, vp.as_str(), &me, with);
+    with_state(ctx, |st| {
+        let m = st.made.entry(made_key(vp.as_str(), with)).or_insert(Made { id, version });
+        m.version = m.version.max(version);
+    })?;
     ctx.repo.record_outside_view(
         format!("share secret {} with {with}", vp.as_str()),
         format!(
@@ -353,8 +291,7 @@ pub fn share(ctx: &mut Ctx, path: &str, with: &str, confirm: &[String], json: bo
         safe(with)
     );
     println!(
-        "  {} your later edits of it in this clone, and their new devices, reach them in the background until you unshare it; \
-         updates follow your working copy forward",
+        "  {} run this again to send a new version; devices they add receive this one automatically, until you unshare it",
         dim("note:")
     );
     print_unconfirmed(with, vp.as_str(), &unconfirmed);
@@ -378,10 +315,7 @@ pub fn unshare(ctx: &mut Ctx, path: &str, from: &str, json: bool) -> Result<()> 
     let vp = ctx.repo_path(path)?;
     // Forgotten here first: whatever the server says later, this clone never
     // seals another version of it (BUG-1060).
-    let mut st = load_state(ctx);
-    if st.made.remove(&made_key(vp.as_str(), from)).is_some() {
-        save_state(ctx, &st)?;
-    }
+    with_state(ctx, |st| st.made.remove(&made_key(vp.as_str(), from)))?;
     let info = client.remove_share(vp.as_str(), from)?;
     ctx.repo.record_outside_view(
         format!("unshare secret {} from {from}", vp.as_str()),
@@ -494,8 +428,8 @@ pub fn after_pull(ctx: &mut Ctx, client: &Client) {
 }
 
 /// The background pass (`vl share-keys`): keep the shares this clone made
-/// up to date, then deliver what is new for this device. What it did, one
-/// line each.
+/// sealed for their recipients' current confirmed devices, then deliver
+/// what is new for this device. What it did, one line each.
 pub fn pass(ctx: &mut Ctx, client: &Client) -> Result<Vec<String>> {
     let Some(me) = hub::signed_in_servers()?.into_iter().find(|(a, _)| *a == client.url.authority).map(|(_, p)| p) else {
         return Ok(vec![]);
@@ -503,32 +437,28 @@ pub fn pass(ctx: &mut Ctx, client: &Client) -> Result<Vec<String>> {
     let shares = client.shares()?;
     let mut out = Vec::new();
     if !load_state(ctx).made.is_empty() {
-        out.extend(update(ctx, client, &me, &shares)?);
+        out.extend(rewrap(ctx, client, &me, &shares)?);
     }
     out.extend(receive(ctx, &me, &shares));
     if !shares.is_empty() && !takes_part(ctx) {
-        save_state(ctx, &load_state(ctx))?;
+        with_state(ctx, |_| ())?;
     }
     Ok(out)
 }
 
-/// Seal a new version of each share **this clone made** (its local record,
-/// never the server's listing: BUG-1060, BUG-1063) whose file changed here,
-/// or whose recipient's confirmed devices changed. A content change is
-/// sealed only forward: never a value the share held before, and never
-/// while this working copy is on an older revision than the one the last
-/// content was sealed on (an explicit `vl secret share` does both on
-/// purpose). A share the server lists as ended, paused or moved on is
-/// forgotten here: only a new `vl secret share` starts it again.
-fn update(ctx: &mut Ctx, client: &Client, me: &str, shares: &[ShareInfo]) -> Result<Vec<String>> {
+/// For each share **this clone made** (its own record, never the server's
+/// listing: BUG-1060, BUG-1063) whose recipient's confirmed devices are
+/// not the ones its last version is sealed for, seal **that same content**
+/// again for them. The content comes from the sharer's own last version
+/// (this device is sealed for it), never from the working copy: a new
+/// content goes out only with `vl secret share`. A share the server lists
+/// as ended, paused or shared again elsewhere is forgotten here: only a new
+/// `vl secret share` starts it again.
+fn rewrap(ctx: &mut Ctx, client: &Client, me: &str, shares: &[ShareInfo]) -> Result<Vec<String>> {
     let identity = load_identity()?;
     let project = project_id(ctx)?;
-    let mut st = load_state(ctx);
     let mut out = Vec::new();
-    let mut changed = false;
-    // Each recipient's devices, asked once per pass.
-    let mut devices_of: BTreeMap<String, std::result::Result<BTreeSet<String>, String>> = BTreeMap::new();
-    for (key, made) in st.made.clone() {
+    for (key, made) in load_state(ctx).made {
         let Some((path, recipient)) = key.split_once('\u{0}') else { continue };
         let label = format!("share of {path} with {recipient}");
         let Some(s) = shares.iter().find(|s| s.sharer == me && s.path == path && s.recipient == recipient) else { continue };
@@ -538,65 +468,36 @@ fn update(ctx: &mut Ctx, client: &Client, me: &str, shares: &[ShareInfo]) -> Res
                 (None, Some(p)) => format!("paused ({p})"),
                 _ => "shared again from elsewhere".to_string(),
             };
-            out.push(format!("{label}: {why}; this clone no longer keeps it up to date (`vl secret share` starts it again)"));
-            st.made.remove(&key);
-            changed = true;
+            // Forgotten only as it was seen: a newer version recorded since
+            // (a `vl secret share` meanwhile) stays.
+            let gone = with_state(ctx, |st| match st.made.get(&key) {
+                Some(m) if m.version == made.version => st.made.remove(&key).is_some(),
+                _ => false,
+            })?;
+            if gone {
+                out.push(format!("{label}: {why}; this clone no longer keeps it sealed for their devices (`vl secret share` starts it again)"));
+            }
             continue;
         }
-        // The version this clone sealed last, as the server holds it: what is
-        // sealed and for whom comes from that signed record and the local
-        // one, never from the listing.
+        // This clone's last version, as the server holds it: signed by this
+        // device, at the version recorded here, for this share.
         let Some(rec) = s.record.as_ref().filter(|r| r.version == made.version && r.signer == identity.verifying_hex()) else { continue };
         let ours = rec.sharer == me && rec.recipient == recipient && rec.path == path && rec.project == project;
         if rec.verify().is_err() || !ours || veil_core::secret_share::share_id(&project, path, me, recipient) != made.id {
             continue;
         }
-        let Ok(vp) = VPath::new(path) else { continue };
-        // The revision, then the file, then the revision again: a file read
-        // while the working copy moved is not sealed (the next pass decides).
-        let before = fresh_bases(ctx, &made.workspace);
-        let Some(content) = ctx.fs.read_opt(&vp)? else { continue };
-        let moved = |ctx: &mut Ctx| {
-            let after = fresh_bases(ctx, &made.workspace);
-            after.len() != before.len() || after.iter().zip(&before).any(|(a, b)| a.snapshot != b.snapshot)
-        };
-        if content.len() > MAX_SHARE_BYTES {
-            out.push(format!("{label}: not updated: the file is larger than a share may be ({} KiB)", MAX_SHARE_BYTES >> 10));
-            continue;
-        }
-        let hash = content_hash(ctx, &identity, &content);
-        let new_content = made.sealed.last() != Some(&hash);
-        if new_content && made.sealed.contains(&hash) {
-            out.push(format!(
-                "{label}: not updated: the file holds a value the share held before (`vl secret share` sends it on purpose)"
-            ));
-            continue;
-        }
-        if new_content && !forward(ctx, &made, &before) {
-            out.push(format!(
-                "{label}: not updated: this working copy is on an older revision than the one the last version was sealed on; \
-                 updates follow your working copy forward (`vl secret share` sends it on purpose)"
-            ));
-            continue;
-        }
-        let devices = devices_of
-            .entry(recipient.to_string())
-            .or_insert_with(|| {
-                recipient_devices(ctx, client, recipient, &[]).map(|(d, _)| d.into_iter().map(|(m, _)| m).collect()).map_err(|e| format!("{e:#}"))
-            })
-            .clone();
-        let mut want = match devices {
-            Ok(d) => d,
+        let mut want: BTreeSet<String> = match recipient_devices(ctx, client, recipient, &[]) {
+            Ok((d, _)) => d.into_iter().map(|(m, _)| m).collect(),
             Err(e) => {
-                out.push(format!("{label}: not updated ({e})"));
+                out.push(format!("{label}: not sealed for their devices again ({e:#})"));
                 continue;
             }
         };
         want.insert(identity.public_hex());
-        let have: BTreeSet<String> = rec.devices().into_iter().collect();
-        if !new_content && want == have {
+        if want == rec.devices().into_iter().collect::<BTreeSet<_>>() {
             continue;
         }
+        let Ok(content) = rec.open(&identity) else { continue };
         let target = ShareTarget {
             project: &project,
             path,
@@ -606,9 +507,6 @@ fn update(ctx: &mut Ctx, client: &Client, me: &str, shares: &[ShareInfo]) -> Res
         };
         let ids: Vec<String> = want.into_iter().collect();
         let record = ShareRecord::seal(&identity, &target, veil_core::now_millis(), &content, &ids)?;
-        if new_content && moved(ctx) {
-            continue;
-        }
         // Built on this clone's last version; if the share moved on the
         // server refuses it, and the next pass decides again.
         if let Ok(()) = client.put_share(&SharePut {
@@ -616,20 +514,15 @@ fn update(ctx: &mut Ctx, client: &Client, me: &str, shares: &[ShareInfo]) -> Res
             reshare: false,
             record,
         })? {
-            let m = st.made.get_mut(&key).expect("the share is recorded");
-            m.version += 1;
-            if new_content {
-                m.sealed.push(hash);
-                let excess = m.sealed.len().saturating_sub(MAX_SEALED);
-                m.sealed.drain(..excess);
-                m.base = before.clone();
-            }
-            changed = true;
-            out.push(format!("{label}: version {}", made.version + 1));
+            // Recorded only if the share is still this clone's at the version
+            // it was built on (an unshare or a share meanwhile wins).
+            with_state(ctx, |st| {
+                if let Some(m) = st.made.get_mut(&key).filter(|m| m.version == made.version) {
+                    m.version += 1;
+                }
+            })?;
+            out.push(format!("{label}: version {} (sealed again for their devices)", made.version + 1));
         }
-    }
-    if changed {
-        save_state(ctx, &st)?;
     }
     Ok(out)
 }
@@ -683,9 +576,12 @@ fn receive(ctx: &Ctx, me: &str, shares: &[ShareInfo]) -> Vec<String> {
     let rings = local_states(ctx);
     let policy = Policy::load(&*ctx.fs).ok();
     let only = ctx.repo.config().remotes.get("origin").and_then(|r| r.only.clone());
-    let mut state = load_state(ctx);
+    // Decided on the record as it is now; recorded under the lock, keeping
+    // only what moves forward (BUG-1066).
+    let state = load_state(ctx);
+    let mut seen_now: Vec<(String, u64)> = Vec::new();
+    let mut written: Vec<(String, ShareRecord)> = Vec::new();
     let mut out = Vec::new();
-    let mut changed = false;
     for s in mine {
         let Some(rec) = &s.record else { continue };
         let from = format!("{} from {}", rec.path, s.sharer);
@@ -719,8 +615,7 @@ fn receive(ctx: &Ctx, me: &str, shares: &[ShareInfo]) -> Vec<String> {
             continue;
         }
         if rec.version > seen {
-            state.seen.insert(key.clone(), rec.version);
-            changed = true;
+            seen_now.push((key.clone(), rec.version));
         }
         let vp = match secret_path(ctx, &rec.path) {
             Ok(vp) => vp,
@@ -788,11 +683,21 @@ fn receive(ctx: &Ctx, me: &str, shares: &[ShareInfo]) -> Vec<String> {
             }
             out.push(format!("received {from} (version {}): it stays on this device", rec.version));
         }
-        state.received.insert(key, rec.clone());
-        changed = true;
+        written.push((key, rec.clone()));
     }
-    if changed {
-        if let Err(e) = save_state(ctx, &state) {
+    if !seen_now.is_empty() || !written.is_empty() {
+        let r = with_state(ctx, |st| {
+            for (k, v) in seen_now {
+                let e = st.seen.entry(k).or_insert(0);
+                *e = (*e).max(v);
+            }
+            for (k, rec) in written {
+                if st.received.get(&k).is_none_or(|l| l.version < rec.version) {
+                    st.received.insert(k, rec);
+                }
+            }
+        });
+        if let Err(e) = r {
             out.push(format!("could not remember the shares received: {e:#}"));
         }
     }
@@ -827,11 +732,31 @@ pub fn hold_back_received(ctx: &Ctx) {
         if tracked {
             continue;
         }
-        let held = format!("{HELD_DIR}/{}", veil_core::secret_share::share_id(&rec.project, &rec.path, &rec.sharer, &rec.recipient));
+        // A new name each time, never over a copy held before (BUG-1067);
+        // and the path is no longer "received": what the person puts there
+        // later is theirs to record.
+        let id = veil_core::secret_share::share_id(&rec.project, &rec.path, &rec.sharer, &rec.recipient);
+        let mut held = String::new();
         let moved = (|| -> Result<()> {
             let data = ctx.fs.read_opt(&vp)?.ok_or_else(|| anyhow!("gone"))?;
-            ctx.fs.write(&VPath::new(&held)?, &data)?;
+            let mut n = 0u32;
+            loop {
+                held = match n {
+                    0 => format!("{HELD_DIR}/{id}"),
+                    _ => format!("{HELD_DIR}/{id}-{n}"),
+                };
+                if ctx.fs.create_new(&VPath::new(&held)?, &data)? {
+                    break;
+                }
+                n += 1;
+            }
             ctx.fs.remove_file(&vp)?;
+            let key = state_key(&rec.sharer, &rec.path);
+            with_state(ctx, |st| {
+                if st.received.get(&key).is_some_and(|r| r.version == rec.version) {
+                    st.received.remove(&key);
+                }
+            })?;
             Ok(())
         })();
         match moved {

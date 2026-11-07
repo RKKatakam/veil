@@ -81,6 +81,15 @@ fn seal_until(hub: &TestHub, p: &Project, f: &Path, path: &str, to: &str, ok: im
     panic!("fin's share of {path} with {to} never got there: {:?}", record(hub, p, path, to).devices());
 }
 
+/// fin sends what fin's clone `f` holds now (`vl secret share` again: the
+/// only way a new content goes out), and the record it stored.
+fn send(hub: &TestHub, p: &Project, f: &Path, path: &str, to: &str, content: &[u8]) -> ShareRecord {
+    p.fin.ok(f, &["secret", "share", path, "--with", to]);
+    let r = record(hub, p, path, to);
+    assert_eq!(r.open(&p.dev.identity()).unwrap(), content);
+    r
+}
+
 fn read(dir: &Path, path: &str) -> Option<String> {
     std::fs::read_to_string(dir.join(path)).ok()
 }
@@ -207,8 +216,8 @@ fn a_share_reaches_its_recipient_only() {
     assert!(out.contains(&env), "{out}");
 }
 
-/// Updates reach the recipient in the background; their own edit is never
-/// written over; unsharing stops every later version (what they received
+/// A new version reaches the recipient when fin shares the file again (an
+/// edit alone sends nothing); their own edit is never written over; unsharing stops every later version (what they received
 /// stays theirs); sharing again starts it again.
 #[test]
 fn updates_and_unsharing() {
@@ -217,14 +226,16 @@ fn updates_and_unsharing() {
     let (f, d) = shared(&hub, &p);
     let env = env_path();
     write_files(&f, &[(&env, "KEY=second-v2\n")]);
-    let dev_id = p.dev.identity();
-    seal_until(&hub, &p, &f, &env, &p.dev.name, |r| r.open(&dev_id).is_ok_and(|c| c == b"KEY=second-v2\n"));
+    // An edit alone sends nothing.
+    p.fin.ok(&f, &["share-keys"]);
+    assert_eq!(record(&hub, &p, &env, &p.dev.name).version, 1);
+    send(&hub, &p, &f, &env, &p.dev.name, b"KEY=second-v2\n");
     p.dev.ok(&d, &["pull"]);
     assert_eq!(read(&d, &env).unwrap(), "KEY=second-v2\n");
     // dev's own edit stays.
     write_files(&d, &[(&env, "KEY=dev-own\n")]);
     write_files(&f, &[(&env, "KEY=third-v3\n")]);
-    seal_until(&hub, &p, &f, &env, &p.dev.name, |r| r.open(&dev_id).is_ok_and(|c| c == b"KEY=third-v3\n"));
+    send(&hub, &p, &f, &env, &p.dev.name, b"KEY=third-v3\n");
     let out = p.dev.ok(&d, &["pull"]);
     assert!(out.contains("not written over your own"), "{out}");
     assert_eq!(read(&d, &env).unwrap(), "KEY=dev-own\n");
@@ -314,8 +325,7 @@ fn a_server_cannot_forge_change_replay_or_move_a_share() {
     let env = env_path();
     let v1 = record(&hub, &p, &env, &p.dev.name);
     write_files(&f, &[(&env, "KEY=genuine-v2\n")]);
-    let dev_id = p.dev.identity();
-    seal_until(&hub, &p, &f, &env, &p.dev.name, |r| r.open(&dev_id).is_ok_and(|c| c == b"KEY=genuine-v2\n"));
+    send(&hub, &p, &f, &env, &p.dev.name, b"KEY=genuine-v2\n");
     p.dev.ok(&d, &["pull"]);
     let v2 = record(&hub, &p, &env, &p.dev.name);
     assert_eq!(read(&d, &env).unwrap(), "KEY=genuine-v2\n");
@@ -509,15 +519,17 @@ fn removed_devices_people_and_access() {
     // dev removes it: fin's next pass seals without it.
     p.dev.ok(&d, &["identity", "remove", &laptop.fingerprint()]);
     p.fin.ok(&f, &["pull"]);
-    write_files(&f, &[(&env, "KEY=after-the-laptop-was-lost\n")]);
-    let dev_id = p.dev.identity();
-    let r = seal_until(&hub, &p, &f, &env, &p.dev.name, |r| r.open(&dev_id).is_ok_and(|c| c == b"KEY=after-the-laptop-was-lost\n"));
-    assert!(!r.devices().contains(&laptop.identity().public_hex()), "{:?}", r.devices());
+    let r = seal_until(&hub, &p, &f, &env, &p.dev.name, |r| !r.devices().contains(&lap));
     assert!(r.open(&laptop.identity()).is_err());
-    // Listed again, with dev's genuine old vouch: still left out.
+    // The same content, sealed again: never what fin's copy holds now.
+    write_files(&f, &[(&env, "KEY=fin-edit-never-sent-by-the-pass\n")]);
+    assert_eq!(r.open(&p.dev.identity()).unwrap(), read(&l, &env).unwrap().as_bytes());
+    // Listed again, with dev's genuine old vouch: still left out, also from
+    // the next version fin sends.
     sql(&hub, "UPDATE devices SET removed_at = NULL WHERE signing_key = $1", &[&laptop.identity().verifying_hex()]);
     write_files(&f, &[(&env, "KEY=later\n")]);
-    let r = seal_until(&hub, &p, &f, &env, &p.dev.name, |r| r.open(&dev_id).is_ok_and(|c| c == b"KEY=later\n"));
+    p.fin.ok(&f, &["share-keys"]);
+    let r = send(&hub, &p, &f, &env, &p.dev.name, b"KEY=later\n");
     assert!(r.version >= 4 && !r.devices().contains(&laptop.identity().public_hex()), "{:?}", r.devices());
     sql(&hub, "UPDATE devices SET removed_at = 1 WHERE signing_key = $1", &[&laptop.identity().verifying_hex()]);
     p.dev.ok(&d, &["pull"]);
@@ -753,8 +765,7 @@ fn bug_1062_a_share_never_replaces_the_recipients_symlink() {
     std::fs::remove_file(d.join(&env)).unwrap();
     std::os::unix::fs::symlink("../dev-own-a3c1.env", d.join(&env)).unwrap();
     write_files(&f, &[(&env, "KEY=sharer-v2-after-the-link\n")]);
-    let dev_id = p.dev.identity();
-    seal_until(&hub, &p, &f, &env, &p.dev.name, |r| r.open(&dev_id).is_ok_and(|c| c == b"KEY=sharer-v2-after-the-link\n"));
+    send(&hub, &p, &f, &env, &p.dev.name, b"KEY=sharer-v2-after-the-link\n");
     p.dev.ok(&d, &["pull"]);
     let meta = std::fs::symlink_metadata(d.join(&env)).unwrap();
     assert!(meta.file_type().is_symlink(), "dev's symlink was replaced by the shared copy: {:?}", read(&d, &env));
@@ -762,7 +773,7 @@ fn bug_1062_a_share_never_replaces_the_recipients_symlink() {
     std::fs::remove_file(d.join(&env)).unwrap();
     assert!(std::process::Command::new("mkfifo").arg(d.join(&env)).status().unwrap().success());
     write_files(&f, &[(&env, "KEY=sharer-v3-after-the-fifo\n")]);
-    seal_until(&hub, &p, &f, &env, &p.dev.name, |r| r.open(&dev_id).is_ok_and(|c| c == b"KEY=sharer-v3-after-the-fifo\n"));
+    send(&hub, &p, &f, &env, &p.dev.name, b"KEY=sharer-v3-after-the-fifo\n");
     let out = p.dev.ok(&d, &["pull"]);
     assert!(out.contains("not a regular file"), "{out}");
     use std::os::unix::fs::FileTypeExt;
@@ -784,7 +795,7 @@ fn bug_1063_another_clone_on_the_sharing_device_never_rolls_the_share_back() {
     let newer = "KEY=MARKER-NEWER-FROM-F-2d7a90be\n";
     write_files(&f, &[(&env, newer)]);
     let dev_id = p.dev.identity();
-    seal_until(&hub, &p, &f, &env, &p.dev.name, |r| r.open(&dev_id).is_ok_and(|c| c == newer.as_bytes()));
+    send(&hub, &p, &f, &env, &p.dev.name, newer.as_bytes());
     // A command in fin's other clone runs its background pass.
     p.fin.ok(&f2, &["share-keys"]);
     let r = record(&hub, &p, &env, &p.dev.name);
@@ -792,45 +803,31 @@ fn bug_1063_another_clone_on_the_sharing_device_never_rolls_the_share_back() {
     assert_eq!(String::from_utf8_lossy(&got), newer, "fin's other clone sealed its older copy (version {})", r.version);
 }
 
-// ---- updates only go forward (owner's delegate, 2026-11-07) ------------------------------
+// ---- content updates are explicit (owner's delegate, 2026-11-07, cycle 3) ---------------
 
-/// The background pass never sends a value the share held before, and
-/// pauses content updates while the working copy is on an older revision
-/// than the one the last version was sealed on. `vl secret share` sends
-/// either on purpose.
+/// A new content goes out only with `vl secret share`: the background pass,
+/// whatever the working copy holds (an edit, a value the share held
+/// before), seals nothing new; run again, the command sends what the clone
+/// holds now, whatever it is.
 #[test]
-fn automatic_updates_never_roll_the_recipient_back() {
+fn content_updates_are_explicit() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
     let (f, d) = shared(&hub, &p);
     let env = env_path();
-    let dev_id = p.dev.identity();
     let first = read(&f, &env).unwrap();
-    // A new value goes out; going back to the first one does not.
-    write_files(&f, &[(&env, "KEY=second-value-9a01\n")]);
-    seal_until(&hub, &p, &f, &env, &p.dev.name, |r| r.open(&dev_id).is_ok_and(|c| c == b"KEY=second-value-9a01\n"));
+    for v in ["KEY=an-edit-0a91\n", "KEY=another-edit-77c2\n"] {
+        write_files(&f, &[(&env, v)]);
+        let out = p.fin.ok(&f, &["share-keys"]);
+        assert!(!out.contains("version"), "{out}");
+        assert_eq!(record(&hub, &p, &env, &p.dev.name).version, 1);
+    }
+    send(&hub, &p, &f, &env, &p.dev.name, b"KEY=another-edit-77c2\n");
+    // On purpose, even a value it held before.
     write_files(&f, &[(&env, &first)]);
-    let out = p.fin.ok(&f, &["share-keys"]);
-    assert!(out.contains("a value the share held before"), "{out}");
-    assert_eq!(record(&hub, &p, &env, &p.dev.name).open(&dev_id).unwrap(), b"KEY=second-value-9a01\n");
-    // On purpose: it does.
-    p.fin.ok(&f, &["secret", "share", &env, "--with", &p.dev.name]);
-    assert_eq!(record(&hub, &p, &env, &p.dev.name).open(&dev_id).unwrap(), first.as_bytes());
-    // fin moves on (a commit), seals a value there, then goes back to the
-    // older revision: content updates pause there.
-    write_files(&f, &[(&format!("{BILL_DIR}/acme/invoice.txt"), "an edit fin commits\n")]);
-    p.fin.ok(&f, &["commit", "-m", "invoice"]);
-    write_files(&f, &[(&env, "KEY=third-on-the-new-revision\n")]);
-    seal_until(&hub, &p, &f, &env, &p.dev.name, |r| r.open(&dev_id).is_ok_and(|c| c == b"KEY=third-on-the-new-revision\n"));
-    p.fin.ok(&f, &["new", "@--"]);
-    write_files(&f, &[(&env, "KEY=fourth-on-the-old-revision\n")]);
-    let out = p.fin.ok(&f, &["share-keys"]);
-    assert!(out.contains("older revision"), "{out}");
-    assert_eq!(record(&hub, &p, &env, &p.dev.name).open(&dev_id).unwrap(), b"KEY=third-on-the-new-revision\n");
-    p.fin.ok(&f, &["secret", "share", &env, "--with", &p.dev.name]);
-    assert_eq!(record(&hub, &p, &env, &p.dev.name).open(&dev_id).unwrap(), b"KEY=fourth-on-the-old-revision\n");
+    send(&hub, &p, &f, &env, &p.dev.name, first.as_bytes());
     p.dev.ok(&d, &["pull"]);
-    assert_eq!(read(&d, &env).unwrap(), "KEY=fourth-on-the-old-revision\n");
+    assert_eq!(read(&d, &env).unwrap(), first);
 }
 
 /// A genuine version the recipient saw but did not write (their own edit
@@ -844,12 +841,11 @@ fn a_version_seen_but_not_written_still_refuses_older_ones() {
     let env = env_path();
     let v1 = record(&hub, &p, &env, &p.dev.name);
     write_files(&d, &[(&env, "KEY=dev-own-edit\n")]);
-    let dev_id = p.dev.identity();
     // Two versions dev sees but does not write (their own edit is there).
     let mut seen = Vec::new();
     for v in ["KEY=newer-v2\n", "KEY=newer-v3\n"] {
         write_files(&f, &[(&env, v)]);
-        seen.push(seal_until(&hub, &p, &f, &env, &p.dev.name, |r| r.open(&dev_id).is_ok_and(|c| c == v.as_bytes())));
+        seen.push(send(&hub, &p, &f, &env, &p.dev.name, v.as_bytes()));
         let out = p.dev.ok(&d, &["pull"]);
         assert!(out.contains("not written over your own"), "{out}");
     }
@@ -923,7 +919,6 @@ fn record_from(hub: &TestHub, p: &Project, path: &str, sharer: &str, recipient: 
 /// moved, and the pass seals the old value, rolling dev back to the secret
 /// the admin rotated away from.
 #[test]
-#[ignore = "BUG-1064: a workspace switch rolls the share back (the rule checks one workspace, the file is another's)"]
 fn bug_1064_switching_the_directory_to_an_older_workspace_never_rolls_the_share_back() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -941,11 +936,8 @@ fn bug_1064_switching_the_directory_to_an_older_workspace_never_rolls_the_share_
     assert_eq!(read(a, &env).unwrap(), old, "the older workspace holds the value before the rotation");
     let out = (0..3).map(|_| p.admin.ok(a, &["share-keys"])).collect::<Vec<_>>().join("");
     let r = record_from(&hub, &p, &env, &p.admin.name, &p.dev.name);
-    assert!(
-        !r.open(&dev_id).is_ok_and(|c| c == old.as_bytes()),
-        "the admin's pass sealed the value from before the rotation for dev (version {}): rolled back\n{out}",
-        r.version
-    );
+    // No content goes out without `vl secret share`: dev keeps the rotated value.
+    assert!(r.version == 1 && r.open(&dev_id).unwrap() == rotated.as_bytes(), "the admin's pass sealed a new content (version {}):\n{out}", r.version);
 }
 
 /// BUG-1065: "forward" accepts any snapshot of the change the last value
@@ -956,7 +948,6 @@ fn bug_1064_switching_the_directory_to_an_older_workspace_never_rolls_the_share_
 /// of the change (where `vl undo` of the squash, or `vl evolog`, lead):
 /// the earlier value is back, and the pass seals it.
 #[test]
-#[ignore = "BUG-1065: an earlier version of the same change counts as forward (change id alone)"]
 fn bug_1065_an_earlier_version_of_the_same_change_is_an_older_revision() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -976,11 +967,8 @@ fn bug_1065_an_earlier_version_of_the_same_change_is_an_older_revision() {
     assert_eq!(read(a, &env).unwrap(), earlier);
     let out = (0..3).map(|_| p.admin.ok(a, &["share-keys"])).collect::<Vec<_>>().join("");
     let r = record_from(&hub, &p, &env, &p.admin.name, &p.dev.name);
-    assert!(
-        !r.open(&dev_id).is_ok_and(|c| c == earlier.as_bytes()),
-        "the admin's pass sealed the earlier version's value for dev (version {}):\n{out}",
-        r.version
-    );
+    // No content goes out without `vl secret share`: dev keeps the current value.
+    assert!(r.version == 1 && r.open(&dev_id).unwrap() == current.as_bytes(), "the admin's pass sealed a new content (version {}):\n{out}", r.version);
 }
 
 /// `vl args` as `who` in `dir`, starting no background pass.
@@ -1017,9 +1005,27 @@ fn no_pass_running(dir: &Path) {
 /// likes); here a gate in the database holds that answer until fin's
 /// unshare is done. (PostgreSQL: advisory locks.)
 #[test]
-#[ignore = "BUG-1066: a background pass in flight writes back a share fin unshared meanwhile"]
 fn bug_1066_a_pass_in_flight_never_brings_back_an_unshare() {
-    let hub = TestHub::start();
+    // The gate replaces the `devices` table with a view and adds a function:
+    // in a database of this test's own, so no other test sees them.
+    let admin_url = std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL (run scripts/verify-server.sh)");
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let name = format!("{}{}", std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_default(), unique("veil_fresh_"));
+    let yugabyte = rt.block_on(async {
+        let db = veil_server::db::connect(&admin_url, 1).await.unwrap();
+        let v: String = sqlx::query_scalar("SELECT version()").fetch_one(&db).await.unwrap();
+        if !v.contains("-YB-") {
+            sqlx::raw_sql(&format!("CREATE DATABASE {name}")).execute(&db).await.unwrap();
+        }
+        db.close().await;
+        v.contains("-YB-")
+    });
+    if yugabyte {
+        eprintln!("bug_1066: the gate uses PostgreSQL's advisory locks; it runs on PostgreSQL only");
+        return;
+    }
+    let (base, _) = admin_url.rsplit_once('/').unwrap();
+    let hub = TestHub::start_on(&format!("{base}/{name}"), std::time::Duration::from_secs(3600));
     let p = setup_project(&hub);
     let (f, _d) = shared(&hub, &p);
     let env = env_path();
@@ -1060,7 +1066,8 @@ fn bug_1066_a_pass_in_flight_never_brings_back_an_unshare() {
     sql(&hub, "CREATE VIEW devices AS SELECT * FROM devices_gated d WHERE veil_test_gate(d.person_id)", &[]);
     let waiting = || -> i64 {
         hub.rt
-            .block_on(sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 4242 AND NOT granted").fetch_one(&db))
+            .block_on(sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 4242 AND NOT granted \
+                 AND database = (SELECT oid FROM pg_database WHERE datname = current_database())").fetch_one(&db))
             .unwrap()
     };
     std::thread::scope(|scope| {
@@ -1109,7 +1116,6 @@ fn bug_1066_a_pass_in_flight_never_brings_back_an_unshare() {
 /// folder's key (the edit is moved out), then writes a file of their own
 /// at that path: it is moved too, over dev's edit, which is lost.
 #[test]
-#[ignore = "BUG-1067: holding back a received copy writes over what it held before"]
 fn bug_1067_holding_back_a_received_copy_never_loses_what_it_held() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1137,4 +1143,92 @@ fn bug_1067_holding_back_a_received_copy_never_loses_what_it_held() {
         .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
         .collect();
     assert!(held.contains(&edited), "dev's own edit of the copy is gone; held now: {held:?}\n{out}");
+}
+
+/// BUG-1066's class, as a property of concurrent commands: random `vl
+/// secret share` and `unshare` commands (a pinned seed) in fin's clone,
+/// while background passes run there and `vl pull` and passes run in dev's
+/// clone, all at once. After each round: fin's record holds exactly the
+/// shares whose last command was a share, each at the server's version;
+/// dev's record never holds a version newer than the server's, never one
+/// older than it saw, and a final pull brings every active share's latest.
+#[test]
+fn concurrency_the_share_record_under_concurrent_commands() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let f = clone(&hub, &p, &p.fin, "f");
+    let d = clone(&hub, &p, &p.dev, "d");
+    let paths: Vec<String> = (0..4).map(|i| format!("{BILL_DIR}/.env.c{i}")).collect();
+    for (i, path) in paths.iter().enumerate() {
+        write_files(&f, &[(path, &format!("C{i}=MARKER-CONCURRENT-{i}-5e81c0d2\n"))]);
+    }
+    let state = |dir: &Path| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(dir.join(".veil/local/secret-shares.json")).unwrap_or_else(|_| "{}".into())).unwrap()
+    };
+    // xorshift64*, seeded: the same commands every run.
+    let mut seed: u64 = std::env::var("PROPTEST_RNG_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0x5eed_1066);
+    let mut next = move || {
+        seed ^= seed >> 12;
+        seed ^= seed << 25;
+        seed ^= seed >> 27;
+        seed.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    };
+    let mut shared_now = std::collections::BTreeSet::new();
+    for round in 0..3 {
+        let ops: Vec<(usize, bool)> = (0..6).map(|_| ((next() % 4) as usize, next() % 3 != 0)).collect();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for (who, dir) in [(&p.fin, &f), (&p.fin, &f), (&p.dev, &d)] {
+                let done = &done;
+                scope.spawn(move || {
+                    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                        let _ = who.command(dir, &["share-keys"]).env("VEIL_KEY_SHARE", "0").output();
+                    }
+                });
+            }
+            let done2 = &done;
+            scope.spawn(|| {
+                while !done2.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = p.dev.command(&d, &["pull"]).env("VEIL_KEY_SHARE", "0").output();
+                }
+            });
+            for (i, share) in &ops {
+                let path = &paths[*i];
+                if *share {
+                    quiet(&p.fin, &f, &["secret", "share", path, "--with", &p.dev.name]);
+                    shared_now.insert(path.clone());
+                } else if shared_now.remove(path) {
+                    quiet(&p.fin, &f, &["secret", "unshare", path, "--from", &p.dev.name]);
+                }
+            }
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        // fin's record: exactly the shares last shared, at the server's version.
+        let st = state(&f);
+        let made: std::collections::BTreeMap<String, u64> = st["made"]
+            .as_object()
+            .map(|m| m.iter().map(|(k, v)| (k.split('\u{0}').next().unwrap().to_string(), v["version"].as_u64().unwrap())).collect())
+            .unwrap_or_default();
+        let want: std::collections::BTreeSet<&String> = shared_now.iter().collect();
+        assert_eq!(made.keys().collect::<std::collections::BTreeSet<_>>(), want, "round {round}: fin's record {st}");
+        for (path, v) in &made {
+            let (server, ended, _) = row(&hub, &p, path, &p.dev.name).unwrap();
+            assert!(ended.is_none() && server as u64 == *v, "round {round}: {path} recorded at {v}, the server has {server}");
+        }
+        // dev's record: never ahead of the server, never behind what it saw.
+        p.dev.ok(&d, &["pull"]);
+        let st = state(&d);
+        for path in &paths {
+            let k = format!("{}\u{0}{path}", p.fin.name);
+            let got = st["received"][&k]["version"].as_u64();
+            let seen = st["seen"][&k].as_u64().unwrap_or(0);
+            let Some((server, ended, _)) = row(&hub, &p, path, &p.dev.name) else { continue };
+            if let Some(g) = got {
+                assert!(g <= server as u64 && seen >= g, "round {round}: {path}: received {g}, seen {seen}, server {server}");
+            }
+            if ended.is_none() {
+                assert_eq!(got, Some(server as u64), "round {round}: {path} not delivered at its latest version: {st}");
+            }
+        }
+    }
 }

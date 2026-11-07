@@ -1526,28 +1526,30 @@ vl secret unshare billing/.env.stripe-test --from bob  # no later version reache
    outside `billing/` gives them that file and nothing else of `billing/`
    (CRYPTO.md C14). The vault entries of `vl secret set` are not shared
    this way: a secret that people use together belongs in a file.
-2. **Updates and revocation.** The **clone that ran `vl secret share`**
-   keeps the share up to date, and only shares it records itself
-   (`.veil/local/secret-shares.json`: the share's id, the last version it
-   sealed, keyed hashes of the contents it sealed, and the revisions its
-   working copy was on), never the server's listing (BUG-1060, BUG-1063).
-   After any `vl` command there (the background pass of §13.12, at most
-   every 10 s) it seals a new version when its copy of the file changed, or
-   when the recipient's confirmed devices changed (a new one is added; one
-   no longer confirmed is left out of every later version). **Updates
-   follow your working copy forward; checking out an older revision pauses
-   them** (owner's delegate, 2026-11-07): an automatic update never sends a
-   value the share held before, and never a changed file while the working
-   copy is on an older revision than (not a descendant of, by change too,
-   so a rewritten revision still counts) the one the last value was sealed
-   on. `vl secret share` sends either on purpose, and makes the clone it
-   runs in the source (any other clone of the person's then stops
-   updating it). `vl secret unshare` **ends** the share: the clone forgets
-   it first, then the server stores or serves no later version. **It
-   cannot take back what the recipient already received** (the command
-   says so, and suggests rotating the secret). A share the server lists as
-   ended, paused or shared again elsewhere is forgotten by the clone too:
-   only a new `vl secret share` starts updates again.
+2. **Updates and revocation: run `vl secret share` again to send a new
+   version; devices the recipient adds receive the current version
+   automatically** (owner's delegate, 2026-11-07, review cycle 3). A new
+   content is sealed only by that explicit command ("send what I have
+   now"): an edit of the file sends nothing, so no checkout, workspace,
+   rewrite or concurrent pass can ever send an older or another value
+   (BUG-1064, BUG-1065). The **clone that ran `vl secret share`** keeps
+   only the shares it records itself (`.veil/local/secret-shares.json`: the
+   share's id and the last version it sealed), never the server's listing
+   (BUG-1060, BUG-1063). After any `vl` command there (the background pass
+   of §13.12, at most every 10 s) it seals **the same content** again when
+   the recipient's confirmed devices changed (a new one is added; one no
+   longer confirmed is left out of every later version), taking it from its
+   own signed last version (the sharing device is sealed for it), never
+   from the working copy. Running `vl secret share` in another clone makes
+   that one the source (the first sees the version move on and stops).
+   Every change of the record is made under its lock, re-read and applied
+   only for that command, never bringing back an entry another command
+   removed, nor an older version (BUG-1066). `vl secret unshare` **ends**
+   the share: the clone forgets it first, then the server stores or serves
+   no later version. **It cannot take back what the recipient already
+   received** (the command says so, and suggests rotating the secret). A
+   share the server lists as ended, paused or shared again elsewhere is
+   forgotten by the clone too: only a new `vl secret share` starts it again.
 3. **Device confirmation, as S2 requires.** The sharing device seals only
    for devices confirmed outside the server, with the same rules an admin's
    `vl group add` uses (§13.11; `hub_keys::person_devices`): a device a
@@ -1578,7 +1580,10 @@ vl secret unshare billing/.env.stripe-test --from bob  # no later version reache
    in that folder, so the copy is not written there and the command says
    why. The same check runs before every snapshot: a copy this device would
    now record (it gained the folder's key since) is moved to
-   `.veil/local/secret-shares-held/` instead. A one-directory clone
+   `.veil/local/secret-shares-held/` instead, under a new name each time
+   (never over a copy held before), and the path is then no longer
+   "received": a file the person puts there later is theirs to record
+   (BUG-1067). A one-directory clone
    (`--only`) writes nothing outside its directory. A version is refused if
    it is older than the newest genuine one this clone saw, written or not.
 6. **Format and wire.** No repository format change (format 8) and no new
@@ -1587,7 +1592,7 @@ vl secret unshare billing/.env.stripe-test --from bob  # no later version reache
    routes below, migration `0009_secret_shares` (the shares and a quota
    row per person and project), and the device-local
    `.veil/local/secret-shares.json` (the shares this clone made, and what it
-   received).
+   received; changed under `.veil/local/secret-shares.lock`).
 
 #### The server
 
@@ -1599,7 +1604,7 @@ vl secret unshare billing/.env.stripe-test --from bob  # no later version reache
   paused, with why (`fin may no longer read billing/.env`; `bob no longer
   takes part in this project`). It is served again if that changes, until
   it is ended; its sharing clone, which forgot it when it saw it paused,
-  seals no later version until its person shares it again.
+  seals it for no new device until its person shares it again.
 * `POST /v1/projects/{p}/shares` (`SharePut {expect, reshare, record}`):
   the record must verify, be signed by the device sending it under its
   person's name, be of a path the caller may read that the accepted policy
@@ -1634,7 +1639,8 @@ secrets, §3.1), unless a row says otherwise. Tests: `server_hub` `shares`,
 | 11 | **Withholds a new version**, or a revocation, from the sharing device | The recipient keeps an older version (freshness is TOFU, as for rings, §13.12); a device the sharer's rings still hold stays sealed for until they are fresh | residual |
 | 12 | **Races an update against an unshare** | Compare-and-swap on the version; an unshare moves it on, and an update never revives an ended share | `concurrency_share_updates_and_unshares_under_load`, `the_share_routes_refuse_what_may_not_be_shared` |
 | 12a | **Forgets an unshare**: lists the last genuine record as active again, then the sharer rotates the secret (BUG-1060) | The sharing clone forgot the share when it unshared it; its pass updates only shares it records | `bug_1060_an_unshare_the_server_forgets_never_seals_a_later_version` |
-| 12b | *Another clone on the sharing device* (an older checkout, an agent's) seals its own copy (BUG-1063) | Only the clone that ran `vl secret share` updates it; it never sends a value the share held before, nor a change made on an older revision | `bug_1063_another_clone_on_the_sharing_device_never_rolls_the_share_back`, `automatic_updates_never_roll_the_recipient_back` |
+| 12b | *Another clone on the sharing device* (an older checkout, an agent's) seals its own copy (BUG-1063); a workspace switch or an earlier version of a change brings an older value back (BUG-1064, BUG-1065) | Only the clone that ran `vl secret share` touches it, and its pass never sends a new content: only the same one, again, for new devices | `bug_1063_another_clone_on_the_sharing_device_never_rolls_the_share_back`, `bug_1064_switching_the_directory_to_an_older_workspace_never_rolls_the_share_back`, `bug_1065_an_earlier_version_of_the_same_change_is_an_older_revision`, `content_updates_are_explicit` |
+| 12d | **Delays its answer to a pass** until the sharer unshared, so the pass writes back the record it read before (BUG-1066) | Every change of the record is made under its lock and re-read there; a pass never re-inserts an entry another command removed | `bug_1066_a_pass_in_flight_never_brings_back_an_unshare`, `concurrency_the_share_record_under_concurrent_commands` |
 | 12c | *A member* sends many new shares at once (BUG-1061) | The limit is reserved on a quota row in the inserting transaction | `bug_1061_concurrent_new_shares_never_pass_the_limit` |
 | 13 | *A member without the folder* shares its secret, or anyone shares code or a personal key | Refused by the route (the caller's access to the path; the accepted policy); the client refuses first | `the_share_routes_refuse_what_may_not_be_shared` |
 | 14 | *A member* shares to a device that is not the person's (by `--confirm`) | Trusted: they hold the file and could leak it anyway (§3.1) | — |
@@ -1643,7 +1649,7 @@ secrets, §3.1), unless a row says otherwise. Tests: `server_hub` `shares`,
 | 17 | *An admin's device* receives a share of a file its folder does not have | Not written: that device would seal it into history for the folder's people | `a_share_reaches_its_recipient_only` |
 | 18 | *The recipient's own edit* of the received file, or a link, folder, FIFO or unreadable file at its path (BUG-1062) | Never written over; a later version waits until they remove theirs | `updates_and_unsharing`, `bug_1062_a_share_never_replaces_the_recipients_symlink` |
 | 18a | **Serves an older genuine version** after the recipient removed their copy | Refused: older than the newest version the clone saw, written or not | `a_version_seen_but_not_written_still_refuses_older_ones` |
-| 18b | *The recipient's device gains the folder's key* after receiving a copy | Before any snapshot, the copy moves to `.veil/local/secret-shares-held/` instead of being sealed for the folder's people | `a_received_copy_is_never_recorded_after_the_device_gains_the_key` |
+| 18b | *The recipient's device gains the folder's key* after receiving a copy | Before any snapshot, the copy moves to `.veil/local/secret-shares-held/` (a new name each time) instead of being sealed for the folder's people; the path is then the person's again (BUG-1067) | `a_received_copy_is_never_recorded_after_the_device_gains_the_key`, `bug_1067_holding_back_a_received_copy_never_loses_what_it_held` |
 | 19 | **Hostile input**: paths with `..`, huge records, many devices, many shares, malformed bodies, no session | Refused (400, 422, 401), never stored; at most 64 KiB, 64 devices, 256 shares per person and project | `the_share_routes_refuse_what_may_not_be_shared` |
 
 **Residual risks** (recorded, not closed here):

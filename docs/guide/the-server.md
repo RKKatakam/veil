@@ -281,13 +281,12 @@ vl secret unshare billing/.env.stripe-test --from bob
   device that holds the folder's key itself (that device would record it
   for everyone in the folder; if his device gains that key later, the copy
   moves to `.veil/local/secret-shares-held/`).
-- **Your later edits reach him in the background** (from the clone you
-  shared it from, after any `vl` command there), and so do his newly
-  confirmed devices; a device he removes gets no later version. **Updates
-  follow your working copy forward; checking out an older revision pauses
-  them**, and an update never sends a value the share held before: run
-  `vl secret share` again to send one on purpose. A share that pauses or
-  ends on the server stops updating until you share it again.
+- **Run `vl secret share` again to send a new version; devices he adds
+  receive the current version automatically** (from the clone you shared
+  it from, after any `vl` command there). An edit of the file alone sends
+  nothing. A device he removes gets no later version. A share that pauses
+  or ends on the server is no longer sealed for his new devices until you
+  share it again.
 - **Admins see that it is shared** (who, which path, when), never what it
   holds. The share pauses while you may no longer read the file's folder,
   or bob no longer takes part in the project.
