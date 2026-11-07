@@ -1281,6 +1281,7 @@ impl<'r> Transaction<'r> {
             legacy: None,
         };
         self.repo.view = std::mem::take(&mut self.view);
+        self.repo.pin_working_copies();
         // Best effort: the index is a cache.
         self.repo.graph.persist(self.repo);
         let warnings = self.take_merge_warnings();

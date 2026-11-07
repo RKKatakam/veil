@@ -343,7 +343,9 @@ impl Ctx {
         let identity = load_identity()?;
         let user = user_for(&identity);
         let fs = Arc::new(DiskBackend::new(&root));
-        let mut repo = Repo::open(fs.clone(), Some(identity), &user)?;
+        let mut repo = Repo::open(fs.clone(), Some(identity.clone()), &user)?;
+        // A thin clone reads what it has not fetched from its server.
+        crate::thin::attach(&repo, &identity);
         // A clone of a server project trusts only the key rings of the
         // project fingerprint this device confirmed, before anything seals
         // (BUG-845). (A repository that will create its project, at its first
@@ -411,7 +413,22 @@ impl Ctx {
     }
 
     pub fn rev(&self, spec: &str) -> Result<ObjectId> {
-        Ok(revset::resolve(&self.repo, spec, &self.ws)?)
+        // A thin clone: a full snapshot id it does not hold is asked of the
+        // server, and a walk that reaches beyond what it holds goes on
+        // through the server's history pages.
+        if self.repo.is_partial() {
+            if let Ok(id) = veil_core::ObjectId::from_hex(spec.trim().trim_end_matches('-')) {
+                if !self.repo.store().has(&id) {
+                    self.repo.deepen(&[id], 1)?;
+                }
+            }
+        }
+        let id = self.repo.exact(|r| revset::resolve(r, spec, &self.ws))?;
+        // `main-` names a parent the clone may not hold yet.
+        if self.repo.is_partial() && !self.repo.store().has(&id) {
+            self.repo.deepen(&[id], 1)?;
+        }
+        Ok(id)
     }
 
     /// Record the project directory into the attached workspace.

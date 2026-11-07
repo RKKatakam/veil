@@ -24,13 +24,16 @@ There is one **repository format**, a number in `.veil/repo.json`:
 | 3 | 1.0.0 | standard cryptography: AES-SIV sealed objects (`veil:sea2`), HPKE-wrapped ring keys (ring format 3); see [CRYPTO.md](CRYPTO.md) |
 | 4 | 1.0.0 | first-class conflicts: conflict objects (`veil:conf`, §3.6) and conflict entries in binary trees (flag bit 6) |
 | 5 | 1.0.0 | symlink tree entries (flag bit 7 and a kind byte, §3.7) and conflict terms (§3.6), annotated tags (`veil:atag`, §3.8; `Tag.annotation`) |
-| 6 | 1.1.0 | the lock-free op log: heads in `.veil/op_heads/` instead of `.veil/op_head`, operations gain `workspace` and `rewritten` (§2, §5 "Format 6"). Not yet built: snapshot attribution (`Snapshot.agent`) and the `partial` marker for fetch on demand (`docs/design/scale/PLAN.md` §1) |
+| 6 | 1.1.0 | the lock-free op log: heads in `.veil/op_heads/` instead of `.veil/op_head`, operations gain `workspace` and `rewritten` (§2, §5 "Format 6"). Not yet built: snapshot attribution (`Snapshot.agent`). The `partial` marker came with format 9 |
 | 7 | 1.1.0 | key rings of ring format 4: invites, shares by members, a member's removal of their own device, and every ring but `team` naming its project (`docs/HUB.md` §13.12). No object encoding changes; the upgrade 6 → 7 rewrites nothing |
 | 8 | 1.1.0 | **only secret files are encrypted.** Removed: sealed descriptions and tag messages (`{"sealed": …}`), cloaked tags and workspaces (`cloak` in views), snapshots on cloaked lines (`Snapshot.cloak`), embargoed tree entries (tier 2) and fallback versions (flag bit 3), sealed directories, embargo keys. Embargo records are plain (embargo record format 2). Decoders refuse what only those wrote; `vl upgrade` brings 6 and 7 to 8 when none of it is there (§5). Formats 1 to 5 are no longer opened |
+| 9 | 1.1.0 | **a thin clone** (S3, `docs/HUB.md` §13.18): format 8 plus the `partial` marker in `repo.json` and the cache area `.veil/cache/`. Only `vl clone` writes it, for a thin clone; every other repository stays at format 8. `vl partial full` brings a thin clone back to format 8 once it holds everything. The marker and format 9 go together: either without the other is refused as corrupt |
 
-* `vl init` writes the newest format (`repo::REPO_FORMAT`), and so do
-  clones and remotes: this release opens format 8 only
-  (`repo::MIN_REPO_FORMAT`).
+* `vl init` writes format 8 (`repo::REPO_FORMAT`), and so do full clones
+  and remotes; a thin clone is format 9 (`repo::PARTIAL_FORMAT`). This
+  release opens formats 8 and 9 (`repo::MIN_REPO_FORMAT` to
+  `repo::MAX_REPO_FORMAT`). An older vl refuses a thin clone by its number,
+  instead of reading what it has not fetched as hidden.
 * A reader **refuses a newer repository format before reading anything
   else** (`Repo::open`, `fsck`, `vl upgrade`): an older vl never
   half-understands, and never rewrites, newer data. The error names the
@@ -53,8 +56,9 @@ not be understood.
 
 | Path / structure | Encoding | Version | Synced? | Notes |
 |---|---|---|---|---|
-| `.veil/repo.json` | pretty JSON `{format, repo_id, remotes, min_vl?}` | `format` | no | written last by `init`, rewritten atomically by `upgrade` (commit point). A remote may be a Veil server (`veil://host[:port]/project` or `https://…`); a server remote cloned with `--only DIR` has `"only": "DIR"` (absent otherwise, so earlier files keep their bytes; an older vl ignores the field and cannot use a server remote) |
+| `.veil/repo.json` | pretty JSON `{format, repo_id, remotes, min_vl?, partial?}` | `format` | no | written last by `init`, rewritten atomically by `upgrade` (commit point). `partial: {remote, cache_limit}` (unknown fields refused) marks a thin clone, format 9 only: objects neither store holds are fetched from `remote`'s server when read, into the cache area, kept under `cache_limit` bytes. A remote may be a Veil server (`veil://host[:port]/project` or `https://…`); a server remote cloned with `--only DIR` has `"only": "DIR"` (absent otherwise, so earlier files keep their bytes; an older vl ignores the field and cannot use a server remote) |
 | objects (§3) | `tag ‖ payload`, id = BLAKE3 | tag + encoding byte | yes | loose: `.veil/objects/ab/cdef…` (the canonical bytes) |
+| `.veil/cache/` (format 9) | an object store of its own: loose `ab/cdef…` and `pack/` as in `.veil/objects/` | as objects | no | a thin clone's trees and files fetched from the server, the only area ever evicted (least recently written first, never what a workspace's working copy or the checkout record pins). Snapshots and everything this repository makes go to `.veil/objects/` only. Losing it loses nothing: it is fetched again |
 | — blob | `veil:blob\n` ‖ bytes | none needed: any bytes are valid | yes | a new blob encoding would be a new tag |
 | — tree | `veil:tree\n` ‖ `{` JSON (v1) or `0x02` binary (v2) | encoding byte | yes | §3 |
 | — snapshot | `veil:snap\n` ‖ `{` JSON (v1) | encoding byte | yes | canonical (§3.3). `conflicts` lists conflicted paths; from format 4 it is an index the engine keeps (every conflict entry of the tree, plus marker conflicts carried from older formats), same field and encoding |
@@ -420,6 +424,28 @@ still waiting for its admin.
   format-1 clone refuses to pull binary trees ("run `vl upgrade`").
 * **Downgrades** are not supported: an older vl refuses a format-2
   repository with a message naming the release it needs.
+
+### Format 9 (thin clones)
+
+Written by `vl clone` for a thin clone only (S3, `docs/HUB.md` §13.18); no
+other repository changes format, so the vl releases that read format 8 keep
+reading every full repository.
+
+* **No upgrade step.** A thin clone is made at format 9 by its clone; `vl
+  upgrade` in one reports it up to date (and runs the ring step, as at any
+  current format). A format-8 repository is never made thin by an upgrade:
+  thinness is how a clone was fetched, not a conversion.
+* **Back to format 8:** `vl partial full` fetches every snapshot and object
+  the person may see into `.veil/objects/`, copies what only this clone's
+  own commits reach from the cache, then rewrites `repo.json` without the
+  marker at format 8 (the commit point), then removes `.veil/cache/`. A crash
+  before the commit point leaves a thin clone, which reads what it lacks
+  from the server; after it, a full one.
+* **Why a number, not just a field:** a vl that ignores the marker would
+  read every object it has not fetched as `Missing`, which the engine takes
+  for redacted: it would leave files out of checkouts and history out of
+  pushes (threat 1 of `docs/design/scale/6-partial-clone.md`). By number it
+  refuses the directory instead.
 
 ### Format 8 (only secret files are encrypted)
 

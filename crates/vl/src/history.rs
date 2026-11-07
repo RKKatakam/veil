@@ -216,7 +216,7 @@ const PICKAXE_MAX_CHANGES: usize = 100_000;
 impl LogFilterArgs {
     /// The query these flags ask for.
     pub fn query(&self, ctx: &Ctx, limit: Option<usize>) -> Result<api::LogQuery> {
-        let ids = self.revset.as_deref().map(|r| revset::resolve_set(&ctx.repo, r, &ctx.ws)).transpose()?;
+        let ids = self.revset.as_deref().map(|r| ctx.repo.exact(|repo| revset::resolve_set(repo, r, &ctx.ws))).transpose()?;
         let paths: Vec<VPath> = self.paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
         if self.follow && paths.len() != 1 {
             bail!("--follow follows exactly one file: give one PATH");
@@ -250,7 +250,22 @@ impl LogFilterArgs {
 
 /// `vl log`, with or without filters.
 pub fn log(ctx: &Ctx, limit: Option<usize>, f: &LogFilterArgs, json: bool) -> Result<()> {
-    let q = f.query(ctx, limit)?;
+    let mut q = f.query(ctx, limit)?;
+    // A thin clone: the history it shows comes from the server's pages
+    // where the walk reaches what the clone does not hold yet.
+    if ctx.repo.is_partial() && q.ids.is_none() {
+        let most = if q.filter.as_ref().is_some_and(|f| !f.is_empty()) { None } else { q.limit.map(|l| l + 1) };
+        q.ids = Some(ctx.repo.exact(|r| {
+            let mut ids = Vec::new();
+            for id in r.visible_iter() {
+                ids.push(id?);
+                if most.is_some_and(|m| ids.len() >= m) {
+                    break;
+                }
+            }
+            Ok(ids)
+        })?);
+    }
     match json {
         true => api::emit_json(&api::log_with(&ctx.repo, &ctx.ws, q)?),
         false => api::text::log(api::log_entries_with(&ctx.repo, &ctx.ws, q)?),
