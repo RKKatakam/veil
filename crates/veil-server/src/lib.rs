@@ -8,6 +8,7 @@
 //! | [`perm`] | the permission model: admins, groups, the accepted policy |
 //! | [`sync`] | projected history, fetch by id, push validation, branch CAS |
 //! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
+//! | [`query`] | the query API: history answered per viewer (S13) |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
 //! | [`store`] | object storage: local directory or S3 |
 //! | [`tls`] | TLS configuration |
@@ -18,6 +19,7 @@ pub mod db;
 pub mod derive;
 pub mod error;
 pub mod perm;
+pub mod query;
 pub mod store;
 pub mod sync;
 pub mod tls;
@@ -45,6 +47,9 @@ pub struct Hub {
     pub certificate: rustls::pki_types::CertificateDer<'static>,
     /// The derive workers (`derive::landed`).
     pub derive: derive::Workers,
+    /// The query API's caches and the viewer-graph fills running here
+    /// (`query::graph`).
+    pub query: query::graph::State,
 }
 
 pub type HubState = Arc<Hub>;
@@ -151,6 +156,7 @@ pub async fn start(config: Config) -> Result<Running> {
         session_ttl_ms: config.session_ttl.as_millis() as i64,
         certificate,
         derive: derive::Workers::default(),
+        query: query::graph::State::default(),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;

@@ -54,6 +54,13 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/groups/{g}/managers", post(add_managers))
         .route("/v1/projects/{p}/rings", get(get_rings))
         .route("/v1/projects/{p}/rings/{scope}", post(post_ring).get(get_ring))
+        // The query API (S13).
+        .route("/v1/projects/{p}/q/log", get(crate::query::log_route))
+        .route("/v1/projects/{p}/q/show", get(crate::query::show_route))
+        .route("/v1/projects/{p}/q/tree", get(crate::query::tree_route))
+        .route("/v1/projects/{p}/q/file", get(crate::query::file_route))
+        .route("/v1/projects/{p}/q/diff", get(crate::query::diff_route))
+        .route("/v1/projects/{p}/q/ancestry", post(crate::query::ancestry_route))
         .layer(DefaultBodyLimit::max(crate::db::body_limit("")))
         .layer(axum::middleware::from_fn(crate::db::retry_requests))
         .with_state(hub)
