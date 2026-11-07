@@ -614,19 +614,24 @@ fn concurrency_share_updates_and_unshares_under_load() {
                 });
             }
         }
-        // Meanwhile two shares end.
+        // Meanwhile two shares end, as soon as they exist: under load their
+        // first version can take seconds, so the wait has a deadline, not a
+        // count of tries, and a share that never ended fails here (a
+        // removal that gave up after 200 tries left the share active, which
+        // the check below misread as an ended share coming back).
         let api = hub.api();
         for i in [1usize, 4] {
-            let (sharer, to) = pairs[i];
-            for _ in 0..200 {
+            let to = pairs[i].1;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
                 let r = api.post_json(Some(&tokens[i].0), &format!("{route}/remove"), &json!({"path": env, "recipient": to.name}));
                 if r.status == 200 {
                     break;
                 }
                 assert_eq!(r.status, 404, "{}", String::from_utf8_lossy(&r.body));
+                assert!(std::time::Instant::now() < deadline, "pair {i}: the share was not created within 120 s, so it never ended");
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            let _ = sharer;
         }
     });
     let accepted = accepted.into_inner().unwrap();
