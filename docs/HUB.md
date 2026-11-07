@@ -2312,31 +2312,38 @@ veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
   polls), for `veil-bench load --mode objects --via server,cache`
   (`scripts/bench-server.sh cache`).
 
-**Measured** (`scripts/bench-server.sh cache` at `c97c32f`, release
-builds, server, cache, PostgreSQL, MinIO and the agents on one 32-thread
-machine; load 14 at the start, 104 at the end, so throughputs are noisy).
-A read is a fresh thin workspace's: the tips, then the root, `w/`,
-`w/seed/` and 100 of its 4 KiB files (103 objects, 4 requests), signed:
+**Measured** (`scripts/bench-server.sh cache` at `9b66cff`, after cycle
+1's fixes, release builds; the server, the cache, PostgreSQL, MinIO and the
+agents on one 32-thread machine; load 16.5 at the start, 79 at the end, so
+throughputs are noisy). A read is a fresh thin workspace's: the tips, then
+the root, `w/`, `w/seed/` and 100 of its 4 KiB files (103 objects, 4
+requests), signed:
 
 | `main` | Agents | Via | Reads/s | p50 / p99 (ms) | Server CPU per read | Cache hits | Cache requests to the server per read | Cache CPU per read | Cache peak |
 |---|---:|---|---:|---|---:|---:|---:|---:|---:|
-| still | 10 | server | 2,540 | 3.9 / 5.9 | 2.56 ms | | | | |
-| still | 10 | cache | 2,516 | 3.6 / 8.6 | 0.19 ms | 100 % | 0.00 | 2.53 ms | 39 MiB |
-| still | 1,000 | server | 4,093 | 235 / 407 | 2.52 ms | | | | |
-| still | 1,000 | cache | 1,842 | 512 / 1,137 | 0.20 ms | 100 % | 0.00 | 2.48 ms | 177 MiB |
-| 20 landings/s | 100 | server | 2,075 | 45 / 99 | 2.32 ms | | | | |
-| 20 landings/s | 100 | cache | 4,982 | 20 / 33 | 0.20 ms | 99.99 % | 0.01 | 2.76 ms | 119 MiB |
-| 20 landings/s | 1,000 | server | 2,156 | 420 / 1,083 | 2.30 ms | | | | |
-| 20 landings/s | 1,000 | cache | 4,649 | 209 / 381 | 0.22 ms | 99.98 % | 0.02 | 2.89 ms | 194 MiB |
+| still | 10 | server | 2,373 | 4.1 / 6.7 | 2.56 ms | | | | |
+| still | 10 | cache | 2,597 | 3.8 / 5.7 | 0.18 ms | 100 % | 0.00 | 2.34 ms | 43 MiB |
+| still | 100 | server | 3,455 | 28.3 / 48.4 | 2.43 ms | | | | |
+| still | 100 | cache | 4,555 | 21.1 / 39.4 | 0.18 ms | 100 % | 0.00 | 2.73 ms | 114 MiB |
+| still | 1,000 | server | 3,886 | 251 / 428 | 2.50 ms | | | | |
+| still | 1,000 | cache | 3,814 | 254 / 484 | 0.20 ms | 100 % | 0.00 | 2.96 ms | 280 MiB |
+| 20 landings/s | 10 | server | 2,459 | 4.0 / 6.0 | 2.63 ms | | | | |
+| 20 landings/s | 10 | cache | 2,545 | 3.7 / 8.2 | 0.23 ms | 99.98 % | 0.02 | 2.42 ms | 49 MiB |
+| 20 landings/s | 100 | server | 4,445 | 22.1 / 34.7 | 2.55 ms | | | | |
+| 20 landings/s | 100 | cache | 4,579 | 21.3 / 35.7 | 0.22 ms | 99.99 % | 0.01 | 2.84 ms | 115 MiB |
+| 20 landings/s | 1,000 | server | 3,866 | 252 / 461 | 2.54 ms | | | | |
+| 20 landings/s | 1,000 | cache | 4,053 | 241 / 427 | 0.24 ms | 99.98 % | 0.02 | 3.11 ms | 281 MiB |
 
 Gates met: at least 99 % of objects from the cache's store, its peak at
-most 512 MiB (`--memory 256M`). The server's CPU per read falls about 12×
-(it answers the tips only); the cache spends about what the server did
-(reading one object a thread cost twice as much before `c97c32f`). On one
-machine the cache competes with the server for the same cores, so
-throughput and latency through it are not a regional win; what it removes
-is the server's work. Coalescing keeps requests to the server at 0.02 per
-read while `main` moves 20 times a second.
+most 512 MiB (`--memory 256M`, 1,024 connections: the bound is about 384
+MiB). The server's CPU per read falls about 11× (it answers the tips only);
+the cache spends about what the server did. The 64 KiB slices and buffers
+cost no throughput measurable here (before them, at `c97c32f`: 1,908–4,982
+reads/s at 100 agents, 1,842–4,649 at 1,000, as noisy). On one machine the
+cache competes with the server for the same cores, so throughput and
+latency through it are not a regional win; what it removes is the server's
+work. Coalescing keeps requests to the server at 0.02 per read while
+`main` moves 20 times a second.
 
 **Threat review** (design §6 rows 1–4, 8, 9, 14, 15, 17, plus this
 milestone's):
