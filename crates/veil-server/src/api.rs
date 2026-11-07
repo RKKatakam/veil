@@ -58,6 +58,9 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/rings/{scope}", post(post_ring).get(get_ring))
         .route("/v1/projects/{p}/shares", get(crate::shares::list).post(crate::shares::put))
         .route("/v1/projects/{p}/shares/remove", post(crate::shares::remove))
+        .route("/v1/objects/{p}/{id}", get(crate::grant::get_object))
+        .route("/v1/objects/{target}", post(crate::grant::batch))
+        .route("/v1/epochs", get(crate::grant::epochs))
         .layer(DefaultBodyLimit::max(crate::db::body_limit("")))
         .layer(axum::middleware::from_fn(crate::db::retry_requests))
         .with_state(hub)
@@ -540,9 +543,14 @@ async fn create_project(State(hub): State<HubState>, caller: Caller, Path(name):
 }
 
 async fn tips(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Json<Tips>> {
-    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
+    // The epochs the view was built under (`perm::open_at`): a later access
+    // change voids the grants made with them.
+    let (project, viewer, epochs) = perm::open_at(&hub, &p, &caller).await?;
     let branches = sync::tips(&hub, &project, &viewer).await?.into_iter().collect();
+    let grants = crate::grant::for_tips(&hub, &project, &viewer, &caller, epochs, &branches).await?;
     Ok(Json(Tips {
+        grants,
+        grant_key: Some(hub.grants.key_hex().to_string()),
         branches,
         default_branch: project.default_branch,
         you: caller.person.map(|p| p.name),

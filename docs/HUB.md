@@ -2057,3 +2057,136 @@ secrets, §3.1), unless a row says otherwise. Tests: `server_hub` `shares`,
 * **A sharer's insider choices** (row 14), and what the file holds: a
   shared `.envrc` is a shell script that direnv runs once the person allows
   it. A share never writes over an existing file.
+
+
+### 13.16 S5: read grants, the object routes, access epochs (built)
+
+Design: `docs/design/server/phase-2-thin-clients.md` §4.3–§4.5, §5.1. Code:
+`veil_core::hub::grant` (the grant, request signatures and the chain
+check: pure, WASM-safe, for the server, the Veil daemon (S6) and regional
+caches (S9)), `crates/veil-server/src/grant.rs` (issuing, the routes, the
+feed); the access epochs are S4's (§13.14, `migrations/0006_access_epochs.sql`). Nothing new is encrypted:
+grants are **signed**.
+
+* **The grant.** `GET …/tips` (revision 3) returns, per branch, a grant
+  and the server's grant key (`Tips::grants`, `Tips::grant_key`). A grant
+  is `hex(JSON body) . hex(signature)`: Ed25519 by the server's **grant
+  key** (`<data>/hub-grant-key`, an Ed25519 seed, 0600; servers sharing the
+  data directory share it), context `hub-grant`, over the body bytes as
+  sent (verified before they are parsed; never re-encoded). The body is
+  `{project, device, root, epoch, person_epoch, expires}`: the project's
+  name, the caller's device's Ed25519 key, their projected root tree of
+  the tip, the access epochs of the project and of the person, and an
+  expiry 10 minutes on. **No database id:** project and person ids are
+  sequential and would count the server's projects and people
+  (BUG-1088); checking a grant looks the project up by name and the
+  person by the device's key, with both epochs, in one statement. It holds nothing its holder could not see
+  otherwise: **no view key** (an unkeyed hash of every access line, hidden
+  ones included, would confirm guesses of hidden folder names: BUG-1080),
+  and epochs that are opaque. Unknown
+  fields are refused, so a layer that does not know a later restriction
+  refuses the grant instead of ignoring it. Anyone on Earth's grant names
+  no person and no device.
+* **Projected trees are stored.** The trees a projection rewrites existed
+  only in memory in S1. Issuing a grant stores them, so a chain through
+  them can be checked from the store alone, by any layer. They hold only
+  what their viewer reads, and no route serves an object by id without a
+  path or chain check.
+* **Requests.** `GET /v1/objects/{p}/{id}` with headers `Veil-Grant`,
+  `Veil-Chain` (the tree ids from the grant's root to the tree naming the
+  object, comma-separated; empty for the root) and `Veil-Signature`
+  (`<unix ms>.<signature>`), `Range` supported; `POST
+  /v1/objects/{p}:batch {grant, ts, signature, wants: [{chain, id}]}`
+  answers object frames of what it serves and leaves the rest out. The
+  device signs `grant hash ‖ ts ‖ BLAKE3(ids)` (context `hub-request`,
+  72 bytes); the server accepts `ts` within ±5 minutes. A copied grant is
+  useless without the device key.
+* **Checks, in order:** the grant's signature, its project (the route's),
+  its expiry, the request's signature, then the project by name, the
+  device (still active) and the current epochs of the project and of the
+  device's person (one statement; both must be equal to the grant's): any
+  failure is `401
+  grant_invalid`, which says nothing about any object. Then each object's
+  chain (`Chains::allows`): `chain[0]` is the grant's root, each tree has
+  a directory entry naming the next, and the last tree has an entry whose
+  object is the id (or the last element is a conflict object
+  named by a conflict entry, and the id is one of its terms: S1's `fetch`
+  serves the same). The check reads only objects it already reached from
+  the root, and an object is read only after its own check, so "not
+  reachable" and "not there" are the same `404` (the same body), and in a
+  batch both are left out; a batch sends each id once. Every object,
+  trees included, is read through `store::Objects`, one at a time
+  (`grant::read`, and `Objects::get_range` for a `Range`), and decoded
+  from S27's encoding (§13.15) and checked against its id: when small
+  objects move into packs (S28), only those change, and a pack is never
+  handed out.
+* **`Range`** answers bytes of the object, never of what is stored. An
+  object stored as it is (S27's plain encoding) is read for those bytes
+  only (`BlobStore::get_range`: a file's seek, an S3 ranged `GET`, an open
+  range sent open; past the end, 416 with the length, from a `HEAD` on S3:
+  BUG-1086). A compressed one is decoded whole, its decoded bytes counted
+  in the server-wide budget below, then sliced.
+* **Read-ahead is bounded by sizes the server can trust** (BUG-1087), in
+  the batch route and in S1's `fetch` alike: at most 64 objects and about
+  8 MiB ahead of what a request has sent, and, across every request,
+  `store::DECODED_IN_FLIGHT` (256 MiB, the budget S27's uploads decode
+  under). An object's cost is the size its entry or conflict term records
+  plus 4 KiB (`store::SIZE_SLACK`): **a push or an API commit whose entry
+  records less than its object holds is refused** (`sync::check_changes`,
+  which reads every new object for the secret checks anyway; an API
+  commit records a sealed secret's stored length). An object that records
+  no size (a tree, a conflict) costs what its encoding declares: S27's
+  frames declare their size in their first bytes, read from the cache or
+  the store. A read waits for the budget only when its request holds none
+  of it, so requests never wait on each other in a cycle; an id asked for
+  more than once is read once.
+  **An error making a grant** (the store failing to read or write the
+  projected trees) is logged, and that branch gets no grant: the tips and
+  every pull still answer (BUG-1083).
+* **Access epochs** are S4's (§13.14): each project and each person has
+  an epoch, a random value that database triggers replace at every access
+  change, in the transaction of the change itself; there is no
+  server-wide row. A grant carries the two epochs its view was built
+  under (`perm::open_at`): random values compared only for equality, they
+  show neither a count, a time nor a rate of changes (BUG-1081). The
+  server reads the current epochs on every object request and refuses a
+  grant with others: a change committed after the view was built voids
+  it, and one committed before is in the view. **Revocation at the server is at the next request**
+  (tested: group removal or deletion, a policy change, a name rebound to a
+  new group, a device removed or barred, and a grant racing a removal).
+* **The feed.** `GET /v1/epochs?projects=a,b` needs a session: it answers
+  `{person, projects: {name: epoch}}`, the caller's own person epoch and
+  the current epoch of each named project the caller can see; a project
+  they cannot see is left out exactly as one that does not exist. Every
+  key asked for gets its current epoch, read from S4's table of each key's
+  current one (no paging and no log, so no change is passed over:
+  BUG-1082). The Veil daemon (S6) polls it for its people and
+  projects, and refuses a grant whose epochs are not those; a project
+  left out voids the caller's grants of it. Regional caches (S9) will
+  authenticate as the server's own.
+
+**Threat review** (design §6 rows 1–4, 14, 15, plus this milestone's):
+
+| # | Attacker | Tries | Result | Test (`server_hub::grants`) |
+|---|---|---|---|---|
+| 1 | Person without access to a folder | asks for every real object id (the admin's), with their own grant and every chain they can build: their own trees, the admin's real chain, the admin's chain from their root, the admin's root | nothing served; one at a time, the same `404` as a random id | `object_routes_serve_only_what_a_grant_reaches` (5 viewers, anyone on Earth included) |
+| 2 | Same | a real grant with a chain through another snapshot's or the admin's trees | the chain must start at the grant's root, each step read from the store | same, and the unit test `chains_reach_only_what_the_root_reaches` (which also checks that only reached objects are read) |
+| 3 | Anyone holding a copy of a grant | uses it from another device, unsigned, with a signature over other ids, six minutes old, an hour ahead | `grant_invalid` | `grants_hold_only_for_their_device_project_key_and_time` |
+| 4 | Person removed from a group; a project whose policy changed; a device an admin removed | keeps using a grant | refused at the next request; the feed lists the change | `access_changes_void_grants_at_the_next_request` |
+| 5 | Person without access | asks for a secret's ciphertext (`billing/.env`) | served only to those who read the folder | test 1 |
+| 6 | Same | an object at a visible and a hidden path | served through the visible chain only (the same bytes); refused through the hidden one | test 1 |
+| 7 | Anyone | a grant re-signed by the server's identity key, a body changed under its signature (a wider root), a grant for another project's URL, an expired one, one older than the project's epoch | `grant_invalid` | test 3 |
+| 8 | Anyone | malformed grants (non-hex, 10 KB), chains of `MAX_CHAIN + 5`, non-hex chains and signatures, more than `MAX_WANTS` wants, bad routes, bad JSON, a `Range` past the end or on a hidden object | refused cleanly (400/401/404/416); a hidden object's `Range` is the same 404 | test 3 |
+| 9 | Person without access | times answers | the grant is checked before any object, and only checked objects are looked up (the batch prefetches after the check) | by construction; residual as design row 14 |
+| 10 | Anyone holding a grant (anyone on Earth, for a project with something public) | tests guesses of the hidden access lines offline against a value it carries | no value a client receives (tips, grants, epochs, errors) is a view key | `bug_1080_…` (BUG-1080) |
+| 11 | Anyone on Earth; a signed-in person outside a project | reads the epoch feed, or counts epochs across grants | the feed needs a session and answers only for the caller and projects they see; epochs are random per key | `bug_1081_…` (BUG-1081) |
+| 12 | — (a cache falling behind) | reads the feed after many changes, one key changing twice | every key's current epoch | `bug_1082_…` (BUG-1082) |
+| 13 | — (an outage) | the store refuses writes | tips still answer; the branch has no grant | `bug_1083_…` (BUG-1083) |
+
+**Residual:** someone who holds grants of a project at two times learns
+whether its access (or their own) changed in between, not how often. A
+signed request can be replayed within ±5 minutes
+by whoever saw it (inside TLS: a cache, which is inside the boundary); it
+returns the same objects. Grants are made per branch at every tips request
+(one signature each). Not built (later milestones): `POST …/grants` for
+older snapshots, caches, `vl` reading through these routes (S3, S6).

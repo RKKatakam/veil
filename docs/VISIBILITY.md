@@ -141,6 +141,7 @@ What the server and `vl` do today; `docs/HUB.md` §13 has the details.
 - **A member shares one of their secret files with another member, without an admin** (`vl secret share billing/.env --with bob`): a copy of that one file, sealed for bob's confirmed devices only, which opens nothing else of `billing/`; admins see that it is shared (who, what path, when), never what it holds; `vl secret unshare` stops later versions, not what bob already received (`HUB.md` §13.17).
 - **Anyone on Earth** (not signed in) receives `public` folders only, and does not see a project with nothing public.
 - **Removing access takes effect at the very next request, on every server** (S4, `HUB.md` §13.14). Servers keep sessions and permissions in memory for speed, but every request checks them against access epochs that each access change renews in the database, so no server ever answers from a decision that change made stale.
+- **Read grants** (S5, `HUB.md` §13.16): with the tips, the server signs what each person may read, so caches can check it without asking. Taking access away voids them at the server's next request; caches (built later) take about 2 seconds, 5 at most (owner-approved).
 
 ## For the design: open technical questions (not product questions)
 

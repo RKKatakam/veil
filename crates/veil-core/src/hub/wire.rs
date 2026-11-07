@@ -19,6 +19,9 @@
 //! GET  /v1/projects/{p}/access?path=P                       → AccessInfo
 //! POST /v1/projects/{p}/groups/…          GroupChange       → GroupInfo
 //! GET|POST /v1/projects/{p}/rings/{scope} ring JSON
+//! GET  /v1/objects/{p}/{id}               headers Veil-Grant, Veil-Chain, Veil-Signature → the object
+//! POST /v1/objects/{p}:batch              grant::BatchRequest → frames (those served)
+//! GET  /v1/epochs?since=N                                   → grant::Epochs
 //! ```
 //!
 //! An object frame is `id [32] ‖ len u32be ‖ the object's canonical
@@ -38,8 +41,9 @@ pub const PROTOCOL: u32 = 1;
 /// What this side of `/v1/` supports beyond its first release, as
 /// [`Tips::revision`] tells clients: 1, a fetch names objects of several
 /// snapshots ([`Want::snapshot`]); 2, uploads may carry compressed
-/// objects ([`super::encoding`]).
-pub const REVISION: u32 = 2;
+/// objects ([`super::encoding`]); 3, read grants with the tips and the
+/// object routes ([`super::grant`]).
+pub const REVISION: u32 = 3;
 /// Largest object a frame may carry.
 pub const MAX_FRAME_OBJECT: usize = 1 << 30;
 /// Most objects one fetch request may name.
@@ -106,6 +110,13 @@ pub struct Tips {
     /// The server's [`REVISION`] (0: a server from before revisions).
     #[serde(default)]
     pub revision: u32,
+    /// Branch → a read grant (revision 3) for its tip's projected root
+    /// tree, signed by the server's grant key (`super::grant`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub grants: BTreeMap<String, String>,
+    /// The server's grant key (hex): what caches check grants against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

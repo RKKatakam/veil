@@ -98,6 +98,13 @@ pub const SIG_CONTEXT_HUB_INVITE: &str = "hub-invite";
 /// (`docs/HUB.md` §13.17, C14), by the sharing device, over
 /// `secret_share::ShareRecord::signing_body`.
 pub const SIG_CONTEXT_HUB_SHARE: &str = "hub-share";
+/// Signature context: a Veil server's read grant (`hub::grant`, `docs/HUB.md`
+/// §13.16), by its grant key, over the grant's JSON body exactly as sent.
+pub const SIG_CONTEXT_HUB_GRANT: &str = "hub-grant";
+/// Signature context: a device's request under a read grant
+/// (`hub::grant::request_message`): the grant's hash, the time and the
+/// hash of the object ids asked for.
+pub const SIG_CONTEXT_HUB_REQUEST: &str = "hub-request";
 
 /// Every signature context, for the uniqueness test.
 pub const SIG_CONTEXTS: &[&str] = &[
@@ -112,6 +119,8 @@ pub const SIG_CONTEXTS: &[&str] = &[
     SIG_CONTEXT_HUB_DEVICE,
     SIG_CONTEXT_HUB_INVITE,
     SIG_CONTEXT_HUB_SHARE,
+    SIG_CONTEXT_HUB_GRANT,
+    SIG_CONTEXT_HUB_REQUEST,
 ];
 
 // ---- key rings and embargoes (keychain.rs) --------------------------------
@@ -164,8 +173,10 @@ pub const GENERATION_SEPARATOR: char = '#';
 
 /// BLAKE3 `derive_key` context of a Veil server's view key: the hash of the
 /// paths one viewer may read under the accepted policy, under which the
-/// server caches that viewer's projections (`hub::access::View::key`). Not
-/// secret; equal for two viewers who read the same paths.
+/// server caches that viewer's projections (`hub::access::View::key`).
+/// Equal for two viewers who read the same paths. **Never sent to a
+/// client:** it hashes every access line's path, hidden ones included, so
+/// holding it confirms guesses of hidden folder names (BUG-1080).
 pub const HUB_VIEW_KEY: &str = "veil 2026 hub view-key v1";
 
 /// BLAKE3 `derive_key` context of a device's fingerprint, over its Ed25519
@@ -266,7 +277,7 @@ mod tests {
             "028e842fb2475981",
             "a signature context changed; that breaks existing signatures. Add a new constant instead."
         );
-        assert_eq!(SIG_CONTEXTS[5..], ["vault-entry", "tag", "hub-login", "hub-device", "hub-invite", "hub-share"], "a signature context changed or was reordered");
+        assert_eq!(SIG_CONTEXTS[5..], ["vault-entry", "tag", "hub-login", "hub-device", "hub-invite", "hub-share", "hub-grant", "hub-request"], "a signature context changed or was reordered");
         let labels = [
             WRAP_LABEL_PREFIX,
             PREV_KEY_LABEL_PREFIX,

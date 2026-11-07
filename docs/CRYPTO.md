@@ -251,9 +251,9 @@ Read forever; written only into format-1/2 repositories.
 
 `Ed25519(signing_key, SIG_PREFIX ‖ context ‖ 0x00 ‖ payload)`, contexts
 `snapshot`, `ring-change`, `member-binding`, `vault-entry`, `tag`,
-`hub-login`, `hub-device`, `hub-invite`, and the retired `embargo` and
-`embargo-release` (signed embargo records, formats 7 and earlier; reserved,
-never reused) (see the
+`hub-login`, `hub-device`, `hub-invite`, `hub-grant`, `hub-request`, and the
+retired `embargo` and `embargo-release` (signed embargo records, formats 7
+and earlier; reserved, never reused) (see the
 domains table). Payloads are fixed encodings (FORMAT.md §2, "signed bodies never
 change"). What a valid signature *means* (who may sign what) is decided
 against the ring log (ARCHITECTURE §3).
@@ -274,6 +274,16 @@ against the ring log (ARCHITECTURE §3).
   older atag of the same name and target, signed then, stays valid: a
   release tag is immutable, so replaying it restores what the signer
   signed.
+* **Read grants (`hub-grant`) and requests under them (`hub-request`).**
+  A grant's payload is its JSON body, and the signature is over those
+  bytes exactly as sent: the receiver verifies them, then parses them, and
+  never re-encodes, so no canonical JSON is needed. Unknown fields are
+  refused. A request's payload is fixed: the BLAKE3 hash of the grant's
+  body ‖ the time (i64 big-endian, unix ms) ‖ BLAKE3 of the object ids in
+  order (72 bytes). The grant key is its own Ed25519 key, not the server's
+  identity; neither signs in the other's context. *Limits:* a grant proves
+  only that the server decided; it is good for 10 minutes unless an access
+  epoch voids it, and a request may be replayed within its ±5 minutes.
 
 ### C6. Ring log hash chain and genesis proof (all) — custom, kept
 
@@ -544,6 +554,10 @@ are distinct and pins their exact bytes.
 | `SIG_CONTEXT_HUB_INVITE` | `hub-invite` | Ed25519 context (a join under an invite, by the invite's key, over `person ‖ 0 ‖ X25519 ‖ Ed25519` of the joining device, HUB.md §13.12) | C5, C13 |
 | `SIG_CONTEXT_HUB_SHARE` | `hub-share` | Ed25519 context (one version of a person-to-person secret share, by the sharing device, over `ShareRecord::signing_body`, HUB.md §13.17) | C5, C14 |
 | `HUB_VIEW_KEY` | `veil 2026 hub view-key v1` | BLAKE3 `derive_key` mode as a hash | server: projection cache key (not secret) |
+
+| `SIG_CONTEXT_HUB_GRANT` | `hub-grant` | Ed25519 context (a server's read grant, by its grant key, over the grant's JSON body as sent, HUB.md §13.16) | C5 |
+| `SIG_CONTEXT_HUB_REQUEST` | `hub-request` | Ed25519 context (a device's request under a read grant, over grant hash ‖ time ‖ BLAKE3 of the ids, HUB.md §13.16) | C5 |
+| `HUB_VIEW_KEY` | `veil 2026 hub view-key v1` | BLAKE3 `derive_key` mode as a hash | server: projection cache key. Never sent to a client: it hashes every access line's path, hidden ones included, so a client holding it could confirm guesses of hidden folder names (BUG-1080) |
 | `HUB_DEVICE_FINGERPRINT` | `veil 2026 hub device-fingerprint v1` | BLAKE3 `derive_key` mode as a hash (first 80 bits) | device fingerprint compared out of band (HUB.md §13.11) |
 | `HUB_UPLOAD_RECEIPT` | `veil 2026 hub upload-receipt v1` | BLAKE3 `derive_key` → keyed BLAKE3 (first 128 bits) | server: upload receipts over project ‖ person ‖ object id (HUB.md §13.5) |
 | `HUB_INVITE_KEY` | `veil 2026 hub invite-key v1` | BLAKE3 `derive_key` → Ed25519 seed | C13: an invite's signing key, from the link's 32 random bytes |

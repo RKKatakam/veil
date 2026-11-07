@@ -128,6 +128,33 @@ pub fn is_compressed(enc: &[u8]) -> bool {
     enc.first() == Some(&ZSTD)
 }
 
+/// How many first bytes of a stored encoding [`declared_len`] needs: the
+/// marker and the longest zstd frame header (18 bytes).
+pub const HEADER: usize = 32;
+
+/// The size an encoding says it decodes to, from its first bytes alone
+/// (`prefix`, at least [`HEADER`] bytes of it or all of it) and its stored
+/// length: a plain encoding is itself, a zstd frame declares its size in
+/// its header. Not checked: for bounding what reading it will hold, before
+/// reading it (the server's read-ahead, BUG-1087).
+pub fn declared_len(prefix: &[u8], stored_len: u64) -> Option<u64> {
+    match *prefix.first()? {
+        PLAIN => Some(stored_len),
+        ZSTD => header_content_size(&prefix[1..]),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "zstd")]
+fn header_content_size(header: &[u8]) -> Option<u64> {
+    zstd::zstd_safe::get_frame_content_size(header).ok()?
+}
+
+#[cfg(not(feature = "zstd"))]
+fn header_content_size(header: &[u8]) -> Option<u64> {
+    crate::pack::frame_content_size(header)
+}
+
 /// The size `enc` says it decodes to (a zstd frame's declared size), not
 /// checked: for sizing a buffer, never as a limit.
 pub fn decoded_len(enc: &[u8]) -> Option<u64> {
@@ -394,5 +421,15 @@ mod tests {
         }
         assert!(split_frames(&encoded[..encoded.len() - 1]).is_err());
         assert!(read_frames(&encoded[..35], 1 << 20).is_err());
+    }
+
+    #[test]
+    fn a_prefix_declares_what_an_encoding_decodes_to() {
+        let raw = [&b"veil:blob\n"[..], &b"abc ".repeat(4096)].concat();
+        let enc = encode(&raw);
+        assert!(is_compressed(&enc));
+        assert_eq!(declared_len(&enc[..HEADER.min(enc.len())], enc.len() as u64), Some(raw.len() as u64));
+        assert_eq!(declared_len(&raw[..HEADER], raw.len() as u64), Some(raw.len() as u64));
+        assert_eq!(declared_len(b"\x01xyz", 4), None);
     }
 }

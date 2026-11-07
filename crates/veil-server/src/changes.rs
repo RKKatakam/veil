@@ -260,7 +260,9 @@ fn entries(src: &Source, pr: &Projector, edits: &[Edit], uploaded: &HashSet<Obje
                 let (size, visibility) = match Object::sealed_scope(&raw) {
                     // The scope a secret is sealed under, without its key
                     // generation (`team#…`), as `vl` labels it.
-                    Some(label) => (0, Visibility::Cloaked { scope: label.split('#').next().unwrap_or_default().to_string() }),
+                    // Its stored length: the server cannot know the
+                    // plaintext's, and a recorded size bounds reads (BUG-1087).
+                    Some(label) => (raw.len() as u64, Visibility::Cloaked { scope: label.split('#').next().unwrap_or_default().to_string() }),
                     None if Object::is_blob_raw(&raw) => match Object::decode(&raw)? {
                         Object::Blob(b) => (b.len() as u64, Visibility::Public),
                         _ => unreachable!("a blob's encoding"),

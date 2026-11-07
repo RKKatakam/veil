@@ -70,7 +70,7 @@ pub fn root_snapshot_id() -> ObjectId {
 
 /// Every history starts at the universal root and its empty tree, which no
 /// project stores.
-fn builtin(id: &ObjectId) -> Option<Bytes> {
+pub(crate) fn builtin(id: &ObjectId) -> Option<Bytes> {
     let empty = Object::Tree(Tree::default()).encode();
     if *id == ObjectId::hash(&empty) {
         return Some(Bytes::from(empty));
@@ -617,64 +617,143 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
     .await?;
     // The answer: objects read concurrently (a remote store's latency would
     // otherwise add up one object at a time), at most `FETCH_WINDOW` of
-    // them and about `FETCH_WINDOW_BYTES` (by the sizes tree entries
-    // carry) ahead of the one sent next, framed in order and sent about a
-    // MiB at a time as the caller takes it.
+    // them and about `FETCH_WINDOW_BYTES` ahead of the one sent next, each
+    // counted by what reading it may hold (`Objects::read_cost`: the size
+    // its entry records, checked at push, or what its encoding declares)
+    // and taken from the server-wide `store::DECODED_IN_FLIGHT` (BUG-1087);
+    // an id asked for more than once is read once. Framed in order and
+    // sent about a MiB at a time as the caller takes it.
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     let (hub, pid) = (hub.clone(), project.id);
     tokio::spawn(async move {
+        use crate::store::ReadAhead;
         let stop = |e: Error| {
             // Details go to the server's log; the caller's answer ends in an
             // error, never taken as whole.
             eprintln!("veil-server: a fetch answer stopped: {e:?}");
             std::io::Error::other("the answer stopped")
         };
+        // What reading each id may hold, looked up once per id, 64 at a
+        // time.
+        let builtin_or_made = |id: &ObjectId| created.get(id).cloned().or_else(|| builtin(id));
+        let mut cost_of: HashMap<ObjectId, u64> = HashMap::new();
+        let mut lookups = tokio::task::JoinSet::new();
+        for (i, w) in wants.iter().enumerate() {
+            if cost_of.contains_key(&w.id) || builtin_or_made(&w.id).is_some() {
+                continue;
+            }
+            cost_of.insert(w.id, 0);
+            if lookups.len() >= FETCH_WINDOW {
+                match lookups.join_next().await {
+                    Some(Ok((id, Ok(c)))) => {
+                        cost_of.insert(id, c);
+                    }
+                    Some(Ok((_, Err(e)))) => return drop(tx.send(Err(stop(Error::Other(e)))).await),
+                    Some(Err(e)) => return drop(tx.send(Err(stop(Error::Other(e.into())))).await),
+                    None => {}
+                }
+            }
+            let (hub, id, recorded) = (hub.clone(), w.id, sizes[i]);
+            lookups.spawn(async move { (id, hub.objects.read_cost(pid, &id, recorded).await) });
+        }
+        while let Some(r) = lookups.join_next().await {
+            match r {
+                Ok((id, Ok(c))) => {
+                    cost_of.insert(id, c);
+                }
+                Ok((_, Err(e))) => return drop(tx.send(Err(stop(Error::Other(e)))).await),
+                Err(e) => return drop(tx.send(Err(stop(Error::Other(e.into())))).await),
+            }
+        }
         let mut set = tokio::task::JoinSet::new();
-        let mut ready: HashMap<usize, Bytes> = HashMap::new();
+        let mut ready: HashMap<usize, (Bytes, Option<ReadAhead>)> = HashMap::new();
+        // Each id read and not yet sent: its want's index. A later want of
+        // the same id inside the window is an alias: it is not read again,
+        // and the bytes (and their share of the budget) are kept in `kept`
+        // from the read's frame to the last alias's.
+        let mut reading: HashMap<ObjectId, usize> = HashMap::new();
+        let mut aliases: HashMap<ObjectId, usize> = HashMap::new();
+        let mut is_alias = vec![false; wants.len()];
+        let mut kept: HashMap<ObjectId, (Bytes, Option<ReadAhead>)> = HashMap::new();
+        let mut cost = vec![0u64; wants.len()];
         let (mut next, mut sent, mut ahead) = (0usize, 0usize, 0u64);
         let mut out = Vec::new();
         while sent < wants.len() {
-            while next < wants.len() && next - sent < FETCH_WINDOW && (next == sent || ahead + sizes[next] <= FETCH_WINDOW_BYTES) {
+            while next < wants.len() && next - sent < FETCH_WINDOW {
                 let id = wants[next].id;
-                match created.get(&id).cloned().or_else(|| builtin(&id)) {
-                    Some(raw) => {
-                        ready.insert(next, raw);
+                if let Some(raw) = builtin_or_made(&id) {
+                    ready.insert(next, (raw, None));
+                } else if reading.contains_key(&id) || kept.contains_key(&id) {
+                    is_alias[next] = true;
+                    *aliases.entry(id).or_default() += 1;
+                } else {
+                    cost[next] = cost_of[&id];
+                    if next != sent && ahead + cost[next] > FETCH_WINDOW_BYTES {
+                        break;
                     }
-                    None => {
-                        let (hub, i) = (hub.clone(), next);
-                        set.spawn(async move {
-                            let got = match encoded {
-                                true => hub.objects.get_encoded(pid, &id).await,
-                                false => hub.objects.get(pid, &id).await,
-                            };
-                            (i, got)
-                        });
-                    }
+                    // Wait for the budget only while holding none of it (an
+                    // empty window holds nothing, `kept` included).
+                    let taken = if next == sent {
+                        ReadAhead::wait(cost[next]).await
+                    } else {
+                        match ReadAhead::try_take(cost[next]) {
+                            Some(t) => t,
+                            None => break,
+                        }
+                    };
+                    reading.insert(id, next);
+                    let (hub, i) = (hub.clone(), next);
+                    set.spawn(async move {
+                        let got = match encoded {
+                            true => hub.objects.get_encoded(pid, &id).await,
+                            false => hub.objects.get(pid, &id).await,
+                        };
+                        (i, got, taken)
+                    });
                 }
-                ahead += sizes[next];
+                ahead += cost[next];
                 next += 1;
             }
-            while !ready.contains_key(&sent) {
-                let got = match set.join_next().await {
-                    Some(Ok((i, Ok(Some(raw))))) => Ok((i, raw)),
-                    Some(Ok((i, Ok(None)))) => Err(Error::Other(anyhow::anyhow!("object {} is not stored", wants[i].id.short()))),
-                    Some(Ok((_, Err(e)))) => Err(Error::Other(e)),
-                    Some(Err(e)) => Err(Error::Other(e.into())),
-                    None => Err(Error::Other(anyhow::anyhow!("a fetch read went missing"))),
-                };
-                match got {
-                    Ok((i, raw)) => {
-                        ready.insert(i, raw);
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(stop(e))).await;
-                        return;
+            let id = wants[sent].id;
+            let raw = if is_alias[sent] {
+                let raw = kept.get(&id).expect("an alias's bytes are kept until it is sent").0.clone();
+                let n = aliases.get_mut(&id).expect("counted");
+                *n -= 1;
+                if *n == 0 {
+                    aliases.remove(&id);
+                    kept.remove(&id);
+                }
+                raw
+            } else {
+                while !ready.contains_key(&sent) {
+                    let got = match set.join_next().await {
+                        Some(Ok((i, Ok(Some(raw)), taken))) => Ok((i, raw, taken)),
+                        Some(Ok((i, Ok(None), _))) => Err(Error::Other(anyhow::anyhow!("object {} is not stored", wants[i].id.short()))),
+                        Some(Ok((_, Err(e), _))) => Err(Error::Other(e)),
+                        Some(Err(e)) => Err(Error::Other(e.into())),
+                        None => Err(Error::Other(anyhow::anyhow!("a fetch read went missing"))),
+                    };
+                    match got {
+                        Ok((i, raw, taken)) => {
+                            ready.insert(i, (raw, Some(taken)));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(stop(e))).await;
+                            return;
+                        }
                     }
                 }
-            }
-            let raw = ready.remove(&sent).expect("ready");
-            put_frame(&mut out, &wants[sent].id, &raw);
-            ahead -= sizes[sent];
+                let (raw, taken) = ready.remove(&sent).expect("ready");
+                if reading.get(&id) == Some(&sent) {
+                    reading.remove(&id);
+                    if aliases.contains_key(&id) {
+                        kept.insert(id, (raw.clone(), taken));
+                    }
+                }
+                raw
+            };
+            put_frame(&mut out, &id, &raw);
+            ahead -= cost[sent];
             sent += 1;
             if out.len() >= 1 << 20 && tx.send(Ok(Bytes::from(std::mem::take(&mut out)))).await.is_err() {
                 return;
@@ -693,7 +772,7 @@ const FETCH_WINDOW: usize = 64;
 const FETCH_WINDOW_BYTES: u64 = 8 << 20;
 
 /// An answer of object frames, sent as [`fetch`] reads them.
-pub struct FrameStream(tokio::sync::mpsc::Receiver<std::result::Result<Bytes, std::io::Error>>);
+pub struct FrameStream(pub(crate) tokio::sync::mpsc::Receiver<std::result::Result<Bytes, std::io::Error>>);
 
 impl hyper::body::Body for FrameStream {
     type Data = Bytes;
@@ -909,10 +988,10 @@ fn check_changes(
         }
         // The content to check: a file's or link's blob, or each term of a
         // conflict, with its label (BUG-931).
-        let contents: Vec<(ObjectId, Visibility)> = match e.kind {
-            k if k.holds_blob() => vec![(e.id, e.visibility.clone())],
+        let contents: Vec<(ObjectId, Visibility, u64)> = match e.kind {
+            k if k.holds_blob() => vec![(e.id, e.visibility.clone(), e.size)],
             EntryKind::Conflict => match Object::decode(&src.raw(&e.id)?)? {
-                Object::Conflict(cf) => cf.adds.iter().chain(&cf.removes).flatten().map(|t| (t.id, t.visibility.clone())).collect(),
+                Object::Conflict(cf) => cf.adds.iter().chain(&cf.removes).flatten().map(|t| (t.id, t.visibility.clone(), t.size)).collect(),
                 _ => return Err(Error::bad_request(format!("'{}': a conflict entry names something else", c.path))),
             },
             _ => continue,
@@ -923,8 +1002,16 @@ fn check_changes(
         // accepted policy (an admin's), or in an admin's own change: anyone
         // may turn `public` into `public!`, which is the same access.
         let unscanned = class.allow_secrets && (admin || accepted.classify(&vp, false).allow_secrets);
-        for (id, visibility) in contents {
+        for (id, visibility, size) in contents {
             let raw = src.raw(&id)?;
+            // The size an entry records bounds what reading its object
+            // holds (`store::Objects::read_cost`, BUG-1087).
+            if raw.len() as u64 > size.saturating_add(crate::store::SIZE_SLACK) {
+                return Err(Error::bad_request(format!(
+                    "'{}': its entry records {size} bytes, less than its content holds",
+                    c.path
+                )));
+            }
             let sealed = Object::sealed_scope(&raw).is_some();
             match class.tier {
                 Tier::Isolated | Tier::Ignored => {
@@ -1637,8 +1724,8 @@ async fn put_many(hub: &Arc<Hub>, project: i64, objects: impl IntoIterator<Item 
 
 /// Bytes decoded from compressed uploads the server holds at once, across
 /// every request (BUG-1009); an object larger than this takes all of it.
-pub const DECODING_IN_FLIGHT: u32 = 256 << 20;
-static DECODING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(DECODING_IN_FLIGHT as usize);
+pub use crate::store::DECODED_IN_FLIGHT as DECODING_IN_FLIGHT;
+use crate::store::DECODED as DECODING;
 
 /// Most object writes one request has in flight ([`put_all`]).
 pub const PUTS_AT_ONCE: usize = 64;

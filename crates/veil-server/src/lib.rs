@@ -10,6 +10,7 @@
 //! | [`shares`] | person-to-person secret shares (ciphertext and the admins' audit) |
 //! | [`sync`] | projected history, fetch by id, push validation, branch CAS |
 //! | [`changes`] | commits through the API: edits on a revision, the push's checks, one commit |
+//! | [`grant`] | read grants, the object routes, the access-epoch feed |
 //! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
 //! | [`store`] | object storage: local directory or S3 |
@@ -22,6 +23,7 @@ pub mod changes;
 pub mod db;
 pub mod derive;
 pub mod error;
+pub mod grant;
 pub mod perm;
 pub mod shares;
 pub mod store;
@@ -54,6 +56,9 @@ pub struct Hub {
     /// The MAC key of upload receipts (`sync::receipt`), derived from the
     /// random secret in `<data>/hub-receipt-key`.
     pub receipt_key: [u8; 32],
+    /// The grant key (`<data>/hub-grant-key`) and what it needs
+    /// (`grant`).
+    pub grants: grant::Grants,
     pub session_ttl_ms: i64,
     /// The TLS certificate (leaf, DER): sign-in accepts only signatures
     /// for a server name it is valid for.
@@ -144,6 +149,7 @@ pub async fn start(config: Config) -> Result<Running> {
     std::fs::create_dir_all(&config.data_dir)?;
     let identity = server_identity(&config.data_dir)?;
     let receipt_key = receipt_key(&config.data_dir)?;
+    let grants = grant::Grants::load(&config.data_dir).context("reading hub-grant-key")?;
     let (tls, cert_pem, certificate) = tls::server_config(&config.tls, &config.data_dir)?;
     let db = db::connect(&config.database_url, config.db_connections).await.context("connecting to the database")?;
     db::migrate(&db).await.context("migrating the database")?;
@@ -170,6 +176,7 @@ pub async fn start(config: Config) -> Result<Running> {
         trees: LruCache::new(256 << 20),
         identity,
         receipt_key,
+        grants,
         session_ttl_ms: config.session_ttl.as_millis() as i64,
         certificate,
         caches: caches::Caches::default(),

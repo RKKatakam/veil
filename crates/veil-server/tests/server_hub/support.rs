@@ -351,6 +351,23 @@ impl Api {
         Self::finish(r.call())
     }
 
+    /// GET with extra headers (the object routes' `Veil-Grant`, …).
+    pub fn get_with(&self, path: &str, headers: &[(&str, &str)]) -> Reply {
+        let mut r = self.agent.get(format!("{}{path}", self.base));
+        for (k, v) in headers {
+            r = r.header(*k, *v);
+        }
+        Self::finish(r.call())
+    }
+
+    pub fn delete(&self, token: Option<&str>, path: &str) -> Reply {
+        let mut r = self.agent.delete(format!("{}{path}", self.base));
+        if let Some(t) = token {
+            r = r.header("authorization", &format!("Bearer {t}"));
+        }
+        Self::finish(r.call())
+    }
+
     pub fn agent_delete(&self, token: &str, path: &str) -> Reply {
         Self::finish(self.agent.delete(format!("{}{path}", self.base)).header("authorization", &format!("Bearer {token}")).call())
     }
@@ -366,6 +383,11 @@ impl Api {
 
     pub fn post_json(&self, token: Option<&str>, path: &str, v: &serde_json::Value) -> Reply {
         self.post(token, path, &serde_json::to_vec(v).unwrap(), true)
+    }
+
+    /// POST JSON, leaving the answer's body unread (a client that stalls).
+    pub fn post_unread(&self, path: &str, body: &[u8]) -> ureq::http::Response<ureq::Body> {
+        self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json").send(body).unwrap()
     }
 
     /// POST JSON as a `vl` that reads encoded frames (compressed objects).
@@ -704,6 +726,12 @@ impl<'a> Craft<'a> {
 
     /// [`Craft::set`] with an entry of `kind` (a conflict, say).
     pub fn set_kind(&mut self, path: &str, object: O, kind: K, vis: Visibility) {
+        // What `vl` records: a file's content length (the server refuses an
+        // entry recording less than its object holds, BUG-1087).
+        let size = match &object {
+            O::Blob(b) => b.len() as u64,
+            o => o.encode().len() as u64,
+        };
         let id = self.put(object);
         let parts: Vec<&str> = path.split('/').collect();
         let entry = TreeEntry {
@@ -711,7 +739,7 @@ impl<'a> Craft<'a> {
             kind,
             id,
             // A conflict entry carries no size (its terms do).
-            size: u64::from(kind != K::Conflict),
+            size: if kind == K::Conflict { 0 } else { size },
             executable: false,
             visibility: vis,
         };
