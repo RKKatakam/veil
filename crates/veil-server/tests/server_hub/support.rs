@@ -67,6 +67,9 @@ impl TestHub {
             data_dir: dir.path().join("data"),
             session_ttl: ttl,
             db_connections: 16,
+            // Tests count their own derive runs; `derived.rs` checks the
+            // start-up catch-up by calling it.
+            catch_up_at_start: false,
         };
         let running = rt.block_on(veil_server::start(config)).expect("server starts");
         let ca = dir.path().join("data/self-signed-cert.pem");

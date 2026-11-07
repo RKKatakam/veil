@@ -816,7 +816,10 @@ CAS, and it applies these rules in order:
      not searched by the assignment rule (whose regexes are compiled only
      for the first chunk with one: they take more time to compile than
      the rest of a one-file commit; the token rules compile on another
-     thread while the command starts, `secrets::prepare`), and the search is limited to
+     thread while the command starts, `secrets::prepare`, and only text
+     holding one of their literals is searched for tokens at all:
+     `TOKEN_LITERALS`, which a test checks against the prefixes each
+     rule's pattern allows), and the search is limited to
      from the first to 16 KiB past the line of the last. On each line with
      a keyword, the `:`/`=` that ends a configuration key is replaced by a
      stand-in (`C`/`E`, upper-case letters never occur in the lowercased
@@ -2128,6 +2131,17 @@ attached.
   generation clock it is 0. A file written in the same tick it was verified
   is therefore re-read on the next run, which records a later `verified_at`.
   A file with a future stamp is never trusted.
+* **Listed ahead** (`prefetch.rs`, performance round 3). On a disk, a
+  working copy of more than 250 files (as the cache counted them) has its
+  directories listed on up to 7 threads while the walk runs: each listing
+  stats its files relative to the open directory (`DirListing::stats`),
+  classifies them against the policy, and loads the directory's tree from
+  the parent snapshot. The walk takes a listing that is ready, waits for one
+  being made, or lists the directory itself; the workers start after the
+  run's clock reading and never descend where the walk does not (ignored
+  directories, nested repositories, `.veil`). Every listing is one
+  observation of the directory taken before its files are read, as the
+  walk's own would be, so nothing it decides changes.
 * **Checkout invalidates** every path it writes or removes. It does not
   insert records for what it wrote: through the generic backend API it
   cannot stat *the* file it wrote, so a concurrent edit between the write and
@@ -2793,16 +2807,26 @@ take no lock:
   objects, larger ones, and every object in memory (`MemoryBackend`,
   where a loose object costs nothing) are loose objects in the
   transaction's own directory, `objects/incoming/tx-<owner>/`
-  (`ObjectStore::begin_tx_staging`), which only it reads. At commit: one
-  barrier (a failure removes the directory,
-  and nobody can have adopted those objects), each object renamed over its
-  final name (`rename_unsynced`; content-addressed, so replacing a
+  (`ObjectStore::begin_tx_staging`), which only it reads. The operation
+  it records, and its empty head file, are staged there too
+  (`stage_unsynced`: the staging directory itself is never synced, since
+  nothing ever names a file in it). At commit: one barrier makes every
+  staged file's content durable (a failure removes the directory, and
+  nobody can have adopted those objects); each object is renamed over its
+  final name (`publish_unsynced`; content-addressed, so replacing a
   concurrent identical copy is harmless), then a second barrier over every
   fan-out directory touched and every fan-out directory of an object the
   transaction found already present instead of writing it (another
-  process's rename may not be durable yet). Only then the operation. So an
-  operation references only objects that were published after their
-  writer's successful barrier (BUG-044's class, across processes). A
+  process's rename may not be durable yet), each on a thread of its own;
+  then the operation is renamed into `ops/` and a third barrier syncs that
+  directory; then the head file is renamed into `op_heads/` and a fourth
+  barrier syncs it (`OpStore::publish_staged`). Each name becomes durable
+  only after everything it depends on did: an operation names only objects
+  published after their writer's successful barrier (BUG-044's class,
+  across processes), and a head only an operation already durable. A
+  transaction superseded at its compare-and-swap removes the operation it
+  staged with the directory (nothing named it). Four barriers in sequence,
+  where there were about twenty (performance round 3). A
   transaction whose staging overlapped a failed barrier of another one on
   the same backend value (they share its write batch) voids itself
   (`StorageBackend::barrier_failures`). A dropped transaction publishes what
@@ -2864,9 +2888,13 @@ take no lock:
 
 **Crash ordering.** Every transaction writes in this order: objects (the
 snapshot, trees and blobs it references), then a durability barrier, then
-the operation, then `op_head` (format 6: staged objects, a barrier, their
-renames, a second barrier, the operation, its head file, the removal of its
-parents' head files). Pull and push copy objects and shared metadata
+the operation, then `op_head` (format 6: the objects, the operation and its
+empty head file staged, a barrier, the objects' renames, a barrier, the
+operation's rename, a barrier, the head file's rename, a barrier, the
+removal of its parents' head files). The crash harness tears what no
+barrier covered, drops staged names, and keeps the unsynced renames of
+every other directory, so that a name made durable before what it depends
+on fails `crash_during_one_operation_commit` and the other sweeps. Pull and push copy objects and shared metadata
 (key rings, embargo records) before the operation that references them.
 `init` writes `repo.json` last, because it is what makes a directory a
 repository.

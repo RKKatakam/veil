@@ -399,8 +399,24 @@ pub struct Rule {
 }
 
 /// The built-in rules, and their glob set, compiled once.
+static BUILTIN: std::sync::OnceLock<(Vec<Rule>, GlobSet)> = std::sync::OnceLock::new();
+
+/// Compile the built-in rules on another thread, for a command that is
+/// about to read the policy (half a millisecond, which the work before
+/// overlaps); one that reads it first waits for that compilation instead
+/// of starting its own (`OnceLock`). A thread that cannot start changes
+/// nothing.
+#[cfg(feature = "os")]
+pub fn prepare() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if BUILTIN.get().is_none() && !STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let _ = std::thread::Builder::new().name("veil-policy".into()).spawn(|| {
+            builtin_rules();
+        });
+    }
+}
+
 fn builtin_rules() -> &'static (Vec<Rule>, GlobSet) {
-    static BUILTIN: std::sync::OnceLock<(Vec<Rule>, GlobSet)> = std::sync::OnceLock::new();
     BUILTIN.get_or_init(|| {
         let mut rules = Vec::new();
         for p in BUILTIN_SECRETS {
