@@ -726,6 +726,12 @@ impl<'a> Craft<'a> {
 
     /// [`Craft::set`] with an entry of `kind` (a conflict, say).
     pub fn set_kind(&mut self, path: &str, object: O, kind: K, vis: Visibility) {
+        // What `vl` records: a file's content length (the server refuses an
+        // entry recording less than its object holds, BUG-1087).
+        let size = match &object {
+            O::Blob(b) => b.len() as u64,
+            o => o.encode().len() as u64,
+        };
         let id = self.put(object);
         let parts: Vec<&str> = path.split('/').collect();
         let entry = TreeEntry {
@@ -733,7 +739,7 @@ impl<'a> Craft<'a> {
             kind,
             id,
             // A conflict entry carries no size (its terms do).
-            size: u64::from(kind != K::Conflict),
+            size: if kind == K::Conflict { 0 } else { size },
             executable: false,
             visibility: vis,
         };
