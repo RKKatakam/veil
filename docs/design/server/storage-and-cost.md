@@ -26,7 +26,7 @@ Each of those is also time on the request path. So every item here makes Veil **
 
 ## 3. One database commit per push (S4)
 
-> **Built** (S4, `HUB.md` §13.13): one commit per landing, measured by `veil-bench load`.
+> **Built** (S4, `HUB.md` §13.14): one commit per landing, measured by `veil-bench load`.
 
 - The push's transaction writes **everything at once:** the snapshot rows, the origin and audit rows, and the one-row compare-and-swap that moves the branch.
 - **Per-viewer views are worked out after the commit, in the background** (as S12's deriver already runs after a landing).
@@ -35,7 +35,7 @@ Each of those is also time on the request path. So every item here makes Veil **
 
 ## 4. Request-path caches (S4)
 
-> **Built** (S4, `HUB.md` §13.13): versioned by access epochs that database triggers bump; every request reads its epochs, so staleness is zero. Tested with two servers on one database.
+> **Built** (S4, `HUB.md` §13.14): versioned by access epochs that database triggers bump; every request reads its epochs, so staleness is zero. Tested with two servers on one database.
 
 In each API server's memory, never in the database:
 - **sessions:** sign-in token → person and device;
@@ -50,7 +50,7 @@ In each API server's memory, never in the database:
 
 ## 5. "Nothing changed" without a hot row
 
-> **Built** (S4, `HUB.md` §13.13) with `LISTEN`/`NOTIFY` on PostgreSQL. On YugabyteDB 2025.2 with default flags the server finds notices are not delivered and relies on the 100 ms expiry; the change feed is not used.
+> **Built** (S4, `HUB.md` §13.14) with `LISTEN`/`NOTIFY` on PostgreSQL. On YugabyteDB 2025.2 with default flags the server finds notices are not delivered and relies on the 100 ms expiry; the change feed is not used.
 
 - Each server keeps each project's **tips in memory**. Every push tells every server to drop its copy.
 - **Not a version counter per project:** one row that every push updates becomes a new hot spot, and database sequences can commit out of order.

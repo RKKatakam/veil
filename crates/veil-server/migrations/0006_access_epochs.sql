@@ -1,4 +1,4 @@
--- Access epochs (docs/HUB.md §13.13; docs/design/server/phase-2-thin-clients.md
+-- Access epochs (docs/HUB.md §13.14; docs/design/server/phase-2-thin-clients.md
 -- §4.4, §5.2): the one record of access changes, for every server's caches
 -- (S4) and for read grants (S5). Every server caches sessions and
 -- permissions in memory and checks them, on every request, against these

@@ -84,7 +84,12 @@ impl TestHub {
     }
 
     fn run(config: Config, dir: tempfile::TempDir) -> TestHub {
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(8).build().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(8)
+            .thread_stack_size(veil_server::THREAD_STACK)
+            .build()
+            .unwrap();
         let running = rt.block_on(veil_server::start(config.clone())).expect("server starts");
         let ca = config.data_dir.join("self-signed-cert.pem");
         TestHub {
@@ -633,7 +638,7 @@ impl<'a> Craft<'a> {
         }
     }
 
-    fn put(&mut self, o: O) -> ObjectId {
+    pub fn put(&mut self, o: O) -> ObjectId {
         let raw = o.encode_with(TreeEncoding::Binary);
         let id = ObjectId::hash(&raw);
         self.objects.push((id, raw));
@@ -643,13 +648,19 @@ impl<'a> Craft<'a> {
     /// Set `path` to an object (`raw`) with `vis`: plain, or sealed under a
     /// scope label.
     pub fn set(&mut self, path: &str, object: O, vis: Visibility) {
+        self.set_kind(path, object, K::File, vis)
+    }
+
+    /// [`Craft::set`] with an entry of `kind` (a conflict, say).
+    pub fn set_kind(&mut self, path: &str, object: O, kind: K, vis: Visibility) {
         let id = self.put(object);
         let parts: Vec<&str> = path.split('/').collect();
         let entry = TreeEntry {
             name: parts.last().unwrap().to_string(),
-            kind: K::File,
+            kind,
             id,
-            size: 1,
+            // A conflict entry carries no size (its terms do).
+            size: u64::from(kind != K::Conflict),
             executable: false,
             visibility: vis,
         };

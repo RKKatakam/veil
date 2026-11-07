@@ -73,8 +73,16 @@ fn database_url(given: Option<String>) -> anyhow::Result<String> {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Deep trees recurse on every server thread (BUG-1052).
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(veil_server::THREAD_STACK)
+        .build()?
+        .block_on(serve())
+}
+
+async fn serve() -> anyhow::Result<()> {
     let a = Args::parse();
     if let Some(Command::Migrate { database_url: url }) = a.command {
         let db = veil_server::db::connect(&database_url(url)?, 2).await?;

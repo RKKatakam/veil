@@ -1,4 +1,4 @@
-//! Request-path caches (`docs/HUB.md` §13.13;
+//! Request-path caches (`docs/HUB.md` §13.14;
 //! `docs/design/server/storage-and-cost.md` §4, §5): sessions, permissions,
 //! snapshot resolution and branch tips, in each server's memory.
 //!

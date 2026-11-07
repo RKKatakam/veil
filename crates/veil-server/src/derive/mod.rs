@@ -212,6 +212,7 @@ fn cx(hub: &Arc<Hub>, project: i64) -> Cx {
             hub: hub.clone(),
             project,
             rt: tokio::runtime::Handle::current(),
+            pending: Default::default(),
         },
     }
 }

@@ -8,7 +8,7 @@
 //! veil-bench report RESULTS.json
 //! veil-bench openscion --vl PATH --server PATH --database-url URL [--s3-…] --dir DIR --out RESULTS.json
 //! veil-bench openscion-memory --out RESULTS.json
-//! veil-bench load --mode pull|land|branches (--server PATH --database-url URL | --url URL [--ca PEM])
+//! veil-bench load --mode pull|land|branches|api (--server PATH --database-url URL | --url URL [--ca PEM])
 //!                 --projects 1,10 --clients 10,100 [--rates 0.35,3.5,max] --out RESULTS.json
 //! ```
 //!
@@ -120,7 +120,9 @@ enum Cmd {
     /// point of each curve (docs/design/scale/LOAD.md).
     Load {
         /// `pull` (agents pull in a closed loop), `land` (agents land
-        /// changes on `main`) or `branches` (each on a branch of its own).
+        /// changes on `main` by pull and push), `branches` (each on a
+        /// branch of its own) or `api` (agents land them through
+        /// `POST …/changes`, letting the server rebase).
         #[arg(long)]
         mode: String,
         /// A running server (`https://host:port`); else `--server` starts one here.
@@ -319,7 +321,8 @@ fn main() -> Result<()> {
                 "pull" => load::Mode::Pull,
                 "land" => load::Mode::Land,
                 "branches" => load::Mode::Branches,
-                m => return Err(anyhow!("--mode {m}: pull, land or branches")),
+                "api" => load::Mode::Api,
+                m => return Err(anyhow!("--mode {m}: pull, land, branches or api")),
             };
             let rates = rates.iter().map(|r| r.parse::<load::Rate>().map_err(|e| anyhow!(e))).collect::<Result<_>>()?;
             let v = load::run_all(&load::Args {
