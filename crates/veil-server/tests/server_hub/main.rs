@@ -25,6 +25,7 @@ mod adversarial_s10;
 mod projects;
 mod shares;
 mod derived;
+mod query;
 mod startup;
 mod grants;
 mod caches;

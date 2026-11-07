@@ -12,6 +12,7 @@
 //! | [`changes`] | commits through the API: edits on a revision, the push's checks, one commit |
 //! | [`grant`] | read grants, the object routes, the access-epoch feed |
 //! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
+//! | [`query`] | the query API: history answered per viewer (S13) |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
 //! | [`store`] | object storage: local directory or S3 |
 //! | [`tls`] | TLS configuration |
@@ -25,6 +26,7 @@ pub mod derive;
 pub mod error;
 pub mod grant;
 pub mod perm;
+pub mod query;
 pub mod shares;
 pub mod store;
 pub mod sync;
@@ -67,6 +69,9 @@ pub struct Hub {
     pub caches: caches::Caches,
     /// The derive workers (`derive::landed`).
     pub derive: derive::Workers,
+    /// The query API's caches and the viewer-graph fills running here
+    /// (`query::graph`).
+    pub query: query::graph::State,
 }
 
 pub type HubState = Arc<Hub>;
@@ -181,6 +186,7 @@ pub async fn start(config: Config) -> Result<Running> {
         certificate,
         caches: caches::Caches::default(),
         derive: derive::Workers::new(derive_db),
+        query: query::graph::State::default(),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;

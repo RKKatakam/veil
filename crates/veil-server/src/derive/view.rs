@@ -1,7 +1,10 @@
-//! Derived data as one viewer may see it: the internal reads that S13's
-//! query routes will serve from. Every answer is in **real** snapshot ids;
-//! mapping them to the viewer's projected ids (`sync::projected`) is the
-//! query layer's last step. A viewer's answer depends only on what they may
+//! Derived data as one viewer may see it: the internal reads of the
+//! per-path indexes (blame, file history and search build on them: S14,
+//! S15). The query API of S13 does not use them: it walks each viewer's own
+//! graph (`crate::query::graph`), whose order and cost depend on nothing
+//! hidden. Every answer here is in **real** snapshot ids; mapping them to
+//! the viewer's projected ids (`sync::projected`) is the caller's last
+//! step. A viewer's answer depends only on what they may
 //! read, so it equals the answer computed on a project holding only their
 //! projected history (the projection-equivalence test,
 //! `tests/server_hub/derived.rs`).
@@ -14,7 +17,7 @@
 //!   added file's sources are only those they may read.
 //! * [`Reader::merge_bases`] answers on the viewer's projected graph.
 //!
-//! **Not yet timing-safe** (design §6, row 4, for S13): `visible` and `rep`
+//! **Not timing-safe** (design §6, row 4): `visible` and `rep`
 //! walk hidden snapshots between visible ones, and `changes` decodes the
 //! whole changed-paths object of a mixed change. Answers never depend on
 //! hidden data; their cost does.

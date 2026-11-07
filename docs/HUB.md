@@ -8,8 +8,10 @@ sync with fetch on demand, enforcement and secrets sealed on the device.
 **§13 records what was built and every decision S1 made**; where §1–§12
 propose something §13 decided otherwise, §13 is what runs. Later
 milestones are in §13.9; **S12** (derived history data: commit graph,
-changed paths, per-rule lists; no query API yet) is built too, recorded
-in `docs/design/server/phase-3-server-history.md` §10. Statements about what Veil does today cite the
+changed paths, per-rule lists) and **S13** (the query API: log, show,
+tree, file, diff and ancestry, answered on each viewer's projected
+history) are built too, recorded in
+`docs/design/server/phase-3-server-history.md` §10 and §11. Statements about what Veil does today cite the
 document or source file they come from; everything else is a proposal and
 is worded as one.
 
@@ -329,6 +331,7 @@ server keeps the shape and replaces the lock with the compare-and-swap.
 | Pack size per upload | 2 GiB (larger: split) | memory |
 | Single object | 4 GiB | `VEIL_MAX_OBJECT` today |
 | Tree depth | 1,024 | `MAX_TREE_DEPTH` |
+| Parents of one snapshot | 64 (built: `sync::MAX_PARENTS`, refused at push and at API commits) | a walk of history reads every parent of a snapshot in one step (BUG-1078) |
 | Landings per agent | per project setting | one runaway agent can't starve the rest |
 
 `error` frames carry `retry_after_ms`. Anonymous reads of `public` folders
@@ -976,6 +979,7 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 | `POST /v1/devices/remove {device, project?}` | remove a device: its person, from another device, everywhere (its sessions end); or an admin of `project` where the person takes part, from that project only (§13.12, BUG-843) |
 | `POST …/invites {key, person, group, expires_at}`, `POST …/invites/join {key, device, signature}` | an admin records an invite's public key; the signed-in device joins under it, once, before it expires (§13.12) |
 | `GET …/keys/pending` | the people whose devices may wait for keys, with their devices, vouches, joins and removed devices: a hint for the devices that share keys (§13.12) |
+| `GET …/q/log`, `…/q/show`, `…/q/tree`, `…/q/file`, `…/q/diff`, `POST …/q/ancestry` | history answered by the server, on the caller's projected history only (S13: `docs/design/server/phase-3-server-history.md` §11) |
 
 * **Fetch on demand (Scion):** `vl` asks for the tips, the snapshots it
   lacks, then trees from the root down and the files it needs, one request

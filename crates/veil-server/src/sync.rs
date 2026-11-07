@@ -54,6 +54,9 @@ use crate::{
 
 /// Most new snapshots one push may carry.
 pub const MAX_PUSH_SNAPSHOTS: usize = 100_000;
+/// Most parents of one snapshot (BUG-1078): a walk of history reads every
+/// parent of each snapshot it passes, in one step.
+pub const MAX_PARENTS: usize = 64;
 /// Most branch updates one push may carry (BUG-913).
 pub const MAX_PUSH_UPDATES: usize = 1_000;
 /// Most branches one project may have (BUG-913): work lives as changes and
@@ -1099,6 +1102,9 @@ pub(crate) fn complete(
     rp: &[ObjectId],
     identity: &veil_core::Identity,
 ) -> Result<Completed> {
+    if rp.len() > MAX_PARENTS {
+        return Err(Error::bad_request(format!("a snapshot may have at most {MAX_PARENTS} parents")));
+    }
     let admin = viewer.admin;
     let view = p.view(viewer);
     let ptrees: Vec<ObjectId> = rp.iter().map(|p| Ok(src.snapshot(p)?.tree)).collect::<Result<_>>()?;
