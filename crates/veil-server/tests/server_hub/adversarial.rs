@@ -729,3 +729,63 @@ fn a_view_without_the_policy_never_seals_a_local_only_file() {
     assert!(!got.contains("MARKER-FINS-OWN-NETRC-5b1e"), "fin's local-only credential was sealed and pushed: {got:?}");
     assert!(got.contains("theirs"), "{got:?}");
 }
+
+/// The server bounds the memory its requests' bodies take, all of them at
+/// once. Each request's body is buffered whole before anything checks it
+/// (`db::retry_requests`, up to 64 MiB a request, `db::body_limit`), and
+/// nothing bounds how many are buffered at once: 8 clients (anyone on
+/// Earth, no session) that each send 56 MiB of a body and stop grow the
+/// server by about 450 MiB. Pre-existing (S1); milestone S24.
+#[test]
+#[ignore = "BUG-1187: the server buffers request bodies of up to 64 MiB each, any number at once"]
+fn bug_1187_request_bodies_are_buffered_without_a_bound_on_how_many() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering::Relaxed},
+        Arc,
+    };
+    struct Stops {
+        left: usize,
+        gate: std::sync::mpsc::Receiver<()>,
+        sent: Arc<AtomicUsize>,
+    }
+    impl Read for Stops {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.left == 0 {
+                let _ = self.gate.recv();
+                return Err(std::io::Error::other("the client went away"));
+            }
+            let n = buf.len().min(self.left).min(64 << 10);
+            buf[..n].fill(b' ');
+            self.left -= n;
+            self.sent.fetch_add(n, Relaxed);
+            Ok(n)
+        }
+    }
+    let rss = || {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        let kib: usize = s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)).unwrap().parse().unwrap();
+        kib << 10
+    };
+    let hub = TestHub::start();
+    let (n, len) = (8, 56usize << 20);
+    let sent = Arc::new(AtomicUsize::new(0));
+    std::thread::sleep(Duration::from_secs(1));
+    let before = rss();
+    let gates: Vec<_> = (0..n)
+        .map(|_| {
+            let (tx, gate) = std::sync::mpsc::channel::<()>();
+            let (api, sent) = (hub.api(), sent.clone());
+            std::thread::spawn(move || drop(api.post_reader("/v1/objects/anything:batch", Stops { left: len, gate, sent })));
+            tx
+        })
+        .collect();
+    let t = Instant::now();
+    while sent.load(Relaxed) < n * len && t.elapsed() < Duration::from_secs(60) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    let grew = rss().saturating_sub(before) >> 20;
+    drop(gates);
+    eprintln!("server: {n} request bodies of {} MiB, stopped before their end: RSS +{grew} MiB", len >> 20);
+    assert!(grew <= 128, "{n} unfinished request bodies grew the server by {grew} MiB");
+}

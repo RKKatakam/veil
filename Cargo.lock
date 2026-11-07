@@ -3080,6 +3080,8 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rcgen",
+ "regex",
+ "regex-syntax",
  "reqwest",
  "rustls",
  "rustls-webpki",

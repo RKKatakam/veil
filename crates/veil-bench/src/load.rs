@@ -40,6 +40,18 @@
 //! project (`a/NNNN`, made from `main` by its first push): pushes never
 //! collide, so a run measures what one push costs.
 //!
+//! In `objects` mode (S9, `docs/HUB.md` §13.18) every agent reads as a
+//! fresh thin workspace, in a closed loop: the tips and its read grant from
+//! the server, then through the object routes (`--via cache`: a regional
+//! cache this tool starts in front of the server; `--via server`: the server
+//! itself) the root tree, `w/`, `w/seed/` (1,000 files of 4 KiB) and 100 of
+//! its files, each request signed by its device. One lander per project
+//! moves `main` at `background` landings per second meanwhile. Measured
+//! besides: the cache's hit share (objects it served from its store, of all
+//! it served), its CPU and its peak memory. **Gates** (`--via cache`): at
+//! least 99 % of objects from the cache's store, and its peak memory at
+//! most 512 MiB.
+//!
 //! Measured per run: operations per second, latency p50/p99, collisions
 //! and retries per landing, errors, and when known the server's CPU per
 //! operation (`--server-pid`, or the server this tool started), the
@@ -72,6 +84,7 @@ use std::{
 use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 use veil_core::{
+    hub::grant::{sign_request, BatchRequest, ChainWant, Grant},
     hub::wire::{put_frame, read_frames, BranchUpdate, FetchRequest, HistoryRequest, PushRequest, PushResult, Tips, Want},
     object::{EntryKind, Object, Snapshot, Text, Tree, TreeEncoding, TreeEntry, Visibility},
     ChangeId, Identity, ObjectId,
@@ -85,11 +98,23 @@ pub enum Mode {
     /// Land on a branch of one's own.
     Branches,
     Api,
+    /// Read as fresh thin workspaces, through the object routes.
+    Objects,
 }
 
 /// The cost gates (`storage-and-cost.md` §9).
 pub const GATE_COMMITS_PER_PUSH: f64 = 1.0;
 pub const GATE_STATEMENTS_PER_WARM_PULL: f64 = 5.0;
+/// `objects` through a regional cache: the share of objects it serves from
+/// its store, and its peak memory (it runs with the default `--memory 128M` and
+/// 1,024 connections: a bound of about 480 MiB, `docs/HUB.md` §13.18).
+pub const GATE_CACHE_HITS: f64 = 0.99;
+pub const GATE_CACHE_MIB: f64 = 512.0;
+
+/// Files of `w/seed/` in an `objects` run's projects, and how many of
+/// them each read takes.
+const SEED_FILES: usize = 1000;
+const READ_FILES: usize = 100;
 
 /// Request and response bytes of every agent (counted in windows).
 static BYTES_SENT: AtomicU64 = AtomicU64::new(0);
@@ -135,6 +160,9 @@ pub struct Args {
     /// Count only the database processes of this container (an id prefix,
     /// as `/proc/PID/cgroup` names it).
     pub db_container: Option<String>,
+    /// `objects`: read through a regional cache (`true`) or the server, one
+    /// set of curves each.
+    pub vias: Vec<bool>,
 }
 
 // ---- the HTTP client ------------------------------------------------------------------------
@@ -295,6 +323,8 @@ struct Agent<'a> {
     clone: Held,
     files: u64,
     c: &'a Counters,
+    /// `objects` through a regional cache: its API.
+    objects: Option<Api>,
 }
 
 impl Agent<'_> {
@@ -534,6 +564,66 @@ impl Agent<'_> {
 }
 
 impl Agent<'_> {
+    /// `--mode objects`: what a fresh thin workspace reads (see the
+    /// module's comment); the objects it read.
+    fn read(&mut self) -> Result<u64> {
+        self.c.requests.fetch_add(1, Ordering::Relaxed);
+        let r = self.api.get(self.token, &self.path("/tips"))?;
+        ok(&r, "tips")?;
+        let tips: Tips = serde_json::from_slice(&r.body)?;
+        let token = tips.grants.get("main").ok_or_else(|| anyhow!("no grant for main"))?;
+        let grant = Grant::verify(token, tips.grant_key.as_deref().unwrap_or_default()).ok_or_else(|| anyhow!("a grant that does not verify"))?;
+        let via = self.objects.as_ref().unwrap_or(&self.api);
+        let path = format!("/v1/objects/{}:batch", self.project);
+        // A batch, asking again for what did not arrive (a cache leaves out
+        // an object it lost since its check).
+        let batch = |wants: Vec<(Vec<ObjectId>, ObjectId)>| -> Result<HashMap<ObjectId, Vec<u8>>> {
+            let mut got = HashMap::new();
+            let mut left = wants;
+            for _ in 0..3 {
+                self.c.requests.fetch_add(1, Ordering::Relaxed);
+                let ids: Vec<ObjectId> = left.iter().map(|w| w.1).collect();
+                let ts = veil_core::now_millis();
+                let req = BatchRequest {
+                    grant: token.clone(),
+                    ts,
+                    signature: Some(sign_request(self.identity, &grant, ts, &ids)),
+                    wants: left.iter().map(|(chain, id)| ChainWant { chain: chain.clone(), id: *id }).collect(),
+                    skip: Vec::new(),
+                };
+                let r = via.post(None, &path, &serde_json::to_vec(&req)?, true)?;
+                ok(&r, "objects")?;
+                for (id, raw) in read_frames(&r.body)? {
+                    got.insert(id, raw.to_vec());
+                }
+                left.retain(|w| !got.contains_key(&w.1));
+                if left.is_empty() {
+                    return Ok(got);
+                }
+            }
+            bail!("objects: {} never arrived", left.len())
+        };
+        let tree = |raw: &[u8]| -> Result<Tree> {
+            match Object::decode(raw)? {
+                Object::Tree(t) => Ok(t),
+                _ => bail!("objects: not a tree"),
+            }
+        };
+        let entry = |t: &Tree, name: &str| t.entries.iter().find(|e| e.name == name).map(|e| e.id).ok_or_else(|| anyhow!("objects: no {name}"));
+        let root = grant.body.root;
+        let t = tree(&batch(vec![(vec![], root)])?[&root])?;
+        let w = entry(&t, "w")?;
+        let wt = tree(&batch(vec![(vec![root], w)])?[&w])?;
+        let seed = entry(&wt, "seed")?;
+        let st = tree(&batch(vec![(vec![root, w], seed)])?[&seed])?;
+        let start = u16::from_le_bytes(veil_core::crypto::random_bytes::<2>()) as usize;
+        let files: Vec<(Vec<ObjectId>, ObjectId)> =
+            (0..READ_FILES.min(st.entries.len())).map(|i| (vec![root, w, seed], st.entries[(start + i) % st.entries.len()].id)).collect();
+        let n = files.len();
+        batch(files)?;
+        Ok(3 + n as u64)
+    }
+
     /// Land one new file through the API (`--mode api`); the collisions on
     /// the way: rebases the server made, and rejections after them.
     fn land_api(&mut self, deadline: Instant) -> Result<u64> {
@@ -736,6 +826,16 @@ pub fn missed_gates(r: &serde_json::Value, background: f64) -> Vec<String> {
             out.push(format!("{mode}: {c:.2} database commits per landing, the deriver's aside (gate: {GATE_COMMITS_PER_PUSH})"));
         }
     }
+    if mode == "objects" && r["via"] == "cache" {
+        match r["cache_hit_share"].as_f64() {
+            Some(h) if h >= GATE_CACHE_HITS => {}
+            h => out.push(format!("objects: {} of objects from the cache's store (gate: {:.0} %)", h.map_or("–".into(), |h| format!("{:.2} %", h * 100.0)), GATE_CACHE_HITS * 100.0)),
+        }
+        match r["cache_peak_mib"].as_f64() {
+            Some(m) if m <= GATE_CACHE_MIB => {}
+            m => out.push(format!("objects: the cache's peak memory {} MiB (gate: {GATE_CACHE_MIB} MiB)", m.map_or("–".into(), |m| format!("{m:.0}")))),
+        }
+    }
     if mode == "pull" && background == 0.0 {
         if let Some(n) = r["db_per_op"].as_f64().filter(|n| *n > GATE_STATEMENTS_PER_WARM_PULL) {
             out.push(format!("pull: {n:.1} statements per up-to-date pull (gate: {GATE_STATEMENTS_PER_WARM_PULL})"));
@@ -758,8 +858,9 @@ fn unique(prefix: &str) -> String {
 }
 
 /// Create a project as `admin`: group `agents` (with `agent`), the policy
-/// `w/  agents`, and a first snapshot.
-fn create_project(api: &Api, admin: &Identity, admin_token: &str, agent: &str) -> Result<String> {
+/// `w/  agents`, and a first snapshot, with `seed` files of 4 KiB in
+/// `w/seed/`.
+fn create_project(api: &Api, admin: &Identity, admin_token: &str, agent: &str, seed: usize) -> Result<String> {
     let name = unique("load-");
     ok(&api.post_json(Some(admin_token), &format!("/v1/projects/{name}"), &json!({}))?, "create project")?;
     ok(&api.post_json(Some(admin_token), &format!("/v1/projects/{name}/groups/agents"), &json!({}))?, "create group")?;
@@ -786,6 +887,17 @@ fn create_project(api: &Api, admin: &Identity, admin_token: &str, agent: &str) -
     let readme = put(Object::Blob(readme));
     let mut w = Tree::default();
     w.insert(file("README", readme, rl));
+    if seed > 0 {
+        let mut st = Tree::default();
+        for i in 0..seed {
+            let mut body = format!("seed file {i} of {name}\n").into_bytes();
+            body.resize(4096, b'.');
+            let id = put(Object::Blob(body));
+            st.insert(file(&format!("f{i:05}"), id, 4096));
+        }
+        let st = put(Object::Tree(st));
+        w.insert(TreeEntry::dir("seed", st));
+    }
     let w = put(Object::Tree(w));
     let mut root = Tree::default();
     root.insert(file(".veilpolicy", policy, pl));
@@ -852,15 +964,17 @@ struct Ctx<'a> {
 /// Scheduled landings of one project, shared by its agents.
 type Schedule = Arc<Mutex<mpsc::Receiver<Instant>>>;
 
-/// One point of a curve.
-fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) -> Result<serde_json::Value> {
+/// One point of a curve; `objects` mode reads through `cache` if given.
+fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, cache: Option<&crate::server::CacheProc>) -> Result<serde_json::Value> {
     let setup = Api::new(cx.base, cx.ca)?;
-    let names: Vec<String> = (0..projects).map(|_| create_project(&setup, cx.admin, cx.admin_token, cx.agent_name)).collect::<Result<_>>()?;
+    let seed = if a.mode == Mode::Objects { SEED_FILES } else { 0 };
+    let names: Vec<String> = (0..projects).map(|_| create_project(&setup, cx.admin, cx.admin_token, cx.agent_name, seed)).collect::<Result<_>>()?;
+    let cache_ca = cache.map(|c| std::fs::read_to_string(&c.cert)).transpose()?;
     let c = Counters::default();
     let bg = Counters::default();
     let stop = AtomicBool::new(false);
     // Agents, the background landers (pull mode) and this thread.
-    let landers = if a.mode == Mode::Pull && a.background > 0.0 { projects } else { 0 };
+    let landers = if matches!(a.mode, Mode::Pull | Mode::Objects) && a.background > 0.0 { projects } else { 0 };
     let ready = Barrier::new(clients + landers + 1);
     // Open loop: scheduled landings, one queue per project.
     let queues: Vec<(mpsc::Sender<Instant>, Schedule)> = (0..projects)
@@ -873,7 +987,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
     std::thread::scope(|s| -> Result<()> {
         for i in 0..clients {
             let p = i % projects;
-            let (name, c, stop, ready, rx) = (&names[p], &c, &stop, &ready, queues[p].1.clone());
+            let (name, c, stop, ready, rx, cache_ca) = (&names[p], &c, &stop, &ready, queues[p].1.clone(), &cache_ca);
             std::thread::Builder::new().stack_size(256 << 10).spawn_scoped(s, move || {
                 let mut agent = match Api::new(cx.base, cx.ca) {
                     Ok(api) => Agent {
@@ -890,6 +1004,17 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
                         clone: Held::default(),
                         files: 0,
                         c,
+                        objects: match (cache, cache_ca) {
+                            (Some(k), Some(ca)) => match Api::new(&k.https(), Some(ca)) {
+                                Ok(api) => Some(api),
+                                Err(e) => {
+                                    c.error(&e);
+                                    ready.wait();
+                                    return;
+                                }
+                            },
+                            _ => None,
+                        },
                     },
                     Err(e) => {
                         c.error(&e);
@@ -897,8 +1022,8 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
                         return;
                     }
                 };
-                // The first clone, before the clock starts.
-                if let Err(e) = agent.pull() {
+                // The first clone (or read), before the clock starts.
+                if let Err(e) = if a.mode == Mode::Objects { agent.read().map(|_| true) } else { agent.pull() } {
                     c.error(&e);
                 }
                 ready.wait();
@@ -914,6 +1039,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
                         Mode::Pull => agent.pull().map(|moved| u64::from(!moved)),
                         Mode::Land | Mode::Branches => agent.land(scheduled + Duration::from_secs(60)),
                         Mode::Api => agent.land_api(scheduled + Duration::from_secs(60)),
+                        Mode::Objects => agent.read(),
                     };
                     let done = Instant::now();
                     if !c.measuring.load(Ordering::Relaxed) {
@@ -922,7 +1048,8 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
                     match r {
                         Ok(n) => {
                             c.ops.fetch_add(1, Ordering::Relaxed);
-                            if a.mode == Mode::Pull {
+                            if matches!(a.mode, Mode::Pull | Mode::Objects) {
+                                // Objects mode: the objects read.
                                 c.noop.fetch_add(n, Ordering::Relaxed);
                             }
                             c.latencies.lock().unwrap().push((done - scheduled).as_secs_f64() * 1000.0);
@@ -951,6 +1078,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
                         clone: Held::default(),
                         files: 0,
                         c: bg,
+                        objects: None,
                     },
                     Err(e) => {
                         bg.error(&e);
@@ -1008,6 +1136,12 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
         let before_server_stats = cx.server_stats.as_ref().and_then(|(pid, f)| server_stats(*pid, f));
         let (sent0, received0) = (BYTES_SENT.load(Ordering::Relaxed), BYTES_RECEIVED.load(Ordering::Relaxed));
         let before_dml = cx.stats.and_then(|(rt, url)| db_writes(rt, url));
+        let cache_pid = cache.map(|k| k.pid());
+        let before_cache = cache.and_then(|k| server_stats(k.pid(), &k.dir.join("stats.json")));
+        let before_cache_cpu = cache_pid.and_then(cpu_of);
+        if let Some(pid) = cache_pid {
+            crate::server::reset_peak(pid);
+        }
         let req0 = c.requests.load(Ordering::Relaxed);
         c.measuring.store(true, Ordering::Relaxed);
         let t0 = Instant::now();
@@ -1029,13 +1163,18 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
         let stat = |k: &str| server_stats.as_ref().and_then(|(b, a)| Some(b[k].as_f64()? - a[k].as_f64()?));
         let dml = cx.stats.and_then(|(rt, url)| db_writes(rt, url)).zip(before_dml).map(|((_, bw), (_, aw))| bw - aw);
         let requests = c.requests.load(Ordering::Relaxed) - req0;
+        let cache_stats = cache.and_then(|k| self::server_stats(k.pid(), &k.dir.join("stats.json"))).zip(before_cache);
+        let cstat = |k: &str| cache_stats.as_ref().and_then(|(b, a)| Some(b[k].as_f64()? - a[k].as_f64()?));
+        let cache_cpu = cache_pid.and_then(cpu_of).zip(before_cache_cpu).map(|(b, a)| b - a);
+        let cache_peak = cache_pid.and_then(crate::server::peak_kib);
         stop.store(true, Ordering::Relaxed);
         let ops = c.ops.load(Ordering::Relaxed) as f64;
         let mut lat = std::mem::take(&mut *c.latencies.lock().unwrap());
         lat.sort_by(|x, y| x.partial_cmp(y).unwrap());
         let per_op = |x: f64| if ops > 0.0 { x / ops } else { f64::NAN };
         result = json!({
-            "mode": match a.mode { Mode::Pull => "pull", Mode::Land => "land", Mode::Branches => "branches", Mode::Api => "api" },
+            "mode": match a.mode { Mode::Pull => "pull", Mode::Land => "land", Mode::Branches => "branches", Mode::Api => "api", Mode::Objects => "objects" },
+
             "projects": projects,
             "clients": clients,
             "rate": match rate { Rate::Max => json!("max"), Rate::PerSecond(r) => json!(r) },
@@ -1074,6 +1213,15 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
             "background_landings": bg.ops.load(Ordering::Relaxed),
             "background_errors": bg.errors.load(Ordering::Relaxed),
         });
+        if a.mode == Mode::Objects {
+            result["via"] = json!(if cache.is_some() { "cache" } else { "server" });
+            result["objects_per_op"] = json!(per_op(c.noop.load(Ordering::Relaxed) as f64));
+            result["cache_hit_share"] = json!(cstat("local").zip(cstat("upstream")).map(|(l, u)| l / (l + u)));
+            result["cache_forwarded_per_op"] = json!(cstat("forwarded").map(per_op));
+            result["cache_cpu_ms_per_op"] = json!(cache_cpu.map(|x| per_op(x * 1000.0)));
+            result["cache_peak_mib"] = json!(cache_peak.map(|k| k as f64 / 1024.0));
+            result["cache_stored_mib"] = json!(cache_stats.as_ref().and_then(|(b, _)| b["stored_bytes"].as_f64()).map(|b| b / (1 << 20) as f64));
+        }
         Ok(())
     })?;
     // The deriver's lag (S12, BUG-911): once the agents stopped, how long
@@ -1146,16 +1294,25 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
         server_stats: _server.as_ref().map(|s: &crate::server::Server| (s.pid(), a.dir.join("server").join("stats.json"))),
     };
     let rates = match a.mode {
-        Mode::Pull => vec![Rate::Max],
+        Mode::Pull | Mode::Objects => vec![Rate::Max],
         Mode::Land | Mode::Branches | Mode::Api => a.rates.clone(),
     };
+    // `objects --via cache`: one regional cache in front of the server
+    // started here, for every run.
+    let vias = if a.mode == Mode::Objects { a.vias.clone() } else { vec![false] };
+    let cache = match (vias.contains(&true), &_server, &a.server.server) {
+        (false, _, _) => None,
+        (true, Some(s), Some(bin)) => Some(crate::server::CacheProc::start(bin, s, &a.dir.join("server"), &a.dir.join("cache"))?),
+        _ => bail!("--via cache needs a server started here (--server)"),
+    };
     let mut runs = Vec::new();
+    for &via in &vias {
     for &projects in &a.projects {
         for &clients in &a.clients {
             for &rate in &rates {
                 let clients = clients.max(projects);
-                eprintln!("load: {:?} projects={projects} clients={clients} rate={rate:?}", a.mode);
-                let mut r = run_one(&cx, a, projects, clients, rate)?;
+                eprintln!("load: {:?} projects={projects} clients={clients} rate={rate:?}{}", a.mode, if via { " via the cache" } else { "" });
+                let mut r = run_one(&cx, a, projects, clients, rate, cache.as_ref().filter(|_| via))?;
                 eprintln!("      {}", line(&r));
                 let missed = missed_gates(&r, a.background);
                 for m in &missed {
@@ -1165,6 +1322,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
                 runs.push(r);
             }
         }
+    }
     }
     Ok(json!({ "profile": "load", "server": base, "runs": runs }))
 }
@@ -1251,6 +1409,31 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             pct(&r["tips_hit_share"]),
             if missed == 0 { "none".to_string() } else { format!("**{missed}**") },
         ));
+    }
+    let objects: Vec<&serde_json::Value> = v["runs"].as_array().into_iter().flatten().filter(|r| r["mode"] == "objects").collect();
+    if !objects.is_empty() {
+        out.push_str(
+            "\n| Via | Projects | Clients | Reads (/s) | Objects per read | p50 (ms) | p99 (ms) | Server CPU (ms/read) | Cache hits | Cache requests to the server per read | Cache CPU (ms/read) | Cache peak (MiB) | Errors |\n\
+             |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        );
+        for r in objects {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                r["via"].as_str().unwrap_or(""),
+                r["projects"],
+                r["clients"],
+                f(&r["ops_per_s"], 1),
+                f(&r["objects_per_op"], 0),
+                f(&r["p50_ms"], 1),
+                f(&r["p99_ms"], 1),
+                f(&r["server_cpu_ms_per_op"], 2),
+                r["cache_hit_share"].as_f64().map(|h| format!("{:.2} %", h * 100.0)).unwrap_or_else(|| "–".into()),
+                f(&r["cache_forwarded_per_op"], 2),
+                f(&r["cache_cpu_ms_per_op"], 2),
+                f(&r["cache_peak_mib"], 0),
+                r["errors"],
+            ));
+        }
     }
     Ok(out)
 }

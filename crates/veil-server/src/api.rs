@@ -61,6 +61,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/objects/{p}/{id}", get(crate::grant::get_object))
         .route("/v1/objects/{target}", post(crate::grant::batch))
         .route("/v1/epochs", get(crate::grant::epochs))
+        .route("/v1/cache/epochs", post(crate::cache::feed::epochs))
         // The query API (S13).
         .route("/v1/projects/{p}/q/log", get(crate::query::log_route))
         .route("/v1/projects/{p}/q/show", get(crate::query::show_route))
@@ -78,6 +79,8 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/prs/{id}/threads/{t}", get(crate::prs::thread_get_route).post(crate::prs::thread_route))
         .route("/v1/projects/{p}/prs/{id}/reviews", post(crate::prs::review_route))
         .route("/v1/projects/{p}/prs/{id}/land", post(crate::prs::land_route))
+        .route("/v1/projects/{p}/q/search", get(crate::search::search_route))
+        .route("/v1/projects/{p}/q/grep", get(crate::search::grep_route))
         .layer(DefaultBodyLimit::max(crate::db::body_limit("")))
         .layer(axum::middleware::from_fn(crate::db::retry_requests))
         .with_state(hub)

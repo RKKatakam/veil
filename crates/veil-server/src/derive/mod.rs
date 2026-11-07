@@ -329,6 +329,8 @@ pub async fn landing(hub: &Arc<Hub>, project: i64, branches: Vec<String>) -> Res
     let permit = hub.derive.permit().await?;
     memo_tips(hub, project, &stats.branches).await?;
     drop(permit);
+    // The search index (S15) follows the derived branches, in its own task.
+    crate::search::index::landed(hub, project, stats.branches.clone());
     Ok(stats)
 }
 
