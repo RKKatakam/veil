@@ -151,7 +151,9 @@ step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-yb-$
 # One at a time: on a database other runs share, three at once could keep
 # a statement past its timeout.
 STEP_LIMIT=2400 step hostile-postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-hpg-$RUN "$BIN" "$HOSTILE" --test-threads=1
-STEP_LIMIT=2400 step hostile-yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-hyb-$RUN "$BIN" "$HOSTILE" --test-threads=1
+# On the shared YugabyteDB, also one run at a time machine-wide: two runs'
+# hostile steps at once time out statements (S12's bug_868 under load).
+STEP_LIMIT=4800 step hostile-yugabyte flock -w 2400 "${XDG_RUNTIME_DIR:-/tmp}/veil-yb-hostile.lock" env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-hyb-$RUN "$BIN" "$HOSTILE" --test-threads=1
 
 echo "== concurrency under load (several copies at once)"
 load() { # url, bucket, copies (each copy bounded like a step)
