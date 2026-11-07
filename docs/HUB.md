@@ -2430,3 +2430,47 @@ in its store (that someone recently read a file they may read; design row
 store for up to one poll after the change (about a second, at most 5 s: the
 owner's bound). Not built: `vl` reading through the
 cache (S3), the Veil daemon (S6), the public CDN URLs of design §4.3.
+
+older snapshots, caches, `vl` reading through these routes (S3, S6).
+
+### 13.23 S15: search (built)
+
+Design: `docs/design/server/phase-3-server-history.md` §3.5 and its §13
+(as built, with the threat review and the measurements). Code:
+`crates/veil-server/src/search/` (`index.rs` builds the index, `segment.rs`
+its pieces, `pattern.rs` what a query asks, `mod.rs` the routes), migration
+`0016_search.sql`, two routes in `api.rs`, one call after each landing's
+derivation (`derive::landing`), and `vl search`. No repository format
+change; nothing new is encrypted.
+
+* **Routes** (`/v1/projects/{p}/q/…`, answers carry `policy_version` and
+  `work`): `GET search?q=&rev=&kind=&path=&lang=&n=&after=` ranks files by
+  their content at a branch tip (`kind=code`, `veil.search/1`) or by name
+  over every path the project's history held (`kind=path`);
+  `GET grep?pattern=&rev=&i=&path=&n=&after=` lists the lines matching a
+  regular expression (linear-time `regex`), file by file in tree order,
+  through the index at a branch tip and by a scan of the viewer's tree at
+  any other revision (`veil.hub-grep/1`; S16 renders it as `vl grep`).
+* **Sharded by access line.** The index is derived data on real history,
+  in shards named by S12's line keys: a file's document is in the shard of
+  the line deciding its path. A query opens only the shards of the lines
+  its viewer reads, so every hit, count, ranking statistic (BM25 over the
+  viewer's shards), page and `work` counter is computed from what the
+  viewer may read: the same, byte for byte, as on a copy of the project
+  holding only their projected history.
+* **Secrets** are indexed by path only (their objects are never opened);
+  **embargo lines** are never indexed or walked; who reads a line is not
+  part of its key, so access changes apply at the next request, and a new
+  policy that changes which paths a line decides answers `indexing` (503)
+  until the shards whose keys changed are rebuilt.
+* **Every branch, always caught up** (BUG-1231): each update also takes
+  every branch whose index is behind its tip, and the server resumes them
+  at start; an answer from an index still catching up says so (`behind`,
+  with `tip_id`, in the viewer's ids).
+* **Bounded** (BUG-1230, BUG-1232): candidates are streamed (postings
+  intersected as decoded, segments merged in tree order) and a query stops
+  at its bound; the deadline is checked inside every loop and before each
+  line a grep searches; a line longer than the pattern's size allows is not
+  searched (`long_lines_skipped`).
+* `vl search WORDS… [--path] [--lang LANG] [-r BRANCH] [-n N] [--json] [-- PATH]`
+  prints the server's answer (exit 1 when nothing matched).
