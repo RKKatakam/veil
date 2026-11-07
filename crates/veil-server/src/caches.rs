@@ -4,7 +4,7 @@
 //!
 //! **A cache never serves a decision a permission change has made stale,
 //! on any server.** Sessions and permissions are versioned by the
-//! **access epochs** in the database (`migrations/0004_access_epochs.sql`):
+//! **access epochs** in the database (`migrations/0006_access_epochs.sql`):
 //!
 //! * `(0, person)`: the person's sessions, devices, admin rights, groups and
 //!   device bars; `(project, 0)`: the project's accepted policy, bindings and
