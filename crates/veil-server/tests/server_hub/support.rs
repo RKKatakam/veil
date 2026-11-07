@@ -327,6 +327,14 @@ impl Api {
         Self::finish(r.call())
     }
 
+    pub fn delete(&self, token: Option<&str>, path: &str) -> Reply {
+        let mut r = self.agent.delete(format!("{}{path}", self.base));
+        if let Some(t) = token {
+            r = r.header("authorization", &format!("Bearer {t}"));
+        }
+        Self::finish(r.call())
+    }
+
     pub fn post(&self, token: Option<&str>, path: &str, body: &[u8], json: bool) -> Reply {
         let mut r = self.agent.post(format!("{}{path}", self.base));
         if let Some(t) = token {

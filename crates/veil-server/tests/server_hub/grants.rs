@@ -549,3 +549,285 @@ fn bench_object_routes() {
     }
     println!("GET /v1/objects over HTTPS, client side (µs): p50 {:.0}  p99 {:.0}", percentile(&mut net.clone(), 0.5), percentile(&mut net, 0.99));
 }
+
+// ---- Adversarial pass: S5 (docs/BUGS.md, "Adversarial pass: S5") ----------
+
+/// The view key `View::key` gives `viewer` of the project in `dir` for
+/// the policy `text`: what anyone holding a grant can compute offline from
+/// a guess of the whole `.veilpolicy`.
+fn guessed_view(text: &str, member_of: &[&str]) -> String {
+    let policy = veil_core::hub::access::AccessPolicy::parse(text);
+    veil_core::hub::access::View::new(&policy, false, |_, name| member_of.contains(&name)).key()
+}
+
+/// The keys (project, person) the feed lists from `since` until its `now`
+/// passes `until`, read page by page as a cache would.
+fn feed_until(api: &Api, mut since: i64, until: i64) -> HashSet<(Option<i64>, Option<i64>)> {
+    let mut seen = HashSet::new();
+    for _ in 0..1000 {
+        let f = feed(api, since);
+        for c in f["changes"].as_array().unwrap() {
+            seen.insert((c["project"].as_i64(), c["person"].as_i64()));
+        }
+        let now = f["now"].as_i64().unwrap();
+        if now >= until || now == since {
+            break;
+        }
+        since = now;
+    }
+    seen
+}
+
+/// BUG-1080. Anyone on Earth, and a teammate without access, holds a grant
+/// whose `view` is an unkeyed hash of every access line's path (hidden ones
+/// included) and whether they read it: a guess of the hidden folder names,
+/// checked offline against it, is confirmed or refused.
+#[test]
+#[ignore = "BUG-1080: a grant's view key confirms guesses of hidden folder names"]
+fn bug_1080_a_grants_view_key_confirms_a_guess_of_hidden_folder_names() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let policy = std::fs::read_to_string(p.dir.join(".veilpolicy")).unwrap();
+    // The key depends on the hidden names: a wrong guess gives another one.
+    let wrong = policy.replace(BILL_DIR, "bill-00000000");
+    assert_ne!(guessed_view(&policy, &[]), guessed_view(&wrong, &[]));
+    for (who, person, groups) in [("anyone on Earth", None, vec![]), ("dev", Some(&p.dev), vec!["devs"])] {
+        let r = Reader::new(&api, person, &p.name);
+        assert!(
+            r.body().view != guessed_view(&policy, &groups),
+            "{who}'s grant confirms, offline, the guess that the policy holds {BILL_DIR}/, {PERSON_DIR}/ and src/{NESTED_DIR}/, \
+             which they cannot see"
+        );
+    }
+}
+
+/// BUG-1081. The epoch feed answers anyone on Earth, and lists a project
+/// that has nothing public (its id, and when its access changes).
+#[test]
+#[ignore = "BUG-1081: the unauthenticated epoch feed lists projects with nothing public"]
+fn bug_1081_the_epoch_feed_shows_anyone_a_project_with_nothing_public() {
+    let hub = TestHub::start();
+    let api = hub.api();
+    let admin = hub.person("quiet");
+    let name = unique("quiet");
+    let dir = admin.dir("quiet");
+    std::fs::create_dir_all(&dir).unwrap();
+    admin.ok(&dir, &["init"]);
+    write_files(&dir, &[("plans/q4.txt", "MARKER-QUIET-PLANS-6b1e0c2a")]);
+    admin.ok(&dir, &["remote", "add", "origin", &hub.url(&name)]);
+    admin.commit_main(&dir, "plans");
+    admin.ok(&dir, &["push"]);
+    admin.ok(&dir, &["access", "plans/", &admin.name]);
+    admin.commit_main(&dir, "access");
+    admin.ok(&dir, &["push"]);
+    // Nothing public: anyone on Earth does not see the project at all.
+    assert!(api.tips(None, &name).is_none());
+    let tips = api.tips(Some(&admin.token()), &name).unwrap();
+    let id = Grant::read_unverified(&tips.grants["main"]).unwrap().project_id;
+    let now = feed(&api, 0)["now"].as_i64().unwrap();
+    let listed = feed_until(&api, 0, now);
+    assert!(
+        !listed.contains(&(Some(id), None)),
+        "anyone on Earth, not signed in, sees project {id} (nothing public) and when its access changed"
+    );
+}
+
+/// A new, empty database on the test server, as a URL; dropped with the
+/// run's (`VEIL_TEST_DB_PREFIX`).
+fn fresh_database(rt: &tokio::runtime::Runtime) -> String {
+    let admin = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+    let name = format!("{}{}", std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_default(), unique("veil_epochs_"));
+    rt.block_on(async {
+        let db = veil_server::db::connect(&admin, 1).await.unwrap();
+        sqlx::raw_sql(&format!("CREATE DATABASE {name}")).execute(&db).await.unwrap();
+        db.close().await;
+    });
+    format!("{}/{name}", admin.rsplit_once('/').unwrap().0)
+}
+
+/// BUG-1082. A cache reads the feed page by page until its `now` passes a
+/// change; the change of a key that changed again since is never listed in
+/// those pages (the row keeps only the newest epoch, past the full page).
+#[test]
+#[ignore = "BUG-1082: the epoch feed passes a change it never lists when its key changed again"]
+fn bug_1082_the_epoch_feed_skips_a_change_whose_key_changed_again() {
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(2).build().unwrap();
+    // A database of its own: nothing else bumps its clock.
+    let hub = TestHub::start_on(&fresh_database(&rt), std::time::Duration::from_secs(3600));
+    let api = hub.api();
+    let db = hub.hub().db.clone();
+    let n = veil_server::grant::FEED_LIMIT;
+    let first = hub.rt.block_on(async {
+        // Project 1's access changes (someone loses it): epoch 1.
+        sqlx::query("SELECT veil_bump_epoch(1, 0)").execute(&db).await.unwrap();
+        let first: i64 = sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 1").fetch_one(&db).await.unwrap();
+        // A full page of other changes, then project 1 changes again.
+        let mut a = 2i64;
+        while a <= n + 1 {
+            let b = (a + 999).min(n + 1);
+            sqlx::query("SELECT veil_bump_epoch(g, 0) FROM generate_series($1::bigint, $2::bigint) g")
+                .bind(a)
+                .bind(b)
+                .execute(&db)
+                .await
+                .unwrap();
+            a = b + 1;
+        }
+        sqlx::query("SELECT veil_bump_epoch(1, 0)").execute(&db).await.unwrap();
+        first
+    });
+    let seen = feed_until(&api, 0, first);
+    assert!(
+        seen.contains(&(Some(1), None)),
+        "the cache's feed has passed epoch {first}, project 1's change, without listing it: a grant of project 1 from before it \
+         still looks current to the cache"
+    );
+}
+
+/// Set every directory under `root` to `mode`.
+fn chmod_dirs(root: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() {
+                stack.push(e.path());
+            }
+        }
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+}
+
+/// BUG-1083. Making a grant stores the projected trees; when the store
+/// cannot be written, the whole tips request fails, so every pull of
+/// everyone but admins fails with it (S1 needed no write to pull). The
+/// code's own comment says the branch only gets no grant.
+#[test]
+#[ignore = "BUG-1083: tips fail when the projected trees of a grant cannot be stored"]
+fn bug_1083_a_store_that_cannot_be_written_fails_every_pull() {
+    let url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+    // Objects in a directory, whatever VEIL_TEST_S3_ENDPOINT says.
+    let hub = TestHub::start_with_s3(&url, std::time::Duration::from_secs(3600), None);
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let dev = Reader::new(&api, Some(&p.dev), &p.name);
+    let (pid, view) = (dev.body().project_id, dev.body().view);
+    // A change dev sees, in src/ (rewritten for dev: it holds a hidden folder).
+    write_files(&p.dir, &[("src/lib.rs", "MARKER-PUBLIC-CHANGED-77c1d0e2")]);
+    p.admin.commit_main(&p.dir, "src changed");
+    p.admin.ok(&p.dir, &["push"]);
+    let tip = {
+        let repo = veil_core::Repo::open(Arc::new(veil_core::DiskBackend::new(&p.dir)), None, "test").unwrap();
+        repo.view().tags["main"].target
+    };
+    // The deriver memoises dev's projection of the new tip after the push
+    // (its snapshot is stored then; no grant, so no tree).
+    let db = hub.hub().db.clone();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let memo: Option<String> = hub.rt.block_on(
+            sqlx::query_scalar("SELECT projected_id FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+                .bind(pid)
+                .bind(&view)
+                .bind(tip.hex())
+                .fetch_optional(&db),
+        )
+        .unwrap();
+        if memo.is_some() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the deriver memoised dev's projection");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // The store still reads, but cannot be written (a full disk, a
+    // read-only bucket policy, an outage of writes).
+    let objects = hub._dir.path().join("objects");
+    chmod_dirs(&objects, 0o555);
+    let r = api.get(Some(&p.dev.token()), &format!("/v1/projects/{}/tips", p.name));
+    chmod_dirs(&objects, 0o755);
+    assert_eq!(r.status, 200, "dev's pull fails: {}", String::from_utf8_lossy(&r.body));
+}
+
+/// Held up (S5 adversarial pass): every other change that takes access
+/// away bumps an epoch and voids the grants it should, at the next
+/// request: a group deleted, a group created under the name a line gave a
+/// person, and a device removed by its person (everywhere).
+#[test]
+fn grants_are_void_after_a_group_deleted_a_name_rebound_and_a_device_removed() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let admin = p.admin.token();
+    // A group deleted: its people lose what it gave them.
+    let fin = Reader::new(&api, Some(&p.fin), &p.name);
+    assert_eq!(fin.get(&[], &fin.root()).status, 200);
+    let r = api.delete(Some(&admin), &format!("/v1/projects/{}/groups/finance", p.name));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert!(invalid(&fin.get(&[], &fin.root())), "a deleted group's member's grant");
+    // A group created under carol's name: the line naming carol now names
+    // the (empty) group, and carol loses the folder.
+    let carol = Reader::new(&api, Some(&p.carol), &p.name);
+    assert!(carol.walk().iter().any(|(_, _, raw)| has_marker(&[(String::new(), raw.clone())], PERSON_MARK)));
+    p.admin.ok(&p.dir, &["group", "create", &p.carol.name]);
+    assert!(invalid(&carol.get(&[], &carol.root())), "carol's grant, after her line was rebound to a group");
+    let again = Reader::new(&api, Some(&p.carol), &p.name);
+    assert!(!again.walk().iter().any(|(_, _, raw)| has_marker(&[(String::new(), raw.clone())], PERSON_MARK)));
+    // A device removed by its person, everywhere (what `POST
+    // /v1/devices/remove` does for the person's own device).
+    let dev = Reader::new(&api, Some(&p.dev), &p.name);
+    assert_eq!(dev.get(&[], &dev.root()).status, 200);
+    hub.rt
+        .block_on(sqlx::query("UPDATE devices SET removed_at = $1 WHERE signing_key = $2").bind(1i64).bind(p.dev.identity().verifying_hex()).execute(&hub.hub().db))
+        .unwrap();
+    assert!(invalid(&dev.get(&[], &dev.root())), "a device its person removed");
+}
+
+/// Held up (S5 adversarial pass): a grant made while its person is being
+/// removed from a group either has the narrower view, or is void once the
+/// removal committed. Never the wider view, still valid.
+#[test]
+fn a_grant_racing_a_removal_never_outlives_it() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let admin = p.admin.token();
+    let fin_token = p.fin.token();
+    let members = format!("/v1/projects/{}/groups/finance/members", p.name);
+    let people = serde_json::json!({"people": [p.fin.name]});
+    let wide = Reader::new(&api, Some(&p.fin), &p.name).root();
+    let (mut wider, mut narrower) = (0, 0);
+    for i in 0..32u64 {
+        // Either side starts first, by 0 to 15 ms.
+        let (wait_tips, wait_removal) = if i % 2 == 0 { (i % 16, 0) } else { (0, i % 6) };
+        let (tips, removed) = std::thread::scope(|s| {
+            let t = s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(wait_tips));
+                api.tips(Some(&fin_token), &p.name).unwrap()
+            });
+            let r = s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(wait_removal));
+                api.post_json(Some(&admin), &format!("{members}/remove"), &people)
+            });
+            (t.join().unwrap(), r.join().unwrap())
+        });
+        assert_eq!(removed.status, 200, "{}", String::from_utf8_lossy(&removed.body));
+        let r = Reader {
+            api: &api,
+            project: p.name.clone(),
+            id: Some(p.fin.identity()),
+            grant: tips.grants["main"].clone(),
+            key: tips.grant_key.clone().unwrap(),
+        };
+        if r.root() == wide {
+            wider += 1;
+            assert!(invalid(&r.get(&[], &r.root())), "round {i}: a grant with finance's view outlived fin's removal");
+        } else {
+            narrower += 1;
+        }
+        let back = api.post_json(Some(&admin), &members, &people);
+        assert_eq!(back.status, 200, "{}", String::from_utf8_lossy(&back.body));
+    }
+    eprintln!("racing grants: {wider} with the wider view (all void), {narrower} with the narrower one");
+}
