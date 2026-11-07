@@ -10,8 +10,8 @@ propose something §13 decided otherwise, §13 is what runs. Later
 milestones are in §13.9; **S12** (derived history data: commit graph,
 changed paths, per-rule lists) and **S13** (the query API: log, show,
 tree, file, diff and ancestry, answered on each viewer's projected
-history) are built too, recorded in
-`docs/design/server/phase-3-server-history.md` §10 and §11. Statements about what Veil does today cite the
+history) and **S14** (blame and file history, §13.22) are built too, recorded in
+`docs/design/server/phase-3-server-history.md` §10, §11 and §12. Statements about what Veil does today cite the
 document or source file they come from; everything else is a proposal and
 is worded as one.
 
@@ -980,6 +980,7 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 | `POST …/invites {key, person, group, expires_at}`, `POST …/invites/join {key, device, signature}` | an admin records an invite's public key; the signed-in device joins under it, once, before it expires (§13.12) |
 | `GET …/keys/pending` | the people whose devices may wait for keys, with their devices, vouches, joins and removed devices: a hint for the devices that share keys (§13.12) |
 | `GET …/q/log`, `…/q/show`, `…/q/tree`, `…/q/file`, `…/q/diff`, `POST …/q/ancestry` | history answered by the server, on the caller's projected history only (S13: `docs/design/server/phase-3-server-history.md` §11) |
+| `GET …/q/blame`, `…/q/history` | who introduced each line of a file, and the changes that made each of its versions (with `follow`, across renames between paths the caller reads), on the caller's projected history only (S14: §13.22) |
 
 * **Fetch on demand (Scion):** `vl` asks for the tips, the snapshots it
   lacks, then trees from the root down and the files it needs, one request
@@ -2194,3 +2195,12 @@ by whoever saw it (inside TLS: a cache, which is inside the boundary); it
 returns the same objects. Grants are made per branch at every tips request
 (one signature each). Not built (later milestones): `POST …/grants` for
 older snapshots, caches, `vl` reading through these routes (S3, S6).
+
+### 13.22 S14: blame and file history (built)
+
+`GET …/q/blame?rev=&path=&follow=` and `GET …/q/history?rev=&path=&follow=` answer on the caller's projected history only, like S13's routes (`docs/design/server/phase-3-server-history.md` §12 has the design as built, its bounds and its threat review).
+
+* **Per viewer, precomputed:** the fill of a viewer's graph (S13) also writes their file history (`view_file_history`, migration 0015): for each of their snapshots, the paths it changed in their projected trees and, per parent, where each path last changed. A query reads only that and the viewer's graph, so neither an answer nor its cost depends on anything hidden.
+* **Blame walks a file's versions** and keeps their blames as objects per view key (`blame_memo`): every 32nd version and every version asked for. A blame costs the file's visible versions; one that stops at its budget or deadline keeps what it computed.
+* **Boundary cuts:** a file moved out of a folder the caller cannot read is added for them, its lines are the moving change's, and nothing names the hidden folder; a file moved into it is deleted. A secret is never read: its blame is refused, its history lists entries only.
+* **Bounds:** 4 blames compute at once per process, each holding at most 64 MiB; plain-text files of at most 1 MiB; 10,000 lines a page; history pages and cursors as the log's; the 2 s deadline.

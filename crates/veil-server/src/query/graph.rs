@@ -46,6 +46,7 @@ use tokio::sync::watch;
 use axum::http::StatusCode;
 use veil_core::{cache::LruCache, object::Snapshot, ObjectId};
 
+use super::{files::Fill as FileFill, trees::Trees};
 use crate::{
     derive::{
         graph::{FLAG_EMBARGO, FLAG_EMBARGO_LINE, MAX_STAMP},
@@ -237,6 +238,12 @@ impl<'a> G<'a> {
         hub.query.rows.insert(k, r.clone(), 320);
         self.local.borrow_mut().insert(*id, r.clone());
         Ok(Some(r))
+    }
+
+    /// Keep `row` of `id`, computed and not written yet (a fill's), for
+    /// the walks of this reader.
+    pub fn keep(&self, id: ObjectId, row: Arc<VRow>) {
+        self.local.borrow_mut().insert(id, row);
     }
 
     /// The row of `id`, which the viewer's graph must have (a parent of a
@@ -544,10 +551,15 @@ pub async fn extend(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[
     let vk = project.view(viewer).key();
     let admin = viewer.admin;
     let pairs: Vec<(ObjectId, ObjectId)> = tips.iter().copied().zip(ps.iter().copied()).collect();
+    let (project, viewer) = (project.clone(), viewer.clone());
     blocking(hub, project.id, move |cx| {
         let g = G::new(cx, &vk, None);
+        let view = project.view(&viewer);
+        let t = Trees::new(&g, &view);
         let mut w = Walk {
             g: &g,
+            t: &t,
+            fill: FileFill::default(),
             admin,
             pmap: HashMap::from([(root(), root())]),
             present: HashSet::new(),
@@ -571,9 +583,13 @@ pub async fn extend(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[
     Ok(ps)
 }
 
-/// One extension of a viewer's graph.
-struct Walk<'g, 'a> {
+/// One extension of a viewer's graph, with its file history (S14:
+/// `files::Fill`, the rows of each snapshot's changed paths, written
+/// before the graph rows).
+struct Walk<'w, 'g, 'a> {
     g: &'g G<'a>,
+    t: &'w Trees<'g, 'a>,
+    fill: FileFill,
     admin: bool,
     /// Real snapshot → its projection (the memo's).
     pmap: HashMap<ObjectId, ObjectId>,
@@ -586,7 +602,7 @@ struct Walk<'g, 'a> {
     pending: Vec<(ObjectId, Arc<VRow>)>,
 }
 
-impl Walk<'_, '_> {
+impl Walk<'_, '_, '_> {
     fn has(&mut self, p: &ObjectId) -> Result<bool> {
         if self.rows.contains_key(p) || self.present.contains(p) {
             return Ok(true);
@@ -693,9 +709,11 @@ impl Walk<'_, '_> {
                 parents.push((*q, r));
             }
             let row = Arc::new(VRow::compute(&ps, &parents, x));
+            self.g.keep(px, row.clone());
             self.rows.insert(px, row.clone());
+            self.fill.add(self.g, self.t, px, &row)?;
             self.pending.push((px, row));
-            if self.pending.len() >= ROWS_PER_STATEMENT {
+            if self.pending.len() >= ROWS_PER_STATEMENT || self.fill.pending.len() >= 4 * ROWS_PER_STATEMENT {
                 self.flush()?;
             }
         }
@@ -706,6 +724,9 @@ impl Walk<'_, '_> {
         if self.pending.is_empty() {
             return Ok(());
         }
+        // File history first: a graph row's presence means its file
+        // history is there.
+        self.fill.flush(self.g)?;
         self.g.add(&self.pending)?;
         self.pending.clear();
         Ok(())
@@ -724,6 +745,10 @@ pub struct State {
     started: Mutex<HashMap<i64, u64>>,
     /// One per fill running here: at most [`MAX_FILLS`] at once.
     slots: Arc<tokio::sync::Semaphore>,
+    /// One per blame computing here (S14): at most
+    /// [`super::files::BLAMES_AT_ONCE`] at once, so what blames hold in all
+    /// is bounded whatever the number of requests.
+    pub blames: Arc<tokio::sync::Semaphore>,
 }
 
 type Fill = watch::Receiver<Option<std::result::Result<(), String>>>;
@@ -735,6 +760,7 @@ impl Default for State {
             fills: Mutex::new(HashMap::new()),
             started: Mutex::new(HashMap::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_FILLS)),
+            blames: Arc::new(tokio::sync::Semaphore::new(super::files::BLAMES_AT_ONCE)),
         }
     }
 }
