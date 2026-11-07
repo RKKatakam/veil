@@ -344,6 +344,19 @@ fn grants_hold_only_for_their_device_project_key_and_time() {
     // A Range on an object the grant does not reach: the same 404.
     let hidden = dev.get_as(&dev.grant, &[], &admin_root, None, &[("range", "bytes=0-0")]);
     assert_eq!(hidden.status, 404);
+    // A batch larger than the read-ahead window and the send chunk arrives
+    // whole and in order, the objects it does not reach left out.
+    let files: Vec<(String, String)> = (0..300).map(|i| (format!("src/bulk/f{i:03}.txt"), format!("{i} {}", "y".repeat(20_000)))).collect();
+    write_files(&p.dir, &files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>());
+    p.admin.commit_main(&p.dir, "bulk");
+    p.admin.ok(&p.dir, &["push"]);
+    let dev = Reader::new(&api, Some(&p.dev), &p.name);
+    let bulk: Vec<(Vec<ObjectId>, ObjectId)> = dev.walk().into_iter().filter(|(_, _, raw)| raw.len() > 20_000).map(|(c, id, _)| (c, id)).collect();
+    assert_eq!(bulk.len(), 300);
+    let mut asked = bulk.clone();
+    asked.insert(150, (vec![dev.root()], admin_root));
+    let got = dev.batch(&asked);
+    assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), bulk.iter().map(|b| b.1).collect::<Vec<_>>());
 }
 
 #[test]
@@ -505,8 +518,10 @@ fn bench_object_routes() {
         let body = axum::body::Bytes::from(serde_json::to_vec(&req).unwrap());
         let t = Instant::now();
         let r = hub.rt.block_on(veil_server::grant::batch(State(state.clone()), P(format!("{}:batch", p.name)), body)).unwrap();
-        b.push(t.elapsed().as_secs_f64() * 1e3);
         assert_eq!(r.status(), 200);
+        let all = hub.rt.block_on(axum::body::to_bytes(r.into_body(), usize::MAX)).unwrap();
+        b.push(t.elapsed().as_secs_f64() * 1e3);
+        assert_eq!(veil_core::hub::wire::read_frames(&all).unwrap().len(), many.len());
     }
     println!("POST :batch of {} objects, in process (ms): p50 {:.1}", many.len(), percentile(&mut b, 0.5));
     // Over HTTPS: the batch, and S1's fetch of the same objects by path.

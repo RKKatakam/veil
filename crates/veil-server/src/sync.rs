@@ -63,7 +63,7 @@ pub fn root_snapshot_id() -> ObjectId {
 
 /// Every history starts at the universal root and its empty tree, which no
 /// project stores.
-fn builtin(id: &ObjectId) -> Option<Bytes> {
+pub(crate) fn builtin(id: &ObjectId) -> Option<Bytes> {
     let empty = Object::Tree(Tree::default()).encode();
     if *id == ObjectId::hash(&empty) {
         return Some(Bytes::from(empty));
@@ -484,7 +484,7 @@ const FETCH_WINDOW: usize = 64;
 const FETCH_WINDOW_BYTES: u64 = 8 << 20;
 
 /// An answer of object frames, sent as [`fetch`] reads them.
-pub struct FrameStream(tokio::sync::mpsc::Receiver<std::result::Result<Bytes, std::io::Error>>);
+pub struct FrameStream(pub(crate) tokio::sync::mpsc::Receiver<std::result::Result<Bytes, std::io::Error>>);
 
 impl hyper::body::Body for FrameStream {
     type Data = Bytes;

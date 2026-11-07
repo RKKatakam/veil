@@ -172,8 +172,9 @@ struct Names {
     dirs: HashSet<ObjectId>,
     /// Conflict entries: a chain may end with one, naming one of its terms.
     conflicts: HashSet<ObjectId>,
-    /// Every entry's object and fallback: what the tree lets be served.
-    named: HashSet<ObjectId>,
+    /// Every entry's object and fallback: what the tree lets be served,
+    /// with the size its entry records (0 for a fallback or a tree).
+    named: HashMap<ObjectId, u64>,
 }
 
 /// Checks chains from one grant's root, remembering the trees it read (one
@@ -207,24 +208,31 @@ impl<'a> Chains<'a> {
     ///
     /// Only objects already reached from the root are read.
     pub fn allows(&mut self, chain: &[ObjectId], id: &ObjectId) -> Result<bool> {
+        Ok(self.check(chain, id)?.is_some())
+    }
+
+    /// [`Chains::allows`], with the size the naming entry records when it
+    /// allows (0 when it records none: a tree, a fallback, a conflict's
+    /// term). A server bounds what it reads ahead by it.
+    pub fn check(&mut self, chain: &[ObjectId], id: &ObjectId) -> Result<Option<u64>> {
         let Some(last) = chain.len().checked_sub(1) else {
-            return Ok(*id == self.root);
+            return Ok((*id == self.root).then_some(0));
         };
         if chain.len() > MAX_CHAIN || chain[0] != self.root {
-            return Ok(false);
+            return Ok(None);
         }
         for i in 0..last {
-            let Some(names) = self.names(&chain[i])? else { return Ok(false) };
+            let Some(names) = self.names(&chain[i])? else { return Ok(None) };
             let next = &chain[i + 1];
             if names.dirs.contains(next) {
                 continue;
             }
             if i + 1 == last && names.conflicts.contains(next) {
-                return Ok(self.terms(next)?.is_some_and(|t| t.contains(id)));
+                return Ok(self.terms(next)?.is_some_and(|t| t.contains(id)).then_some(0));
             }
-            return Ok(false);
+            return Ok(None);
         }
-        Ok(self.names(&chain[last])?.is_some_and(|n| n.named.contains(id)))
+        Ok(self.names(&chain[last])?.and_then(|n| n.named.get(id).copied()))
     }
 
     fn names(&mut self, tree: &ObjectId) -> Result<Option<Arc<Names>>> {
@@ -239,8 +247,10 @@ impl<'a> Chains<'a> {
                     EntryKind::Conflict => n.conflicts.insert(e.id),
                     EntryKind::File | EntryKind::Symlink => false,
                 };
-                n.named.insert(e.id);
-                n.named.extend(e.fallback);
+                n.named.insert(e.id, e.size);
+                if let Some(f) = e.fallback {
+                    n.named.entry(f).or_insert(0);
+                }
             }
             Arc::new(n)
         });

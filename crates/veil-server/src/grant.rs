@@ -11,9 +11,10 @@
 //!   epoch), the device's signature of the request, then each object's
 //!   chain from the grant's root, and only then read the object. "Not
 //!   reachable" and "not there" get the same answer. Every object is read
-//!   through [`crate::store::Objects::get`] and served on its own, after its
-//!   own check: wherever the store keeps it (a pack, later: S28), nothing
-//!   else is ever handed out with it.
+//!   through one function (`read`, over [`crate::store::Objects::get`]) and
+//!   served on its own, after its own check: wherever the store keeps it (a
+//!   pack, later: S28), nothing else is ever handed out with it. A batch is
+//!   streamed with bounded memory, as `sync::fetch` is.
 //! * **Access epochs.** Every change that can take access away bumps an
 //!   epoch in its own transaction (database triggers,
 //!   `migrations/0004_access_epochs.sql`). The server refuses a grant older
@@ -239,32 +240,81 @@ async fn check(hub: &Hub, project: &str, token: &str, ts: i64, signature: Option
     Ok(g)
 }
 
-/// The objects of `wants` that `grant`'s root reaches, each read only after
-/// its own chain check; `None` for the rest (not reached, or not there).
-async fn serve(hub: &Arc<Hub>, grant: &Grant, wants: Vec<(Vec<ObjectId>, ObjectId)>) -> Result<Vec<Option<Bytes>>> {
+/// Which of `wants` `grant`'s root reaches, in order, with the size each
+/// one's entry records. Reads only trees the chains reach.
+async fn reached(hub: &Arc<Hub>, grant: &Grant, wants: Vec<(Vec<ObjectId>, ObjectId)>) -> Result<Vec<(ObjectId, u64)>> {
     let root = grant.body.root;
-    let project = grant.body.project_id;
-    let allowed: Vec<Option<ObjectId>> = sync::blocking(hub, project, move |src| {
+    sync::blocking(hub, grant.body.project_id, move |src| {
         let mut chains = Chains::new(src, root);
-        wants.iter().map(|(chain, id)| Ok(chains.allows(chain, id)?.then_some(*id))).collect()
-    })
-    .await?;
-    // Only checked objects are looked up, so timing says nothing of others.
-    hub.objects.prefetch(project, allowed.iter().flatten().copied().collect()).await;
-    sync::blocking(hub, project, move |src| {
-        allowed
-            .into_iter()
-            .map(|id| match id {
-                None => Ok(None),
-                Some(id) => match src.raw(&id) {
-                    Ok(raw) => Ok(Some(raw)),
-                    Err(VeilError::Missing(_)) => Ok(None),
-                    Err(e) => Err(e.into()),
-                },
-            })
-            .collect()
+        let mut out = Vec::new();
+        for (chain, id) in &wants {
+            if let Some(size) = chains.check(chain, id)? {
+                out.push((*id, size));
+            }
+        }
+        Ok(out)
     })
     .await
+}
+
+/// A checked object, from the store (`None`: not there). The one place the
+/// object routes read an object: whatever holds it, only it is returned.
+async fn read(hub: &Hub, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
+    if let Some(b) = sync::builtin(id) {
+        return Ok(Some(b));
+    }
+    Ok(hub.objects.get(project, id).await?)
+}
+
+/// Most objects, and about the most bytes (by the sizes their entries
+/// record), read ahead of the one a batch sends next: its memory is
+/// bounded, as `sync::fetch`'s is (BUG-860).
+const WINDOW: usize = 64;
+const WINDOW_BYTES: u64 = 8 << 20;
+
+/// Checked objects `items`, read a window ahead and sent as frames in
+/// order; one that is not there is left out. A failure ends the stream
+/// with an error, so it is never taken as whole.
+fn stream(hub: Arc<Hub>, project: i64, items: Vec<(ObjectId, u64)>) -> sync::FrameStream {
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        let mut set = tokio::task::JoinSet::new();
+        let mut ready: std::collections::HashMap<usize, Option<Bytes>> = std::collections::HashMap::new();
+        let (mut next, mut sent, mut ahead) = (0usize, 0usize, 0u64);
+        let mut out = Vec::new();
+        while sent < items.len() {
+            while next < items.len() && next - sent < WINDOW && (next == sent || ahead + items[next].1 <= WINDOW_BYTES) {
+                let (hub, id, i) = (hub.clone(), items[next].0, next);
+                set.spawn(async move { (i, read(&hub, project, &id).await) });
+                ahead += items[next].1;
+                next += 1;
+            }
+            while !ready.contains_key(&sent) {
+                match set.join_next().await {
+                    Some(Ok((i, Ok(raw)))) => {
+                        ready.insert(i, raw);
+                    }
+                    other => {
+                        eprintln!("veil-server: an object batch stopped: {other:?}");
+                        let _ = tx.send(Err(std::io::Error::other("the answer stopped"))).await;
+                        return;
+                    }
+                }
+            }
+            if let Some(raw) = ready.remove(&sent).flatten() {
+                put_frame(&mut out, &items[sent].0, &raw);
+            }
+            ahead -= items[sent].1;
+            sent += 1;
+            if out.len() >= 1 << 20 && tx.send(Ok(Bytes::from(std::mem::take(&mut out)))).await.is_err() {
+                return;
+            }
+        }
+        if !out.is_empty() {
+            let _ = tx.send(Ok(Bytes::from(out))).await;
+        }
+    });
+    sync::FrameStream(rx)
 }
 
 fn header<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -312,7 +362,10 @@ pub async fn get_object(State(hub): State<HubState>, Path((p, id)): Path<(String
     let chain = parse_chain(&headers)?;
     let (ts, sig) = parse_signature(&headers)?;
     let grant = check(&hub, &p, token, ts, sig.as_deref(), &[id]).await?;
-    let raw = serve(&hub, &grant, vec![(chain, id)]).await?.pop().flatten().ok_or_else(not_reached)?;
+    if reached(&hub, &grant, vec![(chain, id)]).await?.is_empty() {
+        return Err(not_reached());
+    }
+    let raw = read(&hub, grant.body.project_id, &id).await?.ok_or_else(not_reached)?;
     let octets = [(header::CONTENT_TYPE, "application/octet-stream".to_string())];
     match parse_range(&headers, raw.len()) {
         None => Ok((octets, raw).into_response()),
@@ -339,14 +392,9 @@ pub async fn batch(State(hub): State<HubState>, Path(target): Path<String>, body
     }
     let ids: Vec<ObjectId> = req.wants.iter().map(|w| w.id).collect();
     let grant = check(&hub, p, &req.grant, req.ts, req.signature.as_deref(), &ids).await?;
-    let served = serve(&hub, &grant, req.wants.into_iter().map(|w| (w.chain, w.id)).collect()).await?;
-    let mut out = Vec::new();
-    for (id, raw) in ids.iter().zip(served) {
-        if let Some(raw) = raw {
-            put_frame(&mut out, id, &raw);
-        }
-    }
-    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], out).into_response())
+    let items = reached(&hub, &grant, req.wants.into_iter().map(|w| (w.chain, w.id)).collect()).await?;
+    let body = axum::body::Body::new(stream(hub.clone(), grant.body.project_id, items));
+    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], body).into_response())
 }
 
 #[derive(Deserialize)]

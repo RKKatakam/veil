@@ -1555,8 +1555,10 @@ grants are **signed**.
   the root, and an object is read only after its own check, so "not
   reachable" and "not there" are the same `404` (the same body), and in a
   batch both are left out. Every object, trees included, is read through
-  `store::Objects::get`, one at a time: when small objects move into packs
-  (S28), only that function changes, and a pack is never handed out.
+  `store::Objects::get`, one at a time (`grant::read`): when small objects
+  move into packs (S28), only that function changes, and a pack is never
+  handed out. A batch is streamed as `fetch` is (BUG-860): at most 64
+  objects and about 8 MiB (by the sizes their entries record) read ahead.
 * **Access epochs.** One clock row, `access_epoch_clock`, incremented by
   every bump while the bump's transaction holds its lock, so epochs
   commit in increasing order. Database triggers bump, in the transaction
