@@ -72,6 +72,10 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub session_ttl: Duration,
     pub db_connections: u32,
+    /// Derive, in the background once serving, every branch a landing left
+    /// underived (`derive::resume`). Servers do; tests that count
+    /// their own derive runs turn it off.
+    pub catch_up_at_start: bool,
 }
 
 /// A running server.
@@ -153,6 +157,9 @@ pub async fn start(config: Config) -> Result<Running> {
     let (tx, rx) = tokio::sync::watch::channel(false);
     let app = api::router(hub.clone());
     let task = tokio::spawn(serve_tls(listener, tls, app, rx));
+    if config.catch_up_at_start {
+        tokio::spawn(derive::resume(hub.clone(), None));
+    }
     Ok(Running {
         addr,
         cert_pem,

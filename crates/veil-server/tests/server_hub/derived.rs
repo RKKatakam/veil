@@ -1848,10 +1848,9 @@ mod s12_adversarial {
     /// reader took `k`. Any viewer's first `visible`, `rep` or
     /// `merge_bases` of such a branch pays it (S13: anyone on Earth).
     #[test]
-    #[ignore = "BUG-980: Reader::visible and rep walk a run of hidden changes again for each of them (quadratic)"]
     fn bug_980_a_run_of_hidden_changes_makes_the_reader_quadratic() {
         let th = TestHub::start();
-        let time = |k: usize| -> Duration {
+        let time = |k: usize| -> (Duration, u64) {
             let (text, bindings) = devs_policy();
             let mut h = Hist::new(&th, &text, &bindings);
             let (t0, o0) = tree_of(&Files::from([("pub/a.txt".to_string(), b"a\n".to_vec())]));
@@ -1880,18 +1879,20 @@ mod s12_adversarial {
                     let r = Reader::new(g, &lines, &view);
                     let t = Instant::now();
                     let v = r.visible(&m)?;
-                    Ok((v, t.elapsed()))
+                    Ok((v, (t.elapsed(), r.work())))
                 }))
                 .unwrap();
             assert!(!visible, "the merge brings nothing new to anyone on Earth");
             took
         };
         let small: usize = std::env::var("VEIL_BUG980_HIDDEN").ok().and_then(|s| s.parse().ok()).unwrap_or(500);
-        let one = time(small);
-        println!("BUG-980: visible(merge) over {small} hidden changes: {one:?}");
-        let four = time(small * 4);
-        println!("BUG-980: visible(merge) over {} hidden changes: {four:?}", small * 4);
-        // Linear: about 4x. Quadratic: about 16x.
+        let (one, w1) = time(small);
+        println!("BUG-980: visible(merge) over {small} hidden changes: {one:?}, {w1} steps");
+        let (four, w4) = time(small * 4);
+        println!("BUG-980: visible(merge) over {} hidden changes: {four:?}, {w4} steps", small * 4);
+        // Linear: about 4x. Quadratic: about 16x. The steps say it whatever
+        // the machine's load; the time too, more loosely.
+        assert!(w4 <= w1 * 4 + 16, "{w4} steps vs {w1}");
         assert!(four < one * 8 + Duration::from_secs(2), "{four:?} vs {one:?}");
     }
 
@@ -1905,7 +1906,6 @@ mod s12_adversarial {
     /// rebuild of a line (`prepare_lists`) and every S13 read of the change
     /// decodes it whole.
     #[test]
-    #[ignore = "BUG-981: the folders a change lists are not counted against MAX_PATHS (uncapped changed-paths objects)"]
     fn bug_981_empty_folders_are_not_capped() {
         let th = TestHub::start();
         let (text, bindings) = devs_policy();
@@ -1949,7 +1949,6 @@ mod s12_adversarial {
     /// underived and its projections unmemoised until the same branch moves
     /// again; the design (§S12, "The worker") says the next landing resumes.
     #[test]
-    #[ignore = "BUG-982: a skipped or lost landing is never resumed by the next landing"]
     fn bug_982_a_skipped_landing_is_resumed_by_the_next() {
         let th = TestHub::start();
         let (text, bindings) = devs_policy();
@@ -1992,5 +1991,22 @@ mod s12_adversarial {
         };
         assert!(derived(m), "main's landing derived main");
         assert!(derived(s), "side's tip, skipped while the lock was held, is never derived by a later landing");
+        // A landing lost to a restart: the branch moved, no run followed.
+        // The next server's start-up catch-up (`derive::resume`, what
+        // `catch_up_at_start` runs) derives it.
+        let (t3, o3) = tree_of(&Files::from([("pub/a.txt".to_string(), b"lost\n".to_vec())]));
+        let l = commit_tree(&th, &mut h, &[s], t3, o3, 4, 4);
+        h.set_branch(&th, "side", l);
+        hub.derive.clear_cache();
+        th.rt.block_on(derive::resume(hub.clone(), Some(id)));
+        assert!(derived(l), "the start-up catch-up derives a landing lost to a restart");
+        let through: String = th.rt.block_on(async {
+            sqlx::query_scalar("SELECT through_snapshot FROM derive_progress WHERE project_id = $1 AND branch = 'side'")
+                .bind(id)
+                .fetch_one(&hub.db)
+                .await
+                .unwrap()
+        });
+        assert_eq!(through, l.hex());
     }
 }

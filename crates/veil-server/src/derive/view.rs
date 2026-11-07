@@ -19,7 +19,10 @@
 //! whole changed-paths object of a mixed change. Answers never depend on
 //! hidden data; their cost does.
 
-use std::{cell::RefCell, collections::HashMap};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+};
 
 use veil_core::{hub::access::View, hub::project::Change, ObjectId};
 
@@ -37,9 +40,12 @@ pub struct Reader<'a> {
     /// The lists the viewer may read.
     pub keys: Vec<String>,
     visible: RefCell<HashMap<ObjectId, bool>>,
-    /// The representative of snapshots already walked ([`Reader::rep`]).
+    /// Snapshots already walked, and where the walk went from them: a
+    /// snapshot whose representative is that one's ([`Reader::known_rep`]).
     reps: RefCell<HashMap<ObjectId, ObjectId>>,
     listed: RefCell<HashMap<ObjectId, bool>>,
+    /// Steps taken: snapshots walked and list lookups ([`Reader::work`]).
+    work: Cell<u64>,
 }
 
 /// What deciding one snapshot's visibility needs: nothing more, or another
@@ -59,12 +65,20 @@ impl<'a> Reader<'a> {
             visible: RefCell::new(HashMap::new()),
             reps: RefCell::new(HashMap::new()),
             listed: RefCell::new(HashMap::new()),
+            work: Cell::new(0),
         }
+    }
+
+    /// The steps this reader has taken (snapshots walked, list lookups):
+    /// what its answers cost, whatever the database's speed.
+    pub fn work(&self) -> u64 {
+        self.work.get()
     }
 
     /// Is `id` on one of the viewer's lists (did it change something they
     /// may read)?
     pub fn listed(&self, id: &ObjectId) -> Result<bool> {
+        self.work.set(self.work.get() + 1);
         let row = self.g.get(id)?;
         let cx = self.g.cx;
         let pool = &cx.hub().db;
@@ -135,29 +149,10 @@ impl<'a> Reader<'a> {
 
     /// Decide `x` from what is decided already, or name what it needs.
     fn step(&self, x: &ObjectId) -> Result<Step> {
+        if let Some(v) = self.simple(x)? {
+            return Ok(Step::Done(v));
+        }
         let row = self.g.get(x)?;
-        if row.changed.as_deref() == Some(WITHHELD) {
-            // An embargo line is withheld until its release (S22).
-            return Ok(Step::Done(false));
-        }
-        let cached = self.listed.borrow().get(x).copied();
-        let listed = match cached {
-            Some(l) => l,
-            None => {
-                let l = self.listed(x)?;
-                self.listed.borrow_mut().insert(*x, l);
-                l
-            }
-        };
-        if listed {
-            return Ok(Step::Done(true));
-        }
-        if row.parents.len() == 1 {
-            return Ok(Step::Done(row.changed.as_deref() == Some(NONE)));
-        }
-        if row.parents.len() < 2 {
-            return Ok(Step::Done(false));
-        }
         let first = match self.known_rep(&row.parents[0])? {
             Ok(r) => r,
             Err(need) => return Ok(Step::Need(need)),
@@ -172,30 +167,79 @@ impl<'a> Reader<'a> {
         Ok(Step::Done(other))
     }
 
-    /// The representative of `id` from what is decided already (each step
-    /// remembered), or the first snapshot on the way whose visibility is
-    /// not decided yet.
+    /// The visibility of `x` when it needs no other snapshot's: withheld,
+    /// on a list, or one parent. `None` for a merge not on a list.
+    fn simple(&self, x: &ObjectId) -> Result<Option<bool>> {
+        let row = self.g.get(x)?;
+        if row.changed.as_deref() == Some(WITHHELD) {
+            // An embargo line is withheld until its release (S22).
+            return Ok(Some(false));
+        }
+        let cached = self.listed.borrow().get(x).copied();
+        let listed = match cached {
+            Some(l) => l,
+            None => {
+                let l = self.listed(x)?;
+                self.listed.borrow_mut().insert(*x, l);
+                l
+            }
+        };
+        if listed {
+            return Ok(Some(true));
+        }
+        match row.parents.len() {
+            0 => Ok(Some(false)),
+            1 => Ok(Some(row.changed.as_deref() == Some(NONE))),
+            _ => Ok(None),
+        }
+    }
+
+    /// The representative of `id`, or the first merge on its first-parent
+    /// line whose visibility is not decided yet. One-parent snapshots are
+    /// decided as they are reached, and everything walked is left pointing
+    /// at where the walk ended (`reps`: "its representative is that one's"),
+    /// so no snapshot is walked twice (BUG-980): a run of `k` hidden changes
+    /// costs `k`, whatever merges sit on it.
     fn known_rep(&self, id: &ObjectId) -> Result<std::result::Result<ObjectId, ObjectId>> {
         let mut walked = Vec::new();
         let mut x = *id;
-        let r = loop {
-            if let Some(r) = self.reps.borrow().get(&x) {
-                break *r;
+        let out = loop {
+            self.work.set(self.work.get() + 1);
+            let pointer = self.reps.borrow().get(&x).copied();
+            if let Some(t) = pointer {
+                walked.push(x);
+                x = t;
+                continue;
             }
-            match self.decided(&x) {
-                Some(true) => break x,
+            let v = match self.decided(&x) {
+                Some(v) => Some(v),
+                None => {
+                    let v = self.simple(&x)?;
+                    if let Some(v) = v {
+                        self.visible.borrow_mut().insert(x, v);
+                    }
+                    v
+                }
+            };
+            match v {
+                Some(true) => break Ok(x),
                 Some(false) => {
                     walked.push(x);
                     x = self.g.get(&x)?.parents[0];
                 }
-                None => return Ok(Err(x)),
+                None => break Err(x),
             }
+        };
+        let end = match out {
+            Ok(r) | Err(r) => r,
         };
         let mut reps = self.reps.borrow_mut();
         for w in walked {
-            reps.insert(w, r);
+            if w != end {
+                reps.insert(w, end);
+            }
         }
-        Ok(Ok(r))
+        Ok(out)
     }
 
     /// The snapshot of the viewer's history that `id` stands for: `id`, or

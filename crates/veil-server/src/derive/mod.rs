@@ -66,13 +66,16 @@ use crate::{
 pub const INDEX: (&str, i32) = ("history", 1);
 /// Snapshots derived between two writes to the database.
 const FLUSH_EVERY: usize = 512;
-/// Rows per insert statement.
-const ROWS_PER_STATEMENT: usize = 2_000;
+/// Rows per insert statement: small enough that one stays well inside the
+/// statement timeout on a busy YugabyteDB.
+const ROWS_PER_STATEMENT: usize = 1_000;
 /// How long a deriver waits for another server's deriver of the same
 /// project; after that the other one (or the next landing) derives it.
 const LOCK_WAIT: Duration = Duration::from_secs(60);
-/// Retries of one statement on a retryable error.
-const STATEMENT_DEADLINE: Duration = Duration::from_secs(45);
+/// Retries of one statement on a retryable error (a statement timeout
+/// included). The deriver works in the background, so it may wait out a
+/// busy database longer than a request does.
+const STATEMENT_DEADLINE: Duration = Duration::from_secs(120);
 /// The advisory lock of project `p` is `LOCK_BASE ^ p`.
 const LOCK_BASE: i64 = 0x7665_696c_6472_0000; // "veildr"
 
@@ -263,9 +266,36 @@ pub fn landed(hub: &Arc<Hub>, project: i64, branches: Vec<String>) {
 /// What [`landed`] runs for the branches a landing moved: derive them, then
 /// memoise their tips' projections for every view key.
 pub async fn landing(hub: &Arc<Hub>, project: i64, branches: Vec<String>) -> Result<Stats> {
-    let stats = catch_up(hub, project, Scope::Branches(branches.clone())).await?;
-    memo_tips(hub, project, &branches).await?;
+    let stats = catch_up(hub, project, Scope::Branches(branches)).await?;
+    memo_tips(hub, project, &stats.branches).await?;
     Ok(stats)
+}
+
+/// At start-up: resume every project (or only `project`) with a branch
+/// whose derived tip is not its target (a landing skipped, failed or cut
+/// by a restart), one project at a time, in the background (BUG-982).
+pub async fn resume(hub: Arc<Hub>, project: Option<i64>) {
+    let projects: Result<Vec<i64>> = sqlx::query_scalar(
+        "SELECT DISTINCT b.project_id FROM branches b LEFT JOIN derive_progress d \
+         ON d.project_id = b.project_id AND d.index_name = $1 AND d.index_version = $2 AND d.branch = b.name \
+         WHERE d.through_snapshot IS DISTINCT FROM b.target AND ($3::bigint IS NULL OR b.project_id = $3)",
+    )
+    .bind(INDEX.0)
+    .bind(INDEX.1)
+    .bind(project)
+    .fetch_all(&hub.db)
+    .await
+    .map_err(Error::from);
+    match projects {
+        Ok(projects) => {
+            for p in projects {
+                if let Err(e) = landing(&hub, p, Vec::new()).await {
+                    eprintln!("veil-server: resuming the derived history of project {p}: {e:?}");
+                }
+            }
+        }
+        Err(e) => eprintln!("veil-server: finding underived branches: {e:?}"),
+    }
 }
 
 /// Derive `snapshot` of `project` (committed history) and everything below
@@ -285,8 +315,11 @@ pub async fn ensure(hub: &Arc<Hub>, project: i64, snapshot: ObjectId) -> Result<
 }
 
 /// What one run derived.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
+    /// Branches whose tips the run derived (and recorded in
+    /// `derive_progress`).
+    pub branches: Vec<String>,
     /// Snapshots derived.
     pub snapshots: usize,
     /// Snapshots added to lists a new policy needed.
@@ -300,7 +333,9 @@ pub struct Stats {
 pub enum Scope {
     /// Every branch: a full catch-up.
     All,
-    /// These branches (what a landing moved); the others are not touched.
+    /// These branches (what a landing moved), and any branch whose derived
+    /// tip is not its target (a landing skipped, failed or cut short:
+    /// BUG-982); the others are not touched.
     Branches(Vec<String>),
     /// One snapshot of committed history and what is below it (on demand).
     Snapshot(ObjectId),
@@ -398,10 +433,16 @@ fn run(cx: &Cx, scope: Scope) -> Result<Stats> {
         Scope::Snapshot(_) => Vec::new(),
         Scope::All => cx.db(|| sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1").bind(cx.project()).fetch_all(pool))?,
         Scope::Branches(names) => cx.db(|| {
-            sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 AND name = ANY($2)")
-                .bind(cx.project())
-                .bind(names)
-                .fetch_all(pool)
+            sqlx::query_as(
+                "SELECT b.name, b.target FROM branches b LEFT JOIN derive_progress d \
+                 ON d.project_id = b.project_id AND d.index_name = $3 AND d.index_version = $4 AND d.branch = b.name \
+                 WHERE b.project_id = $1 AND (b.name = ANY($2) OR d.through_snapshot IS DISTINCT FROM b.target)",
+            )
+            .bind(cx.project())
+            .bind(names)
+            .bind(INDEX.0)
+            .bind(INDEX.1)
+            .fetch_all(pool)
         })?,
     };
     let tips: Vec<(String, ObjectId)> = rows.into_iter().filter_map(|(n, t)| ObjectId::from_hex(&t).ok().map(|t| (n, t))).collect();
@@ -434,6 +475,7 @@ fn run(cx: &Cx, scope: Scope) -> Result<Stats> {
             .execute(pool)
         })?;
     }
+    b.stats.branches = names;
     Ok(b.stats)
 }
 
@@ -629,7 +671,8 @@ impl<'a> Batch<'a> {
                     self.writes.history.push((key.clone(), row.depth, hex.clone()));
                     self.history.entry(key).or_default().push((row.depth, x));
                 }
-                if ch.len() > changes::MAX_PATHS {
+                // Folders count against the cap too (BUG-981).
+                if ch.len() + dirs.len() > changes::MAX_PATHS {
                     row.changed = Some(MANY.into());
                 } else {
                     let (from, capped, similar) = changes::sources(src, &ch)?;
