@@ -6,9 +6,7 @@
 //!   never enter a snapshot, are never searched, and not counted either
 //!   (no existence oracle). There is no option to read the disk.
 //! * **One reader.** Content is read through [`readable_version`](crate::blame::readable_version):
-//!   [`Readable::Plain`] is searched, [`Readable::Fallback`] (the last
-//!   public version of a file this reader cannot open) is searched and
-//!   labelled [`Tier::Fallback`], [`Readable::Redacted`] is counted in
+//!   [`Readable::Plain`] is searched, [`Readable::Redacted`] is counted in
 //!   [`Skipped::sealed`] and never searched. Ciphertext never reaches the
 //!   matcher.
 //! * **Bounded.** The regex is linear-time with compile limits
@@ -75,10 +73,6 @@ pub fn compile(pattern: &str, o: &GrepOptions) -> Result<Regex> {
 pub enum Tier {
     Public,
     Cloaked(String),
-    Embargoed(String),
-    /// The last public version of a file this reader cannot open: members
-    /// see newer content.
-    Fallback,
 }
 
 impl Tier {
@@ -86,8 +80,6 @@ impl Tier {
         match self {
             Tier::Public => "public",
             Tier::Cloaked(_) => "cloaked",
-            Tier::Embargoed(_) => "embargoed",
-            Tier::Fallback => "fallback",
         }
     }
 }
@@ -117,7 +109,7 @@ pub struct GrepFile {
 /// What was not searched. Only files of the snapshot are ever counted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Skipped {
-    /// Unreadable for this reader (and no readable fallback).
+    /// Unreadable for this reader.
     pub sealed: usize,
     /// Binary files that matched (their lines are not shown).
     pub binary: usize,
@@ -153,11 +145,9 @@ fn search_one(store: &ObjectStore, path: &VPath, e: &TreeEntry, re: &Regex, o: &
             let tier = match visibility {
                 Visibility::Public => Tier::Public,
                 Visibility::Cloaked { scope } => Tier::Cloaked(scope),
-                Visibility::Embargoed { embargo } => Tier::Embargoed(embargo),
             };
             (data, tier)
         }
-        Readable::Fallback { data, .. } => (data, Tier::Fallback),
         Readable::Redacted(_) => return Ok(One::Sealed),
     };
     if data.len() > MAX_FILE {

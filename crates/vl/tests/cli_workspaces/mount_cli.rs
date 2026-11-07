@@ -243,9 +243,9 @@ fn cloaked_files_as_a_member_and_as_a_non_member() {
     let env = Env::new();
     let alice = env.dir("alice");
     write(&alice, "README.md", "hello\n");
-    write(&alice, "internal/plan.md", &format!("{CLOAKED}\n"));
+    write(&alice, "internal/.env.plan", &format!("{CLOAKED}\n"));
     env.ok("alice", &alice, &["init"]);
-    env.ok("alice", &alice, &["cloak", "internal/"]);
+    env.ok("alice", &alice, &["cloak", "internal/.env.plan"]);
     env.ok("alice", &alice, &["commit", "-m", "initial"]);
     env.ok("alice", &alice, &["tag", "set", "main", "-r", "@-"]);
     // An ordinary line next to it (its own snapshot, so the embargoed
@@ -253,8 +253,7 @@ fn cloaked_files_as_a_member_and_as_a_non_member() {
     write(&alice, "other.txt", "o\n");
     env.ok("alice", &alice, &["commit", "--no-advance", "-m", "other"]);
     env.ok("alice", &alice, &["tag", "set", "base1", "-r", "@-"]);
-    // An embargoed fix of README.md on main: readers without the key see
-    // the previous version.
+    // An embargoed fix of README.md on main: withheld from every push.
     env.ok("alice", &alice, &["ws", "new", "fix", "-r", "main"]);
     ws_write(&env, "alice", &alice, &["ws", "write", "fix", "README.md"], &format!("hello\n{EMBARGOED}\n"));
     env.ok("alice", &alice, &["describe", "-r", "fix@", "-m", "fix"]);
@@ -265,47 +264,39 @@ fn cloaked_files_as_a_member_and_as_a_non_member() {
     env.ok("bob", &env.root, &["clone", "team", "bob"]);
     let bob = env.root.join("bob");
 
-    // Alice (a member, holding the embargo key) sees both.
+    // Alice (a member) sees both.
     env.ok("alice", &alice, &["ws", "new", "view", "-r", "main"]);
     let (am, _ga) = mount(&env, "alice", &alice, "view");
-    assert_eq!(read(&am, "internal/plan.md"), format!("{CLOAKED}\n"));
+    assert_eq!(read(&am, "internal/.env.plan"), format!("{CLOAKED}\n"));
     assert!(read(&am, "README.md").contains(EMBARGOED));
     // An edit of a cloaked file is recorded sealed.
-    std::fs::write(am.join("internal/plan.md"), format!("{CLOAKED} v2\n")).unwrap();
+    std::fs::write(am.join("internal/.env.plan"), format!("{CLOAKED} v2\n")).unwrap();
     env.ok("alice", &alice, &["ws", "unmount", "view"]);
     let ls = env.stdout("alice", &alice, &["ls", "-r", "view@"]);
-    assert!(ls.lines().any(|l| l.contains("internal/plan.md") && l.starts_with("cloaked:team")), "{ls}");
+    assert!(ls.lines().any(|l| l.contains("internal/.env.plan") && l.starts_with("cloaked:team")), "{ls}");
 
-    // Bob (no key) sees what his checkout shows: no internal/, the
-    // pre-embargo README.md, and no plaintext anywhere.
-    env.ok("bob", &bob, &["ws", "new", "view", "-r", "main"]);
-    let (bm, _gb) = mount(&env, "bob", &bob, "view");
+    // The unreleased embargoed merge never reached the team remote.
+    let out = env.vl("bob", &bob, &["ws", "new", "view", "-r", "main"]);
+    assert!(!out.status.success(), "bob received the embargoed main: {}", text(&out));
+    // Bob (no key) sees what his checkout shows: no internal/, and no
+    // plaintext anywhere. His edit next to the hidden file is recorded, and
+    // the hidden file is carried, not deleted.
+    env.ok("bob", &bob, &["ws", "new", "work", "-r", "base1"]);
+    let (bm, _gw) = mount(&env, "bob", &bob, "work");
     assert_eq!(read(&bm, "README.md"), "hello\n");
-    assert_eq!(std::fs::metadata(bm.join("README.md")).unwrap().len(), 6, "the fallback's size");
     assert!(!bm.join("internal").exists(), "a directory holding only unreadable files shows");
-    assert!(!bm.join("internal/plan.md").exists());
-    assert!(std::fs::read(bm.join("internal/plan.md")).is_err());
+    assert!(!bm.join("internal/.env.plan").exists());
+    assert!(std::fs::read(bm.join("internal/.env.plan")).is_err());
     let mut seen = String::new();
     for e in walk(&bm) {
         seen.push_str(&e.display().to_string());
         seen.push_str(&String::from_utf8_lossy(&std::fs::read(&e).unwrap()));
     }
     assert!(!seen.contains(CLOAKED) && !seen.contains(EMBARGOED), "{seen}");
-    // On the embargoed line Bob's edit is held back (as `vl ws write`
-    // holds it back): it stays in the mount, unrecorded.
-    std::fs::write(bm.join("notes.txt"), "bob\n").unwrap();
-    let out = env.ok("bob", &bob, &["ws", "unmount", "view"]);
-    assert!(out.contains("notes.txt held back") && out.contains("kept 1 file(s)"), "{out}");
-    assert!(!files(&env, "bob", &bob, "view@").contains(&"notes.txt".into()));
-    // Next to the hidden file on an ordinary line it is recorded, and the
-    // hidden file is carried, not deleted.
-    env.ok("bob", &bob, &["ws", "new", "work", "-r", "base1"]);
-    let (bm, _gw) = mount(&env, "bob", &bob, "work");
-    assert!(!bm.join("internal").exists());
     std::fs::write(bm.join("notes.txt"), "bob\n").unwrap();
     let out = env.ok("bob", &bob, &["ws", "unmount", "work"]);
     let ls = env.stdout("bob", &bob, &["ls", "-r", "work@"]);
-    assert!(ls.contains("notes.txt") && ls.contains("internal/plan.md"), "{out}\n{ls}");
+    assert!(ls.contains("notes.txt") && ls.contains("internal/.env.plan"), "{out}\n{ls}");
 }
 
 fn walk(dir: &Path) -> Vec<PathBuf> {

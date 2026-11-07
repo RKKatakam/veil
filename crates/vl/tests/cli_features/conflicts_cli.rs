@@ -88,19 +88,24 @@ fn resolve_keeps_a_side_and_undo_brings_the_conflict_back() {
 }
 
 /// A conflict whose other side is sealed for `team`, as Bob sees it when he
-/// is not in `team`: redacted, and he cannot resolve it by editing.
+/// is not in `team`: redacted, and he cannot resolve it by editing. (A
+/// secret file, sealed on one line and exposed with `--force` on the other.)
 #[test]
 fn an_outsider_sees_a_sealed_side_redacted_and_cannot_resolve_it() {
     let env = Env::new();
-    let proj = env.project("alice", "proj", &[("a.txt", "one\ntwo\nthree\n")]);
-    env.ok("alice", &proj, &["ws", "new", "secret", "-r", "main", "--cloak", "team"]);
-    let mut c = env.cmd("alice", &proj, &["ws", "write", "secret", "a.txt"]);
+    let proj = env.project("alice", "proj", &[("README", "hi\n")]);
+    write(&proj, ".env.app", "one\ntwo\nthree\n");
+    env.ok("alice", &proj, &["cloak", ".env.app"]);
+    env.ok("alice", &proj, &["commit", "-m", "sealed"]);
+    env.ok("alice", &proj, &["ws", "new", "secret", "-r", "main"]);
+    let mut c = env.cmd("alice", &proj, &["ws", "write", "secret", ".env.app"]);
     c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     let mut child = c.spawn().unwrap();
     use std::io::Write;
     child.stdin.take().unwrap().write_all(b"one\nSEALED-SIDE-0042\nthree\n").unwrap();
     assert!(child.wait_with_output().unwrap().status.success());
-    write(&proj, "a.txt", "one\nPUBLIC\nthree\n");
+    env.ok("alice", &proj, &["expose", "--force", ".env.app"]);
+    write(&proj, ".env.app", "one\nPUBLIC\nthree\n");
     env.ok("alice", &proj, &["commit", "-m", "public"]);
     env.ok("alice", &proj, &["new", "@-", "secret@", "-m", "conflicted"]);
     env.ok("alice", &proj, &["tag", "set", "conflicted", "-r", "@"]);
@@ -110,11 +115,11 @@ fn an_outsider_sees_a_sealed_side_redacted_and_cannot_resolve_it() {
     env.ok("bob", &env.root, &["clone", "team", "bob"]);
     let bob = env.root.join("bob");
     env.ok("bob", &bob, &["new", "conflicted"]);
-    let shown = read(&bob, "a.txt");
+    let shown = read(&bob, ".env.app");
     assert!(shown.contains("PUBLIC") && !shown.contains("SEALED-SIDE-0042") && shown.contains("not shown"), "{shown}");
     let list = env.stdout("bob", &bob, &["resolve", "--list"]);
     assert!(list.contains("not readable here"), "{list}");
-    write(&bob, "a.txt", "one\nBOB\nthree\n");
+    write(&bob, ".env.app", "one\nBOB\nthree\n");
     let st = env.ok("bob", &bob, &["status"]);
-    assert!(st.contains("C a.txt"), "{st}");
+    assert!(st.contains("C .env.app"), "{st}");
 }

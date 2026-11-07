@@ -138,7 +138,6 @@ fn entry(name: &str, kind: EntryKind, id: ObjectId, size: u64) -> TreeEntry {
         size,
         executable: false,
         visibility: Default::default(),
-        fallback: None,
     }
 }
 
@@ -196,7 +195,6 @@ impl Hist {
             timestamp,
             predecessors: vec![],
             conflicts: vec![],
-            cloak: None,
             embargo: embargo.map(str::to_string),
             signature: None,
         };
@@ -1363,7 +1361,6 @@ fn derived_speed() {
             timestamp: 1_700_000_000_000 + i as i64 * 1000,
             predecessors: vec![],
             conflicts: vec![],
-            cloak: None,
             embargo: None,
             signature: None,
         };
@@ -1482,7 +1479,6 @@ mod s12_adversarial {
             timestamp,
             predecessors: vec![],
             conflicts: vec![],
-            cloak: None,
             embargo: None,
             signature: None,
         };

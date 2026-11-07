@@ -22,7 +22,7 @@ fn hostile_policy_dir() -> (Repo, Arc<MemoryBackend>, Arc<MemoryBackend>, Object
     fs.write(&p("db.secret"), b"password=hunter2-local-only\n").unwrap();
     let main = commit_files(&mut alice, &*fs, &[("README", "hi\n")], "v1");
     assert!(file_entry(&alice, &main, "db.secret").is_none());
-    alice.set_tag("main", main, None, false).unwrap();
+    alice.set_tag("main", main, false).unwrap();
     let hub = Arc::new(MemoryBackend::new());
     remote::push(&mut alice, hub.clone(), false, &[], false).unwrap();
 
@@ -35,7 +35,7 @@ fn hostile_policy_dir() -> (Repo, Arc<MemoryBackend>, Arc<MemoryBackend>, Object
     root.insert(file("NEWS", blob(&m, b"news\n")));
     let tree = store.put_tree(&root).unwrap();
     let evil = raw_snapshot(&m, vec![main], tree, "docs: news");
-    m.set_tag("main", evil, None, true).unwrap();
+    m.set_tag("main", evil, true).unwrap();
     remote::push(&mut m, hub.clone(), false, &["main".into()], false).unwrap();
     (alice, fs, hub, main, evil)
 }

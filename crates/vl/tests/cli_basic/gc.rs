@@ -7,6 +7,7 @@ use std::{
 
 fn vl(home: &Path, cwd: &Path, args: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_vl"))
+        .env("VEIL_TEST_PATH_REMOTES", "1")
         .args(args)
         .current_dir(cwd)
         .env("VEIL_HOME", home)
@@ -101,7 +102,7 @@ fn background_maintenance_starts_only_where_allowed_and_once() {
     std::fs::create_dir_all(&proj).unwrap();
     let run = |args: &[&str], ci: bool, auto: Option<&str>| {
         let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_vl"));
-        c.args(args).current_dir(&proj).env("VEIL_HOME", &home).env("VEIL_USER", "alice").env("NO_COLOR", "1").env_remove("CI").env_remove("VEIL_GC_AUTO");
+        c.env("VEIL_TEST_PATH_REMOTES", "1").args(args).current_dir(&proj).env("VEIL_HOME", &home).env("VEIL_USER", "alice").env("NO_COLOR", "1").env_remove("CI").env_remove("VEIL_GC_AUTO");
         if ci {
             c.env("CI", "1");
         }

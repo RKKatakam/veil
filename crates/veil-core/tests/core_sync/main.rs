@@ -1,5 +1,5 @@
-//! Remotes: incremental push and pull, push plans, remote locks, SFTP and
-//! storage efficiency.
+//! Repository-to-repository sync (the engine's in-process transfer),
+//! repository locks across hosts, and storage efficiency.
 //!
 //! One test binary for several suites, to save linking time and disk: each
 //! module was its own binary before (`tests/<module>.rs`, or a directory
@@ -10,16 +10,10 @@
 
 #[path = "../adversarial_support/mod.rs"]
 mod adversarial_support;
-#[path = "../sftp_support/mod.rs"]
-mod sftp_support;
 
-mod adversarial3_sftp;
 mod leak_helper;
-mod push_plan;
-mod push_two_phase;
+mod push_releases;
 mod remote_init_race;
 mod remote_lock;
-mod sftp_backend;
-mod sftp_sync;
 mod storage;
-mod sync_incremental;
+mod sync_repair;

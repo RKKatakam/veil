@@ -522,7 +522,6 @@ mod tests {
                                 size: c.len() as u64,
                                 executable: false,
                                 visibility: Visibility::Public,
-                                fallback: None,
                             });
                         }
                     }

@@ -5,7 +5,7 @@
 
 Move a change, or part of it, into its parent or another change.
 
-With no PATHS and no `-i`, `--hunks` or `--plan`, the whole change moves and is abandoned, its description joined to the destination's. Otherwise only what you choose moves; the change keeps the rest (and its description), and is abandoned only if nothing is left. Descendants are rebased. Squashing into a cloaked change seals what it brings for that change's scope.
+With no PATHS and no `-i`, `--hunks` or `--plan`, the whole change moves and is abandoned, its description joined to the destination's. Otherwise only what you choose moves; the change keeps the rest (and its description), and is abandoned only if nothing is left. Descendants are rebased.
 
 ```text
 vl squash [OPTIONS] [PATHS]...

@@ -6,7 +6,7 @@ From `integration` @ 4a62259. This round built the client groundwork for Veil's 
 - **Built, kept as history below:** B (benchmark), F (format 6), O (lock-free op log), I (history index, without the Bloom filters), G1 and G2 (streaming and background maintenance), P (two-phase pushes).
 - **P and G are the server's mechanisms** in client form: the server keeps the holding area and replaces the remote's lock with a compare-and-swap on one row (`docs/HUB.md` §4.5, §9.1), and replaces repacking with retention on object storage.
 - **Re-aimed at the server:** C becomes **fetch on demand from the server** (`6-partial-clone.md`); A (attribution) is built with the server's agent work. R and L are client-side and independent.
-- Where the text below mentions SFTP or path remotes, cloaked profiles or scope batches, it describes today's client as the round planned it.
+- Where the text below mentions SFTP or path remotes, cloaked profiles or scope batches, it describes the client as the round planned it. Repository format 8 later removed every non-secret encryption (cloaking of lines of work and folders, sealed attribution, embargo encryption and fallbacks): only secret files are encrypted.
 
 Designs and threat reviews:
 
@@ -74,7 +74,7 @@ One bump: `REPO_FORMAT = 6`, `min_vl_for_format(6)` = this round's release. It f
    - **An older vl refuses a format-6 repository outright.** This is the point: it would ignore `op_heads/`, read unfetched objects as redacted, and drop `agent` when rewriting.
 9. **Fixtures:** `tests/fixtures/format-6/`, generated once with `generate.sh <vl> <out> <format-5 set>`.
    - **The set:**
-     - attributed snapshots: a public one with a plaintext task, one whose prompt is sealed for a scope, and one on an embargoed line with task and prompt sealed under the embargo key;
+     - attributed snapshots with a plaintext task and prompt (sealed attribution was removed in repository format 8);
      - an op log with two heads and a merge operation carrying `rewritten` and `workspace`;
      - a partial clone's `repo.json`;
      - the `upgraded/` set.
@@ -282,7 +282,7 @@ That is about 19 agent-days without X: roughly 5 working days with four streams 
    - a reader racing loose-object consolidation (item 4, threat 2);
    - a reader racing staging publication (item 2).
 
-   Any of them can make a checkout write an embargo fallback over a member's cloaked file, a push skip history, or gc and fsck misjudge.
+   Any of them can make a checkout leave out a file the reader may read, a push skip history, or gc and fsck misjudge.
    - *Harness:* a fault-injecting store wrapper that turns random reads into "transiently absent" and "remote unreachable". Commands must either succeed with identical results or fail without writing.
    - Plus C2's audit table of every `is_unreadable()` site.
 2. **Concurrency without the repository lock** (item 2). Covers:
@@ -300,7 +300,7 @@ That is about 19 agent-days without X: roughly 5 working days with four streams 
 4. **Confidentiality of new local and remote artefacts.**
    - The index's Bloom filters (item 3, threats 1–2): byte-identical with and without keys.
    - What fetch on demand sends (item 6, threat 2): a server-side request log shows nothing outside the person's access.
-   - Attribution task and prompt on cloaked and embargoed lines (item 7, threats 1–2).
+   - Attribution task and prompt on embargoed lines (item 7, threats 1–2).
    - Public staging after a rejected push (item 1, threat 4).
 5. **The two-phase push.** The boundary disappearing between the phases (item 1, threat 2); the dry run drifting from the push (threat 12); the format-5 compatibility of staging (threat 13).
    - *Harness:* `push_plan.rs`'s property test with a second client force-pushing and pruning between the phases.

@@ -229,7 +229,7 @@ pub fn run_in_memory(sizes: &[usize], runs: usize) -> Result<serde_json::Value> 
         }
         let (fs, mut repo, mut cache) = kept.ok_or_else(|| anyhow!("no runs"))?;
         let (c, _) = repo.commit_working_copy("default", "import")?;
-        repo.set_tag("main", c, None, false)?;
+        repo.set_tag("main", c, false)?;
         for r in 0..runs {
             let t = Instant::now();
             fs.write(&VPath::new("d001/f001.txt")?, format!("change {r}\n").as_bytes())?;

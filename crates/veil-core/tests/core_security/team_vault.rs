@@ -3,7 +3,6 @@
 //! revocation, rotation, and what never leaves (public remotes, Git).
 
 use crate::adversarial_support;
-use crate::sftp_support;
 
 use std::sync::Arc;
 
@@ -505,7 +504,7 @@ const SECRET_VALUE: &str = "sk_live_9f8e7d6c5b4a3210_TEAMVAULT_CANARY";
 fn the_vault_never_reaches_a_public_remote() {
     let mut alice = peer("alice");
     let commit = adversarial_support::commit_files(&mut alice.repo, &*alice.fs, &[("README", "hello\n")], "c");
-    alice.repo.set_tag("main", commit, None, false).unwrap();
+    alice.repo.set_tag("main", commit, false).unwrap();
     set(&alice, SECRET_NAME, SECRET_VALUE);
     alice.repo.keys().create_scope("ops").unwrap();
     alice.repo.keys().team_secret_write("ops", "OPS_ONLY_NAME_CANARY", Some("ops-value-canary")).unwrap();
@@ -528,35 +527,6 @@ fn the_vault_never_reaches_a_public_remote() {
     let r = push_public(&mut alice, &public);
     assert!(r.warnings.iter().any(|w| w.contains("team-vault record")), "{:?}", r.warnings);
     assert_eq!(record_files(&*public, "team").len(), 1);
-}
-
-#[test]
-fn entries_sync_over_sftp_and_the_remote_holds_ciphertext_only() {
-    let Some(server) = sftp_support::server() else { return };
-    let dir = tempfile::tempdir().unwrap();
-    let sftp = |root: &std::path::Path| -> Arc<dyn StorageBackend> { Arc::new(sftp_support::connect(&server, root)) };
-    let mut alice = peer("alice");
-    let bob_id = Identity::generate("bob");
-    alice.repo.keys().grant("team", &bob_id.public_id(), "bob").unwrap();
-    set(&alice, SECRET_NAME, SECRET_VALUE);
-    remote::push(&mut alice.repo, sftp(dir.path()), false, &[], false).unwrap();
-    let mut bob = Repo::init_for_clone(Arc::new(MemoryBackend::new()), Some(bob_id.clone()), "bob").unwrap();
-    remote::pull(&mut bob, "origin", sftp(dir.path())).unwrap();
-    assert_eq!(
-        bob.keys().team_vault("team").unwrap().get(SECRET_NAME).unwrap().value.as_deref(),
-        Some(SECRET_VALUE)
-    );
-    bob.keys().team_secret_write("team", SECRET_NAME, None).unwrap();
-    remote::push(&mut bob, sftp(dir.path()), false, &[], false).unwrap();
-    remote::pull(&mut alice.repo, "origin", sftp(dir.path())).unwrap();
-    assert_eq!(get(&alice, SECRET_NAME), None);
-    let disk = veil_core::DiskBackend::new(dir.path());
-    assert_eq!(record_files(&disk, "team").len(), 2);
-    for needle in [SECRET_NAME, SECRET_VALUE] {
-        assert!(backend_contains(&disk, needle.as_bytes()).is_empty(), "{needle} on the SFTP remote");
-    }
-    let r = fsck::fsck(Arc::new(disk), None).unwrap();
-    assert!(r.is_ok(), "{:?}", r.findings);
 }
 
 // ---- round-8 vault wave ---------------------------------------------------

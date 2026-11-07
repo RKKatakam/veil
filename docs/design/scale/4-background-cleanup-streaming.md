@@ -91,7 +91,7 @@ Three tasks. The first two never need reachability.
 1. **A loose file deleted before its pack is durable.** Consolidation deletes the loose copy, the new pack's `.idx` is lost at a power cut, and the object is gone.
    - *Invariant:* a loose object is removed only after the `.idx` naming its new pack returned from a durable write, and after a barrier covering the `.pack`.
    - *Test:* the `crash.rs` sweep over `maintenance::consolidate` and `merge_packs` in all three modes. Every object reachable before is readable after, and `fsck` passes.
-2. **A reader misses an object during consolidation.** A reader with a cached pack list looks loose (gone), then in its known packs (not there yet), and reports `Missing`. **To the engine `Missing` means redacted** (`VeilError::is_unreadable`), so a builder could carry a "redacted" entry, a checkout could write the fallback, and a push could skip it.
+2. **A reader misses an object during consolidation.** A reader with a cached pack list looks loose (gone), then in its known packs (not there yet), and reports `Missing`. **To the engine `Missing` means redacted** (`VeilError::is_unreadable`), so a builder could carry a "redacted" entry, a checkout could leave it out, and a push could skip it.
    - *Invariant:* `ObjectStore` returns `Missing` only after a loose probe **and** a reload of the pack list **and** a second loose probe.
    - *Test:* one thread consolidates and merges in a loop while 8 threads read random reachable objects. No read ever returns `Missing`.
 3. **Prune beside lock-free writers.** Item 2 commits run during a prune. An operation published after the prune read the heads references an object the mark did not reach.

@@ -2,7 +2,7 @@
 //!
 //! An envelope is a ciphertext plus the *label* (the `scope` field) that
 //! names the key opening it: `<scope>` (generation 0), `<scope>#<key-id>`
-//! (a key generation, see `keychain`), `embargo/<id>`, `local`, or one of
+//! (a key generation, see `keychain`), `local`, or one of
 //! the role prefixes in [`domains`]. The label is always authenticated as
 //! associated data. Two constructions exist (see `docs/CRYPTO.md`):
 //!
@@ -17,7 +17,7 @@
 //!   is exactly the deterministic-AE security notion SIV is proven for.
 //! * [`Suite::XChaCha20Poly1305`] — an explicit 24-byte nonce. Used with a
 //!   **random** nonce for everything that need not be deterministic
-//!   (descriptions, sealed keys, the vault), in every format. In formats
+//!   (sealed keys, the vault), in every format. In formats
 //!   1–2 it was also used for objects with a nonce derived by a keyed
 //!   BLAKE3 hash of label and plaintext (a homemade SIV). That legacy
 //!   construction is still *read* everywhere and still *written* by
@@ -279,7 +279,7 @@ impl Envelope {
     }
 }
 
-/// JSON form (descriptions, sealed keys, embargo records): XChaCha20-Poly1305
+/// JSON form (sealed keys, vault entries): XChaCha20-Poly1305
 /// only. It is part of signed bodies and must never change; AES-SIV
 /// envelopes are only ever objects and have no JSON form.
 #[derive(Serialize, Deserialize)]

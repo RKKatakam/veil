@@ -174,18 +174,6 @@ fn status_warns_about_a_case_only_pair() {
     assert!(st.contains("differ only in case"), "{st}");
 }
 
-// Scenario from jj test_status_command.rs in a cloaked workspace.
-#[test]
-fn status_names_a_cloaked_workspace() {
-    let env = Env::new();
-    let r = env.repo("p");
-    r.commit("base");
-    r.ok(&["ws", "new", "fix", "--cloak"]);
-    r.ok(&["ws", "switch", "fix"]);
-    let st = r.status();
-    assert!(st.contains("Workspace    : fix [cloaked:team]"), "{st}");
-}
-
 // Scenario from git t7063-status-untracked-cache.sh / t0010-racy-git.sh: a
 // same-size edit within the same second is noticed.
 #[test]

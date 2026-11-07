@@ -118,13 +118,13 @@ fn stat_cache_skips_unchanged_files_and_matches_uncached_builds() {
         fs.write(&p(&format!("src/f{i}.rs")), format!("fn f{i}() {{}}\n").as_bytes())
             .unwrap();
     }
-    fs.write(&p("vault/plan.md"), b"secret plans\n").unwrap();
+    fs.write(&p("vault/.env.plan"), b"secret plans\n").unwrap();
     let mut cache = StatCache::new();
 
     let r = snap(&mut repo, &*fs, &mut cache);
     assert_eq!((r.hashed, r.cache_hits), (22, 0), "cold cache reads everything");
     assert_eq!(cache.len(), 22);
-    assert!(cache.get(&p("vault/plan.md")).unwrap().sealed.is_some());
+    assert!(cache.get(&p("vault/.env.plan")).unwrap().sealed.is_some());
     let first = repo.workspace_wc(WS).unwrap();
     cache.save(&*fs, &veil_core::statcache::cache_path(WS)).unwrap();
 
@@ -134,7 +134,7 @@ fn stat_cache_skips_unchanged_files_and_matches_uncached_builds() {
     assert!(!cache.is_dirty(), "an all-hit run does not rewrite the cache");
 
     fs.write(&p("src/f3.rs"), b"fn f3() { changed() }\n").unwrap();
-    fs.write(&p("vault/plan.md"), b"new secret plans\n").unwrap();
+    fs.write(&p("vault/.env.plan"), b"new secret plans\n").unwrap();
     fs.remove_file(&p("src/f7.rs")).unwrap();
     let r = snap(&mut repo, &*fs, &mut cache);
     assert_eq!((r.hashed, r.cache_hits), (2, 19));
@@ -142,9 +142,9 @@ fn stat_cache_skips_unchanged_files_and_matches_uncached_builds() {
 
     // Exactly what a cache-less build of the same directory produces.
     let tree = wc_tree(&repo);
-    let (uncached, _) = repo.build_from(&*fs, Some(tree), None).unwrap();
+    let (uncached, _) = repo.build_from(&*fs, Some(tree)).unwrap();
     assert_eq!(uncached, tree);
-    let e = entry(&repo, &tree, "vault/plan.md").unwrap();
+    let e = entry(&repo, &tree, "vault/.env.plan").unwrap();
     assert_eq!(e.visibility, Visibility::Cloaked { scope: "team".into() });
     assert_eq!(repo.store().read_entry(&e).unwrap(), b"new secret plans\n");
 
@@ -287,10 +287,10 @@ fn a_record_that_can_never_vouch_does_not_rewrite_the_cache() {
 #[test]
 fn policy_change_invalidates_the_cache_and_reclassifies() {
     let (mut repo, fs) = repo_with(MemoryBackend::new());
-    fs.write(&p(".veilpolicy"), b"fixtures/ public!\n").unwrap();
+    fs.write(&p(".veilpolicy"), b"fixtures/ public!\ndocs/ cloak team\n").unwrap();
     fs.write(&p("fixtures/key.js"), b"const k = 'AKIAIOSFODNN7EXAMPLE';\n")
         .unwrap();
-    fs.write(&p("docs/a.md"), b"hello\n").unwrap();
+    fs.write(&p("docs/.env.a"), b"hello\n").unwrap();
     let mut cache = StatCache::new();
     snap(&mut repo, &*fs, &mut cache);
     assert!(
@@ -312,7 +312,7 @@ fn policy_change_invalidates_the_cache_and_reclassifies() {
     );
     let tree = wc_tree(&repo);
     assert!(entry(&repo, &tree, "fixtures/key.js").is_none());
-    let doc = entry(&repo, &tree, "docs/a.md").unwrap();
+    let doc = entry(&repo, &tree, "docs/.env.a").unwrap();
     assert_eq!(
         doc.visibility,
         Visibility::Cloaked { scope: "team".into() },
@@ -323,7 +323,7 @@ fn policy_change_invalidates_the_cache_and_reclassifies() {
     let r = snap(&mut repo, &*fs, &mut cache);
     assert_eq!(
         r.cache_hits, 2,
-        "policy file and docs/a.md; the quarantined file is re-read"
+        "policy file and docs/.env.a; the quarantined file is re-read"
     );
     assert_eq!(wc_tree(&repo), tree);
 }

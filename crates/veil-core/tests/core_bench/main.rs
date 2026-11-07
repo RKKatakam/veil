@@ -8,9 +8,5 @@
 //! umask, current directory, signal handlers), so the suites can share a
 //! process; `cargo nextest` runs every test in its own process anyway.
 
-#[path = "../sftp_support/mod.rs"]
-mod sftp_support;
-
-mod sftp_bench;
 mod storage_bench;
 mod tree_bench;

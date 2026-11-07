@@ -10,15 +10,12 @@ use std::{
 use veil_core::{
     cache::LruCache,
     commands::EmbargoSpec,
-    embargo::apply_embargo,
     gc::{gc, GcOptions},
     now_millis,
-    object::{Object, Snapshot, Text, Tree, TreeEntry, Visibility},
+    object::Object,
     pack::{Pack, PackBuilder},
-    remote,
     store::CacheLimits,
-    tree::lookup,
-    ChangeId, EntryKind, Identity, MemoryBackend, ObjectId, Repo, StorageBackend, VPath, VeilError,
+    tree::lookup, EntryKind, Identity, MemoryBackend, ObjectId, Repo, StorageBackend, VPath, VeilError,
 };
 
 const WS: &str = "default";
@@ -91,12 +88,10 @@ fn assert_history_intact(repo: &Repo) {
             match e.kind {
                 EntryKind::Dir => trees.push(e.id),
                 EntryKind::File | EntryKind::Symlink => {
-                    for id in std::iter::once(e.id).chain(e.fallback) {
-                        let raw = store
-                            .get_raw(&id)
-                            .unwrap_or_else(|err| panic!("{} {}: {err}", e.name, id.short()));
-                        assert_eq!(ObjectId::hash(&raw), id);
-                    }
+                    let raw = store
+                        .get_raw(&e.id)
+                        .unwrap_or_else(|err| panic!("{} {}: {err}", e.name, e.id.short()));
+                    assert_eq!(ObjectId::hash(&raw), e.id);
                 }
                 EntryKind::Conflict => {
                     let c = store.conflict(&e.id).unwrap_or_else(|err| panic!("{} conflict: {err}", e.name));
@@ -132,9 +127,9 @@ fn history(repo: &mut Repo, fs: &MemoryBackend, files: usize, snapshots: usize) 
 fn pack_round_trip_every_object_kind() {
     let (mut repo, fs, _) = new_repo();
     history(&mut repo, &fs, 12, 6);
-    // A cloaked file gives sealed blobs, an embargo gives sealed + fallback.
+    // A sealed secret gives sealed blobs.
     fs.write(&p(".veilpolicy"), b"secret/ cloak team\n").unwrap();
-    fs.write(&p("secret/plan.md"), b"the plan\n").unwrap();
+    fs.write(&p("secret/.env.plan"), b"the plan\n").unwrap();
     let wc = snap(&mut repo, &fs);
     let before = all_raw(&repo);
     assert!(before.values().any(|r| Object::sealed_scope(r).is_some()));
@@ -152,7 +147,7 @@ fn pack_round_trip_every_object_kind() {
         assert_eq!(&reopened.store().get_raw(id).unwrap(), raw, "{}", id.short());
         assert!(reopened.store().has(id));
     }
-    assert_eq!(read_file(&repo, &wc, "secret/plan.md").unwrap(), b"the plan\n");
+    assert_eq!(read_file(&repo, &wc, "secret/.env.plan").unwrap(), b"the plan\n");
     assert!(repo.store().verify_packs().unwrap().is_empty());
     assert_history_intact(&repo);
 }
@@ -389,85 +384,12 @@ fn gc_after_undo_keeps_the_undone_state() {
 }
 
 #[test]
-fn gc_keeps_embargo_fallbacks_that_are_the_only_reference() {
-    let (mut repo, _fs, _) = new_repo();
-    let store = repo.store().clone();
-    // Pre-merge content that is referenced by nothing but a fallback.
-    let old = store
-        .store_file(b"fn check() -> bool { true }\n", &Visibility::Public)
-        .unwrap();
-    let file = |id| TreeEntry {
-        name: "auth.rs".into(),
-        kind: EntryKind::File,
-        id,
-        size: 0,
-        executable: false,
-        visibility: Visibility::Public,
-        fallback: None,
-    };
-    let mut base = Tree::default();
-    base.insert(file(old));
-    let base_tree = store.put_tree(&base).unwrap();
-    let new = store
-        .store_file(b"fn check() -> bool { verify() }\n", &Visibility::Public)
-        .unwrap();
-    let mut merged = Tree::default();
-    merged.insert(file(new));
-    let merged_tree = store.put_tree(&merged).unwrap();
-    let embargo = repo.keys().create_embargo("team", None).unwrap();
-    let sealed_tree = apply_embargo(&store, &merged_tree, &base_tree, &embargo).unwrap();
-
-    let root = repo.root_id();
-    let mut tx = repo.transaction("embargoed").unwrap();
-    let s = tx
-        .write_snapshot(&Snapshot {
-            parents: vec![root],
-            change_id: ChangeId::random(),
-            tree: sealed_tree,
-            description: Text::Plain("embargoed fix".into()),
-            author: "alice".into(),
-            timestamp: now_millis(),
-            predecessors: vec![],
-            conflicts: vec![],
-            cloak: None,
-            embargo: Some(embargo.clone()),
-            signature: None,
-        })
-        .unwrap();
-    tx.view
-        .tags
-        .insert("main".into(), veil_core::oplog::Tag::new(s, None));
-    tx.commit().unwrap();
-
-    let r = gc(&mut repo, &now_gc()).unwrap();
-    assert!(r.deleted >= 2, "the merged tree and plain new blob were garbage");
-    assert!(!store.has(&merged_tree) && !store.has(&new));
-    // The embargoed tree is sealed whole (BUG-018); its fallback is the
-    // pre-merge tree, which therefore stays reachable along with its blob.
-    assert!(store.has(&base_tree), "fallback tree kept");
-    assert!(store.has(&old), "fallback-only blob kept");
-    let e = lookup(&store, &sealed_tree, &p("auth.rs")).unwrap().unwrap();
-    assert_eq!(e.fallback, Some(old));
-    assert_eq!(store.read_entry(&e).unwrap(), b"fn check() -> bool { verify() }\n");
-
-    // A public mirror only has the fallback; its gc keeps it too.
-    let mirror_fs = Arc::new(MemoryBackend::new());
-    remote::push(&mut repo, mirror_fs.clone(), true, &[], false).unwrap();
-    let mut mirror = Repo::open(mirror_fs.clone(), Some(Identity::generate("pub")), "pub").unwrap();
-    assert!(!mirror.store().has(&e.id), "embargoed content withheld");
-    let r = gc(&mut mirror, &now_gc()).unwrap();
-    assert!(r.incomplete.is_empty(), "{:?}", r.incomplete);
-    let mirror = Repo::open(mirror_fs, Some(Identity::generate("pub")), "pub").unwrap();
-    assert_eq!(mirror.store().read_entry(&e).unwrap(), b"fn check() -> bool { true }\n");
-}
-
-#[test]
 fn gc_after_real_embargoed_merge_and_release() {
     let (mut repo, fs, _) = new_repo();
     fs.write(&p("auth.rs"), b"fn check() -> bool { true }\n").unwrap();
     snap(&mut repo, &fs);
     let (main, _) = repo.commit_working_copy(WS, "v1").unwrap();
-    repo.set_tag("main", main, None, false).unwrap();
+    repo.set_tag("main", main, false).unwrap();
     let fix_ws = repo.ephemeral_workspace(main).unwrap();
     fix_ws.write("auth.rs", "fn check() -> bool { verify() }\n").unwrap();
     let (fix, _) = repo.commit_ephemeral(&fix_ws, "fix").unwrap();

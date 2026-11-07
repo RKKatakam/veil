@@ -59,7 +59,7 @@ const PATHS: &[(&str, bool)] = &[
     ("k.pem", false),
     ("keys/id_rsa", false),
     ("README.md", false),
-    ("secrets/db.yml", false),
+    ("secrets/.env.db", false),
     ("a/secrets/x.md", false),
     (".git/config", false),
     ("sub/.git", false),

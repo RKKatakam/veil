@@ -11,7 +11,7 @@ A "Scion for developers" is a source-control service where most of the work happ
 
 **The Veil Hub is built on this design,** for thousands of agents at once pulling, opening PRs and merging. Its design targets (`docs/OVERVIEW.md`, "Design targets") are the server's benchmark gates, listed in `docs/HUB.md` §9.2: thousands of agents (benchmarked at 1,000 and 10,000); a small pull and a PR open or update in under 100 ms of server time; thousands of merges per hour per project with no global lock; a fresh agent workspace in seconds; history, blame and search through the API in milliseconds to low hundreds of ms; permission checks a negligible share of request time.
 
-Veil offers this to any team, not just one company's huge repo, on the Veil server. The server reads code, so it can merge, index and search it as Scion does. Only secrets and embargoed changes are encrypted; those few cases run where the keys are, on a device or machine with access (`docs/HUB.md` §7.5, §8.3).
+Veil offers this to any team, not just one company's huge repo, on the Veil server. The server reads code, so it can merge, index and search it as Scion does. Only secret files are encrypted (repository format 8); those few cases run where the keys are, on a device or machine with access (`docs/HUB.md` §7.5, §8.3).
 
 ## What Scion does
 Scion took Anthropic from about 2,500 merges a day in May 2026 to more than 30,000 a day by September, mostly from agents. All of the following comes from [Anthropic's public post](https://www.anthropic.com/research/redesigning-source-control). The post doesn't say how merges onto `main` are ordered, how fine-grained conflict detection is, or how many writes per second it handles.
@@ -54,7 +54,7 @@ Veil has about half of Scion's foundations, in the client engine. The other half
 | Checkouts where files appear when read | `vl ws mount` (FUSE) and in-memory workspaces | They read from the local copy, not from the server |
 | Write-ahead log | A lock-free op log with undo (built, stream O, format 6) | None |
 | Stable change identity | Change ids instead of branches | None |
-| Per-folder permissions | Today's client restricts paths by encrypting them | The server's permission model replaces this: admins, groups, folder access, `public` (`docs/VISIBILITY.md`) |
+| Per-folder permissions | The client of that round also restricted paths by cloaking them (removed in repository format 8) | The server's permission model replaces this: admins, groups, folder access, `public` (`docs/VISIBILITY.md`) |
 | History indexes | A local commit-graph index with generation numbers (built, stream I) | Server-side indexes for blame, file history and search |
 | No maintenance | Incremental background maintenance and a safe prune (built, stream G2) | Retention-based cleanup on object storage |
 | Server API, server merges, caches | None | All of it |

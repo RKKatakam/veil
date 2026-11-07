@@ -21,7 +21,7 @@
 //! every path against the current policy on every run and only uses a fact
 //! where it would otherwise have needed the bytes. As a second line of
 //! defence the whole cache is keyed on the `.veilpolicy` content id and on a
-//! fingerprint of the key and embargo state, and it is dropped when either
+//! fingerprint of the key state, and it is dropped when either
 //! changes.
 //!
 //! **Racy mtime.** A file written in the same timestamp tick in which it was
@@ -180,7 +180,7 @@ impl Record {
 pub struct CacheKey {
     /// Blob id of `.veilpolicy`, `None` if there is none.
     pub policy: Option<ObjectId>,
-    /// Fingerprint of identity, scope keys and embargo states.
+    /// Fingerprint of identity and scope keys.
     pub keys: ObjectId,
     /// Kind of clock the stamps were taken on.
     pub exact: bool,
@@ -203,7 +203,7 @@ impl CacheKey {
 
 /// Fingerprint of everything in the keychain that can change what a file's
 /// tree entry looks like: who we are, which scope keys we hold (and which
-/// key), and which embargoes exist, are released, or are readable.
+/// key).
 pub fn key_state(keys: &Keychain) -> Result<ObjectId> {
     let mut h = blake3::Hasher::new();
     h.update(b"veil statcache key-state v1\0");
@@ -225,11 +225,6 @@ pub fn key_state(keys: &Keychain) -> Result<ObjectId> {
                 .as_bytes(),
         );
         h.update(b"\0");
-    }
-    h.update(b"embargoes\0");
-    for e in keys.embargoes()? {
-        h.update(e.id.as_bytes());
-        h.update(&[keys.embargo_released(&e.id) as u8, keys.has(&format!("embargo/{}", e.id)) as u8, 0]);
     }
     Ok(ObjectId(*h.finalize().as_bytes()))
 }

@@ -9,7 +9,7 @@ use std::{
 
 fn vl(home: &Path, cwd: &Path, args: &[&str]) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_vl"));
-    c.args(args)
+    c.env("VEIL_TEST_PATH_REMOTES", "1").args(args)
         .current_dir(cwd)
         .env("VEIL_HOME", home)
         .env("VEIL_USER", "bench")

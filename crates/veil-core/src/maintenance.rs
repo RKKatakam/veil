@@ -596,10 +596,8 @@ fn path_hints(
                 match e.kind {
                     EntryKind::Dir => stack.push((e.id, sub)),
                     _ => {
-                        for f in std::iter::once(e.id).chain(e.fallback) {
-                            if set.contains(&f) && walked.insert(f) {
-                                hints.entry((HINT_FILE, sub.clone())).or_default().push(f);
-                            }
+                        if set.contains(&e.id) && walked.insert(e.id) {
+                            hints.entry((HINT_FILE, sub.clone())).or_default().push(e.id);
                         }
                     }
                 }
@@ -735,12 +733,6 @@ fn remove_temps(backend: &dyn StorageBackend, dir: &VPath, ctx: &LockContext, no
         }
     }
     Ok(n)
-}
-
-/// Remove the stream temp files in `dir` whose writer is provably gone
-/// (owner-less ones are left to [`sweep_debris`]).
-pub(crate) fn remove_dead_temps(backend: &dyn StorageBackend, dir: &VPath) -> Result<usize> {
-    remove_temps(backend, dir, &LockContext::default(), None)
 }
 
 // ---- background maintenance ---------------------------------------------------------

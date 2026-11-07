@@ -291,20 +291,13 @@ fn ring_with_path_like_scope_does_not_crash_pull() {
 
 #[test]
 fn embargo_record_with_path_like_id_does_not_crash_pull() {
-    let k = random_key();
     let rec = EmbargoRecord {
+        format: veil_core::keychain::EMBARGO_FORMAT,
         id: "../../../x".into(),
         scope: "team".into(),
-        wrapped: Envelope::seal(&k, "embargo-wrap:x", &k, false).unwrap(),
         until: None,
-        released_key: Some(hex::encode(k)),
         released_at: Some(1),
         created: 1,
-        description: String::new(),
-        scope_key: None,
-        key_id: None,
-        signature: None,
-        release_signature: None,
     };
     let remote = remote_with_meta(&[(".veil/meta/embargoes/x.json", serde_json::to_vec(&rec).unwrap())]);
     let (mut victim, _fs, _) = new_repo("v");
@@ -377,14 +370,14 @@ fn ring_with_empty_key_id_cannot_replace_existing_scope_key() {
     assert_eq!(victim.keys().key("team").unwrap(), real, "scope key was substituted");
 }
 
-/// Embargoed merge of a fix developed in a *cloaked* workspace, so the fix
-/// branch itself is never public. Returns (alice, wc fs, embargo id).
+/// Embargoed merge of a fix developed in its own workspace. Returns (alice,
+/// wc fs, embargo id).
 fn embargoed_setup() -> (Repo, Arc<MemoryBackend>, String) {
     use veil_core::commands::EmbargoSpec;
     let (mut alice, fs, _) = new_repo("alice");
     let main = commit_files(&mut alice, &*fs, &[("auth.rs", "fn check() -> bool { true }\n")], "v1");
-    alice.set_tag("main", main, None, false).unwrap();
-    alice.create_workspace("fix", vec![main], Some("team".into())).unwrap();
+    alice.set_tag("main", main, false).unwrap();
+    alice.create_workspace("fix", vec![main]).unwrap();
     let ov = alice.workspace_overlay("fix").unwrap();
     ov.write(&p("auth.rs"), b"fn check() -> bool { verify_signature() }\n").unwrap();
     let fix = alice.snapshot_workspace("fix", &ov).unwrap().snapshot;
@@ -398,7 +391,8 @@ fn embargoed_setup() -> (Repo, Arc<MemoryBackend>, String) {
     (alice, fs, res.embargo.unwrap())
 }
 
-/// Control for the test below: without forgery the fix stays hidden.
+/// The embargoed merge, and a follow-up on it, stay off the mirror until
+/// the release; then the mirror receives them.
 #[test]
 fn embargo_from_cloaked_branch_stays_hidden_until_release() {
     let (mut alice, fs, embargo) = embargoed_setup();
@@ -408,8 +402,9 @@ fn embargo_from_cloaked_branch_stays_hidden_until_release() {
     remote::push(&mut alice, mirror.clone(), true, &["main".to_string()], false).unwrap();
     assert!(backend_contains(&*mirror, b"verify_signature").is_empty());
     let pubrepo = Repo::open(mirror.clone(), Some(Identity::generate("anon")), "anon").unwrap();
-    let main = pubrepo.view().tags["main"].target;
-    assert_eq!(read_at(&pubrepo, &main, "auth.rs"), b"fn check() -> bool { true }\n");
+    assert!(!pubrepo.view().tags.contains_key("main"), "main moved onto the embargoed merge was pushed");
+    let main = alice.view().tags["main"].target;
+    assert!(pubrepo.snapshot_opt(&main).unwrap().is_none());
     // after a genuine release the mirror sees the fix
     alice.release_embargo(&embargo).unwrap();
     remote::push(&mut alice, mirror.clone(), true, &["main".to_string()], false).unwrap();
@@ -417,52 +412,12 @@ fn embargo_from_cloaked_branch_stays_hidden_until_release() {
     assert!(String::from_utf8(read_at(&pubrepo, &main, "auth.rs")).unwrap().contains("verify_signature"));
 }
 
-/// Mallory (who can write to the team remote but holds no key) forges a
-/// "released" record with a garbage key. Alice pulls, keeps working, commits
-/// and pushes to the public mirror. The fix must not reach the mirror.
-#[test]
-fn forged_embargo_release_does_not_publish_the_fix() {
-    let (mut alice, fs, embargo) = embargoed_setup();
-    let team = Arc::new(MemoryBackend::new());
-    remote::push(&mut alice, team.clone(), false, &[], false).unwrap();
-    let path = p(&format!(".veil/meta/embargoes/{embargo}.json"));
-    let mut rec: EmbargoRecord = serde_json::from_slice(&team.read(&path).unwrap()).unwrap();
-    rec.released_key = Some(hex::encode(random_key()));
-    rec.released_at = Some(1);
-    team.write(&path, &serde_json::to_vec(&rec).unwrap()).unwrap();
-
-    remote::pull(&mut alice, "origin", team).unwrap();
-    snap(&mut alice, &*fs);
-    alice.commit_working_copy(WS, "unrelated follow-up").unwrap();
-    let mirror = Arc::new(MemoryBackend::new());
-    remote::push(&mut alice, mirror.clone(), true, &["main".to_string()], false).unwrap();
-    let hits = backend_contains(&*mirror, b"verify_signature");
-    assert!(hits.is_empty(), "embargoed fix reached the public mirror: {hits:?}");
-}
-
-/// Same forgery, observed from the key holder's side: Alice can no longer
-/// read the embargoed content she merged.
-#[test]
-fn forged_embargo_release_does_not_lock_out_key_holders() {
-    let (mut alice, _fs, embargo) = embargoed_setup();
-    let team = Arc::new(MemoryBackend::new());
-    remote::push(&mut alice, team.clone(), false, &[], false).unwrap();
-    let path = p(&format!(".veil/meta/embargoes/{embargo}.json"));
-    let mut rec: EmbargoRecord = serde_json::from_slice(&team.read(&path).unwrap()).unwrap();
-    rec.released_key = Some(hex::encode(random_key()));
-    team.write(&path, &serde_json::to_vec(&rec).unwrap()).unwrap();
-    remote::pull(&mut alice, "origin", team).unwrap();
-    let main = alice.view().tags["main"].target;
-    let merged = read_at(&alice, &main, "auth.rs");
-    assert!(String::from_utf8(merged).unwrap().contains("verify_signature"), "key holder now sees the fallback");
-}
-
 #[test]
 fn pulled_tag_pointing_at_missing_object_does_not_brick_the_repo() {
     let remote_fs = Arc::new(MemoryBackend::new());
     let mut remote = Repo::init_bare(remote_fs.clone()).unwrap();
     let mut tx = remote.transaction("evil").unwrap();
-    tx.view.tags.insert("main".into(), Tag::new(ObjectId([7; 32]), None));
+    tx.view.tags.insert("main".into(), Tag::new(ObjectId([7; 32])));
     tx.commit().unwrap();
     let (mut victim, _fs, _) = new_repo("v");
     let pulled = remote::pull(&mut victim, "origin", remote_fs);
@@ -479,30 +434,8 @@ fn tag_cannot_point_at_a_non_snapshot_object() {
     let (mut repo, fs, _) = new_repo("alice");
     let c = commit_files(&mut repo, &*fs, &[("a.txt", "a\n")], "c");
     let blob_id = file_entry(&repo, &c, "a.txt").unwrap().id;
-    let _ = repo.set_tag("bad", blob_id, None, false);
+    let _ = repo.set_tag("bad", blob_id, false);
     assert!(repo.visible_snapshots().is_ok(), "view now references a blob as a tag target");
 }
 
 // ---- hostile snapshot metadata ---------------------------------------------
-
-#[test]
-fn hostile_cloak_field_on_snapshot_does_not_panic() {
-    let remote_fs = Arc::new(MemoryBackend::new());
-    let mut remote = Repo::init_bare(remote_fs.clone()).unwrap();
-    let empty = remote.store().empty_tree().unwrap();
-    let mut s = (*remote.snapshot(&remote.root_id()).unwrap()).clone();
-    s.parents = vec![remote.root_id()];
-    s.change_id = veil_core::ChangeId::random();
-    s.tree = empty;
-    s.cloak = Some("../../x".into());
-    let id = remote.store().put_snapshot(&s).unwrap();
-    set_remote_tag(&mut remote, "main", id);
-    let (mut victim, _fs, _) = new_repo("v");
-    remote::pull(&mut victim, "origin", remote_fs).unwrap();
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        let ws = victim.ephemeral_workspace(id).unwrap();
-        ws.write("a.txt", "hello").unwrap();
-        let _ = victim.commit_ephemeral(&ws, "agent work");
-    }));
-    assert!(r.is_ok(), "committing on top of a hostile snapshot panicked");
-}

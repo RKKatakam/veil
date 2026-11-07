@@ -182,30 +182,6 @@ fn disk_backend_never_writes_through_a_symlinked_directory() {
     assert_eq!(std::fs::read(store.path().join("local/state")).unwrap(), b"s");
 }
 
-/// Below repository format 5 a symlink is a special file: never recorded.
-#[cfg(unix)]
-#[test]
-fn a_tracked_path_replaced_by_a_symlink_keeps_its_entry() {
-    let tmp = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
-    std::fs::write(outside.path().join("x"), "outside").unwrap();
-    let fs = DiskBackend::new(tmp.path());
-    fs.write(&p("vendor/x"), b"tracked").unwrap();
-    fs.write(&p("notes.txt"), b"notes").unwrap();
-    let mut repo = Repo::init_for_clone_at(Arc::new(MemoryBackend::new()), Some(Identity::generate("alice")), "alice", 4).unwrap();
-    repo.snapshot_workspace(WS, &fs).unwrap();
-    let before = wc_tree(&repo);
-    std::fs::remove_dir_all(tmp.path().join("vendor")).unwrap();
-    std::fs::remove_file(tmp.path().join("notes.txt")).unwrap();
-    std::os::unix::fs::symlink(outside.path(), tmp.path().join("vendor")).unwrap();
-    std::os::unix::fs::symlink(outside.path().join("x"), tmp.path().join("notes.txt")).unwrap();
-    let out = repo.snapshot_workspace(WS, &fs).unwrap();
-    assert!(!out.changed, "neither a deletion nor content read through the links");
-    assert_eq!(wc_tree(&repo), before);
-    let shadowed: Vec<&str> = out.report.shadowed.iter().map(|p| p.as_str()).collect();
-    assert_eq!(shadowed, vec!["notes.txt", "vendor"]);
-}
-
 /// In format 5 the links are recorded as links (their targets only), and
 /// the old versions stay in history.
 #[cfg(unix)]
@@ -317,20 +293,20 @@ fn injected_secrets_are_quarantined_in_every_tier_but_old_content_is_kept() {
     let fs = base.fork();
     fs.write(&p(".env"), env).unwrap();
     fs.write(&p("config.txt"), env).unwrap();
-    fs.write(&p("private/copy.txt"), b"tok super-secret-isolated-value").unwrap();
+    fs.write(&p("private/.env.copy"), b"tok super-secret-isolated-value").unwrap();
     fs.write(&p("readme.md"), b"uses API_TOKEN=super-secret-isolated-value\n").unwrap();
     fs.write(&p("clean.txt"), b"nothing to see\n").unwrap();
     let out = repo.snapshot_workspace_injected(WS, &fs, None, Some(&inj)).unwrap();
     let t = wc_tree(&repo);
     assert!(entry(&repo, &t, ".env").is_none(), "isolated by policy");
     assert!(entry(&repo, &t, "config.txt").is_none(), "a renamed copy");
-    assert!(entry(&repo, &t, "private/copy.txt").is_none(), "cloaking is no way out either");
+    assert!(entry(&repo, &t, "private/.env.copy").is_none(), "cloaking is no way out either");
     assert_eq!(entry(&repo, &t, "readme.md"), entry(&repo, &parent, "readme.md"), "the edit is held back");
     assert_eq!(entry(&repo, &t, "legacy.txt"), entry(&repo, &parent, "legacy.txt"), "unchanged content predates the injection");
     assert_eq!(entry(&repo, &t, "clean.txt").unwrap().visibility, Visibility::Public);
     let mut q: Vec<&str> = out.report.quarantined.iter().map(|(p, _)| p.as_str()).collect();
     q.sort();
-    assert_eq!(q, vec!["config.txt", "private/copy.txt", "readme.md"]);
+    assert_eq!(q, vec!["config.txt", "private/.env.copy", "readme.md"]);
     assert!(out.report.quarantined.iter().all(|(_, f)| f[0].rule == INJECTED_RULE));
 
     // Without injection the same content is recorded as before.

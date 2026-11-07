@@ -14,7 +14,7 @@
 //!
 //! Steps: init a repository with an identity created in memory, write
 //! files, snapshot, read them back, show the log, diff two snapshots, seal
-//! a cloaked directory under a scope and read it back, check that another
+//! a secret file under a scope and read it back, check that another
 //! identity cannot, merge two lines of work, clone into a second
 //! repository by pull, garbage-collect into a pack and read everything back
 //! from it.
@@ -127,16 +127,16 @@ pub fn smoke() -> Result<String, String> {
     // `Repo::init` with an identity already made the default scope `team`.
     check(repo.keys().is_member("team"), "alice holds the team key")?;
     fs.write(&p(".veilpolicy"), b"secrets/ cloak team\n").map_err(e)?;
-    fs.write(&p("secrets/plan.txt"), b"team-only plan\n").map_err(e)?;
+    fs.write(&p("secrets/.env.plan"), b"team-only plan\n").map_err(e)?;
     let sealed = commit(&mut repo, &fs, "team plan")?;
     let tree = repo.snapshot(&sealed).map_err(e)?.tree;
-    let entry = lookup(repo.store(), &tree, &p("secrets/plan.txt")).map_err(e)?.ok_or("plan missing")?;
+    let entry = lookup(repo.store(), &tree, &p("secrets/.env.plan")).map_err(e)?.ok_or("plan missing")?;
     check(entry.visibility == Visibility::Cloaked { scope: "team".into() }, "cloaked by policy")?;
     let raw = repo.store().get_raw(&entry.id).map_err(e)?;
     check(Object::sealed_scope(&raw).is_some(), "stored sealed")?;
     check(!raw.windows(9).any(|w| w == b"team-only"), "no plaintext in the stored object")?;
     check(repo.store().read_entry(&entry).map_err(e)? == b"team-only plan\n", "a member unseals it")?;
-    writeln!(out, "seal: secrets/plan.txt sealed under scope team ({} bytes), unsealed by alice", raw.len()).unwrap();
+    writeln!(out, "seal: secrets/.env.plan sealed under scope team ({} bytes), unsealed by alice", raw.len()).unwrap();
 
     let outsider = Repo::open(fs.clone(), Some(Identity::generate("mallory")), "mallory").map_err(e)?;
     check(outsider.store().read_entry(&entry).is_err(), "an outsider cannot unseal it")?;
@@ -153,11 +153,11 @@ pub fn smoke() -> Result<String, String> {
     let merged = repo.merge(WS, line_a, vec![line_b], "merge a and b", None).map_err(e)?;
     check(merged.conflicts.is_empty(), "no conflicts")?;
     check(repo.snapshot(&merged.snapshot).map_err(e)?.parents == vec![line_a, line_b], "merge parents")?;
-    for f in ["src/a.rs", "src/b.rs", "secrets/plan.txt"] {
+    for f in ["src/a.rs", "src/b.rs", "secrets/.env.plan"] {
         check(read_at(&repo, &merged.snapshot, f)?.is_some(), &format!("merge has {f}"))?;
     }
     writeln!(out, "merge: {} = {} + {}", merged.snapshot.short(), line_a.short(), line_b.short()).unwrap();
-    repo.set_tag("main", merged.snapshot, None, false).map_err(e)?;
+    repo.set_tag("main", merged.snapshot, false).map_err(e)?;
 
     // ---- sync: clone by pull into a second repository ----------------------
     let bob_fs = Arc::new(MemoryBackend::new());
