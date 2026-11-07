@@ -2214,7 +2214,8 @@ encrypted.
 | `GET prs/{id}` | the PR, its revisions in the caller's ids, the review gate |
 | `GET prs/{id}/diff?revision=&change=&stat=` | a revision's diff (base to head) or one change's: S13's `diff` on the caller's projected history |
 | `POST prs/{id}/revisions {head}`, `POST prs/{id}/close` | a new revision, close (the author or an admin) |
-| `GET\|POST prs/{id}/threads`, `POST prs/{id}/threads/{t} {body?, state?}` | threads, on the PR or anchored to lines; replies; resolve |
+| `GET prs/{id}/threads?after=`, `POST prs/{id}/threads {body, anchor?}` | a page of threads (on the PR or anchored to lines), each with its first 20 comments; a new thread (answered with that thread) |
+| `GET prs/{id}/threads/{t}?after=`, `POST prs/{id}/threads/{t} {body?, state?}` | a page of one thread's comments; a reply or resolve (answered with that thread) |
 | `POST prs/{id}/reviews {patch, verdict, body?, signature}` | a verdict, signed by the device |
 | `POST prs/{id}/land` | the review gate: `not_ready` with the reasons, or, when met, `landing_unavailable` until S17 (below) |
 
@@ -2246,15 +2247,31 @@ vl pr land ID
   lines (`policy_key`: their paths, in order; who a line names does not
   matter). When the lines change, every PR's class is computed again from
   its touched paths (`pr_paths`) before any PR answer is given. A PR whose
-  class belongs to old lines is visible to nobody until then.
+  class belongs to old lines is visible to nobody until then. **Every write
+  of a class is conditional on the inputs it was computed from**
+  (BUG-1250): a reclassification updates a row only if its key and its
+  revision (the one thing that changes its paths) are still those it read;
+  a new revision is a compare-and-swap of the revision, with key and lines
+  from one policy. A row that changed meanwhile stays stale (visible to
+  nobody) until the next request; the pass goes once over the stale rows in
+  id order, so servers that briefly disagree on the lines never chase each
+  other's writes.
 * **Ids are random** (`pr-` and 8 hex digits, decision 10), so no gaps
   count hidden PRs. Anything that is not such an id is no PR, with the same
   answer.
 * **Creating or updating a PR** needs a person of the project. Every path
-  the PR touches must be readable by them. Otherwise the request is refused
-  ("this PR would touch files you cannot see"), which, like a push's merge
-  across hidden folders (§13.4), says only that the stack the server holds
-  contains something they cannot see.
+  the PR touches must be readable by them. To anyone but an admin, every
+  refusal of the stack (a path they cannot see, a merge, a change id twice,
+  more than 100 changes or 10,000 paths) is the same one ("this cannot be
+  a PR of yours: …"), so it names no hidden change and counts no hidden
+  path. Like a push's merge across hidden folders (§13.4), it says only
+  that the stack does not qualify. Admins are told which reason. "Nothing
+  to review" (the revision is already part of the target) is told to
+  everyone, as their own history shows it.
+* **A new revision that is the same to its maker** (its base and head are,
+  in their history, the current ones) is refused as "that is revision N
+  already", N in their numbering (BUG-1254). The 100-revision limit is
+  stated without a count.
 
 **What a viewer is shown is computed on their projected history** (§13.4,
 S13): snapshot ids are theirs, diffs are S13's diffs between them, and a
@@ -2272,7 +2289,9 @@ parents, down to the first one that is an ancestor of the target's tip
 (the base). There is at most one parent per change (a merge is refused:
 rebase it), no change id twice, at most 100 changes and 10,000 touched
 paths over every revision. A new revision keeps the PR's place; its
-threads are carried to it.
+threads are carried to it: each (change, side, file) is read and diffed
+once for all the anchors on it, within 64 MiB of text per revision (the
+rest outdated, in thread order) and the request's deadline (BUG-1255).
 
 **Threads and anchors** (§7.3). An anchor names a change (by change id), a
 file that change changed, a side (`old` is the change's parent, `new` the
@@ -2284,6 +2303,11 @@ versions (lines inside a changed block do not map), and only if the lines
 it lands on still hash to the anchor's context. Otherwise the thread is
 **outdated**. Anchors name only change ids, paths and line numbers. There
 are at most 1,000 threads a PR and 500 comments a thread, of 64 KiB each.
+**Answers are paged** (BUG-1253): a listing holds at most 100 threads, each
+with its first 20 comments, and about 1 MiB of comment text in all
+(`next`, and a thread's `comments_next`). A thread's own page holds up to
+500 comments and about 1 MiB. A new thread or a reply is answered with
+that thread only. `vl pr show --threads` follows the cursors.
 
 **Reviews** (threats 15, 16). A reviewer must see the PR, may write every
 path it touches (an admin, or the groups and people the deciding lines
@@ -2297,8 +2321,9 @@ reviewer's latest verdict given on the current patch (a rebase over
 unrelated changes keeps approvals; any change to the files dismisses
 them), checked again against the reviewer's access at each answer. The
 author's verdict never counts. Where the rule says `people_only` (always
-for high risk), an agent session's approval does not count. A counted
-reviewer's request for changes holds the PR until they approve. Agent
+for high risk), an agent session's approval does not count. **A request
+for changes**, on any revision, holds the PR until that reviewer approves
+(the current patch) or no longer may write its files. Agent
 sessions are S11: the review row records `agent`, and every session today
 is a person's.
 
@@ -2308,11 +2333,25 @@ is a person's.
   `package.json`, lock files, `go.mod`, …), a secret (a sealed entry on
   either side), a path under a `high_risk_paths` entry, or more than 1,000
   files;
-* **low:** every file is documentation (under `docs/` or `doc/`, `*.md`,
-  `*.txt`, `README*`, `LICENSE*`, …) or tests (under `tests/`, `test/`,
-  `__tests__/`, `spec/`, `testdata/`; `*_test.*`, `test_*`, `*.test.*`,
-  `*.spec.*`), or changed only whitespace (both sides text; 16 MiB read at
-  most per revision);
+* **low:** every file is documentation or tests, or changed only
+  whitespace:
+  * **documentation:** `*.md`, `*.markdown`, `*.rst`, `*.adoc` anywhere;
+    `README`, `LICENSE`, `COPYING`, `CHANGELOG`, `CONTRIBUTING`, `AUTHORS`,
+    `NOTICE`, `CODE_OF_CONDUCT` with no extension or `.txt`; images under
+    `docs/` or `doc/` (no SVG). Not `*.txt` in general, nor everything under
+    `docs/` (BUG-1252: `CMakeLists.txt`, `docs/conf.py`);
+  * **tests:** files under `tests/`, `test/`, `__tests__/`, `spec/`,
+    `testdata/`, or named `*_test.*`, `test_*`, `*.test.*`, `*.spec.*`;
+  * **never documentation or tests:** build and configuration files
+    wherever they are (`CMakeLists.txt`, `Makefile`, `*.cmake`, `*.mk`,
+    `build.rs`, `setup.py`, `conftest.py`, `Dockerfile`, `BUILD`, `*.bzl`,
+    `*.gradle`, `*.nix`, `conf.py`, …), and executable files;
+  * **whitespace-only** (BUG-1251): the same kind and executable bit, both
+    sides text with the same lines, each equal but for trailing whitespace
+    and line ending. Python, YAML, Makefiles and other files whose meaning
+    depends on whitespace allow only the line ending. Moving text between
+    lines, splitting a token or changing indentation is not whitespace-only.
+    At most 16 MiB is read per revision;
 * **normal:** everything else.
 
 Comment-only changes are not detected (phase-4 open question 4).
@@ -2334,10 +2373,13 @@ high_risk_paths = ["src/auth/", "infra/"]
 * **The defaults** (decision 12) apply with no file: low needs no
   approval, normal one (an agent's counts unless it is a session of the
   author), high one person's. `people_only` is forced for high.
-* **A file that does not parse** makes every risk need one person's
-  approval. Its warnings quote the file, which is the admins' (no access
-  line names the root), so only admins read them. Others are told the rules
-  "need an admin's attention".
+* **A file that does not parse never weakens review.** The last version of
+  it that parsed, on the default branch's first parents (at most 1,000
+  back), still applies: an admin's `approvals = 3` stays 3. With none (the
+  file was new, or absent before), every risk needs one person's approval.
+  Its warnings quote the file, which is the admins' (no access line names
+  the root), so only admins read them. Others are told the rules "need an
+  admin's attention".
 * **Who can change it.** Until S17's push check (admins only) is merged, the
   file changes like any root file: only admins, unless an admin wrote an
   access line naming `.veilrules`.
@@ -2346,8 +2388,10 @@ high_risk_paths = ["src/auth/", "infra/"]
 `501 landing_unavailable`, and nothing moves. The follow-up, once S17 is
 merged, submits the stack to `POST …/land` one change at a time, bottom
 first, onto the target, re-checks the gate in the same request, and marks
-the PR `landed`. Whether `vl land` straight onto a protected branch must
-also pass the review rules (no PR) is for that follow-up and the owner.
+the PR `landed`. **Decided (owner, 2026-11-07): landing onto a protected
+branch meets the same review rules whichever way it comes,** `vl pr land`,
+`vl land` or a push that lands; otherwise review is bypassable. The landing
+service enforces it once S17 merges, and that is part of the follow-up.
 
 **Not built here:** notifications and the event stream (S18; deliver
 `pr.*` only after `prs::visible` at delivery), embargoed PRs (S23; the
@@ -2374,6 +2418,11 @@ names is S3's client work), and rate limits on PR creation (S24).
 | 13 | A participant | opens a PR from an embargoed change, or one built on it | no such revision (embargo lines are withheld from every viewer until S22) | `pr_rules_from_veilrules` |
 | 14 | Same | reads a broken `.veilrules` through PR answers | review gets stricter; the file's text reaches admins only | same |
 | 15 | Same | floods threads or comments | at most 1,000 threads a PR, 500 comments a thread, under the PR's row lock | by construction (limits checked in the transaction) |
+| 16 | — (a race) | an access-line change, a reclassification and a new revision at once | no class of other paths is ever stored under the current lines (BUG-1250) | `s21_adversarial::bug_1250_…` (deterministic), `s21_adversarial::class_writes_race_revisions_and_access_lines` (both databases) |
+| 17 | A member who may write a folder | a change of behaviour made of whitespace (a joined line, a split token, indentation), an executable bit, a build file named like documentation | `normal` risk: needs the rule's approvals (BUG-1251, BUG-1252) | `s21_adversarial::bug_1251_…`, `bug_1252_…`, unit tests in `prs::rules` and `prs::revision` |
+| 18 | Any participant | posts many large comments, then has everyone read them | every answer about 1 MiB of comments at most (BUG-1253) | `s21_adversarial::bug_1253_…` |
+| 19 | The author of a PR rebased over hidden changes | asks for the revision they are shown | "that is revision 1 already", their numbering (BUG-1254) | `s21_adversarial::bug_1254_…` |
+| 20 | Any participant | anchors 1,000 threads, slowing every revision | one diff per (change, side, file); 1,000 threads: 0.65 s (debug), was about 13 min (BUG-1255) | `s21_adversarial::bug_1255_…` (`VEIL_BUG1255_THREADS=1000`) |
 
 **Residual:**
 * The first PR request after an access-line change reclassifies every PR

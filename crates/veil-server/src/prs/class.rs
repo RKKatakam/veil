@@ -112,24 +112,38 @@ const RECLASSIFY_BATCH: i64 = 200;
 
 /// Compute again the class of every PR whose class is of other access lines
 /// than the project's current ones. Every PR request runs it first; it
-/// does nothing unless the lines changed. Idempotent: servers doing it at
-/// once write the same rows.
+/// does nothing unless the lines changed (two empty range scans).
+///
+/// **Every write of a class is conditional on the inputs it was computed
+/// from** (BUG-1250): the key of the lines it replaces and the PR's
+/// revision, the one thing that changes its paths (only a new revision adds
+/// paths, and it always moves `revision`). A row that changed meanwhile
+/// is left as it is: stale, so visible to nobody until the next request
+/// computes it again; never a class of other paths under these lines.
+/// One pass in id order, so servers that briefly disagree on the lines
+/// never chase each other's writes.
 pub async fn reclassify(hub: &Hub, project: &Project) -> Result<()> {
     let key = policy_key(&project.policy);
+    let mut after = String::new();
     loop {
-        let stale: Vec<(String, String)> =
-            // Two range scans of `prs_by_policy`, empty unless the lines
-            // changed (`<>` would read every PR's entry).
-            sqlx::query_as("SELECT id, policy_key FROM prs WHERE project_id = $1 AND (policy_key < $2 OR policy_key > $2) LIMIT $3")
-                .bind(project.id)
-                .bind(&key)
-                .bind(RECLASSIFY_BATCH)
-                .fetch_all(&hub.db)
-                .await?;
-        if stale.is_empty() {
-            return Ok(());
-        }
+        let stale: Vec<(String, String, i32)> =
+            // Range scans of `prs_by_policy`, empty unless the lines changed
+            // (`<>` would read every PR's entry).
+            sqlx::query_as(
+                "SELECT id, policy_key, revision FROM prs WHERE project_id = $1 AND (policy_key < $2 OR policy_key > $2) AND id > $3 \
+                 ORDER BY id LIMIT $4",
+            )
+            .bind(project.id)
+            .bind(&key)
+            .bind(&after)
+            .bind(RECLASSIFY_BATCH)
+            .fetch_all(&hub.db)
+            .await?;
+        let Some(last) = stale.last() else { return Ok(()) };
+        after = last.0.clone();
         let ids: Vec<String> = stale.iter().map(|s| s.0.clone()).collect();
+        // Read after the revisions were: a revision committed in between
+        // adds paths here, and its row's guard then fails.
         let paths: Vec<(String, String)> = sqlx::query_as("SELECT pr, path FROM pr_paths WHERE project_id = $1 AND pr = ANY($2)")
             .bind(project.id)
             .bind(&ids)
@@ -140,15 +154,16 @@ pub async fn reclassify(hub: &Hub, project: &Project) -> Result<()> {
             by_pr.entry(pr.as_str()).or_default().push(path.as_str());
         }
         let mut c = hub.db.acquire().await?;
-        for (id, old) in &stale {
+        for (id, old, revision) in &stale {
             let lines = lines_of(&project.policy, by_pr.get(id.as_str()).cloned().unwrap_or_default());
             let class = put_class(&mut c, project.id, &key, &lines).await?;
-            sqlx::query("UPDATE prs SET class_id = $1, policy_key = $2 WHERE project_id = $3 AND id = $4 AND policy_key = $5")
+            sqlx::query("UPDATE prs SET class_id = $1, policy_key = $2 WHERE project_id = $3 AND id = $4 AND policy_key = $5 AND revision = $6")
                 .bind(&class)
                 .bind(&key)
                 .bind(project.id)
                 .bind(id)
                 .bind(old)
+                .bind(revision)
                 .execute(&mut *c)
                 .await?;
         }

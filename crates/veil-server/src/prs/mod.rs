@@ -239,11 +239,30 @@ async fn compute(hub: &Arc<Hub>, ask: &Ask, head: ObjectId, onto: ObjectId) -> R
     let deadline = Instant::now() + DEADLINE;
     ensure(hub, &ask.project, &admin(), &[head, onto], Some(deadline)).await?;
     let rules = rules(hub, ask).await?;
-    blocking(hub, ask.project.id, move |cx| {
+    let r = blocking(hub, ask.project.id, move |cx| {
         let g = G::new(cx, "admin", Some(deadline));
         revision::compute(cx, &g, head, onto, &rules)
     })
-    .await
+    .await;
+    match r {
+        // The stack's refusals name its changes and count its paths, as the
+        // server has them: only admins (who see all of it) are told which;
+        // anyone else gets the one refusal `readable_by` gives.
+        Err(Error::Api { code: "bad_request", message, .. }) if !ask.viewer.admin && !message.starts_with(revision::NOTHING_TO_REVIEW) => Err(not_a_pr()),
+        r => r,
+    }
+}
+
+/// The one refusal of a stack to anyone but an admin (whatever the reason:
+/// a merge, a change twice, too many changes or paths, a path they cannot
+/// see), so a refusal says nothing of the part they cannot see.
+fn not_a_pr() -> Error {
+    Error::forbidden(format!(
+        "this cannot be a PR of yours: a PR is a stack of at most {} changes with one parent each, touching at most {} paths, \
+         every one of them a file you can see; ask someone with access to the rest to open it",
+        revision::MAX_STACK,
+        revision::MAX_PATHS
+    ))
 }
 
 fn signed_in(caller: &Caller) -> Result<&crate::auth::Person> {
@@ -285,7 +304,7 @@ fn check_title(t: &str) -> Result<String> {
 fn readable_by(ask: &Ask, touched: &BTreeSet<String>) -> Result<()> {
     let lines = class::lines_of(&ask.project.policy, touched.iter().map(String::as_str));
     if !class::satisfies(&ask.project.view(&ask.viewer), &lines, "") {
-        return Err(Error::forbidden("this PR would touch files you cannot see; ask someone with access to them to open it"));
+        return Err(not_a_pr());
     }
     Ok(())
 }
@@ -709,20 +728,26 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
     query::resolve(hub, ask, &pr.target, deadline).await.map_err(|_| Error::conflict(format!("the target {} no longer exists", pr.target)))?;
     let onto = tip(hub, ask.project.id, &pr.target).await?.ok_or_else(|| Error::conflict(format!("the target {} no longer exists", pr.target)))?;
     let r = compute(hub, ask, head, onto).await?;
-    let revs = revisions(hub, ask.project.id, &pr.id).await?;
+    let (revs, _, vn) = viewer_revisions(hub, ask, &pr.id).await?;
     let current = revs.iter().find(|x| x.n == pr.revision).cloned().ok_or_else(|| Error::Other(anyhow::anyhow!("the PR's revision is missing")))?;
-    if current.head == r.head && current.base == r.base {
-        return Err(Error::bad_request(format!("that is revision {} already", pr.revision)));
+    // The same revision to the caller (BUG-1254): named by their number,
+    // and refused, as a revision only hidden content tells apart would be
+    // shown to them as this one anyway.
+    let p = projected(hub, ask, &[current.base, current.head, r.base, r.head]).await?;
+    if p[&current.head] == p[&r.head] && p[&current.base] == p[&r.base] {
+        return Err(Error::bad_request(format!("that is revision {} already", vn[&pr.revision])));
     }
     // What the PR touches is the union over every revision.
     let mut all: BTreeSet<String> = review::paths_of(hub, ask.project.id, &pr.id).await?.into_iter().collect();
     all.extend(r.touched.iter().cloned());
+    // Visibility first, then the bound (the union's size counts paths the
+    // caller may not see).
+    readable_by(ask, &all)?;
     if all.len() > revision::MAX_PATHS {
         return Err(Error::bad_request(format!("a PR touches at most {} paths over all its revisions; open a new one", revision::MAX_PATHS)));
     }
-    readable_by(ask, &all)?;
     // Carry every positioned anchor to the new revision.
-    let threads: Vec<ThreadRow> = sqlx::query_as("SELECT id, anchor, now_at FROM pr_threads WHERE project_id = $1 AND pr = $2 AND now_at IS NOT NULL")
+    let threads: Vec<ThreadRow> = sqlx::query_as("SELECT id, anchor, now_at FROM pr_threads WHERE project_id = $1 AND pr = $2 AND now_at IS NOT NULL ORDER BY created_at, id")
         .bind(ask.project.id)
         .bind(&pr.id)
         .fetch_all(&hub.db)
@@ -730,14 +755,12 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
     let n = pr.revision + 1;
     let (old_stack, new_stack) = (current.changes.clone(), r.changes.clone());
     let moved: Vec<(String, Option<String>)> = blocking(hub, ask.project.id, move |cx| {
-        let mut out = Vec::new();
-        for (tid, anchor, now) in threads {
-            let (Some(a), Some(at)) = (anchor, now) else { continue };
-            let (Ok(a), Ok(at)) = (serde_json::from_str::<Anchor>(&a), serde_json::from_str::<At>(&at)) else { continue };
-            let next = threads::carry(cx, &a, at, &old_stack, &new_stack, n as u32)?;
-            out.push((tid, next.map(|x| serde_json::to_string(&x).expect("numbers"))));
-        }
-        Ok(out)
+        let anchors: Vec<(String, Anchor, At)> = threads
+            .into_iter()
+            .filter_map(|(tid, anchor, now)| Some((tid, serde_json::from_str(&anchor?).ok()?, serde_json::from_str(&now?).ok()?)))
+            .collect();
+        let moved = threads::carry_all(cx, anchors, &old_stack, &new_stack, n as u32, deadline)?;
+        Ok(moved.into_iter().map(|(t, at)| (t, at.map(|x| serde_json::to_string(&x).expect("numbers")))).collect())
     })
     .await?;
     let key = class::policy_key(&ask.project.policy);
@@ -818,50 +841,163 @@ fn random_short() -> String {
     hex::encode(veil_core::crypto::random_bytes::<6>())
 }
 
-pub async fn threads_json(hub: &Arc<Hub>, ask: &Ask, id: &str) -> Result<Value> {
-    let pr = visible(hub, ask, id).await?;
-    let (_, _, vn) = viewer_revisions(hub, ask, &pr.id).await?;
-    type T = (String, Option<String>, Option<String>, String, i64, i64);
-    let ts: Vec<T> = sqlx::query_as(
-        "SELECT id, anchor, now_at, state, author, created_at FROM pr_threads WHERE project_id = $1 AND pr = $2 ORDER BY created_at, id",
-    )
-    .bind(ask.project.id)
-    .bind(&pr.id)
-    .fetch_all(&hub.db)
-    .await?;
-    let cs: Vec<(String, String, i64, String, i64)> =
-        sqlx::query_as("SELECT thread, id, author, body, at FROM pr_comments WHERE project_id = $1 AND pr = $2 ORDER BY at, id")
-            .bind(ask.project.id)
-            .bind(&pr.id)
-            .fetch_all(&hub.db)
-            .await?;
+/// About the most bytes of comment text one answer holds (BUG-1253); one
+/// comment is at most [`MAX_TEXT`], and an answer always holds at least one.
+pub const ANSWER_BYTES: usize = 1 << 20;
+/// Threads a listing page holds at most, and comments shown with each.
+pub const THREADS_PAGE: i64 = 100;
+pub const COMMENTS_SHOWN: i64 = 20;
+/// Comments a thread's page holds at most.
+pub const COMMENTS_PAGE: i64 = 500;
+
+/// `"<time>:<id>"`, the cursor of threads and comments.
+fn cursor(s: Option<&str>) -> Result<(i64, String)> {
+    let Some(s) = s else { return Ok((i64::MIN, String::new())) };
+    let bad = || Error::bad_request("invalid cursor");
+    let (t, id) = s.split_once(':').ok_or_else(bad)?;
+    if id.len() != 12 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(bad());
+    }
+    Ok((t.parse().map_err(|_| bad())?, id.to_string()))
+}
+
+type ThreadMeta = (String, Option<String>, Option<String>, String, i64, i64);
+type CommentRow = (String, String, i64, String, i64);
+
+/// A thread as the viewer is shown it, with `comments` (and the cursor of
+/// the rest, if any).
+fn thread_value(t: &ThreadMeta, comments: Vec<Value>, more: Option<String>, ppl: &HashMap<i64, String>, vn: &HashMap<i32, i32>) -> Value {
+    let (tid, anchor, now, state, author, created_at) = t;
+    let a: Option<Anchor> = anchor.as_deref().and_then(|a| serde_json::from_str(a).ok());
+    let at: Option<At> = now.as_deref().and_then(|a| serde_json::from_str(a).ok());
+    let at = at.map(|a| json!({ "revision": vn.get(&(a.revision as i32)), "start": a.start, "end": a.end }));
+    json!({
+        "id": tid,
+        "state": state,
+        "author": ppl.get(author),
+        "created_at": created_at,
+        "outdated": a.is_some() && at.is_none(),
+        "anchor": a.map(|a| json!({ "revision": vn.get(&(a.revision as i32)), "change_id": a.change, "path": a.path, "side": a.side, "start": a.start, "end": a.end })),
+        "now": at,
+        "comments": comments,
+        "comments_next": more,
+    })
+}
+
+async fn people_of(hub: &Hub, ts: &[ThreadMeta], cs: &[CommentRow]) -> Result<HashMap<i64, String>> {
     let mut people: Vec<i64> = ts.iter().map(|t| t.4).chain(cs.iter().map(|c| c.2)).collect();
     people.sort();
     people.dedup();
-    let ppl = names(hub, &people).await?;
-    let mut by_thread: HashMap<&str, Vec<Value>> = HashMap::new();
-    for (t, cid, author, body, at) in &cs {
-        by_thread.entry(t.as_str()).or_default().push(json!({ "id": cid, "author": ppl.get(author), "body": body, "at": at }));
+    names(hub, &people).await
+}
+
+/// A page of the PR's threads, oldest first, each with its first comments,
+/// within [`ANSWER_BYTES`] of comment text (BUG-1253): `next` names the
+/// rest of the threads, and a thread's `comments_next` the rest of its
+/// comments (`thread_json`).
+pub async fn threads_json(hub: &Arc<Hub>, ask: &Ask, id: &str, after: Option<&str>) -> Result<Value> {
+    let (after_at, after_id) = cursor(after)?;
+    let pr = visible(hub, ask, id).await?;
+    let (_, _, vn) = viewer_revisions(hub, ask, &pr.id).await?;
+    let ts: Vec<ThreadMeta> = sqlx::query_as(
+        "SELECT id, anchor, now_at, state, author, created_at FROM pr_threads WHERE project_id = $1 AND pr = $2 \
+         AND (created_at > $3 OR (created_at = $3 AND id > $4)) ORDER BY created_at, id LIMIT $5",
+    )
+    .bind(ask.project.id)
+    .bind(&pr.id)
+    .bind(after_at)
+    .bind(&after_id)
+    .bind(THREADS_PAGE + 1)
+    .fetch_all(&hub.db)
+    .await?;
+    let more_threads = ts.len() as i64 > THREADS_PAGE;
+    let ts = &ts[..ts.len().min(THREADS_PAGE as usize)];
+    let ids: Vec<String> = ts.iter().map(|t| t.0.clone()).collect();
+    // Each thread's first comments and one more (to know there are more).
+    let cs: Vec<CommentRow> = sqlx::query_as(
+        "SELECT thread, id, author, body, at FROM ( \
+             SELECT thread, id, author, body, at, ROW_NUMBER() OVER (PARTITION BY thread ORDER BY at, id) AS k \
+             FROM pr_comments WHERE project_id = $1 AND pr = $2 AND thread = ANY($3)) c \
+         WHERE k <= $4 ORDER BY at, id",
+    )
+    .bind(ask.project.id)
+    .bind(&pr.id)
+    .bind(&ids)
+    .bind(COMMENTS_SHOWN + 1)
+    .fetch_all(&hub.db)
+    .await?;
+    let ppl = people_of(hub, ts, &cs).await?;
+    let mut by_thread: HashMap<&str, Vec<&CommentRow>> = HashMap::new();
+    for c in &cs {
+        by_thread.entry(c.0.as_str()).or_default().push(c);
     }
-    let out: Vec<Value> = ts
-        .iter()
-        .map(|(tid, anchor, now, state, author, created_at)| {
-            let a: Option<Anchor> = anchor.as_deref().and_then(|a| serde_json::from_str(a).ok());
-            let at: Option<At> = now.as_deref().and_then(|a| serde_json::from_str(a).ok());
-            let at = at.map(|a| json!({ "revision": vn.get(&(a.revision as i32)), "start": a.start, "end": a.end }));
-            json!({
-                "id": tid,
-                "state": state,
-                "author": ppl.get(author),
-                "created_at": created_at,
-                "outdated": a.is_some() && at.is_none(),
-                "anchor": a.map(|a| json!({ "revision": vn.get(&(a.revision as i32)), "change_id": a.change, "path": a.path, "side": a.side, "start": a.start, "end": a.end })),
-                "now": at,
-                "comments": by_thread.remove(tid.as_str()).unwrap_or_default(),
-            })
-        })
-        .collect();
-    Ok(json!({ "schema": "veil.pr.threads/1", "pr": pr.id, "revision": vn[&pr.revision], "threads": out }))
+    let (mut out, mut bytes, mut next) = (Vec::new(), 0usize, None);
+    for t in ts {
+        if bytes >= ANSWER_BYTES && !out.is_empty() {
+            next = out.last().map(|v: &Value| format!("{}:{}", v["created_at"], v["id"].as_str().unwrap_or("")));
+            break;
+        }
+        let mine = by_thread.remove(t.0.as_str()).unwrap_or_default();
+        let (mut shown, mut more) = (Vec::new(), None);
+        for (i, c) in mine.iter().enumerate() {
+            if i as i64 == COMMENTS_SHOWN || (bytes >= ANSWER_BYTES && !shown.is_empty()) {
+                more = shown.last().map(|v: &Value| format!("{}:{}", v["at"], v["id"].as_str().unwrap_or("")));
+                break;
+            }
+            bytes += c.3.len() + 64;
+            shown.push(json!({ "id": c.1, "author": ppl.get(&c.2), "body": c.3, "at": c.4 }));
+        }
+        out.push(thread_value(t, shown, more, &ppl, &vn));
+    }
+    if next.is_none() && more_threads {
+        next = ts.last().map(|t| format!("{}:{}", t.5, t.0));
+    }
+    Ok(json!({ "schema": "veil.pr.threads/2", "pr": pr.id, "revision": vn[&pr.revision], "threads": out, "next": next }))
+}
+
+/// One thread with a page of its comments from `after`, within
+/// [`ANSWER_BYTES`].
+pub async fn thread_json(hub: &Arc<Hub>, ask: &Ask, id: &str, thread: &str, after: Option<&str>) -> Result<Value> {
+    let (after_at, after_id) = cursor(after)?;
+    let pr = visible(hub, ask, id).await?;
+    if thread.len() != 12 || !thread.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::not_found("no such thread in this PR"));
+    }
+    let (_, _, vn) = viewer_revisions(hub, ask, &pr.id).await?;
+    let t: Option<ThreadMeta> =
+        sqlx::query_as("SELECT id, anchor, now_at, state, author, created_at FROM pr_threads WHERE project_id = $1 AND pr = $2 AND id = $3")
+            .bind(ask.project.id)
+            .bind(&pr.id)
+            .bind(thread)
+            .fetch_optional(&hub.db)
+            .await?;
+    let t = t.ok_or_else(|| Error::not_found("no such thread in this PR"))?;
+    let cs: Vec<CommentRow> = sqlx::query_as(
+        "SELECT thread, id, author, body, at FROM pr_comments WHERE project_id = $1 AND pr = $2 AND thread = $3 \
+         AND (at > $4 OR (at = $4 AND id > $5)) ORDER BY at, id LIMIT $6",
+    )
+    .bind(ask.project.id)
+    .bind(&pr.id)
+    .bind(thread)
+    .bind(after_at)
+    .bind(&after_id)
+    .bind(COMMENTS_PAGE + 1)
+    .fetch_all(&hub.db)
+    .await?;
+    let ppl = people_of(hub, std::slice::from_ref(&t), &cs).await?;
+    let (mut shown, mut bytes, mut more) = (Vec::new(), 0usize, None);
+    for (i, c) in cs.iter().enumerate() {
+        if i as i64 == COMMENTS_PAGE || (bytes >= ANSWER_BYTES && !shown.is_empty()) {
+            more = shown.last().map(|v: &Value| format!("{}:{}", v["at"], v["id"].as_str().unwrap_or("")));
+            break;
+        }
+        bytes += c.3.len() + 64;
+        shown.push(json!({ "id": c.1, "author": ppl.get(&c.2), "body": c.3, "at": c.4 }));
+    }
+    let mut v = thread_value(&t, shown, more, &ppl, &vn);
+    v["schema"] = json!("veil.pr.thread/1");
+    v["pr"] = json!(pr.id);
+    Ok(v)
 }
 
 pub async fn new_thread(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: NewThread) -> Result<Value> {
@@ -884,6 +1020,7 @@ pub async fn new_thread(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q:
         }
     };
     let (project, prid, body, tid, cid) = (ask.project.id, pr.id.clone(), q.body.clone(), random_short(), random_short());
+    let tid_out = tid.clone();
     let now = veil_core::now_millis();
     let made = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
         let (prid, body, tid, cid, anchor, at) = (prid.clone(), body.clone(), tid.clone(), cid.clone(), anchor.clone(), at.clone());
@@ -926,7 +1063,7 @@ pub async fn new_thread(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q:
     if !made {
         return Err(Error::bad_request(format!("a PR has at most {MAX_THREADS} threads")));
     }
-    threads_json(hub, ask, id).await
+    thread_json(hub, ask, id, &tid_out, None).await
 }
 
 pub async fn update_thread(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, thread: &str, q: ThreadUpdate) -> Result<Value> {
@@ -998,7 +1135,7 @@ pub async fn update_thread(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str,
     })
     .await?;
     match found {
-        Some(true) => threads_json(hub, ask, id).await,
+        Some(true) => thread_json(hub, ask, id, thread, None).await,
         Some(false) => Err(Error::not_found("no such thread in this PR")),
         None => Err(Error::bad_request(format!("a thread has at most {MAX_COMMENTS} comments"))),
     }
@@ -1140,9 +1277,24 @@ pub async fn close_route(State(hub): State<HubState>, caller: Caller, Path((p, i
     Ok(Json(close(&hub, &ask, &caller, &id).await?))
 }
 
-pub async fn threads_route(State(hub): State<HubState>, caller: Caller, Path((p, id)): Path<(String, String)>) -> Result<Json<Value>> {
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct After {
+    pub after: Option<String>,
+}
+
+pub async fn threads_route(State(hub): State<HubState>, caller: Caller, Path((p, id)): Path<(String, String)>, Query(q): Query<After>) -> Result<Json<Value>> {
     let ask = open(&hub, &p, &caller).await?;
-    Ok(Json(threads_json(&hub, &ask, &id).await?))
+    Ok(Json(threads_json(&hub, &ask, &id, q.after.as_deref()).await?))
+}
+
+pub async fn thread_get_route(
+    State(hub): State<HubState>,
+    caller: Caller,
+    Path((p, id, t)): Path<(String, String, String)>,
+    Query(q): Query<After>,
+) -> Result<Json<Value>> {
+    let ask = open(&hub, &p, &caller).await?;
+    Ok(Json(thread_json(&hub, &ask, &id, &t, q.after.as_deref()).await?))
 }
 
 pub async fn new_thread_route(

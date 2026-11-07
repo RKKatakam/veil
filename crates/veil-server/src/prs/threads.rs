@@ -132,30 +132,93 @@ fn map_line(d: &veil_core::hunks::TextDiff, l: usize) -> Option<usize> {
     Some((l as isize + delta) as usize)
 }
 
-/// Where anchor `a`, at `now` on stack `old`, is on the next revision's
-/// stack `new` (numbered `revision`); `None`: outdated.
-pub fn carry(cx: &Cx, a: &Anchor, now: At, old: &[StackChange], new: &[StackChange], revision: u32) -> Result<Option<At>> {
-    let (Some(oc), Some(nc)) = (old.iter().find(|c| c.change == a.change), new.iter().find(|c| c.change == a.change)) else {
-        return Ok(None);
-    };
-    let (Some((oid, otext)), Some((nid, ntext))) = (side_text(cx, oc, &a.side, &a.path)?, side_text(cx, nc, &a.side, &a.path)?) else {
-        return Ok(None);
-    };
-    if oid == nid {
-        return Ok(Some(At { revision, ..now }));
+/// The most bytes of file text one new revision reads to carry its
+/// threads (both sides of each file, once): past it, the remaining files'
+/// threads are outdated, in a fixed order (BUG-1255).
+pub const CARRY_BUDGET: u64 = 64 << 20;
+
+/// One file side's two versions, read and diffed once for every anchor on
+/// it.
+struct Versions {
+    same: bool,
+    diff: veil_core::hunks::TextDiff,
+    new_lines: Vec<String>,
+}
+
+/// Where each anchor (thread id, anchor, its place now on stack `old`) is
+/// on the next revision's stack `new` (numbered `revision`); `None`:
+/// outdated. Each (change, side, path) is read and diffed once (BUG-1255),
+/// within [`CARRY_BUDGET`] bytes, and the deadline is checked between files.
+pub fn carry_all(
+    cx: &Cx,
+    anchors: Vec<(String, Anchor, At)>,
+    old: &[StackChange],
+    new: &[StackChange],
+    revision: u32,
+    deadline: std::time::Instant,
+) -> Result<Vec<(String, Option<At>)>> {
+    use std::collections::BTreeMap;
+    let mut cache: BTreeMap<(String, String, String), Option<Versions>> = BTreeMap::new();
+    let mut budget = CARRY_BUDGET;
+    let mut out = Vec::with_capacity(anchors.len());
+    for (tid, a, now) in anchors {
+        let k = (a.change.clone(), a.side.clone(), a.path.clone());
+        if !cache.contains_key(&k) {
+            if std::time::Instant::now() > deadline {
+                return Err(crate::query::graph::too_slow());
+            }
+            let v = match (old.iter().find(|c| c.change == a.change), new.iter().find(|c| c.change == a.change)) {
+                (Some(oc), Some(nc)) => versions(cx, oc, nc, &a.side, &a.path, &mut budget)?,
+                _ => None,
+            };
+            cache.insert(k.clone(), v);
+        }
+        let at = match &cache[&k] {
+            None => None,
+            Some(v) if v.same => Some(At { revision, ..now }),
+            Some(v) => moved(v, &a, now, revision),
+        };
+        out.push((tid, at));
     }
-    let d = veil_core::hunks::diff_text(&otext, &ntext);
+    Ok(out)
+}
+
+/// The two versions of a file side, within `budget`; `None` if either is
+/// absent or not text, or the budget is spent.
+fn versions(cx: &Cx, oc: &StackChange, nc: &StackChange, side: &str, path: &str, budget: &mut u64) -> Result<Option<Versions>> {
+    let side_entry = |c: &StackChange| -> Result<Option<veil_core::object::TreeEntry>> {
+        let snap = if side == "old" { c.parent_id() } else { c.snapshot_id() };
+        entry_at(&cx.src, cx.src.snapshot(&snap)?.tree, path)
+    };
+    let (Some(o), Some(n)) = (side_entry(oc)?, side_entry(nc)?) else { return Ok(None) };
+    if o.id == n.id {
+        return Ok(Some(Versions { same: true, diff: Default::default(), new_lines: Vec::new() }));
+    }
+    if o.size + n.size > *budget {
+        *budget = 0;
+        return Ok(None);
+    }
+    *budget -= o.size + n.size;
+    let (Some(ot), Some(nt)) = (text_of(cx, &o)?, text_of(cx, &n)?) else { return Ok(None) };
+    let diff = veil_core::hunks::diff_text(&ot, &nt);
+    let new_lines = veil_core::hunks::lines(&nt).into_iter().map(str::to_string).collect();
+    Ok(Some(Versions { same: false, diff, new_lines }))
+}
+
+/// Anchor `a` at `now` through the diff `v`, if its lines map whole and
+/// still hash to its context.
+fn moved(v: &Versions, a: &Anchor, now: At, revision: u32) -> Option<At> {
     let (s, e) = (now.start as usize - 1, now.end as usize - 1);
-    let (Some(ns), Some(ne)) = (map_line(&d, s), map_line(&d, e)) else { return Ok(None) };
-    let lines = veil_core::hunks::lines(&ntext);
-    if ne < ns || ne - ns != e - s || ne >= lines.len() || context_of(&lines[ns..=ne]) != a.context {
-        return Ok(None);
+    let (ns, ne) = (map_line(&v.diff, s)?, map_line(&v.diff, e)?);
+    if ne < ns || ne - ns != e - s || ne >= v.new_lines.len() {
+        return None;
     }
-    Ok(Some(At {
+    let lines: Vec<&str> = v.new_lines[ns..=ne].iter().map(String::as_str).collect();
+    (context_of(&lines) == a.context).then_some(At {
         revision,
         start: ns as u32 + 1,
         end: ne as u32 + 1,
-    }))
+    })
 }
 
 #[cfg(test)]

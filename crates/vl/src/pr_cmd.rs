@@ -228,7 +228,7 @@ pub fn run(ctx: &mut Ctx, cmd: &PrCmd) -> Result<()> {
         }
         PrCmd::Show { id, threads, out } => {
             let v = c.project_json("GET", &pr_path(id, "")?, None)?;
-            let t = if *threads || out.json { Some(c.project_json("GET", &pr_path(id, "/threads")?, None)?) } else { None };
+            let t = if *threads { Some(all_threads(&c, id)?) } else { None };
             if out.json {
                 let mut v = v;
                 if *threads {
@@ -322,6 +322,40 @@ pub fn run(ctx: &mut Ctx, cmd: &PrCmd) -> Result<()> {
             let v = c.project_json("POST", &pr_path(id, "/land")?, None)?;
             println!("Landed {} ({})", bold(id), safe(&v.to_string()));
             Ok(())
+        }
+    }
+}
+
+/// Every thread of a PR with every comment, page by page (the server
+/// answers about 1 MiB of comments at a time).
+fn all_threads(c: &Client, id: &str) -> Result<Value> {
+    let mut threads: Vec<Value> = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let path = match &after {
+            None => pr_path(id, "/threads")?,
+            Some(a) => pr_path(id, &format!("/threads?after={}", q(a)))?,
+        };
+        let page = c.project_json("GET", &path, None)?;
+        for mut t in page["threads"].as_array().cloned().unwrap_or_default() {
+            let mut more = t["comments_next"].as_str().map(str::to_string);
+            while let Some(m) = more {
+                let tid = s(&t, "id").to_string();
+                if !tid.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    break;
+                }
+                let rest = c.project_json("GET", &pr_path(id, &format!("/threads/{tid}?after={}", q(&m)))?, None)?;
+                if let (Some(have), Some(new)) = (t["comments"].as_array_mut(), rest["comments"].as_array()) {
+                    have.extend(new.iter().cloned());
+                }
+                more = rest["comments_next"].as_str().map(str::to_string);
+            }
+            t["comments_next"] = Value::Null;
+            threads.push(t);
+        }
+        after = page["next"].as_str().map(str::to_string);
+        if after.is_none() {
+            return Ok(json!({ "threads": threads }));
         }
     }
 }

@@ -11,8 +11,9 @@
 //!   approvals; any change to the files dismisses them), checked again
 //!   against the reviewer's access now. Approvals from agent sessions never
 //!   count where the rule says `people_only` (always for high risk). The
-//!   author's never count. A counted reviewer's request for changes holds
-//!   the PR until they approve.
+//!   author's never count. A request for changes, on any revision, holds
+//!   the PR until that reviewer approves (the current patch) or no longer
+//!   may write its files.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -152,12 +153,14 @@ pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, pat
                 w
             }
         };
-        let eligible = v.current && writes && v.person != pr.author;
-        let counted = eligible && v.verdict == "approve" && !(need.people_only && v.agent);
+        let reviewer = writes && v.person != pr.author;
+        let counted = reviewer && v.current && v.verdict == "approve" && !(need.people_only && v.agent);
         if counted {
             approvals += 1;
         }
-        if eligible && v.verdict == "request-changes" {
+        // A request for changes holds the PR, on any revision, until that
+        // reviewer approves or no longer may write its files.
+        if reviewer && v.verdict == "request-changes" {
             held.push(v.name.clone());
         }
         reviews.push((v, counted));

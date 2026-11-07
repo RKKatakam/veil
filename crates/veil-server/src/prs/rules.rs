@@ -18,8 +18,9 @@
 //! * **The defaults** (no file, or no `[review]`): low risk needs no
 //!   approval, normal one, high one from a person (an agent's never counts
 //!   for high risk). **A file that does not parse** never weakens review:
-//!   every risk then needs one person's approval, and every answer says
-//!   why.
+//!   the last version of it that parsed, on the default branch's first
+//!   parents, still applies (`revision::rules_at`); with none, every risk
+//!   needs one person's approval. Only admins are told why.
 //! * **Risk** ([`classify`]): **high** if any file is `.veilpolicy`,
 //!   `.veilrules`, under `.ci/`, a dependency manifest or lock file, a
 //!   secret, under a `high_risk_paths` entry, or there are more than
@@ -53,6 +54,9 @@ pub struct Review {
     pub high_risk_paths: Vec<String>,
     /// Why the file was not used as written, if it was not.
     pub warnings: Vec<String>,
+    /// The file did not parse: these are the strict rules, until
+    /// `revision::rules_at` finds the last valid ones.
+    pub broken: bool,
 }
 
 impl Default for Review {
@@ -63,6 +67,7 @@ impl Default for Review {
             high: Need { approvals: 1, people_only: true },
             high_risk_paths: Vec::new(),
             warnings: Vec::new(),
+            broken: false,
         }
     }
 }
@@ -102,15 +107,17 @@ impl Review {
     }
 
     /// Every risk needs one person's approval: what a file that does not
-    /// parse gives.
-    fn strict(why: String) -> Review {
+    /// parse gives when no earlier version of it did (the strictest of the
+    /// defaults).
+    pub fn strict(why: String) -> Review {
         let one = Need { approvals: 1, people_only: true };
         Review {
             low: one,
             normal: one,
             high: one,
             high_risk_paths: Vec::new(),
-            warnings: vec![format!("{RULES_FILE}: {why}; until it is fixed, every PR needs one person's approval")],
+            warnings: vec![format!("{RULES_FILE}: {why}")],
+            broken: true,
         }
     }
 
@@ -175,8 +182,11 @@ pub struct FileChange {
     pub path: String,
     /// A secret (sealed) on either side.
     pub secret: bool,
-    /// Both sides are text that differ only in whitespace.
+    /// Both sides are text that differ only in whitespace (as
+    /// `revision::whitespace_only` defines it).
     pub whitespace_only: bool,
+    /// Executable on the new side, in any change.
+    pub executable: bool,
 }
 
 const MANIFESTS: &[&str] = &[
@@ -213,15 +223,43 @@ fn name_of(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-fn is_docs(path: &str) -> bool {
+/// Build and configuration files, whatever their name looks like: never
+/// documentation or tests (BUG-1252).
+fn is_build(path: &str) -> bool {
     let name = name_of(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
-    let upper = name.to_ascii_uppercase();
-    path.split('/').rev().skip(1).any(|c| c == "docs" || c == "doc")
-        || matches!(ext.as_str(), "md" | "markdown" | "rst" | "adoc" | "txt")
-        || ["README", "LICENSE", "CHANGELOG", "CONTRIBUTING", "AUTHORS", "NOTICE"].iter().any(|p| upper.starts_with(p))
+    matches!(
+        name,
+        "CMakeLists.txt" | "Makefile" | "makefile" | "GNUmakefile" | "build.rs" | "setup.py" | "setup.cfg" | "conftest.py"
+            | "Dockerfile" | "Containerfile" | "Justfile" | "justfile" | "Rakefile" | "BUILD" | "BUILD.bazel" | "WORKSPACE"
+            | "MODULE.bazel" | "meson.build" | "meson_options.txt" | "Taskfile.yml" | "tox.ini" | "noxfile.py" | "Vagrantfile"
+            | "conf.py" | "mkdocs.yml" | "book.toml" | ".envrc"
+    ) || matches!(ext.as_str(), "cmake" | "mk" | "bzl" | "gradle" | "nix")
 }
 
+/// Documentation: Markdown, reStructuredText and AsciiDoc anywhere; the
+/// usual top files by name (`README`, `LICENSE`, …, with no extension or
+/// a text one); images under `docs/` or `doc/`. Nothing else: a `.txt` or
+/// a file under `docs/` may be a build input (`CMakeLists.txt`,
+/// `docs/conf.py`).
+fn is_docs(path: &str) -> bool {
+    let name = name_of(path);
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, e.to_ascii_lowercase()),
+        _ => (name, String::new()),
+    };
+    let in_docs = path.split('/').rev().skip(1).any(|c| c == "docs" || c == "doc");
+    matches!(ext.as_str(), "md" | "markdown" | "rst" | "adoc" | "asciidoc")
+        || (matches!(
+            stem.to_ascii_uppercase().as_str(),
+            "README" | "LICENSE" | "LICENCE" | "COPYING" | "CHANGELOG" | "CHANGES" | "CONTRIBUTING" | "AUTHORS" | "NOTICE" | "CODE_OF_CONDUCT"
+        ) && matches!(ext.as_str(), "" | "txt"))
+        || (in_docs && matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp"))
+}
+
+/// Tests: under a `test`, `tests`, `__tests__`, `spec` or `testdata`
+/// folder, or named `*_test.*`, `test_*`, `*.test.*`, `*.spec.*` (build
+/// files excepted, `is_build`).
 fn is_test(path: &str) -> bool {
     let name = name_of(path);
     let stem = name.split('.').next().unwrap_or(name);
@@ -263,7 +301,9 @@ pub fn classify(files: &[FileChange], rules: &Review) -> (Risk, Vec<String>) {
         high.truncate(20);
         return (Risk::High, high);
     }
-    if files.iter().all(|f| is_docs(&f.path) || is_test(&f.path) || f.whitespace_only) {
+    // Low: every file documentation or a test (never a build file, nothing
+    // executable), or a whitespace-only change.
+    if files.iter().all(|f| f.whitespace_only || (!f.executable && !is_build(&f.path) && (is_docs(&f.path) || is_test(&f.path)))) {
         return (Risk::Low, vec!["only documentation, tests or whitespace".into()]);
     }
     (Risk::Normal, Vec::new())
@@ -274,7 +314,7 @@ mod tests {
     use super::*;
 
     fn f(p: &str) -> FileChange {
-        FileChange { path: p.into(), secret: false, whitespace_only: false }
+        FileChange { path: p.into(), secret: false, whitespace_only: false, executable: false }
     }
 
     #[test]
@@ -325,6 +365,15 @@ mod tests {
             assert_eq!(classify(&[f(p), f("docs/a.md")], &rules).0, Risk::High, "{p}");
         }
         assert_eq!(classify(&[f("src/authx.rs")], &rules).0, Risk::Normal);
+        // BUG-1252: build inputs that look like documentation or tests.
+        for p in ["pub/CMakeLists.txt", "notes.txt", "docs/conf.py", "docs/Makefile", "tests/CMakeLists.txt", "tests/build.rs", "README.sh", "docs/x.svg", "cmake/x.cmake"] {
+            assert_eq!(classify(&[f(p)], &rules).0, Risk::Normal, "{p}");
+        }
+        for p in ["README", "LICENSE.txt", "docs/a.rst", "docs/img/a.png", "CHANGELOG.md"] {
+            assert_eq!(classify(&[f(p)], &rules).0, Risk::Low, "{p}");
+        }
+        let exe = FileChange { executable: true, ..f("tests/run.md") };
+        assert_eq!(classify(&[exe], &rules).0, Risk::Normal, "an executable file is never documentation");
         let secret = FileChange { secret: true, ..f("docs/.env") };
         assert_eq!(classify(&[secret], &rules).0, Risk::High);
         let many: Vec<FileChange> = (0..=LARGE_FILES).map(|i| f(&format!("docs/{i}.md"))).collect();

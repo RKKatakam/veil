@@ -75,7 +75,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/prs/{id}/revisions", post(crate::prs::revision_route))
         .route("/v1/projects/{p}/prs/{id}/close", post(crate::prs::close_route))
         .route("/v1/projects/{p}/prs/{id}/threads", get(crate::prs::threads_route).post(crate::prs::new_thread_route))
-        .route("/v1/projects/{p}/prs/{id}/threads/{t}", post(crate::prs::thread_route))
+        .route("/v1/projects/{p}/prs/{id}/threads/{t}", get(crate::prs::thread_get_route).post(crate::prs::thread_route))
         .route("/v1/projects/{p}/prs/{id}/reviews", post(crate::prs::review_route))
         .route("/v1/projects/{p}/prs/{id}/land", post(crate::prs::land_route))
         .layer(DefaultBodyLimit::max(crate::db::body_limit("")))
