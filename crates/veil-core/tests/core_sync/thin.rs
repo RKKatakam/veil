@@ -607,3 +607,104 @@ fn s3r_each_protocol_revision_announces_one_thing() {
     assert_eq!(named, once, "a revision is described twice: {doc}");
     assert_eq!(once.last().copied(), Some(veil_core::hub::wire::REVISION), "{doc}");
 }
+
+// ---- S3 cycle 2 review (`docs/BUGS.md`, "S3 cycle 2") --------------------
+
+/// BUG-1147: the locator skips a file that a pack of the *cache* area holds
+/// when its tree is decoded; the cache is evicted, so once that pack goes
+/// (a trim in the same process) the file has no place, and every read of it
+/// in this process is `Unavailable` ("run the command again"), however
+/// often its tree is read again: the decoded tree stays in the store's
+/// tree cache and is never decoded (noted) again. A long-lived process
+/// (`vl mount`, the S6 daemon) never recovers.
+#[test]
+#[ignore = "BUG-1147: a file in an evicted cache pack has no place for the rest of the process"]
+fn s3r2_a_file_whose_cache_pack_was_evicted_is_read_again_in_the_same_process() {
+    // A directory of 20 files: the fetch-ahead writes them as one pack
+    // (from 16 objects; fewer are written loose).
+    let id = Identity::generate("alice");
+    let sfs = Arc::new(MemoryBackend::new());
+    let mut srepo = Repo::init(sfs.clone(), Some(id.clone()), "alice").unwrap();
+    let files: Vec<(String, String)> = (0..20).map(|i| (format!("src/f{i:02}.txt"), format!("file {i}\n"))).collect();
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let tip = commit_files(&mut srepo, &*sfs, &refs, "twenty");
+    let server = Arc::new(Server {
+        store: srepo.store().clone(),
+        tips: vec![tip],
+        down: AtomicBool::new(false),
+        tamper: AtomicBool::new(false),
+        refuse: Mutex::new(HashSet::new()),
+        asked: Mutex::new(Vec::new()),
+        pages: Mutex::new(0),
+    });
+    let pr = Project { server, commits: vec![tip], tip, id };
+    let (mut repo, fs) = thin(&pr, 1 << 30);
+    // The checkout fetches the tip's files ahead, into a cache pack.
+    checkout(&mut repo, &fs, pr.tip);
+    let backend: Arc<dyn StorageBackend> = repo.backend().clone();
+    drop(repo);
+    // A fresh process (`vl mount`, a daemon): it decodes the tip's trees
+    // while the pack holds their files.
+    let again = Repo::open(backend.clone(), Some(pr.id.clone()), "alice").unwrap();
+    again.store().set_promisor(pr.server.clone());
+    let e = entry(&again, &pr.tip, "src/f07.txt");
+    assert_eq!(again.store().read_entry(&e).unwrap(), b"file 7\n");
+    // The working copy moves elsewhere (nothing pins the tip), and the
+    // cache is trimmed: the pack goes.
+    let _ = backend.remove_file(&p(".veil/local/checkout.json"));
+    again.store().set_anchor_snapshots(Vec::new());
+    again.store().set_cache_limit(0);
+    again.store().trim_cache().unwrap();
+    again.store().set_cache_limit(1 << 30);
+    assert!(!again.store().cache().unwrap().has(&e.id), "the pack was evicted");
+    // Read the file again, as the same process: its tree read afresh first.
+    let e = entry(&again, &pr.tip, "src/f07.txt");
+    let got = again.store().read_entry(&e);
+    assert!(got.is_ok(), "the server would serve it, yet this process cannot place it: {:?}", got.err());
+}
+
+/// BUG-1148: gc in a thin clone after an ordinary eviction. A local commit
+/// `L` on the server's tip keeps the tip's unchanged directories by id
+/// (`src/`, `gen/`, …); once the working copy moves on (a pull, a checkout
+/// of the new tip) and the cache is trimmed, those directories and the
+/// tip's own trees are evicted. gc's mark meets the directories missing
+/// under `L`; `classify_gap` needs the tip's evicted root tree to tell, so
+/// every one is `Unknown`, the mark is incomplete, and gc deletes nothing,
+/// in every run while `L` is in the view: in steady state a thin clone's gc
+/// never completes. Each of those objects is the server's: the tip, on the
+/// server, names `L`'s directory by the same id (`L`'s own tree, held, says
+/// so).
+#[test]
+#[ignore = "BUG-1148: gc in a thin clone never completes once the tip's trees are evicted"]
+fn s3r2_gc_in_a_thin_clone_completes_after_an_eviction() {
+    let id = Identity::generate("alice");
+    let sfs = Arc::new(MemoryBackend::new());
+    let mut srepo = Repo::init(sfs.clone(), Some(id.clone()), "alice").unwrap();
+    let t = commit_files(&mut srepo, &*sfs, &[("src/a.txt", "a one\n"), ("doc/r.md", "readme\n")], "t");
+    let q = commit_files(&mut srepo, &*sfs, &[("src/a.txt", "a by a teammate\n")], "q");
+    let server = Arc::new(Server {
+        store: srepo.store().clone(),
+        tips: vec![q],
+        down: AtomicBool::new(false),
+        tamper: AtomicBool::new(false),
+        refuse: Mutex::new(HashSet::new()),
+        asked: Mutex::new(Vec::new()),
+        pages: Mutex::new(0),
+    });
+    let pr = Project { server: server.clone(), commits: vec![t, q], tip: t, id: id.clone() };
+    let (mut repo, fs) = thin(&pr, 1 << 30);
+    checkout(&mut repo, &fs, t);
+    let _mine = commit_files(&mut repo, &*fs, &[("new.txt", "mine, unpushed\n")], "local work");
+    // The pull of `Q` (recorded as the remote's tip), and a checkout of it.
+    repo.store().put_raw(&q, &server.store.get_raw(&q).unwrap()).unwrap();
+    let mut tx = repo.transaction("pull").unwrap();
+    tx.view.remote_tags.insert("origin/main".into(), q);
+    tx.commit().unwrap();
+    checkout(&mut repo, &fs, q);
+    repo.store().set_anchor_snapshots(vec![q]);
+    repo.store().set_cache_limit(0);
+    repo.store().trim_cache().unwrap();
+    repo.store().set_cache_limit(1 << 30);
+    let report = gc(&mut repo, &GcOptions { grace: Duration::ZERO, ..GcOptions::default() }).unwrap();
+    assert!(report.incomplete.is_empty(), "gc deleted nothing: {:?}", report.incomplete);
+}

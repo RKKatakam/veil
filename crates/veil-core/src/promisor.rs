@@ -1085,3 +1085,36 @@ pub fn parse_size(s: &str) -> Result<u64> {
     let n: u64 = num.trim().parse().map_err(|_| VeilError::repo(format!("not a size: {s:?} (bytes, or a number with K, M or G)")))?;
     n.checked_mul(1u64 << shift).ok_or_else(|| VeilError::repo(format!("size too large: {s:?}")))
 }
+
+#[cfg(test)]
+mod s3r2_tests {
+    use super::*;
+
+    /// BUG-1149: the locator at its bound. `LOCATOR_CAP` says "about 46
+    /// bytes each: at most about 90 MiB" (and `docs/HUB.md` "under the
+    /// 512 MiB client gate"); the maps' own capacity at the bound is more
+    /// than half again (a hash map grows by doubling, to 7/8 full at most),
+    /// before the parents' map and vector. A scratch run with a counting
+    /// allocator held 166 to 376 MiB at the bound (peak 248 to 458 MiB),
+    /// for 100 to 1 entries per tree.
+    #[test]
+    #[ignore = "BUG-1149: the locator at its bound holds about twice the 90 MiB it states"]
+    fn s3r2_the_locator_at_its_bound_is_about_90_mib() {
+        let id = |i: u64, tag: u8| {
+            let mut x = [0u8; 32];
+            x[..8].copy_from_slice(&i.to_le_bytes());
+            x[31] = tag;
+            ObjectId(x)
+        };
+        let mut l = Locator::default();
+        // Ten entries per tree, a usual directory.
+        for i in 0..LOCATOR_CAP as u64 + 10 {
+            l.note(id(i, 0), id(i / 10, 1), (i % 10) as u32);
+        }
+        assert_eq!(l.at.len(), LOCATOR_CAP);
+        let bytes = l.at.capacity() * std::mem::size_of::<(ObjectId, (u32, u32))>()
+            + l.handles.capacity() * std::mem::size_of::<(ObjectId, u32)>()
+            + l.parents.capacity() * std::mem::size_of::<ObjectId>();
+        assert!(bytes <= 90 << 20, "the locator at its bound holds at least {} MiB", bytes >> 20);
+    }
+}

@@ -428,3 +428,212 @@ fn s3r_a_checkout_past_the_cache_bound_fails_before_writing() {
     }
     admin.ok(&thin, &["status"]);
 }
+
+// ---- S3 cycle 2 review (`docs/BUGS.md`, "S3 cycle 2") --------------------
+
+/// A project whose `main` is small and whose branch `big` adds 400 KB of
+/// files that do not compress (20 of 20 KB), both pushed.
+fn project_with_big_branch(hub: &TestHub) -> (Person, String) {
+    let (admin, dir, name) = project_with_history(hub, 0, 0);
+    admin.ok(&dir, &["new", "main"]);
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for i in 0..20 {
+        let mut text = String::new();
+        while text.len() < 20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            text.push_str(&format!("{x:016x}"));
+        }
+        write_files(&dir, &[(&format!("big/f{i:02}.bin"), &text)]);
+    }
+    admin.ok(&dir, &["commit", "-m", "big"]);
+    admin.ok(&dir, &["tag", "set", "big", "-r", "@-"]);
+    let first = log_ids(&admin, &dir)[2].clone();
+    admin.ok(&dir, &["tag", "set", "main", "-r", &first, "--force"]);
+    admin.ok(&dir, &["push"]);
+    (admin, name)
+}
+
+/// After `cmd` ran in thin clone `thin` (bounded at 100 KiB) and tried to
+/// move the working copy onto `big`'s 400 KB: either it moved, within the
+/// bound, or it failed and recorded nothing, so the next command works.
+fn assert_a_failed_move_records_nothing(admin: &Person, thin: &Path, cmd: &[&str], o: std::process::Output) {
+    let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    if o.status.success() {
+        let cache = du(&thin.join(".veil/cache"));
+        assert!(cache <= 100 * 1024 + 64 * 1024, "`vl {}` left {cache} bytes in a cache bounded at 100 KiB:\n{out}", cmd.join(" "));
+        return;
+    }
+    let st = admin.run(thin, &["status"]);
+    let status = format!("{}{}", String::from_utf8_lossy(&st.stdout), String::from_utf8_lossy(&st.stderr));
+    // What the person would try next (shown on failure).
+    let tried = |args: &[&str]| {
+        let o = admin.run(thin, args);
+        format!("`vl {}` ({}): {}{}", args.join(" "), o.status, String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))
+    };
+    let next = if st.status.success() { String::new() } else { format!("{}\n{}", tried(&["undo"]), tried(&["partial", "limit", "1G"])) };
+    assert!(
+        st.status.success(),
+        "`vl {}` failed to fetch, yet recorded its move: every later command retries it and fails.\n`vl {}`:\n{out}\n`vl status`:\n{status}\n{next}",
+        cmd.join(" "),
+        cmd.join(" ")
+    );
+}
+
+/// A thin clone (default bound) that has had `big` checked out and gone
+/// back to `main`, then had its bound lowered to 100 KiB: `big`'s files
+/// are evicted, and an operation in the log has the working copy on `big`.
+/// Returns the clone and the id of that operation.
+fn clone_that_visited_big(admin: &Person, hub: &TestHub, name: &str) -> (std::path::PathBuf, String) {
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(name), thin.to_str().unwrap()]);
+    admin.ok(&thin, &["new", "big"]);
+    let o = admin.run(&thin, &["op", "log", "--json"]);
+    let ops = json(&String::from_utf8_lossy(&o.stdout));
+    let on_big = ops["operations"][0]["op_id"].as_str().unwrap().to_string();
+    admin.ok(&thin, &["new", "main"]);
+    admin.ok(&thin, &["partial", "limit", "100K"]);
+    // A command in a fresh process, which trims under the new bound.
+    admin.ok(&thin, &["partial", "limit", "100K"]);
+    assert!(du(&thin.join(".veil/cache")) <= 100 * 1024 + 64 * 1024, "big's files were evicted");
+    (thin, on_big)
+}
+
+/// BUG-1146 (BUG-1145's second half, the class): `vl rebase` of the
+/// working copy onto a branch past the cache's bound records the rebase,
+/// then fails to fetch; every later command retries the move and fails.
+#[test]
+#[ignore = "BUG-1146: a working-copy move recorded before its fetch (rebase)"]
+fn s3r2_a_rebase_past_the_cache_bound_records_nothing() {
+    let hub = TestHub::start();
+    let (admin, name) = project_with_big_branch(&hub);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", "--cache-size", "100K", &hub.url(&name), thin.to_str().unwrap()]);
+    let cmd = ["rebase", "-s", "@", "-d", "big"];
+    let o = admin.run(&thin, &cmd);
+    assert_a_failed_move_records_nothing(&admin, &thin, &cmd, o);
+}
+
+/// BUG-1146: `vl merge` into the working copy, the same route.
+#[test]
+#[ignore = "BUG-1146: a working-copy move recorded before its fetch (merge)"]
+fn s3r2_a_merge_past_the_cache_bound_records_nothing() {
+    let hub = TestHub::start();
+    let (admin, name) = project_with_big_branch(&hub);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", "--cache-size", "100K", &hub.url(&name), thin.to_str().unwrap()]);
+    let cmd = ["merge", "big"];
+    let o = admin.run(&thin, &cmd);
+    assert_a_failed_move_records_nothing(&admin, &thin, &cmd, o);
+}
+
+/// BUG-1146: `vl undo` back onto a working copy whose files were evicted.
+#[test]
+#[ignore = "BUG-1146: a working-copy move recorded before its fetch (undo)"]
+fn s3r2_an_undo_past_the_cache_bound_records_nothing() {
+    let hub = TestHub::start();
+    let (admin, name) = project_with_big_branch(&hub);
+    let (thin, _) = clone_that_visited_big(&admin, &hub, &name);
+    let cmd = ["undo"];
+    let o = admin.run(&thin, &cmd);
+    assert_a_failed_move_records_nothing(&admin, &thin, &cmd, o);
+}
+
+/// BUG-1146: `vl op restore` of an operation whose working copy was evicted.
+#[test]
+#[ignore = "BUG-1146: a working-copy move recorded before its fetch (op restore)"]
+fn s3r2_an_op_restore_past_the_cache_bound_records_nothing() {
+    let hub = TestHub::start();
+    let (admin, name) = project_with_big_branch(&hub);
+    let (thin, on_big) = clone_that_visited_big(&admin, &hub, &name);
+    let cmd = ["op", "restore", on_big.as_str()];
+    let o = admin.run(&thin, &cmd);
+    assert_a_failed_move_records_nothing(&admin, &thin, &cmd, o);
+}
+
+/// `vl ws switch` to a workspace on `big`: the move is not recorded first.
+/// (A control: `ws switch` holds.)
+#[test]
+fn s3r2_a_workspace_switch_past_the_cache_bound_records_nothing() {
+    let hub = TestHub::start();
+    let (admin, name) = project_with_big_branch(&hub);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", "--cache-size", "100K", &hub.url(&name), thin.to_str().unwrap()]);
+    admin.ok(&thin, &["ws", "new", "other", "-r", "big"]);
+    let cmd = ["ws", "switch", "other"];
+    let o = admin.run(&thin, &cmd);
+    assert_a_failed_move_records_nothing(&admin, &thin, &cmd, o);
+}
+
+/// BUG-1146: `vl new A B` (a merge): the fetch-ahead of `vl new` runs for
+/// one parent only.
+#[test]
+#[ignore = "BUG-1146: a working-copy move recorded before its fetch (new of a merge)"]
+fn s3r2_a_new_merge_past_the_cache_bound_records_nothing() {
+    let hub = TestHub::start();
+    let (admin, name) = project_with_big_branch(&hub);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", "--cache-size", "100K", &hub.url(&name), thin.to_str().unwrap()]);
+    let cmd = ["new", "main", "big"];
+    let o = admin.run(&thin, &cmd);
+    assert_a_failed_move_records_nothing(&admin, &thin, &cmd, o);
+}
+
+/// `vl restore --from big` (the working copy takes `big`'s files): a
+/// control, it holds.
+#[test]
+fn s3r2_a_restore_past_the_cache_bound_records_nothing() {
+    let hub = TestHub::start();
+    let (admin, name) = project_with_big_branch(&hub);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", "--cache-size", "100K", &hub.url(&name), thin.to_str().unwrap()]);
+    let cmd = ["restore", "--from", "big"];
+    let o = admin.run(&thin, &cmd);
+    assert_a_failed_move_records_nothing(&admin, &thin, &cmd, o);
+}
+
+/// BUG-1146: `vl cherry-pick big` onto the working copy's parent.
+#[test]
+#[ignore = "BUG-1146: a working-copy move recorded before its fetch (cherry-pick)"]
+fn s3r2_a_cherry_pick_past_the_cache_bound_records_nothing() {
+    let hub = TestHub::start();
+    let (admin, name) = project_with_big_branch(&hub);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", "--cache-size", "100K", &hub.url(&name), thin.to_str().unwrap()]);
+    let cmd = ["cherry-pick", "big"];
+    let o = admin.run(&thin, &cmd);
+    assert_a_failed_move_records_nothing(&admin, &thin, &cmd, o);
+}
+
+/// BUG-1260: a thin clone of a project with a tag whose name could be an
+/// id (`lts`, `trunk`, `work`: only the letters k–z, as change ids are
+/// written; or four hex digits or more, as `2025`) fetches the project's
+/// whole history. The pull's tag check (`apply_remote_tags`, BUG-105:
+/// would the new tag hide an id?) walks every visible snapshot
+/// (`RevisionNames::shadows`, `topo_children_first`), and since cycle 1
+/// every snapshot read pages history in at the boundary
+/// (`Repo::snapshot_opt`). The clone then holds every snapshot, as a full
+/// clone: here, `vl log` works with the server gone, where a clone of the
+/// same project without that tag needs the server.
+#[test]
+#[ignore = "BUG-1260: a tag named like an id makes a thin clone fetch the whole history"]
+fn s3r2_a_tag_named_like_an_id_does_not_fetch_the_whole_history() {
+    let hub = TestHub::start();
+    let (admin, dir, name) = project_with_history(&hub, 6, 10);
+    let plain = admin.dir("plain");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), plain.to_str().unwrap()]);
+    admin.ok(&dir, &["tag", "set", "lts", "-r", "main"]);
+    admin.ok(&dir, &["push"]);
+    let tagged = admin.dir("tagged");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), tagged.to_str().unwrap()]);
+    drop(hub);
+    let o = admin.run(&plain, &["log"]);
+    assert!(!o.status.success(), "a thin clone holds its tips only, and needs the server for history");
+    let o = admin.run(&tagged, &["log"]);
+    assert!(
+        !o.status.success(),
+        "the clone of the project tagged `lts` holds the whole history (`vl log` with the server gone):\n{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+}
