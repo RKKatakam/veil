@@ -473,8 +473,9 @@ impl Ctx {
         committed: &mut Option<veil_core::commands::CommitResult>,
     ) -> Result<()> {
         // One recorder of this directory at a time (the lock-free op log
-        // has no repository lock to serialise them).
-        let _wc = self.lock_wc()?;
+        // has no repository lock to serialise them), judging it by what it
+        // holds now (BUG-1084).
+        let _wc = self.lock_dir(None)?;
         // A move of the directory that a previous command started and did
         // not finish (killed, disk full): finish it before recording
         // anything, or the half-moved directory would be recorded as the
@@ -757,13 +758,37 @@ impl Ctx {
         Ok(())
     }
 
-    /// Lock the attached workspace's directory for recording or checkout
-    /// ([`veil_core::lock::WcLock`]).
-    fn lock_wc(&self) -> Result<Option<veil_core::lock::WcLock>> {
+    /// Lock the project directory for recording or checkout
+    /// ([`veil_core::lock::WcLock`]: the lock of the workspace it is
+    /// attached to, and of `to`, a workspace this command moves it to), then
+    /// read again what it holds and where the workspace points
+    /// ([`Ctx::refresh`]). Read before the lock, both may predate another
+    /// `vl` that recorded or moved the directory while this one waited: the
+    /// directory then looked stale, and its edits were moved into a side
+    /// change and out of it (BUG-1084). If the directory was attached
+    /// elsewhere meanwhile, that workspace is locked instead (BUG-1121).
+    fn lock_dir(&mut self, to: Option<&str>) -> Result<Vec<veil_core::lock::WcLock>> {
         if self.bare {
-            return Ok(None);
+            return Ok(Vec::new());
         }
-        Ok(Some(veil_core::lock::WcLock::acquire(&veil_core::repo::state_dir(&self.root), &self.ws)?))
+        for _ in 0..RECORD_ATTEMPTS {
+            let attached = self.ws.clone();
+            let mut names = vec![attached.as_str()];
+            names.extend(to);
+            // One order for every process, so two never wait for each other.
+            names.sort_unstable();
+            names.dedup();
+            let state = veil_core::repo::state_dir(&self.root);
+            let locks = names
+                .iter()
+                .map(|ws| veil_core::lock::WcLock::acquire(&state, ws))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            self.refresh()?;
+            if self.ws == attached {
+                return Ok(locks);
+            }
+        }
+        bail!("the working copy keeps moving under this command (another `vl` is running here?); try again")
     }
 
     /// Print what merges of concurrent operations decided (once: only the
@@ -788,7 +813,14 @@ impl Ctx {
         if self.bare {
             return Ok(());
         }
-        let _wc = self.lock_wc()?;
+        // A workspace this command attached the directory to (`vl ws
+        // switch`, undoing one) is where it goes; otherwise it follows what
+        // its record says now, under the lock.
+        let to = (self.ws != self.checkout.attached()).then(|| std::mem::replace(&mut self.ws, self.checkout.attached().to_string()));
+        let _wc = self.lock_dir(to.as_deref())?;
+        if let Some(ws) = to {
+            self.attach(&ws)?;
+        }
         if self.checkout.pending.is_some() {
             self.resume()?;
         }

@@ -2079,10 +2079,27 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
             let mut data = Vec::new();
             std::io::stdin().read_to_end(&mut data)?;
             let _wc = veil_core::lock::WcLock::acquire(&veil_core::repo::state_dir(&ctx.root), name)?;
-            let overlay = ctx.repo.workspace_overlay(name)?;
             let vp = VPath::new(path)?;
-            overlay.write(&vp, &data)?;
-            let out = ctx.repo.snapshot_workspace(name, &overlay)?;
+            // Written over the workspace as it is now, and recorded only if
+            // it still is: built on an older `@`, the snapshot reverted a
+            // write that landed while this one waited for the lock, or what
+            // another command changed in the workspace meanwhile (BUG-1120).
+            let mut attempts = 0;
+            let (overlay, out) = loop {
+                ctx.repo.reload()?;
+                let wc = ctx.repo.workspace_wc(name)?;
+                let overlay = ctx.repo.workspace_overlay(name)?;
+                overlay.write(&vp, &data)?;
+                let opts = veil_core::workspace::SnapshotOptions { expected_wc: Some(wc), ..Default::default() };
+                let out = ctx.repo.snapshot_workspace_with(name, &overlay, opts)?;
+                attempts += 1;
+                if !out.superseded {
+                    break (overlay, out);
+                }
+                if attempts == 16 {
+                    bail!("workspace '{}' keeps moving while it is recorded (other commands are recording it); try again", safe(name));
+                }
+            };
             print_build_warnings(&out.report);
             // Say what the builder did with it, not what was asked (BUG-102).
             let tree = ctx.repo.snapshot(&out.snapshot)?.tree;
