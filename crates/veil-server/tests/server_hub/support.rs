@@ -253,7 +253,9 @@ impl Person {
     /// Clone `url` into `dir` and confirm the project's fingerprint `fp`
     /// (compared with an admin out of band): the clone trusts its keys.
     pub fn clone_trusting(&self, url: &str, dir: &Path, fp: &str) {
-        self.ok(self.home.path(), &["clone", url, dir.to_str().unwrap()]);
+        // A full clone, as the tests written before thin clones (S3)
+        // expect; `thin.rs` tests thin ones.
+        self.ok(self.home.path(), &["clone", "--full", url, dir.to_str().unwrap()]);
         self.ok(dir, &["identity", "confirm", fp]);
     }
 
@@ -456,6 +458,14 @@ pub fn everything_in(clone: &Path) -> Vec<(String, Vec<u8>)> {
         for id in repo.store().list_objects().unwrap() {
             if let Ok(raw) = repo.store().get_raw(&id) {
                 out.push((format!("object {}", id.short()), raw));
+            }
+        }
+        // A thin clone's cache area (S3): its packs are compressed.
+        if let Some(cache) = repo.store().cache() {
+            for id in cache.list_objects().unwrap() {
+                if let Ok(raw) = cache.get_raw(&id) {
+                    out.push((format!("cached object {}", id.short()), raw));
+                }
             }
         }
     }

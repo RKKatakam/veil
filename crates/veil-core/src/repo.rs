@@ -32,7 +32,7 @@ use crate::{
     lock::RepoLock,
     merge::{merge_trees, virtual_merge_base, MergeOutcome},
     now_millis,
-    object::{Snapshot, Text},
+    object::{Object, Snapshot, Text},
     oplog::{OpStore, Operation, RawHeads, View, WorkspaceState},
     policy::DEFAULT_SCOPE,
     graph_index::GraphIndex,
@@ -43,6 +43,12 @@ use crate::{
 };
 
 pub const VEIL_DIR: &str = ".veil";
+
+thread_local! {
+    /// Depth of [`Repo::exact`] on this thread: nested queries run once,
+    /// inside the outer one's rounds.
+    static EXACT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 
 /// The directory holding the Veil repository of the project at `root`:
 /// `<root>/.veil`.
@@ -62,6 +68,7 @@ pub fn state_dir(root: &Path) -> std::path::PathBuf {
 /// | 6 | vl 1.1.0 | the lock-free op log: `op_heads/`, `Operation::{workspace, rewritten}` |
 /// | 7 | vl 1.1.0 | key rings of ring format 4: invites, shares by members, a member's removal of their own device (`docs/HUB.md` §13.12) |
 /// | 8 | vl 1.1.0 | only secret files are encrypted: no encrypted descriptions, tag messages, tag names, embargoes, folders or lines of work; plain embargo records (embargo record format 2) |
+/// | 9 | vl 1.1.0 | a thin clone of a server project ([`PARTIAL_FORMAT`]): the `partial` marker, objects fetched on demand into `.veil/cache/` |
 ///
 /// This build reads format 8 only. `vl upgrade` brings formats 6 and 7 to
 /// it, after checking that they hold nothing the removed encryption of
@@ -72,6 +79,19 @@ pub const REPO_FORMAT: u32 = 8;
 /// Oldest repository format this build opens.
 pub const MIN_REPO_FORMAT: u32 = REPO_FORMAT;
 
+/// The format of a thin clone (`docs/HUB.md` §13.18): format 8 plus the
+/// `partial` marker in `repo.json`. Only `vl clone` writes it, for a thin
+/// clone; every other repository stays at [`REPO_FORMAT`], readable by the
+/// vl releases that read format 8. A vl that does not know format 9 refuses
+/// a thin clone instead of reading its unfetched objects as hidden.
+pub const PARTIAL_FORMAT: u32 = 9;
+
+/// Newest repository format this build opens.
+pub const MAX_REPO_FORMAT: u32 = PARTIAL_FORMAT;
+
+/// Default bound of a thin clone's object cache (`vl clone --cache-size`).
+pub const DEFAULT_CACHE_LIMIT: u64 = 4 << 30;
+
 /// Oldest repository format `vl upgrade` brings to [`REPO_FORMAT`].
 pub const MIN_UPGRADE_FORMAT: u32 = 6;
 
@@ -80,7 +100,7 @@ pub fn min_vl_for_format(format: u32) -> &'static str {
     match format {
         0 | 1 => "0.1.0",
         2..=5 => "1.0.0",
-        6..=8 => "1.1.0",
+        6..=9 => "1.1.0",
         _ => "a newer release",
     }
 }
@@ -99,11 +119,11 @@ pub fn check_format_supported(format: u32) -> Result<()> {
 }
 
 /// `Ok` if `vl upgrade` (and `vl fsck`) can read a repository of `format`:
-/// [`MIN_UPGRADE_FORMAT`] to [`REPO_FORMAT`].
+/// [`MIN_UPGRADE_FORMAT`] to [`MAX_REPO_FORMAT`].
 pub fn check_format_upgradable(format: u32) -> Result<()> {
-    if format > REPO_FORMAT {
+    if format > MAX_REPO_FORMAT {
         return Err(VeilError::Unsupported(format!(
-            "this repository uses format {format}, which needs a newer vl (this is vl {}, which reads format {REPO_FORMAT})",
+            "this repository uses format {format}, which needs a newer vl (this is vl {}, which reads formats {REPO_FORMAT} and {MAX_REPO_FORMAT})",
             env!("CARGO_PKG_VERSION")
         )));
     }
@@ -139,6 +159,17 @@ pub struct RemoteConfig {
     pub only: Option<String>,
 }
 
+/// The `partial` marker of a thin clone (format [`PARTIAL_FORMAT`],
+/// device-local): objects not in the main store are fetched from the
+/// server of remote `remote` when read, into the cache area, which is kept
+/// under `cache_limit` bytes (`docs/HUB.md` §13.18).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartialConfig {
+    pub remote: String,
+    pub cache_limit: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RepoConfig {
     /// Repository format ([`REPO_FORMAT`]). A reader refuses a format newer
@@ -152,6 +183,10 @@ pub struct RepoConfig {
     /// of releases that do not know the format yet ("needs vl ≥ X").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_vl: Option<String>,
+    /// A thin clone (format [`PARTIAL_FORMAT`] only; absent otherwise, so
+    /// other `repo.json` files keep their bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<PartialConfig>,
 }
 
 impl RepoConfig {
@@ -159,14 +194,34 @@ impl RepoConfig {
     /// it needs when the configuration says so.
     pub fn check_supported(&self) -> Result<()> {
         check_format_supported(self.format).map_err(|e| match (&e, &self.min_vl) {
-            (VeilError::Unsupported(_), Some(v)) if self.format > REPO_FORMAT => VeilError::Unsupported(format!(
+            (VeilError::Unsupported(_), Some(v)) if self.format > MAX_REPO_FORMAT => VeilError::Unsupported(format!(
                 "this repository uses format {} and needs vl {v} or later (this is vl {})",
                 self.format,
                 env!("CARGO_PKG_VERSION")
             )),
             _ => e,
         })?;
-        Ok(())
+        self.check_partial()
+    }
+
+    /// The `partial` marker and format 9 go together: a marker in another
+    /// format, or format 9 without one, is a damaged `repo.json` (threat 14
+    /// of `docs/design/scale/6-partial-clone.md`).
+    pub fn check_partial(&self) -> Result<()> {
+        match (&self.partial, self.format == PARTIAL_FORMAT) {
+            (Some(_), false) => Err(VeilError::Corrupt(
+                "repo.json".into(),
+                format!("a `partial` marker in a repository of format {} (only format {PARTIAL_FORMAT} has one)", self.format),
+            )),
+            (None, true) => Err(VeilError::Corrupt("repo.json".into(), format!("format {PARTIAL_FORMAT} without its `partial` marker"))),
+            (Some(p), true) if p.remote.is_empty() => Err(VeilError::Corrupt("repo.json".into(), "a `partial` marker naming no remote".into())),
+            _ => Ok(()),
+        }
+    }
+
+    /// Is this a thin clone?
+    pub fn is_partial(&self) -> bool {
+        self.partial.is_some()
     }
 }
 
@@ -297,6 +352,7 @@ impl Repo {
             repo_id: hex::encode(random_bytes::<16>()),
             remotes: BTreeMap::new(),
             min_vl: (format > 1).then(|| min_vl_for_format(format).to_string()),
+            partial: None,
         };
         let has_identity = identity.is_some();
         let keys = Arc::new(Keychain::new(backend.clone(), identity, config.repo_id.clone()));
@@ -404,6 +460,9 @@ impl Repo {
         let keys = Arc::new(Keychain::new(backend.clone(), identity, config.repo_id.clone()));
         let store = Arc::new(ObjectStore::new(backend.clone(), VPath::new(".veil/objects")?, keys));
         store.set_format(config.format);
+        if let Some(p) = &config.partial {
+            store.set_partial(VPath::new(crate::promisor::CACHE_DIR)?, p.cache_limit);
+        }
         let root_id = store.put_snapshot(&Snapshot::root(store.empty_tree()?))?;
         let ops = OpStore::new(backend.clone());
         ops.set_format(config.format);
@@ -479,7 +538,81 @@ impl Repo {
         self.base = heads;
         self.op_id = op_id;
         self.view = view;
+        self.pin_working_copies();
         Ok(true)
+    }
+
+    /// A thin clone pins what its workspaces hold (never evicted from the
+    /// cache): called whenever the view changes.
+    pub(crate) fn pin_working_copies(&self) {
+        if self.store.is_partial() {
+            self.store.set_anchor_snapshots(self.view.workspaces.values().map(|w| w.wc).collect());
+        }
+    }
+
+    /// Is this a thin clone (`docs/HUB.md` §13.18)?
+    pub fn is_partial(&self) -> bool {
+        self.config.partial.is_some()
+    }
+
+    /// Run graph query `f` exactly in a thin clone: when its walk reached
+    /// snapshots this clone does not hold (its boundary), fetch the next
+    /// page of history from the server and run it again, until the walk
+    /// stays inside what is held or the server has no more. In any other
+    /// repository, `f` once. A thin clone that cannot reach the server
+    /// fails with [`VeilError::Unavailable`]; it never answers from the
+    /// part of the graph it holds alone.
+    pub fn exact<R>(&self, mut f: impl FnMut(&Repo) -> Result<R>) -> Result<R> {
+        if !self.store.is_partial() || EXACT.with(|d| d.get() > 0) {
+            return f(self);
+        }
+        EXACT.with(|d| d.set(d.get() + 1));
+        struct Undo;
+        impl Drop for Undo {
+            fn drop(&mut self) {
+                EXACT.with(|d| d.set(d.get() - 1));
+            }
+        }
+        let _undo = Undo;
+        loop {
+            let _ = self.store.take_boundary_hits();
+            // An error too (a revision not found) is answered again once
+            // the history it may be in is here.
+            let out = f(self);
+            let hits = self.store.take_boundary_hits();
+            if hits.is_empty() || self.deepen(&hits, crate::promisor::HISTORY_PAGE)? == 0 {
+                return out;
+            }
+        }
+    }
+
+    /// Fetch one page of history below `tips` (snapshots this thin clone
+    /// lacks) into the main store; returns how many snapshots were new.
+    pub fn deepen(&self, tips: &[ObjectId], limit: usize) -> Result<usize> {
+        let Some(promisor) = self.store.promisor() else {
+            return Err(VeilError::Unavailable(
+                "this command needs history this thin clone does not hold, and has no connection to its server".into(),
+            ));
+        };
+        let page = promisor.history(tips, limit)?;
+        let mut incoming = crate::remote::Incoming::new(&self.store);
+        let mut new = 0;
+        for (id, raw) in page {
+            if ObjectId::hash(&raw) != id {
+                return Err(VeilError::Corrupt(id.hex(), "the server sent history that does not match its ids".into()));
+            }
+            if !matches!(Object::decode(&raw)?, Object::Snapshot(_)) {
+                return Err(VeilError::Corrupt(id.hex(), "the server sent a non-snapshot in history".into()));
+            }
+            if !self.store.has(&id) && incoming.put(id, raw, "")? {
+                new += 1;
+            }
+        }
+        incoming.finish()?;
+        if new > 0 {
+            self.graph.revalidate(self);
+        }
+        Ok(new)
     }
 
     /// Re-read the operation heads (another process or task may have
@@ -713,6 +846,12 @@ impl Repo {
     pub fn save_config(&mut self, config: RepoConfig) -> Result<()> {
         config.check_supported()?;
         write_config(&*self.backend, &config)?;
+        if let Some(p) = &config.partial {
+            match self.store.is_partial() {
+                false => self.store.set_partial(VPath::new(crate::promisor::CACHE_DIR)?, p.cache_limit),
+                true => self.store.set_cache_limit(p.cache_limit),
+            }
+        }
         self.store.set_format(config.format);
         self.ops.set_format(config.format);
         self.config = config;
@@ -854,15 +993,23 @@ impl Repo {
     /// Is `a` an ancestor of (or equal to) `b`? Reads only the history
     /// between them (the history index stops the walk below `a`).
     pub fn is_ancestor(&self, a: &ObjectId, b: &ObjectId) -> Result<bool> {
-        // A snapshot this replica lacks (a redacted parent) has no
-        // generation; it is an ancestor if some ancestor names it.
-        if a != b && self.snapshot_opt(a)?.is_none() {
-            return Ok(self.ancestors(b)?.contains(a));
-        }
-        self.graph.is_ancestor(self, a, b)
+        // A thin clone answers from the server's history where the walk
+        // reaches what it does not hold.
+        self.exact(|r| {
+            // A snapshot this replica lacks (a redacted parent) has no
+            // generation; it is an ancestor if some ancestor names it.
+            if a != b && r.snapshot_opt(a)?.is_none() {
+                return Ok(r.ancestors(b)?.contains(a));
+            }
+            r.graph.is_ancestor(r, a, b)
+        })
     }
 
     pub fn common_ancestor(&self, a: &ObjectId, b: &ObjectId) -> Result<ObjectId> {
+        self.exact(|r| r.common_ancestor_here(a, b))
+    }
+
+    fn common_ancestor_here(&self, a: &ObjectId, b: &ObjectId) -> Result<ObjectId> {
         let anc = self.ancestors(a)?;
         let mut queue = VecDeque::from([*b]);
         let mut seen = HashSet::new();
@@ -930,14 +1077,16 @@ impl Repo {
     /// (by timestamp, then id), so the order does not depend on the order
     /// of `a` and `b`. Redacted snapshots are left out.
     pub fn merge_bases(&self, a: &[ObjectId], b: &[ObjectId]) -> Result<Vec<ObjectId>> {
-        let mut best = Vec::new();
-        for c in self.graph.merge_bases(self, a, b)? {
-            if let Some(s) = self.snapshot_opt(&c)? {
-                best.push((s.timestamp, c));
+        self.exact(|r| {
+            let mut best = Vec::new();
+            for c in r.graph.merge_bases(r, a, b)? {
+                if let Some(s) = r.snapshot_opt(&c)? {
+                    best.push((s.timestamp, c));
+                }
             }
-        }
-        best.sort();
-        Ok(best.into_iter().map(|(_, id)| id).collect())
+            best.sort();
+            Ok(best.into_iter().map(|(_, id)| id).collect())
+        })
     }
 
     /// [`Repo::merge_bases`] by full ancestor sets, without the history

@@ -2057,3 +2057,96 @@ secrets, §3.1), unless a row says otherwise. Tests: `server_hub` `shares`,
 * **A sharer's insider choices** (row 14), and what the file holds: a
   shared `.envrc` is a shell script that direnv runs once the person allows
   it. A share never writes over an existing file.
+
+### 13.18 S3: thin clones, fetch on demand (as built)
+
+Milestone S3 of `docs/design/server/phase-2-thin-clients.md` (§4.2, §5.4,
+§9): the client half of `docs/design/scale/6-partial-clone.md`, re-aimed
+at the server, with **no full graph**. Code: `veil-core/src/promisor.rs`
+(the read path, the cache, eviction), `Repo::exact` and `Repo::deepen`
+(`repo.rs`), `crates/vl/src/thin.rs` (the connection and `vl partial`),
+`hub.rs` (the thin pull). One server change: `history` answers pages.
+
+#### The design as built
+
+* **`vl clone` is thin by default** on a server project (owner decision 3
+  of the phase-2 design); `--full` keeps S1's clone. A thin clone fetches
+  the branch tips (one `history` page holding just them) and the trees and
+  files of the branch it checks out, into `.veil/cache/`. `--only DIR`
+  clones keep their S1 form (not thin).
+* **Repository format 9** (`docs/FORMAT.md`): format 8 plus the
+  `partial: {remote, cache_limit}` marker. Only a thin clone is format 9;
+  every other repository stays at 8. An older vl refuses format 9.
+* **Two areas.** `.veil/objects/` holds every snapshot the clone fetched and
+  everything it made; it is never evicted, and `put_raw` always writes it
+  (a local write is never skipped because the cache holds the object).
+  `.veil/cache/` (an `ObjectStore` of its own) holds the fetched trees and
+  files and is the only area evicted.
+* **The read path** (`ObjectStore::read_raw`): the main store, the cache,
+  then the server. The object's place is the snapshot and path where this
+  process met it, recorded when the tree naming it was decoded (a compact
+  map: child → parent and entry index). The client asks S1's `fetch` for
+  that id at that place; the server checks it against the person's
+  projection. What arrives is re-hashed (BLAKE3), decoded and checked
+  storable before it is written to the cache. An object met only under a
+  local commit is asked for at the same path under the remote's tips.
+  * the server's 404 ("no such object at that path that you can see") is
+    `VeilError::Missing`, a real redaction;
+  * a server that cannot be reached, any other answer, or a command with no
+    connection is the new `VeilError::Unavailable`, which is not
+    `is_unreadable()`: every site that leaves a hidden object out fails
+    instead. Its message names the server and the path, never an id.
+* **No full graph.** Snapshots are never fetched by the read path: the
+  history index computes a generation from all ancestors, so a snapshot
+  fetched on a miss would make the first graph query fetch the whole
+  history one request at a time. A snapshot the clone lacks is beyond its
+  boundary: `Missing`, as for any replica, and recorded.
+  `Repo::is_ancestor`, `merge_bases`, `common_ancestor`, revision
+  resolution and `vl log` run through `Repo::exact`: when the walk reached
+  the boundary, the next page of history (2,000 snapshots, `Repo::deepen`)
+  is fetched into the main store and the query runs again, until the walk
+  stays inside or the server has no more. Without the server: `Unavailable`.
+  A later pull fetches the new snapshots down to what it has, a page at
+  most, and the content of the checked-out branch's tip only.
+* **Checkout fetches ahead.** Before a thin clone's working copy moves
+  (`move_working_copy`), the trees and files that differ are fetched a
+  level at a time, 1,000 per request (`ObjectStore::prefetch_diff`), so a
+  lost server fails the move before it writes anything, even its journal.
+* **The cache's bound** (default 4 GiB, `--cache-size`, `vl partial
+  limit`): when a fetch would pass it, the cache is evicted down to 80 %,
+  least recently written first. **Pinned, never evicted:** the trees of
+  every workspace's working-copy snapshot and of the checkout record (and
+  of an unfinished move's target). A pack holding pinned objects is
+  rewritten with them before it is removed, so a reader whose pack
+  vanished finds them again. When what is pinned alone passes the bound,
+  the fetch fails with a clear error (never an eviction loop); a clone
+  whose checkout passes it is refused. Snapshots and local work are in the
+  main store; the op log's views name snapshots, all of which are there.
+* **gc, fsck and maintenance never fetch.** In a thin clone gc's mark stops
+  at what is on the server (nothing local sits only below it: local
+  objects are referenced from local trees only); `fsck` reports what it
+  has not fetched as notes.
+* **`vl partial full`** fetches every snapshot and object into the main
+  store, copies what only local commits reach from the cache (or the
+  server), rewrites `repo.json` at format 8 without the marker (the commit
+  point), then removes the cache.
+* **Server:** `POST …/history` takes `limit` (revision 3): every tip, then
+  their ancestors, those of the newest children first, at most `limit` in
+  all. Without `limit`, the whole history as before.
+
+#### Not built in S3 (and why)
+
+* **anchors.json** (pinning before a non-fast-forward pull): the server
+  keeps every object it has stored (it has no gc yet), so what a clone did
+  not fetch cannot disappear. S29's gc must keep a retention window for
+  thin clones; the pinning comes with it.
+* **Promotion** of cached objects a transaction references: not needed
+  while the server keeps everything; pins cover the working set.
+* `vl partial widen|narrow PATH`, `vl fetch REV -- PATH`, thin `--only`
+  clones (S8's sparse fallback), the mount's folder prefetch (S8), the
+  daemon (S6).
+* `fsck` in a thin clone does not ask the server whether an unfetched
+  object exists there: it is a note.
+* Walks other than those above (embargo checks, revsets' `::x`, gc,
+  change-id shadowing on pull) take the boundary for the end of the graph.
+  The server decides embargoes and closure itself (§13.5).

@@ -17,3 +17,4 @@ mod remote_init_race;
 mod remote_lock;
 mod storage;
 mod sync_repair;
+mod thin;

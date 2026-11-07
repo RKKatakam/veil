@@ -38,8 +38,9 @@ pub const PROTOCOL: u32 = 1;
 /// What this side of `/v1/` supports beyond its first release, as
 /// [`Tips::revision`] tells clients: 1, a fetch names objects of several
 /// snapshots ([`Want::snapshot`]); 2, uploads may carry compressed
-/// objects ([`super::encoding`]).
-pub const REVISION: u32 = 2;
+/// objects ([`super::encoding`]); 3, history answers pages
+/// ([`HistoryRequest::limit`]), for thin clones.
+pub const REVISION: u32 = 3;
 /// Largest object a frame may carry.
 pub const MAX_FRAME_OBJECT: usize = 1 << 30;
 /// Most objects one fetch request may name.
@@ -115,6 +116,12 @@ pub struct HistoryRequest {
     /// Snapshots the caller already has: the walk stops there.
     #[serde(default)]
     pub stop: Vec<ObjectId>,
+    /// One page (revision 3): every tip, then their ancestors newest first
+    /// (by timestamp, then id), at most this many snapshots in all. A thin
+    /// clone takes its tips with it, and the history it reaches later page
+    /// by page. Without it, the whole history down to `stop`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
 }
 
 /// One object a client asks for: its id, and the path where it met it

@@ -79,6 +79,7 @@ pub mod object;
 pub mod oplog;
 pub mod pack;
 pub mod policy;
+pub mod promisor;
 #[cfg(feature = "os")]
 mod prefetch;
 pub mod remote;
