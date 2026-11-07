@@ -1023,6 +1023,26 @@ pub fn names_secret(pattern: &str) -> bool {
     builtin_rules().1.is_match(&*name)
 }
 
+/// Is a sealed file at `path`, under `scope`, one format 8 itself seals
+/// (`docs/FORMAT.md` §5)? Yes when the path names a secret file
+/// ([`names_secret`]), or when its content descends from a secret: its
+/// object was a secret's before (`known`), a parent held a secret sealed at
+/// the same path (`sealed_in_a_parent(path)`: an edit after a rename), or a
+/// parent's secret of the same scope left its path in this snapshot
+/// (`moved_away(scope)`: a rename, which `vl` keeps sealed). Anything else
+/// sealed only the removed encryption of non-secret content wrote. `vl
+/// upgrade` and the server's push checks decide by this one rule (BUG-1055);
+/// each clause is asked only if the ones before it say no.
+pub fn sealed_secret<E>(
+    path: &str,
+    scope: &str,
+    known: bool,
+    sealed_in_a_parent: impl FnOnce(&str) -> std::result::Result<bool, E>,
+    moved_away: impl FnOnce(&str) -> std::result::Result<bool, E>,
+) -> std::result::Result<bool, E> {
+    Ok(names_secret(path) || known || sealed_in_a_parent(path)? || moved_away(scope)?)
+}
+
 impl Classification {
     /// A path no rule matches.
     fn unmatched() -> Classification {

@@ -646,15 +646,23 @@ fn query_landing_fills_the_viewer_graphs() {
         let key = project.view(&viewer).key();
         for tip in h.branches.values() {
             let p = th.rt.block_on(veil_server::sync::projected(&h.hub, &project, &viewer, *tip)).unwrap();
-            let n: i64 = th.rt.block_on(
-                sqlx::query_scalar("SELECT COUNT(*) FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = $3")
-                    .bind(h.id)
-                    .bind(&key)
-                    .bind(p.hex())
-                    .fetch_one(&h.hub.db),
-            )
-            .unwrap();
-            assert_eq!(n, 1, "{key}: the tip's row");
+            // The landing queued the fill; it runs in the background.
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                let n: i64 = th.rt.block_on(
+                    sqlx::query_scalar("SELECT COUNT(*) FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = $3")
+                        .bind(h.id)
+                        .bind(&key)
+                        .bind(p.hex())
+                        .fetch_one(&h.hub.db),
+                )
+                .unwrap();
+                if n == 1 {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "{key}: the tip's row");
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
     }
 }
@@ -1338,7 +1346,6 @@ mod s13_adversarial {
     /// answers `warming`, and when they end the key is still cold. Under a
     /// steady supply of fills it never warms: the queries starve.
     #[test]
-    #[ignore = "BUG-1074: a query that waits out its deadline for a fill slot leaves no fill queued; its view key stays cold"]
     fn bug_1074_a_query_that_waits_out_its_deadline_for_a_fill_slot_never_fills() {
         let th = TestHub::start();
         let carol = 760_001;
@@ -1408,7 +1415,6 @@ mod s13_adversarial {
     /// and wait: no fill of any other key runs here, though none is
     /// running; every cold query on the server answers `warming`.
     #[test]
-    #[ignore = "BUG-1075: fills waiting for another server's lease hold this server's fill slots"]
     fn bug_1075_fills_waiting_for_another_servers_lease_hold_every_slot() {
         let th = TestHub::start();
         let carol = 760_002;
@@ -1471,7 +1477,6 @@ mod s13_adversarial {
     /// (the client's Kahn walk held only the main line's next snapshot).
     /// Here `k` = 8 with a cursor limit of 8; by default, 1,000 branches.
     #[test]
-    #[ignore = "BUG-1076: a log cursor (the whole frontier) can name more snapshots than the next page accepts"]
     fn bug_1076_a_log_cursor_names_more_snapshots_than_the_next_page_accepts() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);
@@ -1531,6 +1536,98 @@ mod s13_adversarial {
         }
         assert_eq!(seen, total);
     }
+    /// A log over a wide graph pages to the end, through cursors the server
+    /// keeps (BUG-1076), and the pages together are the log in one page:
+    /// 40 lines from the root that never meet but at the top, merged one
+    /// after another, so that 40 are open at once while the log walks
+    /// them; with a cursor limit of 8.
+    #[test]
+    fn query_wide_logs_page_through_kept_cursors() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let t0 = 1_700_000_000_000i64;
+        let (lines, len) = (40usize, 5usize);
+        let mut tips = Vec::new();
+        for l in 0..lines {
+            let mut tip = root_snapshot_id();
+            for i in 0..len {
+                let f = Files::from([(format!("pub/l{l}.txt"), format!("{i}\n").into_bytes())]);
+                let mut change = [0u8; 16];
+                change[..8].copy_from_slice(&((l * 100 + i) as u64 + 1).to_le_bytes());
+                change[15] = 0xd1;
+                tip = h.commit(&th, &[tip], f, change, t0 + (i * lines + l) as i64 * 1000, None);
+            }
+            tips.push(tip);
+        }
+        let mut top = tips[0];
+        for (l, t) in tips.iter().enumerate().skip(1) {
+            let mut change = [0u8; 16];
+            change[..8].copy_from_slice(&(l as u64).to_le_bytes());
+            change[15] = 0xd2;
+            top = h.commit(&th, &[top, *t], Files::from([("pub/top.txt".to_string(), format!("{l}\n").into_bytes())]), change, t0 + 10_000_000 + l as i64, None);
+        }
+        h.set_branch(&th, "main", top);
+        warm_up(&th, &h, &Viewer::default());
+        let a = ask(&th, &h, &Viewer::default());
+        let ids = |v: &Value| v["entries"].as_array().unwrap().iter().map(|e| e["snapshot_id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let whole = th.rt.block_on(query::log(&h.hub, &a, LogParams { n: Some(1000), ..Default::default() }, Limits::default())).unwrap();
+        assert!(whole["next"].is_null());
+        let narrow = Limits {
+            cursor: 8,
+            ..Limits::default()
+        };
+        let (mut paged, mut after, mut kept) = (Vec::new(), None::<String>, 0);
+        for _ in 0..200 {
+            let v = th.rt.block_on(query::log(&h.hub, &a, LogParams { n: Some(7), after: after.clone(), ..Default::default() }, narrow)).unwrap();
+            paged.extend(ids(&v));
+            after = v["next"].as_str().map(str::to_string);
+            match &after {
+                Some(c) if c.starts_with("frontier-") => kept += 1,
+                Some(c) => assert!(c.split(',').count() <= 8, "{c}"),
+                None => break,
+            }
+        }
+        assert!(after.is_none(), "the log did not end");
+        assert_eq!(paged, ids(&whole));
+        assert_eq!(paged.len(), lines * len + lines - 1 + 1);
+        assert!(kept > 0, "the frontier never passed the limit");
+        // A kept cursor is the viewer's: another view key does not have it.
+        let v = th.rt.block_on(query::log(&h.hub, &a, LogParams { n: Some(lines), ..Default::default() }, narrow)).unwrap();
+        let c = v["next"].as_str().unwrap().to_string();
+        assert!(c.starts_with("frontier-"), "{c}");
+        let other = ask(&th, &h, &admin());
+        warm_up(&th, &h, &admin());
+        let r = th.rt.block_on(query::log(&h.hub, &other, LogParams { after: Some(c), ..Default::default() }, narrow));
+        assert!(matches!(r, Err(Error::Api { code: "bad_request", .. })), "{r:?}");
+    }
+
+    /// BUG-1078's bound at the source: a snapshot of more than
+    /// `sync::MAX_PARENTS` (64) parents is refused at push; 64 are taken.
+    #[test]
+    fn query_pushes_cap_a_snapshots_parents() {
+        let th = TestHub::start();
+        let p = setup_project(&th);
+        let api = th.api();
+        let token = p.admin.token();
+        let max = veil_server::sync::MAX_PARENTS;
+        let mut tips = Vec::new();
+        for i in 0..max {
+            let mut f = Craft::new(&api, &p.admin, &p.name, "main");
+            f.file(&format!("src/w{i}.txt"), "w");
+            let r = f.push_to(&format!("w{i}"), None);
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            tips.push(api.tips(Some(&token), &p.name).unwrap().branches[&format!("w{i}")]);
+        }
+        let c = Craft::new(&api, &p.admin, &p.name, "main");
+        let r = c.push_merge("main", &tips);
+        assert_eq!(r.status, 400, "{} parents: {}", max + 1, String::from_utf8_lossy(&r.body));
+        assert!(String::from_utf8_lossy(&r.body).contains("at most 64 parents"));
+        let c = Craft::new(&api, &p.admin, &p.name, "main");
+        let r = c.push_merge("main", &tips[1..]);
+        assert_eq!(r.status, 200, "{max} parents: {}", String::from_utf8_lossy(&r.body));
+    }
+
     /// BUG-1077: `SIMILAR_MAX_HELD` (16 MiB) counts the deleted files'
     /// bytes, but what is held is their tables of line hashes: an entry of
     /// 12 bytes, in a hash table, per distinct line. Lines of 4 bytes
@@ -1539,12 +1636,11 @@ mod s13_adversarial {
     /// several times the stated bound; and nothing bounds how many run at
     /// once (each on its own blocking thread, up to 512).
     #[test]
-    #[ignore = "BUG-1077: rename detection holds line tables several times SIMILAR_MAX_HELD"]
     fn bug_1077_rename_detection_holds_far_more_than_its_held_bound() {
         const CHILD: &str = "VEIL_BUG1077_CHILD";
         if std::env::var(CHILD).is_err() {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "query::s13_adversarial::bug_1077_rename_detection_holds_far_more_than_its_held_bound", "--nocapture", "--include-ignored"])
+                .args(["--exact", "query::s13_adversarial::bug_1077_rename_detection_holds_far_more_than_its_held_bound", "--nocapture"])
                 .env(CHILD, "1")
                 .output()
                 .unwrap();
@@ -1606,7 +1702,6 @@ mod s13_adversarial {
     /// parents, BUG-1076's refusal too). A page of 1 entry with a budget
     /// of 100 here reads every parent.
     #[test]
-    #[ignore = "BUG-1078: one log step over a merge of many parents passes the page's work budget"]
     fn bug_1078_one_log_step_over_a_wide_merge_passes_the_budget() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);

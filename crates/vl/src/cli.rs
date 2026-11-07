@@ -88,6 +88,10 @@ pub enum Cmd {
     /// Groups of people on the Veil server (the origin remote's project).
     #[command(subcommand)]
     Group(GroupCmd),
+    /// Commit through the Veil server's API, without a checkout (scripts,
+    /// CI, agents).
+    #[command(subcommand)]
+    Change(ChangeCmd),
     /// Invite a person to a group (admins): prints a one-time link to send
     /// them (Slack, email).
     ///
@@ -547,7 +551,8 @@ pub enum Cmd {
     // ---- secrets & identities ---------------------------------------------
     /// Encrypted secrets: the device-local vault, or a scope's team vault
     /// (`--scope`), sealed for the scope's members (it does not sync
-    /// through the Veil server yet).
+    /// through the Veil server yet); and secret files shared from one
+    /// member to another (`share`, `unshare`, `shares`).
     #[command(subcommand)]
     Secret(SecretCmd),
     /// Run a command with vault secrets injected as environment variables.
@@ -928,6 +933,48 @@ pub enum SecretCmd {
         /// Dotenv file to read.
         file: PathBuf,
     },
+    /// Share one secret file (`.env`, …) with another member of the
+    /// project, without an admin.
+    ///
+    /// A copy of that one file is sealed on this device for the person's
+    /// confirmed devices only (confirmed outside the server, as for every
+    /// key): it opens nothing else of its folder. Run it again to send a new
+    /// version (an edit of the file alone sends nothing); devices they add
+    /// receive the current version automatically, until you unshare it.
+    /// Admins see that it is shared (who, what path, when), never what it
+    /// holds. Their
+    /// `vl pull` writes it at the same path, where it stays on their device
+    /// (and reaches their agents with `vl ws exec --with-isolated`).
+    Share {
+        /// The secret file, in the working copy.
+        path: String,
+        /// The person to share it with.
+        #[arg(long, value_name = "PERSON")]
+        with: String,
+        /// A device fingerprint of theirs you compared with them (needed
+        /// when no key ring records a device of theirs yet).
+        #[arg(long, value_name = "FINGERPRINT")]
+        confirm: Vec<String>,
+        #[command(flatten)]
+        out: JsonOut,
+    },
+    /// Stop sharing a secret file with a person: they get no later
+    /// version. What they already received stays theirs.
+    Unshare {
+        /// The secret file.
+        path: String,
+        /// The person you shared it with.
+        #[arg(long, value_name = "PERSON")]
+        from: String,
+        #[command(flatten)]
+        out: JsonOut,
+    },
+    /// List the secret shares you make and receive (admins: every share of
+    /// the project), never their content; receives what is new for you.
+    Shares {
+        #[command(flatten)]
+        out: JsonOut,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1007,6 +1054,48 @@ pub enum IdentityCmd {
         /// one this device is signed in to.
         #[arg(long)]
         server: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ChangeCmd {
+    /// Make a change from a list of edits on the server: it builds the
+    /// change on its own copy of the project, with every check a push gets,
+    /// and can move a branch to it at once.
+    ///
+    /// FILE is a JSON list of edits, paths from the project root:
+    /// `[{"path": "src/a.rs", "put": {"text": "…"}}, {"path": "old.rs",
+    /// "delete": true}]` (`"executable": true` in a put for an executable
+    /// file). Secret files (`.env`) are encrypted here first, which needs a
+    /// clone of the project holding their key; anything that looks like a
+    /// secret in an ordinary file is refused. With `--onto`, the branch
+    /// moves to the change; when it moved since `--base`, the server
+    /// applies the edits to its new tip instead, unless a file they edit
+    /// changed there (`--expected` moves only from that tip).
+    New {
+        /// The project, `veil://host[:port]/project` (default: this
+        /// clone's origin).
+        project: Option<String>,
+        /// The edits, as JSON (`-` reads standard input).
+        #[arg(long, value_name = "FILE")]
+        edits: PathBuf,
+        /// The snapshot the edits are on, as the server shows it to you
+        /// (default: the tip of `--onto`, or of the default branch).
+        #[arg(long, value_name = "ID")]
+        base: Option<String>,
+        /// The change's description.
+        #[arg(short, long)]
+        message: Option<String>,
+        /// Move this branch to the change.
+        #[arg(long, value_name = "BRANCH")]
+        onto: Option<String>,
+        /// Move the branch only if its tip is still this snapshot id.
+        #[arg(long, value_name = "ID", requires = "onto")]
+        expected: Option<String>,
+        /// Make a new revision of this change of yours (one made with `vl
+        /// change new`).
+        #[arg(long, value_name = "CHANGE")]
+        change: Option<String>,
     },
 }
 

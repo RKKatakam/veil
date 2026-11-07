@@ -7,12 +7,12 @@
 //! directory (development and unit tests), [`S3Store`] in an S3 bucket
 //! (tested against MinIO).
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{borrow::Cow, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use veil_core::{cache::LruCache, ObjectId};
+use veil_core::{cache::LruCache, hub::encoding, ObjectId};
 
 #[async_trait]
 pub trait BlobStore: Send + Sync {
@@ -115,10 +115,11 @@ const S3_FIRST_WAIT: Duration = Duration::from_millis(25);
 const S3_MOST_WAIT: Duration = Duration::from_secs(1);
 
 /// Send an S3 request (`make` builds it afresh for each try) and read its
-/// answer, again while the answer is a server error (5xx) or the request
-/// fails, for at most [`S3_RETRY_FOR`] (BUG-861). A connection the store
-/// closed, reset or timed out, before or during the answer, and the
-/// store's own transient errors (500, 503 "slow down"), are tried again:
+/// answer, again while the answer is a server error (5xx) or 429, or the
+/// request fails, for at most [`S3_RETRY_FOR`] (BUG-861). A connection the
+/// store closed, reset or timed out, before or during the answer, and the
+/// store's own transient errors (500, 503 "slow down", 429 "too many
+/// requests": MinIO under load, BUG-1005), are tried again:
 /// every request the store sends is idempotent (GET, HEAD, and PUT of a
 /// key that names its content).
 async fn s3_send(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, Bytes)> {
@@ -135,7 +136,8 @@ async fn s3_send(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, Byt
         let jitter = Duration::from_millis(u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1));
         let last = tokio::time::Instant::now() + wait + jitter >= deadline;
         match answer {
-            Ok((status, body)) if !status.is_server_error() || last => return Ok((status.as_u16(), body)),
+            // 429: the store asks for fewer requests (BUG-1005, BUG-1053).
+            Ok((status, body)) if !(status.is_server_error() || status.as_u16() == 429) || last => return Ok((status.as_u16(), body)),
             Err(e) if last || e.is_builder() => return Err(anyhow::Error::new(e).context(format!("S3 request failed {tries} times"))),
             _ => {}
         }
@@ -207,9 +209,34 @@ impl BlobStore for S3Store {
 
 /// The objects of every project, through an in-memory cache of recently
 /// read objects (objects are immutable, so the cache never goes stale).
+///
+/// Objects are stored, cached and sent in their encoding
+/// ([`veil_core::hub::encoding`], S27): compressed with zstd when that is
+/// smaller, under the same key (the id of the uncompressed object). Old
+/// objects, stored as they are, stay readable. Every object read from the
+/// store is decoded (bounded by the object size limit) and checked against
+/// its id before it is cached or served.
 pub struct Objects {
     store: Arc<dyn BlobStore>,
+    /// Encodings, checked against their ids.
     cache: LruCache<Bytes>,
+    /// Requests to the store, for the benchmarks' cost gates
+    /// (`storage-and-cost.md` §9): writes, bytes written, reads.
+    pub writes: std::sync::atomic::AtomicU64,
+    pub written_bytes: std::sync::atomic::AtomicU64,
+    pub reads: std::sync::atomic::AtomicU64,
+}
+
+/// The largest object the store holds, decoded: the largest a frame
+/// carries.
+const MAX_OBJECT: u64 = veil_core::hub::wire::MAX_FRAME_OBJECT as u64;
+
+/// The object `id` decoded from its encoding `enc`, checked.
+fn decoded(id: &ObjectId, enc: &Bytes) -> Result<Bytes> {
+    match encoding::decode(id, enc, MAX_OBJECT).map_err(|_| anyhow!("stored object {} does not match its id", id.short()))? {
+        Cow::Borrowed(_) => Ok(enc.clone()),
+        Cow::Owned(raw) => Ok(Bytes::from(raw)),
+    }
 }
 
 impl Objects {
@@ -217,6 +244,9 @@ impl Objects {
         Objects {
             store,
             cache: LruCache::new(cache_bytes),
+            writes: Default::default(),
+            written_bytes: Default::default(),
+            reads: Default::default(),
         }
     }
 
@@ -236,43 +266,71 @@ impl Objects {
         ObjectId(*h.finalize().as_bytes())
     }
 
-    /// The raw object `id` of `project`, checked against its id.
+    /// The object `id` of `project` (its canonical encoding), checked
+    /// against its id.
     pub async fn get(&self, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
-        let ck = Self::cache_key(project, id);
-        if let Some(b) = self.cache.get(&ck) {
-            return Ok(Some(b));
+        match self.cache.get(&Self::cache_key(project, id)) {
+            Some(enc) => decoded(id, &enc).map(Some),
+            None => {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.load(project, id, self.store.get(&object_key(project, id)).await?)
+            }
         }
-        let Some(b) = self.store.get(&object_key(project, id)).await? else {
+    }
+
+    /// The encoding of object `id` of `project`, as stored (and sent to a
+    /// client that reads encoded frames), checked against its id.
+    pub async fn get_encoded(&self, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
+        let ck = Self::cache_key(project, id);
+        if let Some(enc) = self.cache.get(&ck) {
+            return Ok(Some(enc));
+        }
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(enc) = self.store.get(&object_key(project, id)).await? else {
             return Ok(None);
         };
-        if ObjectId::hash(&b) != *id {
-            bail!("stored object {} does not match its id", id.short());
-        }
-        self.cache.insert(ck, b.clone(), b.len());
-        Ok(Some(b))
+        decoded(id, &enc)?;
+        self.cache.insert(ck, enc.clone(), enc.len());
+        Ok(Some(enc))
+    }
+
+    /// Check and cache the encoding the store answered; the object decoded.
+    fn load(&self, project: i64, id: &ObjectId, enc: Option<Bytes>) -> Result<Option<Bytes>> {
+        let Some(enc) = enc else { return Ok(None) };
+        let raw = decoded(id, &enc)?;
+        self.cache.insert(Self::cache_key(project, id), enc.clone(), enc.len());
+        Ok(Some(raw))
     }
 
     /// [`Objects::get`] from a blocking thread: a local store is read
     /// directly; any other through `rt`.
     pub fn get_blocking(&self, rt: &tokio::runtime::Handle, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
-        let ck = Self::cache_key(project, id);
-        if let Some(b) = self.cache.get(&ck) {
-            return Ok(Some(b));
+        if let Some(enc) = self.cache.get(&Self::cache_key(project, id)) {
+            return decoded(id, &enc).map(Some);
         }
         let Some(r) = self.store.get_blocking(&object_key(project, id)) else {
             return rt.block_on(self.get(project, id));
         };
-        let Some(b) = r? else { return Ok(None) };
-        if ObjectId::hash(&b) != *id {
-            bail!("stored object {} does not match its id", id.short());
-        }
-        self.cache.insert(ck, b.clone(), b.len());
-        Ok(Some(b))
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.load(project, id, r?)
     }
 
+    /// Store object `id` (its canonical encoding `raw`), compressed when
+    /// that is smaller.
     pub async fn put(&self, project: i64, id: &ObjectId, raw: Bytes) -> Result<()> {
-        self.store.put(&object_key(project, id), raw.clone()).await?;
-        self.cache.insert(Self::cache_key(project, id), raw.clone(), raw.len());
+        let enc = match encoding::encode(&raw) {
+            Cow::Borrowed(_) => raw,
+            Cow::Owned(z) => Bytes::from(z),
+        };
+        self.put_encoded(project, id, enc).await
+    }
+
+    /// Store `enc`, an encoding of object `id` the caller has checked.
+    pub async fn put_encoded(&self, project: i64, id: &ObjectId, enc: Bytes) -> Result<()> {
+        self.writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.written_bytes.fetch_add(enc.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.store.put(&object_key(project, id), enc.clone()).await?;
+        self.cache.insert(Self::cache_key(project, id), enc.clone(), enc.len());
         Ok(())
     }
 
@@ -308,5 +366,64 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"veil:blob\nbad").unwrap();
         assert!(objects.get(3, &id).await.is_err());
+    }
+
+    /// S27: objects are stored compressed when that is smaller, under the
+    /// id of the uncompressed object; objects stored before (as they are)
+    /// stay readable; whatever the store answers is checked, bounded,
+    /// against the id.
+    #[tokio::test]
+    async fn objects_are_stored_compressed_and_old_ones_stay_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStore::new(dir.path());
+        let objects = Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20);
+        let raw = Bytes::from([&b"veil:blob\n"[..], &b"let x = 1;\n".repeat(500)].concat());
+        let id = ObjectId::hash(&raw);
+        objects.put(1, &id, raw.clone()).await.unwrap();
+        let stored = s.get(&object_key(1, &id)).await.unwrap().unwrap();
+        assert!(encoding::is_compressed(&stored) && stored.len() < raw.len() / 10, "{} bytes stored", stored.len());
+        let fresh = Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20);
+        assert_eq!(fresh.get(1, &id).await.unwrap().unwrap(), raw);
+        assert_eq!(fresh.get_encoded(1, &id).await.unwrap().unwrap(), stored);
+        let rt = tokio::runtime::Handle::current();
+        let fresh2 = Arc::new(Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20));
+        let f = fresh2.clone();
+        let got = tokio::task::spawn_blocking(move || f.get_blocking(&rt, 1, &id)).await.unwrap().unwrap().unwrap();
+        assert_eq!(got, raw);
+        // An object stored before S27, as it is.
+        let old = Bytes::from_static(b"veil:blob\nan object from before compression, stored as it is");
+        let old_id = ObjectId::hash(&old);
+        s.put(&object_key(2, &old_id), old.clone()).await.unwrap();
+        assert_eq!(fresh.get(2, &old_id).await.unwrap().unwrap(), old);
+        assert_eq!(fresh.get_encoded(2, &old_id).await.unwrap().unwrap(), old);
+        // Incompressible content (a secret's ciphertext) is stored as it is.
+        let noise = Bytes::from([&b"veil:sea2\n"[..], &veil_core::crypto::random_bytes::<2048>()].concat());
+        let nid = ObjectId::hash(&noise);
+        objects.put(1, &nid, noise.clone()).await.unwrap();
+        assert_eq!(s.get(&object_key(1, &nid)).await.unwrap().unwrap(), noise);
+        // A store answering another object's frame, an unknown marker, or a
+        // bomb past the object size limit: refused, never served.
+        let other = encoding::encode(b"veil:blob\nsomething else entirely, something else entirely").into_owned();
+        let mut bomb = vec![encoding::ZSTD];
+        bomb.extend(zstd_frame_declaring(MAX_OBJECT + 1));
+        for bad in [other, b"\x01veil:blob\n".to_vec(), bomb] {
+            let bid = ObjectId::hash(b"veil:blob\nwanted");
+            s.put(&object_key(4, &bid), Bytes::from(bad)).await.unwrap();
+            assert!(fresh.get(4, &bid).await.is_err());
+            assert!(fresh.get_encoded(4, &bid).await.is_err());
+            std::fs::remove_file(dir.path().join(object_key(4, &bid))).unwrap();
+        }
+    }
+
+    /// The header of a zstd frame declaring `size` bytes of content (and
+    /// one empty raw block): enough for a decoder to refuse it from its
+    /// header.
+    fn zstd_frame_declaring(size: u64) -> Vec<u8> {
+        // Magic, descriptor (8-byte content size, single segment off),
+        // window descriptor, the size, then a last raw block of 0 bytes.
+        let mut f = vec![0x28, 0xb5, 0x2f, 0xfd, 0b1100_0000, 0x50];
+        f.extend_from_slice(&size.to_le_bytes());
+        f.extend_from_slice(&[0x01, 0x00, 0x00]);
+        f
     }
 }

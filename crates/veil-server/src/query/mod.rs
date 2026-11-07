@@ -37,7 +37,7 @@ pub mod graph;
 pub mod trees;
 
 use std::{
-    collections::{BinaryHeap, HashSet},
+    collections::{BinaryHeap, HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -77,8 +77,12 @@ pub struct Limits {
     pub diff: DiffLimits,
     /// Most entries of a folder listing.
     pub list: usize,
-    /// Most snapshots a cursor names.
+    /// Most snapshots a cursor names itself; a wider one is kept by the
+    /// server and named by a token (BUG-1076).
     pub cursor: usize,
+    /// Most snapshots a log's frontier (and a kept cursor) may hold: a page
+    /// ends before a step would pass it.
+    pub frontier: usize,
     /// Most ancestry pairs.
     pub pairs: usize,
     pub deadline: Duration,
@@ -93,6 +97,7 @@ impl Default for Limits {
             diff: DiffLimits::default(),
             list: 10_000,
             cursor: 1_000,
+            frontier: 100_000,
             pairs: 100,
             deadline: Duration::from_secs(2),
         }
@@ -115,7 +120,7 @@ impl Ask {
             .bind(project)
             .fetch_optional(&hub.db)
             .await?;
-        let (project, viewer) = perm::open(&hub.db, project, caller).await?;
+        let (project, viewer) = perm::open(hub, project, caller).await?;
         let policy_version = policy_version.unwrap_or(0);
         Ok(Ask {
             project,
@@ -242,59 +247,93 @@ fn snapshot_json(id: &ObjectId, s: &Snapshot, empty: bool) -> Value {
 /// The log's walk on a viewer's graph: newest first by generation (the
 /// corrected commit date: a snapshot's timestamp, raised above its
 /// parents'), ties by id. Generations strictly decrease from child to
-/// parent, so children always come before their parents, and the order is
-/// `vl log`'s (newest first by timestamp) wherever every snapshot is dated
-/// after its parents. Each step reads one snapshot's parents and nothing
-/// else, so a page's work is bounded by its budget whatever the history
-/// holds (BUG-1071: the client's lazy Kahn walk may explore the whole
-/// history in one step when a merge takes in a snapshot dated far behind);
-/// and what is left to walk is exactly the frontier, which the cursor names.
+/// parent, so children always come before their parents. Every read is one
+/// row (BUG-1071, BUG-1078): a snapshot's parents wait in `pending` and
+/// are read one at a time before the next snapshot is taken, so a page can
+/// stop between any two reads. What is left to walk is exactly the
+/// frontier (the heap and `pending`), which the cursor names.
 struct LogWalk<'g, 'a> {
     g: &'g G<'a>,
     heap: BinaryHeap<(i64, ObjectId)>,
+    rows: HashMap<ObjectId, Arc<VRow>>,
     queued: HashSet<ObjectId>,
+    pending: Vec<ObjectId>,
 }
 
 impl<'g, 'a> LogWalk<'g, 'a> {
-    fn new(g: &'g G<'a>, roots: &[ObjectId]) -> Result<LogWalk<'g, 'a>> {
+    fn new(g: &'g G<'a>, roots: &[ObjectId]) -> LogWalk<'g, 'a> {
         let mut w = LogWalk {
             g,
             heap: BinaryHeap::new(),
+            rows: HashMap::new(),
             queued: HashSet::new(),
+            pending: Vec::new(),
         };
         for r in roots {
-            w.push(*r)?;
+            if w.queued.insert(*r) {
+                w.pending.push(*r);
+            }
         }
-        Ok(w)
+        w
     }
 
-    fn push(&mut self, id: ObjectId) -> Result<()> {
-        if self.queued.insert(id) {
-            self.heap.push((self.g.get(&id)?.generation, id));
-        }
-        Ok(())
+    /// Read one waiting snapshot's row into the heap; false if none waits.
+    /// A snapshot a cursor names that is not in the viewer's graph (or is
+    /// withheld) is no revision of theirs.
+    fn read_one(&mut self) -> Result<bool> {
+        let Some(id) = self.pending.pop() else { return Ok(false) };
+        let row = match self.g.row(&id)? {
+            Some(r) if !r.withheld() => r,
+            _ => return Err(no_revision()),
+        };
+        self.heap.push((row.generation, id));
+        self.rows.insert(id, row);
+        Ok(true)
     }
 
-    /// The next snapshot of the log, and its row. Every child of a
-    /// snapshot has a larger generation, so it was emitted (and pushed this
-    /// one) before this one is popped: none is pushed twice or after it is
-    /// emitted.
-    fn step(&mut self) -> Result<Option<(ObjectId, Arc<VRow>)>> {
-        let Some((_, id)) = self.heap.pop() else { return Ok(None) };
-        let row = self.g.get(&id)?;
+    /// The next snapshot of the log and its row, once nothing waits, unless
+    /// taking it would make the frontier wider than `max`. Every child of a
+    /// snapshot has a larger generation, so it was taken (and queued this
+    /// one) before this one is: none is queued twice or after it is taken.
+    fn take(&mut self, max: usize) -> Option<(ObjectId, Arc<VRow>)> {
+        debug_assert!(self.pending.is_empty());
+        let &(_, id) = self.heap.peek()?;
+        let row = self.rows[&id].clone();
+        let grows = row.parents.iter().filter(|p| !self.queued.contains(p)).count();
+        if self.heap.len() - 1 + grows > max {
+            return None;
+        }
+        self.heap.pop();
+        self.rows.remove(&id);
         for p in &row.parents {
-            self.push(*p)?;
+            if self.queued.insert(*p) {
+                self.pending.push(*p);
+            }
         }
-        Ok(Some((id, row)))
+        Some((id, row))
     }
 
     /// The snapshots the rest of the log starts from: the walk of the rest
     /// from them is exactly the rest of this one.
     fn frontier(&self) -> Vec<ObjectId> {
-        let mut out: Vec<ObjectId> = self.heap.iter().map(|(_, id)| *id).collect();
+        let mut out: Vec<ObjectId> = self.heap.iter().map(|(_, id)| *id).chain(self.pending.iter().copied()).collect();
         out.sort();
         out
     }
+}
+
+/// A cursor naming more than `Limits::cursor` snapshots is kept by the
+/// server (BUG-1076), under the hash of what it names and the viewer's key,
+/// and handed out as `frontier-<hash>`: a function of the viewer's history,
+/// as the cursor itself is (the same page always writes the same row).
+const STORED_CURSOR: &str = "frontier-";
+
+fn cursor_id(ids: &[ObjectId]) -> String {
+    let mut h = blake3::Hasher::new_derive_key("veil 2026 hub log cursor v1");
+    for id in ids {
+        h.update(&id.0);
+    }
+    hex::encode(&h.finalize().as_bytes()[..16])
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -310,9 +349,11 @@ pub async fn log(hub: &Arc<Hub>, ask: &Ask, q: LogParams, limits: Limits) -> Res
     let deadline = Instant::now() + limits.deadline;
     let n = q.n.unwrap_or(50).min(limits.page);
     let path = clean_path(q.path.as_deref().unwrap_or(""))?;
-    let roots: Vec<ObjectId> = match &q.after {
-        Some(after) => {
-            let ids: Vec<&str> = after.split(',').filter(|s| !s.is_empty()).collect();
+    let after = q.after.clone();
+    let roots: Vec<ObjectId> = match &after {
+        Some(a) if a.starts_with(STORED_CURSOR) => Vec::new(),
+        Some(a) => {
+            let ids: Vec<&str> = a.split(',').filter(|s| !s.is_empty()).collect();
             if ids.len() > limits.cursor {
                 return Err(Error::bad_request("cursor too long"));
             }
@@ -327,21 +368,32 @@ pub async fn log(hub: &Arc<Hub>, ask: &Ask, q: LogParams, limits: Limits) -> Res
         None => vec![resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?],
     };
     on_graph(hub, ask, deadline, move |g, t| {
-        for r in &roots {
-            match g.row(r)? {
-                Some(row) if !row.withheld() => {}
-                _ => return Err(no_revision()),
-            }
+        let mut roots = roots;
+        if let Some(token) = after.as_deref().and_then(|a| a.strip_prefix(STORED_CURSOR)) {
+            g.tick()?;
+            let (cx, vk) = (g.cx, g.vk);
+            let stored: Option<String> = cx.db(|| {
+                sqlx::query_scalar("SELECT frontier FROM log_cursors WHERE project_id = $1 AND view_key = $2 AND id = $3")
+                    .bind(cx.project())
+                    .bind(vk)
+                    .bind(token)
+                    .fetch_optional(&cx.hub().db)
+            })?;
+            let stored = stored.ok_or_else(|| Error::bad_request("invalid cursor"))?;
+            roots = stored.split(',').map(|s| parse_id(s).ok_or_else(|| Error::bad_request("invalid cursor"))).collect::<Result<_>>()?;
         }
-        let mut walk = LogWalk::new(g, &roots)?;
+        let mut walk = LogWalk::new(g, &roots);
         let start = g.work();
         let mut entries = Vec::new();
         let mut bytes = 0usize;
-        while entries.len() < n {
-            if g.work() - start >= limits.work {
-                break;
+        let mut moved = false;
+        while entries.len() < n && g.work() - start < limits.work {
+            if walk.read_one()? {
+                moved = true;
+                continue;
             }
-            let Some((id, row)) = walk.step()? else { break };
+            let Some((id, row)) = walk.take(limits.frontier) else { break };
+            moved = true;
             if !path.is_empty() {
                 let (now, before) = t.roots_of(&row)?;
                 if !t.differs_at(now, before, &path)? {
@@ -361,11 +413,34 @@ pub async fn log(hub: &Arc<Hub>, ask: &Ask, q: LogParams, limits: Limits) -> Res
             }
         }
         let heads = walk.frontier();
+        if !moved && !heads.is_empty() {
+            // Nothing could be taken without a frontier wider than the
+            // server keeps: an error, never a cursor that goes nowhere.
+            return Err(Error::bad_request("this history is too wide to page (more open lines than the server keeps in a cursor)"));
+        }
+        let next = if heads.is_empty() {
+            None
+        } else if heads.len() <= limits.cursor {
+            Some(heads.iter().map(|h| h.hex()).collect::<Vec<_>>().join(","))
+        } else {
+            let id = cursor_id(&heads);
+            let text = heads.iter().map(|h| h.hex()).collect::<Vec<_>>().join(",");
+            let (cx, vk) = (g.cx, g.vk);
+            cx.db(|| {
+                sqlx::query("INSERT INTO log_cursors (project_id, view_key, id, frontier) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING")
+                    .bind(cx.project())
+                    .bind(vk)
+                    .bind(&id)
+                    .bind(&text)
+                    .execute(&cx.hub().db)
+            })?;
+            Some(format!("{STORED_CURSOR}{id}"))
+        };
         Ok(json!({
             "schema": "veil.log/2",
             "entries": entries,
-            "truncated": !heads.is_empty(),
-            "next": (!heads.is_empty()).then(|| heads.iter().map(|h| h.hex()).collect::<Vec<_>>().join(",")),
+            "truncated": next.is_some(),
+            "next": next,
         }))
     })
     .await

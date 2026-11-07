@@ -29,6 +29,7 @@ Global options (accepted by every command):
 | [`vl clone`](clone.md) | Copy a repository (and every tag you can see) into a new directory |
 | [`vl login`](login.md) | Sign in to a Veil server with this device's identity key |
 | [`vl group`](group.md) | Groups of people on the Veil server (the origin remote's project) |
+| [`vl change`](change.md) | Commit through the Veil server's API, without a checkout (scripts, CI, agents) |
 | [`vl invite`](invite.md) | Invite a person to a group (admins): prints a one-time link to send them (Slack, email) |
 | [`vl join`](join.md) | Join a project with the link `vl invite` printed: signs this device in (registering the invited name if it is new), confirms it and joins the group |
 | [`vl access`](access.md) | Who may see a path; with WHO, give a group, a person or `public` access to it |
@@ -68,7 +69,7 @@ Global options (accepted by every command):
 | [`vl scan`](scan.md) | Scan the working copy for secrets that would become public |
 | [`vl attr`](attr.md) | Per-path attributes from `.veilattributes`: line endings, binary files, diff and merge drivers |
 | [`vl renormalize`](renormalize.md) | Re-record files with the line endings `.veilattributes` asks for now (changing `.veilattributes` alone never re-records a file). `vl undo` reverts it |
-| [`vl secret`](secret.md) | Encrypted secrets: the device-local vault, or a scope's team vault (`--scope`), sealed for the scope's members (it does not sync through the Veil server yet) |
+| [`vl secret`](secret.md) | Encrypted secrets: the device-local vault, or a scope's team vault (`--scope`), sealed for the scope's members (it does not sync through the Veil server yet); and secret files shared from one member to another (`share`, `unshare`, `shares`) |
 | [`vl run`](run.md) | Run a command with vault secrets injected as environment variables |
 | [`vl identity`](identity.md) | Your public-key identity |
 | [`vl scope`](scope.md) | Key scopes and their members (identity rings) |

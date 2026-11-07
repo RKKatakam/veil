@@ -524,6 +524,7 @@ pub async fn blocking<T: Send + 'static>(hub: &Arc<Hub>, project: i64, f: impl F
             hub: hub.clone(),
             project,
             rt: tokio::runtime::Handle::current(),
+            pending: Default::default(),
         },
     };
     tokio::task::spawn_blocking(move || f(&cx)).await.map_err(|e| Error::Other(e.into()))?
@@ -760,9 +761,10 @@ pub fn warming() -> Error {
 const FILL_LOCK_WAIT: Duration = Duration::from_secs(600);
 /// Most fills running at once on one server (BUG-1073). A fill runs its
 /// statements one at a time, so fills hold at most this many of the
-/// pool's connections, and only while a statement runs; past it, a query
-/// waits for a slot until its deadline (then `warming`), a landing until
-/// one is free.
+/// pool's connections, and only while a statement runs. Past it, a fill
+/// waits for a slot in its own task: a query waits for the fill until its
+/// deadline (then `warming`, and the fill stays queued), a landing until
+/// it is done.
 pub const MAX_FILLS: usize = 4;
 /// How long a fill's lease lasts unless renewed, and how often it is.
 const LEASE: Duration = Duration::from_secs(120);
@@ -796,7 +798,7 @@ pub async fn ensure(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[
         }
         // Another caller's fill may be for other tips: wait for it, then
         // look again (and start ours).
-        let (mut rx, started) = start_or_join(hub, project, viewer, &vk, tips, deadline).await?;
+        let (mut rx, started) = start_or_join(hub, project, viewer, &vk, tips);
         let done = async { rx.wait_for(|d| d.is_some()).await.ok().and_then(|d| d.clone()) };
         let outcome = match deadline {
             Some(d) => tokio::time::timeout_at(d.into(), done).await.map_err(|_| warming())?,
@@ -807,6 +809,19 @@ pub async fn ensure(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[
         }
         ours_done = started;
     }
+}
+
+/// Queue the fill of `viewer`'s graph up to `tips` unless it holds them
+/// already, and return at once: what a landing does for each view key
+/// (`derive::memo_tips`). The deriver never waits for a fill, so a long
+/// first fill cannot hold up deriving this or any project, and waiting it
+/// holds no connection, lock or slot (the fill's own task waits for those).
+pub async fn prefill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId]) -> Result<()> {
+    let vk = project.view(viewer).key();
+    if warm(hub, project.id, &vk, viewer.admin, tips).await?.is_none() {
+        start_or_join(hub, project, viewer, &vk, tips);
+    }
+    Ok(())
 }
 
 /// The viewer's ids of `tips` if their graph holds them all.
@@ -844,57 +859,41 @@ async fn warm(hub: &Arc<Hub>, project: i64, vk: &str, admin: bool, tips: &[Objec
     Ok(Some(out))
 }
 
-/// Join the fill running for (`project`, `vk`), or start one for `tips`
-/// once one of the server's [`MAX_FILLS`] slots is free (waiting for it
-/// until `deadline`, then [`warming`]); whether this call started it.
-async fn start_or_join(
-    hub: &Arc<Hub>,
-    project: &Project,
-    viewer: &Viewer,
-    vk: &str,
-    tips: &[ObjectId],
-    deadline: Option<Instant>,
-) -> Result<(Fill, bool)> {
+/// Join the fill running for (`project`, `vk`), or register one for
+/// `tips` and start its task at once (BUG-1074: a fill is queued the moment
+/// anyone needs it, whoever stops waiting); whether this call started it.
+/// The task waits for the view key's lease, then for one of the server's
+/// [`MAX_FILLS`] slots ([`leased_fill`]).
+fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, tips: &[ObjectId]) -> (Fill, bool) {
     let key = (project.id, vk.to_string());
-    loop {
-        if let Some(rx) = hub.query.fills.lock().unwrap().get(&key) {
-            return Ok((rx.clone(), false));
-        }
-        let slot = hub.query.slots.clone().acquire_owned();
-        let slot = match deadline {
-            Some(d) => tokio::time::timeout_at(d.into(), slot).await.map_err(|_| warming())?,
-            None => slot.await,
-        }
-        .map_err(|e| Error::Other(e.into()))?;
-        let mut fills = hub.query.fills.lock().unwrap();
-        if fills.contains_key(&key) {
-            // Started by another caller while this one waited for a slot.
-            continue;
-        }
-        let (tx, rx) = watch::channel(None);
-        fills.insert(key.clone(), rx.clone());
-        *hub.query.started.lock().unwrap().entry(project.id).or_default() += 1;
-        drop(fills);
-        let (hub, project, viewer, tips, key) = (hub.clone(), project.clone(), viewer.clone(), tips.to_vec(), key.clone());
-        tokio::spawn(async move {
-            let r = leased_fill(&hub, &project, &viewer, &key.1, &tips).await;
-            if let Err(e) = &r {
-                eprintln!("veil-server: filling a viewer graph of project {}: {e:?}", project.id);
-            }
-            hub.query.fills.lock().unwrap().remove(&key);
-            drop(slot);
-            let _ = tx.send(Some(r.map(|_| ()).map_err(|e| format!("{e:?}"))));
-        });
-        return Ok((rx, true));
+    let mut fills = hub.query.fills.lock().unwrap();
+    if let Some(rx) = fills.get(&key) {
+        return (rx.clone(), false);
     }
+    let (tx, rx) = watch::channel(None);
+    fills.insert(key.clone(), rx.clone());
+    *hub.query.started.lock().unwrap().entry(project.id).or_default() += 1;
+    drop(fills);
+    let (hub, project, viewer, tips) = (hub.clone(), project.clone(), viewer.clone(), tips.to_vec());
+    tokio::spawn(async move {
+        let r = leased_fill(&hub, &project, &viewer, &key.1, &tips).await;
+        if let Err(e) = &r {
+            eprintln!("veil-server: filling a viewer graph of project {}: {e:?}", project.id);
+        }
+        hub.query.fills.lock().unwrap().remove(&key);
+        let _ = tx.send(Some(r.map(|_| ()).map_err(|e| format!("{e:?}"))));
+    });
+    (rx, true)
 }
 
 /// [`extend`] under the lease of (`project`, `vk`) in `view_fills`, so that
-/// two servers do not fill one view key at once. Taking, renewing and
-/// giving back the lease are single statements: no connection is held
-/// while the fill runs (BUG-1073). A lease another server holds is waited
-/// for (one statement every 250 ms) up to [`FILL_LOCK_WAIT`]; a lease left
-/// by a server that stopped expires after [`LEASE`].
+/// two servers do not fill one view key at once, and in one of this
+/// server's [`MAX_FILLS`] slots. The lease comes first (BUG-1075): a fill
+/// that waits for another server's lease holds no slot meanwhile. Taking,
+/// renewing and giving back the lease are single statements: no connection
+/// is held while the fill runs (BUG-1073). A lease another server holds is
+/// waited for (one statement every 250 ms) up to [`FILL_LOCK_WAIT`]; a
+/// lease left by a server that stopped expires after [`LEASE`].
 async fn leased_fill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, tips: &[ObjectId]) -> Result<()> {
     let holder = hex::encode(veil_core::crypto::random_bytes::<16>());
     let take = || async {
@@ -934,7 +933,10 @@ async fn leased_fill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &st
             }
         })
     });
-    let r = extend(hub, project, viewer, tips).await.map(|_| ());
+    let r = match hub.query.slots.clone().acquire_owned().await {
+        Ok(_slot) => extend(hub, project, viewer, tips).await.map(|_| ()),
+        Err(e) => Err(Error::Other(e.into())),
+    };
     if let Some(renew) = renew {
         renew.abort();
         let _ = sqlx::query("DELETE FROM view_fills WHERE project_id = $1 AND view_key = $2 AND holder = $3")

@@ -302,3 +302,28 @@ fn a_repository_for_native_vl() {
     export(&fs, &VPath::root(), &dir.join("repo"));
     std::fs::write(dir.join("home/identity.json"), id.to_json()).unwrap();
 }
+
+/// S27: the web client reads the server's compressed objects. A frame the
+/// `zstd` tool wrote (level 3) decodes to its object, bounded by the
+/// limit, with the pure decoder as with the C library; a plain object is
+/// its own encoding.
+#[test]
+fn compressed_objects_from_the_server_decode() {
+    use veil_core::hub::encoding;
+    let raw = [&b"veil:blob\n"[..], &b"portable ".repeat(40)].concat();
+    let id = ObjectId::hash(&raw);
+    let enc = [
+        &[encoding::ZSTD][..],
+        &[
+            0x28, 0xb5, 0x2f, 0xfd, 0x64, 0x72, 0x00, 0xd5, 0x00, 0x00, 0x98, 0x76, 0x65, 0x69, 0x6c, 0x3a, 0x62, 0x6c, 0x6f, 0x62, 0x0a,
+            0x70, 0x6f, 0x72, 0x74, 0x61, 0x62, 0x6c, 0x65, 0x20, 0x01, 0x00, 0xb9, 0xa8, 0x96, 0x30, 0x0c, 0xca, 0xa2, 0xb4,
+        ],
+    ]
+    .concat();
+    assert_eq!(&*encoding::decode(&id, &enc, 1 << 20).unwrap(), &raw[..]);
+    assert!(encoding::decode(&id, &enc, raw.len() as u64 - 1).is_err());
+    assert!(encoding::decode(&ObjectId::hash(b"veil:blob\n"), &enc, 1 << 20).is_err());
+    assert_eq!(&*encoding::decode(&id, &raw, 1 << 20).unwrap(), &raw[..]);
+    // Every encoding decodes back, whichever form `encode` keeps.
+    assert_eq!(&*encoding::decode(&id, &encoding::encode(&raw), 1 << 20).unwrap(), &raw[..]);
+}

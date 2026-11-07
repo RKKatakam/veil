@@ -9,7 +9,10 @@ use std::{
 };
 
 use veil_core::{
-    hub::wire::{put_frame, read_frames, Tips},
+    hub::{
+        encoding,
+        wire::{put_frame, Tips},
+    },
     Identity, ObjectId,
 };
 use veil_server::{tls::TlsSource, Config, Running, Storage};
@@ -24,6 +27,7 @@ pub struct TestHub {
     pub port: u16,
     pub ca: PathBuf,
     pub cert_pem: String,
+    config: Config,
     pub _dir: tempfile::TempDir,
 }
 
@@ -44,7 +48,6 @@ impl TestHub {
     /// A server whose objects are in the S3 store at `endpoint` (MinIO, or
     /// something in front of it), or in a temporary directory.
     pub fn start_with_s3(database_url: &str, ttl: Duration, endpoint: Option<String>) -> TestHub {
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(8).build().unwrap();
         let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
         let storage = match endpoint {
             Some(endpoint) => Storage::S3 {
@@ -68,14 +71,37 @@ impl TestHub {
             // start-up catch-up by calling it.
             catch_up_at_start: false,
         };
-        let running = rt.block_on(veil_server::start(config)).expect("server starts");
-        let ca = dir.path().join("data/self-signed-cert.pem");
+        TestHub::run(config, dir)
+    }
+
+    /// Another server beside `other`, as a deployment runs several: the
+    /// same database, data directory (identity, certificate, receipt key)
+    /// and object storage.
+    pub fn beside(other: &TestHub) -> TestHub {
+        let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
+        let config = Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..other.config.clone()
+        };
+        TestHub::run(config, dir)
+    }
+
+    fn run(config: Config, dir: tempfile::TempDir) -> TestHub {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(8)
+            .thread_stack_size(veil_server::THREAD_STACK)
+            .build()
+            .unwrap();
+        let running = rt.block_on(veil_server::start(config.clone())).expect("server starts");
+        let ca = config.data_dir.join("self-signed-cert.pem");
         TestHub {
             port: running.addr.port(),
             cert_pem: running.cert_pem.clone(),
             running: Some(running),
             rt,
             ca,
+            config,
             _dir: dir,
         }
     }
@@ -271,9 +297,16 @@ impl Reply {
     pub fn json(&self) -> serde_json::Value {
         serde_json::from_slice(&self.body).unwrap_or(serde_json::Value::Null)
     }
+    /// The objects of an answer of frames, plain or encoded (decoded).
     pub fn frames(&self) -> Vec<(ObjectId, Vec<u8>)> {
         assert_eq!(self.status, 200, "{}", String::from_utf8_lossy(&self.body));
-        read_frames(&self.body).unwrap().into_iter().map(|(i, r)| (i, r.to_vec())).collect()
+        encoding::read_frames(&self.body, 1 << 32).unwrap().into_iter().map(|(i, r)| (i, r.into_owned())).collect()
+    }
+
+    /// The frames of the answer as sent: ids and encodings.
+    pub fn raw_frames(&self) -> Vec<(ObjectId, Vec<u8>)> {
+        assert_eq!(self.status, 200, "{}", String::from_utf8_lossy(&self.body));
+        encoding::split_frames(&self.body).unwrap().into_iter().map(|(i, e)| (i, e.to_vec())).collect()
     }
 }
 
@@ -318,6 +351,10 @@ impl Api {
         Self::finish(r.call())
     }
 
+    pub fn agent_delete(&self, token: &str, path: &str) -> Reply {
+        Self::finish(self.agent.delete(format!("{}{path}", self.base)).header("authorization", &format!("Bearer {token}")).call())
+    }
+
     pub fn post(&self, token: Option<&str>, path: &str, body: &[u8], json: bool) -> Reply {
         let mut r = self.agent.post(format!("{}{path}", self.base));
         if let Some(t) = token {
@@ -329,6 +366,34 @@ impl Api {
 
     pub fn post_json(&self, token: Option<&str>, path: &str, v: &serde_json::Value) -> Reply {
         self.post(token, path, &serde_json::to_vec(v).unwrap(), true)
+    }
+
+    /// POST JSON as a `vl` that reads encoded frames (compressed objects).
+    pub fn post_json_encoded(&self, token: Option<&str>, path: &str, v: &serde_json::Value) -> (Reply, Option<String>) {
+        let mut r = self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json").header("accept", encoding::FRAMES);
+        if let Some(t) = token {
+            r = r.header("authorization", &format!("Bearer {t}"));
+        }
+        let resp = r.send(&serde_json::to_vec(v).unwrap()[..]).unwrap();
+        let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).map(str::to_string);
+        (Self::finish(Ok(resp)), ct)
+    }
+
+    /// POST object frames as they are (encoded or not, well formed or not).
+    pub fn upload_body(&self, token: &str, project: &str, body: &[u8]) -> Reply {
+        self.post(Some(token), &format!("/v1/projects/{project}/objects"), body, false)
+    }
+
+    /// POST encoded object frames (S27), under the encoded frames' media
+    /// type (which the server does not need: it reads every upload as
+    /// encoded frames).
+    pub fn upload_encoded_body(&self, token: &str, project: &str, body: &[u8]) -> Reply {
+        let r = self
+            .agent
+            .post(format!("{}/v1/projects/{project}/objects", self.base))
+            .header("authorization", &format!("Bearer {token}"))
+            .header("content-type", encoding::FRAMES);
+        Self::finish(r.send(body))
     }
 
     /// POST JSON with the `Host` header a relaying server would send.
@@ -407,6 +472,19 @@ pub fn everything_in(clone: &Path) -> Vec<(String, Vec<u8>)> {
         }
     }
     out
+}
+
+/// The bytes of a file in the server's data directory, an object's decoded
+/// (S27: objects are stored compressed, so a scan of the raw files would
+/// miss what they hold). Object files are `…/ab/cdef…` under their id.
+pub fn stored_bytes(path: &Path) -> Vec<u8> {
+    let b = std::fs::read(path).unwrap_or_default();
+    let name = |p: Option<&Path>| p.and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let hex = format!("{}{}", name(path.parent()), name(Some(path)));
+    match ObjectId::from_hex(&hex) {
+        Ok(id) if encoding::is_compressed(&b) => encoding::decode(&id, &b, u64::MAX).map(|r| r.into_owned()).unwrap_or(b),
+        _ => b,
+    }
 }
 
 /// Assert no item contains any of `markers` (whole markers only).
@@ -611,7 +689,7 @@ impl<'a> Craft<'a> {
         }
     }
 
-    fn put(&mut self, o: O) -> ObjectId {
+    pub fn put(&mut self, o: O) -> ObjectId {
         let raw = o.encode_with(TreeEncoding::Binary);
         let id = ObjectId::hash(&raw);
         self.objects.push((id, raw));
@@ -621,13 +699,19 @@ impl<'a> Craft<'a> {
     /// Set `path` to an object (`raw`) with `vis`: plain, or sealed under a
     /// scope label.
     pub fn set(&mut self, path: &str, object: O, vis: Visibility) {
+        self.set_kind(path, object, K::File, vis)
+    }
+
+    /// [`Craft::set`] with an entry of `kind` (a conflict, say).
+    pub fn set_kind(&mut self, path: &str, object: O, kind: K, vis: Visibility) {
         let id = self.put(object);
         let parts: Vec<&str> = path.split('/').collect();
         let entry = TreeEntry {
             name: parts.last().unwrap().to_string(),
-            kind: K::File,
+            kind,
             id,
-            size: 1,
+            // A conflict entry carries no size (its terms do).
+            size: u64::from(kind != K::Conflict),
             executable: false,
             visibility: vis,
         };

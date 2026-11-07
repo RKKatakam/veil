@@ -66,10 +66,15 @@ pub const SIMILAR_MAX_BYTES: u64 = 1 << 20;
 pub const SIMILAR_MAX_FILES: usize = 1_000;
 pub const SIMILAR_BUDGET: u64 = 20_000_000;
 pub const SIMILAR_MIN: u32 = 50;
-/// Similarity: most bytes of deleted files held at once, and most bytes
-/// read for one change (BUG-1072).
+/// Similarity: most memory its tables of line hashes take at once (the
+/// deleted files' and the added file being compared: BUG-1077), and most
+/// bytes read for one change (BUG-1072).
 pub const SIMILAR_MAX_HELD: u64 = 16 << 20;
 pub const SIMILAR_MAX_READ: u64 = 64 << 20;
+/// Most similarity passes running at once in the process (BUG-1077): with
+/// [`SIMILAR_MAX_HELD`], what rename detection holds in all, whatever the
+/// number of queries and derivations.
+pub const SIMILAR_AT_ONCE: usize = 4;
 
 const MAGIC: &[u8] = b"veil-derived changed-paths 1\n";
 
@@ -247,6 +252,44 @@ fn text_lines(src: &Source, e: &TreeEntry) -> Result<(Option<Lines>, u64)> {
     Ok((Some((lines, n)), read))
 }
 
+/// The memory a table of line hashes takes: its buckets (a 12-byte entry
+/// and a control byte each, at most 7/8 of them used) and the map itself.
+fn table_bytes(t: &Lines) -> u64 {
+    t.0.capacity() as u64 * 8 / 7 * 13 + 64
+}
+
+static SIMILAR_RUNNING: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static SIMILAR_FREED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// One of the process's [`SIMILAR_AT_ONCE`] similarity passes, waited for
+/// with `tick` called every 50 ms (a query's deadline ends the wait).
+struct SimilarSlot;
+
+impl SimilarSlot {
+    fn take(tick: &dyn Fn() -> Result<()>) -> Result<SimilarSlot> {
+        loop {
+            {
+                let n = SIMILAR_RUNNING.lock().unwrap();
+                let (mut n, _) = SIMILAR_FREED
+                    .wait_timeout_while(n, std::time::Duration::from_millis(50), |n| *n >= SIMILAR_AT_ONCE)
+                    .unwrap();
+                if *n < SIMILAR_AT_ONCE {
+                    *n += 1;
+                    return Ok(SimilarSlot);
+                }
+            }
+            tick()?;
+        }
+    }
+}
+
+impl Drop for SimilarSlot {
+    fn drop(&mut self) {
+        *SIMILAR_RUNNING.lock().unwrap() -= 1;
+        SIMILAR_FREED.notify_one();
+    }
+}
+
 /// The sources of each added file in `changes` (the same order), whether
 /// each list was capped, and whether similarity was computed for the whole
 /// of `changes`. A function of `changes` alone: run on the part a viewer
@@ -257,10 +300,12 @@ pub fn sources(src: &Source, changes: &[Change]) -> Result<(Vec<Vec<From>>, Vec<
 
 /// [`sources`], calling `tick` before each file it reads (the query API
 /// counts the reads and stops at its deadline). Memory and reading are
-/// bounded (BUG-1072): the deleted files' lines are held, at most
-/// [`SIMILAR_MAX_HELD`] bytes of them; each added file is read, compared
-/// and dropped; at most [`SIMILAR_MAX_READ`] bytes are read in all. Past
-/// either, similarity is skipped for the whole change (`similar: false`),
+/// bounded (BUG-1072, BUG-1077): the deleted files' tables of line hashes
+/// are held, and with the added file's being compared take at most
+/// [`SIMILAR_MAX_HELD`] bytes; each added file is read, compared and
+/// dropped; at most [`SIMILAR_MAX_READ`] bytes are read in all; and at
+/// most [`SIMILAR_AT_ONCE`] passes run at once in the process. Past either
+/// bound, similarity is skipped for the whole change (`similar: false`),
 /// as past the file and comparison caps: a function of the change alone.
 pub fn sources_with(src: &Source, changes: &[Change], tick: &dyn Fn() -> Result<()>) -> Result<(Vec<Vec<From>>, Vec<bool>, bool)> {
     let file_like = |e: &TreeEntry| e.kind.holds_blob();
@@ -298,6 +343,7 @@ pub fn sources_with(src: &Source, changes: &[Change], tick: &dyn Fn() -> Result<
         if deleted.len() > SIMILAR_MAX_FILES || added_files.len() > SIMILAR_MAX_FILES {
             similar = false;
         } else {
+            let _slot = SimilarSlot::take(tick)?;
             let mut read = 0u64;
             let mut held_bytes = 0u64;
             let mut held: HashMap<usize, Lines> = HashMap::new();
@@ -305,9 +351,7 @@ pub fn sources_with(src: &Source, changes: &[Change], tick: &dyn Fn() -> Result<
                 tick()?;
                 let (t, r) = text_lines(src, changes[d].old.as_ref().unwrap())?;
                 read += r;
-                if t.is_some() {
-                    held_bytes += r;
-                }
+                held_bytes += t.as_ref().map_or(0, table_bytes);
                 if read > SIMILAR_MAX_READ || held_bytes > SIMILAR_MAX_HELD {
                     similar = false;
                     break;
@@ -322,7 +366,7 @@ pub fn sources_with(src: &Source, changes: &[Change], tick: &dyn Fn() -> Result<
                 tick()?;
                 let (t, r) = text_lines(src, changes[a].new.as_ref().unwrap())?;
                 read += r;
-                if read > SIMILAR_MAX_READ {
+                if read > SIMILAR_MAX_READ || held_bytes + t.as_ref().map_or(0, table_bytes) > SIMILAR_MAX_HELD {
                     similar = false;
                     break;
                 }

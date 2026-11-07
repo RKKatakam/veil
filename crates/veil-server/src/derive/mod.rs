@@ -214,6 +214,7 @@ fn cx(hub: &Arc<Hub>, project: i64) -> Cx {
             hub: hub.clone(),
             project,
             rt: tokio::runtime::Handle::current(),
+            pending: Default::default(),
         },
     }
 }
@@ -887,8 +888,9 @@ impl<'a> Batch<'a> {
 /// Project the tips of `branches` of `project` for each view key of its
 /// people and of anyone on Earth, so that their next pull finds the
 /// projection memoised (phase 4 §4.5), and extend each view key's graph
-/// (admins' included) for the query API (S13). Only the branches named (a
-/// landing's) are touched (BUG-870).
+/// (admins' included) for the query API (S13): both by the view key's fill,
+/// queued here and run in the background (`query::graph::prefill`). Only
+/// the branches named (a landing's) are touched (BUG-870).
 pub async fn memo_tips(hub: &Arc<Hub>, project_id: i64, branches: &[String]) -> Result<()> {
     let mut c = hub.db.acquire().await?;
     let name: String = sqlx::query_scalar("SELECT name FROM projects WHERE id = $1").bind(project_id).fetch_one(&mut *c).await?;
@@ -942,11 +944,11 @@ pub async fn memo_tips(hub: &Arc<Hub>, project_id: i64, branches: &[String]) -> 
         if !view.sees_anything() || !keys.insert(view.key()) {
             continue;
         }
-        // Memoise the projections, and extend the viewer's graph with them
-        // (`query::graph::ensure`: the one fill of this view key, which a
-        // query that needs it joins), so that queries find both. One view
-        // key's failure leaves the others' done.
-        if let Err(e) = crate::query::graph::ensure(hub, &project, &v, &tips, None).await {
+        // Queue the fill that memoises the projections and extends the
+        // viewer's graph (`query::graph::prefill`: the one fill of this
+        // view key, which a query that needs it joins). Never waited for
+        // here: the deriver holds nothing while fills run (BUG-911).
+        if let Err(e) = crate::query::graph::prefill(hub, &project, &v, &tips).await {
             if failed.is_ok() {
                 failed = Err(e);
             }

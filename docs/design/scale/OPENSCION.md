@@ -404,7 +404,7 @@ everything 15.5–26.3 / 153–200 ms, commit one file 1.3–1.8 / 9.4–18.5 ms
 the Veil server"): after the server bench fixes a full clone through the
 server peaks at 433 MiB on the client (was 979 MiB, BUG-859) and the
 initial push is accepted at 401 MiB (was refused at 2.4 GB, BUG-857 and
-BUG-858); the server's own memory is BUG-860 (fixed) and BUG-864 (open).
+BUG-858); the server's own memory is BUG-860 and BUG-864 (fixed) and BUG-1000 (open).
 
 **Run:**
 
