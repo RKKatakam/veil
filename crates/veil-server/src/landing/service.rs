@@ -603,6 +603,7 @@ impl Service {
                     Some((i, m)) => attach.push((k, a, i, m)),
                     None => {
                         known.prefilled.insert(k.clone(), Instant::now());
+                        hub.landing.stats.prefilled.fetch_add(1, Ordering::Relaxed);
                         if let Some(tip) = committed {
                             if let Err(e) = crate::query::graph::prefill(hub, &a.project, &a.viewer, &[tip]).await {
                                 eprintln!("veil-server: queueing a view's fill for project {}: {e:?}", self.project);
@@ -827,7 +828,7 @@ impl Service {
                         let ours: HashMap<(&str, &str), &str> =
                             mk.iter().zip(&mr).zip(&mp).map(|((k, r), p)| ((k.as_str(), r.as_str()), p.as_str())).collect();
                         if have.iter().any(|(k, r, p)| ours.get(&(k.as_str(), r.as_str())).is_some_and(|o| o != p)) {
-                            return Err(Error::conflict(MOVED));
+                            return Err(Error::conflict(MEMO_RACE));
                         }
                     }
                 }
@@ -855,6 +856,10 @@ impl Service {
                 return Ok(Committed::LeaseLost);
             }
             Err(Error::Api { code: "conflict", message, .. }) if message == MOVED => return Ok(Committed::Moved),
+            Err(Error::Api { code: "conflict", message, .. }) if message == MEMO_RACE => {
+                hub.landing.stats.memo_races.fetch_add(1, Ordering::Relaxed);
+                return Ok(Committed::Moved);
+            }
             Err(e) => return Err(e),
         };
         for s in &b.snapshots {
@@ -868,6 +873,7 @@ impl Service {
             crate::derive::landed(hub, self.project, vec![self.branch.clone()]);
         }
         let st = &hub.landing.stats;
+        st.kept.store(b.after.keys.len() as u64, Ordering::Relaxed);
         st.batches.fetch_add(1, Ordering::Relaxed);
         st.landed.fetch_add(landed as u64, Ordering::Relaxed);
         st.conflicts.fetch_add(b.outcomes.iter().filter(|o| matches!(o, Outcome::Conflict { .. })).count() as u64, Ordering::Relaxed);
@@ -916,6 +922,7 @@ async fn memos(hub: &Hub, project: i64, keys: &[String], reals: &[ObjectId]) -> 
 
 const LEASE_LOST: &str = "the landing lease was lost";
 const MOVED: &str = "the branch moved under the landing service";
+const MEMO_RACE: &str = "a projection memo was stored meanwhile with another value";
 
 fn state_name(s: LandState) -> &'static str {
     match s {
@@ -1023,6 +1030,7 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
             hub.landing.stats.projected.fetch_add(1, Ordering::Relaxed);
         }
         b.after.keys.insert(k, Kept { who, at: p });
+        hub.landing.stats.attached.fetch_add(1, Ordering::Relaxed);
     }
     for p in entries {
         if b.alone {
@@ -1186,6 +1194,7 @@ fn entry(
         // classification reads.
         let policy_moved = sync::entry_at(src, &parent_tree, POLICY_FILE)? != sync::entry_at(src, &chain_tree, POLICY_FILE)?;
         if p.recheck || policy_moved {
+            hub.landing.stats.rechecked.fetch_add(1, Ordering::Relaxed);
             if let Err(why) = recheck(src, &who, &snap, &parents, set, &hub.identity)? {
                 return Ok(Some(Outcome::Rejected(why)));
             }
@@ -1235,6 +1244,7 @@ fn entry(
     }
     for k in &dropped {
         keys.remove(k);
+        hub.landing.stats.dropped.fetch_add(1, Ordering::Relaxed);
     }
     for (k, x, px, raw) in new_memos {
         if keys.contains_key(&k) {

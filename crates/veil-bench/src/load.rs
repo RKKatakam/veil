@@ -1162,6 +1162,9 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
         result["landing_batches"] = json!(stat("landing_batches"));
         result["landings_per_batch"] = json!(ratio(stat("landing_landed"), stat("landing_batches"), 1.0));
         result["landing_build_ms_per_op"] = json!(ratio(stat("landing_build_us"), stat("landing_landed"), 1000.0));
+        for k in ["landing_projected", "landing_attached", "landing_prefilled", "landing_dropped", "landing_memo_races", "landing_rechecked"] {
+            result[k] = json!(stat(k));
+        }
         result["landing_prepare_ms_per_batch"] = json!(ratio(stat("landing_prepare_us"), stat("landing_batches"), 1000.0));
         result["landing_store_ms_per_batch"] = json!(ratio(stat("landing_store_us"), stat("landing_batches"), 1000.0));
         result["landing_commit_ms_per_batch"] = json!(ratio(stat("landing_commit_us"), stat("landing_batches"), 1000.0));

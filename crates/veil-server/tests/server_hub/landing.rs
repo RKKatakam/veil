@@ -189,6 +189,10 @@ fn non_overlapping_changes_land_in_batches_each_once_with_exactly_its_edits() {
         }
     });
     assert_eq!(hub.hub().landing.stats.rejected.load(std::sync::atomic::Ordering::Relaxed), 0);
+    // Nobody's access changed: no entry's checks ran again.
+    let rechecked = hub.hub().landing.stats.rechecked.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("rechecked {rechecked}");
+    assert_eq!(rechecked, 0, "entries were checked again with no access change");
     // A landed change is a base like any snapshot: the next one builds on
     // the dev's own last landing, which main has moved past.
     let r = land(&api, &token, &p.name, seen_landed[0], json!([put("src/agents/later.rs", "later\n")]), true);

@@ -132,6 +132,16 @@ pub struct Stats {
     /// Projections the services made (each new snapshot, for each view key
     /// kept, and the recent line for a key attached).
     pub projected: AtomicU64,
+    /// View keys attached from the recent line, handed to the background
+    /// fill, and dropped (a projection they needed was not stored); batches
+    /// rolled back for a memo stored meanwhile; the keys the last batch kept.
+    pub attached: AtomicU64,
+    pub prefilled: AtomicU64,
+    pub dropped: AtomicU64,
+    pub memo_races: AtomicU64,
+    pub kept: AtomicU64,
+    /// Entries whose submit's checks ran again (access changed meanwhile).
+    pub rechecked: AtomicU64,
 }
 
 struct Running {
