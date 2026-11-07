@@ -55,6 +55,29 @@ impl Server {
         Server { child: Some(child), sock }
     }
 
+    /// Like [`Server::start`], but told that the server listens by its
+    /// `Serving` line, not by connecting: that probe is a client too, and
+    /// holds one of the server's slots until it has seen it leave (BUG-855).
+    fn start_unprobed(env: &Env, user: &str, dir: &Path) -> Server {
+        let mut child = env.spawn(user, dir, &["serve", "--local"]);
+        let mut err = BufReader::new(child.stderr.take().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Read on until the server exits: its stderr stays open.
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            while err.read_line(&mut line).is_ok_and(|n| n > 0) {
+                if line.contains("Serving") {
+                    let _ = tx.send(());
+                }
+                line.clear();
+            }
+        });
+        let up = rx.recv_timeout(Duration::from_secs(20)).is_ok();
+        let server = Server { child: Some(child), sock: sock_of(dir) };
+        assert!(up, "vl serve did not start listening on {}", server.sock.display());
+        server
+    }
+
     fn conn(&self) -> Conn {
         Conn::open(&self.sock)
     }
@@ -596,7 +619,7 @@ fn oversized_requests_are_refused_and_the_connection_closed() {
 fn connections_are_capped() {
     let env = Env::new();
     let p = env.project("alice", "p", &[("README.md", "hi\n")]);
-    let server = Server::start(&env, "alice", &p);
+    let server = Server::start_unprobed(&env, "alice", &p);
     let mut open: Vec<Conn> = (0..32).map(|_| server.conn()).collect();
     for c in &mut open {
         c.ok("server.info", json!({}));

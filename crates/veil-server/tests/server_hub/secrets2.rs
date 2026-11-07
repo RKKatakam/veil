@@ -22,14 +22,27 @@ pub(crate) fn pid(i: &Identity) -> PublicIdentity {
     parse_public_identity(&i.public_id()).unwrap()
 }
 
-/// Run `q` with text and integer binds on the server's database.
+/// Run `q` with text and integer binds on the server's database, again
+/// while it loses a race (YugabyteDB reports deadlocks and conflicts under
+/// load, as the server's own transactions retry them).
 pub(crate) fn sql(hub: &TestHub, q: &str, binds: &[&dyn Bind]) {
     let db = hub.hub().db.clone();
-    let mut query = sqlx::query(q);
-    for b in binds {
-        query = b.bind(query);
+    for attempt in 0.. {
+        let mut query = sqlx::query(q);
+        for b in binds {
+            query = b.bind(query);
+        }
+        match hub.rt.block_on(query.execute(&db)) {
+            Ok(_) => return,
+            Err(e) if attempt < 100 && lost_race(&e) => std::thread::sleep(Duration::from_millis(20 + attempt * 10)),
+            Err(e) => panic!("{q}: {e:?}"),
+        }
     }
-    hub.rt.block_on(query.execute(&db)).unwrap();
+}
+
+/// A serialisation failure or deadlock: run the statement again.
+pub(crate) fn lost_race(e: &sqlx::Error) -> bool {
+    matches!(e.as_database_error().and_then(|d| d.code()).as_deref(), Some("40001" | "40P01"))
 }
 
 pub(crate) trait Bind {

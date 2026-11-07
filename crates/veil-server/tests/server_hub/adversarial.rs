@@ -686,14 +686,19 @@ fn bug_835_a_confirmed_device_is_recorded_under_its_persons_name() {
     let _spare = hub.new_device_of(&two);
     let db = hub.hub().db.clone();
     let move_device = |to: &str| {
-        hub.rt
-            .block_on(
+        for attempt in 0.. {
+            let r = hub.rt.block_on(
                 sqlx::query("UPDATE devices SET person_id = (SELECT id FROM people WHERE name = $1) WHERE signing_key = $2")
                     .bind(to)
                     .bind(two.identity().verifying_hex())
                     .execute(&db),
-            )
-            .unwrap();
+            );
+            match r {
+                Ok(_) => break,
+                Err(e) if attempt < 100 && crate::secrets2::lost_race(&e) => std::thread::sleep(std::time::Duration::from_millis(20 + attempt * 10)),
+                Err(e) => panic!("{e:?}"),
+            }
+        }
     };
     // The admin compared two's fingerprint with two; the server lists
     // two's device under one.
