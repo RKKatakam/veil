@@ -122,7 +122,7 @@ Options:
 | `--only <PATH>` | Sparse sandbox: hold only these paths (files or directories of the workspace, relative to the current directory) |
 | `--record-only` | Run nothing: record what an earlier run left unrecorded (vl was killed, or recording failed) |
 | `--unconfined` | Run without confinement: the command can read and change everything your user can |
-| `--allow <PATH>` | Also show PATH (a folder or file of this machine) to the command, read-only. Repeatable |
+| `--allow <PATH>` | Also show PATH (a folder or file of this machine) to the command; its writes go to the workspace's own layer, never to PATH. Repeatable |
 | `--no-network` | No network: the command gets only a private loopback |
 | `--memory <SIZE>` | Memory limit, e.g. 4G or 512M |
 | `--cpus <N>` | CPU rate limit, in CPUs, e.g. 2 or 0.5 |

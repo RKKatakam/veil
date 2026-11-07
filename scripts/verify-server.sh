@@ -5,7 +5,8 @@
 #
 # Steps: the migrations, once per database; the server's unit tests and
 # clippy; the container test suite
-# (`--features containers`) on PostgreSQL + MinIO and on YugabyteDB + MinIO;
+# (`--features containers`) on PostgreSQL + MinIO and on YugabyteDB + MinIO,
+# and its hostile-size reproductions in steps of their own;
 # then the concurrency tests under load (several copies of the test binary
 # at once, as the veil-review skill's lens 3 asks).
 #
@@ -52,7 +53,7 @@ cleanup() {
       D exec "$PG" psql -U veil -d veil -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1
     done
     for db in $YB_DB $(ysql_at "$q" 2>/dev/null); do
-      ysql "DROP DATABASE IF EXISTS $db" >/dev/null 2>&1
+      ysql "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1
     done
   else
     D rm -f "$PG" "$YB" "$S3" >/dev/null 2>&1
@@ -68,11 +69,28 @@ start_services() {
   # servers and connection pools; shared runs can overlap, so allow plenty.
   running "$PG" || { D rm -f "$PG" >/dev/null 2>&1; D run -d --name "$PG" -e POSTGRES_PASSWORD=veil -e POSTGRES_USER=veil -e POSTGRES_DB=veil -p 127.0.0.1::5432 "$PG_IMAGE" -c max_connections=1500 >/dev/null || return 1; }
   running "$S3" || { D rm -f "$S3" >/dev/null 2>&1; D run -d --name "$S3" -e MINIO_ROOT_USER=veilminio -e MINIO_ROOT_PASSWORD=veilminio-secret -p 127.0.0.1::9000 "$S3_IMAGE" >/dev/null || return 1; }
-  running "$YB" || { D rm -f "$YB" >/dev/null 2>&1; D run -d --name "$YB" -p 127.0.0.1::5433 "$YB_IMAGE" bin/yugabyted start --background=false >/dev/null || return 1; }
+  # Memory capped: a long-lived YugabyteDB otherwise grows toward most of the
+  # machine's memory (8 GB seen) while agents build beside it.
+  running "$YB" || { D rm -f "$YB" >/dev/null 2>&1; D run -d --name "$YB" -p 127.0.0.1::5433 "$YB_IMAGE" bin/yugabyted start --background=false \
+    --tserver_flags=memory_limit_hard_bytes=3221225472 --master_flags=memory_limit_hard_bytes=1073741824 >/dev/null || return 1; }
   PG_PORT=$(port "$PG" 5432) S3_PORT=$(port "$S3" 9000) YB_PORT=$(port "$YB" 5433)
   for i in $(seq 120); do D exec "$PG" pg_isready -U veil >/dev/null 2>&1 && break; sleep 1; done
   for i in $(seq 120); do curl -sf "http://127.0.0.1:$S3_PORT/minio/health/live" >/dev/null && break; sleep 1; done
   for i in $(seq 180); do ysql "select 1" >/dev/null 2>&1 && break; sleep 2; done
+}
+
+# Databases left by runs that were killed before their cleanup ran: each
+# name carries its run's pid (veil_run_PID, or rPIDx… for the tests' own).
+drop_dead_runs() {
+  local q="SELECT datname FROM pg_database WHERE datname LIKE 'veil_run_%' OR datname LIKE 'r%x%'" db pid
+  for db in $(D exec "$PG" psql -U veil -d veil -tAc "$q" 2>/dev/null); do
+    pid=$(echo "$db" | sed -E 's/^r([0-9]+)x.*/\1/; s/^veil_run_([0-9]+)$/\1/')
+    [ -d "/proc/$pid" ] || D exec "$PG" psql -U veil -d veil -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1
+  done
+  for db in $(ysql_at "$q" 2>/dev/null); do
+    pid=$(echo "$db" | sed -E 's/^r([0-9]+)x.*/\1/; s/^veil_run_([0-9]+)$/\1/')
+    [ -d "/proc/$pid" ] || ysql "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1
+  done
 }
 
 if [ $SHARED = 1 ]; then
@@ -81,6 +99,7 @@ if [ $SHARED = 1 ]; then
   exec 9>"${XDG_RUNTIME_DIR:-/tmp}/veil-shared-services.lock"
   flock 9
   start_services || { echo "starting containers failed"; exit 1; }
+  drop_dead_runs
   flock -u 9
   PG_DB=veil_run_$RUN YB_DB=veil_run_$RUN
   D exec "$PG" psql -U veil -d veil -c "CREATE DATABASE $PG_DB" >/dev/null || { echo "creating $PG_DB failed"; exit 1; }
@@ -122,8 +141,16 @@ step unit cargo test -p veil-server
 step clippy cargo clippy -q -p veil-server --all-targets --features containers -- -D warnings
 
 echo "== container suite"
-step postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-pg-$RUN "$BIN"
-step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-yb-$RUN "$BIN"
+# The hostile-size reproductions (S12's adversarial pass: millions of
+# rows) run in steps of their own, so that their load never starves the
+# suite's contention-sensitive tests (sign-up under SERIALIZABLE).
+HOSTILE=derived::s12_adversarial
+step postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-pg-$RUN "$BIN" --skip "$HOSTILE"
+step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-yb-$RUN "$BIN" --skip "$HOSTILE"
+# One at a time: on a database other runs share, three at once could keep
+# a statement past its timeout.
+STEP_LIMIT=2400 step hostile-postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-hpg-$RUN "$BIN" "$HOSTILE" --test-threads=1
+STEP_LIMIT=2400 step hostile-yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-hyb-$RUN "$BIN" "$HOSTILE" --test-threads=1
 
 echo "== concurrency under load (several copies at once)"
 load() { # url, bucket, copies (each copy bounded like a step)
