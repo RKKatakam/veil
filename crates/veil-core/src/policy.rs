@@ -377,7 +377,9 @@ pub struct Rule {
     pub pattern: String,
     pub tier: Tier,
     /// The groups and people an access line names (empty for every other
-    /// rule). On the device the rule is a plain `public` rule.
+    /// rule, and for an access line that also names `public`). On the
+    /// device the rule is a plain `public` rule; one with grantees publishes
+    /// nothing, so it never warns that it exposes a built-in secret.
     pub grantees: Vec<String>,
     /// `public!` — deliberate exposure, secret scanning disabled.
     pub force: bool,
@@ -765,7 +767,10 @@ impl Policy {
                 None => invalid("expected '<pattern> <tier>'".into()),
                 // An access line: plain text here, access decided by the server.
                 Some(_) if is_access_line(&parts) => {
-                    grantees = parts[1..].iter().filter(|n| *n != "public").cloned().collect();
+                    // Naming `public` publishes the folder, as a `public` rule does.
+                    if !parts[1..].iter().any(|n| n == "public") {
+                        grantees = parts[1..].to_vec();
+                    }
                     (Tier::Public, false)
                 }
                 Some("public") => (Tier::Public, false),
@@ -1125,9 +1130,11 @@ impl Classification {
         if self.builtin_artefact && !(r.tier == Tier::Isolated || (r.force && r.names_scratch)) {
             return false;
         }
-        // A built-in secret: a plain `public` rule cannot expose it.
+        // A built-in secret: a plain `public` rule cannot expose it. An
+        // access line naming only groups and people publishes nothing, so it
+        // settles an earlier ignored `public` rule without a warning of its own.
         if r.tier == Tier::Public && self.builtin_secret && !r.force {
-            self.blocked_exposure = true;
+            self.blocked_exposure = r.grantees.is_empty();
             return false;
         }
         self.tier = r.tier.clone();
@@ -2008,6 +2015,10 @@ mod tests {
         assert!(!k.blocked_exposure && k.allow_secrets && k.tier == Tier::Public);
         assert!(!c("t.pem public\nt.pem cloak\n").blocked_exposure);
         assert!(c("t.pem cloak\nt.pem public\n").blocked_exposure, "the ignored rule is the last one");
+        // BUG-839: an access line publishes nothing unless it names `public`.
+        assert!(!c("t.pem finance\n").blocked_exposure);
+        assert!(!c("t.pem public\nt.pem finance alice\n").blocked_exposure, "the access line decides");
+        assert!(c("t.pem finance public\n").blocked_exposure);
     }
 
     #[test]

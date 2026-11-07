@@ -228,7 +228,14 @@ where
                     // Whatever the outcome, the request may have changed
                     // something now: [`retry_requests`] does not run it again.
                     let _ = COMMITTED.try_with(|c| c.set(true));
-                    r
+                    // A commit that timed out may have committed: neither is
+                    // `f` run again (BUG-890).
+                    match r {
+                        Err(Error::Db(e)) if e.as_database_error().is_some_and(|d| crate::error::is_rpc_timeout(d.message())) => {
+                            Err(Error::Other(anyhow::Error::new(e).context("the commit timed out; its outcome is unknown")))
+                        }
+                        r => r,
+                    }
                 }
                 Err(e) => {
                     let _ = tx.rollback().await;

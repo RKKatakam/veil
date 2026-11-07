@@ -57,10 +57,12 @@ impl Error {
         match e.as_database_error() {
             Some(d) => {
                 // Serialisation failure, deadlock, lock or statement
-                // timeout; on YugabyteDB, a read to restart or a catalog
-                // changed by DDL (BUG-838).
+                // timeout; on YugabyteDB, a read to restart, a catalog
+                // changed by DDL (BUG-838) or a stalled tablet RPC (BUG-890;
+                // never run again after a commit, `db::transaction`).
                 let m = d.message();
                 matches!(d.code().as_deref(), Some("40001" | "40P01" | "55P03" | "57014"))
+                    || is_rpc_timeout(m)
                     || m.contains("Restart read required")
                     || m.contains("Try again")
                     || m.contains("catalog snapshot")
@@ -70,6 +72,13 @@ impl Error {
             None => false,
         }
     }
+}
+
+/// YugabyteDB's `XX000 … Rpc timeout`: a tablet RPC that did not answer in
+/// time. Before a commit nothing took effect; on the commit itself the
+/// outcome is unknown.
+pub fn is_rpc_timeout(message: &str) -> bool {
+    message.contains("Rpc timeout")
 }
 
 impl From<sqlx::Error> for Error {
@@ -123,5 +132,48 @@ impl IntoResponse for Error {
             }
         };
         (status, Json(ErrorBody { code: code.into(), message })).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A database error with YugabyteDB's code and message.
+    #[derive(Debug)]
+    struct YbError(&'static str);
+    impl std::fmt::Display for YbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for YbError {}
+    impl sqlx::error::DatabaseError for YbError {
+        fn message(&self) -> &str {
+            self.0
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some("XX000".into())
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    /// BUG-890: a stalled tablet RPC is run again; other internal errors are not.
+    #[test]
+    fn bug_890_a_yugabytedb_rpc_timeout_is_retryable() {
+        let db = |m| Error::Db(sqlx::Error::Database(Box::new(YbError(m))));
+        assert!(db("Timed out: Perform RPC (request call id 81) to 127.0.0.1:9100 timed out after 15.000s; Rpc timeout, passed: 15.0s, timeout: 15.000s").is_retryable());
+        assert!(!db("internal error: tablet not found").is_retryable());
     }
 }

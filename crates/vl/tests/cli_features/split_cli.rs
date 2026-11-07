@@ -149,8 +149,10 @@ fn squash_paths_and_hunks_into_parent_and_elsewhere() {
     assert!(out.contains("Squashed into") && out.contains("the rest stays in"), "{out}");
     assert_eq!(cat(&env, &proj, "@-", "c.txt"), "c\n");
     assert_eq!(status_paths(&env, &proj), ["a.txt", "b.txt"]);
-    let log = env.stdout("alice", &proj, &["log", "-n", "2"]);
-    assert!(log.contains("work") && log.contains("initial"), "both descriptions stay: {log}");
+    // Whole descriptions, not substrings: "work" is spelled in the letters
+    // of change ids, which the log prints too.
+    change_named(&env, &proj, "work");
+    change_named(&env, &proj, "initial");
     // Interactive: move a.txt's second hunk only (mode first is absent).
     let out = with_stdin(&env, &proj, &["squash", "-i"], "n\ny\nn\n");
     assert!(out.status.success(), "{}", text(&out));

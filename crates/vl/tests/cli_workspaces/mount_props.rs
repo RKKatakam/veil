@@ -392,7 +392,7 @@ impl World {
                 std::fs::write(self.mnt.join(&path), &content).unwrap();
                 self.model.insert(path, content);
                 let out = self.env.ok("bob", &self.bob, &["undo"]);
-                prop_assert!(out.contains("Undid: commit change") && !out.contains("mount"), "undo undid something else:\n{out}");
+                prop_assert!(out.contains("Undid: commit change") && !out.contains("record the mount of workspace"), "undo undid something else:\n{out}");
                 self.settle();
             }
             Op::Crash => {
