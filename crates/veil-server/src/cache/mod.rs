@@ -88,6 +88,9 @@ const MAX_FLIGHTS: usize = 1 << 16;
 const FLIGHT_WAIT: Duration = Duration::from_secs(2);
 /// Most objects one request marks in flight.
 const MAX_MARKS: usize = 256;
+/// How long a request keeps its marks while its client has not taken the
+/// last chunk: a client that reads takes it within moments (BUG-1180).
+const MARK_GRACE: Duration = Duration::from_millis(100);
 /// How long a write to a client may stay pending before its connection is
 /// closed (BUG-1181).
 const WRITE_DEADLINE: Duration = Duration::from_secs(30);
@@ -564,9 +567,10 @@ fn broken(what: &str) -> std::io::Error {
 }
 
 /// An answer being sent: bytes gathered with their share of the budget,
-/// and sent with it. **It never waits holding marks:** before it waits for
-/// its client or for the budget, it lets go of its [`Flight`], so a client
-/// that does not read never holds up other readers (BUG-1180). And it waits
+/// and sent with it. **It never waits long holding marks:** before it waits
+/// for the budget, or for its client past [`MARK_GRACE`], it lets go of its
+/// [`Flight`], so a client that does not read never holds up other readers
+/// (BUG-1180). And it waits
 /// for the budget only after sending what it holds, so answers never wait
 /// on each other in a cycle.
 struct Out {
@@ -642,12 +646,18 @@ impl Out {
             match self.tx.try_send(Ok(piece)) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return false,
-                Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => {
-                    *flight = None;
-                    if self.tx.send(item).await.is_err() {
-                        return false;
+                // A client that reads takes it within moments; one that does
+                // not is let go of the marks it would hold up.
+                Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => match self.tx.send_timeout(item, MARK_GRACE).await {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::SendTimeoutError::Closed(_)) => return false,
+                    Err(tokio::sync::mpsc::error::SendTimeoutError::Timeout(item)) => {
+                        *flight = None;
+                        if self.tx.send(item).await.is_err() {
+                            return false;
+                        }
                     }
-                }
+                },
             }
         }
         true

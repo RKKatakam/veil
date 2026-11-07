@@ -2253,8 +2253,8 @@ veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
   reading a new tree after a landing costs the server one request (tested:
   24 readers at once, 1 request). A mark is let go once its object is kept,
   all of them once the server's answer has passed, and all of them before
-  the request waits for its client or the budget: a client that stalls
-  holds none (BUG-1180). A local object lost
+  the request waits for the budget, or for its client past 100 ms: a client
+  that stalls holds none for longer (BUG-1180). A local object lost
   between the check and the read (evicted, damaged) is left out of a batch
   (the client asks again; the cache, which removed it, then asks the
   server).
