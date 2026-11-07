@@ -170,6 +170,7 @@ Anthropic once saw an agent author and an agent reviewer cycle more than fifty t
 3. **Never re-report** a finding from an earlier cycle. Report each finding's whole class once, so it gets fixed once.
 4. **A pre-existing issue never sends a branch back.** File it.
 5. **Pivot early.** If the approach is wrong, say so on the first cycle, not after three rounds of line comments. Agent work is cheap to throw away.
+6. **When the same class comes back with a new route, fix what the check compares, not the route.** Simplification part 2 needed three cycles for embargo leaks (abandon, squash, rebase, squash-into-fix, an earlier version) because each fix compared snapshot ids, which every rewrite changes. The fix that closes the class keys the rule on what rewrites keep (change ids and descent). A reviewer who sees a second route of a class should say so and ask for the identity basis to change.
 
 ## Step 6: decide and merge (orchestrator)
 

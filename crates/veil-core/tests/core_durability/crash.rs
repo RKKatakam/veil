@@ -103,6 +103,10 @@ struct FaultyBackend {
     /// history index's layers): no barrier covers them, a power loss tears
     /// them.
     never_synced: Mutex<Vec<VPath>>,
+    /// Written by `stage_unsynced` and not published yet: a barrier makes
+    /// the content durable, never the name (as on disk, where the staging
+    /// directory is never synced), so a power loss removes them.
+    staged: Mutex<Vec<VPath>>,
     tore: AtomicBool,
 }
 
@@ -117,6 +121,7 @@ impl FaultyBackend {
             volatile: Mutex::new(Vec::new()),
             renamed: Mutex::new(Vec::new()),
             never_synced: Mutex::new(Vec::new()),
+            staged: Mutex::new(Vec::new()),
             tore: AtomicBool::new(false),
         }
     }
@@ -127,11 +132,35 @@ impl FaultyBackend {
 
     /// Power loss: what never reached stable storage is torn.
     fn tear_volatile(&self) {
-        // A rename whose directory was never synced did not happen.
-        for (from, to) in self.renamed.lock().unwrap().drain(..).rev() {
+        // A rename whose directory was never synced may or may not have
+        // happened. Directories are independent of each other (a journal
+        // keeps the renames into one directory in order): those into every
+        // other directory, by first appearance, are undone, so that a name
+        // made durable before what it depends on (in another directory) is
+        // caught.
+        let renamed: Vec<(VPath, VPath)> = self.renamed.lock().unwrap().drain(..).collect();
+        let mut dirs: Vec<VPath> = Vec::new();
+        for (_, to) in &renamed {
+            let d = to.parent().unwrap_or_else(VPath::root);
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+        for (from, to) in renamed.into_iter().rev() {
+            let d = to.parent().unwrap_or_else(VPath::root);
+            if dirs.iter().position(|x| *x == d).is_some_and(|i| i % 2 == 1) {
+                continue;
+            }
             if let Some(data) = self.inner.read_opt(&to).unwrap() {
                 self.inner.write(&from, &data).unwrap();
                 self.inner.remove_file(&to).unwrap();
+            }
+        }
+        // Staged files whose names never became durable: gone, synced or not.
+        for path in self.staged.lock().unwrap().drain(..) {
+            if self.inner.read_opt(&path).unwrap().is_some() {
+                self.inner.remove_file(&path).unwrap();
+                self.tore.store(true, Ordering::SeqCst);
             }
         }
         let mut volatile = self.volatile.lock().unwrap();
@@ -225,6 +254,26 @@ impl StorageBackend for FaultyBackend {
             }
             Ok(())
         })
+    }
+    /// As `DiskBackend` stages a transaction's file: the content waits for
+    /// the next barrier, the name for none (see `staged`).
+    fn stage_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        self.write_unsynced(path, data)?;
+        self.staged.lock().unwrap().push(path.clone());
+        Ok(())
+    }
+    /// A staged file renamed into place: the new name waits for the next
+    /// barrier (a power loss before it undoes the rename, and the staged
+    /// name is not durable either).
+    fn publish_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        self.rename_unsynced(from, to)?;
+        let mut staged = self.staged.lock().unwrap();
+        staged.retain(|p| p != from);
+        // The undone rename brings it back under its staged name only.
+        if self.renamed.lock().unwrap().iter().any(|(f, _)| f == from) {
+            staged.push(from.clone());
+        }
+        Ok(())
     }
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
         self.mutate(|| self.inner.create_new(path, data))
@@ -765,6 +814,29 @@ fn crash_during_commit() {
     sweep("commit", Target::Local, |env| {
         let mut repo = env.open(&env.local)?;
         repo.commit_working_copy(WS, "commit under fire")?;
+        Ok(())
+    });
+}
+
+/// `vl commit`: the working copy recorded and committed as one operation
+/// (`SnapshotOptions::commit`). Its operation and head file are staged with
+/// its objects and made durable by their barrier, then named in turn, each
+/// after a barrier (a power loss tears what no barrier covered, and takes
+/// the staged names with it): a crash at any point leaves the commit
+/// recorded completely or not at all.
+#[test]
+fn crash_during_one_operation_commit() {
+    sweep("one-operation commit", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        let out = repo.snapshot_workspace_with(
+            WS,
+            &*env.local,
+            SnapshotOptions {
+                commit: Some(("committed under fire", true)),
+                ..Default::default()
+            },
+        )?;
+        assert!(out.committed.is_some());
         Ok(())
     });
 }

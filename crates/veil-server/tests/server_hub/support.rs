@@ -38,17 +38,23 @@ impl TestHub {
 
     /// A server on the database at `database_url`.
     pub fn start_on(database_url: &str, ttl: Duration) -> TestHub {
+        TestHub::start_with_s3(database_url, ttl, std::env::var("VEIL_TEST_S3_ENDPOINT").ok())
+    }
+
+    /// A server whose objects are in the S3 store at `endpoint` (MinIO, or
+    /// something in front of it), or in a temporary directory.
+    pub fn start_with_s3(database_url: &str, ttl: Duration, endpoint: Option<String>) -> TestHub {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(8).build().unwrap();
         let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
-        let storage = match std::env::var("VEIL_TEST_S3_ENDPOINT") {
-            Ok(endpoint) => Storage::S3 {
+        let storage = match endpoint {
+            Some(endpoint) => Storage::S3 {
                 endpoint,
                 bucket: std::env::var("VEIL_TEST_S3_BUCKET").unwrap_or_else(|_| "veil-test".into()),
                 region: "us-east-1".into(),
                 key: std::env::var("VEIL_TEST_S3_KEY").unwrap(),
                 secret: std::env::var("VEIL_TEST_S3_SECRET").unwrap(),
             },
-            Err(_) => Storage::Dir(dir.path().join("objects")),
+            None => Storage::Dir(dir.path().join("objects")),
         };
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
