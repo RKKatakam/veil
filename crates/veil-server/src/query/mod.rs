@@ -438,14 +438,16 @@ pub async fn log(hub: &Arc<Hub>, ask: &Ask, q: LogParams, limits: Limits) -> Res
         let start = g.work();
         let mut entries = Vec::new();
         let mut bytes = 0usize;
-        let mut moved = false;
+        // Whether the page took a snapshot: reading the cursor's rows alone
+        // is no progress (BUG-1079), and a page that only reads them would
+        // hand back the cursor it was given.
+        let mut took = false;
         while entries.len() < n && g.work() - start < limits.work {
             if walk.read_one()? {
-                moved = true;
                 continue;
             }
             let Some((id, row)) = walk.take(limits.frontier) else { break };
-            moved = true;
+            took = true;
             if !path.is_empty() {
                 let (now, before) = t.roots_of(&row)?;
                 if !t.differs_at(now, before, &path)? {
@@ -465,7 +467,7 @@ pub async fn log(hub: &Arc<Hub>, ask: &Ask, q: LogParams, limits: Limits) -> Res
             }
         }
         let heads = walk.frontier();
-        if !moved && !heads.is_empty() {
+        if !took && n > 0 && !heads.is_empty() {
             // Nothing could be taken without a frontier wider than the
             // server keeps: an error, never a cursor that goes nowhere.
             return Err(Error::bad_request("this history is too wide to page (more open lines than the server keeps in a cursor)"));

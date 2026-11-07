@@ -1609,6 +1609,40 @@ mod s13_adversarial {
         assert!(matches!(r, Err(Error::Api { code: "bad_request", .. })), "{r:?}");
     }
 
+    /// BUG-1079: a page that only reads its cursor's snapshots, and cannot
+    /// take the next one without passing `Limits::frontier`, answered no
+    /// entries and the cursor it was given, so a reader paging to the end
+    /// asked forever (each page reading the whole frontier). It must end
+    /// in the "too wide" error instead. 40 lines open at once, a frontier
+    /// limit of 20: every page either moves the log on or is that error.
+    #[test]
+    fn bug_1079_a_log_page_never_hands_back_the_cursor_it_was_given() {
+        let th = TestHub::start();
+        let (h, _, _) = wide_graph(&th);
+        let a = ask(&th, &h, &Viewer::default());
+        let tight = Limits {
+            cursor: 8,
+            frontier: 20,
+            ..Limits::default()
+        };
+        let mut after = None::<String>;
+        for page in 0..200 {
+            let r = th.rt.block_on(query::log(&h.hub, &a, LogParams { n: Some(7), after: after.clone(), ..Default::default() }, tight));
+            let v = match r {
+                Ok(v) => v,
+                Err(Error::Api { code: "bad_request", .. }) if page > 0 => return,
+                Err(e) => panic!("page {page}: {e:?}"),
+            };
+            let next = v["next"].as_str().map(str::to_string);
+            assert!(next.is_none() || next != after, "page {page} answered {} entries and the cursor it was given", v["entries"].as_array().unwrap().len());
+            if next.is_none() {
+                return;
+            }
+            after = next;
+        }
+        panic!("200 pages and the log neither ended nor refused");
+    }
+
     /// Kept cursors are bounded, whatever anyone asks: anyone on Earth
     /// paging a wide public log over and over, from many places, makes the
     /// server keep at most `Limits::kept_bytes` of cursors for the project
