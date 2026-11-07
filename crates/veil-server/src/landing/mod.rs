@@ -122,6 +122,9 @@ pub struct Stats {
     /// the request path), storing their objects, and committing them (the
     /// transaction).
     pub build_us: AtomicU64,
+    /// Microseconds spent reading what a batch needs before it is built
+    /// (who lands as whom, memos, view keys to attach).
+    pub prepare_us: AtomicU64,
     pub store_us: AtomicU64,
     pub commit_us: AtomicU64,
     /// Batches refused at commit because the lease had moved (fencing).

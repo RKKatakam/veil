@@ -180,6 +180,7 @@ fn stats(hub: &veil_server::Hub, n: u64) -> serde_json::Value {
         "landing_conflicts": hub.landing.stats.conflicts.load(Relaxed),
         "landing_rejected": hub.landing.stats.rejected.load(Relaxed),
         "landing_build_us": hub.landing.stats.build_us.load(Relaxed),
+        "landing_prepare_us": hub.landing.stats.prepare_us.load(Relaxed),
         "landing_store_us": hub.landing.stats.store_us.load(Relaxed),
         "landing_commit_us": hub.landing.stats.commit_us.load(Relaxed),
     })

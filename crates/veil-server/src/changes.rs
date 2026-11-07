@@ -341,6 +341,9 @@ struct Built {
     /// are not the accepted ones: accepted only if the branch moves, and
     /// only from an admin.
     accept: Option<String>,
+    /// The branch rules (`.veilrules`) of the full tree, to compare with the
+    /// default branch's tip's (BUG-1102).
+    rules: Option<TreeEntry>,
 }
 
 /// Who asks, as of one attempt: the project with its accepted policy and
@@ -440,7 +443,8 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, who: &Arc<Who>, parent: ObjectI
             }
             false => None,
         };
-        Ok(Built { real: real_id, store, mine, accept })
+        let rules = sync::entry_at(src, &real.tree, crate::landing::rules::RULES_FILE)?;
+        Ok(Built { real: real_id, store, mine, accept, rules })
     })
     .await
 }
@@ -925,8 +929,12 @@ pub(crate) async fn create_with(
         // for an admin, judged against its tip (BUG-1102).
         let rules_moved = match cur {
             Some(c) if plan.default_branch && !who.viewer.admin && rejected.is_none() => {
-                let r = built.real;
-                sync::blocking(hub, project.id, move |src| crate::landing::rules_changed(src, &src.snapshot(&r)?.tree, Some(&src.snapshot(&c)?.tree))).await?
+                let tip = sync::blocking(hub, project.id, move |src| sync::entry_at(src, &src.snapshot(&c)?.tree, crate::landing::rules::RULES_FILE)).await?;
+                match (&built.rules, &tip) {
+                    (None, None) => false,
+                    (Some(a), Some(b)) => !a.same_content(b),
+                    _ => true,
+                }
             }
             _ => false,
         };

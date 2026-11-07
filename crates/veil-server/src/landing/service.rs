@@ -331,8 +331,12 @@ impl Service {
                 continue;
             }
             idle = Instant::now();
-            let on = inflight.as_ref().map(|f| f.after.clone()).unwrap_or_else(|| state.clone());
+            // The batch being committed holds its objects; a committed one's
+            // are stored (BUG-1107).
+            let on = inflight.as_ref().map(|f| f.after.clone()).unwrap_or_else(|| State { made_bytes: 0, ..state.clone() });
+            let t = Instant::now();
             let inputs = self.prepare(rows, &on, state.tip, &mut known).await?;
+            self.hub.landing.stats.prepare_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
             let t = Instant::now();
             let built = self.build(inputs, on).await?;
             self.hub.landing.stats.build_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -581,10 +585,11 @@ impl Service {
         // View keys known and not kept: attached from their newest memo on
         // the recent line, or handed to the background fill.
         let recent: Vec<ObjectId> = on.recent.iter().copied().collect();
+        // (A key handed to the fill is looked for again only after a while.)
         let unkept: Vec<(String, As)> = known
             .views
             .iter()
-            .filter(|(k, _)| !on.keys.contains_key(*k))
+            .filter(|(k, _)| !on.keys.contains_key(*k) && known.prefilled.get(*k).is_none_or(|t| t.elapsed() > PREFILL_EVERY))
             .take(MAX_KEYS.saturating_sub(on.keys.len()))
             .map(|(k, a)| (k.clone(), a.clone()))
             .collect();
@@ -597,12 +602,10 @@ impl Service {
                 match newest {
                     Some((i, m)) => attach.push((k, a, i, m)),
                     None => {
+                        known.prefilled.insert(k.clone(), Instant::now());
                         if let Some(tip) = committed {
-                            if known.prefilled.get(&k).is_none_or(|t| t.elapsed() > PREFILL_EVERY) {
-                                known.prefilled.insert(k.clone(), Instant::now());
-                                if let Err(e) = crate::query::graph::prefill(hub, &a.project, &a.viewer, &[tip]).await {
-                                    eprintln!("veil-server: queueing a view's fill for project {}: {e:?}", self.project);
-                                }
+                            if let Err(e) = crate::query::graph::prefill(hub, &a.project, &a.viewer, &[tip]).await {
+                                eprintln!("veil-server: queueing a view's fill for project {}: {e:?}", self.project);
                             }
                         }
                     }
