@@ -656,3 +656,232 @@ fn blame_speed() {
         }
     }
 }
+
+// ---- S14 cycle 1: adversarial review ---------------------------------------------------
+
+mod s14c1_adversarial {
+    use super::*;
+    use crate::support::unique;
+
+    /// The snapshot ids of a blame's lines, in order.
+    fn origins(v: &Value) -> Vec<String> {
+        v["lines"].as_array().unwrap().iter().map(|l| l["snapshot"].as_str().unwrap().to_string()).collect()
+    }
+
+    /// BUG-1210. A viewer graph row whose snapshot has no file-history rows
+    /// is trusted as if it had them. That is the state an S13 server leaves
+    /// beside S14 servers after migration 0015 (a rolling restart, which
+    /// `db::migrate` supports: the S13 server goes on filling, writing graph
+    /// rows only). Here the S13 server's fill is reproduced by removing one
+    /// snapshot's file-history rows after the fill; then an S14 server fills
+    /// the next landing on top. Blame and history answer from the older
+    /// version, silently and for good: the next landing's `prev` skips the
+    /// snapshot, and nothing ever fills it again.
+    #[test]
+    #[ignore = "BUG-1210: graph rows without file history (an S13 server beside S14) give silently wrong blame and history, for good"]
+    fn bug_1210_graph_rows_without_file_history_give_silently_wrong_answers() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let mut f = Files::new();
+        f.insert("pub/a.txt".into(), b"one\n".to_vec());
+        let c1 = h.commit(&th, &[root_snapshot_id()], f.clone(), [1; 16], 1_700_000_000_000, None);
+        f.insert("pub/a.txt".into(), b"one\ntwo\n".to_vec());
+        let c2 = h.commit(&th, &[c1], f.clone(), [2; 16], 1_700_000_001_000, None);
+        h.set_branch(&th, "main", c2);
+        let viewer = Viewer::default();
+        warm_up(&th, &h, &viewer);
+        // c2's graph row as an S13 server writes it: no file history.
+        th.rt.block_on(async {
+            sqlx::query("DELETE FROM view_file_history WHERE project_id = $1 AND snapshot = $2").bind(h.id).bind(c2.hex()).execute(&h.hub.db).await.unwrap();
+        });
+        // The next landing, filled by an S14 server.
+        f.insert("pub/a.txt".into(), b"one\ntwo\nthree\n".to_vec());
+        let c3 = h.commit(&th, &[c2], f.clone(), [3; 16], 1_700_000_002_000, None);
+        h.set_branch(&th, "main", c3);
+        warm_up(&th, &h, &viewer);
+        let p = projections(&th, &h, &h.project(&th), &viewer);
+        assert_eq!((p[&c1], p[&c2], p[&c3]), (c1, c2, c3), "every change is public");
+        let a = ask(&th, &h, &viewer);
+        // The server may refuse (it cannot know the missing rows); it may not answer wrongly.
+        let blame = th.rt.block_on(query::blame(&h.hub, &a, BlameParams { path: "pub/a.txt".into(), ..Default::default() }, Limits::default()));
+        let history = history_all(&th, &h, &a, "main", "pub/a.txt", false, 50);
+        println!("blame: {:?}\nhistory: {history:?}", blame.as_ref().map(origins));
+        if let Ok(v) = &blame {
+            assert_eq!(origins(v), [c1.hex(), c2.hex(), c3.hex()], "a silently wrong blame: line 2 is c2's");
+        }
+        if let Ok(hist) = &history {
+            let got: Vec<String> = hist.iter().map(|e| e.0.clone()).collect();
+            assert_eq!(got, [c3.hex(), c2.hex(), c1.hex()], "a silently wrong file history: c2 changed the file");
+        }
+    }
+
+    /// BUG-1211. Migration 0015 ends in `DELETE FROM view_graph`: one
+    /// statement over every viewer graph of every project, which
+    /// `migrate_once` runs in one transaction under the server's 15 s
+    /// statement timeout (`db::STATEMENT_TIMEOUT`). On a server whose graphs
+    /// hold more rows than that deletes in 15 s, every attempt is cancelled
+    /// (57014, retried as retryable until the 10-minute `MIGRATION_DEADLINE`)
+    /// and no S14 server starts. Measured here: the migration over 300,000
+    /// graph rows, and how many rows it would delete within the timeout.
+    /// The bar is 10 million rows (50 projects of 20,000 snapshots with 10
+    /// view keys each). On YugabyteDB (about 45,000 rows/s) the limit is
+    /// about 680,000 rows, three such projects; on PostgreSQL about 40
+    /// million.
+    #[test]
+    #[ignore = "BUG-1211: migration 0015's unbounded DELETE FROM view_graph cannot finish within the statement timeout on a large server (YugabyteDB)"]
+    fn bug_1211_migration_0015_cannot_finish_on_a_large_server() {
+        const ROWS: i64 = 300_000;
+        const BAR: f64 = 10_000_000.0;
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(2).build().unwrap();
+        let admin = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+        let name = format!("{}{}", std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_default(), unique("veil_m15_"));
+        let (r, took) = rt.block_on(async {
+            let db = veil_server::db::connect(&admin, 1).await.unwrap();
+            sqlx::raw_sql(&format!("CREATE DATABASE {name}")).execute(&db).await.unwrap();
+            db.close().await;
+            let url = format!("{}/{name}", admin.rsplit_once('/').unwrap().0);
+            let db = veil_server::db::connect(&url, 2).await.unwrap();
+            veil_server::db::migrate(&db).await.unwrap();
+            for chunk in 0..ROWS / 50_000 {
+                sqlx::query(
+                    "INSERT INTO view_graph (project_id, view_key, snapshot, generation, depth, parents, flags, skip, down_id, real_id) \
+                     SELECT g / 20000, 'k' || (g % 10), md5(g::text), g, g, '[]', 0, '[]', '', '' FROM generate_series($1::bigint, $2::bigint) g",
+                )
+                .bind(chunk * 50_000)
+                .bind(chunk * 50_000 + 49_999)
+                .execute(&db)
+                .await
+                .unwrap();
+            }
+            // Migration 0015 as `migrate_once` applies it: in a transaction,
+            // on a connection of the server's (its statement timeout).
+            let sql = include_str!("../../migrations/0015_file_history_and_blame.sql");
+            let mut tx = db.begin().await.unwrap();
+            let t = Instant::now();
+            let r = sqlx::raw_sql(sql).execute(&mut *tx).await.map(|_| ()).map_err(|e| e.to_string());
+            let took = t.elapsed();
+            let _ = tx.rollback().await;
+            db.close().await;
+            let db = veil_server::db::connect(&admin, 1).await.unwrap();
+            let _ = sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")).execute(&db).await;
+            (r, took)
+        });
+        let within = ROWS as f64 / took.as_secs_f64() * veil_server::db::STATEMENT_TIMEOUT.as_secs_f64();
+        println!("migration 0015 over {ROWS} graph rows: {r:?} after {took:?}: about {within:.0} rows within the statement timeout");
+        assert!(r.is_ok(), "{r:?}");
+        assert!(within >= BAR, "migration 0015 deletes about {within:.0} viewer-graph rows within the 15 s statement timeout; a server with more never starts S14");
+    }
+
+    /// BUG-1212. A blame keeps its progress when it stops while computing
+    /// (its budget, the deadline, the memory bound), but not when it stops
+    /// on its walk down to the versions it starts from: nothing is computed
+    /// or kept yet, so the next request walks the same way and stops in the
+    /// same place. A first blame whose walk down is longer than the deadline
+    /// never answers. Here: a file renamed at each of 400 changes, blamed
+    /// with `follow` (each version's walk diffs the snapshot's projected
+    /// trees to pair the rename), with a deadline a quarter of what the
+    /// walk down takes.
+    #[test]
+    #[ignore = "BUG-1212: a blame that stops on its walk down keeps nothing, so a long history never gets its first blame"]
+    fn bug_1212_a_blame_stopped_on_its_walk_down_never_makes_progress() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let mut f = Files::new();
+        let mut body: Vec<String> = (0..40).map(|i| format!("line {i} of a file that moves at every change\n")).collect();
+        for i in 0..20 {
+            f.insert(format!("pub/other/o{i}.txt"), lines(&format!("o{i}"), 10));
+        }
+        let mut tip = root_snapshot_id();
+        let mut path = String::new();
+        for i in 0..400usize {
+            body[i % 40] = format!("edited at change {i}\n");
+            f.remove(&path);
+            path = format!("pub/moving/name{}.txt", i % 2);
+            f.insert(path.clone(), body.concat().into_bytes());
+            let mut change = [7u8; 16];
+            change[..2].copy_from_slice(&(i as u16).to_le_bytes());
+            tip = h.commit(&th, &[tip], f.clone(), change, 1_700_000_000_000 + i as i64 * 1000, None);
+        }
+        h.set_branch(&th, "main", tip);
+        let viewer = Viewer::default();
+        let a = ask(&th, &h, &viewer);
+        warm_up(&th, &h, &viewer);
+        let q = || BlameParams { path: path.clone(), follow: Some(true), ..Default::default() };
+        // How long the walk down takes: a budget of one diff stops the blame
+        // right after it (warm: the second time).
+        let walk = Limits { blame: BlameLimits { work: 1, ..BlameLimits::default() }, deadline: Duration::from_secs(120), ..Limits::default() };
+        let mut took = Duration::ZERO;
+        for _ in 0..2 {
+            forget_blames(&th, &h);
+            let t = Instant::now();
+            let r = th.rt.block_on(query::blame(&h.hub, &a, q(), walk));
+            took = t.elapsed();
+            assert!(matches!(r, Err(Error::Api { code: "partial", .. })), "{r:?}");
+        }
+        forget_blames(&th, &h);
+        let deadline = took / 4;
+        println!("walk down: {took:?}; deadline {deadline:?}");
+        let short = Limits { deadline, ..Limits::default() };
+        let mut answers = Vec::new();
+        for _ in 0..40 {
+            match th.rt.block_on(query::blame(&h.hub, &a, q(), short)) {
+                Ok(v) => {
+                    assert_eq!(v["line_count"], 40);
+                    return;
+                }
+                Err(Error::Api { code, .. }) => answers.push(code),
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+        let kept: i64 = th.rt.block_on(async {
+            sqlx::query_scalar("SELECT COUNT(*) FROM blame_memo WHERE project_id = $1").bind(h.id).fetch_one(&h.hub.db).await.unwrap()
+        });
+        panic!("40 requests and no blame ({kept} versions kept): {answers:?}");
+    }
+
+    /// BUG-1213 (BUG-1076's class). A history cursor names each version
+    /// still to walk with its path inline (`snapshot.hex(path)`), up to
+    /// `Limits::cursor` (1,000) versions, and the route takes it in its URL.
+    /// A frontier of a few dozen versions of a file with a long path (a
+    /// path may have 4,096 bytes, so a version up to 8,257 bytes) already
+    /// passes what a request line can carry (64 KiB), and the history
+    /// cannot be paged past it, for everyone who sees the file. Here: a
+    /// file of a 1,500-byte path changed on 30 branches, merged together.
+    #[test]
+    #[ignore = "BUG-1213: a file history's cursor can be longer than a request can carry, so the history cannot be paged past it"]
+    fn bug_1213_a_history_cursor_is_longer_than_a_request_carries() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let path = format!("pub/{}f.txt", format!("{}/", "d".repeat(99)).repeat(15));
+        assert!(path.len() > 1_500 && path.len() < 4096);
+        let mut f = Files::new();
+        f.insert(path.clone(), lines("base", 40));
+        let c0 = h.commit(&th, &[root_snapshot_id()], f.clone(), [1; 16], 1_700_000_000_000, None);
+        let mut branches = Vec::new();
+        let mut merged: Vec<String> = (0..40).map(|i| format!("base {i}\n")).collect();
+        for i in 0..30usize {
+            let mut body: Vec<String> = (0..40).map(|j| format!("base {j}\n")).collect();
+            body[i] = format!("branch {i}\n");
+            merged[i] = format!("branch {i}\n");
+            let mut g = f.clone();
+            g.insert(path.clone(), body.concat().into_bytes());
+            branches.push(h.commit(&th, &[c0], g, [10 + i as u8; 16], 1_700_000_001_000 + i as i64 * 1000, None));
+        }
+        f.insert(path.clone(), merged.concat().into_bytes());
+        let m = h.commit(&th, &branches, f.clone(), [99; 16], 1_700_000_100_000, None);
+        h.set_branch(&th, "main", m);
+        warm_up(&th, &h, &Viewer::default());
+        let api = th.api();
+        let base = format!("/v1/projects/{}/q/history", h.name);
+        let first = api.get(None, &format!("{base}?path={path}&n=1"));
+        assert_eq!(first.status, 200, "{}", String::from_utf8_lossy(&first.body));
+        let next = first.json()["next"].as_str().unwrap().to_string();
+        println!("a cursor of {} bytes", next.len());
+        let second = api.get(None, &format!("{base}?after={next}&n=50"));
+        assert_eq!(second.status, 200, "the second page: {} {}", second.status, String::from_utf8_lossy(&second.body));
+        assert_eq!(second.json()["entries"].as_array().unwrap().len(), 31);
+    }
+}
