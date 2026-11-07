@@ -21,7 +21,7 @@ Each of those is also time on the request path. So every item here makes Veil **
 | Database statements per pull | about 46 | **a handful**, most answered from memory |
 | Landings/s across 100 projects, MinIO | 376 (bound by the object store) | 4,000 (phase 2 gate) |
 | Landings/s into one `main` | about 20 | 100 (phase 2), 1,000 (phase 4, by batching) |
-| Bytes stored and sent | uncompressed | compressed (zstd) |
+| Bytes stored and sent | uncompressed | compressed (zstd): **built in S27** (`HUB.md` §13.13) |
 | Server memory, 1 GB project push | 2.3 GB peak (BUG-864: allocator arenas) | under 1 GB |
 
 ## 3. One database commit per push (S4)
@@ -56,6 +56,8 @@ In each API server's memory, never in the database:
 - A pull may see a tip up to 100 ms old, which `phase-2-thin-clients.md` §5.1 already allows.
 
 ## 6. Compressed objects (S27)
+
+> **Built** (2026-11-07): `docs/HUB.md` §13.13 has the design as built, its threat review and the measurements.
 
 - Objects are compressed with **zstd** (level 3) when stored and when sent. A server or cache may also keep them compressed in memory.
 - **Object ids stay the hash of the uncompressed bytes,** so content addressing, deduplication and every signature are unchanged. Compression is a storage and transport encoding, recorded per object (one header byte), so old uncompressed objects stay readable.

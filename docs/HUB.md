@@ -831,7 +831,7 @@ protocol as pure functions, shared with `vl`; they build for WASM),
 | HTTPS API | tokio, axum, hyper, rustls (ring) | TLS on every connection; `--tls-cert/--tls-key`, or a self-signed certificate (rcgen) for `localhost`/`127.0.0.1` created in the data directory, which `vl login --ca FILE` pins for that server |
 | Metadata | sqlx, PostgreSQL 17 (development, CI) and YugabyteDB 2025.2 | portable SQL only; read-check-write transactions are SERIALIZABLE through `db::serializable`, except where unique keys and row locks decide the races (branch moves, sign-in, project and group creation, group changes: READ COMMITTED, because on YugabyteDB a SERIALIZABLE read blocks every insert into the table it read until it commits, BUG-847); retried with capped exponential backoff on `40001`/`40P01` (YugabyteDB reports conflicts as both) |
 | Migrations | `db::migrate`, `migrations/0001_initial.sql`, `0002_device_vouches.sql` (pending devices, vouches: §13.11), `0003_invites_and_key_sharing.sql` (invites, key requests, pending devices by fingerprint and the fingerprints a person waits for, devices barred from one project: §13.12) | each in its own transaction, recorded in `schema_migrations`; servers starting together race on its primary key and the loser re-checks. On PostgreSQL DDL is transactional; on YugabyteDB DDL inside a transaction block is applied statement by statement unless transactional DDL is enabled, so **migration files are idempotent** (`IF NOT EXISTS`) and a half-applied one is completed by the next start |
-| Object storage | `store::BlobStore`: `FsStore` (a directory; unit tests, development) and `S3Store` (rusty-s3 request signing + reqwest; tested against MinIO) | key `p/<project id>/ab/cdef…`: projects never share an object; every read is re-hashed against its id; an in-memory cache of objects and decoded trees (256 MiB each, decoded trees weighed by the memory they hold: BUG-860). Every S3 request is idempotent (GET, HEAD, PUT of a key naming its content) and is tried again for up to 10 s, with jittered waits doubling from 25 ms to 1 s, when its connection closes or resets or the store answers 5xx; idle connections are dropped after 15 s, before S3 services drop them (BUG-861) |
+| Object storage | `store::BlobStore`: `FsStore` (a directory; unit tests, development) and `S3Store` (rusty-s3 request signing + reqwest; tested against MinIO) | key `p/<project id>/ab/cdef…`: projects never share an object; objects are stored compressed (zstd) when that is smaller, under the id of the uncompressed object (S27, §13.13); every read is decoded, bounded, and re-hashed against its id; an in-memory cache of objects (as stored) and decoded trees (256 MiB each, decoded trees weighed by the memory they hold: BUG-860). Every S3 request is idempotent (GET, HEAD, PUT of a key naming its content) and is tried again for up to 10 s, with jittered waits doubling from 25 ms to 1 s, when its connection closes or resets or the store answers 5xx; idle connections are dropped after 15 s, before S3 services drop them (BUG-861) |
 | Server identity | an Ed25519 `Identity` in `<data>/hub-identity.json` (0600); a random secret in `<data>/hub-receipt-key` (0600) | signs projected snapshots (§13.4); its key is shown by `vl login`. The secret keys upload receipts (§13.5); servers sharing the data directory accept each other's |
 
 **YugabyteDB's licence (checked 2026-11-06).** The `LICENSE.md` shipped in
@@ -973,9 +973,9 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 | Route | |
 |---|---|
 | `GET /v1/projects/{p}/tips` | branches → tips as the caller sees them (projections) |
-| `POST …/history {tips, stop}` | the caller's projected snapshots from `tips` down to `stop`, as object frames (`id ‖ len u32be ‖ object`) |
-| `POST …/fetch {snapshot, objects: [{path, id, snapshot?}]}` | objects by id, each with the path where the client met it under that snapshot (its own `snapshot`, or the request's); the server walks the viewer's projection of that snapshot to that path and serves the object only if it is there. No list of what the client has; each request names an immutable object, so a per-viewer cache can serve it |
-| `POST …/objects` | upload object frames: re-hashed, canonically decoded, format-checked, stored; invisible until a push reaches them. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id) |
+| `POST …/history {tips, stop}` | the caller's projected snapshots from `tips` down to `stop`, as object frames (`id ‖ len u32be ‖ object`); to a caller that accepts encoded frames, each object as stored, compressed or not (§13.13) |
+| `POST …/fetch {snapshot, objects: [{path, id, snapshot?}]}` | objects by id, each with the path where the client met it under that snapshot (its own `snapshot`, or the request's); the server walks the viewer's projection of that snapshot to that path and serves the object only if it is there (as stored, to a caller that accepts encoded frames: §13.13). No list of what the client has; each request names an immutable object, so a per-viewer cache can serve it |
+| `POST …/objects` | upload object frames, plain or encoded (§13.13): decoded (bounded), re-hashed, canonically decoded, format-checked, stored compressed when that is smaller; invisible until a push reaches them. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id) |
 | `POST …/push {updates: [{branch, expected, new}], force, receipts}` | complete and check every new snapshot, then move the branches in **one serialisable transaction of compare-and-swaps** (`UPDATE branches SET target = new WHERE … AND target = expected`); one lost race rejects the whole push with 409 and `vl` retries |
 | `GET …/access?path=` | the deciding line and who it names; only for a path the caller may read |
 | `…/groups`, `GET|POST …/rings/{scope}`, `GET /v1/people/{name}/devices` | groups; key rings of secret scopes; a person's devices (active, the newest pending, removed), the vouches and invite joins the server stores, which devices check before sharing a key (§13.11, §13.12) |
@@ -1507,3 +1507,98 @@ secrets, §3.1), unless a row says otherwise. Each row is tested in
 * **A clone made before its device anchored the project** opens no secret
   until the person confirms the fingerprint; this is the price of never
   trusting a ring on the server's word.
+
+### 13.13 S27: compressed objects in storage and on the wire
+
+Built on `integration` @ `f7e9aac` (2026-11-07), as
+`docs/design/server/storage-and-cost.md` §6 asks. Code:
+`veil_core::hub::encoding`, `crates/veil-server/src/store.rs`
+(`Objects`), the `history`, `fetch` and `objects` routes, and `vl`'s
+client (`crates/vl/src/hub.rs`).
+
+#### The design
+
+* **An object's encoding** is how the server stores it and sends it. Its
+  first byte says which:
+
+  ```text
+  'v' …          the canonical encoding itself (every object starts `veil:`);
+                 every object stored before S27 is one, so they stay readable
+  'z' ‖ frame    one zstd frame (level 3) of the canonical encoding, declaring its size
+  ```
+
+  **Object ids stay the BLAKE3 of the uncompressed canonical encoding**, so
+  content addressing, deduplication, upload receipts and signatures don't
+  change, and the storage key is the same (`p/<project>/ab/cdef…`).
+* **The encoder keeps whichever is smaller** (`encoding::encode`). Secrets
+  are ciphertext and don't shrink: they are stored and sent as they are.
+  Objects are compressed **one at a time, never together**, and only after
+  a secret is sealed on its device (never compress-then-encrypt).
+* **The server's store** (`Objects`) writes the encoding, and keeps
+  encodings in its object cache (so the cache holds more objects), each
+  checked against its id when it was read from the store or received.
+  `get` returns the canonical encoding (the projection, push checks and
+  older clients use it); `get_encoded` returns what is stored, for the wire.
+  Every object the store answers is decoded, bounded, and re-hashed before
+  it is cached or served, as before.
+* **The wire.** An *encoded frame* is `id ‖ len u32be ‖ encoding`. A body of
+  plain frames (S1's) is also a body of encoded frames.
+  * `vl` sends `Accept: application/x-veil-encoded-frames` and reads every
+    answer as encoded frames. The server answers `history` and `fetch` with
+    each object **as stored** (no compression on the request path) to a
+    caller that accepts them, and plain frames to anyone else. Projected
+    trees made for one viewer are sent as they are.
+  * **Uploads:** the server reads every upload as encoded frames (so a `vl`
+    from before S27 still uploads), decodes and checks each, and stores the
+    client's frame when it is smaller, else compresses the object itself.
+    `vl` compresses an upload on up to 8 threads, but only for a server of
+    **revision 2** (`Tips::revision`); to an older server it sends plain
+    frames.
+* **Compatibility, both ways.** An older `vl` sends no `Accept` and gets
+  plain frames; its plain uploads are compressed by the server. A newer
+  `vl` and an older server: the server ignores `Accept` and answers plain
+  frames, which `vl` reads; `vl` uploads plain frames to it. Were encoded
+  frames ever sent to an older server, it would refuse them (their bytes
+  don't hash to their ids), never misread them.
+* **Bounded decoding** (`encoding::decode`): a `z` frame must be exactly one
+  zstd frame that declares its size (no trailing bytes, no second or
+  skippable frame), and that size must be at most the object size limit
+  (`wire::MAX_FRAME_OBJECT`, as for a plain frame) before anything is
+  decoded. The decoder never produces more than the declared size, objects
+  above 64 MiB are hashed while streaming before they are held in memory
+  (BUG-490's rule), and the result must hash to the id. An upload's objects
+  together may decode to at most the request body limit (2 GiB), so a
+  compressed request costs the server no more than a plain one could.
+* **What it does not change:** the client's local store (pulled objects
+  already go into zstd packs; loose objects stay as they are until
+  `vl gc`), the repository format, and the per-object permission checks.
+
+#### Threat review
+
+Attackers outside the trust boundary (§3.1): a participant uploading
+crafted frames, a reader without access to a folder, a network observer
+(TLS everywhere). The server and its object store are trusted with code.
+
+| # | Threat | Defence | Test |
+|---|---|---|---|
+| 1 | **Zip bomb:** a small upload that expands past the object size limit, or a request that decodes to gigabytes | size declared, checked against the limit before decoding; the decoder stops at the declared size; per-request total ≤ the body limit | `encoding::tests::a_zip_bomb_is_refused_before_it_expands`, `server_hub::sync::hostile_compressed_uploads_are_refused` |
+| 2 | **A frame that decodes to other content** than its id (to plant one object under another's id) | every decoded object is re-hashed against its id, on upload and on every read from the store | `decoding_refuses_wrong_ids_and_unknown_markers`, `hostile_compressed_uploads_are_refused`, `store::tests::objects_are_stored_compressed_and_old_ones_stay_readable` |
+| 3 | **Malformed frames:** no declared size, trailing bytes or a second frame (hidden data riding along in storage), an unknown marker, truncation | refused; the whole request is refused, with no receipt | `malformed_frames_are_refused`, `hostile_compressed_uploads_are_refused` |
+| 4 | **Compression as an oracle** (BREACH-style: a guess and hidden data compressed together) | each object is compressed alone; answers carry only objects the viewer may read at their path; projected trees hold only what the viewer may see | `compressed_answers_hold_nothing_the_viewer_may_not_see` |
+| 5 | **Secrets**: plaintext compressed, or compressed before encryption | secrets are sealed on the device before upload; the server sees and stores ciphertext, kept as it is | `objects_are_compressed_in_storage_and_for_clients_that_read_them` (the `.env` is stored uncompressed), `leaks::…` (the server never holds the secret's plaintext, decoded) |
+| 6 | **Mixed versions misread each other's frames** | negotiated (`Accept`, revision 2); a plain frame is an encoded frame; encoded frames sent to an older server fail its hash check | `objects_are_compressed_in_storage_and_for_clients_that_read_them`, `hub::tests::answers_of_plain_and_encoded_frames` |
+| 7 | **Tests that scan the server's files** for leaked plaintext miss it once objects are compressed | the scan decodes object files first (`support::stored_bytes`) | `secrets2::…` |
+
+**Left as it is (medium, accepted):** a participant can make the server
+spend CPU decoding up to 2 GiB per upload request from a small body
+(before S27 that cost them 2 GiB of upload). The bound is per request;
+rate limits per person are later work (§4.7).
+
+#### Reverting
+
+Revert the merge **only if no server ran it on real data**: an older
+server cannot read objects stored compressed (they fail its hash check,
+"stored object … does not match its id"). Once a server has stored
+compressed objects, revert by making `encoding::encode` return its input
+(one line): the server then stores and sends plain objects, and keeps
+reading both kinds.

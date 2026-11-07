@@ -12,9 +12,9 @@
 //! deduplication, receipts and signatures don't change. [`encode`] keeps
 //! whichever is smaller: secrets are ciphertext and stay as they are.
 //!
-//! **Encoded frames** are `id [32] ‖ len u32be ‖ encoding`. A body of plain
-//! object frames ([`super::wire::put_frame`]) is also a body of encoded
-//! frames, so a receiver that reads encoded frames reads both.
+//! **Encoded frames** are `id [32] ‖ len u32be ‖ encoding`, written with
+//! [`super::wire::put_frame`]. A body of plain object frames is also a body
+//! of encoded frames, so a receiver that reads encoded frames reads both.
 //!
 //! **Decoding is bounded** ([`decode`]): a frame must declare its size, be
 //! exactly one frame, and declare at most the caller's limit; the decoder
@@ -32,7 +32,8 @@ pub const ZSTD: u8 = b'z';
 /// First byte of every canonical encoding (`veil:`).
 const PLAIN: u8 = b'v';
 /// zstd level the encoder uses.
-pub const LEVEL: i32 = 3;
+#[cfg_attr(not(feature = "zstd"), allow(dead_code))]
+const LEVEL: i32 = 3;
 
 /// The `Accept` media type of a client that reads encoded frames: a server
 /// answers it with compressed objects (`history`, `fetch`).
@@ -107,11 +108,6 @@ pub fn decode<'a>(id: &ObjectId, enc: &'a [u8], limit: u64) -> Result<Cow<'a, [u
     Ok(raw)
 }
 
-/// Append one encoded frame (`enc` already an encoding of `id`).
-pub fn put_frame(out: &mut Vec<u8>, id: &ObjectId, enc: &[u8]) {
-    super::wire::put_frame(out, id, enc)
-}
-
 /// Split a body of encoded frames into ids and encodings, checking only
 /// the framing (each encoding at most [`super::wire::MAX_FRAME_OBJECT`]).
 pub fn split_frames(mut body: &[u8]) -> Result<Vec<(ObjectId, &[u8])>> {
@@ -148,7 +144,7 @@ pub fn read_frames(body: &[u8], total: u64) -> Result<Vec<(ObjectId, Cow<'_, [u8
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{super::wire::put_frame, *};
 
     fn blob(body: &[u8]) -> Vec<u8> {
         let mut raw = b"veil:blob\n".to_vec();
@@ -262,7 +258,7 @@ mod tests {
         let mut encoded = Vec::new();
         for raw in &objs {
             let id = ObjectId::hash(raw);
-            super::super::wire::put_frame(&mut plain, &id, raw);
+            put_frame(&mut plain, &id, raw);
             put_frame(&mut encoded, &id, &encode(raw));
         }
         for body in [&plain, &encoded] {
