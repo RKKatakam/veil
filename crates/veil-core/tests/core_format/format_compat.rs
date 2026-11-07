@@ -319,7 +319,7 @@ fn golden_encodings() -> Vec<(String, Vec<u8>)> {
 fn golden_operation() -> veil_core::oplog::Operation {
     let mut view = veil_core::oplog::View::default();
     view.heads.insert(ObjectId([0x51; 32]));
-    view.workspaces.insert("agent-1".into(), veil_core::oplog::WorkspaceState { wc: ObjectId([0x52; 32]) });
+    view.workspaces.insert("agent-1".into(), veil_core::oplog::WorkspaceState { wc: ObjectId([0x52; 32]), id: None });
     view.tags.insert("main".into(), veil_core::oplog::Tag::new(ObjectId([0x53; 32])));
     view.remote_tags.insert("origin/main".into(), ObjectId([0x53; 32]));
     let mut rewritten = std::collections::BTreeMap::new();
@@ -727,7 +727,7 @@ fn write_format_6_extras() {
     let mut tx_b = b.transaction("create workspace 'concurrent'").unwrap();
     tx_b.for_workspace("concurrent");
     let wc = tx_b.new_change(vec![x], "").unwrap();
-    tx_b.view.workspaces.insert("concurrent".into(), veil_core::oplog::WorkspaceState { wc });
+    tx_b.view.workspaces.insert("concurrent".into(), veil_core::oplog::WorkspaceState { wc, id: None });
     tx_a.commit().unwrap();
     tx_b.commit().unwrap();
     drop((a, b));

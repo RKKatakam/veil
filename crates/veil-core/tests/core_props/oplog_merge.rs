@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use proptest::prelude::*;
 use veil_core::{
-    oplog::{merge_views, Tag, View, WorkspaceState, OP_HEADS_DIR},
+    oplog::{merge_views, revert_views, Tag, View, WorkspaceState, OP_HEADS_DIR},
     Identity, MemoryBackend, ObjectId, Repo, StorageBackend, VPath,
 };
 
@@ -43,7 +43,7 @@ fn base_view() -> View {
         v.tags.insert(format!("t{t}"), Tag::new(id(1)));
     }
     for w in 0..3u8 {
-        v.workspaces.insert(format!("w{w}"), WorkspaceState { wc: id(2) });
+        v.workspaces.insert(format!("w{w}"), WorkspaceState { wc: id(2), id: None });
     }
     v
 }
@@ -226,5 +226,30 @@ proptest! {
             }
         }
         prop_assert_eq!(r.heads().len(), 1);
+    }
+}
+
+/// BUG-1031: a workspace's identity goes with the working copy that won: a
+/// concurrent move keeps it, and an undo that brings back an earlier
+/// workspace of the same name brings back that one's, never the later one's.
+#[test]
+fn a_workspace_keeps_its_identity_through_merges_and_undo() {
+    let first = WorkspaceState::new(id(2));
+    let later = WorkspaceState::new(id(5));
+    assert!(first.id.is_some() && first.id != later.id, "each workspace gets its own id");
+    let mut base = View::default();
+    base.workspaces.insert("w".into(), first.clone());
+    let mut moved = base.clone();
+    moved.workspaces.get_mut("w").unwrap().wc = id(4);
+    let m = merge_views(&base, &[&moved, &base], &mut no_descent).view;
+    assert_eq!(m.workspaces["w"].id, first.id);
+    // Removed, then made again under its name; undoing the removal's
+    // successor and the removal brings the first back, with its own id.
+    let gone = View::default();
+    let mut again = View::default();
+    again.workspaces.insert("w".into(), later.clone());
+    let back = revert_views(&gone, &base, &again, &mut no_descent).view;
+    if let Some(w) = back.workspaces.get("w") {
+        assert!((w.wc == first.wc && w.id == first.id) || (w.wc == later.wc && w.id == later.id), "{w:?}");
     }
 }

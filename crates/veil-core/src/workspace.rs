@@ -818,7 +818,7 @@ impl Repo {
             return Err(VeilError::AlreadyExists(format!("workspace '{name}'")));
         }
         let wc = tx.new_change(bases, "")?;
-        tx.view.workspaces.insert(name.to_string(), WorkspaceState { wc });
+        tx.view.workspaces.insert(name.to_string(), WorkspaceState::new(wc));
         tx.commit()?;
         Ok(wc)
     }

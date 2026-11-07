@@ -197,11 +197,11 @@ What the command sees:
 | **The project** | the workspace's sandbox, read-write, **at the project's real path** (`/home/me/app`), starting in the sub-folder you ran `vl` from. Absolute paths and tools that look in parent directories behave as in the project; every write goes to the sandbox. Your project directory and its `.veil` are not there. |
 | **The computer's tools** | `/usr`, `/bin`, `/lib`, `/etc`, `/opt`: read-only, live. |
 | **`HOME`, `/tmp`, `/var/tmp`** | empty and private, gone after the run. `~/.ssh`, `~/.gnupg`, cloud credentials, other projects and the Veil identity are not there. |
-| **The allow-list** | toolchains and agents' own configuration, **read-only**: `~/.cargo` (without its `credentials.toml`), `~/.rustup`, `~/.local/bin`, `~/.local/share/claude`, `~/.nvm`, `~/.pyenv`, `~/.volta`, `~/.bun`, `~/.deno`, `~/.claude`, `~/.claude.json`, `~/.codex`, `~/.gemini`, those that exist. |
+| **The allow-list** | toolchains and agents' own configuration: `~/.cargo` (without its `credentials.toml`), `~/.rustup`, `~/.local/bin`, `~/.local/share/claude`, `~/.nvm`, `~/.pyenv`, `~/.volta`, `~/.bun`, `~/.deno`, `~/.claude`, `~/.claude.json`, `~/.codex`, `~/.gemini`, those that exist. **Writable, but never your real folders:** what the command writes there (cargo's downloads, an agent's settings and sessions, an `npm -g` install) goes to the workspace's own layer, and its next runs see it. |
 | **Processes** | only its own: it cannot see or signal your other programs, or another workspace's run. |
 | **Network** | on (agents call their model's API); `--no-network` leaves only a private loopback. |
 
-* **More of the machine, read-only:** `--allow PATH` (repeatable), or for
+* **More of the machine:** `--allow PATH` (repeatable), or for
   every run, in `.veil/local/config.toml` (this repository) or
   `$VEIL_HOME/config.toml` (all of them):
 
@@ -214,9 +214,40 @@ What the command sees:
   teammate's tracked `config.toml`) can widen what an agent sees. The Veil
   home, your project directory and cargo's credentials stay hidden even
   inside an allowed folder, or behind an allowed link to one; a path
-  inside the Veil home or the project cannot be allowed. An agent that must
-  write its configuration (a token refresh) cannot, here; a read-only
-  folder still lets the command reach sockets and FIFOs in it.
+  inside the Veil home or the project cannot be allowed. The command can
+  reach sockets and FIFOs in an allowed folder.
+* **Writes to the allow-list stay with the workspace.** Each allowed folder
+  is shown through an overlay: your real `~/.cargo` underneath, unchanged,
+  and the workspace's own layer on top, in
+  `.veil/local/sandboxes/agent/layers-…/` (only you can read it; it is never
+  recorded or synced, and other workspaces don't see it). An allowed file
+  (`~/.claude.json`) is copied there on first use. So `cargo build` after an
+  agent adds a crate works, and the agent keeps its settings and session
+  history from one run to the next; your own `cargo` and `claude` never see
+  any of it. A download costs disk once per workspace (serde_json and its
+  dependencies, about 5 MiB; tokio with all features, about 26 MiB; next to
+  nothing for crates your `~/.cargo` already has).
+  * **Starting over:** delete `.veil/local/sandboxes/agent/layers-*` (when
+    nothing runs in the workspace); `vl ws rm` deletes it with the
+    workspace. A workspace made again under the name of one you removed
+    (with `vl undo`) starts from your real folders: the layers belong to
+    the workspace, not its name. The workspace's copy of a file is not
+    refreshed from yours. A `chmod` an agent makes to its layer is undone
+    at the next run.
+  * **Sockets and FIFOs** you allow are shown as they are (reachable,
+    never copied).
+  * **Thrown away instead:** with `--ephemeral`, and with `--with-isolated`
+    (a command given secrets keeps nothing it wrote outside its files, so
+    no copy of a secret, and no transcript quoting one, outlives the run).
+  * **Read-only:** a folder that holds the project, or something hidden
+    deeper inside it (`running … (confined at …, read-only: ~/src)`).
+  * **Hooks and configuration an agent plants in its layer** (an
+    `~/.claude/settings.json` hook) apply to that workspace's later
+    confined runs only; deleting the layers removes them.
+  * **Without overlayfs** (a kernel before 5.11, a restricted user
+    namespace; `vl doctor` says), the allow-list is read-only and `vl`
+    says what that breaks: `cargo cannot download crates, and coding
+    agents cannot save their settings or sessions`.
 * **When the command exits, everything it started stops** (a dev server
   too), and `kill -9` of `vl` stops it all as well. In the rare instant
   `bwrap` starts the sandbox, that is left to the reaper (with injected
