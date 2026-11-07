@@ -380,7 +380,7 @@ pub async fn history(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &
 ///
 /// Memory is bounded (BUG-860): every want is checked first, a snapshot at
 /// a time (its projected trees dropped before the next), then the answer
-/// is read and sent a few objects ahead of the caller ([`FETCH_WINDOW`]);
+/// is read and sent a few objects ahead of the caller (`FETCH_WINDOW`);
 /// a failure while sending ends the stream with an error, so it is never
 /// taken as whole.
 pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot: ObjectId, wants: Vec<Want>) -> Result<FrameStream> {
@@ -413,8 +413,8 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
     })
     .await?;
     // The answer: objects read concurrently (a remote store's latency would
-    // otherwise add up one object at a time), at most [`FETCH_WINDOW`] of
-    // them and about [`FETCH_WINDOW_BYTES`] (by the sizes tree entries
+    // otherwise add up one object at a time), at most `FETCH_WINDOW` of
+    // them and about `FETCH_WINDOW_BYTES` (by the sizes tree entries
     // carry) ahead of the one sent next, framed in order and sent about a
     // MiB at a time as the caller takes it.
     let (tx, rx) = tokio::sync::mpsc::channel(4);
