@@ -40,6 +40,22 @@ pub struct WorkspaceState {
     /// Scope under which this workspace's line of work is cloaked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloak: Option<String>,
+    /// Random, made when the workspace is created: another workspace made
+    /// later under the same name (after `vl undo` of the first one's
+    /// creation, or `vl op restore`) has another. Device-local state kept
+    /// per workspace (its `ws exec` sandbox and layers) belongs to an id,
+    /// not a name (BUG-1031, BUG-1033). Absent on workspaces made before it
+    /// existed, and dropped by an older vl that rewrites the view (whose
+    /// sandbox then starts afresh).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+impl WorkspaceState {
+    /// A new workspace's state, with a fresh [`WorkspaceState::id`].
+    pub fn new(wc: ObjectId, cloak: Option<String>) -> WorkspaceState {
+        WorkspaceState { wc, cloak, id: Some(hex::encode(crate::crypto::random_bytes::<16>())) }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -713,6 +729,8 @@ fn merge_views_with(base: &View, sides: &[&View], first_wins: bool, descends: &m
         let vals: Vec<Option<&WorkspaceState>> = sides.iter().map(|s| s.workspaces.get(name)).collect();
         let Some((wc, lost)) = pick(b.map(|w| w.wc), vals.iter().map(|v| v.map(|w| w.wc)).collect(), first_wins) else { continue };
         let cloak = pick_cloak(b.map(|w| w.cloak.clone()), vals.iter().map(|v| v.map(|w| w.cloak.clone())).collect(), first_wins);
+        // The identity goes with the working copy that won.
+        let id = vals.iter().flatten().chain(b.iter()).find(|w| w.wc == wc).and_then(|w| w.id.clone());
         if !lost.is_empty() {
             out.warnings.push(format!(
                 "workspace '{name}' was moved by concurrent commands; kept {}, and the other working cop{} as visible change{}",
@@ -727,6 +745,7 @@ fn merge_views_with(base: &View, sides: &[&View], first_wins: bool, descends: &m
             WorkspaceState {
                 wc,
                 cloak: cloak.unwrap_or_default(),
+                id,
             },
         );
     }
