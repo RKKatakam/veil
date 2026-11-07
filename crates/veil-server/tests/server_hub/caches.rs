@@ -54,7 +54,7 @@ fn both(apis: &[&Api; 2], token: &str, project: &str) -> [bool; 2] {
 }
 
 /// Run `q` straight in the database, as an operator would. Its trigger
-/// bumps the one epoch clock, which other tests bump too: YugabyteDB may
+/// bumps an epoch row that concurrent changes may bump too: YugabyteDB may
 /// refuse it as a conflict (`40001`), and it runs again.
 fn sql(hub: &TestHub, q: &str) -> u64 {
     let h = hub.hub();
@@ -312,7 +312,7 @@ fn a_push_is_one_database_commit() {
 
 /// What a read grant needs from the permission cache (S5): a view comes
 /// with the epochs read before its rows were loaded (`perm::open_at`), so a
-/// grant made from it carries those, never a later clock. After a removal
+/// grant made from it carries those, never a later read. After a removal
 /// committed on one server, the other server's very next view is the new
 /// one, and comes with the removal's epoch; before it, with an older one.
 #[test]
@@ -350,5 +350,8 @@ fn a_view_carries_the_epochs_it_was_built_under() {
         .unwrap();
     let (_, v, after) = open();
     assert!(!v.groups.contains(&finance), "the very next view on the other server is the new one");
-    assert!(after.person >= bump && bump > before.person, "it carries the removal's epoch ({before:?} → {bump} → {after:?})");
+    assert_eq!(after.person, bump, "it carries the removal's epoch");
+    assert_ne!(bump, before.person, "the removal set a new epoch ({before:?} → {bump})");
+    // A random value, not a count (BUG-1081): nothing small or in sequence.
+    assert!(bump.unsigned_abs() > 1 << 20 && bump != before.person + 1, "epoch {bump} looks like a count");
 }

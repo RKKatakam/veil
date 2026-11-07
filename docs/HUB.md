@@ -1520,10 +1520,13 @@ database):
 **Access epochs: never stale, on any server.** `access_epochs` holds an
 epoch per person (`(0, person)`: their sessions, devices, admin rights,
 group memberships, device bars) and per project (`(project, 0)`: its
-accepted policy, bindings and groups): the value of one clock
-(`access_epoch_clock`) at the row's last bump, so epochs only grow. The
-table, the clock and the bump are shared with S5's read grants, which are
-void below their person's or project's epoch. **Triggers** on `group_members`,
+accepted policy, bindings and groups). **Each change sets its key's epoch
+to a fresh random value** (60 bits from `gen_random_uuid()`, never 0 and
+never the previous value), not a count: an epoch carried to a client shows
+neither how many changes happened nor when (BUG-1081). Only equality is
+compared. A bump writes only its own key's row; there is no server-wide
+row. S5's read grants use the same epochs (void unless equal to the
+current ones). **Triggers** on `group_members`,
 `project_admins`, `sessions`, `people`, `devices`, `device_bars`,
 `projects` and `groups` bump them in the transaction of the change itself,
 whatever route (or operator) makes it, so a route written later cannot
@@ -1532,20 +1535,21 @@ primary-key lookups (the session check reads them; it learns the project's
 id from the path), and a cached session or permission is used only if it
 was built under exactly those epochs. An entry is built by reading the
 epochs first and the records after, or both in one statement, so it is
-never tagged newer than what it holds.
+never tagged with an epoch set after what it holds was read.
 
 *What a read grant can rely on (S5):* (1) an entry records the epochs read
 before its rows, and `perm::open_at` returns them with the view, so a grant
-made from it carries those, never a later read of the clock; (2) an entry
+made from it carries those, never a later read of the epochs; (2) an entry
 is used only while its person's and project's epochs equal its recorded
 ones; (3) permission entries are per device (a bar is the device's);
 (4) nothing else that decides a view (policy text and bindings, groups,
 admin rows, devices, sessions) is cached outside such an entry
 (`a_view_carries_the_epochs_it_was_built_under`).
 
-*How staleness is bounded:* a change commits together with its epoch bump;
-any request that starts after the commit reads the new epoch, misses every
-entry built before it, and reads the database. So a cached decision is the
+*How staleness is bounded:* a change commits together with its new epoch;
+any request that starts after the commit reads it, misses every entry
+built under an earlier one (a random value repeats an earlier one with
+negligible odds: 2^-60 for each pair), and reads the database. So a cached decision is the
 one the database gives at the moment of the request: **staleness is zero**,
 for removals from a group, policy changes, deleted groups, admin rights,
 device bars and removals, and ended sessions (there is no sign-out route;

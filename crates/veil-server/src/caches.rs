@@ -14,7 +14,9 @@
 //!   two primary-key lookups) before it uses a cached session or permission,
 //!   and an entry is used only if it was built under exactly those epochs.
 //!   An entry is built by reading the epochs *first* and the records after
-//!   (or in the same statement), so it is never tagged newer than its data.
+//!   (or in the same statement), so it is never tagged with an epoch set
+//!   after its data was read. Epochs are random values, new at each change
+//!   (never a count): only equality is compared.
 //!   So a cached answer is the answer the database gives at the moment of
 //!   the request: **staleness is zero.** A change committed before a request
 //!   starts is seen by that request, on every server.
