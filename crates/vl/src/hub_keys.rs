@@ -1297,6 +1297,8 @@ pub fn remove_device(fingerprint: &str, server: Option<&str>) -> Result<()> {
 /// to `cloak rule`, creates and grants the rule rings, and revokes every
 /// non-admin from `team`. The next commit re-seals each secret.
 pub fn upgrade_rule_keys(ctx: &mut Ctx, dry_run: bool) -> Result<std::process::ExitCode> {
+    // Rewrites `.veilpolicy` in the directory (BUG-1125).
+    let _wc = ctx.lock_dir(None)?;
     let text = policy_text(ctx);
     // Already rewritten (also by a run that stopped before its keys were
     // moved, BUG-844): the keys are still brought up to date below.
