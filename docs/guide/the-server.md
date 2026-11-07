@@ -331,6 +331,25 @@ vl secret unshare billing/.env.stripe-test --from bob
 - **`vl secret unshare` stops later versions; it cannot take back what bob
   already received.** Rotate the secret if that matters.
 
+## Searching
+
+`vl search` asks the server, so it works the same in any clone and needs
+no checkout:
+
+```
+vl search handler                    # code at the tip of main, best matches first
+vl search parse config --lang rust   # every word must occur (any case)
+vl search -r feature-x handler       # another branch's tip
+vl search invoice --path             # file names, over all of the project's history
+vl search handler -- src/api         # only under src/api
+vl search handler --json             # the server's answer (veil.search/1)
+```
+
+You find only what you may see: a folder you cannot see is never found,
+counted or ranked, and a secret file (`.env`) is found by its name, never by
+what it holds. A branch just pushed takes a moment to be indexed; `vl
+search` waits for it.
+
 ## What someone without access sees
 
 Bob is not in `finance`. His clone of `acme` has `src/` only: no `billing/`,

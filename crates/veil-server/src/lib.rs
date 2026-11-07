@@ -27,6 +27,7 @@ pub mod error;
 pub mod grant;
 pub mod perm;
 pub mod query;
+pub mod search;
 pub mod shares;
 pub mod store;
 pub mod sync;

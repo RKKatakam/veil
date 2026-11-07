@@ -1622,3 +1622,7 @@ Security review (layer 3, tier A, Deep) of the S13 fixes (`t3/dd667ae9` @ `1ec85
 **Not filed:**
 * **Interaction with BUG-911's fix (the deriver pool, not landed).** `memo_tips` waits for a fill slot with no deadline (`derive/mod.rs:949`) inside the landing's task. If that fix holds a pool permit across `memo_tips`, four long fills (or BUG-1075's waits) would stall every project's derivation. Check it when both land.
 * **The order departs from `vl log`'s with skewed clocks** (documented in the phase-3 design, §3.3). The two orders are the same only where each snapshot is dated *strictly* after its parents: a child in the same millisecond as its parent gets the parent's generation + 1 and may tie with an unrelated snapshot, which the walk orders by id. Thin and full clones can then list such snapshots in different orders. Whether to accept this is the owner's call (phase-3 design §2: "`vl log` … work the same in a thin clone as in a full one").
+
+## Findings from S15 (search, 2026-11-07)
+
+None open. Departures and limits are in `docs/design/server/phase-3-server-history.md` §12 (unreferenced segments wait for S29's garbage collection; descriptions are not searched; path search over 11,111 matching names takes 24 ms at p99 against the 20 ms target).
