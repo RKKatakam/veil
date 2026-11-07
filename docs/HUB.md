@@ -2194,7 +2194,7 @@ by whoever saw it (inside TLS: a cache, which is inside the boundary); it
 returns the same objects. Grants are made per branch at every tips request
 (one signature each). Not built (later milestones): `POST …/grants` for
 older snapshots, caches, `vl` reading through these routes (S3, S6).
-### 13.18 S3: thin clones, fetch on demand (as built)
+### 13.21 S3: thin clones, fetch on demand (as built)
 
 Milestone S3 of `docs/design/server/phase-2-thin-clients.md` (§4.2, §5.4,
 §9): the client half of `docs/design/scale/6-partial-clone.md`, re-aimed
@@ -2228,45 +2228,70 @@ at the server, with **no full graph**. Code: `veil-core/src/promisor.rs`
   local commit is asked for at the same path under the remote's tips.
   * the server's 404 ("no such object at that path that you can see") is
     `VeilError::Missing`, a real redaction;
-  * a server that cannot be reached, any other answer, or a command with no
-    connection is the new `VeilError::Unavailable`, which is not
+  * a server that cannot be reached, any other answer, a command with no
+    connection, or a tree or file whose place this process did not record
+    (BUG-1142) is the new `VeilError::Unavailable`, which is not
     `is_unreadable()`: every site that leaves a hidden object out fails
     instead. Its message names the server and the path, never an id.
-* **No full graph.** Snapshots are never fetched by the read path: the
-  history index computes a generation from all ancestors, so a snapshot
-  fetched on a miss would make the first graph query fetch the whole
-  history one request at a time. A snapshot the clone lacks is beyond its
-  boundary: `Missing`, as for any replica, and recorded.
-  `Repo::is_ancestor`, `merge_bases`, `common_ancestor`, revision
-  resolution and `vl log` run through `Repo::exact`: when the walk reached
-  the boundary, the next page of history (2,000 snapshots, `Repo::deepen`)
-  is fetched into the main store and the query runs again, until the walk
-  stays inside or the server has no more. Without the server: `Unavailable`.
+  * **Where `Missing` comes from**, audited by
+    `thin::every_producer_of_missing_is_audited`: the server's refusal at a
+    place under a snapshot on the server; a snapshot beyond the boundary
+    (a read asked for a snapshot); "not held" while fetching is off (gc,
+    fsck, maintenance, which classify it).
+  * An object met under a local commit is asked for at the same path under
+    the commit's nearest ancestors on the server, then the remote's tips
+    (BUG-1144).
+  * **The locator** records every tree met (a place is the chain of trees
+    above an object) and the files no pack holds, at most 2,000,000 places
+    (about 90 MiB, under the 512 MiB client gate); past it, a read of what
+    is not held is `Unavailable`.
+* **No full graph.** A snapshot the clone lacks is beyond its boundary.
+  **Every snapshot read (`Repo::snapshot`, `snapshot_opt`) fetches a page of
+  history there** (2,000 snapshots, `Repo::deepen`, into the main store), so
+  `vl show`, `blame`, evolog, bisect, search and the rewrite bookkeeping
+  read history as a full clone does (BUG-1141); a snapshot the server's
+  history for this person lacks is `None`, asked once. Without the server:
+  `Unavailable`. **The history index alone reads only what is held**
+  (`Repo::snapshot_held`): a generation needs every ancestor, so fetching
+  there would make the first graph query fetch the whole history. The
+  queries that walk the index (`is_ancestor`, `merge_bases`,
+  `common_ancestor`, revision resolution, `vl log`) run through
+  `Repo::exact`, which pages history in where the walk reached the boundary
+  and runs them again. The reads that skip the boundary on purpose are
+  audited by `thin::every_snapshot_read_that_does_not_fetch_is_audited`.
   A later pull fetches the new snapshots down to what it has, a page at
   most, and the content of the checked-out branch's tip only.
 * **Checkout fetches ahead.** Before a thin clone's working copy moves
   (`move_working_copy`), the trees and files that differ are fetched a
-  level at a time, 1,000 per request (`ObjectStore::prefetch_diff`), so a
-  lost server fails the move before it writes anything, even its journal.
+  level at a time, in batches of at most 1,000 objects and about 8 MiB by
+  the sizes tree entries carry (`ObjectStore::prefetch_diff`), so a lost
+  server or a full cache fails the move before it writes anything, even its
+  journal. `vl new REV` and `vl edit REV` fetch ahead before they record the
+  move, so a failed one leaves nothing for the next command to retry.
 * **The cache's bound** (default 4 GiB, `--cache-size`, `vl partial
   limit`): when a fetch would pass it, the cache is evicted down to 80 %,
   least recently written first. **Pinned, never evicted:** the trees of
   every workspace's working-copy snapshot and of the checkout record (and
   of an unfinished move's target). A pack holding pinned objects is
   rewritten with them before it is removed, so a reader whose pack
-  vanished finds them again. When what is pinned alone passes the bound,
+  vanished finds them again. The bytes of a batch not yet on disk count in
+  the bound with what is (BUG-1145). When what is pinned alone passes the bound,
   the fetch fails with a clear error (never an eviction loop); a clone
   whose checkout passes it is refused. Snapshots and local work are in the
   main store; the op log's views name snapshots, all of which are there.
-* **gc, fsck and maintenance never fetch.** In a thin clone gc's mark stops
-  at what is on the server (nothing local sits only below it: local
-  objects are referenced from local trees only); `fsck` reports what it
-  has not fetched as notes.
+* **gc, fsck and maintenance never fetch.** A gap they meet is classified
+  (`ObjectStore::classify_gap`, BUG-1143): **the server's** when its
+  snapshot is in the remotes' history (from every operation's remote tags),
+  or when a parent, down to one there, names the same object at the same
+  path (fsck: a note, "not fetched"; gc: its mark skips it); **lost** when
+  only this clone's own snapshots name it (fsck: corrupt; gc: incomplete,
+  so nothing is deleted, as in a full clone); **unknown** when the trees
+  that would tell are not held (fsck: a warning; gc: incomplete).
 * **`vl partial full`** fetches every snapshot and object into the main
   store, copies what only local commits reach from the cache (or the
   server), rewrites `repo.json` at format 8 without the marker (the commit
   point), then removes the cache.
-* **Server:** `POST …/history` takes `limit` (revision 3): every tip, then
+* **Server:** `POST …/history` takes `limit` (revision 4; 3 is S5's read grants, BUG-1140): every tip, then
   their ancestors, those of the newest children first, at most `limit` in
   all. Without `limit`, the whole history as before.
 
@@ -2302,25 +2327,26 @@ at the server, with **no full graph**. Code: `veil-core/src/promisor.rs`
 
 | # | Threat | As built | Test |
 |---|---|---|---|
-| 1 | an unfetched object read as hidden | `Missing` only from the server's own refusal at a place under a snapshot on the server; else `Unavailable` (not `is_unreadable`); every `Missing`/`is_unreadable` site in `veil-core` is listed in an audit table | `core_sync` `thin::an_unreachable_server_is_unavailable_never_hidden`, `a_command_without_a_connection_fails_instead_of_hiding`, `every_site_that_reads_missing_as_hidden_is_audited` |
+| 1 | an unfetched object read as hidden | `Missing` only from the server's own refusal at a place under a snapshot on the server, or a snapshot beyond the boundary; a tree or file without a recorded place is `Unavailable` (BUG-1142); every site that reads, and every site that makes, a `Missing` in `veil-core` is listed in an audit table | `core_sync` `thin::an_unreachable_server_is_unavailable_never_hidden`, `a_command_without_a_connection_fails_instead_of_hiding`, `s3r_an_object_without_a_recorded_place_is_never_hidden`, `every_site_that_reads_missing_as_hidden_is_audited`, `every_producer_of_missing_is_audited` |
 | 2 | the server sends what the person may not see | the client asks only for ids met in trees the server gave it, at that path; the server checks each (S1) | `server_hub` `thin::a_thin_clone_receives_nothing_its_person_may_not_see` (dev and anyone, every revision shown, then `vl partial full`; cache packs scanned decoded) |
 | 4 | a tampered or wrong object | re-hashed (BLAKE3), decoded, checked storable before use; a snapshot where a tree entry was asked is refused | `thin::a_tampered_object_is_refused_and_never_cached` |
-| 5 | gc in a thin clone | never fetches; the mark stops at what is on the server | `thin::gc_in_a_thin_clone_never_fetches_and_keeps_local_work` |
+| 5 | gc and fsck in a thin clone | never fetch; a gap of the server's history is skipped (a note), one only local snapshots name is lost work (corrupt; gc deletes nothing) (BUG-1143) | `thin::gc_in_a_thin_clone_never_fetches_and_keeps_local_work`, `s3r_fsck_in_a_thin_clone_reports_lost_local_work` |
 | 6 | eviction of local work | local writes go to the main store, even when cached; only the cache is evicted | `thin::local_work_is_never_in_the_cache_and_survives_eviction` |
 | 7 | the server prunes what we relied on | not reachable yet: the server has no gc (anchors.json deferred to S29) | — |
 | 8 | eviction racing readers | pinned objects rewritten before a pack goes; a vanished copy is fetched again | `thin::eviction_keeps_the_bound_and_the_pins` |
 | 9 | push from a thin clone leaves the receiver incomplete | the push sends what differs from the parents (S1's `Introduced`); the server checks closure | `server_hub` `thin::a_thin_clone_holds_the_tips_…` (push, then a full clone pulls, checks out and passes `fsck`) |
-| 11 | fetch storms, a thrashing cache | stops at the bound with an error; a too-large checkout is refused at clone | `thin::a_full_cache_fails_cleanly`, `server_hub` `thin::the_cache_stays_under_its_bound` |
+| 11 | fetch storms, a thrashing cache | stops at the bound with an error, bytes in flight counted (BUG-1145); a too-large checkout is refused at clone, a too-large move before it is recorded | `thin::a_full_cache_fails_cleanly`, `server_hub` `thin::the_cache_stays_under_its_bound`, `s3r_a_checkout_past_the_cache_bound_fails_before_writing` |
 | 12 | the server is unreachable | fails before writing anything (the checkout fetches ahead, before its journal); local work goes on | `server_hub` `thin::a_lost_server_is_a_clear_error_never_a_hidden_file` |
 | 14 | format and older vl | format 9 with its marker, refused by number; either without the other refused | `thin::the_partial_marker_needs_format_9_and_back`, `format_compat` |
-| — | no full graph | snapshots never fetched on a miss; ancestry and log page through `history`; without the server, `Unavailable` | `thin::ancestry_beyond_the_boundary_asks_the_server`, `server_hub` `thin::history_answers_pages` |
+| — | no full graph, yet history read as a full clone reads it | snapshot reads fetch history pages at the boundary, the history index never does; ancestry and log page through `history`; without the server, `Unavailable` (BUG-1141); pages are revision 4 (BUG-1140) | `thin::ancestry_beyond_the_boundary_asks_the_server`, `every_snapshot_read_that_does_not_fetch_is_audited`, `s3r_each_protocol_revision_announces_one_thing`, `server_hub` `thin::history_answers_pages`, `s3r_show_of_a_snapshot_whose_parent_is_beyond_the_boundary`, `s3r_show_of_a_merge_whose_other_parent_is_beyond_the_boundary`, `s3r_blame_in_a_thin_clone_is_the_full_clones` |
+| — | a local commit's object after the server moved on | asked under the commit's nearest ancestors on the server (BUG-1144) | `thin::s3r_a_local_commits_unchanged_directory_is_found_after_the_server_moved_on` |
 
 #### Reverting
 
 Revert the merge commit. Thin clones made meanwhile are format 9, which
 the reverted vl refuses by number (nothing is misread): run `vl partial
 full` in each before reverting, or clone again. The server change (the
-`limit` of `history`, revision 3) is additive: an older client never sends
+`limit` of `history`, revision 4) is additive: an older client never sends
 it.
 
 #### Not built in S3 (and why)
@@ -2336,6 +2362,7 @@ it.
   daemon (S6).
 * `fsck` in a thin clone does not ask the server whether an unfetched
   object exists there: it is a note.
-* Walks other than those above (embargo checks, revsets' `::x`, gc,
-  change-id shadowing on pull) take the boundary for the end of the graph.
-  The server decides embargoes and closure itself (§13.5).
+* The reads that keep to what is held (the history index, gc, maintenance,
+  push's walk of what the server has) take the boundary for the end of the
+  graph, on purpose; every other snapshot read fetches history there. The
+  server decides embargoes and closure itself (§13.5).

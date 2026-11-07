@@ -412,6 +412,20 @@ impl Ctx {
         Ok(self.repo.workspace_wc(&self.ws)?)
     }
 
+    /// A thin clone, before a command records that the working copy moves
+    /// to `target`: fetch what the move will read (BUG-1145), so that a
+    /// cache too small or a lost server fails the command before it records
+    /// anything (the move itself would otherwise be retried by every later
+    /// command). Nothing in any other repository.
+    pub fn fetch_ahead(&self, target: &ObjectId) -> Result<()> {
+        if !self.repo.is_partial() || self.bare {
+            return Ok(());
+        }
+        let from = self.repo.snapshot(&self.checkout.snapshot)?.tree;
+        let to = self.repo.snapshot(target)?.tree;
+        Ok(self.repo.store().prefetch_diff(Some(&from), &to)?)
+    }
+
     pub fn rev(&self, spec: &str) -> Result<ObjectId> {
         // A thin clone: a full snapshot id it does not hold is asked of the
         // server, and a walk that reaches beyond what it holds goes on
@@ -423,12 +437,9 @@ impl Ctx {
                 }
             }
         }
-        let id = self.repo.exact(|r| revset::resolve(r, spec, &self.ws))?;
-        // `main-` names a parent the clone may not hold yet.
-        if self.repo.is_partial() && !self.repo.store().has(&id) {
-            self.repo.deepen(&[id], 1)?;
-        }
-        Ok(id)
+        // (`main-` names a parent the clone may not hold yet: reading it
+        // fetches it, `Repo::snapshot_opt`.)
+        Ok(self.repo.exact(|r| revset::resolve(r, spec, &self.ws))?)
     }
 
     /// Record the project directory into the attached workspace.

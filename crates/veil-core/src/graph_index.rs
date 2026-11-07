@@ -854,7 +854,7 @@ struct Walker<'a> {
 
 impl Walker<'_> {
     fn snapshot(&mut self, id: &ObjectId) -> Result<Option<Arc<Snapshot>>> {
-        self.repo.snapshot_opt(id)
+        self.repo.snapshot_held(id)
     }
 
     /// The entry of `id`, computing it (and every unindexed ancestor) from
@@ -874,7 +874,7 @@ impl Walker<'_> {
                 if pending.contains_key(&x) {
                     continue;
                 }
-                let Some(s) = self.repo.snapshot_opt(&x)? else { continue };
+                let Some(s) = self.repo.snapshot_held(&x)? else { continue };
                 stack.push((x, true));
                 for p in &s.parents {
                     if self.st.get(p).is_none() && !pending.contains_key(p) {

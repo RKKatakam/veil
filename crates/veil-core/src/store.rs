@@ -1005,9 +1005,16 @@ impl ObjectStore {
     /// process for those; blobs are hashed on every read (BLAKE3, typically
     /// well above 1 GiB/s, so small next to the I/O and decryption).
     pub(crate) fn read_raw(&self, id: &ObjectId) -> Result<Vec<u8>> {
+        self.read_raw_as(id, false)
+    }
+
+    /// [`ObjectStore::read_raw`]; `snapshot`: the reader asks for a
+    /// snapshot (a thin clone answers one it lacks as beyond its boundary,
+    /// and anything else it cannot place as `Unavailable`).
+    fn read_raw_as(&self, id: &ObjectId, snapshot: bool) -> Result<Vec<u8>> {
         match self.read_main(id) {
             // A thin clone: the cache area, then the server (`promisor`).
-            Err(VeilError::Missing(_)) if self.partial.get().is_some() => self.read_partial(id),
+            Err(VeilError::Missing(_)) if self.partial.get().is_some() => self.read_partial(id, snapshot),
             r => r,
         }
     }
@@ -1282,7 +1289,12 @@ impl ObjectStore {
 
     /// Decode without decrypting.
     pub fn get(&self, id: &ObjectId) -> Result<Object> {
-        let obj = Object::decode(&self.get_raw(id)?)?;
+        self.get_as(id, false)
+    }
+
+    fn get_as(&self, id: &ObjectId, snapshot: bool) -> Result<Object> {
+        self.freshen(id);
+        let obj = Object::decode(&self.read_raw_as(id, snapshot)?)?;
         if self.partial.get().is_some() {
             self.note_decoded(id, &obj);
         }
@@ -1385,7 +1397,7 @@ impl ObjectStore {
         if let Some(s) = self.snapshots.get(id) {
             return Ok(s);
         }
-        let s = match self.get(id)? {
+        let s = match self.get_as(id, true)? {
             Object::Snapshot(s) => Arc::new(s),
             o => {
                 return Err(VeilError::Corrupt(

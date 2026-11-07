@@ -1,4 +1,4 @@
-//! Thin clones of server projects (milestone S3, `docs/HUB.md` §13.18):
+//! Thin clones of server projects (milestone S3, `docs/HUB.md` §13.21):
 //! the connection the engine fetches through ([`HubPromisor`]), and
 //! `vl partial`.
 //!

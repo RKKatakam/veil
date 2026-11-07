@@ -127,7 +127,7 @@ pub struct HistoryRequest {
     /// Snapshots the caller already has: the walk stops there.
     #[serde(default)]
     pub stop: Vec<ObjectId>,
-    /// One page (revision 3): every tip, then their ancestors newest first
+    /// One page (revision 4): every tip, then their ancestors newest first
     /// (by timestamp, then id), at most this many snapshots in all. A thin
     /// clone takes its tips with it, and the history it reaches later page
     /// by page. Without it, the whole history down to `stop`.

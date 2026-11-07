@@ -47,7 +47,7 @@ pub enum VeilError {
     /// A thin clone needed an object or a page of history from the Veil
     /// server and could not get it: the server could not be reached, timed
     /// out or failed, or this command has no connection to it
-    /// (`docs/HUB.md` §13.18). **Never a redaction:** unlike
+    /// (`docs/HUB.md` §13.21). **Never a redaction:** unlike
     /// [`VeilError::Missing`] it is not [`VeilError::is_unreadable`], so
     /// every caller that would leave a hidden object out fails instead,
     /// before writing anything. The message names no object id.

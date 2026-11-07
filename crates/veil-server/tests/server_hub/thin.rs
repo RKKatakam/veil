@@ -1,4 +1,4 @@
-//! S3: thin clones against the real server (`docs/HUB.md` §13.18). `vl
+//! S3: thin clones against the real server (`docs/HUB.md` §13.21). `vl
 //! clone` is thin by default: the branch tips and what it checks out; the
 //! rest is fetched when read, through S1's `fetch` and the `history` pages.
 
@@ -244,7 +244,7 @@ fn history_answers_pages() {
     let api = hub.api();
     let token = admin.token();
     let tips = api.tips(Some(&token), &name).unwrap();
-    assert!(tips.revision >= 3);
+    assert!(tips.revision >= 4, "history pages are revision 4 (BUG-1140)");
     let tip = tips.branches["main"];
     let one = api.post_json(Some(&token), &format!("/v1/projects/{name}/history"), &serde_json::json!({"tips": [tip], "limit": 1}));
     let frames = one.frames();
@@ -302,7 +302,6 @@ fn partial_full_keeps_what_a_rebuilt_tree_reaches() {
 /// hold yet as a full clone does (the diff against that parent), not with
 /// an error or a diff against nothing.
 #[test]
-#[ignore = "BUG-1141: `vl show` reads the parent beyond a thin clone's boundary outside `Repo::exact` and fails"]
 fn s3r_show_of_a_snapshot_whose_parent_is_beyond_the_boundary() {
     let hub = TestHub::start();
     let (admin, _dir, name) = project_with_history(&hub, 4, 100);
@@ -321,7 +320,6 @@ fn s3r_show_of_a_snapshot_whose_parent_is_beyond_the_boundary() {
 /// `vl blame` in a thin clone attributes each line as in a full clone: the
 /// history it walks is paged in from the server, never cut at the boundary.
 #[test]
-#[ignore = "BUG-1141: `vl blame` in a thin clone stops at the boundary and gives every line to the tip"]
 fn s3r_blame_in_a_thin_clone_is_the_full_clones() {
     let hub = TestHub::start();
     let admin = hub.person("admin");
@@ -350,7 +348,6 @@ fn s3r_blame_in_a_thin_clone_is_the_full_clones() {
 /// diffs it against both parents, as a full clone does, instead of taking
 /// that parent for a withheld one that contributes nothing.
 #[test]
-#[ignore = "BUG-1141: a merge's parent beyond a thin clone's boundary is taken for a withheld one: a wrong diff"]
 fn s3r_show_of_a_merge_whose_other_parent_is_beyond_the_boundary() {
     let hub = TestHub::start();
     let admin = hub.person("admin");
@@ -395,7 +392,6 @@ fn s3r_show_of_a_merge_whose_other_parent_is_beyond_the_boundary() {
 /// object before its batch is on disk, and the eviction it triggers counts
 /// only what is on disk).
 #[test]
-#[ignore = "BUG-1145: a checkout's fetch-ahead is not charged against the cache bound until its batch is written"]
 fn s3r_a_checkout_past_the_cache_bound_fails_before_writing() {
     let hub = TestHub::start();
     let (admin, dir, name) = project_with_history(&hub, 0, 0);

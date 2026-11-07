@@ -759,6 +759,11 @@ impl Client {
 
 // ---- pull ---------------------------------------------------------------------------------
 
+/// The server revision from which `history` answers pages
+/// (`HistoryRequest::limit`), which thin clones need (BUG-1140: revision 3
+/// is S5's read grants).
+pub const HISTORY_PAGES: u32 = 4;
+
 /// The branch a clone checks out (`hub_cmd::clone`): `main`, `trunk` or
 /// `master`, else the first by name.
 pub fn checkout_branch(tips: &Tips) -> Option<String> {
@@ -796,7 +801,7 @@ pub fn pull_with(repo: &mut Repo, remote: &str, client: &Client, only: Option<&s
     // content of the branch it checks out only; the rest is fetched when
     // read.
     let thin = repo.is_partial() && !widen;
-    if thin && tips.revision < 3 {
+    if thin && tips.revision < HISTORY_PAGES {
         bail!(
             "the server at {} is older than this vl and cannot serve a thin clone; `vl partial full` makes this a full clone",
             client.url.authority

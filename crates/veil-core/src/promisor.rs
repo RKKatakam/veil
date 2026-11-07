@@ -1,4 +1,4 @@
-//! Fetch on demand for a thin clone (milestone S3, `docs/HUB.md` §13.18;
+//! Fetch on demand for a thin clone (milestone S3, `docs/HUB.md` §13.21;
 //! the client design of `docs/design/scale/6-partial-clone.md` as amended by
 //! `docs/design/server/phase-2-thin-clients.md` §4.2).
 //!
@@ -64,13 +64,21 @@ pub const CACHE_DIR: &str = ".veil/cache";
 /// the boundary.
 pub const HISTORY_PAGE: usize = 2_000;
 
-/// Objects per request when a checkout fetches ahead.
+/// Objects per request when a checkout fetches ahead, and about the most
+/// bytes (by the sizes tree entries carry).
 const PREFETCH_BATCH: usize = 1_000;
+const PREFETCH_BYTES: u64 = 8 << 20;
 
-/// Most locations one process records (about 45 bytes each). Past it,
-/// objects met later have no location and their reads fail with
-/// [`VeilError::Unavailable`], never as hidden.
-const LOCATOR_CAP: usize = 8_000_000;
+/// Most locations one process records (about 46 bytes each: at most about
+/// 90 MiB). Every tree met is recorded (a location is the chain of trees
+/// above an object); a file is not when a pack of either area already holds
+/// it. Past the bound, objects met later have no location, and reading one
+/// that is not held fails with [`VeilError::Unavailable`], never as hidden.
+const LOCATOR_CAP: usize = 2_000_000;
+
+/// Nearest ancestors on the server an object met under a local commit is
+/// asked for under.
+const SERVER_ANCESTORS: usize = 8;
 
 /// Entry index of a root tree (its parent is a snapshot).
 const ROOT: u32 = u32::MAX;
@@ -150,10 +158,16 @@ pub(crate) struct Partial {
     /// Snapshots whose trees are pinned: each workspace's working copy
     /// (set by the repository from its view).
     anchors: RwLock<Vec<ObjectId>>,
-    /// Snapshots found to be on the server (memo of `on_server`).
+    /// Snapshots found to be on the server (memo of `on_server`), and
+    /// whether that set is whole for the snapshots held now.
     server: Mutex<HashSet<ObjectId>>,
+    server_walked: std::sync::atomic::AtomicBool,
     /// Objects fetched on demand by this process.
     fetched: AtomicU64,
+    /// Bytes fetched into a batch not yet on disk: counted in the bound.
+    in_flight: AtomicU64,
+    /// Snapshots the server has no page of history for (no further asks).
+    refused: Mutex<HashSet<ObjectId>>,
 }
 
 thread_local! {
@@ -205,7 +219,10 @@ impl ObjectStore {
             bytes: Mutex::new(None),
             anchors: RwLock::new(Vec::new()),
             server: Mutex::new(HashSet::new()),
+            server_walked: std::sync::atomic::AtomicBool::new(false),
             fetched: AtomicU64::new(0),
+            in_flight: AtomicU64::new(0),
+            refused: Mutex::new(HashSet::new()),
         }));
     }
 
@@ -224,6 +241,7 @@ impl ObjectStore {
     pub fn set_promisor(&self, promisor: Arc<dyn Promisor>) {
         if let Some(p) = self.partial.get() {
             *p.promisor.write().unwrap_or_else(|e| e.into_inner()) = Some(promisor);
+            self.forget_server_walk();
         }
     }
 
@@ -275,6 +293,23 @@ impl ObjectStore {
         p.no_fetch.load(Ordering::SeqCst) == 0 && NO_FETCH.with(|c| c.get() == 0)
     }
 
+    /// May a read of this thin clone's store fetch now (not in gc, fsck,
+    /// maintenance or an eviction's walk)? `false` for any other store.
+    pub fn may_fetch(&self) -> bool {
+        self.partial.get().is_some_and(|p| self.fetching(p))
+    }
+
+    /// Has the server said it has no history for snapshot `id` (so a read
+    /// of it is not asked again)? Records the answer with `refused`.
+    pub(crate) fn history_refused(&self, id: &ObjectId, refused: bool) -> bool {
+        let Some(p) = self.partial.get() else { return false };
+        let mut r = p.refused.lock().unwrap_or_else(|e| e.into_inner());
+        if refused {
+            r.insert(*id);
+        }
+        r.contains(id)
+    }
+
     /// The snapshots reads missed since the last call: the boundary a graph
     /// walk reached ([`crate::Repo::exact`]).
     pub fn take_boundary_hits(&self) -> Vec<ObjectId> {
@@ -295,10 +330,18 @@ impl ObjectStore {
     /// Record where the objects `obj` names were met (thin clones only).
     pub(crate) fn note_decoded(&self, id: &ObjectId, obj: &Object) {
         let Some(p) = self.partial.get() else { return };
+        if let Object::Tree(_) = obj {
+            let _ = (self.ensure_packs(), p.cache.ensure_packs());
+        }
         let mut l = p.locator.lock().unwrap_or_else(|e| e.into_inner());
         match obj {
             Object::Tree(t) => {
                 for (i, e) in t.entries.iter().enumerate() {
+                    // A file a pack holds needs no place; a tree always
+                    // does (it is on the way to what is below it).
+                    if e.kind != EntryKind::Dir && (self.in_loaded_packs(&e.id) || p.cache.in_loaded_packs(&e.id)) {
+                        continue;
+                    }
                     l.note(e.id, *id, i as u32);
                 }
             }
@@ -345,6 +388,10 @@ impl ObjectStore {
         if p.server.lock().unwrap_or_else(|e| e.into_inner()).contains(s) {
             return true;
         }
+        // Walked since the last snapshots arrived: the set is whole.
+        if p.server_walked.load(Ordering::SeqCst) {
+            return false;
+        }
         let mut seen = HashSet::new();
         let mut stack = promisor.server_tips();
         let mut found = false;
@@ -361,7 +408,43 @@ impl ObjectStore {
         // for the queries that are running.
         let _ = self.take_boundary_hits_of(&seen);
         p.server.lock().unwrap_or_else(|e| e.into_inner()).extend(seen);
+        p.server_walked.store(true, Ordering::SeqCst);
         found
+    }
+
+    /// Snapshots arrived (history pages, a pull): `on_server` walks again.
+    pub fn forget_server_walk(&self) {
+        if let Some(p) = self.partial.get() {
+            p.server_walked.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// The nearest ancestors of local snapshot `s` (this clone's own
+    /// commits) that are on the server, from what this clone holds.
+    fn server_ancestors(&self, p: &Partial, promisor: &dyn Promisor, s: &ObjectId) -> Vec<ObjectId> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let mut queue = std::collections::VecDeque::from([*s]);
+        while let Some(x) = queue.pop_front() {
+            if out.len() >= SERVER_ANCESTORS || !seen.insert(x) || seen.len() > 10_000 {
+                break;
+            }
+            let Ok(snap) = self.snapshot(&x) else { continue };
+            for parent in &snap.parents {
+                if self.on_server(p, promisor, parent) {
+                    out.push(*parent);
+                } else {
+                    queue.push_back(*parent);
+                }
+            }
+        }
+        self.take_boundary_hits_of(&seen);
+        out
+    }
+
+    /// Forget the boundary hit of `id` (fetched where it was read).
+    pub(crate) fn take_boundary_hits_of_one(&self, id: &ObjectId) -> usize {
+        self.take_boundary_hits_of(&HashSet::from([*id]))
     }
 
     fn take_boundary_hits_of(&self, ids: &HashSet<ObjectId>) -> usize {
@@ -373,7 +456,15 @@ impl ObjectStore {
     }
 
     /// A read neither area of a thin clone's store could answer.
-    pub(crate) fn read_partial(&self, id: &ObjectId) -> Result<Vec<u8>> {
+    /// `snapshot`: the reader asked for a snapshot.
+    ///
+    /// **Where `Missing` comes from** (BUG-1142): only (1) the server's own
+    /// answer that it has nothing at the object's place that this person may
+    /// see, under a snapshot that is on the server, and (2) a snapshot this
+    /// clone does not hold (its boundary, recorded for [`crate::Repo::exact`];
+    /// [`crate::Repo::snapshot_opt`] fetches history there). A tree or file
+    /// whose place this process does not know is `Unavailable`.
+    pub(crate) fn read_partial(&self, id: &ObjectId, snapshot: bool) -> Result<Vec<u8>> {
         let p = self.partial.get().expect("a thin clone's store");
         match p.cache.read_raw(id) {
             Ok(raw) => return Ok(raw),
@@ -389,11 +480,18 @@ impl ObjectStore {
         if !self.fetching(p) {
             return Err(VeilError::Missing(*id));
         }
+        let wanted_snapshot = snapshot;
         let Some((snapshot, path)) = self.locate(p, id)? else {
-            // Not met in any tree: a snapshot beyond the boundary (or an id
-            // named some other way). Recorded for `Repo::exact`.
-            p.hits.lock().unwrap_or_else(|e| e.into_inner()).insert(*id);
-            return Err(VeilError::Missing(*id));
+            if wanted_snapshot {
+                // A snapshot beyond the boundary: recorded for `Repo::exact`.
+                p.hits.lock().unwrap_or_else(|e| e.into_inner()).insert(*id);
+                return Err(VeilError::Missing(*id));
+            }
+            // Never hidden for want of a place: the server may well serve it.
+            return Err(VeilError::Unavailable(
+                "an object this thin clone has not fetched, met where this command did not record its place; run the command again"
+                    .into(),
+            ));
         };
         let shown = if path.is_empty() { "/".to_string() } else { path.clone() };
         let Some(promisor) = self.promisor() else {
@@ -402,13 +500,17 @@ impl ObjectStore {
             )));
         };
         let mut got = promisor.fetch(&[Located { id: *id, snapshot, path: path.clone() }])?.pop().flatten();
-        if got.is_none() {
-            // Met under a snapshot the server may not have (a local
-            // commit): ask at the same path under the server's tips.
+        if got.is_none() && !self.on_server(p, &*promisor, &snapshot) {
+            // Met under a snapshot the server does not have (a local
+            // commit): ask at the same path under its nearest ancestors on
+            // the server (BUG-1144), then under the server's tips.
+            let mut places = self.server_ancestors(p, &*promisor, &snapshot);
             for t in promisor.server_tips() {
-                if t == snapshot {
-                    continue;
+                if !places.contains(&t) {
+                    places.push(t);
                 }
+            }
+            for t in places {
                 got = promisor.fetch(&[Located { id: *id, snapshot: t, path: path.clone() }])?.pop().flatten();
                 if got.is_some() {
                     break;
@@ -442,7 +544,7 @@ impl ObjectStore {
         }
         let mut level: Vec<(Option<ObjectId>, ObjectId)> = vec![(from.copied(), *to)];
         while !level.is_empty() {
-            self.ensure_held(p, level.iter().map(|(_, t)| *t).collect())?;
+            self.ensure_held(p, level.iter().map(|(_, t)| (*t, 0)).collect())?;
             let mut next = Vec::new();
             let mut files = Vec::new();
             for (f, t) in level {
@@ -463,16 +565,16 @@ impl ObjectStore {
                     }
                     match e.kind {
                         EntryKind::Dir => next.push((old.filter(|o| o.kind == EntryKind::Dir).map(|o| o.id), e.id)),
-                        _ => files.push(e.id),
+                        _ => files.push((e.id, e.size)),
                     }
                 }
             }
             self.ensure_held(p, files.clone())?;
             // A conflict's terms are read too.
             let mut terms = Vec::new();
-            for id in files {
+            for (id, _) in files {
                 if let Ok(Object::Conflict(c)) = self.get(&id) {
-                    terms.extend(c.referenced_ids());
+                    terms.extend(c.referenced_ids().into_iter().map(|t| (t, 0)));
                 }
             }
             self.ensure_held(p, terms)?;
@@ -484,11 +586,12 @@ impl ObjectStore {
     /// Fetch those of `ids` neither area holds, in batches of their
     /// locations; one the server refuses is left for its reader (who finds
     /// it hidden), one without a location is read the ordinary way.
-    fn ensure_held(&self, p: &Partial, ids: Vec<ObjectId>) -> Result<()> {
+    /// `ids` with the sizes tree entries give them (0 where unknown).
+    fn ensure_held(&self, p: &Partial, ids: Vec<(ObjectId, u64)>) -> Result<()> {
         let _ = (self.ensure_packs(), p.cache.ensure_packs());
-        let missing: Vec<ObjectId> = ids
+        let missing: Vec<(ObjectId, u64)> = ids
             .into_iter()
-            .filter(|id| !(self.in_loaded_packs(id) || p.cache.in_loaded_packs(id) || self.has(id)))
+            .filter(|(id, _)| !(self.in_loaded_packs(id) || p.cache.in_loaded_packs(id) || self.has(id)))
             .collect();
         if missing.is_empty() {
             return Ok(());
@@ -499,24 +602,43 @@ impl ObjectStore {
             ));
         };
         let mut wants = Vec::new();
-        for id in missing {
+        for (id, size) in missing {
             match self.locate(p, &id)? {
-                Some((snapshot, path)) => wants.push(Located { id, snapshot, path }),
-                None => match self.read_raw(&id) {
-                    Ok(_) | Err(VeilError::Missing(_)) => {}
-                    Err(e) => return Err(e),
-                },
+                Some((snapshot, path)) => wants.push((Located { id, snapshot, path }, size)),
+                // Read the ordinary way: `Unavailable` (never hidden).
+                None => {
+                    self.read_raw(&id)?;
+                }
             }
         }
-        wants.sort_by_key(|w| w.snapshot);
-        for batch in wants.chunks(PREFETCH_BATCH) {
+        wants.sort_by_key(|(w, _)| w.snapshot);
+        // Batches of at most PREFETCH_BATCH objects and about
+        // PREFETCH_BYTES (BUG-1145: a batch is held in memory and counted
+        // in the bound until its pack is on disk).
+        let mut batches: Vec<(Vec<Located>, u64)> = Vec::new();
+        for (w, size) in wants {
+            match batches.last_mut() {
+                Some((b, bytes)) if b.len() < PREFETCH_BATCH && (b.is_empty() || *bytes + size <= PREFETCH_BYTES) => {
+                    b.push(w);
+                    *bytes += size;
+                }
+                _ => batches.push((vec![w], size)),
+            }
+        }
+        for (batch, bytes) in batches {
+            // Room first: a batch that cannot fit fails before it is asked.
+            self.room_for(p, bytes)?;
             let mut refused = Vec::new();
+            let flight = InFlight { p, bytes: AtomicU64::new(0) };
             // One pack per batch (one barrier), not a durable file each.
             let mut incoming = crate::remote::Incoming::new(&p.cache);
-            for (w, got) in batch.iter().zip(promisor.fetch(batch)?) {
+            for (w, got) in batch.iter().zip(promisor.fetch(&batch)?) {
                 match got {
                     Some(raw) => {
-                        self.check_fetched(p, &w.id, &raw)?;
+                        let len = raw.len() as u64;
+                        self.check_object(&w.id, &raw)?;
+                        self.charge(p, len, true)?;
+                        flight.bytes.fetch_add(len, Ordering::Relaxed);
                         incoming.put(w.id, raw, &w.path)?;
                         p.fetched.fetch_add(1, Ordering::Relaxed);
                     }
@@ -524,6 +646,7 @@ impl ObjectStore {
                 }
             }
             incoming.finish()?;
+            flight.landed();
             // Asked again the ordinary way: other places, then `Missing`
             // (hidden) or `Unavailable`.
             for id in refused {
@@ -540,13 +663,14 @@ impl ObjectStore {
     /// its BLAKE3 id, a canonical decoding, storable in this format, and
     /// room under the cache's bound.
     fn keep_fetched(&self, p: &Partial, id: &ObjectId, raw: &[u8]) -> Result<()> {
-        self.check_fetched(p, id, raw)?;
+        self.check_object(id, raw)?;
+        self.charge(p, raw.len() as u64, false)?;
         p.cache.put_raw(id, raw)?;
         Ok(())
     }
 
-    /// The checks of [`ObjectStore::keep_fetched`], and the room it takes.
-    fn check_fetched(&self, p: &Partial, id: &ObjectId, raw: &[u8]) -> Result<()> {
+    /// The checks of [`ObjectStore::keep_fetched`].
+    fn check_object(&self, id: &ObjectId, raw: &[u8]) -> Result<()> {
         if ObjectId::hash(raw) != *id {
             return Err(VeilError::Corrupt(id.hex(), "the server sent an object that does not match its id".into()));
         }
@@ -554,25 +678,38 @@ impl ObjectStore {
         if matches!(obj, Object::Snapshot(_)) {
             return Err(VeilError::Corrupt(id.hex(), "the server sent a snapshot where a tree entry was asked for".into()));
         }
-        self.check_storable(raw)?;
-        self.charge(p, raw.len() as u64)
+        self.check_storable(raw)
     }
 
-    /// Make room for `need` more bytes in the cache, evicting if needed;
-    /// fails cleanly when what is left is all pinned (threat 11: never an
-    /// eviction loop).
-    fn charge(&self, p: &Partial, need: u64) -> Result<()> {
+    /// Make room for `need` more bytes in the cache, evicting if needed:
+    /// what is on disk, what batches hold in flight, and `need` together
+    /// stay under the bound. Fails cleanly when what is left is all pinned
+    /// (threat 11: never an eviction loop).
+    fn room_for(&self, p: &Partial, need: u64) -> Result<()> {
         let limit = p.limit.load(Ordering::Relaxed);
-        let now = self.cache_bytes(p)?;
-        if now + need > limit {
-            let t = self.trim_cache_to(p, need)?;
-            if t.after + need > limit {
-                return Err(cache_full(limit, t.after));
+        let flying = p.in_flight.load(Ordering::SeqCst);
+        if self.cache_bytes(p)? + flying + need > limit {
+            let t = self.trim_cache_to(p, need + flying)?;
+            if t.after + flying + need > limit {
+                return Err(cache_full(limit, t.after + flying));
             }
         }
-        let mut b = p.bytes.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(b) = b.as_mut() {
-            *b += need;
+        Ok(())
+    }
+
+    /// [`ObjectStore::room_for`] `need` bytes, and count them: on disk now,
+    /// or (`batch`) in flight until the batch's pack lands.
+    fn charge(&self, p: &Partial, need: u64, batch: bool) -> Result<()> {
+        self.room_for(p, need)?;
+        match batch {
+            true => {
+                p.in_flight.fetch_add(need, Ordering::SeqCst);
+            }
+            false => {
+                if let Some(b) = p.bytes.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                    *b += need;
+                }
+            }
         }
         Ok(())
     }
@@ -790,6 +927,129 @@ impl ObjectStore {
             }
         }
         Ok(Some(u))
+    }
+}
+
+/// What a missing object of a thin clone is ([`ObjectStore::classify_gap`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gap {
+    /// An object of the server's history this clone has not fetched.
+    Server,
+    /// Only this clone's own snapshots name it: lost local work.
+    Lost,
+    /// The trees that would tell are not held either.
+    Unknown,
+}
+
+impl ObjectStore {
+    /// The snapshots on the server as this clone holds them: those
+    /// reachable from `tips` (the remote's tips), and the parents beyond its
+    /// boundary that they name. Never fetches.
+    pub fn server_history(&self, tips: &[ObjectId]) -> HashSet<ObjectId> {
+        let mut seen = HashSet::new();
+        let mut stack = tips.to_vec();
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            if let Ok(s) = self.snapshot(&x) {
+                stack.extend(s.parents.iter().copied());
+            }
+        }
+        self.take_boundary_hits_of(&seen);
+        seen
+    }
+
+    /// fsck and gc in a thin clone (BUG-1143): object `id`, missing at
+    /// `path` of snapshot `snap`'s tree. It is the server's when `snap` is
+    /// in `server` (its history), or when a parent, through this clone's own
+    /// snapshots down to one in `server`, names the same object at the same
+    /// path. It is lost when no parent does. Reads only what is held.
+    pub fn classify_gap(&self, server: &HashSet<ObjectId>, snap: &ObjectId, path: &str, id: &ObjectId) -> Gap {
+        if server.contains(snap) {
+            return Gap::Server;
+        }
+        let mut unknown = false;
+        let mut seen = HashSet::new();
+        let mut stack = vec![*snap];
+        while let Some(s) = stack.pop() {
+            if !seen.insert(s) || seen.len() > 256 {
+                continue;
+            }
+            let Ok(snapshot) = self.snapshot(&s) else {
+                unknown = true;
+                continue;
+            };
+            for parent in &snapshot.parents {
+                let Ok(ps) = self.snapshot(parent) else {
+                    // Beyond the boundary: on the server if its child is.
+                    unknown |= server.contains(parent);
+                    continue;
+                };
+                match self.entry_held(&ps.tree, path) {
+                    Some(Some(e)) if e == *id => match server.contains(parent) {
+                        true => return Gap::Server,
+                        false => stack.push(*parent),
+                    },
+                    Some(_) => {}
+                    None => unknown = true,
+                }
+            }
+        }
+        self.take_boundary_hits_of(&seen);
+        if unknown {
+            Gap::Unknown
+        } else {
+            Gap::Lost
+        }
+    }
+
+    /// The id at `path` in tree `root`, from what is held: `Some(None)` if
+    /// nothing is there, `None` if a tree on the way is not held.
+    fn entry_held(&self, root: &ObjectId, path: &str) -> Option<Option<ObjectId>> {
+        if path.is_empty() {
+            return Some(Some(*root));
+        }
+        let mut cur = *root;
+        let mut parts = path.split('/').peekable();
+        while let Some(name) = parts.next() {
+            let t = match self.tree_object(&cur) {
+                Ok(t) => t,
+                Err(_) => return None,
+            };
+            let Some(e) = t.get(name) else { return Some(None) };
+            if parts.peek().is_none() {
+                return Some(Some(e.id));
+            }
+            if e.kind != EntryKind::Dir {
+                return Some(None);
+            }
+            cur = e.id;
+        }
+        Some(None)
+    }
+}
+
+/// A batch's bytes in flight: on disk once it lands, dropped if it fails.
+struct InFlight<'a> {
+    p: &'a Partial,
+    bytes: AtomicU64,
+}
+
+impl InFlight<'_> {
+    /// The batch's pack is on disk: its bytes count there now.
+    fn landed(self) {
+        let n = self.bytes.swap(0, Ordering::SeqCst);
+        self.p.in_flight.fetch_sub(n, Ordering::SeqCst);
+        if let Some(b) = self.p.bytes.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            *b += n;
+        }
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.p.in_flight.fetch_sub(self.bytes.swap(0, Ordering::SeqCst), Ordering::SeqCst);
     }
 }
 

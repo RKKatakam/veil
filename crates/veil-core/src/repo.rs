@@ -79,7 +79,7 @@ pub const REPO_FORMAT: u32 = 8;
 /// Oldest repository format this build opens.
 pub const MIN_REPO_FORMAT: u32 = REPO_FORMAT;
 
-/// The format of a thin clone (`docs/HUB.md` §13.18): format 8 plus the
+/// The format of a thin clone (`docs/HUB.md` §13.21): format 8 plus the
 /// `partial` marker in `repo.json`. Only `vl clone` writes it, for a thin
 /// clone; every other repository stays at [`REPO_FORMAT`], readable by the
 /// vl releases that read format 8. A vl that does not know format 9 refuses
@@ -162,7 +162,7 @@ pub struct RemoteConfig {
 /// The `partial` marker of a thin clone (format [`PARTIAL_FORMAT`],
 /// device-local): objects not in the main store are fetched from the
 /// server of remote `remote` when read, into the cache area, which is kept
-/// under `cache_limit` bytes (`docs/HUB.md` §13.18).
+/// under `cache_limit` bytes (`docs/HUB.md` §13.21).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartialConfig {
@@ -550,7 +550,7 @@ impl Repo {
         }
     }
 
-    /// Is this a thin clone (`docs/HUB.md` §13.18)?
+    /// Is this a thin clone (`docs/HUB.md` §13.21)?
     pub fn is_partial(&self) -> bool {
         self.config.partial.is_some()
     }
@@ -610,6 +610,7 @@ impl Repo {
         }
         incoming.finish()?;
         if new > 0 {
+            self.store.forget_server_walk();
             self.graph.revalidate(self);
         }
         Ok(new)
@@ -876,13 +877,38 @@ impl Repo {
     }
 
     pub fn snapshot(&self, id: &ObjectId) -> Result<Arc<Snapshot>> {
-        self.store.snapshot(id)
+        self.snapshot_opt(id)?.ok_or(VeilError::Missing(*id))
     }
 
     /// Like [`Repo::snapshot`], but `None` for a snapshot this replica does
     /// not hold. Graph walks use it: a public remote withholds the merged-in
     /// history of an unreleased embargoed merge, so such parents are absent.
+    ///
+    /// **A thin clone** fetches a page of history from the server when the
+    /// snapshot is beyond what it holds (BUG-1141): every command that reads
+    /// a snapshot reads it as a full clone would, and `None` is the
+    /// server's own answer (this person's history has no such snapshot).
+    /// Without the server: `Unavailable`. The one walk that must not fetch
+    /// (the history index computes a generation from every ancestor) reads
+    /// with [`Repo::snapshot_held`].
     pub fn snapshot_opt(&self, id: &ObjectId) -> Result<Option<Arc<Snapshot>>> {
+        if let Some(s) = self.snapshot_held(id)? {
+            return Ok(Some(s));
+        }
+        if !self.store.may_fetch() || self.store.history_refused(id, false) {
+            return Ok(None);
+        }
+        let _ = self.store.take_boundary_hits_of_one(id);
+        if self.deepen(&[*id], crate::promisor::HISTORY_PAGE)? == 0 && !self.store.has_main(id) {
+            self.store.history_refused(id, true);
+            return Ok(None);
+        }
+        self.snapshot_held(id)
+    }
+
+    /// [`Repo::snapshot_opt`] of what this replica holds, never fetching:
+    /// `None` beyond a thin clone's boundary (recorded for [`Repo::exact`]).
+    pub fn snapshot_held(&self, id: &ObjectId) -> Result<Option<Arc<Snapshot>>> {
         match self.store.snapshot(id) {
             Ok(s) => Ok(Some(s)),
             Err(VeilError::Missing(_)) => Ok(None),

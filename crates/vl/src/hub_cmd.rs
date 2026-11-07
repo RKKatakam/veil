@@ -201,7 +201,7 @@ fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>, mut thin: Optio
     // Thin by default (S3): format 9 and the `partial` marker, written
     // before anything is fetched, so an interrupted clone is never read as
     // a full one. A server too old for thin clones gets a full one.
-    if thin.is_some() && client.tips()?.is_some_and(|t| t.revision < 3) {
+    if thin.is_some() && client.tips()?.is_some_and(|t| t.revision < crate::hub::HISTORY_PAGES) {
         println!("  {} the server is older than this vl: making a full clone", yellow("note:"));
         thin = None;
     }

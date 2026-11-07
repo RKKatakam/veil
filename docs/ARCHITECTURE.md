@@ -2679,7 +2679,7 @@ snapshot 1, a base its size in bytes. The defaults are 200k tree entries,
 
 ### Thin clones: fetch on demand (`promisor.rs`)
 
-A thin clone of a server project (format 9, `docs/HUB.md` §13.18) keeps
+A thin clone of a server project (format 9, `docs/HUB.md` §13.21) keeps
 two object stores: `.veil/objects/` (every snapshot it fetched, and
 everything it made; never evicted) and `.veil/cache/` (trees and files
 fetched from the server; evicted least recently written first, down to 80 %

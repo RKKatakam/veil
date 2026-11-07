@@ -27,7 +27,7 @@ There is one **repository format**, a number in `.veil/repo.json`:
 | 6 | 1.1.0 | the lock-free op log: heads in `.veil/op_heads/` instead of `.veil/op_head`, operations gain `workspace` and `rewritten` (§2, §5 "Format 6"). Not yet built: snapshot attribution (`Snapshot.agent`). The `partial` marker came with format 9 |
 | 7 | 1.1.0 | key rings of ring format 4: invites, shares by members, a member's removal of their own device, and every ring but `team` naming its project (`docs/HUB.md` §13.12). No object encoding changes; the upgrade 6 → 7 rewrites nothing |
 | 8 | 1.1.0 | **only secret files are encrypted.** Removed: sealed descriptions and tag messages (`{"sealed": …}`), cloaked tags and workspaces (`cloak` in views), snapshots on cloaked lines (`Snapshot.cloak`), embargoed tree entries (tier 2) and fallback versions (flag bit 3), sealed directories, embargo keys. Embargo records are plain (embargo record format 2). Decoders refuse what only those wrote; `vl upgrade` brings 6 and 7 to 8 when none of it is there (§5). Formats 1 to 5 are no longer opened |
-| 9 | 1.1.0 | **a thin clone** (S3, `docs/HUB.md` §13.18): format 8 plus the `partial` marker in `repo.json` and the cache area `.veil/cache/`. Only `vl clone` writes it, for a thin clone; every other repository stays at format 8. `vl partial full` brings a thin clone back to format 8 once it holds everything. The marker and format 9 go together: either without the other is refused as corrupt |
+| 9 | 1.1.0 | **a thin clone** (S3, `docs/HUB.md` §13.21): format 8 plus the `partial` marker in `repo.json` and the cache area `.veil/cache/`. Only `vl clone` writes it, for a thin clone; every other repository stays at format 8. `vl partial full` brings a thin clone back to format 8 once it holds everything. The marker and format 9 go together: either without the other is refused as corrupt |
 
 * `vl init` writes format 8 (`repo::REPO_FORMAT`), and so do full clones
   and remotes; a thin clone is format 9 (`repo::PARTIAL_FORMAT`). This
@@ -427,7 +427,7 @@ still waiting for its admin.
 
 ### Format 9 (thin clones)
 
-Written by `vl clone` for a thin clone only (S3, `docs/HUB.md` §13.18); no
+Written by `vl clone` for a thin clone only (S3, `docs/HUB.md` §13.21); no
 other repository changes format, so the vl releases that read format 8 keep
 reading every full repository.
 

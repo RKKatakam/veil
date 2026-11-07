@@ -1,4 +1,4 @@
-//! Thin clones (milestone S3, `docs/HUB.md` §13.18): fetch on demand
+//! Thin clones (milestone S3, `docs/HUB.md` §13.21): fetch on demand
 //! through a promisor, the cache area and its bound, the history boundary,
 //! and the partial-clone threat review (`docs/design/scale/6-partial-clone.md`).
 //!
@@ -153,6 +153,10 @@ fn thin_unconnected(pr: &Project, fs: &Arc<MemoryBackend>, limit: u64) -> Repo {
     .unwrap();
     let raw = pr.server.store.get_raw(&pr.tip).unwrap();
     repo.store().put_raw(&pr.tip, &raw).unwrap();
+    // As a clone records it: the server's tip.
+    let mut tx = repo.transaction("clone").unwrap();
+    tx.view.remote_tags.insert("origin/main".into(), pr.tip);
+    tx.commit().unwrap();
     repo
 }
 
@@ -313,10 +317,10 @@ fn a_full_cache_fails_cleanly() {
 fn ancestry_beyond_the_boundary_asks_the_server() {
     let pr = project();
     let (repo, _fs) = thin(&pr, 1 << 30);
-    assert!(repo.snapshot_opt(&pr.commits[0]).unwrap().is_none(), "the clone holds no history");
+    assert!(repo.snapshot_held(&pr.commits[0]).unwrap().is_none(), "the clone holds no history");
     assert!(repo.is_ancestor(&pr.commits[0], &pr.tip).unwrap());
     assert!(*pr.server.pages.lock().unwrap() >= 1);
-    assert!(repo.snapshot_opt(&pr.commits[0]).unwrap().is_some());
+    assert!(repo.snapshot_held(&pr.commits[0]).unwrap().is_some());
 
     let fs = Arc::new(MemoryBackend::new());
     let unconnected = thin_unconnected(&pr, &fs, 1 << 30);
@@ -397,6 +401,34 @@ fn the_partial_marker_needs_format_9_and_back() {
     assert!(matches!(err, VeilError::Unsupported(_)), "{err:?}");
 }
 
+/// Occurrences per file of what `count` counts in `veil-core/src`, sorted.
+fn count_in_src(count: impl Fn(&str) -> usize) -> Vec<(String, usize)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let n = count(&std::fs::read_to_string(&path).unwrap());
+            if n > 0 {
+                found.push((path.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"), n));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+fn table(rows: &[(&str, usize, &str)]) -> Vec<(String, usize)> {
+    let mut t: Vec<(String, usize)> = rows.iter().map(|(f, n, _)| (f.to_string(), *n)).collect();
+    t.sort();
+    t
+}
+
 /// Threat 1's audit: every place the engine reads `Missing` (or any
 /// unreadable object) as "hidden". `VeilError::Unavailable` is a variant
 /// of its own, never `is_unreadable()`, so each of these sites passes it
@@ -411,13 +443,13 @@ fn every_site_that_reads_missing_as_hidden_is_audited() {
         ("conflict.rs", 2, "a hidden term is shown as hidden"),
         ("embargo.rs", 2, "a withheld fix"),
         ("error.rs", 1, "the definition of is_unreadable"),
-        ("fsck.rs", 1, "a thin clone's unfetched object is a note (fetching off)"),
-        ("gc.rs", 4, "a thin clone's mark stops at what is on the server (fetching off)"),
+        ("fsck.rs", 1, "a thin clone's gap is classified (classify_gap): the server's a note, lost work damage"),
+        ("gc.rs", 4, "a thin clone's mark skips only a gap of the server's history (classify_gap)"),
         ("hub/project.rs", 2, "the server's own projection"),
         ("maintenance.rs", 2, "fetching off"),
-        ("promisor.rs", 8, "the read path itself; a checkout's prefetch leaves a refused object for its reader, who finds it hidden"),
+        ("promisor.rs", 7, "the read path itself; a checkout's prefetch leaves a refused object for its reader, who finds it hidden"),
         ("remote.rs", 9, "transfers between local repositories (test fixtures); the server checks closure itself"),
-        ("repo.rs", 1, "snapshot_opt: a snapshot beyond the boundary; graph queries run through Repo::exact"),
+        ("repo.rs", 2, "snapshot_held: a snapshot beyond the boundary; snapshot reads fetch history pages there"),
         ("sandbox.rs", 3, "a hidden file is not given to the sandbox"),
         ("search.rs", 1, "a hidden file is not searched"),
         ("selection.rs", 2, "a hidden file is not selectable"),
@@ -425,28 +457,40 @@ fn every_site_that_reads_missing_as_hidden_is_audited() {
         ("transaction.rs", 1, "tolerated: an entry kept by id"),
         ("wc_policy.rs", 1, "an unreadable policy"),
     ];
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut found = Vec::new();
-    let mut stack = vec![root.clone()];
-    while let Some(d) = stack.pop() {
-        for e in std::fs::read_dir(&d).unwrap().flatten() {
-            let path = e.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).unwrap();
-            let n = text.matches("is_unreadable()").count() + text.matches("VeilError::Missing(").count();
-            if n > 0 {
-                let rel = path.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
-                found.push((rel, n));
-            }
-        }
-    }
-    found.sort();
-    let mut audited: Vec<(String, usize)> = AUDITED.iter().map(|(f, n, _)| (f.to_string(), *n)).collect();
-    audited.sort();
-    assert_eq!(found, audited, "a site that reads Missing changed: review it for thin clones and update the table");
+    let found = count_in_src(|t| t.matches("is_unreadable()").count() + t.matches("VeilError::Missing(").count());
+    assert_eq!(found, table(AUDITED), "a site that reads Missing changed: review it for thin clones and update the table");
+}
+
+/// BUG-1142's class: every place that *makes* a `Missing`. In a thin clone
+/// `Missing` must mean the server's own "nothing there you may see", a
+/// snapshot beyond the boundary, or (gc, fsck, maintenance only) "not held,
+/// fetching off", which they classify. A new producer fails this table.
+#[test]
+fn every_producer_of_missing_is_audited() {
+    const PRODUCERS: &[(&str, usize, &str)] = &[
+        ("hub/project.rs", 2, "the server's projection: an object its store lacks"),
+        ("promisor.rs", 3, "fetching off (gc, fsck, maintenance: classified); a snapshot beyond the boundary; the server's refusal under a snapshot on the server"),
+        ("repo.rs", 1, "Repo::snapshot: the server has no such snapshot in this person's history (after a page was asked)"),
+        ("store.rs", 1, "the main store's read: then the cache, then the server (read_partial)"),
+    ];
+    let found = count_in_src(|t| t.matches("VeilError::Missing(").count() - t.matches("VeilError::Missing(_)").count());
+    assert_eq!(found, table(PRODUCERS), "a producer of Missing changed: in a thin clone, Missing must come from the server's own answer");
+}
+
+/// BUG-1141's class: snapshot reads that do not fetch history beyond a
+/// thin clone's boundary. `Repo::snapshot` and `snapshot_opt` fetch it;
+/// these read only what is held, on purpose.
+#[test]
+fn every_snapshot_read_that_does_not_fetch_is_audited() {
+    const HELD_ONLY: &[(&str, usize, &str)] = &[
+        ("gc.rs", 1, "gc never fetches; its mark classifies a gap"),
+        ("graph_index.rs", 2, "a generation needs every ancestor: the index walks what is held, and Repo::exact pages history in"),
+        ("maintenance.rs", 1, "maintenance never fetches"),
+        ("remote.rs", 3, "transfers between local repositories (test fixtures)"),
+        ("repo.rs", 4, "snapshot_held itself, and snapshot_opt's first read"),
+    ];
+    let found = count_in_src(|t| t.matches("store.snapshot(").count() + t.matches("store().snapshot(").count() + t.matches("snapshot_held(").count());
+    assert_eq!(found, table(HELD_ONLY), "a snapshot read that skips the boundary's history changed: review it for thin clones");
 }
 
 // ---- S3 cycle 1 review (`docs/BUGS.md`, "S3 cycle 1") --------------------
@@ -459,7 +503,6 @@ fn every_site_that_reads_missing_as_hidden_is_audited() {
 /// local commit's own ancestors on the server, and fails with a message
 /// whose advice (`vl pull`) cannot help.
 #[test]
-#[ignore = "BUG-1144: an object met under a local commit is asked for under the server's current tips only"]
 fn s3r_a_local_commits_unchanged_directory_is_found_after_the_server_moved_on() {
     let id = Identity::generate("alice");
     let sfs = Arc::new(MemoryBackend::new());
@@ -505,7 +548,6 @@ fn s3r_a_local_commits_unchanged_directory_is_found_after_the_server_moved_on() 
 /// bound at 6 to 12 checked out 0 to 6 of 12 files and recorded the rest
 /// as hidden).
 #[test]
-#[ignore = "BUG-1142: an object without a recorded place (past LOCATOR_CAP) reads as Missing, a redaction"]
 fn s3r_an_object_without_a_recorded_place_is_never_hidden() {
     let pr = project();
     let (repo, _fs) = thin(&pr, 1 << 30);
@@ -519,7 +561,6 @@ fn s3r_an_object_without_a_recorded_place_is_never_hidden() {
 /// server, a note. An object of the clone's own unpushed commit is on no
 /// server: its loss is damage that fsck must report.
 #[test]
-#[ignore = "BUG-1143: fsck in a thin clone takes a lost object of unpushed work for one on the server"]
 fn s3r_fsck_in_a_thin_clone_reports_lost_local_work() {
     let pr = project();
     let (mut repo, fs) = thin(&pr, 1 << 30);
@@ -542,7 +583,6 @@ fn s3r_fsck_in_a_thin_clone_reports_lost_local_work() {
 /// Each revision names one release of the server's routes: a client that
 /// sees 3 cannot tell whether `history` pages.
 #[test]
-#[ignore = "BUG-1140: protocol revision 3 announces both S5's read grants and S3's history pages"]
 fn s3r_each_protocol_revision_announces_one_thing() {
     let src = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/hub/wire.rs")).unwrap();
     let at = src.find("pub const REVISION: u32 = ").expect("REVISION");

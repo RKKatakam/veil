@@ -428,8 +428,12 @@ impl<'a> Reach<'a> {
 
 struct Mark<'a> {
     store: &'a ObjectStore,
-    /// A thin clone: an object it does not hold is on the server.
-    partial: bool,
+    /// A thin clone: the server's history as the clone holds it. A gap in
+    /// it is on the server; a gap only this clone's own snapshots name is
+    /// lost work, and stops the sweep as in a full clone (BUG-1143).
+    server: Option<std::collections::HashSet<ObjectId>>,
+    /// The snapshot whose tree is being marked.
+    walking: Option<ObjectId>,
     reach: Reach<'a>,
     incomplete: Vec<String>,
 }
@@ -447,11 +451,22 @@ impl Mark<'_> {
                 Ok(s) => {
                     let embargoed = s.embargo.as_deref().is_some_and(|e| !self.store.keys.embargo_released(e));
                     stack.extend(s.parents.iter().enumerate().map(|(i, p)| (*p, embargoed && i > 0)));
+                    self.walking = Some(id);
                     self.tree(s.tree, String::new());
+                    self.walking = None;
                 }
-                Err(VeilError::Missing(_)) if withheld || self.partial => {}
+                Err(VeilError::Missing(_)) if withheld || self.server.as_ref().is_some_and(|h| h.contains(&id)) => {}
                 Err(e) => self.incomplete.push(format!("snapshot {}: {e}", id.short())),
             }
+        }
+    }
+
+    /// A thin clone: is `id`, missing at `path` of the snapshot being
+    /// marked, the server's (not fetched)?
+    fn servers(&self, id: &ObjectId, path: &str) -> bool {
+        match (&self.server, self.walking) {
+            (Some(server), Some(snap)) => self.store.classify_gap(server, &snap, path, id) == crate::promisor::Gap::Server,
+            _ => false,
         }
     }
 
@@ -463,7 +478,7 @@ impl Mark<'_> {
             }
             let t = match self.store.tree_object(&id) {
                 Ok(t) => t,
-                Err(VeilError::Missing(_)) if self.partial => continue,
+                Err(VeilError::Missing(_)) if self.servers(&id, &path) => continue,
                 Err(e) => {
                     self.incomplete.push(format!("tree {} at '{path}': {e}", id.short()));
                     continue;
@@ -517,7 +532,7 @@ impl Mark<'_> {
                     self.reach.insert(t);
                 }
             }
-            Err(VeilError::Missing(_)) if self.partial => {}
+            Err(VeilError::Missing(_)) if self.servers(&id, path) => {}
             Err(e) => self.incomplete.push(format!("conflict {} at '{path}': {e}", id.short())),
         }
     }
@@ -753,8 +768,19 @@ fn prune_store(
     // 3. Mark.
     roots.extend(opts.extra_roots.iter().copied());
     roots.extend(checkout_snapshots(&*backend));
+    // A thin clone: snapshots any retained operation saw on a remote.
+    let server = store.is_partial().then(|| {
+        let mut tips: Vec<ObjectId> = repo.view.remote_tags.values().copied().collect();
+        for id in &retained {
+            if let Ok(Some(op)) = repo.ops.try_get(id) {
+                tips.extend(op.view.remote_tags.values().copied());
+            }
+        }
+        store.server_history(&tips)
+    });
     let mut mark = Mark {
-        partial: store.is_partial(),
+        server,
+        walking: None,
         store,
         reach: Reach::new(&inv),
         incomplete,

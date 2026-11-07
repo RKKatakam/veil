@@ -316,6 +316,9 @@ pub fn fsck(backend: Arc<dyn StorageBackend>, identity: Option<Identity>) -> Res
         missing_predecessors: 0,
         temp_files: 0,
         torn: 0,
+        server_tips: Vec::new(),
+        server: None,
+        walking: None,
     };
     c.check_meta()?;
     let roots = c.check_ops()?;
@@ -363,6 +366,12 @@ struct Checker {
     temp_files: usize,
     /// Unreachable objects that fail their hash while a lock is left over.
     torn: usize,
+    /// A thin clone: the remotes' tips every operation recorded, the
+    /// history they reach (computed once), and the snapshot whose tree is
+    /// being checked.
+    server_tips: Vec<ObjectId>,
+    server: Option<HashSet<ObjectId>>,
+    walking: Option<ObjectId>,
 }
 
 impl Checker {
@@ -479,11 +488,19 @@ impl Checker {
         Some(obj)
     }
 
-    fn note_missing(&mut self, id: ObjectId, severity: Severity, message: String) {
-        // A thin clone holds only what it fetched: the rest is read from
-        // the server when needed.
+    fn note_missing(&mut self, id: ObjectId, severity: Severity, message: String, at: Option<&str>) {
+        // A thin clone holds only what it fetched: what is missing from the
+        // server's history is read from the server when needed; what only
+        // its own snapshots name is lost (BUG-1143).
         let (severity, message) = match self.store.is_partial() && severity == Severity::Corrupt {
-            true => (Severity::Note, format!("{message} (not fetched: this thin clone reads it from the server)")),
+            true => match self.gap(&id, at) {
+                crate::promisor::Gap::Server => (Severity::Note, format!("{message} (not fetched: this thin clone reads it from the server)")),
+                crate::promisor::Gap::Unknown => (
+                    Severity::Warning,
+                    format!("{message} (not fetched, or lost: this thin clone holds nothing that tells; `vl partial full` fetches what the server has)"),
+                ),
+                crate::promisor::Gap::Lost => (severity, format!("{message} (only this clone's own, unpushed snapshots name it)")),
+            },
             false => (severity, message),
         };
         match self.missing.get(&id) {
@@ -491,6 +508,31 @@ impl Checker {
             _ => {
                 self.missing.insert(id, (severity, message));
             }
+        }
+    }
+
+    /// What missing object `id` is in a thin clone: a snapshot, by whether
+    /// the server's history names it; a tree entry met at fsck path `at`
+    /// ("snapshot ab12:/dir/file"), by [`ObjectStore::classify_gap`].
+    fn gap(&mut self, id: &ObjectId, at: Option<&str>) -> crate::promisor::Gap {
+        if self.server.is_none() {
+            let tips = self.server_tips.clone();
+            self.server = Some(self.store.server_history(&tips));
+        }
+        let server = self.server.as_ref().expect("computed above");
+        match (at, self.walking) {
+            (None, _) if server.contains(id) => crate::promisor::Gap::Server,
+            (None, _) => crate::promisor::Gap::Lost,
+            (Some(at), Some(snap)) => {
+                let path = at.split_once(":/").map_or("", |(_, p)| p);
+                // A conflict's term ("… (conflict side 1)") is not at a path
+                // of its own.
+                if path.contains(" (conflict ") {
+                    return crate::promisor::Gap::Unknown;
+                }
+                self.store.classify_gap(server, &snap, path.trim_end_matches('/'), id)
+            }
+            (Some(_), None) => crate::promisor::Gap::Unknown,
         }
     }
 
@@ -518,6 +560,7 @@ impl Checker {
                         id,
                         Severity::Redacted,
                         format!("snapshot {id} (merged by {from}) is withheld until its embargo is released"),
+                        None,
                     );
                     continue;
                 }
@@ -526,6 +569,7 @@ impl Checker {
                         id,
                         Severity::Corrupt,
                         format!("snapshot {id} (referenced by {from}) is missing"),
+                        None,
                     );
                     continue;
                 }
@@ -548,7 +592,9 @@ impl Checker {
             if let Some(e) = &s.embargo {
                 self.check_embargo_known(e);
             }
+            self.walking = Some(id);
             self.check_tree(s.tree, &format!("{me}:/"), false);
+            self.walking = None;
         }
     }
 
@@ -585,7 +631,7 @@ impl Checker {
                 } else {
                     Severity::Corrupt
                 };
-                self.note_missing(id, sev, format!("directory {path}: tree {id} is missing"));
+                self.note_missing(id, sev, format!("directory {path}: tree {id} is missing"), Some(path));
                 return next;
             }
             Load::Bad => return next,
@@ -672,7 +718,7 @@ impl Checker {
                 return;
             }
             Load::Missing => {
-                self.note_missing(e.id, Severity::Corrupt, format!("conflict {path}: conflict object {} is missing", e.id));
+                self.note_missing(e.id, Severity::Corrupt, format!("conflict {path}: conflict object {} is missing", e.id), Some(path));
                 return;
             }
             Load::Bad => return,
@@ -723,7 +769,7 @@ impl Checker {
                 }
                 Load::Missing => {
                     if first {
-                        self.note_missing(id, Severity::Corrupt, format!("annotated tag {id} is missing"));
+                        self.note_missing(id, Severity::Corrupt, format!("annotated tag {id} is missing"), None);
                     }
                     continue;
                 }
@@ -758,7 +804,7 @@ impl Checker {
             ),
         };
         let label = format!("{} {path}", if e.kind.is_special() { e.kind.name() } else { "file" });
-        self.check_blob(e.id, &label, missing_as, &why, Some(e.visibility.key_scope()));
+        self.check_blob(e.id, &label, missing_as, &why, Some(e.visibility.key_scope()), Some(path));
     }
 
     /// `expected_scope`: `Some(None)` = must be plaintext, `Some(Some(s))` =
@@ -770,18 +816,19 @@ impl Checker {
         missing_as: Severity,
         why: &str,
         expected_scope: Option<Option<String>>,
+        at: Option<&str>,
     ) {
         if !self.seen_blobs.insert(id) {
             // Already verified; a missing object may need a stricter class.
             if self.missing.contains_key(&id) {
-                self.note_missing(id, missing_as, format!("{label}: content {id} is missing{why}"));
+                self.note_missing(id, missing_as, format!("{label}: content {id} is missing{why}"), at);
             }
             return;
         }
         let obj = match self.load(&id) {
             Load::Obj(o) => o,
             Load::Missing => {
-                self.note_missing(id, missing_as, format!("{label}: content {id} is missing{why}"));
+                self.note_missing(id, missing_as, format!("{label}: content {id} is missing{why}"), at);
                 return;
             }
             Load::Bad => return,
@@ -1136,6 +1183,9 @@ impl Checker {
             }
         }
 
+        // A thin clone: snapshots any operation saw on a remote are the
+        // server's (BUG-1143).
+        self.server_tips = ops.values().flat_map(|op| op.view.remote_tags.values().copied()).collect();
         let mut roots = Vec::new();
         for h in &heads {
             roots.extend(

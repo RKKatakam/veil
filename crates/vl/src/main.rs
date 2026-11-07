@@ -347,6 +347,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         }
         Cmd::Edit { rev } => {
             let id = ctx.rev(rev)?;
+            ctx.fetch_ahead(&id)?;
             let ws = ctx.ws.clone();
             ctx.repo.edit(&ws, id)?;
         }
