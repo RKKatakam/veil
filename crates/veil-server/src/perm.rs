@@ -178,6 +178,42 @@ pub async fn bind_names(c: &mut PgConnection, project: i64, policy: &AccessPolic
     Ok(out)
 }
 
+/// Accept `text` as the project's policy (the default branch moved to it,
+/// by an admin), binding its names ([`bind_names`]), inside the caller's
+/// transaction.
+pub async fn accept_policy(c: &mut PgConnection, project: i64, text: &str) -> Result<()> {
+    let policy = AccessPolicy::parse(text);
+    let bindings = bind_names(&mut *c, project, &policy).await?;
+    sqlx::query("UPDATE projects SET policy_text = $1, policy_bindings = $2, policy_version = policy_version + 1 WHERE id = $3")
+        .bind(text)
+        .bind(serde_json::to_string(&bindings).map_err(|e| Error::Other(e.into()))?)
+        .bind(project)
+        .execute(&mut *c)
+        .await?;
+    Ok(())
+}
+
+/// After [`accept_policy`], never silently: who can now see what, as the
+/// admin is told.
+pub fn accepted_listing(project: &Project) -> Vec<String> {
+    let mut out = Vec::new();
+    for r in &project.policy.rules {
+        let mut who: Vec<String> = Vec::new();
+        if r.public {
+            who.push("everyone on Earth (public, read)".into());
+        }
+        for n in &r.names {
+            who.push(match project.bindings.get(n) {
+                Some(Binding::Group(_)) => format!("group {n}"),
+                _ => format!("person {n}"),
+            });
+        }
+        out.push(format!("access accepted: {}/ → {}", r.path, who.join(", ")));
+    }
+    out.extend(project.policy.warnings.iter().cloned());
+    out
+}
+
 /// Is `person` a manager of `group`? The row is locked (`FOR SHARE`) for
 /// the rest of the transaction: a concurrent removal of the manager waits.
 pub async fn is_manager(c: &mut PgConnection, group: i64, person: i64) -> Result<bool> {

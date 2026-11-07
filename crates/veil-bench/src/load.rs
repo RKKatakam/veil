@@ -8,6 +8,12 @@
 //! * **pull:** the tips; when `main` moved, the history down to the tip it
 //!   knows, then the new trees and files level by level, only what it
 //!   does not hold yet (`vl pull`, `crates/vl/src/hub.rs`);
+//! * **api:** one new file in its own directory, committed through the
+//!   API (`POST …/changes`, `docs/HUB.md` §13.13) on the tip it last saw,
+//!   with `onto main` and `"rebase"`: no pull and no upload. When `main`
+//!   moved, the server applies the file to the new tip itself; a change
+//!   rejected after its rebases (a *collision*) asks for the tips and
+//!   tries again;
 //! * **land:** a pull, then a new file in its own directory on top of that
 //!   `main` (a blob and the trees above it, and a signed snapshot),
 //!   uploaded, then pushed as a compare-and-swap of `main`. When `main`
@@ -61,6 +67,7 @@ use veil_core::{
 pub enum Mode {
     Pull,
     Land,
+    Api,
 }
 
 /// Target aggregate landings per second, or as fast as the agents go.
@@ -492,6 +499,56 @@ impl Agent<'_> {
     }
 }
 
+impl Agent<'_> {
+    /// Land one new file through the API (`--mode api`); the collisions on
+    /// the way: rebases the server made, and rejections after them.
+    fn land_api(&mut self, deadline: Instant) -> Result<u64> {
+        let mut collisions = 0;
+        let mut attempt = 0u32;
+        self.files += 1;
+        let path = format!("{}/f{:06}", self.dir.join("/"), self.files);
+        loop {
+            attempt += 1;
+            if Instant::now() > deadline {
+                bail!("no landing within the deadline after {collisions} collisions");
+            }
+            let base = match self.clone.tip {
+                Some((t, _)) => t,
+                None => {
+                    self.c.requests.fetch_add(1, Ordering::Relaxed);
+                    let r = self.api.get(self.token, &self.path("/tips"))?;
+                    ok(&r, "tips")?;
+                    let tips: Tips = serde_json::from_slice(&r.body)?;
+                    *tips.branches.get("main").ok_or_else(|| anyhow!("no main"))?
+                }
+            };
+            self.c.requests.fetch_add(1, Ordering::Relaxed);
+            let req = json!({"base": base.hex(), "description": format!("land {}", self.files),
+                "edits": [{"path": path, "put": {"text": format!("agent file {} of {}\n", self.files, self.dir.join("/"))}}],
+                "onto": {"branch": "main", "expected": "rebase"}});
+            let r = self.api.post_json(Some(self.token), &self.path("/changes"), &req)?;
+            if r.status == 503 {
+                self.c.count(&self.c.busy, 1);
+                backoff(attempt);
+                continue;
+            }
+            ok(&r, "change")?;
+            let v: serde_json::Value = serde_json::from_slice(&r.body)?;
+            let rebased = v["branch"]["rebased"].as_u64().unwrap_or(0);
+            collisions += rebased;
+            self.c.count(&self.c.collisions, rebased);
+            if v["branch"]["status"] == "ok" {
+                let mine: ObjectId = serde_json::from_value(v["snapshot"].clone())?;
+                self.clone.tip = Some((mine, mine));
+                return Ok(collisions);
+            }
+            collisions += 1;
+            self.c.count(&self.c.collisions, 1);
+            self.clone.tip = None;
+        }
+    }
+}
+
 /// Capped, jittered backoff after a busy server.
 fn backoff(attempt: u32) {
     let cap = 5u64 << attempt.min(6);
@@ -533,6 +590,23 @@ fn db_cpu(container: Option<&str>) -> f64 {
         })
         .filter_map(cpu_of)
         .sum()
+}
+
+/// Explicit transactions committed (`COMMIT`) and write statements
+/// (`INSERT`, `UPDATE`, `DELETE`, in a transaction or not) the database
+/// ran so far, if `pg_stat_statements` is loaded: the cost gates of
+/// `docs/design/server/storage-and-cost.md` §9.
+fn db_writes(rt: &tokio::runtime::Runtime, url: &str) -> Option<(f64, f64)> {
+    rt.block_on(async {
+        let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(url).await.ok()?;
+        sqlx::query_as::<_, (f64, f64)>(
+            "SELECT coalesce(sum(calls) FILTER (WHERE query ILIKE 'commit%'), 0)::float8, \
+             coalesce(sum(calls) FILTER (WHERE query ~* '^\\s*(insert|update|delete)'), 0)::float8 FROM pg_stat_statements",
+        )
+        .fetch_one(&mut c)
+        .await
+        .ok()
+    })
 }
 
 /// Statements the database ran so far (`pg_stat_statements`), or its
@@ -704,7 +778,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
                 ready.wait();
                 while !stop.load(Ordering::Relaxed) {
                     let scheduled = match (a.mode, rate) {
-                        (Mode::Land, Rate::PerSecond(_)) => match rx.lock().unwrap().recv_timeout(Duration::from_millis(100)) {
+                        (Mode::Land | Mode::Api, Rate::PerSecond(_)) => match rx.lock().unwrap().recv_timeout(Duration::from_millis(100)) {
                             Ok(t) => t,
                             Err(_) => continue,
                         },
@@ -713,6 +787,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
                     let r = match a.mode {
                         Mode::Pull => agent.pull().map(|moved| u64::from(!moved)),
                         Mode::Land => agent.land(scheduled + Duration::from_secs(60)),
+                        Mode::Api => agent.land_api(scheduled + Duration::from_secs(60)),
                     };
                     let done = Instant::now();
                     if !c.measuring.load(Ordering::Relaxed) {
@@ -776,7 +851,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
         ready.wait();
         // Open loop: schedule landings at `rate`, round robin over the projects.
         let schedule = |until: Instant, start: Instant, mut k: u64| -> u64 {
-            if let (Mode::Land, Rate::PerSecond(r)) = (a.mode, rate) {
+            if let (Mode::Land | Mode::Api, Rate::PerSecond(r)) = (a.mode, rate) {
                 loop {
                     let at = start + Duration::from_secs_f64(k as f64 / r);
                     if at >= until {
@@ -800,6 +875,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
         let before_db = db_cpu(a.db_container.as_deref());
         let before_self = cpu_of(std::process::id());
         let before_stmts = cx.stats.and_then(|(rt, url)| db_statements(rt, url));
+        let before_writes = cx.stats.and_then(|(rt, url)| db_writes(rt, url));
         let req0 = c.requests.load(Ordering::Relaxed);
         c.measuring.store(true, Ordering::Relaxed);
         let t0 = Instant::now();
@@ -810,6 +886,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
         let db = db_cpu(a.db_container.as_deref()) - before_db;
         let me = cpu_of(std::process::id()).zip(before_self).map(|(b, a)| b - a);
         let stmts = cx.stats.and_then(|(rt, url)| db_statements(rt, url)).zip(before_stmts).map(|((b, what), (a, _))| (b - a, what));
+        let writes = cx.stats.and_then(|(rt, url)| db_writes(rt, url)).zip(before_writes).map(|((bc, bw), (ac, aw))| (bc - ac, bw - aw));
         let requests = c.requests.load(Ordering::Relaxed) - req0;
         stop.store(true, Ordering::Relaxed);
         let ops = c.ops.load(Ordering::Relaxed) as f64;
@@ -817,7 +894,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
         lat.sort_by(|x, y| x.partial_cmp(y).unwrap());
         let per_op = |x: f64| if ops > 0.0 { x / ops } else { f64::NAN };
         result = json!({
-            "mode": match a.mode { Mode::Pull => "pull", Mode::Land => "land" },
+            "mode": match a.mode { Mode::Pull => "pull", Mode::Land => "land", Mode::Api => "api" },
             "projects": projects,
             "clients": clients,
             "rate": match rate { Rate::Max => json!("max"), Rate::PerSecond(r) => json!(r) },
@@ -839,6 +916,8 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
             "db_cores": db / elapsed,
             "db_per_op": stmts.map(|(n, _)| per_op(n)),
             "db_counted": stmts.map(|(_, w)| w),
+            "db_commits_per_op": writes.map(|(c, _)| per_op(c)),
+            "db_writes_per_op": writes.map(|(_, w)| per_op(w)),
             "load_tool_cores": me.map(|x| x / elapsed),
             "background_landings": bg.ops.load(Ordering::Relaxed),
             "background_errors": bg.errors.load(Ordering::Relaxed),
@@ -915,7 +994,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
     };
     let rates = match a.mode {
         Mode::Pull => vec![Rate::Max],
-        Mode::Land => a.rates.clone(),
+        Mode::Land | Mode::Api => a.rates.clone(),
     };
     let mut runs = Vec::new();
     for &projects in &a.projects {
@@ -935,7 +1014,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
 fn line(r: &serde_json::Value) -> String {
     let f = |k: &str| r[k].as_f64().map(|v| format!("{v:.2}")).unwrap_or_else(|| "–".into());
     format!(
-        "{} ops/s ({} agents finishing), p50 {} ms, p99 {} ms, collisions/op {}, errors {}, server ms/op {}, db ms/op {}, db/op {}, derived {} s later ({} branches behind)",
+        "{} ops/s ({} agents finishing), p50 {} ms, p99 {} ms, collisions/op {}, errors {}, server ms/op {}, db ms/op {}, db/op {}, commits/op {}, writes/op {}, derived {} s later ({} branches behind)",
         f("ops_per_s"),
         r["agents_finishing"],
         f("p50_ms"),
@@ -945,6 +1024,8 @@ fn line(r: &serde_json::Value) -> String {
         f("server_cpu_ms_per_op"),
         f("db_cpu_ms_per_op"),
         f("db_per_op"),
+        f("db_commits_per_op"),
+        f("db_writes_per_op"),
         f("derive_lag_s"),
         r["derive_behind"]
     )
@@ -953,13 +1034,13 @@ fn line(r: &serde_json::Value) -> String {
 /// The runs as a Markdown table.
 pub fn markdown(v: &serde_json::Value) -> Result<String> {
     let mut out = String::from(
-        "| Mode | Projects | Clients | Agents finishing | Target rate (/s) | Done (/s) | p50 (ms) | p99 (ms) | Collisions per landing | Requests per op | Server CPU (ms/op) | Server cores | DB CPU (ms/op) | DB cores | DB statements per op | Load tool cores | Errors |\n\
-         |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        "| Mode | Projects | Clients | Agents finishing | Target rate (/s) | Done (/s) | p50 (ms) | p99 (ms) | Collisions per landing | Requests per op | Server CPU (ms/op) | Server cores | DB CPU (ms/op) | DB cores | DB statements per op | DB commits per op | DB writes per op | Load tool cores | Errors |\n\
+         |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
     );
     let f = |x: &serde_json::Value, d: usize| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{v:.d$}")).unwrap_or_else(|| "–".into());
     for r in v["runs"].as_array().ok_or_else(|| anyhow!("no runs"))? {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             r["mode"].as_str().unwrap_or(""),
             r["projects"],
             r["clients"],
@@ -969,7 +1050,7 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             f(&r["p50_ms"], 1),
             f(&r["p99_ms"], 1),
             match r["mode"].as_str() {
-                Some("land") => f(&r["collisions_per_op"], 2),
+                Some("land" | "api") => f(&r["collisions_per_op"], 2),
                 _ => "–".into(),
             },
             f(&r["requests_per_op"], 1),
@@ -978,6 +1059,8 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             f(&r["db_cpu_ms_per_op"], 2),
             f(&r["db_cores"], 1),
             f(&r["db_per_op"], 1),
+            f(&r["db_commits_per_op"], 2),
+            f(&r["db_writes_per_op"], 1),
             f(&r["load_tool_cores"], 1),
             r["errors"],
         ));
