@@ -2286,6 +2286,32 @@ veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
   polls), for `veil-bench load --mode objects --via server,cache`
   (`scripts/bench-server.sh cache`).
 
+**Measured** (`scripts/bench-server.sh cache` at `c97c32f`, release
+builds, server, cache, PostgreSQL, MinIO and the agents on one 32-thread
+machine; load 14 at the start, 104 at the end, so throughputs are noisy).
+A read is a fresh thin workspace's: the tips, then the root, `w/`,
+`w/seed/` and 100 of its 4 KiB files (103 objects, 4 requests), signed:
+
+| `main` | Agents | Via | Reads/s | p50 / p99 (ms) | Server CPU per read | Cache hits | Cache requests to the server per read | Cache CPU per read | Cache peak |
+|---|---:|---|---:|---|---:|---:|---:|---:|---:|
+| still | 10 | server | 2,540 | 3.9 / 5.9 | 2.56 ms | | | | |
+| still | 10 | cache | 2,516 | 3.6 / 8.6 | 0.19 ms | 100 % | 0.00 | 2.53 ms | 39 MiB |
+| still | 1,000 | server | 4,093 | 235 / 407 | 2.52 ms | | | | |
+| still | 1,000 | cache | 1,842 | 512 / 1,137 | 0.20 ms | 100 % | 0.00 | 2.48 ms | 177 MiB |
+| 20 landings/s | 100 | server | 2,075 | 45 / 99 | 2.32 ms | | | | |
+| 20 landings/s | 100 | cache | 4,982 | 20 / 33 | 0.20 ms | 99.99 % | 0.01 | 2.76 ms | 119 MiB |
+| 20 landings/s | 1,000 | server | 2,156 | 420 / 1,083 | 2.30 ms | | | | |
+| 20 landings/s | 1,000 | cache | 4,649 | 209 / 381 | 0.22 ms | 99.98 % | 0.02 | 2.89 ms | 194 MiB |
+
+Gates met: at least 99 % of objects from the cache's store, its peak at
+most 512 MiB (`--memory 256M`). The server's CPU per read falls about 12×
+(it answers the tips only); the cache spends about what the server did
+(reading one object a thread cost twice as much before `c97c32f`). On one
+machine the cache competes with the server for the same cores, so
+throughput and latency through it are not a regional win; what it removes
+is the server's work. Coalescing keeps requests to the server at 0.02 per
+read while `main` moves 20 times a second.
+
 **Threat review** (design §6 rows 1–4, 8, 9, 14, 15, 17, plus this
 milestone's):
 
