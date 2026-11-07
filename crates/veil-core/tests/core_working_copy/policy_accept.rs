@@ -122,13 +122,15 @@ fn an_incoming_policy_cannot_uncloak_or_re_scope_new_local_files() {
     let main = commit_files(&mut repo, &*fs, &[], "policy");
     let pr = incoming(&mut repo, main, &[(".veilpolicy", "private/ cloak team\n")]);
     move_to(&mut repo, &*fs, pr);
-    fs.write(&p("secrets/db.yml"), b"host: db\n").unwrap();
-    fs.write(&p("private/notes.md"), b"plans\n").unwrap();
+    fs.write(&p("secrets/.env.db"), b"host: db\n").unwrap();
+    fs.write(&p("private/.env.notes"), b"plans\n").unwrap();
     let wc = snap(&mut repo, &*fs);
-    for path in ["secrets/db.yml", "private/notes.md"] {
-        let e = file_entry(&repo, &wc, path).unwrap();
-        assert_eq!(e.visibility, Visibility::Cloaked { scope: "ops".into() }, "{path}");
-    }
+    // `private/` re-scoped is held back; `secrets/` dropped leaves its
+    // secret isolated (stronger): neither is sealed for anyone else.
+    let e = file_entry(&repo, &wc, "private/.env.notes").unwrap();
+    assert_eq!(e.visibility, Visibility::Cloaked { scope: "ops".into() });
+    let e = file_entry(&repo, &wc, "secrets/.env.db");
+    assert!(e.as_ref().is_none_or(|e| e.visibility == Visibility::Cloaked { scope: "ops".into() }), "{e:?}");
 }
 
 #[test]
@@ -176,7 +178,7 @@ fn a_pull_into_a_fresh_member_records_nothing_until_accepted() {
     let (mut mallory, mfs, _) = new_repo("mallory");
     commit_files(&mut mallory, &*mfs, &[("README", "hi\n")], "v1");
     let main = commit_files(&mut mallory, &*mfs, &[(".veilpolicy", "keys/ public!\n")], "policy");
-    mallory.set_tag("main", main, None, false).unwrap();
+    mallory.set_tag("main", main, false).unwrap();
     let team = Arc::new(MemoryBackend::new());
     remote::push(&mut mallory, team.clone(), false, &[], false).unwrap();
 
@@ -193,7 +195,7 @@ fn other_backends_keep_their_own_policy_and_never_move_the_accepted_one() {
     let (mut repo, fs, main) = setup();
     let acc = load_accepted(&*fs).unwrap();
     // An agent edits the policy in an overlay of another workspace.
-    repo.create_workspace("agent", vec![main], None).unwrap();
+    repo.create_workspace("agent", vec![main]).unwrap();
     let overlay = repo.workspace_overlay("agent").unwrap();
     overlay.write(&p(".veilpolicy"), b".env public!\n").unwrap();
     overlay.write(&p(".env"), b"FIXTURE=1\n").unwrap();

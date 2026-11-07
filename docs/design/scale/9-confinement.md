@@ -87,7 +87,7 @@ Defaults from `[exec.limits]` (`memory`, `cpus`, `cpu-time`, `pids`, `timeout`, 
 
 The attacker is **the command** (a coding agent, a test suite, a dependency's build script), running as the user. It controls everything it executes and writes. The goal: it can change only its sandbox, and read only the sandbox, the computer's public tools, the allow-list and what it is given (environment, injected secrets).
 
-1. **Reading private files** (`~/.ssh`, `~/.gnupg`, cloud credentials, other projects, the Veil identity, the real `.veil` store with cloaked plaintext, other workspaces' sandboxes).
+1. **Reading private files** (`~/.ssh`, `~/.gnupg`, cloud credentials, other projects, the Veil identity, the real `.veil` store, other workspaces' sandboxes).
    - *Invariant:* the root is an empty tmpfs; only the paths above are mounted; `HOME` is an empty tmpfs; `$VEIL_HOME` is masked last; the project path is the sandbox.
    - *Tests:* `HOME/.ssh/id_test` planted in a fake home is not visible; `$VEIL_HOME/identity.json` is not visible (also when an allowed folder contains it); the real project's `.veil` is not visible; `~/.cargo/credentials.toml` is masked.
 2. **Writing outside the sandbox** through `..`, absolute paths, symlinks (absolute, relative, `/proc/self/root`, `/proc/1/root`, `/proc/self/cwd`).

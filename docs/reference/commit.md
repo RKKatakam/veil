@@ -5,7 +5,7 @@
 
 Describe the working-copy change and start a new one on top.
 
-Tags that pointed at the change's parent move to it (`main` follows your commits), except on a cloaked line: there only tags cloaked under the same scope move, so cloaked work never reaches `main` by accident (publish it with `vl merge`).
+Tags that pointed at the change's parent move to it (`main` follows your commits).
 
 ```text
 vl commit [OPTIONS] --message <MESSAGE>

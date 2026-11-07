@@ -4,10 +4,10 @@
 //! must neither overflow the stack nor accept unbounded nesting. Tests run
 //! on the default 2 MiB test-thread stack on purpose.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::sync::Arc;
 
 use veil_core::{
-    embargo::{normalize_tree, wrap, NormalizeOptions, NormalizeReport},
+    embargo::{normalize_tree, NormalizeOptions, NormalizeReport},
     fsck::{fsck, Severity},
     merge::merge_trees,
     object::{EntryKind, Snapshot, Tree, TreeEntry, Visibility},
@@ -25,7 +25,6 @@ fn file(store: &ObjectStore, name: &str, data: &[u8]) -> TreeEntry {
         size: data.len() as u64,
         executable: false,
         visibility: Visibility::Public,
-        fallback: None,
     }
 }
 
@@ -77,28 +76,20 @@ fn merge_of_deep_trees_is_bounded_and_does_not_overflow() {
 }
 
 #[test]
-fn normalisation_and_embargo_sealing_of_deep_trees_do_not_overflow() {
+fn normalisation_of_deep_trees_does_not_overflow() {
     let r = repo();
     let s = r.store();
     let policy = Policy::parse("secret/ cloak team\n");
-    let none = BTreeSet::new();
     let base = chain(s, 3, b"base");
     let opts = NormalizeOptions {
         policy: &policy,
         dest_policy: &policy,
         dest_tree: base,
-        cloak: Some("team"),
-        declassify: &none,
-        defer_declassify: false,
     };
     let ok = chain(s, MAX_TREE_DEPTH - 24, b"x");
     normalize_tree(s, &ok, &opts, &mut NormalizeReport::default()).unwrap();
     let deep = chain(s, 4 * MAX_TREE_DEPTH, b"x");
     assert!(normalize_tree(s, &deep, &opts, &mut NormalizeReport::default()).is_err());
-
-    let id = r.keys().create_embargo("team", None).unwrap();
-    wrap(s, &id, &ok, &base).unwrap();
-    assert!(wrap(s, &id, &deep, &base).is_err());
 }
 
 #[test]
@@ -111,7 +102,7 @@ fn fsck_reports_hostile_nesting_without_overflowing() {
         ..Snapshot::root(tree)
     };
     let id = r.store().put_snapshot(&snap).unwrap();
-    r.set_tag("deep", id, None, true).unwrap();
+    r.set_tag("deep", id, true).unwrap();
     let report = fsck(r.backend().clone(), None).unwrap();
     assert!(
         report

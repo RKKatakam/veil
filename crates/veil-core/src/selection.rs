@@ -14,16 +14,14 @@
 //! read anything:
 //!
 //! * a whole unit's halves are its entries exactly as recorded (same
-//!   object, same sealing, same fallback): no content is read or sealed;
+//!   object, same sealing): no content is read or sealed;
 //! * a text unit is offered by hunk only when this reader can read both
 //!   versions (a version it cannot read makes the file whole: a reader
 //!   cannot choose lines it cannot see), when both labels are verified
-//!   against their objects (`builder::verify_sealing`), when neither is
-//!   under an embargo, and when the new version's audience holds the old
+//!   against their objects (`builder::verify_sealing`), and when the new version's audience holds the old
 //!   one's (the old one public, or sealed exactly as the new one). A file in
 //!   between holds lines of both versions; it is sealed exactly as the new
-//!   version (its scope, and its fallback: the last public version, so the
-//!   public fallback rules still hold). Lines of a version sealed for `s`
+//!   version (its scope). Lines of a version sealed for `s`
 //!   therefore never end up in a file readable by anyone outside `s`.
 //!   A version moved to a wider or another audience (an exposure, a
 //!   re-key) is whole;
@@ -68,8 +66,6 @@ pub enum Whole {
     NoSealingKey(String),
     /// An unresolved conflict on either side.
     Conflict,
-    /// Under an embargo.
-    Embargoed,
     /// The versions have different audiences (exposed, cloaked or
     /// re-keyed by this change).
     Audience,
@@ -94,7 +90,6 @@ impl Whole {
             Whole::Missing => "missing",
             Whole::NoSealingKey(_) => "no_sealing_key",
             Whole::Conflict => "conflict",
-            Whole::Embargoed => "embargoed",
             Whole::Audience => "audience",
             Whole::Unverified => "unverified",
             Whole::Policy => "policy",
@@ -113,7 +108,6 @@ impl Whole {
             Whole::Missing => "its content is not in this repository".into(),
             Whole::NoSealingKey(s) => format!("you hold no current key of '{s}' to seal a part of it"),
             Whole::Conflict => "conflicted (a conflict moves whole; resolve it to split it)".into(),
-            Whole::Embargoed => "under an embargo".into(),
             Whole::Audience => "its audience changes in this change".into(),
             Whole::Unverified => "its visibility label does not match its content".into(),
             Whole::Policy => "the visibility policy".into(),
@@ -206,15 +200,8 @@ pub type Selection = BTreeMap<VPath, Pick>;
 
 /// The file-level changes from `from` to `to`, as units, without reading
 /// any content (every unit [`Content::Pending`], or whole for a
-/// file/directory swap; see [`classify`]). Trees under an embargo wrapper are refused.
+/// file/directory swap; see [`classify`]).
 pub fn units(store: &ObjectStore, from: &ObjectId, to: &ObjectId) -> Result<Vec<Unit>> {
-    for t in [from, to] {
-        if crate::embargo::wrapper_of(store, t)?.is_some() {
-            return Err(VeilError::Policy(
-                "this change is under an embargo: it can only be squashed whole (`vl squash` with no paths)".into(),
-            ));
-        }
-    }
     let changes = diff_trees(store, Some(from), Some(to))?;
     let file_paths: BTreeSet<VPath> = changes.iter().map(|c| c.path.clone()).collect();
     // The highest changed path that is a proper ancestor of `p`: `p` is
@@ -276,9 +263,6 @@ fn classify_change(store: &ObjectStore, c: &TreeChange, conflicted: &[String]) -
     if sides.iter().flatten().any(|e| e.kind == EntryKind::Conflict) || conflicted.iter().any(|p| p == c.path.as_str()) {
         return whole(Whole::Conflict);
     }
-    if sides.iter().flatten().any(|e| matches!(e.visibility, Visibility::Embargoed { .. })) {
-        return whole(Whole::Embargoed);
-    }
     for e in sides.iter().flatten() {
         if !matches!(verify_sealing(store, e)?, Sealing::Verified) {
             return whole(Whole::Unverified);
@@ -289,8 +273,7 @@ fn classify_change(store: &ObjectStore, c: &TreeChange, conflicted: &[String]) -
             return whole(Whole::Audience);
         }
     }
-    // The object itself, never a fallback: the lines chosen must be the
-    // version's own.
+    // The object itself: the lines chosen must be the version's own.
     let read = |e: Option<&TreeEntry>| -> Result<Result<Vec<u8>, Whole>> {
         let Some(e) = e else { return Ok(Ok(Vec::new())) };
         match store.read_blob(&e.id) {
@@ -416,7 +399,6 @@ fn part(store: &ObjectStore, c: &TreeChange, t: &TextUnit, blocks: &BTreeSet<Blo
         size: data.len() as u64,
         executable,
         visibility: template.visibility.clone(),
-        fallback: template.fallback,
     }))
 }
 

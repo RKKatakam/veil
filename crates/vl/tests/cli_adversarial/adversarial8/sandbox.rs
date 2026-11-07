@@ -319,20 +319,22 @@ fn deleting_a_file_of_the_set_keeps_its_siblings() {
 #[test]
 fn deleting_the_policy_in_a_sandbox_never_declassifies_cloaked_files() {
     let env = Env::new();
-    let proj = env.project(U, "proj", &[("src/lib.rs", "lib\n"), ("secret/plan.md", "TOP-SECRET-PLAN-5521\n")]);
+    let proj = env.project(U, "proj", &[("src/lib.rs", "lib\n"), ("secret/.env.plan", "TOP-SECRET-PLAN-5521\n")]);
     let policy = std::fs::read_to_string(proj.join(".veilpolicy")).unwrap();
-    write(&proj, ".veilpolicy", &format!("{policy}secret/ cloak team\n"));
+    write(&proj, ".veilpolicy", &format!("{policy}secret/.env.* cloak team\n"));
     env.ok(U, &proj, &["commit", "-m", "cloak"]);
     env.ok(U, &proj, &["ws", "new", "agent", "-r", "@-"]);
     env.ok(U, &proj, &["ws", "new", "sparse", "-r", "@-"]);
     let before = env.stdout(U, &proj, &["files", "-r", "agent@"]);
-    assert!(before.contains("cloaked:team") && before.contains("secret/plan.md"), "{before}");
+    assert!(before.contains("cloaked:team") && before.contains("secret/.env.plan"), "{before}");
     exec(&env, &proj, &["--", "rm", ".veilpolicy"]);
     env.ok(U, &proj, &["ws", "exec", "sparse", "--only", "src", "--", "rm", ".veilpolicy"]);
     for ws in ["agent@", "sparse@"] {
         let after = env.stdout(U, &proj, &["files", "-r", ws]);
-        let line = after.lines().find(|l| l.contains("secret/plan.md")).unwrap_or_default().to_string();
-        assert!(line.starts_with("cloaked:team"), "{ws}: the cloaked file was declassified: {after}");
+        let line = after.lines().find(|l| l.contains("secret/.env.plan")).unwrap_or_default().to_string();
+        // Sealed for `team`, or (the built-in rules, stronger) not recorded.
+        assert!(line.is_empty() || line.starts_with("cloaked:team"), "{ws}: the cloaked file was declassified: {after}");
+        assert!(!after.lines().any(|l| l.starts_with("public") && l.contains("secret/")), "{ws}: {after}");
     }
 }
 

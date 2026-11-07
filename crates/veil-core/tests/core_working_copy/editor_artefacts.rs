@@ -74,7 +74,7 @@ fn artefacts_of_isolated_files_stay_local_at_any_depth() {
         assert!(out.report.isolated.contains(&p(a)), "{a} is not listed as local-only: {:?}", out.report.isolated);
     }
     let main = repo.commit_working_copy(WS, "notes").unwrap().0;
-    repo.set_tag("main", main, None, false).unwrap();
+    repo.set_tag("main", main, false).unwrap();
     let mirror = Arc::new(MemoryBackend::new());
     remote::push(&mut repo, mirror.clone(), true, &["main".to_string()], false).unwrap();
     for needle in ["QyNTUxOQAAACBGqZt3YkVvQ2mR8sXlN0pWcF4hTj7uK9eAoD1bLyS6xQ", "acquisition closes", "Zq8vXk9mQ2vL7pR4"] {
@@ -86,21 +86,21 @@ fn artefacts_of_isolated_files_stay_local_at_any_depth() {
 fn artefacts_of_cloaked_files_keep_the_scope() {
     let (mut repo, fs, _) = new_repo("alice");
     fs.write(&p(POLICY_FILE), b"plans/ cloak team\n").unwrap();
-    fs.write(&p("plans/q3/launch.md"), NOTE.as_bytes()).unwrap();
+    fs.write(&p("plans/q3/launch.pem"), NOTE.as_bytes()).unwrap();
     // Backup copies are recorded under the same scope.
-    for a in ["plans/q3/launch.md.orig", "plans/q3/launch.md.bak", "plans/q3/launch.md.tmp"] {
+    for a in ["plans/q3/launch.pem.orig", "plans/q3/launch.pem.bak", "plans/q3/launch.pem.tmp"] {
         fs.write(&p(a), NOTE.as_bytes()).unwrap();
     }
     // Scratch files are not recorded at all.
-    for a in ["plans/q3/.launch.md.swp", "plans/q3/launch.md~", "plans/q3/#launch.md#"] {
+    for a in ["plans/q3/.launch.pem.swp", "plans/q3/launch.pem~", "plans/q3/#launch.pem#"] {
         fs.write(&p(a), NOTE.as_bytes()).unwrap();
     }
     let s = snap(&mut repo, &*fs);
-    for a in ["plans/q3/launch.md", "plans/q3/launch.md.orig", "plans/q3/launch.md.bak", "plans/q3/launch.md.tmp"] {
+    for a in ["plans/q3/launch.pem", "plans/q3/launch.pem.orig", "plans/q3/launch.pem.bak", "plans/q3/launch.pem.tmp"] {
         let e = file_entry(&repo, &s, a).unwrap_or_else(|| panic!("{a} missing"));
         assert_eq!(e.visibility, Visibility::Cloaked { scope: "team".into() }, "{a}");
     }
-    for a in ["plans/q3/.launch.md.swp", "plans/q3/launch.md~", "plans/q3/#launch.md#"] {
+    for a in ["plans/q3/.launch.pem.swp", "plans/q3/launch.pem~", "plans/q3/#launch.pem#"] {
         assert!(file_entry(&repo, &s, a).is_none(), "{a} was recorded");
     }
     // A rule naming scratch files publishes those of public files, not those
@@ -109,7 +109,7 @@ fn artefacts_of_cloaked_files_keep_the_scope() {
     fs.write(&p("src/.main.rs.swp"), b"fn main() {}\0").unwrap();
     let s = snap(&mut repo, &*fs);
     assert_eq!(file_entry(&repo, &s, "src/.main.rs.swp").unwrap().visibility, Visibility::Public);
-    for a in ["plans/q3/.launch.md.swp", "plans/q3/launch.md~"] {
+    for a in ["plans/q3/.launch.pem.swp", "plans/q3/launch.pem~"] {
         let e = file_entry(&repo, &s, a).unwrap_or_else(|| panic!("{a} missing"));
         assert_eq!(e.visibility, Visibility::Cloaked { scope: "team".into() }, "{a}");
     }

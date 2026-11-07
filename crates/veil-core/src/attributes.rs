@@ -731,8 +731,6 @@ impl AttrSource for TreeSource<'_> {
         if e.size > MAX_FILE as u64 {
             return Err(too_large());
         }
-        // Readers without the key see the last public version of a sealed
-        // edit, as everywhere else.
         match self.store.read_entry(&e) {
             Ok(d) => Ok(Some(d)),
             Err(err) => Err(err.to_string()),
@@ -741,9 +739,8 @@ impl AttrSource for TreeSource<'_> {
 }
 
 /// The `.veilattributes` files of a recorded tree as one **audience** reads
-/// them (BUG-705): a file whose content is public (or under a released
-/// embargo), or sealed exactly for `audience`, is read as it is; a file
-/// sealed for anyone else gives its last public version (its fallback), or
+/// them (BUG-705): a file whose content is public, or sealed exactly for
+/// `audience`, is read as it is; a file sealed for anyone else gives
 /// nothing. Attributes that shape a merged result therefore come only from
 /// what the result's readers can read: a sealed `merge=union` never decides
 /// a public merge (the rule public patches already follow).
@@ -771,7 +768,6 @@ impl AttrSource for AudienceTreeSource<'_> {
         }
         let shown = |v: &crate::object::Visibility| match v {
             crate::object::Visibility::Public => true,
-            crate::object::Visibility::Embargoed { embargo } if self.store.keys.embargo_released(embargo) => true,
             v => *v == self.audience,
         };
         // What it really is sealed for (the visibility the opened object
@@ -779,7 +775,7 @@ impl AttrSource for AudienceTreeSource<'_> {
         let data = match readable_version(self.store, &e, Reader::Me).map_err(|e| e.to_string())? {
             Readable::Plain { data, visibility, .. } if shown(&visibility) => Some(data),
             _ => match readable_version(self.store, &e, Reader::Public).map_err(|e| e.to_string())? {
-                Readable::Plain { data, .. } | Readable::Fallback { data, .. } => Some(data),
+                Readable::Plain { data, .. } => Some(data),
                 Readable::Redacted(_) => None,
             },
         };

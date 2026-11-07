@@ -190,12 +190,12 @@ fn mode_changes_are_a_choice_of_their_own() {
 #[test]
 fn cloaked_hunks_stay_cloaked() {
     let env = Env::new();
-    let proj = env.project("alice", "proj", &[(".veilpolicy", "secret/ cloak team\n"), ("secret/s.txt", OLD)]);
-    write(&proj, "secret/s.txt", NEW);
-    env.ok("alice", &proj, &["split", "--hunks", "secret/s.txt:1.1"]);
-    assert_eq!(cat(&env, &proj, "@-", "secret/s.txt"), OLD.replacen("2\n", "TWO\n", 1));
+    let proj = env.project("alice", "proj", &[(".veilpolicy", "secret/.env.s cloak team\n"), ("secret/.env.s", OLD)]);
+    write(&proj, "secret/.env.s", NEW);
+    env.ok("alice", &proj, &["split", "--hunks", "secret/.env.s:1.1"]);
+    assert_eq!(cat(&env, &proj, "@-", "secret/.env.s"), OLD.replacen("2\n", "TWO\n", 1));
     let ls: Value = serde_json::from_str(&env.stdout("alice", &proj, &["ls", "-r", "@-", "--json"])).unwrap();
-    let e = ls["entries"].as_array().unwrap().iter().find(|e| e["path"] == "secret/s.txt").unwrap().clone();
+    let e = ls["entries"].as_array().unwrap().iter().find(|e| e["path"] == "secret/.env.s").unwrap().clone();
     assert_eq!(e["visibility"]["kind"], "cloaked", "{e}");
     assert_eq!(e["visibility"]["scope"], "team", "{e}");
     // No plaintext of the half anywhere in the store.

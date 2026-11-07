@@ -41,8 +41,8 @@ fn status_lists_editor_artefacts_of_protected_files_as_local_only() {
 fn status_says_why_a_file_is_redacted() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("README.md", "hello\n")]);
-    env.ok("alice", &proj, &["cloak", "plans/"]);
-    write(&proj, "plans/q3.md", "launch\n");
+    env.ok("alice", &proj, &["cloak", "plans/.env.q3"]);
+    write(&proj, "plans/.env.q3", "launch\n");
     env.ok("alice", &proj, &["commit", "-m", "plans"]);
     env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
     let mirror = env.root.join("mirror");
@@ -54,8 +54,8 @@ fn status_says_why_a_file_is_redacted() {
 
     env.ok("bob", &env.root, &["clone", mirror.to_str().unwrap(), "bob"]);
     let status = env.ok("bob", &env.root.join("bob"), &["status"]);
-    assert!(status.contains("R plans/q3.md [redacted]  (cloaked:team; withheld by a public remote)"), "{status}");
+    assert!(status.contains("R plans/.env.q3 [redacted]  (cloaked:team; not received)"), "{status}");
     env.ok("carol", &env.root, &["clone", team.to_str().unwrap(), "carol"]);
     let status = env.ok("carol", &env.root.join("carol"), &["status"]);
-    assert!(status.contains("R plans/q3.md [redacted]  (cloaked:team; no key)"), "{status}");
+    assert!(status.contains("R plans/.env.q3 [redacted]  (cloaked:team; no key)"), "{status}");
 }

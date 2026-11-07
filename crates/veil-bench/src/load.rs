@@ -398,7 +398,6 @@ impl Agent<'_> {
                 size,
                 executable: false,
                 visibility: Visibility::Public,
-                fallback: None,
             });
             let mut child = put(Object::Tree(leaf));
             for (t, part) in chain.into_iter().zip(&self.dir).rev() {
@@ -416,7 +415,6 @@ impl Agent<'_> {
                 timestamp: veil_core::now_millis(),
                 predecessors: vec![],
                 conflicts: vec![],
-                cloak: None,
                 embargo: None,
                 signature: None,
             };
@@ -587,7 +585,6 @@ fn create_project(api: &Api, admin: &Identity, admin_token: &str, agent: &str) -
         size,
         executable: false,
         visibility: Visibility::Public,
-        fallback: None,
     };
     let policy = b"w/  agents\n".to_vec();
     let readme = b"agents land here\n".to_vec();
@@ -610,7 +607,6 @@ fn create_project(api: &Api, admin: &Identity, admin_token: &str, agent: &str) -
         timestamp: veil_core::now_millis(),
         predecessors: vec![],
         conflicts: vec![],
-        cloak: None,
         embargo: None,
         signature: None,
     };

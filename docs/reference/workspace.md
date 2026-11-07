@@ -52,7 +52,6 @@ Options:
 | | |
 |---|---|
 | `-r, --rev <REV>` | Base revision (default: the parents of @, like a fresh checkout) |
-| `--cloak [<SCOPE>]` | Cloak everything recorded in this workspace (default scope: team) |
 
 ## `vl workspace switch`
 
@@ -165,7 +164,7 @@ Arguments:
 
 Mount a workspace as a directory (FUSE), without checking it out.
 
-Reads come from the workspace's tree, as this identity may see it (cloaked files it cannot read are absent or show their public version, as in a checkout). Writes go to an overlay kept in .veil/local/mounts/NAME and are recorded into the workspace, through the policy and the secret scanner: by `vl ws unmount`, before every other vl command, every --record-every seconds, and when the directory is unmounted from outside. Isolated, ignored and quarantined files stay in the mount and are never recorded. Without --foreground a background process serves the mount. Needs FUSE (/dev/fuse and fusermount3 on Linux; macFUSE and a `--features macfuse` build on macOS).
+Reads come from the workspace's tree, as this identity may see it (secret files it cannot read are absent, as in a checkout). Writes go to an overlay kept in .veil/local/mounts/NAME and are recorded into the workspace, through the policy and the secret scanner: by `vl ws unmount`, before every other vl command, every --record-every seconds, and when the directory is unmounted from outside. Isolated, ignored and quarantined files stay in the mount and are never recorded. Without --foreground a background process serves the mount. Needs FUSE (/dev/fuse and fusermount3 on Linux; macFUSE and a `--features macfuse` build on macOS).
 
 ```text
 vl workspace mount [OPTIONS] <NAME> <DIR>

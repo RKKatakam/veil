@@ -9,7 +9,7 @@ use std::{
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use veil_core::{
-    keychain::{validate_scope_name, Keychain, RingMerge},
+    keychain::{validate_scope_name, Keychain},
     team_vault::{env_cost, is_execution_variable, is_identifier, RevokeReport, TeamVault},
     VPath,
 };
@@ -46,51 +46,8 @@ pub(crate) fn check_scope(keys: &Keychain, scope: &str) -> Result<()> {
     Ok(())
 }
 
-/// BUG-524: bring the scope's key ring up to date from the team remotes
-/// before sealing, so a revocation this device has not pulled yet does not
-/// leave the new value readable by the revoked member. Warns when no team
-/// remote could be checked (`vl push` re-seals such a write before sending
-/// it, see `veil_core::team_vault`).
-fn refresh_ring(ctx: &Ctx, scope: &str) {
-    let team: Vec<String> = ctx
-        .repo
-        .config()
-        .remotes
-        .iter()
-        .filter(|(_, r)| !r.public)
-        .map(|(n, _)| n.clone())
-        .collect();
-    let mut checked = false;
-    let mut failed = Vec::new();
-    for name in &team {
-        let merged = crate::remote_backend(ctx, name)
-            .and_then(|(backend, _)| Ok(veil_core::remote::refresh_ring(&ctx.repo, backend, scope)?));
-        match merged {
-            Ok(Some(RingMerge::Rejected(w))) => {
-                warn(&safe(&w));
-                failed.push(format!("{name} (its key ring was not taken)"));
-            }
-            Ok(Some(RingMerge::Updated)) => {
-                checked = true;
-                eprintln!("{}", dim(&format!("Updated the key ring of scope {scope} from remote {}", safe(name))));
-            }
-            Ok(_) => checked = true,
-            Err(e) => failed.push(format!("{name}: {e:#}")),
-        }
-    }
-    if !checked && !failed.is_empty() {
-        warn(&format!(
-            "could not check that the key ring of scope {scope} is current ({}). If a member was revoked since your \
-             last pull, this value is sealed under a key they still hold; `vl push` re-seals it under the current key \
-             before sending it",
-            safe(&failed.join("; "))
-        ));
-    }
-}
-
 pub fn set(ctx: &mut Ctx, scope: &str, name: &str, value: &str) -> Result<()> {
     check_scope(ctx.repo.keys(), scope)?;
-    refresh_ring(ctx, scope);
     let out = ctx.repo.keys().team_secret_write(scope, name, Some(value))?;
     for n in &out.notes {
         warn(&safe(n));
@@ -184,7 +141,6 @@ pub fn list(ctx: &Ctx, scope: &str, exposed_to: Option<&str>, json: bool) -> Res
 
 pub fn rm(ctx: &mut Ctx, scope: &str, name: &str) -> Result<()> {
     check_scope(ctx.repo.keys(), scope)?;
-    refresh_ring(ctx, scope);
     let out = ctx.repo.keys().team_secret_write(scope, name, None)?;
     for n in &out.notes {
         warn(&safe(n));

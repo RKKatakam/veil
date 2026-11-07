@@ -37,9 +37,9 @@ fn conflicts(repo: &Repo) -> Vec<String> {
     repo.snapshot(&repo.workspace_wc(WS).unwrap()).unwrap().conflicts.clone()
 }
 
-/// `f.txt` = `a b c` at `base`; `ours` and `theirs` edit line 2 (each
-/// sealed as its `vis` says, through the policy); merged with `vl merge`,
-/// the working copy checked out on top of the merge.
+/// `f.txt` = `a b c` at `base`; `ours` and `theirs` edit line 2 (`theirs`
+/// sealed for `team` if `theirs_sealed`); merged with `vl merge`, the
+/// working copy checked out on top of the merge.
 struct World {
     repo: Repo,
     fs: Arc<MemoryBackend>,
@@ -48,14 +48,26 @@ struct World {
     theirs: ObjectId,
 }
 
-fn world(theirs_cloaked: bool) -> World {
+fn world(theirs_sealed: bool) -> World {
     let (mut repo, fs, _) = new_repo("alice");
     let base = commit_files(&mut repo, &*fs, &[("f.txt", "a\nb\nc\n"), ("other.txt", "x\n")], "base");
     let ours = commit_files(&mut repo, &*fs, &[("f.txt", "a\nOURS\nc\n")], "ours");
-    repo.create_workspace("t", vec![base], theirs_cloaked.then(|| "team".to_string())).unwrap();
-    let o = repo.workspace_overlay("t").unwrap();
-    o.write(&p("f.txt"), b"a\nTHEIRS\nc\n").unwrap();
-    let theirs = repo.snapshot_workspace("t", &o).unwrap().snapshot;
+    let theirs = if theirs_sealed {
+        // A version sealed for `team` (as a secret file's is), stored as is.
+        let store = repo.store();
+        let mut root = (*store.tree(&store.snapshot(&base).unwrap().tree).unwrap()).clone();
+        let mut e = root.get("f.txt").unwrap().clone();
+        e.id = store.store_file(b"a\nTHEIRS\nc\n", &team()).unwrap();
+        e.size = "a\nTHEIRS\nc\n".len() as u64;
+        e.visibility = team();
+        root.insert(e);
+        raw_snapshot(&repo, vec![base], store.put_tree(&root).unwrap(), "theirs")
+    } else {
+        repo.create_workspace("t", vec![base]).unwrap();
+        let o = repo.workspace_overlay("t").unwrap();
+        o.write(&p("f.txt"), b"a\nTHEIRS\nc\n").unwrap();
+        repo.snapshot_workspace("t", &o).unwrap().snapshot
+    };
     World { repo, fs, base, ours, theirs }
 }
 
@@ -83,7 +95,7 @@ fn a_merge_records_a_conflict_entry_rendered_only_on_checkout() {
     let m = w.merge();
     let e = file_entry(&w.repo, &m, "f.txt").unwrap();
     assert_eq!(e.kind, EntryKind::Conflict);
-    assert!(e.visibility.is_public() && e.fallback.is_none() && !e.executable && e.size == 0);
+    assert!(e.visibility.is_public() && !e.executable && e.size == 0);
     let c = w.repo.store().conflict(&e.id).unwrap();
     assert_eq!((c.adds.len(), c.removes.len()), (2, 1));
     // No blob in the store holds the markers: they exist only on disk.
@@ -181,7 +193,7 @@ fn rebasing_onto_a_resolution_resolves_and_otherwise_carries_the_conflict() {
     // Onto a change of `ours` that already made `theirs`' edit: resolved
     // by the new parent (both sides made the same change).
     let moved = w.repo.rebase(back, vec![w.ours]).unwrap();
-    w.repo.create_workspace("fix", vec![w.ours], None).unwrap();
+    w.repo.create_workspace("fix", vec![w.ours]).unwrap();
     let o = w.repo.workspace_overlay("fix").unwrap();
     o.write(&p("f.txt"), b"a\nTHEIRS\nc\n").unwrap();
     let fixed = w.repo.snapshot_workspace("fix", &o).unwrap().snapshot;
@@ -234,7 +246,7 @@ fn resolve_keeps_a_version_exactly_as_recorded() {
         assert_eq!((e.id, &e.visibility), (chosen.id, &chosen.visibility), "{pick:?}: the version as recorded");
         assert_eq!(w.disk("f.txt"), want);
         assert!(conflicts(&w.repo).is_empty());
-        // Theirs was sealed for `team` on its cloaked line: kept so.
+        // Theirs was sealed for `team`: kept so.
         if pick == Pick::Theirs {
             assert_eq!(e.visibility, team());
         }
@@ -261,7 +273,7 @@ fn resolve_refuses_what_is_not_a_conflict() {
 fn a_sealed_side_is_redacted_for_outsiders_who_cannot_resolve_it() {
     let mut w = world(true);
     let m = w.merge();
-    w.repo.set_tag("main", m, None, true).unwrap();
+    w.repo.set_tag("main", m, true).unwrap();
     let e = file_entry(&w.repo, &m, "f.txt").unwrap();
     let mine = materialize_entry(w.repo.store(), &e, Audience::Reader).unwrap();
     assert_eq!(mine.visibility, team());
@@ -299,7 +311,7 @@ fn a_sealed_side_is_redacted_for_outsiders_who_cannot_resolve_it() {
 fn a_redacted_copy_is_filled_in_once_the_reader_is_granted() {
     let mut w = world(true);
     let m = w.merge();
-    w.repo.set_tag("main", m, None, true).unwrap();
+    w.repo.set_tag("main", m, true).unwrap();
     let hub = Arc::new(MemoryBackend::new());
     remote::push(&mut w.repo, hub.clone(), false, &[], false).unwrap();
     let bob = Identity::generate("bob");
@@ -333,7 +345,7 @@ fn a_redacted_copy_is_filled_in_once_the_reader_is_granted() {
 fn a_public_push_withholds_sealed_sides_of_a_conflict() {
     let mut w = world(true);
     let m = w.merge();
-    w.repo.set_tag("main", m, None, true).unwrap();
+    w.repo.set_tag("main", m, true).unwrap();
     let mirror = Arc::new(MemoryBackend::new());
     let rep = remote::push(&mut w.repo, mirror.clone(), true, &["main".into()], false).unwrap();
     assert!(rep.redacted >= 1, "{rep:?}");
@@ -357,7 +369,7 @@ fn merging_conflicts_gives_a_many_sided_conflict() {
     let mut w = world(false);
     let m1 = w.merge();
     // A second, different conflict of f.txt from `ours`.
-    w.repo.create_workspace("u", vec![w.base], None).unwrap();
+    w.repo.create_workspace("u", vec![w.base]).unwrap();
     let o = w.repo.workspace_overlay("u").unwrap();
     o.write(&p("f.txt"), b"a\nUUU\nc\n").unwrap();
     let u = w.repo.snapshot_workspace("u", &o).unwrap().snapshot;
@@ -382,7 +394,7 @@ fn a_modify_delete_conflict_shows_the_modified_side() {
     let (mut repo, fs, _) = new_repo("alice");
     let base = commit_files(&mut repo, &*fs, &[("f.txt", "v1\n")], "base");
     let ours = commit_files(&mut repo, &*fs, &[("f.txt", "v2\n")], "ours");
-    repo.create_workspace("d", vec![base], None).unwrap();
+    repo.create_workspace("d", vec![base]).unwrap();
     let o = repo.workspace_overlay("d").unwrap();
     o.remove_file(&p("f.txt")).unwrap();
     o.write(&p("g.txt"), b"g\n").unwrap();

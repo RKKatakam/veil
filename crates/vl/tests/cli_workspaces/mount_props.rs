@@ -110,10 +110,10 @@ fn tree(dir: &Path) -> BTreeMap<String, String> {
     out
 }
 
-const SECRET: &str = "docs/secret.md";
+const SECRET: &str = "docs/.env.secret";
 const SECRET_TEXT: &str = "SECRET-PLAN-77\n";
 
-/// Alice's project on a team remote: `docs/secret.md` cloaked for `team`
+/// Alice's project on a team remote: `docs/.env.secret` cloaked for `team`
 /// next to public files, `docs/readme.md` in the same directory. Bob clones
 /// it before he holds the key and has workspace `work` on `main`.
 fn bob_without_the_key(env: &Env) -> (PathBuf, PathBuf) {
@@ -161,16 +161,16 @@ fn a_repository_around_a_mount_never_records_it() {
     let env = Env::new();
     let secret = env.dir("secret");
     write(&secret, "README.md", "hello\n");
-    write(&secret, "internal/plan.md", SECRET_TEXT);
+    write(&secret, "internal/.env.plan", SECRET_TEXT);
     env.ok("alice", &secret, &["init"]);
-    env.ok("alice", &secret, &["cloak", "internal/"]);
+    env.ok("alice", &secret, &["cloak", "internal/.env.plan"]);
     env.ok("alice", &secret, &["commit", "-m", "initial"]);
     env.ok("alice", &secret, &["ws", "new", "view", "-r", "@-"]);
     let outer = env.dir("outer");
     write(&outer, "lib.rs", "pub fn f() {}\n");
     let mnt = outer.join("mnt");
     let _g = mount_at(&env, "alice", &secret, "view", &mnt);
-    assert_eq!(read(&mnt, "internal/plan.md"), SECRET_TEXT);
+    assert_eq!(read(&mnt, "internal/.env.plan"), SECRET_TEXT);
     // Now a repository is made around it.
     env.ok("alice", &outer, &["init"]);
     env.ok("alice", &outer, &["commit", "-m", "first"]);
@@ -179,7 +179,7 @@ fn a_repository_around_a_mount_never_records_it() {
     assert!(!recorded.iter().any(|f| f.starts_with("mnt")), "the enclosing repository recorded the mount: {recorded:?}");
     // And it never writes into the mount (a checkout of another revision).
     env.ok("alice", &outer, &["new", "root()"]);
-    assert_eq!(read(&mnt, "internal/plan.md"), SECRET_TEXT);
+    assert_eq!(read(&mnt, "internal/.env.plan"), SECRET_TEXT);
     let out = env.ok("alice", &secret, &["ws", "unmount", "view"]);
     assert!(!files(&env, "alice", &secret, "view@").is_empty(), "{out}");
 }

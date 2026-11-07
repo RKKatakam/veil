@@ -26,12 +26,6 @@
 //! A driver gets the base only where its audience is the result's (as
 //! conflict markers do, BUG-126), never runs where two scopes clash, and
 //! its output is sealed as any merged content is.
-//!
-//! Trees under an unreleased embargo (see [`crate::embargo`]) stay under it:
-//! the result is re-wrapped under the same embargo, with the merge of the
-//! inputs' public views as its fallback. Merging them needs the embargo key,
-//! and trees under two different unreleased embargoes are never merged
-//! (embargoes cannot overlap in Veil 1.0).
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -43,7 +37,6 @@ use crate::{
     blame::Reader,
     builder::{verify_sealing, Sealing},
     conflict::{Merge, Term},
-    embargo::{overlap_error, public_view, unreleased_wrapper, wrap},
     error::{Result, VeilError},
     id::ObjectId,
     object::{ConflictTerm, EntryKind, Tree, TreeEntry, Visibility},
@@ -84,19 +77,11 @@ enum Mode {
 
 /// Three-way merge of trees. In a repository of format 4 or later, files
 /// that do not merge become conflict entries ([`crate::conflict`]); below
-/// format 4, and for trees under an unreleased embargo, they get conflict
+/// format 4, they get conflict
 /// markers in their content, as before.
 pub fn merge_trees(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId) -> Result<MergeOutcome> {
     let markers = store.format() < crate::object::CONFLICT_REPO_FORMAT;
     merge_trees_in(store, base, ours, theirs, Mode::Merge, markers)
-}
-
-/// [`merge_trees`] that writes conflicts as markers in the file whatever
-/// the repository format (a merge about to be put under an embargo: sealed
-/// trees never hold conflict entries). Conflict entries met on the way are
-/// replaced by their marker files.
-pub fn merge_trees_with_markers(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId) -> Result<MergeOutcome> {
-    merge_trees_in(store, base, ours, theirs, Mode::Merge, true)
 }
 
 /// The virtual merge base of two merge bases `ours` and `theirs` (whose
@@ -117,42 +102,7 @@ fn merge_trees_in(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, t
     if Some(ours) == base {
         return Ok(MergeOutcome::clean(theirs));
     }
-    let mut wrapped: Option<crate::embargo::EmbargoWrapper> = None;
-    for id in [Some(ours), Some(theirs), base].into_iter().flatten() {
-        if let Some(w) = unreleased_wrapper(store, &id)? {
-            if !store.keys.has(&w.key_label()) {
-                return Err(VeilError::Policy(format!(
-                    "cannot merge: part of this history is under unreleased embargo {} and you do not hold its key",
-                    w.embargo
-                )));
-            }
-            // Embargoes never overlap (Veil 1.0): combining two lines under
-            // different unreleased embargoes would nest one inside the other.
-            match &wrapped {
-                Some(first) if first.embargo != w.embargo => return Err(overlap_error(&first.embargo, &w.embargo)),
-                Some(_) => {}
-                None => wrapped = Some(w),
-            }
-        }
-    }
-    // Trees under an embargo never hold conflict entries.
-    let markers = markers || wrapped.is_some();
-    let full = merge_resolved(store, base, ours, theirs, mode, markers)?;
-    let Some(w) = wrapped else {
-        return Ok(full);
-    };
-    // What readers without the key see: the same merge of what they see.
-    let pv = |id: ObjectId| public_view(store, &id);
-    let (pb, po, pt) = (base.map(pv).transpose()?, pv(ours)?, pv(theirs)?);
-    let fallback = match merge_resolved(store, pb, po, pt, mode, markers) {
-        Ok(m) => m.tree,
-        Err(_) => po,
-    };
-    Ok(MergeOutcome {
-        tree: wrap(store, &w.embargo, &full.tree, &fallback)?,
-        conflicts: full.conflicts,
-        renames: full.renames,
-    })
+    merge_resolved(store, base, ours, theirs, mode, markers)
 }
 
 fn merge_resolved(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId, mode: Mode, markers: bool) -> Result<MergeOutcome> {
@@ -200,12 +150,7 @@ fn subtree(store: &ObjectStore, e: Option<&TreeEntry>) -> Result<Option<(Arc<Tre
 }
 
 fn read_for_merge(store: &ObjectStore, e: &TreeEntry, path: &VPath) -> Result<Vec<u8>> {
-    // A cloaked entry's fallback is its last public version, not its
-    // content: merging that would silently revert the sealed edit.
-    let read = match e.visibility {
-        Visibility::Cloaked { .. } => store.read_blob(&e.id),
-        _ => store.read_entry(e),
-    };
+    let read = store.read_blob(&e.id);
     read.map_err(|err| match err {
         VeilError::Redacted { scope } => VeilError::Policy(format!(
             "cannot merge {path}: it is cloaked under scope '{scope}' and you do not hold the key"
@@ -499,10 +444,7 @@ impl<'a> MergeAttrs<'a> {
 
     /// The attributes for a result sealed as `audience`.
     fn for_audience(&self, audience: &Visibility) -> Arc<Attrs<'a>> {
-        let audience = match audience {
-            Visibility::Embargoed { embargo } if self.store.keys.embargo_released(embargo) => Visibility::Public,
-            v => v.clone(),
-        };
+        let audience = audience.clone();
         let mut by = self.by_audience.borrow_mut();
         if let Some((_, a)) = by.iter().find(|(v, _)| *v == audience) {
             return a.clone();
@@ -647,7 +589,7 @@ fn merge_file_content(
         return Ok(Some(TreeEntry { executable, ..oe.clone() }));
     }
     let (oe, te) = (&checked(store, oe, path)?, &checked(store, te, path)?);
-    let (visibility, fallback) = merged_visibility(store, oe, te);
+    let visibility = merged_visibility(oe, te);
     let base_ok = base_shown(store, be, &visibility)?;
     let how = strategy(store, attrs, &visibility, path, mode);
     let merged = match content_merge(store, path, &how, &base, &ours, &theirs, base_ok, crate::textmerge::Style::Diff3) {
@@ -665,7 +607,6 @@ fn merge_file_content(
         size: merged.len() as u64,
         executable,
         visibility,
-        fallback,
     }))
 }
 
@@ -712,7 +653,7 @@ fn merge_file(
     // (BUG-103: a forged `cloaked:embargo/<released>` or `cloaked:<scope of
     // the attacker's>` label on one side would re-key it).
     let (oe, te) = (&checked(store, oe, path)?, &checked(store, te, path)?);
-    let (visibility, fallback) = merged_visibility(store, oe, te);
+    let visibility = merged_visibility(oe, te);
     // The base's text may appear in the result only where its audience is
     // the result's (BUG-126): a base sealed for a scope never shows in a
     // public result, or in one sealed for another audience.
@@ -758,7 +699,6 @@ fn merge_file(
         size: merged.len() as u64,
         executable,
         visibility,
-        fallback,
     })
 }
 
@@ -804,7 +744,7 @@ fn verified_visibility(store: &ObjectStore, e: &TreeEntry) -> Result<Option<Visi
 
 /// Whether the text of the base `be` may appear in a merged file sealed as
 /// `result`, as the "original" section of its conflict markers (BUG-126):
-/// when the base is public (or under a released embargo), or (verifiably)
+/// when the base is public, or (verifiably)
 /// sealed exactly as the result is. Otherwise the conflict shows only the
 /// two sides. A clean merge never holds lines of the base that neither side
 /// has, so only the markers are concerned.
@@ -814,7 +754,6 @@ fn base_shown(store: &ObjectStore, be: Option<&TreeEntry>, result: &Visibility) 
     };
     Ok(match verified_visibility(store, b)? {
         Some(Visibility::Public) => true,
-        Some(Visibility::Embargoed { embargo }) if store.keys.embargo_released(&embargo) => true,
         Some(v) => v == *result,
         None => false,
     })
@@ -847,36 +786,13 @@ fn audience_clash(store: &ObjectStore, be: Option<&TreeEntry>, oe: &TreeEntry, t
 }
 
 /// The visibility of a file merged from `oe` and `te`: never wider than
-/// either side. Ours' sealing wins if ours is sealed; otherwise theirs'.
-/// An embargoed result taken from theirs shows ours (public) as fallback.
-/// A cloaked result from a side that is a sealed edit of a public file
-/// (it has a fallback) shows the other side's public version as its
-/// fallback if there is one (the newest public version), else the
-/// sealed side's own.
-///
-/// A scope's sealing beats an embargo's (the release would publish the
-/// scope's content), and a released embargo counts as public: its key is
-/// public, so nothing new is ever sealed under it.
-fn merged_visibility(store: &ObjectStore, oe: &TreeEntry, te: &TreeEntry) -> (Visibility, Option<ObjectId>) {
-    let public_other = |sealed: &TreeEntry, other: &TreeEntry| match (sealed.fallback, other.visibility.is_public() && other.fallback.is_none()) {
-        (Some(_), true) => Some(other.id),
-        (fb, _) => fb,
-    };
-    let rank = |e: &TreeEntry| match &e.visibility {
-        Visibility::Cloaked { .. } => 2,
-        Visibility::Embargoed { embargo } if !store.keys.embargo_released(embargo) => 1,
-        _ => 0,
-    };
-    let ours_wins = rank(oe) >= rank(te);
-    let (sealed, other) = if ours_wins { (oe, te) } else { (te, oe) };
-    match rank(sealed) {
-        2 => (sealed.visibility.clone(), public_other(sealed, other)),
-        // An embargoed result shows ours (its fallback, or ours itself when
-        // public) to readers without the key.
-        1 if ours_wins => (oe.visibility.clone(), oe.fallback),
-        1 if oe.visibility.is_public() => (te.visibility.clone(), Some(oe.id)),
-        1 => (te.visibility.clone(), te.fallback),
-        _ => (Visibility::Public, None),
+/// either side. Ours' sealing wins if ours is sealed (a secret); otherwise
+/// theirs'.
+fn merged_visibility(oe: &TreeEntry, te: &TreeEntry) -> Visibility {
+    match (&oe.visibility, &te.visibility) {
+        (Visibility::Cloaked { .. }, _) => oe.visibility.clone(),
+        (_, Visibility::Cloaked { .. }) => te.visibility.clone(),
+        _ => Visibility::Public,
     }
 }
 
@@ -944,9 +860,8 @@ pub struct FollowedRename {
     pub score: u8,
     pub side: RenameSide,
     pub how: RenameMerge,
-    /// The result at `to` is sealed for this audience: it stays sealed at
-    /// its new path, whatever the policy says there; only `vl expose`
-    /// publishes it.
+    /// The result at `to` is a sealed secret, for this audience: it stays
+    /// sealed at its new path.
     pub sealed: Option<Visibility>,
 }
 
@@ -1197,54 +1112,12 @@ fn finish_renames(
         if let Some(e) = lookup(store, &tree, &r.to)?.filter(|e| e.kind == EntryKind::File) {
             r.sealed = match verified_visibility(store, &e)? {
                 Some(Visibility::Public) | None => None,
-                Some(Visibility::Embargoed { embargo }) if store.keys.embargo_released(&embargo) => None,
                 Some(v) => Some(v),
             };
         }
         out.push(r);
     }
     Ok((tree, out))
-}
-
-/// For `vl merge`, after it re-derived audiences
-/// ([`crate::embargo::normalize_tree`]): a file whose edit followed a rename
-/// and that the merge left sealed keeps its sealed entry from `merged` at
-/// its new path, even where the policy would publish the merged-in line's
-/// files (or quarantine them): the rename put it there, not the line being
-/// merged, and only `vl expose` publishes it. Such paths leave
-/// `declassified` and `quarantined`, and `warnings` says why.
-pub fn keep_followed_sealed(
-    store: &ObjectStore,
-    mut tree: ObjectId,
-    merged: ObjectId,
-    renames: &[FollowedRename],
-    declassified: &mut Vec<VPath>,
-    quarantined: &mut Vec<(VPath, Vec<crate::secrets::Finding>)>,
-    warnings: &mut Vec<String>,
-) -> Result<ObjectId> {
-    for r in renames {
-        let Some(vis) = &r.sealed else { continue };
-        let was_declassified = declassified.contains(&r.to);
-        let was_quarantined = quarantined.iter().any(|(p, _)| *p == r.to);
-        if !was_declassified && !was_quarantined {
-            continue;
-        }
-        declassified.retain(|p| *p != r.to);
-        quarantined.retain(|(p, _)| *p != r.to);
-        let Some(sealed) = lookup(store, &merged, &r.to)? else { continue };
-        let now = lookup(store, &tree, &r.to)?;
-        if now.as_ref() != Some(&sealed) && unreleased_wrapper(store, &tree)?.is_none() {
-            tree = crate::conflict::set_entry(store, &tree, &r.to, Some(sealed))?;
-        }
-        warnings.push(format!(
-            "{} followed the rename of {} and stays sealed ({}) at its new path; `vl expose {}` publishes it",
-            r.to,
-            r.from,
-            vis.label(),
-            r.to
-        ));
-    }
-    Ok(tree)
 }
 
 /// `tree` with `entry` moved from `from` to `to` (directories created as

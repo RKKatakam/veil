@@ -160,7 +160,7 @@ pub fn request_signed(grant: &Grant, ts: i64, ids: &[ObjectId], signature: Optio
 pub trait ChainSource {
     /// The tree `id`; `None` if it is not held or not a tree.
     fn tree(&self, id: &ObjectId) -> Result<Option<Arc<Tree>>>;
-    /// The ids conflict object `id` names (its terms and their fallbacks);
+    /// The ids conflict object `id` names (its terms);
     /// `None` if it is not held or not a conflict.
     fn conflict_terms(&self, id: &ObjectId) -> Result<Option<Vec<ObjectId>>>;
 }
@@ -172,8 +172,8 @@ struct Hit {
     dir: bool,
     /// A conflict entry names it: a chain may end with it, naming a term.
     conflict: bool,
-    /// An entry's object or fallback is it (may be served), with the size
-    /// the entry records (0 for a fallback).
+    /// An entry's object is it (may be served), with the size the entry
+    /// records.
     size: Option<u64>,
 }
 
@@ -183,9 +183,6 @@ impl Hit {
             self.dir |= e.kind == EntryKind::Dir;
             self.conflict |= e.kind == EntryKind::Conflict;
             self.size = Some(e.size);
-        }
-        if e.fallback == Some(*id) {
-            self.size.get_or_insert(0);
         }
     }
 }
@@ -225,7 +222,7 @@ impl<'a> Chains<'a> {
     /// * An empty chain names the root itself.
     /// * Otherwise `chain[0]` is the root; each tree `chain[i]` has a
     ///   directory entry naming `chain[i + 1]`; and the last tree has an
-    ///   entry whose object or fallback is `id`. The last element may
+    ///   entry whose object is `id`. The last element may
     ///   instead be a conflict object, named by a conflict entry of the
     ///   tree before it, with `id` one of its terms.
     ///
@@ -235,7 +232,7 @@ impl<'a> Chains<'a> {
     }
 
     /// [`Chains::allows`], with the size the naming entry records when it
-    /// allows (0 when it records none: a tree, a fallback, a conflict's
+    /// allows (0 when it records none: a tree, a conflict's
     /// term). A server bounds what it reads ahead by it.
     pub fn check(&mut self, chain: &[ObjectId], id: &ObjectId) -> Result<Option<u64>> {
         let Some(last) = chain.len().checked_sub(1) else {
@@ -278,9 +275,6 @@ impl<'a> Chains<'a> {
                 let mut ix: HashMap<ObjectId, Hit> = HashMap::with_capacity(t.entries.len());
                 for e in &t.entries {
                     ix.entry(e.id).or_default().add(e, &e.id);
-                    if let Some(f) = e.fallback {
-                        ix.entry(f).or_default().add(e, &f);
-                    }
                 }
                 ix
             }
@@ -374,7 +368,6 @@ mod tests {
             size: 0,
             executable: false,
             visibility: Default::default(),
-            fallback: None,
         }
     }
 
@@ -393,12 +386,10 @@ mod tests {
     #[test]
     fn chains_reach_only_what_the_root_reaches() {
         let mut s = Store::default();
-        let (a, b, fb, hidden, term) = (blob("a"), blob("b"), blob("fallback"), blob("hidden"), blob("term"));
+        let (a, b, hidden, term) = (blob("a"), blob("b"), blob("hidden"), blob("term"));
         let conflict = ObjectId::hash(b"veil:conflict\n{}");
         s.conflicts.insert(conflict, vec![term]);
-        let mut with_fb = entry("b", EntryKind::File, b);
-        with_fb.fallback = Some(fb);
-        let sub = put(&mut s, vec![entry("a", EntryKind::File, a), with_fb, entry("c", EntryKind::Conflict, conflict)]);
+        let sub = put(&mut s, vec![entry("a", EntryKind::File, a), entry("b", EntryKind::File, b), entry("c", EntryKind::Conflict, conflict)]);
         let root = put(&mut s, vec![entry("src", EntryKind::Dir, sub), entry("x", EntryKind::File, a)]);
         // Another root (the admin's), which also holds `hidden`.
         let secret = put(&mut s, vec![entry("h", EntryKind::File, hidden)]);
@@ -407,7 +398,6 @@ mod tests {
         assert!(c.allows(&[], &root).unwrap());
         assert!(c.allows(&[root], &sub).unwrap() && c.allows(&[root], &a).unwrap());
         assert!(c.allows(&[root, sub], &a).unwrap() && c.allows(&[root, sub], &b).unwrap());
-        assert!(c.allows(&[root, sub], &fb).unwrap(), "a fallback is served at its entry");
         assert!(c.allows(&[root, sub], &conflict).unwrap() && c.allows(&[root, sub, conflict], &term).unwrap());
         s.reads.borrow_mut().clear();
         // Refused: another root, a chain through a tree the root does not
@@ -438,7 +428,7 @@ mod tests {
         for _ in 0..INDEX_AFTER {
             indexed.check(&[root, sub], &a).unwrap();
         }
-        for id in [a, b, fb, conflict, term, hidden, sub, secret, root] {
+        for id in [a, b, conflict, term, hidden, sub, secret, root] {
             for chain in [vec![root], vec![root, sub]] {
                 assert_eq!(Chains::new(&s, root).check(&chain, &id).unwrap(), indexed.check(&chain, &id).unwrap(), "{chain:?} {id:?}");
             }

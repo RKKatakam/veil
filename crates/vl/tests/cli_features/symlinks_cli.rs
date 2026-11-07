@@ -78,9 +78,9 @@ fn a_cloaked_links_target_is_never_shown_without_the_key() {
     let dir = env.dir("alice");
     write(&dir, "README", "hi\n");
     std::fs::create_dir_all(dir.join("private")).unwrap();
-    std::os::unix::fs::symlink(TARGET, dir.join("private/current")).unwrap();
+    std::os::unix::fs::symlink(TARGET, dir.join("private/.env.current")).unwrap();
     env.ok("alice", &dir, &["init"]);
-    env.ok("alice", &dir, &["cloak", "private/"]);
+    env.ok("alice", &dir, &["cloak", "private/.env.current"]);
     env.ok("alice", &dir, &["commit", "-m", "one"]);
     env.ok("alice", &dir, &["tag", "set", "main", "-r", "@-"]);
     let ls = env.stdout("alice", &dir, &["ls", "private"]);
@@ -97,9 +97,9 @@ fn a_cloaked_links_target_is_never_shown_without_the_key() {
     let all = text(&out);
     assert!(out.status.success() && all.contains("redacted") && !all.contains(TARGET), "{all}");
     let v = json(&env, "bob", &bob, &["ls", "--json"]);
-    let e = v["entries"].as_array().unwrap().iter().find(|e| e["path"] == "private/current").unwrap();
+    let e = v["entries"].as_array().unwrap().iter().find(|e| e["path"] == "private/.env.current").unwrap();
     assert_eq!((e["kind"].as_str(), e["target"].as_str(), e["tier"].as_str()), (Some("symlink"), None, Some("redacted")));
-    assert!(std::fs::symlink_metadata(bob.join("private/current")).is_err(), "a link bob cannot read was written");
+    assert!(std::fs::symlink_metadata(bob.join("private/.env.current")).is_err(), "a link bob cannot read was written");
     let out = env.vl("bob", &bob, &["diff", "-r", "main"]);
     assert!(!text(&out).contains(TARGET), "{}", text(&out));
     let st = env.vl("bob", &bob, &["status"]);

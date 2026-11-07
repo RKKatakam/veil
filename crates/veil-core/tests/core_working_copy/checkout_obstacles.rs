@@ -22,7 +22,7 @@ fn mem_repo() -> Repo {
 /// The tree a working copy holding `files` would record.
 fn tree(repo: &Repo, files: &[(&str, &str)]) -> ObjectId {
     let fs = MemoryBackend::from_files(files.iter().map(|(p, c)| (*p, c.as_bytes()))).unwrap();
-    repo.build_from(&fs, None, None).unwrap().0
+    repo.build_from(&fs, None).unwrap().0
 }
 
 fn wc(repo: &Repo, files: &[(&str, &str)]) -> MemoryBackend {
@@ -138,7 +138,7 @@ fn undo_refuses_a_command_whose_effect_is_outside_the_view() {
     fs.write(&p("a.txt"), b"a\n").unwrap();
     repo.snapshot_workspace("default", &*fs).unwrap();
     let (c, _) = repo.commit_working_copy("default", "one").unwrap();
-    repo.set_tag("main", c, None, false).unwrap();
+    repo.set_tag("main", c, false).unwrap();
     let before = repo.op_id();
     repo.record_outside_view("grant scope team to bob", "revoke it with `vl scope revoke`").unwrap();
     let err = repo.undo_keeping_edits("default").unwrap_err().to_string();
@@ -171,7 +171,6 @@ fn a_name_the_filesystem_refuses_is_reported_and_the_checkout_goes_on() {
         size: 1,
         executable: false,
         visibility: veil_core::object::Visibility::Public,
-        fallback: None,
     };
     let mut t = veil_core::object::Tree::default();
     t.insert(entry(&long, blob(b"long\n")));
@@ -190,7 +189,7 @@ fn a_name_the_filesystem_refuses_is_reported_and_the_checkout_goes_on() {
     let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(left, vec![std::ffi::OsString::from("ok.txt")]);
     // The next snapshot keeps the entry it could not write.
-    let (built, _) = repo.build_from_recorded(&fs, Some(to), None, None, Some(&record)).unwrap();
+    let (built, _) = repo.build_from_recorded(&fs, Some(to), None, Some(&record)).unwrap();
     assert_eq!(built, to, "the unwritable file was recorded as deleted");
 }
 

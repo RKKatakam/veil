@@ -1,0 +1,8 @@
+{
+  "format": 2,
+  "name": "carol",
+  "public": "veil17299538b6b211178e88c8998c184245b05248c0cf010a9eb6ee94dd34cc66e5d",
+  "signing": "bcfbbaac1b4f0695192d596ae366e45b23eb63b225b5f438f631d9bee81be082",
+  "encryption_secret": "022ccc10b0f3b7204a5b1a35889d4fe171bc3f417a8315a1318e4f5c12da7373",
+  "signing_secret": "6f6667c0466491a55abdaab3608d3a51fbcf346e632f76e65fb22af9dd7d3021"
+}

@@ -28,11 +28,11 @@ fn project(env: &Env) -> PathBuf {
             ("src/util/mod.rs", "pub fn u() {}\n"),
             ("tests/t.rs", "#[test] fn t() {}\n"),
             ("docs/guide.md", "guide\n"),
-            ("secret/plan.md", "the plan\n"),
+            ("secret/.env.plan", "the plan\n"),
         ],
     );
     let policy = std::fs::read_to_string(proj.join(".veilpolicy")).unwrap();
-    write(&proj, ".veilpolicy", &format!("{policy}secret/ cloak team\n"));
+    write(&proj, ".veilpolicy", &format!("{policy}secret/.env.plan cloak team\n"));
     write(&proj, ".netrc", "API_TOKEN=super-secret-isolated-value\n");
     env.ok("alice", &proj, &["commit", "-m", "base"]);
     env.ok("alice", &proj, &["ws", "new", "agent", "-r", "@-"]);
@@ -122,7 +122,7 @@ fn a_sparse_sandbox_holds_only_its_paths_and_records_only_edits_inside_them() {
     want.push(("public".into(), "src/new.rs".into()));
     want.sort_by(|a, b| a.1.cmp(&b.1));
     assert_eq!(now, want);
-    assert!(now.contains(&("cloaked:team".into(), "secret/plan.md".into())), "{now:?}");
+    assert!(now.contains(&("cloaked:team".into(), "secret/.env.plan".into())), "{now:?}");
     assert_eq!(env.stdout("alice", &proj, &["ws", "cat", "agent", "README.md"]), "readme\n");
     assert_eq!(env.stdout("alice", &proj, &["ws", "cat", "agent", "src/lib.rs"]), "pub fn f() {}\npub fn g() {}\n");
     // The strays are gone from the sandbox; ignored build output stays.
@@ -148,7 +148,7 @@ fn a_different_set_changes_the_sandbox_incrementally() {
     // The whole tree.
     let out = exec(&env, &proj, &["--", "true"]);
     assert!(out.contains("sparse: sandbox holds the whole tree"), "{out}");
-    assert!(dir.join("docs/guide.md").exists() && dir.join("secret/plan.md").exists());
+    assert!(dir.join("docs/guide.md").exists() && dir.join("secret/.env.plan").exists());
     assert_eq!(ino(&dir.join("src/lib.rs")), lib);
     // Narrow to one file: everything else goes, build output stays.
     let out = exec(&env, &proj, &["--only", "docs/guide.md", "--", "true"]);
@@ -201,11 +201,11 @@ fn only_paths_follow_the_cli_path_rules() {
 fn a_policy_edit_in_a_sparse_run_reclassifies_files_outside_it() {
     let env = Env::new();
     let proj = project(&env);
-    exec(&env, &proj, &["--only", "src", "--", "sh", "-c", "echo 'docs/ cloak team' >> .veilpolicy"]);
+    exec(&env, &proj, &["--only", "src", "--", "sh", "-c", "echo 'docs/ isolate' >> .veilpolicy"]);
     let now = files(&env, &proj, "agent@");
-    assert!(now.contains(&("cloaked:team".into(), "docs/guide.md".into())), "{now:?}");
-    assert_eq!(env.stdout("alice", &proj, &["ws", "cat", "agent", "docs/guide.md"]), "guide\n");
-    assert_eq!(now.len(), 7, "{now:?}");
+    assert!(!now.iter().any(|(_, p)| p == "docs/guide.md"), "{now:?}");
+    assert!(now.contains(&("cloaked:team".into(), "secret/.env.plan".into())), "{now:?}");
+    assert_eq!(now.len(), 6, "{now:?}");
 }
 
 #[test]

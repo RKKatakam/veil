@@ -55,7 +55,8 @@ pub struct BlameArgs {
     /// reported as unattributed.
     #[arg(long, value_name = "N", default_value_t = 100_000)]
     pub max_changes: usize,
-    /// Annotate as a public mirror sees the history (no cloaked versions).
+    /// Annotate as a public mirror sees the history: no secret files, and
+    /// nothing an unreleased embargo withholds (refused for such a revision).
     #[arg(long)]
     pub public: bool,
     #[command(flatten)]
@@ -73,7 +74,7 @@ fn line_range(s: &str) -> Result<(usize, usize)> {
     Ok((a, b))
 }
 
-/// The `veil.blame/1` document of `a` (`vl blame`, and `vl serve`'s
+/// The `veil.blame/2` document of `a` (`vl blame`, and `vl serve`'s
 /// `blame` method).
 pub fn blame_doc(ctx: &Ctx, a: &BlameArgs) -> Result<api::BlameDoc> {
     let lines = a.lines.as_deref().map(line_range).transpose()?;
@@ -133,7 +134,7 @@ pub struct GrepArgs {
     pub out: JsonOut,
 }
 
-/// The `veil.grep/1` document of `a` (`vl grep`, and `vl serve`'s `grep`
+/// The `veil.grep/2` document of `a` (`vl grep`, and `vl serve`'s `grep`
 /// method).
 pub fn grep_doc(ctx: &Ctx, a: &GrepArgs) -> Result<api::GrepDoc> {
     let opts = GrepOptions {
@@ -298,11 +299,11 @@ impl RenameArgs {
 
 /// `vl diff`.
 pub fn diff(ctx: &Ctx, rev: Option<&str>, from: Option<&str>, to: Option<&str>, stat: bool, r: &RenameArgs, json: bool) -> Result<()> {
-    let (a, b) = api::diff_trees_for(ctx, rev, from, to)?;
+    let t = api::diff_trees_for(ctx, rev, from, to)?;
     let renames = r.renames();
     match json {
-        true => api::emit_json(&api::diff_with(&ctx.repo, &a, &b, stat, &renames)?),
-        false => api::text::diff(&ctx.repo, &a, &b, stat, &renames),
+        true => api::emit_json(&api::diff_with(&ctx.repo, &t, stat, &renames)?),
+        false => api::text::diff(&ctx.repo, &t.from, &t.to, stat, &renames),
     }
 }
 
@@ -516,16 +517,13 @@ fn note(s: &mut State, action: &str, id: &ObjectId, code: Option<i32>) {
     s.log.push(LogLine { action: action.to_string(), snapshot: id.hex(), code });
 }
 
-/// Files of `tree` this reader cannot read as they are (redacted, or shown
-/// as an embargo fallback): a verdict there may be misleading.
+/// Files of `tree` this reader cannot read (sealed secrets of another
+/// scope): a verdict there may be misleading.
 fn unreadable_files(ctx: &Ctx, tree: &ObjectId) -> Result<usize> {
     let store = ctx.repo.store();
-    let (_, fell_back) = veil_core::checkout::resolve_view(store, tree)?;
-    let mut n = usize::from(fell_back);
+    let mut n = 0;
     for (_, e) in veil_core::tree::walk_files(store, tree)? {
-        // Readable as it is (its fallback does not count).
-        let own = veil_core::TreeEntry { fallback: None, ..e };
-        if own.kind == veil_core::EntryKind::File && !store.entry_readable(&own) {
+        if e.kind == veil_core::EntryKind::File && !store.entry_readable(&e) {
             n += 1;
         }
     }
@@ -546,7 +544,7 @@ fn take_step(ctx: &mut Ctx, s: &mut State, step: Step, by_hand: bool) -> Result<
             let hidden = unreadable_files(ctx, &tree)?;
             if hidden > 0 {
                 warn(&format!(
-                    "{hidden} file(s) of this snapshot are sealed for you (left out, or shown as their last public version): \
+                    "{hidden} file(s) of this snapshot are secrets sealed for others (left out): \
                      a verdict here may be misleading{}",
                     if by_hand { "; `vl bisect skip` if you cannot tell" } else { "" }
                 ));
@@ -764,8 +762,7 @@ fn run_on(ctx: &Ctx, candidate: &ObjectId, with_isolated: bool, command: &[Strin
     let dir = sb.path().to_path_buf();
     let fs = SandboxFs::new(&dir, None, false);
     let report = ctx.repo.checkout_tree(&fs, None, &tree)?;
-    let (_, fell_back) = veil_core::checkout::resolve_view(ctx.repo.store(), &tree)?;
-    let partial = fell_back || !report.redacted.is_empty() || !report.from_fallback.is_empty() || !report.failed.is_empty();
+    let partial = !report.redacted.is_empty() || !report.from_fallback.is_empty() || !report.failed.is_empty();
     if with_isolated {
         // The vault copies of local-only files (`ws exec --with-isolated`).
         for (p, hexdata) in ctx.repo.vault_load()?.files {

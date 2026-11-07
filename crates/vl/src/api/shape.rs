@@ -1,4 +1,4 @@
-//! `vl split` and `vl squash` (`veil.split/1`, `veil.squash/1`), shared by
+//! `vl split` and `vl squash` (`veil.split/2`, `veil.squash/2`), shared by
 //! the command line and `vl serve --local` (`split`, `squash`).
 //!
 //! What to take is a [`Choice`]: paths, hunk specs (`--hunks`, `--plan`),
@@ -19,8 +19,8 @@ use veil_core::{
 use super::{op_ref, snapshot_ref, OpRef, SnapshotRef};
 use crate::ctx::Ctx;
 
-pub const SPLIT_SCHEMA: &str = "veil.split/1";
-pub const SQUASH_SCHEMA: &str = "veil.squash/1";
+pub const SPLIT_SCHEMA: &str = "veil.split/2";
+pub const SQUASH_SCHEMA: &str = "veil.squash/2";
 
 /// What to take of a change.
 #[derive(Clone, Debug, Default)]
@@ -183,7 +183,7 @@ fn taken(units: &[Unit], sel: &Selection) -> Vec<Taken> {
     out
 }
 
-/// `vl split` (`veil.split/1`).
+/// `vl split` (`veil.split/2`).
 #[derive(Serialize, Debug)]
 pub struct Split {
     pub schema: &'static str,
@@ -227,7 +227,7 @@ pub fn split(ctx: &mut Ctx, rev: &str, choice: &Choice, message: Option<&str>, p
     })
 }
 
-/// `vl squash` (`veil.squash/1`).
+/// `vl squash` (`veil.squash/2`).
 #[derive(Serialize, Debug)]
 pub struct Squash {
     pub schema: &'static str,

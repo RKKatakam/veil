@@ -1,0 +1,28 @@
+@  uwqmmmly alice ✓ 2026-11-06 22:49:31 default@ 8f14aa58 (empty)
+│  (no description set)
+○  woqvrvyp alice ✓ 2026-11-06 22:49:31 main 52bd87cc (empty) [embargo:3ce86505c4]
+│ │  Fix B (embargoed)  ⇠ merges qkulumol, yssxttus
+│ ○  yssxttus alice ✓ 2026-11-06 22:49:31 fix-b@ e159bdad
+│ │  (no description set)
+│ │ ×  zxvqrrxu alice ✓ 2026-11-06 22:49:30 link-conflict mirror/link-conflict origin/link-conflict 72e2b607 (conflict)
+│ │ │  a link/file conflict
+│ │ ○  nztoozlv alice ✓ 2026-11-06 22:49:30 links team-release v5.0 mirror/links mirror/team-release mirror/v5.0 origin/links origin/team-release origin/v5.0 f7de4d3f
+│ │ │  format 5: symlinks
+│ │ │ ×  wqpvwoku alice ✓ 2026-11-06 22:49:30 conflicted mirror/conflicted origin/conflicted 4fbd5148 (conflict)
+│ │ │ │ │  keep side b's strings.rs  ⇠ merges uwmnwvsk, qqnvzlzy
+│ │ │ │ ○  qqnvzlzy alice ✓ 2026-11-06 22:49:30 side-b@ 1e9f32bd
+│ │ │ │ │  (no description set)
+│ │ │ ○ │  uwmnwvsk alice ✓ 2026-11-06 22:49:30 side-a@ bdf43042
+│ │ │ │ │  (no description set)
+○          qkulumol alice ✓ 2026-11-06 22:49:30 c513697c
+│  third: loose objects
+○  xwyuwmsn alice ✓ 2026-11-06 22:49:29 5eee1aee (empty) [embargo:384e9b60ef released]
+│ │  Fix A (released)  ⇠ merges svzvymro, rqnmvtow
+│ ○  rqnmvtow alice ✓ 2026-11-06 22:49:29 fix-a@ team-only mirror/team-only origin/team-only 6ed0516e
+│ │  (no description set)
+○    svzvymro alice ✓ 2026-11-06 22:49:29 9a3bc269
+│  second: edit docs and notes
+○  uwtpukrx alice ✓ 2026-11-06 22:49:28 51c1909e
+│  initial import
+◆  zzzzzzzz 72edc798
+   root()

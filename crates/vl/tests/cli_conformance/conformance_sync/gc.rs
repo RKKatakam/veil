@@ -240,8 +240,8 @@ fn gc_keeps_cloaked_content_and_content_it_cannot_read() {
     let env = Env::new();
     let proj = env.dir("proj");
     env.ok("alice", &proj, &["init"]);
-    env.ok("alice", &proj, &["cloak", "secrets/"]);
-    write(&proj, "secrets/s.txt", "sealed\n");
+    env.ok("alice", &proj, &["cloak", "secrets/.env.s"]);
+    write(&proj, "secrets/.env.s", "sealed\n");
     write(&proj, "p.txt", "public\n");
     env.ok("alice", &proj, &["commit", "-m", "c"]);
     env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
@@ -249,7 +249,7 @@ fn gc_keeps_cloaked_content_and_content_it_cannot_read() {
     env.ok("alice", &proj, &["push"]);
     gc(&env, &proj, &["--keep-ops-days", "0", "--prune-now"]);
     assert_eq!(
-        env.stdout("alice", &proj, &["cat", "secrets/s.txt", "-r", "main"]),
+        env.stdout("alice", &proj, &["cat", "secrets/.env.s", "-r", "main"]),
         "sealed\n"
     );
     let bob = env.clone("bob", &env.path("hub"), "bob");
@@ -264,7 +264,7 @@ fn gc_keeps_cloaked_content_and_content_it_cannot_read() {
     env.ok("alice", &proj, &["push"]);
     env.ok("bob", &bob, &["pull"]);
     assert_eq!(
-        read(&bob, "secrets/s.txt"),
+        read(&bob, "secrets/.env.s"),
         "sealed\n",
         "gc deleted the ciphertext Bob could not read yet"
     );

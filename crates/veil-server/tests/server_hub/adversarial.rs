@@ -582,7 +582,6 @@ fn bug_834_a_conflict_names_no_hidden_object() {
             size: 1,
             executable: false,
             visibility: Visibility::Public,
-            fallback: None,
         })
     };
     let mut c = Craft::new(&api, &p.dev, &p.name, "main");
@@ -600,7 +599,6 @@ fn bug_834_a_conflict_names_no_hidden_object() {
             size: 0,
             executable: false,
             visibility: Visibility::Public,
-            fallback: None,
         },
     );
     let r = c.push("main", "a conflict");
@@ -615,54 +613,6 @@ fn bug_834_a_conflict_names_no_hidden_object() {
             !String::from_utf8_lossy(&f.body).contains(BILL_MARK),
             "a hidden file was served through a conflict that names it"
         );
-    }
-}
-
-/// BUG-834, the other route: a sealed secret's `fallback` names an object
-/// the push never uploaded, and the fetch route serves an entry's fallback.
-#[test]
-fn bug_834_a_fallback_names_no_hidden_object() {
-    use veil_core::{
-        crypto::{Envelope, Suite},
-        object::{EntryKind, TreeEntry, Visibility},
-    };
-    let hub = TestHub::start();
-    let p = setup_project(&hub);
-    let api = hub.api();
-    let path = format!("{BILL_DIR}/acme/invoice.txt");
-    let real = real_paths(&p.dir).into_iter().find(|(q, _)| *q == path).unwrap().1;
-    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
-    let sealed = c.put_object(Object::Sealed(Envelope {
-        scope: "team".into(),
-        suite: Suite::AesSiv,
-        ciphertext: vec![7u8; 48],
-    }));
-    c.set_entry(
-        "src/.env",
-        TreeEntry {
-            name: String::new(),
-            kind: EntryKind::File,
-            id: sealed,
-            size: 1,
-            executable: false,
-            visibility: Visibility::Cloaked { scope: "team".into() },
-            fallback: Some(real),
-        },
-    );
-    let r = c.push("main", "a secret with a fallback");
-    if r.status == 200 {
-        let tip = api.tips(Some(&p.dev.token()), &p.name).unwrap().branches["main"];
-        let f = api.post_json(
-            Some(&p.dev.token()),
-            &format!("/v1/projects/{}/fetch", p.name),
-            &json!({"snapshot": tip.hex(), "objects": [{"path": "src/.env", "id": real.hex()}]}),
-        );
-        assert!(
-            !String::from_utf8_lossy(&f.body).contains(BILL_MARK),
-            "a hidden file was served as a secret's fallback"
-        );
-    } else {
-        println!("refused: {}", String::from_utf8_lossy(&r.body));
     }
 }
 

@@ -9,12 +9,6 @@ Check this machine's setup and explain every problem found: identity, VEIL_HOME,
 vl doctor [OPTIONS]
 ```
 
-Options:
-
-| | |
-|---|---|
-| `--remotes` | Also check that every remote can be reached |
-
 ---
 
 [All commands](README.md) · [User guide](../guide/README.md)

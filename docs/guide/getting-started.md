@@ -1,6 +1,6 @@
 # Getting started
 
-> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). Where this page mentions cloaking, scopes, isolated files or path and SSH remotes, the server replaces them with folder access, encrypted secrets and pushes to the server.
+> Only secret files (`.env`, keys) are ever encrypted ("cloaked", for a scope); who sees folders and code is decided by folder access (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). `vl` syncs only through the Veil server.
 
 1. [Install](#install)
 2. [Your identity](#your-identity)
@@ -42,12 +42,12 @@ stored at   /home/alice/.config/veil/identity.json
 ```
 
 * **`public key`** is what you give teammates so they can grant you access
-  to cloaked files (`vl scope grant`). Always share the full key.
+  to sealed secret files (`vl scope grant`). Always share the full key.
 * **`identity.json` holds your private keys.** It is created mode `0600`,
   once: several `vl` commands starting at the same time on a new machine
   all end up with the same identity.
-  Back it up somewhere safe: without it you lose access to everything
-  cloaked for you, and to your local secret vault (see
+  Back it up somewhere safe: without it you lose access to every
+  secret file sealed for you, and to your local secret vault (see
   [Maintenance](maintenance.md#backups)).
 * It lives in `$VEIL_HOME` (default `$XDG_CONFIG_HOME/veil`, else
   `~/.config/veil`), shared by all your repositories.
@@ -90,7 +90,7 @@ It also records whatever is already in the directory, except secrets: a
 `.env` or a key file is listed as `local-only` instead.
 
 To work on an existing Veil repository, `vl clone` it rather than running
-`vl init` (see [Teams and remotes](teams-and-remotes.md#onboarding-a-teammate)).
+`vl init` (see [Teams and remotes](teams-and-remotes.md#teammates)).
 
 ## No staging: every command snapshots
 
@@ -163,7 +163,7 @@ $ vl log
 | `vl log [-n N]` | The snapshot graph: change id, author, signature, time, tags and workspaces, snapshot id, description |
 | `vl show [REV] [--stat]` | One snapshot's metadata and diff |
 | `vl describe -m MSG [-r REV]` | Set the description of a change (default `@`). Does not start a new change |
-| `vl commit -m MSG [--no-advance]` | Describe `@`, then start a new, empty change on top of it. **Moves tags that pointed at the parent** to the committed change (in a cloaked workspace, only tags cloaked under its scope; with `--no-advance`, none) |
+| `vl commit -m MSG [--no-advance]` | Describe `@`, then start a new, empty change on top of it. **Moves tags that pointed at the parent** to the committed change (with `--no-advance`, none) |
 | `vl new [REVS…] [-m MSG]` | Start a new change on top of `REVS` (default `@`); with several revisions, a merge. Moves no tags |
 | `vl ls [-r REV] [PATHS…]`, `vl cat PATH [-r REV]` | List a snapshot's files with their tier (public, cloaked, isolated, …), or print one |
 
@@ -191,14 +191,12 @@ main: yltznuyx 53414202 Greet the world
 * A tag **follows its change** when that change is rewritten (`describe`,
   `rebase`, `squash`).
 * `vl commit` moves every tag that pointed at the parent of `@` onto the
-  committed change. That is how `main` moved above. In a cloaked workspace
-  it moves only tags cloaked under the same scope, so cloaked work never
-  reaches `main` by accident. `vl merge` moves tags
+  committed change. That is how `main` moved above. `vl merge` moves tags
   that pointed at the change merged into. Pulls fast-forward tags.
 * Nothing else moves a tag. `vl tag set` refuses to move one backwards or
   sideways unless you pass `--allow-backwards`.
-* `vl tag set NAME --cloak [SCOPE]` makes a tag that public remotes never
-  see.
+* Tag names are plain: `vl push` sends each as a branch that everyone who
+  may read the project sees.
 
 ## Change ids and snapshot ids
 
@@ -406,12 +404,11 @@ executable-bit change. The numbers are the hunks `vl diff -r REV --json`
 lists (from 1). `--plan FILE` (or `-` for standard input) takes the same as
 JSON, and `vl serve --local` offers `split` and `squash` taking that plan;
 with `--json`, both commands print what they made
-([`veil.split/1`, `veil.squash/1`](../reference/json.md#veilsplit1)).
+([`veil.split/2`, `veil.squash/2`](../reference/json.md#veilsplit2)).
 
 **What can be split by hunk.** Visibility never changes: a hunk of a
-cloaked file goes into the other change sealed for the same scope, and an
-edit made on a cloaked line keeps showing its last public version to
-everyone else. Some files only move whole, and the picker says why:
+sealed secret file goes into the other change sealed for the same scope.
+Some files only move whole, and the picker says why:
 
 * a file you cannot read (sealed for a scope you are not in): you can move
   it, but not choose lines you cannot see;
@@ -498,10 +495,6 @@ the markers as a `(not shown: …)` line. You cannot resolve such a conflict:
 an edit of the file is held back (it stays local), and deleting it is not a
 resolution. A member of the scope resolves it.
 
-Repositories at an older format (before `vl upgrade` to format 4), and
-merges under an embargo, still write the markers into the file itself;
-such a conflict is resolved by editing the file in the conflicted change.
-
 When one side has a file where the other has a directory of the same name,
 both survive: the directory keeps the name, and the file is moved aside to
 `NAME~ours` or `NAME~theirs` (the side it came from). Both paths are marked
@@ -516,7 +509,6 @@ other way round), then delete the moved-aside copy.
 | `--no-snapshot` | Don't record the working copy before the command |
 | `VEIL_HOME` | Where your identity lives (default `$XDG_CONFIG_HOME/veil` or `~/.config/veil`) |
 | `VEIL_USER` | Your name on new changes (`Name <email>` records an email too) |
-| `VEIL_SSH` | The `ssh` command used for SSH remotes |
 | `VEIL_FS_FOLDING` | Override the detected filename case/Unicode folding (see the README's platform notes) |
 | `VEIL_MAX_OBJECT` | Largest object a pack may hold when read (default `4G`; a larger declared size is refused as damaged or hostile) |
 | `NO_COLOR` | Disable colours (they are off anyway when output is not a terminal) |

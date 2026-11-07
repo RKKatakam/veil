@@ -11,7 +11,7 @@
 #   scripts/bench-scale.sh                 # the 1 GB profile
 #   scripts/bench-scale.sh 5g              # ~5 GB: only when nothing else builds
 #   scripts/bench-scale.sh small --cloaked # 85 % of the files cloaked
-#   scripts/bench-scale.sh 1g -- --agents 4,16 --rtt 0,2   # extra veil-bench flags
+#   scripts/bench-scale.sh 1g -- --agents 4,16   # extra veil-bench flags
 #
 # Environment:
 #   MIN_FREE_GB   stop when free disk would drop below this (default 8)

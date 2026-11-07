@@ -49,7 +49,7 @@ fn agent_workspace_in_an_on_disk_repository() -> veil_core::Result<()> {
     let ws = repo.ephemeral_workspace(base)?;
     ws.write("NOTES.md", "written by an agent\n")?;
     let (snapshot, _) = repo.commit_ephemeral(&ws, "agent: notes")?;
-    repo.set_tag("agent-result", snapshot, None, false)?;
+    repo.set_tag("agent-result", snapshot, false)?;
     // --- end ---
 
     assert_eq!(veil_core::revset::resolve(&repo, "agent-result", "default")?, snapshot);

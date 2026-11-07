@@ -17,7 +17,7 @@ pub fn one_line(r: &SnapshotRef) -> String {
     let (Some(change), true) = (&r.change_short, r.available) else {
         return r.snapshot_short.clone();
     };
-    let desc = description_shown(&r.description, &r.description_hidden);
+    let desc = description_shown(&r.description);
     let desc = if desc.trim().is_empty() {
         dim("(no description set)")
     } else {
@@ -27,14 +27,9 @@ pub fn one_line(r: &SnapshotRef) -> String {
     format!("{} {} {empty}{desc}", bold(&magenta(change)), blue(&r.snapshot_short))
 }
 
-/// A description as the text output shows it: sealed ones as
-/// `[cloaked:scope]` (what `Repo::description` returns).
-fn description_shown(d: &Option<String>, hidden: &Option<HiddenText>) -> String {
-    match (d, hidden) {
-        (Some(d), _) => d.clone(),
-        (None, Some(h)) => format!("[cloaked:{}]", h.scope),
-        (None, None) => String::new(),
-    }
+/// A description as the text output shows it.
+fn description_shown(d: &Option<String>) -> String {
+    d.clone().unwrap_or_default()
 }
 
 // ---- status ----------------------------------------------------------------------
@@ -72,12 +67,11 @@ pub fn changes_summary_with(changes: &[Change], scores: bool) {
 }
 
 /// A tier as `vl ls` prints it: `public`, `cloaked:<scope>`,
-/// `embargoed:<id>`, `redacted`, `isolated`, `ignored`, `quarantined`.
-pub fn tier_label(tier: &str, scope: Option<&str>, embargo: Option<&str>) -> String {
-    match (tier, scope, embargo) {
-        ("cloaked", Some(s), _) => format!("cloaked:{}", safe(s)),
-        ("embargoed", _, Some(e)) => format!("embargoed:{}", safe(e)),
-        (t, _, _) => t.to_string(),
+/// `redacted`, `isolated`, `ignored`, `quarantined`.
+pub fn tier_label(tier: &str, scope: Option<&str>) -> String {
+    match (tier, scope) {
+        ("cloaked", Some(s)) => format!("cloaked:{}", safe(s)),
+        (t, _) => t.to_string(),
     }
 }
 
@@ -93,16 +87,15 @@ fn tier_coloured(label: &str, tier: &str) -> String {
 
 /// ` [tier]` after a path in `vl status` (nothing for public files), with
 /// what a redacted file is sealed for.
-fn tier_mark(tier: &str, scope: Option<&str>, embargo: Option<&str>) -> String {
+fn tier_mark(tier: &str, scope: Option<&str>) -> String {
     if tier == "public" {
         return String::new();
     }
-    format!(" {}", tier_coloured(&format!("[{}]", tier_label(tier, scope, embargo)), tier))
+    format!(" {}", tier_coloured(&format!("[{}]", tier_label(tier, scope)), tier))
 }
 
 fn change_mark(c: &Change) -> String {
-    let (scope, embargo) = (c.visibility.scope.as_deref(), c.visibility.embargo.as_deref());
-    let mut mark = tier_mark(c.tier, scope, embargo);
+    let mut mark = tier_mark(c.tier, c.visibility.scope.as_deref());
     if c.conflict.is_some() {
         mark.push_str(&format!(" {}", red("[conflict]")));
     }
@@ -120,10 +113,7 @@ pub fn status(s: &Status) {
         println!("Working copy changes:");
         changes_summary(&s.changes);
     }
-    println!("Workspace    : {}{}", green(&safe(&s.workspace.name)), match &s.workspace.cloak {
-        Some(c) => magenta(&format!(" [cloaked:{}]", safe(c))),
-        None => String::new(),
-    });
+    println!("Workspace    : {}", green(&safe(&s.workspace.name)));
     println!("Working copy : {} {}", bold(&green("@")), one_line(&s.working_copy));
     for p in &s.parents {
         println!("Parent       : {}", one_line(p));
@@ -131,7 +121,7 @@ pub fn status(s: &Status) {
     if !s.isolated.is_empty() {
         println!("{}", dim("Local-only (isolated; never snapshotted or pushed):"));
         for p in &s.isolated {
-            println!("  {} {}{}", dim("L"), safe(p), tier_mark("isolated", None, None));
+            println!("  {} {}{}", dim("L"), safe(p), tier_mark("isolated", None));
         }
     }
     if !s.quarantined.is_empty() {
@@ -141,7 +131,7 @@ pub fn status(s: &Status) {
                 "held_back" => "edit held back; history keeps the previous version",
                 _ => "never recorded",
             };
-            println!("  {} {}{}  ({}; {state})", yellow("Q"), safe(&q.path), tier_mark(q.tier, None, None), q.rule);
+            println!("  {} {}{}  ({}; {state})", yellow("Q"), safe(&q.path), tier_mark(q.tier, None), q.rule);
         }
     }
     if !s.policy_held_back.is_empty() {
@@ -151,7 +141,7 @@ pub fn status(s: &Status) {
                 "  {} {}{}  ({}; .veilpolicy says {})",
                 yellow("P"),
                 safe(&h.path),
-                tier_mark(h.tier, h.scope.as_deref(), None),
+                tier_mark(h.tier, h.scope.as_deref()),
                 safe(&h.accepted),
                 safe(&h.wanted)
             );
@@ -166,7 +156,7 @@ pub fn status(s: &Status) {
     if !s.redacted.is_empty() {
         println!("{}", dim("Redacted (unreadable here; kept in history, absent on disk):"));
         for r in &s.redacted {
-            println!("  {} {}{}  ({})", dim("R"), safe(&r.path), tier_mark(r.tier, None, None), safe(&r.redaction.message));
+            println!("  {} {}{}  ({})", dim("R"), safe(&r.path), tier_mark(r.tier, None), safe(&r.redaction.message));
         }
     }
     if !s.conflicts.is_empty() {
@@ -292,10 +282,7 @@ fn log_entry(e: &LogEntry, lanes: &mut Vec<Option<ObjectId>>) {
     let tags: Vec<String> = e
         .tags
         .iter()
-        .map(|t| match &t.cloak {
-            Some(s) => format!("{}[cloaked:{}]", safe(&t.name), safe(s)),
-            None => safe(&t.name).into_owned(),
-        })
+        .map(|t| safe(&t.name).into_owned())
         .chain(e.remote_tags.iter().map(|t| safe(t).into_owned()))
         .collect();
     if !tags.is_empty() {
@@ -307,9 +294,6 @@ fn log_entry(e: &LogEntry, lanes: &mut Vec<Option<ObjectId>>) {
     }
     if !e.conflicts.is_empty() {
         header.push(red("(conflict)"));
-    }
-    if let Some(c) = &e.cloak {
-        header.push(magenta(&format!("[cloaked:{}]", safe(c))));
     }
     if let Some(em) = &e.embargo {
         header.push(yellow(&format!("[embargo:{}{}]", safe(&em.id), if em.released { " released" } else { "" })));
@@ -339,7 +323,7 @@ fn log_entry(e: &LogEntry, lanes: &mut Vec<Option<ObjectId>>) {
     if e.root {
         println!("{line2_prefix} {}", dim("root()"));
     } else {
-        let desc = description_shown(&e.description, &e.description_hidden);
+        let desc = description_shown(&e.description);
         let desc = if desc.trim().is_empty() {
             dim("(no description set)")
         } else {
@@ -528,9 +512,6 @@ pub fn show(repo: &Repo, s: &Show, r: &Renames) -> Result<()> {
     if !s.tags.is_empty() {
         println!("Tags      : {}", cyan(&s.tags.iter().map(|t| safe(t)).collect::<Vec<_>>().join(", ")));
     }
-    if let Some(c) = &s.cloak {
-        println!("Cloaked   : {}", magenta(&safe(c)));
-    }
     if let Some(e) = &s.embargo {
         let state = match (e.state, e.until_ms) {
             ("released", _) => "released".to_string(),
@@ -548,7 +529,7 @@ pub fn show(repo: &Repo, s: &Show, r: &Renames) -> Result<()> {
         println!("Conflicts : {}", red(&paths.join(", ")));
     }
     println!();
-    let desc = description_shown(&s.description, &s.description_hidden);
+    let desc = description_shown(&s.description);
     if desc.trim().is_empty() {
         println!("    {}", dim("(no description set)"));
     } else {
@@ -565,8 +546,7 @@ pub fn show(repo: &Repo, s: &Show, r: &Renames) -> Result<()> {
 pub fn workspace_list(w: &WorkspaceList) {
     for ws in &w.workspaces {
         let here = if ws.current { green("* ") } else { "  ".into() };
-        let cloak = ws.cloak.as_ref().map(|c| magenta(&format!(" [cloaked:{}]", safe(c)))).unwrap_or_default();
-        println!("{here}{}{cloak}: {}", bold(&safe(&ws.name)), one_line(&ws.working_copy));
+        println!("{here}{}: {}", bold(&safe(&ws.name)), one_line(&ws.working_copy));
     }
 }
 
@@ -577,8 +557,7 @@ pub fn tag_list(t: &TagList) {
         Some(_) => yellow(" [release]"),
     };
     for tag in &t.tags {
-        let cloak = tag.cloak.as_ref().map(|c| magenta(&format!(" [cloaked:{}]", safe(c)))).unwrap_or_default();
-        println!("{}{}{cloak}: {}", cyan(&safe(&tag.name)), release(&tag.annotation), one_line(&tag.target));
+        println!("{}{}: {}", cyan(&safe(&tag.name)), release(&tag.annotation), one_line(&tag.target));
     }
     for tag in &t.remote_tags {
         println!("{}: {}", dim(&safe(&tag.name)), one_line(&tag.target));
@@ -630,7 +609,7 @@ pub fn scan(s: &Scan) {
     match (gate, s.clean) {
         (false, true) => println!("{} no secrets in public files ({} protected file(s) contain secrets)", green("ok:"), s.protected),
         (false, false) => println!(
-            "{} {} public file(s) contain secrets; they are quarantined from snapshots until cloaked, isolated or fixed",
+            "{} {} public file(s) contain secrets; they are quarantined from snapshots until moved into a secret file, isolated or fixed",
             red("found:"),
             s.exposed
         ),
@@ -698,7 +677,7 @@ pub fn ls(l: &Ls) {
         if stdout_closed() {
             return;
         }
-        let label = tier_label(e.tier, e.scope.as_deref(), e.embargo.as_deref());
+        let label = tier_label(e.tier, e.scope.as_deref());
         let size = e.size.map_or_else(|| "-".to_string(), |s| s.to_string());
         let mut note = Vec::new();
         if let Some(r) = &e.redaction {
@@ -741,136 +720,12 @@ pub fn ls(l: &Ls) {
     }
 }
 
-// ---- push --dry-run ----------------------------------------------------------------
-
-/// Bytes, for people: `512 B`, `4.1 KiB`, `12.0 MiB`.
-pub fn human_bytes(n: u64) -> String {
-    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
-    if n < 1024 {
-        return format!("{n} B");
-    }
-    let mut v = n as f64 / 1024.0;
-    let mut u = 0;
-    while v >= 1024.0 && u + 1 < UNITS.len() {
-        v /= 1024.0;
-        u += 1;
-    }
-    format!("{v:.1} {}", UNITS[u])
-}
-
-pub fn push_plan(doc: &PushPlanDoc) {
-    for (i, r) in doc.remotes.iter().enumerate() {
-        if i > 0 {
-            println!();
-        }
-        println!(
-            "{} {} {}{}",
-            bold(&safe(&r.name)),
-            if r.public { yellow("public") } else { green("team") },
-            dim(&safe(&r.url)),
-            if r.creates_remote { dim(" (no repository there yet: the push creates one)") } else { String::new() }
-        );
-        if let Some(e) = &r.error {
-            println!("  {} {}", red("error:"), safe(e));
-            continue;
-        }
-        for t in &r.tags {
-            let name = cyan(&safe(&t.name));
-            let from = t.remote_target.as_deref().map(|h| h.get(..8).unwrap_or(h).to_string());
-            let reason = t.message.as_deref().map(|w| format!(" ({})", safe(w))).unwrap_or_default();
-            match t.action {
-                "create" => println!("  {} {name} → {}", green("create   "), t.target_short),
-                "update" => println!("  {} {name} {} → {}", green("update   "), from.unwrap_or_default(), t.target_short),
-                "unchanged" => println!("  {} {name} {}", dim("unchanged"), dim(&format!("(already at {})", t.target_short))),
-                "rejected" => println!("  {} {name}{reason}", red("rejected ")),
-                _ => println!("  {} {name}{reason}", yellow("skipped  ")),
-            }
-        }
-        if r.objects == 0 {
-            println!("  no objects to send");
-        } else {
-            println!(
-                "  would send {} snapshot(s), {} object(s) ({} tree(s), {} file content(s), {} encrypted): {}, {} packed",
-                r.snapshots,
-                r.objects,
-                r.trees,
-                r.blobs,
-                r.sealed,
-                human_bytes(r.object_bytes),
-                human_bytes(r.pack_bytes)
-            );
-        }
-        if r.withheld_objects > 0 {
-            println!("  {} {} cloaked/embargoed object(s)", yellow("withheld "), r.withheld_objects);
-        }
-        let mut by_embargo: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-        for s in &r.withheld_snapshots {
-            *by_embargo.entry(&s.embargo).or_default() += 1;
-        }
-        for (e, n) in by_embargo {
-            println!(
-                "  {} {n} snapshot(s) of the history merged under unreleased embargo {} (sent when it is released)",
-                yellow("withheld "),
-                safe(e)
-            );
-        }
-        for e in &r.releases {
-            println!("  {} the release of embargo {} (its key goes into the pushed record)", green("publish  "), safe(e));
-        }
-        if let Some(f) = &r.files {
-            if f.published.is_empty() {
-                println!("  no file content becomes public");
-            } else {
-                println!("  Would become public on {}:", safe(&r.name));
-                for p in &f.published {
-                    let word = match p.exposure {
-                        "new" => green("new     "),
-                        "exposed" => yellow("exposed "),
-                        _ => cyan("modified"),
-                    };
-                    let size = p.size.map_or_else(|| "-".to_string(), |s| s.to_string());
-                    let note = match (&p.released_embargo, p.exposure) {
-                        (Some(e), _) => dim(&format!("  (released embargo {})", safe(e))),
-                        (None, "exposed") => dim("  (withheld there until now)"),
-                        _ => String::new(),
-                    };
-                    println!("    {word} {size:>9}  {}{note}", safe(&p.path));
-                }
-            }
-            if !f.withheld.is_empty() || !f.embargoed_trees.is_empty() {
-                println!("  Withheld from {}:", safe(&r.name));
-                for w in &f.withheld {
-                    println!("    {}  {}", safe(&w.path), dim(&format!("({})", safe(&w.message))));
-                }
-                for t in &f.embargoed_trees {
-                    println!(
-                        "    {}  {}",
-                        t.snapshot_short,
-                        dim(&format!("(its tree is under unreleased embargo {}; the remote sees the pre-merge tree)", safe(&t.embargo)))
-                    );
-                }
-            }
-        }
-        for w in &r.warnings {
-            crate::render::warn_untrusted(w);
-        }
-    }
-    println!("{}", dim("Dry run: nothing was sent."));
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
-    fn bytes_for_people() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(1023), "1023 B");
-        assert_eq!(human_bytes(1024), "1.0 KiB");
-        assert_eq!(human_bytes(2110), "2.1 KiB");
-        assert_eq!(human_bytes(5 << 20), "5.0 MiB");
-        assert_eq!(human_bytes(3 << 40), "3.0 TiB");
-        assert_eq!(tier_label("cloaked", Some("ops"), None), "cloaked:ops");
-        assert_eq!(tier_label("embargoed", None, Some("e1")), "embargoed:e1");
-        assert_eq!(tier_label("redacted", Some("ops"), None), "redacted");
+    fn tier_labels() {
+        assert_eq!(tier_label("cloaked", Some("ops")), "cloaked:ops");
+        assert_eq!(tier_label("redacted", Some("ops")), "redacted");
     }
 
     use proptest::prelude::*;
@@ -952,9 +807,6 @@ pub fn blame(b: &BlameDoc) {
             }
         }
     }
-    if b.version == "fallback" {
-        crate::render::warn("you cannot read the current version of this file: its last public version is annotated (members see newer content)");
-    }
     if b.unattributed > 0 {
         let why = match b.stopped {
             Some("max_changes") => "the walk stopped at --max-changes; raise it to go further",
@@ -1008,14 +860,6 @@ pub fn grep(g: &GrepDoc, style: GrepStyle) {
                 false => println!("{}:{text}{cut}", magenta(&p)),
             }
         }
-    }
-    let fallback: Vec<String> = g.files.iter().filter(|f| f.tier == "fallback").map(|f| safe(&f.path).into_owned()).collect();
-    if !fallback.is_empty() {
-        crate::render::warn(&format!(
-            "searched the last public version of {} file(s) you cannot read (members see newer content): {}",
-            fallback.len(),
-            fallback.join(", ")
-        ));
     }
     if g.skipped.sealed > 0 {
         crate::render::warn(&format!("{} file(s) not searched: sealed for a scope you are not in", g.skipped.sealed));

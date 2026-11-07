@@ -184,24 +184,6 @@ fn commit_does_not_move_tags_elsewhere() {
     assert_eq!(r.change("old"), one);
 }
 
-// Scenario from the guide's pitfall: in a cloaked workspace, `vl commit`
-// moves only tags cloaked under the same scope, never `main`.
-#[test]
-fn commit_in_a_cloaked_workspace_does_not_move_main() {
-    let env = Env::new();
-    let r = env.repo("p");
-    r.write("a.txt", "a\n");
-    let base = r.commit("base");
-    r.ok(&["tag", "set", "main", "-r", base.as_str()]);
-    r.ok(&["ws", "new", "fix", "--cloak"]);
-    r.ok(&["ws", "switch", "fix"]);
-    r.write("fix.txt", SECRET_PLAN);
-    let out = r.ok(&["commit", "-m", "secret fix"]);
-    assert!(out.contains("main not moved"), "{out}");
-    assert_eq!(r.change("main"), base);
-    assert!(r.files("@-").iter().any(|f| f.path == "fix.txt" && f.vis == "cloaked:team"));
-}
-
 // Scenario from git t7509-commit-authorship.sh: the author is
 // `$VEIL_USER`, taken when the change is created.
 #[test]
@@ -299,21 +281,4 @@ fn messages_that_look_like_options() {
     let r = env.repo("p");
     r.ok(&["commit", "--message=-m --no-advance"]);
     assert_eq!(r.description("@-"), "-m --no-advance");
-}
-
-// Scenario from jj test_describe_command.rs with a cloaked workspace:
-// its descriptions are cloaked too (never shown on a public surface).
-#[test]
-fn descriptions_in_a_cloaked_workspace_are_cloaked() {
-    let env = Env::new();
-    let r = env.repo("p");
-    r.commit("base");
-    r.ok(&["ws", "new", "fix", "--cloak"]);
-    r.ok(&["ws", "switch", "fix"]);
-    r.write("f.txt", "f\n");
-    r.ok(&["commit", "-m", SECRET_PLAN]);
-    assert_eq!(r.description("@-"), SECRET_PLAN, "members read it");
-    let show = r.out(&["show", "--stat", "@-"]);
-    assert!(show.contains("Cloaked   : team"), "{show}");
-    assert!(!contains_bytes(&all_bytes(&r.path(".veil/objects")), SECRET_PLAN), "stored sealed");
 }

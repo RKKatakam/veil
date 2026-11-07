@@ -10,13 +10,13 @@ embargoes, threat model), and the on-disk encodings are in
 **What encryption is for.** Veil is server-centric
 ([OVERVIEW.md](OVERVIEW.md)): code is plain text on the Veil server, which
 enforces who can see what ([VISIBILITY.md](VISIBILITY.md)). **Encryption is
-for secrets (`.env`, keys) and embargoed changes only;** personal private
-keys never leave the machine. Code is not encrypted, and there is no plan to
-encrypt it. Today's client, before the server, also seals *cloaked* paths
-with these constructions (C1 under a scope key); that is built and is
-described here as a fact. With the server, cloaked paths become private
-folders, and the same constructions protect secrets and embargoes
-([HUB.md](HUB.md) §6, §8).
+for secret files (`.env`, keys) only** (owner, 2026-11-06); personal private
+keys never leave the machine. Code, folders, descriptions, tags and
+embargoes are not encrypted: they are plain text behind the server's
+permissions. Repository formats 7 and earlier also sealed descriptions, tag
+messages, embargoed merges and folders with these constructions; format 8
+removed every such use (FORMAT.md §5, "Format 8"), and this document
+describes what is left.
 
 Code map:
 
@@ -25,10 +25,10 @@ Code map:
 | `crates/veil-core/src/crypto/domains.rs` | **every** domain-separation string (KDF contexts, HPKE `info`, signature prefix and contexts, label prefixes). Nothing else may spell one. |
 | `crates/veil-core/src/crypto.rs` | envelopes: AES-SIV (deterministic) and XChaCha20-Poly1305 (random nonce, and the legacy deterministic form) |
 | `crates/veil-core/src/identity.rs` | identities, HPKE key wrapping (and the legacy sealed box), Ed25519 signatures |
-| `crates/veil-core/src/keychain.rs` | key generations, ring log (hash chain, signatures, genesis MAC), embargo key wrapping and release |
+| `crates/veil-core/src/keychain.rs` | key generations, ring log (hash chain, signatures, genesis MAC); embargo records (plain, no cryptography) |
 | `crates/veil-core/src/team_vault.rs` | team-vault records: sealed entries, their signatures and who counts (C12) |
 | `crates/veil-core/src/store.rs` | which construction a repository writes (by repository format) and what it accepts |
-| `crates/veil-core/src/upgrade.rs` | the migration to format 3 |
+| `crates/veil-core/src/upgrade.rs` | the ring step of the migration to format 3 (HPKE), and the format-8 check |
 
 ## 1. Primitives and crates
 
@@ -62,14 +62,16 @@ every format.
   Shrimpton 2006): no nonce, associated data is the vector `[label]`.
   The key is `HKDF-SHA256(salt = none, ikm = scope key, info =
   AES_SIV_SUBKEY, L = 64)` (RFC 5869).
-* **Inputs.** The 32-byte scope (or embargo) key; the label
-  (`<scope>#<key-id>`, `<scope>`, `embargo/<id>`); the plaintext is the
-  canonical encoding of another object (a blob or a tree).
+* **Inputs.** The 32-byte scope key; the label (`<scope>#<key-id>`,
+  `<scope>`); the plaintext is the canonical encoding of another object (a
+  secret file's blob, or a symlink target). Formats 7 and earlier also
+  sealed trees and used embargo keys (label `embargo/<id>`); format 8
+  refuses both.
 * **Encoding.** `veil:sea2\n ‖ u16be label_len ‖ label ‖ SIV[16] ‖ C`.
   The object id is `BLAKE3(encoding)`.
-* **Goal.** Confidentiality and integrity of cloaked and embargoed content
-  and trees. The label is authenticated, so ciphertext cannot be moved to
-  another scope, generation or embargo. **Determinism is required:**
+* **Goal.** Confidentiality and integrity of sealed secret files. The label
+  is authenticated, so ciphertext cannot be moved to another scope or
+  generation. **Determinism is required:**
   re-snapshotting unchanged content must give the same id (deduplication,
   no-op snapshots, unchanged directories keeping their tree ids).
 * **Known limits.**
@@ -125,28 +127,22 @@ repositories at format 1 or 2 (so that older vl can read them), see §5.
 
   | use | label | key | where |
   |---|---|---|---|
-  | cloaked change descriptions | `<scope>#<key-id>` / `embargo/<id>` | scope / embargo key | `Text::Sealed` in snapshots |
-  | cloaked tag messages (format 5) | `<scope>#<key-id>` | scope generation key | `Text::Sealed` in annotated tags (`veil:atag`) |
   | older generation key | `prev-key:<scope>#<new-key-id>` | the new generation's key | ring `Rotation.previous` |
-  | embargo key | `embargo-wrap:<id>` | scope key (generation in `scope_key`) | `EmbargoRecord.wrapped` |
   | device-local vault | `local` | `local_key` (C8) | `.veil/local/vault.sealed` |
   | team-vault entry (name and value) | `vault:<scope>#<key-id>` | scope generation key | `.veil/meta/vault/` records (C12) |
 
-* A cloaked tag message shares its label with cloaked descriptions under
-  the same key: a member could copy a sealed description into an atag of
-  their own (it then shows as that tag's message), but not into anyone
-  else's signed atag, whose signature covers the ciphertext. Both are text
-  for the same audience, so no content changes audience.
+* Formats 7 and earlier also sealed change descriptions and cloaked tags'
+  messages (label `<scope>#<key-id>` or `embargo/<id>`) and embargo keys
+  (label `embargo-wrap:<id>`); format 8 refuses all three, and the labels
+  stay reserved.
 * **Goal.** Ordinary nonce-based AEAD. The label is authenticated, so a
-  sealed key cannot be presented as another role or for another embargo or
-  generation. Scope names are `[a-z0-9_-]`, so a label prefix such as
+  sealed key cannot be presented as another role or generation. Scope names are `[a-z0-9_-]`, so a label prefix such as
   `wrap:` can never be read as a scope.
 * **Why not AES-SIV here too.** These need no determinism. XChaCha20 with
   random 192-bit nonces has negligible collision probability at any
   realistic volume (about 2^-96 after 2^48 messages under one key), and it
-  is constant-time without AES hardware. Keeping it also keeps three
-  **signed** encodings unchanged (the embargo record body, ring change bodies
-  that carry `previous`, and snapshot ids that cover descriptions). Changing
+  is constant-time without AES hardware. Keeping it also keeps the
+  **signed** ring change bodies that carry `previous` unchanged. Changing
   them would have needed new signature contexts and would have broken every
   existing signature.
 * **Known limits.** Not key-committing. The JSON form (`{scope, nonce,
@@ -253,9 +249,10 @@ Read forever; written only into format-1/2 repositories.
 ### C5. Signatures (all)
 
 `Ed25519(signing_key, SIG_PREFIX ‖ context ‖ 0x00 ‖ payload)`, contexts
-`snapshot`, `ring-change`, `embargo`, `embargo-release`, `member-binding`,
-`vault-entry`, `tag`, `hub-login`, `hub-device`, `hub-invite`, `hub-grant`,
-`hub-request` (see the
+`snapshot`, `ring-change`, `member-binding`, `vault-entry`, `tag`,
+`hub-login`, `hub-device`, `hub-invite`, `hub-grant`, `hub-request`, and the
+retired `embargo` and `embargo-release` (signed embargo records, formats 7
+and earlier; reserved, never reused) (see the
 domains table). Payloads are fixed encodings (FORMAT.md §2, "signed bodies never
 change"). What a valid signature *means* (who may sign what) is decided
 against the ring log (ARCHITECTURE §3).
@@ -263,8 +260,8 @@ against the ring log (ARCHITECTURE §3).
 * **Annotated tags (`tag`, repository format 5).** The payload is the
   32-byte *unsigned id* of the atag: the BLAKE3 id of its canonical
   encoding (`veil:atag\n` ‖ JSON) with `signature` omitted, as for
-  snapshots. It therefore covers the tag's name, target, kind, message (as
-  stored: the ciphertext of a sealed one), tagger and time.
+  snapshots. It therefore covers the tag's name, target, kind, message,
+  tagger and time.
   Goals: a signature cannot be moved to another tag name or target (the
   atag changes, the signature fails), and a view entry that names a
   genuine atag under another name or target is reported as "unverified
@@ -307,52 +304,22 @@ against the ring log (ARCHITECTURE §3).
   without NUL, so the MAC input is unambiguous. Freshness is TOFU (threat
   model).
 
-### C7. Embargo key wrapping and release (all) — kept
+### C7. Embargoes — removed (format 8)
 
-* Creation: a random 32-byte embargo key, sealed under the scope's current
-  generation key with C2 (label `embargo-wrap:<id>`, the generation named
-  in `scope_key`). The record commits to `key_id = fingerprint(key)` (C9)
-  and is signed (C5, `embargo`).
-* Release: the plaintext key is published in the record (`released_key`),
-  signed (C5, `embargo-release`). Every reader checks
-  `fingerprint(released_key) == key_id` before using it.
-* Goal: before release only scope members (holders of the generation key)
-  can read embargoed content; after release everyone can, and nobody can
-  publish a different key.
-* Who may sign a record is judged against the scope's ring. A public
-  remote holds no rings (BUG-077), so its clones accept records unverified:
-  they hold no scope key, so a record can never trigger a release there,
-  and a published key is still checked against `key_id` and then by the
-  AEAD of the content it opens. A record a ring later shows to be signed by
-  a member replaces an unverified local one.
-* **Who may release (BUG-108).** A valid release signature is not enough.
-  Where a repository holds a verified signed ring for the embargo's scope,
-  it accepts a release only if its signer is a **current** member of that
-  scope, signing with the key the ring registers for them, or if the
-  record's (good-signed) deadline has passed. The check runs on every
-  lookup, not only on pull, so a release accepted before a revocation
-  arrived stops counting once it does; a pull drops an unaccepted release
-  from the incoming record with a warning, and an accepted one replaces it
-  later. Without such a ring (public clones, legacy rings) the release is
-  judged by `key_id` alone, as before. A member granted by short member id
-  has no registered signing key and cannot release before the deadline.
-  What this does not prevent: a revoked member still holds the embargo key
-  (revocation is forward-only, and rotating the scope does not re-key an
-  embargo whose content is already sealed), so they can leak the key or
-  the fix out of band. What it prevents is an in-protocol release that
-  honest replicas act on, publishing the fix with their next public push.
-* **Staged release (BUG-109).** `Repo::release_embargo` (`vl embargo
-  release`) does not write the record. It stores the signed release fields
-  in device-local state (`.veil/local/releases/<id>.json`), which no sync
-  or remote reads, and which only the identity that signed it honours. The
-  next push copies them into the record before the record is
-  synced (`Keychain::publish_staged_releases`). So until then the key has
-  not left the repository through vl, and `vl undo` deletes the staged
-  release outright. After it, undo refuses: a published key cannot be
-  taken back. No construction changes; the signed release body is the
-  same.
-* Known limits: time-based release is enforced by key holders' engines, not
-  cryptography (threat model).
+Embargoes are permissions, not cryptography. Formats 7 and earlier sealed an
+embargoed merge's changed content under a random embargo key, wrapped that
+key under the scope key (label `embargo-wrap:<id>`), signed the record
+(contexts `embargo`, `embargo-release`) and published the key on release.
+Format 8 has none of it: an embargo record is plain (`EmbargoRecord
+{format: 2, id, scope, until, released_at, created}`), the embargoed merge
+and the history it brings in are withheld from every push until the
+release, and who may see them before it is a permission the server
+enforces (`docs/VISIBILITY.md`). The labels and signature contexts stay
+reserved in `domains.rs` and are never reused. What the client still
+guarantees without cryptography: nothing of an unreleased embargo leaves
+the repository through `vl` (ARCHITECTURE.md §7). What it no longer does:
+judge who may release (BUG-108); a release in a record a remote hands over
+is taken as it is, so the remote (the Veil server) is the authority.
 
 ### C8. Device-local vault key (all)
 
@@ -363,12 +330,10 @@ used with C2 (label `local`). Never stored or synced. The X25519 secret is
 ### C9. Key fingerprints (all)
 
 `key_id = hex(BLAKE3-derive_key(KEY_FINGERPRINT, key)[..8])`: public, 64
-bits. Goal: name a generation in labels, detect a wrong key after unwrapping
-and commit embargo records to their key. A collision gives no key material.
-At 64 bits, a *chosen* collision costs about 2^32. An admin could make two
-generations share an id, but `check_rotation` refuses a reused key id. An
-embargo creator could commit to an id two keys share, but the creator is a
-scope member who already holds the content.
+bits. Goal: name a generation in labels and detect a wrong key after
+unwrapping. A collision gives no key material. At 64 bits, a *chosen*
+collision costs about 2^32. An admin could make two generations share an
+id, but `check_rotation` refuses a reused key id.
 
 ### C10. Object ids and integrity checksums (all)
 
@@ -444,7 +409,7 @@ and is trusted with code but never with secrets.
 * **Goal.** Only members of the scope (holders of a generation key) read
   names and values. A record counts only if its signer is a *current*
   member with the signing key the verified ring registers (judged by every
-  reader against the ring, as for embargo releases, C7). The label binds
+  reader against the ring). The label binds
   the ciphertext to the scope and generation, and the signature binds the
   ciphertext to its writer, time and scope. Because the signature is over the
   ciphertext, a non-member relay can check who wrote a record without being
@@ -453,8 +418,8 @@ and is trusted with code but never with secrets.
   record is written once and never re-derived. Determinism would leak
   equality: setting a secret back to an earlier value, or two entries with
   the same value, would give identical ciphertexts. The `vault:` prefix keeps
-  these envelopes apart from cloaked change descriptions, which use C2 with
-  the bare `<scope>#<key-id>` label under the same key.
+  these envelopes apart from sealed secret files, which use C1 with the
+  bare `<scope>#<key-id>` label under the same key.
 * **Why encrypt-then-sign.** The signer is a member who could read and
   re-sign any entry anyway, so signing the ciphertext gives up nothing and
   lets anyone holding the ring verify membership. A member can take
@@ -525,8 +490,8 @@ are distinct and pins their exact bytes.
 | `SIG_PREFIX` | `veil 2026 sig v1\0` | Ed25519 message prefix | C5 |
 | `SIG_CONTEXT_SNAPSHOT` | `snapshot` | Ed25519 context | C5 |
 | `SIG_CONTEXT_RING_CHANGE` | `ring-change` | Ed25519 context | C5, C6 |
-| `SIG_CONTEXT_EMBARGO` | `embargo` | Ed25519 context | C5, C7 |
-| `SIG_CONTEXT_EMBARGO_RELEASE` | `embargo-release` | Ed25519 context | C5, C7 |
+| `SIG_CONTEXT_EMBARGO` | `embargo` | Ed25519 context | C5, C7 (retired in format 8: reserved, never reused) |
+| `SIG_CONTEXT_EMBARGO_RELEASE` | `embargo-release` | Ed25519 context | C5, C7 (retired in format 8: reserved, never reused) |
 | `SIG_CONTEXT_MEMBER_BINDING` | `member-binding` | Ed25519 context | C4, C5 |
 | `SIG_CONTEXT_VAULT_ENTRY` | `vault-entry` | Ed25519 context | C5, C12 |
 | `SIG_CONTEXT_TAG` | `tag` | Ed25519 context (format 5: annotated tags, over `Atag::unsigned_id`) | C5 |
@@ -543,8 +508,8 @@ are distinct and pins their exact bytes.
 | `POLICY_RULE_SCOPE` | `veil 2026 policy rule-scope v1` | BLAKE3 `derive_key` mode as a hash (first 80 bits) | the scope name `rule-<hex>` of an access line's secrets (not secret) |
 | `WRAP_LABEL_PREFIX` | `wrap:` | AEAD associated data | C3, C3L |
 | `PREV_KEY_LABEL_PREFIX` | `prev-key:` | AEAD associated data | C2 |
-| `EMBARGO_WRAP_LABEL_PREFIX` | `embargo-wrap:` | AEAD associated data | C2, C7 |
-| `EMBARGO_LABEL_PREFIX` | `embargo/` | AEAD associated data | C1, C2 |
+| `EMBARGO_WRAP_LABEL_PREFIX` | `embargo-wrap:` | AEAD associated data | C2, C7 (retired in format 8: reserved, never reused) |
+| `EMBARGO_LABEL_PREFIX` | `embargo/` | AEAD associated data | C1, C2 (retired in format 8: reserved, never reused) |
 | `LOCAL_LABEL` | `local` | AEAD associated data | C2, C8 |
 | `VAULT_LABEL_PREFIX` | `vault:` | AEAD associated data | C2, C12 |
 | `GENERATION_SEPARATOR` | `#` | label syntax `<scope>#<key-id>` | C1, C2 |
@@ -564,8 +529,6 @@ Signature contexts never contain NUL and are followed by `0x00`, so
   Veil-specific purpose.
 * **Key generations and the `previous` chain**: each generation key sealed
   under its successor (C2). This is key management, not a primitive.
-* **Embargo wrapping and release** (C7): standard AEAD, plus a published
-  key checked against a fingerprint commitment.
 * **BLAKE3 derivations** (§3): all through BLAKE3's specified KDF and keyed
   modes, with the contexts in one module.
 * **Labels as associated data**: the convention that the envelope label
@@ -577,17 +540,20 @@ Signature contexts never contain NUL and are followed by `0x00`, so
 | repository format | sealed objects | wrapped ring keys | ring format | identities created |
 |---|---|---|---|---|
 | 1, 2 | C1L `veil:seal` | C3L | 0/1 (legacy), 2 | (older vl) derived signing key |
-| 3, 4, 5 | C1 `veil:sea2` | C3 HPKE | 3 once it holds an HPKE wrap | independent signing key |
+| 3 to 7 | C1 `veil:sea2` | C3 HPKE | 3 once it holds an HPKE wrap (4 for invites and shares, format 7) | independent signing key |
+| 8 | C1 `veil:sea2`, for secret files only | C3 HPKE | 3, 4 | independent signing key |
 
 Format 5 adds no construction: a sealed symlink target is a sealed blob
-(C1), a cloaked tag message a C2 envelope, and an
-annotated tag's signature a C5 signature in the new context `tag`.
+(C1), and an annotated tag's signature a C5 signature in the new context
+`tag`. Format 8 adds none either: it removes every use of encryption but
+secret files (FORMAT.md §5), and opens only format 8.
 
-* **Readers** read every construction forever: `veil:seal` and `veil:sea2`
-  objects, legacy and HPKE wraps, legacy and new identity files.
+* **Readers** read every construction an upgraded repository can hold:
+  `veil:seal` and `veil:sea2` objects, legacy and HPKE wraps, legacy and
+  new identity files.
 * **Writers** write the constructions of their **repository format**, as
-  for tree encodings (FORMAT.md §1). A format-1/2 repository keeps writing
-  C1L and C3L, so older vl can keep reading it. Identity files are
+  for tree encodings (FORMAT.md §1); this release writes format 8 only, so
+  C1 and C3. Identity files are
   device-local, so new identities always get independent keys.
 * **Refusals** (`Unsupported`, "upgrade it with `vl upgrade` / `vl upgrade
   --remote <name>`"): a format-1/2 repository refuses `veil:sea2` objects
@@ -613,7 +579,7 @@ annotated tag's signature a C5 signature in the new context `tag`.
   blocks the upgrade after its commit point.
 * **Nothing is re-sealed.** Re-sealing history would change object ids, so
   every tree and snapshot above them, every snapshot signature and change
-  id would change. Unchanged cloaked files also keep
+  id would change. Unchanged sealed files also keep
   their existing sealing when re-snapshotted (`matches_encoding` compares
   plaintext), so they keep their ids.
 
@@ -655,16 +621,14 @@ every file would get new content off them, never old content.
   all-zero enc, wrong scope, wrong recipient, unknown suite, unknown
   fields), legacy wraps, identity files (damaged, mixed, newer).
 * **Cross-version and migration** (`tests/core_format/format_compat.rs`).
-  * Every fixture set (formats 1, 2, 3) reads, verifies and `fsck`s.
-  * The format-3 set has only C1/C3, plus a member with a legacy identity.
-  * Its `upgraded/` repository, a format-2 set after `vl upgrade`, mixes
-    both constructions, and every member reads exactly their share.
-  * A format-2 repository keeps writing C1L/C3L.
-  * Upgrading 1→3 and 2→3 rotates rings to HPKE, keeps every object and
-    id, and keeps unchanged files' sealing. It is idempotent, resumes after
-    a crash, and leaves rings alone (with a note) for a non-admin.
-  * `veil:sea2` objects and HPKE rings never reach a format-2 repository
-    (incremental and full sync, push and pull), and `fsck` reports them.
+  * The format-8 set reads, verifies and `fsck`s, with only C1/C3 and a
+    member with a legacy identity, and seals nothing but secret files.
+  * Every older set is refused unchanged (formats 1 to 5 as no longer
+    read; 6 and 7 naming what they hold that format 8 removed).
+  * Until format 8 these suites also checked the 1→3 and 2→3 upgrades
+    (rings rotated to HPKE, every object and id kept) and that format-3
+    cryptography never reached a format-2 repository; those formats are no
+    longer read.
 * The adversarial suites (`adversarial_*`, `hostile_*`) run unchanged
   against both constructions where they construct legacy data explicitly.
 

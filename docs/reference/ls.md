@@ -5,7 +5,7 @@
 
 List a snapshot's files with their tier: who can read each one, and what never leaves this machine.
 
-One line per file: tier, size in bytes, path (`*` marks an executable), and a note in parentheses. Tiers: `public`; `cloaked:<scope>` (encrypted for a scope you are in); `embargoed:<id>` (under an unreleased embargo whose key you hold); `redacted` (sealed for someone else, or withheld from this repository: the note says for whom). For the working copy (`-r @`, the default) the local-only files are listed too: `isolated` (never snapshotted or pushed), `quarantined` (a secret was found in it) and, with `--all`, `ignored`. No content is ever printed.
+One line per file: tier, size in bytes, path (`*` marks an executable), and a note in parentheses. Tiers: `public`; `embargoed` (plain, but an unreleased embargo withholds this version: no push sends it before the release); `cloaked:<scope>` (a secret file encrypted for a scope you are in); `redacted` (a secret sealed for someone else, or withheld from this repository: the note says for whom). For the working copy (`-r @`, the default) the local-only files are listed too: `isolated` (never snapshotted or pushed), `quarantined` (a secret was found in it) and, with `--all`, `ignored`. No content is ever printed.
 
 ```text
 vl ls [OPTIONS] [PATHS]...

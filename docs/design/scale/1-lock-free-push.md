@@ -1,6 +1,6 @@
 # 1. Lock-free, resumable two-phase pushes
 
-Status: **built** (stream P, Scion 1.1 and 1.5), in today's client, against today's remotes (path and SFTP, which the simplification pass removes). **The server keeps the shape** (`docs/HUB.md` §4.5): objects go to a holding area without a lock, and only the branch move is done one at a time, as a compare-and-swap on one database row instead of under the remote's lock. This document is the design and threat review as it was built. **No repository format change.** A format-5 remote keeps working with format-5 clients, and with this release pushing beside them.
+Status: **removed** with path and SFTP remotes (simplification pass, part 1, 2026-11-06); this is the record of what was built (stream P, Scion 1.1 and 1.5). **The server keeps the shape** (`docs/HUB.md` §4.5): objects go to a holding area without a lock, and only the branch move is done one at a time, as a compare-and-swap on one database row instead of under the remote's lock. This document is the design and threat review as it was built. **No repository format change.** A format-5 remote keeps working with format-5 clients, and with this release pushing beside them.
 
 ## The problem
 

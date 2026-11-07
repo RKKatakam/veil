@@ -35,7 +35,7 @@ cargo test -p vl --test cli_conformance -- --ignored conformance_worktree::    #
 | BUG-204 | low (fixed, working-copy wave 2) | Path arguments: `\` is rewritten to `/`; an absolute path outside the repository is taken relative to its root |
 | BUG-205 | low (fixed, working-copy wave 2) | `vl cat <directory>` reports a corrupt object |
 | BUG-209 | low (fixed, working-copy wave 2) | `vl restore` leaves the directories it empties behind |
-| BUG-210 | low | `vl tag set --cloak SCOPE` accepts unknown, non-member, reserved and malformed scopes |
+| BUG-210 | low (fixed; feature removed in repository format 8) | `vl tag set --cloak SCOPE` accepted unknown, non-member, reserved and malformed scopes |
 
 ### Deliberate differences from Git (documented Veil behaviour, tested as such)
 
@@ -207,7 +207,7 @@ reason share a line.
 | t3060-ls-files-with-tree | ported | `files::files_of_other_revisions` |
 | t3070-wildmatch | ported | `ignores::character_classes_question_marks_and_alternatives`, `double_star_*` (wildmatch semantics through policy rules; Veil uses globset) |
 | t3100-ls-tree-restrict … t3105-ls-tree-output (6 scripts) | ported | `files::files_of_other_revisions`, `files_shows_cloaked_files_with_their_scope`, `sizes_are_exact_for_large_files`, `files_and_cat_for_a_non_member` (ls-tree formats not applicable) |
-| t3200-branch | ported | `tags::*` (18 tests: create, default `@`, delete, unknown, forward/backward/sideways, invalid names, hierarchy, sort, rewrites, abandon, root, cloaked) — BUG-210. Not applicable: upstream tracking, `--contains`, `-m` rename (no rename command: `tags::renaming_a_tag_by_set_and_delete`), reflogs, worktree checks |
+| t3200-branch | ported | `tags::*` (16 tests: create, default `@`, delete, unknown, forward/backward/sideways, invalid names, hierarchy, sort, rewrites, abandon, root). Not applicable: upstream tracking, `--contains`, `-m` rename (no rename command: `tags::renaming_a_tag_by_set_and_delete`), reflogs, worktree checks |
 | t3201-branch-contains | not applicable | `branch --contains/--merged` (history queries: pending "history search") |
 | t3202-show-branch | not applicable | `show-branch` |
 | t3203-branch-output | ported | `tags::tag_list_is_sorted`, `tag_set_creates_and_list_shows_it` |
@@ -243,7 +243,7 @@ reason share a line.
 | t7001-mv | ported | `add_rm_mv::moving_a_file_is_a_delete_and_an_add`, `moving_a_directory_moves_its_files`, `moving_over_an_existing_file`, `moving_a_file_into_a_cloaked_directory_cloaks_it`, `renaming_a_file_to_a_secret_name_stops_recording_it` (rename detection pending) |
 | t7002-mv-sparse-checkout | not applicable | sparse checkout / skip-worktree |
 | t7003-filter-branch | not applicable | filter-branch |
-| t7004-tag | ported | `tags::*` (Veil tags are local names; annotated and signed tags: `vl tag set -a`, `vl tag verify`), `visibility::a_cloaked_tag_stays_off_a_public_remote` |
+| t7004-tag | ported | `tags::*` (Veil tags are local names; annotated and signed tags: `vl tag set -a`, `vl tag verify`) |
 | t7005-editor … t7006-pager (2 scripts) | not applicable | editor and pager (no editor prompt: `-m` is required) |
 | t7007-show | not applicable | other conformance agent (diff/history): `git show` |
 | t7008-filter-branch-null-sha1 | not applicable | filter-branch |
@@ -304,10 +304,10 @@ reason share a line.
 
 | File | Status | Veil tests / reason |
 |---|---|---|
-| cli `test_status_command.rs` | ported | `status::*` (clean, A/M/D, merge parents, conflicts, `st` alias, local-only/quarantined sections, cloaked workspace). Not applicable: fileset arguments, templates |
+| cli `test_status_command.rs` | ported | `status::*` (clean, A/M/D, merge parents, conflicts, `st` alias, local-only/quarantined sections). Not applicable: fileset arguments, templates |
 | cli `test_commit_command.rs` | ported | `commit::*` (commit, empty, multi-line, merge, summary). Not applicable: interactive `-i`, paths (partial commit: no equivalent in 1.0), `--reset-author`, editor |
 | cli `test_new_command.rs` | ported | `checkout::new_without_arguments_starts_on_the_working_copy`, `new_with_several_parents_merges_their_trees`, `an_empty_undescribed_change_is_discarded_on_moving_away`, `new_on_root_is_an_orphan_with_an_empty_tree`. Not applicable: `--insert-before/after`, revset expressions |
-| cli `test_describe_command.rs` | ported | `commit::describe_rewrites_a_change_and_tags_follow`, `describe_then_new_is_commit_without_moving_tags`, `describe_of_the_root_fails`, `descriptions_in_a_cloaked_workspace_are_cloaked`, `commit_and_describe_require_a_message`. Not applicable: editor, several revisions at once |
+| cli `test_describe_command.rs` | ported | `commit::describe_rewrites_a_change_and_tags_follow`, `describe_then_new_is_commit_without_moving_tags`, `describe_of_the_root_fails`, `commit_and_describe_require_a_message`. Not applicable: editor, several revisions at once |
 | cli `test_edit_command.rs` | ported | `checkout::edit_amends_an_older_change_and_rebases_descendants`, `edit_of_the_working_copy_is_a_no_op`, `edit_of_another_workspaces_working_copy`, `undo::undo_of_new_and_edit_returns_to_the_previous_working_copy` |
 | cli `test_restore_command.rs` | ported | `restore::*` — BUG-201, BUG-208, BUG-209. Not applicable: `--changes-in`, `--into`, interactive |
 | cli `test_workspaces.rs` | ported | `workspaces::*` (21 tests: new, list, switch, rm/forget, exec, ephemeral, write/cat, stale working copy, policy in sandboxes). Not applicable: workspace root paths, `update-stale` (Veil updates automatically) |
@@ -321,7 +321,7 @@ reason share a line.
 | cli `test_file_edit_command.rs`, `test_file_annotate_command.rs`, `test_file_search_command.rs` | pending feature | editor-driven edit (not planned), annotate/blame, grep |
 | cli `test_tag_command.rs` | ported | `tags::*` (Veil tags are local names) — BUG-210 |
 | cli `test_bookmark_command.rs` | ported (local behaviour) | `tags::*`: create, move, backwards guard, delete, rewrites, abandon. Not applicable: remote tracking, `track/untrack`, conflicted bookmarks |
-| cli `test_advance_bookmarks.rs` | ported | `commit::commit_advances_every_tag_at_the_parent`, `commit_does_not_move_tags_elsewhere`, `commit_in_a_cloaked_workspace_does_not_move_main` |
+| cli `test_advance_bookmarks.rs` | ported | `commit::commit_advances_every_tag_at_the_parent`, `commit_does_not_move_tags_elsewhere` |
 | cli `test_undo_redo_commands.rs` | ported | `undo::*` — BUG-206. Not applicable: `jj redo` (no command; a second undo redoes) |
 | cli `test_operations.rs` | ported | `undo::op_log_lists_operations_newest_first`, `snapshots_are_operations_but_idle_commands_add_none`, `undo_skips_the_automatic_snapshot`. Not applicable: `op show`, `op diff`, `--at-op`, templates |
 | cli `test_op_restore_command.rs` | ported | `undo::op_restore_*` |
@@ -346,12 +346,12 @@ reason share a line.
 
 ## Veil-specific variants
 
-`visibility::*` (12 tests) reruns the everyday scenarios with an isolated
-`.env`, a quarantined credential and a cloaked file: commit, checkout round
-trips, restore, undo and op restore, output of every inspecting command, a
-copy of `.env` under another name, editor artefacts, case variants of secret
-names, `ws exec` (`--with-isolated`, cloaked workspaces), a non-member's
-edit of a cloaked file, and a cloaked tag pushed to a public remote. Each
+`visibility::*` (10 tests) reruns the everyday scenarios with an isolated
+`.env`, a quarantined credential and a sealed secret file: commit, checkout
+round trips, restore, undo and op restore, output of every inspecting
+command, a copy of `.env` under another name, editor artefacts, case
+variants of secret names, `ws exec --with-isolated`, and a non-member's
+edit of a sealed secret file. Each
 greps the whole `.veil/` directory (and the remote) for the plaintext.
 Further variants live next to their Git scenario (`init_lists_existing_secrets_as_local_only`,
 `an_isolated_local_file_is_not_overwritten_or_published`,

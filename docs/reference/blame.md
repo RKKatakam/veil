@@ -5,7 +5,7 @@
 
 Show which change last touched each line of a file.
 
-History is read as you may see it: a version cloaked for a scope you are not in is never opened (a public file edited on a cloaked line is read as its last public version), and lines whose history is sealed for you are reported unattributed, never guessed. Prints change ids, never descriptions.
+History is read as you may see it: a secret file sealed for a scope you are not in is never opened, and lines whose history is sealed for you are reported unattributed, never guessed. Prints change ids, never descriptions.
 
 Alias: `vl annotate`.
 
@@ -27,7 +27,7 @@ Options:
 | `-L <START,END>` | Only annotate lines START to END (1-based, inclusive) |
 | `--follow` | Follow the file across renames |
 | `--max-changes <N>` | Stop after visiting this many snapshots; lines still open are reported as unattributed (default: `100000`) |
-| `--public` | Annotate as a public mirror sees the history (no cloaked versions) |
+| `--public` | Annotate as a public mirror sees the history: no secret files, and nothing an unreleased embargo withholds (refused for such a revision) |
 | `--json` | Print one JSON document instead of text (its schema is named in its `schema` field; see docs/reference/json.md). Errors then also print a `veil.error/1` document |
 
 ---

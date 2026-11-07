@@ -3,16 +3,12 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    builder::trusted_cloak,
-    embargo::{
-        apply_embargo, description_scope, normalize_tree, policy_rekeys, recordable_conflicts, seal_declassified, seal_introduced,
-        unreleased_wrapper, wrap, NormalizeOptions, NormalizeReport,
-    },
+    embargo::{normalize_tree, policy_rekeys, NormalizeOptions, NormalizeReport},
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
     keychain::{ReleaseState, StageOutcome, TakeBack},
     now_millis,
-    object::{Snapshot, Text, TreeEntry, Visibility},
+    object::{Snapshot, Text, TreeEntry},
     oplog::Tag,
     policy::{Policy, POLICY_FILE},
     repo::Repo,
@@ -27,8 +23,6 @@ use crate::{
 /// How [`Repo::set_tag_with`] sets a tag (`vl tag set`).
 #[derive(Debug, Clone, Default)]
 pub struct TagSpec {
-    /// Cloak the tag under this scope (kept from the existing tag if unset).
-    pub cloak: Option<String>,
     /// Allow moving a plain tag to a snapshot that is not a descendant.
     pub allow_backwards: bool,
     /// Make an annotated release tag with this message (`-a`, `-m`).
@@ -81,12 +75,6 @@ pub struct MergeResult {
     pub snapshot: ObjectId,
     pub conflicts: Vec<String>,
     pub embargo: Option<String>,
-    /// Files of a merged-in cloaked line of work that this merge made public
-    /// (each was secret-scanned first).
-    pub declassified: Vec<String>,
-    /// Files that would have become public but hold a secret: left out of
-    /// the merge (the destination keeps its own version, if any).
-    pub quarantined: Vec<String>,
     /// Visibility changes the merge refused to make silently.
     pub warnings: Vec<String>,
     /// Renames the merge followed (this reader's report; never stored).
@@ -99,23 +87,18 @@ pub struct MergeResult {
 /// takes back both); without, the working copy as it is.
 pub(crate) fn commit_in(tx: &mut Transaction, ws: &str, message: &str, advance: bool, recorded: Option<Snapshot>) -> Result<CommitResult> {
     let wc_id = tx.view.workspace(ws)?.wc;
-    let cloak = tx.view.workspace(ws)?.cloak.clone();
     let s = tx.repo().snapshot(&wc_id)?;
     let mut ns = recorded.unwrap_or_else(|| (*s).clone());
-    // On a line under an unreleased embargo a key holder's message
-    // describes the hidden fix: it is sealed under the embargo key.
-    let store = &tx.repo().store;
-    ns.description = store.make_text(message, description_scope(store, &ns.tree, ns.cloak.as_deref())?.as_deref())?;
+    ns.description = Text::Plain(message.to_string());
     ns.predecessors = vec![wc_id];
     ns.timestamp = now_millis();
     let committed = tx.rewrite(wc_id, ns)?;
-    let line_cloak = cloak.clone().or_else(|| s.cloak.clone());
     let (mut advanced, mut kept) = (Vec::new(), Vec::new());
     for (name, tag) in tx.view.tags.iter_mut() {
         if s.parents.first() != Some(&tag.target) {
             continue;
         }
-        match tag_kept(tag, line_cloak.as_deref(), advance) {
+        match tag_kept(tag, advance) {
             None => {
                 tag.target = committed;
                 advanced.push(name.clone());
@@ -123,7 +106,7 @@ pub(crate) fn commit_in(tx: &mut Transaction, ws: &str, message: &str, advance: 
             Some(why) => kept.push((name.clone(), why)),
         }
     }
-    let wc = tx.new_change(vec![committed], "", cloak)?;
+    let wc = tx.new_change(vec![committed], "")?;
     tx.set_workspace_wc(ws, wc)?;
     tx.set_description(format!("commit change {}", s.change_id.short()));
     Ok(CommitResult {
@@ -150,9 +133,6 @@ pub struct CommitResult {
 /// Why a tag at the parent of a commit did not move with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TagKept {
-    /// The commit is on a cloaked line (this scope) and the tag is not
-    /// cloaked under that scope: cloaked work never moves it.
-    CloakedLine(String),
     /// The caller asked for no tag to move (`vl commit --no-advance`).
     NoAdvance,
     /// An annotated release tag: immutable (`vl tag set --force` moves it).
@@ -161,18 +141,12 @@ pub enum TagKept {
 
 /// Which tags a commit moves (see [`Repo::commit`]): `None` if `tag` may
 /// advance, else why it stays.
-fn tag_kept(tag: &Tag, line_cloak: Option<&str>, advance: bool) -> Option<TagKept> {
+fn tag_kept(tag: &Tag, advance: bool) -> Option<TagKept> {
     if tag.annotation.is_some() {
         // A release tag is immutable: commits never move it.
         return Some(TagKept::Release);
     }
-    if !advance {
-        return Some(TagKept::NoAdvance);
-    }
-    match line_cloak {
-        Some(scope) if tag.cloak.as_deref() != Some(scope) => Some(TagKept::CloakedLine(scope.to_string())),
-        _ => None,
-    }
+    (!advance).then_some(TagKept::NoAdvance)
 }
 
 /// `tree` with its root entry `name` replaced by `entry` (or removed).
@@ -185,36 +159,6 @@ fn with_root_entry(store: &ObjectStore, tree: &ObjectId, name: &str, entry: Opti
         }
     }
     store.put_tree(&t)
-}
-
-/// Files that `tree` adds or changes relative to `dest` and that are sealed
-/// under a scope other than `scope`. An embargo wrapper keeps such content
-/// sealed as it is (releasing the embargo must not declassify it), so every
-/// member of that other scope could read the change before the release.
-fn sealed_for_other_scopes(store: &ObjectStore, dest: &ObjectId, tree: &ObjectId, scope: &str) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-    for c in crate::tree::diff_trees(store, Some(dest), Some(tree))? {
-        let Some(e) = &c.new else { continue };
-        if let (true, Visibility::Cloaked { scope: s }) = (e.kind.holds_blob(), &e.visibility) {
-            if s != scope {
-                out.push(format!("{} (cloaked under '{s}')", c.path));
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// Is `text` the description `message`, sealed for `scope` (plain when
-/// `None`)?
-fn same_description(store: &ObjectStore, text: &Text, message: &str, scope: Option<&str>) -> bool {
-    match (text, scope) {
-        (Text::Plain(t), None) => t == message,
-        (Text::Sealed(env), Some(scope)) => {
-            store.keys.sealing_key(scope).is_ok_and(|(label, _)| label == env.scope)
-                && store.read_text(text).as_deref() == Some(message)
-        }
-        _ => false,
-    }
 }
 
 /// A change taken apart for [`Repo::split`] and [`Repo::squash_into`]
@@ -300,15 +244,11 @@ pub fn validate_tag_name(name: &str) -> Result<()> {
 }
 
 impl Repo {
-    /// The unreleased embargo that snapshot `id` carries, if any: its tree
-    /// is under one, or one of its ancestors (itself included) is an
-    /// embargoed merge whose embargo has not been released. An embargo this
+    /// The unreleased embargo that snapshot `id` carries, if any: one of its
+    /// ancestors (itself included) is an embargoed merge whose embargo has
+    /// not been released. An embargo this
     /// repository has no record of counts as unreleased.
     pub fn carried_embargo(&self, id: &ObjectId) -> Result<Option<String>> {
-        let s = self.snapshot(id)?;
-        if let Some(w) = unreleased_wrapper(&self.store, &s.tree)? {
-            return Ok(Some(w.embargo));
-        }
         // Embargoed snapshots come from the history index: with none in
         // the history, nothing is walked.
         let mut carried: Vec<ObjectId> = self.graph().embargoed_among(self, [*id])?.into_iter().collect();
@@ -327,8 +267,7 @@ impl Repo {
     /// Start a new change on top of `parents` in workspace `ws`.
     pub fn new_change(&mut self, ws: &str, parents: Vec<ObjectId>, message: &str) -> Result<ObjectId> {
         let mut tx = self.transaction("new change")?;
-        let cloak = tx.view.workspace(ws)?.cloak.clone();
-        let id = tx.new_change(parents, message, cloak)?;
+        let id = tx.new_change(parents, message)?;
         tx.set_workspace_wc(ws, id)?;
         let change = tx.repo().snapshot(&id)?.change_id;
         tx.set_description(format!("new change {}", change.short()));
@@ -340,15 +279,11 @@ impl Repo {
         let mut tx = self.transaction("describe")?;
         let s = tx.repo().snapshot(&id)?;
         let mut ns = (*s).clone();
-        let store = &tx.repo().store;
-        let scope = description_scope(store, &s.tree, s.cloak.as_deref())?;
-        // The same message, sealed for the same audience: nothing to do
-        // (a sealed description never encrypts the same way twice, so the
-        // rewrite's own no-op check cannot see this, BUG-246).
-        if same_description(store, &s.description, message, scope.as_deref()) {
+        // The same message: nothing to do (BUG-246).
+        if s.description.as_str() == message {
             return Ok(id);
         }
-        ns.description = store.make_text(message, scope.as_deref())?;
+        ns.description = Text::Plain(message.to_string());
         ns.predecessors = vec![id];
         let new = tx.rewrite(id, ns)?;
         tx.set_description(format!("describe change {}", s.change_id.short()));
@@ -370,12 +305,7 @@ impl Repo {
     /// **Tags.** A tag pointing at the working copy's (first) parent moves
     /// to the commit, so committing on `main` moves `main`, except:
     ///
-    /// * on a **cloaked line** (the workspace, or the change itself, is
-    ///   cloaked under scope `S`), only tags cloaked under `S` move. An
-    ///   uncloaked tag such as `main` stays: it is what public remotes
-    ///   receive, and cloaked work reaches it only through an explicit
-    ///   `vl merge` (which publishes it after a secret scan, or embargoes
-    ///   it) or `vl tag set`;
+    /// * a release tag (annotated) never moves;
     /// * with `advance == false` (`vl commit --no-advance`), no tag moves.
     ///
     /// Tags that stayed are reported in [`CommitResult::kept`].
@@ -430,7 +360,7 @@ impl Repo {
         }
         let mut tx = self.transaction("rebase")?;
         let s = tx.repo().snapshot(&source)?;
-        let out = tx.repo().rebase_tree(&s.parents, &dest, s.tree, s.cloak.as_deref())?;
+        let out = tx.repo().rebase_tree(&s.parents, &dest, s.tree)?;
         let mut ns = (*s).clone();
         ns.parents = dest;
         ns.tree = out.tree;
@@ -438,7 +368,6 @@ impl Repo {
         ns.conflicts.extend(out.conflicts.iter().map(|p| p.to_string()));
         ns.conflicts.sort();
         ns.conflicts.dedup();
-        ns.conflicts = recordable_conflicts(&tx.repo().store, &ns.tree, ns.conflicts)?;
         let id = tx.rewrite(source, ns)?;
         tx.set_description(format!("rebase change {}", s.change_id.short()));
         tx.commit()?;
@@ -501,17 +430,15 @@ impl Repo {
                 "everything chosen: the second change would be empty (to change only the description, use `vl describe`)",
             ));
         }
-        let scope = description_scope(&store, &h.chosen, s.cloak.as_deref())?;
         let first = Snapshot {
             parents: s.parents.clone(),
             change_id: ChangeId::random(),
             tree: h.chosen,
-            description: store.make_text(message.unwrap_or(""), scope.as_deref())?,
+            description: Text::Plain(message.unwrap_or("").to_string()),
             author: s.author.clone(),
             timestamp: s.timestamp,
             predecessors: vec![id],
-            conflicts: recordable_conflicts(&store, &h.chosen, moved_conflicts(&store, &s, &h.chosen))?,
-            cloak: s.cloak.clone(),
+            conflicts: moved_conflicts(&store, &s, &h.chosen),
             embargo: None,
             signature: None,
         };
@@ -532,21 +459,18 @@ impl Repo {
     /// destination's, as a whole squash always did.
     ///
     /// * into its **parent**: the parent gets the chosen part; the source's
-    ///   own tree is unchanged (it already held everything), except that
-    ///   what a cloaked destination sealed is sealed in it too
-    ///   ([`crate::embargo::seal_moved`]);
+    ///   own tree is unchanged (it already held everything);
     /// * into an **ancestor**: the chosen part is merged into it, the
     ///   changes in between are rebased onto it, and the source keeps its
-    ///   tree (sealed the same way);
+    ///   tree;
     /// * into a **descendant**: the source keeps the rest, the changes in
     ///   between are rebased without the chosen part, and the destination
     ///   keeps its tree;
     /// * into an **unrelated** change: the source keeps the rest and the
     ///   chosen part is merged into the destination.
     ///
-    /// Descendants are rebased, and a cloaked destination seals what it is
-    /// given (as [`crate::embargo::seal_introduced`] does for a whole
-    /// squash). One transaction: `vl undo` restores everything.
+    /// Descendants are rebased. One transaction: `vl undo` restores
+    /// everything.
     pub fn squash_into(&mut self, id: ObjectId, into: Option<ObjectId>, part: Option<(&ChangeParts, &Selection)>) -> Result<SquashResult> {
         let mut tx = self.transaction("squash")?;
         let s = tx.repo().snapshot(&id)?;
@@ -590,32 +514,13 @@ impl Repo {
                 (base, s.tree, base, true)
             }
         };
-        let general = !into_parent || part.is_some();
-        if general {
-            let d = tx.repo().snapshot(&dest)?;
-            for t in [&s.tree, &base, &d.tree] {
-                if crate::embargo::wrapper_of(&store, t)?.is_some() {
-                    return Err(VeilError::Policy(
-                        "a change under an embargo can only be squashed whole into its parent (`vl squash` with no paths)".into(),
-                    ));
-                }
-            }
-        }
         let d = tx.repo().snapshot(&dest)?;
         // The destination as it ends up: `tree`, conflicts, and (if the
         // source is emptied) the joined description.
         let finish_dest = |tx: &Transaction, cur: ObjectId, tree: ObjectId, extra: Vec<String>| -> Result<Snapshot> {
             let now = tx.repo().snapshot(&cur)?;
             let mut nd = (*now).clone();
-            nd.tree = match &now.cloak {
-                // Folding into a cloaked change: what it introduces is part
-                // of the cloaked line and is sealed like the rest of it.
-                Some(scope) => {
-                    let pbase = tx.repo().parents_tree(&now.parents)?.tree;
-                    seal_introduced(&store, &tree, Some(pbase), scope)?
-                }
-                None => tree,
-            };
+            nd.tree = tree;
             nd.predecessors = vec![cur, id];
             // A path stays conflicted only if the result still has the
             // conflict: the destination's conflicted files the squash left
@@ -630,27 +535,13 @@ impl Repo {
             }
             conflicts.extend(moved_conflicts(&store, &s, &nd.tree));
             conflicts.extend(extra);
-            nd.conflicts = recordable_conflicts(&store, &nd.tree, conflicts.into_iter().collect())?;
+            nd.conflicts = conflicts.into_iter().collect();
             if all {
                 let pd = tx.repo().description(&now);
                 let sd = tx.repo().description(&s);
                 if !sd.trim().is_empty() {
                     let joined = if pd.trim().is_empty() { sd } else { format!("{pd}\n\n{sd}") };
-                    // A cloaked change's description stays sealed for its
-                    // scope, even when folded into a public one (the
-                    // joined text is sealed).
-                    let scope = match (&now.cloak, &s.cloak) {
-                        (Some(a), Some(b)) if a != b => {
-                            return Err(VeilError::Policy(format!(
-                                "cannot squash a change cloaked under '{b}' into one cloaked under '{a}'"
-                            )))
-                        }
-                        (a, b) => a.as_deref().or(b.as_deref()),
-                    };
-                    // Folded into (or from) a line under an unreleased
-                    // embargo: the joined text stays sealed under its key.
-                    let scope = description_scope(&store, &nd.tree, scope)?;
-                    nd.description = store.make_text(&joined, scope.as_deref())?;
+                    nd.description = Text::Plain(joined);
                 }
             }
             Ok(nd)
@@ -668,34 +559,22 @@ impl Repo {
             ns.tree = tree;
             ns.predecessors = vec![cur];
             ns.conflicts = s.conflicts.clone();
-            ns.conflicts = recordable_conflicts(&store, &tree, ns.conflicts)?;
             Ok(Some(tx.rewrite(cur, ns)?))
         };
         let merge_into = |tree: ObjectId| -> Result<(ObjectId, Vec<String>)> {
             let out = crate::merge::merge_trees(&store, Some(base), tree, chosen)?;
             Ok((out.tree, out.conflicts.iter().map(|p| p.to_string()).collect()))
         };
-        // A source that keeps its tree (into its parent or an ancestor)
-        // still holds what it gave: where a cloaked destination sealed it,
-        // the source holds it sealed too, so that the moved part leaves
-        // the source's own change and nothing sealed in the destination
-        // stays public on top of it (BUG-483).
-        let kept_source = |nd: &Snapshot, given: ObjectId| -> Result<ObjectId> {
-            match &nd.cloak {
-                Some(scope) => crate::embargo::seal_moved(&store, s.tree, given, nd.tree, scope),
-                None => Ok(s.tree),
-            }
-        };
         let (destination, source) = if into_parent {
             let nd = finish_dest(&tx, dest, chosen, vec![])?;
-            let src_tree = kept_source(&nd, chosen)?;
+            let src_tree = s.tree;
             let new_dest = tx.rewrite(dest, nd)?;
             let source = finish_source(&mut tx, id, Some(vec![new_dest]), src_tree)?;
             (new_dest, source)
         } else if tx.repo().is_ancestor(&dest, &id)? {
             let (tree, extra) = merge_into(d.tree)?;
             let nd = finish_dest(&tx, dest, tree, extra)?;
-            let src_tree = kept_source(&nd, tree)?;
+            let src_tree = s.tree;
             let new_dest = tx.rewrite(dest, nd)?;
             tx.rebase_now()?;
             let cur = tx.current(id).ok_or_else(|| VeilError::repo("the change to squash disappeared while rebasing"))?;
@@ -757,11 +636,7 @@ impl Repo {
         parents.extend(others.iter().copied());
         let into_snap = tx.repo().snapshot(&into)?;
         let store = tx.repo().store.clone();
-        let cloak = into_snap.cloak.as_deref();
-        // A merge put under an embargo records its conflicts as markers:
-        // the embargo's sealed tree never holds conflict entries.
-        let merged = tx.repo().parents_tree_with(&parents, embargo.is_some())?;
-        let outer = unreleased_wrapper(&store, &merged.tree)?;
+        let merged = tx.repo().parents_tree(&parents)?;
         // An unreadable `.veilpolicy` on either side (a hostile tree's
         // directory, BUG-121) never blocks the merge: the accepted policy
         // applies there, with a warning.
@@ -772,12 +647,12 @@ impl Repo {
         warnings.dedup();
         let mut tree = merged.tree;
 
-        // A merged `.veilpolicy` that would move existing cloaked content to
+        // A merged `.veilpolicy` that would move an existing secret to
         // another audience (re-key it, or make it public) is not taken: the
         // destination's policy is kept and the member is told. Applying it
         // is a deliberate edit, not a side effect of merging someone's PR.
-        let mut rekeys = policy_rekeys(&store, &into_snap.tree, &dest_policy, &policy, cloak)?;
-        for r in policy_rekeys(&store, &tree, &dest_policy, &policy, cloak)? {
+        let mut rekeys = policy_rekeys(&store, &into_snap.tree, &dest_policy, &policy)?;
+        for r in policy_rekeys(&store, &tree, &dest_policy, &policy)? {
             if !rekeys.iter().any(|(p, _, _)| *p == r.0) {
                 rekeys.push(r);
             }
@@ -791,32 +666,9 @@ impl Repo {
                 .map(|(p, from, to)| format!("{p}: {} → {}", from.label(), to.label()))
                 .collect();
             warnings.push(format!(
-                "kept the destination's {POLICY_FILE}: the merged one would change the audience of existing cloaked files ({}); review it and apply it deliberately",
+                "kept the destination's {POLICY_FILE}: the merged one would change the audience of existing secrets ({}); review it and apply it deliberately",
                 list.join(", ")
             ));
-        }
-
-        // Merging a cloaked line of work into this one is the explicit act
-        // that may publish its files (secret-scanned). A `cloak` field is a
-        // claim anyone can write over anyone's sealed objects, so a line
-        // counts only if every snapshot the merge brings in is signed by a
-        // current member of its scope (BUG-122).
-        let mut declassify = BTreeSet::new();
-        for o in &others {
-            let Some(c) = trusted_cloak(tx.repo().snapshot(o)?.cloak.as_deref()).map(str::to_string) else {
-                continue;
-            };
-            if Some(c.as_str()) == cloak || declassify.contains(&c) {
-                continue;
-            }
-            if tx.repo().merged_in_signed_by(&into, &others, &c)? {
-                declassify.insert(c);
-            } else {
-                warnings.push(format!(
-                    "not publishing the files of the line cloaked under '{c}' ({}): not every snapshot this merge brings in is signed by a current member of '{c}', and only members may publish its content; they stay cloaked (`vl expose` publishes deliberately)",
-                    o.short()
-                ));
-            }
         }
         let mut report = NormalizeReport::default();
         tree = normalize_tree(
@@ -826,65 +678,17 @@ impl Repo {
                 policy: &policy,
                 dest_policy: &dest_policy,
                 dest_tree: into_snap.tree,
-                cloak,
-                declassify: &declassify,
-                // Declassified content of an embargoed result is sealed
-                // under the embargo key directly, never stored as
-                // plaintext first (BUG-249).
-                defer_declassify: embargo.is_some() || outer.is_some(),
             },
             &mut report,
         )?;
-        // A file whose edit followed a rename stays sealed at its new path,
-        // whatever the policy says there: the rename moved it, not the line
-        // being merged, and only `vl expose` publishes it.
-        tree = crate::merge::keep_followed_sealed(&store, tree, merged.tree, &merged.renames, &mut report.declassified, &mut report.quarantined, &mut warnings)?;
-        // The destination is under an unreleased embargo: stay under it.
-        if let Some(w) = &outer {
-            tree = seal_declassified(&store, &tree, &report.declassified, &w.embargo, &into_snap.tree)?;
-            if tree != merged.tree {
-                tree = wrap(&store, &w.embargo, &tree, &w.fallback)?;
-            }
-        }
-        let mut conflicts: Vec<String> = merged.conflicts.iter().map(|p| p.to_string()).collect();
-        let reported_conflicts = conflicts.clone();
-        // Embargo records are synced to every remote, public ones included,
-        // so the record carries no message; the merge's description is
-        // sealed under the embargo key instead. The record is only created
-        // once the merge is known to be possible.
+        let conflicts: Vec<String> = merged.conflicts.iter().map(|p| p.to_string()).collect();
+        // The record is only created once the merge is known to be
+        // possible. It is plain: embargoes are permissions, not encryption.
         let embargo_id = match &embargo {
-            Some(spec) => {
-                let mut other_scopes = sealed_for_other_scopes(&store, &into_snap.tree, &tree, &spec.scope)?;
-                // Declassified files are still sealed under their line's
-                // scope here; they go under the embargo key below.
-                other_scopes.retain(|o| !report.declassified.iter().any(|p| o.starts_with(&format!("{p} ("))));
-                if !other_scopes.is_empty() {
-                    return Err(VeilError::Policy(format!(
-                        "cannot merge under an embargo for scope '{}': the merge changes files cloaked under another scope, whose members could read them before the release ({}); embargo under that scope, or make those changes after the release",
-                        spec.scope,
-                        other_scopes.join(", ")
-                    )));
-                }
-                let e = tx.repo().keys().create_embargo(&spec.scope, spec.until)?;
-                tree = seal_declassified(&store, &tree, &report.declassified, &e, &into_snap.tree)?;
-                tree = apply_embargo(&store, &tree, &into_snap.tree, &e)?;
-                Some(e)
-            }
+            Some(spec) => Some(tx.repo().keys().create_embargo(&spec.scope, spec.until)?),
             None => None,
         };
-        let recorded = recordable_conflicts(&store, &tree, std::mem::take(&mut conflicts))?;
-        if recorded.len() < reported_conflicts.len() {
-            warnings.push(format!(
-                "{} conflicted file(s) are not recorded on the merge: snapshot metadata is public, and their names would reveal what the embargo hides; resolve the conflict markers before committing",
-                reported_conflicts.len()
-            ));
-        }
-        let scope = match (&embargo_id, cloak) {
-            (Some(e), None) => Some(format!("embargo/{e}")),
-            // Also a plain merge into a line under an unreleased embargo.
-            _ => description_scope(&store, &tree, cloak)?,
-        };
-        let description = store.make_text(message, scope.as_deref())?;
+        let description = Text::Plain(message.to_string());
         warnings.extend(report.kept_sealed.iter().map(|(p, why)| format!("{p} {why}")));
         let snap = Snapshot {
             parents,
@@ -894,8 +698,7 @@ impl Repo {
             author: tx.repo().user.clone(),
             timestamp: now_millis(),
             predecessors: vec![],
-            conflicts: recorded,
-            cloak: into_snap.cloak.clone(),
+            conflicts: conflicts.clone(),
             embargo: embargo_id.clone(),
             signature: None, // signed by the transaction
         };
@@ -906,8 +709,7 @@ impl Repo {
                 tag.target = m;
             }
         }
-        let cloak = tx.view.workspace(ws)?.cloak.clone();
-        let wc = tx.new_change(vec![m], "", cloak)?;
+        let wc = tx.new_change(vec![m], "")?;
         tx.set_workspace_wc(ws, wc)?;
         tx.set_description(match &embargo_id {
             Some(e) => format!("merge {} (embargo {e})", snap.change_id.short()),
@@ -916,54 +718,19 @@ impl Repo {
         tx.commit()?;
         Ok(MergeResult {
             snapshot: m,
-            conflicts: reported_conflicts,
+            conflicts,
             embargo: embargo_id,
-            declassified: report.declassified.iter().map(|p| p.to_string()).collect(),
-            quarantined: report
-                .quarantined
-                .iter()
-                .map(|(p, f)| {
-                    let rules: Vec<&str> = f.iter().map(|f| f.rule).collect();
-                    format!("{p} ({})", rules.join(", "))
-                })
-                .collect(),
             warnings,
             renames: merged.renames,
         })
     }
 
-    /// Is every snapshot that merging `others` into `into` brings in (an
-    /// ancestor of one of `others`, not of `into`) present and signed by a
-    /// current member of `scope` ([`crate::keychain::Keychain::signed_by_member`])?
-    fn merged_in_signed_by(&self, into: &ObjectId, others: &[ObjectId], scope: &str) -> Result<bool> {
-        // What the merge brings in, without reading `into`'s history below
-        // the merge base (the history index).
-        let brought = self.graph().range(self, others, &[*into])?;
-        for x in others.iter().chain(&brought) {
-            if brought.contains(x) || !self.is_ancestor(x, into)? {
-                let Some(s) = self.snapshot_opt(x)? else { return Ok(false) };
-                if !self.keys().signed_by_member(scope, &s) {
-                    return Ok(false);
-                }
-                // A parent this replica lacks counts as unsigned unless
-                // `into` already has it.
-                for p in &s.parents {
-                    if !brought.contains(p) && self.snapshot_opt(p)?.is_none() && !self.is_ancestor(p, into)? {
-                        return Ok(false);
-                    }
-                }
-            }
-        }
-        Ok(true)
-    }
-
     /// Create or move a plain (branch-like) tag. See [`Repo::set_tag_with`].
-    pub fn set_tag(&mut self, name: &str, target: ObjectId, cloak: Option<String>, allow_backwards: bool) -> Result<()> {
+    pub fn set_tag(&mut self, name: &str, target: ObjectId, allow_backwards: bool) -> Result<()> {
         self.set_tag_with(
             name,
             target,
             &TagSpec {
-                cloak,
                 allow_backwards,
                 ..TagSpec::default()
             },
@@ -982,20 +749,9 @@ impl Repo {
     /// tag -f`). The annotation is never dropped silently: forcing without
     /// a message keeps the old one, and turning a release tag back into a
     /// plain tag takes `vl tag delete` first. Commits and merges never
-    /// advance a release tag. A cloaked tag's message is sealed under its
-    /// scope.
+    /// advance a release tag.
     pub fn set_tag_with(&mut self, name: &str, target: ObjectId, spec: &TagSpec) -> Result<SetTagOutcome> {
         validate_tag_name(name)?;
-        let cloak = spec.cloak.clone();
-        // A cloaked tag names a scope you can use, as `vl ws new --cloak`
-        // and `vl cloak --scope` require: a typo or a reserved name would
-        // leave a tag no cloaked line ever advances (BUG-210).
-        if let Some(scope) = &cloak {
-            crate::keychain::validate_scope_name(scope)?;
-            if !self.keys().is_member(scope) {
-                return Err(VeilError::Policy(format!("you hold no key for scope '{scope}'")));
-            }
-        }
         // A tag on anything but a snapshot (a blob, a tree) would break
         // every graph query that walks the view.
         match self.snapshot(&target) {
@@ -1017,9 +773,7 @@ impl Repo {
         if let Some(t) = &existing {
             match t.annotation {
                 Some(a) => {
-                    let unchanged = t.target == target
-                        && spec.annotate.is_none()
-                        && spec.cloak.as_ref().is_none_or(|c| t.cloak.as_ref() == Some(c));
+                    let unchanged = t.target == target && spec.annotate.is_none();
                     if unchanged && !spec.force {
                         return Ok(SetTagOutcome {
                             annotation: Some(a),
@@ -1047,26 +801,18 @@ impl Repo {
                 )));
             }
         }
-        let cloak = cloak.or_else(|| existing.as_ref().and_then(|t| t.cloak.clone()));
         // The annotation: a new message, or (forcing a release tag without
         // one) the old message, never dropped.
         let message = match (&spec.annotate, old_annotation) {
             (Some(m), _) => Some(m.clone()),
-            (None, Some(a)) => {
-                let old = self.store().atag(&a)?;
-                Some(self.store().read_text(&old.message).ok_or_else(|| {
-                    VeilError::repo(format!(
-                        "the message of release tag '{name}' is sealed and you cannot read it; give a new one with -m"
-                    ))
-                })?)
-            }
+            (None, Some(a)) => Some(self.store().atag(&a)?.message.as_str().to_string()),
             (None, None) => None,
         };
         let mut signed = false;
         let annotation = match message {
             None => None,
             Some(m) => {
-                let text = self.store().make_text(&m, cloak.as_deref())?;
+                let text = Text::Plain(m);
                 let tagger: String = self.user.chars().filter(|c| !c.is_control()).take(crate::tag_object::MAX_TAGGER).collect();
                 let mut a = Atag::annotated(name, target, text, &tagger, now_millis());
                 if let Some(id) = self.identity() {
@@ -1080,11 +826,7 @@ impl Repo {
         tx.repository_wide();
         tx.view.tags.insert(
             name.to_string(),
-            Tag {
-                target,
-                cloak,
-                annotation,
-            },
+            Tag { target, annotation },
         );
         tx.commit()?;
         Ok(SetTagOutcome {
@@ -1126,7 +868,7 @@ impl Repo {
             }
             _ => None,
         };
-        let message = self.store().read_text(&atag.message);
+        let message = Some(atag.message.as_str().to_string());
         Ok(TagCheck {
             id: *id,
             verified: signer.is_some(),
@@ -1153,7 +895,7 @@ impl Repo {
 
     /// Release embargo `id`, recorded as the operation `release embargo
     /// <id>`. The release is **staged** ([`Keychain::stage_release`]): this
-    /// repository treats the embargo as released at once, and the key
+    /// repository treats the embargo as released at once, and the release
     /// reaches the synced record with the next push. Until
     /// then `vl undo` takes the release back completely; afterwards it
     /// cannot be undone (BUG-109).
@@ -1175,8 +917,8 @@ impl Repo {
     /// device-local state), not in the view an undo restores. So undoing
     /// `release embargo <id>` takes back a release that is only staged
     /// (returns its id, for [`Repo::finish_undo_release`] once the view is
-    /// restored), and is **refused**, before anything changes, when the key
-    /// has been published: nothing can unpublish it. Undoing the undo of a
+    /// restored), and is **refused**, before anything changes, when the
+    /// release has been published: nothing can unpublish it. Undoing the undo of a
     /// release is refused too: undo never releases an embargo.
     pub fn check_undo_release(&self, description: &str) -> Result<Option<String>> {
         if let Some(id) = description.strip_prefix("undo: ").and_then(|d| d.strip_prefix(RELEASE_OP_PREFIX)) {
@@ -1189,10 +931,10 @@ impl Repo {
         };
         match self.keys().release_state(id) {
             ReleaseState::Released => Err(VeilError::Policy(format!(
-                "cannot undo `{description}`: the embargo key has been published (pushed, or received from a remote), and a published key cannot be taken back. Nothing was changed. Treat the fix as public"
+                "cannot undo `{description}`: the release has been published (pushed, received from a remote, or past its deadline), and a published release cannot be taken back. Nothing was changed. Treat the fix as public"
             ))),
             ReleaseState::Staged => Ok(Some(id.to_string())),
-            ReleaseState::Unreleased | ReleaseState::Rejected(_) => Ok(None),
+            ReleaseState::Unreleased => Ok(None),
         }
     }
 
@@ -1224,24 +966,6 @@ impl Repo {
             }
         }
         Ok((staged, published))
-    }
-
-    /// Release every embargo whose deadline passed and for which we hold the
-    /// key. Called on every CLI invocation.
-    pub fn auto_release_embargoes(&mut self) -> Result<Vec<String>> {
-        let now = now_millis();
-        let mut released = Vec::new();
-        for rec in self.keys().embargoes()? {
-            // Only a deadline signed by a scope member may trigger a release.
-            if self.keys().embargo_released(&rec.id) || rec.until.is_none_or(|u| u > now) || !self.keys().embargo_trusted(&rec) {
-                continue;
-            }
-            if self.keys().has(&format!("embargo/{}", rec.id)) {
-                self.release_embargo(&rec.id)?;
-                released.push(rec.id);
-            }
-        }
-        Ok(released)
     }
 
     /// Undo the most recent operation by restoring the view before it.

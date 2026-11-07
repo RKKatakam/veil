@@ -112,7 +112,6 @@ impl<'a> Reader<'a> {
                         c.push(id);
                         for e in &t.entries {
                             next.push((c.clone(), e.id));
-                            next.extend(e.fallback.map(|f| (c.clone(), f)));
                         }
                     }
                     Ok(Object::Conflict(k)) => {

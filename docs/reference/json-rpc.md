@@ -48,23 +48,23 @@ documents described [below](#write-results).
 
 | Method | Command | Parameters | Result |
 |---|---|---|---|
-| `status` | `vl status` | | [`veil.status/1`](json.md#veilstatus1) |
-| `log` | `vl log` | `limit` (number) | [`veil.log/1`](json.md#veillog1) |
-| `diff` | `vl diff` | `rev`, or `from` and `to` (revisions); `stat` (bool) | [`veil.diff/1`](json.md#veildiff1) |
-| `show` | `vl show` | `rev` (default `@`), `stat` (bool) | [`veil.show/1`](json.md#veilshow1) |
-| `blame` | `vl blame` | `path` (required), `rev` (default `@`), `lines` (`[START, END]`), `follow` (bool), `max_changes` (number), `public` (bool) | [`veil.blame/1`](json.md#veilblame1) |
-| `grep` | `vl grep` | `pattern` (required), `rev` (default `@`), `paths` (list), `ignore_case`, `fixed_strings`, `word_regexp`, `text` (bools), `max_count` (number) | [`veil.grep/1`](json.md#veilgrep1) |
-| `ws.list` (also `workspace.list`) | `vl workspace list` | | [`veil.workspace.list/1`](json.md#veilworkspacelist1) |
-| `tag.list` | `vl tag list` | | [`veil.tag.list/1`](json.md#veiltaglist1) |
+| `status` | `vl status` | | [`veil.status/2`](json.md#veilstatus2) |
+| `log` | `vl log` | `limit` (number) | [`veil.log/2`](json.md#veillog2) |
+| `diff` | `vl diff` | `rev`, or `from` and `to` (revisions); `stat` (bool) | [`veil.diff/2`](json.md#veildiff2) |
+| `show` | `vl show` | `rev` (default `@`), `stat` (bool) | [`veil.show/2`](json.md#veilshow2) |
+| `blame` | `vl blame` | `path` (required), `rev` (default `@`), `lines` (`[START, END]`), `follow` (bool), `max_changes` (number), `public` (bool) | [`veil.blame/2`](json.md#veilblame2) |
+| `grep` | `vl grep` | `pattern` (required), `rev` (default `@`), `paths` (list), `ignore_case`, `fixed_strings`, `word_regexp`, `text` (bools), `max_count` (number) | [`veil.grep/2`](json.md#veilgrep2) |
+| `ws.list` (also `workspace.list`) | `vl workspace list` | | [`veil.workspace.list/2`](json.md#veilworkspacelist2) |
+| `tag.list` | `vl tag list` | | [`veil.tag.list/2`](json.md#veiltaglist2) |
 | `op.log` | `vl op log` | `limit` (number, default 20) | [`veil.op.log/1`](json.md#veiloplog1) |
 | `scan` | `vl scan` | `policy_from` (a file inside the repository) | [`veil.scan/1`](json.md#veilscan1) |
 | `secret.list` | `vl secret list` | `scope` (a team vault instead of the local vault), `exposed_to` (with `scope`: only what that member could read) | [`veil.secret.list/1`](json.md#veilsecretlist1) |
-| `snapshot` | (any command's automatic snapshot) | none | [`veil.snapshot/1`](#veilsnapshot1) |
-| `describe` | `vl describe` | `message` (required), `rev` (default `@`), `no_verify` (bool) | [`veil.describe/1`](#veildescribe1) |
-| `new` | `vl new` | `revs` (list, default `[@]`), `message` | [`veil.new/1`](#veilnew1) |
-| `commit` | `vl commit` | `message` (required), `no_advance` (bool), `no_verify` (bool) | [`veil.commit/1`](#veilcommit1) |
-| `split` | `vl split` | `files` (required: a [plan](json.md#veilsplit1)'s `files`), `rev` (default `@`), `message` | [`veil.split/1`](json.md#veilsplit1) |
-| `squash` | `vl squash` | `rev` (default `@`), `into` (a revision), `files` (as for `split`; leave it out to move the whole change) | [`veil.squash/1`](json.md#veilsquash1) |
+| `snapshot` | (any command's automatic snapshot) | none | [`veil.snapshot/2`](#veilsnapshot2) |
+| `describe` | `vl describe` | `message` (required), `rev` (default `@`), `no_verify` (bool) | [`veil.describe/2`](#veildescribe2) |
+| `new` | `vl new` | `revs` (list, default `[@]`), `message` | [`veil.new/2`](#veilnew2) |
+| `commit` | `vl commit` | `message` (required), `no_advance` (bool), `no_verify` (bool) | [`veil.commit/2`](#veilcommit2) |
+| `split` | `vl split` | `files` (required: a [plan](json.md#veilsplit2)'s `files`), `rev` (default `@`), `message` | [`veil.split/2`](json.md#veilsplit2) |
+| `squash` | `vl squash` | `rev` (default `@`), `into` (a revision), `files` (as for `split`; leave it out to move the whole change) | [`veil.squash/2`](json.md#veilsquash2) |
 | `watch` | | `interval_ms` (50–60000, default 500), `working_copy` (bool) | [`veil.watch/1`](#veilwatch1), then [`changed`](#notifications) notifications |
 | `unwatch` | | none | [`veil.watch/1`](#veilwatch1) |
 | `server.info` | | none | [`veil.server.info/1`](#veilserverinfo1) |
@@ -110,37 +110,37 @@ hooks as the commands (see [the hooks guide](../guide/hooks.md)), unless
 into the reply; a failing hook is an error reply, and nothing is
 committed. There is no method to trust repository hooks.
 
-#### `veil.snapshot/1`
+#### `veil.snapshot/2`
 
 The working copy was recorded (if nothing changed, no operation was).
 
 | Field | Type | |
 |---|---|---|
-| `schema` | string | `veil.snapshot/1` |
+| `schema` | string | `veil.snapshot/2` |
 | `working_copy` | [snapshot reference](json.md#snapshot-reference) | the working-copy snapshot now |
 | `operation` | [operation](#operation) | the head of the operation log |
 
-#### `veil.describe/1`
+#### `veil.describe/2`
 
 | Field | Type | |
 |---|---|---|
-| `schema` | string | `veil.describe/1` |
+| `schema` | string | `veil.describe/2` |
 | `described` | [snapshot reference](json.md#snapshot-reference) | the change with its new description (a new snapshot of it; descendants are rebased onto it) |
 | `operation` | [operation](#operation) | |
 
-#### `veil.new/1`
+#### `veil.new/2`
 
 | Field | Type | |
 |---|---|---|
-| `schema` | string | `veil.new/1` |
+| `schema` | string | `veil.new/2` |
 | `working_copy` | [snapshot reference](json.md#snapshot-reference) | the new change, now the working copy |
 | `operation` | [operation](#operation) | |
 
-#### `veil.commit/1`
+#### `veil.commit/2`
 
 | Field | Type | |
 |---|---|---|
-| `schema` | string | `veil.commit/1` |
+| `schema` | string | `veil.commit/2` |
 | `committed` | [snapshot reference](json.md#snapshot-reference) | the change just committed |
 | `working_copy` | [snapshot reference](json.md#snapshot-reference) | the new, empty change on top of it |
 | `advanced` | list of strings | tags that moved from the parent to the committed change |
