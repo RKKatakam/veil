@@ -78,6 +78,10 @@ const RECENT: usize = 1024;
 /// while ordinary changes (a few KiB of listings each) still fill batches
 /// of hundreds.
 pub const BATCH_BYTES: usize = 8 << 20;
+/// Most projections one batch makes to attach view keys (each over what
+/// came after its memo on the recent line); a key past it is the
+/// background fill's.
+pub const ATTACH_BUDGET: usize = 256;
 /// A view key with no memo on the recent line is handed to the background
 /// fill at most this often.
 const PREFILL_EVERY: Duration = Duration::from_secs(5);
@@ -137,7 +141,8 @@ struct Row {
     seq: i64,
     ticket: String,
     person: Person,
-    stack: Vec<ObjectId>,
+    /// Each change with its base (`landing::stack`).
+    stack: Vec<(ObjectId, ObjectId)>,
     epochs: (i64, i64),
 }
 
@@ -200,6 +205,8 @@ struct Inputs {
     memo: HashMap<(String, ObjectId), ObjectId>,
     /// Origins (`sync::push`) of the stack snapshots that have one.
     origins: HashMap<ObjectId, ObjectId>,
+    /// Stack changes that landed already (`landings`: submitted → landed).
+    landed: HashMap<ObjectId, ObjectId>,
 }
 
 /// What one entry came to.
@@ -216,6 +223,11 @@ struct Built {
     outcomes: Vec<Outcome>,
     objects: Vec<(ObjectId, Bytes)>,
     bytes: usize,
+    /// How many times the objects held were stored mid-build (`flush`).
+    flushes: usize,
+    /// Bytes of every new object of the batch, stored mid-build or not:
+    /// what decides whether another entry joins it.
+    made: usize,
     snapshots: Vec<ObjectId>,
     /// Submitted snapshots made again: `(submitted, landed)`.
     landings: Vec<(ObjectId, ObjectId)>,
@@ -232,8 +244,30 @@ struct Built {
 impl Built {
     fn object(&mut self, src: &mut Source, id: ObjectId, raw: Bytes) {
         self.bytes += raw.len();
+        self.made += raw.len();
         src.pending.insert(id, raw.clone());
         self.objects.push((id, raw));
+    }
+
+    /// Once the objects held (with the batch being committed's, `before`)
+    /// pass [`BATCH_BYTES`], store them now and hold them no longer: no
+    /// entry and no batch, its first included, holds more (BUG-1107,
+    /// BUG-1272). Objects stored for an entry that then does not land are
+    /// unreferenced, as a discarded batch's are.
+    fn flush(&mut self, hub: &Arc<Hub>, src: &mut Source, before: usize) -> Result<()> {
+        if before + self.bytes < BATCH_BYTES || self.objects.is_empty() {
+            return Ok(());
+        }
+        let t = Instant::now();
+        let objects = std::mem::take(&mut self.objects);
+        for (id, _) in &objects {
+            src.pending.remove(id);
+        }
+        src.rt.block_on(sync::put_all(hub, src.project, objects))?;
+        hub.landing.stats.store_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        self.bytes = 0;
+        self.flushes += 1;
+        Ok(())
     }
 }
 
@@ -387,12 +421,18 @@ impl Service {
         }
     }
 
-    /// Finished rows older than [`KEEP_DONE_MS`] go.
+    /// Finished rows, and `landings` rows, older than [`KEEP_DONE_MS`] go.
     async fn clean(&self) -> Result<()> {
+        let before = veil_core::now_millis() - KEEP_DONE_MS;
         sqlx::query("DELETE FROM landing_queue WHERE project_id = $1 AND branch = $2 AND state <> 'queued' AND done_at < $3")
             .bind(self.project)
             .bind(&self.branch)
-            .bind(veil_core::now_millis() - KEEP_DONE_MS)
+            .bind(before)
+            .execute(&self.hub.db)
+            .await?;
+        sqlx::query("DELETE FROM landings WHERE project_id = $1 AND at < $2")
+            .bind(self.project)
+            .bind(before)
             .execute(&self.hub.db)
             .await?;
         Ok(())
@@ -454,8 +494,9 @@ impl Service {
             if exclude.contains(&seq) {
                 continue;
             }
-            let stack: Vec<String> = serde_json::from_str(&stack).map_err(|e| Error::Other(e.into()))?;
-            let stack = stack.iter().map(|s| ObjectId::from_hex(s).map_err(|e| Error::Other(e.into()))).collect::<Result<_>>()?;
+            let stack: Vec<[String; 2]> = serde_json::from_str(&stack).map_err(|e| Error::Other(e.into()))?;
+            let hex = |s: &str| ObjectId::from_hex(s).map_err(|e| Error::Other(e.into()));
+            let stack = stack.iter().map(|[s, b]| Ok((hex(s)?, hex(b)?))).collect::<Result<_>>()?;
             out.push(Row {
                 seq,
                 ticket,
@@ -597,10 +638,17 @@ impl Service {
         if !unkept.is_empty() && !recent.is_empty() {
             let keys: Vec<String> = unkept.iter().map(|u| u.0.clone()).collect();
             let found = memos(hub, self.project, &keys, &recent).await?;
+            let mut budget = ATTACH_BUDGET;
             for (k, a) in unkept {
                 let newest = recent.iter().enumerate().rev().find_map(|(i, x)| found.get(&(k.clone(), *x)).map(|m| (i, *m)));
+                // Each attach projects what came after its memo: within the
+                // batch's budget, else the background fill's work.
+                let newest = newest.filter(|(i, _)| recent.len() - (i + 1) <= budget);
                 match newest {
-                    Some((i, m)) => attach.push((k, a, i, m)),
+                    Some((i, m)) => {
+                        budget -= recent.len() - (i + 1);
+                        attach.push((k, a, i, m))
+                    }
                     None => {
                         known.prefilled.insert(k.clone(), Instant::now());
                         hub.landing.stats.prefilled.fetch_add(1, Ordering::Relaxed);
@@ -617,7 +665,7 @@ impl Service {
         // they are), their other parents and predecessors, and of the other
         // parents and predecessors of the recent snapshots an attached key
         // is projected over; and the stack snapshots' origins.
-        let stacks: Vec<ObjectId> = entries.iter().flat_map(|e| e.row.stack.iter().copied()).collect();
+        let stacks: Vec<ObjectId> = entries.iter().flat_map(|e| e.row.stack.iter().map(|x| x.0)).collect();
         let first_gap = attach.iter().map(|a| a.2 + 1).min().unwrap_or(recent.len());
         let gap: Vec<ObjectId> = recent[first_gap.min(recent.len())..].to_vec();
         let (s2, g2) = (stacks.clone(), gap.clone());
@@ -643,7 +691,19 @@ impl Service {
         // (No origins: a projection equal to a pusher's own snapshot is
         // that pusher's view key's, whose memo the push stored.)
         let origins = HashMap::new();
-        Ok(Inputs { entries, attach, memo, origins })
+        // Stack changes another stack landed already (BUG-1270).
+        let landed: HashMap<ObjectId, ObjectId> = if stacks.is_empty() {
+            HashMap::new()
+        } else {
+            let hex: Vec<String> = stacks.iter().map(ObjectId::hex).collect();
+            let rows: Vec<(String, String)> = sqlx::query_as("SELECT submitted, landed FROM landings WHERE project_id = $1 AND submitted = ANY($2)")
+                .bind(self.project)
+                .bind(&hex)
+                .fetch_all(&hub.db)
+                .await?;
+            rows.into_iter().filter_map(|(s, l)| Some((ObjectId::from_hex(&s).ok()?, ObjectId::from_hex(&l).ok()?))).collect()
+        };
+        Ok(Inputs { entries, attach, memo, origins, landed })
     }
 
     /// Build the batch on `on` (on a blocking thread: trees, hashes,
@@ -783,12 +843,13 @@ impl Service {
                 }
                 if !ls.is_empty() {
                     sqlx::query(
-                        "INSERT INTO landings (project_id, submitted, landed) SELECT $1, s, l FROM unnest($2::TEXT[], $3::TEXT[]) AS v(s, l) \
+                        "INSERT INTO landings (project_id, submitted, landed, at) SELECT $1, s, l, $4 FROM unnest($2::TEXT[], $3::TEXT[]) AS v(s, l) \
                          ON CONFLICT DO NOTHING",
                     )
                     .bind(pid)
                     .bind(&ls)
                     .bind(&ll)
+                    .bind(veil_core::now_millis())
                     .execute(&mut *c)
                     .await?;
                 }
@@ -977,12 +1038,14 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
         rt,
         pending: (*on.made).clone(),
     };
-    let Inputs { entries, attach, mut memo, origins } = inputs;
+    let Inputs { entries, attach, mut memo, origins, landed } = inputs;
     let mut b = Built {
         rows: Vec::new(),
         outcomes: Vec::new(),
         objects: Vec::new(),
         bytes: 0,
+        flushes: 0,
+        made: 0,
         snapshots: Vec::new(),
         landings: Vec::new(),
         memos: Vec::new(),
@@ -999,6 +1062,10 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
         for x in on.recent.iter().skip(at + 1) {
             match project_onto(&src, &who, &k, *x, p, &memo, &origins, &hub.identity)? {
                 Some((px, raw, new)) => {
+                    // Held at once: the next projection reads it (BUG-1110).
+                    if let Some(raw) = &raw {
+                        src.pending.insert(px, raw.clone());
+                    }
                     if new {
                         made.push((*x, px, raw));
                     }
@@ -1021,6 +1088,7 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
             b.memos.push((k.clone(), x, px));
             hub.landing.stats.projected.fetch_add(1, Ordering::Relaxed);
         }
+        b.flush(&hub, &mut src, on.made_bytes)?;
         b.after.keys.insert(k, Kept { who, at: p });
         hub.landing.stats.attached.fetch_add(1, Ordering::Relaxed);
     }
@@ -1028,13 +1096,15 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
         if b.alone {
             break;
         }
-        // Bounded in bytes, with the batch being committed (BUG-1107).
-        if !b.rows.is_empty() && on.made_bytes + b.bytes >= BATCH_BYTES {
+        // Bounded in bytes, with the batch being committed (BUG-1107): no
+        // entry joins a batch that made this much (one alone may: it is
+        // stored as it goes, `Built::flush`).
+        if !b.rows.is_empty() && on.made_bytes + b.made >= BATCH_BYTES {
             break;
         }
-        let mark = (b.objects.len(), b.bytes, b.snapshots.len(), b.memos.len(), b.landings.len());
+        let mark = (b.objects.len(), b.bytes, b.snapshots.len(), b.memos.len(), b.landings.len(), b.flushes);
         let row = (p.row.seq, p.row.ticket.clone());
-        let outcome = match entry(&hub, &mut src, branch, &p, &mut b, &mut memo, &origins) {
+        let outcome = match entry(&hub, &mut src, branch, &p, &mut b, &mut memo, &origins, &landed, on.made_bytes) {
             Ok(Some(o)) => o,
             // It changes access or rules and others come before it: it lands
             // alone, in the next batch.
@@ -1045,9 +1115,14 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
             }
         };
         if !matches!(outcome, Outcome::Landed { .. }) {
-            // Nothing of it stays.
-            b.objects.truncate(mark.0);
-            b.bytes = mark.1;
+            // Nothing of it stays (what was stored for it is unreferenced).
+            if b.flushes == mark.5 {
+                b.objects.truncate(mark.0);
+                b.bytes = mark.1;
+            } else {
+                b.objects.clear();
+                b.bytes = 0;
+            }
             b.snapshots.truncate(mark.2);
             b.memos.truncate(mark.3);
             b.landings.truncate(mark.4);
@@ -1070,6 +1145,7 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
 /// Land one entry's stack on `b.after`'s tip: its outcome (and, when it
 /// landed, `b.after` moved on), or `None` when it must land alone and does
 /// not come first.
+#[allow(clippy::too_many_arguments)]
 fn entry(
     hub: &Arc<Hub>,
     src: &mut Source,
@@ -1078,6 +1154,8 @@ fn entry(
     b: &mut Built,
     memo: &mut HashMap<(String, ObjectId), ObjectId>,
     origins: &HashMap<ObjectId, ObjectId>,
+    landed_before: &HashMap<ObjectId, ObjectId>,
+    before: usize,
 ) -> Result<Option<Outcome>> {
     let Some(tip) = b.after.tip else { return Ok(Some(Outcome::Rejected(format!("there is no branch '{branch}'")))) };
     let who = match &p.who {
@@ -1087,11 +1165,11 @@ fn entry(
     if p.row.stack.is_empty() {
         return Ok(Some(Outcome::Rejected("nothing to land".into())));
     }
-    let snaps: Vec<Arc<Snapshot>> = p.row.stack.iter().map(|s| src.snapshot(s)).collect::<veil_core::Result<_>>()?;
+    let snaps: Vec<Arc<Snapshot>> = p.row.stack.iter().map(|s| src.snapshot(&s.0)).collect::<veil_core::Result<_>>()?;
     let mut sets: Vec<Vec<Change>> = Vec::new();
-    for s in &snaps {
-        let parent = src.snapshot(&s.parents[0])?;
-        sets.push(edits::edit_set(src, s.tree, parent.tree)?);
+    for (_, base) in &p.row.stack {
+        let base = src.snapshot(base)?;
+        sets.push(edits::edit_set(src, snaps[sets.len()].tree, base.tree)?);
     }
     if sets.iter().flatten().any(|c| c.path == POLICY_FILE || c.path == RULES_FILE) {
         if !b.rows.is_empty() {
@@ -1105,8 +1183,10 @@ fn entry(
     // from another parent are the push's checks', below.)
     if p.recheck {
         let view = who.project.view(&who.viewer);
-        for (s, set) in snaps.iter().zip(&sets) {
-            if s.parents.len() == 1 {
+        for ((s, set), (_, base)) in snaps.iter().zip(&sets).zip(&p.row.stack) {
+            // (A merge landing as it is: its other parents' changes are the
+            // push's checks', below.)
+            if s.parents.len() == 1 || *base != s.parents[0] {
                 if let Some(c) = set.iter().find(|c| !view.write(&c.path)) {
                     return Ok(Some(Outcome::Rejected(format!("you may not write '{}'", c.path))));
                 }
@@ -1118,14 +1198,28 @@ fn entry(
     let tip_tree = src.snapshot(&tip)?.tree;
     let mut chain_tree = tip_tree;
     let mut landed: Vec<(ObjectId, Arc<Snapshot>)> = Vec::new();
+    // Where each change of the stack is on the branch (a change another
+    // stack landed already counts there, BUG-1270).
+    let mut reals: Vec<ObjectId> = Vec::new();
     for (i, (s, set)) in snaps.iter().zip(&sets).enumerate() {
-        let sid = p.row.stack[i];
-        let parent = s.parents[0];
-        let parent_tree = src.snapshot(&parent)?.tree;
-        let (id, snap, parents) = if parent == chain {
+        let (sid, base) = p.row.stack[i];
+        let earlier = b.landings.iter().find(|l| l.0 == sid).map(|l| l.1).or_else(|| landed_before.get(&sid).copied());
+        if let Some(l) = earlier {
+            // Landed by another stack (this batch's or an earlier one's):
+            // the changes after it are applied on the tip as they are.
+            reals.push(l);
+            continue;
+        }
+        let base_tree = src.snapshot(&base)?.tree;
+        let parent_tree = base_tree;
+        let (id, snap, parents) = if base == s.parents[0] && base == chain {
+            b.landings.push((sid, sid));
             (sid, s.clone(), s.parents.clone())
         } else {
-            if s.parents.len() > 1 {
+            // A merge lands as it is, on its first parent; a merge with a
+            // parent on the branch lands as its edits against that parent
+            // (`landing::stack`, BUG-1271).
+            if s.parents.len() > 1 && base == s.parents[0] {
                 return Ok(Some(Outcome::Rejected(
                     "a merge lands only on the tip it was made on: merge the branch's new tip and land again".into(),
                 )));
@@ -1148,6 +1242,7 @@ fn entry(
             for (id, (raw, _)) in made {
                 b.object(src, id, Bytes::from(raw));
             }
+            b.flush(hub, src, before)?;
             // The landing check: the new snapshot's diff is exactly the
             // change's edits.
             if !edits::same_edits(&edits::edit_set(src, tree, chain_tree)?, set) {
@@ -1191,6 +1286,7 @@ fn entry(
                 return Ok(Some(Outcome::Rejected(why)));
             }
         }
+        reals.push(id);
         landed.push((id, snap));
         chain = id;
         chain_tree = landed.last().expect("pushed").1.tree;
@@ -1224,6 +1320,11 @@ fn entry(
             }
             match project_onto(src, &kept.who, k, *x, kept.at, memo, origins, &hub.identity)? {
                 Some((px, raw, new)) => {
+                    // Held at once: the next change's projection reads it
+                    // (BUG-1110).
+                    if let Some(raw) = &raw {
+                        src.pending.insert(px, raw.clone());
+                    }
                     if new {
                         new_memos.push((k.clone(), *x, px, raw));
                     }
@@ -1247,6 +1348,7 @@ fn entry(
             hub.landing.stats.projected.fetch_add(1, Ordering::Relaxed);
         }
     }
+    b.flush(hub, src, before)?;
     b.after.keys = keys;
     for (x, _) in &landed {
         b.after.recent.push_back(*x);
@@ -1255,9 +1357,7 @@ fn entry(
         }
     }
     b.after.tip = Some(chain);
-    Ok(Some(Outcome::Landed {
-        reals: landed.iter().map(|l| l.0).collect(),
-    }))
+    Ok(Some(Outcome::Landed { reals }))
 }
 
 /// The push's checks (`sync::complete`) for candidate `real` (a real

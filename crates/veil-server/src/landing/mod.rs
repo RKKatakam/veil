@@ -22,6 +22,7 @@
 pub mod edits;
 pub mod rules;
 mod service;
+pub use service::ATTACH_BUDGET;
 
 use std::{
     collections::HashMap,
@@ -69,8 +70,10 @@ pub struct Submitter {
 pub struct Queued {
     pub ticket: String,
     pub branch: String,
-    /// The real submitted snapshots, oldest first.
-    pub stack: Vec<ObjectId>,
+    /// The real submitted snapshots, oldest first, each with its base: the
+    /// parent its edits are against (its first parent, or for a merge with
+    /// a parent on the branch, that parent: `stack`).
+    pub stack: Vec<(ObjectId, ObjectId)>,
 }
 
 /// A new random ticket.
@@ -81,7 +84,7 @@ pub fn ticket() -> String {
 /// Insert `q` for `who` into the queue of `project`, in the caller's
 /// transaction.
 pub async fn insert(c: &mut PgConnection, project: i64, who: &Submitter, q: &Queued) -> Result<()> {
-    let stack: Vec<String> = q.stack.iter().map(ObjectId::hex).collect();
+    let stack: Vec<[String; 2]> = q.stack.iter().map(|(s, b)| [s.hex(), b.hex()]).collect();
     sqlx::query(
         "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, person_epoch, project_epoch, \
          state, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued', (extract(epoch FROM clock_timestamp()) * 1000000)::BIGINT)",
@@ -147,7 +150,12 @@ pub struct Stats {
     pub kept: AtomicU64,
     /// Entries whose submit's checks ran again (access changed meanwhile).
     pub rechecked: AtomicU64,
+    /// Statements the branches' pollers made (`poll`).
+    pub polls: AtomicU64,
 }
+
+/// A waiting ticket's answer channel, and the branch it waits on.
+type Waiting = (oneshot::Sender<LandResult>, Option<(i64, String)>);
 
 struct Running {
     wake: Arc<Notify>,
@@ -161,7 +169,11 @@ pub struct Services {
     /// When a service here last failed to take a branch's lease (another
     /// server holds it): not tried again sooner than [`RETRY_LEASE`].
     held_elsewhere: Mutex<HashMap<(i64, String), Instant>>,
-    waiters: Mutex<HashMap<String, oneshot::Sender<LandResult>>>,
+    /// Each waiting ticket: where its answer goes, and (once its request
+    /// waits) the branch it lands on, for that branch's poller.
+    waiters: Mutex<HashMap<String, Waiting>>,
+    /// The branches whose waiters here a poller answers (`poll`).
+    pollers: Mutex<std::collections::HashSet<(i64, String)>>,
     pub stats: Stats,
 }
 
@@ -174,6 +186,7 @@ impl Default for Services {
             running: Mutex::new(HashMap::new()),
             held_elsewhere: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
+            pollers: Mutex::new(Default::default()),
             stats: Stats::default(),
         }
     }
@@ -190,7 +203,7 @@ impl Services {
     /// Wait here for `ticket`'s outcome.
     pub fn register(&self, ticket: &str) -> Waiter {
         let (tx, rx) = oneshot::channel();
-        self.waiters.lock().unwrap().insert(ticket.to_string(), tx);
+        self.waiters.lock().unwrap().insert(ticket.to_string(), (tx, None));
         Waiter { ticket: ticket.to_string(), rx }
     }
 
@@ -202,7 +215,7 @@ impl Services {
     fn resolve(&self, outcomes: impl IntoIterator<Item = (String, LandResult)>) {
         let mut w = self.waiters.lock().unwrap();
         for (t, r) in outcomes {
-            if let Some(tx) = w.remove(&t) {
+            if let Some((tx, _)) = w.remove(&t) {
                 let _ = tx.send(r);
             }
         }
@@ -314,39 +327,86 @@ pub fn queued(ticket: &str) -> LandResult {
 }
 
 /// Wait for `w`'s outcome until `deadline`: from the service here as soon as
-/// it commits; else (a service on another server) from the queue row, read
-/// with a backoff from 250 ms to 2 s, keeping a service running meanwhile.
-/// While this server runs the branch's service, the row is read only every
-/// 5 s (a fallback): thousands of waiters must not each poll the database
-/// while a batch is late, or the backlog feeds itself.
+/// it commits; else from the branch's poller here, which reads the rows of
+/// the branch finished since it last looked, in one statement (every
+/// 250 ms while another server runs the branch's service, every 5 s as a
+/// fallback while this one does): its cost follows the landings, never the
+/// number of waiters (BUG-1108).
 pub async fn wait(hub: &Arc<Hub>, project: i64, person: i64, branch: &str, mut w: Waiter, deadline: tokio::time::Instant) -> Result<LandResult> {
-    let key = (project, branch.to_string());
-    let mut step = Duration::from_millis(250);
-    let mut last_read = tokio::time::Instant::now();
-    let out = loop {
-        let until = (tokio::time::Instant::now() + step).min(deadline);
-        if let Ok(Ok(r)) = tokio::time::timeout_at(until, &mut w.rx).await {
-            break r;
-        }
-        let local = hub.landing.running.lock().unwrap().contains_key(&key);
-        if !local || last_read.elapsed() >= Duration::from_secs(5) {
-            last_read = tokio::time::Instant::now();
-            if let Some((_, r)) = read(hub, project, person, &w.ticket).await? {
-                if r.state != LandState::Queued {
-                    break r;
-                }
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            break queued(&w.ticket);
-        }
-        if !local {
-            step = (step * 2).min(Duration::from_secs(2));
-            ensure(hub, project, branch);
-        }
+    if let Some(e) = hub.landing.waiters.lock().unwrap().get_mut(&w.ticket) {
+        e.1 = Some((project, branch.to_string()));
+    }
+    poll(hub, project, branch);
+    let out = match tokio::time::timeout_at(deadline, &mut w.rx).await {
+        Ok(Ok(r)) => r,
+        // The deadline: the row as it is now.
+        _ => match read(hub, project, person, &w.ticket).await? {
+            Some((_, r)) => r,
+            None => queued(&w.ticket),
+        },
     };
     hub.landing.forget(&w.ticket);
     Ok(out)
+}
+
+/// Make sure a poller answers this server's waiters of `branch` (see
+/// [`wait`]); it stops once none waits, and keeps a service running.
+fn poll(hub: &Arc<Hub>, project: i64, branch: &str) {
+    let key = (project, branch.to_string());
+    if !hub.landing.pollers.lock().unwrap().insert(key.clone()) {
+        return;
+    }
+    let hub = hub.clone();
+    tokio::spawn(async move {
+        // Rows finished since (servers' clocks differ: a margin, and what
+        // is read twice is answered once).
+        let mut since = veil_core::now_millis() - 60_000;
+        let mut read_at = Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            // A service here answers its waiters itself: the row is read
+            // only as a fallback, every 5 s.
+            let local = hub.landing.running.lock().unwrap().contains_key(&key);
+            if local && read_at.elapsed() < Duration::from_secs(5) {
+                continue;
+            }
+            read_at = Instant::now();
+            let waiting: std::collections::HashSet<String> = {
+                let w = hub.landing.waiters.lock().unwrap();
+                let waiting: std::collections::HashSet<String> =
+                    w.iter().filter(|(_, (_, at))| at.as_ref() == Some(&key)).map(|(t, _)| t.clone()).collect();
+                if waiting.is_empty() {
+                    // Under the waiters' lock: a waiter registering now finds
+                    // no poller and starts one.
+                    hub.landing.pollers.lock().unwrap().remove(&key);
+                    return;
+                }
+                waiting
+            };
+            let now = veil_core::now_millis();
+            hub.landing.stats.polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let rows: std::result::Result<Vec<(String, String)>, _> = sqlx::query_as(
+                "SELECT ticket, result FROM landing_queue WHERE project_id = $1 AND branch = $2 AND done_at >= $3 AND result IS NOT NULL",
+            )
+            .bind(key.0)
+            .bind(&key.1)
+            .bind(since - 5_000)
+            .fetch_all(&hub.db)
+            .await;
+            match rows {
+                Ok(rows) => {
+                    since = now;
+                    // Only the tickets waiting here.
+                    let mine = rows.into_iter().filter(|(t, _)| waiting.contains(t));
+                    hub.landing.resolve(mine.filter_map(|(t, r)| Some((t, serde_json::from_str(&r).ok()?))))
+                }
+                Err(e) => eprintln!("veil-server: reading landing outcomes: {e:?}"),
+            }
+            if !local {
+                ensure(&hub, key.0, &key.1);
+            }
+        }
+    });
 }
 
 /// Unregister a waiter whose submit failed.
@@ -432,15 +492,36 @@ pub async fn submit(
     }
 }
 
-/// The stack a push of `new` (real) to a branch at `tip` lands (§4.6):
-/// every change from the branch's tip up to `new`, oldest first, on
-/// `new`'s first-parent line: the snapshots this push brought (`fresh`,
-/// with their real parents) and those the server already held (on another
-/// branch, an API commit, a landing answered `conflict` with a fix on top),
-/// down to the first that is the tip or below it (BUG-1103). `Err(why)` to
-/// refuse.
-pub async fn stack(hub: &Arc<Hub>, project: i64, new: ObjectId, tip: ObjectId, fresh: &HashMap<ObjectId, Vec<ObjectId>>) -> Result<std::result::Result<Vec<ObjectId>, String>> {
+/// The stack a landing of `new` (real) on a branch at `tip` lands (§4.6),
+/// whichever route submits it (a push, `vl land`, edits on a base): every
+/// change from the branch's tip up to `new`, oldest first, on `new`'s
+/// first-parent line, each with its **base** (what its edits are against):
+///
+/// * those the request brought (`fresh`, with their real parents: they
+///   passed the push's checks as this submitter's), and those the server
+///   already held (on another branch, an API commit, a landing answered
+///   `conflict`), down to the first that is on the branch (the tip or below
+///   it, or a submitted snapshot that landed: `landings`; BUG-1103,
+///   BUG-1112);
+/// * a merge with a parent on the branch ends the stack: its edits against
+///   that parent are everything the branch lacks (a conflicted change with
+///   the branch merged into it and resolved, BUG-1271);
+/// * a held change must touch only paths `viewer` may read, so that no
+///   answer about the stack (a conflict, a refusal) can name one they
+///   cannot (BUG-1111), and must hold no conflicts.
+///
+/// `Err(why)` to refuse (naming no path).
+#[allow(clippy::too_many_arguments)]
+pub async fn stack(
+    hub: &Arc<Hub>,
+    project: &crate::perm::Project,
+    viewer: &crate::perm::Viewer,
+    new: ObjectId,
+    tip: ObjectId,
+    fresh: &HashMap<ObjectId, Vec<ObjectId>>,
+) -> Result<std::result::Result<Vec<(ObjectId, ObjectId)>, String>> {
     let root = crate::sync::root_snapshot_id();
+    let pid = project.id;
     let mut out = Vec::new();
     let mut x = new;
     while x != tip && x != root {
@@ -450,39 +531,80 @@ pub async fn stack(hub: &Arc<Hub>, project: i64, new: ObjectId, tip: ObjectId, f
                 veil_core::hub::land::MAX_LAND_STACK
             )));
         }
-        let (parents, conflicted) = match fresh.get(&x) {
-            Some(p) => (p.clone(), None),
+        let held = !fresh.contains_key(&x);
+        if held && on_branch_or_landed(hub, pid, x, tip).await? {
+            break;
+        }
+        let parents = match fresh.get(&x) {
+            Some(p) => p.clone(),
             None => {
-                if on_branch(hub, project, x, tip).await? {
-                    break;
-                }
-                // Landed, made again on a newer tip: its change is there.
-                let landed: Option<String> = sqlx::query_scalar("SELECT landed FROM landings WHERE project_id = $1 AND submitted = $2")
-                    .bind(project)
-                    .bind(x.hex())
-                    .fetch_optional(&hub.db)
-                    .await?;
-                if let Some(l) = landed.and_then(|l| ObjectId::from_hex(&l).ok()) {
-                    if on_branch(hub, project, l, tip).await? {
-                        break;
-                    }
-                }
                 let y = x;
-                crate::sync::blocking(hub, project, move |src| {
-                    let s = src.snapshot(&y)?;
-                    Ok((s.parents.clone(), Some(!s.conflicts.is_empty())))
-                })
-                .await?
+                crate::sync::blocking(hub, pid, move |src| Ok(src.snapshot(&y)?.parents.clone())).await?
             }
         };
-        if conflicted == Some(true) {
-            return Ok(Err("a change with unresolved conflicts never lands: resolve them first".into()));
+        // A merge with a parent on the branch: its edits against that one.
+        let mut base = parents[0];
+        let mut last = false;
+        if parents.len() > 1 && !on_branch_or_landed(hub, pid, parents[0], tip).await? {
+            for p in &parents[1..] {
+                if on_branch_or_landed(hub, pid, *p, tip).await? {
+                    base = *p;
+                    last = true;
+                    break;
+                }
+            }
         }
-        out.push(x);
+        if held {
+            let (y, b, view_policy, view_bindings, v) = (x, base, project.policy_text.clone(), project.bindings.clone(), viewer.clone());
+            let refusal = crate::sync::blocking(hub, pid, move |src| {
+                let s = src.snapshot(&y)?;
+                if !s.conflicts.is_empty() {
+                    return Ok(Some("a change with unresolved conflicts never lands: resolve them first"));
+                }
+                let p = crate::perm::Project {
+                    id: src.project,
+                    name: String::new(),
+                    default_branch: String::new(),
+                    policy: veil_core::hub::access::AccessPolicy::parse(&view_policy),
+                    policy_text: view_policy,
+                    bindings: view_bindings,
+                };
+                let view = p.view(&v);
+                let set = edits::edit_set(src, s.tree, src.snapshot(&b)?.tree)?;
+                Ok(set.iter().any(|c| !view.read(&c.path)).then_some(
+                    "the changes under this one touch folders you cannot see: ask someone who can see them to land them",
+                ))
+            })
+            .await?;
+            if let Some(why) = refusal {
+                return Ok(Err(why.to_string()));
+            }
+        }
+        out.push((x, base));
+        if last {
+            break;
+        }
         x = parents[0];
     }
     out.reverse();
     Ok(Ok(out))
+}
+
+/// Is real snapshot `x` on the branch at `tip` (the tip or below it), or a
+/// submitted snapshot whose landing is?
+async fn on_branch_or_landed(hub: &Arc<Hub>, project: i64, x: ObjectId, tip: ObjectId) -> Result<bool> {
+    if on_branch(hub, project, x, tip).await? {
+        return Ok(true);
+    }
+    let landed: Option<String> = sqlx::query_scalar("SELECT landed FROM landings WHERE project_id = $1 AND submitted = $2")
+        .bind(project)
+        .bind(x.hex())
+        .fetch_optional(&hub.db)
+        .await?;
+    match landed.and_then(|l| ObjectId::from_hex(&l).ok()) {
+        Some(l) if l != x => on_branch(hub, project, l, tip).await,
+        _ => Ok(false),
+    }
 }
 
 /// Is real snapshot `x` the branch tip `tip` or below it? From the derived

@@ -565,16 +565,9 @@ async fn commit(
     land: Option<&(crate::landing::Submitter, crate::landing::Queued)>,
 ) -> Result<Option<bool>> {
     let pid = who.project.id;
-    // A landing: the change joins the queue in this same commit.
-    let land = land.map(|(w, q)| {
-        (
-            w.clone(),
-            crate::landing::Queued {
-                stack: vec![built.real],
-                ..q.clone()
-            },
-        )
-    });
+    // A landing: the change (and what it stacks on: `landing::stack`) joins
+    // the queue in this same commit.
+    let land = land.cloned();
     let view_key = (!who.viewer.admin).then(|| who.project.view(&who.viewer).key());
     let mut snaps: Vec<(String, String)> = restacked.iter().map(|(n, _, m)| (n.hex(), m.hex())).collect();
     snaps.push((built.real.hex(), built.mine.hex()));
@@ -805,7 +798,7 @@ pub(crate) async fn create_with(
     viewer: &Viewer,
     caller: &Caller,
     req: ChangeRequest,
-    land: Option<(crate::landing::Submitter, crate::landing::Queued)>,
+    mut land: Option<(crate::landing::Submitter, crate::landing::Queued)>,
 ) -> Result<ChangeResult> {
     let person = caller.signed_in()?.clone();
     if land.is_some() && req.onto.is_some() {
@@ -925,6 +918,22 @@ pub(crate) async fn create_with(
             }
         }
         let built = build(hub, &plan, &who, parent, pparent).await?;
+        // A landing of edits: the stack is every change from the branch's
+        // tip up to this one, as for a pushed snapshot (BUG-1112).
+        if let Some((_, q)) = land.as_mut() {
+            let fresh = HashMap::from([(built.real, vec![parent])]);
+            q.stack = match tip(hub, project.id, &q.branch).await? {
+                Some(t) => match crate::landing::stack(hub, &who.project, &who.viewer, built.real, t, &fresh).await? {
+                    Ok(s) => s,
+                    Err(why) => return Err(bad(why)),
+                },
+                // No branch: the service answers so.
+                None => vec![(built.real, parent)],
+            };
+            if q.stack.is_empty() {
+                return Err(bad("nothing to land: this change is on the branch already"));
+            }
+        }
         // The branch rules: a move of the default branch changes them only
         // for an admin, judged against its tip (BUG-1102).
         let rules_moved = match cur {

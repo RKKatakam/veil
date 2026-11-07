@@ -1435,7 +1435,7 @@ pub(crate) async fn push_with(
             }
             // Every change between the branch's tip and the pushed one: what
             // this push brought, and what the server already held (BUG-1103).
-            let stack = match crate::landing::stack(hub, project.id, new_real, cur.expect("checked"), &real_parents_of).await? {
+            let stack = match crate::landing::stack(hub, project, viewer, new_real, cur.expect("checked"), &real_parents_of).await? {
                 Ok(s) => s,
                 Err(why) => {
                     results.push(refuse(&why));
@@ -1446,7 +1446,7 @@ pub(crate) async fn push_with(
                 results.push(refuse("nothing to land: that snapshot is already on the branch"));
                 continue;
             }
-            if stack.iter().any(|s| parents_of.iter().any(|(pid, n)| real_of.get(pid) == Some(s) && !n.conflicts.is_empty())) {
+            if stack.iter().any(|(s, _)| parents_of.iter().any(|(pid, n)| real_of.get(pid) == Some(s) && !n.conflicts.is_empty())) {
                 results.push(refuse("a change with unresolved conflicts never lands: resolve them first"));
                 continue;
             }
@@ -1531,7 +1531,7 @@ pub(crate) async fn push_with(
         }
     }
     for q in &queued {
-        Box::pin(projected_inner(hub, project, viewer, *q.stack.last().expect("a stack is never empty"), Some(&mut deferred))).await?;
+        Box::pin(projected_inner(hub, project, viewer, q.stack.last().expect("a stack is never empty").0, Some(&mut deferred))).await?;
     }
     // Only the snapshots this push made (known ones are recorded already:
     // rewriting their rows made every racing pusher write the same row),
@@ -1539,7 +1539,7 @@ pub(crate) async fn push_with(
     // update's snapshots are no branch's history (BUG-914).
     let landing: HashSet<ObjectId> = {
         let mut seen = HashSet::new();
-        let mut stack: Vec<ObjectId> = plans.iter().filter_map(|p| p.2).chain(queued.iter().filter_map(|q| q.stack.last().copied())).collect();
+        let mut stack: Vec<ObjectId> = plans.iter().filter_map(|p| p.2).chain(queued.iter().filter_map(|q| q.stack.last().map(|e| e.0))).collect();
         while let Some(x) = stack.pop() {
             if let Some(ps) = real_parents_of.get(&x) {
                 if seen.insert(x) {

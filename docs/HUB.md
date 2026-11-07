@@ -2464,15 +2464,21 @@ through `changes::create` (the same `complete`, inline text held in memory
 until the checks pass). Instead of a branch's compare-and-swap, the
 request's transaction inserts one **queue row**: the stack of real
 snapshots (oldest first, at most 64), the submitter, and the access epochs
-its checks ran under. **An uploaded snapshot's stack** is every change on
-its first-parent line from the branch's tip up to it (§4.6): those this
-request brought and those the server already held (on another branch, an
-API commit, a landing answered `conflict` with a fix on top), down to the
-first that is the tip or below it (the derived commit graph decides; the
-tip is derived first if the deriver lags), none holding conflicts. A
-submitted snapshot the service made again on a newer tip is on the branch
-when what it landed as is (`landings`). A change made of edits is its
-edits on `base`, as `POST …/changes` makes it. The snapshots become committed history
+its checks ran under. **The stack** (`landing::stack`, for every route: a
+pushed or uploaded snapshot, and edits on a `base`) is every change on its
+first-parent line from the branch's tip up to it (§4.6), each with its
+**base**: those this request brought and those the server already held (on
+another branch, an API commit, a landing answered `conflict`), down to the
+first that is on the branch (the tip or below it, by the derived commit
+graph, the tip derived first if the deriver lags; or a submitted snapshot
+that landed: `landings`). A merge with a parent on the branch ends the
+stack with that parent as its base: it lands as its edits against it, the
+whole of what the branch lacks (so a change answered `conflict`, with the
+branch merged into it and the file resolved, lands; a fix on top that is
+not such a merge does not: redo the change on the new tip). A held change
+must touch only paths the submitter may read, and hold no conflicts, else
+the submit is refused naming no path: no answer about a stack can name a
+path its submitter could not read. The snapshots become committed history
 in that commit (they resolve and project like any other); the edit set is
 not stored: it is each snapshot's diff against its first parent, read from
 the objects. With `wait` (the default) the request answers once the
@@ -2483,22 +2489,27 @@ branch's **lease** (`landing_leases`: a holder, a fencing epoch bumped at
 every takeover, an expiry on the database's clock, 2 s unless renewed). A
 submit wakes the service on its own server, starting one if no other
 server holds the lease; a waiting submitter hears from the service on its
-server as soon as the batch commits, and keeps one running: where another
-server holds the lease it re-reads its row with a backoff from 250 ms to
-2 s (where this server runs the service, only every 5 s, so thousands of
-waiters never poll the database while a batch is late); a starting server
-resumes every branch with queued rows. A service with nothing to do
+server as soon as the batch commits; one poller per branch and server
+answers the others from the rows of the branch finished since it last
+looked (every 250 ms while another server holds the lease, every 5 s as a
+fallback while this one does: a cost that follows the landings, never the
+number of waiters), and keeps a service running; a starting server resumes
+every branch with queued rows. A service with nothing to do
 for 5 s gives the lease back. Its loop:
 
 * **Batch:** every ready row not in the batch being committed, in queue
-  order (the database's clock at submit), at most 64 (larger batches cost more per landing here: `LOAD.md`), and at most 8 MiB of
-  new objects held with the batch being committed (`BATCH_BYTES`; the
-  first entry always goes). An entry whose edits touch `.veilpolicy` or
+  order (the database's clock at submit), at most 64 (larger batches cost
+  more per landing here: `LOAD.md`); no entry joins a batch that made
+  8 MiB of new objects with the batch being committed (`BATCH_BYTES`), and
+  the build stores what it holds as soon as it passes that, so no entry and
+  no batch, its first entry included, holds more. An entry whose edits touch `.veilpolicy` or
   `.veilrules` ends the batch before it and **lands alone**; nothing is
   built after it until it is committed.
-* **For each change of an entry's stack:** on the tip already, it lands as
-  it is (the submitted snapshot). Otherwise **the fast path**: every path
-  of its edit set must be, on the tip, what it was in its base: the same
+* **For each change of an entry's stack:** landed already by another
+  stack (`landings`, or this batch), it is skipped. On the tip already (its
+  base its first parent, and the tip), it lands as it is (the submitted
+  snapshot). Otherwise **the fast path**: every path of its edit set (its
+  diff against its base) must be, on the tip, what it was in its base: the same
   entry (kind, content, mode, label), absent in both, or under the same
   non-folder in both. Exact per path: nothing else on the tip matters. Then
   its edits are applied (only the folder listings on the way are rewritten;
@@ -2535,8 +2546,10 @@ for 5 s gives the lease back. Its loop:
   memos only). A key it does not keep is attached from its newest memo on
   the branch's recent first-parent line (the last 1,024 snapshots it knows;
   S12's deriver keeps tips memoised for every key), projecting only what
-  came after; a key with no memo there is handed to S13's background fill
-  (`query::graph::prefill`). Every projection made is stored in the batch's
+  came after, within 256 projections a batch (`ATTACH_BUDGET`); a key with
+  no memo there, or past the budget, is handed to S13's background fill
+  (`query::graph::prefill`). Each projection is held as soon as it is made
+  (the next one reads it). Every projection made is stored in the batch's
   commit, and a stored memo wins: one written meanwhile with another value
   rolls the batch back (it is built again). Outcomes hold real snapshots;
   each answer is projected for its asker (from the memo, else in their own
@@ -2550,8 +2563,10 @@ for 5 s gives the lease back. Its loop:
   compare-and-swap, an accepted policy, the queue rows (each must still be
   `queued`, else nothing commits: an entry never lands twice), the
   snapshot, `landings` and memo rows, an audit row and the tips notice.
-  Finished queue rows are deleted after a day (a ticket's outcome is kept
-  that long).
+  Finished queue rows, and `landings` rows (where each landed stack change
+  is on the branch), are deleted after a day: a later push on a submitted
+  snapshot older than that is answered `conflict` for the change it would
+  repeat, never landed over.
 
 **Protected branches.** `.veilrules` at the project root (TOML;
 `[branches.NAME] protected = true`; other tables are left to later

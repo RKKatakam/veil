@@ -537,7 +537,11 @@ fn bug_1100_a_new_view_key_after_an_access_change_never_stalls_the_landing_servi
     });
     assert_eq!(dev["state"], "landed", "{dev}");
     let inline = projected() - before;
-    assert!(inline <= 20, "the landing service made {inline} projections for two landings");
+    // At most one attach budget (a key the background fill memoised part of
+    // the way is projected the rest of it, bounded) and a projection per key
+    // and landing.
+    let bound = veil_server::landing::ATTACH_BUDGET as u64 + 20;
+    assert!(inline <= bound, "the landing service made {inline} projections for two landings");
     // The service's own time for these batches (reading and building them):
     // no history walk in it. (The admin's request time also counts the
     // database connections the background fills hold, on a busy machine.)
@@ -660,14 +664,12 @@ fn bug_1103_a_landed_stack_brings_every_change_the_branch_lacks() {
     c.file("src/second.rs", "second\n");
     c.tip = first;
     let v = c.push("main", "second").json();
-    let ok = v["results"][0]["ok"] == true;
+    assert_eq!(v["results"][0]["ok"], true, "the push of a change on a held one lands: {v}");
     let check = p.dev.dir("check");
     p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), check.to_str().unwrap()]);
-    if ok {
-        assert!(check.join("src/second.rs").exists(), "{v}");
-        // Main was asked to hold both changes; it says "landed".
-        assert!(check.join("src/first.rs").exists(), "main got the second change without the first, and the push said it landed: {v}");
-    }
+    assert!(check.join("src/second.rs").exists(), "{v}");
+    // Main was asked to hold both changes; it says "landed".
+    assert!(check.join("src/first.rs").exists(), "main got the second change without the first, and the push said it landed: {v}");
 }
 
 #[test]
@@ -892,7 +894,6 @@ fn kept_change(api: &Api, token: &str, project: &str, base: ObjectId, edits: Val
 }
 
 #[test]
-#[ignore = "BUG-1110: a stack of two or more changes is rejected (\"missing object\"): a kept view key's new projection is read before it is held"]
 fn bug_1110_a_stack_of_two_new_changes_lands() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -927,7 +928,6 @@ fn bug_1110_a_stack_of_two_new_changes_lands() {
 }
 
 #[test]
-#[ignore = "BUG-1111: a landing's stack takes in another person's change: its conflict names their paths the submitter cannot read"]
 fn bug_1111_a_landing_answer_names_no_path_its_submitter_cannot_read() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -956,7 +956,6 @@ fn bug_1111_a_landing_answer_names_no_path_its_submitter_cannot_read() {
 }
 
 #[test]
-#[ignore = "BUG-1112: a landing of edits on an unlanded base lands only the edits and says landed (BUG-1103's class, the edits route)"]
 fn bug_1112_edits_landed_on_an_unlanded_base_bring_the_base_or_are_refused() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -968,15 +967,13 @@ fn bug_1112_edits_landed_on_an_unlanded_base_bring_the_base_or_are_refused() {
     let first = kept_change(&api, &token, &p.name, tip_for(&hub, &token, &p.name), json!([put("src/first.rs", "first\n")]));
     // A second change made of edits on it, landed.
     let r = land(&api, &token, &p.name, first, json!([put("src/second.rs", "second\n")]), true).json();
-    eprintln!("{r}");
-    if r["state"] == "landed" {
-        assert!(real_file(&hub, pid, "src/second.rs").is_some(), "{r}");
-        assert!(real_file(&hub, pid, "src/first.rs").is_some(), "main got the second change without the first it was made on, and the answer says landed: {r}");
-    }
+    assert_eq!(r["state"], "landed", "{r}");
+    assert_eq!(r["landed"].as_array().map(Vec::len), Some(2), "the base change lands with it: {r}");
+    assert!(real_file(&hub, pid, "src/second.rs").is_some(), "{r}");
+    assert!(real_file(&hub, pid, "src/first.rs").is_some(), "main got the second change without the first it was made on, and the answer says landed: {r}");
 }
 
 #[test]
-#[ignore = "BUG-1270: two queued stacks that share a change: the second is answered conflict on the shared change's own paths"]
 fn bug_1270_stacks_that_share_a_change_both_land_and_it_lands_once() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1008,7 +1005,6 @@ fn bug_1270_stacks_that_share_a_change_both_land_and_it_lands_once() {
 }
 
 #[test]
-#[ignore = "BUG-1271: a change answered conflict, with a fix on top (a merge of main into it), is answered conflict again forever"]
 fn bug_1271_a_conflicted_change_with_a_fix_on_top_lands() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1110,7 +1106,6 @@ fn the_default_branch_rules_change_by_no_route_but_an_admin_s() {
 
 /// BUG-1272, in a process of its own (it measures this process's memory).
 #[test]
-#[ignore = "BUG-1272: a batch's first entry is not bounded in bytes: a stack of 64 changes in a big folder holds 64 rewritten listings"]
 fn bug_1272_a_stack_of_changes_in_a_big_folder_stays_within_the_batch_bound() {
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["landing::big_folder_stacks_in_a_child", "--exact", "--include-ignored", "--nocapture", "--test-threads", "1"])
@@ -1215,3 +1210,104 @@ fn big_folder_stacks_in_a_child() {
     // bug_1107's bound for 400 such changes in batches of 8 MiB.
     assert!(grew <= 256, "the landing service's peak grew by {grew} MiB for two stacks of 64 one-line changes ({batches} batches)");
 }
+
+/// BUG-1112's class, the other two routes: `vl land` of a change on one the
+/// server holds on another branch, and an API commit with `onto` on one kept
+/// on no branch, each bring the change under it to main (a push and a
+/// landing of edits: `bug_1103_…`, `bug_1112_…`).
+#[test]
+fn every_route_lands_the_changes_under_a_change() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    // `vl land`: A pushed to a branch of its own, B on it, landed.
+    let d = p.dev.dir("land");
+    p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+    write_files(&d, &[("src/route-a.rs", "a\n")]);
+    p.dev.ok(&d, &["commit", "-m", "a"]);
+    p.dev.ok(&d, &["tag", "set", "side", "-r", "@-"]);
+    p.dev.ok(&d, &["push", "-t", "side"]);
+    write_files(&d, &[("src/route-b.rs", "b\n")]);
+    p.dev.ok(&d, &["commit", "-m", "b"]);
+    let out = p.dev.ok(&d, &["land"]);
+    assert!(out.contains("landed main") && out.contains("2 change(s)"), "{out}");
+    assert!(real_file(&hub, pid, "src/route-a.rs").is_some() && real_file(&hub, pid, "src/route-b.rs").is_some());
+    // An API commit with `onto` (an expected tip) on a change kept on no
+    // branch: the kept change is made again under it.
+    let token = p.dev.token();
+    let tip = tip_for(&hub, &token, &p.name);
+    let kept = kept_change(&api, &token, &p.name, tip, json!([put("src/route-c.rs", "c\n")]));
+    let r = api.post_json(
+        Some(&token),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({"base": kept.hex(), "edits": [put("src/route-d.rs", "d\n")], "onto": {"branch": "main", "expected": tip.hex()}}),
+    );
+    assert_eq!(r.json()["branch"]["status"], "ok", "{}", String::from_utf8_lossy(&r.body));
+    assert!(real_file(&hub, pid, "src/route-c.rs").is_some() && real_file(&hub, pid, "src/route-d.rs").is_some());
+}
+
+/// The costs the cycle-2 review asked to measure, bounded: (1) the service
+/// reads the project's view keys again at an access change, with 5,000
+/// members; (2) waiters on a server that does not hold the lease cost that
+/// server one statement per poll, however many wait.
+#[test]
+fn the_service_s_reads_at_an_access_change_and_remote_waiters_stay_bounded() {
+    let a = TestHub::start();
+    let p = setup_project(&a);
+    let pid = project_id(&a, &p.name);
+    let api = a.api();
+    let token = p.dev.token();
+    // 5,000 people in the devs group (straight into the database).
+    let h = a.hub();
+    a.rt.block_on(async {
+        let gid: i64 = sqlx::query_scalar("SELECT id FROM groups WHERE project_id = $1 AND name = 'devs'").bind(pid).fetch_one(&h.db).await.unwrap();
+        sqlx::query(
+            "WITH p AS (INSERT INTO people (name, created_at) SELECT 'member-' || $2 || '-' || g, 0 FROM generate_series(1, 5000) g RETURNING id) \
+             INSERT INTO group_members (group_id, person_id) SELECT $1, id FROM p",
+        )
+        .bind(gid)
+        .bind(unique("m"))
+        .execute(&h.db)
+        .await
+        .unwrap();
+    });
+    // An access change of the project (a new group), then a landing: the
+    // service reads the view keys again before it.
+    p.admin.ok(&p.dir, &["group", "create", "observers"]);
+    let st = &h.landing.stats;
+    let prep0 = st.prepare_us.load(std::sync::atomic::Ordering::Relaxed);
+    let r = land(&api, &token, &p.name, tip_for(&a, &token, &p.name), json!([put("src/after.rs", "after\n")]), true);
+    assert_eq!(r.json()["state"], "landed", "{}", String::from_utf8_lossy(&r.body));
+    let prep = Duration::from_micros(st.prepare_us.load(std::sync::atomic::Ordering::Relaxed) - prep0);
+    eprintln!("prepare with 5,000 members, after an access change: {prep:?}");
+    assert!(prep < Duration::from_secs(2), "{prep:?}");
+    // Waiters on a second server while the first holds the lease: hold it
+    // as nobody, queue 100 landings through b, and count b's polls.
+    let b = TestHub::beside(&a);
+    hold(&a, pid);
+    let bapi = b.api();
+    let base = tip_for(&b, &token, &p.name);
+    let polls = || b.hub().landing.stats.polls.load(std::sync::atomic::Ordering::Relaxed);
+    let polls0 = polls();
+    let t = std::time::Instant::now();
+    std::thread::scope(|s| {
+        for i in 0..100 {
+            let (bapi, token, name) = (&bapi, &token, &p.name);
+            s.spawn(move || {
+                let r = land(bapi, token, name, base, json!([put(&format!("src/remote/{i:03}.rs"), "r\n")]), true);
+                assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            });
+        }
+        // Released after 3 s: a's service lands them, b's poller answers.
+        std::thread::sleep(Duration::from_secs(3));
+        release(&a, pid);
+        let _rt = a.rt.enter();
+        veil_server::landing::ensure(&a.hub(), pid, "main");
+    });
+    let n = polls() - polls0;
+    let secs = t.elapsed().as_secs_f64();
+    eprintln!("100 remote waiters for {secs:.1} s: {n} statements from their server's poller");
+    assert!((n as f64) < secs * 4.0 + 8.0, "{n} polls in {secs:.1} s for 100 waiters");
+}
+

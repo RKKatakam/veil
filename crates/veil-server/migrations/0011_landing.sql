@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS landing_queue (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS landing_queue_ticket ON landing_queue (ticket);
 CREATE INDEX IF NOT EXISTS landing_queue_ready ON landing_queue (project_id, branch, state, created_at, seq);
+-- What a branch's poller reads (`landing::poll`: the rows finished since it
+-- last looked).
+CREATE INDEX IF NOT EXISTS landing_queue_done ON landing_queue (project_id, branch, done_at);
 -- What a starting server resumes (`landing::resume`: every queued row).
 CREATE INDEX IF NOT EXISTS landing_queue_state ON landing_queue (state, project_id, branch);
 
@@ -56,13 +59,17 @@ CREATE TABLE IF NOT EXISTS landing_leases (
     PRIMARY KEY (project_id, branch)
 );
 
--- A submitted snapshot the landing service made again on a newer tip, and
--- the snapshot it landed as (its change is on the branch, though the
--- submitted snapshot is not): a later push on top of the submitted one
--- does not land that change twice (BUG-1103).
+-- Where each submitted snapshot of a landed stack is on the branch: itself
+-- (landed as it was), or the snapshot it was made again as on a newer tip.
+-- A later stack on a submitted snapshot does not land its change twice
+-- (BUG-1103, BUG-1270). Kept as long as finished queue rows (a day): a push
+-- on a submitted snapshot older than that is answered `conflict` for the
+-- change it repeats, never landed over.
 CREATE TABLE IF NOT EXISTS landings (
     project_id BIGINT NOT NULL REFERENCES projects(id),
     submitted TEXT NOT NULL,
     landed TEXT NOT NULL,
+    at BIGINT NOT NULL,
     PRIMARY KEY (project_id, submitted)
 );
+CREATE INDEX IF NOT EXISTS landings_at ON landings (project_id, at);
