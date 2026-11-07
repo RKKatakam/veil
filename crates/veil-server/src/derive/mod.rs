@@ -32,8 +32,10 @@
 //! (`ON CONFLICT DO NOTHING`), and nothing marked derived without its
 //! values. Every statement is retried on a retryable database error.
 //!
-//! **No query API yet** (S13). [`read`] and [`view`] are the internal reads
-//! S13 will serve answers from.
+//! **The query API** (S13, `crate::query`) does not read these: it answers
+//! from each viewer's own graph (`query::graph`), which [`memo_tips`]
+//! extends with the projections. [`read`] and [`view`] stay the internal
+//! reads of blame, file history and search (S14, S15).
 
 pub mod changes;
 pub mod graph;
@@ -884,8 +886,9 @@ impl<'a> Batch<'a> {
 
 /// Project the tips of `branches` of `project` for each view key of its
 /// people and of anyone on Earth, so that their next pull finds the
-/// projection memoised (phase 4 §4.5). Admins see real history: nothing to
-/// do. Only the branches named (a landing's) are touched (BUG-870).
+/// projection memoised (phase 4 §4.5), and extend each view key's graph
+/// (admins' included) for the query API (S13). Only the branches named (a
+/// landing's) are touched (BUG-870).
 pub async fn memo_tips(hub: &Arc<Hub>, project_id: i64, branches: &[String]) -> Result<()> {
     let mut c = hub.db.acquire().await?;
     let name: String = sqlx::query_scalar("SELECT name FROM projects WHERE id = $1").bind(project_id).fetch_one(&mut *c).await?;
@@ -926,16 +929,27 @@ pub async fn memo_tips(hub: &Arc<Hub>, project_id: i64, branches: &[String]) -> 
             });
         }
     }
+    let tips: Vec<ObjectId> = branches.iter().map(|t| ObjectId::from_hex(t).map_err(bad)).collect::<Result<_>>()?;
+    // The admins' graph of the query API too (S13): it holds real history.
+    viewers.push(crate::perm::Viewer {
+        admin: true,
+        ..Default::default()
+    });
     let mut keys = HashSet::new();
+    let mut failed = Ok(());
     for v in viewers {
         let view = project.view(&v);
         if !view.sees_anything() || !keys.insert(view.key()) {
             continue;
         }
-        for t in &branches {
-            let t = ObjectId::from_hex(t).map_err(bad)?;
-            crate::sync::projected(hub, &project, &v, t).await?;
+        // Memoise the projections, and extend the viewer's graph with them
+        // (`query::graph::extend`), so that queries find both. One view
+        // key's failure leaves the others' done (and a query fills it).
+        if let Err(e) = crate::query::graph::extend(hub, &project, &v, &tips, None).await {
+            if failed.is_ok() {
+                failed = Err(e);
+            }
         }
     }
-    Ok(())
+    failed
 }

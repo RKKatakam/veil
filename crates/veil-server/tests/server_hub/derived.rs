@@ -307,7 +307,7 @@ const GROUP_SEC: i64 = 900_002;
 const GROUP_FIN: i64 = 900_003;
 
 /// The policy and bindings of a generated project; `carol` is a person id.
-fn policy(carol: i64) -> (String, BTreeMap<String, Binding>) {
+pub fn policy(carol: i64) -> (String, BTreeMap<String, Binding>) {
     let text = "pub/ public devs\npub/sec/ security\nfin/ finance\ncarol-d/ carol\n".to_string();
     let b = BTreeMap::from([
         ("devs".to_string(), Binding::Group(GROUP_DEVS)),
@@ -318,7 +318,7 @@ fn policy(carol: i64) -> (String, BTreeMap<String, Binding>) {
     (text, b)
 }
 
-fn viewers(carol: i64) -> Vec<(&'static str, Viewer)> {
+pub fn viewers(carol: i64) -> Vec<(&'static str, Viewer)> {
     let v = |person: i64, groups: &[i64]| Viewer {
         person: Some(person),
         admin: false,
@@ -334,7 +334,7 @@ fn viewers(carol: i64) -> Vec<(&'static str, Viewer)> {
     ]
 }
 
-fn text(rng: &mut Rng, tag: &str, n: usize) -> Vec<u8> {
+pub fn text(rng: &mut Rng, tag: &str, n: usize) -> Vec<u8> {
     let mut out = String::new();
     for i in 0..n {
         out.push_str(&format!("{tag} line {i} {}\n", rng.next() % 1000));
@@ -585,7 +585,7 @@ fn answers(
 }
 
 /// `viewer`'s projection of every snapshot of `h` (the root maps to itself).
-fn projections(th: &TestHub, h: &Hist, project: &PermProject, viewer: &Viewer) -> HashMap<ObjectId, ObjectId> {
+pub fn projections(th: &TestHub, h: &Hist, project: &PermProject, viewer: &Viewer) -> HashMap<ObjectId, ObjectId> {
     let mut p = HashMap::from([(root_snapshot_id(), root_snapshot_id())]);
     for s in &h.order {
         let q = th.rt.block_on(sync::projected(&h.hub, project, viewer, *s)).unwrap();
@@ -597,7 +597,7 @@ fn projections(th: &TestHub, h: &Hist, project: &PermProject, viewer: &Viewer) -
 /// A new project holding exactly `viewer`'s projected history of `h`: the
 /// projected snapshots and the projected trees under them, and the same
 /// branches. Nobody is restricted in it (no access lines).
-fn copy_for(th: &TestHub, h: &Hist, project: &PermProject, viewer: &Viewer, p: &HashMap<ObjectId, ObjectId>) -> Hist {
+pub fn copy_for(th: &TestHub, h: &Hist, project: &PermProject, viewer: &Viewer, p: &HashMap<ObjectId, ObjectId>) -> Hist {
     let mut copy = Hist::new(th, "", &BTreeMap::new());
     let reals: Vec<ObjectId> = h.order.clone();
     let wanted: BTreeSet<ObjectId> = p.values().copied().filter(|q| *q != root_snapshot_id()).collect();
