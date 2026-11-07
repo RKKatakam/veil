@@ -1835,4 +1835,162 @@ mod s12_adversarial {
         assert!(!in_history, "the projection hides the change of fin/ only");
         assert_eq!(visible, in_history, "the reader shows anyone on Earth a change of fin/ only");
     }
+
+    // ---- S12 cycle 2 (docs/BUGS.md, "S12 cycle 2") -------------------------
+
+    /// BUG-980: the iterative `Reader` (BUG-869's fix) walks a run of hidden
+    /// one-parent changes again from the start for each of them. To decide
+    /// a merge, `known_rep` walks its first parent's line down to the first
+    /// snapshot whose visibility is not decided yet and gives up there,
+    /// remembering nothing of the walk; `visible` decides that one snapshot
+    /// and asks again. A merge on top of `k` changes an outsider cannot see
+    /// (ordinary work in `fin/`) costs `k²/2` steps, where the recursive
+    /// reader took `k`. Any viewer's first `visible`, `rep` or
+    /// `merge_bases` of such a branch pays it (S13: anyone on Earth).
+    #[test]
+    #[ignore = "BUG-980: Reader::visible and rep walk a run of hidden changes again for each of them (quadratic)"]
+    fn bug_980_a_run_of_hidden_changes_makes_the_reader_quadratic() {
+        let th = TestHub::start();
+        let time = |k: usize| -> Duration {
+            let (text, bindings) = devs_policy();
+            let mut h = Hist::new(&th, &text, &bindings);
+            let (t0, o0) = tree_of(&Files::from([("pub/a.txt".to_string(), b"a\n".to_vec())]));
+            let a = commit_tree(&th, &mut h, &[root_snapshot_id()], t0, o0, 1, 1);
+            // `k` changes of fin/ only, then a merge that takes `a` in again.
+            let mut tip = a;
+            let mut last = t0;
+            for i in 0..k {
+                let (t, o) = tree_of(&Files::from([
+                    ("pub/a.txt".to_string(), b"a\n".to_vec()),
+                    ("fin/ledger-980.txt".to_string(), format!("{i}\n").into_bytes()),
+                ]));
+                tip = commit_tree(&th, &mut h, &[tip], t, o, 2 + i as u128, 2 + i as i64);
+                last = t;
+            }
+            let m = commit_tree(&th, &mut h, &[tip, a], last, Vec::new(), 1_000_000, 1_000_000);
+            h.set_branch(&th, "main", m);
+            h.derive(&th);
+            let project = h.project(&th);
+            let (visible, took) = th
+                .rt
+                .block_on(derive::read(&h.hub, h.id, move |g| {
+                    let lines = g.cx.lines()?;
+                    let anyone = Viewer::default();
+                    let view = project.view(&anyone);
+                    let r = Reader::new(g, &lines, &view);
+                    let t = Instant::now();
+                    let v = r.visible(&m)?;
+                    Ok((v, t.elapsed()))
+                }))
+                .unwrap();
+            assert!(!visible, "the merge brings nothing new to anyone on Earth");
+            took
+        };
+        let small: usize = std::env::var("VEIL_BUG980_HIDDEN").ok().and_then(|s| s.parse().ok()).unwrap_or(500);
+        let one = time(small);
+        println!("BUG-980: visible(merge) over {small} hidden changes: {one:?}");
+        let four = time(small * 4);
+        println!("BUG-980: visible(merge) over {} hidden changes: {four:?}", small * 4);
+        // Linear: about 4x. Quadratic: about 16x.
+        assert!(four < one * 8 + Duration::from_secs(2), "{four:?} vs {one:?}");
+    }
+
+    /// BUG-981: the folders `changes::diff` reports (BUG-871's fix) are not
+    /// counted against `MAX_PATHS`. A snapshot that adds 100,001 empty
+    /// folders (and changes no file) is not `many`: its changed-paths object
+    /// lists every one of them, so the object has no size bound. Alternating
+    /// such a folder, with one file changed each time so that no two
+    /// objects are the same, writes an object of megabytes for each
+    /// snapshot of a few hundred bytes, up to 100,000 in one push; every
+    /// rebuild of a line (`prepare_lists`) and every S13 read of the change
+    /// decodes it whole.
+    #[test]
+    #[ignore = "BUG-981: the folders a change lists are not counted against MAX_PATHS (uncapped changed-paths objects)"]
+    fn bug_981_empty_folders_are_not_capped() {
+        let th = TestHub::start();
+        let (text, bindings) = devs_policy();
+        let mut h = Hist::new(&th, &text, &bindings);
+        let small = Files::from([("pub/keep.txt".to_string(), b"keep\n".to_vec())]);
+        let mut wide = small.clone();
+        for i in 0..=derive::changes::MAX_PATHS {
+            wide.insert(format!("pub/empty/{i:06}/"), Vec::new());
+        }
+        let (ta, oa) = tree_of(&small);
+        let (tb, ob) = tree_of(&wide);
+        let a = commit_tree(&th, &mut h, &[root_snapshot_id()], ta, oa, 1, 1);
+        let b = commit_tree(&th, &mut h, &[a], tb, ob, 2, 2);
+        h.set_branch(&th, "main", b);
+        h.derive(&th);
+        let (hub, id) = (h.hub.clone(), h.id);
+        let changed: Option<String> = th.rt.block_on(async {
+            sqlx::query_scalar("SELECT changed FROM graph WHERE project_id = $1 AND snapshot = $2").bind(id).bind(b.hex()).fetch_one(&hub.db).await.unwrap()
+        });
+        let changed = changed.unwrap();
+        if let Ok(oid) = ObjectId::from_hex(&changed) {
+            let raw = th.rt.block_on(hub.objects.get(id, &oid)).unwrap().unwrap();
+            let c = Changed::decode(&raw).unwrap();
+            println!("BUG-981: one changed-paths object lists {} paths and {} folders ({} bytes)", c.paths.len(), c.dirs.len(), raw.len());
+            assert!(
+                c.paths.len() + c.dirs.len() <= derive::changes::MAX_PATHS,
+                "the object lists {} entries ({} bytes), above the cap of {}",
+                c.paths.len() + c.dirs.len(),
+                raw.len(),
+                derive::changes::MAX_PATHS
+            );
+        }
+    }
+
+    /// BUG-982: since BUG-870's fix a run derives only the branches its
+    /// landing moved, and nothing else ever derives the others: no caller
+    /// runs `Scope::All`, there is no start-up scan, and `derive_progress`
+    /// is never read. A landing whose run is skipped (another server holds
+    /// the project's lock for more than 60 s: a long backfill), fails (a
+    /// busy database), or is cut by a restart, leaves that branch's tip
+    /// underived and its projections unmemoised until the same branch moves
+    /// again; the design (§S12, "The worker") says the next landing resumes.
+    #[test]
+    #[ignore = "BUG-982: a skipped or lost landing is never resumed by the next landing"]
+    fn bug_982_a_skipped_landing_is_resumed_by_the_next() {
+        let th = TestHub::start();
+        let (text, bindings) = devs_policy();
+        let mut h = Hist::new(&th, &text, &bindings);
+        let (t0, o0) = tree_of(&Files::from([("pub/a.txt".to_string(), b"a\n".to_vec())]));
+        let a = commit_tree(&th, &mut h, &[root_snapshot_id()], t0, o0, 1, 1);
+        h.set_branch(&th, "main", a);
+        h.derive(&th);
+        let (hub, id) = (h.hub.clone(), h.id);
+        // Another server's deriver holds the project's lock (derive/mod.rs
+        // LOCK_BASE ^ project) while `side` lands here.
+        let (t1, o1) = tree_of(&Files::from([("pub/a.txt".to_string(), b"side\n".to_vec())]));
+        let s = commit_tree(&th, &mut h, &[a], t1, o1, 2, 2);
+        h.set_branch(&th, "side", s);
+        let key: i64 = 0x7665_696c_6472_0000 ^ id;
+        let skipped = th.rt.block_on(async {
+            let mut holder = hub.db.acquire().await.unwrap();
+            let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)").bind(key).fetch_one(&mut *holder).await.unwrap();
+            assert!(got);
+            let st = derive::landing(&hub, id, vec!["side".to_string()]).await.unwrap();
+            let _: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)").bind(key).fetch_one(&mut *holder).await.unwrap();
+            st.skipped
+        });
+        assert!(skipped, "the run waited out the lock and left the work");
+        // The next landing, of main.
+        let (t2, o2) = tree_of(&Files::from([("pub/a.txt".to_string(), b"main\n".to_vec())]));
+        let m = commit_tree(&th, &mut h, &[a], t2, o2, 3, 3);
+        h.set_branch(&th, "main", m);
+        th.rt.block_on(derive::landing(&hub, id, vec!["main".to_string()])).unwrap();
+        let derived = |x: ObjectId| -> bool {
+            th.rt.block_on(async {
+                let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM graph WHERE project_id = $1 AND snapshot = $2")
+                    .bind(id)
+                    .bind(x.hex())
+                    .fetch_one(&hub.db)
+                    .await
+                    .unwrap();
+                n > 0
+            })
+        };
+        assert!(derived(m), "main's landing derived main");
+        assert!(derived(s), "side's tip, skipped while the lock was held, is never derived by a later landing");
+    }
 }
