@@ -2253,7 +2253,7 @@ resumes every branch with queued rows. A service with nothing to do
 for 5 s gives the lease back. Its loop:
 
 * **Batch:** every ready row not in the batch being committed, in queue
-  order (the database's clock at submit), at most 500, and at most 8 MiB of
+  order (the database's clock at submit), at most 64 (larger batches cost more per landing here: `LOAD.md`), and at most 8 MiB of
   new objects held with the batch being committed (`BATCH_BYTES`; the
   first entry always goes). An entry whose edits touch `.veilpolicy` or
   `.veilrules` ends the batch before it and **lands alone**; nothing is

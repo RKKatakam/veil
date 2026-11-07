@@ -43,9 +43,14 @@ use crate::{
     Hub,
 };
 
-/// Most entries one batch takes (the design's "500 ready PRs become one
-/// move").
-pub const MAX_BATCH: usize = 500;
+/// Most entries one batch takes. The design says up to 500; measured, a
+/// batch's object writes cost more per landing the more there are at once
+/// (about 0.9 ms a landing in batches of 10–25, 1.5 ms in batches of
+/// 150–300: synced writes contend), so a service that once fell behind
+/// stayed behind with large batches, at a p50 of seconds. At 64 it drains a
+/// backlog in small batches (`docs/design/scale/LOAD.md`, "The landing
+/// service"); the branch still moves once for up to 64 changes.
+pub const MAX_BATCH: usize = 64;
 /// How long a submit waits for its outcome before answering `queued`.
 pub const WAIT: Duration = Duration::from_secs(30);
 /// How long a lease lasts unless renewed, in milliseconds: another server
