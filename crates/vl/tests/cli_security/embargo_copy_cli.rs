@@ -450,17 +450,17 @@ fn random_rewrites_never_push_what_an_unreleased_embargo_withholds() {
             let b = rng.pick(&revs).to_string();
             let n = rng.next();
             let args: Vec<String> = match n % 10 {
-                0 if n % 3 == 0 => vec!["squash".into(), "-r".into(), a],
+                0 if n.is_multiple_of(3) => vec!["squash".into(), "-r".into(), a],
                 0 => vec!["squash".into(), "-r".into(), a, "--into".into(), b],
-                1 if n % 3 == 0 => vec!["rebase".into(), "-s".into(), a, "-d".into(), b],
+                1 if n.is_multiple_of(3) => vec!["rebase".into(), "-s".into(), a, "-d".into(), b],
                 1 if n % 3 == 1 => vec!["rebase".into(), "-r".into(), a, "-d".into(), b.clone(), "-d".into(), rng.pick(&revs).to_string()],
                 1 => vec!["rebase".into(), "-r".into(), a, "-d".into(), b],
                 2 => vec!["describe".into(), "-r".into(), a, "-m".into(), format!("reworded {step}")],
-                3 if n % 2 == 0 => vec!["undo".into()],
+                3 if n.is_multiple_of(2) => vec!["undo".into()],
                 3 => vec!["undo".into(), "--op".into(), rng.pick(&ops).to_string()],
                 4 => vec!["restore".into(), "--from".into(), a],
                 5 => vec!["tag".into(), "set".into(), ["fix", "main", "rel"][(n / 10 % 3) as usize].into(), "-r".into(), a],
-                6 if n % 2 == 0 => vec!["new".into(), a, b],
+                6 if n.is_multiple_of(2) => vec!["new".into(), a, b],
                 6 => vec!["new".into(), a],
                 7 => vec!["split".into(), "-r".into(), a, ["FIXNAME-K7.c", "a.c", "child.c"][(n / 10 % 3) as usize].into()],
                 8 => vec!["abandon".into(), a],

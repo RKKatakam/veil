@@ -727,7 +727,8 @@ impl<'r> Transaction<'r> {
         // of a withheld change visible now must still be withheld (all
         // that descends from one then is too).
         std::mem::swap(&mut self.repo.view, &mut self.view);
-        let res = (|repo: &Repo| -> Result<(Vec<(ObjectId, String)>, HashSet<String>)> {
+        type Lost = (Vec<(ObjectId, String)>, HashSet<String>);
+        let res = (|repo: &Repo| -> Result<Lost> {
             let now = crate::remote::embargo_withheld(repo)?;
             let refs = repo.view.refs();
             let mut lost = Vec::new();
