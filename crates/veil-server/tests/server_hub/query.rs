@@ -89,6 +89,7 @@ enum Q {
 pub(crate) fn forget_blames(th: &TestHub, h: &Hist) {
     th.rt.block_on(async {
         again(|| sqlx::query("DELETE FROM blame_memo WHERE project_id = $1").bind(h.id).execute(&h.hub.db)).await;
+        again(|| sqlx::query("DELETE FROM blame_walks WHERE project_id = $1").bind(h.id).execute(&h.hub.db)).await;
     });
 }
 
@@ -219,7 +220,7 @@ fn queries(rng: &mut Rng, revs: &[String], paths: &[String]) -> Vec<Q> {
     // S14: blame and file history, with and without following renames,
     // in small pages, and with budgets small enough to stop and go on.
     let tiny = Limits {
-        blame: query::files::BlameLimits { work: 40, lines: 3, ..Default::default() },
+        blame: query::files::BlameLimits { work: 40, walk: 25, lines: 3, ..Default::default() },
         work: 6,
         ..Limits::default()
     };

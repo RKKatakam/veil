@@ -362,7 +362,7 @@ fn renamed_from(t: &Trees, row: &VRow, path: &str) -> Result<Option<String>> {
 
 /// A version of a file: the snapshot that introduced it, its depth there,
 /// and the path.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Version {
     pub id: ObjectId,
     pub depth: i64,
@@ -410,6 +410,11 @@ pub struct BlameLimits {
     /// Diff work ([`veil_core::blame::map_cost`]); past it the blame
     /// stops, keeping what it computed.
     pub work: u64,
+    /// Work of the walk down to the versions a blame starts from (rows,
+    /// objects and trees read: [`G::tick`]); past it the walk stops and
+    /// keeps where it got to, and the next request blames those deeper
+    /// versions first (BUG-1212).
+    pub walk: u64,
     /// Bytes of texts and blames held at once.
     pub held: usize,
     /// Lines a page shows.
@@ -420,6 +425,7 @@ impl Default for BlameLimits {
     fn default() -> Self {
         BlameLimits {
             work: veil_core::blame::DEFAULT_WORK_BUDGET,
+            walk: 20_000,
             held: 64 << 20,
             lines: 10_000,
         }
@@ -469,7 +475,17 @@ pub struct Blamer<'f, 'g, 'a, 'h, 'b> {
     /// The last version computed and not kept: kept when the blame stops,
     /// so every request that computes something leaves progress.
     last: Option<(Version, Arc<Blame>)>,
+    /// Walks down cut before (`blame_walks`): from a version, the deeper
+    /// versions it reached, which are blamed first.
+    walked: HashMap<Version, Vec<Version>>,
+    /// Walks cut by this request, to write.
+    cut: Vec<(Version, Vec<Version>)>,
 }
+
+/// Most versions a cut walk keeps as where it got to.
+const MAX_FRONTIER: usize = 64;
+/// Most walks followed down from one version within a request.
+const MAX_RESUMES: usize = 10_000;
 
 impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
     pub fn new(f: &'f Files<'g, 'a>, t: &'f Trees<'h, 'b>, follow: bool, limits: BlameLimits) -> Self {
@@ -482,6 +498,8 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             renames: HashMap::new(),
             writes: Vec::new(),
             last: None,
+            walked: HashMap::new(),
+            cut: Vec::new(),
         }
     }
 
@@ -511,6 +529,21 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         Ok(self.kept[&key].get(&v.id).copied())
     }
 
+    /// What the walk down needs of version `v`: its change, the versions
+    /// it came from (none when its blame is kept, or it is not text), and
+    /// its kept blame.
+    #[allow(clippy::type_complexity)]
+    fn expand(&mut self, v: &Version) -> Result<(Arc<FChange>, Vec<Option<Version>>, Option<ObjectId>)> {
+        let change = self.f.find(&v.path, v.depth, v.id)?.ok_or_else(|| bad(format!("no row for a version at {}", v.id.short())))?;
+        let kept = if texty(&change.new) { self.kept_of(v)? } else { None };
+        let parents = if texty(&change.new) && kept.is_none() {
+            parents_of(self.f, self.t, v, &change, self.follow, &mut self.renames)?
+        } else {
+            Vec::new()
+        };
+        Ok((change, parents, kept))
+    }
+
     /// The text of entry `e`, if it is plain text the server may read.
     fn text(&self, e: &Option<TreeEntry>) -> Result<Option<Arc<Text>>> {
         if !texty(e) {
@@ -527,16 +560,93 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
     /// The text and blame of version `start`; `None` when it is not plain
     /// text. Kept blames are written, also when it stops.
     pub fn blame(&mut self, start: &Version) -> Result<Done> {
-        let r = self.run(start);
+        let r = self.resumed(start);
         if r.is_err() {
             if let Some((v, b)) = self.last.take() {
                 self.keep(&v, &b);
             }
         }
-        let w = self.write();
+        let w = self.write().and_then(|_| self.write_cuts());
         let out = r?;
         w?;
         Ok(out)
+    }
+
+    /// Blame `start`, first blaming (and keeping) the deepest versions an
+    /// earlier walk down from it reached before it was cut, so that every
+    /// request leaves progress whatever stops it (BUG-1212).
+    fn resumed(&mut self, start: &Version) -> Result<Done> {
+        let mut tried: HashSet<Version> = HashSet::new();
+        loop {
+            let mut v = start.clone();
+            for _ in 0..MAX_RESUMES {
+                let mut next = None;
+                for x in self.walked_from(&v)? {
+                    if !tried.contains(&x) && self.kept_of(&x)?.is_none() {
+                        next = Some(x);
+                        break;
+                    }
+                }
+                match next {
+                    Some(x) => v = x,
+                    None => break,
+                }
+            }
+            if v == *start {
+                return self.run(start);
+            }
+            tried.insert(v.clone());
+            self.run(&v)?;
+        }
+    }
+
+    /// Where a cut walk down from `v` got to (`blame_walks`).
+    fn walked_from(&mut self, v: &Version) -> Result<Vec<Version>> {
+        if let Some(w) = self.walked.get(v) {
+            return Ok(w.clone());
+        }
+        let g = self.f.g;
+        let cx = g.cx;
+        g.tick()?;
+        let row: Option<String> = cx.db(|| {
+            sqlx::query_scalar(
+                "SELECT frontier FROM blame_walks WHERE project_id = $1 AND view_key = $2 AND path_key = $3 AND follow = $4 AND snapshot = $5",
+            )
+            .bind(cx.project())
+            .bind(g.vk)
+            .bind(path_key(&v.path))
+            .bind(self.follow)
+            .bind(v.id.hex())
+            .fetch_optional(&cx.hub().db)
+        })?;
+        let w: Vec<Version> = match row {
+            Some(r) => serde_json::from_str(&r).map_err(bad)?,
+            None => Vec::new(),
+        };
+        self.walked.insert(v.clone(), w.clone());
+        Ok(w)
+    }
+
+    /// Write the walks this request cut.
+    fn write_cuts(&mut self) -> Result<()> {
+        let cx = self.f.g.cx;
+        for (v, frontier) in std::mem::take(&mut self.cut) {
+            let text = serde_json::to_string(&frontier).map_err(bad)?;
+            cx.db(|| {
+                sqlx::query(
+                    "INSERT INTO blame_walks (project_id, view_key, path_key, follow, snapshot, frontier) VALUES ($1, $2, $3, $4, $5, $6) \
+                     ON CONFLICT (project_id, view_key, path_key, follow, snapshot) DO UPDATE SET frontier = EXCLUDED.frontier",
+                )
+                .bind(cx.project())
+                .bind(self.f.g.vk)
+                .bind(path_key(&v.path))
+                .bind(self.follow)
+                .bind(v.id.hex())
+                .bind(&text)
+                .execute(&cx.hub().db)
+            })?;
+        }
+        Ok(())
     }
 
     fn run(&mut self, start: &Version) -> Result<Done> {
@@ -546,6 +656,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         let mut order: Vec<Version> = Vec::new();
         let mut stack: Vec<(Version, bool)> = vec![(start.clone(), false)];
         let mut held = 0usize;
+        let began = self.f.g.work();
         while let Some((v, ready)) = stack.pop() {
             if ready {
                 order.push(v);
@@ -554,14 +665,27 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             if nodes.contains_key(&v) {
                 continue;
             }
-            let change = self.f.find(&v.path, v.depth, v.id)?.ok_or_else(|| bad(format!("no row for a version at {}", v.id.short())))?;
-            held += 256 + v.path.len();
-            let kept = if texty(&change.new) { self.kept_of(&v)? } else { None };
-            let parents = if texty(&change.new) && kept.is_none() {
-                parents_of(self.f, self.t, &v, &change, self.follow, &mut self.renames)?
-            } else {
-                Vec::new()
+            // Stopped (its work, its memory, or the deadline): where it got
+            // to is kept, and blamed first next time (BUG-1212).
+            let over = self.f.g.work() - began > self.limits.walk || held > self.limits.held;
+            let r = if over { Err(partial()) } else { self.expand(&v) };
+            let (change, parents, kept) = match r {
+                Ok(x) => x,
+                Err(e) => {
+                    stack.push((v, false));
+                    let mut frontier: Vec<Version> = Vec::new();
+                    for (x, ready) in stack.iter().rev() {
+                        if !ready && !nodes.contains_key(x) && !frontier.contains(x) && *x != *start && frontier.len() < MAX_FRONTIER {
+                            frontier.push(x.clone());
+                        }
+                    }
+                    if !frontier.is_empty() {
+                        self.cut.push((start.clone(), frontier));
+                    }
+                    return Err(e);
+                }
             };
+            held += 256 + v.path.len();
             stack.push((v.clone(), true));
             for p in parents.iter().rev().flatten() {
                 if !nodes.contains_key(p) {
@@ -569,9 +693,6 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                 }
             }
             nodes.insert(v, Node { change, parents, kept, left: 0 });
-            if held > self.limits.held {
-                return Err(too_wide());
-            }
         }
         let edges: Vec<Version> = nodes.values().flat_map(|n| n.parents.iter().flatten().cloned()).collect();
         for p in edges {
@@ -767,6 +888,16 @@ pub fn blame_json(g: &G, rev: ObjectId, path: &str, follow: bool, text: &Text, b
 
 // ---- file history -----------------------------------------------------------------
 
+/// Most bytes of a history's frontier (its cursor's text): a page ends
+/// before a step would pass it, so a kept cursor is at most about this
+/// (BUG-1213).
+pub const FRONTIER_BYTES: usize = 1 << 20;
+
+/// The bytes a version takes in a cursor.
+fn cursor_bytes(v: &Version) -> usize {
+    66 + 2 * v.path.len()
+}
+
 /// A history cursor: `snapshot.hex(path)` for each version still to walk.
 pub fn cursor(nodes: &[Version]) -> String {
     nodes.iter().map(|v| format!("{}.{}", v.id.hex(), hex::encode(v.path.as_bytes()))).collect::<Vec<_>>().join(",")
@@ -798,7 +929,9 @@ pub fn parse_cursor(s: &str, max: usize) -> Result<Vec<(ObjectId, String)>> {
 /// by the viewer's generation (ties by id, then path), each with the
 /// snapshot that made it; a version's parents are its row's `prev`, and
 /// with `follow`, a rename's source. Stops at `n` entries, `page_bytes`, a
-/// work budget, or before the frontier would pass `frontier`.
+/// work budget, or before the frontier would pass `frontier` versions or
+/// [`FRONTIER_BYTES`]. Answers the page without `next`, and the versions
+/// still to walk (the caller makes the cursor: `query::history`).
 #[allow(clippy::too_many_arguments)]
 pub fn history_page(
     f: &Files,
@@ -810,7 +943,7 @@ pub fn history_page(
     work: u64,
     frontier: usize,
     snapshot_json: impl Fn(&ObjectId, &veil_core::object::Snapshot) -> Value,
-) -> Result<Value> {
+) -> Result<(Value, Vec<Version>)> {
     let g = f.g;
     let invalid = || Error::bad_request("invalid cursor");
     let mut heap: BinaryHeap<(i64, ObjectId, String, i64)> = BinaryHeap::new();
@@ -822,6 +955,7 @@ pub fn history_page(
         }
     }
     let mut renames = HashMap::new();
+    let mut frontier_bytes: usize = heap.iter().map(|(_, _, p, _)| 66 + 2 * p.len()).sum();
     let begin = g.work();
     let mut entries = Vec::new();
     let mut bytes = 0usize;
@@ -835,10 +969,12 @@ pub fn history_page(
             let mut seen = HashSet::new();
             parents.iter().flatten().filter(|p| !queued.contains(&(p.id, p.path.clone())) && seen.insert((p.id, p.path.clone()))).cloned().collect()
         };
-        if heap.len() - 1 + fresh.len() > frontier {
+        let grows: usize = fresh.iter().map(cursor_bytes).sum::<usize>();
+        if heap.len() - 1 + fresh.len() > frontier || frontier_bytes - cursor_bytes(&v) + grows > FRONTIER_BYTES {
             break;
         }
         heap.pop();
+        frontier_bytes = frontier_bytes - cursor_bytes(&v) + grows;
         took = true;
         for p in fresh {
             queued.insert((p.id, p.path.clone()));
@@ -874,11 +1010,12 @@ pub fn history_page(
     if !took && n > 0 && !rest.is_empty() {
         return Err(Error::bad_request("this file history is too wide to page (more open lines than a cursor holds)"));
     }
-    let next = (!rest.is_empty()).then(|| cursor(&rest));
-    Ok(json!({
-        "schema": "veil.history/1",
-        "entries": entries,
-        "truncated": next.is_some(),
-        "next": next,
-    }))
+    Ok((
+        json!({
+            "schema": "veil.history/1",
+            "entries": entries,
+            "truncated": !rest.is_empty(),
+        }),
+        rest,
+    ))
 }

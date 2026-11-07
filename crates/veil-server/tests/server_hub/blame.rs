@@ -399,14 +399,23 @@ fn blame_keeps_versions_and_resumes() {
     assert!(stops > 2, "the budget never stopped it ({stops})");
     let lines: Origins = got["lines"].as_array().unwrap().iter().map(|l| (l["snapshot"].as_str().unwrap().into(), l["path"].as_str().unwrap().into(), l["origin_line"].as_u64().unwrap() as u32)).collect();
     assert_eq!(lines, want);
-    // Memory: a bound below one version's text and blame refuses.
+    // Memory: a bound below one version's text and blame refuses. The walk
+    // down stops at it first, keeping where it got to (BUG-1212), until
+    // the versions to compute do not fit.
     forget_blames(&th, &h);
     let small = Limits {
         blame: BlameLimits { held: 2_000, ..BlameLimits::default() },
         ..Limits::default()
     };
-    let r = th.rt.block_on(query::blame(&h.hub, &a, BlameParams { path: "pub/long.txt".into(), ..Default::default() }, small));
-    assert!(matches!(r, Err(Error::Api { code: "too_wide", .. })), "{r:?}");
+    let mut partials = 0;
+    let r = loop {
+        let r = th.rt.block_on(query::blame(&h.hub, &a, BlameParams { path: "pub/long.txt".into(), ..Default::default() }, small));
+        match r {
+            Err(Error::Api { code: "partial", .. }) if partials < 500 => partials += 1,
+            r => break r,
+        }
+    };
+    assert!(matches!(r, Err(Error::Api { code: "too_wide", .. })), "after {partials} partial answers: {r:?}");
 }
 
 // ---- hostile inputs ------------------------------------------------------------------
@@ -594,6 +603,34 @@ fn blame_speed() {
         println!("blame_speed: {who}: projected every snapshot (S1) in {projected:?}; then filled the graph and its file history in {filled:?} ({rows} file-history rows in the project)");
         let hub = h.hub.clone();
         let bq = |follow: bool| BlameParams { path: path.clone(), follow: Some(follow), ..Default::default() };
+        // Where a first blame's time goes: the walk down alone (a diff
+        // budget of 1 stops it at its first diff), then one diff and one
+        // version's read on their own.
+        let walk_only = Limits { blame: BlameLimits { work: 1, walk: u64::MAX, ..BlameLimits::default() }, deadline: Duration::from_secs(600), ..Limits::default() };
+        let t = Instant::now();
+        let r = th.rt.block_on(query::blame(&hub, &a, bq(true), walk_only));
+        assert!(matches!(r, Err(Error::Api { code: "partial", .. })), "{r:?}");
+        let walk = t.elapsed();
+        forget_blames(&th, &h);
+        let texts: Vec<Vec<u8>> = h.order.iter().rev().take(41).filter_map(|s| h.files[s].get(&path).cloned()).collect();
+        let t = Instant::now();
+        let mut diffs = 0;
+        for w in texts.windows(2) {
+            let n = veil_core::blame::line_ranges(&w[1]).len();
+            std::hint::black_box(veil_core::blame::map_lines(&w[0], &w[1], n));
+            diffs += 1;
+        }
+        let per_diff = t.elapsed() / diffs.max(1);
+        let tip_file = th.rt.block_on(query::file(&hub, &a, query::FileParams { rev: None, path: path.clone() }, Limits::default())).unwrap();
+        let t = Instant::now();
+        for _ in 0..20 {
+            std::hint::black_box(th.rt.block_on(query::file(&hub, &a, query::FileParams { rev: None, path: path.clone() }, Limits::default())).unwrap());
+        }
+        println!(
+            "blame_speed: {who}: walk down over {versions} versions: {walk:?}; one diff of 5,000 lines (map_lines): {per_diff:?}; one `file` request of {} bytes (graph, projected tree, object): {:?}",
+            tip_file.1.len(),
+            t.elapsed() / 20
+        );
         // The first time: from nothing (a blame stopped at its budget goes
         // on, and counts).
         let t = Instant::now();
@@ -678,7 +715,6 @@ mod s14c1_adversarial {
     /// version, silently and for good: the next landing's `prev` skips the
     /// snapshot, and nothing ever fills it again.
     #[test]
-    #[ignore = "BUG-1210: graph rows without file history (an S13 server beside S14) give silently wrong blame and history, for good"]
     fn bug_1210_graph_rows_without_file_history_give_silently_wrong_answers() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);
@@ -691,10 +727,14 @@ mod s14c1_adversarial {
         h.set_branch(&th, "main", c2);
         let viewer = Viewer::default();
         warm_up(&th, &h, &viewer);
-        // c2's graph row as an S13 server writes it: no file history.
+        // c2's graph row as an S13 server writes it: no file history, and
+        // (since the fix) no `files` mark; that server's rows were never in
+        // this server's cache.
         th.rt.block_on(async {
             sqlx::query("DELETE FROM view_file_history WHERE project_id = $1 AND snapshot = $2").bind(h.id).bind(c2.hex()).execute(&h.hub.db).await.unwrap();
+            sqlx::query("UPDATE view_graph SET files = NULL WHERE project_id = $1 AND snapshot = $2").bind(h.id).bind(c2.hex()).execute(&h.hub.db).await.unwrap();
         });
+        h.hub.query.rows.clear();
         // The next landing, filled by an S14 server.
         f.insert("pub/a.txt".into(), b"one\ntwo\nthree\n".to_vec());
         let c3 = h.commit(&th, &[c2], f.clone(), [3; 16], 1_700_000_002_000, None);
@@ -714,6 +754,69 @@ mod s14c1_adversarial {
             let got: Vec<String> = hist.iter().map(|e| e.0.clone()).collect();
             assert_eq!(got, [c3.hex(), c2.hex(), c1.hex()], "a silently wrong file history: c2 changed the file");
         }
+        // Since the fix: answered, and right (c2 filled again).
+        assert!(blame.is_ok() && history.is_ok());
+    }
+
+    /// BUG-1210's fix, for a whole graph: every graph row as an S13 server
+    /// fills them (graph rows only, unmarked), then a landing; S14 fills
+    /// them again with their file history, and every viewer's blame and
+    /// file history equal the model's.
+    #[test]
+    fn s13_filled_graphs_are_filled_again_with_file_history() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(3);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let mut rng = Rng::new(404);
+        random_history(&th, &mut h, &mut rng, 30);
+        let project = h.project(&th);
+        for (_, viewer) in viewers(3) {
+            warm_up(&th, &h, &viewer);
+        }
+        warm_up(&th, &h, &admin());
+        th.rt.block_on(async {
+            sqlx::query("DELETE FROM view_file_history WHERE project_id = $1").bind(h.id).execute(&h.hub.db).await.unwrap();
+            sqlx::query("UPDATE view_graph SET files = NULL WHERE project_id = $1").bind(h.id).execute(&h.hub.db).await.unwrap();
+        });
+        h.hub.query.rows.clear();
+        // One more landing on main.
+        let tip = h.branches["main"];
+        let mut f = h.files[&tip].clone();
+        f.insert("pub/after-s13.txt".into(), lines("after", 5));
+        if let Some(k) = f.keys().find(|k| k.starts_with("pub/") && !k.ends_with('/')).cloned() {
+            let mut c = f[&k].clone();
+            c.extend(b"edited after the S13 fill\n");
+            f.insert(k, c);
+        }
+        let c = h.commit(&th, &[tip], f, [77; 16], 1_800_000_000_000, None);
+        h.set_branch(&th, "main", c);
+        let all: BTreeSet<String> = h.files.values().flat_map(|f| f.keys().filter(|k| !k.ends_with('/')).cloned()).collect();
+        let mut checked = 0;
+        for (who, viewer) in viewers(3).into_iter().chain([("admin", admin())]) {
+            let p = projections(&th, &h, &project, &viewer);
+            let view = project.view(&viewer);
+            let m = model(&h, &p, &view);
+            let copy = copy_for(&th, &h, &project, &viewer, &p);
+            let a = ask(&th, &h, &viewer);
+            warm_up(&th, &h, &viewer);
+            let x = p[&h.branches["main"]];
+            let order: Vec<ObjectId> = model_log(&th, &copy, x).iter().map(|s| ObjectId::from_hex(s).unwrap()).collect();
+            let mut memo = HashMap::new();
+            for path in all.iter().filter(|p| view.read(p)) {
+                if m.files[&x].contains_key(path) {
+                    let (got, _) = blame_all(&th, &h, &a, "main", path, false, Limits::default()).unwrap();
+                    assert_eq!(got, model_blame(&m, x, path, &mut memo), "{who}: blame {path}");
+                    checked += 1;
+                }
+                let want = model_history(&m, x, path);
+                if !want.is_empty() {
+                    let got: Vec<String> = history_all(&th, &h, &a, "main", path, false, 3).unwrap().into_iter().map(|e| e.0).collect();
+                    let want: Vec<String> = order.iter().filter(|s| want.contains(s)).map(|s| s.hex()).collect();
+                    assert_eq!(got, want, "{who}: history {path}");
+                }
+            }
+        }
+        assert!(checked > 50, "{checked}");
     }
 
     /// BUG-1211. Migration 0015 ends in `DELETE FROM view_graph`: one
@@ -729,7 +832,6 @@ mod s14c1_adversarial {
     /// about 680,000 rows, three such projects; on PostgreSQL about 40
     /// million.
     #[test]
-    #[ignore = "BUG-1211: migration 0015's unbounded DELETE FROM view_graph cannot finish within the statement timeout on a large server (YugabyteDB)"]
     fn bug_1211_migration_0015_cannot_finish_on_a_large_server() {
         const ROWS: i64 = 300_000;
         const BAR: f64 = 10_000_000.0;
@@ -783,7 +885,6 @@ mod s14c1_adversarial {
     /// trees to pair the rename), with a deadline a quarter of what the
     /// walk down takes.
     #[test]
-    #[ignore = "BUG-1212: a blame that stops on its walk down keeps nothing, so a long history never gets its first blame"]
     fn bug_1212_a_blame_stopped_on_its_walk_down_never_makes_progress() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);
@@ -850,7 +951,6 @@ mod s14c1_adversarial {
     /// cannot be paged past it, for everyone who sees the file. Here: a
     /// file of a 1,500-byte path changed on 30 branches, merged together.
     #[test]
-    #[ignore = "BUG-1213: a file history's cursor can be longer than a request can carry, so the history cannot be paged past it"]
     fn bug_1213_a_history_cursor_is_longer_than_a_request_carries() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);

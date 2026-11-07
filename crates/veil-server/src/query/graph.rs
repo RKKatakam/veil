@@ -218,7 +218,7 @@ impl<'a> G<'a> {
         let row: Option<Row> = self.cx.db(|| {
             sqlx::query_as(
                 "SELECT generation, depth, parents, flags, skip, down_id, real_id FROM view_graph \
-                 WHERE project_id = $1 AND view_key = $2 AND snapshot = $3",
+                 WHERE project_id = $1 AND view_key = $2 AND snapshot = $3 AND files IS TRUE",
             )
             .bind(self.cx.project())
             .bind(self.vk)
@@ -267,7 +267,7 @@ impl<'a> G<'a> {
         }
         let hub = self.cx.hub();
         let found: Vec<String> = self.cx.db(|| {
-            sqlx::query_scalar("SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = ANY($3)")
+            sqlx::query_scalar("SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = ANY($3) AND files IS TRUE")
                 .bind(self.cx.project())
                 .bind(self.vk)
                 .bind(&ask)
@@ -277,7 +277,10 @@ impl<'a> G<'a> {
         Ok(out)
     }
 
-    /// Write `rows` (parents before children) and keep them.
+    /// Write `rows` (parents before children) and keep them, marked as
+    /// having their file history (`files`, S14: written before them). A
+    /// row without the mark (an S13 server's, which writes graph rows
+    /// only: BUG-1210) is not read as present; filling it again marks it.
     fn add(&self, rows: &[(ObjectId, Arc<VRow>)]) -> Result<()> {
         let hub = self.cx.hub();
         for chunk in rows.chunks(ROWS_PER_STATEMENT) {
@@ -291,9 +294,9 @@ impl<'a> G<'a> {
             let reals: Vec<String> = chunk.iter().map(|(_, r)| r.real.hex()).collect();
             self.cx.db(|| {
                 sqlx::query(
-                    "INSERT INTO view_graph (project_id, view_key, snapshot, generation, depth, parents, flags, skip, down_id, real_id) \
-                     SELECT $1, $2, * FROM UNNEST($3::text[], $4::bigint[], $5::bigint[], $6::text[], $7::int[], $8::text[], $9::text[], $10::text[]) \
-                     ON CONFLICT DO NOTHING",
+                    "INSERT INTO view_graph (project_id, view_key, snapshot, generation, depth, parents, flags, skip, down_id, real_id, files) \
+                     SELECT $1, $2, *, TRUE FROM UNNEST($3::text[], $4::bigint[], $5::bigint[], $6::text[], $7::int[], $8::text[], $9::text[], $10::text[]) \
+                     ON CONFLICT (project_id, view_key, snapshot) DO UPDATE SET files = TRUE WHERE view_graph.files IS NOT TRUE",
                 )
                 .bind(self.cx.project())
                 .bind(self.vk)
@@ -870,7 +873,7 @@ async fn warm(hub: &Arc<Hub>, project: i64, vk: &str, admin: bool, tips: &[Objec
         };
         let cached = p == root() || hub.query.rows.get(&cache_key(project, vk, &p)).is_some();
         if !cached {
-            let found: Option<String> = sqlx::query_scalar("SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = $3")
+            let found: Option<String> = sqlx::query_scalar("SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = $3 AND files IS TRUE")
                 .bind(project)
                 .bind(vk)
                 .bind(p.hex())

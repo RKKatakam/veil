@@ -31,6 +31,21 @@ CREATE TABLE IF NOT EXISTS blame_memo (
     object TEXT NOT NULL,
     PRIMARY KEY (project_id, view_key, path_key, follow, snapshot)
 );
--- Viewer graphs filled before this migration have no file history: drop
--- them (a cache), so the next landing or query fills them again with it.
-DELETE FROM view_graph;
+-- Walks down to the versions a blame starts from that stopped before
+-- they got there (BUG-1212): from a version (snapshot and path), the
+-- deeper versions reached (JSON), which the next blame computes first.
+CREATE TABLE IF NOT EXISTS blame_walks (
+    project_id BIGINT NOT NULL,
+    view_key TEXT NOT NULL,
+    path_key TEXT NOT NULL,
+    follow BOOLEAN NOT NULL,
+    snapshot TEXT NOT NULL,
+    frontier TEXT NOT NULL,
+    PRIMARY KEY (project_id, view_key, path_key, follow, snapshot)
+);
+-- Which viewer-graph rows have their file history (S14 writes it before
+-- the row, and sets `files`; an S13 server, which may still run beside S14
+-- servers in a rolling restart, writes graph rows only and never sets it).
+-- A row without it is not read as present: S14 fills it again and marks
+-- it (BUG-1210). Adding a nullable column rewrites no rows (BUG-1211).
+ALTER TABLE view_graph ADD COLUMN IF NOT EXISTS files BOOLEAN;

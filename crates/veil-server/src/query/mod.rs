@@ -384,6 +384,22 @@ fn keep_cursor(cx: &crate::derive::Cx, vk: &str, id: &str, text: &str, limits: &
     Ok(())
 }
 
+/// The text of the cursor kept under `token` for the viewer, while fresh.
+fn kept_cursor(g: &G, token: &str, limits: &Limits) -> Result<String> {
+    g.tick()?;
+    let (cx, vk) = (g.cx, g.vk);
+    let fresh = veil_core::now_millis() - limits.kept_for.as_millis() as i64;
+    let stored: Option<String> = cx.db(|| {
+        sqlx::query_scalar("SELECT frontier FROM log_cursors WHERE project_id = $1 AND view_key = $2 AND id = $3 AND created_at >= $4")
+            .bind(cx.project())
+            .bind(vk)
+            .bind(token)
+            .bind(fresh)
+            .fetch_optional(&cx.hub().db)
+    })?;
+    stored.ok_or_else(|| Error::bad_request("invalid cursor"))
+}
+
 fn cursor_id(ids: &[ObjectId]) -> String {
     let mut h = blake3::Hasher::new_derive_key("veil 2026 hub log cursor v1");
     for id in ids {
@@ -426,18 +442,7 @@ pub async fn log(hub: &Arc<Hub>, ask: &Ask, q: LogParams, limits: Limits) -> Res
     on_graph(hub, ask, deadline, move |g, t| {
         let mut roots = roots;
         if let Some(token) = after.as_deref().and_then(|a| a.strip_prefix(STORED_CURSOR)) {
-            g.tick()?;
-            let (cx, vk) = (g.cx, g.vk);
-            let fresh = veil_core::now_millis() - limits.kept_for.as_millis() as i64;
-            let stored: Option<String> = cx.db(|| {
-                sqlx::query_scalar("SELECT frontier FROM log_cursors WHERE project_id = $1 AND view_key = $2 AND id = $3 AND created_at >= $4")
-                    .bind(cx.project())
-                    .bind(vk)
-                    .bind(token)
-                    .bind(fresh)
-                    .fetch_optional(&cx.hub().db)
-            })?;
-            let stored = stored.ok_or_else(|| Error::bad_request("invalid cursor"))?;
+            let stored = kept_cursor(g, token, &limits)?;
             roots = stored.split(',').map(|s| parse_id(s).ok_or_else(|| Error::bad_request("invalid cursor"))).collect::<Result<_>>()?;
         }
         let mut walk = LogWalk::new(g, &roots);
@@ -739,6 +744,10 @@ pub async fn blame(hub: &Arc<Hub>, ask: &Ask, q: BlameParams, limits: Limits) ->
     .await
 }
 
+/// Most bytes of a history cursor handed out in full; a longer one is kept
+/// by the server (BUG-1213).
+pub const HISTORY_CURSOR_INLINE: usize = 8 << 10;
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct HistoryParams {
     pub rev: Option<String>,
@@ -755,7 +764,8 @@ pub async fn history(hub: &Arc<Hub>, ask: &Ask, q: HistoryParams, limits: Limits
     let n = q.n.unwrap_or(50).min(limits.page);
     let follow = q.follow.unwrap_or(false);
     let start = match &q.after {
-        Some(a) => Err(files::parse_cursor(a, limits.cursor)?),
+        Some(a) if a.starts_with(STORED_CURSOR) => Err(None),
+        Some(a) => Err(Some(files::parse_cursor(a, limits.cursor)?)),
         None => {
             let path = clean_path(q.path.as_deref().unwrap_or(""))?;
             if path.is_empty() {
@@ -773,6 +783,13 @@ pub async fn history(hub: &Arc<Hub>, ask: &Ask, q: HistoryParams, limits: Limits
                 vec![files::Version { id: x, depth, path }]
             }
             Err(nodes) => {
+                let nodes = match nodes {
+                    Some(n) => n,
+                    None => {
+                        let token = q.after.as_deref().and_then(|a| a.strip_prefix(STORED_CURSOR)).unwrap_or("");
+                        files::parse_cursor(&kept_cursor(g, token, &limits)?, limits.frontier)?
+                    }
+                };
                 let mut out = Vec::new();
                 for (id, path) in nodes {
                     // A cursor names versions of the viewer's own graph.
@@ -785,7 +802,24 @@ pub async fn history(hub: &Arc<Hub>, ask: &Ask, q: HistoryParams, limits: Limits
                 out
             }
         };
-        files::history_page(&f, t, starts, follow, n, limits.page_bytes, limits.work, limits.cursor, |id, s| snapshot_json(id, s, false))
+        let (mut v, rest) = files::history_page(&f, t, starts, follow, n, limits.page_bytes, limits.work, limits.frontier, |id, s| snapshot_json(id, s, false))?;
+        // The cursor: in the request while it is small; else kept by the
+        // server, as the log's (BUG-1213: a request line carries 64 KiB).
+        v["next"] = if rest.is_empty() {
+            Value::Null
+        } else {
+            let text = files::cursor(&rest);
+            if rest.len() <= limits.cursor && text.len() <= HISTORY_CURSOR_INLINE {
+                json!(text)
+            } else {
+                let mut h = blake3::Hasher::new_derive_key("veil 2026 hub history cursor v1");
+                h.update(text.as_bytes());
+                let id = hex::encode(&h.finalize().as_bytes()[..16]);
+                keep_cursor(g.cx, g.vk, &id, &text, &limits)?;
+                json!(format!("{STORED_CURSOR}{id}"))
+            }
+        };
+        Ok(v)
     })
     .await
 }
