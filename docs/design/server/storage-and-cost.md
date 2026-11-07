@@ -22,7 +22,7 @@ Each of those is also time on the request path. So every item here makes Veil **
 | Landings/s across 100 projects, MinIO | 376 (bound by the object store) | 4,000 (phase 2 gate) |
 | Landings/s into one `main` | about 20 | 100 (phase 2), 1,000 (phase 4, by batching) |
 | Bytes stored and sent | uncompressed | compressed (zstd) |
-| Server memory, 1 GB project push | 2.3 GB peak (BUG-864: allocator arenas) | under 1 GB |
+| Server memory, 1 GB project | push 2.4 GB, clone 2.9 GB peak (BUG-864: allocator arenas; fixed with jemalloc, 2026-11-07: push 0.98 GB, clone 1.58 GB, BUG-1000) | under 1 GB |
 
 ## 3. One database commit per push (S4)
 
@@ -115,7 +115,8 @@ Found by the benchmarks of 2026-11-06. Each is a small fix round, not a mileston
 
 | Item | What | Where it's tracked |
 |---|---|---|
-| Server memory arenas | glibc keeps one memory arena per thread (2.3 GB peak; one arena: 840 MB). Use a different allocator, or cap the arenas, in `veil-server`. | BUG-864 |
+| Server memory arenas | Done: glibc kept one memory arena per thread (2.4 GB push peak). `veil-server` now uses jemalloc with two arenas (push 984 MiB; measurements in `BASELINE.md`, "The server's allocator"). | BUG-864 (fixed) |
+| Server memory during a clone | A full clone of the 1 GB profile still adds about 0.7 GB beyond the caches, under every allocator (peak 1.58 GB). Profile the fetch path and bound it. | BUG-1000 |
 | Push checks one snapshot at a time | The 1 GB project's first push takes about 330 s. Check snapshots in parallel, bounded by memory. | BUG-865 |
 | Commit one file | Still 3–4× slower than Git: the scan of every file. Use the stat cache to skip unchanged files (performance round 3); the daemon's file watcher (S7) removes the scan entirely. | `OPENSCION.md` |
 | Clone one folder | About 60 forced disk writes in sequence. Use one durability barrier, as the full clone already does. | `OPENSCION.md` |
