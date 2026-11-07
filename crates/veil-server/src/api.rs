@@ -710,6 +710,11 @@ async fn create_group(State(hub): State<HubState>, caller: Caller, Path((p, g)):
     let info = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let g = g2.clone();
         Box::pin(async move {
+            // Bounded (concurrent creations may each add up to the bound).
+            let n: i64 = sqlx::query_scalar("SELECT count(*) FROM groups WHERE project_id = $1").bind(pid).fetch_one(&mut *c).await?;
+            if n >= perm::MAX_GROUPS {
+                return Err(Error::bad_request(format!("a project has at most {} groups", perm::MAX_GROUPS)));
+            }
             // A plain insert, the unique key refusing a second group.
             let r = sqlx::query("INSERT INTO groups (project_id, name) VALUES ($1, $2)").bind(pid).bind(&g).execute(&mut *c).await;
             if let Err(sqlx::Error::Database(d)) = &r {

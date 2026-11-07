@@ -14,7 +14,7 @@ use veil_core::{
 };
 use veil_server::{
     auth::Person as Who,
-    caches::{Caches, ProjectEntry, TipsLookup, ViewerEntry, TIPS_TTL},
+    caches::{project_bytes, Caches, ProjectEntry, TipsLookup, ViewerEntry, TIPS_TTL},
     perm::{Project as Proj, Viewer},
 };
 
@@ -37,11 +37,22 @@ const MIB: usize = 1 << 20;
 /// So a server's memory grows with what they wrote, and is kept: tip rows
 /// stay after they expire, until the same project is read again.
 ///
-/// Run alone (it measures this process's memory):
-/// `server_hub adversarial_s4::bug_913 --ignored --test-threads=1`.
+/// Fixed: every entry is weighed by what it holds, each cache has a byte
+/// budget, and expired tip rows are freed. It measures memory, so it runs
+/// in a process of its own (other tests beside it count for nothing).
 #[test]
-#[ignore = "BUG-913: caches bounded by count, not bytes (tips rows kept past expiry, viewer groups, parsed policies)"]
 fn bug_913_caches_are_bounded_by_bytes_not_by_what_an_attacker_writes() {
+    const CHILD: &str = "VEIL_BUG913_CHILD";
+    if std::env::var(CHILD).is_err() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "adversarial_s4::bug_913_caches_are_bounded_by_bytes_not_by_what_an_attacker_writes", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+        return;
+    }
     let c = Caches::default();
     let mut failures = Vec::new();
 
@@ -90,23 +101,22 @@ fn bug_913_caches_are_bounded_by_bytes_not_by_what_an_attacker_writes() {
         failures.push(format!("50 permission entries (of 100,000 allowed) keep {} MiB", viewers / MIB));
     }
 
-    // 3. Projects: one accepted policy of 1 MiB of five-byte lines, weighed
-    //    at 1 KiB + 3 bytes per byte of text (the cache's 64 MiB budget).
+    // 3. Projects: one accepted policy of 1 MiB of five-byte lines (about
+    //    200,000 rules). Its entry must weigh at least half of what it holds
+    //    (`caches::project_bytes`, against the cache's byte budget).
     let text: String = "a/ x\n".repeat(MIB / 5);
-    let weight = 1024 + 3 * text.len();
     let before = rss();
     let policy = AccessPolicy::parse(&text);
-    c.put_project(ProjectEntry {
-        project: Proj {
-            id: 1,
-            name: "p".into(),
-            default_branch: "main".into(),
-            policy,
-            policy_text: text,
-            bindings: Default::default(),
-        },
-        epoch: 1,
-    });
+    let project = Proj {
+        id: 1,
+        name: "p".into(),
+        default_branch: "main".into(),
+        policy,
+        policy_text: text,
+        bindings: Default::default(),
+    };
+    let weight = project_bytes(&project);
+    c.put_project(ProjectEntry { project, epoch: 1 });
     let project = rss().saturating_sub(before);
     if project > 2 * weight {
         failures.push(format!(
@@ -116,6 +126,13 @@ fn bug_913_caches_are_bounded_by_bytes_not_by_what_an_attacker_writes() {
             project / weight
         ));
     }
+    println!(
+        "BUG-913: expired tips of 100 projects {} MiB, 50 permission entries {} MiB, a project weighed {} MiB holds {} MiB",
+        tips / MIB,
+        viewers / MIB,
+        weight / MIB,
+        project / MIB
+    );
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
@@ -126,7 +143,6 @@ fn bug_913_caches_are_bounded_by_bytes_not_by_what_an_attacker_writes() {
 /// projections can then be fetched by id, and the database grows on every
 /// lost race).
 #[test]
-#[ignore = "BUG-914: a partly refused push records its refused update's snapshots as committed history"]
 fn bug_914_a_partly_refused_push_records_the_refused_updates_snapshots() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -196,7 +212,6 @@ fn bug_914_a_partly_refused_push_records_the_refused_updates_snapshots() {
 /// see". A server with a cold cache accepts it (the database lists every
 /// real snapshot the id stands for, `changes::resolve_base` tries 16).
 #[test]
-#[ignore = "BUG-915: the resolution cache keeps one real snapshot per projected id, another view's: a seen base is refused"]
 fn bug_915_a_base_two_views_share_is_refused_once_the_other_views_memo_is_cached() {
     let a = TestHub::start();
     let b = TestHub::beside(&a);

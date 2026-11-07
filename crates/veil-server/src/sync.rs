@@ -52,6 +52,11 @@ use crate::{
 
 /// Most new snapshots one push may carry.
 pub const MAX_PUSH_SNAPSHOTS: usize = 100_000;
+/// Most branch updates one push may carry (BUG-913).
+pub const MAX_PUSH_UPDATES: usize = 1_000;
+/// Most branches one project may have (BUG-913): work lives as changes and
+/// PRs, not as thousands of long-lived branches (`docs/OVERVIEW.md`).
+pub const MAX_BRANCHES: usize = 10_000;
 /// Most snapshots one history answer holds.
 pub const MAX_HISTORY: usize = 200_000;
 
@@ -426,22 +431,20 @@ pub(crate) fn project_one(
 
 /// The real snapshots a snapshot id the client names may stand for: itself
 /// if it is committed history, else the snapshots it is a projection of
-/// (newest first). Served from the server's memory where it knows the
-/// answer: that a snapshot is committed never changes, and a projected id
-/// stands for a real snapshot forever. Callers project what they get for
-/// the asker's current view, so the answer grants nothing.
-pub async fn resolve(hub: &Hub, project: i64, id: &ObjectId) -> Result<Vec<ObjectId>> {
+/// (newest first). From the server's memory where it knows the answer for
+/// the asker's view (`view_key`): that a snapshot is committed never
+/// changes, and a real snapshot whose projection for that view is `id` is
+/// one (BUG-915: never another view's). Otherwise the database's list.
+/// Callers project what they get for the asker's current view, so the
+/// answer grants nothing.
+pub async fn resolve(hub: &Hub, project: i64, view_key: &str, id: &ObjectId) -> Result<Vec<ObjectId>> {
     if *id == root_snapshot_id() || hub.caches.committed(project, id) {
         return Ok(vec![*id]);
     }
-    if let Some(real) = hub.caches.resolved(project, id) {
+    if let Some(real) = hub.caches.resolved(project, view_key, id) {
         return Ok(vec![real]);
     }
-    let r = resolve_stored(hub, project, id).await?;
-    if let Some(first) = r.first() {
-        hub.caches.put_resolved(project, id, first);
-    }
-    Ok(r)
+    resolve_stored(hub, project, id).await
 }
 
 /// [`resolve`] as the database answers it now, newest first (a push picks
@@ -517,7 +520,7 @@ pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer) -> Result<
 pub async fn history(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId], stop: &[ObjectId]) -> Result<Vec<u8>> {
     let mut starts = Vec::new();
     for t in tips {
-        let Some(real) = resolve(hub, project.id, t).await?.into_iter().next() else {
+        let Some(real) = resolve(hub, project.id, &project.view(viewer).key(), t).await?.into_iter().next() else {
             return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
         };
         starts.push(projected(hub, project, viewer, real).await?);
@@ -564,7 +567,7 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
         if reals.contains_key(&snap) {
             continue;
         }
-        let Some(real) = resolve(hub, project.id, &snap).await?.into_iter().next() else {
+        let Some(real) = resolve(hub, project.id, &project.view(viewer).key(), &snap).await?.into_iter().next() else {
             return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
         };
         reals.insert(snap, real);
@@ -1069,6 +1072,9 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     if req.force && !viewer.admin {
         return Err(Error::forbidden("only admins may force a branch move"));
     }
+    if req.updates.len() > MAX_PUSH_UPDATES {
+        return Err(Error::bad_request(format!("at most {MAX_PUSH_UPDATES} branch updates per push")));
+    }
     let root = root_snapshot_id();
     // Current tips (always from the database: a push never trusts a cache),
     // to pick which real snapshot a projected parent stands for (the
@@ -1167,6 +1173,8 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     let uploaded = Arc::new(receipted(hub, project.id, person, &req.receipts));
     // 2. Complete and check each new snapshot.
     let mut completed: Vec<Completed> = Vec::new();
+    // Each new real snapshot's real parents.
+    let mut real_parents_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
     for id in &order {
         let n = parents_of[id].clone();
         if n.embargo.is_some() {
@@ -1212,11 +1220,18 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             hub.objects.put(project.id, &c.real, raw.clone()).await?;
         }
         real_of.insert(*id, c.real);
+        real_parents_of.insert(c.real, real_parents);
         completed.push(c);
     }
     // 3. Move the branches: one serialisable transaction of compare-and-swaps.
     let mut plans = Vec::new();
     let mut results = Vec::new();
+    // New branches, against the branches when the push began (concurrent
+    // pushes may each add up to the bound).
+    let created: HashSet<&str> = req.updates.iter().filter(|u| u.new.is_some() && !current.contains_key(&u.branch)).map(|u| u.branch.as_str()).collect();
+    if !created.is_empty() && current.len() + created.len() > MAX_BRANCHES {
+        return Err(Error::bad_request(format!("a project has at most {MAX_BRANCHES} branches")));
+    }
     for u in &req.updates {
         if veil_core::commands::validate_tag_name(&u.branch).is_err() {
             return Err(Error::bad_request(format!("invalid branch name {:?}", u.branch)));
@@ -1280,8 +1295,23 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             Box::pin(projected_inner(hub, project, viewer, *n, Some(&mut deferred))).await?;
         }
     }
-    // Only the snapshots this push made: known ones are recorded already
-    // (rewriting their rows made every racing pusher write the same row).
+    // Only the snapshots this push made (known ones are recorded already:
+    // rewriting their rows made every racing pusher write the same row),
+    // and of those only what the updates that land reach: a refused
+    // update's snapshots are no branch's history (BUG-914).
+    let landing: HashSet<ObjectId> = {
+        let mut seen = HashSet::new();
+        let mut stack: Vec<ObjectId> = plans.iter().filter_map(|p| p.2).collect();
+        while let Some(x) = stack.pop() {
+            if let Some(ps) = real_parents_of.get(&x) {
+                if seen.insert(x) {
+                    stack.extend(ps.iter().copied());
+                }
+            }
+        }
+        seen
+    };
+    completed.retain(|c| landing.contains(&c.real));
     let new_reals: Vec<String> = completed.iter().map(|c| c.real.hex()).collect();
     let origins: Vec<(String, String)> = completed.iter().filter_map(|c| c.origin.map(|o| (c.real.hex(), o.hex()))).collect();
     let memos: Vec<(String, String, String)> = deferred.rows.iter().map(|(k, r, p)| (k.clone(), r.hex(), p.hex())).collect();

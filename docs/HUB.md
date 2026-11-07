@@ -1625,15 +1625,15 @@ Milestone S4 (`docs/design/server/phase-2-thin-clients.md` §9,
 `perm.rs` (`open`), `sync.rs` (`projected`, `resolve`, `tips`, `push`),
 `migrations/0006_access_epochs.sql`.
 
-**What each server keeps in memory** (bounded LRU caches; never in the
-database):
+**What each server keeps in memory** (LRU caches with byte budgets; never
+in the database):
 
 | Cache | Key → value | Kept fresh by |
 |---|---|---|
 | sessions | token hash → person, device, expiry | the person's access epoch, read on every request; the expiry |
 | projects | name → accepted policy, bindings, default branch | the project's access epoch, read on every request |
 | permissions | (project, person, device) → admin, groups, device barred | both epochs |
-| snapshot resolution | (project, id) → committed; (project, view key, real) → projected; (project, projected) → real | nothing: these facts never change (rows are never deleted or rewritten; a view key is a hash of what its viewer may read) |
+| snapshot resolution | (project, id) → committed; (project, view key, real) → projected; (project, view key, projected) → real | nothing: these facts never change (rows are never deleted or rewritten; a view key is a hash of what its viewer may read) |
 | branch tips | project → branch rows | a notice from every push (`NOTIFY`), or at most 100 ms |
 
 **Access epochs: never stale, on any server.** `access_epochs` holds an
@@ -1682,10 +1682,27 @@ tests fail.
 
 **Snapshot resolution** answers from memory what never changes; every
 answer is still projected for the asker's current view, so it grants
-nothing. A projected id stands for one remembered real snapshot rather than
-the newest one the database lists; for the viewers it is a projection for,
-any of them gives the same tree and history. A push resolves parents from
-the database (newest first) or from the branch tips it reads.
+nothing. **A resolution is per view:** for a viewer, a projected id
+stands for a real snapshot whose projection *for that viewer's view key*
+is that id (any of them gives that viewer the same tree and history);
+another view's real snapshot for the same id is never used, since the
+same projected id can stand for different real snapshots in different
+views (BUG-915). Without one for the asker's view, the database lists every
+real snapshot the id stands for. A push resolves parents from the database
+(newest first) or from the branch tips it reads.
+
+**Bounded by bytes, and by limits** (BUG-913). Every entry is weighed by
+what it holds (strings, a parsed policy's rules, a view's group set, branch
+rows, plus the cache's own bookkeeping), never counted as one, since its
+size is the asker's to choose. Budgets: sessions 16 MiB, projects 32 MiB,
+permissions 32 MiB, snapshot resolution 64 MiB, branch tips 32 MiB (about
+176 MiB in all); an entry heavier than its cache's budget is not kept.
+Expired tip rows are freed as time passes. Server limits that bound what
+one entry can hold: **10,000 branches per project** and **1,000 branch
+updates per push** (`sync::MAX_BRANCHES`, `MAX_PUSH_UPDATES`), and **1,000
+groups per project** (`perm::MAX_GROUPS`); each is checked against the
+records when the request begins, so concurrent requests may each add up to
+the bound.
 
 **Branch tips.** A pull may see a tip up to **100 ms** old, as
 `phase-2-thin-clients.md` §5.1 allows; rows read before a push's notice are
@@ -1701,7 +1718,8 @@ compare-and-swaps, the accepted policy, the snapshot and origin rows, the
 pusher's projection memo of what it moved (worked out before the
 transaction, as it will read after the commit) and the audit row, and sends
 the notice. A push whose every update is refused commits nothing
-(BUG-910). Other viewers' projections are worked out when they first ask,
+(BUG-910), and a push records only the snapshots of the updates that land
+(BUG-914). Other viewers' projections are worked out when they first ask,
 as before; a reader never gets an unprojected answer. A push reads only the
 signing keys its snapshots name, not every device.
 

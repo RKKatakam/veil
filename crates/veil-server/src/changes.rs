@@ -693,7 +693,7 @@ async fn resolve_base(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, base: 
     // A projection many hidden-only changes share stands for each of them;
     // the newest few are enough (they differ only in what the caller
     // cannot see).
-    for r in sync::resolve(hub, project.id, &base).await?.into_iter().take(16) {
+    for r in sync::resolve(hub, project.id, &project.view(viewer).key(), &base).await?.into_iter().take(16) {
         if sync::projected(hub, project, viewer, r).await? == base {
             return Ok(r);
         }

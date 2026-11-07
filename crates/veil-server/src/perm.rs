@@ -72,6 +72,10 @@ impl Project {
     }
 }
 
+/// Most groups one project may have (BUG-913): bounds what a person's view
+/// of it holds.
+pub const MAX_GROUPS: i64 = 1_000;
+
 pub fn valid_project_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
