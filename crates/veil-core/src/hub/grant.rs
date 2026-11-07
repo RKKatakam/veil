@@ -39,7 +39,7 @@ use crate::{
     error::Result,
     id::ObjectId,
     identity::{verify_signature, SeedSigner},
-    object::{EntryKind, Tree},
+    object::{EntryKind, Tree, TreeEntry},
     tree::MAX_TREE_DEPTH,
 };
 
@@ -165,24 +165,47 @@ pub trait ChainSource {
     fn conflict_terms(&self, id: &ObjectId) -> Result<Option<Vec<ObjectId>>>;
 }
 
-/// The ids one tree names, by role.
-#[derive(Default)]
-struct Names {
-    /// Directory entries: a chain may go on through them.
-    dirs: HashSet<ObjectId>,
-    /// Conflict entries: a chain may end with one, naming one of its terms.
-    conflicts: HashSet<ObjectId>,
-    /// Every entry's object and fallback: what the tree lets be served,
-    /// with the size its entry records (0 for a fallback or a tree).
-    named: HashMap<ObjectId, u64>,
+/// What one tree's entries say of one id.
+#[derive(Clone, Copy, Default)]
+struct Hit {
+    /// A directory entry names it: a chain may go on through it.
+    dir: bool,
+    /// A conflict entry names it: a chain may end with it, naming a term.
+    conflict: bool,
+    /// An entry's object or fallback is it (may be served), with the size
+    /// the entry records (0 for a fallback).
+    size: Option<u64>,
 }
+
+impl Hit {
+    fn add(&mut self, e: &TreeEntry, id: &ObjectId) {
+        if e.id == *id {
+            self.dir |= e.kind == EntryKind::Dir;
+            self.conflict |= e.kind == EntryKind::Conflict;
+            self.size = Some(e.size);
+        }
+        if e.fallback == Some(*id) {
+            self.size.get_or_insert(0);
+        }
+    }
+}
+
+/// A tree a check has read: scanned for its first few lookups (one object
+/// costs no index of a large folder), indexed from [`INDEX_AFTER`] on.
+enum Seen {
+    Scanned(Arc<Tree>, u32),
+    Indexed(HashMap<ObjectId, Hit>),
+}
+
+/// The lookup in one tree from which it is indexed.
+const INDEX_AFTER: u32 = 4;
 
 /// Checks chains from one grant's root, remembering the trees it read (one
 /// request's worth).
 pub struct Chains<'a> {
     src: &'a dyn ChainSource,
     root: ObjectId,
-    trees: HashMap<ObjectId, Option<Arc<Names>>>,
+    trees: HashMap<ObjectId, Option<Seen>>,
     terms: HashMap<ObjectId, Option<Arc<HashSet<ObjectId>>>>,
 }
 
@@ -222,40 +245,49 @@ impl<'a> Chains<'a> {
             return Ok(None);
         }
         for i in 0..last {
-            let Some(names) = self.names(&chain[i])? else { return Ok(None) };
             let next = &chain[i + 1];
-            if names.dirs.contains(next) {
+            let hit = self.lookup(&chain[i], next)?;
+            if hit.dir {
                 continue;
             }
-            if i + 1 == last && names.conflicts.contains(next) {
+            if i + 1 == last && hit.conflict {
                 return Ok(self.terms(next)?.is_some_and(|t| t.contains(id)).then_some(0));
             }
             return Ok(None);
         }
-        Ok(self.names(&chain[last])?.and_then(|n| n.named.get(id).copied()))
+        Ok(self.lookup(&chain[last], id)?.size)
     }
 
-    fn names(&mut self, tree: &ObjectId) -> Result<Option<Arc<Names>>> {
-        if let Some(n) = self.trees.get(tree) {
-            return Ok(n.clone());
+    /// What tree `tree` (already reached) says of `id`; nothing if the
+    /// tree is not held.
+    fn lookup(&mut self, tree: &ObjectId, id: &ObjectId) -> Result<Hit> {
+        if !self.trees.contains_key(tree) {
+            let t = self.src.tree(tree)?;
+            self.trees.insert(*tree, t.map(|t| Seen::Scanned(t, 0)));
         }
-        let n = self.src.tree(tree)?.map(|t| {
-            let mut n = Names::default();
-            for e in &t.entries {
-                match e.kind {
-                    EntryKind::Dir => n.dirs.insert(e.id),
-                    EntryKind::Conflict => n.conflicts.insert(e.id),
-                    EntryKind::File | EntryKind::Symlink => false,
-                };
-                n.named.insert(e.id, e.size);
-                if let Some(f) = e.fallback {
-                    n.named.entry(f).or_insert(0);
+        let Some(Some(seen)) = self.trees.get_mut(tree) else { return Ok(Hit::default()) };
+        let index = match seen {
+            Seen::Indexed(ix) => return Ok(ix.get(id).copied().unwrap_or_default()),
+            Seen::Scanned(t, n) => {
+                *n += 1;
+                if *n < INDEX_AFTER {
+                    let mut h = Hit::default();
+                    t.entries.iter().for_each(|e| h.add(e, id));
+                    return Ok(h);
                 }
+                let mut ix: HashMap<ObjectId, Hit> = HashMap::with_capacity(t.entries.len());
+                for e in &t.entries {
+                    ix.entry(e.id).or_default().add(e, &e.id);
+                    if let Some(f) = e.fallback {
+                        ix.entry(f).or_default().add(e, &f);
+                    }
+                }
+                ix
             }
-            Arc::new(n)
-        });
-        self.trees.insert(*tree, n.clone());
-        Ok(n)
+        };
+        let h = index.get(id).copied().unwrap_or_default();
+        *seen = Seen::Indexed(index);
+        Ok(h)
     }
 
     fn terms(&mut self, conflict: &ObjectId) -> Result<Option<Arc<HashSet<ObjectId>>>> {
@@ -314,7 +346,7 @@ pub struct EpochChange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::{Object, TreeEntry};
+    use crate::object::Object;
 
     #[derive(Default)]
     struct Store {
@@ -400,6 +432,17 @@ mod tests {
         // It never read an object it had not reached from the root.
         assert!(s.reads.borrow().iter().all(|r| [root, sub, conflict].contains(r)), "{:?}", s.reads.borrow());
         assert!(!Chains::new(&s, root).allows(&vec![root; MAX_CHAIN + 1], &a).unwrap());
+        // A tree's first lookups scan it, later ones use its index: the
+        // same answers, sizes included.
+        let mut indexed = Chains::new(&s, root);
+        for _ in 0..INDEX_AFTER {
+            indexed.check(&[root, sub], &a).unwrap();
+        }
+        for id in [a, b, fb, conflict, term, hidden, sub, secret, root] {
+            for chain in [vec![root], vec![root, sub]] {
+                assert_eq!(Chains::new(&s, root).check(&chain, &id).unwrap(), indexed.check(&chain, &id).unwrap(), "{chain:?} {id:?}");
+            }
+        }
     }
 
     fn body(device: Option<String>) -> GrantBody {
