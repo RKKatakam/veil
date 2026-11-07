@@ -427,7 +427,11 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
     }
 
     print_running(a.command, &paths.files, confine);
-    let code = run_command(&paths.files, &paths.dir, a.command, confine);
+    // What the command writes to the allow-list stays for the workspace's
+    // later runs, unless it was given secrets: then nothing it wrote
+    // outside its files outlives it.
+    let layers = injection.is_none().then_some(paths.dir.as_path());
+    let code = run_command(&paths.files, &paths.dir, a.command, confine, layers);
     // Nothing may have run (the command was not found): recording finds no
     // change and the injected files are taken out as after any run.
     finish(ctx, name, &paths, &mut m, &mut cache, &fs, injection.as_ref(), Some(&kept))?;
@@ -836,15 +840,17 @@ fn print_running(command: &[String], dir: &Path, confine: Option<&Confine>) {
 /// only, and SIGTERM and SIGHUP sent to `vl` (an IDE stopping a task, a
 /// closed terminal) are forwarded to it: `vl` waits for it and records what
 /// it left (BUG-550). With `confine`, `dir` appears at the project's path
-/// inside the confinement ([`crate::confine`], which forwards the signals).
-fn run_command(dir: &Path, ceiling: &Path, command: &[String], confine: Option<&Confine>) -> Result<i32> {
+/// inside the confinement ([`crate::confine`], which forwards the signals),
+/// and the allow-list's writes are kept in the layers of `layers` (a
+/// persistent sandbox's directory) or thrown away (`None`).
+fn run_command(dir: &Path, ceiling: &Path, command: &[String], confine: Option<&Confine>, layers: Option<&Path>) -> Result<i32> {
     let mut ceilings = ceiling.as_os_str().to_owned();
     if let Some(old) = std::env::var_os("GIT_CEILING_DIRECTORIES").filter(|v| !v.is_empty()) {
         ceilings.push(":");
         ceilings.push(old);
     }
     if let Some(c) = confine {
-        return crate::confine::run(c, dir, command, &[("GIT_CEILING_DIRECTORIES", ceilings)]);
+        return crate::confine::run(c, dir, command, &[("GIT_CEILING_DIRECTORIES", ceilings)], layers);
     }
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]).current_dir(dir);
@@ -1022,7 +1028,7 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>, confine: Option<&Confine>) -> Res
         }
         sb.make_private()?;
         print_running(a.command, &dir, confine);
-        let code = run_command(&dir, &dir, a.command, confine)?;
+        let code = run_command(&dir, &dir, a.command, confine, None)?;
         // A deleted or unreadable `.veilpolicy` keeps the recorded one.
         let pin = core::PolicyPin::new(&sandbox, ctx.repo.store(), &tree)?;
         let view = set.as_ref().map(|s| SparseView::new(&pin, ctx.repo.store().clone(), tree, s));

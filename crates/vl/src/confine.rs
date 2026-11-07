@@ -9,9 +9,11 @@
 //! * the computer's tools (`/usr`, `/etc`, …) are bound read-only;
 //! * `HOME`, `/tmp` and `/var/tmp` are empty and private; the Veil home is
 //!   always hidden;
-//! * an **allow-list** of toolchain and agent folders from the home is
-//!   bound read-only (defaults, `--allow`, and `[exec.confine] allow` in
-//!   the device-local configuration);
+//! * an **allow-list** of toolchain and agent folders from the home
+//!   (defaults, `--allow`, and `[exec.confine] allow` in the device-local
+//!   configuration) is shown through overlays: the real folders are never
+//!   written; the command's writes go to the workspace's own layers
+//!   ([`Layers`], BUG-1025), or are thrown away after the run;
 //! * the command gets its own pid, IPC and UTS namespaces, no
 //!   capabilities, no further user namespaces, and with `--no-network`
 //!   its own network namespace.
@@ -48,7 +50,7 @@ pub struct ConfineArgs {
     /// Run without confinement: the command can read and change everything your user can.
     #[arg(long, conflicts_with_all = ["allow", "no_network", "memory", "cpus", "cpu_time", "pids", "timeout", "limits"])]
     pub unconfined: bool,
-    /// Also show PATH (a folder or file of this machine) to the command, read-only. Repeatable.
+    /// Also show PATH (a folder or file of this machine) to the command; its writes go to the workspace's own layer, never to PATH. Repeatable.
     #[arg(long, value_name = "PATH")]
     pub allow: Vec<String>,
     /// No network: the command gets only a private loopback.
@@ -74,8 +76,8 @@ pub struct ConfineArgs {
     pub limits: Option<String>,
 }
 
-/// Folders and files of the home shown to the command (read-only) by
-/// default, when they exist: toolchains, and coding agents' own
+/// Folders and files of the home shown to the command by default, when
+/// they exist: toolchains, and coding agents' own
 /// configuration. Never `~/.ssh`, `~/.gnupg` or the Veil home.
 pub const DEFAULT_ALLOW: &[&str] = &[
     ".cargo",
@@ -338,7 +340,7 @@ enum Backend {
 pub struct Confine {
     bwrap: PathBuf,
     /// Namespaces and every mount but the sandbox's.
-    base: Vec<OsString>,
+    mounts: Mounts,
     /// The project's canonical path, where the sandbox appears.
     root: PathBuf,
     /// The sub-folder `vl` was run from, relative to `root`.
@@ -389,8 +391,8 @@ impl Confine {
         allow.extend(default_allow(home.as_deref()));
         let home = home.unwrap_or_else(|| PathBuf::from("/tmp/home"));
         let bwrap = find_program("bwrap", Some(&root)).ok_or_else(|| anyhow!("confinement needs bubblewrap, which is not installed: {INSTALL}, {OPT_OUT}"))?;
-        let base = base_args(&home, Some(&root), &allow, a.no_network)?;
-        probe(&bwrap, &base)?;
+        let mounts = base_args(&home, Some(&root), &allow, a.no_network)?;
+        probe(&bwrap, &mounts.args(&Layers::ReadOnly)?)?;
         let backend = backend(&limits, &root)?;
         let (soft, unavailable) = weak_limits(&limits, &backend);
         if !soft.is_empty() || !unavailable.is_empty() {
@@ -407,7 +409,7 @@ impl Confine {
             }
             warn(&format!("limits: {} ({why})", parts.join("; ")));
         }
-        Ok(Some(Confine { bwrap, base, root, rel, home, limits, backend }))
+        Ok(Some(Confine { bwrap, mounts, root, rel, home, limits, backend }))
     }
 
     /// Where the command starts, inside the confinement: the sub-folder
@@ -422,7 +424,7 @@ impl Confine {
 
     /// The whole command line for running `command` with `sandbox` at the
     /// project's path: `(program, args)`.
-    fn argv(&self, sandbox: &Path, command: &[String], unit: &str) -> (PathBuf, Vec<OsString>) {
+    fn argv(&self, mounts: Vec<OsString>, sandbox: &Path, command: &[String], unit: &str) -> (PathBuf, Vec<OsString>) {
         let dir = self.start_dir(sandbox);
         let mut args: Vec<OsString> = Vec::new();
         let program = match &self.backend {
@@ -453,7 +455,7 @@ impl Confine {
             }
             _ => self.bwrap.clone(),
         };
-        args.extend(self.base.iter().cloned());
+        args.extend(mounts);
         for a in [
             "--bind".into(),
             sandbox.as_os_str().to_owned(),
@@ -480,8 +482,12 @@ impl Confine {
     /// One line for `running … in …`.
     pub fn describe(&self, sandbox: &Path) -> String {
         let mut what = vec![format!("confined at {}", self.start_dir(sandbox).display())];
-        if self.base.iter().any(|a| a == "--unshare-net") {
+        if self.mounts.head.iter().any(|a| a == "--unshare-net") {
             what.push("no network".into());
+        }
+        let read_only: Vec<String> = self.mounts.allowed.iter().filter(|a| !a.layer).map(|a| a.dest.display().to_string()).collect();
+        if !read_only.is_empty() {
+            what.push(format!("read-only: {}", read_only.join(", ")));
         }
         let l = &self.limits;
         if let Some(m) = &l.memory {
@@ -542,6 +548,140 @@ fn is_executable(p: &Path) -> bool {
     }
 }
 
+/// Every mount but the sandbox's ([`base_args`]).
+#[derive(Debug)]
+struct Mounts {
+    /// Namespaces, the computer's tools, and the private `HOME` and `/tmp`.
+    head: Vec<OsString>,
+    /// The allow-list.
+    allowed: Vec<Allowed>,
+    /// What stays hidden whatever the allow-list shows, mounted last.
+    masks: Vec<OsString>,
+}
+
+/// A folder or file of the allow-list.
+#[derive(Debug)]
+struct Allowed {
+    /// Where it appears.
+    dest: PathBuf,
+    /// The real folder or file it shows (canonical).
+    src: PathBuf,
+    dir: bool,
+    /// Writes to it go to a layer ([`Layers`]). Not for a folder that holds
+    /// the project (whose `.veil` holds the layers), nor for one with
+    /// anything hidden below its top level: a hidden path must stay a
+    /// mount point the command cannot rename or delete.
+    layer: bool,
+}
+
+/// Where writes to the allow-list go. The real folders and files are never
+/// written: a folder is the lower layer of an overlay, a file is copied.
+#[derive(Debug)]
+enum Layers<'a> {
+    /// Nowhere: the allow-list is read-only (the probe, and where overlayfs
+    /// does not work).
+    ReadOnly,
+    /// Thrown away after the run: `--tmp-overlay`, and file copies in this
+    /// directory.
+    Throwaway(&'a Path),
+    /// Kept for the workspace's later runs, in this directory of its
+    /// sandbox's private state.
+    Workspace(&'a Path),
+}
+
+/// The directory of a workspace's layers, in its sandbox's directory
+/// (`.veil/local/sandboxes/<ws>`): removed with it by `vl ws rm`.
+const LAYERS_DIR: &str = "layers";
+
+/// The name of the layer of the allowed path `dest` in a layers directory:
+/// its last component, readable, and a hash of the whole path.
+fn layer_name(dest: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let last = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut name: String = last
+        .trim_start_matches('.')
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .take(32)
+        .collect();
+    if name.is_empty() {
+        name.push_str("layer");
+    }
+    let hash = blake3::hash(dest.as_os_str().as_bytes());
+    format!("{name}-{}", &hash.to_hex()[..16])
+}
+
+/// A private copy of the real file `src` at `at` (`0600`, `0700` if `src`
+/// is executable): kept if `keep`
+/// and it is already a regular file, else made afresh. Never written
+/// through a link: whatever is at `at` is removed first, and the copy is
+/// created exclusively, then renamed into place.
+fn file_copy(src: &Path, at: &Path, keep: bool) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if keep && std::fs::symlink_metadata(at).is_ok_and(|m| m.is_file()) {
+        return Ok(());
+    }
+    veil_core::vfs::remove_tree(at).with_context(|| format!("removing {}", at.display()))?;
+    let dir = at.parent().ok_or_else(|| anyhow!("{} has no parent", at.display()))?;
+    let tmp = dir.join(format!(".copy-{}", hex::encode(veil_core::crypto::random_bytes::<8>())));
+    let made = (|| -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut from = std::fs::File::open(src)?;
+        let mode = if from.metadata()?.permissions().mode() & 0o100 != 0 { 0o700 } else { 0o600 };
+        let mut to = std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
+        std::io::copy(&mut from, &mut to)?;
+        std::fs::rename(&tmp, at)
+    })();
+    if made.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    made.with_context(|| format!("copying {} to {}", src.display(), at.display()))
+}
+
+impl Mounts {
+    /// The `bwrap` arguments, with writes to the allow-list going to
+    /// `layers` (whose directories and copies this makes).
+    fn args(&self, layers: &Layers<'_>) -> Result<Vec<OsString>> {
+        let mut a = self.head.clone();
+        for al in &self.allowed {
+            let (src, dest) = (al.src.as_os_str().to_owned(), al.dest.as_os_str().to_owned());
+            let at = match (layers, al.layer) {
+                (Layers::Throwaway(d) | Layers::Workspace(d), true) => d.join(layer_name(&al.dest)),
+                _ => {
+                    a.extend(["--ro-bind".into(), src, dest]);
+                    continue;
+                }
+            };
+            let keep = matches!(layers, Layers::Workspace(_));
+            if !al.dir {
+                if let Some(d) = at.parent() {
+                    veil_core::vfs::private_dir(d).with_context(|| format!("creating {}", d.display()))?;
+                }
+                file_copy(&al.src, &at, keep)?;
+                a.extend(["--bind".into(), at.into_os_string(), dest]);
+            } else if !keep {
+                a.extend(["--overlay-src".into(), src, "--tmp-overlay".into(), dest]);
+            } else {
+                if !std::fs::symlink_metadata(&at).is_ok_and(|m| m.is_dir()) {
+                    veil_core::vfs::remove_tree(&at).with_context(|| format!("removing {}", at.display()))?;
+                }
+                let (upper, work) = (at.join("upper"), at.join("work"));
+                for d in [&at, &upper, &work] {
+                    veil_core::vfs::private_dir(d).with_context(|| format!("creating {}", d.display()))?;
+                }
+                a.extend(["--overlay-src".into(), src, "--overlay".into(), upper.into_os_string(), work.into_os_string(), dest]);
+            }
+        }
+        a.extend(self.masks.iter().cloned());
+        Ok(a)
+    }
+
+    /// Does any allowed path take writes?
+    fn any_layer(&self) -> bool {
+        self.allowed.iter().any(|a| a.layer)
+    }
+}
+
 /// The namespaces and every mount but the sandbox's. `allow`: `(path,
 /// explicit)`; a missing default is skipped, a missing explicit entry is an
 /// error. `root`: the project's canonical path, where the sandbox appears.
@@ -552,7 +692,7 @@ fn is_executable(p: &Path) -> bool {
 /// allowed link gives them (an allowed `~/src` that links to the disk
 /// holding the project). An allowed path inside the Veil home or the
 /// project is refused.
-fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], no_network: bool) -> Result<Vec<OsString>> {
+fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], no_network: bool) -> Result<Mounts> {
     let mut a: Vec<OsString> = Vec::new();
     let mut push = |items: &[&std::ffi::OsStr]| a.extend(items.iter().map(|s| s.to_os_string()));
     for f in [
@@ -630,7 +770,6 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], no_net
         if bound.iter().any(|(d, _)| *d == dest) {
             continue;
         }
-        push(&["--ro-bind".as_ref(), src.as_os_str(), dest.as_os_str()]);
         bound.push((dest, src));
     }
     // Every name under which the allow-list shows `real` (canonical).
@@ -657,43 +796,105 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], no_net
         masks.extend(aliases(r).into_iter().filter(|a| a != r).map(|a| ("", a)));
     }
     let mut done: Vec<PathBuf> = Vec::new();
+    let mut hide: Vec<OsString> = Vec::new();
     for (with, at) in masks {
         if at == Path::new("/") || done.contains(&at) {
             continue;
         }
         match with {
-            "" => push(&["--tmpfs".as_ref(), at.as_os_str()]),
-            file => push(&["--ro-bind".as_ref(), file.as_ref(), at.as_os_str()]),
+            "" => hide.extend(["--tmpfs".into(), at.as_os_str().to_owned()]),
+            file => hide.extend(["--ro-bind".into(), file.into(), at.as_os_str().to_owned()]),
         }
         done.push(at);
     }
-    Ok(a)
+    let allowed = bound
+        .into_iter()
+        .map(|(dest, src)| {
+            let holds_project = root.is_some_and(|r| r.starts_with(&src));
+            let hidden_below = done.iter().any(|m| m.starts_with(&dest) && m.parent() != Some(dest.as_path()));
+            Allowed { dir: src.is_dir(), layer: !holds_project && !hidden_below, dest, src }
+        })
+        .collect();
+    Ok(Mounts { head: a, allowed, masks: hide })
 }
 
 /// Run the confinement once with `true`: a missing or unusable `bwrap`
 /// fails here, before the sandbox is touched.
 fn probe(bwrap: &Path, base: &[OsString]) -> Result<()> {
-    let out = std::process::Command::new(bwrap)
-        .args(base)
-        .args(["--", "true"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output();
-    match out {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => {
-            let err = String::from_utf8_lossy(&o.stderr);
-            let err = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("it failed without a message");
-            bail!(
-                "confinement does not work on this machine ({}). Check that bubblewrap works here ({INSTALL}; its AppArmor profile lets it create namespaces), {OPT_OUT}",
-                safe(err.trim())
-            )
-        }
+    match try_true(bwrap, base) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => bail!(
+            "confinement does not work on this machine ({}). Check that bubblewrap works here ({INSTALL}; its AppArmor profile lets it create namespaces), {OPT_OUT}",
+            safe(&err)
+        ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             bail!("confinement needs bubblewrap, which is not installed: {INSTALL}, {OPT_OUT}")
         }
         Err(e) => bail!("confinement does not work on this machine (running {}: {e}), {OPT_OUT}", bwrap.display()),
+    }
+}
+
+/// `bwrap ARGS -- true`: `Err` if it cannot be run, `Ok(Err(first line of
+/// its error))` if it fails.
+fn try_true(bwrap: &Path, args: &[OsString]) -> std::io::Result<std::result::Result<(), String>> {
+    let o = std::process::Command::new(bwrap)
+        .args(args)
+        .args(["--", "true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()?;
+    if o.status.success() {
+        return Ok(Ok(()));
+    }
+    let err = String::from_utf8_lossy(&o.stderr);
+    Ok(Err(err.lines().find(|l| !l.trim().is_empty()).unwrap_or("it failed without a message").trim().to_string()))
+}
+
+/// What a read-only allow-list breaks, for the warning when overlayfs does
+/// not work.
+const READ_ONLY_BREAKS: &str = "cargo cannot download crates, and coding agents cannot save their settings or sessions";
+
+impl Confine {
+    /// The mounts of a run: writes to the allow-list are kept in the
+    /// layers of `state` (a persistent sandbox's directory; the caller holds
+    /// its lock), or thrown away after the run (`None`), with the throwaway
+    /// directory of file copies. Where overlayfs does not work, the
+    /// allow-list is read-only, and `vl` says what that breaks.
+    fn layered(&self, state: Option<&Path>) -> Result<(Vec<OsString>, Option<crate::sandbox::Sandbox>)> {
+        let read_only = || self.mounts.args(&Layers::ReadOnly);
+        if !self.mounts.any_layer() {
+            return Ok((read_only()?, None));
+        }
+        let mut copies = None;
+        let layered = match state {
+            Some(s) => {
+                let dir = s.join(LAYERS_DIR);
+                veil_core::vfs::private_dir(&dir)
+                    .with_context(|| format!("creating {}", dir.display()))
+                    .and_then(|()| self.mounts.args(&Layers::Workspace(&dir)))
+            }
+            None => {
+                if self.mounts.allowed.iter().any(|a| a.layer && !a.dir) {
+                    copies = Some(crate::sandbox::Sandbox::create("home")?);
+                }
+                let dir = copies.as_ref().map_or(Path::new("/nonexistent"), |c| c.path());
+                self.mounts.args(&Layers::Throwaway(dir))
+            }
+        };
+        let why = match layered {
+            Ok(args) => match try_true(&self.bwrap, &args) {
+                Ok(Ok(())) => return Ok((args, copies)),
+                Ok(Err(e)) => format!("overlayfs does not work here: {e}"),
+                Err(e) => e.to_string(),
+            },
+            Err(e) => format!("{e:#}"),
+        };
+        warn(&format!(
+            "the allow-list is read-only in this run ({}); {READ_ONLY_BREAKS}",
+            safe(&why)
+        ));
+        Ok((read_only()?, None))
     }
 }
 
@@ -798,10 +999,23 @@ pub fn doctor(root: Option<&Path>) -> Vec<(bool, String, Vec<String>)> {
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
-            let probe = base_args(&home, None, &[], false).and_then(|base| probe(&bwrap, &base));
-            match probe {
+            let base = base_args(&home, None, &[], false).and_then(|m| m.args(&Layers::ReadOnly));
+            match base.as_ref().map_err(|e| anyhow!("{e:#}")).and_then(|b| probe(&bwrap, b)) {
                 Ok(()) => out.push((true, format!("confinement works ({}): `vl ws exec` runs confined", safe(&version)), Vec::new())),
                 Err(e) => out.push((false, "confinement does not work here".into(), vec![safe(&e.to_string()).into_owned()])),
+            }
+            // Writes to the allow-list: an overlay of a folder every machine has.
+            if let Ok(mut b) = base {
+                b.extend(["--overlay-src", "/usr", "--tmp-overlay", "/usr"].map(OsString::from));
+                match try_true(&bwrap, &b) {
+                    Ok(Ok(())) => out.push((true, "allow-list: writable, each workspace's writes kept in its own layer (overlayfs)".into(), Vec::new())),
+                    Ok(Err(e)) => out.push((
+                        false,
+                        format!("allow-list: read-only, overlayfs does not work here ({})", safe(&e)),
+                        vec![format!("{READ_ONLY_BREAKS} (a Linux kernel of 5.11 or later, and bubblewrap 0.10 or later, have it)")],
+                    )),
+                    Err(_) => {}
+                }
             }
         }
     }
@@ -822,7 +1036,7 @@ pub fn doctor(root: Option<&Path>) -> Vec<(bool, String, Vec<String>)> {
 pub use run::{run, stop_leftovers};
 
 #[cfg(not(target_os = "linux"))]
-pub fn run(_: &Confine, _: &Path, _: &[String], _: &[(&str, OsString)]) -> Result<i32> {
+pub fn run(_: &Confine, _: &Path, _: &[String], _: &[(&str, OsString)], _: Option<&Path>) -> Result<i32> {
     bail!("confinement is only built for Linux")
 }
 
@@ -1148,11 +1362,15 @@ mod run {
     }
 
     /// Run `command` confined by `c`, with `sandbox` at the project's path
-    /// and `env` added. The exit status is the command's (128 + n for a
+    /// and `env` added; writes to the allow-list kept in the layers of
+    /// `state` (a persistent sandbox's directory), or thrown away (`None`).
+    /// The exit status is the command's (128 + n for a
     /// signal); a limit that stopped it is reported.
-    pub fn run(c: &Confine, sandbox: &Path, command: &[String], env: &[(&str, OsString)]) -> Result<i32> {
+    pub fn run(c: &Confine, sandbox: &Path, command: &[String], env: &[(&str, OsString)], state: Option<&Path>) -> Result<i32> {
         let unit = format!("veil-exec-{}-{}", std::process::id(), hex::encode(veil_core::crypto::random_bytes::<4>()));
-        let (program, args) = c.argv(sandbox, command, &unit);
+        // The throwaway file copies live until the command has exited.
+        let (mounts, _copies) = c.layered(state)?;
+        let (program, args) = c.argv(mounts, sandbox, command, &unit);
         let scoped = program != c.bwrap;
         let signals = Signals::install()?;
         let mut cmd = Command::new(&program);
