@@ -6,13 +6,13 @@
 //!
 //! 1. applies the edits to the caller's projection of `base`, as the
 //!    caller's own `vl` would have built the tree it pushes;
-//! 2. runs **the push's own checks** on it ([`sync::complete`]): the graft
+//! 2. runs **the push's own checks** on it (`sync::complete`): the graft
 //!    onto the full tree (nothing the caller cannot see is touched), write
 //!    access for every edited path, access lines changed only by admins,
 //!    closure, personal keys refused, secrets only as ciphertext, and the
 //!    secret scan of every new plain-text file (check 9);
 //! 3. signs the full snapshot with its key, and works out the caller's
-//!    projection of it ([`sync::project_one`]);
+//!    projection of it (`sync::project_one`);
 //! 4. stores the objects, then writes everything in **one database
 //!    commit**: the snapshot row, the caller's projection memo, the change
 //!    ref, the audit row and, with `onto`, the one-row compare-and-swap of
