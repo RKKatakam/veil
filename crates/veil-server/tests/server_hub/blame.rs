@@ -985,3 +985,342 @@ mod s14c1_adversarial {
         assert_eq!(second.json()["entries"].as_array().unwrap().len(), 31);
     }
 }
+
+// ---- S14 cycle 2: review of the cycle-1 fixes ------------------------------------------
+
+mod s14c2_adversarial {
+    use super::*;
+    use crate::support::unique;
+
+    /// Kept blames and cut walks of the project.
+    fn progress(th: &TestHub, h: &Hist) -> (i64, i64) {
+        th.rt.block_on(async {
+            let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blame_memo WHERE project_id = $1").bind(h.id).fetch_one(&h.hub.db).await.unwrap();
+            let walks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blame_walks WHERE project_id = $1").bind(h.id).fetch_one(&h.hub.db).await.unwrap();
+            (kept, walks)
+        })
+    }
+
+    /// BUG-1215. A walk down cut by its own budget (`BlameLimits::walk`)
+    /// keeps where it got to, and the next requests blame those deeper
+    /// versions first; but nothing shortens the walk from the version
+    /// asked for down to them. Once they are kept, that walk costs what it
+    /// cost the first time (each request reads its rows, windows, kept
+    /// blames and renames afresh), passes the budget at the same place
+    /// (the check comes before a version is expanded, kept or not) and is
+    /// cut again with the same frontier: every request answers `partial`
+    /// and nothing more is kept, for good. Here: a file renamed at each of
+    /// 80 changes, blamed with `follow`, with walk budgets that its walk
+    /// down passes (the default, 20,000 reads, is passed the same way by a
+    /// longer history), and a deadline long enough not to matter.
+    #[test]
+    #[ignore = "BUG-1215: a blame whose walk down passes its budget never finishes: once the deeper versions are kept, the same walk is cut at the same place for good"]
+    fn bug_1215_a_blame_whose_walk_down_passes_its_budget_never_finishes() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let mut f = Files::new();
+        let mut body: Vec<String> = (0..40).map(|i| format!("line {i} of a file that moves at every change\n")).collect();
+        for i in 0..10 {
+            f.insert(format!("pub/other/o{i}.txt"), lines(&format!("o{i}"), 10));
+        }
+        let mut tip = root_snapshot_id();
+        let mut path = String::new();
+        for i in 0..80usize {
+            body[i % 40] = format!("edited at change {i}\n");
+            f.remove(&path);
+            path = format!("pub/moving/name{}.txt", i % 2);
+            f.insert(path.clone(), body.concat().into_bytes());
+            let mut change = [9u8; 16];
+            change[..2].copy_from_slice(&(i as u16).to_le_bytes());
+            tip = h.commit(&th, &[tip], f.clone(), change, 1_700_000_000_000 + i as i64 * 1000, None);
+        }
+        h.set_branch(&th, "main", tip);
+        let viewer = Viewer::default();
+        let a = ask(&th, &h, &viewer);
+        warm_up(&th, &h, &viewer);
+        let q = || BlameParams { path: path.clone(), follow: Some(true), ..Default::default() };
+        // What the whole walk down costs: unbounded, a diff budget of one.
+        forget_blames(&th, &h);
+        let whole = Limits { blame: BlameLimits { work: 1, walk: u64::MAX, ..BlameLimits::default() }, deadline: Duration::from_secs(120), ..Limits::default() };
+        let r = th.rt.block_on(query::blame(&h.hub, &a, q(), whole));
+        assert!(matches!(r, Err(Error::Api { code: "partial", .. })), "{r:?}");
+        let mut stuck = Vec::new();
+        for walk in [150u64, 400, 1_000] {
+            forget_blames(&th, &h);
+            let limits = Limits { blame: BlameLimits { walk, ..BlameLimits::default() }, deadline: Duration::from_secs(120), ..Limits::default() };
+            let mut seen = Vec::new();
+            let mut answered = false;
+            for _ in 0..200 {
+                match th.rt.block_on(query::blame(&h.hub, &a, q(), limits)) {
+                    Ok(v) => {
+                        assert_eq!(v["line_count"], 40);
+                        answered = true;
+                        break;
+                    }
+                    Err(Error::Api { code: "partial", .. }) => seen.push(progress(&th, &h)),
+                    Err(e) => panic!("{e:?}"),
+                }
+            }
+            println!("bug_1215: walk budget {walk}: answered {answered} after {} partial answers; (kept blames, cut walks) after each: {seen:?}", seen.len());
+            if !answered {
+                stuck.push((walk, seen.last().copied()));
+            }
+        }
+        assert!(stuck.is_empty(), "blames that never finished (walk budget, kept blames and cut walks after 200 requests): {stuck:?}");
+    }
+
+    /// Every row of a project's viewer graphs and file history, without
+    /// the project id (the same history in two projects compares equal).
+    fn dump(th: &TestHub, h: &Hist) -> (Vec<String>, Vec<String>) {
+        th.rt.block_on(async {
+            type G = (String, String, i64, i64, String, i32, String, String, Option<bool>);
+            let g: Vec<G> = sqlx::query_as(
+                "SELECT view_key, snapshot, generation, depth, parents, flags, skip, down_id, files FROM view_graph WHERE project_id = $1",
+            )
+            .bind(h.id)
+            .fetch_all(&h.hub.db)
+            .await
+            .unwrap();
+            type F = (String, String, i64, String, String);
+            let f: Vec<F> = sqlx::query_as("SELECT view_key, path_key, depth, snapshot, change FROM view_file_history WHERE project_id = $1")
+                .bind(h.id)
+                .fetch_all(&h.hub.db)
+                .await
+                .unwrap();
+            let mut g: Vec<String> = g.iter().map(|x| format!("{x:?}")).collect();
+            let mut f: Vec<String> = f.iter().map(|x| format!("{x:?}")).collect();
+            g.sort();
+            f.sort();
+            (g, f)
+        })
+    }
+
+    /// Guarantee 1 of the cycle-1 fixes (BUG-1210): rows an S13 server
+    /// left (graph rows, no mark, no file history), all of them or the
+    /// newest ones, filled again by several servers at once, are exactly
+    /// what one S14 fill writes: the same graph rows, all marked, and the
+    /// same file history.
+    #[test]
+    fn s13_rows_refilled_by_servers_at_once_equal_one_fill() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut answers = Vec::new();
+        // (servers refilling at once, rows left unmarked: all, or those
+        // above this generation)
+        for (parallel, above) in [(0usize, 0i64), (1, 0), (6, 0), (6, 25), (3, 40)] {
+            let mut h = Hist::new(&th, &policy_text, &bindings);
+            random_history(&th, &mut h, &mut Rng::new(37), 50);
+            let project = h.project(&th);
+            let tips: Vec<ObjectId> = h.branches.values().copied().collect();
+            let vs: Vec<Viewer> = viewers(1).into_iter().map(|(_, v)| v).chain([admin()]).collect();
+            for v in &vs {
+                th.rt.block_on(query::graph::extend(&h.hub, &project, v, &tips)).unwrap();
+            }
+            if parallel > 0 {
+                th.rt.block_on(async {
+                    sqlx::query(
+                        "DELETE FROM view_file_history f WHERE project_id = $1 AND EXISTS (SELECT 1 FROM view_graph g \
+                         WHERE g.project_id = f.project_id AND g.view_key = f.view_key AND g.snapshot = f.snapshot AND g.generation > $2)",
+                    )
+                    .bind(h.id)
+                    .bind(above)
+                    .execute(&h.hub.db)
+                    .await
+                    .unwrap();
+                    sqlx::query("UPDATE view_graph SET files = NULL WHERE project_id = $1 AND generation > $2").bind(h.id).bind(above).execute(&h.hub.db).await.unwrap();
+                });
+                h.hub.query.rows.clear();
+                th.rt.block_on(async {
+                    let mut set = tokio::task::JoinSet::new();
+                    for i in 0..parallel {
+                        for v in &vs {
+                            let (hub, project, v) = (h.hub.clone(), project.clone(), v.clone());
+                            let mut tips = tips.clone();
+                            if i % 2 == 1 {
+                                tips.reverse();
+                            }
+                            set.spawn(async move { query::graph::extend(&hub, &project, &v, &tips).await.unwrap() });
+                        }
+                    }
+                    while let Some(r) = set.join_next().await {
+                        r.unwrap();
+                    }
+                });
+            }
+            let d = dump(&th, &h);
+            assert!(d.0.iter().all(|r| r.ends_with("Some(true))")), "({parallel}, {above}): a row left unmarked");
+            answers.push(((parallel, above), d));
+        }
+        let (_, first) = &answers[0];
+        assert!(!first.0.is_empty() && !first.1.is_empty());
+        for (case, d) in &answers[1..] {
+            assert_eq!(d.0, first.0, "{case:?}: graph rows");
+            assert_eq!(d.1, first.1, "{case:?}: file history");
+        }
+    }
+
+    /// Guarantee 5 of the cycle-1 fixes (BUG-1211). `bug_1211_…` runs
+    /// migration 0015 on a database `db::migrate` already brought to 0015,
+    /// where `ADD COLUMN IF NOT EXISTS` does nothing, so it measures no
+    /// change to the table. Here the column is removed first (the table as
+    /// S13 left it, 300,000 rows), and the migration runs while S13 servers
+    /// go on writing and reading graph rows with S13's own statements: it
+    /// takes a small, size-independent time, and their statements fail at
+    /// most with errors they retry.
+    #[test]
+    fn migration_0015_adds_its_column_in_bounded_time_beside_s13_servers() {
+        const ROWS: i64 = 300_000;
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(4).build().unwrap();
+        let admin = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+        let name = format!("{}{}", std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_default(), unique("veil_m15c2_"));
+        rt.block_on(async {
+            let db = veil_server::db::connect(&admin, 1).await.unwrap();
+            sqlx::raw_sql(&format!("CREATE DATABASE {name}")).execute(&db).await.unwrap();
+            db.close().await;
+            let url = format!("{}/{name}", admin.rsplit_once('/').unwrap().0);
+            let db = veil_server::db::connect(&url, 8).await.unwrap();
+            veil_server::db::migrate(&db).await.unwrap();
+            sqlx::raw_sql("ALTER TABLE view_graph DROP COLUMN files").execute(&db).await.unwrap();
+            for chunk in 0..ROWS / 50_000 {
+                sqlx::query(
+                    "INSERT INTO view_graph (project_id, view_key, snapshot, generation, depth, parents, flags, skip, down_id, real_id) \
+                     SELECT g / 20000, 'k' || (g % 10), md5(g::text), g, g, '[]', 0, '[]', '', '' FROM generate_series($1::bigint, $2::bigint) g",
+                )
+                .bind(chunk * 50_000)
+                .bind(chunk * 50_000 + 49_999)
+                .execute(&db)
+                .await
+                .unwrap();
+            }
+            // S13 servers at work: their insert and their read.
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut s13 = tokio::task::JoinSet::new();
+            for w in 0..4i64 {
+                let (db, stop) = (db.clone(), stop.clone());
+                s13.spawn(async move {
+                    let (mut done, mut retried) = (0u64, 0u64);
+                    let mut i = 0i64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        i += 1;
+                        let snap = format!("s13-{w}-{i}");
+                        let r = sqlx::query(
+                            "INSERT INTO view_graph (project_id, view_key, snapshot, generation, depth, parents, flags, skip, down_id, real_id) \
+                             VALUES (999, 'k', $1, $2, $2, '[]', 0, '[]', '', '') ON CONFLICT DO NOTHING",
+                        )
+                        .bind(&snap)
+                        .bind(i)
+                        .execute(&db)
+                        .await
+                        .map(|_| ());
+                        let r = match r {
+                            Ok(()) => sqlx::query_scalar::<_, i64>("SELECT generation FROM view_graph WHERE project_id = 999 AND view_key = 'k' AND snapshot = $1")
+                                .bind(&snap)
+                                .fetch_optional(&db)
+                                .await
+                                .map(|_| ()),
+                            e => e,
+                        };
+                        match r {
+                            Ok(()) => done += 1,
+                            Err(e) => {
+                                let e = Error::from(e);
+                                assert!(e.is_retryable(), "an S13 statement failed for good during migration 0015: {e:?}");
+                                retried += 1;
+                            }
+                        }
+                    }
+                    (done, retried)
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Migration 0015 as `migrate_locked` applies it: in a
+            // transaction, again on a retryable error.
+            let sql = include_str!("../../migrations/0015_file_history_and_blame.sql");
+            let t = Instant::now();
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                let mut tx = db.begin().await.unwrap();
+                let r = sqlx::raw_sql(sql).execute(&mut *tx).await.map(|_| ());
+                let r = match r {
+                    Ok(()) => tx.commit().await,
+                    Err(e) => Err(e),
+                };
+                match r {
+                    Ok(()) => break,
+                    Err(e) if attempts < 50 => {
+                        let e = Error::from(e);
+                        assert!(e.is_retryable(), "migration 0015 failed: {e:?}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(e) => panic!("migration 0015 failed after {attempts} attempts: {e:?}"),
+                }
+            }
+            let took = t.elapsed();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let mut totals = Vec::new();
+            while let Some(r) = s13.join_next().await {
+                totals.push(r.unwrap());
+            }
+            let has: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'view_graph' AND column_name = 'files')")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            db.close().await;
+            let db = veil_server::db::connect(&admin, 1).await.unwrap();
+            let _ = sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")).execute(&db).await;
+            println!("migration 0015 over {ROWS} graph rows beside S13 servers: {took:?} in {attempts} attempt(s); S13 statements (done, retried) per server: {totals:?}");
+            assert!(has);
+            assert!(took < Duration::from_secs(10), "migration 0015 took {took:?} over {ROWS} rows");
+            assert!(totals.iter().all(|(done, _)| *done > 0));
+        });
+    }
+
+    /// Guarantee 3 of the cycle-1 fixes (BUG-1213): a history cursor the
+    /// server keeps fits in a URL and answers only the viewer (view key)
+    /// and project it was made for; another viewer, or the same history in
+    /// another project, gets `invalid cursor`, never the page.
+    #[test]
+    fn kept_history_cursors_answer_only_their_viewer_and_project() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let path = format!("pub/{}f.txt", format!("{}/", "d".repeat(99)).repeat(15));
+        let make = |th: &TestHub| {
+            let mut h = Hist::new(th, &policy_text, &bindings);
+            let mut f = Files::new();
+            f.insert(path.clone(), lines("base", 12));
+            let c0 = h.commit(th, &[root_snapshot_id()], f.clone(), [1; 16], 1_700_000_000_000, None);
+            let mut branches = Vec::new();
+            for i in 0..10usize {
+                let mut g = f.clone();
+                let mut body: Vec<String> = (0..12).map(|j| format!("base {j}\n")).collect();
+                body[i] = format!("branch {i}\n");
+                g.insert(path.clone(), body.concat().into_bytes());
+                branches.push(h.commit(th, &[c0], g, [10 + i as u8; 16], 1_700_000_001_000 + i as i64 * 1000, None));
+            }
+            f.insert(path.clone(), lines("merged", 12));
+            let m = h.commit(th, &branches, f, [99; 16], 1_700_000_100_000, None);
+            h.set_branch(th, "main", m);
+            h
+        };
+        let (h, other) = (make(&th), make(&th));
+        let anyone = Viewer::default();
+        for v in [&anyone, &admin()] {
+            warm_up(&th, &h, v);
+            warm_up(&th, &other, v);
+        }
+        let page = |h: &Hist, v: &Viewer, after: Option<String>| th.rt.block_on(query::history(&h.hub, &ask(&th, h, v), HistoryParams { path: Some(path.clone()), n: Some(1), after, ..Default::default() }, Limits::default()));
+        let first = page(&h, &anyone, None).unwrap();
+        let next = first["next"].as_str().unwrap().to_string();
+        assert!(next.starts_with("frontier-") && next.len() < 100, "a kept cursor: {next}");
+        assert!(page(&h, &anyone, Some(next.clone())).is_ok(), "its own viewer pages on");
+        for (who, r) in [("admin", page(&h, &admin(), Some(next.clone()))), ("another project", page(&other, &anyone, Some(next.clone())))] {
+            match r {
+                Err(Error::Api { code, message, .. }) => assert!(code == "bad_request" && message.contains("invalid cursor"), "{who}: {code} {message}"),
+                r => panic!("{who}: a kept cursor answered for someone it was not made for: {r:?}"),
+            }
+        }
+    }
+}

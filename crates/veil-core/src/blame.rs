@@ -862,4 +862,109 @@ mod tests {
             }
         }
     }
+
+    /// S14 cycle 2 (review): `map_lines` with its trimmed ends answers
+    /// exactly what it answered before the trim (the diff of the whole
+    /// texts within the work limit, the shared ends past it), on
+    /// adversarially repetitive texts: few distinct lines, runs of the
+    /// edge lines inside the middle, CRLF and bare CR, empty texts, a last
+    /// line without its newline; and on texts straddling the work limit,
+    /// where the coarse decision must equal `textmerge::fits` on the whole.
+    #[test]
+    fn s14c2_trimmed_map_lines_equals_the_whole_texts_diff() {
+        fn reference(old: &[u8], new: &[u8], n: usize) -> (Vec<Option<u32>>, bool) {
+            let a: Vec<&[u8]> = old.split_inclusive(|b| *b == b'\n').collect();
+            let b: Vec<&[u8]> = new.split_inclusive(|b| *b == b'\n').collect();
+            if !textmerge::fits(old, new) {
+                (ends_map(&a, &b, n), true)
+            } else {
+                (diff_map(old, new, n), false)
+            }
+        }
+        let mut seed = 0x51c2_7a3d_9e01_44b5u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        const TOKENS: [&str; 9] = ["a\n", "b\n", "a\r\n", "\n", "\r\n", "a", "a\r", "e\n", "e\r\n"];
+        let mut cases = 0;
+        for case in 0..40_000u64 {
+            let k = 1 + (rnd() % TOKENS.len() as u64) as usize;
+            let tok = |r: u64| TOKENS[(r % k as u64) as usize];
+            let edge = tok(rnd()).to_string();
+            let mid = |rnd: &mut dyn FnMut() -> u64| -> String {
+                let n = (rnd() % 12) as usize;
+                (0..n).map(|_| if rnd() % 3 == 0 { edge.clone() } else { tok(rnd()).to_string() }).collect()
+            };
+            let (pre, suf) = (edge.repeat((rnd() % 6) as usize), edge.repeat((rnd() % 6) as usize));
+            let base = format!("{pre}{}{suf}", mid(&mut rnd));
+            let mut old = base.clone();
+            let mut new = match rnd() % 4 {
+                0 => format!("{pre}{}{suf}", mid(&mut rnd)),
+                1 => String::new(),
+                _ => {
+                    // Edits of the base: blocks of the edge line or tokens,
+                    // inserted, deleted or replaced anywhere.
+                    let mut v: Vec<String> = base.split_inclusive('\n').map(str::to_string).collect();
+                    for _ in 0..1 + rnd() % 3 {
+                        let at = (rnd() as usize) % (v.len() + 1);
+                        let block: Vec<String> = (0..1 + rnd() % 3).map(|_| if rnd() % 2 == 0 { edge.clone() } else { tok(rnd()).to_string() }).collect();
+                        match rnd() % 3 {
+                            0 => {
+                                v.splice(at..at, block);
+                            }
+                            1 if at < v.len() => {
+                                let end = (at + 1 + (rnd() as usize) % 3).min(v.len());
+                                v.drain(at..end);
+                            }
+                            _ if at < v.len() => v[at] = block.concat(),
+                            _ => {}
+                        }
+                    }
+                    v.concat()
+                }
+            };
+            if case % 11 == 0 {
+                old.clear();
+            }
+            if case % 7 == 0 {
+                new.pop();
+            }
+            if case % 13 == 0 {
+                old.pop();
+            }
+            let n = line_ranges(new.as_bytes()).len();
+            assert_eq!(map_lines(old.as_bytes(), new.as_bytes(), n), reference(old.as_bytes(), new.as_bytes(), n), "{old:?} -> {new:?}");
+            cases += 1;
+        }
+        // Around the work limit: shared ends of repeated edge lines (which
+        // also occur in the middle, so the trim is cut back) around middles
+        // of two lines in random order, whose diff costs about the square
+        // of their length; the length straddles where `fits` flips.
+        let (mut coarse, mut fine) = (0, 0);
+        for len in (1_000..9_000).step_by(500) {
+            for ends in [3usize, 2_000] {
+                let pick = |r: u64| if r % 2 == 0 { "x\n" } else { "e\n" };
+                let o: String = (0..len).map(|_| pick(rnd())).collect();
+                let w: String = (0..len).map(|_| pick(rnd())).collect();
+                let e = "e\n".repeat(ends);
+                let (old, new) = (format!("{e}{o}{e}"), format!("{e}{w}y{e}"));
+                let n = line_ranges(new.as_bytes()).len();
+                let got = map_lines(old.as_bytes(), new.as_bytes(), n);
+                let want = reference(old.as_bytes(), new.as_bytes(), n);
+                assert_eq!(got.1, want.1, "coarse decision, {len} lines in the middle, {ends} at each end");
+                assert!(got == want, "mapping, {len} lines in the middle, {ends} at each end");
+                if got.1 {
+                    coarse += 1;
+                } else {
+                    fine += 1;
+                }
+                cases += 1;
+            }
+        }
+        assert!(coarse > 0 && fine > 0, "both sides of the limit: {coarse} coarse, {fine} fine");
+        assert!(cases > 40_000);
+    }
 }
