@@ -818,8 +818,9 @@ protocol as pure functions, shared with `vl`; they build for WASM),
 |---|---|---|
 | HTTPS API | tokio, axum, hyper, rustls (ring) | TLS on every connection; `--tls-cert/--tls-key`, or a self-signed certificate (rcgen) for `localhost`/`127.0.0.1` created in the data directory, which `vl login --ca FILE` pins for that server |
 | Metadata | sqlx, PostgreSQL 17 (development, CI) and YugabyteDB 2025.2 | portable SQL only; read-check-write transactions are SERIALIZABLE through `db::serializable`, except where unique keys and row locks decide the races (branch moves, sign-in, project and group creation, group changes: READ COMMITTED, because on YugabyteDB a SERIALIZABLE read blocks every insert into the table it read until it commits, BUG-847); retried with capped exponential backoff on `40001`/`40P01` (YugabyteDB reports conflicts as both) |
-| Migrations | `db::migrate`, `migrations/0001_initial.sql`, `0002_device_vouches.sql` (pending devices, vouches: §13.11), `0003_invites_and_key_sharing.sql` (invites, key requests, pending devices by fingerprint and the fingerprints a person waits for, devices barred from one project: §13.12) | each in its own transaction, recorded in `schema_migrations`; servers starting together race on its primary key and the loser re-checks. On PostgreSQL DDL is transactional; on YugabyteDB DDL inside a transaction block is applied statement by statement unless transactional DDL is enabled, so **migration files are idempotent** (`IF NOT EXISTS`) and a half-applied one is completed by the next start |
-| Object storage | `store::BlobStore`: `FsStore` (a directory; unit tests, development) and `S3Store` (rusty-s3 request signing + reqwest; tested against MinIO) | key `p/<project id>/ab/cdef…`: projects never share an object; objects are stored compressed (zstd) when that is smaller, under the id of the uncompressed object (S27, §13.13); every read is decoded, bounded, and re-hashed against its id; an in-memory cache of objects (as stored) and decoded trees (256 MiB each, decoded trees weighed by the memory they hold: BUG-860). Every S3 request is idempotent (GET, HEAD, PUT of a key naming its content) and is tried again for up to 10 s, with jittered waits doubling from 25 ms to 1 s, when its connection closes or resets or the store answers 5xx or 429 (BUG-1005); idle connections are dropped after 15 s, before S3 services drop them (BUG-861) |
+| Migrations | `db::migrate`, `migrations/0001_initial.sql`, `0002_device_vouches.sql` (pending devices, vouches: §13.11), `0003_invites_and_key_sharing.sql` (invites, key requests, pending devices by fingerprint and the fingerprints a person waits for, devices barred from one project: §13.12), `0006_access_epochs.sql` (access epochs and the triggers that bump them: §13.14) | each in its own transaction, recorded in `schema_migrations`; servers starting together race on its primary key and the loser re-checks. On PostgreSQL DDL is transactional; on YugabyteDB DDL inside a transaction block is applied statement by statement unless transactional DDL is enabled, so **migration files are idempotent** (`IF NOT EXISTS`) and a half-applied one is completed by the next start |
+| Object storage | `store::BlobStore`: `FsStore` (a directory; unit tests, development) and `S3Store` (rusty-s3 request signing + reqwest; tested against MinIO) | key `p/<project id>/ab/cdef…`: projects never share an object; objects are stored compressed (zstd) when that is smaller, under the id of the uncompressed object (S27, §13.15); every read is decoded, bounded, and re-hashed against its id; an in-memory cache of objects (as stored) and decoded trees (256 MiB each, decoded trees weighed by the memory they hold: BUG-860). Every S3 request is idempotent (GET, HEAD, PUT of a key naming its content) and is tried again for up to 10 s, with jittered waits doubling from 25 ms to 1 s, when its connection closes or resets or the store answers 5xx or 429 (BUG-1005, BUG-1053); idle connections are dropped after 15 s, before S3 services drop them (BUG-861) |
+| Memory allocator | jemalloc (`tikv-jemallocator`, pinned), the `veil-server` binary's only | two arenas, background purging, 1 s decay (`src/main.rs`; `_RJEM_MALLOC_CONF` overrides them): glibc's arena per thread held 2-3x the server's data (BUG-864; `docs/design/scale/BASELINE.md`, "The server's allocator"). **Building the server needs `make` and a C compiler** (jemalloc is built from source) |
 | Server identity | an Ed25519 `Identity` in `<data>/hub-identity.json` (0600); a random secret in `<data>/hub-receipt-key` (0600) | signs projected snapshots (§13.4); its key is shown by `vl login`. The secret keys upload receipts (§13.5); servers sharing the data directory accept each other's |
 
 **YugabyteDB's licence (checked 2026-11-06).** The `LICENSE.md` shipped in
@@ -911,7 +912,9 @@ quay.io; the tests use the MinIO server binary packaged as
   | force a branch move, delete a branch | admins |
 
 * **Every check is on the server, on every request**; removing someone
-  takes effect on their next request.
+  takes effect on their next request, on every server: servers cache
+  sessions and permissions, but check them against the access epochs on
+  every request (§13.14).
 
 ### 13.4 History for someone without access: projected history (§5.4, §12.1 Q1, decided)
 
@@ -960,11 +963,12 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 
 | Route | |
 |---|---|
-| `GET /v1/projects/{p}/tips` | branches → tips as the caller sees them (projections) |
-| `POST …/history {tips, stop}` | the caller's projected snapshots from `tips` down to `stop`, as object frames (`id ‖ len u32be ‖ object`); to a caller that accepts encoded frames, each object as stored, compressed or not (§13.13) |
-| `POST …/fetch {snapshot, objects: [{path, id, snapshot?}]}` | objects by id, each with the path where the client met it under that snapshot (its own `snapshot`, or the request's); the server walks the viewer's projection of that snapshot to that path and serves the object only if it is there (as stored, to a caller that accepts encoded frames: §13.13). No list of what the client has; each request names an immutable object, so a per-viewer cache can serve it |
-| `POST …/objects` | upload object frames, plain or encoded (§13.13): decoded (bounded), re-hashed, canonically decoded, format-checked, stored compressed when that is smaller; invisible until a push reaches them. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id) |
+| `GET /v1/projects/{p}/tips` | branches → tips as the caller sees them (projections); the branch rows may be up to 100 ms old (§13.14) |
+| `POST …/history {tips, stop}` | the caller's projected snapshots from `tips` down to `stop`, as object frames (`id ‖ len u32be ‖ object`); to a caller that accepts encoded frames, each object as stored, compressed or not (§13.15) |
+| `POST …/fetch {snapshot, objects: [{path, id, snapshot?}]}` | objects by id, each with the path where the client met it under that snapshot (its own `snapshot`, or the request's); the server walks the viewer's projection of that snapshot to that path and serves the object only if it is there (as stored, to a caller that accepts encoded frames: §13.15). No list of what the client has; each request names an immutable object, so a per-viewer cache can serve it |
+| `POST …/objects` | upload object frames, plain or encoded (§13.15): decoded (bounded), re-hashed, canonically decoded, format-checked, stored compressed when that is smaller; invisible until a push reaches them. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id) |
 | `POST …/push {updates: [{branch, expected, new}], force, receipts}` | complete and check every new snapshot, then move the branches in **one serialisable transaction of compare-and-swaps** (`UPDATE branches SET target = new WHERE … AND target = expected`); one lost race rejects the whole push with 409 and `vl` retries |
+| `POST …/changes {base, edits, onto?, change_id?, receipts}` | a commit through the API, without a checkout (S10, §13.13) |
 | `GET …/access?path=` | the deciding line and who it names; only for a path the caller may read |
 | `…/groups`, `GET|POST …/rings/{scope}`, `GET /v1/people/{name}/devices` | groups; key rings of secret scopes; a person's devices (active, the newest pending, removed), the vouches and invite joins the server stores, which devices check before sharing a key (§13.11, §13.12) |
 | `POST /v1/devices/vouch {device, signature}` | the signed-in device vouches for another device of its person; a pending one becomes active |
@@ -1008,7 +1012,9 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
   push never confirms a guess of a hidden file or folder: BUG-824),
   8 (§13.6), 10 (every
   new snapshot signed by a registered device key) and 12 (fast-forward
-  unless an admin forces) are built. Embargoed merges are refused in S1. Not built: 9 (the server-side secret scan), 11, 13.
+  unless an admin forces) are built. Embargoed merges are refused in S1.
+  9 (the server-side secret scan) is built by S10 (§13.13), for pushes and
+  commits through the API alike. Not built: 11, 13.
 * **What a push uploads** (`hub::push`, `hub::Introduced`): every new
   snapshot and, at each path where its tree differs from all of its
   parents' trees, the trees down to that path and what the entry there
@@ -1497,7 +1503,243 @@ secrets, §3.1), unless a row says otherwise. Each row is tested in
   until the person confirms the fingerprint; this is the price of never
   trusting a ring on the server's word.
 
-### 13.13 S27: compressed objects in storage and on the wire
+### 13.13 S10: commits through the API
+
+Built 2026-11-07 (`crates/veil-server/src/changes.rs`; the messages in
+`veil_core::hub::changes`; `vl change new`). Design: phase 2 §5.5
+(`docs/design/server/phase-2-thin-clients.md`).
+
+```text
+POST /v1/projects/{p}/changes
+{ "base": "<snapshot id as the caller sees it>",
+  "change_id": "<optional: a new revision of a change of yours made here>",
+  "description": "…",
+  "edits": [ {"path": "src/a.rs", "put": {"text": "…", "executable": false}},
+             {"path": "src/b.bin", "put": {"object": "<id>"}},          // uploaded first, with its receipt
+             {"path": "src/old.rs", "delete": true} ],
+  "receipts": {"<id>": "<receipt>"},
+  "onto": {"branch": "main", "expected": "<tip id>" | "rebase"} }      // optional
+→ { "change_id", "snapshot": "<as the caller sees it>",
+    "branch": {"branch", "status": "ok" | "rejected", "message"?, "tip"?, "rebased": n},
+    "warnings": […] }                                                     // an admin's access change, listed
+```
+
+* **The same checks as a push, by the same code.** The server applies the
+  edits to the caller's projection of `base` (the tree their own `vl` would
+  push), then runs the push's per-snapshot checks on it
+  (`sync::complete`): the graft onto the full tree, so nothing the caller
+  cannot see is touched; write access for every edited path; access lines
+  changed only by admins, against the actual parent (the authority is the
+  accepted policy); closure (an object that is not the caller's upload, nor
+  the entry at that path in the caller's **view** of `base`, gets the answer
+  a missing one gets, before anything reads it, so a guess of a hidden
+  file's content is never confirmed: BUG-1050); personal keys refused;
+  secret paths only as ciphertext; check 9 below. A move of the default
+  branch accepts its policy only when the branch moves and only from an
+  admin, with the same listing of who can now see what; anyone else's
+  change of access lines is kept, `rejected` (BUG-1051).
+* **Check 9, the server-side secret scan** (also for pushes): every new
+  plain-text file, symlink and conflict term is scanned with the scanner `vl` uses
+  (`veil_core::secrets::scan`); a hit refuses the change. The error names
+  the path, the rule and the line, never the text. `public!` turns it off
+  only where the **accepted** policy (an admin's) says so, or in an admin's
+  own change: anyone may turn `public` into `public!`, which is the same
+  access. A push of old history recorded under an older scanner can now be
+  refused where today's scanner finds something.
+* **Inline text is held in memory until every check passed** (`Source::pending`),
+  so a refused plain-text secret is never stored. (An object uploaded
+  through `POST …/objects` is stored at upload, as for pushes: BUG-930.)
+* **Labels are claims:** an uploaded object's entry takes its kind, size and
+  label from the object (a sealed envelope is a secret of its scope, a blob
+  is plain); anything else is refused. As in every push (format 8), a sealed
+  object is accepted only as a secret: at a secret file's path, or as
+  content that descends from a secret (a renamed secret, which `vl` keeps
+  sealed), by the rule `vl upgrade` checks (`policy::sealed_secret`).
+* **The snapshot** is signed by the server's key; its author is the caller.
+  Other viewers get the same projections as for any pushed snapshot (§13.4);
+  the caller's own projection is worked out before the commit and recorded
+  with it.
+* **One database commit per API commit** (`storage-and-cost.md` §3): the
+  snapshot row, the caller's projection memo, the change ref, the audit row
+  and, with `onto`, the one-row compare-and-swap of the branch (and an
+  admin's policy) are one READ COMMITTED transaction. Objects are stored
+  before it, at most 64 at a time (BUG-1053). A non-admin's one-file change stores 6 objects (the blob, the
+  full trees on its path, the snapshot and the caller's projection).
+* **Change refs** (`change_refs`, migration 5): every change made this way
+  is kept under its change id, whether or not a branch moved, and is a
+  `base` like any snapshot. Only its creator makes a new revision of it
+  (`change_id`); the new snapshot names the previous one as predecessor.
+* **`onto`.** `expected` is the push's compare-and-swap, judged on the
+  caller's view: the move is refused (the change is still kept) unless the
+  branch's tip is that snapshot as the caller sees it, and `base` is that
+  tip or a stack of up to 64 of the caller's own unlanded changes on it,
+  each writing only paths they may still write. When changes the caller
+  cannot see landed under the stack, the server makes the caller's changes
+  again on the real tip (each their view grafted onto the new parent, with
+  the push's checks); the caller sees them with the same ids, so nothing
+  tells them a hidden change landed (BUG-1054). `"rebase"`: when the tip
+  is not `base`, the server applies the edits to the tip instead, provided the
+  entry at every edited path, and whether each folder above it is a folder,
+  is the same in `base` and the tip; it tries again on a lost race, up to 5
+  times, then answers `rejected`. Each try reads the accepted policy and
+  the caller's access again. **The change is its edits:** applied to
+  another tip, it never carries what `base` had and the tip has not (to
+  stack on an unlanded change, use `expected`).
+* **Limits:** 10,000 edits, 64 MiB of inline text (and the 64 MiB body
+  limit), paths of at most 4,096 bytes with at most 1,024 folders above the
+  file (`MAX_TREE_DEPTH`, a tree's own limit; every server thread has a
+  stack for walks that deep: BUG-1052), in Unicode NFC,
+  each component a valid entry name (no `..`, `.`, empty, NUL or any
+  spelling of `.veil`); two edits of one path, or of a file and something
+  below it, are refused; a delete names an existing file.
+* **`vl change new [PROJECT] --edits FILE.json [--base ID] [-m MSG]
+  [--onto BRANCH [--expected ID]] [--change ID]`** sends the list. In a
+  clone of the project it seals secret files with the clone's keys
+  first (outside one, it refuses to send them), and it scans every
+  ordinary file itself, so a secret never leaves the device.
+* **Measured** (`docs/design/scale/LOAD.md`, "Commits through the API"):
+  one file by one agent, p50 7.4 ms as the client sees it, 2.7 ms of
+  server CPU, 13 statements and 1 commit (a push: 10.7 ms, 34 statements,
+  3 commits); 1,000 landings/s across 100 projects (pushes: 283–547);
+  into one `main` with 50 agents, 20/s at p99 95 ms, peaking near 35/s,
+  short of phase 2's 100/s (each lost race rebuilds the change; S17
+  batches).
+
+Threat review (phase 2 §6, rows 11–13, and what S10 adds):
+
+| # | Attacker | Capability | Harm | Mitigation | Test (`server_hub` `changes`) |
+|---|---|---|---|---|---|
+| 1 | A member | edits outside their folders, at the private root, in a nested hidden folder; deletes a hidden file | writes where they may not, or learns a hidden name exists | the push's graft and write check; a hidden file and a missing one get the same "nothing at" | `an_api_commit_is_refused_whatever_a_push_refuses_and_stores_nothing` |
+| 2 | A member | edits `.veilpolicy`'s access lines; turns `public` into `public!` | gains access, or turns the scan off | the push's access-line check against the parents; the scan's exemption needs the accepted policy or an admin | same, and `the_secret_scan_is_off_only_where_the_accepted_policy_says_public_bang` |
+| 3 | A member, or a hostile API client | sends a plain-text `.env`, a token in an ordinary file, a personal key | a secret stored in the clear, or echoed in an error, log or JSON | checks 8 and 9; inline text is stored only after the checks; errors name the rule and line only | same (the blobs are not in the store; the answers lack the secret) |
+| 4 | A member | `put.object` names a hidden blob's id (from an old grant, a log) | copies a hidden file into their folder, or confirms it exists | an object without the caller's receipt that is not the entry at that path in `base` gets the missing answer, before it is read | same (a hidden id and a random one get the same answer) |
+| 5 | A member | `base` is the real id of a snapshot they see only part of | a graft on content they cannot see, or a confirmation of the real id | `base` must equal the caller's projection of the real snapshot it resolves to | same (404) |
+| 6 | Hostile API client | `..`, NUL, `.veil` and its spellings, non-NFC names, 1,100 levels, 10,001 edits, 64 MiB + 1 of text, overlapping or duplicate edits, unknown fields, a snapshot id as a file | a corrupt tree, or work quadratic in the input | the request limits; each component checked with the tree's own name check; one pass per path for overlaps and rebases | `hostile_edit_lists_are_refused` |
+| 7 | Racing agents | `rebase` onto one `main` | a change lost, landed twice, or applied over a newer edit of its file | reapplied only when every edited path is unchanged; the branch moves only by the compare-and-swap, in the same transaction as the change's rows | `rebase_lands_every_racing_change_once_with_exactly_its_edits` (50 agents: each landed once, each landed snapshot's diff is exactly its edit) |
+| 8 | Another person | `change_id` of someone else's change | rewrites their change | revisions only by the change ref's creator (also in the upsert itself) | `expected_tips_and_revisions_of_a_change` |
+| 9 | Anyone on Earth | calls the route signed out | commits | 401; a participant is required | `an_api_commit_is_refused_…` |
+
+### 13.14 S4: request-path caches and one commit per push (as built)
+
+Milestone S4 (`docs/design/server/phase-2-thin-clients.md` §9,
+`storage-and-cost.md` §3–5, §9). Code: `caches.rs`, `auth.rs` (`Caller`),
+`perm.rs` (`open`), `sync.rs` (`projected`, `resolve`, `tips`, `push`),
+`migrations/0006_access_epochs.sql`.
+
+**What each server keeps in memory** (LRU caches with byte budgets; never
+in the database):
+
+| Cache | Key → value | Kept fresh by |
+|---|---|---|
+| sessions | token hash → person, device, expiry | the person's access epoch, read on every request; the expiry |
+| projects | name → accepted policy, bindings, default branch | the project's access epoch, read on every request |
+| permissions | (project, person, device) → admin, groups, device barred | both epochs |
+| snapshot resolution | (project, id) → committed; (project, view key, real) → projected; (project, view key, projected) → real | nothing: these facts never change (rows are never deleted or rewritten; a view key is a hash of what its viewer may read) |
+| branch tips | project → branch rows | a notice from every push (`NOTIFY`), or at most 100 ms |
+
+**Access epochs: never stale, on any server.** `access_epochs` holds an
+epoch per person (`(0, person)`: their sessions, devices, admin rights,
+group memberships, device bars) and per project (`(project, 0)`: its
+accepted policy, bindings and groups). **Each change sets its key's epoch
+to a fresh random value** (60 bits from `gen_random_uuid()`, never 0 and
+never the previous value), not a count: an epoch carried to a client shows
+neither how many changes happened nor when (BUG-1081). Only equality is
+compared. A bump writes only its own key's row; there is no server-wide
+row. S5's read grants use the same epochs (void unless equal to the
+current ones). **Triggers** on `group_members`,
+`project_admins`, `sessions`, `people`, `devices`, `device_bars`,
+`projects` and `groups` bump them in the transaction of the change itself,
+whatever route (or operator) makes it, so a route written later cannot
+forget. **Every request reads its two epochs** in one statement of two
+primary-key lookups (the session check reads them; it learns the project's
+id from the path), and a cached session or permission is used only if it
+was built under exactly those epochs. An entry is built by reading the
+epochs first and the records after, or both in one statement, so it is
+never tagged with an epoch set after what it holds was read.
+
+*What a read grant can rely on (S5):* (1) an entry records the epochs read
+before its rows, and `perm::open_at` returns them with the view, so a grant
+made from it carries those, never a later read of the epochs; (2) an entry
+is used only while its person's and project's epochs equal its recorded
+ones; (3) permission entries are per device (a bar is the device's);
+(4) nothing else that decides a view (policy text and bindings, groups,
+admin rows, devices, sessions) is cached outside such an entry
+(`a_view_carries_the_epochs_it_was_built_under`).
+
+*How staleness is bounded:* a change commits together with its new epoch;
+any request that starts after the commit reads it, misses every entry
+built under an earlier one (a random value repeats an earlier one with
+negligible odds: 2^-60 for each pair), and reads the database. So a cached decision is the
+one the database gives at the moment of the request: **staleness is zero**,
+for removals from a group, policy changes, deleted groups, admin rights,
+device bars and removals, and ended sessions (there is no sign-out route;
+deleting a session row, as device removal does, is one). A request already
+running when the change commits finishes as it would have without caches.
+Tested with two servers on one database (`server_hub` `caches`): each kind
+of change through either server or straight in the database, and readers
+hammering both servers while an admin removes them (every request started
+after the removal returned was refused). Dropping one trigger makes both
+tests fail.
+
+**Snapshot resolution** answers from memory what never changes; every
+answer is still projected for the asker's current view, so it grants
+nothing. **A resolution is per view:** for a viewer, a projected id
+stands for a real snapshot whose projection *for that viewer's view key*
+is that id (any of them gives that viewer the same tree and history);
+another view's real snapshot for the same id is never used, since the
+same projected id can stand for different real snapshots in different
+views (BUG-915). Without one for the asker's view, the database lists every
+real snapshot the id stands for. A push resolves parents from the database
+(newest first) or from the branch tips it reads.
+
+**Bounded by bytes, and by limits** (BUG-913). Every entry is weighed by
+what it holds (strings, a parsed policy's rules, a view's group set, branch
+rows, plus the cache's own bookkeeping), never counted as one, since its
+size is the asker's to choose. Budgets: sessions 16 MiB, projects 32 MiB,
+permissions 32 MiB, snapshot resolution 64 MiB, branch tips 32 MiB (about
+176 MiB in all); an entry heavier than its cache's budget is not kept.
+Expired tip rows are freed as time passes. Server limits that bound what
+one entry can hold: **10,000 branches per project** and **1,000 branch
+updates per push** (`sync::MAX_BRANCHES`, `MAX_PUSH_UPDATES`), and **1,000
+groups per project** (`perm::MAX_GROUPS`); each is checked against the
+records when the request begins, so concurrent requests may each add up to
+the bound.
+
+**Branch tips.** A pull may see a tip up to **100 ms** old, as
+`phase-2-thin-clients.md` §5.1 allows; rows read before a push's notice are
+never kept after it. A push never trusts the cache: it reads the branches
+and compares and swaps in the database. Notices: PostgreSQL delivers
+`NOTIFY` (another server saw a push within 5–15 ms in the tests);
+**YugabyteDB 2025.2 does not by default** (`ysql_yb_enable_listen_notify`
+is off), which the server detects at start (it sends itself a notice), and
+tips then expire after 100 ms only. Its change feed is not used.
+
+**One database commit per push.** The push's transaction writes the branch
+compare-and-swaps, the accepted policy, the snapshot and origin rows, the
+pusher's projection memo of what it moved (worked out before the
+transaction, as it will read after the commit) and the audit row, and sends
+the notice. A push whose every update is refused commits nothing
+(BUG-910), and a push records only the snapshots of the updates that land
+(BUG-914). Other viewers' projections are worked out when they first ask,
+as before; a reader never gets an unprojected answer. A push reads only the
+signing keys its snapshots name, not every device.
+
+**Cost** (`veil-bench load`, `docs/design/scale/LOAD.md`): a landing's
+push is 1 commit (3 before) and its request path 15 statements (34 before);
+S12's deriver adds about 4 commits and 16 statements in the background. An
+up-to-date pull is 1 statement (6); a request with warm caches 1 statement
+(its epochs). **Gates** in
+`veil-bench load`: at most 1 commit per landing, at most 5 statements per
+up-to-date pull. A pull that brings new snapshots makes one request per
+tree level (7 for the load test's agents), each reading its epochs, so it
+costs about 8 statements: under the hard rule that every request is decided
+on current access, fewer statements per such pull needs fewer requests per
+pull (S3), not a staler check.
+
+`veil-server` writes its counters (storage writes and reads, cache hits and
+misses) to `DATA/stats.json` at start and on `SIGUSR1`, for the benchmarks.
+
+### 13.15 S27: compressed objects in storage and on the wire
 
 Built on `integration` @ `f7e9aac` (2026-11-07), as
 `docs/design/server/storage-and-cost.md` §6 asks. Code:
@@ -1619,3 +1861,4 @@ server cannot read objects stored compressed (they fail its hash check,
 compressed objects, revert by making `encoding::encode` return its input
 (one line): the server then stores and sends plain objects, and keeps
 reading both kinds.
+

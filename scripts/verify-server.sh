@@ -69,10 +69,11 @@ start_services() {
   # servers and connection pools; shared runs can overlap, so allow plenty.
   running "$PG" || { D rm -f "$PG" >/dev/null 2>&1; D run -d --name "$PG" -e POSTGRES_PASSWORD=veil -e POSTGRES_USER=veil -e POSTGRES_DB=veil -p 127.0.0.1::5432 "$PG_IMAGE" -c max_connections=1500 >/dev/null || return 1; }
   running "$S3" || { D rm -f "$S3" >/dev/null 2>&1; D run -d --name "$S3" -e MINIO_ROOT_USER=veilminio -e MINIO_ROOT_PASSWORD=veilminio-secret -p 127.0.0.1::9000 "$S3_IMAGE" >/dev/null || return 1; }
-  # Memory capped: a long-lived YugabyteDB otherwise grows toward most of the
+  # Memory capped, one tablet per table, no tablet-count limit: a long-lived
+  # YugabyteDB otherwise grows toward most of the
   # machine's memory (8 GB seen) while agents build beside it.
   running "$YB" || { D rm -f "$YB" >/dev/null 2>&1; D run -d --name "$YB" -p 127.0.0.1::5433 "$YB_IMAGE" bin/yugabyted start --background=false \
-    --tserver_flags=memory_limit_hard_bytes=3221225472 --master_flags=memory_limit_hard_bytes=1073741824 >/dev/null || return 1; }
+    --tserver_flags=memory_limit_hard_bytes=3221225472,ysql_num_shards_per_tserver=1 --master_flags=memory_limit_hard_bytes=1073741824,enforce_tablet_replica_limits=false >/dev/null || return 1; }
   PG_PORT=$(port "$PG" 5432) S3_PORT=$(port "$S3" 9000) YB_PORT=$(port "$YB" 5433)
   for i in $(seq 120); do D exec "$PG" pg_isready -U veil >/dev/null 2>&1 && break; sleep 1; done
   for i in $(seq 120); do curl -sf "http://127.0.0.1:$S3_PORT/minio/health/live" >/dev/null && break; sleep 1; done
@@ -149,8 +150,22 @@ step postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-pg-$
 step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-yb-$RUN "$BIN" --skip "$HOSTILE"
 # One at a time: on a database other runs share, three at once could keep
 # a statement past its timeout.
-STEP_LIMIT=2400 step hostile-postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-hpg-$RUN "$BIN" "$HOSTILE" --test-threads=1
-STEP_LIMIT=2400 step hostile-yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-hyb-$RUN "$BIN" "$HOSTILE" --test-threads=1
+# The hostile-size sets take about half an hour and touch only S12/S13's
+# derived data, so they run when this branch changes `derive/` or `query/`
+# (compared with `integration`), or when VEIL_VERIFY_HOSTILE=1 (always for
+# merges into `integration`). On the shared YugabyteDB they also run one at a
+# time machine-wide: two runs' hostile steps at once time out statements.
+hostile=${VEIL_VERIFY_HOSTILE:-auto}
+if [ "$hostile" = auto ]; then
+  base=$(git merge-base HEAD integration 2>/dev/null)
+  if [ -n "$base" ] && git diff --name-only "$base" HEAD -- crates/veil-server/src/derive crates/veil-server/src/query crates/veil-server/tests/server_hub/derived.rs | grep -q .; then hostile=1; else hostile=0; fi
+fi
+if [ "$hostile" = 1 ]; then
+  STEP_LIMIT=2400 step hostile-postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-hpg-$RUN "$BIN" "$HOSTILE" --test-threads=1
+  STEP_LIMIT=9000 step hostile-yugabyte flock -w 7200 "${XDG_RUNTIME_DIR:-/tmp}/veil-yb-hostile.lock" env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-hyb-$RUN "$BIN" "$HOSTILE" --test-threads=1
+else
+  echo "   skip  hostile sets (no derive/ or query/ changes; VEIL_VERIFY_HOSTILE=1 runs them)"
+fi
 
 echo "== concurrency under load (several copies at once)"
 load() { # url, bucket, copies (each copy bounded like a step)

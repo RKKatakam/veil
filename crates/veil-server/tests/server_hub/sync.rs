@@ -457,7 +457,7 @@ fn project_id(hub: &TestHub, name: &str) -> i64 {
         .unwrap()
 }
 
-/// S27 (`docs/HUB.md` §13.13): objects are stored compressed, under the id
+/// S27 (`docs/HUB.md` §13.15): objects are stored compressed, under the id
 /// of the uncompressed object, and travel compressed to a `vl` that reads
 /// encoded frames. A client from before (plain frames, no `Accept`) gets
 /// every object as it always did, and its plain uploads are compressed by

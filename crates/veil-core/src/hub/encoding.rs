@@ -1,5 +1,5 @@
 //! How the Veil server stores objects and sends them (`docs/HUB.md`
-//! §13.13, milestone S27): an object's **encoding** is either its canonical
+//! §13.15, milestone S27): an object's **encoding** is either its canonical
 //! encoding itself, or a zstd frame of it, told apart by the first byte.
 //!
 //! ```text

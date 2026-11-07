@@ -136,6 +136,7 @@ async fn s3_send(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, Byt
         let jitter = Duration::from_millis(u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1));
         let last = tokio::time::Instant::now() + wait + jitter >= deadline;
         match answer {
+            // 429: the store asks for fewer requests (BUG-1005, BUG-1053).
             Ok((status, body)) if !(status.is_server_error() || status.as_u16() == 429) || last => return Ok((status.as_u16(), body)),
             Err(e) if last || e.is_builder() => return Err(anyhow::Error::new(e).context(format!("S3 request failed {tries} times"))),
             _ => {}
@@ -219,6 +220,11 @@ pub struct Objects {
     store: Arc<dyn BlobStore>,
     /// Encodings, checked against their ids.
     cache: LruCache<Bytes>,
+    /// Requests to the store, for the benchmarks' cost gates
+    /// (`storage-and-cost.md` §9): writes, bytes written, reads.
+    pub writes: std::sync::atomic::AtomicU64,
+    pub written_bytes: std::sync::atomic::AtomicU64,
+    pub reads: std::sync::atomic::AtomicU64,
 }
 
 /// The largest object the store holds, decoded: the largest a frame
@@ -238,6 +244,9 @@ impl Objects {
         Objects {
             store,
             cache: LruCache::new(cache_bytes),
+            writes: Default::default(),
+            written_bytes: Default::default(),
+            reads: Default::default(),
         }
     }
 
@@ -262,7 +271,10 @@ impl Objects {
     pub async fn get(&self, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
         match self.cache.get(&Self::cache_key(project, id)) {
             Some(enc) => decoded(id, &enc).map(Some),
-            None => self.load(project, id, self.store.get(&object_key(project, id)).await?),
+            None => {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.load(project, id, self.store.get(&object_key(project, id)).await?)
+            }
         }
     }
 
@@ -273,6 +285,7 @@ impl Objects {
         if let Some(enc) = self.cache.get(&ck) {
             return Ok(Some(enc));
         }
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(enc) = self.store.get(&object_key(project, id)).await? else {
             return Ok(None);
         };
@@ -298,6 +311,7 @@ impl Objects {
         let Some(r) = self.store.get_blocking(&object_key(project, id)) else {
             return rt.block_on(self.get(project, id));
         };
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.load(project, id, r?)
     }
 
@@ -313,6 +327,8 @@ impl Objects {
 
     /// Store `enc`, an encoding of object `id` the caller has checked.
     pub async fn put_encoded(&self, project: i64, id: &ObjectId, enc: Bytes) -> Result<()> {
+        self.writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.written_bytes.fetch_add(enc.len() as u64, std::sync::atomic::Ordering::Relaxed);
         self.store.put(&object_key(project, id), enc.clone()).await?;
         self.cache.insert(Self::cache_key(project, id), enc.clone(), enc.len());
         Ok(())

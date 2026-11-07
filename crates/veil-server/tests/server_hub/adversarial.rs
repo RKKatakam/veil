@@ -491,13 +491,10 @@ fn a_later_device_is_confirmed_by_its_person() {
     thief.fails(thief.home.path(), &["login", &format!("veil://{}", hub.authority()), "--ca", hub.ca.to_str().unwrap()]);
     // Removing fin from their last group rotates the key away from both
     // devices, even one a compromised server leaves out of the list.
-    hub.rt
-        .block_on(
-            sqlx::query("UPDATE devices SET removed_at = 1 WHERE signing_key = $1")
-                .bind(laptop.identity().verifying_hex())
-                .execute(&hub.hub().db),
-        )
-        .unwrap();
+    // Straight in the database (a run again on a lost race: the trigger
+    // bumps an access epoch that concurrent changes may bump too).
+    let key = laptop.identity().verifying_hex();
+    crate::secrets2::sql(&hub, "UPDATE devices SET removed_at = 1 WHERE signing_key = $1", &[&key.as_str()]);
     let out = p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
     assert!(out.contains("rotated away"), "{out}");
     let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&p.dir)), None, "test").unwrap();
@@ -684,17 +681,12 @@ fn bug_836_a_removal_that_does_not_rotate_says_so() {
     // billing/ is finance's and security's.
     p.admin.ok(&p.dir, &["access", &format!("{BILL_DIR}/"), "finance", "security"]);
     // The server's records gain fin in `security` (no admin did that).
-    hub.rt
-        .block_on(
-            sqlx::query(
-                "INSERT INTO group_members (group_id, person_id) SELECT g.id, pe.id FROM groups g JOIN projects pr ON pr.id = g.project_id, \
-                 people pe WHERE pr.name = $1 AND g.name = 'security' AND pe.name = $2",
-            )
-            .bind(&p.name)
-            .bind(&p.fin.name)
-            .execute(&hub.hub().db),
-        )
-        .unwrap();
+    crate::secrets2::sql(
+        &hub,
+        "INSERT INTO group_members (group_id, person_id) SELECT g.id, pe.id FROM groups g JOIN projects pr ON pr.id = g.project_id, \
+         people pe WHERE pr.name = $1 AND g.name = 'security' AND pe.name = $2",
+        &[&p.name.as_str(), &p.fin.name.as_str()],
+    );
     let out = p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
     assert!(out.contains("not rotated") && out.contains("security"), "{out}");
 }

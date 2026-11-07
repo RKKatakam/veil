@@ -93,6 +93,10 @@ cargo install --locked --path crates/vl
 cargo build --release --locked        # binary at target/release/vl
 ```
 
+The Veil server (`cargo build --release --locked -p veil-server`) also
+needs `make` and a C compiler: it is built with jemalloc, from source
+(BUG-864).
+
 A static Linux binary, as releases ship it, needs the musl target and
 `musl-gcc` (Debian/Ubuntu package `musl-tools`):
 

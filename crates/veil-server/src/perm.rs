@@ -17,9 +17,12 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgConnection;
 use veil_core::hub::access::{AccessPolicy, View};
 
+use std::sync::atomic::Ordering;
+
 use crate::{
-    auth::Caller,
+    auth::{Caller, Person},
     error::{Error, Result},
+    Hub,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +72,10 @@ impl Project {
     }
 }
 
+/// Most groups one project may have (BUG-913): bounds what a person's view
+/// of it holds.
+pub const MAX_GROUPS: i64 = 1_000;
+
 pub fn valid_project_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -97,51 +104,133 @@ pub async fn load_project(c: &mut PgConnection, name: &str) -> Result<Option<Pro
     }))
 }
 
-pub async fn load_viewer(c: &mut PgConnection, project: i64, caller: &Caller) -> Result<Viewer> {
-    let Some(p) = &caller.person else {
-        return Ok(Viewer::default());
-    };
-    // One round trip: an admin? and is this device barred from the project
-    // (an admin removed it from this project only, BUG-843)?
-    let (admin, barred): (bool, bool) = sqlx::query_as(
+/// `person`'s view of `project` from the database, and whether an admin
+/// barred their device from it (BUG-843), in one statement.
+pub async fn load_viewer(c: &mut PgConnection, project: i64, person: &Person) -> Result<(Viewer, bool)> {
+    let (admin, barred, groups): (bool, bool, Vec<i64>) = sqlx::query_as(
         "SELECT EXISTS (SELECT 1 FROM project_admins WHERE project_id = $1 AND person_id = $2), \
-         EXISTS (SELECT 1 FROM device_bars b JOIN devices d ON d.id = b.device_id WHERE b.project_id = $1 AND d.signing_key = $3)",
+         EXISTS (SELECT 1 FROM device_bars b JOIN devices d ON d.id = b.device_id WHERE b.project_id = $1 AND d.signing_key = $3), \
+         ARRAY(SELECT g.id FROM groups g JOIN group_members m ON m.group_id = g.id WHERE g.project_id = $1 AND m.person_id = $2)",
     )
     .bind(project)
-    .bind(p.id)
-    .bind(&p.device_key)
+    .bind(person.id)
+    .bind(&person.device_key)
     .fetch_one(&mut *c)
     .await?;
-    if barred {
-        return Err(Error::forbidden(
-            "an admin removed this device from this project: use another of your devices (`vl identity confirm` a new one)",
-        ));
-    }
-    let groups: Vec<i64> = sqlx::query_scalar(
-        "SELECT g.id FROM groups g JOIN group_members m ON m.group_id = g.id WHERE g.project_id = $1 AND m.person_id = $2",
-    )
-    .bind(project)
-    .bind(p.id)
-    .fetch_all(&mut *c)
-    .await?;
-    Ok(Viewer {
-        person: Some(p.id),
-        admin,
-        groups: groups.into_iter().collect(),
-    })
+    Ok((
+        Viewer {
+            person: Some(person.id),
+            admin,
+            groups: groups.into_iter().collect(),
+        },
+        barred,
+    ))
 }
 
 /// A project and the caller's view of it. A project the caller can see
 /// nothing of is reported as not found, whether or not it exists.
-pub async fn open(db: &sqlx::PgPool, name: &str, caller: &Caller) -> Result<(Project, Viewer)> {
-    let mut c = db.acquire().await?;
+///
+/// Served from the server's caches when they were built under the access
+/// epochs this request read (`caches`): a group, admin, device, policy or
+/// binding change on any server bumps an epoch in its own transaction, so
+/// the answer is always the database's at the moment of the request.
+pub async fn open(hub: &Hub, name: &str, caller: &Caller) -> Result<(Project, Viewer)> {
+    open_at(hub, name, caller).await.map(|(p, v, _)| (p, v))
+}
+
+/// [`open`], with the access epochs the view was built under: read before
+/// its rows were. Anything issued from this view (a read grant) must carry
+/// these, never a later read of the epochs, so it can never be newer than
+/// the access it was decided on.
+pub async fn open_at(hub: &Hub, name: &str, caller: &Caller) -> Result<(Project, Viewer, crate::caches::Epochs)> {
     let not_found = || Error::not_found(format!("no project '{name}' that you can see"));
-    let project = load_project(&mut c, name).await?.ok_or_else(not_found)?;
-    let viewer = load_viewer(&mut c, project.id, caller).await?;
+    if !valid_project_name(name) {
+        return Err(not_found());
+    }
+    let stats = &hub.caches.stats;
+    let cached = hub.caches.project(name);
+    // The project's epoch as this request read it (the session check reads it
+    // when the project was cached), or now, before anything it is used for.
+    let project_epoch = match (&cached, caller.epochs.project) {
+        (Some(e), Some((id, epoch))) if e.project.id == id => Some(epoch),
+        (Some(e), _) => {
+            let p = caller.person.as_ref().map_or(0, |p| p.id);
+            crate::caches::read_epochs(&hub.db, p, Some(e.project.id)).await?.project.map(|(_, epoch)| epoch)
+        }
+        (None, _) => None,
+    };
+    let entry = match (cached, project_epoch) {
+        (Some(e), Some(epoch)) if e.epoch == epoch => e,
+        _ => {
+            // The row and its epoch in one statement.
+            let row: Option<(i64, String, String, String, String, i64)> = sqlx::query_as(
+                "SELECT id, name, default_branch, policy_text, policy_bindings, \
+                 COALESCE((SELECT epoch FROM access_epochs e WHERE e.project_id = projects.id AND e.person_id = 0), 0) \
+                 FROM projects WHERE name = $1",
+            )
+            .bind(name)
+            .fetch_optional(&hub.db)
+            .await?;
+            let (id, name, default_branch, policy_text, bindings, epoch) = row.ok_or_else(not_found)?;
+            let e = crate::caches::ProjectEntry {
+                project: Project {
+                    id,
+                    name,
+                    default_branch,
+                    policy: AccessPolicy::parse(&policy_text),
+                    policy_text,
+                    bindings: serde_json::from_str(&bindings).unwrap_or_default(),
+                },
+                epoch,
+            };
+            hub.caches.put_project(e)
+        }
+    };
+    let project = entry.project.clone();
+    let mut person_epoch = caller.epochs.person;
+    let viewer = match &caller.person {
+        None => Viewer::default(),
+        Some(p) => {
+            let fresh = |v: &crate::caches::ViewerEntry| v.project_epoch == entry.epoch && v.person_epoch == caller.epochs.person;
+            let v = match hub.caches.viewer(project.id, p).filter(|v| fresh(v)) {
+                Some(v) => {
+                    stats.permission_hits.fetch_add(1, Ordering::Relaxed);
+                    v
+                }
+                None => {
+                    stats.permission_misses.fetch_add(1, Ordering::Relaxed);
+                    // Read after both epochs were (by the session check, and
+                    // with the project row): never tagged newer than its data.
+                    let (viewer, barred) = load_viewer(&mut *hub.db.acquire().await?, project.id, p).await?;
+                    hub.caches.put_viewer(
+                        project.id,
+                        p,
+                        crate::caches::ViewerEntry {
+                            viewer,
+                            barred,
+                            project_epoch: entry.epoch,
+                            person_epoch: caller.epochs.person,
+                        },
+                    )
+                }
+            };
+            if v.barred {
+                return Err(Error::forbidden(
+                    "an admin removed this device from this project: use another of your devices (`vl identity confirm` a new one)",
+                ));
+            }
+            person_epoch = v.person_epoch;
+            v.viewer.clone()
+        }
+    };
     if !project.view(&viewer).sees_anything() && !project.participant(&viewer) {
         return Err(not_found());
     }
-    Ok((project, viewer))
+    let epochs = crate::caches::Epochs {
+        person: person_epoch,
+        project: Some((project.id, entry.epoch)),
+    };
+    Ok((project, viewer, epochs))
 }
 
 /// Bind every name of `policy`: to the project's group of that name if
@@ -176,6 +265,42 @@ pub async fn bind_names(c: &mut PgConnection, project: i64, policy: &AccessPolic
         out.insert(name, b);
     }
     Ok(out)
+}
+
+/// Accept `text` as the project's policy (the default branch moved to it,
+/// by an admin), binding its names ([`bind_names`]), inside the caller's
+/// transaction.
+pub async fn accept_policy(c: &mut PgConnection, project: i64, text: &str) -> Result<()> {
+    let policy = AccessPolicy::parse(text);
+    let bindings = bind_names(&mut *c, project, &policy).await?;
+    sqlx::query("UPDATE projects SET policy_text = $1, policy_bindings = $2, policy_version = policy_version + 1 WHERE id = $3")
+        .bind(text)
+        .bind(serde_json::to_string(&bindings).map_err(|e| Error::Other(e.into()))?)
+        .bind(project)
+        .execute(&mut *c)
+        .await?;
+    Ok(())
+}
+
+/// After [`accept_policy`], never silently: who can now see what, as the
+/// admin is told.
+pub fn accepted_listing(project: &Project) -> Vec<String> {
+    let mut out = Vec::new();
+    for r in &project.policy.rules {
+        let mut who: Vec<String> = Vec::new();
+        if r.public {
+            who.push("everyone on Earth (public, read)".into());
+        }
+        for n in &r.names {
+            who.push(match project.bindings.get(n) {
+                Some(Binding::Group(_)) => format!("group {n}"),
+                _ => format!("person {n}"),
+            });
+        }
+        out.push(format!("access accepted: {}/ → {}", r.path, who.join(", ")));
+    }
+    out.extend(project.policy.warnings.iter().cloned());
+    out
 }
 
 /// Is `person` a manager of `group`? The row is locked (`FOR SHARE`) for

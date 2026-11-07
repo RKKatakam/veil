@@ -608,6 +608,11 @@ impl Client {
         }
     }
 
+    /// A commit through the API (`POST …/changes`).
+    pub fn change(&self, req: &veil_core::hub::changes::ChangeRequest) -> Result<veil_core::hub::changes::ChangeResult> {
+        self.json("POST", &self.url.project_path("/changes"), Some(req))
+    }
+
     pub fn access(&self, path: &str) -> Result<AccessInfo> {
         let mut q = String::new();
         for b in path.bytes() {

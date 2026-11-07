@@ -5,8 +5,10 @@
 //! |---|---|
 //! | [`api`] | the HTTPS routes |
 //! | [`auth`] | challenge-response sign-in, session tokens |
+//! | [`caches`] | sessions, permissions, snapshot resolution and tips in memory, versioned by access epochs |
 //! | [`perm`] | the permission model: admins, groups, the accepted policy |
 //! | [`sync`] | projected history, fetch by id, push validation, branch CAS |
+//! | [`changes`] | commits through the API: edits on a revision, the push's checks, one commit |
 //! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
 //! | [`store`] | object storage: local directory or S3 |
@@ -14,6 +16,8 @@
 
 pub mod api;
 pub mod auth;
+pub mod caches;
+pub mod changes;
 pub mod db;
 pub mod derive;
 pub mod error;
@@ -26,6 +30,15 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use veil_core::{cache::LruCache, object::Tree, object::TreeEncoding, Identity};
+
+/// The stack of every thread that runs the server's work (the runtime's
+/// workers and blocking threads): enough for the walks that recurse once
+/// per folder level (projection, the graft, an API commit's edits) at
+/// `veil_core::tree::MAX_TREE_DEPTH` levels, the deepest a tree may be
+/// (BUG-1052). Whoever builds the runtime `start` runs on sets it
+/// (`main.rs`, the tests). Address space only: a thread uses what it
+/// touches.
+pub const THREAD_STACK: usize = 64 << 20;
 
 /// Shared server state.
 pub struct Hub {
@@ -43,6 +56,8 @@ pub struct Hub {
     /// The TLS certificate (leaf, DER): sign-in accepts only signatures
     /// for a server name it is valid for.
     pub certificate: rustls::pki_types::CertificateDer<'static>,
+    /// Request-path caches (`caches`): never stale for a permission.
+    pub caches: caches::Caches,
     /// The derive workers (`derive::landed`).
     pub derive: derive::Workers,
 }
@@ -150,12 +165,15 @@ pub async fn start(config: Config) -> Result<Running> {
         receipt_key,
         session_ttl_ms: config.session_ttl.as_millis() as i64,
         certificate,
+        caches: caches::Caches::default(),
         derive: derive::Workers::default(),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
     let (tx, rx) = tokio::sync::watch::channel(false);
     let app = api::router(hub.clone());
+    // Push notices drop other servers' cached tips (`caches::listen`).
+    tokio::spawn(caches::listen(hub.clone(), rx.clone()));
     let task = tokio::spawn(serve_tls(listener, tls, app, rx));
     if config.catch_up_at_start {
         tokio::spawn(derive::resume(hub.clone(), None));
