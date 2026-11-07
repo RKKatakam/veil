@@ -35,7 +35,7 @@ S1 is built. **S2** (secrets at scale: keys per access rule, background wrapping
 | S6 | 2 | The Veil daemon: shared object cache | S3, S5 |
 | S7 | 2 | The daemon's file watcher (`status`/`commit` without a scan) | S6 |
 | S8 | 2 | Workspaces that fetch on first read; the workspace socket for sandboxes | S3; phase 1's isolated sandboxes (S6 for the warm numbers) |
-| S9 | 2 | Regional cache | S5 |
+| S9 | 2 | Regional cache (built: `HUB.md` §13.18) | S5 |
 | S10 | 2 | Commits through the API (with the server-side secret scan): **built** (`HUB.md` §13.13) | S1 |
 | S11 | 2 | Agent sessions and attribution | S10, S8 |
 | S27 | 2 | Compressed objects (zstd) in storage and transport (`storage-and-cost.md` §6). **Built** (`HUB.md` §13.15) | S1 |

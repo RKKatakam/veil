@@ -322,6 +322,11 @@ pub struct BatchRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     pub wants: Vec<ChainWant>,
+    /// Ids of `wants` not to send: a regional cache forwarding a signed
+    /// request (whose signature covers every want) names those it served
+    /// itself. Unsigned: it can only make the answer smaller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip: Vec<ObjectId>,
 }
 
 /// `GET /v1/epochs?projects=a,b` (signed in): the current access epochs
