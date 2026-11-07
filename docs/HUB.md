@@ -2308,6 +2308,13 @@ at the server, with **no full graph**. Code: `veil-core/src/promisor.rs`
 | `vl log -n 20` in the thin clone (fetches history pages) | 5.5 s | 77 MiB | |
 | `vl status` in the thin clone, clean (3 runs) | 9.8, 1.4, 0.08 s | 115 MiB | |
 
+After review cycle 1 (BUG-1140..1145 fixed; same profile, 2026-11-07, load
+20.5 before (the quiet wait ran out) and 9.9 after): thin clone **7.6 s, 366
+MiB** client peak, 0.43 GB in `.veil`; full clone 67.1 s, 457 MiB; `log -n
+20` 4.7 s; `status` in the thin clone 8.9, 0.63, 0.09 s. Snapshot reads that
+page history in, and the fetch-ahead's byte-bounded batches, cost nothing
+measurable on these cases.
+
 * A thin clone's time and memory follow what it checks out (the tip's
   35,000 files), not the history: it holds 2 snapshots of 10,022.
 * The first `vl status` after a clone re-reads the files written within
