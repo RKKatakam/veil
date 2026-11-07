@@ -475,6 +475,9 @@ impl Ctx {
         // One recorder of this directory at a time (the lock-free op log
         // has no repository lock to serialise them).
         let _wc = self.lock_wc()?;
+        // A copy of a secret share this device would now seal for the
+        // folder's people never enters history (docs/HUB.md §13.17).
+        crate::share_cmd::hold_back_received(self);
         // A move of the directory that a previous command started and did
         // not finish (killed, disk full): finish it before recording
         // anything, or the half-moved directory would be recorded as the

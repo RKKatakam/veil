@@ -27,6 +27,7 @@ Code map:
 | `crates/veil-core/src/identity.rs` | identities, HPKE key wrapping (and the legacy sealed box), Ed25519 signatures |
 | `crates/veil-core/src/keychain.rs` | key generations, ring log (hash chain, signatures, genesis MAC); embargo records (plain, no cryptography) |
 | `crates/veil-core/src/team_vault.rs` | team-vault records: sealed entries, their signatures and who counts (C12) |
+| `crates/veil-core/src/secret_share.rs` | person-to-person secret shares: one secret file sealed for one person's devices, signed by the sharer's (C14) |
 | `crates/veil-core/src/store.rs` | which construction a repository writes (by repository format) and what it accepts |
 | `crates/veil-core/src/upgrade.rs` | the ring step of the migration to format 3 (HPKE), and the format-8 check |
 
@@ -388,6 +389,59 @@ and is trusted with code but never with secrets.
   server can withhold a rotation from one device: HUB.md §13.12, "Residual
   risks").
 
+### C14. Person-to-person secret shares — standard parts (C2, C3, C5), one key per version
+
+**Approved by the orchestrator under the owner's delegation, 2026-11-07**,
+as a construction from C2, C3 and C5.
+
+What it is for (`docs/HUB.md` §13.17): a member gives **one secret file**
+to **one other member**, without an admin, so that only that person's
+confirmed devices (and the sharing device) can open it, and the server,
+which stores it, cannot.
+
+* **Construction.** For each version the sharing device makes a fresh
+  32-byte key `K` (OS RNG). The file (at most 64 KiB) is sealed under `K`
+  with C2 (XChaCha20-Poly1305, random nonce), label `share:<id>#<version>`;
+  `K` is wrapped with C3 (HPKE base mode, `info = HPKE_KEY_WRAP_INFO`) to
+  each device, `aad = "wrap:" ‖ "share:<id>#<version>"`. `<id>` is
+  `BLAKE3-derive_key(HUB_SHARE_ID, len‖project ‖ len‖path ‖ len‖sharer ‖
+  len‖recipient)[..16]` (64-bit little-endian lengths). The record `{format,
+  project, path, sharer, recipient, version, at, signer, sealed, wraps}` is
+  signed by the sharing device (C5, context `hub-share`, over that exact
+  JSON, `ShareRecord::signing_body`, pinned by a unit test).
+* **Goal.** Only the devices wrapped for open the file: the recipient's
+  confirmed devices and the sharing device (which re-reads its own last
+  version to see whether its copy changed). The labels bind the sealed file
+  and each wrap to the share and the version, so neither moves to another
+  share, version or person; the signature binds the whole record to its
+  signer, project, path, sharer and recipient, so the server can change
+  nothing in it (it would no longer verify). No other key is involved: a
+  share holds no ring key, so it opens nothing but the one file.
+* **Why a key per version.** A device left out of a version (removed, or no
+  longer confirmed) opens no later version, without any rotation protocol:
+  each version is sealed afresh for the devices confirmed then.
+* **Who the devices are, and who the signer is, are not cryptographic
+  questions of C14.** The sharing device seals only for devices confirmed
+  outside the server (HUB.md §13.11, §13.12: a verified ring, the sharer's
+  fingerprint comparison, an invite join, a vouch by one of these); the
+  receiving device accepts a record only if its `signer` is a current
+  member, named as the sharer, of a key ring of this project it verifies
+  (C6, project-bound by C13). The server's lists are never enough for
+  either.
+* **Freshness.** The recipient's device refuses a version older than the
+  newest genuine one it saw (device-local memory). A server can withhold a newer
+  version (as for rings: TOFU freshness), never make one.
+* **New devices, the same content.** The sharing clone's background pass
+  seals a new version only of the content of its own last version (opened
+  with the sharing device's own wrap, signature and version checked), for
+  the recipient's current confirmed devices; a new content is sealed only
+  by an explicit `vl secret share`. Each version still has its own fresh
+  key.
+* **Not covered.** Taking back what a recipient already opened (an unshare
+  stops later versions only); a sharer leaking the file some other way
+  (trusted, §3.1 of HUB.md); a member's device holding the file's plaintext
+  after the share ends.
+
 ### C12. Team-vault records (all)
 
 * **Construction.** C2 (XChaCha20-Poly1305, random nonce) under the
@@ -488,18 +542,21 @@ are distinct and pins their exact bytes.
 | `SIG_CONTEXT_HUB_LOGIN` | `hub-login` | Ed25519 context (signing in to a Veil server, HUB.md §13.2) | C5 |
 | `SIG_CONTEXT_HUB_DEVICE` | `hub-device` | Ed25519 context (a device vouching for another device of its person, over X25519 ‖ Ed25519 public keys, HUB.md §13.11) | C5, C13 |
 | `SIG_CONTEXT_HUB_INVITE` | `hub-invite` | Ed25519 context (a join under an invite, by the invite's key, over `person ‖ 0 ‖ X25519 ‖ Ed25519` of the joining device, HUB.md §13.12) | C5, C13 |
+| `SIG_CONTEXT_HUB_SHARE` | `hub-share` | Ed25519 context (one version of a person-to-person secret share, by the sharing device, over `ShareRecord::signing_body`, HUB.md §13.17) | C5, C14 |
 | `HUB_VIEW_KEY` | `veil 2026 hub view-key v1` | BLAKE3 `derive_key` mode as a hash | server: projection cache key (not secret) |
 | `HUB_DEVICE_FINGERPRINT` | `veil 2026 hub device-fingerprint v1` | BLAKE3 `derive_key` mode as a hash (first 80 bits) | device fingerprint compared out of band (HUB.md §13.11) |
 | `HUB_UPLOAD_RECEIPT` | `veil 2026 hub upload-receipt v1` | BLAKE3 `derive_key` → keyed BLAKE3 (first 128 bits) | server: upload receipts over project ‖ person ‖ object id (HUB.md §13.5) |
 | `HUB_INVITE_KEY` | `veil 2026 hub invite-key v1` | BLAKE3 `derive_key` → Ed25519 seed | C13: an invite's signing key, from the link's 32 random bytes |
 | `HUB_PROJECT_FINGERPRINT` | `veil 2026 hub project-fingerprint v1` | BLAKE3 `derive_key` mode as a hash (first 80 bits) | C13: a project's fingerprint, over its id; in invite links and compared out of band (not secret) |
 | `POLICY_RULE_SCOPE` | `veil 2026 policy rule-scope v1` | BLAKE3 `derive_key` mode as a hash (first 80 bits) | the scope name `rule-<hex>` of an access line's secrets (not secret) |
+| `HUB_SHARE_ID` | `veil 2026 hub share-id v1` | BLAKE3 `derive_key` mode as a hash (first 128 bits) | C14: a share's id in its labels, over its project, path, sharer and recipient (not secret) |
 | `WRAP_LABEL_PREFIX` | `wrap:` | AEAD associated data | C3, C3L |
 | `PREV_KEY_LABEL_PREFIX` | `prev-key:` | AEAD associated data | C2 |
 | `EMBARGO_WRAP_LABEL_PREFIX` | `embargo-wrap:` | AEAD associated data | C2, C7 (retired in format 8: reserved, never reused) |
 | `EMBARGO_LABEL_PREFIX` | `embargo/` | AEAD associated data | C1, C2 (retired in format 8: reserved, never reused) |
 | `LOCAL_LABEL` | `local` | AEAD associated data | C2, C8 |
 | `VAULT_LABEL_PREFIX` | `vault:` | AEAD associated data | C2, C12 |
+| `SHARE_LABEL_PREFIX` | `share:` | AEAD associated data (and, after `wrap:`, HPKE aad; no scope name has a `:`) | C2, C3, C14 |
 | `GENERATION_SEPARATOR` | `#` | label syntax `<scope>#<key-id>` | C1, C2 |
 
 Signature contexts never contain NUL and are followed by `0x00`, so

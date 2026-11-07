@@ -88,6 +88,7 @@ pub mod revset;
 #[cfg(feature = "os")]
 pub mod sandbox;
 pub mod search;
+pub mod secret_share;
 pub mod secrets;
 pub mod selection;
 pub mod statcache;

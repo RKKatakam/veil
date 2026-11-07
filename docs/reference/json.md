@@ -17,6 +17,8 @@ text:
 | [`vl op log`](op.md#vl-op-log) | [`veil.op.log/1`](#veiloplog1) |
 | [`vl scan`](scan.md) | [`veil.scan/1`](#veilscan1) |
 | [`vl secret list`](secret.md#vl-secret-list) | [`veil.secret.list/1`](#veilsecretlist1) |
+| [`vl secret shares`](secret.md#vl-secret-shares) | [`veil.secret.shares/1`](#veilsecretshares1) |
+| [`vl secret share`](secret.md#vl-secret-share), [`vl secret unshare`](secret.md#vl-secret-unshare) (write commands) | [`veil.secret.share/1`](#veilsecretshare1) |
 | [`vl ls`](ls.md) | [`veil.ls/2`](#veills2) |
 | [`vl resolve --list`](resolve.md) | [`veil.resolve.list/2`](#veilresolvelist2) |
 | [`vl split`](split.md) (a write command) | [`veil.split/2`](#veilsplit2) |
@@ -442,6 +444,33 @@ the local vault's document has none of them:
 | `secrets[].timestamp_ms` | number | The same, in milliseconds since the epoch |
 | `secrets[].generation` | number | Key generation the value is sealed under |
 | `secrets[].stale_generation` | bool | Sealed under an old generation, after a revocation, by a writer whose key ring was out of date: the revoked member can read it. Set it again |
+
+## `veil.secret.shares/1`
+
+`vl secret shares --json`: the person-to-person secret shares you make and
+receive on the project's server (an admin: every share of the project;
+`docs/HUB.md` §13.17). Never a share's content. What is delivered to you on
+the way is reported on standard error.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.secret.shares/1` |
+| `shares` | array | By path, sharer and recipient: `path` (the secret file); `sharer`; `recipient`; `version` (moves on with every new version and at the end); `created_at`, `updated_at` (ms since the epoch, the server's clock); `unshared_at` (number or null: when the sharer ended it); `active` (bool: served to the recipient now); `paused` (string or null: why an unended share is not served, e.g. the sharer may no longer read the path) |
+
+## `veil.secret.share/1`
+
+`vl secret share PATH --with PERSON --json` and `vl secret unshare PATH
+--from PERSON --json`: what was done.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.secret.share/1` |
+| `action` | string | `shared` or `unshared` |
+| `path` | string | The secret file |
+| `recipient` | string | The person |
+| `version` | number | The share's version now |
+| `devices` | array of strings | Fingerprints of the recipient's confirmed devices this version is sealed for (empty for `unshared`) |
+| `unconfirmed` | array of strings | Fingerprints of their listed devices nothing confirms: not sealed for (`--confirm` one after comparing it with them) |
 
 ## `veil.ls/2`
 

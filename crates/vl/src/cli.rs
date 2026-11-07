@@ -551,7 +551,8 @@ pub enum Cmd {
     // ---- secrets & identities ---------------------------------------------
     /// Encrypted secrets: the device-local vault, or a scope's team vault
     /// (`--scope`), sealed for the scope's members (it does not sync
-    /// through the Veil server yet).
+    /// through the Veil server yet); and secret files shared from one
+    /// member to another (`share`, `unshare`, `shares`).
     #[command(subcommand)]
     Secret(SecretCmd),
     /// Run a command with vault secrets injected as environment variables.
@@ -931,6 +932,48 @@ pub enum SecretCmd {
     Import {
         /// Dotenv file to read.
         file: PathBuf,
+    },
+    /// Share one secret file (`.env`, …) with another member of the
+    /// project, without an admin.
+    ///
+    /// A copy of that one file is sealed on this device for the person's
+    /// confirmed devices only (confirmed outside the server, as for every
+    /// key): it opens nothing else of its folder. Run it again to send a new
+    /// version (an edit of the file alone sends nothing); devices they add
+    /// receive the current version automatically, until you unshare it.
+    /// Admins see that it is shared (who, what path, when), never what it
+    /// holds. Their
+    /// `vl pull` writes it at the same path, where it stays on their device
+    /// (and reaches their agents with `vl ws exec --with-isolated`).
+    Share {
+        /// The secret file, in the working copy.
+        path: String,
+        /// The person to share it with.
+        #[arg(long, value_name = "PERSON")]
+        with: String,
+        /// A device fingerprint of theirs you compared with them (needed
+        /// when no key ring records a device of theirs yet).
+        #[arg(long, value_name = "FINGERPRINT")]
+        confirm: Vec<String>,
+        #[command(flatten)]
+        out: JsonOut,
+    },
+    /// Stop sharing a secret file with a person: they get no later
+    /// version. What they already received stays theirs.
+    Unshare {
+        /// The secret file.
+        path: String,
+        /// The person you shared it with.
+        #[arg(long, value_name = "PERSON")]
+        from: String,
+        #[command(flatten)]
+        out: JsonOut,
+    },
+    /// List the secret shares you make and receive (admins: every share of
+    /// the project), never their content; receives what is new for you.
+    Shares {
+        #[command(flatten)]
+        out: JsonOut,
     },
 }
 

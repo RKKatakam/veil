@@ -7,6 +7,7 @@
 //! | [`auth`] | challenge-response sign-in, session tokens |
 //! | [`caches`] | sessions, permissions, snapshot resolution and tips in memory, versioned by access epochs |
 //! | [`perm`] | the permission model: admins, groups, the accepted policy |
+//! | [`shares`] | person-to-person secret shares (ciphertext and the admins' audit) |
 //! | [`sync`] | projected history, fetch by id, push validation, branch CAS |
 //! | [`changes`] | commits through the API: edits on a revision, the push's checks, one commit |
 //! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
@@ -22,6 +23,7 @@ pub mod db;
 pub mod derive;
 pub mod error;
 pub mod perm;
+pub mod shares;
 pub mod store;
 pub mod sync;
 pub mod tls;
