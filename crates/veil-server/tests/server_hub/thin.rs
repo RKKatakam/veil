@@ -1060,3 +1060,441 @@ fn a_thin_clone_answers_as_a_full_clone() {
         assert_eq!(normal(&got), normal(&want), "`vl {}` in a thin clone answers otherwise than in a full one", args.join(" "));
     }
 }
+
+// ---- S3 redesign review (cycle 1 of the revised design): `s3rd_…` ---------------
+
+/// One command's answer as compared between clones: whether it succeeded,
+/// and its output (JSON without each clone's own working copy, else the
+/// text of stdout and stderr).
+fn answer(who: &Person, dir: &Path, args: &[&str]) -> (bool, String) {
+    let o = who.run(dir, args);
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    let err = String::from_utf8_lossy(&o.stderr).to_string();
+    let text = match serde_json::from_str::<serde_json::Value>(out.trim()) {
+        Ok(mut v) => {
+            if let Some(e) = v.get_mut("entries").and_then(|e| e.as_array_mut()) {
+                e.retain(|x| x["current"] != serde_json::json!(true));
+            }
+            v.to_string()
+        }
+        Err(_) => format!("{out}{err}"),
+    };
+    (o.status.success(), text)
+}
+
+/// Each of `cmds` in the full clone `full`, then in a fresh thin clone of
+/// `name`: the same answer. Returns every one that differs.
+fn first_difference(who: &Person, hub: &TestHub, name: &str, full: &Path, cmds: &[Vec<String>], tag: &str) -> Option<String> {
+    let mut out = Vec::new();
+    for (i, cmd) in cmds.iter().enumerate() {
+        let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        let want = answer(who, full, &args);
+        let thin = who.dir(&format!("{tag}-{i}"));
+        who.ok(who.home.path(), &["clone", &hub.url(name), thin.to_str().unwrap()]);
+        let got = answer(who, &thin, &args);
+        if got != want {
+            let cut = |t: &str| t.chars().take(600).collect::<String>();
+            out.push(format!("`vl {}`:\nfull clone ({}):\n{}\nthin clone ({}):\n{}", args.join(" "), want.0, cut(&want.1), got.0, cut(&got.1)));
+        }
+    }
+    (!out.is_empty()).then(|| out.join("\n\n"))
+}
+
+/// Guarantee 1 (the redesign's): revision forms beyond the nine of
+/// `a_thin_clone_answers_as_a_full_clone`: `@-`, `..x`, `x..`, `x` with
+/// `-` steps past the boundary, an ambiguous and a unique change id
+/// prefix of history the thin clone does not hold, a tag named like an id,
+/// and `vl evolog` of an old change. Each command runs in the full clone,
+/// then in a fresh thin one.
+#[test]
+fn s3rd_a_thin_clone_answers_as_a_full_clone_for_more_revision_forms() {
+    let hub = TestHub::start();
+    let (admin, dir, name) = project_with_history(&hub, 24, 10);
+    // A tag named like a snapshot id prefix of the history, pushed.
+    let third = snapshot_of(&admin, &dir, "commit 2");
+    admin.ok(&dir, &["tag", "set", "rel-1", "-r", "main---"]);
+    admin.ok(&dir, &["push"]);
+    let full = admin.dir("full");
+    admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
+    // The change ids of the pushed history (not of any clone's own working
+    // copy, which a prefix must not match: ids are random).
+    let log = json(&admin.ok(&full, &["log", "--json"]));
+    let changes: Vec<String> = log["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["current"] != serde_json::json!(true))
+        .map(|e| e["change_id"].as_str().unwrap().to_string())
+        .collect();
+    // An ambiguous prefix: the longest one two pushed changes share.
+    let mut ambiguous = String::new();
+    for (i, a) in changes.iter().enumerate() {
+        for b in &changes[i + 1..] {
+            let n = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+            if n > ambiguous.len() {
+                ambiguous = a[..n].to_string();
+            }
+        }
+    }
+    assert!(!ambiguous.is_empty());
+    // The shortest unique prefix of the oldest change, at least 5 letters
+    // (a clone's own working copy matches it once in about a million). A
+    // working copy matching the ambiguous prefix keeps it ambiguous.
+    let oldest = changes.last().unwrap().clone();
+    let unique_len = (1..=32).find(|&n| changes.iter().filter(|c| c.starts_with(&oldest[..n])).count() == 1).unwrap().max(5);
+    let unique_prefix = oldest[..unique_len].to_string();
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+    let cmds = vec![
+        s(&["show", "--json", "@-"]),
+        s(&["log", "--json", "-r", "..main----"]),
+        s(&["log", "--json", "-r", &format!("{}..", &third[..12])]),
+        s(&["show", "--json", "main------------"]),
+        s(&["show", "--json", "rel-1"]),
+        s(&["show", "--json", &ambiguous]),
+        s(&["show", "--json", &unique_prefix]),
+        s(&["evolog", "-r", &unique_prefix]),
+        s(&["log", "--json", "-r", &format!("::{unique_prefix}")]),
+    ];
+    if let Some(d) = first_difference(&admin, &hub, &name, &full, &cmds, "more") {
+        panic!("a thin clone answers otherwise than a full clone: {d}");
+    }
+}
+
+/// Guarantee 1 after history was rewritten on the server: the admin
+/// rewrites the first change (`vl describe`, which rewrites everything
+/// above it) and force-pushes. A full clone made afterwards holds the new
+/// versions only, so `vl show <change>` of an old change shows its new
+/// version; and the old versions' snapshot ids name nothing it can show.
+/// `q/resolve` answers from the real graph (`graph`, every snapshot ever
+/// derived, old versions included: `query::resolve_prefix`), so a thin
+/// clone is told about the old versions as well.
+#[test]
+#[ignore = "BUG-1268: q/resolve names old versions of rewritten changes"]
+fn s3rd_a_thin_clone_names_what_a_full_clone_names_after_a_rewrite() {
+    let hub = TestHub::start();
+    let (admin, dir, name) = project_with_history(&hub, 6, 10);
+    let first: String = change_of(&admin, &dir, "first").chars().take(12).collect();
+    let old_first: String = snapshot_of(&admin, &dir, "first").chars().take(12).collect();
+    let old_tip: String = snapshot_of(&admin, &dir, "commit 5").chars().take(12).collect();
+    admin.ok(&dir, &["describe", "-r", &first, "-m", "first, renamed"]);
+    admin.ok(&dir, &["push", "--force"]);
+    let full = admin.dir("full");
+    admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+    let cmds = vec![
+        s(&["show", "--json", &first]),
+        s(&["show", "--json", &old_first]),
+        s(&["show", "--json", &old_tip]),
+        s(&["evolog", "-r", &first]),
+        s(&["log", "--json"]),
+    ];
+    if let Some(d) = first_difference(&admin, &hub, &name, &full, &cmds, "rw") {
+        panic!("after a rewrite, a thin clone answers otherwise than a full clone: {d}");
+    }
+}
+
+/// The shape of `dir`'s history as `vl log --json` shows it: each entry's
+/// change id (`@` for the working copy's, `new` for any other not in
+/// `known`: both are made at random per clone), description, emptiness,
+/// conflicts, tags and parents' change ids.
+fn history_shape(who: &Person, dir: &Path, known: &[String]) -> Vec<String> {
+    let log = json(&who.ok(dir, &["log", "--json"]));
+    let entries = log["entries"].as_array().unwrap();
+    let current: Vec<String> = entries.iter().filter(|e| e["current"] == serde_json::json!(true)).map(|e| e["change_id"].as_str().unwrap().to_string()).collect();
+    let name = |c: &str| match () {
+        _ if current.iter().any(|x| x == c) => "@".to_string(),
+        _ if c != "-" && !known.iter().any(|k| k == c) => "new".to_string(),
+        _ => c.to_string(),
+    };
+    entries
+        .iter()
+        .map(|e| {
+            let parents: Vec<String> = e["parents"].as_array().unwrap().iter().map(|p| name(p["change_id"].as_str().unwrap_or("-"))).collect();
+            format!(
+                "{} {:?} empty={} conflicts={} tags={} parents={parents:?}",
+                name(e["change_id"].as_str().unwrap_or("-")),
+                e["description"].as_str().unwrap_or(""),
+                e["empty"],
+                e["conflicts"],
+                e["tags"]
+            )
+        })
+        .collect()
+}
+
+/// Guarantee 1 for commands that rewrite or move onto history a thin
+/// clone does not hold (the old changes of a long history): each runs in
+/// a fresh full clone and a fresh thin one; afterwards both have the same
+/// history (by change id and description, `@` aside) and the same files.
+#[test]
+#[ignore = "BUG-1290: rewrites of unheld changes walk held history (rebase_descendants, check_current)"]
+fn s3rd_rewrites_of_unheld_history_match_a_full_clone() {
+    let hub = TestHub::start();
+    let (admin, dir, name) = project_with_history(&hub, 8, 10);
+    let c = |d: &str| -> String { change_of(&admin, &dir, d).chars().take(12).collect() };
+    let (first, c1, c2, c3, c4) = (c("first"), c("commit 1"), c("commit 2"), c("commit 3"), c("commit 4"));
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+    let ops: Vec<Vec<String>> = vec![
+        s(&["describe", "-r", &c1, "-m", "commit 1, renamed"]),
+        s(&["abandon", &c2]),
+        s(&["squash", "-r", &c3]),
+        s(&["rebase", "-s", &c4, "-d", &first]),
+        s(&["split", "-r", &c1, "-m", "the data of commit 1", "data"]),
+        s(&["new", &first]),
+        s(&["edit", &c1]),
+        s(&["duplicate", &c1, "-d", "main"]),
+        s(&["cherry-pick", &c1]),
+        s(&["restore", "--from", &first]),
+        s(&["rebase", "-s", "@", "-d", &c2]),
+        s(&["new", &c1, "main"]),
+    ];
+    let known: Vec<String> = json(&admin.ok(&dir, &["log", "--json"]))["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["current"] != serde_json::json!(true))
+        .filter_map(|e| e["change_id"].as_str().map(str::to_string))
+        .collect();
+    // `vl status` without the line naming the clone's own working copy.
+    let status = |d: &Path| -> (bool, String) {
+        let (ok, t) = answer(&admin, d, &["status"]);
+        // Short ids out too: a copied change's are made at random.
+        let id = |w: &str| { let w = w.trim_end_matches(')'); w.len() == 8 && (w.bytes().all(|b| (b'k'..=b'z').contains(&b)) || w.bytes().all(|b| b.is_ascii_hexdigit())) };
+        let lines = t.lines().filter(|l| !l.starts_with("Working copy :"));
+        (ok, lines.map(|l| l.split(' ').filter(|w| !id(w)).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join("\n"))
+    };
+    let mut diffs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        let args: Vec<&str> = op.iter().map(String::as_str).collect();
+        let full = admin.dir(&format!("rwf-{i}"));
+        admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
+        let thin = admin.dir(&format!("rwt-{i}"));
+        admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+        let want = answer(&admin, &full, &args);
+        let got = answer(&admin, &thin, &args);
+        if want.0 != got.0 {
+            diffs.push(format!("`vl {}`: full {} ({}), thin {} ({})", args.join(" "), want.0, want.1.trim(), got.0, got.1.trim()));
+            continue;
+        }
+        let (hf, ht) = (history_shape(&admin, &full, &known), history_shape(&admin, &thin, &known));
+        if hf != ht {
+            diffs.push(format!("`vl {}`: history\nfull: {hf:#?}\nthin: {ht:#?}", args.join(" ")));
+        }
+        let (ff, ft) = (answer(&admin, &full, &["files"]), answer(&admin, &thin, &["files"]));
+        let (sf, st) = (status(&full), status(&thin));
+        if ff != ft || sf != st {
+            diffs.push(format!("`vl {}`: files or status\nfull: {ff:?} {sf:?}\nthin: {ft:?} {st:?}", args.join(" ")));
+        }
+    }
+    assert!(diffs.is_empty(), "rewrites in a thin clone end otherwise than in a full clone:\n{}", diffs.join("\n\n"));
+}
+
+/// Guarantee 4 for `vl redo` and `vl undo` of a workspace switch whose
+/// target's files were evicted meanwhile: `other` is moved onto `big`
+/// (the directory stays on `default`), the directory switches to `other`
+/// and back, everything is undone (so `big`'s files are pinned by nothing
+/// and evicted under a 100 KiB bound), then redone. Redoing the switch
+/// must either fetch within the bound or fail and record nothing; `vl
+/// status` runs after each step.
+#[test]
+fn s3rd_redo_of_a_switch_past_the_cache_bound_records_nothing() {
+    let hub = TestHub::start();
+    let (admin, name) = project_with_big_branch(&hub);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    admin.ok(&thin, &["ws", "new", "other", "-r", "main"]);
+    admin.ok(&thin, &["rebase", "-s", "other@", "-d", "big"]);
+    admin.ok(&thin, &["ws", "switch", "other"]);
+    assert!(thin.join("big/f00.bin").exists());
+    admin.ok(&thin, &["ws", "switch", "default"]);
+    for _ in 0..3 {
+        admin.ok(&thin, &["undo"]);
+    }
+    admin.ok(&thin, &["partial", "limit", "100K"]);
+    admin.ok(&thin, &["partial", "limit", "100K"]);
+    let cache = du(&thin.join(".veil/cache"));
+    assert!(cache <= 100 * 1024 + 64 * 1024, "big's files were evicted: {cache} bytes in the cache");
+    admin.ok(&thin, &["redo"]);
+    let mut seen = Vec::new();
+    for cmd in [&["redo"][..], &["redo"][..], &["undo"][..]] {
+        let o = admin.run(&thin, cmd);
+        seen.push(format!("`vl {}`: {}{}", cmd.join(" "), String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)));
+        assert_a_failed_move_records_nothing(&admin, &thin, cmd, o);
+        // Attached to `other` means holding its files.
+        let attached = json(&std::fs::read_to_string(thin.join(".veil/local/checkout.json")).unwrap())["workspace"].as_str().unwrap().to_string();
+        assert_eq!(attached == "other", thin.join("big/f00.bin").exists(), "attached to {attached}:\n{}", seen.join("\n"));
+    }
+    eprintln!("{}", seen.join("\n"));
+}
+
+/// The cache's bound (threat 11) bounds what a thin clone keeps of the
+/// server's files: they are fetched into `.veil/cache/`, which is
+/// evicted; `.veil/objects/` holds snapshots and local work. A `vl ws
+/// switch` away from a workspace whose files were fetched (here `big`'s
+/// 400 KB, unchanged) writes every one of them into the main store, which
+/// is never evicted; `vl gc` keeps them (the op log reaches them), even
+/// after the workspace is removed. `vl new big` and `vl new main` in the
+/// same clone copy nothing.
+#[test]
+#[ignore = "BUG-1293: a workspace switch copies fetched files into the main store"]
+fn s3rd_a_workspace_switch_does_not_copy_fetched_files_into_the_main_store() {
+    let hub = TestHub::start();
+    let (admin, name) = project_with_big_branch(&hub);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    admin.ok(&thin, &["ws", "new", "other", "-r", "main"]);
+    admin.ok(&thin, &["rebase", "-s", "other@", "-d", "big"]);
+    admin.ok(&thin, &["ws", "switch", "other"]);
+    let before = du(&thin.join(".veil/objects"));
+    admin.ok(&thin, &["ws", "switch", "default"]);
+    admin.ok(&thin, &["ws", "rm", "other"]);
+    admin.ok(&thin, &["gc"]);
+    let after = du(&thin.join(".veil/objects"));
+    assert!(after < before + 100_000, "switching away from a workspace of fetched, unchanged files put {} bytes into the main store", after - before);
+}
+
+/// Guarantees 5 and 6: a thin clone that pulls in full from a second
+/// remote (a fork on the same server), commits locally, pulls its own
+/// server's new commit, rebases its local commit onto it, visits the fork
+/// and is evicted down to 100 KiB: after each step `vl gc` completes (it
+/// never says part of the history could not be read) and `vl fsck` finds
+/// nothing corrupt; afterwards everything named is still readable, and
+/// the fork's snapshots are never asked of the clone's server.
+#[test]
+fn s3rd_gc_completes_across_a_second_remote_pulls_commits_rebases_and_evictions() {
+    let hub = TestHub::start();
+    let (admin, name, fork) = project_and_fork(&hub);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    let pusher = admin.dir("pusher");
+    admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), pusher.to_str().unwrap()]);
+    let mut log = Vec::new();
+    let check = |step: &str, log: &mut Vec<String>| {
+        let gc = admin.ok(&thin, &["gc"]);
+        let fsck = admin.run(&thin, &["fsck"]);
+        let fsck_out = format!("{}{}", String::from_utf8_lossy(&fsck.stdout), String::from_utf8_lossy(&fsck.stderr));
+        log.push(format!("after {step}:\n{gc}\nfsck: {fsck_out}"));
+        assert!(!gc.contains("could not be read"), "{}", log.join("\n"));
+        assert!(fsck.status.success() && fsck_out.contains("No corruption found"), "{}", log.join("\n"));
+    };
+    admin.ok(&thin, &["remote", "add", "fork", &hub.url(&fork)]);
+    admin.ok(&thin, &["pull", "fork"]);
+    check("a full pull of the fork", &mut log);
+    write_files(&thin, &[("local/mine.txt", "local work 4d1e\n")]);
+    admin.ok(&thin, &["commit", "-m", "local work"]);
+    check("a local commit", &mut log);
+    write_files(&pusher, &[("src/lib.rs", "fn lib() { 99 }\n")]);
+    admin.commit_main(&pusher, "pushed later");
+    admin.ok(&pusher, &["push"]);
+    admin.ok(&thin, &["pull"]);
+    check("a pull of the clone's own server", &mut log);
+    admin.ok(&thin, &["rebase", "-s", "@-", "-d", "origin/main"]);
+    check("a rebase onto the new tip", &mut log);
+    admin.ok(&thin, &["new", "fork/main"]);
+    admin.ok(&thin, &["new", "origin/main"]);
+    admin.ok(&thin, &["partial", "limit", "100K"]);
+    admin.ok(&thin, &["partial", "limit", "100K"]);
+    check("an eviction", &mut log);
+    admin.ok(&thin, &["remote", "rm", "fork"]);
+    check("removing the fork", &mut log);
+    for (rev, path) in [("origin/main", "src/lib.rs"), ("origin/main-", "src/lib.rs")] {
+        let o = admin.run(&thin, &["cat", "-r", rev, path]);
+        assert!(o.status.success(), "{rev}: {}\n{}", String::from_utf8_lossy(&o.stderr), log.join("\n"));
+    }
+    let local = admin.ok(&thin, &["log", "--json"]);
+    let mine = json(&local)["entries"].as_array().unwrap().iter().find(|e| e["description"].as_str().is_some_and(|d| d.trim() == "local work")).unwrap()["snapshot_id"].as_str().unwrap().to_string();
+    assert!(admin.ok(&thin, &["cat", "-r", &mine, "local/mine.txt"]).contains("local work 4d1e"));
+}
+
+/// Guarantees 4 and 5 for the remote a thin clone fetches from: `vl
+/// remote rm origin` succeeds and leaves the clone's `partial` marker
+/// naming a remote that is gone, so the clone has no server; the same
+/// project added back under another name is "another remote", whose pull
+/// is a full pull (`docs/HUB.md` §13.21) that pulls nothing (its
+/// snapshots are held, their trees and files are not); and from then on a
+/// file of the tip the local work is on, once evicted, cannot be read ("this
+/// command has no connection to the server of this thin clone"), with no
+/// word of what to do, while `vl gc` and `vl fsck` report nothing wrong.
+/// Either the removal is refused, or what the clone holds stays readable.
+#[test]
+#[ignore = "BUG-1292: removing the partial remote leaves a thin clone without a server"]
+fn s3rd_removing_a_thin_clones_remote_leaves_it_readable_or_is_refused() {
+    let hub = TestHub::start();
+    let (admin, _dir, name) = project_with_history(&hub, 6, 20_000);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    // Local work on the tip: the tip's own root tree is pinned by nothing.
+    write_files(&thin, &[("local/mine.txt", "local work 4d1e\n")]);
+    admin.ok(&thin, &["commit", "-m", "local work"]);
+    if !admin.run(&thin, &["remote", "rm", "origin"]).status.success() {
+        return;
+    }
+    admin.ok(&thin, &["remote", "add", "up", &hub.url(&name)]);
+    admin.ok(&thin, &["pull", "up"]);
+    admin.ok(&thin, &["partial", "limit", "10K"]);
+    admin.ok(&thin, &["partial", "limit", "10K"]);
+    let o = admin.run(&thin, &["cat", "-r", "up/main", "data/f5.bin"]);
+    assert!(o.status.success(), "a file of the checked-out tip is unreadable: {}", String::from_utf8_lossy(&o.stderr));
+}
+
+/// Guarantee 1 (and 3) for `vl serve --local`'s read methods, which
+/// answer "with exactly the document its command prints with `--json`"
+/// (`docs/reference/json-rpc.md`): in a thin clone, the `log` method lists
+/// what `vl log --json` lists. `serve.rs` calls `api::log`, whose walk
+/// with no ids is `Held::visible_iter` (`api::log_entries_with`): the
+/// snapshots the clone holds, outside any `Exact`.
+#[test]
+#[ignore = "BUG-1290: the served log walks held history only"]
+fn s3rd_serve_log_in_a_thin_clone_is_vl_log() {
+    let hub = TestHub::start();
+    let (admin, _dir, name) = project_with_history(&hub, 6, 10);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    let mut server = admin.command(&thin, &["serve", "--local"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let sock = thin.join(".veil/local/sock");
+    for _ in 0..200 {
+        if sock.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let o = admin.run(&thin, &["serve", "--call", "log", "{\"limit\": 50}"]);
+    let _ = server.kill();
+    let _ = server.wait();
+    let served = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(o.status.success(), "{served}{}", String::from_utf8_lossy(&o.stderr));
+    let count = |v: &serde_json::Value| v["entries"].as_array().map_or(0, |e| e.len());
+    let cli = json(&admin.ok(&thin, &["log", "--json", "-n", "50"]));
+    assert_eq!(count(&json(&served)), count(&cli), "the served log lists otherwise than `vl log --json`:\nserved: {served}");
+}
+
+/// Guarantee 1 for `vl status` and `vl log` after a pull: a full and a
+/// thin clone at the same state pull the same pushed commit; both then
+/// show the same history and the same status.
+#[test]
+fn s3rd_status_and_log_after_a_pull_match_a_full_clone() {
+    let hub = TestHub::start();
+    let (admin, dir, name) = project_with_history(&hub, 6, 10);
+    let full = admin.dir("full");
+    admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    write_files(&dir, &[("src/lib.rs", "fn lib() { 77 }\n"), ("data/new.bin", "new\n")]);
+    admin.commit_main(&dir, "pushed after the clones");
+    admin.ok(&dir, &["push"]);
+    let known: Vec<String> = json(&admin.ok(&dir, &["log", "--json"]))["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["current"] != serde_json::json!(true))
+        .filter_map(|e| e["change_id"].as_str().map(str::to_string))
+        .collect();
+    for c in [&full, &thin] {
+        admin.ok(c, &["pull"]);
+        admin.ok(c, &["new", "main"]);
+    }
+    assert_eq!(history_shape(&admin, &thin, &known), history_shape(&admin, &full, &known));
+    let status = |d: &Path| admin.ok(d, &["status"]).lines().filter(|l| !l.starts_with("Working copy :")).collect::<Vec<_>>().join("\n");
+    assert_eq!(status(&thin), status(&full));
+    assert_eq!(admin.ok(&thin, &["files"]), admin.ok(&full, &["files"]));
+}

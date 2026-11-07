@@ -880,3 +880,34 @@ fn s3r3_the_whole_graph_walks_page_in_nothing() {
     repo.held().merge_bases_naive(&[pr.tip], &[pr.commits[3]]).unwrap();
     assert_eq!(*pr.server.pages.lock().unwrap(), 0);
 }
+
+/// Guarantee 3 of the redesign (S3 redesign review): every `Exact` walk is
+/// bounded by its own range. In a thin clone of 40 commits whose server
+/// pages history 2 snapshots at a time, a range of the last 6 snapshots
+/// (bisect's candidates, `x..y`, `Exact::range`), ancestry and merge
+/// bases between near snapshots read a handful of pages, never the 20 of
+/// the whole history; and each answer is the full clone's. Each walk runs
+/// in a fresh clone.
+#[test]
+#[ignore = "BUG-1291: Exact walks page in the whole ancestry of their lower bound"]
+fn s3rd_exact_walks_page_in_only_their_range() {
+    type Walk = Box<dyn Fn(&Repo, &Project)>;
+    let walks: Vec<(&str, Walk)> = vec![
+        ("bisect candidates", Box::new(|r, pr| assert_eq!(veil_core::bisect::candidates(r, &pr.tip, &[pr.commits[34]]).unwrap().len(), 5))),
+        ("x..y", Box::new(|r, pr| assert_eq!(veil_core::revset::resolve_set(r, &format!("{}-----..{}", pr.tip.hex(), pr.tip.hex()), "default").unwrap().len(), 5))),
+        ("Exact::range", Box::new(|r, pr| assert_eq!(r.exact().range(&[pr.tip], &[pr.commits[34]]).unwrap().len(), 5))),
+        ("is_ancestor(near, tip)", Box::new(|r, pr| assert!(r.is_ancestor(&pr.commits[34], &pr.tip).unwrap()))),
+        ("is_ancestor(tip, near)", Box::new(|r, pr| assert!(!r.is_ancestor(&pr.tip, &pr.commits[34]).unwrap()))),
+        ("merge_bases", Box::new(|r, pr| assert_eq!(r.merge_bases(&[pr.tip], &[pr.commits[35]]).unwrap(), vec![pr.commits[35]]))),
+        ("common_ancestor", Box::new(|r, pr| assert_eq!(r.common_ancestor(&pr.tip, &pr.commits[36]).unwrap(), pr.commits[36]))),
+    ];
+    let mut costs = Vec::new();
+    for (what, walk) in &walks {
+        let (pr, repo, _fs) = long_project(40);
+        *pr.server.pages.lock().unwrap() = 0;
+        walk(&repo, &pr);
+        costs.push((what.to_string(), *pr.server.pages.lock().unwrap()));
+    }
+    let over: Vec<_> = costs.iter().filter(|(_, n)| *n > 6).collect();
+    assert!(over.is_empty(), "walks of a 6-snapshot range read more pages than it needs (20 pages is the whole history): {costs:?}");
+}

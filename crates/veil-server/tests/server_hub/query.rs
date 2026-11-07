@@ -1864,3 +1864,113 @@ mod s13_adversarial {
         assert!(work <= 2 * limits.work, "a page with a budget of {} read {work} rows and objects", limits.work);
     }
 }
+
+// ---- q/resolve (S3 redesign review, cycle 1): `s3rd_…` ------------------------------
+
+/// `q/resolve` of `prefix` as `a`, as compared.
+fn resolved(th: &TestHub, h: &Hist, a: &Ask, prefix: &str) -> String {
+    th.rt.block_on(async { norm(settled(|| query::resolve_prefix(&h.hub, a, prefix, Limits::default())).await) })
+}
+
+/// Guarantee 2 of the redesign (the cap reveals nothing hidden): a
+/// snapshot id prefix that 16 snapshots of the admin's history match, in
+/// a project that also holds one snapshot on an embargo line with that
+/// prefix (withheld from everyone, admins too, until its release), gets
+/// the same answer as in the same project without it. `resolve_prefix`
+/// reads at most 17 rows of `view_graph` with the prefix, withheld ones
+/// among them, sets `more` from that count, keeps the first 16, and only
+/// then drops the withheld: the embargoed snapshot takes a visible one's
+/// place, and turns `more` on.
+#[test]
+#[ignore = "BUG-1269: q/resolve counts and cuts withheld rows before dropping them"]
+fn s3rd_resolve_caps_reveal_no_withheld_snapshot() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut a = Hist::new(&th, &policy_text, &bindings);
+    let mut b = Hist::new(&th, &policy_text, &bindings);
+    let files = Files::from([("pub/a.rs".to_string(), b"fn a() {}\n".to_vec())]);
+    let (mut ta, mut tb) = (root_snapshot_id(), root_snapshot_id());
+    let mut ts = 1_700_000_000_000;
+    for i in 0..16u8 {
+        let mut f = files.clone();
+        f.insert(format!("pub/f{i}.rs"), vec![b'x'; 8]);
+        // Every visible snapshot's id starts with abcd, and sorts after
+        // abcd0 (the embargoed one's).
+        ts = Hist::timestamp_for(&[ta], &f, [i + 1; 16], ts, None, |h| h.starts_with("abcd") && !h.starts_with("abcd0"));
+        ta = a.commit(&th, &[ta], f.clone(), [i + 1; 16], ts, None);
+        tb = b.commit(&th, &[tb], f, [i + 1; 16], ts, None);
+        assert_eq!(ta, tb);
+        assert!(ta.hex().starts_with("abcd"));
+        ts += 1;
+    }
+    a.set_branch(&th, "main", ta);
+    b.set_branch(&th, "main", tb);
+    // In b only: an embargoed fix on top, whose id sorts first.
+    let mut fixed = files.clone();
+    fixed.insert("pub/fix-embargo-3c11.rs".into(), b"FIX-MARKER-77e0\n".to_vec());
+    let at = Hist::timestamp_for(&[tb], &fixed, [0x77; 16], ts, Some("cve-9"), |h| h.starts_with("abcd0"));
+    let e = b.commit(&th, &[tb], fixed, [0x77; 16], at, Some("cve-9"));
+    b.set_branch(&th, "embargoed", e);
+    let adm = admin();
+    warm_up(&th, &a, &adm);
+    warm_up(&th, &b, &adm);
+    let (xa, xb) = (ask(&th, &a, &adm), ask(&th, &b, &adm));
+    let without = resolved(&th, &a, &xa, "abcd");
+    assert!(without.contains("\"more\":false"), "{without}");
+    assert!(!resolved(&th, &b, &xb, "abcd").contains(&e.hex()), "the withheld snapshot is named");
+    assert_eq!(resolved(&th, &b, &xb, "abcd"), without, "a withheld snapshot changes the answer for a prefix it matches");
+}
+
+/// Guarantee 2 of the redesign: changes the caller cannot see (wholly in a
+/// folder they have no access to) whose change ids share a prefix with a
+/// visible change's do not change the answer for that prefix.
+/// `resolve_prefix` reads at most 64 rows of the real `graph` with the
+/// prefix (hidden changes among them, in no stated order), projects them,
+/// and drops the hidden; `more` says nothing of the rows it did not read:
+/// the visible change is left out, and the answer is "nothing matched".
+#[test]
+#[ignore = "BUG-1269: q/resolve reads 64 real rows, hidden ones among them, before dropping the hidden"]
+fn s3rd_resolve_of_a_change_prefix_ignores_hidden_changes() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut a = Hist::new(&th, &policy_text, &bindings);
+    let mut b = Hist::new(&th, &policy_text, &bindings);
+    let base = Files::from([("pub/a.rs".to_string(), b"fn a() {}\n".to_vec()), ("fin/base.txt".to_string(), b"hidden in both\n".to_vec())]);
+    let root = root_snapshot_id();
+    let v0a = a.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+    let v0b = b.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+    // In b only: 70 changes of fin/ (hidden from devs and anyone), change
+    // ids abcd00…, abcd01…, on a branch of their own.
+    let mut hid = base.clone();
+    let mut th_tip = v0b;
+    for i in 0..70u8 {
+        hid.insert(format!("fin/q{i}.txt"), format!("plan {i}\n").into_bytes());
+        let mut change = [0u8; 16];
+        change[0] = 0xab;
+        change[1] = 0xcd;
+        change[2] = i;
+        th_tip = b.commit(&th, &[th_tip], hid.clone(), change, 2_000 + i64::from(i), None);
+    }
+    b.set_branch(&th, "fin-work", th_tip);
+    // In both: a visible change abcdff….
+    let mut f = base.clone();
+    f.insert("pub/b.rs".into(), b"fn b() {}\n".to_vec());
+    let mut change = [0xffu8; 16];
+    change[0] = 0xab;
+    change[1] = 0xcd;
+    let va = a.commit(&th, &[v0a], f.clone(), change, 3_000, None);
+    let vb = b.commit(&th, &[v0b], f, change, 3_000, None);
+    a.set_branch(&th, "main", va);
+    b.set_branch(&th, "main", vb);
+    a.derive(&th);
+    b.derive(&th);
+    let prefix = veil_core::ChangeId(change).display()[..4].to_string();
+    for (who, viewer) in [("anyone on Earth", Viewer::default()), ("a dev", viewers(1)[1].1.clone())] {
+        warm_up(&th, &a, &viewer);
+        warm_up(&th, &b, &viewer);
+        let (xa, xb) = (ask(&th, &a, &viewer), ask(&th, &b, &viewer));
+        let without = resolved(&th, &a, &xa, &prefix);
+        assert!(!without.contains("\"changes\":[]"), "{who}: the visible change is named: {without}");
+        assert_eq!(resolved(&th, &b, &xb, &prefix), without, "{who}: hidden changes change the answer for {prefix}");
+    }
+}
