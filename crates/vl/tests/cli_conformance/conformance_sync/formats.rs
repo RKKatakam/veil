@@ -26,40 +26,15 @@ fn vl_home(
         .unwrap()
 }
 
-// Veil (jj test_load_repo.rs: loading a repository written by an older version): a new
-// repository pushing to a format-1 remote is refused with the upgrade hint and writes nothing.
+// Veil: a remote in format 7 (which may hold encrypted descriptions, tags, embargoes or
+// folders) is refused by a clone until it is upgraded, and nothing is written to it.
 #[test]
-fn a_new_repository_cannot_push_into_a_format_1_remote_and_leaves_it_untouched() {
+fn a_clone_of_a_format_7_remote_is_refused_until_it_is_upgraded() {
     let env = Env::new();
-    let root = fx(&env, 1);
-    let remote = root.join("team-remote");
-    let before = listing(&remote);
-    let proj = env.project("zoe", "zoe", &[("z.txt", "z\n")]);
-    env.ok(
-        "zoe",
-        &proj,
-        &["remote", "add", "old", remote.to_str().unwrap()],
-    );
-    // A new tag: the remote's `main` is unrelated history, and a diverged tag is refused before
-    // anything is sent (BUG-288), so it would never reach the format check.
-    env.ok("zoe", &proj, &["tag", "set", "zoe-work", "-r", "main"]);
-    let out = env.fails("zoe", &proj, &["push", "old", "-t", "zoe-work"]);
-    assert!(out.contains("vl upgrade --remote"), "{out}");
-    assert_eq!(
-        listing(&remote),
-        before,
-        "a refused push wrote to the remote"
-    );
-    assert_eq!(repo_format(&remote), 1);
-}
-
-// jj test_load_repo.rs: an older remote is still readable by a newer client.
-#[test]
-fn a_current_clone_of_a_format_2_remote_reads_and_pushes_back() {
-    let env = Env::new();
-    let root = fx(&env, 2);
+    let root = fx(&env, 7);
     let remote = root.join("team-remote");
     let home = root.join("home-bob");
+    let before = listing(&remote);
     let out = vl_home(
         &env,
         &home,
@@ -70,50 +45,11 @@ fn a_current_clone_of_a_format_2_remote_reads_and_pushes_back() {
             env.path("bob").to_str().unwrap(),
         ],
     );
-    assert!(out.status.success(), "{}", text(&out));
-    let bob = env.path("bob");
-    assert_eq!(repo_format(&bob), 2);
-    write(&bob, "from-bob.txt", "bob\n");
-    for args in [
-        vec!["commit", "-m", "bob on format 2"],
-        vec!["tag", "set", "main", "-r", "@-", "--allow-backwards"],
-        vec!["push"],
-        vec!["fsck"],
-    ] {
-        let out = vl_home(&env, &home, &bob, &args);
-        assert!(out.status.success(), "{args:?}: {}", text(&out));
-    }
-    assert_eq!(
-        repo_format(&remote),
-        2,
-        "pushing does not upgrade the remote"
-    );
-    let out = vl_home(
-        &env,
-        &home,
-        &env.root,
-        &["fsck", "-R", remote.to_str().unwrap()],
-    );
-    assert!(out.status.success(), "{}", text(&out));
-}
-
-// Veil: old-format public mirrors hold no cloaked plaintext either.
-#[test]
-fn old_format_public_mirrors_hold_no_cloaked_plaintext() {
-    let env = Env::new();
-    for n in [1, 2, 3] {
-        let root = fx(&env, n);
-        let mirror = root.join("public-mirror");
-        assert_absent(
-            &mirror,
-            "team-only notes",
-            &format!("format-{n} public mirror"),
-        );
-        assert!(
-            contains(&everything_in(&root.join("team-remote")), "veil:"),
-            "control: objects were read"
-        );
-    }
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("format 7") && text(&out).contains("vl upgrade"), "{}", text(&out));
+    assert!(!env.path("bob").join(".veil").exists());
+    assert_eq!(repo_format(&remote), 7);
+    assert_eq!(listing(&remote), before);
 }
 
 // Veil: a remote written by a newer vl (unknown format) is refused by clone, pull and push,
@@ -135,24 +71,4 @@ fn a_remote_in_a_newer_format_is_refused_without_writing() {
     env.fails("bob", &env.root, &["clone", hub.to_str().unwrap(), "bob"]);
     assert!(!env.path("bob").exists());
     assert_eq!(listing(&hub), before);
-}
-
-// Veil: `vl upgrade --remote --dry-run` describes the upgrade and writes nothing.
-#[test]
-fn upgrade_remote_dry_run_writes_nothing() {
-    let env = Env::new();
-    let root = fx(&env, 1);
-    let alice = root.join("alice");
-    let home = root.join("home-alice");
-    let remote = root.join("team-remote");
-    let before = listing(&remote);
-    let out = vl_home(
-        &env,
-        &home,
-        &alice,
-        &["upgrade", "--remote", "origin", "--dry-run"],
-    );
-    assert!(out.status.success(), "{}", text(&out));
-    assert!(text(&out).contains("format 1"), "{}", text(&out));
-    assert_eq!(listing(&remote), before);
 }

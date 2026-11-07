@@ -25,7 +25,7 @@ fn p(s: &str) -> VPath {
 fn repo() -> Repo {
     let mut repo = Repo::init(Arc::new(MemoryBackend::new()), Some(Identity::generate("alice")), "alice").unwrap();
     let base = repo.workspace_wc("default").unwrap();
-    repo.create_workspace(WS, vec![base], None).unwrap();
+    repo.create_workspace(WS, vec![base]).unwrap();
     repo
 }
 
@@ -44,7 +44,7 @@ fn sync(repo: &Repo, fs: &SandboxFs, m: &mut Manifest, cache: &mut StatCache) ->
 /// What the sandbox holds, built without any cache, relative to `parent`.
 fn fresh_build(repo: &Repo, dir: &Path, parent: ObjectId) -> ObjectId {
     let plain = veil_core::DiskBackend::new(dir);
-    repo.build_from(&plain, Some(parent), None).unwrap().0
+    repo.build_from(&plain, Some(parent)).unwrap().0
 }
 
 #[derive(Clone, Debug)]
@@ -244,8 +244,9 @@ fn unchanged_cloaked_files_are_cached_after_a_checkout() {
     let mut repo = repo();
     let overlay = repo.workspace_overlay(WS).unwrap();
     overlay.write(&p(".veilpolicy"), b"vault/ cloak team\n").unwrap();
-    overlay.write(&p("vault/plan.md"), b"secret plans\n").unwrap();
-    repo.snapshot_workspace(WS, &overlay).unwrap();
+    overlay.write(&p("vault/.env.plan"), b"secret plans\n").unwrap();
+    let s = repo.snapshot_workspace(WS, &overlay).unwrap().snapshot;
+    assert!(!veil_core::tree::lookup(repo.store(), &repo.snapshot(&s).unwrap().tree, &p("vault/.env.plan")).unwrap().unwrap().visibility.is_public());
     let tmp = tempfile::tempdir().unwrap();
     let fs = SandboxFs::new(tmp.path(), None, true);
     let mut m = Manifest::new(WS);
@@ -267,11 +268,11 @@ fn unchanged_cloaked_files_are_cached_after_a_checkout() {
 // ---- sparse sandboxes -------------------------------------------------------
 
 /// Paths of the sparse property test (no file is another's directory).
-/// `g/` is cloaked.
-const SPARSE_PATHS: &[&str] = &["a", "b/c", "b/d", "b/e/f", "b/e/g", "g/h", "g/i/j", "k.bin"];
+/// `g/` holds the sealed secret files.
+const SPARSE_PATHS: &[&str] = &["a", "b/c", "b/d", "b/e/f", "b/e/g", "g/.env.h", "g/i/.env.j", "k.bin"];
 /// Candidate `--only` paths (only those in the workspace's tree are used).
 const SPARSE_ONLY: &[&str] = &["a", "b", "b/d", "b/e", "b/e/f", "g", "g/i", "k.bin"];
-const SPARSE_POLICY: &[u8] = b"g/ cloak team\n";
+const SPARSE_POLICY: &[u8] = b"g/.env.h cloak team\ng/i/.env.j cloak team\n";
 
 use std::collections::BTreeMap;
 use veil_core::vfs::{SparseSet, SparseView};

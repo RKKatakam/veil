@@ -152,9 +152,9 @@ fn public_push_withholds_cloaked_files_and_isolated_secrets() {
     let proj = env.dir("proj");
     env.ok("alice", &proj, &["init"]);
     write(&proj, ".env", "DB=postgres://ISOLATED-SECRET\n");
-    write(&proj, "secrets/k.txt", "CLOAKED-SECRET\n");
+    write(&proj, "secrets/k.pem", "CLOAKED-SECRET\n");
     write(&proj, "pub.txt", "public\n");
-    env.ok("alice", &proj, &["cloak", "secrets/"]);
+    env.ok("alice", &proj, &["cloak", "secrets/k.pem"]);
     env.ok("alice", &proj, &["commit", "-m", "c"]);
     env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
     let mirror = env.dir("mirror");
@@ -172,7 +172,7 @@ fn public_push_withholds_cloaked_files_and_isolated_secrets() {
     let work = env.dir("work");
     env.ok("bob", &work, &["clone", mirror.to_str().unwrap(), "dest"]);
     assert!(!Path::new(&work.join("dest/.env")).exists());
-    assert!(!Path::new(&work.join("dest/secrets/k.txt")).exists());
+    assert!(!Path::new(&work.join("dest/secrets/k.pem")).exists());
     assert_eq!(read(&work.join("dest"), "pub.txt"), "public\n");
 }
 

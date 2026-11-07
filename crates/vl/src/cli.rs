@@ -12,7 +12,7 @@ pub const VERSION: &str = concat!(
     env!("VL_GIT_COMMIT"),
     ", repository format ",
     // Kept in step with `veil_core::repo::REPO_FORMAT_VERSION` by a test.
-    "7",
+    "8",
     ")"
 );
 
@@ -21,13 +21,13 @@ pub const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\ncommit: ",
     env!("VL_GIT_COMMIT"),
-    "\nrepository format: 7",
+    "\nrepository format: 8",
     "\ntarget: ",
     env!("VL_TARGET"),
 );
 
-/// Veil — snapshot-first version control with cloaking, engine-level secret
-/// protection and virtual workspaces.
+/// Veil — snapshot-first version control with engine-level secret
+/// protection (secret files are encrypted) and virtual workspaces.
 ///
 /// There is no staging area: every `vl` invocation first records the working
 /// copy as a snapshot of the current change. Use `vl commit -m` to finish a
@@ -59,15 +59,13 @@ pub enum Cmd {
     ///
     /// SOURCE is a Veil server project (`veil://host[:port]/project` or
     /// `https://host[:port]/project`): you receive only what you may see.
-    /// Today's client also clones a path, `ssh://[user@]host[:port]/path` or
-    /// scp-style `[user@]host:path` (through your own `ssh`).
     Clone {
-        /// Project or repository to clone: a server URL, a path or an SSH URL.
+        /// The project's server URL: `veil://host[:port]/project`.
         source: String,
-        /// Directory to clone into (default: the source's last path component).
+        /// Directory to clone into (default: the project's name).
         dest: Option<PathBuf>,
-        /// From a Veil server: fetch only this directory's files (the server
-        /// sends only that subtree's objects).
+        /// Fetch only this directory's files (the server sends only that
+        /// subtree's objects).
         #[arg(long, value_name = "DIR")]
         only: Option<String>,
     },
@@ -204,9 +202,8 @@ pub enum Cmd {
     ///
     /// One line per file: tier, size in bytes, path (`*` marks an
     /// executable), and a note in parentheses. Tiers: `public`;
-    /// `cloaked:<scope>` (encrypted for a scope you are in);
-    /// `embargoed:<id>` (under an unreleased embargo whose key you hold);
-    /// `redacted` (sealed for someone else, or withheld from this
+    /// `cloaked:<scope>` (a secret file encrypted for a scope you are in);
+    /// `redacted` (a secret sealed for someone else, or withheld from this
     /// repository: the note says for whom). For the working copy (`-r @`,
     /// the default) the local-only files are listed too: `isolated` (never
     /// snapshotted or pushed), `quarantined` (a secret was found in it) and,
@@ -238,7 +235,7 @@ pub enum Cmd {
         #[arg(short, long)]
         verbose: bool,
     },
-    /// Upgrade the repository (or a remote) to the newest format.
+    /// Upgrade the repository to the newest format.
     ///
     /// Existing repositories keep working at their format without this;
     /// upgrading enables what the newer format adds (format 2: binary
@@ -249,9 +246,6 @@ pub enum Cmd {
         /// Show what would happen without changing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Upgrade this remote instead of the local repository.
-        #[arg(long, value_name = "NAME")]
-        remote: Option<String>,
         /// Upgrade even if fsck reports corruption.
         #[arg(long)]
         force: bool,
@@ -260,14 +254,14 @@ pub enum Cmd {
         /// repositories do: lists the files that would start syncing, then
         /// adds the rules to `.veilpolicy` (with --dry-run: only lists).
         /// Personal private keys stay on this device.
-        #[arg(long, conflicts_with_all = ["remote", "force"])]
+        #[arg(long, conflicts_with = "force")]
         sync_secrets: bool,
         /// Give each folder's secrets their own key, instead of one key for
         /// every secret of the project (milestone S1's): lists every secret
         /// with its new key and who will hold it, then rewrites the lines
         /// and sets up the keys (with --dry-run: only lists). Admins of a
         /// Veil server project; commit and push afterwards.
-        #[arg(long, conflicts_with_all = ["remote", "force", "sync_secrets"])]
+        #[arg(long, conflicts_with_all = ["force", "sync_secrets"])]
         rule_keys: bool,
     },
     /// Show how a change evolved (amends, rewrites, rebases).
@@ -278,10 +272,9 @@ pub enum Cmd {
     },
     /// Show which change last touched each line of a file.
     ///
-    /// History is read as you may see it: a version cloaked for a scope you
-    /// are not in is never opened (a public file edited on a cloaked line
-    /// is read as its last public version), and lines whose history is
-    /// sealed for you are reported unattributed, never guessed. Prints
+    /// History is read as you may see it: a secret file sealed for a scope
+    /// you are not in is never opened, and lines whose history is sealed
+    /// for you are reported unattributed, never guessed. Prints
     /// change ids, never descriptions.
     #[command(visible_alias = "annotate")]
     Blame(history::BlameArgs),
@@ -290,8 +283,8 @@ pub enum Cmd {
     ///
     /// Searches recorded files only (default `@`, snapshotted first):
     /// isolated, quarantined and ignored files are never searched or
-    /// counted. Files you cannot read are skipped; a file you can read only
-    /// as its last public version is searched and labelled so. Exits 1
+    /// counted. Files you cannot read (secrets sealed for others) are
+    /// skipped. Exits 1
     /// when nothing matches.
     Grep(history::GrepArgs),
     /// Find the change that introduced a problem by binary search.
@@ -327,9 +320,7 @@ pub enum Cmd {
     /// Describe the working-copy change and start a new one on top.
     ///
     /// Tags that pointed at the change's parent move to it (`main` follows
-    /// your commits), except on a cloaked line: there only tags cloaked
-    /// under the same scope move, so cloaked work never reaches `main` by
-    /// accident (publish it with `vl merge`).
+    /// your commits).
     Commit {
         /// Description of the change being committed.
         #[arg(short, long)]
@@ -366,7 +357,7 @@ pub enum Cmd {
     /// With no `--ours`/`--theirs`/`--base`/`--side`, lists the conflicts
     /// of the working copy (or `-r REV`): each version with who can read
     /// it. Otherwise each conflict at or below PATHS in the working copy is
-    /// replaced by the version named, exactly as it is recorded: a version
+    /// replaced by the version named, exactly as it is recorded: a secret
     /// sealed for a scope stays sealed for that scope, and a version with
     /// no file removes the path. To combine the versions instead, edit the
     /// file: a conflict is resolved once its markers are gone.
@@ -405,8 +396,8 @@ pub enum Cmd {
     /// its child, holds the rest and stays the change you split: the same
     /// change id, description and files, so its descendants, tags and the
     /// working copy follow it with nothing to rebase. No file changes
-    /// visibility: a cloaked file's hunks stay sealed for its scope in both
-    /// halves. Hunks of a file you cannot read, of a binary or conflicted
+    /// visibility: a sealed secret file's hunks stay sealed for its scope
+    /// in both halves. Hunks of a file you cannot read, of a binary or conflicted
     /// file, or of a file whose visibility this change alters cannot be
     /// chosen one by one: such a file moves whole. A split that would leave
     /// either change empty is refused.
@@ -431,8 +422,7 @@ pub enum Cmd {
     /// moves and is abandoned, its description joined to the destination's.
     /// Otherwise only what you choose moves; the change keeps the rest (and
     /// its description), and is abandoned only if nothing is left.
-    /// Descendants are rebased. Squashing into a cloaked change seals what
-    /// it brings for that change's scope.
+    /// Descendants are rebased.
     Squash {
         /// Files or directories whose changes move (with `-i`: the files to
         /// ask about).
@@ -475,8 +465,9 @@ pub enum Cmd {
         /// Description of the merge (default: "merge REVS").
         #[arg(short, long)]
         message: Option<String>,
-        /// Delayed-visibility merge: hide the merged changes from anyone
-        /// outside SCOPE until released.
+        /// Delayed-visibility merge: the server keeps the merge and the
+        /// history it brings in from anyone outside SCOPE until released
+        /// (a permission; nothing is encrypted).
         #[arg(long)]
         embargo: bool,
         /// Release automatically at TIME (RFC 3339, YYYY-MM-DD, or +7d/+12h/+30m).
@@ -494,9 +485,11 @@ pub enum Cmd {
     Tag(TagCmd),
 
     // ---- visibility ---------------------------------------------------------
-    /// Encrypt matching paths for a scope (default: team).
+    /// Encrypt matching secret files (.env, keys, ...) for a scope (default:
+    /// team). Only secret files are ever encrypted; `vl access` decides who
+    /// sees everything else.
     Cloak {
-        /// Paths or glob patterns.
+        /// Secret files (paths or glob patterns).
         #[arg(required = true)]
         patterns: Vec<String>,
         /// Scope to encrypt for (you must hold its key).
@@ -552,7 +545,8 @@ pub enum Cmd {
 
     // ---- secrets & identities ---------------------------------------------
     /// Encrypted secrets: the device-local vault, or a scope's team vault
-    /// (`--scope`), shared with the scope's members through team remotes.
+    /// (`--scope`), sealed for the scope's members (it does not sync
+    /// through the Veil server yet).
     #[command(subcommand)]
     Secret(SecretCmd),
     /// Run a command with vault secrets injected as environment variables.
@@ -650,65 +644,28 @@ pub enum Cmd {
     },
 
     // ---- sync -------------------------------------------------------------
-    /// Manage remotes.
+    /// Manage remotes: the Veil server projects this repository syncs with.
     #[command(subcommand)]
     Remote(RemoteCmd),
-    /// Send tags and their history to a remote (visibility-filtered).
-    ///
-    /// `--dry-run` shows what the push would send, writing nothing to the
-    /// remote (it only reads the remote's tags): which tags it creates,
-    /// moves or would have rejected, how many snapshots and objects it
-    /// sends and their size, and what stays here (embargoed history). For a
-    /// public remote it also lists every file whose content would become
-    /// public there, and the files it withholds, with the reason.
+    /// Send tags and their history to the Veil server, which moves each
+    /// branch only if nobody moved it meanwhile (and checks your access).
     Push {
-        /// Remote to push to (default: origin; with --dry-run, every
-        /// configured remote).
+        /// Remote to push to (default: origin).
         remote: Option<String>,
         /// Only push these tags.
         #[arg(short, long)]
         tag: Vec<String>,
-        /// Overwrite tags that diverged on the remote.
+        /// Overwrite branches that diverged on the server (admins only).
         #[arg(long)]
         force: bool,
-        /// Move release tags (annotated: `vl tag set -a`) that the
-        /// remote holds at another target. A release is otherwise never
-        /// replaced, even by a fast-forward.
-        #[arg(long)]
-        force_tags: bool,
-        /// Walk and verify every object instead of skipping what the remote
-        /// provably has (repairs damaged or missing objects on the remote).
-        #[arg(long)]
-        full: bool,
-        /// Delete this tag on the remote (repeatable). Delete it here first
-        /// with `vl tag delete`. Refused if someone moved it there since
-        /// (unless --force). With no --tag, nothing else is pushed.
-        #[arg(short, long, value_name = "TAG")]
-        delete: Vec<String>,
-        /// Start the upload afresh instead of resuming an interrupted push
-        /// of the same tags to this remote (what it uploaded is not reused).
-        #[arg(long)]
-        no_resume: bool,
-        /// Show what would be sent, and send nothing.
-        #[arg(long, conflicts_with_all = ["full", "delete"])]
-        dry_run: bool,
-        /// With --dry-run: print one JSON document (`veil.push.plan/1`; see
-        /// docs/reference/json.md) instead of text. Errors then also print
-        /// a `veil.error/1` document.
-        #[arg(long, requires = "dry_run")]
-        json: bool,
         #[command(flatten)]
         hooks: hooks::NoVerifyArgs,
     },
-    /// Fetch tags and history from a remote.
+    /// Fetch tags and history from the Veil server: what you may see.
     Pull {
         /// Remote to pull from.
         #[arg(default_value = "origin")]
         remote: String,
-        /// Walk and verify every object instead of skipping what this
-        /// repository provably has (repairs damaged local objects).
-        #[arg(long)]
-        full: bool,
     },
 
     /// Hooks run before commits and pushes; repository-suggested ones only
@@ -755,11 +712,7 @@ pub enum Cmd {
     /// VEIL_HOME, the repository and its lock, the stat cache, the
     /// filesystem (case sensitivity, fsync, network mounts), the clock, the
     /// vault and leftover sandboxes. Exits 1 if anything is broken.
-    Doctor {
-        /// Also check that every remote can be reached.
-        #[arg(long)]
-        remotes: bool,
-    },
+    Doctor,
     /// Print a shell completion script, e.g. `vl completions zsh > ~/.zfunc/_vl`.
     Completions {
         /// Shell to generate the script for.
@@ -830,7 +783,6 @@ impl Cmd {
             | Cmd::Duplicate(rewrite_cmd::DuplicateArgs { out, .. })
             | Cmd::CherryPick(rewrite_cmd::CherryPickArgs { out, .. })
             | Cmd::Attr(attr_cmd::AttrArgs { cmd: attr_cmd::AttrCmd::Check { out, .. } }) => out,
-            Cmd::Push { json, .. } => return *json,
             _ => return false,
         };
         out.json
@@ -851,9 +803,6 @@ pub enum TagCmd {
         /// Snapshot the tag points at.
         #[arg(short, long, default_value = "@")]
         rev: String,
-        /// Cloak the tag (default scope: team): never pushed to public remotes.
-        #[arg(long, value_name = "SCOPE", num_args = 0..=1, default_missing_value = "team")]
-        cloak: Option<String>,
         /// Allow moving the tag to a snapshot that is not a descendant.
         #[arg(long)]
         allow_backwards: bool,
@@ -861,8 +810,7 @@ pub enum TagCmd {
         /// an identity.
         #[arg(short, long)]
         annotate: bool,
-        /// The annotated tag's message (implies `-a`; sealed for a cloaked
-        /// tag).
+        /// The annotated tag's message (implies `-a`).
         #[arg(short, long)]
         message: Option<String>,
         /// Replace an existing annotated tag (or annotate a plain one). A
@@ -930,8 +878,8 @@ pub enum SecretCmd {
         /// Secret value (default: read from stdin, which keeps it out of
         /// your shell history).
         value: Option<String>,
-        /// Store it in this scope's team vault (sealed for its members,
-        /// pushed to team remotes) instead of the local vault.
+        /// Store it in this scope's team vault (sealed for its members)
+        /// instead of the local vault.
         #[arg(long, value_name = "SCOPE")]
         scope: Option<String>,
     },
@@ -1156,9 +1104,6 @@ pub enum WsCmd {
         /// Base revision (default: the parents of @, like a fresh checkout).
         #[arg(short, long)]
         rev: Option<String>,
-        /// Cloak everything recorded in this workspace (default scope: team).
-        #[arg(long, value_name = "SCOPE", num_args = 0..=1, default_missing_value = "team")]
-        cloak: Option<String>,
     },
     /// Attach the project directory to another workspace.
     Switch {
@@ -1250,8 +1195,7 @@ pub enum WsCmd {
     /// Mount a workspace as a directory (FUSE), without checking it out.
     ///
     /// Reads come from the workspace's tree, as this identity may see it
-    /// (cloaked files it cannot read are absent or show their public
-    /// version, as in a checkout). Writes go to an overlay kept in
+    /// (secret files it cannot read are absent, as in a checkout). Writes go to an overlay kept in
     /// .veil/local/mounts/NAME and are recorded into the workspace, through
     /// the policy and the secret scanner: by `vl ws unmount`, before every
     /// other vl command, every --record-every seconds, and when the
@@ -1308,18 +1252,17 @@ pub enum OpCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum RemoteCmd {
-    /// Add a remote: a path to another Veil repository, or an SSH remote
-    /// (`ssh://[user@]host[:port]/path` or `[user@]host:path`), reached
-    /// through your own `ssh` and its SFTP subsystem (`VEIL_SSH` overrides
-    /// the command). Nothing but SSH is needed on the server.
+    /// Add a remote: a project on a Veil server
+    /// (`veil://host[:port]/project`).
     Add {
         /// Remote name.
         name: String,
-        /// Path or SSH URL.
+        /// The project's server URL.
         url: String,
-        /// Public remote: cloaked content, cloaked tags and unreleased
-        /// embargoes are never sent.
-        #[arg(long)]
+        /// Test fixture only (debug builds, `VEIL_TEST_PATH_REMOTES`): a
+        /// public path remote (`test_remotes.rs`).
+        #[cfg(debug_assertions)]
+        #[arg(long, hide = true)]
         public: bool,
     },
     /// List remotes.

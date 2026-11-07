@@ -410,7 +410,6 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
                 let tree = dir_tree(&mut pr, dirs, dir)?.ok_or_else(gone)?;
                 let e = tree.get(name).ok_or_else(gone)?;
                 e.id == w.id
-                    || e.fallback == Some(w.id)
                     || (e.kind == EntryKind::Conflict
                         && matches!(Object::decode(&src.raw(&e.id)?)?, Object::Conflict(c) if c.referenced_ids().contains(&w.id)))
             };
@@ -489,12 +488,10 @@ fn entry_at(src: &Source, tree: &ObjectId, path: &str) -> Result<Option<veil_cor
     Ok(None)
 }
 
-/// Every object entry `e` names: its object, its fallback and, for a
-/// conflict, its terms' objects and fallbacks (what `fetch` serves at its
-/// path).
+/// Every object entry `e` names: its object and, for a conflict, its
+/// terms' objects (what `fetch` serves at its path).
 fn named_ids(src: &Source, e: &veil_core::TreeEntry) -> Result<Vec<ObjectId>> {
     let mut out = vec![e.id];
-    out.extend(e.fallback);
     if e.kind == EntryKind::Conflict {
         if let Object::Conflict(c) = Object::decode(&src.raw(&e.id)?)? {
             out.extend(c.referenced_ids());
@@ -570,9 +567,6 @@ fn check_changes(src: &Source, view: &View, changes: &[Change], real_tree: &Obje
                 "'{}' is a personal private key: it never leaves your device",
                 c.path
             )));
-        }
-        if matches!(e.visibility, Visibility::Embargoed { .. }) || e.fallback.is_some() && !matches!(e.visibility, Visibility::Cloaked { .. }) {
-            return Err(Error::forbidden(format!("'{}': embargoed content cannot be pushed to the server yet", c.path)));
         }
         if !e.kind.holds_blob() {
             continue;
@@ -702,9 +696,9 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     let mut completed: Vec<Completed> = Vec::new();
     for id in &order {
         let n = parents_of[id].clone();
-        if n.cloak.is_some() || n.embargo.is_some() {
+        if n.embargo.is_some() {
             return Err(Error::forbidden(
-                "cloaked lines of work and embargoed merges cannot be pushed to the server yet (docs/HUB.md §11)",
+                "embargoed merges cannot be pushed to the server yet (docs/HUB.md §11)",
             ));
         }
         match &n.signature {
@@ -755,8 +749,8 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             for (id, raw) in &trees {
                 src.rt.block_on(src.hub.objects.put(src.project, id, Bytes::from(raw.clone())))?;
             }
-            // Every object a changed path names (its object, fallback and
-            // conflict terms) was uploaded by the pusher, or is named by the
+            // Every object a changed path names (its object and conflict
+            // terms) was uploaded by the pusher, or is named by the
             // entry at that path in a parent: anything else gets the answer
             // a missing object gets, stored or not (BUG-824, BUG-834).
             for c in &g.changes {

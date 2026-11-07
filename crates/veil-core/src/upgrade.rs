@@ -1,40 +1,41 @@
 //! `vl upgrade`: explicit, crash-safe, resumable repository migrations.
 //!
 //! A repository is read and written at the format in `.veil/repo.json`
-//! ([`crate::repo::REPO_FORMAT`] lists them). Every format this build knows is
-//! read *and keeps being written in its own encoding*, so nothing changes
-//! until the owner runs `vl upgrade` (see `docs/FORMAT.md`, "Migrations").
+//! ([`crate::repo::REPO_FORMAT`] lists them). This build opens format 8
+//! only; `vl upgrade` brings formats 6 and 7 to it (formats 1 to 5 are no
+//! longer read: an earlier vl upgrades them to 7 first). See
+//! `docs/FORMAT.md`, "Migrations".
 //!
 //! An upgrade runs under the repository lock and keeps a journal in
 //! `.veil/upgrade.json`:
 //!
-//! 1. **verify**: `fsck` the repository; any corruption stops the upgrade
-//!    before anything is written (unless forced), and a census counts the
-//!    trees in each encoding;
-//! 2. one **step per format transition** (`1 → 2` and `2 → 3` have none:
-//!    existing objects keep their bytes and ids, only what is written from
-//!    now on changes);
-//! 3. **set-format**: write `repo.json` with the new format, atomically.
+//! 1. **verify**: check that the repository holds nothing that only the
+//!    removed encryption of non-secret content wrote ([`removed_content`]:
+//!    encrypted descriptions and tag messages, cloaked tags and lines of
+//!    work, encrypted embargoes and folders, encrypted files that are not
+//!    secret files). Anything found stops the upgrade before anything is
+//!    written, and every path, snapshot, tag or record is named: nothing
+//!    is ever dropped silently. Then `fsck` the repository; any corruption
+//!    stops the upgrade too (unless forced), and a census counts the trees
+//!    in each encoding;
+//! 2. **set-format**: write `repo.json` with the new format, atomically.
 //!    This is the commit point: before it the repository is entirely the old
-//!    format, after it entirely the new one;
-//! 4. steps that need the new format (`3:hpke-ring-keys`: move every scope
-//!    this identity administers to HPKE key wrapping by appending a signed
-//!    rotation to its ring, see [`Keychain::migrate_to_hpke`]);
-//! 5. remove the journal.
+//!    format, after it entirely the new one. `6 → 7` and `7 → 8` rewrite
+//!    nothing: every object keeps its bytes and id;
+//! 3. `3:hpke-ring-keys`, when one of this identity's rings still has a
+//!    legacy key wrap (BUG-071: a clone of an upgraded remote, or one a
+//!    non-admin upgraded): move every scope this identity administers to
+//!    HPKE key wrapping by appending a signed rotation to its ring (see
+//!    [`Keychain::migrate_to_hpke`]). A scope the step cannot rotate (a
+//!    member no key can be wrapped to is skipped, BUG-070; anything else)
+//!    is reported in a note and never blocks the upgrade after its commit
+//!    point. It also runs on its own in a repository already at format 8;
+//! 4. remove the journal.
 //!
-//! `3:hpke-ring-keys` is also run on its own, whenever it is pending, in a
-//! repository that is already at format 3 (BUG-071): a fresh clone of an
-//! upgraded remote, or a clone a non-admin upgraded, still holds rings whose
-//! current key was wrapped with the legacy box, and their admin is told to
-//! run `vl upgrade`. A scope the step cannot rotate (a member no key can be
-//! wrapped to is skipped, BUG-070; anything else) is reported in a note and
-//! never blocks the upgrade after its commit point.
-//!
-//! **Sealed history is not re-sealed** by `2 → 3`: re-sealing would change
-//! object ids, and with them every tree, snapshot id and signature above
-//! them. Objects sealed before the upgrade stay in the legacy construction
-//! (readable forever); new objects are sealed with AES-SIV. See
-//! `docs/CRYPTO.md`, "Migration".
+//! **Removed content is not converted.** Opening it would mean re-writing
+//! the objects that hold it, which changes their ids and with them every
+//! tree, snapshot id and signature above them: the whole history. A
+//! repository that holds it is refused, with the list.
 //!
 //! Each finished step is recorded in the journal before the next starts, so a
 //! crashed upgrade resumes where it stopped (`vl upgrade` again). Old data is
@@ -51,9 +52,8 @@ use crate::{
     keychain::{HpkeMigration, Keychain, HPKE_REPO_FORMAT},
     lock::RepoLock,
     now_millis,
-    object::{Object, TreeEncoding},
-    oplog::{OP_HEADS_DIR, OP_HEADS_REPO_FORMAT, OP_HEAD_FILE},
-    repo::{check_format_supported, min_vl_for_format, read_config, write_config, REPO_FORMAT},
+    object::{EntryKind, Object, TreeEncoding, Visibility},
+    repo::{check_format_upgradable, min_vl_for_format, read_config, write_config, REPO_FORMAT},
     store::ObjectStore,
     vfs::StorageBackend,
     vpath::VPath,
@@ -108,6 +108,9 @@ pub struct UpgradeReport {
     pub objects: usize,
     /// Corruption `fsck` found (the upgrade refuses to run unless forced).
     pub corrupt: Vec<String>,
+    /// What only the removed encryption of non-secret content wrote
+    /// ([`removed_content`]): the upgrade refuses to run while any is left.
+    pub removed: Vec<String>,
     /// What the upgrade means for this repository and its users.
     pub notes: Vec<String>,
     /// What the steps did (e.g. which key rings were re-keyed).
@@ -129,70 +132,6 @@ fn read_journal(backend: &dyn StorageBackend) -> Result<Option<Journal>> {
 
 fn write_journal(backend: &dyn StorageBackend, j: &Journal) -> Result<()> {
     backend.write(&journal_path(), &serde_json::to_vec_pretty(j)?)
-}
-
-/// Data-transforming steps for the transition `from → from + 1` (each must
-/// be idempotent: a resumed upgrade may run a step that was interrupted).
-fn transition_steps(from: u32) -> Vec<&'static str> {
-    match from {
-        // Binary trees: nothing to rewrite. Existing JSON trees keep their
-        // bytes and ids (and with them every snapshot id and signature).
-        1 => vec![],
-        // AES-SIV and HPKE: nothing to rewrite either (old sealed objects
-        // keep their bytes, ids and the legacy construction).
-        2 => vec![],
-        // First-class conflicts: nothing to rewrite. Conflicts recorded
-        // before the upgrade stay as they are (markers in the file, the
-        // path listed on the snapshot): rewriting them would change the
-        // ids and signatures of every snapshot above them. Merges made
-        // after the upgrade record conflicts as conflict entries.
-        3 => vec![],
-        // Symlinks and annotated tags: nothing to rewrite. Links recorded before the upgrade
-        // stayed unrecorded (a format-4 snapshot never holds one), so no
-        // object, id or signature changes.
-        4 => vec![],
-        // The lock-free op log: a head file for the current `op_head`,
-        // before the commit point (format-5 readers ignore `op_heads/`).
-        5 => vec!["op-heads"],
-        // Ring format 4 (invites and shares): nothing to rewrite. Rings
-        // already stored keep their format until a change needs format 4.
-        6 => vec![],
-        _ => vec![],
-    }
-}
-
-/// Steps that run after the commit point, in the new format (each must be
-/// idempotent). Named `<format>:<step>`.
-fn post_commit_steps(from: u32, to: u32) -> Vec<String> {
-    let mut out = Vec::new();
-    if from < HPKE_REPO_FORMAT && to >= HPKE_REPO_FORMAT {
-        out.push(format!("{HPKE_REPO_FORMAT}:hpke-ring-keys"));
-    }
-    if from < OP_HEADS_REPO_FORMAT && to >= OP_HEADS_REPO_FORMAT {
-        out.push(format!("{OP_HEADS_REPO_FORMAT}:remove-op-head"));
-    }
-    out
-}
-
-/// The head file of `op_head`'s operation (idempotent).
-fn op_heads_step(backend: &Arc<dyn StorageBackend>) -> Result<()> {
-    let Some(raw) = backend.read_opt(&VPath::new(OP_HEAD_FILE)?)? else {
-        return Ok(()); // already moved (a resumed upgrade)
-    };
-    let head = crate::id::ObjectId::from_hex(String::from_utf8_lossy(&raw).trim())
-        .map_err(|_| VeilError::Corrupt(OP_HEAD_FILE.into(), "does not contain an operation id".into()))?;
-    backend.create_new(&VPath::new(&format!("{OP_HEADS_DIR}/{}", head.hex()))?, b"")?;
-    Ok(())
-}
-
-/// `6:remove-op-head`: after the commit point, `op_head` is not written any
-/// more. Its operation gets a head file first (it may have moved since the
-/// first step, if the upgrade was interrupted in between), then it is
-/// removed, with the fixed pull spool of format 5 (now one per pull).
-fn remove_op_head_step(backend: &Arc<dyn StorageBackend>) -> Result<()> {
-    op_heads_step(backend)?;
-    backend.remove_file(&VPath::new(OP_HEAD_FILE)?)?;
-    backend.remove_dir_all(&VPath::new(".veil/objects/incoming/pull")?)
 }
 
 /// `3:hpke-ring-keys`: rotate every ring this identity may change whose
@@ -250,76 +189,145 @@ fn hpke_ring_keys(backend: &Arc<dyn StorageBackend>, identity: Option<&Identity>
     Ok(notes)
 }
 
-fn notes_for(from: u32, to: u32, report: &UpgradeReport) -> Vec<String> {
+fn notes_for(from: u32, to: u32) -> Vec<String> {
     let mut notes = Vec::new();
-    if from < HPKE_REPO_FORMAT && to >= HPKE_REPO_FORMAT {
+    if from < REPO_FORMAT && to >= REPO_FORMAT {
         notes.push(
-            "new content is sealed with AES-SIV and scope keys are wrapped with HPKE; existing sealed objects \
-             keep the legacy construction, their bytes and their ids (nothing is re-sealed), so snapshot ids \
-             and signatures do not change"
-                .into(),
-        );
-        notes.push(
-            "a remote still at format 1 or 2 refuses AES-SIV objects and HPKE key rings: upgrade it with \
-             `vl upgrade --remote <name>`; a member's clone at format 2 cannot pull them until it is upgraded"
-                .into(),
-        );
-    }
-    if from < crate::object::CONFLICT_REPO_FORMAT && to >= crate::object::CONFLICT_REPO_FORMAT {
-        notes.push(
-            "merges now record conflicts as data (conflict entries; `vl resolve`); conflicts recorded before \
-             the upgrade stay as they are, as markers in their files, and are resolved by editing them"
-                .into(),
-        );
-        notes.push(
-            "a remote or clone still at format 3 refuses conflict entries: upgrade it with `vl upgrade --remote <name>` \
-             before pushing a change that holds an unresolved conflict"
-                .into(),
-        );
-    }
-    if from < crate::object::GIT_PARITY_REPO_FORMAT && to >= crate::object::GIT_PARITY_REPO_FORMAT {
-        notes.push(
-            "the repository may now record symlinks and annotated (signed) tags; nothing recorded before the \
-             upgrade changes"
-                .into(),
-        );
-        notes.push(
-            "a remote or clone still at format 4 refuses symlinks and annotated tags: upgrade it with \
-             `vl upgrade --remote <name>` before pushing them; vl releases that only know format 4 refuse this \
-             repository"
-                .into(),
-        );
-    }
-    if from < OP_HEADS_REPO_FORMAT && to >= OP_HEADS_REPO_FORMAT {
-        notes.push(
-            "commands no longer wait for each other: each records its operation without the repository lock, \
-             and concurrent operations are merged; `vl undo` undoes the last command of the workspace it runs in; \
-             nothing recorded before the upgrade changes"
+            "only secret files are encrypted from now on (`docs/VISIBILITY.md`): descriptions, tags, embargoes \
+             and folders are plain text behind the server's permissions; nothing recorded before the upgrade \
+             changes"
                 .into(),
         );
         notes.push(format!(
-            "vl releases that only know format 5 refuse this repository; a remote at format 5 keeps working \
-             (upgrade it with `vl upgrade --remote <name>` once everyone who uses it runs vl {} or later)",
-            min_vl_for_format(OP_HEADS_REPO_FORMAT)
+            "vl releases older than {} refuse this repository, and this vl refuses clones still at format 6 or 7 \
+             until they are upgraded (`vl upgrade` there)",
+            min_vl_for_format(REPO_FORMAT)
         ));
-    }
-    if from < 2 && to >= 2 {
-        notes.push(format!(
-            "{} existing JSON tree(s) keep their bytes and ids, so snapshot ids, change ids and signatures do not change; \
-             new and changed directories are written as binary trees",
-            report.trees_json
-        ));
-        notes.push(format!(
-            "vl releases older than {} cannot read the repository afterwards",
-            min_vl_for_format(2)
-        ));
-        notes.push(
-            "a remote still at format 1 refuses binary trees: upgrade it with `vl upgrade --remote <name>` \
-             once everyone who uses it has upgraded vl; pulling from format-1 remotes keeps working"
-                .into(),
-        );
     }
     notes
+}
+
+/// The refusal of an upgrade of a repository holding `removed`
+/// ([`removed_content`]), naming each thing.
+fn removed_refusal(removed: &[String]) -> VeilError {
+    let n = removed.len();
+    let mut list: Vec<String> = removed.iter().take(MAX_REMOVED_LISTED).cloned().collect();
+    if n > MAX_REMOVED_LISTED {
+        list.push(format!("… and {} more", n - MAX_REMOVED_LISTED));
+    }
+    // One line: the CLI prints errors escaped (a path here is untrusted).
+    VeilError::repo(format!(
+        "upgrade refused: this repository holds {n} thing(s) encrypted by features vl no longer has \
+         (only secret files are encrypted from format {REPO_FORMAT} on), and converting them would \
+         rewrite its whole history. Nothing was changed. Found: {}. Keep using the vl that wrote it \
+         (format 7 or earlier), or start a new repository from a checkout of the files",
+        list.join("; ")
+    ))
+}
+
+/// Most findings [`removed_content`] names one by one.
+const MAX_REMOVED_LISTED: usize = 50;
+
+/// What the repository on `backend` holds that only the removed encryption
+/// of non-secret content wrote (formats 7 and earlier), one line each:
+/// snapshots with an encrypted description or on a cloaked line of work,
+/// annotated tags whose message is encrypted, trees with encrypted
+/// directories, embargoed entries or fallback versions, encrypted files that
+/// are not secret files (`policy::names_secret`), cloaked tags and
+/// workspaces in any retained operation's view, and embargo records that
+/// hold an embargo key. Nothing is decrypted: labels and structure name it.
+pub fn removed_content(backend: &Arc<dyn StorageBackend>) -> Result<Vec<String>> {
+    use std::collections::{BTreeSet, HashSet};
+    let keys = Arc::new(Keychain::new(backend.clone(), None, String::new()));
+    let store = ObjectStore::new(backend.clone(), VPath::new(".veil/objects")?, keys);
+    store.set_freshening(false);
+    let mut found: BTreeSet<String> = BTreeSet::new();
+    let mut roots: Vec<(crate::id::ObjectId, String)> = Vec::new();
+    for id in store.list_objects()? {
+        let Ok(raw) = store.read_raw(&id) else { continue };
+        if Object::is_snapshot_raw(&raw) {
+            let payload = &raw[b"veil:snap\n".len()..];
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) else { continue };
+            if v.get("cloak").is_some_and(|c| !c.is_null()) {
+                found.insert(format!("snapshot {}: on a cloaked line of work", id.short()));
+            }
+            if v.get("description").and_then(|d| d.get("sealed")).is_some() {
+                found.insert(format!("snapshot {}: an encrypted description", id.short()));
+            }
+            if let Some(t) = v.get("tree").and_then(|t| serde_json::from_value(t.clone()).ok()) {
+                roots.push((t, String::new()));
+            }
+        } else if raw.starts_with(crate::object::ATAG_TAG) {
+            if let Err(e) = Object::decode(&raw) {
+                found.insert(format!("annotated tag {}: its message cannot be read here ({e})", id.short()));
+            }
+        }
+    }
+    // The trees, by path (each tree object once).
+    let mut seen: HashSet<crate::id::ObjectId> = HashSet::new();
+    while let Some((id, dir)) = roots.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Ok(raw) = store.read_raw(&id) else { continue };
+        let shown = if dir.is_empty() { "/".to_string() } else { format!("{dir}/") };
+        let tree = match Object::decode(&raw) {
+            Ok(Object::Tree(t)) => t,
+            Ok(Object::Sealed(_)) => {
+                found.insert(format!("{shown}: an encrypted directory"));
+                continue;
+            }
+            Ok(_) => continue,
+            Err(e) => {
+                found.insert(format!("{shown}: {e}"));
+                continue;
+            }
+        };
+        for e in &tree.entries {
+            let path = if dir.is_empty() { e.name.clone() } else { format!("{dir}/{}", e.name) };
+            match e.kind {
+                EntryKind::Dir => roots.push((e.id, path)),
+                EntryKind::File | EntryKind::Symlink
+                    if matches!(e.visibility, Visibility::Cloaked { .. }) && !crate::policy::names_secret(&path) =>
+                {
+                    found.insert(format!("{path}: encrypted ({}), and not a secret file", e.visibility.label()));
+                }
+                EntryKind::Conflict => {
+                    if let Err(err) = store.get_raw(&e.id).and_then(|r| Object::decode(&r)) {
+                        found.insert(format!("{path}: {err}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Every retained operation's view (an undo restores any of them).
+    let ops = VPath::new(".veil/ops")?;
+    if backend.exists(&ops)? {
+        for f in backend.list_dir(&ops)? {
+            let Ok(raw) = backend.read(&ops.join(&f.name)) else { continue };
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) else { continue };
+            for (what, key) in [("tag", "tags"), ("workspace", "workspaces")] {
+                let Some(m) = v.get("view").and_then(|v| v.get(key)).and_then(|m| m.as_object()) else { continue };
+                for (name, item) in m {
+                    if item.get("cloak").is_some_and(|c| !c.is_null()) {
+                        found.insert(format!("{what} '{name}': cloaked"));
+                    }
+                }
+            }
+        }
+    }
+    let embargoes = VPath::new(".veil/meta/embargoes")?;
+    if backend.exists(&embargoes)? {
+        for f in backend.list_dir(&embargoes)? {
+            let Some(id) = f.name.strip_suffix(".json") else { continue };
+            let Ok(raw) = backend.read(&embargoes.join(&f.name)) else { continue };
+            if crate::keychain::check_embargo_format(&raw).is_err() {
+                found.insert(format!("embargo {id}: its record holds an embargo key"));
+            }
+        }
+    }
+    Ok(found.into_iter().collect())
 }
 
 /// Upgrade the repository on `backend` (a project or a bare remote) to
@@ -329,7 +337,18 @@ pub fn upgrade(
     identity: Option<Identity>,
     opts: &UpgradeOptions,
 ) -> Result<UpgradeReport> {
-    check_format_supported(opts.to)?;
+    check_format_upgradable(opts.to)?;
+    // Before any lock is taken (a lock leaves its file): a format this
+    // build does not read, or a repository it would refuse, is left exactly
+    // as it was. The check is repeated under the lock.
+    let config = read_config(&*backend)?;
+    check_format_upgradable(config.format)?;
+    if !opts.dry_run && config.format < REPO_FORMAT {
+        let removed = removed_content(&backend)?;
+        if !removed.is_empty() {
+            return Err(removed_refusal(&removed));
+        }
+    }
     // The gc lease first (threat 10 of the maintenance design): no gc or
     // background maintenance runs while the format changes under it.
     let _lease = match opts.dry_run {
@@ -344,7 +363,7 @@ pub fn upgrade(
         Some(RepoLock::acquire(backend.clone())?)
     };
     let mut config = read_config(&*backend)?;
-    config.check_supported()?;
+    check_format_upgradable(config.format)?;
     let journal = read_journal(&*backend)?;
     let mut report = UpgradeReport {
         from: journal.as_ref().map_or(config.format, |j| j.from),
@@ -392,17 +411,13 @@ pub fn upgrade(
         return Ok(report);
     }
 
-    let mut plan: Vec<String> = vec!["verify".into()];
-    for f in report.from..report.to {
-        plan.extend(transition_steps(f).into_iter().map(|s| format!("{f}->{}:{s}", f + 1)));
-    }
-    plan.push("set-format".into());
-    plan.extend(post_commit_steps(report.from, report.to));
-    // From format 3 on (3 → 4): the ring step is not tied to the 2 → 3
-    // transition (BUG-071); run it too when one of this identity's rings
-    // still needs it, as `vl upgrade` at the newest format would.
+    // `6 → 7` and `7 → 8` rewrite nothing (see the module docs).
+    let mut plan: Vec<String> = vec!["verify".into(), "set-format".into()];
+    // The ring step is not tied to a format transition (BUG-071); run it
+    // too when one of this identity's rings still needs it, as `vl upgrade`
+    // at the newest format would.
     let ring_step = format!("{HPKE_REPO_FORMAT}:hpke-ring-keys");
-    if report.from >= HPKE_REPO_FORMAT && !plan.contains(&ring_step) && identity.is_some() {
+    if identity.is_some() {
         let keys = Keychain::new(backend.clone(), identity.clone(), config.repo_id.clone());
         keys.set_format(config.format);
         if keys.hpke_migration_pending()?.iter().any(|(_, mine)| *mine) || journal.as_ref().is_some_and(|j| j.done.iter().any(|d| d == &ring_step)) {
@@ -428,6 +443,17 @@ pub fn upgrade(
         }
         if step == "verify" {
             census(&backend, &mut report)?;
+            // First: `fsck` would report what the removed features wrote
+            // as damage, without saying what it is.
+            if report.from < REPO_FORMAT {
+                report.removed = removed_content(&backend)?;
+            }
+            if !report.removed.is_empty() && !opts.dry_run {
+                if j.done.is_empty() {
+                    backend.remove_file(&journal_path())?;
+                }
+                return Err(removed_refusal(&report.removed));
+            }
             let fsck = fsck(backend.clone(), identity.clone())?;
             report.corrupt = fsck
                 .findings
@@ -457,12 +483,6 @@ pub fn upgrade(
             let notes = hpke_ring_keys(&backend, identity.as_ref(), &config.repo_id)?;
             report.step_notes.extend(notes);
         }
-        if step.ends_with(":op-heads") {
-            op_heads_step(&backend)?;
-        }
-        if step.ends_with(":remove-op-head") {
-            remove_op_head_step(&backend)?;
-        }
         j.done.push(step);
         write_journal(&*backend, &j)?;
     }
@@ -470,7 +490,18 @@ pub fn upgrade(
         // Resumed after verification: the census was not repeated.
         census(&backend, &mut report)?;
     }
-    report.notes = notes_for(report.from, report.to, &report);
+    report.notes = notes_for(report.from, report.to);
+    if opts.dry_run && !report.removed.is_empty() {
+        report.notes.insert(
+            0,
+            format!(
+                "the upgrade would be refused: {} thing(s) here are encrypted by features vl no longer has (only secret \
+                 files are encrypted from format {REPO_FORMAT} on): {}",
+                report.removed.len(),
+                report.removed.iter().take(MAX_REMOVED_LISTED).cloned().collect::<Vec<_>>().join("; ")
+            ),
+        );
+    }
     report.notes.append(&mut report.step_notes);
     if !opts.dry_run {
         backend.remove_file(&journal_path())?;

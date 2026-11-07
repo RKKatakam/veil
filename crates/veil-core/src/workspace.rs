@@ -255,7 +255,6 @@ struct ChangedProbe {
 /// Build the tree recording `fs` as an amendment of working copy `wc`.
 fn build_wc_tree(
     repo: &Repo,
-    wc_id: &ObjectId,
     wc: &crate::object::Snapshot,
     fs: &dyn StorageBackend,
     p: &BuildParams<'_>,
@@ -272,24 +271,20 @@ fn build_wc_tree(
     let (wp, command_edit) = recording_policy(repo, fs, &parent_tree, p.policy_from_command, || {
         repo.snapshot_policy(fs, (!p.policy_incoming).then_some(&wc.tree))
     })?;
-    let line_base = || Ok(repo.parents_tree(&wc.parents)?.tree);
     let (tree, mut report) = build_tree_cached(
         &store,
         fs,
         &BuildOptions {
             policy: &wp.policy,
             parent_tree: Some(parent_tree),
-            cloak: wc.cloak.as_deref(),
             injected: p.injected,
             rescan,
             materialised: p.materialised,
-            line_base: Some(&line_base),
             line_endings: p.line_endings,
         },
         cache,
     )?;
     let tree = hold_command_edit(&store, tree, &parent_tree, command_edit, &mut report)?;
-    let tree = repo.keep_line_embargo(wc_id, &parent_tree, tree, &mut report)?;
     Ok(Built { tree, report, wp })
 }
 
@@ -470,7 +465,7 @@ impl Repo {
                 }
                 p.built
             }
-            None => build_wc_tree(tx.repo(), &wc_id, &wc, fs, &params, rescan, cache)?,
+            None => build_wc_tree(tx.repo(), &wc, fs, &params, rescan, cache)?,
         };
         let Built { tree, report, wp } = built;
         tx.repo().record_accepted(&wp)?;
@@ -567,7 +562,7 @@ impl Repo {
         let mut scanned = cache.cloned();
         let store = self.store.clone();
         let scope = store.begin_staging();
-        let built = build_wc_tree(self, &wc_id, &wc, fs, params, false, scanned.as_mut());
+        let built = build_wc_tree(self, &wc, fs, params, false, scanned.as_mut());
         let staged = scope.finish();
         let built = match built {
             Ok(b) if !staged.overflowed() => b,
@@ -617,66 +612,27 @@ impl Repo {
     ) -> Result<(ObjectId, BuildReport)> {
         let snap = self.snapshot(snapshot)?;
         let policy = self.snapshot_policy(fs, None)?.policy;
-        let line_base = || Ok(self.parents_tree(&snap.parents)?.tree);
         let parent_tree = with_carried(&self.store, snap.tree, carried)?;
-        let (tree, mut report) = build_tree_cached(
+        let (tree, report) = build_tree_cached(
             &self.store,
             fs,
             &BuildOptions {
                 policy: &policy,
                 parent_tree: Some(parent_tree),
-                cloak: snap.cloak.as_deref(),
                 injected: None,
                 rescan: false,
                 materialised,
-                line_base: Some(&line_base),
                 line_endings: LineEndings::Convert,
             },
             cache,
         )?;
-        let tree = self.keep_line_embargo(snapshot, &parent_tree, tree, &mut report)?;
         Ok((tree, report))
     }
 
-    /// A line under an unreleased embargo stays under it (BUG-761). The
-    /// builder keeps a tree under its parent's wrapper; this covers a line
-    /// whose tree is not wrapped although an ancestor of `line` (the
-    /// snapshot being amended, or the base of a new one) is an unreleased
-    /// embargoed merge (a snapshot that deleted the fix's files took the
-    /// line off the wrapper). A new `tree` there is wrapped under that
-    /// embargo, with `parent_tree`'s public view as what everyone else
-    /// sees, so what it adds (the fix put back) is sealed until the release; without the
-    /// embargo's key, its edits are held back as the builder holds them.
-    pub(crate) fn keep_line_embargo(&self, line: &ObjectId, parent_tree: &ObjectId, tree: ObjectId, report: &mut BuildReport) -> Result<ObjectId> {
-        let store = &self.store;
-        if tree == *parent_tree
-            || crate::embargo::unreleased_wrapper(store, &tree)?.is_some()
-            || crate::embargo::unreleased_wrapper(store, parent_tree)?.is_some()
-        {
-            return Ok(tree);
-        }
-        // Cheap first: no unreleased embargo is known here (an embargo with
-        // no record here cannot have been read, so nothing of it put back).
-        if !self.keys().embargoes()?.iter().any(|r| !self.keys().embargo_released(&r.id)) {
-            return Ok(tree);
-        }
-        let Some(e) = self.carried_embargo(line)? else { return Ok(tree) };
-        if self.keys().has(&format!("embargo/{e}")) {
-            let fallback = crate::embargo::public_view(store, parent_tree)?;
-            return crate::embargo::wrap_line(store, &e, &tree, &fallback);
-        }
-        for c in crate::tree::diff_trees(store, Some(parent_tree), Some(&tree))? {
-            report.held_back.push((c.path, e.clone()));
-        }
-        Ok(*parent_tree)
-    }
-
     /// Build a tree from `fs` relative to `parent_tree` without recording
-    /// anything (dry run / change detection). With a `cloak`, the line's
-    /// base is unknown (see [`BuildOptions::line_base`]); to rebuild a
-    /// snapshot of a cloaked line use [`Repo::build_amending`].
-    pub fn build_from(&self, fs: &dyn StorageBackend, parent_tree: Option<ObjectId>, cloak: Option<&str>) -> Result<(ObjectId, BuildReport)> {
-        self.build_from_cached(fs, parent_tree, cloak, None)
+    /// anything (dry run / change detection).
+    pub fn build_from(&self, fs: &dyn StorageBackend, parent_tree: Option<ObjectId>) -> Result<(ObjectId, BuildReport)> {
+        self.build_from_cached(fs, parent_tree, None)
     }
 
     /// [`Repo::build_from`] using (and updating) the stat cache of `fs`.
@@ -684,10 +640,9 @@ impl Repo {
         &self,
         fs: &dyn StorageBackend,
         parent_tree: Option<ObjectId>,
-        cloak: Option<&str>,
         cache: Option<&mut StatCache>,
     ) -> Result<(ObjectId, BuildReport)> {
-        self.build_from_recorded(fs, parent_tree, cloak, cache, None)
+        self.build_from_recorded(fs, parent_tree, cache, None)
     }
 
     /// [`Repo::build_from_cached`] for a working copy materialised as
@@ -696,7 +651,6 @@ impl Repo {
         &self,
         fs: &dyn StorageBackend,
         parent_tree: Option<ObjectId>,
-        cloak: Option<&str>,
         cache: Option<&mut StatCache>,
         materialised: Option<&Materialised>,
     ) -> Result<(ObjectId, BuildReport)> {
@@ -707,11 +661,9 @@ impl Repo {
             &BuildOptions {
                 policy: &policy,
                 parent_tree,
-                cloak,
                 injected: None,
                 rescan: false,
                 materialised,
-                line_base: None,
                 line_endings: LineEndings::Convert,
             },
             cache,
@@ -750,9 +702,9 @@ impl Repo {
         checkout_recorded(&self.store, fs, from, to, record, cache)
     }
 
-    /// Materialise what `record` says is missing from `fs` (or shown as an
-    /// embargo fallback) relative to `tree`, where this reader can now read
-    /// it: a scope key arrived, an embargo was released. Local edits are
+    /// Materialise what `record` says is missing from `fs` relative to
+    /// `tree`, where this reader can now read it: a scope key arrived.
+    /// Local edits are
     /// never overwritten. See [`Materialised::fill_in`].
     pub fn fill_in_materialised(
         &self,
@@ -822,7 +774,6 @@ impl Repo {
         let parent = tx.repo().snapshot(&base)?;
         let store = tx.repo().store.clone();
         // The new change's base is `base` itself.
-        let line_base = || Ok(parent.tree);
         let parent_tree = with_carried(&store, parent.tree, carried)?;
         let (wp, command_edit) =
             recording_policy(tx.repo(), fs, &parent_tree, policy_from_command, || tx.repo().snapshot_policy(fs, None))?;
@@ -832,31 +783,24 @@ impl Repo {
             &BuildOptions {
                 policy: &wp.policy,
                 parent_tree: Some(parent_tree),
-                cloak: parent.cloak.as_deref(),
                 injected,
                 rescan: false,
                 materialised,
-                line_base: Some(&line_base),
                 line_endings: LineEndings::Convert,
             },
             None,
         )?;
         let tree = hold_command_edit(&store, tree, &parent_tree, command_edit, &mut report)?;
-        let tree = tx.repo().keep_line_embargo(&base, &parent_tree, tree, &mut report)?;
         tx.repo().record_accepted(&wp)?;
         let snap = Snapshot {
             parents: vec![base],
             change_id: ChangeId::random(),
             tree,
-            description: store.make_text(
-                description,
-                crate::embargo::description_scope(&store, &tree, parent.cloak.as_deref())?.as_deref(),
-            )?,
+            description: crate::object::Text::Plain(description.to_string()),
             author: tx.repo().user.clone(),
             timestamp: now_millis(),
             predecessors: vec![],
             conflicts: vec![],
-            cloak: parent.cloak.clone(),
             embargo: None,
             signature: None, // signed by the transaction
         };
@@ -867,22 +811,14 @@ impl Repo {
     }
 
     /// Create a named virtual workspace with a fresh change on `base`.
-    pub fn create_workspace(&mut self, name: &str, bases: Vec<ObjectId>, cloak: Option<String>) -> Result<ObjectId> {
+    pub fn create_workspace(&mut self, name: &str, bases: Vec<ObjectId>) -> Result<ObjectId> {
         validate_workspace_name(name)?;
-        if let Some(scope) = &cloak {
-            // A line is cloaked under a scope: never an embargo (whose key
-            // `is_member` also finds), `local` or a key generation (BUG-124).
-            crate::keychain::validate_scope_name(scope)?;
-            if !self.keys().is_member(scope) {
-                return Err(VeilError::Policy(format!("you hold no key for scope '{scope}'")));
-            }
-        }
         let mut tx = self.transaction(format!("create workspace '{name}'"))?;
         if tx.view.workspaces.contains_key(name) {
             return Err(VeilError::AlreadyExists(format!("workspace '{name}'")));
         }
-        let wc = tx.new_change(bases, "", cloak.clone())?;
-        tx.view.workspaces.insert(name.to_string(), WorkspaceState { wc, cloak });
+        let wc = tx.new_change(bases, "")?;
+        tx.view.workspaces.insert(name.to_string(), WorkspaceState { wc });
         tx.commit()?;
         Ok(wc)
     }

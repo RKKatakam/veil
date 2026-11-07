@@ -91,7 +91,7 @@ impl Model {
     fn new(single_embargo: bool) -> Model {
         let (mut alice, fs, _) = new_repo("alice");
         let main = commit_files(&mut alice, &*fs, &[(".veilpolicy", "secrets/ cloak team\n"), ("README", "r\n")], "v1");
-        alice.set_tag("main", main, None, false).unwrap();
+        alice.set_tag("main", main, false).unwrap();
         let materialised = alice.snapshot(&alice.workspace_wc(WS).unwrap()).unwrap().tree;
         let bob = Repo::init_for_clone(Arc::new(MemoryBackend::new()), Some(Identity::generate("bob")), "bob").unwrap();
         Model {
@@ -184,7 +184,7 @@ impl Model {
                 let path = format!("src/fix{}.rs", file % 3);
                 let fix = if *cloaked_line {
                     let name = format!("fix{}", self.next);
-                    self.alice.create_workspace(&name, vec![tip], Some("team".into())).unwrap();
+                    self.alice.create_workspace(&name, vec![tip]).unwrap();
                     let ov = self.alice.workspace_overlay(&name).unwrap();
                     ov.write(&p(&path), format!("{t}\n").as_bytes()).unwrap();
                     self.alice.snapshot_workspace(&name, &ov).unwrap().snapshot
@@ -262,7 +262,7 @@ impl Model {
                 let (side, _) = self.alice.commit_ephemeral(&ws, "side").unwrap();
                 let main = self.main();
                 if let Ok(s2) = self.alice.rebase(side, vec![main]) {
-                    let _ = self.alice.set_tag("side", s2, None, true);
+                    let _ = self.alice.set_tag("side", s2, true);
                 }
             }
             Op::PushPublic => {

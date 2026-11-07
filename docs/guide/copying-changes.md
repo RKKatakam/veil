@@ -1,6 +1,6 @@
 # Copying changes, and merges that follow renames
 
-> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). Where this page mentions cloaking, scopes, isolated files or path and SSH remotes, the server replaces them with folder access, encrypted secrets and pushes to the server.
+> Only secret files (`.env`, keys) are ever encrypted ("cloaked", for a scope); who sees folders and code is decided by folder access (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). `vl` syncs only through the Veil server.
 
 `vl duplicate` copies changes onto other parents, as new changes;
 `vl cherry-pick` is its Git-style shortcut. Merges, rebases and copies
@@ -38,9 +38,8 @@ of the copy, keeping what you had changed in it. As in Git:
 
 - several revisions (or a range, `vl cherry-pick A..B`) are copied **one
   after the other**, oldest first, each onto the previous copy;
-- the tags at `@-` move to the last copy, as `vl commit` moves them (not on
-  a cloaked line, unless the tag is cloaked for that scope; never a release
-  tag);
+- the tags at `@-` move to the last copy, as `vl commit` moves them (never
+  a release tag);
 - a copy that conflicts is not refused: the conflict is recorded in the copy
   ([Conflicts](getting-started.md#conflicts)), and `vl resolve` clears it.
 
@@ -109,14 +108,7 @@ budget), only exact renames are followed, and the rest merge as before.
 Copies and rename-following merges are tree merges: they never decrypt
 content into a wider audience, and never publish anything.
 
-- **A cloaked change copied onto a public line** stays sealed: its files
-  stay sealed for their scope, and a sealed description stays sealed (`-x`
-  leaves it alone). The copy is on a public line, so it can be pushed; what
-  a public remote receives is the sealed objects, which it cannot read.
-- **A public change copied into a cloaked line** is sealed there, as
-  anything that line introduces (`vl squash` into a cloaked change does the
-  same), with the last public version as the fallback readers without the
-  key see.
+- **Sealed secret files stay sealed** in a copy, for their own scope.
 - **A conflict is copied as recorded**: each version keeps its own sealing.
 - **A change an unreleased embargo withholds** (the fix, the changes
   that made it, work built on it, and the changes on the embargoed line)
@@ -131,12 +123,13 @@ content into a wider audience, and never publish anything.
   other. Pairing reads only public content (sealed files pair only when
   they are the very same sealed object), so whether a rename is followed
   never depends on your keys, and a merge never reads what you cannot.
-- **A cloaked file moved to a path the policy leaves public** stays sealed
-  there when an edit follows it, even when `vl merge` publishes the rest of
-  a cloaked line; `vl merge` warns, and only `vl expose` publishes it:
+- **A sealed secret file moved to a path the policy leaves public** stays
+  sealed there when an edit follows it; the merge says so, and only
+  `vl expose` publishes it:
 
   ```text
-  warning: docs/db.yml followed the rename of secrets/db.yml and stays sealed (cloaked:team) at its new path; `vl expose docs/db.yml` publishes it
+    rename: followed rename deploy/.env -> deploy/env.txt
+      note: deploy/env.txt stays sealed (cloaked:team) at its new path; `vl expose deploy/env.txt` publishes it
   ```
 
 Renames are computed when merging and reported to you; they are never

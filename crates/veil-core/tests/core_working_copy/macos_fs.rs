@@ -126,11 +126,11 @@ fn moving_the_working_copy_between_changes_round_trips_on_every_backend() {
         assert!(co.kept_local.is_empty() && co.blocked.is_empty(), "{kind}: {co:?}");
         assert_eq!(fs.read(&p("Docs/Guide.md")).unwrap(), b"v1\n", "{kind}");
         assert!(!fs.exists(&p("docs2/new.md")).unwrap(), "{kind}");
-        let (rebuilt, _) = repo.build_from(&*fs, Some(t_first), None).unwrap();
+        let (rebuilt, _) = repo.build_from(&*fs, Some(t_first)).unwrap();
         assert_eq!(rebuilt, t_first, "{kind}: checkout then snapshot changes nothing");
 
         repo.checkout_tree(&*fs, Some(&t_first), &t_wc).unwrap();
-        let (rebuilt, _) = repo.build_from(&*fs, Some(t_wc), None).unwrap();
+        let (rebuilt, _) = repo.build_from(&*fs, Some(t_wc)).unwrap();
         assert_eq!(rebuilt, t_wc, "{kind}");
 
         repo.undo().unwrap();
@@ -144,7 +144,7 @@ fn secrets_and_cloaking_are_enforced_on_every_backend() {
         let (mut repo, fs) = new_repo(make);
         // The pattern is typed in NFC, the directory created in NFD.
         fs.write(&p(".veilpolicy"), "Caf\u{e9}/ cloak team\n".as_bytes()).unwrap();
-        fs.write(&p("Cafe\u{301}/db.yml"), b"password: hunter2\n").unwrap();
+        fs.write(&p("Cafe\u{301}/.env.db"), b"password: hunter2\n").unwrap();
         fs.write(&p(".ENV"), b"DATABASE_URL=postgres://u:pw@db/prod\n").unwrap();
         fs.write(&p("config.js"), b"const key = 'AKIAIOSFODNN7EXAMPLE';\n").unwrap();
         let out = repo.snapshot_workspace(WS, &*fs).unwrap();
@@ -152,7 +152,7 @@ fn secrets_and_cloaking_are_enforced_on_every_backend() {
         let files = names(&repo, &tree);
         assert!(!files.iter().any(|f| f.eq_ignore_ascii_case(".env")), "{kind}: {files:?}");
         assert!(!files.contains(&"config.js".to_string()), "{kind}: quarantined");
-        let db = files.iter().find(|f| f.ends_with("/db.yml")).expect("db.yml recorded");
+        let db = files.iter().find(|f| f.ends_with("/.env.db")).expect(".env.db recorded");
         let e = entry(&repo, &tree, db).unwrap();
         assert_eq!(e.visibility, Visibility::Cloaked { scope: "team".into() }, "{kind}: {db}");
     }
@@ -176,7 +176,7 @@ fn merges_work_on_every_backend() {
         let t = tree_of(&repo, &merged.snapshot);
         let co = repo.checkout_tree(&*fs, Some(&tree_of(&repo, &base)), &t).unwrap();
         assert!(co.kept_local.is_empty(), "{kind}");
-        assert_eq!(repo.build_from(&*fs, Some(t), None).unwrap().0, t, "{kind}");
+        assert_eq!(repo.build_from(&*fs, Some(t)).unwrap().0, t, "{kind}");
     }
 }
 
@@ -210,7 +210,7 @@ fn a_tree_recorded_in_either_form_checks_out_and_snapshots_unchanged() {
         let tree = exact_tree(&mut repo, &[(&format!("Caf\u{e9}/{form}") as &str, "x\n"), ("b.txt", "b\n")]);
         for wc in [FoldingBackend::apfs(), FoldingBackend::hfs_plus()] {
             repo.checkout_tree(&wc, None, &tree).unwrap();
-            let (rebuilt, _) = repo.build_from(&wc, Some(tree), None).unwrap();
+            let (rebuilt, _) = repo.build_from(&wc, Some(tree)).unwrap();
             assert_eq!(rebuilt, tree, "{:?} with {form:?}: spelling kept", wc.flavor());
         }
     }
@@ -250,7 +250,7 @@ fn case_renames_from_a_teammate_check_out_exactly() {
         assert!(co.kept_local.is_empty(), "{co:?}");
         let root: Vec<String> = wc.inner().list_dir(&VPath::root()).unwrap().into_iter().map(|e| e.name).collect();
         assert_eq!(root, vec!["README", "docs"], "{:?}: new spelling on disk", wc.flavor());
-        assert_eq!(repo.build_from(&wc, Some(after), None).unwrap().0, after);
+        assert_eq!(repo.build_from(&wc, Some(after)).unwrap().0, after);
     }
 }
 
@@ -282,7 +282,7 @@ fn colliding_trees_are_refused_on_folding_backends_before_anything_is_written() 
         // Fine where names are byte-exact (Linux).
         let linux = MemoryBackend::new();
         repo.checkout_tree(&linux, None, &tree).unwrap();
-        assert_eq!(repo.build_from(&linux, Some(tree), None).unwrap().0, tree);
+        assert_eq!(repo.build_from(&linux, Some(tree)).unwrap().0, tree);
 
         for wc in [FoldingBackend::apfs(), FoldingBackend::hfs_plus()] {
             let err = repo.checkout_tree(&wc, None, &tree).unwrap_err();
@@ -359,7 +359,6 @@ fn trees_naming_a_dot_veil_alias_are_refused_on_decode() {
                 size: 2,
                 executable: false,
                 visibility: Visibility::Public,
-                fallback: None,
             }],
         };
         assert!(Object::decode(&Object::Tree(tree.clone()).encode()).is_err(), "{alias:?}");

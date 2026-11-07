@@ -16,5 +16,4 @@ mod integrity;
 mod large;
 mod push_pull;
 mod remotes;
-mod sftp;
 mod visibility;

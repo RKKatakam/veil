@@ -155,18 +155,19 @@ fn renaming_a_file_to_a_secret_name_stops_recording_it() {
     assert!(!contains_bytes(&all_bytes(&r.path(".veil/objects")), "Xk29vLq8sPz"));
 }
 
-// Scenario from git t7001-mv.sh with Veil's invariant: moving a file into
-// a cloaked directory records it cloaked.
+// Scenario from git t7001-mv.sh with Veil's invariant: moving a secret
+// file (local-only by the built-in rules) into a directory whose secret
+// files are cloaked records it cloaked.
 #[test]
 fn moving_a_file_into_a_cloaked_directory_cloaks_it() {
     let env = Env::new();
     let r = env.repo("p");
-    r.ok(&["cloak", "private/"]);
-    r.write("plan.txt", "draft\n");
+    r.ok(&["cloak", "private/*.pem"]);
+    r.write("plan.pem", "draft\n");
     r.commit("one");
     r.mkdir("private");
-    std::fs::rename(r.path("plan.txt"), r.path("private/plan.txt")).unwrap();
-    let f = r.files("@").into_iter().find(|f| f.path == "private/plan.txt").unwrap();
+    std::fs::rename(r.path("plan.pem"), r.path("private/plan.pem")).unwrap();
+    let f = r.files("@").into_iter().find(|f| f.path == "private/plan.pem").unwrap();
     assert_eq!(f.vis, "cloaked:team");
 }
 

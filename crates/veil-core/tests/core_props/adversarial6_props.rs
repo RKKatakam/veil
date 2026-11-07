@@ -16,7 +16,7 @@ use veil_core::{
     keychain::{validate_scope_name, EmbargoRecord, KeyRing},
     policy::{fold_edit, weakens, Policy},
     workspace::validate_workspace_name,
-    SshUrl, VPath,
+    VPath,
 };
 
 // ---- the policy fold ------------------------------------------------------------------
@@ -62,18 +62,6 @@ proptest! {
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: 1500, ..ProptestConfig::default() })]
-
-    #[test]
-    fn ssh_url_parsing_never_panics_and_never_yields_an_option_like_name(s in "[a-zA-Z0-9@:/\\[\\]~.\\-_ ]{0,40}|.{0,30}") {
-        if let Some(Ok(u)) = SshUrl::parse(&s) {
-            prop_assert!(!u.host.starts_with('-'), "{s:?} → host {:?}", u.host);
-            prop_assert!(u.user.as_deref().is_none_or(|x| !x.starts_with('-')), "{s:?} → user {:?}", u.user);
-            let args = u.ssh_args();
-            prop_assert!(args.iter().all(|a| !a.is_empty()));
-            let _ = u.last_component();
-            let _ = u.to_string();
-        }
-    }
 
     #[test]
     fn identity_and_id_parsers_never_panic(s in "(veil1)?[0-9a-fA-F]{0,300}|.{0,80}") {

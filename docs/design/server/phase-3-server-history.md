@@ -15,7 +15,7 @@ The design check:
 |---|---|
 | Server-centric, always connected | History lives on the server; `vl log`, `blame`, `grep` in a thin clone ask it. |
 | Code is plain text behind the server's checks | The server indexes plain-text code, and every answer passes the one access function (`HUB.md` §4.6). |
-| Only secrets and embargoes are encrypted | Secrets and unreleased embargoed content are never indexed in the clear: the server cannot open them, and does not try (§6, rows 7–8). |
+| Only secret files are encrypted | Secrets are never indexed in the clear: the server cannot open them, and does not try (§6, row 7). Unreleased embargoed content is not indexed until release (row 8). |
 | Admins, groups, managers, folder access, public | Answers are filtered by the same rules; nothing here adds an access concept. |
 | No Git, no offline mode, no SFTP | None. |
 
@@ -141,7 +141,7 @@ Each answer is a page with a cursor; every route has a deadline (default 2 s) an
 | Plain-text code in any folder | yes, in its line's shard |
 | **Secrets** (`.env`, keys, sealed files) | **content no**: the server holds ciphertext and no key. The **path** is indexed in its line's shard, because people with folder access already see that `billing/.env` exists (`HUB.md` §6.3) |
 | **Personal keys** | never uploaded |
-| **Unreleased embargoed content** | **no**: wrapper trees are opaque to the server, and embargo lines are not indexed until release (§6, row 8). After release, the content is ordinary and is indexed |
+| **Unreleased embargoed content** | **no**: embargo lines are not indexed until release (§6, row 8). After release, the content is ordinary and is indexed |
 | Binary files, files over 1 MiB, generated files the policy marks | paths only |
 
 **Patterns.** Regular expressions use a linear-time engine (the `regex` crate, no backtracking), with a size limit; trigrams narrow the candidate files, and each candidate is confirmed against its content.
@@ -251,7 +251,7 @@ New derived objects under the project's key prefix (`p/<project id>/…`), addre
 | 5 | Same | `blame` of a readable file with lines copied from a hidden one | learns the hidden path or its history | copies and renames cut at the boundary (§3.6) | a property test with moves and copies across the boundary; no hidden path string in any answer |
 | 6 | Same | asks for a path or revision that is hidden, then one that does not exist | tells them apart | same answer and same code path; projected ids only; real ids are never accepted from a viewer without full view | a grep of every answer for real snapshot ids not in the viewer's history: none; error bodies compared byte for byte |
 | 7 | Someone who breaks into the server | reads the indexes | reads secrets | secrets are ciphertext, never decrypted or indexed; only their paths are | after a run with secrets, no index object contains any secret's plaintext (the test knows them) |
-| 8 | Person outside an embargo's groups | searches, blames, logs | learns the fix before release | wrappers are opaque; embargo lines are not indexed or listed until release; the per-rule lists skip embargoed snapshots for viewers outside the groups | embargoed fix with distinctive names and strings: no query by an outsider finds them before release; all do after |
+| 8 | Person outside an embargo's groups | searches, blames, logs | learns the fix before release | embargo lines are not indexed or listed until release; the per-rule lists skip embargoed snapshots for viewers outside the groups | embargoed fix with distinctive names and strings: no query by an outsider finds them before release; all do after |
 | 9 | A person whose access was just removed | repeats a cached query | sees what they no longer may | caches keyed by view key and policy version; a group change bumps the epoch (phase 2) and voids the person's cached answers | remove, then re-query within a second: the hidden results are gone |
 | 10 | Hostile pusher | a file with 10⁷ lines, a pathological regex, 10⁶ renames in one change | exhausts the derive workers or a query | caps (changed paths 100,000, similarity 1 MiB and 1,000 candidates, segment size), linear regex, per-query deadline and per-person query limits | generators of each; workers stay within 2× linear and other projects' queries keep their targets |
 | 11 | — (a bug) | a derived value wrong after a crash or a race | wrong history | values are a function of immutable inputs; workers recompute deterministically; a sampled self-check compares derived answers with direct walks | kill workers mid-batch in a loop; every answer equals the direct walk |

@@ -1,6 +1,6 @@
 # Veil
 
-Veil (`vl`) is a **server-centric** version control system in Rust. **It is not Git and not offline-first:** the `vl` client is always connected to the Veil server (the Hub), which stores the code and enforces permissions. Access is the ordinary model in `docs/VISIBILITY.md`; code is plain text on the server, and only secrets are encrypted (embargoes are server-enforced permissions that turn public at a deadline). Read `docs/OVERVIEW.md` first. The built client engine has embargoes, secret scanning, change ids, an undoable op log, workspaces (with `vl ws exec` confined by bubblewrap on Linux) and a BLAKE3 content-addressed store. The server's milestone S1 is built (`docs/HUB.md` §13). Today's client still also restricts paths by cloaking them and syncs through path and SFTP remotes; the simplification pass removes those.
+Veil (`vl`) is a **server-centric** version control system in Rust. **It is not Git and not offline-first:** the `vl` client is always connected to the Veil server (the Hub), which stores the code and enforces permissions. Access is the ordinary model in `docs/VISIBILITY.md`; code is plain text on the server, and only secrets are encrypted (embargoes are server-enforced permissions that turn public at a deadline). Read `docs/OVERVIEW.md` first. The built client engine has embargoes, secret scanning, change ids, an undoable op log, workspaces (with `vl ws exec` confined by bubblewrap on Linux) and a BLAKE3 content-addressed store. The server's milestone S1 is built (`docs/HUB.md` §13), and `vl` syncs only through it: path and SFTP remotes were removed in the simplification pass, part 1 (debug builds keep path remotes as a test fixture, `crates/vl/src/test_remotes.rs`, active only with `VEIL_TEST_PATH_REMOTES`). Part 2 removed every encryption but that of secret files (repository format 8).
 
 Crates:
 - `crates/veil-core`: the engine;
@@ -24,7 +24,7 @@ Veil automatically **encrypts secrets** (`.env`, keys), which follow the same pe
 - Private, secret and embargoed content never reaches public snapshots, public remotes, logs, JSON or error messages, and nobody receives a file they have no access to. Secrets are only ever stored encrypted. Personal private keys never leave the machine.
 - **Only secret files (`.env`, keys) are ever encrypted.** Never encrypt code, descriptions, tags, embargoes, PRs or attribution; they are plain text behind the server's permissions (`docs/VISIBILITY.md`, "What is encrypted").
 - Visibility labels are claims; objects are authority (`verify_sealing`).
-- Old repository formats stay readable. A format change bumps the version and adds a `vl upgrade` path.
+- Old repository formats stay upgradable: a format change bumps the version and adds a `vl upgrade` path, which converts or clearly refuses, never drops silently. (Formats 1 to 5 were dropped with the owner's approval, 2026-11-06: format 8 opens only format 8, and upgrades 6 and 7.)
 - **Veil is server-centric** (owner, 2026-11-05): the client is always connected to the Veil server, and the server enforces every permission. There is no offline mode and no plain-file remotes (SFTP); don't design for them. `veil-core` builds for WASM (the server's web client uses it): OS-only code goes behind `#[cfg(feature = "os")]`.
 
 ## Checks to run, and show the output of

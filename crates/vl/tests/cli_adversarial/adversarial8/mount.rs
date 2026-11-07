@@ -59,21 +59,18 @@ fn files(env: &Env, user: &str, proj: &Path, rev: &str) -> Vec<String> {
         .collect()
 }
 
-fn embargo_id(env: &Env, user: &str, dir: &Path) -> String {
-    env.stdout(user, dir, &["embargo", "list"]).split_whitespace().next().expect("an embargo").to_string()
-}
 
 const CLOAKED: &str = "CLOAKED-PLAN-9d41";
 
-/// Alice's project (`internal/plan.md` cloaked for `team`) on a team
+/// Alice's project (`internal/.env.plan` cloaked for `team`) on a team
 /// remote, cloned by Bob before he holds the key; Bob has workspace `work`
 /// on `main`.
 fn bob_without_the_key(env: &Env) -> (PathBuf, PathBuf) {
     let alice = env.dir("alice");
     write(&alice, "README.md", "hello\n");
-    write(&alice, "internal/plan.md", &format!("{CLOAKED}\n"));
+    write(&alice, "internal/.env.plan", &format!("{CLOAKED}\n"));
     env.ok(U, &alice, &["init"]);
-    env.ok(U, &alice, &["cloak", "internal/"]);
+    env.ok(U, &alice, &["cloak", "internal/.env.plan"]);
     env.ok(U, &alice, &["commit", "-m", "initial"]);
     env.ok(U, &alice, &["tag", "set", "main", "-r", "@-"]);
     let team = env.root.join("team");
@@ -87,7 +84,7 @@ fn bob_without_the_key(env: &Env) -> (PathBuf, PathBuf) {
 
 // ---- readability changing under a live mount --------------------------------
 
-/// Bob mounts a workspace while he cannot read `internal/plan.md`, is then
+/// Bob mounts a workspace while he cannot read `internal/.env.plan`, is then
 /// granted the scope and pulls (the onboarding flow). A checkout fills the
 /// file in; the mount keeps the reader view it started with, and its next
 /// recording (of an unrelated edit) records the now-readable file it never
@@ -113,49 +110,9 @@ fn a_grant_during_a_mount_never_deletes_the_files_it_never_showed() {
     let recorded = files(&env, "bob", &bob, "work@");
     assert!(recorded.contains(&"notes.txt".to_string()), "{out}");
     assert!(
-        recorded.contains(&"internal/plan.md".to_string()),
+        recorded.contains(&"internal/.env.plan".to_string()),
         "the mount recorded the cloaked file Bob was just granted as deleted:\n{out}\n{recorded:?}"
     );
-}
-
-/// Control: the embargo flavour of BUG-534 (Carol's mount on a public
-/// mirror never showed the embargoed fix's new file; the release arrives by
-/// a pull) keeps the released files.
-#[test]
-fn control_an_embargo_release_during_a_mount_keeps_the_released_files() {
-    if !fuse_available() {
-        return;
-    }
-    let env = Env::new();
-    let proj = env.project(U, "proj", &[("auth.rs", "v1\n"), ("README", "hi\n")]);
-    env.ok(U, &proj, &["ws", "new", "fix", "-r", "main"]);
-    ws_write(&env, &proj, "fix", "auth.rs", "v2\n");
-    ws_write(&env, &proj, "fix", "src/verify.rs", "fn verify() {}\n");
-    env.ok(U, &proj, &["describe", "-r", "fix@", "-m", "fix"]);
-    env.ok(U, &proj, &["merge", "fix@", "--into", "main", "--embargo", "-m", "embargoed fix"]);
-    let mirror = env.root.join("mirror");
-    env.ok(U, &proj, &["remote", "add", "mirror", mirror.to_str().unwrap(), "--public"]);
-    env.ok(U, &proj, &["push", "mirror", "-t", "main"]);
-    env.ok("carol", &env.root, &["clone", "mirror", "carol"]);
-    let carol = env.root.join("carol");
-    env.ok("carol", &carol, &["ws", "new", "work", "-r", "main"]);
-    let (mnt, _g) = mount(&env, "carol", &carol, "work");
-    assert_eq!(read(&mnt, "auth.rs"), "v1\n");
-    assert!(!mnt.join("src").exists());
-
-    let id = embargo_id(&env, U, &proj);
-    env.ok(U, &proj, &["embargo", "release", &id, "--yes"]);
-    env.ok(U, &proj, &["push", "mirror", "-t", "main"]);
-    env.ok("carol", &carol, &["pull"]);
-    std::fs::write(mnt.join("notes.txt"), "carol\n").unwrap();
-    let out = env.ok("carol", &carol, &["ws", "unmount", "work"]);
-    let recorded = files(&env, "carol", &carol, "work@");
-    assert!(recorded.contains(&"notes.txt".to_string()), "{out}");
-    assert!(
-        recorded.contains(&"src/verify.rs".to_string()),
-        "the mount recorded the released fix's file as deleted:\n{out}\n{recorded:?}"
-    );
-    assert_eq!(env.stdout("carol", &carol, &["cat", "auth.rs", "-r", "work@"]), "v2\n", "{out}");
 }
 
 /// Control: a checkout of the same flow (the project directory) keeps the
@@ -168,10 +125,10 @@ fn control_a_grant_in_the_project_directory_fills_the_file_in() {
     env.ok(U, &alice, &["scope", "grant", "team", &key, "--name", "bob"]);
     env.ok(U, &alice, &["push"]);
     env.ok("bob", &bob, &["pull"]);
-    assert_eq!(read(&bob, "internal/plan.md"), format!("{CLOAKED}\n"));
+    assert_eq!(read(&bob, "internal/.env.plan"), format!("{CLOAKED}\n"));
     write(&bob, "notes.txt", "bob\n");
     env.ok("bob", &bob, &["status"]);
-    assert!(files(&env, "bob", &bob, "@").contains(&"internal/plan.md".to_string()));
+    assert!(files(&env, "bob", &bob, "@").contains(&"internal/.env.plan".to_string()));
 }
 
 fn state_pid(proj: &Path, ws: &str) -> i32 {
@@ -369,19 +326,24 @@ fn a_sparse_file_in_the_mount_costs_no_memory() {
 
 // ---- what a non-member can read -----------------------------------------------
 
-/// A conflict whose "theirs" side is sealed for `team`, published to a
-/// public remote and mounted by Carol (no key): she must see the redacted
-/// materialisation only, with a size that matches what a read returns.
+/// A conflict whose "theirs" side is sealed for `team` (a secret file,
+/// exposed with `--force` on the other side), published to a public remote
+/// and mounted by Carol (no key): she must see the redacted materialisation
+/// only, with a size that matches what a read returns.
 #[test]
 fn a_sealed_conflict_side_never_reaches_a_non_member_through_the_mount() {
     if !fuse_available() {
         return;
     }
     let env = Env::new();
-    let proj = env.project(U, "proj", &[("a.txt", "one\ntwo\nthree\n")]);
-    env.ok(U, &proj, &["ws", "new", "sec", "-r", "main", "--cloak", "team"]);
-    ws_write(&env, &proj, "sec", "a.txt", "one\nSEALED-SIDE-0042\nthree\n");
-    write(&proj, "a.txt", "one\nPUBLIC\nthree\n");
+    let proj = env.project(U, "proj", &[("README", "hi\n")]);
+    write(&proj, ".env.app", "one\ntwo\nthree\n");
+    env.ok(U, &proj, &["cloak", ".env.app"]);
+    env.ok(U, &proj, &["commit", "-m", "sealed"]);
+    env.ok(U, &proj, &["ws", "new", "sec", "-r", "main"]);
+    ws_write(&env, &proj, "sec", ".env.app", "one\nSEALED-SIDE-0042\nthree\n");
+    env.ok(U, &proj, &["expose", "--force", ".env.app"]);
+    write(&proj, ".env.app", "one\nPUBLIC\nthree\n");
     env.ok(U, &proj, &["commit", "--no-advance", "-m", "public"]);
     env.ok(U, &proj, &["new", "@-", "sec@", "-m", "conflicted"]);
     env.ok(U, &proj, &["tag", "set", "conflicted", "-r", "@"]);
@@ -392,10 +354,11 @@ fn a_sealed_conflict_side_never_reaches_a_non_member_through_the_mount() {
     let carol = env.root.join("carol");
     env.ok("carol", &carol, &["ws", "new", "view", "-r", "conflicted"]);
     let (mnt, _g) = mount(&env, "carol", &carol, "view");
-    let data = std::fs::read(mnt.join("a.txt")).unwrap();
+    let data = std::fs::read(mnt.join(".env.app")).unwrap();
     let shown = String::from_utf8_lossy(&data).into_owned();
     assert!(!shown.contains("SEALED-SIDE"), "{shown}");
-    assert_eq!(std::fs::metadata(mnt.join("a.txt")).unwrap().len(), data.len() as u64, "{shown}");
+    assert!(shown.contains("PUBLIC"), "{shown}");
+    assert_eq!(std::fs::metadata(mnt.join(".env.app")).unwrap().len(), data.len() as u64, "{shown}");
     for (p, c) in super::walk(&mnt).iter().filter_map(|p| std::fs::read(mnt.join(p)).ok().map(|c| (p.clone(), c))) {
         assert!(!String::from_utf8_lossy(&c).contains("SEALED-SIDE"), "{p:?}");
     }
@@ -417,9 +380,9 @@ fn a_mount_inside_another_project_is_never_recorded_by_it() {
     let env = Env::new();
     let secret = env.dir("secret");
     write(&secret, "README.md", "hello\n");
-    write(&secret, "internal/plan.md", &format!("{CLOAKED}\n"));
+    write(&secret, "internal/.env.plan", &format!("{CLOAKED}\n"));
     env.ok(U, &secret, &["init"]);
-    env.ok(U, &secret, &["cloak", "internal/"]);
+    env.ok(U, &secret, &["cloak", "internal/.env.plan"]);
     env.ok(U, &secret, &["commit", "-m", "initial"]);
     env.ok(U, &secret, &["ws", "new", "view", "-r", "@-"]);
     // An unrelated, public project of the same user.
@@ -430,9 +393,9 @@ fn a_mount_inside_another_project_is_never_recorded_by_it() {
     if !out.status.success() {
         return; // refused: the correct outcome
     }
-    assert_eq!(read(&mnt, "internal/plan.md"), format!("{CLOAKED}\n"));
+    assert_eq!(read(&mnt, "internal/.env.plan"), format!("{CLOAKED}\n"));
     env.ok(U, &oss, &["status"]);
-    let recorded = super::cat(&env, U, &oss, "@", "scratch-mount/internal/plan.md");
+    let recorded = super::cat(&env, U, &oss, "@", "scratch-mount/internal/.env.plan");
     let _ = env.vl(U, &secret, &["ws", "unmount", "view"]);
     assert!(
         !recorded.as_deref().unwrap_or_default().contains(CLOAKED),

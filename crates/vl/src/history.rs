@@ -516,16 +516,13 @@ fn note(s: &mut State, action: &str, id: &ObjectId, code: Option<i32>) {
     s.log.push(LogLine { action: action.to_string(), snapshot: id.hex(), code });
 }
 
-/// Files of `tree` this reader cannot read as they are (redacted, or shown
-/// as an embargo fallback): a verdict there may be misleading.
+/// Files of `tree` this reader cannot read (sealed secrets of another
+/// scope): a verdict there may be misleading.
 fn unreadable_files(ctx: &Ctx, tree: &ObjectId) -> Result<usize> {
     let store = ctx.repo.store();
-    let (_, fell_back) = veil_core::checkout::resolve_view(store, tree)?;
-    let mut n = usize::from(fell_back);
+    let mut n = 0;
     for (_, e) in veil_core::tree::walk_files(store, tree)? {
-        // Readable as it is (its fallback does not count).
-        let own = veil_core::TreeEntry { fallback: None, ..e };
-        if own.kind == veil_core::EntryKind::File && !store.entry_readable(&own) {
+        if e.kind == veil_core::EntryKind::File && !store.entry_readable(&e) {
             n += 1;
         }
     }
@@ -546,7 +543,7 @@ fn take_step(ctx: &mut Ctx, s: &mut State, step: Step, by_hand: bool) -> Result<
             let hidden = unreadable_files(ctx, &tree)?;
             if hidden > 0 {
                 warn(&format!(
-                    "{hidden} file(s) of this snapshot are sealed for you (left out, or shown as their last public version): \
+                    "{hidden} file(s) of this snapshot are secrets sealed for others (left out): \
                      a verdict here may be misleading{}",
                     if by_hand { "; `vl bisect skip` if you cannot tell" } else { "" }
                 ));
@@ -764,8 +761,7 @@ fn run_on(ctx: &Ctx, candidate: &ObjectId, with_isolated: bool, command: &[Strin
     let dir = sb.path().to_path_buf();
     let fs = SandboxFs::new(&dir, None, false);
     let report = ctx.repo.checkout_tree(&fs, None, &tree)?;
-    let (_, fell_back) = veil_core::checkout::resolve_view(ctx.repo.store(), &tree)?;
-    let partial = fell_back || !report.redacted.is_empty() || !report.from_fallback.is_empty() || !report.failed.is_empty();
+    let partial = !report.redacted.is_empty() || !report.from_fallback.is_empty() || !report.failed.is_empty();
     if with_isolated {
         // The vault copies of local-only files (`ws exec --with-isolated`).
         for (p, hexdata) in ctx.repo.vault_load()?.files {

@@ -20,19 +20,17 @@ fn entry_strategy() -> impl Strategy<Value = TreeEntry> {
         prop_oneof![
             Just(Visibility::Public),
             "[a-z]{0,8}".prop_map(|s| Visibility::Cloaked { scope: s }),
-            "[0-9a-f]{10}".prop_map(|s| Visibility::Embargoed { embargo: s }),
         ],
-        proptest::option::of(any::<[u8; 32]>()),
     )
-        .prop_map(|(name, kind, id, size, executable, visibility, fallback)| TreeEntry {
+        .prop_map(|(name, kind, id, size, executable, visibility)| TreeEntry {
             name,
             kind,
             id: ObjectId(id),
             size,
             // A symlink is never executable (refused below).
             executable: executable && !kind.is_special(),
-            visibility,
-            fallback: fallback.map(ObjectId),
+            // Only secret files are sealed: never a directory.
+            visibility: if kind == EntryKind::Dir { Visibility::Public } else { visibility },
         })
 }
 
@@ -92,7 +90,6 @@ fn one_entry() -> Vec<u8> {
         size: 5,
         executable: false,
         visibility: Visibility::Public,
-        fallback: None,
     });
     Object::Tree(t).encode_with(TreeEncoding::Binary)
 }
@@ -157,7 +154,6 @@ fn binary_trees_are_smaller() {
             size: 1000 + i,
             executable: false,
             visibility: Visibility::Public,
-            fallback: None,
         });
     }
     let json = Object::Tree(t.clone()).encode_with(TreeEncoding::Json).len();
@@ -176,7 +172,6 @@ fn special(kind: EntryKind) -> Vec<u8> {
         size: 5,
         executable: false,
         visibility: Visibility::Public,
-        fallback: None,
     });
     Object::Tree(t).encode_with(TreeEncoding::Binary)
 }
@@ -233,15 +228,13 @@ fn link_term_strategy() -> impl Strategy<Value = Option<veil_core::ConflictTerm>
             prop_oneof![Just(0u64), 1u64..5000],
             any::<bool>(),
             prop_oneof![Just(Visibility::Public), "[a-z]{1,8}".prop_map(|s| Visibility::Cloaked { scope: s })],
-            proptest::option::of(any::<[u8; 32]>()),
         )
-            .prop_map(|(kind, id, size, executable, visibility, fallback)| veil_core::ConflictTerm {
+            .prop_map(|(kind, id, size, executable, visibility)| veil_core::ConflictTerm {
                 kind,
                 id: ObjectId(id),
                 size,
                 executable: executable && kind == TermKind::File,
                 visibility,
-                fallback: fallback.map(ObjectId),
             }),
     )
 }
@@ -283,7 +276,6 @@ fn executable_link_terms_are_refused() {
         size: 0,
         executable: false,
         visibility: Visibility::Public,
-        fallback: None,
     };
     let c = veil_core::Conflict {
         adds: vec![Some(t(TermKind::Symlink)), Some(t(TermKind::File))],

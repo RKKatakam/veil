@@ -22,11 +22,6 @@ use crate::{
     render::{bold, cyan, dim, green, safe, warn_untrusted, yellow},
 };
 
-/// Is remote `name` a Veil server?
-pub fn is_hub_remote(ctx: &Ctx, name: &str) -> bool {
-    ctx.repo.config().remotes.get(name).is_some_and(|r| hub::is_hub_url(&r.url))
-}
-
 pub fn client_for(ctx: &Ctx, remote: &str) -> Result<(Client, RemoteConfig)> {
     let r = ctx
         .repo
@@ -34,8 +29,13 @@ pub fn client_for(ctx: &Ctx, remote: &str) -> Result<(Client, RemoteConfig)> {
         .remotes
         .get(remote)
         .cloned()
-        .ok_or_else(|| anyhow!("no remote named '{remote}'"))?;
-    let url = HubUrl::parse(&r.url).ok_or_else(|| anyhow!("remote '{remote}' is not a Veil server (veil://host/project)"))??;
+        .ok_or_else(|| anyhow!("no remote named '{remote}' (add one with `vl remote add {remote} veil://host/project`)"))?;
+    let url = HubUrl::parse(&r.url).ok_or_else(|| {
+        anyhow!(
+            "remote '{remote}' ({}) is not a Veil server; vl syncs only through a Veil server now. Replace it: `vl remote rm {remote}`, then `vl remote add {remote} veil://host/project`",
+            crate::render::safe(&r.url)
+        )
+    })??;
     Ok((Client::new(&url, load_identity()?)?, r))
 }
 
@@ -253,8 +253,9 @@ pub fn pull(ctx: &mut Ctx, remote: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn push(ctx: &mut Ctx, remote: &str, tags: &[String], force: bool) -> Result<ExitCode> {
-    let (client, _) = client_for(ctx, remote)?;
+pub fn push(ctx: &mut Ctx, remote: &str, tags: &[String], force: bool, verify: &crate::hooks::NoVerifyArgs) -> Result<ExitCode> {
+    let (client, cfg) = client_for(ctx, remote)?;
+    crate::hooks::before_push(ctx, verify, remote, &cfg.url, tags)?;
     let out = hub::push(&mut ctx.repo, remote, &client, tags, force)?;
     if out.created {
         println!("Created project {} on {}: you are its admin, and everything is private", client.url.project, client.url.authority);

@@ -3,13 +3,13 @@
 //! 1. `vl ws exec --ephemeral -r agent-I --only <subtree> -m "…" -- <edit>`
 //!    (a sparse one-shot sandbox; the edit appends to 1–10 files, and the
 //!    result is recorded as a new change on top of `agent-I`);
-//! 2. `vl tag set agent-I -r <new change>`;
-//! 3. `vl push agents -t agent-I` (retried on failure),
+//! 2. `vl tag set agent-I -r <new change>`,
 //!
-//! all in one repository and against one path remote. Reported: landings
-//! per minute, p50/p95 latency per command, failures and retries, and from
-//! a shorter traced repetition, the time spent waiting on and holding
-//! `.veil/lock` and the remote's lock.
+//! all in one repository. Reported: landings (recorded and tagged changes)
+//! per minute, p50/p95 latency per command, and failures, and from a
+//! shorter traced repetition, the time spent waiting on and holding
+//! `.veil/lock`. Landings through the Veil server are measured by
+//! `veil-bench load` (`docs/design/scale/LOAD.md`).
 
 use std::{
     collections::HashSet,
@@ -22,7 +22,7 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use crate::{
-    proc::{check_stop, remove_tree, VlEnv},
+    proc::{check_stop, VlEnv},
     run::Bench,
     trace::{self, TraceSummary},
 };
@@ -31,14 +31,12 @@ use crate::{
 struct Samples {
     exec: Vec<f64>,
     tag: Vec<f64>,
-    push: Vec<f64>,
     iteration: Vec<f64>,
     rss_kib: u64,
     landings: u64,
     failures: u64,
-    retries: u64,
     errors: Vec<String>,
-    traces: [TraceSummary; 3],
+    traces: [TraceSummary; 2],
 }
 
 fn pct(v: &mut [f64], p: f64) -> f64 {
@@ -162,48 +160,15 @@ fn agent_loop(b: &Shared<'_>, i: usize, sub: &(String, Vec<String>), iters: usiz
                 continue;
             }
         }
-        drop(s);
-        let mut landed = false;
-        for attempt in 0..5 {
-            let o = env.run(repo, &["push", "agents", "-t", &tag], traced);
-            let mut s = out.lock().unwrap();
-            if attempt > 0 {
-                s.retries += 1;
-            }
-            match o {
-                Ok(o) => {
-                    s.push.push(o.secs);
-                    s.rss_kib = s.rss_kib.max(o.maxrss_kib);
-                    if let Some(t) = &o.trace {
-                        s.traces[2].merge(&trace::summarise_files(t, b.snapshots, repo));
-                    }
-                    if o.ok() {
-                        landed = true;
-                        break;
-                    }
-                    s.errors.push(format!("push ({}): {}", o.code, o.stderr.lines().last().unwrap_or("")));
-                }
-                Err(e) => s.errors.push(format!("push: {e}")),
-            }
-            drop(s);
-            std::thread::sleep(std::time::Duration::from_millis(50 << attempt));
-        }
-        let mut s = out.lock().unwrap();
-        if landed {
-            s.landings += 1;
-            s.iteration.push(t_iter.elapsed().as_secs_f64());
-        } else {
-            s.failures += 1;
-        }
+        s.landings += 1;
+        s.iteration.push(t_iter.elapsed().as_secs_f64());
     }
 }
 
 fn lock_json(t: &TraceSummary) -> Value {
     let l = t.lock("local");
-    let r = t.lock("remote");
     json!({
         "local_wait_ms": l.wait_ms, "local_hold_ms": l.hold_ms, "local_max_hold_ms": l.max_hold_ms, "local_acquisitions": l.acquisitions, "local_failed_attempts": l.failed_attempts,
-        "remote_wait_ms": r.wait_ms, "remote_hold_ms": r.hold_ms, "remote_max_hold_ms": r.max_hold_ms, "remote_acquisitions": r.acquisitions,
         "snapshots_read": t.snapshots_distinct,
     })
 }
@@ -237,13 +202,12 @@ fn one(b: &Bench, n: usize, iters: usize, traced: bool, subs: &[(String, Vec<Str
         "landings": s.landings,
         "landings_per_min": s.landings as f64 / wall * 60.0,
         "failures": s.failures,
-        "retries": s.retries,
         "errors": errors,
-        "latency": {"exec": lat(&mut s.exec), "tag_set": lat(&mut s.tag), "push": lat(&mut s.push), "iteration": lat(&mut s.iteration)},
+        "latency": {"exec": lat(&mut s.exec), "tag_set": lat(&mut s.tag), "iteration": lat(&mut s.iteration)},
         "maxrss_mib": s.rss_kib as f64 / 1024.0,
     });
     if traced {
-        v["locks"] = json!({"exec": lock_json(&s.traces[0]), "tag_set": lock_json(&s.traces[1]), "push": lock_json(&s.traces[2])});
+        v["locks"] = json!({"exec": lock_json(&s.traces[0]), "tag_set": lock_json(&s.traces[1])});
     }
     v
 }
@@ -251,8 +215,6 @@ fn one(b: &Bench, n: usize, iters: usize, traced: bool, subs: &[(String, Vec<Str
 /// Run the profile for each N (capped at twice the CPUs).
 pub fn run(b: &mut Bench, ns: &[usize], iters: usize, trace_iters: usize) -> Result<Vec<Value>> {
     let repo = b.repo.clone();
-    let remote = b.dir.join("remote-agents");
-    remove_tree(&remote, &b.dir)?;
     let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let cap = cpus * 2;
     let max_n = ns.iter().copied().max().unwrap_or(1).min(cap);
@@ -260,15 +222,9 @@ pub fn run(b: &mut Bench, ns: &[usize], iters: usize, trace_iters: usize) -> Res
     if subs.is_empty() {
         return Err(anyhow!("no subtrees for agents"));
     }
-    let store = b.manifest["store_disk_bytes_packed"].as_u64().or(b.manifest["store_disk_bytes_loose"].as_u64()).unwrap_or(2_000_000_000);
-    b.preflight("agents remote", store + 2_000_000_000)?;
-    let _ = b.env.run(&repo, &["remote", "rm", "agents"], false);
-    b.env.ok(&repo, &["remote", "add", "agents", &remote.display().to_string()])?;
     for i in 0..max_n {
         b.env.ok(&repo, &["tag", "set", &format!("agent-{i}"), "-r", "main", "--allow-backwards"])?;
     }
-    b.say("agents: initial push of main to the agents remote");
-    b.env.ok(&repo, &["push", "agents", "-t", "main"])?;
     let mut results = Vec::new();
     for &n0 in ns {
         let n = n0.min(cap);
@@ -280,10 +236,10 @@ pub fn run(b: &mut Bench, ns: &[usize], iters: usize, trace_iters: usize) -> Res
         let mut v = one(b, n, iters, false, &subs);
         v["requested"] = json!(n0);
         b.say(&format!(
-            "  {} landings in {:.1} s ({:.1}/min), {} failures, {} retries; exec p50 {:.2} s p95 {:.2} s; push p50 {:.2} s p95 {:.2} s",
-            v["landings"], v["wall_secs"].as_f64().unwrap_or(0.0), v["landings_per_min"].as_f64().unwrap_or(0.0), v["failures"], v["retries"],
+            "  {} landings in {:.1} s ({:.1}/min), {} failures; exec p50 {:.2} s p95 {:.2} s; tag p50 {:.2} s p95 {:.2} s",
+            v["landings"], v["wall_secs"].as_f64().unwrap_or(0.0), v["landings_per_min"].as_f64().unwrap_or(0.0), v["failures"],
             v["latency"]["exec"]["p50"].as_f64().unwrap_or(0.0), v["latency"]["exec"]["p95"].as_f64().unwrap_or(0.0),
-            v["latency"]["push"]["p50"].as_f64().unwrap_or(0.0), v["latency"]["push"]["p95"].as_f64().unwrap_or(0.0),
+            v["latency"]["tag_set"]["p50"].as_f64().unwrap_or(0.0), v["latency"]["tag_set"]["p95"].as_f64().unwrap_or(0.0),
         ));
         results.push(v);
         check_stop()?;
@@ -291,20 +247,16 @@ pub fn run(b: &mut Bench, ns: &[usize], iters: usize, trace_iters: usize) -> Res
             b.say(&format!("agents: N = {n} traced, {trace_iters} iterations each"));
             let mut v = one(b, n, trace_iters, true, &subs);
             v["requested"] = json!(n0);
-            for c in ["exec", "tag_set", "push"] {
+            for c in ["exec", "tag_set"] {
                 b.say(&format!(
-                    "  {c}: local lock wait {:.0} ms hold {:.0} ms; remote lock wait {:.0} ms hold {:.0} ms",
+                    "  {c}: local lock wait {:.0} ms hold {:.0} ms",
                     v["locks"][c]["local_wait_ms"].as_f64().unwrap_or(0.0),
                     v["locks"][c]["local_hold_ms"].as_f64().unwrap_or(0.0),
-                    v["locks"][c]["remote_wait_ms"].as_f64().unwrap_or(0.0),
-                    v["locks"][c]["remote_hold_ms"].as_f64().unwrap_or(0.0),
                 ));
             }
             results.push(v);
             check_stop()?;
         }
     }
-    let _ = b.env.run(&repo, &["remote", "rm", "agents"], false);
-    remove_tree(&remote, &b.dir)?;
     Ok(results)
 }

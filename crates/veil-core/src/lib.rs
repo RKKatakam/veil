@@ -23,7 +23,7 @@
 //!
 //! | Feature | Default | What it adds |
 //! |---------|---------|--------------|
-//! | `os` | yes | `DiskBackend`, `SftpBackend`, process checks and a heartbeat thread in the [`lock`], worker threads, the system clock |
+//! | `os` | yes | `DiskBackend`, process checks and a heartbeat thread in the [`lock`], worker threads, the system clock |
 //! | `zstd` | yes | the zstd C library: compressed and delta pack entries |
 //! | `ruzstd` | no | a pure-Rust zstd decoder that reads every pack without the C library |
 //! | `wasm` | no | `ruzstd` plus WebCrypto randomness: with `--no-default-features`, the engine for `wasm32-unknown-unknown` |
@@ -79,7 +79,6 @@ pub mod object;
 pub mod oplog;
 pub mod pack;
 pub mod policy;
-pub mod push_plan;
 pub mod remote;
 pub mod rename;
 pub mod repo;
@@ -109,9 +108,9 @@ pub use id::{ChangeId, ObjectId};
 pub use identity::Identity;
 pub use object::{Conflict, ConflictTerm, EntryKind, Snapshot, Tree, TreeEntry, Visibility};
 pub use repo::Repo;
-pub use vfs::{MemoryBackend, OverlayBackend, SshUrl, StorageBackend};
+pub use vfs::{MemoryBackend, OverlayBackend, StorageBackend};
 #[cfg(feature = "os")]
-pub use vfs::{DiskBackend, SftpBackend};
+pub use vfs::DiskBackend;
 pub use vpath::VPath;
 
 #[cfg(not(any(feature = "zstd", feature = "ruzstd")))]

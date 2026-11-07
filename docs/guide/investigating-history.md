@@ -1,14 +1,14 @@
 # Investigating history
 
-> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). Where this page mentions cloaking, scopes, isolated files or path and SSH remotes, the server replaces them with folder access, encrypted secrets and pushes to the server.
+> Only secret files (`.env`, keys) are ever encrypted ("cloaked", for a scope); who sees folders and code is decided by folder access (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). `vl` syncs only through the Veil server.
 
 Who wrote this line, when did this string appear, which change broke the
 build? Veil answers with `vl blame`, `vl grep`, the `vl log` filters and
 `vl bisect`. Renames are detected in `vl status`, `vl diff` and `vl show`.
 
-All of them read history **as you may see it**. Content cloaked for a scope
-you are not in, an unreleased embargo, and your own local-only files never
-show up in their output, not even as a count, and they never decrypt
+All of them read history **as you may see it**. Secret files sealed for a
+scope you are not in, and your own local-only files, never show up in their
+output, not even as a count, and they never decrypt
 anything you do not hold the key for. [Confidentiality](#what-you-cannot-see-stays-out)
 below says exactly what that means.
 
@@ -203,8 +203,8 @@ and anything else, a signal included, stops the bisection, as in Git.
 * The sandbox holds the snapshot only: your `.env` and other isolated files
   are not in it, and no vault secret is injected. `--with-isolated` copies
   your local-only files in, as `vl ws exec --with-isolated` does.
-* A candidate with files you cannot read (cloaked for someone else, or
-  shown as their last public version) may give a misleading verdict:
+* A candidate with files you cannot read (secret files sealed for someone
+  else) may give a misleading verdict:
   `bisect run` marks it `skip` and says so. `--trust-partial` keeps the
   verdict instead.
 * The state lives in `.veil/local/bisect.json` on this device only.
@@ -218,23 +218,14 @@ executes code.
 
 These tools never show you more than `vl cat` and a checkout would:
 
-* **Cloaked content you hold no key for** is never opened. `vl blame` and
-  `vl grep` read a public file edited on a cloaked line as its last public
-  version: blame attributes nothing to the cloaked change, and grep labels
-  such hits `(last public version)` (`"tier": "fallback"` in JSON), since
-  members see newer content there. A file with no public version is
-  skipped: blame refuses it with the usual explanation, grep counts it in
+* **Sealed secret files you hold no key for** are never opened: blame
+  refuses them with the usual explanation, grep counts them in
   `skipped.sealed`, and `vl log -S` leaves the snapshot out (with
   `--show-skipped` it is listed as `not searched: sealed for …`). Nothing is
   ever matched or counted on ciphertext.
-* **An unreleased embargo** looks to you exactly like its pre-merge tree:
-  `vl log -- src/vuln.c`, `vl log -S <the fixed line>`, `vl blame` and
-  rename detection do not reveal which files the fix touched or created.
 * **Local-only files** (isolated, quarantined, ignored) are in no snapshot,
   so none of these tools can find them.
-* `vl blame --public` shows the history as a public mirror sees it, for a
-  screenshot or a bug report. With `--json`, a description the mirror
-  cannot read (cloaked, or under an unreleased embargo) is hidden even if
-  you hold its key (`description_hidden`, reason `not_public`).
+* `vl blame --public` shows the history as a public mirror sees it (no
+  sealed versions), for a screenshot or a bug report.
 * Search memos live in memory only: nothing derived from sealed content is
   written to disk.

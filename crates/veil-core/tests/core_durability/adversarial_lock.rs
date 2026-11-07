@@ -9,117 +9,11 @@ use std::{
 
 use adversarial_support::*;
 use veil_core::{
-    lock::{LockInfo, LockOptions, RepoLock},
-    now_millis, MemoryBackend, Repo, StorageBackend, VeilError,
+    lock::RepoLock,
+    now_millis, MemoryBackend, Repo, StorageBackend,
 };
 
 const LOCK: &str = ".veil/lock";
-
-/// A slow transaction (e.g. snapshotting a huge tree) holds the lock for more
-/// than two minutes. The MVP judged staleness by age alone, so a second
-/// process stole the lock and one operation silently disappeared.
-///
-/// Adapted to the renewed-lease lock (the original planted a legacy
-/// `"<pid> <millis>"` file over the live lock, which the current lock
-/// rightly treats as tampering; see the next test). Here A's lock file is
-/// rewritten in the current format to look like a lease that expired two
-/// minutes ago, held by another process on this machine that is still
-/// running (a live child). B, a separate handle in its own thread, must
-/// wait rather than steal, and both operations must be recorded.
-///
-/// Adapted again for BUG-052 (pid reuse): the planted lock records the
-/// child's start time, as every current lock does for its holder. Without
-/// it, a lock "acquired" two minutes before its pid's process started is
-/// exactly what a dead holder's lock with a reused pid looks like, and is
-/// taken over (`adversarial2_durability::a_reused_pid_does_not_keep_a_dead_holders_lock`).
-#[test]
-#[cfg(unix)]
-fn a_live_lock_holder_is_never_robbed() {
-    // Transactions hold the lock up to format 5 (and on remotes).
-    let (mut a, fs, _) = new_repo_v5("alice");
-    let base = commit_files(&mut a, &*fs, &[("f", "1\n")], "base");
-    let mut alive = std::process::Command::new("sleep").arg("60").spawn().expect("spawn `sleep`");
-
-    let mut tx_a = a.transaction("slow op by A").unwrap();
-    // ...A is still working, 121 s after its lease was last renewed:
-    let mut info = LockInfo::parse(&fs.read(&p(LOCK)).unwrap()).expect("current lock format");
-    info.pid = alive.id();
-    info.acquired = now_millis() - 121_000;
-    info.renewed = info.acquired;
-    let mut planted = serde_json::to_value(&info).unwrap();
-    let start = veil_core::lock::process_start(alive.id()).expect("start time of a live child");
-    planted["pid_start"] = start.id.into();
-    fs.write(&p(LOCK), &serde_json::to_vec(&planted).unwrap()).unwrap();
-
-    let b = std::thread::spawn({
-        let fs = fs.clone();
-        move || {
-            let mut b = Repo::open(fs, None, "bob").unwrap();
-            let mut tx_b = b.transaction("op by B").unwrap();
-            let entered = Instant::now();
-            tx_b.view.tags.insert("from-b".into(), veil_core::oplog::Tag::new(base, None));
-            tx_b.commit().unwrap();
-            entered
-        }
-    });
-    std::thread::sleep(Duration::from_millis(1500));
-    assert!(!b.is_finished(), "B entered while A held the lock");
-    tx_a.view.tags.insert("from-a".into(), veil_core::oplog::Tag::new(base, None));
-    tx_a.commit().expect("A's lock was not taken over");
-    let committed = Instant::now();
-    let b_entered = b.join().unwrap();
-    let _ = alive.kill();
-    let _ = alive.wait();
-
-    assert!(b_entered >= committed, "B entered before A released the lock");
-    let head = Repo::open(fs.clone(), None, "x").unwrap();
-    assert!(
-        head.view().tags.contains_key("from-a") && head.view().tags.contains_key("from-b"),
-        "an operation was lost: tags = {:?}",
-        head.view().tags.keys().collect::<Vec<_>>()
-    );
-    let log: Vec<String> = head.op_log(3).unwrap().into_iter().map(|(_, op)| op.description).collect();
-    assert_eq!(log[..2], ["op by B".to_string(), "slow op by A".to_string()], "linear op log");
-}
-
-/// A lock file replaced behind the holder's back (tampering, or a legacy
-/// `"<pid> <millis>"` file naming this process with no token) may be
-/// reclaimed. Nothing is lost silently: the original holder can no longer
-/// commit and gets an error, and the new holder's operation is recorded.
-/// A legacy lock naming a live process is never reclaimed.
-#[test]
-#[cfg(unix)]
-fn a_tampered_lock_is_reclaimed_and_its_holder_cannot_commit() {
-    // Transactions hold the lock up to format 5 (and on remotes).
-    let (mut a, fs, _) = new_repo_v5("alice");
-    let base = commit_files(&mut a, &*fs, &[("f", "1\n")], "base");
-    let mut b = Repo::open(fs.clone(), None, "bob").unwrap();
-
-    let mut tx_a = a.transaction("op by A").unwrap();
-    fs.write(&p(LOCK), format!("{} {}", std::process::id(), now_millis() - 121_000).as_bytes()).unwrap();
-    let mut tx_b = b.transaction("op by B").expect("a tokenless lock of this process is reclaimed");
-    tx_b.view.tags.insert("from-b".into(), veil_core::oplog::Tag::new(base, None));
-    tx_b.commit().unwrap();
-    tx_a.view.tags.insert("from-a".into(), veil_core::oplog::Tag::new(base, None));
-    let err = tx_a.commit().expect_err("A must notice that it lost the lock");
-    assert!(matches!(err, VeilError::Locked(_)), "{err}");
-    let head = Repo::open(fs.clone(), None, "x").unwrap();
-    assert!(head.view().tags.contains_key("from-b") && !head.view().tags.contains_key("from-a"));
-
-    // Legacy format, live holder on this machine: never robbed. (A legacy
-    // lock records no start time, so the holder must be a process that was
-    // already running when the lock was taken: one started after it cannot
-    // be its holder, BUG-052. Init, pid 1, was running long before.)
-    let legacy = format!("1 {}", now_millis() - 600_000);
-    fs.write(&p(LOCK), legacy.as_bytes()).unwrap();
-    let quick = LockOptions {
-        wait: Duration::from_millis(300),
-        ..LockOptions::default()
-    };
-    let err = RepoLock::acquire_with(fs.clone(), &quick).unwrap_err();
-    assert!(err.to_string().contains("still running"), "{err}");
-    assert_eq!(fs.read(&p(LOCK)).unwrap(), legacy.as_bytes(), "lock untouched");
-}
 
 #[test]
 fn dropping_a_lock_never_releases_someone_elses_lock() {
@@ -176,7 +70,7 @@ fn concurrent_writers_never_lose_operations() {
                 let mut r = Repo::open(fs, None, &format!("t{t}")).unwrap();
                 for i in 0..per {
                     let mut tx = r.transaction(format!("t{t}-{i}")).unwrap();
-                    tx.view.tags.insert(format!("t{t}-{i}"), veil_core::oplog::Tag::new(base, None));
+                    tx.view.tags.insert(format!("t{t}-{i}"), veil_core::oplog::Tag::new(base));
                     tx.commit().unwrap();
                 }
             })
@@ -201,7 +95,7 @@ fn concurrent_snapshots_of_different_workspaces_are_all_recorded() {
     let mut init = Repo::init(fs.clone(), Some(veil_core::Identity::generate("a")), "a").unwrap();
     let base = commit_files(&mut init, &*fs, &[("f", "1\n")], "base");
     for i in 0..4 {
-        init.create_workspace(&format!("w{i}"), vec![base], None).unwrap();
+        init.create_workspace(&format!("w{i}"), vec![base]).unwrap();
     }
     let handles: Vec<_> = (0..4)
         .map(|i| {
@@ -282,7 +176,7 @@ fn slow_snapshot_serialises_with_a_concurrent_writer() {
             let start = Instant::now();
             let mut tx = r.transaction("concurrent tag").unwrap();
             let root = tx.repo().root_id();
-            tx.view.tags.insert("b".into(), veil_core::oplog::Tag::new(root, None));
+            tx.view.tags.insert("b".into(), veil_core::oplog::Tag::new(root));
             tx.commit().unwrap();
             start.elapsed()
         }

@@ -638,6 +638,10 @@ pub struct Classification {
     /// *accepted* classification, and `held_back` holds what the working
     /// copy's policy wanted (`(tier, public!)`).
     pub held_back: Option<(Tier, bool)>,
+    /// A `cloak` line decided this path, which is not a secret file: it is
+    /// isolated instead (only secret files are sealed). An editor or backup
+    /// artefact of a sealed secret still takes the secret's scope.
+    cloak_demoted: bool,
 }
 
 impl Classification {
@@ -765,6 +769,12 @@ impl Policy {
                 Some("ignore" | "ignored") => (Tier::Ignored, false),
                 Some(other) => invalid(format!("unknown tier '{other}'")),
             };
+            if matches!(tier, Tier::Cloaked(_)) && !names_secret(&parts[0]) {
+                policy.warnings.push(format!(
+                    "{at}: `cloak` seals secret files only (.env, keys, ...): what '{}' names that is not a secret file is isolated (kept on this device); give folders access with `vl access`",
+                    parts[0]
+                ));
+            }
             match Rule::new(&parts[0], tier.clone(), force, false, false) {
                 Ok(mut r) => {
                     r.grantees = grantees;
@@ -954,6 +964,10 @@ impl Policy {
             }
         }
         let mut hit = self.rules.iter().zip(&matched).filter(|(_, m)| **m).map(|(r, _)| r).peekable();
+        // A built-in rule names the path: a secret file (`.env`), or its
+        // public example (`.env.example`), the only paths a `cloak` line
+        // seals.
+        let secret_file = hit.peek().is_some_and(|r| r.builtin);
         // Built-in rules come first.
         while let Some(r) = hit.next_if(|r| r.builtin) {
             c.builtin_secret = r.secret;
@@ -973,8 +987,24 @@ impl Policy {
         if c.tier == Tier::Cloaked(RULE_SCOPE.to_string()) {
             c.tier = Tier::Cloaked(rule_scope(&self.access, &name));
         }
+        // Only secret files are ever sealed: a `cloak` line keeps any other
+        // file on the device, failing safe (its parse warned). A directory
+        // is not demoted: the secret files under it are sealed, the rest is
+        // isolated file by file (what walks directories descends into it).
+        if matches!(c.tier, Tier::Cloaked(_)) && !secret_file && !is_dir {
+            c.tier = Tier::Isolated;
+            c.cloak_demoted = true;
+        }
         c
     }
+}
+
+/// Does the pattern `pattern`, read as a path, name a built-in secret file
+/// (`.env`, `*.pem`, …)? A `cloak` line whose pattern does not is warned
+/// about (and `vl cloak` refuses it): it seals nothing.
+pub fn names_secret(pattern: &str) -> bool {
+    let name = crate::vpath::nfc(pattern.trim_end_matches('/'));
+    builtin_rules().1.is_match(&*name)
 }
 
 impl Classification {
@@ -990,6 +1020,7 @@ impl Classification {
             builtin_artefact: false,
             artefact_of: None,
             held_back: None,
+            cloak_demoted: false,
         }
     }
 
@@ -1023,6 +1054,7 @@ impl Classification {
     /// classification does.
     fn inherit(&mut self, base: &Classification, base_path: &VPath) {
         let stronger = match (&self.tier, &base.tier) {
+            (Tier::Isolated, Tier::Cloaked(_)) if self.cloak_demoted => true,
             (_, Tier::Public) | (Tier::Isolated, _) => false,
             (_, Tier::Isolated) => true,
             (Tier::Ignored, _) => false,
@@ -1040,6 +1072,7 @@ impl Classification {
             self.rule = base.rule.clone();
             self.blocked_exposure = false;
             self.builtin_secret = base.builtin_secret;
+            self.cloak_demoted = false;
             self.artefact_of = Some(base.artefact_of.clone().unwrap_or_else(|| base_path.clone()));
         }
     }
@@ -1787,7 +1820,12 @@ mod tests {
         let p = Policy::parse(
             "secrets/  cloak ops\n*.log ignore\n.env public\nconfig/.env cloak\nfixtures/ public!\ntarget/ ignore\n",
         );
-        assert_eq!(class(&p, "secrets/db.yml"), Tier::Cloaked("ops".into()));
+        assert_eq!(class(&p, "secrets/.env.db"), Tier::Cloaked("ops".into()));
+        // Only secret files are sealed: a `cloak` line keeps anything else
+        // on the device, and says so.
+        assert_eq!(class(&p, "secrets/db.yml"), Tier::Isolated);
+        assert!(p.warnings.iter().any(|w| w.contains(".veilpolicy:1") && w.contains("seals secret files only")), "{:?}", p.warnings);
+        assert!(!p.warnings.iter().any(|w| w.contains(".veilpolicy:4")), "config/.env is a secret file: {:?}", p.warnings);
         assert_eq!(class(&p, "a/b/x.log"), Tier::Ignored);
         let c = p.classify(&VPath::new(".env").unwrap(), false);
         assert_eq!(c.tier, Tier::Isolated, "plain `public` cannot expose a builtin secret");
@@ -1804,12 +1842,12 @@ mod tests {
     fn escapes_and_fields() {
         let p = Policy::parse(&format!(
             "{} cloak\n{} isolate # comment\nissue\\#1.md ignore\n",
-            escape_literal("config[prod].yml"),
+            escape_literal(".env.[prod]"),
             escape_literal("my notes.txt")
         ));
         assert!(p.warnings.is_empty(), "{:?}", p.warnings);
-        assert_eq!(class(&p, "config[prod].yml"), Tier::Cloaked("team".into()));
-        assert_eq!(class(&p, "configp.yml"), Tier::Public, "no longer a character class");
+        assert_eq!(class(&p, ".env.[prod]"), Tier::Cloaked("team".into()));
+        assert_eq!(class(&p, ".env.p"), Tier::Isolated, "no longer a character class: only the built-in rule");
         assert_eq!(class(&p, "my notes.txt"), Tier::Isolated);
         assert_eq!(class(&p, "issue#1.md"), Tier::Ignored);
         assert_eq!(escape_field("a b#c\\#d*"), "a\\ b\\#c\\#d*");
@@ -1817,8 +1855,8 @@ mod tests {
 
     #[test]
     fn protective_rules_ignore_case_exposing_rules_do_not() {
-        let p = Policy::parse("secrets/ cloak\nkeys/ isolate\nfixtures/ public!\nbuild/ ignore\n");
-        assert_eq!(class(&p, "Secrets/a"), Tier::Cloaked("team".into()));
+        let p = Policy::parse("secrets/.env.* cloak\nkeys/ isolate\nfixtures/ public!\nbuild/ ignore\n");
+        assert_eq!(class(&p, "Secrets/.ENV.a"), Tier::Cloaked("team".into()));
         assert_eq!(class(&p, "KEYS/a"), Tier::Isolated);
         assert_eq!(class(&p, "Fixtures/a"), Tier::Public);
         assert_eq!(p.classify(&VPath::new("Fixtures/a.pem").unwrap(), false).tier, Tier::Isolated);
@@ -1834,18 +1872,19 @@ mod tests {
         assert!(w("", ".env public!\n", ".env"), "isolated → public");
         assert!(w("", ".env cloak\n", ".env"), "isolated → cloaked");
         assert!(!w("", ".env ignore\n", ".env"), "isolated → ignored stays local");
-        assert!(w("s/ cloak ops\n", "", "s/a"), "cloaked → public");
-        assert!(w("s/ cloak ops\n", "s/ cloak team\n", "s/a"), "another audience");
-        assert!(!w("s/ cloak ops\n", "s/ isolate\n", "s/a"));
+        assert!(w("s/.env cloak ops\n", "s/.env public!\n", "s/.env"), "cloaked → public");
+        assert!(w("s/.env cloak ops\n", "s/.env cloak team\n", "s/.env"), "another audience");
+        assert!(!w("s/.env cloak ops\n", "s/.env isolate\n", "s/.env"));
         assert!(w("", "t/ public!\n", "t/a"), "scanning turned off");
         assert!(!w("t/ public!\n", "", "t/a"));
         assert!(w("k/ ignore\n", "k/ public!\n", "k/id_rsa"), "ignore lifted from a built-in secret");
         assert!(!w("build/ ignore\n", "", "build/out.txt"), "ignore lifted from an ordinary file");
-        assert!(!w("", "x/ cloak\n", "x/a"), "public → cloaked strengthens");
+        assert!(!w("", "x/.env.example cloak\n", "x/.env.example"), "public → cloaked strengthens");
+        assert!(!w("", "x/ cloak\n", "x/a"), "public → isolated (a `cloak` line on what is not a secret) strengthens");
         let g = Policy::parse(".env public!\nsecrets/ public\n").guarded_by(Policy::parse("secrets/ cloak\n"));
         let e = g.classify(&VPath::new(".env").unwrap(), false);
         assert_eq!((e.tier.clone(), e.held_back.clone()), (Tier::Isolated, Some((Tier::Public, true))));
-        assert_eq!(g.classify(&VPath::new("secrets/a").unwrap(), false).tier, Tier::Cloaked("team".into()));
+        assert_eq!(g.classify(&VPath::new("secrets/a").unwrap(), false).tier, Tier::Isolated, "the accepted `cloak` line keeps it local");
         assert_eq!(g.classify(&VPath::new("src/a").unwrap(), false).held_back, None);
     }
 
@@ -1896,7 +1935,7 @@ mod tests {
         }
         assert_eq!(c(".hg", false).tier, Tier::Public, "only a .git file counts, not a .hg file");
         assert_eq!(c("a.git/x", false).tier, Tier::Public);
-        assert_eq!(c("src/main.rs", false).tier, Tier::Cloaked("team".into()));
+        assert_eq!(c("src/main.rs", false).tier, Tier::Isolated, "a `cloak` line on what is not a secret");
         // Only a `public!` naming the directory records it.
         let p = Policy::parse("fixtures/repo/.git/ public!\n**/.hg public!\n");
         let c = |path: &str| p.classify(&VPath::new(path).unwrap(), false);
@@ -2016,6 +2055,8 @@ mod tests {
     #[test]
     fn editor_artefacts_take_their_bases_protection() {
         let p = Policy::parse("notes/** public\nnotes/private.md isolate\nsecrets/ cloak ops\nx/ cloak team\nbuild.log ignore\n");
+        // Only secret files are sealed, so the sealed bases here are keys
+        // (`*.pem`): `secrets/db.yml` itself is isolated.
         let c = |path: &str| p.classify(&VPath::new(path).unwrap(), false);
         for path in [
             "deploy/.id_ed25519.swp",
@@ -2045,15 +2086,18 @@ mod tests {
         assert_eq!(c(".envrc.bak~").artefact_of, Some(VPath::new(".envrc").unwrap()), "unwrapped twice");
         // Cloaked bases: backup copies get the same scope; scratch files stay
         // ignored (they never leave the device) unless a rule lifts that.
-        assert_eq!(c("secrets/db.yml.bak").tier, Tier::Cloaked("ops".into()));
-        assert_eq!(c("secrets/.db.yml.swp").tier, Tier::Ignored);
-        assert_eq!(c("secrets/.db.yml.swp").rule.as_deref(), Some(".*.sw[a-p]"));
-        assert_eq!(c("x/.db.yml.swp").tier, Tier::Ignored, "a plain cloak does not lift the scratch rule");
+        assert_eq!(c("secrets/db.pem").tier, Tier::Cloaked("ops".into()));
+        assert_eq!(c("secrets/db.pem.bak").tier, Tier::Cloaked("ops".into()));
+        assert_eq!(c("secrets/db.yml").tier, Tier::Isolated);
+        assert_eq!(c("secrets/db.yml.bak").tier, Tier::Isolated);
+        assert_eq!(c("secrets/.db.pem.swp").tier, Tier::Ignored);
+        assert_eq!(c("secrets/.db.pem.swp").rule.as_deref(), Some(".*.sw[a-p]"));
+        assert_eq!(c("x/.db.pem.swp").tier, Tier::Ignored, "a plain cloak does not lift the scratch rule");
         let lifted = Policy::parse("secrets/ cloak ops\n*.sw? public!\nx/ cloak team\nx/*.bak cloak ops\n");
-        let k = lifted.classify(&VPath::new("secrets/.db.yml.swp").unwrap(), false);
+        let k = lifted.classify(&VPath::new("secrets/.db.pem.swp").unwrap(), false);
         assert_eq!(k.tier, Tier::Cloaked("ops".into()), "the base's scope, not public: {k:?}");
         assert_eq!(lifted.classify(&VPath::new("src/.main.rs.swp").unwrap(), false).tier, Tier::Public);
-        let k = lifted.classify(&VPath::new("x/db.yml.bak").unwrap(), false);
+        let k = lifted.classify(&VPath::new("x/db.pem.bak").unwrap(), false);
         assert_eq!(k.tier, Tier::Cloaked("team".into()), "the base's scope, not the artefact's: {k:?}");
         // Ignored bases.
         assert_eq!(c("build.log.old").tier, Tier::Ignored);
@@ -2082,7 +2126,7 @@ mod tests {
         assert!(w("", "id_ed25519 public!\n*.swp public!\n", "deploy/.id_ed25519.swp"), "published with its base");
         assert!(w("", "*.swp public!\n", "src/.main.rs.swp"), "the scratch rule lifted");
         assert!(w("", "id_ed25519 public!\n", "deploy/id_ed25519.bak"), "its base published");
-        assert!(w("s/ cloak ops\n", "s/ cloak team\n", "s/a.yml.bak"), "another audience");
+        assert!(w("s/ cloak ops\n", "s/ cloak team\n", "s/a.pem.bak"), "another audience");
         assert!(w("k/ ignore\n", "k/ public!\n", "k/id_rsa.bak"), "ignore lifted from a built-in secret's artefact");
         assert!(!w("k/ ignore\n", "k/ public!\n", "k/.id_rsa.swp"), "the scratch rule still ignores it");
         assert!(!w("", "*.swp isolate\n", "src/.main.rs.swp"));
@@ -2110,8 +2154,10 @@ mod tests {
         for path in ["a/x", "b/x", "c/x", "d/x"] {
             assert_eq!(class(&p, path), Tier::Isolated, "{path}: {:?}", p.warnings);
         }
-        assert_eq!(class(&p, "e["), Tier::Cloaked("team".into()), "a bad glob still protects its literal name");
+        assert_eq!(class(&p, "e["), Tier::Isolated, "a bad glob still protects its literal name (isolated: not a secret file)");
         assert_eq!(class(&p, "f[/k.pem"), Tier::Isolated, "an invalid exposing rule is dropped");
-        assert_eq!(p.warnings.len(), 6, "{:?}", p.warnings);
+        assert_eq!(p.warnings.len(), 7, "{:?}", p.warnings);
+        let p = Policy::parse(".env.x[ cloak\n");
+        assert_eq!(class(&p, ".env.x["), Tier::Cloaked("team".into()), "a bad glob still seals its literal secret name");
     }
 }

@@ -192,12 +192,12 @@ fn log_labels_tags_workspaces_and_empty_changes() {
     let r = env.repo("p");
     r.commit("first", &[("f", "1\n")]);
     r.tag("main", "@-");
-    r.ok(&["tag", "set", "secret-tag", "-r", "@-", "--cloak"]);
+    r.ok(&["tag", "set", "other-tag", "-r", "@-"]);
     r.ok(&["ws", "new", "agent", "-r", "@-"]);
     let log = r.out(&["log"]);
     let first = log.lines().find(|l| l.contains(&r.cid("@-")[..8])).unwrap();
     assert!(first.contains(" main"), "{first}");
-    assert!(first.contains("secret-tag[cloaked:team]"), "{first}");
+    assert!(first.contains("other-tag"), "{first}");
     let wc = log.lines().find(|l| l.contains("default@")).unwrap();
     assert!(wc.contains("default@") && wc.contains("(empty)"), "{wc}");
     assert!(log.contains("agent@"), "{log}");

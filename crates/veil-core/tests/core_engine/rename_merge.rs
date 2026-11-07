@@ -547,69 +547,6 @@ proptest! {
     }
 }
 
-/// Threat review 3 through `vl merge`: a cloaked line (signed by a member,
-/// so its files may be published where the policy says public) edited
-/// `secrets/db.yml`; the destination moved that sealed file to
-/// `docs/db.yml`, which the policy leaves public. The edit follows the
-/// rename and stays sealed there: the rename put it there, not the line,
-/// and only `vl expose` publishes it.
-#[test]
-fn merging_a_cloaked_line_never_publishes_a_followed_rename() {
-    use veil_core::{
-        object::{Snapshot, Text},
-        remote, ChangeId, MemoryBackend, StorageBackend,
-    };
-    let (mut r, fs, _) = new_repo("alice");
-    fs.write(&p(".veilpolicy"), b"secrets/ cloak team\n").unwrap();
-    let body = lines("password", 10);
-    let main0 = commit_files(&mut r, &*fs, &[("secrets/db.yml", &body), ("README", "hi\n")], "v1");
-    let sealed = file_entry(&r, &main0, "secrets/db.yml").unwrap();
-    assert_eq!(sealed.visibility, team());
-    // The cloaked line edits it.
-    r.create_workspace("t", vec![main0], Some("team".into())).unwrap();
-    let o = r.workspace_overlay("t").unwrap();
-    o.write(&p("secrets/db.yml"), edit_line(&body, 4, "password: ROTATED-Q8").as_bytes()).unwrap();
-    r.snapshot_workspace("t", &o).unwrap();
-    let line = r.commit("t", "rotate", false).unwrap().committed;
-    // The destination moves the sealed object to docs/db.yml.
-    let t0 = r.snapshot(&main0).unwrap().tree;
-    let mut root = (*r.store().tree(&t0).unwrap()).clone();
-    root.remove("secrets");
-    let mut docs = Tree::default();
-    docs.insert(TreeEntry { name: "db.yml".into(), ..sealed.clone() });
-    root.insert(TreeEntry::dir("docs", r.store().put_tree(&docs).unwrap()));
-    let moved = r.store().put_tree(&root).unwrap();
-    let mut tx = r.transaction("mv").unwrap();
-    let main1 = tx
-        .write_snapshot(&Snapshot {
-            parents: vec![main0],
-            change_id: ChangeId::random(),
-            tree: moved,
-            description: Text::Plain("move db.yml".into()),
-            author: "alice".into(),
-            timestamp: 2,
-            predecessors: vec![],
-            conflicts: vec![],
-            cloak: None,
-            embargo: None,
-            signature: None,
-        })
-        .unwrap();
-    tx.commit().unwrap();
-    let m = r.merge(WS, main1, vec![line], "merge the line", None).unwrap();
-    assert!(m.renames.iter().any(|f| f.to.as_str() == "docs/db.yml" && f.sealed == Some(team())), "{:?}", m.renames);
-    assert!(!m.declassified.contains(&"docs/db.yml".to_string()), "{:?}", m.declassified);
-    assert!(m.warnings.iter().any(|w| w.contains("docs/db.yml") && w.contains("stays sealed")), "{:?}", m.warnings);
-    let e = file_entry(&r, &m.snapshot, "docs/db.yml").unwrap();
-    let (vis, data) = versions(&r, &e).remove(0);
-    assert_eq!(vis, team());
-    assert!(String::from_utf8(data.unwrap()).unwrap().contains("ROTATED-Q8"), "the edit followed");
-    r.set_tag("main", m.snapshot, None, false).unwrap();
-    let mirror = std::sync::Arc::new(MemoryBackend::new());
-    remote::push(&mut r, mirror.clone(), true, &[], false).unwrap();
-    assert!(backend_contains(mirror.as_ref(), b"ROTATED-Q8").is_empty(), "never published");
-}
-
 /// Threat review 9: a conflict entry is renamed only as the very same
 /// conflict object; the other side's resolution then follows it.
 #[test]

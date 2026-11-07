@@ -25,7 +25,7 @@ veil-bench report  RESULTS.json… > docs/design/scale/BENCH.md (appends a dated
 | `small` | 100 MB | 3,500 | 1,000 snapshots | smoke test; minutes |
 | `1g` | 1 GB | 35,000 | 10,000 snapshots, a merge every 50, 20 tags | 70 % synthetic source (zstd ratio about 4), 20 % JSON/YAML, 10 % incompressible binaries of 100 KB–20 MB |
 | `5g` | 5 GB | 150,000 | 20,000 snapshots | as `1g`, plus 4 binaries of 200–400 MB (the large-file paths) |
-| `cloaked-1g` | 1 GB | 35,000 | 10,000 snapshots | 85 % of files under `cloak` rules for scopes `a` and `b`; one cloaked line; one unreleased embargo whose fix line has 50 snapshots; isolated `.env` files |
+| `cloaked-1g` | 1 GB | 35,000 | 10,000 snapshots | 85 % of files under access lines for groups `a` and `b` (the name is historical: since repository format 8 only secret files are encrypted); one unreleased embargo whose fix line has 50 snapshots; isolated `.env` files |
 
 - **Directory shape:** fan-out of about 20 and depth up to 8, with file sizes log-normal around 30 KB.
 - **Edits per snapshot:** 1–20 files, with renames and deletions at about 2 %.
@@ -92,7 +92,7 @@ Measured on this machine: **17 GB free** on `/` (ext4, no reflinks) and 7 GB on 
 |---|---|---|
 | `small` | under 1 GB | — |
 | `1g` | about 5 GB | working tree 1 GB, store about 0.4 GB, remote 0.4 GB, clone 1.4 GB, 32 sparse sandboxes about 1.6 GB |
-| `cloaked-1g` | about 6 GB | sealed objects neither compress nor delta: store and remote about 1 GB each |
+| `cloaked-1g` | about 6 GB | estimated when the profile sealed its files (sealed objects neither compress nor delta): store and remote about 1 GB each |
 | `5g` | about 10 GB | phases in sequence: init, status, commit and gc (5 + 1.5); push (+1.5); **delete the source working tree** (−5); clone (+6.5); delete the clone before the next case |
 
 - **Location.** Everything lives under `.scratch/bench/` of the bench's worktree.

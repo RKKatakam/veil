@@ -21,7 +21,7 @@ impl Env {
 
     fn cmd(&self, user: &str, cwd: &Path, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_vl"));
-        c.args(args)
+        c.env("VEIL_TEST_PATH_REMOTES", "1").args(args)
             .current_dir(cwd)
             .env("VEIL_HOME", self.root.join(format!("home-{user}")))
             .env("VEIL_USER", user)
@@ -247,32 +247,4 @@ fn revoke_lists_the_secrets_to_rotate() {
     assert!(env
         .fails("bob", &bob_dir, &["secret", "set", "--scope", "team", "DB_PASSWORD", "x"])
         .contains("not a member"));
-}
-
-/// BUG-524: `vl secret set --scope` brings the scope's key ring up to date
-/// from the team remotes first, so a teammate who has not pulled a
-/// revocation still seals a new value under the current generation; with
-/// no reachable remote it warns.
-#[test]
-fn a_write_checks_the_key_ring_against_the_team_remote_first() {
-    let env = Env::new();
-    let (proj, _bob_dir, bob) = setup(&env);
-    let carol = env.public_key("carol");
-    env.ok("alice", &proj, &["scope", "grant", "team", &carol, "--name", "carol"]);
-    env.ok("alice", &proj, &["push"]);
-    env.ok("carol", &env.root, &["clone", "team", "carol"]);
-    let carol_dir = env.root.join("carol");
-    env.ok("alice", &proj, &["scope", "revoke", "team", &bob]);
-    env.ok("alice", &proj, &["push"]);
-    // Carol has not pulled the revocation.
-    let (_, err) = env.ok2("carol", &carol_dir, &["secret", "set", "--scope", "team", "NEW_KEY", "fresh"]);
-    assert!(err.contains("Updated the key ring of scope team from remote origin"), "{err}");
-    let (list, _) = env.ok2("carol", &carol_dir, &["secret", "list", "--scope", "team"]);
-    assert!(list.contains("NEW_KEY") && list.contains("key generation 1"), "{list}");
-    // Unreachable: a warning, and the write still happens.
-    let gone = env.root.join("team-moved");
-    std::fs::rename(env.root.join("team"), &gone).unwrap();
-    std::fs::write(env.root.join("team"), "not a directory").unwrap();
-    let (_, err) = env.ok2("carol", &carol_dir, &["secret", "set", "--scope", "team", "OFFLINE_KEY", "v"]);
-    assert!(err.contains("could not check that the key ring of scope team is current"), "{err}");
 }

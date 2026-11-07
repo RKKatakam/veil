@@ -52,15 +52,15 @@ A layer:
 - **Generation** is the topological level: 1 + the largest of the parents' levels, and 1 for the root.
   - It is `GEN_UNKNOWN` (`u32::MAX`) when any parent is missing or has `GEN_UNKNOWN`. That propagates to descendants until the parent arrives (threat 4).
   - Timestamps are not trusted for pruning: a snapshot's `timestamp` is chosen by its author.
-- **`flags`** (plaintext fields of the snapshot): `EMBARGO_MERGE` (`embargo` set, with 2+ parents), `CLOAKED` (`cloak` set), `WRAPPER` (its tree is an embargo wrapper), `BLOOM_FULL`, `BLOOM_UNKNOWN`.
+- **`flags`** (plaintext fields of the snapshot): `EMBARGO_MERGE` (`embargo` set, with 2+ parents), `BLOOM_FULL`, `BLOOM_UNKNOWN`. (The design's `CLOAKED` and `WRAPPER` flags went with the snapshot's `cloak` field and embargo wrappers in repository format 8.)
 - **The Bloom filter** (changed paths, against the first parent): Git's parameters, 10 bits per entry, 7 hashes (BLAKE3-keyed, context `veil 2026 graph-bloom v1`), at most 512 entries; above that `BLOOM_FULL` means "maybe" for every path.
 
 ### What goes into the Bloom filter: the public projection
 
 The filter is computed from **what a reader with no keys sees**, never from decrypted trees (threat 1). `graph_index::changed_paths(store, tree, parent_tree)` diffs the two trees:
 - **Plaintext directories** (`EntryKind::Dir` with `visibility.is_public()`, the rule `remote::local_trees` uses): descend; add every changed path and each of its ancestor directories.
-- **A changed entry that is not a public directory** (a sealed directory, a file sealed or not): add its path. A sealed directory is not descended into; its path is added as a **boundary key**, `"\x01" ‖ path`.
-- **An embargo wrapper tree** (`embargo::unreleased_wrapper` or any wrapper marker) on either side: add only the root boundary `"\x01"`. The fix's file names never enter the index (threat 2).
+- **A changed entry that is not a public directory** (a sealed directory, a file sealed or not): add its path. A sealed directory is not descended into; its path is added as a **boundary key**, `"\x01" ‖ path`. (Sealed directories were removed in repository format 8.)
+- **An embargo wrapper tree**: Removed in repository format 8 (only secret files are encrypted).
 - **A snapshot whose trees are not local** (a partial clone, item 6): `BLOOM_UNKNOWN`.
 
 A query `maybe_touches(id, path)` answers true if the filter holds `path`, or holds `"\x01" ‖ a` for any ancestor directory `a` of `path` (including the root `"\x01"`), or the entry is `FULL` or `UNKNOWN`. False means "provably unchanged for every reader".
@@ -112,15 +112,13 @@ impl GraphIndex {
 
 ## Threat review
 
-1. **Sealed paths leak into the index.** Bloom filters built from decrypted trees would let anyone holding `.veil/` (a stolen laptop, a backup, an agent on the machine without the identity) test "did any change touch `secrets/acquisition/plan.md`", which today's at-rest sealing hides.
+1. **Sealed paths leak into the index.** Bloom filters built from decrypted trees would let anyone holding `.veil/` (a stolen laptop, a backup, an agent on the machine without the identity) test "did any change touch `deploy/.env.acquisition`", which at-rest sealing hides.
    - *Invariant:* the index bytes are a function of plaintext objects only: built with no identity, they are byte-identical to the index built with every key.
-   - *Test:* a property test over random histories with cloaked directories, cloaked lines, isolated files and embargoes. `vl index rebuild` with `VEIL_HOME` empty and then with the full identity must give identical files.
-2. **The fix's file names under an embargo.** Confinement exists to keep them unpublished (BUG-681); an index entry for the embargoed merge that named them would undo it locally.
-   - *Invariant:* a wrapper tree contributes only the root boundary.
-   - *Test:* two embargoed merges that differ only in which file the fix touched give byte-identical layers.
+   - *Test:* a property test over random histories with sealed secret files, isolated files and embargoes. `vl index rebuild` with `VEIL_HOME` empty and then with the full identity must give identical files.
+2. **The fix's file names under an embargo.** Removed in repository format 8 (only secret files are encrypted). Embargoes are not encrypted, and an unreleased embargo is withheld from every push.
 3. **A false negative in the Bloom filter.** `vl log -- p` and `blame` miss a change, or a security check that someday uses the filter misses something.
    - *Invariant:* `maybe_touches(id, p) == false` implies that the full diff of `id` against its first parent, for **any** reader, changes nothing at or below `p`.
-   - *Test:* a property test against the full diff for every reader (no keys, member of S, embargo key holder) over trees with sealed boundaries, renames, conflicts, symlinks, `BLOOM_FULL` edits (600 files) and wrappers.
+   - *Test:* a property test against the full diff for every reader (no keys, member of S) over trees with sealed files, renames, conflicts, symlinks and `BLOOM_FULL` edits (600 files).
 4. **A stale generation after a missing parent arrives.** A public clone sees an embargoed merge with its extra parents redacted. After the release, the next pull brings them. Had the merge been given a finite generation, a parent arriving with a higher one would break `gen(a) < gen(b)`, and `is_ancestor` would answer false. `embargo_withheld` and confinement would then miss the fix line, and something withheld would be pushed.
    - *Invariant:* no entry with a missing parent, or a parent with `GEN_UNKNOWN`, has a finite generation; `GEN_UNKNOWN` never prunes a walk. When a snapshot listed in any layer's `missing_parents` arrives, the layers from the lowest one holding that entry are rebuilt.
    - *Test:* public clone, embargoed merge, release, pull. `is_ancestor`, `range` and `embargo_withheld` equal the naive walks, and a public push afterwards sends exactly what the naive push sends.
@@ -128,7 +126,7 @@ impl GraphIndex {
    - *Invariant:* every layer is checksummed and its records are bounds-checked on open. Any failure ignores the whole chain (with a note), so queries fall back to object reads, and the next maintenance rebuilds it. A layer never gives a wrong answer silently.
    - *Test:* flip each byte (sampled) and truncate each layer; every query equals the naive walk.
 6. **A tampered index steers a security decision.** A crafted layer says X is not an ancestor of Y, and `embargo_withheld` stops early and sends the fix.
-   - *Invariant:* walks behind push filtering, `embargo_withheld`, confinement and `merged_in_signed_by` read each snapshot they visit anyway (for `embargo`, `cloak` and signatures). They check that the index's parents equal the object's, and that each edge's generation strictly decreases. A mismatch raises `IndexCorrupt`, which drops the index and re-runs the walk without it.
+   - *Invariant:* walks behind push filtering, `embargo_withheld`, confinement and `merged_in_signed_by` read each snapshot they visit anyway (for `embargo` and signatures). They check that the index's parents equal the object's, and that each edge's generation strictly decreases. A mismatch raises `IndexCorrupt`, which drops the index and re-runs the walk without it.
    - *Test:* craft a layer with a wrong parent and one with a non-decreasing generation. `embargo_withheld` returns the naive result, and the index is marked bad.
 7. **Entries for collected snapshots.**
    - *Invariant:* a resolution through the index (`by_change_id`, prefixes) is confirmed against the store, and an id that is not present is skipped.

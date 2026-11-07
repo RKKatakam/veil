@@ -181,30 +181,31 @@ fn write_stdin(env: &Env, user: &str, dir: &Path, args: &[&str], input: &[u8]) {
 // ---- the scenario ----------------------------------------------------------------------
 
 const CLOAKED_TEXT: &str = "CLOAKED-PLAN-4417";
-const CLOAKED_DESC: &str = "CLOAKED-DESCRIPTION-9902";
+/// The sealed secret file.
+const PLAN: &str = "internal/.env.plan";
 const ISOLATED_TEXT: &str = "ISOLATED-VALUE-6623";
 const VAULT_VALUE: &str = "VAULT-VALUE-1187";
 
-/// Alice's project (public, cloaked and isolated files, a cloaked
-/// workspace with a sealed description, a cloaked tag, a vault secret) and
+/// Alice's project (public, cloaked (a sealed secret file) and isolated
+/// files, a second workspace editing the secret file, a tag, a vault secret) and
 /// Bob's clone of it, without a key for `team`.
 fn world() -> (Env, PathBuf, PathBuf) {
     let env = Env::new();
     let alice = env.dir("alice");
     write(&alice, "README.md", "hello\n");
-    write(&alice, "internal/plan.md", &format!("{CLOAKED_TEXT}\n"));
+    write(&alice, PLAN, &format!("{CLOAKED_TEXT}\n"));
     write(&alice, ".netrc", &format!("API={ISOLATED_TEXT}\n"));
     write(&alice, "policy.txt", "");
     env.ok("alice", &alice, &["init"]);
-    env.ok("alice", &alice, &["cloak", "internal/"]);
+    env.ok("alice", &alice, &["cloak", PLAN]);
     env.ok("alice", &alice, &["commit", "-m", "initial"]);
     env.ok("alice", &alice, &["tag", "set", "main", "-r", "@-"]);
     env.ok("alice", &alice, &["secret", "set", "API_TOKEN", VAULT_VALUE]);
     env.ok("alice", &alice, &["secret", "set", "--scope", "team", "TEAM_TOKEN", VAULT_VALUE]);
-    env.ok("alice", &alice, &["ws", "new", "plan", "-r", "main", "--cloak", "team"]);
-    write_stdin(&env, "alice", &alice, &["ws", "write", "plan", "internal/plan.md"], format!("{CLOAKED_TEXT} v2\n").as_bytes());
-    env.ok("alice", &alice, &["describe", "-r", "plan@", "-m", CLOAKED_DESC]);
-    env.ok("alice", &alice, &["tag", "set", "plan-tag", "-r", "plan@", "--cloak", "team"]);
+    env.ok("alice", &alice, &["ws", "new", "plan", "-r", "main"]);
+    write_stdin(&env, "alice", &alice, &["ws", "write", "plan", PLAN], format!("{CLOAKED_TEXT} v2\n").as_bytes());
+    env.ok("alice", &alice, &["describe", "-r", "plan@", "-m", "plan"]);
+    env.ok("alice", &alice, &["tag", "set", "plan-tag", "-r", "plan@"]);
     write(&alice, "README.md", "hello\nworld\n");
     let team = env.root.join("team");
     env.ok("alice", &alice, &["remote", "add", "origin", team.to_str().unwrap()]);
@@ -287,13 +288,13 @@ fn compare_all(env: &Env, user: &str, dir: &Path) -> String {
 fn every_read_method_returns_the_clis_json_document() {
     let (env, alice, bob) = world();
     let a = compare_all(&env, "alice", &alice);
-    assert!(a.contains(CLOAKED_TEXT) && a.contains(CLOAKED_DESC), "alice is a member and reads it");
+    assert!(a.contains(CLOAKED_TEXT), "alice is a member and reads it");
     for secret in [ISOLATED_TEXT, VAULT_VALUE] {
         assert!(!a.contains(secret), "{secret} reached a document");
     }
     // Bob holds no key: the server shows him no more than his CLI does.
     let b = compare_all(&env, "bob", &bob);
-    for secret in [CLOAKED_TEXT, CLOAKED_DESC, ISOLATED_TEXT, VAULT_VALUE] {
+    for secret in [CLOAKED_TEXT, ISOLATED_TEXT, VAULT_VALUE] {
         assert!(!b.contains(secret), "{secret} reached bob");
     }
     assert!(b.contains("no_key"));
@@ -374,7 +375,7 @@ fn write_methods_record_operations_that_undo_takes_back() {
     // A tag at the parent moves with the commit; `no_advance` keeps it.
     env.ok("alice", &alice, &["tag", "set", "here", "-r", "@-"]);
     let cm = c.ok("commit", json!({"message": "keep", "no_advance": true}));
-    assert!(cm["kept"].as_array().unwrap().contains(&json!({"name": "here", "reason": "no_advance", "scope": null})), "{cm}");
+    assert!(cm["kept"].as_array().unwrap().contains(&json!({"name": "here", "reason": "no_advance"})), "{cm}");
     let cm = c.ok("commit", json!({"message": "x"}));
     assert_eq!(cm["advanced"], json!([]));
 

@@ -1,7 +1,11 @@
 # Veil on-disk formats
 
-From 1.0 on, a repository written by any vl release stays readable by every
-later release. This document lists everything Veil persists, how each part
+From 1.0 on, a repository written by any vl release is readable by every
+later release, or upgradable to what it reads, with one exception the owner
+approved (2026-11-06): format 8, where only secret files are encrypted,
+no longer reads formats 1 to 5, and upgrades formats 6 and 7 only when they
+hold nothing that the removed encryption of non-secret content wrote (§5,
+"Format 8"). This document lists everything Veil persists, how each part
 is versioned, the rules for changing any of it, and how `vl upgrade`
 migrates a repository.
 
@@ -21,18 +25,20 @@ There is one **repository format**, a number in `.veil/repo.json`:
 | 5 | 1.0.0 | symlink tree entries (flag bit 7 and a kind byte, §3.7) and conflict terms (§3.6), annotated tags (`veil:atag`, §3.8; `Tag.annotation`) |
 | 6 | 1.1.0 | the lock-free op log: heads in `.veil/op_heads/` instead of `.veil/op_head`, operations gain `workspace` and `rewritten` (§2, §5 "Format 6"). Not yet built: snapshot attribution (`Snapshot.agent`) and the `partial` marker for fetch on demand (`docs/design/scale/PLAN.md` §1) |
 | 7 | 1.1.0 | key rings of ring format 4: invites, shares by members, a member's removal of their own device, and every ring but `team` naming its project (`docs/HUB.md` §13.12). No object encoding changes; the upgrade 6 → 7 rewrites nothing |
+| 8 | 1.1.0 | **only secret files are encrypted.** Removed: sealed descriptions and tag messages (`{"sealed": …}`), cloaked tags and workspaces (`cloak` in views), snapshots on cloaked lines (`Snapshot.cloak`), embargoed tree entries (tier 2) and fallback versions (flag bit 3), sealed directories, embargo keys. Embargo records are plain (embargo record format 2). Decoders refuse what only those wrote; `vl upgrade` brings 6 and 7 to 8 when none of it is there (§5). Formats 1 to 5 are no longer opened |
 
-* `vl init` writes the newest format (`repo::REPO_FORMAT`). `vl clone` takes
-  the format of its source, so that what the clone writes can be pushed
-  back and read by everyone who reads the source. A bare remote created by
-  `vl push` is created at the newest format.
+* `vl init` writes the newest format (`repo::REPO_FORMAT`), and so do
+  clones and remotes: this release opens format 8 only
+  (`repo::MIN_REPO_FORMAT`).
 * A reader **refuses a newer repository format before reading anything
   else** (`Repo::open`, `fsck`, `vl upgrade`): an older vl never
   half-understands, and never rewrites, newer data. The error names the
   release it needs when `repo.json` says so (`min_vl`).
-* A reader reads **every older format**, and keeps writing it unchanged:
-  a format-1 repository written by vl 1.0 is still a format-1 repository
-  that vl 0.1.0 can read. Nothing changes until someone runs `vl upgrade`.
+* A reader refuses an **older format** too, with what to do: formats 6 and
+  7 "run `vl upgrade`", formats 1 to 5 "upgrade it to format 7 first
+  with a vl from before format 8". Objects that older formats wrote (JSON trees, legacy sealed
+  objects, legacy key wraps) are still read wherever an upgraded repository
+  holds them.
 * Some parts carry their own version as well (objects, packs, rings,
   embargo records, caches), because they travel between repositories or
   outlive one process. Their rules are below.
@@ -52,10 +58,9 @@ not be understood.
 | — tree | `veil:tree\n` ‖ `{` JSON (v1) or `0x02` binary (v2) | encoding byte | yes | §3 |
 | — snapshot | `veil:snap\n` ‖ `{` JSON (v1) | encoding byte | yes | canonical (§3.3). `conflicts` lists conflicted paths; from format 4 it is an index the engine keeps (every conflict entry of the tree, plus marker conflicts carried from older formats), same field and encoding |
 | — conflict (format 4) | `veil:conf\n` ‖ `0x04` ‖ binary terms (§3.6) | encoding byte | yes | refused below format 4; plaintext (ids and labels only, never content); one with a symlink term refused below format 5 |
-| — annotated tag (format 5) | `veil:atag\n` ‖ `{` canonical JSON (§3.8) | encoding byte | yes, with its tag | refused below format 5; plaintext but for a cloaked tag's message (sealed); never sent to a public remote when that message is sealed |
-| — sealed (formats 1–2) | `veil:seal\n` ‖ u16 **big-endian** label length ‖ label ‖ nonce[24] ‖ XChaCha20-Poly1305 ciphertext | tag | yes | the plaintext is another object's encoding; nonce derived from the plaintext (legacy, CRYPTO.md C1L); still written by format-1/2 repositories |
+| — annotated tag (format 5) | `veil:atag\n` ‖ `{` canonical JSON (§3.8) | encoding byte | yes, with its tag | refused below format 5; plaintext (a sealed message, which only formats 7 and earlier wrote, is refused) |
+| — sealed (formats 1–2) | `veil:seal\n` ‖ u16 **big-endian** label length ‖ label ‖ nonce[24] ‖ XChaCha20-Poly1305 ciphertext | tag | yes | the plaintext is another object's encoding; nonce derived from the plaintext (legacy, CRYPTO.md C1L); written by format-1/2 repositories only, read wherever an upgraded repository holds one |
 | — sealed (format 3) | `veil:sea2\n` ‖ u16 **big-endian** label length ‖ label ‖ SIV[16] ‖ AES-SIV ciphertext | tag | yes | AES-SIV-CMAC-512 under `HKDF-SHA256(scope key)`, AD = `[label]` (CRYPTO.md C1); refused below format 3 |
-| — embargo wrapper | an ordinary tree with an `embargo` marker entry | as trees | yes | `embargo.rs`. Since BUG-104 the listed entries omit ids the fallback tree reaches (the pre-merge versions of changed files); same encoding, and every reader keeps those objects through the fallback, so no new version |
 | packs `.veil/objects/pack/pack-<sum>.pack` | `VEILPAK1` ‖ count u32 ‖ entries ‖ BLAKE3 | magic digit | no (sync sends canonical objects) | entry kinds 0 stored, 1 zstd, 2 delta; 3–15 reserved. A delta is a zstd frame read with its base as a raw-content dictionary; above 2 MiB of base plus object it is written with the base as a *prefix* and long-distance matching (BUG-290), with a window of at most 2^27, which every zstd decoder accepts by default: the same bytes to every reader, so no new version. Builds without the zstd C library (WASM, ARCHITECTURE.md §13) write kind 0 only and read 1 and 2 with a pure-Rust decoder (a delta's base given to it as a formatted dictionary: a fixed header, then the base); no new version either |
 | pack indexes `pack-<sum>.idx` | `VEILIDX1` ‖ count ‖ fanout ‖ ids ‖ offsets ‖ lengths ‖ pack sum ‖ BLAKE3 | magic digit | no | |
 | operations `.veil/ops/<id>` | JSON `Operation {parents, timestamp, user, description, view, manual_undo?, undo_of?, redo_of?, workspace?, rewritten?}`, id = BLAKE3 of the bytes | repository format | no (device/repository-local) | `manual_undo` (absent unless set) marks an operation whose effect lies outside the view; `undo_of` / `redo_of` (absent unless set, hex operation ids) mark an undo and a redo, so repeated undos go further back (BUG-247). Older readers ignore all three (an older `vl undo` then treats an undo as a plain operation, as it always did); operations written before them have none, so no version bump or upgrade step. Format 5: a view's tags may carry `annotation` (hex id of a `veil:atag`) and the view `remote_release_tags` (`"<remote>/<name>"` → atag id); both omitted when absent or empty, so earlier views keep their bytes, and an operation using either is refused below format 5 (`OpStore::put`), so a format-4 vl never meets one (it refuses the repository and the remote by format before reading a view). Format 6: `workspace` (the workspace the command was run for; absent for repository-wide commands) and `rewritten` (hex snapshot id → its replacements, empty for abandoned; omitted when empty) come after `redo_of`, so every earlier operation keeps its bytes and id; an operation using either is refused below format 6 (`OpStore::put`). A merge of concurrent operations has several `parents` (sorted), `user` `"veil"`, `description` `merge N concurrent operations` and the largest of its parents' timestamps, so every process merging the same heads writes the same bytes. |
@@ -77,9 +82,9 @@ not be understood.
 | — ring format 4 changes | `{"kind": "invite", person, key, expires_at}`, `{"kind": "uninvite", key}`, `{"kind": "share", member, proof: {"kind": "invite", key, signature} \| {"kind": "vouch", by, signature}}`, `{"kind": "revoke_own", member, rotation}`, in the signed body like every change; and `project` (32 lowercase hex digits) in a genesis, after `proof` | ring format 4 | yes | the rules the replay applies are in `docs/HUB.md` §13.12; a share and a `revoke_own` are signed by a current member, the others by an admin. `project` is the hash of the project's `team` ring's genesis change (BUG-845): every ring but `team` made in a format-7 repository holding a `team` ring carries it, `team` never does, and a reader refuses a ring naming another project (`Keychain::bound`) |
 | — wrapped key (in a ring change) | JSON: legacy `{ephemeral, sealed}` or HPKE `{hpke, enc, ct}` | shape + `hpke` suite string | yes | legacy written by format 1–2, HPKE by format 3 (CRYPTO.md C3/C3L); unknown fields or suites refused |
 | — member binding (in a genesis member or grant) | `"binding": hex(Ed25519 signature)`, after `signing_key`; absent when not recorded | ring format 3 | yes | written from repository format 3 only (CRYPTO.md C4); a ring with one must say format 3, so format-1/2 repositories and older vl never receive it. Added to ring format 3 before any release wrote that format; the format-3 fixtures predate it and carry none |
-| embargo records `.veil/meta/embargoes/<id>.json` | pretty JSON `EmbargoRecord` | implicit 1; a later format adds `"format": N` | yes | readers reject `format > 1` |
+| embargo records `.veil/meta/embargoes/<id>.json` | pretty JSON `EmbargoRecord {format, id, scope, until, released_at, created}`, plain | `format` (2; format 1, without the field, held an embargo key) | yes | readers reject any format but 2: format 1 only in a repository before format 8 (`vl upgrade` refuses it), a newer one as `Unsupported`. Released when `released_at` is set or `until` has passed |
 | team-vault records `.veil/meta/vault/<scope>/<id>.json` | compact JSON `VaultRecord {format, scope, sealed, timestamp, signature}`; `sealed` is the JSON envelope (C2) of the padded JSON `{name, value, since}` under label `vault:<scope>#<key-id>`; `<id>` = hex BLAKE3 of the file, which must be exactly the canonical encoding | `format` (1); unknown fields refused | yes, team remotes only | immutable, never rewritten: a write adds a record, compaction deletes superseded ones (ARCHITECTURE §3). A newer `format`, unknown fields or a non-canonical file make the record not count, with a warning; nothing is rewritten. Older vl never read, write or relay the directory, so no repository format change |
-| staged embargo releases `.veil/local/releases/<id>.json` | pretty JSON `{released_key, released_at, release_signature}` (the record's release fields) | none: unknown or invalid content is ignored (the embargo stays unreleased) | no (device-local; honoured only by the identity that signed it) | written by `vl embargo release`, moved into the record by the next push, deleted by `vl undo` (BUG-109); an older vl ignores it, i.e. the release is not yet made |
+| staged embargo releases `.veil/local/releases/<id>.json` | pretty JSON `{released_at}` | none: invalid content is ignored (the embargo stays unreleased) | no (device-local) | written by `vl embargo release`, moved into the record by the next push, deleted by `vl undo` (BUG-109) |
 | team-vault value history `.veil/local/vault-history/<scope>.json` | compact JSON `{names: {<name hash>: {<value hash>: <generation>}}}`: keyed BLAKE3 (key `derive_key(TEAM_VAULT_HISTORY, local vault key)`, CRYPTO.md C12) of each name, and of each value it held, with the first key generation that value was sealed under; at most 256 values per name | none: unreadable content reads as empty | no (device-local) | new in this release (BUG-521); no repository format change. Only makes `since` of later writes, and `--exposed-to`, more conservative; losing it forgets what this device saw. An older vl ignores it |
 | `vl run` default scopes `.veil/local/run-scopes.json` | compact JSON `{scopes: [<scope>…]}` | none | no (device-local) | new in this release, written by `vl run --remember` (BUG-520). Missing: `vl run` loads no team vault unless `--scope` is given. An older vl ignores it (and loads every scope) |
 | vault `.veil/local/vault.sealed` | envelope (label `local`) around JSON `VaultData {secrets, files, removed?}` | repository format | no (device-local) | `removed`: backups of vanished isolated files with `removed_at`, kept 30 days; older readers ignore it |
@@ -89,7 +94,7 @@ not be understood.
 | scanner markers `.veil/local/scanned/<ws>.version` | decimal `secrets::RULES_VERSION` | itself | no | a mismatch re-scans once |
 | project anchor `.veil/local/project-anchor` (format 7) | the project fingerprint this device confirmed (`XXXX-XXXX-XXXX-XXXX-XXXX`), or empty: none yet | none: anything else reads as empty | no (device-local) | written in every clone of a Veil server project (`vl clone`, the first `vl pull`, `vl identity confirm`, `vl push` creating the project) from `$VEIL_HOME/hub.json`. While it exists, the keychain trusts only the `team` ring with that fingerprint and rings naming that project, and nothing while it is empty (BUG-845). Missing (a repository that is not such a clone): rings that name no project are trusted as before. An older vl ignores it |
 | accepted policy `.veil/local/accepted-policy` | the text of the `.veilpolicy` this device's member last accepted (empty: none) | as `.veilpolicy` | no (device-local) | missing: the next working-copy snapshot records the current `.veilpolicy` |
-| checkout state `.veil/local/checkout.json` | pretty JSON `{workspace, snapshot, materialised?, pending?: {workspace, snapshot}}`; `materialised` is `{view?, hidden?, fallback?, crlf?}` (`crlf`: paths written with CRLF line endings for `eol=crlf`) | repository format | no | gc keeps both snapshots; `pending` is the journal of an unfinished move of the directory; `crlf` is an addition an older vl ignores (a record without it means "written as recorded") |
+| checkout state `.veil/local/checkout.json` | pretty JSON `{workspace, snapshot, materialised?, pending?: {workspace, snapshot}}`; `materialised` is `{view?, hidden?, fallback?, crlf?}` (`fallback`: conflicts written with a version this reader could not read, with the rendering written; `crlf`: paths written with CRLF line endings for `eol=crlf`) | repository format | no | gc keeps both snapshots; `pending` is the journal of an unfinished move of the directory; `crlf` is an addition an older vl ignores (a record without it means "written as recorded") |
 | attributes `.veil/local/attributes`, drivers `.veil/local/config.toml` and `$VEIL_HOME/config.toml` | `.veilattributes` syntax; TOML `[merge.<name>] command = [argv…]`, `[diff.<name>] textconv = [argv…]` | none | no (device-local) | new in this release (feature 7); an older vl ignores them |
 | `ws exec` sandbox `.veil/local/sandboxes/<ws>/` (`.`/`..` spelt `%2e`/`%2e%2e`) | `manifest.json`: pretty JSON `{version, workspace, tree?, snapshot?, materialised?, boot, running?, only?, quarantined?, pending?, guard_checked?}` (`pending`: `{run, base, message?, started, kept?, injected?, recorded?}`, the command's unrecorded output; `guard_checked`: ns since the epoch); `statcache` in the stat-cache format above; `lock` (empty, `flock`ed); `files/` the sandbox's files; `guard.sealed` (an `Envelope` sealed under `local`: JSON `{files: [[path, hex]], injection?: {run, paths, stash: [[path, hex, executable]]}}`); `unrecorded-<ms>-<rand>/` previous files a rebuild kept whole | `version` (1) | no (device-local) | new in this release; no repository format change; `pending`, `guard_checked` and `guard.sealed` are additions an older reader ignores. Any other version, an unreadable manifest, a `running` marker, another boot, a non-empty `only` (reserved for sparse sandboxes): the sandbox is rebuilt, keeping unrecorded work (re-imported, or kept whole in `unrecorded-…/`). A `pending` run is recorded before anything else. gc does not keep `tree`: a missing one is rebuilt. An older vl ignores the directory |
 | `ws mount` state `.veil/local/mounts/<ws>/` (`.`/`..` spelt `%2e`/`%2e%2e`) | `state.json`: pretty JSON `{version, workspace, base, mountpoint?, pid?, boot?, socket?}` (`base`: hex id of the snapshot the overlay is over); `upper/` the overlay's written files and directories; `whiteouts`: one JSON string (a path) per line, appended; `unseen`: the files the whiteouts hide that the mount never showed (carried by every recording), one JSON string per line, rewritten; `lock` (empty, `flock`ed by the serving process); `log`; `ctl` the control socket (or one under `$XDG_RUNTIME_DIR`, named in `state.json`) | `version` (1) | no (device-local) | new in this release; no repository format change. Holds user data (isolated and unrecorded files): never wiped. Another `version` is refused (unmount with that vl). A torn last line of `whiteouts` is skipped. `unseen` is new in the round-8 mount wave and optional (absent: nothing to carry); a vl from before it ignores it. An older vl ignores the directory |
@@ -104,8 +109,7 @@ not be understood.
 | `.veilpolicy` | text, one rule per line | grammar is fail-safe: unknown tiers isolate | yes (it is a tracked file) | **access lines** (the Veil server, S1): a line whose fields after the pattern are all `public` or group/person names (lowercase letters, digits, `-`, `_`, `.`; never a tier word) is an access line, a plain `public` rule on the device. Older vl read such a line as an unknown tier and isolate its pattern: fail-safe, never a leak. New repositories get `cloak team` lines for shared secrets (`vl init`; `vl upgrade --sync-secrets` adds them) |
 
 Signed bodies have their own fixed encodings and must never change: the ring
-change body (`RingChange::signing_body`), the embargo body
-(`EmbargoRecord::body`), the team-vault record body
+change body (`RingChange::signing_body`), the team-vault record body
 (`VaultRecord::signing_body`, pinned by a unit test), the snapshot's *unsigned id* (the id of its
 encoding without `signature`) and, from format 5, the annotated tag's unsigned id
 (`Atag::unsigned_id`, context `tag`). A format change that touches a signed type
@@ -136,18 +140,22 @@ entry   = name_len uvarint | name (UTF-8) | flags u8
           | kind u8                         if flags.KIND (format 5)
           | id [32]
           | size uvarint                    if flags.SIZE    (then size != 0)
-          | label_len uvarint | label UTF-8  if tier != public (scope / embargo id)
-          | fallback [32]                   if flags.FALLBACK
-flags   = bit 0 DIR · bit 1 EXECUTABLE · bit 2 SIZE · bit 3 FALLBACK
-          bits 4–5 tier: 0 public, 1 cloaked, 2 embargoed, 3 reserved
+          | label_len uvarint | label UTF-8  if tier != public (the scope)
+flags   = bit 0 DIR · bit 1 EXECUTABLE · bit 2 SIZE · bit 3 reserved
+          bits 4–5 tier: 0 public, 1 cloaked (a sealed secret file),
+                2 and 3 reserved
+          (Formats 7 and earlier wrote bit 3 FALLBACK, followed by a
+          fallback id [32], and tier 2 embargoed, with the embargo id as
+          the label; format 8 refuses both, and a cloaked DIR, as content
+          only the removed encryption of non-secret content wrote.)
           bit 6 CONFLICT (format 4): `id` names a conflict object (§3.6);
                 every other bit must be clear (a conflict entry has no
-                size, executable bit, label or fallback of its own)
+                size, executable bit or label of its own)
           bit 7 KIND (format 5): a kind byte follows the flags,
                 1 symlink (0 and 2–255 `Unsupported`; 2 is reserved
                 and never reused);
-                DIR, EXECUTABLE and CONFLICT must be clear, SIZE,
-                FALLBACK and the tier keep their meaning (§3.7)
+                DIR, EXECUTABLE and CONFLICT must be clear, SIZE
+                and the tier keep their meaning (§3.7)
 uvarint = unsigned LEB128, shortest form
 ```
 
@@ -197,7 +205,7 @@ gives each logical tree exactly one id. A format-2 repository can still hold
 a format-1 copy of the same logical tree from before its upgrade: **equal
 ids imply equal content, but after an upgrade equal content no longer
 implies equal ids**. Every algorithm already treats "different id" as
-"compare inside" (diff, merge, embargo sealing), so the only effect is
+"compare inside" (diff, merge), so the only effect is
 work, which the engine avoids:
 
 * the builder reuses the parent's tree id for an unchanged directory
@@ -219,8 +227,8 @@ work, which the engine avoids:
   keychain follows the same format: it wraps keys with HPKE only from
   format 3 and refuses to store a format-3 ring below it. Push and pull copy objects with
   `put_raw`, so a format-1 remote or clone can never receive an object an
-  older vl could not read: the push fails with "upgrade it with `vl upgrade
-  --remote <name>`", and nothing is recorded.
+  older vl could not read: the push fails with "upgrade it with `vl
+  upgrade`", and nothing is recorded.
 * `fsck` reports a binary tree in a format-1 repository, an AES-SIV object
   or an HPKE ring in a format-1/2 repository, a conflict object or
   conflict entry below format 4, and any format-5 object or view field
@@ -245,16 +253,16 @@ term     = 0x00                                    (no file)
          | flags u8 | id [32]
            | size uvarint                          if flags.SIZE (then != 0)
            | label_len uvarint | label UTF-8       if tier != public
-           | fallback [32]                         if flags.FALLBACK
 flags    = bit 0 PRESENT (set) · bit 1 EXECUTABLE · bit 2 SIZE ·
-           bit 3 FALLBACK · bits 4–5 tier (as in trees) ·
+           bit 3 reserved (FALLBACK in formats 7 and earlier; refused) ·
+           bits 4–5 tier (as in trees) ·
            bits 6–7 term kind (format 5): 0 file, 1 symlink, 2 and 3
            reserved (`Unsupported`; 2 is never reused); EXECUTABLE clear
            unless a file
 ```
 
 * A term is what a file entry holds, without the name: each version keeps
-  its own id, label, executable bit and fallback. The object itself is
+  its own id, label and executable bit. The object itself is
   plaintext and carries no content, so it may be sent anywhere; the
   versions it names are sent or withheld one by one like any object (a
   public remote gets a public conflict naming a sealed version, never that
@@ -278,13 +286,13 @@ flags    = bit 0 PRESENT (set) · bit 1 EXECUTABLE · bit 2 SIZE ·
 * **Symlink** (`EntryKind::Symlink`, kind byte 1): `id` names the blob of
   the link's *target bytes* (UTF-8, no NUL, at most 4096 bytes; `size` is
   its length), plaintext or sealed exactly like file content under the
-  policy of the link's own path. Never executable; a fallback is allowed.
+  policy of the link's own path. Never executable.
 * Kind byte 2 is reserved, never reused: a tree entry holding it is
   `Unsupported` (a removed kind, so a stray old entry is never misread as
   something new).
 * A symlink is a leaf: `walk_files` and `diff_trees` list them, `lookup` never
-  goes through them, and sync, gc, fsck, `push --dry-run` and embargo
-  sealing treat their object as a file's (sealed, withheld, listed,
+  goes through them, and sync, gc, fsck and `push --dry-run` treat their
+  object as a file's (sealed, withheld, listed,
   published by the same rules). fsck warns about a readable target that
   breaks the rules above.
 * The builder records a working copy's symlinks as symlink entries
@@ -298,7 +306,7 @@ flags    = bit 0 PRESENT (set) · bit 1 EXECUTABLE · bit 2 SIZE ·
 atag = "veil:atag\n" ‖ canonical JSON, exactly what serde_json writes for
   {"name": tag name, "target": hex snapshot id,
    "kind": "annotated",
-   "message": {"plain": text} | {"sealed": envelope},
+   "message": {"plain": text},
    "tagger": text, "timestamp": ms since the epoch,
    "signature"?: {"signer", "key", "sig"}}
 ```
@@ -311,11 +319,10 @@ atag = "veil:atag\n" ‖ canonical JSON, exactly what serde_json writes for
   `name` and `target` (`Atag::verify`): a push refuses a tag whose
   annotation is missing, not an atag, or names another tag or target, and
   a pull receives such a tag without its annotation (with a warning).
-* A cloaked tag's message is sealed under its scope (CRYPTO.md C2). Push
-  sends an atag only with its tag, after the tag's checks (cloaked tags
-  and tags on embargo-withheld history stay here, their atags with them),
-  and never sends an atag with a sealed message to a public remote,
-  whichever tag names it.
+* The message is plain text (formats 7 and earlier could seal a cloaked
+  tag's message, `{"sealed": envelope}`; format 8 refuses it). Push sends
+  an atag only with its tag, after the tag's checks (tags on
+  embargo-withheld history stay here, their atags with them).
 * gc keeps every atag a retained view names and its target.
 
 ## 4. Rules for changing a format
@@ -332,8 +339,8 @@ atag = "veil:atag\n" ‖ canonical JSON, exactly what serde_json writes for
    `min_vl_for_format` and to the table in §1, a transition in
    `upgrade::transition_steps` (idempotent steps; may be empty), and the
    `put_raw` rule for what the new format permits.
-4. **Rings and embargo records** may only raise their `format` together
-   with the repository format; readers reject newer ones (fail closed: no
+4. **Rings and embargo records** may only change their `format` together
+   with the repository format; readers reject other ones (fail closed: no
    keys, no release). **Team-vault records** are immutable and never
    rewritten, so a later record format needs no repository format: readers
    skip records with a newer `format` (fail closed: the entry is not
@@ -346,22 +353,25 @@ atag = "veil:atag\n" ‖ canonical JSON, exactly what serde_json writes for
 
 ## 5. Migrations: `vl upgrade`
 
-Decision: **existing repositories keep working read-compatibly, forever.**
-A format-1 repository opens, reads, verifies, syncs and keeps writing
-format 1 with this release; there is no forced migration. `vl upgrade` is
-the explicit opt-in to what a newer format adds (format 2: binary trees, a
-faster `vl status`).
+Decision (until format 8): **existing repositories keep working
+read-compatibly.** `vl upgrade` was the explicit opt-in to what a newer
+format adds (format 2: binary trees, a faster `vl status`). Format 8 is the
+exception, below.
 
 ```text
-vl upgrade [--dry-run] [--remote NAME] [--force]
+vl upgrade [--dry-run] [--force]
 ```
 
-1. Takes the repository lock (a dry run takes none and writes nothing) and
-   writes the journal `.veil/upgrade.json`.
-2. **verify**: runs `fsck` and counts trees by encoding. Any corruption
-   stops the upgrade before anything changes (`--force` overrides).
-3. One step per format transition. `1 → 2`, `2 → 3` and `3 → 4` have
-   none: no object is rewritten.
+1. Checks the repository's format (6 to 8; anything else is refused before
+   any lock is taken, so nothing changes) and, below format 8, that it
+   holds nothing format 8 removed (see "Format 8"). Then takes the gc
+   lease and the repository lock (a dry run takes none and writes nothing)
+   and writes the journal `.veil/upgrade.json`.
+2. **verify**: the removed-content check again, under the lock, then
+   `fsck`, and counts trees by encoding. Any corruption stops the upgrade
+   before anything changes (`--force` overrides).
+3. No format transition from 6 on rewrites anything: no object, operation
+   or id changes.
 4. **set-format**: rewrites `repo.json` with the new format and `min_vl`,
    atomically and durably. This is the commit point: before it the
    repository is entirely the old format, after it entirely the new one.
@@ -378,10 +388,9 @@ vl upgrade [--dry-run] [--remote NAME] [--force]
 
 Each finished step is journaled before the next starts, so `vl upgrade`
 after a crash resumes (it skips verification if it already passed, and
-notices a commit point already reached; `tests/core_durability/crash.rs` crashes 1→3 and
-2→3 at every write). Old data is never removed. A remote is upgraded with
-`--remote NAME` (checked structurally, without opening sealed content);
-an SSH remote is reached over SFTP, as push and pull reach it.
+notices a commit point already reached). Old data is never removed. A bare
+repository (`vl -R DIR upgrade`) is upgraded structurally, without opening
+sealed content.
 
 An upgrade from format 3 (to 4) runs `3:hpke-ring-keys` too when one of
 this identity's rings still needs it. In a repository that is already at
@@ -403,12 +412,52 @@ still waiting for its admin.
   --remote origin`, then members upgrade their clones when they like.
   Pulling from a format-1 remote into a format-2 repository always works; a
   format-1 clone refuses to pull binary trees ("run `vl upgrade`").
-* **Embargoes.** Sealed trees inside an embargo are written in the writer's
-  encoding too. A format-1 relay cannot see inside them, but every embargo
-  also has a plaintext wrapper tree in the same encoding, so the relay's
-  `put_raw` refuses the push as a whole.
 * **Downgrades** are not supported: an older vl refuses a format-2
   repository with a message naming the release it needs.
+
+### Format 8 (only secret files are encrypted)
+
+Owner decision (2026-11-06): **only secret files are ever encrypted**
+(`docs/VISIBILITY.md`). Formats 7 and earlier could also encrypt change
+descriptions and attribution, annotated-tag messages, tag names (cloaked
+tags), whole lines of work (cloaked workspaces, whose public edits carried
+a *fallback* version), embargoed merges (embargo keys, wrapper trees,
+signed records) and folders. Format 8 removes all of it.
+
+* **Why a new format.** An older vl reading a format-8 repository would
+  write those things into it again (a cloaked workspace, a sealed message)
+  and would treat plain embargo records as unknown; and a format-7
+  repository may already hold them, which this build cannot read (its
+  decoders refuse them) and must never silently treat as plain (a cloaked
+  tag read without its `cloak` field would be pushed to a public remote).
+  The format number keeps the two apart: an older vl refuses format 8 by
+  number, and this vl opens only format 8.
+* **`vl upgrade` from 6 or 7.** Nothing is converted: re-writing an object
+  that holds encrypted content changes its id, and with it every tree,
+  snapshot id and signature above it, the whole history. Instead the
+  upgrade checks (`upgrade::removed_content`), structurally and without
+  decrypting, every snapshot (an encrypted description, a `cloak` field),
+  every annotated tag (a sealed message), every tree reachable from a
+  snapshot (embargoed entries, fallback versions, encrypted directories,
+  and an encrypted file whose path no built-in secret rule names, such as
+  a file under a cloaked folder), the view of every retained operation
+  (cloaked tags and workspaces, which an undo could bring back) and every
+  embargo record (one holding a key). If it finds nothing, the upgrade
+  writes `repo.json` and nothing else: every object, operation and id
+  stays. If it finds anything, it **refuses before anything is written**
+  and names each thing (path, snapshot, tag, workspace or embargo record);
+  `--dry-run` lists them and exits 1.
+* **A repository that holds removed content** (keys or not) stays at its
+  format: this vl does not open it, and an older vl keeps working with it.
+  Whoever holds the keys can read it with the vl that wrote it and start a new
+  repository from a checkout of the files; the refusal says so. Holding
+  the keys does not change the answer: unsealing would still rewrite the
+  history.
+* **Formats 1 to 5** are no longer read: opening, `fsck` and `vl upgrade`
+  refuse them, saying to upgrade them to format 7 first with a vl from before format 8.
+* **Objects of older formats** that an upgraded repository holds (JSON
+  trees, legacy sealed objects, legacy key wraps, marker conflicts) are
+  still read.
 
 ### Format 7 (key rings of ring format 4)
 
@@ -452,8 +501,9 @@ still waiting for its admin.
   operation in and removes the file. This vl's own format-5 transactions
   re-read `repo.json` under the lock before moving the head, and fail
   ("the repository was upgraded while this command ran") instead.
-* **Remotes and clones.** `vl upgrade --remote NAME` does the same on a
-  remote. A remote keeps one head, written under its lock, at every
+* **Remotes and clones.** `vl -R <bare repository> upgrade` does the same
+  on a bare repository (an old path remote, upgraded structurally: no
+  identity, no re-keying). A remote keeps one head, written under its lock, at every
   format. An older vl refuses a format-6 repository or remote outright: it
   would read only `op_head` and silently fork the log. Lock-free pushes and
   pulls work against format-5 remotes (the remote's side is unchanged).
@@ -466,7 +516,7 @@ still waiting for its admin.
   `min_vl`.
 * **Remotes and clones.** A format-4 remote or clone refuses symlink
   trees, link-term conflicts and annotated tags ("upgrade it with
-  `vl upgrade --remote <name>`"), and its operation store refuses a view
+  `vl upgrade`"), and its operation store refuses a view
   naming one; an older vl refuses a format-5 repository or remote outright
   (so it never drops `Tag.annotation` by rewriting a view). The order for
   a team is the usual one.
@@ -487,14 +537,9 @@ still waiting for its admin.
   editing the file). Rewriting them as conflict entries would change every
   snapshot id above them. Merges made after the upgrade record conflict
   entries.
-* **What a format-4 repository still writes as markers:** merges under an
-  unreleased embargo (the embargo's sealed trees never hold a conflict
-  entry, whose versions keep their own sealing outside the embargo; a
-  conflict entry the embargoed tree would take in goes in as its file of
-  markers), and nothing else.
 * **Remotes and clones.** A format-3 remote or clone refuses conflict
-  objects and trees with conflict entries ("upgrade it with `vl upgrade
-  --remote <name>`"): only history that holds an unresolved conflict is
+  objects and trees with conflict entries ("upgrade it with `vl
+  upgrade`"): only history that holds an unresolved conflict is
   affected. An older vl refuses a format-4 repository outright ("this
   repository uses format 4, which needs a newer vl"), and a conflict entry
   or object met elsewhere as `Unsupported`.
@@ -504,14 +549,14 @@ still waiting for its admin.
 * **Nothing is re-sealed.** Sealed objects written before the upgrade keep
   the legacy construction, their bytes and their ids; re-sealing would
   change every tree and snapshot id above them and break every signature.
-  Unchanged cloaked files keep their sealing when re-snapshotted. New and
+  Unchanged sealed files keep their sealing when re-snapshotted. New and
   changed content is sealed with AES-SIV. For the security review this
   means pre-upgrade history stays under the legacy constructions forever
   (CRYPTO.md §5).
 * **Rings.** The upgrading admin's rotation makes each ring format 3. A
   remote or clone at format 2 refuses it (and AES-SIV objects) with "run
-  `vl upgrade` / `vl upgrade --remote <name>`". The order for a team is the
-  one above: everyone installs this vl, `vl upgrade --remote origin`, one
+  `vl upgrade`". The order for a team is the
+  one above: everyone installs this vl, the shared repository is upgraded, one
   admin upgrades and pushes (others pull before upgrading, so the rotation
   is not made twice: two admins rotating concurrently diverge the ring, as
   any concurrent admin edits do).
@@ -534,51 +579,52 @@ written through the engine by `write_format_5_extras` in
 `format_compat.rs`; from format 6 also concurrent operations, written last
 by `write_format_6_extras`: a merge whose side carries `rewritten` and
 `workspace`, and two heads left unmerged): three identities (`home-alice`, `home-bob`, `home-carol`), the
-project `alice/` (packed and loose objects, a cloaked directory, a ring with
+project `alice/` (packed and loose objects, through format 7 a cloaked directory, a ring with
 a grant, a revocation and a rotation (key generation 2), a released and an
-unreleased embargo, a cloaked tag, a vault, gc pending list, pruned ops,
+unreleased embargo, through format 7 a cloaked tag, a vault, gc pending list, pruned ops,
 stat cache and checkout state), and its `team-remote/` and
 `public-mirror/`. The identity files are test-only keys.
+
+From format 8 on, `alice/` holds no cloaked tag, workspace or directory:
+its sealed file is the secret `secrets/.env.notes`, its sealed link
+`secrets/.env.current`, its embargoed work an ordinary workspace, and
+`upgraded/` is skipped (the format-7 set cannot be upgraded: it holds what
+format 8 removed).
 
 `tests/core_format/format_compat.rs` and `crates/vl/tests/cli_basic/upgrade_cli.rs` check that
 this build:
 
 * opens, reads (as the admin, a member, a revoked member and an outsider),
   verifies signatures, rings, embargo records and the vault, and `fsck`s
-  every fixture set and its remotes;
-* keeps writing format 1 in a format-1 repository;
-* upgrades with a dry run that writes nothing, keeps every id and the
-  view, resumes after a crash on either side of the commit point, and
-  refuses a corrupt repository without changing it;
-* syncs across formats as described in §5;
+  the format-8 set and its remotes; finds nothing sealed but secret files;
+  finds neither the unreleased embargo's fix nor a secret on either remote;
+  reads its links, link conflict and annotated tags as each identity's
+  audience allows;
+* refuses every set before format 8, by opening, `fsck` and `vl upgrade`,
+  with what to do, and leaves it byte for byte unchanged: formats 1 to 5
+  as no longer read, formats 6 and 7 naming what they hold that format 8
+  removed (`--dry-run` lists it);
+* upgrades a format-6 or format-7 repository that holds none of it,
+  rewriting nothing;
 * refuses newer repository formats, object encodings, flag bits, object
-  kinds, pack versions, ring and embargo-record formats as `Unsupported`;
-* writes only AES-SIV objects and HPKE wraps at format 3 and only the legacy
-  ones at formats 1–2, upgrades 1→3 and 2→3 (rings rotated to HPKE, every
-  object and id kept), and never lets format-3 cryptography reach a
-  format-1/2 repository (push, pull, incremental and full);
-* reads the format-4 set's conflict entries as each identity's audience
-  allows (members both sides, the revoked member and the public mirror's
-  readers neither), never lets a conflict reach a format-3 repository, and
-  upgrades 3→4 keeping marker conflicts and every id;
-* reads the format-5 set's links, link conflict and annotated tags as
-  each identity's audience allows, verifies the signed atags, finds no
-  sealed target or tag message on the public mirror, never lets a format-5
-  object reach a format-4 repository (push, pull, API), and upgrades 4→5
-  rewriting nothing.
+  kinds, pack versions, ring and embargo-record formats as `Unsupported`.
 
 Two checks make format changes impossible to miss:
 
 * `every_repository_format_has_a_fixture_set` fails unless every format from
-  `MIN_REPO_FORMAT` to `REPO_FORMAT` has a fixture set at that format;
+  1 to `REPO_FORMAT` has a fixture set at that format;
 * `encodings_match_the_golden_file` pins the bytes of every object encoding
   in `tests/fixtures/encodings.txt` (blob, empty tree, JSON and binary
   trees, root and full snapshots with a signature, sealed, sealed with
   AES-SIV, a conflict object, a binary tree with a conflict entry, a binary
-  tree with symlinks, a conflict with symlink terms, and annotated tags:
-  signed, sealed). Changing what is
-  written fails until the change becomes a new format; then new lines are
-  appended (`VEIL_BLESS_ENCODINGS=1`), never edited.
+  tree with symlinks, a conflict with symlink terms, a signed annotated
+  tag, an operation). Changing what is written fails until the change
+  becomes a new format; then new lines are appended
+  (`VEIL_BLESS_ENCODINGS=1`), never edited. The lines of encodings only a
+  removed feature wrote (the format-7 trees with an embargoed entry and
+  fallback, the snapshot with a sealed description, the sealed atag, the
+  operations with a cloaked workspace) stay in the file, and must be
+  refused; their format-8 replacements end in `-8`.
 
 ## 7. Measurements
 
@@ -590,7 +636,7 @@ Release build, Linux, warm cache.
 | their size | 2,449 KiB | 882 KiB |
 | `vl status`, unchanged 20k files (`bench_status`, median) | 72–77 ms | 58–59 ms |
 | `vl status`, one public file edited | 77–99 ms | 63 ms |
-| `vl status`, one cloaked file edited | 77–84 ms | 62–69 ms |
+| `vl status`, one sealed file edited | 77–84 ms | 62–69 ms |
 
 The status runs alternate the vl 0.1.0 binary (format 1) and this build
 (format 2) on the same machine, two runs each, on tmpfs. A format-1

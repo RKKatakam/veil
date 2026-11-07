@@ -21,7 +21,7 @@ fn embargoed(env: &Env) -> (PathBuf, PathBuf, String) {
     let mirror = env.dir("mirror");
     env.ok(U, &proj, &["remote", "add", "mirror", mirror.to_str().unwrap(), "--public"]);
     env.ok(U, &proj, &["push", "mirror"]);
-    env.ok(U, &proj, &["ws", "new", "fix", "-r", "main", "--cloak", "team"]);
+    env.ok(U, &proj, &["ws", "new", "fix", "-r", "main"]);
     let mut c = env.cmd(U, &proj, &["ws", "write", "fix", "auth.rs"]);
     c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     let mut child = c.spawn().unwrap();

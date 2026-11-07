@@ -84,12 +84,12 @@ fn files_lists_only_what_is_recorded() {
 fn files_shows_cloaked_files_with_their_scope() {
     let env = Env::new();
     let r = env.repo("p");
-    r.ok(&["cloak", "secrets/"]);
-    r.write("secrets/plan.txt", SECRET_PLAN);
-    let f = r.files("@").into_iter().find(|f| f.path == "secrets/plan.txt").unwrap();
+    r.ok(&["cloak", "secrets/plan.pem"]);
+    r.write("secrets/plan.pem", SECRET_PLAN);
+    let f = r.files("@").into_iter().find(|f| f.path == "secrets/plan.pem").unwrap();
     assert_eq!(f.vis, "cloaked:team");
     assert!(!f.redacted, "the member can read it");
-    assert_eq!(r.cat("secrets/plan.txt", "@"), SECRET_PLAN);
+    assert_eq!(r.cat("secrets/plan.pem", "@"), SECRET_PLAN);
 }
 
 // Scenario from jj test_file_show_command.rs: `vl cat` prints the bytes
@@ -201,8 +201,8 @@ fn sizes_are_exact_for_large_files() {
 fn files_and_cat_for_a_non_member() {
     let env = Env::new();
     let r = env.repo("alice");
-    r.ok(&["cloak", "secrets/"]);
-    r.write("secrets/plan.txt", SECRET_PLAN);
+    r.ok(&["cloak", "secrets/plan.pem"]);
+    r.write("secrets/plan.pem", SECRET_PLAN);
     r.write("pub.txt", "public\n");
     r.commit("one");
     r.ok(&["tag", "set", "main", "-r", "@-"]);
@@ -213,9 +213,9 @@ fn files_and_cat_for_a_non_member() {
     let out = env.run_as("bob", &env.root, &["clone", remote.to_str().unwrap(), bob_dir.to_str().unwrap()]);
     assert!(out.status.success(), "{}", text(&out));
     let bob = env.as_user("bob", &bob_dir);
-    let f = bob.files("main").into_iter().find(|f| f.path == "secrets/plan.txt").unwrap();
+    let f = bob.files("main").into_iter().find(|f| f.path == "secrets/plan.pem").unwrap();
     assert!(f.redacted, "{f:?}");
-    let err = bob.fails(&["cat", "-r", "main", "secrets/plan.txt"]);
+    let err = bob.fails(&["cat", "-r", "main", "secrets/plan.pem"]);
     assert!(err.contains("cloaked under scope 'team'"), "{err}");
     assert!(!err.contains(SECRET_PLAN));
     assert_eq!(bob.cat("pub.txt", "main"), "public\n");

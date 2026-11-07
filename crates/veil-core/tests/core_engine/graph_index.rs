@@ -192,7 +192,6 @@ fn a_deep_history_is_indexed_iteratively() {
             timestamp: i,
             predecessors: vec![],
             conflicts: vec![],
-            cloak: None,
             embargo: None,
             signature: None,
         };

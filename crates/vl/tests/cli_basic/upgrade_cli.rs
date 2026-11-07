@@ -1,5 +1,5 @@
-//! `vl upgrade` and format handling of `vl clone`, on a copy of the
-//! format-1 golden fixture (`crates/veil-core/tests/fixtures`).
+//! `vl upgrade` on a copy of a golden fixture
+//! (`crates/veil-core/tests/fixtures`).
 
 use std::{
     path::{Path, PathBuf},
@@ -25,6 +25,7 @@ fn copy_dir(from: &Path, to: &Path) {
 
 fn vl(home: &Path, cwd: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_vl"))
+        .env("VEIL_TEST_PATH_REMOTES", "1")
         .args(args)
         .current_dir(cwd)
         .env("VEIL_HOME", home)
@@ -49,85 +50,52 @@ fn format_of(repo: &Path) -> u64 {
     v["format"].as_u64().unwrap()
 }
 
+fn err(o: &Output) -> String {
+    assert!(!o.status.success(), "unexpectedly succeeded: {}", String::from_utf8_lossy(&o.stdout));
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// Every file under `dir`, with its bytes.
+fn snapshot_dir(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+    for e in std::fs::read_dir(dir).unwrap() {
+        let e = e.unwrap();
+        if e.file_type().unwrap().is_dir() {
+            snapshot_dir(&e.path(), out);
+        } else {
+            out.push((e.path(), std::fs::read(e.path()).unwrap()));
+        }
+    }
+    out.sort();
+}
+
+/// The format-7 fixture holds what format 8 removed (cloaked folders, tags
+/// and lines of work, sealed descriptions, embargo keys): this vl refuses
+/// to open it, and `vl upgrade` refuses it, naming each thing and changing
+/// nothing.
 #[test]
 fn upgrade_from_the_cli() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("fx");
-    copy_dir(&fixture(1), &root);
+    copy_dir(&fixture(7), &root);
     let (home, alice) = (root.join("home-alice"), root.join("alice"));
+    let mut before = Vec::new();
+    snapshot_dir(&root, &mut before);
 
-    // A format-1 repository works without upgrading.
-    assert!(ok(&vl(&home, &alice, &["cat", "secrets/notes.txt", "-r", "main"])).contains("team-only notes v2"));
-    let dry = ok(&vl(&home, &alice, &["upgrade", "--dry-run"]));
-    assert!(
-        dry.contains(&format!("Would upgrade this repository from format 1 to format {}", veil_core::repo::REPO_FORMAT)),
-        "{dry}"
-    );
-    assert_eq!(format_of(&alice), 1);
-
-    let out = ok(&vl(&home, &alice, &["upgrade"]));
-    assert!(
-        out.contains(&format!("Upgraded this repository from format 1 to format {}", veil_core::repo::REPO_FORMAT)),
-        "{out}"
-    );
-    assert!(out.contains("scope 'team': new key generation 3"), "{out}");
-    assert_eq!(format_of(&alice), u64::from(veil_core::repo::REPO_FORMAT));
-    assert!(ok(&vl(&home, &alice, &["upgrade"])).contains(&format!("already at format {}", veil_core::repo::REPO_FORMAT)));
-    ok(&vl(&home, &alice, &["fsck"]));
-
-    // New commits are binary; the format-1 remote refuses them until upgraded.
-    std::fs::write(alice.join("after.txt"), "after\n").unwrap();
-    ok(&vl(&home, &alice, &["commit", "-m", "after upgrade"]));
-    ok(&vl(
-        &home,
-        &alice,
-        &["tag", "set", "main", "-r", "@-", "--allow-backwards"],
-    ));
-    let push = vl(&home, &alice, &["push", "origin"]);
-    assert!(!push.status.success());
-    assert!(
-        String::from_utf8_lossy(&push.stderr).contains("vl upgrade --remote"),
-        "{push:?}"
-    );
-    let up = ok(&vl(&home, &alice, &["upgrade", "--remote", "origin"]));
-    assert!(up.contains("Upgraded remote 'origin'"), "{up}");
-    ok(&vl(&home, &alice, &["push", "origin"]));
-    assert_eq!(format_of(&root.join("team-remote")), u64::from(veil_core::repo::REPO_FORMAT));
-}
-
-#[test]
-fn upgrade_from_format_2_moves_keys_to_hpke_from_the_cli() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join("fx");
-    copy_dir(&fixture(2), &root);
-    let (home, alice) = (root.join("home-alice"), root.join("alice"));
-    let show = ok(&vl(&home, &alice, &["identity", "show"]));
-    assert!(show.contains("legacy: derived from the encryption key"), "{show}");
-
-    let out = ok(&vl(&home, &alice, &["upgrade"]));
-    assert!(out.contains(&format!("from format 2 to format {}", veil_core::repo::REPO_FORMAT)), "{out}");
-    assert!(out.contains("3:hpke-ring-keys"), "{out}");
-    assert!(out.contains("nothing is re-sealed"), "{out}");
-    assert!(ok(&vl(&home, &alice, &["cat", "secrets/notes.txt", "-r", "main"])).contains("team-only notes v2"));
-    ok(&vl(&home, &alice, &["fsck"]));
-
-    std::fs::write(alice.join("secrets/notes.txt"), "notes after the upgrade\n").unwrap();
-    ok(&vl(&home, &alice, &["commit", "-m", "after upgrade"]));
-    ok(&vl(&home, &alice, &["tag", "set", "main", "-r", "@-", "--allow-backwards"]));
-    // The format-2 remote refuses AES-SIV objects and the HPKE ring.
-    let push = vl(&home, &alice, &["push", "origin"]);
-    assert!(!push.status.success());
-    assert!(String::from_utf8_lossy(&push.stderr).contains("vl upgrade --remote"), "{push:?}");
-    assert_eq!(format_of(&root.join("team-remote")), 2);
-    ok(&vl(&home, &alice, &["upgrade", "--remote", "origin"]));
-    ok(&vl(&home, &alice, &["push", "origin"]));
-
-    // Bob (a member, legacy identity) clones the upgraded remote and reads it.
-    let bob_home = root.join("home-bob");
-    let dest = tmp.path().join("bob-clone");
-    ok(&vl(&bob_home, tmp.path(), &["clone", root.join("team-remote").to_str().unwrap(), dest.to_str().unwrap()]));
-    assert_eq!(format_of(&dest), u64::from(veil_core::repo::REPO_FORMAT));
-    assert!(ok(&vl(&bob_home, &dest, &["cat", "secrets/notes.txt", "-r", "main"])).contains("notes after the upgrade"));
+    let e = err(&vl(&home, &alice, &["cat", "README.md", "-r", "main"]));
+    assert!(e.contains("format 7") && e.contains("vl upgrade"), "{e}");
+    let dry = vl(&home, &alice, &["upgrade", "--dry-run"]);
+    let dry = String::from_utf8_lossy(&dry.stdout).into_owned();
+    assert!(dry.contains(&format!("Would upgrade this repository from format 7 to format {}", veil_core::repo::REPO_FORMAT)), "{dry}");
+    assert!(dry.contains("The upgrade would be refused"), "{dry}");
+    let e = err(&vl(&home, &alice, &["upgrade"]));
+    assert!(e.contains("upgrade refused") && e.contains("Nothing was changed"), "{e}");
+    for thing in ["tag 'team-only': cloaked", "workspace 'fix-a': cloaked", "an encrypted description", "its record holds an embargo key", "secrets/notes.txt: encrypted (cloaked:team), and not a secret file"] {
+        assert!(e.contains(thing), "{thing:?} not named: {e}");
+    }
+    assert_eq!(format_of(&alice), 7);
+    let mut after = Vec::new();
+    snapshot_dir(&root, &mut after);
+    assert!(before == after, "a refused upgrade changed files");
 }
 
 #[test]
@@ -141,37 +109,4 @@ fn new_identities_have_independent_keys() {
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(home.join("identity.json")).unwrap()).unwrap();
     assert_eq!(v["format"], 2);
     assert!(v.get("secret").is_none() && v.get("signing_secret").is_some());
-}
-
-#[test]
-fn clone_keeps_the_format_of_its_source() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join("fx");
-    copy_dir(&fixture(1), &root);
-    let home = root.join("home-bob");
-    let dest = tmp.path().join("bob-clone");
-    ok(&vl(
-        &home,
-        tmp.path(),
-        &[
-            "clone",
-            root.join("team-remote").to_str().unwrap(),
-            dest.to_str().unwrap(),
-        ],
-    ));
-    assert_eq!(
-        format_of(&dest),
-        1,
-        "a clone of a format-1 remote must stay pushable to it"
-    );
-    assert!(ok(&vl(&home, &dest, &["cat", "secrets/notes.txt", "-r", "main"])).contains("team-only notes v2"));
-    std::fs::write(dest.join("bob.txt"), "bob\n").unwrap();
-    ok(&vl(&home, &dest, &["commit", "-m", "bob"]));
-    ok(&vl(
-        &home,
-        &dest,
-        &["tag", "set", "main", "-r", "@-", "--allow-backwards"],
-    ));
-    ok(&vl(&home, &dest, &["push", "origin"]));
-    ok(&vl(&home, &dest, &["fsck"]));
 }

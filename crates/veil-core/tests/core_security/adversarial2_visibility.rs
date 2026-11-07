@@ -46,7 +46,7 @@ fn a_merged_policy_cannot_publish_the_merging_members_isolated_files() {
     fs.write(&p("deploy/id_rsa"), b"-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtz\n").unwrap();
     let main = commit_files(&mut alice, &*fs, &[("README", "hi\n")], "v1");
     assert!(file_entry(&alice, &main, ".env").is_none());
-    alice.set_tag("main", main, None, false).unwrap();
+    alice.set_tag("main", main, false).unwrap();
 
     // Mallory's PR: "tidy up the policy".
     let pr_ws = alice.ephemeral_workspace(main).unwrap();
@@ -78,7 +78,7 @@ fn a_pulled_policy_cannot_publish_isolated_files() {
     let main = commit_files(&mut mallory, &*mfs, &[("README", "hi\n")], "v1");
     let main2 = commit_files(&mut mallory, &*mfs, &[(".veilpolicy", ".env public!\n")], "policy");
     let _ = main;
-    mallory.set_tag("main", main2, None, false).unwrap();
+    mallory.set_tag("main", main2, false).unwrap();
     let team = Arc::new(MemoryBackend::new());
     remote::push(&mut mallory, team.clone(), false, &[], false).unwrap();
 
@@ -149,7 +149,7 @@ fn gc_on_a_store_full_of_wrappers_keeps_everything_readable() {
             &[("a/x.rs", "x1\n"), ("a/y.rs", "y1\n"), ("b/z.rs", "z1\n"), ("README", "r\n")],
             "v1",
         );
-        alice.set_tag("main", main, None, false).unwrap();
+        alice.set_tag("main", main, false).unwrap();
         let mut embargoes = Vec::new();
         for (i, path) in ["a/x.rs", "b/z.rs"].into_iter().enumerate() {
             let tip = if i == 0 { alice.view().tags["main"].target } else { main };
@@ -159,7 +159,7 @@ fn gc_on_a_store_full_of_wrappers_keeps_everything_readable() {
             let (fix, _) = alice.commit_ephemeral(&ws, "fix").unwrap();
             let r = alice.merge(WS, tip, vec![fix], "fix", embargo("team")).unwrap();
             if i == 1 {
-                alice.set_tag("release", r.snapshot, None, false).unwrap();
+                alice.set_tag("release", r.snapshot, false).unwrap();
             }
             embargoes.push(r.embargo.unwrap());
             prune(&mut alice);
@@ -196,7 +196,7 @@ fn gc_by_a_non_holder_keeps_what_the_release_will_reveal() {
     let (mut alice, fs, _) = new_repo("alice");
     alice.keys().create_scope("sec").unwrap();
     let main = commit_files(&mut alice, &*fs, &[("auth.rs", "v1\n")], "v1");
-    alice.set_tag("main", main, None, false).unwrap();
+    alice.set_tag("main", main, false).unwrap();
     let ws = alice.ephemeral_workspace(main).unwrap();
     ws.write("auth.rs", "v2 fixed\n").unwrap();
     ws.write("docs/advisory.md", "advisory\n").unwrap();
@@ -215,36 +215,4 @@ fn gc_by_a_non_holder_keeps_what_the_release_will_reveal() {
     // nothing new for him except the record.
     remote::pull(&mut bob, "origin", team).unwrap();
     assert_eq!(read_at(&bob, &r.snapshot, "docs/advisory.md"), b"advisory\n");
-}
-
-// ---- push availability ------------------------------------------------------------------
-
-/// The fix was started in an ordinary change and continued in a cloaked
-/// workspace on top of it (`vl ws new fix -r <wip> --cloak team`). Pushing
-/// `main` to the team remote must still work: the plaintext part of the fix
-/// is withheld and the cloaked part may go. Instead push_closure rejects
-/// `main` itself ("builds on … withheld"), so main cannot be pushed to the
-/// team at all until the release.
-#[test]
-fn main_can_be_pushed_to_the_team_when_the_fix_line_starts_in_plaintext() {
-    let (mut alice, fs, _) = new_repo("alice");
-    let main = commit_files(&mut alice, &*fs, &[("auth.rs", "v1\n")], "v1");
-    alice.set_tag("main", main, None, false).unwrap();
-    let ws = alice.ephemeral_workspace(main).unwrap();
-    ws.write("notes.txt", "started looking at the auth bug\n").unwrap();
-    let (wip, _) = alice.commit_ephemeral(&ws, "wip").unwrap();
-    alice.create_workspace("fix", vec![wip], Some("team".into())).unwrap();
-    let ov = alice.workspace_overlay("fix").unwrap();
-    ov.write(&p("auth.rs"), b"v2 fixed\n").unwrap();
-    let fix = alice.snapshot_workspace("fix", &ov).unwrap().snapshot;
-    let r = alice.merge(WS, main, vec![fix], "fix", embargo("team")).unwrap();
-
-    let team = Arc::new(MemoryBackend::new());
-    let rep = remote::push(&mut alice, team.clone(), false, &[], false).unwrap();
-    assert!(
-        rep.tags_updated.iter().any(|(t, id)| t == "main" && *id == r.snapshot),
-        "main was not pushed: {:?}",
-        rep.tags_skipped
-    );
-    assert!(backend_contains(&*team, b"started looking at the auth bug").is_empty());
 }

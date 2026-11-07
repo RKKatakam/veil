@@ -51,7 +51,7 @@ vl="$PWD/target/debug/vl"
     "$vl" log >"$export_dir/log.txt"
     grep -q "portable: after gc" "$export_dir/log.txt"
     grep -q "portable: merge" "$export_dir/log.txt"
-    test "$("$vl" cat secrets/plan.txt)" = "team-only plan"
+    test "$("$vl" cat secrets/.env.plan)" = "team-only plan"
     test "$("$vl" cat src/lib.rs)" = "pub fn portable() {}"
     "$vl" gc >/dev/null
     "$vl" fsck >/dev/null
