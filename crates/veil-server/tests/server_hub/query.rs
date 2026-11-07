@@ -1490,13 +1490,13 @@ mod s13_adversarial {
         }
         let mut top = *main.last().unwrap();
         let mut all = files.clone();
-        for i in 1..=k {
-            let mut f = h.files[&main[i]].clone();
+        for (i, fork) in main.iter().copied().enumerate().take(k + 1).skip(1) {
+            let mut f = h.files[&fork].clone();
             f.insert(format!("pub/b{i}.txt"), b"branch\n".to_vec());
             let mut change = [0u8; 16];
             change[..8].copy_from_slice(&(i as u64).to_le_bytes());
             change[15] = 0xb2;
-            let x = h.commit(&th, &[main[i]], f, change, t0 + 1_000_000 + i as i64, None);
+            let x = h.commit(&th, &[fork], f, change, t0 + 1_000_000 + i as i64, None);
             all.insert(format!("pub/b{i}.txt"), b"branch\n".to_vec());
             change[15] = 0xb3;
             top = h.commit(&th, &[top, x], all.clone(), change, t0 + 2_000_000 + i as i64, None);
