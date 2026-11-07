@@ -313,10 +313,29 @@ impl Ctx {
         };
         let root = find_root(&start).ok_or_else(|| anyhow!("no Veil repository found in {} or its parents (run `vl init`)", start.display()))?;
         check_clone_finished(&root)?;
+        // The stat cache of the workspace the directory is attached to
+        // (most of opening a large working copy) is read meanwhile; used
+        // only if that is the workspace the session attaches to.
+        let early_cache = {
+            let root = root.clone();
+            std::thread::Builder::new()
+                .name("veil-statcache".into())
+                .spawn(move || {
+                    let fs = DiskBackend::new(&root);
+                    let ws = match CheckoutState::load(&fs).ok()? {
+                        Some(st) => st.attached().to_string(),
+                        None => DEFAULT_WORKSPACE.to_string(),
+                    };
+                    veil_core::workspace::validate_workspace_name(&ws).ok()?;
+                    Some((StatCache::load(&fs, &cache_path(&ws)), ws))
+                })
+                .ok()
+        };
         if snapshot {
             // The snapshot may scan changed files: the scanner's rules
-            // compile on another thread meanwhile.
+            // compile on another thread meanwhile, as do the policy's.
             veil_core::secrets::prepare();
+            veil_core::policy::prepare();
             // What was written in mounted workspaces is recorded first, as
             // the project directory is below.
             crate::mount::record_live(&root);
@@ -360,7 +379,10 @@ impl Ctx {
         // The operations of this command are for the attached workspace
         // (`vl undo` there undoes them; format 6).
         repo.set_command_workspace(Some(ws.clone()));
-        let cache = StatCache::load(&*fs, &cache_path(&ws));
+        let cache = match early_cache.and_then(|h| h.join().ok().flatten()) {
+            Some((cache, read_for)) if read_for == ws => cache,
+            _ => StatCache::load(&*fs, &cache_path(&ws)),
+        };
         let mut ctx = Ctx {
             root,
             fs,

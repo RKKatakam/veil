@@ -237,8 +237,6 @@ struct Rules {
     /// compiled for the first match.
     token_caps: OnceLock<Regex>,
     token_groups: Vec<usize>,
-    /// Finds [`KEYWORD_PARTS`] (see `lowercase_into`).
-    keyword_parts: aho_corasick::AhoCorasick,
     /// Groups of `token_re` holding the part to judge and print.
     token_values: Vec<usize>,
     /// `key = value` assignments, run on ASCII-lowercased text: `(?i)`
@@ -457,6 +455,44 @@ fn unbounded(pattern: &str) -> String {
 
 static RULES: OnceLock<Rules> = OnceLock::new();
 
+/// A literal that every match of some token rule contains, for each rule
+/// (in the order of [`Rules::tokens`]): text holding none of them holds no
+/// token, and is not searched. A test derives each rule's prefixes from
+/// its pattern and checks that every one contains a literal of its rule.
+const TOKEN_LITERALS: &[(&str, &[&str])] = &[
+    ("private-key", &["-----BEGIN "]),
+    ("aws-access-key-id", &["AKIA", "ASIA", "ABIA", "ACCA"]),
+    ("github-token", &["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"]),
+    ("gitlab-token", &["glpat-"]),
+    ("slack-token", &["xox"]),
+    ("stripe-secret-key", &["k_live_"]),
+    ("anthropic-api-key", &["sk-ant-"]),
+    ("openai-api-key", &["sk-"]),
+    ("google-api-key", &["AIza"]),
+    ("jwt", &["eyJ"]),
+    ("url-password", &["://", r":\/\/"]),
+];
+
+/// Finds any of [`TOKEN_LITERALS`] (microseconds to build).
+fn token_literals() -> &'static aho_corasick::AhoCorasick {
+    static FINDER: OnceLock<aho_corasick::AhoCorasick> = OnceLock::new();
+    FINDER.get_or_init(|| {
+        aho_corasick::AhoCorasick::new(TOKEN_LITERALS.iter().flat_map(|(_, l)| l.iter())).expect("token literals")
+    })
+}
+
+/// Finds [`KEYWORD_PARTS`] (see `lowercase_into`), without compiling the
+/// rules.
+fn keyword_parts() -> &'static aho_corasick::AhoCorasick {
+    static FINDER: OnceLock<aho_corasick::AhoCorasick> = OnceLock::new();
+    FINDER.get_or_init(|| {
+        aho_corasick::AhoCorasick::builder()
+            .match_kind(aho_corasick::MatchKind::LeftmostFirst)
+            .build(KEYWORD_PARTS)
+            .expect("keyword parts")
+    })
+}
+
 /// Compile the rules on another thread, for a command that may scan soon:
 /// the token rules take 2 to 3 ms to compile (the assignment rule's are
 /// compiled when a keyword is first found), about what the rest of a
@@ -516,10 +552,6 @@ fn rules() -> &'static Rules {
         let token_pattern = alternation.join("|");
         let token_re = compile(&token_pattern);
         Rules {
-            keyword_parts: aho_corasick::AhoCorasick::builder()
-                .match_kind(aho_corasick::MatchKind::LeftmostFirst)
-                .build(KEYWORD_PARTS)
-                .expect("keyword parts"),
             token_groups: (0..tokens.len()).map(|i| group(&token_re, &format!("t{i}"))).collect(),
             token_values: vec![group(&token_re, "pw")],
             assignments: OnceLock::new(),
@@ -1744,6 +1776,16 @@ struct Hit {
 /// `limit` overlap owned by the next chunk). `stripped`: `hay` is
 /// NUL-padded data with the NULs removed.
 fn search_tokens(hay: &[u8], from: usize, limit: usize, stripped: bool, out: &mut Vec<Hit>) {
+    // Text holding none of the token rules' literals holds no token: the
+    // rules (2 to 3 ms to compile) are not needed for it.
+    if !token_literals().is_match(hay) {
+        return;
+    }
+    search_all_tokens(hay, from, limit, stripped, out);
+}
+
+/// [`search_tokens`] without the literal check.
+fn search_all_tokens(hay: &[u8], from: usize, limit: usize, stripped: bool, out: &mut Vec<Hit>) {
     let rules = rules();
     search_with(&rules.token_re, &|| rules.token_caps(), &rules.token_values, None, stripped, hay, hay, from..limit, out, |caps| {
         let i = rules.token_groups.iter().position(|&g| caps.get(g).is_some()).expect("one alternative matched");
@@ -2108,7 +2150,7 @@ fn lowercase_into(buf: &mut Vec<u8>, s: &[u8]) -> Option<(usize, usize)> {
     // [`KEYWORD_PARTS`]. (The stand-ins are no part of any keyword, so
     // marking does not change what is found next.) The keywords found also
     // tell `search_assignments` where to search.
-    let finder = &rules().keyword_parts;
+    let finder = keyword_parts();
     let mut pos = 0;
     let mut first = None;
     while let Some((start, end)) = finder.find(&buf[pos..]).map(|m| (pos + m.start(), pos + m.end())) {
@@ -2434,6 +2476,147 @@ pub fn scan(data: &[u8]) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every match of a token rule starts with one of the prefixes its
+    /// pattern allows (derived here from the pattern itself), and each of
+    /// those holds one of the rule's [`TOKEN_LITERALS`]: so text without
+    /// any of them can hold no token, and skipping it finds the same.
+    #[test]
+    fn every_token_prefix_holds_one_of_its_rules_literals() {
+        use regex_syntax::hir::literal::{ExtractKind, Extractor};
+        let rules = rules();
+        let names: Vec<&str> = rules.tokens.iter().map(|t| t.name).collect();
+        let listed: Vec<&str> = TOKEN_LITERALS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, listed, "TOKEN_LITERALS must list every token rule, in order");
+        for (t, (_, literals)) in rules.tokens.iter().zip(TOKEN_LITERALS) {
+            let hir = regex_syntax::ParserBuilder::new().utf8(false).unicode(false).build().parse(&t.pattern).unwrap();
+            let seq = Extractor::new().kind(ExtractKind::Prefix).extract(&hir);
+            let prefixes = seq.literals().unwrap_or_else(|| panic!("{}: its prefixes are not a finite set", t.name));
+            assert!(!prefixes.is_empty(), "{}", t.name);
+            for p in prefixes {
+                let p = p.as_bytes();
+                assert!(
+                    literals.iter().any(|l| p.windows(l.len()).any(|w| w == l.as_bytes())),
+                    "{}: prefix {:?} holds none of {literals:?}",
+                    t.name,
+                    String::from_utf8_lossy(p)
+                );
+            }
+        }
+    }
+
+    /// The literal check never changes what the token rules find: random
+    /// text built from literals, near misses, real tokens and noise.
+    #[test]
+    fn token_literal_check_finds_what_the_full_search_finds() {
+        let pieces: &[&str] = &[
+            "AKIA", "AKIAIOSFODNN7EXAMPLE", "ASIA", "ghp_", "gho_", "gh", "ghp", "github_pat_", "glpat-", "glpat", "xox", "xoxb-",
+            "sk_live_", "rk_live_", "k_live", "sk-", "sk-ant-", "sk-proj-", "AIza", "eyJ", "eyJhbGciOiJIUzI1NiJ9", ".", "://", ":\\/\\/",
+            ":/", "@db", "@", "-----BEGIN ", "-----BEGIN RSA PRIVATE KEY-----", "PRIVATE KEY-----", "user:", "hunter2hunter2",
+            "Xk9mQ2vL7pR4wZt8uY3nXk9mQ2vL7pR4wZt8", "0123456789ABCDEF", "abcdefghijklmnopqrstuvwxyz0123456789", "_", "-", " ", "\n", "\0",
+            "\u{9ad8}", "\u{FF}",
+        ];
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let (mut differed, mut found) = (0, 0);
+        for _ in 0..20_000 {
+            let n = 1 + next() % 12;
+            let mut text = Vec::new();
+            for _ in 0..n {
+                text.extend_from_slice(pieces[(next() % pieces.len() as u64) as usize].as_bytes());
+            }
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            search_tokens(&text, 0, text.len(), false, &mut a);
+            search_all_tokens(&text, 0, text.len(), false, &mut b);
+            let key = |h: &Vec<Hit>| h.iter().map(|h| (h.rule, h.offset, h.excerpt.clone())).collect::<Vec<_>>();
+            differed += usize::from(key(&a) != key(&b));
+            found += b.len();
+            assert_eq!(key(&a), key(&b), "{:?}", String::from_utf8_lossy(&text));
+        }
+        assert_eq!(differed, 0);
+        assert!(found > 1000, "the inputs exercise the rules: {found} findings");
+    }
+
+    /// Whole files: `scan` finds the same with and without the literal
+    /// check (UTF-16 and NUL-separated text included).
+    #[test]
+    fn literal_check_skips_plain_text_and_keeps_utf16_tokens() {
+        for text in ["change 1 0.123\n", "fn main() {}\n", "password = \"Xk9mQ2vL7pR4wZt8uY3n\"\n"] {
+            let mut hits = Vec::new();
+            search_tokens(text.as_bytes(), 0, text.len(), false, &mut hits);
+            assert!(hits.is_empty());
+        }
+        let utf16: Vec<u8> = "token AKIAIOSFODNN7EXAMPLE\n".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        assert!(!scan(&utf16).is_empty(), "a UTF-16 token is still found");
+        assert!(!scan(b"x = 1\nkey AKIAIOSFODNN7EXAMPLE\n").is_empty());
+    }
+
+    /// Adversarial pass, performance round 3: the literal check against
+    /// the full token search on adversarial pieces (case variants, split
+    /// and escaped prefixes, Unicode look-alikes, NUL padding), every
+    /// real token shape, NUL-stripped searches and windows with context
+    /// before `from` and overlap after `limit` (as the chunked passes
+    /// search them).
+    #[test]
+    fn token_literal_check_adversarial_windows() {
+        let pieces: &[&[u8]] = &[
+            b"AKIA", b"akia", b"AKIA\nIOSFODNN7EXAMPLE", b"AKIAIOSFODNN7EXAMPLE", b"ASIAIOSFODNN7EXAMPLE", b"ACCAIOSFODNN7EXAMPLE",
+            b"ABIAIOSFODNN7EXAMPLE", b"AK\0IA", b"A\0K\0I\0A\0", b"GHP_", b"ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789",
+            b"ghs_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789", b"github_pat_11ABCDEFG0aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789aBcDeFgHiJkLmNoPqRs",
+            b"glpat-aBcDeFgHiJkLmNoPqRsT", b"xoxb-1234567890-abc", b"xoxp-", b"XOXB-", b"sk_live_aBcDeFgHiJkLmNoPqRsT",
+            b"rk_live_aBcDeFgHiJkLmNoPqRsT", b"sk-ant-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345", b"sk-proj-Xk9mQ2vL7pR4wZt8uY3nXk9mQ2vL7pR4",
+            b"sk-Xk9mQ2vL7pR4wZt8uY3nXk9mQ2vL7pR4wZt8", b"SK-", b"s\xc2\xadk-", b"AIzaSyAbCdEfGhIjKlMnOpQrStUvWxYz012345678",
+            b"aiza", b"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig_nature-123", b"eyj", b"postgres://app:hunter2hunter2@db",
+            b"postgres:\\/\\/app:hunter2hunter2@db", b"postgres:%2F%2Fapp:hunter2hunter2@db", b":/\\/", b"\xef\xbc\x9a//",
+            b"-----BEGIN RSA PRIVATE KEY-----", b"-----BEGIN\tRSA PRIVATE KEY-----", b"-----begin ", b"-----BEGIN ", b"\xff\xfe",
+            b"\0", b"\0\0\0", b"\n", b"\r\n", b" ", b"_", b"-", b".", b"@", b":", b"//", b"Xk9mQ2vL7pR4wZt8uY3n", b"\xe2\x80\x8b",
+        ];
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut found = 0;
+        for round in 0..30_000 {
+            let n = 1 + next() % 16;
+            let mut text = Vec::new();
+            for _ in 0..n {
+                text.extend_from_slice(pieces[(next() % pieces.len() as u64) as usize]);
+            }
+            // NUL-padded variants, searched with the NULs removed.
+            let stripped = round % 3 == 0;
+            if stripped {
+                text.retain(|&b| b != 0);
+            }
+            let from = (next() as usize) % (text.len() + 1);
+            let limit = from + (next() as usize) % (text.len() - from + 1);
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            search_tokens(&text, from, limit, stripped, &mut a);
+            search_all_tokens(&text, from, limit, stripped, &mut b);
+            let key = |h: &Vec<Hit>| h.iter().map(|h| (h.rule, h.offset, h.excerpt.clone())).collect::<Vec<_>>();
+            assert_eq!(key(&a), key(&b), "{:?} {from}..{limit} stripped={stripped}", String::from_utf8_lossy(&text));
+            found += b.len();
+        }
+        assert!(found > 2000, "the inputs exercise the rules: {found} findings");
+        // UTF-16 (both orders) and UTF-32 files: the scan still finds every
+        // token kind through the NUL-stripped pass.
+        for token in ["AKIAIOSFODNN7EXAMPLE", "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789", "postgres://app:hunter2hunter2@db.example"] {
+            let line = format!("value {token}\n");
+            let le: Vec<u8> = line.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            let be: Vec<u8> = [0xfe, 0xff].into_iter().chain(line.encode_utf16().flat_map(|u| u.to_be_bytes())).collect();
+            let u32le: Vec<u8> = line.chars().flat_map(|c| (c as u32).to_le_bytes()).collect();
+            for data in [le, be, u32le] {
+                assert!(!scan(&data).is_empty(), "{token} in {:?}", &data[..8]);
+            }
+        }
+    }
 
     const PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
