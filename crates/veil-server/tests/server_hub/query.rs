@@ -80,6 +80,25 @@ enum Q {
     Ancestry(Vec<(String, String)>),
 }
 
+/// Ask again while the answer is `warming` or `deadline`, as a client does
+/// (both say "try again"), for at most 120 s: what the harness compares is
+/// the answer, and under a loaded machine a first fill or a slow page can
+/// pass the 2 s deadline (BUG-1172). Tests of those answers call the query
+/// functions directly.
+async fn settled<T, F, Fut>(mut f: F) -> veil_server::error::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = veil_server::error::Result<T>>,
+{
+    let end = Instant::now() + Duration::from_secs(120);
+    loop {
+        match f().await {
+            Err(Error::Api { code: "warming" | "deadline", .. }) if Instant::now() < end => tokio::time::sleep(Duration::from_millis(100)).await,
+            r => return r,
+        }
+    }
+}
+
 /// Run `q` as `a`; a log is followed through every page (at most 60).
 fn run(th: &TestHub, h: &Hist, a: &Ask, q: &Q) -> Vec<String> {
     let hub = h.hub.clone();
@@ -89,7 +108,7 @@ fn run(th: &TestHub, h: &Hist, a: &Ask, q: &Q) -> Vec<String> {
                 let mut out = Vec::new();
                 let mut p = p.clone();
                 for _ in 0..60 {
-                    let r = query::log(&hub, a, p.clone(), *limits).await;
+                    let r = settled(|| query::log(&hub, a, p.clone(), *limits)).await;
                     let next = r.as_ref().ok().and_then(|v| v["next"].as_str().map(str::to_string));
                     out.push(norm(r));
                     match next {
@@ -99,14 +118,14 @@ fn run(th: &TestHub, h: &Hist, a: &Ask, q: &Q) -> Vec<String> {
                 }
                 out
             }
-            Q::Show(p) => vec![norm(query::show(&hub, a, p.clone(), Limits::default()).await)],
-            Q::Tree(p) => vec![norm(query::tree(&hub, a, p.clone(), Limits::default()).await)],
-            Q::File(p) => vec![norm(query::file(&hub, a, p.clone(), Limits::default()).await.map(|(mut m, bytes)| {
+            Q::Show(p) => vec![norm(settled(|| query::show(&hub, a, p.clone(), Limits::default())).await)],
+            Q::Tree(p) => vec![norm(settled(|| query::tree(&hub, a, p.clone(), Limits::default())).await)],
+            Q::File(p) => vec![norm(settled(|| query::file(&hub, a, p.clone(), Limits::default())).await.map(|(mut m, bytes)| {
                 m["bytes"] = json!(hex::encode(bytes));
                 m
             }))],
-            Q::Diff(p) => vec![norm(query::diff(&hub, a, p.clone(), Limits::default()).await)],
-            Q::Ancestry(pairs) => vec![norm(query::ancestry(&hub, a, query::AncestryRequest { pairs: pairs.clone() }, Limits::default()).await)],
+            Q::Diff(p) => vec![norm(settled(|| query::diff(&hub, a, p.clone(), Limits::default())).await)],
+            Q::Ancestry(pairs) => vec![norm(settled(|| query::ancestry(&hub, a, query::AncestryRequest { pairs: pairs.clone() }, Limits::default())).await)],
         }
     })
 }
@@ -935,6 +954,11 @@ fn query_speed() {
     h.set_branch(&th, "b", side_b);
     println!("query_speed: built {n} snapshots in {:?}", t0.elapsed());
     let project = h.project(&th);
+    // It measures time; the 2 s deadline is not what it tests (BUG-1172).
+    let patient = Limits {
+        deadline: Duration::from_secs(120),
+        ..Limits::default()
+    };
     for (who, viewer) in [("admin", admin()), ("anyone on Earth", Viewer::default())] {
         let a = ask(&th, &h, &viewer);
         let t = Instant::now();
@@ -958,28 +982,28 @@ fn query_speed() {
                     works.insert(name, v["work"].as_u64().unwrap_or(0));
                 };
                 let t = Instant::now();
-                let v = query::log(&hub, &a, LogParams { n: Some(50), ..Default::default() }, Limits::default()).await.unwrap();
+                let v = query::log(&hub, &a, LogParams { n: Some(50), ..Default::default() }, patient).await.unwrap();
                 time("log -n 50", v, t);
                 let t = Instant::now();
-                let v = query::log(&hub, &a, LogParams { n: Some(50), path: Some(hot.clone()), ..Default::default() }, Limits::default()).await.unwrap();
+                let v = query::log(&hub, &a, LogParams { n: Some(50), path: Some(hot.clone()), ..Default::default() }, patient).await.unwrap();
                 assert_eq!(v["entries"].as_array().unwrap().len(), 50, "{v}");
                 time("log -n 50 -- hot file", v, t);
                 let t = Instant::now();
-                let v = query::ancestry(&hub, &a, query::AncestryRequest { pairs: vec![(pa.hex(), pb.hex())] }, Limits::default()).await.unwrap();
+                let v = query::ancestry(&hub, &a, query::AncestryRequest { pairs: vec![(pa.hex(), pb.hex())] }, patient).await.unwrap();
                 assert_eq!(v["results"][0]["is_ancestor"], json!(false));
                 time("ancestry (merge base 20k apart)", v, t);
                 let t = Instant::now();
-                let v = query::ancestry(&hub, &a, query::AncestryRequest { pairs: vec![(root_snapshot_id().hex(), tip_p.hex())] }, Limits::default()).await.unwrap();
+                let v = query::ancestry(&hub, &a, query::AncestryRequest { pairs: vec![(root_snapshot_id().hex(), tip_p.hex())] }, patient).await.unwrap();
                 time("is_ancestor(root, tip)", v, t);
                 let t = Instant::now();
-                let v = query::diff(&hub, &a, DiffParams { from: "main".into(), to: Some("b".into()), ..Default::default() }, Limits::default()).await.unwrap();
+                let v = query::diff(&hub, &a, DiffParams { from: "main".into(), to: Some("b".into()), ..Default::default() }, patient).await.unwrap();
                 assert!(v["files"].as_array().unwrap().len() >= 50, "{}", v["files"].as_array().unwrap().len());
                 time("diff, 100 files vs merge base", v, t);
                 let t = Instant::now();
-                let v = query::tree(&hub, &a, TreeParams { path: Some("pub/d0".into()), ..Default::default() }, Limits::default()).await.unwrap();
+                let v = query::tree(&hub, &a, TreeParams { path: Some("pub/d0".into()), ..Default::default() }, patient).await.unwrap();
                 time("tree", v, t);
                 let t = Instant::now();
-                let v = query::file(&hub, &a, FileParams { rev: None, path: hot.clone() }, Limits::default()).await.unwrap().0;
+                let v = query::file(&hub, &a, FileParams { rev: None, path: hot.clone() }, patient).await.unwrap().0;
                 time("file", v, t);
             }
         });
