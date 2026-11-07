@@ -241,3 +241,62 @@ fn squashing_the_embargoed_merge_away_publishes_nothing() {
     assert!(out.contains("embargoed merge") && out.contains("vl embargo release"), "{out}");
     publishes_nothing(&env, &r);
 }
+
+// ---- simplification cycle 2 --------------------------------------------------
+
+/// BUG-990 (pre-existing on `integration` 0fbe207; the class of BUG-942):
+/// a rebase of the embargoed merge that keeps its embargo but changes its
+/// parents (the fix first, the fix alone, or `main` alone) changes what
+/// the embargo withholds: `remote::embargo_withheld` takes the fix to be
+/// the history behind the merge's non-first parents, so the fix tag stops
+/// being withheld while the embargo is still pending, and the next push
+/// publishes the fix.
+#[test]
+#[ignore = "BUG-990: rebasing the embargoed merge onto other parents un-withholds its fix"]
+fn rebasing_the_embargoed_merge_onto_other_parents_publishes_nothing() {
+    for dest in [&["fix", "V1"][..], &["fix"], &["V1"]] {
+        let env = Env::new();
+        let (r, v1) = embargoed(&env);
+        let mut args = vec!["rebase", "-r", "main"];
+        for d in dest {
+            args.extend(["-d", if *d == "V1" { v1.as_str() } else { d }]);
+        }
+        let _ = r.run(&args);
+        assert!(r.ok(&["embargo", "list"]).contains("manual release"), "control: the embargo is still pending");
+        publishes_nothing(&env, &r);
+    }
+}
+
+/// BUG-991 (regression: `integration` 0fbe207 refuses, "cannot be read as
+/// the public sees it"): `vl blame --public` annotates the fix's lines in
+/// the embargoed `main` as a public mirror sees them, attributed to the
+/// fix's change and description, although no push sends any of it before
+/// the release.
+#[test]
+#[ignore = "BUG-991: `vl blame --public` reads an unreleased embargo's history as public"]
+fn blame_public_never_shows_an_unreleased_embargo_as_public() {
+    let env = Env::new();
+    let (r, _) = embargoed(&env);
+    let out = text(&r.run(&["blame", "FIXNAME-K7.c", "-r", "main", "--public", "--json"]));
+    assert!(!out.contains("FIXBODY-K7") && !out.contains("FIXDESC-K7"), "the public view shows the withheld fix: {out}");
+}
+
+/// BUG-992 (the rest of BUG-944): `vl diff --json` and `vl show --json`
+/// list the files an unreleased embargo withholds with the visibility
+/// `public` and nothing else to say otherwise (format 7 said `embargoed`;
+/// the `/2` schemas dropped that kind and added no tier to file diffs).
+#[test]
+#[ignore = "BUG-992: `vl diff --json` and `vl show --json` call an unreleased embargo's files public"]
+fn diff_and_show_json_never_call_a_file_under_an_unreleased_embargo_public() {
+    let env = Env::new();
+    let (r, v1) = embargoed(&env);
+    for args in [&["diff", "--from", v1.as_str(), "--to", "main", "--json"][..], &["diff", "-r", "fix", "--json"], &["show", "fix", "--json"]] {
+        let doc: serde_json::Value = serde_json::from_str(&r.ok(args)).unwrap();
+        let files = if doc["diff"].is_object() { &doc["diff"]["files"] } else { &doc["files"] };
+        let fix = files.as_array().unwrap().iter().find(|f| f["path"] == "FIXNAME-K7.c").unwrap_or_else(|| panic!("{args:?}: {doc}")).clone();
+        assert!(
+            fix["new"]["visibility"]["kind"] != "public" || fix.get("tier").is_some_and(|t| t != "public"),
+            "{args:?}: a file no push sends before the release is public: {fix}"
+        );
+    }
+}
