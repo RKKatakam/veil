@@ -326,8 +326,16 @@ async fn shards(hub: &Arc<Hub>, ask: &Ask, kind: &'static str, branch: &str) -> 
     let (head, covered, target, shards) = blocking(hub, ask.project.id, move |cx| {
         let pool = &cx.hub().db;
         let shard_branch = if kind == NAMES { "" } else { b.as_str() };
+        // Names: the branch's walked tip is read before the shards (BUG-1233).
+        // An update commits both together, so shards read afterwards are at
+        // least as new as that tip: a race can only make an answer say it is
+        // behind when it is not, never call an older answer current.
+        let walked = if kind == NAMES { Some(read_head(cx, pool, index::WALK, &b)?.map(|w| w.snapshot)) } else { None };
         let (head, shards) = read_state(cx, pool, kind, shard_branch, Some(&keys))?;
-        let covered = if kind == NAMES { read_head(cx, pool, index::WALK, &b)?.map(|w| w.snapshot) } else { head.as_ref().map(|h| h.snapshot.clone()) };
+        let covered = match walked {
+            Some(w) => w,
+            None => head.as_ref().map(|h| h.snapshot.clone()),
+        };
         let target: Option<String> = cx.db(|| sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2").bind(cx.project()).bind(&b).fetch_optional(pool))?;
         Ok((head, covered, target, shards))
     })

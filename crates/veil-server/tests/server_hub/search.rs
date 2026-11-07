@@ -1122,7 +1122,6 @@ fn bug_1232_candidates_are_collected_past_the_bounds() {
 /// update runs; the first answer each gets that says it is current must
 /// hold the name.
 #[test]
-#[ignore = "BUG-1233: a name search reads its walked tip after its shards and can call a stale answer current"]
 fn bug_1233_a_name_search_is_current_only_with_its_names() {
     let th = TestHub::start();
     let (policy_text, bindings) = policy(1);
