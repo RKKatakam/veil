@@ -11,6 +11,7 @@
 //! | [`sync`] | projected history, fetch by id, push validation, branch CAS |
 //! | [`changes`] | commits through the API: edits on a revision, the push's checks, one commit |
 //! | [`grant`] | read grants, the object routes, the access-epoch feed |
+//! | [`cache`] | the regional cache (`veil-server cache`, S9), and the epoch feed it polls |
 //! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
 //! | [`query`] | the query API: history answered per viewer (S13) |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
@@ -19,6 +20,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod cache;
 pub mod caches;
 pub mod changes;
 pub mod db;
@@ -61,6 +63,9 @@ pub struct Hub {
     /// The grant key (`<data>/hub-grant-key`) and what it needs
     /// (`grant`).
     pub grants: grant::Grants,
+    /// The hash of the regional caches' token (`<data>/hub-cache-token`):
+    /// what `POST /v1/cache/epochs` accepts (`cache::feed`).
+    pub cache_token: blake3::Hash,
     pub session_ttl_ms: i64,
     /// The TLS certificate (leaf, DER): sign-in accepts only signatures
     /// for a server name it is valid for.
@@ -155,6 +160,7 @@ pub async fn start(config: Config) -> Result<Running> {
     let identity = server_identity(&config.data_dir)?;
     let receipt_key = receipt_key(&config.data_dir)?;
     let grants = grant::Grants::load(&config.data_dir).context("reading hub-grant-key")?;
+    let cache_token = cache::feed::load_token(&config.data_dir).context("reading hub-cache-token")?;
     let (tls, cert_pem, certificate) = tls::server_config(&config.tls, &config.data_dir)?;
     let db = db::connect(&config.database_url, config.db_connections).await.context("connecting to the database")?;
     db::migrate(&db).await.context("migrating the database")?;
@@ -182,6 +188,7 @@ pub async fn start(config: Config) -> Result<Running> {
         identity,
         receipt_key,
         grants,
+        cache_token,
         session_ttl_ms: config.session_ttl.as_millis() as i64,
         certificate,
         caches: caches::Caches::default(),
@@ -211,7 +218,7 @@ pub async fn start(config: Config) -> Result<Running> {
 /// a request's head.
 const IDLE_LIMIT: Duration = Duration::from_secs(20);
 
-async fn serve_tls(
+pub(crate) async fn serve_tls(
     listener: tokio::net::TcpListener,
     tls: Arc<rustls::ServerConfig>,
     app: axum::Router,

@@ -112,6 +112,65 @@ impl Server {
     }
 }
 
+/// A regional cache (`veil-server cache`, S9) in front of a server started
+/// here, with its directory `dir` (its log beside it, `dir.log`), and
+/// `--memory 256M`. Killed when dropped.
+pub struct CacheProc {
+    child: Child,
+    pub authority: String,
+    pub cert: PathBuf,
+    pub dir: PathBuf,
+}
+
+impl Drop for CacheProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl CacheProc {
+    /// Start one in front of `server` (whose data directory is `data`: the
+    /// caches' token is there), and wait until it answers.
+    pub fn start(bin: &Path, server: &Server, data: &Path, dir: &Path) -> Result<CacheProc> {
+        std::fs::create_dir_all(dir)?;
+        let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let child = Command::new(bin)
+            .args(["cache", "--upstream", &server.https(), "--listen", &format!("127.0.0.1:{port}"), "--memory", "256M", "--upstream-ca"])
+            .arg(&server.cert)
+            .arg("--token-file")
+            .arg(data.join("hub-cache-token"))
+            .arg("--dir")
+            .arg(dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(dir.with_extension("log"))?))
+            .spawn()
+            .context("starting veil-server cache")?;
+        let c = CacheProc {
+            child,
+            authority: format!("127.0.0.1:{port}"),
+            cert: dir.join("self-signed-cert.pem"),
+            dir: dir.to_path_buf(),
+        };
+        for _ in 0..600 {
+            if c.dir.join("stats.json").exists() && std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return Ok(c);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        bail!("veil-server cache did not start (log: {})", dir.with_extension("log").display())
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn https(&self) -> String {
+        format!("https://{}", self.authority)
+    }
+}
+
 /// Start a new peak-RSS window for process `pid` (Linux: `clear_refs` 5);
 /// its RSS now, in KiB. The peak restarts at this RSS, not below it: a
 /// server keeps the memory it has used (its caches, the allocator's).
