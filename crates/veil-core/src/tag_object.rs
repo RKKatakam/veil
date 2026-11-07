@@ -15,7 +15,7 @@
 //!
 //! ```text
 //! {"name":…,"target":…,"kind":"annotated",
-//!  "message":{"plain":…}|{"sealed":…},"tagger":…,"timestamp":…,
+//!  "message":{"plain":…},"tagger":…,"timestamp":…,
 //!  "signature"?:{signer,key,sig}}
 //! ```
 //!
@@ -25,7 +25,7 @@
 //! with [`SIG_CONTEXT_TAG`], where
 //! the unsigned id is the id of the encoding without `signature`. The
 //! signature therefore covers the name, the target, the kind, the
-//! (possibly sealed) message, the tagger and the time: an
+//! message, the tagger and the time: an
 //! atag cannot be moved to another target or name without breaking it, and
 //! [`Atag::verify`] also checks that the view entry naming it agrees with
 //! its `name` and `target` (a valid atag of `v1.0` shown under `v2.0`, or
@@ -33,11 +33,10 @@
 //!
 //! # Confidentiality
 //!
-//! A cloaked tag seals its message under the tag's scope
-//! ([`crate::store::ObjectStore::make_text`]): the atag object itself stays
-//! plaintext (name, target, tagger and time are as visible as the tag's
-//! view entry), and a public remote never receives an atag whose message
-//! is sealed (`remote.rs` withholds it, as it withholds cloaked tags).
+//! An atag is plain text, its message included (only secret files are
+//! ever encrypted, `docs/VISIBILITY.md`): it is as visible as the tag's
+//! view entry, and push sends it only with its tag. A sealed message,
+//! which only formats 7 and earlier wrote, is refused on decoding.
 
 use serde::{Deserialize, Serialize};
 
@@ -50,7 +49,7 @@ use crate::{
     object::{Object, Text},
 };
 
-/// Largest message (plain or sealed, in bytes) an atag may carry: a
+/// Largest message (in bytes) an atag may carry: a
 /// hostile object carrying more is corrupt.
 pub const MAX_TAG_MESSAGE: usize = 1 << 20;
 /// Largest tagger string.

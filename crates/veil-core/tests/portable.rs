@@ -255,7 +255,7 @@ fn a_repository_for_native_vl() {
     let id = Identity::generate("alice");
     let mut repo = Repo::init(fs.clone(), Some(id.clone()), "alice").unwrap();
     fs.write(&p(".veilpolicy"), b"secrets/ cloak team\n").unwrap();
-    fs.write(&p("secrets/plan.txt"), b"team-only plan\n").unwrap();
+    fs.write(&p("secrets/.env.plan"), b"team-only plan\n").unwrap();
     fs.write(&p("README.md"), b"written without an operating system\n").unwrap();
     repo.snapshot_workspace("default", &*fs).unwrap();
     let (first, _) = repo.commit_working_copy("default", "portable: first").unwrap();
