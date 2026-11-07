@@ -9,6 +9,8 @@
 //! | `GET file?rev=&path=` | a file's bytes (a secret's ciphertext) |
 //! | `GET diff?from=&to=&base=&path=&stat=` | the diff from the merge base of `from` and `to` (`base=merge`, the default) or from `from` itself (`base=from`), to `to` |
 //! | `POST ancestry {pairs}` | `is_ancestor` and merge bases, for pairs of revisions |
+//! | `GET blame?rev=&path=&follow=&after=&n=` | who introduced each line of a file (S14, [`files`]): a page of its lines, each with the change that introduced it, its path and line there |
+//! | `GET history?rev=&path=&follow=&n=&after=` | the changes that made each version of a file (S14), newest first; with `follow`, across renames between paths the viewer reads |
 //!
 //! **Every answer is computed on the viewer's projected history** (the
 //! history pulls give them, `docs/HUB.md` §13.4): its graph
@@ -33,6 +35,7 @@
 //! Every answer carries the policy version it was computed under, and its
 //! `work` (rows and objects read).
 
+pub mod files;
 pub mod graph;
 pub mod trees;
 
@@ -89,6 +92,8 @@ pub struct Limits {
     pub kept_bytes: usize,
     /// Most ancestry pairs.
     pub pairs: usize,
+    /// What one blame may spend and show (S14).
+    pub blame: files::BlameLimits,
     pub deadline: Duration,
 }
 
@@ -105,6 +110,7 @@ impl Default for Limits {
             kept_for: Duration::from_secs(3600),
             kept_bytes: 32 << 20,
             pairs: 100,
+            blame: files::BlameLimits::default(),
             deadline: Duration::from_secs(2),
         }
     }
@@ -674,6 +680,116 @@ pub async fn ancestry(hub: &Arc<Hub>, ask: &Ask, q: AncestryRequest, limits: Lim
     .await
 }
 
+// ---- blame and file history (S14) ------------------------------------------------------
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct BlameParams {
+    pub rev: Option<String>,
+    pub path: String,
+    pub follow: Option<bool>,
+    /// Lines shown start after this one (a page's `next`).
+    pub after: Option<usize>,
+    pub n: Option<usize>,
+}
+
+/// The version of a file a blame or history starts from, at the viewer's
+/// snapshot `id`: its entry there must be a file (a missing and a hidden
+/// path are the same: absent from the projected tree).
+fn file_entry(g: &G, t: &Trees, id: &ObjectId, path: &str) -> Result<Option<veil_core::TreeEntry>> {
+    let root = t.root_of(&*g.get(id)?)?;
+    let e = t.entry_at(root, path)?;
+    if e.as_ref().is_some_and(|e| e.kind == veil_core::object::EntryKind::Dir) {
+        return Err(Error::bad_request("a folder: blame and file history are of files (`log` takes a folder)"));
+    }
+    Ok(e)
+}
+
+/// Who introduced each line of a file at a revision: computed on the
+/// viewer's projected history from its versions' kept blames
+/// ([`files::Blamer`]), a page of lines at a time.
+pub async fn blame(hub: &Arc<Hub>, ask: &Ask, q: BlameParams, limits: Limits) -> Result<Value> {
+    let deadline = Instant::now() + limits.deadline;
+    let path = clean_path(&q.path)?;
+    if path.is_empty() {
+        return Err(no_path());
+    }
+    let id = resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?;
+    let follow = q.follow.unwrap_or(false);
+    let (after, n) = (q.after.unwrap_or(0), q.n.unwrap_or(limits.blame.lines).min(limits.blame.lines));
+    // One of the process's blames (BUG-1072's lesson: bounded whatever
+    // the number of requests), waited for until the deadline.
+    let _slot = tokio::time::timeout_at(deadline.into(), hub.query.blames.clone().acquire_owned())
+        .await
+        .map_err(|_| graph::too_slow())?
+        .map_err(|e| Error::Other(e.into()))?;
+    on_graph(hub, ask, deadline, move |g, t| {
+        let e = file_entry(g, t, &id, &path)?.ok_or_else(no_path)?;
+        if !e.visibility.is_public() {
+            return Err(Error::bad_request("a secret: its content is encrypted, and the server cannot read it"));
+        }
+        let f = files::Files::new(g);
+        let (depth, x) = f.intro(id, &path)?.ok_or_else(|| Error::Other(anyhow::anyhow!("file history: no version of a file present")))?;
+        let start = files::Version { id: x, depth, path: path.clone() };
+        let mut b = files::Blamer::new(&f, t, follow, limits.blame);
+        let Some((text, bl)) = b.blame(&start)? else {
+            return Err(Error::bad_request("not a plain-text file of at most 1 MiB: nothing to blame line by line"));
+        };
+        files::blame_json(g, id, &path, follow, &text, &bl, after, n)
+    })
+    .await
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct HistoryParams {
+    pub rev: Option<String>,
+    pub path: Option<String>,
+    pub follow: Option<bool>,
+    pub n: Option<usize>,
+    pub after: Option<String>,
+}
+
+/// A page of a file's history: the changes that made each of its versions,
+/// newest first; with `follow`, across renames between readable paths.
+pub async fn history(hub: &Arc<Hub>, ask: &Ask, q: HistoryParams, limits: Limits) -> Result<Value> {
+    let deadline = Instant::now() + limits.deadline;
+    let n = q.n.unwrap_or(50).min(limits.page);
+    let follow = q.follow.unwrap_or(false);
+    let start = match &q.after {
+        Some(a) => Err(files::parse_cursor(a, limits.cursor)?),
+        None => {
+            let path = clean_path(q.path.as_deref().unwrap_or(""))?;
+            if path.is_empty() {
+                return Err(no_path());
+            }
+            Ok((resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?, path))
+        }
+    };
+    on_graph(hub, ask, deadline, move |g, t| {
+        let f = files::Files::new(g);
+        let starts = match start {
+            Ok((id, path)) => {
+                file_entry(g, t, &id, &path)?;
+                let (depth, x) = f.intro(id, &path)?.ok_or_else(no_path)?;
+                vec![files::Version { id: x, depth, path }]
+            }
+            Err(nodes) => {
+                let mut out = Vec::new();
+                for (id, path) in nodes {
+                    // A cursor names versions of the viewer's own graph.
+                    let r = match g.row(&id)? {
+                        Some(r) if !r.withheld() => r,
+                        _ => return Err(no_revision()),
+                    };
+                    out.push(files::Version { id, depth: r.depth, path });
+                }
+                out
+            }
+        };
+        files::history_page(&f, t, starts, follow, n, limits.page_bytes, limits.work, limits.cursor, |id, s| snapshot_json(id, s, false))
+    })
+    .await
+}
+
 // ---- routes ---------------------------------------------------------------------------
 
 pub async fn log_route(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Query(q): Query<LogParams>) -> Result<Json<Value>> {
@@ -724,6 +840,16 @@ fn ascii_json(v: &Value) -> String {
 pub async fn diff_route(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Query(q): Query<DiffParams>) -> Result<Json<Value>> {
     let ask = Ask::open(&hub, &p, &caller).await?;
     Ok(Json(diff(&hub, &ask, q, Limits::default()).await?))
+}
+
+pub async fn blame_route(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Query(q): Query<BlameParams>) -> Result<Json<Value>> {
+    let ask = Ask::open(&hub, &p, &caller).await?;
+    Ok(Json(blame(&hub, &ask, q, Limits::default()).await?))
+}
+
+pub async fn history_route(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Query(q): Query<HistoryParams>) -> Result<Json<Value>> {
+    let ask = Ask::open(&hub, &p, &caller).await?;
+    Ok(Json(history(&hub, &ask, q, Limits::default()).await?))
 }
 
 pub async fn ancestry_route(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(q): Json<AncestryRequest>) -> Result<Json<Value>> {

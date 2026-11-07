@@ -1,6 +1,6 @@
 # Phase 3: history answered by the server
 
-> **Status:** S12 built (2026-11-06, §10); S13 built (2026-11-07, §11); S14–S16 design. Base: `integration` @ `3851159` (S13: `d58a952`).
+> **Status:** S12 built (2026-11-06, §10); S13 built (2026-11-07, §11); S14 built (2026-11-07, §12); S15–S16 design. Base: `integration` @ `3851159` (S13: `d58a952`).
 > Sources of truth: `docs/OVERVIEW.md` and `docs/VISIBILITY.md`; where this document disagrees with them, they win. The server as built is `docs/HUB.md` §13; projected history is §13.4. The roadmap is `docs/design/scion-for-developers.md`, phase 3 (items 3.1–3.6). The client's commit-graph index (`docs/design/scale/3-history-index.md`, built) is the model for the server's.
 
 ## 1. Goal
@@ -430,3 +430,59 @@ Admins have a graph too (view key `admin`, of real history), so every viewer run
 | `tree` | 10 ms | 0.3 / 0.3 ms | 0.3 / 0.4 ms | 5 / 5 |
 
 S12's paint-down took 707 ms (debug) for the same merge bases. The merge-base walk still visits every merge on the line (here 400 of them, a few rows each); a line without merges costs tens of rows. Filling a view key's graph for the whole 20,000-snapshot history (once, in the background) took 3.3 s for the admins and 41 s for anyone on Earth in release (80 s in debug), almost all of it S1's projection of every snapshot for that key (what `tips` pays today); after that, a landing costs a few rows per new snapshot and view key.
+
+## 12. As built: S14, blame and file history (2026-11-07)
+
+Code: `crates/veil-server/src/query/files.rs` (the viewer's file history, blame and the history walk), `crates/veil-server/src/derive/blame.rs` (the blame value and its one step), two routes in `query/mod.rs` and `api.rs`, the file history written by the viewer-graph fill (`query/graph.rs`, `Walk`), migration `0015_file_history_and_blame.sql`, and `veil-core`'s line mapping made public (`blame::map_lines`, `line_ranges`, `map_cost`: the server maps lines exactly as `vl blame` does). Tests: `crates/veil-server/tests/server_hub/blame.rs`, and S13's harness (`query.rs`) extended. No repository format change.
+
+**Routes** (`/v1/projects/{p}/q/…`; every answer carries `policy_version` and `work`):
+
+| Route | Answers |
+|---|---|
+| `GET blame?rev=&path=&follow=&after=&n=` | `veil.blame/2`: each line of the file at `rev` (default: the default branch) with the change that introduced it (`snapshot`, `change`), the file's path there and the line's number there (`origin_line`), and the changes named, newest first; at most 10,000 lines a page (`next`: the line to go on after); `coarse` as `vl blame`. With `follow`, a file added by a rename continues at the version it was renamed from |
+| `GET history?rev=&path=&follow=&n=&after=` | `veil.history/1`: the changes that made each version of the file reachable from `rev`, newest first by the viewer's generation (ties by id, then path), each with its `status` (`added`, `modified`, `deleted`, `renamed` with `from`), its old and new entries; `n` ≤ 1,000, a work budget per page and a cursor (`next`: the versions still to walk) |
+
+**Design changes against §3.1 and §3.6:**
+* **Blame and file history are computed on the viewer's projected history, never on real history** (§3.6 said "computed on real history" and mapped ids). Real history ordered by real depth or generation makes the cost, and S13's harness, depend on hidden work (S13's lesson). So:
+* **A per-viewer file history** (`view_file_history`), not S12's `file_history`/`prev`: for each snapshot of a viewer's graph, a row per path its change against its first parent touched **in their projected trees**, with the old and new entries and, per parent, the depth and id of the snapshot that last changed the path along that parent's first parents (S12's `prev`, on the viewer's graph). It is written by the fill that writes the viewer's graph rows, before them (a graph row's presence means its file history is there), so it is what the viewer's own copy derives, and a query reads only it and the viewer's graph. A fill trusts its own unwritten rows only along a first-parent run it computed itself, so a second fill of the same view key (after a lease expired) can never make it miss a deeper row. Embargo lines have no rows. Migration 0015 drops the viewer graphs filled before it (a cache), so they fill again with file history.
+* **Blame walks versions, not snapshots** (`files::Blamer`): a version is the snapshot that introduced it and the path; its parents are its row's `prev` (and, with `follow`, for a file the change added, the version of the path it was renamed from, first parent only, paired as `diff` pairs renames). A version's blame is `derive::blame::step` of its text and its parent versions' blames: a line moves to the first parent version that holds it (`map_lines`), else it is the version's own. So a blame costs the file's visible versions, never the history's length, and is the answer `vl blame` gives on the viewer's copy (a model sharing no code with the server agrees, below).
+* **Lazy blame objects, kept per view key** (`blame_memo` → an object `veil-derived blame 1`, addressed by its hash): every 32nd version (by version depth: one more than the deepest parent version) and every version asked for, with or without `follow`. A blame starts from the nearest kept versions. A blame that stops (its diff budget, the deadline, the memory bound) keeps what it computed (its checkpoints and its last version), so the next request goes on from there; each request is bounded and the work is never lost.
+
+**Boundary cuts** need nothing of their own: a path the viewer cannot read is absent from their projected trees. A file moved or copied out of `fin/` is *added* for anyone without `fin/`, its lines are the moving change's, and no answer names `fin/` or the hidden changes; a file moved into `fin/` is *deleted* for them; a reader of both follows the rename (`blame_and_history_cut_at_the_boundary`).
+
+**Bounds** (row 10): a blame holds at most 64 MiB of texts and blames (`too_wide` beyond), spends at most `veil_core::blame::DEFAULT_WORK_BUDGET` of diff work (`partial` beyond, progress kept), and at most 4 blames compute at once in a process (`BLAMES_AT_ONCE`; a request waits for a slot until its deadline), so what blames hold is bounded whatever the number of requests; only plain-text files of at most 1 MiB are read (a secret, a binary, a conflict or a larger file is "not a plain-text file", and as a parent version holds no line); a page is 10,000 lines; a history page is S13's `n`, bytes and work budget, and a cursor of at most 1,000 versions (a wider frontier ends the page before it; a page that can take nothing is "too wide to page"); a kept blame is at most 8 MiB; every query has the 2 s deadline. What viewers can make the server keep is bounded by history, not by requests: per view key and file version, at most one kept blame with `follow` and one without (and only every 32nd version unless it was asked for or a blame stopped there).
+
+**Departures and limits:**
+* Renames are followed against the first parent only (as S12 records sources); `vl blame --follow` detects them against every parent. Copies are not followed (a copy is `added`), as `vl blame`.
+* Agent attribution (`--agent`) waits for phase 2's attribution: snapshots carry none yet.
+* **Residual timing (row 4):** kept blames are per view key, so a blame can find one that another person with exactly the same read set computed; it reveals that such a person blamed that file, nothing hidden. A landing's fill now also diffs each new snapshot's projected trees once per view key (a background cost, per landing, like S13's). The `work` counter counts what the answer read; the harness compares it.
+* A server of S13 running beside S14 servers after migration 0015 would fill viewer graphs without file history; deploy them together.
+* Purging (§8, item 5): kept blames and `view_file_history` rows depend on objects; nothing purges them yet.
+
+**Threat review (§6) for S14, and the tests:**
+
+| Row | What S14 does | Test |
+|---|---|---|
+| 1, 2, 5 | blame and history computed on the viewer's graph, projected trees and their own file history; origins are projected ids and readable paths | `query_projection_equivalence` (S13's harness, extended): blame with and without `follow`, in pages, and with budgets small enough to stop and go on; history in pages; byte for byte, `work` included, against the copy's admin, with no hidden path or real id in any answer. `blame_and_history_match_the_projected_files`: every readable file's blame and file history at every tip and at random snapshots of every viewer (and the admin) against a model computed straight from their projected files (no server code). `blame_and_history_cut_at_the_boundary` |
+| 4 | work counted on the viewer's own rows and objects | `query_work_ignores_hidden_content` (extended with blame and history) |
+| 6 | hidden and missing paths, cursors naming hidden or missing versions: one error, one code path | `query_routes_serve_each_person_their_part` (byte for byte over HTTPS), `blame_hostile_inputs_are_bounded`, the model test |
+| 7 | secrets never read (only plain public blobs are), their paths and entries only in file history | `query_routes_serve_each_person_their_part`: finance's blame of `billing/.env` is refused, its history holds no plaintext marker |
+| 8 | embargo lines: no file history rows, no revision | `query_hidden_and_withheld_are_missing` (extended) |
+| 9 | kept blames per view key: a removed reader has a new key | `query_routes_serve_each_person_their_part`: removed from finance, the next blame of `billing/` is missing |
+| 10 | the bounds above | `blame_hostile_inputs_are_bounded`, `blame_keeps_versions_and_resumes` |
+| 11 | rows a function of the projected history; written before graph rows; `ON CONFLICT DO NOTHING`; kept blames content-addressed | `file_history_rows_agree_across_fills` (six fills at once write what one writes), `query_concurrent_extensions_agree` |
+| 13 | a new policy gives new view keys, whose graphs and file history fill afresh | by construction (S13's `query_follows_policy_changes`) |
+| 3, 12 | ranking: S15; narrowed sessions: phase 2 | — |
+
+**Speed:** (`blame_speed`, PostgreSQL 17 and MinIO, release build, through `bench-quiet.sh`, load 14.0 before and 5.1 after; `VEIL_BLAME_BENCH_VERSIONS=2000`: 4,000 snapshots, a 5,000-line file changed 2,000 times (1–3 lines each), a hidden change between every two (anyone on Earth sees none of them), a rename half way; 20 rounds):
+
+| Query | Target (p99) | admin p50 / p99 | anyone on Earth p50 / p99 | work (admin / anyone) |
+|---|---|---|---|---|
+| `blame --follow`, precomputed (5,000 lines from 1,676 changes) | 50 ms | 15.7 / 17.6 ms | 18.7 / 26.3 ms | 3,408 / 3,404 |
+| `history --follow -n 50` | 50 ms | 0.9 / 1.3 ms | 1.3 / 3.9 ms | 186 / 182 |
+| `history --follow`, all 2,000 entries (two pages) | — | 26.8 / 45.0 ms | 30.2 / 50.2 ms | 3,013 / 3,013 |
+| the first blame, from nothing | 1 s | 2.56 s in 2 requests | 2.44 s in 2 requests | 4,149 / 4,127 |
+
+* **The first blame misses its target:** about 1.2 ms per version of a 5,000-line file (reading it and one diff), so 10,000 versions take about 12 s, in requests of at most 2 s each that keep what they computed (the client asks again on `deadline` or `partial`). The time per version (reading it, and one diff of 5,000 lines with `map_lines`, `vl blame`'s) was not profiled further; a diff that trims the common start and end first, in `veil-core` for both, is the candidate next step. After the first blame, every blame of the file starts from a kept version at most 32 versions below.
+* **Fills:** the admins' graph with its file history for the 4,000 snapshots took 1.5 s; anyone on Earth's 1.46 s after S1's projection of every snapshot (12.1 s), which dominates as in S13. The file history is one projected diff per snapshot and view key, written with the graph rows.
+* In a debug build on the loaded machine (100 versions): precomputed blame 60–70 ms, history 18–30 ms, the first blame 1.6 s.

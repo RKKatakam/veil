@@ -259,7 +259,7 @@ fn hidden(store: &ObjectStore, e: &TreeEntry, reader: Reader) -> Hidden {
 
 /// Byte ranges of the lines of `data`, as diffy splits them (each with its
 /// `\n`; a last line without one is a line too).
-pub(crate) fn line_ranges(data: &[u8]) -> Vec<(usize, usize)> {
+pub fn line_ranges(data: &[u8]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut start = 0;
     for l in data.split_inclusive(|b| *b == b'\n') {
@@ -271,8 +271,10 @@ pub(crate) fn line_ranges(data: &[u8]) -> Vec<(usize, usize)> {
 
 /// Where each line of `new` comes from in `old` (`None`: not there), and
 /// whether the diff was past its work limit (then only the lines both
-/// share at the start and at the end are mapped).
-pub(crate) fn map_lines(old: &[u8], new: &[u8], new_lines: usize) -> (Vec<Option<u32>>, bool) {
+/// share at the start and at the end are mapped). The server's blame
+/// (`veil-server`, `derive::blame`) maps lines with it too, so both
+/// attribute a line alike.
+pub fn map_lines(old: &[u8], new: &[u8], new_lines: usize) -> (Vec<Option<u32>>, bool) {
     let mut map: Vec<Option<u32>> = vec![None; new_lines];
     if !textmerge::fits(old, new) {
         let a: Vec<&[u8]> = old.split_inclusive(|b| *b == b'\n').collect();
@@ -319,6 +321,22 @@ pub(crate) fn map_lines(old: &[u8], new: &[u8], new_lines: usize) -> (Vec<Option
         oi += 1;
     }
     (map, false)
+}
+
+/// What one [`map_lines`] cost, in the work units of
+/// [`BlameOptions::work_budget`]: the lines read, plus the diff's search
+/// (past its limit the whole limit was spent measuring; within it, about
+/// `D²` for `D` differing lines).
+pub fn map_cost(old_lines: usize, map: &[Option<u32>], coarse: bool) -> u64 {
+    let lines = (old_lines + map.len()) as u64;
+    let search = if coarse {
+        textmerge::work_limit(lines as usize)
+    } else {
+        let kept = map.iter().filter(|m| m.is_some()).count() as u64;
+        let d = lines.saturating_sub(2 * kept);
+        d.saturating_mul(d)
+    };
+    lines.saturating_add(search)
 }
 
 // ---- blame -------------------------------------------------------------------------
@@ -612,18 +630,8 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
                     pending.insert((q.id, q.path.clone()), Pending { lines: open, version: cur });
                     break 'walk;
                 }
-                let lines = (pver.lines.len() + cur.lines.len()) as u64;
                 let (map, coarse) = map_lines(&pver.data, &cur.data, cur.lines.len());
-                // What the diff cost: past its limit the whole limit was
-                // spent measuring; within it, about D² for D edits.
-                let search = if coarse {
-                    textmerge::work_limit(lines as usize)
-                } else {
-                    let kept = map.iter().filter(|m| m.is_some()).count() as u64;
-                    let d = lines.saturating_sub(2 * kept);
-                    d.saturating_mul(d)
-                };
-                work = work.saturating_add(lines).saturating_add(search);
+                work = work.saturating_add(map_cost(pver.lines.len(), &map, coarse));
                 result.coarse |= coarse;
                 let mut passed = Vec::new();
                 open.retain(|&(fin, local)| match map.get(local as usize).copied().flatten() {
