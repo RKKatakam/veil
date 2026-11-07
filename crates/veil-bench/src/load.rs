@@ -1162,6 +1162,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
         result["landing_batches"] = json!(stat("landing_batches"));
         result["landings_per_batch"] = json!(ratio(stat("landing_landed"), stat("landing_batches"), 1.0));
         result["landing_build_ms_per_op"] = json!(ratio(stat("landing_build_us"), stat("landing_landed"), 1000.0));
+        result["landing_prepare_ms_per_batch"] = json!(ratio(stat("landing_prepare_us"), stat("landing_batches"), 1000.0));
         result["landing_store_ms_per_batch"] = json!(ratio(stat("landing_store_us"), stat("landing_batches"), 1000.0));
         result["landing_commit_ms_per_batch"] = json!(ratio(stat("landing_commit_us"), stat("landing_batches"), 1000.0));
         Ok(())
@@ -1345,17 +1346,18 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
     let landing: Vec<&serde_json::Value> = v["runs"].as_array().map(|r| r.iter().filter(|r| r["mode"] == "landing").collect()).unwrap_or_default();
     if !landing.is_empty() {
         out.push_str(
-            "\n| Landing service: clients | Target rate (/s) | Done (/s) | Batches | Landings per batch | Build CPU (ms/landing) | Store objects (ms/batch) | Transaction (ms/batch) |\n\
-             |---:|---:|---:|---:|---:|---:|---:|---:|\n",
+            "\n| Landing service: clients | Target rate (/s) | Done (/s) | Batches | Landings per batch | Prepare (ms/batch) | Build CPU (ms/landing) | Store objects (ms/batch) | Transaction (ms/batch) |\n\
+             |---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
         );
         for r in landing {
             out.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 r["clients"],
                 r["rate"].as_str().map(str::to_string).unwrap_or_else(|| f(&r["rate"], 2)),
                 f(&r["ops_per_s"], 1),
                 f(&r["landing_batches"], 0),
                 f(&r["landings_per_batch"], 1),
+                f(&r["landing_prepare_ms_per_batch"], 1),
                 f(&r["landing_build_ms_per_op"], 3),
                 f(&r["landing_store_ms_per_batch"], 1),
                 f(&r["landing_commit_ms_per_batch"], 1),
