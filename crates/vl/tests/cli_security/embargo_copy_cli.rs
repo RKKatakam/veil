@@ -297,3 +297,87 @@ fn diff_and_show_json_never_call_a_file_under_an_unreleased_embargo_public() {
         );
     }
 }
+
+// ---- simplification cycle 3 --------------------------------------------------
+
+/// BUG-1015 (regression: `t3/b837a04e` 94aba9b refuses, "cannot drop or
+/// replace the embargoed merge … is built on it"): `vl squash` of the
+/// embargoed merge into the fix rewrites the fix too, so every snapshot the
+/// embargo withheld gets a new id. `Transaction::check_withheld` only asks
+/// whether the *old* ids are still visible, finds none, and lets it through:
+/// the fix (and the follow-up on `main`, now a plain merge holding it) are
+/// no longer withheld, and the next push publishes them.
+#[test]
+#[ignore = "BUG-1015: squashing the embargoed merge into the fix publishes the fix"]
+fn squashing_the_embargoed_merge_into_the_fix_publishes_nothing() {
+    for follow_up in [false, true] {
+        let env = Env::new();
+        let (r, _) = embargoed(&env);
+        let merge = if follow_up {
+            r.ok(&["new", "main"]);
+            r.commit("follow-up", &[("f.c", "f\n")]);
+            r.tag("main", "@-");
+            "main-"
+        } else {
+            "main"
+        };
+        let _ = r.run(&["squash", "-r", merge, "--into", "fix"]);
+        assert!(r.ok(&["embargo", "list"]).contains("manual release"), "control: the embargo is still pending");
+        publishes_nothing(&env, &r);
+    }
+}
+
+/// BUG-1016 (pre-existing on 94aba9b): only the snapshots behind a visible
+/// embargoed merge are withheld, not the earlier versions of the same
+/// changes. `vl undo --op` of a describe of the fix made before the merge
+/// moves the `fix` tag back to the earlier version (a ref-only transaction,
+/// which `check_withheld` never sees), and `vl restore --from` an earlier
+/// version copies it onto another line (`check_confinement` only knows the
+/// withheld ids): either way the next push publishes the fix while its
+/// embargo is pending.
+#[test]
+#[ignore = "BUG-1016: an earlier version of a withheld change is not withheld"]
+fn an_earlier_version_of_the_fix_is_withheld_too() {
+    for route in ["undo", "restore"] {
+        let env = Env::new();
+        let r = env.repo("p");
+        r.commit("v1", &[("a.c", "v\n")]);
+        r.tag("main", "@-");
+        let v1 = r.sid("@-")[..16].to_string();
+        r.ok(&["new", "main"]);
+        r.commit("FIXDESC-K7", &[("FIXNAME-K7.c", "FIXBODY-K7\n")]);
+        r.tag("fix", "@-");
+        let earlier = r.sid("fix")[..16].to_string();
+        r.ok(&["describe", "-r", "fix", "-m", "FIXDESC-K7 reworded"]);
+        let describe = r.op_head();
+        r.ok(&["merge", "fix", "--into", "main", "--embargo", "-m", "embargoed"]);
+        if route == "undo" {
+            // The user puts the old description back.
+            let _ = r.run(&["undo", "--op", &describe]);
+        } else {
+            other(&r, &v1);
+            r.ok(&["new", "other"]);
+            let _ = r.run(&["restore", "--from", &earlier]);
+            r.ok(&["commit", "-m", "rel"]);
+            r.tag("rel", "@-");
+        }
+        assert!(r.ok(&["embargo", "list"]).contains("manual release"), "{route}: control: the embargo is still pending");
+        publishes_nothing(&env, &r);
+    }
+}
+
+/// BUG-1017 (pre-existing on 94aba9b): undoing the embargoed merge
+/// withdraws its embargo (the documented limitation: the fix line is then an
+/// ordinary change, pushed as soon as a tag reaches it), but `vl embargo
+/// list` still reports it as pending ("manual release") and the push that
+/// then publishes the fix says nothing, so the record tells the member the
+/// fix is still withheld.
+#[test]
+#[ignore = "BUG-1017: a withdrawn embargo is still listed as pending"]
+fn a_withdrawn_embargo_is_not_listed_as_pending() {
+    let env = Env::new();
+    let (r, _) = embargoed(&env);
+    r.ok(&["undo"]);
+    let list = r.ok(&["embargo", "list"]);
+    assert!(!list.contains("manual release") || list.contains("withdrawn"), "nothing withholds the fix, yet: {list}");
+}
