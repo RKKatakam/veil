@@ -252,6 +252,8 @@ fn tips_follow_pushes_on_every_server() {
 /// audit rows, and the branch move) is one database commit
 /// (`storage-and-cost.md` §3): every row it wrote carries the same
 /// transaction id (`xmin`, PostgreSQL), whatever else runs at the time.
+/// Other viewers' projections, which the deriver works out after the
+/// landing (S12), are their own commits.
 #[test]
 fn a_push_is_one_database_commit() {
     let hub = TestHub::start();
@@ -273,20 +275,27 @@ fn a_push_is_one_database_commit() {
         let since = veil_core::now_millis().to_string();
         let r = c.push("main", "one commit");
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        // The pusher's projection of what landed, as the push answered it.
+        let seen = r.json()["results"][0]["tip"].as_str().unwrap().to_string();
         let real: String = hub.rt.block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'main'").bind(pid).fetch_one(&h.db)).unwrap();
         let mut xids = Vec::new();
         for (what, sql, arg) in [
             ("branch", "SELECT xmin::text FROM branches WHERE project_id = $1 AND target = $2", &real),
             ("snapshot", "SELECT xmin::text FROM snapshots WHERE project_id = $1 AND id = $2", &real),
             ("origin", "SELECT xmin::text FROM origins WHERE project_id = $1 AND real_id = $2", &real),
-            ("memo", "SELECT xmin::text FROM projections WHERE project_id = $1 AND created_at >= $2::bigint", &since),
+            ("memo", "SELECT xmin::text FROM projections WHERE project_id = $1 AND projected_id = $2", &seen),
             ("audit", "SELECT xmin::text FROM audit_log WHERE project_id = $1 AND action = 'push' AND at >= $2::bigint", &since),
         ] {
             let got = q(sql, pid, arg);
             assert!(!got.is_empty(), "push {i}: no {what} row");
             xids.extend(got.into_iter().map(|x| (what, x)));
         }
-        let distinct: std::collections::BTreeSet<&String> = xids.iter().map(|(_, x)| x).collect();
+        // The pusher's memo row is one of those naming its projection.
+        let push_xid = xids.iter().find(|(w, _)| *w == "branch").unwrap().1.clone();
+        let mut written: Vec<_> = xids.iter().filter(|(w, x)| *w != "memo" || *x == push_xid).collect();
+        written.dedup_by_key(|(w, _)| *w);
+        assert!(written.iter().any(|(w, _)| *w == "memo"), "push {i}: the pusher's memo row was written by another transaction: {xids:?}");
+        let distinct: std::collections::BTreeSet<&String> = written.iter().map(|(_, x)| x).collect();
         assert_eq!(distinct.len(), 1, "push {i}: rows written by more than one transaction: {xids:?}");
     }
 }
