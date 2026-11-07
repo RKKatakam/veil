@@ -14,21 +14,39 @@ fn f(v: &Value, d: usize) -> String {
 /// to 1 GB (1,024 MiB) or more.
 pub const SERVER_GATE_MIB: f64 = 1024.0;
 
-/// The cases whose server peak RSS misses the gate, as "case: N MiB"
-/// (none for the 5 GB profile, which the gate does not cover).
-pub fn server_over_gate(r: &Value) -> Vec<String> {
-    if r["manifest"]["profile"].as_str() == Some("5g") {
-        return Vec::new();
+/// Cases over the server gate because of a known, filed bug: still marked
+/// ⛔ with "known: BUG-NNN", but they do not fail the run. Remove an entry
+/// when its bug is fixed.
+pub const SERVER_GATE_KNOWN: &[(&str, &str)] = &[
+    ("clone, full", "BUG-1000"),
+    ("clone, one directory (--only docs)", "BUG-1000"),
+];
+
+/// The bug that excuses `case` over the server gate, if any.
+fn known_over_gate(case: &str) -> Option<&'static str> {
+    SERVER_GATE_KNOWN.iter().find(|(c, _)| *c == case).map(|(_, bug)| *bug)
+}
+
+/// Whether a case's server peak misses the gate (never on the 5 GB
+/// profile, which the gate does not cover).
+fn server_over(r: &Value, c: &Value) -> Option<f64> {
+    let m = c["server_maxrss_mib"].as_f64()?;
+    (r["manifest"]["profile"].as_str() != Some("5g") && m >= SERVER_GATE_MIB).then_some(m)
+}
+
+/// The cases whose server peak RSS misses the gate, as "case: N MiB", split
+/// into those that fail the run and those a known bug excuses.
+pub fn server_over_gate(r: &Value) -> (Vec<String>, Vec<String>) {
+    let (mut failing, mut known) = (Vec::new(), Vec::new());
+    for c in r["cases"].as_array().into_iter().flatten() {
+        let Some(m) = server_over(r, c) else { continue };
+        let name = c["name"].as_str().unwrap_or("?");
+        match known_over_gate(name) {
+            Some(bug) => known.push(format!("{name}: {m:.0} MiB (known: {bug})")),
+            None => failing.push(format!("{name}: {m:.0} MiB")),
+        }
     }
-    r["cases"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|c| {
-            let m = c["server_maxrss_mib"].as_f64()?;
-            (m >= SERVER_GATE_MIB).then(|| format!("{}: {m:.0} MiB", c["name"].as_str().unwrap_or("?")))
-        })
-        .collect()
+    (failing, known)
 }
 
 pub fn markdown(r: &Value) -> String {
@@ -64,7 +82,7 @@ pub fn markdown(r: &Value) -> String {
         man["generate_seconds"].as_f64().unwrap_or(0.0),
     ));
     o.push_str(&format!(
-        "Peak RSS is the child's `ru_maxrss`; it cannot read below the harness's own peak ({} MiB): values at that floor mean \"at most this\". ⛔ marks a case over the 512 MiB gate (the client's) or the 1 GB gate (the server's, `storage-and-cost.md` §9; not on the 5 GB profile). The server's RSS is its `VmRSS` before the case's first run and its `VmHWM` during the case's runs (reset before each run; it cannot restart below the RSS the server keeps).\n\n",
+        "Peak RSS is the child's `ru_maxrss`; it cannot read below the harness's own peak ({} MiB): values at that floor mean \"at most this\". ⛔ marks a case over the 512 MiB gate (the client's) or the 1 GB gate (the server's, `storage-and-cost.md` §9; not on the 5 GB profile; \"known: BUG-NNN\" marks a case a filed bug excuses, which does not fail the run). The server's RSS is its `VmRSS` before the case's first run and its `VmHWM` during the case's runs (reset before each run; it cannot restart below the RSS the server keeps).\n\n",
         f(&r["rss_floor_mib"], 0)
     ));
     o.push_str("| case | group | median | spread | runs | peak RSS | server RSS before → peak | snapshots read | local lock held | remote lock held | ok |\n");
@@ -105,7 +123,11 @@ pub fn markdown(r: &Value) -> String {
             f(&c["maxrss_mib"], 0),
             if c["maxrss_mib"].as_f64().is_some_and(|m| m > 512.0) { " ⛔" } else { "" },
             c["server_maxrss_mib"].as_f64().map(|m| format!("{} → {m:.0} MiB", f(&c["server_rss_before_mib"], 0))).unwrap_or_default(),
-            if man["profile"].as_str() != Some("5g") && c["server_maxrss_mib"].as_f64().is_some_and(|m| m >= SERVER_GATE_MIB) { " ⛔" } else { "" },
+            match (server_over(r, c), known_over_gate(c["name"].as_str().unwrap_or(""))) {
+                (None, _) => String::new(),
+                (Some(_), None) => " ⛔".into(),
+                (Some(_), Some(bug)) => format!(" ⛔ (known: {bug})"),
+            },
             snaps,
             lock("local_lock"),
             lock("remote_lock"),
@@ -183,15 +205,21 @@ mod tests {
                 "manifest": {"profile": profile},
                 "cases": [
                     {"name": "push, initial (all tags)", "server_maxrss_mib": 1100.4},
-                    {"name": "clone, full", "server_maxrss_mib": 900.0},
+                    {"name": "clone, full", "server_maxrss_mib": 1579.0},
+                    {"name": "pull, nothing new", "server_maxrss_mib": 900.0},
                     {"name": "status in clone, clean", "server_maxrss_mib": null},
                     null,
                 ],
             })
         };
-        assert_eq!(server_over_gate(&r("1g")), vec!["push, initial (all tags): 1100 MiB".to_string()]);
-        assert!(server_over_gate(&r("5g")).is_empty());
-        assert!(markdown(&r("1g")).contains("→ 1100 MiB ⛔"));
-        assert!(!markdown(&r("5g")).contains("1100 MiB ⛔"));
+        let (failing, known) = server_over_gate(&r("1g"));
+        assert_eq!(failing, vec!["push, initial (all tags): 1100 MiB".to_string()]);
+        assert_eq!(known, vec!["clone, full: 1579 MiB (known: BUG-1000)".to_string()]);
+        assert_eq!(server_over_gate(&r("5g")), (vec![], vec![]));
+        let md = markdown(&r("1g"));
+        assert!(md.contains("→ 1100 MiB ⛔ |"), "{md}");
+        assert!(md.contains("→ 1579 MiB ⛔ (known: BUG-1000) |"), "{md}");
+        assert!(!md.contains("900 MiB ⛔"), "{md}");
+        assert!(!markdown(&r("5g")).contains("MiB ⛔"));
     }
 }

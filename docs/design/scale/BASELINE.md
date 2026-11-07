@@ -54,7 +54,7 @@ The A/B rounds, alternating glibc and jemalloc tuned (pulls with 100 and 1,000 c
 
 It is the `veil-server` binary's global allocator only; `veil-core` (which builds for WASM) and `vl` are unchanged. `vl` stays under its 512 MiB gate with glibc (344 to 491 MiB in these runs) and is a short-lived process. `tikv-jemallocator` is pinned (`=0.7.0`, released 2026-05-25; the TiKV project's maintained fork, which TiKV runs in production) and builds jemalloc 5.3 from source with the C compiler zstd already needs, plus `make`.
 
-**The gate:** `veil-bench run` now marks a server peak of 1 GB or more with ⛔ and exits non-zero after writing its results (`storage-and-cost.md` §9; the 5 GB profile is exempt). On this branch it still fails, on the full clone (1,579 MiB) and the clone of one directory after it (1,069 MiB): BUG-1000. The push passes, with 4 % to spare.
+**The gate:** `veil-bench run` now marks a server peak of 1 GB or more with ⛔ and exits non-zero after writing its results (`storage-and-cost.md` §9; the 5 GB profile is exempt). The full clone (1,579 MiB) and the clone of one directory after it (1,069 MiB) are still over it, because of BUG-1000; while that bug is open they show "⛔ (known: BUG-1000)" and do not fail the run (`report::SERVER_GATE_KNOWN`, the one place to remove them from when it is fixed). Any other case over 1 GB fails the run. The push passes, with 4 % to spare.
 
 ## After the server bench fixes (2026-11-06, `7fb947f`)
 

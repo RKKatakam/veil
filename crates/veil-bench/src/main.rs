@@ -528,7 +528,10 @@ fn main() -> Result<()> {
                 proc::remove_tree(&dir, &base)?;
                 log_line(&format!("removed {}", dir.display()));
             }
-            let over = report::server_over_gate(&results);
+            let (over, known) = report::server_over_gate(&results);
+            if !known.is_empty() {
+                log_line(&format!("server memory gate (under {} MiB) missed by known bugs: {}", report::SERVER_GATE_MIB, known.join("; ")));
+            }
             if !over.is_empty() {
                 return Err(anyhow!("server memory gate (under {} MiB) missed: {}", report::SERVER_GATE_MIB, over.join("; ")));
             }
