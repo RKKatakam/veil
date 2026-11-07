@@ -1566,7 +1566,7 @@ POST /v1/projects/{p}/changes
   admin's policy) are one READ COMMITTED transaction. Objects are stored
   before it. A non-admin's one-file change stores 6 objects (the blob, the
   full trees on its path, the snapshot and the caller's projection).
-* **Change refs** (`change_refs`, migration 4): every change made this way
+* **Change refs** (`change_refs`, migration 5): every change made this way
   is kept under its change id, whether or not a branch moved, and is a
   `base` like any snapshot. Only its creator makes a new revision of it
   (`change_id`); the new snapshot names the previous one as predecessor.
