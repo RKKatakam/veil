@@ -251,7 +251,7 @@ A **permission cache** in each API server (in memory, not in the database) holds
 
 ### 5.3 Object store
 
-No change to objects or their keys. The server's grant key is a new Ed25519 key in the data directory beside `hub-identity.json` (0600). Caches store objects by `(project, id)` as the server does, re-hash every object they read, and hold no other state: losing a cache loses nothing.
+Objects keep their keys and ids. Small objects of a push are stored together in one pack with an index, and every object is compressed (S27–S29, `storage-and-cost.md` §6–8); readers still receive objects one at a time, after the same checks. The server's grant key is a new Ed25519 key in the data directory beside `hub-identity.json` (0600). Caches store objects by `(project, id)` as the server does, re-hash every object they read, and hold no other state: losing a cache loses nothing.
 
 ### 5.4 What moves from a thin client to the server
 
@@ -328,7 +328,7 @@ Attackers are those of `HUB.md` §3.2. The server is trusted with code, never wi
 |---|---|---|---|
 | Pulls/s, one project, `main` moving 20/s | 2,100–2,500 (one machine) | **10,000** on the same machine, with over 99 % of object reads answered by caches | per-person permission cache and snapshot-resolution cache (46 → about 6 statements per pull); thin pulls fetch the tip, not every snapshot since; objects from caches |
 | Pulls/s while `main` moves 1,000/s | not measured; catch-up pulls fetch every new snapshot | **1,000+**, cost per pull independent of the landing rate | thin pulls never fetch intermediate snapshots |
-| Landings/s across projects | 2,094 | **4,000** | fewer commits per landing (the memo, origin and audit rows in the push's transaction: 8 → 2) |
+| Landings/s across projects | 2,094 | **4,000** | one database commit per landing (the snapshot, memo, origin and audit rows in the push's transaction: 8 → 1; `storage-and-cost.md` §3), and one storage write per push for small objects (S28) |
 | Landings/s into one `main`, 50 agents | 20–30 | **100** | API commits with `onto: rebase`: one request per landing, and a lost race costs a server-side retry, not a catch-up pull |
 | Merges per day, one project | about 2 million at 20–30/s in theory; less with peaks | **about 8 million** at 100/s, so 1 million a day with 8× peaks | as above |
 | Agents at once | 2,000 simulated | **10,000** simulated, with caches | daemons and regional caches take the reads |
@@ -345,7 +345,7 @@ All in `crates/veil-bench`, on the development machine of `OPENSCION.md` (never 
 |---|---|---|
 | `veil-bench workspace --files 100k,1M --bytes 10G` (new) | `vl ws new --mount` to the first `ls` and `cat`; then reading 10,000 files under one folder; cold daemon, warm daemon, no daemon | ready under 2 s cold, 300 ms warm, at both sizes; reading 10,000 files under 3 s warm |
 | `veil-bench load --mode pull --thin --caches regional,daemon` (extended) | pulls/s, p50/p99, statements per pull, cache hit rate per layer; `main` moving 20/s and 1,000/s | 10,000 pulls/s at 20/s; 1,000 pulls/s at 1,000/s; 99 % of object reads from caches |
-| `veil-bench load --mode land --api --rebase` (extended) | landings/s into one `main` with 50 and 1,000 agents; across 100 projects | 100/s into one `main` with p99 under 500 ms; 4,000/s across projects; at most 2 database commits per landing |
+| `veil-bench load --mode land --api --rebase` (extended) | landings/s into one `main` with 50 and 1,000 agents; across 100 projects | 100/s into one `main` with p99 under 500 ms; 4,000/s across projects; 1 database commit and at most 2 storage writes per landing (`storage-and-cost.md` §9) |
 | `veil-bench openscion` (existing) | commit one changed file with the watcher; clone one directory as a thin clone | commit one changed file beats Git at 1k and 10k; clone one directory beats Git |
 | `veil-bench cache-access` (new, a correctness run at load) | the leak checks of §6 rows 1–5 under load, with access changes during the run | zero objects served outside a requester's view; removal effective within 5 s at every layer |
 
@@ -356,7 +356,7 @@ Each is small enough for one agent. Dependencies and parallel work are in `docs/
 | # | Milestone | Contents | Depends on | Touches |
 |---|---|---|---|---|
 | **S3** | Fetch on demand in the client | `6-partial-clone.md` as amended here: `partial` marker, promisor, `Unavailable`, bounded cache and eviction, anchors; thin clone by default with no full graph; `vl log`/ancestry through `history` pages; `--full`, `vl partial`; uses S1's `fetch` | S1; the simplification pass (or S3 refuses partial clones of path and SFTP remotes) | `veil-core` store and remote, `crates/vl/src/hub.rs` |
-| **S4** | Request-path caches and fewer commits per landing | permission cache per person and project, session cache, snapshot-resolution cache, in-memory tips; the memo, origin and audit rows in the push transaction | S1 | `veil-server` `auth.rs`, `perm.rs`, `sync.rs` |
+| **S4** | Request-path caches and one commit per landing | permission cache per person and project, session cache, snapshot-resolution cache, in-memory tips invalidated by notification (no per-project counter); the snapshot, memo, origin and audit rows in the push transaction; cost gates in `veil-bench load` (`storage-and-cost.md`) | S1 | `veil-server` `auth.rs`, `perm.rs`, `sync.rs` |
 | **S5** | Read grants and the object routes | grant key, `hub-grant` and `hub-request` contexts, grants with tips, `GET /v1/objects`, `:batch`, the chain check as a `veil-core::hub` function (WASM-safe, shared by every layer), access epochs and their feed | S1 | `veil-core/src/hub/`, new `veil-server` `grant.rs` |
 | **S6** | The Veil daemon: shared object cache | `vl daemon`, socket, store, LRU and pinning, grant and chain checks per request, forwarding signed requests upstream, epoch polling, warm trees of followed projects; the promisor reads through it | S3, S5 | new `crates/vl/src/daemon/` |
 | **S7** | The file watcher | inotify and FSEvents, tokens in `checkout.json`, "unknown: rescan" rules, `vl status`/`commit` asking the daemon | S6 (its process and socket) | `daemon/watch.rs`, the scan in `veil-core` |
