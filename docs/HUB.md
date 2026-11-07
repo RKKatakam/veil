@@ -1549,8 +1549,9 @@ POST /v1/projects/{p}/changes
 * **Labels are claims:** an uploaded object's entry takes its kind, size and
   label from the object (a sealed envelope is a secret of its scope, a blob
   is plain); anything else is refused. As in every push (format 8), a sealed
-  object is accepted only at a secret file's path (`policy::names_secret`):
-  only secret files are encrypted.
+  object is accepted only as a secret: at a secret file's path, or as
+  content that descends from a secret (a renamed secret, which `vl` keeps
+  sealed), by the rule `vl upgrade` checks (`policy::sealed_secret`).
 * **The snapshot** is signed by the server's key; its author is the caller.
   Other viewers get the same projections as for any pushed snapshot (§13.4);
   the caller's own projection is worked out before the commit and recorded

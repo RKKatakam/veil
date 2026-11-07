@@ -764,10 +764,14 @@ fn check_changes(
                 Tier::Cloaked(_) if !sealed || !matches!(visibility, Visibility::Cloaked { .. }) => {
                     return Err(Error::forbidden(format!("'{}' is a secret and must arrive encrypted", c.path)))
                 }
-                // Format 8: only secret files are encrypted. (A secret file a
-                // policy makes public may still arrive sealed: the member's
-                // `vl` keeps the protection they accepted.)
-                Tier::Public if sealed && !veil_core::policy::names_secret(&c.path) => {
+                // Format 8: only secret files are encrypted, by the rule `vl`
+                // seals by and `vl upgrade` checks (BUG-1055): a secret's
+                // path, or content that descends from a secret (a parent's
+                // secret at this path, or one of the same scope this
+                // snapshot moved away). A secret a policy makes public may
+                // also arrive sealed: the member's `vl` keeps the protection
+                // they accepted.
+                Tier::Public if sealed && !sealed_secret_here(src, c, changes, parents, &visibility)? => {
                     return Err(Error::forbidden(format!("'{}' is not a secret file: only secret files are encrypted", c.path)))
                 }
                 _ => {}
@@ -793,6 +797,31 @@ fn check_changes(
         }
     }
     Ok(())
+}
+
+/// [`veil_core::policy::sealed_secret`] for sealed content labelled
+/// `visibility` at changed path `c`, among `changes` (relative to the first
+/// of real `parents`).
+fn sealed_secret_here(src: &Source, c: &Change, changes: &[Change], parents: &[ObjectId], visibility: &Visibility) -> Result<bool> {
+    let Visibility::Cloaked { scope } = visibility else { return Ok(false) };
+    veil_core::policy::sealed_secret(
+        &c.path,
+        scope,
+        false,
+        |path| {
+            for p in parents {
+                if entry_at(src, &src.snapshot(p)?.tree, path)?.is_some_and(|e| !e.visibility.is_public()) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        },
+        |scope| {
+            Ok(changes.iter().any(|o| {
+                o.new.is_none() && o.old.as_ref().is_some_and(|e| matches!(&e.visibility, Visibility::Cloaked { scope: s } if s == scope))
+            }))
+        },
+    )
 }
 
 /// Complete and check new snapshot `n` on its real parents `rp`, for

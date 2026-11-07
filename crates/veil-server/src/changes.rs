@@ -493,6 +493,13 @@ async fn restack(hub: &Arc<Hub>, who: &Arc<Who>, chain: Vec<ObjectId>, onto: Obj
             let view = w.project.view(&w.viewer);
             let mut pr = Projector::new(src, &view);
             let tree = pr.root(s.tree)?;
+            // The folders of the caller's view on the way to each path the
+            // change made (a new folder, or one they see whole: real trees
+            // of theirs), as known as its files (BUG-1056).
+            for c in &diff.changes {
+                let parts: Vec<String> = c.path.split('/').map(str::to_string).collect();
+                known.extend(walk(&pr, tree, &parts)?.0);
+            }
             let overlay: HashMap<ObjectId, Bytes> = pr.created.iter().map(|(id, (_, raw))| (*id, Bytes::from(raw.clone()))).collect();
             known.extend(overlay.keys().copied());
             let n = Snapshot {

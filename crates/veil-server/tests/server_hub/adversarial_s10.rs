@@ -278,7 +278,6 @@ fn bug_1054_a_hidden_change_on_main_does_not_refuse_an_expected_move() {
 /// writes). The server must take what `vl` itself writes: the member's
 /// push of the rename lands, still sealed.
 #[test]
-#[ignore = "BUG-1055: a push of a renamed secret, which vl keeps sealed, is refused as 'not a secret file'"]
 fn bug_1055_a_renamed_secret_that_vl_keeps_sealed_is_accepted() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -307,7 +306,6 @@ fn bug_1055_a_renamed_secret_that_vl_keeps_sealed_is_accepted() {
 /// lands, so the answer also tells the caller that a change they cannot
 /// see landed (BUG-1054's class, through the fix).
 #[test]
-#[ignore = "BUG-1056: a stack over a hidden change fails with 'missing object' when one of its changes holds a folder its maker sees whole"]
 fn bug_1056_a_stack_over_a_hidden_change_lands_when_it_adds_a_folder() {
     let hub = TestHub::start();
     let mut failures = Vec::new();
