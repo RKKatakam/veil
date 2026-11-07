@@ -1391,3 +1391,32 @@ Branch `t3/5a7dd43b` @ `1a51b65` (S10: commits through the API; includes `integr
 **Out of scope (trusted):** a member's own crafted push whose secret entry carries a plain-text `fallback` (checks 8 and 9 read only the entry's object), and a "sealed" object that is plain text under an envelope header: both need the member's own client to be hostile toward their own secret.
 
 **Nit** (not filed; **fixed** with BUG-1051: each attempt reads the accepted policy again; from the code, `changes.rs:438-440`, not tested): when a rebase moves an admin's API commit onto a tip whose policy another admin has already accepted, the answer lists "access accepted …" as if this admin had changed access (the request's `Plan.project` is stale; same root as BUG-1051).
+
+### S10 cycle 2
+
+Branch `t3/5a7dd43b` @ `e443637` (the fixes for BUG-1050..1054 in `b5189d5`, and format 8 merged in `b3772e3`/`e443637`), reviewed at merge `aab97dc`. Tests in `server_hub` `adversarial_s10`, run on PostgreSQL + MinIO.
+
+| ID | Sev. | Area | Finding | Root cause | Reproducing tests |
+|---|---|---|---|---|---|
+| BUG-1055 | medium (introduced by S10's format-8 check, `e443637`) | server / push and API commits / format 8 | **A push of a renamed secret, which `vl` itself keeps sealed, is refused: "'settings-from-env.txt' is not a secret file: only secret files are encrypted".** Format 8 keeps a secret sealed when it is moved to a path no rule names ("protection follows a secret across a rename", `veil-core/src/builder.rs` `protect_moves`; `docs/FORMAT.md` §5 "a renamed secret that format 8 keeps sealed"; `upgrade.rs` accepts it). The admin of the test project runs `mv billing/.env settings-from-env.txt`, then commits (the entry stays `cloaked`) and pushes: refused. Every later push of that history is refused too, and so is the same entry through the API. Attacker: none (a wrong answer to a member's own work). Harm: a member's legitimate history cannot reach the server. The only way out is to rewrite the rename, or to store the secret in plain text, which check 9 then refuses. | `sync::check_changes` (`sync.rs:770`) accepts a sealed object at a `Tier::Public` path only when `policy::names_secret(path)`. That is the built-in names, not where format 8 seals: the server judges by the path, while `vl` and `vl upgrade` judge by descent. Suggested fix: accept a sealed entry at a non-secret path also when it descends from a secret, by `upgrade::removed_content`'s rule (a parent held a sealed entry at that path, or a sealed entry of the same scope that this snapshot removes). Share one helper between the two. | `adversarial_s10::bug_1055_a_renamed_secret_that_vl_keeps_sealed_is_accepted` |
+| BUG-1056 | medium (introduced by BUG-1054's fix, `b5189d5`) | server / API commits / hidden history | **A stack over a hidden change fails with 400 "missing object" when one of its changes holds a folder its maker sees whole.** Two cases: a dev's unlanded change adds `src/newdir/first.txt`, or the dev sees everything in the fork (a project with only `src/` and `.veilpolicy` granted to devs). After an admin's change the dev cannot see lands on main, the dev's next change with base = that change and `expected` = main (as they see it) answers `400 missing object <id>` instead of `ok`. Without the hidden change the same request lands (BUG-1054's own test passes only because every folder of its change is one the projector rebuilt). Attacker: a member without the folder, who probes. Harm: the documented stacking workflow fails, and the different answer reveals that a change they cannot see landed on main, and when (BUG-1054's class, through the fix). | `changes::restack` (`changes.rs:478-489`) passes as `known` only the objects of the leaf entries the change made, plus the trees the projector created. A real tree of the caller's (a new folder, or any folder of a wholly visible change) is neither, so the graft's `check_pushed` (`veil-core/src/hub/project.rs`, `Graft::proving`) answers `Missing`. Suggested fix: count as known every tree of the caller's view of the old change (their own change, checked when it was made), e.g. the folders along each changed path. A local probe that adds them makes both cases land, with the caller's ids unchanged. | `adversarial_s10::bug_1056_a_stack_over_a_hidden_change_lands_when_it_adds_a_folder` |
+
+**Held up, as tested or traced:**
+* BUG-1050..1054's reproductions all pass un-ignored on PostgreSQL + MinIO (`bug_105[0-4]`).
+* **BUG-1050:** `entries` reads nothing before the caller's projection of `base` names the object at that path; an uploaded guess at a hidden path gets the graft's "no access", whatever the guess.
+* **BUG-1051:**
+  * The accepted policy changes only together with a compare-and-swap of the default branch (`perm::accept_policy` is called only from the push's and `commit`'s CAS), so no policy change can fall between an attempt's reload and its CAS.
+  * Group-membership changes are not serialised with a commit, as for a push (a race equal to "landed just before").
+  * The loop runs at most `MAX_REBASES + 1` builds: `keep_on_loss` after that, and immediately for `expected`.
+* **BUG-1054 restack:**
+  * The graft keeps every hidden change of the tip (the caller's view of each change only replaces what they see), and `complete` re-runs checks 2/8/9 and the access-line rule.
+  * A non-admin's stack cannot carry access-line edits: each change was refused them against its parent.
+  * Admins see everything, so they never restack.
+  * Write access lost since a change was made is refused per file (Graft changes are leaves).
+  * The caller's ids are unchanged: Ed25519 is deterministic and the projection is server-signed.
+  * A hidden finance-branch snapshot a no-`onto` change was resolved onto is dropped by the restack, not landed.
+* **64 MiB stacks:** on the runtime's workers and blocking pool; derive's recursion (`derive/changes.rs` `walk`) is depth-limited and runs on workers. Address space only: tokio's 512 blocking threads come to 32 GiB virtual.
+
+**Out of scope (trusted):** a member's own client sealing a `.env.example` through `cloak .env.*`. This is deliberate (`policy.rs` `classify_rules`: "the only paths a `cloak` line seals"), and it is their own content.
+
+**Not filed:** timing. A stack made again takes a few extra round trips when a hidden change landed, but every request whose tip moved already computes a new projection (`tips` included), so the class is pre-existing and no new channel opens.

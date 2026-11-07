@@ -269,3 +269,102 @@ fn bug_1054_a_hidden_change_on_main_does_not_refuse_an_expected_move() {
     assert_eq!(with, without, "a change the dev cannot see changed the answer");
 }
 
+
+// ---- S10 cycle 2 (BUG-1055..) ----
+
+/// Format 8 keeps a secret sealed when its member renames it to an
+/// ordinary name ("protection follows a secret across a rename",
+/// `veil-core` `builder.rs`; `upgrade.rs` accepts it as what format 8
+/// writes). The server must take what `vl` itself writes: the member's
+/// push of the rename lands, still sealed.
+#[test]
+#[ignore = "BUG-1055: a push of a renamed secret, which vl keeps sealed, is refused as 'not a secret file'"]
+fn bug_1055_a_renamed_secret_that_vl_keeps_sealed_is_accepted() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    // To a path no rule of the policy names (the private root): the case
+    // `vl` protects (`builder.rs` `protect_moves`).
+    std::fs::rename(p.dir.join(format!("{BILL_DIR}/.env")), p.dir.join("settings-from-env.txt")).unwrap();
+    p.admin.commit_main(&p.dir, "rename the env file");
+    // Control: the member's own vl keeps it sealed at the new path.
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&p.dir)), None, "test").unwrap();
+    let tree = repo.store().snapshot(&repo.view().tags["main"].target).unwrap().tree;
+    let e = veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new("settings-from-env.txt").unwrap()).unwrap().expect("renamed");
+    assert!(!e.visibility.is_public(), "control: vl keeps the renamed secret sealed");
+    drop(repo);
+    let out = p.admin.run(&p.dir, &["push"]);
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "the push of vl's own renamed secret was refused: {text}");
+}
+
+/// A stack over a hidden change (BUG-1054's fix makes the caller's own
+/// changes again on the real tip) fails with 400 "missing object" when a
+/// change of the stack holds a folder its maker sees whole: `restack`
+/// counts as known only the files it changed and the trees the projector
+/// made, never a real tree of the caller's (a new folder of theirs, or
+/// every folder for a member who sees all of the fork), so the push's
+/// closure check refuses it. Without the hidden change the same request
+/// lands, so the answer also tells the caller that a change they cannot
+/// see landed (BUG-1054's class, through the fix).
+#[test]
+#[ignore = "BUG-1056: a stack over a hidden change fails with 'missing object' when one of its changes holds a folder its maker sees whole"]
+fn bug_1056_a_stack_over_a_hidden_change_lands_when_it_adds_a_folder() {
+    let hub = TestHub::start();
+    let mut failures = Vec::new();
+    // A: the usual project; the dev's first change adds a new folder.
+    {
+        let p = setup_project(&hub);
+        let token = p.dev.token();
+        let main = tip(&hub, &token, &p.name);
+        let r = change(&hub, &token, &p.name, &json!({"base": main.hex(), "edits": [put("src/newdir/first.txt", "1")]}));
+        assert_eq!(r.status, 200, "{}", body(&r));
+        let x: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+        write_files(&p.dir, &[(&format!("{BILL_DIR}/acme/invoice.txt"), "MARKER-HIDDEN-UNDER-NEWDIR-0c4e19")]);
+        p.admin.commit_main(&p.dir, "billing only");
+        p.admin.ok(&p.dir, &["push"]);
+        assert_eq!(tip(&hub, &token, &p.name), main, "control: a hidden-only change is not in the dev's history");
+        let r = change(&hub, &token, &p.name, &json!({"base": x.hex(), "edits": [put("src/second.txt", "2")],
+            "onto": {"branch": "main", "expected": main.hex()}}));
+        if r.status != 200 || r.json()["branch"]["status"] != "ok" {
+            failures.push(format!("a new folder: {} {}", r.status, body(&r)));
+        }
+    }
+    // B: a member who sees all of the fork (src/ and .veilpolicy).
+    {
+        let admin = hub.person("admin");
+        let dev = hub.person("dev");
+        let name = unique("full");
+        let dir = admin.dir("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        admin.ok(&dir, &["init"]);
+        write_files(&dir, &[("src/lib.rs", "pub fn f() {}\n")]);
+        admin.ok(&dir, &["remote", "add", "origin", &hub.url(&name)]);
+        admin.commit_main(&dir, "initial import");
+        admin.ok(&dir, &["push"]);
+        admin.ok(&dir, &["group", "create", "devs"]);
+        admin.ok(&dir, &["group", "add", "devs", &dev.name, "--confirm", &dev.fingerprint()]);
+        admin.ok(&dir, &["access", "src/", "devs"]);
+        admin.ok(&dir, &["access", ".veilpolicy", "devs"]);
+        admin.commit_main(&dir, "access rules");
+        admin.ok(&dir, &["push"]);
+        dev.trust_project(&hub, &name, &admin.project_fingerprint(&dir));
+        let (token, atok) = (dev.token(), admin.token());
+        let main = tip(&hub, &token, &name);
+        assert_eq!(main, tip(&hub, &atok, &name), "control: the dev sees all of main");
+        let r = change(&hub, &token, &name, &json!({"base": main.hex(), "edits": [put("src/first.txt", "1")]}));
+        assert_eq!(r.status, 200, "{}", body(&r));
+        let x: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+        // The admin adds a file in the private root: hidden from the dev.
+        write_files(&dir, &[("notes-admin-only.txt", "MARKER-ADMIN-ONLY-NOTE-5e21c0")]);
+        admin.commit_main(&dir, "admin only");
+        admin.ok(&dir, &["push"]);
+        assert_eq!(tip(&hub, &token, &name), main, "control: a hidden-only change is not in the dev's history");
+        assert_ne!(tip(&hub, &atok, &name), main);
+        let r = change(&hub, &token, &name, &json!({"base": x.hex(), "edits": [put("src/second.txt", "2")],
+            "onto": {"branch": "main", "expected": main.hex()}}));
+        if r.status != 200 || r.json()["branch"]["status"] != "ok" {
+            failures.push(format!("a member who sees the whole fork: {} {}", r.status, body(&r)));
+        }
+    }
+    assert!(failures.is_empty(), "a stack over a hidden change did not land: {failures:#?}");
+}
