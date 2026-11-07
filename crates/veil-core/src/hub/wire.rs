@@ -37,8 +37,9 @@ use crate::{
 pub const PROTOCOL: u32 = 1;
 /// What this side of `/v1/` supports beyond its first release, as
 /// [`Tips::revision`] tells clients: 1, a fetch names objects of several
-/// snapshots ([`Want::snapshot`]).
-pub const REVISION: u32 = 1;
+/// snapshots ([`Want::snapshot`]); 2, uploads may carry compressed
+/// objects ([`super::encoding`]).
+pub const REVISION: u32 = 2;
 /// Largest object a frame may carry.
 pub const MAX_FRAME_OBJECT: usize = 1 << 30;
 /// Most objects one fetch request may name.

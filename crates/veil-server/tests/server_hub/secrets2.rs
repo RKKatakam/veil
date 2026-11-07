@@ -238,7 +238,8 @@ fn an_invite_confirms_a_device_and_a_member_shares_the_key() {
             let path = e.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if let Ok(b) = std::fs::read(&path) {
+            } else {
+                let b = stored_bytes(&path);
                 assert!(!String::from_utf8_lossy(&b).contains(&secret), "the invite's secret is in {}", path.display());
             }
         }

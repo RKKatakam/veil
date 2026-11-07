@@ -28,8 +28,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use veil_core::{
     crypto::domains::{SIG_CONTEXT_HUB_DEVICE, SIG_CONTEXT_HUB_LOGIN},
+    hub::encoding,
     hub::wire::{
-        device_fingerprint, put_frame, read_frames, vouch_message, AccessInfo, BranchUpdate, Challenge, ChallengeRequest, Devices, ErrorBody,
+        device_fingerprint, put_frame, vouch_message, AccessInfo, BranchUpdate, Challenge, ChallengeRequest, Devices, ErrorBody,
         FetchRequest, GroupChange, GroupInfo, HistoryRequest, LoginRequest, PushRequest, PushResult, Session, Tips, VouchRequest, Want,
     },
     identity::parse_public_identity,
@@ -244,7 +245,34 @@ const FETCH_REQUESTS: usize = 8;
 /// Body of a response: JSON or object frames.
 fn read_body(resp: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>> {
     let mut body = resp.into_body();
-    Ok(body.with_config().limit(4 << 30).read_to_vec()?)
+    Ok(body.with_config().limit(ANSWER_LIMIT).read_to_vec()?)
+}
+
+/// Most bytes one answer may hold, and its objects decoded.
+const ANSWER_LIMIT: u64 = 4 << 30;
+
+/// What `vl` reads: encoded frames (compressed objects, S27) as well as
+/// JSON. A server from before S27 ignores it and sends plain frames, which
+/// are encoded frames too.
+const ACCEPT: &str = "application/x-veil-encoded-frames, application/json";
+
+/// The objects of an answer of (encoded or plain) frames, each decoded
+/// (bounded) and checked against its id.
+fn objects_of(body: &[u8]) -> Result<Vec<(ObjectId, Vec<u8>)>> {
+    Ok(encoding::read_frames(body, ANSWER_LIMIT)?.into_iter().map(|(id, raw)| (id, raw.into_owned())).collect())
+}
+
+/// `objects`' encodings, compressed on several threads; in order.
+fn encode_all(objects: &[(ObjectId, Vec<u8>)]) -> Vec<std::borrow::Cow<'_, [u8]>> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    let chunk = objects.len().div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        let parts: Vec<_> = objects
+            .chunks(chunk)
+            .map(|c| s.spawn(move || c.iter().map(|(_, raw)| encoding::encode(raw)).collect::<Vec<_>>()))
+            .collect();
+        parts.into_iter().flat_map(|p| p.join().expect("an encoding thread panicked")).collect()
+    })
 }
 
 impl Client {
@@ -319,6 +347,7 @@ impl Client {
                 if let Some(t) = &token {
                     r = r.header("authorization", &format!("Bearer {t}"));
                 }
+                r = r.header("accept", ACCEPT);
                 match body {
                     Some((ct, b)) => r.header("content-type", ct).send(&b[..]),
                     None => r.send_empty(),
@@ -426,7 +455,7 @@ impl Client {
             &self.url.project_path("/history"),
             Some(("application/json", serde_json::to_vec(&HistoryRequest { tips, stop })?)),
         )?;
-        Ok(read_frames(&out)?.into_iter().map(|(id, raw)| (id, raw.to_vec())).collect())
+        objects_of(&out)
     }
 
     /// The answer to one fetch request: the object frames of `objects`.
@@ -465,8 +494,9 @@ impl Client {
         if start < wants.len() {
             parts.push(start..wants.len());
         }
-        let mut check = |part: &[Want], body: &[u8]| -> Result<()> {
-            let got = read_frames(body)?;
+        // Each part's objects decoded where its answer arrives (on the
+        // fetch threads), then checked against its wants here.
+        let mut check = |part: &[Want], got: Vec<(ObjectId, Vec<u8>)>| -> Result<()> {
             if got.len() != part.len() {
                 bail!("the server sent {} objects for {} asked", got.len(), part.len());
             }
@@ -474,12 +504,12 @@ impl Client {
                 if id != w.id {
                     bail!("the server sent another object than asked");
                 }
-                f(w, raw)?;
+                f(w, &raw)?;
             }
             Ok(())
         };
         if parts.len() == 1 {
-            return check(wants, &self.fetch_body(snapshot, wants.to_vec())?);
+            return check(wants, objects_of(&self.fetch_body(snapshot, wants.to_vec())?)?);
         }
         let token = self.token.borrow().clone();
         let url = format!("{}{}", self.url.base(), self.url.project_path("/fetch"));
@@ -488,20 +518,21 @@ impl Client {
         std::thread::scope(|s| -> Result<()> {
             // A part fetched waits here until the one before is written:
             // at most one answer per request in flight, plus this one.
-            let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Option<Vec<u8>>)>(0);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Option<Vec<(ObjectId, Vec<u8>)>>)>(0);
             for _ in 0..FETCH_REQUESTS.min(parts.len()) {
                 let (tx, url, token, next) = (tx.clone(), &url, &token, &next);
                 s.spawn(move || loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(p) = parts.get(i) else { break };
-                    let body = (|| -> Option<Vec<u8>> {
+                    let body = (|| -> Option<Vec<(ObjectId, Vec<u8>)>> {
                         let body = serde_json::to_vec(&FetchRequest { snapshot, objects: wants[p.clone()].to_vec() }).ok()?;
-                        let mut r = agent.post(url).header("content-type", "application/json");
+                        let mut r = agent.post(url).header("content-type", "application/json").header("accept", ACCEPT);
                         if let Some(t) = token {
                             r = r.header("authorization", &format!("Bearer {t}"));
                         }
                         let resp = r.send(&body[..]).ok()?;
-                        (resp.status().as_u16() == 200).then(|| read_body(resp).ok()).flatten()
+                        let body = (resp.status().as_u16() == 200).then(|| read_body(resp).ok()).flatten()?;
+                        objects_of(&body).ok()
                     })();
                     // The receiver is gone when writing failed: stop.
                     if tx.send((i, body)).is_err() {
@@ -514,17 +545,18 @@ impl Client {
                 let (i, body) = rx.recv().map_err(|_| anyhow!("a fetch thread stopped"))?;
                 let part = &wants[parts[i].clone()];
                 match body {
-                    Some(body) => check(part, &body)?,
+                    Some(got) => check(part, got)?,
                     // Anything else (a session to renew, an error to
                     // report): this part again, the ordinary way.
-                    None => check(part, &self.fetch_body(snapshot, part.to_vec())?)?,
+                    None => check(part, objects_of(&self.fetch_body(snapshot, part.to_vec())?)?)?,
                 }
             }
             Ok(())
         })
     }
 
-    /// Upload object frames; the server's receipt for each, in order.
+    /// Upload object frames (plain, or encoded for a server of revision 2);
+    /// the server's receipt for each, in order.
     pub fn upload(&self, frames: Vec<u8>) -> Result<Vec<String>> {
         let out = self.ok("POST", &self.url.project_path("/objects"), Some(("application/octet-stream", frames)))?;
         Ok(serde_json::from_slice::<veil_core::hub::wire::Uploaded>(&out)?.receipts)
@@ -978,36 +1010,52 @@ impl<'a, F: FnMut(ObjectId, Vec<u8>) -> Result<()>> Introduced<'a, F> {
     }
 }
 
-/// Object frames on their way to the server, about 8 MiB per request, and
-/// the server's receipt for each: the push shows them, so it names nothing
-/// it did not send (BUG-824).
+/// Objects on their way to the server, about 8 MiB (uncompressed) per
+/// request, and the server's receipt for each: the push shows them, so it
+/// names nothing it did not send (BUG-824). To a server of revision 2 they
+/// go compressed (S27).
 struct Uploads<'a> {
     client: &'a Client,
-    frames: Vec<u8>,
-    ids: Vec<ObjectId>,
+    compress: bool,
+    objects: Vec<(ObjectId, Vec<u8>)>,
+    bytes: usize,
     receipts: BTreeMap<ObjectId, String>,
 }
 
 impl Uploads<'_> {
-    fn add(&mut self, id: &ObjectId, raw: &[u8]) -> Result<()> {
-        put_frame(&mut self.frames, id, raw);
-        self.ids.push(*id);
-        if self.frames.len() > 8 << 20 {
+    fn add(&mut self, id: ObjectId, raw: Vec<u8>) -> Result<()> {
+        self.bytes += raw.len();
+        self.objects.push((id, raw));
+        if self.bytes > 8 << 20 {
             self.flush()?;
         }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
-        if self.ids.is_empty() {
+        if self.objects.is_empty() {
             return Ok(());
         }
-        let r = self.client.upload(std::mem::take(&mut self.frames))?;
-        let ids = std::mem::take(&mut self.ids);
-        if r.len() != ids.len() {
-            bail!("the server sent {} upload receipts for {} objects", r.len(), ids.len());
+        let objects = std::mem::take(&mut self.objects);
+        self.bytes = 0;
+        let mut frames = Vec::new();
+        match self.compress {
+            true => {
+                for ((id, _), enc) in objects.iter().zip(encode_all(&objects)) {
+                    put_frame(&mut frames, id, &enc);
+                }
+            }
+            false => {
+                for (id, raw) in &objects {
+                    put_frame(&mut frames, id, raw);
+                }
+            }
         }
-        self.receipts.extend(ids.into_iter().zip(r));
+        let r = self.client.upload(frames)?;
+        if r.len() != objects.len() {
+            bail!("the server sent {} upload receipts for {} objects", r.len(), objects.len());
+        }
+        self.receipts.extend(objects.into_iter().map(|(id, _)| id).zip(r));
         Ok(())
     }
 }
@@ -1023,12 +1071,16 @@ pub struct PushOutcome {
 /// Push local tags (all, or `only_tags`) to the server.
 pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String], force: bool) -> Result<PushOutcome> {
     let mut created = false;
-    if client.tips()?.is_none() {
-        client.create_project()?;
-        created = true;
-        // This device made the project's `team` ring: the one it trusts.
-        crate::hub_keys::anchor_created(repo.keys(), &client.url)?;
-    }
+    let revision = match client.tips()? {
+        Some(tips) => tips.revision,
+        None => {
+            let tips = client.create_project()?;
+            created = true;
+            // This device made the project's `team` ring: the one it trusts.
+            crate::hub_keys::anchor_created(repo.keys(), &client.url)?;
+            tips.revision
+        }
+    };
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -1094,8 +1146,9 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         }
         // Upload what the push introduces as the walk finds it, 8 MiB per
         // request (BUG-858).
-        let mut up = Uploads { client, frames: Vec::new(), ids: Vec::new(), receipts: BTreeMap::new() };
-        let mut walk = Introduced::new(&store, |id, raw| up.add(&id, &raw));
+        // A server of revision 2 reads compressed objects.
+        let mut up = Uploads { client, compress: revision >= 2, objects: Vec::new(), bytes: 0, receipts: BTreeMap::new() };
+        let mut walk = Introduced::new(&store, |id, raw| up.add(id, raw));
         for (id, s) in &new {
             let parents: Vec<ObjectId> = s.parents.iter().filter_map(|p| store.snapshot(p).ok().map(|ps| ps.tree)).collect();
             walk.snapshot(*id, s.tree, parents)?;
@@ -1154,6 +1207,26 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `vl` says it reads encoded frames, and reads both kinds: plain
+    /// frames (a server from before S27) and compressed ones.
+    #[test]
+    fn answers_of_plain_and_encoded_frames() {
+        assert!(ACCEPT.split(", ").any(|t| t == encoding::FRAMES));
+        let objs: Vec<(ObjectId, Vec<u8>)> = [&b"veil:blob\none"[..], &b"veil:blob\ntwo two two two two two two two two two two two two"[..]]
+            .iter()
+            .map(|r| (ObjectId::hash(r), r.to_vec()))
+            .collect();
+        let (mut plain, mut encoded) = (Vec::new(), Vec::new());
+        for ((id, raw), enc) in objs.iter().zip(encode_all(&objs)) {
+            put_frame(&mut plain, id, raw);
+            put_frame(&mut encoded, id, &enc);
+        }
+        assert_ne!(plain, encoded);
+        assert_eq!(objects_of(&plain).unwrap(), objs);
+        assert_eq!(objects_of(&encoded).unwrap(), objs);
+        assert!(encode_all(&[]).is_empty());
+    }
 
     #[test]
     fn urls() {

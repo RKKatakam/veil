@@ -4,6 +4,8 @@
 
 use std::sync::Arc;
 
+use veil_core::ObjectId;
+
 use crate::support::*;
 
 #[test]
@@ -412,4 +414,191 @@ fn flaky_proxy(upstream: String, drop_it: impl Fn(usize) -> bool + Send + 'stati
         }
     });
     format!("http://{addr}")
+}
+
+/// The project's id in the server's database.
+fn project_id(hub: &TestHub, name: &str) -> i64 {
+    hub.rt
+        .block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(name).fetch_one(&hub.hub().db))
+        .unwrap()
+}
+
+/// S27 (`docs/HUB.md` §13.13): objects are stored compressed, under the id
+/// of the uncompressed object, and travel compressed to a `vl` that reads
+/// encoded frames. A client from before (plain frames, no `Accept`) gets
+/// every object as it always did, and its plain uploads are compressed by
+/// the server. Ids, receipts and signatures don't change: a fresh clone
+/// has every file, and the pushed history verifies.
+#[test]
+fn objects_are_compressed_in_storage_and_for_clients_that_read_them() {
+    use veil_core::hub::encoding;
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let text = "pub fn compressible() -> u32 { 42 }\n".repeat(2000);
+    write_files(&p.dir, &[("src/big.rs", &text)]);
+    p.admin.commit_main(&p.dir, "a big file");
+    p.admin.ok(&p.dir, &["push"]);
+    let (_, id) = real_paths(&p.dir).into_iter().find(|(path, _)| path == "src/big.rs").unwrap();
+    let repo = veil_core::Repo::open(Arc::new(veil_core::DiskBackend::new(&p.dir)), None, "test").unwrap();
+    let raw = repo.store().get_raw(&id).unwrap();
+    let hubref = hub.hub();
+    let pid = project_id(&hub, &p.name);
+    let stored = hub.rt.block_on(hubref.objects.get_encoded(pid, &id)).unwrap().unwrap();
+    assert!(encoding::is_compressed(&stored) && stored.len() * 10 < raw.len(), "{} bytes stored for {}", stored.len(), raw.len());
+    // A secret is ciphertext: stored as it is, never compressed.
+    let (_, env) = real_paths(&p.dir).into_iter().find(|(path, _)| *path == format!("{BILL_DIR}/.env")).unwrap();
+    let env_stored = hub.rt.block_on(hubref.objects.get_encoded(pid, &env)).unwrap().unwrap();
+    assert!(!encoding::is_compressed(&env_stored));
+    let api = hub.api();
+    let token = p.admin.token();
+    let tip = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+    let fetch = format!("/v1/projects/{}/fetch", p.name);
+    let want = serde_json::json!({"snapshot": tip.hex(), "objects": [{"path": "src/big.rs", "id": id.hex()}]});
+    // A client from before: plain frames.
+    assert_eq!(api.post_json(Some(&token), &fetch, &want).raw_frames(), vec![(id, raw.clone())]);
+    // A client that reads encoded frames: the stored encoding, as it is.
+    let (r, ct) = api.post_json_encoded(Some(&token), &fetch, &want);
+    assert_eq!(ct.as_deref(), Some(encoding::FRAMES));
+    assert_eq!(r.raw_frames(), vec![(id, stored.to_vec())]);
+    assert_eq!(r.frames(), vec![(id, raw.clone())]);
+    let (h, ct) = api.post_json_encoded(Some(&token), &format!("/v1/projects/{}/history", p.name), &serde_json::json!({"tips": [tip.hex()]}));
+    assert_eq!(ct.as_deref(), Some(encoding::FRAMES));
+    assert!(h.frames().iter().any(|(i, _)| *i == tip));
+    // An upload of plain frames (a client from before S27): accepted, and
+    // stored compressed.
+    let old_text = "fn from_a_client_from_before() {}\n".repeat(1000);
+    let old_raw = veil_core::object::Object::Blob(old_text.clone().into_bytes()).encode();
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file("src/old.rs", &old_text);
+    let r = c.push("main", "from a client from before");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let old_stored = hub.rt.block_on(hubref.objects.get_encoded(pid, &ObjectId::hash(&old_raw))).unwrap().unwrap();
+    assert!(encoding::is_compressed(&old_stored) && old_stored.len() * 10 < old_raw.len());
+    // Everyone gets every file they may see, whole.
+    let d = p.dev.dir("clone");
+    p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(d.join("src/big.rs")).unwrap(), text);
+    assert_eq!(std::fs::read_to_string(d.join("src/old.rs")).unwrap(), old_text);
+    let log = p.dev.ok(&d, &["log", "-r", "main", "--json"]);
+    assert!(!log.contains("\"signature_valid\":false"), "{log}");
+}
+
+/// S27 threat review: hostile compressed uploads (a participant's, so
+/// inside the project but outside the server). A zip bomb declaring more
+/// than the object size limit, a frame of other content, an unknown
+/// marker, bytes after the frame, a frame that does not declare its size,
+/// or a request decoding to more than a plain request may carry: each
+/// refused from the request alone, quickly, with nothing stored and no
+/// receipt; the server answers the next request as usual.
+#[test]
+fn hostile_compressed_uploads_are_refused() {
+    use veil_core::hub::{encoding, wire::put_frame};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let token = p.dev.token();
+    let raw = veil_core::object::Object::Blob(b"hello compressed world ".repeat(64)).encode();
+    let id = ObjectId::hash(&raw);
+    let good = encoding::encode(&raw).into_owned();
+    assert!(encoding::is_compressed(&good));
+    // The header of a zstd frame declaring `size` bytes, and an empty last
+    // raw block: refused from its header.
+    let declaring = |size: u64| {
+        let mut f = vec![encoding::ZSTD, 0x28, 0xb5, 0x2f, 0xfd, 0b1100_0000, 0x50];
+        f.extend_from_slice(&size.to_le_bytes());
+        f.extend_from_slice(&[0x01, 0x00, 0x00]);
+        f
+    };
+    let other = encoding::encode(&veil_core::object::Object::Blob(b"other content entirely ".repeat(64)).encode()).into_owned();
+    let mut trailing = good.clone();
+    trailing.extend_from_slice(b"junk");
+    let mut marker = good.clone();
+    marker[0] = 0x01;
+    let undeclared = {
+        let mut f = vec![encoding::ZSTD];
+        let mut z = good[1..].to_vec();
+        // Clear the frame's content-size flag: a frame of another shape,
+        // still refused (it no longer declares its size or parses).
+        z[4] &= 0b0011_1111;
+        f.extend(z);
+        f
+    };
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("a bomb past the object size limit", declaring((1 << 30) + 1)),
+        ("a bomb declaring 2^63", declaring(1 << 63)),
+        ("a frame of other content", other),
+        ("bytes after the frame", trailing),
+        ("an unknown marker", marker),
+        ("a frame without its size", undeclared),
+        ("only a marker", vec![encoding::ZSTD]),
+    ];
+    for (what, enc) in cases {
+        let mut body = Vec::new();
+        // A good object first: the whole request is refused, so even it
+        // gets no receipt.
+        put_frame(&mut body, &id, &good);
+        put_frame(&mut body, &id, &enc);
+        let t = std::time::Instant::now();
+        let r = api.upload_body(&token, &p.name, &body);
+        assert_eq!(r.status, 400, "{what}: {}", String::from_utf8_lossy(&r.body));
+        assert!(r.json()["receipts"].is_null(), "{what}");
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "{what} took {:?}", t.elapsed());
+    }
+    // A request that decodes to more than a plain request may carry (the
+    // body limit) is refused once the total passes it: 3 frames of 1 GiB
+    // each would be 3 GiB. Shown with the real decoder on a small limit in
+    // `veil_core::hub::encoding`'s tests; here, the server still answers.
+    let mut body = Vec::new();
+    put_frame(&mut body, &id, &good);
+    let r = api.upload_body(&token, &p.name, &body);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["receipts"].as_array().map(|a| a.len()), Some(1));
+}
+
+/// S27 threat review: compressed answers carry only what the viewer may
+/// see. Every viewer's walk of the project through encoded frames (as a
+/// `vl` that reads them) holds no marker of a folder they can't read.
+#[test]
+fn compressed_answers_hold_nothing_the_viewer_may_not_see() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let anyone = hub.anyone();
+    let cases: Vec<(&Person, Option<String>, Vec<&str>)> = vec![
+        (&anyone, None, vec![]),
+        (&p.dev, Some(p.dev.token()), vec![]),
+        (&p.fin, Some(p.fin.token()), vec![BILL_DIR, BILL_MARK, ENV_MARK, DESC_MARK]),
+        (&p.carol, Some(p.carol.token()), vec![PERSON_DIR, PERSON_MARK]),
+        (&p.sec, Some(p.sec.token()), vec![NESTED_DIR, NESTED_MARK]),
+    ];
+    for (who, token, allowed) in &cases {
+        let token = token.as_deref();
+        let tip = api.tips(token, &p.name).unwrap().branches["main"];
+        let (h, _) = api.post_json_encoded(token, &format!("/v1/projects/{}/history", p.name), &serde_json::json!({"tips": [tip.hex()]}));
+        let mut got: Vec<(String, Vec<u8>)> = h.frames().into_iter().map(|(i, r)| (format!("snapshot {}", i.short()), r)).collect();
+        let veil_core::object::Object::Snapshot(s) = veil_core::object::Object::decode(&got.iter().find(|(n, _)| *n == format!("snapshot {}", tip.short())).unwrap().1).unwrap() else {
+            panic!()
+        };
+        let mut stack = vec![(String::new(), s.tree)];
+        while let Some((path, id)) = stack.pop() {
+            let (r, _) = api.post_json_encoded(
+                token,
+                &format!("/v1/projects/{}/fetch", p.name),
+                &serde_json::json!({"snapshot": tip.hex(), "objects": [{"path": path, "id": id.hex()}]}),
+            );
+            let (_, raw) = r.frames().into_iter().next().unwrap();
+            if let Ok(veil_core::object::Object::Tree(t)) = veil_core::object::Object::decode(&raw) {
+                for e in &t.entries {
+                    let child = if path.is_empty() { e.name.clone() } else { format!("{path}/{}", e.name) };
+                    got.push((format!("name {child}"), child.clone().into_bytes()));
+                    stack.push((child, e.id));
+                }
+            }
+            got.push((format!("object at '{path}'"), raw));
+        }
+        // Safety first, then liveness.
+        let forbidden: Vec<&str> = restricted_markers().into_iter().filter(|m| !allowed.contains(m)).collect();
+        assert_no_marker(&got, &forbidden, &who.name);
+        assert!(has_marker(&got, PUBLIC_MARK), "{} lacks the public folder", who.name);
+    }
 }

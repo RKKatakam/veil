@@ -27,6 +27,7 @@
 //! `projections` under the viewer's view key.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -37,7 +38,8 @@ use veil_core::{
     hub::{
         access::{AccessPolicy, View},
         project::{Change, Graft, Node, Projector, TreeSource},
-        wire::{put_frame, BranchResult, PushRequest, PushResult, Want},
+        encoding,
+        wire::{put_frame, BranchResult, PushRequest, PushResult, Want, MAX_FRAME_OBJECT},
     },
     object::{EntryKind, Object, Snapshot, Tree, Visibility},
     policy::{Policy, Tier, POLICY_FILE},
@@ -88,6 +90,17 @@ impl Source {
         self.hub
             .objects
             .get_blocking(&self.rt, self.project, id)
+            .map_err(|e| VeilError::Repo(format!("object store: {e}")))?
+            .ok_or(VeilError::Missing(*id))
+    }
+
+    /// Object `id` as stored ([`crate::store::Objects::get_encoded`]).
+    pub fn encoded(&self, id: &ObjectId) -> veil_core::Result<Bytes> {
+        if let Some(b) = builtin(id) {
+            return Ok(b);
+        }
+        self.rt
+            .block_on(self.hub.objects.get_encoded(self.project, id))
             .map_err(|e| VeilError::Repo(format!("object store: {e}")))?
             .ok_or(VeilError::Missing(*id))
     }
@@ -340,8 +353,16 @@ pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer) -> Result<
 }
 
 /// The snapshots reachable from `tips` in `viewer`'s projected history,
-/// down to (not including) `stop`, as object frames.
-pub async fn history(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId], stop: &[ObjectId]) -> Result<Vec<u8>> {
+/// down to (not including) `stop`, as object frames: as stored, compressed
+/// or not, when the caller reads `encoded` frames.
+pub async fn history(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    tips: &[ObjectId],
+    stop: &[ObjectId],
+    encoded: bool,
+) -> Result<Vec<u8>> {
     let mut starts = Vec::new();
     for t in tips {
         let Some(real) = resolve(hub, project.id, t).await?.into_iter().next() else {
@@ -365,7 +386,10 @@ pub async fn history(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &
             let Object::Snapshot(s) = Object::decode(&raw)? else {
                 return Err(Error::Other(anyhow::anyhow!("projected history holds a non-snapshot")));
             };
-            put_frame(&mut out, &id, &raw);
+            match encoded {
+                true => put_frame(&mut out, &id, &src.encoded(&id)?),
+                false => put_frame(&mut out, &id, &raw),
+            }
             stack.extend(s.parents.iter().copied());
         }
         Ok(out)
@@ -374,7 +398,10 @@ pub async fn history(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &
 }
 
 /// Objects `wants` under snapshot `snapshot`, each checked against what
-/// `viewer` may read at its path, as a stream of object frames. Anything
+/// `viewer` may read at its path, as a stream of object frames (`encoded`:
+/// each object as stored, compressed or not, for a caller that reads
+/// encoded frames; the projected trees made for this viewer as they
+/// are). Anything
 /// not found at its path in the viewer's projection is refused as not
 /// found, without saying whether it exists.
 ///
@@ -383,7 +410,7 @@ pub async fn history(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &
 /// is read and sent a few objects ahead of the caller (`FETCH_WINDOW`);
 /// a failure while sending ends the stream with an error, so it is never
 /// taken as whole.
-pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot: ObjectId, wants: Vec<Want>) -> Result<FrameStream> {
+pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot: ObjectId, wants: Vec<Want>, encoded: bool) -> Result<FrameStream> {
     // Each want is checked in its own snapshot (revision 1), as the viewer
     // sees it.
     let mut reals: HashMap<ObjectId, ObjectId> = HashMap::new();
@@ -439,7 +466,13 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
                     }
                     None => {
                         let (hub, i) = (hub.clone(), next);
-                        set.spawn(async move { (i, hub.objects.get(pid, &id).await) });
+                        set.spawn(async move {
+                            let got = match encoded {
+                                true => hub.objects.get_encoded(pid, &id).await,
+                                false => hub.objects.get(pid, &id).await,
+                            };
+                            (i, got)
+                        });
                     }
                 }
                 ahead += sizes[next];
@@ -1144,36 +1177,51 @@ fn receipted(hub: &Hub, project: i64, person: i64, receipts: &std::collections::
         .collect()
 }
 
-/// Store uploaded objects (`docs/HUB.md` §4.5): each is re-hashed against
-/// its id and must decode canonically (safe names, sorted trees) at a
-/// repository format the server serves. Nothing uploaded is visible until a
-/// push makes a branch reach it. Returns a receipt per object, in order
-/// (stored whether or not the project held it already, so the answer is
-/// the same either way).
-pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes) -> Result<Vec<String>> {
-    // Each object copied out of the request: a slice would keep the whole
-    // body alive in the object cache for as long as any one of its objects
-    // stays there (BUG-860).
-    let frames: Vec<(ObjectId, Bytes)> = veil_core::hub::wire::read_frames(&body)?
-        .into_iter()
-        .map(|(id, raw)| (id, Bytes::copy_from_slice(raw)))
-        .collect();
-    drop(body);
-    for (_, raw) in &frames {
-        if Object::min_repo_format(raw) > veil_core::repo::REPO_FORMAT {
-            return Err(Error::bad_request("an object of a newer format than this server serves"));
+/// Store uploaded objects (`docs/HUB.md` §4.5): each is decoded if it came
+/// compressed (bounded: at most the object size limit each, and at most
+/// `limit` bytes for the whole request, so a compressed request costs no
+/// more than a plain one could), re-hashed against its id, and must decode
+/// canonically (safe names, sorted trees) at a repository format the server
+/// serves. It is stored compressed when that is smaller (`docs/HUB.md`
+/// §13.13). Nothing uploaded is visible until a push makes a branch reach
+/// it. Returns a receipt per object, in order (stored whether or not the
+/// project held it already, so the answer is the same either way).
+pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limit: u64) -> Result<Vec<String>> {
+    // The checks, decoding and compressing on a blocking thread. Each
+    // encoding is copied out of the request: a slice would keep the whole
+    // body alive in the object cache for as long as any one of its
+    // objects stays there (BUG-860).
+    let frames: Vec<(ObjectId, Bytes)> = tokio::task::spawn_blocking(move || -> Result<Vec<(ObjectId, Bytes)>> {
+        let mut left = limit;
+        let mut out = Vec::new();
+        for (id, enc) in encoding::split_frames(&body)? {
+            let raw = encoding::decode(&id, enc, left.min(MAX_FRAME_OBJECT as u64))?;
+            left -= raw.len() as u64;
+            if Object::min_repo_format(&raw) > veil_core::repo::REPO_FORMAT {
+                return Err(Error::bad_request("an object of a newer format than this server serves"));
+            }
+            Object::decode(&raw)?;
+            // Stored as the client compressed it when that is smaller;
+            // compressed here otherwise (an older client's plain frame).
+            let stored = match &raw {
+                Cow::Owned(r) if enc.len() < r.len() => Bytes::copy_from_slice(enc),
+                _ => Bytes::copy_from_slice(&encoding::encode(&raw)),
+            };
+            out.push((id, stored));
         }
-        Object::decode(raw)?;
-    }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| Error::Other(e.into()))??;
     let receipts = frames.iter().map(|(id, _)| receipt(hub, project, person, id)).collect();
     let mut set = tokio::task::JoinSet::new();
     let hub2 = hub.clone();
     let mut it = frames.into_iter();
     loop {
         while set.len() < 64 {
-            let Some((id, raw)) = it.next() else { break };
+            let Some((id, enc)) = it.next() else { break };
             let h = hub2.clone();
-            set.spawn(async move { h.objects.put(project, &id, raw).await });
+            set.spawn(async move { h.objects.put_encoded(project, &id, enc).await });
         }
         match set.join_next().await {
             Some(r) => r.map_err(|e| Error::Other(e.into()))??,

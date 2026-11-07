@@ -613,7 +613,7 @@ impl Pack {
 /// of their size at once; above [`BULK_LIMIT`] the frame is first streamed
 /// into the hash only, and decoded into memory once that matched (BUG-490).
 /// Neither pass ever produces more than `raw_len` bytes.
-fn decompress(data: &[u8], raw_len: u64, dict: Option<&[u8]>, id: &ObjectId) -> std::result::Result<Vec<u8>, String> {
+pub(crate) fn decompress(data: &[u8], raw_len: u64, dict: Option<&[u8]>, id: &ObjectId) -> std::result::Result<Vec<u8>, String> {
     if raw_len <= BULK_LIMIT {
         return decompress_bulk(data, raw_len, dict);
     }
@@ -660,6 +660,24 @@ fn decompress_bulk(data: &[u8], raw_len: u64, dict: Option<&[u8]>) -> std::resul
         return Err("decompressed length does not match the recorded length".into());
     }
     Ok(out)
+}
+
+/// The content size `data`, one whole zstd frame, declares: `None` if it
+/// declares none, or is not exactly one frame (trailing bytes, a second
+/// or skippable frame).
+#[cfg(feature = "zstd")]
+pub(crate) fn frame_content_size(data: &[u8]) -> Option<u64> {
+    if zstd::zstd_safe::find_frame_compressed_size(data).ok()? != data.len() {
+        return None;
+    }
+    zstd::zstd_safe::get_frame_content_size(data).ok()?
+}
+
+/// Without the C library (WASM: frames from the server only) the size the
+/// frame's header declares; data after the frame is never decoded.
+#[cfg(not(feature = "zstd"))]
+pub(crate) fn frame_content_size(data: &[u8]) -> Option<u64> {
+    pure::frame_content_size(data)
 }
 
 /// Stream the frame's content to `sink` in chunks of at most
@@ -807,6 +825,15 @@ pub(crate) mod pure {
             return Err(too_long());
         }
         Ok(())
+    }
+
+    /// The content size the frame header of `data` declares, if any.
+    #[cfg_attr(feature = "zstd", allow(dead_code))]
+    pub(crate) fn frame_content_size(data: &[u8]) -> Option<u64> {
+        let mut d = FrameDecoder::new();
+        let mut src = data;
+        d.init(&mut src).ok()?;
+        frame_declares_size(data).then(|| d.content_size())
     }
 
     /// Does the frame header carry a content size? (`content_size()` is 0
@@ -1497,6 +1524,30 @@ mod tests {
                     assert_eq!(pure::decompress(&z, raw.len() as u64, None).unwrap(), raw, "level {level}, {} bytes", raw.len());
                 }
             }
+        }
+
+        /// The content size the pure decoder reads from a frame's header
+        /// (the WASM build's check of a server's compressed object, S27)
+        /// is libzstd's; a frame that declares none has none.
+        #[test]
+        fn frame_content_sizes_match_libzstd() {
+            use std::io::Write;
+            for raw in [Vec::new(), b"x".to_vec(), text(255), text(256), text(70_000), noise(5000, 3), text(3 << 20)] {
+                let z = plain(DEFAULT_LEVEL, &raw);
+                assert_eq!(super::super::frame_content_size(&z), Some(raw.len() as u64));
+                assert_eq!(pure::frame_content_size(&z), Some(raw.len() as u64));
+                let mut e = zstd::stream::write::Encoder::new(Vec::new(), DEFAULT_LEVEL).unwrap();
+                e.include_contentsize(false).unwrap();
+                e.write_all(&raw).unwrap();
+                let undeclared = e.finish().unwrap();
+                assert_eq!(super::super::frame_content_size(&undeclared), None);
+                assert_eq!(pure::frame_content_size(&undeclared), None);
+                // libzstd refuses bytes after the frame.
+                let mut t = z.clone();
+                t.push(0);
+                assert_eq!(super::super::frame_content_size(&t), None);
+            }
+            assert_eq!(pure::frame_content_size(b"not a frame"), None);
         }
 
         #[test]
