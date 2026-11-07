@@ -94,6 +94,10 @@ pub const SIG_CONTEXT_HUB_DEVICE: &str = "hub-device";
 /// the invite's key, over `person ‖ 0x00 ‖ X25519 ‖ Ed25519` of the
 /// joining device (`hub::wire::join_message`).
 pub const SIG_CONTEXT_HUB_INVITE: &str = "hub-invite";
+/// Signature context: one version of a person-to-person secret share
+/// (`docs/HUB.md` §13.13, C14), by the sharing device, over
+/// `secret_share::ShareRecord::signing_body`.
+pub const SIG_CONTEXT_HUB_SHARE: &str = "hub-share";
 
 /// Every signature context, for the uniqueness test.
 pub const SIG_CONTEXTS: &[&str] = &[
@@ -107,6 +111,7 @@ pub const SIG_CONTEXTS: &[&str] = &[
     SIG_CONTEXT_HUB_LOGIN,
     SIG_CONTEXT_HUB_DEVICE,
     SIG_CONTEXT_HUB_INVITE,
+    SIG_CONTEXT_HUB_SHARE,
 ];
 
 // ---- key rings and embargoes (keychain.rs) --------------------------------
@@ -146,6 +151,12 @@ pub const EMBARGO_LABEL_PREFIX: &str = "embargo/";
 /// prefix keeps it apart from sealed secret files, which use the bare
 /// `<scope>#<key-id>` label under the same key.
 pub const VAULT_LABEL_PREFIX: &str = "vault:";
+/// `share:<share id>#<version>`: one version of a person-to-person secret
+/// share (C14): the secret file sealed under the version's random key
+/// (XChaCha20-Poly1305, random nonce), and that key wrapped to each device
+/// (HPKE aad `wrap:share:…`, which no scope name can spell: scope names
+/// have no `:`).
+pub const SHARE_LABEL_PREFIX: &str = "share:";
 /// `local`: the device-local vault and isolated files.
 pub const LOCAL_LABEL: &str = "local";
 /// Separator of `<scope>#<key-id>` generation labels.
@@ -187,6 +198,11 @@ pub const HUB_PROJECT_FINGERPRINT: &str = "veil 2026 hub project-fingerprint v1"
 /// over the line's path. Not secret.
 pub const POLICY_RULE_SCOPE: &str = "veil 2026 policy rule-scope v1";
 
+/// BLAKE3 `derive_key` context of a secret share's id (C14), over the
+/// length-prefixed project id, path, sharer and recipient (first 16 bytes,
+/// hex): part of the share's labels. Not secret.
+pub const HUB_SHARE_ID: &str = "veil 2026 hub share-id v1";
+
 /// Every BLAKE3 `derive_key` context, for the uniqueness test.
 pub const BLAKE3_CONTEXTS: &[&str] = &[
     LEGACY_SIV_NONCE,
@@ -203,6 +219,7 @@ pub const BLAKE3_CONTEXTS: &[&str] = &[
     HUB_INVITE_KEY,
     POLICY_RULE_SCOPE,
     HUB_PROJECT_FINGERPRINT,
+    HUB_SHARE_ID,
 ];
 
 #[cfg(test)]
@@ -225,7 +242,8 @@ mod tests {
                 "veil 2026 hub upload-receipt v1",
                 "veil 2026 hub invite-key v1",
                 "veil 2026 policy rule-scope v1",
-                "veil 2026 hub project-fingerprint v1"
+                "veil 2026 hub project-fingerprint v1",
+                "veil 2026 hub share-id v1"
             ],
             "a context changed or was reordered"
         );
@@ -248,13 +266,14 @@ mod tests {
             "028e842fb2475981",
             "a signature context changed; that breaks existing signatures. Add a new constant instead."
         );
-        assert_eq!(SIG_CONTEXTS[5..], ["vault-entry", "tag", "hub-login", "hub-device", "hub-invite"], "a signature context changed or was reordered");
+        assert_eq!(SIG_CONTEXTS[5..], ["vault-entry", "tag", "hub-login", "hub-device", "hub-invite", "hub-share"], "a signature context changed or was reordered");
         let labels = [
             WRAP_LABEL_PREFIX,
             PREV_KEY_LABEL_PREFIX,
             EMBARGO_WRAP_LABEL_PREFIX,
             EMBARGO_LABEL_PREFIX,
             VAULT_LABEL_PREFIX,
+            SHARE_LABEL_PREFIX,
         ];
         for (i, a) in labels.iter().enumerate() {
             for b in &labels[i + 1..] {

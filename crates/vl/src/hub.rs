@@ -653,6 +653,31 @@ impl Client {
     pub fn pending_keys(&self) -> Result<Vec<Devices>> {
         self.json("GET", &self.url.project_path("/keys/pending"), None::<&()>)
     }
+
+    /// The secret shares this person makes or receives here (admins: every
+    /// share of the project), `docs/HUB.md` §13.13.
+    pub fn shares(&self) -> Result<Vec<veil_core::secret_share::ShareInfo>> {
+        self.json("GET", &self.url.project_path("/shares"), None::<&()>)
+    }
+
+    /// Store a new version of a share; `Err(why)` if the server's share
+    /// moved on meanwhile (409): read it and decide again.
+    pub fn put_share(&self, req: &veil_core::secret_share::SharePut) -> Result<std::result::Result<(), String>> {
+        let (status, out) = self.call("POST", &self.url.project_path("/shares"), Some(("application/json", serde_json::to_vec(req)?)))?;
+        match status {
+            200 => Ok(Ok(())),
+            409 => Ok(Err(Self::error(status, &out).to_string())),
+            s => Err(Self::error(s, &out)),
+        }
+    }
+
+    pub fn remove_share(&self, path: &str, recipient: &str) -> Result<veil_core::secret_share::ShareInfo> {
+        let req = veil_core::secret_share::ShareRemove {
+            path: path.to_string(),
+            recipient: recipient.to_string(),
+        };
+        self.json("POST", &self.url.project_path("/shares/remove"), Some(&req))
+    }
 }
 
 // ---- pull ---------------------------------------------------------------------------------

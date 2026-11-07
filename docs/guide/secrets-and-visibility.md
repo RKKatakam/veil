@@ -440,6 +440,7 @@ db=postgres://app:Xk29vLq8sPz@db/prod token=s3cr3t-value
 | `vl secret files` | List the vault's backups of isolated files, including those of files gone from the working copy (kept 30 days) |
 | `vl secret recover PATH` | Write the backup of an isolated file back into the working copy (never over an existing file) |
 | `vl run -- CMD…` | Run `CMD` with the vault's secrets in its environment (and those of the team vaults you choose, see below); exits with its status |
+| `vl secret share PATH --with PERSON` / `unshare PATH --from PERSON` / `shares` | Share one secret file with another member of a server project, for their confirmed devices only (see [The Veil server](the-server.md#sharing-one-secret-with-one-person)) |
 
 The vault is per repository and per device. A teammate's clone has its own.
 Replacing your identity makes the vault unreadable until you re-key it

@@ -131,7 +131,7 @@ fn entitled(rule: &AccessRule, groups: &[GroupInfo]) -> BTreeMap<String, Vec<Str
 
 /// How a device of a person was confirmed outside the server.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum How {
+pub(crate) enum How {
     /// A verified key ring holds it now, under the person's name.
     Ring,
     /// This command's `--confirm`: the admin compared its fingerprint now.
@@ -380,19 +380,19 @@ fn me_admin(st: &RingState, keys: &Keychain) -> bool {
 }
 
 /// Every verified ring of this repository.
-fn local_states(ctx: &Ctx) -> Vec<RingState> {
+pub(crate) fn local_states(ctx: &Ctx) -> Vec<RingState> {
     let keys = ctx.repo.keys();
     keys.rings().unwrap_or_default().iter().filter_map(|r| keys.trusted_state(r).ok()).collect()
 }
 
 /// A person's confirmed and unconfirmed listed devices.
-struct PersonDevices {
-    person: String,
-    devices: Devices,
-    confirmed: Vec<(String, How)>,
+pub(crate) struct PersonDevices {
+    pub(crate) person: String,
+    pub(crate) devices: Devices,
+    pub(crate) confirmed: Vec<(String, How)>,
 }
 
-fn person_devices(ctx: &Ctx, client: &Client, people: &[String], confirm: &[String]) -> Result<Vec<PersonDevices>> {
+pub(crate) fn person_devices(ctx: &Ctx, client: &Client, people: &[String], confirm: &[String]) -> Result<Vec<PersonDevices>> {
     let rings = local_states(ctx);
     let mut confirm: Vec<String> = confirm
         .iter()
@@ -1068,8 +1068,9 @@ const PASS_EVERY: Duration = Duration::from_secs(10);
 const LOG_LIMIT: u64 = 1 << 20;
 
 /// After a command in a clone of a server project, on a device that holds a
-/// secret key: start `vl share-keys` detached, at most every
-/// [`PASS_EVERY`] (`VEIL_KEY_SHARE=0` turns this off). Best effort.
+/// secret key or takes part in a secret share: start `vl share-keys`
+/// detached, at most every [`PASS_EVERY`] (`VEIL_KEY_SHARE=0` turns this
+/// off). Best effort.
 pub fn maybe_spawn(ctx: &Ctx) {
     if ctx.bare || std::env::var("VEIL_KEY_SHARE").is_ok_and(|v| v == "0") {
         return;
@@ -1077,7 +1078,8 @@ pub fn maybe_spawn(ctx: &Ctx) {
     if !ctx.repo.config().remotes.get("origin").is_some_and(|r| hub::is_hub_url(&r.url)) {
         return;
     }
-    let holds = ctx.repo.keys().rings().is_ok_and(|rs| rs.iter().any(|r| ctx.repo.keys().is_member(&r.scope)));
+    let holds = ctx.repo.keys().rings().is_ok_and(|rs| rs.iter().any(|r| ctx.repo.keys().is_member(&r.scope)))
+        || crate::share_cmd::takes_part(ctx);
     if !holds {
         return;
     }
@@ -1127,10 +1129,16 @@ fn spawn(root: &Path, log: &Path) -> std::io::Result<()> {
 
 /// `vl share-keys` (hidden; what the background runs): one pass, printed.
 pub fn run_pass(ctx: &mut Ctx, client: &Client) -> Result<()> {
-    for (label, person, what) in share_pass(ctx, client)? {
-        println!("  {} the secret key of {} {what} {}", dim("keys:"), safe(&label), safe(&person));
+    let keys = share_pass(ctx, client);
+    for (label, person, what) in keys.as_ref().map(Vec::as_slice).unwrap_or_default() {
+        println!("  {} the secret key of {} {what} {}", dim("keys:"), safe(label), safe(person));
     }
-    Ok(())
+    // Person-to-person secret shares (docs/HUB.md §13.13), whatever the
+    // key pass did.
+    for line in crate::share_cmd::pass(ctx, client)? {
+        println!("  {} {}", dim("shares:"), safe(&line));
+    }
+    keys.map(drop)
 }
 
 // ---- devices ----------------------------------------------------------------------------

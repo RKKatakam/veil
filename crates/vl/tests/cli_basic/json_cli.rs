@@ -211,6 +211,19 @@ fn specs() -> Vec<(&'static str, Value)> {
             "files": [scan_file], "exposed": "number", "protected": "number", "clean": "bool",
         })),
         ("veil.secret.list/1", json!({"schema": "string", "secrets": [{"name": "string"}]})),
+        // Through a Veil server only: shapes checked in `server_hub` `shares`.
+        (
+            "veil.secret.shares/1",
+            json!({"schema": "string", "shares": [{
+                "path": "string", "sharer": "string", "recipient": "string", "version": "number", "created_at": "number",
+                "updated_at": "number", "unshared_at": "number|null", "active": "bool", "paused": "string|null",
+            }]}),
+        ),
+        (
+            "veil.secret.share/1",
+            json!({"schema": "string", "action": "string", "path": "string", "recipient": "string", "version": "number",
+                "devices": ["string"], "unconfirmed": ["string"]}),
+        ),
         ("veil.ls/2", json!({
             "schema": "string", "snapshot": snapshot_ref(), "working_copy": "bool", "all": "bool",
             "entries": [{

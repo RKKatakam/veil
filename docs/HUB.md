@@ -1166,6 +1166,8 @@ can run in parallel).
 1. **S2: secrets at scale** (built, §13.12) — invites, keys per access
    rule, sharing in the background for new members and devices, device
    removal.
+   Person-to-person secret shares (`vl secret share`, §13.13) close
+   phase 1.
 2. **S3: fetch on demand in the client** — the partial-clone design
    (`docs/design/scale/6-partial-clone.md`): bounded cache, objects fetched
    when read, `vl ws mount` over the server; layered caches (per-machine
@@ -1496,3 +1498,133 @@ secrets, §3.1), unless a row says otherwise. Each row is tested in
 * **A clone made before its device anchored the project** opens no secret
   until the person confirms the fingerprint; this is the price of never
   trusting a ring on the server's word.
+
+### 13.13 Person-to-person secret shares (phase 1)
+
+**Goal** (owner, 2026-11-06): any member shares **their own** secret with
+any other member, **without an admin**. It is wrapped (HPKE) to that
+person's **confirmed** devices only, and only the sharer and the recipient
+can open it. Admins see that a share exists, never what it holds.
+
+```
+vl secret share billing/.env.stripe-test --with bob    # seal a copy for bob's confirmed devices
+vl secret share billing/.env.stripe-test --with bob --confirm 4F2A-…   # bob is in no key ring yet
+vl secret shares                                        # mine (admins: every share), never contents
+vl secret unshare billing/.env.stripe-test --from bob  # no later version reaches bob
+```
+
+#### Decisions (delegated to the orchestrator)
+
+1. **What a secret is: one secret file.** A share is a copy of one file
+   that is a secret by its name (`.env`, `.env.*`, `.envrc`, Terraform
+   state) or that the project's policy seals, never code (code is shared
+   with `vl access`) and never a personal key (`id_rsa` & co. never leave
+   the device). Each version has its **own random key**, wrapped (HPKE,
+   C3) to the recipient's confirmed devices and to the sharing device,
+   and the file is sealed under it (C2): the share holds no key of the
+   access line that covers the file, so sharing `billing/.env` with someone
+   outside `billing/` gives them that file and nothing else of `billing/`
+   (CRYPTO.md C14). The vault entries of `vl secret set` are not shared
+   this way: a secret that people use together belongs in a file.
+2. **Updates and revocation.** The **device that made the share** keeps it
+   up to date: after any `vl` command (the background pass of §13.12, at
+   most every 10 s) it seals a new version when its copy of the file
+   changed, or when the recipient's confirmed devices changed (a new one
+   is added; one no longer confirmed is left out of every later version).
+   Running `vl secret share` on another device makes that one the source.
+   `vl secret unshare` **ends** the share: no later version is stored or
+   served. **It cannot take back what the recipient already received**
+   (the command says so, and suggests rotating the secret).
+3. **Device confirmation, as S2 requires.** The sharing device seals only
+   for devices confirmed outside the server, with the same rules an admin's
+   `vl group add` uses (§13.11; `hub_keys::person_devices`): a device a
+   verified ring of this project records under the person's name, one the
+   sharer compared by fingerprint (`--confirm`, remembered on the device),
+   one with a join under an invite for the person, or one vouched for by one
+   of these; a device a ring once held and revoked counts only if a ring
+   holds it now or the sharer compares it again. The server's device list
+   is never enough. Listed devices nothing confirms are printed with their
+   fingerprints (`confirm bob's device: …`).
+4. **The admins' audit.** In plain text on the server, never contents:
+   who shares which path with whom, when it started, when it last changed,
+   when it ended, and its version. `vl secret shares` lists them (admins:
+   every share of the project; others: the shares they make or receive);
+   ended shares keep their row, without the record. Each share and unshare
+   is also in the server's audit log.
+5. **Agents.** The recipient's `vl pull` (and `vl secret shares`, and the
+   background pass once the clone took part in a share) writes the file at
+   its path, where it **stays on their device**: an isolated file, never
+   recorded, backed up in the local vault like any local-only secret. Their
+   agents get it as they get the person's other secrets, with `vl ws exec
+   --with-isolated`. A copy is written only if the file is absent, or holds
+   exactly the version this clone wrote before (the person's own edit is
+   never written over), and only where this device would **not** record it:
+   a device that holds the key of the file's folder (an admin's, say) would
+   seal it into history for everyone in that folder, so the copy is not
+   written there and the command says why. A one-directory clone (`--only`)
+   writes nothing outside its directory.
+6. **Format and wire.** No repository format change (format 8) and no new
+   ring kind: shares are server records, not ring changes. New: the signed
+   share record (`veil_core::secret_share`, record format 1, FORMAT.md), the
+   routes below, migration `0009_secret_shares`, and the device-local
+   `.veil/local/secret-shares.json` (the last version received of each
+   share).
+
+#### The server
+
+* `GET /v1/projects/{p}/shares`: participants only. Admins get every
+  share's metadata; others the shares they make or receive. The record
+  (ciphertext) goes only to its sharer and its recipient, and only while the
+  share is **active**: not ended, the sharer may still read its path, and the
+  recipient still takes part in the project. Otherwise it is listed as
+  paused, with why (`fin may no longer read billing/.env`; `bob no longer
+  takes part in this project`); it resumes if that changes, until it is
+  ended.
+* `POST /v1/projects/{p}/shares` (`SharePut {expect, reshare, record}`):
+  the record must verify, be signed by the device sending it under its
+  person's name, be of a path the caller may read that the accepted policy
+  seals (never a personal key), be for another participant, and carry
+  version `expect + 1`. One statement with a compare-and-swap on the
+  version; a background update (`reshare: false`) never brings back an
+  ended share; at most 256 shares per person and project.
+* `POST /v1/projects/{p}/shares/remove`: the sharer ends a share (its
+  version moves on, its record is dropped, its row stays for the audit).
+  Ending an ended share again changes nothing.
+
+#### Threat review
+
+The attacker is **whoever controls the server** (outside the boundary for
+secrets, §3.1), unless a row says otherwise. Tests: `server_hub` `shares`,
+`veil-core` `secret_share`.
+
+| # | Tries | Result | Test |
+|---|---|---|---|
+| 1 | **Reads a share** (the database, the object store, the routes) | Ciphertext only: the version key is wrapped to devices' X25519 keys; the server holds none | `a_share_reaches_its_recipient_only` (the row holds no marker, in text or hex) |
+| 2 | **Lists its own device under the recipient**, with a vouch it signed | Not confirmed (§13.11): not sealed for, and shown as `confirm bob's device: <its fingerprint>`; bob reads a different one, so a `--confirm` of it fails and shares nothing | `a_server_cannot_redirect_a_share_to_its_device` |
+| 3 | **Moves another person's device under the recipient's name** | Rings record it under its real name: not confirmed for the recipient | same |
+| 4 | **The recipient is in no ring** | Nothing confirms a device of theirs: the share is refused until the sharer compares a fingerprint (`--confirm`) | same |
+| 5 | **Adds a wrap, swaps the sealed file, changes the path, recipient, sharer, version or project** of a stored record | The signature fails, or the labels (share id, version) do not match: refused, nothing written | `a_server_cannot_forge_change_replay_or_move_a_share`, `secret_share::tests` |
+| 6 | **Signs a record of its own** in the sharer's name (hostile content into the recipient's tree) | Its key is no current ring member named as the sharer: refused | same |
+| 7 | **Replays an older version** | The recipient's device refuses a version older than the last it received | same |
+| 8 | **Serves a genuine record of another project** (the sharer shares the same path there) | The record names its project; the recipient compares it with the project it anchored (BUG-845) | same |
+| 9 | **Moves a share to another path or recipient** (its own row) | The record's path and recipient are signed; the other recipient cannot open it either | same |
+| 10 | **Lists a removed device again**, with its genuine old vouch | Rings revoked it: it counts only through a ring holding it now or a new `--confirm`; every later version leaves it out | `removed_devices_people_and_access` |
+| 11 | **Withholds a new version**, or a revocation, from the sharing device | The recipient keeps an older version (freshness is TOFU, as for rings, §13.12); a device the sharer's rings still hold stays sealed for until they are fresh | residual |
+| 12 | **Races an update against an unshare** | Compare-and-swap on the version; an unshare moves it on, and an update never revives an ended share | `concurrency_share_updates_and_unshares_under_load`, `the_share_routes_refuse_what_may_not_be_shared` |
+| 13 | *A member without the folder* shares its secret, or anyone shares code or a personal key | Refused by the route (the caller's access to the path; the accepted policy); the client refuses first | `the_share_routes_refuse_what_may_not_be_shared` |
+| 14 | *A member* shares to a device that is not the person's (by `--confirm`) | Trusted: they hold the file and could leak it anyway (§3.1) | — |
+| 15 | *A sharer who loses the folder* keeps updating | Their updates are refused and the share is no longer served (paused) | `removed_devices_people_and_access` |
+| 16 | *A recipient who leaves the project* | Not served; no update is sealed for them while they are out | same |
+| 17 | *An admin's device* receives a share of a file its folder does not have | Not written: that device would seal it into history for the folder's people | `a_share_reaches_its_recipient_only` |
+| 18 | *The recipient's own edit* of the received file | Never written over; a later version waits until they remove their copy | `updates_and_unsharing` |
+| 19 | **Hostile input**: paths with `..`, huge records, many devices, many shares, malformed bodies, no session | Refused (400, 422, 401), never stored; at most 64 KiB, 64 devices, 256 shares per person and project | `the_share_routes_refuse_what_may_not_be_shared` |
+
+**Residual risks** (recorded, not closed here):
+* **What was received stays received.** An unshare, a removed device or a
+  person leaving stops later versions only; rotate the secret.
+* **Freshness** (row 11), as for rings.
+* **The recipient learns the path's name** (a file of a folder they may not
+  see): the sharer chose to give them that file.
+* **A sharer's insider choices** (row 14), and what the file holds: a
+  shared `.envrc` is a shell script that direnv runs once the person allows
+  it. A share never writes over an existing file.

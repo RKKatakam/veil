@@ -3,7 +3,7 @@
 
 # `vl secret`
 
-Encrypted secrets: the device-local vault, or a scope's team vault (`--scope`), sealed for the scope's members (it does not sync through the Veil server yet)
+Encrypted secrets: the device-local vault, or a scope's team vault (`--scope`), sealed for the scope's members (it does not sync through the Veil server yet); and secret files shared from one member to another (`share`, `unshare`, `shares`)
 
 Subcommands:
 
@@ -14,6 +14,9 @@ Subcommands:
 * [`vl secret files`](#vl-secret-files): List the vault's backups of isolated files (`.env` & co), including those of files gone from the working copy (kept 30 days)
 * [`vl secret recover`](#vl-secret-recover): Write the vault's backup of an isolated file back into the working copy (never over an existing file)
 * [`vl secret import`](#vl-secret-import): Import KEY=VALUE lines from a dotenv file
+* [`vl secret share`](#vl-secret-share): Share one secret file (`.env`, …) with another member of the project, without an admin
+* [`vl secret unshare`](#vl-secret-unshare): Stop sharing a secret file with a person: they get no later version. What they already received stays theirs
+* [`vl secret shares`](#vl-secret-shares): List the secret shares you make and receive (admins: every share of the project), never their content; receives what is new for you
 
 ## `vl secret set`
 
@@ -127,6 +130,65 @@ Arguments:
 | | |
 |---|---|
 | `<FILE>` | Dotenv file to read (required) |
+
+## `vl secret share`
+
+Share one secret file (`.env`, …) with another member of the project, without an admin.
+
+A copy of that one file is sealed on this device for the person's confirmed devices only (confirmed outside the server, as for every key): it opens nothing else of its folder. Your later edits of the file, and their newly confirmed devices, reach them in the background until you unshare it. Admins see that it is shared (who, what path, when), never what it holds. Their `vl pull` writes it at the same path, where it stays on their device (and reaches their agents with `vl ws exec --with-isolated`).
+
+```text
+vl secret share [OPTIONS] --with <PERSON> <PATH>
+```
+
+Arguments:
+
+| | |
+|---|---|
+| `<PATH>` | The secret file, in the working copy (required) |
+
+Options:
+
+| | |
+|---|---|
+| `--with <PERSON>` | The person to share it with (required) |
+| `--confirm <FINGERPRINT>` | A device fingerprint of theirs you compared with them (needed when no key ring records a device of theirs yet) |
+| `--json` | Print one JSON document instead of text (its schema is named in its `schema` field; see docs/reference/json.md). Errors then also print a `veil.error/1` document |
+
+## `vl secret unshare`
+
+Stop sharing a secret file with a person: they get no later version. What they already received stays theirs
+
+```text
+vl secret unshare [OPTIONS] --from <PERSON> <PATH>
+```
+
+Arguments:
+
+| | |
+|---|---|
+| `<PATH>` | The secret file (required) |
+
+Options:
+
+| | |
+|---|---|
+| `--from <PERSON>` | The person you shared it with (required) |
+| `--json` | Print one JSON document instead of text (its schema is named in its `schema` field; see docs/reference/json.md). Errors then also print a `veil.error/1` document |
+
+## `vl secret shares`
+
+List the secret shares you make and receive (admins: every share of the project), never their content; receives what is new for you
+
+```text
+vl secret shares [OPTIONS]
+```
+
+Options:
+
+| | |
+|---|---|
+| `--json` | Print one JSON document instead of text (its schema is named in its `schema` field; see docs/reference/json.md). Errors then also print a `veil.error/1` document |
 
 ---
 
