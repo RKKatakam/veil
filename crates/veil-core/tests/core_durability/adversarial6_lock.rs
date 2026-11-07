@@ -72,15 +72,17 @@ fn a_symlinked_lock_or_guard_is_diagnosed_at_once() {
         }
         std::os::unix::fs::symlink("/nonexistent", dir.path().join(".veil").join(name)).unwrap();
         let b: Arc<dyn StorageBackend> = backend;
-        let started = std::time::Instant::now();
         let opts = veil_core::lock::LockOptions {
             lease: Duration::from_millis(200),
             ..veil_core::lock::LockOptions::default()
         };
-        let r = within(Duration::from_secs(60), move || RepoLock::acquire_with(b, &opts).map(|_| ()));
-        let err = r.expect("acquire hung").expect_err("acquired through a symlink");
+        // How long it waited, on a simulated clock (BUG-970), against the
+        // whole wait (15 s).
+        let r = within(Duration::from_secs(60), move || crate::acquire_counting_wait(&b, &opts));
+        let (r, waited) = r.expect("acquire hung");
+        let err = r.map(|_| ()).expect_err("acquired through a symlink");
         let msg = err.to_string();
         assert!(msg.contains(&format!(".veil/{name} is a symlink")) && msg.contains("remove"), "{name}: {msg}");
-        assert!(started.elapsed() < Duration::from_secs(5), "{name}: took {:?}", started.elapsed());
+        assert!(waited < Duration::from_secs(5), "{name}: waited {waited:?}");
     }
 }

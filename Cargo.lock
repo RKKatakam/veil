@@ -3081,6 +3081,8 @@ dependencies = [
  "hyper-util",
  "proptest",
  "rcgen",
+ "regex",
+ "regex-syntax",
  "reqwest",
  "rustls",
  "rustls-webpki",

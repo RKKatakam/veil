@@ -45,6 +45,7 @@ Global options (accepted by every command):
 | [`vl evolog`](evolog.md) | Show how a change evolved (amends, rewrites, rebases) |
 | [`vl blame`](blame.md) | Show which change last touched each line of a file |
 | [`vl grep`](grep.md) | Search the files of a snapshot (never the working copy's local-only files) for a pattern |
+| [`vl search`](search.md) | Search the project on its Veil server: code at a branch tip, ranked, or file names over all of its history (`--path`) |
 | [`vl bisect`](bisect.md) | Find the change that introduced a problem by binary search |
 | [`vl describe`](describe.md) | Set the description of a change |
 | [`vl new`](new.md) | Start a new change on top of REVS (default: @). Several = merge |
@@ -90,5 +91,5 @@ Global options (accepted by every command):
 | [`vl man`](man.md) | Print the man page (`vl man \| man -l -`), or write one page per command into DIR |
 
 The read commands (`status`, `log`, `diff`, `show`, `workspace list`, `tag list`, `op log`,
-`scan`, `secret list`, `ls`, `resolve --list`, `blame`, `grep`, `attr check`) take `--json`, and so do `split`,
+`scan`, `secret list`, `ls`, `resolve --list`, `blame`, `grep`, `search`, `attr check`) take `--json`, and so do `split`,
 `squash`, `duplicate` and `cherry-pick`: their schemas are in [JSON output](json.md).

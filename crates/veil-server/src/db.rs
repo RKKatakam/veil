@@ -44,6 +44,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (9, "secret_shares", include_str!("../migrations/0009_secret_shares.sql")),
     (10, "view_graph", include_str!("../migrations/0010_view_graph.sql")),
     (11, "landing", include_str!("../migrations/0011_landing.sql")),
+    (16, "search", include_str!("../migrations/0016_search.sql")),
 ];
 
 pub async fn connect(url: &str, max: u32) -> anyhow::Result<PgPool> {
@@ -229,7 +230,14 @@ where
                     // Whatever the outcome, the request may have changed
                     // something now: [`retry_requests`] does not run it again.
                     let _ = COMMITTED.try_with(|c| c.set(true));
-                    r
+                    // A commit that timed out may have committed: neither is
+                    // `f` run again (BUG-890).
+                    match r {
+                        Err(Error::Db(e)) if e.as_database_error().is_some_and(|d| crate::error::is_rpc_timeout(d.message())) => {
+                            Err(Error::Other(anyhow::Error::new(e).context("the commit timed out; its outcome is unknown")))
+                        }
+                        r => r,
+                    }
                 }
                 Err(e) => {
                     let _ = tx.rollback().await;

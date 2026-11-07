@@ -145,23 +145,38 @@ fn a_server_stops_when_its_repository_or_socket_moves() {
 }
 
 /// BUG-485: a request that arrives before the once-a-second check is
-/// refused by the request's own check, and stops the server.
+/// refused by the request's own check, and stops the server. Another
+/// repository takes the path at once (made beforehand, then renamed in), so
+/// the request follows the move within microseconds; should the accept
+/// loop's check still come first (a loaded machine), the connection closes
+/// unanswered, which is as safe, and the case is tried again (BUG-1010: the
+/// newcomer used to be made between the move and the request, which took
+/// longer than a second under load).
 #[test]
 fn a_request_after_a_move_is_refused_at_once() {
     let env = Env::new();
-    let proj = env.project(U, "proj", &[("old.txt", "old\n")]);
-    let mut server = Server::start(&env, &proj);
-    // A connection made before the move goes with the server.
-    let mut c = UnixStream::connect(proj.join(".veil/local/sock")).unwrap();
-    std::fs::rename(&proj, env.root.join("proj-old")).unwrap();
-    let newcomer = env.project(U, "proj", &[("new.txt", "new\n")]);
-    c.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"commit\",\"params\":{\"message\":\"meant for old\"}}\n").unwrap();
-    let mut answer = String::new();
-    BufReader::new(&c).read_line(&mut answer).unwrap();
-    assert!(answer.contains("\"error\"") && answer.contains("moved or replaced"), "{answer}");
-    assert!(server.exits_within(10).is_some(), "the server kept running");
-    let log = env.stdout(U, &newcomer, &["--no-snapshot", "log"]);
-    assert!(!log.contains("meant for old"), "{log}");
+    for attempt in 0..5 {
+        let (name, new) = (format!("proj{attempt}"), format!("new{attempt}"));
+        let proj = env.project(U, &name, &[("old.txt", "old\n")]);
+        let staged = env.project(U, &new, &[("new.txt", "new\n")]);
+        let mut server = Server::start(&env, &proj);
+        // A connection made before the move goes with the server.
+        let mut c = UnixStream::connect(proj.join(".veil/local/sock")).unwrap();
+        std::fs::rename(&proj, env.root.join(format!("{name}-old"))).unwrap();
+        std::fs::rename(&staged, &proj).unwrap();
+        let newcomer = proj;
+        let sent = c.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"commit\",\"params\":{\"message\":\"meant for old\"}}\n").is_ok();
+        let mut answer = String::new();
+        let _ = BufReader::new(&c).read_line(&mut answer);
+        assert!(server.exits_within(10).is_some(), "the server kept running");
+        let log = env.stdout(U, &newcomer, &["--no-snapshot", "log"]);
+        assert!(!log.contains("meant for old"), "{log}");
+        if sent && !answer.is_empty() {
+            assert!(answer.contains("\"error\"") && answer.contains("moved or replaced"), "{answer}");
+            return;
+        }
+    }
+    panic!("in 5 tries, the server's own check always stopped it before the request arrived");
 }
 
 /// A server whose connection timeouts are `idle`, `request` and `evict`

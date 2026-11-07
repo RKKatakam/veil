@@ -5,6 +5,10 @@
 //!             [--storage DIR | --s3-endpoint URL --s3-bucket B]
 //!             [--tls-cert cert.pem --tls-key key.pem]   (default: self-signed)
 //! veil-server migrate --database-url postgres://…   (apply migrations, then exit)
+//! veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
+//!             [--listen 127.0.0.1:8444] [--size 10G] [--memory 128M] [--max-connections 1024]
+//!             [--upstream-ca PEM]
+//!             (a regional cache: docs/HUB.md §13.18)
 //! ```
 //!
 //! On `SIGUSR1` the server writes its request-path counters (storage
@@ -65,6 +69,54 @@ enum Command {
         #[arg(long)]
         database_url: Option<String>,
     },
+    /// Run a regional cache of the object routes in front of a Veil
+    /// server (`docs/HUB.md` §13.18). It holds objects only, no key and no
+    /// database, and serves one only under a grant the server signed.
+    Cache {
+        /// The Veil server: `https://host:port`.
+        #[arg(long)]
+        upstream: String,
+        /// The server's certificate (PEM), for a self-signed one.
+        #[arg(long)]
+        upstream_ca: Option<PathBuf>,
+        /// The file holding the server's `hub-cache-token`.
+        #[arg(long)]
+        token_file: PathBuf,
+        /// The cache's directory (its objects, its certificate).
+        #[arg(long)]
+        dir: PathBuf,
+        /// Address to listen on (HTTPS).
+        #[arg(long, default_value = "127.0.0.1:8444")]
+        listen: SocketAddr,
+        /// Most bytes of objects kept on disk (K, M, G suffixes).
+        #[arg(long, default_value = "10G", value_parser = bytes)]
+        size: u64,
+        /// About the most memory for decoded trees, the store's index,
+        /// batch requests and answers being sent (K, M, G suffixes).
+        #[arg(long, default_value = "128M", value_parser = bytes)]
+        memory: u64,
+        /// Most client connections open at once (the next waits until one
+        /// closes): each may hold about 352 KiB beyond --memory (its TLS and
+        /// HTTP buffers), so the defaults bound the cache at about 480 MiB.
+        #[arg(long, default_value_t = 1024)]
+        max_connections: usize,
+        /// TLS certificate chain (PEM); without it, a self-signed certificate.
+        #[arg(long, requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+        #[arg(long)]
+        tls_key: Option<PathBuf>,
+    },
+}
+
+/// `123`, `64K`, `256M`, `10G`.
+fn bytes(s: &str) -> Result<u64, String> {
+    let (n, shift) = match s.char_indices().last() {
+        Some((i, 'K' | 'k')) => (&s[..i], 10),
+        Some((i, 'M' | 'm')) => (&s[..i], 20),
+        Some((i, 'G' | 'g')) => (&s[..i], 30),
+        _ => (s, 0),
+    };
+    n.parse::<u64>().ok().and_then(|n| n.checked_mul(1 << shift)).filter(|n| *n > 0).ok_or_else(|| format!("{s}: a size such as 512M or 10G"))
 }
 
 fn database_url(given: Option<String>) -> anyhow::Result<String> {
@@ -105,6 +157,23 @@ async fn serve() -> anyhow::Result<()> {
         veil_server::db::migrate(&db).await?;
         println!("veil-server: the database schema is current");
         return Ok(());
+    }
+    if let Some(Command::Cache { upstream, upstream_ca, token_file, dir, listen, size, memory, max_connections, tls_cert, tls_key }) = a.command {
+        return cache(veil_server::cache::Config {
+            listen,
+            upstream,
+            upstream_ca: upstream_ca.map(std::fs::read_to_string).transpose()?,
+            token: std::fs::read_to_string(&token_file).map_err(|e| anyhow::anyhow!("reading {}: {e}", token_file.display()))?,
+            dir,
+            tls: match (tls_cert, tls_key) {
+                (Some(cert), Some(key)) => TlsSource::Files { cert, key },
+                _ => TlsSource::SelfSigned,
+            },
+            size,
+            memory,
+            max_connections,
+        })
+        .await;
     }
     let data = a.data.expect("clap requires --data");
     let storage = match a.s3_endpoint {
@@ -153,6 +222,33 @@ async fn serve() -> anyhow::Result<()> {
                     eprintln!("veil-server: writing {}: {e}", path.display());
                 }
             }
+        }
+    }
+    running.stop().await;
+    Ok(())
+}
+
+/// Run a regional cache until interrupted; `SIGUSR1` writes its counters to
+/// `DIR/stats.json`.
+async fn cache(config: veil_server::cache::Config) -> anyhow::Result<()> {
+    let dir = config.dir.clone();
+    let running = veil_server::cache::start(config).await?;
+    println!("veil-server cache listening on https://{}", running.addr);
+    let mut usr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    let write = |n: u64| {
+        let mut v = veil_server::cache::stats_json(&running.cache);
+        v["n"] = n.into();
+        let (path, tmp) = (dir.join("stats.json"), dir.join("stats.json.tmp"));
+        if let Err(e) = std::fs::write(&tmp, v.to_string()).and_then(|_| std::fs::rename(&tmp, &path)) {
+            eprintln!("veil-server cache: writing {}: {e}", path.display());
+        }
+    };
+    write(0);
+    let mut n = 0;
+    loop {
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => { r?; break; }
+            _ = usr1.recv() => { n += 1; write(n); }
         }
     }
     running.stop().await;

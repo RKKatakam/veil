@@ -2194,6 +2194,244 @@ signed request can be replayed within ±5 minutes
 by whoever saw it (inside TLS: a cache, which is inside the boundary); it
 returns the same objects. Grants are made per branch at every tips request
 (one signature each). Not built (later milestones): `POST …/grants` for
+older snapshots, the Veil daemon, `vl` reading through these routes (S3,
+S6). Regional caches: S9, §13.18.
+
+### 13.18 S9: the regional cache (built)
+
+Design: `docs/design/server/phase-2-thin-clients.md` §4.1–§4.4, the S9 row
+of §9, and product decision 1 (removal at caches takes about 2 s, at most
+5). Code: `crates/veil-server/src/cache/` (`mod.rs` the routes and the
+decision, `epochs.rs` what the cache knows of access epochs, `disk.rs` its
+store, `relay.rs` passing the server's answers on, `feed.rs` the server's
+side); `veil-server cache` in `main.rs`. Touched elsewhere, minimally:
+`api.rs` (one route), `lib.rs` (the caches' token, `serve_tls` shared),
+`grant.rs` (`skip`, and its header parsers shared), and
+`veil_core::hub::grant::BatchRequest` (`skip`).
+
+```text
+veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
+                  [--listen 127.0.0.1:8444] [--size 10G] [--memory 128M]
+                  [--max-connections 1024] [--upstream-ca PEM] [--tls-cert C --tls-key K]
+```
+
+* **What it answers.** S5's object routes only, as the server answers
+  them: `GET /v1/objects/{p}/{id}` (with `Range`) and `POST
+  /v1/objects/{p}:batch`, the same headers, bodies, statuses and order.
+  Tips, grants, history, pushes and every other route go to the server; a
+  cache never says what `main` is. It holds **no database, no session, no
+  key and no permission authority**: only objects, the server's grant key
+  (public) and the caches' token.
+* **When it serves from its store** (in this order, nothing looked up
+  before its turn): the grant verifies under the server's grant key, for
+  this project, not expired; the request is signed by the grant's device
+  (§13.16); the grant's project epoch and its device's person epoch were
+  confirmed current by the server at most 5 s ago; the want's chain starts
+  at the grant's root and each step is an entry of a tree in the store
+  (`veil_core::hub::grant::Chains`, the server's own check), and only then
+  is the object looked up. An invalid grant or signature is `401
+  grant_invalid`, and a chain the root does not reach is `404` or left out
+  of a batch, as at the server; both are final, since trees are addressed
+  by their content and the cache reads only those it reached. **Everything
+  else goes to the server, with the client's own signed request:** the
+  grant key not known yet, epochs not confirmed (a first request, a stale
+  feed, an epoch other than the grant's), a tree of the chain or the object
+  not in the store. A batch is forwarded once, with `skip` naming the
+  objects the cache sends itself (unsigned: it only makes the answer
+  smaller; optional, so no protocol revision: a server that does not know
+  it sends everything, and the cache drops what it already sent), and the
+  answer merges both in the request's order. An id wanted again after a
+  want only the server can decide sends the whole batch to the server,
+  answered unchanged, since where the server places it depends on which of
+  its wants the server allows (BUG-1182). What the
+  server sends is kept (whole objects of at most 16 MiB, each checked
+  against its id). A refusal from the server is passed on as it is; a
+  server the cache cannot reach is `503 unavailable`. **Concurrent misses are
+  coalesced:** a request fetching objects whose chain checked and that the
+  store keeps (at most 16 MiB) marks them in flight (at most 256 a request,
+  65,536 in all), and a later request needing one of them waits for that
+  fetch (at most 2 s), then decides again from the store, so every agent
+  reading a new tree after a landing costs the server one request (tested:
+  24 readers at once, 1 request). A mark is let go once its object is kept,
+  all of them once the server's answer has passed, and all of them before
+  the request waits for the budget, or for its client past 100 ms: a client
+  that stalls holds none for longer (BUG-1180). A local object lost
+  between the check and the read (evicted, damaged) is left out of a batch
+  (the client asks again; the cache, which removed it, then asks the
+  server).
+* **Access epochs: the feed for caches.** `POST /v1/cache/epochs {projects,
+  devices}` (`feed.rs`), with the header `Veil-Cache-Token`, answers the
+  grant key, each named project's epoch and each named device's person
+  epoch, and leaves out a project that does not exist and a device that is
+  removed or pending (both void their grants), the same values
+  `Grants::current` reads for the server's own check, in two statements.
+  **Only the server's caches may ask:** the token is `<data>/hub-cache-token`
+  (32 random bytes, 0600, made at the first start; servers sharing a data
+  directory share it), compared by hash; a session, even an admin's, is
+  refused, since epochs tell who had an access change (BUG-1081). The cache
+  polls it every second for every project and device a grant named in the
+  last 15 minutes (a grant's life and the request skew; at most 100,000 of
+  each, 50,000 keys a request), and at once (within 50 ms) when a grant
+  names a new one.
+* **Removal within the bound.** A key's confirmation is the time its poll
+  was *sent*, so an access change committed at time R is in every poll sent
+  after R: the cache serves under a grant it voided only until R + 5 s at
+  the latest, and in practice within one poll (tested: a person removed from
+  a group, a policy that stopped `src/` being public, a device an admin
+  removed; refused at the cache 26–232 ms after the change returned, the
+  bound asserted). **Without the feed it fails closed:** 5 s after its last
+  answer nothing is served from the store, public objects included (a
+  policy change can make a public folder private), and every request goes
+  to the server (or gets `503`); it serves again at the next answer.
+* **The store** (`disk.rs`): objects as the server sends them (canonical
+  encodings; secret files stay ciphertext), keyed by a hash of the
+  project's name and the id (so projects never share an entry, and the
+  directory names no project), least recently used out first within
+  `--size` bytes and an entry count from `--memory`. Every object is checked
+  against its id when written and each time it is read: one that does not
+  match is removed and read as absent. A restart keeps the store.
+* **Memory** (`--memory`, default 128 MiB): a quarter for decoded trees, a
+  quarter for the store's index (128 bytes an object), an eighth (at least
+  12 MiB) for batch requests and three eighths for answers. **Answers**
+  (BUG-1181): every chunk of every answer (from the store, passed on from
+  the server, an error) and every object being kept takes its share of the
+  budget, and the share travels inside the bytes handed to the connection
+  (`Bytes::from_owner`), given back only once they are written. Answers go
+  out in 64 KiB slices, **each with its own share**, and an object of the
+  store larger than a slice is read a slice at a time, its hash checked as
+  the slices go and its last slice sent only once the whole matched (one
+  that does not is removed and its answer ends unfinished, an error to the
+  client, never a whole answer with wrong bytes), so a slow client holds a
+  slice or two of the budget whatever the object's size (BUG-1186). **No
+  answer waits for the budget while holding any of it** (BUG-1185): it
+  sends what it gathered first, and gives up keeping an object it is
+  collecting (its bytes and share: it is then not kept, and nobody waits
+  for it) before it waits, and before it waits for its client past 100 ms,
+  so every share taken is free or on its way to a client, answers never
+  wait on each other, and a slow client never holds an object's share; a
+  `GET` from the store sends its head at once and its bytes once their
+  shares are free. **Batch
+  requests** (BUG-1184): a body is read only under a share of the
+  requests' pool, three times its length (the parsed request, the copy sent
+  to the server, the answer's plan), taken in one step before reading for
+  the length it declares (a body of unknown length starts with a slice's
+  share and grows it only while it is free), and held until its answer
+  ends. The pool is always taken before the answers' budget, never while
+  holding it. The cache decides bodies of at most 4 MiB (about 20,000 wants
+  two folders deep); a larger body, or one whose share is not free, goes to
+  the server as it arrives, a chunk at a time, and the server's answer is
+  passed on as it is (its own 64 MiB limit and checks apply), so the cache
+  never holds it and its answers stay the server's at any size. **Outside
+  `--memory`, per connection, by its buffers' limits:** to the client, TLS
+  records being received (one record of 16 KiB being assembled, and up to
+  32 KiB decrypted ahead: 50 KiB), TLS records to send (one record, 16 KiB:
+  the cache sets rustls's 64 KiB default down) and the HTTP read buffer
+  (64 KiB; the HTTP write side holds only slices under the budget: HTTP/1.1
+  only, since HTTP/2 keeps a send buffer per stream), about 130 KiB; to the
+  server, for an answer passed on, its TLS records received (50 KiB) and its
+  HTTP read buffer, which holds the chunk the answer is waiting to send
+  (records arrive at most two per read, so it stays within 64 KiB, and
+  128 KiB while a chunk is out), or, for a body passed on as it arrives,
+  two chunks of it (64 KiB each) and the TLS records to send (80 KiB):
+  about 220 KiB. **So a connection holds at most about 352 KiB beyond
+  `--memory`,** and at most `--max-connections` (default 1,024) are open,
+  the next waiting in the listener's queue: **the cache holds at most
+  `--memory` + 352 KiB × `--max-connections`, about 480 MiB with the
+  defaults,** besides its fixed costs and the kernel's socket buffers
+  (measured: 192 clients stalled on cold answers grow it by 6 MiB, about
+  32 KiB each, since the kernel's buffers take most of each answer; 8
+  bodies of 56 MiB that stop before their end, by 9 MiB).
+* **Every connection slot comes back in bounded time** (BUG-1183): a TLS
+  handshake within 20 s, a request's head within 20 s (and an idle
+  keep-alive connection is closed after 20 s), and its body due at an
+  average of 16 KiB/s (128 kbit/s, a slow mobile link) after a 20 s grace,
+  checked before each read, so a body of `n` bytes takes at most 20 s +
+  `n` / 16 KiB/s (at most 4 min 36 s for the largest the cache decides,
+  68 min for the server's 64 MiB limit), else `408` and the connection is
+  closed. The answer: a write pending for 30 s closes the connection, and
+  so does one that would bring the time its writes have waited, over the
+  connection, past 30 s plus a second per 16 KiB written, so a client
+  reading at 16 KiB/s or faster is never cut off, and an answer of `n` bytes
+  holds its slot (and its shares) for at most 30 s + `n` / 16 KiB/s of a
+  slow client's reading, besides waits for the budget, which are bounded
+  by the same limits on the answers holding it.
+* **Only `https://` upstreams:** the caches' token and the grant key never
+  cross the network in clear; any other `--upstream` is refused at start.
+* **Counters:** `SIGUSR1` writes `DIR/stats.json` (requests, objects from
+  the store and from the server, refusals, requests forwarded and why,
+  polls), for `veil-bench load --mode objects --via server,cache`
+  (`scripts/bench-server.sh cache`).
+
+**Measured** (`scripts/bench-server.sh cache` on `s9-cycle3`, after cycle
+3's fixes, release builds, the cache at its defaults, `--memory 128M` and
+1,024 connections; the server, the cache, PostgreSQL, MinIO and the agents
+on one 32-thread machine; load 14.8 at the start, 71 at the end, so
+throughputs are noisy). A read is a fresh thin workspace's: the tips, then
+the root, `w/`, `w/seed/` and 100 of its 4 KiB files (103 objects, 4
+requests), signed:
+
+| `main` | Agents | Via | Reads/s | p50 / p99 (ms) | Server CPU per read | Cache hits | Cache requests to the server per read | Cache CPU per read | Cache peak |
+|---|---:|---|---:|---|---:|---:|---:|---:|---:|
+| still | 10 | server | 2,564 | 3.8 / 5.7 | 2.52 ms | | | | |
+| still | 10 | cache | 2,513 | 3.9 / 5.7 | 0.19 ms | 100 % | 0.00 | 2.50 ms | 39 MiB |
+| still | 100 | server | 4,570 | 21.4 / 34.0 | 2.48 ms | | | | |
+| still | 100 | cache | 3,818 | 25.5 / 43.3 | 0.19 ms | 100 % | 0.00 | 2.94 ms | 98 MiB |
+| still | 1,000 | server | 3,693 | 263 / 439 | 2.53 ms | | | | |
+| still | 1,000 | cache | 4,062 | 241 / 400 | 0.20 ms | 100 % | 0.00 | 3.13 ms | 185 MiB |
+| 20 landings/s | 10 | server | 2,334 | 4.2 / 6.7 | 2.66 ms | | | | |
+| 20 landings/s | 10 | cache | 2,605 | 3.7 / 6.4 | 0.22 ms | 99.99 % | 0.02 | 2.44 ms | 36 MiB |
+| 20 landings/s | 100 | server | 3,674 | 24.0 / 125 | 2.54 ms | | | | |
+| 20 landings/s | 100 | cache | 4,389 | 22.3 / 34.3 | 0.22 ms | 99.99 % | 0.01 | 3.02 ms | 100 MiB |
+| 20 landings/s | 1,000 | server | 3,686 | 265 / 481 | 2.53 ms | | | | |
+| 20 landings/s | 1,000 | cache | 3,837 | 254 / 454 | 0.24 ms | 99.98 % | 0.02 | 3.16 ms | 179 MiB |
+
+Gates met: at least 99 % of objects from the cache's store, its peak at
+most 512 MiB (the defaults' bound is about 480 MiB; before cycle 3, at
+`--memory 256M`, 221–281 MiB at 1,000 agents). The server's CPU per read
+falls about 11× (it answers the tips only); the cache spends about what the
+server did. Neither the slices with a share each, the smaller pools nor
+the time limits cost throughput measurable here (cycle 2, at `9b66cff`:
+3,814–4,555 reads/s at 100 and 1,000 agents, as noisy; a run of this branch
+before BUG-1186's fix: 4,388–5,035). On one machine the cache competes with
+the server for the same cores, so throughput and latency through it are not
+a regional win; what it removes is the server's work. Coalescing keeps
+requests to the server at 0.02 per read while `main` moves 20 times a
+second.
+
+**Threat review** (design §6 rows 1–4, 8, 9, 14, 15, 17, plus this
+milestone's):
+
+| # | Attacker | Tries | Result | Test (`server_hub::cache`) |
+|---|---|---|---|---|
+| 1 | Person without access to a folder | asks the cache, which holds every object of the project (the admin read them through it), for every real object id with every chain they can build: their trees, the admin's chain, the admin's chain from their root, the admin's root | nothing served; one at a time the server's own `404`; no request answered from the store | `the_cache_serves_only_what_a_grant_reaches` (5 viewers, anyone on Earth included, cold and warm) |
+| 2 | Same | a real grant with a chain through another snapshot's or the admin's trees | refused: chains start at the grant's root, each step from the hash-checked store | same |
+| 3 | Anyone holding a copy of a grant | uses it at the cache unsigned, from another device, over other ids, 6 minutes old, re-signed by the server's identity key, with a wider root, expired | `grant_invalid`, the object in the store untouched | `grants_at_the_cache_hold_only_for_their_device_and_time` |
+| 4 | A person removed from a group; a project whose policy changed; a device an admin removed | keeps using a grant at the cache, which holds the objects | refused within 5 s (measured 26–232 ms), and never served again | `a_removed_person_is_refused_at_the_cache_within_the_bound` |
+| 5 | Same, with the feed cut (a partition, a dead server) | keeps using a grant | 5 s after the last answer nothing from the store, public included; `503`; served again once the feed is back | `the_cache_fails_closed_without_the_feed` |
+| 6 | A local process, a torn write | changes bytes in the store | the object fails its id check, is removed, and comes from the server; never wrong bytes; a large one read in slices ends its answer unfinished (`GET`, a range, a batch) | `a_damaged_object_in_the_cache_is_never_served`, `s9_cycle2::a_large_damaged_object_ends_its_answer_unfinished`; unit tests in `disk.rs` |
+| 7 | Anyone | a grant of one project at another project's URL | `grant_invalid`; entries are per project | test 1 |
+| 8 | Anyone on Earth; a signed-in person, an admin | reads the feed for caches (no token, a wrong one, a session) | `401`, naming nothing | `the_epoch_feed_for_caches_needs_the_caches_token` |
+| 9 | Hostile input | malformed grants (non-hex, 10 KB), chains of `MAX_CHAIN + 5`, non-hex chains and signatures, more than `MAX_WANTS` wants, bad JSON, routes the cache does not serve, a `Range` past the end or on a hidden object; a feed request with 50,001 keys, unknown fields, wrong types | refused cleanly (400/401/404/416), as at the server | tests 3 and 8 |
+| 10 | — (a cache that loses an object) | an object evicted or damaged between check and read | left out of a batch; the client asks again and the server sends it | `the_cache_store_keeps_to_its_size` (a 64 KiB store under 200 files of 4 KiB) |
+| 11 | A compromised regional cache | reads what it stores, serves it to anyone | plain-text code, as the server holds it (inside its boundary, design §4.1; `ARCHITECTURE.md` "Threat model"): as trusted as the object store; secret files only as ciphertext; it cannot sign a grant | the store holds no plaintext of `billing/.env` (test 1) |
+| 12 | — (load) | every agent reads a new tree after a landing | one request to the server per object, not one per reader | `concurrent_readers_of_a_new_object_cost_the_server_one_request` |
+| 13 | Anyone on Earth | stalls many answers (a 15 MiB public object, 16 clients that never read); opens many connections | the budget holds: 2 answers read at a time at `--memory 64M`; connections past `--max-connections` wait | `s9_adversarial::bug_1181_…`, `connections_past_the_cap_wait_for_one_to_close` |
+| 14 | Anyone on Earth | fills the in-flight marks (a 70,000-want batch, a 17 MiB object, a client that never reads) | nothing marked that no one can use; coalescing holds for others | `s9_adversarial::bug_1180_…` (both) |
+| 15 | Anyone | a batch naming an id twice, through a tree the cache lacks and then held ones; random batches over random caches | the server's answer, byte for byte | `s9_adversarial::bug_1182_…`, `…::the_caches_answers_are_the_servers_byte_for_byte` |
+| 16 | An operator's mistake | `--upstream http://…` | refused at start | `cache::tests::an_upstream_that_is_not_https_is_refused` |
+| 17 | Anyone on Earth | sends a batch's head and a few bytes of its body, then stops; reads an answer a few bytes at a time | `408` after 20 s, the slot given back (a third client served at 20 s with a cap of 2); writes cut off below 16 KiB/s after a 30 s grace | `s9_cycle2::bug_1183_…`; `cache::deadline::tests::a_client_reading_below_the_minimum_rate_is_cut_off` |
+| 18 | Anyone on Earth | 8 batch bodies of 56 MiB that stop before their end | the cache's process grows 9 MiB at `--memory 64M` (466 MiB before) | `s9_cycle2::bug_1184_…` (the cache as its own process) |
+| 19 | Anyone on Earth, clients reading normally | many large cold reads at once (four of 10 MiB through a 20 MiB budget; 16 `GET`s and batches of 40 MiB) | every answer completes; a small `GET` afterwards in 5–13 ms (before: 0 of 4 within 60 s, and the cache stuck) | `s9_cycle2::bug_1185_…`, `…::many_large_cold_reads_at_once_all_complete` |
+| 20 | Anyone on Earth, given a large public file | reads it from the store slowly (two clients of 15 MiB at 32 KiB/s, above the minimum) | each holds a slice or two of the budget; a `GET` of the root beside them in 8 ms (before: still waiting after 20 s) | `s9_cycle2::bug_1186_…` |
+
+**Residual:** the cache answers a request it can decide faster than one it
+forwards, so timing tells whether trees and objects the asker may read are
+in its store (that someone recently read a file they may read; design row
+14, accepted). A grant voided by an access change is still served from the
+store for up to one poll after the change (about a second, at most 5 s: the
+owner's bound). Not built: `vl` reading through the
+cache (S3), the Veil daemon (S6), the public CDN URLs of design §4.3.
+
 older snapshots, caches, `vl` reading through these routes (S3, S6).
 
 ### 13.19 S17: the landing service (as built)
@@ -2366,3 +2604,44 @@ Threat review (phase 4 §6, rows 1–4, and what S17 adds), tests in
 | 12 | Any participant | lands after a pause, or with a view the service does not keep | stalls every landing on the branch | no walk in the service: incremental projections, background fills | `bug_1106_…`, `bug_1100_…` |
 | 13 | Ordinary agents | many one-line changes in a 30,000-file folder | the server out of memory | batches bounded in bytes | `bug_1107_…` (in a child process) |
 
+### 13.23 S15: search (built)
+
+Design: `docs/design/server/phase-3-server-history.md` §3.5 and its §13
+(as built, with the threat review and the measurements). Code:
+`crates/veil-server/src/search/` (`index.rs` builds the index, `segment.rs`
+its pieces, `pattern.rs` what a query asks, `mod.rs` the routes), migration
+`0016_search.sql`, two routes in `api.rs`, one call after each landing's
+derivation (`derive::landing`), and `vl search`. No repository format
+change; nothing new is encrypted.
+
+* **Routes** (`/v1/projects/{p}/q/…`, answers carry `policy_version` and
+  `work`): `GET search?q=&rev=&kind=&path=&lang=&n=&after=` ranks files by
+  their content at a branch tip (`kind=code`, `veil.search/1`) or by name
+  over every path the project's history held (`kind=path`);
+  `GET grep?pattern=&rev=&i=&path=&n=&after=` lists the lines matching a
+  regular expression (linear-time `regex`), file by file in tree order,
+  through the index at a branch tip and by a scan of the viewer's tree at
+  any other revision (`veil.hub-grep/1`; S16 renders it as `vl grep`).
+* **Sharded by access line.** The index is derived data on real history,
+  in shards named by S12's line keys: a file's document is in the shard of
+  the line deciding its path. A query opens only the shards of the lines
+  its viewer reads, so every hit, count, ranking statistic (BM25 over the
+  viewer's shards), page and `work` counter is computed from what the
+  viewer may read: the same, byte for byte, as on a copy of the project
+  holding only their projected history.
+* **Secrets** are indexed by path only (their objects are never opened);
+  **embargo lines** are never indexed or walked; who reads a line is not
+  part of its key, so access changes apply at the next request, and a new
+  policy that changes which paths a line decides answers `indexing` (503)
+  until the shards whose keys changed are rebuilt.
+* **Every branch, always caught up** (BUG-1231): each update also takes
+  every branch whose index is behind its tip, and the server resumes them
+  at start; an answer from an index still catching up says so (`behind`,
+  with `tip_id`, in the viewer's ids).
+* **Bounded** (BUG-1230, BUG-1232): candidates are streamed (postings
+  intersected as decoded, segments merged in tree order) and a query stops
+  at its bound; the deadline is checked inside every loop and before each
+  line a grep searches; a line longer than the pattern's size allows is not
+  searched (`long_lines_skipped`).
+* `vl search WORDS… [--path] [--lang LANG] [-r BRANCH] [-n N] [--json] [-- PATH]`
+  prints the server's answer (exit 1 when nothing matched).

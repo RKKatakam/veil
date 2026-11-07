@@ -758,6 +758,33 @@ impl Client {
         };
         self.json("POST", &self.url.project_path("/shares/remove"), Some(&req))
     }
+
+    /// A query route (`GET …/q/ROUTE?PARAMS`, `docs/HUB.md` §13.23): its
+    /// JSON answer, or the server's error code and message.
+    pub fn query(&self, route: &str, params: &[(&str, String)]) -> Result<std::result::Result<serde_json::Value, (String, String)>> {
+        let q: Vec<String> = params.iter().map(|(k, v)| format!("{k}={}", percent(v))).collect();
+        let (status, out) = self.call("GET", &self.url.project_path(&format!("/q/{route}?{}", q.join("&"))), None)?;
+        if (200..300).contains(&status) {
+            return Ok(Ok(serde_json::from_slice(&out).context("the server's answer")?));
+        }
+        match serde_json::from_slice::<ErrorBody>(&out) {
+            Ok(e) => Ok(Err((e.code, e.message))),
+            Err(_) => Err(Self::error(status, &out)),
+        }
+    }
+}
+
+/// `s` percent-encoded for a query string.
+fn percent(s: &str) -> String {
+    let mut q = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+            q.push(b as char);
+        } else {
+            q.push_str(&format!("%{b:02X}"));
+        }
+    }
+    q
 }
 
 // ---- pull ---------------------------------------------------------------------------------
