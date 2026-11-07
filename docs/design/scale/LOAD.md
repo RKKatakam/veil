@@ -345,7 +345,12 @@ collisions per landing, p50 70 ms; after 0.02, p50 14 ms; at 40/s, before
 both bend (43 vs 33 landed).
 
 **Across 100 projects** nothing lands, before or after: S12's deriver holds
-every database connection (BUG-911). Across 1 and 10 projects: LANDING_AB.
+every database connection (BUG-911). Across 1 and 10 projects, one agent
+each, both servers interleaved on the same minutes (load average 9–21):
+one project 84 and 73 landings/s before, **105 and 114** after (p50 10–12
+→ 8 ms); ten projects 659 and 649 before, **775 and 875** after (p50 14 →
+11 ms). (The run of the first table measured 30 and 317 for these points
+late in a run, at load 49: noise.)
 
 **Notices.** PostgreSQL delivers the push's `NOTIFY`: another server saw a
 push 5–15 ms later in the tests. YugabyteDB 2025.2 does not by default, and
