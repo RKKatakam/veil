@@ -237,6 +237,10 @@ pub struct DirListing {
     /// Entries whose names are not valid UTF-8, escaped for display
     /// (`\xNN` per invalid byte). They cannot be represented as a [`VPath`].
     pub unrepresentable: Vec<String>,
+    /// Empty, or one per entry: what [`StorageBackend::metadata`] said of
+    /// the entry while it was listed (a file or a symlink; `None`: not
+    /// known, ask). A snapshot stats every file once, beside its listing.
+    pub stats: Vec<Option<Metadata>>,
 }
 
 /// Prefix and suffix of the temp files [`DiskBackend`] writes before the
@@ -335,6 +339,25 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
         let data = self.read(from)?;
         self.write_unsynced(to, &data)?;
         self.remove_file(from)
+    }
+
+    /// [`StorageBackend::write_unsynced`] of a file that nothing names
+    /// until [`StorageBackend::publish_unsynced`] moves it (a transaction's
+    /// staging directory): the next barrier makes its content durable, but
+    /// neither its name nor its directory. A crash leaves it as debris of
+    /// a directory that is swept, never read. The default is
+    /// [`StorageBackend::write_unsynced`].
+    fn stage_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        self.write_unsynced(path, data)
+    }
+
+    /// [`StorageBackend::rename_unsynced`] of a file written by
+    /// [`StorageBackend::stage_unsynced`], once its content is durable: the
+    /// next barrier makes the new name durable (and any directories created
+    /// for it), not the removal of the old one, which nothing reads. The
+    /// default is [`StorageBackend::rename_unsynced`].
+    fn publish_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        self.rename_unsynced(from, to)
     }
 
     /// How many [`StorageBackend::sync_barrier`] calls on this value failed

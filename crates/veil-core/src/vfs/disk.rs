@@ -123,6 +123,66 @@ fn escape_name(name: &std::ffi::OsStr) -> String {
 }
 
 impl DiskBackend {
+    /// [`StorageBackend::write_unsynced`] below `.veil/`; with `names`, the
+    /// next barrier also syncs the directories the name was created in.
+    fn write_own_unsynced(&self, path: &VPath, data: &[u8], names: bool) -> Result<()> {
+        self.refuse_symlinked_parent(path)?;
+        let full = self.full_path(path);
+        let parent = full.parent().expect("non-root path has a parent");
+        let mut created = Vec::new();
+        create_dir_all_tracked(parent, &mut created).map_err(|e| io_err(parent, e))?;
+        // Record the new directories before anything can fail, so the next
+        // barrier syncs them even if this write does not complete.
+        if names && !created.is_empty() {
+            let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
+            u.dirs.extend(created.iter().filter_map(|d| d.parent().map(Path::to_path_buf)));
+        }
+        let tmp = temp_path(parent, path);
+        let res = (|| {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?
+                .write_all(data)?;
+            #[cfg(unix)]
+            if let Ok(old) = fs::metadata(&full) {
+                fs::set_permissions(&tmp, old.permissions())?;
+            }
+            fs::rename(&tmp, &full)
+        })();
+        if let Err(e) = res {
+            let _ = fs::remove_file(&tmp);
+            return Err(io_err(&full, e));
+        }
+        let parent = parent.to_path_buf();
+        let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
+        u.files.push(full);
+        if names {
+            u.dirs.insert(parent);
+        }
+        Ok(())
+    }
+
+
+    /// [`StorageBackend::rename_unsynced`] within `.veil/`; with `source`,
+    /// the next barrier also syncs the directory the file left.
+    fn rename_own_unsynced(&self, from: &VPath, to: &VPath, source: bool) -> Result<()> {
+        let (src, dst) = (self.full_path(from), self.full_path(to));
+        let parent = dst.parent().expect("non-root path has a parent");
+        let mut created = Vec::new();
+        create_dir_all_tracked(parent, &mut created).map_err(|e| io_err(parent, e))?;
+        {
+            let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
+            u.dirs.extend(created.iter().filter_map(|d| d.parent().map(Path::to_path_buf)));
+        }
+        fs::rename(&src, &dst).map_err(|e| io_err(&dst, e))?;
+        let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
+        u.dirs.insert(parent.to_path_buf());
+        if let Some(d) = src.parent().filter(|_| source) {
+            u.dirs.insert(d.to_path_buf());
+        }
+        Ok(())
+    }
     pub fn new(root: impl Into<PathBuf>) -> Self {
         DiskBackend {
             root: root.into(),
@@ -845,41 +905,24 @@ impl StorageBackend for DiskBackend {
             u.files.push(full);
             return Ok(());
         }
-        self.refuse_symlinked_parent(path)?;
-        let full = self.full_path(path);
-        let parent = full.parent().expect("non-root path has a parent");
-        let mut created = Vec::new();
-        create_dir_all_tracked(parent, &mut created).map_err(|e| io_err(parent, e))?;
-        // Record the new directories before anything can fail, so the next
-        // barrier syncs them even if this write does not complete.
-        if !created.is_empty() {
-            let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
-            u.dirs.extend(created.iter().filter_map(|d| d.parent().map(Path::to_path_buf)));
-        }
-        let tmp = temp_path(parent, path);
-        let res = (|| {
-            fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?
-                .write_all(data)?;
-            #[cfg(unix)]
-            if let Ok(old) = fs::metadata(&full) {
-                fs::set_permissions(&tmp, old.permissions())?;
-            }
-            fs::rename(&tmp, &full)
-        })();
-        if let Err(e) = res {
-            let _ = fs::remove_file(&tmp);
-            return Err(io_err(&full, e));
-        }
-        let parent = parent.to_path_buf();
-        let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
-        u.files.push(full);
-        u.dirs.insert(parent);
-        Ok(())
+        self.write_own_unsynced(path, data, true)
     }
 
+    /// Below `.veil/` only, the staging directory's files: their names
+    /// are never synced (see [`StorageBackend::stage_unsynced`]).
+    fn stage_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        match Self::own_path(path) && !path.is_root() {
+            true => self.write_own_unsynced(path, data, false),
+            false => self.write_unsynced(path, data),
+        }
+    }
+
+    fn publish_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        match Self::own_path(from) && Self::own_path(to) && !to.is_root() {
+            true => self.rename_own_unsynced(from, to, false),
+            false => self.rename_unsynced(from, to),
+        }
+    }
     /// Working-copy paths: the temp file is written beneath the root (no
     /// symlink followed), with the mode of the file it will replace, and
     /// left for the next barrier; [`DiskBackend::rename_unsynced`] then
@@ -928,21 +971,7 @@ impl StorageBackend for DiskBackend {
             self.write_unsynced(to, &data)?;
             return self.remove_file(from);
         }
-        let (src, dst) = (self.full_path(from), self.full_path(to));
-        let parent = dst.parent().expect("non-root path has a parent");
-        let mut created = Vec::new();
-        create_dir_all_tracked(parent, &mut created).map_err(|e| io_err(parent, e))?;
-        {
-            let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
-            u.dirs.extend(created.iter().filter_map(|d| d.parent().map(Path::to_path_buf)));
-        }
-        fs::rename(&src, &dst).map_err(|e| io_err(&dst, e))?;
-        let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
-        u.dirs.insert(parent.to_path_buf());
-        if let Some(d) = src.parent() {
-            u.dirs.insert(d.to_path_buf());
-        }
-        Ok(())
+        self.rename_own_unsynced(from, to, true)
     }
 
     fn barrier_failures(&self) -> u64 {
@@ -972,7 +1001,14 @@ impl StorageBackend for DiskBackend {
         // thread costs tens of microseconds, a journal commit hundreds).
         // Directories: once the files' fsyncs have committed the journal
         // they are mostly clean, and a thread for each costs more than
-        // their fsyncs; one worker per 16.
+        // their fsyncs; one worker per 16. A barrier of names alone (the
+        // renames that publish what an earlier barrier made durable) has
+        // only dirty directories: a worker each, so that their journal
+        // commits are shared as the files' are.
+        let per_dir = match batch.files.is_empty() {
+            true => 1,
+            false => 16,
+        };
         let res = for_each_parallel(&batch.files, SYNC_WORKERS, 1, |f| match barrier_sync_file(f) {
             // Removed since (by gc, or by crash recovery as torn): the
             // directory sync below makes the removal durable instead.
@@ -980,7 +1016,7 @@ impl StorageBackend for DiskBackend {
             r => r,
         })
         .and_then(|()| {
-            for_each_parallel(&dirs, SYNC_WORKERS, 16, |d| match barrier_sync_dir(d) {
+            for_each_parallel(&dirs, SYNC_WORKERS, per_dir, |d| match barrier_sync_dir(d) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
                 r => r,
             })
@@ -1227,9 +1263,26 @@ impl StorageBackend for DiskBackend {
                 out.special.push(name); // sockets, FIFOs, devices
                 continue;
             };
+            // As `metadata` would say, but relative to the directory being
+            // listed (one name to look up, not the whole path). Not found,
+            // or anything unexpected: not known (`metadata` is asked).
+            let stat = match (kind, entry.metadata()) {
+                (NodeKind::Dir, _) | (_, Err(_)) => None,
+                (_, Ok(m)) if m.is_file() => Some(file_metadata(&m)),
+                (_, Ok(m)) if m.file_type().is_symlink() => Some(Metadata {
+                    kind: NodeKind::Symlink,
+                    executable: false,
+                    ..file_metadata(&m)
+                }),
+                (_, Ok(_)) => None,
+            };
+            out.stats.push(stat);
             out.entries.push(DirEntry { name, kind });
         }
-        out.entries.sort_by(|a, b| a.name.cmp(&b.name));
+        // Sorted together (names are unique).
+        let mut both: Vec<(DirEntry, Option<Metadata>)> = std::mem::take(&mut out.entries).into_iter().zip(std::mem::take(&mut out.stats)).collect();
+        both.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+        (out.entries, out.stats) = both.into_iter().unzip();
         out.special.sort();
         out.unrepresentable.sort();
         Ok(out)

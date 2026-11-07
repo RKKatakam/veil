@@ -60,6 +60,9 @@ wasm = ["ruzstd", "getrandom/wasm_js"]
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 tempfile.workspace = true
 proptest = "1"
+# Already in the tree (through `regex`): the scanner's test derives each
+# token rule's literal prefixes from its pattern.
+regex-syntax = "0.8"
 
 [lints.rust]
 # `examples/wasm_smoke.rs` supplies randomness itself when built with

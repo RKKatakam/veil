@@ -79,6 +79,8 @@ pub mod object;
 pub mod oplog;
 pub mod pack;
 pub mod policy;
+#[cfg(feature = "os")]
+mod prefetch;
 pub mod remote;
 pub mod rename;
 pub mod repo;

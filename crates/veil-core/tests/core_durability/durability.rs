@@ -25,6 +25,19 @@ enum Call {
     Barrier,
     Rename(String),
     CreateNew(String),
+    /// `stage_unsynced` (path), `publish_unsynced` (new name).
+    Staged(String),
+    Published(String),
+}
+
+/// The operation file named (written, or a staged one renamed).
+fn is_op(c: &Call) -> bool {
+    matches!(c, Call::Write(p) | Call::Published(p) if p.starts_with(".veil/ops/"))
+}
+
+/// The head file named (format 6: created, or a staged one renamed).
+fn is_head(c: &Call) -> bool {
+    matches!(c, Call::CreateNew(p) | Call::Published(p) if p.starts_with(".veil/op_heads/"))
 }
 
 /// Records every mutation, in order.
@@ -67,6 +80,14 @@ impl StorageBackend for Recorder {
         self.calls.lock().unwrap().push(Call::Rename(to.to_string()));
         self.inner.rename_unsynced(from, to)
     }
+    fn stage_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        self.calls.lock().unwrap().push(Call::Staged(path.to_string()));
+        self.inner.stage_unsynced(path, data)
+    }
+    fn publish_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        self.calls.lock().unwrap().push(Call::Published(to.to_string()));
+        self.inner.publish_unsynced(from, to)
+    }
     fn remove_file(&self, path: &VPath) -> Result<()> {
         self.inner.remove_file(path)
     }
@@ -95,17 +116,19 @@ impl StorageBackend for Recorder {
 
 /// Formats ≤ 5: objects are written unsynced, then one barrier, then the
 /// operation, then the head; no unsynced write follows the barrier.
-/// Format 6: objects are written unsynced into the transaction's staging
-/// directory, one barrier, renamed into place, a second barrier, then the
-/// operation and its head file.
+/// Format 6: the objects, the operation and its (empty) head file are
+/// staged in the transaction's directory; one barrier; the objects renamed
+/// into place; a barrier; the operation renamed into place; a barrier; the
+/// head renamed into place; a barrier. Each name becomes durable only
+/// after everything it depends on did.
 fn assert_ordered(calls: &[Call], what: &str, format: u32) {
+    if format >= 6 {
+        return assert_ordered_staged(calls, what);
+    }
     let pos = |pred: &dyn Fn(&Call) -> bool| calls.iter().position(pred);
     let op = pos(&|c| matches!(c, Call::Write(p) if p.starts_with(".veil/ops/")))
         .unwrap_or_else(|| panic!("{what}: no op written: {calls:?}"));
-    let head = match format {
-        f if f >= 6 => pos(&|c| matches!(c, Call::CreateNew(p) if p.starts_with(".veil/op_heads/"))).expect("head file created"),
-        _ => pos(&|c| matches!(c, Call::Write(p) if p == ".veil/op_head")).expect("head written"),
-    };
+    let head = pos(&|c| matches!(c, Call::Write(p) if p == ".veil/op_head")).expect("head written");
     let barrier = calls[..op]
         .iter()
         .rposition(|c| *c == Call::Barrier)
@@ -113,27 +136,41 @@ fn assert_ordered(calls: &[Call], what: &str, format: u32) {
     let unsynced: Vec<usize> = (0..calls.len()).filter(|i| matches!(calls[*i], Call::Unsynced(_))).collect();
     assert!(!unsynced.is_empty(), "{what}: objects were written durably one by one");
     assert!(barrier < op && op < head, "{what}: order is objects, barrier, op, head: {calls:?}");
-    if format >= 6 {
-        let renames: Vec<usize> = (0..calls.len()).filter(|i| matches!(calls[*i], Call::Rename(_))).collect();
-        let first_barrier = calls.iter().position(|c| *c == Call::Barrier).unwrap();
-        assert!(!renames.is_empty(), "{what}: nothing published: {calls:?}");
-        assert!(unsynced.iter().all(|i| *i < first_barrier), "{what}: unsynced write after the staging barrier: {calls:?}");
-        assert!(renames.iter().all(|i| *i > first_barrier && *i < barrier), "{what}: renames between the barriers: {calls:?}");
-        for c in calls {
-            match c {
-                Call::Unsynced(p) => assert!(p.starts_with(".veil/objects/incoming/tx-"), "{what}: staged outside the transaction's directory ({p})"),
-                Call::Rename(p) => assert!(p.starts_with(".veil/objects/") && !p.contains("incoming"), "{what}: renamed to {p}"),
-                _ => {}
-            }
-        }
-        return;
-    }
     assert!(unsynced.iter().all(|i| *i < barrier), "{what}: unsynced write after the barrier: {calls:?}");
     for c in calls {
         if let Call::Unsynced(p) = c {
             assert!(p.starts_with(".veil/objects/"), "{what}: only objects are written unsynced ({p})");
         }
     }
+}
+
+/// [`assert_ordered`] for formats 6 and later (staged transactions).
+fn assert_ordered_staged(calls: &[Call], what: &str) {
+    let pos = |pred: &dyn Fn(&Call) -> bool| calls.iter().position(pred).unwrap_or_else(|| panic!("{what}: {calls:?}"));
+    let barrier_after = |i: usize| i + 1 + calls[i + 1..].iter().position(|c| *c == Call::Barrier).unwrap_or_else(|| panic!("{what}: no barrier after call {i}: {calls:?}"));
+    let op = pos(&is_op);
+    let head = pos(&is_head);
+    let staged: Vec<(usize, &String)> = calls.iter().enumerate().filter_map(|(i, c)| match c {
+        Call::Staged(p) => Some((i, p)),
+        _ => None,
+    }).collect();
+    assert!(staged.len() > 2, "{what}: objects were written durably one by one: {calls:?}");
+    assert!(staged.iter().all(|(_, p)| p.starts_with(".veil/objects/incoming/tx-")), "{what}: staged outside the transaction's directory: {calls:?}");
+    assert!(staged.iter().any(|(_, p)| p.ends_with("/operation")) && staged.iter().any(|(_, p)| p.ends_with("/head")), "{what}: the operation and its head are staged: {calls:?}");
+    // The staged contents, then one barrier.
+    let first = barrier_after(staged.last().unwrap().0);
+    assert!(calls[..first].iter().all(|c| !matches!(c, Call::Published(_) | Call::Rename(_))), "{what}: a name before the first barrier: {calls:?}");
+    // The objects' names, then a barrier.
+    let objects: Vec<usize> = (0..calls.len()).filter(|i| matches!(&calls[*i], Call::Published(p) if p.starts_with(".veil/objects/"))).collect();
+    assert!(!objects.is_empty(), "{what}: no object published: {calls:?}");
+    assert!(objects.iter().all(|i| *i > first), "{what}: {calls:?}");
+    let second = barrier_after(*objects.last().unwrap());
+    // The operation's name, a barrier, the head's name, a barrier.
+    assert!(op > second, "{what}: the operation is named after its objects are durable: {calls:?}");
+    let third = barrier_after(op);
+    assert!(head > third, "{what}: the head is named after its operation is durable: {calls:?}");
+    barrier_after(head);
+    assert!(calls.iter().all(|c| !matches!(c, Call::Unsynced(p) | Call::Write(p) if p.starts_with(".veil/objects/") || p.starts_with(".veil/ops/"))), "{what}: {calls:?}");
 }
 
 #[test]
@@ -357,10 +394,10 @@ fn many_new_objects_are_one_pack_published_before_the_operation() {
     let calls = rec.take();
     let pos = |pred: &dyn Fn(&Call) -> bool| calls.iter().position(pred).unwrap_or_else(|| panic!("{calls:?}"));
     let idx = pos(&|c| matches!(c, Call::Write(p) if p.starts_with(".veil/objects/pack/") && p.ends_with(".idx")));
-    let op = pos(&|c| matches!(c, Call::Write(p) if p.starts_with(".veil/ops/")));
-    let head = pos(&|c| matches!(c, Call::CreateNew(p) if p.starts_with(".veil/op_heads/")));
+    let op = pos(&is_op);
+    let head = pos(&is_head);
     assert!(idx < op && op < head, "{calls:?}");
-    let loose_writes = calls.iter().filter(|c| matches!(c, Call::Unsynced(p) if p.starts_with(".veil/objects/"))).count();
+    let loose_writes = calls.iter().filter(|c| matches!(c, Call::Unsynced(p) | Call::Staged(p) if p.starts_with(".veil/objects/") && !p.ends_with("/operation") && !p.ends_with("/head"))).count();
     // The root, `src`, its 7 directories and the snapshot.
     assert_eq!(loose_writes, 10, "only trees and the snapshot are loose: {calls:?}");
     let packs = dir("pack");
@@ -442,7 +479,7 @@ fn pulled_packs_are_published_before_their_index_and_the_operation() {
     let pos = |pred: &dyn Fn(&Call) -> bool| calls.iter().position(pred).unwrap_or_else(|| panic!("{calls:?}"));
     let idx = pos(&|c| matches!(c, Call::Write(p) if p.starts_with(".veil/objects/pack/") && p.ends_with(".idx")));
     let barrier = calls[..idx].iter().rposition(|c| *c == Call::Barrier).unwrap_or_else(|| panic!("no barrier before the index: {calls:?}"));
-    let op = pos(&|c| matches!(c, Call::Write(p) if p.starts_with(".veil/ops/")));
+    let op = pos(&is_op);
     assert!(barrier < idx && idx < op, "{calls:?}");
     assert!(!calls.iter().any(|c| matches!(c, Call::Write(p) | Call::Unsynced(p) if p.ends_with(".pack"))), "the pack is streamed: {calls:?}");
     let packs: Vec<String> = std::fs::read_dir(tmp.path().join("b/.veil/objects/pack")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();

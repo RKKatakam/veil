@@ -143,7 +143,12 @@ fn error_hint(e: &anyhow::Error) -> Option<&'static str> {
 
 fn open(cli: &Cli) -> Result<Ctx> {
     // `vl commit` records the directory in its own transaction (one
-    // operation with the commit, `Ctx::commit`).
+    // operation with the commit, `Ctx::commit`): what it compiles for that
+    // starts now, on other threads (as `Ctx::open` does for a snapshot).
+    if matches!(cli.cmd, Cmd::Commit { .. }) && !cli.no_snapshot {
+        veil_core::secrets::prepare();
+        veil_core::policy::prepare();
+    }
     Ctx::open(cli.repository.as_deref(), !cli.no_snapshot && !matches!(cli.cmd, Cmd::Commit { .. }))
 }
 
