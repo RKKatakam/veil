@@ -8,7 +8,7 @@
 //! veil-bench report RESULTS.json
 //! veil-bench openscion --vl PATH --server PATH --database-url URL [--s3-…] --dir DIR --out RESULTS.json
 //! veil-bench openscion-memory --out RESULTS.json
-//! veil-bench load --mode pull|land|branches|api (--server PATH --database-url URL | --url URL [--ca PEM])
+//! veil-bench load --mode pull|land|branches|api|objects [--via server,cache] (--server PATH --database-url URL | --url URL [--ca PEM])
 //!                 --projects 1,10 --clients 10,100 [--rates 0.35,3.5,max] --out RESULTS.json
 //! ```
 //!
@@ -121,8 +121,9 @@ enum Cmd {
     Load {
         /// `pull` (agents pull in a closed loop), `land` (agents land
         /// changes on `main` by pull and push), `branches` (each on a
-        /// branch of its own) or `api` (agents land them through
-        /// `POST …/changes`, letting the server rebase).
+        /// branch of its own), `api` (agents land them through
+        /// `POST …/changes`, letting the server rebase) or `objects`
+        /// (agents read as fresh thin workspaces through the object routes).
         #[arg(long)]
         mode: String,
         /// A running server (`https://host:port`); else `--server` starts one here.
@@ -162,6 +163,10 @@ enum Cmd {
         /// Count only this container's database processes (a container id prefix).
         #[arg(long)]
         db_container: Option<String>,
+        /// `objects`: read through `cache` (a regional cache started here in
+        /// front of the server) or `server`; one set of curves each.
+        #[arg(long, value_delimiter = ',', default_value = "server,cache")]
+        via: Vec<String>,
         /// Bench directory (the server started here keeps its data there).
         #[arg(long)]
         dir: PathBuf,
@@ -314,6 +319,7 @@ fn main() -> Result<()> {
             warmup,
             background,
             db_container,
+            via,
             dir,
             out,
         } => {
@@ -322,8 +328,17 @@ fn main() -> Result<()> {
                 "land" => load::Mode::Land,
                 "branches" => load::Mode::Branches,
                 "api" => load::Mode::Api,
-                m => return Err(anyhow!("--mode {m}: pull, land, branches or api")),
+                "objects" => load::Mode::Objects,
+                m => return Err(anyhow!("--mode {m}: pull, land, branches, api or objects")),
             };
+            let vias = via
+                .iter()
+                .map(|v| match v.as_str() {
+                    "cache" => Ok(true),
+                    "server" => Ok(false),
+                    v => Err(anyhow!("--via {v}: server or cache")),
+                })
+                .collect::<Result<_>>()?;
             let rates = rates.iter().map(|r| r.parse::<load::Rate>().map_err(|e| anyhow!(e))).collect::<Result<_>>()?;
             let v = load::run_all(&load::Args {
                 url,
@@ -343,6 +358,7 @@ fn main() -> Result<()> {
                 warmup: Duration::from_secs_f64(warmup),
                 background,
                 db_container,
+                vias,
             })?;
             std::fs::write(&out, serde_json::to_vec_pretty(&v)?)?;
             let md = load::markdown(&v)?;

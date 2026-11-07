@@ -8,6 +8,7 @@
 #   scripts/bench-server.sh small       # the same at 100 MB (tiny: a smoke test)
 #   scripts/bench-server.sh openscion   # the four OpenScion workloads, 1k and 10k files, Git beside
 #   scripts/bench-server.sh load        # the server's load curves (docs/design/scale/LOAD.md)
+#   scripts/bench-server.sh cache       # reads through a regional cache and straight from the server (S9)
 #   scripts/bench-server.sh 1g -- --runs 5   # extra veil-bench flags
 #
 # Environment:
@@ -31,8 +32,8 @@ if [[ "${1:-}" == "--" ]]; then
 fi
 EXTRA=("$@")
 case "$PROFILE" in
-    tiny|small|1g|5g|openscion|load) ;;
-    *) echo "usage: $0 [tiny|small|1g|5g|openscion|load] [-- veil-bench flags]" >&2; exit 2 ;;
+    tiny|small|1g|5g|openscion|load|cache) ;;
+    *) echo "usage: $0 [tiny|small|1g|5g|openscion|load|cache] [-- veil-bench flags]" >&2; exit 2 ;;
 esac
 
 STEP_LIMIT=${STEP_LIMIT:-3600}
@@ -138,6 +139,14 @@ case "$PROFILE" in
         # many agents into one main with the server rebasing.
         run "${L[@]}" --dir "$WORK/api" --mode api --projects 1,10,100 --clients 1 --rates max --out "${OUT%.json}-api.json" "${EXTRA[@]}" || status=$?
         run "${L[@]}" --dir "$WORK/api-hot" --mode api --projects 1 --clients 50 --rates 20,50,100,max --out "${OUT%.json}-api-hot.json" "${EXTRA[@]}" || status=$?
+        ;;
+    cache)
+        # Fresh thin workspaces reading through a regional cache, and
+        # straight from the server (docs/HUB.md §13.18): hit share, latency,
+        # the cache's memory (gates: 99 % from its store, 512 MiB).
+        L=("$BENCH" load "${SERVER_ARGS[@]}" --db-container "$PG_ID" --duration 15 --mode objects --via server,cache)
+        run "${L[@]}" --dir "$WORK/still" --projects 1 --clients 10,100,1000 --background 0 --out "${OUT%.json}-still.json" "${EXTRA[@]}" || status=$?
+        run "${L[@]}" --dir "$WORK/moving" --projects 1 --clients 10,100,1000 --background 20 --out "${OUT%.json}-moving.json" "${EXTRA[@]}" || status=$?
         ;;
     *)
         # Generation, the checkout, the server phase (push, clone, pull,

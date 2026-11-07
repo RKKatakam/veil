@@ -61,6 +61,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/objects/{p}/{id}", get(crate::grant::get_object))
         .route("/v1/objects/{target}", post(crate::grant::batch))
         .route("/v1/epochs", get(crate::grant::epochs))
+        .route("/v1/cache/epochs", post(crate::cache::feed::epochs))
         .layer(DefaultBodyLimit::max(crate::db::body_limit("")))
         .layer(axum::middleware::from_fn(crate::db::retry_requests))
         .with_state(hub)

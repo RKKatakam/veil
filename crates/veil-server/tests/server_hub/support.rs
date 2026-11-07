@@ -312,7 +312,13 @@ impl Reply {
 
 impl Api {
     fn new(hub: &TestHub) -> Api {
-        let certs: Vec<ureq::tls::Certificate<'static>> = ureq::tls::parse_pem(hub.cert_pem.as_bytes())
+        Api::at(&hub.authority(), &hub.cert_pem)
+    }
+
+    /// A client of the HTTPS server at `authority` (a regional cache, say)
+    /// whose certificate is `cert_pem`.
+    pub fn at(authority: &str, cert_pem: &str) -> Api {
+        let certs: Vec<ureq::tls::Certificate<'static>> = ureq::tls::parse_pem(cert_pem.as_bytes())
             .filter_map(|i| match i {
                 Ok(ureq::tls::PemItem::Certificate(c)) => Some(c),
                 _ => None,
@@ -331,8 +337,8 @@ impl Api {
             .new_agent();
         Api {
             agent,
-            base: format!("https://{}", hub.authority()),
-            authority: hub.authority(),
+            base: format!("https://{authority}"),
+            authority: authority.to_string(),
         }
     }
 
@@ -378,6 +384,15 @@ impl Api {
             r = r.header("authorization", &format!("Bearer {t}"));
         }
         r = r.header("content-type", if json { "application/json" } else { "application/octet-stream" });
+        Self::finish(r.send(body))
+    }
+
+    /// POST JSON with extra headers (a cache's token, …).
+    pub fn post_with(&self, path: &str, body: &[u8], headers: &[(&str, &str)]) -> Reply {
+        let mut r = self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json");
+        for (k, v) in headers {
+            r = r.header(*k, *v);
+        }
         Self::finish(r.send(body))
     }
 
