@@ -2448,8 +2448,10 @@ server.**
 * **"On the server" is the clone's own server:** the snapshots reachable
   from the `partial` remote's tags (`<remote>/…`) only, everywhere it is
   judged (the read path, eviction's pins, gc, fsck). A second remote's
-  snapshot is never taken for the server's; its content is fetched only
-  under its own snapshot, from that remote's server.
+  snapshot is never taken for the server's. A thin clone fetches on demand
+  from its own server only, so a pull from another remote is a full pull:
+  its snapshots and everything they reach go to the main store (never
+  evicted, never asked of the clone's server).
 * **gc's roots:** eviction pins the trees (not files) of the server-side
   bases of every local-only snapshot gc roots: those of every operation
   the op log keeps (rewritten versions included), not the view's alone, so
