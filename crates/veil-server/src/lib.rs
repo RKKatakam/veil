@@ -71,6 +71,8 @@ pub struct Config {
     /// The server's identity and the self-signed certificate live here.
     pub data_dir: PathBuf,
     pub session_ttl: Duration,
+    /// The requests' connections; the background deriver has its own
+    /// `derive::DERIVE_CONNECTIONS` more.
     pub db_connections: u32,
     /// Derive, in the background once serving, every branch a landing left
     /// underived (`derive::resume`). Servers do; tests that count
@@ -128,6 +130,8 @@ pub async fn start(config: Config) -> Result<Running> {
     let (tls, cert_pem, certificate) = tls::server_config(&config.tls, &config.data_dir)?;
     let db = db::connect(&config.database_url, config.db_connections).await.context("connecting to the database")?;
     db::migrate(&db).await.context("migrating the database")?;
+    // The background deriver's own connections (BUG-911).
+    let derive_db = db::connect(&config.database_url, derive::DERIVE_CONNECTIONS).await.context("connecting to the database")?;
     let blob: Arc<dyn store::BlobStore> = match &config.storage {
         Storage::Dir(d) => Arc::new(store::FsStore::new(d)),
         Storage::S3 {
@@ -150,7 +154,7 @@ pub async fn start(config: Config) -> Result<Running> {
         receipt_key,
         session_ttl_ms: config.session_ttl.as_millis() as i64,
         certificate,
-        derive: derive::Workers::default(),
+        derive: derive::Workers::new(derive_db),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;

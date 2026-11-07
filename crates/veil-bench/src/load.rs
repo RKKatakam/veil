@@ -845,7 +845,38 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
         });
         Ok(())
     })?;
+    // The deriver's lag (S12, BUG-911): once the agents stopped, how long
+    // until every branch of these projects is derived, and how many are not
+    // after five minutes.
+    if let Some((rt, url)) = cx.stats {
+        let t = Instant::now();
+        let behind = loop {
+            let n = derive_behind(rt, url, &names);
+            if n != Some(0) && n.is_some() && t.elapsed() < Duration::from_secs(300) {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            break n;
+        };
+        result["derive_lag_s"] = json!(t.elapsed().as_secs_f64());
+        result["derive_behind"] = json!(behind);
+    }
     Ok(result)
+}
+
+/// Branches of `projects` whose derived history is not their tip.
+fn derive_behind(rt: &tokio::runtime::Runtime, url: &str, projects: &[String]) -> Option<i64> {
+    rt.block_on(async {
+        let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(url).await.ok()?;
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM branches b JOIN projects p ON p.id = b.project_id LEFT JOIN derive_progress d \
+             ON d.project_id = b.project_id AND d.branch = b.name WHERE p.name = ANY($1) AND d.through_snapshot IS DISTINCT FROM b.target",
+        )
+        .bind(projects)
+        .fetch_one(&mut c)
+        .await
+        .ok()
+    })
 }
 
 pub fn run_all(a: &Args) -> Result<serde_json::Value> {
@@ -904,7 +935,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
 fn line(r: &serde_json::Value) -> String {
     let f = |k: &str| r[k].as_f64().map(|v| format!("{v:.2}")).unwrap_or_else(|| "–".into());
     format!(
-        "{} ops/s ({} agents finishing), p50 {} ms, p99 {} ms, collisions/op {}, errors {}, server ms/op {}, db ms/op {}, db/op {}",
+        "{} ops/s ({} agents finishing), p50 {} ms, p99 {} ms, collisions/op {}, errors {}, server ms/op {}, db ms/op {}, db/op {}, derived {} s later ({} branches behind)",
         f("ops_per_s"),
         r["agents_finishing"],
         f("p50_ms"),
@@ -913,7 +944,9 @@ fn line(r: &serde_json::Value) -> String {
         r["errors"],
         f("server_cpu_ms_per_op"),
         f("db_cpu_ms_per_op"),
-        f("db_per_op")
+        f("db_per_op"),
+        f("derive_lag_s"),
+        r["derive_behind"]
     )
 }
 
