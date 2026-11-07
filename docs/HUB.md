@@ -2331,6 +2331,12 @@ alike: `status` 0.65, 0.21, 0.04 s (thin) and 0.64, 0.17, 0.05 s (full);
 clone 1.56 and 1.22 s, 140 and 132 MiB. Nothing on the clone path costs
 measurably more; the 1 GB numbers are to be taken again on a quiet machine.
 
+After review cycle 3 (the redesign: names asked of the server, `Held` and
+`Exact`, one rule for moves), the same profile at load 35.6 before (the
+quiet wait ran out): thin clone **7.9 s, 337 MiB** client peak, 0.43 GB in
+`.veil`; `status` 7.7, 0.49, 0.10 s; `log -n 20` 6.0 s; full clone 100 s,
+456 MiB. Back to cycle 1's level for the thin clone.
+
 * A thin clone's time and memory follow what it checks out (the tip's
   35,000 files), not the history: it holds 2 snapshots of 10,022.
 * The first `vl status` after a clone re-reads the files written within
