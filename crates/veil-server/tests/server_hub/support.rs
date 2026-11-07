@@ -385,6 +385,14 @@ impl Api {
         self.post(token, path, &serde_json::to_vec(v).unwrap(), true)
     }
 
+    /// POST JSON, failing the test only after `limit` (instead of the
+    /// agent's 120 s): for requests whose duration a test scales from a
+    /// baseline measured in the same run.
+    pub fn post_json_within(&self, token: &str, path: &str, v: &serde_json::Value, limit: std::time::Duration) -> Reply {
+        let r = self.agent.post(format!("{}{path}", self.base)).header("authorization", &format!("Bearer {token}")).header("content-type", "application/json");
+        Self::finish(r.config().timeout_global(Some(limit)).build().send(&serde_json::to_vec(v).unwrap()[..]))
+    }
+
     /// POST JSON, leaving the answer's body unread (a client that stalls).
     pub fn post_unread(&self, path: &str, body: &[u8]) -> ureq::http::Response<ureq::Body> {
         self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json").send(body).unwrap()

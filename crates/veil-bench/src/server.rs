@@ -9,6 +9,7 @@
 //! restart below it).
 
 use std::{
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::Duration,
@@ -50,7 +51,7 @@ impl Drop for Server {
 
 impl Server {
     /// Migrate the database, start the server with its data in `data`
-    /// (its log beside it, `data.log`), and wait until it answers.
+    /// (its log beside it, `data.log`), and wait until it listens.
     pub fn start(a: &ServerArgs, data: &Path, db_connections: u32) -> Result<Server> {
         let (Some(bin), Some(url)) = (&a.server, &a.database_url) else {
             bail!("starting a server needs --server and --database-url");
@@ -60,32 +61,40 @@ impl Server {
         if !st.success() {
             bail!("veil-server migrate failed ({st})");
         }
-        let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        // The server binds port 0 itself and prints the address it got: a
+        // port picked here and released could be taken before the server
+        // binds it, and binding one fails outright when the previous
+        // curve's closed connections hold the ephemeral range (BUG-1001).
         let mut cmd = Command::new(bin);
-        cmd.args(["--listen", &format!("127.0.0.1:{port}"), "--data"])
+        cmd.args(["--listen", "127.0.0.1:0", "--data"])
             .arg(data)
             .args(["--database-url", url, "--db-connections", &db_connections.to_string()]);
         if let (Some(e), Some(b)) = (&a.s3_endpoint, &a.s3_bucket) {
             cmd.args(["--s3-endpoint", e, "--s3-bucket", b]);
         }
-        let child = cmd
+        let log = data.with_extension("log");
+        let mut child = cmd
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(std::fs::File::create(data.with_extension("log"))?))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(std::fs::File::create(&log)?))
             .spawn()
             .context("starting veil-server")?;
-        let s = Server {
-            child,
-            authority: format!("127.0.0.1:{port}"),
-            cert: data.join("self-signed-cert.pem"),
-        };
-        for _ in 0..600 {
-            if s.cert.exists() && std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return Ok(s);
+        let stdout = child.stdout.take().context("veil-server's stdout")?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Reads the whole of stdout, so the server never blocks on a full pipe.
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(addr) = line.strip_prefix("veil-server listening on https://") {
+                    let _ = tx.send(addr.to_string());
+                }
             }
-            std::thread::sleep(Duration::from_millis(50));
+        });
+        let mut s = Server { child, authority: String::new(), cert: data.join("self-signed-cert.pem") };
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(addr) if s.cert.exists() => s.authority = addr,
+            _ => bail!("veil-server did not start (log: {})", log.display()),
         }
-        bail!("veil-server did not start (log: {})", data.with_extension("log").display())
+        Ok(s)
     }
 
     pub fn pid(&self) -> u32 {

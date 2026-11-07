@@ -625,20 +625,30 @@ fn pickaxe_is_lazy_and_linear() {
     let mut s = Searcher::new(&r, LogFilter { pickaxe: Some(Pickaxe::string("needle", false).unwrap()), ..LogFilter::default() });
     let t = Instant::now();
     assert!(matches!(s.check(&parent).unwrap(), Match::Yes { .. }));
+    // Lazy: the first match is found having searched one snapshot (counted,
+    // not timed: BUG-1007).
     assert_eq!(s.searched, 1);
     eprintln!("measured: log -S first match in a 10 000-snapshot history with a 1 MiB file: {:?}", t.elapsed());
-    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
-    // Counting is linear in the blob size.
-    let time = |n: usize| {
-        let (r, fs, _) = new_repo("bob");
-        let _ = fs;
+    // Counting is linear in the blob size. A machine pause stretches any one
+    // timing, so each size keeps its fastest of five runs, interleaved, and
+    // 8 MiB is compared with the 1 MiB baseline of the same run (BUG-1007).
+    let history = |n: usize| {
+        let (r, _, _) = new_repo("bob");
         let a = raw_snapshot(&r, vec![r.root_id()], raw_tree(&r, vec![file("f", blob(&r, &vec![b'a'; n]))]), "a");
         let b = raw_snapshot(&r, vec![a], raw_tree(&r, vec![file("f", blob(&r, &[vec![b'a'; n], b"needle".to_vec()].concat()))]), "b");
-        let mut s = Searcher::new(&r, LogFilter { pickaxe: Some(Pickaxe::string("aaneedle", true).unwrap()), ..LogFilter::default() });
+        (r, b)
+    };
+    let time = |(r, b): &(veil_core::Repo, veil_core::ObjectId)| {
+        let mut s = Searcher::new(r, LogFilter { pickaxe: Some(Pickaxe::string("aaneedle", true).unwrap()), ..LogFilter::default() });
         let t = Instant::now();
-        assert!(matches!(s.check(&b).unwrap(), Match::Yes { .. }));
+        assert!(matches!(s.check(b).unwrap(), Match::Yes { .. }));
         t.elapsed()
     };
-    let (ts, tl) = (time(1 << 20).min(time(1 << 20)), time(8 << 20));
+    let (small, large) = (history(1 << 20), history(8 << 20));
+    let (mut ts, mut tl) = (Duration::MAX, Duration::MAX);
+    for _ in 0..5 {
+        ts = ts.min(time(&small));
+        tl = tl.min(time(&large));
+    }
     assert!(tl < ts * 24 + Duration::from_millis(300), "superlinear: 1 MiB {ts:?}, 8 MiB {tl:?}");
 }

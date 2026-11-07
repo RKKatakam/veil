@@ -102,7 +102,7 @@ fn root_changes_and_the_root() {
     r.tag("orphan", "@-");
     r.ok(&["duplicate", "orphan", "-d", "feature"]);
     let t = r.fails(&["duplicate", "root"]);
-    assert!(t.contains("root"), "{t}");
+    assert!(t.contains("root snapshot"), "{t}");
 }
 
 // Scenario from git t3505-cherry-pick-empty.sh: picking a change already applied gives an empty copy, not an error.

@@ -343,7 +343,7 @@ fn the_root_snapshot_is_empty_and_immutable() {
     let r = env.repo("p");
     assert!(r.out(&["files", "-r", "root"]).is_empty());
     let err = r.fails(&["edit", "root"]);
-    assert!(err.contains("root"), "{err}");
+    assert!(err.contains("root snapshot"), "{err}");
     r.fails(&["describe", "-r", "root", "-m", "nope"]);
     r.fails(&["abandon", "root"]);
     assert_eq!(r.change("root"), "z".repeat(32));

@@ -340,11 +340,12 @@ fn gc_on_a_thread_holding_a_transaction_defers_deletion() {
     repo.abandon(old).unwrap();
     let mut g = open(&fs, &id);
     let tx = repo.transaction("held").unwrap();
-    let started = std::time::Instant::now();
     let r = gc(&mut g, &prune_now()).unwrap();
-    assert!(started.elapsed() < Duration::from_secs(3), "gc waited for its own thread");
     assert_eq!(r.deleted, 0);
-    assert!(r.deferred.is_some());
+    // Refused at once, not after waiting for the transaction to finish
+    // ("… kept running for 65 s"): the reason says which (BUG-970).
+    let why = r.deferred.as_deref().expect("deferred");
+    assert!(why.contains("this thread holds a transaction"), "gc waited for its own thread: {why}");
     drop(tx);
     assert!(repo.store().has(&old));
     let r = gc(&mut g, &prune_now()).unwrap();

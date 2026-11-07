@@ -144,7 +144,7 @@ fn describe_of_the_root_fails() {
     let env = Env::new();
     let r = env.repo("p");
     let err = r.fails(&["describe", "-r", "root", "-m", "x"]);
-    assert!(err.contains("root"), "{err}");
+    assert!(err.contains("root snapshot"), "{err}");
 }
 
 // Scenario from jj test_advance_bookmarks.rs: `vl commit` moves every tag

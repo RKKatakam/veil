@@ -439,7 +439,7 @@ fn squashing_into_the_root_is_refused() {
     let env = Env::new();
     let r = chain(&env);
     let err = r.fails(&["squash", "-r", "a"]);
-    assert!(err.contains("root"), "{err}");
+    assert!(err.contains("root snapshot"), "{err}");
     r.fails(&["squash", "-r", "root"]);
 }
 
@@ -531,7 +531,7 @@ fn abandoning_the_root_is_refused() {
     let env = Env::new();
     let r = chain(&env);
     let err = r.fails(&["abandon", "root"]);
-    assert!(err.contains("root"), "{err}");
+    assert!(err.contains("root snapshot"), "{err}");
 }
 
 // Scenario from jj test_abandon_many (merge): abandoning a merge gives its child both parents.
@@ -616,7 +616,7 @@ fn describing_the_root_is_refused() {
     let env = Env::new();
     let r = env.repo("p");
     let err = r.fails(&["describe", "-r", "root", "-m", "x"]);
-    assert!(err.contains("root"), "{err}");
+    assert!(err.contains("root snapshot"), "{err}");
 }
 
 // Scenario from git t3408-rebase-multi-line.sh: multi-line descriptions survive rewrites.
