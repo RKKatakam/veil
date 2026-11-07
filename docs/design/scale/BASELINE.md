@@ -1,6 +1,6 @@
 # Scale baseline: 1 GB, `integration` @ b549e1e
 
-These are the scale benchmark's numbers for today's client (`9-scale-benchmark.md`), first measured on `integration` @ **b549e1e** before any scale stream landed, then after each. **Push, clone and pull now go through the Veil server** ([after the server bench fixes](#after-the-server-bench-fixes-2026-11-06-7fb947f), and [the first measurement](#through-the-veil-server-2026-11-06-bfa691a)); the older remote cases below used path and SFTP remotes, which the simplification pass removes, and are kept as history. The server's own targets are in `docs/HUB.md` §9.2. They rank the streams: see [the ranked list](#ranked-offenders) and [what it means for the plan](#what-this-means-for-the-plan).
+These are the scale benchmark's numbers for today's client (`9-scale-benchmark.md`), first measured on `integration` @ **b549e1e** before any scale stream landed, then after each. **Push, clone and pull now go through the Veil server** ([the server's allocator](#the-servers-allocator-bug-864-2026-11-07), [after the server bench fixes](#after-the-server-bench-fixes-2026-11-06-7fb947f), and [the first measurement](#through-the-veil-server-2026-11-06-bfa691a)); the older remote cases below used path and SFTP remotes, which the simplification pass removes, and are kept as history. The server's own targets are in `docs/HUB.md` §9.2. They rank the streams: see [the ranked list](#ranked-offenders) and [what it means for the plan](#what-this-means-for-the-plan).
 
 - **Machine:**
   - 32 CPUs (i9-13900KF), 30 GB RAM;
@@ -9,6 +9,52 @@ These are the scale benchmark's numbers for today's client (`9-scale-benchmark.m
 - **Neighbours:** other agents were building at the same time, so the absolute times carry some noise.
 - **Run:** `scripts/bench-scale.sh 1g -- --rtt 0,2`, 2026-11-05. It took 21.5 minutes end to end, including 4 minutes of generation, then deleted everything it generated.
 - **Raw results** (not committed): `.scratch/bench-results/1g-seed1-*.json` and `.md`.
+
+## The server's allocator (BUG-864, 2026-11-07)
+
+`scripts/bench-server.sh 1g` (the server phase; `--skip-phase gc`) and `scripts/bench-server.sh load`, on `integration` @ `f7e9aac`, each run through `bench-quiet.sh`, with the same `vl` and the same server code built with each allocator. Other agents loaded the machine throughout (load average 15 to 200), so **memory is the reliable measure and wall-clock throughput is not**: two glibc load runs differed by 3×. Throughput was therefore also compared in alternating A/B rounds (glibc, then jemalloc, four times), with the server's CPU per operation, which noise moves much less. Server RSS is the server's `VmHWM` per case (1g) and sampled every 0.5 s (load). Raw results (not committed): `.scratch/results/` of the BUG-864 branch.
+
+**Memory, 1 GB profile** (server peak RSS in MiB; the gate is under 1,024):
+
+| allocator | push, initial: time, server 12 → peak | clone, full: time, server before → peak | RSS kept at the end |
+|---|---:|---:|---:|
+| glibc (default: an arena per thread) | 307 s, **2,367** | 58.0 s, 2,343 → **2,877** | 2,880 |
+| glibc, `mallopt(M_ARENA_MAX, 1)` | 314 s, 953 | 42.9 s, 928 → 1,785 | 1,786 |
+| glibc, `mallopt(M_ARENA_MAX, 2)` | 250 s, 993 | 55.6 s, 968 → 1,925 | 1,925 |
+| mimalloc 0.1.52 (defaults) | 273 s, 1,686 | 70.9 s, 1,579 → 1,908 | 1,381 |
+| jemalloc 0.7.0 (defaults: 4 arenas per CPU, 10 s decay) | 420 s, 1,233 | 52.8 s, 1,187 → 1,686 | 1,255 |
+| **jemalloc, 2 arenas, background purge, 1 s decay (chosen)** | 251 s, **984** (a first run: 331 s, 972) | 46.6 s, 851 → **1,579** (first run: 840 → 1,572) | **948** |
+
+- **The push** (what BUG-864 measured) drops from 2.4 GB to under 1 GB with jemalloc tuned or with glibc capped at one or two arenas.
+- **The full clone still takes every allocator past 1 GB:** it adds 0.5 to 0.9 GB to what the push left, even with a single glibc arena (+857 MiB), so that part is the fetch path's own memory, not arenas: **BUG-1000**. jemalloc tuned has the lowest clone peak.
+- **jemalloc gives memory back:** between cases its RSS falls back (984 → 851 MiB before the clone, 1,579 → 954 after it), where glibc and its capped variants keep their high-water mark for the rest of the run.
+
+**Throughput.** Medians over every load run (glibc: 4 full runs and the A/B rounds; jemalloc tuned: 2 full runs and the A/B rounds; the others: their runs), as landings or pulls per second and the server's CPU per operation:
+
+| point | glibc default | jemalloc tuned | glibc arena 1 | glibc arena 2 | jemalloc default | mimalloc |
+|---|---|---|---|---|---|---|
+| pull, 100 clients | 2,473/s, 1.24 ms | 2,722/s, **1.02 ms** | 2,231/s, 1.72 ms | 1,483/s, 1.88 ms | 1,164/s, 1.49 ms | 497/s, 1.68 ms |
+| pull, 1,000 clients | 2,040/s, 1.87 ms | 1,487/s, **1.72 ms** | 1,867/s, 3.24 ms | 800/s, 2.38 ms | 472/s, 1.77 ms | 867/s, 1.71 ms |
+| land, 1 project | 44/s, **3.82 ms** | 25/s, 4.06 ms | 71/s, 3.57 ms | 65/s, 3.92 ms | 34/s, 4.25 ms | 37/s, 4.43 ms |
+| land, 10 projects | 158/s, 3.18 ms | 264/s, **3.01 ms** | 420/s, 5.07 ms | 461/s, 3.58 ms | 449/s, 2.90 ms | 139/s, 3.26 ms |
+| land, 100 projects | 431/s, 2.93 ms | 427/s, **2.71 ms** | 453/s, 4.87 ms | 635/s, 3.79 ms | 483/s, 2.69 ms | 156/s, 2.89 ms |
+
+The A/B rounds, alternating glibc and jemalloc tuned (pulls with 100 and 1,000 clients; landings with 1 and 10 projects):
+- **Pulls, 100 clients:** glibc 3,678, 1,509, 3,430, 3,189/s; jemalloc 1,273, 3,519, 3,246, 3,893/s.
+- **Pulls, 1,000 clients:** glibc 2,035, 2,046, 2,200, 2,200/s; jemalloc 733, 2,133, 2,107, 2,200/s. Each side had one dip, when the machine's load jumped (to 47 and 78). 2,200/s is the load tool's ceiling here.
+- **Landings, 1 project:** 3.7 to 78/s on both sides, with the machine at a load of 49 to 199. Server CPU per landing was glibc 4.09, 3.93, 4.55, 3.93 ms and jemalloc 3.64, 4.55, 3.85, 3.99 ms.
+- **Landings, 10 projects:** glibc 147, 55, 20, 99/s at 3.12 to 3.46 ms each; jemalloc 210, 15, 475, 318/s at 2.96 to 3.52 ms each.
+
+**The choice: jemalloc, with two arenas and background purging** (`crates/veil-server/src/main.rs`; settings `narenas:2,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0`, which `_RJEM_MALLOC_CONF` can override in a deployment). The reasons:
+- **The lowest memory of all six:** push 984 MiB and clone 1,579 MiB, against 2,367 and 2,877 MiB with glibc's default.
+- **It returns memory after a burst:** 948 MiB kept at the end of the run, against 1.8 to 2.9 GB for every glibc variant.
+- **No throughput loss:** pulls and landings are at parity with glibc in the A/B rounds, and the server spends less CPU per operation at every loaded point (18 % less for pulls at 100 clients, 8 % at 1,000, and 5 to 8 % less for landings at 10 and 100 projects). Its one higher point is a single idle agent (land, 1 project: 4.06 against 3.82 ms per landing): the background purging, spread over few landings.
+- **Capping glibc's arenas costs CPU instead:** one arena gets close on the push (953 MiB) but its threads contend for the arena lock, which costs 73 % more CPU per pull at 1,000 clients (3.24 ms) and 66 % more per landing at 100 projects (4.87 ms). It also keeps its 1.8 GB peak afterwards.
+- **mimalloc** kept more than jemalloc on both cases.
+
+It is the `veil-server` binary's global allocator only; `veil-core` (which builds for WASM) and `vl` are unchanged. `vl` stays under its 512 MiB gate with glibc (344 to 491 MiB in these runs) and is a short-lived process. `tikv-jemallocator` is pinned (`=0.7.0`, released 2026-05-25; the TiKV project's maintained fork, which TiKV runs in production) and builds jemalloc 5.3 from source with the C compiler zstd already needs, plus `make`.
+
+**The gate:** `veil-bench run` now marks a server peak of 1 GB or more with ⛔ and exits non-zero after writing its results (`storage-and-cost.md` §9; the 5 GB profile is exempt). On this branch it still fails, on the full clone (1,579 MiB) and the clone of one directory after it (1,069 MiB): BUG-1000. The push passes, with 4 % to spare.
 
 ## After the server bench fixes (2026-11-06, `7fb947f`)
 
@@ -27,7 +73,7 @@ These are the scale benchmark's numbers for today's client (`9-scale-benchmark.m
 
 - **The initial push** now does in one push what took 116 s of refused upload and 200 s of fast-forward steps before (316 s in all): 337 s; the server checks the 10,022 snapshots one after another (BUG-865). An earlier run of the branch (`65519e1`) measured 317.5 s and 350 MiB.
 - **The full clone** writes each part of a level as it arrives; its peak (433 MiB) is the fetch and checkout's staging together, under the gate. The first run of the branch (`65519e1`) took 81 s: tree levels went out as 4 requests instead of 8; `7fb947f` keeps at least 8 parts for a level of 2,000 objects or more, and the server reads ahead in a sliding window instead of 64 objects at a time.
-- **The server** still grows past its caches' 512 MiB, but no longer with what it serves: a full clone adds 365 MiB where it added 785 MiB. An upload's objects are copied out of the request (a slice kept the whole 8 MiB body alive in the object cache), fetch answers stream, and decoded trees are weighed by their real size. What remains is the allocator's (BUG-864): pushes of a generated 1 GB repository to a fresh server, measured by hand (not `--plain`, so each was refused at its embargoed merge after its uploads and part of its checks: a lower bound), peaked at 1.5–2.6 GB with glibc's default arenas (one per thread: 34 to 146 threads), 1.1 GB with `MALLOC_ARENA_MAX=2` and 0.84 GB with `MALLOC_ARENA_MAX=1`, whose single heap held about 330 MiB during the uploads (the bounded caches) and 820 MiB during the checks (both caches full, plus the push's tables).
+- **The server** still grows past its caches' 512 MiB, but no longer with what it serves: a full clone adds 365 MiB where it added 785 MiB. An upload's objects are copied out of the request (a slice kept the whole 8 MiB body alive in the object cache), fetch answers stream, and decoded trees are weighed by their real size. What remains is the allocator's (BUG-864, fixed since: [the server's allocator](#the-servers-allocator-bug-864-2026-11-07)): pushes of a generated 1 GB repository to a fresh server, measured by hand (not `--plain`, so each was refused at its embargoed merge after its uploads and part of its checks: a lower bound), peaked at 1.5–2.6 GB with glibc's default arenas (one per thread: 34 to 146 threads), 1.1 GB with `MALLOC_ARENA_MAX=2` and 0.84 GB with `MALLOC_ARENA_MAX=1`, whose single heap held about 330 MiB during the uploads (the bounded caches) and 820 MiB during the checks (both caches full, plus the push's tables).
 
 **Nothing got slower** (the same machine and evening; with load averages of 6 to 72, single runs vary by up to 2×, so the base and the branch were also run alternately):
 
