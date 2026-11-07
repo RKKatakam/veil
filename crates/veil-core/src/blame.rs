@@ -18,7 +18,7 @@
 //!
 //! Lines of the file at the starting snapshot are open until attributed.
 //! Snapshots are visited in topological order, children before parents
-//! ([`Repo::topo_children_first`]), each once, with every line its children
+//! ([`crate::repo::Held::topo_children_first`]), each once, with every line its children
 //! passed it (threat review 5: no snapshot is visited twice, whatever the
 //! timestamps say). A snapshot's version is compared
 //! with each parent's in order; a line the parent holds moves to the first
@@ -469,7 +469,7 @@ impl PartialOrd for Queued {
     }
 }
 
-/// Topological ranks (children first, as [`Repo::topo_children_first`]
+/// Topological ranks (children first, as [`crate::repo::Held::topo_children_first`]
 /// numbers them), produced only as far as they are asked for.
 struct LazyRank<'r> {
     iter: crate::graph_index::TopoIter<'r>,

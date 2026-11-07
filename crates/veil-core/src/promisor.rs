@@ -35,7 +35,7 @@
 //! replica lacks, and the id is recorded ([`ObjectStore::take_boundary_hits`]).
 //! The graph queries whose answer can depend on what lies beyond
 //! (`Repo::is_ancestor`, `merge_bases`, `common_ancestor`, `vl log`) run
-//! through [`crate::Repo::exact`], which fetches the next page of history
+//! through [`crate::repo::Exact::run`], which fetches the next page of history
 //! from the server when a walk reached the boundary and runs the query
 //! again.
 
@@ -367,7 +367,7 @@ impl ObjectStore {
     }
 
     /// The snapshots reads missed since the last call: the boundary a graph
-    /// walk reached ([`crate::Repo::exact`]).
+    /// walk reached ([`crate::repo::Exact::run`]).
     pub fn take_boundary_hits(&self) -> Vec<ObjectId> {
         let Some(p) = self.partial.get() else { return Vec::new() };
         let mut h = p.hits.lock().unwrap_or_else(|e| e.into_inner());
@@ -593,8 +593,8 @@ impl ObjectStore {
     /// **Where `Missing` comes from** (BUG-1142): only (1) the server's own
     /// answer that it has nothing at the object's place that this person may
     /// see, under a snapshot that is on the server, and (2) a snapshot this
-    /// clone does not hold (its boundary, recorded for [`crate::Repo::exact`];
-    /// [`crate::Repo::snapshot_opt`] fetches history there). A tree or file
+    /// clone does not hold (its boundary, recorded for [`crate::repo::Exact::run`];
+    /// [`crate::repo::Exact::snapshot`] fetches history there). A tree or file
     /// whose place this process does not know is `Unavailable`.
     pub(crate) fn read_partial(&self, id: &ObjectId, snapshot: bool) -> Result<Vec<u8>> {
         let p = self.partial.get().expect("a thin clone's store");

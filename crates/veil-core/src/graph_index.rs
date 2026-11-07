@@ -828,7 +828,7 @@ impl GraphIndex {
 
     /// Snapshots reachable from `roots`, children before parents, newest
     /// first among unrelated snapshots: exactly the order of
-    /// [`Repo::topo_children_first`], produced lazily (an incremental
+    /// [`crate::repo::Held::topo_children_first`], produced lazily (an incremental
     /// topological walk, as Git's `--topo-order` since 2.20).
     pub fn topo_iter<'r>(&'r self, repo: &'r Repo, roots: impl IntoIterator<Item = ObjectId>) -> TopoIter<'r> {
         TopoIter {

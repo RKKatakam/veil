@@ -1301,7 +1301,7 @@ impl StorageBackend for InitWrites {
 #[derive(Clone, Copy)]
 pub struct Held<'r>(&'r Repo);
 
-/// Reads whose answer is a **full clone's** (`Repo::exact`): in a thin
+/// Reads whose answer is a **full clone's** ([`Repo::exact`]): in a thin
 /// clone, a single read fetches a page of history at the boundary, and a
 /// walk is the held walk run again after each page of history the boundary
 /// it reached needs, so it pages in what its own range reaches and no more.
