@@ -26,12 +26,16 @@ Each of those is also time on the request path. So every item here makes Veil **
 
 ## 3. One database commit per push (S4)
 
+> **Built** (S4, `HUB.md` §13.14): one commit per landing, measured by `veil-bench load`.
+
 - The push's transaction writes **everything at once:** the snapshot rows, the origin and audit rows, and the one-row compare-and-swap that moves the branch.
 - **Per-viewer views are worked out after the commit, in the background** (as S12's deriver already runs after a landing).
   - **Rule:** a reader never receives an unprojected answer. If a view isn't ready yet, the request projects it on demand, exactly as today, and the background job only saves that work.
 - `LOAD.md` measured about 8 commits per landing, spent on the database's write-ahead log. One commit is close to Git hosting's ref compare-and-swap.
 
 ## 4. Request-path caches (S4)
+
+> **Built** (S4, `HUB.md` §13.14): versioned by access epochs that database triggers bump; every request reads its epochs, so staleness is zero. Tested with two servers on one database.
 
 In each API server's memory, never in the database:
 - **sessions:** sign-in token → person and device;
@@ -45,6 +49,8 @@ In each API server's memory, never in the database:
 - This is tested under load with several servers on one database.
 
 ## 5. "Nothing changed" without a hot row
+
+> **Built** (S4, `HUB.md` §13.14) with `LISTEN`/`NOTIFY` on PostgreSQL. On YugabyteDB 2025.2 with default flags the server finds notices are not delivered and relies on the 100 ms expiry; the change feed is not used.
 
 - Each server keeps each project's **tips in memory**. Every push tells every server to drop its copy.
 - **Not a version counter per project:** one row that every push updates becomes a new hot spot, and database sequences can commit out of order.
@@ -84,6 +90,8 @@ In each API server's memory, never in the database:
 - **Crash safety:** a crash at any point leaves either the old packs or the new ones listed, never neither (the same write-then-switch-then-delete order as the client's G2 maintenance).
 
 ## 9. Cost gates in every benchmark run (S4, then each milestone)
+
+> **Built** (S4): `veil-bench load --mode branches`, the cost columns, and the gates for commits per landing and statements per up-to-date pull. Storage writes are reported, not gated, until S28. **A pull that brings new snapshots** makes one request per tree level, and each request reads its access epochs (the hard rule of §4), so it costs about one statement per request: about 8 for the load test's agents. Meeting 5 for those pulls needs fewer requests per pull (S3), not a weaker check.
 
 `veil-bench load` gains a mode where **many agents push to their own branches in one project**. It reports, per push and per pull:
 - storage writes and reads;

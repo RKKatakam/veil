@@ -6,6 +6,10 @@
 //!             [--tls-cert cert.pem --tls-key key.pem]   (default: self-signed)
 //! veil-server migrate --database-url postgres://…   (apply migrations, then exit)
 //! ```
+//!
+//! On `SIGUSR1` the server writes its request-path counters (storage
+//! writes and reads, cache hits and misses) to `DATA/stats.json`, for the
+//! benchmarks' cost gates (`docs/design/server/storage-and-cost.md` §9).
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
@@ -131,7 +135,44 @@ async fn serve() -> anyhow::Result<()> {
     if matches!(running.cert_pem.as_str(), s if !s.is_empty()) {
         println!("certificate: {}", data.join("self-signed-cert.pem").display());
     }
-    tokio::signal::ctrl_c().await?;
+    let hub = running.hub.clone();
+    let mut usr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    let mut n = 0u64;
+    // Written once at start: it says this server answers SIGUSR1.
+    let _ = std::fs::write(data.join("stats.json"), serde_json::to_vec(&stats(&hub, 0))?);
+    loop {
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => { r?; break; }
+            _ = usr1.recv() => {
+                n += 1;
+                let path = data.join("stats.json");
+                let tmp = data.join("stats.json.tmp");
+                let written = std::fs::write(&tmp, serde_json::to_vec(&stats(&hub, n))?).and_then(|_| std::fs::rename(&tmp, &path));
+                if let Err(e) = written {
+                    eprintln!("veil-server: writing {}: {e}", path.display());
+                }
+            }
+        }
+    }
     running.stop().await;
     Ok(())
+}
+
+/// The counters `SIGUSR1` writes (`n` counts the signals).
+fn stats(hub: &veil_server::Hub, n: u64) -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = &hub.caches.stats;
+    serde_json::json!({
+        "n": n,
+        "storage_writes": hub.objects.writes.load(Relaxed),
+        "storage_written_bytes": hub.objects.written_bytes.load(Relaxed),
+        "storage_reads": hub.objects.reads.load(Relaxed),
+        "session_hits": c.session_hits.load(Relaxed),
+        "session_misses": c.session_misses.load(Relaxed),
+        "permission_hits": c.permission_hits.load(Relaxed),
+        "permission_misses": c.permission_misses.load(Relaxed),
+        "tips_hits": c.tips_hits.load(Relaxed),
+        "tips_misses": c.tips_misses.load(Relaxed),
+        "notices": hub.caches.notices.load(Relaxed),
+    })
 }

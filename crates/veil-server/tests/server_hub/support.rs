@@ -24,6 +24,7 @@ pub struct TestHub {
     pub port: u16,
     pub ca: PathBuf,
     pub cert_pem: String,
+    config: Config,
     pub _dir: tempfile::TempDir,
 }
 
@@ -44,12 +45,6 @@ impl TestHub {
     /// A server whose objects are in the S3 store at `endpoint` (MinIO, or
     /// something in front of it), or in a temporary directory.
     pub fn start_with_s3(database_url: &str, ttl: Duration, endpoint: Option<String>) -> TestHub {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(8)
-            .thread_stack_size(veil_server::THREAD_STACK)
-            .build()
-            .unwrap();
         let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
         let storage = match endpoint {
             Some(endpoint) => Storage::S3 {
@@ -73,14 +68,37 @@ impl TestHub {
             // start-up catch-up by calling it.
             catch_up_at_start: false,
         };
-        let running = rt.block_on(veil_server::start(config)).expect("server starts");
-        let ca = dir.path().join("data/self-signed-cert.pem");
+        TestHub::run(config, dir)
+    }
+
+    /// Another server beside `other`, as a deployment runs several: the
+    /// same database, data directory (identity, certificate, receipt key)
+    /// and object storage.
+    pub fn beside(other: &TestHub) -> TestHub {
+        let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
+        let config = Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..other.config.clone()
+        };
+        TestHub::run(config, dir)
+    }
+
+    fn run(config: Config, dir: tempfile::TempDir) -> TestHub {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(8)
+            .thread_stack_size(veil_server::THREAD_STACK)
+            .build()
+            .unwrap();
+        let running = rt.block_on(veil_server::start(config.clone())).expect("server starts");
+        let ca = config.data_dir.join("self-signed-cert.pem");
         TestHub {
             port: running.addr.port(),
             cert_pem: running.cert_pem.clone(),
             running: Some(running),
             rt,
             ca,
+            config,
             _dir: dir,
         }
     }
@@ -321,6 +339,10 @@ impl Api {
             r = r.header("authorization", &format!("Bearer {t}"));
         }
         Self::finish(r.call())
+    }
+
+    pub fn agent_delete(&self, token: &str, path: &str) -> Reply {
+        Self::finish(self.agent.delete(format!("{}{path}", self.base)).header("authorization", &format!("Bearer {token}")).call())
     }
 
     pub fn post(&self, token: Option<&str>, path: &str, body: &[u8], json: bool) -> Reply {
