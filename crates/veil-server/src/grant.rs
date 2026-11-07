@@ -17,7 +17,7 @@
 //!   streamed with bounded memory, as `sync::fetch` is.
 //! * **Access epochs.** Every change that can take access away bumps an
 //!   epoch in its own transaction (database triggers,
-//!   `migrations/0004_access_epochs.sql`). The server refuses a grant older
+//!   `migrations/0007_access_epochs.sql`). The server refuses a grant older
 //!   than its project's or person's newest epoch on the next request;
 //!   `GET /v1/epochs?since=N` lists the changes for caches.
 //!

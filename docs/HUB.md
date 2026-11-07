@@ -1514,7 +1514,7 @@ Design: `docs/design/server/phase-2-thin-clients.md` §4.3–§4.5, §5.1. Code:
 `veil_core::hub::grant` (the grant, request signatures and the chain
 check: pure, WASM-safe, for the server, the Veil daemon (S6) and regional
 caches (S9)), `crates/veil-server/src/grant.rs` (issuing, the routes, the
-feed), `migrations/0004_access_epochs.sql`. Nothing new is encrypted:
+feed), `migrations/0007_access_epochs.sql`. Nothing new is encrypted:
 grants are **signed**.
 
 * **The grant.** `GET …/tips` (revision 2) returns, per branch, a grant
