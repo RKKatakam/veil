@@ -2556,6 +2556,68 @@ mod tests {
         assert!(!scan(b"x = 1\nkey AKIAIOSFODNN7EXAMPLE\n").is_empty());
     }
 
+    /// Adversarial pass, performance round 3: the literal check against
+    /// the full token search on adversarial pieces (case variants, split
+    /// and escaped prefixes, Unicode look-alikes, NUL padding), every
+    /// real token shape, NUL-stripped searches and windows with context
+    /// before `from` and overlap after `limit` (as the chunked passes
+    /// search them).
+    #[test]
+    fn token_literal_check_adversarial_windows() {
+        let pieces: &[&[u8]] = &[
+            b"AKIA", b"akia", b"AKIA\nIOSFODNN7EXAMPLE", b"AKIAIOSFODNN7EXAMPLE", b"ASIAIOSFODNN7EXAMPLE", b"ACCAIOSFODNN7EXAMPLE",
+            b"ABIAIOSFODNN7EXAMPLE", b"AK\0IA", b"A\0K\0I\0A\0", b"GHP_", b"ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789",
+            b"ghs_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789", b"github_pat_11ABCDEFG0aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789aBcDeFgHiJkLmNoPqRs",
+            b"glpat-aBcDeFgHiJkLmNoPqRsT", b"xoxb-1234567890-abc", b"xoxp-", b"XOXB-", b"sk_live_aBcDeFgHiJkLmNoPqRsT",
+            b"rk_live_aBcDeFgHiJkLmNoPqRsT", b"sk-ant-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345", b"sk-proj-Xk9mQ2vL7pR4wZt8uY3nXk9mQ2vL7pR4",
+            b"sk-Xk9mQ2vL7pR4wZt8uY3nXk9mQ2vL7pR4wZt8", b"SK-", b"s\xc2\xadk-", b"AIzaSyAbCdEfGhIjKlMnOpQrStUvWxYz012345678",
+            b"aiza", b"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig_nature-123", b"eyj", b"postgres://app:hunter2hunter2@db",
+            b"postgres:\\/\\/app:hunter2hunter2@db", b"postgres:%2F%2Fapp:hunter2hunter2@db", b":/\\/", b"\xef\xbc\x9a//",
+            b"-----BEGIN RSA PRIVATE KEY-----", b"-----BEGIN\tRSA PRIVATE KEY-----", b"-----begin ", b"-----BEGIN ", b"\xff\xfe",
+            b"\0", b"\0\0\0", b"\n", b"\r\n", b" ", b"_", b"-", b".", b"@", b":", b"//", b"Xk9mQ2vL7pR4wZt8uY3n", b"\xe2\x80\x8b",
+        ];
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut found = 0;
+        for round in 0..30_000 {
+            let n = 1 + next() % 16;
+            let mut text = Vec::new();
+            for _ in 0..n {
+                text.extend_from_slice(pieces[(next() % pieces.len() as u64) as usize]);
+            }
+            // NUL-padded variants, searched with the NULs removed.
+            let stripped = round % 3 == 0;
+            if stripped {
+                text.retain(|&b| b != 0);
+            }
+            let from = (next() as usize) % (text.len() + 1);
+            let limit = from + (next() as usize) % (text.len() - from + 1);
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            search_tokens(&text, from, limit, stripped, &mut a);
+            search_all_tokens(&text, from, limit, stripped, &mut b);
+            let key = |h: &Vec<Hit>| h.iter().map(|h| (h.rule, h.offset, h.excerpt.clone())).collect::<Vec<_>>();
+            assert_eq!(key(&a), key(&b), "{:?} {from}..{limit} stripped={stripped}", String::from_utf8_lossy(&text));
+            found += b.len();
+        }
+        assert!(found > 2000, "the inputs exercise the rules: {found} findings");
+        // UTF-16 (both orders) and UTF-32 files: the scan still finds every
+        // token kind through the NUL-stripped pass.
+        for token in ["AKIAIOSFODNN7EXAMPLE", "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789", "postgres://app:hunter2hunter2@db.example"] {
+            let line = format!("value {token}\n");
+            let le: Vec<u8> = line.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            let be: Vec<u8> = [0xfe, 0xff].into_iter().chain(line.encode_utf16().flat_map(|u| u.to_be_bytes())).collect();
+            let u32le: Vec<u8> = line.chars().flat_map(|c| (c as u32).to_le_bytes()).collect();
+            for data in [le, be, u32le] {
+                assert!(!scan(&data).is_empty(), "{token} in {:?}", &data[..8]);
+            }
+        }
+    }
+
     const PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
 QyNTUxOQAAACBGqZt3YkVvQ2mR8sXlN0pWcF4hTj7uK9eAoD1bLyS6xQAAAJgVb1oKFW9a
