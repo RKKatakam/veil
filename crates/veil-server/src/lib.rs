@@ -141,8 +141,9 @@ pub async fn start(config: Config) -> Result<Running> {
     let (tls, cert_pem, certificate) = tls::server_config(&config.tls, &config.data_dir)?;
     let db = db::connect(&config.database_url, config.db_connections).await.context("connecting to the database")?;
     db::migrate(&db).await.context("migrating the database")?;
-    // The background deriver's own connections (BUG-911).
-    let derive_db = db::connect(&config.database_url, derive::DERIVE_CONNECTIONS).await.context("connecting to the database")?;
+    // The background deriver's own connections (BUG-911), opened when a
+    // run first needs one.
+    let derive_db = db::connect_lazy(&config.database_url, derive::DERIVE_CONNECTIONS)?;
     let blob: Arc<dyn store::BlobStore> = match &config.storage {
         Storage::Dir(d) => Arc::new(store::FsStore::new(d)),
         Storage::S3 {

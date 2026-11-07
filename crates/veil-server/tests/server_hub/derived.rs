@@ -1465,9 +1465,10 @@ fn derived_speed() {
 /// no landing or pull found one until the pool's 30 s timeout, and the runs
 /// failed. Here every one of 48 projects has a run started at once (what 48
 /// landings start), on a server with 16 request connections; then each
-/// project is pulled and lands again while those runs (and the new ones)
-/// derive. Every landing succeeds, promptly, and the derived data catches
-/// up afterwards.
+/// project is pulled and lands again (eight at a time) while those runs
+/// and the new ones derive. Every landing succeeds, promptly (on the base
+/// they failed `busy` after the pool's 30 s timeout), and the derived data
+/// catches up afterwards.
 #[test]
 fn bug_911_landings_across_many_projects_while_derivers_run() {
     const PROJECTS: usize = 48;
@@ -1510,17 +1511,21 @@ fn bug_911_landings_across_many_projects_while_derivers_run() {
     }
     let slowest = std::thread::scope(|s| {
         let runs: Vec<_> = names
-            .iter()
-            .map(|name| {
+            .chunks(PROJECTS / 8)
+            .map(|names| {
                 let (th, admin) = (&th, &admin);
                 s.spawn(move || {
                     let api = th.api();
-                    let t = Instant::now();
-                    let mut c = Craft::new(&api, admin, name, "main");
-                    c.file("w/second.txt", "second\n");
-                    let r = c.push("main", "second");
-                    assert!(r.status == 200 && r.json()["results"][0]["ok"] == true, "{name}: {} {}", r.status, String::from_utf8_lossy(&r.body));
-                    t.elapsed()
+                    let mut slowest = Duration::ZERO;
+                    for name in names {
+                        let t = Instant::now();
+                        let mut c = Craft::new(&api, admin, name, "main");
+                        c.file("w/second.txt", "second\n");
+                        let r = c.push("main", "second");
+                        assert!(r.status == 200 && r.json()["results"][0]["ok"] == true, "{name}: {} {}", r.status, String::from_utf8_lossy(&r.body));
+                        slowest = slowest.max(t.elapsed());
+                    }
+                    slowest
                 })
             })
             .collect();

@@ -43,16 +43,24 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
 ];
 
 pub async fn connect(url: &str, max: u32) -> anyhow::Result<PgPool> {
+    let (pool, opts) = options(url, max)?;
+    Ok(pool.connect_with(opts).await?)
+}
+
+/// A pool that opens its connections when they are first needed (the
+/// background deriver's: BUG-911).
+pub fn connect_lazy(url: &str, max: u32) -> anyhow::Result<PgPool> {
+    let (pool, opts) = options(url, max)?;
+    Ok(pool.connect_lazy_with(opts))
+}
+
+fn options(url: &str, max: u32) -> anyhow::Result<(PgPoolOptions, sqlx::postgres::PgConnectOptions)> {
     let opts: sqlx::postgres::PgConnectOptions = url.parse()?;
     let opts = opts.options([
         ("statement_timeout", format!("{}", STATEMENT_TIMEOUT.as_millis())),
         ("lock_timeout", format!("{}", LOCK_TIMEOUT.as_millis())),
     ]);
-    Ok(PgPoolOptions::new()
-        .max_connections(max)
-        .acquire_timeout(Duration::from_secs(30))
-        .connect_with(opts)
-        .await?)
+    Ok((PgPoolOptions::new().max_connections(max).acquire_timeout(Duration::from_secs(30)), opts))
 }
 
 /// The advisory lock that one migrating process holds (any key; both
