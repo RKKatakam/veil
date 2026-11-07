@@ -44,6 +44,7 @@
 //! extends with the projections. [`read`] and [`view`] stay the internal
 //! reads of blame, file history and search (S14, S15).
 
+pub mod blame;
 pub mod changes;
 pub mod graph;
 pub mod lines;
