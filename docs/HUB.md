@@ -2193,4 +2193,151 @@ signed request can be replayed within ±5 minutes
 by whoever saw it (inside TLS: a cache, which is inside the boundary); it
 returns the same objects. Grants are made per branch at every tips request
 (one signature each). Not built (later milestones): `POST …/grants` for
-older snapshots, caches, `vl` reading through these routes (S3, S6).
+older snapshots, the Veil daemon, `vl` reading through these routes (S3,
+S6). Regional caches: S9, §13.18.
+
+### 13.18 S9: the regional cache (built)
+
+Design: `docs/design/server/phase-2-thin-clients.md` §4.1–§4.4, the S9 row
+of §9, and product decision 1 (removal at caches takes about 2 s, at most
+5). Code: `crates/veil-server/src/cache/` (`mod.rs` the routes and the
+decision, `epochs.rs` what the cache knows of access epochs, `disk.rs` its
+store, `relay.rs` passing the server's answers on, `feed.rs` the server's
+side); `veil-server cache` in `main.rs`. Touched elsewhere, minimally:
+`api.rs` (one route), `lib.rs` (the caches' token, `serve_tls` shared),
+`grant.rs` (`skip`, and its header parsers shared), and
+`veil_core::hub::grant::BatchRequest` (`skip`).
+
+```text
+veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
+                  [--listen 127.0.0.1:8444] [--size 10G] [--memory 256M]
+                  [--upstream-ca PEM] [--tls-cert C --tls-key K]
+```
+
+* **What it answers.** S5's object routes only, as the server answers
+  them: `GET /v1/objects/{p}/{id}` (with `Range`) and `POST
+  /v1/objects/{p}:batch`, the same headers, bodies, statuses and order.
+  Tips, grants, history, pushes and every other route go to the server; a
+  cache never says what `main` is. It holds **no database, no session, no
+  key and no permission authority**: only objects, the server's grant key
+  (public) and the caches' token.
+* **When it serves from its store** (in this order, nothing looked up
+  before its turn): the grant verifies under the server's grant key, for
+  this project, not expired; the request is signed by the grant's device
+  (§13.16); the grant's project epoch and its device's person epoch were
+  confirmed current by the server at most 5 s ago; the want's chain starts
+  at the grant's root and each step is an entry of a tree in the store
+  (`veil_core::hub::grant::Chains`, the server's own check), and only then
+  is the object looked up. An invalid grant or signature is `401
+  grant_invalid`, and a chain the root does not reach is `404` or left out
+  of a batch, as at the server; both are final, since trees are addressed
+  by their content and the cache reads only those it reached. **Everything
+  else goes to the server, with the client's own signed request:** the
+  grant key not known yet, epochs not confirmed (a first request, a stale
+  feed, an epoch other than the grant's), a tree of the chain or the object
+  not in the store. A batch is forwarded once, with `skip` naming the
+  objects the cache sends itself (unsigned: it only makes the answer
+  smaller), and the answer merges both in the request's order. What the
+  server sends is kept (whole objects of at most 16 MiB, each checked
+  against its id). A refusal from the server is passed on as it is; a
+  server the cache cannot reach is `503 unavailable`. **Concurrent misses are
+  coalesced:** a request fetching objects from the server marks them in
+  flight (at most 65,536 at once), and a later request needing one of them
+  waits for that fetch (at most 2 s), then decides again from the store, so
+  every agent reading a new tree after a landing costs the server one
+  request (tested: 24 readers at once, 1 request). A local object lost
+  between the check and the read (evicted, damaged) is left out of a batch
+  (the client asks again; the cache, which removed it, then asks the
+  server).
+* **Access epochs: the feed for caches.** `POST /v1/cache/epochs {projects,
+  devices}` (`feed.rs`), with the header `Veil-Cache-Token`, answers the
+  grant key, each named project's epoch and each named device's person
+  epoch, and leaves out a project that does not exist and a device that is
+  removed or pending (both void their grants), the same values
+  `Grants::current` reads for the server's own check, in two statements.
+  **Only the server's caches may ask:** the token is `<data>/hub-cache-token`
+  (32 random bytes, 0600, made at the first start; servers sharing a data
+  directory share it), compared by hash; a session, even an admin's, is
+  refused, since epochs tell who had an access change (BUG-1081). The cache
+  polls it every second for every project and device a grant named in the
+  last 15 minutes (a grant's life and the request skew; at most 100,000 of
+  each, 50,000 keys a request), and at once (within 50 ms) when a grant
+  names a new one.
+* **Removal within the bound.** A key's confirmation is the time its poll
+  was *sent*, so an access change committed at time R is in every poll sent
+  after R: the cache serves under a grant it voided only until R + 5 s at
+  the latest, and in practice within one poll (tested: a person removed from
+  a group, a policy that stopped `src/` being public, a device an admin
+  removed; refused at the cache 26–232 ms after the change returned, the
+  bound asserted). **Without the feed it fails closed:** 5 s after its last
+  answer nothing is served from the store, public objects included (a
+  policy change can make a public folder private), and every request goes
+  to the server (or gets `503`); it serves again at the next answer.
+* **The store** (`disk.rs`): objects as the server sends them (canonical
+  encodings; secret files stay ciphertext), keyed by a hash of the
+  project's name and the id (so projects never share an entry, and the
+  directory names no project), least recently used out first within
+  `--size` bytes and an entry count from `--memory`. Every object is checked
+  against its id when written and each time it is read: one that does not
+  match is removed and read as absent. A restart keeps the store.
+* **Memory** (`--memory`, default 256 MiB): a quarter for decoded trees, a
+  quarter for the store's index (128 bytes an object), half for objects
+  being read for answers (a semaphore across requests). Answers are
+  streamed in chunks of 256 KiB; a server's answer is passed on as it
+  arrives, holding at most the object being kept.
+* **Counters:** `SIGUSR1` writes `DIR/stats.json` (requests, objects from
+  the store and from the server, refusals, requests forwarded and why,
+  polls), for `veil-bench load --mode objects --via server,cache`
+  (`scripts/bench-server.sh cache`).
+
+**Measured** (`scripts/bench-server.sh cache` at `c97c32f`, release
+builds, server, cache, PostgreSQL, MinIO and the agents on one 32-thread
+machine; load 14 at the start, 104 at the end, so throughputs are noisy).
+A read is a fresh thin workspace's: the tips, then the root, `w/`,
+`w/seed/` and 100 of its 4 KiB files (103 objects, 4 requests), signed:
+
+| `main` | Agents | Via | Reads/s | p50 / p99 (ms) | Server CPU per read | Cache hits | Cache requests to the server per read | Cache CPU per read | Cache peak |
+|---|---:|---|---:|---|---:|---:|---:|---:|---:|
+| still | 10 | server | 2,540 | 3.9 / 5.9 | 2.56 ms | | | | |
+| still | 10 | cache | 2,516 | 3.6 / 8.6 | 0.19 ms | 100 % | 0.00 | 2.53 ms | 39 MiB |
+| still | 1,000 | server | 4,093 | 235 / 407 | 2.52 ms | | | | |
+| still | 1,000 | cache | 1,842 | 512 / 1,137 | 0.20 ms | 100 % | 0.00 | 2.48 ms | 177 MiB |
+| 20 landings/s | 100 | server | 2,075 | 45 / 99 | 2.32 ms | | | | |
+| 20 landings/s | 100 | cache | 4,982 | 20 / 33 | 0.20 ms | 99.99 % | 0.01 | 2.76 ms | 119 MiB |
+| 20 landings/s | 1,000 | server | 2,156 | 420 / 1,083 | 2.30 ms | | | | |
+| 20 landings/s | 1,000 | cache | 4,649 | 209 / 381 | 0.22 ms | 99.98 % | 0.02 | 2.89 ms | 194 MiB |
+
+Gates met: at least 99 % of objects from the cache's store, its peak at
+most 512 MiB (`--memory 256M`). The server's CPU per read falls about 12×
+(it answers the tips only); the cache spends about what the server did
+(reading one object a thread cost twice as much before `c97c32f`). On one
+machine the cache competes with the server for the same cores, so
+throughput and latency through it are not a regional win; what it removes
+is the server's work. Coalescing keeps requests to the server at 0.02 per
+read while `main` moves 20 times a second.
+
+**Threat review** (design §6 rows 1–4, 8, 9, 14, 15, 17, plus this
+milestone's):
+
+| # | Attacker | Tries | Result | Test (`server_hub::cache`) |
+|---|---|---|---|---|
+| 1 | Person without access to a folder | asks the cache, which holds every object of the project (the admin read them through it), for every real object id with every chain they can build: their trees, the admin's chain, the admin's chain from their root, the admin's root | nothing served; one at a time the server's own `404`; no request answered from the store | `the_cache_serves_only_what_a_grant_reaches` (5 viewers, anyone on Earth included, cold and warm) |
+| 2 | Same | a real grant with a chain through another snapshot's or the admin's trees | refused: chains start at the grant's root, each step from the hash-checked store | same |
+| 3 | Anyone holding a copy of a grant | uses it at the cache unsigned, from another device, over other ids, 6 minutes old, re-signed by the server's identity key, with a wider root, expired | `grant_invalid`, the object in the store untouched | `grants_at_the_cache_hold_only_for_their_device_and_time` |
+| 4 | A person removed from a group; a project whose policy changed; a device an admin removed | keeps using a grant at the cache, which holds the objects | refused within 5 s (measured 26–232 ms), and never served again | `a_removed_person_is_refused_at_the_cache_within_the_bound` |
+| 5 | Same, with the feed cut (a partition, a dead server) | keeps using a grant | 5 s after the last answer nothing from the store, public included; `503`; served again once the feed is back | `the_cache_fails_closed_without_the_feed` |
+| 6 | A local process, a torn write | changes bytes in the store | the object fails its id check, is removed, and comes from the server; never wrong bytes | `a_damaged_object_in_the_cache_is_never_served`; unit tests in `disk.rs` |
+| 7 | Anyone | a grant of one project at another project's URL | `grant_invalid`; entries are per project | test 1 |
+| 8 | Anyone on Earth; a signed-in person, an admin | reads the feed for caches (no token, a wrong one, a session) | `401`, naming nothing | `the_epoch_feed_for_caches_needs_the_caches_token` |
+| 9 | Hostile input | malformed grants (non-hex, 10 KB), chains of `MAX_CHAIN + 5`, non-hex chains and signatures, more than `MAX_WANTS` wants, bad JSON, routes the cache does not serve, a `Range` past the end or on a hidden object; a feed request with 50,001 keys, unknown fields, wrong types | refused cleanly (400/401/404/416), as at the server | tests 3 and 8 |
+| 10 | — (a cache that loses an object) | an object evicted or damaged between check and read | left out of a batch; the client asks again and the server sends it | `the_cache_store_keeps_to_its_size` (a 64 KiB store under 200 files of 4 KiB) |
+| 11 | A compromised regional cache | reads what it stores, serves it to anyone | plain-text code, as the server holds it (inside its boundary, design §4.1; `ARCHITECTURE.md` "Threat model"): as trusted as the object store; secret files only as ciphertext; it cannot sign a grant | the store holds no plaintext of `billing/.env` (test 1) |
+| 12 | — (load) | every agent reads a new tree after a landing | one request to the server per object, not one per reader | `concurrent_readers_of_a_new_object_cost_the_server_one_request` |
+
+**Residual:** the cache answers a request it can decide faster than one it
+forwards, so timing tells whether trees and objects the asker may read are
+in its store (that someone recently read a file they may read; design row
+14, accepted). A grant voided by an access change is still served from the
+store for up to one poll after the change (about a second, at most 5 s: the
+owner's bound). Not built: `vl` reading through the
+cache (S3), the Veil daemon (S6), the public CDN URLs of design §4.3.
