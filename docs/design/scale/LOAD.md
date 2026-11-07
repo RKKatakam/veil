@@ -398,6 +398,13 @@ landing.**
 | 1,000 | 1,000 | **1,084** | 196 | 1,785 | 14.7 | 0.27 | 13.3 | 4.2 | **1.06** | 11.5 | 13.7 | 6.6 | 0 |
 | 1,000 | 2,000 | **1,353** | 4,167 | 6,417 | 332.9 | 0.30 | 296.1 | 44.9 | 1.00 | 11.1 | 13.3 | 7.2 | 0 |
 
+**10,000 agents** (load average 19 before, 3 after; `bench5`; agents start
+from the tips, without a clone):
+
+| Agents | Target (/s) | Landed (/s) | p50 (ms) | p99 (ms) | Agents that landed | Landings per batch | Build CPU (ms/landing) | Store objects (ms/batch) | Transaction (ms/batch) | DB commits per landing | DB statements per landing | Storage writes per landing | Refused |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10,000 | 1,000 | **995** | 152 | 1,596 | 9,975 | 26.6 | 0.36 | 23.8 | 9.8 | **1.06** | 11.1 | 14.0 | 0 |
+
 **The whole curve, on a busier machine** (load 16 at the start, up to 199
 during the later points as other agents built; `bench3`):
 
@@ -409,10 +416,10 @@ during the later points as other agents built; `bench3`):
 | 1,000 | 100 | 100 | 10.7 | 190 | 5.5 (2.0) | 35 | 0 |
 | 1,000 | 1,000 | 841 | 2,033 | 3,083 | 1.02 | 12.8 | 0 |
 | 1,000 | 2,000 | 524 | 7,351 | 12,289 | 1.10 | 16.5 | 0 |
-| 10,000 | 1,000 | TEN_THOUSAND | | | | | |
 
 * **1,000 landings/s into one `main`: reached on a quiet machine** (1,084/s
-  at the 1,000/s target, 1,353/s at most), with no collision and no agent
+  at the 1,000/s target with 1,000 agents, 1,353/s at most; 995/s with
+  10,000 agents), with no collision and no agent
   ever pulling: one `main` was bent at 20–40/s before (§3), 35/s through
   the API (S10). Every change is its own snapshot; `main` moved 74 times a
   second at 1,000/s (14.7 changes per move) and 4 times a second at the
@@ -422,8 +429,8 @@ during the later points as other agents built; `bench3`):
   At 100/s each landing has its batch to itself, so it costs two; S12's
   deriver adds about 4 per batch in the background, as for a push.
   About 11 statements per landing.
-* **p50 196 ms and p99 1.8 s at 1,000/s: the latency targets (150 ms, 1 s)
-  are missed.** Where the time goes: a landing waits for its submit (an API
+* **p50 152–196 ms and p99 1.6–1.8 s at 1,000/s: the latency targets
+  (150 ms, 1 s) are missed** (p50 by a little, p99 by about 0.7 s). Where the time goes: a landing waits for its submit (an API
   commit's checks and objects: about 6 ms of CPU and 7–9 objects written)
   and then for one to two batch cycles. **The object store is the limit**:
   13.3 storage writes per landing (about 7 at the submit, the new trees and
@@ -438,10 +445,11 @@ during the later points as other agents built; `bench3`):
 * **50 agents cannot keep 1,000/s:** each has one landing in flight, so 50
   agents land at most 50 per request time; the design's point is for
   thousands of agents.
-* **Fairness:** every agent landed in every point (1,000 of 1,000, and 993–997
-  of 1,000 at 100/s, where some had no turn in 15 s).
+* **Fairness:** every agent landed in every point (1,000 of 1,000 at
+  1,000/s; 993–997 of 1,000 at 100/s and 9,975 of 10,000 at 1,000/s, where
+  some had no turn in 15 s).
 
-Raw results (not committed): `.scratch/bench-results/server-landing-d8cf2b2-20261107T143547Z*` (quiet) and the `bench3` log.
+Raw results (not committed): `.scratch/bench-results/server-landing-d8cf2b2-20261107T143547Z*` (quiet), `…T150318Z*` (10,000 agents) and the `bench3` log.
 
 ## What would raise each ceiling (not built)
 
