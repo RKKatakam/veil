@@ -51,6 +51,11 @@ tempfile.workspace = true
 # returns little of it, so the server held 2-3x its data. jemalloc with two
 # arenas and background purging (settings in src/main.rs) measured best.
 tikv-jemallocator = "=0.7.0"
+# Search (S15): grep's regular expressions run in linear time (no
+# backtracking), and their syntax tree gives the trigrams every match
+# holds. Both are in the tree already (veil-core's scanner).
+regex.workspace = true
+regex-syntax = "0.8"
 
 [features]
 # Tests that need Docker (PostgreSQL, YugabyteDB, MinIO): run by
