@@ -43,12 +43,15 @@
 //! `pg_stat_database`) and this tool's own CPU.
 //!
 //! **Cost per operation** (`docs/design/server/storage-and-cost.md` §9):
-//! database commits (transactions that wrote: transaction ids PostgreSQL
-//! assigned), statements, storage writes and reads (the server this tool
-//! started writes its counters on `SIGUSR1`), and bytes sent and received.
-//! **Gates**, which fail the run: at most 1 database commit per landing
-//! (`land`, `branches`), and at most 5 statements per pull with warm caches
-//! when nothing changed (`pull` with `--background 0`).
+//! database commits (transactions that wrote and committed: the ids
+//! PostgreSQL assigned in the window, each checked with `txid_status`), of
+//! which the deriver's background writes (S12), statements, storage writes
+//! and reads (the server this tool started writes its counters on
+//! `SIGUSR1`), and bytes sent and received.
+//! **Gates**, which fail the run: at most 1 database commit per landing,
+//! the deriver's background work aside (`land`, `branches`), and at most 5
+//! statements per pull with warm caches when nothing changed (`pull` with
+//! `--background 0`).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -584,18 +587,42 @@ fn db_statements(rt: &tokio::runtime::Runtime, url: &str) -> Option<(f64, &'stat
     })
 }
 
-/// Commits that wrote, so far: the transaction ids PostgreSQL assigned (a
-/// read-only transaction gets none), less the transactions rolled back (a
-/// compare-and-swap that loses a race takes an id, then rolls back).
-/// `None` elsewhere (YugabyteDB).
-fn db_writes(rt: &tokio::runtime::Runtime, url: &str) -> Option<f64> {
+/// The next transaction id PostgreSQL will assign (`None` elsewhere:
+/// YugabyteDB).
+fn next_xid(rt: &tokio::runtime::Runtime, url: &str) -> Option<i64> {
     rt.block_on(async {
         let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(url).await.ok()?;
-        // Statistics reach pg_stat_database within a second or so.
-        let _ = sqlx::query("SELECT pg_stat_force_next_flush()").execute(&mut c).await;
+        sqlx::query_scalar::<_, i64>("SELECT pg_snapshot_xmax(pg_current_snapshot())::text::bigint").fetch_one(&mut c).await.ok()
+    })
+}
+
+/// Transactions that wrote and committed among the ids `from..to`: each id
+/// is one transaction that wrote (a read-only one gets none); a
+/// compare-and-swap that lost a race took one and aborted.
+fn db_commits(rt: &tokio::runtime::Runtime, url: &str, from: i64, to: i64) -> Option<f64> {
+    rt.block_on(async {
+        let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(url).await.ok()?;
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM generate_series($1::bigint, $2::bigint - 1) x WHERE txid_status(x) = 'committed'",
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_one(&mut c)
+        .await
+        .ok()
+        .map(|n| n as f64)
+    })
+}
+
+/// Executions of the deriver's own writes so far (S12, in the background
+/// after a landing: `derive/mod.rs`), from `pg_stat_statements`: each is at
+/// most one commit of its own.
+fn deriver_writes(rt: &tokio::runtime::Runtime, url: &str) -> Option<f64> {
+    rt.block_on(async {
+        let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(url).await.ok()?;
         sqlx::query_scalar::<_, f64>(
-            "SELECT pg_snapshot_xmax(pg_current_snapshot())::text::float8 \
-             - (SELECT xact_rollback FROM pg_stat_database WHERE datname = current_database())::float8",
+            "SELECT coalesce(sum(calls), 0)::float8 FROM pg_stat_statements WHERE query ~* \
+             '^\\s*(INSERT INTO|UPDATE|DELETE FROM) (graph|file_history|rule_history|rule_lines|derive_progress)\\M'",
         )
         .fetch_one(&mut c)
         .await
@@ -633,8 +660,8 @@ pub fn missed_gates(r: &serde_json::Value, background: f64) -> Vec<String> {
         // maintenance (autovacuum, analyze) takes a few transactions.
         let ops = r["ops"].as_f64().unwrap_or(0.0);
         let over = |c: f64| c * ops > GATE_COMMITS_PER_PUSH * ops * 1.02 + 20.0;
-        if let Some(c) = r["db_commits_per_op"].as_f64().filter(|c| over(*c)) {
-            out.push(format!("{mode}: {c:.2} database commits per landing (gate: {GATE_COMMITS_PER_PUSH})"));
+        if let Some(c) = r["db_push_commits_per_op"].as_f64().filter(|c| over(*c)) {
+            out.push(format!("{mode}: {c:.2} database commits per landing, the deriver's aside (gate: {GATE_COMMITS_PER_PUSH})"));
         }
     }
     if mode == "pull" && background == 0.0 {
@@ -905,7 +932,8 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
         let before_db = db_cpu(a.db_container.as_deref());
         let before_self = cpu_of(std::process::id());
         let before_stmts = cx.stats.and_then(|(rt, url)| db_statements(rt, url));
-        let before_writes = cx.stats.and_then(|(rt, url)| db_writes(rt, url));
+        let before_xid = cx.stats.and_then(|(rt, url)| next_xid(rt, url));
+        let before_deriver = cx.stats.and_then(|(rt, url)| deriver_writes(rt, url));
         let before_server_stats = cx.server_stats.as_ref().and_then(|(pid, f)| server_stats(*pid, f));
         let (sent0, received0) = (BYTES_SENT.load(Ordering::Relaxed), BYTES_RECEIVED.load(Ordering::Relaxed));
         let req0 = c.requests.load(Ordering::Relaxed);
@@ -918,7 +946,12 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
         let db = db_cpu(a.db_container.as_deref()) - before_db;
         let me = cpu_of(std::process::id()).zip(before_self).map(|(b, a)| b - a);
         let stmts = cx.stats.and_then(|(rt, url)| db_statements(rt, url)).zip(before_stmts).map(|((b, what), (a, _))| (b - a, what));
-        let writes = cx.stats.and_then(|(rt, url)| db_writes(rt, url)).zip(before_writes).map(|(b, a)| b - a);
+        let writes = cx
+            .stats
+            .and_then(|(rt, url)| Some((rt, url, next_xid(rt, url)?)))
+            .zip(before_xid)
+            .and_then(|((rt, url, to), from)| db_commits(rt, url, from, to));
+        let deriver = cx.stats.and_then(|(rt, url)| deriver_writes(rt, url)).zip(before_deriver).map(|(b, a)| b - a);
         let (sent, received) = (BYTES_SENT.load(Ordering::Relaxed) - sent0, BYTES_RECEIVED.load(Ordering::Relaxed) - received0);
         let server_stats = cx.server_stats.as_ref().and_then(|(pid, f)| server_stats(*pid, f)).zip(before_server_stats);
         let stat = |k: &str| server_stats.as_ref().and_then(|(b, a)| Some(b[k].as_f64()? - a[k].as_f64()?));
@@ -953,6 +986,8 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate) 
             "db_counted": stmts.map(|(_, w)| w),
             "db_per_request": stmts.map(|(n, _)| if requests > 0 { n / requests as f64 } else { f64::NAN }),
             "db_commits_per_op": writes.map(per_op),
+            "db_deriver_writes_per_op": deriver.map(per_op),
+            "db_push_commits_per_op": writes.zip(deriver).map(|(w, d)| per_op((w - d).max(0.0))),
             "storage_writes_per_op": stat("storage_writes").map(per_op),
             "storage_written_bytes_per_op": stat("storage_written_bytes").map(per_op),
             "storage_reads_per_op": stat("storage_reads").map(per_op),
@@ -1078,7 +1113,7 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
         ));
     }
     out.push_str(
-        "\n| Mode | Projects | Clients | Target rate (/s) | DB commits per op | DB statements per op | DB statements per request | Storage writes per op | Storage reads per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates missed |\n\
+        "\n| Mode | Projects | Clients | Target rate (/s) | DB commits per op (the deriver's aside) | DB statements per op | DB statements per request | Storage writes per op | Storage reads per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates missed |\n\
          |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|\n",
     );
     let pct = |x: &serde_json::Value| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{:.0} %", v * 100.0)).unwrap_or_else(|| "–".into());
@@ -1086,12 +1121,13 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
     for r in v["runs"].as_array().ok_or_else(|| anyhow!("no runs"))? {
         let missed = r["gates_missed"].as_array().map(|m| m.len()).unwrap_or(0);
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} / {} / {} | {} |\n",
+            "| {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {} | {} | {} / {} / {} | {} |\n",
             r["mode"].as_str().unwrap_or(""),
             r["projects"],
             r["clients"],
             r["rate"].as_str().map(str::to_string).unwrap_or_else(|| f(&r["rate"], 2)),
             f(&r["db_commits_per_op"], 2),
+            f(&r["db_push_commits_per_op"], 2),
             f(&r["db_per_op"], 1),
             f(&r["db_per_request"], 2),
             f(&r["storage_writes_per_op"], 1),
