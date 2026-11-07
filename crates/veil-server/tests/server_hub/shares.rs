@@ -1,4 +1,4 @@
-//! Person-to-person secret shares (`docs/HUB.md` §13.15): `vl secret share
+//! Person-to-person secret shares (`docs/HUB.md` §13.17): `vl secret share
 //! PATH --with PERSON`, `unshare`, `shares`, and their background delivery.
 //! Most tests play a **compromised server**: it writes its own rows (devices,
 //! vouches, share records) and must never read a share nor get one sealed

@@ -449,7 +449,7 @@ the local vault's document has none of them:
 
 `vl secret shares --json`: the person-to-person secret shares you make and
 receive on the project's server (an admin: every share of the project;
-`docs/HUB.md` §13.15). Never a share's content. What is delivered to you on
+`docs/HUB.md` §13.17). Never a share's content. What is delivered to you on
 the way is reported on standard error.
 
 | Field | Type | Meaning |

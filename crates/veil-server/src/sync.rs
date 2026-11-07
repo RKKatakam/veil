@@ -27,6 +27,7 @@
 //! `projections` under the viewer's view key.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -37,7 +38,8 @@ use veil_core::{
     hub::{
         access::{AccessPolicy, View},
         project::{Change, Graft, Node, Projector, TreeSource},
-        wire::{put_frame, BranchResult, PushRequest, PushResult, Want},
+        encoding,
+        wire::{put_frame, BranchResult, PushRequest, PushResult, Want, MAX_FRAME_OBJECT},
     },
     object::{EntryKind, Object, Snapshot, Tree, Visibility},
     policy::{Policy, Tier, POLICY_FILE},
@@ -100,6 +102,17 @@ impl Source {
         self.hub
             .objects
             .get_blocking(&self.rt, self.project, id)
+            .map_err(|e| VeilError::Repo(format!("object store: {e}")))?
+            .ok_or(VeilError::Missing(*id))
+    }
+
+    /// Object `id` as stored ([`crate::store::Objects::get_encoded`]).
+    pub fn encoded(&self, id: &ObjectId) -> veil_core::Result<Bytes> {
+        if let Some(b) = builtin(id) {
+            return Ok(b);
+        }
+        self.rt
+            .block_on(self.hub.objects.get_encoded(self.project, id))
             .map_err(|e| VeilError::Repo(format!("object store: {e}")))?
             .ok_or(VeilError::Missing(*id))
     }
@@ -516,8 +529,16 @@ pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer) -> Result<
 }
 
 /// The snapshots reachable from `tips` in `viewer`'s projected history,
-/// down to (not including) `stop`, as object frames.
-pub async fn history(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId], stop: &[ObjectId]) -> Result<Vec<u8>> {
+/// down to (not including) `stop`, as object frames: as stored, compressed
+/// or not, when the caller reads `encoded` frames.
+pub async fn history(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    tips: &[ObjectId],
+    stop: &[ObjectId],
+    encoded: bool,
+) -> Result<Vec<u8>> {
     let mut starts = Vec::new();
     for t in tips {
         let Some(real) = resolve(hub, project.id, &project.view(viewer).key(), t).await?.into_iter().next() else {
@@ -541,7 +562,10 @@ pub async fn history(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &
             let Object::Snapshot(s) = Object::decode(&raw)? else {
                 return Err(Error::Other(anyhow::anyhow!("projected history holds a non-snapshot")));
             };
-            put_frame(&mut out, &id, &raw);
+            match encoded {
+                true => put_frame(&mut out, &id, &src.encoded(&id)?),
+                false => put_frame(&mut out, &id, &raw),
+            }
             stack.extend(s.parents.iter().copied());
         }
         Ok(out)
@@ -550,7 +574,10 @@ pub async fn history(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &
 }
 
 /// Objects `wants` under snapshot `snapshot`, each checked against what
-/// `viewer` may read at its path, as a stream of object frames. Anything
+/// `viewer` may read at its path, as a stream of object frames (`encoded`:
+/// each object as stored, compressed or not, for a caller that reads
+/// encoded frames; the projected trees made for this viewer as they
+/// are). Anything
 /// not found at its path in the viewer's projection is refused as not
 /// found, without saying whether it exists.
 ///
@@ -559,7 +586,7 @@ pub async fn history(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &
 /// is read and sent a few objects ahead of the caller (`FETCH_WINDOW`);
 /// a failure while sending ends the stream with an error, so it is never
 /// taken as whole.
-pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot: ObjectId, wants: Vec<Want>) -> Result<FrameStream> {
+pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot: ObjectId, wants: Vec<Want>, encoded: bool) -> Result<FrameStream> {
     // Each want is checked in its own snapshot (revision 1), as the viewer
     // sees it.
     let mut reals: HashMap<ObjectId, ObjectId> = HashMap::new();
@@ -615,7 +642,13 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
                     }
                     None => {
                         let (hub, i) = (hub.clone(), next);
-                        set.spawn(async move { (i, hub.objects.get(pid, &id).await) });
+                        set.spawn(async move {
+                            let got = match encoded {
+                                true => hub.objects.get_encoded(pid, &id).await,
+                                false => hub.objects.get(pid, &id).await,
+                            };
+                            (i, got)
+                        });
                     }
                 }
                 ahead += sizes[next];
@@ -1502,42 +1535,97 @@ pub(crate) fn receipted(hub: &Hub, project: i64, person: i64, receipts: &std::co
         .collect()
 }
 
-/// Store uploaded objects (`docs/HUB.md` §4.5): each is re-hashed against
-/// its id and must decode canonically (safe names, sorted trees) at a
-/// repository format the server serves. Nothing uploaded is visible until a
-/// push makes a branch reach it. Returns a receipt per object, in order
-/// (stored whether or not the project held it already, so the answer is
-/// the same either way).
-pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes) -> Result<Vec<String>> {
-    // Each object copied out of the request: a slice would keep the whole
-    // body alive in the object cache for as long as any one of its objects
-    // stays there (BUG-860).
-    let frames: Vec<(ObjectId, Bytes)> = veil_core::hub::wire::read_frames(&body)?
-        .into_iter()
-        .map(|(id, raw)| (id, Bytes::copy_from_slice(raw)))
-        .collect();
-    drop(body);
-    for (_, raw) in &frames {
-        if Object::min_repo_format(raw) > veil_core::repo::REPO_FORMAT {
-            return Err(Error::bad_request("an object of a newer format than this server serves"));
+/// Store uploaded objects (`docs/HUB.md` §4.5). Each frame, plain or
+/// compressed (`docs/HUB.md` §13.15), is decoded (bounded: at most the
+/// object size limit each, at most `limit` bytes for the whole request, a
+/// compressed one only if it expands at most [`encoding::MAX_RATIO`] times
+/// its size, and at most [`DECODING_IN_FLIGHT`] bytes across the server at
+/// once: BUG-1009), re-hashed against its id, and must decode canonically
+/// (safe names, sorted trees) at a repository format the server serves.
+/// It is stored as the server's own encoding of it, never as the client
+/// sent it, so no client chooses the stored bytes of an object others
+/// share (BUG-1008). Nothing uploaded is visible until a push makes a
+/// branch reach it. Returns a receipt per object, in order (stored whether
+/// or not the project held it already, so the answer is the same either
+/// way).
+pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limit: u64) -> Result<Vec<String>> {
+    // The checks, decoding and compressing on a blocking thread.
+    let rt = Handle::current();
+    let frames: Vec<(ObjectId, Bytes)> = tokio::task::spawn_blocking(move || -> Result<Vec<(ObjectId, Bytes)>> {
+        let mut left = limit;
+        let mut out = Vec::new();
+        for (id, enc) in encoding::split_frames(&body)? {
+            if !encoding::within_ratio(enc) {
+                return Err(Error::bad_request(format!(
+                    "object {} expands more than {} times its compressed size: send it uncompressed",
+                    id.short(),
+                    encoding::MAX_RATIO
+                )));
+            }
+            // Bytes decoded from a compressed frame count against the
+            // server-wide bound while they are held.
+            let _decoding = match encoding::is_compressed(enc) {
+                true => {
+                    let n = encoding::decoded_len(enc).unwrap_or(0).min(DECODING_IN_FLIGHT as u64) as u32;
+                    Some(rt.block_on(DECODING.acquire_many(n)).map_err(|e| Error::Other(e.into()))?)
+                }
+                false => None,
+            };
+            let raw = encoding::decode(&id, enc, left.min(MAX_FRAME_OBJECT as u64))?;
+            left -= raw.len() as u64;
+            if Object::min_repo_format(&raw) > veil_core::repo::REPO_FORMAT {
+                return Err(Error::bad_request("an object of a newer format than this server serves"));
+            }
+            // Any bytes are a blob: decoding one would only copy it.
+            if !raw.starts_with(b"veil:blob\n") {
+                Object::decode(&raw)?;
+            }
+            // The server's own encoding of what it decoded (BUG-1008). Each
+            // is its own allocation: a slice would keep the whole body
+            // alive in the object cache (BUG-860).
+            let compressed = match encoding::encode(&raw) {
+                Cow::Owned(z) => Some(z),
+                Cow::Borrowed(_) => None,
+            };
+            let stored = match (compressed, raw) {
+                (Some(z), _) => Bytes::from(z),
+                (None, Cow::Owned(r)) => Bytes::from(r),
+                (None, Cow::Borrowed(r)) => Bytes::copy_from_slice(r),
+            };
+            out.push((id, stored));
         }
-        Object::decode(raw)?;
-    }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| Error::Other(e.into()))??;
     let receipts = frames.iter().map(|(id, _)| receipt(hub, project, person, id)).collect();
-    put_all(hub, project, frames).await?;
+    // Encodings, checked above: stored as they are, never encoded again.
+    put_many(hub, project, frames, true).await?;
     Ok(receipts)
 }
 
-/// Store `objects` in `project`, at most [`PUTS_AT_ONCE`] at a time (an
-/// object store answers a flood with "slow down": BUG-1053).
+/// Store `objects` (canonical encodings; compressed by the store) in
+/// `project`, at most [`PUTS_AT_ONCE`] at a time (an object store answers a
+/// flood with "slow down": BUG-1053).
 pub async fn put_all(hub: &Arc<Hub>, project: i64, objects: impl IntoIterator<Item = (ObjectId, Bytes)>) -> Result<()> {
+    put_many(hub, project, objects, false).await
+}
+
+/// [`put_all`] of canonical encodings, or (`encoded`) of checked encodings
+/// stored as they are ([`crate::store::Objects::put_encoded`]).
+async fn put_many(hub: &Arc<Hub>, project: i64, objects: impl IntoIterator<Item = (ObjectId, Bytes)>, encoded: bool) -> Result<()> {
     let mut set = tokio::task::JoinSet::new();
     let mut it = objects.into_iter();
     loop {
         while set.len() < PUTS_AT_ONCE {
-            let Some((id, raw)) = it.next() else { break };
+            let Some((id, b)) = it.next() else { break };
             let h = hub.clone();
-            set.spawn(async move { h.objects.put(project, &id, raw).await });
+            set.spawn(async move {
+                match encoded {
+                    true => h.objects.put_encoded(project, &id, b).await,
+                    false => h.objects.put(project, &id, b).await,
+                }
+            });
         }
         match set.join_next().await {
             Some(r) => r.map_err(|e| Error::Other(e.into()))??,
@@ -1546,6 +1634,11 @@ pub async fn put_all(hub: &Arc<Hub>, project: i64, objects: impl IntoIterator<It
     }
     Ok(())
 }
+
+/// Bytes decoded from compressed uploads the server holds at once, across
+/// every request (BUG-1009); an object larger than this takes all of it.
+pub const DECODING_IN_FLIGHT: u32 = 256 << 20;
+static DECODING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(DECODING_IN_FLIGHT as usize);
 
 /// Most object writes one request has in flight ([`put_all`]).
 pub const PUTS_AT_ONCE: usize = 64;
