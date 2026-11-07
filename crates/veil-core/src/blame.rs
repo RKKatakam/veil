@@ -896,7 +896,7 @@ mod tests {
             let edge = tok(rnd()).to_string();
             let mid = |rnd: &mut dyn FnMut() -> u64| -> String {
                 let n = (rnd() % 12) as usize;
-                (0..n).map(|_| if rnd() % 3 == 0 { edge.clone() } else { tok(rnd()).to_string() }).collect()
+                (0..n).map(|_| if rnd().is_multiple_of(3) { edge.clone() } else { tok(rnd()).to_string() }).collect()
             };
             let (pre, suf) = (edge.repeat((rnd() % 6) as usize), edge.repeat((rnd() % 6) as usize));
             let base = format!("{pre}{}{suf}", mid(&mut rnd));
@@ -910,7 +910,7 @@ mod tests {
                     let mut v: Vec<String> = base.split_inclusive('\n').map(str::to_string).collect();
                     for _ in 0..1 + rnd() % 3 {
                         let at = (rnd() as usize) % (v.len() + 1);
-                        let block: Vec<String> = (0..1 + rnd() % 3).map(|_| if rnd() % 2 == 0 { edge.clone() } else { tok(rnd()).to_string() }).collect();
+                        let block: Vec<String> = (0..1 + rnd() % 3).map(|_| if rnd().is_multiple_of(2) { edge.clone() } else { tok(rnd()).to_string() }).collect();
                         match rnd() % 3 {
                             0 => {
                                 v.splice(at..at, block);
@@ -926,13 +926,13 @@ mod tests {
                     v.concat()
                 }
             };
-            if case % 11 == 0 {
+            if case.is_multiple_of(11) {
                 old.clear();
             }
-            if case % 7 == 0 {
+            if case.is_multiple_of(7) {
                 new.pop();
             }
-            if case % 13 == 0 {
+            if case.is_multiple_of(13) {
                 old.pop();
             }
             let n = line_ranges(new.as_bytes()).len();
@@ -946,7 +946,7 @@ mod tests {
         let (mut coarse, mut fine) = (0, 0);
         for len in (1_000..9_000).step_by(500) {
             for ends in [3usize, 2_000] {
-                let pick = |r: u64| if r % 2 == 0 { "x\n" } else { "e\n" };
+                let pick = |r: u64| if r.is_multiple_of(2) { "x\n" } else { "e\n" };
                 let o: String = (0..len).map(|_| pick(rnd())).collect();
                 let w: String = (0..len).map(|_| pick(rnd())).collect();
                 let e = "e\n".repeat(ends);
