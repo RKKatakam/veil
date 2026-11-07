@@ -1288,4 +1288,353 @@ mod s13_adversarial {
             "{k} cold fills: took {took:?}, unrelated statement {probe:?}, answers {codes:?}"
         );
     }
+    // ---- S13 cycle 2 -------------------------------------------------------------
+
+    /// A line of `n` snapshots on `main`, each changing `pub/a.txt` and
+    /// every other one `fin/b.txt` too, so that every view key's projection
+    /// differs from the admins' (a fill walks and projects all of it).
+    fn line(th: &TestHub, h: &mut Hist, n: usize) -> ObjectId {
+        let mut files = Files::new();
+        let mut tip = root_snapshot_id();
+        for i in 0..n {
+            files.insert("pub/a.txt".into(), format!("version {i}\n").into_bytes());
+            if i % 2 == 0 {
+                files.insert("fin/b.txt".into(), format!("ledger {i}\n").into_bytes());
+            }
+            let mut change = [0u8; 16];
+            change[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+            change[15] = 0xa7;
+            tip = h.commit(th, &[tip], files.clone(), change, 1_700_000_000_000 + i as i64 * 1000, None);
+        }
+        h.set_branch(th, "main", tip);
+        tip
+    }
+
+    /// Viewers of `project` with distinct view keys (the admins' last).
+    fn distinct_viewers(project: &veil_server::perm::Project, carol: i64) -> Vec<Viewer> {
+        let mut keys = HashSet::new();
+        let mut out: Vec<Viewer> = viewers(carol).into_iter().map(|(_, v)| v).chain([admin()]).filter(|v| keys.insert(project.view(v).key())).collect();
+        out.truncate(query::graph::MAX_FILLS + 1);
+        assert_eq!(out.len(), query::graph::MAX_FILLS + 1, "enough distinct view keys");
+        out
+    }
+
+    fn code(r: &veil_server::error::Result<Value>) -> String {
+        match r {
+            Ok(_) => "ok".into(),
+            Err(Error::Api { code, .. }) => code.to_string(),
+            Err(e) => format!("{e:?}").chars().take(160).collect(),
+        }
+    }
+
+    /// BUG-1074: a query whose view key is cold starts its fill only if one
+    /// of the server's `MAX_FILLS` slots frees up before the query's own
+    /// deadline (`graph::start_or_join` waits for the slot *before* it
+    /// registers the fill). A query that gives up leaves nothing queued, so
+    /// `ensure`'s promise ("a query's deadline never bounds, nor pays for,
+    /// a first fill") is broken: while four fills run (landings, which wait
+    /// with no deadline, other projects' first fills, anyone on Earth's
+    /// queries of cold public projects), every query of the cold key
+    /// answers `warming`, and when they end the key is still cold. Under a
+    /// steady supply of fills it never warms: the queries starve.
+    #[test]
+    #[ignore = "BUG-1074: a query that waits out its deadline for a fill slot leaves no fill queued; its view key stays cold"]
+    fn bug_1074_a_query_that_waits_out_its_deadline_for_a_fill_slot_never_fills() {
+        let th = TestHub::start();
+        let carol = 760_001;
+        let (policy_text, bindings) = policy(carol);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let n: usize = std::env::var("VEIL_BUG1074_LINE").ok().and_then(|s| s.parse().ok()).unwrap_or(400);
+        let tip = line(&th, &mut h, n);
+        let project = h.project(&th);
+        let vs = distinct_viewers(&project, carol);
+        let hub = th.hub();
+        // Four fills, as four landings start them (no deadline).
+        let t = Instant::now();
+        let busy: Vec<_> = vs[..query::graph::MAX_FILLS]
+            .iter()
+            .map(|v| {
+                let (hub, project, v) = (hub.clone(), project.clone(), v.clone());
+                th.rt.spawn(async move { query::graph::ensure(&hub, &project, &v, &[tip], None).await.map(|_| ()) })
+            })
+            .collect();
+        while hub.query.fills_started(h.id) < query::graph::MAX_FILLS as u64 {
+            assert!(t.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Meanwhile a fifth viewer asks for the log, with a deadline of
+        // 300 ms: `warming`, as the design says, "and the fill goes on".
+        let late = ask(&th, &h, &vs[4]);
+        let quick = Limits {
+            deadline: Duration::from_millis(300),
+            ..Limits::default()
+        };
+        let answer = code(&th.rt.block_on(query::log(&hub, &late, LogParams::default(), quick)));
+        let all_busy = !busy.iter().any(|b| b.is_finished());
+        for b in busy {
+            th.rt.block_on(b).unwrap().unwrap();
+        }
+        let busy_took = t.elapsed();
+        // Nobody asks any more: the fill the query asked for runs now, if
+        // anything queued it (up to 30 s; asking would start it).
+        let wait = Instant::now();
+        while hub.query.fills_started(h.id) <= query::graph::MAX_FILLS as u64 && wait.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let started = hub.query.fills_started(h.id);
+        println!("BUG-1074: four fills of a line of {n} took {busy_took:?}; a fifth view key's query meanwhile answered {answer}; fills started {:?} after: {started}", wait.elapsed());
+        assert!(answer == "warming" && all_busy, "precondition: the four fills ended before the query met its deadline (make the line longer): {answer}");
+        assert_eq!(
+            started,
+            query::graph::MAX_FILLS as u64 + 1,
+            "the query met its deadline waiting for a fill slot and left no fill of its view key queued: still cold once every slot was free"
+        );
+        let a = ask(&th, &h, &vs[4]);
+        let patient = Limits {
+            deadline: Duration::from_secs(120),
+            ..Limits::default()
+        };
+        assert_eq!(code(&th.rt.block_on(query::log(&hub, &a, LogParams::default(), patient))), "ok");
+        assert_eq!(hub.query.fills_started(h.id), query::graph::MAX_FILLS as u64 + 1, "the queued fill was the one");
+    }
+
+    /// BUG-1075: a fill holds one of the server's `MAX_FILLS` slots while it
+    /// waits for another server's lease on its view key
+    /// (`graph::leased_fill` polls for up to `FILL_LOCK_WAIT`, 600 s, inside
+    /// the slot `start_or_join` took). Another server filling four view keys
+    /// (anyone on Earth asking it for four cold public projects' logs) or a
+    /// server that stopped mid-fill (its leases stand for 120 s) makes this
+    /// server's landings and queries of the same keys take all four slots
+    /// and wait: no fill of any other key runs here, though none is
+    /// running; every cold query on the server answers `warming`.
+    #[test]
+    #[ignore = "BUG-1075: fills waiting for another server's lease hold this server's fill slots"]
+    fn bug_1075_fills_waiting_for_another_servers_lease_hold_every_slot() {
+        let th = TestHub::start();
+        let carol = 760_002;
+        let (policy_text, bindings) = policy(carol);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let tip = line(&th, &mut h, 12);
+        let project = h.project(&th);
+        let vs = distinct_viewers(&project, carol);
+        let hub = th.hub();
+        // Another server holds the leases of four of the project's keys.
+        let now = veil_core::now_millis();
+        for v in &vs[..query::graph::MAX_FILLS] {
+            let key = project.view(v).key();
+            th.rt.block_on(again(|| {
+                sqlx::query("INSERT INTO view_fills (project_id, view_key, holder, expires_at) VALUES ($1, $2, 'another-server', $3)")
+                    .bind(h.id)
+                    .bind(&key)
+                    .bind(now + 600_000)
+                    .execute(&hub.db)
+            }));
+        }
+        // Landings here need the same keys (as `memo_tips` does).
+        let t = Instant::now();
+        let waiting: Vec<_> = vs[..query::graph::MAX_FILLS]
+            .iter()
+            .map(|v| {
+                let (hub, project, v) = (hub.clone(), project.clone(), v.clone());
+                th.rt.spawn(async move { query::graph::ensure(&hub, &project, &v, &[tip], None).await.map(|_| ()) })
+            })
+            .collect();
+        while hub.query.fills_started(h.id) < query::graph::MAX_FILLS as u64 {
+            assert!(t.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // A key no server is filling: a short history, ten seconds.
+        let a = ask(&th, &h, &vs[4]);
+        let limits = Limits {
+            deadline: Duration::from_secs(10),
+            ..Limits::default()
+        };
+        let q = Instant::now();
+        let r = th.rt.block_on(query::log(&hub, &a, LogParams::default(), limits));
+        let took = q.elapsed();
+        // The other server finishes: the waiting fills go on.
+        th.rt.block_on(again(|| sqlx::query("DELETE FROM view_fills WHERE project_id = $1 AND holder = 'another-server'").bind(h.id).execute(&hub.db)));
+        for w in waiting {
+            th.rt.block_on(w).unwrap().unwrap();
+        }
+        println!("BUG-1075: four fills waiting for another server's leases; a query of a fifth, cold key of 12 snapshots answered {} after {took:?}", code(&r));
+        assert_eq!(code(&r), "ok", "a cold key no server fills waited {took:?} for a slot held by fills that only wait");
+    }
+
+    /// BUG-1076: a log page's cursor is the walk's whole frontier, and the
+    /// next page refuses a cursor naming more than `Limits::cursor`
+    /// snapshots (1,000): so a log whose frontier is wider than that cannot
+    /// be paged past, for everyone who sees it. With the walk by
+    /// generation, the frontier holds every fork point whose branch was
+    /// shown: `k` long-lived branches, each forked from its own main-line
+    /// snapshot and merged at the top, leave all `k` fork points in it
+    /// (the client's Kahn walk held only the main line's next snapshot).
+    /// Here `k` = 8 with a cursor limit of 8; by default, 1,000 branches.
+    #[test]
+    #[ignore = "BUG-1076: a log cursor (the whole frontier) can name more snapshots than the next page accepts"]
+    fn bug_1076_a_log_cursor_names_more_snapshots_than_the_next_page_accepts() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let k: usize = std::env::var("VEIL_BUG1076_BRANCHES").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+        let t0 = 1_700_000_000_000i64;
+        let mut files = Files::new();
+        let mut main = vec![root_snapshot_id()];
+        for i in 0..k + 2 {
+            files.insert("pub/main.txt".into(), format!("main {i}\n").into_bytes());
+            let mut change = [0u8; 16];
+            change[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+            change[15] = 0xb1;
+            let tip = *main.last().unwrap();
+            main.push(h.commit(&th, &[tip], files.clone(), change, t0 + i as i64 * 1000, None));
+        }
+        let mut top = *main.last().unwrap();
+        let mut all = files.clone();
+        for i in 1..=k {
+            let mut f = h.files[&main[i]].clone();
+            f.insert(format!("pub/b{i}.txt"), b"branch\n".to_vec());
+            let mut change = [0u8; 16];
+            change[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            change[15] = 0xb2;
+            let x = h.commit(&th, &[main[i]], f, change, t0 + 1_000_000 + i as i64, None);
+            all.insert(format!("pub/b{i}.txt"), b"branch\n".to_vec());
+            change[15] = 0xb3;
+            top = h.commit(&th, &[top, x], all.clone(), change, t0 + 2_000_000 + i as i64, None);
+        }
+        h.set_branch(&th, "main", top);
+        warm_up(&th, &h, &Viewer::default());
+        let a = ask(&th, &h, &Viewer::default());
+        let limits = Limits {
+            cursor: k,
+            ..Limits::default()
+        };
+        let total = h.order.len() + 1; // and the root
+        let (mut seen, mut after, mut pages) = (0usize, None::<String>, Vec::new());
+        loop {
+            let r = th.rt.block_on(query::log(&h.hub, &a, LogParams { n: Some(2 * k), after: after.clone(), ..Default::default() }, limits));
+            let v = match r {
+                Ok(v) => v,
+                Err(e) => {
+                    let width = after.as_deref().map_or(0, |c| c.split(',').count());
+                    println!("BUG-1076: {k} long-lived branches, cursor limit {k}: pages {pages:?}, then a cursor of {width} snapshots: {e:?}");
+                    panic!("after {seen} of {total} entries, the server refused the cursor it gave ({width} snapshots, limit {k}): {e:?}");
+                }
+            };
+            let got = v["entries"].as_array().unwrap().len();
+            seen += got;
+            pages.push(got);
+            match v["next"].as_str() {
+                Some(c) => after = Some(c.to_string()),
+                None => break,
+            }
+            assert!(pages.len() < 100);
+        }
+        assert_eq!(seen, total);
+    }
+    /// BUG-1077: `SIMILAR_MAX_HELD` (16 MiB) counts the deleted files'
+    /// bytes, but what is held is their tables of line hashes: an entry of
+    /// 12 bytes, in a hash table, per distinct line. Lines of 4 bytes
+    /// (three non-zero bytes and a newline: 16 million distinct ones) make
+    /// a table several times its file, so one anonymous `diff` holds
+    /// several times the stated bound; and nothing bounds how many run at
+    /// once (each on its own blocking thread, up to 512).
+    #[test]
+    #[ignore = "BUG-1077: rename detection holds line tables several times SIMILAR_MAX_HELD"]
+    fn bug_1077_rename_detection_holds_far_more_than_its_held_bound() {
+        const CHILD: &str = "VEIL_BUG1077_CHILD";
+        if std::env::var(CHILD).is_err() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "query::s13_adversarial::bug_1077_rename_detection_holds_far_more_than_its_held_bound", "--nocapture", "--include-ignored"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines().filter(|l| l.contains("BUG-1077:")) {
+                println!("{line}");
+            }
+            assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+            return;
+        }
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        // Just under 1 MiB of distinct 4-byte lines (no zero byte, so text).
+        let blob = |salt: u8| -> (ObjectId, Vec<u8>, u64) {
+            let mut b = Vec::with_capacity(1 << 20);
+            let nl = |v: u8| if v == b'\n' { 251 } else { v };
+            for j in 0..((1u32 << 20) - 64) / 4 {
+                let c = |k: u32| ((j / k) % 250) as u8 + 1;
+                b.extend_from_slice(&[nl(c(62_500) + salt), nl(c(250)), nl(c(1)), b'\n']);
+            }
+            let raw = Object::Blob(b.clone()).encode();
+            (ObjectId::hash(&raw), raw, b.len() as u64)
+        };
+        let (ida, rawa, sa) = blob(0);
+        let (idb, rawb, sb) = blob(5);
+        let n = 15; // 15 MiB: under the 16 MiB held
+        let mut oa = vec![(ida, rawa)];
+        let ta = folder_of_copies("a", n, ida, sa, &mut oa);
+        let mut ob = vec![(idb, rawb)];
+        let tb = folder_of_copies("b", n, idb, sb, &mut ob);
+        let x = commit_tree(&th, &mut h, &[root_snapshot_id()], ta, oa, 1, 1_000);
+        let y = commit_tree(&th, &mut h, &[x], tb, ob, 2, 2_000);
+        h.set_branch(&th, "main", y);
+        let a = ask(&th, &h, &Viewer::default());
+        warm_up(&th, &h, &Viewer::default());
+        let slow = Limits {
+            deadline: Duration::from_secs(120),
+            ..Limits::default()
+        };
+        let p = DiffParams { from: x.hex(), to: Some(y.hex()), base: Some("from".into()), stat: Some(true), path: None };
+        let t = Instant::now();
+        let (r, grew) = peak_growth(|| th.rt.block_on(query::diff(&h.hub, &a, p, slow)));
+        let r = r.unwrap();
+        println!(
+            "BUG-1077: diff of {n} deleted and {n} added files of 1 MiB of 4-byte lines, as anyone on Earth: renames_skipped {}, took {:?}, memory rose {} MiB (bound stated: {} MiB held)",
+            r["renames_skipped"],
+            t.elapsed(),
+            grew >> 20,
+            veil_server::derive::changes::SIMILAR_MAX_HELD >> 20
+        );
+        assert!(grew < 2 * veil_server::derive::changes::SIMILAR_MAX_HELD, "memory rose {} MiB", grew >> 20);
+    }
+    /// BUG-1078: BUG-1071's fix bounds a log page by its budget "whatever
+    /// the history holds" because each step reads one snapshot's parents;
+    /// but nothing bounds how many parents a snapshot has (push accepts any
+    /// number). One step of a merge of `k` parents reads `k` rows, and puts
+    /// all `k` in the frontier, which is the next cursor (so past 1,000
+    /// parents, BUG-1076's refusal too). A page of 1 entry with a budget
+    /// of 100 here reads every parent.
+    #[test]
+    #[ignore = "BUG-1078: one log step over a merge of many parents passes the page's work budget"]
+    fn bug_1078_one_log_step_over_a_wide_merge_passes_the_budget() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let k: usize = std::env::var("VEIL_BUG1078_PARENTS").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
+        let t0 = 1_700_000_000_000i64;
+        let mut parents = Vec::new();
+        let mut files = Files::new();
+        for i in 0..k {
+            let f = Files::from([(format!("pub/p{i}.txt"), b"x\n".to_vec())]);
+            files.extend(f.clone());
+            let mut change = [0u8; 16];
+            change[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+            change[15] = 0xc4;
+            parents.push(h.commit(&th, &[root_snapshot_id()], f, change, t0 + i as i64, None));
+        }
+        let top = h.commit(&th, &parents, files, [0xc5; 16], t0 + 1_000_000, None);
+        h.set_branch(&th, "main", top);
+        warm_up(&th, &h, &Viewer::default());
+        let a = ask(&th, &h, &Viewer::default());
+        let limits = Limits {
+            work: 100,
+            ..Limits::default()
+        };
+        let v = th.rt.block_on(query::log(&h.hub, &a, LogParams { n: Some(1), ..Default::default() }, limits)).unwrap();
+        let work = v["work"].as_u64().unwrap();
+        let width = v["next"].as_str().map_or(0, |c| c.split(',').count());
+        println!("BUG-1078: a page of 1 entry over a merge of {k} parents, budget {}: work {work}, next cursor of {width} snapshots", limits.work);
+        assert!(work <= 2 * limits.work, "a page with a budget of {} read {work} rows and objects", limits.work);
+    }
 }
