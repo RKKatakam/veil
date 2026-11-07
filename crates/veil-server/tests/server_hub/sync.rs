@@ -829,10 +829,16 @@ fn an_uploaded_frame_of_raw_blocks_round_trips_to_its_id() {
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     let pid = project_id(&hub, &p.name);
     let hubref = hub.hub();
-    let stored = hub.rt.block_on(hubref.objects.get_encoded(pid, &id)).unwrap().unwrap();
+    // Staged (S28): in the pack the receipt names, as the server's own
+    // encoding; not the project's until a push lists it.
+    let receipt = r.json()["receipts"][0].as_str().unwrap().to_string();
+    let pack = receipt.split_once('.').unwrap().1.to_string();
+    let (index, _) = hub.rt.block_on(hubref.objects.staged_index(pid, &pack)).unwrap().unwrap();
+    let (stored, got) = hub.rt.block_on(hubref.objects.get_staged(pid, &pack, index.get(&id).unwrap(), &id)).unwrap().unwrap();
     assert_eq!(&stored[..], &encoding::encode(&raw)[..], "stored as the server's own encoding");
     assert_eq!(&*encoding::decode(&id, &stored, 1 << 20).unwrap(), &raw[..]);
-    assert_eq!(&hub.rt.block_on(hubref.objects.get(pid, &id)).unwrap().unwrap()[..], &raw[..]);
+    assert_eq!(&got[..], &raw[..]);
+    assert!(hub.rt.block_on(hubref.objects.get(pid, &id)).unwrap().is_none(), "staged, not the project's");
 }
 
 /// This process's resident memory, in bytes.

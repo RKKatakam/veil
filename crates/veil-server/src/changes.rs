@@ -769,6 +769,10 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
     }
     let mut pending = HashMap::new();
     let edits = validate(&req, &mut pending)?;
+    // Uploads are staged (S28): read into memory with what the change makes,
+    // stored only once every check passed (BUG-930).
+    let (uploaded, staged) = sync::take_uploads(hub, project.id, person.id, &req.receipts).await?;
+    pending.extend(staged);
     let onto = req.onto.clone();
     let mut who = Arc::new(Who {
         project: project.clone(),
@@ -803,7 +807,7 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
         sync::blocking(hub, project.id, move |src| Ok(src.snapshot(&b)?.tree)).await?
     };
     let plan = Arc::new(Plan {
-        uploaded: sync::receipted(hub, project.id, person.id, &req.receipts),
+        uploaded,
         pending,
         change_id,
         description: req.description.clone(),

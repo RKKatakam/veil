@@ -267,6 +267,7 @@ fn cx(hub: &Arc<Hub>, project: i64) -> Cx {
             project,
             rt: tokio::runtime::Handle::current(),
             pending: Default::default(),
+            staged: None,
         },
     }
 }
@@ -296,7 +297,8 @@ pub fn landed(hub: &Arc<Hub>, project: i64, branches: Vec<String>) {
         active.insert(project, BTreeSet::new());
     }
     let hub = hub.clone();
-    tokio::spawn(async move {
+    // Its writes are the deriver's, counted apart (`storage-and-cost.md` §9).
+    tokio::spawn(crate::store::in_background(async move {
         let mut branches = branches;
         loop {
             if let Err(e) = landing(&hub, project, branches).await {
@@ -315,7 +317,7 @@ pub fn landed(hub: &Arc<Hub>, project: i64, branches: Vec<String>) {
             }
             branches = next.into_iter().collect();
         }
-    });
+    }));
 }
 
 /// What [`landed`] runs for the branches a landing moved: derive them, then
@@ -885,7 +887,7 @@ impl<'a> Batch<'a> {
                 while set.len() < 32 {
                     let Some((id, raw)) = it.next() else { break };
                     let h = hub.clone();
-                    set.spawn(async move { h.objects.put(project, &id, raw).await });
+                    set.spawn(async move { h.objects.put_background(project, &id, raw).await });
                 }
                 match set.join_next().await {
                     Some(r) => r.map_err(|e| Error::Other(e.into()))?.map_err(Error::Other)?,

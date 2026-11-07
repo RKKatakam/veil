@@ -498,9 +498,19 @@ pub fn everything_in(clone: &Path) -> Vec<(String, Vec<u8>)> {
 
 /// The bytes of a file in the server's data directory, an object's decoded
 /// (S27: objects are stored compressed, so a scan of the raw files would
-/// miss what they hold). Object files are `…/ab/cdef…` under their id.
+/// miss what they hold). Object files are `…/ab/cdef…` under their id; a
+/// pack (S28) is every object in it, decoded, one after another.
 pub fn stored_bytes(path: &Path) -> Vec<u8> {
     let b = std::fs::read(path).unwrap_or_default();
+    if b.starts_with(veil_server::pack::MAGIC) {
+        let index = veil_server::pack::parse_index(&b, Some(b.len() as u64)).expect("a pack the server wrote");
+        let mut out = Vec::new();
+        for (id, s) in index.iter() {
+            let enc = &b[s.offset as usize..=s.last() as usize];
+            out.extend_from_slice(&encoding::decode(id, enc, u64::MAX).expect("a packed object matches its id"));
+        }
+        return out;
+    }
     let name = |p: Option<&Path>| p.and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let hex = format!("{}{}", name(path.parent()), name(Some(path)));
     match ObjectId::from_hex(&hex) {

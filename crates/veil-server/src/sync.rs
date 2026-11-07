@@ -29,7 +29,7 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use bytes::Bytes;
@@ -48,6 +48,7 @@ use veil_core::{
 
 use crate::{
     error::{Error, Result},
+    pack::{Index, Slot},
     perm::{Project, Viewer},
     Hub,
 };
@@ -89,6 +90,58 @@ pub struct Source {
     /// stored yet (stored only once every check passed, so a refused
     /// plain-text secret is never stored; `changes`).
     pub pending: HashMap<ObjectId, Bytes>,
+    /// A push's uploads and what it made (S28), read before the store.
+    pub staged: Option<Arc<Staged>>,
+}
+
+/// A pack's name, index and length.
+type StagedPack = (Arc<str>, Arc<Index>, u64);
+
+/// What a push's receipts name in staged packs, and the objects the server
+/// made for it (S28). None of it is the project's until the push's
+/// transaction lists it: staged objects are read only through this (under
+/// cache keys of their own), so a refused upload is never answered as the
+/// project's, and it is discarded with its pack (BUG-930).
+pub struct Staged {
+    /// Each receipted object in a staged pack: the pack and its slot.
+    at: Arc<HashMap<ObjectId, (Arc<str>, Slot)>>,
+    /// The staged packs: index and length.
+    packs: Arc<Vec<StagedPack>>,
+    /// Objects the server made for the push (canonical encodings).
+    made: Arc<Mutex<HashMap<ObjectId, Bytes>>>,
+    /// The staged objects read through this one: what the checks read.
+    touched: Mutex<HashSet<ObjectId>>,
+}
+
+impl Staged {
+    /// The same uploads and made objects, with reads counted apart (one
+    /// snapshot's completion).
+    fn child(&self) -> Arc<Staged> {
+        Arc::new(Staged {
+            at: self.at.clone(),
+            packs: self.packs.clone(),
+            made: self.made.clone(),
+            touched: Mutex::new(HashSet::new()),
+        })
+    }
+
+    fn touched(&self) -> HashSet<ObjectId> {
+        std::mem::take(&mut *self.touched.lock().unwrap())
+    }
+
+    /// The staged packs' names.
+    fn names(&self) -> Vec<Arc<str>> {
+        self.packs.iter().map(|p| p.0.clone()).collect()
+    }
+
+    /// A staged or made object's key in [`Hub::trees`]: never the
+    /// project's.
+    fn tree_key(&self, project: i64, id: &ObjectId) -> Option<ObjectId> {
+        if self.made.lock().unwrap().contains_key(id) {
+            return Some(crate::store::Objects::staged_key(project, "made", id, true));
+        }
+        self.at.get(id).map(|(n, _)| crate::store::Objects::staged_key(project, n, id, true))
+    }
 }
 
 impl Source {
@@ -98,6 +151,18 @@ impl Source {
         }
         if let Some(b) = builtin(id) {
             return Ok(b);
+        }
+        if let Some(st) = &self.staged {
+            if let Some(raw) = st.made.lock().unwrap().get(id) {
+                return Ok(raw.clone());
+            }
+            if let Some((name, slot)) = st.at.get(id) {
+                let got = self.rt.block_on(self.hub.objects.get_staged(self.project, name, *slot, id));
+                if let Some((_, raw)) = got.map_err(|e| VeilError::Repo(format!("object store: {e}")))? {
+                    st.touched.lock().unwrap().insert(*id);
+                    return Ok(raw);
+                }
+            }
         }
         self.hub
             .objects
@@ -127,8 +192,19 @@ impl Source {
 
 impl TreeSource for Source {
     fn node(&self, id: &ObjectId) -> veil_core::Result<Node> {
-        let ck = crate::store::Objects::tree_key(self.project, id);
+        // A push's uploads and made trees are cached under keys of their
+        // own, never as the project's.
+        let staged = self.staged.as_ref().and_then(|st| st.tree_key(self.project, id).map(|k| (st, k)));
+        let ck = match &staged {
+            Some((_, k)) => *k,
+            None => crate::store::Objects::tree_key(self.project, id),
+        };
         if let Some(t) = self.hub.trees.get(&ck) {
+            if let Some((st, _)) = &staged {
+                if st.at.contains_key(id) {
+                    st.touched.lock().unwrap().insert(*id);
+                }
+            }
             return Ok(Node::Tree(t.0, t.1));
         }
         let raw = self.raw(id)?;
@@ -169,11 +245,32 @@ pub async fn blocking_with<T: Send + 'static>(
     pending: HashMap<ObjectId, Bytes>,
     f: impl FnOnce(&Source) -> Result<T> + Send + 'static,
 ) -> Result<T> {
+    blocking_in(hub, project, pending, None, f).await
+}
+
+/// [`blocking`], reading a push's `staged` objects before the store.
+async fn blocking_staged<T: Send + 'static>(
+    hub: &Arc<Hub>,
+    project: i64,
+    staged: Option<Arc<Staged>>,
+    f: impl FnOnce(&Source) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    blocking_in(hub, project, HashMap::new(), staged, f).await
+}
+
+async fn blocking_in<T: Send + 'static>(
+    hub: &Arc<Hub>,
+    project: i64,
+    pending: HashMap<ObjectId, Bytes>,
+    staged: Option<Arc<Staged>>,
+    f: impl FnOnce(&Source) -> Result<T> + Send + 'static,
+) -> Result<T> {
     let src = Source {
         hub: hub.clone(),
         project,
         rt: Handle::current(),
         pending,
+        staged,
     };
     tokio::task::spawn_blocking(move || f(&src)).await.map_err(|e| Error::Other(e.into()))?
 }
@@ -200,6 +297,10 @@ struct Deferred {
     fresh: HashMap<ObjectId, Option<ObjectId>>,
     /// Memo rows `(view key, real, projected)` for the push's transaction.
     rows: Vec<(String, ObjectId, ObjectId)>,
+    /// The push's uploads and made objects (its new snapshots are there).
+    staged: Option<Arc<Staged>>,
+    /// The projections it signed, among the made objects, for its pack.
+    made: Vec<ObjectId>,
 }
 
 /// Is `id` committed history of `project` (a `snapshots` row; never deleted,
@@ -242,7 +343,8 @@ async fn projected_predecessors(
         }
         let pp = Box::pin(projected_inner(hub, project, viewer, *p, deferred.as_deref_mut())).await?;
         let (p, pp2) = (*p, pp);
-        let same = blocking(hub, project.id, move |src| Ok(src.snapshot(&pp2)?.change_id == src.snapshot(&p)?.change_id)).await?;
+        let staged = deferred.as_ref().and_then(|d| d.staged.clone());
+        let same = blocking_staged(hub, project.id, staged, move |src| Ok(src.snapshot(&pp2)?.change_id == src.snapshot(&p)?.change_id)).await?;
         if same && !out.contains(&pp) {
             out.push(pp);
         }
@@ -262,6 +364,7 @@ async fn projected_inner(
     }
     let view_key = project.view(viewer).key();
     let root = root_snapshot_id();
+    let staged = deferred.as_ref().and_then(|d| d.staged.clone());
     let mut done: HashMap<ObjectId, ObjectId> = HashMap::new();
     let mut stack = vec![(real, false)];
     let mut snaps: HashMap<ObjectId, Arc<Snapshot>> = HashMap::new();
@@ -303,7 +406,7 @@ async fn projected_inner(
                 done.insert(x, p);
                 continue;
             }
-            let s = blocking(hub, project.id, move |src| Ok(src.snapshot(&x)?)).await?;
+            let s = blocking_staged(hub, project.id, staged.clone(), move |src| Ok(src.snapshot(&x)?)).await?;
             stack.push((x, true));
             for p in s.parents.iter().rev() {
                 if !done.contains_key(p) {
@@ -338,7 +441,7 @@ async fn projected_inner(
         let ppreds = projected_predecessors(hub, project, viewer, &s, deferred.as_deref_mut()).await?;
         let (proj_text, bindings, viewer2) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
         let hub2 = hub.clone();
-        let (result, new_obj) = blocking(hub, project.id, move |src| {
+        let (result, new_obj) = blocking_staged(hub, project.id, staged.clone(), move |src| {
             let policy = AccessPolicy::parse(&proj_text);
             let p = Project {
                 id: src.project,
@@ -351,15 +454,25 @@ async fn projected_inner(
             project_one(src, &p.view(&viewer2), x, &s, pparents, ppreds, origin, &hub2.identity)
         })
         .await?;
-        if let Some(raw) = new_obj {
-            hub.objects.put(project.id, &result, raw).await?;
-        }
         let result = match deferred.as_deref_mut() {
             Some(d) => {
+                // Stored with the push's pack (S28).
+                if let Some(raw) = new_obj {
+                    match &d.staged {
+                        Some(st) => {
+                            st.made.lock().unwrap().insert(result, raw);
+                            d.made.push(result);
+                        }
+                        None => hub.objects.put(project.id, &result, raw).await?,
+                    }
+                }
                 d.rows.push((view_key.clone(), x, result));
                 result
             }
             None => {
+                if let Some(raw) = new_obj {
+                    hub.objects.put(project.id, &result, raw).await?;
+                }
                 let inserted = sqlx::query(
                     "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at) VALUES ($1, $2, $3, $4, $5) \
                      ON CONFLICT DO NOTHING",
@@ -1116,9 +1229,17 @@ pub(crate) fn complete(
     }
     let mut trees: Vec<(ObjectId, Vec<u8>)> = g.created.drain().collect();
     trees.sort();
-    // Store the trees the graft built before checking (the check reads them).
-    for (id, raw) in &trees {
-        src.rt.block_on(src.hub.objects.put(src.project, id, Bytes::from(raw.clone())))?;
+    // The trees the graft built, readable before checking (the check reads
+    // them): a push's go into its pack once every check passed (S28);
+    // anyone else's are stored now.
+    let made: Vec<ObjectId> = trees.iter().map(|(id, _)| *id).collect();
+    for (id, raw) in trees {
+        match &src.staged {
+            Some(st) => {
+                st.made.lock().unwrap().insert(id, Bytes::from(raw));
+            }
+            None => src.rt.block_on(src.hub.objects.put(src.project, &id, Bytes::from(raw)))?,
+        }
     }
     // Every object a changed path names (its object and conflict
     // terms) was uploaded by the pusher, or is named by the
@@ -1160,6 +1281,7 @@ pub(crate) fn complete(
             real: ObjectId::hash(&Object::Snapshot(real).encode()),
             raw: None,
             origin: None,
+            made,
         });
     }
     real.sign(identity);
@@ -1168,6 +1290,7 @@ pub(crate) fn complete(
         real: ObjectId::hash(&raw),
         raw: Some(Bytes::from(raw)),
         origin: None,
+        made,
     })
 }
 
@@ -1177,15 +1300,90 @@ pub(crate) struct Completed {
     pub raw: Option<Bytes>,
     /// The pusher's own snapshot, when the server completed it.
     pub origin: Option<ObjectId>,
+    /// The trees the graft built (stored already, unless the source was a
+    /// push's: then in its made objects).
+    pub made: Vec<ObjectId>,
 }
 
 /// Handle a push (`docs/HUB.md` §4.5): complete and check every new
-/// snapshot, store what the server built, then move every branch in one
-/// transaction of compare-and-swaps, which also writes the snapshot,
-/// origin, projection memo and audit rows: **one database commit per push**
-/// (`storage-and-cost.md` §3). Other viewers' projections are worked out when
-/// they first ask, as before.
-pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i64, req: PushRequest) -> Result<PushResult> {
+/// snapshot, then move every branch in one transaction of
+/// compare-and-swaps, which also lists the packs holding what the push
+/// stored and writes the snapshot, origin, projection memo and audit rows:
+/// **one database commit per push** (`storage-and-cost.md` §3). Other
+/// viewers' projections are worked out when they first ask, as before.
+///
+/// **What it stores** (S28): the uploads its receipts name are staged packs
+/// ([`upload`]). A staged pack every object of which the checks read is
+/// listed as it is; the objects the checks read from any other, and the
+/// objects the server made (the graft's trees, completed snapshots, the
+/// pusher's signed projections), go into one pack of the push's own. So a
+/// push costs at most one storage write of its own, and none for a `vl`
+/// push's uploads. Staged packs it does not list are discarded once it is
+/// answered, landed or refused (BUG-930), except after an error the request
+/// may be run again for (a database or store error).
+pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i64, mut req: PushRequest) -> Result<PushResult> {
+    // The receipts (a long history's are tens of megabytes) are not held
+    // through the checks once read.
+    let receipts = std::mem::take(&mut req.receipts);
+    let (uploaded, staged) = receipted(hub, project.id, person, &receipts);
+    drop(receipts);
+    let st = Arc::new(staging(hub, project.id, &staged).await?);
+    drop(staged);
+    let progress = Mutex::new(Progress::default());
+    let r = push_staged(hub, project, viewer, req, person, uploaded, st.clone(), &progress).await;
+    let p = progress.into_inner().unwrap();
+    let (staged_gone, own_gone): (Vec<Arc<str>>, Vec<Arc<str>>) = match &r {
+        // Landed: an upload it did not list (its checks did not read all of
+        // it; what they read was copied into its own pack).
+        Ok((_, kept)) => (st.names().into_iter().filter(|n| !kept.is_empty() && !kept.contains(n)).collect(), Vec::new()),
+        // Refused by its checks, before its transaction: what it was
+        // refused for is deleted (BUG-930), and its own pack was never
+        // listed.
+        Err(Error::Api { .. }) if !p.transaction => (st.names(), p.written),
+        // A lost race (409: every check passed, `vl` uploads again) or an
+        // error the request may be run again for: nothing is deleted, and
+        // what no push lists stays unread until S29's job removes it (no
+        // commit for a refused push: BUG-910).
+        Err(_) => (Vec::new(), Vec::new()),
+    };
+    if let Err(e) = hub.objects.discard(project.id, &staged_gone).await {
+        eprintln!("veil-server: discarding the uploads a push refused: {e:#}");
+    }
+    if let Err(e) = hub.objects.delete_unlisted(project.id, &own_gone).await {
+        eprintln!("veil-server: deleting a refused push's own pack: {e:#}");
+    }
+    r.map(|(res, _)| res)
+}
+
+/// What a push wrote, and whether its transaction began.
+#[derive(Default)]
+struct Progress {
+    /// Its own packs (fresh names, in no receipt).
+    written: Vec<Arc<str>>,
+    transaction: bool,
+}
+
+/// One new snapshot completed, and what its checks read of the uploads.
+type Checked = (Completed, HashSet<ObjectId>);
+
+/// How many new snapshots a push checks at once (BUG-865).
+const CHECKS_AT_ONCE: usize = 8;
+/// How many it checks ahead on a guess, a window at a time.
+const GUESS_WINDOW: usize = 64;
+
+/// [`push`] with its uploads read: the result and the packs it listed
+/// (none if nothing landed). `progress`: what it wrote, how far it got.
+#[allow(clippy::too_many_arguments)]
+async fn push_staged(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    req: PushRequest,
+    person: i64,
+    uploaded: HashSet<ObjectId>,
+    st: Arc<Staged>,
+    progress: &Mutex<Progress>,
+) -> Result<(PushResult, HashSet<Arc<str>>)> {
     if !project.participant(viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
@@ -1235,7 +1433,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             known.insert(id, r);
             continue;
         }
-        let s = blocking(hub, project.id, move |src| match src.snapshot(&id) {
+        let s = blocking_staged(hub, project.id, Some(st.clone()), move |src| match src.snapshot(&id) {
             Err(VeilError::Missing(_)) => Err(Error::bad_request(format!("snapshot {} was not uploaded", id.short()))),
             r => Ok(r?),
         })
@@ -1251,8 +1449,8 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     let mut order = Vec::new();
     {
         let mut placed = HashSet::new();
-        let mut st: Vec<(ObjectId, bool)> = new.iter().map(|id| (*id, false)).collect();
-        while let Some((id, expanded)) = st.pop() {
+        let mut todo: Vec<(ObjectId, bool)> = new.iter().map(|id| (*id, false)).collect();
+        while let Some((id, expanded)) = todo.pop() {
             if placed.contains(&id) || !parents_of.contains_key(&id) {
                 continue;
             }
@@ -1260,9 +1458,9 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                 placed.insert(id);
                 order.push(id);
             } else {
-                st.push((id, true));
+                todo.push((id, true));
                 for p in &parents_of[&id].parents {
-                    st.push((*p, false));
+                    todo.push((*p, false));
                 }
             }
         }
@@ -1290,58 +1488,77 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     }
     // What this pusher uploaded (BUG-824): a push names nothing else that
     // is not already where it was in a parent.
-    let uploaded = Arc::new(receipted(hub, project.id, person, &req.receipts));
-    // 2. Complete and check each new snapshot.
+    let uploaded = Arc::new(uploaded);
+    // What the walk read of the uploads (the new snapshots).
+    let mut touched = st.touched();
+    // 2. Complete and check each new snapshot, parents first. BUG-865:
+    //    several at once, on the guess that each new parent is completed to
+    //    itself (its real id is its own): a right guess gives exactly the
+    //    answer of checking one at a time (the same inputs), and a wrong one
+    //    is checked again, in order. Results and the first error are taken
+    //    in order, as one at a time.
     let mut completed: Vec<Completed> = Vec::new();
     // Each new real snapshot's real parents.
     let mut real_parents_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
-    for id in &order {
-        let n = parents_of[id].clone();
-        if n.embargo.is_some() {
-            return Err(Error::forbidden(
-                "embargoed merges cannot be pushed to the server yet (docs/HUB.md §11)",
-            ));
-        }
-        match &n.signature {
-            Some(sig) if n.signature_valid() == Some(true) && signers.contains(&sig.key) => {}
-            Some(_) if n.signature_valid() == Some(true) => {
-                return Err(Error::forbidden(format!(
-                    "snapshot {} is signed by a key no device here is registered with",
-                    id.short()
-                )))
+    let mut made: Vec<ObjectId> = Vec::new();
+    let mut guessing = true;
+    for window in order.chunks(GUESS_WINDOW) {
+        let mut guesses: HashMap<ObjectId, (Vec<ObjectId>, Result<Checked>)> = HashMap::new();
+        if guessing && window.len() > 1 {
+            let mut set = tokio::task::JoinSet::new();
+            let mut it = window.iter();
+            loop {
+                while set.len() < CHECKS_AT_ONCE {
+                    let Some(id) = it.next() else { break };
+                    let n = parents_of[id].clone();
+                    if precheck(id, &n, &signers).is_err() {
+                        continue;
+                    }
+                    let rp: Vec<ObjectId> = n.parents.iter().map(|p| real_of.get(p).copied().unwrap_or(*p)).collect();
+                    let job = complete_one(hub.clone(), project.clone(), viewer.clone(), uploaded.clone(), st.child(), n, rp.clone());
+                    let id = *id;
+                    set.spawn(async move { (id, rp, job.await) });
+                }
+                match set.join_next().await {
+                    Some(Ok((id, rp, r))) => {
+                        guesses.insert(id, (rp, r));
+                    }
+                    Some(Err(e)) => return Err(Error::Other(e.into())),
+                    None => break,
+                }
             }
-            _ => return Err(Error::forbidden(format!("snapshot {} is unsigned or its signature is invalid", id.short()))),
         }
-        if n.parents.is_empty() {
-            return Err(Error::bad_request("a snapshot without parents (only the root has none)"));
-        }
-        let real_parents: Vec<ObjectId> = n.parents.iter().map(|p| real_of[p]).collect();
-        let (policy_text_acc, bindings, viewer2, n2) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone(), n.clone());
-        let hub2 = hub.clone();
-        let rp = real_parents.clone();
-        let uploaded = uploaded.clone();
-        let c = blocking(hub, project.id, move |src| {
-            let p = Project {
-                id: src.project,
-                name: String::new(),
-                default_branch: String::new(),
-                policy: AccessPolicy::parse(&policy_text_acc),
-                policy_text: policy_text_acc,
-                bindings,
+        let mut wrong = 0;
+        for id in window {
+            let n = parents_of[id].clone();
+            precheck(id, &n, &signers)?;
+            let real_parents: Vec<ObjectId> = n.parents.iter().map(|p| real_of[p]).collect();
+            let (c, read) = match guesses.remove(id) {
+                Some((rp, r)) if rp == real_parents => r?,
+                g => {
+                    wrong += usize::from(g.is_some());
+                    complete_one(hub.clone(), project.clone(), viewer.clone(), uploaded.clone(), st.child(), n, real_parents.clone()).await?
+                }
             };
-            complete(src, &p, &viewer2, &uploaded, &n2, &rp, &hub2.identity)
-        })
-        .await?;
-        let c = Completed {
-            origin: c.raw.as_ref().map(|_| *id),
-            ..c
-        };
-        if let Some(raw) = &c.raw {
-            hub.objects.put(project.id, &c.real, raw.clone()).await?;
+            let c = Completed {
+                origin: c.raw.as_ref().map(|_| *id),
+                ..c
+            };
+            touched.extend(read);
+            made.extend(c.made.iter().copied());
+            if let Some(raw) = &c.raw {
+                st.made.lock().unwrap().insert(c.real, raw.clone());
+                made.push(c.real);
+            }
+            real_of.insert(*id, c.real);
+            real_parents_of.insert(c.real, real_parents);
+            completed.push(c);
         }
-        real_of.insert(*id, c.real);
-        real_parents_of.insert(c.real, real_parents);
-        completed.push(c);
+        // Mostly wrong (a pusher who cannot see everything: the server
+        // completes each snapshot): one at a time from here.
+        if wrong * 2 > window.len() {
+            guessing = false;
+        }
     }
     // 3. Move the branches: one serialisable transaction of compare-and-swaps.
     let mut plans = Vec::new();
@@ -1378,7 +1595,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             return Err(Error::forbidden("only admins may delete a branch"));
         }
         if let (Some(c), Some(n)) = (cur, new_real) {
-            if !req.force && !is_ancestor(hub, project.id, c, n).await? {
+            if !req.force && !is_ancestor_in(hub, project.id, Some(st.clone()), c, n).await? {
                 results.push(BranchResult {
                     branch: u.branch.clone(),
                     ok: false,
@@ -1392,7 +1609,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         let mut accept = None;
         if u.branch == project.default_branch {
             if let Some(n) = new_real {
-                let text = blocking(hub, project.id, move |src| policy_text(src, &src.snapshot(&n)?.tree)).await?;
+                let text = blocking_staged(hub, project.id, Some(st.clone()), move |src| policy_text(src, &src.snapshot(&n)?.tree)).await?;
                 let incoming = AccessPolicy::parse(&text);
                 if !incoming.same_rules(&project.policy) {
                     if !viewer.admin {
@@ -1409,12 +1626,16 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     let mut deferred = Deferred {
         fresh: completed.iter().map(|c| (c.real, c.origin)).collect(),
         rows: Vec::new(),
+        staged: Some(st.clone()),
+        made: Vec::new(),
     };
     for (_, _, new, _) in &plans {
         if let Some(n) = new {
             Box::pin(projected_inner(hub, project, viewer, *n, Some(&mut deferred))).await?;
         }
     }
+    touched.extend(st.touched());
+    made.extend(deferred.made.iter().copied());
     // Only the snapshots this push made (known ones are recorded already:
     // rewriting their rows made every racing pusher write the same row),
     // and of those only what the updates that land reach: a refused
@@ -1432,14 +1653,27 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         seen
     };
     completed.retain(|c| landing.contains(&c.real));
+    // What it stores (S28), when something lands: staged packs whose every
+    // object the checks read, as they are; the rest of what they read, and
+    // what the server made, in one pack of the push's own.
+    let listed = match plans.is_empty() {
+        true => Vec::new(),
+        false => packs_to_list(hub, project.id, &st, &touched, &made, progress).await?,
+    };
     let new_reals: Vec<String> = completed.iter().map(|c| c.real.hex()).collect();
     let origins: Vec<(String, String)> = completed.iter().filter_map(|c| c.origin.map(|o| (c.real.hex(), o.hex()))).collect();
     let memos: Vec<(String, String, String)> = deferred.rows.iter().map(|(k, r, p)| (k.clone(), r.hex(), p.hex())).collect();
     let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let pid = project.id;
     let plans2 = plans.clone();
+    let packs: (Vec<String>, Vec<i64>, Vec<i64>) = (
+        listed.iter().map(|p| p.0.to_string()).collect(),
+        listed.iter().map(|p| p.2 as i64).collect(),
+        listed.iter().map(|p| p.1.len() as i64).collect(),
+    );
     // Nothing to move (every update refused: the pusher pulls and tries
     // again): no commit, and nothing recorded as history no branch reaches.
+    progress.lock().unwrap().transaction = !plans.is_empty();
     let (moved, memo_stored) = if plans.is_empty() {
         (Vec::new(), Vec::new())
     } else {
@@ -1448,6 +1682,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         let new_reals = new_reals.clone();
         let origins = origins.clone();
         let memos = memos.clone();
+        let packs = packs.clone();
         Box::pin(async move {
             let mut moved = Vec::new();
             for (branch, cur, new, accept) in plans {
@@ -1486,6 +1721,27 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                     crate::perm::accept_policy(&mut *c, pid, &text).await?;
                 }
                 moved.push(branch);
+            }
+            // The packs that hold what this push stored (S28): an upload's
+            // staged pack, or the push's own. A pack a refused push of the
+            // same person discarded first cannot be listed: nothing lands,
+            // and `vl` uploads again.
+            if !packs.0.is_empty() {
+                let listed: Vec<bool> = sqlx::query_scalar(
+                    "INSERT INTO packs (project_id, name, size, objects, listed, created_at) \
+                     SELECT $1, n, s, o, TRUE, $5 FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]) AS t(n, s, o) \
+                     ON CONFLICT (project_id, name) DO UPDATE SET listed = packs.listed RETURNING listed",
+                )
+                .bind(pid)
+                .bind(&packs.0)
+                .bind(&packs.1)
+                .bind(&packs.2)
+                .bind(veil_core::now_millis())
+                .fetch_all(&mut *c)
+                .await?;
+                if listed.contains(&false) {
+                    return Err(Error::conflict("an upload this push names was discarded; push again"));
+                }
             }
             for r in &new_reals {
                 sqlx::query("INSERT INTO snapshots (project_id, id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
@@ -1541,6 +1797,8 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     .await?
     };
     if !moved.is_empty() {
+        // Before anything reads what it stored.
+        hub.objects.listed_here(project.id, listed.iter().map(|p| (p.0.clone(), p.1.clone())).collect());
         hub.caches.tips_changed(project.id);
         for c in &completed {
             hub.caches.put_committed(project.id, &c.real);
@@ -1553,6 +1811,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     }
     // Derived history data for the branches moved, in the background: the
     // push never waits.
+    let landed = !moved.is_empty();
     crate::derive::landed(hub, project.id, moved);
     // The tips as the pusher sees them now (their own snapshots, where the
     // server's projection gives them back).
@@ -1577,12 +1836,114 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         };
         results.push(BranchResult { branch, ok: true, message: None, tip });
     }
-    Ok(PushResult { results, warnings })
+    let kept = match landed {
+        false => HashSet::new(),
+        true => listed.into_iter().map(|p| p.0).collect(),
+    };
+    Ok((PushResult { results, warnings }, kept))
 }
 
-/// Is `a` an ancestor of (or equal to) `b` in the real history?
-pub(crate) async fn is_ancestor(hub: &Arc<Hub>, project: i64, a: ObjectId, b: ObjectId) -> Result<bool> {
-    blocking(hub, project, move |src| {
+/// The checks of new snapshot `id` (`n`) that need nothing but itself:
+/// no embargo, signed by a registered device (`signers`), parents.
+fn precheck(id: &ObjectId, n: &Snapshot, signers: &HashSet<String>) -> Result<()> {
+    if n.embargo.is_some() {
+        return Err(Error::forbidden(
+            "embargoed merges cannot be pushed to the server yet (docs/HUB.md §11)",
+        ));
+    }
+    match &n.signature {
+        Some(sig) if n.signature_valid() == Some(true) && signers.contains(&sig.key) => {}
+        Some(_) if n.signature_valid() == Some(true) => {
+            return Err(Error::forbidden(format!(
+                "snapshot {} is signed by a key no device here is registered with",
+                id.short()
+            )))
+        }
+        _ => return Err(Error::forbidden(format!("snapshot {} is unsigned or its signature is invalid", id.short()))),
+    }
+    if n.parents.is_empty() {
+        return Err(Error::bad_request("a snapshot without parents (only the root has none)"));
+    }
+    Ok(())
+}
+
+/// [`complete`] new snapshot `n` on real parents `rp`, reading the push's
+/// uploads through `staged` (one completion's own): the result, and what it
+/// read of the uploads.
+async fn complete_one(
+    hub: Arc<Hub>,
+    project: Project,
+    viewer: Viewer,
+    uploaded: Arc<HashSet<ObjectId>>,
+    staged: Arc<Staged>,
+    n: Arc<Snapshot>,
+    rp: Vec<ObjectId>,
+) -> Result<Checked> {
+    let st = staged.clone();
+    let hub2 = hub.clone();
+    let c = blocking_staged(&hub, project.id, Some(staged), move |src| complete(src, &project, &viewer, &uploaded, &n, &rp, &hub2.identity)).await?;
+    Ok((c, st.touched()))
+}
+
+/// The packs a landing push lists (S28): each staged pack every object of
+/// which its checks read (`touched`), as it is; and, if anything is left,
+/// one pack of its own (written now, named in `written`) with the objects
+/// it read from any other staged pack and those the server made for it
+/// (`made`). Nothing a check did not read is kept. `progress` records the
+/// pack it writes.
+async fn packs_to_list(
+    hub: &Arc<Hub>,
+    project: i64,
+    st: &Staged,
+    touched: &HashSet<ObjectId>,
+    made: &[ObjectId],
+    progress: &Mutex<Progress>,
+) -> Result<Vec<StagedPack>> {
+    let mut listed = Vec::new();
+    let mut kept: HashSet<ObjectId> = HashSet::new();
+    for (name, index, size) in st.packs.iter() {
+        if !index.is_empty() && index.iter().all(|(id, _)| touched.contains(id)) {
+            kept.extend(index.iter().map(|(id, _)| *id));
+            listed.push((name.clone(), index.clone(), *size));
+        }
+    }
+    let mut own: Vec<(ObjectId, Bytes)> = Vec::new();
+    for (name, index, _) in st.packs.iter() {
+        for (id, slot) in index.iter() {
+            if touched.contains(id) && kept.insert(*id) {
+                let (enc, _) = hub
+                    .objects
+                    .get_staged(project, name, *slot, id)
+                    .await
+                    .map_err(Error::Other)?
+                    .ok_or_else(|| Error::conflict("an upload this push names was discarded; push again"))?;
+                own.push((*id, enc));
+            }
+        }
+    }
+    let made_objects: Vec<(ObjectId, Bytes)> = {
+        let m = st.made.lock().unwrap();
+        made.iter().filter(|id| !kept.contains(*id)).filter_map(|id| Some((*id, m.get(id)?.clone()))).collect()
+    };
+    if !made_objects.is_empty() {
+        // Compressed on a blocking thread (the server's own encoding).
+        let enc = tokio::task::spawn_blocking(move || made_objects.into_iter().map(|(id, raw)| (id, crate::store::encode(raw))).collect::<Vec<_>>())
+            .await
+            .map_err(|e| Error::Other(e.into()))?;
+        own.extend(enc);
+    }
+    if !own.is_empty() {
+        let (name, index, size) = hub.objects.put_pack(project, own).await.map_err(Error::Other)?;
+        progress.lock().unwrap().written.push(name.clone());
+        listed.push((name, index, size));
+    }
+    Ok(listed)
+}
+
+/// Is `a` an ancestor of (or equal to) `b` in the real history (a push's
+/// `staged` snapshots read first)?
+async fn is_ancestor_in(hub: &Arc<Hub>, project: i64, staged: Option<Arc<Staged>>, a: ObjectId, b: ObjectId) -> Result<bool> {
+    blocking_staged(hub, project, staged, move |src| {
         let mut seen = HashSet::new();
         let mut stack = vec![b];
         while let Some(x) = stack.pop() {
@@ -1599,42 +1960,173 @@ pub(crate) async fn is_ancestor(hub: &Arc<Hub>, project: i64, a: ObjectId, b: Ob
     .await
 }
 
-/// The receipt for `person` uploading object `id` to `project`: a MAC only
-/// the server can make. A push shows it for each object it introduces.
-pub fn receipt(hub: &Hub, project: i64, person: i64, id: &ObjectId) -> String {
+/// The receipt for `person` uploading object `id` to `project` in staged
+/// pack `pack` (S28): a MAC only the server can make, then the pack's name.
+/// A push shows it for each object it introduces; the server reads the
+/// object from that pack, and only for that person.
+pub fn receipt(hub: &Hub, project: i64, person: i64, id: &ObjectId, pack: &str) -> String {
+    format!("{}.{pack}", mac(hub, project, person, id, Some(pack)))
+}
+
+fn mac(hub: &Hub, project: i64, person: i64, id: &ObjectId, pack: Option<&str>) -> String {
     let mut h = blake3::Hasher::new_keyed(&hub.receipt_key);
     h.update(&project.to_le_bytes());
     h.update(&person.to_le_bytes());
     h.update(&id.0);
+    if let Some(p) = pack {
+        h.update(b"staged in");
+        h.update(p.as_bytes());
+    }
     hex::encode(&h.finalize().as_bytes()[..16])
 }
 
-/// The objects whose receipts in `receipts` are `person`'s (compared in
-/// constant time).
-pub(crate) fn receipted(hub: &Hub, project: i64, person: i64, receipts: &std::collections::BTreeMap<ObjectId, String>) -> HashSet<ObjectId> {
-    receipts
-        .iter()
-        .filter(|(id, r)| {
-            let want = receipt(hub, project, person, id);
-            r.len() == want.len() && r.bytes().zip(want.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
-        })
-        .map(|(id, _)| *id)
-        .collect()
+/// Compared in constant time.
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Store uploaded objects (`docs/HUB.md` §4.5). Each frame, plain or
-/// compressed (`docs/HUB.md` §13.15), is decoded (bounded: at most the
-/// object size limit each, at most `limit` bytes for the whole request, a
-/// compressed one only if it expands at most [`encoding::MAX_RATIO`] times
-/// its size, and at most [`DECODING_IN_FLIGHT`] bytes across the server at
-/// once: BUG-1009), re-hashed against its id, and must decode canonically
-/// (safe names, sorted trees) at a repository format the server serves.
-/// It is stored as the server's own encoding of it, never as the client
-/// sent it, so no client chooses the stored bytes of an object others
-/// share (BUG-1008). Nothing uploaded is visible until a push makes a
-/// branch reach it. Returns a receipt per object, in order (stored whether
-/// or not the project held it already, so the answer is the same either
-/// way).
+/// The objects whose receipts in `receipts` are `person`'s, and of those
+/// the staged pack of each one an upload staged. A receipt without a pack
+/// (a server before S28 stored the object as it came) names a stored
+/// object.
+pub(crate) fn receipted(
+    hub: &Hub,
+    project: i64,
+    person: i64,
+    receipts: &std::collections::BTreeMap<ObjectId, String>,
+) -> (HashSet<ObjectId>, HashMap<ObjectId, Arc<str>>) {
+    let mut uploaded = HashSet::new();
+    let mut staged = HashMap::new();
+    let mut names: HashMap<&str, Arc<str>> = HashMap::new();
+    for (id, r) in receipts {
+        let (m, pack) = match r.split_once('.') {
+            Some((m, p)) if crate::pack::valid_name(p) => (m, Some(p)),
+            Some(_) => continue,
+            None => (r.as_str(), None),
+        };
+        if !same(m, &mac(hub, project, person, id, pack)) {
+            continue;
+        }
+        uploaded.insert(*id);
+        if let Some(p) = pack {
+            staged.insert(*id, names.entry(p).or_insert_with(|| Arc::from(p)).clone());
+        }
+    }
+    (uploaded, staged)
+}
+
+/// The staged packs `staged` names (from [`receipted`]): each one's index,
+/// and where each object is. A pack no longer in the store (discarded) is
+/// left out: its objects are then missing, as never uploaded.
+async fn staging(hub: &Arc<Hub>, project: i64, staged: &HashMap<ObjectId, Arc<str>>) -> Result<Staged> {
+    let mut names: Vec<Arc<str>> = staged.values().cloned().collect();
+    names.sort();
+    names.dedup();
+    let mut packs = Vec::new();
+    let mut set = tokio::task::JoinSet::new();
+    let mut it = names.into_iter();
+    loop {
+        while set.len() < 16 {
+            let Some(n) = it.next() else { break };
+            let h = hub.clone();
+            set.spawn(async move {
+                let r = h.objects.staged_index(project, &n).await;
+                (n, r)
+            });
+        }
+        match set.join_next().await {
+            Some(Ok((n, Ok(Some((index, size)))))) => packs.push((n, index, size)),
+            Some(Ok((_, Ok(None)))) => {}
+            Some(Ok((_, Err(e)))) => return Err(Error::Other(e)),
+            Some(Err(e)) => return Err(Error::Other(e.into())),
+            None => break,
+        }
+    }
+    let by_name: HashMap<&str, &Arc<Index>> = packs.iter().map(|(n, i, _)| (&**n, i)).collect();
+    let at = staged
+        .iter()
+        .filter_map(|(id, n)| Some((*id, (n.clone(), by_name.get(&**n)?.get(id)?))))
+        .collect();
+    Ok(Staged {
+        at: Arc::new(at),
+        packs: Arc::new(packs),
+        made: Default::default(),
+        touched: Mutex::new(HashSet::new()),
+    })
+}
+
+/// The objects an API commit's `receipts` name in staged packs (S28), read
+/// into memory for its checks (`changes`: what the commit keeps is stored
+/// once every check passed), at most [`MAX_FRAME_OBJECT`] bytes of them;
+/// and every object the receipts name. [`settle_uploads`] discards the
+/// packs when the commit is answered.
+pub(crate) async fn take_uploads(
+    hub: &Arc<Hub>,
+    project: i64,
+    person: i64,
+    receipts: &std::collections::BTreeMap<ObjectId, String>,
+) -> Result<(HashSet<ObjectId>, HashMap<ObjectId, Bytes>)> {
+    let (uploaded, staged) = receipted(hub, project, person, receipts);
+    let st = staging(hub, project, &staged).await?;
+    let mut out = HashMap::new();
+    let mut total = 0u64;
+    for (id, (name, slot)) in st.at.iter() {
+        let Some((_, raw)) = hub.objects.get_staged(project, name, *slot, id).await? else { continue };
+        total += raw.len() as u64;
+        if total > MAX_FRAME_OBJECT as u64 {
+            return Err(Error::bad_request(format!(
+                "a commit through the API names at most {} MiB of uploaded objects: push larger changes with `vl push`",
+                MAX_FRAME_OBJECT >> 20
+            )));
+        }
+        out.insert(*id, raw);
+    }
+    Ok((uploaded, out))
+}
+
+/// After an API commit with `receipts` was answered with `outcome`: its
+/// staged packs are discarded when it landed (what it kept was stored) or
+/// its checks refused it (BUG-930); not after a lost race (409: every check
+/// passed, and the caller may try again with the same receipts) or a
+/// database error the request is run again for (`db::retry_requests`
+/// reads them again).
+pub(crate) async fn settle_uploads<T>(
+    hub: &Arc<Hub>,
+    project: i64,
+    person: i64,
+    receipts: &std::collections::BTreeMap<ObjectId, String>,
+    outcome: &Result<T>,
+) {
+    match outcome {
+        Ok(_) => {}
+        Err(Error::Api { status, .. }) if *status != axum::http::StatusCode::CONFLICT => {}
+        Err(_) => return,
+    }
+    let (_, staged) = receipted(hub, project, person, receipts);
+    let mut names: Vec<Arc<str>> = staged.into_values().collect();
+    names.sort();
+    names.dedup();
+    if let Err(e) = hub.objects.discard(project, &names).await {
+        eprintln!("veil-server: discarding staged uploads: {e:#}");
+    }
+}
+
+/// Check uploaded objects (`docs/HUB.md` §4.5) and stage them (S28). Each
+/// frame, plain or compressed (`docs/HUB.md` §13.15), is decoded (bounded:
+/// at most the object size limit each, at most `limit` bytes for the whole
+/// request, a compressed one only if it expands at most
+/// [`encoding::MAX_RATIO`] times its size, and at most
+/// [`DECODING_IN_FLIGHT`] bytes across the server at once: BUG-1009),
+/// re-hashed against its id, and must decode canonically (safe names,
+/// sorted trees) at a repository format the server serves. It is kept as
+/// the server's own encoding of it, never as the client sent it, so no
+/// client chooses the stored bytes of an object others share (BUG-1008).
+/// The request's objects are written as **one staged pack** (one storage
+/// write), which nobody reads but a push or API commit of the same person
+/// that shows its receipts; a push that lands lists it, a refused one
+/// deletes it (BUG-930). Returns a receipt per object, in order (made
+/// whether or not the project held it already, so the answer is the same
+/// either way).
 pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limit: u64) -> Result<Vec<String>> {
     // The checks, decoding and compressing on a blocking thread.
     let rt = Handle::current();
@@ -1685,34 +2177,26 @@ pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limi
     })
     .await
     .map_err(|e| Error::Other(e.into()))??;
-    let receipts = frames.iter().map(|(id, _)| receipt(hub, project, person, id)).collect();
-    // Encodings, checked above: stored as they are, never encoded again.
-    put_many(hub, project, frames, true).await?;
-    Ok(receipts)
+    if frames.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<ObjectId> = frames.iter().map(|(id, _)| *id).collect();
+    // Encodings, checked above: staged as they are, never encoded again.
+    let pack = hub.objects.stage(project, frames).await.map_err(Error::Other)?;
+    Ok(ids.iter().map(|id| receipt(hub, project, person, id, &pack)).collect())
 }
 
 /// Store `objects` (canonical encodings; compressed by the store) in
 /// `project`, at most [`PUTS_AT_ONCE`] at a time (an object store answers a
 /// flood with "slow down": BUG-1053).
 pub async fn put_all(hub: &Arc<Hub>, project: i64, objects: impl IntoIterator<Item = (ObjectId, Bytes)>) -> Result<()> {
-    put_many(hub, project, objects, false).await
-}
-
-/// [`put_all`] of canonical encodings, or (`encoded`) of checked encodings
-/// stored as they are ([`crate::store::Objects::put_encoded`]).
-async fn put_many(hub: &Arc<Hub>, project: i64, objects: impl IntoIterator<Item = (ObjectId, Bytes)>, encoded: bool) -> Result<()> {
     let mut set = tokio::task::JoinSet::new();
     let mut it = objects.into_iter();
     loop {
         while set.len() < PUTS_AT_ONCE {
             let Some((id, b)) = it.next() else { break };
             let h = hub.clone();
-            set.spawn(async move {
-                match encoded {
-                    true => h.objects.put_encoded(project, &id, b).await,
-                    false => h.objects.put(project, &id, b).await,
-                }
-            });
+            set.spawn(async move { h.objects.put(project, &id, b).await });
         }
         match set.join_next().await {
             Some(r) => r.map_err(|e| Error::Other(e.into()))??,
