@@ -281,14 +281,15 @@ fn entries(src: &Source, edits: &[Edit], uploaded: &HashSet<ObjectId>, base_tree
     Ok(out)
 }
 
-/// Walk `parts` down real tree `root`: the folders on the way (the root's
-/// id first, then each folder's, as far as they are folders) and the entry
-/// at the end.
-fn walk(src: &Source, root: ObjectId, parts: &[String]) -> Result<(Vec<ObjectId>, Option<TreeEntry>)> {
+/// Walk `parts` down tree `root` (a real tree, read as it is, or one `pr`
+/// projected; `pr` projects nothing itself): the
+/// folders on the way (the root's id first, then each folder's, as far as
+/// they are folders) and the entry at the end.
+fn walk(pr: &Projector, root: ObjectId, parts: &[String]) -> Result<(Vec<ObjectId>, Option<TreeEntry>)> {
     let mut dirs = vec![root];
     let mut cur = root;
     for (i, part) in parts.iter().enumerate() {
-        let Node::Tree(t, _) = src.node(&cur)? else { return Ok((dirs, None)) };
+        let Some(t) = pr.tree(&cur)? else { return Ok((dirs, None)) };
         let Some(e) = t.get(part) else { return Ok((dirs, None)) };
         if i + 1 == parts.len() {
             return Ok((dirs, Some(e.clone())));
@@ -302,13 +303,15 @@ fn walk(src: &Source, root: ObjectId, parts: &[String]) -> Result<(Vec<ObjectId>
     Ok((dirs, None))
 }
 
-/// May edits made on real tree `a` be applied to real tree `b`: the same
-/// entry at every edited path, and each folder above it a folder in both or
-/// in neither?
-fn unchanged(src: &Source, a: &ObjectId, b: &ObjectId, edits: &[Edit]) -> Result<bool> {
+/// May edits made on real tree `a` be applied to real tree `b`: as the
+/// caller sees them (`pr`), the same entry at every edited path, and each
+/// folder above it a folder in both or in neither? (On the caller's view
+/// only: whether to rebase never tells them about what they cannot see.)
+fn unchanged(pr: &mut Projector, a: &ObjectId, b: &ObjectId, edits: &[Edit]) -> Result<bool> {
+    let (a, b) = (pr.root(*a)?, pr.root(*b)?);
     for e in edits {
-        let (da, ea) = walk(src, *a, &e.parts)?;
-        let (db, eb) = walk(src, *b, &e.parts)?;
+        let (da, ea) = walk(pr, a, &e.parts)?;
+        let (db, eb) = walk(pr, b, &e.parts)?;
         if ea != eb || da.len() != db.len() {
             return Ok(false);
         }
@@ -353,25 +356,13 @@ struct Plan {
     default_branch: bool,
 }
 
-fn accessor(plan: &Plan) -> Project {
-    Project {
-        id: plan.project.id,
-        name: String::new(),
-        default_branch: String::new(),
-        policy: plan.project.policy.clone(),
-        policy_text: plan.project.policy_text.clone(),
-        bindings: plan.project.bindings.clone(),
-    }
-}
-
 /// Build the change on real snapshot `parent` (which the caller sees as
 /// `pparent`), with every check a push gets.
 async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, parent: ObjectId, pparent: ObjectId) -> Result<Built> {
     // The caller's tree, as their `vl` would push it.
     let p = plan.clone();
     let shaped = sync::blocking_with(hub, plan.project.id, plan.pending.clone(), move |src| {
-        let project = accessor(&p);
-        let view = project.view(&p.viewer);
+        let view = p.project.view(&p.viewer);
         let mut pr = Projector::new(src, &view);
         let ptree = pr.root(src.snapshot(&parent)?.tree)?;
         let entries = entries(src, &p.edits, &p.uploaded, &p.base_tree)?;
@@ -386,7 +377,7 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, parent: ObjectId, pparent: Obje
     overlay.extend(shaped.made.iter().map(|(k, v)| (*k, v.clone())));
     let (p, hub2) = (plan.clone(), hub.clone());
     sync::blocking_with(hub, plan.project.id, overlay, move |src| {
-        let project = accessor(&p);
+        let project = &p.project;
         let mut n = Snapshot {
             parents: vec![parent],
             change_id: p.change_id,
@@ -403,7 +394,7 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, parent: ObjectId, pparent: Obje
         n.sign(&hub2.identity);
         let mut known = p.uploaded.clone();
         known.extend(src.pending.keys().copied());
-        let c = sync::complete(src, &project, &p.viewer, &known, &n, &[parent], &hub2.identity)?;
+        let c = sync::complete(src, project, &p.viewer, &known, &n, &[parent], &hub2.identity)?;
         let (real, raw) = match c.raw {
             Some(raw) => match Object::decode(&raw)? {
                 Object::Snapshot(s) => (s, raw),
@@ -429,7 +420,7 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, parent: ObjectId, pparent: Obje
                     }
                 }
             }
-            for d in walk(src, real.tree, &e.parts)?.0 {
+            for d in walk(&Projector::new(src, &view), real.tree, &e.parts)?.0 {
                 if let Some(raw) = shaped.made.get(&d) {
                     if seen.insert(d) {
                         store.push((d, raw.clone()));
@@ -665,13 +656,16 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: 
     let rebase = onto.as_ref().is_some_and(|o| o.expected == Expected::Rebase);
     let (mut parent, mut pparent) = (base_real, req.base);
     let mut rebased = 0u32;
+    let mut attempts = 0u32;
     let (built, moved) = loop {
+        attempts += 1;
         if let (true, None, Some(c)) = (rebase, &rejected, cur) {
             if c != parent {
                 let (bt, b) = (plan.base_tree, plan.clone());
                 let ok = sync::blocking(hub, project.id, move |src| {
                     let ct = src.snapshot(&c)?.tree;
-                    unchanged(src, &bt, &ct, &b.edits)
+                    let view = b.project.view(&b.viewer);
+                    unchanged(&mut Projector::new(src, &view), &bt, &ct, &b.edits)
                 })
                 .await?;
                 match ok {
@@ -690,7 +684,8 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: 
             (Some(o), Some(c), None) => Some(Move {
                 branch: o.branch.clone(),
                 cur: c,
-                keep_on_loss: !rebase || rebased >= MAX_REBASES,
+                // A tip that moves away and back must not keep it trying.
+                keep_on_loss: !rebase || rebased >= MAX_REBASES || attempts > MAX_REBASES,
             }),
             _ => None,
         };
@@ -714,11 +709,12 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: 
             if moved == Some(false) {
                 rejected = Some("the branch moved during the request".into());
             }
-            let now = tip(hub, project.id, &o.branch).await?;
-            let tip_seen = match (landed, now) {
-                (true, _) => Some(built.mine),
-                (false, Some(t)) => Some(sync::projected(hub, project, viewer, t).await?),
-                (false, None) => None,
+            let tip_seen = match landed {
+                true => Some(built.mine),
+                false => match tip(hub, project.id, &o.branch).await? {
+                    Some(t) => Some(sync::projected(hub, project, viewer, t).await?),
+                    None => None,
+                },
             };
             if landed && built.accept.is_some() {
                 let p = crate::perm::load_project(&mut *hub.db.acquire().await?, &project.name)

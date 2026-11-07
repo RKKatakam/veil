@@ -1573,6 +1573,13 @@ POST /v1/projects/{p}/changes
   clone of the project it seals secret files with the clone's keys
   first (outside one, it refuses to send them), and it scans every
   ordinary file itself, so a secret never leaves the device.
+* **Measured** (`docs/design/scale/LOAD.md`, "Commits through the API"):
+  one file by one agent, p50 7.4 ms as the client sees it, 2.7 ms of
+  server CPU, 13 statements and 1 commit (a push: 10.7 ms, 34 statements,
+  3 commits); 1,000 landings/s across 100 projects (pushes: 283–547);
+  into one `main` with 50 agents, 20/s at p99 95 ms, peaking near 35/s,
+  short of phase 2's 100/s (each lost race rebuilds the change; S17
+  batches).
 
 Threat review (phase 2 §6, rows 11–13, and what S10 adds):
 

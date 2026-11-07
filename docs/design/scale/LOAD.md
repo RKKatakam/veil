@@ -275,6 +275,28 @@ read the shape, not the last digit.
 
 Raw results (not committed): `.scratch/bench-results/server-load-bfa691a-20261106T202331Z-*` (MinIO, with the server logs) and `…T202730Z-*` (local objects).
 
+## Commits through the API (S10, 2026-11-07)
+
+`scripts/bench-server.sh load` on `5ea7197` (PostgreSQL 17 with `pg_stat_statements`, MinIO, one release server, 15 s per point, the machine shared with other agents: load average 8 before, 87 after). `--mode api`: each agent commits one new file through `POST …/changes` with `onto main` and `"rebase"` (no pull, no upload; `docs/HUB.md` §13.13); `--mode land` is the push path of §2–3, in the same run. "Commits" are explicit `COMMIT`s; "writes" are `INSERT`/`UPDATE`/`DELETE` statements, in a transaction or not.
+
+| Mode | Projects | Agents | Target (/s) | Done (/s) | p50 (ms) | p99 (ms) | Collisions per landing | Server CPU (ms/op) | DB statements per op | Commits per op | Writes per op | Errors |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| land | 1 | 1 | max | 88.1 | 10.7 | 23.0 | 0 | 3.22 | 34.0 | 1.00 | 5.0 | 0 |
+| **api** | 1 | 1 | max | **125.3** | **7.4** | 19.8 | 0 | **2.66** | **13.0** | **1.00** | 5.0 | 0 |
+| land | 10 | 10 | max | 422.9 | 19.5 | 100.6 | 0 | 3.23 | 34.0 | 1.00 | 5.0 | 0 |
+| **api** | 10 | 10 | max | **767.6** | 11.3 | 47.5 | 0 | 2.14 | 13.0 | 1.00 | 5.0 | 0 |
+| land | 100 | 100 | max | 283.3 | 354.4 | 711.2 | 0 | 2.59 | 34.0 | 1.01 | 5.0 | 0 |
+| **api** | 100 | 100 | max | **1,000.7** | 80.2 | 290.0 | 0 | 1.98 | 13.9 | 1.00 | 5.0 | 2,118 (MinIO resets, BUG-861) |
+| land | 1 (one `main`) | 50 | 20 | 6.6 | 5,034 | 15,621 | 27.4 | 117.9 | 2,033 | 27.4 | 91.0 | 0 |
+| **api** | 1 (one `main`) | 50 | 20 | **19.9** | **8.1** | **95.1** | 1.05 | 2.34 | 17.3 | 1.00 | 5.1 | 0 |
+| **api** | 1 (one `main`) | 50 | 50 | 34.7 | 1,076 | 7,524 | 26.0 | 39.5 | 210 | 5.10 | 47.0 | 6 (BUG-861) |
+| **api** | 1 (one `main`) | 50 | 100 | 32.2 | 4,365 | 11,118 | 32.7 | 51.5 | 261 | 6.21 | 58.3 | 0 |
+
+* **One database commit per API commit.** Every write of a landing (the branch's compare-and-swap, the snapshot row, the caller's projection memo, the change ref, the audit row) is in its one transaction: 1 commit and 5 writes per landing, against the push's 1 transaction plus 2 writes outside it (the projection memo and the audit row: 3 commits). Statements per landing fall from 34 to 13.
+* **Storage writes:** a one-file change by a non-admin stores 6 objects (the blob, the three full trees on its path, the server's snapshot, the caller's projection; `server_hub` `changes`). Packs (S28) make that one write.
+* **Across projects** the API lands 1,000/s, 2–3.5× the push path, limited by MinIO (its connection resets are BUG-861).
+* **Into one `main`,** the API lands 20/s with 50 agents at p99 95 ms (the push path manages 6.6/s with 27 collisions per landing), and peaks at about 35/s: **the phase 2 target of 100/s is not met.** Each lost race rebuilds the change and stores its objects again inside the window between reading the tip and its compare-and-swap (about 10 ms with MinIO), so above about 30/s most attempts lose and collisions climb to 26–33 per landing. Batched landing (S17) is the planned fix; shortening the window (one storage write per landing with packs, S28) helps first.
+
 ## What would raise each ceiling (not built)
 
 | Ceiling | Bound by | What raises it |
