@@ -150,10 +150,22 @@ step postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-pg-$
 step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-yb-$RUN "$BIN" --skip "$HOSTILE"
 # One at a time: on a database other runs share, three at once could keep
 # a statement past its timeout.
-STEP_LIMIT=2400 step hostile-postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-hpg-$RUN "$BIN" "$HOSTILE" --test-threads=1
-# On the shared YugabyteDB, also one run at a time machine-wide: two runs'
-# hostile steps at once time out statements (S12's bug_868 under load).
-STEP_LIMIT=4800 step hostile-yugabyte flock -w 2400 "${XDG_RUNTIME_DIR:-/tmp}/veil-yb-hostile.lock" env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-hyb-$RUN "$BIN" "$HOSTILE" --test-threads=1
+# The hostile-size sets take about half an hour and touch only S12/S13's
+# derived data, so they run when this branch changes `derive/` or `query/`
+# (compared with `integration`), or when VEIL_VERIFY_HOSTILE=1 (always for
+# merges into `integration`). On the shared YugabyteDB they also run one at a
+# time machine-wide: two runs' hostile steps at once time out statements.
+hostile=${VEIL_VERIFY_HOSTILE:-auto}
+if [ "$hostile" = auto ]; then
+  base=$(git merge-base HEAD integration 2>/dev/null)
+  if [ -n "$base" ] && git diff --name-only "$base" HEAD -- crates/veil-server/src/derive crates/veil-server/src/query crates/veil-server/tests/server_hub/derived.rs | grep -q .; then hostile=1; else hostile=0; fi
+fi
+if [ "$hostile" = 1 ]; then
+  STEP_LIMIT=2400 step hostile-postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-hpg-$RUN "$BIN" "$HOSTILE" --test-threads=1
+  STEP_LIMIT=9000 step hostile-yugabyte flock -w 7200 "${XDG_RUNTIME_DIR:-/tmp}/veil-yb-hostile.lock" env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-hyb-$RUN "$BIN" "$HOSTILE" --test-threads=1
+else
+  echo "   skip  hostile sets (no derive/ or query/ changes; VEIL_VERIFY_HOSTILE=1 runs them)"
+fi
 
 echo "== concurrency under load (several copies at once)"
 load() { # url, bucket, copies (each copy bounded like a step)
