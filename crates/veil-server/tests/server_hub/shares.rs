@@ -635,3 +635,154 @@ fn concurrency_share_updates_and_unshares_under_load() {
     }
     eprintln!("{} share versions accepted under load", accepted.len());
 }
+
+// ---- adversarial pass: secret shares (docs/BUGS.md) --------------------------------------
+
+/// BUG-1060: the sharing device does not remember its own unshare. A
+/// compromised server puts back the last record and lists the share as
+/// active again; fin's background pass then seals fin's **rotated** secret
+/// (the rotation `vl secret unshare` advises) for dev, whom fin cut off.
+#[test]
+#[ignore = "BUG-1060: the background updater revives a share its own device ended, on the server's word"]
+fn bug_1060_an_unshare_the_server_forgets_never_seals_a_later_version() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let (f, _d) = shared(&hub, &p);
+    let env = env_path();
+    let last = record(&hub, &p, &env, &p.dev.name);
+    p.fin.ok(&f, &["secret", "unshare", &env, "--from", &p.dev.name]);
+    // The compromised server forgets the unshare: the last record is back,
+    // at its version, and the share is listed as active.
+    store(&hub, &p, &env, &last);
+    sql(
+        &hub,
+        "UPDATE secret_shares SET unshared_at = NULL WHERE path = $1 AND project_id = (SELECT id FROM projects WHERE name = $2)",
+        &[&env, &p.name],
+    );
+    // fin rotates the secret, as the unshare told them to.
+    let rotated = "KEY=MARKER-ROTATED-AFTER-UNSHARE-5b0e77c1\n";
+    write_files(&f, &[(&env, rotated)]);
+    for _ in 0..3 {
+        p.fin.ok(&f, &["share-keys"]);
+    }
+    let r = record(&hub, &p, &env, &p.dev.name);
+    let dev_id = p.dev.identity();
+    assert!(
+        !r.open(&dev_id).is_ok_and(|c| c == rotated.as_bytes()),
+        "fin's device sealed the rotated secret for dev after fin unshared it (version {} > {})",
+        r.version,
+        last.version
+    );
+}
+
+/// BUG-1061: the limit of 256 shares per person and project is a count,
+/// then an insert, in separate statements: requests that arrive together
+/// all see room and all insert.
+#[test]
+#[ignore = "BUG-1061: concurrent new shares pass the 256-per-person limit"]
+fn bug_1061_concurrent_new_shares_never_pass_the_limit() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let project = project_id(&p.dir);
+    // One short of the limit (ended shares count too).
+    sql(
+        &hub,
+        "INSERT INTO secret_shares (project_id, path, sharer_id, recipient_id, version, created_at, updated_at, unshared_at) \
+         SELECT pr.id, 'x/' || g || '/.env', a.id, b.id, 1, 0, 0, 0 FROM projects pr, people a, people b, generate_series(1, $1) g \
+         WHERE pr.name = $2 AND a.name = $3 AND b.name = $4",
+        &[&(MAX_SHARES_PER_SHARER - 1), &p.name, &p.fin.name, &p.carol.name],
+    );
+    let route = format!("/v1/projects/{}/shares", p.name);
+    let (token, fin) = (p.fin.token(), p.fin.identity());
+    let n = 24;
+    let start = std::sync::Barrier::new(n);
+    let accepted = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for i in 0..n {
+            let (route, token, fin, project, start, accepted, dev, me) = (&route, &token, &fin, &project, &start, &accepted, &p.dev.name, &p.fin.name);
+            let api = hub.api();
+            scope.spawn(move || {
+                let path = format!("{BILL_DIR}/race-{i}/.env");
+                let t = ShareTarget {
+                    project,
+                    path: &path,
+                    sharer: me,
+                    recipient: dev,
+                    version: 1,
+                };
+                let r = ShareRecord::seal(fin, &t, 1, b"K=1\n", &[fin.public_hex()]).unwrap();
+                let body = serde_json::to_value(SharePut { expect: 0, reshare: true, record: r }).unwrap();
+                start.wait();
+                let s = api.post_json(Some(token), route, &body).status;
+                assert!(s == 200 || s == 403, "unexpected {s}");
+                if s == 200 {
+                    accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    let count: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar(
+                "SELECT count(*) FROM secret_shares s JOIN projects pr ON pr.id = s.project_id JOIN people a ON a.id = s.sharer_id \
+                 WHERE pr.name = $1 AND a.name = $2",
+            )
+            .bind(&p.name)
+            .bind(&p.fin.name)
+            .fetch_one(&hub.hub().db),
+        )
+        .unwrap();
+    assert!(
+        count <= MAX_SHARES_PER_SHARER,
+        "{count} shares stored for one person (at most {MAX_SHARES_PER_SHARER}); {} of {n} concurrent new shares accepted",
+        accepted.into_inner()
+    );
+}
+
+/// BUG-1062: a symlink at the share's path in the recipient's working copy
+/// (dev keeps `.env -> ../dev-own.env`) reads as "absent", so a new version
+/// replaces dev's link with the sharer's copy: written over dev's own setup,
+/// which "never written over the person's own edit" promises not to do.
+#[test]
+#[ignore = "BUG-1062: a received share replaces the recipient's own symlink at its path"]
+fn bug_1062_a_share_never_replaces_the_recipients_symlink() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let (f, d) = shared(&hub, &p);
+    let env = env_path();
+    // dev points the path at a file of their own.
+    write_files(&d, &[("dev-own-a3c1.env", "DEV=MARKER-DEV-OWN-LINKED-6e2f\n")]);
+    std::fs::remove_file(d.join(&env)).unwrap();
+    std::os::unix::fs::symlink("../dev-own-a3c1.env", d.join(&env)).unwrap();
+    write_files(&f, &[(&env, "KEY=sharer-v2-after-the-link\n")]);
+    let dev_id = p.dev.identity();
+    seal_until(&hub, &p, &f, &env, &p.dev.name, |r| r.open(&dev_id).is_ok_and(|c| c == b"KEY=sharer-v2-after-the-link\n"));
+    p.dev.ok(&d, &["pull"]);
+    let meta = std::fs::symlink_metadata(d.join(&env)).unwrap();
+    assert!(meta.file_type().is_symlink(), "dev's symlink was replaced by the shared copy: {:?}", read(&d, &env));
+}
+
+/// BUG-1063: every clone on the sharing device updates the share, each
+/// from its own copy. fin keeps a second clone (an older checkout, an
+/// agent's): its background pass seals that clone's older secret as a new
+/// version, and dev is rolled back to it; the two clones then take turns.
+#[test]
+#[ignore = "BUG-1063: a second clone on the sharing device seals its own older copy over the share"]
+fn bug_1063_another_clone_on_the_sharing_device_never_rolls_the_share_back() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let (f, _d) = shared(&hub, &p);
+    let env = env_path();
+    let f2 = clone(&hub, &p, &p.fin, "f2");
+    assert!(read(&f2, &env).unwrap().contains(ENV_MARK));
+    let newer = "KEY=MARKER-NEWER-FROM-F-2d7a90be\n";
+    write_files(&f, &[(&env, newer)]);
+    let dev_id = p.dev.identity();
+    seal_until(&hub, &p, &f, &env, &p.dev.name, |r| r.open(&dev_id).is_ok_and(|c| c == newer.as_bytes()));
+    // A command in fin's other clone runs its background pass.
+    p.fin.ok(&f2, &["share-keys"]);
+    let r = record(&hub, &p, &env, &p.dev.name);
+    let got = r.open(&dev_id).unwrap();
+    assert_eq!(String::from_utf8_lossy(&got), newer, "fin's other clone sealed its older copy (version {})", r.version);
+}
