@@ -55,7 +55,8 @@ pub struct BlameArgs {
     /// reported as unattributed.
     #[arg(long, value_name = "N", default_value_t = 100_000)]
     pub max_changes: usize,
-    /// Annotate as a public mirror sees the history (no cloaked versions).
+    /// Annotate as a public mirror sees the history: no secret files, and
+    /// nothing an unreleased embargo withholds (refused for such a revision).
     #[arg(long)]
     pub public: bool,
     #[command(flatten)]
@@ -298,11 +299,11 @@ impl RenameArgs {
 
 /// `vl diff`.
 pub fn diff(ctx: &Ctx, rev: Option<&str>, from: Option<&str>, to: Option<&str>, stat: bool, r: &RenameArgs, json: bool) -> Result<()> {
-    let (a, b) = api::diff_trees_for(ctx, rev, from, to)?;
+    let t = api::diff_trees_for(ctx, rev, from, to)?;
     let renames = r.renames();
     match json {
-        true => api::emit_json(&api::diff_with(&ctx.repo, &a, &b, stat, &renames)?),
-        false => api::text::diff(&ctx.repo, &a, &b, stat, &renames),
+        true => api::emit_json(&api::diff_with(&ctx.repo, &t, stat, &renames)?),
+        false => api::text::diff(&ctx.repo, &t.from, &t.to, stat, &renames),
     }
 }
 

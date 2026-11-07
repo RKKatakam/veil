@@ -68,8 +68,8 @@ pub enum Reader {
     /// This repository's keychain: whatever its keys open.
     #[default]
     Me,
-    /// A public mirror: plaintext objects and released embargoes only (the
-    /// `--public` view).
+    /// A public mirror: plaintext objects, and no history an unreleased
+    /// embargo withholds (the `--public` view).
     Public,
 }
 
@@ -511,6 +511,15 @@ fn version_at(store: &ObjectStore, tree: &ObjectId, path: &VPath, reader: Reader
 
 /// Attribute each line of the file `path` at snapshot `rev`.
 pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Result<Blame> {
+    // A public mirror lacks what an unreleased embargo withholds (BUG-991):
+    // no push sends it before the release. A revision it has holds none of
+    // it in its history, so only the revision itself is checked.
+    if o.reader == Reader::Public && crate::remote::embargo_blocks(repo, &[*rev])?[0].is_some() {
+        return Err(VeilError::Policy(format!(
+            "{} is not public: an unreleased embargo withholds it, and a public mirror does not have it before the release",
+            rev.short()
+        )));
+    }
     let store = repo.store();
     let mut stats = ReadStats::default();
     let top = repo.snapshot(rev)?;
