@@ -523,3 +523,284 @@ fn bug_1100_the_first_landing_after_an_access_change_projects_one_batch_not_all_
         .unwrap();
     assert!(rows <= 10, "{rows} projections made for one landing");
 }
+
+// S17 review, cycle 1 (docs/BUGS.md, "S17 cycle 1").
+
+use veil_core::object::{Object as O, Snapshot, Text};
+
+/// `c`'s root without the entry `name` (fetched as the crafter sees it).
+fn without(c: &mut Craft<'_>, name: &str) {
+    let r = c.api.post_json(
+        Some(&c.token),
+        &format!("/v1/projects/{}/fetch", c.project),
+        &json!({"snapshot": c.tip.hex(), "objects": [{"path": "", "id": c.root.hex()}]}),
+    );
+    let O::Tree(mut t) = O::decode(&r.frames()[0].1).unwrap() else { panic!("not a tree") };
+    assert!(t.get(name).is_some(), "{name} is not in the crafter's root");
+    t.remove(name);
+    c.root = c.put(O::Tree(t));
+}
+
+/// Sign a snapshot of `c`'s root on `parents`, upload it with what `c`
+/// made, and submit it to land on main (`POST …/land` of a snapshot).
+fn land_crafted(mut c: Craft<'_>, parents: Vec<ObjectId>, wait: bool) -> Reply {
+    let mut s = Snapshot {
+        parents,
+        change_id: veil_core::ChangeId::random(),
+        tree: c.root,
+        description: Text::Plain("crafted".into()),
+        author: "crafter".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        signature: None,
+    };
+    s.sign(&c.identity);
+    let id = c.put(O::Snapshot(s));
+    let up = c.api.upload(&c.token, &c.project, &c.objects);
+    assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+    let receipts = up.json()["receipts"].as_array().unwrap().clone();
+    let map: serde_json::Map<String, Value> = c.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+    c.api.post_json(
+        Some(&c.token),
+        &format!("/v1/projects/{}/land", c.project),
+        &json!({"onto": "main", "snapshot": id.hex(), "receipts": map, "wait": wait}),
+    )
+}
+
+#[test]
+#[ignore = "BUG-1102: a non-admin's merge takes .veilrules from a parent without it: main is no longer protected"]
+fn bug_1102_a_merge_never_lets_a_non_admin_change_the_branch_rules() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    // The admin gives the devs the rules file (as
+    // `protected_branches_move_only_by_landing_and_push_lands_instead`
+    // does), then protects main.
+    p.admin.ok(&p.dir, &["access", ".veilrules", "devs"]);
+    p.admin.commit_main(&p.dir, "devs may edit the rules file");
+    p.admin.ok(&p.dir, &["push"]);
+    let token = p.dev.token();
+    // A change of the dev's own from before the rules, kept on no branch
+    // (an API commit without `onto`).
+    let base = tip_for(&hub, &token, &p.name);
+    let r = api.post_json(Some(&token), &format!("/v1/projects/{}/changes", p.name), &json!({"base": base.hex(), "edits": [put("src/side.rs", "side\n")]}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let unprotected: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+    write_files(&p.dir, &[(".veilrules", "[branches.main]\nprotected = true\n")]);
+    p.admin.commit_main(&p.dir, "protect main");
+    p.admin.ok(&p.dir, &["push"]);
+    // A plain edit of the rules by the dev is refused (the builder's test).
+    let r = land(&api, &token, &p.name, tip_for(&hub, &token, &p.name), json!([put(".veilrules", "")]), true);
+    assert!(String::from_utf8_lossy(&r.body).contains("only admins may change the branch rules"));
+    // The dev merges main with their change from before the rules, keeping
+    // that side's (absent) .veilrules: every parent's rules count as "the
+    // same rules" in `sync::complete`.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    without(&mut c, ".veilrules");
+    let tip = c.tip;
+    let r = land_crafted(c, vec![tip, unprotected], true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    // Expected: refused, as any non-admin change of the rules is.
+    let landed = r.status == 200 && r.json()["state"] == "landed";
+    // Main is still protected: a plain push of it lands (it has a ticket).
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/direct.rs", "direct\n");
+    let v = c.push("main", "a direct push").json();
+    assert!(v["results"][0]["ticket"].is_string(), "main is no longer protected after a non-admin's merge ({body}): {v}");
+    assert!(!landed, "a non-admin's merge changed the branch rules: {body}");
+}
+
+#[test]
+#[ignore = "BUG-1103: a push or land to a protected branch drops the changes under it the server already holds"]
+fn bug_1103_a_landed_stack_brings_every_change_the_branch_lacks() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    write_files(&p.dir, &[(".veilrules", "[branches.main]\nprotected = true\n")]);
+    p.admin.commit_main(&p.dir, "protect main");
+    p.admin.ok(&p.dir, &["push"]);
+    let token = p.dev.token();
+    let base = tip_for(&hub, &token, &p.name);
+    // A change the server keeps on no branch (an API commit without
+    // `onto`; a `vl push` of another branch, or a landing answered
+    // `conflict`, leaves the same).
+    let r = api.post_json(Some(&token), &format!("/v1/projects/{}/changes", p.name), &json!({"base": base.hex(), "edits": [put("src/first.rs", "first\n")]}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let first: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+    // A second change on top of it, pushed to main: it lands instead.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/first.rs", "first\n");
+    c.file("src/second.rs", "second\n");
+    c.tip = first;
+    let v = c.push("main", "second").json();
+    let ok = v["results"][0]["ok"] == true;
+    let check = p.dev.dir("check");
+    p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), check.to_str().unwrap()]);
+    if ok {
+        assert!(check.join("src/second.rs").exists(), "{v}");
+        // Main was asked to hold both changes; it says "landed".
+        assert!(check.join("src/first.rs").exists(), "main got the second change without the first, and the push said it landed: {v}");
+    }
+}
+
+#[test]
+#[ignore = "BUG-1104: a landing's conflict is decided before its access is checked again: it tells a submitter who lost access that a path changed"]
+fn bug_1104_a_submitter_who_lost_access_is_told_nothing_of_what_changed_since() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    // fin is also a dev, so stays in the project without finance.
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name]);
+    let token = p.fin.token();
+    let base = tip_for(&hub, &token, &p.name);
+    let invoice = format!("{BILL_DIR}/acme/invoice.txt");
+    let other = format!("{BILL_DIR}/acme/other.txt");
+    hold(&hub, pid);
+    let changed = land(&api, &token, &p.name, base, json!([put(&invoice, "fin's edit\n")]), false).json();
+    let unchanged = land(&api, &token, &p.name, base, json!([put(&other, "fin's file\n")]), false).json();
+    assert_eq!(changed["state"], "queued", "{changed}");
+    // fin loses billing; then the admin edits the invoice (main is not
+    // protected: a plain push, while fin's entries wait).
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    write_files(&p.dir, &[(&invoice, "the admin's edit, after fin lost billing\n")]);
+    p.admin.commit_main(&p.dir, "after fin lost billing");
+    p.admin.ok(&p.dir, &["push"]);
+    release(&hub, pid);
+    let u = outcome(&api, &token, &p.name, unchanged["ticket"].as_str().unwrap());
+    assert_eq!(u["state"], "rejected", "{u}");
+    let c = outcome(&api, &token, &p.name, changed["ticket"].as_str().unwrap());
+    // Both answers must be the same kind: a `conflict` tells fin the
+    // invoice changed after it was hidden from them.
+    assert_eq!(c["state"], "rejected", "the answer tells someone without access that a hidden file changed: {c}");
+}
+
+#[test]
+#[ignore = "BUG-1105: when a merge's checks run again at landing, its other parents are dropped: a merge accepted at submit is refused"]
+fn bug_1105_a_merge_checked_again_at_landing_keeps_its_other_parents() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    // The dev adds a file to src/ on a branch of their own.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/feature.rs", "feature\n");
+    let r = c.push_to("feature", None);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    // fin reads src/ (it is public) but may not write it; a merge taking
+    // the dev's change from the other parent is allowed (`check_changes`).
+    let ftok = p.fin.token();
+    let feature = api.tips(Some(&ftok), &p.name).unwrap().branches["feature"];
+    let mut m = Craft::new(&api, &p.fin, &p.name, "main");
+    m.root = m.tree_of(feature);
+    let tip = m.tip;
+    hold(&hub, pid);
+    let r = land_crafted(m, vec![tip, feature], false);
+    let v = r.json();
+    assert_eq!(v["state"], "queued", "accepted at submit: {v}");
+    // fin's access epoch changes (a new group: nothing they may read or
+    // write changes), so the checks run again when the merge lands.
+    p.admin.ok(&p.dir, &["group", "create", "observers"]);
+    p.admin.ok(&p.dir, &["group", "add", "observers", &p.fin.name]);
+    release(&hub, pid);
+    let r = outcome(&api, &ftok, &p.name, v["ticket"].as_str().unwrap());
+    assert_eq!(r["state"], "landed", "{r}");
+}
+
+#[test]
+#[ignore = "BUG-1106: with no access change, a submitter whose view key the service is not keeping walks history in the service's loop"]
+fn bug_1106_a_landing_after_the_service_restarts_projects_one_batch_not_the_gap() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let r = land(&api, &token, &p.name, tip_for(&hub, &token, &p.name), json!([put("src/first.rs", "x\n")]), true);
+    assert_eq!(r.json()["state"], "landed");
+    // Nothing to land for longer than a service waits idle (5 s): it
+    // stops, and the next one keeps no view key.
+    std::thread::sleep(Duration::from_secs(7));
+    // Then 150 landings by the admin (who sees real snapshots: no view
+    // key), as any busy branch has from others.
+    let atok = p.admin.token();
+    let abase = tip_for(&hub, &atok, &p.name);
+    let tickets: Vec<String> = (0..150)
+        .map(|i| land(&api, &atok, &p.name, abase, json!([put(&format!("src/g/{i:03}.rs"), "x\n")]), false).json()["ticket"].as_str().unwrap().to_string())
+        .collect();
+    for t in &tickets {
+        assert_eq!(outcome(&api, &atok, &p.name, t)["state"], "landed");
+    }
+    // No access changed. The dev lands once more.
+    let before = veil_core::now_millis();
+    let t = std::time::Instant::now();
+    let r = land(&api, &token, &p.name, tip_for(&hub, &token, &p.name), json!([put("src/after.rs", "after\n")]), true);
+    assert_eq!(r.json()["state"], "landed");
+    let took = t.elapsed();
+    let h = hub.hub();
+    let rows: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT count(*) FROM projections WHERE project_id = $1 AND created_at >= $2").bind(pid).bind(before).fetch_one(&h.db))
+        .unwrap();
+    assert!(rows <= 10, "{rows} projections made in the landing service's loop for one landing ({took:?}), with no access change");
+}
+
+/// This process's resident memory and its peak since the last reset, in
+/// bytes (Linux).
+fn rss() -> (u64, u64) {
+    let s = std::fs::read_to_string("/proc/self/status").unwrap();
+    let kb = |k: &str| s.lines().find(|l| l.starts_with(k)).unwrap().split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() * 1024;
+    (kb("VmRSS:"), kb("VmHWM:"))
+}
+
+#[test]
+#[ignore = "BUG-1107: a batch holds every folder listing it rewrites, for up to 500 entries, in memory at once"]
+fn bug_1107_a_batch_of_one_line_changes_in_a_big_folder_stays_within_memory() {
+    use veil_core::object::{EntryKind, Tree, TreeEntry, Visibility};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    // A folder of 30,000 files (generated code, fixtures, translations):
+    // its listing is about 1.6 MB.
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    let blob = c.put(O::Blob(b"x\n".to_vec()));
+    let mut t = Tree::default();
+    for i in 0..30_000 {
+        t.insert(TreeEntry {
+            name: format!("generated-file-{i:05}.rs"),
+            kind: EntryKind::File,
+            id: blob,
+            size: 2,
+            executable: false,
+            visibility: Visibility::Public,
+        });
+    }
+    let big = c.put(O::Tree(t));
+    c.refer_dir("src/big", big);
+    let r = c.push("main", "a big folder");
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    // 400 agents each change one file in it, from the same base.
+    let token = p.dev.token();
+    let base = tip_for(&hub, &token, &p.name);
+    hold(&hub, pid);
+    let tickets: Vec<String> = (0..400)
+        .map(|i| {
+            let r = land(&api, &token, &p.name, base, json!([put(&format!("src/big/generated-file-{i:05}.rs"), &format!("{i}\n"))]), false);
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            r.json()["ticket"].as_str().unwrap().to_string()
+        })
+        .collect();
+    // The peak from here: the landing service's batch.
+    std::fs::write("/proc/self/clear_refs", "5").unwrap();
+    let (start, _) = rss();
+    release(&hub, pid);
+    for t in &tickets {
+        assert_eq!(outcome(&api, &token, &p.name, t)["state"], "landed");
+    }
+    let (_, peak) = rss();
+    let grew = peak.saturating_sub(start) >> 20;
+    let batches = sql_i64(&hub, "SELECT count(*) FROM audit_log WHERE project_id = $1 AND action = 'land'", pid);
+    assert!(grew <= 256, "the landing service's peak grew by {grew} MiB for 400 one-line changes ({batches} batches)");
+}
