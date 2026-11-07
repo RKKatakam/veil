@@ -1206,7 +1206,9 @@ fn cmd_embargo_release(ctx: &mut Ctx, id: &str, yes: bool) -> Result<()> {
     );
     let mut merges = Vec::new();
     let mut tags = Vec::new();
-    for sid in ctx.repo.visible_snapshots()? {
+    // The embargoed merges, from the history index (it walks only lines
+    // that build on one), exactly.
+    for sid in ctx.repo.exact().run(|r| r.visible_embargoed())? {
         let s = ctx.repo.snapshot(&sid)?;
         if s.embargo.as_deref() == Some(id) {
             merges.push((sid, first_line(&ctx.repo.description(&s)).to_string()));

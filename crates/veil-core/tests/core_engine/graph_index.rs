@@ -46,8 +46,8 @@ fn commits_append_layers_that_stay_few() {
     let parent = reopened.snapshot(&wc).unwrap().parents[0];
     let (g, pg) = (reopened.graph().generation(&reopened, &wc).unwrap(), reopened.graph().generation(&reopened, &parent).unwrap());
     assert!(g.is_some() && pg.is_some() && g > pg, "{g:?} above {pg:?}");
-    let visible: Vec<_> = reopened.visible_iter().map(Result::unwrap).collect();
-    assert_eq!(visible, reopened.visible_snapshots().unwrap());
+    let visible: Vec<_> = reopened.held().visible_iter().map(Result::unwrap).collect();
+    assert_eq!(visible, reopened.exact().visible().unwrap());
 }
 
 /// Counts the layer files created (`create_new` under the index).
@@ -134,7 +134,7 @@ fn a_lost_slot_is_retried_after_the_winners_layer() {
     let fresh = Repo::open(backend.clone(), None, "t").unwrap();
     let wc = fresh.workspace_wc(WS).unwrap();
     assert!(fresh.graph().generation(&fresh, &wc).unwrap().is_some());
-    assert_eq!(fresh.visible_iter().map(Result::unwrap).collect::<Vec<_>>(), fresh.visible_snapshots().unwrap());
+    assert_eq!(fresh.held().visible_iter().map(Result::unwrap).collect::<Vec<_>>(), fresh.exact().visible().unwrap());
 }
 
 /// A layer of a voided epoch (left by a process that appended while the
@@ -147,7 +147,7 @@ fn layers_of_an_older_epoch_are_ignored() {
     backend.write(&dir().join("L-0-7-7.vcg"), b"not a layer").unwrap();
     backend.create_new(&dir().join("E-1"), b"").unwrap();
     let mut fresh = Repo::open(backend.clone(), None, "t").unwrap();
-    assert_eq!(fresh.visible_iter().map(Result::unwrap).collect::<Vec<_>>(), fresh.visible_snapshots().unwrap());
+    assert_eq!(fresh.held().visible_iter().map(Result::unwrap).collect::<Vec<_>>(), fresh.exact().visible().unwrap());
     fresh.describe(fresh.workspace_wc(WS).unwrap(), "two").unwrap();
     let names = files(&*backend);
     assert!(names.iter().any(|n| n.starts_with("L-1-")), "{names:?}");
@@ -200,7 +200,7 @@ fn a_deep_history_is_indexed_iteratively() {
     tx.add_head(parent).unwrap();
     tx.commit().unwrap();
     assert_eq!(repo.graph().generation(&repo, &parent).unwrap(), Some(20_001));
-    let first: Vec<_> = repo.topo_iter([parent]).take(3).map(Result::unwrap).collect();
+    let first: Vec<_> = repo.held().topo_iter([parent]).take(3).map(Result::unwrap).collect();
     assert_eq!(first[0], parent);
     assert_eq!(first.len(), 3);
 }
@@ -222,7 +222,7 @@ fn collected_snapshots_do_not_resolve_through_the_index() {
     let hex = doomed.hex();
     backend.remove_file(&VPath::new(&format!(".veil/objects/{}/{}", &hex[..2], &hex[2..])).unwrap()).unwrap();
     let fresh = Repo::open(backend.clone(), None, "t").unwrap();
-    assert!(fresh.snapshot_opt(&doomed).unwrap().is_none(), "collected");
+    assert!(fresh.exact().snapshot(&doomed).unwrap().is_none(), "collected");
     let prefix = &change.to_string()[..8];
     let err = revset::resolve(&fresh, prefix, WS).unwrap_err();
     assert!(err.to_string().contains("not found"), "{err}");

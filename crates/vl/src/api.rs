@@ -914,7 +914,7 @@ pub fn log_entries_with<'a>(repo: &'a Repo, ws: &str, q: LogQuery) -> Result<Log
     // `-n` reads only the history it shows.
     let mut ids: Box<dyn Iterator<Item = veil_core::error::Result<ObjectId>> + 'a> = match q.ids {
         Some(ids) => Box::new(ids.into_iter().map(Ok)),
-        None => Box::new(repo.visible_iter()),
+        None => Box::new(repo.held().visible_iter()),
     };
     let searcher = q.filter.filter(|f| !f.is_empty()).map(|f| Searcher::new(repo, f));
     // Without a filter `-n` is known at once; with one, only once enough
@@ -1038,7 +1038,7 @@ impl LogEntries<'_> {
             .map(|p| {
                 // A parent may be withheld (unreleased embargo on a public
                 // clone): it is known by snapshot id only.
-                let change_short = match repo.snapshot_opt(p) {
+                let change_short = match repo.exact().snapshot(p) {
                     Ok(Some(ps)) => Some(ps.change_id.short()),
                     _ => None,
                 };

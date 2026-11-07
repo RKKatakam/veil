@@ -545,7 +545,7 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
     // Children before parents: every line a snapshot will receive has
     // arrived by the time it is popped.
     // Ranks come lazily, as far down as the walk goes (the history index).
-    let mut rank = LazyRank { iter: repo.topo_iter([*rev]), ranks: HashMap::new() };
+    let mut rank = LazyRank { iter: repo.held().topo_iter([*rev]), ranks: HashMap::new() };
     if !open.is_empty() {
         pending.insert((*rev, path.clone()), Pending { lines: open, version: version.clone() });
         heap.push(Queued { rank: 0, id: *rev, path: path.clone() });
@@ -570,7 +570,7 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
             }
             // A parent withheld here (an unreleased embargo on a public
             // clone) is not part of this replica's history.
-            let Some(ps) = repo.snapshot_opt(parent)? else { continue };
+            let Some(ps) = repo.exact().snapshot(parent)? else { continue };
             let Some(prank) = rank.of(parent)? else { continue };
             let mut ppath = q.path.clone();
             let mut pv = match pending.get(&(*parent, ppath.clone())) {

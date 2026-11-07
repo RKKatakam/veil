@@ -545,7 +545,7 @@ impl Withheld {
                 if !seen.insert(p) {
                     continue;
                 }
-                let Some(ps) = local.snapshot_opt(&p)? else { continue };
+                let Some(ps) = local.exact().snapshot(&p)? else { continue };
                 if ps.embargo.as_deref() != Some(e.as_str()) {
                     continue;
                 }
@@ -558,7 +558,7 @@ impl Withheld {
                     continue;
                 }
                 for a in local.graph().range(local, &vs.parents[1..], &vs.parents[..1])? {
-                    if let Some(sa) = local.snapshot_opt(&a)? {
+                    if let Some(sa) = local.exact().snapshot(&a)? {
                         line.changes.insert(sa.change_id);
                         if v == id {
                             line.history.push(a);
@@ -621,7 +621,7 @@ impl Withheld {
     fn versions_in(&self, local: &Repo, line: &FixLine, roots: &[ObjectId]) -> Result<HashSet<ObjectId>> {
         let mut versions = HashSet::new();
         for y in local.graph().range(local, roots, &line.base)? {
-            if local.snapshot_opt(&y)?.is_some_and(|s| line.changes.contains(&s.change_id)) {
+            if local.exact().snapshot(&y)?.is_some_and(|s| line.changes.contains(&s.change_id)) {
                 versions.insert(y);
             }
         }
@@ -697,7 +697,7 @@ pub fn withdrawn_warnings(local: &Repo, targets: &[ObjectId]) -> Result<Vec<Stri
     let flagged = local.graph().entries_matching(local, local.view().refs(), |_, e| e.flags & crate::graph_index::FLAG_EMBARGO != 0)?;
     let mut merges = Vec::new();
     for id in flagged {
-        if local.snapshot_opt(&id)?.is_some_and(|s| s.embargo.as_ref().is_some_and(|e| withdrawn.contains(e))) {
+        if local.exact().snapshot(&id)?.is_some_and(|s| s.embargo.as_ref().is_some_and(|e| withdrawn.contains(e))) {
             merges.push(id);
         }
     }
@@ -723,7 +723,7 @@ pub fn embargo_base(local: &Repo, id: &ObjectId) -> Result<Option<ObjectId>> {
     }
     let mut x = *id;
     loop {
-        let Some(s) = local.snapshot_opt(&x)? else { return Ok(Some(local.root_id())) };
+        let Some(s) = local.exact().snapshot(&x)? else { return Ok(Some(local.root_id())) };
         let Some(p) = s.parents.first().copied() else { return Ok(Some(local.root_id())) };
         if withheld.of_snapshot(local, &p)?.is_none() {
             return Ok(Some(p));

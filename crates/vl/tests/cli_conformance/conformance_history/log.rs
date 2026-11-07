@@ -17,7 +17,7 @@ fn row_of(log: &str, change: &str) -> usize {
 fn assert_topological(r: &R, log: &str) {
     let repo = r.core();
     let root = repo.root_id();
-    for id in repo.visible_snapshots().unwrap() {
+    for id in repo.exact().visible().unwrap() {
         if id == root {
             continue;
         }

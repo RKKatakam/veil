@@ -178,7 +178,7 @@ fn resolve_all(ctx: &Ctx, specs: &[String]) -> Result<Vec<ObjectId>> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for spec in specs {
-        let mut set = ctx.repo.exact(|r| revset::resolve_set(r, spec, &ctx.ws))?;
+        let mut set = revset::resolve_set(&ctx.repo, spec, &ctx.ws)?;
         set.reverse();
         for id in set {
             if seen.insert(id) {

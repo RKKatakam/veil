@@ -43,8 +43,9 @@ pub const PROTOCOL: u32 = 1;
 /// snapshots ([`Want::snapshot`]); 2, uploads may carry compressed
 /// objects ([`super::encoding`]); 3, read grants with the tips and the
 /// object routes ([`super::grant`]); 4, history answers pages
-/// ([`HistoryRequest::limit`]), for thin clones.
-pub const REVISION: u32 = 4;
+/// ([`HistoryRequest::limit`]), for thin clones; 5, `q/resolve` names the
+/// snapshots of the caller's history by id prefix ([`Resolved`]).
+pub const REVISION: u32 = 5;
 /// Largest object a frame may carry.
 pub const MAX_FRAME_OBJECT: usize = 1 << 30;
 /// Most objects one fetch request may name.
@@ -133,6 +134,19 @@ pub struct HistoryRequest {
     /// by page. Without it, the whole history down to `stop`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+}
+
+/// The answer of `GET …/q/resolve?prefix=` (revision 5): the snapshots of
+/// the caller's own history whose id (`snapshots`), or whose change id
+/// (`changes`), starts with the prefix; `more` when either list was cut.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Resolved {
+    #[serde(default)]
+    pub snapshots: Vec<ObjectId>,
+    #[serde(default)]
+    pub changes: Vec<ObjectId>,
+    #[serde(default)]
+    pub more: bool,
 }
 
 /// One object a client asks for: its id, and the path where it met it

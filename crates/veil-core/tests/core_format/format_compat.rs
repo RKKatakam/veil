@@ -627,7 +627,7 @@ fn the_format_8_set_opens_reads_and_verifies() {
     for (path, e) in walk_files(repo.store(), &tree).unwrap() {
         assert!(e.visibility.is_public() || veil_core::policy::names_secret(path.as_str()), "{path} is sealed");
     }
-    for id in repo.topo_children_first([main]).unwrap() {
+    for id in repo.exact().topo_children_first([main]).unwrap() {
         let s = repo.snapshot(&id).unwrap();
         if s.parents.is_empty() {
             continue;
@@ -659,7 +659,7 @@ fn the_format_8_set_keeps_key_generations_and_audiences() {
     let carol = fx.open("alice", Some("carol"));
     assert_eq!(read_str(&carol, &main, "secrets/.env.notes"), None);
     let first = carol
-        .topo_children_first([main])
+        .exact().topo_children_first([main])
         .unwrap()
         .into_iter()
         .find(|id| carol.description(&carol.snapshot(id).unwrap()) == "initial import")
@@ -681,7 +681,7 @@ fn the_format_8_set_remotes_read_and_verify() {
         let r = fx.open(name, None);
         assert_eq!(r.format(), 8);
         assert_fsck_clean(fx.backend(name), None);
-        assert!(r.snapshot_opt(&fix_b).unwrap().is_none(), "{name} holds the unreleased embargo's merge");
+        assert!(r.exact().snapshot(&fix_b).unwrap().is_none(), "{name} holds the unreleased embargo's merge");
         assert!(!r.view().tags.contains_key("main"), "{name}: main builds on the unreleased embargo");
         let links = tag(&r, "links");
         assert_eq!(read_str(&r, &links, "README.md").as_deref(), Some("Fixture project\n"));

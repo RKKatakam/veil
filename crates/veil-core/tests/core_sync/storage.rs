@@ -586,7 +586,7 @@ fn tree_and_snapshot_caches_are_bounded() {
     gc(&mut repo, &now_gc()).unwrap();
     for (_, op) in repo.op_log(usize::MAX).unwrap() {
         for s in op.view.refs() {
-            for id in repo.ancestors(&s).unwrap() {
+            for id in repo.exact().ancestors(&s).unwrap() {
                 let t = repo.snapshot(&id).unwrap().tree;
                 lookup(&store, &t, &p("src/m3/f7.txt")).unwrap();
             }

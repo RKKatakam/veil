@@ -2252,21 +2252,12 @@ at the server, with **no full graph**. Code: `veil-core/src/promisor.rs`
     them, refreshed on every change of the view (a pull in a long-lived
     process is seen at once).
 * **No full graph.** A snapshot the clone lacks is beyond its boundary.
-  **Every snapshot read (`Repo::snapshot`, `snapshot_opt`) fetches a page of
-  history there** (2,000 snapshots, `Repo::deepen`, into the main store), so
-  `vl show`, `blame`, evolog, bisect, search and the rewrite bookkeeping
-  read history as a full clone does (BUG-1141); a snapshot the server's
-  history for this person lacks is `None`, asked once. Without the server:
-  `Unavailable`. **Walks of the whole graph** (all visible snapshots, every
-  ancestor: the tag-name check of a pull, `embargo release`, `bisect`)
-  **read only what is held** (BUG-1260), as does **the history index**
-  (`Repo::snapshot_held`): a generation needs every ancestor, so fetching
-  there would make the first graph query fetch the whole history. The
-  queries that walk the index (`is_ancestor`, `merge_bases`,
-  `common_ancestor`, revision resolution, `vl log`) run through
-  `Repo::exact`, which pages history in where the walk reached the boundary
-  and runs them again. The reads that skip the boundary on purpose are
-  audited by `thin::every_snapshot_read_that_does_not_fetch_is_audited`.
+  History is read through two types (see "Revised: names and fetching"
+  below): `Held` reads never fetch (the history index, gc, maintenance,
+  eviction's pins, this clone's own history); `Exact` reads answer as a full
+  clone (a single read fetches a 2,000-snapshot page at the boundary, a walk
+  pages in what its range reaches). Revision names its held history cannot
+  decide are asked of the server. Without the server: `Unavailable`.
   A later pull fetches the new snapshots down to what it has, a page at
   most, and the content of the checked-out branch's tip only.
 * **Checkout fetches ahead.** Before a thin clone's working copy moves
@@ -2370,7 +2361,7 @@ measurably more; the 1 GB numbers are to be taken again on a quiet machine.
 | 11 | fetch storms, a thrashing cache | stops at the bound with an error, bytes in flight counted (BUG-1145); a too-large checkout is refused at clone, a too-large move before it is recorded | `thin::a_full_cache_fails_cleanly`, `server_hub` `thin::the_cache_stays_under_its_bound`, `s3r_a_checkout_past_the_cache_bound_fails_before_writing` |
 | 12 | the server is unreachable | fails before writing anything (the checkout fetches ahead, before its journal); local work goes on | `server_hub` `thin::a_lost_server_is_a_clear_error_never_a_hidden_file` |
 | 14 | format and older vl | format 9 with its marker, refused by number; either without the other refused | `thin::the_partial_marker_needs_format_9_and_back`, `format_compat` |
-| — | no full graph, yet history read as a full clone reads it | snapshot reads fetch history pages at the boundary, the history index never does; ancestry and log page through `history`; without the server, `Unavailable` (BUG-1141); pages are revision 4 (BUG-1140) | `thin::ancestry_beyond_the_boundary_asks_the_server`, `every_snapshot_read_that_does_not_fetch_is_audited`, `s3r_each_protocol_revision_announces_one_thing`, `server_hub` `thin::history_answers_pages`, `s3r_show_of_a_snapshot_whose_parent_is_beyond_the_boundary`, `s3r_show_of_a_merge_whose_other_parent_is_beyond_the_boundary`, `s3r_blame_in_a_thin_clone_is_the_full_clones` |
+| — | no full graph, yet history read as a full clone reads it | snapshot reads fetch history pages at the boundary, the history index never does; ancestry and log page through `history`; without the server, `Unavailable` (BUG-1141); pages are revision 4 (BUG-1140) | `thin::ancestry_beyond_the_boundary_asks_the_server`, `server_hub` `thin::a_thin_clone_answers_as_a_full_clone`, `s3r_each_protocol_revision_announces_one_thing`, `server_hub` `thin::history_answers_pages`, `s3r_show_of_a_snapshot_whose_parent_is_beyond_the_boundary`, `s3r_show_of_a_merge_whose_other_parent_is_beyond_the_boundary`, `s3r_blame_in_a_thin_clone_is_the_full_clones` |
 | — | a local commit's object after the server moved on | asked under the commit's nearest ancestors on the server (BUG-1144) | `thin::s3r_a_local_commits_unchanged_directory_is_found_after_the_server_moved_on` |
 
 #### Reverting
@@ -2456,6 +2447,18 @@ server.**
   bases of every local-only snapshot gc roots: those of every operation
   the op log keeps (rewritten versions included), not the view's alone, so
   `classify_gap` can always compare and gc completes.
+
+**As built (S3 cycle 3).** `q/resolve` is `query::resolve_prefix`
+(`veil-server`); the client asks it through `Promisor::resolve`
+(`revset::server_names`), and a server below revision 5 gets held answers
+only. `Held` and `Exact` are in `repo.rs`; the old walks are private to it,
+so every other module states which it needs; bisect uses
+`Exact::range(bad, goods)`, `x..y` revsets `Exact::range`, `::x` and the
+visible set `Exact`, the embargo release listing the history index under
+`Exact::run`. `Transaction::attaches` carries a switch's target to the
+fetch-ahead. Tests: `server_hub` `thin::a_thin_clone_answers_as_a_full_clone`
+(nine commands, full against thin), the reviewer's `s3r3_*` reproductions,
+`thin::every_working_copy_move_past_the_cache_bound_records_nothing`.
 
 #### Not built in S3 (and why)
 

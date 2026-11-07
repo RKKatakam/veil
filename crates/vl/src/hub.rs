@@ -494,6 +494,11 @@ impl Client {
         self.call("POST", &self.url.project_path(path), Some(("application/json", body)))
     }
 
+    /// [`Client::post_status`] of a GET.
+    pub(crate) fn get_status(&self, path: &str) -> Result<(u16, Vec<u8>)> {
+        self.call("GET", &self.url.project_path(path), None)
+    }
+
     /// The answer to one fetch request: the object frames of `objects`.
     fn fetch_body(&self, snapshot: ObjectId, objects: Vec<Want>) -> Result<Vec<u8>> {
         self.ok(
@@ -800,7 +805,12 @@ pub fn pull_with(repo: &mut Repo, remote: &str, client: &Client, only: Option<&s
     // A thin clone (S3) takes the new snapshots (a page at most) and the
     // content of the branch it checks out only; the rest is fetched when
     // read.
-    let thin = repo.is_partial() && !widen;
+    // A thin clone fetches on demand from its own remote's server only: a
+    // pull from another remote is a full one, into the main store (BUG-1265).
+    let own = repo.config().partial.as_ref().is_some_and(|p| p.remote == remote);
+    let thin = own && !widen;
+    // What that pull, and a widening one, takes as held: the main store's.
+    let main_only = widen || (repo.is_partial() && !own);
     if thin && tips.revision < HISTORY_PAGES {
         bail!(
             "the server at {} is older than this vl and cannot serve a thin clone; `vl partial full` makes this a full clone",
@@ -827,7 +837,7 @@ pub fn pull_with(repo: &mut Repo, remote: &str, client: &Client, only: Option<&s
     let root = tx.repo().root_id();
     let fresh = stop.is_empty() && tx.view.heads.iter().all(|h| *h == root);
     let empty_tree = tx.repo().snapshot(&root)?.tree;
-    let have = |id: &ObjectId| match (fresh, widen) {
+    let have = |id: &ObjectId| match (fresh, main_only) {
         (true, _) => *id == root || *id == empty_tree,
         (false, true) => store.has_main(id),
         (false, false) => store.has(id),

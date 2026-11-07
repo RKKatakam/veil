@@ -97,7 +97,7 @@ fn local_cycle_in_tampered_store_does_not_hang_graph_queries() {
 
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = repo.visible_snapshots();
+        let _ = repo.exact().visible();
         let _ = repo.is_ancestor(&repo.root_id(), &a);
         let _ = resolve(&repo, "loop------------------", WS);
         let _ = repo.common_ancestor(&a, &repo.root_id());
@@ -404,7 +404,7 @@ fn embargo_from_cloaked_branch_stays_hidden_until_release() {
     let pubrepo = Repo::open(mirror.clone(), Some(Identity::generate("anon")), "anon").unwrap();
     assert!(!pubrepo.view().tags.contains_key("main"), "main moved onto the embargoed merge was pushed");
     let main = alice.view().tags["main"].target;
-    assert!(pubrepo.snapshot_opt(&main).unwrap().is_none());
+    assert!(pubrepo.exact().snapshot(&main).unwrap().is_none());
     // after a genuine release the mirror sees the fix
     alice.release_embargo(&embargo).unwrap();
     remote::push(&mut alice, mirror.clone(), true, &["main".to_string()], false).unwrap();
@@ -423,7 +423,7 @@ fn pulled_tag_pointing_at_missing_object_does_not_brick_the_repo() {
     let pulled = remote::pull(&mut victim, "origin", remote_fs);
     if pulled.is_ok() {
         assert!(
-            victim.visible_snapshots().is_ok(),
+            victim.exact().visible().is_ok(),
             "a dangling remote tag was accepted and now breaks every graph query"
         );
     }
@@ -435,7 +435,7 @@ fn tag_cannot_point_at_a_non_snapshot_object() {
     let c = commit_files(&mut repo, &*fs, &[("a.txt", "a\n")], "c");
     let blob_id = file_entry(&repo, &c, "a.txt").unwrap().id;
     let _ = repo.set_tag("bad", blob_id, false);
-    assert!(repo.visible_snapshots().is_ok(), "view now references a blob as a tag target");
+    assert!(repo.exact().visible().is_ok(), "view now references a blob as a tag target");
 }
 
 // ---- hostile snapshot metadata ---------------------------------------------

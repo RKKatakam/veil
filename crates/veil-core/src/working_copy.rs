@@ -267,6 +267,7 @@ impl Repo {
         // `vl undo` in the workspace the directory is now attached to
         // undoes the switch.
         tx.for_workspace(to);
+        tx.attaches(to);
         link(&mut tx);
         tx.view.workspace(to)?;
         tx.manual_undo(format!(

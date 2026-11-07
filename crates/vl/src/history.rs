@@ -216,7 +216,7 @@ const PICKAXE_MAX_CHANGES: usize = 100_000;
 impl LogFilterArgs {
     /// The query these flags ask for.
     pub fn query(&self, ctx: &Ctx, limit: Option<usize>) -> Result<api::LogQuery> {
-        let ids = self.revset.as_deref().map(|r| ctx.repo.exact(|repo| revset::resolve_set(repo, r, &ctx.ws))).transpose()?;
+        let ids = self.revset.as_deref().map(|r| revset::resolve_set(&ctx.repo, r, &ctx.ws)).transpose()?;
         let paths: Vec<VPath> = self.paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
         if self.follow && paths.len() != 1 {
             bail!("--follow follows exactly one file: give one PATH");
@@ -255,9 +255,9 @@ pub fn log(ctx: &Ctx, limit: Option<usize>, f: &LogFilterArgs, json: bool) -> Re
     // where the walk reaches what the clone does not hold yet.
     if ctx.repo.is_partial() && q.ids.is_none() {
         let most = if q.filter.as_ref().is_some_and(|f| !f.is_empty()) { None } else { q.limit.map(|l| l + 1) };
-        q.ids = Some(ctx.repo.exact(|r| {
+        q.ids = Some(ctx.repo.exact().run(|r| {
             let mut ids = Vec::new();
-            for id in r.visible_iter() {
+            for id in r.held().visible_iter() {
                 ids.push(id?);
                 if most.is_some_and(|m| ids.len() >= m) {
                     break;
@@ -492,7 +492,7 @@ impl Ids {
     fn of(ctx: &Ctx, s: &State) -> Result<Ids> {
         let one = |h: &str| -> Result<ObjectId> {
             let id = ObjectId::from_hex(h).map_err(|_| damaged("names something that is not a snapshot id"))?;
-            match ctx.repo.snapshot_opt(&id) {
+            match ctx.repo.exact().snapshot(&id) {
                 Ok(Some(_)) => Ok(id),
                 _ => Err(anyhow!(
                     "snapshot {} of the bisection is no longer in this repository (abandoned and collected by `vl gc`?); {RESET_HINT}",
@@ -730,15 +730,24 @@ pub fn bisect(ctx: &mut Ctx, cmd: &BisectCmd) -> Result<ExitCode> {
             };
             let ws = ctx.ws.clone();
             let from = ObjectId::from_hex(&s.started_from).ok();
-            let visible = ctx.repo.visible_snapshots()?;
-            match from.filter(|f| visible.contains(f)) {
+            // Is the snapshot bisect started from still visible? Asked of the
+            // history above it only (exactly, in a thin clone).
+            let visible = |f: &ObjectId| -> Result<bool> {
+                let want: std::collections::HashSet<ObjectId> = [*f].into_iter().collect();
+                Ok(ctx.repo.exact().run(|r| r.visible_among(&want))?.contains(f))
+            };
+            let from = match from {
+                Some(f) if visible(&f)? => Some(f),
+                _ => None,
+            };
+            match from {
                 Some(f) => ctx.repo.edit(&ws, f)?,
                 None => {
                     let parents: Vec<ObjectId> = s
                         .started_parents
                         .iter()
                         .filter_map(|h| ObjectId::from_hex(h).ok())
-                        .filter(|p| ctx.repo.snapshot_opt(p).ok().flatten().is_some())
+                        .filter(|p| ctx.repo.exact().snapshot(p).ok().flatten().is_some())
                         .collect();
                     if !parents.is_empty() {
                         ctx.repo.new_change(&ws, parents, "")?;

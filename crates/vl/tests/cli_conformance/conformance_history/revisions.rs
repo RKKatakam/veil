@@ -89,7 +89,7 @@ fn ambiguous_change_prefix_is_reported() {
     }
     let repo = r.core();
     let mut firsts = std::collections::HashMap::new();
-    for id in repo.visible_snapshots().unwrap() {
+    for id in repo.exact().visible().unwrap() {
         let c = repo.snapshot(&id).unwrap().change_id.display();
         *firsts.entry(c[..1].to_string()).or_insert(0) += 1;
     }

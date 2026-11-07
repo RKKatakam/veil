@@ -553,7 +553,7 @@ type Files = Vec<(String, Option<Vec<u8>>)>;
 /// Every readable file of every snapshot visible in `repo`.
 fn history(repo: &Repo) -> BTreeMap<ObjectId, Files> {
     let mut out = BTreeMap::new();
-    for id in repo.visible_snapshots().unwrap() {
+    for id in repo.exact().visible().unwrap() {
         out.insert(id, files_of(repo, &id));
     }
     out
@@ -1407,7 +1407,7 @@ fn a_power_loss_tears_history_index_layers_and_they_are_rebuilt() {
     }
     line.push(repo.workspace_wc(WS).unwrap());
     let tip = *line.last().unwrap();
-    let visible = repo.visible_snapshots().unwrap();
+    let visible = repo.exact().visible().unwrap();
     drop(repo);
     let layers = |d: &MemoryBackend| -> Vec<(String, Vec<u8>)> {
         let dir = VPath::new(".veil/index/graph").unwrap();
@@ -1434,7 +1434,7 @@ fn a_power_loss_tears_history_index_layers_and_they_are_rebuilt() {
     );
     // Reboot: every query answers as the full walk does.
     let repo = Repo::open(disk.clone(), None, "t").unwrap();
-    assert_eq!(repo.visible_snapshots().unwrap(), visible);
+    assert_eq!(repo.exact().visible().unwrap(), visible);
     for (i, a) in line.iter().enumerate() {
         assert!(repo.is_ancestor(a, &tip).unwrap(), "{i} is below the tip");
         if *a != tip {
@@ -1452,7 +1452,7 @@ fn a_power_loss_tears_history_index_layers_and_they_are_rebuilt() {
     assert!(!rebuilt.is_empty(), "the index was written again");
     assert!(rebuilt.iter().all(|(n, _)| !epochs.contains(&torn_epoch(n))), "{rebuilt:?}");
     let reopened = Repo::open(disk.clone(), None, "t").unwrap();
-    assert_eq!(reopened.visible_snapshots().unwrap(), visible);
+    assert_eq!(reopened.exact().visible().unwrap(), visible);
     assert!(reopened.is_ancestor(&line[0], &tip).unwrap());
 }
 

@@ -116,6 +116,13 @@ pub trait Promisor: Send + Sync {
     /// pulled. An object met only under a snapshot of this repository's own
     /// (a local commit) is asked for at the same path under these.
     fn server_tips(&self) -> Vec<ObjectId>;
+
+    /// The snapshots of this person's history whose id, or change id,
+    /// starts with `prefix` (S3 cycle 3: names held history cannot decide).
+    /// `None`: the server cannot answer (older than protocol revision 5).
+    fn resolve(&self, _prefix: &str) -> Result<Option<crate::hub::wire::Resolved>> {
+        Ok(None)
+    }
 }
 
 /// The location of every object met in a decoded tree, compactly (16 bytes
@@ -386,6 +393,24 @@ impl ObjectStore {
                 self.forget_server_walk();
             }
         }
+    }
+
+    /// The heads, working copies and tags of every operation's view (gc's
+    /// roots; read here, at an eviction, which is rare).
+    fn op_log_heads(&self) -> Vec<ObjectId> {
+        let ops = crate::oplog::OpStore::new(self.backend().clone());
+        ops.set_format(self.format());
+        let Ok(raw) = ops.raw_heads() else { return Vec::new() };
+        let mut out = Vec::new();
+        for op in ops.walk(&raw.all) {
+            let Ok((_, op)) = op else { continue };
+            out.extend(op.view.heads.iter().copied());
+            out.extend(op.view.workspaces.values().map(|w| w.wc));
+            out.extend(op.view.tags.values().map(|t| t.target));
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// The snapshots on the server that this clone's own snapshots (those
@@ -919,7 +944,11 @@ impl ObjectStore {
         }
         // The trees (not the files) of the server-side bases of this
         // clone's own snapshots (BUG-1148).
-        let (heads, tips) = p.local.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let (mut heads, tips) = p.local.read().unwrap_or_else(|e| e.into_inner()).clone();
+        // gc's roots are every operation the op log keeps, not the view
+        // alone: a local commit's earlier version on an old server tip, a
+        // working copy an operation remembers (BUG-1264).
+        heads.extend(self.op_log_heads());
         if !heads.is_empty() {
             let server = self.server_history(&tips);
             let mut trees = Vec::new();
@@ -1056,6 +1085,16 @@ impl ObjectStore {
         }
         Ok(Some(u))
     }
+}
+
+/// The tips of remote `remote` in `remote_tags` (`<remote>/<branch>`): what
+/// a thin clone takes for its server's (its own remote's, never another's:
+/// BUG-1265).
+pub fn own_tips<'a>(remote_tags: &'a std::collections::BTreeMap<String, ObjectId>, remote: &'a str) -> impl Iterator<Item = ObjectId> + 'a {
+    remote_tags
+        .iter()
+        .filter(move |(k, _)| k.len() > remote.len() && k.starts_with(remote) && k.as_bytes()[remote.len()] == b'/')
+        .map(|(_, v)| *v)
 }
 
 /// What a missing object of a thin clone is ([`ObjectStore::classify_gap`]).

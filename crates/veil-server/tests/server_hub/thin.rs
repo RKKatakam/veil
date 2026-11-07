@@ -710,7 +710,6 @@ fn log_field(who: &Person, dir: &Path, description: &str, field: &str) -> String
 /// clone, even after the old change was fetched. Whoever can push a tag
 /// redirects `vl edit <change>` of everyone with a thin clone.
 #[test]
-#[ignore = "BUG-1261: a pulled tag named like an unheld change's id hides that change in a thin clone"]
 fn s3r3_a_pulled_tag_never_hides_the_id_of_a_change_the_thin_clone_does_not_hold() {
     let hub = TestHub::start();
     let (admin, dir, name) = project_with_history(&hub, 6, 10);
@@ -845,7 +844,6 @@ fn bisect_by_hand(who: &Person, dir: &Path, bad: &str, good: &str) -> String {
 /// is not: here `data/f3.bin` arrives in "commit 3", and the thin clone's
 /// bisect finds a later commit.
 #[test]
-#[ignore = "BUG-1262: vl bisect in a thin clone searches only the held snapshots"]
 fn s3r3_bisect_in_a_thin_clone_finds_what_a_full_clone_finds() {
     let hub = TestHub::start();
     let (admin, _dir, name) = project_with_history(&hub, 12, 10);
@@ -874,7 +872,6 @@ fn s3r3_bisect_in_a_thin_clone_finds_what_a_full_clone_finds() {
 /// `s3r2_a_workspace_switch_past_the_cache_bound_records_nothing` passes
 /// because the command now succeeds.)
 #[test]
-#[ignore = "BUG-1263: vl ws switch past the cache bound records the switch, says it switched, and does not"]
 fn s3r3_a_workspace_switch_past_the_cache_bound_switches_or_records_nothing() {
     let hub = TestHub::start();
     let (admin, name) = project_with_big_branch(&hub);
@@ -894,9 +891,15 @@ fn s3r3_a_workspace_switch_past_the_cache_bound_switches_or_records_nothing() {
     } else {
         assert!(!head.contains("switch the project directory"), "a failed switch was recorded:\n{out}\n{head}");
     }
-    // What the warning advises undoes the switch, nothing else.
-    let undo = admin.ok(&thin, &["undo"]);
-    assert!(!undo.contains("create workspace"), "`vl undo` undid an unrelated operation:\n{out}\n{undo}");
+    // What the warning advises undoes the switch, nothing else. (A switch
+    // that failed recorded nothing and advises `vl partial limit`; `vl undo`
+    // then rightly undoes the last operation there is, the `ws new`.)
+    if o.status.success() {
+        let undo = admin.ok(&thin, &["undo"]);
+        assert!(!undo.contains("create workspace"), "`vl undo` undid an unrelated operation:\n{out}\n{undo}");
+    } else {
+        assert!(out.contains("partial limit"), "a failed switch says how to make room:\n{out}");
+    }
 }
 
 
@@ -939,7 +942,6 @@ fn project_and_fork(hub: &TestHub) -> (Person, String, String) {
 /// not fetched, and the server has no copy of it"), until the checkout
 /// record is edited by hand.
 #[test]
-#[ignore = "BUG-1265: a second remote's snapshots count as the thin clone's server's; a move onto one wedges the clone"]
 fn s3r3_a_second_remotes_snapshot_is_never_the_servers_and_never_wedges_the_clone() {
     let hub = TestHub::start();
     let (admin, name, fork) = project_and_fork(&hub);
@@ -997,7 +999,6 @@ fn s3r3_a_revision_that_names_nothing_does_not_fetch_the_whole_history() {
 /// change id or a short snapshot id is not. Same root as BUG-1261: an id
 /// lookup answered from held history only.
 #[test]
-#[ignore = "BUG-1266: a thin clone does not find the change id of a change beyond its boundary"]
 fn s3r3_an_old_change_id_names_the_same_change_as_in_a_full_clone() {
     let hub = TestHub::start();
     let (admin, dir, name) = project_with_history(&hub, 6, 10);
@@ -1012,3 +1013,50 @@ fn s3r3_an_old_change_id_names_the_same_change_as_in_a_full_clone() {
     }
 }
 
+
+/// The S3 cycle 3 redesign's guarantee: on the same history a thin clone
+/// answers as a full clone, command by command (names, ranges, history,
+/// diffs, blame), whatever it held before. Each command runs first in the
+/// full clone, then in a fresh thin one; JSON compared without each
+/// clone's own working copy.
+#[test]
+fn a_thin_clone_answers_as_a_full_clone() {
+    let hub = TestHub::start();
+    let (admin, dir, name) = project_with_history(&hub, 8, 10);
+    let full = admin.dir("full");
+    admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
+    let first_change: String = change_of(&admin, &dir, "first").chars().take(10).collect();
+    let first = snapshot_of(&admin, &dir, "first");
+    let third: String = snapshot_of(&admin, &dir, "commit 2").chars().take(10).collect();
+    let cmds: Vec<Vec<String>> = vec![
+        vec!["log".into(), "--json".into()],
+        vec!["log".into(), "--json".into(), "-r".into(), "::main-".into()],
+        vec!["log".into(), "--json".into(), "-r".into(), format!("{first}..main")],
+        vec!["show".into(), "--json".into(), first_change.clone()],
+        vec!["show".into(), "--json".into(), third.clone()],
+        vec!["show".into(), "--json".into(), "main--".into()],
+        vec!["diff".into(), "--json".into(), "--from".into(), first.clone(), "--to".into(), "main".into()],
+        vec!["blame".into(), "src/lib.rs".into(), "-r".into(), "main".into(), "--json".into()],
+        vec!["cat".into(), "-r".into(), third.clone(), "src/lib.rs".into()],
+    ];
+    // Without the working copy's own snapshot, which differs per clone.
+    let normal = |out: &str| -> serde_json::Value {
+        match serde_json::from_str::<serde_json::Value>(out.trim()) {
+            Ok(mut v) => {
+                if let Some(e) = v.get_mut("entries").and_then(|e| e.as_array_mut()) {
+                    e.retain(|x| x["current"] != serde_json::json!(true));
+                }
+                v
+            }
+            Err(_) => serde_json::Value::String(out.to_string()),
+        }
+    };
+    for (i, cmd) in cmds.iter().enumerate() {
+        let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        let want = admin.ok(&full, &args);
+        let thin = admin.dir(&format!("same-{i}"));
+        admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+        let got = admin.ok(&thin, &args);
+        assert_eq!(normal(&got), normal(&want), "`vl {}` in a thin clone answers otherwise than in a full one", args.join(" "));
+    }
+}

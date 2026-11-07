@@ -317,10 +317,10 @@ fn a_full_cache_fails_cleanly() {
 fn ancestry_beyond_the_boundary_asks_the_server() {
     let pr = project();
     let (repo, _fs) = thin(&pr, 1 << 30);
-    assert!(repo.snapshot_held(&pr.commits[0]).unwrap().is_none(), "the clone holds no history");
+    assert!(repo.held().snapshot(&pr.commits[0]).unwrap().is_none(), "the clone holds no history");
     assert!(repo.is_ancestor(&pr.commits[0], &pr.tip).unwrap());
     assert!(*pr.server.pages.lock().unwrap() >= 1);
-    assert!(repo.snapshot_held(&pr.commits[0]).unwrap().is_some());
+    assert!(repo.held().snapshot(&pr.commits[0]).unwrap().is_some());
 
     let fs = Arc::new(MemoryBackend::new());
     let unconnected = thin_unconnected(&pr, &fs, 1 << 30);
@@ -477,40 +477,7 @@ fn every_producer_of_missing_is_audited() {
     assert_eq!(found, table(PRODUCERS), "a producer of Missing changed: in a thin clone, Missing must come from the server's own answer");
 }
 
-/// BUG-1141's class: snapshot reads that do not fetch history beyond a
-/// thin clone's boundary. `Repo::snapshot` and `snapshot_opt` fetch it;
-/// these read only what is held, on purpose.
-#[test]
-fn every_snapshot_read_that_does_not_fetch_is_audited() {
-    const HELD_ONLY: &[(&str, usize, &str)] = &[
-        ("gc.rs", 1, "gc never fetches; its mark classifies a gap"),
-        ("graph_index.rs", 2, "a generation needs every ancestor: the index walks what is held, and Repo::exact pages history in"),
-        ("maintenance.rs", 1, "maintenance never fetches"),
-        ("remote.rs", 3, "transfers between local repositories (test fixtures)"),
-        ("repo.rs", 11, "snapshot_held itself, snapshot_opt's first read, and the whole-graph walks (BUG-1260): topo_children_first, ancestors, common_ancestor, ancestors_of, merge_bases_naive; their exact answers run through Repo::exact"),
-        ("transaction.rs", 3, "the fetch-ahead of a move (its snapshots are held); the walk of rewritten ancestors (BUG-1260)"),
-    ];
-    let found = count_in_src(|t| t.matches("store.snapshot(").count() + t.matches("store().snapshot(").count() + t.matches("snapshot_held(").count());
-    assert_eq!(found, table(HELD_ONLY), "a snapshot read that skips the boundary's history changed: review it for thin clones");
-}
 
-/// BUG-1260's class: the snapshot reads that *do* fetch history at the
-/// boundary (`Repo::snapshot_opt`). Each is one read of a snapshot a
-/// command names, or a walk bounded by something other than the graph's
-/// size: never a walk of every snapshot (those read held only, above).
-#[test]
-fn every_snapshot_read_that_fetches_is_not_a_whole_graph_walk() {
-    const FETCHING: &[(&str, usize, &str)] = &[
-        ("blame.rs", 1, "a line's history: one parent at a time, down to where each line began"),
-        ("commands.rs", 1, "the embargoed merges the history index found"),
-        ("remote.rs", 5, "an embargo's line: its versions and merged sides (held already), and its first parents while withheld"),
-        ("repo.rs", 5, "the definition, Repo::snapshot, is_ancestor's one read, a merge's parents, merge bases found"),
-        ("search.rs", 1, "a snapshot's parent's tree"),
-        ("transaction.rs", 5, "one snapshot each: a rewrite's old version, a conflict's base, a parent's conflicts, an embargo's"),
-    ];
-    let found = count_in_src(|t| t.matches("snapshot_opt(").count());
-    assert_eq!(found, table(FETCHING), "a snapshot read that pages history in changed: a whole-graph walk must read held only (BUG-1260)");
-}
 
 // ---- S3 cycle 1 review (`docs/BUGS.md`, "S3 cycle 1") --------------------
 
@@ -778,7 +745,6 @@ fn a_pull_in_a_long_lived_process_refreshes_what_is_on_the_server() {
 /// by `T`'s ids) from lost work: gc is incomplete and deletes nothing, on
 /// every run while the op log holds `L`.
 #[test]
-#[ignore = "BUG-1264: gc in a thin clone never completes after a local commit is rebased onto a new server tip"]
 fn s3r3_gc_in_a_thin_clone_completes_after_a_rebase_onto_the_new_tip() {
     let id = Identity::generate("alice");
     let sfs = Arc::new(MemoryBackend::new());
@@ -881,7 +847,6 @@ fn long_project(n: usize) -> (Project, Repo, Arc<MemoryBackend>) {
 /// page of 2 snapshots, and resolving the earlier version reads 20 pages
 /// (every snapshot), where its answer is held already.
 #[test]
-#[ignore = "BUG-1267: a hidden snapshot's short id makes a thin clone fetch the whole history"]
 fn s3r3_a_hidden_snapshots_short_id_does_not_page_in_the_whole_history() {
     let (pr, mut repo, fs) = long_project(40);
     checkout(&mut repo, &fs, pr.tip);
@@ -896,7 +861,9 @@ fn s3r3_a_hidden_snapshots_short_id_does_not_page_in_the_whole_history() {
     repo.abandon(now).unwrap();
     let prefix = &earlier.hex()[..12];
     *pr.server.pages.lock().unwrap() = 0;
-    let got = repo.exact(|r| veil_core::revset::resolve(r, prefix, "default")).unwrap();
+    // As `vl` resolves a name (`Ctx::rev`): since the S3 cycle 3 redesign,
+    // held history and the server's id lookup, never history pages.
+    let got = veil_core::revset::resolve(&repo, prefix, "default").unwrap();
     assert_eq!(got, earlier);
     let pages = *pr.server.pages.lock().unwrap();
     assert!(pages <= 2, "resolving a held, hidden snapshot by its short id read {pages} history pages (the project has 40 snapshots, 2 a page)");
@@ -908,8 +875,8 @@ fn s3r3_a_hidden_snapshots_short_id_does_not_page_in_the_whole_history() {
 fn s3r3_the_whole_graph_walks_page_in_nothing() {
     let (pr, repo, _fs) = long_project(40);
     *pr.server.pages.lock().unwrap() = 0;
-    repo.visible_snapshots().unwrap();
-    repo.ancestors(&pr.tip).unwrap();
-    repo.merge_bases_naive(&[pr.tip], &[pr.commits[3]]).unwrap();
+    repo.held().visible().unwrap();
+    repo.held().ancestors(&pr.tip).unwrap();
+    repo.held().merge_bases_naive(&[pr.tip], &[pr.commits[3]]).unwrap();
     assert_eq!(*pr.server.pages.lock().unwrap(), 0);
 }

@@ -493,6 +493,160 @@ pub async fn log(hub: &Arc<Hub>, ask: &Ask, q: LogParams, limits: Limits) -> Res
     .await
 }
 
+// ---- resolve: names by id prefix (S3 cycle 3) ----------------------------------------
+
+/// Most matches of each kind a `resolve` answers (two already make a name
+/// ambiguous).
+const RESOLVE_MATCHES: usize = 16;
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ResolveParams {
+    pub prefix: String,
+}
+
+/// The smallest string above every string that starts with `prefix`, in
+/// the alphabet `digits` (ascending): `None` when there is none (all the
+/// alphabet's last digit). Comparisons stay within `[0-9a-z]`, which every
+/// collation orders as ASCII does.
+fn prefix_end(prefix: &str, digits: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(c) = chars.pop() {
+        let i = digits.find(c)?;
+        if let Some(next) = digits[i + 1..].chars().next() {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
+/// The snapshots of the viewer's own projected history whose id, or whose
+/// change id, starts with `prefix` (S3 cycle 3, BUG-1261 and 1266: a thin
+/// clone resolves the names its held history cannot decide). A snapshot
+/// id prefix is 4 to 64 hex digits; a change id prefix, as `vl` writes it,
+/// 1 to 32 letters k–z (a pulled tag of any length is checked). A change the viewer cannot see is not in their
+/// history: its projection is its parent's, whose change id differs, and
+/// is left out. Nothing else is named; anything that matches nothing gets
+/// the same empty answer. Bounded: [`RESOLVE_MATCHES`] of each kind, and
+/// the query's deadline (then `warming` while the viewer's graph fills).
+pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, limits: Limits) -> Result<Value> {
+    let deadline = Instant::now() + limits.deadline;
+    let prefix = prefix.trim().to_ascii_lowercase();
+    const HEX: &str = "0123456789abcdef";
+    let snapshot = (4..=64).contains(&prefix.len()) && prefix.chars().all(|c| HEX.contains(c));
+    let change = match (1..=32).contains(&prefix.len()) {
+        true => veil_core::id::ChangeId::reverse_hex_to_hex(&prefix),
+        false => None,
+    };
+    let empty = json!({ "snapshots": [], "changes": [], "more": false, "policy_version": ask.policy_version });
+    if !snapshot && change.is_none() {
+        return Ok(empty);
+    }
+    // The viewer's graph over every branch (filled once, as for any query).
+    let rows: Vec<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1")
+        .bind(ask.project.id)
+        .fetch_all(&hub.db)
+        .await?;
+    let tips: Vec<ObjectId> = rows.iter().filter_map(|t| ObjectId::from_hex(t).ok()).collect();
+    if tips.is_empty() {
+        return Ok(empty);
+    }
+    ensure(hub, &ask.project, &ask.viewer, &tips, Some(deadline)).await?;
+    let (vk, project) = (ask.key(), ask.project.id);
+    let mut more = false;
+    let mut snapshots: Vec<ObjectId> = Vec::new();
+    if snapshot {
+        let found: Vec<String> = match prefix_end(&prefix, HEX) {
+            Some(end) => sqlx::query_scalar(
+                "SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot >= $3 AND snapshot < $4 \
+                 ORDER BY snapshot LIMIT $5",
+            )
+            .bind(project)
+            .bind(&vk)
+            .bind(&prefix)
+            .bind(end)
+            .bind(RESOLVE_MATCHES as i64 + 1)
+            .fetch_all(&hub.db)
+            .await?,
+            None => sqlx::query_scalar("SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot >= $3 ORDER BY snapshot LIMIT $4")
+                .bind(project)
+                .bind(&vk)
+                .bind(&prefix)
+                .bind(RESOLVE_MATCHES as i64 + 1)
+                .fetch_all(&hub.db)
+                .await?,
+        };
+        more |= found.len() > RESOLVE_MATCHES;
+        snapshots = found.iter().filter(|s| s.starts_with(&prefix)).filter_map(|s| ObjectId::from_hex(s).ok()).take(RESOLVE_MATCHES).collect();
+    }
+    let mut changes: Vec<ObjectId> = Vec::new();
+    if let Some(hexp) = change {
+        let reals: Vec<String> = match prefix_end(&hexp, HEX) {
+            Some(end) => sqlx::query_scalar("SELECT snapshot FROM graph WHERE project_id = $1 AND change_id >= $2 AND change_id < $3 LIMIT $4")
+                .bind(project)
+                .bind(&hexp)
+                .bind(end)
+                .bind(4 * RESOLVE_MATCHES as i64)
+                .fetch_all(&hub.db)
+                .await?,
+            None => sqlx::query_scalar("SELECT snapshot FROM graph WHERE project_id = $1 AND change_id >= $2 LIMIT $3")
+                .bind(project)
+                .bind(&hexp)
+                .bind(4 * RESOLVE_MATCHES as i64)
+                .fetch_all(&hub.db)
+                .await?,
+        };
+        let reals: Vec<ObjectId> = reals.iter().filter_map(|s| ObjectId::from_hex(s).ok()).collect();
+        if !reals.is_empty() {
+            let projected = ensure(hub, &ask.project, &ask.viewer, &reals, Some(deadline)).await?;
+            changes = blocking(hub, project, move |cx| {
+                let g = G::new(cx, &vk, Some(deadline));
+                let mut out = Vec::new();
+                for p in projected {
+                    // Not a change of the viewer's history (a projection that
+                    // fell back to its parent's), or withheld: left out.
+                    if g.row(&p)?.is_none_or(|r| r.withheld()) || !hex::encode(g.snapshot(&p)?.change_id.0).starts_with(&hexp) {
+                        continue;
+                    }
+                    if !out.contains(&p) {
+                        out.push(p);
+                    }
+                }
+                Ok(out)
+            })
+            .await?;
+            more |= changes.len() > RESOLVE_MATCHES;
+            changes.truncate(RESOLVE_MATCHES);
+        }
+    }
+    // Withheld rows are no revisions.
+    let checked = {
+        let (vk, ids) = (ask.key(), snapshots.clone());
+        blocking(hub, project, move |cx| {
+            let g = G::new(cx, &vk, Some(deadline));
+            let mut out = Vec::new();
+            for id in ids {
+                if g.row(&id)?.is_some_and(|r| !r.withheld()) {
+                    out.push(id);
+                }
+            }
+            Ok(out)
+        })
+        .await?
+    };
+    Ok(json!({
+        "snapshots": checked.iter().map(|i| i.hex()).collect::<Vec<_>>(),
+        "changes": changes.iter().map(|i| i.hex()).collect::<Vec<_>>(),
+        "more": more,
+        "policy_version": ask.policy_version,
+    }))
+}
+
+pub async fn resolve_route(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Query(q): Query<ResolveParams>) -> Result<Json<Value>> {
+    let ask = Ask::open(&hub, &p, &caller).await?;
+    Ok(Json(resolve_prefix(&hub, &ask, &q.prefix, Limits::default()).await?))
+}
+
 // ---- show, tree, file, diff ----------------------------------------------------------
 
 #[derive(Clone, Debug, Default, Deserialize)]

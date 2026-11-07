@@ -76,6 +76,9 @@ pub struct Transaction<'r> {
     description: String,
     record_always: bool,
     manual_undo: Option<String>,
+    /// The workspace this operation attaches the project directory to (a
+    /// `ws switch`, its undo or redo): its working copy is fetched ahead.
+    attaches: Option<String>,
     undo_of: Option<ObjectId>,
     redo_of: Option<ObjectId>,
     /// The repository lock (format ≤ 5, remotes); `None` when lock-free.
@@ -160,6 +163,7 @@ impl<'r> Transaction<'r> {
             description,
             record_always: false,
             manual_undo: None,
+            attaches: None,
             undo_of: None,
             redo_of: None,
             lock,
@@ -200,7 +204,7 @@ impl<'r> Transaction<'r> {
         let mut rw = HashMap::new();
         for (old, new) in rewritten {
             let r = match new.as_slice() {
-                [] => match tx.repo.snapshot_opt(&old)? {
+                [] => match tx.repo.exact().snapshot(&old)? {
                     Some(s) => Rewrite::Abandoned(s.parents.clone()),
                     None => continue,
                 },
@@ -228,6 +232,12 @@ impl<'r> Transaction<'r> {
     /// remotes, push, pull): `vl undo` in any workspace may undo it.
     pub fn repository_wide(&mut self) {
         self.workspace = None;
+    }
+
+    /// This operation attaches the project directory to workspace `ws`
+    /// (thin clones fetch ahead what it will hold, BUG-1263).
+    pub fn attaches(&mut self, ws: &str) {
+        self.attaches = Some(ws.to_string());
     }
 
     /// Record this operation as run for workspace `ws`.
@@ -332,7 +342,7 @@ impl<'r> Transaction<'r> {
         };
         let from = s.predecessors.first().or(s.parents.first()).copied();
         let base = match from {
-            Some(id) => self.repo.snapshot_opt(&id).ok().flatten(),
+            Some(id) => self.repo.exact().snapshot(&id).ok().flatten(),
             None => None,
         };
         let base = base.as_ref().map(|b| (&b.tree, b.conflicts.as_slice()));
@@ -465,7 +475,7 @@ impl<'r> Transaction<'r> {
         for c in &s.conflicts {
             let mut inherited = false;
             for p in &s.parents {
-                if self.repo.snapshot_opt(p)?.is_some_and(|ps| ps.conflicts.contains(c)) {
+                if self.repo.exact().snapshot(p)?.is_some_and(|ps| ps.conflicts.contains(c)) {
                     inherited = true;
                 }
             }
@@ -827,7 +837,7 @@ impl<'r> Transaction<'r> {
             if abandoned {
                 continue;
             }
-            let Some(prev) = self.repo.snapshot_opt(&old)? else { continue };
+            let Some(prev) = self.repo.exact().snapshot(&old)? else { continue };
             let mut changed = Vec::new();
             for f in finals {
                 if f != old && self.repo.snapshot(&f)?.parents != prev.parents {
@@ -926,7 +936,7 @@ impl<'r> Transaction<'r> {
             for (x, e) in self.withheld_violations(&before)? {
                 let mut merges: Vec<ObjectId> = Vec::new();
                 for old in union.keys() {
-                    if self.repo.snapshot_opt(old)?.is_some_and(|s| s.embargo.as_deref() == Some(e.as_str())) {
+                    if self.repo.exact().snapshot(old)?.is_some_and(|s| s.embargo.as_deref() == Some(e.as_str())) {
                         merges.push(*old);
                     }
                 }
@@ -1035,7 +1045,7 @@ impl<'r> Transaction<'r> {
                 continue;
             }
             // A walk of the history: what is held only (BUG-1260).
-            let Some(s) = self.repo.snapshot_held(&x)? else { continue };
+            let Some(s) = self.repo.held().snapshot(&x)? else { continue };
             for p in &s.parents {
                 if union.contains_key(p) {
                     if !out.contains(p) {
@@ -1181,13 +1191,15 @@ impl<'r> Transaction<'r> {
 
     /// Finish the transaction. Returns the new operation id, or `None` if
     /// nothing changed.
-    /// [`Transaction::commit`]'s fetch-ahead: the tree the project
-    /// directory's workspace moves to, against what the directory holds.
+    /// [`Transaction::commit`]'s fetch-ahead (one rule for moves): the
+    /// tree the project directory will hold after this operation (its
+    /// workspace's working copy, or that of the workspace it attaches the
+    /// directory to), against what the directory holds now.
     fn fetch_ahead_move(&self) -> Result<()> {
         let Some(st) = crate::working_copy::CheckoutState::load(&*self.repo.backend)? else { return Ok(()) };
-        let ws = st.attached();
+        let ws = self.attaches.as_deref().unwrap_or(st.attached());
         let Some(new) = self.view.workspaces.get(ws) else { return Ok(()) };
-        if self.repo.view.workspaces.get(ws).is_some_and(|w| w.wc == new.wc) {
+        if self.attaches.is_none() && self.repo.view.workspaces.get(ws).is_some_and(|w| w.wc == new.wc) {
             return Ok(());
         }
         let store = self.repo.store();
@@ -1223,7 +1235,7 @@ impl<'r> Transaction<'r> {
         // command: new, merge, rebase, cherry-pick, undo, op restore), so a
         // full cache or a lost server fails it with nothing recorded,
         // instead of leaving a move every later command retries.
-        if self.repo.store.is_partial() && self.view != self.repo.view {
+        if self.repo.store.is_partial() && (self.view != self.repo.view || self.attaches.is_some()) {
             self.fetch_ahead_move()?;
         }
         let record = self.view != self.start_view || self.record_always;

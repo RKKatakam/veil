@@ -425,7 +425,9 @@ impl Ctx {
         }
         // (`main-` names a parent the clone may not hold yet: reading it
         // fetches it, `Repo::snapshot_opt`.)
-        Ok(self.repo.exact(|r| revset::resolve(r, spec, &self.ws))?)
+        // Names a thin clone's held history cannot decide are asked of the
+        // server (`revset::server_names`); no paging here.
+        Ok(revset::resolve(&self.repo, spec, &self.ws)?)
     }
 
     /// Record the project directory into the attached workspace.

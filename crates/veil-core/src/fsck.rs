@@ -319,6 +319,7 @@ pub fn fsck(backend: Arc<dyn StorageBackend>, identity: Option<Identity>) -> Res
         server_tips: Vec::new(),
         server: None,
         walking: None,
+        remote: partial.as_ref().map_or(String::new(), |p| p.remote.clone()),
     };
     c.check_meta()?;
     let roots = c.check_ops()?;
@@ -372,6 +373,8 @@ struct Checker {
     server_tips: Vec<ObjectId>,
     server: Option<HashSet<ObjectId>>,
     walking: Option<ObjectId>,
+    /// A thin clone's own remote (`partial.remote`).
+    remote: String,
 }
 
 impl Checker {
@@ -1185,7 +1188,8 @@ impl Checker {
 
         // A thin clone: snapshots any operation saw on a remote are the
         // server's (BUG-1143).
-        self.server_tips = ops.values().flat_map(|op| op.view.remote_tags.values().copied()).collect();
+        let remote = self.remote.clone();
+        self.server_tips = ops.values().flat_map(|op| crate::promisor::own_tips(&op.view.remote_tags, &remote).collect::<Vec<_>>()).collect();
         let mut roots = Vec::new();
         for h in &heads {
             roots.extend(

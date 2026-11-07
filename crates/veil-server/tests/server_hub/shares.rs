@@ -894,7 +894,7 @@ fn a_received_copy_is_never_recorded_after_the_device_gains_the_key() {
     let held = std::fs::read_dir(d.join(".veil/local/secret-shares-held")).unwrap().count();
     assert_eq!(held, 1);
     let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&d)), Some(p.dev.identity()), "test").unwrap();
-    for snap in repo.ancestors(&repo.view().workspaces["default"].wc).unwrap() {
+    for snap in repo.exact().ancestors(&repo.view().workspaces["default"].wc).unwrap() {
         let tree = repo.store().snapshot(&snap).unwrap().tree;
         assert!(veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new(&own).unwrap()).unwrap().is_none(), "recorded in {snap}");
     }

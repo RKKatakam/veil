@@ -279,8 +279,8 @@ fn embargoed_tree_reveals_nothing_about_the_fix() {
     remote::push(&mut alice, mirror.clone(), true, &["main".to_string()], false).unwrap();
     let anon = anon_view(mirror.clone());
     assert!(anon.view().tags.get("main").is_none_or(|t| t.target == main), "main moved to the embargoed merge");
-    assert!(anon.snapshot_opt(&res.snapshot).unwrap().is_none(), "the embargoed merge reached the mirror");
-    assert!(anon.snapshot_opt(&fix).unwrap().is_none(), "the fix reached the mirror");
+    assert!(anon.exact().snapshot(&res.snapshot).unwrap().is_none(), "the embargoed merge reached the mirror");
+    assert!(anon.exact().snapshot(&fix).unwrap().is_none(), "the fix reached the mirror");
     assert!(backend_contains(&*mirror, b"verify_signature_and_expiry").is_empty(), "the fix's content reached the mirror");
     assert!(backend_contains(&*mirror, b"CVE-2026-31337").is_empty(), "the fix's file name reached the mirror");
 

@@ -54,7 +54,7 @@ pub fn resolve_set(repo: &Repo, spec: &str, current_ws: &str) -> Result<Vec<Obje
     let spec = spec.trim();
     if let Some(b) = spec.strip_prefix("::") {
         let b = resolve(repo, nonempty(b, spec)?, current_ws)?;
-        return repo.topo_children_first([b]);
+        return repo.exact().topo_children_first([b]);
     }
     let Some((a, b)) = spec.split_once("..") else {
         return Ok(vec![resolve(repo, spec, current_ws)?]);
@@ -62,15 +62,18 @@ pub fn resolve_set(repo: &Repo, spec: &str, current_ws: &str) -> Result<Vec<Obje
     if b.contains("..") {
         return Err(VeilError::Revset(format!("'{spec}': one `..` per range")));
     }
-    let excluded: HashSet<ObjectId> = match a.trim() {
-        "" => [repo.root_id()].into_iter().collect(),
-        a => repo.ancestors(&resolve(repo, a, current_ws)?)?,
+    let exclude: Vec<ObjectId> = match a.trim() {
+        "" => vec![repo.root_id()],
+        a => vec![resolve(repo, a, current_ws)?],
     };
     let heads: Vec<ObjectId> = match b.trim() {
         "" => repo.view().refs().into_iter().collect(),
         b => vec![resolve(repo, b, current_ws)?],
     };
-    Ok(repo.topo_children_first(heads)?.into_iter().filter(|id| !excluded.contains(id)).collect())
+    // The range itself, exactly (a thin clone pages in what it reaches and
+    // no more), in the held order (everything in it is held by then).
+    let set = repo.exact().range(&heads, &exclude)?;
+    Ok(repo.held().topo_children_first(heads)?.into_iter().filter(|id| set.contains(id)).collect())
 }
 
 fn nonempty<'a>(s: &'a str, spec: &str) -> Result<&'a str> {
@@ -141,7 +144,16 @@ fn resolve_base(repo: &Repo, base: &str, ws: &str) -> Result<ObjectId> {
     };
     if let Some(hex) = ChangeId::reverse_hex_to_hex(base) {
         let mut matches: Vec<(ObjectId, ChangeId)> = Vec::new();
-        for id in visible_matching(&|_, c| hex_starts_with(&c.0, &hex))? {
+        let mut ids = visible_matching(&|_, c| hex_starts_with(&c.0, &hex))?;
+        // A thin clone: and the server's matches beyond what it holds.
+        if let Some(r) = server_names(repo, base)? {
+            for id in r.changes {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        for id in ids {
             matches.push((id, repo.snapshot(&id)?.change_id));
         }
         let mut changes: Vec<ChangeId> = matches.iter().map(|m| m.1).collect();
@@ -168,7 +180,15 @@ fn resolve_base(repo: &Repo, base: &str, ws: &str) -> Result<ObjectId> {
     }
     if base.len() >= 4 && base.bytes().all(|b| b.is_ascii_hexdigit()) {
         let lower = base.to_ascii_lowercase();
-        let found = visible_matching(&|id, _| hex_starts_with(&id.0, &lower))?;
+        let mut found = visible_matching(&|id, _| hex_starts_with(&id.0, &lower))?;
+        if let Some(r) = server_names(repo, &lower)? {
+            for id in r.snapshots {
+                if !found.contains(&id) {
+                    found.push(id);
+                }
+            }
+            found.sort();
+        }
         match found.as_slice() {
             [one] => return Ok(*one),
             [] => {}
@@ -183,6 +203,32 @@ fn resolve_base(repo: &Repo, base: &str, ws: &str) -> Result<ObjectId> {
         }
     }
     Err(VeilError::Revset(format!("revision '{base}' not found")))
+}
+
+/// In a thin clone, the server's answer for id prefix `prefix` (a change id
+/// as written, or snapshot id digits) over this person's history, each
+/// snapshot it names held (fetched alone, a page of one): what held history
+/// cannot decide (`docs/HUB.md` §13.21, "Revised: names and fetching";
+/// BUG-1261, 1266). One request; a name that matches nothing fetches
+/// nothing. `None` in any other repository, or from a server older than
+/// protocol revision 5.
+pub(crate) fn server_names(repo: &Repo, prefix: &str) -> Result<Option<crate::hub::wire::Resolved>> {
+    let store = repo.store();
+    if !store.is_partial() || !store.may_fetch() {
+        return Ok(None);
+    }
+    let Some(promisor) = store.promisor() else {
+        return Err(VeilError::Unavailable(
+            "this thin clone cannot tell what an id names without its server, and this command has no connection to it".into(),
+        ));
+    };
+    let Some(r) = promisor.resolve(prefix)? else { return Ok(None) };
+    for id in r.snapshots.iter().chain(&r.changes) {
+        if !store.has(id) {
+            repo.deepen(&[*id], 1)?;
+        }
+    }
+    Ok(Some(r))
 }
 
 /// Does the lowercase hex spelling of `bytes` start with `prefix`?
@@ -220,7 +266,9 @@ fn recorded_snapshots_with_prefix(repo: &Repo, prefix: &str) -> Result<Vec<Objec
     candidates.retain(|id| id.hex().starts_with(prefix));
     candidates.sort();
     candidates.dedup();
-    candidates.retain(|id| repo.snapshot(id).is_ok());
+    // Held reads only: a hidden version is this repository's own, held,
+    // and a walk of every view must page in nothing (BUG-1267).
+    candidates.retain(|id| matches!(repo.held().snapshot(id), Ok(Some(_))));
     if candidates.is_empty() {
         return Ok(candidates);
     }
@@ -244,7 +292,7 @@ fn recorded_snapshots_with_prefix(repo: &Repo, prefix: &str) -> Result<Vec<Objec
             }
             // Objects stripped by a public remote, or sealed for a scope
             // this reader lacks, end the walk there.
-            if let Ok(s) = repo.snapshot(&id) {
+            if let Ok(Some(s)) = repo.held().snapshot(&id) {
                 stack.extend(s.parents.iter().chain(&s.predecessors).copied());
             }
         }
@@ -264,7 +312,8 @@ fn local_history(repo: &Repo) -> Result<std::collections::HashSet<ObjectId>> {
         .copied()
         .chain(view.workspaces.values().map(|w| w.wc))
         .collect();
-    Ok(repo.topo_children_first(roots)?.into_iter().collect())
+    // This repository's own snapshots are held.
+    Ok(repo.held().topo_children_first(roots)?.into_iter().collect())
 }
 
 /// Change ids and snapshot ids of the snapshots reachable from a set of
@@ -285,15 +334,21 @@ impl RevisionNames {
             return Ok(false);
         }
         if self.0.is_none() {
+            // What is held (this clone's own work among it), and below, in a
+            // thin clone, the server's answer for the rest (BUG-1261).
             let mut v = Vec::new();
-            for id in repo.topo_children_first(refs())? {
-                v.push((hex::encode(repo.snapshot(&id)?.change_id.0), id.hex()));
+            for id in repo.held().topo_children_first(refs())? {
+                let Some(s) = repo.held().snapshot(&id)? else { continue };
+                v.push((hex::encode(s.change_id.0), id.hex()));
             }
             self.0 = Some(v);
         }
         let ids = self.0.as_ref().unwrap();
-        Ok(ids.iter().any(|(c, s)| {
+        if ids.iter().any(|(c, s)| {
             change.as_ref().is_some_and(|h| c.starts_with(h.as_str())) || snapshot.as_ref().is_some_and(|h| s.starts_with(h.as_str()))
-        }))
+        }) {
+            return Ok(true);
+        }
+        Ok(server_names(repo, &name.to_ascii_lowercase())?.is_some_and(|r| !r.snapshots.is_empty() || !r.changes.is_empty() || r.more))
     }
 }

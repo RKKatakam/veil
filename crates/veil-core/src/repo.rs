@@ -550,7 +550,8 @@ impl Repo {
             let mut heads: Vec<ObjectId> = self.view.heads.iter().copied().collect();
             heads.extend(self.view.tags.values().map(|t| t.target));
             heads.extend(self.view.workspaces.values().map(|w| w.wc));
-            self.store.set_local_heads(heads, self.view.remote_tags.values().copied().collect());
+            let remote = self.config.partial.as_ref().map_or("", |p| p.remote.as_str());
+            self.store.set_local_heads(heads, crate::promisor::own_tips(&self.view.remote_tags, remote).collect());
         }
     }
 
@@ -566,7 +567,7 @@ impl Repo {
     /// repository, `f` once. A thin clone that cannot reach the server
     /// fails with [`VeilError::Unavailable`]; it never answers from the
     /// part of the graph it holds alone.
-    pub fn exact<R>(&self, mut f: impl FnMut(&Repo) -> Result<R>) -> Result<R> {
+    fn run_exact<R>(&self, mut f: impl FnMut(&Repo) -> Result<R>) -> Result<R> {
         if !self.store.is_partial() || EXACT.with(|d| d.get() > 0) {
             return f(self);
         }
@@ -895,7 +896,7 @@ impl Repo {
     /// Without the server: `Unavailable`. The one walk that must not fetch
     /// (the history index computes a generation from every ancestor) reads
     /// with [`Repo::snapshot_held`].
-    pub fn snapshot_opt(&self, id: &ObjectId) -> Result<Option<Arc<Snapshot>>> {
+    fn snapshot_opt(&self, id: &ObjectId) -> Result<Option<Arc<Snapshot>>> {
         if let Some(s) = self.snapshot_held(id)? {
             return Ok(Some(s));
         }
@@ -912,7 +913,7 @@ impl Repo {
 
     /// [`Repo::snapshot_opt`] of what this replica holds, never fetching:
     /// `None` beyond a thin clone's boundary (recorded for [`Repo::exact`]).
-    pub fn snapshot_held(&self, id: &ObjectId) -> Result<Option<Arc<Snapshot>>> {
+    fn snapshot_held(&self, id: &ObjectId) -> Result<Option<Arc<Snapshot>>> {
         match self.store.snapshot(id) {
             Ok(s) => Ok(Some(s)),
             Err(VeilError::Missing(_)) => Ok(None),
@@ -933,7 +934,7 @@ impl Repo {
 
     /// Snapshots reachable from `roots`, children before parents, newest
     /// first among unrelated snapshots.
-    pub fn topo_children_first(&self, roots: impl IntoIterator<Item = ObjectId>) -> Result<Vec<ObjectId>> {
+    fn topo_children_first(&self, roots: impl IntoIterator<Item = ObjectId>) -> Result<Vec<ObjectId>> {
         let mut nodes: HashMap<ObjectId, Arc<Snapshot>> = HashMap::new();
         let mut stack: Vec<ObjectId> = roots.into_iter().collect();
         while let Some(id) = stack.pop() {
@@ -971,18 +972,18 @@ impl Repo {
         Ok(out)
     }
 
-    pub fn visible_snapshots(&self) -> Result<Vec<ObjectId>> {
+    fn visible_snapshots(&self) -> Result<Vec<ObjectId>> {
         self.topo_children_first(self.view.refs())
     }
 
     /// [`Repo::topo_children_first`] of `roots`, lazily: callers that need
     /// only the first few snapshots read only the history above them.
-    pub fn topo_iter(&self, roots: impl IntoIterator<Item = ObjectId>) -> crate::graph_index::TopoIter<'_> {
+    fn topo_iter(&self, roots: impl IntoIterator<Item = ObjectId>) -> crate::graph_index::TopoIter<'_> {
         self.graph.topo_iter(self, roots)
     }
 
     /// The visible snapshots ([`Repo::visible_snapshots`]), lazily.
-    pub fn visible_iter(&self) -> crate::graph_index::TopoIter<'_> {
+    fn visible_iter(&self) -> crate::graph_index::TopoIter<'_> {
         self.topo_iter(self.view.refs())
     }
 
@@ -1007,7 +1008,7 @@ impl Repo {
         self.graph.reachable_among(self, self.view.refs(), candidates)
     }
 
-    pub fn ancestors(&self, id: &ObjectId) -> Result<HashSet<ObjectId>> {
+    fn ancestors(&self, id: &ObjectId) -> Result<HashSet<ObjectId>> {
         let mut seen = HashSet::new();
         let mut stack = vec![*id];
         while let Some(x) = stack.pop() {
@@ -1025,7 +1026,7 @@ impl Repo {
     pub fn is_ancestor(&self, a: &ObjectId, b: &ObjectId) -> Result<bool> {
         // A thin clone answers from the server's history where the walk
         // reaches what it does not hold.
-        self.exact(|r| {
+        self.run_exact(|r| {
             // A snapshot this replica lacks (a redacted parent) has no
             // generation; it is an ancestor if some ancestor names it.
             if a != b && r.snapshot_opt(a)?.is_none() {
@@ -1036,7 +1037,7 @@ impl Repo {
     }
 
     pub fn common_ancestor(&self, a: &ObjectId, b: &ObjectId) -> Result<ObjectId> {
-        self.exact(|r| r.common_ancestor_here(a, b))
+        self.run_exact(|r| r.common_ancestor_here(a, b))
     }
 
     fn common_ancestor_here(&self, a: &ObjectId, b: &ObjectId) -> Result<ObjectId> {
@@ -1107,7 +1108,7 @@ impl Repo {
     /// (by timestamp, then id), so the order does not depend on the order
     /// of `a` and `b`. Redacted snapshots are left out.
     pub fn merge_bases(&self, a: &[ObjectId], b: &[ObjectId]) -> Result<Vec<ObjectId>> {
-        self.exact(|r| {
+        self.run_exact(|r| {
             let mut best = Vec::new();
             for c in r.graph.merge_bases(r, a, b)? {
                 if let Some(s) = r.snapshot_opt(&c)? {
@@ -1121,8 +1122,7 @@ impl Repo {
 
     /// [`Repo::merge_bases`] by full ancestor sets, without the history
     /// index: the reference the index is tested against.
-    #[doc(hidden)]
-    pub fn merge_bases_naive(&self, a: &[ObjectId], b: &[ObjectId]) -> Result<Vec<ObjectId>> {
+    fn merge_bases_naive(&self, a: &[ObjectId], b: &[ObjectId]) -> Result<Vec<ObjectId>> {
         let from_a = self.ancestors_of(a)?;
         let common: HashSet<ObjectId> = self.ancestors_of(b)?.into_iter().filter(|x| from_a.contains(x)).collect();
         // Everything below a common ancestor is a common ancestor too, and
@@ -1287,5 +1287,119 @@ impl StorageBackend for InitWrites {
     }
     fn set_executable(&self, path: &VPath, executable: bool) -> Result<()> {
         self.0.set_executable(path, executable)
+    }
+}
+
+
+/// Reads of the history this repository **holds** (`Repo::held`): they
+/// never fetch. In a thin clone a walk stops at the snapshots it does not
+/// hold (its boundary), and records where, for [`Exact`]. For bookkeeping
+/// whose answer is about what is here: the history index, gc and
+/// maintenance, the pins of eviction, the pull's check of tag names (with
+/// the server's lookup), this clone's own history (`docs/HUB.md` §13.21,
+/// "Revised: names and fetching").
+#[derive(Clone, Copy)]
+pub struct Held<'r>(&'r Repo);
+
+/// Reads whose answer is a **full clone's** (`Repo::exact`): in a thin
+/// clone, a single read fetches a page of history at the boundary, and a
+/// walk is the held walk run again after each page of history the boundary
+/// it reached needs, so it pages in what its own range reaches and no more.
+/// For anything shown to the person or deciding a result: revisions,
+/// bisect, evolog, merges, rebases. In any other repository the same as
+/// [`Held`].
+#[derive(Clone, Copy)]
+pub struct Exact<'r>(&'r Repo);
+
+impl Repo {
+    /// Reads of the history held here ([`Held`]).
+    pub fn held(&self) -> Held<'_> {
+        Held(self)
+    }
+
+    /// Reads that answer as a full clone does ([`Exact`]).
+    pub fn exact(&self) -> Exact<'_> {
+        Exact(self)
+    }
+}
+
+impl<'r> Held<'r> {
+    /// Snapshot `id` if held (`None` beyond a thin clone's boundary, or
+    /// withheld).
+    pub fn snapshot(&self, id: &ObjectId) -> Result<Option<Arc<Snapshot>>> {
+        self.0.snapshot_held(id)
+    }
+
+    /// Every held ancestor of `id` (itself included).
+    pub fn ancestors(&self, id: &ObjectId) -> Result<HashSet<ObjectId>> {
+        self.0.ancestors(id)
+    }
+
+    /// The held snapshots reachable from `roots`, children first.
+    pub fn topo_children_first(&self, roots: impl IntoIterator<Item = ObjectId>) -> Result<Vec<ObjectId>> {
+        self.0.topo_children_first(roots)
+    }
+
+    /// The held snapshots reachable from the view, children first.
+    pub fn visible(&self) -> Result<Vec<ObjectId>> {
+        self.0.visible_snapshots()
+    }
+
+    /// [`Held::topo_children_first`], lazily (the history index).
+    pub fn topo_iter(&self, roots: impl IntoIterator<Item = ObjectId>) -> crate::graph_index::TopoIter<'r> {
+        self.0.topo_iter(roots)
+    }
+
+    /// [`Held::visible`], lazily.
+    pub fn visible_iter(&self) -> crate::graph_index::TopoIter<'r> {
+        self.0.visible_iter()
+    }
+
+    /// Merge bases by full ancestor sets, without the history index: the
+    /// reference the index is tested against.
+    #[doc(hidden)]
+    pub fn merge_bases_naive(&self, a: &[ObjectId], b: &[ObjectId]) -> Result<Vec<ObjectId>> {
+        self.0.merge_bases_naive(a, b)
+    }
+}
+
+impl Exact<'_> {
+    /// Snapshot `id` as a full clone holds it: in a thin clone, a page of
+    /// history is fetched where it is beyond the boundary. `None`: this
+    /// person's history has no such snapshot. Without the server:
+    /// `Unavailable`.
+    pub fn snapshot(&self, id: &ObjectId) -> Result<Option<Arc<Snapshot>>> {
+        self.0.snapshot_opt(id)
+    }
+
+    /// Run `f`, a query over held history, until the boundary it reaches no
+    /// longer changes its answer (each round fetches the next page of
+    /// history there). A thin clone that cannot reach the server fails
+    /// with `Unavailable`, never answers from what it holds alone.
+    pub fn run<R>(&self, f: impl FnMut(&Repo) -> Result<R>) -> Result<R> {
+        self.0.run_exact(f)
+    }
+
+    /// Every ancestor of `id` (itself included).
+    pub fn ancestors(&self, id: &ObjectId) -> Result<HashSet<ObjectId>> {
+        self.run(|r| r.ancestors(id))
+    }
+
+    /// The snapshots reachable from `roots`, children first.
+    pub fn topo_children_first(&self, roots: impl IntoIterator<Item = ObjectId>) -> Result<Vec<ObjectId>> {
+        let roots: Vec<ObjectId> = roots.into_iter().collect();
+        self.run(|r| r.topo_children_first(roots.iter().copied()))
+    }
+
+    /// The snapshots reachable from the view, children first.
+    pub fn visible(&self) -> Result<Vec<ObjectId>> {
+        self.run(|r| r.visible_snapshots())
+    }
+
+    /// The snapshots reachable from `include` and not from `exclude`: the
+    /// history index's walk, which stops once everything left is below
+    /// `exclude`, so only that range is paged in.
+    pub fn range(&self, include: &[ObjectId], exclude: &[ObjectId]) -> Result<HashSet<ObjectId>> {
+        self.run(|r| r.graph.range(r, include, exclude))
     }
 }

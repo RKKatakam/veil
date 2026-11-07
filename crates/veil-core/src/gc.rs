@@ -770,10 +770,11 @@ fn prune_store(
     roots.extend(checkout_snapshots(&*backend));
     // A thin clone: snapshots any retained operation saw on a remote.
     let server = store.is_partial().then(|| {
-        let mut tips: Vec<ObjectId> = repo.view.remote_tags.values().copied().collect();
+        let remote = repo.config.partial.as_ref().map_or(String::new(), |p| p.remote.clone());
+        let mut tips: Vec<ObjectId> = crate::promisor::own_tips(&repo.view.remote_tags, &remote).collect();
         for id in &retained {
             if let Ok(Some(op)) = repo.ops.try_get(id) {
-                tips.extend(op.view.remote_tags.values().copied());
+                tips.extend(crate::promisor::own_tips(&op.view.remote_tags, &remote));
             }
         }
         store.server_history(&tips)

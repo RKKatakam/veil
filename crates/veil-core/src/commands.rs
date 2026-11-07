@@ -254,7 +254,7 @@ impl Repo {
         let mut carried: Vec<ObjectId> = self.graph().embargoed_among(self, [*id])?.into_iter().collect();
         carried.sort();
         for a in carried {
-            let Some(s) = self.snapshot_opt(&a)? else { continue };
+            let Some(s) = self.exact().snapshot(&a)? else { continue };
             if let Some(e) = &s.embargo {
                 if !self.keys().embargo_released(e) {
                     return Ok(Some(e.clone()));
