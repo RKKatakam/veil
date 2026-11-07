@@ -62,16 +62,47 @@ impl Terms {
         self.finders[t].find_iter(lower).count() as u64
     }
 
+    /// Every word's trigrams, together (a candidate holds them all).
+    pub fn all_grams(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self.grams.iter().flatten().copied().collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Does any word occur in `lower`?
     pub fn any(&self, lower: &[u8]) -> bool {
         self.finders.iter().any(|f| f.is_match(lower))
     }
 }
 
-/// A grep: a regular expression, and the trigrams every match contains.
+/// Most bytes of compiled pattern times bytes of a line one search may
+/// cover (BUG-1230): the linear-time engine's worst case is linear in
+/// both (a pattern the lazy DFA gives up on runs on the PikeVM), and one
+/// call cannot be stopped, so a line longer than this allows for the
+/// pattern is not searched (and is counted in the answer).
+pub const SCAN_COST: u64 = 1 << 31;
+
+/// A grep: a regular expression, the trigrams every match contains, and
+/// the longest line it searches.
 pub struct Pattern {
     pub regex: Regex,
     pub grams: Vec<u32>,
+    /// About the size of the compiled pattern (a power of two, at least 1 KiB).
+    pub cost: u64,
+    pub max_line: usize,
+}
+
+/// The smallest power of two (from 1 KiB) the compiled pattern fits in.
+fn compiled_size(pattern: &str, ignore_case: bool) -> u64 {
+    let mut size = 1u64 << 10;
+    while size < REGEX_SIZE as u64 {
+        if RegexBuilder::new(pattern).case_insensitive(ignore_case).size_limit(size as usize).build().is_ok() {
+            return size;
+        }
+        size <<= 1;
+    }
+    REGEX_SIZE as u64
 }
 
 impl Pattern {
@@ -98,7 +129,13 @@ impl Pattern {
         let mut g: Vec<u32> = runs.iter().flat_map(|r| grams(r)).collect();
         g.sort_unstable();
         g.dedup();
-        Ok(Pattern { regex, grams: g })
+        let cost = compiled_size(pattern, ignore_case);
+        Ok(Pattern {
+            regex,
+            grams: g,
+            cost,
+            max_line: (SCAN_COST / cost) as usize,
+        })
     }
 }
 
@@ -248,6 +285,15 @@ mod tests {
             let have = grams(text.as_bytes());
             assert!(p.grams.iter().all(|x| have.contains(x)), "{pat}");
         }
+    }
+
+    #[test]
+    fn a_costly_pattern_searches_shorter_lines() {
+        let cheap = Pattern::parse("handler", false).unwrap();
+        let costly = Pattern::parse(r"(?-u)[\x00-\xff]*[a-f][\x00-\xff]{1000}[A-Z]", false).unwrap();
+        println!("costs: {} {}", cheap.cost, costly.cost);
+        assert!(cheap.max_line >= 1 << 20, "{}", cheap.max_line);
+        assert!(costly.max_line < 1 << 17, "{}", costly.max_line);
     }
 
     #[test]

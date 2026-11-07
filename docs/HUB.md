@@ -2197,7 +2197,7 @@ older snapshots, caches, `vl` reading through these routes (S3, S6).
 
 ### 13.23 S15: search (built)
 
-Design: `docs/design/server/phase-3-server-history.md` §3.5 and its §12
+Design: `docs/design/server/phase-3-server-history.md` §3.5 and its §13
 (as built, with the threat review and the measurements). Code:
 `crates/veil-server/src/search/` (`index.rs` builds the index, `segment.rs`
 its pieces, `pattern.rs` what a query asks, `mod.rs` the routes), migration
@@ -2225,5 +2225,14 @@ change; nothing new is encrypted.
   part of its key, so access changes apply at the next request, and a new
   policy that changes which paths a line decides answers `indexing` (503)
   until the shards whose keys changed are rebuilt.
+* **Every branch, always caught up** (BUG-1231): each update also takes
+  every branch whose index is behind its tip, and the server resumes them
+  at start; an answer from an index still catching up says so (`behind`,
+  with `tip_id`, in the viewer's ids).
+* **Bounded** (BUG-1230, BUG-1232): candidates are streamed (postings
+  intersected as decoded, segments merged in tree order) and a query stops
+  at its bound; the deadline is checked inside every loop and before each
+  line a grep searches; a line longer than the pattern's size allows is not
+  searched (`long_lines_skipped`).
 * `vl search WORDS… [--path] [--lang LANG] [-r BRANCH] [-n N] [--json] [-- PATH]`
   prints the server's answer (exit 1 when nothing matched).

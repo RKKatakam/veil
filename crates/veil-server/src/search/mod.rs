@@ -38,7 +38,7 @@ pub mod segment;
 use std::{
     cell::Cell,
     cmp::Reverse,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BinaryHeap},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -53,9 +53,9 @@ use serde_json::{json, Value};
 use veil_core::{object::EntryKind, ObjectId};
 
 use self::{
-    index::{flags_of, identity, read_state, text_of, Shard, CODE, NAMES},
+    index::{flags_of, identity, read_head, read_state, text_of, Shard, CODE, NAMES},
     pattern::{extensions, has_extension, Pattern, Terms},
-    segment::{tree_cmp, Segment, TEXT},
+    segment::{tree_cmp, Budget, Doc, Holding, Segment, TEXT},
 };
 use crate::{
     auth::Caller,
@@ -143,10 +143,6 @@ impl Work {
     }
 }
 
-fn under(path: &str, dir: &str) -> bool {
-    dir.is_empty() || path == dir || (path.len() > dir.len() && path.starts_with(dir) && path.as_bytes()[dir.len()] == b'/')
-}
-
 /// A line as answers show it: lossy UTF-8, at most `max` bytes.
 fn shown(line: &[u8], max: usize) -> String {
     let s = String::from_utf8_lossy(line);
@@ -164,14 +160,15 @@ fn shown(line: &[u8], max: usize) -> String {
 struct Opened(Vec<(Shard, Vec<Arc<Segment>>)>);
 
 impl Opened {
-    fn open(src: &Source, shards: BTreeMap<String, Shard>) -> Result<Opened> {
+    /// Load the segments, checking the deadline before each (BUG-1232).
+    fn open(src: &Source, shards: BTreeMap<String, Shard>, b: &Budget) -> Result<Opened> {
         let mut out = Vec::new();
         for (_, s) in shards {
-            let segs = s
-                .segments
-                .iter()
-                .map(|r| segment::load(src, &ObjectId::from_hex(&r.id).map_err(|e| Error::Other(anyhow::anyhow!("{e}")))?))
-                .collect::<Result<Vec<_>>>()?;
+            let mut segs = Vec::with_capacity(s.segments.len());
+            for r in &s.segments {
+                b.check()?;
+                segs.push(segment::load(src, &ObjectId::from_hex(&r.id).map_err(|e| Error::Other(anyhow::anyhow!("{e}")))?)?);
+            }
             out.push((s, segs));
         }
         Ok(Opened(out))
@@ -192,44 +189,118 @@ impl Opened {
         })
     }
 
-    /// The live documents of each segment holding every trigram of each
-    /// of `want` (one set per entry; all documents for an empty one) that
-    /// `keep` accepts: `(segment, per entry the ordinals)`, walked shard by
-    /// shard.
-    fn each(&self, want: &[Vec<u32>], keep: &dyn Fn(&segment::Doc) -> bool, mut f: impl FnMut(&Segment, Vec<Vec<u32>>) -> Result<()>) -> Result<()> {
+    /// How many live documents `keep` accepts hold every trigram of
+    /// `want`, counting no further than `cap`: the same number whatever
+    /// order the segments are counted in, so a saturated count is still a
+    /// function of the viewer's documents alone.
+    fn count(&self, want: &[u32], keep: &dyn Fn(&Doc) -> bool, cap: u64, b: &Budget) -> Result<u64> {
+        let mut n = 0;
         for (_, segs) in &self.0 {
-            for (i, seg) in segs.iter().enumerate() {
-                let newer = &segs[i + 1..];
-                let mut live: HashMap<u32, bool> = HashMap::new();
-                let mut alive = |o: u32| -> bool {
-                    *live.entry(o).or_insert_with(|| {
-                        let d = &seg.docs[o as usize];
-                        keep(d) && !newer.iter().any(|n| n.shadows(&d.path))
-                    })
-                };
-                let sets: Vec<Vec<u32>> = want
-                    .iter()
-                    .map(|g| {
-                        let base = seg.holding(g).unwrap_or_else(|| (0..seg.docs.len() as u32).collect());
-                        base.into_iter().filter(|o| alive(*o)).collect()
-                    })
-                    .collect();
-                f(seg, sets)?;
+            for i in 0..segs.len() {
+                let mut st = Stream::new(&segs[i], &segs[i + 1..], want, ("", ""), keep);
+                while n < cap && st.next(b)?.is_some() {
+                    n += 1;
+                }
+                if n >= cap {
+                    return Ok(cap);
+                }
             }
         }
-        Ok(())
+        Ok(n)
     }
 }
 
-/// The intersection of sorted sets.
-fn intersect(sets: &[Vec<u32>]) -> Vec<u32> {
-    let Some(first) = sets.first() else { return Vec::new() };
-    let mut out = first.clone();
-    for s in &sets[1..] {
-        let have: HashSet<u32> = s.iter().copied().collect();
-        out.retain(|o| have.contains(o));
+/// One segment's candidates, in tree order: live documents of the range
+/// holding every trigram, that `keep` accepts.
+struct Stream<'a> {
+    seg: &'a Segment,
+    newer: &'a [Arc<Segment>],
+    it: Holding<'a>,
+    keep: &'a dyn Fn(&Doc) -> bool,
+}
+
+impl<'a> Stream<'a> {
+    fn new(seg: &'a Segment, newer: &'a [Arc<Segment>], want: &[u32], (dir, after): (&str, &str), keep: &'a dyn Fn(&Doc) -> bool) -> Stream<'a> {
+        let (lo, hi) = seg.range(dir, after);
+        Stream {
+            seg,
+            newer,
+            it: Holding::new(seg, want, lo, hi),
+            keep,
+        }
     }
-    out
+
+    fn next(&mut self, b: &Budget) -> Result<Option<&'a Doc>> {
+        while let Some(o) = self.it.next(b)? {
+            let d = &self.seg.docs[o as usize];
+            b.step(1 + self.newer.len() as u64)?;
+            if (self.keep)(d) && !self.newer.iter().any(|n| n.shadows(&d.path)) {
+                return Ok(Some(d));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// The candidates of every segment of the viewer's shards, merged in tree
+/// order (a path once: name segments may repeat one), taken one at a time:
+/// a query stops at its bound having read what comes before it, never
+/// collecting or sorting the rest (BUG-1232).
+struct Merge<'a> {
+    streams: Vec<Stream<'a>>,
+    heap: BinaryHeap<Reverse<Head<'a>>>,
+    last: Option<&'a str>,
+}
+
+struct Head<'a>(&'a Doc, usize);
+
+impl PartialEq for Head<'_> {
+    fn eq(&self, o: &Self) -> bool {
+        self.cmp(o) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for Head<'_> {}
+impl PartialOrd for Head<'_> {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for Head<'_> {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        tree_cmp(&self.0.path, &o.0.path).then(self.1.cmp(&o.1))
+    }
+}
+
+impl<'a> Merge<'a> {
+    fn new(opened: &'a Opened, want: &[u32], range: (&str, &str), keep: &'a dyn Fn(&Doc) -> bool, b: &Budget) -> Result<Merge<'a>> {
+        let mut streams = Vec::new();
+        for (_, segs) in &opened.0 {
+            for i in 0..segs.len() {
+                streams.push(Stream::new(&segs[i], &segs[i + 1..], want, range, keep));
+            }
+        }
+        let mut heap = BinaryHeap::with_capacity(streams.len());
+        for (i, st) in streams.iter_mut().enumerate() {
+            if let Some(d) = st.next(b)? {
+                heap.push(Reverse(Head(d, i)));
+            }
+        }
+        Ok(Merge { streams, heap, last: None })
+    }
+
+    fn next(&mut self, b: &Budget) -> Result<Option<&'a Doc>> {
+        while let Some(Reverse(Head(d, i))) = self.heap.pop() {
+            if let Some(n) = self.streams[i].next(b)? {
+                self.heap.push(Reverse(Head(n, i)));
+            }
+            if self.last == Some(d.path.as_str()) {
+                continue;
+            }
+            self.last = Some(&d.path);
+            return Ok(Some(d));
+        }
+        Ok(None)
+    }
 }
 
 /// The branch a search is for: a branch name (the default one if none);
@@ -242,22 +313,33 @@ fn branch_of(ask: &Ask, rev: Option<&str>) -> Result<String> {
     Ok(b)
 }
 
-/// The viewer's readable shards of an index, if it is built under the
-/// accepted policy; otherwise it is (re)built in the background and the
-/// answer is `None`.
+/// The viewer's readable shards of an index, with the snapshot it covers
+/// for `branch` (the code index's head; for names, the branch's walked
+/// tip), if it is built under the accepted policy. An index behind the
+/// branch tip, missing or built under another policy is brought up to date
+/// in the background (BUG-1231); only the last answers `None`.
 async fn shards(hub: &Arc<Hub>, ask: &Ask, kind: &'static str, branch: &str) -> Result<Option<(String, BTreeMap<String, Shard>)>> {
     let lines = Lines::new(&ask.project.policy);
     let ident = identity(&lines);
     let keys = lines.readable(&ask.project.view(&ask.viewer));
     let b = branch.to_string();
-    let (head, shards) = blocking(hub, ask.project.id, move |cx| read_state(cx, &cx.hub().db, kind, &b, Some(&keys))).await?;
-    match head {
-        Some(h) if h.lines == ident => Ok(Some((h.snapshot, shards))),
-        _ => {
-            index::landed(hub, ask.project.id, vec![branch.to_string()]);
-            Ok(None)
-        }
+    let (head, covered, target, shards) = blocking(hub, ask.project.id, move |cx| {
+        let pool = &cx.hub().db;
+        let shard_branch = if kind == NAMES { "" } else { b.as_str() };
+        let (head, shards) = read_state(cx, pool, kind, shard_branch, Some(&keys))?;
+        let covered = if kind == NAMES { read_head(cx, pool, index::WALK, &b)?.map(|w| w.snapshot) } else { head.as_ref().map(|h| h.snapshot.clone()) };
+        let target: Option<String> = cx.db(|| sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2").bind(cx.project()).bind(&b).fetch_optional(pool))?;
+        Ok((head, covered, target, shards))
+    })
+    .await?;
+    let ready = head.as_ref().is_some_and(|h| h.lines == ident);
+    if !ready || covered.is_none() || covered != target {
+        index::landed(hub, ask.project.id, vec![branch.to_string()]);
     }
+    Ok(match (ready, covered) {
+        (true, Some(c)) => Some((c, shards)),
+        _ => None,
+    })
 }
 
 // ---- search ----------------------------------------------------------------------------
@@ -291,21 +373,55 @@ struct Hit {
     v: Value,
 }
 
-/// Order hits by score, then path; the page after `after`.
-fn page(mut hits: Vec<Hit>, after: Option<(i64, String)>, n: usize) -> (Vec<Value>, Option<String>) {
-    hits.sort_by(|a, b| Reverse(a.score).cmp(&Reverse(b.score)).then_with(|| tree_cmp(&a.path, &b.path)));
-    // The first hit ordered after the cursor's (score, path).
-    let start = match &after {
-        Some((score, path)) => hits
-            .iter()
-            .position(|h| Reverse(h.score).cmp(&Reverse(*score)).then_with(|| tree_cmp(&h.path, path)) == std::cmp::Ordering::Greater)
-            .unwrap_or(hits.len()),
-        None => 0,
-    };
-    let rest = &hits[start..];
-    let next = (rest.len() > n).then(|| format!("{}:{}", rest[n - 1].score, rest[n - 1].path));
-    (rest.iter().take(n).map(|h| h.v.clone()).collect(), next)
+/// A hit's place in the ranking: by score, then path.
+struct Rank(Hit);
+
+impl Rank {
+    fn key(&self) -> (Reverse<i64>, &str) {
+        (Reverse(self.0.score), &self.0.path)
+    }
 }
+impl PartialEq for Rank {
+    fn eq(&self, o: &Self) -> bool {
+        self.cmp(o) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for Rank {}
+impl PartialOrd for Rank {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for Rank {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        let (a, b) = (self.key(), o.key());
+        a.0.cmp(&b.0).then_with(|| tree_cmp(a.1, b.1))
+    }
+}
+
+/// The page of `n` hits ranked after `after` (score, path), and the cursor
+/// past it: the best `n + 1` kept in a bounded heap, never every hit sorted.
+fn page(hits: Vec<Hit>, after: Option<(i64, String)>, n: usize) -> (Vec<Value>, Option<String>) {
+    let mut best: BinaryHeap<Rank> = BinaryHeap::with_capacity(n + 2);
+    for h in hits {
+        if let Some((score, path)) = &after {
+            if Reverse(h.score).cmp(&Reverse(*score)).then_with(|| tree_cmp(&h.path, path)) != std::cmp::Ordering::Greater {
+                continue;
+            }
+        }
+        best.push(Rank(h));
+        if best.len() > n + 1 {
+            best.pop();
+        }
+    }
+    let rest: Vec<Hit> = best.into_sorted_vec().into_iter().map(|r| r.0).collect();
+    let next = (rest.len() > n).then(|| format!("{}:{}", rest[n - 1].score, rest[n - 1].path));
+    (rest.into_iter().take(n).map(|h| h.v).collect(), next)
+}
+
+/// Most documents a word's ranking statistic counts (BM25's document
+/// frequency saturates there, so counting it is bounded too: BUG-1232).
+pub const DF_CAP: u64 = 10_000;
 
 /// A ranked search.
 pub async fn search(hub: &Arc<Hub>, ask: &Ask, q: SearchParams, limits: Limits) -> Result<Value> {
@@ -322,27 +438,36 @@ pub async fn search(hub: &Arc<Hub>, ask: &Ask, q: SearchParams, limits: Limits) 
     let n = q.n.unwrap_or(20).clamp(1, limits.results);
     let after = q.after.as_deref().map(parse_cursor).transpose()?;
     let branch = branch_of(ask, q.rev.as_deref())?;
-    query::resolve(hub, ask, &branch, deadline).await?;
+    let tip = query::resolve(hub, ask, &branch, deadline).await?;
     let Some((covered, code)) = shards(hub, ask, CODE, &branch).await? else { return Err(indexing()) };
+    let mut covers = vec![covered];
     let name_shards = if names {
-        match shards(hub, ask, NAMES, "").await? {
-            Some((_, s)) => Some(s),
+        match shards(hub, ask, NAMES, &branch).await? {
+            Some((walked, s)) => {
+                covers.push(walked);
+                Some(s)
+            }
             None => return Err(indexing()),
         }
     } else {
         None
     };
-    let covered = ObjectId::from_hex(&covered).map_err(|e| Error::Other(anyhow::anyhow!("{e}")))?;
-    let snapshot = graph::ensure(hub, &ask.project, &ask.viewer, &[covered], Some(deadline)).await?[0];
+    let covers: Vec<ObjectId> = covers.iter().map(|c| ObjectId::from_hex(c).map_err(|e| Error::Other(anyhow::anyhow!("{e}")))).collect::<Result<_>>()?;
+    let projected = graph::ensure(hub, &ask.project, &ask.viewer, &covers, Some(deadline)).await?;
+    let snapshot = projected[0];
+    // Behind: what the index covers is not the viewer's tip (compared in
+    // the viewer's ids, so a landing they cannot see moves nothing).
+    let behind = projected.iter().any(|p| *p != tip);
     let version = ask.policy_version;
     blocking(hub, ask.project.id, move |cx| {
         let src = &cx.src;
         let work = Work { n: Cell::new(0), deadline };
-        let keep_path = |p: &str| under(p, &dir) && exts.is_none_or(|e| has_extension(p, e));
-        let code = Opened::open(src, code)?;
+        let budget = Budget::new(deadline);
+        let keep_lang = |p: &str| exts.is_none_or(|e| has_extension(p, e));
+        let code = Opened::open(src, code, &budget)?;
         let (hits, files, complete) = match name_shards {
-            None => code_hits(src, &code, &terms, &keep_path, &work, &limits)?,
-            Some(ns) => name_hits(&Opened::open(src, ns)?, &code, &terms, &keep_path, &work, &limits)?,
+            None => code_hits(src, &code, &terms, &dir, &keep_lang, &work, &budget, &limits)?,
+            Some(ns) => name_hits(&Opened::open(src, ns, &budget)?, &code, &terms, &dir, &keep_lang, &work, &budget, &limits)?,
         };
         let (results, next) = page(hits, after, n);
         Ok(json!({
@@ -350,6 +475,8 @@ pub async fn search(hub: &Arc<Hub>, ask: &Ask, q: SearchParams, limits: Limits) 
             "kind": if names { "path" } else { "code" },
             "rev": branch,
             "snapshot_id": snapshot.hex(),
+            "tip_id": tip.hex(),
+            "behind": behind,
             "query": text,
             "files": files,
             "complete": complete,
@@ -364,45 +491,45 @@ pub async fn search(hub: &Arc<Hub>, ask: &Ask, q: SearchParams, limits: Limits) 
 }
 
 /// Code hits: candidates (live documents holding every word's trigrams) in
-/// tree order, read until the bounds, scored by BM25 over the viewer's
+/// tree order, taken until the bounds, scored by BM25 over the viewer's
 /// shards.
-fn code_hits(src: &Source, code: &Opened, terms: &Terms, keep_path: &dyn Fn(&str) -> bool, work: &Work, limits: &Limits) -> Result<(Vec<Hit>, usize, bool)> {
+#[allow(clippy::too_many_arguments)]
+fn code_hits(
+    src: &Source,
+    code: &Opened,
+    terms: &Terms,
+    dir: &str,
+    keep_lang: &dyn Fn(&str) -> bool,
+    work: &Work,
+    b: &Budget,
+    limits: &Limits,
+) -> Result<(Vec<Hit>, usize, bool)> {
     let docs: i64 = code.0.iter().map(|(s, _)| s.text_docs).sum();
     let bytes: i64 = code.0.iter().map(|(s, _)| s.text_bytes).sum();
-    let mut df = vec![0u64; terms.words.len()];
-    let mut cands: Vec<(String, ObjectId, u64)> = Vec::new();
-    code.each(&terms.grams, &|d| d.searchable(), |seg, sets| {
-        for (t, s) in sets.iter().enumerate() {
-            df[t] += s.len() as u64;
-        }
-        for o in intersect(&sets) {
-            let d = &seg.docs[o as usize];
-            if keep_path(&d.path) {
-                cands.push((d.path.clone(), d.id, d.size));
-            }
-        }
-        Ok(())
-    })?;
-    cands.sort_by(|a, b| tree_cmp(&a.0, &b.0));
+    let searchable = |d: &Doc| d.searchable();
+    let df: Vec<u64> = terms.grams.iter().map(|g| code.count(g, &searchable, DF_CAP, b)).collect::<Result<_>>()?;
     let n = docs.max(0) as f64;
     let avg = if docs > 0 { (bytes as f64 / docs as f64).max(1.0) } else { 1.0 };
     let idf: Vec<f64> = df.iter().map(|d| (1.0 + (n - *d as f64 + 0.5) / (*d as f64 + 0.5)).ln()).collect();
+    let keep = |d: &Doc| d.searchable() && keep_lang(&d.path);
+    let mut cands = Merge::new(code, &terms.all_grams(), (dir, ""), &keep, b)?;
     let (mut read, mut read_bytes, mut complete) = (0usize, 0u64, true);
     let mut hits = Vec::new();
-    for (path, id, size) in cands {
-        if read == limits.confirm_files || read_bytes + size > limits.confirm_bytes {
+    while let Some(d) = cands.next(b)? {
+        if read == limits.confirm_files || read_bytes + d.size > limits.confirm_bytes {
             complete = false;
             break;
         }
         work.tick()?;
         read += 1;
-        read_bytes += size;
-        let Some(content) = text_of(src, &id)? else { continue };
+        read_bytes += d.size;
+        let Some(content) = text_of(src, &d.id)? else { continue };
         let lower = content.to_ascii_lowercase();
         let tf: Vec<u64> = (0..terms.words.len()).map(|t| terms.count(t, &lower)).collect();
         if tf.contains(&0) {
             continue;
         }
+        let path = d.path.clone();
         let name = path.rsplit('/').next().unwrap_or(&path).to_ascii_lowercase();
         let len = content.len() as f64;
         let mut score = 0.0;
@@ -424,7 +551,7 @@ fn code_hits(src: &Source, code: &Opened, terms: &Terms, keep_path: &dyn Fn(&str
         }
         let micro = (score * 1e6).round() as i64;
         hits.push(Hit {
-            v: json!({ "path": path, "score": micro as f64 / 1e6, "size": size, "matches": matches, "lines": lines }),
+            v: json!({ "path": path, "score": micro as f64 / 1e6, "size": d.size, "matches": matches, "lines": lines }),
             path,
             score: micro,
         });
@@ -433,44 +560,45 @@ fn code_hits(src: &Source, code: &Opened, terms: &Terms, keep_path: &dyn Fn(&str
     Ok((hits, files, complete))
 }
 
-/// Name hits: every path ever held (deduplicated) whose trigrams hold every
-/// word's, checked until the bound; a word in the file's name weighs more,
-/// a path at the revision more still, a long path less.
-fn name_hits(names: &Opened, code: &Opened, terms: &Terms, keep_path: &dyn Fn(&str) -> bool, work: &Work, limits: &Limits) -> Result<(Vec<Hit>, usize, bool)> {
-    let mut cands: HashSet<String> = HashSet::new();
-    names.each(&terms.grams, &|_| true, |seg, sets| {
-        for o in intersect(&sets) {
-            let p = &seg.docs[o as usize].path;
-            if keep_path(p) {
-                cands.insert(p.clone());
-            }
-        }
-        Ok(())
-    })?;
-    let mut cands: Vec<String> = cands.into_iter().collect();
-    cands.sort_by(|a, b| tree_cmp(a, b));
+/// Name hits: every path ever held whose trigrams hold every word's, in
+/// tree order, checked until the bound; a word in the file's name weighs
+/// more, a path at the revision more still, a long path less.
+#[allow(clippy::too_many_arguments)]
+fn name_hits(
+    names: &Opened,
+    code: &Opened,
+    terms: &Terms,
+    dir: &str,
+    keep_lang: &dyn Fn(&str) -> bool,
+    work: &Work,
+    b: &Budget,
+    limits: &Limits,
+) -> Result<(Vec<Hit>, usize, bool)> {
+    let keep = |d: &Doc| keep_lang(&d.path);
+    let mut cands = Merge::new(names, &terms.all_grams(), (dir, ""), &keep, b)?;
     let mut complete = true;
-    let mut hits = Vec::new();
-    for (i, path) in cands.into_iter().enumerate() {
-        if i == limits.names {
+    let (mut checked, mut hits) = (0usize, Vec::new());
+    while let Some(d) = cands.next(b)? {
+        if checked == limits.names {
             complete = false;
             break;
         }
+        checked += 1;
         work.tick()?;
-        let lower = path.to_ascii_lowercase();
+        let lower = d.path.to_ascii_lowercase();
         if (0..terms.words.len()).any(|t| terms.count(t, lower.as_bytes()) == 0) {
             continue;
         }
         let name = lower.rsplit('/').next().unwrap_or(&lower);
-        let at_rev = code.holds(&path);
+        let at_rev = code.holds(&d.path);
         let mut score: i64 = (0..terms.words.len()).map(|t| if terms.count(t, name.as_bytes()) > 0 { 3_000_000 } else { 1_000_000 }).sum();
         if at_rev {
             score += 2_000_000;
         }
-        score -= path.len().min(999) as i64 * 1_000;
+        score -= d.path.len().min(999) as i64 * 1_000;
         hits.push(Hit {
-            v: json!({ "path": path, "score": score as f64 / 1e6, "at_rev": at_rev }),
-            path,
+            v: json!({ "path": d.path, "score": score as f64 / 1e6, "at_rev": at_rev }),
+            path: d.path.clone(),
             score,
         });
     }
@@ -493,6 +621,7 @@ pub struct GrepParams {
 /// One grep page being filled.
 struct GrepPage<'l> {
     limits: &'l Limits,
+    deadline: Instant,
     files: Vec<Value>,
     want: usize,
     read: usize,
@@ -512,14 +641,25 @@ impl GrepPage<'_> {
         self.full
     }
 
-    fn examine(&mut self, path: &str, content: Option<Vec<u8>>, size: u64, re: &regex::bytes::Regex) {
+    /// Search one file line by line, checking the deadline before each
+    /// line (BUG-1230). A line longer than the pattern allows
+    /// (`Pattern::max_line`: one search of it could take seconds, and
+    /// cannot be stopped) is not searched; the file says how many were not.
+    fn examine(&mut self, path: &str, content: Option<Vec<u8>>, size: u64, pat: &Pattern) -> Result<()> {
         self.read += 1;
         self.read_bytes += size;
         self.last = Some(path.to_string());
-        let Some(content) = content else { return };
-        let (mut matches, mut lines) = (0u64, Vec::new());
+        let Some(content) = content else { return Ok(()) };
+        let (mut matches, mut long, mut lines) = (0u64, 0u64, Vec::new());
         for (no, line) in content.split(|b| *b == b'\n').enumerate() {
-            if re.is_match(line) {
+            if Instant::now() > self.deadline {
+                return Err(too_slow());
+            }
+            if line.len() > pat.max_line {
+                long += 1;
+                continue;
+            }
+            if pat.regex.is_match(line) {
                 matches += 1;
                 if lines.len() < self.limits.grep_lines {
                     let t = shown(line, self.limits.line_bytes);
@@ -528,13 +668,17 @@ impl GrepPage<'_> {
                 }
             }
         }
-        if matches > 0 {
+        if matches > 0 || long > 0 {
             let mut f = json!({ "path": path, "matches": matches, "lines": lines });
             if matches as usize > self.limits.grep_lines {
                 f["lines_truncated"] = json!(true);
             }
+            if long > 0 {
+                f["long_lines_skipped"] = json!(long);
+            }
             self.files.push(f);
         }
+        Ok(())
     }
 }
 
@@ -565,6 +709,7 @@ pub async fn grep(hub: &Arc<Hub>, ask: &Ask, q: GrepParams, limits: Limits) -> R
     blocking(hub, project.id, move |cx| {
         let mut page = GrepPage {
             limits: &limits,
+            deadline,
             files: Vec::new(),
             want,
             read: 0,
@@ -576,23 +721,16 @@ pub async fn grep(hub: &Arc<Hub>, ask: &Ask, q: GrepParams, limits: Limits) -> R
         let (snapshot, work) = match indexed {
             Some((snapshot, shards)) => {
                 let work = Work { n: Cell::new(0), deadline };
-                let code = Opened::open(&cx.src, shards)?;
-                let mut cands: Vec<(String, ObjectId, u64)> = Vec::new();
-                let keep = |d: &segment::Doc| d.searchable() && under(&d.path, &dir) && (after.is_empty() || tree_cmp(&d.path, &after) == std::cmp::Ordering::Greater);
-                code.each(std::slice::from_ref(&pat.grams), &keep, |seg, sets| {
-                    cands.extend(sets[0].iter().map(|o| {
-                        let d = &seg.docs[*o as usize];
-                        (d.path.clone(), d.id, d.size)
-                    }));
-                    Ok(())
-                })?;
-                cands.sort_by(|a, b| tree_cmp(&a.0, &b.0));
-                for (path, id, size) in cands {
-                    if page.stop(size) {
+                let budget = Budget::new(deadline);
+                let code = Opened::open(&cx.src, shards, &budget)?;
+                let searchable = |d: &Doc| d.searchable();
+                let mut cands = Merge::new(&code, &pat.grams, (&dir, &after), &searchable, &budget)?;
+                while let Some(d) = cands.next(&budget)? {
+                    if page.stop(d.size) {
                         break;
                     }
                     work.tick()?;
-                    page.examine(&path, text_of(&cx.src, &id)?, size, &pat.regex);
+                    page.examine(&d.path, text_of(&cx.src, &d.id)?, d.size, &pat)?;
                 }
                 (snapshot, work.n.get())
             }
@@ -610,10 +748,10 @@ pub async fn grep(hub: &Arc<Hub>, ask: &Ask, q: GrepParams, limits: Limits) -> R
                     match entry {
                         Some(e) if e.kind != EntryKind::Dir => {
                             if after.is_empty() || tree_cmp(&dir, &after) == std::cmp::Ordering::Greater {
-                                scan_leaf(&t, &dir, &e, &mut page, &pat.regex)?;
+                                scan_leaf(&t, &dir, &e, &mut page, &pat)?;
                             }
                         }
-                        _ => scan(&t, &dir, id, &after, &mut page, &pat.regex, 0)?,
+                        _ => scan(&t, &dir, id, &after, &mut page, &pat, 0)?,
                     }
                 }
                 let w = g.work();
@@ -625,6 +763,8 @@ pub async fn grep(hub: &Arc<Hub>, ask: &Ask, q: GrepParams, limits: Limits) -> R
             "schema": "veil.hub-grep/1",
             "rev": rev,
             "snapshot_id": snapshot.hex(),
+            "tip_id": resolved.hex(),
+            "behind": snapshot != resolved,
             "pattern": pattern_text,
             "files": page.files,
             "truncated": next.is_some(),
@@ -644,19 +784,18 @@ fn join(dir: &str, name: &str) -> String {
     }
 }
 
-fn scan_leaf(t: &Trees, path: &str, e: &veil_core::TreeEntry, page: &mut GrepPage, re: &regex::bytes::Regex) -> Result<()> {
+fn scan_leaf(t: &Trees, path: &str, e: &veil_core::TreeEntry, page: &mut GrepPage, pat: &Pattern) -> Result<()> {
     if flags_of(e) & TEXT == 0 || page.stop(e.size) {
         return Ok(());
     }
     let (blob, bytes) = t.content(&e.id)?;
     let text = (blob && !bytes.contains(&0) && bytes.len() as u64 <= segment::MAX_TEXT_BYTES).then_some(bytes);
-    page.examine(path, text, e.size, re);
-    Ok(())
+    page.examine(path, text, e.size, pat)
 }
 
 /// Walk folder `id` at `dir` of the viewer's tree in tree order, after
 /// `after`, examining its text files until the page is full.
-fn scan(t: &Trees, dir: &str, id: ObjectId, after: &str, page: &mut GrepPage, re: &regex::bytes::Regex, depth: usize) -> Result<()> {
+fn scan(t: &Trees, dir: &str, id: ObjectId, after: &str, page: &mut GrepPage, pat: &Pattern, depth: usize) -> Result<()> {
     if depth > veil_core::tree::MAX_TREE_DEPTH {
         return Ok(());
     }
@@ -673,10 +812,10 @@ fn scan(t: &Trees, dir: &str, id: ObjectId, after: &str, page: &mut GrepPage, re
             // A folder before the cursor is skipped, unless the cursor is
             // inside it.
             if later || after.starts_with(&format!("{p}/")) {
-                scan(t, &p, e.id, after, page, re, depth + 1)?;
+                scan(t, &p, e.id, after, page, pat, depth + 1)?;
             }
         } else if later {
-            scan_leaf(t, &p, e, page, re)?;
+            scan_leaf(t, &p, e, page, pat)?;
         }
     }
     Ok(())

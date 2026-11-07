@@ -641,6 +641,8 @@ files you may read and nothing else.
 | `kind` | string | `code` (content at a branch tip) or `path` (file names over all of the project's history, `--path`) |
 | `rev` | string | The branch searched |
 | `snapshot_id` | string | Your id of the snapshot whose files were searched (the branch tip the index covers) |
+| `tip_id` | string | Your id of the branch's tip now |
+| `behind` | bool | The index has not caught up with the tip yet (it is being brought up to date): `snapshot_id` (or, for `path`, the history walked) is older than `tip_id` |
 | `query` | string | The words searched for |
 | `files` | number | Files that matched, among those read |
 | `complete` | bool | Every candidate was read (false: the search hit its bounds, and `files` counts the ones read) |

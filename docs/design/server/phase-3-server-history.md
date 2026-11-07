@@ -1,6 +1,6 @@
 # Phase 3: history answered by the server
 
-> **Status:** S12 built (2026-11-06, §10); S13 built (2026-11-07, §11); S15 built (2026-11-07, §12); S14 and S16 design. Base: `integration` @ `3851159` (S13: `d58a952`).
+> **Status:** S12 built (2026-11-06, §10); S13 built (2026-11-07, §11); S15 built (2026-11-07, §13); S14 (§12) and S16 design. Base: `integration` @ `3851159` (S13: `d58a952`).
 > Sources of truth: `docs/OVERVIEW.md` and `docs/VISIBILITY.md`; where this document disagrees with them, they win. The server as built is `docs/HUB.md` §13; projected history is §13.4. The roadmap is `docs/design/scion-for-developers.md`, phase 3 (items 3.1–3.6). The client's commit-graph index (`docs/design/scale/3-history-index.md`, built) is the model for the server's.
 
 ## 1. Goal
@@ -431,7 +431,7 @@ Admins have a graph too (view key `admin`, of real history), so every viewer run
 
 S12's paint-down took 707 ms (debug) for the same merge bases. The merge-base walk still visits every merge on the line (here 400 of them, a few rows each); a line without merges costs tens of rows. Filling a view key's graph for the whole 20,000-snapshot history (once, in the background) took 3.3 s for the admins and 41 s for anyone on Earth in release (80 s in debug), almost all of it S1's projection of every snapshot for that key (what `tips` pays today); after that, a landing costs a few rows per new snapshot and view key.
 
-## 12. As built: S15, search (2026-11-07)
+## 13. As built: S15, search (2026-11-07)
 
 Code: `crates/veil-server/src/search/` (`index.rs` the index and its updates, `segment.rs` segments and merges, `pattern.rs` words, regular expressions and the trigrams they need, `mod.rs` the routes), migration `0016_search.sql`, two routes in `api.rs`, one call at the end of `derive::landing` (the index follows the derived branches, in its own task), and `vl search` (`crates/vl/src/search_cmd.rs`, with one method `Client::query` in `crates/vl/src/hub.rs`). Tests: `crates/veil-server/tests/server_hub/search.rs`. No repository format change. `docs/HUB.md` §13.23 is the summary.
 
@@ -453,19 +453,24 @@ Code: `crates/veil-server/src/search/` (`index.rs` the index and its updates, `s
 **How a query stays per viewer.** It opens only the shards of `Lines::readable(view)`. In each, a document of segment `i` is live unless a newer segment holds a document or a tombstone at its path. Every number of an answer is a function of the live documents of those shards alone:
 * candidates: the live documents holding every trigram a match needs, in tree order; each read is one unit of `work`;
 * the bounds that stop reading (4,000 files or 32 MiB for a ranked search, 100,000 names, 20,000 files or 256 MiB for a grep page; `complete: false` or a cursor), cut in that order;
-* BM25's statistics: live text documents and their bytes (kept per shard, exact functions of the tip's tree), and, per word, the live documents holding its trigrams;
+* BM25's statistics: live text documents and their bytes (kept per shard, exact functions of the tip's tree), and, per word, the live documents holding its trigrams, counted up to 10,000 (`DF_CAP`: a saturated count is the same whatever the layout);
 * scores (integers in millionths, ties by path), pages and cursors.
 
 So the answer, `work` included, equals the one on a copy of the project built from the viewer's projected history (one shard, `none`), whose layout of segments is different. **What `work` does not show, and is the stated bound** (rows 4 and 10): the postings read (they include dead documents of the viewer's shards, at most half their live ones plus 64, and depend on how landings batched); the number of the viewer's shards; and decoding segments (cached, 256 MiB a process). None depends on hidden content: a hidden file is in a shard the viewer never opens. A hidden file's trigrams never touch a visible file's rank.
 
+**Bounded while collecting** (cycle 1: BUG-1230, BUG-1232). Candidates are taken one at a time and never collected: in each segment, the postings of the trigrams are intersected as they are decoded (each list advanced to the largest head), within the range of the folder asked for and the cursor (a folder's documents are next to each other in tree order); the segments' streams are merged in tree order; a query stops at its bound having read what comes before it. A page is the best `n + 1` hits kept in a bounded heap. The deadline is checked every 4,096 postings and documents a query steps over, and before each segment it loads; a grep checks it before each line. A line longer than its pattern allows is not searched (the file counts it, `long_lines_skipped`): the regular expression engine is linear in the line times the compiled pattern and one call cannot be stopped, so the longest line searched is 2³¹ over the compiled pattern's size (a power of two from 1 KiB): 2 MiB for a literal, 16 KiB for a 128 KiB pattern of counted repetitions.
+
 **Building, bounded** (row 10): a segment is written at 32 MiB of content, 4 million postings or 100,000 documents; the newest two segments of a shard merge while the older is at most twice the newer and together under 64 MiB (sizes stay geometric); more than 64 segments merge their smallest neighbours; a code shard whose dead documents pass half its live ones (and 64) is rewritten group by group (each under 64 MiB, newest first, shadowed by the paths after it). A name walk writes every 500,000 names. At most 2 updates run at once in a process, one per project, on the deriver's pool (BUG-911), coalescing landings like the deriver.
+
+**Following every branch** (cycle 1: BUG-1231). Every update, whatever landing asked for it, also takes every branch whose code index or names walk is behind its tip, missing or under another policy (one statement, as S12's BUG-982); one branch's failure does not stop the others; the server resumes such projects at start (`index::resume`, after `derive::resume`). A query on a branch whose index is behind answers from the snapshot the index covers and schedules the update; every answer carries `tip_id` (the viewer's id of the branch tip) and `behind` (the snapshot searched, or for a name search the branch's walked tip, is not it). Both are compared in the viewer's ids, so a landing of only what they cannot see leaves `behind` false.
 
 **Consistent across servers** (row 11): segments are immutable, content-addressed objects written before any row names them; a head and its shards change in one transaction that compares and swaps the head's version, so a loser starts again from the winner's state; readers read the head, the shards, then the head again. A crash leaves at most unreferenced segment objects.
 
 **Limits:**
 * Unreferenced segments (merged away, or written by a loser of a race) stay in the object store until S29's garbage collection; heads of deleted branches stay (a few rows) until a purge (§8, item 5).
 * A first walk of a long history for names runs in one background update (its memory is the walk's visited set and up to 500,000 names); it is not resumable halfway (a crash restarts it).
-* Timing residuals (row 4): `indexing` after a policy change, and an index behind its branch tip while the update after a landing runs (the answer names the snapshot it searched); both durations depend on how much the update does, hidden files included, once per landing, as S13's `warming` after a landing.
+* Timing residuals (row 4): `indexing` after a policy change, and an index behind its branch tip while the update after a landing runs (`behind`); both durations depend on how much the update does, hidden files included, once per landing, as S13's `warming` after a landing.
+* A query holds the segments of the viewer's shards while it runs (those in the 256 MiB cache are shared): what it can load before its deadline.
 
 **Threat review (§6) for S15, and the tests** (`search.rs`):
 
@@ -477,23 +482,25 @@ So the answer, `work` included, equals the one on a copy of the project built fr
 | 7 | secrets by path only, objects never opened | `search_finds_secrets_by_name_only`: a secret's object holding plaintext (as a broken client might upload) is in no segment and found by no search or grep, admins included; its name is found by those who see its folder; over HTTPS with `vl`'s real sealed `.env`, no segment holds its marker |
 | 8 | embargo lines never indexed or walked | `search_withholds_embargo_lines`: an embargoed fix's names and strings are found by nobody (admins included), its branch and ids are no revision, and no segment or head names them |
 | 9 | no answer cache; the viewer's lines from the records at every request | `search_routes_serve_each_person_their_part`: removed from finance, the next search finds nothing of billing |
-| 10 | the bounds above; linear regular expressions; a deadline that fails the query | `search_hostile_inputs_are_bounded`: refused queries and patterns, `(a*)*b` over 1 MiB, 100,000 matching lines in a file, files over 1 MiB and binary ones skipped, candidates past the bound (`complete: false`, the same each time), a grep paged past 40 pages, a zero deadline |
-| 11 | immutable segments, compare-and-swap heads, merges and rewrites of dead documents | `search_increments_equal_a_fresh_build`: 70 landings (edits, renames and deletions across the boundary, merges, a second branch), each indexed by two servers at once, answer for three viewers exactly as an index built from nothing; shards stay under their segment and dead-document bounds |
+| 10 | the bounds above, applied while collecting; linear regular expressions, lines bounded by the pattern's size; a deadline that fails the query, checked inside every loop | `search_hostile_inputs_are_bounded`: refused queries and patterns, `(a*)*b` over 1 MiB, 100,000 matching lines in a file, files over 1 MiB and binary ones skipped, candidates past the bound (`complete: false`, the same each time), a grep paged past 40 pages, a zero deadline; `bug_1230_grep_pattern_cost_passes_the_deadline` (a 41-byte pattern over a 1 MiB line, by the index and by a scan); `bug_1232_candidates_are_collected_past_the_bounds` (300,000 public files, eight short words and a name in all of them, with a 300 ms deadline) |
+| 11 | immutable segments, compare-and-swap heads, merges and rewrites of dead documents; every lagging branch taken by every update, and at start | `bug_1231_index_follows_only_the_branches_asked_for` (a branch never updated is walked; a branch moved with no update is caught up, and the answer meanwhile says `behind`; a hidden-only landing does not); `search_index_resumes_at_start`; `search_increments_equal_a_fresh_build`: 70 landings (edits, renames and deletions across the boundary, merges, a second branch), each indexed by two servers at once, answer for three viewers exactly as an index built from nothing; shards stay under their segment and dead-document bounds |
 | 13 | keys name paths, not readers; changed keys rebuilt, `indexing` until then | `search_follows_policy_changes`: a line made public needs no rebuild and is found at once; a line added below another answers `indexing`, then rebuilds only the changed keys (kept shards keep their segments) and answers as an index built from nothing |
 | 5, 12 | blame (S14); narrowed sessions (phase 2) | — |
 
-**Speed and size** (`search_speed`, release build, PostgreSQL 17, objects on local disk, through `bench-quiet.sh`, load 5.1 before and 6.0 after; 20,000 files of about 5.7 KiB of code-like text, 111 MiB, in five folders of which anyone on Earth reads two fifths, 30 snapshots; 20 rounds after a warm-up):
+**Speed and size** (`search_speed`, release build, PostgreSQL 17, objects on local disk, through `bench-quiet.sh`; 20,000 files of about 5.7 KiB of code-like text, 111 MiB, in five folders of which anyone on Earth reads two fifths, 30 snapshots; 20 rounds after a warm-up). After cycle 1 (candidates streamed), load 14.1 before and 13.0 after:
 
 | | admin p50 / p99 | anyone on Earth p50 / p99 | work (admin / anyone) |
 |---|---|---|---|
-| first index (code and names), once | 1.17 s: 40,006 documents, 10 segments, 26.4 MiB of index for 111 MiB of content (**0.24 bytes a byte**) | | |
-| one landing of 3 files (both indexes) | 9.4 ms p50, 12.6 ms max | | |
-| code search, a common word (bound: 4,000 files read) | 72 / 78 ms | 64 / 72 ms | 4,000 / 4,000 |
-| code search, two common words | 72 / 83 ms | 68 / 70 ms | 4,000 / 4,000 |
-| code search, a rare word | 7.0 / 10 ms | 2.9 / 4.0 ms | 666 / 274 |
-| path search (`file_1`: 11,111 / 4,444 names hold it) | 18 / 24 ms | 9.0 / 15 ms | 11,111 / 4,444 |
-| grep at the tip, a rare word | 13 / 18 ms | 5.3 / 6.6 ms | 1,106 / 442 |
-| grep at the tip, a page of 100 files | 5.2 / 7.6 ms | 2.9 / 5.3 ms | 100 / 100 |
-| grep scan at an old revision, a rare word (a page: 20,000 files read) | 208 / 215 ms | 83 / 87 ms | 20,049 / 8,024 |
+| first index (code and names), once | 1.16 s: 40,006 documents, 10 segments, 26.4 MiB of index for 111 MiB of content (**0.24 bytes a byte**) | | |
+| one landing of 3 files (both indexes) | 10.8 ms p50, 12.3 ms max | | |
+| code search, a common word (bound: 4,000 files read) | 67 / 77 ms | 64 / 106 ms | 4,000 / 4,000 |
+| code search, two common words | 74 / 124 ms | 69 / 124 ms | 4,000 / 4,000 |
+| code search, a rare word | 8.6 / 12 ms | 3.7 / 5.3 ms | 666 / 274 |
+| path search (`file_1`: 11,111 / 4,444 names hold it) | 9.6 / 15 ms | 4.3 / 5.6 ms | 11,111 / 4,444 |
+| grep at the tip, a rare word | 15 / 23 ms | 6.5 / 9.9 ms | 1,106 / 442 |
+| grep at the tip, a page of 100 files | 2.3 / 3.6 ms | 2.8 / 3.7 ms | 100 / 100 |
+| grep scan at an old revision, a rare word (a page: 20,000 files read) | 226 / 229 ms | 91 / 93 ms | 20,049 / 8,024 |
 
-Against §5's targets: code search stays under 200 ms however large the project, because a ranked search reads at most 4,000 candidates (32 MiB) and says `complete: false` past them; the postings it intersects grow with the viewer's shards (26 MiB of index per 111 MiB here, so about 2.4 GB for 10 GB of text, decoded once into the 256 MiB segment cache per process: at that size the cache, not the query, is the limit, and the 10 GB gate run of S16 is what measures it). Path search meets 20 ms for a word in a few thousand names and takes 24 ms (p99) for one in 11,111; a narrower word is faster. Building is about 95 MiB of content a second; a landing's update costs milliseconds. An earlier run with a bound of 10,000 files gave 287 / 316 ms for the common word (load 78 after), hence the lower bound.
+The review's large case (`bug_1232`, 300,000 public files of one line, release, same run): eight words of under three bytes (every document a candidate) 14 ms, `complete: false` at the 4,000-file bound; a name in all 300,000 paths 79 ms, `complete: false` at the 100,000-name bound (before cycle 1, in a debug build, 1.8 s and 1.9 s, then `deadline`). The pattern of BUG-1230 over a 1 MiB line returns at once: the line is longer than its 16 KiB and is counted, not searched.
+
+Against §5's targets: a ranked code search's work is bounded by what precedes its bound in tree order (4,000 candidates or 32 MiB, plus the postings stepped over to reach them, under the deadline), not by the project's size; path search meets 20 ms here. The postings a query may step over grow with the viewer's shards (26 MiB of index per 111 MiB here, so about 2.4 GB for 10 GB of text, decoded once into the 256 MiB segment cache per process: at that size the cache, not the query, is the limit, and the 10 GB gate run of S16 is what measures it). Building is about 95 MiB of content a second; a landing's update costs milliseconds. Before cycle 1 (load 5.1 / 6.0) the same queries measured within a few milliseconds of these, except the path search (18 / 24 ms for the admin, now 9.6 / 15); a first run with a bound of 10,000 files gave 287 / 316 ms for the common word, hence the bound of 4,000.

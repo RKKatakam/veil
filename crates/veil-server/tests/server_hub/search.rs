@@ -928,7 +928,6 @@ fn search_speed() {
 /// holds a blocking thread far past its 2 s deadline, at a branch tip
 /// (through the index) and at an old revision (a scan) alike.
 #[test]
-#[ignore = "BUG-1230: a grep runs one file's regular expression past the query deadline"]
 fn bug_1230_grep_pattern_cost_passes_the_deadline() {
     let th = TestHub::start();
     let (policy_text, bindings) = policy(1);
@@ -971,7 +970,6 @@ fn bug_1230_grep_pattern_cost_passes_the_deadline() {
 /// is only logged) is resumed by nothing but that branch's next landing,
 /// so its index stays behind its tip (S12 resumes derivation; BUG-982).
 #[test]
-#[ignore = "BUG-1231: the search index covers only branches updated since; nothing resumes a missed update"]
 fn bug_1231_index_follows_only_the_branches_asked_for() {
     let th = TestHub::start();
     let (policy_text, bindings) = policy(1);
@@ -1002,16 +1000,60 @@ fn bug_1231_index_follows_only_the_branches_asked_for() {
     warm_up(&th, &h, &anyone);
     let want = projections(&th, &h, &a.project, &anyone)[&next].hex();
     let mut covered = String::new();
+    let mut first = None;
     for _ in 0..25 {
         let r = run(&th, &h, &a, &S::Search(SearchParams { q: Some("hello".into()), ..Default::default() }, Limits::default()));
-        covered = serde_json::from_str::<Value>(&r[0]).map(|v| v["snapshot_id"].as_str().unwrap_or("").to_string()).unwrap_or_default();
+        let v: Value = serde_json::from_str(&r[0]).unwrap_or_else(|_| panic!("{r:?}"));
+        first.get_or_insert(v.clone());
+        covered = v["snapshot_id"].as_str().unwrap_or("").to_string();
         if covered == want {
+            assert_eq!(v["behind"], false, "{v}");
             break;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
     assert_eq!(covered, want, "main's index stays behind its tip");
     assert_eq!(v["files"], 1, "a path only feature's history held: {names:?}");
+    // The first answer after the move came from the old tip, and said so.
+    let first = first.unwrap();
+    assert_eq!((first["behind"].clone(), first["tip_id"].as_str()), (Value::Bool(true), Some(want.as_str())), "{first}");
+    // A landing the viewer cannot see moves nothing they see: not behind.
+    let hidden = h.commit(
+        &th,
+        &[next],
+        Files::from([("pub/common.txt".to_string(), b"hello again\n".to_vec()), ("fin/secret-plan.txt".to_string(), b"hidden\n".to_vec())]),
+        [4; 16],
+        4_000,
+        None,
+    );
+    h.set_branch(&th, "main", hidden);
+    h.derive(&th);
+    warm_up(&th, &h, &anyone);
+    let r = run(&th, &h, &a, &S::Search(SearchParams { q: Some("hello".into()), ..Default::default() }, Limits::default()));
+    let v: Value = serde_json::from_str(&r[0]).unwrap();
+    assert_eq!((v["behind"].clone(), v["snapshot_id"].as_str()), (Value::Bool(false), Some(want.as_str())), "{v}");
+}
+
+/// BUG-1231: at start-up, a project whose index is behind (or was never
+/// built: a project from before the index) is brought up to date.
+#[test]
+fn search_index_resumes_at_start() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &policy_text, &bindings);
+    let tip = h.commit(&th, &[root_snapshot_id()], Files::from([("pub/a.txt".to_string(), b"resumed\n".to_vec())]), [1; 16], 1_000, None);
+    h.set_branch(&th, "main", tip);
+    let side = h.commit(&th, &[tip], Files::from([("pub/b.txt".to_string(), b"side\n".to_vec())]), [2; 16], 2_000, None);
+    h.set_branch(&th, "side", side);
+    h.derive(&th);
+    th.rt.block_on(index::resume(h.hub.clone(), Some(h.id)));
+    let heads: BTreeSet<(String, String, String)> =
+        th.rt.block_on(sqlx::query_as("SELECT kind, branch, snapshot FROM search_heads WHERE project_id = $1 AND kind <> 'names'").bind(h.id).fetch_all(&h.hub.db)).unwrap().into_iter().collect();
+    let want: BTreeSet<(String, String, String)> = [("code", "main", tip), ("code", "side", side), ("walk", "main", tip), ("walk", "side", side)]
+        .into_iter()
+        .map(|(k, b, s)| (k.to_string(), b.to_string(), s.hex()))
+        .collect();
+    assert_eq!(heads, want);
 }
 
 /// The bounds and the deadline are checked only in the loop that reads
@@ -1022,7 +1064,6 @@ fn bug_1231_index_follows_only_the_branches_asked_for() {
 /// 4,000 candidates (or a grep page) it reads, and no deadline stops it.
 /// Anyone on Earth can ask it of a large public project.
 #[test]
-#[ignore = "BUG-1232: a query collects and sorts every candidate before its bounds and deadline apply"]
 fn bug_1232_candidates_are_collected_past_the_bounds() {
     let th = TestHub::start();
     let (policy_text, bindings) = policy(1);
@@ -1065,6 +1106,7 @@ fn bug_1232_candidates_are_collected_past_the_bounds() {
         let r = norm(call());
         took.push((t.elapsed(), r.chars().take(120).collect::<String>()));
     }
+    println!("bug_1232: {took:?}");
     for (t, r) in &took {
         assert!(*t < deadline + Duration::from_millis(700), "a query with a {deadline:?} deadline took {t:?}: {r}\n{took:?}");
     }

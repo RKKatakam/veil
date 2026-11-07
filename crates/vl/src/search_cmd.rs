@@ -85,6 +85,9 @@ pub fn search(ctx: &mut Ctx, a: &SearchArgs) -> Result<ExitCode> {
                 println!("  {}: {}", dim(&l["line"].to_string()), safe(l["text"].as_str().unwrap_or("")));
             }
         }
+        if v["behind"].as_bool() == Some(true) {
+            eprintln!("{}", dim("The index is still catching up with the branch tip: these results are from an earlier snapshot."));
+        }
         if results.is_empty() {
             eprintln!("Nothing found.");
         } else if v["truncated"].as_bool() == Some(true) || v["complete"].as_bool() == Some(false) {

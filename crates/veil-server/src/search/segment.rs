@@ -328,6 +328,216 @@ impl Segment {
     }
 }
 
+/// Work a query does on postings and documents, checked against its
+/// deadline every 4,096 steps (BUG-1232): not part of an answer's `work`
+/// (its amount depends on how segments are laid out), only bounded by time.
+pub struct Budget {
+    pub deadline: std::time::Instant,
+    steps: std::cell::Cell<u64>,
+}
+
+impl Budget {
+    pub fn new(deadline: std::time::Instant) -> Budget {
+        Budget {
+            deadline,
+            steps: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Count `n` steps; past the deadline, the query fails.
+    pub fn step(&self, n: u64) -> Result<()> {
+        let before = self.steps.get();
+        self.steps.set(before + n);
+        if (before >> 12) != ((before + n) >> 12) {
+            self.check()?;
+        }
+        Ok(())
+    }
+
+    /// Fail if the deadline passed.
+    pub fn check(&self) -> Result<()> {
+        if std::time::Instant::now() > self.deadline {
+            return Err(crate::query::graph::too_slow());
+        }
+        Ok(())
+    }
+}
+
+/// The postings of one trigram, decoded as they are read.
+pub struct Posts<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    last: u32,
+    first: bool,
+}
+
+impl Iterator for Posts<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        let (mut v, mut shift) = (0u32, 0u32);
+        while self.pos < self.bytes.len() {
+            let b = self.bytes[self.pos];
+            self.pos += 1;
+            v |= ((b & 0x7f) as u32) << shift;
+            if b & 0x80 == 0 {
+                self.last = if self.first { v } else { self.last + v };
+                self.first = false;
+                return Some(self.last);
+            }
+            shift += 7;
+        }
+        None
+    }
+}
+
+impl Segment {
+    /// The postings of trigram `g`, if any document holds it.
+    pub fn posts(&self, g: u32) -> Option<Posts<'_>> {
+        let i = self.grams.binary_search_by_key(&g, |e| e.0).ok()?;
+        let (_, off, len, _) = self.grams[i];
+        Some(Posts {
+            bytes: &self.postings[off as usize..(off + len) as usize],
+            pos: 0,
+            last: 0,
+            first: true,
+        })
+    }
+
+    /// The ordinals of the documents at or under `dir` (`""`: all) whose
+    /// path is after `after` in tree order (`""`: from the first): one
+    /// range, since documents are in tree order and a folder's paths are
+    /// next to each other in it.
+    pub fn range(&self, dir: &str, after: &str) -> (u32, u32) {
+        let (mut lo, mut hi) = (0usize, self.docs.len());
+        if !dir.is_empty() {
+            lo = self.docs.partition_point(|d| tree_cmp(&d.path, dir) == Ordering::Less);
+            let under = |p: &str| p == dir || (p.len() > dir.len() && p.starts_with(dir) && p.as_bytes()[dir.len()] == b'/');
+            hi = lo + self.docs[lo..].partition_point(|d| under(&d.path));
+        }
+        if !after.is_empty() {
+            lo = lo.max(self.docs.partition_point(|d| tree_cmp(&d.path, after) != Ordering::Greater));
+        }
+        (lo as u32, hi.max(lo) as u32)
+    }
+}
+
+/// The ordinals in `[lo, hi)` of the documents holding every trigram of a
+/// set, in increasing order: the postings are intersected as they are
+/// decoded (each list advanced to the largest head), so taking the first
+/// `k` costs what reaching them costs, not every posting (BUG-1232).
+pub struct Holding<'a> {
+    lists: Vec<Posts<'a>>,
+    heads: Vec<u32>,
+    next: u32,
+    lo: u32,
+    hi: u32,
+    started: bool,
+    done: bool,
+}
+
+impl<'a> Holding<'a> {
+    pub fn new(seg: &'a Segment, want: &[u32], lo: u32, hi: u32) -> Holding<'a> {
+        let mut lists = Vec::with_capacity(want.len());
+        let mut done = lo >= hi;
+        for g in want {
+            match seg.posts(*g) {
+                Some(p) => lists.push(p),
+                None => done = true,
+            }
+        }
+        Holding {
+            heads: vec![0; lists.len()],
+            lists,
+            next: lo,
+            lo,
+            hi,
+            started: false,
+            done,
+        }
+    }
+
+    /// Advance list `i` to its first ordinal at or after `to`.
+    fn advance(&mut self, i: usize, to: u32, b: &Budget) -> Result<Option<u32>> {
+        let mut n = 0;
+        while self.heads[i] < to {
+            match self.lists[i].next() {
+                Some(v) => self.heads[i] = v,
+                None => {
+                    b.step(n)?;
+                    return Ok(None);
+                }
+            }
+            n += 1;
+        }
+        b.step(n)?;
+        Ok(Some(self.heads[i]))
+    }
+
+    pub fn next(&mut self, b: &Budget) -> Result<Option<u32>> {
+        if self.done {
+            return Ok(None);
+        }
+        if self.lists.is_empty() {
+            // No trigram to narrow by: every document of the range.
+            if self.next >= self.hi {
+                self.done = true;
+                return Ok(None);
+            }
+            self.next += 1;
+            b.step(1)?;
+            return Ok(Some(self.next - 1));
+        }
+        if !self.started {
+            self.started = true;
+            for i in 0..self.lists.len() {
+                match self.lists[i].next() {
+                    Some(v) => self.heads[i] = v,
+                    None => {
+                        self.done = true;
+                        return Ok(None);
+                    }
+                }
+                if self.advance(i, self.lo, b)?.is_none() {
+                    self.done = true;
+                    return Ok(None);
+                }
+            }
+        } else {
+            // Past the ordinal last returned.
+            let past = self.heads[0] + 1;
+            if self.advance(0, past, b)?.is_none() {
+                self.done = true;
+                return Ok(None);
+            }
+        }
+        loop {
+            let target = *self.heads.iter().max().expect("lists");
+            if target >= self.hi {
+                self.done = true;
+                return Ok(None);
+            }
+            let mut all = true;
+            for i in 0..self.lists.len() {
+                match self.advance(i, target, b)? {
+                    None => {
+                        self.done = true;
+                        return Ok(None);
+                    }
+                    Some(v) if v > target => {
+                        all = false;
+                        break;
+                    }
+                    Some(_) => {}
+                }
+            }
+            if all {
+                return Ok(Some(target));
+            }
+        }
+    }
+}
+
 /// Merge consecutive segments `inputs` (oldest first) of one shard into
 /// one: live documents only (a document is dropped when a newer input, or
 /// `newer` — the segments after the inputs — shadows its path; in name
@@ -457,6 +667,37 @@ mod tests {
         let (raw, _) = merge(&[s1, s2], &|p| p == "a/x", true);
         let m = Segment::decode(&raw).unwrap();
         assert!(m.docs.is_empty() && m.dead.is_empty());
+    }
+
+    #[test]
+    fn holding_streams_the_intersection() {
+        let mut b = Builder::default();
+        let texts = ["abcdef", "xyz", "abcxyz", "zzabc", "abc", "nothing"];
+        let paths = ["a", "a/b", "a/b/c", "a-c", "b", "c"];
+        for (p, t) in paths.iter().zip(texts) {
+            b.add(doc(p), &grams(t.as_bytes()));
+        }
+        let s = Segment::decode(&b.encode()).unwrap();
+        let budget = Budget::new(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        let all = |want: &[u32], lo: u32, hi: u32| {
+            let mut h = Holding::new(&s, want, lo, hi);
+            let mut out = Vec::new();
+            while let Some(o) = h.next(&budget).unwrap() {
+                out.push(o);
+            }
+            out
+        };
+        let n = s.docs.len() as u32;
+        assert_eq!(all(&grams(b"abc"), 0, n), s.holding(&grams(b"abc")).unwrap());
+        assert_eq!(all(&grams(b"abcxyz"), 0, n), vec![2]);
+        assert_eq!(all(&grams(b"abc"), 1, 3), vec![2]);
+        assert_eq!(all(&[], 2, 4), vec![2, 3]);
+        assert!(all(&grams(b"qqq"), 0, n).is_empty());
+        assert_eq!(s.range("a", ""), (0, 3));
+        assert_eq!(s.range("a/b", ""), (1, 3));
+        assert_eq!(s.range("", "a/b"), (2, n));
+        assert_eq!(s.range("a", "a/b/c"), (3, 3));
+        assert_eq!(s.range("missing", ""), (6, 6));
     }
 
     #[test]

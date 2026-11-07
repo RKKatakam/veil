@@ -587,14 +587,29 @@ pub async fn update(hub: &Arc<Hub>, project: i64, branches: Option<Vec<String>>)
         .bind(project)
         .fetch_all(&hub.derive.db)
         .await?;
-    let default: Option<String> = sqlx::query_scalar("SELECT default_branch FROM projects WHERE id = $1")
+    let row: Option<(String, String)> = sqlx::query_as("SELECT default_branch, policy_text FROM projects WHERE id = $1")
         .bind(project)
         .fetch_optional(&hub.derive.db)
         .await?;
-    let default = default.unwrap_or_else(|| "main".into());
+    let (default, policy) = row.unwrap_or_else(|| ("main".into(), String::new()));
+    let ident = identity(&Lines::new(&veil_core::hub::access::AccessPolicy::parse(&policy)));
+    // Every branch whose index is behind its tip, missing, or built under
+    // another policy is taken too, whatever was asked (BUG-1231, as S12's
+    // BUG-982): an update that failed or was cut is done by the next one,
+    // and a branch that never landed since the index began is walked.
+    let lagging: Vec<String> = sqlx::query_scalar(
+        "SELECT b.name FROM branches b \
+         LEFT JOIN search_heads c ON c.project_id = b.project_id AND c.kind = 'code' AND c.branch = b.name \
+         LEFT JOIN search_heads w ON w.project_id = b.project_id AND w.kind = 'walk' AND w.branch = b.name \
+         WHERE b.project_id = $1 AND (c.snapshot IS DISTINCT FROM b.target OR c.lines IS DISTINCT FROM $2 OR w.snapshot IS DISTINCT FROM b.target)",
+    )
+    .bind(project)
+    .bind(&ident)
+    .fetch_all(&hub.derive.db)
+    .await?;
     let wanted: Vec<(String, ObjectId)> = targets
         .into_iter()
-        .filter(|(n, _)| branches.as_ref().is_none_or(|b| b.contains(n)) || *n == default)
+        .filter(|(n, _)| branches.as_ref().is_none_or(|b| b.contains(n)) || lagging.contains(n) || *n == default)
         .filter_map(|(n, t)| ObjectId::from_hex(&t).ok().map(|t| (n, t)))
         .collect();
     // The default branch first: other new branches start from it.
@@ -621,15 +636,52 @@ pub async fn update(hub: &Arc<Hub>, project: i64, branches: Option<Vec<String>>)
     tokio::task::spawn_blocking(move || {
         let lines = cx.lines()?;
         let mut stats = Stats::default();
+        // One branch's failure does not stop the others; the first error
+        // is returned once all were tried (the next update tries again).
+        let mut first_error = None;
         for (name, tip) in &wanted {
-            code(&cx, &lines, name, *tip, &default, &mut stats)?;
-            names(&cx, &lines, name, *tip, &default, &mut stats)?;
-            stats.branches.push(name.clone());
+            match code(&cx, &lines, name, *tip, &default, &mut stats).and_then(|()| names(&cx, &lines, name, *tip, &default, &mut stats)) {
+                Ok(()) => stats.branches.push(name.clone()),
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
         }
-        Ok(stats)
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(stats),
+        }
     })
     .await
     .map_err(|e| Error::Other(e.into()))?
+}
+
+/// At start-up: bring up to date every project (or only `project`) with a
+/// branch whose index is behind its tip or missing (an update cut by a
+/// restart, or a project from before the index), one project at a time,
+/// in the background (BUG-1231). A project whose policy changed since is
+/// taken at its next landing or query.
+pub async fn resume(hub: Arc<Hub>, project: Option<i64>) {
+    let projects: Result<Vec<i64>> = sqlx::query_scalar(
+        "SELECT DISTINCT b.project_id FROM branches b \
+         LEFT JOIN search_heads c ON c.project_id = b.project_id AND c.kind = 'code' AND c.branch = b.name \
+         LEFT JOIN search_heads w ON w.project_id = b.project_id AND w.kind = 'walk' AND w.branch = b.name \
+         WHERE (c.snapshot IS DISTINCT FROM b.target OR w.snapshot IS DISTINCT FROM b.target) AND ($1::bigint IS NULL OR b.project_id = $1)",
+    )
+    .bind(project)
+    .fetch_all(&hub.derive.db)
+    .await
+    .map_err(Error::from);
+    match projects {
+        Ok(projects) => {
+            for p in projects {
+                if let Err(e) = update(&hub, p, Some(Vec::new())).await {
+                    eprintln!("veil-server: resuming the search index of project {p}: {e:?}");
+                }
+            }
+        }
+        Err(e) => eprintln!("veil-server: finding search indexes behind their branches: {e:?}"),
+    }
 }
 
 fn withheld(g: &Graph, tip: &ObjectId) -> Result<bool> {
@@ -870,24 +922,37 @@ fn names(cx: &Cx, lines: &Lines, branch: &str, tip: ObjectId, default: &str, sta
             removed = old.keys().filter(|k| !all.contains(*k)).cloned().collect();
             shards.retain(|k, _| all.contains(k));
             let fresh: BTreeSet<String> = all.iter().filter(|k| !shards.contains_key(*k)).cloned().collect();
+            // Written every NAMES_HELD names, as the walk is, and one old
+            // segment loaded at a time.
             let mut moved: BTreeMap<String, BTreeMap<String, u8>> = BTreeMap::new();
+            let mut held = 0usize;
+            let write = |moved: &mut BTreeMap<String, BTreeMap<String, u8>>, shards: &mut BTreeMap<String, Shard>, touched: &mut BTreeSet<String>, stats: &mut Stats| -> Result<()> {
+                for (k, m) in std::mem::take(moved) {
+                    let segs = name_segments(src, &m, stats)?;
+                    let s = shards.entry(k.clone()).or_default();
+                    s.docs += m.len() as i64;
+                    s.segments.extend(segs);
+                    compact(src, s, false, stats)?;
+                    touched.insert(k);
+                }
+                Ok(())
+            };
             for s in old.values() {
-                for seg in load_all(src, &s.segments)? {
+                for r in &s.segments {
+                    let seg = segment::load(src, &oid(&r.id)?)?;
                     for d in &seg.docs {
                         let k = lines.key_of(&d.path, &entry_of(d)).to_string();
-                        if fresh.contains(&k) {
-                            moved.entry(k).or_default().insert(d.path.clone(), d.flags);
+                        if fresh.contains(&k) && moved.entry(k).or_default().insert(d.path.clone(), d.flags).is_none() {
+                            held += 1;
                         }
+                    }
+                    if held >= NAMES_HELD {
+                        write(&mut moved, &mut shards, &mut touched, stats)?;
+                        held = 0;
                     }
                 }
             }
-            for (k, m) in moved {
-                let segs = name_segments(src, &m, stats)?;
-                let s = shards.entry(k.clone()).or_default();
-                s.docs = m.len() as i64;
-                s.segments = segs;
-                touched.insert(k);
-            }
+            write(&mut moved, &mut shards, &mut touched, stats)?;
         }
         let mut stops: Vec<ObjectId> = Vec::new();
         if head.is_some() {
