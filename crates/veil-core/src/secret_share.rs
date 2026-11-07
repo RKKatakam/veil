@@ -1,5 +1,5 @@
 //! Person-to-person secret shares (`vl secret share PATH --with PERSON`,
-//! `docs/HUB.md` §13.13, `docs/CRYPTO.md` C14).
+//! `docs/HUB.md` §13.14, `docs/CRYPTO.md` C14).
 //!
 //! A share is a **copy of one secret file**, sealed for the confirmed
 //! devices of one person (and the sharing device), signed by the sharing

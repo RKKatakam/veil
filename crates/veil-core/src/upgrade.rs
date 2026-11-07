@@ -290,10 +290,14 @@ pub fn removed_content(backend: &Arc<dyn StorageBackend>) -> Result<Vec<String>>
         let before: Vec<&HashMap<String, String>> = parents.iter().filter_map(|p| secret_paths.get(p)).collect();
         let mut mine: HashMap<String, String> = HashMap::new();
         for e in &entries {
-            let secret = crate::policy::names_secret(&e.path)
-                || secret_ids.contains(&e.id)
-                || before.iter().any(|b| b.contains_key(&e.path))
-                || before.iter().any(|b| b.iter().any(|(p, scope)| *scope == e.scope && !here.contains(p.as_str())));
+            let secret = crate::policy::sealed_secret::<std::convert::Infallible>(
+                &e.path,
+                &e.scope,
+                secret_ids.contains(&e.id),
+                |path| Ok(before.iter().any(|b| b.contains_key(path))),
+                |scope| Ok(before.iter().any(|b| b.iter().any(|(p, s)| s == scope && !here.contains(p.as_str())))),
+            )
+            .unwrap_or_else(|never| match never {});
             if secret {
                 secret_ids.insert(e.id);
                 mine.insert(e.path.clone(), e.scope.clone());

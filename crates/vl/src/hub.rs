@@ -544,6 +544,11 @@ impl Client {
         }
     }
 
+    /// A commit through the API (`POST …/changes`).
+    pub fn change(&self, req: &veil_core::hub::changes::ChangeRequest) -> Result<veil_core::hub::changes::ChangeResult> {
+        self.json("POST", &self.url.project_path("/changes"), Some(req))
+    }
+
     pub fn access(&self, path: &str) -> Result<AccessInfo> {
         let mut q = String::new();
         for b in path.bytes() {
@@ -655,7 +660,7 @@ impl Client {
     }
 
     /// The secret shares this person makes or receives here (admins: every
-    /// share of the project), `docs/HUB.md` §13.13.
+    /// share of the project), `docs/HUB.md` §13.14.
     pub fn shares(&self) -> Result<Vec<veil_core::secret_share::ShareInfo>> {
         self.json("GET", &self.url.project_path("/shares"), None::<&()>)
     }

@@ -208,6 +208,44 @@ vl push
 - Snapshots you receive are signed: by their author, or, where the server
   left out something you cannot see, by the server's key (`vl log` shows
   `?signer` for it).
+- **The server scans what it receives for secrets**, as `vl` does before
+  it records a file: a token or password in an ordinary file is refused,
+  and the message names the file, the rule and the line, never the secret.
+  Only an admin's `public!` line (test data) turns this off for a folder.
+
+## Committing without a checkout
+
+Scripts, CI jobs and agents can make a change with no clone at all: send
+the server a list of edits on top of a revision, and it builds the change
+on its own copy of the project.
+
+```sh
+cat > edits.json <<'JSON'
+[ {"path": "src/version.txt", "put": {"text": "1.4.2\n"}},
+  {"path": "src/old.rs", "delete": true} ]
+JSON
+vl change new veil://127.0.0.1:8443/acme --edits edits.json -m "Bump the version" --onto main
+```
+
+- **Every check a push gets applies:** you write only the folders you may
+  write, only admins change access lines, personal keys are refused,
+  secret files only go up encrypted, and the server scans for secrets.
+- **`--onto main`** moves `main` to the change in the same request. If
+  `main` moved since the revision you started from, the server applies your
+  edits to its new tip itself, unless a file you edit changed there (then
+  `vl` says so; the change is kept, and you can make a new revision of it
+  on the new tip with `--change ID`). `--expected ID` moves `main` only if
+  its tip is still that snapshot.
+- **Without `--onto`** the change is kept on the server under its change
+  id, and can be the `--base` of the next one.
+- **Secret files** (`.env`) must be encrypted before they leave your
+  device: run `vl change new` in a clone of the project, which holds their
+  key. Outside a clone it refuses to send them. It also scans every other
+  file itself first, so a secret never leaves your machine.
+- The edits are paths from the project root, at most 10,000 per change and
+  64 MiB of text. The change's author is you; the server signs it.
+- The same thing over HTTPS is `POST /v1/projects/{project}/changes`
+  ([HUB.md §13.13](../HUB.md)).
 
 ## Secrets
 

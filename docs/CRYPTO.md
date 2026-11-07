@@ -394,7 +394,7 @@ and is trusted with code but never with secrets.
 **Approved by the orchestrator under the owner's delegation, 2026-11-07**,
 as a construction from C2, C3 and C5.
 
-What it is for (`docs/HUB.md` §13.13): a member gives **one secret file**
+What it is for (`docs/HUB.md` §13.14): a member gives **one secret file**
 to **one other member**, without an admin, so that only that person's
 confirmed devices (and the sharing device) can open it, and the server,
 which stores it, cannot.
@@ -542,7 +542,7 @@ are distinct and pins their exact bytes.
 | `SIG_CONTEXT_HUB_LOGIN` | `hub-login` | Ed25519 context (signing in to a Veil server, HUB.md §13.2) | C5 |
 | `SIG_CONTEXT_HUB_DEVICE` | `hub-device` | Ed25519 context (a device vouching for another device of its person, over X25519 ‖ Ed25519 public keys, HUB.md §13.11) | C5, C13 |
 | `SIG_CONTEXT_HUB_INVITE` | `hub-invite` | Ed25519 context (a join under an invite, by the invite's key, over `person ‖ 0 ‖ X25519 ‖ Ed25519` of the joining device, HUB.md §13.12) | C5, C13 |
-| `SIG_CONTEXT_HUB_SHARE` | `hub-share` | Ed25519 context (one version of a person-to-person secret share, by the sharing device, over `ShareRecord::signing_body`, HUB.md §13.13) | C5, C14 |
+| `SIG_CONTEXT_HUB_SHARE` | `hub-share` | Ed25519 context (one version of a person-to-person secret share, by the sharing device, over `ShareRecord::signing_body`, HUB.md §13.14) | C5, C14 |
 | `HUB_VIEW_KEY` | `veil 2026 hub view-key v1` | BLAKE3 `derive_key` mode as a hash | server: projection cache key (not secret) |
 | `HUB_DEVICE_FINGERPRINT` | `veil 2026 hub device-fingerprint v1` | BLAKE3 `derive_key` mode as a hash (first 80 bits) | device fingerprint compared out of band (HUB.md §13.11) |
 | `HUB_UPLOAD_RECEIPT` | `veil 2026 hub upload-receipt v1` | BLAKE3 `derive_key` → keyed BLAKE3 (first 128 bits) | server: upload receipts over project ‖ person ‖ object id (HUB.md §13.5) |

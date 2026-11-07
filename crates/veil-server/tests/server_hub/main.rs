@@ -13,6 +13,7 @@
 mod support;
 
 mod auth;
+mod changes;
 mod concurrency;
 mod escalation;
 mod leaks;
@@ -20,6 +21,7 @@ mod sync;
 mod adversarial;
 mod secrets2;
 mod adversarial_s2;
+mod adversarial_s10;
 mod projects;
 mod shares;
 mod derived;

@@ -1,4 +1,4 @@
-//! Person-to-person secret shares (`docs/HUB.md` §13.13): a member's copy
+//! Person-to-person secret shares (`docs/HUB.md` §13.14): a member's copy
 //! of one secret file, sealed on their device for another member's
 //! confirmed devices (`veil_core::secret_share`).
 //!

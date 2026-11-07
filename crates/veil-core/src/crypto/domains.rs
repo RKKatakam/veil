@@ -95,7 +95,7 @@ pub const SIG_CONTEXT_HUB_DEVICE: &str = "hub-device";
 /// joining device (`hub::wire::join_message`).
 pub const SIG_CONTEXT_HUB_INVITE: &str = "hub-invite";
 /// Signature context: one version of a person-to-person secret share
-/// (`docs/HUB.md` §13.13, C14), by the sharing device, over
+/// (`docs/HUB.md` §13.14, C14), by the sharing device, over
 /// `secret_share::ShareRecord::signing_body`.
 pub const SIG_CONTEXT_HUB_SHARE: &str = "hub-share";
 

@@ -476,7 +476,7 @@ impl Ctx {
         // has no repository lock to serialise them).
         let _wc = self.lock_wc()?;
         // A copy of a secret share this device would now seal for the
-        // folder's people never enters history (docs/HUB.md §13.13).
+        // folder's people never enters history (docs/HUB.md §13.14).
         crate::share_cmd::hold_back_received(self);
         // A move of the directory that a previous command started and did
         // not finish (killed, disk full): finish it before recording

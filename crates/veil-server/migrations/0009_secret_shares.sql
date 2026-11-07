@@ -1,4 +1,4 @@
--- Person-to-person secret shares (docs/HUB.md §13.13). One row per (path,
+-- Person-to-person secret shares (docs/HUB.md §13.14). One row per (path,
 -- sharer, recipient): the latest signed version (ciphertext only: the
 -- server cannot open it) and, in plain text for the admins' audit, who
 -- shared which path with whom and when. A share the sharer ends keeps its

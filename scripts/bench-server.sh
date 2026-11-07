@@ -128,6 +128,10 @@ case "$PROFILE" in
         run "${L[@]}" --dir "$WORK/pull" --mode pull --projects 1 --clients 10,100,1000 --background 20 --out "${OUT%.json}-pull.json" "${EXTRA[@]}" || status=$?
         ((status == 0)) && { run "${L[@]}" --dir "$WORK/land" --mode land --projects 1,10,100 --clients 1 --rates max --out "${OUT%.json}-land.json" "${EXTRA[@]}" || status=$?; }
         ((status == 0)) && { run "${L[@]}" --dir "$WORK/hot" --mode land --projects 1 --clients 50 --rates 5,20,40 --out "${OUT%.json}-hot.json" "${EXTRA[@]}" || status=$?; }
+        # Commits through the API (docs/HUB.md §13.13): across projects, and
+        # many agents into one main with the server rebasing.
+        ((status == 0)) && { run "${L[@]}" --dir "$WORK/api" --mode api --projects 1,10,100 --clients 1 --rates max --out "${OUT%.json}-api.json" "${EXTRA[@]}" || status=$?; }
+        ((status == 0)) && { run "${L[@]}" --dir "$WORK/api-hot" --mode api --projects 1 --clients 50 --rates 20,50,100,max --out "${OUT%.json}-api-hot.json" "${EXTRA[@]}" || status=$?; }
         ;;
     *)
         # Generation, the checkout, the server phase (push, clone, pull,

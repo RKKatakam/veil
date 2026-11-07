@@ -163,6 +163,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             None => bail!("{} is not a Veil server project: vl clones from a server URL, veil://host[:port]/project", safe(source)),
         },
         Cmd::Login { url, name, ca } => hub_cmd::login(url, name.as_deref(), ca.as_deref()),
+        // Through the server's API, not the working copy: no snapshot.
+        Cmd::Change(c) => hub_cmd::change(cli.repository.as_deref(), c),
         Cmd::Identity(c) => cmd_identity(c),
         Cmd::Fsck { verbose } => cmd_fsck(cli.repository.as_deref(), *verbose),
         Cmd::Doctor => doctor::run(cli.repository.as_deref()),
@@ -250,6 +252,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Init { .. }
         | Cmd::Clone { .. }
         | Cmd::Login { .. }
+        | Cmd::Change(_)
         | Cmd::Join { .. }
         | Cmd::Identity(_)
         | Cmd::Fsck { .. }
