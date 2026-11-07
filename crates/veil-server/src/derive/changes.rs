@@ -66,6 +66,10 @@ pub const SIMILAR_MAX_BYTES: u64 = 1 << 20;
 pub const SIMILAR_MAX_FILES: usize = 1_000;
 pub const SIMILAR_BUDGET: u64 = 20_000_000;
 pub const SIMILAR_MIN: u32 = 50;
+/// Similarity: most bytes of deleted files held at once, and most bytes
+/// read for one change (BUG-1072).
+pub const SIMILAR_MAX_HELD: u64 = 16 << 20;
+pub const SIMILAR_MAX_READ: u64 = 64 << 20;
 
 const MAGIC: &[u8] = b"veil-derived changed-paths 1\n";
 
@@ -219,18 +223,19 @@ fn walk(
 type Lines = (HashMap<[u8; 8], u32>, u64);
 
 /// Lines of a plain-text file the server may read; `None` for anything
-/// else (sealed, binary, too large, not a blob).
-fn text_lines(src: &Source, e: &TreeEntry) -> Result<Option<Lines>> {
+/// else (sealed, binary, too large, not a blob). With the bytes read.
+fn text_lines(src: &Source, e: &TreeEntry) -> Result<(Option<Lines>, u64)> {
     if e.kind != EntryKind::File || e.visibility != Visibility::Public || e.size > SIMILAR_MAX_BYTES {
-        return Ok(None);
+        return Ok((None, 0));
     }
     let raw = src.raw(&e.id)?;
+    let read = raw.len() as u64;
     if !Object::is_blob_raw(&raw) {
-        return Ok(None);
+        return Ok((None, read));
     }
-    let Object::Blob(bytes) = Object::decode(&raw)? else { return Ok(None) };
+    let Object::Blob(bytes) = Object::decode(&raw)? else { return Ok((None, read)) };
     if bytes.len() as u64 > SIMILAR_MAX_BYTES || bytes.contains(&0) {
-        return Ok(None);
+        return Ok((None, read));
     }
     let mut lines: HashMap<[u8; 8], u32> = HashMap::new();
     let mut n = 0u64;
@@ -239,7 +244,7 @@ fn text_lines(src: &Source, e: &TreeEntry) -> Result<Option<Lines>> {
         *lines.entry(h).or_default() += 1;
         n += 1;
     }
-    Ok(Some((lines, n)))
+    Ok((Some((lines, n)), read))
 }
 
 /// The sources of each added file in `changes` (the same order), whether
@@ -247,6 +252,17 @@ fn text_lines(src: &Source, e: &TreeEntry) -> Result<Option<Lines>> {
 /// of `changes`. A function of `changes` alone: run on the part a viewer
 /// may read, it gives what a project holding only that part would hold.
 pub fn sources(src: &Source, changes: &[Change]) -> Result<(Vec<Vec<From>>, Vec<bool>, bool)> {
+    sources_with(src, changes, &|| Ok(()))
+}
+
+/// [`sources`], calling `tick` before each file it reads (the query API
+/// counts the reads and stops at its deadline). Memory and reading are
+/// bounded (BUG-1072): the deleted files' lines are held, at most
+/// [`SIMILAR_MAX_HELD`] bytes of them; each added file is read, compared
+/// and dropped; at most [`SIMILAR_MAX_READ`] bytes are read in all. Past
+/// either, similarity is skipped for the whole change (`similar: false`),
+/// as past the file and comparison caps: a function of the change alone.
+pub fn sources_with(src: &Source, changes: &[Change], tick: &dyn Fn() -> Result<()>) -> Result<(Vec<Vec<From>>, Vec<bool>, bool)> {
     let file_like = |e: &TreeEntry| e.kind.holds_blob();
     let adds: Vec<usize> = (0..changes.len())
         .filter(|&i| changes[i].old.is_none() && changes[i].new.as_ref().is_some_and(file_like))
@@ -282,19 +298,39 @@ pub fn sources(src: &Source, changes: &[Change]) -> Result<(Vec<Vec<From>>, Vec<
         if deleted.len() > SIMILAR_MAX_FILES || added_files.len() > SIMILAR_MAX_FILES {
             similar = false;
         } else {
-            let mut texts: HashMap<usize, Lines> = HashMap::new();
-            for &i in deleted.iter().chain(&added_files) {
-                let e = changes[i].new.as_ref().or(changes[i].old.as_ref()).unwrap();
-                if let Some(t) = text_lines(src, e)? {
-                    texts.insert(i, t);
+            let mut read = 0u64;
+            let mut held_bytes = 0u64;
+            let mut held: HashMap<usize, Lines> = HashMap::new();
+            for &d in &deleted {
+                tick()?;
+                let (t, r) = text_lines(src, changes[d].old.as_ref().unwrap())?;
+                read += r;
+                if t.is_some() {
+                    held_bytes += r;
+                }
+                if read > SIMILAR_MAX_READ || held_bytes > SIMILAR_MAX_HELD {
+                    similar = false;
+                    break;
+                }
+                if let Some(t) = t {
+                    held.insert(d, t);
                 }
             }
             let mut budget = SIMILAR_BUDGET;
             let mut extra: Vec<(usize, u32, usize)> = Vec::new();
-            'pairs: for &a in &added_files {
-                let Some((la, na)) = texts.get(&a) else { continue };
+            'pairs: for &a in added_files.iter().filter(|_| similar) {
+                tick()?;
+                let (t, r) = text_lines(src, changes[a].new.as_ref().unwrap())?;
+                read += r;
+                if read > SIMILAR_MAX_READ {
+                    similar = false;
+                    break;
+                }
+                // This file's lines are dropped at the end of its turn.
+                let Some((la, na)) = t else { continue };
+                let (la, na) = (&la, &na);
                 for &d in &deleted {
-                    let Some((ld, nd)) = texts.get(&d) else { continue };
+                    let Some((ld, nd)) = held.get(&d) else { continue };
                     if changes[a].new.as_ref().unwrap().id == changes[d].old.as_ref().unwrap().id {
                         continue;
                     }

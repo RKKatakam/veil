@@ -3,7 +3,7 @@
 //!
 //! | Route (`/v1/projects/{p}/q/…`) | Answers |
 //! |---|---|
-//! | `GET log?rev=&n=&path=&after=` | a page of the viewer's history from `rev`, children first, newest first among unrelated snapshots (the client's `vl log` order); with `path`, only snapshots that changed something the viewer may read at or under it |
+//! | `GET log?rev=&n=&path=&after=` | a page of the viewer's history from `rev`, children first, newest first by generation (`vl log`'s order wherever every snapshot is dated after its parents); with `path`, only snapshots that changed something the viewer may read at or under it |
 //! | `GET show?rev=&path=&stat=` | a snapshot's fields and its diff against its first parent (the viewer's part) |
 //! | `GET tree?rev=&path=&after=` | a folder of the viewer's projected tree |
 //! | `GET file?rev=&path=` | a file's bytes (a secret's ciphertext) |
@@ -37,7 +37,7 @@ pub mod graph;
 pub mod trees;
 
 use std::{
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BinaryHeap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -239,105 +239,60 @@ fn snapshot_json(id: &ObjectId, s: &Snapshot, empty: bool) -> Value {
 
 // ---- log ---------------------------------------------------------------------------
 
-/// The client's lazy topological walk (`veil_core::graph_index::TopoIter`)
-/// on a viewer's graph: Kahn's algorithm, newest first among snapshots
-/// whose children are all emitted, exploring only as deep as the next one
-/// to emit.
-struct Topo<'g, 'a> {
+/// The log's walk on a viewer's graph: newest first by generation (the
+/// corrected commit date: a snapshot's timestamp, raised above its
+/// parents'), ties by id. Generations strictly decrease from child to
+/// parent, so children always come before their parents, and the order is
+/// `vl log`'s (newest first by timestamp) wherever every snapshot is dated
+/// after its parents. Each step reads one snapshot's parents and nothing
+/// else, so a page's work is bounded by its budget whatever the history
+/// holds (BUG-1071: the client's lazy Kahn walk may explore the whole
+/// history in one step when a merge takes in a snapshot dated far behind);
+/// and what is left to walk is exactly the frontier, which the cursor names.
+struct LogWalk<'g, 'a> {
     g: &'g G<'a>,
-    unexamined: Vec<(i64, ObjectId)>,
-    explore: BinaryHeap<(i64, ObjectId)>,
-    indegree: HashMap<ObjectId, usize>,
-    ready: BinaryHeap<(i64, ObjectId)>,
+    heap: BinaryHeap<(i64, ObjectId)>,
     queued: HashSet<ObjectId>,
-    nodes: HashMap<ObjectId, (Arc<VRow>, Arc<Snapshot>)>,
 }
 
-impl<'g, 'a> Topo<'g, 'a> {
-    fn new(g: &'g G<'a>, roots: &[ObjectId]) -> Result<Topo<'g, 'a>> {
-        let mut t = Topo {
+impl<'g, 'a> LogWalk<'g, 'a> {
+    fn new(g: &'g G<'a>, roots: &[ObjectId]) -> Result<LogWalk<'g, 'a>> {
+        let mut w = LogWalk {
             g,
-            unexamined: Vec::new(),
-            explore: BinaryHeap::new(),
-            indegree: HashMap::new(),
-            ready: BinaryHeap::new(),
+            heap: BinaryHeap::new(),
             queued: HashSet::new(),
-            nodes: HashMap::new(),
         };
         for r in roots {
-            t.discover(*r)?;
-            t.unexamined.push((t.nodes[r].1.timestamp, *r));
+            w.push(*r)?;
         }
-        t.unexamined.sort();
-        t.unexamined.dedup();
-        Ok(t)
+        Ok(w)
     }
 
-    fn discover(&mut self, id: ObjectId) -> Result<()> {
-        if self.nodes.contains_key(&id) {
-            return Ok(());
+    fn push(&mut self, id: ObjectId) -> Result<()> {
+        if self.queued.insert(id) {
+            self.heap.push((self.g.get(&id)?.generation, id));
         }
+        Ok(())
+    }
+
+    /// The next snapshot of the log, and its row. Every child of a
+    /// snapshot has a larger generation, so it was emitted (and pushed this
+    /// one) before this one is popped: none is pushed twice or after it is
+    /// emitted.
+    fn step(&mut self) -> Result<Option<(ObjectId, Arc<VRow>)>> {
+        let Some((_, id)) = self.heap.pop() else { return Ok(None) };
         let row = self.g.get(&id)?;
-        let s = self.g.snapshot(&id)?;
-        self.explore.push((row.generation, id));
-        self.indegree.insert(id, 0);
-        self.nodes.insert(id, (row, s));
-        Ok(())
+        for p in &row.parents {
+            self.push(*p)?;
+        }
+        Ok(Some((id, row)))
     }
 
-    fn explore_to(&mut self, floor: i64) -> Result<()> {
-        while let Some(&(g, id)) = self.explore.peek() {
-            if g < floor {
-                break;
-            }
-            self.explore.pop();
-            for p in self.nodes[&id].0.parents.clone() {
-                self.discover(p)?;
-                *self.indegree.get_mut(&p).unwrap() += 1;
-            }
-        }
-        Ok(())
-    }
-
-    fn settle(&mut self, id: ObjectId) -> Result<()> {
-        if self.queued.contains(&id) {
-            return Ok(());
-        }
-        self.explore_to(self.nodes[&id].0.generation + 1)?;
-        if self.indegree[&id] == 0 {
-            self.queued.insert(id);
-            self.ready.push((self.nodes[&id].1.timestamp, id));
-        }
-        Ok(())
-    }
-
-    fn step(&mut self) -> Result<Option<ObjectId>> {
-        while let Some(&key) = self.unexamined.last() {
-            if self.ready.peek().is_some_and(|top| *top > key) {
-                break;
-            }
-            self.unexamined.pop();
-            self.settle(key.1)?;
-        }
-        let Some((_, id)) = self.ready.pop() else { return Ok(None) };
-        self.explore_to(self.nodes[&id].0.generation)?;
-        for p in self.nodes[&id].0.parents.clone() {
-            let c = self.indegree.get_mut(&p).unwrap();
-            *c -= 1;
-            if *c == 0 {
-                self.settle(p)?;
-            }
-        }
-        Ok(Some(id))
-    }
-
-    /// What is left to emit, as the snapshots it starts from: the walk of
-    /// the rest of the log from them is exactly the rest of this one.
-    fn heads(&self) -> Vec<ObjectId> {
-        let waiting = self.unexamined.iter().map(|(_, id)| *id).filter(|id| !self.queued.contains(id));
-        let mut out: Vec<ObjectId> = self.ready.iter().map(|(_, id)| *id).chain(waiting).collect();
+    /// The snapshots the rest of the log starts from: the walk of the rest
+    /// from them is exactly the rest of this one.
+    fn frontier(&self) -> Vec<ObjectId> {
+        let mut out: Vec<ObjectId> = self.heap.iter().map(|(_, id)| *id).collect();
         out.sort();
-        out.dedup();
         out
     }
 }
@@ -378,7 +333,7 @@ pub async fn log(hub: &Arc<Hub>, ask: &Ask, q: LogParams, limits: Limits) -> Res
                 _ => return Err(no_revision()),
             }
         }
-        let mut topo = Topo::new(g, &roots)?;
+        let mut walk = LogWalk::new(g, &roots)?;
         let start = g.work();
         let mut entries = Vec::new();
         let mut bytes = 0usize;
@@ -386,26 +341,26 @@ pub async fn log(hub: &Arc<Hub>, ask: &Ask, q: LogParams, limits: Limits) -> Res
             if g.work() - start >= limits.work {
                 break;
             }
-            let Some(id) = topo.step()? else { break };
-            let (row, s) = topo.nodes[&id].clone();
-            let parent_tree = match s.parents.first() {
-                Some(p) => Some(topo.nodes[p].1.tree),
-                None => None,
-            };
+            let Some((id, row)) = walk.step()? else { break };
             if !path.is_empty() {
                 let (now, before) = t.roots_of(&row)?;
                 if !t.differs_at(now, before, &path)? {
                     continue;
                 }
             }
-            let e = snapshot_json(&id, &s, parent_tree.is_none_or(|p| p == s.tree));
+            let s = g.snapshot(&id)?;
+            let empty = match s.parents.first() {
+                Some(p) => g.snapshot(p)?.tree == s.tree,
+                None => true,
+            };
+            let e = snapshot_json(&id, &s, empty);
             bytes += e.to_string().len();
             entries.push(e);
             if bytes >= limits.page_bytes {
                 break;
             }
         }
-        let heads = topo.heads();
+        let heads = walk.frontier();
         Ok(json!({
             "schema": "veil.log/2",
             "entries": entries,

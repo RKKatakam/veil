@@ -213,7 +213,8 @@ fn query_projection_equivalence() {
 
 /// The viewer graph's walks against direct ones (row 11: a function of
 /// immutable inputs, never wrong): ancestry and merge bases by brute force,
-/// and the log against the client's order (Kahn's algorithm, newest first),
+/// and the log against its order (newest first by generation, children
+/// before parents),
 /// on histories of long linear runs, merges every way and timestamps far
 /// ahead and far behind, so that the walks pass over runs through the jump
 /// table.
@@ -300,24 +301,22 @@ fn query_graph_matches_direct_walks() {
         for ((pair, w), g) in pairs.iter().zip(&want).zip(&got) {
             assert_eq!(w, g, "seed {seed}: {} {}", pair.0.short(), pair.1.short());
         }
-        // The log: Kahn's algorithm, newest (timestamp, id) first.
+        // The log: newest first by generation (the corrected commit date,
+        // timestamps clamped as the graph clamps them), ties by id.
         let reach = anc(tips[0]);
-        let mut children: HashMap<ObjectId, usize> = HashMap::new();
+        let mut gens: HashMap<ObjectId, i64> = HashMap::from([(root, 0)]);
+        for x in &h.order {
+            let g = h.parents[x].iter().map(|p| gens[p] + 1).max().unwrap_or(0).max(stamps[x].clamp(0, i64::MAX / 4));
+            gens.insert(*x, g);
+        }
+        let mut sorted: Vec<(i64, ObjectId)> = reach.iter().map(|x| (gens[x], *x)).collect();
+        sorted.sort_by(|a, b| b.cmp(a));
+        let order: Vec<String> = sorted.iter().map(|(_, x)| x.hex()).collect();
+        // Children before parents, whatever the timestamps.
+        let at: HashMap<&str, usize> = order.iter().enumerate().map(|(i, x)| (x.as_str(), i)).collect();
         for x in &reach {
             for p in &h.parents[x] {
-                *children.entry(*p).or_default() += 1;
-            }
-        }
-        let mut heap: std::collections::BinaryHeap<(i64, ObjectId)> = reach.iter().filter(|x| !children.contains_key(*x)).map(|x| (stamps[x], *x)).collect();
-        let mut order = Vec::new();
-        while let Some((_, x)) = heap.pop() {
-            order.push(x.hex());
-            for p in &h.parents[&x] {
-                let c = children.get_mut(p).unwrap();
-                *c -= 1;
-                if *c == 0 {
-                    heap.push((stamps[p], *p));
-                }
+                assert!(at[x.hex().as_str()] < at[p.hex().as_str()], "seed {seed}: a parent before its child");
             }
         }
         let a = ask(&th, &h, &admin());
@@ -1047,7 +1046,6 @@ mod s13_adversarial {
     /// line below, whatever the budget. On a long history every such log
     /// meets the 2 s deadline and fails for everyone.
     #[test]
-    #[ignore = "BUG-1071: one step of the log's walk explores the whole history, past the page's work budget"]
     fn bug_1071_a_log_page_walks_past_its_work_budget() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);
@@ -1089,18 +1087,18 @@ mod s13_adversarial {
     /// from anyone on Earth costs the server that memory and CPU, and a few
     /// at once take the process (every project) down.
     #[test]
-    #[ignore = "BUG-1072: the diff route's rename detection holds unbounded memory and ignores the deadline"]
     fn bug_1072_a_diff_holds_gigabytes_past_its_deadline() {
         const CHILD: &str = "VEIL_BUG1072_CHILD";
         if std::env::var(CHILD).is_err() {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "query::s13_adversarial::bug_1072_a_diff_holds_gigabytes_past_its_deadline", "--nocapture", "--include-ignored"])
+                .args(["--exact", "query::s13_adversarial::bug_1072_a_diff_holds_gigabytes_past_its_deadline", "--nocapture"])
                 .env(CHILD, "1")
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout);
-            let line = stdout.lines().find(|l| l.contains("BUG-1072:")).unwrap_or_default();
-            println!("{line}");
+            for line in stdout.lines().filter(|l| l.contains("BUG-1072:")) {
+                println!("{line}");
+            }
             assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
             return;
         }
@@ -1145,6 +1143,19 @@ mod s13_adversarial {
             Err(e) => format!("{e:?}"),
         };
         println!("BUG-1072: diff of {n} deleted and {n} added files of {kib} KiB, as anyone on Earth: memory rose {} MiB, took {took:?} with a deadline of {:?} ({what})", grew >> 20, limits.deadline);
+        // With time to finish, the diff answers: renames by content are
+        // skipped for the whole change (past the bytes held), as past the
+        // other caps, and the memory stays bounded.
+        let p = DiffParams { from: x.hex(), to: Some(y.hex()), base: Some("from".into()), stat: Some(true), path: None };
+        let slow = Limits {
+            deadline: Duration::from_secs(120),
+            ..Limits::default()
+        };
+        let (full, grew_full) = peak_growth(|| th.rt.block_on(query::diff(&h.hub, &a, p, slow)));
+        let full = full.unwrap();
+        println!("BUG-1072: with time to finish: {} files, renames_skipped {}, memory rose {} MiB", full["files"].as_array().unwrap().len(), full["renames_skipped"], grew_full >> 20);
+        assert_eq!(full["renames_skipped"], json!(true));
+        assert!(grew_full < 256 << 20, "memory rose {} MiB", grew_full >> 20);
         assert!(
             grew < 256 << 20 && took < limits.deadline + Duration::from_secs(3),
             "one diff: memory rose {} MiB, and it took {took:?} with a deadline of {:?}",
@@ -1166,7 +1177,6 @@ mod s13_adversarial {
     /// fails, and so do the fills. Anyone on Earth starts them by asking
     /// for the logs of that many public projects at once.
     #[test]
-    #[ignore = "BUG-1073: concurrent first fills hold every pooled connection and stall the whole server"]
     fn bug_1073_cold_fills_exhaust_the_connection_pool() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);

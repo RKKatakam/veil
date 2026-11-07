@@ -217,7 +217,7 @@ impl<'g, 'a> Trees<'g, 'a> {
     /// whether inexact renames were skipped.
     pub fn diff(&self, old: ObjectId, new: ObjectId, under: &str, content: bool, limits: DiffLimits) -> Result<Value> {
         let ch = self.changes(old, new, under)?;
-        let (from, _capped, similar) = changes::sources(&self.g.cx.src, &ch)?;
+        let (from, _capped, similar) = changes::sources_with(&self.g.cx.src, &ch, &|| self.g.tick())?;
         // An added file whose best source the change deleted is a rename
         // (once per source); with any other source, a copy.
         let deleted: std::collections::HashMap<&str, usize> =

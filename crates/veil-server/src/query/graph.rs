@@ -721,6 +721,8 @@ pub struct State {
     fills: Mutex<HashMap<(i64, String), Fill>>,
     /// Fills started here, per project (the tests count them).
     started: Mutex<HashMap<i64, u64>>,
+    /// One per fill running here: at most [`MAX_FILLS`] at once.
+    slots: Arc<tokio::sync::Semaphore>,
 }
 
 type Fill = watch::Receiver<Option<std::result::Result<(), String>>>;
@@ -731,6 +733,7 @@ impl Default for State {
             rows: LruCache::new(64 << 20),
             fills: Mutex::new(HashMap::new()),
             started: Mutex::new(HashMap::new()),
+            slots: Arc::new(tokio::sync::Semaphore::new(MAX_FILLS)),
         }
     }
 }
@@ -755,12 +758,21 @@ pub fn warming() -> Error {
 /// How long a fill waits for another server's fill of the same view key
 /// before it goes ahead itself (it then finds that one's rows).
 const FILL_LOCK_WAIT: Duration = Duration::from_secs(600);
-const FILL_LOCK_BASE: i64 = 0x7665_696c_7166_0000; // "veilqf"
+/// Most fills running at once on one server (BUG-1073). A fill runs its
+/// statements one at a time, so fills hold at most this many of the
+/// pool's connections, and only while a statement runs; past it, a query
+/// waits for a slot until its deadline (then `warming`), a landing until
+/// one is free.
+pub const MAX_FILLS: usize = 4;
+/// How long a fill's lease lasts unless renewed, and how often it is.
+const LEASE: Duration = Duration::from_secs(120);
+const LEASE_RENEW: Duration = Duration::from_secs(30);
 
 /// The viewer's ids of real snapshots `tips`, once the viewer's graph holds
 /// them. A graph that does not hold them yet is filled by **one** task per
 /// project and view key on this server (and one server at a time, by a
-/// database advisory lock): every caller that needs it joins that task.
+/// lease row in `view_fills`), at most [`MAX_FILLS`] at once on a server:
+/// every caller that needs it joins that task.
 /// The task runs in the background to the end, whoever stops waiting;
 /// a caller with a `deadline` gets [`warming`] when it passes (a query's
 /// deadline never bounds, nor pays for, a first fill).
@@ -784,7 +796,7 @@ pub async fn ensure(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[
         }
         // Another caller's fill may be for other tips: wait for it, then
         // look again (and start ours).
-        let (mut rx, started) = start_or_join(hub, project, viewer, &vk, tips);
+        let (mut rx, started) = start_or_join(hub, project, viewer, &vk, tips, deadline).await?;
         let done = async { rx.wait_for(|d| d.is_some()).await.ok().and_then(|d| d.clone()) };
         let outcome = match deadline {
             Some(d) => tokio::time::timeout_at(d.into(), done).await.map_err(|_| warming())?,
@@ -832,52 +844,105 @@ async fn warm(hub: &Arc<Hub>, project: i64, vk: &str, admin: bool, tips: &[Objec
     Ok(Some(out))
 }
 
-/// Join the fill running for (`project`, `vk`), or start one for `tips`;
-/// whether this call started it.
-fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, tips: &[ObjectId]) -> (Fill, bool) {
+/// Join the fill running for (`project`, `vk`), or start one for `tips`
+/// once one of the server's [`MAX_FILLS`] slots is free (waiting for it
+/// until `deadline`, then [`warming`]); whether this call started it.
+async fn start_or_join(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    vk: &str,
+    tips: &[ObjectId],
+    deadline: Option<Instant>,
+) -> Result<(Fill, bool)> {
     let key = (project.id, vk.to_string());
-    let mut fills = hub.query.fills.lock().unwrap();
-    if let Some(rx) = fills.get(&key) {
-        return (rx.clone(), false);
-    }
-    let (tx, rx) = watch::channel(None);
-    fills.insert(key.clone(), rx.clone());
-    *hub.query.started.lock().unwrap().entry(project.id).or_default() += 1;
-    drop(fills);
-    let (hub, project, viewer, tips) = (hub.clone(), project.clone(), viewer.clone(), tips.to_vec());
-    tokio::spawn(async move {
-        let r = locked_fill(&hub, &project, &viewer, &key.1, &tips).await;
-        if let Err(e) = &r {
-            eprintln!("veil-server: filling a viewer graph of project {}: {e:?}", project.id);
+    loop {
+        if let Some(rx) = hub.query.fills.lock().unwrap().get(&key) {
+            return Ok((rx.clone(), false));
         }
-        hub.query.fills.lock().unwrap().remove(&key);
-        let _ = tx.send(Some(r.map(|_| ()).map_err(|e| format!("{e:?}"))));
-    });
-    (rx, true)
+        let slot = hub.query.slots.clone().acquire_owned();
+        let slot = match deadline {
+            Some(d) => tokio::time::timeout_at(d.into(), slot).await.map_err(|_| warming())?,
+            None => slot.await,
+        }
+        .map_err(|e| Error::Other(e.into()))?;
+        let mut fills = hub.query.fills.lock().unwrap();
+        if fills.contains_key(&key) {
+            // Started by another caller while this one waited for a slot.
+            continue;
+        }
+        let (tx, rx) = watch::channel(None);
+        fills.insert(key.clone(), rx.clone());
+        *hub.query.started.lock().unwrap().entry(project.id).or_default() += 1;
+        drop(fills);
+        let (hub, project, viewer, tips, key) = (hub.clone(), project.clone(), viewer.clone(), tips.to_vec(), key.clone());
+        tokio::spawn(async move {
+            let r = leased_fill(&hub, &project, &viewer, &key.1, &tips).await;
+            if let Err(e) = &r {
+                eprintln!("veil-server: filling a viewer graph of project {}: {e:?}", project.id);
+            }
+            hub.query.fills.lock().unwrap().remove(&key);
+            drop(slot);
+            let _ = tx.send(Some(r.map(|_| ()).map_err(|e| format!("{e:?}"))));
+        });
+        return Ok((rx, true));
+    }
 }
 
-/// [`extend`] under the database advisory lock of (`project`, `vk`), so
-/// that two servers do not fill one view key at once.
-async fn locked_fill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, tips: &[ObjectId]) -> Result<()> {
-    let mut h = blake3::Hasher::new();
-    h.update(&project.id.to_le_bytes());
-    h.update(vk.as_bytes());
-    let key = FILL_LOCK_BASE ^ i64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap());
-    let mut c = hub.db.acquire().await?;
-    let deadline = tokio::time::Instant::now() + FILL_LOCK_WAIT;
-    let mut got = false;
-    while !got && tokio::time::Instant::now() < deadline {
-        got = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)").bind(key).fetch_one(&mut *c).await?;
-        if !got {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+/// [`extend`] under the lease of (`project`, `vk`) in `view_fills`, so that
+/// two servers do not fill one view key at once. Taking, renewing and
+/// giving back the lease are single statements: no connection is held
+/// while the fill runs (BUG-1073). A lease another server holds is waited
+/// for (one statement every 250 ms) up to [`FILL_LOCK_WAIT`]; a lease left
+/// by a server that stopped expires after [`LEASE`].
+async fn leased_fill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, tips: &[ObjectId]) -> Result<()> {
+    let holder = hex::encode(veil_core::crypto::random_bytes::<16>());
+    let take = || async {
+        let now = veil_core::now_millis();
+        let got: Option<String> = sqlx::query_scalar(
+            "INSERT INTO view_fills (project_id, view_key, holder, expires_at) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (project_id, view_key) DO UPDATE SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at \
+             WHERE view_fills.expires_at < $5 RETURNING holder",
+        )
+        .bind(project.id)
+        .bind(vk)
+        .bind(&holder)
+        .bind(now + LEASE.as_millis() as i64)
+        .bind(now)
+        .fetch_optional(&hub.db)
+        .await?;
+        Ok::<bool, Error>(got.is_some())
+    };
+    let wait = tokio::time::Instant::now() + FILL_LOCK_WAIT;
+    let mut leased = take().await?;
+    while !leased && tokio::time::Instant::now() < wait {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        leased = take().await?;
     }
+    let renew = leased.then(|| {
+        let (hub, id, vk, holder) = (hub.clone(), project.id, vk.to_string(), holder.clone());
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(LEASE_RENEW).await;
+                let _ = sqlx::query("UPDATE view_fills SET expires_at = $1 WHERE project_id = $2 AND view_key = $3 AND holder = $4")
+                    .bind(veil_core::now_millis() + LEASE.as_millis() as i64)
+                    .bind(id)
+                    .bind(&vk)
+                    .bind(&holder)
+                    .execute(&hub.db)
+                    .await;
+            }
+        })
+    });
     let r = extend(hub, project, viewer, tips).await.map(|_| ());
-    if got {
-        let unlocked = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)").bind(key).fetch_one(&mut *c).await;
-        if !matches!(unlocked, Ok(true)) {
-            let _ = sqlx::Connection::close(c.detach()).await;
-        }
+    if let Some(renew) = renew {
+        renew.abort();
+        let _ = sqlx::query("DELETE FROM view_fills WHERE project_id = $1 AND view_key = $2 AND holder = $3")
+            .bind(project.id)
+            .bind(vk)
+            .bind(&holder)
+            .execute(&hub.db)
+            .await;
     }
     r
 }

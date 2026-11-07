@@ -24,3 +24,14 @@ CREATE TABLE IF NOT EXISTS view_graph (
     real_id TEXT NOT NULL,
     PRIMARY KEY (project_id, view_key, snapshot)
 );
+-- Who fills a view key's graph now (BUG-1073): a lease, taken with one
+-- statement and given back with another, so that no database connection is
+-- held while a fill runs. A lease past `expires_at` (milliseconds since the
+-- epoch; renewed while its fill runs) may be taken over.
+CREATE TABLE IF NOT EXISTS view_fills (
+    project_id BIGINT NOT NULL,
+    view_key TEXT NOT NULL,
+    holder TEXT NOT NULL,
+    expires_at BIGINT NOT NULL,
+    PRIMARY KEY (project_id, view_key)
+);
