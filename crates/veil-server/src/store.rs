@@ -270,26 +270,6 @@ impl Objects {
         Ok(Some(b))
     }
 
-    /// Read `ids` into the cache, many at once (a remote store's latency
-    /// would otherwise add up one object at a time). Only warms the cache:
-    /// what is served is decided afterwards.
-    pub async fn prefetch(self: &std::sync::Arc<Self>, project: i64, ids: Vec<ObjectId>) {
-        let mut set = tokio::task::JoinSet::new();
-        let mut it = ids.into_iter();
-        loop {
-            while set.len() < 64 {
-                let Some(id) = it.next() else { break };
-                let me = self.clone();
-                set.spawn(async move {
-                    let _ = me.get(project, &id).await;
-                });
-            }
-            if set.join_next().await.is_none() {
-                break;
-            }
-        }
-    }
-
     pub async fn put(&self, project: i64, id: &ObjectId, raw: Bytes) -> Result<()> {
         self.store.put(&object_key(project, id), raw.clone()).await?;
         self.cache.insert(Self::cache_key(project, id), raw.clone(), raw.len());

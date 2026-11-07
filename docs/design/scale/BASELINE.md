@@ -29,6 +29,18 @@ These are the scale benchmark's numbers for today's client (`9-scale-benchmark.m
 - **The full clone** writes each part of a level as it arrives; its peak (433 MiB) is the fetch and checkout's staging together, under the gate. The first run of the branch (`65519e1`) took 81 s: tree levels went out as 4 requests instead of 8; `7fb947f` keeps at least 8 parts for a level of 2,000 objects or more, and the server reads ahead in a sliding window instead of 64 objects at a time.
 - **The server** still grows past its caches' 512 MiB, but no longer with what it serves: a full clone adds 365 MiB where it added 785 MiB. An upload's objects are copied out of the request (a slice kept the whole 8 MiB body alive in the object cache), fetch answers stream, and decoded trees are weighed by their real size. What remains is the allocator's (BUG-864): pushes of a generated 1 GB repository to a fresh server, measured by hand (not `--plain`, so each was refused at its embargoed merge after its uploads and part of its checks: a lower bound), peaked at 1.5–2.6 GB with glibc's default arenas (one per thread: 34 to 146 threads), 1.1 GB with `MALLOC_ARENA_MAX=2` and 0.84 GB with `MALLOC_ARENA_MAX=1`, whose single heap held about 330 MiB during the uploads (the bounded caches) and 820 MiB during the checks (both caches full, plus the push's tables).
 
+**Nothing got slower** (the same machine and evening; with load averages of 6 to 72, single runs vary by up to 2×, so the base and the branch were also run alternately):
+
+| workload | before (`1f9f880`): runs, median | after: runs, median |
+|---|---|---|
+| OpenScion clone everything, 1k files | 106.5, 135.4, 126.6, 171.6 ms: 131 ms | 100.8, 97.8, 105.1, 129.7, 151.0 ms: 105 ms |
+| OpenScion clone everything, 10k files | 391.0, 460.4, 487.8, 673.3 ms: 474 ms | 390.6, 413.1, 466.4, 897.9, 404.2 ms: 413 ms |
+| OpenScion clone one directory, 1k / 10k | 58.1, 54.7, 73.0, 53.7 / 54.5, 64.3, 63.9, 121.9 ms: 56 / 64 ms | 55.2, 61.7, 52.3, 58.6, 109.7 / 55.2, 57.2, 60.6, 81.8, 64.3 ms: 59 / 61 ms |
+| load: pull, 100 clients (alternating, 10 s each) | 5,177, 4,616, 4,441 /s | 5,199, 4,532, 4,769 /s |
+| load: land, 10 / 100 projects (`bench-server.sh load`) | 531, 531 / 535 (2,990 errors), 407 /s | 473 / 652 /s, 0 errors |
+
+The load profile's third curve (one project, 50 agents) failed to start its server in the base's first run (`ensure_bucket` met a reset MinIO connection: BUG-861) and in the branch's run with 6 tries in 1.5 s; with tries for up to 10 s every curve ran, with no error.
+
 ## Through the Veil server (2026-11-06, `bfa691a`)
 
 `scripts/bench-server.sh 1g`, 2026-11-06, on `integration` @ **`bfa691a`** (the product code measured; the bench changes of this stream only). Same machine, release builds, everything under the worktree's `.scratch/` on the ext4 disk. The run took 12 minutes end to end (4 of generation), then removed its containers and everything it generated. Raw results (not committed): `.scratch/bench-results/server-1g-bfa691a-20261106T194539Z.{json,md}`.
