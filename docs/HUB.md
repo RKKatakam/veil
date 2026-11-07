@@ -2455,7 +2455,10 @@ A list merges one ordered scan of `prs_by_class` per satisfied class and
 state, at most a page each. A search reads every PR of the satisfied
 classes once (no text index), so its time grows with them: 50,000 is
 about the limit for 50 ms. The first measurement, with a sorted list and
-two search scans, was 55 ms and 89 ms.
+two search scans, was 55 ms and 89 ms. After review cycle 1 (one-pass
+guarded reclassification, paged threads; load 15.6 before and 18.1 after,
+so a little noisy): list 7.7 / 8.3 ms, search 46.1 / 73.1 ms, open
+5.6 / 23.7 ms, update 6.7 / 22.7 ms, show 2.5 / 2.9 ms (p50 / p99).
 
 #### Reverting
 
