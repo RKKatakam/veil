@@ -34,7 +34,8 @@ The Hub follows **the design of Anthropic's Scion**, which handles tens of thous
 - **Layered caches:** the client, then a cache daemon on each machine, then regional caches, then the server. Files are addressed by their hash, so any cache can serve them with no coordination; Scion serves over 99% of reads from caches. Caches only ever hold what the asker is allowed to see.
 - **No locked merge queue:** ready changes that don't overlap are **merged in batches** (500 ready PRs become one move of `main`). Conflicts go back to an agent to fix. Tests run after merging and before deploy.
 - **Few branches:** work lives as changes and PRs, not thousands of long-lived branches.
-- **No maintenance:** each file is stored once in S3-style object storage; there is no repacking.
+- **Cheap storage:** each file is stored once, compressed, in S3-style object storage. A push's small files go up together as **one pack** (one storage write per push instead of one per file), and a background job merges small packs, as Git hosting does. Readers still get files one at a time, only those they may see (`docs/design/server/storage-and-cost.md`).
+- **One database commit per push,** and sign-ins, permissions and branch tips answered from each server's memory, so the database is never the bottleneck.
 - **Horizontal scaling:** stateless API servers, **YugabyteDB** for metadata (Spanner-style; PostgreSQL for development and CI), and object storage. Capacity grows by adding machines.
 - **Permissions on every request,** cached per person and folder, so access control never becomes the bottleneck.
 
@@ -49,6 +50,7 @@ The Hub follows **the design of Anthropic's Scion**, which handles tens of thous
 | A fresh agent workspace on a large project | **Seconds**, fetching on demand |
 | History, blame or search through the API | **Milliseconds to low hundreds of ms**, with no checkout |
 | Permission checks | A negligible share of request time |
+| Cost per push | **1 database commit, at most 2 storage writes**; a warm pull is 5 or fewer database statements |
 
 ### Speed gates: the OpenScion workloads (owner, 2026-11-06)
 

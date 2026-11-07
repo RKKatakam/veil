@@ -859,13 +859,11 @@ fn killing_vl_while_bwrap_or_systemd_run_starts_leaves_nothing_running() {
 
 /// `kill -9` of `vl` at every moment of a confined, limited run with
 /// injected secrets: nothing is left running, no scope stays, the injected
-/// file goes, and the next run records and works. Fails now and then under
-/// load: `vl` killed after `bwrap` cloned the sandbox's init but before
-/// that init armed its own `--die-with-parent` leaves the command running;
-/// `systemd-run` killed while systemd starts its scope can leave the
-/// (empty) scope active.
+/// file goes, and the next run records and works. `vl` killed after `bwrap`
+/// cloned the sandbox's init but before that init armed its own
+/// `--die-with-parent`, or `systemd-run` killed while systemd starts its
+/// scope, leaves the command or the (empty) scope to the reaper (BUG-852).
 #[test]
-#[ignore = "BUG-852: vl killed during bwrap's own start-up can leave the command running"]
 fn killing_vl_at_any_moment_leaves_nothing_and_the_next_run_recovers() {
     let t = T::new();
     t.sh("true");
@@ -897,6 +895,43 @@ fn killing_vl_at_any_moment_leaves_nothing_and_the_next_run_recovers() {
     assert!(o.status.success(), "{}", text(&o));
     assert_eq!(t.cat("next.txt").as_deref(), Some("next\n"), "{}", text(&o));
     assert!(t.cat(".netrc").is_none_or(|c| !c.contains("isolated-value")), "{}", text(&o));
+}
+
+/// A run without injected secrets has no reaper: when its `vl` died in
+/// the moment that leaves the sandbox's init running (BUG-852), the next
+/// run in the workspace, and `vl ws rm`, stop it first. The moment is too
+/// short to hit on purpose, so a `bwrap` started as `vl` starts it, with
+/// the sandbox bound, stands in for the init that outlived `vl`.
+#[test]
+fn the_next_run_and_ws_rm_stop_what_a_dead_run_left_running() {
+    let t = T::new();
+    t.sh("true");
+    let o = Command::new("sh").args(["-c", "command -v bwrap"]).output().unwrap();
+    let bwrap = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    for (i, next) in [&["ws", "exec", "agent", "--", "true"][..], &["ws", "rm", "--force", "agent"]].into_iter().enumerate() {
+        // A run killed while its command runs: its output is unrecorded.
+        let marker = format!("30.{}{i}1", std::process::id());
+        let script = format!("touch started{i}; sleep {marker}");
+        let mut run = t.cmd(&t.proj, &["ws", "exec", "agent", "--", "sh", "-c", &script]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        assert!(wait_for(Duration::from_secs(20), || t.files("agent").join(format!("started{i}")).exists()), "never started");
+        run.kill().unwrap();
+        run.wait().unwrap();
+        assert!(wait_for(Duration::from_secs(15), || !sleeping(&marker)), "the command outlived vl");
+        let left = format!("30.{}{i}2", std::process::id());
+        let files = t.files("agent");
+        let mut init = Command::new(&bwrap)
+            .args(["--die-with-parent", "--unshare-user", "--unshare-pid", "--ro-bind", "/", "/", "--bind"])
+            .args([files.as_os_str(), t.proj.as_os_str()])
+            .args(["--", "sleep", &left])
+            .spawn()
+            .unwrap();
+        assert!(wait_for(Duration::from_secs(10), || sleeping(&left)), "the stand-in never started");
+        let o = t.cmd(&t.proj, next).stdin(Stdio::null()).output().unwrap();
+        assert!(o.status.success(), "{next:?}: {}", text(&o));
+        assert!(!sleeping(&left), "{next:?}: what the dead run left still runs");
+        assert!(init.try_wait().unwrap().is_some(), "{next:?}: the stand-in init still runs");
+    }
+    assert!(!t.files("agent").exists());
 }
 
 #[test]

@@ -37,7 +37,8 @@
 //! isolated secrets from the vault. A tiny **reaper** process (this binary,
 //! re-executed with [`REAPER_ARG`]) watches a pipe whose only writer is this
 //! process. When `vl` exits for any reason, `kill -9` included, the kernel
-//! closes the pipe; unless `vl` said it finished cleanly, the reaper removes
+//! closes the pipe; unless `vl` said it finished cleanly, the reaper stops
+//! what the confined run left running ([`stop_dead_run`]), then removes
 //! the throwaway directory, or, for a persistent sandbox whose run injected
 //! secrets, takes the injected files that are still unchanged out again
 //! (it never deletes anything else: the rest is the command's output). It
@@ -262,6 +263,9 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
     ctx.repo.workspace_wc(name)?;
 
     let loaded = paths.load_manifest();
+    if dead_run(&loaded) {
+        stop_dead_run(&paths.files);
+    }
     let (mut m, mut cache, aside) = match core::rebuild_reason(&ctx.repo, &paths, name, &loaded) {
         None => match loaded {
             Loaded::Found(m) => (*m, paths.load_cache(), SetAside::Nothing),
@@ -773,6 +777,9 @@ pub fn remove_workspace(ctx: &mut Ctx, name: &str, force: bool) -> Result<bool> 
     } else {
         None
     };
+    if exists && dead_run(&paths.load_manifest()) {
+        stop_dead_run(&paths.files);
+    }
     if let (true, false) = (exists, force) {
         let kept = core::kept_dirs(&paths);
         if let Some(d) = kept.first() {
@@ -1132,6 +1139,25 @@ fn restrict(dir: &Path) -> Result<()> {
 
 // ---- the reaper ------------------------------------------------------------
 
+/// Did a run of the sandbox `loaded` describes not finish (its `vl`
+/// died, or failed, after the run started)?
+fn dead_run(loaded: &Loaded) -> bool {
+    match loaded {
+        Loaded::Found(m) => m.pending.is_some() || m.running.is_some(),
+        Loaded::Corrupt(_) => true,
+        Loaded::Missing => false,
+    }
+}
+
+/// Stop what a dead `vl` left of a confined run in `files`: the command,
+/// if `vl` was killed while `bwrap` started the sandbox, and its systemd
+/// scope (BUG-852). Only under the sandbox's lock, or for a throwaway
+/// sandbox whose owner is gone: no live run is ever touched.
+fn stop_dead_run(files: &Path) {
+    crate::confine::stop_leftovers(files);
+    crate::confine::clear_dead_scopes();
+}
+
 /// Start a reaper with `args` (after [`REAPER_ARG`]). Best effort: without
 /// it, cleanup still happens in-process, through [`sweep_stale`] and, for
 /// persistent sandboxes, at the next run.
@@ -1243,13 +1269,15 @@ pub fn reaper_main(args: Vec<std::ffi::OsString>) -> ExitCode {
     match args.as_slice() {
         [mode, dir, run] if mode == PERSISTENT_ARG => {
             let dir = Path::new(dir);
-            if is_persistent_sandbox(dir) && !injected.is_empty() {
+            if is_persistent_sandbox(dir) {
                 reap_persistent(dir, &run.to_string_lossy(), &injected);
             }
         }
         [dir] => {
             let dir = Path::new(dir);
-            if is_sandbox_path(dir) {
+            // A run that ended removed its directory itself.
+            if is_sandbox_path(dir) && std::fs::symlink_metadata(dir).is_ok() {
+                stop_dead_run(dir);
                 let _ = veil_core::vfs::remove_tree(dir);
             }
         }
@@ -1259,13 +1287,17 @@ pub fn reaper_main(args: Vec<std::ffi::OsString>) -> ExitCode {
 }
 
 /// The run `run` of the sandbox in `dir`, which injected `injected`, died
-/// (or failed): take the injected files that are unchanged out again,
-/// unless a later run has already taken the sandbox over (it cleans up
-/// itself). Nothing else is touched: the rest is the command's output, which
-/// the next run records (under the guard).
+/// (or failed): stop what it left running, then take the injected files
+/// that are unchanged out again, unless a later run has already taken the
+/// sandbox over (it cleans up itself). Nothing else is touched: the rest is
+/// the command's output, which the next run records (under the guard).
 fn reap_persistent(dir: &Path, run: &str, injected: &[core::ReaperEntry]) {
     let paths = SandboxPaths::at(dir.to_path_buf());
     let Ok(_lock) = SandboxLock::acquire(&paths.lock, || {}) else { return };
+    stop_dead_run(&paths.files);
+    if injected.is_empty() {
+        return;
+    }
     if let Loaded::Found(m) = paths.load_manifest() {
         let ours = m.running.as_deref() == Some(run) || m.pending.as_ref().is_some_and(|p| p.run == run);
         if ours && std::fs::symlink_metadata(&paths.files).is_ok_and(|md| md.is_dir()) {
@@ -1316,6 +1348,7 @@ pub fn stale_sandboxes(base: &Path) -> Vec<StaleSandbox> {
 /// Remove sandboxes of this user whose owning `vl` process is gone.
 fn sweep_stale(base: &Path) {
     for s in stale_sandboxes(base) {
+        stop_dead_run(&s.path);
         let _ = veil_core::vfs::remove_tree(&s.path);
     }
 }

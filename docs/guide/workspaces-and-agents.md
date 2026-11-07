@@ -220,9 +220,10 @@ What the command sees:
   write its configuration (a token refresh) cannot, here; a read-only
   folder still lets the command reach sockets and FIFOs in it.
 * **When the command exits, everything it started stops** (a dev server
-  too), and `kill -9` of `vl` stops it all as well (except, rarely, in the
-  instant `bwrap` starts the sandbox: BUG-852); the reaper then takes
-  injected files out as before.
+  too), and `kill -9` of `vl` stops it all as well. In the rare instant
+  `bwrap` starts the sandbox, that is left to the reaper (with injected
+  secrets or `--ephemeral`) or to the next `vl ws exec` in the workspace
+  (or `vl ws rm`); the reaper then takes injected files out as before.
 * **Ctrl-C, SIGTERM and SIGHUP** reach the command as before: the command
   has no terminal of its own (no keystrokes can be pushed into yours), so
   `vl` passes them on.
