@@ -746,6 +746,12 @@ impl Client {
         };
         self.json("POST", &self.url.project_path("/shares/remove"), Some(&req))
     }
+
+    /// A JSON request under the project (`path` from `/prs…`), for the
+    /// commands whose answers are plain JSON documents (`vl pr`, S21).
+    pub fn project_json(&self, method: &str, path: &str, body: Option<&serde_json::Value>) -> Result<serde_json::Value> {
+        self.json(method, &self.url.project_path(path), body)
+    }
 }
 
 // ---- pull ---------------------------------------------------------------------------------

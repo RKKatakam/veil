@@ -105,6 +105,9 @@ pub const SIG_CONTEXT_HUB_GRANT: &str = "hub-grant";
 /// (`hub::grant::request_message`): the grant's hash, the time and the
 /// hash of the object ids asked for.
 pub const SIG_CONTEXT_HUB_REQUEST: &str = "hub-request";
+/// Signature context: a reviewer's verdict on one revision of a PR
+/// (`hub::pr::review_message`, `docs/HUB.md` §13.24).
+pub const SIG_CONTEXT_HUB_PR_REVIEW: &str = "hub-pr-review";
 
 /// Every signature context, for the uniqueness test.
 pub const SIG_CONTEXTS: &[&str] = &[
@@ -121,6 +124,7 @@ pub const SIG_CONTEXTS: &[&str] = &[
     SIG_CONTEXT_HUB_SHARE,
     SIG_CONTEXT_HUB_GRANT,
     SIG_CONTEXT_HUB_REQUEST,
+    SIG_CONTEXT_HUB_PR_REVIEW,
 ];
 
 // ---- key rings and embargoes (keychain.rs) --------------------------------

@@ -16,6 +16,8 @@
 //!   ids unchanged (`docs/HUB.md`, S27).
 //! * [`changes`]: the messages of commits through the API
 //!   (`docs/HUB.md` §13.13).
+//! * [`pr`]: what a reviewer's device signs for a PR review
+//!   (`docs/HUB.md` §13.24).
 //!
 //! The server is the authority (`docs/VISIBILITY.md`): it decides from its
 //! own records and the accepted policy, never from labels in a snapshot.
@@ -24,5 +26,6 @@ pub mod access;
 pub mod changes;
 pub mod encoding;
 pub mod grant;
+pub mod pr;
 pub mod project;
 pub mod wire;

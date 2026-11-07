@@ -33,6 +33,7 @@ Global options (accepted by every command):
 | [`vl invite`](invite.md) | Invite a person to a group (admins): prints a one-time link to send them (Slack, email) |
 | [`vl join`](join.md) | Join a project with the link `vl invite` printed: signs this device in (registering the invited name if it is new), confirms it and joins the group |
 | [`vl access`](access.md) | Who may see a path; with WHO, give a group, a person or `public` access to it |
+| [`vl pr`](pr.md) | PRs and review on the Veil server: a PR is visible only to people who can see every file it touches; reviews are signed by this device and stop counting when the files change |
 | [`vl status`](status.md) | Show working-copy changes, local-only files and conflicts |
 | [`vl log`](log.md) | Show the snapshot graph |
 | [`vl show`](show.md) | Show a snapshot's metadata and diff |

@@ -156,6 +156,14 @@ fn parse_id(s: &str) -> Option<ObjectId> {
 /// own history (any committed snapshot for an admin). Hidden, withheld and
 /// missing revisions are all "no such revision".
 pub async fn resolve(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instant) -> Result<ObjectId> {
+    Ok(resolve_real(hub, ask, rev, deadline).await?.0)
+}
+
+/// [`resolve`], with the real snapshot the viewer's id stands for (for the
+/// server's own use: PRs record real snapshots, `prs`): the one that made
+/// it, never a change on top of it that touched only what the viewer cannot
+/// see. Never answered to anyone but an admin.
+pub async fn resolve_real(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instant) -> Result<(ObjectId, ObjectId)> {
     let vk = ask.key();
     let project = ask.project.id;
     let row_of = |id: ObjectId| {
@@ -165,7 +173,7 @@ pub async fn resolve(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instant) ->
     let real = match parse_id(rev) {
         Some(id) => {
             if let Some(r) = row_of(id).await? {
-                return if r.withheld() { Err(no_revision()) } else { Ok(id) };
+                return if r.withheld() { Err(no_revision()) } else { Ok((id, r.real)) };
             }
             let real: Option<String> = if ask.viewer.admin {
                 if id == root() {
@@ -203,7 +211,7 @@ pub async fn resolve(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instant) ->
     };
     let p = ensure(hub, &ask.project, &ask.viewer, &[real], Some(deadline)).await?[0];
     match row_of(p).await? {
-        Some(r) if !r.withheld() && (parse_id(rev).is_none() || parse_id(rev) == Some(p)) => Ok(p),
+        Some(r) if !r.withheld() && (parse_id(rev).is_none() || parse_id(rev) == Some(p)) => Ok((p, r.real)),
         _ => Err(no_revision()),
     }
 }

@@ -39,6 +39,7 @@ mod render;
 mod rewrite_cmd;
 mod sandbox;
 mod serve;
+mod pr_cmd;
 mod share_cmd;
 mod shape;
 mod team_secret;
@@ -564,6 +565,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Invite { person, to } => hub_cmd::invite(ctx, person, to)?,
         Cmd::ShareKeys => hub_cmd::share_keys(ctx)?,
         Cmd::Access { path, who } => hub_cmd::access(ctx, path, who)?,
+        Cmd::Pr(c) => pr_cmd::run(ctx, c)?,
         Cmd::Push { remote, tag, force, hooks } => {
             let name = remote.as_deref().unwrap_or("origin");
             #[cfg(debug_assertions)]

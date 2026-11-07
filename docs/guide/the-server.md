@@ -247,6 +247,56 @@ vl change new veil://127.0.0.1:8443/acme --edits edits.json -m "Bump the version
 - The same thing over HTTPS is `POST /v1/projects/{project}/changes`
   ([HUB.md §13.13](../HUB.md)).
 
+## PRs and review
+
+A PR asks for review of a stack of changes you pushed. It lives on the
+server; its title, description, comments and reviews are plain text that
+only the right people can see.
+
+```sh
+vl commit --no-advance -m "Retry failed payments"
+vl tag set retry -r @-
+vl push
+vl pr create retry --title "Retry failed payments" --body "Three tries, then give up."
+#   Created pr-4f2a9c1b
+vl pr list                                   # open PRs you may see
+vl pr show pr-4f2a9c1b --threads             # revisions, risk, review, comments
+vl pr diff pr-4f2a9c1b                       # or one change: --change CHANGE_ID
+vl pr comment pr-4f2a9c1b --path src/pay.rs --line 12 -m "Why three?"
+vl pr review pr-4f2a9c1b --approve           # signed by this device
+vl pr update pr-4f2a9c1b retry               # a new revision, after more pushes
+```
+
+- **Who sees a PR:** only people who can see **every file it touches**, in
+  every revision. If one revision touched `billing/`, people who cannot see
+  `billing/` never see the PR: not in `vl pr list`, not in a count or a
+  search, and its id answers "no such PR" for them.
+- **PR ids are random** (`pr-4f2a9c1b`), so nobody can count hidden PRs from
+  gaps.
+- **Revisions follow change ids.** Rewrite or rebase your changes, push,
+  and run `vl pr update`: the PR keeps its comments, and a comment on a line
+  moves with that line, or is marked outdated if the line changed.
+- **Risk and approvals.** Each revision is `low` (only docs, tests or
+  whitespace), `normal`, or `high` (access lines, `.veilrules`, CI
+  configuration, dependency manifests and lock files, secrets, or paths
+  your admins mark). By default low needs no approval, normal needs one,
+  and high needs one from a person (never an agent). Admins change this in
+  `.veilrules`:
+
+  ```toml
+  [review]
+  normal = { approvals = 2 }
+  high_risk_paths = ["src/auth/"]
+  ```
+
+- **An approval is for the files as they were.** Change the files and the
+  approvals stop counting. A rebase that leaves your files as they are
+  keeps them. You cannot approve your own PR. Only people who may write
+  every file of a PR review it.
+- `vl pr land` checks the review rules. Landing through the server's
+  landing service comes with that service.
+- Over HTTPS: `/v1/projects/{project}/prs…` ([HUB.md §13.24](../HUB.md)).
+
 ## Secrets
 
 - **New repositories encrypt shared secrets** (`.env`, `.env.*`, `.envrc`,
