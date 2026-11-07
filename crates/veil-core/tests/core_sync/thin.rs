@@ -448,3 +448,122 @@ fn every_site_that_reads_missing_as_hidden_is_audited() {
     audited.sort();
     assert_eq!(found, audited, "a site that reads Missing changed: review it for thin clones and update the table");
 }
+
+// ---- S3 cycle 1 review (`docs/BUGS.md`, "S3 cycle 1") --------------------
+
+/// A local commit on top of the server's old tip `T`, after a teammate's
+/// commit `Q` moved the server's tip on (pulled, checked out): the local
+/// commit's unchanged directory, evicted from the cache, is on the server
+/// under `T` at the same path. The read asks the local commit, then the
+/// server's tips (`Q`, where that path holds something else), never the
+/// local commit's own ancestors on the server, and fails with a message
+/// whose advice (`vl pull`) cannot help.
+#[test]
+#[ignore = "BUG-1144: an object met under a local commit is asked for under the server's current tips only"]
+fn s3r_a_local_commits_unchanged_directory_is_found_after_the_server_moved_on() {
+    let id = Identity::generate("alice");
+    let sfs = Arc::new(MemoryBackend::new());
+    let mut srepo = Repo::init(sfs.clone(), Some(id.clone()), "alice").unwrap();
+    let t = commit_files(&mut srepo, &*sfs, &[("src/a.txt", "a one\n"), ("doc/r.md", "readme\n")], "t");
+    let q = commit_files(&mut srepo, &*sfs, &[("src/a.txt", "a by a teammate\n")], "q");
+    let server = Arc::new(Server {
+        store: srepo.store().clone(),
+        tips: vec![q],
+        down: AtomicBool::new(false),
+        tamper: AtomicBool::new(false),
+        refuse: Mutex::new(HashSet::new()),
+        asked: Mutex::new(Vec::new()),
+        pages: Mutex::new(0),
+    });
+    let pr = Project { server: server.clone(), commits: vec![t, q], tip: t, id: id.clone() };
+    let (mut repo, fs) = thin(&pr, 1 << 30);
+    checkout(&mut repo, &fs, t);
+    let mine = commit_files(&mut repo, &*fs, &[("doc/r.md", "my readme\n")], "local work");
+    // The pull of `Q`, and a checkout of it: the local commit is no longer
+    // what the working copy pins.
+    repo.store().put_raw(&q, &server.store.get_raw(&q).unwrap()).unwrap();
+    checkout(&mut repo, &fs, q);
+    repo.store().set_cache_limit(0);
+    repo.store().trim_cache().unwrap();
+    // A fresh process.
+    let backend: Arc<dyn StorageBackend> = repo.backend().clone();
+    drop(repo);
+    let again = Repo::open(backend, Some(id), "alice").unwrap();
+    again.store().set_promisor(server.clone());
+    let e = entry(&again, &mine, "src/a.txt");
+    let got = again.store().read_entry(&e);
+    assert!(got.is_ok(), "{:?}", got.err());
+}
+
+
+/// Threat 1 past the locator's bound: an object whose place this process
+/// did not record (`LOCATOR_CAP` reached: objects met later are not
+/// recorded) is read as `Missing`, so a checkout leaves it out as hidden
+/// although the server would serve it. `promisor.rs` says such reads fail
+/// with `Unavailable`. Reading a tree this process never met stands in for
+/// one met past the bound (8,000,000 locations; a scratch run with the
+/// bound at 6 to 12 checked out 0 to 6 of 12 files and recorded the rest
+/// as hidden).
+#[test]
+#[ignore = "BUG-1142: an object without a recorded place (past LOCATOR_CAP) reads as Missing, a redaction"]
+fn s3r_an_object_without_a_recorded_place_is_never_hidden() {
+    let pr = project();
+    let (repo, _fs) = thin(&pr, 1 << 30);
+    let root = Object::decode(&pr.server.store.get_raw(&pr.tip).unwrap()).unwrap();
+    let Object::Snapshot(s) = root else { panic!("a snapshot") };
+    let err = repo.store().tree(&s.tree).unwrap_err();
+    assert!(!err.is_unreadable(), "a tree the server would serve reads as hidden: {err:?}");
+}
+
+/// `vl fsck` in a thin clone takes every object it lacks for one on the
+/// server, a note. An object of the clone's own unpushed commit is on no
+/// server: its loss is damage that fsck must report.
+#[test]
+#[ignore = "BUG-1143: fsck in a thin clone takes a lost object of unpushed work for one on the server"]
+fn s3r_fsck_in_a_thin_clone_reports_lost_local_work() {
+    let pr = project();
+    let (mut repo, fs) = thin(&pr, 1 << 30);
+    checkout(&mut repo, &fs, pr.tip);
+    let mine = commit_files(&mut repo, &*fs, &[("mine.txt", "only here, never pushed\n")], "local work");
+    let e = entry(&repo, &mine, "mine.txt");
+    assert!(repo.store().has_main(&e.id));
+    let backend: Arc<dyn StorageBackend> = repo.backend().clone();
+    let hex = e.id.hex();
+    backend.remove_file(&p(&format!(".veil/objects/{}/{}", &hex[..2], &hex[2..]))).unwrap();
+    assert!(!repo.store().has_main(&e.id), "the local file's only copy is gone");
+    drop(repo);
+    let report = veil_core::fsck::fsck(backend, Some(pr.id.clone())).unwrap();
+    let corrupt: Vec<_> = report.findings.iter().filter(|f| f.severity == veil_core::fsck::Severity::Corrupt).collect();
+    assert!(!corrupt.is_empty(), "fsck found nothing wrong: {:?}", report.findings);
+}
+
+/// After the merge of S3 onto `integration`, protocol revision 3 announces
+/// two things: S5's read grants and object routes, and S3's history pages.
+/// Each revision names one release of the server's routes: a client that
+/// sees 3 cannot tell whether `history` pages.
+#[test]
+#[ignore = "BUG-1140: protocol revision 3 announces both S5's read grants and S3's history pages"]
+fn s3r_each_protocol_revision_announces_one_thing() {
+    let src = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/hub/wire.rs")).unwrap();
+    let at = src.find("pub const REVISION: u32 = ").expect("REVISION");
+    let doc: String = src[..at]
+        .lines()
+        .rev()
+        .take_while(|l| l.trim_start().starts_with("///"))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|l| l.trim_start().trim_start_matches("///").trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let doc = doc.split_once(": ").map(|(_, d)| d.to_string()).unwrap_or(doc);
+    let mut named: Vec<u32> = doc
+        .split("; ")
+        .filter_map(|seg| seg.split(|c: char| !c.is_ascii_digit()).next().and_then(|n| n.parse().ok()))
+        .collect();
+    named.sort();
+    let mut once = named.clone();
+    once.dedup();
+    assert_eq!(named, once, "a revision is described twice: {doc}");
+    assert_eq!(once.last().copied(), Some(veil_core::hub::wire::REVISION), "{doc}");
+}

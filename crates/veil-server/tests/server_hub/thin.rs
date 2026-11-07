@@ -255,3 +255,180 @@ fn history_answers_pages() {
     let all = api.post_json(Some(&token), &format!("/v1/projects/{name}/history"), &serde_json::json!({"tips": [tip]})).frames();
     assert!(all.len() > 3);
 }
+
+// ---- S3 cycle 1 review (`docs/BUGS.md`, "S3 cycle 1") --------------------
+
+/// `vl partial full` leaves a format-8 clone holding every object its
+/// history reaches (after it, nothing is fetched and a missing object reads
+/// as hidden), even when the working copy's snapshots rebuilt a tree the
+/// server has (the widening pull does not walk a tree the main store holds)
+/// and no local snapshot reaches it any more. (S3 cycle 1 review: held.)
+#[test]
+fn partial_full_keeps_what_a_rebuilt_tree_reaches() {
+    let hub = TestHub::start();
+    let (admin, _dir, name) = project_with_history(&hub, 3, 100);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    let tip = log_ids(&admin, &thin)[1].clone();
+    // Edit a file and put it back: the working copy's snapshot builds the
+    // tip's own `data/` tree and root tree again, into the main store,
+    // while `data/f2.bin` (untouched) stays in the cache only.
+    let f0 = std::fs::read(thin.join("data/f0.bin")).unwrap();
+    admin.ok(&thin, &["status"]);
+    std::fs::write(thin.join("data/f0.bin"), b"edited\n").unwrap();
+    admin.ok(&thin, &["status"]);
+    std::fs::write(thin.join("data/f0.bin"), &f0).unwrap();
+    admin.ok(&thin, &["status"]);
+    // Then `data/` goes, pushed: no local snapshot reaches it any more.
+    std::fs::remove_dir_all(thin.join("data")).unwrap();
+    admin.commit_main(&thin, "drop data");
+    admin.ok(&thin, &["push"]);
+    admin.ok(&thin, &["partial", "full"]);
+    assert_eq!(repo_json(&thin)["format"], 8);
+    drop(hub);
+    let o = admin.run(&thin, &["fsck"]);
+    let fsck = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    // The old tip's files, as the server has them.
+    let shown = admin.run(&thin, &["cat", "-r", &tip, "data/f2.bin"]);
+    assert!(
+        shown.status.success() && o.status.success() && fsck.contains("No corruption found"),
+        "after `vl partial full`: cat {}{}\nfsck:\n{fsck}",
+        String::from_utf8_lossy(&shown.stdout),
+        String::from_utf8_lossy(&shown.stderr)
+    );
+}
+
+/// A thin clone answers `vl show` of a snapshot whose parent it does not
+/// hold yet as a full clone does (the diff against that parent), not with
+/// an error or a diff against nothing.
+#[test]
+#[ignore = "BUG-1141: `vl show` reads the parent beyond a thin clone's boundary outside `Repo::exact` and fails"]
+fn s3r_show_of_a_snapshot_whose_parent_is_beyond_the_boundary() {
+    let hub = TestHub::start();
+    let (admin, _dir, name) = project_with_history(&hub, 4, 100);
+    let full = admin.dir("full");
+    admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
+    let ids = log_ids(&admin, &full);
+    let middle = ids[3].clone();
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    let o = admin.run(&thin, &["show", &middle]);
+    let got = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(o.status.success(), "vl show in the thin clone failed:\n{got}");
+    assert_eq!(got, admin.ok(&full, &["show", &middle]));
+}
+
+/// `vl blame` in a thin clone attributes each line as in a full clone: the
+/// history it walks is paged in from the server, never cut at the boundary.
+#[test]
+#[ignore = "BUG-1141: `vl blame` in a thin clone stops at the boundary and gives every line to the tip"]
+fn s3r_blame_in_a_thin_clone_is_the_full_clones() {
+    let hub = TestHub::start();
+    let admin = hub.person("admin");
+    let name = unique("thin");
+    let dir = admin.dir("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    admin.ok(&dir, &["init"]);
+    admin.ok(&dir, &["remote", "add", "origin", &hub.url(&name)]);
+    let mut text = String::new();
+    for i in 0..4 {
+        text.push_str(&format!("line {i}\n"));
+        write_files(&dir, &[("notes.txt", &text)]);
+        admin.commit_main(&dir, &format!("line {i}"));
+    }
+    admin.ok(&dir, &["push"]);
+    let full = admin.dir("full");
+    admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    let want = admin.ok(&full, &["blame", "notes.txt", "-r", "main", "--json"]);
+    let got = admin.ok(&thin, &["blame", "notes.txt", "-r", "main", "--json"]);
+    assert_eq!(got, want);
+}
+
+/// A merge whose second parent the thin clone does not hold: `vl show`
+/// diffs it against both parents, as a full clone does, instead of taking
+/// that parent for a withheld one that contributes nothing.
+#[test]
+#[ignore = "BUG-1141: a merge's parent beyond a thin clone's boundary is taken for a withheld one: a wrong diff"]
+fn s3r_show_of_a_merge_whose_other_parent_is_beyond_the_boundary() {
+    let hub = TestHub::start();
+    let admin = hub.person("admin");
+    let name = unique("thin");
+    let dir = admin.dir("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    admin.ok(&dir, &["init"]);
+    admin.ok(&dir, &["remote", "add", "origin", &hub.url(&name)]);
+    write_files(&dir, &[("a.txt", "a\n")]);
+    admin.commit_main(&dir, "base");
+    let base = log_ids(&admin, &dir)[1].clone();
+    write_files(&dir, &[("main.txt", "main side\n")]);
+    admin.commit_main(&dir, "main side");
+    admin.ok(&dir, &["new", &base]);
+    write_files(&dir, &[("side.txt", "other side\n")]);
+    admin.ok(&dir, &["commit", "-m", "other side"]);
+    admin.ok(&dir, &["tag", "set", "side", "-r", "@-"]);
+    admin.ok(&dir, &["merge", "side", "--into", "main", "-m", "merge side"]);
+    let merge = log_ids(&admin, &dir).into_iter().find(|id| admin.ok(&dir, &["show", id]).contains("merge side")).expect("the merge");
+    admin.ok(&dir, &["tag", "set", "main", "-r", &merge, "--force"]);
+    admin.ok(&dir, &["tag", "delete", "side"]);
+    admin.ok(&dir, &["push"]);
+    let full = admin.dir("full");
+    admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    let want = admin.ok(&full, &["show", "main", "--json"]);
+    // The thin clone holds the merge's first parent (a full id is asked of
+    // the server), not the other one.
+    let first = json(&want)["parents"][0]["snapshot_id"].as_str().unwrap().to_string();
+    admin.ok(&thin, &["cat", "-r", &first, "a.txt"]);
+    let o = admin.run(&thin, &["show", "main", "--json"]);
+    let got = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(o.status.success(), "{got}");
+    assert_eq!(json(&got)["diff"], json(&want)["diff"]);
+}
+
+/// Threat 11 after the clone: checking out a branch whose files pass the
+/// cache's bound fails before the move writes anything (as the clone's
+/// refusal does), or keeps the cache under its bound; never a cache filled
+/// past it (here 204 KiB of a 100 KiB bound: the fetch-ahead charges each
+/// object before its batch is on disk, and the eviction it triggers counts
+/// only what is on disk).
+#[test]
+#[ignore = "BUG-1145: a checkout's fetch-ahead is not charged against the cache bound until its batch is written"]
+fn s3r_a_checkout_past_the_cache_bound_fails_before_writing() {
+    let hub = TestHub::start();
+    let (admin, dir, name) = project_with_history(&hub, 0, 0);
+    // Branch `big`: 400 KB of files; `main` stays small.
+    admin.ok(&dir, &["new", "main"]);
+    // Content that does not compress: 20 files of 20 KB.
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for i in 0..20 {
+        let mut text = String::new();
+        while text.len() < 20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            text.push_str(&format!("{x:016x}"));
+        }
+        write_files(&dir, &[(&format!("big/f{i:02}.bin"), &text)]);
+    }
+    admin.ok(&dir, &["commit", "-m", "big"]);
+    admin.ok(&dir, &["tag", "set", "big", "-r", "@-"]);
+    let first = log_ids(&admin, &dir)[2].clone();
+    admin.ok(&dir, &["tag", "set", "main", "-r", &first, "--force"]);
+    admin.ok(&dir, &["push"]);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", "--cache-size", "100K", &hub.url(&name), thin.to_str().unwrap()]);
+    let o = admin.run(&thin, &["new", "big"]);
+    let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let st = std::fs::read_to_string(thin.join(".veil/local/checkout.json")).unwrap();
+    let written = (0..20).filter(|i| thin.join(format!("big/f{i:02}.bin")).exists()).count();
+    if o.status.success() {
+        let cache = du(&thin.join(".veil/cache"));
+        assert!(written == 20 && cache <= 100 * 1024 + 64 * 1024, "the checkout left {cache} bytes in a cache bounded at 100 KiB:\n{out}");
+    } else {
+        assert!(!st.contains("pending") && written == 0, "a failed checkout wrote {written} of 20 files and left {st}:\n{out}");
+    }
+    admin.ok(&thin, &["status"]);
+}
