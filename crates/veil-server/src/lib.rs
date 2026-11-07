@@ -7,12 +7,14 @@
 //! | [`auth`] | challenge-response sign-in, session tokens |
 //! | [`perm`] | the permission model: admins, groups, the accepted policy |
 //! | [`sync`] | projected history, fetch by id, push validation, branch CAS |
+//! | [`changes`] | commits through the API: edits on a revision, the push's checks, one commit |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
 //! | [`store`] | object storage: local directory or S3 |
 //! | [`tls`] | TLS configuration |
 
 pub mod api;
 pub mod auth;
+pub mod changes;
 pub mod db;
 pub mod error;
 pub mod perm;

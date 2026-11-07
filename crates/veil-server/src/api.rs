@@ -46,6 +46,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/fetch", post(fetch))
         .route("/v1/projects/{p}/objects", post(objects).layer(DefaultBodyLimit::max(crate::db::body_limit("/objects"))))
         .route("/v1/projects/{p}/push", post(push))
+        .route("/v1/projects/{p}/changes", post(changes))
         .route("/v1/projects/{p}/access", get(access))
         .route("/v1/projects/{p}/groups", get(list_groups))
         .route("/v1/projects/{p}/groups/{g}", post(create_group).delete(delete_group))
@@ -581,6 +582,18 @@ async fn push(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>
     let me = caller.signed_in()?.id;
     let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
     Ok(Json(sync::push(&hub, &project, &viewer, me, req).await?))
+}
+
+/// A commit through the API (`changes`).
+async fn changes(
+    State(hub): State<HubState>,
+    caller: Caller,
+    Path(p): Path<String>,
+    Json(req): Json<veil_core::hub::changes::ChangeRequest>,
+) -> Result<Json<veil_core::hub::changes::ChangeResult>> {
+    let me = caller.signed_in()?.clone();
+    let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
+    Ok(Json(crate::changes::create(&hub, &project, &viewer, &me, req).await?))
 }
 
 #[derive(Deserialize)]

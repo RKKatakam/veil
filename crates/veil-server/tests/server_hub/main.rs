@@ -13,6 +13,7 @@
 mod support;
 
 mod auth;
+mod changes;
 mod concurrency;
 mod escalation;
 mod leaks;

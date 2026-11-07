@@ -253,35 +253,7 @@ async fn projected_inner(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, rea
                 policy,
                 bindings,
             };
-            let view = p.view(&viewer2);
-            let mut pr = Projector::new(src, &view);
-            let ptree = pr.root(s.tree)?;
-            // A change of what the viewer cannot see only: not in their history.
-            if pparents.len() == 1 && !s.parents.is_empty() {
-                let pp = src.snapshot(&pparents[0])?;
-                let real_changed = s.parents.len() > 1 || src.snapshot(&s.parents[0])?.tree != s.tree;
-                if pp.tree == ptree && real_changed {
-                    return Ok((pparents[0], None));
-                }
-            }
-            let view_read = |p: &str| view.read(p);
-            let mut u = without_signature(&s);
-            u.tree = ptree;
-            u.parents = pparents;
-            u.predecessors = ppreds;
-            u.conflicts.retain(|c| view_read(c));
-            if u == without_signature(&s) {
-                return Ok((x, None));
-            }
-            if let Some(o) = origin {
-                let n = src.snapshot(&o)?;
-                if without_signature(&n) == u {
-                    return Ok((o, None));
-                }
-            }
-            u.sign(&hub2.identity);
-            let raw = Object::Snapshot(u).encode();
-            Ok((ObjectId::hash(&raw), Some(Bytes::from(raw))))
+            project_one(src, &p.view(&viewer2), x, &s, pparents, ppreds, origin, &hub2.identity)
         })
         .await?;
         if let Some(raw) = new_obj {
@@ -301,6 +273,53 @@ async fn projected_inner(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, rea
         done.insert(x, result);
     }
     Ok(done[&real])
+}
+
+/// The projection of real snapshot `s` (id `x`) for a viewer of `view`,
+/// given the projections of its parents (`pparents`) and predecessors
+/// (`ppreds`) and the pusher's own snapshot it was completed from
+/// (`origin`): its id, and the object to store when the server signed a
+/// new one (the module docs). Pure: [`projected`] memoises the answer, and
+/// a commit through the API (`changes`) records it in its own transaction.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn project_one(
+    src: &Source,
+    view: &View,
+    x: ObjectId,
+    s: &Snapshot,
+    pparents: Vec<ObjectId>,
+    ppreds: Vec<ObjectId>,
+    origin: Option<ObjectId>,
+    identity: &veil_core::Identity,
+) -> Result<(ObjectId, Option<Bytes>)> {
+    let mut pr = Projector::new(src, view);
+    let ptree = pr.root(s.tree)?;
+    // A change of what the viewer cannot see only: not in their history.
+    if pparents.len() == 1 && !s.parents.is_empty() {
+        let pp = src.snapshot(&pparents[0])?;
+        let real_changed = s.parents.len() > 1 || src.snapshot(&s.parents[0])?.tree != s.tree;
+        if pp.tree == ptree && real_changed {
+            return Ok((pparents[0], None));
+        }
+    }
+    let view_read = |p: &str| view.read(p);
+    let mut u = without_signature(s);
+    u.tree = ptree;
+    u.parents = pparents;
+    u.predecessors = ppreds;
+    u.conflicts.retain(|c| view_read(c));
+    if u == without_signature(s) {
+        return Ok((x, None));
+    }
+    if let Some(o) = origin {
+        let n = src.snapshot(&o)?;
+        if without_signature(&n) == u {
+            return Ok((o, None));
+        }
+    }
+    u.sign(identity);
+    let raw = Object::Snapshot(u).encode();
+    Ok((ObjectId::hash(&raw), Some(Bytes::from(raw))))
 }
 
 /// The real snapshots a snapshot id the client names may stand for: itself
@@ -601,43 +620,56 @@ fn check_changes(
         if matches!(e.visibility, Visibility::Embargoed { .. }) || e.fallback.is_some() && !matches!(e.visibility, Visibility::Cloaked { .. }) {
             return Err(Error::forbidden(format!("'{}': embargoed content cannot be pushed to the server yet", c.path)));
         }
-        if !e.kind.holds_blob() {
-            continue;
-        }
+        // The content to check: a file's or link's blob, or each term of a
+        // conflict, with its label (BUG-931).
+        let contents: Vec<(ObjectId, Visibility, Option<ObjectId>)> = match e.kind {
+            k if k.holds_blob() => vec![(e.id, e.visibility.clone(), None)],
+            EntryKind::Conflict => match Object::decode(&src.raw(&e.id)?)? {
+                Object::Conflict(cf) => cf.adds.iter().chain(&cf.removes).flatten().map(|t| (t.id, t.visibility.clone(), t.fallback)).collect(),
+                _ => return Err(Error::bad_request(format!("'{}': a conflict entry names something else", c.path))),
+            },
+            _ => continue,
+        };
         let vp = VPath::new(&c.path).map_err(|_| Error::bad_request(format!("invalid path '{}'", c.path)))?;
-        let raw = src.raw(&e.id)?;
-        let sealed = Object::sealed_scope(&raw).is_some();
         let class = policy.classify(&vp, false);
-        match class.tier {
-            Tier::Isolated | Tier::Ignored => {
-                return Err(Error::forbidden(format!(
-                    "'{}' stays on the device by the project's policy (a secret or ignored file)",
-                    c.path
-                )))
-            }
-            Tier::Cloaked(_) if !sealed || !matches!(e.visibility, Visibility::Cloaked { .. }) => {
-                return Err(Error::forbidden(format!("'{}' is a secret and must arrive encrypted", c.path)))
-            }
-            _ => {}
-        }
-        // A sealed object under a plain label (or the reverse) is malformed.
-        if sealed != matches!(e.visibility, Visibility::Cloaked { .. }) {
-            return Err(Error::bad_request(format!("'{}': the entry's label does not match its object", c.path)));
-        }
-        // Check 9: the secret scan of every new plain-text file, as `vl`
-        // scans before it records one. `public!` turns it off only where
-        // the accepted policy (an admin's) says so, or an admin's own
-        // change does: anyone may turn `public` into `public!`, which is
-        // the same access. Findings name the rule and line, never the text.
+        // Check 9 (below) is off only where `public!` says so in the
+        // accepted policy (an admin's), or in an admin's own change: anyone
+        // may turn `public` into `public!`, which is the same access.
         let unscanned = class.allow_secrets && (admin || accepted.classify(&vp, false).allow_secrets);
-        if !sealed && !unscanned {
-            if let Object::Blob(data) = Object::decode(&raw)? {
-                if let Some(f) = veil_core::secrets::scan(&data).first() {
+        for (id, visibility, fallback) in contents {
+            if matches!(visibility, Visibility::Embargoed { .. }) || fallback.is_some() && !matches!(visibility, Visibility::Cloaked { .. }) {
+                return Err(Error::forbidden(format!("'{}': embargoed content cannot be pushed to the server yet", c.path)));
+            }
+            let raw = src.raw(&id)?;
+            let sealed = Object::sealed_scope(&raw).is_some();
+            match class.tier {
+                Tier::Isolated | Tier::Ignored => {
                     return Err(Error::forbidden(format!(
-                        "'{}' looks like it holds a secret ({}, line {}): put secrets in a secret file such as .env, \
-                         which Veil encrypts",
-                        c.path, f.rule, f.line
-                    )));
+                        "'{}' stays on the device by the project's policy (a secret or ignored file)",
+                        c.path
+                    )))
+                }
+                Tier::Cloaked(_) if !sealed || !matches!(visibility, Visibility::Cloaked { .. }) => {
+                    return Err(Error::forbidden(format!("'{}' is a secret and must arrive encrypted", c.path)))
+                }
+                _ => {}
+            }
+            // A sealed object under a plain label (or the reverse) is malformed.
+            if sealed != matches!(visibility, Visibility::Cloaked { .. }) {
+                return Err(Error::bad_request(format!("'{}': the entry's label does not match its object", c.path)));
+            }
+            // Check 9: the secret scan of every new plain-text file, as `vl`
+            // scans before it records one. Findings name the rule and the
+            // line, never the text.
+            if !sealed && !unscanned {
+                if let Object::Blob(data) = Object::decode(&raw)? {
+                    if let Some(f) = veil_core::secrets::scan(&data).first() {
+                        return Err(Error::forbidden(format!(
+                            "'{}' looks like it holds a secret ({}, line {}): put secrets in a secret file such as .env, \
+                             which Veil encrypts",
+                            c.path, f.rule, f.line
+                        )));
+                    }
                 }
             }
         }

@@ -159,7 +159,7 @@ mod tests {
         assert_eq!(r.edits.len(), 2);
         assert_eq!(r.onto.as_ref().unwrap().expected, Expected::Rebase);
         let back: ChangeRequest = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
-        assert_eq!(back.edits[1].delete, true);
+        assert!(back.edits[1].delete);
         let tip = format!(r#"{{"branch":"main","expected":"{}"}}"#, id.hex());
         assert_eq!(serde_json::from_str::<Onto>(&tip).unwrap().expected, Expected::Tip(id));
         assert!(serde_json::from_str::<Onto>(r#"{"branch":"main","expected":"nope"}"#).is_err());
