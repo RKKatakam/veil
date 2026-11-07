@@ -1838,8 +1838,11 @@ A workspace is only a named pointer in the view. It owns no directory.
      so they stop the command, not the recording. **On Linux the command
      is confined** (`confine.rs`, `docs/design/scale/9-confinement.md`):
      `bwrap` binds the sandbox at the project's canonical path, the
-     system read-only, an empty tmpfs `HOME` and `/tmp`, a read-only
-     allow-list, and a tmpfs over the Veil home (and over the Veil home
+     system read-only, an empty tmpfs `HOME` and `/tmp`, the allow-list
+     through overlays whose upper layers are the workspace's own
+     (`.veil/local/sandboxes/<ws>/layers`, thrown away with
+     `--ephemeral` or `--with-isolated`; the real folders are never
+     written, BUG-1025), and a tmpfs over the Veil home (and over the Veil home
      and the project under every other name an allowed link gives them,
      BUG-848), in new user, pid, IPC and UTS namespaces
      (`--disable-userns`, `--die-with-parent`, `--new-session`; `vl` arms
@@ -3815,7 +3818,7 @@ afterwards; textconv input on stdin, output never stored.
 * people outside a folder's access, including others in the same project, and members after they are removed;
 * anything that arrives by push, pull, fetch or merge: trees, names, descriptions, policies, hooks and metadata;
 * the network, and other OS users on the same machine;
-* **a command confined by `vl ws exec`** (Linux, `docs/design/scale/9-confinement.md`; owner, 2026-11-06). It runs as the person, but for files it is outside the trust boundary: it cannot read the person's private files (keys, the rest of the home, the Veil identity, the real repository and other workspaces' sandboxes) or write outside its sandbox, and the files it leaves are untrusted input to `vl`. By the owner's choice it gets the environment variables, and the network unless `--no-network`; what it is given (the environment, injected secrets, the read-only allow-list) it can use and send anywhere. An unconfined run (`--unconfined`, or `vl bisect run`) is the person's own deliberate command.
+* **a command confined by `vl ws exec`** (Linux, `docs/design/scale/9-confinement.md`; owner, 2026-11-06). It runs as the person, but for files it is outside the trust boundary: it cannot read the person's private files (keys, the rest of the home, the Veil identity, the real repository and other workspaces' sandboxes) or write outside its sandbox, and the files it leaves are untrusted input to `vl`. By the owner's choice it gets the environment variables, and the network unless `--no-network`; what it is given (the environment, injected secrets, the allow-list) it can use and send anywhere; what it writes to the allow-list stays in its workspace's layers, read by that workspace's later confined runs only. An unconfined run (`--unconfined`, or `vl bisect run`) is the person's own deliberate command.
 
 **Today's client** (before the server) syncs with plain-file remotes, so for now:
 
