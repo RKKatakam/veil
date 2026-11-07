@@ -2330,6 +2330,16 @@ MiB** client peak, 0.43 GB in `.veil`; full clone 67.1 s, 457 MiB; `log -n
 page history in, and the fetch-ahead's byte-bounded batches, cost nothing
 measurable on these cases.
 
+After review cycle 2 (BUG-1146..1149, 1260 fixed; the clone path now notes
+the files of cache packs): the same profile ran at load 96 (the quiet wait
+ran out), and every case slowed with it (initial push 384 s against 222,
+full clone 105 s against 67): thin clone 13.6 s, **332 MiB**; `log -n 20`
+11.3 s; `status` 31.3, 0.68, 0.47 s. Back to back on one machine at load 40
+to 70, thin and full clones of a 35,000-file project (31 snapshots) are
+alike: `status` 0.65, 0.21, 0.04 s (thin) and 0.64, 0.17, 0.05 s (full);
+clone 1.56 and 1.22 s, 140 and 132 MiB. Nothing on the clone path costs
+measurably more; the 1 GB numbers are to be taken again on a quiet machine.
+
 * A thin clone's time and memory follow what it checks out (the tip's
   35,000 files), not the history: it holds 2 snapshots of 10,022.
 * The first `vl status` after a clone re-reads the files written within
