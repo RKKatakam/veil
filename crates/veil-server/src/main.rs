@@ -6,7 +6,8 @@
 //!             [--tls-cert cert.pem --tls-key key.pem]   (default: self-signed)
 //! veil-server migrate --database-url postgres://…   (apply migrations, then exit)
 //! veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
-//!             [--listen 127.0.0.1:8444] [--size 10G] [--memory 256M] [--upstream-ca PEM]
+//!             [--listen 127.0.0.1:8444] [--size 10G] [--memory 256M] [--max-connections 1024]
+//!             [--upstream-ca PEM]
 //!             (a regional cache: docs/HUB.md §13.18)
 //! ```
 //!
@@ -94,6 +95,11 @@ enum Command {
         /// objects being read (K, M, G suffixes).
         #[arg(long, default_value = "256M", value_parser = bytes)]
         memory: u64,
+        /// Most client connections open at once (the next waits until one
+        /// closes): each may hold about 128 KiB beyond --memory, so the
+        /// defaults bound the cache at about 384 MiB.
+        #[arg(long, default_value_t = 1024)]
+        max_connections: usize,
         /// TLS certificate chain (PEM); without it, a self-signed certificate.
         #[arg(long, requires = "tls_key")]
         tls_cert: Option<PathBuf>,
@@ -152,7 +158,7 @@ async fn serve() -> anyhow::Result<()> {
         println!("veil-server: the database schema is current");
         return Ok(());
     }
-    if let Some(Command::Cache { upstream, upstream_ca, token_file, dir, listen, size, memory, tls_cert, tls_key }) = a.command {
+    if let Some(Command::Cache { upstream, upstream_ca, token_file, dir, listen, size, memory, max_connections, tls_cert, tls_key }) = a.command {
         return cache(veil_server::cache::Config {
             listen,
             upstream,
@@ -165,6 +171,7 @@ async fn serve() -> anyhow::Result<()> {
             },
             size,
             memory,
+            max_connections,
         })
         .await;
     }

@@ -2211,7 +2211,7 @@ side); `veil-server cache` in `main.rs`. Touched elsewhere, minimally:
 ```text
 veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
                   [--listen 127.0.0.1:8444] [--size 10G] [--memory 256M]
-                  [--upstream-ca PEM] [--tls-cert C --tls-key K]
+                  [--max-connections 1024] [--upstream-ca PEM] [--tls-cert C --tls-key K]
 ```
 
 * **What it answers.** S5's object routes only, as the server answers
@@ -2237,15 +2237,24 @@ veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
   feed, an epoch other than the grant's), a tree of the chain or the object
   not in the store. A batch is forwarded once, with `skip` naming the
   objects the cache sends itself (unsigned: it only makes the answer
-  smaller), and the answer merges both in the request's order. What the
+  smaller; optional, so no protocol revision: a server that does not know
+  it sends everything, and the cache drops what it already sent), and the
+  answer merges both in the request's order. An id wanted again after a
+  want only the server can decide sends the whole batch to the server,
+  answered unchanged, since where the server places it depends on which of
+  its wants the server allows (BUG-1182). What the
   server sends is kept (whole objects of at most 16 MiB, each checked
   against its id). A refusal from the server is passed on as it is; a
   server the cache cannot reach is `503 unavailable`. **Concurrent misses are
-  coalesced:** a request fetching objects from the server marks them in
-  flight (at most 65,536 at once), and a later request needing one of them
-  waits for that fetch (at most 2 s), then decides again from the store, so
-  every agent reading a new tree after a landing costs the server one
-  request (tested: 24 readers at once, 1 request). A local object lost
+  coalesced:** a request fetching objects whose chain checked and that the
+  store keeps (at most 16 MiB) marks them in flight (at most 256 a request,
+  65,536 in all), and a later request needing one of them waits for that
+  fetch (at most 2 s), then decides again from the store, so every agent
+  reading a new tree after a landing costs the server one request (tested:
+  24 readers at once, 1 request). A mark is let go once its object is kept,
+  all of them once the server's answer has passed, and all of them before
+  the request waits for its client or the budget: a client that stalls
+  holds none (BUG-1180). A local object lost
   between the check and the read (evicted, damaged) is left out of a batch
   (the client asks again; the cache, which removed it, then asks the
   server).
@@ -2281,10 +2290,23 @@ veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
   against its id when written and each time it is read: one that does not
   match is removed and read as absent. A restart keeps the store.
 * **Memory** (`--memory`, default 256 MiB): a quarter for decoded trees, a
-  quarter for the store's index (128 bytes an object), half for objects
-  being read for answers (a semaphore across requests). Answers are
-  streamed in chunks of 256 KiB; a server's answer is passed on as it
-  arrives, holding at most the object being kept.
+  quarter for the store's index (128 bytes an object), half for answers
+  (BUG-1181): every chunk of every answer (from the store, passed on from
+  the server, an error) and every object being kept takes its share of it,
+  and the share travels inside the bytes handed to the connection
+  (`Bytes::from_owner`), given back only once they are written. Answers go
+  out in 64 KiB slices, and an answer waits for the budget only after
+  sending what it holds, so answers never wait on each other in a cycle; a
+  `GET` from the store sends its head at once and its bytes once its share
+  is free. **Outside it, per connection:** the HTTP layer's write buffer
+  (64 KiB; the cache speaks HTTP/1.1 only, since HTTP/2 keeps a send buffer
+  per stream) and one slice, about 128 KiB; at most `--max-connections`
+  (default 1,024) are open, the next waiting in the listener's queue, and a
+  write pending for 30 s closes its connection. **So the cache holds at most
+  `--memory` + 128 KiB × `--max-connections`: about 384 MiB with the
+  defaults,** besides its fixed costs and the kernel's socket buffers.
+* **Only `https://` upstreams:** the caches' token and the grant key never
+  cross the network in clear; any other `--upstream` is refused at start.
 * **Counters:** `SIGUSR1` writes `DIR/stats.json` (requests, objects from
   the store and from the server, refusals, requests forwarded and why,
   polls), for `veil-bench load --mode objects --via server,cache`
@@ -2333,6 +2355,10 @@ milestone's):
 | 10 | — (a cache that loses an object) | an object evicted or damaged between check and read | left out of a batch; the client asks again and the server sends it | `the_cache_store_keeps_to_its_size` (a 64 KiB store under 200 files of 4 KiB) |
 | 11 | A compromised regional cache | reads what it stores, serves it to anyone | plain-text code, as the server holds it (inside its boundary, design §4.1; `ARCHITECTURE.md` "Threat model"): as trusted as the object store; secret files only as ciphertext; it cannot sign a grant | the store holds no plaintext of `billing/.env` (test 1) |
 | 12 | — (load) | every agent reads a new tree after a landing | one request to the server per object, not one per reader | `concurrent_readers_of_a_new_object_cost_the_server_one_request` |
+| 13 | Anyone on Earth | stalls many answers (a 15 MiB public object, 16 clients that never read); opens many connections | the budget holds: 2 answers read at a time at `--memory 64M`; connections past `--max-connections` wait | `s9_adversarial::bug_1181_…`, `connections_past_the_cap_wait_for_one_to_close` |
+| 14 | Anyone on Earth | fills the in-flight marks (a 70,000-want batch, a 17 MiB object, a client that never reads) | nothing marked that no one can use; coalescing holds for others | `s9_adversarial::bug_1180_…` (both) |
+| 15 | Anyone | a batch naming an id twice, through a tree the cache lacks and then held ones; random batches over random caches | the server's answer, byte for byte | `s9_adversarial::bug_1182_…`, `…::the_caches_answers_are_the_servers_byte_for_byte` |
+| 16 | An operator's mistake | `--upstream http://…` | refused at start | `cache::tests::an_upstream_that_is_not_https_is_refused` |
 
 **Residual:** the cache answers a request it can decide faster than one it
 forwards, so timing tells whether trees and objects the asker may read are

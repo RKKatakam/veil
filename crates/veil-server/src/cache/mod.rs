@@ -29,6 +29,7 @@
 //! * **Bounded:** the store by `--size` bytes; memory by `--memory` (the
 //!   decoded trees, the store's index, and objects being read for answers).
 
+pub(crate) mod deadline;
 pub mod disk;
 pub mod epochs;
 pub mod feed;
@@ -75,12 +76,21 @@ use crate::{
 pub const MAX_OBJECT: u64 = 16 << 20;
 /// Bytes of an answer gathered before they are sent.
 const CHUNK: usize = 256 << 10;
+/// The slices an answer is handed to the connection in, and the size of
+/// each connection's write buffer: a connection holds about two of them
+/// outside `--memory` (BUG-1181).
+const SLICE: usize = 64 << 10;
 /// How long a poll of the feed may take.
 const POLL_TIMEOUT: Duration = Duration::from_secs(3);
 /// Most objects being fetched from the server at once that later requests
 /// can wait on, and how long they wait.
 const MAX_FLIGHTS: usize = 1 << 16;
 const FLIGHT_WAIT: Duration = Duration::from_secs(2);
+/// Most objects one request marks in flight.
+const MAX_MARKS: usize = 256;
+/// How long a write to a client may stay pending before its connection is
+/// closed (BUG-1181).
+const WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
 pub struct Config {
     pub listen: SocketAddr,
@@ -97,6 +107,10 @@ pub struct Config {
     pub size: u64,
     /// About the most memory it holds beyond its fixed costs.
     pub memory: u64,
+    /// Most connections open at once; the next waits until one closes.
+    /// Each may hold the HTTP layer's write buffer and one slice of an
+    /// answer (64 KiB each) outside `memory`.
+    pub max_connections: usize,
 }
 
 /// What the cache did, for its operator and the benchmarks.
@@ -130,8 +144,9 @@ pub struct Cache {
     /// Decoded trees, by the store's key.
     trees: LruCache<Arc<Tree>>,
     pub epochs: epochs::Tracker,
-    /// KiB of objects being read for answers, across every request.
-    budget: tokio::sync::Semaphore,
+    /// KiB of answers being read or sent, across every request: held by
+    /// each chunk until its connection takes it (BUG-1181).
+    budget: Arc<tokio::sync::Semaphore>,
     budget_kib: u32,
     /// Objects a request is fetching from the server, by the store's key:
     /// a later request for one waits for it (closed when it is done)
@@ -140,11 +155,24 @@ pub struct Cache {
     pub stats: Stats,
 }
 
-/// The objects one request is fetching for others to wait on: done when
-/// dropped (its answer finished, kept or not).
+/// The objects one request is fetching for others to wait on. A mark is
+/// let go when its object is kept ([`Flight::done`]), and every mark when
+/// the flight is dropped: once the server's answer has passed, or before
+/// the request waits for its client or the budget (BUG-1180).
 struct Flight {
     cache: Arc<Cache>,
     keys: Vec<[u8; 32]>,
+}
+
+impl Flight {
+    fn done(&mut self, key: &[u8; 32]) {
+        if let Some(i) = self.keys.iter().position(|k| k == key) {
+            self.keys.swap_remove(i);
+            if let Some(s) = self.cache.flights.lock().unwrap().remove(key) {
+                s.close();
+            }
+        }
+    }
 }
 
 impl Drop for Flight {
@@ -177,6 +205,8 @@ impl Running {
 /// Start the cache: open its store, start polling the server's feed, and
 /// serve.
 pub async fn start(c: Config) -> anyhow::Result<Running> {
+    // The caches' token and the grant key never cross the network in clear.
+    anyhow::ensure!(c.upstream.starts_with("https://"), "the upstream server must be an https:// URL (given: {})", c.upstream);
     std::fs::create_dir_all(&c.dir)?;
     let (tls, cert_pem, _) = crate::tls::server_config(&c.tls, &c.dir)?;
     let mut b = reqwest::Client::builder()
@@ -199,7 +229,7 @@ pub async fn start(c: Config) -> anyhow::Result<Running> {
         store,
         trees: LruCache::new(quarter as usize),
         epochs: epochs::Tracker::default(),
-        budget: tokio::sync::Semaphore::new(budget_kib as usize),
+        budget: Arc::new(tokio::sync::Semaphore::new(budget_kib as usize)),
         budget_kib,
         flights: Default::default(),
         stats: Stats::default(),
@@ -213,7 +243,8 @@ pub async fn start(c: Config) -> anyhow::Result<Running> {
         .layer(DefaultBodyLimit::max(crate::db::body_limit("")))
         .with_state(cache.clone());
     tokio::spawn(poll(cache.clone(), rx.clone()));
-    let task = tokio::spawn(crate::serve_tls(listener, tls, app, rx));
+    let limits = crate::ConnectionLimits { write_deadline: WRITE_DEADLINE, max_connections: c.max_connections, buffer: SLICE };
+    let task = tokio::spawn(crate::serve_tls(listener, tls, app, rx, Some(limits)));
     Ok(Running {
         addr,
         cert_pem,
@@ -297,11 +328,21 @@ enum Decision {
     Invalid,
     /// Only the server can say (the grant key or the epochs not confirmed).
     Forward,
-    /// The answer's plan, in the request's order: each object the store
-    /// serves (with its size), once, and each want only the server can
-    /// decide (`None`: a tree of its chain, or the object, not held).
-    /// A want in neither is refused.
-    Checked(Vec<(ObjectId, Option<u64>)>),
+    /// The answer's plan, in the request's order, each id once. A want in
+    /// it is refused.
+    Checked(Vec<(ObjectId, Plan)>),
+}
+
+/// What the cache plans for one object of a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Plan {
+    /// Its chain checked and the store holds it (its size).
+    Local(u64),
+    /// Its chain checked, the store does not hold it: the server sends it
+    /// (the size its entry records).
+    Fetch(u64),
+    /// Only the server can say: a tree of its chain is not held.
+    Unknown,
 }
 
 /// The store, as a chain check reads it: trees decoded once (in
@@ -396,20 +437,26 @@ async fn decide(
             if skip.contains(id) || local.contains(id) {
                 continue;
             }
-            let held = match chains.check(chain, id) {
-                Ok(Some(_)) => crate::sync::builtin(id).map(|b| b.len() as u64).or_else(|| cache.store.has(&project, id)),
+            // Wanted again after a want only the server decides: where the
+            // server sends it depends on which of its wants the server
+            // allows, so the server answers it all (BUG-1182).
+            if up.contains(id) {
+                return Decision::Forward;
+            }
+            let p = match chains.check(chain, id) {
+                Ok(Some(size)) => match crate::sync::builtin(id).map(|b| b.len() as u64).or_else(|| cache.store.has(&project, id)) {
+                    Some(held) => Plan::Local(held),
+                    None => Plan::Fetch(size),
+                },
                 // Refused: final only if everything it read was held.
                 Ok(None) if !src.missed.get() => continue,
-                Ok(None) | Err(_) => None,
+                Ok(None) | Err(_) => Plan::Unknown,
             };
-            match held {
-                Some(size) => {
-                    local.insert(*id);
-                    plan.push((*id, Some(size)));
-                }
-                None if up.insert(*id) => plan.push((*id, None)),
-                None => {}
-            }
+            match p {
+                Plan::Local(_) => local.insert(*id),
+                _ => up.insert(*id),
+            };
+            plan.push((*id, p));
         }
         Decision::Checked(plan)
     })
@@ -417,9 +464,10 @@ async fn decide(
     checked.unwrap_or(Decision::Forward)
 }
 
-/// [`decide`], then, for the objects only the server can give: the request
-/// fetches those nobody else is fetching (the [`Flight`] it holds until its
-/// answer is done), and first waits, at most [`FLIGHT_WAIT`], for those
+/// [`decide`], then, for the objects the server must send whose chains
+/// checked: the request marks those nobody else is fetching (the
+/// [`Flight`] it holds while it reads them from the server, at most
+/// [`MAX_MARKS`]), and first waits, at most [`FLIGHT_WAIT`], for those
 /// another request is fetching, then decides again. So many readers of a
 /// new object (a tree after each landing) cost the server one request, not
 /// one each.
@@ -437,11 +485,14 @@ async fn decide_joined(
     let (mut mine, mut others) = (Vec::new(), Vec::new());
     {
         let mut f = cache.flights.lock().unwrap();
-        for (id, _) in plan.iter().filter(|p| p.1.is_none()) {
+        // Only objects whose chain checked and that the store will keep
+        // (BUG-1180): a fetch of anything else helps no one.
+        let fetch = plan.iter().filter(|p| matches!(p.1, Plan::Fetch(size) if size <= cache.store.max_object));
+        for (id, _) in fetch {
             let k = disk::key(project, id);
             match f.get(&k) {
                 Some(s) => others.push(s.clone()),
-                None if f.len() < MAX_FLIGHTS => {
+                None if f.len() < MAX_FLIGHTS && mine.len() < MAX_MARKS => {
                     f.insert(k, Arc::new(tokio::sync::Semaphore::new(0)));
                     mine.push(k);
                 }
@@ -466,9 +517,12 @@ async fn decide_joined(
 
 // ---- answers -----------------------------------------------------------------------------------
 
+/// A chunk of an answer.
+type Item = std::io::Result<Bytes>;
+
 /// A body sent as it is produced; an error ends it unfinished, so it is
 /// never taken as whole.
-struct Chunks(tokio::sync::mpsc::Receiver<std::io::Result<Bytes>>);
+struct Chunks(tokio::sync::mpsc::Receiver<Item>);
 
 impl hyper::body::Body for Chunks {
     type Data = Bytes;
@@ -482,7 +536,23 @@ impl hyper::body::Body for Chunks {
     }
 }
 
-type Tx = tokio::sync::mpsc::Sender<std::io::Result<Bytes>>;
+fn body(rx: tokio::sync::mpsc::Receiver<Item>) -> axum::body::Body {
+    axum::body::Body::new(Chunks(rx))
+}
+
+/// A chunk's bytes with their share of the budget, given back only when
+/// the connection lets go of the bytes, that is, once they are written
+/// (BUG-1181).
+struct Held {
+    bytes: Vec<u8>,
+    _share: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl AsRef<[u8]> for Held {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
 
 fn unavailable() -> Error {
     Error::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable", "the cache cannot reach the Veil server; try again")
@@ -491,6 +561,107 @@ fn unavailable() -> Error {
 fn broken(what: &str) -> std::io::Error {
     eprintln!("veil-server cache: an answer stopped: {what}");
     std::io::Error::other("the answer stopped")
+}
+
+/// An answer being sent: bytes gathered with their share of the budget,
+/// and sent with it. **It never waits holding marks:** before it waits for
+/// its client or for the budget, it lets go of its [`Flight`], so a client
+/// that does not read never holds up other readers (BUG-1180). And it waits
+/// for the budget only after sending what it holds, so answers never wait
+/// on each other in a cycle.
+struct Out {
+    cache: Arc<Cache>,
+    tx: tokio::sync::mpsc::Sender<Item>,
+    buf: Vec<u8>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Out {
+    fn new(cache: Arc<Cache>) -> (Out, tokio::sync::mpsc::Receiver<Item>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        (Out { cache, tx, buf: Vec::new(), permit: None }, rx)
+    }
+
+    fn take(&mut self, p: tokio::sync::OwnedSemaphorePermit) {
+        match &mut self.permit {
+            Some(q) => q.merge(p),
+            None => self.permit = Some(p),
+        }
+    }
+
+    /// The budget's share for `size` more bytes, if it is free now.
+    fn try_reserve(&mut self, size: u64) -> bool {
+        match self.cache.budget.clone().try_acquire_many_owned(self.cache.kib(size)) {
+            Ok(p) => {
+                self.take(p);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// The budget's share for `size` more bytes; `false` if the client went
+    /// away.
+    async fn reserve(&mut self, size: u64, flight: &mut Option<Flight>) -> bool {
+        let n = self.cache.kib(size);
+        match self.cache.budget.clone().try_acquire_many_owned(n) {
+            Ok(p) => {
+                self.take(p);
+                return true;
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => return false,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {}
+        }
+        *flight = None;
+        if !self.flush(flight).await {
+            return false;
+        }
+        match self.cache.budget.clone().acquire_many_owned(n).await {
+            Ok(p) => {
+                self.take(p);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Send what it gathered, in slices of at most [`SLICE`] that share
+    /// one owner holding the whole share of the budget: the connection's
+    /// layer copies a slice at a time, so the share is given back only once
+    /// it took the last one (BUG-1181). `false` if the client went away.
+    async fn flush(&mut self, flight: &mut Option<Flight>) -> bool {
+        if self.buf.is_empty() {
+            self.permit = None;
+            return true;
+        }
+        let all = Bytes::from_owner(Held { bytes: std::mem::take(&mut self.buf), _share: self.permit.take() });
+        let mut at = 0;
+        while at < all.len() {
+            let piece = all.slice(at..(at + SLICE).min(all.len()));
+            at += piece.len();
+            match self.tx.try_send(Ok(piece)) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return false,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => {
+                    *flight = None;
+                    if self.tx.send(item).await.is_err() {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    async fn flush_if_full(&mut self, flight: &mut Option<Flight>) -> bool {
+        self.buf.len() < CHUNK || self.flush(flight).await
+    }
+
+    /// End the answer unfinished.
+    async fn fail(mut self, e: std::io::Error) {
+        self.permit = None;
+        let _ = self.tx.send(Err(e)).await;
+    }
 }
 
 impl Cache {
@@ -512,13 +683,16 @@ impl Cache {
         .await;
     }
 
-    /// Send the store's objects of `plan` (those with a size) to `out`
-    /// and on to `tx`; one gone or damaged since the check is left out (the
-    /// client asks again). `false` if the client went away.
-    async fn locals(self: &Arc<Self>, project: &str, plan: &[(ObjectId, Option<u64>)], out: &mut Vec<u8>, tx: &Tx) -> bool {
-        let wanted: Vec<(ObjectId, u64)> = plan.iter().filter_map(|(id, size)| Some((*id, (*size)?))).collect();
+    /// Send the store's objects of `plan` to `out`; one gone or damaged
+    /// since the check is left out (the client asks again). `false` if the
+    /// client went away.
+    async fn locals(self: &Arc<Self>, project: &str, plan: &[(ObjectId, Plan)], out: &mut Out, flight: &mut Option<Flight>) -> bool {
+        let wanted: Vec<(ObjectId, u64)> = plan.iter().filter_map(|(id, p)| match p {
+            Plan::Local(size) => Some((*id, *size)),
+            _ => None,
+        }).collect();
         // Read in groups of up to 64 objects and about 1 MiB, each on one
-        // blocking thread under one share of the budget.
+        // blocking thread under one share of the budget, held until sent.
         let mut rest = &wanted[..];
         while !rest.is_empty() {
             let (mut n, mut bytes) = (0, 0u64);
@@ -528,69 +702,95 @@ impl Cache {
             }
             let (group, next) = rest.split_at(n);
             rest = next;
-            let Ok(permit) = self.budget.acquire_many(self.kib(bytes)).await else { return false };
+            if !out.reserve(bytes, flight).await {
+                return false;
+            }
             let (c, q, ids) = (self.clone(), project.to_string(), group.iter().map(|g| g.0).collect::<Vec<_>>());
             let read = tokio::task::spawn_blocking(move || ids.iter().map(|id| (*id, read_local(&c, &q, id))).collect::<Vec<_>>()).await;
             for (id, raw) in read.unwrap_or_default() {
-                // One gone or damaged since the check is left out.
                 if let Some(raw) = raw {
-                    put_frame(out, &id, &raw);
+                    put_frame(&mut out.buf, &id, &raw);
                     self.stats.local.fetch_add(1, Relaxed);
                 }
             }
-            drop(permit);
-            if out.len() >= CHUNK && tx.send(Ok(Bytes::from(std::mem::take(out)))).await.is_err() {
+            if !out.flush_if_full(flight).await {
                 return false;
             }
         }
         true
     }
 
-    /// Send the answer to a batch on to `tx`, in the request's order: the
-    /// store's objects of `plan` read here, the others as the server's
-    /// answer `resp` (a `200` of frames) brings them, dropping those in the
-    /// relay's `sent` and keeping what the store takes. Before each frame
-    /// of the server's, the store's objects planned before it go out.
-    async fn answer(self: &Arc<Self>, project: &str, plan: Vec<(ObjectId, Option<u64>)>, resp: Option<reqwest::Response>, mut r: relay::Relay, tx: Tx) {
-        let mut out = Vec::new();
+    /// Send the answer to a batch, in the request's order: the store's
+    /// objects of `plan` read here, the others as the server's answer `resp`
+    /// (a `200` of frames) brings them, dropping those in the relay's `sent`
+    /// and keeping what the store takes. Before each frame of the server's,
+    /// the store's objects planned before it go out. Each mark of `flight`
+    /// is let go once its object is kept, and all of them once the server's
+    /// answer has passed.
+    async fn answer(self: &Arc<Self>, project: &str, plan: Vec<(ObjectId, Plan)>, resp: Option<reqwest::Response>, mut r: relay::Relay, mut out: Out, mut flight: Option<Flight>) {
         let at: std::collections::HashMap<ObjectId, usize> =
-            plan.iter().enumerate().filter(|(_, p)| p.1.is_none()).map(|(i, p)| (p.0, i)).collect();
+            plan.iter().enumerate().filter(|(_, p)| !matches!(p.1, Plan::Local(_))).map(|(i, p)| (p.0, i)).collect();
         let mut next = 0;
         if let Some(mut resp) = resp {
+            // The share of the budget of the frame being kept, and of those
+            // kept but not stored yet.
+            let mut keeping = None;
+            let mut kept_shares = Vec::new();
             loop {
                 let chunk = match resp.chunk().await {
                     Ok(Some(c)) => c,
                     Ok(None) => break,
-                    Err(e) => return drop(tx.send(Err(broken(&format!("{e}")))).await),
+                    Err(e) => return out.fail(broken(&format!("{e}"))).await,
                 };
+                if !out.reserve(chunk.len() as u64, &mut flight).await {
+                    return;
+                }
                 let mut rest = &chunk[..];
                 let mut kept = Vec::new();
                 loop {
-                    match r.feed(&mut rest, &mut out, &mut kept) {
-                        Ok(Some(id)) => {
+                    match r.feed(&mut rest, &mut out.buf, &mut kept) {
+                        Ok(Some(f)) => {
                             self.stats.upstream.fetch_add(1, Relaxed);
-                            if let Some(&i) = at.get(&id).filter(|i| **i >= next) {
-                                if !self.locals(project, &plan[next..i], &mut out, &tx).await {
+                            kept_shares.extend(keeping.take());
+                            if f.keeping {
+                                match self.budget.clone().try_acquire_many_owned(self.kib(f.len as u64)) {
+                                    Ok(p) => keeping = Some(p),
+                                    Err(_) => r.stop_keeping(),
+                                }
+                            }
+                            if let Some(&i) = at.get(&f.id).filter(|i| **i >= next) {
+                                if !self.locals(project, &plan[next..i], &mut out, &mut flight).await {
                                     return;
                                 }
                                 next = i + 1;
                             }
                         }
                         Ok(None) => break,
-                        Err(e) => return drop(tx.send(Err(broken(e))).await),
+                        Err(e) => return out.fail(broken(e)).await,
                     }
                 }
+                if !r.keeping() {
+                    kept_shares.extend(keeping.take());
+                }
+                let ids: Vec<ObjectId> = kept.iter().map(|k| k.0).collect();
                 self.keep(project, kept).await;
-                if out.len() >= CHUNK && tx.send(Ok(Bytes::from(std::mem::take(&mut out)))).await.is_err() {
+                kept_shares.clear();
+                if let Some(f) = &mut flight {
+                    ids.iter().for_each(|id| f.done(&disk::key(project, id)));
+                }
+                if !out.flush_if_full(&mut flight).await {
                     return;
                 }
             }
+            // The server's part has passed: nobody waits on this answer now.
+            flight = None;
             if !r.whole() {
-                return drop(tx.send(Err(broken("the server's answer ended inside a frame"))).await);
+                return out.fail(broken("the server's answer ended inside a frame")).await;
             }
         }
-        if self.locals(project, &plan[next..], &mut out, &tx).await && !out.is_empty() {
-            let _ = tx.send(Ok(Bytes::from(out))).await;
+        drop(flight);
+        if self.locals(project, &plan[next..], &mut out, &mut None).await {
+            out.flush(&mut None).await;
         }
     }
 
@@ -610,9 +810,8 @@ impl Cache {
     }
 }
 
-/// A server's answer that is not one to keep (an error, a range), passed
-/// on as it is: its status, type, range and body.
-fn pass_on(resp: reqwest::Response) -> Response {
+/// The status and the headers of a server's answer the cache passes on.
+fn head_of(resp: &reqwest::Response) -> (StatusCode, HeaderMap) {
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut headers = HeaderMap::new();
     for h in [header::CONTENT_TYPE, header::CONTENT_RANGE] {
@@ -620,26 +819,38 @@ fn pass_on(resp: reqwest::Response) -> Response {
             headers.insert(h, v);
         }
     }
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    (status, headers)
+}
+
+/// A server's answer that is not one to keep (an error, a range), passed
+/// on as it is: its status, type, range and body, each chunk under its
+/// share of the budget.
+fn pass_on(cache: &Arc<Cache>, resp: reqwest::Response) -> Response {
+    let (status, headers) = head_of(&resp);
+    let (mut out, rx) = Out::new(cache.clone());
     tokio::spawn(async move {
         let mut resp = resp;
         loop {
             match resp.chunk().await {
                 Ok(Some(c)) => {
-                    if tx.send(Ok(c)).await.is_err() {
+                    if !out.reserve(c.len() as u64, &mut None).await {
+                        return;
+                    }
+                    out.buf.extend_from_slice(&c);
+                    if !out.flush(&mut None).await {
                         return;
                     }
                 }
                 Ok(None) => return,
-                Err(e) => return drop(tx.send(Err(broken(&format!("{e}")))).await),
+                Err(e) => return out.fail(broken(&format!("{e}"))).await,
             }
         }
     });
-    (status, headers, axum::body::Body::new(Chunks(rx))).into_response()
+    (status, headers, body(rx)).into_response()
 }
 
-fn frames_response(rx: tokio::sync::mpsc::Receiver<std::io::Result<Bytes>>) -> Response {
-    ([(header::CONTENT_TYPE, "application/octet-stream")], axum::body::Body::new(Chunks(rx))).into_response()
+fn frames_response(rx: tokio::sync::mpsc::Receiver<Item>) -> Response {
+    ([(header::CONTENT_TYPE, "application/octet-stream")], body(rx)).into_response()
 }
 
 /// `POST /v1/objects/{p}:batch`, as the server answers it: the objects of
@@ -669,7 +880,7 @@ async fn batch(State(cache): State<Arc<Cache>>, Path(target): Path<String>, body
         }
         Decision::Forward => (Vec::new(), true),
         Decision::Checked(plan) => {
-            let upstream = plan.iter().any(|p| p.1.is_none());
+            let upstream = plan.iter().any(|p| !matches!(p.1, Plan::Local(_)));
             (plan, upstream)
         }
     };
@@ -678,24 +889,20 @@ async fn batch(State(cache): State<Arc<Cache>>, Path(target): Path<String>, body
         cache.stats.refused.fetch_add(1, Relaxed);
     }
     let resp = if upstream {
-        skip.extend(plan.iter().filter(|p| p.1.is_some()).map(|p| p.0));
+        skip.extend(plan.iter().filter(|p| matches!(p.1, Plan::Local(_))).map(|p| p.0));
         req.skip = skip.iter().copied().collect();
         match cache.post_batch(&p, &req).await {
             Ok(r) if r.status() == reqwest::StatusCode::OK => Some(r),
             // Nothing is sent yet: the server's refusal, as it is.
-            Ok(r) => return pass_on(r),
+            Ok(r) => return pass_on(&cache, r),
             Err(e) => return e.into_response(),
         }
     } else {
         None
     };
     let r = relay::Relay::new(skip, req.wants.iter().map(|w| w.id).collect(), cache.store.max_object as usize);
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
-    tokio::spawn(async move {
-        cache.answer(&p, plan, resp, r, tx).await;
-        // What it fetched is kept: requests waiting on it look again.
-        drop(flight);
-    });
+    let (out, rx) = Out::new(cache.clone());
+    tokio::spawn(async move { cache.answer(&p, plan, resp, r, out, flight).await });
     frames_response(rx)
 }
 
@@ -727,20 +934,44 @@ async fn get_object(State(cache): State<Arc<Cache>>, Path((p, id)): Path<(String
             cache.stats.refused.fetch_add(1, Relaxed);
             grant_invalid().into_response()
         }
-        Decision::Checked(plan) if plan.first().is_some_and(|p| p.1.is_some()) => {
-            let permit = cache.budget.acquire_many(cache.kib(plan[0].1.unwrap_or(0))).await;
-            let c = cache.clone();
-            let q = p.clone();
-            let raw = tokio::task::spawn_blocking(move || read_local(&c, &q, &id)).await;
-            drop(permit);
-            match raw {
-                Ok(Some(raw)) => {
-                    cache.stats.local.fetch_add(1, Relaxed);
-                    local_answer(raw, range)
-                }
-                // Gone or damaged since the check: the server sends it.
-                _ => forward_get(cache, p, id, headers, range.is_some(), flight).await,
+        Decision::Checked(plan) if matches!(plan.first(), Some((_, Plan::Local(_)))) => {
+            let Some(&(_, Plan::Local(size))) = plan.first() else { unreachable!() };
+            let (status, head, part) = local_head(size, range);
+            if status == StatusCode::RANGE_NOT_SATISFIABLE {
+                return (status, head).into_response();
             }
+            let (mut out, rx) = Out::new(cache.clone());
+            let slice = move |raw: Vec<u8>| match part {
+                Some((start, last)) => raw[start as usize..=last as usize].to_vec(),
+                None => raw,
+            };
+            if out.try_reserve(size) {
+                let Ok(Some(raw)) = read_sized(&cache, &p, id, size).await else {
+                    // Gone or damaged since the check: the server sends it.
+                    return forward_get(cache, p, id, headers, range.is_some(), flight).await;
+                };
+                cache.stats.local.fetch_add(1, Relaxed);
+                out.buf = slice(raw);
+                tokio::spawn(async move { out.flush(&mut None).await });
+                return (status, head, body(rx)).into_response();
+            }
+            // The budget is taken: the answer's head now, its bytes once its
+            // share is free (one lost since the check ends it unfinished, and
+            // the client asks again).
+            tokio::spawn(async move {
+                if !out.reserve(size, &mut None).await {
+                    return;
+                }
+                match read_sized(&cache, &p, id, size).await {
+                    Ok(Some(raw)) => {
+                        cache.stats.local.fetch_add(1, Relaxed);
+                        out.buf = slice(raw);
+                        out.flush(&mut None).await;
+                    }
+                    _ => out.fail(broken("an object left the store since its check")).await,
+                }
+            });
+            (status, head, body(rx)).into_response()
         }
         Decision::Checked(plan) if plan.is_empty() => {
             cache.stats.refused.fetch_add(1, Relaxed);
@@ -750,25 +981,37 @@ async fn get_object(State(cache): State<Arc<Cache>>, Path((p, id)): Path<(String
     }
 }
 
-/// An object from the store, whole or the `Range` asked for, as the server
-/// answers it.
-fn local_answer(raw: Vec<u8>, range: Option<(u64, u64)>) -> Response {
-    let octets = (header::CONTENT_TYPE, "application/octet-stream".to_string());
+/// Object `id` of `project` from the store, if it is still the `size` bytes
+/// its check found.
+fn read_sized(cache: &Arc<Cache>, project: &str, id: ObjectId, size: u64) -> tokio::task::JoinHandle<Option<Vec<u8>>> {
+    let (c, q) = (cache.clone(), project.to_string());
+    tokio::task::spawn_blocking(move || read_local(&c, &q, &id).filter(|raw| raw.len() as u64 == size))
+}
+
+/// The head of an answer of an object of `len` bytes from the store, whole
+/// or the `Range` asked for, as the server answers it: the status, the
+/// headers, and the bytes to send (`None`: all of them).
+fn local_head(len: u64, range: Option<(u64, u64)>) -> (StatusCode, HeaderMap, Option<(u64, u64)>) {
+    let mut h = HeaderMap::new();
     let Some((start, end)) = range else {
-        return ([octets], raw).into_response();
+        h.insert(header::CONTENT_TYPE, "application/octet-stream".parse().expect("a header"));
+        return (StatusCode::OK, h, None);
     };
-    let len = raw.len() as u64;
     if start >= len {
-        return (StatusCode::RANGE_NOT_SATISFIABLE, [(header::CONTENT_RANGE, format!("bytes */{len}"))]).into_response();
+        h.insert(header::CONTENT_RANGE, format!("bytes */{len}").parse().expect("a header"));
+        return (StatusCode::RANGE_NOT_SATISFIABLE, h, None);
     }
     let last = end.min(len - 1);
-    let part = raw[start as usize..=last as usize].to_vec();
-    (StatusCode::PARTIAL_CONTENT, [octets, (header::CONTENT_RANGE, format!("bytes {start}-{last}/{len}"))], part).into_response()
+    h.insert(header::CONTENT_TYPE, "application/octet-stream".parse().expect("a header"));
+    h.insert(header::CONTENT_RANGE, format!("bytes {start}-{last}/{len}").parse().expect("a header"));
+    (StatusCode::PARTIAL_CONTENT, h, Some((start, last)))
 }
 
 /// Ask the server for one object with the client's headers; pass its
-/// answer on, keeping a whole object (no range) that matches its id.
-async fn forward_get(cache: Arc<Cache>, p: String, id: ObjectId, headers: HeaderMap, ranged: bool, flight: Option<Flight>) -> Response {
+/// answer on, each chunk under its share of the budget, keeping a whole
+/// object (no range) that matches its id if the budget allows; `flight`'s
+/// mark is let go once it is kept, or the server's answer has passed.
+async fn forward_get(cache: Arc<Cache>, p: String, id: ObjectId, headers: HeaderMap, ranged: bool, mut flight: Option<Flight>) -> Response {
     cache.stats.forwarded.fetch_add(1, Relaxed);
     let mut r = cache.up.get(format!("{}/v1/objects/{}/{}", cache.base, p, id.hex()));
     for h in ["veil-grant", "veil-chain", "veil-signature", "range"] {
@@ -784,37 +1027,47 @@ async fn forward_get(cache: Arc<Cache>, p: String, id: ObjectId, headers: Header
         }
     };
     if resp.status() != reqwest::StatusCode::OK || ranged {
-        return pass_on(resp);
+        return pass_on(&cache, resp);
     }
     cache.stats.upstream.fetch_add(1, Relaxed);
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let (mut out, rx) = Out::new(cache.clone());
     tokio::spawn(async move {
         let (mut resp, max) = (resp, cache.store.max_object as usize);
-        let mut whole = Some(Vec::new());
+        // The object as it arrives, and its share of the budget.
+        let mut whole: Option<(Vec<u8>, Option<tokio::sync::OwnedSemaphorePermit>)> = Some((Vec::new(), None));
         loop {
             match resp.chunk().await {
                 Ok(Some(c)) => {
-                    if let Some(w) = &mut whole {
-                        if w.len() + c.len() <= max {
-                            w.extend_from_slice(&c);
-                        } else {
-                            whole = None;
+                    if let Some((w, share)) = &mut whole {
+                        match cache.budget.clone().try_acquire_many_owned(cache.kib(c.len() as u64)) {
+                            Ok(more) if w.len() + c.len() <= max => {
+                                w.extend_from_slice(&c);
+                                match share {
+                                    Some(s) => s.merge(more),
+                                    None => *share = Some(more),
+                                }
+                            }
+                            _ => whole = None,
                         }
                     }
-                    if tx.send(Ok(c)).await.is_err() {
+                    if !out.reserve(c.len() as u64, &mut flight).await {
+                        return;
+                    }
+                    out.buf.extend_from_slice(&c);
+                    if !out.flush(&mut flight).await {
                         return;
                     }
                 }
                 Ok(None) => break,
-                Err(e) => return drop(tx.send(Err(broken(&format!("{e}")))).await),
+                Err(e) => return out.fail(broken(&format!("{e}"))).await,
             }
         }
-        if let Some(w) = whole {
+        if let Some((w, _share)) = whole {
             cache.keep(&p, vec![(id, w)]).await;
         }
         drop(flight);
     });
-    ([(header::CONTENT_TYPE, "application/octet-stream")], axum::body::Body::new(Chunks(rx))).into_response()
+    ([(header::CONTENT_TYPE, "application/octet-stream")], body(rx)).into_response()
 }
 
 /// The cache's counters, as `veil-server cache` writes them on `SIGUSR1`.
@@ -838,4 +1091,35 @@ pub fn stats_json(cache: &Cache) -> serde_json::Value {
         "polled_projects": projects,
         "polled_devices": devices,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The caches' token and the grant key never cross the network in
+    /// clear: an upstream that is not `https://` is refused at start.
+    #[test]
+    fn an_upstream_that_is_not_https_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for upstream in ["http://127.0.0.1:8443", "127.0.0.1:8443", "HTTP://hub", "ftp://hub"] {
+            let e = rt
+                .block_on(start(Config {
+                    listen: "127.0.0.1:0".parse().unwrap(),
+                    upstream: upstream.into(),
+                    upstream_ca: None,
+                    token: "t".repeat(64),
+                    dir: dir.path().to_path_buf(),
+                    tls: TlsSource::SelfSigned,
+                    size: 1 << 20,
+                    memory: 64 << 20,
+                    max_connections: 16,
+                }))
+                .err()
+                .unwrap_or_else(|| panic!("{upstream} accepted"));
+            assert!(e.to_string().contains("https://"), "{e}");
+        }
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none(), "nothing written before the refusal");
+    }
 }

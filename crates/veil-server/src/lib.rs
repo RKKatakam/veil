@@ -201,7 +201,7 @@ pub async fn start(config: Config) -> Result<Running> {
     let app = api::router(hub.clone());
     // Push notices drop other servers' cached tips (`caches::listen`).
     tokio::spawn(caches::listen(hub.clone(), rx.clone()));
-    let task = tokio::spawn(serve_tls(listener, tls, app, rx));
+    let task = tokio::spawn(serve_tls(listener, tls, app, rx, None));
     if config.catch_up_at_start {
         tokio::spawn(derive::resume(hub.clone(), None));
     }
@@ -218,14 +218,39 @@ pub async fn start(config: Config) -> Result<Running> {
 /// a request's head.
 const IDLE_LIMIT: Duration = Duration::from_secs(20);
 
+/// What a regional cache bounds per connection (BUG-1181), so that its
+/// memory is `--memory` plus `max_connections` × about `2 × buffer`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ConnectionLimits {
+    /// A connection whose write stays pending this long is closed.
+    pub write_deadline: Duration,
+    /// At most this many are open at once; the next waits in the
+    /// listener's queue until one closes.
+    pub max_connections: usize,
+    /// The HTTP layer's write buffer per connection. HTTP/1.1 only: HTTP/2
+    /// would keep a send buffer per stream.
+    pub buffer: usize,
+}
+
+/// Serve `app` over TLS until `stop`, with `limits` (the regional cache's)
+/// or none (the server's).
 pub(crate) async fn serve_tls(
     listener: tokio::net::TcpListener,
     tls: Arc<rustls::ServerConfig>,
     app: axum::Router,
     mut stop: tokio::sync::watch::Receiver<bool>,
+    limits: Option<ConnectionLimits>,
 ) {
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    let open = limits.map(|l| Arc::new(tokio::sync::Semaphore::new(l.max_connections.max(1))));
     loop {
+        let slot = match &open {
+            Some(open) => tokio::select! {
+                s = open.clone().acquire_owned() => s.ok(),
+                _ = stop.changed() => return,
+            },
+            None => None,
+        };
         let (tcp, _) = tokio::select! {
             r = listener.accept() => match r {
                 Ok(c) => c,
@@ -241,12 +266,18 @@ pub(crate) async fn serve_tls(
         let acceptor = acceptor.clone();
         let app = app.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             // A connection that never finishes its handshake, or never sends
             // a request's head, is closed: idle sockets cannot pile up.
             let Ok(Ok(stream)) = tokio::time::timeout(IDLE_LIMIT, acceptor.accept(tcp)).await else { return };
             let service = hyper_util::service::TowerToHyperService::new(app);
             let mut b = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
             b.http1().timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(IDLE_LIMIT);
+            if let Some(l) = limits {
+                b = b.http1_only();
+                b.http1().max_buf_size(l.buffer);
+            }
+            let stream = cache::deadline::WriteDeadline::new(stream, limits.map(|l| l.write_deadline));
             let _ = b.serve_connection(hyper_util::rt::TokioIo::new(stream), service).await;
         });
     }

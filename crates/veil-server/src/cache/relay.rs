@@ -13,6 +13,13 @@ use veil_core::{hub::wire::MAX_FRAME_OBJECT, ObjectId};
 
 const HEADER: usize = 36;
 
+/// The frame about to be sent: its id, its length, and whether it is kept.
+pub struct Next {
+    pub id: ObjectId,
+    pub len: usize,
+    pub keeping: bool,
+}
+
 pub struct Relay {
     /// Bytes of a frame's header so far.
     head: Vec<u8>,
@@ -42,10 +49,10 @@ impl Relay {
 
     /// Take bytes from `chunk`: append what is sent on to `out`, and each
     /// whole object to keep to `kept` (unchecked: the store checks it).
-    /// Returns `Some(id)` when frame `id` is next to be sent, before any of
-    /// it is in `out` (call again, with the rest of `chunk`, to go on);
-    /// `None` once `chunk` is used up.
-    pub fn feed(&mut self, chunk: &mut &[u8], out: &mut Vec<u8>, kept: &mut Vec<(ObjectId, Vec<u8>)>) -> Result<Option<ObjectId>, &'static str> {
+    /// Returns `Some(next)` when frame `next.id` is next to be sent, before
+    /// any of it is in `out` (call again, with the rest of `chunk`, to go
+    /// on); `None` once `chunk` is used up.
+    pub fn feed(&mut self, chunk: &mut &[u8], out: &mut Vec<u8>, kept: &mut Vec<(ObjectId, Vec<u8>)>) -> Result<Option<Next>, &'static str> {
         out.append(&mut self.pending);
         loop {
             if let Some((id, 0, _, keep)) = &mut self.body {
@@ -75,7 +82,8 @@ impl Relay {
                     self.body = Some((id, len, send, keep));
                     if send {
                         self.pending = std::mem::take(&mut self.head);
-                        return Ok(Some(id));
+                        let keeping = self.body.as_ref().is_some_and(|b| b.3.is_some());
+                        return Ok(Some(Next { id, len, keeping }));
                     }
                     self.head.clear();
                 }
@@ -92,6 +100,18 @@ impl Relay {
                 }
             }
         }
+    }
+
+    /// Do not keep the frame being read (its bytes would pass the budget).
+    pub fn stop_keeping(&mut self) {
+        if let Some(b) = &mut self.body {
+            b.3 = None;
+        }
+    }
+
+    /// Is a frame being read and kept?
+    pub fn keeping(&self) -> bool {
+        self.body.as_ref().is_some_and(|b| b.3.is_some())
     }
 
     /// Did the answer end between frames?
@@ -113,10 +133,10 @@ mod tests {
         let (mut out, mut named, mut kept) = (Vec::new(), Vec::new(), Vec::new());
         for c in body.chunks(step) {
             let mut rest = c;
-            while let Some(id) = r.feed(&mut rest, &mut out, &mut kept).unwrap() {
+            while let Some(next) = r.feed(&mut rest, &mut out, &mut kept).unwrap() {
                 // Nothing of the frame named is out yet.
-                assert!(!out.ends_with(&id.0));
-                named.push(id);
+                assert!(!out.ends_with(&next.id.0));
+                named.push(next.id);
             }
         }
         r.feed(&mut &[][..], &mut out, &mut kept).unwrap();
