@@ -309,6 +309,15 @@ impl Api {
         Self::finish(r.call())
     }
 
+    /// GET with extra headers (the object routes' `Veil-Grant`, …).
+    pub fn get_with(&self, path: &str, headers: &[(&str, &str)]) -> Reply {
+        let mut r = self.agent.get(format!("{}{path}", self.base));
+        for (k, v) in headers {
+            r = r.header(*k, *v);
+        }
+        Self::finish(r.call())
+    }
+
     pub fn post(&self, token: Option<&str>, path: &str, body: &[u8], json: bool) -> Reply {
         let mut r = self.agent.post(format!("{}{path}", self.base));
         if let Some(t) = token {

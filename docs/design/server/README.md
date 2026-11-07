@@ -31,7 +31,7 @@ S1 is built. **S2** (secrets at scale: keys per access rule, background wrapping
 |---|---|---|---|
 | S3 | 2 | Fetch on demand in the client (thin clones, bounded cache, no full graph) | S1, simplification pass |
 | S4 | 2 | Request-path caches (permissions, sessions, snapshot resolution, tips invalidated without a hot row), **one database commit per push**, and the cost gates in `veil-bench load` (`storage-and-cost.md` §3–5, §9) | S1 |
-| S5 | 2 | Read grants, the object routes, access epochs | S1 |
+| S5 | 2 | Read grants, the object routes, access epochs (built: `HUB.md` §13.13) | S1 |
 | S6 | 2 | The Veil daemon: shared object cache | S3, S5 |
 | S7 | 2 | The daemon's file watcher (`status`/`commit` without a scan) | S6 |
 | S8 | 2 | Workspaces that fetch on first read; the workspace socket for sandboxes | S3; phase 1's isolated sandboxes (S6 for the warm numbers) |

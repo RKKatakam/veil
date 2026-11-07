@@ -1491,3 +1491,91 @@ secrets, §3.1), unless a row says otherwise. Each row is tested in
 * **A clone made before its device anchored the project** opens no secret
   until the person confirms the fingerprint; this is the price of never
   trusting a ring on the server's word.
+
+### 13.13 S5: read grants, the object routes, access epochs (built)
+
+Design: `docs/design/server/phase-2-thin-clients.md` §4.3–§4.5, §5.1. Code:
+`veil_core::hub::grant` (the grant, request signatures and the chain
+check: pure, WASM-safe, for the server, the Veil daemon (S6) and regional
+caches (S9)), `crates/veil-server/src/grant.rs` (issuing, the routes, the
+feed), `migrations/0004_access_epochs.sql`. Nothing new is encrypted:
+grants are **signed**.
+
+* **The grant.** `GET …/tips` (revision 2) returns, per branch, a grant
+  and the server's grant key (`Tips::grants`, `Tips::grant_key`). A grant
+  is `hex(JSON body) . hex(signature)`: Ed25519 by the server's **grant
+  key** (`<data>/hub-grant-key`, an Ed25519 seed, 0600; servers sharing the
+  data directory share it), context `hub-grant`, over the body bytes as
+  sent (verified before they are parsed; never re-encoded). The body is
+  `{project, project_id, person, device, view, root, epoch, expires}`:
+  the caller's projected root tree of the tip, their device's Ed25519 key,
+  their view key, the access epoch, and an expiry 10 minutes on. Unknown
+  fields are refused, so a layer that does not know a later restriction
+  refuses the grant instead of ignoring it. Anyone on Earth's grant names
+  no person and no device.
+* **Projected trees are stored.** The trees a projection rewrites existed
+  only in memory in S1. Issuing a grant stores them, so a chain through
+  them can be checked from the store alone, by any layer. They hold only
+  what their viewer reads, and no route serves an object by id without a
+  path or chain check.
+* **Requests.** `GET /v1/objects/{p}/{id}` with headers `Veil-Grant`,
+  `Veil-Chain` (the tree ids from the grant's root to the tree naming the
+  object, comma-separated; empty for the root) and `Veil-Signature`
+  (`<unix ms>.<signature>`), `Range` supported; `POST
+  /v1/objects/{p}:batch {grant, ts, signature, wants: [{chain, id}]}`
+  answers object frames of what it serves and leaves the rest out. The
+  device signs `grant hash ‖ ts ‖ BLAKE3(ids)` (context `hub-request`,
+  72 bytes); the server accepts `ts` within ±5 minutes. A copied grant is
+  useless without the device key.
+* **Checks, in order:** the grant's signature, its project (the route's),
+  its expiry, the request's signature, then the newest epoch of its
+  project and person (one indexed query): any failure is `401
+  grant_invalid`, which says nothing about any object. Then each object's
+  chain (`Chains::allows`): `chain[0]` is the grant's root, each tree has
+  a directory entry naming the next, and the last tree has an entry whose
+  object or fallback is the id (or the last element is a conflict object
+  named by a conflict entry, and the id is one of its terms: S1's `fetch`
+  serves the same). The check reads only objects it already reached from
+  the root, and an object is read only after its own check, so "not
+  reachable" and "not there" are the same `404` (the same body), and in a
+  batch both are left out. Every object, trees included, is read through
+  `store::Objects::get`, one at a time: when small objects move into packs
+  (S28), only that function changes, and a pack is never handed out.
+* **Access epochs.** One clock row, `access_epoch_clock`, incremented by
+  every bump while the bump's transaction holds its lock, so epochs
+  commit in increasing order. Database triggers bump, in the transaction
+  of the change itself, so no route can forget: a person leaving a group
+  (removed, or the group deleted) or an admin role, a device removed or
+  barred from a project (person-wide epoch), and a change of a project's
+  accepted policy or its bindings (project epoch). A grant carries the
+  clock as read **before** its viewer was loaded: a change committed after
+  that read has a higher epoch and voids it, and one committed before is
+  in the view. **Revocation at the server is at the next request**
+  (tested: group removal, a policy change, a device barred).
+* **The feed.** `GET /v1/epochs?since=N` (no sign-in) lists
+  `{project | person, epoch}` with epochs above `N`, oldest first, at most
+  10,000, and `now`, the epoch to ask from next; every epoch up to `now`
+  is listed, and a key changed again shows only its newest epoch. It holds
+  numeric ids only: no name, path or content. Caches (S6, S9) poll it and
+  refuse a grant older than its project's or person's epoch.
+
+**Threat review** (design §6 rows 1–4, 14, 15, plus this milestone's):
+
+| # | Attacker | Tries | Result | Test (`server_hub::grants`) |
+|---|---|---|---|---|
+| 1 | Person without access to a folder | asks for every real object id (the admin's), with their own grant and every chain they can build: their own trees, the admin's real chain, the admin's chain from their root, the admin's root | nothing served; one at a time, the same `404` as a random id | `object_routes_serve_only_what_a_grant_reaches` (5 viewers, anyone on Earth included) |
+| 2 | Same | a real grant with a chain through another snapshot's or the admin's trees | the chain must start at the grant's root, each step read from the store | same, and the unit test `chains_reach_only_what_the_root_reaches` (which also checks that only reached objects are read) |
+| 3 | Anyone holding a copy of a grant | uses it from another device, unsigned, with a signature over other ids, six minutes old, an hour ahead | `grant_invalid` | `grants_hold_only_for_their_device_project_key_and_time` |
+| 4 | Person removed from a group; a project whose policy changed; a device an admin removed | keeps using a grant | refused at the next request; the feed lists the change | `access_changes_void_grants_at_the_next_request` |
+| 5 | Person without access | asks for a secret's ciphertext (`billing/.env`) | served only to those who read the folder | test 1 |
+| 6 | Same | an object at a visible and a hidden path | served through the visible chain only (the same bytes); refused through the hidden one | test 1 |
+| 7 | Anyone | a grant re-signed by the server's identity key, a body changed under its signature (a wider root), a grant for another project's URL, an expired one, one older than the project's epoch | `grant_invalid` | test 3 |
+| 8 | Anyone | malformed grants (non-hex, 10 KB), chains of `MAX_CHAIN + 5`, non-hex chains and signatures, more than `MAX_WANTS` wants, bad routes, bad JSON, a `Range` past the end or on a hidden object | refused cleanly (400/401/404/416); a hidden object's `Range` is the same 404 | test 3 |
+| 9 | Person without access | times answers | the grant is checked before any object, and only checked objects are looked up (the batch prefetches after the check) | by construction; residual as design row 14 |
+
+**Residual:** the feed shows when access changes happen and to which
+numeric ids (no names). A signed request can be replayed within ±5 minutes
+by whoever saw it (inside TLS: a cache, which is inside the boundary); it
+returns the same objects. Grants are made per branch at every tips request
+(one signature each). Not built (later milestones): `POST …/grants` for
+older snapshots, caches, `vl` reading through these routes (S3, S6).
