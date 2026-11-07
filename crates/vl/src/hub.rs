@@ -12,8 +12,9 @@
 //!   needs, each by id with the path where it met it. It never sends a list
 //!   of what it has; it skips what it already holds.
 //! * **Push:** the snapshots the server lacks and, of their trees, what
-//!   differs from their parents at the same path; then one request that
-//!   moves each branch by compare-and-swap. Key rings (secret scopes only)
+//!   differs from their parents at the same path ([`Introduced`]),
+//!   uploaded as the walk finds it; then one request that moves each
+//!   branch by compare-and-swap. Key rings (secret scopes only)
 //!   go up first and come down with every pull.
 
 use std::{
@@ -232,12 +233,15 @@ pub struct Client {
     known: bool,
 }
 
-/// Body of a response: JSON or object frames.
-/// Wants per fetch request when [`Client::fetch_all`] splits them, and
-/// how many requests it sends at once.
-const FETCH_PART: usize = 1_000;
+/// Fewest and most objects, and about the most bytes, per fetch request
+/// when [`Client::fetch_each`] splits them, and how many requests it sends
+/// at once.
+const FETCH_PART_MIN: usize = 1_000;
+const FETCH_PART: usize = 2_500;
+const FETCH_BYTES: u64 = 8 << 20;
 const FETCH_REQUESTS: usize = 8;
 
+/// Body of a response: JSON or object frames.
 fn read_body(resp: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>> {
     let mut body = resp.into_body();
     Ok(body.with_config().limit(4 << 30).read_to_vec()?)
@@ -425,55 +429,99 @@ impl Client {
         Ok(read_frames(&out)?.into_iter().map(|(id, raw)| (id, raw.to_vec())).collect())
     }
 
-    pub fn fetch(&self, snapshot: ObjectId, objects: Vec<Want>) -> Result<Vec<(ObjectId, Vec<u8>)>> {
-        let out = self.ok(
+    /// The answer to one fetch request: the object frames of `objects`.
+    fn fetch_body(&self, snapshot: ObjectId, objects: Vec<Want>) -> Result<Vec<u8>> {
+        self.ok(
             "POST",
             &self.url.project_path("/fetch"),
             Some(("application/json", serde_json::to_vec(&FetchRequest { snapshot, objects })?)),
-        )?;
-        Ok(read_frames(&out)?.into_iter().map(|(id, raw)| (id, raw.to_vec())).collect())
+        )
     }
 
-    /// [`Client::fetch`] of many objects: up to [`FETCH_REQUESTS`]
-    /// requests at once, each for a part of `wants` (the server reads,
-    /// frames and encrypts them on several threads), answers in order.
-    pub fn fetch_all(&self, snapshot: ObjectId, wants: Vec<Want>) -> Result<Vec<(ObjectId, Vec<u8>)>> {
-        if wants.len() < 2 * FETCH_PART {
-            return self.fetch(snapshot, wants);
+    /// A fetch of many objects, each handed to `f` with its want
+    /// as its part arrives (BUG-859): `wants` split into parts of about
+    /// [`FETCH_BYTES`] by the sizes tree entries carry (`sizes`, one per
+    /// want; 0 where unknown) and at most [`FETCH_PART`] objects (at least
+    /// [`FETCH_REQUESTS`] parts of a large level), up to
+    /// [`FETCH_REQUESTS`] of them in flight (the server reads and frames
+    /// them on several threads). Each part's objects are checked against
+    /// its wants, in order.
+    pub fn fetch_each(&self, snapshot: ObjectId, wants: &[Want], sizes: &[u64], mut f: impl FnMut(&Want, &[u8]) -> Result<()>) -> Result<()> {
+        // Fewer than 2,000 objects in one request; more in at least
+        // FETCH_REQUESTS parts (the server serves each on its own threads).
+        let most = match wants.len() < 2 * FETCH_PART_MIN {
+            true => wants.len(),
+            false => wants.len().div_ceil(FETCH_REQUESTS).clamp(FETCH_PART_MIN, FETCH_PART),
+        };
+        let mut parts: Vec<std::ops::Range<usize>> = Vec::new();
+        let (mut start, mut bytes) = (0, 0u64);
+        for (i, size) in sizes.iter().enumerate().take(wants.len()) {
+            if i > start && (i - start >= most || bytes + size > FETCH_BYTES) {
+                parts.push(start..i);
+                (start, bytes) = (i, 0);
+            }
+            bytes += size;
+        }
+        if start < wants.len() {
+            parts.push(start..wants.len());
+        }
+        let mut check = |part: &[Want], body: &[u8]| -> Result<()> {
+            let got = read_frames(body)?;
+            if got.len() != part.len() {
+                bail!("the server sent {} objects for {} asked", got.len(), part.len());
+            }
+            for (w, (id, raw)) in part.iter().zip(got) {
+                if id != w.id {
+                    bail!("the server sent another object than asked");
+                }
+                f(w, raw)?;
+            }
+            Ok(())
+        };
+        if parts.len() == 1 {
+            return check(wants, &self.fetch_body(snapshot, wants.to_vec())?);
         }
         let token = self.token.borrow().clone();
         let url = format!("{}{}", self.url.base(), self.url.project_path("/fetch"));
-        let part = wants.len().div_ceil(FETCH_REQUESTS).max(FETCH_PART);
-        let parts: Vec<&[Want]> = wants.chunks(part).collect();
-        let agent = &self.agent;
-        let answers: Vec<Option<Vec<u8>>> = std::thread::scope(|s| {
-            let handles: Vec<_> = parts
-                .iter()
-                .map(|p| {
-                    let (url, token) = (&url, &token);
-                    s.spawn(move || -> Option<Vec<u8>> {
-                        let body = serde_json::to_vec(&FetchRequest { snapshot, objects: p.to_vec() }).ok()?;
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let (agent, parts) = (&self.agent, &parts);
+        std::thread::scope(|s| -> Result<()> {
+            // A part fetched waits here until the one before is written:
+            // at most one answer per request in flight, plus this one.
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Option<Vec<u8>>)>(0);
+            for _ in 0..FETCH_REQUESTS.min(parts.len()) {
+                let (tx, url, token, next) = (tx.clone(), &url, &token, &next);
+                s.spawn(move || loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(p) = parts.get(i) else { break };
+                    let body = (|| -> Option<Vec<u8>> {
+                        let body = serde_json::to_vec(&FetchRequest { snapshot, objects: wants[p.clone()].to_vec() }).ok()?;
                         let mut r = agent.post(url).header("content-type", "application/json");
                         if let Some(t) = token {
                             r = r.header("authorization", &format!("Bearer {t}"));
                         }
                         let resp = r.send(&body[..]).ok()?;
                         (resp.status().as_u16() == 200).then(|| read_body(resp).ok()).flatten()
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().ok().flatten()).collect()
-        });
-        let mut out = Vec::with_capacity(wants.len());
-        for (p, answer) in parts.into_iter().zip(answers) {
-            match answer {
-                Some(body) => out.extend(read_frames(&body)?.into_iter().map(|(id, raw)| (id, raw.to_vec()))),
-                // Anything else (a session to renew, an error to report):
-                // this part again, the ordinary way.
-                None => out.extend(self.fetch(snapshot, p.to_vec())?),
+                    })();
+                    // The receiver is gone when writing failed: stop.
+                    if tx.send((i, body)).is_err() {
+                        break;
+                    }
+                });
             }
-        }
-        Ok(out)
+            drop(tx);
+            for _ in 0..parts.len() {
+                let (i, body) = rx.recv().map_err(|_| anyhow!("a fetch thread stopped"))?;
+                let part = &wants[parts[i].clone()];
+                match body {
+                    Some(body) => check(part, &body)?,
+                    // Anything else (a session to renew, an error to
+                    // report): this part again, the ordinary way.
+                    None => check(part, &self.fetch_body(snapshot, part.to_vec())?)?,
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Upload object frames; the server's receipt for each, in order.
@@ -669,70 +717,67 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
             }
         }
     }
-    // Trees from the root down, then the files: one request per level.
+    // Trees from the root down, then the files: one round per level, each
+    // object written as its part of the level arrives (BUG-859). Sizes are
+    // what tree entries say (0 for trees and other objects they don't size).
     let mut seen: HashSet<ObjectId> = HashSet::new();
-    let mut frontier: Vec<(ObjectId, String, ObjectId)> = Vec::new();
+    let mut frontier: Vec<(ObjectId, String, ObjectId, u64)> = Vec::new();
     for (snap, tree) in &new_snaps {
         if !have(tree) && seen.insert(*tree) {
-            frontier.push((*snap, String::new(), *tree));
+            frontier.push((*snap, String::new(), *tree, 0));
         }
     }
     // A server of revision 1 takes the wants of every snapshot in one
     // request per level; an older one, one request per snapshot.
     let across = tips.revision >= 1;
     while !frontier.is_empty() {
-        let mut by_snap: HashMap<ObjectId, Vec<Want>> = HashMap::new();
-        for (snap, path, id) in frontier.drain(..) {
-            match across {
-                true => {
-                    let first = *by_snap.keys().next().unwrap_or(&snap);
-                    by_snap.entry(first).or_default().push(Want { path, id, snapshot: (first != snap).then_some(snap) });
-                }
-                false => by_snap.entry(snap).or_default().push(Want { path, id, snapshot: None }),
-            }
+        // A snapshot's wants together: each request names few snapshots.
+        frontier.sort_by_key(|f| f.0);
+        let mut by_snap: HashMap<ObjectId, (Vec<Want>, Vec<u64>)> = HashMap::new();
+        for (snap, path, id, size) in frontier.drain(..) {
+            let key = match across {
+                true => *by_snap.keys().next().unwrap_or(&snap),
+                false => snap,
+            };
+            let (wants, sizes) = by_snap.entry(key).or_default();
+            wants.push(Want { path, id, snapshot: (key != snap).then_some(snap) });
+            sizes.push(size);
         }
         let mut next = Vec::new();
-        for (snap, wants) in by_snap {
-            for chunk in wants.chunks(20_000) {
-                let got = client.fetch_all(snap, chunk.to_vec())?;
-                if got.len() != chunk.len() {
-                    bail!("the server sent {} objects for {} asked", got.len(), chunk.len());
-                }
-                for (w, (id, raw)) in chunk.iter().zip(got) {
-                    if id != w.id {
-                        bail!("the server sent another object than asked");
-                    }
-                    let obj = Object::decode(&raw)?;
-                    let mut children = Vec::new();
-                    match &obj {
-                        Object::Tree(t) => {
-                            for e in &t.entries {
-                                let p = if w.path.is_empty() { e.name.clone() } else { format!("{}/{}", w.path, e.name) };
-                                if !in_scope(only, &p) {
-                                    continue;
-                                }
-                                if e.kind == EntryKind::Dir && only.is_some_and(|o| o.len() > p.len()) {
-                                    // A directory on the way to `only`: its tree only.
-                                    children.push((e.id, p));
-                                    continue;
-                                }
-                                children.extend(e.fallback.map(|f| (f, p.clone())));
-                                children.push((e.id, p));
+        for (snap, (wants, sizes)) in by_snap {
+            client.fetch_each(snap, &wants, &sizes, |w, raw| {
+                let obj = Object::decode(raw)?;
+                let mut children = Vec::new();
+                match &obj {
+                    Object::Tree(t) => {
+                        for e in &t.entries {
+                            let p = if w.path.is_empty() { e.name.clone() } else { format!("{}/{}", w.path, e.name) };
+                            if !in_scope(only, &p) {
+                                continue;
                             }
+                            if e.kind == EntryKind::Dir && only.is_some_and(|o| o.len() > p.len()) {
+                                // A directory on the way to `only`: its tree only.
+                                children.push((e.id, p, 0));
+                                continue;
+                            }
+                            children.extend(e.fallback.map(|f| (f, p.clone(), e.size)));
+                            let size = if e.kind == EntryKind::Dir { 0 } else { e.size };
+                            children.push((e.id, p, size));
                         }
-                        Object::Conflict(c) => children.extend(c.referenced_ids().into_iter().map(|i| (i, w.path.clone()))),
-                        _ => {}
                     }
-                    for (cid, p) in children {
-                        if !have(&cid) && seen.insert(cid) {
-                            next.push((w.snapshot.unwrap_or(snap), p, cid));
-                        }
-                    }
-                    if incoming.put(w.id, raw, &w.path)? {
-                        report.objects_copied += 1;
+                    Object::Conflict(c) => children.extend(c.referenced_ids().into_iter().map(|i| (i, w.path.clone(), 0))),
+                    _ => {}
+                }
+                for (cid, p, size) in children {
+                    if !have(&cid) && seen.insert(cid) {
+                        next.push((w.snapshot.unwrap_or(snap), p, cid, size));
                     }
                 }
-            }
+                if incoming.put(w.id, raw.to_vec(), &w.path)? {
+                    report.objects_copied += 1;
+                }
+                Ok(())
+            })?;
         }
         frontier = next;
     }
@@ -816,55 +861,155 @@ pub fn without(store: &ObjectStore, tree: ObjectId, only: &str) -> Result<Object
 
 // ---- push ---------------------------------------------------------------------------------
 
-/// Append the objects of tree `tree` at `path` that differ from `parents`
-/// (the trees at the same path in the snapshot's parents).
-fn collect_tree(
-    store: &ObjectStore,
-    tree: ObjectId,
-    parents: &[ObjectId],
-    path: &str,
-    seen: &mut HashSet<ObjectId>,
-    out: &mut Vec<(ObjectId, Vec<u8>)>,
-) -> Result<()> {
-    if parents.contains(&tree) || !seen.insert(tree) {
-        return Ok(());
-    }
-    let raw = store.get_raw(&tree)?;
-    let Object::Tree(t) = Object::decode(&raw)? else {
-        out.push((tree, raw));
-        return Ok(());
-    };
-    out.push((tree, raw));
-    let ptrees: Vec<Arc<veil_core::Tree>> = parents.iter().filter_map(|p| store.tree(p).ok()).collect();
-    for e in &t.entries {
-        if ptrees.iter().any(|pt| pt.get(&e.name).is_some_and(|pe| pe.id == e.id)) {
-            continue;
+/// Every object entry `e` names: its object, its fallback and, for a
+/// conflict, its terms' objects and fallbacks (the server's `named_ids`).
+fn named_ids(store: &ObjectStore, e: &veil_core::TreeEntry) -> Result<Vec<ObjectId>> {
+    let mut out = vec![e.id];
+    out.extend(e.fallback);
+    if e.kind == EntryKind::Conflict {
+        if let Object::Conflict(c) = store.get(&e.id)? {
+            out.extend(c.referenced_ids());
         }
-        let p = if path.is_empty() { e.name.clone() } else { format!("{path}/{}", e.name) };
-        if e.kind == EntryKind::Dir && matches!(store.get(&e.id), Ok(Object::Tree(_))) {
-            let sub: Vec<ObjectId> = ptrees
-                .iter()
-                .filter_map(|pt| pt.get(&e.name).filter(|pe| pe.kind == EntryKind::Dir).map(|pe| pe.id))
-                .collect();
-            collect_tree(store, e.id, &sub, &p, seen, out)?;
-        } else if seen.insert(e.id) {
-            let raw = store.get_raw(&e.id).with_context(|| format!("reading {p}"))?;
-            if let Ok(Object::Conflict(c)) = Object::decode(&raw) {
-                for r in c.referenced_ids() {
-                    if seen.insert(r) {
-                        out.push((r, store.get_raw(&r)?));
-                    }
+    }
+    Ok(out)
+}
+
+/// The objects a push introduces, each handed to `emit` once: every new
+/// snapshot and, at each path where its tree differs from all of its
+/// parents' (the trees down to that path, and what the entry there names
+/// that no parent's entry at that path names). That is what the server
+/// asks an upload receipt for (`docs/HUB.md` §13, check 7; BUG-824), and
+/// nothing more.
+///
+/// A tree is walked again for each set of parent trees it is compared with:
+/// what it introduces depends on them (BUG-857: a tree walked once, against
+/// a parent that already had a file, was never walked against the snapshot
+/// that introduced the file, so the file was never sent).
+pub struct Introduced<'a, F: FnMut(ObjectId, Vec<u8>) -> Result<()>> {
+    store: &'a ObjectStore,
+    emit: F,
+    sent: HashSet<ObjectId>,
+    walked: HashSet<(ObjectId, Vec<ObjectId>)>,
+}
+
+impl<'a, F: FnMut(ObjectId, Vec<u8>) -> Result<()>> Introduced<'a, F> {
+    pub fn new(store: &'a ObjectStore, emit: F) -> Self {
+        Introduced { store, emit, sent: HashSet::new(), walked: HashSet::new() }
+    }
+
+    fn send(&mut self, id: ObjectId, raw: Option<Vec<u8>>, path: &str) -> Result<()> {
+        if self.sent.insert(id) {
+            let raw = match raw {
+                Some(r) => r,
+                None => self.store.get_raw(&id).with_context(|| format!("reading {}", if path.is_empty() { "/" } else { path }))?,
+            };
+            (self.emit)(id, raw)?;
+        }
+        Ok(())
+    }
+
+    /// New snapshot `id`, whose parents' trees are `parents`.
+    pub fn snapshot(&mut self, id: ObjectId, tree: ObjectId, mut parents: Vec<ObjectId>) -> Result<()> {
+        self.send(id, None, "")?;
+        parents.sort();
+        parents.dedup();
+        if !parents.contains(&tree) && !self.tree(tree, parents, "")? {
+            self.send(tree, None, "")?;
+        }
+        Ok(())
+    }
+
+    /// Object `id` as a tree, if it is one as stored (a sealed directory is
+    /// sent as it is, never walked).
+    fn as_tree(&self, id: &ObjectId) -> Result<Option<(Arc<veil_core::Tree>, Vec<u8>)>> {
+        let raw = self.store.get_raw(id)?;
+        match Object::tree_encoding(&raw) {
+            Some(_) => Ok(Some((self.store.tree_object(id)?, raw))),
+            None => Ok(None),
+        }
+    }
+
+    /// Walk tree `tree` at `path` against `parents` (the trees at `path` in
+    /// the snapshot's parents, sorted; none of them is `tree`). False if
+    /// `tree` is not a tree object.
+    fn tree(&mut self, tree: ObjectId, parents: Vec<ObjectId>, path: &str) -> Result<bool> {
+        let key = (tree, parents);
+        if self.walked.contains(&key) {
+            return Ok(true);
+        }
+        let Some((t, raw)) = self.as_tree(&tree).with_context(|| format!("reading {}", if path.is_empty() { "/" } else { path }))? else {
+            return Ok(false);
+        };
+        let (tree, parents) = key.clone();
+        self.walked.insert(key);
+        self.send(tree, Some(raw), path)?;
+        let mut ptrees = Vec::new();
+        for p in &parents {
+            ptrees.extend(self.as_tree(p)?.map(|(t, _)| t));
+        }
+        for e in &t.entries {
+            let p = if path.is_empty() { e.name.clone() } else { format!("{path}/{}", e.name) };
+            let before: Vec<&veil_core::TreeEntry> = ptrees.iter().filter_map(|pt| pt.get(&e.name)).collect();
+            let mut walked = false;
+            if e.kind == EntryKind::Dir {
+                // The same directory as in a parent: nothing below changed.
+                if before.iter().any(|pe| pe.id == e.id) {
+                    continue;
+                }
+                let mut sub: Vec<ObjectId> = before.iter().filter(|pe| pe.kind == EntryKind::Dir).map(|pe| pe.id).collect();
+                sub.sort();
+                sub.dedup();
+                walked = self.tree(e.id, sub, &p)?;
+            } else if before.iter().any(|pe| pe.id == e.id && pe.kind == e.kind && pe.fallback == e.fallback) {
+                // Names exactly what that parent's entry names.
+                continue;
+            }
+            let mut known = HashSet::new();
+            for pe in &before {
+                known.extend(named_ids(self.store, pe)?);
+            }
+            for id in named_ids(self.store, e)? {
+                if !(walked && id == e.id) && !known.contains(&id) {
+                    self.send(id, None, &p)?;
                 }
             }
-            out.push((e.id, raw));
         }
-        if let Some(fb) = e.fallback {
-            if seen.insert(fb) {
-                out.push((fb, store.get_raw(&fb)?));
-            }
-        }
+        Ok(true)
     }
-    Ok(())
+}
+
+/// Object frames on their way to the server, about 8 MiB per request, and
+/// the server's receipt for each: the push shows them, so it names nothing
+/// it did not send (BUG-824).
+struct Uploads<'a> {
+    client: &'a Client,
+    frames: Vec<u8>,
+    ids: Vec<ObjectId>,
+    receipts: BTreeMap<ObjectId, String>,
+}
+
+impl Uploads<'_> {
+    fn add(&mut self, id: &ObjectId, raw: &[u8]) -> Result<()> {
+        put_frame(&mut self.frames, id, raw);
+        self.ids.push(*id);
+        if self.frames.len() > 8 << 20 {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.ids.is_empty() {
+            return Ok(());
+        }
+        let r = self.client.upload(std::mem::take(&mut self.frames))?;
+        let ids = std::mem::take(&mut self.ids);
+        if r.len() != ids.len() {
+            bail!("the server sent {} upload receipts for {} objects", r.len(), ids.len());
+        }
+        self.receipts.extend(ids.into_iter().zip(r));
+        Ok(())
+    }
 }
 
 pub struct PushOutcome {
@@ -947,36 +1092,17 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             stack.extend(s.parents.iter().copied());
             new.push((id, s));
         }
-        let mut objects: Vec<(ObjectId, Vec<u8>)> = Vec::new();
-        let mut seen = HashSet::new();
+        // Upload what the push introduces as the walk finds it, 8 MiB per
+        // request (BUG-858).
+        let mut up = Uploads { client, frames: Vec::new(), ids: Vec::new(), receipts: BTreeMap::new() };
+        let mut walk = Introduced::new(&store, |id, raw| up.add(&id, &raw));
         for (id, s) in &new {
-            objects.push((*id, store.get_raw(id)?));
             let parents: Vec<ObjectId> = s.parents.iter().filter_map(|p| store.snapshot(p).ok().map(|ps| ps.tree)).collect();
-            collect_tree(&store, s.tree, &parents, "", &mut seen, &mut objects)?;
+            walk.snapshot(*id, s.tree, parents)?;
         }
-        let uploaded = objects.len();
-        // The server's receipt for each object: the push shows them, so it
-        // names nothing it did not send (BUG-824).
-        let mut receipts = BTreeMap::new();
-        let mut send = |frames: Vec<u8>, ids: Vec<ObjectId>| -> Result<()> {
-            let r = client.upload(frames)?;
-            if r.len() != ids.len() {
-                bail!("the server sent {} upload receipts for {} objects", r.len(), ids.len());
-            }
-            receipts.extend(ids.into_iter().zip(r));
-            Ok(())
-        };
-        let (mut frames, mut ids) = (Vec::new(), Vec::new());
-        for (id, raw) in objects {
-            put_frame(&mut frames, &id, &raw);
-            ids.push(id);
-            if frames.len() > 8 << 20 {
-                send(std::mem::take(&mut frames), std::mem::take(&mut ids))?;
-            }
-        }
-        if !frames.is_empty() {
-            send(frames, ids)?;
-        }
+        drop(walk);
+        up.flush()?;
+        let (uploaded, receipts) = (up.receipts.len(), up.receipts);
         // Key rings (secret scopes) first, so new members can open what lands
         // (`team` first of them: it names the project the others belong to).
         for ring in repo.keys().rings()? {
@@ -1047,5 +1173,195 @@ mod tests {
         assert!(in_scope(Some("src/api"), "src/api/x.rs"));
         assert!(!in_scope(Some("src/api"), "src/apix"));
         assert!(!in_scope(Some("src/api"), "docs"));
+    }
+
+    /// What a push of `new` must send, computed path by path from whole
+    /// flattened trees (the server's rule, `docs/HUB.md` §13 check 7): each
+    /// new snapshot; at each path below no directory that equals a
+    /// parent's directory there, the entry's directory tree, or what its
+    /// leaf names that no parent's entry at that path names.
+    fn required(store: &ObjectStore, new: &[(ObjectId, ObjectId, Vec<ObjectId>)]) -> HashSet<ObjectId> {
+        fn flatten(store: &ObjectStore, tree: ObjectId, dir: &str, out: &mut BTreeMap<String, veil_core::TreeEntry>) {
+            for e in &store.tree_object(&tree).unwrap().entries {
+                let p = if dir.is_empty() { e.name.clone() } else { format!("{dir}/{}", e.name) };
+                out.insert(p.clone(), e.clone());
+                if e.kind == EntryKind::Dir {
+                    flatten(store, e.id, &p, out);
+                }
+            }
+        }
+        let mut out = HashSet::new();
+        for (id, tree, parents) in new {
+            out.insert(*id);
+            if !parents.contains(tree) {
+                out.insert(*tree);
+            }
+            let mut mine = BTreeMap::new();
+            flatten(store, *tree, "", &mut mine);
+            let theirs: Vec<BTreeMap<String, veil_core::TreeEntry>> = parents
+                .iter()
+                .map(|t| {
+                    let mut m = BTreeMap::new();
+                    flatten(store, *t, "", &mut m);
+                    m
+                })
+                .collect();
+            let same_in_a_parent = |p: &str, e: &veil_core::TreeEntry| theirs.iter().any(|m| m.get(p).is_some_and(|pe| pe.id == e.id));
+            for (p, e) in &mine {
+                let mut up = p.as_str();
+                let mut unchanged = e.kind == EntryKind::Dir && same_in_a_parent(p, e);
+                while let Some((d, _)) = up.rsplit_once('/') {
+                    unchanged |= same_in_a_parent(d, &mine[d]);
+                    up = d;
+                }
+                if unchanged {
+                    continue;
+                }
+                if e.kind == EntryKind::Dir {
+                    out.insert(e.id);
+                    continue;
+                }
+                let before: HashSet<ObjectId> =
+                    theirs.iter().filter_map(|m| m.get(p)).flat_map(|pe| named_ids(store, pe).unwrap()).collect();
+                out.extend(named_ids(store, e).unwrap().into_iter().filter(|id| !before.contains(id)));
+            }
+        }
+        out
+    }
+
+    /// A leaf: absent, or (content, fallback, a conflict of contents).
+    type Leaf = Option<(u8, Option<u8>, bool)>;
+    const PATHS: [&str; 8] = ["a", "b", "d/a", "d/b", "d/e/a", "d/e/b", "y", "y/a"];
+
+    fn build(store: &ObjectStore, leaves: &[Leaf]) -> ObjectId {
+        let mut files: BTreeMap<String, veil_core::TreeEntry> = BTreeMap::new();
+        for (n, (path, leaf)) in PATHS.iter().zip(leaves).enumerate() {
+            let Some((c, fb, conflict)) = *leaf else { continue };
+            // Contents 0 and 1 are the path's own; others are shared by all
+            // paths (a file copied or moved).
+            let blob = |c: u8| store.put(&Object::Blob(if c < 2 { vec![b'v', c, n as u8] } else { vec![b'v', c] })).unwrap();
+            // `y` is a file or a directory, never both.
+            if *path == "y/a" && files.contains_key("y") {
+                continue;
+            }
+            let name = path.rsplit('/').next().unwrap().to_string();
+            let file = |c: u8| veil_core::TreeEntry {
+                name: name.clone(),
+                kind: EntryKind::File,
+                id: blob(c),
+                size: 2,
+                executable: false,
+                visibility: Default::default(),
+                fallback: None,
+            };
+            let e = if conflict {
+                let t = |c: u8| Some(veil_core::object::ConflictTerm::of(&file(c)));
+                let id = store.put(&Object::Conflict(veil_core::object::Conflict { adds: vec![t(c), t(c + 1)], removes: vec![t(c + 2)] })).unwrap();
+                veil_core::TreeEntry { kind: EntryKind::Conflict, id, size: 0, ..file(c) }
+            } else {
+                veil_core::TreeEntry { fallback: fb.map(blob), ..file(c) }
+            };
+            files.insert(path.to_string(), e);
+        }
+        fn dir(store: &ObjectStore, files: &BTreeMap<String, veil_core::TreeEntry>, at: &str) -> veil_core::Tree {
+            let mut t = veil_core::Tree::default();
+            let mut subdirs = BTreeMap::new();
+            for (p, e) in files {
+                let Some(rest) = (if at.is_empty() { Some(p.as_str()) } else { p.strip_prefix(&format!("{at}/")) }) else { continue };
+                match rest.split_once('/') {
+                    None => t.insert(e.clone()),
+                    Some((d, _)) => {
+                        subdirs.insert(d.to_string(), ());
+                    }
+                }
+            }
+            for d in subdirs.keys() {
+                let sub = dir(store, files, &if at.is_empty() { d.clone() } else { format!("{at}/{d}") });
+                let id = store.put_tree(&sub).unwrap();
+                t.insert(veil_core::TreeEntry {
+                    name: d.clone(),
+                    kind: EntryKind::Dir,
+                    id,
+                    size: 0,
+                    executable: false,
+                    visibility: Default::default(),
+                    fallback: None,
+                });
+            }
+            t
+        }
+        store.put_tree(&dir(store, &files, "")).unwrap()
+    }
+
+    fn leaf() -> impl proptest::strategy::Strategy<Value = Leaf> {
+        use proptest::prelude::*;
+        prop_oneof![
+            3 => Just(None),
+            6 => (0u8..3).prop_map(|c| Some((c, None, false))),
+            1 => (0u8..3, 0u8..3).prop_map(|(c, f)| Some((c, Some(f + 10), false))),
+            1 => (0u8..3).prop_map(|c| Some((c, None, true))),
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+        /// BUG-857: a push sends exactly what the server asks a receipt
+        /// for, whatever the history (trees reused across snapshots, a
+        /// file turned directory, merges, conflicts, fallbacks), whatever
+        /// the server already holds and in whatever order the snapshots
+        /// are walked.
+        #[test]
+        fn a_push_sends_exactly_what_the_server_lacks(
+            snaps in proptest::collection::vec(
+                (proptest::collection::vec(leaf(), PATHS.len()), proptest::collection::vec(0usize..64, 1..3)),
+                1..14,
+            ),
+            known_tips in proptest::collection::vec(0usize..64, 0..3),
+            order in proptest::collection::vec(0usize..1000, 14),
+        ) {
+            let repo = Repo::init(Arc::new(veil_core::MemoryBackend::new()), None, "t").unwrap();
+            let store = repo.store().clone();
+            let root = repo.root_id();
+            // Snapshot i's parents are earlier snapshots (or the root).
+            let mut ids: Vec<ObjectId> = Vec::new();
+            let mut info: HashMap<ObjectId, (ObjectId, Vec<ObjectId>)> = HashMap::new();
+            info.insert(root, (repo.snapshot(&root).unwrap().tree, vec![]));
+            for (i, (leaves, parents)) in snaps.iter().enumerate() {
+                let tree = build(&store, leaves);
+                let mut ps: Vec<ObjectId> = parents.iter().map(|p| if i == 0 || p % 4 == 0 { root } else { ids[p % i] }).collect();
+                ps.dedup();
+                let mut s = veil_core::object::Snapshot::root(tree);
+                s.parents = ps.clone();
+                s.timestamp = i as i64 + 1;
+                let id = store.put(&Object::Snapshot(s)).unwrap();
+                ids.push(id);
+                info.insert(id, (tree, ps));
+            }
+            // What the server holds: everything some snapshots reach.
+            let mut known = HashSet::from([root]);
+            let mut stack: Vec<ObjectId> = known_tips.iter().filter(|_| !ids.is_empty()).map(|k| ids[k % ids.len()]).collect();
+            while let Some(id) = stack.pop() {
+                if known.insert(id) {
+                    stack.extend(info[&id].1.iter().copied());
+                }
+            }
+            let mut new: Vec<ObjectId> = ids.iter().copied().filter(|id| !known.contains(id)).collect();
+            new.sort_by_key(|id| order[ids.iter().position(|x| x == id).unwrap()]);
+            let new: Vec<(ObjectId, ObjectId, Vec<ObjectId>)> =
+                new.iter().map(|id| (*id, info[id].0, info[id].1.iter().map(|p| info[p].0).collect())).collect();
+            let mut sent = Vec::new();
+            let mut walk = Introduced::new(&store, |id, raw| {
+                assert_eq!(ObjectId::hash(&raw), id);
+                sent.push(id);
+                Ok(())
+            });
+            for (id, tree, parents) in &new {
+                walk.snapshot(*id, *tree, parents.clone()).unwrap();
+            }
+            drop(walk);
+            let set: HashSet<ObjectId> = sent.iter().copied().collect();
+            proptest::prop_assert_eq!(set.len(), sent.len(), "an object sent twice");
+            proptest::prop_assert_eq!(set, required(&store, &new));
+        }
     }
 }
