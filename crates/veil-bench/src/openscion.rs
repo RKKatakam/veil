@@ -115,7 +115,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
     let hub = format!("veil://{}", server.authority);
     let tag = server.pid();
     run(vl(&a.dir).args(["login", &hub, "--name", &format!("bench{tag}"), "--ca"]).arg(&server.cert))?;
-    let mut cases = Vec::new();
+    let (mut cases, mut bytes) = (Vec::new(), Vec::new());
     for &files in &a.sizes {
         let name = format!("os{files}-{tag}");
         let src = a.dir.join(format!("src-{files}"));
@@ -140,7 +140,13 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
         run(vl(&proj).args(["remote", "add", "origin", &format!("{hub}/{name}")]))?;
         run(vl(&proj).args(["commit", "-m", "import"]))?;
         run(vl(&proj).args(["tag", "set", "main", "-r", "@-"]))?;
+        // The server's bytes read and written by the push and by the first
+        // clone of everything (bytes received and stored; bytes sent).
+        let io = || crate::server::io_bytes(tag).unwrap_or_default();
+        let before = io();
         run(vl(&proj).args(["push"]))?;
+        let after = io();
+        let mut push_io = json!({ "push_server_read_bytes": after.0.saturating_sub(before.0), "push_server_written_bytes": after.1.saturating_sub(before.1) });
         let gorigin = a.dir.join(format!("gimp-{files}-0"));
         run(git(&gorigin).args(["config", "uploadpack.allowFilter", "true"]))?;
         // Commit one changed file.
@@ -153,7 +159,13 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
         // Clone everything, and one directory.
         for r in 0..a.runs {
             let d = a.dir.join(format!("clone-{files}-{r}"));
+            let before = io();
             veil[1].push(time(vl(&a.dir).args(["clone", &format!("{hub}/{name}")]).arg(&d))?);
+            if r == 0 {
+                let after = io();
+                push_io["clone_server_read_bytes"] = json!(after.0.saturating_sub(before.0));
+                push_io["clone_server_written_bytes"] = json!(after.1.saturating_sub(before.1));
+            }
             let d = a.dir.join(format!("only-{files}-{r}"));
             veil[3].push(time(vl(&a.dir).args(["clone", &format!("{hub}/{name}")]).arg(&d).args(["--only", "d005"]))?);
             let g = a.dir.join(format!("gclone-{files}-{r}"));
@@ -170,6 +182,9 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
                 bail!("vl clone --only wrote {files_out} files, not 100");
             }
         }
+        eprintln!("{files} files, server bytes: {push_io}");
+        push_io["files"] = json!(files);
+        bytes.push(push_io);
         let t = targets(files);
         for (i, case) in ["import a directory", "clone everything (server)", "commit one changed file", "clone one directory (server)"]
             .iter()
@@ -183,7 +198,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
             }));
         }
     }
-    Ok(json!({ "profile": "openscion", "objects": if a.server.s3_endpoint.is_some() { "s3" } else { "directory" }, "cases": cases }))
+    Ok(json!({ "profile": "openscion", "objects": if a.server.s3_endpoint.is_some() { "s3" } else { "directory" }, "cases": cases, "bytes": bytes }))
 }
 
 /// The workloads measured as OpenScion measures its own numbers
@@ -328,6 +343,17 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             c["target_ms"],
             if c["meets_target"] == json!(true) { "yes" } else { "no" },
             if c["beats_git"] == json!(true) { "yes" } else { "no" },
+        ));
+    }
+    let mib = |b: &serde_json::Value| b.as_f64().unwrap_or(f64::NAN) / 1048576.0;
+    out.push_str("\n| Files | Server read by the push (MiB) | Server wrote by the push | Server wrote by a clone |\n|---:|---:|---:|---:|\n");
+    for b in v["bytes"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "| {} | {:.2} | {:.2} | {:.2} |\n",
+            b["files"],
+            mib(&b["push_server_read_bytes"]),
+            mib(&b["push_server_written_bytes"]),
+            mib(&b["clone_server_written_bytes"]),
         ));
     }
     Ok(out)

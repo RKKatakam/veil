@@ -38,7 +38,7 @@ S1 is built. **S2** (secrets at scale: keys per access rule, background wrapping
 | S9 | 2 | Regional cache | S5 |
 | S10 | 2 | Commits through the API (with the server-side secret scan): **built** (`HUB.md` §13.13) | S1 |
 | S11 | 2 | Agent sessions and attribution | S10, S8 |
-| S27 | 2 | Compressed objects (zstd) in storage and transport (`storage-and-cost.md` §6) | S1 |
+| S27 | 2 | Compressed objects (zstd) in storage and transport (`storage-and-cost.md` §6). **Built** (`HUB.md` §13.15) | S1 |
 | S28 | 2 | Packs: one storage write per push for small objects, index, range reads (`storage-and-cost.md` §7) | S5, S27 |
 | S29 | 2 | Merging packs and pack garbage collection (`storage-and-cost.md` §8) | S28 |
 | G2 | 2 | Phase 2 gate run | S3–S11, S27–S29 |
