@@ -1534,10 +1534,14 @@ was built under exactly those epochs. An entry is built by reading the
 epochs first and the records after, or both in one statement, so it is
 never tagged newer than what it holds.
 
-*A grant carries the request's epochs:* the epochs a request read before
-using any cached permission are in `Caller::epochs`; anything issued from
-that permission (S5's read grants) must record those, never a later read,
-so it can never be newer than the view it was made from.
+*What a read grant can rely on (S5):* (1) an entry records the epochs read
+before its rows, and `perm::open_at` returns them with the view, so a grant
+made from it carries those, never a later read of the clock; (2) an entry
+is used only while its person's and project's epochs equal its recorded
+ones; (3) permission entries are per device (a bar is the device's);
+(4) nothing else that decides a view (policy text and bindings, groups,
+admin rows, devices, sessions) is cached outside such an entry
+(`a_view_carries_the_epochs_it_was_built_under`).
 
 *How staleness is bounded:* a change commits together with its epoch bump;
 any request that starts after the commit reads the new epoch, misses every
@@ -1578,9 +1582,11 @@ the notice. A push whose every update is refused commits nothing
 as before; a reader never gets an unprojected answer. A push reads only the
 signing keys its snapshots name, not every device.
 
-**Cost** (`veil-bench load`, `docs/design/scale/LOAD.md`): a landing is 1
-commit and 15 statements (34 before); an up-to-date pull 1 statement (6); a
-request with warm caches 1 statement (its epochs). **Gates** in
+**Cost** (`veil-bench load`, `docs/design/scale/LOAD.md`): a landing's
+push is 1 commit (3 before) and its request path 15 statements (34 before);
+S12's deriver adds about 4 commits and 16 statements in the background. An
+up-to-date pull is 1 statement (6); a request with warm caches 1 statement
+(its epochs). **Gates** in
 `veil-bench load`: at most 1 commit per landing, at most 5 statements per
 up-to-date pull. A pull that brings new snapshots makes one request per
 tree level (7 for the load test's agents), each reading its epochs, so it

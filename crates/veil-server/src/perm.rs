@@ -131,6 +131,14 @@ pub async fn load_viewer(c: &mut PgConnection, project: i64, person: &Person) ->
 /// binding change on any server bumps an epoch in its own transaction, so
 /// the answer is always the database's at the moment of the request.
 pub async fn open(hub: &Hub, name: &str, caller: &Caller) -> Result<(Project, Viewer)> {
+    open_at(hub, name, caller).await.map(|(p, v, _)| (p, v))
+}
+
+/// [`open`], with the access epochs the view was built under: read before
+/// its rows were. Anything issued from this view (a read grant) must carry
+/// these, never a later read of the epochs, so it can never be newer than
+/// the access it was decided on.
+pub async fn open_at(hub: &Hub, name: &str, caller: &Caller) -> Result<(Project, Viewer, crate::caches::Epochs)> {
     let not_found = || Error::not_found(format!("no project '{name}' that you can see"));
     if !valid_project_name(name) {
         return Err(not_found());
@@ -175,6 +183,7 @@ pub async fn open(hub: &Hub, name: &str, caller: &Caller) -> Result<(Project, Vi
         }
     };
     let project = entry.project.clone();
+    let mut person_epoch = caller.epochs.person;
     let viewer = match &caller.person {
         None => Viewer::default(),
         Some(p) => {
@@ -206,13 +215,18 @@ pub async fn open(hub: &Hub, name: &str, caller: &Caller) -> Result<(Project, Vi
                     "an admin removed this device from this project: use another of your devices (`vl identity confirm` a new one)",
                 ));
             }
+            person_epoch = v.person_epoch;
             v.viewer.clone()
         }
     };
     if !project.view(&viewer).sees_anything() && !project.participant(&viewer) {
         return Err(not_found());
     }
-    Ok((project, viewer))
+    let epochs = crate::caches::Epochs {
+        person: person_epoch,
+        project: Some((project.id, entry.epoch)),
+    };
+    Ok((project, viewer, epochs))
 }
 
 /// Bind every name of `policy`: to the project's group of that name if

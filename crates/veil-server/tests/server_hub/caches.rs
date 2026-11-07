@@ -309,3 +309,46 @@ fn a_push_is_one_database_commit() {
         assert_eq!(distinct.len(), 1, "push {i}: rows written by more than one transaction: {xids:?}");
     }
 }
+
+/// What a read grant needs from the permission cache (S5): a view comes
+/// with the epochs read before its rows were loaded (`perm::open_at`), so a
+/// grant made from it carries those, never a later clock. After a removal
+/// committed on one server, the other server's very next view is the new
+/// one, and comes with the removal's epoch; before it, with an older one.
+#[test]
+fn a_view_carries_the_epochs_it_was_built_under() {
+    let a = TestHub::start();
+    let b = TestHub::beside(&a);
+    let p = setup_project(&a);
+    let admin = p.admin.token();
+    let hb = b.hub();
+    let person: i64 = b.rt.block_on(sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&p.fin.name).fetch_one(&hb.db)).unwrap();
+    let device_key = p.fin.identity().verifying_hex();
+    // The caller as server B's session check makes it: its epochs read now.
+    let caller = |project: i64| {
+        let epochs = b.rt.block_on(veil_server::caches::read_epochs(&hb.db, person, Some(project))).unwrap();
+        veil_server::auth::Caller {
+            person: Some(veil_server::auth::Person {
+                id: person,
+                name: p.fin.name.clone(),
+                device_key: device_key.clone(),
+            }),
+            epochs,
+        }
+    };
+    let pid: i64 = b.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hb.db)).unwrap();
+    let open = || b.rt.block_on(veil_server::perm::open_at(&hb, &p.name, &caller(pid))).unwrap();
+    let finance: i64 = b.rt.block_on(sqlx::query_scalar("SELECT id FROM groups WHERE project_id = $1 AND name = 'finance'").bind(pid).fetch_one(&hb.db)).unwrap();
+    let (_, v, before) = open();
+    let (_, v2, again) = open();
+    assert!(v.groups.contains(&finance) && v2.groups.contains(&finance));
+    assert_eq!(before, again, "a cached view carries the epochs it was built under");
+    member(&a.api(), &admin, &p.name, "finance", &p.fin.name, false);
+    let bump: i64 = b
+        .rt
+        .block_on(sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1").bind(person).fetch_one(&hb.db))
+        .unwrap();
+    let (_, v, after) = open();
+    assert!(!v.groups.contains(&finance), "the very next view on the other server is the new one");
+    assert!(after.person >= bump && bump > before.person, "it carries the removal's epoch ({before:?} → {bump} → {after:?})");
+}

@@ -277,10 +277,84 @@ read the shape, not the last digit.
 
 Raw results (not committed): `.scratch/bench-results/server-load-bfa691a-20261106T202331Z-*` (MinIO, with the server logs) and `…T202730Z-*` (local objects).
 
+## S4: request-path caches and one commit per push (2026-11-07)
+
+`scripts/bench-server.sh load` (now with the up-to-date pull, the
+`branches` curve and the cost gates, `storage-and-cost.md` §9), objects in a
+local directory, PostgreSQL 17 in Docker, through
+`~/.cache/veil-orch/bench-quiet.sh`. **Before:** `integration` @ `7a3a9b0`
+(S12 merged, S4 not); **after:** the S4 branch @ `64012c5` (on `integration`
+@ `d58a952`). The same `veil-bench` measured both. The machine was shared
+with other agents' builds (load average 14 at the start of each run, 49–64
+at the end), so read the shape: points taken later in a run are noisier.
+
+| Run | Clients | Before (/s) | p50 / p99 (ms) | After (/s) | p50 / p99 (ms) | DB statements per op (before → after) |
+|---|---:|---:|---:|---:|---:|---:|
+| pull, up to date (`main` quiet) | 10 | 9,934 | 1.0 / 1.7 | 9,763 | 0.6 / 5.0 | 6.0 → **1.0** |
+| pull, up to date | 100 | 17,375 | 5.7 / 7.1 | 19,073 | 3.9 / 21.2 | 6.0 → **1.0** |
+| pull, up to date | 1,000 | 16,936 | 58.7 / 65.1 | 20,422 | 42.5 / 204 | 6.0 → **1.0** |
+| pull, `main` moving 20/s | 10 | 8,909 | 1.0 / 8.0 | **29,305** | 0.3 / 0.9 | 7.0 → 1.1 |
+| pull, `main` moving 20/s | 100 | 3,909 | 39.9 / 48.9 | **32,355** | 1.6 / 24.0 | 26.4 → 1.4 |
+| pull, `main` moving 20/s | 1,000 | 2,076 | 437 / 584 | 2,079 | 394 / 1,188 | 47.6 → 6.5 |
+| landings, own branches, one project | 100 | 386 | 227 / 712 | **1,412** | 65 / 174 | 136.7 → 15.4 |
+| landings into one `main`, 50 agents, target 20/s | 50 | 19 | 80 / 520 | **20** | 13 / 17 | 456 → 37 |
+| landings into one `main`, target 40/s | 50 | 31 | 3,097 / 7,234 | **40** | 12 / 21 | 2,064 → 37 |
+| landings into one `main`, target 80/s | 50 | 33 | 6,111 / 9,983 | 43 | 3,245 / 10,884 | 2,072 → 551 |
+
+With MinIO (`OBJECTS` unset; before `b3ac86e`, after the S4 server), the
+same shape: up-to-date pulls 10,922 / 16,721 / 16,165 → 38,218 / 51,611 /
+42,072 per second, pulls with `main` moving 9,003 / 2,485 / 2,067 → 35,945 /
+36,298 / 5,988, landings on own branches at 100 agents 437 → 773.
+
+**Cost per operation** (the gates: at most 1 database commit per landing,
+at most 5 statements per up-to-date pull; **all met after, none before**):
+
+| | Before | After |
+|---|---:|---:|
+| Database commits per landing, the push's | 3.0 | **1.0** |
+| Database commits per landing, S12's deriver (background) | 4.0 | 4.0 |
+| Statements per landing (one agent, one project) | 51 | 31 (15 of them the push's request path; the rest the deriver's) |
+| Statements per request, warm caches | 6 | **1** (its access epochs) |
+| Statements per pull bringing new snapshots (7 requests) | 46–48 | 6.5 |
+| Session / permission cache hits | – | 100 % / 100 % |
+| Storage writes per landing | – | 9 (one per new object: the agent's 6, the graft's trees, the real snapshot) |
+
+**Where a pull's database time goes** (`pg_stat_statements`, 100 agents,
+`main` moving 20/s, per pull; S4 without S12's deriver):
+
+| Statement | Before (calls, ms) | After (calls, ms) |
+|---|---:|---:|
+| admin and device bar (`project_admins`, `device_bars`) | 6.3, 0.23 | – |
+| session (`sessions` ⋈ `devices` ⋈ `people`) | 6.3, 0.20 | – |
+| groups (`groups` ⋈ `group_members`) | 6.3, 0.13 | – |
+| project (`projects`) | 6.3, 0.11 | – |
+| snapshot resolution (`projections` by projected id, `snapshots`) | 9.9, 0.18 | – |
+| projection memo (`projections` by real id) | 2.6, 0.05 | – |
+| access epochs (the one statement) | – | 1.6, **0.03** |
+
+Sessions and permissions were 0.67 ms of the 1.0 ms of database time a
+pull cost; now 0.03 ms: negligible, as `OVERVIEW.md` asks.
+
+**One `main`.** Landings into one `main` no longer collapse at 40/s: a
+landing is 4 requests and 37 statements instead of a catch-up pull's 7
+requests and up to 46 statements each time, so the gap between two
+landings is no longer shorter than a catch-up. An interleaved run of both
+servers on the same quiet minute (load average 14): at 20/s, before 0.99
+collisions per landing, p50 70 ms; after 0.02, p50 14 ms; at 40/s, before
+23–27 landed per second, after 40 with 0.01 collisions, p50 13 ms. At 80/s
+both bend (43 vs 33 landed).
+
+**Across 100 projects** nothing lands, before or after: S12's deriver holds
+every database connection (BUG-911). Across 1 and 10 projects: LANDING_AB.
+
+**Notices.** PostgreSQL delivers the push's `NOTIFY`: another server saw a
+push 5–15 ms later in the tests. YugabyteDB 2025.2 does not by default, and
+the server falls back to the 100 ms expiry.
+
 ## What would raise each ceiling (not built)
 
 | Ceiling | Bound by | What raises it |
 |---|---|---|
-| Pulls, about 2,500/s here | CPU per pull: 46 statements, mostly per-request permission lookups and per-snapshot resolution | the per-person permission cache of the design; caching snapshot resolution; more servers and database nodes |
-| Merges across projects, about 2,000/s here | the database's WAL: about 8 commits per landing | the memo, origin and audit writes in the push's transaction; database nodes (YugabyteDB) |
+| Pulls, about 2,500/s here | CPU per pull: 46 statements, mostly per-request permission lookups and per-snapshot resolution | **built (S4):** permission, session and resolution caches; 1 statement per request. Next: fewer requests per pull (S3) |
+| Merges across projects, about 2,000/s here | the database's WAL: about 8 commits per landing | **built (S4):** 1 commit for the push; S12's deriver adds about 4 in the background, and holds the pool at 100 projects (BUG-911) |
 | One project's `main`, 20–30/s with many agents | collisions: a catch-up pull is longer than the gap between landings | batched landing (phase 4); cheaper catch-up pulls |
