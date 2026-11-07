@@ -1433,27 +1433,20 @@ pub(crate) async fn push_with(
                 results.push(BranchResult { tip: Some(projected(hub, project, viewer, new_real).await?), ok: true, message: None, ..refuse("") });
                 continue;
             }
-            let fresh: HashSet<ObjectId> = completed.iter().map(|c| c.real).collect();
-            let mut stack = Vec::new();
-            let mut x = new_real;
-            while fresh.contains(&x) && stack.len() <= veil_core::hub::land::MAX_LAND_STACK {
-                stack.push(x);
-                x = real_parents_of[&x][0];
-            }
-            stack.reverse();
+            // Every change between the branch's tip and the pushed one: what
+            // this push brought, and what the server already held (BUG-1103).
+            let stack = match crate::landing::stack(hub, project.id, new_real, cur.expect("checked"), &real_parents_of).await? {
+                Ok(s) => s,
+                Err(why) => {
+                    results.push(refuse(&why));
+                    continue;
+                }
+            };
             if stack.is_empty() {
-                results.push(refuse("nothing new to land: that snapshot is already on the server (land a new change)"));
+                results.push(refuse("nothing to land: that snapshot is already on the branch"));
                 continue;
             }
-            if stack.len() > veil_core::hub::land::MAX_LAND_STACK {
-                results.push(refuse(&format!(
-                    "at most {} new changes land at once; land them in parts, or have an admin push with --force",
-                    veil_core::hub::land::MAX_LAND_STACK
-                )));
-                continue;
-            }
-            let conflicted = stack.iter().any(|s| parents_of.iter().any(|(pid, n)| real_of.get(pid) == Some(s) && !n.conflicts.is_empty()));
-            if conflicted {
+            if stack.iter().any(|s| parents_of.iter().any(|(pid, n)| real_of.get(pid) == Some(s) && !n.conflicts.is_empty())) {
                 results.push(refuse("a change with unresolved conflicts never lands: resolve them first"));
                 continue;
             }
@@ -1508,6 +1501,19 @@ pub(crate) async fn push_with(
                         return Err(Error::forbidden("only admins may change who has access (the default branch's .veilpolicy)"));
                     }
                     accept = Some(text);
+                }
+                // The branch rules likewise: against the tip, never a
+                // parent's (BUG-1102).
+                let changed = blocking(hub, project.id, move |src| {
+                    let t = match cur {
+                        Some(c) => Some(src.snapshot(&c)?.tree),
+                        None => None,
+                    };
+                    crate::landing::rules_changed(src, &src.snapshot(&n)?.tree, t.as_ref())
+                })
+                .await?;
+                if changed && !viewer.admin {
+                    return Err(Error::forbidden("only admins may change the branch rules (.veilrules)"));
                 }
             }
         }
@@ -1675,7 +1681,10 @@ pub(crate) async fn push_with(
     for (q, w) in queued.iter().zip(waiters) {
         crate::landing::ensure(hub, project.id, &q.branch);
         landings.push(match wait {
-            true => crate::landing::wait(hub, project.id, person, &q.branch, w, deadline).await?,
+            true => {
+                let r = crate::landing::wait(hub, project.id, person, &q.branch, w, deadline).await?;
+                crate::landing::seen(hub, project, viewer, r).await?
+            }
             false => {
                 crate::landing::abandon(hub, w);
                 crate::landing::queued(&q.ticket)

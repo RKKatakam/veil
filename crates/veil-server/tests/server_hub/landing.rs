@@ -491,8 +491,7 @@ fn hostile_landing_requests_are_refused() {
 }
 
 #[test]
-#[ignore = "BUG-1100: after an access change, the landing service's first batch projects all history for each new view key"]
-fn bug_1100_the_first_landing_after_an_access_change_projects_one_batch_not_all_history() {
+fn bug_1100_a_new_view_key_after_an_access_change_never_stalls_the_landing_service() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
@@ -511,17 +510,31 @@ fn bug_1100_the_first_landing_after_an_access_change_projects_one_batch_not_all_
     let policy = std::fs::read_to_string(p.dir.join(".veilpolicy")).unwrap();
     let r = land(&api, &atok, &p.name, tip_for(&hub, &atok, &p.name), json!([put(".veilpolicy", &format!("{policy}docs/  public\n"))]), true);
     assert_eq!(r.json()["state"], "landed");
-    let before = veil_core::now_millis();
-    let r = land(&api, &token, &p.name, tip_for(&hub, &token, &p.name), json!([put("src/after.rs", "after\n")]), true);
-    assert_eq!(r.json()["state"], "landed");
-    // One landing: a batch's worth of projections, not one per snapshot of
-    // the history.
+    // The dev lands with that new key, and the admin lands right after.
+    // Nobody holds the dev's new view: its history is projected once, by
+    // the background fill or the dev's own request, never in the landing
+    // service's loop, which the admin's landing (and every other) goes
+    // through meanwhile.
     let h = hub.hub();
-    let rows: i64 = hub
-        .rt
-        .block_on(sqlx::query_scalar("SELECT count(*) FROM projections WHERE project_id = $1 AND created_at >= $2").bind(pid).bind(before).fetch_one(&h.db))
-        .unwrap();
-    assert!(rows <= 10, "{rows} projections made for one landing");
+    let projected = || h.landing.stats.projected.load(std::sync::atomic::Ordering::Relaxed);
+    let before = projected();
+    let (dev, admin) = std::thread::scope(|s| {
+        let dev = s.spawn(|| land(&hub.api(), &token, &p.name, tip_for(&hub, &token, &p.name), json!([put("src/after.rs", "after\n")]), true).json());
+        std::thread::sleep(Duration::from_millis(50));
+        let t = std::time::Instant::now();
+        let r = land(&api, &atok, &p.name, tip_for(&hub, &atok, &p.name), json!([put("src/admin.rs", "admin\n")]), true).json();
+        assert_eq!(r["state"], "landed", "{r}");
+        (dev.join().unwrap(), t.elapsed())
+    });
+    assert_eq!(dev["state"], "landed", "{dev}");
+    let inline = projected() - before;
+    assert!(inline <= 20, "the landing service made {inline} projections for two landings");
+    assert!(admin < Duration::from_secs(2), "another landing waited {admin:?} behind the new view key");
+    // And the dev's answer is theirs: their own view of where it landed.
+    let mine: ObjectId = serde_json::from_value(dev["landed"][0].clone()).unwrap();
+    let r = land(&api, &token, &p.name, mine, json!([put("src/after2.rs", "after\n")]), true);
+    assert_eq!(r.json()["state"], "landed", "the dev's landed snapshot is a base like any: {}", String::from_utf8_lossy(&r.body));
+    let _ = pid;
 }
 
 // S17 review, cycle 1 (docs/BUGS.md, "S17 cycle 1").
@@ -570,7 +583,6 @@ fn land_crafted(mut c: Craft<'_>, parents: Vec<ObjectId>, wait: bool) -> Reply {
 }
 
 #[test]
-#[ignore = "BUG-1102: a non-admin's merge takes .veilrules from a parent without it: main is no longer protected"]
 fn bug_1102_a_merge_never_lets_a_non_admin_change_the_branch_rules() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -613,7 +625,6 @@ fn bug_1102_a_merge_never_lets_a_non_admin_change_the_branch_rules() {
 }
 
 #[test]
-#[ignore = "BUG-1103: a push or land to a protected branch drops the changes under it the server already holds"]
 fn bug_1103_a_landed_stack_brings_every_change_the_branch_lacks() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -646,7 +657,6 @@ fn bug_1103_a_landed_stack_brings_every_change_the_branch_lacks() {
 }
 
 #[test]
-#[ignore = "BUG-1104: a landing's conflict is decided before its access is checked again: it tells a submitter who lost access that a path changed"]
 fn bug_1104_a_submitter_who_lost_access_is_told_nothing_of_what_changed_since() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -678,7 +688,6 @@ fn bug_1104_a_submitter_who_lost_access_is_told_nothing_of_what_changed_since() 
 }
 
 #[test]
-#[ignore = "BUG-1105: when a merge's checks run again at landing, its other parents are dropped: a merge accepted at submit is refused"]
 fn bug_1105_a_merge_checked_again_at_landing_keeps_its_other_parents() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -710,7 +719,6 @@ fn bug_1105_a_merge_checked_again_at_landing_keeps_its_other_parents() {
 }
 
 #[test]
-#[ignore = "BUG-1106: with no access change, a submitter whose view key the service is not keeping walks history in the service's loop"]
 fn bug_1106_a_landing_after_the_service_restarts_projects_one_batch_not_the_gap() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -754,9 +762,28 @@ fn rss() -> (u64, u64) {
     (kb("VmRSS:"), kb("VmHWM:"))
 }
 
+/// BUG-1107, in a process of its own (it measures this process's memory,
+/// which other tests running beside it would add to).
 #[test]
-#[ignore = "BUG-1107: a batch holds every folder listing it rewrites, for up to 500 entries, in memory at once"]
 fn bug_1107_a_batch_of_one_line_changes_in_a_big_folder_stays_within_memory() {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["landing::big_folder_batch_in_a_child", "--exact", "--include-ignored", "--nocapture", "--test-threads", "1"])
+        .env("VEIL_S17_CHILD", "1")
+        // As the server's allocator (jemalloc, two arenas: BUG-864); this
+        // test binary has glibc's, with an arena per thread.
+        .env("MALLOC_ARENA_MAX", "2")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && text.contains("1 passed"), "{}", &text[text.len().saturating_sub(1500)..]);
+}
+
+#[test]
+#[ignore = "helper of bug_1107 (run in a child process)"]
+fn big_folder_batch_in_a_child() {
+    if std::env::var_os("VEIL_S17_CHILD").is_none() {
+        return;
+    }
     use veil_core::object::{EntryKind, Tree, TreeEntry, Visibility};
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -795,12 +822,18 @@ fn bug_1107_a_batch_of_one_line_changes_in_a_big_folder_stays_within_memory() {
     // The peak from here: the landing service's batch.
     std::fs::write("/proc/self/clear_refs", "5").unwrap();
     let (start, _) = rss();
+    let trees0 = hub.hub().trees.stats().weight;
     release(&hub, pid);
     for t in &tickets {
         assert_eq!(outcome(&api, &token, &p.name, t)["state"], "landed");
     }
     let (_, peak) = rss();
-    let grew = peak.saturating_sub(start) >> 20;
+    // The decoded-tree cache filling (shared, bounded by its own budget,
+    // 256 MiB) is not the batch's.
+    let trees = hub.hub().trees.stats().weight.saturating_sub(trees0) as u64;
+    eprintln!("decoded-tree cache grew by {} MiB", trees >> 20);
+    let grew = peak.saturating_sub(start).saturating_sub(trees) >> 20;
     let batches = sql_i64(&hub, "SELECT count(*) FROM audit_log WHERE project_id = $1 AND action = 'land'", pid);
+    eprintln!("the landing service's peak grew by {grew} MiB for 400 one-line changes ({batches} batches)");
     assert!(grew <= 256, "the landing service's peak grew by {grew} MiB for 400 one-line changes ({batches} batches)");
 }

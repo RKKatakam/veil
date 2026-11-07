@@ -126,6 +126,9 @@ pub struct Stats {
     pub commit_us: AtomicU64,
     /// Batches refused at commit because the lease had moved (fencing).
     pub lease_lost: AtomicU64,
+    /// Projections the services made (each new snapshot, for each view key
+    /// kept, and the recent line for a key attached).
+    pub projected: AtomicU64,
 }
 
 struct Running {
@@ -248,7 +251,21 @@ pub async fn resume(hub: Arc<Hub>) {
     }
 }
 
-/// The outcome of `ticket` as stored, if it is `person`'s.
+/// `r` as `viewer` sees it: the snapshots it landed, projected. (Outcomes
+/// hold real snapshots; each answer is projected for its asker, from the
+/// memo the landing stored where it kept their view key, else as a pull
+/// would, in the asker's own request.)
+pub async fn seen(hub: &Arc<Hub>, project: &crate::perm::Project, viewer: &crate::perm::Viewer, mut r: LandResult) -> Result<LandResult> {
+    let mut out = Vec::with_capacity(r.landed.len());
+    for x in &r.landed {
+        out.push(crate::sync::projected(hub, project, viewer, *x).await?);
+    }
+    r.landed = out;
+    Ok(r)
+}
+
+/// The outcome of `ticket` as stored (real snapshots: [`seen`]), if it is
+/// `person`'s.
 pub async fn read(hub: &Hub, project: i64, person: i64, ticket: &str) -> Result<Option<(String, LandResult)>> {
     let row: Option<(String, String, Option<String>)> =
         sqlx::query_as("SELECT branch, state, result FROM landing_queue WHERE ticket = $1 AND project_id = $2 AND person_id = $3")
@@ -339,6 +356,7 @@ pub async fn submit(
             };
             let (pushed, mut landings) = crate::sync::push_with(hub, project, viewer, &who, push, true, req.wait).await?;
             match landings.pop() {
+                // Projected for the pusher by `push_with`.
                 Some(l) => Ok(l),
                 // Refused before it was queued (nothing new, no branch, …).
                 None => Err(Error::bad_request(
@@ -377,8 +395,106 @@ pub async fn submit(
                 }
             };
             r.change_id = Some(made.change_id);
-            Ok(r)
+            seen(hub, project, viewer, r).await
         }
         _ => Err(Error::bad_request("a landing names either an uploaded `snapshot`, or `edits` on a `base`")),
     }
 }
+
+/// The stack a push of `new` (real) to a branch at `tip` lands (§4.6):
+/// every change from the branch's tip up to `new`, oldest first, on
+/// `new`'s first-parent line: the snapshots this push brought (`fresh`,
+/// with their real parents) and those the server already held (on another
+/// branch, an API commit, a landing answered `conflict` with a fix on top),
+/// down to the first that is the tip or below it (BUG-1103). `Err(why)` to
+/// refuse.
+pub async fn stack(hub: &Arc<Hub>, project: i64, new: ObjectId, tip: ObjectId, fresh: &HashMap<ObjectId, Vec<ObjectId>>) -> Result<std::result::Result<Vec<ObjectId>, String>> {
+    let root = crate::sync::root_snapshot_id();
+    let mut out = Vec::new();
+    let mut x = new;
+    while x != tip && x != root {
+        if out.len() == veil_core::hub::land::MAX_LAND_STACK {
+            return Ok(Err(format!(
+                "more than {} changes between the branch's tip and this one: land them in parts, or have an admin push with --force",
+                veil_core::hub::land::MAX_LAND_STACK
+            )));
+        }
+        let (parents, conflicted) = match fresh.get(&x) {
+            Some(p) => (p.clone(), None),
+            None => {
+                if on_branch(hub, project, x, tip).await? {
+                    break;
+                }
+                // Landed, made again on a newer tip: its change is there.
+                let landed: Option<String> = sqlx::query_scalar("SELECT landed FROM landings WHERE project_id = $1 AND submitted = $2")
+                    .bind(project)
+                    .bind(x.hex())
+                    .fetch_optional(&hub.db)
+                    .await?;
+                if let Some(l) = landed.and_then(|l| ObjectId::from_hex(&l).ok()) {
+                    if on_branch(hub, project, l, tip).await? {
+                        break;
+                    }
+                }
+                let y = x;
+                crate::sync::blocking(hub, project, move |src| {
+                    let s = src.snapshot(&y)?;
+                    Ok((s.parents.clone(), Some(!s.conflicts.is_empty())))
+                })
+                .await?
+            }
+        };
+        if conflicted == Some(true) {
+            return Ok(Err("a change with unresolved conflicts never lands: resolve them first".into()));
+        }
+        out.push(x);
+        x = parents[0];
+    }
+    out.reverse();
+    Ok(Ok(out))
+}
+
+/// Is real snapshot `x` the branch tip `tip` or below it? From the derived
+/// commit graph (S12; the tip is derived first if the deriver has not yet),
+/// else by walking.
+async fn on_branch(hub: &Arc<Hub>, project: i64, x: ObjectId, tip: ObjectId) -> Result<bool> {
+    if x == tip {
+        return Ok(true);
+    }
+    let ask = || {
+        crate::derive::read(hub, project, move |g| {
+            Ok(match g.row(&tip)? {
+                None => None,
+                // Everything below a derived snapshot is derived.
+                Some(_) => Some(g.row(&x)?.is_some() && g.is_ancestor(x, tip)?),
+            })
+        })
+    };
+    if let Some(a) = ask().await? {
+        return Ok(a);
+    }
+    crate::derive::ensure(hub, project, tip).await?;
+    match ask().await? {
+        Some(a) => Ok(a),
+        // Another server's deriver holds the project.
+        None => crate::sync::is_ancestor(hub, project, x, tip).await,
+    }
+}
+
+/// The branch rules (`.veilrules`) a move of the default branch to real tree
+/// `new` would change, against its tip's `tip` (BUG-1102): only an admin's
+/// move may. The accepted rules are the tip's, never a parent's.
+pub fn rules_changed(src: &Source, new: &ObjectId, tip: Option<&ObjectId>) -> Result<bool> {
+    let at = |t: &ObjectId| crate::sync::entry_at(src, t, rules::RULES_FILE);
+    let before = match tip {
+        Some(t) => at(t)?,
+        None => None,
+    };
+    let after = at(new)?;
+    Ok(match (after, before) {
+        (None, None) => false,
+        (Some(a), Some(b)) => !a.same_content(&b),
+        _ => true,
+    })
+}
+

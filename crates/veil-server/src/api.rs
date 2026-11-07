@@ -664,23 +664,21 @@ async fn land_status(
     Query(q): Query<WaitQuery>,
 ) -> Result<Json<veil_core::hub::land::LandResult>> {
     let me = caller.signed_in()?.id;
-    let (project, _) = perm::open(&hub, &p, &caller).await?;
-    let not_found = || Error::not_found("no landing of yours with that ticket");
-    let w = hub.landing.register(&ticket);
-    let (branch, r) = match crate::landing::read(&hub, project.id, me, &ticket).await? {
-        Some(x) => x,
-        None => {
-            crate::landing::abandon(&hub, w);
-            return Err(not_found());
-        }
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
+    // Its submitter's only: anyone else's ticket is not found, before any
+    // waiter is registered under it.
+    let Some((branch, r)) = crate::landing::read(&hub, project.id, me, &ticket).await? else {
+        return Err(Error::not_found("no landing of yours with that ticket"));
     };
-    if r.state != veil_core::hub::land::LandState::Queued || q.wait == Some(false) {
-        crate::landing::abandon(&hub, w);
-        return Ok(Json(r));
-    }
-    crate::landing::ensure(&hub, project.id, &branch);
-    let deadline = tokio::time::Instant::now() + crate::landing::WAIT;
-    Ok(Json(crate::landing::wait(&hub, project.id, me, &branch, w, deadline).await?))
+    let r = if r.state != veil_core::hub::land::LandState::Queued || q.wait == Some(false) {
+        r
+    } else {
+        let w = hub.landing.register(&ticket);
+        crate::landing::ensure(&hub, project.id, &branch);
+        let deadline = tokio::time::Instant::now() + crate::landing::WAIT;
+        crate::landing::wait(&hub, project.id, me, &branch, w, deadline).await?
+    };
+    Ok(Json(crate::landing::seen(&hub, &project, &viewer, r).await?))
 }
 
 /// A commit through the API (`changes`).

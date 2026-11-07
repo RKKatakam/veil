@@ -4,23 +4,37 @@
 //!
 //! ```text
 //! loop:
-//!   entries := the ready queue rows not in the batch being committed, in order, at most MAX_BATCH
+//!   entries := the ready queue rows not in the batch being committed, in order,
+//!              at most MAX_BATCH, and at most BATCH_BYTES of new objects held
+//!              (the batch being committed counted too)
 //!   build on the tip the batch being committed leaves (pipelined), in memory:
 //!     an entry that changes .veilpolicy or .veilrules ends the batch before it, and lands alone
+//!     access changed since the submit (epochs): write access first, before anything about the tip
 //!     for each change of an entry's stack:
 //!       on the tip already: it lands as it is
 //!       else: the fast path (every edited path as its base had it) or `conflict`;
 //!             apply its edits; the landing check; a new snapshot, signed by the server
-//!       access changed since the submit (epochs), or the tip's .veilpolicy differs from
-//!       its base's: the push's checks again (`sync::complete`) on the new parent
-//!     projections of every new snapshot for the view keys in use
+//!       access changed, or the tip's .veilpolicy differs from its base's: the push's
+//!       checks again (`sync::complete`) on the new parents
+//!     projections of every new snapshot, onto each kept view key's last memo (never a walk)
 //!   wait for the batch being committed; if it lost (the tip moved, the lease was lost): discard, start again
 //!   store the new objects, then one transaction: the lease's epoch (fencing), the queue rows
 //!   (still queued, or nothing lands), snapshots, projection memos, the branch's compare-and-swap
 //! ```
+//!
+//! **Projections without walks** (BUG-1100, BUG-1106). The service keeps,
+//! for each view key of the project's people (and anyone on Earth's), the
+//! projection of its tip, and projects each new snapshot onto it. A key it
+//! does not keep is attached from its newest memo on the branch's recent
+//! first-parent line (the last [`RECENT`] snapshots this service knows),
+//! projecting only what came after; a key with no memo there is handed to
+//! S13's background fill (`query::graph::prefill`), and its submitters'
+//! answers are projected by their own requests. Every projection the
+//! service makes is stored in the batch's commit, and a stored memo always
+//! wins: one written meanwhile with another value rolls the batch back.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
@@ -54,6 +68,23 @@ const IDLE: Duration = Duration::from_secs(5);
 const RENEW: Duration = Duration::from_millis(500);
 /// View keys whose projections a service keeps up to date, at most.
 const MAX_KEYS: usize = 64;
+/// The recent first-parent line a view key is attached from.
+const RECENT: usize = 1024;
+/// Most bytes of new objects a batch holds, with the batch being committed
+/// (BUG-1107): an entry is left for the next batch past it (the first
+/// entry of a batch always goes). Decoded, a folder listing takes about
+/// three times its bytes, and each change in a big folder decodes several:
+/// 8 MiB keeps 400 changes in a 30,000-file folder near 200 MiB in all,
+/// while ordinary changes (a few KiB of listings each) still fill batches
+/// of hundreds.
+pub const BATCH_BYTES: usize = 8 << 20;
+/// A view key with no memo on the recent line is handed to the background
+/// fill at most this often.
+const PREFILL_EVERY: Duration = Duration::from_secs(5);
+/// Finished queue rows are kept this long (a ticket's outcome), then
+/// deleted, a branch at a time, at most this often.
+const KEEP_DONE_MS: i64 = 24 * 3600 * 1000;
+const CLEAN_EVERY: Duration = Duration::from_secs(60);
 
 /// The database's clock, in milliseconds.
 const DB_NOW: &str = "(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT";
@@ -110,7 +141,7 @@ struct Row {
     epochs: (i64, i64),
 }
 
-/// Who an entry lands as, now.
+/// Someone a projection is made for, now.
 #[derive(Clone)]
 struct As {
     project: Arc<Project>,
@@ -119,33 +150,62 @@ struct As {
     key: Option<String>,
 }
 
+/// A view key the service keeps: one of its viewers (any gives the same
+/// view), and the projection of the tip for it.
+#[derive(Clone)]
+struct Kept {
+    who: As,
+    at: ObjectId,
+}
+
 /// The branch as the service last left it (or predicts it, after the batch
 /// being committed).
 #[derive(Clone, Default)]
 struct State {
     tip: Option<ObjectId>,
-    /// The view keys kept up to date: who has each (any viewer of that key
-    /// gives the same view), and the projection of `tip` for it.
-    keys: BTreeMap<String, (As, ObjectId, Instant)>,
+    /// The first-parent line ending at `tip`, oldest first, at most
+    /// [`RECENT`] long.
+    recent: VecDeque<ObjectId>,
+    keys: BTreeMap<String, Kept>,
     /// The objects of the batch that made `tip`, which may not be stored
     /// yet while it commits: the next batch is built on them.
     made: Arc<HashMap<ObjectId, Bytes>>,
+    made_bytes: usize,
+}
+
+/// The project's view keys, as of its access epoch (re-read when it
+/// changes), and when each unkept one was last handed to the fill.
+#[derive(Default)]
+struct Known {
+    epoch: Option<i64>,
+    views: BTreeMap<String, As>,
+    prefilled: HashMap<String, Instant>,
 }
 
 /// An entry ready to build.
 struct Prepared {
     row: Row,
     who: Result<As, String>,
-    /// Re-run the push's checks when it lands: access changed since it was
-    /// submitted.
+    /// Access changed since it was submitted: write access is decided first,
+    /// and the push's checks run again.
     recheck: bool,
-    /// The submitter's projections of the stack's snapshots.
-    psub: Vec<ObjectId>,
+}
+
+/// A batch's inputs, read before it is built.
+struct Inputs {
+    entries: Vec<Prepared>,
+    /// View keys to attach: `(key, who, position on the recent line, memo there)`.
+    attach: Vec<(String, As, usize, ObjectId)>,
+    /// Stored memos the batch may need, by `(view key, real)`.
+    memo: HashMap<(String, ObjectId), ObjectId>,
+    /// Origins (`sync::push`) of the stack snapshots that have one.
+    origins: HashMap<ObjectId, ObjectId>,
 }
 
 /// What one entry came to.
 enum Outcome {
-    Landed { seen: Vec<ObjectId> },
+    /// Where each change of the stack landed (real snapshots).
+    Landed { reals: Vec<ObjectId> },
     Conflict { paths: Vec<String> },
     Rejected(String),
 }
@@ -155,7 +215,11 @@ struct Built {
     rows: Vec<(i64, String)>,
     outcomes: Vec<Outcome>,
     objects: Vec<(ObjectId, Bytes)>,
+    bytes: usize,
     snapshots: Vec<ObjectId>,
+    /// Submitted snapshots made again: `(submitted, landed)`.
+    landings: Vec<(ObjectId, ObjectId)>,
+    /// New memo rows `(view key, real, projected)`.
     memos: Vec<(String, ObjectId, ObjectId)>,
     old_tip: Option<ObjectId>,
     after: State,
@@ -165,10 +229,20 @@ struct Built {
     accept: Option<String>,
 }
 
+impl Built {
+    fn object(&mut self, src: &mut Source, id: ObjectId, raw: Bytes) {
+        self.bytes += raw.len();
+        src.pending.insert(id, raw.clone());
+        self.objects.push((id, raw));
+    }
+}
+
 /// How a batch's commit ended.
 enum Committed {
     Ok,
-    /// The branch moved under it (an admin's forced push): nothing landed.
+    /// The branch moved under it (an admin's forced push), or a memo was
+    /// stored meanwhile with another value: nothing landed; built again
+    /// from the database.
     Moved,
     /// Another server took the lease: stop.
     LeaseLost,
@@ -217,16 +291,17 @@ struct InFlight {
 impl Service {
     async fn run(&self, wake: Arc<Notify>) -> Result<()> {
         let mut state = self.load().await?;
+        let mut known = Known::default();
         let mut inflight: Option<InFlight> = None;
         let mut idle = Instant::now();
         let mut renewed = Instant::now();
+        let mut cleaned: Option<Instant> = None;
         loop {
             // A change of access or rules is committed before anything is
             // built after it: later entries are checked against it.
             if inflight.as_ref().is_some_and(|f| f.alone) {
-                match self.finish(inflight.take().expect("checked"), &mut state).await? {
-                    true => {}
-                    false => return Ok(()),
+                if !self.finish(inflight.take().expect("checked"), &mut state).await? {
+                    return Ok(());
                 }
                 continue;
             }
@@ -238,6 +313,10 @@ impl Service {
                         return Ok(());
                     }
                     continue;
+                }
+                if cleaned.is_none_or(|t| t.elapsed() > CLEAN_EVERY) {
+                    self.clean().await?;
+                    cleaned = Some(Instant::now());
                 }
                 if idle.elapsed() > IDLE {
                     return Ok(());
@@ -253,20 +332,9 @@ impl Service {
             }
             idle = Instant::now();
             let on = inflight.as_ref().map(|f| f.after.clone()).unwrap_or_else(|| state.clone());
-            let prepared = match self.prepare(rows, &on, inflight.is_some()).await? {
-                Some(p) => p,
-                None => {
-                    // A view key new to this service needs the tip committed.
-                    if let Some(f) = inflight.take() {
-                        if !self.finish(f, &mut state).await? {
-                            return Ok(());
-                        }
-                    }
-                    continue;
-                }
-            };
+            let inputs = self.prepare(rows, &on, state.tip, &mut known).await?;
             let t = Instant::now();
-            let built = self.build(prepared, on).await?;
+            let built = self.build(inputs, on).await?;
             self.hub.landing.stats.build_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
             // Its objects are stored while the batch before it commits (they
             // are content-addressed: stored for a batch that is then
@@ -315,6 +383,17 @@ impl Service {
         }
     }
 
+    /// Finished rows older than [`KEEP_DONE_MS`] go.
+    async fn clean(&self) -> Result<()> {
+        sqlx::query("DELETE FROM landing_queue WHERE project_id = $1 AND branch = $2 AND state <> 'queued' AND done_at < $3")
+            .bind(self.project)
+            .bind(&self.branch)
+            .bind(veil_core::now_millis() - KEEP_DONE_MS)
+            .execute(&self.hub.db)
+            .await?;
+        Ok(())
+    }
+
     /// Wait for the batch being committed: `state` becomes what it left,
     /// or what the database holds if it lost. `false`: the lease is lost.
     async fn finish(&self, f: InFlight, state: &mut State) -> Result<bool> {
@@ -339,17 +418,18 @@ impl Service {
         }
     }
 
-    /// The branch's tip, from the database.
+    /// The branch's tip, from the database (no view key kept yet).
     async fn load(&self) -> Result<State> {
         let t: Option<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2")
             .bind(self.project)
             .bind(&self.branch)
             .fetch_optional(&self.hub.db)
             .await?;
+        let tip = t.map(|t| ObjectId::from_hex(&t).map_err(|e| Error::Other(e.into()))).transpose()?;
         Ok(State {
-            tip: t.map(|t| ObjectId::from_hex(&t).map_err(|e| Error::Other(e.into()))).transpose()?,
-            keys: BTreeMap::new(),
-            made: Arc::default(),
+            tip,
+            recent: tip.into_iter().collect(),
+            ..State::default()
         })
     }
 
@@ -386,11 +466,60 @@ impl Service {
         Ok(out)
     }
 
-    /// Who each entry lands as now, whether its checks must run again, its
-    /// submitter's projections, and the projection of the tip `on` for
-    /// every view key in use. `None` when a view key new to this service
-    /// needs `on` committed first (`pipelined`).
-    async fn prepare(&self, rows: Vec<Row>, on: &State, pipelined: bool) -> Result<Option<(Vec<Prepared>, Vec<(String, As, ObjectId)>)>> {
+    /// The project's view keys (what `derive::memo_tips` keeps warm): each
+    /// non-admin participant's and anyone on Earth's, at most [`MAX_KEYS`].
+    async fn enumerate(&self, known: &mut Known) -> Result<()> {
+        let hub = &self.hub;
+        let mut c = hub.db.acquire().await?;
+        let Some(project) = crate::perm::load_project(&mut c, &self.name).await? else { return Ok(()) };
+        let admins: HashSet<i64> = sqlx::query_scalar("SELECT person_id FROM project_admins WHERE project_id = $1")
+            .bind(self.project)
+            .fetch_all(&mut *c)
+            .await?
+            .into_iter()
+            .collect();
+        let members: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT m.person_id, g.id FROM group_members m JOIN groups g ON g.id = m.group_id WHERE g.project_id = $1")
+                .bind(self.project)
+                .fetch_all(&mut *c)
+                .await?;
+        drop(c);
+        let mut people: BTreeMap<i64, HashSet<i64>> = BTreeMap::new();
+        for (p, g) in members {
+            people.entry(p).or_default().insert(g);
+        }
+        for b in project.bindings.values() {
+            if let crate::perm::Binding::Person(p) = b {
+                people.entry(*p).or_default();
+            }
+        }
+        let project = Arc::new(project);
+        let mut viewers = vec![Viewer::default()];
+        viewers.extend(people.into_iter().filter(|(p, _)| !admins.contains(p)).map(|(p, groups)| Viewer {
+            person: Some(p),
+            admin: false,
+            groups,
+        }));
+        known.views.clear();
+        for v in viewers {
+            let view = project.view(&v);
+            if !view.sees_anything() {
+                continue;
+            }
+            let key = view.key();
+            if known.views.len() < MAX_KEYS && !known.views.contains_key(&key) {
+                known.views.insert(key.clone(), As { project: project.clone(), viewer: v, key: Some(key) });
+            }
+        }
+        Ok(())
+    }
+
+    /// Who each entry lands as now and whether its checks must run again;
+    /// which view keys to attach from the recent line `on.recent`; and the
+    /// stored memos and origins the batch will read. Never a walk of
+    /// history: a view key with no memo on the recent line is handed to
+    /// the background fill, at `committed` (the tip in the database).
+    async fn prepare(&self, rows: Vec<Row>, on: &State, committed: Option<ObjectId>, known: &mut Known) -> Result<Inputs> {
         let hub = &self.hub;
         // The access epochs now, of every submitter and of the project, in
         // one statement.
@@ -410,8 +539,12 @@ impl Service {
         .await?;
         let project_epoch = epochs.iter().find(|e| e.0 == self.project).map_or(0, |e| e.2);
         let person_epoch = |p: i64| epochs.iter().find(|e| e.0 == 0 && e.1 == p).map_or(0, |e| e.2);
+        if known.epoch != Some(project_epoch) {
+            self.enumerate(known).await?;
+            known.epoch = Some(project_epoch);
+        }
         let mut who: HashMap<(i64, String), Result<As, String>> = HashMap::new();
-        let mut out = Vec::new();
+        let mut entries = Vec::new();
         for row in rows {
             let k = (row.person.id, row.person.device_key.clone());
             if !who.contains_key(&k) {
@@ -432,53 +565,97 @@ impl Service {
                     Err(Error::Api { message, code: "forbidden", .. }) => Err(message),
                     Err(e) => return Err(e),
                 };
+                if let Ok(a) = &w {
+                    if let Some(key) = &a.key {
+                        if known.views.len() < MAX_KEYS || known.views.contains_key(key) {
+                            known.views.entry(key.clone()).or_insert_with(|| a.clone());
+                        }
+                    }
+                }
                 who.insert(k.clone(), w);
             }
             let w = who[&k].clone();
             let recheck = row.epochs != (person_epoch(row.person.id), project_epoch);
-            let mut psub = Vec::new();
-            if let Ok(a) = &w {
-                for s in &row.stack {
-                    psub.push(sync::projected(hub, &a.project, &a.viewer, *s).await?);
+            entries.push(Prepared { row, who: w, recheck });
+        }
+        // View keys known and not kept: attached from their newest memo on
+        // the recent line, or handed to the background fill.
+        let recent: Vec<ObjectId> = on.recent.iter().copied().collect();
+        let unkept: Vec<(String, As)> = known
+            .views
+            .iter()
+            .filter(|(k, _)| !on.keys.contains_key(*k))
+            .take(MAX_KEYS.saturating_sub(on.keys.len()))
+            .map(|(k, a)| (k.clone(), a.clone()))
+            .collect();
+        let mut attach = Vec::new();
+        if !unkept.is_empty() && !recent.is_empty() {
+            let keys: Vec<String> = unkept.iter().map(|u| u.0.clone()).collect();
+            let found = memos(hub, self.project, &keys, &recent).await?;
+            for (k, a) in unkept {
+                let newest = recent.iter().enumerate().rev().find_map(|(i, x)| found.get(&(k.clone(), *x)).map(|m| (i, *m)));
+                match newest {
+                    Some((i, m)) => attach.push((k, a, i, m)),
+                    None => {
+                        if let Some(tip) = committed {
+                            if known.prefilled.get(&k).is_none_or(|t| t.elapsed() > PREFILL_EVERY) {
+                                known.prefilled.insert(k.clone(), Instant::now());
+                                if let Err(e) = crate::query::graph::prefill(hub, &a.project, &a.viewer, &[tip]).await {
+                                    eprintln!("veil-server: queueing a view's fill for project {}: {e:?}", self.project);
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            out.push(Prepared { row, who: w, recheck, psub });
         }
-        // The tip as each view key new to this service sees it.
-        let mut new_keys: Vec<(String, As, ObjectId)> = Vec::new();
-        if let Some(tip) = on.tip {
-            for p in &out {
-                let Ok(a) = &p.who else { continue };
-                let Some(k) = &a.key else { continue };
-                if on.keys.contains_key(k) || new_keys.iter().any(|(m, _, _)| m == k) {
-                    continue;
-                }
-                if pipelined {
-                    return Ok(None);
-                }
-                new_keys.push((k.clone(), a.clone(), sync::projected(hub, &a.project, &a.viewer, tip).await?));
+        // The memos the batch may read: of the stack snapshots (landed as
+        // they are), their other parents and predecessors, and of the other
+        // parents and predecessors of the recent snapshots an attached key
+        // is projected over; and the stack snapshots' origins.
+        let stacks: Vec<ObjectId> = entries.iter().flat_map(|e| e.row.stack.iter().copied()).collect();
+        let first_gap = attach.iter().map(|a| a.2 + 1).min().unwrap_or(recent.len());
+        let gap: Vec<ObjectId> = recent[first_gap.min(recent.len())..].to_vec();
+        let (s2, g2) = (stacks.clone(), gap.clone());
+        let mut ids: Vec<ObjectId> = sync::blocking(hub, self.project, move |src| {
+            let mut ids = s2.clone();
+            for x in s2.iter().chain(&g2) {
+                // A recent snapshot may be the batch's being committed, not
+                // stored yet: its parents are then on the line itself.
+                let Ok(s) = src.snapshot(x) else { continue };
+                ids.extend(s.parents.iter().skip(1).copied());
+                ids.extend(s.predecessors.iter().copied());
             }
-        }
-        Ok(Some((out, new_keys)))
+            Ok(ids)
+        })
+        .await?;
+        ids.sort_unstable();
+        ids.dedup();
+        let keys: Vec<String> = on.keys.keys().cloned().chain(attach.iter().map(|a| a.0.clone())).collect();
+        let memo = match keys.is_empty() || ids.is_empty() {
+            true => HashMap::new(),
+            false => memos(hub, self.project, &keys, &ids).await?,
+        };
+        let origins: HashMap<ObjectId, ObjectId> = if stacks.is_empty() {
+            HashMap::new()
+        } else {
+            let hex: Vec<String> = stacks.iter().map(ObjectId::hex).collect();
+            let rows: Vec<(String, String)> = sqlx::query_as("SELECT real_id, origin_id FROM origins WHERE project_id = $1 AND real_id = ANY($2)")
+                .bind(self.project)
+                .bind(&hex)
+                .fetch_all(&hub.db)
+                .await?;
+            rows.into_iter().filter_map(|(r, o)| Some((ObjectId::from_hex(&r).ok()?, ObjectId::from_hex(&o).ok()?))).collect()
+        };
+        Ok(Inputs { entries, attach, memo, origins })
     }
 
     /// Build the batch on `on` (on a blocking thread: trees, hashes,
     /// signatures).
-    async fn build(&self, (prepared, new_keys): (Vec<Prepared>, Vec<(String, As, ObjectId)>), mut on: State) -> Result<Built> {
-        let now = Instant::now();
-        for (k, a, seen) in new_keys {
-            on.keys.insert(k, (a, seen, now));
-        }
-        // Keys nobody landed with for a minute are no longer kept up to date
-        // (their viewers' next requests project on demand, as before).
-        on.keys.retain(|_, v| v.2.elapsed() < Duration::from_secs(60));
-        while on.keys.len() > MAX_KEYS {
-            let oldest = on.keys.iter().min_by_key(|(_, v)| v.2).map(|(k, _)| k.clone()).expect("not empty");
-            on.keys.remove(&oldest);
-        }
+    async fn build(&self, inputs: Inputs, on: State) -> Result<Built> {
         let (hub, project, branch) = (self.hub.clone(), self.project, self.branch.clone());
         let rt = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || build(hub, rt, project, &branch, prepared, on)).await.map_err(|e| Error::Other(e.into()))?
+        tokio::task::spawn_blocking(move || build(hub, rt, project, &branch, inputs, on)).await.map_err(|e| Error::Other(e.into()))?
     }
 
     /// Commit the batch (its objects stored already) in one transaction;
@@ -487,16 +664,16 @@ impl Service {
         let t = Instant::now();
         let hub = &self.hub;
         let moved = b.after.tip != b.old_tip;
-        let mut results: Vec<LandResult> = b
+        let results: Vec<LandResult> = b
             .rows
             .iter()
             .zip(&b.outcomes)
             .map(|((_, ticket), o)| {
                 let mut r = super::queued(ticket);
                 match o {
-                    Outcome::Landed { seen, .. } => {
+                    Outcome::Landed { reals } => {
                         r.state = LandState::Landed;
-                        r.landed = seen.clone();
+                        r.landed = reals.clone();
                     }
                     Outcome::Conflict { paths } => {
                         r.state = LandState::Conflict;
@@ -519,22 +696,16 @@ impl Service {
         let new = b.after.tip.map(|t| t.hex());
         let seqs: Vec<i64> = b.rows.iter().map(|r| r.0).collect();
         let snapshots: Vec<String> = b.snapshots.iter().map(ObjectId::hex).collect();
-        let (mk, mr, mp): (Vec<String>, Vec<String>, Vec<String>) = {
-            let mut k = Vec::new();
-            let mut r = Vec::new();
-            let mut p = Vec::new();
-            for (key, real, proj) in &b.memos {
-                k.push(key.clone());
-                r.push(real.hex());
-                p.push(proj.hex());
-            }
-            (k, r, p)
-        };
+        let (ls, ll): (Vec<String>, Vec<String>) = b.landings.iter().map(|(s, l)| (s.hex(), l.hex())).unzip();
+        let mk: Vec<String> = b.memos.iter().map(|m| m.0.clone()).collect();
+        let mr: Vec<String> = b.memos.iter().map(|m| m.1.hex()).collect();
+        let mp: Vec<String> = b.memos.iter().map(|m| m.2.hex()).collect();
         let accept = b.accept.clone();
         let landed = b.outcomes.iter().filter(|o| matches!(o, Outcome::Landed { .. })).count();
         let notify = hub.caches.notices.load(Ordering::SeqCst);
         let tx_results = results.clone();
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+            let (ls, ll) = (ls.clone(), ll.clone());
             let (branch, holder, old, new, seqs, snapshots, mk, mr, mp, accept, name, mut results) = (
                 branch.clone(),
                 holder.clone(),
@@ -614,18 +785,48 @@ impl Service {
                         .execute(&mut *c)
                         .await?;
                 }
-                if !mk.is_empty() {
+                if !ls.is_empty() {
                     sqlx::query(
+                        "INSERT INTO landings (project_id, submitted, landed) SELECT $1, s, l FROM unnest($2::TEXT[], $3::TEXT[]) AS v(s, l) \
+                         ON CONFLICT DO NOTHING",
+                    )
+                    .bind(pid)
+                    .bind(&ls)
+                    .bind(&ll)
+                    .execute(&mut *c)
+                    .await?;
+                }
+                if !mk.is_empty() {
+                    let stored: Vec<(String, String)> = sqlx::query_as(
                         "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at) \
-                         SELECT $1, k, r, p, $5 FROM unnest($2::TEXT[], $3::TEXT[], $4::TEXT[]) AS v(k, r, p) ON CONFLICT DO NOTHING",
+                         SELECT $1, k, r, p, $5 FROM unnest($2::TEXT[], $3::TEXT[], $4::TEXT[]) AS v(k, r, p) ON CONFLICT DO NOTHING \
+                         RETURNING view_key, real_id",
                     )
                     .bind(pid)
                     .bind(&mk)
                     .bind(&mr)
                     .bind(&mp)
                     .bind(veil_core::now_millis())
-                    .execute(&mut *c)
+                    .fetch_all(&mut *c)
                     .await?;
+                    // A memo stored meanwhile (a background fill) wins: if it
+                    // is another value, this batch built on one nobody has.
+                    if stored.len() < mk.len() {
+                        let have: Vec<(String, String, String)> = sqlx::query_as(
+                            "SELECT p.view_key, p.real_id, p.projected_id FROM projections p \
+                             JOIN unnest($2::TEXT[], $3::TEXT[]) AS v(k, r) ON p.view_key = v.k AND p.real_id = v.r WHERE p.project_id = $1",
+                        )
+                        .bind(pid)
+                        .bind(&mk)
+                        .bind(&mr)
+                        .fetch_all(&mut *c)
+                        .await?;
+                        let ours: HashMap<(&str, &str), &str> =
+                            mk.iter().zip(&mr).zip(&mp).map(|((k, r), p)| ((k.as_str(), r.as_str()), p.as_str())).collect();
+                        if have.iter().any(|(k, r, p)| ours.get(&(k.as_str(), r.as_str())).is_some_and(|o| o != p)) {
+                            return Err(Error::conflict(MOVED));
+                        }
+                    }
                 }
                 sqlx::query("INSERT INTO audit_log (project_id, at, actor, action, details) VALUES ($1, $2, NULL, 'land', $3)")
                     .bind(pid)
@@ -644,7 +845,7 @@ impl Service {
             })
         })
         .await;
-        let stored = match r {
+        let results = match r {
             Ok(r) => r,
             Err(Error::Api { code: "conflict", message, .. }) if message == LEASE_LOST => {
                 hub.landing.stats.lease_lost.fetch_add(1, Ordering::Relaxed);
@@ -653,7 +854,6 @@ impl Service {
             Err(Error::Api { code: "conflict", message, .. }) if message == MOVED => return Ok(Committed::Moved),
             Err(e) => return Err(e),
         };
-        results = stored;
         for s in &b.snapshots {
             hub.caches.put_committed(self.project, s);
         }
@@ -675,6 +875,42 @@ impl Service {
     }
 }
 
+/// Stored memos of `project` for `keys` × `reals`, in one statement (the
+/// server's memory first when it holds them all).
+async fn memos(hub: &Hub, project: i64, keys: &[String], reals: &[ObjectId]) -> Result<HashMap<(String, ObjectId), ObjectId>> {
+    let mut out = HashMap::new();
+    let mut missing = false;
+    for k in keys {
+        for r in reals {
+            match hub.caches.memo(project, k, r) {
+                Some(p) => {
+                    out.insert((k.clone(), *r), p);
+                }
+                None => missing = true,
+            }
+        }
+    }
+    if !missing {
+        return Ok(out);
+    }
+    let hex: Vec<String> = reals.iter().map(ObjectId::hex).collect();
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT view_key, real_id, projected_id FROM projections WHERE project_id = $1 AND view_key = ANY($2) AND real_id = ANY($3)",
+    )
+    .bind(project)
+    .bind(keys)
+    .bind(&hex)
+    .fetch_all(&hub.db)
+    .await?;
+    for (k, r, p) in rows {
+        if let (Ok(r), Ok(p)) = (ObjectId::from_hex(&r), ObjectId::from_hex(&p)) {
+            hub.caches.put_memo(project, &k, &r, &p);
+            out.insert((k, r), p);
+        }
+    }
+    Ok(out)
+}
+
 const LEASE_LOST: &str = "the landing lease was lost";
 const MOVED: &str = "the branch moved under the landing service";
 
@@ -687,33 +923,115 @@ fn state_name(s: LandState) -> &'static str {
     }
 }
 
-/// The batch, built on `on`: each entry in order, until one that must land
-/// alone.
-fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, prepared: Vec<Prepared>, on: State) -> Result<Built> {
+/// The projection of real snapshot `x` (whose first parent's projection is
+/// `pp`) for kept key `k`: a stored memo, else made here from stored memos
+/// only (never a walk). `None` when it needs a projection nobody stored
+/// (another parent's): the key is then not kept. The bool: made here (to
+/// store).
+#[allow(clippy::too_many_arguments)]
+fn project_onto(
+    src: &Source,
+    who: &As,
+    k: &str,
+    x: ObjectId,
+    pp: ObjectId,
+    memo: &HashMap<(String, ObjectId), ObjectId>,
+    origins: &HashMap<ObjectId, ObjectId>,
+    identity: &veil_core::Identity,
+) -> Result<Option<(ObjectId, Option<Bytes>, bool)>> {
+    if let Some(px) = memo.get(&(k.to_string(), x)) {
+        return Ok(Some((*px, None, false)));
+    }
+    let s = src.snapshot(&x)?;
+    let mut pparents = vec![pp];
+    for p in s.parents.iter().skip(1) {
+        let Some(q) = memo.get(&(k.to_string(), *p)) else { return Ok(None) };
+        if !pparents.contains(q) {
+            pparents.push(*q);
+        }
+    }
+    // A predecessor without a stored projection is left out (as one the
+    // viewer's history has no version of).
+    let mut ppreds = Vec::new();
+    for pred in &s.predecessors {
+        if let Some(q) = memo.get(&(k.to_string(), *pred)) {
+            if src.snapshot(q)?.change_id == src.snapshot(pred)?.change_id && !ppreds.contains(q) {
+                ppreds.push(*q);
+            }
+        }
+    }
+    let view = who.project.view(&who.viewer);
+    let (px, raw) = sync::project_one(src, &view, x, &s, pparents, ppreds, origins.get(&x).copied(), identity)?;
+    Ok(Some((px, raw, true)))
+}
+
+/// The batch, built on `on`: the attached view keys, then each entry in
+/// order, until one that must land alone, or the batch holds
+/// [`BATCH_BYTES`].
+fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, inputs: Inputs, on: State) -> Result<Built> {
     let mut src = Source {
         hub: hub.clone(),
         project,
         rt,
         pending: (*on.made).clone(),
     };
+    let Inputs { entries, attach, mut memo, origins } = inputs;
     let mut b = Built {
         rows: Vec::new(),
         outcomes: Vec::new(),
         objects: Vec::new(),
+        bytes: 0,
         snapshots: Vec::new(),
+        landings: Vec::new(),
         memos: Vec::new(),
         old_tip: on.tip,
         after: on.clone(),
         alone: false,
         accept: None,
     };
-    for p in prepared {
+    // Attached keys: projected from their memo over what came after it.
+    for (k, who, at, m) in attach {
+        let mut p = m;
+        let mut made = Vec::new();
+        let mut ok = true;
+        for x in on.recent.iter().skip(at + 1) {
+            match project_onto(&src, &who, &k, *x, p, &memo, &origins, &hub.identity)? {
+                Some((px, raw, new)) => {
+                    if new {
+                        made.push((*x, px, raw));
+                    }
+                    p = px;
+                }
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        for (x, px, raw) in made {
+            if let Some(raw) = raw {
+                b.object(&mut src, px, raw);
+            }
+            memo.insert((k.clone(), x), px);
+            b.memos.push((k.clone(), x, px));
+            hub.landing.stats.projected.fetch_add(1, Ordering::Relaxed);
+        }
+        b.after.keys.insert(k, Kept { who, at: p });
+    }
+    for p in entries {
         if b.alone {
             break;
         }
-        let mark = (b.objects.len(), b.snapshots.len(), b.memos.len(), src.pending.len());
+        // Bounded in bytes, with the batch being committed (BUG-1107).
+        if !b.rows.is_empty() && on.made_bytes + b.bytes >= BATCH_BYTES {
+            break;
+        }
+        let mark = (b.objects.len(), b.bytes, b.snapshots.len(), b.memos.len(), b.landings.len());
         let row = (p.row.seq, p.row.ticket.clone());
-        let outcome = match entry(&hub, &mut src, branch, &p, &mut b) {
+        let outcome = match entry(&hub, &mut src, branch, &p, &mut b, &mut memo, &origins) {
             Ok(Some(o)) => o,
             // It changes access or rules and others come before it: it lands
             // alone, in the next batch.
@@ -726,8 +1044,10 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
         if !matches!(outcome, Outcome::Landed { .. }) {
             // Nothing of it stays.
             b.objects.truncate(mark.0);
-            b.snapshots.truncate(mark.1);
-            b.memos.truncate(mark.2);
+            b.bytes = mark.1;
+            b.snapshots.truncate(mark.2);
+            b.memos.truncate(mark.3);
+            b.landings.truncate(mark.4);
             if b.alone && b.rows.is_empty() {
                 b.alone = false;
                 b.accept = None;
@@ -739,6 +1059,7 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
     // Nothing landed: the tip is still the one `on.made` made.
     if !b.objects.is_empty() {
         b.after.made = Arc::new(b.objects.iter().cloned().collect());
+        b.after.made_bytes = b.bytes;
     }
     Ok(b)
 }
@@ -746,7 +1067,15 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
 /// Land one entry's stack on `b.after`'s tip: its outcome (and, when it
 /// landed, `b.after` moved on), or `None` when it must land alone and does
 /// not come first.
-fn entry(hub: &Arc<Hub>, src: &mut Source, branch: &str, p: &Prepared, b: &mut Built) -> Result<Option<Outcome>> {
+fn entry(
+    hub: &Arc<Hub>,
+    src: &mut Source,
+    branch: &str,
+    p: &Prepared,
+    b: &mut Built,
+    memo: &mut HashMap<(String, ObjectId), ObjectId>,
+    origins: &HashMap<ObjectId, ObjectId>,
+) -> Result<Option<Outcome>> {
     let Some(tip) = b.after.tip else { return Ok(Some(Outcome::Rejected(format!("there is no branch '{branch}'")))) };
     let who = match &p.who {
         Ok(a) => a.clone(),
@@ -767,16 +1096,31 @@ fn entry(hub: &Arc<Hub>, src: &mut Source, branch: &str, p: &Prepared, b: &mut B
         }
         b.alone = true;
     }
+    // Access changed since the submit: it decides first, whatever happened
+    // on the tip since, so the answer to someone who may no longer write a
+    // path never says whether it changed (BUG-1104). (A merge's paths taken
+    // from another parent are the push's checks', below.)
+    if p.recheck {
+        let view = who.project.view(&who.viewer);
+        for (s, set) in snaps.iter().zip(&sets) {
+            if s.parents.len() == 1 {
+                if let Some(c) = set.iter().find(|c| !view.write(&c.path)) {
+                    return Ok(Some(Outcome::Rejected(format!("you may not write '{}'", c.path))));
+                }
+            }
+        }
+    }
     // The stack, change by change, on the tip.
     let mut chain = tip;
-    let mut chain_tree = src.snapshot(&tip)?.tree;
-    let mut landed: Vec<(ObjectId, Arc<Snapshot>, bool)> = Vec::new();
+    let tip_tree = src.snapshot(&tip)?.tree;
+    let mut chain_tree = tip_tree;
+    let mut landed: Vec<(ObjectId, Arc<Snapshot>)> = Vec::new();
     for (i, (s, set)) in snaps.iter().zip(&sets).enumerate() {
         let sid = p.row.stack[i];
         let parent = s.parents[0];
         let parent_tree = src.snapshot(&parent)?.tree;
-        let (id, snap, rebuilt) = if parent == chain {
-            (sid, s.clone(), false)
+        let (id, snap, parents) = if parent == chain {
+            (sid, s.clone(), s.parents.clone())
         } else {
             if s.parents.len() > 1 {
                 return Ok(Some(Outcome::Rejected(
@@ -799,9 +1143,7 @@ fn entry(hub: &Arc<Hub>, src: &mut Source, branch: &str, p: &Prepared, b: &mut B
                 Err(edits::Blocked(path)) => return Ok(Some(Outcome::Conflict { paths: vec![path] })),
             };
             for (id, (raw, _)) in made {
-                let raw = Bytes::from(raw);
-                src.pending.insert(id, raw.clone());
-                b.objects.push((id, raw));
+                b.object(src, id, Bytes::from(raw));
             }
             // The landing check: the new snapshot's diff is exactly the
             // change's edits.
@@ -831,91 +1173,102 @@ fn entry(hub: &Arc<Hub>, src: &mut Source, branch: &str, p: &Prepared, b: &mut B
             n.sign(&hub.identity);
             let raw = Bytes::from(Object::Snapshot(n.clone()).encode());
             let id = ObjectId::hash(&raw);
-            src.pending.insert(id, raw.clone());
-            b.objects.push((id, raw));
+            b.object(src, id, raw);
             b.snapshots.push(id);
-            (id, Arc::new(n), true)
+            b.landings.push((sid, id));
+            (id, Arc::new(n), vec![chain])
         };
-        // The push's checks again, on the new parent, when what they read
+        // The push's checks again, on the new parents, when what they read
         // may have changed: access (epochs), or the policy file the
         // classification reads.
         let policy_moved = sync::entry_at(src, &parent_tree, POLICY_FILE)? != sync::entry_at(src, &chain_tree, POLICY_FILE)?;
         if p.recheck || policy_moved {
-            if let Err(why) = recheck(src, &who, &snap, chain, set, &hub.identity)? {
+            if let Err(why) = recheck(src, &who, &snap, &parents, set, &hub.identity)? {
                 return Ok(Some(Outcome::Rejected(why)));
             }
         }
-        landed.push((id, snap, rebuilt));
+        landed.push((id, snap));
         chain = id;
         chain_tree = landed.last().expect("pushed").1.tree;
     }
-    // A change of who has access, on the default branch: an admin's only.
-    if b.alone && branch == who.project.default_branch {
-        let text = sync::policy_text(src, &chain_tree)?;
-        if !AccessPolicy::parse(&text).same_rules(&who.project.policy) {
-            if !who.viewer.admin {
-                return Ok(Some(Outcome::Rejected("only admins may change who has access (the default branch's .veilpolicy)".into())));
+    if branch == who.project.default_branch {
+        // A change of who has access: an admin's only (the accepted policy).
+        if b.alone {
+            let text = sync::policy_text(src, &chain_tree)?;
+            if !AccessPolicy::parse(&text).same_rules(&who.project.policy) {
+                if !who.viewer.admin {
+                    return Ok(Some(Outcome::Rejected("only admins may change who has access (the default branch's .veilpolicy)".into())));
+                }
+                b.accept = Some(text);
             }
-            b.accept = Some(text);
+        }
+        // The branch rules: an admin's only, judged against the default
+        // branch's tip, never against a parent's (BUG-1102).
+        if !who.viewer.admin && sync::entry_at(src, &chain_tree, RULES_FILE)? != sync::entry_at(src, &tip_tree, RULES_FILE)? {
+            return Ok(Some(Outcome::Rejected("only admins may change the branch rules (.veilrules)".into())));
         }
     }
-    // Projections of every new snapshot for every view key in use; the
-    // submitter's are their answer.
-    let mut seen = Vec::new();
-    for (i, (x, snap, rebuilt)) in landed.iter().enumerate() {
-        let keys: Vec<String> = b.after.keys.keys().cloned().collect();
-        for k in keys {
-            let (a, pp, _) = b.after.keys[&k].clone();
-            let mine = who.key.as_deref() == Some(k.as_str());
-            let px = if mine && !rebuilt {
-                // Landed as it was submitted: its projection is the submit's.
-                p.psub[i]
-            } else {
-                let mut ppreds = Vec::new();
-                for pred in &snap.predecessors {
-                    let pp = match p.row.stack.iter().position(|s| s == pred) {
-                        Some(j) if mine => Some(p.psub[j]),
-                        _ => hub.caches.memo(src.project, &k, pred),
-                    };
-                    if let Some(pp) = pp {
-                        if src.snapshot(&pp)?.change_id == src.snapshot(pred)?.change_id && !ppreds.contains(&pp) {
-                            ppreds.push(pp);
-                        }
-                    }
-                }
-                let view = a.project.view(&a.viewer);
-                let (px, raw) = sync::project_one(src, &view, *x, snap, vec![pp], ppreds, None, &hub.identity)?;
-                if let Some(raw) = raw {
-                    src.pending.insert(px, raw.clone());
-                    b.objects.push((px, raw));
-                }
-                px
-            };
-            b.memos.push((k.clone(), *x, px));
-            if let Some(e) = b.after.keys.get_mut(&k) {
-                e.1 = px;
-                if mine {
-                    e.2 = Instant::now();
-                }
+    // Projections of every new snapshot for every kept view key, onto its
+    // last memo.
+    let mut new_memos = Vec::new();
+    let mut dropped = Vec::new();
+    let mut keys = b.after.keys.clone();
+    for (x, _) in &landed {
+        for (k, kept) in keys.iter_mut() {
+            if dropped.contains(k) {
+                continue;
             }
-            if mine {
-                seen.push(px);
+            match project_onto(src, &kept.who, k, *x, kept.at, memo, origins, &hub.identity)? {
+                Some((px, raw, new)) => {
+                    if new {
+                        new_memos.push((k.clone(), *x, px, raw));
+                    }
+                    memo.insert((k.clone(), *x), px);
+                    kept.at = px;
+                }
+                None => dropped.push(k.clone()),
             }
         }
-        if who.key.is_none() {
-            seen.push(*x);
+    }
+    for k in &dropped {
+        keys.remove(k);
+    }
+    for (k, x, px, raw) in new_memos {
+        if keys.contains_key(&k) {
+            if let Some(raw) = raw {
+                b.object(src, px, raw);
+            }
+            b.memos.push((k, x, px));
+            hub.landing.stats.projected.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    b.after.keys = keys;
+    for (x, _) in &landed {
+        b.after.recent.push_back(*x);
+        if b.after.recent.len() > RECENT {
+            b.after.recent.pop_front();
         }
     }
     b.after.tip = Some(chain);
-    Ok(Some(Outcome::Landed { seen }))
+    Ok(Some(Outcome::Landed {
+        reals: landed.iter().map(|l| l.0).collect(),
+    }))
 }
 
 /// The push's checks (`sync::complete`) for candidate `real` (a real
-/// snapshot) on real parent `parent`, as `who` sees it now: the tree they
-/// would push is their projection of it, grafted back onto the parent; the
-/// graft must give back exactly the candidate's tree. `Ok(Err(why))` when
-/// it is refused.
-fn recheck(src: &mut Source, who: &As, real: &Snapshot, parent: ObjectId, set: &[Change], identity: &veil_core::Identity) -> Result<std::result::Result<(), String>> {
+/// snapshot) on its real `parents` (every one: a merge takes changes from
+/// the others, BUG-1105), as `who` sees it now: the tree they would push is
+/// their projection of it, grafted back onto the first parent; the graft
+/// must give back exactly the candidate's tree. `Ok(Err(why))` when it is
+/// refused.
+fn recheck(
+    src: &mut Source,
+    who: &As,
+    real: &Snapshot,
+    parents: &[ObjectId],
+    set: &[Change],
+    identity: &veil_core::Identity,
+) -> Result<std::result::Result<(), String>> {
     let view = who.project.view(&who.viewer);
     let (ptree, created, mut known) = {
         let mut pr = Projector::new(&*src, &view);
@@ -936,12 +1289,12 @@ fn recheck(src: &mut Source, who: &As, real: &Snapshot, parent: ObjectId, set: &
         src.pending.insert(id, raw);
     }
     let n = Snapshot {
-        parents: vec![parent],
+        parents: parents.to_vec(),
         tree: ptree,
         signature: None,
         ..real.clone()
     };
-    let c = match sync::complete(src, &who.project, &who.viewer, &known, &n, &[parent], identity) {
+    let c = match sync::complete(src, &who.project, &who.viewer, &known, &n, parents, identity) {
         Ok(c) => c,
         Err(Error::Api { message, code: "forbidden" | "bad_request", .. }) => return Ok(Err(message)),
         Err(e) => return Err(e),

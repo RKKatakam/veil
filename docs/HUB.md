@@ -2225,9 +2225,16 @@ admins, closure, personal keys, secrets as ciphertext, check 9), and edits
 through `changes::create` (the same `complete`, inline text held in memory
 until the checks pass). Instead of a branch's compare-and-swap, the
 request's transaction inserts one **queue row**: the stack of real
-snapshots (oldest first, at most 64; an uploaded snapshot brings the new
-snapshots under it, which must not hold conflicts), the submitter, and the
-access epochs its checks ran under. The snapshots become committed history
+snapshots (oldest first, at most 64), the submitter, and the access epochs
+its checks ran under. **An uploaded snapshot's stack** is every change on
+its first-parent line from the branch's tip up to it (§4.6): those this
+request brought and those the server already held (on another branch, an
+API commit, a landing answered `conflict` with a fix on top), down to the
+first that is the tip or below it (the derived commit graph decides; the
+tip is derived first if the deriver lags), none holding conflicts. A
+submitted snapshot the service made again on a newer tip is on the branch
+when what it landed as is (`landings`). A change made of edits is its
+edits on `base`, as `POST …/changes` makes it. The snapshots become committed history
 in that commit (they resolve and project like any other); the edit set is
 not stored: it is each snapshot's diff against its first parent, read from
 the objects. With `wait` (the default) the request answers once the
@@ -2243,7 +2250,9 @@ server resumes every branch with queued rows. A service with nothing to do
 for 5 s gives the lease back. Its loop:
 
 * **Batch:** every ready row not in the batch being committed, in queue
-  order, at most 500. An entry whose edits touch `.veilpolicy` or
+  order (the database's clock at submit), at most 500, and at most 8 MiB of
+  new objects held with the batch being committed (`BATCH_BYTES`; the
+  first entry always goes). An entry whose edits touch `.veilpolicy` or
   `.veilrules` ends the batch before it and **lands alone**; nothing is
   built after it until it is committed.
 * **For each change of an entry's stack:** on the tip already, it lands as
@@ -2266,17 +2275,31 @@ for 5 s gives the lease back. Its loop:
   the tip's `.veilpolicy` is the base's, the submit's checks still hold.
   Otherwise (someone removed from a group, a device barred, an access
   change landed, a policy file moved) the push's checks run again on the
-  new parent, as the submitter is now: their projection of the new snapshot
-  is grafted back by `sync::complete` and must give exactly its tree.
+  new parents (every real parent of a merge), as the submitter is now:
+  their projection of the new snapshot is grafted back by `sync::complete`
+  and must give exactly its tree. When access changed, write access to
+  each path is decided **before** the fast path reads the tip: someone who
+  may no longer write a path is `rejected`, never told whether it changed.
   Someone no longer in the project is refused. A change of who has access
   on the default branch is accepted in the batch's transaction (an admin's
   only), which bumps the project's epoch: every later entry is checked
-  against it.
-* **Projections per viewer:** for every view key in use (the batch's
-  submitters', and those of the last minute, at most 64), the service
-  projects each new snapshot (`sync::project_one`) and writes the memo rows
-  in the batch's commit; a submitter's `landed` ids are theirs. Other
-  viewers' projections are worked out when they ask, as before.
+  against it. **The branch rules** are judged the same way: a landing on
+  the default branch that changes `.veilrules` against its tip is an
+  admin's only (so is a push or an API commit that moves it), never "the
+  same as one of its parents'".
+* **Projections per viewer, never a walk:** the service keeps every view
+  key of the project's people and of anyone on Earth (at most 64; re-read
+  when the project's access epoch changes) with its projection of the tip,
+  and projects each new snapshot onto it (`sync::project_one`, from stored
+  memos only). A key it does not keep is attached from its newest memo on
+  the branch's recent first-parent line (the last 1,024 snapshots it knows;
+  S12's deriver keeps tips memoised for every key), projecting only what
+  came after; a key with no memo there is handed to S13's background fill
+  (`query::graph::prefill`). Every projection made is stored in the batch's
+  commit, and a stored memo wins: one written meanwhile with another value
+  rolls the batch back (it is built again). Outcomes hold real snapshots;
+  each answer is projected for its asker (from the memo, else in their own
+  request, as a pull would).
 * **Pipelined:** while batch *n* is stored and committed, batch *n+1* is
   built on the tip *n* leaves. If *n* loses (the branch moved under it: an
   admin's forced push; or the lease was lost), *n+1* is discarded and built
@@ -2285,7 +2308,9 @@ for 5 s gives the lease back. Its loop:
   transaction: the lease (its holder and epoch: **fencing**), the branch's
   compare-and-swap, an accepted policy, the queue rows (each must still be
   `queued`, else nothing commits: an entry never lands twice), the
-  snapshot rows, the memo rows, an audit row and the tips notice.
+  snapshot, `landings` and memo rows, an audit row and the tips notice.
+  Finished queue rows are deleted after a day (a ticket's outcome is kept
+  that long).
 
 **Protected branches.** `.veilrules` at the project root (TOML;
 `[branches.NAME] protected = true`; other tables are left to later
@@ -2315,9 +2340,9 @@ target is 1 s): the object store's synced writes, 13–14 per landing, are the
 limit (packs, S28).
 
 **Limits.** Fair share between people and sessions is FIFO here (S24); a
-new view key's first projection walks history back to a memo, which the
-service pays in its first batch after an access change (BUG-1100); the
-batch-tip memos for other viewers are S12's.
+submitter whose view key no service keeps (a new one after an access
+change) waits, in their own request, for their view's first projection;
+the batch-tip memos for other viewers are S12's.
 
 Threat review (phase 4 §6, rows 1–4, and what S17 adds), tests in
 `server_hub` `landing` and `veil-server` `landing::edits`:
@@ -2332,4 +2357,9 @@ Threat review (phase 4 §6, rows 1–4, and what S17 adds), tests in
 | 6 | Any participant | a stale clone pushes a protected `main` | moves it over others' work | a push of a protected branch lands instead (fast path or `conflict`) | `protected_branches_move_only_by_landing_and_push_lands_instead` |
 | 7 | A non-admin, even one given `.veilrules` | unprotects `main` | bypasses the landing service | `.veilrules` changes are admins' only, on any branch | same |
 | 8 | Hostile API client | bad branch names, both or neither of `snapshot` and `edits`, unknown fields, missing objects, a branch that does not exist | a corrupt queue or a crash | the request's shape checked first; refusals before anything is queued | `hostile_landing_requests_are_refused` |
+| 9 | A member who lost access while a change waits | reads the answer | learns whether a hidden path changed | access decided before the fast path | `bug_1104_a_submitter_who_lost_access_is_told_nothing_of_what_changed_since` |
+| 10 | A non-admin who may read `.veilrules` | a merge keeping an older side's rules | unprotects `main` | the rules judged against the default branch's tip at every move | `bug_1102_a_merge_never_lets_a_non_admin_change_the_branch_rules` |
+| 11 | A pusher | pushes a change on one the server holds off the branch | a change dropped, `landed` said | the stack is every change between the tip and the pushed one | `bug_1103_a_landed_stack_brings_every_change_the_branch_lacks` |
+| 12 | Any participant | lands after a pause, or with a view the service does not keep | stalls every landing on the branch | no walk in the service: incremental projections, background fills | `bug_1106_…`, `bug_1100_…` |
+| 13 | Ordinary agents | many one-line changes in a 30,000-file folder | the server out of memory | batches bounded in bytes | `bug_1107_…` (in a child process) |
 

@@ -921,11 +921,24 @@ pub(crate) async fn create_with(
             }
         }
         let built = build(hub, &plan, &who, parent, pparent).await?;
+        // The branch rules: a move of the default branch changes them only
+        // for an admin, judged against its tip (BUG-1102).
+        let rules_moved = match cur {
+            Some(c) if plan.default_branch && !who.viewer.admin && rejected.is_none() => {
+                let r = built.real;
+                sync::blocking(hub, project.id, move |src| crate::landing::rules_changed(src, &src.snapshot(&r)?.tree, Some(&src.snapshot(&c)?.tree))).await?
+            }
+            _ => false,
+        };
         let mv = match (&onto, cur, &rejected) {
             // A change of who has access moves the default branch only for
             // an admin (the push's rule); anyone else's change is kept.
             (Some(_), Some(_), None) if built.accept.is_some() && !who.viewer.admin => {
                 rejected = Some("only admins may change who has access (the default branch's .veilpolicy)".into());
+                None
+            }
+            (Some(_), Some(_), None) if rules_moved => {
+                rejected = Some("only admins may change the branch rules (.veilrules)".into());
                 None
             }
             (Some(o), Some(c), None) => Some(Move {

@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS landing_queue (
     project_epoch BIGINT NOT NULL,
     -- queued | landed | conflict | rejected
     state TEXT NOT NULL,
-    -- JSON: the outcome as the submitter sees it.
+    -- JSON: the outcome, with the real snapshots it landed (each answer is
+    -- projected for its asker). Finished rows are deleted after a day.
     result TEXT,
     -- Microseconds, on the database's clock: the queue's order (`seq` is
     -- not in commit order across connections on YugabyteDB, whose
@@ -39,6 +40,8 @@ CREATE TABLE IF NOT EXISTS landing_queue (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS landing_queue_ticket ON landing_queue (ticket);
 CREATE INDEX IF NOT EXISTS landing_queue_ready ON landing_queue (project_id, branch, state, created_at, seq);
+-- What a starting server resumes (`landing::resume`: every queued row).
+CREATE INDEX IF NOT EXISTS landing_queue_state ON landing_queue (state, project_id, branch);
 
 -- One row per branch some landing service has moved. `epoch` is the fencing
 -- token: bumped at every takeover, and checked in the transaction that moves
@@ -51,4 +54,15 @@ CREATE TABLE IF NOT EXISTS landing_leases (
     -- Milliseconds, on the database's clock (servers' clocks never decide).
     expires_at BIGINT NOT NULL,
     PRIMARY KEY (project_id, branch)
+);
+
+-- A submitted snapshot the landing service made again on a newer tip, and
+-- the snapshot it landed as (its change is on the branch, though the
+-- submitted snapshot is not): a later push on top of the submitted one
+-- does not land that change twice (BUG-1103).
+CREATE TABLE IF NOT EXISTS landings (
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    submitted TEXT NOT NULL,
+    landed TEXT NOT NULL,
+    PRIMARY KEY (project_id, submitted)
 );
