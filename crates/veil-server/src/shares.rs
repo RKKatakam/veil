@@ -176,28 +176,53 @@ pub async fn put(State(hub): State<HubState>, caller: Caller, Path(p): Path<Stri
     let now = veil_core::now_millis();
     let version = r.version as i64;
     let rows = if req.expect == 0 {
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM secret_shares WHERE project_id = $1 AND sharer_id = $2")
-            .bind(project.id)
-            .bind(me.id)
-            .fetch_one(&hub.db)
-            .await?;
-        if count >= MAX_SHARES_PER_SHARER {
-            return Err(Error::forbidden(format!("you already have {count} shares in this project (at most {MAX_SHARES_PER_SHARER})")));
+        // The limit is reserved in the transaction that inserts (BUG-1061):
+        // the quota row orders this person's new shares in the project, and
+        // an insert that finds the share there gives the reservation back.
+        let (pid, sid, path_s, body_s) = (project.id, me.id, path.to_string(), body.clone());
+        let created = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+            let (path_s, body_s) = (path_s.clone(), body_s.clone());
+            Box::pin(async move {
+                let used: Option<i64> = sqlx::query_scalar(
+                    "INSERT INTO secret_share_quota (project_id, sharer_id, used) \
+                     SELECT $1, $2, n + 1 FROM (SELECT count(*) AS n FROM secret_shares WHERE project_id = $1 AND sharer_id = $2) t \
+                     WHERE n < $3 \
+                     ON CONFLICT (project_id, sharer_id) DO UPDATE SET used = secret_share_quota.used + 1 \
+                     WHERE secret_share_quota.used < $3 RETURNING used",
+                )
+                .bind(pid)
+                .bind(sid)
+                .bind(MAX_SHARES_PER_SHARER)
+                .fetch_optional(&mut *c)
+                .await?;
+                if used.is_none() {
+                    return Err(Error::forbidden(format!("you have {MAX_SHARES_PER_SHARER} shares in this project, the most one person may")));
+                }
+                let rows = sqlx::query(
+                    "INSERT INTO secret_shares (project_id, path, sharer_id, recipient_id, version, created_at, updated_at, body) \
+                     VALUES ($1, $2, $3, $4, 1, $5, $5, $6) ON CONFLICT DO NOTHING",
+                )
+                .bind(pid)
+                .bind(&path_s)
+                .bind(sid)
+                .bind(recipient)
+                .bind(now)
+                .bind(&body_s)
+                .execute(&mut *c)
+                .await?
+                .rows_affected();
+                if rows == 0 {
+                    return Err(Error::conflict("the share exists"));
+                }
+                Ok(())
+            })
+        })
+        .await;
+        match created {
+            Ok(()) => 1,
+            Err(Error::Api { code: "conflict", .. }) => 0,
+            Err(e) => return Err(e),
         }
-        sqlx::query(
-            "INSERT INTO secret_shares (project_id, path, sharer_id, recipient_id, version, created_at, updated_at, body) \
-             VALUES ($1, $2, $3, $4, $5, $6, $6, $7) ON CONFLICT DO NOTHING",
-        )
-        .bind(project.id)
-        .bind(path)
-        .bind(me.id)
-        .bind(recipient)
-        .bind(version)
-        .bind(now)
-        .bind(&body)
-        .execute(&hub.db)
-        .await?
-        .rows_affected()
     } else {
         sqlx::query(
             "UPDATE secret_shares SET version = $5, updated_at = $6, body = $7, unshared_at = NULL \

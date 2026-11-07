@@ -935,11 +935,13 @@ pub enum SecretCmd {
     /// A copy of that one file is sealed on this device for the person's
     /// confirmed devices only (confirmed outside the server, as for every
     /// key): it opens nothing else of its folder. Your later edits of the
-    /// file, and their newly confirmed devices, reach them in the background
-    /// until you unshare it. Admins see that it is shared (who, what path,
-    /// when), never what it holds. Their `vl pull` writes it at the same
-    /// path, where it stays on their device (and reaches their agents with
-    /// `vl ws exec --with-isolated`).
+    /// file in this clone, and their newly confirmed devices, reach them in
+    /// the background until you unshare it; updates follow your working copy
+    /// forward (never a value it held before, nothing while you are on an
+    /// older revision: run this again to send one on purpose). Admins see
+    /// that it is shared (who, what path, when), never what it holds. Their
+    /// `vl pull` writes it at the same path, where it stays on their device
+    /// (and reaches their agents with `vl ws exec --with-isolated`).
     Share {
         /// The secret file, in the working copy.
         path: String,

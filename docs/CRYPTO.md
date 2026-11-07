@@ -429,8 +429,13 @@ which stores it, cannot.
   (C6, project-bound by C13). The server's lists are never enough for
   either.
 * **Freshness.** The recipient's device refuses a version older than the
-  last one it received (device-local memory). A server can withhold a newer
+  newest genuine one it saw (device-local memory). A server can withhold a newer
   version (as for rings: TOFU freshness), never make one.
+* **Device-local content history.** The sharing clone keeps a keyed
+  BLAKE3 of every content it sealed (key `derive_key(HUB_SHARE_HISTORY,
+  local vault key)`, C8), so its background pass never sends a value the
+  share held before; without the identity the file allows no guessing of a
+  secret. Never stored on the server or synced.
 * **Not covered.** Taking back what a recipient already opened (an unshare
   stops later versions only); a sharer leaking the file some other way
   (trusted, §3.1 of HUB.md); a member's device holding the file's plaintext
@@ -544,6 +549,7 @@ are distinct and pins their exact bytes.
 | `HUB_PROJECT_FINGERPRINT` | `veil 2026 hub project-fingerprint v1` | BLAKE3 `derive_key` mode as a hash (first 80 bits) | C13: a project's fingerprint, over its id; in invite links and compared out of band (not secret) |
 | `POLICY_RULE_SCOPE` | `veil 2026 policy rule-scope v1` | BLAKE3 `derive_key` mode as a hash (first 80 bits) | the scope name `rule-<hex>` of an access line's secrets (not secret) |
 | `HUB_SHARE_ID` | `veil 2026 hub share-id v1` | BLAKE3 `derive_key` mode as a hash (first 128 bits) | C14: a share's id in its labels, over its project, path, sharer and recipient (not secret) |
+| `HUB_SHARE_HISTORY` | `veil 2026 hub share-history v1` | BLAKE3 `derive_key` → keyed BLAKE3 | C14: device-local hashes of the contents a sharing clone sealed |
 | `WRAP_LABEL_PREFIX` | `wrap:` | AEAD associated data | C3, C3L |
 | `PREV_KEY_LABEL_PREFIX` | `prev-key:` | AEAD associated data | C2 |
 | `EMBARGO_WRAP_LABEL_PREFIX` | `embargo-wrap:` | AEAD associated data | C2, C7 (retired in format 8: reserved, never reused) |

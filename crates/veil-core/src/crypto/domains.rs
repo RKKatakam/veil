@@ -203,6 +203,12 @@ pub const POLICY_RULE_SCOPE: &str = "veil 2026 policy rule-scope v1";
 /// hex): part of the share's labels. Not secret.
 pub const HUB_SHARE_ID: &str = "veil 2026 hub share-id v1";
 
+/// BLAKE3 `derive_key` context of the device-local key of a sharing
+/// clone's content history (C14), over the local vault key (C8): a keyed
+/// BLAKE3 of every content it sealed in a share, so its background pass
+/// never sends a value the share held before. Never stored or synced.
+pub const HUB_SHARE_HISTORY: &str = "veil 2026 hub share-history v1";
+
 /// Every BLAKE3 `derive_key` context, for the uniqueness test.
 pub const BLAKE3_CONTEXTS: &[&str] = &[
     LEGACY_SIV_NONCE,
@@ -220,6 +226,7 @@ pub const BLAKE3_CONTEXTS: &[&str] = &[
     POLICY_RULE_SCOPE,
     HUB_PROJECT_FINGERPRINT,
     HUB_SHARE_ID,
+    HUB_SHARE_HISTORY,
 ];
 
 #[cfg(test)]
@@ -243,7 +250,8 @@ mod tests {
                 "veil 2026 hub invite-key v1",
                 "veil 2026 policy rule-scope v1",
                 "veil 2026 hub project-fingerprint v1",
-                "veil 2026 hub share-id v1"
+                "veil 2026 hub share-id v1",
+                "veil 2026 hub share-history v1"
             ],
             "a context changed or was reordered"
         );

@@ -643,7 +643,6 @@ fn concurrency_share_updates_and_unshares_under_load() {
 /// active again; fin's background pass then seals fin's **rotated** secret
 /// (the rotation `vl secret unshare` advises) for dev, whom fin cut off.
 #[test]
-#[ignore = "BUG-1060: the background updater revives a share its own device ended, on the server's word"]
 fn bug_1060_an_unshare_the_server_forgets_never_seals_a_later_version() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -679,7 +678,6 @@ fn bug_1060_an_unshare_the_server_forgets_never_seals_a_later_version() {
 /// then an insert, in separate statements: requests that arrive together
 /// all see room and all insert.
 #[test]
-#[ignore = "BUG-1061: concurrent new shares pass the 256-per-person limit"]
 fn bug_1061_concurrent_new_shares_never_pass_the_limit() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -745,7 +743,6 @@ fn bug_1061_concurrent_new_shares_never_pass_the_limit() {
 /// replaces dev's link with the sharer's copy: written over dev's own setup,
 /// which "never written over the person's own edit" promises not to do.
 #[test]
-#[ignore = "BUG-1062: a received share replaces the recipient's own symlink at its path"]
 fn bug_1062_a_share_never_replaces_the_recipients_symlink() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -761,6 +758,15 @@ fn bug_1062_a_share_never_replaces_the_recipients_symlink() {
     p.dev.ok(&d, &["pull"]);
     let meta = std::fs::symlink_metadata(d.join(&env)).unwrap();
     assert!(meta.file_type().is_symlink(), "dev's symlink was replaced by the shared copy: {:?}", read(&d, &env));
+    // The same for a FIFO (reading it would block), and nothing hangs.
+    std::fs::remove_file(d.join(&env)).unwrap();
+    assert!(std::process::Command::new("mkfifo").arg(d.join(&env)).status().unwrap().success());
+    write_files(&f, &[(&env, "KEY=sharer-v3-after-the-fifo\n")]);
+    seal_until(&hub, &p, &f, &env, &p.dev.name, |r| r.open(&dev_id).is_ok_and(|c| c == b"KEY=sharer-v3-after-the-fifo\n"));
+    let out = p.dev.ok(&d, &["pull"]);
+    assert!(out.contains("not a regular file"), "{out}");
+    use std::os::unix::fs::FileTypeExt;
+    assert!(std::fs::symlink_metadata(d.join(&env)).unwrap().file_type().is_fifo());
 }
 
 /// BUG-1063: every clone on the sharing device updates the share, each
@@ -768,7 +774,6 @@ fn bug_1062_a_share_never_replaces_the_recipients_symlink() {
 /// agent's): its background pass seals that clone's older secret as a new
 /// version, and dev is rolled back to it; the two clones then take turns.
 #[test]
-#[ignore = "BUG-1063: a second clone on the sharing device seals its own older copy over the share"]
 fn bug_1063_another_clone_on_the_sharing_device_never_rolls_the_share_back() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -785,4 +790,111 @@ fn bug_1063_another_clone_on_the_sharing_device_never_rolls_the_share_back() {
     let r = record(&hub, &p, &env, &p.dev.name);
     let got = r.open(&dev_id).unwrap();
     assert_eq!(String::from_utf8_lossy(&got), newer, "fin's other clone sealed its older copy (version {})", r.version);
+}
+
+// ---- updates only go forward (owner's delegate, 2026-11-07) ------------------------------
+
+/// The background pass never sends a value the share held before, and
+/// pauses content updates while the working copy is on an older revision
+/// than the one the last version was sealed on. `vl secret share` sends
+/// either on purpose.
+#[test]
+fn automatic_updates_never_roll_the_recipient_back() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let (f, d) = shared(&hub, &p);
+    let env = env_path();
+    let dev_id = p.dev.identity();
+    let first = read(&f, &env).unwrap();
+    // A new value goes out; going back to the first one does not.
+    write_files(&f, &[(&env, "KEY=second-value-9a01\n")]);
+    seal_until(&hub, &p, &f, &env, &p.dev.name, |r| r.open(&dev_id).is_ok_and(|c| c == b"KEY=second-value-9a01\n"));
+    write_files(&f, &[(&env, &first)]);
+    let out = p.fin.ok(&f, &["share-keys"]);
+    assert!(out.contains("a value the share held before"), "{out}");
+    assert_eq!(record(&hub, &p, &env, &p.dev.name).open(&dev_id).unwrap(), b"KEY=second-value-9a01\n");
+    // On purpose: it does.
+    p.fin.ok(&f, &["secret", "share", &env, "--with", &p.dev.name]);
+    assert_eq!(record(&hub, &p, &env, &p.dev.name).open(&dev_id).unwrap(), first.as_bytes());
+    // fin moves on (a commit), seals a value there, then goes back to the
+    // older revision: content updates pause there.
+    write_files(&f, &[(&format!("{BILL_DIR}/acme/invoice.txt"), "an edit fin commits\n")]);
+    p.fin.ok(&f, &["commit", "-m", "invoice"]);
+    write_files(&f, &[(&env, "KEY=third-on-the-new-revision\n")]);
+    seal_until(&hub, &p, &f, &env, &p.dev.name, |r| r.open(&dev_id).is_ok_and(|c| c == b"KEY=third-on-the-new-revision\n"));
+    p.fin.ok(&f, &["new", "@--"]);
+    write_files(&f, &[(&env, "KEY=fourth-on-the-old-revision\n")]);
+    let out = p.fin.ok(&f, &["share-keys"]);
+    assert!(out.contains("older revision"), "{out}");
+    assert_eq!(record(&hub, &p, &env, &p.dev.name).open(&dev_id).unwrap(), b"KEY=third-on-the-new-revision\n");
+    p.fin.ok(&f, &["secret", "share", &env, "--with", &p.dev.name]);
+    assert_eq!(record(&hub, &p, &env, &p.dev.name).open(&dev_id).unwrap(), b"KEY=fourth-on-the-old-revision\n");
+    p.dev.ok(&d, &["pull"]);
+    assert_eq!(read(&d, &env).unwrap(), "KEY=fourth-on-the-old-revision\n");
+}
+
+/// A genuine version the recipient saw but did not write (their own edit
+/// was there) is remembered: after they remove their copy, a compromised
+/// server cannot serve an older one instead.
+#[test]
+fn a_version_seen_but_not_written_still_refuses_older_ones() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let (f, d) = shared(&hub, &p);
+    let env = env_path();
+    let v1 = record(&hub, &p, &env, &p.dev.name);
+    write_files(&d, &[(&env, "KEY=dev-own-edit\n")]);
+    let dev_id = p.dev.identity();
+    // Two versions dev sees but does not write (their own edit is there).
+    let mut seen = Vec::new();
+    for v in ["KEY=newer-v2\n", "KEY=newer-v3\n"] {
+        write_files(&f, &[(&env, v)]);
+        seen.push(seal_until(&hub, &p, &f, &env, &p.dev.name, |r| r.open(&dev_id).is_ok_and(|c| c == v.as_bytes())));
+        let out = p.dev.ok(&d, &["pull"]);
+        assert!(out.contains("not written over your own"), "{out}");
+    }
+    std::fs::remove_file(d.join(&env)).unwrap();
+    // The version dev wrote, and one older than the newest dev saw: neither
+    // is written now.
+    store(&hub, &p, &env, &v1);
+    p.dev.ok(&d, &["pull"]);
+    assert!(read(&d, &env).is_none());
+    store(&hub, &p, &env, &seen[0]);
+    let out = p.dev.ok(&d, &["pull"]);
+    assert!(out.contains("older than the one received") && read(&d, &env).is_none(), "{out}");
+    store(&hub, &p, &env, &seen[1]);
+    p.dev.ok(&d, &["pull"]);
+    assert_eq!(read(&d, &env).unwrap(), "KEY=newer-v3\n");
+}
+
+/// A received copy is never recorded once the device holds the key of its
+/// folder: dev, with a `.veilpolicy` of their own that seals the folder's
+/// secrets, receives a file of `billing/` while holding no key there; then
+/// dev joins finance, and the next snapshot moves the copy out of the
+/// working copy instead of sealing it for everyone in finance.
+#[test]
+fn a_received_copy_is_never_recorded_after_the_device_gains_the_key() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let f = clone(&hub, &p, &p.fin, "f");
+    let d = clone(&hub, &p, &p.dev, "d");
+    write_files(&d, &[(".veilpolicy", &format!("{}{BILL_DIR}/  finance\n", veil_core::policy::SYNCED_SECRETS_POLICY))]);
+    let own = format!("{BILL_DIR}/.env.fin-own");
+    let mark = "FIN=MARKER-FIN-OWN-SHARED-1f7c3a90\n";
+    write_files(&f, &[(&own, mark)]);
+    p.fin.ok(&f, &["secret", "share", &own, "--with", &p.dev.name]);
+    p.dev.ok(&d, &["pull"]);
+    assert_eq!(read(&d, &own).unwrap(), mark);
+    // dev joins finance: their device receives the folder's key.
+    p.admin.ok(&p.dir, &["group", "add", "finance", &p.dev.name]);
+    p.dev.ok(&d, &["pull"]);
+    let out = p.dev.ok(&d, &["commit", "-m", "after joining finance"]);
+    assert!(read(&d, &own).is_none(), "the copy stayed in the working copy:\n{out}");
+    let held = std::fs::read_dir(d.join(".veil/local/secret-shares-held")).unwrap().count();
+    assert_eq!(held, 1);
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&d)), Some(p.dev.identity()), "test").unwrap();
+    for snap in repo.ancestors(&repo.view().workspaces["default"].wc).unwrap() {
+        let tree = repo.store().snapshot(&snap).unwrap().tree;
+        assert!(veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new(&own).unwrap()).unwrap().is_none(), "recorded in {snap}");
+    }
 }

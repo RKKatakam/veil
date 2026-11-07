@@ -18,3 +18,13 @@ CREATE TABLE IF NOT EXISTS secret_shares (
     body TEXT,
     PRIMARY KEY (project_id, path, sharer_id, recipient_id)
 );
+-- How many shares each person has made in a project (at most
+-- secret_share::MAX_SHARES_PER_SHARER): a new share reserves one in the
+-- same transaction as its insert, so requests sent together never pass the
+-- limit (BUG-1061).
+CREATE TABLE IF NOT EXISTS secret_share_quota (
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    sharer_id BIGINT NOT NULL REFERENCES people(id),
+    used BIGINT NOT NULL,
+    PRIMARY KEY (project_id, sharer_id)
+);
