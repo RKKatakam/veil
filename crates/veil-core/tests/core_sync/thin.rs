@@ -454,7 +454,7 @@ fn every_site_that_reads_missing_as_hidden_is_audited() {
         ("search.rs", 1, "a hidden file is not searched"),
         ("selection.rs", 2, "a hidden file is not selectable"),
         ("store.rs", 4, "the read path: Missing only after every local area"),
-        ("transaction.rs", 1, "tolerated: an entry kept by id"),
+        ("transaction.rs", 2, "tolerated: an entry kept by id; the fetch-ahead of a move from a snapshot no longer held"),
         ("wc_policy.rs", 1, "an unreadable policy"),
     ];
     let found = count_in_src(|t| t.matches("is_unreadable()").count() + t.matches("VeilError::Missing(").count());
@@ -487,10 +487,29 @@ fn every_snapshot_read_that_does_not_fetch_is_audited() {
         ("graph_index.rs", 2, "a generation needs every ancestor: the index walks what is held, and Repo::exact pages history in"),
         ("maintenance.rs", 1, "maintenance never fetches"),
         ("remote.rs", 3, "transfers between local repositories (test fixtures)"),
-        ("repo.rs", 4, "snapshot_held itself, and snapshot_opt's first read"),
+        ("repo.rs", 11, "snapshot_held itself, snapshot_opt's first read, and the whole-graph walks (BUG-1260): topo_children_first, ancestors, common_ancestor, ancestors_of, merge_bases_naive; their exact answers run through Repo::exact"),
+        ("transaction.rs", 3, "the fetch-ahead of a move (its snapshots are held); the walk of rewritten ancestors (BUG-1260)"),
     ];
     let found = count_in_src(|t| t.matches("store.snapshot(").count() + t.matches("store().snapshot(").count() + t.matches("snapshot_held(").count());
     assert_eq!(found, table(HELD_ONLY), "a snapshot read that skips the boundary's history changed: review it for thin clones");
+}
+
+/// BUG-1260's class: the snapshot reads that *do* fetch history at the
+/// boundary (`Repo::snapshot_opt`). Each is one read of a snapshot a
+/// command names, or a walk bounded by something other than the graph's
+/// size: never a walk of every snapshot (those read held only, above).
+#[test]
+fn every_snapshot_read_that_fetches_is_not_a_whole_graph_walk() {
+    const FETCHING: &[(&str, usize, &str)] = &[
+        ("blame.rs", 1, "a line's history: one parent at a time, down to where each line began"),
+        ("commands.rs", 1, "the embargoed merges the history index found"),
+        ("remote.rs", 5, "an embargo's line: its versions and merged sides (held already), and its first parents while withheld"),
+        ("repo.rs", 5, "the definition, Repo::snapshot, is_ancestor's one read, a merge's parents, merge bases found"),
+        ("search.rs", 1, "a snapshot's parent's tree"),
+        ("transaction.rs", 5, "one snapshot each: a rewrite's old version, a conflict's base, a parent's conflicts, an embargo's"),
+    ];
+    let found = count_in_src(|t| t.matches("snapshot_opt(").count());
+    assert_eq!(found, table(FETCHING), "a snapshot read that pages history in changed: a whole-graph walk must read held only (BUG-1260)");
 }
 
 // ---- S3 cycle 1 review (`docs/BUGS.md`, "S3 cycle 1") --------------------
@@ -618,7 +637,6 @@ fn s3r_each_protocol_revision_announces_one_thing() {
 /// tree cache and is never decoded (noted) again. A long-lived process
 /// (`vl mount`, the S6 daemon) never recovers.
 #[test]
-#[ignore = "BUG-1147: a file in an evicted cache pack has no place for the rest of the process"]
 fn s3r2_a_file_whose_cache_pack_was_evicted_is_read_again_in_the_same_process() {
     // A directory of 20 files: the fetch-ahead writes them as one pack
     // (from 16 objects; fewer are written loose).
@@ -675,7 +693,6 @@ fn s3r2_a_file_whose_cache_pack_was_evicted_is_read_again_in_the_same_process() 
 /// server, names `L`'s directory by the same id (`L`'s own tree, held, says
 /// so).
 #[test]
-#[ignore = "BUG-1148: gc in a thin clone never completes once the tip's trees are evicted"]
 fn s3r2_gc_in_a_thin_clone_completes_after_an_eviction() {
     let id = Identity::generate("alice");
     let sfs = Arc::new(MemoryBackend::new());
@@ -707,4 +724,43 @@ fn s3r2_gc_in_a_thin_clone_completes_after_an_eviction() {
     repo.store().set_cache_limit(1 << 30);
     let report = gc(&mut repo, &GcOptions { grace: Duration::ZERO, ..GcOptions::default() }).unwrap();
     assert!(report.incomplete.is_empty(), "gc deleted nothing: {:?}", report.incomplete);
+}
+
+/// (S3 cycle 2, the reviewer's note for S6.) A long-lived process pulls:
+/// the server's tip moves to `Q`, and an object under `Q` that the server
+/// refuses for this person is its redaction, `Missing`, even though the
+/// connection was attached before the pull and still names the old tip.
+/// The tips come from the view, refreshed on every change of it.
+#[test]
+fn a_pull_in_a_long_lived_process_refreshes_what_is_on_the_server() {
+    let id = Identity::generate("alice");
+    let sfs = Arc::new(MemoryBackend::new());
+    let mut srepo = Repo::init(sfs.clone(), Some(id.clone()), "alice").unwrap();
+    let t = commit_files(&mut srepo, &*sfs, &[("src/a.txt", "a\n")], "t");
+    let q = commit_files(&mut srepo, &*sfs, &[("hidden/h.txt", "not for alice\n")], "q");
+    let h = entry(&srepo, &q, "hidden/h.txt").id;
+    // The connection, attached before the pull, knows the old tip only.
+    let server = Arc::new(Server {
+        store: srepo.store().clone(),
+        tips: vec![t],
+        down: AtomicBool::new(false),
+        tamper: AtomicBool::new(false),
+        refuse: Mutex::new(HashSet::from([h])),
+        asked: Mutex::new(Vec::new()),
+        pages: Mutex::new(0),
+    });
+    let pr = Project { server: server.clone(), commits: vec![t, q], tip: t, id };
+    let (repo, _fs) = thin(&pr, 1 << 30);
+    // A read under the old tip: the server walk runs (and is remembered).
+    assert_eq!(read_at(&repo, &t, "src/a.txt"), b"a\n");
+    let _ = entry(&repo, &t, "src/a.txt");
+    // The pull: `Q` arrives, and `origin/main` moves to it.
+    repo.store().put_raw(&q, &server.store.get_raw(&q).unwrap()).unwrap();
+    let mut repo = repo;
+    let mut tx = repo.transaction("pull").unwrap();
+    tx.view.remote_tags.insert("origin/main".into(), q);
+    tx.commit().unwrap();
+    let e = entry(&repo, &q, "hidden/h.txt");
+    let err = repo.store().read_entry(&e).unwrap_err();
+    assert!(matches!(err, VeilError::Missing(_)), "the server's refusal under its new tip reads as {err:?}");
 }

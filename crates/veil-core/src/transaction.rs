@@ -1034,7 +1034,8 @@ impl<'r> Transaction<'r> {
             if !seen.insert(x) || seen.len() > 100_000 {
                 continue;
             }
-            let Some(s) = self.repo.snapshot_opt(&x)? else { continue };
+            // A walk of the history: what is held only (BUG-1260).
+            let Some(s) = self.repo.snapshot_held(&x)? else { continue };
             for p in &s.parents {
                 if union.contains_key(p) {
                     if !out.contains(p) {
@@ -1180,6 +1181,25 @@ impl<'r> Transaction<'r> {
 
     /// Finish the transaction. Returns the new operation id, or `None` if
     /// nothing changed.
+    /// [`Transaction::commit`]'s fetch-ahead: the tree the project
+    /// directory's workspace moves to, against what the directory holds.
+    fn fetch_ahead_move(&self) -> Result<()> {
+        let Some(st) = crate::working_copy::CheckoutState::load(&*self.repo.backend)? else { return Ok(()) };
+        let ws = st.attached();
+        let Some(new) = self.view.workspaces.get(ws) else { return Ok(()) };
+        if self.repo.view.workspaces.get(ws).is_some_and(|w| w.wc == new.wc) {
+            return Ok(());
+        }
+        let store = self.repo.store();
+        let from = match store.snapshot(&st.snapshot) {
+            Ok(s) => Some(s.tree),
+            Err(VeilError::Missing(_)) => None,
+            Err(e) => return Err(e),
+        };
+        let to = store.snapshot(&new.wc)?.tree;
+        store.prefetch_diff(from.as_ref(), &to)
+    }
+
     pub fn commit(mut self) -> Result<Option<ObjectId>> {
         if self.merge.is_some() {
             self.merge_rebase()?;
@@ -1196,6 +1216,15 @@ impl<'r> Transaction<'r> {
             if self.view != self.repo.view {
                 self.check_withheld()?;
             }
+        }
+        // A thin clone: an operation that moves the working copy of the
+        // project directory fetches what the move reads before it is
+        // published (BUG-1146). Keyed on what the operation does (any
+        // command: new, merge, rebase, cherry-pick, undo, op restore), so a
+        // full cache or a lost server fails it with nothing recorded,
+        // instead of leaving a move every later command retries.
+        if self.repo.store.is_partial() && self.view != self.repo.view {
+            self.fetch_ahead_move()?;
         }
         let record = self.view != self.start_view || self.record_always;
         // The operation (format 6), when one is recorded: its bytes and its

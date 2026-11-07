@@ -69,12 +69,15 @@ pub const HISTORY_PAGE: usize = 2_000;
 const PREFETCH_BATCH: usize = 1_000;
 const PREFETCH_BYTES: u64 = 8 << 20;
 
-/// Most locations one process records (about 46 bytes each: at most about
-/// 90 MiB). Every tree met is recorded (a location is the chain of trees
-/// above an object); a file is not when a pack of either area already holds
-/// it. Past the bound, objects met later have no location, and reading one
-/// that is not held fails with [`VeilError::Unavailable`], never as hidden.
-const LOCATOR_CAP: usize = 2_000_000;
+/// Most places and parents the locator holds together (BUG-1149). Measured
+/// with a counting allocator (`core_security` `thin_locator_memory`): about
+/// 70 MiB held and 100 MiB at the peak of a rehash, whatever the entries per
+/// tree. Every tree met is recorded (a location is the chain of trees
+/// above an object); a file is not when the main store's packs hold it
+/// (never evicted, BUG-1147). Past the bound, objects met later have no
+/// location, and reading one that is not held fails with
+/// [`VeilError::Unavailable`], never as hidden.
+pub(crate) const LOCATOR_CAP: usize = 1_500_000;
 
 /// Nearest ancestors on the server an object met under a local commit is
 /// asked for under.
@@ -115,31 +118,71 @@ pub trait Promisor: Send + Sync {
     fn server_tips(&self) -> Vec<ObjectId>;
 }
 
-/// The location of every object met in a decoded tree, compactly: the
-/// parent (a tree, a snapshot for a root tree, a conflict for its terms)
-/// and the entry's index in it.
+/// The location of every object met in a decoded tree, compactly (16 bytes
+/// a place): the first 8 bytes of the object's id → the parent (a tree, a
+/// snapshot for a root tree, a conflict for its terms) and the entry's index
+/// in it. Ids are BLAKE3 hashes, so 8 bytes tell them apart; a collision is
+/// harmless: `ObjectStore::locate` checks that the parent names the object
+/// there, and treats a mismatch as no place.
 #[derive(Default)]
-struct Locator {
+pub(crate) struct Locator {
     parents: Vec<ObjectId>,
-    handles: HashMap<ObjectId, u32>,
-    at: HashMap<ObjectId, (u32, u32)>,
+    handles: HashMap<u64, u32>,
+    at: HashMap<u64, u64>,
+}
+
+fn short_key(id: &ObjectId) -> u64 {
+    u64::from_le_bytes(id.0[..8].try_into().expect("8 bytes"))
 }
 
 impl Locator {
     fn note(&mut self, child: ObjectId, parent: ObjectId, index: u32) {
-        if self.at.len() >= LOCATOR_CAP || self.at.contains_key(&child) {
+        let key = short_key(&child);
+        if self.at.len() + self.parents.len() >= LOCATOR_CAP || self.at.contains_key(&key) {
             return;
         }
         let parents = &mut self.parents;
-        let h = *self.handles.entry(parent).or_insert_with(|| {
+        let h = *self.handles.entry(short_key(&parent)).or_insert_with(|| {
             parents.push(parent);
             (parents.len() - 1) as u32
         });
-        self.at.insert(child, (h, index));
+        self.at.insert(key, (u64::from(h) << 32) | u64::from(index));
     }
 
     fn get(&self, id: &ObjectId) -> Option<(ObjectId, u32)> {
-        self.at.get(id).map(|(h, i)| (self.parents[*h as usize], *i))
+        self.at.get(&short_key(id)).map(|v| (self.parents[(v >> 32) as usize], *v as u32))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.at.len()
+    }
+}
+
+/// A locator filled to its bound with `per_tree` entries a tree, for the
+/// memory test (`core_security` `thin_locator_memory`).
+#[doc(hidden)]
+pub struct LocatorProbe(#[allow(dead_code)] Locator);
+
+impl LocatorProbe {
+    pub fn fill(per_tree: u64) -> LocatorProbe {
+        let id = |i: u64, tag: u8| {
+            let mut x = [0u8; 32];
+            x[..8].copy_from_slice(&blake3::hash(&i.to_le_bytes()).as_bytes()[..8]);
+            x[8..16].copy_from_slice(&i.to_le_bytes());
+            x[31] = tag;
+            ObjectId(x)
+        };
+        let mut l = Locator::default();
+        let mut i = 0u64;
+        while l.at.len() + l.parents.len() < LOCATOR_CAP {
+            l.note(id(i, 0), id(i / per_tree + (1 << 40), 1), (i % per_tree) as u32);
+            i += 1;
+        }
+        LocatorProbe(l)
+    }
+
+    pub fn places(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -158,6 +201,11 @@ pub(crate) struct Partial {
     /// Snapshots whose trees are pinned: each workspace's working copy
     /// (set by the repository from its view).
     anchors: RwLock<Vec<ObjectId>>,
+    /// The view's heads and tags, and the remotes' tips: the server-side
+    /// bases of the snapshots only this clone holds have their *trees*
+    /// pinned, so that gc and fsck can always tell a gap of the server's
+    /// from lost work (BUG-1148).
+    local: RwLock<(Vec<ObjectId>, Vec<ObjectId>)>,
     /// Snapshots found to be on the server (memo of `on_server`), and
     /// whether that set is whole for the snapshots held now.
     server: Mutex<HashSet<ObjectId>>,
@@ -218,6 +266,7 @@ impl ObjectStore {
             no_fetch: AtomicUsize::new(0),
             bytes: Mutex::new(None),
             anchors: RwLock::new(Vec::new()),
+            local: RwLock::new((Vec::new(), Vec::new())),
             server: Mutex::new(HashSet::new()),
             server_walked: std::sync::atomic::AtomicBool::new(false),
             fetched: AtomicU64::new(0),
@@ -327,6 +376,41 @@ impl ObjectStore {
         }
     }
 
+    /// The view's heads and tags (`heads`) and the remotes' tips
+    /// (`server`), for the trees eviction pins (BUG-1148).
+    pub fn set_local_heads(&self, heads: Vec<ObjectId>, server: Vec<ObjectId>) {
+        if let Some(p) = self.partial.get() {
+            let changed = p.local.read().unwrap_or_else(|e| e.into_inner()).1 != server;
+            *p.local.write().unwrap_or_else(|e| e.into_inner()) = (heads, server);
+            if changed {
+                self.forget_server_walk();
+            }
+        }
+    }
+
+    /// The snapshots on the server that this clone's own snapshots (those
+    /// `heads` reach outside `server`'s history) build on.
+    fn server_bases(&self, heads: &[ObjectId], server: &HashSet<ObjectId>) -> Vec<ObjectId> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack: Vec<ObjectId> = heads.iter().filter(|h| !server.contains(h)).copied().collect();
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) || seen.len() > 10_000 {
+                continue;
+            }
+            let Ok(s) = self.snapshot(&x) else { continue };
+            for parent in &s.parents {
+                match server.contains(parent) {
+                    true if !out.contains(parent) => out.push(*parent),
+                    true => {}
+                    false => stack.push(*parent),
+                }
+            }
+        }
+        self.take_boundary_hits_of(&seen);
+        out
+    }
+
     /// Record where the objects `obj` names were met (thin clones only).
     pub(crate) fn note_decoded(&self, id: &ObjectId, obj: &Object) {
         let Some(p) = self.partial.get() else { return };
@@ -337,9 +421,11 @@ impl ObjectStore {
         match obj {
             Object::Tree(t) => {
                 for (i, e) in t.entries.iter().enumerate() {
-                    // A file a pack holds needs no place; a tree always
-                    // does (it is on the way to what is below it).
-                    if e.kind != EntryKind::Dir && (self.in_loaded_packs(&e.id) || p.cache.in_loaded_packs(&e.id)) {
+                    // A file the main store's packs hold (never evicted)
+                    // needs no place; one in the cache may be evicted and
+                    // read again (BUG-1147); a tree always needs one (it is
+                    // on the way to what is below it).
+                    if e.kind != EntryKind::Dir && self.in_loaded_packs(&e.id) {
                         continue;
                     }
                     l.note(e.id, *id, i as u32);
@@ -364,10 +450,20 @@ impl ObjectStore {
             let Some((parent, index)) = found else { return Ok(None) };
             match index {
                 ROOT => {
+                    // The snapshot names this root tree (an 8-byte key may
+                    // name another object).
+                    if self.snapshot(&parent).map_or(true, |s| s.tree != cur) {
+                        return Ok(None);
+                    }
                     names.reverse();
                     return Ok(Some((parent, names.join("/"))));
                 }
-                TERM => cur = parent,
+                TERM => {
+                    if self.conflict(&parent).map_or(true, |c| !c.referenced_ids().contains(&cur)) {
+                        return Ok(None);
+                    }
+                    cur = parent
+                }
                 i => {
                     // The parent tree was decoded here; it may have been
                     // evicted since, and is fetched again from its own
@@ -393,7 +489,7 @@ impl ObjectStore {
             return false;
         }
         let mut seen = HashSet::new();
-        let mut stack = promisor.server_tips();
+        let mut stack = self.server_tips_now(p, promisor);
         let mut found = false;
         while let Some(x) = stack.pop() {
             if !seen.insert(x) {
@@ -410,6 +506,17 @@ impl ObjectStore {
         p.server.lock().unwrap_or_else(|e| e.into_inner()).extend(seen);
         p.server_walked.store(true, Ordering::SeqCst);
         found
+    }
+
+    /// The remotes' tips as the view has them now (every view change sets
+    /// them: a pull in a long-lived process is seen at once), else the
+    /// promisor's.
+    fn server_tips_now(&self, p: &Partial, promisor: &dyn Promisor) -> Vec<ObjectId> {
+        let tips = p.local.read().unwrap_or_else(|e| e.into_inner()).1.clone();
+        match tips.is_empty() {
+            true => promisor.server_tips(),
+            false => tips,
+        }
     }
 
     /// Snapshots arrived (history pages, a pull): `on_server` walks again.
@@ -505,7 +612,7 @@ impl ObjectStore {
             // commit): ask at the same path under its nearest ancestors on
             // the server (BUG-1144), then under the server's tips.
             let mut places = self.server_ancestors(p, &*promisor, &snapshot);
-            for t in promisor.server_tips() {
+            for t in self.server_tips_now(p, &*promisor) {
                 if !places.contains(&t) {
                     places.push(t);
                 }
@@ -810,6 +917,27 @@ impl ObjectStore {
                 }
             }
         }
+        // The trees (not the files) of the server-side bases of this
+        // clone's own snapshots (BUG-1148).
+        let (heads, tips) = p.local.read().unwrap_or_else(|e| e.into_inner()).clone();
+        if !heads.is_empty() {
+            let server = self.server_history(&tips);
+            let mut trees = Vec::new();
+            for b in self.server_bases(&heads, &server) {
+                if let Ok(s) = self.snapshot(&b) {
+                    trees.push(s.tree);
+                }
+            }
+            let mut seen = HashSet::new();
+            while let Some(t) = trees.pop() {
+                if !seen.insert(t) {
+                    continue;
+                }
+                let Ok(tree) = self.tree_object(&t) else { continue };
+                out.insert(t);
+                trees.extend(tree.entries.iter().filter(|e| e.kind == EntryKind::Dir).map(|e| e.id));
+            }
+        }
         // Only the anchors' own snapshots were read as snapshots.
         let roots: HashSet<ObjectId> = p.anchors.read().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
         self.take_boundary_hits_of(&roots);
@@ -1098,7 +1226,6 @@ mod s3r2_tests {
     /// allocator held 166 to 376 MiB at the bound (peak 248 to 458 MiB),
     /// for 100 to 1 entries per tree.
     #[test]
-    #[ignore = "BUG-1149: the locator at its bound holds about twice the 90 MiB it states"]
     fn s3r2_the_locator_at_its_bound_is_about_90_mib() {
         let id = |i: u64, tag: u8| {
             let mut x = [0u8; 32];
@@ -1106,15 +1233,18 @@ mod s3r2_tests {
             x[31] = tag;
             ObjectId(x)
         };
-        let mut l = Locator::default();
-        // Ten entries per tree, a usual directory.
-        for i in 0..LOCATOR_CAP as u64 + 10 {
-            l.note(id(i, 0), id(i / 10, 1), (i % 10) as u32);
+        for per_tree in [1u64, 10, 100] {
+            let mut l = Locator::default();
+            for i in 0..LOCATOR_CAP as u64 + 10 {
+                l.note(id(i, 0), id(i / per_tree + (1 << 40), 1), (i % per_tree) as u32);
+            }
+            assert_eq!(l.at.len() + l.parents.len(), LOCATOR_CAP);
+            // Capacity, not length: a map's room (and one control byte a
+            // bucket), the parents' map and vector.
+            let bytes = l.at.capacity() * (std::mem::size_of::<(u64, u64)>() + 1)
+                + l.handles.capacity() * (std::mem::size_of::<(u64, u32)>() + 1)
+                + l.parents.capacity() * std::mem::size_of::<ObjectId>();
+            assert!(bytes <= 90 << 20, "{per_tree} a tree: the locator at its bound holds at least {} MiB", bytes >> 20);
         }
-        assert_eq!(l.at.len(), LOCATOR_CAP);
-        let bytes = l.at.capacity() * std::mem::size_of::<(ObjectId, (u32, u32))>()
-            + l.handles.capacity() * std::mem::size_of::<(ObjectId, u32)>()
-            + l.parents.capacity() * std::mem::size_of::<ObjectId>();
-        assert!(bytes <= 90 << 20, "the locator at its bound holds at least {} MiB", bytes >> 20);
     }
 }

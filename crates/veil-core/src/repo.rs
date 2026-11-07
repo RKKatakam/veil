@@ -547,6 +547,10 @@ impl Repo {
     pub(crate) fn pin_working_copies(&self) {
         if self.store.is_partial() {
             self.store.set_anchor_snapshots(self.view.workspaces.values().map(|w| w.wc).collect());
+            let mut heads: Vec<ObjectId> = self.view.heads.iter().copied().collect();
+            heads.extend(self.view.tags.values().map(|t| t.target));
+            heads.extend(self.view.workspaces.values().map(|w| w.wc));
+            self.store.set_local_heads(heads, self.view.remote_tags.values().copied().collect());
         }
     }
 
@@ -938,7 +942,7 @@ impl Repo {
             }
             // A redacted parent (withheld by an unreleased embargo) is simply
             // not part of this replica's graph.
-            let Some(s) = self.snapshot_opt(&id)? else { continue };
+            let Some(s) = self.snapshot_held(&id)? else { continue };
             stack.extend(s.parents.iter().copied());
             nodes.insert(id, s);
         }
@@ -1008,7 +1012,7 @@ impl Repo {
         let mut stack = vec![*id];
         while let Some(x) = stack.pop() {
             if seen.insert(x) {
-                if let Some(s) = self.snapshot_opt(&x)? {
+                if let Some(s) = self.snapshot_held(&x)? {
                     stack.extend(s.parents.iter().copied());
                 }
             }
@@ -1044,7 +1048,7 @@ impl Repo {
                 return Ok(x);
             }
             if seen.insert(x) {
-                if let Some(s) = self.snapshot_opt(&x)? {
+                if let Some(s) = self.snapshot_held(&x)? {
                     queue.extend(s.parents.iter().copied());
                 }
             }
@@ -1089,7 +1093,7 @@ impl Repo {
         let mut stack = ids.to_vec();
         while let Some(x) = stack.pop() {
             if seen.insert(x) {
-                if let Some(s) = self.snapshot_opt(&x)? {
+                if let Some(s) = self.snapshot_held(&x)? {
                     stack.extend(s.parents.iter().copied());
                 }
             }
@@ -1126,13 +1130,13 @@ impl Repo {
         let mut below = HashSet::new();
         let mut stack = Vec::new();
         for c in &common {
-            if let Some(s) = self.snapshot_opt(c)? {
+            if let Some(s) = self.snapshot_held(c)? {
                 stack.extend(s.parents.iter().copied());
             }
         }
         while let Some(x) = stack.pop() {
             if below.insert(x) {
-                if let Some(s) = self.snapshot_opt(&x)? {
+                if let Some(s) = self.snapshot_held(&x)? {
                     stack.extend(s.parents.iter().copied());
                 }
             }
@@ -1142,7 +1146,7 @@ impl Repo {
             if below.contains(&c) {
                 continue;
             }
-            if let Some(s) = self.snapshot_opt(&c)? {
+            if let Some(s) = self.snapshot_held(&c)? {
                 best.push((s.timestamp, c));
             }
         }

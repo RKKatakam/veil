@@ -412,20 +412,6 @@ impl Ctx {
         Ok(self.repo.workspace_wc(&self.ws)?)
     }
 
-    /// A thin clone, before a command records that the working copy moves
-    /// to `target`: fetch what the move will read (BUG-1145), so that a
-    /// cache too small or a lost server fails the command before it records
-    /// anything (the move itself would otherwise be retried by every later
-    /// command). Nothing in any other repository.
-    pub fn fetch_ahead(&self, target: &ObjectId) -> Result<()> {
-        if !self.repo.is_partial() || self.bare {
-            return Ok(());
-        }
-        let from = self.repo.snapshot(&self.checkout.snapshot)?.tree;
-        let to = self.repo.snapshot(target)?.tree;
-        Ok(self.repo.store().prefetch_diff(Some(&from), &to)?)
-    }
-
     pub fn rev(&self, spec: &str) -> Result<ObjectId> {
         // A thin clone: a full snapshot id it does not hold is asked of the
         // server, and a walk that reaches beyond what it holds goes on
@@ -573,6 +559,23 @@ impl Ctx {
             let base = self.checkout.snapshot;
             let base_snap = self.repo.snapshot(&base)?;
             let target_tree = self.repo.snapshot(&view_wc)?.tree;
+            // A thin clone fetches the catch-up's move first. If it cannot
+            // (a full cache, a lost server), the directory stays as it is
+            // and nothing is recorded, so `status`, `undo`, `op restore`
+            // and `partial limit` still run (BUG-1146); a command that
+            // would record the directory as a commit stops instead.
+            if let Err(e) = self.repo.store().prefetch_diff(Some(&base_snap.tree), &target_tree) {
+                if commit.is_some() {
+                    return Err(anyhow::Error::from(e).context(
+                        "the working copy is behind `@` and cannot be brought up to it; run `vl undo`, or raise the cache's bound with `vl partial limit SIZE`",
+                    ));
+                }
+                warn(&format!(
+                    "the working copy stays as it is: moving it to `@` needs what this thin clone cannot fetch now ({e}). \
+                     Nothing in it was recorded; run `vl undo` to go back, or `vl partial limit SIZE` and run any command"
+                ));
+                return Ok(true);
+            }
             // What a command put back (`vl restore`) is judged against the
             // entries it was written from, as in the ordinary snapshot
             // below: a sealed version restored stays sealed (BUG-492).
@@ -884,6 +887,16 @@ impl Ctx {
         }
         let from = self.repo.snapshot(&self.checkout.snapshot)?.tree;
         let to_snap = self.repo.snapshot(&target)?;
+        // A thin clone: a move this command could not fetch for (left by an
+        // earlier one; every move this command published was fetched ahead
+        // before it was) leaves the directory as it is (BUG-1146).
+        if let Err(e) = self.repo.store().prefetch_diff(Some(&from), &to_snap.tree) {
+            warn(&format!(
+                "the working copy stays as it is: moving it to `@` needs what this thin clone cannot fetch now ({e}). \
+                 Run `vl undo` to go back, or `vl partial limit SIZE` and run any command"
+            ));
+            return Ok(());
+        }
         let previous = self.checkout.snapshot;
         let needs_checkout = from != to_snap.tree || !self.checkout.materialised.is_empty();
         // Journalled: a crash half way is finished by the next command.

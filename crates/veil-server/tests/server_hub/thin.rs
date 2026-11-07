@@ -504,7 +504,6 @@ fn clone_that_visited_big(admin: &Person, hub: &TestHub, name: &str) -> (std::pa
 /// working copy onto a branch past the cache's bound records the rebase,
 /// then fails to fetch; every later command retries the move and fails.
 #[test]
-#[ignore = "BUG-1146: a working-copy move recorded before its fetch (rebase)"]
 fn s3r2_a_rebase_past_the_cache_bound_records_nothing() {
     let hub = TestHub::start();
     let (admin, name) = project_with_big_branch(&hub);
@@ -517,7 +516,6 @@ fn s3r2_a_rebase_past_the_cache_bound_records_nothing() {
 
 /// BUG-1146: `vl merge` into the working copy, the same route.
 #[test]
-#[ignore = "BUG-1146: a working-copy move recorded before its fetch (merge)"]
 fn s3r2_a_merge_past_the_cache_bound_records_nothing() {
     let hub = TestHub::start();
     let (admin, name) = project_with_big_branch(&hub);
@@ -530,7 +528,6 @@ fn s3r2_a_merge_past_the_cache_bound_records_nothing() {
 
 /// BUG-1146: `vl undo` back onto a working copy whose files were evicted.
 #[test]
-#[ignore = "BUG-1146: a working-copy move recorded before its fetch (undo)"]
 fn s3r2_an_undo_past_the_cache_bound_records_nothing() {
     let hub = TestHub::start();
     let (admin, name) = project_with_big_branch(&hub);
@@ -542,7 +539,6 @@ fn s3r2_an_undo_past_the_cache_bound_records_nothing() {
 
 /// BUG-1146: `vl op restore` of an operation whose working copy was evicted.
 #[test]
-#[ignore = "BUG-1146: a working-copy move recorded before its fetch (op restore)"]
 fn s3r2_an_op_restore_past_the_cache_bound_records_nothing() {
     let hub = TestHub::start();
     let (admin, name) = project_with_big_branch(&hub);
@@ -569,7 +565,6 @@ fn s3r2_a_workspace_switch_past_the_cache_bound_records_nothing() {
 /// BUG-1146: `vl new A B` (a merge): the fetch-ahead of `vl new` runs for
 /// one parent only.
 #[test]
-#[ignore = "BUG-1146: a working-copy move recorded before its fetch (new of a merge)"]
 fn s3r2_a_new_merge_past_the_cache_bound_records_nothing() {
     let hub = TestHub::start();
     let (admin, name) = project_with_big_branch(&hub);
@@ -595,7 +590,6 @@ fn s3r2_a_restore_past_the_cache_bound_records_nothing() {
 
 /// BUG-1146: `vl cherry-pick big` onto the working copy's parent.
 #[test]
-#[ignore = "BUG-1146: a working-copy move recorded before its fetch (cherry-pick)"]
 fn s3r2_a_cherry_pick_past_the_cache_bound_records_nothing() {
     let hub = TestHub::start();
     let (admin, name) = project_with_big_branch(&hub);
@@ -617,7 +611,6 @@ fn s3r2_a_cherry_pick_past_the_cache_bound_records_nothing() {
 /// clone: here, `vl log` works with the server gone, where a clone of the
 /// same project without that tag needs the server.
 #[test]
-#[ignore = "BUG-1260: a tag named like an id makes a thin clone fetch the whole history"]
 fn s3r2_a_tag_named_like_an_id_does_not_fetch_the_whole_history() {
     let hub = TestHub::start();
     let (admin, dir, name) = project_with_history(&hub, 6, 10);
@@ -636,4 +629,49 @@ fn s3r2_a_tag_named_like_an_id_does_not_fetch_the_whole_history() {
         "the clone of the project tagged `lts` holds the whole history (`vl log` with the server gone):\n{}",
         String::from_utf8_lossy(&o.stdout)
     );
+}
+
+/// BUG-1146, the class: every kind of operation that moves the project
+/// directory's working copy, run past the cache's bound in a fresh thin
+/// clone. Each either moves within the bound, or fails having recorded
+/// nothing; then `vl status` and `vl partial limit 1G` run, and the same
+/// command succeeds under the larger bound. (`Transaction::commit` fetches
+/// ahead any move of the attached working copy before publishing, keyed on
+/// what the operation does, so a new command is covered without a change.)
+#[test]
+fn every_working_copy_move_past_the_cache_bound_records_nothing() {
+    let hub = TestHub::start();
+    let (admin, name) = project_with_big_branch(&hub);
+    let moves: &[&[&str]] = &[
+        &["new", "big"],
+        &["edit", "big"],
+        &["new", "main", "big"],
+        &["rebase", "-s", "@", "-d", "big"],
+        &["merge", "big"],
+        &["cherry-pick", "big"],
+        &["restore", "--from", "big"],
+    ];
+    for (i, cmd) in moves.iter().enumerate() {
+        let thin = admin.dir(&format!("every-{i}"));
+        admin.ok(admin.home.path(), &["clone", "--cache-size", "100K", &hub.url(&name), thin.to_str().unwrap()]);
+        let o = admin.run(&thin, cmd);
+        let failed = !o.status.success();
+        assert_a_failed_move_records_nothing(&admin, &thin, cmd, o);
+        if failed {
+            admin.ok(&thin, &["partial", "limit", "1G"]);
+            admin.ok(&thin, &["status"]);
+            admin.ok(&thin, cmd);
+            admin.ok(&thin, &["status"]);
+        }
+    }
+    // Undo and op restore, back onto a working copy whose files were evicted.
+    let (thin, on_big) = clone_that_visited_big(&admin, &hub, &name);
+    for cmd in [vec!["undo"], vec!["op", "restore", on_big.as_str()]] {
+        let o = admin.run(&thin, &cmd);
+        assert_a_failed_move_records_nothing(&admin, &thin, &cmd, o);
+    }
+    admin.ok(&thin, &["partial", "limit", "1G"]);
+    admin.ok(&thin, &["op", "restore", &on_big]);
+    admin.ok(&thin, &["status"]);
+    assert!(thin.join("big/f00.bin").exists(), "under the larger bound the move happens");
 }

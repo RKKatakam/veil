@@ -2242,16 +2242,24 @@ at the server, with **no full graph**. Code: `veil-core/src/promisor.rs`
     the commit's nearest ancestors on the server, then the remote's tips
     (BUG-1144).
   * **The locator** records every tree met (a place is the chain of trees
-    above an object) and the files no pack holds, at most 2,000,000 places
-    (about 90 MiB, under the 512 MiB client gate); past it, a read of what
-    is not held is `Unavailable`.
+    above an object) and every file the main store's packs do not hold (the
+    cache's may be evicted and read again, BUG-1147), compactly (an 8-byte
+    key, 16 bytes a place; the parent is checked to name the object), at
+    most 1,500,000 places and parents: 35 to 66 MiB held, 51 to 82 MiB at
+    the peak, measured with a counting allocator (BUG-1149). Past it, a read
+    of what is not held is `Unavailable`.
+  * What is on the server is judged from the remotes' tips as the view has
+    them, refreshed on every change of the view (a pull in a long-lived
+    process is seen at once).
 * **No full graph.** A snapshot the clone lacks is beyond its boundary.
   **Every snapshot read (`Repo::snapshot`, `snapshot_opt`) fetches a page of
   history there** (2,000 snapshots, `Repo::deepen`, into the main store), so
   `vl show`, `blame`, evolog, bisect, search and the rewrite bookkeeping
   read history as a full clone does (BUG-1141); a snapshot the server's
   history for this person lacks is `None`, asked once. Without the server:
-  `Unavailable`. **The history index alone reads only what is held**
+  `Unavailable`. **Walks of the whole graph** (all visible snapshots, every
+  ancestor: the tag-name check of a pull, `embargo release`, `bisect`)
+  **read only what is held** (BUG-1260), as does **the history index**
   (`Repo::snapshot_held`): a generation needs every ancestor, so fetching
   there would make the first graph query fetch the whole history. The
   queries that walk the index (`is_ancestor`, `merge_bases`,
@@ -2266,8 +2274,12 @@ at the server, with **no full graph**. Code: `veil-core/src/promisor.rs`
   level at a time, in batches of at most 1,000 objects and about 8 MiB by
   the sizes tree entries carry (`ObjectStore::prefetch_diff`), so a lost
   server or a full cache fails the move before it writes anything, even its
-  journal. `vl new REV` and `vl edit REV` fetch ahead before they record the
-  move, so a failed one leaves nothing for the next command to retry.
+  journal. **Before an operation that moves the project directory's working
+  copy is published** (`Transaction::commit`: any command, `new`, `edit`,
+  `merge`, `rebase`, `cherry-pick`, `restore`, `undo`, `op restore`), its
+  target is fetched ahead, so a failed one records nothing (BUG-1146). A
+  stale directory that cannot be brought up to `@` stays as it is, with a
+  warning and nothing recorded, so `status`, `undo` and `partial limit` run.
 * **The cache's bound** (default 4 GiB, `--cache-size`, `vl partial
   limit`): when a fetch would pass it, the cache is evicted down to 80 %,
   least recently written first. **Pinned, never evicted:** the trees of
@@ -2279,6 +2291,9 @@ at the server, with **no full graph**. Code: `veil-core/src/promisor.rs`
   the fetch fails with a clear error (never an eviction loop); a clone
   whose checkout passes it is refused. Snapshots and local work are in the
   main store; the op log's views name snapshots, all of which are there.
+* **Also pinned: the trees (not files) of the server-side bases** of the
+  snapshots only this clone holds, so gc and fsck can tell their gaps
+  (BUG-1148).
 * **gc, fsck and maintenance never fetch.** A gap they meet is classified
   (`ObjectStore::classify_gap`, BUG-1143): **the server's** when its
   snapshot is in the remotes' history (from every operation's remote tags),

@@ -2247,9 +2247,6 @@ pub struct NewChange {
 pub fn new_change(ctx: &mut Ctx, revs: &[String], message: &str) -> Result<NewChange> {
     check_message(message)?;
     let parents = if revs.is_empty() { vec![ctx.wc()?] } else { revs.iter().map(|r| ctx.rev(r)).collect::<Result<_>>()? };
-    if let [one] = parents.as_slice() {
-        ctx.fetch_ahead(one)?;
-    }
     let ws = ctx.ws.clone();
     let id = ctx.repo.new_change(&ws, parents, message)?;
     Ok(NewChange { schema: NEW_SCHEMA, working_copy: snapshot_ref(&ctx.repo, &id), operation: op_ref(&ctx.repo) })
