@@ -2496,6 +2496,7 @@ encrypted.
 | `GET prs/{id}/threads?after=`, `POST prs/{id}/threads {body, anchor?}` | a page of threads (on the PR or anchored to lines), each with its first 20 comments; a new thread (answered with that thread) |
 | `GET prs/{id}/threads/{t}?after=`, `POST prs/{id}/threads/{t} {body?, state?}` | a page of one thread's comments; a reply or resolve (answered with that thread) |
 | `POST prs/{id}/reviews {patch, verdict, body?, signature}` | a verdict, signed by the device |
+| `POST prs/{id}/reviews/dismiss {person}` | an admin dismisses a reviewer's requests for changes |
 | `POST prs/{id}/land` | the review gate: `not_ready` with the reasons, or, when met, `landing_unavailable` until S17 (below) |
 
 ```text
@@ -2505,6 +2506,7 @@ vl pr show ID [--threads]           vl pr diff ID [--revision N] [--change C] [-
 vl pr update ID REV                 vl pr close ID
 vl pr comment ID -m M [--path P --line N [--end M] [--old] [--change C] | --thread T]
 vl pr resolve ID THREAD [--reopen]  vl pr review ID --approve|--request-changes [-m M]
+vl pr dismiss ID PERSON             (admins)
 vl pr land ID
 ```
 
@@ -2569,8 +2571,11 @@ parents, down to the first one that is an ancestor of the target's tip
 rebase it), no change id twice, at most 100 changes and 10,000 touched
 paths over every revision. A new revision keeps the PR's place; its
 threads are carried to it: each (change, side, file) is read and diffed
-once for all the anchors on it, within 64 MiB of text per revision (the
-rest outdated, in thread order) and the request's deadline (BUG-1255).
+once for all the anchors on it, one file at a time, holding only the
+diff's block positions, the new text and where its lines start (about
+4 bytes a line beside the text, BUG-1258). At most 64 MiB of text is read
+per revision (the rest outdated, in thread order), within the request's
+deadline (BUG-1255).
 
 **Threads and anchors** (§7.3). An anchor names a change (by change id), a
 file that change changed, a side (`old` is the change's parent, `new` the
@@ -2585,8 +2590,11 @@ are at most 1,000 threads a PR and 500 comments a thread, of 64 KiB each.
 **Answers are paged** (BUG-1253): a listing holds at most 100 threads, each
 with its first 20 comments, and about 1 MiB of comment text in all
 (`next`, and a thread's `comments_next`). A thread's own page holds up to
-500 comments and about 1 MiB. A new thread or a reply is answered with
-that thread only. `vl pr show --threads` follows the cursors.
+500 comments and about 1 MiB. The bound is applied in the query
+(BUG-1258): comments are chosen by their size (`octet_length`, index
+`pr_comments_by_time`) and only the chosen bodies are read. A new thread
+or a reply is answered with that thread only. `vl pr show --threads`
+follows the cursors.
 
 **Reviews** (threats 15, 16). A reviewer must see the PR, may write every
 path it touches (an admin, or the groups and people the deciding lines
@@ -2602,35 +2610,46 @@ them), checked again against the reviewer's access at each answer. The
 author's verdict never counts. Where the rule says `people_only` (always
 for high risk), an agent session's approval does not count. **A request
 for changes**, on any revision, holds the PR until that reviewer approves
-(the current patch) or no longer may write its files. Agent
+or an admin dismisses it (`POST prs/{id}/reviews/dismiss {person}`,
+`vl pr dismiss ID PERSON`). Nothing the author does releases it, nor does
+a change of access (BUG-1259). If a later revision touches a path the
+reviewer cannot read, the PR disappears for them, as any PR must, and it
+stays held. Everyone who sees it is told "<name> asked for changes", and
+an admin decides. Agent
 sessions are S11: the review row records `agent`, and every session today
 is a person's.
 
 **Risk** (per revision, from every change's files together):
-* **high:** `.veilpolicy`, `.veilrules`, anything under `.ci/`, a
+* **high:** `.veilpolicy`, `.veilrules`, CI or container configuration
+  anywhere (BUG-1257: `.ci/`, `.github/`, `.gitlab/`, `.gitlab-ci*`,
+  `.circleci/`, `.buildkite/`, `Jenkinsfile`, `.travis.yml`,
+  `azure-pipelines.yml`, `docker-compose*`, `compose.y*ml`, …), a
   dependency manifest or lock file (`Cargo.toml`, `Cargo.lock`,
   `package.json`, lock files, `go.mod`, …), a secret (a sealed entry on
   either side), a path under a `high_risk_paths` entry, or more than 1,000
   files;
-* **low:** every file is documentation or tests, or changed only
-  whitespace:
+* **low:** every file is documentation or tests. A whitespace change is
+  rated like any other (owner, 2026-11-07, BUG-1256): trailing whitespace
+  and line endings change what scripts do (a heredoc's closing word). Only
+  documentation files are low whatever changes in them:
   * **documentation:** `*.md`, `*.markdown`, `*.rst`, `*.adoc` anywhere;
     `README`, `LICENSE`, `COPYING`, `CHANGELOG`, `CONTRIBUTING`, `AUTHORS`,
     `NOTICE`, `CODE_OF_CONDUCT` with no extension or `.txt`; images under
     `docs/` or `doc/` (no SVG). Not `*.txt` in general, nor everything under
     `docs/` (BUG-1252: `CMakeLists.txt`, `docs/conf.py`);
-  * **tests:** files under `tests/`, `test/`, `__tests__/`, `spec/`,
-    `testdata/`, or named `*_test.*`, `test_*`, `*.test.*`, `*.spec.*`;
+  * **tests:** only where the build treats files as tests only
+    (BUG-1257): under a `tests/`, `test/`, `__tests__/`, `spec/` or
+    `testdata/` folder that is not inside a `src/` folder (there a "test"
+    module may be compiled in, so `src/` is code), or a Go `*_test.go`
+    file. A name alone (`test_mode.rs`, `integration_test.yml`) is not a
+    test;
   * **never documentation or tests:** build and configuration files
     wherever they are (`CMakeLists.txt`, `Makefile`, `*.cmake`, `*.mk`,
     `build.rs`, `setup.py`, `conftest.py`, `Dockerfile`, `BUILD`, `*.bzl`,
-    `*.gradle`, `*.nix`, `conf.py`, …), and executable files;
-  * **whitespace-only** (BUG-1251): the same kind and executable bit, both
-    sides text with the same lines, each equal but for trailing whitespace
-    and line ending. Python, YAML, Makefiles and other files whose meaning
-    depends on whitespace allow only the line ending. Moving text between
-    lines, splitting a token or changing indentation is not whitespace-only.
-    At most 16 MiB is read per revision;
+    `*.gradle`, `*.nix`, `conf.py`, …), **instructions agents execute**
+    (owner, 2026-11-07: `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `SKILL.md`,
+    anything under `.claude/`, `.cursor/` and the like, `.cursorrules`; they
+    are code for agents, so `normal`), and executable files;
 * **normal:** everything else.
 
 Comment-only changes are not detected (phase-4 open question 4).
@@ -2652,10 +2671,14 @@ high_risk_paths = ["src/auth/", "infra/"]
 * **The defaults** (decision 12) apply with no file: low needs no
   approval, normal one (an agent's counts unless it is a session of the
   author), high one person's. `people_only` is forced for high.
-* **A file that does not parse never weakens review.** The last version of
-  it that parsed, on the default branch's first parents (at most 1,000
-  back), still applies: an admin's `approvals = 3` stays 3. With none (the
-  file was new, or absent before), every risk needs one person's approval.
+* **A file that does not parse never weakens review** (BUG-1259). The
+  server keeps, per project, the last valid `.veilrules` of the default
+  branch (`pr_review_rules`: its text, and the tip it covers). It is kept
+  current after each landing on the default branch (the derive workers)
+  and by every PR request. For a broken file, the newest valid version on
+  the tip's first parents since that tip applies, else the stored one,
+  with no depth limit: an admin's `approvals = 3` stays 3. With none ever
+  valid, every risk needs one person's approval.
   Its warnings quote the file, which is the admins' (no access line names
   the root), so only admins read them. Others are told the rules "need an
   admin's attention".
@@ -2697,8 +2720,10 @@ names is S3's client work), and rate limits on PR creation (S24).
 | 13 | A participant | opens a PR from an embargoed change, or one built on it | no such revision (embargo lines are withheld from every viewer until S22) | `pr_rules_from_veilrules` |
 | 14 | Same | reads a broken `.veilrules` through PR answers | review gets stricter; the file's text reaches admins only | same |
 | 15 | Same | floods threads or comments | at most 1,000 threads a PR, 500 comments a thread, under the PR's row lock | by construction (limits checked in the transaction) |
-| 16 | — (a race) | an access-line change, a reclassification and a new revision at once | no class of other paths is ever stored under the current lines (BUG-1250) | `s21_adversarial::bug_1250_…` (deterministic), `s21_adversarial::class_writes_race_revisions_and_access_lines` (both databases) |
-| 17 | A member who may write a folder | a change of behaviour made of whitespace (a joined line, a split token, indentation), an executable bit, a build file named like documentation | `normal` risk: needs the rule's approvals (BUG-1251, BUG-1252) | `s21_adversarial::bug_1251_…`, `bug_1252_…`, unit tests in `prs::rules` and `prs::revision` |
+| 16 | — (a race) | an access-line change, a reclassification and a new revision at once | no class of other paths is ever stored under the current lines (BUG-1250) | `s21_cycle2::class_writes_hold_under_scripted_interleavings` (each interleaving scripted; fails with the guard removed), `s21_adversarial::bug_1250_…` |
+| 17 | A member who may write a folder | a change of behaviour made of whitespace (a joined line, a split token, indentation, a heredoc's closing word), an executable bit, a build file named like documentation, CI configuration or a source file named like a test, agent instructions | `normal`, or `high` for CI (BUG-1251, 1252, 1256, 1257) | `s21_adversarial::bug_1251_…`, `bug_1252_…`, `s21_cycle2::bug_1256_…`, `bug_1257_…`, unit tests in `prs::rules` |
+| 21 | Any participant | makes a listing or a revision hold far more than it answers | listings read only the bodies they answer; carrying holds one file's positions at a time: +2 MiB for 2,100 comments of 64 KiB (was 139 MiB), +26 MiB for 64 files of 1 MiB (was 729 MiB for 8) (BUG-1258) | `s21_cycle2::bug_1258_…` (two tests, each in a process of its own) |
+| 22 | The author | grows the PR past a reviewer's access, or waits for the default branch to move past a broken `.veilrules` | the request for changes holds until that reviewer approves or an admin dismisses it; the last valid rules apply however far back (BUG-1259) | `s21_cycle2::bug_1259_…` (two tests) |
 | 18 | Any participant | posts many large comments, then has everyone read them | every answer about 1 MiB of comments at most (BUG-1253) | `s21_adversarial::bug_1253_…` |
 | 19 | The author of a PR rebased over hidden changes | asks for the revision they are shown | "that is revision 1 already", their numbering (BUG-1254) | `s21_adversarial::bug_1254_…` |
 | 20 | Any participant | anchors 1,000 threads, slowing every revision | one diff per (change, side, file); 1,000 threads: 0.65 s (debug), was about 13 min (BUG-1255) | `s21_adversarial::bug_1255_…` (`VEIL_BUG1255_THREADS=1000`) |

@@ -104,6 +104,7 @@ fn print_pr(v: &Value, threads: Option<&Value>) {
         let mark = match (s(x, "verdict"), x["counted"] == true) {
             ("approve", true) => green("approved"),
             ("approve", false) => dim("approved (not counted)"),
+            ("dismissed", _) => dim("asked for changes (dismissed by an admin)"),
             _ => red("asked for changes"),
         };
         println!("    {} {mark} on revision {}{}", safe(s(x, "by")), x["revision"], if x["current"] == true { "" } else { " (files changed since)" });
@@ -312,6 +313,11 @@ pub fn run(ctx: &mut Ctx, cmd: &PrCmd) -> Result<()> {
                 println!("{} revision {} of {}", if verdict == "approve" { green("Approved") } else { red("Asked for changes on") }, revision, bold(id));
                 println!("  review: {}/{}  {}", v["review"]["approvals"], v["review"]["needs"]["approvals"], if v["review"]["ready"] == true { green("ready to land") } else { yellow("not ready") });
             })
+        }
+        PrCmd::Dismiss { id, person } => {
+            c.project_json("POST", &pr_path(id, "/reviews/dismiss")?, Some(&json!({ "person": person })))?;
+            println!("Dismissed {}'s request for changes on {}", safe(person), bold(id));
+            Ok(())
         }
         PrCmd::Close { id } => {
             c.project_json("POST", &pr_path(id, "/close")?, None)?;

@@ -323,7 +323,14 @@ pub fn landed(hub: &Arc<Hub>, project: i64, branches: Vec<String>) {
 /// What [`landed`] runs for the branches a landing moved: derive them, then
 /// memoise their tips' projections for every view key.
 pub async fn landing(hub: &Arc<Hub>, project: i64, branches: Vec<String>) -> Result<Stats> {
+    let moved = branches.clone();
     let stats = catch_up(hub, project, Scope::Branches(branches)).await?;
+    // The project's record of its last valid `.veilrules` (S21, BUG-1259),
+    // kept current at each landing on the default branch; a failure here is
+    // only a longer walk at the next PR request.
+    if let Err(e) = crate::prs::landed(hub, project, &moved).await {
+        eprintln!("veil-server: recording the review rules of project {project}: {e:?}");
+    }
     // Memoising runs on the requests' pool, so under a permit too: at most
     // [`DERIVERS`] of its connections at once (BUG-911).
     let permit = hub.derive.permit().await?;

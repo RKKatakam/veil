@@ -36,9 +36,7 @@ pub const NOTHING_TO_REVIEW: &str = "nothing to review";
 pub const MAX_STACK: usize = 100;
 /// The most paths one PR may touch, over all its revisions.
 pub const MAX_PATHS: usize = 10_000;
-/// The most bytes read to tell whitespace-only changes, per revision.
-const WHITESPACE_BUDGET: u64 = 16 << 20;
-/// Text larger than this is never compared for whitespace (or anchored).
+/// Text larger than this is never anchored to.
 pub const MAX_TEXT: u64 = 1 << 20;
 /// The largest `.veilrules` read.
 const MAX_RULES: u64 = 64 << 10;
@@ -116,59 +114,90 @@ pub fn text_of(cx: &Cx, e: &TreeEntry) -> Result<Option<String>> {
     Ok(String::from_utf8(bytes).ok())
 }
 
-/// How far back on the default branch's first parents a broken
-/// `.veilrules` looks for its last valid version.
-pub const RULES_HISTORY: usize = 1_000;
-
-/// The `.veilrules` of snapshot `id` as parsed (`None`: no such file), and
-/// the file's entry id.
-fn rules_of(cx: &Cx, id: &ObjectId) -> Result<Option<(ObjectId, Review)>> {
+/// The `.veilrules` text of snapshot `id`, if it holds a plain file of at
+/// most 64 KiB, with the file's entry id; `None`: no such file.
+pub fn rules_text(cx: &Cx, id: &ObjectId) -> Result<Option<(ObjectId, Option<Vec<u8>>)>> {
     let tree = cx.src.snapshot(id)?.tree;
     let Some(e) = entry_at(&cx.src, tree, RULES_FILE)? else { return Ok(None) };
     if e.kind != EntryKind::File || !e.visibility.is_public() || e.size > MAX_RULES {
-        return Ok(Some((e.id, Review::strict("not a plain file of at most 64 KiB".into()))));
+        return Ok(Some((e.id, None)));
     }
-    let raw = cx.src.raw(&e.id)?;
     Ok(Some((
         e.id,
-        match Object::decode(&raw) {
-            Ok(Object::Blob(b)) if b.len() as u64 <= MAX_RULES => Review::parse(Some(&b)),
-            _ => Review::strict("not a plain file of at most 64 KiB".into()),
+        match Object::decode(&cx.src.raw(&e.id)?) {
+            Ok(Object::Blob(b)) if b.len() as u64 <= MAX_RULES => Some(b),
+            _ => None,
         },
     )))
 }
 
-/// The review rules of the default branch's tip (`None`: no branch yet).
-/// A `.veilrules` that does not parse never weakens review: the last
-/// version that parsed, on the tip's first parents (at most
-/// [`RULES_HISTORY`] back), applies; with none (the file was new, or
-/// absent before), the strict rules do.
-pub fn rules_at(cx: &Cx, tip: Option<ObjectId>) -> Result<Review> {
-    let Some(tip) = tip else { return Ok(Review::default()) };
-    let Some((mut seen, first)) = rules_of(cx, &tip)? else { return Ok(Review::default()) };
-    if !first.broken {
-        return Ok(first);
-    }
+/// What the review rules are at the default branch's `tip`, given the
+/// project's stored record (`checked`: the tip it was made at; `text`: the
+/// last valid `.veilrules` at or before it), and the record to store now
+/// (BUG-1259). A broken file never weakens review: the newest valid
+/// version on the tip's first parents since `checked`, else the stored
+/// one, else the strict rules. No depth limit: the walk stops at
+/// `checked` (or the root, when `checked` is not on the way).
+pub struct RulesNow {
+    pub review: Review,
+    pub checked: ObjectId,
+    pub text: Option<Vec<u8>>,
+}
+
+pub fn rules_now(cx: &Cx, tip: ObjectId, checked: Option<ObjectId>, stored: Option<Vec<u8>>) -> Result<RulesNow> {
+    let parse = |t: &Option<Vec<u8>>| t.as_deref().map(|b| Review::parse(Some(b))).filter(|r| !r.broken);
+    let first = rules_text(cx, &tip)?;
+    let (seen, tip_review) = match &first {
+        // No file: the defaults; the record keeps the last valid one.
+        None => return Ok(RulesNow { review: Review::default(), checked: tip, text: stored }),
+        Some((id, text)) => match parse(text) {
+            Some(r) => return Ok(RulesNow { review: r, checked: tip, text: text.clone() }),
+            None => (*id, text.as_deref().map(|b| Review::parse(Some(b))).unwrap_or_else(|| Review::strict("not a plain file of at most 64 KiB".into()))),
+        },
+    };
+    // Broken at the tip: the newest valid version since the record.
+    let mut found: Option<(ObjectId, Vec<u8>)> = None;
+    let mut last = Some(seen);
     let mut x = tip;
-    for _ in 0..RULES_HISTORY {
+    while Some(x) != checked {
         let Some(p) = cx.src.snapshot(&x)?.parents.first().copied() else { break };
         x = p;
-        match rules_of(cx, &x)? {
-            None => break,
-            Some((id, _)) if id == seen => continue,
-            Some((_, r)) if !r.broken => {
-                let mut kept = r;
-                kept.warnings = first.warnings.clone();
-                kept.warnings.push(format!("until it is fixed, the last valid {RULES_FILE} applies (as of {})", x.short()));
-                kept.broken = true;
-                return Ok(kept);
+        if Some(x) == checked {
+            break;
+        }
+        match rules_text(cx, &x)? {
+            None => last = None,
+            Some((id, _)) if Some(id) == last => {}
+            Some((id, text)) => {
+                last = Some(id);
+                if let (Some(t), true) = (&text, parse(&text).is_some()) {
+                    found = Some((x, t.clone()));
+                    break;
+                }
             }
-            Some((id, _)) => seen = id,
         }
     }
-    let mut strict = first;
-    strict.warnings.push("until it is fixed, every PR needs one person's approval (no earlier version of it is valid)".into());
-    Ok(strict)
+    let (text, from) = match found {
+        Some((at, t)) => (Some(t), Some(at.short())),
+        None => (stored, None),
+    };
+    let mut review = match parse(&text) {
+        Some(mut kept) => {
+            kept.warnings = tip_review.warnings.clone();
+            kept.warnings.push(match from {
+                Some(at) => format!("until it is fixed, the last valid {RULES_FILE} applies (as of {at})"),
+                None => format!("until it is fixed, the last valid {RULES_FILE} applies"),
+            });
+            kept
+        }
+        None => {
+            let mut strict = tip_review;
+            strict.warnings.push("until it is fixed, every PR needs one person's approval (no earlier version of it is valid)".into());
+            strict
+        }
+    };
+    review.broken = true;
+    Ok(RulesNow { review, checked: tip, text })
 }
 
 fn entry_bytes(h: &mut blake3::Hasher, e: Option<&TreeEntry>) {
@@ -181,45 +210,6 @@ fn entry_bytes(h: &mut blake3::Hasher, e: Option<&TreeEntry>) {
             h.update(&e.id.0);
         }
     }
-}
-
-/// Does a file's meaning depend on trailing whitespace or indentation?
-/// There only line endings may change for a whitespace-only change.
-fn whitespace_significant(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
-    matches!(ext.as_str(), "py" | "pyi" | "pyw" | "yaml" | "yml" | "mk" | "make" | "haml" | "pug" | "sass" | "coffee" | "nim")
-        || matches!(name, "Makefile" | "makefile" | "GNUmakefile")
-}
-
-/// Is a change whitespace-only (BUG-1251)? The same kind and executable
-/// bit, both sides text with the same lines, each equal but for trailing
-/// whitespace and its line ending (only the line ending, for files whose
-/// meaning depends on whitespace). Moving text between lines, splitting a
-/// token or changing indentation is never whitespace-only.
-fn whitespace_only(cx: &Cx, c: &Change, budget: &mut u64) -> Result<bool> {
-    let (Some(o), Some(n)) = (&c.old, &c.new) else { return Ok(false) };
-    if o.kind != n.kind || o.executable != n.executable || o.size + n.size > *budget {
-        return Ok(false);
-    }
-    *budget -= o.size + n.size;
-    let (Some(a), Some(b)) = (text_of(cx, o)?, text_of(cx, n)?) else { return Ok(false) };
-    Ok(same_but_whitespace(&c.path, &a, &b))
-}
-
-/// The texts of `whitespace_only`: the same lines, each equal but for
-/// trailing whitespace (only its `\r`, where whitespace is significant).
-pub fn same_but_whitespace(path: &str, a: &str, b: &str) -> bool {
-    let strict = whitespace_significant(path);
-    let norm = |l: &'_ str| -> String {
-        if strict {
-            l.strip_suffix('\r').unwrap_or(l).to_string()
-        } else {
-            l.trim_end().to_string()
-        }
-    };
-    let (la, lb): (Vec<&str>, Vec<&str>) = (a.split('\n').collect(), b.split('\n').collect());
-    la.len() == lb.len() && la.iter().zip(&lb).all(|(x, y)| norm(x) == norm(y))
 }
 
 /// The revision of a PR whose head is real snapshot `head`, onto real
@@ -252,7 +242,6 @@ pub fn compute(cx: &Cx, g: &G, head: ObjectId, onto: ObjectId, rules: &Review) -
     let mut touched = BTreeSet::new();
     let mut files: BTreeMap<String, FileChange> = BTreeMap::new();
     let mut patch = blake3::Hasher::new_derive_key("veil 2026 hub pr patch v1");
-    let mut budget = WHITESPACE_BUDGET;
     let mut out = Vec::new();
     for (snap, parent, change, tree) in &chain {
         let ptree = g.snapshot(parent)?.tree;
@@ -268,11 +257,9 @@ pub fn compute(cx: &Cx, g: &G, head: ObjectId, onto: ObjectId, rules: &Review) -
             entry_bytes(&mut patch, c.old.as_ref());
             entry_bytes(&mut patch, c.new.as_ref());
             let secret = [&c.old, &c.new].iter().any(|e| e.as_ref().is_some_and(|e| !e.visibility.is_public()));
-            let ws = !secret && whitespace_only(cx, c, &mut budget)?;
             let executable = c.new.as_ref().is_some_and(|e| e.executable);
-            let f = files.entry(c.path.clone()).or_insert(FileChange { path: c.path.clone(), secret, whitespace_only: ws, executable });
+            let f = files.entry(c.path.clone()).or_insert(FileChange { path: c.path.clone(), secret, executable });
             f.secret |= secret;
-            f.whitespace_only &= ws;
             f.executable |= executable;
             touched.insert(c.path.clone());
         }
@@ -304,24 +291,4 @@ pub fn compute(cx: &Cx, g: &G, head: ObjectId, onto: ObjectId, rules: &Review) -
 pub fn change_files(cx: &Cx, c: &StackChange) -> Result<Vec<Change>> {
     let (now, before) = (cx.src.snapshot(&c.snapshot_id())?.tree, cx.src.snapshot(&c.parent_id())?.tree);
     Ok(changes::diff(&cx.src, before, now)?.0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::same_but_whitespace as same;
-
-    #[test]
-    fn whitespace_only_keeps_every_line_and_its_indentation() {
-        assert!(same("a.rs", "fn a() {}  \nb();\n", "fn a() {}\nb();\t\n"));
-        assert!(same("a.rs", "a\r\nb\r\n", "a\nb\n"));
-        // BUG-1251: joined lines, split tokens, indentation.
-        assert!(!same("a.rs", "// check\nverify();\n", "// check verify();\n"));
-        assert!(!same("c.sh", "rm -rf /tmp/build\n", "rm -rf / tmp/build\n"));
-        assert!(!same("g.py", "if x:\n    a()\n    b()\n", "if x:\n    a()\nb()\n"));
-        assert!(!same("a.rs", "  a\n", "a\n"));
-        // Trailing whitespace is meaning in a Makefile or YAML.
-        assert!(!same("Makefile", "X = a \n", "X = a\n"));
-        assert!(!same("ci/a.yml", "k: |\n  v  \n", "k: |\n  v\n"));
-        assert!(same("Makefile", "X = a\r\n", "X = a\n"));
-    }
 }

@@ -115,40 +115,41 @@ pub fn anchor(cx: &Cx, revision: u32, stack: &[StackChange], a: &AnchorRequest) 
     })
 }
 
-/// 0-based old line `l` through `d`, if it is not inside a changed block.
-fn map_line(d: &veil_core::hunks::TextDiff, l: usize) -> Option<usize> {
-    let mut delta: isize = 0;
-    for h in &d.hunks {
-        for b in &h.blocks {
-            if l < b.old_at {
-                return Some((l as isize + delta) as usize);
-            }
-            if l < b.old_at + b.old_len {
-                return None;
-            }
-            delta = (b.new_at + b.added.len()) as isize - (b.old_at + b.old_len) as isize;
-        }
-    }
-    Some((l as isize + delta) as usize)
-}
-
 /// The most bytes of file text one new revision reads to carry its
 /// threads (both sides of each file, once): past it, the remaining files'
 /// threads are outdated, in a fixed order (BUG-1255).
 pub const CARRY_BUDGET: u64 = 64 << 20;
 
-/// One file side's two versions, read and diffed once for every anchor on
-/// it.
+/// One file side's two versions, as carrying needs them (BUG-1258): the
+/// diff's block positions only, and the new text with where each line
+/// starts. About 4 bytes a line beside the text; one file is held at a
+/// time.
 struct Versions {
     same: bool,
-    diff: veil_core::hunks::TextDiff,
-    new_lines: Vec<String>,
+    blocks: Vec<(usize, usize, usize, usize)>,
+    text: String,
+    starts: Vec<u32>,
+}
+
+impl Versions {
+    /// New lines `s..=e` (0-based), with their line breaks.
+    fn lines(&self, s: usize, e: usize) -> Vec<&str> {
+        (s..=e)
+            .map(|i| {
+                let from = self.starts[i] as usize;
+                let to = self.starts.get(i + 1).map_or(self.text.len(), |x| *x as usize);
+                &self.text[from..to]
+            })
+            .collect()
+    }
 }
 
 /// Where each anchor (thread id, anchor, its place now on stack `old`) is
 /// on the next revision's stack `new` (numbered `revision`); `None`:
 /// outdated. Each (change, side, path) is read and diffed once (BUG-1255),
-/// within [`CARRY_BUDGET`] bytes, and the deadline is checked between files.
+/// one at a time (BUG-1258), within [`CARRY_BUDGET`] bytes read, in the
+/// order of each file's first thread; the deadline is checked between
+/// files.
 pub fn carry_all(
     cx: &Cx,
     anchors: Vec<(String, Anchor, At)>,
@@ -157,28 +158,35 @@ pub fn carry_all(
     revision: u32,
     deadline: std::time::Instant,
 ) -> Result<Vec<(String, Option<At>)>> {
-    use std::collections::BTreeMap;
-    let mut cache: BTreeMap<(String, String, String), Option<Versions>> = BTreeMap::new();
-    let mut budget = CARRY_BUDGET;
-    let mut out = Vec::with_capacity(anchors.len());
-    for (tid, a, now) in anchors {
-        let k = (a.change.clone(), a.side.clone(), a.path.clone());
-        if !cache.contains_key(&k) {
-            if std::time::Instant::now() > deadline {
-                return Err(crate::query::graph::too_slow());
-            }
-            let v = match (old.iter().find(|c| c.change == a.change), new.iter().find(|c| c.change == a.change)) {
-                (Some(oc), Some(nc)) => versions(cx, oc, nc, &a.side, &a.path, &mut budget)?,
-                _ => None,
-            };
-            cache.insert(k.clone(), v);
+    type Key = (String, String, String);
+    let mut order: Vec<Key> = Vec::new();
+    let mut groups: std::collections::HashMap<Key, Vec<(String, Anchor, At)>> = std::collections::HashMap::new();
+    for x in anchors {
+        let k = (x.1.change.clone(), x.1.side.clone(), x.1.path.clone());
+        if !groups.contains_key(&k) {
+            order.push(k.clone());
         }
-        let at = match &cache[&k] {
-            None => None,
-            Some(v) if v.same => Some(At { revision, ..now }),
-            Some(v) => moved(v, &a, now, revision),
+        groups.entry(k).or_default().push(x);
+    }
+    let mut budget = CARRY_BUDGET;
+    let mut out = Vec::new();
+    for k in order {
+        if std::time::Instant::now() > deadline {
+            return Err(crate::query::graph::too_slow());
+        }
+        let v = match (old.iter().find(|c| c.change == k.0), new.iter().find(|c| c.change == k.0)) {
+            (Some(oc), Some(nc)) => versions(cx, oc, nc, &k.1, &k.2, &mut budget)?,
+            _ => None,
         };
-        out.push((tid, at));
+        for (tid, a, now) in groups.remove(&k).unwrap_or_default() {
+            let at = match &v {
+                None => None,
+                Some(v) if v.same => Some(At { revision, ..now }),
+                Some(v) => moved(v, &a, now, revision),
+            };
+            out.push((tid, at));
+        }
+        // `v` (this file's text and positions) is dropped here.
     }
     Ok(out)
 }
@@ -192,7 +200,7 @@ fn versions(cx: &Cx, oc: &StackChange, nc: &StackChange, side: &str, path: &str,
     };
     let (Some(o), Some(n)) = (side_entry(oc)?, side_entry(nc)?) else { return Ok(None) };
     if o.id == n.id {
-        return Ok(Some(Versions { same: true, diff: Default::default(), new_lines: Vec::new() }));
+        return Ok(Some(Versions { same: true, blocks: Vec::new(), text: String::new(), starts: Vec::new() }));
     }
     if o.size + n.size > *budget {
         *budget = 0;
@@ -200,21 +208,41 @@ fn versions(cx: &Cx, oc: &StackChange, nc: &StackChange, side: &str, path: &str,
     }
     *budget -= o.size + n.size;
     let (Some(ot), Some(nt)) = (text_of(cx, &o)?, text_of(cx, &n)?) else { return Ok(None) };
-    let diff = veil_core::hunks::diff_text(&ot, &nt);
-    let new_lines = veil_core::hunks::lines(&nt).into_iter().map(str::to_string).collect();
-    Ok(Some(Versions { same: false, diff, new_lines }))
+    let blocks = veil_core::hunks::blocks(&ot, &nt);
+    drop(ot);
+    let mut starts = vec![0u32];
+    starts.extend(nt.match_indices('\n').map(|(i, _)| i as u32 + 1).filter(|i| (*i as usize) < nt.len()));
+    if nt.is_empty() {
+        starts.clear();
+    }
+    Ok(Some(Versions { same: false, blocks, text: nt, starts }))
 }
 
-/// Anchor `a` at `now` through the diff `v`, if its lines map whole and
-/// still hash to its context.
+/// 0-based old line `l` through `blocks`, if it is not inside a changed
+/// block.
+fn map_line(blocks: &[(usize, usize, usize, usize)], l: usize) -> Option<usize> {
+    let mut delta: isize = 0;
+    for &(old_at, old_len, new_at, new_len) in blocks {
+        if l < old_at {
+            break;
+        }
+        if l < old_at + old_len {
+            return None;
+        }
+        delta = (new_at + new_len) as isize - (old_at + old_len) as isize;
+    }
+    Some((l as isize + delta) as usize)
+}
+
+/// Anchor `a` at `now` through `v`, if its lines map whole and still hash
+/// to its context.
 fn moved(v: &Versions, a: &Anchor, now: At, revision: u32) -> Option<At> {
     let (s, e) = (now.start as usize - 1, now.end as usize - 1);
-    let (ns, ne) = (map_line(&v.diff, s)?, map_line(&v.diff, e)?);
-    if ne < ns || ne - ns != e - s || ne >= v.new_lines.len() {
+    let (ns, ne) = (map_line(&v.blocks, s)?, map_line(&v.blocks, e)?);
+    if ne < ns || ne - ns != e - s || ne >= v.starts.len() {
         return None;
     }
-    let lines: Vec<&str> = v.new_lines[ns..=ne].iter().map(String::as_str).collect();
-    (context_of(&lines) == a.context).then_some(At {
+    (context_of(&v.lines(ns, ne)) == a.context).then_some(At {
         revision,
         start: ns as u32 + 1,
         end: ne as u32 + 1,
@@ -226,7 +254,7 @@ mod tests {
     use super::*;
 
     fn mapped(old: &str, new: &str, l: usize) -> Option<usize> {
-        map_line(&veil_core::hunks::diff_text(old, new), l)
+        map_line(&veil_core::hunks::blocks(old, new), l)
     }
 
     #[test]

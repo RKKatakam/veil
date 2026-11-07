@@ -86,6 +86,9 @@ CREATE TABLE IF NOT EXISTS pr_comments (
     at BIGINT NOT NULL,
     PRIMARY KEY (project_id, pr, thread, id)
 );
+-- Pages of a thread's comments, oldest first, read by size before their
+-- bodies (BUG-1258).
+CREATE INDEX IF NOT EXISTS pr_comments_by_time ON pr_comments (project_id, pr, thread, at, id);
 
 -- A person's verdict on one revision (the latest they gave), bound to its
 -- patch, with the device signature (over project, PR, patch, verdict).
@@ -102,4 +105,14 @@ CREATE TABLE IF NOT EXISTS pr_reviews (
     body TEXT NOT NULL,
     at BIGINT NOT NULL,
     PRIMARY KEY (project_id, pr, revision, person)
+);
+
+-- The last valid `.veilrules` of each project's default branch (BUG-1259):
+-- `text` is the newest version that parsed at or before `checked` (the tip
+-- last looked at), so a broken file keeps its rules however far back the
+-- valid one is. Written by PR requests and after landings.
+CREATE TABLE IF NOT EXISTS pr_review_rules (
+    project_id BIGINT PRIMARY KEY,
+    checked TEXT NOT NULL,
+    text TEXT
 );

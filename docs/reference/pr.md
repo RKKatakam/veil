@@ -15,6 +15,7 @@ Subcommands:
 * [`vl pr comment`](#vl-pr-comment): Comment on a PR, on lines of a file it changes, or in a thread
 * [`vl pr resolve`](#vl-pr-resolve): Resolve a thread (or reopen it)
 * [`vl pr review`](#vl-pr-review): Approve the PR's current revision, or ask for changes
+* [`vl pr dismiss`](#vl-pr-dismiss): Dismiss a reviewer's request for changes (admins): the only way it stops holding the PR but that reviewer's own approval
 * [`vl pr close`](#vl-pr-close): Close a PR (its author or an admin)
 * [`vl pr land`](#vl-pr-land): Land a PR whose review rules are met
 
@@ -193,6 +194,21 @@ Options:
 | `--request-changes` |  |
 | `-m, --message <MESSAGE>` |  |
 | `--json` | Print one JSON document instead of text (its schema is named in its `schema` field; see docs/reference/json.md). Errors then also print a `veil.error/1` document |
+
+## `vl pr dismiss`
+
+Dismiss a reviewer's request for changes (admins): the only way it stops holding the PR but that reviewer's own approval
+
+```text
+vl pr dismiss [OPTIONS] <ID> <PERSON>
+```
+
+Arguments:
+
+| | |
+|---|---|
+| `<ID>` | (required) |
+| `<PERSON>` | (required) |
 
 ## `vl pr close`
 

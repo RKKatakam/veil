@@ -222,8 +222,52 @@ async fn tip(hub: &Hub, project: i64, branch: &str) -> Result<Option<ObjectId>> 
 
 /// The review rules of the default branch's tip.
 async fn rules(hub: &Arc<Hub>, ask: &Ask) -> Result<Review> {
-    let t = tip(hub, ask.project.id, &ask.project.default_branch).await?;
-    blocking(hub, ask.project.id, move |cx| revision::rules_at(cx, t)).await
+    rules_of_project(hub, ask.project.id, &ask.project.default_branch).await
+}
+
+/// The review rules at the tip of `default_branch`, keeping the project's
+/// record of the last valid `.veilrules` (`pr_review_rules`, BUG-1259)
+/// current. Run by every PR request and, after each landing on the
+/// default branch, by the derive workers ([`landed`]), so the walk past a
+/// broken file is short.
+pub async fn rules_of_project(hub: &Arc<Hub>, project: i64, default_branch: &str) -> Result<Review> {
+    let Some(t) = tip(hub, project, default_branch).await? else { return Ok(Review::default()) };
+    let row: Option<(String, Option<String>)> = sqlx::query_as("SELECT checked, text FROM pr_review_rules WHERE project_id = $1")
+        .bind(project)
+        .fetch_optional(&hub.db)
+        .await?;
+    let (checked, stored) = match row {
+        Some((c, text)) => (ObjectId::from_hex(&c).ok(), text.map(String::into_bytes)),
+        None => (None, None),
+    };
+    let before = (checked, stored.clone());
+    let now = blocking(hub, project, move |cx| revision::rules_now(cx, t, checked, stored)).await?;
+    if before == (Some(now.checked), now.text.clone()) {
+        return Ok(now.review);
+    }
+    // The record: its text is the last valid file at or before `checked`,
+    // written together, so a record from an older tip is only less far
+    // along (the next walk goes further), never wrong.
+    sqlx::query(
+        "INSERT INTO pr_review_rules (project_id, checked, text) VALUES ($1, $2, $3) \
+         ON CONFLICT (project_id) DO UPDATE SET checked = EXCLUDED.checked, text = EXCLUDED.text",
+    )
+    .bind(project)
+    .bind(now.checked.hex())
+    .bind(now.text.as_ref().map(|t| String::from_utf8_lossy(t).into_owned()))
+    .execute(&hub.db)
+    .await?;
+    Ok(now.review)
+}
+
+/// After a landing that moved `branches` of `project`: keep the record of
+/// the last valid `.veilrules` current when the default branch moved.
+pub async fn landed(hub: &Arc<Hub>, project: i64, branches: &[String]) -> Result<()> {
+    let default: Option<String> = sqlx::query_scalar("SELECT default_branch FROM projects WHERE id = $1").bind(project).fetch_optional(&hub.db).await?;
+    match default {
+        Some(d) if branches.contains(&d) => rules_of_project(hub, project, &d).await.map(|_| ()),
+        _ => Ok(()),
+    }
 }
 
 fn admin() -> Viewer {
@@ -862,7 +906,31 @@ fn cursor(s: Option<&str>) -> Result<(i64, String)> {
 }
 
 type ThreadMeta = (String, Option<String>, Option<String>, String, i64, i64);
-type CommentRow = (String, String, i64, String, i64);
+/// A comment without its body: (thread, id, author, at, bytes).
+type CommentMeta = (String, String, i64, i64, i64);
+
+/// The bodies of the chosen comments (thread, id), read only once chosen.
+async fn comment_bodies(hub: &Hub, project: i64, pr: &str, chosen: &[(String, String)]) -> Result<HashMap<(String, String), String>> {
+    if chosen.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let (threads, ids): (Vec<String>, Vec<String>) = chosen.iter().cloned().unzip();
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT c.thread, c.id, c.body FROM UNNEST($3::text[], $4::text[]) AS w(thread, id) \
+         JOIN pr_comments c ON c.project_id = $1 AND c.pr = $2 AND c.thread = w.thread AND c.id = w.id",
+    )
+    .bind(project)
+    .bind(pr)
+    .bind(&threads)
+    .bind(&ids)
+    .fetch_all(&hub.db)
+    .await?;
+    Ok(rows.into_iter().map(|(t, i, b)| ((t, i), b)).collect())
+}
+
+fn comment_value(c: &CommentMeta, bodies: &HashMap<(String, String), String>, ppl: &HashMap<i64, String>) -> Value {
+    json!({ "id": c.1, "author": ppl.get(&c.2), "body": bodies.get(&(c.0.clone(), c.1.clone())), "at": c.3 })
+}
 
 /// A thread as the viewer is shown it, with `comments` (and the cursor of
 /// the rest, if any).
@@ -884,7 +952,7 @@ fn thread_value(t: &ThreadMeta, comments: Vec<Value>, more: Option<String>, ppl:
     })
 }
 
-async fn people_of(hub: &Hub, ts: &[ThreadMeta], cs: &[CommentRow]) -> Result<HashMap<i64, String>> {
+async fn people_of(hub: &Hub, ts: &[ThreadMeta], cs: &[CommentMeta]) -> Result<HashMap<i64, String>> {
     let mut people: Vec<i64> = ts.iter().map(|t| t.4).chain(cs.iter().map(|c| c.2)).collect();
     people.sort();
     people.dedup();
@@ -913,12 +981,13 @@ pub async fn threads_json(hub: &Arc<Hub>, ask: &Ask, id: &str, after: Option<&st
     let more_threads = ts.len() as i64 > THREADS_PAGE;
     let ts = &ts[..ts.len().min(THREADS_PAGE as usize)];
     let ids: Vec<String> = ts.iter().map(|t| t.0.clone()).collect();
-    // Each thread's first comments and one more (to know there are more).
-    let cs: Vec<CommentRow> = sqlx::query_as(
-        "SELECT thread, id, author, body, at FROM ( \
-             SELECT thread, id, author, body, at, ROW_NUMBER() OVER (PARTITION BY thread ORDER BY at, id) AS k \
-             FROM pr_comments WHERE project_id = $1 AND pr = $2 AND thread = ANY($3)) c \
-         WHERE k <= $4 ORDER BY at, id",
+    // Each thread's first comments and one more (to know there are more),
+    // without their bodies: the sizes decide which fit, then only those
+    // bodies are read (BUG-1258).
+    let metas: Vec<CommentMeta> = sqlx::query_as(
+        "SELECT t.id, c.id, c.author, c.at, c.size FROM UNNEST($3::text[]) AS t(id), \
+         LATERAL (SELECT id, author, at, octet_length(body)::BIGINT AS size FROM pr_comments \
+                  WHERE project_id = $1 AND pr = $2 AND thread = t.id ORDER BY at, id LIMIT $4) c",
     )
     .bind(ask.project.id)
     .bind(&pr.id)
@@ -926,28 +995,42 @@ pub async fn threads_json(hub: &Arc<Hub>, ask: &Ask, id: &str, after: Option<&st
     .bind(COMMENTS_SHOWN + 1)
     .fetch_all(&hub.db)
     .await?;
-    let ppl = people_of(hub, ts, &cs).await?;
-    let mut by_thread: HashMap<&str, Vec<&CommentRow>> = HashMap::new();
-    for c in &cs {
+    let mut by_thread: HashMap<&str, Vec<&CommentMeta>> = HashMap::new();
+    for c in &metas {
         by_thread.entry(c.0.as_str()).or_default().push(c);
     }
-    let (mut out, mut bytes, mut next) = (Vec::new(), 0usize, None);
+    for v in by_thread.values_mut() {
+        v.sort_by(|a, b| (a.3, &a.1).cmp(&(b.3, &b.1)));
+    }
+    // Choose within the bytes, in the answer's order.
+    type Planned<'a> = (&'a ThreadMeta, Vec<&'a CommentMeta>, Option<String>);
+    let mut chosen: Vec<(String, String)> = Vec::new();
+    let mut plan: Vec<Planned> = Vec::new();
+    let (mut bytes, mut next): (usize, Option<String>) = (0, None);
     for t in ts {
-        if bytes >= ANSWER_BYTES && !out.is_empty() {
-            next = out.last().map(|v: &Value| format!("{}:{}", v["created_at"], v["id"].as_str().unwrap_or("")));
+        if bytes >= ANSWER_BYTES && !plan.is_empty() {
+            next = plan.last().map(|(t, _, _)| format!("{}:{}", t.5, t.0));
             break;
         }
         let mine = by_thread.remove(t.0.as_str()).unwrap_or_default();
         let (mut shown, mut more) = (Vec::new(), None);
         for (i, c) in mine.iter().enumerate() {
             if i as i64 == COMMENTS_SHOWN || (bytes >= ANSWER_BYTES && !shown.is_empty()) {
-                more = shown.last().map(|v: &Value| format!("{}:{}", v["at"], v["id"].as_str().unwrap_or("")));
+                more = shown.last().map(|c: &&CommentMeta| format!("{}:{}", c.3, c.1));
                 break;
             }
-            bytes += c.3.len() + 64;
-            shown.push(json!({ "id": c.1, "author": ppl.get(&c.2), "body": c.3, "at": c.4 }));
+            bytes += c.4 as usize + 64;
+            chosen.push((c.0.clone(), c.1.clone()));
+            shown.push(*c);
         }
-        out.push(thread_value(t, shown, more, &ppl, &vn));
+        plan.push((t, shown, more));
+    }
+    let bodies = comment_bodies(hub, ask.project.id, &pr.id, &chosen).await?;
+    let ppl = people_of(hub, ts, &metas).await?;
+    let mut out = Vec::new();
+    for (t, shown, more) in plan {
+        let comments = shown.iter().map(|c| comment_value(c, &bodies, &ppl)).collect();
+        out.push(thread_value(t, comments, more, &ppl, &vn));
     }
     if next.is_none() && more_threads {
         next = ts.last().map(|t| format!("{}:{}", t.5, t.0));
@@ -972,8 +1055,9 @@ pub async fn thread_json(hub: &Arc<Hub>, ask: &Ask, id: &str, thread: &str, afte
             .fetch_optional(&hub.db)
             .await?;
     let t = t.ok_or_else(|| Error::not_found("no such thread in this PR"))?;
-    let cs: Vec<CommentRow> = sqlx::query_as(
-        "SELECT thread, id, author, body, at FROM pr_comments WHERE project_id = $1 AND pr = $2 AND thread = $3 \
+    // Sizes first; only the bodies that fit are read (BUG-1258).
+    let cs: Vec<CommentMeta> = sqlx::query_as(
+        "SELECT thread, id, author, at, octet_length(body)::BIGINT FROM pr_comments WHERE project_id = $1 AND pr = $2 AND thread = $3 \
          AND (at > $4 OR (at = $4 AND id > $5)) ORDER BY at, id LIMIT $6",
     )
     .bind(ask.project.id)
@@ -985,15 +1069,18 @@ pub async fn thread_json(hub: &Arc<Hub>, ask: &Ask, id: &str, thread: &str, afte
     .fetch_all(&hub.db)
     .await?;
     let ppl = people_of(hub, std::slice::from_ref(&t), &cs).await?;
-    let (mut shown, mut bytes, mut more) = (Vec::new(), 0usize, None);
+    let (mut picked, mut bytes, mut more) = (Vec::new(), 0usize, None);
     for (i, c) in cs.iter().enumerate() {
-        if i as i64 == COMMENTS_PAGE || (bytes >= ANSWER_BYTES && !shown.is_empty()) {
-            more = shown.last().map(|v: &Value| format!("{}:{}", v["at"], v["id"].as_str().unwrap_or("")));
+        if i as i64 == COMMENTS_PAGE || (bytes >= ANSWER_BYTES && !picked.is_empty()) {
+            more = picked.last().map(|c: &&CommentMeta| format!("{}:{}", c.3, c.1));
             break;
         }
-        bytes += c.3.len() + 64;
-        shown.push(json!({ "id": c.1, "author": ppl.get(&c.2), "body": c.3, "at": c.4 }));
+        bytes += c.4 as usize + 64;
+        picked.push(c);
     }
+    let chosen: Vec<(String, String)> = picked.iter().map(|c| (c.0.clone(), c.1.clone())).collect();
+    let bodies = comment_bodies(hub, ask.project.id, &pr.id, &chosen).await?;
+    let shown = picked.iter().map(|c| comment_value(c, &bodies, &ppl)).collect();
     let mut v = thread_value(&t, shown, more, &ppl, &vn);
     v["schema"] = json!("veil.pr.thread/1");
     v["pr"] = json!(pr.id);
@@ -1208,6 +1295,37 @@ pub async fn add_review(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q:
         return Err(Error::conflict("the PR changed meanwhile: look at it again"));
     }
     show(hub, ask, id).await
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct DismissRequest {
+    /// The reviewer, by name.
+    pub person: String,
+}
+
+/// An admin dismisses a reviewer's requests for changes (BUG-1259).
+pub async fn dismiss(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: DismissRequest) -> Result<Value> {
+    participant(ask, caller)?;
+    let pr = visible(hub, ask, id).await?;
+    if !ask.viewer.admin {
+        return Err(Error::forbidden("only an admin dismisses a request for changes"));
+    }
+    let person: Option<i64> = sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&q.person).fetch_optional(&hub.db).await?;
+    let person = person.ok_or_else(|| Error::not_found("no such person"))?;
+    if review::dismiss(hub, ask.project.id, &pr.id, person).await? == 0 {
+        return Err(Error::not_found(format!("{} has no request for changes on this PR", q.person)));
+    }
+    show(hub, ask, id).await
+}
+
+pub async fn dismiss_route(
+    State(hub): State<HubState>,
+    caller: Caller,
+    Path((p, id)): Path<(String, String)>,
+    Json(q): Json<DismissRequest>,
+) -> Result<Json<Value>> {
+    let ask = open(&hub, &p, &caller).await?;
+    Ok(Json(dismiss(&hub, &ask, &caller, &id, q).await?))
 }
 
 /// The review gate. Submitting the stack to the landing service (S17's

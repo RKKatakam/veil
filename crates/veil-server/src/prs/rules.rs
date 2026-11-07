@@ -19,14 +19,17 @@
 //!   approval, normal one, high one from a person (an agent's never counts
 //!   for high risk). **A file that does not parse** never weakens review:
 //!   the last version of it that parsed, on the default branch's first
-//!   parents, still applies (`revision::rules_at`); with none, every risk
+//!   parents, still applies (`revision::rules_now`, from the project's record of it, with no depth limit); with none, every risk
 //!   needs one person's approval. Only admins are told why.
 //! * **Risk** ([`classify`]): **high** if any file is `.veilpolicy`,
-//!   `.veilrules`, under `.ci/`, a dependency manifest or lock file, a
-//!   secret, under a `high_risk_paths` entry, or there are more than
-//!   [`LARGE_FILES`] files; else **low** if every file is documentation or
-//!   tests, or changed only whitespace; else **normal**. Comment-only
-//!   changes are not detected (phase-4 open question 4).
+//!   `.veilrules`, CI or container configuration (anywhere), a dependency
+//!   manifest or lock file, a secret, under a `high_risk_paths` entry, or
+//!   there are more than [`LARGE_FILES`] files; else **low** if every file
+//!   is documentation or a test (by location or the language's test-only
+//!   convention, never by name alone); else **normal**. Whitespace changes
+//!   are rated like any other, and agent instructions (`CLAUDE.md`,
+//!   `SKILL.md`, …) are code. Comment-only changes are not detected
+//!   (phase-4 open question 4).
 
 use veil_core::hub::access::{covers, normalize_access_path};
 
@@ -55,7 +58,7 @@ pub struct Review {
     /// Why the file was not used as written, if it was not.
     pub warnings: Vec<String>,
     /// The file did not parse: these are the strict rules, until
-    /// `revision::rules_at` finds the last valid ones.
+    /// `revision::rules_now` finds the last valid ones.
     pub broken: bool,
 }
 
@@ -182,9 +185,6 @@ pub struct FileChange {
     pub path: String,
     /// A secret (sealed) on either side.
     pub secret: bool,
-    /// Both sides are text that differ only in whitespace (as
-    /// `revision::whitespace_only` defines it).
-    pub whitespace_only: bool,
     /// Executable on the new side, in any change.
     pub executable: bool,
 }
@@ -257,17 +257,47 @@ fn is_docs(path: &str) -> bool {
         || (in_docs && matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp"))
 }
 
-/// Tests: under a `test`, `tests`, `__tests__`, `spec` or `testdata`
-/// folder, or named `*_test.*`, `test_*`, `*.test.*`, `*.spec.*` (build
-/// files excepted, `is_build`).
+/// Instructions agents execute (`CLAUDE.md`, `AGENTS.md`, `.claude/`,
+/// `SKILL.md`, …): code for agents, never documentation (owner, 2026-11-07,
+/// BUG-1257).
+fn is_agent_instructions(path: &str) -> bool {
+    let name = name_of(path);
+    let upper = name.to_ascii_uppercase();
+    path.split('/').rev().skip(1).any(|c| matches!(c, ".claude" | ".cursor" | ".codex" | ".gemini" | ".windsurf" | ".aider" | ".agents"))
+        || matches!(upper.as_str(), "CLAUDE.MD" | "AGENTS.MD" | "AGENT.MD" | "GEMINI.MD" | "SKILL.MD" | "COPILOT-INSTRUCTIONS.MD" | "CONVENTIONS.MD")
+        || matches!(name, ".cursorrules" | ".windsurfrules" | ".clinerules" | ".aider.conf.yml")
+}
+
+/// Tests (BUG-1257): only where the build treats files as tests only, by
+/// location or by the language's own convention: under a `tests`, `test`,
+/// `__tests__`, `spec` or `testdata` folder that is not inside a `src`
+/// folder (there, a "test" module may be compiled into the program), or a
+/// Go `*_test.go` file (the Go compiler builds those for tests only). A
+/// name alone (`test_mode.rs`, `integration_test.yml`) is not a test.
 fn is_test(path: &str) -> bool {
     let name = name_of(path);
-    let stem = name.split('.').next().unwrap_or(name);
-    path.split('/').rev().skip(1).any(|c| matches!(c, "test" | "tests" | "__tests__" | "spec" | "testdata"))
-        || stem.ends_with("_test")
-        || stem.starts_with("test_")
-        || name.contains(".test.")
-        || name.contains(".spec.")
+    let dirs: Vec<&str> = path.split('/').collect();
+    let dirs = &dirs[..dirs.len() - 1];
+    let under_tests = dirs.iter().any(|c| matches!(*c, "test" | "tests" | "__tests__" | "spec" | "testdata"));
+    let under_src = dirs.contains(&"src");
+    (under_tests && !under_src) || name.ends_with("_test.go")
+}
+
+/// CI and container configuration, anywhere (BUG-1257): run by the CI on
+/// every push, with its secrets.
+fn is_ci(path: &str) -> bool {
+    let name = name_of(path);
+    let first = path.split('/').next().unwrap_or(path);
+    matches!(first, ".ci" | ".github" | ".gitlab" | ".circleci" | ".buildkite" | ".woodpecker" | ".forgejo" | ".gitea" | ".azure-pipelines")
+        || path.split('/').any(|c| matches!(c, ".github" | ".circleci" | ".buildkite" | ".woodpecker"))
+        || name.starts_with(".gitlab-ci")
+        || name.starts_with("docker-compose")
+        || ((name.starts_with("compose.") || name.starts_with("compose-")) && (name.ends_with(".yml") || name.ends_with(".yaml")))
+        || matches!(
+            name,
+            "Jenkinsfile" | ".travis.yml" | "azure-pipelines.yml" | "azure-pipelines.yaml" | "bitbucket-pipelines.yml" | ".drone.yml" | "appveyor.yml"
+                | ".appveyor.yml" | "cloudbuild.yaml" | "cloudbuild.yml" | ".cirrus.yml" | "buildspec.yml" | "codemagic.yaml"
+        )
 }
 
 /// Why `f` makes a revision high risk, if it does.
@@ -276,8 +306,8 @@ fn high_reason(f: &FileChange, rules: &Review) -> Option<String> {
     if p == ".veilpolicy" || p == RULES_FILE {
         return Some(format!("changes {p}"));
     }
-    if covers(".ci", p) {
-        return Some(format!("changes CI configuration ({p})"));
+    if is_ci(p) {
+        return Some(format!("changes CI or container configuration ({p})"));
     }
     if MANIFESTS.contains(&name_of(p)) {
         return Some(format!("changes a dependency manifest or lock file ({p})"));
@@ -301,10 +331,12 @@ pub fn classify(files: &[FileChange], rules: &Review) -> (Risk, Vec<String>) {
         high.truncate(20);
         return (Risk::High, high);
     }
-    // Low: every file documentation or a test (never a build file, nothing
-    // executable), or a whitespace-only change.
-    if files.iter().all(|f| f.whitespace_only || (!f.executable && !is_build(&f.path) && (is_docs(&f.path) || is_test(&f.path)))) {
-        return (Risk::Low, vec!["only documentation, tests or whitespace".into()]);
+    // Low: every file documentation or a test; never a build file, agent
+    // instructions or anything executable. Whitespace changes are rated
+    // like any other (BUG-1256: they change what scripts do).
+    let low = |f: &FileChange| !f.executable && !is_build(&f.path) && !is_agent_instructions(&f.path) && (is_docs(&f.path) || is_test(&f.path));
+    if files.iter().all(low) {
+        return (Risk::Low, vec!["only documentation or tests".into()]);
     }
     (Risk::Normal, Vec::new())
 }
@@ -314,7 +346,7 @@ mod tests {
     use super::*;
 
     fn f(p: &str) -> FileChange {
-        FileChange { path: p.into(), secret: false, whitespace_only: false, executable: false }
+        FileChange { path: p.into(), secret: false, executable: false }
     }
 
     #[test]
@@ -356,12 +388,22 @@ mod tests {
     #[test]
     fn risk() {
         let rules = Review::parse(Some(b"[review]\nhigh_risk_paths = [\"src/auth/\"]\n"));
-        assert_eq!(classify(&[f("docs/guide.md"), f("src/tests/a.rs"), f("README")], &rules).0, Risk::Low);
-        assert_eq!(classify(&[f("src/lib_test.go"), f("web/a.test.ts"), f("tests/x.rs")], &rules).0, Risk::Low);
+        assert_eq!(classify(&[f("docs/guide.md"), f("tests/a.rs"), f("README")], &rules).0, Risk::Low);
+        assert_eq!(classify(&[f("pkg/lib_test.go"), f("web/__tests__/a.ts"), f("tests/x.rs"), f("crates/vl/tests/cli.rs")], &rules).0, Risk::Low);
         assert_eq!(classify(&[f("src/lib.rs"), f("docs/a.md")], &rules).0, Risk::Normal);
-        let ws = FileChange { whitespace_only: true, ..f("src/lib.rs") };
-        assert_eq!(classify(&[ws], &rules).0, Risk::Low);
-        for p in [".veilpolicy", ".veilrules", ".ci/build.yml", "web/package.json", "Cargo.lock", "src/auth/login.rs", "src/auth"] {
+        // BUG-1257: names alone, and test folders inside src/, are code.
+        for p in ["src/tests/a.rs", "web/a.test.ts", "pub/src/test_mode.rs", "lib/test_utils.py", "a.spec.js", "src/__tests__/a.ts"] {
+            assert_eq!(classify(&[f(p)], &rules).0, Risk::Normal, "{p}");
+        }
+        // Agent instructions are code for agents.
+        for p in ["CLAUDE.md", "AGENTS.md", ".claude/skills/review/SKILL.md", "tools/SKILL.md", ".claude/settings.json", "docs/.cursor/rules.md", ".cursorrules"] {
+            assert_eq!(classify(&[f(p)], &rules).0, Risk::Normal, "{p}");
+        }
+        for p in [
+            ".veilpolicy", ".veilrules", ".ci/build.yml", "web/package.json", "Cargo.lock", "src/auth/login.rs", "src/auth",
+            ".github/workflows/integration_test.yml", ".github/workflows/test_release.yml", "tests/.github/workflows/a.yml", ".gitlab-ci.yml",
+            ".circleci/config.yml", "Jenkinsfile", "docker-compose.test.yml", "deploy/compose.yaml", ".travis.yml", "azure-pipelines.yml",
+        ] {
             assert_eq!(classify(&[f(p), f("docs/a.md")], &rules).0, Risk::High, "{p}");
         }
         assert_eq!(classify(&[f("src/authx.rs")], &rules).0, Risk::Normal);

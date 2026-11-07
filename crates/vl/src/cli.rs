@@ -1007,6 +1007,9 @@ pub enum PrCmd {
         #[command(flatten)]
         out: JsonOut,
     },
+    /// Dismiss a reviewer's request for changes (admins): the only way it
+    /// stops holding the PR but that reviewer's own approval.
+    Dismiss { id: String, person: String },
     /// Close a PR (its author or an admin).
     Close { id: String },
     /// Land a PR whose review rules are met.

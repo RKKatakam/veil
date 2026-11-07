@@ -12,8 +12,8 @@
 //!   against the reviewer's access now. Approvals from agent sessions never
 //!   count where the rule says `people_only` (always for high risk). The
 //!   author's never count. A request for changes, on any revision, holds
-//!   the PR until that reviewer approves (the current patch) or no longer
-//!   may write its files.
+//!   the PR until that reviewer approves or an admin dismisses it
+//!   ([`dismiss`]); nothing the author does releases it.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -145,21 +145,25 @@ pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, pat
     let (mut approvals, mut held) = (0u32, Vec::new());
     let mut access: HashMap<i64, bool> = HashMap::new();
     for v in verdicts(hub, project.id, &pr.id, patch).await? {
-        let writes = match access.get(&v.person) {
-            Some(w) => *w,
-            None => {
-                let w = writes_all(project, &viewer_of(hub, project.id, v.person).await?, &paths);
-                access.insert(v.person, w);
-                w
+        let reviewer = v.person != pr.author;
+        // An approval counts while its reviewer may write every path now.
+        let counted = reviewer && v.current && v.verdict == "approve" && !(need.people_only && v.agent) && {
+            match access.get(&v.person) {
+                Some(w) => *w,
+                None => {
+                    let w = writes_all(project, &viewer_of(hub, project.id, v.person).await?, &paths);
+                    access.insert(v.person, w);
+                    w
+                }
             }
         };
-        let reviewer = writes && v.person != pr.author;
-        let counted = reviewer && v.current && v.verdict == "approve" && !(need.people_only && v.agent);
         if counted {
             approvals += 1;
         }
-        // A request for changes holds the PR, on any revision, until that
-        // reviewer approves or no longer may write its files.
+        // A request for changes holds the PR, given on any revision, until
+        // that reviewer approves or an admin dismisses it (BUG-1259): never
+        // released by what the author does, nor by access changing (a later
+        // revision may hide the PR from them; it stays held).
         if reviewer && v.verdict == "request-changes" {
             held.push(v.name.clone());
         }
@@ -199,4 +203,17 @@ pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, pat
         reasons,
         reviews,
     })
+}
+
+/// An admin dismisses `person`'s requests for changes on the PR (BUG-1259):
+/// the only way one stops holding but the reviewer's own approval. The
+/// rows are kept, as `dismissed`. Answers how many were dismissed.
+pub async fn dismiss(hub: &Hub, project: i64, pr: &str, person: i64) -> Result<u64> {
+    Ok(sqlx::query("UPDATE pr_reviews SET verdict = 'dismissed' WHERE project_id = $1 AND pr = $2 AND person = $3 AND verdict = 'request-changes'")
+        .bind(project)
+        .bind(pr)
+        .bind(person)
+        .execute(&hub.db)
+        .await?
+        .rows_affected())
 }

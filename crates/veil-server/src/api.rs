@@ -78,6 +78,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/prs/{id}/threads", get(crate::prs::threads_route).post(crate::prs::new_thread_route))
         .route("/v1/projects/{p}/prs/{id}/threads/{t}", get(crate::prs::thread_get_route).post(crate::prs::thread_route))
         .route("/v1/projects/{p}/prs/{id}/reviews", post(crate::prs::review_route))
+        .route("/v1/projects/{p}/prs/{id}/reviews/dismiss", post(crate::prs::dismiss_route))
         .route("/v1/projects/{p}/prs/{id}/land", post(crate::prs::land_route))
         .route("/v1/projects/{p}/q/search", get(crate::search::search_route))
         .route("/v1/projects/{p}/q/grep", get(crate::search::grep_route))
