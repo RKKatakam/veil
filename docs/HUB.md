@@ -2381,6 +2381,80 @@ full` in each before reverting, or clone again. The server change (the
 `limit` of `history`, revision 4) is additive: an older client never sends
 it.
 
+#### Revised: names and fetching (S3 cycle 3)
+
+Review cycle 3 found seven bugs (BUG-1261..1267) with two roots: revision
+names answered from the history a thin clone holds, and fetching keyed on
+the wrong thing. After three cycles the two mechanisms are redesigned, not
+patched route by route. This subsection is the design; the bullets above it
+describe what it replaces.
+
+**1. Names: the server answers what held history cannot decide.**
+
+* **Route** `GET /v1/projects/{p}/q/resolve?prefix=P` (protocol revision
+  5): over the caller's own projected history (the viewer graph of S13,
+  filled as for every query; `warming` while it fills), the snapshots
+  whose id starts with `P` (hex, 4 to 64 digits) or whose change id starts
+  with `P` (as written, letters k–z, 4 to 32). At most 16 of each, and
+  whether more matched. A change the caller cannot see is not in their
+  history (its projection is its parent's, whose change id differs, and is
+  dropped), so nothing hidden is named, and "nothing matched" is the answer
+  for anything else. One request, no history pages.
+* **Revision resolution** in a thin clone keeps a full clone's order
+  exactly (`@`, `root`, `ws@`, tags, remote tags, `tag:`, a full id, a
+  change id prefix, a snapshot id prefix, a hidden version). The two prefix
+  steps take the held matches *and* the server's (one request; each
+  snapshot it names is fetched alone, as a page of one), and apply the same
+  rules (one match, divergent, ambiguous) to the union. A typo costs one
+  request and fetches nothing. A server below revision 5 gets held matches
+  only.
+* **The pull's tag check** (BUG-105: no tag named like an id of the
+  history) asks the same lookup for each new tag name that looks like an
+  id, with the held history: a name the server's history has as an id is
+  never a local tag.
+* **Hidden versions** (an earlier version of a change: `evolog`, `op log`)
+  are this clone's own and held: their lookup reads held only.
+
+**2. History reads are typed: `Held` or `Exact`.**
+
+* `Repo::held()` returns `Held`: reads and walks of what this clone holds
+  (`snapshot`, `ancestors`, `topo_children_first`, `visible`). They never
+  fetch; a walk records where it met the boundary.
+* `Repo::exact()` returns `Exact`: answers a full clone's. A single read
+  (`snapshot`) fetches a page at the boundary; a walk (`ancestors`,
+  `topo_children_first`, `visible`, `range(include, exclude)`) is the held
+  walk run again after each page the boundary it met needs, so it pages in
+  only what its own range reaches (bisect: from `bad` down to `good`); a
+  query on the history index runs as `Exact::run`. `Repo::snapshot`, the
+  read of a snapshot a command names, is `Exact::snapshot`.
+* Every caller chooses one by type: bisect, evolog, revision resolution,
+  merges, rebases and everything shown to the person use `Exact`; the
+  history index, gc, maintenance, the pull's tag check (with the server
+  lookup), the pins of eviction and other bookkeeping use `Held`. The text
+  audits of snapshot reads are replaced by this split, and a test compares
+  a list of commands' output in a full and a thin clone of one history.
+
+**3. Fetching keyed on what is materialised, and on the clone's own
+server.**
+
+* **One rule for moves:** before an operation is published, the working
+  copy a directory will hold after it is fetched ahead: the project
+  directory's workspace (the one it stays attached to, or the one a `ws
+  switch`, or its undo or redo, attaches it to: `Transaction::attaches`),
+  from what the directory holds now. On failure nothing is published and
+  the command fails. A workspace no directory holds (`vl ws new`) needs
+  nothing until it is attached, or synced by `vl ws exec`, which fetches
+  before it runs.
+* **"On the server" is the clone's own server:** the snapshots reachable
+  from the `partial` remote's tags (`<remote>/…`) only, everywhere it is
+  judged (the read path, eviction's pins, gc, fsck). A second remote's
+  snapshot is never taken for the server's; its content is fetched only
+  under its own snapshot, from that remote's server.
+* **gc's roots:** eviction pins the trees (not files) of the server-side
+  bases of every local-only snapshot gc roots: those of every operation
+  the op log keeps (rewritten versions included), not the view's alone, so
+  `classify_gap` can always compare and gc completes.
+
 #### Not built in S3 (and why)
 
 * **anchors.json** (pinning before a non-fast-forward pull): the server
