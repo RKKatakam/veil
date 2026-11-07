@@ -209,7 +209,7 @@ pub struct Manifest {
     #[serde(default)]
     pub snapshot: Option<ObjectId>,
     /// What the files hold where they differ from [`Manifest::tree`] as
-    /// this reader reads it now (unreadable files, embargo fallbacks).
+    /// this reader reads it now (unreadable files).
     #[serde(default, skip_serializing_if = "Materialised::is_empty")]
     pub materialised: Materialised,
     /// The boot the files were written in ([`crate::lock::boot_identity`]).
@@ -570,7 +570,7 @@ fn rehash_cost_ns(files: usize, bytes: u64) -> i64 {
 /// `wait` allows (by default: if waiting for that costs less than
 /// re-reading the files would), this waits, then
 /// stats every file again and vouches for those whose stamp has not moved
-/// since the write. Cloaked and embargoed files are left to the builder,
+/// since the write. Sealed secret files are left to the builder,
 /// which verifies their sealing. Returns the number of files vouched for.
 pub fn vouch_written(
     store: &ObjectStore,
@@ -646,7 +646,6 @@ pub fn vouch_written(
 fn vouchable(entry: &TreeEntry, content: &ObjectId, executable: bool) -> bool {
     entry.kind == EntryKind::File
         && entry.visibility.is_public()
-        && entry.fallback.is_none()
         && entry.id == *content
         && entry.executable == executable
 }
@@ -1154,7 +1153,7 @@ pub fn take_out_unchanged(fs: &SandboxFs, entries: &[ReaperEntry]) {
 /// BUG-107). A sandbox has no accepted policy of its own that could keep
 /// guarding its next run, so it keeps the recorded one: the snapshot
 /// applies it and records it unchanged. Deleting `.veilpolicy` in a
-/// sandbox thus never declassifies a cloaked file (BUG-553), and an
+/// sandbox thus never exposes a sealed secret file (BUG-553), and an
 /// unreadable one never fails the recording (BUG-554). Only a regular,
 /// readable `.veilpolicy` is an edit of the policy, and one that weakens
 /// the recorded policy is held back by the recording (BUG-560, see
@@ -1602,7 +1601,7 @@ fn differs_from_trees(
                     have = fs.read(&p).ok().map(|d| crate::object::Object::blob_id(&d));
                 }
                 let Some(h) = have else { return true };
-                match e.visibility.is_public() && e.fallback.is_none() {
+                match e.visibility.is_public() {
                     true => e.id == h,
                     false => store.read_entry(&e).is_ok_and(|d| crate::object::Object::blob_id(&d) == h),
                 }

@@ -290,19 +290,6 @@ fn sealed_content_pairs_only_by_exact_id_without_the_key() {
     assert_eq!(d.stats.sealed_opened, 0);
 }
 
-/// A fallback (the last public version) is never read for an inexact
-/// pair: the reader cannot read what the entry is now.
-#[test]
-fn a_fallback_is_never_paired_by_content() {
-    let (_alice, outsider, sealed, _) = sealed_world();
-    let public = lines("pub", 20);
-    let fb = blob(&outsider, public.as_bytes());
-    let old = TreeEntry { fallback: Some(fb), ..sealed_entry("a", sealed) };
-    let changes = vec![TreeChange { path: p("a"), old: Some(old), new: None }, added(&outsider, "b", &format!("{public}x\n"))];
-    let d = detect(outsider.store(), &changes, Reader::Me, &opts()).unwrap();
-    assert!(d.pairs.is_empty(), "{:?}", pairs(&d));
-}
-
 /// Threat review 9: a conflict entry pairs only with an equal conflict id,
 /// and never with a file of the same content.
 #[test]
@@ -319,42 +306,33 @@ fn conflict_entries_pair_only_by_exact_id() {
     assert_eq!(pairs(&d), [("a".into(), "c".into(), 100, false)]);
 }
 
-/// Threat review 8: an embargoed fix renames `a.c` to `b.c`. Detection on
-/// an outsider's (resolved) trees of the merge lists no rename and no
-/// `b.c`; the key holder sees it.
+/// Threat review 8: an embargoed fix renames `a.c` to `b.c`. The key
+/// holder's detection on the merge sees it; the public mirror receives
+/// nothing of the merge (no rename, no `b.c`) before the release.
 #[test]
 fn a_rename_inside_an_embargo_is_invisible_to_outsiders() {
     let (mut alice, fs, _) = new_repo("alice");
     let body = lines("vuln", 20);
     let main = commit_files(&mut alice, &*fs, &[("a.c", &body), ("README", "hi\n")], "v1");
-    alice.set_tag("main", main, None, false).unwrap();
-    alice.create_workspace("fix", vec![main], Some("team".into())).unwrap();
+    alice.set_tag("main", main, false).unwrap();
+    alice.create_workspace("fix", vec![main]).unwrap();
     let ov = alice.workspace_overlay("fix").unwrap();
     veil_core::StorageBackend::remove_file(&ov, &p("a.c")).unwrap();
     veil_core::StorageBackend::write(&ov, &p("b.c"), format!("{body}patched\n").as_bytes()).unwrap();
     let fix = alice.snapshot_workspace("fix", &ov).unwrap().snapshot;
     let m = alice.merge(WS, main, vec![fix], "embargoed fix", Some(EmbargoSpec { scope: "team".into(), until: None })).unwrap();
-    let detect_at = |r: &Repo, id: &ObjectId| {
-        let s = r.snapshot(id).unwrap();
-        let base = r.parents_tree(&s.parents).map(|m| m.tree).unwrap_or_else(|_| r.snapshot(&s.parents[0]).unwrap().tree);
-        let changes = diff_trees(r.store(), Some(&base), Some(&s.tree)).unwrap();
-        detect(r.store(), &changes, Reader::Me, &opts()).unwrap()
-    };
-    let d = detect_at(&alice, &m.snapshot);
+    let s = alice.snapshot(&m.snapshot).unwrap();
+    let first = alice.snapshot(&s.parents[0]).unwrap().tree;
+    let changes = diff_trees(alice.store(), Some(&first), Some(&s.tree)).unwrap();
+    let d = detect(alice.store(), &changes, Reader::Me, &opts()).unwrap();
     assert!(d.pairs.iter().any(|p| p.to.as_str() == "b.c") || d.changes.iter().any(|c| c.path.as_str() == "b.c"), "alice sees the fix");
-    // The public mirror, and an outsider on the team remote.
+    // The public mirror.
     let mirror = Arc::new(MemoryBackend::new());
     remote::push(&mut alice, mirror.clone(), true, &[], false).unwrap();
-    let carol = Repo::open(mirror, Some(Identity::generate("carol")), "carol").unwrap();
-    let mallory = Repo::open(fs, Some(Identity::generate("mallory")), "mallory").unwrap();
-    for r in [&carol, &mallory] {
-        let s = r.snapshot(&m.snapshot).unwrap();
-        let first = r.snapshot(&s.parents[0]).unwrap().tree;
-        let changes = diff_trees(r.store(), Some(&first), Some(&s.tree)).unwrap();
-        let d = detect(r.store(), &changes, Reader::Me, &copies()).unwrap();
-        assert!(d.pairs.is_empty(), "{:?}", pairs(&d));
-        assert!(!d.changes.iter().any(|c| c.path.as_str().contains("b.c")));
-    }
+    let carol = Repo::open(mirror.clone(), Some(Identity::generate("carol")), "carol").unwrap();
+    assert!(carol.snapshot_opt(&m.snapshot).unwrap().is_none(), "the embargoed merge reached the mirror");
+    assert!(carol.snapshot_opt(&fix).unwrap().is_none(), "the fix reached the mirror");
+    assert!(backend_contains(&*mirror, b"patched").is_empty(), "the fix's content reached the mirror");
 }
 
 // ---- properties --------------------------------------------------------------------------

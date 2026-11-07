@@ -36,14 +36,14 @@ const SHARED_PASSWORD: &str = "Shr4dPw9qQ7z";
 const SHARED_ENV: &str = "SHARED_URL=postgres://app:Shr4dPw9qQ7z@db.internal/prod\n";
 
 /// A repository with `.netrc` (a personal credential: isolated), `.env`
-/// (a shared secret: sealed by the default policy), `secrets/plan.txt`
-/// (cloaked) and a public file, committed once.
+/// (a shared secret: sealed by the default policy), `secrets/plan.pem`
+/// (a key, cloaked with `vl cloak`) and a public file, committed once.
 fn protected(env: &Env) -> (R<'_>, String) {
     let r = env.repo("p");
-    r.ok(&["cloak", "secrets/"]);
+    r.ok(&["cloak", "secrets/plan.pem"]);
     r.write(".netrc", DOTENV);
     r.write(".env", SHARED_ENV);
-    r.write("secrets/plan.txt", SECRET_PLAN);
+    r.write("secrets/plan.pem", SECRET_PLAN);
     r.write("app.py", "print('hi')\n");
     let c = r.commit("protected");
     (r, c)
@@ -62,7 +62,7 @@ fn assert_no_plaintext(r: &R, what: &str) {
 fn commit_never_stores_isolated_or_cloaked_plaintext() {
     let env = Env::new();
     let (r, c) = protected(&env);
-    assert_eq!(r.paths(c.as_str()), vec![".env", "app.py", "secrets/plan.txt"]);
+    assert_eq!(r.paths(c.as_str()), vec![".env", "app.py", "secrets/plan.pem"]);
     let env_file = r.files(c.as_str()).into_iter().find(|f| f.path == ".env").unwrap();
     assert_eq!(env_file.vis, "cloaked:team", "a shared secret is recorded sealed");
     assert_no_plaintext(&r, "after commit");
@@ -77,9 +77,11 @@ fn checkout_round_trips_keep_protection() {
     let (r, c) = protected(&env);
     r.ok(&["new", "root"]);
     assert_eq!(r.read(".netrc"), DOTENV, "isolated files are never removed");
-    assert!(!r.exists("secrets/plan.txt"));
+    // Root has no `cloak` rule: the key is local-only there (built-in
+    // rules), kept on disk and never recorded.
+    assert!(!r.paths("@").contains(&"secrets/plan.pem".to_string()));
     r.ok(&["new", c.as_str()]);
-    assert_eq!(r.read("secrets/plan.txt"), SECRET_PLAN);
+    assert_eq!(r.read("secrets/plan.pem"), SECRET_PLAN);
     r.ok(&["edit", c.as_str()]);
     assert_no_plaintext(&r, "after checkouts");
 }
@@ -89,9 +91,9 @@ fn checkout_round_trips_keep_protection() {
 fn restore_keeps_isolated_files_and_cloaked_ones_sealed() {
     let env = Env::new();
     let (r, _) = protected(&env);
-    r.write("secrets/plan.txt", "edited plan\n");
+    r.write("secrets/plan.pem", "edited plan\n");
     r.ok(&["restore"]);
-    assert_eq!(r.read("secrets/plan.txt"), SECRET_PLAN);
+    assert_eq!(r.read("secrets/plan.pem"), SECRET_PLAN);
     r.ok(&["restore", "--from", "root", ".netrc"]);
     assert_eq!(r.read(".netrc"), DOTENV, "restore never touches an isolated file");
     assert_no_plaintext(&r, "after restore");
@@ -160,12 +162,12 @@ fn editor_artefacts_of_protected_files_keep_their_protection() {
     r.write(".netrc.swp", DOTENV);
     r.write(".netrc~", DOTENV);
     r.write(".netrc.bak", DOTENV);
-    r.write("secrets/plan.txt.orig", SECRET_PLAN);
-    r.write("secrets/.plan.txt.swp", SECRET_PLAN);
+    r.write("secrets/plan.pem.orig", SECRET_PLAN);
+    r.write("secrets/.plan.pem.swp", SECRET_PLAN);
     r.ok(&["status"]);
     let files = r.files("@");
     assert!(!files.iter().any(|f| f.path.starts_with(".netrc")), "{files:?}");
-    if let Some(f) = files.iter().find(|f| f.path == "secrets/plan.txt.orig") {
+    if let Some(f) = files.iter().find(|f| f.path == "secrets/plan.pem.orig") {
         assert_eq!(f.vis, "cloaked:team");
     }
     assert_no_plaintext(&r, "after editor artefacts");
@@ -208,20 +210,6 @@ fn ws_exec_with_isolated_quarantines_copies_of_injected_secrets() {
     assert_no_plaintext(&r, "after ws exec");
 }
 
-// Scenario from jj test_workspaces.rs with a cloaked workspace: what the
-// sandbox records there is cloaked.
-#[test]
-fn ws_exec_in_a_cloaked_workspace_records_cloaked_files() {
-    let env = Env::new();
-    let (r, _) = protected(&env);
-    r.ok(&["ws", "new", "fix", "--cloak"]);
-    let out = r.run(&["ws", "exec", "fix", "--", "sh", "-c", &format!("echo '{SECRET_PLAN} v2' > fix.txt")]);
-    assert!(out.status.success(), "{}", text(&out));
-    let f = r.files("fix@").into_iter().find(|f| f.path == "fix.txt").unwrap();
-    assert_eq!(f.vis, "cloaked:team");
-    assert_no_plaintext(&r, "cloaked ws exec");
-}
-
 // Scenario from git t3600-rm.sh / jj test_file_track_untrack with a
 // non-member: an edit to a cloaked file they cannot seal is kept local
 // and never recorded in plaintext.
@@ -238,35 +226,18 @@ fn a_non_members_edit_of_a_cloaked_file_is_kept_local() {
     assert!(out.status.success(), "{}", text(&out));
     let bob = env.as_user("bob", &bob_dir);
     let st = bob.status();
-    assert!(st.contains("R secrets/plan.txt"), "{st}");
-    assert!(!bob.exists("secrets/plan.txt"));
-    bob.write("secrets/plan.txt", "bob's guess\n");
+    assert!(st.contains("R secrets/plan.pem"), "{st}");
+    assert!(!bob.exists("secrets/plan.pem"));
+    bob.write("secrets/plan.pem", "bob's guess\n");
     let st = bob.status();
-    assert!(st.contains("could not cloak secrets/plan.txt"), "{st}");
+    assert!(st.contains("could not cloak secrets/plan.pem"), "{st}");
     bob.commit("bob");
     let o = all_bytes(&bob_dir.join(".veil"));
     assert!(!contains_bytes(&o, "bob's guess"), "the non-member's edit was stored in plaintext");
     assert!(!contains_bytes(&o, SECRET_PLAN));
     // bob's restore cannot write what he cannot read, and does not crash.
-    let out = bob.run(&["restore", "--from", c.as_str(), "secrets/plan.txt"]);
+    let out = bob.run(&["restore", "--from", c.as_str(), "secrets/plan.pem"]);
     assert!(clean_exit(&out), "{}", text(&out));
     let diff = bob.ok(&["diff", "-r", c.as_str()]);
     assert!(!diff.contains(SECRET_PLAN) && diff.contains("content hidden"), "{diff}");
-}
-
-// Scenario from git t7004-tag.sh with Veil's cloaked tags: a tag cloaked
-// for the team is never sent to a public remote.
-#[test]
-fn a_cloaked_tag_stays_off_a_public_remote() {
-    let env = Env::new();
-    let (r, c) = protected(&env);
-    r.ok(&["tag", "set", "main", "-r", c.as_str()]);
-    r.ok(&["tag", "set", "secret-line", "-r", c.as_str(), "--cloak"]);
-    let mirror = env.root.join("mirror");
-    r.ok(&["remote", "add", "mirror", mirror.to_str().unwrap(), "--public"]);
-    r.ok(&["push", "mirror"]);
-    let o = all_bytes(&mirror);
-    assert!(!contains_bytes(&o, "secret-line"), "the cloaked tag reached the public remote");
-    assert!(!contains_bytes(&o, SECRET_PLAN));
-    assert!(!contains_bytes(&o, DB_PASSWORD));
 }

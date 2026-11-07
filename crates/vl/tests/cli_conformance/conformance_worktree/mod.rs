@@ -69,7 +69,7 @@ impl Env {
     /// A `vl` command run as `user` in `cwd`.
     pub fn cmd_as<S: AsRef<OsStr>>(&self, user: &str, cwd: &Path, args: &[S]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_vl"));
-        c.args(args)
+        c.env("VEIL_TEST_PATH_REMOTES", "1").args(args)
             .current_dir(cwd)
             .env("VEIL_HOME", self.root.join(format!("home-{user}")))
             .env("VEIL_USER", user)

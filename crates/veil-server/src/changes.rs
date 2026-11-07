@@ -250,7 +250,6 @@ fn entries(src: &Source, pr: &Projector, edits: &[Edit], uploaded: &HashSet<Obje
                 size: *size,
                 executable: *executable,
                 visibility: Visibility::Public,
-                fallback: None,
             },
             Some(Content::Object(id, executable)) => {
                 let at_base = walk(pr, pbase, &e.parts)?.1.is_some_and(|b| b.id == *id);
@@ -275,7 +274,6 @@ fn entries(src: &Source, pr: &Projector, edits: &[Edit], uploaded: &HashSet<Obje
                     size,
                     executable: *executable,
                     visibility,
-                    fallback: None,
                 }
             }
         };
@@ -397,7 +395,6 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, who: &Arc<Who>, parent: ObjectI
             timestamp: p.timestamp,
             predecessors: p.predecessors.clone(),
             conflicts: vec![],
-            cloak: None,
             embargo: None,
             signature: None,
         };

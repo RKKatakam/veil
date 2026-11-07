@@ -7,9 +7,10 @@ developers and reviewers are in [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md),
 **Veil is server-centric** ([OVERVIEW.md](../OVERVIEW.md)): the `vl` client
 is always connected to the Veil server, which stores the code and enforces
 who can see what ([VISIBILITY.md](../VISIBILITY.md)). Its first milestone
-is built: [The Veil server](the-server.md). **The other pages document
-today's client**; where a page shows cloaking, scopes or SSH and path
-remotes, that changes in the simplification pass.
+is built: [The Veil server](the-server.md), and `vl` syncs only through it.
+Only secret files (`.env`, keys) are ever encrypted: where a page shows
+cloaking or scopes, it is about secret files; folders and code are plain
+text behind folder access (`vl access`).
 
 Every example here was run with the `vl` it documents. Output is real,
 trimmed where marked (`…`); some paths and host names were shortened
@@ -21,7 +22,7 @@ trimmed where marked (`…`); some paths and host names were shortened
 | 2. [Secrets and visibility](secrets-and-visibility.md) | You want to know what is protected, how, and what is not |
 | 3. [Embargoes](embargoes.md) | You are fixing a security issue that must stay private until release |
 | 4. [Workspaces and agents](workspaces-and-agents.md) | You want several lines of work at once, or run tools and AI agents in sandboxes |
-| 5. [Teams and remotes](teams-and-remotes.md) | You share a repository with teammates today, before the server |
+| 5. [Teams and remotes](teams-and-remotes.md) | You push and pull with teammates through the server, or recover from a crash |
 | 6. [Maintenance](maintenance.md) | Housekeeping: `gc`, `fsck`, `doctor`, `upgrade`, backups, recovery |
 | 7. [Troubleshooting and FAQ](troubleshooting.md) | A command printed a warning or an error you want explained |
 | 8. [Scripting with `--json`](scripting.md) | An editor, CI job, agent or script needs `vl`'s output as data |
@@ -55,9 +56,8 @@ vl undo                          # step back through the operation log (`vl redo
   the creator is the admin, everything is private by default, admins give
   groups or people access to folders, and `public` folders are visible to
   everyone. Veil is server-centric ([OVERVIEW.md](../OVERVIEW.md)): the
-  server enforces this. Today's client, before the server, restricts paths
-  by encrypting them for a *scope* (`vl cloak`); this changes when the
-  server lands.
+  server enforces this. Only secret files are encrypted, for a *scope*
+  (`vl cloak .env.prod --scope ops`).
 * **Tags** are Veil's branches. They follow rewrites of the change they
   point at, and move forward on `vl commit`, `vl merge` and pulls; nothing
   else moves them.

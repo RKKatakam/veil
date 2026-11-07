@@ -765,7 +765,6 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
                                 children.push((e.id, p, 0));
                                 continue;
                             }
-                            children.extend(e.fallback.map(|f| (f, p.clone(), e.size)));
                             let size = if e.kind == EntryKind::Dir { 0 } else { e.size };
                             children.push((e.id, p, size));
                         }
@@ -800,11 +799,7 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
         .map(|(n, id)| {
             (
                 n.clone(),
-                Tag {
-                    target: *id,
-                    cloak: None,
-                    annotation: None,
-                },
+                Tag { target: *id, annotation: None },
             )
         })
         .collect();
@@ -866,11 +861,10 @@ pub fn without(store: &ObjectStore, tree: ObjectId, only: &str) -> Result<Object
 
 // ---- push ---------------------------------------------------------------------------------
 
-/// Every object entry `e` names: its object, its fallback and, for a
-/// conflict, its terms' objects and fallbacks (the server's `named_ids`).
+/// Every object entry `e` names: its object and, for a conflict, its
+/// terms' objects (the server's `named_ids`).
 fn named_ids(store: &ObjectStore, e: &veil_core::TreeEntry) -> Result<Vec<ObjectId>> {
     let mut out = vec![e.id];
-    out.extend(e.fallback);
     if e.kind == EntryKind::Conflict {
         if let Object::Conflict(c) = store.get(&e.id)? {
             out.extend(c.referenced_ids());
@@ -965,7 +959,7 @@ impl<'a, F: FnMut(ObjectId, Vec<u8>) -> Result<()>> Introduced<'a, F> {
                 sub.sort();
                 sub.dedup();
                 walked = self.tree(e.id, sub, &p)?;
-            } else if before.iter().any(|pe| pe.id == e.id && pe.kind == e.kind && pe.fallback == e.fallback) {
+            } else if before.iter().any(|pe| pe.id == e.id && pe.kind == e.kind) {
                 // Names exactly what that parent's entry names.
                 continue;
             }
@@ -1059,11 +1053,26 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                 bail!("no tag '{t}' here");
             }
         }
+        // Nothing an unreleased embargo withholds is uploaded: a tag that
+        // would publish it is not pushed (it reaches no remote by any route).
+        let targets: Vec<ObjectId> = updates.iter().filter_map(|u| u.new).collect();
+        let blocks = veil_core::remote::embargo_blocks(repo, &targets)?;
+        let mut withheld = Vec::new();
+        let mut kept = Vec::new();
+        for (u, why) in updates.into_iter().zip(blocks) {
+            match why {
+                Some(why) => withheld.push((u.branch, why)),
+                None => kept.push(u),
+            }
+        }
+        let updates = kept;
+        let sent: Vec<ObjectId> = updates.iter().filter_map(|u| u.new).collect();
+        let withdrawn = veil_core::remote::withdrawn_warnings(repo, &sent)?;
         if updates.is_empty() {
             return Ok(PushOutcome {
                 warnings: vec![],
                 moved: vec![],
-                rejected: vec![],
+                rejected: withheld,
                 uploaded: 0,
                 created,
             });
@@ -1123,9 +1132,9 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             bail!("a branch kept moving during the push; pull, then push again");
         };
         let mut out = PushOutcome {
-            warnings: result.warnings.clone(),
+            warnings: withdrawn.iter().cloned().chain(result.warnings.iter().cloned()).collect(),
             moved: vec![],
-            rejected: vec![],
+            rejected: withheld,
             uploaded,
             created,
         };
@@ -1234,14 +1243,14 @@ mod tests {
         out
     }
 
-    /// A leaf: absent, or (content, fallback, a conflict of contents).
-    type Leaf = Option<(u8, Option<u8>, bool)>;
+    /// A leaf: absent, or (content, a conflict of contents).
+    type Leaf = Option<(u8, bool)>;
     const PATHS: [&str; 8] = ["a", "b", "d/a", "d/b", "d/e/a", "d/e/b", "y", "y/a"];
 
     fn build(store: &ObjectStore, leaves: &[Leaf]) -> ObjectId {
         let mut files: BTreeMap<String, veil_core::TreeEntry> = BTreeMap::new();
         for (n, (path, leaf)) in PATHS.iter().zip(leaves).enumerate() {
-            let Some((c, fb, conflict)) = *leaf else { continue };
+            let Some((c, conflict)) = *leaf else { continue };
             // Contents 0 and 1 are the path's own; others are shared by all
             // paths (a file copied or moved).
             let blob = |c: u8| store.put(&Object::Blob(if c < 2 { vec![b'v', c, n as u8] } else { vec![b'v', c] })).unwrap();
@@ -1257,14 +1266,13 @@ mod tests {
                 size: 2,
                 executable: false,
                 visibility: Default::default(),
-                fallback: None,
             };
             let e = if conflict {
                 let t = |c: u8| Some(veil_core::object::ConflictTerm::of(&file(c)));
                 let id = store.put(&Object::Conflict(veil_core::object::Conflict { adds: vec![t(c), t(c + 1)], removes: vec![t(c + 2)] })).unwrap();
                 veil_core::TreeEntry { kind: EntryKind::Conflict, id, size: 0, ..file(c) }
             } else {
-                veil_core::TreeEntry { fallback: fb.map(blob), ..file(c) }
+                file(c)
             };
             files.insert(path.to_string(), e);
         }
@@ -1290,7 +1298,6 @@ mod tests {
                     size: 0,
                     executable: false,
                     visibility: Default::default(),
-                    fallback: None,
                 });
             }
             t
@@ -1302,9 +1309,8 @@ mod tests {
         use proptest::prelude::*;
         prop_oneof![
             3 => Just(None),
-            6 => (0u8..3).prop_map(|c| Some((c, None, false))),
-            1 => (0u8..3, 0u8..3).prop_map(|(c, f)| Some((c, Some(f + 10), false))),
-            1 => (0u8..3).prop_map(|c| Some((c, None, true))),
+            6 => (0u8..3).prop_map(|c| Some((c, false))),
+            1 => (0u8..3).prop_map(|c| Some((c, true))),
         ]
     }
 
@@ -1312,7 +1318,7 @@ mod tests {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
         /// BUG-857: a push sends exactly what the server asks a receipt
         /// for, whatever the history (trees reused across snapshots, a
-        /// file turned directory, merges, conflicts, fallbacks), whatever
+        /// file turned directory, merges, conflicts), whatever
         /// the server already holds and in whatever order the snapshots
         /// are walked.
         #[test]

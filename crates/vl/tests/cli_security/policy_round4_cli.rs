@@ -101,9 +101,9 @@ fn cloak_by_a_non_member_asks_for_a_grant_not_a_new_scope() {
     env.ok("alice", &alice, &["push"]);
     env.ok("bob", &env.root, &["clone", "team", "bob"]);
     let bob = env.root.join("bob");
-    write(&bob, "notes.md", "bob's notes\n");
+    write(&bob, "notes.pem", "bob's notes\n");
 
-    let out = env.vl("bob", &bob, &["cloak", "notes.md"]);
+    let out = env.vl("bob", &bob, &["cloak", "notes.pem"]);
     let said = text(&out);
     assert!(!out.status.success(), "{said}");
     assert!(!said.contains("scope create"), "suggests creating a scope that exists: {said}");
@@ -116,9 +116,9 @@ fn cloak_by_a_non_member_asks_for_a_grant_not_a_new_scope() {
         .and_then(|l| l.split_whitespace().last().map(str::to_string))
         .unwrap();
     assert!(said.contains(&key), "shows bob's public key {key}: {said}");
-    assert!(!read(&bob, ".veilpolicy").contains("notes.md"), "no rule was added");
+    assert!(!read(&bob, ".veilpolicy").contains("notes.pem"), "no rule was added");
 
     // A scope that does not exist: create it.
-    let out = env.vl("bob", &bob, &["cloak", "--scope", "ops", "notes.md"]);
+    let out = env.vl("bob", &bob, &["cloak", "--scope", "ops", "notes.pem"]);
     assert!(text(&out).contains("vl scope create ops"), "{}", text(&out));
 }

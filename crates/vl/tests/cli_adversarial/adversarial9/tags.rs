@@ -34,8 +34,8 @@ fn pull_never_moves_a_local_release_tag() {
     write(&mallory, "f.txt", "backdoor\n");
     env.ok("mallory", &mallory, &["commit", "-m", "harmless"]);
     env.ok("mallory", &mallory, &["tag", "set", "v1.0", "-r", "@-", "--force"]);
-    // (Replacing a release on the remote takes --force-tags, BUG-710.)
-    env.ok("mallory", &mallory, &["push", "origin", "--force-tags"]);
+    env.ok("mallory", &mallory, &["tag", "set", "work", "-r", "@-"]);
+    move_on_remote(&env, &mallory, &remote, "v1.0");
 
     let pull = env.ok(U, &alice, &["pull", "origin"]);
     let after = env.vl(U, &alice, &["tag", "verify", "v1.0"]);
@@ -47,6 +47,20 @@ fn pull_never_moves_a_local_release_tag() {
     );
     let content = env.stdout(U, &alice, &["cat", "-r", "v1.0", "f.txt"]);
     assert_eq!(content, "release\n", "v1.0 now points at the teammate's code");
+}
+
+/// A teammate (or a hostile remote) moves release tag `name` on the remote
+/// to their own target: their other tags are pushed (the release is never
+/// replaced by a push, BUG-710), then the remote's tag is re-pointed in
+/// place.
+fn move_on_remote(env: &Env, theirs: &std::path::Path, remote: &std::path::Path, name: &str) {
+    let _ = env.vl("mallory", theirs, &["push", "origin"]);
+    let target = veil_core::ObjectId::from_hex(&tag_target(env, theirs, "tags", name)).unwrap();
+    let mut r = veil_core::Repo::open_remote(std::sync::Arc::new(veil_core::DiskBackend::new(remote))).unwrap();
+    assert!(r.store().has(&target), "the teammate's snapshot reached the remote");
+    let mut tx = r.transaction("move a release tag").unwrap();
+    tx.view.tags.insert(name.to_string(), veil_core::oplog::Tag { target, annotation: None });
+    tx.commit().unwrap();
 }
 
 /// The target of `name` in `vl tag list --json` (`tags` or `remote_tags`).
@@ -75,7 +89,7 @@ fn a_moved_release_tag_is_reported_recorded_and_taken_only_with_force() {
     env.ok("mallory", &mallory, &["commit", "-m", "harmless"]);
     env.ok("mallory", &mallory, &["tag", "set", "main", "-r", "@-"]);
     env.ok("mallory", &mallory, &["tag", "set", "v1.0", "-r", "@-", "--force"]);
-    env.ok("mallory", &mallory, &["push", "origin", "--force-tags"]);
+    move_on_remote(&env, &mallory, &remote, "v1.0");
 
     let ours = tag_target(&env, &alice, "tags", "v1.0");
     for _ in 0..2 {
@@ -87,43 +101,7 @@ fn a_moved_release_tag_is_reported_recorded_and_taken_only_with_force() {
     assert_ne!(theirs, ours);
     // Plain tags still follow the remote.
     assert_eq!(tag_target(&env, &alice, "tags", "main"), theirs);
-    // Pushing does not quietly settle it either: the push names the choice.
-    let push = env.vl(U, &alice, &["push", "origin"]);
-    let shown = super::adversarial_support::text(&push);
-    assert!(!push.status.success() && shown.contains("holds release tag v1.0 at another target"), "{shown}");
     // Only an explicit, forced command takes the remote's version.
     env.ok(U, &alice, &["tag", "set", "v1.0", "-r", "origin/v1.0", "--force"]);
     assert_eq!(env.stdout(U, &alice, &["cat", "-r", "v1.0", "f.txt"]), "backdoor\n");
-}
-
-/// BUG-710: `vl push` of a release tag moved here with `vl tag set --force`
-/// (even forward) never moves it on a Veil remote without `--force-tags`.
-/// Plain tags still fast-forward; the dry run says the same.
-#[test]
-fn a_veil_push_never_moves_a_release_tag_without_force_tags() {
-    let env = Env::new();
-    let alice = env.project(U, "alice", &[("f.txt", "release\n")]);
-    env.ok(U, &alice, &["tag", "set", "v1.0", "-r", "main", "-a", "-m", "Release 1.0"]);
-    let remote = env.root.join("team");
-    env.ok(U, &alice, &["remote", "add", "origin", remote.to_str().unwrap()]);
-    env.ok(U, &alice, &["push", "origin"]);
-    let released = tag_target(&env, &alice, "remote_tags", "origin/v1.0");
-    write(&alice, "f.txt", "later\n");
-    env.ok(U, &alice, &["commit", "-m", "later"]);
-    env.ok(U, &alice, &["tag", "set", "main", "-r", "@-"]);
-    env.ok(U, &alice, &["tag", "set", "v1.0", "-r", "@-", "--force"]);
-    let dry = env.vl(U, &alice, &["push", "origin", "--dry-run"]);
-    assert!(!dry.status.success(), "{}", super::adversarial_support::text(&dry));
-    let push = env.vl(U, &alice, &["push", "origin"]);
-    let shown = super::adversarial_support::text(&push);
-    assert!(!push.status.success() && shown.contains("--force-tags"), "{shown}");
-    // `main` (a plain tag) went; the release stayed.
-    assert!(shown.contains("pushed main"), "{shown}");
-    assert_eq!(tag_target(&env, &alice, "remote_tags", "origin/v1.0"), released);
-    env.ok("bob", &env.root, &["clone", "team", "bob"]);
-    assert_eq!(env.stdout("bob", &env.root.join("bob"), &["cat", "-r", "v1.0", "f.txt"]), "release\n");
-    // On purpose, it moves.
-    env.ok(U, &alice, &["push", "origin", "--dry-run", "--force-tags"]);
-    env.ok(U, &alice, &["push", "origin", "--force-tags"]);
-    assert_ne!(tag_target(&env, &alice, "remote_tags", "origin/v1.0"), released);
 }

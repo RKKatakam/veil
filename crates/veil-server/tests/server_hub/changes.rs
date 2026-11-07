@@ -445,7 +445,7 @@ fn bug_931_a_conflicts_terms_get_the_secret_checks() {
         let mut c = Craft::new(&api, &p.dev, &p.name, "main");
         let term = |c: &mut Craft, t: &str| {
             let id = c.put(O::Blob(t.as_bytes().to_vec()));
-            Some(ConflictTerm { kind: Default::default(), id, size: t.len() as u64, executable: false, visibility: Visibility::Public, fallback: None })
+            Some(ConflictTerm { kind: Default::default(), id, size: t.len() as u64, executable: false, visibility: Visibility::Public })
         };
         let (a, b, base) = (term(&mut c, text), term(&mut c, "other\n"), term(&mut c, "base\n"));
         c.set_kind(path, O::Conflict(Conflict { adds: vec![a, b], removes: vec![base] }), EntryKind::Conflict, Visibility::Public);
@@ -496,7 +496,7 @@ fn a_stack_lands_over_a_hidden_change_which_it_keeps_and_never_shows() {
     let mut seen = Vec::new();
     for _ in 0..3 {
         let s = repo.store().snapshot(&cur).unwrap();
-        let veil_core::object::Text::Plain(d) = &s.description else { panic!() };
+        let veil_core::object::Text::Plain(d) = &s.description;
         seen.push(d.clone());
         cur = s.parents[0];
     }
@@ -537,4 +537,32 @@ fn a_stack_writing_where_its_author_lost_access_is_rejected() {
     assert_eq!(v["branch"]["status"], "rejected", "{v}");
     assert!(v["branch"]["message"].as_str().unwrap().contains("writes 'src/x.txt', which you may no longer write"), "{v}");
     assert_eq!(tip_for(&hub, &token, &p.name), now);
+}
+
+/// Format 8: only secret files are encrypted. A sealed object at a path
+/// that is not a secret is refused, through the API and in a push.
+#[test]
+fn a_sealed_object_at_a_path_that_is_not_a_secret_is_refused() {
+    use veil_core::{crypto::Envelope, object::Visibility};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let token = p.dev.token();
+    let base = tip_for(&hub, &token, &p.name);
+    let env = Envelope::seal_random(&[7u8; 32], "team#k1", b"fn hidden() {}").unwrap();
+    let raw = O::Sealed(env.clone()).encode();
+    let id = ObjectId::hash(&raw);
+    let up = api.upload(&token, &p.name, &[(id, raw)]);
+    assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+    let receipt = up.json()["receipts"][0].as_str().unwrap().to_string();
+    let r = change(&hub, &token, &p.name, &json!({"base": base.hex(), "edits": [{"path": "src/code.rs", "put": {"object": id.hex()}}],
+        "receipts": {id.hex(): receipt}}));
+    assert_eq!(r.status, 403, "{}", String::from_utf8_lossy(&r.body));
+    assert!(String::from_utf8_lossy(&r.body).contains("only secret files are encrypted"));
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.set("src/code.rs", O::Sealed(env), Visibility::Cloaked { scope: "team".into() });
+    let r = c.push("main", "sealed code");
+    assert_eq!(r.status, 403, "{}", String::from_utf8_lossy(&r.body));
+    assert!(String::from_utf8_lossy(&r.body).contains("only secret files are encrypted"));
+    assert_eq!(tip_for(&hub, &token, &p.name), base);
 }

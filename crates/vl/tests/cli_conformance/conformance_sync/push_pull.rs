@@ -343,47 +343,6 @@ fn a_rejected_push_leaves_the_remote_tag_alone() {
     assert_eq!(env.tag_target("alice", &alice, "origin/main"), before);
 }
 
-// Scenario from git t5404-tracking-branches.sh: "deleted branches have their tracking branches
-// removed"; jj test_git_push.rs: `jj git push --deleted`. Deleting on the remote is explicit
-// (`vl push --delete`, as `git push --delete`): a plain push never deletes there (control:
-// `deleting_a_local_tag_never_removes_history_from_the_remote`).
-#[test]
-fn a_deleted_tag_stays_deleted_after_push_and_pull() {
-    let env = Env::new();
-    let (alice, hub, bob) = team(&env);
-    env.ok("alice", &alice, &["tag", "set", "feature", "-r", "main"]);
-    env.ok("alice", &alice, &["push"]);
-    env.ok("bob", &bob, &["pull"]);
-    env.ok("alice", &alice, &["tag", "delete", "feature"]);
-    // A plain push and pull leave the remote's tag alone, and the local deletion sticks.
-    env.ok("alice", &alice, &["push"]);
-    let out = env.ok("alice", &alice, &["pull"]);
-    assert!(
-        !env.tags("alice", &alice).contains(&"feature".to_string()),
-        "pull recreated the deleted tag: {out}"
-    );
-    assert!(open_repo(&hub).view().tags.contains_key("feature"));
-    env.ok("alice", &alice, &["push", "--delete", "feature"]);
-    assert!(!env
-        .tags("alice", &alice)
-        .contains(&"origin/feature".to_string()));
-    env.ok("alice", &alice, &["pull"]);
-    assert!(
-        !env.tags("alice", &alice).contains(&"feature".to_string()),
-        "pull recreated the deleted tag"
-    );
-    assert!(
-        !open_repo(&hub).view().tags.contains_key("feature"),
-        "the remote still has the deleted tag"
-    );
-    env.ok("bob", &bob, &["pull"]);
-    assert!(
-        !env.tags("bob", &bob)
-            .contains(&"origin/feature".to_string()),
-        "Bob's remote tag is never pruned"
-    );
-}
-
 // Veil (BUG-280 design, after jj's deleted-but-tracked bookmarks): a tag deleted here comes
 // back when a teammate moves it on the remote to work this repository has not seen.
 #[test]
@@ -405,39 +364,6 @@ fn a_deleted_tag_comes_back_when_a_teammate_moves_it_on_the_remote() {
         env.tag_target("alice", &alice, "feature"),
         env.tag_target("bob", &bob, "feature")
     );
-}
-
-// Veil (BUG-280 design, like `git push --force-with-lease --delete`): deleting a tag that a
-// teammate moved since is refused without --force.
-#[test]
-fn push_delete_is_refused_when_the_remote_moved_the_tag() {
-    let env = Env::new();
-    let (alice, hub, bob) = team(&env);
-    env.ok("alice", &alice, &["tag", "set", "feature", "-r", "main"]);
-    env.ok("alice", &alice, &["push"]);
-    env.ok("bob", &bob, &["pull"]);
-    env.commit("bob", &bob, "more", &[("f.txt", "f\n")]);
-    env.ok("bob", &bob, &["tag", "set", "feature", "-r", "@-"]);
-    env.ok("bob", &bob, &["push"]);
-    env.ok("alice", &alice, &["tag", "delete", "feature"]);
-    let (code, out) = env.code("alice", &alice, &["push", "--delete", "feature"]);
-    assert_eq!(code, 1, "{out}");
-    assert!(open_repo(&hub).view().tags.contains_key("feature"));
-    env.ok("alice", &alice, &["push", "--delete", "feature", "--force"]);
-    assert!(!open_repo(&hub).view().tags.contains_key("feature"));
-    // Deleting again is not an error: the remote is as asked.
-    env.ok("alice", &alice, &["push", "--delete", "feature"]);
-}
-
-// Veil: `vl push --delete` of a tag that still exists here is refused (the next push would
-// publish it again), and touches nothing.
-#[test]
-fn push_delete_of_a_tag_that_still_exists_here_is_refused() {
-    let env = Env::new();
-    let (alice, hub, _bob) = team(&env);
-    let out = env.fails("alice", &alice, &["push", "--delete", "main"]);
-    assert!(out.contains("vl tag delete main"), "{out}");
-    assert!(open_repo(&hub).view().tags.contains_key("main"));
 }
 
 // Scenario from git t5510-fetch.sh: "fetch --prune" removes remote-tracking refs gone on the remote.
@@ -768,22 +694,6 @@ fn incremental_push_and_pull_send_only_what_is_new() {
     assert!(out.contains("Pushed 3 object(s)"), "{out}");
     let out = env.ok("bob", &bob, &["pull"]);
     assert!(out.contains("Pulled 3 object(s)"), "{out}");
-}
-
-// Scenario from git t5516-fetch-push.sh: `push --full` and `pull --full` on healthy repositories.
-#[test]
-fn full_push_and_pull_on_healthy_repositories_change_nothing() {
-    let env = Env::new();
-    let (alice, hub, bob) = team(&env);
-    let tags_before = open_repo(&hub).view().tags.clone();
-    env.ok("alice", &alice, &["push", "--full"]);
-    env.ok("bob", &bob, &["pull", "--full"]);
-    let tags_after = open_repo(&hub).view().tags.clone();
-    assert_eq!(
-        tags_before.keys().collect::<Vec<_>>(),
-        tags_after.keys().collect::<Vec<_>>()
-    );
-    env.ok("bob", &bob, &["fsck"]);
 }
 
 // Scenario from git t5520-pull.sh: pull with uncommitted edits in the working copy.

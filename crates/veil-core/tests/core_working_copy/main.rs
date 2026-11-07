@@ -14,11 +14,9 @@ mod adversarial_support;
 mod macos_support;
 
 mod checkout_obstacles;
-mod cloaked_fallback;
 mod editor_artefacts;
 mod macos_fs;
 mod policy_accept;
-mod stale_fallback;
 mod symlinks;
 mod working_copy;
 mod working_copy_edges;

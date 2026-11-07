@@ -10,9 +10,8 @@
 //!
 //! **Confidentiality.** The results hold exactly what the text output
 //! shows, so JSON can never reveal more: content the reader cannot decrypt
-//! is a [`Redaction`] (a reason, never the plaintext), descriptions sealed
-//! for a scope the reader is not in are a [`HiddenText`], and secret
-//! values never enter a result at all (`secret list` reads names only).
+//! is a [`Redaction`] (a reason, never the plaintext), and secret values
+//! never enter a result at all (`secret list` reads names only).
 //!
 //! **Versioning.** Each document starts with `"schema": "veil.<command>/<n>"`.
 //! Adding a field keeps the version; renaming, removing or retyping one, or
@@ -30,10 +29,10 @@ use anyhow::Result;
 use serde::Serialize;
 use veil_core::{
     blame::Reader,
-    keychain::{split_label, ReleaseState, SignatureStatus},
+    keychain::{ReleaseState, SignatureStatus},
     rename::{Item, Pair, RenameOptions},
     search::{LogFilter, Match, Searcher},
-    object::{EntryKind, Snapshot, Text, Visibility},
+    object::{EntryKind, Snapshot, Visibility},
     policy::{Policy, Tier},
     attributes::Attrs,
     secrets::{self, looks_binary},
@@ -46,25 +45,24 @@ use crate::ctx::Ctx;
 
 // ---- schema names ------------------------------------------------------------
 
-pub const STATUS_SCHEMA: &str = "veil.status/1";
-pub const LOG_SCHEMA: &str = "veil.log/1";
-pub const DIFF_SCHEMA: &str = "veil.diff/1";
-pub const SHOW_SCHEMA: &str = "veil.show/1";
-pub const WORKSPACE_LIST_SCHEMA: &str = "veil.workspace.list/1";
-pub const TAG_LIST_SCHEMA: &str = "veil.tag.list/1";
+pub const STATUS_SCHEMA: &str = "veil.status/2";
+pub const LOG_SCHEMA: &str = "veil.log/2";
+pub const DIFF_SCHEMA: &str = "veil.diff/2";
+pub const SHOW_SCHEMA: &str = "veil.show/2";
+pub const WORKSPACE_LIST_SCHEMA: &str = "veil.workspace.list/2";
+pub const TAG_LIST_SCHEMA: &str = "veil.tag.list/2";
 pub const OP_LOG_SCHEMA: &str = "veil.op.log/1";
 pub const SCAN_SCHEMA: &str = "veil.scan/1";
 pub const SECRET_LIST_SCHEMA: &str = "veil.secret.list/1";
 pub const ERROR_SCHEMA: &str = "veil.error/1";
-pub const LS_SCHEMA: &str = "veil.ls/1";
-pub const PUSH_PLAN_SCHEMA: &str = "veil.push.plan/1";
-pub const RESOLVE_LIST_SCHEMA: &str = "veil.resolve.list/1";
-pub const SNAPSHOT_SCHEMA: &str = "veil.snapshot/1";
-pub const DESCRIBE_SCHEMA: &str = "veil.describe/1";
-pub const NEW_SCHEMA: &str = "veil.new/1";
-pub const COMMIT_SCHEMA: &str = "veil.commit/1";
-pub const BLAME_SCHEMA: &str = "veil.blame/1";
-pub const GREP_SCHEMA: &str = "veil.grep/1";
+pub const LS_SCHEMA: &str = "veil.ls/2";
+pub const RESOLVE_LIST_SCHEMA: &str = "veil.resolve.list/2";
+pub const SNAPSHOT_SCHEMA: &str = "veil.snapshot/2";
+pub const DESCRIBE_SCHEMA: &str = "veil.describe/2";
+pub const NEW_SCHEMA: &str = "veil.new/2";
+pub const COMMIT_SCHEMA: &str = "veil.commit/2";
+pub const BLAME_SCHEMA: &str = "veil.blame/2";
+pub const GREP_SCHEMA: &str = "veil.grep/2";
 
 // ---- JSON output -------------------------------------------------------------
 
@@ -147,32 +145,29 @@ fn path(p: &VPath) -> String {
     p.as_str().to_string()
 }
 
-/// Who can read an entry: `{"kind":"cloaked","scope":"team","embargo":null}`.
+/// Who can read an entry: `{"kind":"cloaked","scope":"team"}` (a sealed
+/// secret file).
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct Vis {
-    /// `public`, `cloaked` or `embargoed`.
+    /// `public` or `cloaked`.
     pub kind: &'static str,
     /// The scope of a cloaked entry.
     pub scope: Option<String>,
-    /// The embargo id of an embargoed entry.
-    pub embargo: Option<String>,
 }
 
 impl From<&Visibility> for Vis {
     fn from(v: &Visibility) -> Vis {
         match v {
-            Visibility::Public => Vis { kind: "public", scope: None, embargo: None },
-            Visibility::Cloaked { scope } => Vis { kind: "cloaked", scope: Some(scope.clone()), embargo: None },
-            Visibility::Embargoed { embargo } => Vis { kind: "embargoed", scope: None, embargo: Some(embargo.clone()) },
+            Visibility::Public => Vis { kind: "public", scope: None },
+            Visibility::Cloaked { scope } => Vis { kind: "cloaked", scope: Some(scope.clone()) },
         }
     }
 }
 
 impl Vis {
     pub fn visibility(&self) -> Visibility {
-        match (self.kind, &self.scope, &self.embargo) {
-            ("cloaked", Some(s), _) => Visibility::Cloaked { scope: s.clone() },
-            ("embargoed", _, Some(e)) => Visibility::Embargoed { embargo: e.clone() },
+        match (self.kind, &self.scope) {
+            ("cloaked", Some(s)) => Visibility::Cloaked { scope: s.clone() },
             _ => Visibility::Public,
         }
     }
@@ -182,8 +177,8 @@ impl Vis {
 #[derive(Serialize, Debug, Clone)]
 pub struct Redaction {
     /// `no_key` (cloaked for a scope you hold no key for, or unreadable),
-    /// `withheld` (a public remote never delivered it), `not_released`
-    /// (an unreleased embargo), `unwritable` (readable, but this
+    /// `withheld` (never received: a public mirror never delivers it),
+    /// `unwritable` (readable, but this
     /// filesystem could not hold the file), `missing` (a public object
     /// absent from the store: damage, not a redaction) or `error` (the
     /// store could not read it).
@@ -192,25 +187,9 @@ pub struct Redaction {
     pub message: String,
 }
 
-/// A description sealed for a scope this reader is not in.
-#[derive(Serialize, Debug, Clone)]
-pub struct HiddenText {
-    /// The scope the description is sealed for.
-    pub scope: String,
-    /// `no_key`, or `not_public` (a `--public` view: a public mirror
-    /// cannot read it, whatever keys this reader holds).
-    pub reason: &'static str,
-}
-
-/// A snapshot's description: the text, or why it is hidden.
-fn description(repo: &Repo, s: &Snapshot) -> (Option<String>, Option<HiddenText>) {
-    match repo.store().read_text(&s.description) {
-        Some(t) => (Some(t), None),
-        None => match &s.description {
-            Text::Sealed(e) => (None, Some(HiddenText { scope: split_label(&e.scope).0.to_string(), reason: "no_key" })),
-            Text::Plain(t) => (Some(t.clone()), None),
-        },
-    }
+/// A snapshot's description (plain text).
+fn description(_repo: &Repo, s: &Snapshot) -> Option<String> {
+    Some(s.description.as_str().to_string())
 }
 
 /// A snapshot in one line, as `vl status`, `tag list` and `workspace list`
@@ -230,26 +209,12 @@ pub struct SnapshotRef {
     /// The change has no changes of its own.
     pub empty: bool,
     pub description: Option<String>,
-    pub description_hidden: Option<HiddenText>,
 }
 
 pub fn snapshot_ref(repo: &Repo, id: &ObjectId) -> SnapshotRef {
-    snapshot_ref_as(repo, id, false)
-}
-
-/// [`snapshot_ref`], with `public`: the description as a public mirror
-/// reads it (`--public` views). A description sealed for a cloak scope or
-/// an unreleased embargo is hidden (`not_public`), keys held or not.
-pub fn snapshot_ref_as(repo: &Repo, id: &ObjectId, public: bool) -> SnapshotRef {
     match repo.snapshot(id) {
         Ok(s) => {
-            let (description, description_hidden) = match (&s.description, public) {
-                (Text::Sealed(e), true) => match veil_core::blame::public_description(repo.store(), &s.description) {
-                    Some(t) => (Some(t), None),
-                    None => (None, Some(HiddenText { scope: split_label(&e.scope).0.to_string(), reason: "not_public" })),
-                },
-                _ => description(repo, &s),
-            };
+            let description = description(repo, &s);
             SnapshotRef {
                 snapshot_id: id.hex(),
                 snapshot_short: id.short(),
@@ -258,7 +223,6 @@ pub fn snapshot_ref_as(repo: &Repo, id: &ObjectId, public: bool) -> SnapshotRef 
                 available: true,
                 empty: repo.is_empty_change(id).unwrap_or(false) && !s.parents.is_empty(),
                 description,
-                description_hidden,
             }
         }
         Err(_) => SnapshotRef {
@@ -269,7 +233,6 @@ pub fn snapshot_ref_as(repo: &Repo, id: &ObjectId, public: bool) -> SnapshotRef 
             available: false,
             empty: false,
             description: None,
-            description_hidden: None,
         },
     }
 }
@@ -442,7 +405,8 @@ pub struct Change {
     /// The new version is unreadable here (`(redacted)` in the text).
     pub redacted: bool,
     /// The tier of the new version (of the old one for a deletion), as
-    /// `vl ls` shows it: `public`, `cloaked`, `embargoed` or `redacted`
+    /// `vl ls` shows it: `public`, `embargoed` (an unreleased embargo
+    /// withholds it), `cloaked` or `redacted`
     /// (this reader cannot read it; `visibility` says for whom it is).
     pub tier: &'static str,
     /// The new version is an unresolved conflict (null otherwise).
@@ -468,12 +432,10 @@ pub fn link_target(repo: &Repo, e: &TreeEntry) -> Option<String> {
     if e.kind != EntryKind::Symlink {
         return None;
     }
-    // Never its embargo fallback: that is another version.
-    let own = TreeEntry { fallback: None, ..e.clone() };
-    if !repo.store().entry_readable(&own) {
+    if !repo.store().entry_readable(e) {
         return None;
     }
-    repo.store().read_entry(&own).ok().map(|t| String::from_utf8_lossy(&t).into_owned())
+    repo.store().read_entry(e).ok().map(|t| String::from_utf8_lossy(&t).into_owned())
 }
 
 /// The mode of entry `e`: `100644`, `100755` or `120000` (symlink).
@@ -513,6 +475,38 @@ pub fn change(repo: &Repo, c: &TreeChange) -> Change {
 
 /// A [`Change`] for each item: a pair is listed at its destination, with
 /// its source in `from`.
+/// Which files of a snapshot an unreleased embargo still withholds
+/// (BUG-944): those that differ from the tree a push already published
+/// (`remote::embargo_base`). Their tier is `embargoed`, never `public`:
+/// no push sends them before the release.
+pub struct EmbargoTiers {
+    base: Option<ObjectId>,
+}
+
+impl EmbargoTiers {
+    pub fn of(repo: &Repo, snapshot: &ObjectId) -> Result<EmbargoTiers> {
+        let base = match veil_core::remote::embargo_base(repo, snapshot)? {
+            Some(b) => Some(repo.snapshot(&b)?.tree),
+            None => None,
+        };
+        Ok(EmbargoTiers { base })
+    }
+
+    /// `tier` of the version `e` at `p`, or `embargoed` if it is a public
+    /// version the embargo withholds.
+    pub fn tier(&self, repo: &Repo, p: &VPath, e: Option<&TreeEntry>, tier: &'static str) -> &'static str {
+        match (&self.base, e) {
+            (Some(base), Some(e)) if tier == "public" => {
+                match lookup(repo.store(), base, p).ok().flatten() {
+                    Some(b) if b.id == e.id && b.kind == e.kind => tier,
+                    _ => "embargoed",
+                }
+            }
+            _ => tier,
+        }
+    }
+}
+
 pub fn item_change(repo: &Repo, item: &Item) -> Change {
     match item {
         Item::Change(c) => change(repo, c),
@@ -529,8 +523,8 @@ pub fn item_change(repo: &Repo, item: &Item) -> Change {
 // ---- tiers -----------------------------------------------------------------------
 
 /// The tier of a recorded file for this reader, as `vl ls` and `vl status`
-/// show it: `public` (plaintext, or a released embargo), `cloaked` or
-/// `embargoed` (sealed, and this reader holds the key), or `redacted`
+/// show it: `public` (plaintext), `cloaked` (a sealed secret file this
+/// reader holds the key of), or `redacted`
 /// (sealed for someone else, or withheld here). The local-only tiers
 /// (`isolated`, `ignored`, `quarantined`) come from the working copy.
 pub fn entry_tier(repo: &Repo, e: &TreeEntry) -> &'static str {
@@ -545,17 +539,13 @@ fn entry_tier_with(repo: &Repo, e: &TreeEntry, looked: Option<&Looked>) -> &'sta
         return match &l.view.visibility {
             _ if l.view.unreadable_side => "redacted",
             Visibility::Public => "public",
-            Visibility::Embargoed { embargo } if repo.keys().embargo_released(embargo) => "public",
             Visibility::Cloaked { .. } => "cloaked",
-            Visibility::Embargoed { .. } => "embargoed",
         };
     }
     match &verified_visibility(repo, e) {
         Visibility::Public => "public",
-        Visibility::Embargoed { embargo } if repo.keys().embargo_released(embargo) => "public",
         _ if !id_readable(repo, &e.id) => "redacted",
         Visibility::Cloaked { .. } => "cloaked",
-        Visibility::Embargoed { .. } => "embargoed",
     }
 }
 
@@ -598,10 +588,7 @@ fn redaction_for_listing(repo: &Repo, e: &TreeEntry) -> Option<Redaction> {
         Visibility::Public => return None,
         Visibility::Cloaked { scope } if present => Redaction { reason: "no_key", message: format!("cloaked:{scope}; no key") },
         Visibility::Cloaked { scope } => {
-            Redaction { reason: "withheld", message: format!("cloaked:{scope}; withheld by a public remote") }
-        }
-        Visibility::Embargoed { embargo } => {
-            Redaction { reason: "not_released", message: format!("embargo {embargo}; not released") }
+            Redaction { reason: "withheld", message: format!("cloaked:{scope}; not received") }
         }
     })
 }
@@ -616,17 +603,14 @@ fn redaction_for_diff(repo: &Repo, e: &TreeEntry, err: &veil_core::VeilError) ->
             Redaction { reason: "no_key", message: format!("{}; you hold no key", e.visibility.label()) }
         }
         Visibility::Cloaked { .. } => {
-            Redaction { reason: "withheld", message: format!("{}; withheld by a public remote", e.visibility.label()) }
-        }
-        Visibility::Embargoed { .. } => {
-            Redaction { reason: "not_released", message: format!("{}; not released yet", e.visibility.label()) }
+            Redaction { reason: "withheld", message: format!("{}; not received", e.visibility.label()) }
         }
     }
 }
 
 // ---- status ----------------------------------------------------------------------
 
-/// `vl status --json` (`veil.status/1`).
+/// `vl status --json` (`veil.status/2`).
 #[derive(Serialize, Debug)]
 pub struct Status {
     pub schema: &'static str,
@@ -653,8 +637,6 @@ pub struct Status {
 #[derive(Serialize, Debug)]
 pub struct WorkspaceInfo {
     pub name: String,
-    /// Scope everything recorded in this workspace is cloaked under.
-    pub cloak: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -714,12 +696,13 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
     let changes = diff_trees(repo.store(), Some(&base), Some(&s.tree))?;
     let (changes, _) = detect_renames(repo, changes, &Renames::default())?;
     let report = &ctx.report;
+    let embargo = EmbargoTiers::of(repo, &wc)?;
     let mut redacted = Vec::new();
     for p in &report.carried {
         let entry = lookup(repo.store(), &s.tree, p)?;
         let why = entry.as_ref().and_then(|e| redaction_for_listing(repo, e));
         // Readable, yet never materialised: the filesystem refused it.
-        let tier = entry.as_ref().map_or("redacted", |e| entry_tier(repo, e));
+        let tier = entry.as_ref().map_or("redacted", |e| embargo.tier(repo, p, Some(e), entry_tier(repo, e)));
         let fallback = match entry {
             Some(e) if repo.store().entry_readable(&e) => {
                 Redaction { reason: "unwritable", message: "this filesystem could not hold it".into() }
@@ -758,10 +741,23 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
     }
     Ok(Status {
         schema: STATUS_SCHEMA,
-        workspace: WorkspaceInfo { name: ctx.ws.clone(), cloak: repo.view().workspace(&ctx.ws)?.cloak.clone() },
+        workspace: WorkspaceInfo { name: ctx.ws.clone() },
         working_copy: snapshot_ref(repo, &wc),
         parents: s.parents.iter().map(|p| snapshot_ref(repo, p)).collect(),
-        changes: changes.iter().map(|c| item_change(repo, c)).collect(),
+        changes: {
+            changes
+                .iter()
+                .map(|c| {
+                    let mut ch = item_change(repo, c);
+                    let (p, e) = match c {
+                        Item::Change(c) => (&c.path, c.new.as_ref()),
+                        Item::Pair(pr) => (&pr.to, Some(&pr.new)),
+                    };
+                    ch.tier = embargo.tier(repo, p, e, ch.tier);
+                    ch
+                })
+                .collect()
+        },
         isolated: report.isolated.iter().map(path).collect(),
         quarantined: report
             .quarantined
@@ -791,7 +787,7 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
 
 // ---- log -------------------------------------------------------------------------
 
-/// `vl log --json` (`veil.log/1`).
+/// `vl log --json` (`veil.log/2`).
 #[derive(Serialize, Debug)]
 pub struct Log {
     pub schema: &'static str,
@@ -837,10 +833,8 @@ pub struct LogEntry {
     pub remote_tags: Vec<String>,
     pub empty: bool,
     pub conflicts: Vec<String>,
-    pub cloak: Option<String>,
     pub embargo: Option<LogEmbargo>,
     pub description: Option<String>,
-    pub description_hidden: Option<HiddenText>,
     pub parents: Vec<ParentRef>,
     /// With `-S` / `-G`: the files that matched (every changed file with
     /// `--pickaxe-all`). Absent otherwise.
@@ -859,7 +853,6 @@ pub struct LogEntry {
 #[derive(Serialize, Debug)]
 pub struct TagLabel {
     pub name: String,
-    pub cloak: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -941,7 +934,7 @@ pub fn log_entries_with<'a>(repo: &'a Repo, ws: &str, q: LogQuery) -> Result<Log
     }
     let mut tags: HashMap<ObjectId, Vec<TagLabel>> = HashMap::new();
     for (name, t) in &repo.view().tags {
-        tags.entry(t.target).or_default().push(TagLabel { name: name.clone(), cloak: t.cloak.clone() });
+        tags.entry(t.target).or_default().push(TagLabel { name: name.clone() });
     }
     let mut remote_tags: HashMap<ObjectId, Vec<String>> = HashMap::new();
     for (name, t) in &repo.view().remote_tags {
@@ -1038,7 +1031,7 @@ impl LogEntries<'_> {
         let repo = self.repo;
         let s = repo.snapshot(&id)?;
         let root = id == self.root;
-        let (description, description_hidden) = description(repo, &s);
+        let description = description(repo, &s);
         let parents = s
             .parents
             .iter()
@@ -1067,10 +1060,8 @@ impl LogEntries<'_> {
             remote_tags: self.remote_tags.remove(&id).unwrap_or_default(),
             empty: !root && repo.is_empty_change(&id).unwrap_or(false),
             conflicts: s.conflicts.clone(),
-            cloak: s.cloak.clone(),
             embargo: s.embargo.as_ref().map(|e| LogEmbargo { id: e.clone(), released: repo.keys().embargo_released(e) }),
             description,
-            description_hidden,
             parents,
             files: None,
             not_searched: None,
@@ -1092,7 +1083,7 @@ pub fn log_with(repo: &Repo, ws: &str, q: LogQuery) -> Result<Log> {
 
 // ---- diff ------------------------------------------------------------------------
 
-/// `vl diff --json` (`veil.diff/1`).
+/// `vl diff --json` (`veil.diff/2`).
 #[derive(Serialize, Debug)]
 pub struct Diff {
     pub schema: &'static str,
@@ -1123,6 +1114,10 @@ pub struct FileDiff {
     /// Renamed or copied: the similarity in percent (absent otherwise).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<u8>,
+    /// The tier of the new version (of the old one for a deletion), as
+    /// `vl ls` shows it, or `embargoed` when an unreleased embargo
+    /// withholds either version (the hunks show both; BUG-992).
+    pub tier: &'static str,
     /// Null for an added (old) or deleted (new) file.
     pub old: Option<EntryInfo>,
     pub new: Option<EntryInfo>,
@@ -1213,6 +1208,7 @@ fn file_diff_with(repo: &Repo, c: &TreeChange, stat: bool, check_readable: bool,
         status: status_word(c),
         from: None,
         score: None,
+        tier: c.new.as_ref().or(c.old.as_ref()).map_or("public", |e| entry_tier(repo, e)),
         old: c.old.as_ref().map(|e| entry_info(repo, e, check_readable)),
         new: c.new.as_ref().map(|e| entry_info(repo, e, check_readable)),
         content: (!stat).then(|| content(repo, c, attrs)),
@@ -1322,41 +1318,69 @@ fn hunks(patch: &diffy::Patch<'_, str>) -> Vec<Hunk> {
         .collect()
 }
 
-pub fn diff_body_with(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool, r: &Renames) -> Result<DiffBody> {
-    let (items, renames_skipped) = detect_renames(repo, diff_changes(repo, from, to)?, r)?;
+/// The two trees a diff compares, and the snapshots whose embargo each
+/// side's versions answer to: for a snapshot against its parents, the
+/// snapshot for both (its parents are withheld only if it is).
+pub struct DiffTrees {
+    pub from: ObjectId,
+    pub to: ObjectId,
+    pub from_rev: ObjectId,
+    pub to_rev: ObjectId,
+}
+
+pub fn diff_body_with(repo: &Repo, t: &DiffTrees, stat: bool, r: &Renames) -> Result<DiffBody> {
+    let (items, renames_skipped) = detect_renames(repo, diff_changes(repo, &t.from, &t.to)?, r)?;
     let attrs = diff_attrs(repo);
-    Ok(DiffBody { stat, files: items.iter().map(|c| item_diff(repo, c, stat, &attrs)).collect(), renames_skipped })
+    let old = EmbargoTiers::of(repo, &t.from_rev)?;
+    let new = if t.to_rev == t.from_rev { None } else { Some(EmbargoTiers::of(repo, &t.to_rev)?) };
+    let new = new.as_ref().unwrap_or(&old);
+    let mut files = Vec::with_capacity(items.len());
+    for c in &items {
+        let mut f = item_diff(repo, c, stat, &attrs);
+        let (from, to) = match c {
+            Item::Change(c) => ((&c.path, c.old.as_ref()), (&c.path, c.new.as_ref())),
+            Item::Pair(p) => ((&p.from, Some(&p.old)), (&p.to, Some(&p.new))),
+        };
+        // A version an embargo withholds is "embargoed" whatever its label.
+        let withheld = |tiers: &EmbargoTiers, (p, e): (&VPath, Option<&TreeEntry>)| e.is_some() && tiers.tier(repo, p, e, "public") == "embargoed";
+        let public = |e: Option<&TreeEntry>| e.is_some_and(|e| entry_tier(repo, e) == "public");
+        if (public(to.1) && withheld(new, to)) || (public(from.1) && withheld(&old, from)) {
+            f.tier = "embargoed";
+        }
+        files.push(f);
+    }
+    Ok(DiffBody { stat, files, renames_skipped })
 }
 
 /// `vl diff --json` with rename detection on (the default).
-pub fn diff(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool) -> Result<Diff> {
-    diff_with(repo, from, to, stat, &Renames::default())
+pub fn diff(repo: &Repo, t: &DiffTrees, stat: bool) -> Result<Diff> {
+    diff_with(repo, t, stat, &Renames::default())
 }
 
-pub fn diff_with(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool, r: &Renames) -> Result<Diff> {
-    Ok(Diff { schema: DIFF_SCHEMA, body: diff_body_with(repo, from, to, stat, r)? })
+pub fn diff_with(repo: &Repo, t: &DiffTrees, stat: bool, r: &Renames) -> Result<Diff> {
+    Ok(Diff { schema: DIFF_SCHEMA, body: diff_body_with(repo, t, stat, r)? })
 }
 
 /// The two trees `vl diff` compares: a snapshot's parents and the snapshot
 /// (`-r`, default `@`), or `--from` and `--to` (each default `@`).
-pub fn diff_trees_for(ctx: &Ctx, rev: Option<&str>, from: Option<&str>, to: Option<&str>) -> Result<(ObjectId, ObjectId)> {
+pub fn diff_trees_for(ctx: &Ctx, rev: Option<&str>, from: Option<&str>, to: Option<&str>) -> Result<DiffTrees> {
     Ok(match (from, to) {
         (None, None) => {
             let id = ctx.rev(rev.unwrap_or("@"))?;
             let s = ctx.repo.snapshot(&id)?;
-            (ctx.repo.parents_tree(&s.parents)?.tree, s.tree)
+            DiffTrees { from: ctx.repo.parents_tree(&s.parents)?.tree, to: s.tree, from_rev: id, to_rev: id }
         }
         _ => {
             let a = ctx.rev(from.unwrap_or("@"))?;
             let b = ctx.rev(to.unwrap_or("@"))?;
-            (ctx.repo.snapshot(&a)?.tree, ctx.repo.snapshot(&b)?.tree)
+            DiffTrees { from: ctx.repo.snapshot(&a)?.tree, to: ctx.repo.snapshot(&b)?.tree, from_rev: a, to_rev: b }
         }
     })
 }
 
 // ---- show ------------------------------------------------------------------------
 
-/// `vl show --json` (`veil.show/1`).
+/// `vl show --json` (`veil.show/2`).
 #[derive(Serialize, Debug)]
 pub struct Show {
     pub schema: &'static str,
@@ -1372,11 +1396,9 @@ pub struct Show {
     pub parents: Vec<SnapshotRef>,
     /// Local tags pointing here.
     pub tags: Vec<String>,
-    pub cloak: Option<String>,
     pub embargo: Option<EmbargoInfo>,
     pub conflicts: Vec<String>,
     pub description: Option<String>,
-    pub description_hidden: Option<HiddenText>,
     /// The snapshot's changes against its parents.
     pub diff: DiffBody,
     /// The merged parents' tree and the snapshot's tree.
@@ -1411,7 +1433,8 @@ pub fn show(ctx: &Ctx, rev: &str, stat: bool) -> Result<Show> {
 
 pub fn show_with(ctx: &Ctx, rev: &str, stat: bool, r: &Renames) -> Result<Show> {
     let mut s = show_header(ctx, rev, stat)?;
-    s.diff = diff_body_with(&ctx.repo, &s.base_tree, &s.tree, stat, r)?;
+    let id = ctx.rev(rev)?;
+    s.diff = diff_body_with(&ctx.repo, &DiffTrees { from: s.base_tree, to: s.tree, from_rev: id, to_rev: id }, stat, r)?;
     Ok(s)
 }
 
@@ -1436,7 +1459,7 @@ pub fn show_header(ctx: &Ctx, rev: &str, stat: bool) -> Result<Show> {
         None => None,
     };
     let status = (!root).then(|| repo.keys().snapshot_status(&s));
-    let (description, description_hidden) = description(repo, &s);
+    let description = description(repo, &s);
     let base = repo.parents_tree(&s.parents)?.tree;
     Ok(Show {
         schema: SHOW_SCHEMA,
@@ -1450,11 +1473,9 @@ pub fn show_header(ctx: &Ctx, rev: &str, stat: bool) -> Result<Show> {
         signature: status.as_ref().map(|st| sig(st, &s)),
         parents: s.parents.iter().map(|p| snapshot_ref(repo, p)).collect(),
         tags: repo.view().tags.iter().filter(|(_, t)| t.target == id).map(|(n, _)| n.clone()).collect(),
-        cloak: s.cloak.clone(),
         embargo,
         conflicts: s.conflicts.clone(),
         description,
-        description_hidden,
         diff: DiffBody { stat, files: Vec::new(), renames_skipped: false },
         base_tree: base,
         tree: s.tree,
@@ -1466,7 +1487,7 @@ pub fn show_header(ctx: &Ctx, rev: &str, stat: bool) -> Result<Show> {
 
 // ---- workspace list, tag list, op log, secret list ----------------------------------------
 
-/// `vl workspace list --json` (`veil.workspace.list/1`).
+/// `vl workspace list --json` (`veil.workspace.list/2`).
 #[derive(Serialize, Debug)]
 pub struct WorkspaceList {
     pub schema: &'static str,
@@ -1478,7 +1499,6 @@ pub struct WorkspaceItem {
     pub name: String,
     /// The workspace the project directory is attached to.
     pub current: bool,
-    pub cloak: Option<String>,
     pub working_copy: SnapshotRef,
 }
 
@@ -1492,14 +1512,13 @@ pub fn workspace_list(repo: &Repo, current: &str) -> WorkspaceList {
             .map(|(name, w)| WorkspaceItem {
                 name: name.clone(),
                 current: name == current,
-                cloak: w.cloak.clone(),
                 working_copy: snapshot_ref(repo, &w.wc),
             })
             .collect(),
     }
 }
 
-/// `vl tag list --json` (`veil.tag.list/1`).
+/// `vl tag list --json` (`veil.tag.list/2`).
 #[derive(Serialize, Debug)]
 pub struct TagList {
     pub schema: &'static str,
@@ -1510,8 +1529,6 @@ pub struct TagList {
 #[derive(Serialize, Debug)]
 pub struct TagItem {
     pub name: String,
-    /// Cloaked tags are never pushed to public remotes.
-    pub cloak: Option<String>,
     pub target: SnapshotRef,
     /// `release` (annotated: immutable) or `branch`.
     pub kind: &'static str,
@@ -1575,7 +1592,6 @@ pub fn tag_list(repo: &Repo) -> TagList {
             .iter()
             .map(|(name, t)| TagItem {
                 name: name.clone(),
-                cloak: t.cloak.clone(),
                 target: snapshot_ref(repo, &t.target),
                 kind: if t.annotation.is_some() { "release" } else { "branch" },
                 annotation: t.annotation.and_then(|a| annotation_item(repo, name, &t.target, &a)),
@@ -1912,7 +1928,7 @@ pub fn scan_gate(fs: &dyn StorageBackend, policy: &Policy, policy_from: &str) ->
 
 // ---- ls --------------------------------------------------------------------------
 
-/// `vl ls --json` (`veil.ls/1`).
+/// `vl ls --json` (`veil.ls/2`).
 #[derive(Serialize, Debug)]
 pub struct Ls {
     pub schema: &'static str,
@@ -1931,14 +1947,12 @@ pub struct LsEntry {
     pub path: String,
     /// An ignored directory, listed as a whole (never descended into).
     pub dir: bool,
-    /// `public`, `cloaked`, `embargoed`, `redacted` (recorded, but sealed
-    /// for someone else or withheld here), `isolated`, `ignored` or
+    /// `public`, `cloaked`, `embargoed` (withheld by an unreleased embargo), `redacted` (recorded, but sealed for someone
+    /// else or withheld here), `isolated`, `ignored` or
     /// `quarantined` (see [`entry_tier`]).
     pub tier: &'static str,
     /// The scope of a cloaked (or redacted cloaked) file.
     pub scope: Option<String>,
-    /// The embargo of an embargoed (or redacted embargoed) file.
-    pub embargo: Option<String>,
     /// In the snapshot. False for local-only files of the working copy.
     pub recorded: bool,
     /// The recorded entry's visibility label (null when not recorded).
@@ -1950,9 +1964,6 @@ pub struct LsEntry {
     pub executable: bool,
     /// This reader can read the content (a local-only file: it is on disk).
     pub readable: bool,
-    /// What this reader reads is the file's last public version (it was
-    /// edited on a cloaked line whose scope this reader is not in).
-    pub fallback: bool,
     /// Why the content cannot be read (`redacted` only). Never content.
     pub redaction: Option<Redaction>,
     /// A quarantined file: the secret rule that matched, and whether
@@ -1978,11 +1989,10 @@ pub struct LsQuarantine {
     pub state: &'static str,
 }
 
-fn vis_parts(v: &Visibility) -> (Option<String>, Option<String>) {
+fn vis_scope(v: &Visibility) -> Option<String> {
     match v {
-        Visibility::Public => (None, None),
-        Visibility::Cloaked { scope } => (Some(scope.clone()), None),
-        Visibility::Embargoed { embargo } => (None, Some(embargo.clone())),
+        Visibility::Public => None,
+        Visibility::Cloaked { scope } => Some(scope.clone()),
     }
 }
 
@@ -2002,6 +2012,7 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
     let working_copy = local_files && !ctx.bare && ctx.wc().ok() == Some(id);
     let filters: Vec<VPath> = paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
     let report = &ctx.report;
+    let embargo = EmbargoTiers::of(repo, &id)?;
     let quarantined: HashMap<&VPath, &veil_core::secrets::Finding> =
         report.quarantined.iter().filter_map(|(p, f)| f.first().map(|f| (p, f))).collect();
     let quarantine = |p: &VPath| {
@@ -2022,16 +2033,11 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
             Some(l) => !l.view.unreadable_side,
             None => id_readable(repo, &e.id),
         };
-        let fallback = !readable && e.fallback.is_some_and(|f| id_readable(repo, &f));
         let redaction = match tier {
-            "redacted" => redaction_for_listing(repo, &e).map(|mut r| {
-                if fallback {
-                    r.message.push_str("; you read its last public version");
-                }
-                r
-            }),
+            "redacted" => redaction_for_listing(repo, &e),
             _ => None,
         };
+        tier = embargo.tier(repo, &p, Some(&e), tier);
         let q = working_copy.then(|| quarantine(&p)).flatten();
         if q.is_some() {
             tier = "quarantined";
@@ -2042,7 +2048,7 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
             Some(l) => (l.view.visibility.clone(), None, l.view.executable),
             None => (verified_visibility(repo, &e), Some(e.size), e.executable),
         };
-        let (scope, embargo) = vis_parts(&vis);
+        let scope = vis_scope(&vis);
         entries.push((
             p.clone(),
             LsEntry {
@@ -2050,13 +2056,11 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
                 dir: false,
                 tier,
                 scope,
-                embargo,
                 recorded: true,
                 visibility: Some(Vis::from(&vis)),
                 size,
                 executable,
-                readable: readable || fallback,
-                fallback,
+                readable,
                 redaction,
                 quarantine: q,
                 conflict: looked.map(|l| l.info),
@@ -2092,13 +2096,11 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
                     dir,
                     tier,
                     scope: None,
-                    embargo: None,
                     recorded: false,
                     visibility: None,
                     size: if dir { None } else { meta.as_ref().map(|m| m.len) },
                     executable: meta.as_ref().is_some_and(|m| m.executable),
                     readable: meta.is_some(),
-                    fallback: false,
                     redaction: None,
                     quarantine: if tier == "quarantined" { quarantine(&p) } else { None },
                     conflict: None,
@@ -2129,7 +2131,7 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
 
 // ---- resolve --list -----------------------------------------------------------------
 
-/// `vl resolve --list --json` (`veil.resolve.list/1`).
+/// `vl resolve --list --json` (`veil.resolve.list/2`).
 #[derive(Serialize, Debug)]
 pub struct ResolveList {
     pub schema: &'static str,
@@ -2174,218 +2176,6 @@ pub fn resolve_list(ctx: &Ctx, rev: &str, paths: &[String]) -> Result<ResolveLis
     Ok(ResolveList { schema: RESOLVE_LIST_SCHEMA, snapshot: snapshot_ref(repo, &id), conflicts })
 }
 
-// ---- push --dry-run ----------------------------------------------------------------
-
-/// `vl push --dry-run --json` (`veil.push.plan/1`): one plan per remote.
-#[derive(Serialize, Debug)]
-pub struct PushPlanDoc {
-    pub schema: &'static str,
-    pub remotes: Vec<RemotePlan>,
-}
-
-#[derive(Serialize, Debug, Default)]
-pub struct RemotePlan {
-    pub name: String,
-    pub url: String,
-    pub public: bool,
-    /// Planning failed for this remote (unreachable, not a repository, a
-    /// tag that would publish withheld history…): the push would fail the
-    /// same way. The other fields are then empty.
-    pub error: Option<String>,
-    /// No repository there yet: the push would create one.
-    pub creates_remote: bool,
-    pub tags: Vec<PlanTag>,
-    /// How many objects would be sent, by kind, and their bytes.
-    pub snapshots: usize,
-    pub objects: usize,
-    pub trees: usize,
-    /// Plaintext file contents.
-    pub blobs: usize,
-    /// Ciphertext: cloaked or embargoed content, sealed trees.
-    pub sealed: usize,
-    /// Sum of the objects' encodings, before packing.
-    pub object_bytes: u64,
-    /// Size of the pack(s) the push would write (compressed, with deltas).
-    pub pack_bytes: u64,
-    /// Every snapshot and every object that would be sent, in hex.
-    pub snapshot_ids: Vec<String>,
-    pub object_ids: Vec<String>,
-    /// Objects the visibility filter holds back (cloaked or embargoed
-    /// content, on a public remote).
-    pub withheld_objects: usize,
-    /// History reachable from the pushed tags only through an unreleased
-    /// embargo: it stays here until the release.
-    pub withheld_snapshots: Vec<PlanSnapshot>,
-    /// Embargo releases staged here that the push would publish.
-    pub releases: Vec<String>,
-    /// Public remotes only.
-    pub files: Option<PlanFiles>,
-    pub warnings: Vec<String>,
-}
-
-#[derive(Serialize, Debug)]
-pub struct PlanTag {
-    pub name: String,
-    /// `create`, `update`, `unchanged`, `rejected` (non-fast-forward) or
-    /// `skipped` (held back by design; see `reason`).
-    pub action: &'static str,
-    pub target: String,
-    pub target_short: String,
-    /// The remote's tag now, if it has one.
-    pub remote_target: Option<String>,
-    /// Why it is rejected or skipped.
-    pub message: Option<String>,
-    /// The scope of a cloaked tag.
-    pub cloak: Option<String>,
-}
-
-#[derive(Serialize, Debug)]
-pub struct PlanSnapshot {
-    pub snapshot_id: String,
-    pub snapshot_short: String,
-    pub embargo: String,
-}
-
-#[derive(Serialize, Debug)]
-pub struct PlanFiles {
-    /// Content that becomes public on this remote with this push.
-    pub published: Vec<PlanPublished>,
-    /// Files of the pushed history whose content stays withheld.
-    pub withheld: Vec<PlanWithheld>,
-    /// Snapshots under an unreleased embargo this reader holds no key for:
-    /// the remote sees their pre-merge tree (which files the embargo
-    /// changes cannot be listed here).
-    pub embargoed_trees: Vec<PlanSnapshot>,
-}
-
-#[derive(Serialize, Debug)]
-pub struct PlanPublished {
-    pub path: String,
-    /// `new` (never public there), `exposed` (there, but withheld until
-    /// now) or `modified` (public there; new content).
-    pub exposure: &'static str,
-    pub size: Option<u64>,
-    /// Published because this embargo was released.
-    pub released_embargo: Option<String>,
-}
-
-#[derive(Serialize, Debug)]
-pub struct PlanWithheld {
-    pub path: String,
-    /// `cloaked`, `cloaked_edit` (the remote keeps the last public version)
-    /// or `embargoed` (the remote shows the pre-merge version).
-    pub reason: &'static str,
-    pub scope: Option<String>,
-    pub embargo: Option<String>,
-    /// The explanation the text output prints.
-    pub message: String,
-}
-
-fn plan_snapshot((id, embargo): &(ObjectId, String)) -> PlanSnapshot {
-    PlanSnapshot { snapshot_id: id.hex(), snapshot_short: id.short(), embargo: embargo.clone() }
-}
-
-fn remote_plan(name: &str, url: &str, plan: veil_core::push_plan::PushPlan) -> RemotePlan {
-    use veil_core::push_plan::WithheldReason;
-    let sent: std::collections::HashSet<ObjectId> = plan.snapshots.iter().copied().collect();
-    let count = |f: &dyn Fn(&veil_core::remote::PlannedObject) -> bool| plan.objects.iter().filter(|o| f(o)).count();
-    let files = plan.files.as_ref().map(|f| PlanFiles {
-        published: f
-            .published
-            .iter()
-            .map(|p| PlanPublished {
-                path: path(&p.path),
-                exposure: p.exposure.word(),
-                size: p.size,
-                released_embargo: p.released_embargo.clone(),
-            })
-            .collect(),
-        withheld: f
-            .withheld
-            .iter()
-            .map(|w| {
-                let (reason, scope, embargo) = match &w.reason {
-                    WithheldReason::Cloaked { scope } => ("cloaked", Some(scope.clone()), None),
-                    WithheldReason::CloakedEdit { scope } => ("cloaked_edit", Some(scope.clone()), None),
-                    WithheldReason::Embargoed { embargo } => ("embargoed", None, Some(embargo.clone())),
-                };
-                PlanWithheld { path: path(&w.path), reason, scope, embargo, message: w.reason.text() }
-            })
-            .collect(),
-        embargoed_trees: f.embargoed_trees.iter().map(plan_snapshot).collect(),
-    });
-    RemotePlan {
-        name: name.to_string(),
-        url: url.to_string(),
-        public: plan.public,
-        error: None,
-        creates_remote: plan.creates_remote,
-        tags: plan
-            .tags
-            .iter()
-            .map(|t| PlanTag {
-                name: t.name.clone(),
-                action: t.action.word(),
-                target: t.target.hex(),
-                target_short: t.target.short(),
-                remote_target: t.remote.map(|r| r.hex()),
-                message: t.reason.clone(),
-                cloak: t.cloak.clone(),
-            })
-            .collect(),
-        snapshots: plan.snapshots.len(),
-        objects: plan.objects.len(),
-        trees: count(&|o| !o.blob && !o.sealed && !sent.contains(&o.id)),
-        blobs: count(&|o| o.blob),
-        sealed: count(&|o| o.sealed),
-        object_bytes: plan.object_bytes(),
-        pack_bytes: plan.pack_bytes,
-        snapshot_ids: plan.snapshots.iter().map(|i| i.hex()).collect(),
-        object_ids: plan.objects.iter().map(|o| o.id.hex()).collect(),
-        withheld_objects: plan.redacted,
-        withheld_snapshots: plan.withheld_snapshots.iter().map(plan_snapshot).collect(),
-        releases: plan.releases.clone(),
-        files,
-        warnings: plan.warnings.clone(),
-    }
-}
-
-/// `vl push --dry-run [REMOTE] [-t TAG…]`: what a push would send to
-/// `remote`, or to every configured remote. Nothing is written to any
-/// remote. With one remote named, a failure is the command's; for all
-/// remotes, each failure is recorded in its plan and the others go on.
-pub fn push_plan(ctx: &Ctx, remote: Option<&str>, tags: &[String], force: bool, force_tags: bool) -> Result<PushPlanDoc> {
-    let names: Vec<String> = match remote {
-        Some(n) => vec![n.to_string()],
-        None => ctx.repo.config().remotes.keys().cloned().collect(),
-    };
-    if names.is_empty() {
-        anyhow::bail!("no remotes are configured (add one with `vl remote add <name> <path>`)");
-    }
-    let mut remotes = Vec::new();
-    for name in &names {
-        let planned = crate::remote_backend(ctx, name).and_then(|(backend, cfg)| {
-            let plan = veil_core::push_plan::plan_push_with(&ctx.repo, backend, cfg.public, tags, force, force_tags)?;
-            Ok(remote_plan(name, &cfg.url, plan))
-        });
-        match planned {
-            Ok(p) => remotes.push(p),
-            Err(e) if remote.is_some() => return Err(e),
-            Err(e) => {
-                let cfg = ctx.repo.config().remotes.get(name).cloned();
-                remotes.push(RemotePlan {
-                    name: name.clone(),
-                    url: cfg.as_ref().map(|c| c.url.clone()).unwrap_or_default(),
-                    public: cfg.is_some_and(|c| c.public),
-                    error: Some(format!("{e:#}")),
-                    ..Default::default()
-                });
-            }
-        }
-    }
-    Ok(PushPlanDoc { schema: PUSH_PLAN_SCHEMA, remotes })
-}
-
 // ---- the write methods of `vl serve --local` ----------------------------------------
 //
 // `vl describe`, `vl new` and `vl commit` call these too, so the CLI and the
@@ -2405,7 +2195,7 @@ pub fn op_ref(repo: &Repo) -> OpRef {
     OpRef { op_id: id.hex(), op_short: id.short() }
 }
 
-/// `snapshot` (`veil.snapshot/1`): the working copy was recorded.
+/// `snapshot` (`veil.snapshot/2`): the working copy was recorded.
 #[derive(Serialize, Debug)]
 pub struct Recorded {
     pub schema: &'static str,
@@ -2418,7 +2208,7 @@ pub fn recorded(ctx: &Ctx) -> Result<Recorded> {
     Ok(Recorded { schema: SNAPSHOT_SCHEMA, working_copy: snapshot_ref(&ctx.repo, &ctx.wc()?), operation: op_ref(&ctx.repo) })
 }
 
-/// `vl describe` (`veil.describe/1`).
+/// `vl describe` (`veil.describe/2`).
 #[derive(Serialize, Debug)]
 pub struct Described {
     pub schema: &'static str,
@@ -2445,7 +2235,7 @@ pub fn describe(ctx: &mut Ctx, rev: &str, message: &str) -> Result<Described> {
     Ok(Described { schema: DESCRIBE_SCHEMA, described: snapshot_ref(&ctx.repo, &new), operation: op_ref(&ctx.repo), id: new })
 }
 
-/// `vl new` (`veil.new/1`).
+/// `vl new` (`veil.new/2`).
 #[derive(Serialize, Debug)]
 pub struct NewChange {
     pub schema: &'static str,
@@ -2462,7 +2252,7 @@ pub fn new_change(ctx: &mut Ctx, revs: &[String], message: &str) -> Result<NewCh
     Ok(NewChange { schema: NEW_SCHEMA, working_copy: snapshot_ref(&ctx.repo, &id), operation: op_ref(&ctx.repo) })
 }
 
-/// `vl commit` (`veil.commit/1`).
+/// `vl commit` (`veil.commit/2`).
 #[derive(Serialize)]
 pub struct Committed {
     pub schema: &'static str,
@@ -2481,10 +2271,8 @@ pub struct Committed {
 #[derive(Serialize, Debug)]
 pub struct KeptTag {
     pub name: String,
-    /// `cloaked_line` (a commit on a line cloaked for `scope` never moves
-    /// an uncloaked tag) or `no_advance`.
+    /// `no_advance` or `release_tag`.
     pub reason: &'static str,
-    pub scope: Option<String>,
 }
 
 /// `vl commit`: with `record`, the project directory is recorded and
@@ -2509,9 +2297,8 @@ pub fn commit(ctx: &mut Ctx, message: &str, advance: bool, record: bool) -> Resu
             .kept
             .iter()
             .map(|(name, why)| match why {
-                TagKept::CloakedLine(s) => KeptTag { name: name.clone(), reason: "cloaked_line", scope: Some(s.clone()) },
-                TagKept::NoAdvance => KeptTag { name: name.clone(), reason: "no_advance", scope: None },
-                TagKept::Release => KeptTag { name: name.clone(), reason: "release_tag", scope: None },
+                TagKept::NoAdvance => KeptTag { name: name.clone(), reason: "no_advance" },
+                TagKept::Release => KeptTag { name: name.clone(), reason: "release_tag" },
             })
             .collect(),
         operation: op_ref(repo),
@@ -2566,8 +2353,6 @@ mod cli_tests {
             &["secret", "list"],
             &["ls"],
             &["ls", "-r", "@-", "src"],
-            &["push", "--dry-run"],
-            &["push", "origin", "--dry-run"],
         ];
         for args in read {
             let with = |json: bool| {
@@ -2585,23 +2370,18 @@ mod cli_tests {
             assert!(!Cli::try_parse_from(args).unwrap().cmd.wants_json());
         }
         assert!(Cli::try_parse_from(["vl", "commit", "-m", "x", "--json"]).is_err(), "write commands do not take --json");
-        assert!(Cli::try_parse_from(["vl", "push", "--json"]).is_err(), "a push takes --json only with --dry-run");
-        assert!(Cli::try_parse_from(["vl", "push", "--dry-run", "--full"]).is_err());
-        assert!(Cli::try_parse_from(["vl", "push", "--dry-run", "--delete", "x"]).is_err());
+        assert!(Cli::try_parse_from(["vl", "push", "--json"]).is_err(), "a push takes no --json");
     }
 }
 
 // ---- blame -----------------------------------------------------------------------
 
-/// `vl blame --json` (`veil.blame/1`).
+/// `vl blame --json` (`veil.blame/2`).
 #[derive(Serialize, Debug)]
 pub struct BlameDoc {
     pub schema: &'static str,
     pub path: String,
     pub rev: SnapshotRef,
-    /// `plain`, or `fallback`: this reader cannot read the file at `rev`,
-    /// and its last public version is annotated instead.
-    pub version: &'static str,
     /// Annotated as a public mirror sees the history (`--public`).
     pub public: bool,
     /// A diff was past its work limit somewhere: a differing middle was
@@ -2747,8 +2527,7 @@ pub fn blame(ctx: &Ctx, req: &BlameRequest<'_>) -> Result<BlameDoc> {
     Ok(BlameDoc {
         schema: BLAME_SCHEMA,
         path: path(&p),
-        rev: snapshot_ref_as(repo, &id, req.public),
-        version: if b.fallback { "fallback" } else { "plain" },
+        rev: snapshot_ref(repo, &id),
         public: req.public,
         coarse: b.coarse,
         stopped: b.stopped.map(|s| match s {
@@ -2758,13 +2537,13 @@ pub fn blame(ctx: &Ctx, req: &BlameRequest<'_>) -> Result<BlameDoc> {
         visited: b.visited,
         unattributed: b.unattributed(),
         lines,
-        changes: stamped.iter().map(|(_, c)| snapshot_ref_as(repo, c, req.public)).collect(),
+        changes: stamped.iter().map(|(_, c)| snapshot_ref(repo, c)).collect(),
     })
 }
 
 // ---- grep ------------------------------------------------------------------------
 
-/// `vl grep --json` (`veil.grep/1`).
+/// `vl grep --json` (`veil.grep/2`).
 #[derive(Serialize, Debug)]
 pub struct GrepDoc {
     pub schema: &'static str,
@@ -2786,9 +2565,8 @@ pub struct GrepMatchDoc {
     pub line: usize,
     /// The line without its line break (cut at 1 MiB).
     pub text: String,
-    /// `public`, `cloaked`, `embargoed` (sealed, and this reader holds the
-    /// key) or `fallback` (the last public version of a file this reader
-    /// cannot read; members see newer content).
+    /// `public` or `cloaked` (a sealed secret file, and this reader holds
+    /// the key).
     pub tier: &'static str,
     /// The line was longer than 1 MiB and is cut.
     pub truncated: bool,
@@ -2798,7 +2576,7 @@ pub struct GrepMatchDoc {
 pub struct GrepFileDoc {
     pub path: String,
     pub tier: &'static str,
-    /// The scope of a cloaked file, the embargo of an embargoed one.
+    /// The scope of a cloaked file.
     pub scope: Option<String>,
     /// Matching lines (up to `--max-count`).
     pub count: usize,
@@ -2835,20 +2613,23 @@ pub fn grep(ctx: &Ctx, req: GrepRequest<'_>) -> Result<GrepDoc> {
     o.paths = req.paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
     let re = veil_core::grep::compile(req.pattern, &o)?;
     let g = veil_core::grep::grep(repo.store(), &tree, &re, &o)?;
+    let embargo = EmbargoTiers::of(repo, &id)?;
     let mut matches = Vec::new();
     let mut files = Vec::new();
     for f in &g.files {
         let scope = match &f.tier {
-            Tier::Cloaked(s) | Tier::Embargoed(s) => Some(s.clone()),
+            Tier::Cloaked(s) => Some(s.clone()),
             _ => None,
         };
-        files.push(GrepFileDoc { path: path(&f.path), tier: f.tier.as_str(), scope, count: f.count, binary: f.binary, conflict: f.conflict });
+        let entry = lookup(repo.store(), &tree, &f.path)?;
+        let tier = embargo.tier(repo, &f.path, entry.as_ref(), f.tier.as_str());
+        files.push(GrepFileDoc { path: path(&f.path), tier, scope, count: f.count, binary: f.binary, conflict: f.conflict });
         for l in &f.lines {
             matches.push(GrepMatchDoc {
                 path: path(&f.path),
                 line: l.number,
                 text: String::from_utf8_lossy(&l.text).into_owned(),
-                tier: f.tier.as_str(),
+                tier,
                 truncated: l.truncated,
             });
         }

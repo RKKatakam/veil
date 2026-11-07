@@ -6,7 +6,7 @@
 Generated from `vl` itself (`vl <command> --help` shows the same text). For
 explanations and worked examples, read the [user guide](../guide/README.md).
 
-Veil — snapshot-first version control with cloaking, engine-level secret protection and virtual workspaces.
+Veil — snapshot-first version control with engine-level secret protection (secret files are encrypted) and virtual workspaces.
 
 There is no staging area: every `vl` invocation first records the working copy as a snapshot of the current change. Use `vl commit -m` to finish a change, `vl undo` to step back through the operation log.
 
@@ -41,7 +41,7 @@ Global options (accepted by every command):
 | [`vl ls`](ls.md) | List a snapshot's files with their tier: who can read each one, and what never leaves this machine |
 | [`vl cat`](cat.md) | Print a file's content at a snapshot |
 | [`vl fsck`](fsck.md) | Verify repository integrity: object hashes, reachability, key rings, embargo records and the operation log. Exits 1 on corruption |
-| [`vl upgrade`](upgrade.md) | Upgrade the repository (or a remote) to the newest format |
+| [`vl upgrade`](upgrade.md) | Upgrade the repository to the newest format |
 | [`vl evolog`](evolog.md) | Show how a change evolved (amends, rewrites, rebases) |
 | [`vl blame`](blame.md) | Show which change last touched each line of a file |
 | [`vl grep`](grep.md) | Search the files of a snapshot (never the working copy's local-only files) for a pattern |
@@ -61,7 +61,7 @@ Global options (accepted by every command):
 | [`vl merge`](merge.md) | Merge REVS into the current line of work |
 | [`vl embargo`](embargo.md) | Manage embargoes created by delayed-visibility merges |
 | [`vl tag`](tag.md) | Manage tags (named pointers into the snapshot graph) |
-| [`vl cloak`](cloak.md) | Encrypt matching paths for a scope (default: team) |
+| [`vl cloak`](cloak.md) | Encrypt matching secret files (.env, keys, ...) for a scope (default: team). Only secret files are ever encrypted; `vl access` decides who sees everything else |
 | [`vl isolate`](isolate.md) | Keep matching paths local-only: never snapshotted, never synced |
 | [`vl expose`](expose.md) | Make matching paths public |
 | [`vl ignore`](ignore.md) | Do not track matching paths at all |
@@ -69,7 +69,7 @@ Global options (accepted by every command):
 | [`vl scan`](scan.md) | Scan the working copy for secrets that would become public |
 | [`vl attr`](attr.md) | Per-path attributes from `.veilattributes`: line endings, binary files, diff and merge drivers |
 | [`vl renormalize`](renormalize.md) | Re-record files with the line endings `.veilattributes` asks for now (changing `.veilattributes` alone never re-records a file). `vl undo` reverts it |
-| [`vl secret`](secret.md) | Encrypted secrets: the device-local vault, or a scope's team vault (`--scope`), shared with the scope's members through team remotes |
+| [`vl secret`](secret.md) | Encrypted secrets: the device-local vault, or a scope's team vault (`--scope`), sealed for the scope's members (it does not sync through the Veil server yet) |
 | [`vl run`](run.md) | Run a command with vault secrets injected as environment variables |
 | [`vl identity`](identity.md) | Your public-key identity |
 | [`vl scope`](scope.md) | Key scopes and their members (identity rings) |
@@ -79,9 +79,9 @@ Global options (accepted by every command):
 | [`vl redo`](redo.md) | Re-apply what the latest `vl undo` took back |
 | [`vl watch`](watch.md) | Snapshot continuously as files change |
 | [`vl serve`](serve.md) | Serve this repository to editors and agents over a local socket |
-| [`vl remote`](remote.md) | Manage remotes |
-| [`vl push`](push.md) | Send tags and their history to a remote (visibility-filtered) |
-| [`vl pull`](pull.md) | Fetch tags and history from a remote |
+| [`vl remote`](remote.md) | Manage remotes: the Veil server projects this repository syncs with |
+| [`vl push`](push.md) | Send tags and their history to the Veil server, which moves each branch only if nobody moved it meanwhile (and checks your access) |
+| [`vl pull`](pull.md) | Fetch tags and history from the Veil server: what you may see |
 | [`vl hooks`](hooks.md) | Hooks run before commits and pushes; repository-suggested ones only once this device trusts them (not implemented yet) |
 | [`vl gc`](gc.md) | Pack objects and delete those no retained operation can reach |
 | [`vl doctor`](doctor.md) | Check this machine's setup and explain every problem found: identity, VEIL_HOME, the repository and its lock, the stat cache, the filesystem (case sensitivity, fsync, network mounts), the clock, the vault and leftover sandboxes. Exits 1 if anything is broken |

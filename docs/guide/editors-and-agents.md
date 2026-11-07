@@ -42,7 +42,7 @@ vl serve --call status
 ```
 
 ```text
-{"schema":"veil.status/1","workspace":{"name":"default","cloak":null},"working_copy":{"snapshot_id":"e3424b1b…","snapshot_short":"e3424b1b","change_id":"ltlptpvm…","change_short":"ltlptpvm","available":true,"empty":false,"description":"","description_hidden":null},"parents":[…],"changes":[{"path":"main.rs","status":"added","visibility":{"kind":"public","scope":null,"embargo":null},"redacted":false}],"isolated":[],"quarantined":[],"policy_held_back":[],"nested":[],"redacted":[],"conflicts":[]}
+{"schema":"veil.status/2","workspace":{"name":"default"},"working_copy":{"snapshot_id":"e3424b1b…","snapshot_short":"e3424b1b","change_id":"ltlptpvm…","change_short":"ltlptpvm","available":true,"empty":false,"description":""},"parents":[…],"changes":[{"path":"main.rs","status":"added","visibility":{"kind":"public","scope":null},"redacted":false}],"isolated":[],"quarantined":[],"policy_held_back":[],"nested":[],"redacted":[],"conflicts":[]}
 ```
 
 Parameters are a JSON object named after the command's flags:
@@ -80,7 +80,7 @@ vl serve --call commit '{"message":"Add main.rs"}'
 ```
 
 ```text
-{"schema":"veil.commit/1","committed":{"snapshot_id":"39a14714…","snapshot_short":"39a14714","change_id":"ltlptpvm…","change_short":"ltlptpvm","available":true,"empty":false,"description":"Add main.rs","description_hidden":null},"working_copy":{…,"empty":true,…},"advanced":["main"],"kept":[],"operation":{"op_id":"380df4fe…","op_short":"380df4fe"}}
+{"schema":"veil.commit/2","committed":{"snapshot_id":"39a14714…","snapshot_short":"39a14714","change_id":"ltlptpvm…","change_short":"ltlptpvm","available":true,"empty":false,"description":"Add main.rs"},"working_copy":{…,"empty":true,…},"advanced":["main"],"kept":[],"operation":{"op_id":"380df4fe…","op_short":"380df4fe"}}
 ```
 
 They take the repository lock and record operations like the commands, so
@@ -162,9 +162,8 @@ parameters and results, and the error codes.
 ## What the server will not do
 
 * **Show more than `vl` would.** It answers as the user who started it,
-  through the same code as the commands: cloaked content you hold no key
-  for is redacted, sealed descriptions are hidden, secret values never
-  appear. See [Secrets and visibility](secrets-and-visibility.md).
+  through the same code as the commands: secret files you hold no key
+  for are redacted, and secret values never appear. See [Secrets and visibility](secrets-and-visibility.md).
 * **Let anyone else in.** The socket is `0600` in a `0700` directory, and the
   server checks every client's user id with the kernel (peer credentials).
   Another user on the machine cannot connect, even if they could reach the

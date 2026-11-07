@@ -65,9 +65,11 @@ pub const SIG_PREFIX: &[u8] = b"veil 2026 sig v1\0";
 pub const SIG_CONTEXT_SNAPSHOT: &str = "snapshot";
 /// Signature context: ring changes (over `RingChange::signing_body`).
 pub const SIG_CONTEXT_RING_CHANGE: &str = "ring-change";
-/// Signature context: embargo creation (over `EmbargoRecord::body`).
+/// Retired signature context (signed embargo records, removed with
+/// encrypted embargoes in repository format 8): reserved, never reused.
 pub const SIG_CONTEXT_EMBARGO: &str = "embargo";
-/// Signature context: embargo release (over `(id, released_key, released_at)`).
+/// Retired signature context (embargo releases, removed in repository
+/// format 8): reserved, never reused.
 pub const SIG_CONTEXT_EMBARGO_RELEASE: &str = "embargo-release";
 /// Signature context: an identity's binding of its Ed25519 key to its
 /// X25519 key (over the 32 raw bytes of the X25519 public key). Proves that
@@ -133,15 +135,16 @@ pub const WRAP_LABEL_PREFIX: &str = "wrap:";
 /// `prev-key:<scope>#<new-key-id>`: an older generation key sealed under a
 /// newer one (XChaCha20-Poly1305, random nonce).
 pub const PREV_KEY_LABEL_PREFIX: &str = "prev-key:";
-/// `embargo-wrap:<id>`: an embargo key sealed under a scope key
-/// (XChaCha20-Poly1305, random nonce).
+/// Retired label (`embargo-wrap:<id>`, embargo keys, removed in repository
+/// format 8): reserved, never reused.
 pub const EMBARGO_WRAP_LABEL_PREFIX: &str = "embargo-wrap:";
-/// `embargo/<id>`: content sealed under an embargo key.
+/// Retired label (`embargo/<id>`, content sealed under an embargo key,
+/// removed in repository format 8): reserved, never reused.
 pub const EMBARGO_LABEL_PREFIX: &str = "embargo/";
 /// `vault:<scope>#<key-id>`: a team-vault entry (name and value) sealed
 /// under a scope generation key (XChaCha20-Poly1305, random nonce). The
-/// prefix keeps it apart from cloaked change descriptions, which use the
-/// bare `<scope>#<key-id>` label under the same key.
+/// prefix keeps it apart from sealed secret files, which use the bare
+/// `<scope>#<key-id>` label under the same key.
 pub const VAULT_LABEL_PREFIX: &str = "vault:";
 /// `local`: the device-local vault and isolated files.
 pub const LOCAL_LABEL: &str = "local";

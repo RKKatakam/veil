@@ -1,35 +1,22 @@
-//! `vl remote add|list|rm` and remote URL parsing (path, scp-style, ssh://).
+//! `vl remote add|list|rm`: a remote is a Veil server project
+//! (`veil://host/project`). Tests that push or pull use the path remotes
+//! of the test fixture (`crates/vl/src/test_remotes.rs`).
 
 use super::support::*;
 
 // Scenario from git t5505-remote.sh: "add another remote" / "remote information for the origin".
 #[test]
-fn remote_add_list_shows_kind_and_url() {
+fn remote_add_list_shows_name_and_url() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
-    let out = env.ok("alice", &proj, &["remote", "add", "origin", "../hub"]);
-    assert!(out.contains("Added team remote origin"), "{out}");
-    let out = env.ok(
-        "alice",
-        &proj,
-        &["remote", "add", "mirror", "../mirror", "--public"],
-    );
-    assert!(out.contains("Added public remote mirror"), "{out}");
+    let out = env.ok("alice", &proj, &["remote", "add", "origin", "veil://hub.example/proj"]);
+    assert!(out.contains("Added remote origin → veil://hub.example/proj"), "{out}");
+    env.ok("alice", &proj, &["remote", "add", "mirror", "https://hub.example:8443/mirror"]);
     let list = env.stdout("alice", &proj, &["remote", "list"]);
     let lines: Vec<&str> = list.lines().collect();
     assert_eq!(lines.len(), 2, "{list}");
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("mirror") && l.contains("public") && l.contains("../mirror")),
-        "{list}"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("origin") && l.contains("team") && l.contains("../hub")),
-        "{list}"
-    );
+    assert!(lines.iter().any(|l| l.starts_with("mirror") && l.contains("https://hub.example:8443/mirror")), "{list}");
+    assert!(lines.iter().any(|l| l.starts_with("origin") && l.contains("veil://hub.example/proj")), "{list}");
 }
 
 // Scenario from git t5505-remote.sh: adding a remote whose name already exists fails.
@@ -37,18 +24,11 @@ fn remote_add_list_shows_kind_and_url() {
 fn remote_add_refuses_a_duplicate_name_and_keeps_the_original() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
-    env.ok("alice", &proj, &["remote", "add", "origin", "../hub"]);
-    let out = env.fails(
-        "alice",
-        &proj,
-        &["remote", "add", "origin", "../other", "--public"],
-    );
+    env.ok("alice", &proj, &["remote", "add", "origin", "veil://hub.example/proj"]);
+    let out = env.fails("alice", &proj, &["remote", "add", "origin", "veil://hub.example/other"]);
     assert!(out.contains("already exists"), "{out}");
     let list = env.stdout("alice", &proj, &["remote", "list"]);
-    assert!(
-        list.contains("../hub") && !list.contains("../other") && list.contains("team"),
-        "{list}"
-    );
+    assert!(list.contains("veil://hub.example/proj") && !list.contains("other"), "{list}");
 }
 
 // Scenario from git t5505-remote.sh: "remove remote".
@@ -144,91 +124,36 @@ fn a_relative_remote_path_resolves_against_the_repository_root_from_a_subdirecto
     env.ok("alice", &proj.join("sub"), &["pull"]);
 }
 
-// Scenario from git t9904-url-parse.sh / t5601: unsupported schemes are refused up front.
+// Scenario from git t9904-url-parse.sh / t5601: unsupported URLs are refused
+// up front. Without the test fixture, as users run vl, a remote is a Veil
+// server project and nothing else: no paths, no SSH or SFTP.
 #[test]
-fn unsupported_url_schemes_are_refused() {
+fn anything_but_a_veil_server_project_is_refused() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
+    let product = |args: &[&str]| {
+        let out = env.cmd("alice", &proj, args).env_remove("VEIL_TEST_PATH_REMOTES").output().unwrap();
+        (out.status.success(), text(&out))
+    };
     for url in [
+        "../hub",
+        "/abs/hub",
         "file:///tmp/x",
         "http://example.com/r",
-        "ftp://example.com/r",
+        "ssh://host/abs/repo",
+        "sftp://host/abs",
+        "user@host:repo",
         "git://example.com/r",
     ] {
-        let out = env.fails("alice", &proj, &["remote", "add", "r", url]);
-        assert!(out.contains("unsupported scheme"), "{url}: {out}");
+        let (ok, out) = product(&["remote", "add", "r", "--", url]);
+        assert!(!ok && out.contains("is not a Veil server project"), "{url}: {out}");
     }
+    let (ok, out) = product(&["remote", "add", "r", "veil://hub.example"]);
+    assert!(!ok && out.contains("names a project"), "{out}");
+    let (ok, out) = product(&["clone", "../hub", "copy"]);
+    assert!(!ok && out.contains("is not a Veil server project"), "{out}");
+    assert!(!env.path("copy").exists());
     assert_eq!(env.stdout("alice", &proj, &["remote", "list"]).trim(), "");
-}
-
-// Scenario from git t9904-url-parse.sh: malformed ssh URLs (bad port, option-like host or user).
-#[test]
-fn malformed_ssh_urls_are_refused() {
-    let env = Env::new();
-    let proj = env.project("alice", "proj", &[("a", "a\n")]);
-    for url in [
-        "ssh://host:notaport/r",
-        "ssh://host:0/r",
-        "ssh://host:70000/r",
-        "ssh://-oProxyCommand=evil/r",
-        "-oProxyCommand=evil:r",
-        "ssh://-l@host/r",
-        "ssh://[::1/r",
-        "ssh:///r",
-        "@host:r",
-    ] {
-        let out = env.vl("alice", &proj, &["remote", "add", "r", "--", url]);
-        assert!(!out.status.success(), "{url} accepted: {}", text(&out));
-        assert!(exited_cleanly(&out));
-    }
-}
-
-// Scenario from git t9904-url-parse.sh / t5601 ("clone ssh://... / host:path"): accepted forms.
-#[test]
-fn ssh_url_forms_are_accepted() {
-    let env = Env::new();
-    let proj = env.project("alice", "proj", &[("a", "a\n")]);
-    for (i, url) in [
-        "host:repo",
-        "user@host:repo",
-        "user@host:/abs/repo",
-        "ssh://host/abs/repo",
-        "ssh://user@host:2222/abs/repo",
-        "ssh://host/~/rel",
-        "sftp://host/abs",
-        "[::1]:repo",
-        "user@[::1]:repo",
-        "ssh://[::1]:22/repo",
-    ]
-    .iter()
-    .enumerate()
-    {
-        let name = format!("r{i}");
-        env.ok("alice", &proj, &["remote", "add", &name, url]);
-    }
-    let list = env.stdout("alice", &proj, &["remote", "list"]);
-    assert_eq!(list.lines().count(), 10, "{list}");
-}
-
-// Scenario from git t9904-url-parse.sh: a ':' after a '/' is a local path, not scp-style.
-#[test]
-fn a_colon_after_a_slash_is_a_local_path() {
-    let env = Env::new();
-    let proj = env.project("alice", "proj", &[("a", "a\n")]);
-    env.ok("alice", &proj, &["remote", "add", "odd", "./odd:name"]);
-    env.ok("alice", &proj, &["push", "odd"]);
-    assert!(
-        proj.join("odd:name/.veil/repo.json").exists(),
-        "pushed to a local directory named odd:name"
-    );
-    let abs = env.path("abs:dir");
-    env.ok(
-        "alice",
-        &proj,
-        &["remote", "add", "abs", abs.to_str().unwrap()],
-    );
-    env.ok("alice", &proj, &["push", "abs"]);
-    assert!(abs.join(".veil/repo.json").exists());
 }
 
 // Scenario from git t5505: `remote list` on a fresh repository is empty and succeeds.
@@ -242,19 +167,12 @@ fn remote_list_is_empty_on_a_fresh_repository() {
 
 // Scenario from git t5505 ("add existing remote" after removal): a removed name can be reused.
 #[test]
-fn a_removed_remote_name_can_be_added_again_with_another_kind() {
+fn a_removed_remote_name_can_be_added_again() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a", "a\n")]);
-    env.ok("alice", &proj, &["remote", "add", "origin", "../hub"]);
+    env.ok("alice", &proj, &["remote", "add", "origin", "veil://hub.example/proj"]);
     env.ok("alice", &proj, &["remote", "rm", "origin"]);
-    env.ok(
-        "alice",
-        &proj,
-        &["remote", "add", "origin", "../mirror", "--public"],
-    );
+    env.ok("alice", &proj, &["remote", "add", "origin", "veil://other.example/proj"]);
     let list = env.stdout("alice", &proj, &["remote", "list"]);
-    assert!(
-        list.contains("public") && list.contains("../mirror"),
-        "{list}"
-    );
+    assert!(list.contains("veil://other.example/proj") && !list.contains("hub.example"), "{list}");
 }

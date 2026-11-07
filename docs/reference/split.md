@@ -5,7 +5,7 @@
 
 Split a change in two: what you choose, then the rest.
 
-The first change, on the original's parents, holds what you choose: the changes at PATHS, the hunks named by `--hunks` or `--plan`, or the hunks you pick with `-i`. It gets a new change id and the description given with `-m` (none by default). The second change, its child, holds the rest and stays the change you split: the same change id, description and files, so its descendants, tags and the working copy follow it with nothing to rebase. No file changes visibility: a cloaked file's hunks stay sealed for its scope in both halves. Hunks of a file you cannot read, of a binary or conflicted file, or of a file whose visibility this change alters cannot be chosen one by one: such a file moves whole. A split that would leave either change empty is refused.
+The first change, on the original's parents, holds what you choose: the changes at PATHS, the hunks named by `--hunks` or `--plan`, or the hunks you pick with `-i`. It gets a new change id and the description given with `-m` (none by default). The second change, its child, holds the rest and stays the change you split: the same change id, description and files, so its descendants, tags and the working copy follow it with nothing to rebase. No file changes visibility: a sealed secret file's hunks stay sealed for its scope in both halves. Hunks of a file you cannot read, of a binary or conflicted file, or of a file whose visibility this change alters cannot be chosen one by one: such a file moves whole. A split that would leave either change empty is refused.
 
 ```text
 vl split [OPTIONS] [PATHS]...

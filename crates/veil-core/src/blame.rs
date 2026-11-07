@@ -9,17 +9,10 @@
 //! unless the envelope's label (bound to the ciphertext) names a key this
 //! reader holds, and it never returns ciphertext:
 //!
-//! * [`Readable::Plain`]: public content, or sealed content this reader
-//!   opens (with [`Reader::Public`], plaintext and released embargoes only:
-//!   what a public mirror holds);
-//! * [`Readable::Fallback`]: the entry's last public version, for a reader
-//!   who cannot open the entry itself (an embargoed file, or a public file
-//!   edited on a cloaked line). That is what `vl cat` and a checkout show
-//!   them;
+//! * [`Readable::Plain`]: public content, or a sealed secret file this
+//!   reader opens (with [`Reader::Public`], plaintext only: what a public
+//!   mirror holds);
 //! * [`Readable::Redacted`]: nothing, and why.
-//!
-//! Trees are read through [`ObjectStore::tree`], which resolves embargo
-//! wrappers for this reader: a non-holder sees the pre-merge tree exactly.
 //!
 //! # The walk
 //!
@@ -31,10 +24,7 @@
 //! with each parent's in order; a line the parent holds moves to the first
 //! parent that holds it, the rest are attributed to the snapshot. A parent
 //! whose readable version is identical (same object, or same bytes) takes
-//! every open line without a diff, so a reader without the key attributes
-//! nothing to a cloaked change whose readable version is its fallback
-//! (threat review 2), and nothing to an embargoed merge (its tree resolves
-//! to the pre-merge tree, threat review 3). A parent whose version is
+//! every open line without a diff. A parent whose version is
 //! redacted stops the lines it might hold: they are reported unattributed
 //! ("history sealed for …"), never guessed.
 //!
@@ -78,8 +68,8 @@ pub enum Reader {
     /// This repository's keychain: whatever its keys open.
     #[default]
     Me,
-    /// A public mirror: plaintext objects and released embargoes only (the
-    /// `--public` view).
+    /// A public mirror: plaintext objects, and no history an unreleased
+    /// embargo withholds (the `--public` view).
     Public,
 }
 
@@ -88,12 +78,8 @@ pub enum Reader {
 pub enum Readable {
     /// The entry's own content. `id` is the object read (for a conflict,
     /// the blob id of its materialisation); `visibility` is what that
-    /// object proves (labels are claims, BUG-482): `Public` for plaintext
-    /// and released embargoes.
+    /// object proves (labels are claims, BUG-482): `Public` for plaintext.
     Plain { id: ObjectId, data: Vec<u8>, visibility: Visibility },
-    /// The entry's last public version (`fallback`), because this reader
-    /// cannot open the entry itself.
-    Fallback { id: ObjectId, data: Vec<u8> },
     /// Nothing this reader may see.
     Redacted(Hidden),
 }
@@ -102,7 +88,7 @@ impl Readable {
     /// The bytes read, unless redacted.
     pub fn data(&self) -> Option<&[u8]> {
         match self {
-            Readable::Plain { data, .. } | Readable::Fallback { data, .. } => Some(data),
+            Readable::Plain { data, .. } => Some(data),
             Readable::Redacted(_) => None,
         }
     }
@@ -110,17 +96,13 @@ impl Readable {
     /// The object read, unless redacted. Equal ids mean equal content.
     pub fn id(&self) -> Option<ObjectId> {
         match self {
-            Readable::Plain { id, .. } | Readable::Fallback { id, .. } => Some(*id),
+            Readable::Plain { id, .. } => Some(*id),
             Readable::Redacted(_) => None,
         }
     }
 
     pub fn is_plain(&self) -> bool {
         matches!(self, Readable::Plain { .. })
-    }
-
-    pub fn is_fallback(&self) -> bool {
-        matches!(self, Readable::Fallback { .. })
     }
 }
 
@@ -141,8 +123,6 @@ pub enum HiddenReason {
     NoKey,
     /// Sealed, and absent here: a public remote never delivered it.
     Withheld,
-    /// Under an unreleased embargo.
-    NotReleased,
     /// Sealed, and the reader is [`Reader::Public`].
     PublicView,
     /// A public object absent from the store (damage, not a redaction).
@@ -157,7 +137,6 @@ impl HiddenReason {
         match self {
             HiddenReason::NoKey => "no_key",
             HiddenReason::Withheld => "withheld",
-            HiddenReason::NotReleased => "not_released",
             HiddenReason::PublicView => "public_view",
             HiddenReason::Missing => "missing",
             HiddenReason::NotAFile => "not_a_file",
@@ -186,21 +165,10 @@ impl ReadStats {
     }
 }
 
-/// A description as a public mirror reads it: `None` if it is sealed for a
-/// cloak scope, `local` or an unreleased embargo (keys this replica holds
-/// for them are never used). For `--public` views.
-pub fn public_description(store: &ObjectStore, t: &Text) -> Option<String> {
-    match t {
-        Text::Plain(s) => Some(s.clone()),
-        Text::Sealed(env) => {
-            let embargo = env.scope.strip_prefix("embargo/")?;
-            if !store.keys.embargo_released(embargo) {
-                return None;
-            }
-            let key = store.keys.key(&env.scope)?;
-            String::from_utf8(env.open(&key).ok()?).ok()
-        }
-    }
+/// A description as a public mirror reads it (descriptions are plain
+/// text). For `--public` views.
+pub fn public_description(_store: &ObjectStore, t: &Text) -> Option<String> {
+    Some(t.as_str().to_string())
 }
 
 /// File entry `e` as `reader` may read it (see the module docs).
@@ -214,13 +182,6 @@ pub fn readable_version_counted(store: &ObjectStore, e: &TreeEntry, reader: Read
         EntryKind::File => {
             if let Some((data, visibility)) = open_readable(store, &e.id, reader, stats)? {
                 return Ok(Readable::Plain { id: e.id, data, visibility });
-            }
-            if let Some(fb) = &e.fallback {
-                // A fallback is the last public version: read it by the
-                // same rule (a hostile entry could name a sealed one).
-                if let Some((data, _)) = open_readable(store, fb, reader, stats)? {
-                    return Ok(Readable::Fallback { id: *fb, data });
-                }
             }
             Ok(Readable::Redacted(hidden(store, e, reader)))
         }
@@ -261,11 +222,8 @@ fn open_readable(store: &ObjectStore, id: &ObjectId, reader: Reader, stats: &mut
         return Ok(None);
     };
     drop(raw);
-    let released = label.strip_prefix("embargo/").is_some_and(|e| store.keys.embargo_released(e));
-    let allowed = match reader {
-        Reader::Me => store.keys.has(&label),
-        Reader::Public => released && store.keys.has(&label),
-    };
+    // A public reader never opens a sealed (secret) file.
+    let allowed = reader == Reader::Me && store.keys.has(&label);
     if !allowed {
         stats.sealed_skipped += 1;
         return Ok(None);
@@ -273,11 +231,7 @@ fn open_readable(store: &ObjectStore, id: &ObjectId, reader: Reader, stats: &mut
     stats.sealed_opened += 1;
     match store.read_blob(id) {
         Ok(data) => {
-            let vis = if released {
-                Visibility::Public
-            } else {
-                object_visibility(&store.get_raw(id)?).unwrap_or(Visibility::Cloaked { scope: label })
-            };
+            let vis = object_visibility(&store.get_raw(id)?).unwrap_or(Visibility::Cloaked { scope: label });
             Ok(Some((data, vis)))
         }
         Err(err) if err.is_unreadable() => {
@@ -294,12 +248,8 @@ fn hidden(store: &ObjectStore, e: &TreeEntry, reader: Reader) -> Hidden {
     let label_held = raw.as_deref().and_then(Object::sealed_scope).is_some_and(|l| store.keys.has(&l));
     let reason = match (&raw, &visibility) {
         (None, Visibility::Public) => HiddenReason::Missing,
-        (_, Visibility::Embargoed { embargo }) if !store.keys.embargo_released(embargo) && reader == Reader::Me => {
-            HiddenReason::NotReleased
-        }
         (None, _) => HiddenReason::Withheld,
         (Some(_), _) if reader == Reader::Public && label_held => HiddenReason::PublicView,
-        (Some(_), Visibility::Embargoed { .. }) => HiddenReason::NotReleased,
         (Some(_), _) => HiddenReason::NoKey,
     };
     Hidden { reason, visibility }
@@ -461,9 +411,6 @@ pub enum Stop {
 pub struct Blame {
     pub path: VPath,
     pub rev: ObjectId,
-    /// The file at `rev` was read as its last public version (this reader
-    /// cannot read the current one).
-    pub fallback: bool,
     pub lines: Vec<BlameLine>,
     /// Some diff was past its work limit: a differing middle was attributed
     /// whole.
@@ -557,13 +504,22 @@ fn version_at(store: &ObjectStore, tree: &ObjectId, path: &VPath, reader: Reader
         Err(err) => return Err(err),
     };
     Ok(Some(match readable_version_counted(store, &e, reader, stats)? {
-        Readable::Plain { id, data, .. } | Readable::Fallback { id, data } => Ok(Version::new(id, data)),
+        Readable::Plain { id, data, .. } => Ok(Version::new(id, data)),
         Readable::Redacted(h) => Err(h),
     }))
 }
 
 /// Attribute each line of the file `path` at snapshot `rev`.
 pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Result<Blame> {
+    // A public mirror lacks what an unreleased embargo withholds (BUG-991):
+    // no push sends it before the release. A revision it has holds none of
+    // it in its history, so only the revision itself is checked.
+    if o.reader == Reader::Public && crate::remote::embargo_blocks(repo, &[*rev])?[0].is_some() {
+        return Err(VeilError::Policy(format!(
+            "{} is not public: an unreleased embargo withholds it, and a public mirror does not have it before the release",
+            rev.short()
+        )));
+    }
     let store = repo.store();
     let mut stats = ReadStats::default();
     let top = repo.snapshot(rev)?;
@@ -572,9 +528,8 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
         Some(_) => return Err(VeilError::NotFound(format!("{path} is a directory in {}", rev.short()))),
         None => return Err(VeilError::NotFound(format!("{path} does not exist in {}", rev.short()))),
     };
-    let (version, fallback) = match readable_version_counted(store, &entry, o.reader, &mut stats)? {
-        Readable::Plain { id, data, .. } => (Version::new(id, data), false),
-        Readable::Fallback { id, data } => (Version::new(id, data), true),
+    let version = match readable_version_counted(store, &entry, o.reader, &mut stats)? {
+        Readable::Plain { id, data, .. } => Version::new(id, data),
         Readable::Redacted(h) => return Err(VeilError::Redacted { scope: h.visibility.label() }),
     };
     let total = version.lines.len();
@@ -583,7 +538,7 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
         None => (0, total),
     };
     let mut origins: Vec<Option<Origin>> = vec![None; total];
-    let mut result = Blame { path: path.clone(), rev: *rev, fallback, lines: Vec::new(), coarse: false, stopped: None, visited: 0, stats };
+    let mut result = Blame { path: path.clone(), rev: *rev, lines: Vec::new(), coarse: false, stopped: None, visited: 0, stats };
     let mut heap: BinaryHeap<Queued> = BinaryHeap::new();
     let mut pending: HashMap<(ObjectId, VPath), Pending> = HashMap::new();
     let open: Vec<(u32, u32)> = (from..to.max(from)).map(|i| (i as u32, i as u32)).collect();

@@ -59,7 +59,7 @@ fn command(repo: &mut Repo, s: &Step, i: usize) -> bool {
         }
         Step::SetTag(t) => {
             let target = repo.snapshot(&wc(repo)).unwrap().parents[0];
-            repo.set_tag(&format!("t{t}"), target, None, true).unwrap();
+            repo.set_tag(&format!("t{t}"), target, true).unwrap();
         }
         _ => unreachable!(),
     }
@@ -195,7 +195,7 @@ proptest! {
         let root = repo.root_id();
         // Actor 2's workspace is its own (`vl ws new agent`, run there).
         repo.set_command_workspace(Some("agent".into()));
-        repo.create_workspace("agent", vec![root], None).unwrap();
+        repo.create_workspace("agent", vec![root]).unwrap();
         repo.set_command_workspace(Some(WS.into()));
         let mut history = vec![actor1_state(&repo)];
         let mut redo = Vec::new();
