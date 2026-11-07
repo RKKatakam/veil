@@ -944,3 +944,274 @@ fn bug_1070_sync_routes_accept_real_ids_of_hidden_snapshots() {
     let (a, b) = (ask(&hidden), ask(&ObjectId([9; 32]).hex()));
     assert_eq!((a.status, a.body), (b.status, b.body), "a hidden snapshot's real id is answered");
 }
+
+/// Adversarial pass on S13 (`docs/BUGS.md`, "Adversarial pass: S13"):
+/// reproductions of the bounds that the query API states (phase-3 design
+/// §11, "Bounds", row 10) and does not keep.
+mod s13_adversarial {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    use veil_core::{
+        object::{EntryKind, Object, Snapshot, Text, Tree, TreeEntry},
+        ChangeId,
+    };
+
+    use super::*;
+
+    fn rss() -> u64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        let kib: u64 = s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)).unwrap().parse().unwrap();
+        kib * 1024
+    }
+
+    /// `f`'s result, and how far the process's memory rose while it ran.
+    fn peak_growth<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let base = rss();
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = stop.clone();
+        let sampler = std::thread::spawn(move || {
+            let mut m = 0;
+            while !s2.load(Ordering::Relaxed) {
+                m = m.max(rss());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            m
+        });
+        let r = f();
+        stop.store(true, Ordering::Relaxed);
+        let peak = sampler.join().unwrap().max(rss());
+        (r, peak.saturating_sub(base))
+    }
+
+    fn entry(name: &str, kind: EntryKind, id: ObjectId, size: u64) -> TreeEntry {
+        TreeEntry {
+            name: name.to_string(),
+            kind,
+            id,
+            size,
+            executable: false,
+            visibility: Default::default(),
+        }
+    }
+
+    fn tree(entries: Vec<TreeEntry>, out: &mut Vec<(ObjectId, Vec<u8>)>) -> ObjectId {
+        let raw = Object::Tree(Tree { entries }).encode();
+        let id = ObjectId::hash(&raw);
+        out.push((id, raw));
+        id
+    }
+
+    /// The tree `pub/<dir>/f0000.txt … f<n-1>.txt`, every file the one blob
+    /// `blob` (`size` bytes): a few hundred bytes of upload per file.
+    fn folder_of_copies(dir: &str, n: usize, blob: ObjectId, size: u64, out: &mut Vec<(ObjectId, Vec<u8>)>) -> ObjectId {
+        let files: Vec<TreeEntry> = (0..n).map(|i| entry(&format!("f{i:04}.txt"), EntryKind::File, blob, size)).collect();
+        let d = tree(files, out);
+        let p = tree(vec![entry(dir, EntryKind::Dir, d, 0)], out);
+        tree(vec![entry("pub", EntryKind::Dir, p, 0)], out)
+    }
+
+    fn commit_tree(th: &TestHub, h: &mut Hist, parents: &[ObjectId], tree: ObjectId, mut objects: Vec<(ObjectId, Vec<u8>)>, n: u8, timestamp: i64) -> ObjectId {
+        let s = Snapshot {
+            parents: parents.to_vec(),
+            change_id: ChangeId([n; 16]),
+            tree,
+            description: Text::Plain(format!("change {n}")),
+            author: "gen".into(),
+            timestamp,
+            predecessors: vec![],
+            conflicts: vec![],
+            embargo: None,
+            signature: None,
+        };
+        let raw = Object::Snapshot(s).encode();
+        let id = ObjectId::hash(&raw);
+        objects.push((id, raw));
+        h.put(th, objects);
+        th.rt.block_on(async {
+            again(|| sqlx::query("INSERT INTO snapshots (project_id, id) VALUES ($1, $2) ON CONFLICT DO NOTHING").bind(h.id).bind(id.hex()).execute(&h.hub.db)).await;
+        });
+        h.parents.insert(id, parents.to_vec());
+        h.order.push(id);
+        id
+    }
+
+    /// BUG-1071: a log page's work budget (`Limits::work`, 20,000 reads) is
+    /// checked only between emitted entries. One step of the topological
+    /// walk explores every snapshot whose generation is above the next
+    /// snapshot to settle, so a merge that takes in one snapshot dated far
+    /// behind (timestamp 0: a crafted push, or a device whose clock is
+    /// wrong) makes the first page of every log above it walk the whole
+    /// line below, whatever the budget. On a long history every such log
+    /// meets the 2 s deadline and fails for everyone.
+    #[test]
+    #[ignore = "BUG-1071: one step of the log's walk explores the whole history, past the page's work budget"]
+    fn bug_1071_a_log_page_walks_past_its_work_budget() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let n: usize = std::env::var("VEIL_BUG1071_LINE").ok().and_then(|s| s.parse().ok()).unwrap_or(400);
+        let mut files = Files::new();
+        let mut tip = root_snapshot_id();
+        for i in 0..n {
+            files.insert("pub/line.txt".into(), format!("version {i}\n").into_bytes());
+            let mut change = [0u8; 16];
+            change[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+            tip = h.commit(&th, &[tip], files.clone(), change, 1_700_000_000_000 + i as i64 * 1000, None);
+        }
+        let old = h.commit(&th, &[root_snapshot_id()], Files::from([("pub/old.txt".to_string(), b"old\n".to_vec())]), [0xee; 16], 0, None);
+        let mut merged = files.clone();
+        merged.insert("pub/old.txt".into(), b"old\n".to_vec());
+        let top = h.commit(&th, &[tip, old], merged, [0xef; 16], 1_800_000_000_000, None);
+        h.set_branch(&th, "main", top);
+        let a = ask(&th, &h, &Viewer::default());
+        warm_up(&th, &h, &Viewer::default());
+        let limits = Limits {
+            work: 100,
+            ..Limits::default()
+        };
+        let v = th.rt.block_on(query::log(&h.hub, &a, LogParams { n: Some(1), ..Default::default() }, limits)).unwrap();
+        let work = v["work"].as_u64().unwrap();
+        println!("BUG-1071: a page of 1 entry over a line of {n}, budget {}: work {work}", limits.work);
+        assert!(work <= 2 * limits.work, "a page with a budget of {} read {work} rows and objects", limits.work);
+    }
+
+    /// BUG-1072: `diff` (and `show`) run the rename and copy detection of
+    /// S12 (`changes::sources`) on any pair of revisions anyone may name.
+    /// It hashes every line of up to 1,000 deleted and 1,000 added plain-text
+    /// files of up to 1 MiB each, and keeps every file's table of line
+    /// hashes until it is done: gigabytes for one request, with no deadline
+    /// check (`G::tick` is not called) and no `work` counted. A member who
+    /// may write a public folder uploads one blob and two trees of copies
+    /// of it (a few hundred KB); then each `diff?from=X&to=Y&base=from`
+    /// from anyone on Earth costs the server that memory and CPU, and a few
+    /// at once take the process (every project) down.
+    #[test]
+    #[ignore = "BUG-1072: the diff route's rename detection holds unbounded memory and ignores the deadline"]
+    fn bug_1072_a_diff_holds_gigabytes_past_its_deadline() {
+        const CHILD: &str = "VEIL_BUG1072_CHILD";
+        if std::env::var(CHILD).is_err() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "query::s13_adversarial::bug_1072_a_diff_holds_gigabytes_past_its_deadline", "--nocapture", "--include-ignored"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let line = stdout.lines().find(|l| l.contains("BUG-1072:")).unwrap_or_default();
+            println!("{line}");
+            assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+            return;
+        }
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let n: usize = std::env::var("VEIL_BUG1072_FILES").ok().and_then(|s| s.parse().ok()).unwrap_or(400);
+        let kib: usize = std::env::var("VEIL_BUG1072_KIB").ok().and_then(|s| s.parse().ok()).unwrap_or(256);
+        // Distinct short lines: one table entry per line.
+        let blob = |tag: char| -> (ObjectId, Vec<u8>, u64) {
+            let mut s = String::new();
+            let mut i = 0u64;
+            while s.len() + 8 < kib << 10 {
+                s.push_str(&format!("{tag}{i:06}\n"));
+                i += 1;
+            }
+            let raw = Object::Blob(s.clone().into_bytes()).encode();
+            (ObjectId::hash(&raw), raw, s.len() as u64)
+        };
+        let (ida, rawa, sa) = blob('a');
+        let (idb, rawb, sb) = blob('b');
+        let mut oa = vec![(ida, rawa)];
+        let ta = folder_of_copies("a", n, ida, sa, &mut oa);
+        let mut ob = vec![(idb, rawb)];
+        let tb = folder_of_copies("b", n, idb, sb, &mut ob);
+        let x = commit_tree(&th, &mut h, &[root_snapshot_id()], ta, oa, 1, 1_000);
+        let y = commit_tree(&th, &mut h, &[x], tb, ob, 2, 2_000);
+        h.set_branch(&th, "main", y);
+        let a = ask(&th, &h, &Viewer::default());
+        warm_up(&th, &h, &Viewer::default());
+        let limits = Limits {
+            deadline: Duration::from_millis(500),
+            ..Limits::default()
+        };
+        let p = DiffParams { from: x.hex(), to: Some(y.hex()), base: Some("from".into()), stat: Some(true), path: None };
+        let t = Instant::now();
+        let (r, grew) = peak_growth(|| th.rt.block_on(query::diff(&h.hub, &a, p, limits)));
+        let took = t.elapsed();
+        let what = match &r {
+            Ok(v) => format!("answered, work {}", v["work"]),
+            Err(Error::Api { code, .. }) => format!("error {code}"),
+            Err(e) => format!("{e:?}"),
+        };
+        println!("BUG-1072: diff of {n} deleted and {n} added files of {kib} KiB, as anyone on Earth: memory rose {} MiB, took {took:?} with a deadline of {:?} ({what})", grew >> 20, limits.deadline);
+        assert!(
+            grew < 256 << 20 && took < limits.deadline + Duration::from_secs(3),
+            "one diff: memory rose {} MiB, and it took {took:?} with a deadline of {:?}",
+            grew >> 20,
+            limits.deadline
+        );
+    }
+
+    /// BUG-1073: every first fill holds a pooled database connection for its
+    /// whole run (`graph::locked_fill`, for the session advisory lock), and
+    /// the fill's own statements need others from the same pool. Fills run
+    /// one per (project, view key), with no limit on how many at once, and a
+    /// query starts one whenever the viewer's graph is cold: after S13 is
+    /// deployed on existing projects (every graph is), after a policy or
+    /// group change, or for a key no landing warmed. As many cold fills as
+    /// the pool has connections (16 here, 32 by default) hold every
+    /// connection while their statements wait for one: every request on
+    /// the server, in every project, waits for the pool's 30 s timeout and
+    /// fails, and so do the fills. Anyone on Earth starts them by asking
+    /// for the logs of that many public projects at once.
+    #[test]
+    #[ignore = "BUG-1073: concurrent first fills hold every pooled connection and stall the whole server"]
+    fn bug_1073_cold_fills_exhaust_the_connection_pool() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let k: usize = std::env::var("VEIL_BUG1073_PROJECTS").ok().and_then(|s| s.parse().ok()).unwrap_or(24);
+        let mut hs = Vec::new();
+        for i in 0..k {
+            let mut h = Hist::new(&th, &policy_text, &bindings);
+            random_history(&th, &mut h, &mut Rng::new(500 + i as u64), 12);
+            hs.push(h);
+        }
+        let asks: Vec<Ask> = hs.iter().map(|h| ask(&th, h, &Viewer::default())).collect();
+        let hub = th.hub();
+        let limits = Limits {
+            deadline: Duration::from_secs(90),
+            ..Limits::default()
+        };
+        let t = Instant::now();
+        let (codes, probe) = th.rt.block_on(async {
+            let mut set = tokio::task::JoinSet::new();
+            for a in asks {
+                let hub = hub.clone();
+                set.spawn(async move {
+                    match query::log(&hub, &a, LogParams::default(), limits).await {
+                        Ok(_) => "ok".to_string(),
+                        Err(Error::Api { code, .. }) => code.to_string(),
+                        Err(e) => format!("{e:?}").chars().take(120).collect(),
+                    }
+                });
+            }
+            // Meanwhile, an unrelated request's statement.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let p = Instant::now();
+            let one: Result<i32, sqlx::Error> = sqlx::query_scalar("SELECT 1").fetch_one(&hub.db).await;
+            let probe = (one.is_ok(), p.elapsed());
+            let mut out = Vec::new();
+            while let Some(r) = set.join_next().await {
+                out.push(r.unwrap());
+            }
+            (out, probe)
+        });
+        let took = t.elapsed();
+        println!("BUG-1073: {k} cold fills at once on a pool of 16: took {took:?}; an unrelated statement meanwhile: {probe:?}; answers {codes:?}");
+        assert!(
+            codes.iter().all(|c| c == "ok") && probe.0 && probe.1 < Duration::from_secs(5) && took < Duration::from_secs(25),
+            "{k} cold fills: took {took:?}, unrelated statement {probe:?}, answers {codes:?}"
+        );
+    }
+}
