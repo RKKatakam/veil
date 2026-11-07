@@ -8,6 +8,7 @@
 //! | [`perm`] | the permission model: admins, groups, the accepted policy |
 //! | [`sync`] | projected history, fetch by id, push validation, branch CAS |
 //! | [`changes`] | commits through the API: edits on a revision, the push's checks, one commit |
+//! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
 //! | [`store`] | object storage: local directory or S3 |
 //! | [`tls`] | TLS configuration |
@@ -16,6 +17,7 @@ pub mod api;
 pub mod auth;
 pub mod changes;
 pub mod db;
+pub mod derive;
 pub mod error;
 pub mod perm;
 pub mod store;
@@ -43,6 +45,8 @@ pub struct Hub {
     /// The TLS certificate (leaf, DER): sign-in accepts only signatures
     /// for a server name it is valid for.
     pub certificate: rustls::pki_types::CertificateDer<'static>,
+    /// The derive workers (`derive::landed`).
+    pub derive: derive::Workers,
 }
 
 pub type HubState = Arc<Hub>;
@@ -70,6 +74,10 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub session_ttl: Duration,
     pub db_connections: u32,
+    /// Derive, in the background once serving, every branch a landing left
+    /// underived (`derive::resume`). Servers do; tests that count
+    /// their own derive runs turn it off.
+    pub catch_up_at_start: bool,
 }
 
 /// A running server.
@@ -144,12 +152,16 @@ pub async fn start(config: Config) -> Result<Running> {
         receipt_key,
         session_ttl_ms: config.session_ttl.as_millis() as i64,
         certificate,
+        derive: derive::Workers::default(),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
     let (tx, rx) = tokio::sync::watch::channel(false);
     let app = api::router(hub.clone());
     let task = tokio::spawn(serve_tls(listener, tls, app, rx));
+    if config.catch_up_at_start {
+        tokio::spawn(derive::resume(hub.clone(), None));
+    }
     Ok(Running {
         addr,
         cert_pem,

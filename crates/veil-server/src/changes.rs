@@ -706,6 +706,11 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: 
         None => None,
         Some(o) => {
             let landed = moved == Some(true);
+            if landed {
+                // Derived history data for the branch, in the background,
+                // as after a push (S12).
+                crate::derive::landed(hub, project.id, vec![o.branch.clone()]);
+            }
             if moved == Some(false) {
                 rejected = Some("the branch moved during the request".into());
             }
