@@ -169,14 +169,18 @@ Nothing is recorded when this happens. Your options:
   by `vl undo --op`, `vl tag set -r`, `vl new` or `vl restore --from` is
   withheld too, and so is everything built on any of them. A rewrite never
   makes the fix line forget a change: dropping the fix from the merge's
-  parents keeps it withheld. Until the release, a command after which a
-  version the embargo withheld is still there but no longer withheld is
-  refused ("release the embargo first, or abandon what is built on the
-  merge too"): `vl abandon` of the merge, or `vl squash` of it into the
-  change on top of it or into the fix, while a change built on it survives;
-  `vl rebase` of the merge onto other parents (the fix first, the fix
-  alone, or without the fix). A concurrent operation that does it (another
-  workspace) is dropped when the operations merge.
+  parents keeps it withheld. Until the release, a command is refused
+  ("release the embargo first, or abandon what is built on the merge too")
+  when, afterwards, a version the embargo withheld is still there but no
+  longer withheld, or when it rewrote something the embargo withheld (the
+  fix, the merge, or work built on them) into something no longer
+  withheld. So `vl abandon` of the merge, or `vl squash` of it into the
+  change on top of it or into the fix, is refused while a change built on
+  it survives, even when that change is all that holds the fix (after `vl
+  squash -r fix --into` it); so is `vl rebase` of the merge onto other
+  parents (the fix first, the fix alone, or without the fix). A
+  concurrent operation that does it (another workspace) is dropped when
+  the operations merge.
   Inside the embargo they all work: restore from the fix into a change on
   the fix line, squash work on the fix into it, rebase or split the fix
   itself (the embargoed merge follows). `vl cat -r` reads it and changes

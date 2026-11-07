@@ -3502,15 +3502,19 @@ The lists below describe what today's client protects, and what not.
   its snapshot id, and so is everything that descends from one. Queries
   walk the graph index from the snapshots asked about down to the first
   parents, never the whole history. Every transaction that changes the
-  visible embargoed merges keeps one invariant
+  visible embargoed merges, or rewrites anything, keeps two invariants
   (`Transaction::check_withheld`): a version of a withheld change still
   visible afterwards is still withheld, unless the embargo was released or
-  withdrawn. A squash or abandon of the merge while a change built on it
-  survives, a squash of it into the fix, or a rebase of it onto other
-  parents is refused; a merge of concurrent operations drops such a rewrite
-  (BUG-942, 943, 990, 1015, 1016). An embargo is *withdrawn* when no
-  visible snapshot carries it any more and nothing it withheld was replaced
-  (the merge undone, or abandoned bare): nothing protects the fix line any
+  withdrawn; and every withheld snapshot the transaction rewrote (not
+  abandoned) has visible successors that are still withheld, unless the
+  embargo was released (BUG-1040: work withheld only because it descends
+  from the merge, holding the fix after `vl squash -r fix --into` it). A
+  squash or abandon of the merge while a change built on it survives, a
+  squash of it into the fix, or a rebase of it onto other parents is
+  refused; a merge of concurrent operations drops such a rewrite (BUG-942,
+  943, 990, 1015, 1016, 1040). An embargo is *withdrawn* when no visible
+  snapshot carries it any more and the transaction rewrote nothing it
+  withheld, only dropped it (the merge undone, or abandoned bare): nothing protects the fix line any
   more, `vl embargo list` says `withdrawn`, and the next push that
   publishes it warns (BUG-1017). `vl blame --public` refuses a revision a
   push withholds (BUG-991).

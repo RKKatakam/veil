@@ -888,7 +888,12 @@ impl Repo {
         let revert = self.parent_view(&op)?;
         let link = OpLink::UndoOf(command);
         let target = Restore::Revert { base: op.view.clone(), revert };
-        let id = self.restore_view_keeping_edits(ws, target, &op.view, format!("undo: {}", op.description), link)?;
+        // The edits to keep are those recorded since the last command, as
+        // for `vl op restore`: not the difference since the undone
+        // operation, which holds another change's whole content once the
+        // working copy moved to it (`vl edit`, `vl new`; BUG-1041).
+        let before_edits = self.ops.get(&self.last_command_op(ws)?)?.view;
+        let id = self.restore_view_keeping_edits(ws, target, &before_edits, format!("undo: {}", op.description), link)?;
         self.finish_undo_release(release)?;
         Ok((id, op.description))
     }
@@ -923,7 +928,9 @@ impl Repo {
             base: undo_op.view.clone(),
             revert,
         };
-        let id = self.restore_view_keeping_edits(ws, target, &undo_op.view, format!("redo: {}", op.description), OpLink::RedoOf(undo))?;
+        // Edits since the last command only (see the undo above, BUG-1041).
+        let before_edits = self.ops.get(&self.last_command_op(ws)?)?.view;
+        let id = self.restore_view_keeping_edits(ws, target, &before_edits, format!("redo: {}", op.description), OpLink::RedoOf(undo))?;
         Ok((id, op.description))
     }
 
@@ -1101,8 +1108,8 @@ impl Repo {
 
     /// Install `target` (inside the transaction, from its base view, so an
     /// operation that landed meanwhile is never reverted by accident), then
-    /// carry the edits of each workspace recorded since `before_edits` (its
-    /// working copy there vs. now) over to the working copy the result
+    /// carry the edits of each workspace recorded since `before_edits` (the
+    /// view of the last command: its working copy there vs. now) over to the working copy the result
     /// gives it. `ws`, the attached workspace, comes first; the others
     /// matter once undo walks back past a switch, whose new workspace may
     /// have recorded edits in the range it skips.
