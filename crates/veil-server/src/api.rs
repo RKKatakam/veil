@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::header,
+    http::{header, HeaderMap},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -13,6 +13,7 @@ use axum::{
 use serde::Deserialize;
 use sqlx::PgConnection;
 use veil_core::{
+    hub::encoding,
     hub::wire::{
         join_valid, vouch_valid, AccessInfo, Devices, FetchRequest, GroupChange, GroupInfo, HistoryRequest, InviteRequest, Join, JoinRequest,
         Joined, PendingDevice, PushRequest, PushResult, RemoveDevice, Tips, Vouch, VouchRequest, MAX_WANTS,
@@ -57,13 +58,21 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/groups/{g}/managers", post(add_managers))
         .route("/v1/projects/{p}/rings", get(get_rings))
         .route("/v1/projects/{p}/rings/{scope}", post(post_ring).get(get_ring))
+        .route("/v1/projects/{p}/shares", get(crate::shares::list).post(crate::shares::put))
+        .route("/v1/projects/{p}/shares/remove", post(crate::shares::remove))
+        .route("/v1/objects/{p}/{id}", get(crate::grant::get_object))
+        .route("/v1/objects/{target}", post(crate::grant::batch))
+        .route("/v1/epochs", get(crate::grant::epochs))
+        // The query API (S13).
+        .route("/v1/projects/{p}/q/log", get(crate::query::log_route))
+        .route("/v1/projects/{p}/q/show", get(crate::query::show_route))
+        .route("/v1/projects/{p}/q/tree", get(crate::query::tree_route))
+        .route("/v1/projects/{p}/q/file", get(crate::query::file_route))
+        .route("/v1/projects/{p}/q/diff", get(crate::query::diff_route))
+        .route("/v1/projects/{p}/q/ancestry", post(crate::query::ancestry_route))
         .layer(DefaultBodyLimit::max(crate::db::body_limit("")))
         .layer(axum::middleware::from_fn(crate::db::retry_requests))
         .with_state(hub)
-}
-
-fn frames(body: Vec<u8>) -> Response {
-    ([(header::CONTENT_TYPE, "application/octet-stream")], body).into_response()
 }
 
 async fn devices(State(hub): State<HubState>, caller: Caller, Path(name): Path<String>) -> Result<Json<Devices>> {
@@ -543,9 +552,14 @@ async fn create_project(State(hub): State<HubState>, caller: Caller, Path(name):
 }
 
 async fn tips(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Json<Tips>> {
-    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
+    // The epochs the view was built under (`perm::open_at`): a later access
+    // change voids the grants made with them.
+    let (project, viewer, epochs) = perm::open_at(&hub, &p, &caller).await?;
     let branches = sync::tips(&hub, &project, &viewer).await?.into_iter().collect();
+    let grants = crate::grant::for_tips(&hub, &project, &viewer, &caller, epochs, &branches).await?;
     Ok(Json(Tips {
+        grants,
+        grant_key: Some(hub.grants.key_hex().to_string()),
         branches,
         default_branch: project.default_branch,
         you: caller.person.map(|p| p.name),
@@ -554,27 +568,60 @@ async fn tips(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>
     }))
 }
 
-async fn history(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<HistoryRequest>) -> Result<Response> {
-    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
-    Ok(frames(sync::history(&hub, &project, &viewer, &req.tips, &req.stop).await?))
+/// Does the caller read encoded frames (compressed objects, S27)? A `vl`
+/// from before says nothing and gets plain frames.
+fn reads_encoded(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.split(',').any(|t| t.split(';').next().is_some_and(|t| t.trim().eq_ignore_ascii_case(encoding::FRAMES))))
 }
 
-async fn fetch(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<FetchRequest>) -> Result<Response> {
+/// The content type of an answer of frames.
+fn frames_type(encoded: bool) -> &'static str {
+    if encoded {
+        encoding::FRAMES
+    } else {
+        "application/octet-stream"
+    }
+}
+
+async fn history(
+    State(hub): State<HubState>,
+    caller: Caller,
+    Path(p): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<HistoryRequest>,
+) -> Result<Response> {
+    let encoded = reads_encoded(&headers);
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
+    let body = sync::history(&hub, &project, &viewer, &req.tips, &req.stop, encoded).await?;
+    Ok(([(header::CONTENT_TYPE, frames_type(encoded))], body).into_response())
+}
+
+async fn fetch(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, headers: HeaderMap, Json(req): Json<FetchRequest>) -> Result<Response> {
     if req.objects.len() > MAX_WANTS {
         return Err(Error::bad_request(format!("at most {MAX_WANTS} objects per request")));
     }
+    let encoded = reads_encoded(&headers);
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
-    let stream = sync::fetch(&hub, &project, &viewer, req.snapshot, req.objects).await?;
-    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], axum::body::Body::new(stream)).into_response())
+    let stream = sync::fetch(&hub, &project, &viewer, req.snapshot, req.objects, encoded).await?;
+    Ok(([(header::CONTENT_TYPE, frames_type(encoded))], axum::body::Body::new(stream)).into_response())
 }
 
-async fn objects(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, body: Bytes) -> Result<Json<veil_core::hub::wire::Uploaded>> {
+async fn objects(
+    State(hub): State<HubState>,
+    caller: Caller,
+    Path(p): Path<String>,
+    body: Bytes,
+) -> Result<Json<veil_core::hub::wire::Uploaded>> {
     let me = caller.signed_in()?.id;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
-    let receipts = sync::upload(&hub, project.id, me, body).await?;
+    let receipts = sync::upload(&hub, project.id, me, body, crate::db::body_limit("/objects") as u64).await?;
     Ok(Json(veil_core::hub::wire::Uploaded {
         stored: receipts.len(),
         receipts,

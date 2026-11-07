@@ -49,7 +49,8 @@ struct Args {
     /// How long a session lasts, in seconds.
     #[arg(long, default_value_t = 12 * 3600)]
     session_seconds: u64,
-    /// Database connections.
+    /// Database connections for requests (the background deriver opens 8
+    /// more of its own).
     #[arg(long, default_value_t = 32)]
     db_connections: u32,
 }

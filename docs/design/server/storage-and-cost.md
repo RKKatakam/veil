@@ -21,7 +21,7 @@ Each of those is also time on the request path. So every item here makes Veil **
 | Database statements per pull | about 46 | **a handful**, most answered from memory |
 | Landings/s across 100 projects, MinIO | 376 (bound by the object store) | 4,000 (phase 2 gate) |
 | Landings/s into one `main` | about 20 | 100 (phase 2), 1,000 (phase 4, by batching) |
-| Bytes stored and sent | uncompressed | compressed (zstd) |
+| Bytes stored and sent | uncompressed | compressed (zstd): **built in S27** (`HUB.md` §13.15) |
 | Server memory, 1 GB project | push 2.4 GB, clone 2.9 GB peak (BUG-864: allocator arenas; fixed with jemalloc, 2026-11-07: push 0.98 GB, clone 1.58 GB, BUG-1000) | under 1 GB |
 
 ## 3. One database commit per push (S4)
@@ -62,6 +62,8 @@ In each API server's memory, never in the database:
 - A pull may see a tip up to 100 ms old, which `phase-2-thin-clients.md` §5.1 already allows.
 
 ## 6. Compressed objects (S27)
+
+> **Built** (2026-11-07): `docs/HUB.md` §13.15 has the design as built, its threat review and the measurements.
 
 - Objects are compressed with **zstd** (level 3) when stored and when sent. A server or cache may also keep them compressed in memory.
 - **Object ids stay the hash of the uncompressed bytes,** so content addressing, deduplication and every signature are unchanged. Compression is a storage and transport encoding, recorded per object (one header byte), so old uncompressed objects stay readable.
@@ -121,7 +123,7 @@ Found by the benchmarks of 2026-11-06. Each is a small fix round, not a mileston
 | Commit one file | Still 3–4× slower than Git: the scan of every file. Use the stat cache to skip unchanged files (performance round 3); the daemon's file watcher (S7) removes the scan entirely. | `OPENSCION.md` |
 | Clone one folder | About 60 forced disk writes in sequence. Use one durability barrier, as the full clone already does. | `OPENSCION.md` |
 | Merge base of distant branches | 0.7 s at 20,000 snapshots apart. Memoise merge bases, or use a better walk. | S13 |
-| One busy `main` | About 20 landings/s. Batch landings: **built** (S17, `HUB.md` §13.15; numbers in `LOAD.md`, "The landing service"). | S17 |
+| One busy `main` | About 20 landings/s. Batch landings: **built** (S17, `HUB.md` §13.19; numbers in `LOAD.md`, "The landing service"). | S17 |
 
 ## 11. Open technical questions
 

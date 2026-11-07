@@ -7,12 +7,12 @@
 //! directory (development and unit tests), [`S3Store`] in an S3 bucket
 //! (tested against MinIO).
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{borrow::Cow, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use veil_core::{cache::LruCache, ObjectId};
+use veil_core::{cache::LruCache, hub::encoding, ObjectId};
 
 #[async_trait]
 pub trait BlobStore: Send + Sync {
@@ -22,11 +22,33 @@ pub trait BlobStore: Send + Sync {
     /// same key twice writes the same bytes.
     async fn put(&self, key: &str, data: Bytes) -> Result<()>;
     async fn exists(&self, key: &str) -> Result<bool>;
+    /// The length of the object at `key` without reading it where the
+    /// store can (a file's size, an S3 `HEAD`); `None` if there is none.
+    async fn len(&self, key: &str) -> Result<Option<u64>> {
+        Ok(self.get(key).await?.map(|b| b.len() as u64))
+    }
+    /// Bytes `start..=end` of the object at `key` (`end` clamped to its
+    /// last byte, `u64::MAX` for "to the end"; empty when `start` is past
+    /// it) and the object's length;
+    /// `None` if there is none. Reads only those bytes where the store can
+    /// (a `Range` request of the object routes); this default reads all.
+    async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Option<(Bytes, u64)>> {
+        Ok(self.get(key).await?.map(|b| (slice(&b, start, end), b.len() as u64)))
+    }
     /// A read that needs no async runtime (a local file), for code already
     /// on a blocking thread; `None`: use [`BlobStore::get`].
     fn get_blocking(&self, _key: &str) -> Option<Result<Option<Bytes>>> {
         None
     }
+}
+
+/// Bytes `start..=end` of `b`, clamped.
+pub(crate) fn slice(b: &Bytes, start: u64, end: u64) -> Bytes {
+    let len = b.len() as u64;
+    if start >= len {
+        return Bytes::new();
+    }
+    b.slice(start as usize..=end.min(len - 1) as usize)
 }
 
 /// Object key of `id` in `project`.
@@ -87,6 +109,35 @@ impl BlobStore for FsStore {
         Ok(tokio::fs::try_exists(self.path(key)?).await?)
     }
 
+    async fn len(&self, key: &str) -> Result<Option<u64>> {
+        match tokio::fs::metadata(self.path(key)?).await {
+            Ok(m) => Ok(Some(m.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Option<(Bytes, u64)>> {
+        let path = self.path(key)?;
+        tokio::task::spawn_blocking(move || -> Result<Option<(Bytes, u64)>> {
+            use std::io::{Read, Seek};
+            let mut f = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+            let len = f.metadata()?.len();
+            if start >= len {
+                return Ok(Some((Bytes::new(), len)));
+            }
+            f.seek(std::io::SeekFrom::Start(start))?;
+            let mut buf = vec![0; (end.min(len - 1) - start + 1) as usize];
+            f.read_exact(&mut buf)?;
+            Ok(Some((Bytes::from(buf), len)))
+        })
+        .await?
+    }
+
     fn get_blocking(&self, key: &str) -> Option<Result<Option<Bytes>>> {
         Some((|| match std::fs::read(self.path(key)?) {
             Ok(b) => Ok(Some(Bytes::from(b))),
@@ -115,29 +166,34 @@ const S3_FIRST_WAIT: Duration = Duration::from_millis(25);
 const S3_MOST_WAIT: Duration = Duration::from_secs(1);
 
 /// Send an S3 request (`make` builds it afresh for each try) and read its
-/// answer, again while the answer is a server error (5xx), "too many
-/// requests" (429), or the request
-/// fails, for at most [`S3_RETRY_FOR`] (BUG-861). A connection the store
-/// closed, reset or timed out, before or during the answer, and the
-/// store's own transient errors (500, 503 "slow down"), are tried again:
+/// answer, again while the answer is a server error (5xx) or 429, or the
+/// request fails, for at most [`S3_RETRY_FOR`] (BUG-861). A connection the
+/// store closed, reset or timed out, before or during the answer, and the
+/// store's own transient errors (500, 503 "slow down", 429 "too many
+/// requests": MinIO under load, BUG-1005), are tried again:
 /// every request the store sends is idempotent (GET, HEAD, and PUT of a
 /// key that names its content).
 async fn s3_send(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, Bytes)> {
+    s3_send_with_headers(make).await.map(|(status, _, body)| (status, body))
+}
+
+/// [`s3_send`], with the answer's headers.
+async fn s3_send_with_headers(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, reqwest::header::HeaderMap, Bytes)> {
     let deadline = tokio::time::Instant::now() + S3_RETRY_FOR;
     let mut wait = S3_FIRST_WAIT;
     for tries in 1.. {
         let answer = match make().send().await {
             Ok(resp) => {
-                let status = resp.status();
-                resp.bytes().await.map(|body| (status, body))
+                let (status, headers) = (resp.status(), resp.headers().clone());
+                resp.bytes().await.map(|body| (status, headers, body))
             }
             Err(e) => Err(e),
         };
         let jitter = Duration::from_millis(u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1));
         let last = tokio::time::Instant::now() + wait + jitter >= deadline;
         match answer {
-            // 429: the store asks for fewer requests (BUG-1053).
-            Ok((status, body)) if !(status.is_server_error() || status.as_u16() == 429) || last => return Ok((status.as_u16(), body)),
+            // 429: the store asks for fewer requests (BUG-1005, BUG-1053).
+            Ok((status, headers, body)) if !(status.is_server_error() || status.as_u16() == 429) || last => return Ok((status.as_u16(), headers, body)),
             Err(e) if last || e.is_builder() => return Err(anyhow::Error::new(e).context(format!("S3 request failed {tries} times"))),
             _ => {}
         }
@@ -186,6 +242,30 @@ impl BlobStore for S3Store {
         }
     }
 
+    async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Option<(Bytes, u64)>> {
+        use rusty_s3::S3Action;
+        let url = self.bucket.get_object(Some(&self.credentials), key).sign(S3_SIGN_FOR);
+        // An open range is sent open: a store that does not parse a huge
+        // end ignores the range and sends the whole object (BUG-1086).
+        let range = if end == u64::MAX { format!("bytes={start}-") } else { format!("bytes={start}-{end}") };
+        let (status, headers, body) = s3_send_with_headers(|| self.http.get(url.clone()).header("range", &range)).await?;
+        // `Content-Range: bytes a-b/len` (206).
+        let len = || -> Result<u64> {
+            let v = headers.get("content-range").and_then(|v| v.to_str().ok()).unwrap_or_default();
+            v.rsplit_once('/').and_then(|(_, l)| l.parse().ok()).ok_or_else(|| anyhow!("S3 GET with a range: no length in {v:?}"))
+        };
+        match status {
+            206 => Ok(Some((body, len()?))),
+            // Past the end. MinIO's 416 names no length (BUG-1086): a HEAD
+            // gives it.
+            416 => Ok(self.len(key).await?.map(|l| (Bytes::new(), l))),
+            // A store that ignores the range sends the whole object.
+            200 => Ok(Some((slice(&body, start, end), body.len() as u64))),
+            404 => Ok(None),
+            s => bail!("S3 GET with a range: HTTP {s}"),
+        }
+    }
+
     async fn put(&self, key: &str, data: Bytes) -> Result<()> {
         use rusty_s3::S3Action;
         let url = self.bucket.put_object(Some(&self.credentials), key).sign(S3_SIGN_FOR);
@@ -205,18 +285,86 @@ impl BlobStore for S3Store {
             s => bail!("S3 HEAD: HTTP {s}"),
         }
     }
+
+    async fn len(&self, key: &str) -> Result<Option<u64>> {
+        use rusty_s3::S3Action;
+        let url = self.bucket.head_object(Some(&self.credentials), key).sign(S3_SIGN_FOR);
+        let (status, headers, _) = s3_send_with_headers(|| self.http.head(url.clone())).await?;
+        match status {
+            200 => {
+                let v = headers.get("content-length").and_then(|v| v.to_str().ok()).unwrap_or_default();
+                Ok(Some(v.parse().map_err(|_| anyhow!("S3 HEAD: no length in {v:?}"))?))
+            }
+            404 => Ok(None),
+            s => bail!("S3 HEAD: HTTP {s}"),
+        }
+    }
+}
+
+/// Decoded bytes the server holds at once, across every request: those an
+/// upload decodes (S27, BUG-1009), those the object routes and `fetch`
+/// have read and not sent yet (BUG-1087), and those a `Range` decodes. Each
+/// takes its share before it reads or decodes, and gives it back when it is
+/// done; an object larger than this takes all of it.
+pub const DECODED_IN_FLIGHT: u32 = 256 << 20;
+pub(crate) static DECODED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(DECODED_IN_FLIGHT as usize);
+
+/// How much more than the size its entry records an object may hold: the
+/// blob's header, or a sealed envelope's nonce, tag and label. A push whose
+/// entry records less is refused (`sync::check_changes`), so a recorded
+/// size bounds what reading its object holds.
+pub const SIZE_SLACK: u64 = 4096;
+
+/// A share of [`DECODED_IN_FLIGHT`] taken by one read or decoding.
+pub struct ReadAhead(#[allow(dead_code)] tokio::sync::SemaphorePermit<'static>);
+
+fn permits(cost: u64) -> u32 {
+    cost.min(u64::from(DECODED_IN_FLIGHT)) as u32
+}
+
+impl ReadAhead {
+    /// Wait for `cost` bytes: only for a request that holds none, so
+    /// requests never wait on one another in a cycle.
+    pub async fn wait(cost: u64) -> ReadAhead {
+        ReadAhead(DECODED.acquire_many(permits(cost)).await.expect("never closed"))
+    }
+
+    /// `cost` bytes if they are free now.
+    pub fn try_take(cost: u64) -> Option<ReadAhead> {
+        DECODED.try_acquire_many(permits(cost)).ok().map(ReadAhead)
+    }
 }
 
 /// The objects of every project, through an in-memory cache of recently
 /// read objects (objects are immutable, so the cache never goes stale).
+///
+/// Objects are stored, cached and sent in their encoding
+/// ([`veil_core::hub::encoding`], S27): compressed with zstd when that is
+/// smaller, under the same key (the id of the uncompressed object). Old
+/// objects, stored as they are, stay readable. Every object read from the
+/// store is decoded (bounded by the object size limit) and checked against
+/// its id before it is cached or served.
 pub struct Objects {
     store: Arc<dyn BlobStore>,
+    /// Encodings, checked against their ids.
     cache: LruCache<Bytes>,
     /// Requests to the store, for the benchmarks' cost gates
     /// (`storage-and-cost.md` §9): writes, bytes written, reads.
     pub writes: std::sync::atomic::AtomicU64,
     pub written_bytes: std::sync::atomic::AtomicU64,
     pub reads: std::sync::atomic::AtomicU64,
+}
+
+/// The largest object the store holds, decoded: the largest a frame
+/// carries.
+const MAX_OBJECT: u64 = veil_core::hub::wire::MAX_FRAME_OBJECT as u64;
+
+/// The object `id` decoded from its encoding `enc`, checked.
+fn decoded(id: &ObjectId, enc: &Bytes) -> Result<Bytes> {
+    match encoding::decode(id, enc, MAX_OBJECT).map_err(|_| anyhow!("stored object {} does not match its id", id.short()))? {
+        Cow::Borrowed(_) => Ok(enc.clone()),
+        Cow::Owned(raw) => Ok(Bytes::from(raw)),
+    }
 }
 
 impl Objects {
@@ -246,48 +394,122 @@ impl Objects {
         ObjectId(*h.finalize().as_bytes())
     }
 
-    /// The raw object `id` of `project`, checked against its id.
+    /// The object `id` of `project` (its canonical encoding), checked
+    /// against its id.
     pub async fn get(&self, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
+        match self.cache.get(&Self::cache_key(project, id)) {
+            Some(enc) => decoded(id, &enc).map(Some),
+            None => {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.load(project, id, self.store.get(&object_key(project, id)).await?)
+            }
+        }
+    }
+
+    /// The encoding of object `id` of `project`, as stored (and sent to a
+    /// client that reads encoded frames), checked against its id.
+    pub async fn get_encoded(&self, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
         let ck = Self::cache_key(project, id);
-        if let Some(b) = self.cache.get(&ck) {
-            return Ok(Some(b));
+        if let Some(enc) = self.cache.get(&ck) {
+            return Ok(Some(enc));
         }
         self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let Some(b) = self.store.get(&object_key(project, id)).await? else {
+        let Some(enc) = self.store.get(&object_key(project, id)).await? else {
             return Ok(None);
         };
-        if ObjectId::hash(&b) != *id {
-            bail!("stored object {} does not match its id", id.short());
-        }
-        self.cache.insert(ck, b.clone(), b.len());
-        Ok(Some(b))
+        decoded(id, &enc)?;
+        self.cache.insert(ck, enc.clone(), enc.len());
+        Ok(Some(enc))
+    }
+
+    /// Check and cache the encoding the store answered; the object decoded.
+    fn load(&self, project: i64, id: &ObjectId, enc: Option<Bytes>) -> Result<Option<Bytes>> {
+        let Some(enc) = enc else { return Ok(None) };
+        let raw = decoded(id, &enc)?;
+        self.cache.insert(Self::cache_key(project, id), enc.clone(), enc.len());
+        Ok(Some(raw))
     }
 
     /// [`Objects::get`] from a blocking thread: a local store is read
     /// directly; any other through `rt`.
     pub fn get_blocking(&self, rt: &tokio::runtime::Handle, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
-        let ck = Self::cache_key(project, id);
-        if let Some(b) = self.cache.get(&ck) {
-            return Ok(Some(b));
+        if let Some(enc) = self.cache.get(&Self::cache_key(project, id)) {
+            return decoded(id, &enc).map(Some);
         }
         let Some(r) = self.store.get_blocking(&object_key(project, id)) else {
             return rt.block_on(self.get(project, id));
         };
         self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let Some(b) = r? else { return Ok(None) };
-        if ObjectId::hash(&b) != *id {
-            bail!("stored object {} does not match its id", id.short());
-        }
-        self.cache.insert(ck, b.clone(), b.len());
-        Ok(Some(b))
+        self.load(project, id, r?)
     }
 
+    /// Store object `id` (its canonical encoding `raw`), compressed when
+    /// that is smaller.
     pub async fn put(&self, project: i64, id: &ObjectId, raw: Bytes) -> Result<()> {
+        let enc = match encoding::encode(&raw) {
+            Cow::Borrowed(_) => raw,
+            Cow::Owned(z) => Bytes::from(z),
+        };
+        self.put_encoded(project, id, enc).await
+    }
+
+    /// Store `enc`, an encoding of object `id` the caller has checked.
+    pub async fn put_encoded(&self, project: i64, id: &ObjectId, enc: Bytes) -> Result<()> {
         self.writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.written_bytes.fetch_add(raw.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        self.store.put(&object_key(project, id), raw.clone()).await?;
-        self.cache.insert(Self::cache_key(project, id), raw.clone(), raw.len());
+        self.written_bytes.fetch_add(enc.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.store.put(&object_key(project, id), enc.clone()).await?;
+        self.cache.insert(Self::cache_key(project, id), enc.clone(), enc.len());
         Ok(())
+    }
+
+    /// Bytes `start..=end` of object `id` of `project` (its canonical
+    /// encoding, never of what is stored) and its length, `end` clamped
+    /// (`u64::MAX`: to the end). An object stored as it is (S27's plain
+    /// encoding) is read for those bytes only. A compressed one is decoded
+    /// whole, as every read is (checked against its id, its decoded bytes
+    /// counted in [`DECODED_IN_FLIGHT`] while held), then sliced. A part of
+    /// a plain object cannot be checked against the id: the client checks
+    /// the object it puts together.
+    pub async fn get_range(&self, project: i64, id: &ObjectId, start: u64, end: u64) -> Result<Option<(Bytes, u64)>> {
+        let key = object_key(project, id);
+        let cached = self.cache.get(&Self::cache_key(project, id));
+        let plain = match &cached {
+            Some(enc) => !encoding::is_compressed(enc),
+            None => {
+                let Some((head, _)) = self.store.get_range(&key, 0, encoding::HEADER as u64 - 1).await? else { return Ok(None) };
+                !encoding::is_compressed(&head)
+            }
+        };
+        if plain {
+            return match cached {
+                Some(enc) => Ok(Some((slice(&enc, start, end), enc.len() as u64))),
+                None => self.store.get_range(&key, start, end).await,
+            };
+        }
+        let cost = self.read_cost(project, id, 0).await?;
+        let _held = ReadAhead::wait(cost).await;
+        Ok(self.get(project, id).await?.map(|raw| (slice(&raw, start, end), raw.len() as u64)))
+    }
+
+    /// What reading object `id` may hold, decoded: by the size its entry
+    /// records (`recorded`, checked at push against the object:
+    /// [`SIZE_SLACK`]), or, for an entry that records none (a tree, a
+    /// conflict, an empty file), by what its encoding declares (in the
+    /// cache, or its first bytes in the store: S27's frames declare their
+    /// size).
+    pub async fn read_cost(&self, project: i64, id: &ObjectId, recorded: u64) -> Result<u64> {
+        if recorded > 0 {
+            return Ok(recorded.saturating_add(SIZE_SLACK));
+        }
+        let declared = match self.cache.get(&Self::cache_key(project, id)) {
+            Some(enc) => encoding::declared_len(&enc[..enc.len().min(encoding::HEADER)], enc.len() as u64),
+            None => match self.store.get_range(&object_key(project, id), 0, encoding::HEADER as u64 - 1).await? {
+                Some((head, len)) => encoding::declared_len(&head, len),
+                None => Some(0),
+            },
+        };
+        // An encoding that declares nothing is refused when it is read.
+        Ok(declared.unwrap_or(0).min(MAX_OBJECT).saturating_add(SIZE_SLACK))
     }
 
     pub async fn exists(&self, project: i64, id: &ObjectId) -> Result<bool> {
@@ -322,5 +544,101 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"veil:blob\nbad").unwrap();
         assert!(objects.get(3, &id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ranges_read_only_the_bytes_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = Bytes::from_static(b"veil:blob\n0123456789");
+        let id = ObjectId::hash(&raw);
+        let fs = FsStore::new(dir.path());
+        fs.put(&object_key(1, &id), raw.clone()).await.unwrap();
+        // A store with only the default (reads the whole object).
+        struct Whole(FsStore);
+        #[async_trait]
+        impl BlobStore for Whole {
+            async fn get(&self, key: &str) -> Result<Option<Bytes>> {
+                self.0.get(key).await
+            }
+            async fn put(&self, key: &str, data: Bytes) -> Result<()> {
+                self.0.put(key, data).await
+            }
+            async fn exists(&self, key: &str) -> Result<bool> {
+                self.0.exists(key).await
+            }
+        }
+        let whole = Whole(FsStore::new(dir.path()));
+        let key = object_key(1, &id);
+        for store in [&fs as &dyn BlobStore, &whole] {
+            let len = raw.len() as u64;
+            assert_eq!(store.get_range(&key, 2, 5).await.unwrap(), Some((raw.slice(2..6), len)));
+            assert_eq!(store.get_range(&key, 3, u64::MAX).await.unwrap(), Some((raw.slice(3..), len)));
+            assert_eq!(store.get_range(&key, len, u64::MAX).await.unwrap(), Some((Bytes::new(), len)));
+            assert_eq!(store.get_range(&object_key(2, &id), 0, 1).await.unwrap(), None);
+        }
+        // Through the cache, or the store: the same part.
+        let objects = Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20);
+        assert_eq!(objects.get_range(1, &id, 0, 3).await.unwrap(), Some((raw.slice(0..4), raw.len() as u64)));
+        objects.get(1, &id).await.unwrap();
+        assert_eq!(objects.get_range(1, &id, 0, 3).await.unwrap(), Some((raw.slice(0..4), raw.len() as u64)));
+    }
+
+    /// S27: objects are stored compressed when that is smaller, under the
+    /// id of the uncompressed object; objects stored before (as they are)
+    /// stay readable; whatever the store answers is checked, bounded,
+    /// against the id.
+    #[tokio::test]
+    async fn objects_are_stored_compressed_and_old_ones_stay_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FsStore::new(dir.path());
+        let objects = Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20);
+        let raw = Bytes::from([&b"veil:blob\n"[..], &b"let x = 1;\n".repeat(500)].concat());
+        let id = ObjectId::hash(&raw);
+        objects.put(1, &id, raw.clone()).await.unwrap();
+        let stored = s.get(&object_key(1, &id)).await.unwrap().unwrap();
+        assert!(encoding::is_compressed(&stored) && stored.len() < raw.len() / 10, "{} bytes stored", stored.len());
+        let fresh = Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20);
+        assert_eq!(fresh.get(1, &id).await.unwrap().unwrap(), raw);
+        assert_eq!(fresh.get_encoded(1, &id).await.unwrap().unwrap(), stored);
+        let rt = tokio::runtime::Handle::current();
+        let fresh2 = Arc::new(Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20));
+        let f = fresh2.clone();
+        let got = tokio::task::spawn_blocking(move || f.get_blocking(&rt, 1, &id)).await.unwrap().unwrap().unwrap();
+        assert_eq!(got, raw);
+        // An object stored before S27, as it is.
+        let old = Bytes::from_static(b"veil:blob\nan object from before compression, stored as it is");
+        let old_id = ObjectId::hash(&old);
+        s.put(&object_key(2, &old_id), old.clone()).await.unwrap();
+        assert_eq!(fresh.get(2, &old_id).await.unwrap().unwrap(), old);
+        assert_eq!(fresh.get_encoded(2, &old_id).await.unwrap().unwrap(), old);
+        // Incompressible content (a secret's ciphertext) is stored as it is.
+        let noise = Bytes::from([&b"veil:sea2\n"[..], &veil_core::crypto::random_bytes::<2048>()].concat());
+        let nid = ObjectId::hash(&noise);
+        objects.put(1, &nid, noise.clone()).await.unwrap();
+        assert_eq!(s.get(&object_key(1, &nid)).await.unwrap().unwrap(), noise);
+        // A store answering another object's frame, an unknown marker, or a
+        // bomb past the object size limit: refused, never served.
+        let other = encoding::encode(b"veil:blob\nsomething else entirely, something else entirely").into_owned();
+        let mut bomb = vec![encoding::ZSTD];
+        bomb.extend(zstd_frame_declaring(MAX_OBJECT + 1));
+        for bad in [other, b"\x01veil:blob\n".to_vec(), bomb] {
+            let bid = ObjectId::hash(b"veil:blob\nwanted");
+            s.put(&object_key(4, &bid), Bytes::from(bad)).await.unwrap();
+            assert!(fresh.get(4, &bid).await.is_err());
+            assert!(fresh.get_encoded(4, &bid).await.is_err());
+            std::fs::remove_file(dir.path().join(object_key(4, &bid))).unwrap();
+        }
+    }
+
+    /// The header of a zstd frame declaring `size` bytes of content (and
+    /// one empty raw block): enough for a decoder to refuse it from its
+    /// header.
+    fn zstd_frame_declaring(size: u64) -> Vec<u8> {
+        // Magic, descriptor (8-byte content size, single segment off),
+        // window descriptor, the size, then a last raw block of 0 bytes.
+        let mut f = vec![0x28, 0xb5, 0x2f, 0xfd, 0b1100_0000, 0x50];
+        f.extend_from_slice(&size.to_le_bytes());
+        f.extend_from_slice(&[0x01, 0x00, 0x00]);
+        f
     }
 }

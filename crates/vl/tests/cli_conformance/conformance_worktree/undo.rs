@@ -204,7 +204,9 @@ fn op_restore_returns_to_an_earlier_state_keeping_edits() {
     assert_eq!(r.change("t1"), one);
     assert_eq!(r.read("a.txt"), "1\n");
     assert_eq!(r.read("wip.txt"), "wip\n");
-    assert!(!r.out(&["log"]).contains("two"));
+    // Description lines only: a random change id can contain "two" (BUG-1127).
+    let log = r.out(&["log"]);
+    assert!(!log.lines().any(|l| l.trim_start_matches(['│', ' ']).trim_end() == "two"), "{log}");
 }
 
 // Scenario from jj test_op_restore_command.rs: op restore is itself an
@@ -215,7 +217,8 @@ fn op_restore_is_undoable() {
     let (r, _, two) = two_commits(&env);
     let init = r.out(&["op", "log"]).lines().last().unwrap().split_whitespace().next().unwrap().to_string();
     r.ok(&["op", "restore", init.as_str()]);
-    assert!(!r.out(&["log"]).contains("two"));
+    let log = r.out(&["log"]);
+    assert!(!log.lines().any(|l| l.trim_start_matches(['│', ' ']).trim_end() == "two"), "{log}");
     r.ok(&["undo"]);
     assert_eq!(r.change("@-"), two);
 }

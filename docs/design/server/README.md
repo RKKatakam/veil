@@ -31,14 +31,14 @@ S1 is built. **S2** (secrets at scale: keys per access rule, background wrapping
 |---|---|---|---|
 | S3 | 2 | Fetch on demand in the client (thin clones, bounded cache, no full graph) | S1, simplification pass |
 | S4 | 2 | **Built** (`HUB.md` §13.14). Request-path caches (permissions, sessions, snapshot resolution, tips invalidated without a hot row), **one database commit per push**, and the cost gates in `veil-bench load` (`storage-and-cost.md` §3–5, §9) | S1 |
-| S5 | 2 | Read grants, the object routes, access epochs | S1 |
+| S5 | 2 | Read grants, the object routes, access epochs (built: `HUB.md` §13.16) | S1 |
 | S6 | 2 | The Veil daemon: shared object cache | S3, S5 |
 | S7 | 2 | The daemon's file watcher (`status`/`commit` without a scan) | S6 |
 | S8 | 2 | Workspaces that fetch on first read; the workspace socket for sandboxes | S3; phase 1's isolated sandboxes (S6 for the warm numbers) |
 | S9 | 2 | Regional cache | S5 |
 | S10 | 2 | Commits through the API (with the server-side secret scan): **built** (`HUB.md` §13.13) | S1 |
 | S11 | 2 | Agent sessions and attribution | S10, S8 |
-| S27 | 2 | Compressed objects (zstd) in storage and transport (`storage-and-cost.md` §6) | S1 |
+| S27 | 2 | Compressed objects (zstd) in storage and transport (`storage-and-cost.md` §6). **Built** (`HUB.md` §13.15) | S1 |
 | S28 | 2 | Packs: one storage write per push for small objects, index, range reads (`storage-and-cost.md` §7) | S5, S27 |
 | S29 | 2 | Merging packs and pack garbage collection (`storage-and-cost.md` §8) | S28 |
 | G2 | 2 | Phase 2 gate run | S3–S11, S27–S29 |

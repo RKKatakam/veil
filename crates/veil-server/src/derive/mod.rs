@@ -32,8 +32,17 @@
 //! (`ON CONFLICT DO NOTHING`), and nothing marked derived without its
 //! values. Every statement is retried on a retryable database error.
 //!
-//! **No query API yet** (S13). [`read`] and [`view`] are the internal reads
-//! S13 will serve answers from.
+//! **Bounded (BUG-911).** At most [`DERIVERS`] runs derive at once in a
+//! server process, on the deriver's own pool ([`Workers::db`], two
+//! connections per run: the lock's and one statement's): however many
+//! projects land, background derivation never takes a connection that
+//! requests need, and runs waiting their turn (or for another server's
+//! lock) hold nothing. The derived data lags instead, and catches up.
+//!
+//! **The query API** (S13, `crate::query`) does not read these: it answers
+//! from each viewer's own graph (`query::graph`), which [`memo_tips`]
+//! extends with the projections. [`read`] and [`view`] stay the internal
+//! reads of blame, file history and search (S14, S15).
 
 pub mod changes;
 pub mod graph;
@@ -41,6 +50,7 @@ pub mod lines;
 pub mod view;
 
 use std::{
+    cell::Cell,
     collections::{BTreeSet, HashMap, HashSet},
     future::Future,
     sync::{Arc, Mutex},
@@ -48,6 +58,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use sqlx::PgPool;
 use veil_core::{cache::LruCache, hub::access::AccessPolicy, hub::project::Change, ObjectId};
 
 use self::{
@@ -78,25 +89,41 @@ const LOCK_WAIT: Duration = Duration::from_secs(60);
 const STATEMENT_DEADLINE: Duration = Duration::from_secs(120);
 /// The advisory lock of project `p` is `LOCK_BASE ^ p`.
 const LOCK_BASE: i64 = 0x7665_696c_6472_0000; // "veildr"
+/// Most runs deriving at once in one server process (BUG-911); the others
+/// wait their turn, holding no connection.
+pub const DERIVERS: usize = 4;
+/// Connections of the deriver's own pool: each run holds the project
+/// lock's and at most one statement's at a time.
+pub const DERIVE_CONNECTIONS: u32 = 2 * DERIVERS as u32;
 
 /// The derive workers' state in one server process.
 pub struct Workers {
+    /// The deriver's own pool ([`DERIVE_CONNECTIONS`]), apart from the
+    /// requests' (BUG-911).
+    pub db: PgPool,
+    /// One permit per run deriving or memoising ([`DERIVERS`]).
+    permits: tokio::sync::Semaphore,
     /// Projects being derived here, with the branches landed on meanwhile.
     active: Mutex<HashMap<i64, BTreeSet<String>>>,
     /// Graph rows by `(project, snapshot)` (rows never change).
     rows: LruCache<Arc<GraphRow>>,
 }
 
-impl Default for Workers {
-    fn default() -> Self {
+impl Workers {
+    /// The workers, deriving on `db` (a pool of [`DERIVE_CONNECTIONS`]).
+    pub fn new(db: PgPool) -> Workers {
         Workers {
+            db,
+            permits: tokio::sync::Semaphore::new(DERIVERS),
             active: Mutex::new(HashMap::new()),
             rows: LruCache::new(64 << 20),
         }
     }
-}
 
-impl Workers {
+    async fn permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        self.permits.acquire().await.map_err(|e| Error::Other(e.into()))
+    }
+
     /// Forget the cached graph rows, as a restarted server would (the
     /// tests' crash and resume).
     pub fn clear_cache(&self) {
@@ -110,6 +137,25 @@ fn row_key(project: i64, id: &ObjectId) -> ObjectId {
     h.update(&project.to_le_bytes());
     h.update(&id.0);
     ObjectId(*h.finalize().as_bytes())
+}
+
+thread_local! {
+    /// Set on the thread of a derive run ([`locked`]): its statements go to
+    /// the deriver's pool.
+    static DERIVING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f` as a derive run on this thread ([`DERIVING`]).
+fn deriving<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            DERIVING.set(false);
+        }
+    }
+    DERIVING.set(true);
+    let _reset = Reset;
+    f()
 }
 
 fn bad(e: impl std::fmt::Display) -> Error {
@@ -128,6 +174,16 @@ impl Cx {
 
     pub fn project(&self) -> i64 {
         self.src.project
+    }
+
+    /// The pool of this thread's statements: the deriver's own in a derive
+    /// run, the requests' in a query's read (BUG-911).
+    pub fn pool(&self) -> &PgPool {
+        if DERIVING.get() {
+            &self.hub().derive.db
+        } else {
+            &self.hub().db
+        }
     }
 
     /// Run a statement, again while it fails on a retryable error.
@@ -162,7 +218,7 @@ impl Cx {
             return Ok(Some(r));
         }
         type Row = (i64, i64, String, String, i32, String, Option<String>);
-        let pool = &self.hub().db;
+        let pool = self.pool();
         let hex = id.hex();
         let row: Option<Row> = self.db(|| {
             sqlx::query_as("SELECT generation, depth, parents, change_id, flags, skip, changed FROM graph WHERE project_id = $1 AND snapshot = $2")
@@ -200,7 +256,7 @@ impl Cx {
 
     /// The accepted policy and its lists.
     pub fn lines(&self) -> Result<Lines> {
-        let pool = &self.hub().db;
+        let pool = self.pool();
         let text: String = self.db(|| sqlx::query_scalar("SELECT policy_text FROM projects WHERE id = $1").bind(self.project()).fetch_one(pool))?;
         Ok(Lines::new(&AccessPolicy::parse(&text)))
     }
@@ -268,7 +324,11 @@ pub fn landed(hub: &Arc<Hub>, project: i64, branches: Vec<String>) {
 /// memoise their tips' projections for every view key.
 pub async fn landing(hub: &Arc<Hub>, project: i64, branches: Vec<String>) -> Result<Stats> {
     let stats = catch_up(hub, project, Scope::Branches(branches)).await?;
+    // Memoising runs on the requests' pool, so under a permit too: at most
+    // [`DERIVERS`] of its connections at once (BUG-911).
+    let permit = hub.derive.permit().await?;
     memo_tips(hub, project, &stats.branches).await?;
+    drop(permit);
     Ok(stats)
 }
 
@@ -353,14 +413,19 @@ pub async fn catch_up(hub: &Arc<Hub>, project: i64, scope: Scope) -> Result<Stat
 }
 
 async fn locked(hub: &Arc<Hub>, project: i64, scope: Scope) -> Result<Stats> {
-    let mut c = hub.db.acquire().await?;
     let key = LOCK_BASE ^ project;
     let deadline = tokio::time::Instant::now() + LOCK_WAIT;
-    loop {
+    // A permit, then a connection of the deriver's pool, held only while
+    // the lock is (BUG-911): a run waiting for another server's deriver
+    // gives both back between tries.
+    let (permit, mut c) = loop {
+        let permit = hub.derive.permit().await?;
+        let mut c = hub.derive.db.acquire().await?;
         let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)").bind(key).fetch_one(&mut *c).await?;
         if got {
-            break;
+            break (permit, c);
         }
+        drop((c, permit));
         if tokio::time::Instant::now() >= deadline {
             return Ok(Stats {
                 skipped: true,
@@ -368,15 +433,16 @@ async fn locked(hub: &Arc<Hub>, project: i64, scope: Scope) -> Result<Stats> {
             });
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    };
     let cx = cx(hub, project);
-    let r = tokio::task::spawn_blocking(move || run(&cx, scope)).await.map_err(|e| Error::Other(e.into()));
+    let r = tokio::task::spawn_blocking(move || deriving(|| run(&cx, scope))).await.map_err(|e| Error::Other(e.into()));
     // The lock is the session's: release it, or close the connection so
     // that the lock never goes back into the pool.
     let unlocked = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)").bind(key).fetch_one(&mut *c).await;
     if !matches!(unlocked, Ok(true)) {
         let _ = sqlx::Connection::close(c.detach()).await;
     }
+    drop(permit);
     r?
 }
 
@@ -427,7 +493,7 @@ pub struct Batch<'a> {
 }
 
 fn run(cx: &Cx, scope: Scope) -> Result<Stats> {
-    let pool = &cx.hub().db;
+    let pool = cx.pool();
     let mut b = Batch::new(cx)?;
     b.prepare_lists()?;
     let rows: Vec<(String, String)> = match &scope {
@@ -498,7 +564,7 @@ impl<'a> Batch<'a> {
     /// changes"). Lists the policy no longer has stop being kept.
     fn prepare_lists(&mut self) -> Result<()> {
         let cx = self.cx;
-        let pool = &cx.hub().db;
+        let pool = cx.pool();
         let want = self.lines.all();
         let have: Vec<(String, bool)> = cx.db(|| {
             sqlx::query_as("SELECT line_key, ready FROM rule_lines WHERE project_id = $1").bind(cx.project()).fetch_all(pool)
@@ -743,28 +809,32 @@ impl<'a> Batch<'a> {
         if ask.is_empty() {
             return Ok(out);
         }
-        // One query for all: the deepest few rows of each path.
+        // One query per [`ROWS_PER_STATEMENT`] paths: the deepest few rows of
+        // each. (One query for all of a snapshot's 100,000 paths ran past
+        // the statement timeout on a busy YugabyteDB: BUG-912.)
         const FIRST: usize = 8;
         const NEXT: i64 = 64;
         let keys: Vec<String> = ask.iter().map(|&i| changes::path_key(&wants[i].0)).collect();
         let maxd: Vec<i64> = ask.iter().map(|&i| depth_of[i]).collect();
-        let pool = &self.cx.hub().db;
+        let pool = self.cx.pool();
         let project = self.cx.project();
-        let rows: Vec<(i64, i64, String)> = self.cx.db(|| {
-            sqlx::query_as(
-                "SELECT k.n, f.depth, f.snapshot FROM UNNEST($2::text[], $3::bigint[]) WITH ORDINALITY AS k(path_key, maxd, n) \
-                 CROSS JOIN LATERAL (SELECT depth, snapshot FROM file_history \
-                   WHERE project_id = $1 AND path_key = k.path_key AND depth <= k.maxd \
-                   ORDER BY depth DESC, snapshot DESC LIMIT 8) f",
-            )
-            .bind(project)
-            .bind(&keys)
-            .bind(&maxd)
-            .fetch_all(pool)
-        })?;
         let mut found: HashMap<usize, Vec<(i64, String)>> = HashMap::new();
-        for (n, d, s) in rows {
-            found.entry(n as usize - 1).or_default().push((d, s));
+        for (part, (keys, maxd)) in keys.chunks(ROWS_PER_STATEMENT).zip(maxd.chunks(ROWS_PER_STATEMENT)).enumerate() {
+            let rows: Vec<(i64, i64, String)> = self.cx.db(|| {
+                sqlx::query_as(
+                    "SELECT k.n, f.depth, f.snapshot FROM UNNEST($2::text[], $3::bigint[]) WITH ORDINALITY AS k(path_key, maxd, n) \
+                     CROSS JOIN LATERAL (SELECT depth, snapshot FROM file_history \
+                       WHERE project_id = $1 AND path_key = k.path_key AND depth <= k.maxd \
+                       ORDER BY depth DESC, snapshot DESC LIMIT 8) f",
+                )
+                .bind(project)
+                .bind(keys)
+                .bind(maxd)
+                .fetch_all(pool)
+            })?;
+            for (n, d, s) in rows {
+                found.entry(part * ROWS_PER_STATEMENT + n as usize - 1).or_default().push((d, s));
+            }
         }
         for (j, &i) in ask.iter().enumerate() {
             let at = wants[i].1;
@@ -826,7 +896,7 @@ impl<'a> Batch<'a> {
             }
             Ok::<(), Error>(())
         })?;
-        let pool = &cx.hub().db;
+        let pool = cx.pool();
         for (sql, rows) in [
             (
                 "INSERT INTO file_history (project_id, path_key, depth, snapshot) SELECT $1, * FROM UNNEST($2::text[], $3::bigint[], $4::text[]) \
@@ -885,8 +955,10 @@ impl<'a> Batch<'a> {
 
 /// Project the tips of `branches` of `project` for each view key of its
 /// people and of anyone on Earth, so that their next pull finds the
-/// projection memoised (phase 4 §4.5). Admins see real history: nothing to
-/// do. Only the branches named (a landing's) are touched (BUG-870).
+/// projection memoised (phase 4 §4.5), and extend each view key's graph
+/// (admins' included) for the query API (S13): both by the view key's fill,
+/// queued here and run in the background (`query::graph::prefill`). Only
+/// the branches named (a landing's) are touched (BUG-870).
 pub async fn memo_tips(hub: &Arc<Hub>, project_id: i64, branches: &[String]) -> Result<()> {
     let mut c = hub.db.acquire().await?;
     let name: String = sqlx::query_scalar("SELECT name FROM projects WHERE id = $1").bind(project_id).fetch_one(&mut *c).await?;
@@ -927,16 +999,28 @@ pub async fn memo_tips(hub: &Arc<Hub>, project_id: i64, branches: &[String]) -> 
             });
         }
     }
+    let tips: Vec<ObjectId> = branches.iter().map(|t| ObjectId::from_hex(t).map_err(bad)).collect::<Result<_>>()?;
+    // The admins' graph of the query API too (S13): it holds real history.
+    viewers.push(crate::perm::Viewer {
+        admin: true,
+        ..Default::default()
+    });
     let mut keys = HashSet::new();
+    let mut failed = Ok(());
     for v in viewers {
         let view = project.view(&v);
         if !view.sees_anything() || !keys.insert(view.key()) {
             continue;
         }
-        for t in &branches {
-            let t = ObjectId::from_hex(t).map_err(bad)?;
-            crate::sync::projected(hub, &project, &v, t).await?;
+        // Queue the fill that memoises the projections and extends the
+        // viewer's graph (`query::graph::prefill`: the one fill of this
+        // view key, which a query that needs it joins). Never waited for
+        // here: the deriver holds nothing while fills run (BUG-911).
+        if let Err(e) = crate::query::graph::prefill(hub, &project, &v, &tips).await {
+            if failed.is_ok() {
+                failed = Err(e);
+            }
         }
     }
-    Ok(())
+    failed
 }

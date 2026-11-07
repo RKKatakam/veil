@@ -116,6 +116,16 @@ pub fn peak_kib(pid: u32) -> Option<u64> {
     status_kib(pid, "VmHWM:")
 }
 
+/// Bytes `pid` has read and written through system calls so far (`rchar`
+/// and `wchar` of `/proc/PID/io`). For the server, nearly all of it is
+/// network traffic: requests in and answers out, and the object store's
+/// requests (with MinIO, a push's writes are the bytes stored).
+pub fn io_bytes(pid: u32) -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
+    let field = |f: &str| s.lines().find_map(|l| l.strip_prefix(f))?.trim().parse().ok();
+    Some((field("rchar:")?, field("wchar:")?))
+}
+
 /// A `/proc/PID/status` field in KiB.
 fn status_kib(pid: u32, field: &str) -> Option<u64> {
     let s = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;

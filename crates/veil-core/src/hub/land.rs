@@ -1,4 +1,4 @@
-//! The landing service's messages (`docs/HUB.md` §13.15; `docs/design/
+//! The landing service's messages (`docs/HUB.md` §13.19; `docs/design/
 //! server/phase-4-agent-scale.md` §4.1, §5.1).
 //!
 //! ```text

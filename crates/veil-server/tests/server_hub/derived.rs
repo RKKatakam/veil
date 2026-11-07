@@ -307,7 +307,7 @@ const GROUP_SEC: i64 = 900_002;
 const GROUP_FIN: i64 = 900_003;
 
 /// The policy and bindings of a generated project; `carol` is a person id.
-fn policy(carol: i64) -> (String, BTreeMap<String, Binding>) {
+pub fn policy(carol: i64) -> (String, BTreeMap<String, Binding>) {
     let text = "pub/ public devs\npub/sec/ security\nfin/ finance\ncarol-d/ carol\n".to_string();
     let b = BTreeMap::from([
         ("devs".to_string(), Binding::Group(GROUP_DEVS)),
@@ -318,7 +318,7 @@ fn policy(carol: i64) -> (String, BTreeMap<String, Binding>) {
     (text, b)
 }
 
-fn viewers(carol: i64) -> Vec<(&'static str, Viewer)> {
+pub fn viewers(carol: i64) -> Vec<(&'static str, Viewer)> {
     let v = |person: i64, groups: &[i64]| Viewer {
         person: Some(person),
         admin: false,
@@ -334,7 +334,7 @@ fn viewers(carol: i64) -> Vec<(&'static str, Viewer)> {
     ]
 }
 
-fn text(rng: &mut Rng, tag: &str, n: usize) -> Vec<u8> {
+pub fn text(rng: &mut Rng, tag: &str, n: usize) -> Vec<u8> {
     let mut out = String::new();
     for i in 0..n {
         out.push_str(&format!("{tag} line {i} {}\n", rng.next() % 1000));
@@ -585,7 +585,7 @@ fn answers(
 }
 
 /// `viewer`'s projection of every snapshot of `h` (the root maps to itself).
-fn projections(th: &TestHub, h: &Hist, project: &PermProject, viewer: &Viewer) -> HashMap<ObjectId, ObjectId> {
+pub fn projections(th: &TestHub, h: &Hist, project: &PermProject, viewer: &Viewer) -> HashMap<ObjectId, ObjectId> {
     let mut p = HashMap::from([(root_snapshot_id(), root_snapshot_id())]);
     for s in &h.order {
         let q = th.rt.block_on(sync::projected(&h.hub, project, viewer, *s)).unwrap();
@@ -597,7 +597,7 @@ fn projections(th: &TestHub, h: &Hist, project: &PermProject, viewer: &Viewer) -
 /// A new project holding exactly `viewer`'s projected history of `h`: the
 /// projected snapshots and the projected trees under them, and the same
 /// branches. Nobody is restricted in it (no access lines).
-fn copy_for(th: &TestHub, h: &Hist, project: &PermProject, viewer: &Viewer, p: &HashMap<ObjectId, ObjectId>) -> Hist {
+pub fn copy_for(th: &TestHub, h: &Hist, project: &PermProject, viewer: &Viewer, p: &HashMap<ObjectId, ObjectId>) -> Hist {
     let mut copy = Hist::new(th, "", &BTreeMap::new());
     let reals: Vec<ObjectId> = h.order.clone();
     let wanted: BTreeSet<ObjectId> = p.values().copied().filter(|q| *q != root_snapshot_id()).collect();
@@ -1456,6 +1456,102 @@ fn derived_speed() {
             Ok(())
         }))
         .unwrap();
+}
+
+/// BUG-911: each landing started a derive run that held a connection of
+/// the server's one pool for its project's lock, and needed a second for
+/// every statement. A landing in more projects at once than the pool has
+/// connections left every connection held by a run waiting for another:
+/// no landing or pull found one until the pool's 30 s timeout, and the runs
+/// failed. Here every one of 48 projects has a run started at once (what 48
+/// landings start), on a server with 16 request connections; then each
+/// project is pulled and lands again (eight at a time) while those runs
+/// and the new ones derive. Every landing succeeds, promptly (on the base
+/// they failed `busy` after the pool's 30 s timeout), and the derived data
+/// catches up afterwards.
+#[test]
+fn bug_911_landings_across_many_projects_while_derivers_run() {
+    const PROJECTS: usize = 48;
+    let th = TestHub::start();
+    let hub = th.hub();
+    let admin = th.person("admin");
+    let (token, identity) = (admin.token(), admin.identity());
+    let api = th.api();
+    let names: Vec<String> = (0..PROJECTS)
+        .map(|_| {
+            let name = unique("bug911-");
+            let r = api.post_json(Some(&token), &format!("/v1/projects/{name}"), &serde_json::json!({}));
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            let mut c = Craft {
+                api: &api,
+                token: token.clone(),
+                identity: identity.clone(),
+                project: name.clone(),
+                tip: root_snapshot_id(),
+                root: root_snapshot_id(),
+                objects: Vec::new(),
+            };
+            c.root = c.put_object(Object::Tree(Tree::default()));
+            c.file("README", "first\n");
+            let r = c.push_to("main", None);
+            assert!(r.status == 200 && r.json()["results"][0]["ok"] == true, "{}", String::from_utf8_lossy(&r.body));
+            name
+        })
+        .collect();
+    let ids: Vec<i64> = th.rt.block_on(async {
+        sqlx::query_scalar("SELECT id FROM projects WHERE name = ANY($1) ORDER BY name").bind(&names).fetch_all(&hub.db).await.unwrap()
+    });
+    assert_eq!(ids.len(), PROJECTS);
+    let start = Instant::now();
+    {
+        let _rt = th.rt.enter();
+        for &id in &ids {
+            derive::landed(&hub, id, vec!["main".to_string()]);
+        }
+    }
+    let slowest = std::thread::scope(|s| {
+        let runs: Vec<_> = names
+            .chunks(PROJECTS / 8)
+            .map(|names| {
+                let (th, admin) = (&th, &admin);
+                s.spawn(move || {
+                    let api = th.api();
+                    let mut slowest = Duration::ZERO;
+                    for name in names {
+                        let t = Instant::now();
+                        let mut c = Craft::new(&api, admin, name, "main");
+                        c.file("w/second.txt", "second\n");
+                        let r = c.push("main", "second");
+                        assert!(r.status == 200 && r.json()["results"][0]["ok"] == true, "{name}: {} {}", r.status, String::from_utf8_lossy(&r.body));
+                        slowest = slowest.max(t.elapsed());
+                    }
+                    slowest
+                })
+            })
+            .collect();
+        runs.into_iter().map(|r| r.join().unwrap()).max().unwrap()
+    });
+    // Derived later: every project's main, through its new tip.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let behind: i64 = th.rt.block_on(async {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM branches b LEFT JOIN derive_progress d ON d.project_id = b.project_id AND d.branch = b.name \
+                 WHERE b.project_id = ANY($1) AND d.through_snapshot IS DISTINCT FROM b.target",
+            )
+            .bind(&ids)
+            .fetch_one(&hub.db)
+            .await
+            .unwrap()
+        });
+        if behind == 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{behind} of {PROJECTS} projects not derived within 120 s");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    println!("BUG-911: {PROJECTS} projects: slowest pull and landing {slowest:?}; derived data caught up {:?} after the first runs started", start.elapsed());
+    assert!(slowest < Duration::from_secs(20), "a landing took {slowest:?} while the derivers ran");
 }
 
 // ---- adversarial pass: S12 derived data (BUG-866…) -------------------------------

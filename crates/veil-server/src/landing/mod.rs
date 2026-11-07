@@ -1,4 +1,4 @@
-//! The landing service (milestone S17; `docs/HUB.md` §13.15;
+//! The landing service (milestone S17; `docs/HUB.md` §13.19;
 //! `docs/design/server/phase-4-agent-scale.md` §4.1–4.6).
 //!
 //! **Submitting** (`POST …/land`, and `vl push` to a protected branch): the

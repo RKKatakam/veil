@@ -41,20 +41,30 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (4, "derived", include_str!("../migrations/0004_derived.sql")),
     (5, "change_refs", include_str!("../migrations/0005_change_refs.sql")),
     (6, "access_epochs", include_str!("../migrations/0006_access_epochs.sql")),
+    (9, "secret_shares", include_str!("../migrations/0009_secret_shares.sql")),
+    (10, "view_graph", include_str!("../migrations/0010_view_graph.sql")),
     (11, "landing", include_str!("../migrations/0011_landing.sql")),
 ];
 
 pub async fn connect(url: &str, max: u32) -> anyhow::Result<PgPool> {
+    let (pool, opts) = options(url, max)?;
+    Ok(pool.connect_with(opts).await?)
+}
+
+/// A pool that opens its connections when they are first needed (the
+/// background deriver's: BUG-911).
+pub fn connect_lazy(url: &str, max: u32) -> anyhow::Result<PgPool> {
+    let (pool, opts) = options(url, max)?;
+    Ok(pool.connect_lazy_with(opts))
+}
+
+fn options(url: &str, max: u32) -> anyhow::Result<(PgPoolOptions, sqlx::postgres::PgConnectOptions)> {
     let opts: sqlx::postgres::PgConnectOptions = url.parse()?;
     let opts = opts.options([
         ("statement_timeout", format!("{}", STATEMENT_TIMEOUT.as_millis())),
         ("lock_timeout", format!("{}", LOCK_TIMEOUT.as_millis())),
     ]);
-    Ok(PgPoolOptions::new()
-        .max_connections(max)
-        .acquire_timeout(Duration::from_secs(30))
-        .connect_with(opts)
-        .await?)
+    Ok((PgPoolOptions::new().max_connections(max).acquire_timeout(Duration::from_secs(30)), opts))
 }
 
 /// The advisory lock that one migrating process holds (any key; both

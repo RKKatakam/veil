@@ -2415,7 +2415,22 @@ take no lock:
   `lock::WcLock` (`flock` on `.veil/local/wc/ws-<name>.lock`, re-entrant
   within a process) keeps one recorder per workspace directory: the
   project directory's `Ctx` for its recording and its checkout, `ws exec`,
-  `ws write` and mount recordings.
+  `ws write` and mount recordings. A holder acts only on what it reads
+  **after** taking the lock: `Ctx::lock_dir` re-reads the view and
+  `checkout.json` under it, as another recorder may have finished while
+  it waited. Read at start-up, a view older than the checkout record made
+  the directory look stale, and its edits went into a "recovered
+  working-copy edits" change and off the disk (BUG-1084). A move of the
+  directory to another workspace (`vl ws switch`, `Ctx::finish`) holds
+  the locks of both workspaces, taken in name order, and a recorder whose
+  directory was attached elsewhere while it waited locks that workspace
+  instead (BUG-1121). `ws write` writes over the `@` it reads under the
+  lock and records with `expected_wc`, so it never reverts what landed
+  meanwhile (BUG-1120). A command that writes into the directory itself
+  (`vl restore`, `vl renormalize`, the policy commands, `vl access`, `vl
+  secret recover`) holds `lock_dir` from before it reads the directory
+  until its closing snapshot (BUG-1125); `finish` prints the warnings of
+  a merge its re-read wrote (BUG-1126).
 * **Merging (`Repo::settle`).** Several heads are merged into one operation
   at open and before every transaction: folded in id order, each against
   the nearest common operation, by `oplog::merge_views`, a 3-way merge per

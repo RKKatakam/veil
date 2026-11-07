@@ -250,6 +250,7 @@ pub fn pull(ctx: &mut Ctx, remote: &str) -> Result<()> {
         warn_untrusted(w);
     }
     println!("Pulled {} object(s) from {remote}", r.objects_copied);
+    crate::share_cmd::after_pull(ctx, &client);
     Ok(())
 }
 
@@ -278,7 +279,7 @@ pub fn push(ctx: &mut Ctx, remote: &str, tags: &[String], force: bool, verify: &
     Ok(if out.rejected.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) })
 }
 
-/// `vl land` (`docs/HUB.md` §13.15).
+/// `vl land` (`docs/HUB.md` §13.19).
 pub fn land(ctx: &mut Ctx, remote: &str, rev: Option<&str>, onto: Option<&str>, wait: bool, status: Option<&str>) -> Result<ExitCode> {
     use veil_core::hub::land::LandState;
     let (client, _) = client_for(ctx, remote)?;
@@ -390,6 +391,8 @@ pub fn access(ctx: &mut Ctx, path: &str, who: &[String]) -> Result<()> {
         }
     }
     let file = VPath::new(POLICY_FILE)?;
+    // Rewrites `.veilpolicy` in the directory (BUG-1125).
+    let wc_lock = ctx.lock_dir(None)?;
     let text = String::from_utf8(ctx.fs.read(&file).unwrap_or_default()).context(".veilpolicy is not UTF-8")?;
     let new_line = format!("{:<24}{}", line_path(&norm), who.join(" "));
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
@@ -409,6 +412,7 @@ pub fn access(ctx: &mut Ctx, path: &str, who: &[String]) -> Result<()> {
     let mut out = lines.join("\n");
     out.push('\n');
     ctx.fs.write(&file, out.as_bytes())?;
+    drop(wc_lock);
     println!("{} .veilpolicy: {}", if replaced { "Updated" } else { "Added to" }, safe(&new_line));
     println!("  Push it to apply (only admins may change access; the last matching line wins).");
     // The line's secrets get their own key (docs/HUB.md §13.12).

@@ -8,8 +8,10 @@ sync with fetch on demand, enforcement and secrets sealed on the device.
 **§13 records what was built and every decision S1 made**; where §1–§12
 propose something §13 decided otherwise, §13 is what runs. Later
 milestones are in §13.9; **S12** (derived history data: commit graph,
-changed paths, per-rule lists; no query API yet) is built too, recorded
-in `docs/design/server/phase-3-server-history.md` §10. Statements about what Veil does today cite the
+changed paths, per-rule lists) and **S13** (the query API: log, show,
+tree, file, diff and ancestry, answered on each viewer's projected
+history) are built too, recorded in
+`docs/design/server/phase-3-server-history.md` §10 and §11. Statements about what Veil does today cite the
 document or source file they come from; everything else is a proposal and
 is worded as one.
 
@@ -329,6 +331,7 @@ server keeps the shape and replaces the lock with the compare-and-swap.
 | Pack size per upload | 2 GiB (larger: split) | memory |
 | Single object | 4 GiB | `VEIL_MAX_OBJECT` today |
 | Tree depth | 1,024 | `MAX_TREE_DEPTH` |
+| Parents of one snapshot | 64 (built: `sync::MAX_PARENTS`, refused at push and at API commits) | a walk of history reads every parent of a snapshot in one step (BUG-1078) |
 | Landings per agent | per project setting | one runaway agent can't starve the rest |
 
 `error` frames carry `retry_after_ms`. Anonymous reads of `public` folders
@@ -819,7 +822,7 @@ protocol as pure functions, shared with `vl`; they build for WASM),
 | HTTPS API | tokio, axum, hyper, rustls (ring) | TLS on every connection; `--tls-cert/--tls-key`, or a self-signed certificate (rcgen) for `localhost`/`127.0.0.1` created in the data directory, which `vl login --ca FILE` pins for that server |
 | Metadata | sqlx, PostgreSQL 17 (development, CI) and YugabyteDB 2025.2 | portable SQL only; read-check-write transactions are SERIALIZABLE through `db::serializable`, except where unique keys and row locks decide the races (branch moves, sign-in, project and group creation, group changes: READ COMMITTED, because on YugabyteDB a SERIALIZABLE read blocks every insert into the table it read until it commits, BUG-847); retried with capped exponential backoff on `40001`/`40P01` (YugabyteDB reports conflicts as both) |
 | Migrations | `db::migrate`, `migrations/0001_initial.sql`, `0002_device_vouches.sql` (pending devices, vouches: §13.11), `0003_invites_and_key_sharing.sql` (invites, key requests, pending devices by fingerprint and the fingerprints a person waits for, devices barred from one project: §13.12), `0006_access_epochs.sql` (access epochs and the triggers that bump them: §13.14) | each in its own transaction, recorded in `schema_migrations`; servers starting together race on its primary key and the loser re-checks. On PostgreSQL DDL is transactional; on YugabyteDB DDL inside a transaction block is applied statement by statement unless transactional DDL is enabled, so **migration files are idempotent** (`IF NOT EXISTS`) and a half-applied one is completed by the next start |
-| Object storage | `store::BlobStore`: `FsStore` (a directory; unit tests, development) and `S3Store` (rusty-s3 request signing + reqwest; tested against MinIO) | key `p/<project id>/ab/cdef…`: projects never share an object; every read is re-hashed against its id; an in-memory cache of objects and decoded trees (256 MiB each, decoded trees weighed by the memory they hold: BUG-860). Every S3 request is idempotent (GET, HEAD, PUT of a key naming its content) and is tried again for up to 10 s, with jittered waits doubling from 25 ms to 1 s, when its connection closes or resets or the store answers 5xx; idle connections are dropped after 15 s, before S3 services drop them (BUG-861) |
+| Object storage | `store::BlobStore`: `FsStore` (a directory; unit tests, development) and `S3Store` (rusty-s3 request signing + reqwest; tested against MinIO) | key `p/<project id>/ab/cdef…`: projects never share an object; objects are stored compressed (zstd) when that is smaller, under the id of the uncompressed object (S27, §13.15); every read is decoded, bounded, and re-hashed against its id; an in-memory cache of objects (as stored) and decoded trees (256 MiB each, decoded trees weighed by the memory they hold: BUG-860). Every S3 request is idempotent (GET, HEAD, PUT of a key naming its content) and is tried again for up to 10 s, with jittered waits doubling from 25 ms to 1 s, when its connection closes or resets or the store answers 5xx or 429 (BUG-1005, BUG-1053); idle connections are dropped after 15 s, before S3 services drop them (BUG-861) |
 | Memory allocator | jemalloc (`tikv-jemallocator`, pinned), the `veil-server` binary's only | two arenas, background purging, 1 s decay (`src/main.rs`; `_RJEM_MALLOC_CONF` overrides them): glibc's arena per thread held 2-3x the server's data (BUG-864; `docs/design/scale/BASELINE.md`, "The server's allocator"). **Building the server needs `make` and a C compiler** (jemalloc is built from source) |
 | Server identity | an Ed25519 `Identity` in `<data>/hub-identity.json` (0600); a random secret in `<data>/hub-receipt-key` (0600) | signs projected snapshots (§13.4); its key is shown by `vl login`. The secret keys upload receipts (§13.5); servers sharing the data directory accept each other's |
 
@@ -964,12 +967,12 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 | Route | |
 |---|---|
 | `GET /v1/projects/{p}/tips` | branches → tips as the caller sees them (projections); the branch rows may be up to 100 ms old (§13.14) |
-| `POST …/history {tips, stop}` | the caller's projected snapshots from `tips` down to `stop`, as object frames (`id ‖ len u32be ‖ object`) |
-| `POST …/fetch {snapshot, objects: [{path, id, snapshot?}]}` | objects by id, each with the path where the client met it under that snapshot (its own `snapshot`, or the request's); the server walks the viewer's projection of that snapshot to that path and serves the object only if it is there. No list of what the client has; each request names an immutable object, so a per-viewer cache can serve it |
-| `POST …/objects` | upload object frames: re-hashed, canonically decoded, format-checked, stored; invisible until a push reaches them. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id) |
+| `POST …/history {tips, stop}` | the caller's projected snapshots from `tips` down to `stop`, as object frames (`id ‖ len u32be ‖ object`); to a caller that accepts encoded frames, each object as stored, compressed or not (§13.15) |
+| `POST …/fetch {snapshot, objects: [{path, id, snapshot?}]}` | objects by id, each with the path where the client met it under that snapshot (its own `snapshot`, or the request's); the server walks the viewer's projection of that snapshot to that path and serves the object only if it is there (as stored, to a caller that accepts encoded frames: §13.15). No list of what the client has; each request names an immutable object, so a per-viewer cache can serve it |
+| `POST …/objects` | upload object frames, plain or encoded (§13.15): decoded (bounded), re-hashed, canonically decoded, format-checked, stored compressed when that is smaller; invisible until a push reaches them. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id) |
 | `POST …/push {updates: [{branch, expected, new}], force, receipts}` | complete and check every new snapshot, then move the branches in **one serialisable transaction of compare-and-swaps** (`UPDATE branches SET target = new WHERE … AND target = expected`); one lost race rejects the whole push with 409 and `vl` retries |
 | `POST …/changes {base, edits, onto?, change_id?, receipts}` | a commit through the API, without a checkout (S10, §13.13) |
-| `POST …/land {onto, snapshot \| base+edits, receipts, wait}`, `GET …/land/{ticket}` | submit a landing to the landing service, and its outcome (S17, §13.15) |
+| `POST …/land {onto, snapshot \| base+edits, receipts, wait}`, `GET …/land/{ticket}` | submit a landing to the landing service, and its outcome (S17, §13.19) |
 | `GET …/access?path=` | the deciding line and who it names; only for a path the caller may read |
 | `…/groups`, `GET|POST …/rings/{scope}`, `GET /v1/people/{name}/devices` | groups; key rings of secret scopes; a person's devices (active, the newest pending, removed), the vouches and invite joins the server stores, which devices check before sharing a key (§13.11, §13.12) |
 | `POST /v1/devices/vouch {device, signature}` | the signed-in device vouches for another device of its person; a pending one becomes active |
@@ -977,6 +980,7 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 | `POST /v1/devices/remove {device, project?}` | remove a device: its person, from another device, everywhere (its sessions end); or an admin of `project` where the person takes part, from that project only (§13.12, BUG-843) |
 | `POST …/invites {key, person, group, expires_at}`, `POST …/invites/join {key, device, signature}` | an admin records an invite's public key; the signed-in device joins under it, once, before it expires (§13.12) |
 | `GET …/keys/pending` | the people whose devices may wait for keys, with their devices, vouches, joins and removed devices: a hint for the devices that share keys (§13.12) |
+| `GET …/q/log`, `…/q/show`, `…/q/tree`, `…/q/file`, `…/q/diff`, `POST …/q/ancestry` | history answered by the server, on the caller's projected history only (S13: `docs/design/server/phase-3-server-history.md` §11) |
 
 * **Fetch on demand (Scion):** `vl` asks for the tips, the snapshots it
   lacks, then trees from the root down and the files it needs, one request
@@ -1173,6 +1177,8 @@ can run in parallel).
 1. **S2: secrets at scale** (built, §13.12) — invites, keys per access
    rule, sharing in the background for new members and devices, device
    removal.
+   Person-to-person secret shares (`vl secret share`, §13.17) close
+   phase 1.
 2. **S3: fetch on demand in the client** — the partial-clone design
    (`docs/design/scale/6-partial-clone.md`): bounded cache, objects fetched
    when read, `vl ws mount` over the server; layered caches (per-machine
@@ -1740,7 +1746,457 @@ pull (S3), not a staler check.
 `veil-server` writes its counters (storage writes and reads, cache hits and
 misses) to `DATA/stats.json` at start and on `SIGUSR1`, for the benchmarks.
 
-### 13.15 S17: the landing service (as built)
+### 13.15 S27: compressed objects in storage and on the wire
+
+Built on `integration` @ `f7e9aac` (2026-11-07), as
+`docs/design/server/storage-and-cost.md` §6 asks. Code:
+`veil_core::hub::encoding`, `crates/veil-server/src/store.rs`
+(`Objects`), the `history`, `fetch` and `objects` routes, and `vl`'s
+client (`crates/vl/src/hub.rs`).
+
+#### The design
+
+* **An object's encoding** is how the server stores it and sends it. Its
+  first byte says which:
+
+  ```text
+  'v' …          the canonical encoding itself (every object starts `veil:`);
+                 every object stored before S27 is one, so they stay readable
+  'z' ‖ frame    one zstd frame (level 3) of the canonical encoding, declaring its size
+  ```
+
+  **Object ids stay the BLAKE3 of the uncompressed canonical encoding**, so
+  content addressing, deduplication, upload receipts and signatures don't
+  change, and the storage key is the same (`p/<project>/ab/cdef…`).
+* **The encoder keeps whichever is smaller** (`encoding::encode`). Secrets
+  are ciphertext and don't shrink: they are stored and sent as they are.
+  Objects are compressed **one at a time, never together**, and only after
+  a secret is sealed on its device (never compress-then-encrypt).
+* **The server's store** (`Objects`) writes the encoding, and keeps
+  encodings in its object cache (so the cache holds more objects), each
+  checked against its id when it was read from the store or received.
+  `vl`'s fetch threads hand on answers as sent (compressed); the receiving
+  thread checks the ids and decodes one answer at a time, on up to 8
+  threads. Decoding on the fetch threads instead held 8 decoded answers at
+  once and broke the 1 GB clone's 512 MiB gate (549–559 MiB).
+  `get` returns the canonical encoding (the projection, push checks and
+  older clients use it); `get_encoded` returns what is stored, for the wire.
+  Every object the store answers is decoded, bounded, and re-hashed before
+  it is cached or served, as before.
+* **The wire.** An *encoded frame* is `id ‖ len u32be ‖ encoding`. A body of
+  plain frames (S1's) is also a body of encoded frames.
+  * `vl` sends `Accept: application/x-veil-encoded-frames` and reads every
+    answer as encoded frames. The server answers `history` and `fetch` with
+    each object **as stored** (no compression on the request path) to a
+    caller that accepts them, and plain frames to anyone else. Projected
+    trees made for one viewer are sent as they are.
+  * **Uploads:** the server reads every upload as encoded frames (so a `vl`
+    from before S27 still uploads), decodes and checks each, and **stores
+    its own encoding** of what it decoded (`encoding::encode`), never the
+    client's frame: no client chooses the stored bytes of an object others
+    share (BUG-1008; an S3 PUT replaces what a key held). `vl` compresses
+    each object as the push's walk finds it, within the ratio below
+    (`encode_to_send`), and only for a server of **revision 2**
+    (`Tips::revision`); to an older server it sends plain frames.
+* **Compatibility, both ways.** An older `vl` sends no `Accept` and gets
+  plain frames; its plain uploads are compressed by the server. A newer
+  `vl` and an older server: the server ignores `Accept` and answers plain
+  frames, which `vl` reads; `vl` uploads plain frames to it. Were encoded
+  frames ever sent to an older server, it would refuse them (their bytes
+  don't hash to their ids), never misread them.
+* **Bounded decoding** (`encoding::decode`): a `z` frame must be exactly one
+  zstd frame that declares its size (no trailing bytes, no second or
+  skippable frame), that size must be at most the object size limit
+  (`wire::MAX_FRAME_OBJECT`, as for a plain frame), and its window at most
+  2^27 bytes (`MAX_WINDOW`: what every decoder reads, the web client's
+  pure decoder included; libzstd's one-shot decoder does not check it,
+  BUG-1008), before anything is decoded. The decoder never produces more than the declared size, objects
+  above 64 MiB are hashed while streaming before they are held in memory
+  (BUG-490's rule), and the result must hash to the id. An upload's objects
+  together may decode to at most the request body limit (2 GiB).
+* **What a client sends expands at most 64 times** (`encoding::within_ratio`;
+  any frame decoding to at most 64 KiB may expand more): the server refuses
+  anything else before decoding it, and `vl` sends such an object plain, so
+  its size is the sender's to pay, as before S27. What the server stores
+  is as small as it gets (no ratio). **Decoding in uploads holds a
+  server-wide budget** of 256 MiB of decoded bytes at once
+  (`sync::DECODING_IN_FLIGHT`, a semaphore by bytes; an object larger than
+  that takes all of it), across every request (BUG-1009).
+* **What it does not change:** the client's local store (pulled objects
+  already go into zstd packs; loose objects stay as they are until
+  `vl gc`), the repository format, and the per-object permission checks.
+
+#### Measured (2026-11-07)
+
+`scripts/bench-server.sh` with MinIO, release builds, before (`f7e9aac` plus
+the byte counters) and after (S27), the bytes being what the server wrote
+(`/proc/PID/io`: to MinIO during a push, to the client during a clone). The
+machine was shared and often loaded (15–70); times are within noise or
+better.
+
+| | before | after |
+|---|---:|---:|
+| 1 GB profile: bytes stored, initial push | 2,462 MiB | **1,191 MiB (−52%)** |
+| 1 GB: bytes sent, full clone | 2,352 MiB | **1,057 MiB (−55%)** |
+| 1 GB: bytes sent, clone of one directory | 82.8 MiB | 42.2 MiB (−49%) |
+| 1 GB: push / full clone | 286 s / 58.4 s | 272 s / 46.8 s |
+| 1 GB: client peak, push / clone (gate 512 MiB) | 341 / 453 MiB | 319 / 448 MiB |
+| 1 GB: server peak, push / clone | 2,550 / 2,958 MiB | 1,999 / 2,984 MiB |
+| OpenScion 10k: bytes stored / sent by a clone | 46.0 / 41.9 MB | 27.2 / 23.1 MB (random hex: −41% / −45%) |
+| OpenScion clone everything, 1k / 10k | 101.8 / 622.8 ms | 100.7 / 501.6 ms |
+| load: server CPU per landing (1 / 10 / 100 projects) | 4.0 / 3.8 / 2.9 ms | 3.6 / 4.0 / 3.4 ms |
+| load: database statements per landing | 34 | 34 |
+
+#### Threat review
+
+Attackers outside the trust boundary (§3.1): a participant uploading
+crafted frames, a reader without access to a folder, a network observer
+(TLS everywhere). The server and its object store are trusted with code.
+
+| # | Threat | Defence | Test |
+|---|---|---|---|
+| 1 | **Zip bomb:** a small upload that expands past the object size limit, or a request that decodes to gigabytes | size declared, checked against the limit before decoding; the decoder stops at the declared size; per-request total ≤ the body limit | `encoding::tests::a_zip_bomb_is_refused_before_it_expands`, `server_hub::sync::hostile_compressed_uploads_are_refused` |
+| 2 | **A frame that decodes to other content** than its id (to plant one object under another's id) | every decoded object is re-hashed against its id, on upload and on every read from the store | `decoding_refuses_wrong_ids_and_unknown_markers`, `hostile_compressed_uploads_are_refused`, `store::tests::objects_are_stored_compressed_and_old_ones_stay_readable` |
+| 3 | **Malformed frames:** no declared size, trailing bytes or a second frame (hidden data riding along in storage), an unknown marker, truncation | refused; the whole request is refused, with no receipt | `malformed_frames_are_refused`, `hostile_compressed_uploads_are_refused` |
+| 4 | **Compression as an oracle** (BREACH-style: a guess and hidden data compressed together) | each object is compressed alone; answers carry only objects the viewer may read at their path; projected trees hold only what the viewer may see | `compressed_answers_hold_nothing_the_viewer_may_not_see` |
+| 5 | **Secrets**: plaintext compressed, or compressed before encryption | secrets are sealed on the device before upload; the server sees and stores ciphertext, kept as it is | `objects_are_compressed_in_storage_and_for_clients_that_read_them` (the `.env` is stored uncompressed), `leaks::…` (the server never holds the secret's plaintext, decoded) |
+| 6 | **Mixed versions misread each other's frames** | negotiated (`Accept`, revision 2); a plain frame is an encoded frame; encoded frames sent to an older server fail its hash check | `objects_are_compressed_in_storage_and_for_clients_that_read_them`, `hub::tests::answers_of_plain_and_encoded_frames` |
+| 7 | **Tests that scan the server's files** for leaked plaintext miss it once objects are compressed | the scan decodes object files first (`support::stored_bytes`) | `secrets2::…` |
+| 8 | **A frame some reader can't decode** stored over another folder's object (a 2 GiB window: BUG-1008) | `decode` refuses windows above 2^27 on every path; the server stores only its own encoding | `encoding::tests::bug_1008_a_frame_every_decoder_reads_or_none`, `server_hub` `sync::bug_1008_…`, `sync::an_uploaded_frame_of_raw_blocks_round_trips_to_its_id` |
+| 9 | **Small uploads that exhaust the server's memory** (4 KiB decoding to 128 MiB, many at once: BUG-1009) | at most 64:1 above 64 KiB, refused before decoding; 256 MiB decoded in flight server-wide; no copy of a blob for its check | `encoding::tests::what_is_sent_expands_at_most_the_ratio`, `sync::bug_1009_…`, `sync::compressed_uploads_decode_within_a_server_wide_bound` (16 × 48 MiB at once: +301 MiB, 821 MiB without the budget) |
+
+**Left as it is (low, accepted):** a participant can still make the
+server decode more than they send: up to 64 times a frame's size (or
+64 KiB from a tiny frame), up to the 2 GiB a request may decode. It is
+**bounded server-wide**: at most 256 MiB is decoded at once across every
+request, so memory stays bounded however many requests arrive; the cost
+left is CPU (zstd decodes at about 1 GB/s), which per-person rate limits
+(later work, §4.7) bound.
+
+#### Reverting
+
+Revert the merge **only if no server ran it on real data**: an older
+server cannot read objects stored compressed (they fail its hash check,
+"stored object … does not match its id"). Once a server has stored
+compressed objects:
+
+1. **Stop writing them:** make `encoding::encode` return its input (one
+   line). Every object the server writes is then plain, uploads included
+   (an upload is always stored as the server's own encoding, never as the
+   client's frame), and the server keeps reading both kinds. Clients may
+   go on sending compressed frames: the server decodes them and stores
+   them plain.
+2. **To stop clients sending compressed frames too,** set `wire::REVISION`
+   back to 1: `vl` then uploads plain frames (it still accepts compressed
+   answers, which a server writing only plain objects no longer sends,
+   except for objects already stored compressed).
+3. **To run a server from before S27** on the same store, every object
+   stored compressed must first be rewritten plain; no tool does that yet.
+### 13.17 Person-to-person secret shares (phase 1)
+
+**Goal** (owner, 2026-11-06): any member shares **their own** secret with
+any other member, **without an admin**. It is wrapped (HPKE) to that
+person's **confirmed** devices only, and only the sharer and the recipient
+can open it. Admins see that a share exists, never what it holds.
+
+```
+vl secret share billing/.env.stripe-test --with bob    # seal a copy for bob's confirmed devices
+vl secret share billing/.env.stripe-test --with bob --confirm 4F2A-…   # bob is in no key ring yet
+vl secret shares                                        # mine (admins: every share), never contents
+vl secret unshare billing/.env.stripe-test --from bob  # no later version reaches bob
+```
+
+#### Decisions (delegated to the orchestrator)
+
+1. **What a secret is: one secret file.** A share is a copy of one file
+   that is a secret by its name (`.env`, `.env.*`, `.envrc`, Terraform
+   state) or that the project's policy seals, never code (code is shared
+   with `vl access`) and never a personal key (`id_rsa` & co. never leave
+   the device). Each version has its **own random key**, wrapped (HPKE,
+   C3) to the recipient's confirmed devices and to the sharing device,
+   and the file is sealed under it (C2): the share holds no key of the
+   access line that covers the file, so sharing `billing/.env` with someone
+   outside `billing/` gives them that file and nothing else of `billing/`
+   (CRYPTO.md C14). The vault entries of `vl secret set` are not shared
+   this way: a secret that people use together belongs in a file.
+2. **Updates and revocation: run `vl secret share` again to send a new
+   version; devices the recipient adds receive the current version
+   automatically** (owner's delegate, 2026-11-07, review cycle 3). A new
+   content is sealed only by that explicit command ("send what I have
+   now"): an edit of the file sends nothing, so no checkout, workspace,
+   rewrite or concurrent pass can ever send an older or another value
+   (BUG-1064, BUG-1065). The **clone that ran `vl secret share`** keeps
+   only the shares it records itself (`.veil/local/secret-shares.json`: the
+   share's id and the last version it sealed), never the server's listing
+   (BUG-1060, BUG-1063). After any `vl` command there (the background pass
+   of §13.12, at most every 10 s) it seals **the same content** again when
+   the recipient's confirmed devices changed (a new one is added; one no
+   longer confirmed is left out of every later version), taking it from its
+   own signed last version (the sharing device is sealed for it), never
+   from the working copy. Running `vl secret share` in another clone makes
+   that one the source (the first sees the version move on and stops).
+   Every change of the record is made under its lock, re-read and applied
+   only for that command, never bringing back an entry another command
+   removed, nor an older version (BUG-1066). `vl secret unshare` **ends**
+   the share: the clone forgets it first, then the server stores or serves
+   no later version. **It cannot take back what the recipient already
+   received** (the command says so, and suggests rotating the secret). A
+   share the server lists as ended, paused or shared again elsewhere is
+   forgotten by the clone too: only a new `vl secret share` starts it again.
+3. **Device confirmation, as S2 requires.** The sharing device seals only
+   for devices confirmed outside the server, with the same rules an admin's
+   `vl group add` uses (§13.11; `hub_keys::person_devices`): a device a
+   verified ring of this project records under the person's name, one the
+   sharer compared by fingerprint (`--confirm`, remembered on the device),
+   one with a join under an invite for the person, or one vouched for by one
+   of these; a device a ring once held and revoked counts only if a ring
+   holds it now or the sharer compares it again. The server's device list
+   is never enough. Listed devices nothing confirms are printed with their
+   fingerprints (`confirm bob's device: …`).
+4. **The admins' audit.** In plain text on the server, never contents:
+   who shares which path with whom, when it started, when it last changed,
+   when it ended, and its version. `vl secret shares` lists them (admins:
+   every share of the project; others: the shares they make or receive);
+   ended shares keep their row, without the record. Each share and unshare
+   is also in the server's audit log.
+5. **Agents.** The recipient's `vl pull` (and `vl secret shares`, and the
+   background pass once the clone took part in a share) writes the file at
+   its path, where it **stays on their device**: an isolated file, never
+   recorded, backed up in the local vault like any local-only secret. Their
+   agents get it as they get the person's other secrets, with `vl ws exec
+   --with-isolated`. A copy is written only if nothing at all is at the
+   path, or a regular file holding exactly the version this clone wrote
+   before (the person's own edit, link, folder or special file, and a file
+   that cannot be read, are never written over: BUG-1062), and only where
+   this device would **not** record it: a device that holds the key of the
+   file's folder (an admin's, say) would seal it into history for everyone
+   in that folder, so the copy is not written there and the command says
+   why. The same check runs before every snapshot: a copy this device would
+   now record (it gained the folder's key since) is moved to
+   `.veil/local/secret-shares-held/` instead, under a new name each time
+   (never over a copy held before), and the path is then no longer
+   "received": a file the person puts there later is theirs to record
+   (BUG-1067). A one-directory clone
+   (`--only`) writes nothing outside its directory. A version is refused if
+   it is older than the newest genuine one this clone saw, written or not.
+6. **Format and wire.** No repository format change (format 8) and no new
+   ring kind: shares are server records, not ring changes. New: the signed
+   share record (`veil_core::secret_share`, record format 1, FORMAT.md), the
+   routes below, migration `0009_secret_shares` (the shares and a quota
+   row per person and project), and the device-local
+   `.veil/local/secret-shares.json` (the shares this clone made, and what it
+   received; changed under `.veil/local/secret-shares.lock`).
+
+#### The server
+
+* `GET /v1/projects/{p}/shares`: participants only. Admins get every
+  share's metadata; others the shares they make or receive. The record
+  (ciphertext) goes only to its sharer and its recipient, and only while the
+  share is **active**: not ended, the sharer may still read its path, and the
+  recipient still takes part in the project. Otherwise it is listed as
+  paused, with why (`fin may no longer read billing/.env`; `bob no longer
+  takes part in this project`). It is served again if that changes, until
+  it is ended; its sharing clone, which forgot it when it saw it paused,
+  seals it for no new device until its person shares it again.
+* `POST /v1/projects/{p}/shares` (`SharePut {expect, reshare, record}`):
+  the record must verify, be signed by the device sending it under its
+  person's name, be of a path the caller may read that the accepted policy
+  seals (never a personal key), be for another participant, and carry
+  version `expect + 1`. One statement with a compare-and-swap on the
+  version; a background update (`reshare: false`) never brings back an
+  ended share; at most 256 shares per person and project, reserved on a
+  quota row in the transaction that inserts, so requests sent together
+  never pass it (BUG-1061).
+* `POST /v1/projects/{p}/shares/remove`: the sharer ends a share (its
+  version moves on, its record is dropped, its row stays for the audit).
+  Ending an ended share again changes nothing.
+
+#### Threat review
+
+The attacker is **whoever controls the server** (outside the boundary for
+secrets, §3.1), unless a row says otherwise. Tests: `server_hub` `shares`,
+`veil-core` `secret_share`.
+
+| # | Tries | Result | Test |
+|---|---|---|---|
+| 1 | **Reads a share** (the database, the object store, the routes) | Ciphertext only: the version key is wrapped to devices' X25519 keys; the server holds none | `a_share_reaches_its_recipient_only` (the row holds no marker, in text or hex) |
+| 2 | **Lists its own device under the recipient**, with a vouch it signed | Not confirmed (§13.11): not sealed for, and shown as `confirm bob's device: <its fingerprint>`; bob reads a different one, so a `--confirm` of it fails and shares nothing | `a_server_cannot_redirect_a_share_to_its_device` |
+| 3 | **Moves another person's device under the recipient's name** | Rings record it under its real name: not confirmed for the recipient | same |
+| 4 | **The recipient is in no ring** | Nothing confirms a device of theirs: the share is refused until the sharer compares a fingerprint (`--confirm`) | same |
+| 5 | **Adds a wrap, swaps the sealed file, changes the path, recipient, sharer, version or project** of a stored record | The signature fails, or the labels (share id, version) do not match: refused, nothing written | `a_server_cannot_forge_change_replay_or_move_a_share`, `secret_share::tests` |
+| 6 | **Signs a record of its own** in the sharer's name (hostile content into the recipient's tree) | Its key is no current ring member named as the sharer: refused | same |
+| 7 | **Replays an older version** | The recipient's device refuses a version older than the last it received | same |
+| 8 | **Serves a genuine record of another project** (the sharer shares the same path there) | The record names its project; the recipient compares it with the project it anchored (BUG-845) | same |
+| 9 | **Moves a share to another path or recipient** (its own row) | The record's path and recipient are signed; the other recipient cannot open it either | same |
+| 10 | **Lists a removed device again**, with its genuine old vouch | Rings revoked it: it counts only through a ring holding it now or a new `--confirm`; every later version leaves it out | `removed_devices_people_and_access` |
+| 11 | **Withholds a new version**, or a revocation, from the sharing device | The recipient keeps an older version (freshness is TOFU, as for rings, §13.12); a device the sharer's rings still hold stays sealed for until they are fresh | residual |
+| 12 | **Races an update against an unshare** | Compare-and-swap on the version; an unshare moves it on, and an update never revives an ended share | `concurrency_share_updates_and_unshares_under_load`, `the_share_routes_refuse_what_may_not_be_shared` |
+| 12a | **Forgets an unshare**: lists the last genuine record as active again, then the sharer rotates the secret (BUG-1060) | The sharing clone forgot the share when it unshared it; its pass updates only shares it records | `bug_1060_an_unshare_the_server_forgets_never_seals_a_later_version` |
+| 12b | *Another clone on the sharing device* (an older checkout, an agent's) seals its own copy (BUG-1063); a workspace switch or an earlier version of a change brings an older value back (BUG-1064, BUG-1065) | Only the clone that ran `vl secret share` touches it, and its pass never sends a new content: only the same one, again, for new devices | `bug_1063_another_clone_on_the_sharing_device_never_rolls_the_share_back`, `bug_1064_switching_the_directory_to_an_older_workspace_never_rolls_the_share_back`, `bug_1065_an_earlier_version_of_the_same_change_is_an_older_revision`, `content_updates_are_explicit` |
+| 12d | **Delays its answer to a pass** until the sharer unshared, so the pass writes back the record it read before (BUG-1066) | Every change of the record is made under its lock and re-read there; a pass never re-inserts an entry another command removed | `bug_1066_a_pass_in_flight_never_brings_back_an_unshare`, `concurrency_the_share_record_under_concurrent_commands` |
+| 12c | *A member* sends many new shares at once (BUG-1061) | The limit is reserved on a quota row in the inserting transaction | `bug_1061_concurrent_new_shares_never_pass_the_limit` |
+| 13 | *A member without the folder* shares its secret, or anyone shares code or a personal key | Refused by the route (the caller's access to the path; the accepted policy); the client refuses first | `the_share_routes_refuse_what_may_not_be_shared` |
+| 14 | *A member* shares to a device that is not the person's (by `--confirm`) | Trusted: they hold the file and could leak it anyway (§3.1) | — |
+| 15 | *A sharer who loses the folder* keeps updating | Their updates are refused and the share is no longer served (paused) | `removed_devices_people_and_access` |
+| 16 | *A recipient who leaves the project* | Not served; no update is sealed for them while they are out | same |
+| 17 | *An admin's device* receives a share of a file its folder does not have | Not written: that device would seal it into history for the folder's people | `a_share_reaches_its_recipient_only` |
+| 18 | *The recipient's own edit* of the received file, or a link, folder, FIFO or unreadable file at its path (BUG-1062) | Never written over; a later version waits until they remove theirs | `updates_and_unsharing`, `bug_1062_a_share_never_replaces_the_recipients_symlink` |
+| 18a | **Serves an older genuine version** after the recipient removed their copy | Refused: older than the newest version the clone saw, written or not | `a_version_seen_but_not_written_still_refuses_older_ones` |
+| 18b | *The recipient's device gains the folder's key* after receiving a copy | Before any snapshot, the copy moves to `.veil/local/secret-shares-held/` (a new name each time) instead of being sealed for the folder's people; the path is then the person's again (BUG-1067) | `a_received_copy_is_never_recorded_after_the_device_gains_the_key`, `bug_1067_holding_back_a_received_copy_never_loses_what_it_held` |
+| 19 | **Hostile input**: paths with `..`, huge records, many devices, many shares, malformed bodies, no session | Refused (400, 422, 401), never stored; at most 64 KiB, 64 devices, 256 shares per person and project | `the_share_routes_refuse_what_may_not_be_shared` |
+
+**Residual risks** (recorded, not closed here):
+* **An unshare from another device of the sharer's** reaches the sharing
+  clone only through the server (it then forgets the share); a compromised
+  server that hides it keeps that clone updating the share. Unshare from
+  the clone that shared it.
+* **A recipient who leaves the project** is known to the sharing clone only
+  from the server's listing; if no key ring records their devices (they
+  were confirmed by `--confirm`), a compromised server that hides the
+  departure keeps them sealed for. Unshare when someone leaves.
+* **What was received stays received.** An unshare, a removed device or a
+  person leaving stops later versions only; rotate the secret.
+* **Freshness** (row 11), as for rings.
+* **The recipient learns the path's name** (a file of a folder they may not
+  see): the sharer chose to give them that file.
+* **A sharer's insider choices** (row 14), and what the file holds: a
+  shared `.envrc` is a shell script that direnv runs once the person allows
+  it. A share never writes over an existing file.
+
+
+### 13.16 S5: read grants, the object routes, access epochs (built)
+
+Design: `docs/design/server/phase-2-thin-clients.md` §4.3–§4.5, §5.1. Code:
+`veil_core::hub::grant` (the grant, request signatures and the chain
+check: pure, WASM-safe, for the server, the Veil daemon (S6) and regional
+caches (S9)), `crates/veil-server/src/grant.rs` (issuing, the routes, the
+feed); the access epochs are S4's (§13.14, `migrations/0006_access_epochs.sql`). Nothing new is encrypted:
+grants are **signed**.
+
+* **The grant.** `GET …/tips` (revision 3) returns, per branch, a grant
+  and the server's grant key (`Tips::grants`, `Tips::grant_key`). A grant
+  is `hex(JSON body) . hex(signature)`: Ed25519 by the server's **grant
+  key** (`<data>/hub-grant-key`, an Ed25519 seed, 0600; servers sharing the
+  data directory share it), context `hub-grant`, over the body bytes as
+  sent (verified before they are parsed; never re-encoded). The body is
+  `{project, device, root, epoch, person_epoch, expires}`: the project's
+  name, the caller's device's Ed25519 key, their projected root tree of
+  the tip, the access epochs of the project and of the person, and an
+  expiry 10 minutes on. **No database id:** project and person ids are
+  sequential and would count the server's projects and people
+  (BUG-1088); checking a grant looks the project up by name and the
+  person by the device's key, with both epochs, in one statement. It holds nothing its holder could not see
+  otherwise: **no view key** (an unkeyed hash of every access line, hidden
+  ones included, would confirm guesses of hidden folder names: BUG-1080),
+  and epochs that are opaque. Unknown
+  fields are refused, so a layer that does not know a later restriction
+  refuses the grant instead of ignoring it. Anyone on Earth's grant names
+  no person and no device.
+* **Projected trees are stored.** The trees a projection rewrites existed
+  only in memory in S1. Issuing a grant stores them, so a chain through
+  them can be checked from the store alone, by any layer. They hold only
+  what their viewer reads, and no route serves an object by id without a
+  path or chain check.
+* **Requests.** `GET /v1/objects/{p}/{id}` with headers `Veil-Grant`,
+  `Veil-Chain` (the tree ids from the grant's root to the tree naming the
+  object, comma-separated; empty for the root) and `Veil-Signature`
+  (`<unix ms>.<signature>`), `Range` supported; `POST
+  /v1/objects/{p}:batch {grant, ts, signature, wants: [{chain, id}]}`
+  answers object frames of what it serves and leaves the rest out. The
+  device signs `grant hash ‖ ts ‖ BLAKE3(ids)` (context `hub-request`,
+  72 bytes); the server accepts `ts` within ±5 minutes. A copied grant is
+  useless without the device key.
+* **Checks, in order:** the grant's signature, its project (the route's),
+  its expiry, the request's signature, then the project by name, the
+  device (still active) and the current epochs of the project and of the
+  device's person (one statement; both must be equal to the grant's): any
+  failure is `401
+  grant_invalid`, which says nothing about any object. Then each object's
+  chain (`Chains::allows`): `chain[0]` is the grant's root, each tree has
+  a directory entry naming the next, and the last tree has an entry whose
+  object is the id (or the last element is a conflict object
+  named by a conflict entry, and the id is one of its terms: S1's `fetch`
+  serves the same). The check reads only objects it already reached from
+  the root, and an object is read only after its own check, so "not
+  reachable" and "not there" are the same `404` (the same body), and in a
+  batch both are left out; a batch sends each id once. Every object,
+  trees included, is read through `store::Objects`, one at a time
+  (`grant::read`, and `Objects::get_range` for a `Range`), and decoded
+  from S27's encoding (§13.15) and checked against its id: when small
+  objects move into packs (S28), only those change, and a pack is never
+  handed out.
+* **`Range`** answers bytes of the object, never of what is stored. An
+  object stored as it is (S27's plain encoding) is read for those bytes
+  only (`BlobStore::get_range`: a file's seek, an S3 ranged `GET`, an open
+  range sent open; past the end, 416 with the length, from a `HEAD` on S3:
+  BUG-1086). A compressed one is decoded whole, its decoded bytes counted
+  in the server-wide budget below, then sliced.
+* **Read-ahead is bounded by sizes the server can trust** (BUG-1087), in
+  the batch route and in S1's `fetch` alike: at most 64 objects and about
+  8 MiB ahead of what a request has sent, and, across every request,
+  `store::DECODED_IN_FLIGHT` (256 MiB, the budget S27's uploads decode
+  under). An object's cost is the size its entry or conflict term records
+  plus 4 KiB (`store::SIZE_SLACK`): **a push or an API commit whose entry
+  records less than its object holds is refused** (`sync::check_changes`,
+  which reads every new object for the secret checks anyway; an API
+  commit records a sealed secret's stored length). An object that records
+  no size (a tree, a conflict) costs what its encoding declares: S27's
+  frames declare their size in their first bytes, read from the cache or
+  the store. A read waits for the budget only when its request holds none
+  of it, so requests never wait on each other in a cycle; an id asked for
+  more than once is read once.
+  **An error making a grant** (the store failing to read or write the
+  projected trees) is logged, and that branch gets no grant: the tips and
+  every pull still answer (BUG-1083).
+* **Access epochs** are S4's (§13.14): each project and each person has
+  an epoch, a random value that database triggers replace at every access
+  change, in the transaction of the change itself; there is no
+  server-wide row. A grant carries the two epochs its view was built
+  under (`perm::open_at`): random values compared only for equality, they
+  show neither a count, a time nor a rate of changes (BUG-1081). The
+  server reads the current epochs on every object request and refuses a
+  grant with others: a change committed after the view was built voids
+  it, and one committed before is in the view. **Revocation at the server is at the next request**
+  (tested: group removal or deletion, a policy change, a name rebound to a
+  new group, a device removed or barred, and a grant racing a removal).
+* **The feed.** `GET /v1/epochs?projects=a,b` needs a session: it answers
+  `{person, projects: {name: epoch}}`, the caller's own person epoch and
+  the current epoch of each named project the caller can see; a project
+  they cannot see is left out exactly as one that does not exist. Every
+  key asked for gets its current epoch, read from S4's table of each key's
+  current one (no paging and no log, so no change is passed over:
+  BUG-1082). The Veil daemon (S6) polls it for its people and
+  projects, and refuses a grant whose epochs are not those; a project
+  left out voids the caller's grants of it. Regional caches (S9) will
+  authenticate as the server's own.
+
+**Threat review** (design §6 rows 1–4, 14, 15, plus this milestone's):
+
+| # | Attacker | Tries | Result | Test (`server_hub::grants`) |
+|---|---|---|---|---|
+| 1 | Person without access to a folder | asks for every real object id (the admin's), with their own grant and every chain they can build: their own trees, the admin's real chain, the admin's chain from their root, the admin's root | nothing served; one at a time, the same `404` as a random id | `object_routes_serve_only_what_a_grant_reaches` (5 viewers, anyone on Earth included) |
+| 2 | Same | a real grant with a chain through another snapshot's or the admin's trees | the chain must start at the grant's root, each step read from the store | same, and the unit test `chains_reach_only_what_the_root_reaches` (which also checks that only reached objects are read) |
+| 3 | Anyone holding a copy of a grant | uses it from another device, unsigned, with a signature over other ids, six minutes old, an hour ahead | `grant_invalid` | `grants_hold_only_for_their_device_project_key_and_time` |
+| 4 | Person removed from a group; a project whose policy changed; a device an admin removed | keeps using a grant | refused at the next request; the feed lists the change | `access_changes_void_grants_at_the_next_request` |
+| 5 | Person without access | asks for a secret's ciphertext (`billing/.env`) | served only to those who read the folder | test 1 |
+| 6 | Same | an object at a visible and a hidden path | served through the visible chain only (the same bytes); refused through the hidden one | test 1 |
+| 7 | Anyone | a grant re-signed by the server's identity key, a body changed under its signature (a wider root), a grant for another project's URL, an expired one, one older than the project's epoch | `grant_invalid` | test 3 |
+| 8 | Anyone | malformed grants (non-hex, 10 KB), chains of `MAX_CHAIN + 5`, non-hex chains and signatures, more than `MAX_WANTS` wants, bad routes, bad JSON, a `Range` past the end or on a hidden object | refused cleanly (400/401/404/416); a hidden object's `Range` is the same 404 | test 3 |
+| 9 | Person without access | times answers | the grant is checked before any object, and only checked objects are looked up (the batch prefetches after the check) | by construction; residual as design row 14 |
+| 10 | Anyone holding a grant (anyone on Earth, for a project with something public) | tests guesses of the hidden access lines offline against a value it carries | no value a client receives (tips, grants, epochs, errors) is a view key | `bug_1080_…` (BUG-1080) |
+| 11 | Anyone on Earth; a signed-in person outside a project | reads the epoch feed, or counts epochs across grants | the feed needs a session and answers only for the caller and projects they see; epochs are random per key | `bug_1081_…` (BUG-1081) |
+| 12 | — (a cache falling behind) | reads the feed after many changes, one key changing twice | every key's current epoch | `bug_1082_…` (BUG-1082) |
+| 13 | — (an outage) | the store refuses writes | tips still answer; the branch has no grant | `bug_1083_…` (BUG-1083) |
+
+**Residual:** someone who holds grants of a project at two times learns
+whether its access (or their own) changed in between, not how often. A
+signed request can be replayed within ±5 minutes
+by whoever saw it (inside TLS: a cache, which is inside the boundary); it
+returns the same objects. Grants are made per branch at every tips request
+(one signature each). Not built (later milestones): `POST …/grants` for
+older snapshots, caches, `vl` reading through these routes (S3, S6).
+
+### 13.19 S17: the landing service (as built)
 
 Milestone S17 (`docs/design/server/phase-4-agent-scale.md` §4.1–4.6, §8).
 Code: `crates/veil-server/src/landing/` (`mod.rs`: submit, waiters, the

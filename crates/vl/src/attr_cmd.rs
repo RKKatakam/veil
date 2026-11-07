@@ -258,6 +258,8 @@ pub fn attr(ctx: &mut Ctx, args: &AttrArgs) -> Result<ExitCode> {
 /// `.veilattributes` asks for now (an operation of its own, which `vl undo`
 /// reverts). The working copy is not rewritten.
 pub fn renormalize(ctx: &mut Ctx, args: &RenormalizeArgs) -> Result<ExitCode> {
+    // What it reports as renormalized is judged under the lock too (BUG-1125).
+    let _wc = ctx.lock_dir(None)?;
     let ps: Vec<VPath> = args.paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
     let select = |p: &VPath| ps.is_empty() || ps.iter().any(|q| p.starts_with(q));
     let before = ctx.repo.snapshot(&ctx.wc()?)?.tree;

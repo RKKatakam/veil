@@ -1,4 +1,4 @@
-//! The landing service (S17, `docs/HUB.md` §13.15; phase 4 §4.1–4.6 and
+//! The landing service (S17, `docs/HUB.md` §13.19; phase 4 §4.1–4.6 and
 //! its threat review, §6 rows 1–4): batched landings with one move of the
 //! branch, the fast path, conflicts never landed over, access checked at
 //! submit and again when an entry lands, fencing between servers, protected

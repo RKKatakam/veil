@@ -7,10 +7,13 @@
 //! | [`auth`] | challenge-response sign-in, session tokens |
 //! | [`caches`] | sessions, permissions, snapshot resolution and tips in memory, versioned by access epochs |
 //! | [`perm`] | the permission model: admins, groups, the accepted policy |
+//! | [`shares`] | person-to-person secret shares (ciphertext and the admins' audit) |
 //! | [`sync`] | projected history, fetch by id, push validation, branch CAS |
 //! | [`changes`] | commits through the API: edits on a revision, the push's checks, one commit |
+//! | [`grant`] | read grants, the object routes, the access-epoch feed |
 //! | [`landing`] | the landing service: the queue, leases, batches, the fast path, protected branches (S17) |
 //! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
+//! | [`query`] | the query API: history answered per viewer (S13) |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
 //! | [`store`] | object storage: local directory or S3 |
 //! | [`tls`] | TLS configuration |
@@ -22,8 +25,11 @@ pub mod changes;
 pub mod db;
 pub mod derive;
 pub mod error;
+pub mod grant;
 pub mod landing;
 pub mod perm;
+pub mod query;
+pub mod shares;
 pub mod store;
 pub mod sync;
 pub mod tls;
@@ -54,6 +60,9 @@ pub struct Hub {
     /// The MAC key of upload receipts (`sync::receipt`), derived from the
     /// random secret in `<data>/hub-receipt-key`.
     pub receipt_key: [u8; 32],
+    /// The grant key (`<data>/hub-grant-key`) and what it needs
+    /// (`grant`).
+    pub grants: grant::Grants,
     pub session_ttl_ms: i64,
     /// The TLS certificate (leaf, DER): sign-in accepts only signatures
     /// for a server name it is valid for.
@@ -62,6 +71,9 @@ pub struct Hub {
     pub caches: caches::Caches,
     /// The derive workers (`derive::landed`).
     pub derive: derive::Workers,
+    /// The query API's caches and the viewer-graph fills running here
+    /// (`query::graph`).
+    pub query: query::graph::State,
     /// The landing services running here, and the submitters waiting here.
     pub landing: landing::Services,
 }
@@ -90,6 +102,8 @@ pub struct Config {
     /// The server's identity and the self-signed certificate live here.
     pub data_dir: PathBuf,
     pub session_ttl: Duration,
+    /// The requests' connections; the background deriver has its own
+    /// `derive::DERIVE_CONNECTIONS` more.
     pub db_connections: u32,
     /// Derive, in the background once serving, every branch a landing left
     /// underived (`derive::resume`), and start the landing services of
@@ -146,9 +160,13 @@ pub async fn start(config: Config) -> Result<Running> {
     std::fs::create_dir_all(&config.data_dir)?;
     let identity = server_identity(&config.data_dir)?;
     let receipt_key = receipt_key(&config.data_dir)?;
+    let grants = grant::Grants::load(&config.data_dir).context("reading hub-grant-key")?;
     let (tls, cert_pem, certificate) = tls::server_config(&config.tls, &config.data_dir)?;
     let db = db::connect(&config.database_url, config.db_connections).await.context("connecting to the database")?;
     db::migrate(&db).await.context("migrating the database")?;
+    // The background deriver's own connections (BUG-911), opened when a
+    // run first needs one.
+    let derive_db = db::connect_lazy(&config.database_url, derive::DERIVE_CONNECTIONS)?;
     let blob: Arc<dyn store::BlobStore> = match &config.storage {
         Storage::Dir(d) => Arc::new(store::FsStore::new(d)),
         Storage::S3 {
@@ -169,10 +187,12 @@ pub async fn start(config: Config) -> Result<Running> {
         trees: LruCache::new(256 << 20),
         identity,
         receipt_key,
+        grants,
         session_ttl_ms: config.session_ttl.as_millis() as i64,
         certificate,
         caches: caches::Caches::default(),
-        derive: derive::Workers::default(),
+        derive: derive::Workers::new(derive_db),
+        query: query::graph::State::default(),
         landing: landing::Services::default(),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
