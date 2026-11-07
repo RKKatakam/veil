@@ -96,6 +96,26 @@ struct TipsSlot {
     /// are never stored after it.
     generation: u64,
     rows: Option<(Instant, BranchRows)>,
+    /// The read in flight, if one started within [`TIPS_TTL`]: others wait
+    /// for it instead of reading too (under load, a herd of readers made
+    /// every read slower than the expiry, so nothing was ever kept).
+    reading: Option<(Instant, Arc<tokio::sync::Notify>)>,
+}
+
+/// What [`Caches::tips`] says to do.
+pub enum TipsLookup {
+    /// The rows, read within [`TIPS_TTL`] and no notice since.
+    Hit(BranchRows),
+    /// Another request is reading them: wait for its notice, then ask again.
+    Wait(Arc<tokio::sync::Notify>),
+    /// Read them, then [`Caches::put_tips`] (or [`Caches::tips_failed`]).
+    Read(TipsRead),
+}
+
+/// One read of a project's branch rows, in flight.
+pub struct TipsRead {
+    generation: (u64, u64),
+    done: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Default)]
@@ -228,40 +248,76 @@ impl Caches {
     // ---- branch tips: dropped on notice, expire after TIPS_TTL ------------------
 
     /// The project's branch rows, if read within [`TIPS_TTL`] and no notice
-    /// came since; otherwise the generation to give [`Caches::put_tips`].
-    pub fn tips(&self, project: i64) -> std::result::Result<BranchRows, (u64, u64)> {
+    /// came since; otherwise a read to wait for, or one to make.
+    pub fn tips(&self, project: i64) -> TipsLookup {
         let mut t = self.tips.lock().unwrap();
         let global = t.generation;
         let slot = t.slots.entry(project).or_default();
-        match &slot.rows {
-            Some((at, rows)) if at.elapsed() < TIPS_TTL => {
+        if let Some((at, rows)) = &slot.rows {
+            if at.elapsed() < TIPS_TTL {
                 self.stats.tips_hits.fetch_add(1, Ordering::Relaxed);
-                Ok(rows.clone())
-            }
-            _ => {
-                self.stats.tips_misses.fetch_add(1, Ordering::Relaxed);
-                Err((global, slot.generation))
+                return TipsLookup::Hit(rows.clone());
             }
         }
+        if let Some((started, done)) = &slot.reading {
+            if started.elapsed() < TIPS_TTL {
+                return TipsLookup::Wait(done.clone());
+            }
+        }
+        self.stats.tips_misses.fetch_add(1, Ordering::Relaxed);
+        let done = Arc::new(tokio::sync::Notify::new());
+        slot.reading = Some((Instant::now(), done.clone()));
+        TipsLookup::Read(TipsRead {
+            generation: (global, slot.generation),
+            done,
+        })
+    }
+
+    /// Is `done`'s read of `project` still in flight?
+    pub fn tips_reading(&self, project: i64, done: &Arc<tokio::sync::Notify>) -> bool {
+        let t = self.tips.lock().unwrap();
+        t.slots.get(&project).and_then(|s| s.reading.as_ref()).is_some_and(|(_, d)| Arc::ptr_eq(d, done))
     }
 
     /// Keep rows read from the database (the read started at `read_at`)
-    /// unless a notice for the project came since `generation`.
-    pub fn put_tips(&self, project: i64, generation: (u64, u64), read_at: Instant, rows: Vec<(String, String)>) {
+    /// unless a notice for the project came since the read was handed out;
+    /// wake whoever waits for it.
+    pub fn put_tips(&self, project: i64, read: TipsRead, read_at: Instant, rows: Vec<(String, String)>) {
         let mut t = self.tips.lock().unwrap();
-        if t.generation != generation.0 {
-            return;
-        }
+        let fits = t.generation == read.generation.0 && t.slots.len() <= MAX_TIP_PROJECTS;
         if t.slots.len() > MAX_TIP_PROJECTS {
-            t.slots.clear();
-            t.generation += 1;
-            return;
+            Self::drop_slots(&mut t);
         }
         let slot = t.slots.entry(project).or_default();
-        if slot.generation == generation.1 {
+        if fits && slot.generation == read.generation.1 {
             // Its age counts from before the read: never older than TIPS_TTL.
             slot.rows = Some((read_at, Arc::new(rows)));
         }
+        Self::finish(slot, &read.done);
+    }
+
+    /// The read failed: wake whoever waits for it (one of them reads again).
+    pub fn tips_failed(&self, project: i64, read: TipsRead) {
+        let mut t = self.tips.lock().unwrap();
+        let slot = t.slots.entry(project).or_default();
+        Self::finish(slot, &read.done);
+    }
+
+    fn finish(slot: &mut TipsSlot, done: &Arc<tokio::sync::Notify>) {
+        if slot.reading.as_ref().is_some_and(|(_, d)| Arc::ptr_eq(d, done)) {
+            slot.reading = None;
+        }
+        done.notify_waiters();
+    }
+
+    fn drop_slots(t: &mut Tips) {
+        for slot in t.slots.values() {
+            if let Some((_, d)) = &slot.reading {
+                d.notify_waiters();
+            }
+        }
+        t.slots.clear();
+        t.generation += 1;
     }
 
     /// A push moved a branch of `project` (a notice, or this server's own).
@@ -274,9 +330,7 @@ impl Caches {
 
     /// Notices may have been missed (the listener's connection was lost).
     pub fn drop_all_tips(&self) {
-        let mut t = self.tips.lock().unwrap();
-        t.slots.clear();
-        t.generation += 1;
+        Self::drop_slots(&mut self.tips.lock().unwrap());
     }
 }
 
@@ -385,29 +439,54 @@ mod tests {
         assert!(c.viewer(2, &person(5, "aa")).is_none());
     }
 
-    #[test]
-    fn a_notice_beats_a_read_that_started_before_it() {
-        let c = Caches::default();
-        let g = c.tips(7).unwrap_err();
-        let at = Instant::now();
-        c.tips_changed(7);
-        c.put_tips(7, g, at, vec![("main".into(), "old".into())]);
-        assert!(c.tips(7).is_err(), "rows read before the notice are not kept");
-        let g = c.tips(7).unwrap_err();
-        c.put_tips(7, g, Instant::now(), vec![("main".into(), "new".into())]);
-        assert_eq!(c.tips(7).unwrap()[0].1, "new");
-        // A lost listener connection drops everything, and reads in flight.
-        let g = c.tips(8).unwrap_err();
-        c.drop_all_tips();
-        c.put_tips(8, g, Instant::now(), vec![]);
-        assert!(c.tips(7).is_err() && c.tips(8).is_err());
+    fn read(c: &Caches, p: i64) -> TipsRead {
+        match c.tips(p) {
+            TipsLookup::Read(r) => r,
+            _ => panic!("expected to read"),
+        }
+    }
+
+    /// The cached rows, if any (a read this starts is ended at once).
+    fn rows(c: &Caches, p: i64) -> Option<BranchRows> {
+        match c.tips(p) {
+            TipsLookup::Hit(r) => Some(r),
+            TipsLookup::Read(r) => {
+                c.tips_failed(p, r);
+                None
+            }
+            TipsLookup::Wait(_) => None,
+        }
     }
 
     #[test]
-    fn tips_expire() {
+    fn a_notice_beats_a_read_that_started_before_it() {
         let c = Caches::default();
-        let g = c.tips(1).unwrap_err();
-        c.put_tips(1, g, Instant::now() - TIPS_TTL, vec![]);
-        assert!(c.tips(1).is_err(), "rows as old as TIPS_TTL are read again");
+        let r = read(&c, 7);
+        let at = Instant::now();
+        c.tips_changed(7);
+        c.put_tips(7, r, at, vec![("main".into(), "old".into())]);
+        assert!(rows(&c, 7).is_none(), "rows read before the notice are not kept");
+        let r = read(&c, 7);
+        c.put_tips(7, r, Instant::now(), vec![("main".into(), "new".into())]);
+        assert_eq!(rows(&c, 7).unwrap()[0].1, "new");
+        // A lost listener connection drops everything, and reads in flight.
+        let r = read(&c, 8);
+        c.drop_all_tips();
+        c.put_tips(8, r, Instant::now(), vec![]);
+        assert!(rows(&c, 7).is_none() && rows(&c, 8).is_none());
+    }
+
+    #[test]
+    fn one_read_at_a_time_and_tips_expire() {
+        let c = Caches::default();
+        let r = read(&c, 1);
+        let TipsLookup::Wait(done) = c.tips(1) else { panic!("a second asker waits") };
+        assert!(c.tips_reading(1, &done));
+        c.put_tips(1, r, Instant::now() - TIPS_TTL, vec![]);
+        assert!(!c.tips_reading(1, &done), "the read finished");
+        assert!(rows(&c, 1).is_none(), "rows as old as TIPS_TTL are read again");
+        let r = read(&c, 1);
+        c.tips_failed(1, r);
+        assert!(matches!(c.tips(1), TipsLookup::Read(_)), "after a failed read, the next asker reads");
     }
 }

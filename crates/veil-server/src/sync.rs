@@ -433,16 +433,38 @@ async fn resolve_stored(hub: &Hub, project: i64, id: &ObjectId) -> Result<Vec<Ob
 /// server's memory for at most `caches::TIPS_TTL`, dropped at every push's
 /// notice; each viewer's projection is of their current view.
 pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer) -> Result<Vec<(String, ObjectId)>> {
-    let rows = match hub.caches.tips(project.id) {
-        Ok(rows) => rows,
-        Err(generation) => {
-            let at = std::time::Instant::now();
-            let rows: Vec<(String, String)> = sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 ORDER BY name")
-                .bind(project.id)
-                .fetch_all(&hub.db)
-                .await?;
-            hub.caches.put_tips(project.id, generation, at, rows.clone());
-            Arc::new(rows)
+    use crate::caches::TipsLookup;
+    let rows = loop {
+        match hub.caches.tips(project.id) {
+            TipsLookup::Hit(rows) => break rows,
+            TipsLookup::Wait(done) => {
+                let woken = done.notified();
+                tokio::pin!(woken);
+                woken.as_mut().enable();
+                if hub.caches.tips_reading(project.id, &done) {
+                    // A read whose request was dropped never wakes anyone:
+                    // after TIPS_TTL the next asker reads.
+                    let _ = tokio::time::timeout(crate::caches::TIPS_TTL, woken).await;
+                }
+            }
+            TipsLookup::Read(read) => {
+                let at = std::time::Instant::now();
+                let r: std::result::Result<Vec<(String, String)>, sqlx::Error> =
+                    sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 ORDER BY name")
+                        .bind(project.id)
+                        .fetch_all(&hub.db)
+                        .await;
+                match r {
+                    Ok(rows) => {
+                        hub.caches.put_tips(project.id, read, at, rows.clone());
+                        break Arc::new(rows);
+                    }
+                    Err(e) => {
+                        hub.caches.tips_failed(project.id, read);
+                        return Err(e.into());
+                    }
+                }
+            }
         }
     };
     let mut out = Vec::new();

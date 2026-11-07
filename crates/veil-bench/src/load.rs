@@ -584,12 +584,22 @@ fn db_statements(rt: &tokio::runtime::Runtime, url: &str) -> Option<(f64, &'stat
     })
 }
 
-/// Transactions that wrote, so far: the transaction ids PostgreSQL assigned
-/// (a read-only transaction gets none). `None` elsewhere (YugabyteDB).
+/// Commits that wrote, so far: the transaction ids PostgreSQL assigned (a
+/// read-only transaction gets none), less the transactions rolled back (a
+/// compare-and-swap that loses a race takes an id, then rolls back).
+/// `None` elsewhere (YugabyteDB).
 fn db_writes(rt: &tokio::runtime::Runtime, url: &str) -> Option<f64> {
     rt.block_on(async {
         let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(url).await.ok()?;
-        sqlx::query_scalar::<_, f64>("SELECT pg_snapshot_xmax(pg_current_snapshot())::text::float8").fetch_one(&mut c).await.ok()
+        // Statistics reach pg_stat_database within a second or so.
+        let _ = sqlx::query("SELECT pg_stat_force_next_flush()").execute(&mut c).await;
+        sqlx::query_scalar::<_, f64>(
+            "SELECT pg_snapshot_xmax(pg_current_snapshot())::text::float8 \
+             - (SELECT xact_rollback FROM pg_stat_database WHERE datname = current_database())::float8",
+        )
+        .fetch_one(&mut c)
+        .await
+        .ok()
     })
 }
 
@@ -619,8 +629,11 @@ pub fn missed_gates(r: &serde_json::Value, background: f64) -> Vec<String> {
     let mut out = Vec::new();
     let mode = r["mode"].as_str().unwrap_or("");
     if matches!(mode, "land" | "branches") {
-        // A few landings straddle the window's edges.
-        if let Some(c) = r["db_commits_per_op"].as_f64().filter(|c| *c > GATE_COMMITS_PER_PUSH * 1.05) {
+        // A few landings straddle the window's edges, and the database's own
+        // maintenance (autovacuum, analyze) takes a few transactions.
+        let ops = r["ops"].as_f64().unwrap_or(0.0);
+        let over = |c: f64| c * ops > GATE_COMMITS_PER_PUSH * ops * 1.02 + 20.0;
+        if let Some(c) = r["db_commits_per_op"].as_f64().filter(|c| over(*c)) {
             out.push(format!("{mode}: {c:.2} database commits per landing (gate: {GATE_COMMITS_PER_PUSH})"));
         }
     }
