@@ -415,7 +415,7 @@ fn every_site_that_reads_missing_as_hidden_is_audited() {
         ("gc.rs", 4, "a thin clone's mark stops at what is on the server (fetching off)"),
         ("hub/project.rs", 2, "the server's own projection"),
         ("maintenance.rs", 2, "fetching off"),
-        ("promisor.rs", 5, "the read path itself"),
+        ("promisor.rs", 8, "the read path itself; a checkout's prefetch leaves a refused object for its reader, who finds it hidden"),
         ("remote.rs", 9, "transfers between local repositories (test fixtures); the server checks closure itself"),
         ("repo.rs", 1, "snapshot_opt: a snapshot beyond the boundary; graph queries run through Repo::exact"),
         ("sandbox.rs", 3, "a hidden file is not given to the sandbox"),

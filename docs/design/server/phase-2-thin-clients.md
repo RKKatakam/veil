@@ -1,6 +1,6 @@
 # Phase 2: thin clients, caches and agent workspaces
 
-> **Status: design, not built** (2026-11-06). Base: `integration` @ `3851159`.
+> **Status: design; S3 built** (2026-11-07, as built in `docs/HUB.md` §13.18), S4 and S10 built, the rest not built (2026-11-06). Base: `integration` @ `3851159`.
 > Sources of truth: `docs/OVERVIEW.md` and `docs/VISIBILITY.md`; where this document disagrees with them, they win. The server as built is `docs/HUB.md` §13. The roadmap is `docs/design/scion-for-developers.md`, phase 2. The client mechanics of fetch on demand come from `docs/design/scale/6-partial-clone.md`, which this document re-aims at the server and does not repeat.
 
 ## 1. Goal
@@ -355,7 +355,7 @@ Each is small enough for one agent. Dependencies and parallel work are in `docs/
 
 | # | Milestone | Contents | Depends on | Touches |
 |---|---|---|---|---|
-| **S3** | Fetch on demand in the client | `6-partial-clone.md` as amended here: `partial` marker, promisor, `Unavailable`, bounded cache and eviction, anchors; thin clone by default with no full graph; `vl log`/ancestry through `history` pages; `--full`, `vl partial`; uses S1's `fetch` | S1; the simplification pass (or S3 refuses partial clones of path and SFTP remotes) | `veil-core` store and remote, `crates/vl/src/hub.rs` |
+| **S3** (**built**, `HUB.md` §13.18) | Fetch on demand in the client | `6-partial-clone.md` as amended here: `partial` marker, promisor, `Unavailable`, bounded cache and eviction, anchors; thin clone by default with no full graph; `vl log`/ancestry through `history` pages; `--full`, `vl partial`; uses S1's `fetch` | S1; the simplification pass (or S3 refuses partial clones of path and SFTP remotes) | `veil-core` store and remote, `crates/vl/src/hub.rs` |
 | **S4** (**built**, `HUB.md` §13.14) | Request-path caches and one commit per landing | permission cache per person and project, session cache, snapshot-resolution cache, in-memory tips invalidated by notification (no per-project counter); the snapshot, memo, origin and audit rows in the push transaction; cost gates in `veil-bench load` (`storage-and-cost.md`) | S1 | `veil-server` `auth.rs`, `perm.rs`, `sync.rs` |
 | **S5** (built, `HUB.md` §13.16) | Read grants and the object routes | grant key, `hub-grant` and `hub-request` contexts, grants with tips, `GET /v1/objects`, `:batch`, the chain check as a `veil-core::hub` function (WASM-safe, shared by every layer), access epochs and their feed | S1 | `veil-core/src/hub/`, new `veil-server` `grant.rs` |
 | **S6** | The Veil daemon: shared object cache | `vl daemon`, socket, store, LRU and pinning, grant and chain checks per request, forwarding signed requests upstream, epoch polling, warm trees of followed projects; the promisor reads through it | S3, S5 | new `crates/vl/src/daemon/` |

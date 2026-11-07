@@ -1,6 +1,6 @@
 # 6. Fetch on demand from the server
 
-Status: **not built; re-aimed at the server** (Scion 4.1, 4.2 and 4.4; `docs/HUB.md` §4.4, §9.1). Veil is server-centric (`docs/OVERVIEW.md`): the client fetches from the Veil server, which checks access on every request and serves each object by id through the caches. The client-side mechanics below (the marker, the cache area, `Unavailable`, eviction, push from a partial checkout) carry over unchanged. **Requires format 6:**
+Status: **built as amended, as milestone S3** (`docs/HUB.md` §13.18: no full graph, format 9, the cache at `.veil/cache/`; anchors.json and promotion deferred until the server has a gc). Re-aimed at the server (Scion 4.1, 4.2 and 4.4; `docs/HUB.md` §4.4, §9.1). Veil is server-centric (`docs/OVERVIEW.md`): the client fetches from the Veil server, which checks access on every request and serves each object by id through the caches. The client-side mechanics below (the marker, the cache area, `Unavailable`, eviction, push from a partial checkout) carry over unchanged. **Requires format 6:**
 - `repo.json` gains the `partial` marker;
 - an older vl would read every object not yet fetched as `Missing`, which **the engine treats as redacted** (`VeilError::is_unreadable`, `error.rs`). It would leave files out of checkouts, skip history on push and gc nothing (threat 1).
 

@@ -15,7 +15,7 @@
 //!
 //! **The read path.** When neither area holds an object:
 //! 1. its *location* is looked up: the snapshot and path where this process
-//!    met it, recorded when the tree naming it was decoded ([`Locator`]).
+//!    met it, recorded when the tree naming it was decoded (the locator).
 //!    The server checks every request against that path in the person's
 //!    projection of that snapshot, so the client never asks for anything
 //!    it did not meet in a tree the server gave it;
@@ -510,18 +510,26 @@ impl ObjectStore {
         }
         wants.sort_by_key(|w| w.snapshot);
         for batch in wants.chunks(PREFETCH_BATCH) {
+            let mut refused = Vec::new();
+            // One pack per batch (one barrier), not a durable file each.
+            let mut incoming = crate::remote::Incoming::new(&p.cache);
             for (w, got) in batch.iter().zip(promisor.fetch(batch)?) {
                 match got {
                     Some(raw) => {
-                        self.keep_fetched(p, &w.id, &raw)?;
+                        self.check_fetched(p, &w.id, &raw)?;
+                        incoming.put(w.id, raw, &w.path)?;
                         p.fetched.fetch_add(1, Ordering::Relaxed);
                     }
-                    // Asked again the ordinary way: other places, then
-                    // `Missing` (hidden) or `Unavailable`.
-                    None => match self.read_raw(&w.id) {
-                        Ok(_) | Err(VeilError::Missing(_)) => {}
-                        Err(e) => return Err(e),
-                    },
+                    None => refused.push(w.id),
+                }
+            }
+            incoming.finish()?;
+            // Asked again the ordinary way: other places, then `Missing`
+            // (hidden) or `Unavailable`.
+            for id in refused {
+                match self.read_raw(&id) {
+                    Ok(_) | Err(VeilError::Missing(_)) => {}
+                    Err(e) => return Err(e),
                 }
             }
         }
@@ -532,6 +540,13 @@ impl ObjectStore {
     /// its BLAKE3 id, a canonical decoding, storable in this format, and
     /// room under the cache's bound.
     fn keep_fetched(&self, p: &Partial, id: &ObjectId, raw: &[u8]) -> Result<()> {
+        self.check_fetched(p, id, raw)?;
+        p.cache.put_raw(id, raw)?;
+        Ok(())
+    }
+
+    /// The checks of [`ObjectStore::keep_fetched`], and the room it takes.
+    fn check_fetched(&self, p: &Partial, id: &ObjectId, raw: &[u8]) -> Result<()> {
         if ObjectId::hash(raw) != *id {
             return Err(VeilError::Corrupt(id.hex(), "the server sent an object that does not match its id".into()));
         }
@@ -540,9 +555,7 @@ impl ObjectStore {
             return Err(VeilError::Corrupt(id.hex(), "the server sent a snapshot where a tree entry was asked for".into()));
         }
         self.check_storable(raw)?;
-        self.charge(p, raw.len() as u64)?;
-        p.cache.put_raw(id, raw)?;
-        Ok(())
+        self.charge(p, raw.len() as u64)
     }
 
     /// Make room for `need` more bytes in the cache, evicting if needed;
@@ -729,8 +742,15 @@ impl ObjectStore {
                         }
                         incoming.finish()?;
                     }
-                    c.backend().remove_file(&crate::pack::index_file(&dir, &name))?;
-                    c.backend().remove_file(&crate::pack::pack_file(&dir, &name))?;
+                    // Index first (readers find a pack by it); another
+                    // process may have removed either already.
+                    for f in [crate::pack::index_file(&dir, &name), crate::pack::pack_file(&dir, &name)] {
+                        match c.backend().remove_file(&f) {
+                            Ok(()) => {}
+                            Err(e) if e.is_not_found() => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
                     out.after = out.after.saturating_sub(len) + added;
                     out.removed += 1;
                 }
