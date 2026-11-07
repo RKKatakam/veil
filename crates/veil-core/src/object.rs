@@ -133,8 +133,8 @@ pub enum EntryKind {
     File,
     Dir,
     /// An unresolved file conflict: `id` names a [`Conflict`] object. The
-    /// entry itself is always public, not executable, with no size or
-    /// fallback (its terms carry their own); repository format 4.
+    /// entry itself is always public, not executable, with no size;
+    /// repository format 4.
     Conflict,
     /// A symbolic link: `id` names the (plaintext or sealed) blob of the
     /// link's target bytes, sealed like file content under the policy of
@@ -223,11 +223,10 @@ pub enum Visibility {
     /// Plaintext, synchronised everywhere.
     #[default]
     Public,
-    /// Encrypted under a scope key; plaintext only for scope members.
+    /// A secret file (`.env`, keys and similar), encrypted under a scope
+    /// key; plaintext only for scope members. Only secret files are ever
+    /// encrypted (`docs/VISIBILITY.md`), and never a directory.
     Cloaked { scope: String },
-    /// Encrypted under a one-off embargo key until released (delayed-visibility
-    /// merge). Readers without the key see the entry's `fallback` instead.
-    Embargoed { embargo: String },
 }
 
 impl Visibility {
@@ -240,7 +239,6 @@ impl Visibility {
         match self {
             Visibility::Public => None,
             Visibility::Cloaked { scope } => Some(scope.clone()),
-            Visibility::Embargoed { embargo } => Some(format!("embargo/{embargo}")),
         }
     }
 
@@ -248,7 +246,6 @@ impl Visibility {
         match self {
             Visibility::Public => "public".into(),
             Visibility::Cloaked { scope } => format!("cloaked:{scope}"),
-            Visibility::Embargoed { embargo } => format!("embargo:{embargo}"),
         }
     }
 }
@@ -271,12 +268,6 @@ pub struct TreeEntry {
     pub executable: bool,
     #[serde(default, skip_serializing_if = "Visibility::is_public")]
     pub visibility: Visibility,
-    /// The object shown to readers who cannot read `id`: for embargoed
-    /// entries the pre-merge version (until they hold the embargo key); for
-    /// a public file sealed only because it was edited on a cloaked line,
-    /// its last public version (ARCHITECTURE §4, rule 5).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback: Option<ObjectId>,
 }
 
 impl TreeEntry {
@@ -286,7 +277,6 @@ impl TreeEntry {
             && self.id == other.id
             && self.executable == other.executable
             && self.visibility == other.visibility
-            && self.fallback == other.fallback
     }
 
     pub fn dir(name: &str, id: ObjectId) -> TreeEntry {
@@ -297,7 +287,6 @@ impl TreeEntry {
             size: 0,
             executable: false,
             visibility: Visibility::Public,
-            fallback: None,
         }
     }
 
@@ -312,7 +301,7 @@ impl TreeEntry {
     /// A conflict entry carries nothing but its name and object id.
     fn conflict_fields_valid(&self) -> bool {
         self.kind != EntryKind::Conflict
-            || (self.size == 0 && !self.executable && self.visibility.is_public() && self.fallback.is_none())
+            || (self.size == 0 && !self.executable && self.visibility.is_public())
     }
 
     /// A symlink is never executable.
@@ -335,8 +324,6 @@ pub struct ConflictTerm {
     pub executable: bool,
     #[serde(default, skip_serializing_if = "Visibility::is_public")]
     pub visibility: Visibility,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback: Option<ObjectId>,
 }
 
 impl ConflictTerm {
@@ -350,7 +337,6 @@ impl ConflictTerm {
             size: e.size,
             executable: e.executable,
             visibility: e.visibility.clone(),
-            fallback: e.fallback,
         }
     }
 
@@ -364,13 +350,12 @@ impl ConflictTerm {
             size: self.size,
             executable: self.executable,
             visibility: self.visibility.clone(),
-            fallback: self.fallback,
         }
     }
 
     /// Same version: equal in everything but the (claimed) size.
     pub fn same(&self, other: &ConflictTerm) -> bool {
-        self.kind == other.kind && self.id == other.id && self.executable == other.executable && self.visibility == other.visibility && self.fallback == other.fallback
+        self.kind == other.kind && self.id == other.id && self.executable == other.executable && self.visibility == other.visibility
     }
 }
 
@@ -427,16 +412,9 @@ impl Conflict {
         (0..=2 * n).map(move |i| if i % 2 == 0 { &self.adds[i / 2] } else { &self.removes[i / 2] })
     }
 
-    /// Every object id the conflict references (term ids and fallbacks).
+    /// Every object id the conflict references (its terms).
     pub fn referenced_ids(&self) -> Vec<ObjectId> {
-        let mut out = Vec::new();
-        for t in self.interleaved().flatten() {
-            out.push(t.id);
-            if let Some(fb) = t.fallback {
-                out.push(fb);
-            }
-        }
-        out
+        self.interleaved().flatten().map(|t| t.id).collect()
     }
 
     /// The payload (without the tag): version byte `0x04`, the number of
@@ -447,9 +425,8 @@ impl Conflict {
     /// term     = 0x00                                   (absent)
     ///          | flags u8 | id [32] | size uvarint      if flags.SIZE
     ///            | label_len uvarint | label            if tier != public
-    ///            | fallback [32]                        if flags.FALLBACK
     /// flags    = bit 0 PRESENT (set) · bit 1 EXECUTABLE · bit 2 SIZE ·
-    ///            bit 3 FALLBACK · bits 4–5 tier as in trees ·
+    ///            bit 3 reserved (a fallback, before format 8) · bits 4–5 tier as in trees ·
     ///            bits 6–7 term kind (format 5): 0 file, 1 symlink,
     ///            2 and 3 reserved; EXECUTABLE clear unless a file
     /// ```
@@ -469,9 +446,6 @@ impl Conflict {
             if t.size != 0 {
                 flags |= C_SIZE;
             }
-            if t.fallback.is_some() {
-                flags |= C_FALLBACK;
-            }
             out.push(flags);
             out.extend_from_slice(&t.id.0);
             if t.size != 0 {
@@ -480,9 +454,6 @@ impl Conflict {
             if let Some(l) = label {
                 put_uvarint(&mut out, l.len() as u64);
                 out.extend_from_slice(l.as_bytes());
-            }
-            if let Some(fb) = &t.fallback {
-                out.extend_from_slice(&fb.0);
             }
         }
         out
@@ -539,7 +510,7 @@ impl Conflict {
             let visibility = match (flags & TIER_MASK) >> TIER_SHIFT {
                 TIER_PUBLIC => Visibility::Public,
                 TIER_CLOAKED => Visibility::Cloaked { scope: r.string().map_err(corrupt)? },
-                TIER_EMBARGOED => Visibility::Embargoed { embargo: r.string().map_err(corrupt)? },
+                TIER_EMBARGOED => return Err(removed_encryption("a conflict term is under an embargo")),
                 t => {
                     return Err(VeilError::Unsupported(format!(
                         "conflict term uses visibility tier {t}, which vl {} does not know; this repository needs a newer vl",
@@ -547,14 +518,15 @@ impl Conflict {
                     )))
                 }
             };
-            let fallback = if flags & C_FALLBACK != 0 { Some(r.id().map_err(corrupt)?) } else { None };
+            if flags & C_FALLBACK != 0 {
+                return Err(removed_encryption("a conflict term carries a fallback version"));
+            }
             terms.push(Some(ConflictTerm {
                 kind,
                 id,
                 size,
                 executable: flags & C_EXEC != 0,
                 visibility,
-                fallback,
             }));
         }
         if r.at != payload.len() {
@@ -687,6 +659,11 @@ impl Tree {
                     format!("{} entry {:?} is executable", e.kind.name(), truncate_for_error(&e.name)),
                 ));
             }
+            // Only secret files are sealed: a sealed directory (a cloaked
+            // folder of an older vl) is refused.
+            if e.kind == EntryKind::Dir && !e.visibility.is_public() {
+                return Err(removed_encryption(&format!("directory {:?} is encrypted", truncate_for_error(&e.name))));
+            }
             if let Some(p) = prev {
                 if p >= e.name.as_str() {
                     return Err(VeilError::Corrupt(
@@ -711,9 +688,10 @@ impl Tree {
 //   entry   = name_len uvarint | name (UTF-8) | flags u8 | id [32]
 //             | size uvarint            if flags & SIZE  (and then size != 0)
 //             | label_len uvarint | label (UTF-8)  if tier != public
-//             | fallback [32]           if flags & FALLBACK
-//   flags   = bit 0 DIR, bit 1 EXECUTABLE, bit 2 SIZE, bit 3 FALLBACK,
-//             bits 4-5 tier (0 public, 1 cloaked, 2 embargoed, 3 reserved),
+//   flags   = bit 0 DIR, bit 1 EXECUTABLE, bit 2 SIZE, bit 3 reserved (a
+//             fallback version before format 8, refused since),
+//             bits 4-5 tier (0 public, 1 cloaked: a secret file, 2 reserved:
+//             embargoed before format 8, refused since, 3 reserved),
 //             bit 6 CONFLICT (format 4: `id` names a conflict object; every
 //             other bit clear), bit 7 KIND (format 5: a `kind` byte follows
 //             the flags, 1 symlink; 2 is reserved, never reused; DIR,
@@ -762,8 +740,16 @@ fn tier_of(v: &Visibility) -> (u8, Option<&String>) {
     match v {
         Visibility::Public => (TIER_PUBLIC, None),
         Visibility::Cloaked { scope } => (TIER_CLOAKED, Some(scope)),
-        Visibility::Embargoed { embargo } => (TIER_EMBARGOED, Some(embargo)),
     }
+}
+
+/// Content that only a removed feature wrote: an embargoed entry or a
+/// fallback version (encrypted embargoes), or a sealed directory (cloaked
+/// folders). Only secret files are encrypted since format 8.
+pub fn removed_encryption(what: &str) -> VeilError {
+    VeilError::Unsupported(format!(
+        "{what}: encryption of anything but secret files was removed from vl (format 8); `vl upgrade` lists what still holds it"
+    ))
 }
 
 fn put_uvarint(out: &mut Vec<u8>, mut v: u64) {
@@ -864,9 +850,6 @@ impl Tree {
             if e.size != 0 {
                 flags |= F_SIZE;
             }
-            if e.fallback.is_some() {
-                flags |= F_FALLBACK;
-            }
             out.push(flags);
             if let Some(k) = kind_byte {
                 out.push(k);
@@ -878,9 +861,6 @@ impl Tree {
             if let Some(l) = label {
                 put_uvarint(&mut out, l.len() as u64);
                 out.extend_from_slice(l.as_bytes());
-            }
-            if let Some(fb) = &e.fallback {
-                out.extend_from_slice(&fb.0);
             }
         }
         out
@@ -948,7 +928,9 @@ impl Tree {
             let visibility = match (flags & TIER_MASK) >> TIER_SHIFT {
                 TIER_PUBLIC => Visibility::Public,
                 TIER_CLOAKED => Visibility::Cloaked { scope: r.string()? },
-                TIER_EMBARGOED => Visibility::Embargoed { embargo: r.string()? },
+                TIER_EMBARGOED => {
+                    return Err(removed_encryption(&format!("tree entry {:?} is under an embargo", truncate_for_error(&name))))
+                }
                 t => {
                     return Err(VeilError::Unsupported(format!(
                         "tree entry {:?} uses visibility tier {t}, which vl {} does not know; this repository needs a newer vl",
@@ -957,7 +939,9 @@ impl Tree {
                     )))
                 }
             };
-            let fallback = if flags & F_FALLBACK != 0 { Some(r.id()?) } else { None };
+            if flags & F_FALLBACK != 0 {
+                return Err(removed_encryption(&format!("tree entry {:?} carries a fallback version", truncate_for_error(&name))));
+            }
             entries.push(TreeEntry {
                 name,
                 kind: if let Some(k) = special {
@@ -973,7 +957,6 @@ impl Tree {
                 size,
                 executable: flags & F_EXEC != 0,
                 visibility,
-                fallback,
             });
         }
         if r.at != payload.len() {
@@ -985,12 +968,22 @@ impl Tree {
     }
 }
 
-/// Descriptions may themselves be cloaked (snapshots on cloaked branches).
+/// A description or message: always plain text (only secret files are
+/// ever encrypted, `docs/VISIBILITY.md`). One variant, encoded as
+/// `{"plain": …}` as before, so existing snapshot ids are unchanged; the
+/// sealed variant of formats 7 and earlier is refused on decoding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Text {
     Plain(String),
-    Sealed(Envelope),
+}
+
+impl Text {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Text::Plain(s) => s,
+        }
+    }
 }
 
 impl Default for Text {
@@ -1015,10 +1008,6 @@ pub struct Snapshot {
     /// Paths that still contain unresolved conflict markers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicts: Vec<String>,
-    /// Set on snapshots of a cloaked line of work: every file and the
-    /// description are sealed under this scope.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cloak: Option<String>,
     /// Embargo introduced by this (merge) snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embargo: Option<String>,
@@ -1045,7 +1034,6 @@ impl Snapshot {
             timestamp: 0,
             predecessors: vec![],
             conflicts: vec![],
-            cloak: None,
             embargo: None,
             signature: None,
         }

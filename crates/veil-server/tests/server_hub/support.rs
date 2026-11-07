@@ -652,7 +652,6 @@ impl<'a> Craft<'a> {
             size: 1,
             executable: false,
             visibility: vis,
-            fallback: None,
         };
         self.root = self.set_at("", Some(self.root), &parts, entry);
     }
@@ -690,7 +689,6 @@ impl<'a> Craft<'a> {
             timestamp: veil_core::now_millis(),
             predecessors: vec![],
             conflicts: vec![],
-            cloak: None,
             embargo: None,
             signature: None,
         };
@@ -715,7 +713,6 @@ impl Craft<'_> {
             timestamp: veil_core::now_millis(),
             predecessors: vec![],
             conflicts: vec![],
-            cloak: None,
             embargo: None,
             signature: None,
         };
@@ -737,7 +734,6 @@ impl Craft<'_> {
             timestamp: veil_core::now_millis(),
             predecessors: vec![],
             conflicts: vec![],
-            cloak: None,
             embargo: None,
             signature: None,
         };
@@ -803,7 +799,6 @@ impl Craft<'_> {
             size,
             executable: false,
             visibility: Visibility::Public,
-            fallback: None,
         };
         self.root = self.set_at("", Some(self.root), &parts, entry);
     }
@@ -830,7 +825,6 @@ impl Craft<'_> {
             timestamp: veil_core::now_millis(),
             predecessors: vec![],
             conflicts: vec![],
-            cloak: None,
             embargo: None,
             signature: None,
         };

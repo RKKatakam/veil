@@ -1,6 +1,6 @@
 # Workspaces and agents
 
-> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). Where this page mentions cloaking, scopes, isolated files or path and SSH remotes, the server replaces them with folder access, encrypted secrets and pushes to the server.
+> Only secret files (`.env`, keys) are ever encrypted ("cloaked", for a scope); who sees folders and code is decided by folder access (see [OVERVIEW.md](../OVERVIEW.md) and [VISIBILITY.md](../VISIBILITY.md)). `vl` syncs only through the Veil server.
 
 A **workspace** is a line of work with its own working-copy change. Unlike a
 Git worktree it needs no directory: it lives in the repository, and you
@@ -32,7 +32,7 @@ $ vl ws list
 
 | Command | Does |
 |---|---|
-| `vl ws new NAME [-r REV] [--cloak [S]]` | A workspace whose working copy is a new change on `REV` (default: the parents of `@`, like a fresh checkout). `--cloak` seals everything recorded in it (default scope `team`) |
+| `vl ws new NAME [-r REV]` | A workspace whose working copy is a new change on `REV` (default: the parents of `@`, like a fresh checkout) |
 | `vl ws list` | Workspaces and their working copies; `*` marks the one your directory is attached to |
 | `vl ws switch NAME` | Attach the project directory to `NAME`: your files are recorded in the current workspace first, then replaced by `NAME`'s. `vl undo` right after it switches back |
 | `vl ws exec NAME -- CMD…` | Run `CMD` in `NAME`'s sandbox, which holds its files, and record the result in `NAME` |
@@ -58,8 +58,7 @@ there. Each workspace keeps its own unrecorded edits whatever you undo or
 redo; an undo that would delete a workspace holding recorded edits (undoing
 its `vl ws new`) is refused.
 
-**Undo with agents at work.** In a repository at format 6 (`vl upgrade`),
-commands never wait for each other: each records its operation without
+**Undo with agents at work.** Commands never wait for each other: each records its operation without
 taking the repository lock, and operations that ran at the same time are
 merged by the next command. Undo then belongs to the workspace you run it
 in: `vl undo` in the project directory undoes your last command there (or
@@ -96,8 +95,7 @@ notes
 ```
 
 **Committing in a workspace moves tags** as in `default`: a `vl commit`
-whose parent is `main` moves `main`. In a **cloaked** workspace it moves
-only tags cloaked under the same scope, never `main`. See
+whose parent is `main` moves `main`. See
 [Tags](getting-started.md#tags).
 When an ordinary workspace's work should land later, `vl describe` it (or
 `vl commit --no-advance`) and `vl merge NAME@` when ready.
@@ -129,12 +127,12 @@ running cargo build in /home/me/app/.veil/local/sandboxes/agent/files (confined 
 * What the command leaves behind is recorded in the workspace, through the
   same policy and secret scanner as your own snapshots, so a tool or agent
   cannot record a secret either.
-* **Agents can't declassify.** In the sandbox the command edits
+* **Agents can't weaken protection.** In the sandbox the command edits
   `.veilpolicy`, not you, so its edit is treated like a policy that
   arrived from someone else. An edit that only protects more (new
   `ignore`, `isolate` or `cloak` rules) is recorded and applies at once.
   One that weakens the workspace's policy (emptying the file, deleting a
-  rule, `public!`, `** public`, moving a cloaked directory to another
+  rule, `public!`, `** public`, moving a secret file to another
   scope) is **held back**: the workspace keeps its recorded `.veilpolicy`,
   every file keeps the protection it had (its stronger rules still
   apply), and `vl` says so:
@@ -142,7 +140,7 @@ running cargo build in /home/me/app/.veil/local/sandboxes/agent/files (confined 
   ```text
   $ vl ws exec agent -- my-agent "tidy the repo"
   …
-  warning: .veilpolicy, as the command left it, would weaken the protection of 1 path(s): the edit is not recorded (a command is not you, so the recorded policy stays, and only the edit's stronger rules apply; these keep their recorded protection: secret/plan.md (cloak team → public)). It stays in the sandbox (…/.veil/local/sandboxes/agent/files): review it, then `vl policy accept --workspace agent` records it
+  warning: .veilpolicy, as the command left it, would weaken the protection of 1 path(s): the edit is not recorded (a command is not you, so the recorded policy stays, and only the edit's stronger rules apply; these keep their recorded protection: deploy/.env.prod (cloak team → public!)). It stays in the sandbox (…/.veil/local/sandboxes/agent/files): review it, then `vl policy accept --workspace agent` records it
   ```
 
   The edit stays in the sandbox, and every later run holds it back again.
@@ -199,11 +197,11 @@ What the command sees:
 | **The project** | the workspace's sandbox, read-write, **at the project's real path** (`/home/me/app`), starting in the sub-folder you ran `vl` from. Absolute paths and tools that look in parent directories behave as in the project; every write goes to the sandbox. Your project directory and its `.veil` are not there. |
 | **The computer's tools** | `/usr`, `/bin`, `/lib`, `/etc`, `/opt`: read-only, live. |
 | **`HOME`, `/tmp`, `/var/tmp`** | empty and private, gone after the run. `~/.ssh`, `~/.gnupg`, cloud credentials, other projects and the Veil identity are not there. |
-| **The allow-list** | toolchains and agents' own configuration, **read-only**: `~/.cargo` (without its `credentials.toml`), `~/.rustup`, `~/.local/bin`, `~/.local/share/claude`, `~/.nvm`, `~/.pyenv`, `~/.volta`, `~/.bun`, `~/.deno`, `~/.claude`, `~/.claude.json`, `~/.codex`, `~/.gemini`, those that exist. |
+| **The allow-list** | toolchains and agents' own configuration: `~/.cargo` (without its `credentials.toml`), `~/.rustup`, `~/.local/bin`, `~/.local/share/claude`, `~/.nvm`, `~/.pyenv`, `~/.volta`, `~/.bun`, `~/.deno`, `~/.claude`, `~/.claude.json`, `~/.codex`, `~/.gemini`, those that exist. **Writable, but never your real folders:** what the command writes there (cargo's downloads, an agent's settings and sessions, an `npm -g` install) goes to the workspace's own layer, and its next runs see it. |
 | **Processes** | only its own: it cannot see or signal your other programs, or another workspace's run. |
 | **Network** | on (agents call their model's API); `--no-network` leaves only a private loopback. |
 
-* **More of the machine, read-only:** `--allow PATH` (repeatable), or for
+* **More of the machine:** `--allow PATH` (repeatable), or for
   every run, in `.veil/local/config.toml` (this repository) or
   `$VEIL_HOME/config.toml` (all of them):
 
@@ -216,9 +214,40 @@ What the command sees:
   teammate's tracked `config.toml`) can widen what an agent sees. The Veil
   home, your project directory and cargo's credentials stay hidden even
   inside an allowed folder, or behind an allowed link to one; a path
-  inside the Veil home or the project cannot be allowed. An agent that must
-  write its configuration (a token refresh) cannot, here; a read-only
-  folder still lets the command reach sockets and FIFOs in it.
+  inside the Veil home or the project cannot be allowed. The command can
+  reach sockets and FIFOs in an allowed folder.
+* **Writes to the allow-list stay with the workspace.** Each allowed folder
+  is shown through an overlay: your real `~/.cargo` underneath, unchanged,
+  and the workspace's own layer on top, in
+  `.veil/local/sandboxes/agent/layers-…/` (only you can read it; it is never
+  recorded or synced, and other workspaces don't see it). An allowed file
+  (`~/.claude.json`) is copied there on first use. So `cargo build` after an
+  agent adds a crate works, and the agent keeps its settings and session
+  history from one run to the next; your own `cargo` and `claude` never see
+  any of it. A download costs disk once per workspace (serde_json and its
+  dependencies, about 5 MiB; tokio with all features, about 26 MiB; next to
+  nothing for crates your `~/.cargo` already has).
+  * **Starting over:** delete `.veil/local/sandboxes/agent/layers-*` (when
+    nothing runs in the workspace); `vl ws rm` deletes it with the
+    workspace. A workspace made again under the name of one you removed
+    (with `vl undo`) starts from your real folders: the layers belong to
+    the workspace, not its name. The workspace's copy of a file is not
+    refreshed from yours. A `chmod` an agent makes to its layer is undone
+    at the next run.
+  * **Sockets and FIFOs** you allow are shown as they are (reachable,
+    never copied).
+  * **Thrown away instead:** with `--ephemeral`, and with `--with-isolated`
+    (a command given secrets keeps nothing it wrote outside its files, so
+    no copy of a secret, and no transcript quoting one, outlives the run).
+  * **Read-only:** a folder that holds the project, or something hidden
+    deeper inside it (`running … (confined at …, read-only: ~/src)`).
+  * **Hooks and configuration an agent plants in its layer** (an
+    `~/.claude/settings.json` hook) apply to that workspace's later
+    confined runs only; deleting the layers removes them.
+  * **Without overlayfs** (a kernel before 5.11, a restricted user
+    namespace; `vl doctor` says), the allow-list is read-only and `vl`
+    says what that breaks: `cargo cannot download crates, and coding
+    agents cannot save their settings or sessions`.
 * **When the command exits, everything it started stops** (a dev server
   too), and `kill -9` of `vl` stops it all as well. In the rare instant
   `bwrap` starts the sandbox, that is left to the reaper (with injected
@@ -303,15 +332,15 @@ a copy of the repository: `vl ws new agent`, then
 
 * **Everything outside the paths is recorded exactly as the workspace has
   it.** A sparse run never deletes or changes a file it doesn't hold, and
-  cloaked files outside keep their sealing.
+  sealed secret files outside keep their sealing.
 * **Inside the paths, it is an ordinary run**: edits, new files and
   deletions are recorded, through the policy and the secret scanner.
   Deleting `.veilpolicy`, or leaving it unreadable, a symlink or a
   directory, is not an edit of the policy, in any sandbox: the workspace
   keeps its recorded policy (with a warning, and a deleted one is put
-  back), so no cloaked file is ever declassified that way. An edit of the
-  file that weakens the policy is held back (see "Agents can't
-  declassify" above).
+  back), so no file's protection is ever weakened that way. An edit of
+  the file that weakens the policy is held back (see "Agents can't weaken
+  protection" above).
 * **Files the command writes outside the paths are not recorded.**
   `vl` lists them (`not recorded: … written outside --only`) and removes
   them from the sandbox, so a later run with more paths never mistakes
@@ -323,7 +352,7 @@ a copy of the repository: `vl ws new agent`, then
 * **`.veilpolicy` is always there** (the snapshot needs it to classify
   anything). If the command edits it, the new policy applies to every
   file of the workspace, inside the paths or not, as for a full run: a
-  newly cloaked directory outside the paths is recorded cloaked, and an
+  newly cloaked secret file outside the paths is recorded sealed, and an
   edit that would weaken the protection of a file outside the paths is
   held back as in a full run. Files
   that were ignored or isolated before the edit are never removed as
@@ -505,11 +534,10 @@ directory per line of work, any tool works in it, your project directory
 stays where it is.
 
 * **What you see** is what a checkout of the workspace would give you, as
-  you: cloaked files you are a member for, in plaintext; cloaked files you
-  are not, absent (or their last public version, as for an embargoed
-  fix); conflicted files with their markers. When you are granted a
-  scope (or an embargo is released) and pull, the files you can now read
-  appear in the mount within about a second. Files you never saw are never
+  you: secret files sealed for a scope you are a member of, in plaintext;
+  those sealed for a scope you are not in, absent; conflicted files with
+  their markers. When you are granted a scope and pull, the files you can
+  now read appear in the mount within about a second. Files you never saw are never
   recorded as deleted: if you delete a directory that held some, they
   stay in the workspace (and out of the mount). Nobody else on the
   machine, not even root, can enter the mount, and its files are `0600`
@@ -524,8 +552,7 @@ stays where it is.
   and agents write in mounts too, so an edit of `.veilpolicy` there is
   judged as in a sandbox: what weakens the policy is held back, stays in
   the mount, and `vl policy accept --workspace NAME` records it.
-  Symlinks are created as they are and recorded as links (repository
-  format 5; refused below it); the mount itself never follows one (the
+  Symlinks are created as they are and recorded as links; the mount itself never follows one (the
   kernel resolves a link for the program that uses it). Hard links and
   special files are refused.
 * **When it is recorded:** by `vl ws unmount`; before every other `vl`
@@ -560,8 +587,8 @@ stays where it is.
   there again at the next mount. `vl ws rm --force NAME` deletes them.
 * You can't mount the workspace your directory is attached to, mount
   inside the project directory or inside any other Veil repository (its
-  snapshots would walk into the mount and record what it shows, cloaked
-  files in plaintext, as its own), or on a directory that is not empty.
+  snapshots would walk into the mount and record what it shows, sealed
+  secret files in plaintext, as its own), or on a directory that is not empty.
   A repository created around a mount later never records it either. `vl ws switch` to a mounted workspace is
   refused: unmount it first.
 * `vl ws unmount` refuses while something has a file open in the mount or
@@ -619,18 +646,17 @@ let base = repo.root_id(); // or any revision: veil_core::revset::resolve(&repo,
 let ws = repo.ephemeral_workspace(base)?;
 ws.write("NOTES.md", "written by an agent\n")?;
 let (snapshot, _) = repo.commit_ephemeral(&ws, "agent: notes")?;
-repo.set_tag("agent-result", snapshot, None, false)?;
+repo.set_tag("agent-result", snapshot, false)?;
 ```
 
 * `identity` is an `Identity`: generate one for the agent
   (`Identity::generate("agent")`) or load one with `Identity::from_json`.
-  An agent identity that isn't a scope member can't read cloaked files, and
-  they are carried over unchanged in what it records.
+  An agent identity that isn't a scope member can't read sealed secret
+  files, and they are carried over unchanged in what it records.
 * `report` (a `BuildReport`) lists what was quarantined, isolated or
   held back, as `vl status` would.
-* The agent and your `vl` commands can run at the same time: at format 6
-  nothing waits for a lock, and concurrent operations are merged; below
-  format 6 writes go through the repository lock.
+* The agent and your `vl` commands can run at the same time: nothing
+  waits for a lock, and concurrent operations are merged.
 * Both examples are compiled and run by
   `crates/vl/tests/cli_workspaces/guide_library.rs`.
 

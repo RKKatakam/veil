@@ -116,7 +116,6 @@ fn leaf(repo: &Repo, name: &str, kind: EntryKind, content: &str, vis: Visibility
         size: content.len() as u64,
         executable: false,
         visibility: vis,
-        fallback: None,
     }
 }
 
@@ -426,9 +425,9 @@ fn vcs_metadata_links_and_a_linked_policy_are_never_recorded_as_links() {
         assert!(entry_at(&repo, &tree, path).is_none(), "{path} was recorded");
     }
     // The linked policy is read (its rules apply), never recorded as a link.
-    d.write("secret/k", "key\n");
+    d.write("secret/.env.k", "key\n");
     repo.snapshot_workspace(WS, &d.fs).unwrap();
-    assert_eq!(entry_at(&repo, &wc_tree(&repo), "secret/k").unwrap().visibility, team());
+    assert_eq!(entry_at(&repo, &wc_tree(&repo), "secret/.env.k").unwrap().visibility, team());
     let _ = s;
 }
 
@@ -462,11 +461,9 @@ fn below_format_5_links_stay_special_files() {
         &veil_core::builder::BuildOptions {
             policy: &veil_core::policy::Policy::builtin(),
             parent_tree: None,
-            cloak: None,
             injected: None,
             rescan: false,
             materialised: None,
-            line_base: None,
             line_endings: Default::default(),
         },
     )
@@ -902,20 +899,20 @@ proptest! {
         let (mut repo, _, _) = new_repo("alice");
         d.write(".veilpolicy", "private/ cloak team\n");
         d.write("README", "hi\n");
-        d.link("private/current", &target);
+        d.link("private/.env.current", &target);
         d.link("public/readme", "../README");
         let snap = repo.snapshot_workspace(WS, &d.fs).unwrap().snapshot;
-        let e = file_entry(&repo, &snap, "private/current").unwrap();
+        let e = file_entry(&repo, &snap, "private/.env.current").unwrap();
         prop_assert_eq!(e.kind, EntryKind::Symlink);
         prop_assert_eq!(&e.visibility, &team());
         prop_assert!(backend_contains(&**repo.backend(), target.as_bytes()).is_empty(), "plaintext target in the store");
-        repo.set_tag("main", snap, None, false).unwrap();
+        repo.set_tag("main", snap, false).unwrap();
         let mirror = Arc::new(MemoryBackend::new());
         remote::push(&mut repo, mirror.clone(), true, &[], false).unwrap();
         prop_assert!(backend_contains(&*mirror, target.as_bytes()).is_empty());
         let m = Repo::open(mirror.clone(), None, "remote").unwrap();
         let tree = m.snapshot(&snap).unwrap().tree;
-        let sealed = lookup(m.store(), &tree, &p("private/current")).unwrap().unwrap();
+        let sealed = lookup(m.store(), &tree, &p("private/.env.current")).unwrap().unwrap();
         prop_assert!(!m.store().has(&sealed.id));
         let public = lookup(m.store(), &tree, &p("public/readme")).unwrap().unwrap();
         prop_assert_eq!(m.store().read_entry(&public).unwrap(), b"../README".to_vec());
@@ -928,7 +925,7 @@ fn an_absolute_target_round_trips_through_push_pull_and_checkout() {
     let (mut alice, _, id) = new_repo("alice");
     d.link("fixtures/dict", "/usr/share/dict/words");
     let snap = alice.snapshot_workspace(WS, &d.fs).unwrap().snapshot;
-    alice.set_tag("main", snap, None, false).unwrap();
+    alice.set_tag("main", snap, false).unwrap();
     let r = Arc::new(MemoryBackend::new());
     remote::push(&mut alice, r.clone(), false, &[], false).unwrap();
     let (mut bob, _) = repo_for("alice", &id);
@@ -946,11 +943,11 @@ fn a_sealed_file_moved_to_a_public_path_stays_sealed() {
     let d = disk();
     let (mut repo, _, _) = new_repo("alice");
     d.write(".veilpolicy", "secrets/ cloak team\n");
-    d.write("secrets/db.yml", "password: moved-secret-42\n");
+    d.write("secrets/.env.db", "password: moved-secret-42\n");
     let first = repo.snapshot_workspace(WS, &d.fs).unwrap().snapshot;
-    assert_eq!(file_entry(&repo, &first, "secrets/db.yml").unwrap().visibility, team());
+    assert_eq!(file_entry(&repo, &first, "secrets/.env.db").unwrap().visibility, team());
     std::fs::create_dir_all(d.root.join("docs")).unwrap();
-    std::fs::rename(d.root.join("secrets/db.yml"), d.root.join("docs/db.yml")).unwrap();
+    std::fs::rename(d.root.join("secrets/.env.db"), d.root.join("docs/db.yml")).unwrap();
     let s = repo.snapshot_workspace(WS, &d.fs).unwrap();
     let e = file_entry(&repo, &s.snapshot, "docs/db.yml").unwrap();
     assert_eq!(e.visibility, team(), "the moved content became public");
@@ -958,7 +955,7 @@ fn a_sealed_file_moved_to_a_public_path_stays_sealed() {
     // It stays sealed in the next snapshots, and is never pushed public.
     let again = repo.snapshot_workspace(WS, &d.fs).unwrap();
     assert!(!again.changed);
-    repo.set_tag("main", again.snapshot, None, false).unwrap();
+    repo.set_tag("main", again.snapshot, false).unwrap();
     let mirror = Arc::new(MemoryBackend::new());
     remote::push(&mut repo, mirror.clone(), true, &[], false).unwrap();
     assert!(backend_contains(&*mirror, b"moved-secret-42").is_empty());
@@ -966,10 +963,10 @@ fn a_sealed_file_moved_to_a_public_path_stays_sealed() {
     let d2 = disk();
     let (mut repo2, _, _) = new_repo("alice");
     d2.write(".veilpolicy", "secrets/ cloak team\ndocs/ public\n");
-    d2.write("secrets/db.yml", "shared: yes\n");
+    d2.write("secrets/.env.db", "shared: yes\n");
     repo2.snapshot_workspace(WS, &d2.fs).unwrap();
     std::fs::create_dir_all(d2.root.join("docs")).unwrap();
-    std::fs::rename(d2.root.join("secrets/db.yml"), d2.root.join("docs/db.yml")).unwrap();
+    std::fs::rename(d2.root.join("secrets/.env.db"), d2.root.join("docs/db.yml")).unwrap();
     let s = repo2.snapshot_workspace(WS, &d2.fs).unwrap();
     assert!(file_entry(&repo2, &s.snapshot, "docs/db.yml").unwrap().visibility.is_public());
 }
@@ -1138,34 +1135,6 @@ fn memory_and_overlay_backends_hold_links_and_never_follow_them() {
     assert_eq!(o.read_link(&p("a/f")).unwrap(), b"../l");
     assert!(o.write(&p("l/x"), b"y").is_err());
     assert_eq!(m.read(&p("a/f")).unwrap(), b"x", "the lower layer changed");
-}
-
-/// Threat 9: in format 4 a tracked file the user replaced by a link keeps
-/// its entry (the link is a special file). After `vl upgrade` to format 5
-/// the next snapshot records the link, and the parent still holds the
-/// file's content (no data loss).
-#[test]
-fn after_an_upgrade_a_file_replaced_by_a_link_is_recorded_and_its_history_kept() {
-    let d = disk();
-    let backend = Arc::new(MemoryBackend::new());
-    let id = veil_core::Identity::generate("alice");
-    let mut repo = Repo::init_for_clone_at(backend.clone(), Some(id.clone()), "alice", 4).unwrap();
-    d.write("config.yml", "port: 80\n");
-    let before = repo.snapshot_workspace(WS, &d.fs).unwrap().snapshot;
-    std::fs::remove_file(d.root.join("config.yml")).unwrap();
-    d.link("config.yml", "config.d/default.yml");
-    let s = repo.snapshot_workspace(WS, &d.fs).unwrap();
-    assert!(!s.changed && s.report.shadowed.iter().any(|p| p.as_str() == "config.yml"), "{:?}", s.report);
-    drop(repo);
-    veil_core::upgrade::upgrade(backend.clone(), Some(id.clone()), &veil_core::upgrade::UpgradeOptions::default()).unwrap();
-    let mut repo = Repo::open(backend, Some(id), "alice").unwrap();
-    assert!(repo.format() >= 5);
-    let s = repo.snapshot_workspace(WS, &d.fs).unwrap();
-    assert!(s.changed && s.report.shadowed.is_empty());
-    let e = file_entry(&repo, &s.snapshot, "config.yml").unwrap();
-    assert_eq!((e.kind, repo.store().read_entry(&e).unwrap()), (EntryKind::Symlink, b"config.d/default.yml".to_vec()));
-    let old = file_entry(&repo, &before, "config.yml").unwrap();
-    assert_eq!(repo.store().read_entry(&old).unwrap(), b"port: 80\n");
 }
 
 /// Threat 14: a hostile tree whose `.veilpolicy` is a symlink entry. It is

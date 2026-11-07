@@ -1,6 +1,6 @@
 # 6. Symlinks
 
-> **Access model:** written for today's client, which restricts paths by cloaking them for a *scope*. With the server, access is the ordinary model in `docs/VISIBILITY.md` (admins, private by default, groups and managers, folder access, `public`): cloaked paths become private folders, and only secrets and embargoed changes are encrypted.
+> **Access model:** written for the client of that round, which also restricted paths by cloaking them for a *scope*. Repository format 8 removed that, with every other non-secret encryption: only secret files (`.env`, keys) are encrypted, and access is the ordinary model in `docs/VISIBILITY.md` (admins, private by default, groups and managers, folder access, `public`).
 
 Status: design and threat review. **Format 5** (a new tree entry kind; see `PLAN.md`). Today symlinks are invisible.
 - `DirListing::special`: never recorded or followed.
@@ -14,8 +14,8 @@ That stays exactly the behaviour of repositories below format 5.
 
 - **Data model (format 5).**
   - `EntryKind::Symlink` in `object.rs`. `id` names an object whose plaintext is the **link target bytes** (UTF-8 only; a non-UTF-8 target is reported as unrepresentable, like names, BUG-039).
-  - The target is sealed like file content when the policy cloaks the link's path: targets can name private paths (`current -> /srv/acme-secret-merger/build`).
-  - `executable` must be false, `size` = target length, and a `fallback` is allowed (a line-cloaked link).
+  - The target is sealed like file content when the policy cloaks the link's path (since repository format 8, only a secret file's path is cloaked).
+  - `executable` must be false, and `size` = target length. (Fallback versions were removed in repository format 8.)
   - Conflict terms gain kind bits so a symlink version can sit in a conflict (`PLAN.md`, format 5).
 - **VFS** (`vfs/mod.rs`):
   - `NodeKind::Symlink`.
@@ -68,7 +68,7 @@ That stays exactly the behaviour of repositories below format 5.
     - Materialisation for the working copy writes **our side as it is** (a link or a file) and reports the conflict, never a file of markers containing a link target. That would turn a target path into file content, which a later edit could publish.
     - Two link targets: our target, reported.
     - *Test:* a merge with link/link and link/file conflicts; `vl resolve --theirs` gives the right kind.
-13. **Hostile trees.** A symlink entry with `executable` set, a non-UTF-8 target object, a target over 4 KiB (`PATH_MAX`), a NUL in the target, or a sealed target with a fallback that is a file blob.
+13. **Hostile trees.** A symlink entry with `executable` set, a non-UTF-8 target object, a target over 4 KiB (`PATH_MAX`), or a NUL in the target.
     - *Invariant:* the binary tree decoder refuses invalid flag combinations (canonical-by-construction). At checkout, a target with NUL or over 4 KiB is refused per path (`failed`), never panicking. *Test:* the fuzzer `adversarial_fuzz.rs` gains a symlink-kind generator.
 14. **An incoming symlink to `.veilpolicy`, or a link named `.veilpolicy`.** That is refused today (BUG-058). *Invariant:* kept. Format 5 does not make `.veilpolicy` a recordable link.
 15. **`vl serve`, `--json`, escapes.** Targets are raw data, escaped by `render::safe` and `to_json`. *Test:* a target holding an OSC 8 hyperlink escape.

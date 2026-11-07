@@ -1611,8 +1611,8 @@ fn read_document(ctx: &Ctx, cmd: &Cmd) -> Result<String> {
         Cmd::Log { limit, .. } => api::to_json(&api::log(&ctx.repo, &ctx.ws, *limit)?),
         Cmd::Show { rev, stat, .. } => api::to_json(&api::show(ctx, rev, *stat)?),
         Cmd::Diff { rev, from, to, stat, .. } => {
-            let (a, b) = api::diff_trees_for(ctx, rev.as_deref(), from.as_deref(), to.as_deref())?;
-            api::to_json(&api::diff(&ctx.repo, &a, &b, *stat)?)
+            let t = api::diff_trees_for(ctx, rev.as_deref(), from.as_deref(), to.as_deref())?;
+            api::to_json(&api::diff(&ctx.repo, &t, *stat)?)
         }
         Cmd::Blame(a) => api::to_json(&crate::history::blame_doc(ctx, a)?),
         Cmd::Grep(a) => api::to_json(&crate::history::grep_doc(ctx, a)?),

@@ -1,6 +1,6 @@
 # 3. History search (`log -S/-G`, path and author filters) and `vl grep`
 
-> **Access model:** written for today's client, which restricts paths by cloaking them for a *scope*. With the server, access is the ordinary model in `docs/VISIBILITY.md` (admins, private by default, groups and managers, folder access, `public`): cloaked paths become private folders, and only secrets and embargoed changes are encrypted.
+> **Access model:** written for the client of that round, which also restricted paths by cloaking them for a *scope*. Repository format 8 removed that, with every other non-secret encryption: only secret files (`.env`, keys) are encrypted, and access is the ordinary model in `docs/VISIBILITY.md` (admins, private by default, groups and managers, folder access, `public`).
 
 Status: design and threat review. No format change.
 
@@ -32,10 +32,10 @@ vl grep PATTERN [-r REV] [-i] [-F] [-w] [-n] [-l] [-c] [--max-count N] [-a] [--j
 
 - **Engine:** new `crates/veil-core/src/grep.rs`, `pub fn grep(repo, tree, pattern, opts, reader, sink)`.
   - It walks `tree::walk_files` of the *snapshot* (default `@`, which every command snapshots first). It **never reads the working copy**, so isolated, quarantined and ignored files are never searched.
-  - Each file is read through `blame::readable_version`. `Plain` is searched. `Fallback` is searched and labelled `(last public version)`. `Redacted` is counted in `skipped: {sealed: N}` and never searched.
+  - Each file is read through `blame::readable_version`. `Plain` is searched. `Redacted` is counted in `skipped: {sealed: N}` and never searched.
   - Binary content (a NUL in the first 8 KiB, or attribute `binary`/`-text`, feature 7) prints "binary file matches" unless `-a`.
   - Conflict entries are searched in their rendering for this reader (`conflict::materialize`).
-- **Output:** `path:line:text`, escaped with `render::safe`. JSON is `veil.grep/1` `{rev, matches:[{path, line, text, tier}], skipped:{sealed, binary, too_large}}`. `serve` gets a `grep` method.
+- **Output:** `path:line:text`, escaped with `render::safe`. JSON is `veil.grep/2` `{rev, matches:[{path, line, text, tier}], skipped:{sealed, binary, too_large}}`. `serve` gets a `grep` method.
 - **Parallelism:** files are searched on `remote::par_map`-style worker threads. Output order is sorted by path, so it is deterministic.
 
 ## Threat review
@@ -44,15 +44,13 @@ vl grep PATTERN [-r REV] [-i] [-F] [-w] [-n] [-l] [-c] [--max-count N] [-a] [--j
    - *Invariant:* `vl grep` searches recorded snapshots only. No option reads isolated or quarantined files. The user's own `rg` is the tool for the disk.
    - *Test:* a repository with `.env` (isolated) and a quarantined file; `vl grep -r @ KEY` and `--json` print neither, and `skipped` does not count them either (no existence oracle).
 2. **Searching ciphertext.** A naive implementation runs the regex over sealed object bytes, giving false hits and wasted CPU.
-   - *Invariant:* only `Plain` and `Fallback` bytes reach the matcher, and `readable_version` is the only reader.
+   - *Invariant:* only `Plain` bytes reach the matcher, and `readable_version` is the only reader.
    - *Test:* a store wrapper counts `read_raw` of sealed objects in grep with no keys: 0 opens attempted beyond the label check.
-3. **Pickaxe as an oracle for a non-member.** `log -S` over history where the file is sealed: a non-member's count is taken on the fallback or skipped, never on ciphertext.
+3. **Pickaxe as an oracle for a non-member.** `log -S` over history where the file is sealed: a non-member's count is skipped, never taken on ciphertext.
    - *Invariant:* a snapshot whose relevant version is `Redacted` is not listed for `-S`/`-G`. With `--show-skipped`, it is listed as "not searched (sealed for …)".
-   - *Test:* an outsider's `log -S <cloaked string>` returns nothing; a member's returns the change.
-4. **The path filter reveals embargo contents.** A non-holder's `vl log -- src/vuln.c` must not list the embargoed merge (the wrapper names objects, the sealed tree names paths).
-   - *Invariant:* the path filter compares reader-resolved trees (`checkout::resolve_view`); for non-holders the wrapper is its fallback, unchanged at that path.
-   - *Test:* an embargoed fix of `src/vuln.c`; an outsider and a public-mirror reader run `log -- src/vuln.c` and `log -S <fixed line>`, and neither lists the merge.
-5. **Sealed descriptions through `--grep`.** If `log --grep MSG` (searching descriptions) is added, it must search `repo.description(s)` as this reader sees it: `api::description`, so `HiddenText` is never matched. *Test:* `--grep` on words of a cloaked description as an outsider gives no match.
+   - *Test:* an outsider's `log -S <sealed string>` returns nothing; a member's returns the change.
+4. **The path filter reveals embargo contents.** Removed in repository format 8 (only secret files are encrypted). An unreleased embargo is withheld from every push.
+5. **Encrypted change descriptions through `--grep`.** Removed in repository format 8 (only secret files are encrypted).
 6. **Regex DoS.** Pattern `(a*)*b`, or a 100 MB literal.
    - *Invariant:* the `regex` crate is linear; the compile limits above apply; a pattern over 64 KiB is refused; lines over 1 MiB are matched but printed truncated (`…`).
    - *Test:* a pathological pattern on a 50 MiB file finishes in under 2 s in release.
@@ -65,10 +63,10 @@ vl grep PATTERN [-r REV] [-i] [-F] [-w] [-n] [-l] [-c] [--max-count N] [-a] [--j
 10. **Escapes and JSON.** Matched lines go through `render::safe` (text) and `to_json` (JSON), including bidi overrides (Trojan Source). *Test:* a line containing U+202E.
 11. **Sparse sandboxes, FUSE mount, `ws exec`.** `vl grep` run inside a sandbox (an agent) searches the sandbox workspace's snapshot, which follows the same reader rules; a sparse sandbox's `only` set does not limit what history holds.
     - *Invariant:* grep's paths are the snapshot's, so the result can name files outside the sparse set. This is documented, since sparse is not an access boundary.
-12. **Fallback lines attributed as current content.** For a reader without the key, a fallback hit is labelled so the user does not take an old public version for what members see. *Test:* the JSON `tier: "fallback"`.
+12. **Fallback lines attributed as current content.** Removed in repository format 8 (only secret files are encrypted).
 
 ## Open decisions
 
 - **Should `vl grep` ever search the working copy?** *Recommendation:* no. It searches the snapshot, which equals the working copy minus local-only files, because every command snapshots first. That gives Git's "tracked files only" behaviour, and closes the agent exfiltration route in point 1.
 - **`log -S` default scope.** *Recommendation:* the same set `vl log` shows (visible history), with `-r` to widen or narrow it. Full revsets are a separate feature.
-- **Searching fallbacks.** *Recommendation:* yes, labelled. A non-member's checkout contains exactly those bytes, so hiding them from grep would be inconsistent, and they reveal nothing new.
+- **Searching fallbacks.** Fallback versions were removed in repository format 8.

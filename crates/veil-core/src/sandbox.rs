@@ -209,7 +209,7 @@ pub struct Manifest {
     #[serde(default)]
     pub snapshot: Option<ObjectId>,
     /// What the files hold where they differ from [`Manifest::tree`] as
-    /// this reader reads it now (unreadable files, embargo fallbacks).
+    /// this reader reads it now (unreadable files).
     #[serde(default, skip_serializing_if = "Materialised::is_empty")]
     pub materialised: Materialised,
     /// The boot the files were written in ([`crate::lock::boot_identity`]).
@@ -244,6 +244,11 @@ pub struct Manifest {
     /// changed since ([`scrub`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard_checked: Option<i64>,
+    /// The [`crate::oplog::WorkspaceState::id`] of the workspace the files
+    /// belong to: a later workspace of the same name is another one, and
+    /// never gets them (BUG-1033). Absent for a workspace without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
 }
 
 /// The output of a command that is not recorded yet ([`Manifest::pending`]).
@@ -288,7 +293,13 @@ impl Manifest {
             quarantined: Vec::new(),
             pending: None,
             guard_checked: None,
+            workspace_id: None,
         }
+    }
+
+    /// A new manifest for workspace `ws` as `repo` has it now.
+    pub fn for_workspace(repo: &Repo, ws: &str) -> Manifest {
+        Manifest { workspace_id: workspace_id(repo, ws), ..Manifest::new(ws) }
     }
 
     /// [`Manifest::only`] as a set (`None`: the whole tree).
@@ -324,6 +335,9 @@ pub fn rebuild_reason(repo: &Repo, paths: &SandboxPaths, ws: &str, loaded: &Load
     if m.workspace != ws {
         return Some(format!("its manifest belongs to workspace '{}'", m.workspace));
     }
+    if m.workspace_id != workspace_id(repo, ws) {
+        return Some(format!("it belongs to an earlier workspace named '{ws}' (removed, then made again)"));
+    }
     if m.running.is_some() {
         return Some("the previous run did not finish (vl was killed or crashed)".into());
     }
@@ -344,6 +358,11 @@ pub fn rebuild_reason(repo: &Repo, paths: &SandboxPaths, ws: &str, loaded: &Load
         Some(t) if !repo.store().has(&t) => Some("the snapshot it holds is no longer in the repository".into()),
         _ => None,
     }
+}
+
+/// The identity of workspace `ws` in `repo` ([`crate::oplog::WorkspaceState::id`]).
+pub fn workspace_id(repo: &Repo, ws: &str) -> Option<String> {
+    repo.view().workspaces.get(ws).and_then(|w| w.id.clone())
 }
 
 /// Remove the sandbox's files, manifest and stat cache (the lock stays):
@@ -551,7 +570,7 @@ fn rehash_cost_ns(files: usize, bytes: u64) -> i64 {
 /// `wait` allows (by default: if waiting for that costs less than
 /// re-reading the files would), this waits, then
 /// stats every file again and vouches for those whose stamp has not moved
-/// since the write. Cloaked and embargoed files are left to the builder,
+/// since the write. Sealed secret files are left to the builder,
 /// which verifies their sealing. Returns the number of files vouched for.
 pub fn vouch_written(
     store: &ObjectStore,
@@ -627,7 +646,6 @@ pub fn vouch_written(
 fn vouchable(entry: &TreeEntry, content: &ObjectId, executable: bool) -> bool {
     entry.kind == EntryKind::File
         && entry.visibility.is_public()
-        && entry.fallback.is_none()
         && entry.id == *content
         && entry.executable == executable
 }
@@ -1135,7 +1153,7 @@ pub fn take_out_unchanged(fs: &SandboxFs, entries: &[ReaperEntry]) {
 /// BUG-107). A sandbox has no accepted policy of its own that could keep
 /// guarding its next run, so it keeps the recorded one: the snapshot
 /// applies it and records it unchanged. Deleting `.veilpolicy` in a
-/// sandbox thus never declassifies a cloaked file (BUG-553), and an
+/// sandbox thus never exposes a sealed secret file (BUG-553), and an
 /// unreadable one never fails the recording (BUG-554). Only a regular,
 /// readable `.veilpolicy` is an edit of the policy, and one that weakens
 /// the recorded policy is held back by the recording (BUG-560, see
@@ -1417,7 +1435,9 @@ pub fn set_aside(repo: &Repo, paths: &SandboxPaths, ws: &str, loaded: &Loaded, t
             SetAside::Nothing
         }
         Ok(_) => match loaded {
-            Loaded::Found(m) if m.pending.is_none() && m.version == MANIFEST_VERSION && m.workspace == ws => {
+            // Only this very workspace's work is re-imported: another one's
+            // (an earlier workspace of the same name) is kept aside whole.
+            Loaded::Found(m) if m.pending.is_none() && m.version == MANIFEST_VERSION && m.workspace == ws && m.workspace_id == workspace_id(repo, ws) => {
                 let (keep, quarantined, differing) = unrecorded_work(repo, paths, m, target)?;
                 if keep.is_empty() && differing {
                     let dir = kept_dir(paths);
@@ -1581,7 +1601,7 @@ fn differs_from_trees(
                     have = fs.read(&p).ok().map(|d| crate::object::Object::blob_id(&d));
                 }
                 let Some(h) = have else { return true };
-                match e.visibility.is_public() && e.fallback.is_none() {
+                match e.visibility.is_public() {
                     true => e.id == h,
                     false => store.read_entry(&e).is_ok_and(|d| crate::object::Object::blob_id(&d) == h),
                 }

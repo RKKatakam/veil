@@ -69,7 +69,7 @@ fn metadata_writes_inside_and_outside_transactions_interleave_safely() {
     fs.write(&VPath::new("a.txt").unwrap(), b"a\n").unwrap();
     repo.snapshot_workspace("default", &*fs).unwrap();
     let (base, _) = repo.commit_working_copy("default", "base").unwrap();
-    repo.set_tag("main", base, None, false).unwrap();
+    repo.set_tag("main", base, false).unwrap();
     let remote_fs: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     remote::push(&mut repo, remote_fs.clone(), false, &[], false).unwrap();
     let embargoes: Vec<String> = (0..4)
@@ -112,7 +112,7 @@ fn metadata_writes_inside_and_outside_transactions_interleave_safely() {
             let mut repo = Repo::open(fs, Some(alice), "alice").unwrap();
             for i in 0..3 {
                 let mut tx = repo.transaction(format!("tag {t}-{i}")).unwrap();
-                tx.view.tags.insert(format!("t{t}-{i}"), Tag::new(base, None));
+                tx.view.tags.insert(format!("t{t}-{i}"), Tag::new(base));
                 tx.commit().unwrap();
                 remote::push(&mut repo, remote_fs.clone(), false, &[], false).unwrap();
             }
@@ -181,7 +181,7 @@ fn grant_racing_lock_free_commits() {
         let mut init = Repo::init(fs.clone(), Some(alice.clone()), "alice").unwrap();
         let root = init.root_id();
         for w in 0..3 {
-            init.create_workspace(&format!("w{w}"), vec![root], None).unwrap();
+            init.create_workspace(&format!("w{w}"), vec![root]).unwrap();
         }
         // A remote with something to pull.
         let remote: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
@@ -190,7 +190,7 @@ fn grant_racing_lock_free_commits() {
         ov.write(&VPath::new("pulled.txt").unwrap(), b"pulled\n").unwrap();
         other.snapshot_workspace("default", &ov).unwrap();
         let (c, _) = other.commit_working_copy("default", "to pull").unwrap();
-        other.set_tag("main", c, None, false).unwrap();
+        other.set_tag("main", c, false).unwrap();
         remote::push(&mut other, remote.clone(), false, &[], false).unwrap();
         drop(init);
         let disk = Arc::new(disk);
@@ -218,7 +218,7 @@ fn grant_racing_lock_free_commits() {
                     ov.write(&VPath::new(&format!("f{w}-{n}")).unwrap(), b"x\n").unwrap();
                     repo.snapshot_workspace(&ws, &ov).unwrap();
                     let (c, _) = repo.commit_working_copy(&ws, &format!("{ws} {n}")).unwrap();
-                    repo.set_tag(&format!("c{w}-{n}"), c, None, true).unwrap();
+                    repo.set_tag(&format!("c{w}-{n}"), c, true).unwrap();
                 }
                 Vec::new()
             }));
@@ -246,6 +246,6 @@ fn grant_racing_lock_free_commits() {
         }
         assert_eq!(repo.view().remote_tags.get("origin/main"), Some(&c), "{}: the pull was lost", fs.kind());
         assert_eq!(repo.heads().len(), 1);
-        let _ = Tag::new(c, None);
+        let _ = Tag::new(c);
     }
 }

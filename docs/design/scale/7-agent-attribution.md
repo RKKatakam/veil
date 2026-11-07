@@ -2,7 +2,7 @@
 
 > **Owner, 2026-11-06:** attribution (`agent`, `task`, `prompt`) is **never encrypted**. It's plain text behind the server's permissions, visible to exactly the people who can see the change. The `Sealed` variants below describe older plans and are dropped.
 
-Status: design and threat review, **not built** (Scion 4.6). It is built with the server's agent work (`docs/design/scion-for-developers.md`, phase 2). Where this document seals text "for a scope" or "for a cloaked line", it describes today's client; on the server, see "Sealing" below. **Requires format 6:** a new snapshot field. `Snapshot` is decoded without `deny_unknown_fields`, so an older vl would silently drop the field when it rewrites a snapshot (`FORMAT.md` §4 rule 1), and its signature would no longer verify.
+Status: design and threat review, **not built** (Scion 4.6). It is built with the server's agent work (`docs/design/scion-for-developers.md`, phase 2). Encryption of descriptions and of whole lines of work was removed in repository format 8 (only secret files are encrypted), so attribution is plain text (see "Sealing" below). **Requires format 6:** a new snapshot field. `Snapshot` is decoded without `deny_unknown_fields`, so an older vl would silently drop the field when it rewrites a snapshot (`FORMAT.md` §4 rule 1), and its signature would no longer verify.
 
 ## Design sketch
 
@@ -47,9 +47,8 @@ pub struct Attribution {
 
 ### Sealing
 
-- **`task` and `prompt` follow the description:** `embargo::description_scope(store, tree, cloak)`, as `Transaction::new_change` does. On the server, that means plain text, visible to exactly the people who can see the change (`docs/VISIBILITY.md`); under an unreleased embargo, sealed with the embargo key.
+- **`task` and `prompt` follow the description:** plain text, visible to exactly the people who can see the change (`docs/VISIBILITY.md`). Under an unreleased embargo they are withheld with the change.
 - **Prompt references can stay on the device.** With `--prompt-local` (or by device setting, `.veil/local/attribution.json`), the prompt reference is **not put in the snapshot**. It goes to a device-local side record, `.veil/local/attribution/<snapshot id>` (0600).
-- In today's client, which still restricts paths by cloaking, `task` and `prompt` on a cloaked line are sealed for the cloak's scope, exactly as the description is.
 
 ### Signatures
 
@@ -64,8 +63,8 @@ pub struct Attribution {
 
 ### Reading it
 
-- `vl log` and `vl show` print `agent: <name> · task: <task or "sealed"> · run: <id>`. The prompt is shown only by `vl show --prompt`, and only if readable.
-- **`--json`**: `veil.log`/`veil.show` gain an optional `agent` object (`{agent, task?, prompt?, run?}`; a sealed field the reader cannot open is `{"sealed": true}`). This is an addition, so the schema's version number follows `docs/reference/json.md`'s rule for added fields.
+- `vl log` and `vl show` print `agent: <name> · task: <task> · run: <id>`. The prompt is shown only by `vl show --prompt`, and only if readable.
+- **`--json`**: `veil.log`/`veil.show` gain an optional `agent` object (`{agent, task?, prompt?, run?}`). This is an addition, so the schema's version number follows `docs/reference/json.md`'s rule for added fields.
 - **The revset function `agent(PATTERN)`** matches the `agent` field exactly or as a glob. **`vl log --agent PATTERN`** is shorthand for it.
 - **`vl blame --agent`** adds the agent column.
 
@@ -75,7 +74,7 @@ pub struct Attribution {
    - *Invariant:* `task` and `prompt` reach exactly the people who can see the change, as its description does.
    - *Test:* a property test (extend `adversarial7` rewrites): random histories with agent-stamped changes on public, private and embargoed lines. Grep everything a person without access receives for each task and prompt string: none.
 2. **Leaking through a task title on an embargoed line** (the BUG-016 class: "embargo messages published in plaintext before release").
-   - *Invariant:* `task` and `prompt` are sealed exactly when and as the description is (`description_scope`).
+   - *Invariant:* `task` and `prompt` are withheld exactly when and as the description is.
    - *Test:* an embargoed fix made by an agent with the task "fix CVE-2026-1234 in auth". Nobody outside the embargo's groups receives "CVE-2026-1234" before release; everyone with access does after (for `task`).
 3. **Spoofing or stripping from inside the sandbox.** The command sets `VEIL_AGENT`, writes a file that looks like attribution, or runs `vl describe`.
    - *Invariant:* attribution comes only from the recording `vl` process's own arguments and environment; a command inside `ws exec` cannot reach the repository (`find_root` refuses `.veil/` and the ceiling is set).

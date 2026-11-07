@@ -7,6 +7,7 @@ use std::{
 
 fn vl(home: &Path, cwd: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_vl"))
+        .env("VEIL_TEST_PATH_REMOTES", "1")
         .args(args)
         .current_dir(cwd)
         .env("VEIL_HOME", home)
@@ -54,6 +55,7 @@ fn a_clone_killed_during_its_checkout_never_records_deletions() {
     for attempt in 0..8 {
         let dst = tmp.path().join(format!("dst{attempt}"));
         let mut child = Command::new(env!("CARGO_BIN_EXE_vl"))
+            .env("VEIL_TEST_PATH_REMOTES", "1")
             .args(["clone", src.to_str().unwrap(), dst.to_str().unwrap()])
             .current_dir(tmp.path())
             .env("VEIL_HOME", &home)
@@ -111,6 +113,7 @@ fn a_clone_killed_during_its_fetch_is_refused_not_shown_empty() {
     for attempt in 0..8 {
         let dst = tmp.path().join(format!("dst{attempt}"));
         let mut child = Command::new(env!("CARGO_BIN_EXE_vl"))
+            .env("VEIL_TEST_PATH_REMOTES", "1")
             .args(["clone", src.to_str().unwrap(), dst.to_str().unwrap()])
             .current_dir(tmp.path())
             .env("VEIL_HOME", &home)

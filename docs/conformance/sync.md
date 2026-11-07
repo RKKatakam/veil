@@ -13,9 +13,14 @@ storage".
 
 * **152 tests**, all passing (200 when first written, 16 of them
   `#[ignore = "BUG-NNN: …"]` reproductions, all fixed since; 48 Git-bridge
-  tests left with Git interop). SFTP tests run through a stand-in `ssh`
-  serving the local OpenSSH `sftp-server` (skipped, with a message, where
-  there is none).
+  tests left with Git interop). **Since the simplification pass, part 1**
+  (path and SFTP remotes removed), the SFTP tests and the tests of removed
+  flags (`--delete`, `--full`, `--dry-run`, remote kinds, `upgrade
+  --remote`) are gone; the rest run through the path remotes of `vl`'s
+  test fixture (`crates/vl/src/test_remotes.rs`, debug builds only), which
+  exercise the engine's transfer and the pull rules
+  (`remote::apply_remote_tags`) the server client shares. Counts below are
+  from before that.
 * **Git scripts in this series:** 318: 177 t5xxx (t5304 included), t1050,
   t1450, t6500 and 138 t9xxx. Not applicable: smart/HTTP/wire protocols,
   Git's pack and index formats, submodules, svn/p4/cvs and other bridges,
@@ -27,7 +32,7 @@ storage".
   high. BUG-285, 287, 291 and 292 were about the Git bridge, and their rows
   are gone with it. No leak was found: public remotes, team remotes and
   older-format mirrors never held cloaked or isolated plaintext, key rings
-  (public), cloaked descriptions or tags, or an unreleased embargo, in any
+  (public), or an unreleased embargo, in any
   scenario tried (every object decompressed and grepped).
   * medium: BUG-280 (tags can never be deleted on a remote; pull
     resurrects deleted tags), BUG-288 (each retried rejected push re-sends
@@ -153,7 +158,7 @@ storage".
 | test_git_import_export.rs | not applicable | Git interop (removed) |
 | test_git_remotes.rs | ported | `remotes::*` |
 | test_git_init.rs | not applicable | Git interop (removed) |
-| test_git_private_commits.rs | ported (analogue) | cloaked workspaces are Veil's private commits: `visibility::*` |
+| test_git_private_commits.rs | not applicable | its analogue, cloaked workspaces, was removed in repository format 8 (only secret files are encrypted) |
 | test_git_colocated.rs, test_git_colocation.rs | not applicable | Git interop (removed) |
 | test_git_root.rs | not applicable | Git interop (removed) |
 | test_bookmark_command.rs (remote tracking, conflicted bookmarks) | ported | tracking: `push_pull::{pull_creates_new_tags_and_remote_tags, push_updates_the_remote_tags (BUG-281)}`; conflicted (diverged) tags: `push_pull::{pull_of_a_diverged_tag_warns_and_keeps_both_sides, after_a_rejection_merge_and_push_again}`; deletion: BUG-280 |

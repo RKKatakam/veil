@@ -97,8 +97,6 @@ All of that is plain text, protected by the server's permissions.
 
 **Not exceptions:** HTTPS (TLS) between `vl` and the server protects the network connection, and a device's own private key may be protected at rest by a passphrase or the OS keychain. Neither encrypts project data.
 
-**Older client code still encrypts more** (cloaked lines' descriptions, sealed tag annotations, encrypted embargoes, cloaked folders). The simplification pass removes all of it, leaving only secret files sealed.
-
 ## Veil always works through its server
 
 **Veil is server-centric, not Git and not offline-first** (owner, 2026-11-05).
@@ -149,7 +147,6 @@ What the server and `vl` do today; `docs/HUB.md` §13 has the details.
 - **The authority:** the server enforces access from the accepted `.veilpolicy` and its own group and admin records, by path, never from labels inside a snapshot.
 - **What the client keeps locally:** a cache of what the user may see. Fetch on demand from the server comes from the scale plan.
 - **Existing repositories:**
-  - cloaked paths become restricted folders, with their secrets still encrypted;
   - `.env` files start syncing (encrypted) only after an explicit upgrade step that lists them;
-  - nothing is ever made public or decrypted silently.
-- **Old commands:** `vl cloak`, `vl isolate` and `vl expose` become aliases of `vl access` or are removed in the simplification pass.
+  - a repository written before format 8 (when `vl` could still encrypt descriptions, tags, embargoes and folders) is upgraded only if it holds none of that; otherwise `vl upgrade` refuses and names each thing (`docs/FORMAT.md`). Nothing is ever made public, decrypted or dropped silently.
+- **Commands:** `vl access` decides who sees a folder. `vl cloak` seals secret files only (it refuses anything else); a `cloak` line in `.veilpolicy` on a path that is not a secret file keeps that path on the device (`isolate`), with a warning. `vl isolate` and `vl expose` write plain `isolate` and `public` rules.

@@ -29,7 +29,6 @@ mod proc;
 mod report;
 mod run;
 mod server;
-mod shim;
 mod trace;
 
 use std::{
@@ -53,11 +52,12 @@ struct GenArgs {
     /// Data profile: tiny (smoke test), small, 1g, 5g.
     #[arg(long, default_value = "small")]
     profile: String,
-    /// 85 % of the files under cloak rules (the `cloaked-*` profiles).
+    /// 85 % of the files under access lines (the `cloaked-*` profiles; a
+    /// historical name, nothing but secret files is encrypted).
     #[arg(long)]
     cloaked: bool,
-    /// What the server accepts: no cloak rules, no `isolate` rule, no
-    /// cloaked fix line, no scopes (set by `run --server`).
+    /// What the server accepts: no access lines, no `isolate` rule, no
+    /// fix line, no scopes (set by `run --server`).
     #[arg(long)]
     plain: bool,
     #[arg(long, default_value_t = 1)]
@@ -188,9 +188,6 @@ enum Cmd {
         /// Iterations per agent in the traced repetition (0: none).
         #[arg(long, default_value_t = 2)]
         agent_trace_iters: usize,
-        /// RTTs (ms) for the SFTP cases.
-        #[arg(long, value_delimiter = ',', default_value = "0")]
-        rtt: Vec<u64>,
         /// Kill a single command after this many seconds.
         #[arg(long, default_value_t = 1800)]
         timeout: u64,
@@ -200,7 +197,7 @@ enum Cmd {
         /// Skip cases whose name starts with this (repeatable).
         #[arg(long)]
         skip: Vec<String>,
-        /// Skip whole phases: import, local, remote-path, server, gc, packed, sftp, agents.
+        /// Skip whole phases: import, local, server, gc, packed, agents.
         #[arg(long, value_delimiter = ',')]
         skip_phase: Vec<String>,
         /// Source checkout, for the commit recorded with the results.
@@ -226,14 +223,6 @@ enum Cmd {
     },
     /// Render RESULTS.json as Markdown on stdout.
     Report { results: PathBuf },
-    /// (internal) Relay stdio to a command with a fixed delay each way.
-    #[command(hide = true)]
-    SftpShim {
-        #[arg(long)]
-        rtt_ms: u64,
-        #[arg(last = true)]
-        cmd: Vec<String>,
-    },
 }
 
 fn log_line(s: &str) {
@@ -287,7 +276,6 @@ fn setup_dirs(g: &GenArgs) -> Result<(PathBuf, proc::VlEnv)> {
         vl: absolute(&g.vl)?,
         home: dir.join("home"),
         tmp,
-        ssh: None,
         logs,
     };
     Ok((dir, env))
@@ -371,7 +359,6 @@ fn main() -> Result<()> {
             print!("{md}");
             Ok(())
         }
-        Cmd::SftpShim { rtt_ms, cmd } => shim::run(Duration::from_millis(rtt_ms) / 2, &cmd),
         Cmd::Report { results } => {
             let r: serde_json::Value = serde_json::from_slice(&std::fs::read(&results)?)?;
             print!("{}", report::markdown(&r));
@@ -382,8 +369,7 @@ fn main() -> Result<()> {
                 vl: absolute(&g.vl)?,
                 home: exact_dir.join("home"),
                 tmp: exact_dir.join("tmp"),
-                ssh: None,
-                logs: exact_dir.join("logs"),
+                        logs: exact_dir.join("logs"),
             };
             generate(&g, &exact_dir, &env)?;
             Ok(())
@@ -403,7 +389,6 @@ fn main() -> Result<()> {
             agents: ns,
             agent_iters,
             agent_trace_iters,
-            rtt,
             timeout,
             long_secs,
             skip,
@@ -415,7 +400,7 @@ fn main() -> Result<()> {
             proc::install_signal_handlers();
             if server.server.is_some() {
                 if g.cloaked {
-                    return Err(anyhow!("--cloaked cannot go through the server (it refuses cloaked content)"));
+                    return Err(anyhow!("--cloaked cannot go through the server (its groups are not set up there)"));
                 }
                 g.plain = true;
             }
@@ -438,12 +423,8 @@ fn main() -> Result<()> {
                     min_free as f64 / 1e9
                 ));
             }
-            let (dir, mut env) = setup_dirs(&g)?;
+            let (dir, env) = setup_dirs(&g)?;
             let me = absolute(&std::env::current_exe()?)?;
-            let sftp = run::sftp_server();
-            if let Some(server) = &sftp {
-                env.ssh = Some(run::write_fake_ssh(&dir, server, &me)?);
-            }
             let started = Instant::now();
             let machine = run::machine_facts(&env.vl, src.as_deref());
             let result = (|| -> Result<run::Bench> {
@@ -480,8 +461,6 @@ fn main() -> Result<()> {
                         long_secs,
                         timeout: Duration::from_secs(timeout),
                         min_free,
-                        rtts: rtt.clone(),
-                        sftp_server: sftp.clone(),
                         skip,
                     },
                     edit_seq: 0,
@@ -498,9 +477,6 @@ fn main() -> Result<()> {
                         let label = if g.pack_every > 0 { "partly packed store" } else { "loose store" };
                         run::local(&mut b, label, true)?;
                     }
-                    if phase("remote-path") {
-                        run::remote(&mut b, "path", 0, true)?;
-                    }
                     if phase("server") && server.server.is_some() {
                         let srv = server::Server::start(&server, &b.dir.join("server"), 32)?;
                         run::server(&mut b, &srv)?;
@@ -511,15 +487,6 @@ fn main() -> Result<()> {
                             run::local(&mut b, "packed store", false)?;
                         }
                         run::gc_incremental(&mut b)?;
-                    }
-                    if phase("sftp") {
-                        if b.opts.sftp_server.is_none() {
-                            b.note("no sftp-server found: SFTP cases skipped");
-                        } else {
-                            for r in b.opts.rtts.clone() {
-                                run::remote(&mut b, "sftp", r, false)?;
-                            }
-                        }
                     }
                     if phase("agents") && !ns.is_empty() {
                         let a = agents::run(&mut b, &ns, agent_iters, agent_trace_iters)?;

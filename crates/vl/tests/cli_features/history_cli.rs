@@ -110,7 +110,8 @@ impl Drop for Server {
 
 const CLOAKED_TEXT: &str = "CLOAKED-PLAN-4417";
 const CLOAKED_LINE: &str = "CLOAKED-LINE-2290";
-const CLOAKED_DESC: &str = "CLOAKED-DESCRIPTION-9902";
+/// The sealed secret file.
+const PLAN: &str = "internal/.env.plan";
 const ISOLATED_TEXT: &str = "ISOLATED-VALUE-6623";
 const VAULT_VALUE: &str = "VAULT-VALUE-1187";
 const TOKEN: &str = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789";
@@ -127,33 +128,31 @@ struct World {
     carol: PathBuf,
 }
 
-/// Alice's project: a public file later edited on a cloaked line (sealed,
-/// with its last public version as fallback), a policy-cloaked file edited
-/// twice, an isolated `.netrc`, a quarantined file, a vault secret, and an
-/// unreleased embargoed fix that edits `src/vuln.c` and renames a file.
+/// Alice's project: a cloaked secret file edited twice (the second time on
+/// another line of work, tagged `plan-tag`), an isolated `.netrc`, a
+/// quarantined file, a vault secret, and an unreleased embargoed fix that
+/// edits `src/vuln.c` and renames a file (tag `base`: main before it).
 fn world() -> World {
     let env = Env::new();
     let alice = env.dir("alice");
     write(&alice, "README.md", "hello\nworld\n");
-    write(&alice, "internal/plan.md", &format!("{CLOAKED_TEXT}\n"));
+    write(&alice, PLAN, &format!("{CLOAKED_TEXT}\n"));
     write(&alice, "src/vuln.c", "int check(int x) {\n  return 1;\n}\n");
     write(&alice, "src/old.c", "int old(void) {\n  return 0;\n}\n/* padding so the rename is inexact */\n");
     write(&alice, ".netrc", &format!("KEY={ISOLATED_TEXT}\n"));
     env.ok("alice", &alice, &["init"]);
-    env.ok("alice", &alice, &["cloak", "internal/"]);
+    env.ok("alice", &alice, &["cloak", PLAN]);
     env.ok("alice", &alice, &["commit", "-m", "initial"]);
     env.ok("alice", &alice, &["tag", "set", "main", "-r", "@-"]);
     env.ok("alice", &alice, &["secret", "set", "API_TOKEN", VAULT_VALUE]);
     // A quarantined file: stays local.
     write(&alice, "leak.txt", &format!("token = {TOKEN}\n"));
 
-    // A cloaked line of work: edits a public file and the cloaked one.
-    env.ok("alice", &alice, &["ws", "new", "plan", "-r", "main", "--cloak", "team"]);
-    write_stdin(&env, "alice", &alice, &["ws", "write", "plan", "README.md"], format!("hello\n{CLOAKED_LINE}\nworld\n").as_bytes());
-    write_stdin(&env, "alice", &alice, &["ws", "write", "plan", "internal/plan.md"], format!("{CLOAKED_TEXT} v2\nKEY step\n").as_bytes());
-    env.ok("alice", &alice, &["describe", "-r", "plan@", "-m", CLOAKED_DESC]);
-    // Pushed to the team remote (not to the mirror) through a cloaked tag.
-    env.ok("alice", &alice, &["tag", "set", "plan-tag", "-r", "plan@", "--cloak", "team"]);
+    // Another line of work: edits the cloaked file.
+    env.ok("alice", &alice, &["ws", "new", "plan", "-r", "main"]);
+    write_stdin(&env, "alice", &alice, &["ws", "write", "plan", PLAN], format!("{CLOAKED_TEXT} v2\n{CLOAKED_LINE}\nKEY step\n").as_bytes());
+    env.ok("alice", &alice, &["describe", "-r", "plan@", "-m", "plan"]);
+    env.ok("alice", &alice, &["tag", "set", "plan-tag", "-r", "plan@"]);
 
     // An unreleased embargo on main: the fix edits vuln.c and renames old.c.
     env.ok("alice", &alice, &["ws", "new", "fix", "-r", "main"]);
@@ -162,6 +161,8 @@ fn world() -> World {
     env.ok("alice", &alice, &["ws", "exec", "fix", "-m", "fix", "--", "sh", "-c", &rename]);
     env.ok("alice", &alice, &["describe", "-r", "fix@", "-m", "fix"]);
     env.ok("alice", &alice, &["merge", "fix@", "--into", "main", "--embargo", "-m", "embargoed merge"]);
+    // Main before the embargoed merge: what the remotes receive of it.
+    env.ok("alice", &alice, &["tag", "set", "base", "-r", "plan@-"]);
 
     let team = env.root.join("team");
     let mirror = env.root.join("mirror");
@@ -190,7 +191,7 @@ fn all_output(env: &Env, user: &str, dir: &Path) -> String {
     let ids: Vec<String> = log["entries"].as_array().unwrap().iter().map(|e| e["snapshot_id"].as_str().unwrap().to_string()).collect();
     let secrets = [CLOAKED_TEXT, CLOAKED_LINE, EMBARGO_TEXT, ISOLATED_TEXT, VAULT_VALUE, TOKEN, EMBARGO_NAME, "KEY", "."];
     // (Never the fix's new file name: an error would echo the argument.)
-    let files = ["README.md", "internal/plan.md", "src/vuln.c", "src/old.c", ".netrc", "leak.txt"];
+    let files = ["README.md", PLAN, "src/vuln.c", "src/old.c", ".netrc", "leak.txt"];
     for id in &ids {
         for f in files {
             for extra in [&[][..], &["--json"], &["--public"], &["--follow", "--json"]] {
@@ -248,8 +249,8 @@ fn assert_absent(haystack: &str, needles: &[&str], who: &str) {
     }
 }
 
-/// No cloaked, embargoed, isolated, quarantined or vault content, no
-/// sealed description and not the embargoed fix's new file name, in any
+/// No cloaked (secret-file), embargoed, isolated, quarantined or vault
+/// content and not the embargoed fix's new file name, in any
 /// output of the history tools for a non-member and a public-mirror
 /// reader; isolated, quarantined and vault content not even for the
 /// owner.
@@ -257,10 +258,10 @@ fn assert_absent(haystack: &str, needles: &[&str], who: &str) {
 fn history_tools_never_reveal_confidential_content() {
     let w = world();
     let bob = all_output(&w.env, "bob", &w.bob);
-    assert_absent(&bob, &[CLOAKED_TEXT, CLOAKED_LINE, CLOAKED_DESC, EMBARGO_TEXT, EMBARGO_NAME, ISOLATED_TEXT, VAULT_VALUE, TOKEN], "bob");
+    assert_absent(&bob, &[CLOAKED_TEXT, CLOAKED_LINE, EMBARGO_TEXT, EMBARGO_NAME, ISOLATED_TEXT, VAULT_VALUE, TOKEN], "bob");
     assert!(bob.contains("hello"), "bob reads public content");
     let carol = all_output(&w.env, "carol", &w.carol);
-    assert_absent(&carol, &[CLOAKED_TEXT, CLOAKED_LINE, CLOAKED_DESC, EMBARGO_TEXT, EMBARGO_NAME, ISOLATED_TEXT, VAULT_VALUE, TOKEN], "carol");
+    assert_absent(&carol, &[CLOAKED_TEXT, CLOAKED_LINE, EMBARGO_TEXT, EMBARGO_NAME, ISOLATED_TEXT, VAULT_VALUE, TOKEN], "carol");
     let alice = all_output(&w.env, "alice", &w.alice);
     assert_absent(&alice, &[ISOLATED_TEXT, VAULT_VALUE, TOKEN], "alice");
     assert!(alice.contains(CLOAKED_TEXT) && alice.contains(CLOAKED_LINE) && alice.contains(EMBARGO_TEXT), "alice reads her own work");
@@ -284,54 +285,50 @@ fn grep_never_searches_or_counts_local_only_files() {
     assert!(stdout_of(&out).is_empty());
 }
 
-/// Design 3, threat 12: a non-member's hits in a file's last public
-/// version are labelled `fallback`; the cloaked file is `skipped.sealed`.
+/// Design 3, threat 12: for a non-member the cloaked file is
+/// `skipped.sealed`; public hits are labelled `public`.
 #[test]
-fn fallback_hits_are_labelled_for_readers_without_the_key() {
+fn sealed_files_are_skipped_for_readers_without_the_key() {
     let w = world();
     let plan = snapshot(&w.env, "alice", &w.alice, "plan@");
     let v = json_ok(&w.env, "bob", &w.bob, &["grep", "hello", "-r", &plan, "--json"]);
     assert_eq!(v["matches"][0]["path"], "README.md");
-    assert_eq!(v["matches"][0]["tier"], "fallback", "{v}");
-    assert_eq!(v["skipped"]["sealed"], 1, "internal/plan.md: {v}");
-    let out = w.env.vl("bob", &w.bob, &["grep", "hello", "-r", &plan]);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("last public version"), "{}", text(&out));
-    let v = json_ok(&w.env, "alice", &w.alice, &["grep", "hello", "-r", "plan@", "--json"]);
+    assert_eq!(v["matches"][0]["tier"], "public", "{v}");
+    assert_eq!(v["skipped"]["sealed"], 1, "{PLAN}: {v}");
+    let (v, code) = json(&w.env, "bob", &w.bob, &["grep", CLOAKED_TEXT, "-r", &plan, "--json"]);
+    assert_eq!(code, Some(1), "{v}");
+    assert!(v["matches"].as_array().unwrap().is_empty(), "{v}");
+    let v = json_ok(&w.env, "alice", &w.alice, &["grep", CLOAKED_TEXT, "-r", "plan@", "--json"]);
     assert_eq!(v["matches"][0]["tier"], "cloaked");
 }
 
-/// Design 1, threats 1-2: an outsider blames the cloaked line's version
-/// as its fallback, and nothing is attributed to the cloaked change.
+/// Design 1, threats 1-2: an outsider's blame of the cloaked file is
+/// refused with the explanation, not its bytes; the member's attributes
+/// her edit.
 #[test]
-fn outsider_blame_attributes_nothing_to_the_cloaked_change() {
+fn outsider_blame_of_a_sealed_file_is_refused() {
     let w = world();
-    let cloaked = change(&w.env, "alice", &w.alice, "plan@");
+    let edit = change(&w.env, "alice", &w.alice, "plan@");
     let plan = snapshot(&w.env, "alice", &w.alice, "plan@");
-    for (who, dir) in [("bob", &w.bob)] {
-        let v = json_ok(&w.env, who, dir, &["blame", "README.md", "-r", &plan, "--json"]);
-        assert_eq!(v["version"], "fallback");
-        for l in v["lines"].as_array().unwrap() {
-            assert_ne!(l["change_short"], cloaked.as_str(), "{who}: {v}");
-            assert!(l["change_short"].is_string());
-        }
-        // The cloaked file: refused with the explanation, not its bytes.
-        let out = w.env.vl(who, dir, &["blame", "internal/plan.md", "-r", &plan]);
+    {
+        let (who, dir) = ("bob", &w.bob);
+        let out = w.env.vl(who, dir, &["blame", PLAN, "-r", &plan]);
         assert_eq!(out.status.code(), Some(1));
         assert!(text(&out).contains("cloaked under scope 'team'"), "{}", text(&out));
+        assert!(!text(&out).contains(CLOAKED_TEXT) && !text(&out).contains(CLOAKED_LINE), "{}", text(&out));
     }
-    // Alice sees her cloaked line attributed to the cloaked change.
-    let v = json_ok(&w.env, "alice", &w.alice, &["blame", "README.md", "-r", "plan@", "--json"]);
-    assert_eq!(v["lines"][1]["change_short"], cloaked.as_str());
+    let v = json_ok(&w.env, "alice", &w.alice, &["blame", PLAN, "-r", "plan@", "--json"]);
+    assert_eq!(v["lines"][1]["change_short"], edit.as_str());
     assert_eq!(v["lines"][1]["text"], CLOAKED_LINE);
     // --public: as the mirror sees it.
-    let v = json_ok(&w.env, "alice", &w.alice, &["blame", "README.md", "-r", "plan@", "--public", "--json"]);
-    assert_eq!(v["version"], "fallback");
-    assert!(!v.to_string().contains(CLOAKED_LINE));
+    let out = w.env.vl("alice", &w.alice, &["blame", PLAN, "-r", "plan@", "--public", "--json"]);
+    assert!(!text(&out).contains(CLOAKED_LINE), "{}", text(&out));
 }
 
 /// Design 1, threat 3 and design 3, threat 4: the embargoed fix of
-/// `src/vuln.c`. Outsiders' blame of `main` attributes the line to the
-/// pre-fix change; `log -- src/vuln.c` and `log -S` do not list the merge.
+/// `src/vuln.c` reaches no remote. Outsiders have no `main`; their blame
+/// of the pre-fix main attributes the line to the pre-fix change;
+/// `log -- src/vuln.c` and `log -S` list neither the merge nor the fix.
 #[test]
 fn the_embargoed_fix_stays_invisible_to_history_tools() {
     let w = world();
@@ -341,26 +338,26 @@ fn the_embargoed_fix_stays_invisible_to_history_tools() {
     let v = json_ok(&w.env, "alice", &w.alice, &["blame", "src/vuln.c", "-r", "main", "--json"]);
     assert_eq!(v["lines"][1]["change_short"], fix.as_str(), "alice sees the fix: {v}");
     for (who, dir) in [("bob", &w.bob), ("carol", &w.carol)] {
-        let v = json_ok(&w.env, who, dir, &["blame", "src/vuln.c", "-r", "main", "--json"]);
+        assert!(!w.env.vl(who, dir, &["show", "main"]).status.success(), "{who} received the embargoed merge");
+        let v = json_ok(&w.env, who, dir, &["blame", "src/vuln.c", "-r", "base", "--json"]);
         for l in v["lines"].as_array().unwrap() {
             assert_eq!(l["change_short"], initial.as_str(), "{who}: {v}");
         }
+        let all = log_ids(&w.env, who, dir, &[]);
+        assert!(!all.contains(&merge) && !all.contains(&fix), "{who}: {all:?}");
         assert!(!log_ids(&w.env, who, dir, &["--", "src/vuln.c"]).contains(&merge), "{who}");
         assert!(!log_ids(&w.env, who, dir, &["--", "src/old.c"]).contains(&merge), "{who}");
         assert!(!log_ids(&w.env, who, dir, &["-S", "return x < 10", "--show-skipped"]).contains(&merge), "{who}");
         assert!(log_ids(&w.env, who, dir, &["-S", "return x < 10"]).is_empty(), "{who}");
-        // No rename in the merge's diff.
-        let v = json_ok(&w.env, who, dir, &["show", "main", "-C", "--json"]);
-        assert!(v["diff"]["files"].as_array().unwrap().is_empty(), "{who}: {v}");
     }
-    assert!(log_ids(&w.env, "alice", &w.alice, &["--", "src/vuln.c"]).contains(&merge));
+    assert!(log_ids(&w.env, "alice", &w.alice, &["--", "src/vuln.c"]).contains(&fix));
     let v = json_ok(&w.env, "alice", &w.alice, &["show", "fix@", "--json"]);
     let renamed: Vec<&Value> = v["diff"]["files"].as_array().unwrap().iter().filter(|f| f["status"] == "renamed").collect();
     assert_eq!(renamed.len(), 1, "alice sees the fix's rename: {v}");
     assert_eq!(renamed[0]["from"], "src/old.c");
 }
 
-/// Design 3, threat 3: `log -S` on a cloaked string. The member finds the
+/// Design 3, threat 3: `log -S` on a string in a sealed secret file. The member finds the
 /// change; the non-member does not, and `--show-skipped` lists it as not
 /// searched.
 #[test]
@@ -392,7 +389,7 @@ fn blame_text_json_and_flags() {
     assert!(lines[1].starts_with(&second[..8]) && lines[1].contains("alice") && lines[1].ends_with("2) TWO"), "{out}");
     assert_eq!(env.stdout("alice", &dir, &["annotate", "f.txt"]), out);
     let v = json_ok(&env, "alice", &dir, &["blame", "f.txt", "-L", "2,3", "--json"]);
-    assert_eq!(v["schema"], "veil.blame/1");
+    assert_eq!(v["schema"], "veil.blame/2");
     assert_eq!(v["lines"].as_array().unwrap().len(), 2);
     assert_eq!(v["lines"][0]["line"], 2);
     assert_eq!(v["lines"][0]["author"], "alice");
@@ -463,7 +460,7 @@ fn grep_flags_output_and_exit_codes() {
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
     let v = json_ok(&env, "alice", &dir, &["grep", "key", "--json", "a.txt", "bin.dat", "src"]);
-    assert_eq!(v["schema"], "veil.grep/1");
+    assert_eq!(v["schema"], "veil.grep/2");
     assert_eq!(v["matches"].as_array().unwrap().len(), 3);
     assert_eq!(v["files"].as_array().unwrap().len(), 3);
     assert_eq!(v["skipped"]["binary"], 1);
@@ -727,9 +724,9 @@ fn bisect_run_injects_no_secrets() {
 fn bisect_run_skips_candidates_it_cannot_fully_read() {
     let env = Env::new();
     let alice = env.project("alice", "a", &[("bug.txt", "fine\n")]);
-    env.ok("alice", &alice, &["cloak", "secret/"]);
-    let good = commit(&env, &alice, &[("secret/s.txt", "sealed\n")], "cloak");
-    let mid = commit(&env, &alice, &[("secret/s.txt", "sealed 2\n")], "sealed edit");
+    env.ok("alice", &alice, &["cloak", "secret/.env.s"]);
+    let good = commit(&env, &alice, &[("secret/.env.s", "sealed\n")], "cloak");
+    let mid = commit(&env, &alice, &[("secret/.env.s", "sealed 2\n")], "sealed edit");
     let bad = commit(&env, &alice, &[("bug.txt", "bad\n")], "bad");
     env.ok("alice", &alice, &["tag", "set", "main", "-r", "@-"]);
     let team = env.root.join("team");
@@ -870,10 +867,10 @@ fn serve_offers_blame_and_grep_but_not_bisect() {
     let info = env.stdout("alice", &dir, &["serve", "--call", "server.info"]);
     assert!(info.contains("\"blame\"") && info.contains("\"grep\"") && !info.contains("bisect"), "{info}");
     let v: Value = serde_json::from_str(&env.stdout("alice", &dir, &["serve", "--call", "blame", r#"{"path":"f.txt","lines":[1,1]}"#])).unwrap();
-    assert_eq!(v["schema"], "veil.blame/1");
+    assert_eq!(v["schema"], "veil.blame/2");
     assert_eq!(v["lines"][0]["text"], "needle");
     let v: Value = serde_json::from_str(&env.stdout("alice", &dir, &["serve", "--call", "grep", r#"{"pattern":"NEEDLE","ignore_case":true}"#])).unwrap();
-    assert_eq!(v["schema"], "veil.grep/1");
+    assert_eq!(v["schema"], "veil.grep/2");
     assert_eq!(v["matches"][0]["path"], "f.txt");
     let out = env.vl("alice", &dir, &["serve", "--call", "bisect", "{}"]);
     assert!(!out.status.success());
@@ -889,11 +886,11 @@ fn new_schemas_are_documented() {
     let dir = env.project("alice", "p", &[("f.txt", "one\n"), ("g.txt", "some content to move\n")]);
     std::fs::rename(dir.join("g.txt"), dir.join("h.txt")).unwrap();
     let docs = [
-        ("veil.blame/1", json_ok(&env, "alice", &dir, &["blame", "f.txt", "--json"])),
-        ("veil.grep/1", json_ok(&env, "alice", &dir, &["grep", "one", "--json"])),
-        ("veil.log/1", json_ok(&env, "alice", &dir, &["log", "-S", "one", "--show-skipped", "--json"])),
-        ("veil.diff/1", json_ok(&env, "alice", &dir, &["diff", "--json"])),
-        ("veil.status/1", json_ok(&env, "alice", &dir, &["status", "--json"])),
+        ("veil.blame/2", json_ok(&env, "alice", &dir, &["blame", "f.txt", "--json"])),
+        ("veil.grep/2", json_ok(&env, "alice", &dir, &["grep", "one", "--json"])),
+        ("veil.log/2", json_ok(&env, "alice", &dir, &["log", "-S", "one", "--show-skipped", "--json"])),
+        ("veil.diff/2", json_ok(&env, "alice", &dir, &["diff", "--json"])),
+        ("veil.status/2", json_ok(&env, "alice", &dir, &["status", "--json"])),
     ];
     fn keys(v: &Value, out: &mut Vec<String>) {
         match v {

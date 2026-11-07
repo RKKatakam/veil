@@ -1,6 +1,6 @@
 # 5. Copy-on-write checkouts of the project directory
 
-Status: design and threat review, **not built** (backlog: "Copy-on-write file clones for project-directory checkouts"). A client-side item, independent of the server. Threats about cloaked files describe today's client; with the server they apply to secrets and embargoed files. **No repository format change.**
+Status: design and threat review, **not built** (backlog: "Copy-on-write file clones for project-directory checkouts"). A client-side item, independent of the server. Threats about sealed content apply to secret files only (repository format 8 encrypts nothing else). **No repository format change.**
 
 > **This machine cannot exercise real reflinks:** `/` is ext4 (no `FICLONE`) and `/tmp` is tmpfs. Real clone tests run on macOS (APFS `clonefileat`, the `macos_fs.rs` precedent) and on any btrfs or XFS developer machine. Here, a `CloneCounting` test backend covers the logic.
 
@@ -9,7 +9,6 @@ Status: design and threat review, **not built** (backlog: "Copy-on-write file cl
 `checkout::apply_changes` already asks the backend to clone: `fs.clone_known(&c.path, &new.id)`. That happens when:
 - the file holds no local edit;
 - no CRLF conversion applies;
-- there is no fallback;
 - and the entry is readable for this reader.
 
 Only `SandboxFs` (`vfs/sandbox.rs`) answers it: it reflinks the **project directory's** file when the project's stat cache vouches for it (`StorageBackend::clone_known`, with the source `fstat`ed before and after). For the project directory itself, `DiskBackend` uses the trait default (`false`), so `vl ws switch`, `vl edit`, `vl new`, `vl undo`'s checkout and `vl clone`'s checkout always decompress (and decrypt) every changed file and write it in full.
@@ -42,7 +41,7 @@ Only `SandboxFs` (`vfs/sandbox.rs`) answers it: it reflinks the **project direct
   - a mount's `upper/` (unrecorded user data);
   - ephemeral sandboxes;
   - other repositories;
-  - **a plaintext blob cache** (a content-addressed directory of checked-out files would keep cloaked plaintext on disk after `vl ws switch` away; see open decision 1).
+  - **a plaintext blob cache** (a content-addressed directory of checked-out files would keep secret plaintext on disk after `vl ws switch` away; see open decision 1).
 - **Measuring.** Item 9's `ws switch` case on a reflink-capable file system, with time and `du` (shared extents) before and after.
 
 ## Threat review
@@ -62,11 +61,11 @@ Only `SandboxFs` (`vfs/sandbox.rs`) answers it: it reflinks the **project direct
 5. **A crash in the middle of the switch.**
    - *Invariant:* the journalled move (`checkout.json` `pending`, BUG-113) is unchanged. Resuming writes from the store whenever a source is missing.
    - *Test:* `crash.rs` `crash_during_workspace_switch` with clone sources, plus a crash after the rename's source was removed.
-6. **A cloaked file for a reader without the key.**
-   - *Invariant:* only entries with `store.entry_readable(new)` are cloned (the existing condition), so a reader without the key gets what checkout gives today (nothing, or the fallback).
-   - *Test:* a sandbox of a cloaked-line workspace; the project directory switched by a member without that scope. No plaintext is cloned.
-7. **Line endings, fallbacks and conflicts.**
-   - *Invariant:* unchanged: never cloned (CRLF conversion, embargo fallbacks and conflict renderings differ from the blob).
+6. **A sealed secret file for a reader without the key.**
+   - *Invariant:* only entries with `store.entry_readable(new)` are cloned (the existing condition), so a reader without the key gets what checkout gives today (nothing).
+   - *Test:* a sandbox holding a sealed secret file; the project directory switched by a member without that scope. No plaintext is cloned.
+7. **Line endings and conflicts.**
+   - *Invariant:* unchanged: never cloned (CRLF conversion and conflict renderings differ from the blob).
    - *Test:* an `eol=crlf` file and a conflicted file in the switch; both are written, not cloned.
 8. **macOS metadata.** `clonefileat` copies xattrs (`com.apple.quarantine`), ACLs and mode.
    - *Invariant:* after a clone the mode is the entry's (executable bit only) and no xattr from the source remains.

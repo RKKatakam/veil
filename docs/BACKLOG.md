@@ -59,8 +59,8 @@ Veil is server-centric ([OVERVIEW.md](OVERVIEW.md)). The order is:
   file can grant others. Add an optional passphrase (Argon2id-wrapped keys)
   and OS keychain / hardware-key storage (macOS Keychain, Secret Service,
   FIDO2/age-plugin style), with a `vl identity protect` migration.
-- **Names of cloaked files are visible** in today's client: tree entries
-  keep their names in plaintext for anyone who can read the repository.
+- **Names of sealed secret files are visible**: tree entries keep their
+  names in plaintext for anyone who can read the repository.
   With the server, people without access to a folder receive neither its
   files nor their names (`docs/HUB.md` §5.4). Until then, keep secrets out
   of file and directory names.
@@ -124,9 +124,8 @@ Veil is server-centric ([OVERVIEW.md](OVERVIEW.md)). The order is:
   upgrade stays under the pre-standard construction (`docs/CRYPTO.md` §5).
 - **The policy pin does not forget an accepted weakening** when a teammate
   later reverts it (only dropped `public!` rules are forgotten).
-- **A hostile SFTP server can still force up to the 4 GiB read ceiling**
-  (`VEIL_SFTP_MAX_FILE`), since sizes come from the server. Goes away with
-  SFTP remotes in the simplification pass.
+- ~~A hostile SFTP server can still force up to the 4 GiB read ceiling~~:
+  gone with SFTP remotes (simplification pass, part 1).
 
 ## Optional (owner: "nice to have, not needed")
 

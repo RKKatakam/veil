@@ -7,9 +7,9 @@
 //!
 //! It also keeps the record of what the directory was materialised from
 //! (`checkout.json`, [`Materialised`]): files left out because they were
-//! unreadable, files written from an embargo fallback. Every command fills
-//! in whatever has become readable since, before it snapshots and again when
-//! it finishes, so a grant or an embargo release is never recorded as a
+//! unreadable. Every command fills in whatever has become readable since,
+//! before it snapshots and again when it finishes, so a grant is never
+//! recorded as a
 //! deletion or a revert.
 
 use std::{
@@ -191,7 +191,7 @@ pub struct Ctx {
     /// Stat cache of the project directory (it follows the directory when
     /// another workspace is attached).
     cache: StatCache,
-    /// A bare repository (a remote created by `vl push`): no workspace, no
+    /// A bare repository (a path remote an older `vl push` created): no workspace, no
     /// working copy. Only commands that read history, and `gc`, run here
     /// (BUG-284); nothing is snapshotted or checked out.
     pub bare: bool,
@@ -371,9 +371,6 @@ impl Ctx {
                 committed_from: None,
             });
         }
-        for id in repo.auto_release_embargoes()? {
-            eprintln!("{} embargo {id}: its release time has passed", render::green("Released"));
-        }
         let checkout = load_state(&fs, &repo)?;
         let ws = attached_workspace(&repo, &checkout)?;
         // The operations of this command are for the attached workspace
@@ -408,7 +405,7 @@ impl Ctx {
 
     pub fn wc(&self) -> Result<ObjectId> {
         if self.bare {
-            return Err(anyhow!("this is a bare repository (a remote): it has no working copy"));
+            return Err(anyhow!("this is a bare repository (an old path remote): it has no working copy"));
         }
         Ok(self.repo.workspace_wc(&self.ws)?)
     }
@@ -671,7 +668,6 @@ impl Ctx {
         let (now, _) = self.repo.build_from_recorded(
             &*disk,
             Some(base.tree),
-            base.cloak.as_deref(),
             Some(&mut self.cache),
             Some(&self.checkout.materialised),
         )?;
@@ -986,7 +982,7 @@ pub fn print_working_copy_warnings(r: &BuildReport) {
 fn print_filled_in(r: &CheckoutReport) {
     if r.written + r.removed > 0 {
         eprintln!(
-            "{} {} file(s) that became readable (a key arrived or an embargo was released), removed {}",
+            "{} {} file(s) that became readable (a key arrived), removed {}",
             render::green("Filled in"),
             r.written,
             r.removed

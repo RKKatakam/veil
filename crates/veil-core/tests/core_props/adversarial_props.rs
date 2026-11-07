@@ -25,7 +25,7 @@ use proptest::prelude::*;
 use veil_core::{
     id::ChangeId,
     remote,
-    tree::{diff_trees, walk_files},
+    tree::walk_files,
     vfs::NodeKind,
     DiskBackend, Identity, MemoryBackend, ObjectId, OverlayBackend, Repo, StorageBackend, VPath,
 };
@@ -112,9 +112,6 @@ struct Harness {
     /// (op id right after the commit, change id, files of the commit)
     commits: Vec<(ObjectId, ChangeId, Vec<(VPath, Vec<u8>)>)>,
     log: Vec<String>,
-    /// Create virtual workspaces cloaked under `team` and check that cloaked
-    /// lines of work never hold public entries.
-    cloaked: bool,
 }
 
 fn files_of(repo: &Repo, snapshot: &ObjectId) -> Vec<(VPath, Vec<u8>)> {
@@ -147,7 +144,6 @@ impl Harness {
             workspaces: 0,
             commits: vec![],
             log: vec![],
-            cloaked: false,
         }
     }
 
@@ -197,51 +193,6 @@ impl Harness {
             for (path, e) in walk_files(self.repo.store(), &snap.tree).unwrap() {
                 veil_core::conflict::read_file_like(self.repo.store(), &e)
                     .unwrap_or_else(|err| panic!("[{ctx}] {path} in {id:?} unreadable: {err}"));
-            }
-        }
-        if self.cloaked {
-            // content *introduced* by a cloaked change must never be public
-            for id in self.visible(true) {
-                let snap = self.repo.snapshot(&id).unwrap();
-                if snap.cloak.is_none() {
-                    continue;
-                }
-                let base = self.repo.parents_tree(&snap.parents).unwrap().tree;
-                for c in diff_trees(self.repo.store(), Some(&base), Some(&snap.tree)).unwrap() {
-                    if let Some(e) = c.new.as_ref().filter(|e| e.kind == veil_core::EntryKind::Conflict) {
-                        // A conflict introduces no content: a public version
-                        // in it is one some public line already holds.
-                        let public = public_blobs(&self.repo);
-                        for t in self.repo.store().conflict(&e.id).unwrap().interleaved().flatten() {
-                            assert!(
-                                !t.visibility.is_public() || public.contains(&t.id) || c.path.as_str() == ".veilpolicy",
-                                "[{ctx}] cloaked change {id:?} introduces a public conflict version at {}\nlog: {:#?}",
-                                c.path,
-                                self.log
-                            );
-                        }
-                        continue;
-                    }
-                    if let Some(e) = &c.new {
-                        // A sealed edit edited back to the version readers
-                        // without the key are shown at that path (the
-                        // fallback of the base's sealed entry) introduces
-                        // nothing either: they see the same bytes before and
-                        // after (BUG-074 records it public again).
-                        let shown_before = c
-                            .old
-                            .as_ref()
-                            .filter(|o| matches!(o.visibility, veil_core::object::Visibility::Cloaked { .. }))
-                            .and_then(|o| o.fallback)
-                            .filter(|_| c.old.as_ref().is_some_and(|o| o.executable == e.executable));
-                        assert!(
-                            !e.visibility.is_public() || c.path.as_str() == ".veilpolicy" || shown_before == Some(e.id),
-                            "[{ctx}] cloaked change {id:?} introduces public content at {}\nlog: {:#?}",
-                            c.path,
-                            self.log
-                        );
-                    }
-                }
             }
         }
         // workspaces point at visible snapshots
@@ -352,8 +303,7 @@ impl Harness {
                 }
                 Op::WsNew(i) => {
                     if let Some(t) = self.pick(*i, true) {
-                        let cloak = self.cloaked.then(|| "team".to_string());
-                        self.repo.create_workspace(&format!("w{}", self.workspaces), vec![t], cloak)?;
+                        self.repo.create_workspace(&format!("w{}", self.workspaces), vec![t])?;
                         self.workspaces += 1;
                     }
                 }
@@ -379,7 +329,7 @@ impl Harness {
                 }
                 Op::Tag(i) => {
                     if let Some(t) = self.pick(*i, false) {
-                        self.repo.set_tag("t", t, None, true)?;
+                        self.repo.set_tag("t", t, true)?;
                     }
                 }
                 Op::Push => {
@@ -451,23 +401,6 @@ impl Harness {
     }
 }
 
-/// Every plaintext file version held by an uncloaked snapshot in the store.
-fn public_blobs(repo: &Repo) -> BTreeSet<ObjectId> {
-    let mut out = BTreeSet::new();
-    for id in repo.store().list_objects().unwrap() {
-        let Ok(s) = repo.store().snapshot(&id) else { continue };
-        if s.cloak.is_some() {
-            continue;
-        }
-        for (_, e) in walk_files(repo.store(), &s.tree).unwrap() {
-            if e.kind == veil_core::EntryKind::File && e.visibility.is_public() {
-                out.insert(e.id);
-            }
-        }
-    }
-    out
-}
-
 fn files_of_tree_of(repo: &Repo, id: &ObjectId) -> usize {
     files_of(repo, id).len()
 }
@@ -481,13 +414,8 @@ fn disk_files(fs: &MemoryBackend) -> Vec<String> {
 }
 
 fn run_ops(ops: &[Op]) -> Result<(), String> {
-    run_ops_with(ops, false)
-}
-
-fn run_ops_with(ops: &[Op], cloaked: bool) -> Result<(), String> {
     let r = catch_unwind(AssertUnwindSafe(|| {
         let mut h = Harness::new();
-        h.cloaked = cloaked;
         for op in ops {
             h.apply(op);
         }
@@ -507,17 +435,6 @@ proptest! {
     #[test]
     fn random_history_operations_preserve_invariants(ops in proptest::collection::vec(arb_op(), 1..30)) {
         let r = run_ops(&ops);
-        prop_assert!(r.is_ok(), "{}", r.unwrap_err());
-    }
-}
-
-proptest! {
-    #![proptest_config(cfg(256))]
-
-    /// Same random operations with cloaked virtual workspaces.
-    #[test]
-    fn cloaked_lines_of_work_never_hold_public_entries(ops in proptest::collection::vec(arb_op(), 1..30)) {
-        let r = run_ops_with(&ops, true);
         prop_assert!(r.is_ok(), "{}", r.unwrap_err());
     }
 }
@@ -774,25 +691,5 @@ fn disk_paths_below_a_file_are_simply_missing() {
         assert_eq!(fs.metadata(&p("a/b")).ok(), Some(None), "{}: metadata", fs.kind());
         assert!(fs.remove_file(&p("a/b")).is_ok(), "{}: remove_file", fs.kind());
         assert!(fs.remove_dir_all(&p("a/b")).is_ok(), "{}: remove_dir_all", fs.kind());
-    }
-}
-
-/// BUG-128: this sequence (found by `cloaked_lines_of_work_never_hold_public_entries`)
-/// sometimes makes a change on a cloaked line record a new *public* file
-/// (`dir/sub/c.txt` after the last `WsWrite`). Which changes the indices
-/// pick depends on random ids, so it fails in about 1 run in 12; the loop
-/// makes a failure near-certain.
-#[test]
-fn bug128_cloaked_line_records_a_public_file() {
-    use Op::*;
-    let ops = vec![
-        Write(0, 1), WsNew(13), WsWrite(50, 1, 3), Remove(5), Undo, WsWrite(25, 1, 5), Push, Remove(2),
-        Write(2, 5), NewMerge(38, 25), Merge(59), Remove(1), Tag(41), WsWrite(44, 4, 4), Write(5, 4),
-        WsWrite(50, 0, 1), Rebase(38, 34), Commit, WsWrite(43, 2, 4), Abandon(43), Describe(11), WsNew(51),
-        Commit, WsWrite(50, 2, 5),
-    ];
-    for _ in 0..100 {
-        let r = run_ops_with(&ops, true);
-        assert!(r.is_ok(), "{}", r.unwrap_err());
     }
 }

@@ -30,15 +30,6 @@ pub fn new_repo(name: &str) -> (Repo, Arc<MemoryBackend>, Identity) {
     (repo, fs, id)
 }
 
-/// [`new_repo`] at format 5: one op head moved under the repository lock
-/// (the lock-free op log is format 6).
-pub fn new_repo_v5(name: &str) -> (Repo, Arc<MemoryBackend>, Identity) {
-    let fs = Arc::new(MemoryBackend::new());
-    let id = Identity::generate(name);
-    let repo = Repo::init_for_clone_at(fs.clone(), Some(id.clone()), name, 5).unwrap();
-    (repo, fs, id)
-}
-
 pub fn repo_for(name: &str, id: &Identity) -> (Repo, Arc<MemoryBackend>) {
     let fs = Arc::new(MemoryBackend::new());
     let repo = Repo::init(fs.clone(), Some(id.clone()), name).unwrap();
@@ -148,9 +139,8 @@ pub fn backend_contains(backend: &dyn StorageBackend, needle: &[u8]) -> Vec<Stri
 }
 
 /// `(label, decoded bytes)` of every object in every pack on `backend`:
-/// published ones (`objects/pack/`) and staged ones (the push staging
-/// directories `objects/incoming/*/`), which a raw reader of the remote can
-/// read too.
+/// published ones (`objects/pack/`) and staged ones (`objects/incoming/*/`),
+/// which a raw reader of the store can read too.
 pub fn packed_objects(backend: &dyn StorageBackend) -> Vec<(String, Vec<u8>)> {
     use veil_core::{cache::LruCache, pack};
     let mut dirs = vec![VPath::new(".veil/objects/pack").unwrap()];
@@ -184,7 +174,6 @@ pub fn file(name: &str, id: ObjectId) -> TreeEntry {
         size: 0,
         executable: false,
         visibility: Visibility::Public,
-        fallback: None,
     }
 }
 
@@ -212,7 +201,6 @@ pub fn raw_snapshot(repo: &Repo, parents: Vec<ObjectId>, tree: ObjectId, desc: &
             timestamp: 1,
             predecessors: vec![],
             conflicts: vec![],
-            cloak: None,
             signature: None,
             embargo: None,
         })
@@ -233,7 +221,7 @@ pub fn evil_remote(build: impl FnOnce(&Repo) -> ObjectId) -> (Arc<MemoryBackend>
 
 pub fn set_remote_tag(remote: &mut Repo, name: &str, target: ObjectId) {
     let mut tx = remote.transaction("evil").unwrap();
-    tx.view.tags.insert(name.to_string(), Tag::new(target, None));
+    tx.view.tags.insert(name.to_string(), Tag::new(target));
     tx.view.heads.insert(target);
     tx.commit().unwrap();
 }

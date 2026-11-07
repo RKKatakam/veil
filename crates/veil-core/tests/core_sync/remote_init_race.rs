@@ -67,7 +67,7 @@ fn concurrent_first_pushes_to_an_empty_remote_all_succeed() {
             .map(|i| {
                 let (mut r, fs, _) = new_repo(&format!("dev{i}"));
                 let c = commit_files(&mut r, &*fs, &[(&format!("dev{i}.txt"), "x\n")], "work");
-                r.set_tag(&format!("t{i}"), c, None, true).unwrap();
+                r.set_tag(&format!("t{i}"), c, true).unwrap();
                 r
             })
             .collect();

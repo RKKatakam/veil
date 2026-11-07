@@ -189,7 +189,7 @@ Also different from Git:
   recorded, members get them converted, and neither is an edit.
 * A merge reads `.veilattributes` as the merged file's readers can: a
   **public** file merges only under public attributes (a sealed
-  `.veilattributes` counts as its last public version, or as absent), so
+  `.veilattributes` counts as absent), so
   a sealed `merge=union` never decides public content, and you and
   someone without the key merge the same files alike. A file cloaked for
   `team` also follows `team`'s own sealed `.veilattributes`.

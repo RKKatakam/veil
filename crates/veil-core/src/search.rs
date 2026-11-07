@@ -1,11 +1,7 @@
 //! History search: the `vl log` filters (paths, `--author`, `--signed-by`,
 //! `-S`, `-G`, `--follow`).
 //!
-//! **As this reader sees history.** Trees are read through
-//! [`ObjectStore::tree`](crate::store::ObjectStore::tree), which resolves an embargo wrapper to its fallback
-//! for a non-holder: an embargoed merge is unchanged at every path for
-//! them, so neither a path filter nor `-S`/`-G` lists it (threat review
-//! 4). File content is read through [`readable_version`](crate::blame::readable_version) only, so the
+//! **As this reader sees history.** File content is read through [`readable_version`](crate::blame::readable_version) only, so the
 //! pickaxe never runs on ciphertext; a snapshot whose relevant version is
 //! redacted is not listed (with [`Match::Skipped`] the caller may say "not
 //! searched") rather than counted on something the reader cannot read
@@ -294,8 +290,8 @@ impl<'a> Searcher<'a> {
             return Ok(Ok(None));
         }
         Ok(match readable_version_counted(self.repo.store(), e, self.filter.reader, &mut self.stats)? {
-            Readable::Plain { id, data, .. } | Readable::Fallback { id, data } if data.len() <= MAX_SEARCHED_FILE => Ok(Some((id, data))),
-            Readable::Plain { .. } | Readable::Fallback { .. } => Ok(None),
+            Readable::Plain { id, data, .. } if data.len() <= MAX_SEARCHED_FILE => Ok(Some((id, data))),
+            Readable::Plain { .. } => Ok(None),
             Readable::Redacted(h) => Err(Some(h.visibility)),
         })
     }

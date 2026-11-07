@@ -157,12 +157,12 @@ fn merging_a_pulled_policy_holds_it_back() {
 
 // ---- what is at .veilpolicy ---------------------------------------------------------
 
-/// A project with `secrets/ cloak team` and one cloaked file.
+/// A project with `secrets/*.pem cloak team` and one cloaked secret file.
 fn cloaked_project(env: &Env) -> std::path::PathBuf {
     let proj = env.dir("proj");
     env.ok(U, &proj, &["init"]);
-    write(&proj, ".veilpolicy", "secrets/ cloak team\n");
-    write(&proj, "secrets/db.yml", "password: hunter2hunter2\n");
+    write(&proj, ".veilpolicy", "secrets/*.pem cloak team\n");
+    write(&proj, "secrets/db.pem", "password: hunter2hunter2\n");
     write(&proj, ".netrc", SECRET);
     write(&proj, "README", "hi\n");
     env.ok(U, &proj, &["commit", "-m", "initial"]);
@@ -170,13 +170,13 @@ fn cloaked_project(env: &Env) -> std::path::PathBuf {
 }
 
 fn assert_still_protected(env: &Env, proj: &Path, what: &str) -> String {
-    write(proj, "secrets/new.yml", "token: Xk9mQ2vL7pR4wZt8\n");
+    write(proj, "secrets/new.pem", "token: Xk9mQ2vL7pR4wZt8\n");
     let status = env.ok(U, proj, &["status"]);
     let files = env.stdout(U, proj, &["files"]);
     for l in files.lines().filter(|l| l.contains("secrets/")) {
         assert!(l.starts_with("cloaked:team"), "{what}: the policy stopped applying:\n{status}\n{files}");
     }
-    assert!(files.contains("secrets/new.yml"), "{what}: {files}");
+    assert!(files.contains("secrets/new.pem"), "{what}: {files}");
     assert!(!files.lines().any(|l| l.ends_with(" .netrc")), "{what}: {files}");
     status
 }
@@ -187,12 +187,18 @@ fn a_deleted_policy_file_does_not_lift_protection() {
     let env = Env::new();
     let proj = cloaked_project(&env);
     std::fs::remove_file(proj.join(".veilpolicy")).unwrap();
-    let status = assert_still_protected(&env, &proj, "deleted");
+    // Without the file the built-in rules keep the secret files local, which
+    // is no weaker than the accepted `cloak team`: nothing becomes public.
+    write(&proj, "secrets/new.pem", "token: Xk9mQ2vL7pR4wZt8\n");
+    let status = env.ok(U, &proj, &["status"]);
     assert!(status.contains(".veilpolicy is missing"), "{status}");
+    let files = env.stdout(U, &proj, &["files"]);
+    assert!(!files.lines().any(|l| l.contains("secrets/") && l.starts_with("public")), "{status}\n{files}");
+    assert!(!files.lines().any(|l| l.ends_with(" .netrc")), "{files}");
     // `vl cloak` starts from the recorded version, not from nothing.
-    env.ok(U, &proj, &["cloak", "more/"]);
+    env.ok(U, &proj, &["cloak", "more/*.pem"]);
     let policy = read(&proj, ".veilpolicy");
-    assert!(policy.contains("secrets/ cloak team") && policy.contains("more/"), "{policy}");
+    assert!(policy.contains("secrets/*.pem cloak team") && policy.contains("more/*.pem"), "{policy}");
     assert_still_protected(&env, &proj, "after vl cloak");
 }
 
@@ -209,28 +215,28 @@ fn a_symlinked_policy_is_followed_but_never_taken_as_the_members_edit() {
     assert!(status.contains("is a symlink"), "{status}");
     assert!(!status.contains("Veil never follows it"), "the old, wrong message: {status}");
     // Strengthening applies at once.
-    std::fs::write(&shared, "secrets/ cloak team\nnotes/ isolate\n").unwrap();
+    std::fs::write(&shared, "secrets/*.pem cloak team\nnotes/ isolate\n").unwrap();
     write(&proj, "notes/n.txt", "n\n");
     let files = env.stdout(U, &proj, &["files"]);
     assert!(!files.contains("notes/n.txt"), "{files}");
     // Weakening the shared file (someone else's monorepo pull) is held back.
-    std::fs::write(&shared, "secrets/ public\n").unwrap();
+    std::fs::write(&shared, "secrets/*.pem public!\n").unwrap();
     assert_still_protected(&env, &proj, "weakened target");
     // `vl cloak` refuses to write over the link.
-    let out = env.vl(U, &proj, &["cloak", "x/"]);
+    let out = env.vl(U, &proj, &["cloak", "x/k.pem"]);
     assert!(!out.status.success() && text(&out).contains("symlink"), "{}", text(&out));
     assert!(std::fs::symlink_metadata(proj.join(".veilpolicy")).unwrap().file_type().is_symlink());
     // An explicit accept reads through the link.
     let accepted = env.ok(U, &proj, &["policy", "accept"]);
-    assert!(accepted.contains("secrets/db.yml: cloak team → public"), "{accepted}");
+    assert!(accepted.contains("secrets/db.pem: cloak team → public"), "{accepted}");
     // The fixture (`password: hunter2hunter2`) is a secret to scanner v4, so
     // the now-public file is quarantined and history keeps the cloaked
     // version; either way it is no longer under the old rule.
     let status = env.ok(U, &proj, &["status"]);
     let files = env.stdout(U, &proj, &["files"]);
     assert!(
-        files.lines().any(|l| l.starts_with("public") && l.contains("secrets/db.yml"))
-            || status.contains("Q secrets/db.yml"),
+        files.lines().any(|l| l.starts_with("public") && l.contains("secrets/db.pem"))
+            || status.contains("Q secrets/db.pem"),
         "{status}\n{files}"
     );
 }

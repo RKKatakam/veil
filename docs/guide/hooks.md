@@ -20,7 +20,7 @@ device.
 |---|---|---|---|
 | `pre-commit` | before `vl commit`, `vl describe` of `@`, and `commit` / `describe` over `vl serve` | `VEIL_SNAPSHOT` (the `@` about to be committed), `VEIL_WORKSPACE` | refuses the commit |
 | `commit-msg` | after `pre-commit` | `$1`: a file holding the message (mode `0600`, in `.veil/local/tmp/`) | refuses the commit; an edited message is used |
-| `pre-push` | before `vl push` | argv: remote name, URL (credentials replaced by `***`), `public` or `team`; stdin: one line per tag (below) | refuses the push |
+| `pre-push` | before `vl push` to the Veil server | argv: remote name, the project's server URL; stdin: one line per tag (below) | refuses the push |
 | `post-checkout` | after `vl new`, `vl edit` and `vl ws switch` moved the working copy | argv: the old and the new snapshot id | a warning only |
 
 A hook runs in the project directory, with `VEIL_HOOK` set to its name.
@@ -210,16 +210,12 @@ you can read there (that is what a linter is for), and it could run `vl
 cat`. Trusting a hook means trusting it with that, so read it first.
 
 `pre-push` reads one line per tag the push sends (or tries to, if the
-remote will reject it):
+server will reject it): each tag whose target differs from the server's
+(`origin/<tag>`), or every such tag named with `-t`:
 
 ```text
-<tag> <snapshot> <remote-snapshot-or-0>            # vl push
-<tag> 0 <remote-snapshot-or-0>                     # vl push --delete
+<tag> <snapshot> <remote-snapshot-or-0>
 ```
-
-On a public remote the lines never name a cloaked tag, and never a
-snapshot that an unreleased embargo holds back: exactly what the remote
-receives.
 
 ## A hook cannot change what you commit
 
@@ -254,6 +250,5 @@ process group is stopped when it exits.
 
 * `vl ws exec` sandboxes and mounted workspaces never run hooks of their
   own, and `vl` inside a sandbox does not act on the project at all.
-* `vl push --dry-run` sends nothing, so it runs no `pre-push`.
 * `vl serve` runs the same hooks for `commit` and `describe` of `@`, with
   their output on the server's stderr; it has no method to trust hooks.
