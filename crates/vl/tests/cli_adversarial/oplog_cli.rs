@@ -320,3 +320,125 @@ fn bug_1121_a_recorder_waits_for_a_live_move_of_the_directory() {
     assert!(out.status.success(), "{t}");
     assert!(blocked && !t.contains("interrupted move"), "a live move was finished by another command: {t}");
 }
+
+// ---- Review: working-copy race fix (BUG-1125, BUG-1126) ----
+
+/// `vl ws write NAME PATH` with `data` on stdin.
+#[cfg(target_os = "linux")]
+fn ws_write(env: &Env, proj: &std::path::Path, ws: &str, path: &str, data: &str) {
+    let mut c = env.cmd("alice", proj, &["ws", "write", ws, path]);
+    c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(data.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+}
+
+/// BUG-1125: `vl renormalize` records the project directory
+/// (`Ctx::snapshot_with_line_endings`) without the working-copy lock, so
+/// it records a directory that another `vl` is moving. Here `vl ws switch
+/// other` is half way (it holds both workspaces' locks, its journal is in
+/// `checkout.json`, `o.txt` is written and `d.txt`, default's, not yet
+/// removed): renormalize records the half-moved directory into `other@`,
+/// so default's `d.txt` lands in the workspace being switched to (BUG-113's
+/// class). (`--no-snapshot` makes the window deterministic; without it the
+/// window is renormalize's own work after its opening snapshot.)
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "BUG-1125: vl renormalize records the directory without the working-copy lock"]
+fn bug_1125_renormalize_waits_for_a_live_move_of_the_directory() {
+    let env = Env::new();
+    let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
+    env.ok("alice", &proj, &["ws", "new", "other"]);
+    ws_write(&env, &proj, "other", "o.txt", "o\n");
+    write(&proj, "d.txt", "d\n");
+    env.ok("alice", &proj, &["status"]);
+    let other: serde_json::Value = serde_json::from_str(&env.stdout("alice", &proj, &["log", "-r", "other@", "--json"])).unwrap();
+    let snapshot = other["entries"][0]["snapshot_id"].clone();
+    // `vl ws switch other`, half way.
+    let l_default = hold_wc_lock(&proj, "default");
+    let l_other = hold_wc_lock(&proj, "other");
+    let record = read(&proj, ".veil/local/checkout.json");
+    let mut v: serde_json::Value = serde_json::from_str(&record).unwrap();
+    v["pending"] = serde_json::json!({"workspace": "other", "snapshot": snapshot});
+    write(&proj, ".veil/local/checkout.json", &v.to_string());
+    write(&proj, "o.txt", "o\n");
+    let before = heads(&proj);
+    let mut child = env.spawn("alice", &proj, &["--no-snapshot", "renormalize"]);
+    // It ends up waiting for a lock either way (its `finish` takes one).
+    let blocked = blocks_on(&l_other, &mut child) || blocks_on(&l_default, &mut child);
+    let recorded_meanwhile = heads(&proj) != before;
+    // The switch finishes.
+    std::fs::remove_file(proj.join("d.txt")).unwrap();
+    v["workspace"] = "other".into();
+    v["snapshot"] = snapshot;
+    v.as_object_mut().unwrap().remove("pending");
+    write(&proj, ".veil/local/checkout.json", &v.to_string());
+    drop(l_other);
+    drop(l_default);
+    let out = child.wait_with_output().unwrap();
+    let t = text(&out);
+    assert!(blocked, "{t}");
+    assert!(!recorded_meanwhile, "renormalize recorded the directory while another `vl` held its lock: {t}");
+    assert!(
+        !env.vl("alice", &proj, &["cat", "-r", "other@", "d.txt"]).status.success(),
+        "default's d.txt was recorded into the workspace being switched to: {t}"
+    );
+}
+
+/// BUG-1125: `vl restore` writes the project directory (`Ctx::restore`,
+/// `main.rs` `cmd_restore`) before it takes the working-copy lock (only its
+/// closing snapshot takes it), so it rewrites files under another `vl`
+/// that is recording or checking out the directory.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "BUG-1125: vl restore writes the directory without the working-copy lock"]
+fn bug_1125_restore_waits_for_another_recorder() {
+    let env = Env::new();
+    let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
+    write(&proj, "a.txt", "edited\n");
+    env.ok("alice", &proj, &["status"]);
+    let lock = hold_wc_lock(&proj, "default");
+    let mut child = env.spawn("alice", &proj, &["--no-snapshot", "restore", "a.txt"]);
+    let blocked = blocks_on(&lock, &mut child);
+    let on_disk = read(&proj, "a.txt");
+    drop(lock);
+    let out = child.wait_with_output().unwrap();
+    assert!(blocked && out.status.success(), "{}", text(&out));
+    assert_eq!(on_disk, "edited\n", "restore rewrote the directory while another `vl` held its lock");
+}
+
+/// BUG-1126: `Ctx::finish` prints the merge warnings, then re-reads the
+/// view under the lock (`lock_dir` → `refresh` → `Repo::reload`), which
+/// merges heads that landed while it waited. That merge's warnings (here:
+/// two concurrent `vl describe` moved `default`, so one working copy was
+/// dropped from `@`) are never printed: only the process that writes a
+/// merge prints it, and later commands find it merged.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "BUG-1126: merge warnings of Ctx::finish's re-read are never printed"]
+fn bug_1126_finish_prints_the_merge_it_wrote() {
+    let env = Env::new();
+    let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
+    env.ok("alice", &proj, &["status"]);
+    let base = heads(&proj);
+    env.ok("alice", &proj, &["--no-snapshot", "describe", "-m", "first side"]);
+    let side_a = heads(&proj);
+    swap_heads(&proj, &side_a, &base);
+    env.ok("alice", &proj, &["--no-snapshot", "describe", "-m", "second side"]);
+    let lock = hold_wc_lock(&proj, "default");
+    let mut child = env.spawn("alice", &proj, &["--no-snapshot", "log"]);
+    let blocked = blocks_on(&lock, &mut child);
+    // The other side lands while `vl log` waits in `finish`.
+    for h in &side_a {
+        write(&proj, &format!(".veil/op_heads/{h}"), "");
+    }
+    drop(lock);
+    let out = child.wait_with_output().unwrap();
+    let mut t = text(&out);
+    assert!(blocked && out.status.success(), "{t}");
+    t.push_str(&text(&env.vl("alice", &proj, &["--no-snapshot", "log"])));
+    t.push_str(&text(&env.vl("alice", &proj, &["status"])));
+    assert!(t.contains("moved by concurrent commands"), "the merge's warning was never printed: {t}");
+}
