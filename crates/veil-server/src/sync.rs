@@ -764,8 +764,10 @@ fn check_changes(
                 Tier::Cloaked(_) if !sealed || !matches!(visibility, Visibility::Cloaked { .. }) => {
                     return Err(Error::forbidden(format!("'{}' is a secret and must arrive encrypted", c.path)))
                 }
-                // Format 8: only secret files are encrypted.
-                Tier::Public if sealed => {
+                // Format 8: only secret files are encrypted. (A secret file a
+                // policy makes public may still arrive sealed: the member's
+                // `vl` keeps the protection they accepted.)
+                Tier::Public if sealed && !veil_core::policy::names_secret(&c.path) => {
                     return Err(Error::forbidden(format!("'{}' is not a secret file: only secret files are encrypted", c.path)))
                 }
                 _ => {}
