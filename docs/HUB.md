@@ -2134,6 +2134,59 @@ at the server, with **no full graph**. Code: `veil-core/src/promisor.rs`
   their ancestors, those of the newest children first, at most `limit` in
   all. Without `limit`, the whole history as before.
 
+#### Measured (2026-11-07)
+
+`scripts/bench-server.sh 1g` through `bench-quiet.sh` (load 15.4 before,
+7.0 after; PostgreSQL and MinIO, release builds, ext4 NVMe): 35,000 files,
+1.15 GB working tree, 10,022 snapshots.
+
+| Case | Time | Client peak | On disk |
+|---|---:|---:|---:|
+| clone, thin (default) | **8.0 s** | **333 MiB** | 0.43 GB in `.veil` |
+| clone, full (`--full`), same run | 56.4 s | 440 MiB | 1.93 GB |
+| `vl log -n 20` in the thin clone (fetches history pages) | 5.5 s | 77 MiB | |
+| `vl status` in the thin clone, clean (3 runs) | 9.8, 1.4, 0.08 s | 115 MiB | |
+
+* A thin clone's time and memory follow what it checks out (the tip's
+  35,000 files), not the history: it holds 2 snapshots of 10,022.
+* The first `vl status` after a clone re-reads the files written within
+  the stat cache's racy window, thin or full alike: on a 10,000-file
+  project (`.scratch` experiment, 31 snapshots) thin 0.12, 0.10, 0.01 s and
+  full 0.19, 0.10, 0.01 s. The benchmark measures the full clone's status
+  only after two pulls, so its 0.09 s is a later run.
+* `log -n 20` fetches 2,000-snapshot pages and runs the walk again after
+  each (the history index is rebuilt once the boundary's parents arrive):
+  seconds on a long history, until phase 3's query API answers it.
+* The server's 1 GB memory gate is missed by every case of this run from
+  the initial push on (push 1,257 MiB; the server keeps that RSS): server
+  push memory is another stream's work (BUG-1000 for clones). A thin clone
+  adds 75 MiB to the server's peak; the full clone 652 MiB.
+
+#### Threat review (the partial-clone design's, and phase 2's rows 9, 16, 18)
+
+| # | Threat | As built | Test |
+|---|---|---|---|
+| 1 | an unfetched object read as hidden | `Missing` only from the server's own refusal at a place under a snapshot on the server; else `Unavailable` (not `is_unreadable`); every `Missing`/`is_unreadable` site in `veil-core` is listed in an audit table | `core_sync` `thin::an_unreachable_server_is_unavailable_never_hidden`, `a_command_without_a_connection_fails_instead_of_hiding`, `every_site_that_reads_missing_as_hidden_is_audited` |
+| 2 | the server sends what the person may not see | the client asks only for ids met in trees the server gave it, at that path; the server checks each (S1) | `server_hub` `thin::a_thin_clone_receives_nothing_its_person_may_not_see` (dev and anyone, every revision shown, then `vl partial full`; cache packs scanned decoded) |
+| 4 | a tampered or wrong object | re-hashed (BLAKE3), decoded, checked storable before use; a snapshot where a tree entry was asked is refused | `thin::a_tampered_object_is_refused_and_never_cached` |
+| 5 | gc in a thin clone | never fetches; the mark stops at what is on the server | `thin::gc_in_a_thin_clone_never_fetches_and_keeps_local_work` |
+| 6 | eviction of local work | local writes go to the main store, even when cached; only the cache is evicted | `thin::local_work_is_never_in_the_cache_and_survives_eviction` |
+| 7 | the server prunes what we relied on | not reachable yet: the server has no gc (anchors.json deferred to S29) | — |
+| 8 | eviction racing readers | pinned objects rewritten before a pack goes; a vanished copy is fetched again | `thin::eviction_keeps_the_bound_and_the_pins` |
+| 9 | push from a thin clone leaves the receiver incomplete | the push sends what differs from the parents (S1's `Introduced`); the server checks closure | `server_hub` `thin::a_thin_clone_holds_the_tips_…` (push, then a full clone pulls, checks out and passes `fsck`) |
+| 11 | fetch storms, a thrashing cache | stops at the bound with an error; a too-large checkout is refused at clone | `thin::a_full_cache_fails_cleanly`, `server_hub` `thin::the_cache_stays_under_its_bound` |
+| 12 | the server is unreachable | fails before writing anything (the checkout fetches ahead, before its journal); local work goes on | `server_hub` `thin::a_lost_server_is_a_clear_error_never_a_hidden_file` |
+| 14 | format and older vl | format 9 with its marker, refused by number; either without the other refused | `thin::the_partial_marker_needs_format_9_and_back`, `format_compat` |
+| — | no full graph | snapshots never fetched on a miss; ancestry and log page through `history`; without the server, `Unavailable` | `thin::ancestry_beyond_the_boundary_asks_the_server`, `server_hub` `thin::history_answers_pages` |
+
+#### Reverting
+
+Revert the merge commit. Thin clones made meanwhile are format 9, which
+the reverted vl refuses by number (nothing is misread): run `vl partial
+full` in each before reverting, or clone again. The server change (the
+`limit` of `history`, revision 3) is additive: an older client never sends
+it.
+
 #### Not built in S3 (and why)
 
 * **anchors.json** (pinning before a non-fast-forward pull): the server
