@@ -22,8 +22,14 @@ pub trait BlobStore: Send + Sync {
     /// same key twice writes the same bytes.
     async fn put(&self, key: &str, data: Bytes) -> Result<()>;
     async fn exists(&self, key: &str) -> Result<bool>;
+    /// The length of the object at `key` without reading it where the
+    /// store can (a file's size, an S3 `HEAD`); `None` if there is none.
+    async fn len(&self, key: &str) -> Result<Option<u64>> {
+        Ok(self.get(key).await?.map(|b| b.len() as u64))
+    }
     /// Bytes `start..=end` of the object at `key` (`end` clamped to its
-    /// last byte; empty when `start` is past it) and the object's length;
+    /// last byte, `u64::MAX` for "to the end"; empty when `start` is past
+    /// it) and the object's length;
     /// `None` if there is none. Reads only those bytes where the store can
     /// (a `Range` request of the object routes); this default reads all.
     async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Option<(Bytes, u64)>> {
@@ -101,6 +107,14 @@ impl BlobStore for FsStore {
 
     async fn exists(&self, key: &str) -> Result<bool> {
         Ok(tokio::fs::try_exists(self.path(key)?).await?)
+    }
+
+    async fn len(&self, key: &str) -> Result<Option<u64>> {
+        match tokio::fs::metadata(self.path(key)?).await {
+            Ok(m) => Ok(Some(m.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Option<(Bytes, u64)>> {
@@ -231,16 +245,20 @@ impl BlobStore for S3Store {
     async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Option<(Bytes, u64)>> {
         use rusty_s3::S3Action;
         let url = self.bucket.get_object(Some(&self.credentials), key).sign(S3_SIGN_FOR);
-        let range = format!("bytes={start}-{end}");
+        // An open range is sent open: a store that does not parse a huge
+        // end ignores the range and sends the whole object (BUG-1086).
+        let range = if end == u64::MAX { format!("bytes={start}-") } else { format!("bytes={start}-{end}") };
         let (status, headers, body) = s3_send_with_headers(|| self.http.get(url.clone()).header("range", &range)).await?;
-        // `Content-Range: bytes a-b/len` (206) or `bytes */len` (416).
+        // `Content-Range: bytes a-b/len` (206).
         let len = || -> Result<u64> {
             let v = headers.get("content-range").and_then(|v| v.to_str().ok()).unwrap_or_default();
             v.rsplit_once('/').and_then(|(_, l)| l.parse().ok()).ok_or_else(|| anyhow!("S3 GET with a range: no length in {v:?}"))
         };
         match status {
             206 => Ok(Some((body, len()?))),
-            416 => Ok(Some((Bytes::new(), len()?))),
+            // Past the end. MinIO's 416 names no length (BUG-1086): a HEAD
+            // gives it.
+            416 => Ok(self.len(key).await?.map(|l| (Bytes::new(), l))),
             // A store that ignores the range sends the whole object.
             200 => Ok(Some((slice(&body, start, end), body.len() as u64))),
             404 => Ok(None),
@@ -266,6 +284,53 @@ impl BlobStore for S3Store {
             404 => Ok(false),
             s => bail!("S3 HEAD: HTTP {s}"),
         }
+    }
+
+    async fn len(&self, key: &str) -> Result<Option<u64>> {
+        use rusty_s3::S3Action;
+        let url = self.bucket.head_object(Some(&self.credentials), key).sign(S3_SIGN_FOR);
+        let (status, headers, _) = s3_send_with_headers(|| self.http.head(url.clone())).await?;
+        match status {
+            200 => {
+                let v = headers.get("content-length").and_then(|v| v.to_str().ok()).unwrap_or_default();
+                Ok(Some(v.parse().map_err(|_| anyhow!("S3 HEAD: no length in {v:?}"))?))
+            }
+            404 => Ok(None),
+            s => bail!("S3 HEAD: HTTP {s}"),
+        }
+    }
+}
+
+/// Bytes of objects the object routes and `fetch` have read and not sent
+/// yet, across every request (BUG-1087): each read takes its cost
+/// ([`Objects::read_cost`]) before it starts, and gives it back when its
+/// frame is sent; an object costing more than this takes all of it.
+pub const READ_AHEAD: u32 = 256 << 20;
+static READ_AHEAD_BYTES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(READ_AHEAD as usize);
+
+/// How much more than the size its entry records an object may hold: the
+/// blob's header, or a sealed envelope's nonce, tag and label. A push whose
+/// entry records less is refused (`sync::check_changes`), so a recorded
+/// size bounds what reading its object holds.
+pub const SIZE_SLACK: u64 = 4096;
+
+/// Read-ahead taken by one object read ([`READ_AHEAD`]).
+pub struct ReadAhead(#[allow(dead_code)] tokio::sync::SemaphorePermit<'static>);
+
+fn permits(cost: u64) -> u32 {
+    cost.min(u64::from(READ_AHEAD)) as u32
+}
+
+impl ReadAhead {
+    /// Wait for `cost` bytes of read-ahead: only for a request that holds
+    /// none, so requests never wait on one another in a cycle.
+    pub async fn wait(cost: u64) -> ReadAhead {
+        ReadAhead(READ_AHEAD_BYTES.acquire_many(permits(cost)).await.expect("never closed"))
+    }
+
+    /// `cost` bytes of read-ahead if they are free now.
+    pub fn try_take(cost: u64) -> Option<ReadAhead> {
+        READ_AHEAD_BYTES.try_acquire_many(permits(cost)).ok().map(ReadAhead)
     }
 }
 
@@ -361,6 +426,21 @@ impl Objects {
             return Ok(Some((slice(&b, start, end), b.len() as u64)));
         }
         self.store.get_range(&object_key(project, id), start, end).await
+    }
+
+    /// What reading object `id` may hold, by the size its entry records
+    /// (`recorded`, checked at push against the object: [`SIZE_SLACK`]), or,
+    /// for an entry that records none (a tree, a conflict, an empty file),
+    /// by its length in the cache or the store.
+    pub async fn read_cost(&self, project: i64, id: &ObjectId, recorded: u64) -> Result<u64> {
+        if recorded > 0 {
+            return Ok(recorded.saturating_add(SIZE_SLACK));
+        }
+        let len = match self.cache.get(&Self::cache_key(project, id)) {
+            Some(b) => Some(b.len() as u64),
+            None => self.store.len(&object_key(project, id)).await?,
+        };
+        Ok(len.unwrap_or(0) + SIZE_SLACK)
     }
 
     pub async fn exists(&self, project: i64, id: &ObjectId) -> Result<bool> {

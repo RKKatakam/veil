@@ -62,12 +62,12 @@ pub const MAX_GRANT_TOKEN: usize = 4096;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrantBody {
-    /// The project's name (as in the routes) and id (as in the store).
+    /// The project's name (as in the routes). No database id: ids are
+    /// sequential, and would count the server's projects and people
+    /// (BUG-1088); the server looks them up when it checks the grant.
     pub project: String,
-    pub project_id: i64,
-    /// Who it was issued to: a person's id and their device's Ed25519 key
-    /// (hex); both `None` for anyone on Earth.
-    pub person: Option<i64>,
+    /// The device it was issued to: its Ed25519 key (hex); `None` for
+    /// anyone on Earth.
     pub device: Option<String>,
     /// The viewer's projected root tree of one snapshot.
     pub root: ObjectId,
@@ -437,8 +437,6 @@ mod tests {
     fn body(device: Option<String>) -> GrantBody {
         GrantBody {
             project: "acme".into(),
-            project_id: 7,
-            person: device.as_ref().map(|_| 3),
             person_epoch: if device.is_some() { -9 } else { 0 },
             device,
             root: blob("root"),

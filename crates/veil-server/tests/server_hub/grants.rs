@@ -152,6 +152,11 @@ fn real_chains(dir: &Path) -> Vec<(String, Vec<ObjectId>, ObjectId)> {
     out
 }
 
+/// Project `name`'s database id (the store's key; no client sees it).
+fn project_id(hub: &TestHub, name: &str) -> i64 {
+    hub.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(name).fetch_one(&hub.hub().db)).unwrap()
+}
+
 fn items(walked: &[(Vec<ObjectId>, ObjectId, Vec<u8>)]) -> Vec<(String, Vec<u8>)> {
     walked.iter().map(|(_, id, raw)| (format!("object {}", id.short()), raw.clone())).collect()
 }
@@ -311,7 +316,7 @@ fn grants_hold_only_for_their_device_project_key_and_time() {
     assert_eq!(dev.get_as(&fresh, &[], &root, None, &[]).status, 200, "the same grant, re-signed, still works");
     // Anyone on Earth's grant names no device and needs no signature.
     let anyone = Reader::new(&api, None, &p.name);
-    assert!(anyone.body().device.is_none() && anyone.body().person.is_none());
+    assert!(anyone.body().device.is_none() && anyone.body().person_epoch == 0);
     assert_eq!(api.get_with(&format!("/v1/objects/{}/{}", p.name, anyone.root().hex()), &[("veil-grant", &anyone.grant)]).status, 200);
 
     // Hostile input: nothing crashes, nothing is served.
@@ -469,7 +474,7 @@ fn bench_object_routes() {
     let mut q = Vec::new();
     for _ in 0..1000 {
         let t = Instant::now();
-        hub.rt.block_on(state.grants.current(&state.db, g.body.project_id, g.body.person)).unwrap();
+        hub.rt.block_on(state.grants.current(&state.db, &p.name, g.body.device.as_deref())).unwrap();
         q.push(t.elapsed().as_secs_f64() * 1e6);
     }
     println!("   of which the epoch query (µs): p50 {:.0}  p99 {:.0}", percentile(&mut q.clone(), 0.5), percentile(&mut q, 0.99));
@@ -482,7 +487,7 @@ fn bench_object_routes() {
     }
     println!("   grant and request signature checks (µs): {:.0}", t.elapsed().as_secs_f64() * 1e6 / 1000.0);
     // The chain check alone, against the server's store and tree cache.
-    let src = veil_server::sync::Source { hub: state.clone(), project: g.body.project_id, rt: hub.rt.handle().clone(), pending: Default::default() };
+    let src = veil_server::sync::Source { hub: state.clone(), project: project_id(&hub, &p.name), rt: hub.rt.handle().clone(), pending: Default::default() };
     let mut cold = Vec::new();
     for (chain, id) in &many {
         let t = Instant::now();
@@ -666,7 +671,7 @@ fn bug_1082_the_epoch_feed_skips_a_change_whose_key_changed_again() {
     let db = hub.hub().db.clone();
     let token = p.dev.token();
     let dev = Reader::new(&api, Some(&p.dev), &p.name);
-    let pid = dev.body().project_id;
+    let pid = project_id(&hub, &p.name);
     let mut seen = vec![dev.body().epoch];
     // SQL straight in the database, run again on a lost race or a catalog
     // another test's DDL changed (YugabyteDB: 40001), as the routes are.
@@ -727,11 +732,11 @@ fn bug_1083_a_store_that_cannot_be_written_fails_every_pull() {
     let hub = TestHub::start_with_s3(&url, std::time::Duration::from_secs(3600), None);
     let p = setup_project(&hub);
     let api = hub.api();
-    let dev = Reader::new(&api, Some(&p.dev), &p.name);
+    let _dev = Reader::new(&api, Some(&p.dev), &p.name);
     // The server's own projection memo key for dev (computed here from the
     // policy the test wrote; no client receives it).
     let policy = std::fs::read_to_string(p.dir.join(".veilpolicy")).unwrap();
-    let (pid, view) = (dev.body().project_id, guessed_view(&policy, &["devs"]));
+    let (pid, view) = (project_id(&hub, &p.name), guessed_view(&policy, &["devs"]));
     // A change dev sees, in src/ (rewritten for dev: it holds a hidden folder).
     write_files(&p.dir, &[("src/lib.rs", "MARKER-PUBLIC-CHANGED-77c1d0e2")]);
     p.admin.commit_main(&p.dir, "src changed");
@@ -871,7 +876,6 @@ fn a_grant_racing_a_removal_never_outlives_it() {
 /// instead of the directory store's 416. The S3 store must answer as the
 /// directory store does, reading only the bytes asked for.
 #[test]
-#[ignore = "BUG-1086: S3 ranged reads: an open range reads the whole object, a range past the end is an error (500)"]
 fn bug_1086_s3_ranges_read_only_the_bytes_asked_for_and_answer_as_the_directory_store() {
     use veil_server::store::{BlobStore, FsStore, S3Store};
     let Ok(endpoint) = std::env::var("VEIL_TEST_S3_ENDPOINT") else {
@@ -979,7 +983,6 @@ fn reset_peak() {
 /// file with its true size stays within the bound (the control). It
 /// measures memory, so it runs in a process of its own.
 #[test]
-#[ignore = "BUG-1087: read-ahead trusts the sizes pushed tree entries record (a 1-byte entry for 8 MiB: 64 copies at once)"]
 fn bug_1087_a_batch_reads_ahead_by_sizes_the_pusher_wrote() {
     const CHILD: &str = "VEIL_BUG1087_CHILD";
     if std::env::var(CHILD).is_err() {
@@ -1009,6 +1012,18 @@ fn bug_1087_a_batch_reads_ahead_by_sizes_the_pusher_wrote() {
         c.set_entry(path, veil_core::TreeEntry { name: String::new(), kind: EntryKind::File, id, size, executable: false, visibility: Default::default() });
     }
     let r = c.push("main", "two large files");
+    // The entry that records 1 byte for 8 MiB is refused at push: a
+    // recorded size bounds what reading its object holds.
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+    assert!(String::from_utf8_lossy(&r.body).contains("src/lying.bin"), "{}", String::from_utf8_lossy(&r.body));
+    // The same two files recorded truthfully: "lying.bin" is then asked
+    // for 64 times in one batch, and read once.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    for (path, tag) in [("src/honest.bin", "honest"), ("src/lying.bin", "lying")] {
+        let id = c.put_object(file(tag));
+        c.set_entry(path, veil_core::TreeEntry { name: String::new(), kind: EntryKind::File, id, size: honest_len, executable: false, visibility: Default::default() });
+    }
+    let r = c.push("main", "two large files, sizes recorded");
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     // Another server of the deployment, whose cache holds neither.
     let cold = TestHub::beside(&hub);
@@ -1044,7 +1059,7 @@ fn bug_1087_a_batch_reads_ahead_by_sizes_the_pusher_wrote() {
     }
     eprintln!("peak growth while one batch of 64 wants of an 8 MiB file is not read (MiB): {grew:?}");
     assert!(grew[0].1 < 192, "the control (true size) went past the bound: {grew:?}");
-    assert!(grew[1].1 < 192, "a batch held {} MiB for one request, by sizes its pusher wrote: {grew:?}", grew[1].1);
+    assert!(grew[1].1 < 64, "a batch of one id asked for 64 times held {} MiB: {grew:?}", grew[1].1);
 }
 
 /// BUG-1088. A grant names its project and person by their database ids,
@@ -1057,7 +1072,6 @@ fn bug_1087_a_batch_reads_ahead_by_sizes_the_pusher_wrote() {
 /// (BUG-1081 removed the feed's). In a database of its own, so the count is
 /// exact.
 #[test]
-#[ignore = "BUG-1088: grants carry sequential project and person ids: anyone counts the server's private projects"]
 fn bug_1088_a_grants_ids_count_the_servers_private_projects() {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(2).build().unwrap();
     let hub = TestHub::start_on(&fresh_database(&rt), std::time::Duration::from_secs(3600));
@@ -1083,6 +1097,11 @@ fn bug_1088_a_grants_ids_count_the_servers_private_projects() {
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     }
     let second = create(&watcher);
-    let between = second.project_id - first.project_id - 1;
-    assert_ne!(between, 5, "the watcher's two grants show that 5 projects were created by others in between");
+    // A grant holds no database id: only the project's name, the device's
+    // key, the root, two random epochs and its expiry.
+    for g in [&first, &second] {
+        let v = serde_json::to_value(g).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["device", "epoch", "expires", "person_epoch", "project", "root"], "{v}");
+    }
 }

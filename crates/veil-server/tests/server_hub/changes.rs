@@ -74,6 +74,9 @@ fn an_api_commit_lands_and_verifies_like_a_push_for_every_viewer() {
                 "onto": {"branch": "main", "expected": base.hex()}}),
     );
     let took = t0.elapsed();
+    // Counted before the tips below, which store the projected trees of
+    // the caller's grant (S5).
+    let new = count() - before;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     let v = r.json();
     assert_eq!(v["branch"]["status"], "ok", "{v}");
@@ -83,7 +86,6 @@ fn an_api_commit_lands_and_verifies_like_a_push_for_every_viewer() {
     if std::env::var_os("VEIL_TEST_S3_ENDPOINT").is_none() {
         // The blob, the full trees on its path (root, src/, src/api/), the
         // server's snapshot and the dev's projection of it.
-        let new = count() - before;
         eprintln!("api commit of one file by a non-admin: {new} new objects stored");
         assert!(new <= 6, "{new} objects stored for one file");
     }

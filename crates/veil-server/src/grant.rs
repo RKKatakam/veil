@@ -95,11 +95,28 @@ impl Grants {
         Grant::issue(&self.key, body)
     }
 
-    /// The current access epochs of `project` and of `person` (anyone on
-    /// Earth: 0), from S4's table (one indexed query).
-    pub async fn current(&self, db: &sqlx::PgPool, project: i64, person: Option<i64>) -> Result<(i64, i64)> {
-        let e = crate::caches::read_epochs(db, person.unwrap_or(0), Some(project)).await?;
-        Ok((e.project.map_or(0, |(_, e)| e), person.map_or(0, |_| e.person)))
+    /// For a grant of project `project` to `device` (`None`: anyone on
+    /// Earth): the project's id and the current epochs of the project and of
+    /// the device's person (0: none), in one statement; `None` if there is
+    /// no such project, or the device is no longer an active one. A grant
+    /// names neither id (BUG-1088).
+    pub async fn current(&self, db: &sqlx::PgPool, project: &str, device: Option<&str>) -> Result<Option<(i64, i64, i64)>> {
+        let row: Option<(i64, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT p.id, \
+             COALESCE((SELECT epoch FROM access_epochs WHERE project_id = p.id AND person_id = 0), 0), \
+             (SELECT COALESCE((SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = d.person_id), 0) \
+              FROM devices d WHERE d.signing_key = $2 AND d.removed_at IS NULL AND NOT d.pending) \
+             FROM projects p WHERE p.name = $1",
+        )
+        .bind(project)
+        .bind(device.unwrap_or(""))
+        .fetch_optional(db)
+        .await?;
+        Ok(match (row, device) {
+            (Some((id, epoch, _)), None) => Some((id, epoch, 0)),
+            (Some((id, epoch, Some(person_epoch))), Some(_)) => Some((id, epoch, person_epoch)),
+            _ => None,
+        })
     }
 }
 
@@ -130,8 +147,6 @@ pub async fn for_tips(
         };
         let body = GrantBody {
             project: project.name.clone(),
-            project_id: project.id,
-            person: caller.person.as_ref().map(|p| p.id),
             device: caller.person.as_ref().map(|p| p.device_key.clone()),
             root,
             epoch,
@@ -222,31 +237,37 @@ fn not_reached() -> Error {
     Error::not_found("no such object that your grant reaches")
 }
 
-/// The grant in `token`, if it may be used now for `project` by the
-/// request for `ids` at `ts` signed `signature`. Checked before any object
-/// is looked at.
-async fn check(hub: &Hub, project: &str, token: &str, ts: i64, signature: Option<&str>, ids: &[ObjectId]) -> Result<Grant> {
+/// The grant in `token` and its project's id, if it may be used now for
+/// `project` by the request for `ids` at `ts` signed `signature`. Checked
+/// before any object is looked at.
+async fn check(hub: &Hub, project: &str, token: &str, ts: i64, signature: Option<&str>, ids: &[ObjectId]) -> Result<(Grant, i64)> {
     let g = Grant::verify(token, hub.grants.key_hex()).ok_or_else(grant_invalid)?;
     let now = veil_core::now_millis();
     if !g.usable(project, now, g.body.epoch, g.body.person_epoch) || !request_signed(&g, ts, ids, signature, now) {
         return Err(grant_invalid());
     }
-    let (epoch, person_epoch) = hub.grants.current(&hub.db, g.body.project_id, g.body.person).await?;
+    let (id, epoch, person_epoch) = hub.grants.current(&hub.db, project, g.body.device.as_deref()).await?.ok_or_else(grant_invalid)?;
     if !g.usable(project, now, epoch, person_epoch) {
         return Err(grant_invalid());
     }
-    Ok(g)
+    Ok((g, id))
 }
 
-/// Which of `wants` `grant`'s root reaches, in order, with the size each
-/// one's entry records. Reads only trees the chains reach.
-async fn reached(hub: &Arc<Hub>, grant: &Grant, wants: Vec<(Vec<ObjectId>, ObjectId)>) -> Result<Vec<(ObjectId, u64)>> {
+/// Which of `wants` `grant`'s root reaches, in order, each once (a
+/// repeated id is read and sent once: BUG-1087), with the size each one's
+/// entry records. Reads only trees the chains reach.
+async fn reached(hub: &Arc<Hub>, project: i64, grant: &Grant, wants: Vec<(Vec<ObjectId>, ObjectId)>) -> Result<Vec<(ObjectId, u64)>> {
     let root = grant.body.root;
-    sync::blocking(hub, grant.body.project_id, move |src| {
+    sync::blocking(hub, project, move |src| {
         let mut chains = Chains::new(src, root);
         let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for (chain, id) in &wants {
+            if seen.contains(id) {
+                continue;
+            }
             if let Some(size) = chains.check(chain, id)? {
+                seen.insert(*id);
                 out.push((*id, size));
             }
         }
@@ -264,53 +285,77 @@ async fn read(hub: &Hub, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
     Ok(hub.objects.get(project, id).await?)
 }
 
-/// Most objects, and about the most bytes, read ahead of the one a batch
-/// sends next: its memory is bounded, as `sync::fetch`'s is (BUG-860). An
-/// object counts the size its entry or conflict term records; one that
-/// records none (a tree, an empty file) counts [`UNSIZED`] until it is read,
-/// and then what it is.
+/// Most objects, and about the most bytes, one batch reads ahead of the
+/// one it sends next (as `sync::fetch`, BUG-860); across every request,
+/// reads also take their cost from the server's read-ahead
+/// ([`crate::store::READ_AHEAD`], BUG-1087).
 const WINDOW: usize = 64;
 const WINDOW_BYTES: u64 = 8 << 20;
-const UNSIZED: u64 = 1 << 20;
 
-/// Checked objects `items`, read a window ahead and sent as frames in
-/// order; one that is not there is left out. A failure ends the stream
-/// with an error, so it is never taken as whole.
+/// Checked objects `items` (id, recorded size), read a window ahead and
+/// sent as frames in order; one that is not there is left out. A failure
+/// ends the stream with an error, so it is never taken as whole.
 fn stream(hub: Arc<Hub>, project: i64, items: Vec<(ObjectId, u64)>) -> sync::FrameStream {
+    use crate::store::ReadAhead;
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     tokio::spawn(async move {
+        let stop = |e: String| {
+            eprintln!("veil-server: an object batch stopped: {e}");
+            std::io::Error::other("the answer stopped")
+        };
+        // What each read may hold: by the size its entry records (checked
+        // at push), else by the store's length; looked up 64 at a time.
+        let mut cost = vec![0u64; items.len()];
+        let mut lookups = tokio::task::JoinSet::new();
+        for (i, (id, recorded)) in items.iter().enumerate() {
+            if lookups.len() >= WINDOW {
+                match lookups.join_next().await {
+                    Some(Ok((j, Ok(c)))) => cost[j] = c,
+                    other => return drop(tx.send(Err(stop(format!("{other:?}")))).await),
+                }
+            }
+            let (hub, id, recorded) = (hub.clone(), *id, *recorded);
+            lookups.spawn(async move { (i, hub.objects.read_cost(project, &id, recorded).await) });
+        }
+        while let Some(r) = lookups.join_next().await {
+            match r {
+                Ok((j, Ok(c))) => cost[j] = c,
+                other => return drop(tx.send(Err(stop(format!("{other:?}")))).await),
+            }
+        }
         let mut set = tokio::task::JoinSet::new();
-        let mut ready: std::collections::HashMap<usize, Option<Bytes>> = std::collections::HashMap::new();
+        let mut ready: std::collections::HashMap<usize, (Option<Bytes>, ReadAhead)> = std::collections::HashMap::new();
         let (mut next, mut sent, mut ahead) = (0usize, 0usize, 0u64);
-        // What each object read counts against the window: its recorded
-        // size, or UNSIZED, then its real size once read.
-        let mut cost: Vec<u64> = items.iter().map(|(_, size)| if *size == 0 { UNSIZED } else { *size }).collect();
         let mut out = Vec::new();
         while sent < items.len() {
             while next < items.len() && next - sent < WINDOW && (next == sent || ahead + cost[next] <= WINDOW_BYTES) {
+                // Wait for read-ahead only while holding none of it.
+                let taken = if next == sent { ReadAhead::wait(cost[next]).await } else {
+                    match ReadAhead::try_take(cost[next]) {
+                        Some(t) => t,
+                        None => break,
+                    }
+                };
                 let (hub, id, i) = (hub.clone(), items[next].0, next);
-                set.spawn(async move { (i, read(&hub, project, &id).await) });
+                set.spawn(async move { (i, read(&hub, project, &id).await, taken) });
                 ahead += cost[next];
                 next += 1;
             }
             while !ready.contains_key(&sent) {
                 match set.join_next().await {
-                    Some(Ok((i, Ok(raw)))) => {
-                        let real = raw.as_ref().map_or(0, |r| r.len() as u64);
-                        ahead = ahead - cost[i] + real;
-                        cost[i] = real;
-                        ready.insert(i, raw);
+                    Some(Ok((i, Ok(raw), taken))) => {
+                        ready.insert(i, (raw, taken));
                     }
-                    other => {
-                        eprintln!("veil-server: an object batch stopped: {other:?}");
-                        let _ = tx.send(Err(std::io::Error::other("the answer stopped"))).await;
-                        return;
-                    }
+                    Some(Ok((_, Err(e), _))) => return drop(tx.send(Err(stop(format!("{e:?}")))).await),
+                    Some(Err(e)) => return drop(tx.send(Err(stop(format!("{e:?}")))).await),
+                    None => return drop(tx.send(Err(stop("a read went missing".into()))).await),
                 }
             }
-            if let Some(raw) = ready.remove(&sent).flatten() {
+            let (raw, taken) = ready.remove(&sent).expect("ready");
+            if let Some(raw) = raw {
                 put_frame(&mut out, &items[sent].0, &raw);
             }
+            drop(taken);
             ahead -= cost[sent];
             sent += 1;
             if out.len() >= 1 << 20 && tx.send(Ok(Bytes::from(std::mem::take(&mut out)))).await.is_err() {
@@ -371,11 +416,10 @@ pub async fn get_object(State(hub): State<HubState>, Path((p, id)): Path<(String
     let id = ObjectId::from_hex(&id).map_err(|_| Error::bad_request("an object id is 64 hex digits"))?;
     let chain = parse_chain(&headers)?;
     let (ts, sig) = parse_signature(&headers)?;
-    let grant = check(&hub, &p, token, ts, sig.as_deref(), &[id]).await?;
-    if reached(&hub, &grant, vec![(chain, id)]).await?.is_empty() {
+    let (grant, project) = check(&hub, &p, token, ts, sig.as_deref(), &[id]).await?;
+    if reached(&hub, project, &grant, vec![(chain, id)]).await?.is_empty() {
         return Err(not_reached());
     }
-    let project = grant.body.project_id;
     let octets = (header::CONTENT_TYPE, "application/octet-stream".to_string());
     let Some((start, end)) = parse_range(&headers) else {
         let raw = read(&hub, project, &id).await?.ok_or_else(not_reached)?;
@@ -404,9 +448,9 @@ pub async fn batch(State(hub): State<HubState>, Path(target): Path<String>, body
         return Err(Error::bad_request(format!("at most {MAX_WANTS} objects per request")));
     }
     let ids: Vec<ObjectId> = req.wants.iter().map(|w| w.id).collect();
-    let grant = check(&hub, p, &req.grant, req.ts, req.signature.as_deref(), &ids).await?;
-    let items = reached(&hub, &grant, req.wants.into_iter().map(|w| (w.chain, w.id)).collect()).await?;
-    let body = axum::body::Body::new(stream(hub.clone(), grant.body.project_id, items));
+    let (grant, project) = check(&hub, p, &req.grant, req.ts, req.signature.as_deref(), &ids).await?;
+    let items = reached(&hub, project, &grant, req.wants.into_iter().map(|w| (w.chain, w.id)).collect()).await?;
+    let body = axum::body::Body::new(stream(hub.clone(), project, items));
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], body).into_response())
 }
 

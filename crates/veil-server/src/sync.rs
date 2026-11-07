@@ -876,10 +876,10 @@ fn check_changes(
         }
         // The content to check: a file's or link's blob, or each term of a
         // conflict, with its label (BUG-931).
-        let contents: Vec<(ObjectId, Visibility)> = match e.kind {
-            k if k.holds_blob() => vec![(e.id, e.visibility.clone())],
+        let contents: Vec<(ObjectId, Visibility, u64)> = match e.kind {
+            k if k.holds_blob() => vec![(e.id, e.visibility.clone(), e.size)],
             EntryKind::Conflict => match Object::decode(&src.raw(&e.id)?)? {
-                Object::Conflict(cf) => cf.adds.iter().chain(&cf.removes).flatten().map(|t| (t.id, t.visibility.clone())).collect(),
+                Object::Conflict(cf) => cf.adds.iter().chain(&cf.removes).flatten().map(|t| (t.id, t.visibility.clone(), t.size)).collect(),
                 _ => return Err(Error::bad_request(format!("'{}': a conflict entry names something else", c.path))),
             },
             _ => continue,
@@ -890,8 +890,16 @@ fn check_changes(
         // accepted policy (an admin's), or in an admin's own change: anyone
         // may turn `public` into `public!`, which is the same access.
         let unscanned = class.allow_secrets && (admin || accepted.classify(&vp, false).allow_secrets);
-        for (id, visibility) in contents {
+        for (id, visibility, size) in contents {
             let raw = src.raw(&id)?;
+            // The size an entry records bounds what reading its object
+            // holds (`store::Objects::read_cost`, BUG-1087).
+            if raw.len() as u64 > size.saturating_add(crate::store::SIZE_SLACK) {
+                return Err(Error::bad_request(format!(
+                    "'{}': its entry records {size} bytes, less than its content holds",
+                    c.path
+                )));
+            }
             let sealed = Object::sealed_scope(&raw).is_some();
             match class.tier {
                 Tier::Isolated | Tier::Ignored => {
