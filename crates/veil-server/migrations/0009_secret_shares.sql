@@ -3,7 +3,9 @@
 -- server cannot open it) and, in plain text for the admins' audit, who
 -- shared which path with whom and when. A share the sharer ends keeps its
 -- row (the audit) without its body. Idempotent (IF NOT EXISTS): YugabyteDB
--- may apply DDL statement by statement.
+-- may apply DDL statement by statement. Every query is by project: the
+-- primary key's prefix serves them, so there is no other index (each one is
+-- a tablet more per database on YugabyteDB).
 CREATE TABLE IF NOT EXISTS secret_shares (
     project_id BIGINT NOT NULL REFERENCES projects(id),
     path TEXT NOT NULL,
@@ -16,5 +18,3 @@ CREATE TABLE IF NOT EXISTS secret_shares (
     body TEXT,
     PRIMARY KEY (project_id, path, sharer_id, recipient_id)
 );
-CREATE INDEX IF NOT EXISTS secret_shares_by_recipient ON secret_shares (project_id, recipient_id);
-CREATE INDEX IF NOT EXISTS secret_shares_by_sharer ON secret_shares (project_id, sharer_id);
