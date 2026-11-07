@@ -250,6 +250,7 @@ pub fn pull(ctx: &mut Ctx, remote: &str) -> Result<()> {
         warn_untrusted(w);
     }
     println!("Pulled {} object(s) from {remote}", r.objects_copied);
+    crate::share_cmd::after_pull(ctx, &client);
     Ok(())
 }
 

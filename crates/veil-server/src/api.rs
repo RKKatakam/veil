@@ -54,6 +54,8 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/groups/{g}/managers", post(add_managers))
         .route("/v1/projects/{p}/rings", get(get_rings))
         .route("/v1/projects/{p}/rings/{scope}", post(post_ring).get(get_ring))
+        .route("/v1/projects/{p}/shares", get(crate::shares::list).post(crate::shares::put))
+        .route("/v1/projects/{p}/shares/remove", post(crate::shares::remove))
         .layer(DefaultBodyLimit::max(crate::db::body_limit("")))
         .layer(axum::middleware::from_fn(crate::db::retry_requests))
         .with_state(hub)

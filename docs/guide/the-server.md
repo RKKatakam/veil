@@ -251,6 +251,43 @@ vl upgrade --rule-keys --dry-run
 vl upgrade --rule-keys
 ```
 
+### Sharing one secret with one person
+
+Any member can give another member **one of their secret files**, without
+an admin: a test API key for a contractor, your `.env` for a teammate
+outside your folder.
+
+```sh
+vl secret share billing/.env.stripe-test --with bob
+#   Shared billing/.env.stripe-test with bob (version 1, 2 devices)
+vl secret shares                    # what you share and receive (admins: every share)
+vl secret unshare billing/.env.stripe-test --from bob
+```
+
+- **Only bob's confirmed devices, and yours, can open it.** It is a copy of
+  that one file under a key of its own: bob gets nothing else of `billing/`,
+  and the server stores only ciphertext. A device of bob's that no key ring
+  records, nobody compared, and no invite or vouch confirms is shown as
+  `confirm bob's device: 4F2A-…` and gets nothing; if bob is in no key ring
+  at all, compare that fingerprint with what `vl identity show` prints on
+  his device and add `--confirm 4F2A-…`.
+- **It is a file that is a secret**: `.env`, `.env.*`, `.envrc`, Terraform
+  state, or one the project's policy seals. Never code (give folders with
+  `vl access`) and never a personal key.
+- **Bob's `vl pull` writes it at the same path**, where it stays on his
+  device: never recorded, backed up in his local vault, and given to his
+  agents with `vl ws exec --with-isolated`. It never writes over a file bob
+  changed, and not on a device that holds the folder's key itself (that
+  device would record it for everyone in the folder).
+- **Your later edits reach him in the background** (from the device that
+  shared it, after any `vl` command), and so do his newly confirmed
+  devices; a device he removes gets no later version.
+- **Admins see that it is shared** (who, which path, when), never what it
+  holds. The share pauses while you may no longer read the file's folder,
+  or bob no longer takes part in the project.
+- **`vl secret unshare` stops later versions; it cannot take back what bob
+  already received.** Rotate the secret if that matters.
+
 ## What someone without access sees
 
 Bob is not in `finance`. His clone of `acme` has `src/` only: no `billing/`,

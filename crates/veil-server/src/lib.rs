@@ -6,6 +6,7 @@
 //! | [`api`] | the HTTPS routes |
 //! | [`auth`] | challenge-response sign-in, session tokens |
 //! | [`perm`] | the permission model: admins, groups, the accepted policy |
+//! | [`shares`] | person-to-person secret shares (ciphertext and the admins' audit) |
 //! | [`sync`] | projected history, fetch by id, push validation, branch CAS |
 //! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
@@ -18,6 +19,7 @@ pub mod db;
 pub mod derive;
 pub mod error;
 pub mod perm;
+pub mod shares;
 pub mod store;
 pub mod sync;
 pub mod tls;

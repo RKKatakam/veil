@@ -39,6 +39,7 @@ mod render;
 mod rewrite_cmd;
 mod sandbox;
 mod serve;
+mod share_cmd;
 mod shape;
 mod team_secret;
 #[cfg(debug_assertions)]
@@ -1776,6 +1777,9 @@ fn cmd_secret(ctx: &mut Ctx, c: &SecretCmd) -> Result<()> {
             }
             println!("Recovered {} from the local vault", safe(p.as_str()));
         }
+        SecretCmd::Share { path, with, confirm, out } => share_cmd::share(ctx, path, with, confirm, out.json)?,
+        SecretCmd::Unshare { path, from, out } => share_cmd::unshare(ctx, path, from, out.json)?,
+        SecretCmd::Shares { out } => share_cmd::list(ctx, out.json)?,
         SecretCmd::Import { file } => {
             let text = std::fs::read_to_string(file)?;
             let mut pairs = Vec::new();
