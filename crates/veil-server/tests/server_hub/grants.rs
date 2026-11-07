@@ -668,16 +668,24 @@ fn bug_1082_the_epoch_feed_skips_a_change_whose_key_changed_again() {
     let dev = Reader::new(&api, Some(&p.dev), &p.name);
     let pid = dev.body().project_id;
     let mut seen = vec![dev.body().epoch];
-    let bump = |key: i64| hub.rt.block_on(sqlx::query("SELECT veil_bump_epoch($1, 0)").bind(key).execute(&db)).unwrap();
-    bump(pid);
-    hub.rt.block_on(async {
-        let mut a = pid + 1;
-        while a <= pid + 10_001 {
-            let b = (a + 999).min(pid + 10_001);
-            sqlx::query("SELECT veil_bump_epoch(g, 0) FROM generate_series($1::bigint, $2::bigint) g").bind(a).bind(b).execute(&db).await.unwrap();
-            a = b + 1;
+    // SQL straight in the database, run again on a lost race or a catalog
+    // another test's DDL changed (YugabyteDB: 40001), as the routes are.
+    let sql = |q: &str, a: i64, b: i64| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        while let Err(e) = hub.rt.block_on(sqlx::query(q).bind(a).bind(b).execute(&db)) {
+            let retryable = matches!(&e, sqlx::Error::Database(d) if matches!(d.code().as_deref(), Some("40001" | "40P01")));
+            assert!(retryable && std::time::Instant::now() < deadline, "{e:?}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
-    });
+    };
+    let bump = |key: i64| sql("SELECT veil_bump_epoch($1, $2)", key, 0);
+    bump(pid);
+    let mut a = pid + 1;
+    while a <= pid + 10_001 {
+        let b = (a + 999).min(pid + 10_001);
+        sql("SELECT veil_bump_epoch(g, 0) FROM generate_series($1::bigint, $2::bigint) g", a, b);
+        a = b + 1;
+    }
     seen.push(feed(&api, &token, &[&p.name])["projects"][&p.name].as_i64().unwrap());
     bump(pid);
     let now = feed(&api, &token, &[&p.name])["projects"][&p.name].as_i64().unwrap();
