@@ -492,7 +492,7 @@ fn a_later_device_is_confirmed_by_its_person() {
     // Removing fin from their last group rotates the key away from both
     // devices, even one a compromised server leaves out of the list.
     // Straight in the database (a run again on a lost race: the trigger
-    // bumps the shared access-epoch clock).
+    // bumps an access epoch that concurrent changes may bump too).
     let key = laptop.identity().verifying_hex();
     crate::secrets2::sql(&hub, "UPDATE devices SET removed_at = 1 WHERE signing_key = $1", &[&key.as_str()]);
     let out = p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);

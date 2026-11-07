@@ -139,8 +139,8 @@ What the server and `vl` do today; `docs/HUB.md` §13 has the details.
   - **keys are shared in the background:** a teammate's device that holds a key gives it to a newly confirmed device within seconds of its next `vl` command; an admin's `vl group add` still grants it at once. A manager's addition, or anything the server does on its own, gives folder access but no key;
   - **removing someone rotates only the keys they lose** (an admin's `vl group remove`; a manager's says it did not rotate and asks an admin). **A lost device** is removed with `vl identity remove FINGERPRINT`: by its person, everywhere (it can no longer sign in); by an admin, from their project only. Either way the project's keys it held rotate.
 - **Anyone on Earth** (not signed in) receives `public` folders only, and does not see a project with nothing public.
-- **Removing access takes effect at the very next request, on every server** (S4, `HUB.md` §13.13). Servers keep sessions and permissions in memory for speed, but every request checks them against counters that each access change bumps in the database, so no server ever answers from a decision that change made stale.
-- **Read grants** (S5, `HUB.md` §13.14): with the tips, the server signs what each person may read, so caches can check it without asking. Taking access away voids them at the server's next request; caches (built later) take about 2 seconds, 5 at most (owner-approved).
+- **Removing access takes effect at the very next request, on every server** (S4, `HUB.md` §13.14). Servers keep sessions and permissions in memory for speed, but every request checks them against access epochs that each access change renews in the database, so no server ever answers from a decision that change made stale.
+- **Read grants** (S5, `HUB.md` §13.15): with the tips, the server signs what each person may read, so caches can check it without asking. Taking access away voids them at the server's next request; caches (built later) take about 2 seconds, 5 at most (owner-approved).
 
 ## For the design: open technical questions (not product questions)
 

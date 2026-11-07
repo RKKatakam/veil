@@ -1,4 +1,4 @@
-//! Request-path caches (`docs/HUB.md` §13.13;
+//! Request-path caches (`docs/HUB.md` §13.14;
 //! `docs/design/server/storage-and-cost.md` §4, §5): sessions, permissions,
 //! snapshot resolution and branch tips, in each server's memory.
 //!
@@ -14,7 +14,9 @@
 //!   two primary-key lookups) before it uses a cached session or permission,
 //!   and an entry is used only if it was built under exactly those epochs.
 //!   An entry is built by reading the epochs *first* and the records after
-//!   (or in the same statement), so it is never tagged newer than its data.
+//!   (or in the same statement), so it is never tagged with an epoch set
+//!   after its data was read. Epochs are random values, new at each change
+//!   (never a count): only equality is compared.
 //!   So a cached answer is the answer the database gives at the moment of
 //!   the request: **staleness is zero.** A change committed before a request
 //!   starts is seen by that request, on every server.
@@ -95,7 +97,8 @@ struct TipsSlot {
     /// Bumped by every notice for the project: rows read before a notice
     /// are never stored after it.
     generation: u64,
-    rows: Option<(Instant, BranchRows)>,
+    /// The rows, when they were read, and what they weigh.
+    rows: Option<(Instant, BranchRows, usize)>,
     /// The read in flight, if one started within [`TIPS_TTL`]: others wait
     /// for it instead of reading too (under load, a herd of readers made
     /// every read slower than the expiry, so nothing was ever kept).
@@ -124,10 +127,93 @@ struct Tips {
     /// Bumped when every slot is dropped (a lost notice connection, a full
     /// map).
     generation: u64,
+    /// What the kept rows weigh in all ([`TIPS_BUDGET`]).
+    bytes: usize,
+    /// Rows kept, oldest first: expired ones are freed as time passes, and
+    /// the oldest go first when the budget is full (BUG-913).
+    order: std::collections::VecDeque<(Instant, i64)>,
+}
+
+impl Tips {
+    /// Free the rows of `project` read at `at`, if they are still the kept ones.
+    fn free(&mut self, project: i64, at: Option<Instant>) {
+        if let Some(slot) = self.slots.get_mut(&project) {
+            if let Some((read, _, w)) = &slot.rows {
+                if at.is_none_or(|at| *read == at) {
+                    self.bytes -= *w;
+                    slot.rows = None;
+                }
+            }
+        }
+    }
+
+    /// Free expired rows, then the oldest until `room` more bytes fit.
+    fn sweep(&mut self, room: usize) {
+        while let Some(&(at, project)) = self.order.front() {
+            if at.elapsed() < TIPS_TTL && self.bytes + room <= TIPS_BUDGET {
+                break;
+            }
+            self.order.pop_front();
+            self.free(project, Some(at));
+        }
+    }
 }
 
 /// Most projects whose tips one server holds; past it, all are dropped.
 const MAX_TIP_PROJECTS: usize = 100_000;
+
+/// Byte budgets of the caches (BUG-913: every entry is weighed by what it
+/// holds, never counted as one, since its size is the asker's to choose).
+pub const SESSIONS_BUDGET: usize = 16 << 20;
+pub const PROJECTS_BUDGET: usize = 32 << 20;
+pub const VIEWERS_BUDGET: usize = 32 << 20;
+pub const SNAPSHOTS_BUDGET: usize = 64 << 20;
+pub const TIPS_BUDGET: usize = 32 << 20;
+
+/// What one entry costs the LRU itself: its key, slot and recency record.
+const ENTRY: usize = 192;
+/// One snapshot-resolution entry.
+const SNAPSHOT_ENTRY: usize = ENTRY + 32;
+
+/// A heap string: its header, its bytes (rounded as the allocator does) and
+/// the allocation's own overhead.
+fn string_bytes(s: &str) -> usize {
+    24 + s.len().next_multiple_of(16) + 16
+}
+
+/// What a parsed policy holds.
+fn policy_bytes(p: &veil_core::hub::access::AccessPolicy) -> usize {
+    let rule = |r: &veil_core::hub::access::AccessRule| {
+        64 + string_bytes(&r.path) + 16 + r.names.iter().map(|n| string_bytes(n)).sum::<usize>()
+    };
+    24 + p.rules.iter().map(rule).sum::<usize>() + 24 + p.warnings.iter().map(|w| string_bytes(w)).sum::<usize>()
+}
+
+/// What a cached project holds: its name, accepted policy (as text and
+/// parsed) and bindings.
+pub fn project_bytes(p: &Project) -> usize {
+    ENTRY
+        + string_bytes(&p.name)
+        + string_bytes(&p.default_branch)
+        + string_bytes(&p.policy_text)
+        + policy_bytes(&p.policy)
+        + p.bindings.keys().map(|k| string_bytes(k) + 48).sum::<usize>()
+}
+
+/// What a cached view holds: its group set (a hash table of ids).
+fn viewer_bytes(v: &Viewer) -> usize {
+    let buckets = (v.groups.capacity() * 8 / 7 + 1).next_power_of_two();
+    ENTRY + 96 + buckets * 9
+}
+
+fn session_bytes(e: &SessionEntry) -> usize {
+    ENTRY + 64 + string_bytes(&e.person.name) + string_bytes(&e.person.device_key)
+}
+
+/// What a project's branch rows hold.
+fn rows_bytes(rows: &[(String, String)]) -> usize {
+    64 + rows.iter().map(|(n, t)| string_bytes(n) + string_bytes(t)).sum::<usize>()
+}
 
 pub struct Caches {
     sessions: LruCache<Arc<SessionEntry>>,
@@ -169,11 +255,10 @@ fn key(tag: &str, parts: &[&[u8]]) -> ObjectId {
 impl Default for Caches {
     fn default() -> Self {
         Caches {
-            sessions: LruCache::new(100_000),
-            // By bytes: a project's accepted policy may be long.
-            projects: LruCache::new(64 << 20),
-            viewers: LruCache::new(100_000),
-            snapshots: LruCache::new(500_000),
+            sessions: LruCache::new(SESSIONS_BUDGET),
+            projects: LruCache::new(PROJECTS_BUDGET),
+            viewers: LruCache::new(VIEWERS_BUDGET),
+            snapshots: LruCache::new(SNAPSHOTS_BUDGET),
             tips: Mutex::new(Tips::default()),
             notices: AtomicBool::new(false),
             stats: Stats::default(),
@@ -189,7 +274,8 @@ impl Caches {
     }
 
     pub fn put_session(&self, token_hash: &str, e: SessionEntry) {
-        self.sessions.insert(key("session", &[token_hash.as_bytes()]), Arc::new(e), 1);
+        let weight = session_bytes(&e);
+        self.sessions.insert(key("session", &[token_hash.as_bytes()]), Arc::new(e), weight);
     }
 
     pub fn project(&self, name: &str) -> Option<Arc<ProjectEntry>> {
@@ -198,7 +284,7 @@ impl Caches {
 
     pub fn put_project(&self, e: ProjectEntry) -> Arc<ProjectEntry> {
         let e = Arc::new(e);
-        let weight = 1024 + 3 * e.project.policy_text.len() + 64 * e.project.bindings.len();
+        let weight = project_bytes(&e.project);
         self.projects.insert(key("project", &[e.project.name.as_bytes()]), e.clone(), weight);
         e
     }
@@ -208,8 +294,9 @@ impl Caches {
     }
 
     pub fn put_viewer(&self, project: i64, person: &Person, e: ViewerEntry) -> Arc<ViewerEntry> {
+        let weight = viewer_bytes(&e.viewer) + string_bytes(&person.device_key);
         let e = Arc::new(e);
-        self.viewers.insert(viewer_key(project, person), e.clone(), 1);
+        self.viewers.insert(viewer_key(project, person), e.clone(), weight);
         e
     }
 
@@ -221,7 +308,7 @@ impl Caches {
     }
 
     pub fn put_committed(&self, project: i64, id: &ObjectId) {
-        self.snapshots.insert(key("committed", &[&project.to_le_bytes(), &id.0]), *id, 1);
+        self.snapshots.insert(key("committed", &[&project.to_le_bytes(), &id.0]), *id, SNAPSHOT_ENTRY);
     }
 
     /// The projection of real snapshot `real` under `view_key`, if known.
@@ -230,19 +317,19 @@ impl Caches {
     }
 
     /// Record that `real` projects to `projected` under `view_key` (a row of
-    /// `projections` as stored), and that `projected` stands for `real`.
+    /// `projections` as stored), and so that, for that view, `projected`
+    /// stands for `real`.
     pub fn put_memo(&self, project: i64, view_key: &str, real: &ObjectId, projected: &ObjectId) {
-        self.snapshots.insert(key("memo", &[&project.to_le_bytes(), view_key.as_bytes(), &real.0]), *projected, 1);
-        self.put_resolved(project, projected, real);
+        self.snapshots.insert(key("memo", &[&project.to_le_bytes(), view_key.as_bytes(), &real.0]), *projected, SNAPSHOT_ENTRY);
+        self.snapshots.insert(key("resolved", &[&project.to_le_bytes(), view_key.as_bytes(), &projected.0]), *real, SNAPSHOT_ENTRY);
     }
 
-    /// A real snapshot projected id `id` stands for (`sync::resolve`).
-    pub fn resolved(&self, project: i64, id: &ObjectId) -> Option<ObjectId> {
-        self.snapshots.get(&key("resolved", &[&project.to_le_bytes(), &id.0]))
-    }
-
-    pub fn put_resolved(&self, project: i64, id: &ObjectId, real: &ObjectId) {
-        self.snapshots.insert(key("resolved", &[&project.to_le_bytes(), &id.0]), *real, 1);
+    /// A real snapshot that projects to `id` under `view_key` (`sync::resolve`):
+    /// for a viewer of that view, any of them gives the same tree and
+    /// history. Never another view's (BUG-915): the same projected id can
+    /// stand for other real snapshots in another view.
+    pub fn resolved(&self, project: i64, view_key: &str, id: &ObjectId) -> Option<ObjectId> {
+        self.snapshots.get(&key("resolved", &[&project.to_le_bytes(), view_key.as_bytes(), &id.0]))
     }
 
     // ---- branch tips: dropped on notice, expire after TIPS_TTL ------------------
@@ -251,9 +338,10 @@ impl Caches {
     /// came since; otherwise a read to wait for, or one to make.
     pub fn tips(&self, project: i64) -> TipsLookup {
         let mut t = self.tips.lock().unwrap();
+        t.sweep(0);
         let global = t.generation;
         let slot = t.slots.entry(project).or_default();
-        if let Some((at, rows)) = &slot.rows {
+        if let Some((at, rows, _)) = &slot.rows {
             if at.elapsed() < TIPS_TTL {
                 self.stats.tips_hits.fetch_add(1, Ordering::Relaxed);
                 return TipsLookup::Hit(rows.clone());
@@ -288,11 +376,18 @@ impl Caches {
         if t.slots.len() > MAX_TIP_PROJECTS {
             Self::drop_slots(&mut t);
         }
-        let slot = t.slots.entry(project).or_default();
-        if fits && slot.generation == read.generation.1 {
+        let weight = rows_bytes(&rows);
+        let fresh = t.slots.get(&project).is_none_or(|s| s.generation == read.generation.1);
+        // Rows heavier than the whole budget are not kept (BUG-913).
+        if fits && fresh && weight <= TIPS_BUDGET {
+            t.free(project, None);
+            t.sweep(weight);
             // Its age counts from before the read: never older than TIPS_TTL.
-            slot.rows = Some((read_at, Arc::new(rows)));
+            t.slots.entry(project).or_default().rows = Some((read_at, Arc::new(rows), weight));
+            t.bytes += weight;
+            t.order.push_back((read_at, project));
         }
+        let slot = t.slots.entry(project).or_default();
         Self::finish(slot, &read.done);
     }
 
@@ -317,15 +412,16 @@ impl Caches {
             }
         }
         t.slots.clear();
+        t.order.clear();
+        t.bytes = 0;
         t.generation += 1;
     }
 
     /// A push moved a branch of `project` (a notice, or this server's own).
     pub fn tips_changed(&self, project: i64) {
         let mut t = self.tips.lock().unwrap();
-        let slot = t.slots.entry(project).or_default();
-        slot.generation += 1;
-        slot.rows = None;
+        t.free(project, None);
+        t.slots.entry(project).or_default().generation += 1;
     }
 
     /// Notices may have been missed (the listener's connection was lost).
@@ -421,7 +517,12 @@ mod tests {
         c.put_committed(1, &id);
         assert!(c.committed(1, &id));
         assert!(!c.committed(2, &id), "projects never share entries");
-        assert_eq!(c.resolved(1, &id), None);
+        assert_eq!(c.resolved(1, "k", &id), None);
+        // A view's resolution is its own (BUG-915).
+        let real = ObjectId::hash(b"real");
+        c.put_memo(1, "devs", &real, &id);
+        assert_eq!(c.resolved(1, "devs", &id), Some(real));
+        assert_eq!(c.resolved(1, "finance", &id), None, "another view's real snapshot is never answered");
     }
 
     #[test]

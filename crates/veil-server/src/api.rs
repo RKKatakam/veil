@@ -46,6 +46,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/fetch", post(fetch))
         .route("/v1/projects/{p}/objects", post(objects).layer(DefaultBodyLimit::max(crate::db::body_limit("/objects"))))
         .route("/v1/projects/{p}/push", post(push))
+        .route("/v1/projects/{p}/changes", post(changes))
         .route("/v1/projects/{p}/access", get(access))
         .route("/v1/projects/{p}/groups", get(list_groups))
         .route("/v1/projects/{p}/groups/{g}", post(create_group).delete(delete_group))
@@ -592,6 +593,18 @@ async fn push(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>
     Ok(Json(sync::push(&hub, &project, &viewer, me, req).await?))
 }
 
+/// A commit through the API (`changes`).
+async fn changes(
+    State(hub): State<HubState>,
+    caller: Caller,
+    Path(p): Path<String>,
+    Json(req): Json<veil_core::hub::changes::ChangeRequest>,
+) -> Result<Json<veil_core::hub::changes::ChangeResult>> {
+    caller.signed_in()?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
+    Ok(Json(crate::changes::create(&hub, &project, &viewer, &caller, req).await?))
+}
+
 #[derive(Deserialize)]
 struct PathQuery {
     path: String,
@@ -705,6 +718,11 @@ async fn create_group(State(hub): State<HubState>, caller: Caller, Path((p, g)):
     let info = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let g = g2.clone();
         Box::pin(async move {
+            // Bounded (concurrent creations may each add up to the bound).
+            let n: i64 = sqlx::query_scalar("SELECT count(*) FROM groups WHERE project_id = $1").bind(pid).fetch_one(&mut *c).await?;
+            if n >= perm::MAX_GROUPS {
+                return Err(Error::bad_request(format!("a project has at most {} groups", perm::MAX_GROUPS)));
+            }
             // A plain insert, the unique key refusing a second group.
             let r = sqlx::query("INSERT INTO groups (project_id, name) VALUES ($1, $2)").bind(pid).bind(&g).execute(&mut *c).await;
             if let Err(sqlx::Error::Database(d)) = &r {

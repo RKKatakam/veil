@@ -72,6 +72,10 @@ impl Project {
     }
 }
 
+/// Most groups one project may have (BUG-913): bounds what a person's view
+/// of it holds.
+pub const MAX_GROUPS: i64 = 1_000;
+
 pub fn valid_project_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -261,6 +265,42 @@ pub async fn bind_names(c: &mut PgConnection, project: i64, policy: &AccessPolic
         out.insert(name, b);
     }
     Ok(out)
+}
+
+/// Accept `text` as the project's policy (the default branch moved to it,
+/// by an admin), binding its names ([`bind_names`]), inside the caller's
+/// transaction.
+pub async fn accept_policy(c: &mut PgConnection, project: i64, text: &str) -> Result<()> {
+    let policy = AccessPolicy::parse(text);
+    let bindings = bind_names(&mut *c, project, &policy).await?;
+    sqlx::query("UPDATE projects SET policy_text = $1, policy_bindings = $2, policy_version = policy_version + 1 WHERE id = $3")
+        .bind(text)
+        .bind(serde_json::to_string(&bindings).map_err(|e| Error::Other(e.into()))?)
+        .bind(project)
+        .execute(&mut *c)
+        .await?;
+    Ok(())
+}
+
+/// After [`accept_policy`], never silently: who can now see what, as the
+/// admin is told.
+pub fn accepted_listing(project: &Project) -> Vec<String> {
+    let mut out = Vec::new();
+    for r in &project.policy.rules {
+        let mut who: Vec<String> = Vec::new();
+        if r.public {
+            who.push("everyone on Earth (public, read)".into());
+        }
+        for n in &r.names {
+            who.push(match project.bindings.get(n) {
+                Some(Binding::Group(_)) => format!("group {n}"),
+                _ => format!("person {n}"),
+            });
+        }
+        out.push(format!("access accepted: {}/ → {}", r.path, who.join(", ")));
+    }
+    out.extend(project.policy.warnings.iter().cloned());
+    out
 }
 
 /// Is `person` a manager of `group`? The row is locked (`FOR SHARE`) for

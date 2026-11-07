@@ -9,14 +9,17 @@
 //!   pushed tree back into the full tree (`docs/HUB.md` §4.6, §5.4).
 //! * [`grant`]: read grants (signed by the server, bound to a device) and
 //!   the chain check every layer uses to serve an object only to someone
-//!   whose projected root reaches it (`docs/HUB.md` §13.14).
+//!   whose projected root reaches it (`docs/HUB.md` §13.15).
 //! * [`wire`]: the JSON messages and the object frames of the protocol
 //!   (`docs/HUB.md` §4).
+//! * [`changes`]: the messages of commits through the API
+//!   (`docs/HUB.md` §13.13).
 //!
 //! The server is the authority (`docs/VISIBILITY.md`): it decides from its
 //! own records and the accepted policy, never from labels in a snapshot.
 
 pub mod access;
+pub mod changes;
 pub mod grant;
 pub mod project;
 pub mod wire;

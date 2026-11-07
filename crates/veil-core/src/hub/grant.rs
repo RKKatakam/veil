@@ -1,4 +1,4 @@
-//! Read grants and the chain check (`docs/HUB.md` §13.14; design:
+//! Read grants and the chain check (`docs/HUB.md` §13.15; design:
 //! `docs/design/server/phase-2-thin-clients.md` §4.3–§4.5).
 //!
 //! **A grant** is the server's decision, in a form any layer can check by
@@ -11,8 +11,8 @@
 //! sent (the receiver verifies those bytes, then parses them; nothing is
 //! re-encoded). It holds nothing its holder could not see otherwise: no
 //! view key (an unkeyed hash of every access line, hidden ones included,
-//! BUG-1080), and epochs as opaque tokens that equal ones compare as equal,
-//! never as counts or times (BUG-1081).
+//! BUG-1080), and epochs that are random values compared only for equality,
+//! never counts or times (BUG-1081).
 //!
 //! **Reachability is the authority.** A projected tree holds exactly what
 //! its viewer may read (`hub::project`), so every object reachable from a
@@ -71,10 +71,10 @@ pub struct GrantBody {
     pub device: Option<String>,
     /// The viewer's projected root tree of one snapshot.
     pub root: ObjectId,
-    /// Tokens of the access epochs of the project and of the person (0 for
-    /// anyone on Earth) the grant's view was built under: opaque values
-    /// that change at every access change of that project or person
-    /// (BUG-1081). A grant holds only while both are still current.
+    /// The access epochs of the project and of the person (0 for anyone on
+    /// Earth) the grant's view was built under: random values, new at every
+    /// access change of that project or person (BUG-1081). A grant holds
+    /// only while both are still current.
     pub epoch: i64,
     pub person_epoch: i64,
     /// Unix milliseconds.

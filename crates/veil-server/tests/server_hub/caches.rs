@@ -1,4 +1,4 @@
-//! Request-path caches (milestone S4, `docs/HUB.md` §13.13): a cache never
+//! Request-path caches (milestone S4, `docs/HUB.md` §13.14): a cache never
 //! serves a decision that a permission change has made stale, on any server.
 //! Two servers on one database (the normal deployment): whatever changes
 //! someone's access, through either server or straight in the database, their
@@ -54,7 +54,7 @@ fn both(apis: &[&Api; 2], token: &str, project: &str) -> [bool; 2] {
 }
 
 /// Run `q` straight in the database, as an operator would. Its trigger
-/// bumps the one epoch clock, which other tests bump too: YugabyteDB may
+/// bumps an epoch row that concurrent changes may bump too: YugabyteDB may
 /// refuse it as a conflict (`40001`), and it runs again.
 fn sql(hub: &TestHub, q: &str) -> u64 {
     let h = hub.hub();
@@ -312,7 +312,7 @@ fn a_push_is_one_database_commit() {
 
 /// What a read grant needs from the permission cache (S5): a view comes
 /// with the epochs read before its rows were loaded (`perm::open_at`), so a
-/// grant made from it carries those, never a later clock. After a removal
+/// grant made from it carries those, never a later read. After a removal
 /// committed on one server, the other server's very next view is the new
 /// one, and comes with the removal's epoch; before it, with an older one.
 #[test]
@@ -350,5 +350,65 @@ fn a_view_carries_the_epochs_it_was_built_under() {
         .unwrap();
     let (_, v, after) = open();
     assert!(!v.groups.contains(&finance), "the very next view on the other server is the new one");
-    assert!(after.person >= bump && bump > before.person, "it carries the removal's epoch ({before:?} → {bump} → {after:?})");
+    assert_eq!(after.person, bump, "it carries the removal's epoch");
+    assert_ne!(bump, before.person, "the removal set a new epoch ({before:?} → {bump})");
+    // A random value, not a count (BUG-1081): nothing small or in sequence.
+    assert!(bump.unsigned_abs() > 1 << 20 && bump != before.person + 1, "epoch {bump} looks like a count");
+}
+
+/// A commit through the API (S10) that moves `main` is one database commit
+/// too (branch, snapshot, memo, change ref, audit), and every server's tips
+/// follow it: its notice is sent in that commit.
+#[test]
+fn an_api_commit_is_one_commit_and_moves_every_servers_tips() {
+    let a = TestHub::start();
+    let b = TestHub::beside(&a);
+    let p = setup_project(&a);
+    let h = a.hub();
+    let dev = p.dev.token();
+    let pid: i64 = a.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&h.db)).unwrap();
+    let xmin = a.rt.block_on(sqlx::query("SELECT xmin FROM projects LIMIT 1").execute(&h.db)).is_ok();
+    for i in 0..3 {
+        let base = a.api().tips(Some(&dev), &p.name).unwrap().branches["main"];
+        // B has seen the old tip (and may hold it).
+        assert_eq!(b.api().tips(Some(&dev), &p.name).unwrap().branches["main"], base);
+        let since = veil_core::now_millis().to_string();
+        let r = a.api().post_json(
+            Some(&dev),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base.hex(), "edits": [{"path": format!("src/api-{i}.txt"), "put": {"text": "through the API"}}],
+                    "onto": {"branch": "main", "expected": base.hex()}}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let v = r.json();
+        assert_eq!(v["branch"]["status"], "ok", "{v}");
+        let seen = v["branch"]["tip"].as_str().unwrap().to_string();
+        let t = Instant::now();
+        while b.api().tips(Some(&dev), &p.name).unwrap().branches["main"].hex() != seen {
+            assert!(t.elapsed() < Duration::from_secs(5), "the other server never saw the API commit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !xmin {
+            continue;
+        }
+        let real: String =
+            a.rt.block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'main'").bind(pid).fetch_one(&h.db)).unwrap();
+        let q = |sql: &str, arg: &str| -> Vec<String> { a.rt.block_on(sqlx::query_scalar::<_, String>(sql).bind(pid).bind(arg).fetch_all(&h.db)).unwrap() };
+        let branch = q("SELECT xmin::text FROM branches WHERE project_id = $1 AND target = $2", &real);
+        let mut rows = vec![("branch", branch[0].clone())];
+        for (what, sql, arg) in [
+            ("snapshot", "SELECT xmin::text FROM snapshots WHERE project_id = $1 AND id = $2", &real),
+            ("change ref", "SELECT xmin::text FROM change_refs WHERE project_id = $1 AND snapshot = $2", &real),
+            ("audit", "SELECT xmin::text FROM audit_log WHERE project_id = $1 AND action = 'change' AND at >= $2::bigint", &since),
+        ] {
+            let got = q(sql, arg);
+            assert!(!got.is_empty(), "commit {i}: no {what} row");
+            rows.extend(got.into_iter().map(|x| (what, x)));
+        }
+        // The caller's memo row is one of those naming its projection.
+        let memos = q("SELECT xmin::text FROM projections WHERE project_id = $1 AND projected_id = $2", &seen);
+        assert!(memos.contains(&rows[0].1), "commit {i}: the caller's memo row is another transaction's: {memos:?} {rows:?}");
+        let distinct: std::collections::BTreeSet<&String> = rows.iter().map(|(_, x)| x).collect();
+        assert_eq!(distinct.len(), 1, "commit {i}: rows written by more than one transaction: {rows:?}");
+    }
 }

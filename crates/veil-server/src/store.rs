@@ -152,7 +152,8 @@ const S3_FIRST_WAIT: Duration = Duration::from_millis(25);
 const S3_MOST_WAIT: Duration = Duration::from_secs(1);
 
 /// Send an S3 request (`make` builds it afresh for each try) and read its
-/// answer, again while the answer is a server error (5xx) or the request
+/// answer, again while the answer is a server error (5xx), "too many
+/// requests" (429), or the request
 /// fails, for at most [`S3_RETRY_FOR`] (BUG-861). A connection the store
 /// closed, reset or timed out, before or during the answer, and the
 /// store's own transient errors (500, 503 "slow down"), are tried again:
@@ -177,7 +178,8 @@ async fn s3_send_with_headers(make: impl Fn() -> reqwest::RequestBuilder) -> Res
         let jitter = Duration::from_millis(u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1));
         let last = tokio::time::Instant::now() + wait + jitter >= deadline;
         match answer {
-            Ok((status, headers, body)) if !status.is_server_error() || last => return Ok((status.as_u16(), headers, body)),
+            // 429: the store asks for fewer requests (BUG-1053).
+            Ok((status, headers, body)) if !(status.is_server_error() || status.as_u16() == 429) || last => return Ok((status.as_u16(), headers, body)),
             Err(e) if last || e.is_builder() => return Err(anyhow::Error::new(e).context(format!("S3 request failed {tries} times"))),
             _ => {}
         }

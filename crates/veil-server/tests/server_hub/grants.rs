@@ -482,7 +482,7 @@ fn bench_object_routes() {
     }
     println!("   grant and request signature checks (µs): {:.0}", t.elapsed().as_secs_f64() * 1e6 / 1000.0);
     // The chain check alone, against the server's store and tree cache.
-    let src = veil_server::sync::Source { hub: state.clone(), project: g.body.project_id, rt: hub.rt.handle().clone() };
+    let src = veil_server::sync::Source { hub: state.clone(), project: g.body.project_id, rt: hub.rt.handle().clone(), pending: Default::default() };
     let mut cold = Vec::new();
     for (chain, id) in &many {
         let t = Instant::now();
@@ -693,7 +693,7 @@ fn bug_1082_the_epoch_feed_skips_a_change_whose_key_changed_again() {
         .rt
         .block_on(sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = 0").bind(pid).fetch_one(&db))
         .unwrap();
-    assert_eq!(now, hub.hub().grants.tokens(pid, current, None, 0).0, "the feed gives the project's current epoch");
+    assert_eq!(now, current, "the feed gives the project's current epoch");
     assert!(!seen.contains(&now), "each change gives a new epoch: {seen:?} then {now}");
     assert!(invalid(&dev.get(&[], &dev.root())), "a grant of an earlier epoch");
     let fresh = Reader::new(&api, Some(&p.dev), &p.name);

@@ -95,7 +95,7 @@ pub const SIG_CONTEXT_HUB_DEVICE: &str = "hub-device";
 /// joining device (`hub::wire::join_message`).
 pub const SIG_CONTEXT_HUB_INVITE: &str = "hub-invite";
 /// Signature context: a Veil server's read grant (`hub::grant`, `docs/HUB.md`
-/// §13.14), by its grant key, over the grant's JSON body exactly as sent.
+/// §13.15), by its grant key, over the grant's JSON body exactly as sent.
 pub const SIG_CONTEXT_HUB_GRANT: &str = "hub-grant";
 /// Signature context: a device's request under a read grant
 /// (`hub::grant::request_message`): the grant's hash, the time and the
@@ -198,14 +198,6 @@ pub const HUB_PROJECT_FINGERPRINT: &str = "veil 2026 hub project-fingerprint v1"
 /// over the line's path. Not secret.
 pub const POLICY_RULE_SCOPE: &str = "veil 2026 policy rule-scope v1";
 
-/// BLAKE3 `derive_key` context of a Veil server's epoch-token MAC key, from
-/// its grant key's seed: a read grant carries, for its project's and
-/// person's access epochs (S4's: values of one server-wide clock), keyed
-/// BLAKE3 over `kind ‖ id ‖ epoch` (first 8 bytes) instead, so a grant
-/// shows its holder neither the clock nor how often anything changed
-/// (BUG-1081). Equal tokens are equal epochs; the server recomputes them.
-pub const HUB_EPOCH_TOKEN: &str = "veil 2026 hub epoch-token v1";
-
 /// Every BLAKE3 `derive_key` context, for the uniqueness test.
 pub const BLAKE3_CONTEXTS: &[&str] = &[
     LEGACY_SIV_NONCE,
@@ -222,7 +214,6 @@ pub const BLAKE3_CONTEXTS: &[&str] = &[
     HUB_INVITE_KEY,
     POLICY_RULE_SCOPE,
     HUB_PROJECT_FINGERPRINT,
-    HUB_EPOCH_TOKEN,
 ];
 
 #[cfg(test)]
@@ -245,8 +236,7 @@ mod tests {
                 "veil 2026 hub upload-receipt v1",
                 "veil 2026 hub invite-key v1",
                 "veil 2026 policy rule-scope v1",
-                "veil 2026 hub project-fingerprint v1",
-                "veil 2026 hub epoch-token v1"
+                "veil 2026 hub project-fingerprint v1"
             ],
             "a context changed or was reordered"
         );

@@ -1,5 +1,5 @@
 //! Read grants, the object routes and the access-epoch feed (`docs/HUB.md`
-//! §13.14; [`veil_core::hub::grant`] has the grant and the chain check).
+//! §13.15; [`veil_core::hub::grant`] has the grant and the chain check).
 //!
 //! * **Grants with the tips.** `GET …/tips` returns, per branch, a grant for
 //!   the caller's projected root tree of its tip, signed by the server's
@@ -16,14 +16,13 @@
 //!   (a pack, later: S28), nothing else is ever handed out with it. A batch
 //!   is streamed with bounded memory, as `sync::fetch` is.
 //! * **Access epochs** are S4's (`migrations/0006_access_epochs.sql`,
-//!   `caches`): every access change bumps its project's or person's epoch
-//!   in its own transaction. A grant carries **tokens** of the epochs its
-//!   view was built under (`perm::open_at`), keyed BLAKE3 values
-//!   ([`Grants::tokens`]), never the epochs, which are values of one
-//!   server-wide clock (BUG-1081). The server refuses a grant whose tokens
-//!   are not those of the current epochs on the next request; `GET
-//!   /v1/epochs` gives a signed-in caller the current tokens of their
-//!   person and of the projects they can see, for caches.
+//!   `caches`): every access change gives its project or person a new
+//!   random epoch in its own transaction. A grant carries the two epochs
+//!   its view was built under (`perm::open_at`); they show no count, time
+//!   or server-wide clock (BUG-1081). The server refuses a grant whose
+//!   epochs are not the current ones on the next request; `GET /v1/epochs`
+//!   gives a signed-in caller the current epochs of their person and of the
+//!   projects they can see, for caches.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -62,8 +61,6 @@ pub const FEED_PROJECTS: usize = 1000;
 pub struct Grants {
     key: SeedSigner,
     key_hex: String,
-    /// The MAC key of epoch tokens (`HUB_EPOCH_TOKEN`).
-    epoch_key: [u8; 32],
     stored: LruCache<()>,
 }
 
@@ -84,7 +81,6 @@ impl Grants {
         Ok(Grants {
             key_hex: key.verifying_hex(),
             key,
-            epoch_key: blake3::derive_key(veil_core::crypto::domains::HUB_EPOCH_TOKEN, &seed),
             stored: LruCache::new(8 << 20),
         })
     }
@@ -99,26 +95,11 @@ impl Grants {
         Grant::issue(&self.key, body)
     }
 
-    /// The tokens a grant carries for S4's access epochs (`caches::Epochs`)
-    /// of `project` and of `person` (anyone on Earth: 0): keyed BLAKE3 over
-    /// `kind ‖ id ‖ epoch`, so equal tokens are equal epochs and no client
-    /// sees the server-wide clock the epochs are values of (BUG-1081).
-    pub fn tokens(&self, project: i64, project_epoch: i64, person: Option<i64>, person_epoch: i64) -> (i64, i64) {
-        let mac = |kind: u8, id: i64, epoch: i64| {
-            let mut h = blake3::Hasher::new_keyed(&self.epoch_key);
-            h.update(&[kind]);
-            h.update(&id.to_le_bytes());
-            h.update(&epoch.to_le_bytes());
-            i64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap())
-        };
-        (mac(b'p', project, project_epoch), person.map_or(0, |p| mac(b'q', p, person_epoch)))
-    }
-
-    /// The tokens of the current epochs of `project` and `person` (one
-    /// indexed query).
+    /// The current access epochs of `project` and of `person` (anyone on
+    /// Earth: 0), from S4's table (one indexed query).
     pub async fn current(&self, db: &sqlx::PgPool, project: i64, person: Option<i64>) -> Result<(i64, i64)> {
         let e = crate::caches::read_epochs(db, person.unwrap_or(0), Some(project)).await?;
-        Ok(self.tokens(project, e.project.map_or(0, |(_, e)| e), person, e.person))
+        Ok((e.project.map_or(0, |(_, e)| e), person.map_or(0, |_| e.person)))
     }
 }
 
@@ -135,7 +116,7 @@ pub async fn for_tips(
     tips: &BTreeMap<String, ObjectId>,
 ) -> Result<BTreeMap<String, String>> {
     let person = caller.person.as_ref().map(|p| p.id);
-    let (epoch, person_epoch) = hub.grants.tokens(project.id, epochs.project.map_or(0, |(_, e)| e), person, epochs.person);
+    let (epoch, person_epoch) = (epochs.project.map_or(0, |(_, e)| e), person.map_or(0, |_| epochs.person));
     let expires = veil_core::now_millis() + GRANT_TTL_MS;
     let mut out = BTreeMap::new();
     for (branch, snap) in tips {
@@ -178,7 +159,7 @@ async fn grant_root(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snap: Ob
     if hub.grants.stored.get(&memo).is_some() {
         return Ok(Some(root));
     }
-    let reals = sync::resolve(hub, project.id, &snap).await?;
+    let reals = sync::resolve(hub, project.id, &project.view(viewer).key(), &snap).await?;
     let (p, v) = (project.clone(), viewer.clone());
     let created = sync::blocking(hub, project.id, move |src| {
         let view = p.view(&v);
@@ -444,15 +425,15 @@ pub struct EpochsQuery {
 /// its current epoch: nothing is paged, so no change is passed over
 /// (BUG-1082).
 pub async fn epochs(State(hub): State<HubState>, caller: Caller, Query(q): Query<EpochsQuery>) -> Result<Json<Epochs>> {
-    let me = caller.signed_in()?.id;
+    caller.signed_in()?;
     let names: Vec<&str> = q.projects.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
     if names.len() > FEED_PROJECTS {
         return Err(Error::bad_request(format!("at most {FEED_PROJECTS} projects per request")));
     }
-    let mut out = Epochs { person: hub.grants.tokens(0, 0, Some(me), caller.epochs.person).1, ..Default::default() };
+    let mut out = Epochs { person: caller.epochs.person, ..Default::default() };
     for name in names {
         let Ok((project, _, e)) = crate::perm::open_at(&hub, name, &caller).await else { continue };
-        out.projects.insert(project.name, hub.grants.tokens(project.id, e.project.map_or(0, |(_, e)| e), None, 0).0);
+        out.projects.insert(project.name, e.project.map_or(0, |(_, e)| e));
     }
     Ok(Json(out))
 }

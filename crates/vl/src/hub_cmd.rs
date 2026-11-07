@@ -384,3 +384,157 @@ pub fn share_keys(ctx: &mut Ctx) -> Result<()> {
     let (client, _) = client_for(ctx, "origin")?;
     crate::hub_keys::run_pass(ctx, &client)
 }
+
+/// `vl change new`: a commit through the server's API (`docs/HUB.md`
+/// §13.13), with no working copy involved. In a clone of the project,
+/// secret files are sealed with its keys (the server takes them only as
+/// ciphertext); every file is scanned for secrets here first, so one never
+/// leaves the device.
+pub fn change(repository: Option<&Path>, cmd: &crate::cli::ChangeCmd) -> Result<ExitCode> {
+    use veil_core::{
+        hub::changes::{ChangeRequest, Edit, Expected, Onto, Status},
+        object::Object,
+        policy::{Policy, Tier},
+        ObjectId,
+    };
+    let crate::cli::ChangeCmd::New {
+        project,
+        edits,
+        base,
+        message,
+        onto,
+        expected,
+        change,
+    } = cmd;
+    // The clone here (or at -R), if it is one of this project's.
+    let start = match repository {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir()?,
+    };
+    let clone = crate::ctx::find_root(&start).and_then(|r| Ctx::open(Some(&r), false).ok()).filter(|c| {
+        let origin = c.repo.config().remotes.get("origin").and_then(|r| HubUrl::parse(&r.url)).and_then(|u| u.ok());
+        match project {
+            Some(p) => origin.is_some_and(|o| HubUrl::parse(p).and_then(|u| u.ok()) == Some(o)),
+            None => origin.is_some(),
+        }
+    });
+    let url = match (project, &clone) {
+        (Some(p), _) => HubUrl::parse(p).ok_or_else(|| anyhow!("expected veil://host[:port]/project"))??,
+        (None, Some(c)) => HubUrl::parse(&c.repo.config().remotes["origin"].url).expect("checked")?,
+        (None, None) => bail!("give the project (veil://host[:port]/project), or run this in a clone of it"),
+    };
+    if url.project.is_empty() {
+        bail!("give a project: veil://host[:port]/project");
+    }
+    let text = if edits.as_os_str() == "-" {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+        s
+    } else {
+        std::fs::read_to_string(edits).with_context(|| format!("reading {}", edits.display()))?
+    };
+    let mut list: Vec<Edit> = serde_json::from_str(&text).context("the edits: a JSON list of {\"path\", \"put\": {\"text\"}} or {\"path\", \"delete\": true}")?;
+    let client = Client::new(&url, load_identity()?)?;
+    let policy = match &clone {
+        Some(c) => Policy::parse(&crate::hub_keys::policy_text(c)),
+        None => Policy::builtin(),
+    };
+    let mut frames = Vec::new();
+    let mut sealed = Vec::new();
+    for e in &mut list {
+        let Some(put) = &mut e.put else { continue };
+        let Some(content) = put.text.as_ref() else { continue };
+        let path = VPath::new(&e.path).map_err(|_| anyhow!("'{}' is not a valid path", safe(&e.path)))?;
+        let class = policy.classify(&path, false);
+        match class.tier {
+            Tier::Isolated | Tier::Ignored => bail!(
+                "'{}' stays on this device (a personal key, or a secret file the project does not share){}",
+                safe(&e.path),
+                if clone.is_none() { "; in a clone of the project, a shared secret file is encrypted and sent" } else { "" }
+            ),
+            Tier::Cloaked(scope) => {
+                let c = clone.as_ref().expect("only a clone's policy shares secrets");
+                let obj = c
+                    .repo
+                    .store()
+                    .seal(&Object::Blob(content.as_bytes().to_vec()), &scope)
+                    .with_context(|| format!("'{}' is a secret: this clone has no key to encrypt it", safe(&e.path)))?;
+                let raw = obj.encode();
+                let id = ObjectId::hash(&raw);
+                veil_core::hub::wire::put_frame(&mut frames, &id, &raw);
+                sealed.push(id);
+                put.object = Some(id);
+                put.text = None;
+            }
+            Tier::Public if !class.allow_secrets => {
+                if let Some(f) = veil_core::secrets::scan(content.as_bytes()).first() {
+                    bail!(
+                        "'{}' looks like it holds a secret ({}, line {}): put secrets in a secret file such as .env",
+                        safe(&e.path),
+                        f.rule,
+                        f.line
+                    );
+                }
+            }
+            Tier::Public => {}
+        }
+    }
+    let mut receipts = std::collections::BTreeMap::new();
+    if !frames.is_empty() {
+        for (id, r) in sealed.iter().zip(client.upload(frames)?) {
+            receipts.insert(*id, r);
+        }
+    }
+    let base = match base {
+        Some(b) => ObjectId::from_hex(b).map_err(|_| anyhow!("--base takes a snapshot id (hex)"))?,
+        None => {
+            let tips = client.tips()?.ok_or_else(|| anyhow!("no project {} that you can see", safe(&url.project)))?;
+            let branch = onto.clone().unwrap_or(tips.default_branch.clone());
+            *tips.branches.get(&branch).ok_or_else(|| anyhow!("no branch '{}' to start from: give --base", safe(&branch)))?
+        }
+    };
+    let req = ChangeRequest {
+        base,
+        change_id: change.as_deref().map(veil_core::ChangeId::parse).transpose().map_err(|_| anyhow!("--change takes a change id"))?,
+        description: message.clone().unwrap_or_default(),
+        edits: list,
+        onto: match onto {
+            Some(b) => Some(Onto {
+                branch: b.clone(),
+                expected: match expected {
+                    Some(t) => Expected::Tip(ObjectId::from_hex(t).map_err(|_| anyhow!("--expected takes a snapshot id (hex)"))?),
+                    None => Expected::Rebase,
+                },
+            }),
+            None => None,
+        },
+        receipts,
+    };
+    let r = client.change(&req)?;
+    println!("Change {} (snapshot {})", bold(&r.change_id.to_string()), r.snapshot.hex());
+    for w in &r.warnings {
+        println!("  {}", yellow(&safe(w)));
+    }
+    Ok(match r.branch {
+        None => ExitCode::SUCCESS,
+        Some(b) if b.status == Status::Ok => {
+            let again = match b.rebased {
+                0 => String::new(),
+                1 => " (applied to its new tip)".into(),
+                n => format!(" (applied to its new tip; {n} tries)"),
+            };
+            println!("{} {}{again}", green("Moved"), safe(&b.branch));
+            ExitCode::SUCCESS
+        }
+        Some(b) => {
+            eprintln!(
+                "{} did not move: {}. The change is kept on the server (the snapshot above); \
+                 make a new revision of it on the new tip with `--change {}`",
+                safe(&b.branch),
+                safe(b.message.as_deref().unwrap_or("rejected")),
+                r.change_id
+            );
+            ExitCode::FAILURE
+        }
+    })
+}
