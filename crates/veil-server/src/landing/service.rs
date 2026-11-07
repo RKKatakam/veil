@@ -640,17 +640,9 @@ impl Service {
             true => HashMap::new(),
             false => memos(hub, self.project, &keys, &ids).await?,
         };
-        let origins: HashMap<ObjectId, ObjectId> = if stacks.is_empty() {
-            HashMap::new()
-        } else {
-            let hex: Vec<String> = stacks.iter().map(ObjectId::hex).collect();
-            let rows: Vec<(String, String)> = sqlx::query_as("SELECT real_id, origin_id FROM origins WHERE project_id = $1 AND real_id = ANY($2)")
-                .bind(self.project)
-                .bind(&hex)
-                .fetch_all(&hub.db)
-                .await?;
-            rows.into_iter().filter_map(|(r, o)| Some((ObjectId::from_hex(&r).ok()?, ObjectId::from_hex(&o).ok()?))).collect()
-        };
+        // (No origins: a projection equal to a pusher's own snapshot is
+        // that pusher's view key's, whose memo the push stored.)
+        let origins = HashMap::new();
         Ok(Inputs { entries, attach, memo, origins })
     }
 
