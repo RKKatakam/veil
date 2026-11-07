@@ -917,6 +917,12 @@ mod s9_adversarial {
         let (served, grew) = (c.stat("local") - local, rss().saturating_sub(before) / MIB);
         eprintln!("cache: 16 stalled answers of a 15 MiB object at --memory 64M: {served} read from the store, RSS +{grew} MiB");
         assert!(served <= 3, "{served} answers of 15 MiB hold their bytes at once, within a 32 MiB budget (RSS +{grew} MiB)");
+        // Since BUG-1186's fix a stalled answer of a large object holds a
+        // slice or two and counts as served only once whole, so this count
+        // no longer measures what is held: `s9_cycle2::bug_1186_…` checks
+        // that the budget stays free beside slow readers, and the
+        // `cache_process` tests measure the cache's own memory (this
+        // process's RSS includes the tests running beside it).
         drop(stalled);
     }
 
@@ -1069,12 +1075,8 @@ mod s9_cycle2 {
     use veil_core::object::Tree;
 
     const MIB: usize = 1 << 20;
-
-    fn rss() -> usize {
-        let s = std::fs::read_to_string("/proc/self/status").unwrap();
-        let kib: usize = s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)).unwrap().parse().unwrap();
-        kib << 10
-    }
+    /// What one connection may hold outside `--memory` (`docs/HUB.md` §13.18).
+    const PER_CONNECTION_KIB: usize = 352;
 
     fn tree(r: &Reader, chain: &[ObjectId], id: &ObjectId) -> Tree {
         let g = r.get(chain, id);
@@ -1117,8 +1119,11 @@ mod s9_cycle2 {
     /// Start a `POST …:batch` to the cache whose body stops after `len`
     /// bytes; dropping the returned sender ends it.
     fn stopping_post(c: &TestCache, project: &str, len: usize, sent: &Arc<AtomicUsize>) -> std::sync::mpsc::Sender<()> {
+        stopping_post_at(Api::at(&c.running.addr.to_string(), &c.running.cert_pem), project, len, sent)
+    }
+
+    fn stopping_post_at(api: Api, project: &str, len: usize, sent: &Arc<AtomicUsize>) -> std::sync::mpsc::Sender<()> {
         let (tx, gate) = std::sync::mpsc::channel();
-        let api = Api::at(&c.running.addr.to_string(), &c.running.cert_pem);
         let (path, sent) = (format!("/v1/objects/{project}:batch"), sent.clone());
         std::thread::spawn(move || drop(api.post_reader(&path, Stops { left: len, gate, sent })));
         tx
@@ -1129,9 +1134,9 @@ mod s9_cycle2 {
     /// for as long as the client likes: `header_read_timeout` (20 s) covers
     /// only the head, the write deadline (30 s) only writes, and nothing
     /// bounds reading the body. 1,024 such connections (anyone on Earth,
-    /// no grant needed) close the cache to everyone.
+    /// no grant needed) close the cache to everyone. Fixed: a body is due at
+    /// 16 KiB/s after a 20 s grace, so both are answered `408` and let go.
     #[test]
-    #[ignore = "BUG-1183: a request body that never arrives holds its connection slot forever"]
     fn bug_1183_a_body_that_never_arrives_holds_its_connection_slot() {
         let hub = TestHub::start();
         let p = setup_project(&hub);
@@ -1165,29 +1170,36 @@ mod s9_cycle2 {
         assert_eq!(reader.join().unwrap(), 200);
     }
 
-    /// Guarantee 3: the cache's memory stays within `--memory` + about
-    /// 128 KiB per connection. A batch's body is read whole into memory
+    /// Guarantee 3: the cache's memory stays within `--memory` plus its
+    /// connections' buffers. A batch's body was read whole into memory
     /// before anything else (axum's `Bytes`, up to the 64 MiB body limit),
-    /// outside the budget: 8 clients that each send 56 MiB of a body and
-    /// stop hold about 450 MiB at `--memory 64M`.
+    /// outside the budget: 8 clients that each sent 56 MiB of a body and
+    /// stopped held about 450 MiB at `--memory 64M`. Fixed: a body is held
+    /// only under a share of the requests' pool, and one larger than the
+    /// cache decides itself goes to the server as it arrives. Measured on
+    /// the cache's own process: the server, in this one, holds the bodies
+    /// the cache passes on (its own limit, 64 MiB a request).
     #[test]
-    #[ignore = "BUG-1184: request bodies (up to 64 MiB each) are held outside --memory"]
     fn bug_1184_request_bodies_are_held_outside_the_memory_bound() {
         let hub = TestHub::start();
         let p = setup_project(&hub);
-        let c = TestCache::start(&hub, &hub.authority(), 1 << 30);
+        let dir = tempfile::Builder::new().prefix("veil-cache-proc").tempdir().unwrap();
+        let (mut child, addr, pem) = cache_process(&hub, dir.path());
+        std::thread::sleep(Duration::from_secs(1));
         let (n, len) = (8, 56 * MIB);
         let sent = Arc::new(AtomicUsize::new(0));
-        let before = rss();
-        let gates: Vec<_> = (0..n).map(|_| stopping_post(&c, &p.name, len, &sent)).collect();
+        let before = rss_of(child.id());
+        let gates: Vec<_> = (0..n).map(|_| stopping_post_at(Api::at(&addr, &pem), &p.name, len, &sent)).collect();
         until(Duration::from_secs(60), "the bodies sent", || sent.load(Relaxed) >= n * len);
         std::thread::sleep(Duration::from_secs(1));
-        let grew = rss().saturating_sub(before) / MIB;
+        let grew = rss_of(child.id()).saturating_sub(before) / MIB;
+        let _ = child.kill();
+        let _ = child.wait();
         drop(gates);
-        // --memory 64M, plus 128 KiB a connection, plus slack for the test.
-        let bound = 64 + n / 8 + 32;
-        eprintln!("cache: {n} bodies of {} MiB, stopped before their end, at --memory 64M: RSS +{grew} MiB (bound about {bound} MiB)", len / MIB);
-        assert!(grew <= bound, "{n} unfinished request bodies grew the cache by {grew} MiB, past --memory 64M + 128 KiB a connection");
+        // --memory 64M, plus the connections' buffers, plus slack for the test.
+        let bound = 64 + n * PER_CONNECTION_KIB / 1024 + 32;
+        eprintln!("cache process: {n} bodies of {} MiB, stopped before their end, at --memory 64M: RSS +{grew} MiB (bound about {bound} MiB)", len / MIB);
+        assert!(grew <= bound, "{n} unfinished request bodies grew the cache by {grew} MiB, past --memory 64M and its connections' buffers");
     }
 
     /// Guarantee 5: no circular waits. An answer relaying a frame it keeps
@@ -1198,15 +1210,16 @@ mod s9_cycle2 {
     /// forever, though their clients read everything: the semaphore hands
     /// every share given back to the first waiter, whose chunk is larger
     /// than what is left. Then every answer of the cache that needs the
-    /// budget waits too. Anyone on Earth: four cold public files.
+    /// budget waits too. Anyone on Earth: four cold public files. Fixed: an
+    /// answer gives up keeping before it waits for the budget.
     #[test]
-    #[ignore = "BUG-1185: answers hold kept frames' shares while waiting for the budget (deadlock)"]
     fn bug_1185_kept_frames_hold_the_budget_while_their_answers_wait_for_it() {
         let hub = TestHub::start();
         let p = setup_project(&hub);
-        // --memory 64M: a budget of 32,768 KiB; each object 16,234 KiB, so
-        // two kept frames leave 300 KiB, less than a chunk can be.
-        let size = 16_234 * 1024 - 64;
+        // --memory 64M: a budget of 20,480 KiB (32,768 when found, with
+        // objects of 16,234 KiB); each object 10,090 KiB, so two kept frames
+        // leave 300 KiB, less than a chunk can be.
+        let size = 10_090 * 1024 - 64;
         let files: Vec<(String, String)> = (0..4).map(|i| (format!("src/big{i}.bin"), format!("{i}{}", "k".repeat(size - 1)))).collect();
         let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
         land(&p, &refs, "four large public files");
@@ -1255,7 +1268,7 @@ mod s9_cycle2 {
                     Err(_) => break,
                 }
             }
-            eprintln!("cache: round {round}: {done} of {} answers of 16 MiB cold objects within {:?}", ids.len(), t.elapsed());
+            eprintln!("cache: round {round}: {done} of {} answers of 10 MiB cold objects within {:?}", ids.len(), t.elapsed());
             if done < ids.len() {
                 hung += 1;
                 // A later small answer waits too: the whole cache is stuck.
@@ -1276,7 +1289,202 @@ mod s9_cycle2 {
                 std::mem::forget(c);
             }
         }
-        assert_eq!(hung, 0, "four readers of cold 16 MiB objects never got their answers (clients reading)");
+        assert_eq!(hung, 0, "four readers of cold 10 MiB objects never got their answers (clients reading)");
+    }
+
+    /// BUG-1185's class: no answer waits for the budget while holding any
+    /// of it. Many large cold reads at once (`GET`s and batches of one and
+    /// two objects, 16 clients reading promptly, 40 MiB of objects through
+    /// a 20 MiB budget) all complete, each object whole, and a small `GET`
+    /// from the store is fast afterwards, in every round.
+    #[test]
+    fn many_large_cold_reads_at_once_all_complete() {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        let size = 10 * MIB;
+        let files: Vec<(String, String)> = (0..4).map(|i| (format!("src/cold{i}.bin"), format!("{i}{}", "c".repeat(size - 1)))).collect();
+        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        land(&p, &refs, "four large public files");
+        let server = hub.api();
+        for round in 0..3 {
+            let c = TestCache::start(&hub, &hub.authority(), 1 << 30);
+            let r = Reader::new(&server, &c.api, None, &p.name);
+            let root = r.root();
+            warm(&c, &r, &[], &root);
+            let src = tree(&r, &[], &root).get("src").unwrap().id;
+            let st = tree(&r, &[root], &src);
+            let ids: Vec<ObjectId> = (0..4).map(|i| st.get(&format!("cold{i}.bin")).unwrap().id).collect();
+            let chain = format!("{},{}", root.hex(), src.hex());
+            let n = 16;
+            let barrier = Arc::new(std::sync::Barrier::new(n));
+            let (tx, rx) = std::sync::mpsc::channel();
+            for i in 0..n {
+                let (tx, barrier, chain) = (tx.clone(), barrier.clone(), chain.clone());
+                let api = Api::at(&c.running.addr.to_string(), &c.running.cert_pem);
+                let (grant, project) = (r.grant.clone(), p.name.clone());
+                let wanted: Vec<ObjectId> = match i % 3 {
+                    0 | 1 => vec![ids[i % 4]],
+                    _ => vec![ids[i % 4], ids[(i + 1) % 4]],
+                };
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let got: Vec<(ObjectId, Vec<u8>)> = if i % 3 == 0 {
+                        let g = api.get_with(&format!("/v1/objects/{project}/{}", wanted[0].hex()), &[("veil-grant", &grant), ("veil-chain", &chain)]);
+                        if g.status == 200 { vec![(wanted[0], g.body)] } else { Vec::new() }
+                    } else {
+                        let req = BatchRequest {
+                            grant,
+                            ts: veil_core::now_millis(),
+                            signature: None,
+                            wants: wanted.iter().map(|id| ChainWant { chain: vec![root, src], id: *id }).collect(),
+                            skip: Vec::new(),
+                        };
+                        let got = api.post(None, &format!("/v1/objects/{project}:batch"), &serde_json::to_vec(&req).unwrap(), true);
+                        if got.status == 200 { got.frames() } else { Vec::new() }
+                    };
+                    let whole = got.len() == wanted.len() && got.iter().zip(&wanted).all(|((id, raw), w)| id == w && ObjectId::hash(raw) == *w);
+                    let _ = tx.send(whole);
+                });
+            }
+            drop(tx);
+            let t = Instant::now();
+            let mut done = 0;
+            while done < n {
+                match rx.recv_timeout(Duration::from_secs(90).saturating_sub(t.elapsed())) {
+                    Ok(whole) => {
+                        assert!(whole, "round {round}: an answer was not the objects asked for");
+                        done += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            eprintln!("cache: round {round}: {done} of {n} large cold reads within {:?}", t.elapsed());
+            assert_eq!(done, n, "round {round}: large cold reads at once never got their answers");
+            let t = Instant::now();
+            let g = c.api.get_with(&format!("/v1/objects/{}/{}", p.name, root.hex()), &[("veil-grant", &r.grant)]);
+            assert_eq!(g.status, 200);
+            eprintln!("cache: round {round}: a GET of the root afterwards in {:?}", t.elapsed());
+            assert!(t.elapsed() < Duration::from_secs(2), "round {round}: a small GET waited {:?} after the large reads", t.elapsed());
+        }
+    }
+
+    /// The budget is shared fairly in time: an answer that holds a large
+    /// share gives it back in bounded time even to clients that read at the
+    /// minimum rate. A `GET` from the store takes its whole object's share
+    /// (up to 16 MiB) and holds it until its last byte is written, so two
+    /// clients reading a 15 MiB public object at 32 KiB/s (twice the
+    /// minimum: never cut off) hold the 20 MiB budget of `--memory 64M` for
+    /// minutes, and every other answer waits; at the default `--memory`, three
+    /// such clients (96 KiB/s from anyone on Earth) hold it all.
+    /// Fixed: an object larger than a slice is read and sent a slice at a
+    /// time, each under its own share, so a slow client holds a slice or two.
+    #[test]
+    fn bug_1186_slow_readers_of_a_large_object_hold_the_budget() {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        let big = "s".repeat(15 * MIB);
+        land(&p, &[("src/slow.bin", &big)], "a large public file");
+        let server = hub.api();
+        let c = TestCache::start(&hub, &hub.authority(), 1 << 30);
+        let r = Reader::new(&server, &c.api, None, &p.name);
+        let root = r.root();
+        warm(&c, &r, &[], &root);
+        let src = tree(&r, &[], &root).get("src").unwrap().id;
+        let big_id = tree(&r, &[root], &src).get("slow.bin").unwrap().id;
+        warm(&c, &r, &[root, src], &big_id);
+        let chain = format!("{},{}", root.hex(), src.hex());
+        let path = format!("/v1/objects/{}/{}", p.name, big_id.hex());
+        let stop = Arc::new(AtomicBool::new(false));
+        let slow: Vec<_> = (0..2)
+            .map(|_| {
+                let resp = c.api.get_unread(&path, &[("veil-grant", &r.grant), ("veil-chain", &chain)]);
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut body = resp.into_body();
+                    let mut reader = body.as_reader();
+                    let mut buf = vec![0u8; 32 << 10];
+                    while !stop.load(SeqCst) {
+                        if std::io::Read::read_exact(&mut reader, &mut buf).is_err() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_secs(2));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let api = Api::at(&c.running.addr.to_string(), &c.running.cert_pem);
+        let (grant, project) = (r.grant.clone(), p.name.clone());
+        let t = Instant::now();
+        std::thread::spawn(move || {
+            let _ = tx.send(api.get_with(&format!("/v1/objects/{project}/{}", root.hex()), &[("veil-grant", &grant)]).status);
+        });
+        let small = rx.recv_timeout(Duration::from_secs(20));
+        eprintln!("cache: a GET of the root while two clients read a 15 MiB object at 32 KiB/s: {small:?} after {:?}", t.elapsed());
+        stop.store(true, SeqCst);
+        drop(slow);
+        assert_eq!(small, Ok(200), "two clients reading at twice the minimum rate held the budget for {:?}", t.elapsed());
+    }
+
+    /// BUG-1186's fix reads large objects in slices, checking their hash as
+    /// they go: a large object damaged in the store (a flipped byte near its
+    /// end, a truncated file) ends its answer unfinished (`GET`, a range of
+    /// it, a batch), never whole with wrong bytes; it is removed, and the
+    /// next read gets the right bytes from the server.
+    #[test]
+    fn a_large_damaged_object_ends_its_answer_unfinished() {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        let big = "d".repeat(3 * MIB);
+        land(&p, &[("src/damaged.bin", &big)], "a large public file");
+        let server = hub.api();
+        let c = TestCache::start(&hub, &hub.authority(), 1 << 30);
+        let r = Reader::new(&server, &c.api, None, &p.name);
+        let root = r.root();
+        warm(&c, &r, &[], &root);
+        let src = tree(&r, &[], &root).get("src").unwrap().id;
+        let id = tree(&r, &[root], &src).get("damaged.bin").unwrap().id;
+        let good = server_bytes_at(&server, &r, &[root, src], id);
+        let chain = format!("{},{}", root.hex(), src.hex());
+        let path = format!("/v1/objects/{}/{}", p.name, id.hex());
+        for (case, how) in ["get", "range", "batch"].iter().enumerate() {
+            for damage in 0..2 {
+                warm(&c, &r, &[root, src], &id);
+                let file: Vec<String> = c.files().into_iter().filter(|(_, b)| *b == good).map(|(f, _)| f).collect();
+                assert_eq!(file.len(), 1, "{how}: the object's file in the store");
+                let mut b = good.clone();
+                match damage {
+                    0 => b[good.len() - 10] ^= 1,
+                    _ => b.truncate(good.len() - 1000),
+                }
+                std::fs::write(&file[0], &b).unwrap();
+                let read = match *how {
+                    "batch" => {
+                        let req = BatchRequest {
+                            grant: r.grant.clone(),
+                            ts: veil_core::now_millis(),
+                            signature: None,
+                            wants: vec![ChainWant { chain: vec![root, src], id }],
+                            skip: Vec::new(),
+                        };
+                        let body = std::io::Cursor::new(serde_json::to_vec(&req).unwrap());
+                        c.api.post_reader(&format!("/v1/objects/{}:batch", p.name), body).map_err(|e| e.to_string()).and_then(|resp| resp.into_body().read_to_vec().map_err(|e| e.to_string()))
+                    }
+                    _ => {
+                        let mut h = vec![("veil-grant", r.grant.as_str()), ("veil-chain", chain.as_str())];
+                        if *how == "range" {
+                            h.push(("range", "bytes=100-200"));
+                        }
+                        c.api.get_unread(&path, &h).into_body().read_to_vec().map_err(|e| e.to_string())
+                    }
+                };
+                eprintln!("cache: case {case} ({how}), damage {damage}: {:?}", read.as_ref().map(|b| b.len()));
+                assert!(read.is_err(), "{how}, damage {damage}: a damaged object's answer read as whole ({:?} bytes)", read.map(|b| b.len()));
+                assert!(c.files().iter().all(|(_, f)| *f != b), "{how}, damage {damage}: the damaged file is removed");
+                assert_eq!(r.get(&[root, src], &id).body, good, "{how}, damage {damage}: then the right bytes, from the server");
+            }
+        }
     }
 
     /// Guarantee 6: a cut-off body is an error, never a short object. A
@@ -1392,9 +1600,9 @@ mod s9_cycle2 {
         let _ = child.kill();
         let _ = child.wait();
         drop(stalled);
-        let bound = 64 + n * 128 / 1024;
+        let bound = 64 + n * PER_CONNECTION_KIB / 1024;
         eprintln!("cache process: {n} stalled GETs of cold 1 MiB objects at --memory 64M: RSS +{grew} MiB (bound {bound} MiB)");
-        assert!(grew <= bound, "{n} stalled clients grew the cache by {grew} MiB, past --memory 64M + 128 KiB a connection ({bound} MiB)");
+        assert!(grew <= bound, "{n} stalled clients grew the cache by {grew} MiB, past --memory 64M + {PER_CONNECTION_KIB} KiB a connection ({bound} MiB)");
     }
 
     /// Guarantee 1, widened: the cache's answers are the server's, byte for

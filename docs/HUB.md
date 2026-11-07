@@ -2210,7 +2210,7 @@ side); `veil-server cache` in `main.rs`. Touched elsewhere, minimally:
 
 ```text
 veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
-                  [--listen 127.0.0.1:8444] [--size 10G] [--memory 256M]
+                  [--listen 127.0.0.1:8444] [--size 10G] [--memory 128M]
                   [--max-connections 1024] [--upstream-ca PEM] [--tls-cert C --tls-key K]
 ```
 
@@ -2289,22 +2289,71 @@ veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
   `--size` bytes and an entry count from `--memory`. Every object is checked
   against its id when written and each time it is read: one that does not
   match is removed and read as absent. A restart keeps the store.
-* **Memory** (`--memory`, default 256 MiB): a quarter for decoded trees, a
-  quarter for the store's index (128 bytes an object), half for answers
+* **Memory** (`--memory`, default 128 MiB): a quarter for decoded trees, a
+  quarter for the store's index (128 bytes an object), an eighth (at least
+  12 MiB) for batch requests and three eighths for answers. **Answers**
   (BUG-1181): every chunk of every answer (from the store, passed on from
-  the server, an error) and every object being kept takes its share of it,
-  and the share travels inside the bytes handed to the connection
+  the server, an error) and every object being kept takes its share of the
+  budget, and the share travels inside the bytes handed to the connection
   (`Bytes::from_owner`), given back only once they are written. Answers go
-  out in 64 KiB slices, and an answer waits for the budget only after
-  sending what it holds, so answers never wait on each other in a cycle; a
-  `GET` from the store sends its head at once and its bytes once its share
-  is free. **Outside it, per connection:** the HTTP layer's write buffer
-  (64 KiB; the cache speaks HTTP/1.1 only, since HTTP/2 keeps a send buffer
-  per stream) and one slice, about 128 KiB; at most `--max-connections`
-  (default 1,024) are open, the next waiting in the listener's queue, and a
-  write pending for 30 s closes its connection. **So the cache holds at most
-  `--memory` + 128 KiB × `--max-connections`: about 384 MiB with the
-  defaults,** besides its fixed costs and the kernel's socket buffers.
+  out in 64 KiB slices, **each with its own share**, and an object of the
+  store larger than a slice is read a slice at a time, its hash checked as
+  the slices go and its last slice sent only once the whole matched (one
+  that does not is removed and its answer ends unfinished, an error to the
+  client, never a whole answer with wrong bytes), so a slow client holds a
+  slice or two of the budget whatever the object's size (BUG-1186). **No
+  answer waits for the budget while holding any of it** (BUG-1185): it
+  sends what it gathered first, and gives up keeping an object it is
+  collecting (its bytes and share: it is then not kept, and nobody waits
+  for it) before it waits, and before it waits for its client past 100 ms,
+  so every share taken is free or on its way to a client, answers never
+  wait on each other, and a slow client never holds an object's share; a
+  `GET` from the store sends its head at once and its bytes once their
+  shares are free. **Batch
+  requests** (BUG-1184): a body is read only under a share of the
+  requests' pool, three times its length (the parsed request, the copy sent
+  to the server, the answer's plan), taken in one step before reading for
+  the length it declares (a body of unknown length starts with a slice's
+  share and grows it only while it is free), and held until its answer
+  ends. The pool is always taken before the answers' budget, never while
+  holding it. The cache decides bodies of at most 4 MiB (about 20,000 wants
+  two folders deep); a larger body, or one whose share is not free, goes to
+  the server as it arrives, a chunk at a time, and the server's answer is
+  passed on as it is (its own 64 MiB limit and checks apply), so the cache
+  never holds it and its answers stay the server's at any size. **Outside
+  `--memory`, per connection, by its buffers' limits:** to the client, TLS
+  records being received (one record of 16 KiB being assembled, and up to
+  32 KiB decrypted ahead: 50 KiB), TLS records to send (one record, 16 KiB:
+  the cache sets rustls's 64 KiB default down) and the HTTP read buffer
+  (64 KiB; the HTTP write side holds only slices under the budget: HTTP/1.1
+  only, since HTTP/2 keeps a send buffer per stream), about 130 KiB; to the
+  server, for an answer passed on, its TLS records received (50 KiB) and its
+  HTTP read buffer, which holds the chunk the answer is waiting to send
+  (records arrive at most two per read, so it stays within 64 KiB, and
+  128 KiB while a chunk is out), or, for a body passed on as it arrives,
+  two chunks of it (64 KiB each) and the TLS records to send (80 KiB):
+  about 220 KiB. **So a connection holds at most about 352 KiB beyond
+  `--memory`,** and at most `--max-connections` (default 1,024) are open,
+  the next waiting in the listener's queue: **the cache holds at most
+  `--memory` + 352 KiB × `--max-connections`, about 480 MiB with the
+  defaults,** besides its fixed costs and the kernel's socket buffers
+  (measured: 192 clients stalled on cold answers grow it by 6 MiB, about
+  32 KiB each, since the kernel's buffers take most of each answer; 8
+  bodies of 56 MiB that stop before their end, by 9 MiB).
+* **Every connection slot comes back in bounded time** (BUG-1183): a TLS
+  handshake within 20 s, a request's head within 20 s (and an idle
+  keep-alive connection is closed after 20 s), and its body due at an
+  average of 16 KiB/s (128 kbit/s, a slow mobile link) after a 20 s grace,
+  checked before each read, so a body of `n` bytes takes at most 20 s +
+  `n` / 16 KiB/s (at most 4 min 36 s for the largest the cache decides,
+  68 min for the server's 64 MiB limit), else `408` and the connection is
+  closed. The answer: a write pending for 30 s closes the connection, and
+  so does one that would bring the time its writes have waited, over the
+  connection, past 30 s plus a second per 16 KiB written, so a client
+  reading at 16 KiB/s or faster is never cut off, and an answer of `n` bytes
+  holds its slot (and its shares) for at most 30 s + `n` / 16 KiB/s of a
+  slow client's reading, besides waits for the budget, which are bounded
+  by the same limits on the answers holding it.
 * **Only `https://` upstreams:** the caches' token and the grant key never
   cross the network in clear; any other `--upstream` is refused at start.
 * **Counters:** `SIGUSR1` writes `DIR/stats.json` (requests, objects from
@@ -2312,38 +2361,41 @@ veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
   polls), for `veil-bench load --mode objects --via server,cache`
   (`scripts/bench-server.sh cache`).
 
-**Measured** (`scripts/bench-server.sh cache` at `9b66cff`, after cycle
-1's fixes, release builds; the server, the cache, PostgreSQL, MinIO and the
-agents on one 32-thread machine; load 16.5 at the start, 79 at the end, so
+**Measured** (`scripts/bench-server.sh cache` on `s9-cycle3`, after cycle
+3's fixes, release builds, the cache at its defaults, `--memory 128M` and
+1,024 connections; the server, the cache, PostgreSQL, MinIO and the agents
+on one 32-thread machine; load 14.8 at the start, 71 at the end, so
 throughputs are noisy). A read is a fresh thin workspace's: the tips, then
 the root, `w/`, `w/seed/` and 100 of its 4 KiB files (103 objects, 4
 requests), signed:
 
 | `main` | Agents | Via | Reads/s | p50 / p99 (ms) | Server CPU per read | Cache hits | Cache requests to the server per read | Cache CPU per read | Cache peak |
 |---|---:|---|---:|---|---:|---:|---:|---:|---:|
-| still | 10 | server | 2,373 | 4.1 / 6.7 | 2.56 ms | | | | |
-| still | 10 | cache | 2,597 | 3.8 / 5.7 | 0.18 ms | 100 % | 0.00 | 2.34 ms | 43 MiB |
-| still | 100 | server | 3,455 | 28.3 / 48.4 | 2.43 ms | | | | |
-| still | 100 | cache | 4,555 | 21.1 / 39.4 | 0.18 ms | 100 % | 0.00 | 2.73 ms | 114 MiB |
-| still | 1,000 | server | 3,886 | 251 / 428 | 2.50 ms | | | | |
-| still | 1,000 | cache | 3,814 | 254 / 484 | 0.20 ms | 100 % | 0.00 | 2.96 ms | 280 MiB |
-| 20 landings/s | 10 | server | 2,459 | 4.0 / 6.0 | 2.63 ms | | | | |
-| 20 landings/s | 10 | cache | 2,545 | 3.7 / 8.2 | 0.23 ms | 99.98 % | 0.02 | 2.42 ms | 49 MiB |
-| 20 landings/s | 100 | server | 4,445 | 22.1 / 34.7 | 2.55 ms | | | | |
-| 20 landings/s | 100 | cache | 4,579 | 21.3 / 35.7 | 0.22 ms | 99.99 % | 0.01 | 2.84 ms | 115 MiB |
-| 20 landings/s | 1,000 | server | 3,866 | 252 / 461 | 2.54 ms | | | | |
-| 20 landings/s | 1,000 | cache | 4,053 | 241 / 427 | 0.24 ms | 99.98 % | 0.02 | 3.11 ms | 281 MiB |
+| still | 10 | server | 2,564 | 3.8 / 5.7 | 2.52 ms | | | | |
+| still | 10 | cache | 2,513 | 3.9 / 5.7 | 0.19 ms | 100 % | 0.00 | 2.50 ms | 39 MiB |
+| still | 100 | server | 4,570 | 21.4 / 34.0 | 2.48 ms | | | | |
+| still | 100 | cache | 3,818 | 25.5 / 43.3 | 0.19 ms | 100 % | 0.00 | 2.94 ms | 98 MiB |
+| still | 1,000 | server | 3,693 | 263 / 439 | 2.53 ms | | | | |
+| still | 1,000 | cache | 4,062 | 241 / 400 | 0.20 ms | 100 % | 0.00 | 3.13 ms | 185 MiB |
+| 20 landings/s | 10 | server | 2,334 | 4.2 / 6.7 | 2.66 ms | | | | |
+| 20 landings/s | 10 | cache | 2,605 | 3.7 / 6.4 | 0.22 ms | 99.99 % | 0.02 | 2.44 ms | 36 MiB |
+| 20 landings/s | 100 | server | 3,674 | 24.0 / 125 | 2.54 ms | | | | |
+| 20 landings/s | 100 | cache | 4,389 | 22.3 / 34.3 | 0.22 ms | 99.99 % | 0.01 | 3.02 ms | 100 MiB |
+| 20 landings/s | 1,000 | server | 3,686 | 265 / 481 | 2.53 ms | | | | |
+| 20 landings/s | 1,000 | cache | 3,837 | 254 / 454 | 0.24 ms | 99.98 % | 0.02 | 3.16 ms | 179 MiB |
 
 Gates met: at least 99 % of objects from the cache's store, its peak at
-most 512 MiB (`--memory 256M`, 1,024 connections: the bound is about 384
-MiB). The server's CPU per read falls about 11× (it answers the tips only);
-the cache spends about what the server did. The 64 KiB slices and buffers
-cost no throughput measurable here (before them, at `c97c32f`: 1,908–4,982
-reads/s at 100 agents, 1,842–4,649 at 1,000, as noisy). On one machine the
-cache competes with the server for the same cores, so throughput and
-latency through it are not a regional win; what it removes is the server's
-work. Coalescing keeps requests to the server at 0.02 per read while
-`main` moves 20 times a second.
+most 512 MiB (the defaults' bound is about 480 MiB; before cycle 3, at
+`--memory 256M`, 221–281 MiB at 1,000 agents). The server's CPU per read
+falls about 11× (it answers the tips only); the cache spends about what the
+server did. Neither the slices with a share each, the smaller pools nor
+the time limits cost throughput measurable here (cycle 2, at `9b66cff`:
+3,814–4,555 reads/s at 100 and 1,000 agents, as noisy; a run of this branch
+before BUG-1186's fix: 4,388–5,035). On one machine the cache competes with
+the server for the same cores, so throughput and latency through it are not
+a regional win; what it removes is the server's work. Coalescing keeps
+requests to the server at 0.02 per read while `main` moves 20 times a
+second.
 
 **Threat review** (design §6 rows 1–4, 8, 9, 14, 15, 17, plus this
 milestone's):
@@ -2355,7 +2407,7 @@ milestone's):
 | 3 | Anyone holding a copy of a grant | uses it at the cache unsigned, from another device, over other ids, 6 minutes old, re-signed by the server's identity key, with a wider root, expired | `grant_invalid`, the object in the store untouched | `grants_at_the_cache_hold_only_for_their_device_and_time` |
 | 4 | A person removed from a group; a project whose policy changed; a device an admin removed | keeps using a grant at the cache, which holds the objects | refused within 5 s (measured 26–232 ms), and never served again | `a_removed_person_is_refused_at_the_cache_within_the_bound` |
 | 5 | Same, with the feed cut (a partition, a dead server) | keeps using a grant | 5 s after the last answer nothing from the store, public included; `503`; served again once the feed is back | `the_cache_fails_closed_without_the_feed` |
-| 6 | A local process, a torn write | changes bytes in the store | the object fails its id check, is removed, and comes from the server; never wrong bytes | `a_damaged_object_in_the_cache_is_never_served`; unit tests in `disk.rs` |
+| 6 | A local process, a torn write | changes bytes in the store | the object fails its id check, is removed, and comes from the server; never wrong bytes; a large one read in slices ends its answer unfinished (`GET`, a range, a batch) | `a_damaged_object_in_the_cache_is_never_served`, `s9_cycle2::a_large_damaged_object_ends_its_answer_unfinished`; unit tests in `disk.rs` |
 | 7 | Anyone | a grant of one project at another project's URL | `grant_invalid`; entries are per project | test 1 |
 | 8 | Anyone on Earth; a signed-in person, an admin | reads the feed for caches (no token, a wrong one, a session) | `401`, naming nothing | `the_epoch_feed_for_caches_needs_the_caches_token` |
 | 9 | Hostile input | malformed grants (non-hex, 10 KB), chains of `MAX_CHAIN + 5`, non-hex chains and signatures, more than `MAX_WANTS` wants, bad JSON, routes the cache does not serve, a `Range` past the end or on a hidden object; a feed request with 50,001 keys, unknown fields, wrong types | refused cleanly (400/401/404/416), as at the server | tests 3 and 8 |
@@ -2366,6 +2418,10 @@ milestone's):
 | 14 | Anyone on Earth | fills the in-flight marks (a 70,000-want batch, a 17 MiB object, a client that never reads) | nothing marked that no one can use; coalescing holds for others | `s9_adversarial::bug_1180_…` (both) |
 | 15 | Anyone | a batch naming an id twice, through a tree the cache lacks and then held ones; random batches over random caches | the server's answer, byte for byte | `s9_adversarial::bug_1182_…`, `…::the_caches_answers_are_the_servers_byte_for_byte` |
 | 16 | An operator's mistake | `--upstream http://…` | refused at start | `cache::tests::an_upstream_that_is_not_https_is_refused` |
+| 17 | Anyone on Earth | sends a batch's head and a few bytes of its body, then stops; reads an answer a few bytes at a time | `408` after 20 s, the slot given back (a third client served at 20 s with a cap of 2); writes cut off below 16 KiB/s after a 30 s grace | `s9_cycle2::bug_1183_…`; `cache::deadline::tests::a_client_reading_below_the_minimum_rate_is_cut_off` |
+| 18 | Anyone on Earth | 8 batch bodies of 56 MiB that stop before their end | the cache's process grows 9 MiB at `--memory 64M` (466 MiB before) | `s9_cycle2::bug_1184_…` (the cache as its own process) |
+| 19 | Anyone on Earth, clients reading normally | many large cold reads at once (four of 10 MiB through a 20 MiB budget; 16 `GET`s and batches of 40 MiB) | every answer completes; a small `GET` afterwards in 5–13 ms (before: 0 of 4 within 60 s, and the cache stuck) | `s9_cycle2::bug_1185_…`, `…::many_large_cold_reads_at_once_all_complete` |
+| 20 | Anyone on Earth, given a large public file | reads it from the store slowly (two clients of 15 MiB at 32 KiB/s, above the minimum) | each holds a slice or two of the budget; a `GET` of the root beside them in 8 ms (before: still waiting after 20 s) | `s9_cycle2::bug_1186_…` |
 
 **Residual:** the cache answers a request it can decide faster than one it
 forwards, so timing tells whether trees and objects the asker may read are

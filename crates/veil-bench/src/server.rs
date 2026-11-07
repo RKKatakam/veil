@@ -114,7 +114,7 @@ impl Server {
 
 /// A regional cache (`veil-server cache`, S9) in front of a server started
 /// here, with its directory `dir` (its log beside it, `dir.log`), and
-/// `--memory 256M`. Killed when dropped.
+/// `--memory 128M`. Killed when dropped.
 pub struct CacheProc {
     child: Child,
     pub authority: String,
@@ -136,7 +136,7 @@ impl CacheProc {
         std::fs::create_dir_all(dir)?;
         let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
         let child = Command::new(bin)
-            .args(["cache", "--upstream", &server.https(), "--listen", &format!("127.0.0.1:{port}"), "--memory", "256M", "--upstream-ca"])
+            .args(["cache", "--upstream", &server.https(), "--listen", &format!("127.0.0.1:{port}"), "--memory", "128M", "--upstream-ca"])
             .arg(&server.cert)
             .arg("--token-file")
             .arg(data.join("hub-cache-token"))

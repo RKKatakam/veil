@@ -4,8 +4,8 @@
 //! collected for the store. Before each frame it sends, it stops and names
 //! it, so the cache can first send the objects of its own that come before
 //! it: the answer keeps the order of the request, as the server's does.
-//! Memory: the frame being collected (at most the store's largest object)
-//! and what the caller has not sent yet.
+//! Memory: what the caller has not sent yet; the frame being collected to
+//! keep is the caller's ([`Keeping`]), so it can let it go at any time.
 
 use std::collections::HashSet;
 
@@ -13,11 +13,22 @@ use veil_core::{hub::wire::MAX_FRAME_OBJECT, ObjectId};
 
 const HEADER: usize = 36;
 
-/// The frame about to be sent: its id, its length, and whether it is kept.
+/// The frame about to be sent: its id, its length, and whether it may be
+/// kept (asked for, and small enough): it is, if the caller passes a
+/// [`Keeping`] for it.
 pub struct Next {
     pub id: ObjectId,
     pub len: usize,
     pub keeping: bool,
+}
+
+/// An object being collected to keep, its bytes so far, and their share of
+/// the cache's budget: the caller's, given to [`Relay::feed`] while it
+/// lasts.
+pub struct Keeping {
+    pub id: ObjectId,
+    pub bytes: Vec<u8>,
+    pub share: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 pub struct Relay {
@@ -25,9 +36,9 @@ pub struct Relay {
     head: Vec<u8>,
     /// The header of the frame just named, written at the next call.
     pending: Vec<u8>,
-    /// The frame being read: its id, bytes still to come, whether it is
-    /// sent on, and its bytes if it is being kept.
-    body: Option<(ObjectId, usize, bool, Option<Vec<u8>>)>,
+    /// The frame being read: its id, bytes still to come, and whether it is
+    /// sent on.
+    body: Option<(ObjectId, usize, bool)>,
     /// Ids already sent (by the cache itself, or earlier in this answer).
     pub sent: HashSet<ObjectId>,
     /// Ids that may be kept (those asked for).
@@ -47,17 +58,18 @@ impl Relay {
         }
     }
 
-    /// Take bytes from `chunk`: append what is sent on to `out`, and each
-    /// whole object to keep to `kept` (unchecked: the store checks it).
-    /// Returns `Some(next)` when frame `next.id` is next to be sent, before
-    /// any of it is in `out` (call again, with the rest of `chunk`, to go
-    /// on); `None` once `chunk` is used up.
-    pub fn feed(&mut self, chunk: &mut &[u8], out: &mut Vec<u8>, kept: &mut Vec<(ObjectId, Vec<u8>)>) -> Result<Option<Next>, &'static str> {
+    /// Take bytes from `chunk`: append what is sent on to `out`, the frame
+    /// being read to `keep` if it is that frame's, and move `keep` to `kept`
+    /// once its frame is whole (unchecked: the store checks it). Returns
+    /// `Some(next)` when frame `next.id` is next to be sent, before any of it
+    /// is in `out` (call again, with the rest of `chunk`, to go on); `None`
+    /// once `chunk` is used up.
+    pub fn feed(&mut self, chunk: &mut &[u8], out: &mut Vec<u8>, keep: &mut Option<Keeping>, kept: &mut Vec<Keeping>) -> Result<Option<Next>, &'static str> {
         out.append(&mut self.pending);
         loop {
-            if let Some((id, 0, _, keep)) = &mut self.body {
-                if let Some(k) = keep.take() {
-                    kept.push((*id, k));
+            if let Some((id, 0, send)) = self.body {
+                if send && keep.as_ref().is_some_and(|k| k.id == id) {
+                    kept.extend(keep.take());
                 }
                 self.body = None;
             }
@@ -78,40 +90,27 @@ impl Relay {
                         return Err("an oversized frame");
                     }
                     let send = self.sent.insert(id);
-                    let keep = (send && len <= self.keep_max && self.wanted.contains(&id)).then(|| Vec::with_capacity(len));
-                    self.body = Some((id, len, send, keep));
+                    self.body = Some((id, len, send));
                     if send {
                         self.pending = std::mem::take(&mut self.head);
-                        let keeping = self.body.as_ref().is_some_and(|b| b.3.is_some());
+                        let keeping = len <= self.keep_max && self.wanted.contains(&id);
                         return Ok(Some(Next { id, len, keeping }));
                     }
                     self.head.clear();
                 }
-                Some((_, left, send, keep)) => {
+                Some((id, left, send)) => {
                     let n = (*left).min(chunk.len());
                     if *send {
                         out.extend_from_slice(&chunk[..n]);
-                    }
-                    if let Some(k) = keep {
-                        k.extend_from_slice(&chunk[..n]);
+                        if let Some(k) = keep.as_mut().filter(|k| k.id == *id) {
+                            k.bytes.extend_from_slice(&chunk[..n]);
+                        }
                     }
                     *left -= n;
                     *chunk = &chunk[n..];
                 }
             }
         }
-    }
-
-    /// Do not keep the frame being read (its bytes would pass the budget).
-    pub fn stop_keeping(&mut self) {
-        if let Some(b) = &mut self.body {
-            b.3 = None;
-        }
-    }
-
-    /// Is a frame being read and kept?
-    pub fn keeping(&self) -> bool {
-        self.body.as_ref().is_some_and(|b| b.3.is_some())
     }
 
     /// Did the answer end between frames?
@@ -130,17 +129,20 @@ mod tests {
     /// Feed `body` in chunks of `step`; what was sent, the ids named, and
     /// what was kept.
     fn run(r: &mut Relay, body: &[u8], step: usize) -> (Vec<u8>, Vec<ObjectId>, Kept) {
-        let (mut out, mut named, mut kept) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut out, mut named, mut keep, mut kept) = (Vec::new(), Vec::new(), None, Vec::new());
         for c in body.chunks(step) {
             let mut rest = c;
-            while let Some(next) = r.feed(&mut rest, &mut out, &mut kept).unwrap() {
+            while let Some(next) = r.feed(&mut rest, &mut out, &mut keep, &mut kept).unwrap() {
                 // Nothing of the frame named is out yet.
                 assert!(!out.ends_with(&next.id.0));
+                if next.keeping {
+                    keep = Some(Keeping { id: next.id, bytes: Vec::new(), share: None });
+                }
                 named.push(next.id);
             }
         }
-        r.feed(&mut &[][..], &mut out, &mut kept).unwrap();
-        (out, named, kept)
+        r.feed(&mut &[][..], &mut out, &mut keep, &mut kept).unwrap();
+        (out, named, kept.into_iter().map(|k| (k.id, k.bytes)).collect())
     }
 
     #[test]
@@ -171,6 +173,6 @@ mod tests {
         assert!(!r.whole(), "cut inside a frame");
         let mut bad = vec![0u8; 32];
         bad.extend_from_slice(&u32::MAX.to_be_bytes());
-        assert!(Relay::new(HashSet::new(), HashSet::new(), 0).feed(&mut &bad[..], &mut Vec::new(), &mut Vec::new()).is_err());
+        assert!(Relay::new(HashSet::new(), HashSet::new(), 0).feed(&mut &bad[..], &mut Vec::new(), &mut None, &mut Vec::new()).is_err());
     }
 }

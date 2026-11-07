@@ -6,7 +6,7 @@
 //!             [--tls-cert cert.pem --tls-key key.pem]   (default: self-signed)
 //! veil-server migrate --database-url postgres://…   (apply migrations, then exit)
 //! veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
-//!             [--listen 127.0.0.1:8444] [--size 10G] [--memory 256M] [--max-connections 1024]
+//!             [--listen 127.0.0.1:8444] [--size 10G] [--memory 128M] [--max-connections 1024]
 //!             [--upstream-ca PEM]
 //!             (a regional cache: docs/HUB.md §13.18)
 //! ```
@@ -91,13 +91,13 @@ enum Command {
         /// Most bytes of objects kept on disk (K, M, G suffixes).
         #[arg(long, default_value = "10G", value_parser = bytes)]
         size: u64,
-        /// About the most memory for decoded trees, the store's index and
-        /// objects being read (K, M, G suffixes).
-        #[arg(long, default_value = "256M", value_parser = bytes)]
+        /// About the most memory for decoded trees, the store's index,
+        /// batch requests and answers being sent (K, M, G suffixes).
+        #[arg(long, default_value = "128M", value_parser = bytes)]
         memory: u64,
         /// Most client connections open at once (the next waits until one
-        /// closes): each may hold about 128 KiB beyond --memory, so the
-        /// defaults bound the cache at about 384 MiB.
+        /// closes): each may hold about 352 KiB beyond --memory (its TLS and
+        /// HTTP buffers), so the defaults bound the cache at about 480 MiB.
         #[arg(long, default_value_t = 1024)]
         max_connections: usize,
         /// TLS certificate chain (PEM); without it, a self-signed certificate.

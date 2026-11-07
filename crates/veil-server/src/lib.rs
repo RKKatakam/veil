@@ -218,19 +218,26 @@ pub async fn start(config: Config) -> Result<Running> {
 /// a request's head.
 const IDLE_LIMIT: Duration = Duration::from_secs(20);
 
-/// What a regional cache bounds per connection (BUG-1181), so that its
-/// memory is `--memory` plus `max_connections` × about `2 × buffer`.
+/// What a regional cache bounds per connection (BUG-1181, BUG-1183), so
+/// that its memory is `--memory` plus `max_connections` times what one
+/// connection holds (`docs/HUB.md` §13.18), and every connection slot is
+/// given back in bounded time.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ConnectionLimits {
-    /// A connection whose write stays pending this long is closed.
-    pub write_deadline: Duration,
+    /// A connection whose writes stall, or fall below the minimum rate, is
+    /// closed.
+    pub pace: cache::deadline::Pace,
     /// At most this many are open at once; the next waits in the
     /// listener's queue until one closes.
     pub max_connections: usize,
-    /// The HTTP layer's write buffer per connection. HTTP/1.1 only: HTTP/2
-    /// would keep a send buffer per stream.
+    /// The HTTP layer's read and write buffers per connection. HTTP/1.1
+    /// only: HTTP/2 would keep a send buffer per stream.
     pub buffer: usize,
 }
+
+/// TLS records waiting to be sent per connection, with [`ConnectionLimits`]:
+/// one record (rustls's default is 64 KiB).
+const TLS_SEND_BUFFER: usize = 16 << 10;
 
 /// Serve `app` over TLS until `stop`, with `limits` (the regional cache's)
 /// or none (the server's).
@@ -269,7 +276,10 @@ pub(crate) async fn serve_tls(
             let _slot = slot;
             // A connection that never finishes its handshake, or never sends
             // a request's head, is closed: idle sockets cannot pile up.
-            let Ok(Ok(stream)) = tokio::time::timeout(IDLE_LIMIT, acceptor.accept(tcp)).await else { return };
+            let Ok(Ok(mut stream)) = tokio::time::timeout(IDLE_LIMIT, acceptor.accept(tcp)).await else { return };
+            if limits.is_some() {
+                stream.get_mut().1.set_buffer_limit(Some(TLS_SEND_BUFFER));
+            }
             let service = hyper_util::service::TowerToHyperService::new(app);
             let mut b = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
             b.http1().timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(IDLE_LIMIT);
@@ -277,7 +287,7 @@ pub(crate) async fn serve_tls(
                 b = b.http1_only();
                 b.http1().max_buf_size(l.buffer);
             }
-            let stream = cache::deadline::WriteDeadline::new(stream, limits.map(|l| l.write_deadline));
+            let stream = cache::deadline::WriteDeadline::new(stream, limits.map(|l| l.pace));
             let _ = b.serve_connection(hyper_util::rt::TokioIo::new(stream), service).await;
         });
     }

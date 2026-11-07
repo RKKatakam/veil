@@ -13,7 +13,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -59,6 +59,17 @@ impl Index {
         self.bytes -= size as u64;
         true
     }
+}
+
+/// An object of the store being read in pieces ([`Store::open_object`]).
+pub struct Reading {
+    k: Key,
+    id: ObjectId,
+    file: std::fs::File,
+    /// Its length as recorded, and bytes read so far.
+    pub size: u64,
+    read: u64,
+    hash: blake3::Hasher,
 }
 
 pub struct Store {
@@ -168,6 +179,55 @@ impl Store {
         }
     }
 
+    /// Object `id` of `project`, opened to be read in pieces
+    /// ([`Store::read_some`]); `None` if not held or not openable (then it is
+    /// removed).
+    pub fn open_object(&self, project: &str, id: &ObjectId) -> Option<Reading> {
+        let k = key(project, id);
+        let size = self.index.lock().unwrap().touch(&k)? as u64;
+        match std::fs::File::open(self.path(&k)) {
+            Ok(file) => Some(Reading { k, id: *id, file, size, read: 0, hash: blake3::Hasher::new() }),
+            Err(_) => {
+                self.discard(&k);
+                None
+            }
+        }
+    }
+
+    /// The next bytes of `r`, at most `n`, hashed as they are read. **The
+    /// last of them come back only once the whole object matched its id**
+    /// (its recorded length, then nothing more, then its hash): otherwise it
+    /// is removed and this is an error, so an answer sending it in pieces
+    /// ends unfinished, never with wrong bytes whole (BUG-1186).
+    pub fn read_some(&self, r: &mut Reading, n: usize) -> std::io::Result<Vec<u8>> {
+        let want = (n as u64).min(r.size - r.read) as usize;
+        let mut buf = vec![0u8; want];
+        let mut checked = r.file.read_exact(&mut buf);
+        if checked.is_ok() {
+            r.hash.update(&buf);
+            r.read += want as u64;
+            if r.read == r.size {
+                let mut more = [0u8; 1];
+                let whole = matches!(r.file.read(&mut more), Ok(0)) && ObjectId(*r.hash.finalize().as_bytes()) == r.id;
+                if !whole {
+                    checked = Err(std::io::Error::other("an object in the store does not match its id"));
+                }
+            }
+        }
+        if let Err(e) = checked {
+            eprintln!("veil-server cache: an object in the store does not match its id; removed");
+            self.discard(&r.k);
+            return Err(e);
+        }
+        Ok(buf)
+    }
+
+    /// Forget object `k` and remove its file.
+    fn discard(&self, k: &Key) {
+        self.index.lock().unwrap().remove(k);
+        let _ = std::fs::remove_file(self.path(k));
+    }
+
     /// Keep `raw` as object `id` of `project` if it is that object and no
     /// larger than [`Store::max_object`]; `true` if kept. Written whole to a
     /// temporary file, then renamed into place.
@@ -206,6 +266,47 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BUG-1186: an object read in pieces is checked as a whole before its
+    /// last piece comes back; a damaged one (a flipped byte, a longer or a
+    /// shorter file) fails at its end and is removed.
+    #[test]
+    fn an_object_read_in_pieces_is_checked_before_its_last_piece() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), 1 << 30, 1000, 1 << 20).unwrap();
+        let (id, raw) = obj(1, 200_000);
+        assert!(s.put("p", &id, &raw));
+        let mut r = s.open_object("p", &id).unwrap();
+        let mut got = Vec::new();
+        while got.len() < raw.len() {
+            got.extend(s.read_some(&mut r, 65_536).unwrap());
+        }
+        assert_eq!(got, raw);
+        for damage in 0..3 {
+            let path = s.path(&key("p", &id));
+            let mut b = raw.clone();
+            match damage {
+                0 => b[150_000] ^= 1,
+                1 => b.push(b'x'),
+                _ => b.truncate(199_000),
+            }
+            std::fs::write(&path, &b).unwrap();
+            let mut r = s.open_object("p", &id).unwrap();
+            let mut pieces = 0;
+            let failed = loop {
+                match s.read_some(&mut r, 65_536) {
+                    Ok(_) if r.read == r.size => break false,
+                    Ok(_) => pieces += 1,
+                    Err(_) => break true,
+                }
+            };
+            assert!(failed, "damage {damage} read as whole");
+            assert_eq!(pieces, 3, "damage {damage}: the pieces before the last");
+            assert_eq!(s.has("p", &id), None, "damage {damage}: removed");
+            assert!(!path.exists());
+            assert!(s.put("p", &id, &raw));
+        }
+    }
 
     fn obj(n: usize, len: usize) -> (ObjectId, Vec<u8>) {
         let mut raw = format!("veil:blob\n{n}:").into_bytes();
