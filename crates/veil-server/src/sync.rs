@@ -1535,38 +1535,62 @@ pub(crate) fn receipted(hub: &Hub, project: i64, person: i64, receipts: &std::co
         .collect()
 }
 
-/// Store uploaded objects (`docs/HUB.md` §4.5): each is decoded if it came
-/// compressed (bounded: at most the object size limit each, and at most
-/// `limit` bytes for the whole request, so a compressed request costs no
-/// more than a plain one could), re-hashed against its id, and must decode
-/// canonically (safe names, sorted trees) at a repository format the server
-/// serves. It is stored as the client encoded it when the client sent
-/// `encoded` frames (made as small as they get) and that is no larger than
-/// the object; a plain frame is compressed here when that is smaller
-/// (`docs/HUB.md` §13.15). Nothing uploaded is visible until a push makes a branch reach
-/// it. Returns a receipt per object, in order (stored whether or not the
-/// project held it already, so the answer is the same either way).
-pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limit: u64, encoded: bool) -> Result<Vec<String>> {
-    // The checks, decoding and compressing on a blocking thread. Each
-    // encoding is copied out of the request: a slice would keep the whole
-    // body alive in the object cache for as long as any one of its
-    // objects stays there (BUG-860).
+/// Store uploaded objects (`docs/HUB.md` §4.5). Each frame, plain or
+/// compressed (`docs/HUB.md` §13.15), is decoded (bounded: at most the
+/// object size limit each, at most `limit` bytes for the whole request, a
+/// compressed one only if it expands at most [`encoding::MAX_RATIO`] times
+/// its size, and at most [`DECODING_IN_FLIGHT`] bytes across the server at
+/// once: BUG-1009), re-hashed against its id, and must decode canonically
+/// (safe names, sorted trees) at a repository format the server serves.
+/// It is stored as the server's own encoding of it, never as the client
+/// sent it, so no client chooses the stored bytes of an object others
+/// share (BUG-1008). Nothing uploaded is visible until a push makes a
+/// branch reach it. Returns a receipt per object, in order (stored whether
+/// or not the project held it already, so the answer is the same either
+/// way).
+pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limit: u64) -> Result<Vec<String>> {
+    // The checks, decoding and compressing on a blocking thread.
+    let rt = Handle::current();
     let frames: Vec<(ObjectId, Bytes)> = tokio::task::spawn_blocking(move || -> Result<Vec<(ObjectId, Bytes)>> {
         let mut left = limit;
         let mut out = Vec::new();
         for (id, enc) in encoding::split_frames(&body)? {
+            if !encoding::within_ratio(enc) {
+                return Err(Error::bad_request(format!(
+                    "object {} expands more than {} times its compressed size: send it uncompressed",
+                    id.short(),
+                    encoding::MAX_RATIO
+                )));
+            }
+            // Bytes decoded from a compressed frame count against the
+            // server-wide bound while they are held.
+            let _decoding = match encoding::is_compressed(enc) {
+                true => {
+                    let n = encoding::decoded_len(enc).unwrap_or(0).min(DECODING_IN_FLIGHT as u64) as u32;
+                    Some(rt.block_on(DECODING.acquire_many(n)).map_err(|e| Error::Other(e.into()))?)
+                }
+                false => None,
+            };
             let raw = encoding::decode(&id, enc, left.min(MAX_FRAME_OBJECT as u64))?;
             left -= raw.len() as u64;
             if Object::min_repo_format(&raw) > veil_core::repo::REPO_FORMAT {
                 return Err(Error::bad_request("an object of a newer format than this server serves"));
             }
-            Object::decode(&raw)?;
-            // As the client encoded it (never larger than the object);
-            // compressed here when the client sent plain frames.
-            let stored = match &raw {
-                Cow::Owned(r) if enc.len() >= r.len() => Bytes::copy_from_slice(r),
-                _ if encoded => Bytes::copy_from_slice(enc),
-                _ => Bytes::copy_from_slice(&encoding::encode(&raw)),
+            // Any bytes are a blob: decoding one would only copy it.
+            if !raw.starts_with(b"veil:blob\n") {
+                Object::decode(&raw)?;
+            }
+            // The server's own encoding of what it decoded (BUG-1008). Each
+            // is its own allocation: a slice would keep the whole body
+            // alive in the object cache (BUG-860).
+            let compressed = match encoding::encode(&raw) {
+                Cow::Owned(z) => Some(z),
+                Cow::Borrowed(_) => None,
+            };
+            let stored = match (compressed, raw) {
+                (Some(z), _) => Bytes::from(z),
+                (None, Cow::Owned(r)) => Bytes::from(r),
+                (None, Cow::Borrowed(r)) => Bytes::copy_from_slice(r),
             };
             out.push((id, stored));
         }
@@ -1610,6 +1634,11 @@ async fn put_many(hub: &Arc<Hub>, project: i64, objects: impl IntoIterator<Item 
     }
     Ok(())
 }
+
+/// Bytes decoded from compressed uploads the server holds at once, across
+/// every request (BUG-1009); an object larger than this takes all of it.
+pub const DECODING_IN_FLIGHT: u32 = 256 << 20;
+static DECODING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(DECODING_IN_FLIGHT as usize);
 
 /// Most object writes one request has in flight ([`put_all`]).
 pub const PUTS_AT_ONCE: usize = 64;

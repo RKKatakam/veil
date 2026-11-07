@@ -855,7 +855,7 @@ const LONG_DELTA: usize = 2 << 20;
 /// Largest zstd window a delta may use: 2^27 (128 MiB) is the most every
 /// zstd decoder accepts by default, so packs stay readable by every vl.
 #[cfg_attr(not(feature = "zstd"), allow(dead_code))]
-const MAX_DELTA_WINDOW_LOG: u32 = 27;
+pub(crate) const MAX_DELTA_WINDOW_LOG: u32 = 27;
 
 /// zstd-compress `raw` against `base` (a delta entry; read back with
 /// `base` as a raw-content dictionary).

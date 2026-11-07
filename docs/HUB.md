@@ -1784,14 +1784,13 @@ client (`crates/vl/src/hub.rs`).
     caller that accepts them, and plain frames to anyone else. Projected
     trees made for one viewer are sent as they are.
   * **Uploads:** the server reads every upload as encoded frames (so a `vl`
-    from before S27 still uploads), and decodes and checks each. A `vl`
-    that compresses sends its upload as
-    `Content-Type: application/x-veil-encoded-frames`, each object already
-    as small as it gets (compressed as the push's walk finds it): the server
-    stores each as sent (never larger than the object). A plain upload (an
-    older `vl`) is compressed by the server. `vl` compresses only for a
-    server of **revision 2** (`Tips::revision`); to an older server it
-    sends plain frames.
+    from before S27 still uploads), decodes and checks each, and **stores
+    its own encoding** of what it decoded (`encoding::encode`), never the
+    client's frame: no client chooses the stored bytes of an object others
+    share (BUG-1008; an S3 PUT replaces what a key held). `vl` compresses
+    each object as the push's walk finds it, within the ratio below
+    (`encode_to_send`), and only for a server of **revision 2**
+    (`Tips::revision`); to an older server it sends plain frames.
 * **Compatibility, both ways.** An older `vl` sends no `Accept` and gets
   plain frames; its plain uploads are compressed by the server. A newer
   `vl` and an older server: the server ignores `Accept` and answers plain
@@ -1800,13 +1799,22 @@ client (`crates/vl/src/hub.rs`).
   don't hash to their ids), never misread them.
 * **Bounded decoding** (`encoding::decode`): a `z` frame must be exactly one
   zstd frame that declares its size (no trailing bytes, no second or
-  skippable frame), and that size must be at most the object size limit
-  (`wire::MAX_FRAME_OBJECT`, as for a plain frame) before anything is
-  decoded. The decoder never produces more than the declared size, objects
+  skippable frame), that size must be at most the object size limit
+  (`wire::MAX_FRAME_OBJECT`, as for a plain frame), and its window at most
+  2^27 bytes (`MAX_WINDOW`: what every decoder reads, the web client's
+  pure decoder included; libzstd's one-shot decoder does not check it,
+  BUG-1008), before anything is decoded. The decoder never produces more than the declared size, objects
   above 64 MiB are hashed while streaming before they are held in memory
   (BUG-490's rule), and the result must hash to the id. An upload's objects
-  together may decode to at most the request body limit (2 GiB), so a
-  compressed request costs the server no more than a plain one could.
+  together may decode to at most the request body limit (2 GiB).
+* **What a client sends expands at most 64 times** (`encoding::within_ratio`;
+  any frame decoding to at most 64 KiB may expand more): the server refuses
+  anything else before decoding it, and `vl` sends such an object plain, so
+  its size is the sender's to pay, as before S27. What the server stores
+  is as small as it gets (no ratio). **Decoding in uploads holds a
+  server-wide budget** of 256 MiB of decoded bytes at once
+  (`sync::DECODING_IN_FLIGHT`, a semaphore by bytes; an object larger than
+  that takes all of it), across every request (BUG-1009).
 * **What it does not change:** the client's local store (pulled objects
   already go into zstd packs; loose objects stay as they are until
   `vl gc`), the repository format, and the per-object permission checks.
@@ -1847,18 +1855,33 @@ crafted frames, a reader without access to a folder, a network observer
 | 5 | **Secrets**: plaintext compressed, or compressed before encryption | secrets are sealed on the device before upload; the server sees and stores ciphertext, kept as it is | `objects_are_compressed_in_storage_and_for_clients_that_read_them` (the `.env` is stored uncompressed), `leaks::…` (the server never holds the secret's plaintext, decoded) |
 | 6 | **Mixed versions misread each other's frames** | negotiated (`Accept`, revision 2); a plain frame is an encoded frame; encoded frames sent to an older server fail its hash check | `objects_are_compressed_in_storage_and_for_clients_that_read_them`, `hub::tests::answers_of_plain_and_encoded_frames` |
 | 7 | **Tests that scan the server's files** for leaked plaintext miss it once objects are compressed | the scan decodes object files first (`support::stored_bytes`) | `secrets2::…` |
+| 8 | **A frame some reader can't decode** stored over another folder's object (a 2 GiB window: BUG-1008) | `decode` refuses windows above 2^27 on every path; the server stores only its own encoding | `encoding::tests::bug_1008_a_frame_every_decoder_reads_or_none`, `server_hub` `sync::bug_1008_…`, `sync::an_uploaded_frame_of_raw_blocks_round_trips_to_its_id` |
+| 9 | **Small uploads that exhaust the server's memory** (4 KiB decoding to 128 MiB, many at once: BUG-1009) | at most 64:1 above 64 KiB, refused before decoding; 256 MiB decoded in flight server-wide; no copy of a blob for its check | `encoding::tests::what_is_sent_expands_at_most_the_ratio`, `sync::bug_1009_…`, `sync::compressed_uploads_decode_within_a_server_wide_bound` (16 × 48 MiB at once: +301 MiB, 821 MiB without the budget) |
 
-**Left as it is (medium, accepted):** a participant can make the server
-spend CPU decoding up to 2 GiB per upload request from a small body
-(before S27 that cost them 2 GiB of upload). The bound is per request;
-rate limits per person are later work (§4.7).
+**Left as it is (low, accepted):** a participant can still make the
+server decode more than they send: up to 64 times a frame's size (or
+64 KiB from a tiny frame), up to the 2 GiB a request may decode. It is
+**bounded server-wide**: at most 256 MiB is decoded at once across every
+request, so memory stays bounded however many requests arrive; the cost
+left is CPU (zstd decodes at about 1 GB/s), which per-person rate limits
+(later work, §4.7) bound.
 
 #### Reverting
 
 Revert the merge **only if no server ran it on real data**: an older
 server cannot read objects stored compressed (they fail its hash check,
 "stored object … does not match its id"). Once a server has stored
-compressed objects, revert by making `encoding::encode` return its input
-(one line): the server then stores and sends plain objects, and keeps
-reading both kinds.
+compressed objects:
 
+1. **Stop writing them:** make `encoding::encode` return its input (one
+   line). Every object the server writes is then plain, uploads included
+   (an upload is always stored as the server's own encoding, never as the
+   client's frame), and the server keeps reading both kinds. Clients may
+   go on sending compressed frames: the server decodes them and stores
+   them plain.
+2. **To stop clients sending compressed frames too,** set `wire::REVISION`
+   back to 1: `vl` then uploads plain frames (it still accepts compressed
+   answers, which a server writing only plain objects no longer sends,
+   except for objects already stored compressed).
+3. **To run a server from before S27** on the same store, every object
+   stored compressed must first be rewritten plain; no tool does that yet.

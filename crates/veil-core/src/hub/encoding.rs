@@ -17,8 +17,13 @@
 //! of encoded frames, so a receiver that reads encoded frames reads both.
 //!
 //! **Decoding is bounded** ([`decode`]): a frame must declare its size, be
-//! exactly one frame, and declare at most the caller's limit; the decoder
-//! never produces more than that, and the result must hash to the id.
+//! exactly one frame, declare at most the caller's limit and a window of at
+//! most 2^27 bytes (what every decoder reads, the web client's included:
+//! BUG-1008); the decoder never produces more than that, and the result
+//! must hash to the id. **What a client sends** expands at most
+//! [`MAX_RATIO`] times (above [`RATIO_FLOOR`]): [`within_ratio`], which the
+//! server checks on upload and [`encode_to_send`] keeps to, so a small
+//! request never makes the server decode a large object (BUG-1009).
 
 use std::borrow::Cow;
 
@@ -36,10 +41,19 @@ const PLAIN: u8 = b'v';
 const LEVEL: i32 = 3;
 
 /// The media type of a body of encoded frames: a client that reads them
-/// says so in `Accept` (a server then answers `history` and `fetch` with
-/// objects as stored), and sends its uploads under it (each object
-/// already as small as it gets: a server stores it as it is).
+/// says so in `Accept`, and a server then answers `history` and `fetch`
+/// with objects as stored.
 pub const FRAMES: &str = "application/x-veil-encoded-frames";
+
+/// The largest window a frame may declare: 2^27 bytes, the most every
+/// zstd decoder reads by default (the pure decoder of the WASM web client
+/// refuses more; libzstd's one-shot decoder does not check: BUG-1008).
+pub const MAX_WINDOW: u64 = 1 << crate::pack::MAX_DELTA_WINDOW_LOG;
+
+/// How many times its own size a frame a client sends may expand
+/// ([`within_ratio`]), and the size below which any frame may (BUG-1009).
+pub const MAX_RATIO: u64 = 64;
+pub const RATIO_FLOOR: u64 = 64 << 10;
 
 /// The encoding of `raw` (a canonical encoding): a zstd frame when that is
 /// smaller, else `raw` itself. Without the zstd C library (WASM) always
@@ -77,6 +91,38 @@ pub fn encode(raw: &[u8]) -> Cow<'_, [u8]> {
     Cow::Borrowed(raw)
 }
 
+/// [`encode`], for sending: a zstd frame only [`within_ratio`] (an object
+/// that compresses better goes plain, so its size is the sender's to pay,
+/// as before S27). What a server stores is its own [`encode`].
+pub fn encode_to_send(raw: &[u8]) -> Cow<'_, [u8]> {
+    match encode(raw) {
+        Cow::Owned(z) if !within_ratio(&z) => Cow::Borrowed(raw),
+        e => e,
+    }
+}
+
+/// Does `enc` expand to at most [`MAX_RATIO`] times its own size, or to at
+/// most [`RATIO_FLOOR`] bytes? (A plain encoding always does.) A server
+/// decodes nothing a client sent that does not (BUG-1009).
+pub fn within_ratio(enc: &[u8]) -> bool {
+    match enc.first() {
+        Some(&ZSTD) => decoded_len(enc).is_some_and(|n| n <= RATIO_FLOOR.max(MAX_RATIO.saturating_mul(enc.len() as u64))),
+        _ => true,
+    }
+}
+
+/// The window the zstd frame `frame` declares (a single-segment frame's is
+/// its content size), from its header (RFC 8878 §3.1.1.1).
+fn frame_window(frame: &[u8]) -> Option<u64> {
+    let fhd = *frame.get(4)?;
+    if fhd & 0x20 != 0 {
+        return crate::pack::frame_content_size(frame);
+    }
+    let wd = *frame.get(5)?;
+    let base = 1u64 << (10 + u32::from(wd >> 3));
+    Some(base + (base / 8) * u64::from(wd & 7))
+}
+
 /// Is `enc` a compressed encoding?
 pub fn is_compressed(enc: &[u8]) -> bool {
     enc.first() == Some(&ZSTD)
@@ -94,9 +140,9 @@ pub fn decoded_len(enc: &[u8]) -> Option<u64> {
 
 /// The canonical encoding of object `id` from its encoding `enc`, at most
 /// `limit` bytes (the object size limit): checked against `id`. A zstd frame
-/// that declares more than `limit`, declares no size, is not exactly one
-/// frame, or decodes to anything else is refused before more than its
-/// declared size is produced.
+/// that declares more than `limit`, declares no size or a window past
+/// [`MAX_WINDOW`], is not exactly one frame, or decodes to anything else is
+/// refused before more than its declared size is produced.
 pub fn decode<'a>(id: &ObjectId, enc: &'a [u8], limit: u64) -> Result<Cow<'a, [u8]>> {
     let bad = |m: &str| VeilError::Corrupt(id.hex(), m.to_string());
     let raw: Cow<'a, [u8]> = match enc.first() {
@@ -111,6 +157,11 @@ pub fn decode<'a>(id: &ObjectId, enc: &'a [u8], limit: u64) -> Result<Cow<'a, [u
             let size = crate::pack::frame_content_size(frame).ok_or_else(|| bad("not one zstd frame that declares its size"))?;
             if size > limit {
                 return Err(bad("compressed object expands past the limit"));
+            }
+            // Every decoder reads it, or none: libzstd's one-shot decoder
+            // would accept any window (BUG-1008).
+            if frame_window(frame).is_none_or(|w| w > MAX_WINDOW) {
+                return Err(bad("compressed object declares a window past 2^27 bytes"));
             }
             Cow::Owned(crate::pack::decompress(frame, size, None, id).map_err(|e| bad(&e))?)
         }
@@ -278,7 +329,6 @@ mod tests {
     /// and serves it as stored: `decode` must refuse what the slowest
     /// reader refuses, so every reader decodes what the server accepts.
     #[test]
-    #[ignore = "BUG-1008: a frame with a window past 2^27 passes decode but the WASM decoder refuses it"]
     fn bug_1008_a_frame_every_decoder_reads_or_none() {
         let raw = blob(b"a file any participant knows: a licence, a vendored library");
         let id = ObjectId::hash(&raw);
@@ -301,6 +351,28 @@ mod tests {
         #[cfg(feature = "ruzstd")]
         assert!(crate::pack::pure::decompress(&enc[1..], raw.len() as u64, None).is_err(), "the WASM decoder refuses it");
         assert!(decode(&id, &enc, 1 << 20).is_err(), "decode accepted a frame the WASM decoder refuses");
+    }
+
+    /// BUG-1009: what a client sends expands at most 64 times (above
+    /// 64 KiB); an object that compresses better is sent plain. What a
+    /// server stores ([`encode`]) is as small as it gets.
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn what_is_sent_expands_at_most_the_ratio() {
+        let zeros = blob(&vec![0u8; 8 << 20]);
+        let stored = encode(&zeros);
+        assert!(is_compressed(&stored) && !within_ratio(&stored));
+        assert!(matches!(encode_to_send(&zeros), Cow::Borrowed(_)));
+        // Ordinary text compresses well within it, and is sent compressed.
+        let text = blob(&(0..20_000u32).flat_map(|i| format!("    let v{i} = compute({}, \"{:x}\"); // line {i}\n", i * 7 % 13, i.wrapping_mul(2654435761)).into_bytes()).collect::<Vec<u8>>());
+        let sent = encode_to_send(&text);
+        assert!(is_compressed(&sent) && within_ratio(&sent), "{} bytes for {}", sent.len(), text.len());
+        // Below the floor, any ratio.
+        let small = blob(&vec![0u8; 60 << 10]);
+        assert!(is_compressed(&encode_to_send(&small)));
+        assert!(within_ratio(&small) && within_ratio(b"veil:blob\n"));
+        // A frame that declares no size is not within it.
+        assert!(!within_ratio(&[ZSTD, 0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00]));
     }
 
     #[test]

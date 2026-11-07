@@ -586,11 +586,10 @@ impl Client {
         })
     }
 
-    /// Upload object frames (plain, or `encoded` for a server of revision
-    /// 2); the server's receipt for each, in order.
-    pub fn upload(&self, frames: Vec<u8>, encoded: bool) -> Result<Vec<String>> {
-        let ct = if encoded { encoding::FRAMES } else { "application/octet-stream" };
-        let out = self.ok("POST", &self.url.project_path("/objects"), Some((ct, frames)))?;
+    /// Upload object frames (plain, or encoded for a server of revision 2);
+    /// the server's receipt for each, in order.
+    pub fn upload(&self, frames: Vec<u8>) -> Result<Vec<String>> {
+        let out = self.ok("POST", &self.url.project_path("/objects"), Some(("application/octet-stream", frames)))?;
         Ok(serde_json::from_slice::<veil_core::hub::wire::Uploaded>(&out)?.receipts)
     }
 
@@ -1056,7 +1055,8 @@ struct Uploads<'a> {
 impl Uploads<'_> {
     fn add(&mut self, id: &ObjectId, raw: &[u8]) -> Result<()> {
         match self.compress {
-            true => put_frame(&mut self.frames, id, &encoding::encode(raw)),
+            // Compressed within the ratio a server decodes (BUG-1009).
+            true => put_frame(&mut self.frames, id, &encoding::encode_to_send(raw)),
             false => put_frame(&mut self.frames, id, raw),
         }
         self.ids.push(*id);
@@ -1070,7 +1070,7 @@ impl Uploads<'_> {
         if self.ids.is_empty() {
             return Ok(());
         }
-        let r = self.client.upload(std::mem::take(&mut self.frames), self.compress)?;
+        let r = self.client.upload(std::mem::take(&mut self.frames))?;
         let ids = std::mem::take(&mut self.ids);
         if r.len() != ids.len() {
             bail!("the server sent {} upload receipts for {} objects", r.len(), ids.len());

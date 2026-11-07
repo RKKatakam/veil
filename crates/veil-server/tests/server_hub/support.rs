@@ -384,8 +384,9 @@ impl Api {
         self.post(Some(token), &format!("/v1/projects/{project}/objects"), body, false)
     }
 
-    /// POST object frames as a `vl` that sends encoded frames does (S27):
-    /// under `Content-Type: application/x-veil-encoded-frames`.
+    /// POST encoded object frames (S27), under the encoded frames' media
+    /// type (which the server does not need: it reads every upload as
+    /// encoded frames).
     pub fn upload_encoded_body(&self, token: &str, project: &str, body: &[u8]) -> Reply {
         let r = self
             .agent

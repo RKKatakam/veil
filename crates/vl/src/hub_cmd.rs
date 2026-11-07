@@ -481,7 +481,7 @@ pub fn change(repository: Option<&Path>, cmd: &crate::cli::ChangeCmd) -> Result<
     }
     let mut receipts = std::collections::BTreeMap::new();
     if !frames.is_empty() {
-        for (id, r) in sealed.iter().zip(client.upload(frames, false)?) {
+        for (id, r) in sealed.iter().zip(client.upload(frames)?) {
             receipts.insert(*id, r);
         }
     }
