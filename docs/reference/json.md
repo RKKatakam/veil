@@ -90,7 +90,9 @@ lines of work and embargoes needed: `description_hidden` in snapshot
 references, `cloak` (workspaces, tags, log and show entries), `embargo` in a
 visibility and in `ls` entries, `fallback` (`ls`), blame's `version`, a kept
 tag's `scope`, and the visibility kind `embargoed`. The tier `embargoed`
-now means a file an unreleased embargo withholds (below).
+now means a file an unreleased embargo withholds (below), and the file
+entries of `diff` and `show` have a `tier` too (an added field, so still
+version 2).
 
 ### Confidentiality
 
@@ -228,6 +230,7 @@ One file of `vl diff` and `vl show`.
 | `status` | string | `added`, `deleted`, `modified`, `renamed` or `copied` |
 | `from` | string *(optional)* | Renamed or copied: the path it came from; `old` is that file's version |
 | `score` | number *(optional)* | Renamed or copied: the similarity in percent |
+| `tier` | string | The [tier](#tier) of the new version (of the old one for a deletion); `embargoed` when an unreleased embargo withholds either version, whose lines `content` shows. Each entry's `visibility` says who can read that version, not whether a push sends it |
 | `old`, `new` | entry or null | The two versions; `old` is null for an added file, `new` for a deleted one |
 | `content` | object or null | The changed lines; null with `--stat` |
 
@@ -550,7 +553,7 @@ guessed through: lines whose history is sealed for you are unattributed.
 | `schema` | string | `veil.blame/2` |
 | `path` | string | The file |
 | `rev` | [snapshot reference](#snapshot-reference) | The snapshot whose version is annotated (`-r`) |
-| `public` | bool | `--public`: annotated as a public mirror sees the history |
+| `public` | bool | `--public`: annotated as a public mirror sees the history: no secret files, and nothing an unreleased embargo withholds (`vl blame --public` refuses a revision that such an embargo withholds, since a public mirror does not have it) |
 | `coarse` | bool | Some two versions differed too much to compare line by line: their differing middle is attributed whole |
 | `stopped` | string or null | `max_changes` (`--max-changes` was reached) or `budget` (the work budget was spent); null when the walk finished |
 | `visited` | number | Snapshot visits of the walk |

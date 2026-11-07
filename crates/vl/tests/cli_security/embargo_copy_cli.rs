@@ -252,7 +252,6 @@ fn squashing_the_embargoed_merge_away_publishes_nothing() {
 /// being withheld while the embargo is still pending, and the next push
 /// publishes the fix.
 #[test]
-#[ignore = "BUG-990: rebasing the embargoed merge onto other parents un-withholds its fix"]
 fn rebasing_the_embargoed_merge_onto_other_parents_publishes_nothing() {
     for dest in [&["fix", "V1"][..], &["fix"], &["V1"]] {
         let env = Env::new();
@@ -273,7 +272,6 @@ fn rebasing_the_embargoed_merge_onto_other_parents_publishes_nothing() {
 /// fix's change and description, although no push sends any of it before
 /// the release.
 #[test]
-#[ignore = "BUG-991: `vl blame --public` reads an unreleased embargo's history as public"]
 fn blame_public_never_shows_an_unreleased_embargo_as_public() {
     let env = Env::new();
     let (r, _) = embargoed(&env);
@@ -286,7 +284,6 @@ fn blame_public_never_shows_an_unreleased_embargo_as_public() {
 /// `public` and nothing else to say otherwise (format 7 said `embargoed`;
 /// the `/2` schemas dropped that kind and added no tier to file diffs).
 #[test]
-#[ignore = "BUG-992: `vl diff --json` and `vl show --json` call an unreleased embargo's files public"]
 fn diff_and_show_json_never_call_a_file_under_an_unreleased_embargo_public() {
     let env = Env::new();
     let (r, v1) = embargoed(&env);

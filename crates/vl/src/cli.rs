@@ -202,7 +202,8 @@ pub enum Cmd {
     ///
     /// One line per file: tier, size in bytes, path (`*` marks an
     /// executable), and a note in parentheses. Tiers: `public`;
-    /// `cloaked:<scope>` (a secret file encrypted for a scope you are in);
+    /// `embargoed` (plain, but an unreleased embargo withholds this version:
+    /// no push sends it before the release); `cloaked:<scope>` (a secret file encrypted for a scope you are in);
     /// `redacted` (a secret sealed for someone else, or withheld from this
     /// repository: the note says for whom). For the working copy (`-r @`,
     /// the default) the local-only files are listed too: `isolated` (never

@@ -139,7 +139,7 @@ fn diff_files() -> Value {
     let line = json!({"kind": "string", "text": "string", "newline": "bool"});
     let hunk = json!({"old_start": "number", "old_lines": "number", "new_start": "number", "new_lines": "number", "lines": [line]});
     json!([{
-        "path": "string", "status": "string", "old": entry, "new": entry,
+        "path": "string", "status": "string", "tier": "string", "old": entry, "new": entry,
         "content": nullable(json!({"binary": "bool", "hidden": nullable(redaction()), "hunks": [hunk]})),
     }])
 }
@@ -568,6 +568,9 @@ fn diff_and_show_shape() {
     #[cfg(unix)]
     assert_eq!(by("run.sh")["new"]["mode"], "100755");
     assert_eq!(by(PLAN)["new"]["visibility"], json!({"kind": "cloaked", "scope": "team"}));
+    assert_eq!(by(PLAN)["tier"], "cloaked");
+    // `main` is an unreleased embargo's merge whose fix changed README.md.
+    assert_eq!(by("README.md")["tier"], "embargoed");
     assert!(!files.iter().any(|f| f["path"] == ".netrc"), "isolated files are never recorded");
 
     let v = json_ok(env, "alice", alice, &["diff", "--from", "root()", "--to", "main", "--stat", "--json"]);

@@ -405,7 +405,8 @@ pub struct Change {
     /// The new version is unreadable here (`(redacted)` in the text).
     pub redacted: bool,
     /// The tier of the new version (of the old one for a deletion), as
-    /// `vl ls` shows it: `public`, `cloaked` or `redacted`
+    /// `vl ls` shows it: `public`, `embargoed` (an unreleased embargo
+    /// withholds it), `cloaked` or `redacted`
     /// (this reader cannot read it; `visibility` says for whom it is).
     pub tier: &'static str,
     /// The new version is an unresolved conflict (null otherwise).
@@ -695,12 +696,13 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
     let changes = diff_trees(repo.store(), Some(&base), Some(&s.tree))?;
     let (changes, _) = detect_renames(repo, changes, &Renames::default())?;
     let report = &ctx.report;
+    let embargo = EmbargoTiers::of(repo, &wc)?;
     let mut redacted = Vec::new();
     for p in &report.carried {
         let entry = lookup(repo.store(), &s.tree, p)?;
         let why = entry.as_ref().and_then(|e| redaction_for_listing(repo, e));
         // Readable, yet never materialised: the filesystem refused it.
-        let tier = entry.as_ref().map_or("redacted", |e| entry_tier(repo, e));
+        let tier = entry.as_ref().map_or("redacted", |e| embargo.tier(repo, p, Some(e), entry_tier(repo, e)));
         let fallback = match entry {
             Some(e) if repo.store().entry_readable(&e) => {
                 Redaction { reason: "unwritable", message: "this filesystem could not hold it".into() }
@@ -743,7 +745,6 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
         working_copy: snapshot_ref(repo, &wc),
         parents: s.parents.iter().map(|p| snapshot_ref(repo, p)).collect(),
         changes: {
-            let embargo = EmbargoTiers::of(repo, &wc)?;
             changes
                 .iter()
                 .map(|c| {
@@ -1113,6 +1114,10 @@ pub struct FileDiff {
     /// Renamed or copied: the similarity in percent (absent otherwise).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<u8>,
+    /// The tier of the new version (of the old one for a deletion), as
+    /// `vl ls` shows it, or `embargoed` when an unreleased embargo
+    /// withholds either version (the hunks show both; BUG-992).
+    pub tier: &'static str,
     /// Null for an added (old) or deleted (new) file.
     pub old: Option<EntryInfo>,
     pub new: Option<EntryInfo>,
@@ -1203,6 +1208,7 @@ fn file_diff_with(repo: &Repo, c: &TreeChange, stat: bool, check_readable: bool,
         status: status_word(c),
         from: None,
         score: None,
+        tier: c.new.as_ref().or(c.old.as_ref()).map_or("public", |e| entry_tier(repo, e)),
         old: c.old.as_ref().map(|e| entry_info(repo, e, check_readable)),
         new: c.new.as_ref().map(|e| entry_info(repo, e, check_readable)),
         content: (!stat).then(|| content(repo, c, attrs)),
@@ -1312,34 +1318,62 @@ fn hunks(patch: &diffy::Patch<'_, str>) -> Vec<Hunk> {
         .collect()
 }
 
-pub fn diff_body_with(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool, r: &Renames) -> Result<DiffBody> {
-    let (items, renames_skipped) = detect_renames(repo, diff_changes(repo, from, to)?, r)?;
+/// The two trees a diff compares, and the snapshots whose embargo each
+/// side's versions answer to: for a snapshot against its parents, the
+/// snapshot for both (its parents are withheld only if it is).
+pub struct DiffTrees {
+    pub from: ObjectId,
+    pub to: ObjectId,
+    pub from_rev: ObjectId,
+    pub to_rev: ObjectId,
+}
+
+pub fn diff_body_with(repo: &Repo, t: &DiffTrees, stat: bool, r: &Renames) -> Result<DiffBody> {
+    let (items, renames_skipped) = detect_renames(repo, diff_changes(repo, &t.from, &t.to)?, r)?;
     let attrs = diff_attrs(repo);
-    Ok(DiffBody { stat, files: items.iter().map(|c| item_diff(repo, c, stat, &attrs)).collect(), renames_skipped })
+    let old = EmbargoTiers::of(repo, &t.from_rev)?;
+    let new = if t.to_rev == t.from_rev { None } else { Some(EmbargoTiers::of(repo, &t.to_rev)?) };
+    let new = new.as_ref().unwrap_or(&old);
+    let mut files = Vec::with_capacity(items.len());
+    for c in &items {
+        let mut f = item_diff(repo, c, stat, &attrs);
+        let (from, to) = match c {
+            Item::Change(c) => ((&c.path, c.old.as_ref()), (&c.path, c.new.as_ref())),
+            Item::Pair(p) => ((&p.from, Some(&p.old)), (&p.to, Some(&p.new))),
+        };
+        // A version an embargo withholds is "embargoed" whatever its label.
+        let withheld = |tiers: &EmbargoTiers, (p, e): (&VPath, Option<&TreeEntry>)| e.is_some() && tiers.tier(repo, p, e, "public") == "embargoed";
+        let public = |e: Option<&TreeEntry>| e.is_some_and(|e| entry_tier(repo, e) == "public");
+        if (public(to.1) && withheld(new, to)) || (public(from.1) && withheld(&old, from)) {
+            f.tier = "embargoed";
+        }
+        files.push(f);
+    }
+    Ok(DiffBody { stat, files, renames_skipped })
 }
 
 /// `vl diff --json` with rename detection on (the default).
-pub fn diff(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool) -> Result<Diff> {
-    diff_with(repo, from, to, stat, &Renames::default())
+pub fn diff(repo: &Repo, t: &DiffTrees, stat: bool) -> Result<Diff> {
+    diff_with(repo, t, stat, &Renames::default())
 }
 
-pub fn diff_with(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool, r: &Renames) -> Result<Diff> {
-    Ok(Diff { schema: DIFF_SCHEMA, body: diff_body_with(repo, from, to, stat, r)? })
+pub fn diff_with(repo: &Repo, t: &DiffTrees, stat: bool, r: &Renames) -> Result<Diff> {
+    Ok(Diff { schema: DIFF_SCHEMA, body: diff_body_with(repo, t, stat, r)? })
 }
 
 /// The two trees `vl diff` compares: a snapshot's parents and the snapshot
 /// (`-r`, default `@`), or `--from` and `--to` (each default `@`).
-pub fn diff_trees_for(ctx: &Ctx, rev: Option<&str>, from: Option<&str>, to: Option<&str>) -> Result<(ObjectId, ObjectId)> {
+pub fn diff_trees_for(ctx: &Ctx, rev: Option<&str>, from: Option<&str>, to: Option<&str>) -> Result<DiffTrees> {
     Ok(match (from, to) {
         (None, None) => {
             let id = ctx.rev(rev.unwrap_or("@"))?;
             let s = ctx.repo.snapshot(&id)?;
-            (ctx.repo.parents_tree(&s.parents)?.tree, s.tree)
+            DiffTrees { from: ctx.repo.parents_tree(&s.parents)?.tree, to: s.tree, from_rev: id, to_rev: id }
         }
         _ => {
             let a = ctx.rev(from.unwrap_or("@"))?;
             let b = ctx.rev(to.unwrap_or("@"))?;
-            (ctx.repo.snapshot(&a)?.tree, ctx.repo.snapshot(&b)?.tree)
+            DiffTrees { from: ctx.repo.snapshot(&a)?.tree, to: ctx.repo.snapshot(&b)?.tree, from_rev: a, to_rev: b }
         }
     })
 }
@@ -1399,7 +1433,8 @@ pub fn show(ctx: &Ctx, rev: &str, stat: bool) -> Result<Show> {
 
 pub fn show_with(ctx: &Ctx, rev: &str, stat: bool, r: &Renames) -> Result<Show> {
     let mut s = show_header(ctx, rev, stat)?;
-    s.diff = diff_body_with(&ctx.repo, &s.base_tree, &s.tree, stat, r)?;
+    let id = ctx.rev(rev)?;
+    s.diff = diff_body_with(&ctx.repo, &DiffTrees { from: s.base_tree, to: s.tree, from_rev: id, to_rev: id }, stat, r)?;
     Ok(s)
 }
 

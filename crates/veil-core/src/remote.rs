@@ -524,14 +524,28 @@ pub fn embargo_blocks(local: &Repo, targets: &[ObjectId]) -> Result<Vec<Option<S
 /// beyond that one is under the embargo (`vl ls`'s tier `embargoed`).
 pub fn embargo_base(local: &Repo, id: &ObjectId) -> Result<Option<ObjectId>> {
     let withheld = embargo_withheld(local)?;
-    if withheld.is_empty() || push_closure(local.store(), &[*id], &withheld)?.is_ok() {
+    if withheld.is_empty() {
+        return Ok(None);
+    }
+    // A snapshot builds on withheld history exactly when one of the lowest
+    // withheld snapshots (none of whose parents is withheld) is it or an
+    // ancestor of it: one bounded query of the graph index per first parent
+    // walked, never a walk of the whole history (`push_closure`).
+    let mut lowest = HashSet::new();
+    for w in withheld.keys() {
+        if !local.snapshot_opt(w)?.is_some_and(|s| s.parents.iter().any(|p| withheld.contains_key(p))) {
+            lowest.insert(*w);
+        }
+    }
+    let blocked = |x: &ObjectId| -> Result<bool> { Ok(lowest.contains(x) || !local.graph().reachable_among(local, [*x], &lowest)?.is_empty()) };
+    if !blocked(id)? {
         return Ok(None);
     }
     let mut x = *id;
     loop {
         let Some(s) = local.snapshot_opt(&x)? else { return Ok(Some(local.root_id())) };
         let Some(p) = s.parents.first().copied() else { return Ok(Some(local.root_id())) };
-        if push_closure(local.store(), &[p], &withheld)?.is_ok() {
+        if !blocked(&p)? {
             return Ok(Some(p));
         }
         x = p;
