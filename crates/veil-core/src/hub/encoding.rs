@@ -82,6 +82,16 @@ pub fn is_compressed(enc: &[u8]) -> bool {
     enc.first() == Some(&ZSTD)
 }
 
+/// The size `enc` says it decodes to (a zstd frame's declared size), not
+/// checked: for sizing a buffer, never as a limit.
+pub fn decoded_len(enc: &[u8]) -> Option<u64> {
+    match *enc.first()? {
+        PLAIN => Some(enc.len() as u64),
+        ZSTD => crate::pack::frame_content_size(&enc[1..]),
+        _ => None,
+    }
+}
+
 /// The canonical encoding of object `id` from its encoding `enc`, at most
 /// `limit` bytes (the object size limit): checked against `id`. A zstd frame
 /// that declares more than `limit`, declares no size, is not exactly one
@@ -170,6 +180,8 @@ mod tests {
         #[cfg(feature = "zstd")]
         assert!(is_compressed(&enc) && enc.len() < text.len() / 10);
         assert_eq!(&*decode(&ObjectId::hash(&text), &enc, 1 << 20).unwrap(), &text[..]);
+        assert_eq!(decoded_len(&enc), Some(text.len() as u64));
+        assert_eq!(decoded_len(b"\x01"), None);
         // Ciphertext-like bytes don't shrink: kept as they are.
         let noise = blob(&crate::crypto::random_bytes::<4096>());
         assert!(matches!(encode(&noise), Cow::Borrowed(_)));
