@@ -360,7 +360,7 @@ fn bug_861_a_closed_object_store_connection_is_tried_again() {
         return;
     };
     let upstream = endpoint.trim_start_matches("http://").trim_end_matches('/').to_string();
-    let proxy = flaky_proxy(upstream, |n| n < 12 && n % 2 == 0);
+    let proxy = flaky_proxy(upstream, |n| (n < 12 && n % 2 == 0).then_some(&b""[..]));
     let hub = TestHub::start_with_s3(
         &std::env::var("VEIL_TEST_DATABASE_URL").unwrap(),
         std::time::Duration::from_secs(3600),
@@ -381,9 +381,42 @@ fn bug_861_a_closed_object_store_connection_is_tried_again() {
     }
 }
 
-/// A TCP proxy to `upstream` that closes new connection `n` after reading
-/// its first bytes, without answering, when `drop_it(n)`. Returns its URL.
-fn flaky_proxy(upstream: String, drop_it: impl Fn(usize) -> bool + Send + 'static) -> String {
+/// BUG-1005. An object store that asks the server to slow down (HTTP 429,
+/// as S3 and MinIO do under load, seen on the shared MinIO of
+/// `verify-server.sh`): the first eight connections are answered 429. The
+/// server tries each such request again, as it does a 5xx: it starts, a
+/// push stores every object and a clone fetches them (before, the first
+/// 429 failed the request: "S3 PUT: HTTP 429").
+#[test]
+fn bug_1005_an_object_store_asking_to_slow_down_is_tried_again() {
+    let Ok(endpoint) = std::env::var("VEIL_TEST_S3_ENDPOINT") else {
+        eprintln!("bug_1005: skipped (no VEIL_TEST_S3_ENDPOINT: run scripts/verify-server.sh)");
+        return;
+    };
+    let upstream = endpoint.trim_start_matches("http://").trim_end_matches('/').to_string();
+    let slow_down = &b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..];
+    let proxy = flaky_proxy(upstream, move |n| (n < 8).then_some(slow_down));
+    let hub = TestHub::start_with_s3(
+        &std::env::var("VEIL_TEST_DATABASE_URL").unwrap(),
+        std::time::Duration::from_secs(3600),
+        Some(proxy),
+    );
+    let admin = hub.person("admin");
+    let dir = admin.dir("proj");
+    let name = new_project(&hub, &admin, &dir);
+    write_files(&dir, &[("src/a.txt", "slowed down, then stored")]);
+    admin.commit_main(&dir, "one file");
+    admin.ok(&dir, &["push"]);
+    let c = admin.dir("clone");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), c.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(c.join("src/a.txt")).unwrap(), "slowed down, then stored");
+}
+
+/// A TCP proxy to `upstream`. New connection `n` is passed through, unless
+/// `answer(n)` gives bytes: then, after its first bytes are read, it is
+/// answered those bytes (none: nothing) and closed. Returns its URL.
+fn flaky_proxy(upstream: String, answer: impl Fn(usize) -> Option<&'static [u8]> + Send + 'static) -> String {
+    use std::io::Write;
     use std::{
         io::Read,
         net::{Shutdown, TcpListener, TcpStream},
@@ -393,9 +426,10 @@ fn flaky_proxy(upstream: String, drop_it: impl Fn(usize) -> bool + Send + 'stati
     std::thread::spawn(move || {
         for (n, c) in l.incoming().enumerate() {
             let Ok(mut c) = c else { continue };
-            if drop_it(n) {
+            if let Some(bytes) = answer(n) {
                 let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                 let _ = c.read(&mut [0u8; 4096]);
+                let _ = c.write_all(bytes);
                 continue;
             }
             let up = upstream.clone();
