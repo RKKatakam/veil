@@ -1132,6 +1132,7 @@ fn cmd_embargo(ctx: &mut Ctx, c: &EmbargoCmd) -> Result<()> {
             if list.is_empty() {
                 println!("No embargoes.");
             }
+            let withdrawn = remote::withdrawn_embargoes(&ctx.repo)?;
             for r in list {
                 let pending = || match r.until {
                     Some(u) => yellow(&format!("until {}", fmt_deadline(u))),
@@ -1144,6 +1145,10 @@ fn cmd_embargo(ctx: &mut Ctx, c: &EmbargoCmd) -> Result<()> {
                         green("released"),
                         yellow("(not pushed yet: `vl undo` takes it back)")
                     ),
+                    // BUG-1017: no visible merge carries it any more.
+                    ReleaseState::Unreleased if withdrawn.contains(&r.id) => {
+                        yellow("withdrawn (its embargoed merge was undone or abandoned: nothing holds the fix back)")
+                    }
                     ReleaseState::Unreleased => pending(),
                 };
                 println!("{}  scope:{}  {state}", bold(&safe(&r.id)), safe(&r.scope));

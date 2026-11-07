@@ -3463,16 +3463,29 @@ The lists below describe what today's client protects, and what not.
   counts as released everywhere.
 * *An embargo release is final once pushed.* Until the next push it is
   staged locally and `vl undo` takes it back (§7).
-* *History withheld by an embargo* is computed from the local graph. If the
-  embargoed merge is undone, or abandoned with nothing built on it, before
-  a push, nothing protects the fix branch any more; it is then an ordinary
-  change. Otherwise a transaction's rewrites keep one invariant
-  (`Transaction::check_withheld`): every snapshot an unreleased embargo
-  withheld before that is still visible is still withheld afterwards. A
-  squash or abandon of the merge while a change built on it survives, or a
-  rebase of the merge onto other parents, is refused; a merge of
-  concurrent operations drops such a rewrite (BUG-942, BUG-943, BUG-990).
-  `vl blame --public` refuses a revision a push withholds (BUG-991).
+* *History withheld by an embargo* is computed from the local graph, by
+  **change**, in one place (`remote::Withheld`; push, the copy checks of
+  `confinement`, `vl blame --public`, the JSON tiers and the commit check
+  all ask it). For each visible merge of an unreleased embargo, the fix
+  line is the history behind its other parents and not behind its first
+  parent, plus the merge, for the merge and every earlier version of it
+  (`predecessors`). Every version of a change of a fix line is withheld
+  (unless behind the first parent: already on the public line), whatever
+  its snapshot id, and so is everything that descends from one. Queries
+  walk the graph index from the snapshots asked about down to the first
+  parents, never the whole history. Every transaction that changes the
+  visible embargoed merges keeps one invariant
+  (`Transaction::check_withheld`): a version of a withheld change still
+  visible afterwards is still withheld, unless the embargo was released or
+  withdrawn. A squash or abandon of the merge while a change built on it
+  survives, a squash of it into the fix, or a rebase of it onto other
+  parents is refused; a merge of concurrent operations drops such a rewrite
+  (BUG-942, 943, 990, 1015, 1016). An embargo is *withdrawn* when no
+  visible snapshot carries it any more and nothing it withheld was replaced
+  (the merge undone, or abandoned bare): nothing protects the fix line any
+  more, `vl embargo list` says `withdrawn`, and the next push that
+  publishes it warns (BUG-1017). `vl blame --public` refuses a revision a
+  push withholds (BUG-991).
 * Content committed in plaintext **before** a path was cloaked stays readable
   in those older snapshots. `vl cloak` warns when this applies.
 

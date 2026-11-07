@@ -1061,6 +1061,8 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             }
         }
         let updates = kept;
+        let sent: Vec<ObjectId> = updates.iter().filter_map(|u| u.new).collect();
+        let withdrawn = veil_core::remote::withdrawn_warnings(repo, &sent)?;
         if updates.is_empty() {
             return Ok(PushOutcome {
                 warnings: vec![],
@@ -1125,7 +1127,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             bail!("a branch kept moving during the push; pull, then push again");
         };
         let mut out = PushOutcome {
-            warnings: result.warnings.clone(),
+            warnings: withdrawn.iter().cloned().chain(result.warnings.iter().cloned()).collect(),
             moved: vec![],
             rejected: withheld,
             uploaded,

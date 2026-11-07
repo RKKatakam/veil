@@ -464,42 +464,195 @@ pub(crate) fn ancestors_in(store: &ObjectStore, tips: &[ObjectId]) -> Result<Vec
 }
 
 /// The snapshots that unreleased embargo `embargo` withholds from a
-/// public remote (its fix history): what releasing it publishes, beside
-/// the merge's content.
+/// public remote (its merges and the visible history of its fix line):
+/// what releasing it publishes, beside the merge's content.
 pub fn withheld_by_embargo(local: &Repo, embargo: &str) -> Result<Vec<ObjectId>> {
-    let mut out: Vec<ObjectId> = embargo_withheld(local)?
-        .into_iter()
-        .filter(|(_, e)| e == embargo)
-        .map(|(id, _)| id)
-        .collect();
+    let w = embargo_withheld(local)?;
+    let mut out: Vec<ObjectId> = w.lines.iter().filter(|l| l.embargo == embargo).flat_map(|l| l.history.iter().copied()).collect();
     out.sort();
+    out.dedup();
     Ok(out)
 }
 
-/// History that must not leave this repository yet: for every unreleased
-/// embargoed merge in the local graph, the merge itself and the snapshots
-/// reachable only through its merged-in (non-first) parents (the fix, and
-/// how it was made). Maps each to the embargo that withholds it.
-/// Embargoes are not encrypted, so no receiver gets any of it before the
-/// release, and a snapshot that builds on it is refused too
-/// ([`push_closure`]).
-pub(crate) fn embargo_withheld(local: &Repo) -> Result<HashMap<ObjectId, String>> {
-    let mut out = HashMap::new();
-    for id in local.visible_embargoed()? {
-        let s = local.snapshot(&id)?;
-        let Some(e) = &s.embargo else { continue };
-        if local.keys().embargo_released(e) {
-            continue;
-        }
-        out.entry(id).or_insert_with(|| e.clone());
-        if s.parents.len() < 2 {
-            continue;
-        }
-        for a in local.graph().range(local, &s.parents[1..], &s.parents[..1])? {
-            out.entry(a).or_insert_with(|| e.clone());
-        }
+/// What unreleased embargoes withhold, by **change** (BUG-1015, BUG-1016):
+/// the one rule push, the copy checks (`confinement`), `vl blame --public`,
+/// the JSON tiers and the transaction's commit check all ask.
+///
+/// For each visible merge of an unreleased embargo, its *fix line* is the
+/// history behind its other parents that is not behind its first parent
+/// (the public line the merge was made on), plus the merge itself, for the
+/// merge and every earlier version of it (`predecessors`): a fix line only
+/// grows while the embargo is unreleased. The embargo withholds **every version** of
+/// every change of the fix line (any snapshot with its change id, past,
+/// present or rewritten, unless it is behind a first parent: already on
+/// the public line), and every snapshot that descends from one. An
+/// earlier version brought back by `vl undo --op`, `vl tag set -r` or
+/// `vl new`, or a rewrite of the fix with a new id, stays withheld.
+///
+/// A query never reads the whole history: per embargo, one walk of the
+/// graph index from the snapshots asked about down to the first parents
+/// (`GraphIndex::range`), whose versions of fix-line changes are the only
+/// ones that can withhold them.
+#[derive(Clone, Debug, Default)]
+pub struct Withheld {
+    lines: Vec<FixLine>,
+}
+
+#[derive(Clone, Debug)]
+struct FixLine {
+    embargo: String,
+    /// The changes of the fix line and of the embargoed merge.
+    changes: HashSet<crate::id::ChangeId>,
+    /// The merge's first parent (none for a root merge).
+    base: Vec<ObjectId>,
+    /// The merge, then the visible snapshots of its fix line.
+    history: Vec<ObjectId>,
+}
+
+impl Withheld {
+    /// What `local`'s current view withholds.
+    pub fn of(local: &Repo) -> Result<Withheld> {
+        Withheld::of_merges(local, &local.visible_embargoed()?, false)
     }
-    Ok(out)
+
+    /// What the embargoed merges `merges` withhold (released embargoes
+    /// left out unless `released`).
+    fn of_merges(local: &Repo, merges: &[ObjectId], released: bool) -> Result<Withheld> {
+        // One line per merge: what is behind its own first parent is on
+        // the public line it was made on.
+        let mut lines: Vec<FixLine> = Vec::new();
+        for id in merges {
+            let s = local.snapshot(id)?;
+            let Some(e) = &s.embargo else { continue };
+            if !released && local.keys().embargo_released(e) {
+                continue;
+            }
+            let mut line = FixLine {
+                embargo: e.clone(),
+                changes: HashSet::new(),
+                base: s.parents.first().copied().into_iter().collect(),
+                history: vec![*id],
+            };
+            // The merge and every earlier version of it (its evolution
+            // log): a rewrite that drops the fix from the merge's parents
+            // (the fix abandoned, the merge rebased) never forgets the fix
+            // line, so a later `vl undo --op` that brings back a version of
+            // the fix finds it still withheld.
+            let mut versions = vec![(*id, s.clone())];
+            let mut seen: HashSet<ObjectId> = [*id].into_iter().collect();
+            let mut stack: Vec<ObjectId> = s.predecessors.clone();
+            while let Some(p) = stack.pop() {
+                if !seen.insert(p) {
+                    continue;
+                }
+                let Some(ps) = local.snapshot_opt(&p)? else { continue };
+                if ps.embargo.as_deref() != Some(e.as_str()) {
+                    continue;
+                }
+                stack.extend(ps.predecessors.iter().copied());
+                versions.push((p, ps));
+            }
+            for (v, vs) in &versions {
+                line.changes.insert(vs.change_id);
+                if vs.parents.len() < 2 {
+                    continue;
+                }
+                for a in local.graph().range(local, &vs.parents[1..], &vs.parents[..1])? {
+                    if let Some(sa) = local.snapshot_opt(&a)? {
+                        line.changes.insert(sa.change_id);
+                        if v == id {
+                            line.history.push(a);
+                        }
+                    }
+                }
+            }
+            lines.push(line);
+        }
+        lines.sort_by(|a, b| (&a.embargo, &a.history[0]).cmp(&(&b.embargo, &b.history[0])));
+        Ok(Withheld { lines })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// The embargoes that withhold anything.
+    pub fn embargoes(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.lines.iter().map(|l| l.embargo.clone()).collect();
+        out.dedup();
+        out
+    }
+
+    /// Add `other`'s fix lines (what any of several views withheld).
+    pub fn extend(&mut self, other: Withheld) {
+        self.lines.extend(other.lines);
+        self.lines.sort_by(|a, b| (&a.embargo, &a.history[0]).cmp(&(&b.embargo, &b.history[0])));
+    }
+
+    /// The embargo that withholds snapshot `id`, if any.
+    pub fn of_snapshot(&self, local: &Repo, id: &ObjectId) -> Result<Option<String>> {
+        Ok(self.blocking(local, &[*id])?.pop().flatten())
+    }
+
+    /// For each of `ids`, the embargo that withholds it, if any.
+    pub fn blocking(&self, local: &Repo, ids: &[ObjectId]) -> Result<Vec<Option<String>>> {
+        let mut out: Vec<Option<String>> = vec![None; ids.len()];
+        for line in &self.lines {
+            let todo: Vec<usize> = (0..ids.len()).filter(|i| out[*i].is_none()).collect();
+            if todo.is_empty() {
+                break;
+            }
+            let roots: Vec<ObjectId> = todo.iter().map(|i| ids[*i]).collect();
+            let versions = self.versions_in(local, line, &roots)?;
+            if versions.is_empty() {
+                continue;
+            }
+            for i in todo {
+                if versions.contains(&ids[i]) || !local.graph().reachable_among(local, [ids[i]], &versions)?.is_empty() {
+                    out[i] = Some(line.embargo.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The versions of `line`'s changes reachable from `roots` and not
+    /// behind its merges' first parents.
+    fn versions_in(&self, local: &Repo, line: &FixLine, roots: &[ObjectId]) -> Result<HashSet<ObjectId>> {
+        let mut versions = HashSet::new();
+        for y in local.graph().range(local, roots, &line.base)? {
+            if local.snapshot_opt(&y)?.is_some_and(|s| line.changes.contains(&s.change_id)) {
+                versions.insert(y);
+            }
+        }
+        Ok(versions)
+    }
+
+    /// The versions of embargo `embargo`'s withheld changes visible from
+    /// `roots`: every snapshot this rule withholds there descends from one.
+    pub(crate) fn versions_from(&self, local: &Repo, embargo: &str, roots: &[ObjectId]) -> Result<Vec<ObjectId>> {
+        let mut out = Vec::new();
+        for line in self.lines.iter().filter(|l| l.embargo == embargo) {
+            out.extend(self.versions_in(local, line, roots)?);
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+}
+
+/// What unreleased embargoes withhold in `local`'s current view: the one
+/// source of the withholding rule ([`Withheld`]).
+pub fn embargo_withheld(local: &Repo) -> Result<Withheld> {
+    Withheld::of(local)
+}
+
+/// The reason a push may not send `id`, which embargo `e` withholds.
+fn withheld_reason(id: &ObjectId, e: &str) -> String {
+    format!(
+        "{} holds history unreleased embargo {e} withholds (the fix, its merge, or work built on them); it is pushed when the embargo is released",
+        id.short()
+    )
 }
 
 /// For each of `targets` (tags another route, such as the Veil server's
@@ -511,41 +664,68 @@ pub fn embargo_blocks(local: &Repo, targets: &[ObjectId]) -> Result<Vec<Option<S
     if withheld.is_empty() {
         return Ok(vec![None; targets.len()]);
     }
-    targets
-        .iter()
-        .map(|t| Ok(push_closure(local.store(), &[*t], &withheld)?.err()))
-        .collect()
+    Ok(withheld.blocking(local, targets)?.into_iter().zip(targets).map(|(e, t)| e.map(|e| withheld_reason(t, &e))).collect())
+}
+
+/// The unreleased embargoes that no visible snapshot carries any more:
+/// withdrawn by the member (the embargoed merge undone, or abandoned with
+/// nothing built on it). Nothing holds their fix back (BUG-1017).
+pub fn withdrawn_embargoes(local: &Repo) -> Result<Vec<String>> {
+    let mut carried = HashSet::new();
+    for id in local.visible_embargoed()? {
+        carried.extend(local.snapshot(&id)?.embargo.clone());
+    }
+    let mut out: Vec<String> = local
+        .keys()
+        .embargoes()?
+        .into_iter()
+        .filter(|r| !local.keys().embargo_released(&r.id) && !carried.contains(&r.id))
+        .map(|r| r.id)
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
+/// Warnings for a push of `targets`: history a withdrawn embargo used to
+/// hold back that the push publishes (its merges are found among every
+/// snapshot this device has indexed).
+pub fn withdrawn_warnings(local: &Repo, targets: &[ObjectId]) -> Result<Vec<String>> {
+    let withdrawn = withdrawn_embargoes(local)?;
+    if withdrawn.is_empty() || targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let flagged = local.graph().entries_matching(local, local.view().refs(), |_, e| e.flags & crate::graph_index::FLAG_EMBARGO != 0)?;
+    let mut merges = Vec::new();
+    for id in flagged {
+        if local.snapshot_opt(&id)?.is_some_and(|s| s.embargo.as_ref().is_some_and(|e| withdrawn.contains(e))) {
+            merges.push(id);
+        }
+    }
+    let used = Withheld::of_merges(local, &merges, true)?;
+    let mut hit: Vec<String> = used.blocking(local, targets)?.into_iter().flatten().collect();
+    hit.sort();
+    hit.dedup();
+    Ok(hit
+        .into_iter()
+        .map(|e| format!("embargo {e} was withdrawn (its embargoed merge was undone or abandoned), and this push publishes the fix it used to hold back"))
+        .collect())
 }
 
 /// For a snapshot no push may send yet (an unreleased embargo withholds
-/// it, or it builds on withheld history): the nearest snapshot down its
-/// first parents that a push does send, whose files are already
-/// published. `None` for a snapshot a push sends. What the snapshot holds
-/// beyond that one is under the embargo (`vl ls`'s tier `embargoed`).
+/// it): the nearest snapshot down its first parents that a push does send,
+/// whose files are already published. `None` for a snapshot a push sends.
+/// What the snapshot holds beyond that one is under the embargo (`vl ls`'s
+/// tier `embargoed`).
 pub fn embargo_base(local: &Repo, id: &ObjectId) -> Result<Option<ObjectId>> {
     let withheld = embargo_withheld(local)?;
-    if withheld.is_empty() {
-        return Ok(None);
-    }
-    // A snapshot builds on withheld history exactly when one of the lowest
-    // withheld snapshots (none of whose parents is withheld) is it or an
-    // ancestor of it: one bounded query of the graph index per first parent
-    // walked, never a walk of the whole history (`push_closure`).
-    let mut lowest = HashSet::new();
-    for w in withheld.keys() {
-        if !local.snapshot_opt(w)?.is_some_and(|s| s.parents.iter().any(|p| withheld.contains_key(p))) {
-            lowest.insert(*w);
-        }
-    }
-    let blocked = |x: &ObjectId| -> Result<bool> { Ok(lowest.contains(x) || !local.graph().reachable_among(local, [*x], &lowest)?.is_empty()) };
-    if !blocked(id)? {
+    if withheld.is_empty() || withheld.of_snapshot(local, id)?.is_none() {
         return Ok(None);
     }
     let mut x = *id;
     loop {
         let Some(s) = local.snapshot_opt(&x)? else { return Ok(Some(local.root_id())) };
         let Some(p) = s.parents.first().copied() else { return Ok(Some(local.root_id())) };
-        if !blocked(&p)? {
+        if withheld.of_snapshot(local, &p)?.is_none() {
             return Ok(Some(p));
         }
         x = p;
@@ -553,13 +733,14 @@ pub fn embargo_base(local: &Repo, id: &ObjectId) -> Result<Option<ObjectId>> {
 }
 
 /// The snapshots to send for `tips`: every ancestor. Fails with a reason
-/// if the tips reach history an unreleased embargo withholds (the
-/// embargoed merge, its fix, or anything built on them).
-pub(crate) fn push_closure(
-    store: &ObjectStore,
-    tips: &[ObjectId],
-    withheld: &HashMap<ObjectId, String>,
-) -> Result<Result<Vec<ObjectId>, String>> {
+/// if a tip holds history an unreleased embargo withholds.
+pub(crate) fn push_closure(local: &Repo, tips: &[ObjectId], withheld: &Withheld) -> Result<Result<Vec<ObjectId>, String>> {
+    for (t, e) in tips.iter().zip(withheld.blocking(local, tips)?) {
+        if let Some(e) = e {
+            return Ok(Err(withheld_reason(t, &e)));
+        }
+    }
+    let store = local.store();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     let mut stack: Vec<ObjectId> = tips.to_vec();
@@ -567,29 +748,12 @@ pub(crate) fn push_closure(
         if !seen.insert(id) {
             continue;
         }
-        if let Some(e) = withheld.get(&id) {
-            return Ok(Err(format!(
-                "{} is part of the history merged under unreleased embargo {e}; it is pushed when the embargo is released",
-                id.short()
-            )));
-        }
         let s = match store.snapshot(&id) {
             Ok(s) => s,
             Err(VeilError::Missing(_)) => continue,
             Err(e) => return Err(e),
         };
-        for p in &s.parents {
-            match withheld.get(p) {
-                None => stack.push(*p),
-                Some(e) => {
-                    return Ok(Err(format!(
-                        "snapshot {} builds on {}, which is withheld by unreleased embargo {e}; release the embargo first",
-                        id.short(),
-                        p.short()
-                    )))
-                }
-            }
-        }
+        stack.extend(s.parents.iter().copied());
         out.push(id);
     }
     Ok(Ok(out))
@@ -856,8 +1020,9 @@ pub fn push(
     let (sendable, withheld) = sendable_tags(local, only_tags, &mut report)?;
     let selected = accepted_tags(local, sendable, &tx.view.tags, force, &mut report)?;
     let tips: Vec<ObjectId> = selected.iter().map(|(_, t)| t.target).collect();
-    let ids = push_closure(local.store(), &tips, &withheld)?
+    let ids = push_closure(local, &tips, &withheld)?
         .map_err(|why| VeilError::repo(format!("push: {why}")))?;
+    report.warnings.extend(withdrawn_warnings(local, &tips)?);
     {
         let dst = tx.repo().store().clone();
         let mut xfer = Transfer {
@@ -906,7 +1071,7 @@ fn sendable_tags(
     local: &Repo,
     only_tags: &[String],
     report: &mut SyncReport,
-) -> Result<(Vec<(String, Tag)>, HashMap<ObjectId, String>)> {
+) -> Result<(Vec<(String, Tag)>, Withheld)> {
     let mut selected: Vec<(String, Tag)> = Vec::new();
     for (name, tag) in &local.view().tags {
         if !only_tags.is_empty() && !only_tags.contains(name) {
@@ -927,10 +1092,11 @@ fn sendable_tags(
     // so does any tag that would publish it by another route.
     let withheld = embargo_withheld(local)?;
     let mut sendable = Vec::new();
-    for (name, tag) in selected {
-        match push_closure(local.store(), &[tag.target], &withheld)? {
-            Ok(_) => sendable.push((name, tag)),
-            Err(why) => report.tags_skipped.push((name, why)),
+    let targets: Vec<ObjectId> = selected.iter().map(|(_, t)| t.target).collect();
+    for ((name, tag), e) in selected.into_iter().zip(withheld.blocking(local, &targets)?) {
+        match e {
+            None => sendable.push((name, tag)),
+            Some(e) => report.tags_skipped.push((name, withheld_reason(&tag.target, &e))),
         }
     }
     Ok((sendable, withheld))

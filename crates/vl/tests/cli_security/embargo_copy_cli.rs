@@ -308,7 +308,6 @@ fn diff_and_show_json_never_call_a_file_under_an_unreleased_embargo_public() {
 /// the fix (and the follow-up on `main`, now a plain merge holding it) are
 /// no longer withheld, and the next push publishes them.
 #[test]
-#[ignore = "BUG-1015: squashing the embargoed merge into the fix publishes the fix"]
 fn squashing_the_embargoed_merge_into_the_fix_publishes_nothing() {
     for follow_up in [false, true] {
         let env = Env::new();
@@ -336,7 +335,6 @@ fn squashing_the_embargoed_merge_into_the_fix_publishes_nothing() {
 /// withheld ids): either way the next push publishes the fix while its
 /// embargo is pending.
 #[test]
-#[ignore = "BUG-1016: an earlier version of a withheld change is not withheld"]
 fn an_earlier_version_of_the_fix_is_withheld_too() {
     for route in ["undo", "restore"] {
         let env = Env::new();
@@ -373,11 +371,127 @@ fn an_earlier_version_of_the_fix_is_withheld_too() {
 /// then publishes the fix says nothing, so the record tells the member the
 /// fix is still withheld.
 #[test]
-#[ignore = "BUG-1017: a withdrawn embargo is still listed as pending"]
 fn a_withdrawn_embargo_is_not_listed_as_pending() {
     let env = Env::new();
     let (r, _) = embargoed(&env);
     r.ok(&["undo"]);
     let list = r.ok(&["embargo", "list"]);
     assert!(!list.contains("manual release") || list.contains("withdrawn"), "nothing withholds the fix, yet: {list}");
+}
+
+// ---- the withholding rule, randomized -----------------------------------------
+
+/// Found by the randomized test below (another seed): abandoning the fix
+/// rebases the embargoed merge down to one parent, which forgot the fix
+/// line; `vl undo --op` of an earlier abandon then brought back work built
+/// on the old fix, and nothing withheld it. The fix line includes every
+/// earlier version of the merge (`predecessors`), so it stays withheld.
+#[test]
+fn work_on_an_abandoned_fix_brought_back_by_undo_stays_withheld() {
+    let env = Env::new();
+    let (r, v1) = embargoed(&env);
+    with_child(&r, &v1);
+    r.ok(&["abandon", "fixchild"]);
+    let abandon = r.op_head();
+    r.ok(&["abandon", "fix"]);
+    r.ok(&["undo", "--op", &abandon]);
+    assert!(r.tag_target("fixchild").is_some(), "control: the work on the old fix is back");
+    assert!(!r.ok(&["embargo", "list"]).contains("withdrawn"));
+    publishes_nothing(&env, &r);
+}
+
+/// A pinned pseudo-random sequence (xorshift64*): the same cases every run.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn pick<'a>(&mut self, xs: &'a [String]) -> &'a str {
+        &xs[(self.next() % xs.len() as u64) as usize]
+    }
+}
+
+/// The withholding rule (`remote::Withheld`, by change), randomized: random
+/// sequences of the rewrite commands (squash, rebase, describe, undo,
+/// restore, tag set, new, split, abandon, duplicate) over an embargoed
+/// history, on any revision (current names and every snapshot id seen so
+/// far, earlier versions included). After each command a push to a public
+/// remote publishes nothing of the fix, unless the member withdrew the
+/// embargo (its merge undone or abandoned bare): then `vl embargo list`
+/// says so, and the push that publishes it warns.
+#[test]
+fn random_rewrites_never_push_what_an_unreleased_embargo_withholds() {
+    const CASES: usize = 8;
+    const STEPS: usize = 24;
+    let markers = ["FIXNAME-K7", "FIX2-K7", "FIXBODY-K7", "FIXDESC-K7", "CHILDDESC-K7"];
+    let mut rng = Rng(0x5eed_1015_1016_1017);
+    let mut withdrawn_cases = 0;
+    for case in 0..CASES {
+        let env = Env::new();
+        let (r, v1) = embargoed(&env);
+        with_child(&r, &v1);
+        other(&r, &v1);
+        let mirror = env.dir("mirror");
+        env.run(U, &mirror, &["init", "--bare"]);
+        r.ok(&["remote", "add", "pub", mirror.to_str().unwrap(), "--public"]);
+        let mut revs: Vec<String> = ["fix", "main", "main-", "fixchild", "other", "@", "@-", v1.as_str()].iter().map(|s| s.to_string()).collect();
+        for n in ["fix", "main", "fixchild"] {
+            revs.push(r.sid(n)[..16].to_string());
+        }
+        let mut ops: Vec<String> = vec![r.op_head()];
+        let mut log = Vec::new();
+        for step in 0..STEPS {
+            let a = rng.pick(&revs).to_string();
+            let b = rng.pick(&revs).to_string();
+            let n = rng.next();
+            let args: Vec<String> = match n % 10 {
+                0 if n % 3 == 0 => vec!["squash".into(), "-r".into(), a],
+                0 => vec!["squash".into(), "-r".into(), a, "--into".into(), b],
+                1 if n % 3 == 0 => vec!["rebase".into(), "-s".into(), a, "-d".into(), b],
+                1 if n % 3 == 1 => vec!["rebase".into(), "-r".into(), a, "-d".into(), b.clone(), "-d".into(), rng.pick(&revs).to_string()],
+                1 => vec!["rebase".into(), "-r".into(), a, "-d".into(), b],
+                2 => vec!["describe".into(), "-r".into(), a, "-m".into(), format!("reworded {step}")],
+                3 if n % 2 == 0 => vec!["undo".into()],
+                3 => vec!["undo".into(), "--op".into(), rng.pick(&ops).to_string()],
+                4 => vec!["restore".into(), "--from".into(), a],
+                5 => vec!["tag".into(), "set".into(), ["fix", "main", "rel"][(n / 10 % 3) as usize].into(), "-r".into(), a],
+                6 if n % 2 == 0 => vec!["new".into(), a, b],
+                6 => vec!["new".into(), a],
+                7 => vec!["split".into(), "-r".into(), a, ["FIXNAME-K7.c", "a.c", "child.c"][(n / 10 % 3) as usize].into()],
+                8 => vec!["abandon".into(), a],
+                _ => vec!["duplicate".into(), a, "-d".into(), b],
+            };
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = r.run(&argv);
+            assert!(exited_cleanly(&out), "case {case}, {argv:?} crashed:\n{}", text(&out));
+            log.push(format!("{argv:?} -> {}", if out.status.success() { "ok" } else { "refused" }));
+            ops.push(r.op_head());
+            for rev in ["fix", "main", "@", "@-", "fixchild"] {
+                if let Some(s) = r.try_snap(rev) {
+                    let id = s.id[..16].to_string();
+                    if !revs.contains(&id) {
+                        revs.push(id);
+                    }
+                }
+            }
+            let push = text(&r.run(&["push", "pub"]));
+            let leaked: Vec<&str> = markers.iter().copied().filter(|m| !store_contains(&mirror, m.as_bytes()).is_empty()).collect();
+            if !leaked.is_empty() {
+                let list = r.ok(&["embargo", "list"]);
+                assert!(
+                    list.contains("withdrawn") && push.contains("withdrawn"),
+                    "case {case}: {leaked:?} reached the public remote while the embargo is not withdrawn:\n{}\nembargo list: {list}\npush: {push}",
+                    log.join("\n")
+                );
+                withdrawn_cases += 1;
+                break;
+            }
+        }
+    }
+    println!("{withdrawn_cases} of {CASES} cases ended with the embargo withdrawn");
 }

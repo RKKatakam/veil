@@ -439,7 +439,6 @@ fn an_unreleased_embargo_never_reaches_the_server() {
 /// next `vl push` uploads the fix and every member who can read the project
 /// gets it before the release.
 #[test]
-#[ignore = "BUG-1015: squashing the embargoed merge into the fix publishes the fix"]
 fn squashing_the_embargoed_merge_into_the_fix_never_reaches_the_server() {
     const FIX: &str = "EMBARGOED-FIX-MARKER-5582";
     let hub = TestHub::start();

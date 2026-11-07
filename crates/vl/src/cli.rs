@@ -834,7 +834,9 @@ pub enum TagCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum EmbargoCmd {
-    /// List embargoes.
+    /// List embargoes: pending (with their deadline), released, or
+    /// withdrawn (the embargoed merge was undone or abandoned, so nothing
+    /// holds the fix back any more).
     List,
     /// Release an embargo: show what becomes public, ask, and release it in
     /// this repository. The next push publishes the release and the

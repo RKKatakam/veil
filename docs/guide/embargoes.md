@@ -163,14 +163,19 @@ Nothing is recorded when this happens. Your options:
   fix's own parent), `vl duplicate` and `vl cherry-pick`, `vl rebase`
   of work built on the fix onto another line, and `vl abandon` of the fix
   while work is built on it.
-* **What the embargo withholds stays withheld.** Until the release, a
-  command after which something the embargo withheld is still there but no
-  longer withheld is refused ("release the embargo first, or abandon what
-  is built on the merge too"): `vl abandon` of the merge, or `vl squash` of
-  it into the change on top of it, while a change built on it survives
-  (that change holds the fix); `vl rebase` of the merge onto other parents
-  (the fix first, the fix alone, or without the fix), which would stop it
-  covering the fix line. A concurrent operation that does it (another
+* **What the embargo withholds stays withheld.** The embargo withholds
+  every version of every change on the fix line (the fix, how it was made,
+  and the merge), whatever its snapshot id: an earlier version brought back
+  by `vl undo --op`, `vl tag set -r`, `vl new` or `vl restore --from` is
+  withheld too, and so is everything built on any of them. A rewrite never
+  makes the fix line forget a change: dropping the fix from the merge's
+  parents keeps it withheld. Until the release, a command after which a
+  version the embargo withheld is still there but no longer withheld is
+  refused ("release the embargo first, or abandon what is built on the
+  merge too"): `vl abandon` of the merge, or `vl squash` of it into the
+  change on top of it or into the fix, while a change built on it survives;
+  `vl rebase` of the merge onto other parents (the fix first, the fix
+  alone, or without the fix). A concurrent operation that does it (another
   workspace) is dropped when the operations merge.
   Inside the embargo they all work: restore from the fix into a change on
   the fix line, squash work on the fix into it, rebase or split the fix
@@ -183,10 +188,12 @@ Nothing is recorded when this happens. Your options:
 * **One embargo per line** (above).
 * **A pushed release is final.** Only an unpushed release can be undone
   (above).
-* **Undoing the merge undoes the embargo.** If the embargoed merge is
+* **Undoing the merge withdraws the embargo.** If the embargoed merge is
   undone, or abandoned with nothing built on it, before a push, the fix
   line is an ordinary change again, pushed as soon as a tag reaches it.
-  (Work built on the merge keeps it in history, so its fix stays withheld.)
+  `vl embargo list` then shows the embargo as `withdrawn`, and the push
+  that publishes what it used to hold back warns. (Work built on the merge
+  keeps it in history, so its fix stays withheld.)
 
 Who sees what is described in [VISIBILITY.md](../VISIBILITY.md), "Hidden changes".
 

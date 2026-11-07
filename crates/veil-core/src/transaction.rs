@@ -624,22 +624,22 @@ impl<'r> Transaction<'r> {
         Ok(())
     }
 
-    /// BUG-942/943/990: what an unreleased embargo withholds stays
-    /// withheld. After the transaction's rewrites, every snapshot that a
-    /// view it started from withheld (`remote::embargo_withheld`: the
-    /// embargoed merge and the fix behind its other parents) and that is
-    /// still visible must still be withheld, unless its embargo was
-    /// released or withdrawn. Otherwise the next push would send it before
-    /// the release: a squash of the merge into its follow-up, an abandon
-    /// that rebases the follow-up onto the merge's parents, a rebase of the
-    /// merge onto other parents (which keeps its `embargo` field but no
-    /// longer covers the fix), ...
+    /// BUG-942/943/990/1015/1016: what an unreleased embargo withholds
+    /// stays withheld. The rule is by change (`remote::Withheld`): every
+    /// version of a change of the fix line, and everything descending from
+    /// one. After any transaction, no visible snapshot that the rule of the
+    /// view it started from withheld may be left unwithheld, unless its
+    /// embargo was released or withdrawn: a squash of the merge into its
+    /// follow-up or into the fix, an abandon that rebases the follow-up
+    /// onto the merge's parents, a rebase of the merge onto other parents
+    /// (which keeps its `embargo` field but no longer covers the fix), ...
     ///
     /// An embargo is withdrawn, as undoing the merge withdraws it, when no
-    /// visible snapshot carries it any more and nothing that was built on
-    /// one of its merges survives the rewrites. A transaction without
-    /// rewrites never breaks the invariant otherwise: what a visible
-    /// embargoed merge withholds depends on its parents only.
+    /// visible snapshot carries it any more and the transaction replaced
+    /// nothing it withheld (only dropped it: the bare merge abandoned, or a
+    /// view restored by `vl undo`). The rule depends only on the visible
+    /// embargoed merges: a transaction that leaves them as they were cannot
+    /// break it, and is not checked further.
     fn check_withheld(&mut self) -> Result<()> {
         let before = vec![self.repo.view.clone()];
         match self.withheld_violations(&before)?.into_iter().next() {
@@ -651,81 +651,105 @@ impl<'r> Transaction<'r> {
         }
     }
 
-    /// [`Transaction::check_withheld`]'s findings: `(a snapshot no longer
-    /// withheld, the embargo that withheld it)`, sorted.
-    fn withheld_violations(&mut self, before: &[View]) -> Result<Vec<(ObjectId, String)>> {
-        let mut was: HashMap<ObjectId, String> = HashMap::new();
-        for v in before {
-            let mut v = v.clone();
-            std::mem::swap(&mut self.repo.view, &mut v);
-            let res = crate::remote::embargo_withheld(self.repo);
-            std::mem::swap(&mut self.repo.view, &mut v);
-            for (id, e) in res? {
-                was.entry(id).or_insert(e);
-            }
-        }
-        if was.is_empty() {
-            return Ok(Vec::new());
-        }
-        std::mem::swap(&mut self.repo.view, &mut self.view);
-        let res = (|repo: &Repo| -> Result<(HashSet<ObjectId>, HashSet<String>)> {
-            let now = crate::remote::embargo_withheld(repo)?;
-            let lost: HashSet<ObjectId> = was.keys().filter(|id| !now.contains_key(*id)).copied().collect();
-            if lost.is_empty() {
-                return Ok((lost, HashSet::new()));
-            }
-            let visible = repo.visible_among(&lost)?;
-            let mut carried = HashSet::new();
-            for id in repo.visible_embargoed()? {
-                carried.extend(repo.snapshot(&id)?.embargo.clone());
-            }
-            Ok((visible, carried))
-        })(self.repo);
-        std::mem::swap(&mut self.repo.view, &mut self.view);
-        let (lost, carried) = res?;
+    /// The visible unreleased embargoed merges of view `v`, sorted.
+    fn embargoed_merges_in(&mut self, v: &View) -> Result<Vec<ObjectId>> {
+        let mut v = v.clone();
+        std::mem::swap(&mut self.repo.view, &mut v);
+        let res = self.repo.visible_embargoed();
+        std::mem::swap(&mut self.repo.view, &mut v);
         let mut out = Vec::new();
-        let mut withdrawn: HashMap<String, bool> = HashMap::new();
-        for x in lost {
-            let e = &was[&x];
-            if self.repo.keys().embargo_released(e) {
-                continue;
-            }
-            let gone = match withdrawn.get(e) {
-                Some(w) => *w,
-                None => {
-                    let w = !carried.contains(e) && !self.survives_on_merge_of(e, &was)?;
-                    withdrawn.insert(e.clone(), w);
-                    w
-                }
-            };
-            if !gone {
-                out.push((x, e.clone()));
+        for id in res? {
+            if self.repo.snapshot(&id)?.embargo.as_deref().is_some_and(|e| !self.repo.keys().embargo_released(e)) {
+                out.push(id);
             }
         }
         out.sort();
         Ok(out)
     }
 
-    /// Does a change built on one of embargo `e`'s merges (among the
-    /// withheld snapshots `was`) survive this transaction's rewrites?
-    fn survives_on_merge_of(&self, e: &str, was: &HashMap<ObjectId, String>) -> Result<bool> {
-        let mut merges = Vec::new();
-        for (id, we) in was {
-            if we == e && self.repo.snapshot(id)?.embargo.as_deref() == Some(e) {
-                merges.push(*id);
-            }
+    /// [`Transaction::check_withheld`]'s findings: `(a version of a
+    /// withheld change, visible and no longer withheld, its embargo)`,
+    /// sorted.
+    fn withheld_violations(&mut self, before: &[View]) -> Result<Vec<(ObjectId, String)>> {
+        // Nothing withheld before: nothing to lose (and the view it ends
+        // with is not read: most transactions stop here).
+        let mut before_merges = Vec::new();
+        for v in before {
+            before_merges.push(self.embargoed_merges_in(v)?);
         }
-        for d in self.rewritten.keys() {
-            if merges.contains(d) || self.resolve(*d).1 {
-                continue;
-            }
-            for m in &merges {
-                if self.repo.is_ancestor(m, d)? {
-                    return Ok(true);
+        if before_merges.iter().all(|m| m.is_empty()) {
+            return Ok(Vec::new());
+        }
+        let after_view = self.view.clone();
+        let after_merges = self.embargoed_merges_in(&after_view)?;
+        if before_merges.iter().all(|m| *m == after_merges) {
+            return Ok(Vec::new());
+        }
+        let mut was = crate::remote::Withheld::default();
+        // What each view the transaction started from withheld, and which
+        // of its rewritten snapshots were withheld there.
+        let olds: Vec<ObjectId> = self.rewritten.keys().copied().collect();
+        let mut replaced: HashSet<String> = HashSet::new();
+        for v in before {
+            let mut v = v.clone();
+            std::mem::swap(&mut self.repo.view, &mut v);
+            let res = (|repo: &Repo| -> Result<(crate::remote::Withheld, Vec<Option<String>>)> {
+                let w = crate::remote::embargo_withheld(repo)?;
+                let of = if w.is_empty() { vec![None; olds.len()] } else { w.blocking(repo, &olds)? };
+                Ok((w, of))
+            })(self.repo);
+            std::mem::swap(&mut self.repo.view, &mut v);
+            let (w, of) = res?;
+            for (old, e) in olds.iter().zip(of) {
+                if let Some(e) = e {
+                    if !self.resolve(*old).1 {
+                        replaced.insert(e);
+                    }
                 }
             }
+            was.extend(w);
         }
-        Ok(false)
+        if was.is_empty() {
+            return Ok(Vec::new());
+        }
+        // ...against what the view it ends with withholds: every version
+        // of a withheld change visible now must still be withheld (all
+        // that descends from one then is too).
+        std::mem::swap(&mut self.repo.view, &mut self.view);
+        let res = (|repo: &Repo| -> Result<(Vec<(ObjectId, String)>, HashSet<String>)> {
+            let now = crate::remote::embargo_withheld(repo)?;
+            let refs = repo.view.refs();
+            let mut lost = Vec::new();
+            for e in was.embargoes() {
+                let versions = was.versions_from(repo, &e, &refs)?;
+                for (y, w) in versions.iter().zip(now.blocking(repo, &versions)?) {
+                    if w.is_none() {
+                        lost.push((*y, e.clone()));
+                    }
+                }
+            }
+            let mut carried = HashSet::new();
+            for id in repo.visible_embargoed()? {
+                carried.extend(repo.snapshot(&id)?.embargo.clone());
+            }
+            Ok((lost, carried))
+        })(self.repo);
+        std::mem::swap(&mut self.repo.view, &mut self.view);
+        let (lost, carried) = res?;
+        let mut out = Vec::new();
+        for (y, e) in lost {
+            if self.repo.keys().embargo_released(&e) {
+                continue;
+            }
+            // Withdrawn: nothing carries it, and nothing it withheld was
+            // replaced (only dropped).
+            if !carried.contains(&e) && !replaced.contains(&e) {
+                continue;
+            }
+            out.push((y, e));
+        }
+        out.sort();
+        Ok(out)
     }
 
     /// BUG-681: no rewrite moves a change confined to an unreleased embargo
@@ -1079,10 +1103,18 @@ impl<'r> Transaction<'r> {
     pub fn commit(mut self) -> Result<Option<ObjectId>> {
         if self.merge.is_some() {
             self.merge_rebase()?;
-        } else if !self.rewritten.is_empty() {
-            self.rebase_descendants()?;
-            self.check_withheld()?;
-            self.check_confinement()?;
+        } else {
+            if !self.rewritten.is_empty() {
+                self.rebase_descendants()?;
+            }
+            // Any change of the view, rewrites or not (`vl undo`, a tag
+            // moved): the withholding rule follows the visible merges.
+            if self.view != self.repo.view {
+                self.check_withheld()?;
+            }
+            if !self.rewritten.is_empty() {
+                self.check_confinement()?;
+            }
         }
         if self.staging {
             // A long transaction freshens everything it references (gc's
