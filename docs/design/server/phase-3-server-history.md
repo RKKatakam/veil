@@ -408,3 +408,17 @@ Admins have a graph too (view key `admin`, of real history), so every viewer run
 | 11 | rows a function of projected objects, written parents first, `ON CONFLICT DO NOTHING` | `query_concurrent_extensions_agree` (six extenders per view key at once write what one writes); `query_graph_matches_direct_walks` (ancestry, merge bases and log order against brute force, 700-snapshot histories with long runs, merges every way and skewed timestamps) |
 | 13 | a new policy gives new view keys, whose graphs are built from their own projections | `query_follows_policy_changes` |
 | 3, 12 | ranking: S15; narrowed sessions: phase 2 | — |
+
+**Speed** (`query_speed`, PostgreSQL 17, through `bench-quiet.sh`; 20,000 snapshots, 500 files, 1–4 changed a snapshot, a merge every 50, a hot file changed every 10th snapshot, two branches whose merge base is the 11th snapshot; anyone on Earth cannot see two fifths of the files; 20 rounds after a warm-up). Release build, load 8.3 before and 45.6 after; debug build in brackets, load 16.0 before and 8.3 after:
+
+| Query | Target (p99) | admin p50 / p99 | anyone on Earth p50 / p99 | rows read (admin / anyone) |
+|---|---|---|---|---|
+| `log -n 50` | 20 ms | 0.9 / 1.1 ms (3.3 / 6.0) | 1.8 / 3.8 ms (4.6 / 8.9) | 103 / 123 |
+| `log -n 50 -- PATH` (hot file) | 50 ms | 7.0 / 8.5 ms (44 / 55) | 10.5 / 13.9 ms (47 / 83) | 3,967 / 2,945 |
+| merge bases 20,000 apart | 5 ms | 1.0 / 1.7 ms (5.8 / 11.7) | 1.8 / 2.8 ms (6.0 / 6.1) | 12,390 / 12,425 |
+| `is_ancestor(root, tip)` | 5 ms | 0.04 / 0.06 ms | 0.08 / 1.4 ms | 26 / 22 |
+| `diff` against the merge base, 100 files | 50 ms | 5.2 / 6.2 ms (21 / 29) | 7.0 / 9.9 ms (21 / 23) | 225 / 225 |
+| `file` | 10 ms | 0.5 / 0.6 ms | 1.1 / 6.1 ms | 6 / 6 |
+| `tree` | 10 ms | 0.6 / 0.9 ms | 1.2 / 3.0 ms | 5 / 5 |
+
+S12's paint-down took 707 ms (debug) for the same merge bases. The merge-base walk still visits every merge on the line (here 400 of them, a few rows each); a line without merges costs tens of rows. Filling a view key's graph for the whole 20,000-snapshot history took 4.3 s for the admins and 80 s for anyone on Earth, almost all of it S1's projection of every snapshot for that key (what `tips` pays today); after that, a landing costs a few rows per new snapshot and view key.
