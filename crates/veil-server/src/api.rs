@@ -69,6 +69,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/q/file", get(crate::query::file_route))
         .route("/v1/projects/{p}/q/diff", get(crate::query::diff_route))
         .route("/v1/projects/{p}/q/ancestry", post(crate::query::ancestry_route))
+        .route("/v1/cache/epochs", post(crate::cache::feed::epochs))
         .layer(DefaultBodyLimit::max(crate::db::body_limit("")))
         .layer(axum::middleware::from_fn(crate::db::retry_requests))
         .with_state(hub)

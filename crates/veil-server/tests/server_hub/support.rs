@@ -413,6 +413,16 @@ impl Api {
         self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json").send(body).unwrap()
     }
 
+    /// GET with extra headers, leaving the answer's body unread (a client
+    /// that stalls).
+    pub fn get_unread(&self, path: &str, headers: &[(&str, &str)]) -> ureq::http::Response<ureq::Body> {
+        let mut r = self.agent.get(format!("{}{path}", self.base));
+        for (k, v) in headers {
+            r = r.header(*k, *v);
+        }
+        r.call().unwrap()
+    }
+
     /// POST JSON as a `vl` that reads encoded frames (compressed objects).
     pub fn post_json_encoded(&self, token: Option<&str>, path: &str, v: &serde_json::Value) -> (Reply, Option<String>) {
         let mut r = self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json").header("accept", encoding::FRAMES);
