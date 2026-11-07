@@ -30,6 +30,7 @@ use crate::{
     object::Snapshot,
     oplog::{Operation, RawHeads, View},
     repo::Repo,
+    vpath::VPath,
 };
 
 /// How old a transaction may get before it freshens, at commit, every
@@ -101,7 +102,16 @@ pub struct Transaction<'r> {
     pub(crate) check_carried: bool,
     merge: Option<MergeCtx>,
     done: bool,
+    /// The staging directory, kept after the objects' publication for the
+    /// staged operation ([`STAGED_OP`]); removed when it is published, or
+    /// when the transaction ends without publishing it.
+    kept_dir: Option<VPath>,
 }
+
+/// Names of the operation's bytes and of its (empty) head file in a
+/// transaction's staging directory (format 6).
+const STAGED_OP: &str = "operation";
+const STAGED_HEAD: &str = "head";
 
 impl<'r> Transaction<'r> {
     pub(crate) fn new(repo: &'r mut Repo, description: String, lock: Option<RepoLock>) -> Result<Self> {
@@ -160,6 +170,7 @@ impl<'r> Transaction<'r> {
             check_carried: false,
             merge: None,
             done: false,
+            kept_dir: None,
         })
     }
 
@@ -982,6 +993,40 @@ impl<'r> Transaction<'r> {
         }
     }
 
+    /// The operation this transaction records (its view and rewrites as
+    /// they are now).
+    fn operation(&self) -> Operation {
+        let format6 = self.repo.format() >= crate::oplog::OP_HEADS_REPO_FORMAT;
+        let mut parents = self.base.clone();
+        parents.sort();
+        let mut rewritten = BTreeMap::new();
+        if format6 {
+            for (old, r) in &self.rewritten {
+                let new = match r {
+                    Rewrite::Replaced(n) => vec![*n],
+                    Rewrite::Abandoned(_) => Vec::new(),
+                };
+                rewritten.insert(*old, new);
+            }
+        }
+        let (timestamp, user) = match &self.merge {
+            Some(m) => (m.timestamp, "veil".to_string()),
+            None => (now_millis(), self.repo.user.clone()),
+        };
+        Operation {
+            parents,
+            timestamp,
+            user,
+            description: self.description.clone(),
+            view: self.view.clone(),
+            manual_undo: self.manual_undo.clone(),
+            undo_of: self.undo_of,
+            redo_of: self.redo_of,
+            workspace: self.workspace.clone().filter(|_| format6),
+            rewritten,
+        }
+    }
+
     /// Finish the transaction. Returns the new operation id, or `None` if
     /// nothing changed.
     pub fn commit(mut self) -> Result<Option<ObjectId>> {
@@ -991,6 +1036,11 @@ impl<'r> Transaction<'r> {
             self.rebase_descendants()?;
             self.check_confinement()?;
         }
+        let record = self.view != self.start_view || self.record_always;
+        // The operation (format 6), when one is recorded: its bytes and its
+        // empty head file are staged with the objects, so that the objects'
+        // barrier makes them durable too (`OpStore::publish_staged`).
+        let mut staged = None;
         if self.staging {
             // A long transaction freshens everything it references (gc's
             // grace period); one that gc deleted objects under checks what
@@ -999,17 +1049,30 @@ impl<'r> Transaction<'r> {
             if long || self.check_carried {
                 self.freshen_references(long)?;
             }
+            if record {
+                let op = self.operation();
+                let (id, raw) = self.repo.ops.encode(&op)?;
+                let op_file = self.repo.store.stage_tx_file(STAGED_OP, &raw)?;
+                let head = self.repo.store.stage_tx_file(STAGED_HEAD, b"")?;
+                staged = Some((id, op, op_file, head));
+            }
             // Durability barrier, then publication: every object this
             // transaction wrote is on stable storage, under its final name,
-            // before the operation that references it is written.
+            // before the operation that references it is named.
             self.done = true;
-            self.repo.store.publish_tx_staging()?;
+            self.kept_dir = match record {
+                true => self.repo.store.publish_tx_staging_keeping_dir()?,
+                false => {
+                    self.repo.store.publish_tx_staging()?;
+                    None
+                }
+            };
         } else {
             // Durability barrier: every object this transaction wrote is on
             // stable storage before the operation that references it.
             self.repo.store.sync_barrier()?;
         }
-        if self.view == self.start_view && !self.record_always {
+        if !record {
             return Ok(None);
         }
         let lock_free = self.lock.is_none() && self.merge.is_none();
@@ -1032,40 +1095,23 @@ impl<'r> Transaction<'r> {
                 ));
             }
         }
-        let format6 = self.repo.format() >= crate::oplog::OP_HEADS_REPO_FORMAT;
-        let mut parents = self.base.clone();
-        parents.sort();
-        let mut rewritten = BTreeMap::new();
-        if format6 {
-            for (old, r) in &self.rewritten {
-                let new = match r {
-                    Rewrite::Replaced(n) => vec![*n],
-                    Rewrite::Abandoned(_) => Vec::new(),
-                };
-                rewritten.insert(*old, new);
-            }
-        }
-        let (timestamp, user) = match &self.merge {
-            Some(m) => (m.timestamp, "veil".to_string()),
-            None => (now_millis(), self.repo.user.clone()),
-        };
-        let op = Operation {
-            parents,
-            timestamp,
-            user,
-            description: self.description.clone(),
-            view: self.view.clone(),
-            manual_undo: self.manual_undo.clone(),
-            undo_of: self.undo_of,
-            redo_of: self.redo_of,
-            workspace: self.workspace.clone().filter(|_| format6),
-            rewritten,
-        };
         if let Some(lock) = &self.lock {
             // Fencing: never move the head unless we still hold the lock.
             lock.ensure_held()?;
         }
-        let id = self.repo.ops.publish(&op, &self.stale)?;
+        let id = match staged {
+            Some((id, op, op_file, head)) => {
+                self.repo.ops.publish_staged(&id, &op, &op_file, &head, &self.stale)?;
+                id
+            }
+            None => {
+                let op = self.operation();
+                self.repo.ops.publish(&op, &self.stale)?
+            }
+        };
+        if let Some(dir) = self.kept_dir.take() {
+            self.repo.store.drop_tx_dir(&dir);
+        }
         drop(publishing);
         self.repo.op_id = id;
         self.repo.base = vec![id];
@@ -1116,6 +1162,11 @@ impl Drop for Transaction<'_> {
         if self.staging {
             if !self.done {
                 let _ = self.repo.store.publish_tx_staging();
+            }
+            // An operation staged but not published (superseded, or a
+            // barrier failed): nothing names it.
+            if let Some(dir) = self.kept_dir.take() {
+                self.repo.store.drop_tx_dir(&dir);
             }
             self.reg.take();
             return;

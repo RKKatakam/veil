@@ -268,10 +268,12 @@ read the shape, not the last digit.
 - **One project's `main`** still saturates at about 20 landings/s with 50
   agents (collisions, 28–31 per landing at a target of 40/s), as in round
   2: phase 4's batched landing is the fix.
-- **BUG-861:** in a first MinIO run, 1,239 uploads at 100 projects failed
-  with HTTP 500; the server's log of the second run shows why: S3 requests
-  on connections MinIO had reset, which the server does not retry. The
-  run above had no errors.
+- **BUG-861 (fixed, server bench fixes):** in a first MinIO run, 1,239
+  uploads at 100 projects failed with HTTP 500; the server's log of the
+  second run shows why: S3 requests on connections MinIO had reset, which
+  the server did not try again. It now tries each S3 request again, for up
+  to 10 s with waits doubling to 1 s, when its connection closes or
+  resets or the store answers 5xx.
 
 Raw results (not committed): `.scratch/bench-results/server-load-bfa691a-20261106T202331Z-*` (MinIO, with the server logs) and `…T202730Z-*` (local objects).
 

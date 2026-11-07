@@ -485,3 +485,52 @@ fn checkout_never_overwrites_a_quarantined_edit() {
     assert!(fs.exists(&p("config.js")).unwrap());
     assert!(!fs.exists(&p("other.txt")).unwrap());
 }
+
+/// A large working copy on a disk is listed, stat'ed and classified ahead
+/// of the walk, on other threads (`prefetch`, from 250 cached files): the
+/// snapshot it makes is exactly the one a full read makes, whatever the
+/// directory holds (ignored and nested directories, crash debris, a link
+/// to a directory, an executable, edits, deletions, new directories).
+#[test]
+fn a_snapshot_listed_ahead_records_what_a_full_read_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut repo, fs) = repo_with(veil_core::DiskBackend::new(tmp.path()));
+    fs.write(&p(".veilpolicy"), b"build/ ignore\n").unwrap();
+    for d in 0..40 {
+        for f in 0..10 {
+            fs.write(&p(&format!("d{d:02}/sub{}/f{f}.txt", d % 3)), format!("{d} {f}\n").as_bytes()).unwrap();
+        }
+    }
+    fs.write(&p("build/out.o"), b"ignored\n").unwrap();
+    fs.write(&p("vendored/.veil/repo.json"), b"{}\n").unwrap();
+    fs.write(&p("vendored/lib.rs"), b"another repository's\n").unwrap();
+    fs.write(&p("d01/.f1.txt.vltmp0badf00d"), b"crash debris\n").unwrap();
+    std::os::unix::fs::symlink("d02", tmp.path().join("link")).unwrap();
+    fs.write(&p("d03/run.sh"), b"#!/bin/sh\n").unwrap();
+    fs.set_executable(&p("d03/run.sh"), true).unwrap();
+    // Older than the racy window: the next runs' cache vouches for them.
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let mut cache = StatCache::new();
+    snap(&mut repo, &*fs, &mut cache);
+    let r = snap(&mut repo, &*fs, &mut cache);
+    assert!(cache.len() >= 400 && r.cache_hits >= 400, "{} records, {} hits", cache.len(), r.cache_hits);
+    // Edits, a deletion, a new file in a new directory, a removed directory.
+    fs.write(&p("d05/sub2/f3.txt"), b"edited\n").unwrap();
+    fs.remove_file(&p("d06/sub0/f4.txt")).unwrap();
+    fs.write(&p("new/dir/file.txt"), b"new\n").unwrap();
+    std::fs::remove_dir_all(tmp.path().join("d07")).unwrap();
+    let ahead = repo.snapshot_workspace_cached(WS, &*fs, Some(&mut cache)).unwrap();
+    assert!(ahead.changed);
+    let tree = wc_tree(&repo);
+    assert_eq!(entry(&repo, &tree, "d05/sub2/f3.txt").map(|e| e.size), Some(7));
+    assert!(entry(&repo, &tree, "d06/sub0/f4.txt").is_none() && entry(&repo, &tree, "d07").is_none());
+    assert!(entry(&repo, &tree, "new/dir/file.txt").is_some() && entry(&repo, &tree, "d03/run.sh").unwrap().executable);
+    assert!(entry(&repo, &tree, "build").is_none() && entry(&repo, &tree, "vendored").is_none());
+    assert!(entry(&repo, &tree, "d01/.f1.txt.vltmp0badf00d").is_none());
+    // A full read, nothing from any cache: nothing to record.
+    let full = repo.snapshot_workspace_cached(WS, &*fs, Some(&mut StatCache::new())).unwrap();
+    assert!(!full.changed, "the full read found something the listing ahead missed");
+    assert_eq!(wc_tree(&repo), tree);
+    let r = (&ahead.report, &full.report);
+    assert_eq!((r.0.files, r.0.ignored, &r.0.nested, &r.0.ignored_paths), (r.1.files, r.1.ignored, &r.1.nested, &r.1.ignored_paths));
+}
