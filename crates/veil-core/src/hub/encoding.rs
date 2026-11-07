@@ -267,6 +267,42 @@ mod tests {
         }
     }
 
+    /// BUG-1008 (S27 adversarial pass). A frame whose header declares a
+    /// window far past its content (2^31 here: allowed by the format, never
+    /// written by `encode`) decodes with libzstd's one-shot decoder, which
+    /// the server and native `vl` use for objects up to 64 MiB and which
+    /// does not check the window. The pure decoder of the WASM web client
+    /// refuses any window above 2^27 (`pack::pure::MAX_WINDOW`). The server
+    /// stores a participant's encoded upload as sent, under an id the
+    /// project may already hold in folders the participant can't write,
+    /// and serves it as stored: `decode` must refuse what the slowest
+    /// reader refuses, so every reader decodes what the server accepts.
+    #[test]
+    #[ignore = "BUG-1008: a frame with a window past 2^27 passes decode but the WASM decoder refuses it"]
+    fn bug_1008_a_frame_every_decoder_reads_or_none() {
+        let raw = blob(b"a file any participant knows: a licence, a vendored library");
+        let id = ObjectId::hash(&raw);
+        // Magic; descriptor: 4-byte content size, not single-segment, no
+        // checksum, no dictionary; window descriptor: 2^(10 + exponent);
+        // the size; one last raw block holding `raw`.
+        let frame = |exponent: u8| {
+            let mut enc = vec![ZSTD, 0x28, 0xb5, 0x2f, 0xfd, 0x80, exponent << 3];
+            enc.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            enc.extend_from_slice(&(((raw.len() as u32) << 3) | 1).to_le_bytes()[..3]);
+            enc.extend_from_slice(&raw);
+            enc
+        };
+        // A 128 MiB window: both decoders read it.
+        assert_eq!(&*decode(&id, &frame(17), 1 << 20).unwrap(), &raw[..]);
+        #[cfg(feature = "ruzstd")]
+        assert!(crate::pack::pure::decompress(&frame(17)[1..], raw.len() as u64, None).is_ok());
+        // A 2 GiB window: the WASM decoder refuses it.
+        let enc = frame(21);
+        #[cfg(feature = "ruzstd")]
+        assert!(crate::pack::pure::decompress(&enc[1..], raw.len() as u64, None).is_err(), "the WASM decoder refuses it");
+        assert!(decode(&id, &enc, 1 << 20).is_err(), "decode accepted a frame the WASM decoder refuses");
+    }
+
     #[test]
     fn plain_frames_are_encoded_frames() {
         let objs = [blob(b"one"), blob(&b"two ".repeat(400)), b"veil:blob\n".to_vec()];
