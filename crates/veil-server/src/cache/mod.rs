@@ -516,13 +516,27 @@ impl Cache {
     /// and on to `tx`; one gone or damaged since the check is left out (the
     /// client asks again). `false` if the client went away.
     async fn locals(self: &Arc<Self>, project: &str, plan: &[(ObjectId, Option<u64>)], out: &mut Vec<u8>, tx: &Tx) -> bool {
-        for (id, size) in plan {
-            let Some(size) = size else { continue };
-            let Ok(permit) = self.budget.acquire_many(self.kib(*size)).await else { return false };
-            let (c, q, i) = (self.clone(), project.to_string(), *id);
-            if let Ok(Some(raw)) = tokio::task::spawn_blocking(move || read_local(&c, &q, &i)).await {
-                put_frame(out, id, &raw);
-                self.stats.local.fetch_add(1, Relaxed);
+        let wanted: Vec<(ObjectId, u64)> = plan.iter().filter_map(|(id, size)| Some((*id, (*size)?))).collect();
+        // Read in groups of up to 64 objects and about 1 MiB, each on one
+        // blocking thread under one share of the budget.
+        let mut rest = &wanted[..];
+        while !rest.is_empty() {
+            let (mut n, mut bytes) = (0, 0u64);
+            while n < rest.len() && n < 64 && (n == 0 || bytes + rest[n].1 <= 1 << 20) {
+                bytes += rest[n].1;
+                n += 1;
+            }
+            let (group, next) = rest.split_at(n);
+            rest = next;
+            let Ok(permit) = self.budget.acquire_many(self.kib(bytes)).await else { return false };
+            let (c, q, ids) = (self.clone(), project.to_string(), group.iter().map(|g| g.0).collect::<Vec<_>>());
+            let read = tokio::task::spawn_blocking(move || ids.iter().map(|id| (*id, read_local(&c, &q, id))).collect::<Vec<_>>()).await;
+            for (id, raw) in read.unwrap_or_default() {
+                // One gone or damaged since the check is left out.
+                if let Some(raw) = raw {
+                    put_frame(out, &id, &raw);
+                    self.stats.local.fetch_add(1, Relaxed);
+                }
             }
             drop(permit);
             if out.len() >= CHUNK && tx.send(Ok(Bytes::from(std::mem::take(out)))).await.is_err() {
