@@ -888,12 +888,13 @@ impl Repo {
         let revert = self.parent_view(&op)?;
         let link = OpLink::UndoOf(command);
         let target = Restore::Revert { base: op.view.clone(), revert };
-        // The edits to keep are those recorded since the last command, as
-        // for `vl op restore`: not the difference since the undone
-        // operation, which holds another change's whole content once the
-        // working copy moved to it (`vl edit`, `vl new`; BUG-1041).
-        let before_edits = self.ops.get(&self.last_command_op(ws)?)?.view;
-        let id = self.restore_view_keeping_edits(ws, target, &before_edits, format!("undo: {}", op.description), link)?;
+        // The edits to keep: those recorded since the undone operation
+        // while the working copy is still the change it was there, else
+        // those since the last command (BUG-1041: once the working copy
+        // moved to another change, `vl edit`, `vl new`, the difference
+        // since the undone operation is that change's whole content).
+        let last = self.ops.get(&self.last_command_op(ws)?)?.view;
+        let id = self.restore_view_keeping_edits(ws, target, &[op.view.clone(), last], format!("undo: {}", op.description), link)?;
         self.finish_undo_release(release)?;
         Ok((id, op.description))
     }
@@ -928,9 +929,9 @@ impl Repo {
             base: undo_op.view.clone(),
             revert,
         };
-        // Edits since the last command only (see the undo above, BUG-1041).
-        let before_edits = self.ops.get(&self.last_command_op(ws)?)?.view;
-        let id = self.restore_view_keeping_edits(ws, target, &before_edits, format!("redo: {}", op.description), OpLink::RedoOf(undo))?;
+        // The edits to keep, as for an undo (BUG-1041).
+        let last = self.ops.get(&self.last_command_op(ws)?)?.view;
+        let id = self.restore_view_keeping_edits(ws, target, &[undo_op.view.clone(), last], format!("redo: {}", op.description), OpLink::RedoOf(undo))?;
         Ok((id, op.description))
     }
 
@@ -1025,7 +1026,7 @@ impl Repo {
         let command = self.last_command_op(ws)?;
         let before_edits = self.ops.get(&command)?.view;
         let view = self.ops.get(&op)?.view;
-        self.restore_view_keeping_edits(ws, Restore::Exact(view), &before_edits, format!("restore to operation {}", op.short()), OpLink::None)
+        self.restore_view_keeping_edits(ws, Restore::Exact(view), &[before_edits], format!("restore to operation {}", op.short()), OpLink::None)
     }
 
     /// The operations recorded after `op` (that it does not reach) for a
@@ -1108,8 +1109,10 @@ impl Repo {
 
     /// Install `target` (inside the transaction, from its base view, so an
     /// operation that landed meanwhile is never reverted by accident), then
-    /// carry the edits of each workspace recorded since `before_edits` (the
-    /// view of the last command: its working copy there vs. now) over to the working copy the result
+    /// carry the edits of each workspace recorded since the first of
+    /// `before_edits` whose working copy for it is the change it is now
+    /// (its working copy there vs. now; none if there is no such view: the
+    /// working copy moved to another change, whose content is not an edit) over to the working copy the result
     /// gives it. `ws`, the attached workspace, comes first; the others
     /// matter once undo walks back past a switch, whose new workspace may
     /// have recorded edits in the range it skips.
@@ -1117,7 +1120,7 @@ impl Repo {
     /// An undo or redo that would remove a workspace holding such edits is
     /// refused (nothing changes): they could not be carried anywhere.
     /// `vl op restore` goes to the exact state the user picked.
-    fn restore_view_keeping_edits(&mut self, ws: &str, target: Restore, before_edits: &View, description: String, link: OpLink) -> Result<ObjectId> {
+    fn restore_view_keeping_edits(&mut self, ws: &str, target: Restore, before_edits: &[View], description: String, link: OpLink) -> Result<ObjectId> {
         let mut tx = self.transaction(description.clone())?;
         let current = tx.view.clone();
         let (mut view, revert_heads) = match target {
@@ -1134,9 +1137,18 @@ impl Repo {
         names.sort_by_key(|n| n.as_str() != ws);
         let mut edits = Vec::new();
         for name in names {
-            let (Some(base), Some(now)) = (wc_of(before_edits, name), wc_of(&current, name)) else {
-                continue;
-            };
+            let Some(now) = wc_of(&current, name) else { continue };
+            let change = tx.repo().snapshot(&now)?.change_id;
+            let mut base = None;
+            for v in before_edits {
+                if let Some(b) = wc_of(v, name) {
+                    if tx.repo().snapshot(&b)?.change_id == change {
+                        base = Some(b);
+                        break;
+                    }
+                }
+            }
+            let Some(base) = base else { continue };
             if base == now || tx.repo().snapshot(&base)?.tree == tx.repo().snapshot(&now)?.tree {
                 continue;
             }

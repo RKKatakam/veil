@@ -931,9 +931,17 @@ impl<'r> Transaction<'r> {
                     }
                 }
                 if merges.is_empty() {
-                    // No rewrite of its merge to drop: that of what was
-                    // withheld, or of what it followed.
-                    merges.push(x);
+                    // No rewrite of its merge to drop: the rewrite that
+                    // made `x` (a final no longer withheld, BUG-1040), or
+                    // that of what was withheld, or of what it followed.
+                    let mut made: Vec<ObjectId> = Vec::new();
+                    for (old, r) in &union {
+                        if matches!(r, Rewrite::Replaced(_)) && self.resolve(*old).0.contains(&x) {
+                            made.push(*old);
+                        }
+                    }
+                    made.sort();
+                    merges = if made.is_empty() { vec![x] } else { made };
                 }
                 for m in merges {
                     if !bad.iter().any(|(o, _)| *o == m) {
