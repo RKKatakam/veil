@@ -89,6 +89,7 @@ The owner adopted the four synthetic workloads published by OpenScion, an indepe
     - the computer's own tools (`/usr`, `/bin`, `/lib`, toolchains) are visible **read-only and live**;
     - the sandbox appears **at the project's real path**, starting in the same sub-folder, so directories and absolute paths behave as in the real project, while every write goes to the sandbox;
     - `HOME` and `/tmp` are private; `~/.ssh`, personal keys and other projects are hidden;
+    - toolchains and the agent's own configuration (`~/.cargo`, `~/.claude`) are writable through a layer of the workspace's own, so downloads and sessions persist for that workspace, and the real folders are never changed;
     - the agent sees only its own processes;
     - **CPU, memory, process and time limits** apply.
   - **Network:** on by default, because agents need their model's API; `--no-network` for runs that shouldn't call out.
