@@ -11,20 +11,21 @@
 //!   epoch), the device's signature of the request, then each object's
 //!   chain from the grant's root, and only then read the object. "Not
 //!   reachable" and "not there" get the same answer. Every object is read
-//!   through one function (`read`, over [`crate::store::Objects::get`]) and
-//!   served on its own, after its own check: wherever the store keeps it (a
-//!   pack, later: S28), nothing else is ever handed out with it. A batch is
-//!   streamed with bounded memory, as `sync::fetch` is.
-//! * **Access epochs.** Every change that can take access away bumps an
-//!   epoch in its own transaction (database triggers,
-//!   `migrations/0007_access_epochs.sql`). The server refuses a grant older
-//!   than its project's or person's newest epoch on the next request;
-//!   `GET /v1/epochs?since=N` lists the changes for caches.
+//!   through [`crate::store::Objects`] only (`read`, and `Range` reads),
+//!   and served on its own, after its own check: wherever the store keeps it
+//!   (a pack, later: S28), nothing else is ever handed out with it. A batch
+//!   is streamed with bounded memory, as `sync::fetch` is.
+//! * **Access epochs.** Every change that can take access away gives its
+//!   project or person a new epoch, a random value, in its own transaction
+//!   (database triggers, `migrations/0007_access_epochs.sql`). The server
+//!   refuses a grant whose epochs are not the current ones on the next
+//!   request; `GET /v1/epochs` gives a signed-in caller the current epochs
+//!   of their person and of the projects they can see, for caches.
 //!
-//! **Order matters when a grant is made:** the clock is read *before* the
-//! caller's view is loaded. An access change committed after that read has
-//! a higher epoch and voids the grant; one committed before it is in the
-//! view.
+//! **Order matters when a grant is made:** the epochs are read *before*
+//! the caller's view is loaded. An access change committed after that read
+//! gives a new epoch and voids the grant; one committed before it is in
+//! the view.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -39,7 +40,7 @@ use serde::Deserialize;
 use veil_core::{
     cache::LruCache,
     hub::{
-        grant::{request_signed, BatchRequest, ChainSource, Chains, EpochChange, Epochs, Grant, GrantBody, GRANT_TTL_MS},
+        grant::{request_signed, BatchRequest, ChainSource, Chains, Epochs, Grant, GrantBody, GRANT_TTL_MS},
         project::{Node, Projector, TreeSource},
         wire::{put_frame, MAX_WANTS},
     },
@@ -56,8 +57,8 @@ use crate::{
     Hub, HubState,
 };
 
-/// Most changes one epoch-feed answer lists.
-pub const FEED_LIMIT: i64 = 10_000;
+/// Most projects one epoch-feed request names.
+pub const FEED_PROJECTS: usize = 1000;
 
 /// The server's grant key, and the projected roots whose trees it stored.
 pub struct Grants {
@@ -98,15 +99,14 @@ impl Grants {
     }
 }
 
-/// The access-epoch clock: every epoch committed so far is at most this.
-pub async fn clock(db: &sqlx::PgPool) -> Result<i64> {
-    Ok(sqlx::query_scalar("SELECT n FROM access_epoch_clock WHERE id = 1").fetch_optional(db).await?.unwrap_or(0))
-}
-
-/// The newest epoch of `project` and of `person`.
-pub async fn newest_epoch(db: &sqlx::PgPool, project: i64, person: Option<i64>) -> Result<i64> {
-    Ok(sqlx::query_scalar(
-        "SELECT COALESCE(MAX(epoch), 0) FROM access_epochs WHERE (project_id = $1 AND person_id = 0) OR (project_id = 0 AND person_id = $2)",
+/// The current access epochs of the project named `project` and of
+/// `person` (0 where there is none): what a grant is made with, read
+/// before the caller's view.
+pub async fn epochs_by_name(db: &sqlx::PgPool, project: &str, person: Option<i64>) -> Result<(i64, i64)> {
+    Ok(sqlx::query_as(
+        "SELECT COALESCE(MAX(epoch) FILTER (WHERE person_id = 0), 0), COALESCE(MAX(epoch) FILTER (WHERE project_id = 0), 0) \
+         FROM access_epochs WHERE (project_id = (SELECT id FROM projects WHERE name = $1) AND person_id = 0) \
+         OR (project_id = 0 AND person_id = $2)",
     )
     .bind(project)
     .bind(person.unwrap_or(-1))
@@ -114,30 +114,50 @@ pub async fn newest_epoch(db: &sqlx::PgPool, project: i64, person: Option<i64>) 
     .await?)
 }
 
-/// Grants for `tips` (branch → projected snapshot), made with the epoch
-/// `epoch` read before `viewer` was loaded. A branch whose projected root
-/// cannot be stored gets none (the server logs it; S1's fetch still works).
+/// The current access epochs of `project` and of `person` (0 where there
+/// is none): one indexed query.
+pub async fn current_epochs(db: &sqlx::PgPool, project: i64, person: Option<i64>) -> Result<(i64, i64)> {
+    Ok(sqlx::query_as(
+        "SELECT COALESCE(MAX(epoch) FILTER (WHERE person_id = 0), 0), COALESCE(MAX(epoch) FILTER (WHERE project_id = 0), 0) \
+         FROM access_epochs WHERE (project_id = $1 AND person_id = 0) OR (project_id = 0 AND person_id = $2)",
+    )
+    .bind(project)
+    .bind(person.unwrap_or(-1))
+    .fetch_one(db)
+    .await?)
+}
+
+/// Grants for `tips` (branch → projected snapshot), made with the epochs
+/// read before `viewer` was loaded. A branch whose projected root cannot be
+/// stored (the store failing, BUG-1083) gets none: the server logs it, and
+/// the tips, S1's fetch and every pull still work.
 pub async fn for_tips(
     hub: &Arc<Hub>,
     project: &Project,
     viewer: &Viewer,
     caller: &Caller,
-    epoch: i64,
+    (epoch, person_epoch): (i64, i64),
     tips: &BTreeMap<String, ObjectId>,
 ) -> Result<BTreeMap<String, String>> {
-    let view = project.view(viewer).key();
     let expires = veil_core::now_millis() + GRANT_TTL_MS;
     let mut out = BTreeMap::new();
     for (branch, snap) in tips {
-        let Some(root) = grant_root(hub, project, viewer, *snap).await? else { continue };
+        let root = match grant_root(hub, project, viewer, *snap).await {
+            Ok(Some(root)) => root,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("veil-server: no grant for a branch of project {}: {e:?}", project.id);
+                continue;
+            }
+        };
         let body = GrantBody {
             project: project.name.clone(),
             project_id: project.id,
             person: caller.person.as_ref().map(|p| p.id),
             device: caller.person.as_ref().map(|p| p.device_key.clone()),
-            view: view.clone(),
             root,
             epoch,
+            person_epoch,
             expires,
         };
         out.insert(branch.clone(), hub.grants.issue(&body));
@@ -196,10 +216,10 @@ impl ChainSource for Source {
         }
     }
 
-    fn conflict_terms(&self, id: &ObjectId) -> veil_core::Result<Option<Vec<ObjectId>>> {
+    fn conflict_terms(&self, id: &ObjectId) -> veil_core::Result<Option<Vec<(ObjectId, u64)>>> {
         match self.raw(id) {
             Ok(raw) => Ok(match Object::decode(&raw)? {
-                Object::Conflict(c) => Some(c.referenced_ids()),
+                Object::Conflict(c) => Some(c.interleaved().flatten().map(|t| (t.id, t.size)).collect()),
                 _ => None,
             }),
             Err(VeilError::Missing(_)) => Ok(None),
@@ -230,11 +250,11 @@ fn not_reached() -> Error {
 async fn check(hub: &Hub, project: &str, token: &str, ts: i64, signature: Option<&str>, ids: &[ObjectId]) -> Result<Grant> {
     let g = Grant::verify(token, hub.grants.key_hex()).ok_or_else(grant_invalid)?;
     let now = veil_core::now_millis();
-    if !g.usable(project, now, 0) || !request_signed(&g, ts, ids, signature, now) {
+    if !g.usable(project, now, g.body.epoch, g.body.person_epoch) || !request_signed(&g, ts, ids, signature, now) {
         return Err(grant_invalid());
     }
-    let newest = newest_epoch(&hub.db, g.body.project_id, g.body.person).await?;
-    if !g.usable(project, now, newest) {
+    let (epoch, person_epoch) = current_epochs(&hub.db, g.body.project_id, g.body.person).await?;
+    if !g.usable(project, now, epoch, person_epoch) {
         return Err(grant_invalid());
     }
     Ok(g)
@@ -266,11 +286,14 @@ async fn read(hub: &Hub, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
     Ok(hub.objects.get(project, id).await?)
 }
 
-/// Most objects, and about the most bytes (by the sizes their entries
-/// record), read ahead of the one a batch sends next: its memory is
-/// bounded, as `sync::fetch`'s is (BUG-860).
+/// Most objects, and about the most bytes, read ahead of the one a batch
+/// sends next: its memory is bounded, as `sync::fetch`'s is (BUG-860). An
+/// object counts the size its entry or conflict term records; one that
+/// records none (a tree, an empty file) counts [`UNSIZED`] until it is read,
+/// and then what it is.
 const WINDOW: usize = 64;
 const WINDOW_BYTES: u64 = 8 << 20;
+const UNSIZED: u64 = 1 << 20;
 
 /// Checked objects `items`, read a window ahead and sent as frames in
 /// order; one that is not there is left out. A failure ends the stream
@@ -281,17 +304,23 @@ fn stream(hub: Arc<Hub>, project: i64, items: Vec<(ObjectId, u64)>) -> sync::Fra
         let mut set = tokio::task::JoinSet::new();
         let mut ready: std::collections::HashMap<usize, Option<Bytes>> = std::collections::HashMap::new();
         let (mut next, mut sent, mut ahead) = (0usize, 0usize, 0u64);
+        // What each object read counts against the window: its recorded
+        // size, or UNSIZED, then its real size once read.
+        let mut cost: Vec<u64> = items.iter().map(|(_, size)| if *size == 0 { UNSIZED } else { *size }).collect();
         let mut out = Vec::new();
         while sent < items.len() {
-            while next < items.len() && next - sent < WINDOW && (next == sent || ahead + items[next].1 <= WINDOW_BYTES) {
+            while next < items.len() && next - sent < WINDOW && (next == sent || ahead + cost[next] <= WINDOW_BYTES) {
                 let (hub, id, i) = (hub.clone(), items[next].0, next);
                 set.spawn(async move { (i, read(&hub, project, &id).await) });
-                ahead += items[next].1;
+                ahead += cost[next];
                 next += 1;
             }
             while !ready.contains_key(&sent) {
                 match set.join_next().await {
                     Some(Ok((i, Ok(raw)))) => {
+                        let real = raw.as_ref().map_or(0, |r| r.len() as u64);
+                        ahead = ahead - cost[i] + real;
+                        cost[i] = real;
                         ready.insert(i, raw);
                     }
                     other => {
@@ -304,7 +333,7 @@ fn stream(hub: Arc<Hub>, project: i64, items: Vec<(ObjectId, u64)>) -> sync::Fra
             if let Some(raw) = ready.remove(&sent).flatten() {
                 put_frame(&mut out, &items[sent].0, &raw);
             }
-            ahead -= items[sent].1;
+            ahead -= cost[sent];
             sent += 1;
             if out.len() >= 1 << 20 && tx.send(Ok(Bytes::from(std::mem::take(&mut out)))).await.is_err() {
                 return;
@@ -344,18 +373,21 @@ fn parse_signature(h: &HeaderMap) -> Result<(i64, Option<String>)> {
     }
 }
 
-/// A single `bytes=START-[END]` range within `len` bytes.
-fn parse_range(h: &HeaderMap, len: usize) -> Option<std::result::Result<(usize, usize), ()>> {
+/// A single `bytes=START-[END]` range (`END` absent: to the end); `None`
+/// for no range, or one this server does not take (it then sends the whole
+/// object, as HTTP allows).
+fn parse_range(h: &HeaderMap) -> Option<(u64, u64)> {
     let r = header(h, "range")?.strip_prefix("bytes=")?;
     let (a, b) = r.split_once('-')?;
-    let start: usize = a.trim().parse().ok()?;
-    let end: usize = if b.trim().is_empty() { len.saturating_sub(1) } else { b.trim().parse::<usize>().ok()?.min(len.saturating_sub(1)) };
-    Some(if start >= len || end < start { Err(()) } else { Ok((start, end)) })
+    let start: u64 = a.trim().parse().ok()?;
+    let end: u64 = if b.trim().is_empty() { u64::MAX } else { b.trim().parse().ok()? };
+    (end >= start).then_some((start, end))
 }
 
 /// `GET /v1/objects/{p}/{id}`: one object, under the grant of `Veil-Grant`
 /// at the end of `Veil-Chain`, the request signed in `Veil-Signature`;
-/// `Range` supported (a dropped download resumes).
+/// `Range` supported (a dropped download resumes), reading only the bytes
+/// asked for.
 pub async fn get_object(State(hub): State<HubState>, Path((p, id)): Path<(String, String)>, headers: HeaderMap) -> Result<Response> {
     let token = header(&headers, "veil-grant").ok_or_else(grant_invalid)?;
     let id = ObjectId::from_hex(&id).map_err(|_| Error::bad_request("an object id is 64 hex digits"))?;
@@ -365,18 +397,21 @@ pub async fn get_object(State(hub): State<HubState>, Path((p, id)): Path<(String
     if reached(&hub, &grant, vec![(chain, id)]).await?.is_empty() {
         return Err(not_reached());
     }
-    let raw = read(&hub, grant.body.project_id, &id).await?.ok_or_else(not_reached)?;
-    let octets = [(header::CONTENT_TYPE, "application/octet-stream".to_string())];
-    match parse_range(&headers, raw.len()) {
-        None => Ok((octets, raw).into_response()),
-        Some(Ok((a, b))) => Ok((
-            StatusCode::PARTIAL_CONTENT,
-            [octets[0].clone(), (header::CONTENT_RANGE, format!("bytes {a}-{b}/{}", raw.len()))],
-            raw.slice(a..=b),
-        )
-            .into_response()),
-        Some(Err(())) => Ok((StatusCode::RANGE_NOT_SATISFIABLE, [(header::CONTENT_RANGE, format!("bytes */{}", raw.len()))]).into_response()),
+    let project = grant.body.project_id;
+    let octets = (header::CONTENT_TYPE, "application/octet-stream".to_string());
+    let Some((start, end)) = parse_range(&headers) else {
+        let raw = read(&hub, project, &id).await?.ok_or_else(not_reached)?;
+        return Ok(([octets], raw).into_response());
+    };
+    let (part, len) = match sync::builtin(&id) {
+        Some(b) => (crate::store::slice(&b, start, end), b.len() as u64),
+        None => hub.objects.get_range(project, &id, start, end).await?.ok_or_else(not_reached)?,
+    };
+    if start >= len {
+        return Ok((StatusCode::RANGE_NOT_SATISFIABLE, [(header::CONTENT_RANGE, format!("bytes */{len}"))]).into_response());
     }
+    let last = start + part.len() as u64 - 1;
+    Ok((StatusCode::PARTIAL_CONTENT, [octets, (header::CONTENT_RANGE, format!("bytes {start}-{last}/{len}"))], part).into_response())
 }
 
 /// `POST /v1/objects/{p}:batch`: the objects of the request its grant
@@ -398,35 +433,29 @@ pub async fn batch(State(hub): State<HubState>, Path(target): Path<String>, body
 }
 
 #[derive(Deserialize)]
-pub struct Since {
+pub struct EpochsQuery {
+    /// Project names, separated by commas.
     #[serde(default)]
-    since: i64,
+    projects: String,
 }
 
-/// `GET /v1/epochs?since=N`: access changes with an epoch above `N`, oldest
-/// first, and `now`, the epoch to ask from next. Numeric ids only: no name,
-/// path or content. Every epoch up to `now` is listed (they commit in
-/// order); a key changed again since shows only its newest epoch.
-pub async fn epochs(State(hub): State<HubState>, Query(q): Query<Since>) -> Result<Json<Epochs>> {
-    let now = clock(&hub.db).await?;
-    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
-        "SELECT project_id, person_id, epoch FROM access_epochs WHERE epoch > $1 AND epoch <= $2 ORDER BY epoch LIMIT $3",
-    )
-    .bind(q.since)
-    .bind(now)
-    .bind(FEED_LIMIT)
-    .fetch_all(&hub.db)
-    .await?;
-    let now = if rows.len() as i64 == FEED_LIMIT { rows.last().map_or(now, |r| r.2) } else { now };
-    Ok(Json(Epochs {
-        now,
-        changes: rows
-            .into_iter()
-            .map(|(project, person, epoch)| EpochChange {
-                project: (project != 0).then_some(project),
-                person: (person != 0).then_some(person),
-                epoch,
-            })
-            .collect(),
-    }))
+/// `GET /v1/epochs?projects=a,b` (signed in, BUG-1081): the caller's own
+/// person epoch, and the current epoch of each named project the caller
+/// can see; a project they cannot see, or that does not exist, is left out
+/// alike. What the Veil daemon polls (S6); regional caches (S9) will
+/// authenticate as the server's own. Every key asked for is answered with
+/// its current epoch: nothing is paged, so no change is passed over
+/// (BUG-1082).
+pub async fn epochs(State(hub): State<HubState>, caller: Caller, Query(q): Query<EpochsQuery>) -> Result<Json<Epochs>> {
+    let me = caller.signed_in()?.id;
+    let names: Vec<&str> = q.projects.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
+    if names.len() > FEED_PROJECTS {
+        return Err(Error::bad_request(format!("at most {FEED_PROJECTS} projects per request")));
+    }
+    let mut out = Epochs { person: current_epochs(&hub.db, 0, Some(me)).await?.1, ..Default::default() };
+    for name in names {
+        let Ok((project, _)) = crate::perm::open(&hub.db, name, &caller).await else { continue };
+        out.projects.insert(project.name, current_epochs(&hub.db, project.id, None).await?.0);
+    }
+    Ok(Json(out))
 }

@@ -205,7 +205,9 @@ impl<'a> View<'a> {
     }
 
     /// A key that is equal for two viewers exactly when they read the same
-    /// paths: projections are cached under it.
+    /// paths: projections are cached under it. Server-side only: it hashes
+    /// every rule's path, hidden ones included, so a client holding it could
+    /// confirm guesses of hidden folder names (BUG-1080).
     pub fn key(&self) -> String {
         if self.admin {
             return "admin".into();

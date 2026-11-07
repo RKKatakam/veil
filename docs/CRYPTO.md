@@ -500,7 +500,7 @@ are distinct and pins their exact bytes.
 | `SIG_CONTEXT_HUB_INVITE` | `hub-invite` | Ed25519 context (a join under an invite, by the invite's key, over `person ‖ 0 ‖ X25519 ‖ Ed25519` of the joining device, HUB.md §13.12) | C5, C13 |
 | `SIG_CONTEXT_HUB_GRANT` | `hub-grant` | Ed25519 context (a server's read grant, by its grant key, over the grant's JSON body as sent, HUB.md §13.13) | C5 |
 | `SIG_CONTEXT_HUB_REQUEST` | `hub-request` | Ed25519 context (a device's request under a read grant, over grant hash ‖ time ‖ BLAKE3 of the ids, HUB.md §13.13) | C5 |
-| `HUB_VIEW_KEY` | `veil 2026 hub view-key v1` | BLAKE3 `derive_key` mode as a hash | server: projection cache key (not secret) |
+| `HUB_VIEW_KEY` | `veil 2026 hub view-key v1` | BLAKE3 `derive_key` mode as a hash | server: projection cache key. Never sent to a client: it hashes every access line's path, hidden ones included, so a client holding it could confirm guesses of hidden folder names (BUG-1080) |
 | `HUB_DEVICE_FINGERPRINT` | `veil 2026 hub device-fingerprint v1` | BLAKE3 `derive_key` mode as a hash (first 80 bits) | device fingerprint compared out of band (HUB.md §13.11) |
 | `HUB_UPLOAD_RECEIPT` | `veil 2026 hub upload-receipt v1` | BLAKE3 `derive_key` → keyed BLAKE3 (first 128 bits) | server: upload receipts over project ‖ person ‖ object id (HUB.md §13.5) |
 | `HUB_INVITE_KEY` | `veil 2026 hub invite-key v1` | BLAKE3 `derive_key` → Ed25519 seed | C13: an invite's signing key, from the link's 32 random bytes |

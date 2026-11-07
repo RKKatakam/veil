@@ -543,11 +543,11 @@ async fn create_project(State(hub): State<HubState>, caller: Caller, Path(name):
 }
 
 async fn tips(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Json<Tips>> {
-    // The epoch before the view (`grant`): a later access change voids the grants.
-    let epoch = crate::grant::clock(&hub.db).await?;
+    // The epochs before the view (`grant`): a later access change voids the grants.
+    let epochs = crate::grant::epochs_by_name(&hub.db, &p, caller.person.as_ref().map(|p| p.id)).await?;
     let (project, viewer) = perm::open(&hub.db, &p, &caller).await?;
     let branches = sync::tips(&hub, &project, &viewer).await?.into_iter().collect();
-    let grants = crate::grant::for_tips(&hub, &project, &viewer, &caller, epoch, &branches).await?;
+    let grants = crate::grant::for_tips(&hub, &project, &viewer, &caller, epochs, &branches).await?;
     Ok(Json(Tips {
         grants,
         grant_key: Some(hub.grants.key_hex().to_string()),

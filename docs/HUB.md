@@ -1512,9 +1512,13 @@ grants are **signed**.
   key** (`<data>/hub-grant-key`, an Ed25519 seed, 0600; servers sharing the
   data directory share it), context `hub-grant`, over the body bytes as
   sent (verified before they are parsed; never re-encoded). The body is
-  `{project, project_id, person, device, view, root, epoch, expires}`:
-  the caller's projected root tree of the tip, their device's Ed25519 key,
-  their view key, the access epoch, and an expiry 10 minutes on. Unknown
+  `{project, project_id, person, device, root, epoch, person_epoch,
+  expires}`: the caller's projected root tree of the tip, their device's
+  Ed25519 key, the access epochs of the project and of the person, and an
+  expiry 10 minutes on. It holds nothing its holder could not see
+  otherwise: **no view key** (an unkeyed hash of every access line, hidden
+  ones included, would confirm guesses of hidden folder names: BUG-1080),
+  and epochs that are opaque. Unknown
   fields are refused, so a layer that does not know a later restriction
   refuses the grant instead of ignoring it. Anyone on Earth's grant names
   no person and no device.
@@ -1533,8 +1537,9 @@ grants are **signed**.
   72 bytes); the server accepts `ts` within ±5 minutes. A copied grant is
   useless without the device key.
 * **Checks, in order:** the grant's signature, its project (the route's),
-  its expiry, the request's signature, then the newest epoch of its
-  project and person (one indexed query): any failure is `401
+  its expiry, the request's signature, then the current epochs of its
+  project and person (one indexed query; both must be equal to the
+  grant's): any failure is `401
   grant_invalid`, which says nothing about any object. Then each object's
   chain (`Chains::allows`): `chain[0]` is the grant's root, each tree has
   a directory entry naming the next, and the last tree has an entry whose
@@ -1544,27 +1549,41 @@ grants are **signed**.
   the root, and an object is read only after its own check, so "not
   reachable" and "not there" are the same `404` (the same body), and in a
   batch both are left out. Every object, trees included, is read through
-  `store::Objects::get`, one at a time (`grant::read`): when small objects
-  move into packs (S28), only that function changes, and a pack is never
-  handed out. A batch is streamed as `fetch` is (BUG-860): at most 64
-  objects and about 8 MiB (by the sizes their entries record) read ahead.
-* **Access epochs.** One clock row, `access_epoch_clock`, incremented by
-  every bump while the bump's transaction holds its lock, so epochs
-  commit in increasing order. Database triggers bump, in the transaction
-  of the change itself, so no route can forget: a person leaving a group
-  (removed, or the group deleted) or an admin role, a device removed or
-  barred from a project (person-wide epoch), and a change of a project's
-  accepted policy or its bindings (project epoch). A grant carries the
-  clock as read **before** its viewer was loaded: a change committed after
-  that read has a higher epoch and voids it, and one committed before is
-  in the view. **Revocation at the server is at the next request**
-  (tested: group removal, a policy change, a device barred).
-* **The feed.** `GET /v1/epochs?since=N` (no sign-in) lists
-  `{project | person, epoch}` with epochs above `N`, oldest first, at most
-  10,000, and `now`, the epoch to ask from next; every epoch up to `now`
-  is listed, and a key changed again shows only its newest epoch. It holds
-  numeric ids only: no name, path or content. Caches (S6, S9) poll it and
-  refuse a grant older than its project's or person's epoch.
+  `store::Objects`, one at a time (`grant::read`, and `Objects::get_range`
+  for a `Range`): when small objects move into packs (S28), only those
+  change, and a pack is never handed out. A `Range` reads only the bytes
+  asked for from the store (`BlobStore::get_range`). A batch is streamed as
+  `fetch` is (BUG-860): at most 64 objects and about 8 MiB read ahead,
+  each counted by the size its entry or conflict term records, or as 1 MiB
+  until it is read when it records none (a tree), then as what it is.
+  **An error making a grant** (the store failing to read or write the
+  projected trees) is logged, and that branch gets no grant: the tips and
+  every pull still answer (BUG-1083).
+* **Access epochs.** Each project (its accepted policy) and each person
+  (their groups, admin rights and devices) has its own epoch in
+  `access_epochs`: **a random value, new at each change**, never a count,
+  so a grant shows neither how many changes happened nor when, and there
+  is no server-wide clock (BUG-1081). Database triggers bump, in the
+  transaction of the change itself, so no route can forget: a person
+  leaving a group (removed, or the group deleted) or an admin role, a
+  device removed or barred from a project (the person's epoch), and a
+  change of a project's accepted policy or its bindings (the project's).
+  A bump writes only its key's row, locked until the change commits, so
+  bumps of different keys never wait for each other. A grant carries both
+  epochs as read **before** its viewer was loaded: a change committed
+  after that read gives a new epoch and voids it, and one committed before
+  is in the view. **Revocation at the server is at the next request**
+  (tested: group removal or deletion, a policy change, a name rebound to a
+  new group, a device removed or barred, and a grant racing a removal).
+* **The feed.** `GET /v1/epochs?projects=a,b` needs a session: it answers
+  `{person, projects: {name: epoch}}`, the caller's own person epoch and
+  the current epoch of each named project the caller can see; a project
+  they cannot see is left out exactly as one that does not exist. Every
+  key asked for gets its current epoch (no paging, so no change is passed
+  over: BUG-1082). The Veil daemon (S6) polls it for its people and
+  projects, and refuses a grant whose epochs are not those; a project
+  left out voids the caller's grants of it. Regional caches (S9) will
+  authenticate as the server's own.
 
 **Threat review** (design §6 rows 1–4, 14, 15, plus this milestone's):
 
@@ -1579,9 +1598,14 @@ grants are **signed**.
 | 7 | Anyone | a grant re-signed by the server's identity key, a body changed under its signature (a wider root), a grant for another project's URL, an expired one, one older than the project's epoch | `grant_invalid` | test 3 |
 | 8 | Anyone | malformed grants (non-hex, 10 KB), chains of `MAX_CHAIN + 5`, non-hex chains and signatures, more than `MAX_WANTS` wants, bad routes, bad JSON, a `Range` past the end or on a hidden object | refused cleanly (400/401/404/416); a hidden object's `Range` is the same 404 | test 3 |
 | 9 | Person without access | times answers | the grant is checked before any object, and only checked objects are looked up (the batch prefetches after the check) | by construction; residual as design row 14 |
+| 10 | Anyone holding a grant (anyone on Earth, for a project with something public) | tests guesses of the hidden access lines offline against a value it carries | no value a client receives (tips, grants, epochs, errors) is a view key | `bug_1080_…` (BUG-1080) |
+| 11 | Anyone on Earth; a signed-in person outside a project | reads the epoch feed, or counts epochs across grants | the feed needs a session and answers only for the caller and projects they see; epochs are random per key | `bug_1081_…` (BUG-1081) |
+| 12 | — (a cache falling behind) | reads the feed after many changes, one key changing twice | every key's current epoch | `bug_1082_…` (BUG-1082) |
+| 13 | — (an outage) | the store refuses writes | tips still answer; the branch has no grant | `bug_1083_…` (BUG-1083) |
 
-**Residual:** the feed shows when access changes happen and to which
-numeric ids (no names). A signed request can be replayed within ±5 minutes
+**Residual:** someone who holds grants of a project at two times learns
+whether its access (or their own) changed in between, not how often. A
+signed request can be replayed within ±5 minutes
 by whoever saw it (inside TLS: a cache, which is inside the boundary); it
 returns the same objects. Grants are made per branch at every tips request
 (one signature each). Not built (later milestones): `POST …/grants` for

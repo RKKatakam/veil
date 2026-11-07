@@ -3,12 +3,15 @@
 //!
 //! **A grant** is the server's decision, in a form any layer can check by
 //! itself: "this device may read what is reachable from projected root
-//! tree `root` of `project`, until `expires`, unless an access change newer
-//! than `epoch` reached its person or project". It is **signed, not
+//! tree `root` of `project`, until `expires`, while the access epochs of
+//! its project and person are still `epoch` and `person_epoch`". It is
+//! **signed, not
 //! encrypted**: an Ed25519 signature by the server's grant key, context
 //! [`SIG_CONTEXT_HUB_GRANT`], over the grant's JSON body exactly as it is
 //! sent (the receiver verifies those bytes, then parses them; nothing is
-//! re-encoded).
+//! re-encoded). It holds nothing its holder could not see otherwise: no
+//! view key (an unkeyed hash of every access line, hidden ones included,
+//! BUG-1080), and epochs that are opaque random values, not counts.
 //!
 //! **Reachability is the authority.** A projected tree holds exactly what
 //! its viewer may read (`hub::project`), so every object reachable from a
@@ -28,7 +31,7 @@
 //! Veil daemon and regional caches share them, and they build for WASM.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::Arc,
 };
 
@@ -65,13 +68,14 @@ pub struct GrantBody {
     /// (hex); both `None` for anyone on Earth.
     pub person: Option<i64>,
     pub device: Option<String>,
-    /// The viewer's view key (`hub::access::View::key`).
-    pub view: String,
     /// The viewer's projected root tree of one snapshot.
     pub root: ObjectId,
-    /// The server's access epoch when the grant was made: an access change
-    /// of its project or person with a newer epoch voids it.
+    /// The access epochs of the project and of the person (0 for anyone on
+    /// Earth) as read before the grant's view was: opaque values, new at
+    /// every access change of that project or person (BUG-1081). A grant
+    /// holds only while both are still current.
     pub epoch: i64,
+    pub person_epoch: i64,
     /// Unix milliseconds.
     pub expires: i64,
 }
@@ -113,10 +117,12 @@ impl Grant {
         *blake3::hash(&self.raw).as_bytes()
     }
 
-    /// May the grant be used now, for `project`, when the newest access
-    /// epoch of its project and person known to the checker is `newest`?
-    pub fn usable(&self, project: &str, now: i64, newest: i64) -> bool {
-        self.body.project == project && now < self.body.expires && newest <= self.body.epoch
+    /// May the grant be used now, for `project`, when the current access
+    /// epochs of its project and person are `epoch` and `person_epoch`?
+    /// Epochs are compared for equality: a layer that knows other values
+    /// than the grant's (newer or older) does not serve under it.
+    pub fn usable(&self, project: &str, now: i64, epoch: i64, person_epoch: i64) -> bool {
+        self.body.project == project && now < self.body.expires && epoch == self.body.epoch && person_epoch == self.body.person_epoch
     }
 }
 
@@ -160,9 +166,9 @@ pub fn request_signed(grant: &Grant, ts: i64, ids: &[ObjectId], signature: Optio
 pub trait ChainSource {
     /// The tree `id`; `None` if it is not held or not a tree.
     fn tree(&self, id: &ObjectId) -> Result<Option<Arc<Tree>>>;
-    /// The ids conflict object `id` names (its terms);
-    /// `None` if it is not held or not a conflict.
-    fn conflict_terms(&self, id: &ObjectId) -> Result<Option<Vec<ObjectId>>>;
+    /// The ids conflict object `id` names (its terms), with the sizes the
+    /// terms record; `None` if it is not held or not a conflict.
+    fn conflict_terms(&self, id: &ObjectId) -> Result<Option<Vec<(ObjectId, u64)>>>;
 }
 
 /// What one tree's entries say of one id.
@@ -203,7 +209,7 @@ pub struct Chains<'a> {
     src: &'a dyn ChainSource,
     root: ObjectId,
     trees: HashMap<ObjectId, Option<Seen>>,
-    terms: HashMap<ObjectId, Option<Arc<HashSet<ObjectId>>>>,
+    terms: HashMap<ObjectId, Option<Arc<HashMap<ObjectId, u64>>>>,
 }
 
 impl<'a> Chains<'a> {
@@ -248,7 +254,7 @@ impl<'a> Chains<'a> {
                 continue;
             }
             if i + 1 == last && hit.conflict {
-                return Ok(self.terms(next)?.is_some_and(|t| t.contains(id)).then_some(0));
+                return Ok(self.terms(next)?.and_then(|t| t.get(id).copied()));
             }
             return Ok(None);
         }
@@ -284,11 +290,11 @@ impl<'a> Chains<'a> {
         Ok(h)
     }
 
-    fn terms(&mut self, conflict: &ObjectId) -> Result<Option<Arc<HashSet<ObjectId>>>> {
+    fn terms(&mut self, conflict: &ObjectId) -> Result<Option<Arc<HashMap<ObjectId, u64>>>> {
         if let Some(t) = self.terms.get(conflict) {
             return Ok(t.clone());
         }
-        let t = self.src.conflict_terms(conflict)?.map(|v| Arc::new(v.into_iter().collect::<HashSet<_>>()));
+        let t = self.src.conflict_terms(conflict)?.map(|v| Arc::new(v.into_iter().collect::<HashMap<_, _>>()));
         self.terms.insert(*conflict, t.clone());
         Ok(t)
     }
@@ -317,24 +323,15 @@ pub struct BatchRequest {
     pub wants: Vec<ChainWant>,
 }
 
-/// `GET /v1/epochs?since=N`: the access epochs newer than `N`, oldest
-/// first, and the epoch to ask from next.
+/// `GET /v1/epochs?projects=a,b` (signed in): the current access epochs
+/// of the caller (`person`) and of each named project the caller can see
+/// (`projects`, by name); a project left out cannot be seen by the caller,
+/// so their grants of it are void. Every key's current epoch is listed
+/// (there is no paging, so no change is passed over: BUG-1082).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Epochs {
-    pub now: i64,
-    pub changes: Vec<EpochChange>,
-}
-
-/// One access change: of a project's policy (`project`), or of a person's
-/// groups or devices (`person`). A grant of that project or person with an
-/// older epoch is void.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EpochChange {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub person: Option<i64>,
-    pub epoch: i64,
+    pub person: i64,
+    pub projects: std::collections::BTreeMap<String, i64>,
 }
 
 #[cfg(test)]
@@ -345,7 +342,7 @@ mod tests {
     #[derive(Default)]
     struct Store {
         trees: HashMap<ObjectId, Arc<Tree>>,
-        conflicts: HashMap<ObjectId, Vec<ObjectId>>,
+        conflicts: HashMap<ObjectId, Vec<(ObjectId, u64)>>,
         reads: std::cell::RefCell<Vec<ObjectId>>,
     }
 
@@ -354,7 +351,7 @@ mod tests {
             self.reads.borrow_mut().push(*id);
             Ok(self.trees.get(id).cloned())
         }
-        fn conflict_terms(&self, id: &ObjectId) -> Result<Option<Vec<ObjectId>>> {
+        fn conflict_terms(&self, id: &ObjectId) -> Result<Option<Vec<(ObjectId, u64)>>> {
             self.reads.borrow_mut().push(*id);
             Ok(self.conflicts.get(id).cloned())
         }
@@ -388,7 +385,7 @@ mod tests {
         let mut s = Store::default();
         let (a, b, hidden, term) = (blob("a"), blob("b"), blob("hidden"), blob("term"));
         let conflict = ObjectId::hash(b"veil:conflict\n{}");
-        s.conflicts.insert(conflict, vec![term]);
+        s.conflicts.insert(conflict, vec![(term, 5)]);
         let sub = put(&mut s, vec![entry("a", EntryKind::File, a), entry("b", EntryKind::File, b), entry("c", EntryKind::Conflict, conflict)]);
         let root = put(&mut s, vec![entry("src", EntryKind::Dir, sub), entry("x", EntryKind::File, a)]);
         // Another root (the admin's), which also holds `hidden`.
@@ -399,6 +396,7 @@ mod tests {
         assert!(c.allows(&[root], &sub).unwrap() && c.allows(&[root], &a).unwrap());
         assert!(c.allows(&[root, sub], &a).unwrap() && c.allows(&[root, sub], &b).unwrap());
         assert!(c.allows(&[root, sub], &conflict).unwrap() && c.allows(&[root, sub, conflict], &term).unwrap());
+        assert_eq!(c.check(&[root, sub, conflict], &term).unwrap(), Some(5), "a term's recorded size");
         s.reads.borrow_mut().clear();
         // Refused: another root, a chain through a tree the root does not
         // reach, a tree that does not name the next, a file as a step.
@@ -440,8 +438,8 @@ mod tests {
             project: "acme".into(),
             project_id: 7,
             person: device.as_ref().map(|_| 3),
+            person_epoch: if device.is_some() { -9 } else { 0 },
             device,
-            view: "v".into(),
             root: blob("root"),
             epoch: 41,
             expires: 1_000_000,
@@ -474,8 +472,12 @@ mod tests {
             assert!(Grant::verify(junk, &key.verifying_hex()).is_none());
         }
         // Expiry, epoch, project.
-        assert!(g.usable("acme", 999_999, 41) && g.usable("acme", 0, 0));
-        assert!(!g.usable("acme", 1_000_000, 41) && !g.usable("acme", 0, 42) && !g.usable("acme2", 0, 0));
+        assert!(g.usable("acme", 999_999, 41, -9) && g.usable("acme", 0, 41, -9));
+        assert!(!g.usable("acme", 1_000_000, 41, -9) && !g.usable("acme2", 0, 41, -9));
+        // Any other epoch, newer or older, of the project or the person.
+        for (e, pe) in [(42, -9), (40, -9), (0, -9), (41, -8), (41, 0)] {
+            assert!(!g.usable("acme", 0, e, pe), "{e} {pe}");
+        }
     }
 
     #[test]

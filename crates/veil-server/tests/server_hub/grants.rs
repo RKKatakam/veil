@@ -254,9 +254,9 @@ fn invalid(r: &Reply) -> bool {
     r.status == 401 && r.json()["code"] == "grant_invalid"
 }
 
-/// The epoch feed's newest change.
-fn feed(api: &Api, since: i64) -> serde_json::Value {
-    let r = api.get(None, &format!("/v1/epochs?since={since}"));
+/// The epoch feed, as the signed-in `token` sees it for `projects`.
+fn feed(api: &Api, token: &str, projects: &[&str]) -> serde_json::Value {
+    let r = api.get(Some(token), &format!("/v1/epochs?projects={}", projects.join(",")));
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     r.json()
 }
@@ -300,13 +300,13 @@ fn grants_hold_only_for_their_device_project_key_and_time() {
     let grants = &hub.hub().grants;
     let expired = grants.issue(&GrantBody { expires: veil_core::now_millis() - 1, ..body.clone() });
     assert!(invalid(&dev.get_as(&expired, &[], &root, None, &[])), "expired");
-    let f = feed(&api, 0);
-    let project_epoch = f["changes"].as_array().unwrap().iter().find(|c| c["project"] == body.project_id).expect("setup accepted a policy")["epoch"]
-        .as_i64()
-        .unwrap();
-    assert!(body.epoch >= project_epoch);
-    let stale = grants.issue(&GrantBody { epoch: project_epoch - 1, ..body.clone() });
-    assert!(invalid(&dev.get_as(&stale, &[], &root, None, &[])), "older than the project's epoch");
+    let f = feed(&api, &p.dev.token(), &[&p.name]);
+    assert_eq!((f["projects"][&p.name].as_i64(), f["person"].as_i64()), (Some(body.epoch), Some(body.person_epoch)));
+    assert_ne!(body.epoch, 0, "setup accepted a policy");
+    for (e, pe) in [(body.epoch + 1, body.person_epoch), (body.epoch - 1, body.person_epoch), (0, body.person_epoch), (body.epoch, body.person_epoch + 1)] {
+        let stale = grants.issue(&GrantBody { epoch: e, person_epoch: pe, ..body.clone() });
+        assert!(invalid(&dev.get_as(&stale, &[], &root, None, &[])), "another epoch than the current ones");
+    }
     let fresh = grants.issue(&body);
     assert_eq!(dev.get_as(&fresh, &[], &root, None, &[]).status, 200, "the same grant, re-signed, still works");
     // Anyone on Earth's grant names no device and needs no signature.
@@ -370,16 +370,15 @@ fn access_changes_void_grants_at_the_next_request() {
     let fin = Reader::new(&api, Some(&p.fin), &p.name);
     let (chain, id) = invoice(&fin).expect("fin reads the invoice");
     assert_eq!(fin.get(&chain, &id).status, 200);
-    let before = fin.body().epoch;
+    let (before, project_before) = (fin.body().person_epoch, fin.body().epoch);
     p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
     assert!(invalid(&fin.get(&chain, &id)), "the old grant stops at once");
     assert!(invalid(&fin.batch_as(&fin.grant, &[(chain.clone(), id)])));
-    let f = feed(&api, before);
-    let person = fin.body().person.unwrap();
-    assert!(f["changes"].as_array().unwrap().iter().any(|c| c["person"] == person), "{f}");
-    assert!(f["now"].as_i64().unwrap() > before);
+    let f = feed(&api, &p.fin.token(), &[&p.name]);
+    assert_ne!(f["person"].as_i64(), Some(before), "{f}");
+    assert_eq!(f["projects"][&p.name].as_i64(), Some(project_before), "{f}: a person's change leaves the project's epoch");
     let again = Reader::new(&api, Some(&p.fin), &p.name);
-    assert!(again.body().epoch > before);
+    assert_eq!(again.body().person_epoch, f["person"].as_i64().unwrap());
     assert!(invoice(&again).is_none(), "the new grant reaches no billing file");
     assert!(again.batch(&[(chain.clone(), id)]).is_empty());
 
@@ -402,15 +401,15 @@ fn access_changes_void_grants_at_the_next_request() {
     assert_eq!(sec.get(&[], &sec.root()).status, 200);
     p.admin.ok(&p.dir, &["identity", "remove", &p.sec.fingerprint()]);
     assert!(invalid(&sec.get(&[], &sec.root())), "a removed device's grant");
-    // Each change is in the feed, numbers only.
-    let f = feed(&api, 0);
-    for c in f["changes"].as_array().unwrap() {
-        let keys: Vec<&String> = c.as_object().unwrap().keys().collect();
-        assert!(keys.iter().all(|k| ["project", "person", "epoch"].contains(&k.as_str())), "{c}");
-        assert!(c.as_object().unwrap().values().all(|v| v.is_i64()), "{c}");
-    }
-    assert!(f["changes"].as_array().unwrap().iter().any(|c| c["project"] == dev.body().project_id));
-    assert!(f["changes"].as_array().unwrap().iter().any(|c| c["person"] == sec.body().person.unwrap()));
+    // Each change is in the feed of whom it concerns: the project's new
+    // epoch for dev (the grants made since carry it), sec's new one for sec.
+    let f = feed(&api, &p.dev.token(), &[&p.name]);
+    assert_eq!(f.as_object().unwrap().keys().collect::<Vec<_>>(), ["person", "projects"]);
+    assert_eq!(f["projects"][&p.name].as_i64(), Some(dev2.body().epoch));
+    assert_ne!(dev2.body().epoch, dev.body().epoch);
+    let f = feed(&api, &p.sec.token(), &[&p.name]);
+    assert_ne!(f["person"].as_i64(), Some(sec.body().person_epoch), "{f}");
+    assert!(f["projects"].as_object().unwrap().is_empty(), "a device barred from the project sees no epoch of it: {f}");
 }
 
 fn percentile(v: &mut [f64], p: f64) -> f64 {
@@ -470,7 +469,7 @@ fn bench_object_routes() {
     let mut q = Vec::new();
     for _ in 0..1000 {
         let t = Instant::now();
-        hub.rt.block_on(veil_server::grant::newest_epoch(&state.db, g.body.project_id, g.body.person)).unwrap();
+        hub.rt.block_on(veil_server::grant::current_epochs(&state.db, g.body.project_id, g.body.person)).unwrap();
         q.push(t.elapsed().as_secs_f64() * 1e6);
     }
     println!("   of which the epoch query (µs): p50 {:.0}  p99 {:.0}", percentile(&mut q.clone(), 0.5), percentile(&mut q, 0.99));
@@ -560,30 +559,11 @@ fn guessed_view(text: &str, member_of: &[&str]) -> String {
     veil_core::hub::access::View::new(&policy, false, |_, name| member_of.contains(&name)).key()
 }
 
-/// The keys (project, person) the feed lists from `since` until its `now`
-/// passes `until`, read page by page as a cache would.
-fn feed_until(api: &Api, mut since: i64, until: i64) -> HashSet<(Option<i64>, Option<i64>)> {
-    let mut seen = HashSet::new();
-    for _ in 0..1000 {
-        let f = feed(api, since);
-        for c in f["changes"].as_array().unwrap() {
-            seen.insert((c["project"].as_i64(), c["person"].as_i64()));
-        }
-        let now = f["now"].as_i64().unwrap();
-        if now >= until || now == since {
-            break;
-        }
-        since = now;
-    }
-    seen
-}
-
-/// BUG-1080. Anyone on Earth, and a teammate without access, holds a grant
-/// whose `view` is an unkeyed hash of every access line's path (hidden ones
-/// included) and whether they read it: a guess of the hidden folder names,
-/// checked offline against it, is confirmed or refused.
+/// BUG-1080. A grant held nothing that confirms a guess of hidden access
+/// lines (it carried the view key: an unkeyed hash of every line's path,
+/// hidden ones included). Now no value a viewer receives with the tips is
+/// the view key of the true policy, and the grant has no `view`.
 #[test]
-#[ignore = "BUG-1080: a grant's view key confirms guesses of hidden folder names"]
 fn bug_1080_a_grants_view_key_confirms_a_guess_of_hidden_folder_names() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -593,23 +573,38 @@ fn bug_1080_a_grants_view_key_confirms_a_guess_of_hidden_folder_names() {
     let wrong = policy.replace(BILL_DIR, "bill-00000000");
     assert_ne!(guessed_view(&policy, &[]), guessed_view(&wrong, &[]));
     for (who, person, groups) in [("anyone on Earth", None, vec![]), ("dev", Some(&p.dev), vec!["devs"])] {
-        let r = Reader::new(&api, person, &p.name);
+        let token = person.map(|p| p.token());
+        let tips = api.get(token.as_deref(), &format!("/v1/projects/{}/tips", p.name));
+        assert_eq!(tips.status, 200);
+        let right = guessed_view(&policy, &groups);
+        let mut all = tips.body.clone();
+        for g in tips.json()["grants"].as_object().unwrap().values() {
+            let body = hex::decode(g.as_str().unwrap().split_once('.').unwrap().0).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(v.get("view").is_none(), "{who}'s grant has a view: {v}");
+            all.extend(body);
+        }
         assert!(
-            r.body().view != guessed_view(&policy, &groups),
-            "{who}'s grant confirms, offline, the guess that the policy holds {BILL_DIR}/, {PERSON_DIR}/ and src/{NESTED_DIR}/, \
-             which they cannot see"
+            !has_marker(&[(String::new(), all)], &right),
+            "{who}'s tips confirm, offline, the guess that the policy holds {BILL_DIR}/, {PERSON_DIR}/ and src/{NESTED_DIR}/"
         );
+        if let Some(t) = &token {
+            let f = api.get(Some(t), &format!("/v1/epochs?projects={}", p.name));
+            assert!(!has_marker(&[(String::new(), f.body)], &right), "{who}'s epochs");
+        }
     }
 }
 
-/// BUG-1081. The epoch feed answers anyone on Earth, and lists a project
-/// that has nothing public (its id, and when its access changes).
+/// BUG-1081. The epoch feed answered anyone on Earth, and listed a project
+/// that has nothing public. Now it needs a session and answers only for
+/// the caller and the projects they can see; and a grant's epochs are its
+/// project's and person's own, untouched by changes elsewhere.
 #[test]
-#[ignore = "BUG-1081: the unauthenticated epoch feed lists projects with nothing public"]
 fn bug_1081_the_epoch_feed_shows_anyone_a_project_with_nothing_public() {
     let hub = TestHub::start();
     let api = hub.api();
     let admin = hub.person("quiet");
+    let other = hub.person("other");
     let name = unique("quiet");
     let dir = admin.dir("quiet");
     std::fs::create_dir_all(&dir).unwrap();
@@ -623,14 +618,24 @@ fn bug_1081_the_epoch_feed_shows_anyone_a_project_with_nothing_public() {
     admin.ok(&dir, &["push"]);
     // Nothing public: anyone on Earth does not see the project at all.
     assert!(api.tips(None, &name).is_none());
-    let tips = api.tips(Some(&admin.token()), &name).unwrap();
-    let id = Grant::read_unverified(&tips.grants["main"]).unwrap().project_id;
-    let now = feed(&api, 0)["now"].as_i64().unwrap();
-    let listed = feed_until(&api, 0, now);
-    assert!(
-        !listed.contains(&(Some(id), None)),
-        "anyone on Earth, not signed in, sees project {id} (nothing public) and when its access changed"
-    );
+    let r = api.get(None, &format!("/v1/epochs?projects={name}"));
+    assert_eq!(r.status, 401, "anyone on Earth reads no epochs");
+    let r = api.get(None, "/v1/epochs");
+    assert_eq!(r.status, 401);
+    // Someone signed in who cannot see it: left out, as a project that
+    // does not exist is.
+    let f = feed(&api, &other.token(), &[&name, "no-such-project-0f3a"]);
+    assert!(f["projects"].as_object().unwrap().is_empty(), "{f}");
+    // Its admin: listed, with the epoch their grant carries.
+    let g = Grant::read_unverified(&api.tips(Some(&admin.token()), &name).unwrap().grants["main"]).unwrap();
+    let f = feed(&api, &admin.token(), &[&name]);
+    assert_eq!(f["projects"][&name].as_i64(), Some(g.epoch));
+    // Access changes in other projects leave this project's epoch, and the
+    // admin's person epoch, as they were: a grant shows no server-wide count.
+    let p = setup_project(&hub);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let g2 = Grant::read_unverified(&api.tips(Some(&admin.token()), &name).unwrap().grants["main"]).unwrap();
+    assert_eq!((g2.epoch, g2.person_epoch), (g.epoch, g.person_epoch));
 }
 
 /// A new, empty database on the test server, as a URL; dropped with the
@@ -646,43 +651,46 @@ fn fresh_database(rt: &tokio::runtime::Runtime) -> String {
     format!("{}/{name}", admin.rsplit_once('/').unwrap().0)
 }
 
-/// BUG-1082. A cache reads the feed page by page until its `now` passes a
-/// change; the change of a key that changed again since is never listed in
-/// those pages (the row keeps only the newest epoch, past the full page).
+/// BUG-1082. The feed paged over a log keeping one row per key, and passed
+/// over the change of a key that changed again past a full page. Now it
+/// answers each key asked for with its current epoch: after a change, ten
+/// thousand changes of other keys and another change of the same key, it
+/// gives the newest, and the grants of each earlier epoch are void.
 #[test]
-#[ignore = "BUG-1082: the epoch feed passes a change it never lists when its key changed again"]
 fn bug_1082_the_epoch_feed_skips_a_change_whose_key_changed_again() {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(2).build().unwrap();
-    // A database of its own: nothing else bumps its clock.
+    // A database of its own: the other keys bumped here are nobody's.
     let hub = TestHub::start_on(&fresh_database(&rt), std::time::Duration::from_secs(3600));
+    let p = setup_project(&hub);
     let api = hub.api();
     let db = hub.hub().db.clone();
-    let n = veil_server::grant::FEED_LIMIT;
-    let first = hub.rt.block_on(async {
-        // Project 1's access changes (someone loses it): epoch 1.
-        sqlx::query("SELECT veil_bump_epoch(1, 0)").execute(&db).await.unwrap();
-        let first: i64 = sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 1").fetch_one(&db).await.unwrap();
-        // A full page of other changes, then project 1 changes again.
-        let mut a = 2i64;
-        while a <= n + 1 {
-            let b = (a + 999).min(n + 1);
-            sqlx::query("SELECT veil_bump_epoch(g, 0) FROM generate_series($1::bigint, $2::bigint) g")
-                .bind(a)
-                .bind(b)
-                .execute(&db)
-                .await
-                .unwrap();
+    let token = p.dev.token();
+    let dev = Reader::new(&api, Some(&p.dev), &p.name);
+    let pid = dev.body().project_id;
+    let mut seen = vec![dev.body().epoch];
+    let bump = |key: i64| hub.rt.block_on(sqlx::query("SELECT veil_bump_epoch($1, 0)").bind(key).execute(&db)).unwrap();
+    bump(pid);
+    hub.rt.block_on(async {
+        let mut a = pid + 1;
+        while a <= pid + 10_001 {
+            let b = (a + 999).min(pid + 10_001);
+            sqlx::query("SELECT veil_bump_epoch(g, 0) FROM generate_series($1::bigint, $2::bigint) g").bind(a).bind(b).execute(&db).await.unwrap();
             a = b + 1;
         }
-        sqlx::query("SELECT veil_bump_epoch(1, 0)").execute(&db).await.unwrap();
-        first
     });
-    let seen = feed_until(&api, 0, first);
-    assert!(
-        seen.contains(&(Some(1), None)),
-        "the cache's feed has passed epoch {first}, project 1's change, without listing it: a grant of project 1 from before it \
-         still looks current to the cache"
-    );
+    seen.push(feed(&api, &token, &[&p.name])["projects"][&p.name].as_i64().unwrap());
+    bump(pid);
+    let now = feed(&api, &token, &[&p.name])["projects"][&p.name].as_i64().unwrap();
+    let current: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = 0").bind(pid).fetch_one(&db))
+        .unwrap();
+    assert_eq!(now, current, "the feed gives the project's current epoch");
+    assert!(!seen.contains(&now), "each change gives a new epoch: {seen:?} then {now}");
+    assert!(invalid(&dev.get(&[], &dev.root())), "a grant of an earlier epoch");
+    let fresh = Reader::new(&api, Some(&p.dev), &p.name);
+    assert_eq!(fresh.body().epoch, now);
+    assert_eq!(fresh.get(&[], &fresh.root()).status, 200);
 }
 
 /// Set every directory under `root` to `mode`.
@@ -701,11 +709,10 @@ fn chmod_dirs(root: &Path, mode: u32) {
 }
 
 /// BUG-1083. Making a grant stores the projected trees; when the store
-/// cannot be written, the whole tips request fails, so every pull of
-/// everyone but admins fails with it (S1 needed no write to pull). The
-/// code's own comment says the branch only gets no grant.
+/// could not be written, the whole tips request failed, so every pull of
+/// everyone but admins failed with it (S1 needed no write to pull). Now the
+/// branch only gets no grant.
 #[test]
-#[ignore = "BUG-1083: tips fail when the projected trees of a grant cannot be stored"]
 fn bug_1083_a_store_that_cannot_be_written_fails_every_pull() {
     let url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
     // Objects in a directory, whatever VEIL_TEST_S3_ENDPOINT says.
@@ -713,7 +720,10 @@ fn bug_1083_a_store_that_cannot_be_written_fails_every_pull() {
     let p = setup_project(&hub);
     let api = hub.api();
     let dev = Reader::new(&api, Some(&p.dev), &p.name);
-    let (pid, view) = (dev.body().project_id, dev.body().view);
+    // The server's own projection memo key for dev (computed here from the
+    // policy the test wrote; no client receives it).
+    let policy = std::fs::read_to_string(p.dir.join(".veilpolicy")).unwrap();
+    let (pid, view) = (dev.body().project_id, guessed_view(&policy, &["devs"]));
     // A change dev sees, in src/ (rewritten for dev: it holds a hidden folder).
     write_files(&p.dir, &[("src/lib.rs", "MARKER-PUBLIC-CHANGED-77c1d0e2")]);
     p.admin.commit_main(&p.dir, "src changed");

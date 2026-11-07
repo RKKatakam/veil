@@ -162,8 +162,10 @@ pub const GENERATION_SEPARATOR: char = '#';
 
 /// BLAKE3 `derive_key` context of a Veil server's view key: the hash of the
 /// paths one viewer may read under the accepted policy, under which the
-/// server caches that viewer's projections (`hub::access::View::key`). Not
-/// secret; equal for two viewers who read the same paths.
+/// server caches that viewer's projections (`hub::access::View::key`).
+/// Equal for two viewers who read the same paths. **Never sent to a
+/// client:** it hashes every access line's path, hidden ones included, so
+/// holding it confirms guesses of hidden folder names (BUG-1080).
 pub const HUB_VIEW_KEY: &str = "veil 2026 hub view-key v1";
 
 /// BLAKE3 `derive_key` context of a device's fingerprint, over its Ed25519

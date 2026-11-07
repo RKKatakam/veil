@@ -1,20 +1,16 @@
 -- Access epochs (docs/HUB.md §13.13; phase-2 design §4.4, §5.2): every
--- change that can take access away bumps an epoch, in the same transaction
--- as the change, and a read grant older than its project's or person's
--- epoch is void. Idempotent: YugabyteDB may apply DDL statement by
--- statement.
+-- change that can take access away gives its project or person a new
+-- epoch, in the same transaction as the change, and a read grant made
+-- with another epoch than the current one is void. Idempotent: YugabyteDB
+-- may apply DDL statement by statement.
 --
--- One clock for every epoch. A bump increments its row, which stays locked
--- until the bump's transaction commits, so epochs commit in increasing
--- order: a reader that sees the clock at N sees every bump up to N (the
--- epoch feed relies on this), and a bump committed after it is above N.
-CREATE TABLE IF NOT EXISTS access_epoch_clock (
-    id INT PRIMARY KEY,
-    n BIGINT NOT NULL
-);
-INSERT INTO access_epoch_clock (id, n) VALUES (1, 0) ON CONFLICT DO NOTHING;
--- The newest epoch of each project (person_id 0: its accepted policy) and
--- of each person (project_id 0: their groups, admin rights or devices).
+-- One row per project (person_id 0: its accepted policy) and per person
+-- (project_id 0: their groups, admin rights or devices). An epoch is a
+-- random value, new at each change, never a count: a grant shows its
+-- holder neither how many changes happened nor when (BUG-1081). A bump
+-- writes only its own key's row, which stays locked until the change
+-- commits, so a grant that read the epoch before the change is void after
+-- it, and bumps of different keys never wait for one another.
 CREATE TABLE IF NOT EXISTS access_epochs (
     project_id BIGINT NOT NULL,
     person_id BIGINT NOT NULL,
@@ -22,16 +18,16 @@ CREATE TABLE IF NOT EXISTS access_epochs (
     changed_at BIGINT NOT NULL,
     PRIMARY KEY (project_id, person_id)
 );
-CREATE INDEX IF NOT EXISTS access_epochs_by_epoch ON access_epochs (epoch);
 
 CREATE OR REPLACE FUNCTION veil_bump_epoch(p BIGINT, q BIGINT) RETURNS VOID AS $$
 DECLARE
-    e BIGINT;
+    e BIGINT := floor(random() * 9.0e18)::BIGINT + 1;
 BEGIN
-    UPDATE access_epoch_clock SET n = n + 1 WHERE id = 1 RETURNING n INTO e;
     INSERT INTO access_epochs (project_id, person_id, epoch, changed_at)
     VALUES (p, q, e, (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT)
-    ON CONFLICT (project_id, person_id) DO UPDATE SET epoch = EXCLUDED.epoch, changed_at = EXCLUDED.changed_at;
+    ON CONFLICT (project_id, person_id) DO UPDATE
+        SET epoch = CASE WHEN access_epochs.epoch = EXCLUDED.epoch THEN EXCLUDED.epoch + 1 ELSE EXCLUDED.epoch END,
+            changed_at = EXCLUDED.changed_at;
 END
 $$ LANGUAGE plpgsql;
 
