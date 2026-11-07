@@ -1111,3 +1111,265 @@ fn bug_1232_candidates_are_collected_past_the_bounds() {
         assert!(*t < deadline + Duration::from_millis(700), "a query with a {deadline:?} deadline took {t:?}: {r}\n{took:?}");
     }
 }
+
+// ---- S15 cycle 2 review (BUG-1233..) ------------------------------------------------
+
+/// A name search's answer is current (`behind: false`) only once its names
+/// are: the branch's walked tip is read after the names shards, in its own
+/// statement, so an update that commits between the two reads gives an
+/// answer from the shards before it that says it covers the new tip. Each
+/// round adds a name and asks for it from six searches at once while the
+/// update runs; the first answer each gets that says it is current must
+/// hold the name.
+#[test]
+#[ignore = "BUG-1233: a name search reads its walked tip after its shards and can call a stale answer current"]
+fn bug_1233_a_name_search_is_current_only_with_its_names() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &policy_text, &bindings);
+    let mut files = Files::from([("pub/base.txt".to_string(), b"base\n".to_vec())]);
+    let mut tip = h.commit(&th, &[root_snapshot_id()], files.clone(), [1; 16], 1_000, None);
+    h.set_branch(&th, "main", tip);
+    index(&th, &h);
+    let anyone = Viewer::default();
+    let a = ask(&th, &h, &anyone);
+    let mut stale = Vec::new();
+    let mut samples = 0;
+    for i in 0..40u8 {
+        let word = format!("racename{i:03}q");
+        files.insert(format!("pub/{word}.txt"), b"x\n".to_vec());
+        tip = h.commit(&th, &[tip], files.clone(), [10 + i; 16], 2_000 + i64::from(i), None);
+        h.set_branch(&th, "main", tip);
+        h.derive(&th);
+        let want = th.rt.block_on(query::resolve(&h.hub, &a, "main", Instant::now() + Duration::from_secs(60))).unwrap().hex();
+        let got: Vec<Option<String>> = th.rt.block_on(async {
+            let mut tasks = Vec::new();
+            for _ in 0..6 {
+                let (hub, a, word, want) = (h.hub.clone(), a.clone(), word.clone(), want.clone());
+                tasks.push(tokio::spawn(async move {
+                    let give_up = Instant::now() + Duration::from_secs(60);
+                    loop {
+                        let p = SearchParams { q: Some(word.clone()), kind: Some("path".into()), ..Default::default() };
+                        if let Ok(v) = search::search(&hub, &a, p, Limits::default()).await {
+                            if v["behind"] == false && v["tip_id"].as_str() == Some(want.as_str()) {
+                                return (v["files"] != 1).then(|| v.to_string());
+                            }
+                        }
+                        assert!(Instant::now() < give_up, "{word}: never caught up");
+                    }
+                }));
+            }
+            let mut out = Vec::new();
+            for t in tasks {
+                out.push(t.await.unwrap());
+            }
+            out
+        });
+        samples += got.len();
+        stale.extend(got.into_iter().flatten());
+    }
+    assert!(stale.is_empty(), "{} of {samples} answers said they were current without the tip's names: {:?}", stale.len(), &stale[..stale.len().min(3)]);
+}
+
+/// Guarantee 1 of cycle 2: a word's document count (saturated at
+/// `DF_CAP`), the ranking built on it, and the long lines a grep skips are
+/// functions of the viewer's documents alone: the same answers from a
+/// project indexed landing by landing (several segments, dead documents)
+/// and from one holding as well hidden files full of the same words and
+/// long lines, indexed at once (one layout, another count if hidden ones
+/// were counted).
+#[test]
+fn search_counts_and_long_lines_are_per_viewer() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut a = Hist::new(&th, &policy_text, &bindings);
+    let mut b = Hist::new(&th, &policy_text, &bindings);
+    let root = root_snapshot_id();
+    let (mut ta, mut tb) = (root, root);
+    // One line longer than the costly pattern below may search (16 KiB).
+    let mut long = b"handler zeta ".to_vec();
+    long.extend(std::iter::repeat_n(b'b', 20_000));
+    long.extend(b"\nshort line\n");
+    let mut files = Files::from([("fin/base.txt".to_string(), b"alpha hidden in both\n".to_vec())]);
+    let mut hidden = Files::new();
+    for i in 0..6u8 {
+        for k in 0..2_000usize {
+            let n = usize::from(i) * 2_000 + k;
+            // `zeta` in 9,500 visible files (under the cap), 11,900 with
+            // the hidden ones; `handler` in all (past it either way).
+            let body = format!("handler {}{}\n", "x ".repeat(n % 7), if n < 9_500 { "zeta" } else { "" });
+            files.insert(format!("pub/d{i}/f{k}.txt"), body.into_bytes());
+        }
+        // Edits: dead documents in the older segments of `a`.
+        for k in 0..300usize {
+            files.insert(format!("pub/d0/f{k}.txt"), format!("handler zeta edit {i}\n").into_bytes());
+        }
+        files.insert(format!("pub/long/l{i}.min.js"), long.clone());
+        for k in 0..400 {
+            hidden.insert(format!("fin/d{i}/h{k}.txt"), b"handler zeta\n".to_vec());
+        }
+        hidden.insert(format!("fin/long/h{i}.min.js"), long.clone());
+        let ts = 1_700_000_000_000 + i64::from(i) * 1000;
+        ta = a.commit(&th, &[ta], files.clone(), [i + 1; 16], ts, None);
+        a.set_branch(&th, "main", ta);
+        index(&th, &a);
+        let mut fb = files.clone();
+        fb.extend(hidden.clone());
+        tb = b.commit(&th, &[tb], fb, [i + 1; 16], ts, None);
+    }
+    b.set_branch(&th, "main", tb);
+    index(&th, &b);
+    let segs = |h: &Hist| -> usize {
+        th.rt.block_on(async {
+            let rows: Vec<String> = sqlx::query_scalar("SELECT segments FROM search_shards WHERE project_id = $1 AND kind = 'code'").bind(h.id).fetch_all(&h.hub.db).await.unwrap();
+            rows.iter().map(|r| serde_json::from_str::<Vec<index::SegRef>>(r).unwrap().len()).sum()
+        })
+    };
+    println!("code segments: a {}, b {}", segs(&a), segs(&b));
+    let anyone = Viewer::default();
+    let (aa, ab) = (ask(&th, &a, &anyone), ask(&th, &b, &anyone));
+    warm_up(&th, &a, &anyone);
+    warm_up(&th, &b, &anyone);
+    let tip = th.rt.block_on(query::resolve(&a.hub, &aa, "main", Instant::now() + Duration::from_secs(60))).unwrap();
+    let slow = Limits { deadline: Duration::from_secs(120), ..Limits::default() };
+    let costly = r"(?-u)[\x00-\xff]*[a-f][\x00-\xff]{1000}[A-Z]";
+    let mut qs = Vec::new();
+    for q in ["zeta", "handler", "handler zeta", "edit zeta"] {
+        qs.push(S::Search(SearchParams { q: Some(q.into()), n: Some(50), ..Default::default() }, slow));
+    }
+    for rev in ["main".to_string(), tip.hex()] {
+        qs.push(S::Grep(GrepParams { pattern: costly.into(), rev: Some(rev.clone()), n: Some(1_000), ..Default::default() }, slow));
+        qs.push(S::Grep(GrepParams { pattern: "short line".into(), rev: Some(rev), ..Default::default() }, slow));
+    }
+    for q in &qs {
+        let (x, y) = (run(&th, &a, &aa, q), run(&th, &b, &ab, q));
+        assert!(!x[0].starts_with("error"), "{q:?}: {x:?}");
+        assert_eq!(x, y, "{q:?}");
+        assert!(!x.iter().any(|r| r.contains("fin/")), "{q:?}: {x:?}");
+        if let S::Grep(p, _) = q {
+            if p.pattern == costly {
+                let v: Value = serde_json::from_str(&x[0]).unwrap();
+                let skipped: Vec<(String, u64)> = v["files"].as_array().unwrap().iter().map(|f| (f["path"].as_str().unwrap().to_string(), f["long_lines_skipped"].as_u64().unwrap_or(0))).collect();
+                let want: Vec<(String, u64)> = (0..6).map(|i| (format!("pub/long/l{i}.min.js"), 1)).collect();
+                assert_eq!(skipped, want, "{q:?}");
+            }
+        }
+    }
+}
+
+/// Guarantee 2 of cycle 2: over 300,000 public files written in three
+/// landings (several segments), every route stays within its deadline:
+/// a grep whose trigrams every file holds and whose expression matches
+/// none (through the index and by a scan), a grep from a cursor near the
+/// end, searches whose language filter rejects every candidate, and a
+/// folder at the end of the tree.
+#[test]
+fn search_every_route_is_bounded_at_scale() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &policy_text, &bindings);
+    let mut files = Files::new();
+    let mut tip = root_snapshot_id();
+    for part in 0..3 {
+        for d in (part * 50)..(part * 50 + 50) {
+            for f in 0..2_000 {
+                files.insert(format!("pub/d{d}/f{f}.txt"), b"common word\n".to_vec());
+            }
+        }
+        tip = h.commit(&th, &[tip], files.clone(), [9 + part as u8; 16], 1_000 + part as i64, None);
+        h.set_branch(&th, "main", tip);
+        index(&th, &h);
+    }
+    let anyone = Viewer::default();
+    warm_up(&th, &h, &anyone);
+    let a = ask(&th, &h, &anyone);
+    let id = th.rt.block_on(query::resolve(&h.hub, &a, "main", Instant::now() + Duration::from_secs(60))).unwrap().hex();
+    let deadline = Duration::from_millis(300);
+    let limits = Limits { deadline, ..Limits::default() };
+    let grep = |pattern: &str, rev: &str, after: Option<&str>| S::Grep(GrepParams { pattern: pattern.into(), rev: Some(rev.into()), after: after.map(str::to_string), ..Default::default() }, limits);
+    let queries = [
+        grep(r"common\d word", "main", None),
+        grep(r"common\d word", &id, None),
+        grep("common", "main", Some("pub/d149/f1990.txt")),
+        grep("common", &id, Some("pub/d149/f1990.txt")),
+        S::Search(SearchParams { q: Some("common".into()), lang: Some("rust".into()), ..Default::default() }, limits),
+        S::Search(SearchParams { q: Some("txt".into()), kind: Some("path".into()), lang: Some("rust".into()), ..Default::default() }, limits),
+        S::Search(SearchParams { q: Some("common word".into()), path: Some("pub/d149".into()), ..Default::default() }, limits),
+    ];
+    let mut took = Vec::new();
+    for q in &queries {
+        let hub = h.hub.clone();
+        let call = || {
+            th.rt.block_on(async {
+                match q {
+                    S::Search(p, l) => search::search(&hub, &a, p.clone(), *l).await,
+                    S::Grep(p, l) => search::grep(&hub, &a, p.clone(), *l).await,
+                }
+            })
+        };
+        let _ = call();
+        let t = Instant::now();
+        let r = norm(call());
+        took.push((t.elapsed(), r.chars().take(160).collect::<String>()));
+    }
+    println!("every route: {took:#?}");
+    for (t, r) in &took {
+        assert!(*t < deadline + Duration::from_millis(700), "a query with a {deadline:?} deadline took {t:?}: {r}");
+    }
+}
+
+/// Guarantee 3 of cycle 2: an update asked for one branch also brings up
+/// to date a branch whose update was cut (its names walk behind its tip)
+/// and, after a policy change, every branch built under the old one; the
+/// answers then equal an index built from nothing.
+#[test]
+fn search_index_catches_up_every_branch() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &policy_text, &bindings);
+    let base = h.commit(&th, &[root_snapshot_id()], Files::from([("pub/deep/a.txt".to_string(), b"alpha\n".to_vec())]), [1; 16], 1_000, None);
+    h.set_branch(&th, "main", base);
+    let side = h.commit(
+        &th,
+        &[base],
+        Files::from([("pub/deep/a.txt".to_string(), b"alpha\n".to_vec()), ("pub/deep/sidewalkq.txt".to_string(), b"beta\n".to_vec())]),
+        [2; 16],
+        2_000,
+        None,
+    );
+    h.set_branch(&th, "side", side);
+    index(&th, &h);
+    let heads = || -> BTreeSet<(String, String, String, String)> {
+        th.rt.block_on(sqlx::query_as("SELECT kind, branch, snapshot, lines FROM search_heads WHERE project_id = $1").bind(h.id).fetch_all(&h.hub.db)).unwrap().into_iter().collect()
+    };
+    // A cut update of side: its walk recorded nothing.
+    th.rt.block_on(sqlx::query("DELETE FROM search_heads WHERE project_id = $1 AND kind = 'walk' AND branch = 'side'").bind(h.id).execute(&h.hub.db)).unwrap();
+    th.rt.block_on(index::update(&h.hub, h.id, Some(vec!["main".to_string()]))).unwrap();
+    assert!(heads().iter().any(|(k, b, s, _)| k == "walk" && b == "side" && *s == side.hex()), "{:?}", heads());
+    // A line below pub/: every shard of pub/ is under new keys.
+    let moved = format!("{policy_text}pub/deep/ security\n");
+    th.rt.block_on(async {
+        again(|| sqlx::query("UPDATE projects SET policy_text = $1, policy_version = 2 WHERE id = $2").bind(&moved).bind(h.id).execute(&h.hub.db)).await;
+    });
+    th.rt.block_on(index::update(&h.hub, h.id, Some(vec!["main".to_string()]))).unwrap();
+    let lines: BTreeSet<String> = heads().into_iter().filter(|(k, ..)| k != "walk").map(|(.., l)| l).collect();
+    assert_eq!(lines.len(), 1, "every head under one policy: {:?}", heads());
+    let sec = viewers(1)[2].1.clone();
+    let side_answers = |h: &Hist| -> Vec<String> {
+        let a = Ask { project: h.project(&th), ..ask(&th, h, &sec) };
+        warm_up(&th, h, &sec);
+        ["alpha", "beta", "sidewalkq"]
+            .iter()
+            .flat_map(|w| {
+                [None, Some("path".to_string())].into_iter().flat_map(|kind| {
+                    run(&th, h, &a, &S::Search(SearchParams { q: Some(w.to_string()), rev: Some("side".into()), kind, ..Default::default() }, Limits::default()))
+                })
+            })
+            .collect()
+    };
+    let caught_up = side_answers(&h);
+    assert!(caught_up.iter().all(|r| !r.starts_with("error")), "{caught_up:?}");
+    assert!(caught_up.iter().any(|r| r.contains("pub/deep/sidewalkq.txt")), "{caught_up:?}");
+    rebuild(&th, &h);
+    assert_eq!(caught_up, side_answers(&h));
+}
