@@ -1011,3 +1011,69 @@ fn hostile_bug_1397_api_commits_read_their_uploads_within_the_servers_bound() {
     assert!(grew < 1 << 30, "eight API commits at once took the server {} MiB past where it was", grew >> 20);
 }
 
+
+/// BUG-1496 (S28 cycle 3 review; BUG-1087's class): pack indexes read into
+/// memory are held outside every bound. A push reads the index of every
+/// staged pack its receipts name (`sync::staging`) and holds them all until
+/// it is answered: an index is 48 bytes a slot in memory, a staged pack may
+/// hold 2^21 objects (an upload request may be 2 GiB), and the staged-index
+/// cache (32 MiB) keeps none larger than itself, so each push reads and
+/// holds copies of its own. A participant uploads two packs of a million
+/// tiny objects once, then sends pushes that name one receipt of each and
+/// lose their race (the expected tip is wrong): the uploads stay staged,
+/// and each push holds about 96 MiB of indexes (and their 88 MB of encoding
+/// while it reads them). The same class: `Packs::refresh` holds every index
+/// of a project it has not read before it adds any (the first lookup of a
+/// large project on a server), `Packs::find_paged` one per lookup, with any
+/// number at once. Hostile size: run alone.
+#[test]
+#[ignore = "BUG-1496: a push holds every staged index its receipts name, outside any bound on memory"]
+fn hostile_bug_1496_pushes_hold_the_staged_indexes_they_name_within_a_bound() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let token = p.dev.token();
+    let tip = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+    let mut receipts = serde_json::Map::new();
+    for k in 0..2 {
+        let mut body = Vec::with_capacity(60 << 20);
+        let mut first = None;
+        for i in 0..1_000_000u32 {
+            let raw = O::Blob(format!("{k}.{i}").into_bytes()).encode();
+            let id = ObjectId::hash(&raw);
+            first.get_or_insert(id);
+            put_frame(&mut body, &id, &raw);
+        }
+        let up = api.upload_encoded_body(&token, &p.name, &body);
+        assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body[..up.body.len().min(400)]));
+        // The first receipt (the answer holds a million).
+        let text = std::str::from_utf8(&up.body).unwrap();
+        let at = text.find("[\"").expect("receipts") + 2;
+        let r = &text[at..at + text[at..].find('"').unwrap()];
+        receipts.insert(first.unwrap().hex(), json!(r));
+    }
+    let wrong = ObjectId::hash(b"not the tip");
+    let body = json!({"updates": [{"branch": "main", "expected": wrong.hex(), "new": tip.hex()}], "receipts": receipts});
+    let path = format!("/v1/projects/{}/push", p.name);
+    let vm = |field: &str| -> u64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        let l = s.lines().find(|l| l.starts_with(field)).unwrap();
+        l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() << 10
+    };
+    std::fs::write("/proc/self/clear_refs", "5").unwrap();
+    let before = vm("VmRSS:");
+    let replies: Vec<Reply> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..8).map(|_| s.spawn(|| api.post_json(Some(&token), &path, &body))).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for r in &replies {
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["results"][0]["ok"], json!(false), "the push lost its race: {}", String::from_utf8_lossy(&r.body));
+    }
+    let grew = vm("VmHWM:").saturating_sub(before);
+    assert!(
+        grew < 256 << 20,
+        "eight pushes naming two staged uploads each took the server {} MiB past where it was (the staged-index cache is 32 MiB, the lookup budget 128 MiB)",
+        grew >> 20
+    );
+}

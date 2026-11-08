@@ -1441,4 +1441,262 @@ mod tests {
         f.extend_from_slice(&[0x01, 0x00, 0x00]);
         f
     }
+
+    /// A small fixed-seed generator for the damage tests.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    /// The pack's head: the magic and the count; one index entry.
+    const PACK_HEAD: usize = 14;
+    const PACK_ENTRY: usize = 44;
+
+    /// The objects of the damage tests (id, object, encoding): plain ones
+    /// of one length (so slots can be swapped), compressed ones, and a large
+    /// plain one (ranges past `pack_range`'s single read), each with a
+    /// marker of its own.
+    fn damage_objects() -> Vec<(ObjectId, Bytes, Bytes)> {
+        let mut raws: Vec<Bytes> = (0..6).map(|i| Bytes::from(format!("veil:blob\nMARKER-DAMAGE-PLAIN-{i:02}-7d3e0b5a19c4f2"))).collect();
+        raws.extend((0..2).map(|i| Bytes::from([&b"veil:blob\n"[..], format!("MARKER-DAMAGE-COMPRESSED-{i}-").repeat(300).as_bytes()].concat())));
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut large = b"veil:blob\n".to_vec();
+        large.extend((0..(1_500_000 / 8)).flat_map(|_| rng.next().to_le_bytes()));
+        raws.push(Bytes::from(large));
+        let objs: Vec<(ObjectId, Bytes, Bytes)> = raws.into_iter().map(|raw| (ObjectId::hash(&raw), raw.clone(), encode(raw))).collect();
+        assert!(objs[..6].iter().all(|o| !encoding::is_compressed(&o.2)) && objs[6..8].iter().all(|o| encoding::is_compressed(&o.2)));
+        assert!(!encoding::is_compressed(&objs[8].2), "the large object is stored plain");
+        objs
+    }
+
+    /// Every kind of read of every object of the pack `name` of project 1
+    /// in `dir`, listed with `index` (parsed from the pack as it was when
+    /// its index was read): each answers its own object exactly, or refuses
+    /// (an error, or nothing). The number of reads answered.
+    async fn reads_answer_their_own_objects(dir: &std::path::Path, name: &Arc<str>, index: &Arc<Index>, objs: &[(ObjectId, Bytes, Bytes)], case: &str) -> usize {
+        let fresh = || {
+            let o = Objects::new(Arc::new(FsStore::new(dir)), 64 << 20);
+            o.listed_here(1, vec![(name.clone(), index.clone())]);
+            o
+        };
+        let mut answered = 0;
+        let whole = fresh();
+        let encoded = fresh();
+        for (id, raw, enc) in objs {
+            if let Ok(Some(got)) = whole.get(1, id).await {
+                assert!(got == *raw, "{case}: a whole read of {} answered other bytes", id.short());
+                answered += 1;
+            }
+            if let Ok(Some(got)) = encoded.get_encoded(1, id).await {
+                assert!(got == *enc, "{case}: an encoded read of {} answered other bytes", id.short());
+                answered += 1;
+            }
+            let len = raw.len() as u64;
+            for (start, end) in [(0, u64::MAX), (5, 40), (len.saturating_sub(3), len + 100), (len / 2, u64::MAX), (1_200_000, 1_200_100)] {
+                let ranges = fresh();
+                if let Ok(Some((part, l))) = ranges.get_range(1, id, start, end).await {
+                    let want = slice(raw, start, end);
+                    assert!(
+                        l == len && part == want,
+                        "{case}: a range {start}..={end} of {} answered {} bytes of length {l}, not its own {} bytes of length {len}: {:?}",
+                        id.short(),
+                        part.len(),
+                        want.len(),
+                        String::from_utf8_lossy(&part[..part.len().min(120)])
+                    );
+                    answered += 1;
+                }
+            }
+        }
+        // Neighbours read together, then each read from the cache.
+        let ahead = fresh();
+        let ids: Vec<ObjectId> = objs.iter().map(|o| o.0).collect();
+        ahead.prefetch(1, &ids).await;
+        for (id, raw, _) in objs {
+            if let Ok(Some(got)) = ahead.get(1, id).await {
+                assert!(got == *raw, "{case}: a read after a neighbour read of {} answered other bytes", id.short());
+                answered += 1;
+            }
+        }
+        // From a blocking thread (a local store read directly).
+        let blocking = Arc::new(fresh());
+        let rt = tokio::runtime::Handle::current();
+        let objs2 = objs.to_vec();
+        let (b, c) = (blocking.clone(), case.to_string());
+        answered += tokio::task::spawn_blocking(move || {
+            let mut n = 0;
+            for (id, raw, _) in &objs2 {
+                if let Ok(Some(got)) = b.get_blocking(&rt, 1, id) {
+                    assert!(got == *raw, "{c}: a blocking read of {} answered other bytes", id.short());
+                    n += 1;
+                }
+            }
+            n
+        })
+        .await
+        .unwrap();
+        answered
+    }
+
+    /// A pack of the damage tests in `dir`: its name, bytes and index.
+    async fn damage_pack(dir: &std::path::Path, objs: &[(ObjectId, Bytes, Bytes)]) -> (Arc<str>, Vec<u8>, Arc<Index>) {
+        let objects = Objects::new(Arc::new(FsStore::new(dir)), 1 << 20);
+        let (name, index, _) = objects.put_pack(1, 7, objs.iter().map(|(id, _, enc)| (*id, enc.clone())).collect()).await.unwrap();
+        let bytes = std::fs::read(dir.join(crate::pack::key(1, &name))).unwrap();
+        (name, bytes, index)
+    }
+
+    /// Guarantee 1 of S28 (cycle 3 review): a read of one packed object
+    /// answers exactly that object, or refuses, however the pack or its
+    /// index is damaged: any byte of the index, slots of other entries,
+    /// ids of other entries, the pack truncated before or after its index
+    /// was read, entries swapped in the pack. Whole, encoded, ranged,
+    /// neighbour and blocking reads. (A boundary moved between two
+    /// neighbouring slots is BUG-1497, below.)
+    #[tokio::test]
+    async fn packed_reads_answer_their_own_object_or_refuse_whatever_the_damage() {
+        let dir = tempfile::tempdir().unwrap();
+        let objs = damage_objects();
+        let (name, intact, index) = damage_pack(dir.path(), &objs).await;
+        let path = dir.path().join(crate::pack::key(1, &name));
+        // Undamaged: every read answers.
+        let all = reads_answer_their_own_objects(dir.path(), &name, &index, &objs, "intact").await;
+        assert_eq!(all, objs.len() * 9, "every read of an intact pack answers");
+        let hl = PACK_HEAD + objs.len() * PACK_ENTRY;
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let (mut parsed, mut refused) = (0, 0);
+        for case in 0..240 {
+            let mut bytes = intact.clone();
+            let mut stale: Option<Vec<u8>> = None;
+            let kind = case % 6;
+            let e = |i: u64| PACK_HEAD + i as usize * PACK_ENTRY;
+            let n = objs.len() as u64;
+            match kind {
+                // Any byte of the head or the index.
+                0 => {
+                    let at = 10 + rng.below((hl - 10) as u64) as usize;
+                    bytes[at] = rng.next() as u8;
+                }
+                // An entry's offset or length taken from another entry.
+                1 => {
+                    let (a, b) = (e(rng.below(n)), e(rng.below(n)));
+                    let f = if rng.below(2) == 0 { 32..40 } else { 40..44 };
+                    let v = bytes[b + f.start..b + f.end].to_vec();
+                    bytes[a + f.start..a + f.end].copy_from_slice(&v);
+                }
+                // An entry's id: another's, or a fresh one.
+                2 => {
+                    let a = e(rng.below(n));
+                    let id: [u8; 32] = if rng.below(2) == 0 {
+                        let b = e(rng.below(n));
+                        bytes[b..b + 32].try_into().unwrap()
+                    } else {
+                        ObjectId::hash(&rng.next().to_le_bytes()).0
+                    };
+                    bytes[a..a + 32].copy_from_slice(&id);
+                }
+                // Truncated before its index is read.
+                3 => bytes.truncate(rng.below(intact.len() as u64) as usize),
+                // Truncated after its index was read.
+                4 => {
+                    stale = Some(bytes.clone());
+                    bytes.truncate(hl + rng.below((intact.len() - hl) as u64) as usize);
+                }
+                // Two slots of the same length swapped in the index (the
+                // plain objects, all of one length), or their entries swapped
+                // in the pack.
+                _ => {
+                    let plain: Vec<u64> = (0..n).filter(|i| u32::from_be_bytes(bytes[e(*i) + 40..e(*i) + 44].try_into().unwrap()) as usize == 32 + objs[0].2.len()).collect();
+                    assert!(plain.len() >= 2, "plain objects of one length");
+                    let (a, b) = (plain[rng.below(plain.len() as u64) as usize], plain[rng.below(plain.len() as u64) as usize]);
+                    let (oa, ob) = (e(a), e(b));
+                    if rng.below(2) == 0 {
+                        let (sa, sb) = (bytes[oa + 32..oa + 40].to_vec(), bytes[ob + 32..ob + 40].to_vec());
+                        bytes[oa + 32..oa + 40].copy_from_slice(&sb);
+                        bytes[ob + 32..ob + 40].copy_from_slice(&sa);
+                    } else {
+                        let off = |o: usize| u64::from_be_bytes(intact[o + 32..o + 40].try_into().unwrap()) as usize;
+                        let l = 32 + objs[0].2.len();
+                        let (pa, pb) = (off(oa), off(ob));
+                        let (ea, eb) = (intact[pa..pa + l].to_vec(), intact[pb..pb + l].to_vec());
+                        bytes[pa..pa + l].copy_from_slice(&eb);
+                        bytes[pb..pb + l].copy_from_slice(&ea);
+                    }
+                }
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            let seen = stale.as_deref().unwrap_or(&bytes);
+            let damaged = match crate::pack::parse_index(seen, Some(seen.len() as u64)) {
+                Ok(i) => Arc::new(i),
+                Err(_) => {
+                    refused += 1;
+                    continue;
+                }
+            };
+            parsed += 1;
+            reads_answer_their_own_objects(dir.path(), &name, &damaged, &objs, &format!("case {case} (kind {kind})")).await;
+        }
+        println!("damage cases: {parsed} indexes accepted and read, {refused} refused");
+        assert!(parsed >= 40 && refused >= 40, "both kinds of outcome are exercised: {parsed} read, {refused} refused");
+    }
+
+    /// BUG-1497 (S28 cycle 3 review; BUG-1394's class, a route the fix did
+    /// not close): `pack::parse_index` checks that the slots tile the pack,
+    /// so each slot ends where the next one starts, but not **where** that
+    /// boundary lies. Move the boundary between two neighbouring slots (the
+    /// first one longer by `d`, the next one starting `d` later and shorter
+    /// by `d`: a merger's off-by-`d`, BUG-1154's model) and the slots still
+    /// tile: the first passes its id check, and a ranged read of a plain
+    /// object serves its own bytes and then the next entry's id and bytes
+    /// (or, moved the other way, a length that is not the object's).
+    #[tokio::test]
+    #[ignore = "BUG-1497: a boundary moved between two neighbouring slots passes the tiling check, and a range serves the neighbour's bytes"]
+    async fn bug_1497_a_boundary_moved_between_neighbours_never_serves_the_neighbours_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let objs = damage_objects();
+        let (name, intact, _) = damage_pack(dir.path(), &objs).await;
+        let path = dir.path().join(crate::pack::key(1, &name));
+        let n = objs.len();
+        let slot = |b: &[u8], i: usize| {
+            let at = PACK_HEAD + i * PACK_ENTRY;
+            (u64::from_be_bytes(b[at + 32..at + 40].try_into().unwrap()), u32::from_be_bytes(b[at + 40..at + 44].try_into().unwrap()))
+        };
+        let set = |b: &mut [u8], i: usize, off: u64, len: u32| {
+            let at = PACK_HEAD + i * PACK_ENTRY;
+            b[at + 32..at + 40].copy_from_slice(&off.to_be_bytes());
+            b[at + 40..at + 44].copy_from_slice(&len.to_be_bytes());
+        };
+        // Neighbours by offset: (index entry of the first, of the next).
+        let mut by_offset: Vec<usize> = (0..n).collect();
+        by_offset.sort_by_key(|&i| slot(&intact, i).0);
+        let mut moved = 0;
+        for w in by_offset.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            for d in [48i64, 33, 32, 31, 1, -1, -8] {
+                let ((oa, la), (ob, lb)) = (slot(&intact, a), slot(&intact, b));
+                let (la2, lb2) = (i64::from(la) + d, i64::from(lb) - d);
+                if la2 <= 32 || lb2 <= 32 {
+                    continue;
+                }
+                let mut bytes = intact.clone();
+                set(&mut bytes, a, oa, la2 as u32);
+                set(&mut bytes, b, (ob as i64 + d) as u64, lb2 as u32);
+                std::fs::write(&path, &bytes).unwrap();
+                let index = Arc::new(crate::pack::parse_index(&bytes, Some(bytes.len() as u64)).expect("the moved boundary still tiles the pack"));
+                moved += 1;
+                reads_answer_their_own_objects(dir.path(), &name, &index, &objs, &format!("the boundary after entry {a} moved by {d}")).await;
+            }
+        }
+        assert!(moved >= 40, "boundaries moved: {moved}");
+    }
 }

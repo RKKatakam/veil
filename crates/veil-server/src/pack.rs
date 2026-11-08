@@ -800,6 +800,92 @@ mod tests {
         }
     }
 
+    /// BUG-1495 (S28 cycle 3 review): `Objects::in_pack` asks
+    /// [`Packs::find`] (the loaded indexes) and then, on `Paged`,
+    /// [`Packs::find_paged`], which searches only the indexes unloaded **when
+    /// it starts**. Nothing holds the map between the two: a lookup of the
+    /// same project that pages the object's index in between (a clone's
+    /// concurrent reads past the budget do) makes it loaded, so neither call
+    /// searches it, and an object of a listed pack reads as missing. Here
+    /// the two lookups are interleaved by hand, as two tasks can be.
+    #[tokio::test]
+    #[ignore = "BUG-1495: a lookup racing another lookup's page-in reads a listed object as missing"]
+    async fn bug_1495_a_lookup_racing_a_page_in_still_finds_its_object() {
+        let budget = 1 << 20;
+        let packs = Packs { budget, ..Packs::new(None) };
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn BlobStore> = Arc::new(crate::store::FsStore::new(dir.path()));
+        // Three packs of 8,000 objects (384 KiB of index each): two fit.
+        let mut names = Vec::new();
+        let mut members = Vec::new();
+        for k in 0..3 {
+            let objects: Vec<_> = (0..8_000).map(|i| obj(&format!("pack {k} object {i}"))).collect();
+            members.push((objects[0].0, objects[1].0));
+            let (bytes, index) = build(objects).unwrap();
+            let name: Arc<str> = Arc::from(new_name());
+            store.put(&key(7, &name), bytes).await.unwrap();
+            packs.listed_here(7, vec![(name.clone(), Arc::new(index))]);
+            names.push(name);
+        }
+        assert!(total(&packs) <= budget, "within the budget: {}", total(&packs));
+        let (target, neighbour) = members[0];
+        // Task A: its object's pack (the oldest) is unloaded.
+        assert!(matches!(packs.find(7, &target), Found::Paged), "the first pack's index is unloaded past the budget");
+        // Task B, in between: pages the same pack in, for another object of it.
+        let reads = AtomicU64::new(0);
+        let b = packs.find_paged(&store, 7, &neighbour, &reads).await.unwrap();
+        assert_eq!(b.map(|(n, _)| n), Some(names[0].clone()), "task B finds its object in the first pack");
+        // Task A goes on: `find_paged`, as `in_pack` calls it on `Paged`.
+        let a = packs.find_paged(&store, 7, &target, &reads).await.unwrap();
+        assert_eq!(a.map(|(n, _)| n), Some(names[0].clone()), "an object of a listed pack read as missing");
+    }
+
+    /// BUG-1498 (S28 cycle 3 review): `Packs::discard` turns the rows
+    /// discarded, then deletes the packs one by one and stops at the first
+    /// delete that fails (a store error past its retries), so the packs after
+    /// it stay in storage, discarded, with nothing to delete them: S29's job
+    /// is documented (`HUB.md` §13.20) to remove staged rows' packs, not
+    /// discarded ones'. What a refused push uploaded (a plain-text secret,
+    /// BUG-930) then stays stored. A server stopped between the update and
+    /// the deletes leaves the same.
+    #[tokio::test]
+    #[ignore = "BUG-1498: a failed delete stops a discard, and discarded packs left in storage are removed by nothing"]
+    async fn bug_1498_a_failed_delete_leaves_no_other_discarded_pack_stored() {
+        struct FailsOnce(crate::store::FsStore, std::sync::atomic::AtomicBool);
+        #[async_trait::async_trait]
+        impl BlobStore for FailsOnce {
+            async fn get(&self, key: &str) -> Result<Option<Bytes>> {
+                self.0.get(key).await
+            }
+            async fn put(&self, key: &str, data: Bytes) -> Result<()> {
+                self.0.put(key, data).await
+            }
+            async fn exists(&self, key: &str) -> Result<bool> {
+                self.0.exists(key).await
+            }
+            async fn delete(&self, key: &str) -> Result<()> {
+                if !self.1.swap(true, Ordering::SeqCst) {
+                    bail!("the store is unreachable");
+                }
+                self.0.delete(key).await
+            }
+            async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+                self.0.list(prefix).await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = FailsOnce(crate::store::FsStore::new(dir.path()), Default::default());
+        let packs = Packs::new(None);
+        let names: Vec<Arc<str>> = (0..3).map(|_| Arc::from(new_name())).collect();
+        for (i, n) in names.iter().enumerate() {
+            store.put(&key(1, n), build(vec![obj(&format!("refused {i}"))]).unwrap().0).await.unwrap();
+        }
+        let r = packs.discard(&store, 1, &names).await;
+        assert!(r.is_err(), "the first delete fails");
+        let left = store.list("p/1/pack/").await.unwrap();
+        assert!(left.len() <= 1, "packs discarded but left in storage after one failed delete: {left:?}");
+    }
+
     /// BUG-1396 (S28 cycle 2), the same class: the recent uploads of each
     /// person in each project (`Packs::recent`, for a retry's receipts) are
     /// kept for every pair that ever uploaded on this server, never dropped:
