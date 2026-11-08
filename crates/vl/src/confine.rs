@@ -247,9 +247,10 @@ fn seed(spec: &str, root: &Path, home: Option<&Path>) -> Result<(PathBuf, PathBu
     if home.and_then(|h| h.canonicalize().ok()).is_some_and(|h| h.starts_with(&src)) {
         bail!("--seed {shown}: SRC is your home, or holds it (keys, other projects); seed a directory of its own");
     }
-    let vh = crate::ctx::veil_home();
-    if [Some(vh.clone()), vh.canonicalize().ok()].iter().flatten().any(|v| overlaps(v)) {
-        bail!("--seed {shown}: SRC is the Veil home, inside it, or holds it");
+    for vh in crate::ctx::veil_private_dirs() {
+        if [Some(vh.clone()), vh.canonicalize().ok()].iter().flatten().any(|v| overlaps(v)) {
+            bail!("--seed {shown}: SRC is the Veil home or the Veil daemon's folder, inside one, or holds one");
+        }
     }
     if overlaps(root) {
         bail!("--seed {shown}: SRC is the project, inside it, or holds it; the sandbox already shows the project's files");
@@ -891,12 +892,20 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], seeds:
         }
     }
     push(&["--tmpfs".as_ref(), home.as_os_str()]);
-    let vh = crate::ctx::veil_home();
-    let vh_real = vh.canonicalize().ok().filter(|v| v.is_dir() && v != Path::new("/"));
-    // What an allowed path may not be inside of.
-    let inside: Vec<(&Path, &str)> = [(vh_real.as_deref(), "inside the Veil home, which stays hidden"), (root, "inside the project, where the command sees its sandbox")]
+    // Veil's own state (the Veil home, the daemon's folders: one list,
+    // `ctx::veil_private_dirs`), as named and resolved.
+    let private: Vec<(PathBuf, PathBuf)> = crate::ctx::veil_private_dirs()
         .into_iter()
-        .filter_map(|(p, why)| Some((p?, why)))
+        .filter_map(|v| {
+            let real = v.canonicalize().ok().filter(|r| r.is_dir() && r != Path::new("/"))?;
+            Some((v, real))
+        })
+        .collect();
+    // What an allowed path may not be inside of.
+    let inside: Vec<(&Path, &str)> = private
+        .iter()
+        .map(|(_, real)| (real.as_path(), "inside the Veil home or the Veil daemon's folders, which stay hidden"))
+        .chain(root.map(|r| (r, "inside the project, where the command sees its sandbox")))
         .collect();
     // `(dest, src)`: where each allowed path appears, and what it shows.
     let mut bound: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -958,9 +967,10 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], seeds:
             }
         }
     }
-    // The Veil identity and keys, and the real project.
-    if let Some(v) = &vh_real {
-        masks.extend(normal(&vh).into_iter().chain([v.clone()]).chain(aliases(v)).map(|v| ("", v)));
+    // The Veil identity and keys, the daemon's store and socket, and the
+    // real project.
+    for (vh, v) in &private {
+        masks.extend(normal(vh).into_iter().chain([v.clone()]).chain(aliases(v)).map(|v| ("", v)));
     }
     if let Some(r) = root {
         masks.extend(aliases(r).into_iter().filter(|a| a != r).map(|a| ("", a)));

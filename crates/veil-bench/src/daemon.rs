@@ -50,7 +50,9 @@ fn credentials(home: &Path) -> Result<(String, Identity)> {
 /// One batch through the daemon's socket: the objects that arrived.
 fn via_daemon(socket: &Path, authority: &str, project: &str, batch: &BatchRequest) -> Result<Vec<(ObjectId, Vec<u8>)>> {
     let mut s = UnixStream::connect(socket).with_context(|| format!("the daemon at {}", socket.display()))?;
-    let body = serde_json::to_vec(&json!({"op": "batch", "upstream": authority, "project": project, "batch": batch}))?;
+    // The protocol version (1), then the request.
+    let mut body = vec![1u8];
+    body.extend_from_slice(&serde_json::to_vec(&json!({"op": "batch", "upstream": authority, "project": project, "batch": batch}))?);
     let mut msg = vec![b'Q'];
     msg.extend_from_slice(&(body.len() as u32).to_be_bytes());
     msg.extend_from_slice(&body);
@@ -62,6 +64,7 @@ fn via_daemon(socket: &Path, authority: &str, project: &str, batch: &BatchReques
         let mut payload = vec![0u8; u32::from_be_bytes(head[1..].try_into()?) as usize];
         s.read_exact(&mut payload)?;
         match head[0] {
+            b'A' => {}
             b'O' => out.push((ObjectId(payload[..32].try_into()?), payload[32..].to_vec())),
             b'E' => return Ok(out),
             k => bail!("an unknown message {k}"),

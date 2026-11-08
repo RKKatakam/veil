@@ -944,14 +944,25 @@ pub fn pull_with(repo: &mut Repo, remote: &str, client: &Client, only: Option<&s
     // request per level; an older one, one request per snapshot.
     let across = tips.revision >= 1;
     // A thin clone reads through the Veil daemon first (S6): each object's
-    // chain of trees from its snapshot's projected root, by id (an id is in
-    // the frontier once), is what the daemon checks.
+    // chain of trees from its snapshot's projected root is what the daemon
+    // checks. Kept as each object's parent (the tree or conflict naming it;
+    // an id is in the frontier once), the chain walked up when asked for.
     let daemon = thin && crate::thin::daemon_on();
     let roots: HashMap<ObjectId, ObjectId> = new_snaps.iter().copied().collect();
-    let mut chains: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+    let mut parents: HashMap<ObjectId, ObjectId> = HashMap::new();
+    let chain_of = |parents: &HashMap<ObjectId, ObjectId>, id: &ObjectId| -> Vec<ObjectId> {
+        let mut chain = Vec::new();
+        let mut cur = *id;
+        while let Some(p) = parents.get(&cur).filter(|_| chain.len() <= veil_core::hub::grant::MAX_CHAIN) {
+            chain.push(*p);
+            cur = *p;
+        }
+        chain.reverse();
+        chain
+    };
     while !frontier.is_empty() {
         let asked: Vec<(ObjectId, Vec<ObjectId>, ObjectId)> = match daemon {
-            true => frontier.iter().filter_map(|(snap, _, id, _)| Some((*roots.get(snap)?, chains.get(id).cloned().unwrap_or_default(), *id))).collect(),
+            true => frontier.iter().filter_map(|(snap, _, id, _)| Some((*roots.get(snap)?, chain_of(&parents, id), *id))).collect(),
             false => Vec::new(),
         };
         let mut next = Vec::new();
@@ -977,14 +988,10 @@ pub fn pull_with(repo: &mut Repo, remote: &str, client: &Client, only: Option<&s
                 Object::Conflict(c) => children.extend(c.referenced_ids().into_iter().map(|i| (i, w.path.clone(), 0))),
                 _ => {}
             }
-            let chain = match daemon && !children.is_empty() {
-                true => [chains.get(&w.id).cloned().unwrap_or_default(), vec![w.id]].concat(),
-                false => Vec::new(),
-            };
             for (cid, p, size) in children {
                 if !have(&cid) && seen.insert(cid) {
                     if daemon {
-                        chains.insert(cid, chain.clone());
+                        parents.insert(cid, w.id);
                     }
                     next.push((snap, p, cid, size));
                 }

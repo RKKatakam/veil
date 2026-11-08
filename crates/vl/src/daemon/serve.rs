@@ -482,12 +482,24 @@ impl Daemon {
         s.set_read_timeout(Some(READ_TIMEOUT))?;
         s.set_write_timeout(Some(WRITE_TIMEOUT))?;
         let (kind, len) = proto::read_head(&mut s, MAX_REQUEST)?;
-        if kind != proto::Q {
-            bail!("not a request");
+        match kind {
+            proto::S => {
+                self.stop_now();
+                return Ok(());
+            }
+            proto::Q => {}
+            _ => bail!("not a request"),
         }
         let _share = self.requests.take(len as u64 * 3);
-        let req: Request = serde_json::from_slice(&proto::read_payload(&mut s, len)?)?;
+        let payload = proto::read_payload(&mut s, len)?;
+        let Some((&version, json)) = payload.split_first() else { bail!("an empty request") };
+        // At once: a client that hears nothing soon asks the server instead.
+        proto::write_msg(&mut s, proto::A, &[proto::PROTOCOL])?;
         let mut w = BufWriter::with_capacity(SLICE, s);
+        if version != proto::PROTOCOL {
+            return end(&mut w, &Head { status: Some(426), body: Some(json!({ "version": proto::PROTOCOL })), ..Default::default() });
+        }
+        let req: Request = serde_json::from_slice(json)?;
         match req {
             Request::Batch { upstream, project, batch } => {
                 self.stats.requests.fetch_add(1, Ordering::Relaxed);
@@ -509,14 +521,14 @@ impl Daemon {
                 end(&mut w, &Head { status: None, body: Some(json!(f)), ..Default::default() })?;
             }
             Request::Status => end(&mut w, &Head { status: None, body: Some(self.status()), ..Default::default() })?,
-            Request::Stop => {
-                self.stop.store(true, Ordering::SeqCst);
-                end(&mut w, &Head::default())?;
-                // Wake the accept loop.
-                let _ = UnixStream::connect(&self.paths.socket);
-            }
         }
         Ok(())
+    }
+
+    fn stop_now(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // Wake the accept loop.
+        let _ = UnixStream::connect(&self.paths.socket);
     }
 
     pub fn status(&self) -> serde_json::Value {
@@ -527,6 +539,7 @@ impl Daemon {
         let confirmed = self.confirms().values().filter(|c| !c.void && c.confirmed > 0 && t - c.confirmed <= STALE_MS).count();
         json!({
             "pid": std::process::id(),
+            "protocol": proto::PROTOCOL,
             "socket": self.paths.socket,
             "store": {
                 "bytes": u.bytes, "objects": u.objects, "limit": u.limit, "pins": u.pins, "ready": u.ready,

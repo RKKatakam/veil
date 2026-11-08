@@ -230,9 +230,11 @@ pushes work as in a full clone, and a large project clones in seconds.
 
 Every thin clone and workspace on your machine shares one object cache,
 kept by a small background process, the **Veil daemon**. `vl` starts it
-the first time a thin clone needs something; thirty agents reading the
-same project then fetch each file from the server once, and a new clone
-finds the project's top folders already there (the daemon keeps the top
+the first time a thin clone needs something. Once one clone or agent
+has read a file, the others on the machine read it from the daemon, not
+the server (agents that ask for the same new file at the same moment
+each fetch it: those first reads are not combined), and a new clone finds
+the project's top folders already there (the daemon keeps the top
 folders of `main` of the projects you use up to date).
 
 ```text
@@ -250,7 +252,9 @@ vl daemon start [--cache-size 8G]  turn it on again (default size: 20 GiB or a t
   reach the server for 5 seconds it serves nothing from its cache at all.
 - **It changes no answer.** Whatever it does not send, `vl` asks the server
   for, and only the server's answer ever means "not there for you". With
-  the daemon off, or stopped, or broken, `vl` works exactly as before.
+  the daemon off, or stopped, or broken, `vl` works exactly as before: a
+  daemon that does not answer within half a second, or speaks another
+  version, is passed over for the rest of that command.
 - **It is yours alone**: its socket and cache are in folders only your OS
   user can open (`$XDG_RUNTIME_DIR/veil/` and `~/.cache/veil/daemon/`, or
   `$VEIL_HOME/daemon/`), and it refuses connections from other users.

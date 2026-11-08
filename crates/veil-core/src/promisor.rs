@@ -777,7 +777,16 @@ impl ObjectStore {
                     cur = e.id;
                 }
             }
-            (cur == *id).then_some(chain)
+            if cur == *id {
+                return Some(chain);
+            }
+            // A conflict's term, served at the conflict's path: the chain
+            // ends with the conflict object.
+            let c = self.conflict(&cur).ok()?;
+            c.referenced_ids().contains(id).then(|| {
+                chain.push(cur);
+                chain
+            })
         })
     }
 

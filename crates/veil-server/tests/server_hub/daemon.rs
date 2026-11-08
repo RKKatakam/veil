@@ -40,12 +40,23 @@ const STALE: Duration = Duration::from_secs(5);
 fn ask(socket: &Path, req: &serde_json::Value) -> (Vec<(ObjectId, Vec<u8>)>, Option<serde_json::Value>) {
     let mut s = UnixStream::connect(socket).unwrap_or_else(|e| panic!("connecting to {}: {e}", socket.display()));
     s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
-    let body = serde_json::to_vec(req).unwrap();
+    ask_as(&mut s, PROTOCOL, req)
+}
+
+/// The daemon's socket protocol version (`proto::PROTOCOL`).
+const PROTOCOL: u8 = 1;
+
+/// [`ask`] on stream `s`, the request sent as protocol version `version`.
+/// The daemon acknowledges every request with its version (`A`) first.
+fn ask_as(s: &mut UnixStream, version: u8, req: &serde_json::Value) -> (Vec<(ObjectId, Vec<u8>)>, Option<serde_json::Value>) {
+    let mut body = vec![version];
+    body.extend_from_slice(&serde_json::to_vec(req).unwrap());
     let mut msg = vec![b'Q'];
     msg.extend_from_slice(&(body.len() as u32).to_be_bytes());
     msg.extend_from_slice(&body);
     s.write_all(&msg).unwrap();
     let mut got = Vec::new();
+    let mut acked = false;
     loop {
         let mut head = [0u8; 5];
         if s.read_exact(&mut head).is_err() {
@@ -57,7 +68,13 @@ fn ask(socket: &Path, req: &serde_json::Value) -> (Vec<(ObjectId, Vec<u8>)>, Opt
             return (got, None);
         }
         match head[0] {
+            b'A' => {
+                assert!(!acked && got.is_empty(), "the acknowledgement comes first, once");
+                assert_eq!(payload, [PROTOCOL], "the daemon's version");
+                acked = true;
+            }
             b'O' => {
+                assert!(acked, "an object before the acknowledgement");
                 let id = ObjectId(payload[..32].try_into().unwrap());
                 let raw = payload[32..].to_vec();
                 assert_eq!(ObjectId::hash(&raw), id, "the daemon sent bytes that are not the object's");
@@ -1006,8 +1023,10 @@ fn vl_works_without_the_daemon() {
                 }
                 let mut body = vec![0u8; u32::from_be_bytes(head[1..].try_into().unwrap()) as usize];
                 let _ = s.read_exact(&mut body);
-                let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-                let mut out = Vec::new();
+                let req: serde_json::Value = serde_json::from_slice(body.get(1..).unwrap_or_default()).unwrap_or_default();
+                // Acknowledged as a daemon of this version is: the lie is in
+                // what follows.
+                let mut out = vec![b'A', 0, 0, 0, 1, PROTOCOL];
                 if wrong {
                     for w in req["batch"]["wants"].as_array().into_iter().flatten() {
                         let id = ObjectId::from_hex(w["id"].as_str().unwrap()).unwrap();
@@ -1036,7 +1055,6 @@ fn vl_works_without_the_daemon() {
 /// answers (a daemon wedged, stopped, or its disk hung) costs a `vl` at
 /// most one wait, not one wait for every request it would have sent there.
 #[test]
-#[ignore = "BUG-1514: a stalled daemon costs vl 60 s for every request, so a clone takes minutes"]
 fn a_stalled_daemon_costs_a_vl_at_most_one_wait() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1068,7 +1086,73 @@ fn a_stalled_daemon_costs_a_vl_at_most_one_wait() {
     assert_eq!(std::fs::read_to_string(c.join("src/lib.rs")).unwrap(), PUBLIC_MARK);
     assert!(asked > 0, "the clone never asked the daemon");
     eprintln!("a clone with a stalled daemon: {took:?}, {asked} connection(s)");
-    assert!(took < Duration::from_secs(75), "a clone with a stalled daemon took {took:?} ({asked} connections)");
+    // One wait for an acknowledgement (0.5 s), then the server: the same
+    // clone without a daemon takes a second or two here.
+    assert!(took < Duration::from_secs(15), "a clone with a stalled daemon took {took:?} ({asked} connections)");
+}
+
+/// A `vl` and a daemon of other protocol versions agree (the socket's
+/// version, `proto::PROTOCOL`): the daemon serves nothing to a request of
+/// another version and says its own; a `vl` that meets an older daemon
+/// stops it and reads from the server, so the next `vl` starts its own; a
+/// clone meanwhile answers as the server.
+#[test]
+fn a_vl_and_a_daemon_of_other_versions_agree() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let who = &p.dev;
+    let d = Daemon::start(who, None);
+    // A request of another version: refused, nothing served.
+    let mut s = UnixStream::connect(&d.socket).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let server = hub.api();
+    let r = Reader::new(&server, &d.socket, &hub.authority(), Some(who), &p.name);
+    let req = serde_json::json!({"op": "status"});
+    let mut body = vec![PROTOCOL + 1];
+    body.extend_from_slice(&serde_json::to_vec(&req).unwrap());
+    let mut msg = vec![b'Q'];
+    msg.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    msg.extend_from_slice(&body);
+    s.write_all(&msg).unwrap();
+    let mut all = Vec::new();
+    s.read_to_end(&mut all).unwrap();
+    assert_eq!(&all[..6], &[b'A', 0, 0, 0, 1, PROTOCOL], "acknowledged with the daemon's version");
+    let end: serde_json::Value = serde_json::from_slice(&all[11..]).unwrap();
+    assert_eq!((all[6], end["status"].as_u64(), end["body"]["version"].as_u64()), (b'E', Some(426), Some(PROTOCOL as u64)), "{end}");
+    assert_eq!(r.batch(&[(Vec::new(), r.root())]).len(), 1, "a request of this version is still served");
+    // An older daemon: acknowledges with version 0. The clone stops it
+    // (the empty `S`, the same in every version) and reads from the server.
+    who.ok(who.home.path(), &["daemon", "stop"]);
+    std::fs::remove_file(d.dir.join("off")).unwrap();
+    let _ = std::fs::remove_file(&d.socket);
+    let l = std::os::unix::net::UnixListener::bind(&d.socket).unwrap();
+    let older = std::thread::spawn(move || {
+        l.set_nonblocking(true).unwrap();
+        let t = Instant::now();
+        let mut kinds = Vec::new();
+        while t.elapsed() < Duration::from_secs(60) && !kinds.contains(&b'S') {
+            let Ok((mut s, _)) = l.accept() else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            s.set_nonblocking(false).unwrap();
+            let mut head = [0u8; 5];
+            if s.read_exact(&mut head).is_err() {
+                continue;
+            }
+            let mut body = vec![0u8; u32::from_be_bytes(head[1..].try_into().unwrap()) as usize];
+            let _ = s.read_exact(&mut body);
+            kinds.push(head[0]);
+            let _ = s.write_all(&[b'A', 0, 0, 0, 1, 0]);
+        }
+        kinds
+    });
+    let c = who.dir("older");
+    who.ok(who.home.path(), &["clone", &hub.url(&p.name), c.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(c.join("src/lib.rs")).unwrap(), PUBLIC_MARK);
+    let kinds = older.join().unwrap();
+    assert!(kinds.contains(&b'S'), "the older daemon was not stopped: {kinds:?}");
+    assert_eq!(kinds.iter().filter(|k| **k == b'Q').count(), 1, "asked once, then the server: {kinds:?}");
 }
 
 // ---- 6. its user's alone ------------------------------------------------------------

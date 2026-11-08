@@ -212,7 +212,6 @@ fn the_veil_identity_keys_and_the_real_repository_are_not_visible() {
 /// home: `~/.cache/veil/daemon/`, the socket in its `run/` without
 /// `XDG_RUNTIME_DIR`.
 #[test]
-#[ignore = "BUG-1512: the daemon's store and socket are not hidden from vl ws exec when an allowed folder holds them"]
 fn the_daemons_store_and_socket_stay_hidden_when_an_allowed_folder_holds_them() {
     const STORED: &str = "DAEMON-STORE-OBJECT-OF-ANOTHER-PROJECT-3c71e0b5";
     let t = T::new();

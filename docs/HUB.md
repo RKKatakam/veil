@@ -3045,9 +3045,11 @@ vl daemon status | start [--cache-size SIZE] | stop
   socket is removed or replaced, `off` appears, its Veil home's identity
   is gone, or nobody read or pinned through it for an hour (the next `vl`
   that needs it starts it again, its store as it was). It never makes a
-  Veil home: only its own directory, inside one that exists (found running
-  the suites: a test's home, removed while a daemon started, was made
-  again and the daemon ran on; `the_daemon_never_outlives_its_veil_home`).
+  Veil home: only its own directory, inside one that exists, and below it
+  one folder at a time, never their parents (found running the suites: a
+  test's home, removed while a daemon started, was made again and the
+  daemon ran on, `the_daemon_never_outlives_its_veil_home`; and an object
+  kept while its home was removed made it again, BUG-1513).
 * **What the design assumes of the machine** (§4.1: "the machine is
   theirs"): one OS user is one person, or people who may read each other's
   files. The store is that user's files, as each clone's `.veil/cache/`
@@ -3055,9 +3057,14 @@ vl daemon status | start [--cache-size SIZE] | stop
   whose daemons share no socket, store or process. Within one OS user every
   request is still checked by its own grant and device signature, which is
   what keeps another Veil home's device, and later a narrower agent
-  session (S11), to its own projection through the socket. Sandboxed
-  commands (`vl ws exec`) see neither the socket nor the store: the
-  sandbox puts a tmpfs over `HOME` and `/tmp` and an empty `/run`.
+  session (S11), to its own projection through the socket. **Sandboxed
+  commands (`vl ws exec`) see neither the socket nor the store**: the
+  daemon's folders are Veil's own private folders, listed with the Veil
+  home in one place (`ctx::veil_private_dirs`), which the confinement
+  hides wherever a sandbox could show them (under every allowed path or
+  seed that holds them, an allowed path inside one refused) and Veil's
+  sandboxes never write through a link into (BUG-1512: `--allow
+  ~/.cache` showed the store, which is outside the Veil home by default).
 
 #### The decision, per request
 
@@ -3156,8 +3163,20 @@ returns no object.
   and at most 4 arenas, so what the budgets free is given back (before:
   325 MiB peak in the test below; after: 69 MiB).
 * **Time:** a request within 20 s of connecting, each write within 30 s;
-  to the server, connecting within 5 s and each read within 30 s. A client
-  waits at most 60 s between messages, then asks the server.
+  to the server, connecting within 5 s and each read within 30 s. The
+  daemon acknowledges a request as soon as it has read it; a client waits
+  at most 0.5 s for that and 35 s between two messages of an answer.
+  **A daemon that fails a process once** (no acknowledgement, an answer
+  that stalls, ends unfinished or sends what was not asked, another
+  version) **is not asked again by that process**, which reads from the
+  server (BUG-1514: a stalled daemon cost every request a full wait, a
+  small clone 184 s; now one wait of 0.5 s).
+* **Versions:** every request names the socket protocol's version and every
+  acknowledgement the daemon's (`proto::PROTOCOL`, now 1). A daemon serves
+  nothing to a request of another version (`426` with its own); a `vl`
+  that meets a daemon of another version reads from the server, and stops
+  an older one (the empty stop message is the same in every version), so
+  the next `vl` starts its own.
 
 #### Guarantees and their tests (`server_hub::daemon`)
 
@@ -3171,7 +3190,8 @@ returns no object.
 | 5 | A `vl` without the daemon works: off is not started again; a daemon killed with `SIGKILL` leaves `vl` working (and is started again); a daemon that answers nothing, or wrong bytes for every object, changes no answer | `vl_works_without_the_daemon` |
 | 6 | Its socket and store are its user's alone (0700, 0600; a 0777 directory narrowed); a damaged object in its store is never served | `the_daemons_socket_and_store_are_its_users_alone` |
 | — | Warm trees: a new tip's trees to depth 3 in the store with no reader, nothing deeper; a new clone reads them from the store | `the_daemon_keeps_the_top_trees_of_followed_projects_warm` |
-| — | It never outlives its Veil home: exits within a second once the identity is gone; in a removed home, `vl daemon run` and `start` refuse and make nothing | `the_daemon_never_outlives_its_veil_home` |
+| — | It never outlives its Veil home: exits within a second once the identity is gone; in a removed home, `vl daemon run` and `start` refuse and make nothing; nor does keeping an object | `the_daemon_never_outlives_its_veil_home`, `daemon::store::tests::keeping_an_object_never_makes_a_removed_veil_home_again` (BUG-1513) |
+| — | A stalled daemon costs a process one short wait; a `vl` and a daemon of other versions agree | `a_stalled_daemon_costs_a_vl_at_most_one_wait` (BUG-1514), `a_vl_and_a_daemon_of_other_versions_agree` |
 
 #### Threat review (design §6 rows 1–5, 8, 9, 14, 15, 18, plus this milestone's)
 
@@ -3181,7 +3201,7 @@ returns no object.
 | 2 | Same | a real grant with a chain through another snapshot's or the admin's trees | chains start at the grant's root, each step from the hash-checked store | guarantee 1 |
 | 3 | A same-user process | hands the daemon its own grant key and a grant it signed | no such field: the daemon checks under the key it fetched from the server | by construction; guarantee 1 (a grant signed by another key) |
 | 4 | A person or device removed | keeps using a grant | refused within 5 s | guarantee 2 |
-| 5 | A sandboxed agent (`vl ws exec`) | connects to the socket, reads the store | the sandbox's `HOME`, `/tmp` and `/run` are its own; without the device key it could not sign a request anyway | the sandbox's own tests (S8, `confine.rs`); by construction |
+| 5 | A sandboxed agent (`vl ws exec`) | connects to the socket, reads the store, also through an allowed folder that holds them (`--allow ~/.cache`) | both hidden as the Veil home is, wherever the sandbox could show them (BUG-1512); without the device key it could not sign a request anyway | `cli_workspaces` `confine_cli::the_daemons_store_and_socket_stay_hidden_when_an_allowed_folder_holds_them` |
 | 6 | Another OS user | connects to the socket, reads the store | the directories are 0700 and the peer's uid is checked | guarantee 6 (modes; a second uid needs root to test) |
 | 7 | A local process, a torn write | changes bytes in the store | the object fails its id check, is removed, comes from the server | guarantee 6, `store::tests` |
 | 8 | A lying or broken daemon (a same-user process on its socket) | answers nothing, wrong bytes, another object, one object without end | the client checks each object's id, that it was asked for and arrives once; the rest from the server | guarantee 5 |

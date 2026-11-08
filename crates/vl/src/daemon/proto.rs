@@ -1,13 +1,21 @@
 //! The daemon's local protocol (its socket, `docs/HUB.md` §13.29).
 //!
 //! Messages are `kind (1 byte) ‖ length (u32, big-endian) ‖ payload`.
-//! A client sends one request ([`Q`], JSON) per connection; the daemon
-//! answers object frames ([`O`]: the id, then the object's bytes), then
-//! [`E`] once the answer is whole (JSON, a [`Head`]). Anything else (an
-//! error, a closed connection, a timeout) leaves the answer unfinished: the
-//! client keeps the objects that arrived (each checked against its id) and
-//! asks the server itself for the rest. An object the daemon leaves out is
-//! never an answer: only the server's refusal is.
+//! A client sends one request per connection: [`Q`], its payload the
+//! protocol version ([`PROTOCOL`], one byte) and then JSON. The daemon
+//! acknowledges it at once ([`A`], its own version), then answers object
+//! frames ([`O`]: the id, then the object's bytes), then [`E`] once the
+//! answer is whole (JSON, a [`Head`]). Anything else (an error, a closed
+//! connection, a timeout) leaves the answer unfinished: the client keeps
+//! the objects that arrived (each checked against its id) and asks the
+//! server itself for the rest. An object the daemon leaves out is never an
+//! answer: only the server's refusal is.
+//!
+//! **Versions.** A daemon answers a request of another version with `E`
+//! status 426 and its version, and serves nothing. A `vl` that meets a
+//! daemon of another version reads from the server for the rest of the
+//! process; one newer than the daemon stops it ([`S`], the one message every
+//! version keeps as it is: an empty stop), so the next `vl` starts its own.
 
 use std::io::{Read, Write};
 
@@ -15,8 +23,15 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use veil_core::{hub::grant::BatchRequest, ObjectId};
 
-/// A request (JSON).
+/// The protocol's version: a request's first byte, and the acknowledgement's.
+pub const PROTOCOL: u8 = 1;
+/// A request: the version, then JSON.
 pub const Q: u8 = b'Q';
+/// The acknowledgement, sent as soon as a request is read: the daemon's
+/// version.
+pub const A: u8 = b'A';
+/// Stop, empty: the same in every version.
+pub const S: u8 = b'S';
 /// One object: its id (32 bytes), then its bytes.
 pub const O: u8 = b'O';
 /// The end of a whole answer (JSON: [`Head`]).
@@ -43,7 +58,6 @@ pub enum Request {
     /// The projects followed (for `vl daemon follow`).
     Follows,
     Status,
-    Stop,
 }
 
 /// What ends an answer.

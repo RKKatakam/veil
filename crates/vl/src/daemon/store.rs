@@ -115,8 +115,10 @@ impl Store {
     }
 
     pub fn open_with(dir: &Path, limit: u64, max_entries: usize) -> Result<Arc<Store>> {
-        super::private_dir(dir)?;
-        std::fs::create_dir_all(dir.join("objects"))?;
+        // Below the daemon's own folder, which `Paths::prepare` made: never
+        // its parents (BUG-1513).
+        super::private_subdir(dir)?;
+        super::private_subdir(&dir.join("objects"))?;
         let pins: BTreeMap<String, Pin> = std::fs::read(dir.join("pins.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let s = Arc::new(Store {
             dir: dir.to_path_buf(),
@@ -256,7 +258,14 @@ impl Store {
         let path = self.path(key);
         static WRITES: AtomicU64 = AtomicU64::new(0);
         let tmp = path.with_extension(format!("tmp{}-{}", std::process::id(), WRITES.fetch_add(1, Ordering::Relaxed)));
-        let written = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::write(&tmp, raw)).and_then(|_| std::fs::rename(&tmp, &path));
+        // The fan-out folder alone (`objects/` exists from `open`): a store
+        // removed meanwhile (its Veil home) fails the write, and nothing is
+        // made again (BUG-1513).
+        let fan_out = path.parent().map_or(Ok(()), |d| match std::fs::create_dir(d) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e),
+            _ => Ok(()),
+        });
+        let written = fan_out.and_then(|_| std::fs::write(&tmp, raw)).and_then(|_| std::fs::rename(&tmp, &path));
         if written.is_err() {
             let _ = std::fs::remove_file(&tmp);
             self.counters.not_kept.fetch_add(1, Ordering::Relaxed);
@@ -469,10 +478,11 @@ mod tests {
     /// the daemon sees the home gone) is not kept, and nothing is made
     /// again.
     #[test]
-    #[ignore = "BUG-1513: Store::put makes its folders with create_dir_all, which makes a removed Veil home again"]
     fn keeping_an_object_never_makes_a_removed_veil_home_again() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("veil-home");
+        // As `Paths::prepare` leaves it: the home and the daemon's folder.
+        std::fs::create_dir_all(home.join("daemon")).unwrap();
         let s = Store::open(&home.join("daemon").join("store"), 1 << 30).unwrap();
         wait_ready(&s);
         let (id, raw) = blob(1, 100);

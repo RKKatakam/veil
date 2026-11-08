@@ -56,19 +56,14 @@ impl Paths {
     /// one that exists: a daemon or `vl` racing the removal of its Veil
     /// home never makes it again.
     pub fn prepare(&self) -> Result<()> {
-        if let Some(h) = &self.home {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                match std::fs::DirBuilder::new().mode(0o700).create(&self.state) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(e) => bail!("the Veil home {} is not there ({e})", h.display()),
-                }
+        match &self.home {
+            // `state` and `run` are one folder, in the home.
+            Some(h) => private_subdir(&self.state).map_err(|e| anyhow::anyhow!("the Veil home {} is not there ({e:#})", h.display())),
+            None => {
+                private_dir(&self.state)?;
+                private_dir(&self.run)
             }
         }
-        private_dir(&self.state)?;
-        private_dir(&self.run)
     }
 }
 
@@ -87,12 +82,29 @@ pub fn paths() -> Paths {
 }
 
 /// Make `dir` (and its parents) and check it is this user's and no one
-/// else's: owned by this user, mode 0700 (set if it was wider).
+/// else's: owned by this user, mode 0700 (set if it was wider). Only for
+/// the default layout's folders (`~/.cache/veil/daemon`, the runtime
+/// folder); inside a Veil home, [`private_subdir`].
 pub fn private_dir(dir: &Path) -> Result<()> {
+    make_private(dir, true)
+}
+
+/// [`private_dir`], making `dir` alone: its parent must exist, so a folder
+/// removed meanwhile (a Veil home being removed) is never made again
+/// (BUG-1513).
+pub fn private_subdir(dir: &Path) -> Result<()> {
+    make_private(dir, false)
+}
+
+fn make_private(dir: &Path, parents: bool) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).with_context(|| format!("creating {}", dir.display()))?;
+        match std::fs::DirBuilder::new().recursive(parents).mode(0o700).create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+        }
         let m = std::fs::symlink_metadata(dir)?;
         if !m.is_dir() || m.uid() != my_uid() {
             bail!("{} is not a directory of this user's: the daemon will not use it", dir.display());
@@ -102,7 +114,13 @@ pub fn private_dir(dir: &Path) -> Result<()> {
         }
     }
     #[cfg(not(unix))]
-    std::fs::create_dir_all(dir)?;
+    match parents {
+        true => std::fs::create_dir_all(dir)?,
+        false => match std::fs::create_dir(dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e.into()),
+            _ => {}
+        },
+    }
     Ok(())
 }
 
@@ -208,9 +226,32 @@ mod client {
 
     fn connect_at(p: &Paths) -> Option<UnixStream> {
         let s = UnixStream::connect(&p.socket).ok()?;
-        s.set_read_timeout(Some(Duration::from_secs(60))).ok()?;
-        s.set_write_timeout(Some(Duration::from_secs(10))).ok()?;
+        s.set_write_timeout(Some(Duration::from_secs(2))).ok()?;
         Some(s)
+    }
+
+    /// Stop the running daemon, whatever its version ([`proto::S`]).
+    pub fn stop_running() {
+        if let Some(mut s) = connect() {
+            let _ = proto::write_msg(&mut s, proto::S, &[]);
+        }
+    }
+
+    /// The daemon failed this process once (no acknowledgement within
+    /// [`ACK_WAIT`], an answer that stalled or made no sense, another
+    /// protocol version): the process reads from the server directly from
+    /// then on (BUG-1514: a stalled daemon cost every request a full wait).
+    static UNUSABLE: AtomicBool = AtomicBool::new(false);
+    /// How long a request waits for the daemon's acknowledgement (it is
+    /// sent as soon as the request is read: a daemon that is stopped,
+    /// wedged or on a hung disk costs this, once).
+    const ACK_WAIT: Duration = Duration::from_millis(500);
+    /// How long a request waits between two messages of an answer: the
+    /// daemon's own wait for the server's next bytes (30 s) and a margin.
+    const BETWEEN: Duration = Duration::from_secs(35);
+
+    fn give_up() {
+        UNUSABLE.store(true, Ordering::SeqCst);
     }
 
     /// The daemon, started if it is not running and not turned off
@@ -218,7 +259,7 @@ mod client {
     pub fn connect_or_start() -> Option<UnixStream> {
         static TRIED: AtomicBool = AtomicBool::new(false);
         let p = paths();
-        if p.off.exists() {
+        if p.off.exists() || UNUSABLE.load(Ordering::SeqCst) {
             return None;
         }
         if let Some(s) = connect_at(&p) {
@@ -260,29 +301,62 @@ mod client {
     /// Send `req`; the objects that arrived (each checked against its id
     /// and asked for), and the answer's end if it arrived (`None`: the
     /// answer is unfinished).
+    ///
+    /// A daemon that does not acknowledge within [`ACK_WAIT`], stalls
+    /// [`BETWEEN`] messages, sends anything but what was asked, or speaks
+    /// another version, is not asked again by this process; one older than
+    /// this `vl` is stopped, so the next `vl` starts its own.
     pub fn request(mut s: UnixStream, req: &Request, wanted: &dyn Fn(&ObjectId) -> bool) -> (Vec<(ObjectId, Vec<u8>)>, Option<Head>) {
         let mut got = Vec::new();
-        let Ok(body) = serde_json::to_vec(req) else { return (got, None) };
-        if proto::write_msg(&mut s, proto::Q, &body).is_err() {
+        let Ok(json) = serde_json::to_vec(req) else { return (got, None) };
+        let mut body = vec![proto::PROTOCOL];
+        body.extend_from_slice(&json);
+        if proto::write_msg(&mut s, proto::Q, &body).is_err() || s.set_read_timeout(Some(ACK_WAIT)).is_err() {
+            give_up();
             return (got, None);
         }
         let mut r = std::io::BufReader::with_capacity(64 << 10, s);
+        match proto::read_head(&mut r, 1).and_then(|(kind, len)| Ok((kind, proto::read_payload(&mut r, len)?))) {
+            Ok((proto::A, v)) if v == [proto::PROTOCOL] => {}
+            Ok((proto::A, v)) => {
+                if v.first().is_some_and(|d| *d < proto::PROTOCOL) {
+                    stop_running();
+                }
+                give_up();
+                return (got, None);
+            }
+            _ => {
+                give_up();
+                return (got, None);
+            }
+        }
+        if r.get_ref().set_read_timeout(Some(BETWEEN)).is_err() {
+            give_up();
+            return (got, None);
+        }
         let mut seen = std::collections::HashSet::new();
+        let failed = |got| {
+            give_up();
+            (got, None)
+        };
         loop {
-            let Ok((kind, len)) = proto::read_head(&mut r, MAX_OBJECT + 32) else { return (got, None) };
-            let Ok(payload) = proto::read_payload(&mut r, len) else { return (got, None) };
+            let Ok((kind, len)) = proto::read_head(&mut r, MAX_OBJECT + 32) else { return failed(got) };
+            let Ok(payload) = proto::read_payload(&mut r, len) else { return failed(got) };
             match kind {
                 proto::O => {
-                    let Ok((id, raw)) = proto::object_of(payload) else { return (got, None) };
+                    let Ok((id, raw)) = proto::object_of(payload) else { return failed(got) };
                     // Never wrong bytes: an object that is not what was
                     // asked for, or sent twice, ends the answer.
                     if !wanted(&id) || !seen.insert(id) || ObjectId::hash(&raw) != id {
-                        return (got, None);
+                        return failed(got);
                     }
                     got.push((id, raw));
                 }
-                proto::E => return (got, serde_json::from_slice(&payload).ok()),
-                _ => return (got, None),
+                proto::E => match serde_json::from_slice(&payload) {
+                    Ok(h) => return (got, Some(h)),
+                    Err(_) => return failed(got),
+                },
+                _ => return failed(got),
             }
         }
     }
@@ -300,8 +374,10 @@ mod client {
     /// Ask the running daemon (never started for this) to pin `roots` for
     /// working copy `key`.
     pub fn pin(authority: &str, project: &str, key: &str, roots: Vec<ObjectId>) {
+        if UNUSABLE.load(Ordering::SeqCst) {
+            return;
+        }
         let Some(s) = connect() else { return };
-        let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
         let req = Request::Pin { upstream: authority.to_string(), project: project.to_string(), key: key.to_string(), roots };
         let _ = request(s, &req, &|_| false);
     }
@@ -372,9 +448,7 @@ pub fn run(cmd: &DaemonCmd) -> Result<std::process::ExitCode> {
             DaemonCmd::Stop => {
                 p.prepare()?;
                 std::fs::write(&p.off, b"off\n")?;
-                if let Some(s) = connect() {
-                    let _ = request(s, &proto::Request::Stop, &|_| false);
-                }
+                stop_running();
                 let t = std::time::Instant::now();
                 while connect().is_some() {
                     if t.elapsed() > std::time::Duration::from_secs(5) {
@@ -401,6 +475,10 @@ fn write_config(p: &Paths, limit: u64) -> Result<()> {
 fn print_status(p: &Paths) {
     use veil_core::promisor::human;
     let Some(s) = status() else {
+        if connect().is_some() {
+            println!("Veil daemon: one this vl cannot read runs (another version, or not answering); `vl daemon stop` stops it");
+            return;
+        }
         match p.off.exists() {
             true => println!("Veil daemon: off (`vl daemon start` turns it on)"),
             false => println!("Veil daemon: not running (vl starts it when a thin clone needs it)"),
