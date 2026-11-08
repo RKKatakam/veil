@@ -86,6 +86,22 @@ impl TestHub {
         TestHub::run(config, dir)
     }
 
+    /// This server stopped and started again on the same port, data
+    /// directory and storage, its memory empty (as after an upgrade);
+    /// `between` runs while it is down (a migration).
+    pub fn restart(mut self, between: impl FnOnce(&str)) -> TestHub {
+        if let Some(r) = self.running.take() {
+            self.rt.block_on(r.stop());
+        }
+        between(&self.config.database_url);
+        let config = Config {
+            listen: format!("127.0.0.1:{}", self.port).parse().unwrap(),
+            ..self.config.clone()
+        };
+        let dir = std::mem::replace(&mut self._dir, tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap());
+        TestHub::run(config, dir)
+    }
+
     fn run(config: Config, dir: tempfile::TempDir) -> TestHub {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()

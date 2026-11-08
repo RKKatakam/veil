@@ -1842,3 +1842,55 @@ fn s3rd2_a_thin_clone_made_before_a_rewrite_pulls_it_as_a_full_clone() {
     }
     assert!(diffs.is_empty(), "a thin clone made before a rewrite shows otherwise than a full clone after pulling it:\n{}", diffs.join("\n\n"));
 }
+
+/// BUG-1384 (S3 redesign, cycle 3; properties 2 and 4: a thin clone
+/// answers as a full clone; the viewer graph is a cache, refilled when it
+/// is cleared). A thin clone and a full clone made before a rewrite
+/// elsewhere both pull it; their old tip stays a head (its tag diverged).
+/// Then the server is upgraded: migration 19 clears the viewer graph
+/// (`DELETE FROM view_graph`), and the server starts again. A thin clone
+/// names what its server does not show it from its own refs (`from`,
+/// BUG-1319), sending only those `q/generations` knows
+/// (`Repo::server_roots`); `q/generations` answers from rows already in the
+/// viewer graph, and refills only what the branches reach. The old tip is
+/// no longer filled, so it reads as the clone's own unpushed work, and the
+/// old versions below it, which the clone does not hold, are named by no
+/// root: "revision … not found", where the full clone shows them (and the
+/// thin clone did before the cache was cleared).
+#[test]
+#[ignore = "BUG-1384: after the viewer graph is cleared, a thin clone's old tip is unknown to q/generations and its old versions cannot be named"]
+fn s3rd3_a_thin_clone_names_its_old_versions_after_the_viewer_graph_is_cleared() {
+    let hub = TestHub::start();
+    let (admin, dir, name) = project_with_history(&hub, 6, 10);
+    let full = admin.dir("full");
+    admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    let first: String = change_of(&admin, &dir, "first").chars().take(12).collect();
+    let old_three = snapshot_of(&admin, &dir, "commit 3");
+    admin.ok(&dir, &["describe", "-r", &first, "-m", "first, renamed"]);
+    admin.ok(&dir, &["push", "--force"]);
+    for d in [&full, &thin] {
+        admin.ok(d, &["pull"]);
+    }
+    let hub = hub.restart(|url| {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let db = veil_server::db::connect(url, 1).await.unwrap();
+            // What migration 19 does (and the new table, which it creates empty).
+            sqlx::raw_sql("DELETE FROM view_graph; DELETE FROM view_changes").execute(&db).await.unwrap();
+            db.close().await;
+        });
+    });
+    let mut diffs = Vec::new();
+    for args in [vec!["show", "--json", &old_three[..12]], vec!["show", "--json", &old_three]] {
+        let want = answer(&admin, &full, &args);
+        assert!(want.0 && want.1.contains(&old_three), "the full clone shows the old version (`vl {}`): {}", args.join(" "), want.1);
+        let got = answer(&admin, &thin, &args);
+        if got != want {
+            diffs.push(format!("`vl {}`: thin ({}): {}", args.join(" "), got.0, got.1.chars().take(400).collect::<String>()));
+        }
+    }
+    drop(hub);
+    assert!(diffs.is_empty(), "after the viewer graph is cleared, a thin clone names its old versions otherwise than a full clone:\n{}", diffs.join("\n"));
+}

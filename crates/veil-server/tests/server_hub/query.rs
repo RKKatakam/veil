@@ -2199,3 +2199,73 @@ fn s3rd2_resolve_reads_a_bounded_part_of_the_callers_graph() {
     let out = th.rt.block_on(async { norm(settled(|| query::resolve_prefix(&h.hub, &x, &prefix, &[], small)).await) });
     assert!(out.starts_with("error 400") && out.contains("give more of it"), "{out}");
 }
+
+/// Property 1 of the S3 redesign's cycle 3 review: `q/resolve` with `from`
+/// roots shows each viewer only their own history. On random histories,
+/// for every viewer, `from` mixes their own ids (reached by a branch or
+/// not), real ids of snapshots hidden from them, other viewers' ids and
+/// withheld snapshots; each answer (snapshot id and change id prefixes) is
+/// the one their admin gets, with the same `from`, on a copy of the
+/// project built from their projected history alone (where nothing hidden
+/// exists, and the other ids are unknown), and names no hidden real id.
+#[test]
+fn s3rd3_resolve_from_roots_is_projection_equivalent() {
+    let th = TestHub::start();
+    for seed in seeds(&[131, 132]) {
+        let carol = 730_000 + seed as i64;
+        let (policy_text, bindings) = policy(carol);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let mut rng = Rng::new(seed);
+        random_history(&th, &mut h, &mut rng, 40);
+        let project = h.project(&th);
+        let all = viewers(carol);
+        let projs: Vec<HashMap<ObjectId, ObjectId>> = all.iter().map(|(_, v)| projections(&th, &h, &project, v)).collect();
+        let mut compared = 0usize;
+        for (i, (who, viewer)) in all.iter().enumerate() {
+            let p = &projs[i];
+            let copy = copy_for(&th, &h, &project, viewer, p);
+            let mine: Vec<ObjectId> = p.values().copied().collect::<BTreeSet<_>>().into_iter().collect();
+            let hidden_real: Vec<ObjectId> = h.order.iter().copied().filter(|s| p[s] != *s).collect();
+            let others: Vec<ObjectId> = projs
+                .iter()
+                .flat_map(|q| q.values().copied())
+                .filter(|x| !mine.contains(x))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let (mine_ask, copy_ask) = (ask(&th, &h, viewer), ask(&th, &copy, &admin()));
+            warm_up(&th, &h, viewer);
+            warm_up(&th, &copy, &admin());
+            for round in 0..10 {
+                let mut from: Vec<ObjectId> = (0..rng.below(4)).map(|_| mine[rng.below(mine.len())]).collect();
+                if !hidden_real.is_empty() && rng.chance(60) {
+                    from.push(hidden_real[rng.below(hidden_real.len())]);
+                }
+                if !others.is_empty() && rng.chance(60) {
+                    from.push(others[rng.below(others.len())]);
+                }
+                let target = mine[rng.below(mine.len())];
+                let mut prefixes = vec![target.hex()[..4].to_string(), target.hex()[..12].to_string()];
+                if let Some(s) = hidden_real.first() {
+                    prefixes.push(s.hex()[..12].to_string());
+                }
+                let letters = "klmnopqrstuvwxyz".as_bytes();
+                prefixes.push((letters[rng.below(16)] as char).to_string());
+                prefixes.push(format!("{}{}", letters[rng.below(16)] as char, letters[rng.below(16)] as char));
+                for prefix in &prefixes {
+                    let run = |hh: &Hist, a: &Ask| {
+                        th.rt.block_on(async { norm(settled(|| query::resolve_prefix(&hh.hub, a, prefix, &from, Limits::default())).await) })
+                    };
+                    let (real, theirs) = (run(&h, &mine_ask), run(&copy, &copy_ask));
+                    assert!(!real.starts_with("error"), "seed {seed}, {who}, round {round}: q/resolve {prefix} from {from:?} failed: {real}");
+                    assert_eq!(real, theirs, "seed {seed}, {who}, round {round}: q/resolve {prefix} from {from:?}");
+                    for s in &hidden_real {
+                        assert!(!real.contains(&s.hex()), "seed {seed}, {who}: real id {} in {real}", s.short());
+                    }
+                    compared += 1;
+                }
+            }
+        }
+        println!("seed {seed}: {} changes, {compared} answers compared", h.order.len());
+    }
+}
