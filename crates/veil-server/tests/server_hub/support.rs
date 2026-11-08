@@ -148,6 +148,17 @@ impl TestHub {
     pub fn hub(&self) -> Arc<veil_server::Hub> {
         self.running.as_ref().unwrap().hub.clone()
     }
+
+    /// The server's object storage, opened anew (what another server on it
+    /// reads).
+    pub fn blob_store(&self) -> Arc<dyn veil_server::store::BlobStore> {
+        match &self.config.storage {
+            Storage::Dir(d) => Arc::new(veil_server::store::FsStore::new(d)),
+            Storage::S3 { endpoint, bucket, region, key, secret } => {
+                Arc::new(veil_server::store::S3Store::new(endpoint, bucket, region, key, secret).unwrap())
+            }
+        }
+    }
 }
 
 impl Drop for TestHub {

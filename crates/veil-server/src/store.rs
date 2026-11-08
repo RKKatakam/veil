@@ -992,6 +992,58 @@ mod tests {
         assert!(fresh.staged_index(1, &other).await.unwrap().is_none(), "and gone from the store");
     }
 
+    /// BUG-1154 (S28 cycle 1): a listed pack whose index gives one object
+    /// the slot of another (a damaged index, or a wrong one a later pack
+    /// merger writes) must never serve the other object's bytes. Whole
+    /// reads are checked against the id; a `Range` of a plain packed object
+    /// (S5's `GET /v1/objects/…` with `Range: bytes=0-`) is not, and hands
+    /// out the bytes of whatever object the slot points at: from the same
+    /// pack, so possibly of a folder the reader cannot see.
+    #[tokio::test]
+    #[ignore = "BUG-1154: a ranged read of a plain packed object serves the bytes its slot names, unchecked"]
+    async fn bug_1154_a_wrong_slot_never_serves_another_objects_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20);
+        // Two plain objects of one push: one anyone may read, one hidden.
+        let open = Bytes::from_static(b"veil:blob\nan open file, readable by its grant: 0123");
+        let hidden = Bytes::from_static(b"veil:blob\nMARKER-HIDDEN-PACKED-OBJECT-5c1e90d7aa");
+        let (oid, hid) = (ObjectId::hash(&open), ObjectId::hash(&hidden));
+        let encs = vec![(oid, encode(open.clone())), (hid, encode(hidden.clone()))];
+        assert!(!encoding::is_compressed(&encs[0].1) && !encoding::is_compressed(&encs[1].1), "both stored plain");
+        let (name, index, _) = objects.put_pack(1, encs).await.unwrap();
+        // The index damaged: the open object's entry names the hidden one's
+        // slot (the rest of the pack intact).
+        let path = dir.path().join(crate::pack::key(1, &name));
+        let mut bytes = std::fs::read(&path).unwrap();
+        let (os, hs) = (index.get(&oid).unwrap(), index.get(&hid).unwrap());
+        let at = bytes.windows(32).position(|w| w == oid.0).expect("the open object's index entry");
+        bytes[at + 32..at + 40].copy_from_slice(&hs.offset.to_be_bytes());
+        bytes[at + 40..at + 44].copy_from_slice(&hs.len.to_be_bytes());
+        assert_ne!(os, hs);
+        std::fs::write(&path, &bytes).unwrap();
+        let damaged = Arc::new(crate::pack::parse_index(&bytes, Some(bytes.len() as u64)).expect("a damaged index that parses"));
+        // A server that reads the damaged index (nothing cached).
+        let fresh = Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20);
+        fresh.listed_here(1, vec![(name.clone(), damaged)]);
+        // A whole read is checked against the id: refused.
+        assert!(fresh.get(1, &oid).await.is_err(), "a whole read checks the id");
+        // A range of the open object: its own bytes or an error, never the
+        // hidden object's.
+        match fresh.get_range(1, &oid, 0, u64::MAX).await {
+            // Refused, as the whole read is.
+            Err(_) => {}
+            Ok(Some((part, _))) => {
+                assert!(
+                    !part.windows(b"MARKER-HIDDEN-PACKED-OBJECT".len()).any(|w| w == b"MARKER-HIDDEN-PACKED-OBJECT"),
+                    "a range of one object served another object's bytes: {:?}",
+                    String::from_utf8_lossy(&part)
+                );
+                assert_eq!(part, open, "a range read served other bytes than the object's");
+            }
+            Ok(None) => panic!("a listed object read as absent"),
+        }
+    }
+
     /// The header of a zstd frame declaring `size` bytes of content (and
     /// one empty raw block): enough for a decoder to refuse it from its
     /// header.

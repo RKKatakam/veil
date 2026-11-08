@@ -247,3 +247,398 @@ fn bug_865_a_long_history_is_checked_several_at_once_with_the_same_answers() {
         assert!(log.contains(&format!("dev {i}")), "dev {i} missing from\n{log}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// S28 cycle 1 review (`docs/BUGS.md` "S28 cycle 1").
+
+/// A snapshot of `c`'s tree on `parents`, signed by `by` (the crafter's
+/// device unless another identity is given), put among `c`'s objects.
+fn snap(c: &mut Craft, parents: Vec<ObjectId>, msg: &str, by: Option<&veil_core::Identity>) -> ObjectId {
+    let mut s = veil_core::object::Snapshot {
+        parents,
+        change_id: veil_core::ChangeId::random(),
+        tree: c.root,
+        description: veil_core::object::Text::Plain(msg.into()),
+        author: "crafter".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        signature: None,
+    };
+    s.sign(by.unwrap_or(&c.identity));
+    c.put(O::Snapshot(s))
+}
+
+/// Upload `c`'s objects (one request: one staged pack) as `c`'s person;
+/// the receipts by id, and the pack's name.
+fn upload_all(api: &Api, c: &Craft) -> (serde_json::Map<String, serde_json::Value>, String) {
+    let up = api.upload(&c.token, &c.project, &c.objects);
+    assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+    let receipts: Vec<String> = serde_json::from_value(up.json()["receipts"].clone()).unwrap();
+    let pack = receipts[0].split_once('.').unwrap().1.to_string();
+    (c.objects.iter().zip(&receipts).map(|((id, _), r)| (id.hex(), json!(r))).collect(), pack)
+}
+
+fn push_body(api: &Api, token: &str, project: &str, expected: ObjectId, new: ObjectId, receipts: &serde_json::Map<String, serde_json::Value>) -> Reply {
+    let body = json!({"updates": [{"branch": "main", "expected": expected.hex(), "new": new.hex()}], "receipts": receipts});
+    api.post_json(Some(token), &format!("/v1/projects/{project}/push"), &body)
+}
+
+/// BUG-1155 (S28 cycle 1; BUG-824's class): a receipt still counts as an
+/// upload after its staged pack was discarded, and the object is then read
+/// from the project's store. So a member can confirm a guess of content in
+/// a folder they cannot see: upload the guess, have a push refused (which
+/// discards the upload), then push a file naming the guess with its old
+/// receipt. A right guess lands (the hidden object is read from the
+/// project); a wrong one is refused as missing. Both must get the same
+/// answer, as before S28 (an upload was stored, so a guess always read).
+#[test]
+#[ignore = "BUG-1155: a receipt of a discarded upload still counts as uploaded and reads the project's store: a guess of hidden content is confirmed"]
+fn bug_1155_a_receipt_of_a_discarded_upload_confirms_no_guess() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    // The dev guesses the hidden invoice exactly (asserted: the real id).
+    let hidden_path = format!("{BILL_DIR}/acme/invoice.txt");
+    let real = real_paths(&p.dir).into_iter().find(|(path, _)| *path == hidden_path).unwrap().1;
+    let right = format!("{BILL_MARK}\nsecond").into_bytes();
+    let wrong = b"MARKER-A-WRONG-GUESS-OF-THE-INVOICE-71c0".to_vec();
+    let (rid, rraw) = (ObjectId::hash(&O::Blob(right.clone()).encode()), O::Blob(right.clone()).encode());
+    let (wid, wraw) = (ObjectId::hash(&O::Blob(wrong.clone()).encode()), O::Blob(wrong.clone()).encode());
+    assert_eq!(rid, real, "the guess is the hidden object");
+    let up = api.upload(&token, &p.name, &[(rid, rraw), (wid, wraw)]);
+    assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+    let receipts: Vec<String> = serde_json::from_value(up.json()["receipts"].clone()).unwrap();
+    let pack = receipts[0].split_once('.').unwrap().1.to_string();
+    // A push its checks refuse, naming those receipts: the upload is
+    // discarded (BUG-930).
+    let tip = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+    let shown: serde_json::Map<String, serde_json::Value> = [(rid.hex(), json!(receipts[0])), (wid.hex(), json!(receipts[1]))].into_iter().collect();
+    let refused = push_body(&api, &token, &p.name, tip, ObjectId::hash(b"never uploaded"), &shown);
+    assert_eq!(refused.status, 400, "{}", String::from_utf8_lossy(&refused.body));
+    assert!(hub.rt.block_on(hub.hub().objects.staged_index(pid, &pack)).unwrap().is_none(), "the upload is discarded");
+    // Now a file naming each guess, shown with its old receipt (the file's
+    // object is not uploaded again).
+    let mut answers = Vec::new();
+    for (id, content, receipt) in [(wid, &wrong, &receipts[1]), (rid, &right, &receipts[0])] {
+        let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+        c.set("src/guess.txt", O::Blob(content.clone()), veil_core::object::Visibility::Public);
+        c.objects.retain(|(o, _)| *o != id);
+        let s = { let t = c.tip; snap(&mut c, vec![t], "a guess", None) };
+        let (mut map, _) = upload_all(&api, &c);
+        map.insert(id.hex(), json!(receipt));
+        let r = push_body(&api, &c.token, &p.name, c.tip, s, &map);
+        answers.push((r.status, String::from_utf8_lossy(&r.body).to_string()));
+    }
+    let (wrong_answer, right_answer) = (&answers[0], &answers[1]);
+    assert!(wrong_answer.0 == 400 || wrong_answer.0 == 404, "a wrong guess, its upload discarded: {wrong_answer:?}");
+    assert_eq!(
+        right_answer.0, wrong_answer.0,
+        "a right guess of hidden content got another answer than a wrong one: right {right_answer:?}, wrong {wrong_answer:?}"
+    );
+}
+
+/// The refusal (status and message) of pushing `n` new snapshots on
+/// `main`, as `who`, each changing one file; `bad` makes snapshot `i`
+/// refused: a plain-text `.env` (`Some(path)`), or signed by a key no
+/// device is registered with (`None`).
+fn refused_history(hub: &TestHub, p: &Project, who: &Person, n: usize, bad: &[(usize, Option<String>)]) -> (u16, String) {
+    let api = hub.api();
+    let mut c = Craft::new(&api, who, &p.name, "main");
+    let tip = c.tip;
+    let stranger = veil_core::Identity::generate("stranger");
+    let mut prev = tip;
+    for i in 0..n {
+        c.file(&format!("src/chain/f{}.rs", i % 7), &format!("step {i} of {n}"));
+        let mut by = None;
+        for (at, what) in bad.iter().filter(|(at, _)| *at == i) {
+            match what {
+                Some(path) => c.file(path, &format!("KEY=MARKER-PLAIN-ENV-{at}-3d1f\n")),
+                None => by = Some(&stranger),
+            }
+        }
+        prev = snap(&mut c, vec![prev], &format!("step {i}"), by);
+    }
+    let (map, _) = upload_all(&api, &c);
+    let r = push_body(&api, &c.token, &p.name, tip, prev, &map);
+    (r.status, String::from_utf8_lossy(&r.body).to_string())
+}
+
+/// Guarantee 4 (BUG-865's fix): checks run several at once answer as one
+/// at a time, the first error included, whether the guesses are right
+/// (the admin's history: each snapshot is its own real one) or wrong (a
+/// developer's, whom the server completes every snapshot for), within the
+/// first window or past it, and whatever kind each error is.
+#[test]
+fn guessed_checks_refuse_with_the_first_error_in_order() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let tip = hub.api().tips(Some(&p.admin.token()), &p.name).unwrap().branches["main"];
+    let env = |i: usize| Some(format!("src/chain/e{i}/.env"));
+    for who in [&p.admin, &p.dev] {
+        // Two secrets: the first in order is the answer.
+        let (status, body) = refused_history(&hub, &p, who, 30, &[(20, env(20)), (6, env(6))]);
+        assert_eq!(status, 403, "{}: {body}", who.name);
+        assert!(body.contains("'src/chain/e6/.env' is a secret and must arrive encrypted") && !body.contains("e20"), "{}: {body}", who.name);
+        // A precheck refusal (an unknown key) after a secret, and before one.
+        let (status, body) = refused_history(&hub, &p, who, 30, &[(2, env(2)), (5, None)]);
+        assert_eq!(status, 403, "{}: {body}", who.name);
+        assert!(body.contains("'src/chain/e2/.env'"), "{}: {body}", who.name);
+        let (status, body) = refused_history(&hub, &p, who, 30, &[(3, None), (10, env(10))]);
+        assert_eq!(status, 403, "{}: {body}", who.name);
+        assert!(body.contains("signed by a key no device here is registered with") && !body.contains("e10"), "{}: {body}", who.name);
+        // Past the first window of guesses.
+        let (status, body) = refused_history(&hub, &p, who, 75, &[(70, env(70)), (66, env(66))]);
+        assert_eq!(status, 403, "{}: {body}", who.name);
+        assert!(body.contains("'src/chain/e66/.env'") && !body.contains("e70"), "{}: {body}", who.name);
+    }
+    assert_eq!(hub.api().tips(Some(&p.admin.token()), &p.name).unwrap().branches["main"], tip, "nothing landed");
+}
+
+/// BUG-1157 (S28 cycle 1): a push that lands nothing because every update
+/// lost a race (here: not on the branch's current tip) keeps its staged
+/// upload, unread, until S29 exists; `vl` then uploads everything again
+/// (up to five tries per `vl push`). Before S28 an upload of the same
+/// objects wrote the same keys again; now every try leaves a whole copy,
+/// so storage grows with attempts, not content, with nothing bounding it.
+#[test]
+#[ignore = "BUG-1157: every push attempt that loses a race leaves a full staged copy of its upload in storage (no bound until S29)"]
+fn bug_1157_a_push_that_lost_a_race_leaves_no_copy_of_its_upload() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/raced.rs", "MARKER-RACED-UPLOAD-61aa");
+    let s = { let t = c.tip; snap(&mut c, vec![t], "raced", None) };
+    // Someone else lands first.
+    write_files(&p.dir, &[("src/first.rs", "first")]);
+    p.admin.commit_main(&p.dir, "first");
+    p.admin.ok(&p.dir, &["push"]);
+    let mut packs = Vec::new();
+    for _ in 0..3 {
+        let (map, pack) = upload_all(&api, &c);
+        let r = push_body(&api, &c.token, &p.name, c.tip, s, &map);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["results"][0]["ok"], json!(false), "{}", String::from_utf8_lossy(&r.body));
+        packs.push(pack);
+    }
+    let left: Vec<&String> = packs.iter().filter(|n| hub.rt.block_on(hub.hub().objects.staged_index(pid, n)).unwrap().is_some()).collect();
+    assert!(left.is_empty(), "{} of 3 refused attempts left their upload in storage", left.len());
+}
+
+/// BUG-1153 (S28 × S15 merge): a push's storage writes are its own pack
+/// and upload; the background indexers' are counted apart. S15's search
+/// indexer stores its segments with `Objects::put` on a blocking thread,
+/// outside `store::in_background`, so they count as the push's: S28's
+/// `a_push_is_one_storage_write…` fails whenever the indexer runs before
+/// it counts, and `veil-bench load`'s writes-per-push gate counts them.
+#[test]
+#[ignore = "BUG-1153: S15's search segments count as a push's storage writes, not the background's"]
+fn bug_1153_background_indexing_is_not_counted_as_a_pushs_writes() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let settle = || {
+        // Until the background work is done: no write for 3 s.
+        let mut last = (u64::MAX, std::time::Instant::now());
+        let start = std::time::Instant::now();
+        loop {
+            let w = hub.hub().objects.writes.load(Relaxed);
+            if w != last.0 {
+                last = (w, std::time::Instant::now());
+            } else if last.1.elapsed() > std::time::Duration::from_secs(3) {
+                return;
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(120), "the background never settled");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+    settle();
+    write_files(&p.dir, &[("src/indexed.rs", "fn MARKER_SEARCHED_WORD_b71d() {}")]);
+    p.admin.commit_main(&p.dir, "indexed");
+    let w = writes(&hub);
+    p.admin.ok(&p.dir, &["push"]);
+    settle();
+    assert_eq!(writes(&hub) - w, 1, "an admin's push, its background work done: one storage write of its own");
+}
+
+/// Guarantee 3: a staged pack that one push of a person lists while
+/// another push of theirs, on another server, refuses and discards it: the
+/// listing push lands with its content readable, or is refused and nothing
+/// moves; never a listed pack missing from the store.
+#[test]
+fn a_pack_discarded_while_another_server_lists_it_is_listed_or_gone() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let other = TestHub::beside(&hub);
+    let (a, b) = (hub.api(), other.api());
+    let stranger = veil_core::Identity::generate("stranger");
+    let mut landed = 0;
+    for round in 0..8 {
+        let mut c = Craft::new(&a, &p.dev, &p.name, "main");
+        let mark = format!("MARKER-RACED-LISTING-{round}-8e2c");
+        c.file(&format!("src/race{round}.rs"), &mark);
+        let good = { let t = c.tip; snap(&mut c, vec![t], "good", None) };
+        let (map, _) = upload_all(&a, &c);
+        // The refused push: a snapshot of an unknown key, with the same
+        // receipts (and its own upload).
+        let mut bad = Craft::new(&a, &p.dev, &p.name, "main");
+        bad.objects.clear();
+        let unknown = snap(&mut bad, vec![c.tip], "unknown key", Some(&stranger));
+        let (mut bad_map, _) = upload_all(&a, &bad);
+        bad_map.extend(map.clone());
+        let (token, project, tip) = (c.token.clone(), p.name.clone(), c.tip);
+        let (ra, rb) = std::thread::scope(|s| {
+            let x = s.spawn(|| push_body(&a, &token, &project, tip, good, &map));
+            let y = s.spawn(|| push_body(&b, &token, &project, tip, unknown, &bad_map));
+            (x.join().unwrap(), y.join().unwrap())
+        });
+        assert_eq!(rb.status, 403, "{}", String::from_utf8_lossy(&rb.body));
+        let now = a.tips(Some(&token), &p.name).unwrap().branches["main"];
+        match ra.status {
+            200 => {
+                assert_eq!(ra.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&ra.body));
+                landed += 1;
+                // Read back through a third server: nothing cached.
+                let third = TestHub::beside(&hub);
+                assert_eq!(read_file(&third.api(), &token, &p.name, &format!("src/race{round}.rs")).as_deref(), Some(mark.as_bytes()));
+            }
+            400 | 409 => assert_eq!(now, tip, "refused, yet main moved: {}", String::from_utf8_lossy(&ra.body)),
+            s => panic!("the listing push: {s} {}", String::from_utf8_lossy(&ra.body)),
+        }
+    }
+    eprintln!("{landed} of 8 listing pushes landed");
+}
+
+/// BUG-1156 (S28 cycle 1): an API commit reads every upload its receipts
+/// name into memory (up to 1 GiB each) before its checks, outside the
+/// server's bound on decoded bytes in flight (`store::DECODED_IN_FLIGHT`,
+/// 256 MiB, BUG-1009/BUG-1087). Uploads are stored compressed, so a member
+/// sends a few MiB per upload, then several API commits at once: each
+/// holds its 256 MiB decoded. Before S28 a commit read uploads from the
+/// store as its checks needed them. Hostile size: run alone.
+#[test]
+#[ignore = "BUG-1156: API commits hold up to 1 GiB of decoded uploads each, outside the server-wide bound"]
+fn bug_1156_api_commits_hold_their_uploads_within_the_servers_bound() {
+    use veil_core::hub::{encoding, wire::put_frame};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let token = p.dev.token();
+    // 16 objects of 16 MiB, about 12 times compressible (within the 64
+    // times an upload may expand).
+    let mut frames = Vec::new();
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for k in 0..16u8 {
+        let mut b = vec![0u8; 16 << 20];
+        for i in (0..b.len()).step_by(16) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            b[i] = x as u8;
+        }
+        b[0] = k;
+        let raw = O::Blob(b).encode();
+        let id = ObjectId::hash(&raw);
+        frames.push((id, encoding::encode(&raw).into_owned()));
+    }
+    let base = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+    let commits: Vec<serde_json::Value> = (0..6)
+        .map(|n| {
+            let mut body = Vec::new();
+            for (id, enc) in &frames {
+                put_frame(&mut body, id, enc);
+            }
+            let up = api.upload_encoded_body(&token, &p.name, &body);
+            assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+            let receipts: Vec<String> = serde_json::from_value(up.json()["receipts"].clone()).unwrap();
+            let edits: Vec<serde_json::Value> =
+                frames.iter().enumerate().map(|(i, (id, _))| json!({"path": format!("src/big{n}/b{i}.bin"), "put": {"object": id.hex()}})).collect();
+            let receipts: serde_json::Map<String, serde_json::Value> = frames.iter().zip(&receipts).map(|((id, _), r)| (id.hex(), json!(r))).collect();
+            json!({"base": base.hex(), "description": "large", "edits": edits, "receipts": receipts})
+        })
+        .collect();
+    let vm = |field: &str| -> u64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        let l = s.lines().find(|l| l.starts_with(field)).unwrap();
+        l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() << 10
+    };
+    // Peak memory from now on.
+    std::fs::write("/proc/self/clear_refs", "5").unwrap();
+    let before = vm("VmRSS:");
+    let replies: Vec<Reply> = std::thread::scope(|s| {
+        let hs: Vec<_> = commits.iter().map(|c| s.spawn(|| api.post_json_within(&token, &format!("/v1/projects/{}/changes", p.name), c, std::time::Duration::from_secs(1200)))).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for r in &replies {
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    }
+    let grew = vm("VmHWM:").saturating_sub(before);
+    assert!(grew < 1 << 30, "six API commits at once took the server {} MiB past where it was", grew >> 20);
+}
+
+/// BUG-1158 (S28 cycle 1): a rolling upgrade runs servers before S28
+/// beside S28 servers, on one database and one object store (the
+/// migrations are built for it: BUG-838). A server before S28 reads an
+/// object only under its own key (`p/<project>/<id>`; `integration` @
+/// `6fa552c4`, `store.rs` `Objects::get`), which is exactly what
+/// `Objects` without a database and without listed packs reads. Whatever
+/// an S28 server took in a push is in packs only, so every older server
+/// answers "missing object" for it (and refuses S28's receipts) until the
+/// last one is stopped; `HUB.md` §13.20 says how to revert, not that the
+/// upgrade cannot be rolling.
+#[test]
+#[ignore = "BUG-1158: a server before S28 beside an S28 server cannot find any object S28 stored (packs only): a rolling upgrade answers 'missing object' for objects that exist"]
+fn bug_1158_a_server_before_s28_finds_what_an_s28_server_stored() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    write_files(&p.dir, &[("src/rolling.rs", "MARKER-ROLLING-UPGRADE-0f4b")]);
+    p.admin.commit_main(&p.dir, "during the upgrade");
+    p.admin.ok(&p.dir, &["push"]);
+    let id = blob("MARKER-ROLLING-UPGRADE-0f4b").0;
+    let api = hub.api();
+    assert_eq!(read_file(&api, &p.admin.token(), &p.name, "src/rolling.rs").as_deref(), Some(&b"MARKER-ROLLING-UPGRADE-0f4b"[..]), "the S28 server reads it");
+    // What a server before S28 reads, on the same store.
+    let before_s28 = veil_server::store::Objects::new(hub.blob_store(), 1 << 20);
+    let got = hub.rt.block_on(before_s28.get(pid, &id)).unwrap();
+    assert_eq!(got.as_deref(), Some(&O::Blob(b"MARKER-ROLLING-UPGRADE-0f4b".to_vec()).encode()[..]), "a server before S28 finds no object an S28 server stored");
+}
+
+/// Guarantee 2: a plain-text secret uploaded with a push's objects but
+/// named by none of its snapshots (its checks never read it) is in no
+/// listed pack once the push lands, and its staged upload is deleted: the
+/// push copies what its checks read into a pack of its own.
+#[test]
+fn an_unread_plain_text_secret_beside_a_landing_push_is_not_kept() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/landed.rs", "MARKER-LANDED-BESIDE-A-SECRET-2b7e");
+    let s = { let t = c.tip; snap(&mut c, vec![t], "beside a secret", None) };
+    let secret = "AWS_SECRET_ACCESS_KEY=MARKER-UNREAD-PLAIN-SECRET-c4d9e1\n";
+    let (sid, sraw) = blob(secret);
+    c.objects.push((sid, sraw));
+    let (map, pack) = upload_all(&api, &c);
+    let r = push_body(&api, &c.token, &p.name, c.tip, s, &map);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&r.body));
+    let h = hub.hub();
+    assert!(hub.rt.block_on(h.objects.staged_index(pid, &pack)).unwrap().is_none(), "the upload it did not list is deleted");
+    let fresh = TestHub::beside(&hub);
+    assert!(fresh.rt.block_on(fresh.hub().objects.get(pid, &sid)).unwrap().is_none(), "the unread secret is not the project's");
+    // In no listed pack's index.
+    let names: Vec<String> =
+        hub.rt.block_on(sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND listed").bind(pid).fetch_all(&h.db)).unwrap();
+    let store = hub.blob_store();
+    for n in &names {
+        let (index, _) = hub.rt.block_on(veil_server::pack::read_index(&*store, &veil_server::pack::key(pid, n))).unwrap().unwrap();
+        assert!(index.get(&sid).is_none(), "the unread secret is in listed pack {n}");
+    }
+    assert_eq!(read_file(&fresh.api(), &c.token, &p.name, "src/landed.rs").as_deref(), Some(&b"MARKER-LANDED-BESIDE-A-SECRET-2b7e"[..]));
+}
