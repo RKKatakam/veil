@@ -2510,9 +2510,12 @@ at the server, with **no full graph**. Code: `veil-core/src/promisor.rs`
   warning and nothing recorded, so `status`, `undo` and `partial limit` run.
 * **The cache's bound** (default 4 GiB, `--cache-size`, `vl partial
   limit`): when a fetch would pass it, the cache is evicted down to 80 %,
-  least recently written first. **Pinned, never evicted:** the trees of
-  every workspace's working-copy snapshot and of the checkout record (and
-  of an unfinished move's target). A pack holding pinned objects is
+  least recently written first. **Pinned, never evicted:** everything,
+  trees *and files*, of every workspace's working-copy snapshot (a parked
+  workspace's too: it is checked out again as it is) and of the checkout
+  record (and of an unfinished move's target); and the trees only, not the
+  files, of the server-side bases of the snapshots only this clone holds
+  (for gc and fsck). A pack holding pinned objects is
   rewritten with them before it is removed, so a reader whose pack
   vanished finds them again. The bytes of a batch not yet on disk count in
   the bound with what is (BUG-1145). When what is pinned alone passes the bound,
@@ -2702,6 +2705,36 @@ visible set `Exact`, the embargo release listing the history index under
 fetch-ahead. Tests: `server_hub` `thin::a_thin_clone_answers_as_a_full_clone`
 (nine commands, full against thin), the reviewer's `s3r3_*` reproductions,
 `thin::every_working_copy_move_past_the_cache_bound_records_nothing`.
+
+**Revised again (S3 redesign review, cycle 1).**
+
+* `q/resolve` answers only from what the caller sees: rows in a fixed
+  order, a chunk at a time, those withheld (in the query), unreached by
+  the viewer's branches, or of a change the caller cannot see dropped
+  before anything is counted; it stops at 17 that count (BUG-1268, 1269).
+  A history page starts only from snapshots the branches reach (branch
+  tips need no check), so an old version a rewrite left behind is never
+  sent to a thin clone, as a full clone never receives it.
+* **Generations at the boundary come from the server** (`POST
+  …/q/generations`, protocol revision 6; the viewer graph's, the history
+  index's own arithmetic). A thin clone's index then has an exact
+  generation for every snapshot it holds without the ancestry below, and an
+  `Exact` walk pages in only what its range reaches: a 6-snapshot range of
+  a 40-snapshot history reads at most 6 two-snapshot pages, never 20
+  (BUG-1291). Without the server an `Exact` walk fails; a `Held` one goes
+  on with lower bounds it never persists and `Exact` never uses. (S13's
+  query API answers pairs of server snapshots only, and a thin clone's own
+  commits are not on the server, so its index stays the walker, with the
+  server's numbers at its edge.)
+* **The split is closed** (BUG-1290): `Repo::graph`, `visible_among`,
+  `visible_embargoed` and the index are private to `repo.rs`,
+  `ObjectStore::snapshot` to the engine; `Held` and `Exact` carry every
+  history read. Descendant rewriting (`rebase_descendants`), `check_current`
+  and the served log read `Exact`.
+* The remote a thin clone fetches from cannot be removed (BUG-1292); a
+  working-copy snapshot never copies an unchanged fetched file into the
+  main store (BUG-1293), and `vl partial full` copies what only the cache
+  holds for everything the kept history reaches.
 
 #### Not built in S3 (and why)
 

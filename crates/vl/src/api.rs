@@ -909,7 +909,23 @@ pub struct LogQuery {
     pub max_changes: Option<usize>,
 }
 
-pub fn log_entries_with<'a>(repo: &'a Repo, ws: &str, q: LogQuery) -> Result<LogEntries<'a>> {
+pub fn log_entries_with<'a>(repo: &'a Repo, ws: &str, mut q: LogQuery) -> Result<LogEntries<'a>> {
+    // A thin clone: the history it shows is a full clone's, paged in from
+    // the server where the walk reaches what it does not hold (`Exact`;
+    // `vl log` and `vl serve --local`'s `log` alike, BUG-1290).
+    if repo.is_partial() && q.ids.is_none() {
+        let most = if q.filter.as_ref().is_some_and(|f| !f.is_empty()) { None } else { q.limit.map(|l| l + 1) };
+        q.ids = Some(repo.exact().run(|r| {
+            let mut ids = Vec::new();
+            for id in r.held().visible_iter() {
+                ids.push(id?);
+                if most.is_some_and(|m| ids.len() >= m) {
+                    break;
+                }
+            }
+            Ok(ids)
+        })?);
+    }
     // All visible snapshots are produced lazily (the history index), so
     // `-n` reads only the history it shows.
     let mut ids: Box<dyn Iterator<Item = veil_core::error::Result<ObjectId>> + 'a> = match q.ids {

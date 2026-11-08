@@ -675,8 +675,8 @@ pub fn setup_project(hub: &TestHub) -> Project {
 pub fn real_paths(dir: &Path) -> Vec<(String, ObjectId)> {
     let repo = veil_core::Repo::open(Arc::new(veil_core::DiskBackend::new(dir)), None, "test").unwrap();
     let tip = repo.view().tags["main"].target;
-    let mut out = vec![(String::new(), repo.store().snapshot(&tip).unwrap().tree)];
-    let mut stack = vec![(String::new(), repo.store().snapshot(&tip).unwrap().tree)];
+    let mut out = vec![(String::new(), repo.snapshot(&tip).unwrap().tree)];
+    let mut stack = vec![(String::new(), repo.snapshot(&tip).unwrap().tree)];
     while let Some((p, id)) = stack.pop() {
         if let Ok(t) = repo.store().tree(&id) {
             for e in &t.entries {
@@ -701,7 +701,7 @@ pub fn real_snapshots(dir: &Path) -> Vec<ObjectId> {
             continue;
         }
         out.push(id);
-        if let Ok(s) = repo.store().snapshot(&id) {
+        if let Ok(s) = repo.snapshot(&id) {
             stack.extend(s.parents.iter().copied());
         }
     }

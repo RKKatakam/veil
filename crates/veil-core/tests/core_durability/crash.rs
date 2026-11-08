@@ -1440,10 +1440,10 @@ fn a_power_loss_tears_history_index_layers_and_they_are_rebuilt() {
         if *a != tip {
             assert!(!repo.is_ancestor(&tip, a).unwrap(), "the tip is not below {i}");
         }
-        let (g, gt) = (repo.graph().generation(&repo, a).unwrap(), repo.graph().generation(&repo, &tip).unwrap());
+        let (g, gt) = (repo.held().index().generation(&repo, a).unwrap(), repo.held().index().generation(&repo, &tip).unwrap());
         assert!(*a == tip || g < gt, "{i}: generation {g:?} below the tip's {gt:?}");
     }
-    repo.graph().persist(&repo);
+    repo.held().index().persist(&repo);
     drop(repo);
     // The torn epoch is gone: what is left was written again, and parses.
     let torn_epoch = |n: &str| n.split('-').nth(1).map(str::to_string);

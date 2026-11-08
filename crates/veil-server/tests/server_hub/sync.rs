@@ -152,7 +152,7 @@ fn people_see_each_others_pushes_and_every_signature_verifies() {
             if id == repo.root_id() {
                 continue;
             }
-            let s = repo.store().snapshot(&id).unwrap();
+            let s = repo.snapshot(&id).unwrap();
             assert_eq!(s.signature_valid(), Some(true), "{} in {}", id.short(), dir.display());
             stack.extend(s.parents.iter().copied());
             seen += 1;
@@ -164,7 +164,7 @@ fn people_see_each_others_pushes_and_every_signature_verifies() {
     let mine = (|| {
         let mut stack = vec![repo.view().tags["main"].target];
         while let Some(id) = stack.pop() {
-            let s = repo.store().snapshot(&id).unwrap();
+            let s = repo.snapshot(&id).unwrap();
             if matches!(&s.description, veil_core::object::Text::Plain(t) if t.contains("dev change")) {
                 return s;
             }

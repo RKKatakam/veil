@@ -137,8 +137,9 @@ fn resolve_base(repo: &Repo, base: &str, ws: &str) -> Result<ObjectId> {
     // walked for, never all history.
     let visible_matching = |keep: &dyn Fn(&ObjectId, &ChangeId) -> bool| -> Result<Vec<ObjectId>> {
         let found: HashSet<ObjectId> =
-            repo.graph().entries_matching(repo, view.refs(), |id, e| keep(id, &e.change_id))?.into_iter().collect();
-        let mut v: Vec<ObjectId> = repo.visible_among(&found)?.into_iter().collect();
+            repo.held().entries_matching(view.refs(), |id, e| keep(id, &e.change_id))?.into_iter().collect();
+        // Held: a thin clone adds the server's answer (`server_names`).
+        let mut v: Vec<ObjectId> = repo.held().visible_among(&found)?.into_iter().collect();
         v.sort();
         Ok(v)
     };

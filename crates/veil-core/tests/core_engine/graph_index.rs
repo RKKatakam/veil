@@ -44,7 +44,7 @@ fn commits_append_layers_that_stay_few() {
     let reopened = Repo::open(backend.clone(), None, "t").unwrap();
     let wc = reopened.workspace_wc(WS).unwrap();
     let parent = reopened.snapshot(&wc).unwrap().parents[0];
-    let (g, pg) = (reopened.graph().generation(&reopened, &wc).unwrap(), reopened.graph().generation(&reopened, &parent).unwrap());
+    let (g, pg) = (reopened.held().index().generation(&reopened, &wc).unwrap(), reopened.held().index().generation(&reopened, &parent).unwrap());
     assert!(g.is_some() && pg.is_some() && g > pg, "{g:?} above {pg:?}");
     let visible: Vec<_> = reopened.held().visible_iter().map(Result::unwrap).collect();
     assert_eq!(visible, reopened.exact().visible().unwrap());
@@ -114,7 +114,7 @@ fn a_compaction_writes_one_merged_layer() {
     assert!(!names.is_empty() && names.len() <= 8, "layers: {names:?}");
     let reopened = Repo::open(backend.clone(), None, "t").unwrap();
     let wc = reopened.workspace_wc(WS).unwrap();
-    assert!(reopened.graph().generation(&reopened, &wc).unwrap().is_some());
+    assert!(reopened.held().index().generation(&reopened, &wc).unwrap().is_some());
 }
 
 /// Another process took the next slot first: the appender reads its layer
@@ -133,7 +133,7 @@ fn a_lost_slot_is_retried_after_the_winners_layer() {
     assert!(after.len() >= before.len(), "{before:?} -> {after:?}");
     let fresh = Repo::open(backend.clone(), None, "t").unwrap();
     let wc = fresh.workspace_wc(WS).unwrap();
-    assert!(fresh.graph().generation(&fresh, &wc).unwrap().is_some());
+    assert!(fresh.held().index().generation(&fresh, &wc).unwrap().is_some());
     assert_eq!(fresh.held().visible_iter().map(Result::unwrap).collect::<Vec<_>>(), fresh.exact().visible().unwrap());
 }
 
@@ -169,7 +169,7 @@ fn a_damaged_index_is_rebuilt_not_an_error() {
     backend.write(&dir().join("L-01-1.vcg"), b"non-canonical name").unwrap();
     let mut fresh = Repo::open(backend.clone(), None, "t").unwrap();
     let wc = fresh.workspace_wc(WS).unwrap();
-    assert!(fresh.graph().generation(&fresh, &wc).unwrap().is_some());
+    assert!(fresh.held().index().generation(&fresh, &wc).unwrap().is_some());
     fresh.describe(wc, "after").unwrap();
     assert!(!layers(&*backend).is_empty());
 }
@@ -199,7 +199,7 @@ fn a_deep_history_is_indexed_iteratively() {
     }
     tx.add_head(parent).unwrap();
     tx.commit().unwrap();
-    assert_eq!(repo.graph().generation(&repo, &parent).unwrap(), Some(20_001));
+    assert_eq!(repo.held().index().generation(&repo, &parent).unwrap(), Some(20_001));
     let first: Vec<_> = repo.held().topo_iter([parent]).take(3).map(Result::unwrap).collect();
     assert_eq!(first[0], parent);
     assert_eq!(first.len(), 3);
@@ -218,7 +218,7 @@ fn collected_snapshots_do_not_resolve_through_the_index() {
     repo.abandon(doomed).unwrap();
     // Indexed (the commits persisted it), then collected: remove the
     // loose object as gc would.
-    assert!(repo.graph().generation(&repo, &doomed).unwrap().is_some());
+    assert!(repo.held().index().generation(&repo, &doomed).unwrap().is_some());
     let hex = doomed.hex();
     backend.remove_file(&VPath::new(&format!(".veil/objects/{}/{}", &hex[..2], &hex[2..])).unwrap()).unwrap();
     let fresh = Repo::open(backend.clone(), None, "t").unwrap();

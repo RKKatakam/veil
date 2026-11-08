@@ -552,6 +552,20 @@ pub async fn history(
     }
     let stop: HashSet<ObjectId> = stop.iter().copied().collect();
     if let Some(limit) = limit {
+        // A page (a thin clone's): from snapshots the viewer's branches
+        // reach only, as a full clone holds them; any other start (an old
+        // version a rewrite left behind) is left out, as an unknown one is
+        // (S3, BUG-1268).
+        // (Branch tips, as a clone and a pull ask for, are reached: no
+        // viewer graph is needed for them.)
+        let branch_tips: HashSet<ObjectId> = self::tips(hub, project, viewer).await?.into_iter().map(|(_, t)| t).collect();
+        let starts = match starts.iter().all(|s| branch_tips.contains(s)) {
+            true => starts,
+            false => {
+                let reached = crate::query::reached_from_branches(hub, project, viewer, starts.clone()).await?;
+                starts.into_iter().zip(reached).filter(|(_, r)| *r).map(|(s, _)| s).collect()
+            }
+        };
         return blocking(hub, project.id, move |src| history_page(src, starts, &stop, limit.clamp(1, MAX_HISTORY), encoded)).await;
     }
     blocking(hub, project.id, move |src| {

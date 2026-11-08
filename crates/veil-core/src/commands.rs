@@ -198,7 +198,9 @@ pub struct SquashResult {
 /// choice can take minutes, and `vl watch` or another command may have
 /// rewritten the change meanwhile).
 fn check_current(repo: &Repo, ids: &[ObjectId], parts: &ChangeParts, s: &Snapshot) -> Result<()> {
-    let visible = repo.visible_among(&ids.iter().copied().collect())?;
+    // Exactly: in a thin clone the change may be one beyond what it holds
+    // until this command (BUG-1290).
+    let visible = repo.exact().visible_among(&ids.iter().copied().collect())?;
     for i in ids {
         if !visible.contains(i) {
             return Err(VeilError::repo(format!(
@@ -251,7 +253,7 @@ impl Repo {
     pub fn carried_embargo(&self, id: &ObjectId) -> Result<Option<String>> {
         // Embargoed snapshots come from the history index: with none in
         // the history, nothing is walked.
-        let mut carried: Vec<ObjectId> = self.graph().embargoed_among(self, [*id])?.into_iter().collect();
+        let mut carried: Vec<ObjectId> = self.exact().embargoed_among([*id])?.into_iter().collect();
         carried.sort();
         for a in carried {
             let Some(s) = self.exact().snapshot(&a)? else { continue };

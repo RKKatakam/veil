@@ -548,7 +548,9 @@ impl<'r> Transaction<'r> {
         // instead of reading all history.
         let mut floor = crate::graph_index::Gen::MAX;
         for old in self.rewritten.keys() {
-            if let Some(g) = self.repo.graph.generation(self.repo, old)? {
+            // Exactly (a thin clone: the rewritten change may be one it
+            // has just fetched, its descendants above it unheld: BUG-1290).
+            if let Some(g) = self.repo.exact().generation(old)? {
                 floor = floor.min(g);
             }
         }
@@ -556,8 +558,8 @@ impl<'r> Transaction<'r> {
             crate::graph_index::Gen::MAX => Vec::new(),
             f => self
                 .repo
-                .graph
-                .down_to(self.repo, roots, f + 1)?
+                .exact()
+                .down_to(roots, f + 1)?
                 .into_iter()
                 .map(|(id, (g, s))| (g, s.timestamp, id))
                 .collect(),
@@ -682,7 +684,7 @@ impl<'r> Transaction<'r> {
     fn embargoed_merges_in(&mut self, v: &View) -> Result<Vec<ObjectId>> {
         let mut v = v.clone();
         std::mem::swap(&mut self.repo.view, &mut v);
-        let res = self.repo.visible_embargoed();
+        let res = self.repo.exact().visible_embargoed();
         std::mem::swap(&mut self.repo.view, &mut v);
         let mut out = Vec::new();
         for id in res? {
@@ -764,7 +766,7 @@ impl<'r> Transaction<'r> {
                 }
             }
             let finals: HashSet<ObjectId> = replaced.iter().map(|(f, _)| *f).collect();
-            let visible = repo.visible_among(&finals)?;
+            let visible = repo.exact().visible_among(&finals)?;
             let shown: Vec<(ObjectId, String)> = replaced.iter().filter(|(f, _)| visible.contains(f)).cloned().collect();
             let ids: Vec<ObjectId> = shown.iter().map(|(f, _)| *f).collect();
             let mut moved = Vec::new();
@@ -774,7 +776,7 @@ impl<'r> Transaction<'r> {
                 }
             }
             let mut carried = HashSet::new();
-            for id in repo.visible_embargoed()? {
+            for id in repo.exact().visible_embargoed()? {
                 carried.extend(repo.snapshot(&id)?.embargo.clone());
             }
             Ok((lost, moved, carried))
@@ -1324,7 +1326,7 @@ impl<'r> Transaction<'r> {
         self.repo.view = std::mem::take(&mut self.view);
         self.repo.pin_working_copies();
         // Best effort: the index is a cache.
-        self.repo.graph.persist(self.repo);
+        self.repo.persist_index();
         let warnings = self.take_merge_warnings();
         self.repo.warnings.extend(warnings);
         // Concurrent operations are merged by the next open or

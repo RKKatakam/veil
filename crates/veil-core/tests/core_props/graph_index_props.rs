@@ -130,7 +130,7 @@ fn reachable(repo: &Repo, roots: &[ObjectId]) -> HashSet<ObjectId> {
 fn check_all(repo: &Repo, nodes: &[ObjectId], pick: &[usize]) {
     let pick: Vec<ObjectId> = pick.iter().map(|i| nodes[i % nodes.len()]).collect();
     let roots: Vec<ObjectId> = pick.iter().take(3).copied().collect();
-    let g = repo.graph();
+    let g = repo.held().index();
     // Order: exactly `topo_children_first`'s (threat 12).
     let lazy: Vec<ObjectId> = repo.held().topo_iter(roots.iter().copied()).map(Result::unwrap).collect();
     assert_eq!(lazy, repo.exact().topo_children_first(roots.iter().copied()).unwrap(), "topo order");
@@ -203,7 +203,7 @@ proptest! {
         // Empty index, computed on the fly.
         check_all(&repo, &ids, &pick);
         // Persisted, then read back by another handle.
-        repo.graph().persist(&repo);
+        repo.held().index().persist(&repo);
         let reopened = Repo::open(backend.clone(), None, "t").unwrap();
         check_all(&reopened, &ids, &pick);
         // The late snapshots arrive: some were missing parents of indexed
@@ -215,9 +215,9 @@ proptest! {
         }
         let later = Repo::open(backend.clone(), None, "t").unwrap();
         check_all(&later, &ids, &pick);
-        later.graph().persist(&later);
+        later.held().index().persist(&later);
         // So must a handle that indexed before they arrived.
-        reopened.graph().revalidate(&reopened);
+        reopened.held().index().revalidate(&reopened);
         check_all(&reopened, &ids, &pick);
         // A damaged layer (threat 5): one byte flipped, or cut short.
         let files = index_files(&*backend);
@@ -249,9 +249,9 @@ proptest! {
             let _ = backend.remove_dir_all(&dir);
             let r = Repo::open(backend.clone(), identity, "t").unwrap();
             for id in &ids {
-                r.graph().generation(&r, id).unwrap();
+                r.held().index().generation(&r, id).unwrap();
             }
-            r.graph().persist(&r);
+            r.held().index().persist(&r);
             index_files(&*backend).into_iter().map(|(_, d)| d).collect::<Vec<_>>()
         };
         let without = build_with(None);

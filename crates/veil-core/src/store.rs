@@ -1393,7 +1393,10 @@ impl ObjectStore {
         self.put_tree(&Tree::default())
     }
 
-    pub fn snapshot(&self, id: &ObjectId) -> Result<Arc<Snapshot>> {
+    /// Snapshot object `id` as this store holds it (decoded, cached). Inside
+    /// the engine only: history is read through `Repo::held` or
+    /// `Repo::exact`, which say whether a thin clone fetches (BUG-1290).
+    pub(crate) fn snapshot(&self, id: &ObjectId) -> Result<Arc<Snapshot>> {
         if let Some(s) = self.snapshots.get(id) {
             return Ok(s);
         }

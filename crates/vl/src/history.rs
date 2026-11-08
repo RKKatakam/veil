@@ -250,22 +250,7 @@ impl LogFilterArgs {
 
 /// `vl log`, with or without filters.
 pub fn log(ctx: &Ctx, limit: Option<usize>, f: &LogFilterArgs, json: bool) -> Result<()> {
-    let mut q = f.query(ctx, limit)?;
-    // A thin clone: the history it shows comes from the server's pages
-    // where the walk reaches what the clone does not hold yet.
-    if ctx.repo.is_partial() && q.ids.is_none() {
-        let most = if q.filter.as_ref().is_some_and(|f| !f.is_empty()) { None } else { q.limit.map(|l| l + 1) };
-        q.ids = Some(ctx.repo.exact().run(|r| {
-            let mut ids = Vec::new();
-            for id in r.held().visible_iter() {
-                ids.push(id?);
-                if most.is_some_and(|m| ids.len() >= m) {
-                    break;
-                }
-            }
-            Ok(ids)
-        })?);
-    }
+    let q = f.query(ctx, limit)?;
     match json {
         true => api::emit_json(&api::log_with(&ctx.repo, &ctx.ws, q)?),
         false => api::text::log(api::log_entries_with(&ctx.repo, &ctx.ws, q)?),
@@ -734,7 +719,7 @@ pub fn bisect(ctx: &mut Ctx, cmd: &BisectCmd) -> Result<ExitCode> {
             // history above it only (exactly, in a thin clone).
             let visible = |f: &ObjectId| -> Result<bool> {
                 let want: std::collections::HashSet<ObjectId> = [*f].into_iter().collect();
-                Ok(ctx.repo.exact().run(|r| r.visible_among(&want))?.contains(f))
+                Ok(ctx.repo.exact().visible_among(&want)?.contains(f))
             };
             let from = match from {
                 Some(f) if visible(&f)? => Some(f),

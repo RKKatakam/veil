@@ -73,7 +73,7 @@ fn assert_history_intact(repo: &Repo) {
         if !seen.insert(id) {
             continue;
         }
-        let s = store
+        let s = repo
             .snapshot(&id)
             .unwrap_or_else(|e| panic!("snapshot {}: {e}", id.short()));
         snaps.extend(s.parents.iter().copied());
@@ -233,7 +233,7 @@ fn other_process_survives_a_repack() {
     fs.write(&p("src/later.txt"), b"later\n").unwrap();
     snap(&mut repo, &fs);
     gc(&mut repo, &now_gc()).unwrap();
-    other.store().snapshot(&repo.workspace_wc(WS).unwrap()).unwrap();
+    other.snapshot(&repo.workspace_wc(WS).unwrap()).unwrap();
     assert!(
         read_file(&other, &wc, "src/m2/f2.txt").is_some(),
         "re-scans packs after they vanish"

@@ -713,6 +713,43 @@ pub async fn generations_route(
     Ok(Json(generations(&hub, &ask, q.snapshots, Limits::default()).await?))
 }
 
+/// Which of `ids` (projected snapshots of `viewer`'s) the viewer's branches
+/// reach: their projected history as a full clone of it holds it (S3: what
+/// a thin clone is told about, never an old version a rewrite left behind,
+/// BUG-1268). The viewer graph, filled as for any query; withheld ones are
+/// not reached.
+pub async fn reached_from_branches(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, ids: Vec<ObjectId>) -> Result<Vec<bool>> {
+    let deadline = Instant::now() + Limits::default().deadline;
+    let rows: Vec<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1")
+        .bind(project.id)
+        .fetch_all(&hub.db)
+        .await?;
+    let tips: Vec<ObjectId> = rows.iter().filter_map(|t| ObjectId::from_hex(t).ok()).collect();
+    if tips.is_empty() {
+        return Ok(vec![false; ids.len()]);
+    }
+    let ptips = ensure(hub, project, viewer, &tips, Some(deadline)).await?;
+    let vk = project.view(viewer).key();
+    blocking(hub, project.id, move |cx| {
+        let g = G::new(cx, &vk, Some(deadline));
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let mut reached = false;
+            if g.row(&id)?.is_some_and(|r| !r.withheld()) {
+                for t in &ptips {
+                    if g.is_ancestor(id, *t)? {
+                        reached = true;
+                        break;
+                    }
+                }
+            }
+            out.push(reached);
+        }
+        Ok(out)
+    })
+    .await
+}
+
 pub async fn resolve_route(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Query(q): Query<ResolveParams>) -> Result<Json<Value>> {
     let ask = Ask::open(&hub, &p, &caller).await?;
     Ok(Json(resolve_prefix(&hub, &ask, &q.prefix, Limits::default()).await?))

@@ -253,7 +253,7 @@ pub struct Repo {
     pub(crate) user: String,
     pub(crate) root_id: ObjectId,
     /// The history index (`graph_index`): generations, to stop walks early.
-    pub(crate) graph: GraphIndex,
+    graph: GraphIndex,
     /// The heads the view was read from (ancestors dropped, sorted): the
     /// parents of the next operation.
     pub(crate) base: Vec<ObjectId>,
@@ -855,10 +855,6 @@ impl Repo {
     pub fn root_id(&self) -> ObjectId {
         self.root_id
     }
-    /// The history index.
-    pub fn graph(&self) -> &GraphIndex {
-        &self.graph
-    }
     pub fn user(&self) -> &str {
         &self.user
     }
@@ -1011,7 +1007,7 @@ impl Repo {
     /// (generation, then timestamp, then id). Found through the history
     /// index, which walks only lines that build on one: with no embargo in
     /// the history, nothing is walked.
-    pub fn visible_embargoed(&self) -> Result<Vec<ObjectId>> {
+    fn visible_embargoed(&self) -> Result<Vec<ObjectId>> {
         let found = self.graph.embargoed_among(self, self.view.refs())?;
         let mut out = Vec::with_capacity(found.len());
         for id in found {
@@ -1024,7 +1020,7 @@ impl Repo {
 
     /// Which of `candidates` are visible (reachable from the view)? Reads
     /// only the history above the oldest candidate.
-    pub fn visible_among(&self, candidates: &HashSet<ObjectId>) -> Result<HashSet<ObjectId>> {
+    fn visible_among(&self, candidates: &HashSet<ObjectId>) -> Result<HashSet<ObjectId>> {
         self.graph.reachable_among(self, self.view.refs(), candidates)
     }
 
@@ -1392,6 +1388,53 @@ impl<'r> Held<'r> {
     pub fn merge_bases_naive(&self, a: &[ObjectId], b: &[ObjectId]) -> Result<Vec<ObjectId>> {
         self.0.merge_bases_naive(a, b)
     }
+
+    /// The history index itself: held data (its own tests read it).
+    pub fn index(&self) -> &'r crate::graph_index::GraphIndex {
+        &self.0.graph
+    }
+
+    /// Which of `candidates` the view reaches, in held history.
+    pub fn visible_among(&self, candidates: &HashSet<ObjectId>) -> Result<HashSet<ObjectId>> {
+        self.0.visible_among(candidates)
+    }
+
+    /// The held embargoed merges the view reaches (the history index walks
+    /// only lines that build on one).
+    pub fn visible_embargoed(&self) -> Result<Vec<ObjectId>> {
+        self.0.visible_embargoed()
+    }
+
+    /// The held snapshots reachable from `include` and not from `exclude`.
+    pub fn range(&self, include: &[ObjectId], exclude: &[ObjectId]) -> Result<HashSet<ObjectId>> {
+        self.0.graph.range(self.0, include, exclude)
+    }
+
+    /// Which of `wanted` held history reaches from `roots`.
+    pub fn reachable_among(&self, roots: impl IntoIterator<Item = ObjectId>, wanted: &HashSet<ObjectId>) -> Result<HashSet<ObjectId>> {
+        self.0.graph.reachable_among(self.0, roots, wanted)
+    }
+
+    /// Held snapshots reachable from `roots` whose index entry `keep`s,
+    /// after indexing them (candidates for a change-id prefix or a flag;
+    /// the caller confirms what it uses against the store).
+    pub fn entries_matching(
+        &self,
+        roots: impl IntoIterator<Item = ObjectId>,
+        keep: impl FnMut(&ObjectId, &crate::graph_index::Entry) -> bool,
+    ) -> Result<Vec<ObjectId>> {
+        self.0.graph.entries_matching(self.0, roots, keep)
+    }
+
+    /// The held embargoed merges reachable from `roots`.
+    pub fn embargoed_among(&self, roots: impl IntoIterator<Item = ObjectId>) -> Result<HashSet<ObjectId>> {
+        self.0.graph.embargoed_among(self.0, roots)
+    }
+
+    /// The generation of `id` in the history index (`None` if not held).
+    pub fn generation(&self, id: &ObjectId) -> Result<Option<crate::graph_index::Gen>> {
+        self.0.graph.generation(self.0, id)
+    }
 }
 
 impl Exact<'_> {
@@ -1432,5 +1475,49 @@ impl Exact<'_> {
     /// `exclude`, so only that range is paged in.
     pub fn range(&self, include: &[ObjectId], exclude: &[ObjectId]) -> Result<HashSet<ObjectId>> {
         self.run(|r| r.graph.range(r, include, exclude))
+    }
+
+    /// Which of `candidates` the view reaches (the history above the
+    /// oldest of them only).
+    pub fn visible_among(&self, candidates: &HashSet<ObjectId>) -> Result<HashSet<ObjectId>> {
+        self.run(|r| r.visible_among(candidates))
+    }
+
+    /// The embargoed merges the view reaches.
+    pub fn visible_embargoed(&self) -> Result<Vec<ObjectId>> {
+        self.run(|r| r.visible_embargoed())
+    }
+
+    /// The embargoed merges reachable from `roots`.
+    pub fn embargoed_among(&self, roots: impl IntoIterator<Item = ObjectId>) -> Result<HashSet<ObjectId>> {
+        let roots: Vec<ObjectId> = roots.into_iter().collect();
+        self.run(|r| r.graph.embargoed_among(r, roots.iter().copied()))
+    }
+
+    /// The generation of `id` (fetched as `Exact::snapshot` fetches it).
+    pub fn generation(&self, id: &ObjectId) -> Result<Option<crate::graph_index::Gen>> {
+        if self.snapshot(id)?.is_none() {
+            return Ok(None);
+        }
+        self.run(|r| r.graph.generation(r, id))
+    }
+
+    /// Every snapshot reachable from `roots` of generation `floor` or more,
+    /// with its generation and snapshot (the walk stops below `floor`, so a
+    /// thin clone pages in only that part).
+    pub fn down_to(
+        &self,
+        roots: impl IntoIterator<Item = ObjectId>,
+        floor: crate::graph_index::Gen,
+    ) -> Result<HashMap<ObjectId, (crate::graph_index::Gen, Arc<Snapshot>)>> {
+        let roots: Vec<ObjectId> = roots.into_iter().collect();
+        self.run(|r| r.graph.down_to(r, roots.iter().copied(), floor))
+    }
+}
+
+impl Repo {
+    /// Persist the history index's new entries (best effort).
+    pub(crate) fn persist_index(&self) {
+        self.graph.persist(self);
     }
 }

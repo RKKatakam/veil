@@ -863,7 +863,11 @@ pub fn pull_with(repo: &mut Repo, remote: &str, client: &Client, only: Option<&s
         let page = thin.then_some(if first { want_tips.len() } else { veil_core::promisor::HISTORY_PAGE });
         for (id, raw) in client.history(want_tips, stop, page)? {
             let held = have(&id);
-            if held && !widen {
+            // A widening pull, and a full pull from another remote, walk
+            // what each snapshot reaches even when they hold the snapshot:
+            // its trees and files may be in the cache, or not fetched
+            // (BUG-1292).
+            if held && !main_only {
                 continue;
             }
             let Object::Snapshot(s) = Object::decode(&raw)? else {
@@ -1269,8 +1273,10 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                 created,
             });
         }
-        // What the server has: everything the remote tags reach.
+        // What the server has: everything the remote tags reach, as held
+        // (beyond a thin clone's boundary it is the server's anyway).
         let store = repo.store().clone();
+        let held = repo.held();
         let mut known: HashSet<ObjectId> = HashSet::new();
         let mut stack: Vec<ObjectId> = view
             .remote_tags
@@ -1283,7 +1289,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             if !known.insert(id) {
                 continue;
             }
-            if let Ok(s) = store.snapshot(&id) {
+            if let Ok(Some(s)) = held.snapshot(&id) {
                 stack.extend(s.parents.iter().copied());
             }
         }
@@ -1294,7 +1300,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             if known.contains(&id) || !seen_snaps.insert(id) {
                 continue;
             }
-            let s = store.snapshot(&id)?;
+            let s = held.snapshot(&id)?.ok_or(veil_core::VeilError::Missing(id))?;
             stack.extend(s.parents.iter().copied());
             new.push((id, s));
         }
@@ -1304,7 +1310,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         let mut up = Uploads { client, compress: revision >= 2, frames: Vec::new(), ids: Vec::new(), receipts: BTreeMap::new() };
         let mut walk = Introduced::new(&store, |id, raw| up.add(&id, &raw));
         for (id, s) in &new {
-            let parents: Vec<ObjectId> = s.parents.iter().filter_map(|p| store.snapshot(p).ok().map(|ps| ps.tree)).collect();
+            let parents: Vec<ObjectId> = s.parents.iter().filter_map(|p| held.snapshot(p).ok().flatten().map(|ps| ps.tree)).collect();
             walk.snapshot(*id, s.tree, parents)?;
         }
         drop(walk);

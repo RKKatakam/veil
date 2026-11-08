@@ -1169,7 +1169,6 @@ fn s3rd_a_thin_clone_answers_as_a_full_clone_for_more_revision_forms() {
 /// derived, old versions included: `query::resolve_prefix`), so a thin
 /// clone is told about the old versions as well.
 #[test]
-#[ignore = "BUG-1268: q/resolve names old versions of rewritten changes"]
 fn s3rd_a_thin_clone_names_what_a_full_clone_names_after_a_rewrite() {
     let hub = TestHub::start();
     let (admin, dir, name) = project_with_history(&hub, 6, 10);
@@ -1227,7 +1226,6 @@ fn history_shape(who: &Person, dir: &Path, known: &[String]) -> Vec<String> {
 /// a fresh full clone and a fresh thin one; afterwards both have the same
 /// history (by change id and description, `@` aside) and the same files.
 #[test]
-#[ignore = "BUG-1290: rewrites of unheld changes walk held history (rebase_descendants, check_current)"]
 fn s3rd_rewrites_of_unheld_history_match_a_full_clone() {
     let hub = TestHub::start();
     let (admin, dir, name) = project_with_history(&hub, 8, 10);
@@ -1336,7 +1334,6 @@ fn s3rd_redo_of_a_switch_past_the_cache_bound_records_nothing() {
 /// after the workspace is removed. `vl new big` and `vl new main` in the
 /// same clone copy nothing.
 #[test]
-#[ignore = "BUG-1293: a workspace switch copies fetched files into the main store"]
 fn s3rd_a_workspace_switch_does_not_copy_fetched_files_into_the_main_store() {
     let hub = TestHub::start();
     let (admin, name) = project_with_big_branch(&hub);
@@ -1417,7 +1414,6 @@ fn s3rd_gc_completes_across_a_second_remote_pulls_commits_rebases_and_evictions(
 /// word of what to do, while `vl gc` and `vl fsck` report nothing wrong.
 /// Either the removal is refused, or what the clone holds stays readable.
 #[test]
-#[ignore = "BUG-1292: removing the partial remote leaves a thin clone without a server"]
 fn s3rd_removing_a_thin_clones_remote_leaves_it_readable_or_is_refused() {
     let hub = TestHub::start();
     let (admin, _dir, name) = project_with_history(&hub, 6, 20_000);
@@ -1444,7 +1440,6 @@ fn s3rd_removing_a_thin_clones_remote_leaves_it_readable_or_is_refused() {
 /// with no ids is `Held::visible_iter` (`api::log_entries_with`): the
 /// snapshots the clone holds, outside any `Exact`.
 #[test]
-#[ignore = "BUG-1290: the served log walks held history only"]
 fn s3rd_serve_log_in_a_thin_clone_is_vl_log() {
     let hub = TestHub::start();
     let (admin, _dir, name) = project_with_history(&hub, 6, 10);

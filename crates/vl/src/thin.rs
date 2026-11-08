@@ -96,7 +96,18 @@ impl Promisor for HubPromisor {
             return Ok(Vec::new());
         }
         let req = HistoryRequest { tips: tips.to_vec(), stop: Vec::new(), limit: Some(limit) };
-        let (status, out) = self.post("/history", serde_json::to_vec(&req)?)?;
+        let body = serde_json::to_vec(&req)?;
+        // The viewer graph may still be filling ("warming", 503): ask again
+        // for about 10 s, as for any query.
+        let mut answer = self.post("/history", body.clone())?;
+        for _ in 0..20 {
+            if answer.0 != 503 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            answer = self.post("/history", body.clone())?;
+        }
+        let (status, out) = answer;
         match status {
             200 => crate::hub::objects_of(&out).map_err(|e| unavailable(&self.url, format!("{e:#}"))),
             // A tip this person's history does not have is left out.
@@ -274,38 +285,50 @@ fn full(ctx: &mut Ctx, remote: &str) -> Result<()> {
     Ok(())
 }
 
-/// Copy into the main store every object the snapshots only this clone
-/// holds (not reachable from the server's tips) reach, that is not there
-/// yet. Returns how many were copied.
+/// Copy into the main store every object that the history this clone now
+/// holds reaches and that only the cache holds (or nobody: fetched): every
+/// snapshot of the view and of every operation the op log keeps, every tree
+/// and file below. A working copy's snapshot reuses fetched files it did
+/// not change (BUG-1293), and the widening pull does not walk into a tree
+/// the main store already has, so both are covered here. Returns how many
+/// objects were copied.
 fn promote_local(repo: &Repo) -> Result<usize> {
     let store: &Arc<ObjectStore> = repo.store();
-    let prefix = format!("{}/", repo.config().partial.as_ref().map_or("origin", |p| p.remote.as_str()));
-    let server: Vec<ObjectId> = repo.view().remote_tags.iter().filter(|(k, _)| k.starts_with(&prefix)).map(|(_, v)| *v).collect();
-    let local = repo.graph().range(repo, &repo.view().refs(), &server)?;
-    let mut seen = std::collections::HashSet::new();
-    let mut stack: Vec<ObjectId> = Vec::new();
-    for s in &local {
-        stack.push(repo.snapshot(s)?.tree);
+    let mut roots = repo.view().refs();
+    for (_, op) in repo.op_log(usize::MAX)? {
+        roots.extend(op.view.refs());
     }
+    roots.sort();
+    roots.dedup();
+    // Held: after the widening pull every snapshot is.
+    let mut stack: Vec<ObjectId> = Vec::new();
+    for s in repo.held().topo_children_first(roots)? {
+        if let Some(snap) = repo.held().snapshot(&s)? {
+            stack.push(snap.tree);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut incoming = veil_core::remote::Incoming::new(store);
     let mut copied = 0;
     while let Some(id) = stack.pop() {
         if !seen.insert(id) {
             continue;
         }
+        let in_main = store.has_main(&id);
         let raw = match store.get_raw(&id) {
             Ok(raw) => raw,
             Err(e) if e.is_unreadable() => continue,
             Err(e) => return Err(e.into()),
         };
-        if !store.has_main(&id) {
-            store.put_raw(&id, &raw)?;
-            copied += 1;
-        }
         match veil_core::object::Object::decode(&raw)? {
             veil_core::object::Object::Tree(t) => stack.extend(t.entries.iter().map(|e| e.id)),
             veil_core::object::Object::Conflict(c) => stack.extend(c.referenced_ids()),
             _ => {}
         }
+        if !in_main && incoming.put(id, raw, "")? {
+            copied += 1;
+        }
     }
+    incoming.finish()?;
     Ok(copied)
 }
