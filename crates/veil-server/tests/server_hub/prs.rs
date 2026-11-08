@@ -3182,3 +3182,245 @@ mod s21_redesign {
         assert_eq!((r.as_str(), ready), ("normal", false));
     }
 }
+
+/// Review of the redesign's fixes, cycle 2 (BUG-1321 to 1325; `docs/BUGS.md`,
+/// "S21 redesign, cycle 2"). Each test states a guarantee and checks it.
+mod s21_redesign_cycle2 {
+    use veil_core::object::{Object, Snapshot, Text, Tree, TreeEntry};
+
+    use super::s21_cycle2::{pr_id, put_review};
+    use super::s21_cycle3::{held, member, Held};
+    use super::*;
+
+    /// Guarantee 2: a request for changes on a PR holds that PR until its
+    /// reviewer approves it or an admin dismisses it. Here alice asked for
+    /// changes to bob's PR (it drops a check in `pub/auth.rs`; cy
+    /// approved). Bob then opens a second PR at the same path, a comment
+    /// only, and alice approves that one, as she should. Her approval of
+    /// the comment is not an approval of the first PR, which must stay
+    /// held.
+    #[test]
+    #[ignore = "BUG-1326: an approval of another PR at the same paths releases the request for changes on this one"]
+    fn bug_1326_an_approval_of_another_pr_releases_the_request_on_this_one() {
+        let Held { th, mut h, alice, bob, cy, id, .. } = held();
+        let hub = h.hub.clone();
+        let me = caller(bob.0, &bob.1);
+        let review = |h: &Hist, pr: &str| -> Value { th.rt.block_on(prs::show(&hub, &member(&th, h, bob.0), pr)).unwrap()["review"].clone() };
+        let r = review(&h, &id);
+        assert!(r["ready"] == false && r["reasons"].to_string().contains(&format!("{} asked for changes", alice.1)), "held: {r}");
+        let mut f = h.files[&h.branches["main"]].clone();
+        f.insert("pub/auth.rs".into(), b"// checks the caller\nfn check() { verify() }\n".to_vec());
+        let s = h.commit(&th, &[h.branches["main"]], f, [8; 16], 7_000, None);
+        h.set_branch(&th, "comment", s);
+        let v = th.rt.block_on(prs::create(&hub, &member(&th, &h, bob.0), &me, CreatePr { head: "comment".into(), title: "a comment".into(), ..Default::default() })).unwrap();
+        let other = pr_id(v.clone());
+        put_review(&th, &h, &other, 1, alice.0, "approve", v["patch"].as_str().unwrap());
+        let o = review(&h, &other);
+        assert_eq!(o["approvals"], 1, "alice's approval of the comment counts: {o}");
+        let r = review(&h, &id);
+        assert_eq!(r["approvals"], 1, "cy's approval of the first PR: {r}");
+        assert_eq!(r["ready"], false, "alice never approved the first PR (cy is {}), and nobody dismissed her request: {r}", cy.1);
+    }
+
+    /// Guarantee 6 (the defaults): nothing is checks-only unless the admins
+    /// list it. A PR whose only change is a new empty folder (no file
+    /// changes) is rated `checks-only` and is ready with no approval.
+    #[test]
+    #[ignore = "BUG-1328: a PR that changes no file is checks-only under the defaults"]
+    fn bug_1328_a_pr_of_folders_only_is_checks_only_by_default() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let mut files = Files::new();
+        files.insert("pub/keep.rs".into(), b"fn keep() {}\n".to_vec());
+        let b = h.commit(&th, &[root_snapshot_id()], files.clone(), [1; 16], 1_000, None);
+        h.set_branch(&th, "main", b);
+        // The same files, and an empty folder `pub/empty` beside them.
+        let mut objects = Vec::new();
+        let empty = Object::Tree(Tree { entries: vec![] }).encode();
+        let empty_id = ObjectId::hash(&empty);
+        objects.push((empty_id, empty));
+        let keep = Object::Blob(b"fn keep() {}\n".to_vec()).encode();
+        let keep_id = ObjectId::hash(&keep);
+        objects.push((keep_id, keep));
+        let pubt = Object::Tree(Tree {
+            entries: vec![
+                TreeEntry::dir("empty", empty_id),
+                TreeEntry { name: "keep.rs".into(), kind: veil_core::object::EntryKind::File, id: keep_id, size: 13, executable: false, visibility: Default::default() },
+            ],
+        })
+        .encode();
+        let pub_id = ObjectId::hash(&pubt);
+        objects.push((pub_id, pubt));
+        let root = Object::Tree(Tree { entries: vec![TreeEntry::dir("pub", pub_id)] }).encode();
+        let root_id = ObjectId::hash(&root);
+        objects.push((root_id, root));
+        let s = Snapshot {
+            parents: vec![b],
+            change_id: veil_core::ChangeId([2; 16]),
+            tree: root_id,
+            description: Text::Plain("an empty folder".into()),
+            author: "gen".into(),
+            timestamp: 2_000,
+            predecessors: vec![],
+            conflicts: vec![],
+            embargo: None,
+            signature: None,
+        };
+        let raw = Object::Snapshot(s).encode();
+        let id = ObjectId::hash(&raw);
+        objects.push((id, raw));
+        h.put(&th, objects);
+        th.rt.block_on(again(|| sqlx::query("INSERT INTO snapshots (project_id, id) VALUES ($1, $2) ON CONFLICT DO NOTHING").bind(h.id).bind(id.hex()).execute(&h.hub.db)));
+        h.files.insert(id, files);
+        h.parents.insert(id, vec![b]);
+        h.order.push(id);
+        let (author, name) = person_row(&th, "author");
+        let v = th.rt.block_on(prs::create(&h.hub, &ask_as(&th, &h, &admin_of(author)), &caller(author, &name), CreatePr { head: id.hex(), title: "folder".into(), ..Default::default() })).unwrap();
+        assert!(v["id"].is_string(), "the PR was made: {v}");
+        assert_ne!(v["risk"], "checks-only", "no checks_only in .veilrules: {v}");
+        assert_eq!(v["review"]["ready"], false, "the defaults need an approval for every class: {}", v["review"]);
+    }
+
+    /// The real snapshot ids carol is shown, from `tip` down its first
+    /// parents: `[tip, parent, grandparent, …]`, `n` of them.
+    fn first_parents(api: &Api, token: &str, project: &str, tip: ObjectId, n: usize) -> Vec<(ObjectId, Snapshot)> {
+        let mut out = Vec::new();
+        let mut s = tip;
+        for _ in 0..n {
+            let h = api.post_json(Some(token), &format!("/v1/projects/{project}/history"), &json!({"tips": [s.hex()]}));
+            let (_, raw) = h.frames().into_iter().find(|(id, _)| *id == s).unwrap();
+            let Object::Snapshot(snap) = Object::decode(&raw).unwrap() else { panic!() };
+            let next = snap.parents[0];
+            out.push((s, snap));
+            s = next;
+        }
+        out
+    }
+
+    /// Guarantee 3: a merge that keeps an older version of a file the
+    /// pusher may not write is refused, whatever the history's shape.
+    /// carol reads `src/` and may not write it. A dev changes `src/lib.rs`
+    /// twice (`A0` → `A1` → `T`). carol's merge of `T` with `A0` that keeps
+    /// `T`'s tree changes nothing and is accepted (`M1`). Her merge of `A1`
+    /// and `M1` with `A1`'s `src/lib.rs` takes back the dev's second change:
+    /// the merge base of `A1` and `M1` is `A1`, where the file already had
+    /// that version, so nobody's side made it. It must be refused as the
+    /// same merge without `M1` is; the check's common ancestor
+    /// (`sync::common_ancestor`, the first snapshot either walk reaches
+    /// that the other has seen) is `A0` here, through `M1`'s second parent.
+    #[test]
+    #[ignore = "BUG-1327: the merge check uses a common ancestor that need not be a merge base"]
+    fn bug_1327_the_merge_check_uses_a_common_ancestor_that_is_not_a_merge_base() {
+        older_version_through_a_merge(false);
+    }
+
+    /// BUG-1327 with the tip first (`[M1, A1]`): the check of the merge's
+    /// changes against its first parent (BUG-820's rule, before this
+    /// diff) takes the same common ancestor, so this route predates
+    /// BUG-1321's fix.
+    #[test]
+    #[ignore = "BUG-1327: the merge check uses a common ancestor that need not be a merge base"]
+    fn bug_1327_with_the_tip_first() {
+        older_version_through_a_merge(true);
+    }
+
+    fn older_version_through_a_merge(tip_first: bool) {
+        let th = TestHub::start();
+        let p = setup_project(&th);
+        let api = th.api();
+        for (i, text) in ["MARKER-V1-the-first-0c5e", "MARKER-V2-the-fix-8d21"].iter().enumerate() {
+            let mut f = Craft::new(&api, &p.dev, &p.name, "main");
+            f.file("src/lib.rs", text);
+            let r = f.push("main", &format!("dev {i}"));
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", String::from_utf8_lossy(&r.body));
+        }
+        let token = p.carol.token();
+        let tip = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+        let line = first_parents(&api, &token, &p.name, tip, 3);
+        let (t, a1, a0) = (line[0].0, line[1].0, line[2].0);
+        let a1_tree = line[1].1.tree;
+        // Without M1 the same merge is refused (BUG-1321's fix).
+        let mut c = Craft::new(&api, &p.carol, &p.name, "main");
+        c.root = a1_tree;
+        let (_, r) = c.push_edited("main", Some(t), |s| s.parents = vec![a1, t]);
+        assert_eq!(r.status, 403, "the merge of A1 and T keeping A1's file: {}", String::from_utf8_lossy(&r.body));
+        // M1: T and A0, T's tree. A merge that changes nothing is accepted.
+        let c = Craft::new(&api, &p.carol, &p.name, "main");
+        let (_, r) = c.push_edited("main", Some(t), |s| s.parents = vec![t, a0]);
+        assert_eq!(r.status, 200, "M1: {}", String::from_utf8_lossy(&r.body));
+        assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "M1: {}", String::from_utf8_lossy(&r.body));
+        let m1 = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+        assert_ne!(m1, t, "main moved to M1");
+        // M2: A1 and M1, A1's tree (M1's tree differs from it only at src/lib.rs).
+        let mut c = Craft::new(&api, &p.carol, &p.name, "main");
+        c.root = a1_tree;
+        let (_, r) = c.push_edited("main", Some(m1), move |s| s.parents = if tip_first { vec![m1, a1] } else { vec![a1, m1] });
+        let now = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+        let line = first_parents(&api, &token, &p.name, now, 1);
+        assert_eq!(r.status, 403, "M2 took back the dev's fix (main's src/lib.rs is now the first version: {}): {}", line[0].1.tree == a1_tree, String::from_utf8_lossy(&r.body));
+        assert_eq!(now, m1, "main did not move");
+    }
+
+    /// Bounded work: the merge check finds each merge base once per pair
+    /// of parents, not once per path. A dev makes 150 changes of 20 new
+    /// files each in `src/`; carol (who may not write `src/`) pushes a
+    /// merge of the tip and the snapshot before them that keeps the tip's
+    /// tree, so it changes nothing. Measured (debug build, PostgreSQL):
+    /// 1,000 paths 2.1 s, 2,000 paths 8.0 s, 4,000 paths 45.7 s; 47 ms for
+    /// 4,000 paths without BUG-1321's new loop. The bound here is 3 s.
+    #[test]
+    #[ignore = "BUG-1329: the merge check walks the history once per path"]
+    fn bug_1329_the_merge_check_walks_the_history_once_per_path() {
+        let n: usize = std::env::var("S21_N").ok().and_then(|v| v.parse().ok()).unwrap_or(150);
+        let th = TestHub::start();
+        let p = setup_project(&th);
+        let api = th.api();
+        let token = p.carol.token();
+        let a0 = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+        for i in 0..n {
+            let mut f = Craft::new(&api, &p.dev, &p.name, "main");
+            for k in 0..20 {
+                f.file(&format!("src/g{i}/f{k}.rs"), &format!("fn f{i}_{k}() {{}}\n"));
+            }
+            let r = f.push("main", &format!("dev {i}"));
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", String::from_utf8_lossy(&r.body));
+        }
+        let tip = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+        let c = Craft::new(&api, &p.carol, &p.name, "main");
+        let t = std::time::Instant::now();
+        let (_, r) = c.push_edited("main", Some(tip), |s| s.parents = vec![tip, a0]);
+        let took = t.elapsed();
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", String::from_utf8_lossy(&r.body));
+        eprintln!("S21-MERGE-COST n={n} paths={} took {took:?}", n * 20);
+        assert!(took < std::time::Duration::from_secs(3), "a merge that changes nothing, {} paths apart: {took:?}", n * 20);
+    }
+
+    /// Guarantee 2 through a rename: after alice asked for changes to bob's
+    /// PR of `pub/auth.rs`, a new PR by bob that moves the file (with the
+    /// same change) to `pub/login.rs` touches `pub/auth.rs` too, and is
+    /// held.
+    #[test]
+    fn a_hold_follows_a_renamed_file() {
+        let Held { th, mut h, alice, bob, cy, id, .. } = held();
+        let hub = h.hub.clone();
+        let me = caller(bob.0, &bob.1);
+        let closed = th.rt.block_on(prs::close(&hub, &member(&th, &h, bob.0), &me, &id)).unwrap();
+        assert_eq!(closed["state"], "closed", "{closed}");
+        let mut f = h.files[&h.branches["main"]].clone();
+        let body = f.remove("pub/auth.rs").unwrap();
+        assert_eq!(body, b"fn check() { verify() }\n".to_vec());
+        f.insert("pub/login.rs".into(), b"fn check() {}\n".to_vec());
+        let s = h.commit(&th, &[h.branches["main"]], f, [8; 16], 7_000, None);
+        h.set_branch(&th, "renamed", s);
+        let v = th.rt.block_on(prs::create(&hub, &member(&th, &h, bob.0), &me, CreatePr { head: "renamed".into(), title: "renamed".into(), ..Default::default() })).unwrap();
+        let renamed = pr_id(v.clone());
+        put_review(&th, &h, &renamed, 1, cy.0, "approve", v["patch"].as_str().unwrap());
+        let r = th.rt.block_on(prs::show(&hub, &member(&th, &h, bob.0), &renamed)).unwrap()["review"].clone();
+        assert_eq!(r["approvals"], 1, "{r}");
+        assert!(r["ready"] == false && r["reasons"].to_string().contains(&format!("{} asked for changes", alice.1)), "held: {r}");
+    }
+}
