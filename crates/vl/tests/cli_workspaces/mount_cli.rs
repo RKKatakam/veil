@@ -442,3 +442,51 @@ fn bug_1365_open_files_of_a_mount_are_not_held_in_memory() {
     drop(open);
     assert!(during < before + 96, "8 open files of 32 MiB grew the mount from {before} to {during} MiB");
 }
+
+/// BUG-1368: BUG-1365's bound covers only the content kept for open files.
+/// The first read of a lower file still reads it whole (and copies it to
+/// the spill file), so the mount's peak grows by twice the largest file
+/// opened; an open lower file that is unlinked and then written is held in
+/// memory (`VecFile`), growing with every write. Either way the confined
+/// command drives memory outside its `--memory`.
+#[test]
+#[ignore = "BUG-1368: opening a large lower file peaks at twice its size, and an unlinked open file is written in memory without bound"]
+fn bug_1368_a_mount_never_holds_a_large_file_whole_in_memory() {
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    let big = "y".repeat(128 << 20);
+    let proj = env.project("alice", "proj", &[("big.bin", big.as_str()), ("small.txt", "small\n")]);
+    drop(big);
+    env.ok("alice", &proj, &["ws", "new", "agent", "-r", "main"]);
+    let (mnt, _m) = mount(&env, "alice", &proj, "agent");
+    let pid = state_pid(&proj, "agent");
+    let status = |k: &str| -> u64 {
+        let s = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        s.lines().find(|l| l.starts_with(k)).unwrap().split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() / 1024
+    };
+    let start = status("VmHWM:");
+    // One byte read of a 128 MiB file.
+    let mut f = std::fs::File::open(mnt.join("big.bin")).unwrap();
+    let mut b = [0u8; 1];
+    std::io::Read::read_exact(&mut f, &mut b).unwrap();
+    assert_eq!(b[0], b'y');
+    drop(f);
+    let opened = status("VmHWM:");
+    // 128 MiB written through the open handle of a lower file unlinked meanwhile.
+    let before = status("VmRSS:");
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).open(mnt.join("small.txt")).unwrap();
+    std::fs::remove_file(mnt.join("small.txt")).unwrap();
+    let chunk = vec![b'z'; 1 << 20];
+    for _ in 0..128 {
+        std::io::Write::write_all(&mut f, &chunk).unwrap();
+    }
+    std::io::Write::flush(&mut f).unwrap();
+    let written = status("VmRSS:");
+    drop(f);
+    assert!(
+        opened < start + 48 && written < before + 48,
+        "the mount's peak went from {start} to {opened} MiB for one byte of a 128 MiB file, and from {before} to {written} MiB for 128 MiB written to an unlinked open file"
+    );
+}

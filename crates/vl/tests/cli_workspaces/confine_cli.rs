@@ -1577,3 +1577,25 @@ fn concurrent_workspaces_keep_their_own_layers() {
     }
     assert_eq!(snapshot(&t.home, &[]), before, "a real allowed folder changed");
 }
+
+// ---- S8 cycle 2 review (`docs/BUGS.md`, "S8 cycle 2"; pre-existing) ------
+
+/// BUG-1369: cargo's `credentials.toml` kept elsewhere and linked into
+/// `~/.cargo` (a dotfiles manager's way: stow, chezmoi, home-manager) makes
+/// every confined run fail: the mask is bound over the link, which `bwrap`
+/// follows to a target the sandbox does not show, and `vl` says that
+/// confinement does not work on this machine. Expected: the run runs, with
+/// the credentials masked (as they are when the file is a plain file).
+#[test]
+#[ignore = "BUG-1369: a symlinked ~/.cargo/credentials.toml makes every confined run fail as 'confinement does not work on this machine'"]
+fn bug_1369_a_linked_cargo_credentials_file_is_masked_and_the_run_runs() {
+    let t = T::new();
+    let elsewhere = t.env.dir("dotfiles");
+    write(&elsewhere, "cargo/credentials.toml", "token = \"LINKED-CRATES-IO-TOKEN-1369ab\"\n");
+    std::fs::remove_file(t.home.join(".cargo/credentials.toml")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.join("cargo/credentials.toml"), t.home.join(".cargo/credentials.toml")).unwrap();
+    let o = t.exec(&["agent", "--", "sh", "-c", "~/.cargo/bin/tool; cat ~/.cargo/credentials.toml; echo end"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(o.status.success() && out.contains("tool-ran") && out.contains("end"), "{}", text(&o));
+    assert!(!out.contains("LINKED-CRATES-IO-TOKEN-1369ab"), "{out}");
+}

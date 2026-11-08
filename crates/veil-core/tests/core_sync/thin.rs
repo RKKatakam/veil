@@ -960,4 +960,90 @@ fn s3rd2_no_read_of_history_outside_held_or_exact() {
         Err(VeilError::Unavailable(_)) => {}
         r => panic!("a snapshot of the person's history, read outside Held and Exact: {:?}", r.map(|o| o.kind_name())),
     }
+
+// ---- S8 cycle 2 review (`docs/BUGS.md`, "S8 cycle 2") --------------------
+
+/// BUG-1366: `names_held` (S8 cycle 1 fixes) turns fetching off for the
+/// whole store (`without_fetching`, a counter every thread reads), not for
+/// its own thread, while it looks a refused object up in a held tree. A
+/// read on any other thread in that window gets `Missing` ("not yours")
+/// for a file the server serves: the "fetching off" producer of `Missing`,
+/// outside gc, fsck and maintenance, which alone may meet it. Here one
+/// thread reads a refused file under a local change (as a mount does after
+/// access is removed) while another reads 600 readable files under the
+/// server's tip, as a checkout's staging threads or `vl grep` do: every one
+/// of them must read.
+#[test]
+#[ignore = "BUG-1366: names_held's without_fetching turns fetching off for every thread of the store, so a concurrent read of a served file is Missing"]
+fn s8r2_a_refusal_met_on_one_thread_never_hides_another_threads_read() {
+    let id = Identity::generate("alice");
+    let sfs = Arc::new(MemoryBackend::new());
+    let mut srv = Repo::init(sfs.clone(), Some(id.clone()), "alice").unwrap();
+    let mut files: Vec<(String, String)> = (0..600).map(|i| (format!("many/f{i}.txt"), format!("readable {i}\n"))).collect();
+    files.push(("closed/s.txt".into(), "REFUSED-CONTENT-1366\n".into()));
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let tip = commit_files(&mut srv, &*sfs, &refs, "one");
+    let server = Arc::new(Server {
+        store: srv.store().clone(),
+        tips: vec![tip],
+        down: AtomicBool::new(false),
+        tamper: AtomicBool::new(false),
+        refuse: Mutex::new(HashSet::new()),
+        asked: Mutex::new(Vec::new()),
+        pages: Mutex::new(0),
+    });
+    let pr = Project { server: server.clone(), commits: vec![tip], tip, id: id.clone() };
+    let (mut repo, fs) = thin(&pr, 1 << 30);
+    checkout(&mut repo, &fs, tip);
+    // The local change adds a file beside the one access will be removed from.
+    let mine = commit_files(&mut repo, &*fs, &[("closed/mine.txt", "mine\n")], "local work");
+    repo.store().set_anchor_snapshots(Vec::new());
+    repo.store().set_cache_limit(0);
+    std::mem::drop(fs);
+    let backend: Arc<dyn StorageBackend> = repo.backend().clone();
+    let _ = backend.remove_file(&p(".veil/local/checkout.json"));
+    repo.store().trim_cache().unwrap();
+    let again = Repo::open(backend, Some(id), "alice").unwrap();
+    again.store().set_promisor(server.clone());
+    again.store().set_cache_limit(1 << 30);
+    // Access to closed/ is removed on the server.
+    let closed = lookup(&server.store, &srv.snapshot(&tip).unwrap().tree, &p("closed/s.txt")).unwrap().unwrap();
+    server.refuse.lock().unwrap().insert(closed.id);
+    // Met under the local change first (its place is there), then the
+    // tip's trees are held too (a listing read them); no file is.
+    let refused = entry(&again, &mine, "closed/s.txt");
+    let _ = entry(&again, &tip, "closed/s.txt");
+    let many: Vec<veil_core::TreeEntry> = (0..600).map(|i| entry(&again, &tip, &format!("many/f{i}.txt"))).collect();
+    assert_eq!(refused.id, closed.id);
+    let err = again.store().read_entry(&refused).unwrap_err();
+    assert!(matches!(err, VeilError::Missing(_)), "the refusal under the local change is the server's: {err:?}");
+    let store = again.store().clone();
+    let done = AtomicBool::new(false);
+    let hidden: Vec<usize> = std::thread::scope(|s| {
+        let a = s.spawn(|| {
+            let mut n = 0u64;
+            while !done.load(Ordering::SeqCst) {
+                let e = store.read_entry(&refused).unwrap_err();
+                assert!(matches!(e, VeilError::Missing(_)), "{e:?}");
+                n += 1;
+            }
+            n
+        });
+        let reader = s.spawn(|| {
+            let mut hidden = Vec::new();
+            for (i, e) in many.iter().enumerate() {
+                match store.read_entry(e) {
+                    Ok(data) => assert_eq!(data, format!("readable {i}\n").into_bytes()),
+                    Err(VeilError::Missing(_)) => hidden.push(i),
+                    Err(other) => panic!("many/f{i}.txt: {other:?}"),
+                }
+            }
+            done.store(true, Ordering::SeqCst);
+            hidden
+        });
+        let h = reader.join().unwrap();
+        assert!(a.join().unwrap() > 0, "the refusal was read meanwhile");
+        h
+    });
+    assert!(hidden.is_empty(), "{} of 600 files the server serves read as Missing (hidden) while another thread met a refusal: {:?}", hidden.len(), &hidden[..hidden.len().min(10)]);
 }

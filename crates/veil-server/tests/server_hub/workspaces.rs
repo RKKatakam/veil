@@ -506,3 +506,37 @@ fn a_server_refusal_hides_the_file() {
     assert_no_marker(&everything_in(&thin), &[FEATURE_BILL], "fin's clone after the refusal");
     m.unmount();
 }
+
+// ---- S8 cycle 2 review (`docs/BUGS.md`, "S8 cycle 2") --------------------
+
+/// BUG-1367: a refusal hides the refused *object* (its id), not the file
+/// at its place: a file elsewhere with the same content (an empty file, a
+/// licence, a copied config) that the person may read is absent from the
+/// mount for 10 s, though the server serves it there.
+#[test]
+#[ignore = "BUG-1367: a refusal in a thin clone's mount hides every file with the same content, readable ones included"]
+fn bug_1367_a_refusal_hides_only_the_refused_file_not_its_content_elsewhere() {
+    const SAME: &str = "SAME-CONTENT-IN-TWO-FOLDERS-b7e24f19\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    write_files(&p.dir, &[("src/shared/same.txt", SAME), (&format!("{BILL_DIR}/acme/same.txt"), SAME)]);
+    p.admin.ok(&p.dir, &["commit", "--no-advance", "-m", "same content twice"]);
+    p.admin.ok(&p.dir, &["tag", "set", "feature", "-r", "@-"]);
+    p.admin.ok(&p.dir, &["push"]);
+    let thin = thin_with_agent(&p, &hub, &p.fin, "thin");
+    let m = Mounted::new(&p.fin, &thin, "agent");
+    let (shared, acme) = (m.dir.join("src/shared"), m.dir.join(format!("{BILL_DIR}/acme")));
+    let names: Vec<String> = std::fs::read_dir(&acme).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(names.contains(&"same.txt".to_string()), "{names:?}");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let e = std::fs::read(acme.join("same.txt")).expect_err("the billing copy is refused");
+    assert_eq!(e.raw_os_error(), Some(EACCES), "{e}");
+    // fin still reads src/ (public): the server serves the same content there.
+    let got = std::fs::read(shared.join("same.txt"));
+    assert_eq!(
+        got.as_deref().map_err(|e| e.to_string()),
+        Ok(SAME.as_bytes()),
+        "a file fin may read is hidden because a file elsewhere with its content was refused"
+    );
+    m.unmount();
+}
