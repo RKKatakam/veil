@@ -452,6 +452,9 @@ impl Repo {
         let base = self.parents_tree(&s.parents)?.tree;
         let mut units = selection::units(&self.store, &base, &s.tree)?;
         if by_hunk {
+            // In a thin clone, each side asked for at its own path
+            // (BUG-1506).
+            crate::tree::prefetch_changes(&self.store, Some(&base), Some(&s.tree), units.iter().flat_map(|u| &u.changes))?;
             for u in &mut units {
                 selection::classify(&self.store, u, &s.conflicts)?;
             }

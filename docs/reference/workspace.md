@@ -120,9 +120,12 @@ Options:
 | `--with-isolated` | Copy local-only (isolated) files such as .env into the sandbox for this run (they are taken out again afterwards) |
 | `--only <PATH>` | Sparse sandbox: hold only these paths (files or directories of the workspace, relative to the current directory) |
 | `--record-only` | Run nothing: record what an earlier run left unrecorded (vl was killed, or recording failed) |
+| `--mount` | Run over a mount of the workspace (FUSE) instead of a checkout: ready at once, and a file is read (in a thin clone, fetched from the server) only when the command reads it. Without FUSE here, the sandbox is checked out as without --mount |
 | `--unconfined` | Run without confinement: the command can read and change everything your user can |
 | `--allow <PATH>` | Also show PATH (a folder or file of this machine) to the command; its writes go to the workspace's own layer, never to PATH. Repeatable |
 | `--no-network` | No network: the command gets only a private loopback |
+| `--private-ports` | A private loopback that keeps outbound access: the command gets its own network, so every run can bind 127.0.0.1:5432 or :8080 at once, and reaches the outside through pasta (from passt). The host's loopback is not reachable from it |
+| `--seed <SRC:DEST>` | Mount the directory SRC at DEST (absolute paths) with a writable layer of this run's own on top: every run starts from SRC as it is, nothing is copied, SRC is never written, and the run's writes vanish when it exits. Repeatable |
 | `--memory <SIZE>` | Memory limit, e.g. 4G or 512M |
 | `--cpus <N>` | CPU rate limit, in CPUs, e.g. 2 or 0.5 |
 | `--cpu-time <DURATION>` | Total CPU-time limit, e.g. 30m or 90s |

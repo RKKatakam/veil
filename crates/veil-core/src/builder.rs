@@ -1274,7 +1274,8 @@ impl<'a> Builder<'a> {
                     // Readable and absent is a deletion, unless it was never
                     // materialised (it became readable since checkout).
                     let never_materialised = b.opts.materialised.is_some_and(|m| m.hidden(path));
-                    let readable = b.store.entry_readable(e);
+                    // In a thin clone, not fetched is shown (S8): absent is a deletion.
+                    let readable = b.store.entry_shown(e);
                     if readable && !never_materialised {
                         Ok(Err(None))
                     } else {
@@ -1305,7 +1306,8 @@ impl<'a> Builder<'a> {
                 // a deletion (a removed link).
                 EntryKind::Symlink => {
                     let never_materialised = b.opts.materialised.is_some_and(|m| m.hidden(path));
-                    let readable = b.store.entry_readable(e);
+                    // In a thin clone, not fetched is shown (S8): absent is a deletion.
+                    let readable = b.store.entry_shown(e);
                     if b.links && readable && !never_materialised {
                         Ok(Err(None))
                     } else {

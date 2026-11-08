@@ -823,6 +823,11 @@ impl Repo {
         let wc = tx.new_change(bases, "")?;
         tx.view.workspaces.insert(name.to_string(), WorkspaceState::new(wc));
         tx.commit()?;
+        // Its working copy is snapshots already recorded, nothing of this
+        // device's: nothing for the current scanner rules to look at again.
+        // (Otherwise its first recording would read every file, and in a
+        // thin clone fetch the whole workspace: milestone S8.)
+        mark_scanned(&*self.backend, name)?;
         Ok(wc)
     }
 

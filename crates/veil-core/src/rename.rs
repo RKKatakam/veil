@@ -143,9 +143,11 @@ struct Source {
     change: Option<usize>,
 }
 
-/// Detect renames (and copies) among `changes`, reading as `reader`.
-pub fn detect(store: &ObjectStore, changes: &[TreeChange], reader: Reader, o: &RenameOptions) -> Result<Detected> {
-    detect_with_sources(store, None, changes, reader, o)
+/// Detect renames (and copies) among `changes` (from `from` to `to`),
+/// reading as `reader`. In a thin clone, what the inexact pass reads is
+/// asked for at its path in `from` or `to` (BUG-1506).
+pub fn detect(store: &ObjectStore, from: Option<&ObjectId>, to: Option<&ObjectId>, changes: &[TreeChange], reader: Reader, o: &RenameOptions) -> Result<Detected> {
+    detect_in(store, (from, to), false, changes, reader, o)
 }
 
 /// [`detect`]; with copies on and `old_tree` given, the unchanged files of
@@ -153,10 +155,23 @@ pub fn detect(store: &ObjectStore, changes: &[TreeChange], reader: Reader, o: &R
 pub fn detect_with_sources(
     store: &ObjectStore,
     old_tree: Option<&ObjectId>,
+    new_tree: Option<&ObjectId>,
     changes: &[TreeChange],
     reader: Reader,
     o: &RenameOptions,
 ) -> Result<Detected> {
+    detect_in(store, (old_tree, new_tree), true, changes, reader, o)
+}
+
+fn detect_in(
+    store: &ObjectStore,
+    (from, to): (Option<&ObjectId>, Option<&ObjectId>),
+    unchanged_sources: bool,
+    changes: &[TreeChange],
+    reader: Reader,
+    o: &RenameOptions,
+) -> Result<Detected> {
+    let old_tree = from.filter(|_| unchanged_sources);
     let mut sources: Vec<Source> = Vec::new();
     let mut dests: Vec<usize> = Vec::new();
     for (i, c) in changes.iter().enumerate() {
@@ -276,6 +291,7 @@ pub fn detect_with_sources(
         if (open_dests.len() as u128) * (open_sources.len() as u128) > limit {
             d.truncated = true;
         } else {
+            prefetch_inexact(store, (from, to), &sources, &open_sources, changes, &open_dests, o)?;
             match inexact(store, &sources, &open_sources, changes, &open_dests, reader, o, &mut d.stats)? {
                 None => d.truncated = true,
                 Some(mut cands) => {
@@ -403,6 +419,43 @@ fn read_plain(store: &ObjectStore, e: &TreeEntry, reader: Reader, stats: &mut Re
         Readable::Plain { data, .. } if data.len() as u64 <= MAX_INEXACT_FILE => Some(data),
         _ => None,
     })
+}
+
+/// In a thin clone, what [`inexact`] reads (in its order, within its
+/// budget), each at its own path: sources in `from`, destinations in `to`.
+fn prefetch_inexact(
+    store: &ObjectStore,
+    (from, to): (Option<&ObjectId>, Option<&ObjectId>),
+    sources: &[Source],
+    open_sources: &[usize],
+    changes: &[TreeChange],
+    open_dests: &[usize],
+    o: &RenameOptions,
+) -> Result<()> {
+    if !store.may_fetch() {
+        return Ok(());
+    }
+    let mut left = o.budget;
+    let mut within = |e: &TreeEntry| {
+        let take = e.size <= MAX_INEXACT_FILE && e.size <= left;
+        if take {
+            left -= e.size;
+        }
+        take
+    };
+    let src: Vec<(&VPath, &TreeEntry)> = open_sources.iter().map(|&si| (&sources[si].path, &sources[si].entry)).filter(|(_, e)| within(e)).collect();
+    let dst: Vec<(&VPath, &TreeEntry)> = open_dests
+        .iter()
+        .filter_map(|&di| changes[di].new.as_ref().map(|e| (&changes[di].path, e)))
+        .filter(|(_, e)| within(e))
+        .collect();
+    if let Some(f) = from {
+        crate::tree::prefetch_files(store, f, src)?;
+    }
+    if let Some(t) = to {
+        crate::tree::prefetch_files(store, t, dst)?;
+    }
+    Ok(())
 }
 
 /// The inexact candidates `(score, dest change, source)`, or `None` when a
