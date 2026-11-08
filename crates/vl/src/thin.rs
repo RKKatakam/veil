@@ -119,6 +119,27 @@ impl Promisor for HubPromisor {
         self.tips.clone()
     }
 
+    fn generations(&self, snapshots: &[ObjectId]) -> veil_core::Result<Option<Vec<Option<u64>>>> {
+        let body = serde_json::to_vec(&veil_core::hub::wire::GenerationsRequest { snapshots: snapshots.to_vec() })?;
+        for attempt in 0..20 {
+            let (status, out) = self.post("/q/generations", body.clone())?;
+            match status {
+                200 => {
+                    let g: veil_core::hub::wire::Generations = serde_json::from_slice(&out).map_err(|e| unavailable(&self.url, e))?;
+                    if g.generations.len() != snapshots.len() {
+                        return Err(unavailable(&self.url, "the server answered other generations than asked"));
+                    }
+                    return Ok(Some(g.generations));
+                }
+                // A server older than revision 6.
+                404 | 405 => return Ok(None),
+                503 if attempt < 19 => std::thread::sleep(std::time::Duration::from_millis(500)),
+                s => return Err(self.refused(s, &out)),
+            }
+        }
+        Err(unavailable(&self.url, "the server kept preparing this history"))
+    }
+
     fn resolve(&self, prefix: &str) -> veil_core::Result<Option<veil_core::hub::wire::Resolved>> {
         // Only letters and digits reach the URL (a prefix is hex or k–z).
         if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_alphanumeric()) {

@@ -1882,7 +1882,6 @@ fn resolved(th: &TestHub, h: &Hist, a: &Ask, prefix: &str) -> String {
 /// then drops the withheld: the embargoed snapshot takes a visible one's
 /// place, and turns `more` on.
 #[test]
-#[ignore = "BUG-1269: q/resolve counts and cuts withheld rows before dropping them"]
 fn s3rd_resolve_caps_reveal_no_withheld_snapshot() {
     let th = TestHub::start();
     let (policy_text, bindings) = policy(1);
@@ -1929,7 +1928,6 @@ fn s3rd_resolve_caps_reveal_no_withheld_snapshot() {
 /// and drops the hidden; `more` says nothing of the rows it did not read:
 /// the visible change is left out, and the answer is "nothing matched".
 #[test]
-#[ignore = "BUG-1269: q/resolve reads 64 real rows, hidden ones among them, before dropping the hidden"]
 fn s3rd_resolve_of_a_change_prefix_ignores_hidden_changes() {
     let th = TestHub::start();
     let (policy_text, bindings) = policy(1);

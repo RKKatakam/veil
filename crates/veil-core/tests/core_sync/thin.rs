@@ -100,6 +100,29 @@ impl Promisor for Server {
     fn server_tips(&self) -> Vec<ObjectId> {
         self.tips.clone()
     }
+
+    /// As the server's viewer graph computes them: the larger of the
+    /// timestamp and 1 plus the parents' largest (0 with none).
+    fn generations(&self, snapshots: &[ObjectId]) -> veil_core::Result<Option<Vec<Option<u64>>>> {
+        if self.down.load(Ordering::SeqCst) {
+            return Err(VeilError::Unavailable("test server: connection refused".into()));
+        }
+        fn generation(store: &ObjectStore, id: &ObjectId, memo: &mut std::collections::HashMap<ObjectId, u64>) -> Option<u64> {
+            if let Some(g) = memo.get(id) {
+                return Some(*g);
+            }
+            let Ok(Object::Snapshot(s)) = store.get(id) else { return None };
+            let mut g = 0u64;
+            for p in &s.parents {
+                g = g.max(generation(store, p, memo)? + 1);
+            }
+            let g = g.max(s.timestamp.max(0) as u64);
+            memo.insert(*id, g);
+            Some(g)
+        }
+        let mut memo = std::collections::HashMap::new();
+        Ok(Some(snapshots.iter().map(|id| generation(&self.store, id, &mut memo)).collect()))
+    }
 }
 
 /// The project as the server holds it: three commits, then the tip.
@@ -805,6 +828,10 @@ impl Promisor for Capped {
     fn server_tips(&self) -> Vec<ObjectId> {
         self.0.server_tips()
     }
+
+    fn generations(&self, snapshots: &[ObjectId]) -> veil_core::Result<Option<Vec<Option<u64>>>> {
+        self.0.generations(snapshots)
+    }
 }
 
 /// A server project of `n` linear commits, and a thin clone of its tip
@@ -889,7 +916,6 @@ fn s3r3_the_whole_graph_walks_page_in_nothing() {
 /// the whole history; and each answer is the full clone's. Each walk runs
 /// in a fresh clone.
 #[test]
-#[ignore = "BUG-1291: Exact walks page in the whole ancestry of their lower bound"]
 fn s3rd_exact_walks_page_in_only_their_range() {
     type Walk = Box<dyn Fn(&Repo, &Project)>;
     let walks: Vec<(&str, Walk)> = vec![

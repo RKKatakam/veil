@@ -123,6 +123,14 @@ pub trait Promisor: Send + Sync {
     fn resolve(&self, _prefix: &str) -> Result<Option<crate::hub::wire::Resolved>> {
         Ok(None)
     }
+
+    /// The generations of `snapshots` in this person's history, as the
+    /// server's viewer graph computes them (the history index's own
+    /// arithmetic), each `None` where its history has no such snapshot.
+    /// `None`: the server cannot answer (older than protocol revision 6).
+    fn generations(&self, _snapshots: &[ObjectId]) -> Result<Option<Vec<Option<u64>>>> {
+        Ok(None)
+    }
 }
 
 /// The location of every object met in a decoded tree, compactly (16 bytes

@@ -44,8 +44,9 @@ pub const PROTOCOL: u32 = 1;
 /// objects ([`super::encoding`]); 3, read grants with the tips and the
 /// object routes ([`super::grant`]); 4, history answers pages
 /// ([`HistoryRequest::limit`]), for thin clones; 5, `q/resolve` names the
-/// snapshots of the caller's history by id prefix ([`Resolved`]).
-pub const REVISION: u32 = 5;
+/// snapshots of the caller's history by id prefix ([`Resolved`]); 6,
+/// `q/generations` gives their generations ([`Generations`]).
+pub const REVISION: u32 = 6;
 /// Largest object a frame may carry.
 pub const MAX_FRAME_OBJECT: usize = 1 << 30;
 /// Most objects one fetch request may name.
@@ -135,6 +136,24 @@ pub struct HistoryRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
 }
+
+/// `POST …/q/generations` (revision 6): the snapshots, of the caller's
+/// own history, whose generations a thin clone's history index needs at
+/// its boundary (at most [`MAX_GENERATIONS`]).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GenerationsRequest {
+    pub snapshots: Vec<ObjectId>,
+}
+
+/// Its answer: one generation per snapshot asked, `None` where the caller's
+/// history has no such snapshot (or it is withheld).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Generations {
+    pub generations: Vec<Option<u64>>,
+}
+
+/// Most snapshots one `q/generations` request names.
+pub const MAX_GENERATIONS: usize = 1_000;
 
 /// The answer of `GET …/q/resolve?prefix=` (revision 5): the snapshots of
 /// the caller's own history whose id (`snapshots`), or whose change id

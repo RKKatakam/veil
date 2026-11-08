@@ -212,6 +212,10 @@ struct State {
     fresh_missing: HashSet<ObjectId>,
     /// Missing parents listed by the loaded layers, and by `fresh`.
     missing: HashSet<ObjectId>,
+    /// A thin clone: entries computed with ancestors it does not hold and
+    /// no generation from its server (it could not be reached): lower
+    /// bounds. Never persisted, and invisible to `Exact` walks (BUG-1291).
+    partial: HashSet<ObjectId>,
 }
 
 impl State {
@@ -220,6 +224,14 @@ impl State {
             return Some(*e);
         }
         self.layers.iter().rev().find_map(|l| l.find(id))
+    }
+
+    /// [`State::get`] for an `Exact` walk: a partial entry is none.
+    fn get_for(&self, id: &ObjectId, exact: bool) -> Option<Entry> {
+        if exact && self.partial.contains(id) {
+            return None;
+        }
+        self.get(id)
     }
 
     fn reset(&mut self, epoch: u64) {
@@ -426,7 +438,7 @@ impl GraphIndex {
     fn with<R>(&self, repo: &Repo, f: impl FnOnce(&mut Walker<'_>) -> Result<R>) -> Result<R> {
         let mut st = self.lock();
         self.ensure_loaded(repo, &mut st);
-        let mut w = Walker { repo, st: &mut st };
+        let mut w = Walker { repo, st: &mut st, exact: crate::repo::in_exact() };
         let out = f(&mut w)?;
         if st.fresh.len() >= PERSIST_BATCH {
             self.persist_locked(&mut st);
@@ -457,8 +469,11 @@ impl GraphIndex {
             return;
         }
         for _ in 0..4 {
-            // Entries another appender has persisted meanwhile are dropped.
-            let fresh: Vec<ObjectId> = st.fresh.iter().copied().filter(|id| !st.layers.iter().any(|l| l.find(id).is_some())).collect();
+            // Entries another appender has persisted meanwhile are dropped,
+            // and partial ones are never written (a thin clone's lower
+            // bounds, BUG-1291).
+            let fresh: Vec<ObjectId> =
+                st.fresh.iter().copied().filter(|id| !st.partial.contains(id) && !st.layers.iter().any(|l| l.find(id).is_some())).collect();
             if fresh.is_empty() {
                 st.fresh.clear();
                 st.fresh_missing.clear();
@@ -850,6 +865,8 @@ impl GraphIndex {
 struct Walker<'a> {
     repo: &'a Repo,
     st: &'a mut State,
+    /// Inside `Exact::run`: partial entries do not count.
+    exact: bool,
 }
 
 impl Walker<'_> {
@@ -860,14 +877,15 @@ impl Walker<'_> {
     /// The entry of `id`, computing it (and every unindexed ancestor) from
     /// the store if needed; `None` if the store does not hold `id`.
     fn entry(&mut self, id: &ObjectId) -> Result<Option<Entry>> {
-        if let Some(e) = self.st.get(id) {
+        let exact = self.exact;
+        if let Some(e) = self.st.get_for(id, exact) {
             return Ok(Some(e));
         }
         // Post-order over the unindexed ancestors, iterative.
         let mut pending: HashMap<ObjectId, Arc<Snapshot>> = HashMap::new();
         let mut stack = vec![(*id, false)];
         while let Some((x, expanded)) = stack.pop() {
-            if self.st.get(&x).is_some() {
+            if self.st.get_for(&x, exact).is_some() {
                 continue;
             }
             if !expanded {
@@ -875,9 +893,30 @@ impl Walker<'_> {
                     continue;
                 }
                 let Some(s) = self.repo.held().snapshot(&x)? else { continue };
+                // A thin clone, at its boundary (a parent it does not
+                // hold): the generation is the server's (exact), so the
+                // ancestry below is never needed (BUG-1291).
+                if s.parents.iter().any(|p| !self.repo.store().has_main(p)) {
+                    match self.repo.boundary_generation(&x) {
+                        Ok(Some(g)) => {
+                            let flags = if s.embargo.is_some() { FLAG_EMBARGO | FLAG_EMBARGO_LINE } else { 0 };
+                            self.st.mem.insert(x, Entry { generation: g, change_id: s.change_id, flags });
+                            self.st.partial.remove(&x);
+                            self.st.fresh.push(x);
+                            continue;
+                        }
+                        Ok(None) => {}
+                        // The server cannot be reached: an `Exact` walk
+                        // fails; a held one goes on with a lower bound.
+                        Err(e) if exact => return Err(e),
+                        Err(_) => {
+                            self.st.partial.insert(x);
+                        }
+                    }
+                }
                 stack.push((x, true));
                 for p in &s.parents {
-                    if self.st.get(p).is_none() && !pending.contains_key(p) {
+                    if self.st.get_for(p, exact).is_none() && !pending.contains_key(p) {
                         stack.push((*p, false));
                     }
                 }
@@ -887,11 +926,13 @@ impl Walker<'_> {
             let s = pending.remove(&x).expect("expanded snapshots are pending");
             let mut above: Gen = 0;
             let mut flags = if s.embargo.is_some() { FLAG_EMBARGO | FLAG_EMBARGO_LINE } else { 0 };
+            let mut partial = self.st.partial.contains(&x);
             for p in &s.parents {
-                match self.st.get(p) {
+                match self.st.get_for(p, exact) {
                     Some(e) => {
                         above = above.max(e.generation);
                         flags |= e.flags & FLAG_EMBARGO_LINE;
+                        partial |= self.st.partial.contains(p);
                     }
                     None => {
                         self.st.missing.insert(*p);
@@ -908,9 +949,13 @@ impl Walker<'_> {
                 flags,
             };
             self.st.mem.insert(x, e);
+            match partial {
+                true => self.st.partial.insert(x),
+                false => self.st.partial.remove(&x),
+            };
             self.st.fresh.push(x);
         }
-        Ok(self.st.get(id))
+        Ok(self.st.get_for(id, exact))
     }
 }
 

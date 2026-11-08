@@ -50,6 +50,11 @@ thread_local! {
     static EXACT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// Is this thread inside [`Exact::run`]?
+pub(crate) fn in_exact() -> bool {
+    EXACT.with(|d| d.get() > 0)
+}
+
 /// The directory holding the Veil repository of the project at `root`:
 /// `<root>/.veil`.
 pub fn state_dir(root: &Path) -> std::path::PathBuf {
@@ -591,6 +596,21 @@ impl Repo {
         }
     }
 
+    /// A thin clone: the generation of snapshot `id` (held, at the boundary)
+    /// as the server's viewer graph has it, the history index's exact value
+    /// without the ancestry below (BUG-1291). `None`: not a thin clone, a
+    /// server older than protocol revision 6, or a snapshot its history
+    /// lacks (one of this clone's own). An error when it cannot be reached.
+    pub(crate) fn boundary_generation(&self, id: &ObjectId) -> Result<Option<u64>> {
+        if !self.store.is_partial() || !self.store.may_fetch() {
+            return Ok(None);
+        }
+        let Some(promisor) = self.store.promisor() else {
+            return Err(VeilError::Unavailable("this thin clone has no connection to its server".into()));
+        };
+        Ok(promisor.generations(&[*id])?.and_then(|g| g.first().copied().flatten()))
+    }
+
     /// Fetch one page of history below `tips` (snapshots this thin clone
     /// lacks) into the main store; returns how many snapshots were new.
     pub fn deepen(&self, tips: &[ObjectId], limit: usize) -> Result<usize> {
@@ -1030,6 +1050,12 @@ impl Repo {
             // A snapshot this replica lacks (a redacted parent) has no
             // generation; it is an ancestor if some ancestor names it.
             if a != b && r.snapshot_opt(a)?.is_none() {
+                // A thin clone asked its server: `a` is in no history of
+                // this person's, so it is no ancestor (never a walk of all
+                // of `b`'s ancestry, BUG-1291).
+                if r.store.is_partial() {
+                    return Ok(false);
+                }
                 return Ok(r.ancestors(b)?.contains(a));
             }
             r.graph.is_ancestor(r, a, b)
@@ -1037,6 +1063,11 @@ impl Repo {
     }
 
     pub fn common_ancestor(&self, a: &ObjectId, b: &ObjectId) -> Result<ObjectId> {
+        // A thin clone: the newest merge base, a walk bounded by the history
+        // index (the walk of every ancestor of `a` is not, BUG-1291).
+        if self.store.is_partial() {
+            return Ok(self.merge_bases(&[*a], &[*b])?.last().copied().unwrap_or(self.root_id));
+        }
         self.run_exact(|r| r.common_ancestor_here(a, b))
     }
 
