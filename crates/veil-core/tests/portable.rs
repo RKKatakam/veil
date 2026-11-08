@@ -747,6 +747,73 @@ fn bug_1487_a_restore_that_stops_before_taking_back_a_release_still_takes_it_bac
     assert_eq!(next.keys().release_state(&e), veil_core::keychain::ReleaseState::Unreleased, "taken back");
 }
 
+/// BUG-1535 (op log merges review, cycle 5): a retractor stopped before
+/// its take-back, then itself taken back, revives the release. `vl op
+/// restore` past a staged release (or `vl undo` of the release) commits
+/// first and takes the release back after; the process stops between the
+/// two. The next command takes the retractor back (an undo of the
+/// restore; an op restore to just after the release, past the undo).
+/// Run to the end, the first command took the release back for good, and
+/// undo and restore never release (`a_release_taken_back_by_a_restore_
+/// stays_taken_back_through_undo_redo_and_merges`). Stopped, the push's
+/// check reads the retractor as not in force (`retracted_commands`), so
+/// the release counts as in force and the push publishes the embargoed
+/// fix the user took back.
+#[test]
+#[ignore = "BUG-1535: a restore or undo stopped before taking back a release, then itself undone or restored past, leaves the release in force: the push publishes it"]
+fn bug_1535_a_stopped_take_back_whose_retractor_is_taken_back_still_takes_the_release_back() {
+    let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for shape in ["undo of the restore", "restore past the undo"] {
+        clock::reset_clock();
+        let fs = Arc::new(MemoryBackend::new());
+        let me = Identity::generate("alice");
+        let mut repo = Repo::init(fs.clone(), Some(me.clone()), "alice").unwrap();
+        fs.write(&p("auth.rs"), b"fn check() -> bool { true }\n").unwrap();
+        repo.snapshot_workspace("default", &*fs).unwrap();
+        let (main, _) = repo.commit_working_copy("default", "v1").unwrap();
+        repo.create_workspace("fix", vec![main]).unwrap();
+        let ov = repo.workspace_overlay("fix").unwrap();
+        ov.write(&p("auth.rs"), b"fn check() -> bool { verify_signature() }\n").unwrap();
+        let fix = repo.snapshot_workspace("fix", &ov).unwrap().snapshot;
+        let merged = repo.merge("default", main, vec![fix], "merge", Some(veil_core::commands::EmbargoSpec { scope: "team".into(), until: None })).unwrap();
+        let e = merged.embargo.expect("an embargo");
+        repo.set_tag("main", main, false).unwrap();
+        let before = repo.op_id();
+        repo.release_embargo(&e).unwrap();
+        let release = repo.op_id();
+        assert_eq!(repo.keys().release_state(&e), veil_core::keychain::ReleaseState::Staged, "{shape}: staged");
+        // The retractor's operation, as `vl op restore` or `vl undo`
+        // commits it; then the process stops, before the take-back.
+        let view = repo.ops().get(&before).unwrap().view;
+        let desc = match shape {
+            "undo of the restore" => format!("restore to operation {}", before.short()),
+            _ => format!("undo: release embargo {e}"),
+        };
+        let mut tx = repo.transaction(desc).unwrap();
+        tx.view = view;
+        match shape {
+            "undo of the restore" => tx.restore_of(before),
+            _ => tx.undo_of(release),
+        }
+        tx.commit().unwrap().expect("recorded");
+        drop(repo);
+        // The next process takes the retractor back.
+        let mut next = Repo::open(fs.clone(), Some(me.clone()), "alice").unwrap();
+        match shape {
+            "undo of the restore" => {
+                let (_, undone) = next.undo_keeping_edits("default").unwrap();
+                assert!(undone.starts_with("restore to operation"), "undid the restore: {undone}");
+            }
+            _ => {
+                next.restore_operation_keeping_edits("default", release).unwrap();
+            }
+        }
+        let report = veil_core::remote::push(&mut next, Arc::new(MemoryBackend::new()), true, &[], false).unwrap();
+        assert!(report.releases_published.is_empty(), "{shape}: the release taken back was published: {:?}", report.releases_published);
+        assert_eq!(next.keys().release_state(&e), veil_core::keychain::ReleaseState::Unreleased, "{shape}: taken back");
+    }
+}
+
 /// A memory backend that counts the operations read (`.veil/ops/`).
 #[derive(Debug, Default)]
 struct CountingOps {

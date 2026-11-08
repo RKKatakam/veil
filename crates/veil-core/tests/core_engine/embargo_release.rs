@@ -371,3 +371,122 @@ fn bug_1532_a_staged_release_stays_staged_when_gc_prunes_its_operation() {
     assert_eq!(published, vec![e.clone()]);
     assert!(fix, "the released fix is public");
 }
+
+/// `vl gc --keep-ops-days 0`, an hour on: the operations it leaves.
+fn gc_all_ops(repo: &mut Repo) -> usize {
+    let r = veil_core::gc::gc(
+        repo,
+        &veil_core::gc::GcOptions { keep_ops: Some(std::time::Duration::ZERO), now: Some(veil_core::now_millis() + 3_600_000), ..Default::default() },
+    )
+    .unwrap();
+    assert!(r.ops_before > 0, "gc ran over the op log");
+    r.ops_before - r.ops_pruned
+}
+
+/// `vl op restore <before>` as it commits its operation, the process
+/// stopping before it takes the release back (BUG-1487).
+fn stopped_restore(repo: &mut Repo, before: veil_core::ObjectId) {
+    let view = repo.ops().get(&before).unwrap().view;
+    let mut tx = repo.transaction(format!("restore to operation {}", before.short())).unwrap();
+    tx.view = view;
+    tx.restore_of(before);
+    tx.commit().unwrap().expect("recorded");
+}
+
+/// Op log merges review, cycle 5 (guarantee 2): what `vl gc
+/// --keep-ops-days 0` keeps while a release is staged is exactly what the
+/// push's check reads (the op log from the heads down to the release's
+/// operation), and nothing more once the release is published or taken
+/// back; without a staged release it keeps what it always kept.
+#[test]
+fn gc_keeps_exactly_what_the_push_check_reads_and_frees_it_after() {
+    let (mut alice, e, fs, me) = embargoed_reopenable();
+    let main = alice.view().tags["main"].target;
+    for n in ["a", "b", "c", "d"] {
+        alice.set_tag(n, main, false).unwrap();
+    }
+    let floor = gc_all_ops(&mut alice);
+    assert!(floor <= 3, "without a staged release gc keeps the heads and their parents: {floor}");
+    alice.release_embargo(&e).unwrap();
+    for n in ["f", "g", "h", "i", "j"] {
+        alice.set_tag(n, main, false).unwrap();
+    }
+    let (standing, read) = alice.staged_release_standing().unwrap();
+    assert_eq!(standing.get(&e), Some(&veil_core::commands::Standing::InForce), "in force");
+    assert_eq!(read.len(), 6, "the check reads the release's operation and the five since");
+    let kept = gc_all_ops(&mut alice);
+    assert_eq!(kept, read.len(), "gc keeps what the check reads, and no more");
+    let (after, read_after) = reopen(&fs, &me).staged_release_standing().unwrap();
+    assert_eq!((after, read_after), (standing, read), "the check reads the same after gc");
+    assert_eq!(gc_all_ops(&mut alice), kept, "a second gc keeps the same");
+    // Published: freed.
+    let mut next = reopen(&fs, &me);
+    let (published, fix) = push_public(&mut next);
+    assert_eq!(published, vec![e.clone()], "published");
+    assert!(fix, "the fix is public");
+    assert!(gc_all_ops(&mut next) <= floor, "freed once published");
+    // Taken back by an undo: freed.
+    let (mut bob, e2, _, _) = embargoed_reopenable();
+    bob.release_embargo(&e2).unwrap();
+    bob.undo().unwrap();
+    assert_eq!(bob.keys().release_state(&e2), ReleaseState::Unreleased, "the undo took it back");
+    let main2 = bob.view().tags["main"].target;
+    for n in ["f", "g", "h", "i", "j"] {
+        bob.set_tag(n, main2, false).unwrap();
+    }
+    assert!(gc_all_ops(&mut bob) <= floor, "freed once taken back");
+}
+
+/// Op log merges review, cycle 5 (guarantee 1): a restore past a staged
+/// release that stopped before taking it back, then `vl gc
+/// --keep-ops-days 0` (which prunes the restored operation, older than
+/// the release): the push still does not publish it, and says so.
+#[test]
+fn a_release_a_stopped_restore_took_back_stays_unpublished_through_gc() {
+    let (mut alice, e, fs, me) = embargoed_reopenable();
+    let main = alice.view().tags["main"].target;
+    let before = alice.op_id();
+    alice.set_tag("a", main, false).unwrap();
+    alice.release_embargo(&e).unwrap();
+    stopped_restore(&mut alice, before);
+    drop(alice);
+    let mut next = reopen(&fs, &me);
+    next.set_tag("later", main, false).unwrap();
+    gc_all_ops(&mut next);
+    assert!(next.ops().try_get(&before).unwrap().is_none(), "gc pruned the restored operation");
+    assert_eq!(next.keys().release_state(&e), ReleaseState::Staged, "staged until the push checks it");
+    let mirror = Arc::new(MemoryBackend::new());
+    let rep = remote::push(&mut next, mirror.clone(), true, &[], false).unwrap();
+    assert!(rep.releases_published.is_empty(), "not published: {:?}", rep.releases_published);
+    assert!(!mirror_has_fix(&mirror), "the fix stays embargoed");
+    assert!(rep.warnings.iter().any(|w| w.contains(&e) && w.contains("not published")), "the push says so: {:?}", rep.warnings);
+    assert_eq!(next.keys().release_state(&e), ReleaseState::Unreleased, "taken back");
+}
+
+/// Op log merges review, cycle 5 (guarantee 3): the push's warning and
+/// the release's standing name only the releases this person staged.
+/// Bob, a member who pulled Alice's embargo, sees no standing for it and
+/// no warning, while Alice's own push names it.
+#[test]
+fn the_push_warning_and_standing_name_only_ones_own_staged_releases() {
+    let bob = Identity::generate("bob");
+    let (mut alice, e, hub) = embargoed(&[&bob]);
+    let before = alice.op_id();
+    alice.release_embargo(&e).unwrap();
+    stopped_restore(&mut alice, before);
+    let (mut bobs, _) = repo_for("bob", &bob);
+    remote::pull(&mut bobs, "alice", alice.backend().clone()).unwrap();
+    remote::pull(&mut bobs, "hub", hub.clone()).unwrap();
+    assert!(bobs.keys().load_embargo(&e).unwrap().is_some(), "Bob holds the embargo's record");
+    let (standing, read) = bobs.staged_release_standing().unwrap();
+    assert!(standing.is_empty() && read.is_empty(), "Bob staged nothing: {standing:?}");
+    let rep = remote::push(&mut bobs, Arc::new(MemoryBackend::new()), true, &[], false).unwrap();
+    assert!(!rep.warnings.iter().any(|w| w.contains(&e)), "Bob's push names Alice's embargo: {:?}", rep.warnings);
+    let (standing, _) = alice.staged_release_standing().unwrap();
+    assert_eq!(standing.keys().cloned().collect::<Vec<_>>(), vec![e.clone()], "Alice's standing: her release only");
+    let rep = remote::push(&mut alice, Arc::new(MemoryBackend::new()), true, &[], false).unwrap();
+    assert!(rep.releases_published.is_empty(), "not published: {:?}", rep.releases_published);
+    let named: Vec<&String> = rep.warnings.iter().filter(|w| w.contains("was not published")).collect();
+    assert_eq!(named.len(), 1, "one warning, for her release: {:?}", rep.warnings);
+    assert!(named[0].contains(&e), "it names her embargo: {named:?}");
+}
