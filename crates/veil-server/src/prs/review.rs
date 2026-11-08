@@ -15,7 +15,7 @@
 //!   the PR until that reviewer approves or an admin dismisses it
 //!   ([`dismiss`]); nothing the author does releases it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
@@ -34,7 +34,10 @@ pub struct Verdict {
     pub revision: i32,
     pub verdict: String,
     pub agent: bool,
-    pub body: String,
+    /// Its text, if it is one of the reviews an answer shows.
+    pub body: Option<String>,
+    /// Bytes of its text.
+    pub size: i64,
     pub at: i64,
     pub current: bool,
 }
@@ -71,35 +74,163 @@ pub async fn paths_of(hub: &Hub, project: i64, pr: &str) -> Result<Vec<String>> 
         .await?)
 }
 
-/// Every reviewer's latest verdict on the PR, marked `current` if it was
-/// given on a revision with patch `patch`.
+/// Reviews a PR answer shows (the latest ones), and the bytes of their
+/// texts it reads.
+pub const REVIEWS_SHOWN: usize = 100;
+pub const REVIEW_BYTES: usize = 256 << 10;
+
+/// Every reviewer's latest verdict on the PR, without its text (one row per
+/// reviewer, chosen in the query), marked `current` if it was given on a
+/// revision with patch `patch`; the texts of the latest
+/// [`REVIEWS_SHOWN`] within [`REVIEW_BYTES`] are read after.
 pub async fn verdicts(hub: &Hub, project: i64, pr: &str, patch: &str) -> Result<Vec<Verdict>> {
-    type Row = (i64, String, i32, String, bool, String, i64, String);
+    type Row = (i64, String, i32, String, bool, i64, String, i64);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT r.person, pe.name, r.revision, r.verdict, r.agent, r.body, r.at, r.patch FROM pr_reviews r JOIN people pe ON pe.id = r.person \
-         WHERE r.project_id = $1 AND r.pr = $2 ORDER BY r.at, r.revision",
+        "SELECT DISTINCT ON (r.person) r.person, pe.name, r.revision, r.verdict, r.agent, r.at, r.patch, octet_length(r.body)::BIGINT \
+         FROM pr_reviews r JOIN people pe ON pe.id = r.person WHERE r.project_id = $1 AND r.pr = $2 \
+         ORDER BY r.person, r.at DESC, r.revision DESC",
     )
     .bind(project)
     .bind(pr)
     .fetch_all(&hub.db)
     .await?;
-    let mut latest: BTreeMap<i64, Verdict> = BTreeMap::new();
-    for (person, name, revision, verdict, agent, body, at, p) in rows {
-        latest.insert(
-            person,
-            Verdict {
-                person,
-                name,
-                revision,
-                verdict,
-                agent,
-                body,
-                at,
-                current: p == patch,
-            },
-        );
+    let mut out: Vec<Verdict> = rows
+        .into_iter()
+        .map(|(person, name, revision, verdict, agent, at, p, size)| Verdict { person, name, revision, verdict, agent, body: None, size, at, current: p == patch })
+        .collect();
+    out.sort_by_key(|a| std::cmp::Reverse((a.at, a.person)));
+    let mut bytes = 0usize;
+    let mut want: Vec<(i64, i32)> = Vec::new();
+    for v in out.iter().take(REVIEWS_SHOWN) {
+        if bytes + v.size as usize > REVIEW_BYTES {
+            break;
+        }
+        bytes += v.size as usize;
+        want.push((v.person, v.revision));
     }
-    Ok(latest.into_values().collect())
+    if !want.is_empty() {
+        let (people, revs): (Vec<i64>, Vec<i32>) = want.iter().copied().unzip();
+        let bodies: Vec<(i64, i32, String)> = sqlx::query_as(
+            "SELECT r.person, r.revision, r.body FROM UNNEST($3::bigint[], $4::int[]) AS w(person, revision) \
+             JOIN pr_reviews r ON r.project_id = $1 AND r.pr = $2 AND r.person = w.person AND r.revision = w.revision",
+        )
+        .bind(project)
+        .bind(pr)
+        .bind(&people)
+        .bind(&revs)
+        .fetch_all(&hub.db)
+        .await?;
+        let bodies: HashMap<(i64, i32), String> = bodies.into_iter().map(|(p, r, b)| ((p, r), b)).collect();
+        for v in out.iter_mut() {
+            v.body = bodies.get(&(v.person, v.revision)).cloned();
+        }
+    }
+    Ok(out)
+}
+
+/// The change ids of revision `n` of a PR.
+async fn change_ids(c: &mut sqlx::PgConnection, project: i64, pr: &str, n: i32) -> Result<Vec<String>> {
+    let changes: Option<String> = sqlx::query_scalar("SELECT changes FROM pr_revisions WHERE project_id = $1 AND pr = $2 AND n = $3")
+        .bind(project)
+        .bind(pr)
+        .bind(n)
+        .fetch_optional(&mut *c)
+        .await?;
+    let stack: Vec<super::revision::StackChange> = changes.as_deref().map(serde_json::from_str).transpose().map_err(|e| crate::error::Error::Other(e.into()))?.unwrap_or_default();
+    Ok(stack.into_iter().map(|c| c.change).collect())
+}
+
+/// One verdict, as every verdict is written: the review row, and the holds
+/// (BUG-1278). A request for changes holds every change id of revision
+/// `revision`'s stack; an approval releases that person's holds on them.
+/// With `only_current`, nothing is written unless `revision` is still the
+/// PR's and the PR is open; answers whether it was written.
+#[allow(clippy::too_many_arguments)]
+pub async fn put_verdict(
+    hub: &Hub,
+    project: i64,
+    pr: &str,
+    revision: i32,
+    person: i64,
+    verdict: &str,
+    patch: &str,
+    agent: bool,
+    device: &str,
+    signature: &str,
+    body: &str,
+    only_current: bool,
+) -> Result<bool> {
+    let (pr, verdict, patch, device, signature, body) = (pr.to_string(), verdict.to_string(), patch.to_string(), device.to_string(), signature.to_string(), body.to_string());
+    let now = veil_core::now_millis();
+    crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+        let (pr, verdict, patch, device, signature, body) = (pr.clone(), verdict.clone(), patch.clone(), device.clone(), signature.clone(), body.clone());
+        Box::pin(async move {
+            let stored = sqlx::query(
+                "INSERT INTO pr_reviews (project_id, pr, revision, person, verdict, patch, agent, device, signature, body, at) \
+                 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11 WHERE NOT $12 OR EXISTS \
+                   (SELECT 1 FROM prs WHERE project_id = $1 AND id = $2 AND revision = $3 AND state = 'open') \
+                 ON CONFLICT (project_id, pr, revision, person) DO UPDATE SET verdict = EXCLUDED.verdict, patch = EXCLUDED.patch, \
+                   agent = EXCLUDED.agent, device = EXCLUDED.device, signature = EXCLUDED.signature, body = EXCLUDED.body, at = EXCLUDED.at",
+            )
+            .bind(project)
+            .bind(&pr)
+            .bind(revision)
+            .bind(person)
+            .bind(&verdict)
+            .bind(&patch)
+            .bind(agent)
+            .bind(&device)
+            .bind(&signature)
+            .bind(&body)
+            .bind(now)
+            .bind(only_current)
+            .execute(&mut *c)
+            .await?
+            .rows_affected();
+            if stored == 0 {
+                return Ok(false);
+            }
+            let ids = change_ids(&mut *c, project, &pr, revision).await?;
+            match verdict.as_str() {
+                "request-changes" => {
+                    sqlx::query(
+                        "INSERT INTO pr_holds (project_id, person, change_id, pr, at) SELECT $1, $2, id, $4, $5 FROM UNNEST($3::text[]) AS id \
+                         ON CONFLICT (project_id, person, change_id) DO UPDATE SET pr = EXCLUDED.pr, at = EXCLUDED.at",
+                    )
+                    .bind(project)
+                    .bind(person)
+                    .bind(&ids)
+                    .bind(&pr)
+                    .bind(now)
+                    .execute(&mut *c)
+                    .await?;
+                }
+                "approve" => {
+                    sqlx::query("DELETE FROM pr_holds WHERE project_id = $1 AND person = $2 AND change_id = ANY($3)")
+                        .bind(project)
+                        .bind(person)
+                        .bind(&ids)
+                        .execute(&mut *c)
+                        .await?;
+                }
+                _ => {}
+            }
+            Ok(true)
+        })
+    })
+    .await
+}
+
+/// The people whose requests for changes hold a PR whose revisions hold
+/// `changes` (BUG-1278), by name.
+pub async fn holds_on(hub: &Hub, project: i64, changes: &[String]) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT DISTINCT pe.name FROM pr_holds h JOIN people pe ON pe.id = h.person WHERE h.project_id = $1 AND h.change_id = ANY($2) ORDER BY pe.name",
+    )
+    .bind(project)
+    .bind(changes)
+    .fetch_all(&hub.db)
+    .await?)
 }
 
 /// What the PR needs and has, and whether it may land.
@@ -110,7 +241,10 @@ pub struct Gate {
     pub people_only: bool,
     pub ready: bool,
     pub reasons: Vec<String>,
+    /// The latest reviews (at most [`REVIEWS_SHOWN`]), and how many
+    /// reviewers there are.
     pub reviews: Vec<(Verdict, bool)>,
+    pub total: usize,
 }
 
 impl Gate {
@@ -131,18 +265,22 @@ impl Gate {
                 "body": v.body,
                 "at": v.at,
             })).collect::<Vec<_>>(),
+            "reviews_total": self.total,
         })
     }
 }
 
 /// The review gate of `pr`, whose current revision has `patch`, under
 /// `rules`, as `viewer` is shown it.
-pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, patch: &str, rules: &Review) -> Result<Gate> {
+pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, patch: &str, changes: &[String], rules: &Review) -> Result<Gate> {
     let risk = Risk::parse(&pr.risk);
     let need = rules.need(risk);
     let paths = paths_of(hub, project.id, &pr.id).await?;
     let mut reviews = Vec::new();
-    let (mut approvals, mut held) = (0u32, Vec::new());
+    let mut approvals = 0u32;
+    // Requests for changes on any of the PR's change ids, from any PR
+    // (BUG-1278): released only by their reviewer's approval or an admin.
+    let held: Vec<String> = holds_on(hub, project.id, changes).await?;
     let mut access: HashMap<i64, bool> = HashMap::new();
     for v in verdicts(hub, project.id, &pr.id, patch).await? {
         let reviewer = v.person != pr.author;
@@ -160,15 +298,10 @@ pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, pat
         if counted {
             approvals += 1;
         }
-        // A request for changes holds the PR, given on any revision, until
-        // that reviewer approves or an admin dismisses it (BUG-1259): never
-        // released by what the author does, nor by access changing (a later
-        // revision may hide the PR from them; it stays held).
-        if reviewer && v.verdict == "request-changes" {
-            held.push(v.name.clone());
-        }
         reviews.push((v, counted));
     }
+    let total = reviews.len();
+    reviews.truncate(REVIEWS_SHOWN);
     // `.veilrules` is the admins' file (no line names the root): its
     // warnings quote it, so only admins read them.
     let mut reasons: Vec<String> = if project.view(viewer).admin {
@@ -202,18 +335,30 @@ pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, pat
         ready,
         reasons,
         reviews,
+        total,
     })
 }
 
-/// An admin dismisses `person`'s requests for changes on the PR (BUG-1259):
-/// the only way one stops holding but the reviewer's own approval. The
-/// rows are kept, as `dismissed`. Answers how many were dismissed.
-pub async fn dismiss(hub: &Hub, project: i64, pr: &str, person: i64) -> Result<u64> {
-    Ok(sqlx::query("UPDATE pr_reviews SET verdict = 'dismissed' WHERE project_id = $1 AND pr = $2 AND person = $3 AND verdict = 'request-changes'")
+/// An admin dismisses `person`'s requests for changes on the PR (BUG-1259,
+/// BUG-1278): the only way one stops holding but the reviewer's own
+/// approval. Their holds on every change id of the PR's revisions go; their
+/// review rows stay, shown as `dismissed`. Answers how many holds went (one
+/// statement: of two admins at once, one dismisses, the other finds none).
+pub async fn dismiss(hub: &Hub, project: i64, pr: &str, person: i64, changes: &[String]) -> Result<u64> {
+    let gone = sqlx::query("DELETE FROM pr_holds WHERE project_id = $1 AND person = $2 AND change_id = ANY($3)")
         .bind(project)
-        .bind(pr)
         .bind(person)
+        .bind(changes)
         .execute(&hub.db)
         .await?
-        .rows_affected())
+        .rows_affected();
+    if gone > 0 {
+        sqlx::query("UPDATE pr_reviews SET verdict = 'dismissed' WHERE project_id = $1 AND pr = $2 AND person = $3 AND verdict = 'request-changes'")
+            .bind(project)
+            .bind(pr)
+            .bind(person)
+            .execute(&hub.db)
+            .await?;
+    }
+    Ok(gone)
 }

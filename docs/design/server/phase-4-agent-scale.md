@@ -230,6 +230,7 @@ Every viewer without full view needs projected snapshots (`HUB.md` §13.4), and 
   | **high** | touches `.veilpolicy` or the rules, CI configuration, dependency manifests and lock files, secret files, or paths the admins mark high-risk (`src/auth/`); or is very large |
 
 * **The rules** say what each risk needs (for example: low lands with checks alone; normal needs one approval; high needs one approval from a person, not an agent). Which defaults ship, and whether agents' approvals count, are product decisions (§11, item 5).
+* **As built (S21, after review cycle 3, `HUB.md` §13.24):** low risk is an allow-list (documentation under the top-level `docs/` and the root's `README`/`LICENSE`/`CHANGELOG`/`CONTRIBUTING`; test source files in test folders outside `src/`, Go `*_test.go`); everything else is normal or high. A request for changes is attached to change ids, so it holds any PR of the same changes until its reviewer approves or an admin dismisses it. The `[review]` rules in force are a state recorded in each landing's transaction on the default branch (a file, absent, or strict), never found by walking history.
 * **Approvals** are recorded per revision with the reviewer's device signature and dismissed when the files change (`HUB.md` §7.4). A reviewer can approve only what they can see, which for a PR is everything it touches.
 * **Landing a PR:** when its rules are met, `vl pr land` (or the rules' auto-land) submits its stack to the landing service.
 

@@ -921,7 +921,7 @@ fn pr_speed() {
 fn pr_rules_from_veilrules() {
     let th = TestHub::start();
     let (policy_text, bindings) = policy(1);
-    let mut h = Hist::new(&th, &policy_text, &bindings);
+    let mut h = Hist::new(&th, &format!("{policy_text}docs/ public devs\n"), &bindings);
     let root = root_snapshot_id();
     let mut base = Files::new();
     base.insert("pub/a.rs".into(), b"fn a() {}\n".to_vec());
@@ -941,7 +941,7 @@ fn pr_rules_from_veilrules() {
     };
     let normal = on(&mut h, "pub/a.rs", 1);
     let high = on(&mut h, "pub/auth/login.rs", 2);
-    let low = on(&mut h, "pub/docs/guide.md", 3);
+    let low = on(&mut h, "docs/guide.md", 3);
     let mk = |head: ObjectId, t: &str| th.rt.block_on(prs::create(&hub, &admin, &me, CreatePr { head: head.hex(), title: t.into(), ..Default::default() })).unwrap();
     let v = mk(normal, "normal");
     let normal_id = v["id"].as_str().unwrap().to_string();
@@ -980,11 +980,11 @@ fn pr_rules_from_veilrules() {
     // A project whose only .veilrules is broken: the strictest rules.
     let mut h2 = Hist::new(&th, &policy_text, &bindings);
     let mut f = Files::new();
-    f.insert("pub/docs/a.md".into(), b"# a\n".to_vec());
+    f.insert("docs/a.md".into(), b"# a\n".to_vec());
     f.insert(".veilrules".into(), b"[review\n".to_vec());
     let c = h2.commit(&th, &[root], f.clone(), [1; 16], 1_000, None);
     h2.set_branch(&th, "main", c);
-    f.insert("pub/docs/b.md".into(), b"# b\n".to_vec());
+    f.insert("docs/b.md".into(), b"# b\n".to_vec());
     let head2 = h2.commit(&th, &[c], f, [2; 16], 2_000, None);
     let admin2 = ask_as(&th, &h2, &admin_of(author));
     let v = th.rt.block_on(prs::create(&hub, &admin2, &me, CreatePr { head: head2.hex(), title: "strict".into(), ..Default::default() })).unwrap();
@@ -1915,22 +1915,14 @@ mod s21_cycle2 {
         names.iter().map(|(n, p)| (n.to_string(), veil_server::perm::Binding::Person(*p))).collect()
     }
 
+    /// A verdict as every verdict is written (the review row and its holds,
+    /// `prs::review::put_verdict`), without a device signature.
     pub(super) fn put_review(th: &TestHub, h: &Hist, pr: &str, revision: i32, person: i64, verdict: &str, patch: &str) {
-        th.rt.block_on(again(|| {
-            sqlx::query(
-                "INSERT INTO pr_reviews (project_id, pr, revision, person, verdict, patch, agent, device, signature, body, at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, FALSE, '', '', '', $7) \
-                 ON CONFLICT (project_id, pr, revision, person) DO UPDATE SET verdict = EXCLUDED.verdict, at = EXCLUDED.at",
-            )
-            .bind(h.id)
-            .bind(pr)
-            .bind(revision)
-            .bind(person)
-            .bind(verdict)
-            .bind(patch)
-            .bind(veil_core::now_millis())
-            .execute(&h.hub.db)
-        }));
+        let written = th
+            .rt
+            .block_on(veil_server::prs::review::put_verdict(&h.hub, h.id, pr, revision, person, verdict, patch, false, "", "", "", false))
+            .unwrap();
+        assert!(written);
     }
 
     /// BUG-1259 (a request for changes): it stops holding the PR once the
@@ -2004,6 +1996,9 @@ mod s21_cycle2 {
         base.insert("pub/keep.rs".into(), b"fn keep() {}\n".to_vec());
         base.insert(".veilrules".into(), b"[review]\nnormal = { approvals = 3 }\n".to_vec());
         let mut tip = h.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+        // The valid file lands (its state is recorded: cycle 3's design).
+        h.set_branch(&th, "main", tip);
+        assert_eq!(th.rt.block_on(prs::rules_of_project(&h.hub, h.id, "main")).unwrap().need(veil_server::prs::rules::Risk::Normal).approvals, 3);
         // An admin's edit breaks it.
         let mut broken = base.clone();
         broken.insert(".veilrules".into(), b"[review\nnormal = { approvals = 3 }\n".to_vec());
@@ -2102,7 +2097,6 @@ mod s21_cycle3 {
     /// prompt under `src/` read by `include_str!`. The owner's rule (BUG-
     /// 1257) makes agent instructions `normal`; only the listed names are.
     #[test]
-    #[ignore = "BUG-1276: Markdown that agents execute or programs compile in is rated documentation (low risk, no review)"]
     fn bug_1276_markdown_agents_execute_or_programs_compile_in_needs_no_review() {
         let cases = [
             "skills/deploy/reference.md",
@@ -2135,7 +2129,6 @@ mod s21_cycle3 {
     /// `tests/` a source file includes (`include_str!`). Each change of
     /// behaviour is low risk and lands with no review.
     #[test]
-    #[ignore = "BUG-1277: spec/, testdata/ and tests/ files the build reads are rated tests (low risk, no review)"]
     fn bug_1277_build_inputs_in_test_folders_need_no_review() {
         let cases = ["api/spec/openapi.yaml", "spec/openapi.json", "internal/assets/testdata/default_policy.json", "crates/server/tests/fixtures/default.toml"];
         let low: Vec<&str> = cases.iter().copied().filter(|p| rated(p) == Risk::Low).collect();
@@ -2289,7 +2282,6 @@ mod s21_cycle3 {
     /// cy's one approval makes the new PR ready. Alice's request never
     /// applied to it, and nobody dismissed it.
     #[test]
-    #[ignore = "BUG-1278: the author releases a request for changes by opening the same changes as a new PR"]
     fn bug_1278_a_new_pr_of_the_same_changes_drops_a_request_for_changes() {
         let Held { th, h, alice, bob, cy, id, .. } = held();
         let hub = h.hub.clone();
@@ -2372,23 +2364,19 @@ mod s21_cycle3 {
                 out
             });
             assert!(got.iter().all(|n| *n == want[i]), "tip {i}: {got:?}, want {}", want[i]);
-            // A slow server writes the record of an older tip late.
+            // A slow server read the record before this tip landed and
+            // now writes an older tip's state: its compare-and-swap on the
+            // record's tip finds the record moved, and writes nothing.
+            let (checked, state): (String, String) =
+                th.rt.block_on(sqlx::query_as("SELECT checked, state FROM pr_review_rules WHERE project_id = $1").bind(h.id).fetch_one(&hub1.db)).unwrap();
+            assert_eq!(checked, tip.hex(), "the record follows the tip");
             for old in (0..=i).rev().take(2) {
-                let (checked, text): (String, Option<String>) =
-                    th.rt.block_on(sqlx::query_as("SELECT checked, text FROM pr_review_rules WHERE project_id = $1").bind(h.id).fetch_one(&hub1.db)).unwrap();
-                assert_eq!(checked, tip.hex(), "the record follows the tip");
-                let older = tips[old];
-                let older_text = th.rt.block_on(async {
-                    let hub = hub1.clone();
-                    let id = h.id;
-                    veil_server::query::graph::blocking(&hub, id, move |cx| Ok(veil_server::prs::revision::rules_now(cx, older, None, None)?.text)).await
-                });
-                let older_text = older_text.unwrap().map(|t| String::from_utf8(t).unwrap());
-                th.rt.block_on(again(|| {
-                    sqlx::query("UPDATE pr_review_rules SET checked = $2, text = $3 WHERE project_id = $1").bind(h.id).bind(older.hex()).bind(older_text.clone()).execute(&hub1.db)
-                }));
+                let stale_read = tips[old].hex();
+                let older_state = if old == 0 { veil_server::prs::state::RulesState::Strict } else { serde_json::from_str(&state).unwrap() };
+                let wrote = th.rt.block_on(veil_server::prs::state::write_record(&hub2, h.id, Some(&stale_read), tips[old], &older_state)).unwrap();
+                assert!(!wrote, "a stale write moved the record back to tip {old}");
                 let n = normal_at(&th, &mut h, &hub2, *tip);
-                assert_eq!(n, want[i], "tip {i}, a record from tip {old} written late (was {checked}, {text:?})");
+                assert_eq!(n, want[i], "tip {i}, after a late write from tip {old} (was {checked}, {state})");
             }
         }
         // A forced move to another history whose file was always broken:
@@ -2404,8 +2392,9 @@ mod s21_cycle3 {
         h.set_branch(&th, "main", next);
         let stats = th.rt.block_on(veil_server::derive::landing(&hub1, h.id, vec!["main".into()])).unwrap();
         assert!(!stats.skipped, "the landing derived");
-        let (checked, text): (String, Option<String>) = th.rt.block_on(sqlx::query_as("SELECT checked, text FROM pr_review_rules WHERE project_id = $1").bind(h.id).fetch_one(&hub1.db)).unwrap();
-        assert_eq!((checked, text.as_deref()), (next.hex(), Some("[review]\nnormal = { approvals = 4 }\n")), "the landing recorded its tip's rules");
+        let (checked, state): (String, String) = th.rt.block_on(sqlx::query_as("SELECT checked, state FROM pr_review_rules WHERE project_id = $1").bind(h.id).fetch_one(&hub1.db)).unwrap();
+        let state: veil_server::prs::state::RulesState = serde_json::from_str(&state).unwrap();
+        assert_eq!((checked, state), (next.hex(), veil_server::prs::state::RulesState::File { text: "[review]\nnormal = { approvals = 4 }\n".into() }), "the landing recorded its tip's rules");
     }
 
     /// BUG-1279: the rules a broken `.veilrules` falls back to are not the
@@ -2419,7 +2408,6 @@ mod s21_cycle3 {
     /// to 3 approvals (the old tip is its second parent; the merge keeps
     /// main's broken file) brings back the older file's 1 approval.
     #[test]
-    #[ignore = "BUG-1279: a broken .veilrules falls back to a deleted file, or an older one than the record holds"]
     fn bug_1279_a_broken_veilrules_falls_back_to_rules_no_longer_in_force() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);
@@ -2460,5 +2448,132 @@ mod s21_cycle3 {
             wrong.push(format!("fast-forward to a merge: normal needs {n} (the feature line's older file), was 3 before"));
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Guarantee 2 (cycle 3): a request for changes is attached to change
+    /// ids, so no PR of those changes escapes it: a second PR opened beside
+    /// the first, a PR of a larger stack holding them, all held; when the
+    /// reviewer approves a patch holding them (any of those PRs), every PR
+    /// of them is released.
+    #[test]
+    fn a_request_for_changes_follows_its_change_ids_into_every_pr() {
+        let Held { th, mut h, alice, bob, id, .. } = held();
+        let hub = h.hub.clone();
+        let me = caller(bob.0, &bob.1);
+        let held_by_alice = |h: &Hist, pr: &str| -> bool {
+            let v = th.rt.block_on(prs::show(&hub, &member(&th, h, bob.0), pr)).unwrap();
+            v["review"]["reasons"].to_string().contains(&format!("{} asked for changes", alice.1))
+        };
+        assert!(held_by_alice(&h, &id));
+        // A second PR of the same head, beside the first.
+        let beside = pr_id(th.rt.block_on(prs::create(&hub, &member(&th, &h, bob.0), &me, CreatePr { head: "feature".into(), title: "beside".into(), ..Default::default() })).unwrap());
+        assert!(held_by_alice(&h, &beside), "a second PR of the same changes is held");
+        // A larger stack holding the change.
+        let mut f = h.files[&h.branches["feature"]].clone();
+        f.insert("pub/more.rs".into(), b"fn more() {}\n".to_vec());
+        let top = h.commit(&th, &[h.branches["feature"]], f, [4; 16], 5_000, None);
+        h.set_branch(&th, "bigger", top);
+        let v = th.rt.block_on(prs::create(&hub, &member(&th, &h, bob.0), &me, CreatePr { head: "bigger".into(), title: "bigger".into(), ..Default::default() })).unwrap();
+        let bigger = pr_id(v.clone());
+        assert!(held_by_alice(&h, &bigger), "a stack holding the change is held");
+        // Alice approves the larger stack's patch: every PR of the change is
+        // released.
+        put_review(&th, &h, &bigger, 1, alice.0, "approve", v["patch"].as_str().unwrap());
+        for pr in [&id, &beside, &bigger] {
+            assert!(!held_by_alice(&h, pr), "{pr}: released by alice's approval of a patch holding the change");
+        }
+    }
+
+    /// Guarantee 3 (cycle 3), through real landings (commits through the
+    /// API, recorded in their transactions): the rules in force follow
+    /// valid files, deletions and broken files exactly, never an older
+    /// file's text, and concurrent landings on two servers keep them.
+    #[test]
+    fn the_rules_in_force_are_recorded_at_each_landing() {
+        let th = TestHub::start();
+        let th2 = TestHub::beside(&th);
+        let p = setup_project(&th);
+        let hub = th.hub();
+        let pid: i64 = th.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hub.db)).unwrap();
+        let admin = p.admin.token();
+        let tip = |t: &TestHub, token: &str| t.api().tips(Some(token), &p.name).unwrap().branches["main"];
+        let land = |t: &TestHub, token: &str, edits: Value| -> bool {
+            let base = tip(t, token);
+            let r = t.api().post_json(Some(token), &format!("/v1/projects/{}/changes", p.name), &json!({"base": base.hex(), "edits": edits, "onto": {"branch": "main", "expected": "rebase"}}));
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            r.json()["branch"]["status"] == "ok"
+        };
+        let put = |text: &str| json!([{"path": ".veilrules", "put": {"text": text}}]);
+        let normal = || th.rt.block_on(prs::rules_of_project(&hub, pid, "main")).unwrap().need(Risk::Normal).approvals;
+        let recorded = || -> String {
+            th.rt.block_on(sqlx::query_scalar::<_, String>("SELECT checked FROM pr_review_rules WHERE project_id = $1").bind(pid).fetch_one(&hub.db)).unwrap()
+        };
+        let steps: [(Value, u32); 6] = [
+            (put("[review]\nnormal = { approvals = 3 }\n"), 3),
+            (put(BROKEN), 3),
+            (json!([{"path": ".veilrules", "delete": true}]), 1),
+            (put(BROKEN), 1),
+            (put("[review]\nnormal = { approvals = 0 }\n"), 0),
+            (put("[review\n"), 0),
+        ];
+        for (i, (edits, want)) in steps.iter().enumerate() {
+            assert!(land(&th, &admin, edits.clone()), "step {i} landed");
+            // Recorded by the landing itself, before any PR request.
+            assert_eq!(recorded(), tip(&th, &admin).hex(), "step {i}: the landing recorded its tip");
+            assert_eq!(normal(), *want, "step {i}");
+        }
+        // Back to 3, broken, then 16 landings of other files at once, from
+        // both servers: the state is kept through every one of them.
+        assert!(land(&th, &admin, put("[review]\nnormal = { approvals = 3 }\n")));
+        assert!(land(&th, &admin, put(BROKEN)));
+        let dev = p.dev.token();
+        std::thread::scope(|s| {
+            for i in 0..16 {
+                let (t, dev, land) = (if i % 2 == 0 { &th } else { &th2 }, &dev, &land);
+                s.spawn(move || {
+                    for _ in 0..20 {
+                        if land(t, dev, json!([{"path": format!("src/race-{i}.rs"), "put": {"text": format!("fn r{i}() {{}}\n")}}])) {
+                            return;
+                        }
+                    }
+                    panic!("landing {i} never landed");
+                });
+            }
+        });
+        assert_eq!(recorded(), tip(&th, &admin).hex(), "the last landing recorded its tip");
+        assert_eq!(normal(), 3, "kept through 16 concurrent landings");
+    }
+
+    /// Bounded reviews in answers (cycle 3): 300 reviewers' verdicts with
+    /// 64 KiB texts: a PR answer lists the 100 latest, with texts within
+    /// 256 KiB, and says how many there are.
+    #[test]
+    fn reviews_in_answers_are_bounded() {
+        let Held { th, h, id, .. } = held();
+        let hub = h.hub.clone();
+        th.rt.block_on(again(|| {
+            sqlx::query(
+                "INSERT INTO people (name, created_at) SELECT 'rev' || $1 || '-' || i, 0 FROM generate_series(1, 300) AS i ON CONFLICT DO NOTHING",
+            )
+            .bind(&id[3..])
+            .execute(&hub.db)
+        }));
+        th.rt.block_on(again(|| {
+            sqlx::query(
+                "INSERT INTO pr_reviews (project_id, pr, revision, person, verdict, patch, agent, device, signature, body, at) \
+                 SELECT $1, $2, 1, p.id, 'approve', 'x', FALSE, '', '', repeat('r', 65536), p.id FROM people p WHERE p.name LIKE 'rev' || $3 || '-%' \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(h.id)
+            .bind(&id)
+            .bind(&id[3..])
+            .execute(&hub.db)
+        }));
+        let v = th.rt.block_on(prs::show(&hub, &ask_as(&th, &h, &Viewer::default()), &id)).unwrap();
+        let text = v.to_string();
+        let reviews = v["review"]["reviews"].as_array().unwrap();
+        assert!(reviews.len() <= 100, "{}", reviews.len());
+        assert!(v["review"]["reviews_total"].as_u64().unwrap() >= 300, "{}", v["review"]["reviews_total"]);
+        assert!(text.len() < 512 << 10, "a PR answer of {} bytes", text.len());
     }
 }

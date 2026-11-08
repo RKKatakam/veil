@@ -107,12 +107,29 @@ CREATE TABLE IF NOT EXISTS pr_reviews (
     PRIMARY KEY (project_id, pr, revision, person)
 );
 
--- The last valid `.veilrules` of each project's default branch (BUG-1259):
--- `text` is the newest version that parsed at or before `checked` (the tip
--- last looked at), so a broken file keeps its rules however far back the
--- valid one is. Written by PR requests and after landings.
+-- Each reviewer's latest verdict, read without its body (cycle 3).
+CREATE INDEX IF NOT EXISTS pr_reviews_by_person ON pr_reviews (project_id, pr, person, at);
+
+-- A request for changes, attached to the change ids of the revision it was
+-- given on (BUG-1278): it holds every PR whose revisions contain one of
+-- them, until that reviewer approves a patch containing it or an admin
+-- dismisses it.
+CREATE TABLE IF NOT EXISTS pr_holds (
+    project_id BIGINT NOT NULL,
+    person BIGINT NOT NULL,
+    change_id TEXT NOT NULL,
+    pr TEXT NOT NULL,                      -- the PR it was given on
+    at BIGINT NOT NULL,
+    PRIMARY KEY (project_id, person, change_id)
+);
+CREATE INDEX IF NOT EXISTS pr_holds_by_change ON pr_holds (project_id, change_id);
+
+-- The `[review]` rules in force on each project's default branch
+-- (BUG-1279): a state recorded at each landing, in the landing's
+-- transaction (`prs::record_landing`), for the tip it landed. `state` is
+-- JSON: {"kind": "file", "text": …} | {"kind": "absent"} | {"kind": "strict"}.
 CREATE TABLE IF NOT EXISTS pr_review_rules (
     project_id BIGINT PRIMARY KEY,
     checked TEXT NOT NULL,
-    text TEXT
+    state TEXT NOT NULL
 );

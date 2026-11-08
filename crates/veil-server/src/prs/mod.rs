@@ -39,6 +39,7 @@ pub mod class;
 pub mod review;
 pub mod revision;
 pub mod rules;
+pub mod state;
 pub mod threads;
 
 use std::{
@@ -222,46 +223,23 @@ async fn tip(hub: &Hub, project: i64, branch: &str) -> Result<Option<ObjectId>> 
 
 /// The review rules of the default branch's tip.
 async fn rules(hub: &Arc<Hub>, ask: &Ask) -> Result<Review> {
-    rules_of_project(hub, ask.project.id, &ask.project.default_branch).await
+    state::rules_in_force(hub, &ask.project, &ask.project.default_branch).await
 }
 
-/// The review rules at the tip of `default_branch`, keeping the project's
-/// record of the last valid `.veilrules` (`pr_review_rules`, BUG-1259)
-/// current. Run by every PR request and, after each landing on the
-/// default branch, by the derive workers ([`landed`]), so the walk past a
-/// broken file is short.
+/// The review rules in force at the tip of `default_branch`: the state
+/// recorded at the last landing (`state`, BUG-1279), brought up to the tip
+/// if the branch moved without a landing.
 pub async fn rules_of_project(hub: &Arc<Hub>, project: i64, default_branch: &str) -> Result<Review> {
-    let Some(t) = tip(hub, project, default_branch).await? else { return Ok(Review::default()) };
-    let row: Option<(String, Option<String>)> = sqlx::query_as("SELECT checked, text FROM pr_review_rules WHERE project_id = $1")
-        .bind(project)
-        .fetch_optional(&hub.db)
-        .await?;
-    let (checked, stored) = match row {
-        Some((c, text)) => (ObjectId::from_hex(&c).ok(), text.map(String::into_bytes)),
-        None => (None, None),
-    };
-    let before = (checked, stored.clone());
-    let now = blocking(hub, project, move |cx| revision::rules_now(cx, t, checked, stored)).await?;
-    if before == (Some(now.checked), now.text.clone()) {
-        return Ok(now.review);
-    }
-    // The record: its text is the last valid file at or before `checked`,
-    // written together, so a record from an older tip is only less far
-    // along (the next walk goes further), never wrong.
-    sqlx::query(
-        "INSERT INTO pr_review_rules (project_id, checked, text) VALUES ($1, $2, $3) \
-         ON CONFLICT (project_id) DO UPDATE SET checked = EXCLUDED.checked, text = EXCLUDED.text",
-    )
-    .bind(project)
-    .bind(now.checked.hex())
-    .bind(now.text.as_ref().map(|t| String::from_utf8_lossy(t).into_owned()))
-    .execute(&hub.db)
-    .await?;
-    Ok(now.review)
+    let name: Option<String> = sqlx::query_scalar("SELECT name FROM projects WHERE id = $1").bind(project).fetch_optional(&hub.db).await?;
+    let Some(name) = name else { return Ok(Review::default()) };
+    let p = crate::perm::load_project(&mut *hub.db.acquire().await?, &name).await?.ok_or_else(|| Error::not_found("no such project"))?;
+    state::rules_in_force(hub, &p, default_branch).await
 }
 
-/// After a landing that moved `branches` of `project`: keep the record of
-/// the last valid `.veilrules` current when the default branch moved.
+/// After a landing that moved `branches` of `project` (the derive workers):
+/// a landing records its rules state in its own transaction
+/// (`state::record_landing`); this only brings up a record that is behind
+/// the tip (a move that recorded nothing).
 pub async fn landed(hub: &Arc<Hub>, project: i64, branches: &[String]) -> Result<()> {
     let default: Option<String> = sqlx::query_scalar("SELECT default_branch FROM projects WHERE id = $1").bind(project).fetch_optional(&hub.db).await?;
     match default {
@@ -422,6 +400,15 @@ fn viewer_numbers(revs: &[RevRow], p: &HashMap<ObjectId, ObjectId>) -> Vec<i32> 
     out
 }
 
+/// Every change id any revision holds (what requests for changes are
+/// attached to, BUG-1278).
+fn change_ids_of(revs: &[RevRow]) -> Vec<String> {
+    let mut ids: Vec<String> = revs.iter().flat_map(|r| r.changes.iter().map(|c| c.change.clone())).collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// Every real snapshot the revisions name.
 fn reals_of(revs: &[RevRow]) -> Vec<ObjectId> {
     let mut reals: Vec<ObjectId> = Vec::new();
@@ -452,7 +439,7 @@ pub async fn pr_json(hub: &Arc<Hub>, ask: &Ask, pr: &PrRow) -> Result<Value> {
     let ppl = names(hub, &revs.iter().map(|r| r.pushed_by).collect::<Vec<_>>()).await?;
     let current = revs.iter().find(|r| r.n == pr.revision).ok_or_else(|| Error::Other(anyhow::anyhow!("the PR's revision is missing")))?;
     let rules = rules(hub, ask).await?;
-    let gate = review::gate(hub, &ask.project, &ask.viewer, pr, &current.patch, &rules).await?;
+    let gate = review::gate(hub, &ask.project, &ask.viewer, pr, &current.patch, &change_ids_of(&revs), &rules).await?;
     let mut review = gate.json();
     for r in review["reviews"].as_array_mut().into_iter().flatten() {
         let real = r["revision"].as_i64().unwrap_or(0) as i32;
@@ -1269,29 +1256,8 @@ pub async fn add_review(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q:
     }
     // Agent sessions (S11) set `agent`; every session today is a person's.
     let agent = false;
-    let now = veil_core::now_millis();
-    let stored = sqlx::query(
-        "INSERT INTO pr_reviews (project_id, pr, revision, person, verdict, patch, agent, device, signature, body, at) \
-         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11 WHERE EXISTS \
-           (SELECT 1 FROM prs WHERE project_id = $1 AND id = $2 AND revision = $3 AND state = 'open') \
-         ON CONFLICT (project_id, pr, revision, person) DO UPDATE SET verdict = EXCLUDED.verdict, patch = EXCLUDED.patch, \
-           agent = EXCLUDED.agent, device = EXCLUDED.device, signature = EXCLUDED.signature, body = EXCLUDED.body, at = EXCLUDED.at",
-    )
-    .bind(ask.project.id)
-    .bind(&pr.id)
-    .bind(pr.revision)
-    .bind(me)
-    .bind(&q.verdict)
-    .bind(&current.patch)
-    .bind(agent)
-    .bind(&person.device_key)
-    .bind(&q.signature)
-    .bind(&body)
-    .bind(now)
-    .execute(&hub.db)
-    .await?
-    .rows_affected();
-    if stored == 0 {
+    let stored = review::put_verdict(hub, ask.project.id, &pr.id, pr.revision, me, &q.verdict, &current.patch, agent, &person.device_key, &q.signature, &body, true).await?;
+    if !stored {
         return Err(Error::conflict("the PR changed meanwhile: look at it again"));
     }
     show(hub, ask, id).await
@@ -1312,7 +1278,8 @@ pub async fn dismiss(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: Di
     }
     let person: Option<i64> = sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&q.person).fetch_optional(&hub.db).await?;
     let person = person.ok_or_else(|| Error::not_found("no such person"))?;
-    if review::dismiss(hub, ask.project.id, &pr.id, person).await? == 0 {
+    let changes = change_ids_of(&revisions(hub, ask.project.id, &pr.id).await?);
+    if review::dismiss(hub, ask.project.id, &pr.id, person, &changes).await? == 0 {
         return Err(Error::not_found(format!("{} has no request for changes on this PR", q.person)));
     }
     show(hub, ask, id).await
@@ -1340,9 +1307,10 @@ pub async fn land(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Resul
         return Err(Error::forbidden("only the author, or someone who may write every file of this PR, lands it"));
     }
     let revs = revisions(hub, ask.project.id, &pr.id).await?;
+    let changes = change_ids_of(&revs);
     let current = revs.into_iter().find(|r| r.n == pr.revision).ok_or_else(|| Error::Other(anyhow::anyhow!("the PR's revision is missing")))?;
     let rules = rules(hub, ask).await?;
-    let gate = review::gate(hub, &ask.project, &ask.viewer, &pr, &current.patch, &rules).await?;
+    let gate = review::gate(hub, &ask.project, &ask.viewer, &pr, &current.patch, &changes, &rules).await?;
     if !gate.ready {
         return Err(Error::new(StatusCode::CONFLICT, "not_ready", format!("not ready to land: {}", gate.reasons.join("; "))));
     }

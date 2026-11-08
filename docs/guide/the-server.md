@@ -276,12 +276,14 @@ vl pr update pr-4f2a9c1b retry               # a new revision, after more pushes
 - **Revisions follow change ids.** Rewrite or rebase your changes, push,
   and run `vl pr update`: the PR keeps its comments, and a comment on a line
   moves with that line, or is marked outdated if the line changed.
-- **Risk and approvals.** Each revision is `low` (only documentation, or
-  tests in a tests folder), `normal`, or `high` (access lines,
-  `.veilrules`, CI and container configuration, dependency manifests and
-  lock files, secrets, or paths your admins mark). Whitespace changes count
-  like any other change, and instruction files for agents (`CLAUDE.md`,
-  `SKILL.md`, …) are code. By default low needs no approval, normal needs one,
+- **Risk and approvals.** Each revision is `low` only if every file is
+  documentation (in the top-level `docs/` folder, or the root's `README`,
+  `LICENSE`, `CHANGELOG`, `CONTRIBUTING`) or test source code (in a `tests/`
+  folder outside `src/`, or Go's `*_test.go`). It is `high` for access lines,
+  `.veilrules`, `CODEOWNERS`, CI and container configuration, dependency
+  manifests and lock files, secrets, or paths your admins mark. Everything
+  else is `normal`, including other Markdown such as agent instructions.
+  By default low needs no approval, normal needs one,
   and high needs one from a person (never an agent). Admins change this in
   `.veilrules`:
 
@@ -294,9 +296,9 @@ vl pr update pr-4f2a9c1b retry               # a new revision, after more pushes
 - **An approval is for the files as they were.** Change the files and the
   approvals stop counting. A rebase that leaves your files as they are
   keeps them. You cannot approve your own PR. Only people who may write
-  every file of a PR review it. A request for changes holds the PR until
-  that reviewer approves, or an admin dismisses it (`vl pr dismiss ID
-  PERSON`).
+  every file of a PR review it. A request for changes holds every PR of
+  those changes (a new PR of them too) until that reviewer approves, or an
+  admin dismisses it (`vl pr dismiss ID PERSON`).
 - `vl pr land` checks the review rules. Landing through the server's
   landing service comes with that service.
 - Over HTTPS: `/v1/projects/{project}/prs…` ([HUB.md §13.24](../HUB.md)).

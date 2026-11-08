@@ -18,17 +18,18 @@
 //! * **The defaults** (no file, or no `[review]`): low risk needs no
 //!   approval, normal one, high one from a person (an agent's never counts
 //!   for high risk). **A file that does not parse** never weakens review:
-//!   the last version of it that parsed, on the default branch's first
-//!   parents, still applies (`revision::rules_now`, from the project's record of it, with no depth limit); with none, every risk
-//!   needs one person's approval. Only admins are told why.
+//!   the state recorded at the last landing on the default branch applies
+//!   (`state`: a file, its absence, or strict); with none, every risk needs
+//!   one person's approval. Only admins are told why.
 //! * **Risk** ([`classify`]): **high** if any file is `.veilpolicy`,
-//!   `.veilrules`, CI or container configuration (anywhere), a dependency
-//!   manifest or lock file, a secret, under a `high_risk_paths` entry, or
-//!   there are more than [`LARGE_FILES`] files; else **low** if every file
-//!   is documentation or a test (by location or the language's test-only
-//!   convention, never by name alone); else **normal**. Whitespace changes
-//!   are rated like any other, and agent instructions (`CLAUDE.md`,
-//!   `SKILL.md`, …) are code. Comment-only changes are not detected
+//!   `.veilrules`, `CODEOWNERS`, CI or container configuration (anywhere),
+//!   a dependency manifest or lock file, a secret, under a
+//!   `high_risk_paths` entry, or there are more than [`LARGE_FILES`]
+//!   files; else **low** only by an allow-list (documentation under the
+//!   top-level `docs/` and the root's `README`-like files; test source
+//!   code in test folders outside `src/`, Go's `*_test.go`); everything
+//!   else **normal**. Whitespace changes are rated like any other, and
+//!   agent instructions are code. Comment-only changes are not detected
 //!   (phase-4 open question 4).
 
 use veil_core::hub::access::{covers, normalize_access_path};
@@ -57,8 +58,8 @@ pub struct Review {
     pub high_risk_paths: Vec<String>,
     /// Why the file was not used as written, if it was not.
     pub warnings: Vec<String>,
-    /// The file did not parse: these are the strict rules, until
-    /// `revision::rules_now` finds the last valid ones.
+    /// The file did not parse: these are the strict rules, or the state
+    /// recorded at the last landing (`state::review_of`).
     pub broken: bool,
 }
 
@@ -237,24 +238,28 @@ fn is_build(path: &str) -> bool {
     ) || matches!(ext.as_str(), "cmake" | "mk" | "bzl" | "gradle" | "nix")
 }
 
-/// Documentation: Markdown, reStructuredText and AsciiDoc anywhere; the
-/// usual top files by name (`README`, `LICENSE`, …, with no extension or
-/// a text one); images under `docs/` or `doc/`. Nothing else: a `.txt` or
-/// a file under `docs/` may be a build input (`CMakeLists.txt`,
-/// `docs/conf.py`).
+/// Documentation, an allow-list (BUG-1276): Markdown, reStructuredText,
+/// AsciiDoc or an image under the top-level `docs/` folder (not inside a
+/// dot-folder there, and not an agent's instructions), or `README*`,
+/// `LICENSE*`, `CHANGELOG*`, `CONTRIBUTING*` at the project root with no
+/// extension or a text one. Nothing else, wherever it sits.
 fn is_docs(path: &str) -> bool {
+    let parts: Vec<&str> = path.split('/').collect();
     let name = name_of(path);
     let (stem, ext) = match name.rsplit_once('.') {
         Some((s, e)) if !s.is_empty() => (s, e.to_ascii_lowercase()),
         _ => (name, String::new()),
     };
-    let in_docs = path.split('/').rev().skip(1).any(|c| c == "docs" || c == "doc");
-    matches!(ext.as_str(), "md" | "markdown" | "rst" | "adoc" | "asciidoc")
-        || (matches!(
-            stem.to_ascii_uppercase().as_str(),
-            "README" | "LICENSE" | "LICENCE" | "COPYING" | "CHANGELOG" | "CHANGES" | "CONTRIBUTING" | "AUTHORS" | "NOTICE" | "CODE_OF_CONDUCT"
-        ) && matches!(ext.as_str(), "" | "txt"))
-        || (in_docs && matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp"))
+    if parts.len() == 1 {
+        let upper = stem.to_ascii_uppercase();
+        return ["README", "LICENSE", "LICENCE", "CHANGELOG", "CONTRIBUTING"].iter().any(|p| upper == *p || upper.starts_with(&format!("{p}-")) || upper.starts_with(&format!("{p}_")))
+            && matches!(ext.as_str(), "" | "txt" | "md" | "markdown" | "rst" | "adoc");
+    }
+    parts[0] == "docs"
+        && !parts[1..parts.len() - 1].iter().any(|d| d.starts_with('.'))
+        && !name.starts_with('.')
+        && !is_agent_instructions(path)
+        && matches!(ext.as_str(), "md" | "markdown" | "rst" | "adoc" | "asciidoc" | "png" | "jpg" | "jpeg" | "gif" | "webp")
 }
 
 /// Instructions agents execute (`CLAUDE.md`, `AGENTS.md`, `.claude/`,
@@ -268,19 +273,33 @@ fn is_agent_instructions(path: &str) -> bool {
         || matches!(name, ".cursorrules" | ".windsurfrules" | ".clinerules" | ".aider.conf.yml")
 }
 
-/// Tests (BUG-1257): only where the build treats files as tests only, by
-/// location or by the language's own convention: under a `tests`, `test`,
-/// `__tests__`, `spec` or `testdata` folder that is not inside a `src`
-/// folder (there, a "test" module may be compiled into the program), or a
-/// Go `*_test.go` file (the Go compiler builds those for tests only). A
-/// name alone (`test_mode.rs`, `integration_test.yml`) is not a test.
+/// Source code of a programming language (by extension): what a test may
+/// be. Data, configuration, specifications and Markdown never are.
+const SOURCE: &[&str] = &[
+    "rs", "py", "js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts", "rb", "java", "kt", "scala", "swift", "c", "cc", "cpp", "cxx", "h",
+    "hpp", "cs", "fs", "php", "ex", "exs", "erl", "hs", "ml", "lua", "dart", "zig", "nim", "jl", "r", "clj", "go",
+];
+
+/// Test source code, an allow-list (BUG-1277): a source file of a
+/// programming language under a `tests`, `test` or `__tests__` folder that
+/// is not inside `src/` (where a test module may be compiled into the
+/// program), or a Go `*_test.go` (the Go compiler builds those for tests
+/// only). Never anything under `spec/`, `testdata/` or `fixtures/`
+/// (specifications and inputs the build may read), and a Go file under a
+/// tests folder only if it is a `_test.go`.
 fn is_test(path: &str) -> bool {
     let name = name_of(path);
     let dirs: Vec<&str> = path.split('/').collect();
     let dirs = &dirs[..dirs.len() - 1];
-    let under_tests = dirs.iter().any(|c| matches!(*c, "test" | "tests" | "__tests__" | "spec" | "testdata"));
-    let under_src = dirs.contains(&"src");
-    (under_tests && !under_src) || name.ends_with("_test.go")
+    if dirs.iter().any(|c| matches!(*c, "spec" | "specs" | "testdata" | "fixtures" | "fixture" | "data" | "snapshots")) {
+        return false;
+    }
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    if ext == "go" {
+        return name.ends_with("_test.go");
+    }
+    let under_tests = dirs.iter().any(|c| matches!(*c, "test" | "tests" | "__tests__"));
+    under_tests && !dirs.contains(&"src") && SOURCE.contains(&ext.as_str())
 }
 
 /// CI and container configuration, anywhere (BUG-1257): run by the CI on
@@ -303,7 +322,7 @@ fn is_ci(path: &str) -> bool {
 /// Why `f` makes a revision high risk, if it does.
 fn high_reason(f: &FileChange, rules: &Review) -> Option<String> {
     let p = f.path.as_str();
-    if p == ".veilpolicy" || p == RULES_FILE {
+    if p == ".veilpolicy" || p == RULES_FILE || name_of(p) == "CODEOWNERS" {
         return Some(format!("changes {p}"));
     }
     if is_ci(p) {
@@ -331,9 +350,10 @@ pub fn classify(files: &[FileChange], rules: &Review) -> (Risk, Vec<String>) {
         high.truncate(20);
         return (Risk::High, high);
     }
-    // Low: every file documentation or a test; never a build file, agent
-    // instructions or anything executable. Whitespace changes are rated
-    // like any other (BUG-1256: they change what scripts do).
+    // Low, an allow-list: every file documentation or test source code;
+    // never a build file, agent instructions or anything executable.
+    // Everything else is normal. Whitespace changes are rated like any
+    // other (BUG-1256: they change what scripts do).
     let low = |f: &FileChange| !f.executable && !is_build(&f.path) && !is_agent_instructions(&f.path) && (is_docs(&f.path) || is_test(&f.path));
     if files.iter().all(low) {
         return (Risk::Low, vec!["only documentation or tests".into()]);
@@ -420,5 +440,42 @@ mod tests {
         assert_eq!(classify(&[secret], &rules).0, Risk::High);
         let many: Vec<FileChange> = (0..=LARGE_FILES).map(|i| f(&format!("docs/{i}.md"))).collect();
         assert_eq!(classify(&many, &rules).0, Risk::High);
+    }
+
+    /// The allow-list against a corpus of real layouts (BUG-1276, 1277):
+    /// low is only documentation under the top-level `docs/`, the root's
+    /// README-like files, and test source code in test folders.
+    #[test]
+    fn low_is_an_allow_list() {
+        let rules = Review::default();
+        let low = [
+            "README", "README.md", "LICENSE", "LICENSE.txt", "LICENSE-MIT", "CHANGELOG.md", "CONTRIBUTING.md", "docs/guide.md", "docs/a/b.rst",
+            "docs/book.adoc", "docs/img/a.png", "docs/_static/logo.png", "tests/cli.rs", "tests/test_api.py", "test/user_test.rb",
+            "web/__tests__/a.ts", "crates/vl/tests/cli_security.rs", "crates/x/tests/common/mod.rs", "pkg/auth/auth_test.go",
+            "internal/x/x_linux_test.go", "tests/unit/a.spec.ts",
+        ];
+        let normal = [
+            // Markdown agents execute or programs include.
+            "skills/deploy/reference.md", "skills/deploy/SKILL.md", "plugins/ops/commands/release.md", "plugins/ops/agents/reviewer.md",
+            ".clinerules/security.md", ".roo/rules/deploy.md", ".kiro/steering/tech.md", ".junie/guidelines.md", "AGENTS.override.md",
+            "app/src/prompts/system.md", "prompts/system.md", "CLAUDE.md", "docs/CLAUDE.md", "docs/SKILL.md", "docs/.vitepress/x.md",
+            "docs/.claude/commands/ship.md", "sub/README.md", "crates/x/README.md", "book/src/intro.md", "notes.md", "README.sh",
+            // Build inputs in test-named folders.
+            "api/spec/openapi.yaml", "spec/openapi.json", "spec/models/user_spec.rb", "internal/assets/testdata/default_policy.json",
+            "crates/server/tests/fixtures/default.toml", "tests/fixtures/a.rs", "tests/data/x.csv", "tests/snapshots/x.snap",
+            "testdata/x_test.go", "tests/a.json", "tests/a.yaml", "tests/a.md", "tests/helpers.sh", "tests/pkg/main.go",
+            // Test configuration, build scripts, sources.
+            "tests/conftest.py", "build.rs", "tests/build.rs", "tests/Makefile", "tests/CMakeLists.txt", "benches/scale.rs", "examples/a.rs",
+            "src/tests/a.rs", "crates/x/src/tests.rs", "packages/web/src/__tests__/login.ts", "pub/src/test_mode.rs", "lib/test_utils.py",
+            "a.test.ts", "docs/conf.py", "docs/index.html", "docs/x.svg", "notes.txt", "pub/CMakeLists.txt",
+        ];
+        let high = ["CODEOWNERS", "docs/CODEOWNERS", ".github/CODEOWNERS", "tests/package.json", "tests/Cargo.toml", "tests/docker-compose.yml"];
+        for (want, paths) in [(Risk::Low, &low[..]), (Risk::Normal, &normal[..]), (Risk::High, &high[..])] {
+            for p in paths {
+                assert_eq!(classify(&[f(p)], &rules).0, want, "{p}");
+            }
+        }
+        let exe = FileChange { executable: true, ..f("tests/run.py") };
+        assert_eq!(classify(&[exe], &rules).0, Risk::Normal);
     }
 }

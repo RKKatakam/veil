@@ -341,6 +341,9 @@ struct Built {
     /// are not the accepted ones: accepted only if the branch moves, and
     /// only from an admin.
     accept: Option<String>,
+    /// The new tip's `.veilrules`, for a move of the default branch (S21:
+    /// the review rules state its landing records, `prs::state`).
+    rules: Option<crate::prs::state::RulesFile>,
 }
 
 /// Who asks, as of one attempt: the project with its accepted policy and
@@ -440,7 +443,11 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, who: &Arc<Who>, parent: ObjectI
             }
             false => None,
         };
-        Ok(Built { real: real_id, store, mine, accept })
+        let rules = match p.default_branch {
+            true => Some(crate::prs::state::file_at(src, real.tree)?),
+            false => None,
+        };
+        Ok(Built { real: real_id, store, mine, accept, rules })
     })
     .await
 }
@@ -564,12 +571,18 @@ async fn commit(
     snaps.push((built.real.hex(), built.mine.hex()));
     let moved_refs: Vec<(String, String)> = restacked.iter().map(|(n, o, _)| (n.hex(), o.hex())).collect();
     let (real, cid, accept) = (built.real.hex(), plan.change_id.to_string(), built.accept.clone());
+    // A change onto the tip is a fast-forward from it.
+    let rules_landing = match (&built.rules, &mv) {
+        (Some(file), Some(m)) => Some(crate::prs::state::Landing { old: Some(m.cur), new: built.real, file: file.clone(), fast_forward: true }),
+        _ => None,
+    };
     let mv = mv.map(|m| (m.branch, m.cur.hex(), m.keep_on_loss));
     let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let committed: Vec<ObjectId> = restacked.iter().map(|(n, _, _)| *n).chain(std::iter::once(built.real)).collect();
     let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let (real, cid, accept, mv, view_key, snaps, moved_refs) =
             (real.clone(), cid.clone(), accept.clone(), mv.clone(), view_key.clone(), snaps.clone(), moved_refs.clone());
+        let rules_landing = rules_landing.clone();
         Box::pin(async move {
             let now = veil_core::now_millis();
             let mut moved = None;
@@ -588,6 +601,9 @@ async fn commit(
                 moved = Some(rows == 1);
                 if let (1, Some(text)) = (rows, &accept) {
                     crate::perm::accept_policy(&mut *c, pid, text).await?;
+                }
+                if let (1, Some(l)) = (rows, &rules_landing) {
+                    crate::prs::state::record_landing(&mut *c, pid, l).await?;
                 }
             }
             for (snap, mine) in &snaps {

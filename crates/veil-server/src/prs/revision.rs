@@ -21,7 +21,7 @@ use veil_core::{
     ChangeId, ObjectId,
 };
 
-use super::rules::{classify, FileChange, Review, Risk, RULES_FILE};
+use super::rules::{classify, FileChange, Review, Risk};
 use crate::{
     derive::{changes, Cx},
     error::{Error, Result},
@@ -38,8 +38,6 @@ pub const MAX_STACK: usize = 100;
 pub const MAX_PATHS: usize = 10_000;
 /// Text larger than this is never anchored to.
 pub const MAX_TEXT: u64 = 1 << 20;
-/// The largest `.veilrules` read.
-const MAX_RULES: u64 = 64 << 10;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct StackChange {
@@ -112,92 +110,6 @@ pub fn text_of(cx: &Cx, e: &TreeEntry) -> Result<Option<String>> {
         return Ok(None);
     }
     Ok(String::from_utf8(bytes).ok())
-}
-
-/// The `.veilrules` text of snapshot `id`, if it holds a plain file of at
-/// most 64 KiB, with the file's entry id; `None`: no such file.
-pub fn rules_text(cx: &Cx, id: &ObjectId) -> Result<Option<(ObjectId, Option<Vec<u8>>)>> {
-    let tree = cx.src.snapshot(id)?.tree;
-    let Some(e) = entry_at(&cx.src, tree, RULES_FILE)? else { return Ok(None) };
-    if e.kind != EntryKind::File || !e.visibility.is_public() || e.size > MAX_RULES {
-        return Ok(Some((e.id, None)));
-    }
-    Ok(Some((
-        e.id,
-        match Object::decode(&cx.src.raw(&e.id)?) {
-            Ok(Object::Blob(b)) if b.len() as u64 <= MAX_RULES => Some(b),
-            _ => None,
-        },
-    )))
-}
-
-/// What the review rules are at the default branch's `tip`, given the
-/// project's stored record (`checked`: the tip it was made at; `text`: the
-/// last valid `.veilrules` at or before it), and the record to store now
-/// (BUG-1259). A broken file never weakens review: the newest valid
-/// version on the tip's first parents since `checked`, else the stored
-/// one, else the strict rules. No depth limit: the walk stops at
-/// `checked` (or the root, when `checked` is not on the way).
-pub struct RulesNow {
-    pub review: Review,
-    pub checked: ObjectId,
-    pub text: Option<Vec<u8>>,
-}
-
-pub fn rules_now(cx: &Cx, tip: ObjectId, checked: Option<ObjectId>, stored: Option<Vec<u8>>) -> Result<RulesNow> {
-    let parse = |t: &Option<Vec<u8>>| t.as_deref().map(|b| Review::parse(Some(b))).filter(|r| !r.broken);
-    let first = rules_text(cx, &tip)?;
-    let (seen, tip_review) = match &first {
-        // No file: the defaults; the record keeps the last valid one.
-        None => return Ok(RulesNow { review: Review::default(), checked: tip, text: stored }),
-        Some((id, text)) => match parse(text) {
-            Some(r) => return Ok(RulesNow { review: r, checked: tip, text: text.clone() }),
-            None => (*id, text.as_deref().map(|b| Review::parse(Some(b))).unwrap_or_else(|| Review::strict("not a plain file of at most 64 KiB".into()))),
-        },
-    };
-    // Broken at the tip: the newest valid version since the record.
-    let mut found: Option<(ObjectId, Vec<u8>)> = None;
-    let mut last = Some(seen);
-    let mut x = tip;
-    while Some(x) != checked {
-        let Some(p) = cx.src.snapshot(&x)?.parents.first().copied() else { break };
-        x = p;
-        if Some(x) == checked {
-            break;
-        }
-        match rules_text(cx, &x)? {
-            None => last = None,
-            Some((id, _)) if Some(id) == last => {}
-            Some((id, text)) => {
-                last = Some(id);
-                if let (Some(t), true) = (&text, parse(&text).is_some()) {
-                    found = Some((x, t.clone()));
-                    break;
-                }
-            }
-        }
-    }
-    let (text, from) = match found {
-        Some((at, t)) => (Some(t), Some(at.short())),
-        None => (stored, None),
-    };
-    let mut review = match parse(&text) {
-        Some(mut kept) => {
-            kept.warnings = tip_review.warnings.clone();
-            kept.warnings.push(match from {
-                Some(at) => format!("until it is fixed, the last valid {RULES_FILE} applies (as of {at})"),
-                None => format!("until it is fixed, the last valid {RULES_FILE} applies"),
-            });
-            kept
-        }
-        None => {
-            let mut strict = tip_review;
-            strict.warnings.push("until it is fixed, every PR needs one person's approval (no earlier version of it is valid)".into());
-            strict
-        }
-    };
-    review.broken = true;
-    Ok(RulesNow { review, checked: tip, text })
 }
 
 fn entry_bytes(h: &mut blake3::Hasher, e: Option<&TreeEntry>) {

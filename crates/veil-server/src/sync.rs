@@ -1362,6 +1362,9 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     // 3. Move the branches: one serialisable transaction of compare-and-swaps.
     let mut plans = Vec::new();
     let mut results = Vec::new();
+    // The review rules a landing on the default branch brings (S21,
+    // `prs::state`): recorded in this push's transaction.
+    let mut rules_landing: Option<crate::prs::state::Landing> = None;
     // New branches, against the branches when the push began (concurrent
     // pushes may each add up to the bound).
     let created: HashSet<&str> = req.updates.iter().filter(|u| u.new.is_some() && !current.contains_key(&u.branch)).map(|u| u.branch.as_str()).collect();
@@ -1408,6 +1411,12 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         let mut accept = None;
         if u.branch == project.default_branch {
             if let Some(n) = new_real {
+                let file = blocking(hub, project.id, move |src| crate::prs::state::file_at(src, src.snapshot(&n)?.tree)).await?;
+                let fast_forward = match cur {
+                    Some(c) => !req.force || is_ancestor(hub, project.id, c, n).await?,
+                    None => false,
+                };
+                rules_landing = Some(crate::prs::state::Landing { old: cur, new: n, file, fast_forward });
                 let text = blocking(hub, project.id, move |src| policy_text(src, &src.snapshot(&n)?.tree)).await?;
                 let incoming = AccessPolicy::parse(&text);
                 if !incoming.same_rules(&project.policy) {
@@ -1454,6 +1463,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let pid = project.id;
     let plans2 = plans.clone();
+    let default_branch = project.default_branch.clone();
     // Nothing to move (every update refused: the pusher pulls and tries
     // again): no commit, and nothing recorded as history no branch reaches.
     let (moved, memo_stored) = if plans.is_empty() {
@@ -1461,6 +1471,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     } else {
         crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let plans = plans2.clone();
+        let (rules_landing, default_branch) = (rules_landing.clone(), default_branch.clone());
         let new_reals = new_reals.clone();
         let origins = origins.clone();
         let memos = memos.clone();
@@ -1500,6 +1511,9 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                     // Bumps the project's access epoch (a trigger): every
                     // server's cached permissions for it are void.
                     crate::perm::accept_policy(&mut *c, pid, &text).await?;
+                }
+                if let (true, Some(l)) = (branch == default_branch, &rules_landing) {
+                    crate::prs::state::record_landing(&mut *c, pid, l).await?;
                 }
                 moved.push(branch);
             }
