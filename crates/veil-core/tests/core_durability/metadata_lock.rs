@@ -177,6 +177,24 @@ fn concurrent_vault_updates_never_lose_a_secret() {
 #[test]
 fn grant_racing_lock_free_commits() {
     for (fs, disk) in backends() {
+        grant_race(fs, disk);
+    }
+}
+
+/// BUG-1294: under load (about 1 run in 70 with the machine's load near
+/// 100), a lock-free commit's tag names a tree without the file the
+/// commit wrote (`["f0-0", "f0-2"]` for `c0-1`), on the memory backend:
+/// on `integration` as on this branch. Many rounds of the race above.
+#[test]
+#[ignore = "BUG-1294: a lock-free commit racing grants and a pull can lose its own file"]
+fn bug_1294_lock_free_commits_keep_their_files() {
+    for _ in 0..200 {
+        grant_race(Arc::new(MemoryBackend::new()), None);
+    }
+}
+
+fn grant_race(fs: Arc<dyn StorageBackend>, disk: Option<tempfile::TempDir>) {
+    {
         let alice = Identity::generate("alice");
         let mut init = Repo::init(fs.clone(), Some(alice.clone()), "alice").unwrap();
         let root = init.root_id();

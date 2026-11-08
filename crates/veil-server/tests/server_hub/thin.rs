@@ -1205,18 +1205,30 @@ fn history_shape(who: &Person, dir: &Path, known: &[String]) -> Vec<String> {
         _ if c != "-" && !known.iter().any(|k| k == c) => "new".to_string(),
         _ => c.to_string(),
     };
-    entries
+    let shapes: Vec<(String, String)> = entries
         .iter()
         .map(|e| {
             let parents: Vec<String> = e["parents"].as_array().unwrap().iter().map(|p| name(p["change_id"].as_str().unwrap_or("-"))).collect();
-            format!(
+            let shape = format!(
                 "{} {:?} empty={} conflicts={} tags={} parents={parents:?}",
                 name(e["change_id"].as_str().unwrap_or("-")),
                 e["description"].as_str().unwrap_or(""),
                 e["empty"],
                 e["conflicts"],
                 e["tags"]
-            )
+            );
+            (e["timestamp"].to_string(), shape)
+        })
+        .collect();
+    // Snapshots of one timestamp (`vl split`'s first half keeps the
+    // original's) are ordered by id, which a random change id makes: in
+    // any order within such a run.
+    shapes
+        .chunk_by(|a, b| a.0 == b.0)
+        .flat_map(|run| {
+            let mut run: Vec<String> = run.iter().map(|(_, s)| s.clone()).collect();
+            run.sort();
+            run
         })
         .collect()
 }

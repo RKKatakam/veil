@@ -1829,7 +1829,7 @@ impl<'a> Builder<'a> {
         if desired.is_public() {
             if let Some(pe) = parent_file {
                 if !self.policy_changed && !self.rescan && pe.id == content && pe.visibility.is_public() && pe.executable == executable {
-                    self.learn(path, meta.as_ref(), content, false, None);
+                    self.learn(path, meta.as_ref(), content, scanned_clean, None);
                     return Ok(Some(pe.clone())); // unchanged; scanned before
                 }
             }
@@ -1903,7 +1903,7 @@ impl<'a> Builder<'a> {
         // (BUG-1293); new content always is.
         if let Some(pe) = parent_file {
             if desired.is_public() && pe.visibility.is_public() && pe.executable == executable && pe.id == content && self.store.has(&content) {
-                self.learn(path, meta.as_ref(), content, false, None);
+                self.learn(path, meta.as_ref(), content, scanned_clean, None);
                 return Ok(Some(TreeEntry { name: name.to_string(), ..pe.clone() }));
             }
         }

@@ -2577,6 +2577,18 @@ quiet wait ran out): thin clone **7.9 s, 337 MiB** client peak, 0.43 GB in
 `.veil`; `status` 7.7, 0.49, 0.10 s; `log -n 20` 6.0 s; full clone 100 s,
 456 MiB. Back to cycle 1's level for the thin clone.
 
+After the redesign's review cycle 1 (boundary generations from the
+server, `q/resolve` filtered first, history pages from reached snapshots
+only), the same profile from load 12.5 (quiet) to 96.6 by its end:
+`log -n 20` in the thin clone **0.14 s** (6.0 s before: the history index
+takes the boundary's generations from the server and pages nothing in),
+59 MiB; `status` in the thin clone 0.27 s, 62 MiB; thin clone 19.4 s, **337
+MiB**, 0.43 GB in `.veil`; full clone 90.3 s, 418 MiB. The thin clone's
+time follows the load that rose during the run: back to back at load 40 to
+55, thin and full clones of a 35,000-file project (31 snapshots) are alike,
+clone 1.93 and 1.39 s (thin) against 1.55 and 1.73 s (full), 137 to 143
+MiB, `log -n 20` 0.03 s against 0.05 s, as in cycle 2.
+
 * A thin clone's time and memory follow what it checks out (the tip's
   35,000 files), not the history: it holds 2 snapshots of 10,022.
 * The first `vl status` after a clone re-reads the files written within
@@ -2584,9 +2596,10 @@ quiet wait ran out): thin clone **7.9 s, 337 MiB** client peak, 0.43 GB in
   project (`.scratch` experiment, 31 snapshots) thin 0.12, 0.10, 0.01 s and
   full 0.19, 0.10, 0.01 s. The benchmark measures the full clone's status
   only after two pulls, so its 0.09 s is a later run.
-* `log -n 20` fetches 2,000-snapshot pages and runs the walk again after
-  each (the history index is rebuilt once the boundary's parents arrive):
-  seconds on a long history, until phase 3's query API answers it.
+* `log -n 20` fetched 2,000-snapshot pages and ran the walk again after
+  each until cycle 3 (seconds on a long history). Since the redesign's
+  review cycle 1 the boundary's generations come from the server
+  (`q/generations`), so the walk pages in only the part of history it shows.
 * The server's 1 GB memory gate is missed by every case of this run from
   the initial push on (push 1,257 MiB; the server keeps that RSS): server
   push memory is another stream's work (BUG-1000 for clones). A thin clone
