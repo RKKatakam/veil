@@ -502,13 +502,13 @@ impl Daemon {
                     true => None,
                     false => Some(400),
                 };
-                end(&mut w, &Head { status, body: None })?;
+                end(&mut w, &Head { status, body: None, ..Default::default() })?;
             }
             Request::Follows => {
                 let f: Vec<(String, String)> = self.follows.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
-                end(&mut w, &Head { status: None, body: Some(json!(f)) })?;
+                end(&mut w, &Head { status: None, body: Some(json!(f)), ..Default::default() })?;
             }
-            Request::Status => end(&mut w, &Head { status: None, body: Some(self.status()) })?,
+            Request::Status => end(&mut w, &Head { status: None, body: Some(self.status()), ..Default::default() })?,
             Request::Stop => {
                 self.stop.store(true, Ordering::SeqCst);
                 end(&mut w, &Head::default())?;
@@ -550,7 +550,7 @@ impl Daemon {
     /// sends for the rest. Returns the answer's end.
     fn batch(&self, w: &mut impl Write, authority: &str, project: &str, req: BatchRequest) -> Result<Head> {
         if !valid_authority(authority) || !valid_project(project) || req.wants.len() > MAX_WANTS || req.skip.len() > MAX_WANTS {
-            return Ok(Head { status: Some(400), body: None });
+            return Ok(Head { status: Some(400), body: None, ..Default::default() });
         }
         let up = self.upstream(authority)?;
         self.follow(authority, project);
@@ -568,10 +568,12 @@ impl Daemon {
             }
         }
         let skipped: HashSet<ObjectId> = req.skip.iter().copied().collect();
-        if ids.iter().all(|i| sent.contains(i) || skipped.contains(i)) {
-            return Ok(Head::default());
-        }
-        self.forward(w, &up, project, req, checked.as_ref(), &sent)
+        let mut head = match ids.iter().all(|i| sent.contains(i) || skipped.contains(i)) {
+            true => Head::default(),
+            false => self.forward(w, &up, project, req, checked.as_ref(), &sent)?,
+        };
+        head.from_store = sent.len();
+        Ok(head)
     }
 
     /// Steps 1–4: the epochs the request's grant is under (when its grant
@@ -631,7 +633,7 @@ impl Daemon {
             Ok(r) => r,
             Err(_) => {
                 self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
-                return Ok(Head { status: Some(503), body: None });
+                return Ok(Head { status: Some(503), body: None, ..Default::default() });
             }
         };
         drop(body);
@@ -647,7 +649,7 @@ impl Daemon {
         }
         if status != 200 {
             self.stats.refused_upstream.fetch_add(1, Ordering::Relaxed);
-            return Ok(Head { status: Some(status), body: None });
+            return Ok(Head { status: Some(status), body: None, ..Default::default() });
         }
         let mut r = resp.into_body().into_reader();
         loop {

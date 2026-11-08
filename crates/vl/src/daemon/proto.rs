@@ -56,6 +56,13 @@ pub struct Head {
     /// `Status`: the daemon's counters; `Follows`: the projects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<serde_json::Value>,
+    /// `Batch`: how many of the objects sent came from the daemon's store.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub from_store: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 pub fn write_msg(w: &mut impl Write, kind: u8, payload: &[u8]) -> std::io::Result<()> {
