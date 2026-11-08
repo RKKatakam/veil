@@ -456,3 +456,460 @@ fn bug_1331_vl_waits_out_a_rate_limit() {
         assert!(o.status.success(), "clone {i}: {}", String::from_utf8_lossy(&o.stderr));
     }
 }
+
+// ---------------------------------------------------------------------------
+// S24 cycle 1's review (`docs/BUGS.md`, "S24 cycle 1"): a test for each
+// property the review checked; where one does not hold, an ignored
+// reproduction (BUG-1333 to BUG-1338).
+
+/// Raw TLS connections from a chosen local address (clients on several
+/// addresses of one machine: 127.0.0.2, …, or two IPv6 addresses of one
+/// /64), and raw HTTP/1.1 and HTTP/2 over them.
+mod raw {
+    use std::{
+        io::Read,
+        net::{IpAddr, SocketAddr, TcpStream},
+        sync::Arc,
+        time::Duration,
+    };
+
+    use rustls::{
+        client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+        crypto::CryptoProvider,
+        pki_types::{CertificateDer, ServerName, UnixTime},
+        DigitallySignedStruct, SignatureScheme,
+    };
+
+    /// A TCP connection from `local` to `to`.
+    pub fn tcp(local: IpAddr, to: SocketAddr) -> TcpStream {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_io().build().unwrap();
+        rt.block_on(async {
+            let s = match to {
+                SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+                SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
+            }
+            .unwrap();
+            s.bind(SocketAddr::new(local, 0)).unwrap_or_else(|e| panic!("binding {local}: {e}"));
+            let c = s.connect(to).await.unwrap_or_else(|e| panic!("connecting from {local} to {to}: {e}"));
+            let c = c.into_std().unwrap();
+            c.set_nonblocking(false).unwrap();
+            c
+        })
+    }
+
+    /// The test server's certificate is self-signed: any certificate, its
+    /// handshake signatures checked.
+    #[derive(Debug)]
+    struct AnyCertificate(Arc<CryptoProvider>);
+
+    impl ServerCertVerifier for AnyCertificate {
+        fn verify_server_cert(&self, _: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+        }
+        fn verify_tls13_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    pub type Tls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+
+    /// TLS over `tcp`, its handshake done.
+    pub fn tls(tcp: TcpStream) -> Tls {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AnyCertificate(provider)))
+            .with_no_client_auth();
+        let conn = rustls::ClientConnection::new(Arc::new(config), ServerName::try_from("localhost").unwrap()).unwrap();
+        let mut s = rustls::StreamOwned::new(conn, tcp);
+        while s.conn.is_handshaking() {
+            s.conn.complete_io(&mut s.sock).expect("the TLS handshake");
+        }
+        s
+    }
+
+    /// Whether the server closed `s` within `wait`.
+    pub fn closed(s: &mut TcpStream, wait: Duration) -> bool {
+        s.set_read_timeout(Some(wait)).unwrap();
+        match s.read(&mut [0u8; 1]) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) => !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
+        }
+    }
+
+    /// An HTTP/2 frame.
+    pub fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let mut f = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+        f.extend([kind, flags]);
+        f.extend(stream.to_be_bytes());
+        f.extend(payload);
+        f
+    }
+}
+
+fn spawn_flood(hub: &TestHub, token: &str, paths: Vec<String>, clients: usize, stop: &Arc<AtomicBool>, served: &Arc<AtomicUsize>) -> Vec<std::thread::JoinHandle<()>> {
+    (0..clients)
+        .map(|i| {
+            let (api, stop, served, token, path) = (hub.api(), stop.clone(), served.clone(), token.to_string(), paths[i % paths.len()].clone());
+            std::thread::spawn(move || {
+                while !stop.load(Relaxed) {
+                    let r = api.get(Some(&token), &path);
+                    match r.status {
+                        200 => {
+                            served.fetch_add(1, Relaxed);
+                        }
+                        503 => {}
+                        s => panic!("{path}: {s}: {}", String::from_utf8_lossy(&r.body)),
+                    }
+                }
+            })
+        })
+        .collect()
+}
+
+/// BUG-1339 (S24 cycle 1): at the server's defaults (60 a second, 5,000
+/// an hour a device), an agent fleet of one person on one device is
+/// refused. Agents in workspaces share their person's device (agent
+/// sessions, S11, are not built), and `vl` sends about 18 requests per
+/// commit, push and pull (measured here with the limits out of the way:
+/// 438 requests for 6 clones and 24 cycles, in 6.3 s, about 70 a second).
+/// 6 agents, each cloning and then committing, pushing its own tag and
+/// pulling 4 times, are refused `429` within seconds; and the hour's 5,000
+/// is about 4.6 such cycles a minute for the whole device.
+#[test]
+#[ignore = "BUG-1339: the default device rate refuses an agent fleet of one device (about 18 requests a commit-push-pull)"]
+fn bug_1339_an_agent_fleet_on_one_device_is_refused_at_the_defaults() {
+    let hub = TestHub::start_with_limits(Settings::default());
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let admin = p.admin.token();
+    let requests = |api: &Api| {
+        let r = api.get(Some(&admin), &format!("/v1/projects/{}/health", p.name));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        r.json()["since_start"]["requests"].as_u64().unwrap()
+    };
+    let before = requests(&api);
+    let (agents, cycles) = (6, 4);
+    std::thread::scope(|s| {
+        for a in 0..agents {
+            let (p, hub) = (&p, &hub);
+            s.spawn(move || {
+                let d = p.dev.dir(&format!("agent{a}"));
+                p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+                for c in 0..cycles {
+                    write_files(&d, &[(&format!("src/agent{a}/f{c}.txt"), &format!("agent {a} cycle {c}"))]);
+                    p.dev.ok(&d, &["commit", "-m", &format!("agent {a} cycle {c}")]);
+                    p.dev.ok(&d, &["tag", "set", &format!("agent{a}"), "-r", "@-", "--force"]);
+                    p.dev.ok(&d, &["push", "--tag", &format!("agent{a}")]);
+                    p.dev.ok(&d, &["pull"]);
+                }
+            });
+        }
+    });
+    let used = requests(&api) - before - 1;
+    eprintln!("{agents} agents on one device: {used} requests for {agents} clones and {} commit-push-pull cycles ({:.1} a cycle with its share of the clone)", agents * cycles, used as f64 / (agents * cycles) as f64);
+    assert!(used > 0);
+}
+
+/// BUG-1333 (S24 cycle 1), the signed-in pool: one signed-in upload
+/// larger than its quarter takes the whole pool from its first byte until
+/// its last, and holds it while it arrives at any rate at or above the
+/// minimum. At `--request-memory 64M` (a 48 MiB signed-in pool), one person
+/// uploads a 50 MiB file on a slow link (its first 256 KiB, then the rest
+/// later, within the 20 s grace): meanwhile someone else's push of one
+/// small file, in another project, waits 10 s for its share and is refused
+/// `busy`. At the defaults the same holds for any upload over 384 MiB, for
+/// as long as it takes (a 400 MiB file at 10 Mbit/s: five minutes).
+#[test]
+#[ignore = "BUG-1333: a few slow bodies hold a whole pool of the request budget: every other body on the server is refused busy"]
+fn bug_1333_one_slow_large_upload_refuses_every_other_signed_in_body() {
+    use std::io::Write;
+    let hub = TestHub::start_with_limits(Settings { request_memory: 64 << 20, ..TestHub::limits() });
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let uploader = signed_up(&api);
+    let theirs = project(&api, &uploader);
+    let server: std::net::SocketAddr = hub.authority().parse().unwrap();
+    let mut up = raw::tls(raw::tcp("127.0.0.1".parse().unwrap(), server));
+    write!(up, "POST /v1/projects/{theirs}/objects HTTP/1.1\r\nhost: veil\r\nauthorization: Bearer {uploader}\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\n\r\n", 50 << 20).unwrap();
+    up.write_all(&vec![0u8; 256 << 10]).unwrap();
+    up.flush().unwrap();
+    let t = Instant::now();
+    while hub.hub().limits.bodies.held_kib().0 == 0 && t.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let held = hub.hub().limits.bodies.held_kib();
+    assert_eq!(held.0, 48 << 10, "the upload holds the whole signed-in pool: {held:?} KiB");
+    write_files(&p.dir, &[("src/small.txt", "one small file")]);
+    p.admin.commit_main(&p.dir, "a small change");
+    let t = Instant::now();
+    let o = p.admin.run(&p.dir, &["push"]);
+    let took = t.elapsed();
+    drop(up);
+    assert!(o.status.success(), "a push of one small file beside one slow upload, refused after {took:?}: {}", String::from_utf8_lossy(&o.stderr));
+}
+
+/// BUG-1333 (S24 cycle 1), the anonymous pool: four addresses, each
+/// within its quarter, hold the whole anonymous pool with request heads
+/// alone (a declared length, no byte of the body: the share is taken
+/// before any is read), and then every sign-in on the server (its
+/// challenge, a body of a few bytes) waits 10 s for its share and is
+/// refused `busy`, for as long as the four keep the minimum rate (20 s +
+/// 32 MiB at 16 KiB/s: 35 minutes, 64 KiB/s in all).
+#[test]
+#[ignore = "BUG-1333: a few slow bodies hold a whole pool of the request budget: every other body on the server is refused busy"]
+fn bug_1333_four_addresses_holding_bodies_refuse_every_sign_in() {
+    use std::io::Write;
+    let hub = TestHub::start();
+    let server: std::net::SocketAddr = hub.authority().parse().unwrap();
+    let quarter = hub.hub().limits.bodies.anonymous_limit();
+    let held: Vec<_> = (2..=5)
+        .map(|i| {
+            let mut s = raw::tls(raw::tcp(format!("127.0.0.{i}").parse().unwrap(), server));
+            write!(s, "POST /v1/auth/challenge HTTP/1.1\r\nhost: veil\r\ncontent-type: application/json\r\ncontent-length: {quarter}\r\n\r\n").unwrap();
+            s.flush().unwrap();
+            s
+        })
+        .collect();
+    let t = Instant::now();
+    while u64::from(hub.hub().limits.bodies.held_kib().1) < 4 * (quarter >> 10) && t.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(u64::from(hub.hub().limits.bodies.held_kib().1), 4 * (quarter >> 10), "four heads hold the anonymous pool");
+    let t = Instant::now();
+    let r = challenge(&hub.api());
+    let took = t.elapsed();
+    drop(held);
+    assert_eq!(r.status, 200, "a sign-in from another address, after {took:?}: {}", String::from_utf8_lossy(&r.body));
+}
+
+/// BUG-1334 (S24 cycle 1): a project's gate is keyed by the name in the
+/// path, for everyone, so a request for a private project waits behind
+/// its people's requests before it is refused. Someone who cannot see the
+/// project then tells a busy private project from a missing name: while
+/// the project's people keep its gate full (64 clients reading its groups,
+/// a database read each), an outsider's search of it waits its second and
+/// is shed `503 busy`, where a name nobody has is answered `404` at once.
+/// Both must be the not-found answer, in about the same time.
+#[test]
+#[ignore = "BUG-1334: a busy private project's gate tells an outsider it exists (503 after a wait instead of 404)"]
+fn bug_1334_a_busy_private_project_is_told_apart_from_a_missing_one() {
+    let hub = TestHub::start();
+    let api = hub.api();
+    let (owner, outsider) = (signed_up(&api), signed_up(&api));
+    let secret = project(&api, &owner);
+    let (stop, served) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+    let floods = spawn_flood(&hub, &owner, vec![format!("/v1/projects/{secret}/groups")], 64, &stop, &served);
+    std::thread::sleep(Duration::from_secs(1));
+    let mut answers = Vec::new();
+    for _ in 0..5 {
+        let missing = unique("lim");
+        for (what, name) in [("private", &secret), ("missing", &missing)] {
+            let t = Instant::now();
+            let r = api.get(Some(&outsider), &format!("/v1/projects/{name}/q/search?q=x"));
+            answers.push((what, r.status, t.elapsed()));
+        }
+    }
+    stop.store(true, Relaxed);
+    for t in floods {
+        t.join().unwrap();
+    }
+    eprintln!("an outsider's searches beside the project's own work: {answers:?}");
+    assert!(served.load(Relaxed) > 0, "the project's people were served");
+    assert!(answers.iter().filter(|a| a.0 == "missing").all(|a| a.1 == 404), "a missing name is not found: {answers:?}");
+    for (what, status, took) in &answers {
+        assert_eq!(*status, 404, "{what}: an outsider tells a busy private project from a missing one: {answers:?}");
+        assert!(*took < Duration::from_millis(500), "{what}: answered after {took:?}: {answers:?}");
+    }
+}
+
+/// BUG-1335 (S24 cycle 1): gates are keyed by the path's spelling of the
+/// project's name, but the routes decode it (`%6C` is `l`), so one
+/// project named in 8 spellings (its first three letters percent-encoded
+/// or not) gets 8 gates and runs up to the server's whole gate (32 at
+/// once on a pool of 16), not three quarters of the connections: the
+/// bulkhead that keeps a project's storm from starving the others does not
+/// hold against a member, or anyone on Earth for a public project.
+#[test]
+#[ignore = "BUG-1335: a project named in percent-encoded spellings gets a gate per spelling and runs past its bulkhead"]
+fn bug_1335_a_project_named_in_other_spellings_runs_past_its_bulkhead() {
+    let hub = TestHub::start();
+    let api = hub.api();
+    let flooder = signed_up(&api);
+    let pa = project(&api, &flooder);
+    let spelled = |k: usize| pa.char_indices().map(|(i, c)| if i < 3 && k >> i & 1 == 1 { format!("%{:02X}", c as u32) } else { c.to_string() }).collect::<String>();
+    let paths: Vec<String> = (0..8).map(|k| format!("/v1/projects/{}/groups", spelled(k))).collect();
+    for path in &paths {
+        let r = api.get(Some(&flooder), path);
+        assert_eq!(r.status, 200, "{path} names the project: {}", String::from_utf8_lossy(&r.body));
+    }
+    let server = hub.hub();
+    let (stop, served) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+    let floods = spawn_flood(&hub, &flooder, paths, 64, &stop, &served);
+    let most = Arc::new(AtomicUsize::new(0));
+    let sampler = {
+        let (stop, most, server) = (stop.clone(), most.clone(), server.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Relaxed) {
+                // Only this project's requests are in the server's gate.
+                most.fetch_max(server.limits.load(None).0, Relaxed);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_secs(3));
+    stop.store(true, Relaxed);
+    for t in floods {
+        t.join().unwrap();
+    }
+    sampler.join().unwrap();
+    let most = most.load(Relaxed);
+    eprintln!("one project in 8 spellings: {} served, at most {most} running at once", served.load(Relaxed));
+    assert!(served.load(Relaxed) > 0, "the flood was served");
+    assert!(most <= 12, "the project ran {most} requests at once: more than three quarters of the 16 connections");
+}
+
+/// Two global IPv6 addresses of this machine in one /64, if it has them.
+fn two_in_one_64() -> Option<(std::net::Ipv6Addr, std::net::Ipv6Addr)> {
+    let s = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
+    let mut seen: Vec<std::net::Ipv6Addr> = Vec::new();
+    for l in s.lines() {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        // Global scope, not tentative or deprecated.
+        if f.len() < 6 || f[3] != "00" || u8::from_str_radix(f[4], 16).ok()? & 0x60 != 0 {
+            continue;
+        }
+        let a = std::net::Ipv6Addr::from(u128::from_str_radix(f[0], 16).ok()?);
+        if let Some(b) = seen.iter().find(|b| u128::from(**b) >> 64 == u128::from(a) >> 64 && **b != a) {
+            return Some((*b, a));
+        }
+        seen.push(a);
+    }
+    None
+}
+
+/// BUG-1336 (S24 cycle 1): the listener's per-address share (an eighth of
+/// `--max-connections`) is keyed by the whole IPv6 address, where the rate
+/// limits and body shares key an address by its /64 (one subscriber's
+/// allocation): one host with a /64 opens every connection of the server
+/// from addresses of its own. With `--max-connections 16`, an address
+/// opens 2 and its third is closed at once, but another address of the
+/// same /64 opens more. Needs two global IPv6 addresses of one /64 on the
+/// machine (two interfaces on one network, or `ip -6 addr add`).
+#[test]
+#[ignore = "BUG-1336: the per-address connection share counts each IPv6 address, not its /64"]
+fn bug_1336_one_ipv6_subscriber_opens_more_than_an_eighth_of_the_connections() {
+    let (a, b) = two_in_one_64().expect("this reproduction needs two global IPv6 addresses of one /64 on this machine");
+    let hub = TestHub::start_with_limits_on(std::net::SocketAddr::new(a.into(), 0), Settings { max_connections: 16, ..TestHub::limits() });
+    let server = std::net::SocketAddr::new(a.into(), hub.port);
+    // The address's share: 2 connections, waiting for their handshakes.
+    let mut held: Vec<_> = (0..2).map(|_| raw::tcp(a.into(), server)).collect();
+    std::thread::sleep(Duration::from_millis(500));
+    let mut third = raw::tcp(a.into(), server);
+    assert!(raw::closed(&mut third, Duration::from_secs(3)), "a third connection from {a} is closed at once");
+    for h in &mut held {
+        assert!(!raw::closed(h, Duration::from_millis(100)), "the share's two stay open");
+    }
+    let mut more = raw::tcp(b.into(), server);
+    assert!(raw::closed(&mut more, Duration::from_secs(3)), "{b}, of {a}'s /64 (one subscriber, as the rate limits count it), opened a third connection");
+}
+
+/// BUG-1337 (S24 cycle 1): HTTP/2 connections have no idle limit. An
+/// HTTP/1.1 connection that sends no request is closed after 20 s
+/// (BUG-825), but one that speaks HTTP/2 and answers the server's pings
+/// keeps its connection slot for ever without sending a request: an
+/// eighth of `--max-connections` per address (all of them from 8
+/// addresses, or one IPv6 /64 by BUG-1336), held at no cost but a ping
+/// every 20 s. Every connection slot must come back in bounded time.
+#[test]
+#[ignore = "BUG-1337: an idle HTTP/2 connection that answers pings keeps its connection slot for ever"]
+fn bug_1337_an_idle_http2_connection_keeps_its_slot_for_ever() {
+    use std::io::{Read, Write};
+    let hub = TestHub::start_with_limits(Settings { max_connections: 16, ..TestHub::limits() });
+    let server: std::net::SocketAddr = hub.authority().parse().unwrap();
+    let mut s = raw::tls(raw::tcp("127.0.0.1".parse().unwrap(), server));
+    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").unwrap();
+    s.write_all(&raw::frame(4, 0, 0, &[])).unwrap();
+    s.flush().unwrap();
+    s.sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    let start = Instant::now();
+    let (mut spoke_h2, mut pings, mut buf) = (false, 0, Vec::new());
+    let closed = loop {
+        if start.elapsed() > Duration::from_secs(50) {
+            break None;
+        }
+        while buf.len() >= 9 {
+            let len = u32::from_be_bytes([0, buf[0], buf[1], buf[2]]) as usize;
+            if buf.len() < 9 + len {
+                break;
+            }
+            let (kind, flags, payload) = (buf[3], buf[4], buf[9..9 + len].to_vec());
+            buf.drain(..9 + len);
+            match (kind, flags & 1) {
+                (4, 0) => {
+                    spoke_h2 = true;
+                    s.write_all(&raw::frame(4, 1, 0, &[])).unwrap();
+                }
+                (6, 0) => {
+                    pings += 1;
+                    s.write_all(&raw::frame(6, 1, 0, &payload)).unwrap();
+                }
+                _ => {}
+            }
+            s.flush().unwrap();
+        }
+        let mut chunk = [0u8; 4096];
+        match s.read(&mut chunk) {
+            Ok(0) => break Some(start.elapsed()),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(_) => break Some(start.elapsed()),
+        }
+    };
+    eprintln!("an idle HTTP/2 connection: closed {closed:?}, {pings} pings answered");
+    assert!(spoke_h2, "the server spoke HTTP/2");
+    assert!(closed.is_some_and(|t| t < Duration::from_secs(45)), "still open after {:?} ({pings} pings answered), no request sent", start.elapsed());
+}
+
+/// BUG-1338 (S24 cycle 1): a session this server has not met yet costs its
+/// address's anonymous rate (20 a second), so signed-in people behind one
+/// address (an office's NAT, a CI fleet) are refused on a server new to
+/// their sessions: the second server of a deployment, or the first after a
+/// restart or once the session cache has evicted them. 40 people sign in
+/// through the first server within the address's rate; their first
+/// requests to a second server, at once, are refused `429` past the 20th,
+/// though each person is far within the device rate.
+#[test]
+#[ignore = "BUG-1338: a known person's first request to a server that has not cached their session is charged to their address"]
+fn bug_1338_signed_in_people_behind_one_address_are_refused_on_a_server_new_to_them() {
+    let hub = TestHub::start_with_limits(Settings::default());
+    let api = hub.api();
+    let tokens: Vec<String> = (0..40)
+        .map(|_| {
+            std::thread::sleep(Duration::from_millis(150));
+            let t = signed_up(&api);
+            let r = api.get(Some(&t), "/v1/epochs");
+            assert_eq!(r.status, 200, "each person uses the first server: {}", String::from_utf8_lossy(&r.body));
+            t
+        })
+        .collect();
+    let second = TestHub::beside(&hub);
+    std::thread::sleep(Duration::from_millis(1500));
+    let api2 = second.api();
+    let answers: Vec<u16> = std::thread::scope(|s| {
+        let asked: Vec<_> = tokens.iter().map(|t| s.spawn(|| api2.get(Some(t), "/v1/epochs").status)).collect();
+        asked.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let refused = answers.iter().filter(|s| **s == 429).count();
+    assert!(answers.iter().all(|s| *s == 200 || *s == 429), "{answers:?}");
+    assert_eq!(refused, 0, "{refused} of 40 signed-in people refused on their first request to the second server: {answers:?}");
+}

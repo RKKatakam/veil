@@ -56,16 +56,22 @@ impl TestHub {
     /// A server whose objects are in the S3 store at `endpoint` (MinIO, or
     /// something in front of it), or in a temporary directory.
     pub fn start_with_s3(database_url: &str, ttl: Duration, endpoint: Option<String>) -> TestHub {
-        TestHub::start_with(database_url, ttl, endpoint, TestHub::limits())
+        TestHub::start_with(database_url, ttl, endpoint, TestHub::limits(), "127.0.0.1:0".parse().unwrap())
     }
 
     /// A server with `limits` (S24's tests).
     pub fn start_with_limits(limits: veil_server::limits::Settings) -> TestHub {
-        let url = std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL (run scripts/verify-server.sh)");
-        TestHub::start_with(&url, Duration::from_secs(3600), std::env::var("VEIL_TEST_S3_ENDPOINT").ok(), limits)
+        TestHub::start_with_limits_on("127.0.0.1:0".parse().unwrap(), limits)
     }
 
-    fn start_with(database_url: &str, ttl: Duration, endpoint: Option<String>, limits: veil_server::limits::Settings) -> TestHub {
+    /// A server with `limits`, listening on `listen` (S24 cycle 1's review:
+    /// an IPv6 address).
+    pub fn start_with_limits_on(listen: std::net::SocketAddr, limits: veil_server::limits::Settings) -> TestHub {
+        let url = std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL (run scripts/verify-server.sh)");
+        TestHub::start_with(&url, Duration::from_secs(3600), std::env::var("VEIL_TEST_S3_ENDPOINT").ok(), limits, listen)
+    }
+
+    fn start_with(database_url: &str, ttl: Duration, endpoint: Option<String>, limits: veil_server::limits::Settings, listen: std::net::SocketAddr) -> TestHub {
         let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
         let storage = match endpoint {
             Some(endpoint) => Storage::S3 {
@@ -78,7 +84,7 @@ impl TestHub {
             None => Storage::Dir(dir.path().join("objects")),
         };
         let config = Config {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen,
             database_url: database_url.to_string(),
             storage,
             tls: TlsSource::SelfSigned,
