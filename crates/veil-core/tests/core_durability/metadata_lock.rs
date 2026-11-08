@@ -182,11 +182,11 @@ fn grant_racing_lock_free_commits() {
 }
 
 /// BUG-1294: under load (about 1 run in 70 with the machine's load near
-/// 100), a lock-free commit's tag names a tree without the file the
+/// 100), a lock-free commit's tag named a tree without the file the
 /// commit wrote (`["f0-0", "f0-2"]` for `c0-1`), on the memory backend:
-/// on `integration` as on this branch. Many rounds of the race above.
+/// a merge after a criss-cross of settlers kept a workspace's older
+/// working copy. Many rounds of the race above.
 #[test]
-#[ignore = "BUG-1294: a lock-free commit racing grants and a pull can lose its own file"]
 fn bug_1294_lock_free_commits_keep_their_files() {
     for _ in 0..200 {
         grant_race(Arc::new(MemoryBackend::new()), None);
