@@ -1328,3 +1328,361 @@ fn an_agent_session_creates_a_new_projects_default_branch_only_without_access_fi
     assert_eq!(r.status, 200, "{}", body(&r));
     assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "a first main without access files: {}", body(&r));
 }
+
+// ---- S11 review, cycle 1 of the redesign (BUG-1536..1539) ----------------------------
+
+/// Rule 1 for search: a narrowed session's ranked results inside its paths
+/// are a function of what lies inside them alone. A file added outside its
+/// paths (one its person may read) leaves them as they were.
+#[test]
+#[ignore = "BUG-1536: search's ranking counts every document of the person's index, outside the narrowing too"]
+fn a_narrowed_sessions_search_results_do_not_depend_on_files_outside_its_paths() {
+    use std::time::{Duration, Instant};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    with_api_folder(&hub, &p);
+    let token = p.dev.token();
+    let narrow = agent_token(&hub, &token, &p.name, &["src/api"]);
+    // The narrowed search, once the index covers the tip it is asked at.
+    let settled = |old_tip: Option<&str>| -> Value {
+        let end = Instant::now() + Duration::from_secs(120);
+        loop {
+            let r = q(&hub, Some(&narrow), &p.name, "search", "q=marker-inside-1c&path=src/api");
+            if r.status == 200 && r.json()["behind"] == false && old_tip.is_none_or(|t| r.json()["tip_id"] != t) && r.json()["files"] == 1 {
+                return r.json();
+            }
+            assert!(Instant::now() < end, "never indexed: {} {}", r.status, body(&r));
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    let before = settled(None);
+    assert_eq!(before["results"][0]["path"], "src/api/h.rs", "{before}");
+    // The person adds files outside the session's paths.
+    let base = tip(&hub, &token, &p.name);
+    let r = change(
+        &hub,
+        &token,
+        &p.name,
+        &json!({"base": base.hex(), "description": "outside", "onto": {"branch": "main", "expected": base.hex()},
+                "edits": [{"path": "src/other-a.rs", "put": {"text": "marker-inside-1c marker-inside-1c\n".repeat(50)}},
+                          {"path": "src/other-b.rs", "put": {"text": "marker-inside-1c\n"}}]}),
+    );
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["branch"]["status"], "ok", "{}", body(&r));
+    let after = settled(before["tip_id"].as_str());
+    assert_eq!(before["results"], after["results"], "the results inside the narrowing changed with files outside it");
+}
+
+/// Rule 1 for every route that takes a path, not only `q/`: the access
+/// route's `path` outside a narrowed session's paths gets the one refusal
+/// the query routes give, whether the person may read it, and whether it
+/// exists.
+#[test]
+#[ignore = "BUG-1537: the access route (and the rings and shares routes) answer a narrowed session about paths outside its paths"]
+fn a_narrowed_sessions_access_route_answers_one_way_outside_its_paths() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    with_api_folder(&hub, &p);
+    let narrow = agent_token(&hub, &p.dev.token(), &p.name, &["src/api"]);
+    let api = hub.api();
+    // Control: inside its paths, the person's answer.
+    let r = api.get(Some(&narrow), &format!("/v1/projects/{}/access?path=src/api/h.rs", p.name));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    // The query routes' refusal of a path outside.
+    let refusal = q(&hub, Some(&narrow), &p.name, "file", "path=src/other.rs");
+    assert_eq!(refusal.status, 403, "{}", body(&refusal));
+    for path in ["src/other.rs", "src/no-such-path-6f.rs", BILL_DIR, &format!("src/{NESTED_DIR}")] {
+        let r = api.get(Some(&narrow), &format!("/v1/projects/{}/access?path={path}", p.name));
+        assert_eq!((r.status, body(&r)), (refusal.status, body(&refusal)), "access?path={path}");
+    }
+}
+
+/// Rule 3, the accepted text: an agent session recreating a deleted default
+/// branch never sets a `.veilpolicy` other than the one the branch last
+/// carried. The accepted text is updated only when access lines change, so
+/// it may be an older text than the branch's (a tier line added since).
+#[test]
+#[ignore = "BUG-1538: a recreated default branch is compared with the last accepted text, which tier-line changes never update"]
+fn an_agent_session_never_recreates_the_default_branch_with_an_older_policy_text() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let atok = p.admin.token();
+    let older = tip(&hub, &atok, &p.name);
+    // The admin adds a tier line (no access line changes: not re-accepted).
+    let policy = std::fs::read_to_string(p.dir.join(".veilpolicy")).unwrap();
+    let mut own = Craft::new(&api, &p.admin, &p.name, "main");
+    own.file(".veilpolicy", &format!("{policy}src/api/generated/  ignore\n"));
+    let r = own.push_to("main", Some(older));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", body(&r));
+    let newer = tip(&hub, &atok, &p.name);
+    // The admin deletes main.
+    let r = api.post_json(Some(&atok), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": newer.hex(), "new": null}]}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "the admin deletes main: {}", body(&r));
+    // The admin's agent session creates main at the snapshot before the
+    // tier line: its `.veilpolicy` is not the one main last carried.
+    let agent = agent_token(&hub, &atok, &p.name, &[]);
+    let r = api.post_json(Some(&agent), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": null, "new": older.hex()}]}));
+    let refused = (r.status == 403 && body(&r).contains("agent_session")) || (r.status == 200 && r.json()["results"][0]["ok"] == false);
+    assert!(refused, "the agent recreated main with an older .veilpolicy: {} {}", r.status, body(&r));
+    assert!(!api.tips(Some(&atok), &p.name).unwrap().branches.contains_key("main"), "main was created");
+}
+
+/// Rule 2, before the graft's own answers: a narrowed session's pushed
+/// snapshot that writes outside its paths gets one answer, whether its
+/// person may read the outside path or not.
+#[test]
+#[ignore = "BUG-1539: the graft's per-path refusal answers before the narrowing gate"]
+fn a_narrowed_sessions_push_outside_gets_one_answer_whatever_its_person_may_read_there() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    with_api_folder(&hub, &p);
+    let api = hub.api();
+    let narrow = agent_token(&hub, &p.dev.token(), &p.name, &["src/api"]);
+    let mut answers = Vec::new();
+    for path in ["src/other.rs".to_string(), format!("{BILL_DIR}/x.txt"), format!("src/{NESTED_DIR}/x.txt"), format!("{PERSON_DIR}/x.txt")] {
+        let mut c = Craft::with(&api, narrow.clone(), p.dev.identity(), &p.name, "main");
+        let t = c.tip;
+        c.file(&path, "x");
+        let r = c.push_to("main", Some(t));
+        assert_eq!(r.status, 403, "{path}: {}", body(&r));
+        assert!(body(&r).contains("agent_session"), "{path}: {}", body(&r));
+        answers.push((path, body(&r)));
+    }
+    for (path, a) in &answers {
+        assert_eq!(a, &answers[0].1, "{path}");
+    }
+}
+
+/// Rule 3, the comparison itself: a recreated default branch passes only
+/// with a root `.veilpolicy` of exactly the accepted bytes, as a plain file.
+/// A trailing byte, a byte-order mark, another `.veilpolicy` in a folder or
+/// the accepted text as a symbolic link are each refused; the exact text
+/// is allowed (the control, last).
+#[test]
+fn a_recreated_default_branch_passes_only_with_the_accepted_policy_byte_for_byte() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let atok = p.admin.token();
+    let tip0 = tip(&hub, &atok, &p.name);
+    let policy = std::fs::read_to_string(p.dir.join(".veilpolicy")).unwrap();
+    let agent = agent_token(&hub, &atok, &p.name, &[]);
+    let craft = || Craft::with(&api, agent.clone(), p.admin.identity(), &p.name, "main");
+    let mut variants = Vec::new();
+    let mut c = craft();
+    c.file(".veilpolicy", &format!("{policy}\n"));
+    variants.push(("a trailing byte", c));
+    let mut c = craft();
+    c.file(".veilpolicy", &format!("\u{feff}{policy}"));
+    variants.push(("a byte-order mark", c));
+    let mut c = craft();
+    c.file("src/.veilpolicy", &policy);
+    variants.push(("a .veilpolicy in a folder", c));
+    let mut c = craft();
+    c.set_kind(".veilpolicy", O::Blob(policy.as_bytes().to_vec()), veil_core::object::EntryKind::Symlink, veil_core::object::Visibility::Public);
+    variants.push(("the text as a symbolic link", c));
+    let mut control = craft();
+    control.file("src/recreated.rs", "fn r() {}");
+    // The admin deletes main.
+    let r = api.post_json(Some(&atok), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": tip0.hex(), "new": null}]}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "the admin deletes main: {}", body(&r));
+    for (what, c) in variants {
+        let r = c.push_to("main", None);
+        assert!(r.status == 403, "{what}: {} {}", r.status, body(&r));
+        assert!(!api.tips(Some(&atok), &p.name).unwrap().branches.contains_key("main"), "{what}: main was created");
+    }
+    let r = control.push_to("main", None);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "control: the accepted text exactly: {}", body(&r));
+}
+
+/// Rule 1, mechanically: every route the server answers is classified here
+/// by what it does with a path or a revision, and a route added without a
+/// class fails this test. Each query route that takes a path must take it
+/// through `Ask::file_path` (the log through `Ask::log_path`); the routes
+/// that read the tree by path (`fetch`) or write (`push`, `changes`) must
+/// decide the narrowing. Routes that take a path and are not narrowed yet
+/// are listed as open, with their bug (BUG-1537), so that fixing them moves
+/// them to a narrowed class.
+#[test]
+fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
+    const API: &str = include_str!("../../src/api.rs");
+    const QUERY: &str = include_str!("../../src/query/mod.rs");
+    const SEARCH: &str = include_str!("../../src/search/mod.rs");
+    const SYNC: &str = include_str!("../../src/sync.rs");
+    const CHANGES: &str = include_str!("../../src/changes.rs");
+    // (route, class): "path" a query route taking a path (its function must
+    // call `file_path` or `log_path`); "rev" revisions of the person's
+    // history only; "tree" serves the tree by path (narrowed in `fetch`);
+    // "write" (narrowed in push and changes); "person" refused to agent
+    // sessions (`person_only`); "none" takes neither; "open:BUG-NNN" takes a
+    // path, not narrowed yet.
+    let classes: &[(&str, &str)] = &[
+        ("/v1/auth/challenge", "none"),
+        ("/v1/auth/login", "none"),
+        ("/v1/sessions/agent", "person"),
+        ("/v1/people/{name}/devices", "none"),
+        ("/v1/people/{name}/pending/{fingerprint}", "none"),
+        ("/v1/devices/vouch", "person"),
+        ("/v1/devices/remove", "person"),
+        ("/v1/projects/{p}/invites", "person"),
+        ("/v1/projects/{p}/invites/join", "person"),
+        ("/v1/projects/{p}/keys/pending", "person"),
+        ("/v1/projects/{p}", "person"),
+        ("/v1/projects/{p}/tips", "rev"),
+        ("/v1/projects/{p}/history", "rev"),
+        ("/v1/projects/{p}/fetch", "tree"),
+        ("/v1/projects/{p}/objects", "none"),
+        ("/v1/projects/{p}/push", "write"),
+        ("/v1/projects/{p}/changes", "write"),
+        ("/v1/projects/{p}/access", "open:BUG-1537"),
+        ("/v1/projects/{p}/groups", "none"),
+        ("/v1/projects/{p}/groups/{g}", "person"),
+        ("/v1/projects/{p}/groups/{g}/members", "person"),
+        ("/v1/projects/{p}/groups/{g}/members/remove", "person"),
+        ("/v1/projects/{p}/groups/{g}/managers", "person"),
+        ("/v1/projects/{p}/rings", "open:BUG-1537"),
+        ("/v1/projects/{p}/rings/{scope}", "open:BUG-1537"),
+        ("/v1/projects/{p}/shares", "open:BUG-1537"),
+        ("/v1/projects/{p}/shares/remove", "person"),
+        ("/v1/objects/{p}/{id}", "none"),
+        ("/v1/objects/{target}", "none"),
+        ("/v1/epochs", "none"),
+        ("/v1/cache/epochs", "none"),
+        ("/v1/projects/{p}/q/log", "path"),
+        ("/v1/projects/{p}/q/show", "path"),
+        ("/v1/projects/{p}/q/tree", "path"),
+        ("/v1/projects/{p}/q/file", "path"),
+        ("/v1/projects/{p}/q/diff", "path"),
+        ("/v1/projects/{p}/q/ancestry", "rev"),
+        ("/v1/projects/{p}/q/resolve", "rev"),
+        ("/v1/projects/{p}/q/generations", "rev"),
+        ("/v1/projects/{p}/q/search", "path"),
+        ("/v1/projects/{p}/q/grep", "path"),
+    ];
+    let routes: Vec<&str> = API.split(".route(\"").skip(1).map(|s| s.split('"').next().unwrap()).collect();
+    assert!(routes.len() >= 40, "the router was not read: {routes:?}");
+    for r in &routes {
+        assert!(classes.iter().any(|(c, _)| c == r), "route {r} is not classified: decide how it treats a narrowed session");
+    }
+    for (c, _) in classes {
+        assert!(routes.contains(c), "{c} is classified but not routed");
+    }
+    // The body of `fn name` in `src`, up to the next item.
+    let body_of = |src: &'static str, name: &str| -> &'static str {
+        let start = src.find(&format!("pub async fn {name}(")).unwrap_or_else(|| panic!("no fn {name}"));
+        let rest = &src[start + 1..];
+        let end = ["\npub async fn ", "\nasync fn ", "\npub fn ", "\nfn ", "\n#[derive"].iter().filter_map(|m| rest.find(m)).min().unwrap_or(rest.len());
+        &rest[..end]
+    };
+    for (f, src) in [("log", QUERY), ("show", QUERY), ("tree", QUERY), ("file", QUERY), ("diff", QUERY), ("search", SEARCH), ("grep", SEARCH)] {
+        let b = body_of(src, f);
+        assert!(b.contains("ask.file_path(") || b.contains("ask.log_path("), "query route {f} takes its path without Ask::file_path");
+    }
+    assert!(SYNC.contains("let narrowed_dir = !view.within_narrowing(&w.path);"), "fetch serves the tree without the narrowing");
+    assert!(SYNC.contains("narrowing_gate(&view, &g.changes)?"), "complete does not run the narrowing gate after the graft");
+    assert!(body_of(CHANGES, "create").contains("within_narrowing"), "an API commit's edits are not narrowed");
+}
+
+/// Rule 2, the kinds the cycle-4 test leaves out: a rename into or out of
+/// the narrowing, a mode change outside, and a merge whose tree takes
+/// another parent's change outside each get the one refusal a plain file
+/// outside gets; a write inside only still lands (the control, last).
+#[test]
+fn a_narrowed_sessions_renames_mode_changes_and_merges_outside_get_the_one_refusal() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    with_api_folder(&hub, &p);
+    let api = hub.api();
+    let atok = p.admin.token();
+    // The admin's draft of a file outside the narrowing.
+    let mut d = Craft::new(&api, &p.admin, &p.name, "main");
+    d.file("src/other.rs", "fn o() {} // the admin's draft");
+    let r = d.push_to("draft-r4", None);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", body(&r));
+    let draft = api.tips(Some(&atok), &p.name).unwrap().branches["draft-r4"];
+    let narrow = agent_token(&hub, &p.dev.token(), &p.name, &["src/api"]);
+    let craft = || Craft::with(&api, narrow.clone(), p.dev.identity(), &p.name, "main");
+    let theirs = Craft::with(&api, narrow.clone(), p.dev.identity(), &p.name, "draft-r4").entry("src/other.rs").expect("the draft's entry");
+    let mut answers = Vec::new();
+    // A plain file outside: the answer every other kind must equal.
+    let mut c = craft();
+    let t = c.tip;
+    c.file("src/other.rs", "changed");
+    answers.push(("a file", c.push_to("main", Some(t))));
+    // A rename out of the narrowing.
+    let mut c = craft();
+    let t = c.tip;
+    let h = c.entry("src/api/h.rs").unwrap();
+    c.remove("src/api/h.rs");
+    c.set_entry("src/moved-h.rs", h);
+    answers.push(("a rename out", c.push_to("main", Some(t))));
+    // A rename into it.
+    let mut c = craft();
+    let t = c.tip;
+    let o = c.entry("src/other.rs").unwrap();
+    c.remove("src/other.rs");
+    c.set_entry("src/api/other.rs", o);
+    answers.push(("a rename in", c.push_to("main", Some(t))));
+    // A mode change outside.
+    let mut c = craft();
+    let t = c.tip;
+    let mut o = c.entry("src/other.rs").unwrap();
+    o.executable = true;
+    c.set_entry("src/other.rs", o);
+    answers.push(("a mode change", c.push_to("main", Some(t))));
+    // A merge whose tree takes the draft's change outside.
+    let mut c = craft();
+    c.set_entry("src/other.rs", theirs);
+    c.file("src/api/m.rs", "m");
+    answers.push(("a merge taking theirs", c.push_merge("main", &[draft])));
+    let first = body(&answers[0].1);
+    assert_eq!(answers[0].1.status, 403, "{first}");
+    assert!(first.contains("agent_session") && !first.contains("src/"), "{first}");
+    for (what, r) in &answers {
+        assert_eq!((r.status, body(r)), (403, first.clone()), "{what}");
+    }
+    // Control: a write inside its paths lands.
+    let mut c = craft();
+    let t = c.tip;
+    c.file("src/api/inside.rs", "fn i() {}");
+    let r = c.push_to("main", Some(t));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "control: {}", body(&r));
+}
+
+/// Rule 2, a merge parent whose changes lie outside the narrowing: a
+/// narrowed session's merge that keeps its own side outside still records
+/// the other parent as merged, so the person's later merge of that parent
+/// finds nothing to do and its change outside never lands. A narrowed
+/// session never decides how changes outside its paths merge.
+#[test]
+#[ignore = "BUG-1540: a narrowed session's merge of a parent whose changes lie outside its paths lands"]
+fn a_narrowed_session_never_merges_a_parent_whose_changes_lie_outside_its_paths() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    with_api_folder(&hub, &p);
+    let api = hub.api();
+    let atok = p.admin.token();
+    let mut d = Craft::new(&api, &p.admin, &p.name, "main");
+    d.file("src/other.rs", "fn o() {} // MARKER-DRAFT-FIX-4e");
+    let r = d.push_to("draft-r4b", None);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", body(&r));
+    let draft = api.tips(Some(&atok), &p.name).unwrap().branches["draft-r4b"];
+    let narrow = agent_token(&hub, &p.dev.token(), &p.name, &["src/api"]);
+    let mut c = Craft::with(&api, narrow.clone(), p.dev.identity(), &p.name, "main");
+    c.file("src/api/m.rs", "m");
+    let r = c.push_merge("main", &[draft]);
+    let refused = (r.status == 403 && body(&r).contains("agent_session")) || (r.status == 200 && r.json()["results"][0]["ok"] == false);
+    assert!(refused, "the narrowed session merged the draft, keeping main's side outside: {} {}", r.status, body(&r));
+    let main = tip(&hub, &atok, &p.name);
+    let r = hub.api().post_json(Some(&atok), &format!("/v1/projects/{}/q/ancestry", p.name), &json!({"pairs": [[draft.hex(), main.hex()]]}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["results"][0]["is_ancestor"], false, "the draft is now merged into main without its change");
+}

@@ -988,6 +988,41 @@ impl Craft<'_> {
         self.root = self.set_at("", Some(self.root), &parts, entry);
     }
 
+    /// The entry at `path` in the crafter's tree, if any.
+    pub fn entry(&self, path: &str) -> Option<TreeEntry> {
+        let parts: Vec<&str> = path.split('/').collect();
+        let (mut dir, mut id) = (String::new(), self.root);
+        for (i, part) in parts.iter().enumerate() {
+            let e = self.tree(&dir, id).get(part).cloned()?;
+            if i + 1 == parts.len() {
+                return Some(e);
+            }
+            dir = if dir.is_empty() { part.to_string() } else { format!("{dir}/{part}") };
+            id = e.id;
+        }
+        None
+    }
+
+    /// Remove the entry at `path` (a file or a folder) from the crafter's tree.
+    pub fn remove(&mut self, path: &str) {
+        let parts: Vec<&str> = path.split('/').collect();
+        self.root = self.remove_at("", self.root, &parts);
+    }
+
+    fn remove_at(&mut self, dir: &str, tree: ObjectId, parts: &[&str]) -> ObjectId {
+        let mut t = self.tree(dir, tree);
+        if parts.len() > 1 {
+            let child = t.get(parts[0]).filter(|e| e.kind == K::Dir).map(|e| e.id).expect("a folder on the way");
+            let sub = if dir.is_empty() { parts[0].to_string() } else { format!("{dir}/{}", parts[0]) };
+            let id = self.remove_at(&sub, child, &parts[1..]);
+            t.remove(parts[0]);
+            t.insert(TreeEntry::dir(parts[0], id));
+        } else {
+            assert!(t.remove(parts[0]).is_some(), "nothing at {dir}/{}", parts[0]);
+        }
+        self.put(O::Tree(t))
+    }
+
     /// The root tree of snapshot `id` (one the crafter was given).
     pub fn tree_of(&self, id: ObjectId) -> ObjectId {
         let h = self.api.post_json(Some(&self.token), &format!("/v1/projects/{}/history", self.project), &serde_json::json!({"tips": [id.hex()]}));
