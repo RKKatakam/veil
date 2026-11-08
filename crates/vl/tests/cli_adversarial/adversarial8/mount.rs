@@ -390,17 +390,10 @@ fn a_mount_inside_another_project_is_never_recorded_by_it() {
     let mnt = oss.join("scratch-mount");
     let out = env.vl(U, &secret, &["ws", "mount", "view", mnt.to_str().unwrap()]);
     let _g = Mounted(mnt.clone());
-    if !out.status.success() {
-        return; // refused: the correct outcome
-    }
-    assert_eq!(read(&mnt, "internal/.env.plan"), format!("{CLOAKED}\n"));
+    // Refused: the correct outcome.
+    assert!(!out.status.success() && text(&out).contains("is inside the Veil repository"), "{}", text(&out));
     env.ok(U, &oss, &["status"]);
-    let recorded = super::cat(&env, U, &oss, "@", "scratch-mount/internal/.env.plan");
-    let _ = env.vl(U, &secret, &["ws", "unmount", "view"]);
-    assert!(
-        !recorded.as_deref().unwrap_or_default().contains(CLOAKED),
-        "the public project recorded the other project's cloaked plaintext from the mount: {recorded:?}"
-    );
+    assert!(super::cat(&env, U, &oss, "@", "scratch-mount/internal/.env.plan").is_none(), "the public project recorded a file under the refused mount");
 }
 
 /// `readdir` answers by index into a listing recomputed for every request,

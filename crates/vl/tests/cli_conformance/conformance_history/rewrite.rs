@@ -121,13 +121,9 @@ fn rebase_with_a_repeated_destination_records_one_parent() {
     let env = Env::new();
     let r = chain(&env);
     r.write("wip", "w\n");
-    let out = r.run(&["rebase", "-s", "@", "-d", "a", "-d", "a"]);
-    if out.status.success() {
-        let s = r.snap("@");
-        let mut uniq = s.parents.clone();
-        uniq.dedup();
-        assert_eq!(uniq.len(), s.parents.len(), "duplicate parents: {s:?}");
-    }
+    r.ok(&["rebase", "-s", "@", "-d", "a", "-d", "a"]);
+    let s = r.snap("@");
+    assert_eq!(s.parents, vec![r.sid("a")], "duplicate parents: {s:?}");
 }
 
 // Scenario from git t3425-rebase-topology-merges.sh / jj test_rebase_single_revision_merge_parent: flatten a merge.

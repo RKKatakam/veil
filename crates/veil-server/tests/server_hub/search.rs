@@ -711,6 +711,21 @@ fn search_hostile_inputs_are_bounded() {
 /// content is found by nobody, its name by those who see its folder; a
 /// hidden match and no match give the same body; `vl search` prints
 /// the same; someone removed from a group loses its folder at once.
+/// `api.get`, asked again while the server answers 503 (`deadline`,
+/// `indexing`, `warming`: each says "try again"), for at most 120 s, as a
+/// client does (BUG-1174: under a loaded machine an answer passed the 2 s
+/// deadline and the test read an error as an answer).
+fn settled(api: &Api, token: Option<&str>, path: &str) -> Reply {
+    let end = Instant::now() + Duration::from_secs(120);
+    loop {
+        let r = api.get(token, path);
+        if r.status != 503 || Instant::now() >= end {
+            return r;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 fn search_routes_serve_each_person_their_part() {
     let th = TestHub::start();
@@ -741,13 +756,13 @@ fn search_routes_serve_each_person_their_part() {
         let t = token.as_deref();
         let mut bodies = Vec::new();
         for m in markers {
-            let r = api.get(t, &format!("{base}/search?q={m}"));
+            let r = settled(&api, t, &format!("{base}/search?q={m}"));
             assert_eq!(r.status, 200, "{who}: {}", String::from_utf8_lossy(&r.body));
             let found = r.json()["files"].as_u64().unwrap();
             assert_eq!(found == 1, !hidden.contains(&m), "{who}: {m}: {}", String::from_utf8_lossy(&r.body));
             if hidden.contains(&m) {
                 // A hidden match and no match: the same answer.
-                let none = api.get(t, &format!("{base}/search?q=no-such-word-{}", &m[..6]));
+                let none = settled(&api, t, &format!("{base}/search?q=no-such-word-{}", &m[..6]));
                 let strip = |b: &[u8]| {
                     let mut v: Value = serde_json::from_slice(b).unwrap();
                     v.as_object_mut().unwrap().remove("query");
@@ -757,7 +772,7 @@ fn search_routes_serve_each_person_their_part() {
             } else {
                 bodies.push(r.body);
             }
-            let g = api.get(t, &format!("{base}/grep?pattern={m}"));
+            let g = settled(&api, t, &format!("{base}/grep?pattern={m}"));
             assert_eq!(g.status, 200, "{who}");
             if hidden.contains(&m) {
                 assert!(g.json()["files"].as_array().unwrap().is_empty(), "{who}: {m}");
@@ -765,10 +780,10 @@ fn search_routes_serve_each_person_their_part() {
             bodies.push(g.body);
         }
         for q in ["md", "txt", "env", "acme", "notes", "lib", "key"] {
-            bodies.push(api.get(t, &format!("{base}/search?q={q}&kind=path")).body);
-            bodies.push(api.get(t, &format!("{base}/grep?pattern=.&path=src")).body);
+            bodies.push(settled(&api, t, &format!("{base}/search?q={q}&kind=path")).body);
+            bodies.push(settled(&api, t, &format!("{base}/grep?pattern=.&path=src")).body);
         }
-        let env = api.get(t, &format!("{base}/search?q=.env&kind=path")).json();
+        let env = settled(&api, t, &format!("{base}/search?q=.env&kind=path")).json();
         let sees = env["results"].as_array().unwrap().iter().any(|r| r["path"] == format!("{BILL_DIR}/.env"));
         assert_eq!(sees, matches!(*who, "fin" | "admin"), "{who}: {env}");
         // What they asked for is echoed; the rest is what they were given.
