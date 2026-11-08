@@ -706,6 +706,42 @@ fn blame_speed() {
     }
 }
 
+/// BUG-1214 (open, for S16): a first blame's job costs more than its gate
+/// allows (1 s for 10,000 versions of a 5,000-line file: 0.1 ms a version).
+/// Here: 300 versions of a 5,000-line file, one job from nothing, timed.
+#[test]
+#[ignore = "BUG-1214: a first blame's job costs about 2 ms a version of a 5,000-line file, against the gate's 0.1 ms (1 s at 10,000 versions)"]
+fn bug_1214_a_first_blame_costs_more_than_its_gate() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &policy_text, &bindings);
+    let mut rng = Rng::new(1214);
+    let mut body: Vec<String> = (0..5000).map(|i| format!("fn line_{i}() {{ let x = {}; }}\n", rng.next() % 100_000)).collect();
+    let mut f = Files::new();
+    let mut tip = root_snapshot_id();
+    let versions = 300usize;
+    for i in 0..versions {
+        for _ in 0..1 + rng.below(3) {
+            let k = rng.below(body.len());
+            body[k] = format!("fn line_{k}() {{ edited({i}); }}\n");
+        }
+        f.insert("pub/hot.rs".into(), body.concat().into_bytes());
+        tip = h.commit(&th, &[tip], f.clone(), [(i % 200) as u8 + 1; 16], 1_700_000_000_000 + i as i64 * 1000, None);
+    }
+    h.set_branch(&th, "main", tip);
+    let viewer = Viewer::default();
+    let a = ask(&th, &h, &viewer);
+    warm_up(&th, &h, &viewer);
+    let t = Instant::now();
+    let (v, blamed) = from_nothing(&th, &h, &a, || BlameParams { path: "pub/hot.rs".into(), n: Some(1), ..Default::default() });
+    let took = t.elapsed();
+    assert_eq!(v["line_count"], 5000);
+    assert_eq!(blamed, versions as u64);
+    let per = took / versions as u32;
+    println!("bug_1214: {versions} versions in {took:?}: {per:?} a version (gate: 100 µs)");
+    assert!(per <= Duration::from_micros(100), "{per:?} a version");
+}
+
 // ---- S14 cycle 1: adversarial review ---------------------------------------------------
 
 mod s14c1_adversarial {
@@ -1444,7 +1480,12 @@ mod s14c3_adversarial {
         let file = body.len();
         let largest = sizes.iter().copied().max().unwrap_or(0);
         let total: usize = sizes.iter().sum();
-        let bound = |lines: usize| veil_server::derive::blame::BASE_BYTES + veil_server::derive::blame::MAX_BYTES_PER_LINE * lines;
+        // Its 400 lines come from 400 changes: what an answer shows of each
+        // is kept with it too.
+        let bound = |lines: usize| {
+            use veil_server::derive::blame::{BASE_BYTES, MAX_BYTES_PER_CHANGE, MAX_BYTES_PER_LINE};
+            BASE_BYTES + (MAX_BYTES_PER_LINE + MAX_BYTES_PER_CHANGE) * lines
+        };
         println!("bug_1217: a {file}-byte file at a {}-byte path: {} kept blames, the largest {largest} bytes (bound {}), {total} bytes in all (memory bound {held})", path.len(), sizes.len(), bound(400));
         assert!(!sizes.is_empty(), "nothing kept");
         assert!(largest <= bound(400), "a kept blame of {largest} bytes for 400 lines");

@@ -1750,6 +1750,14 @@ Review cycle 3 (the last; layer 3, tier A, Deep; new diff only) of milestone S14
 * **Guarantee 4, concurrency.** Records are written `ON CONFLICT DO NOTHING` and never changed, kept blames are content-addressed and a function of the version alone, and a record's versions carry what a fresh walk derives. `s14c3_blames_resumed_at_once_on_two_servers_keep_only_right_blames`: six requests on two servers, each with its own small budgets, resume the same blame at once (a chain, diamonds, renamed merges): all answer as one unbounded request does, no two records disagree on a version, and every kept blame is the object a request from nothing keeps for that version; 16 runs, 8 at once, all green.
 * **Guarantee 5 otherwise:** a blame object is decoded with at most `MAX_LINES` lines, and only plain public blobs of at most 1 MiB are read, on every path.
 
+### S14 speed (for S16)
+
+Measured by S14's cycle-3 speed fixes (`blame_speed`, release, through `bench-quiet.sh`, 10,000 versions of a 5,000-line file). Precomputed blame meets its target (18.1 / 21.3 ms p99 for an admin, 25.4 / 40.4 ms for anyone on Earth, against 50 ms); the first blame does not.
+
+| ID | Sev. | Area | Finding | Root cause | Reproducing tests |
+|---|---|---|---|---|---|
+| BUG-1214 | low (open; speed gate, not correctness: requests answer `warming` within their deadline and the job finishes in the background; goes to S16's speed work) | server / blame jobs | **The first blame of a long history misses its gate (1 s at 10,000 versions) by about 20×:** a job blames about 2.1 ms a version of a 5,000-line file, so 10,000 versions take 21.2 s (admin) and 23.1 s (anyone on Earth), the first answer coming after 17.9 s and 20.3 s. Interning origin paths once per job and spacing checkpoints by bytes (cycle 3's fixes) changed it little (27.4 s and 21.8 s before). | Each version is read, decoded and line-split, and diffed against its parent version one after another on one thread (`Blamer::run`, `derive::blame::step`, `veil_core::blame::map_lines`); not profiled further. Suggested: compute the line maps of a job's version pairs in parallel (each depends only on its two texts; only their composition is sequential), and keep each version's line hashes beside it so that a diff neither reads nor hashes its text again. | `server_hub` `blame::bug_1214_a_first_blame_costs_more_than_its_gate` (ignored) |
+
 ## Findings from S15 (search, 2026-11-07)
 
 None open. Departures and limits are in `docs/design/server/phase-3-server-history.md` §13 (unreferenced segments wait for S29's garbage collection; descriptions are not searched; path search over 11,111 matching names takes 24 ms at p99 against the 20 ms target).

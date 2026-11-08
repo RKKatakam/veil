@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS view_file_history (
     PRIMARY KEY (project_id, view_key, path_key, depth, snapshot)
 );
 -- Kept blames (S14 cycle 3): the encoded blame (`veil-derived blame 2`,
--- at most 64 + 128 bytes a line of its version) of the version a snapshot
+-- at most 64 + 128 bytes a line of its version and 768 a change its lines
+-- name: what an answer shows of each) of the version a snapshot
 -- of a viewer's graph introduced at a path, with or without following
 -- renames; `bytes` its size, `created_at` when written (milliseconds):
 -- a project keeps at most 256 MiB of them, its oldest dropped first.
@@ -33,9 +34,11 @@ CREATE TABLE IF NOT EXISTS blame_memo (
     body BYTEA NOT NULL,
     bytes BIGINT NOT NULL,
     created_at BIGINT NOT NULL,
+    path_keys TEXT NOT NULL,
     PRIMARY KEY (project_id, view_key, path_key, follow, snapshot)
 );
--- The paths kept blames name, once per project, by key.
+-- The paths kept blames name, once per project, by key (`path_keys` above:
+-- the keys a kept blame names, comma-separated, read with it).
 CREATE TABLE IF NOT EXISTS blame_paths (
     project_id BIGINT NOT NULL,
     path_key TEXT NOT NULL,

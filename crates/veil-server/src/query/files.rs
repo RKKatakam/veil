@@ -58,7 +58,7 @@ use super::{
 };
 use crate::{
     derive::{
-        blame::{step, Blame, Text},
+        blame::{step, Blame, Meta, Origin, Text},
         changes::{self, path_key},
     },
     error::{Error, Result},
@@ -445,6 +445,19 @@ impl Default for BlameLimits {
 
 /// Bytes of kept blames one project keeps (oldest dropped first).
 pub const KEPT_BYTES: usize = 256 << 20;
+/// About the most bytes of checkpoints one job writes: checkpoints are
+/// spaced to keep to it (S14 cycle 3), at least [`CHECKPOINT`] versions
+/// apart.
+pub const JOB_CHECKPOINT_BYTES: u64 = 32 << 20;
+
+/// The spacing of checkpoints (in version depth) for a job that computes
+/// `versions` versions whose blames take about `bytes` each: a power of
+/// two, at least [`CHECKPOINT`], so that their checkpoints take about
+/// [`JOB_CHECKPOINT_BYTES`] at most (a power of two, so that jobs of
+/// different starts mostly keep the same versions).
+fn spacing(versions: u64, bytes: usize) -> u64 {
+    (versions.saturating_mul(bytes as u64) / JOB_CHECKPOINT_BYTES).max(CHECKPOINT).next_power_of_two()
+}
 /// Kept blames written at once: at most this many bytes, or [`BATCH_BLAMES`].
 const BATCH_BYTES: usize = 4 << 20;
 const BATCH_BLAMES: usize = 64;
@@ -480,12 +493,17 @@ pub struct Blamer<'f, 'g, 'a, 'h, 'b> {
     pub limits: BlameLimits,
     /// The versions kept, by path key.
     kept: HashMap<String, HashSet<ObjectId>>,
-    /// Paths by key, of kept blames read.
-    paths: HashMap<String, String>,
+    /// Every path the job's blames name, interned once (S14 cycle 3), and
+    /// the bytes they take.
+    paths: HashMap<String, Arc<str>>,
+    path_bytes: usize,
+    /// What an answer shows of each snapshot the job's blames name.
+    metas: HashMap<ObjectId, Arc<Meta>>,
     renames: HashMap<ObjectId, Option<String>>,
-    /// Kept blames to write: `(path key, snapshot, bytes)`, and the paths
-    /// they name; [`Blamer::pending_bytes`] of them.
-    writes: Vec<(String, ObjectId, Vec<u8>)>,
+    /// Kept blames to write: `(path key, snapshot, bytes, the path keys
+    /// they name)`, and the paths they name; [`Blamer::pending_bytes`] of
+    /// them.
+    writes: Vec<(String, ObjectId, Vec<u8>, String)>,
     write_paths: HashMap<String, String>,
     pending_bytes: usize,
 }
@@ -499,6 +517,8 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             limits,
             kept: HashMap::new(),
             paths: HashMap::new(),
+            path_bytes: 0,
+            metas: HashMap::new(),
             renames: HashMap::new(),
             writes: Vec::new(),
             write_paths: HashMap::new(),
@@ -528,34 +548,60 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         Ok(self.kept[&key].contains(&v.id))
     }
 
-    /// The kept blame of `v`, if it is (still) kept.
+    /// The interned path `p`.
+    fn intern(&mut self, p: &str) -> Arc<str> {
+        if let Some(a) = self.paths.get(p) {
+            return a.clone();
+        }
+        let a: Arc<str> = Arc::from(p);
+        self.path_bytes += 64 + p.len();
+        self.paths.insert(p.to_string(), a.clone());
+        a
+    }
+
+    /// What an answer shows of the viewer's snapshot `id`.
+    fn meta(&mut self, id: &ObjectId) -> Result<Arc<Meta>> {
+        if let Some(m) = self.metas.get(id) {
+            return Ok(m.clone());
+        }
+        let g = self.f.g;
+        let m = Arc::new(Meta::of(&*g.snapshot(id)?, g.get(id)?.generation));
+        self.metas.insert(*id, m.clone());
+        Ok(m)
+    }
+
+    /// The kept blame of `v`, if it is (still) kept: one statement, the
+    /// blame and the paths it names (S14 cycle 3: an answer reads nothing
+    /// else of history).
     pub fn kept_blame(&mut self, v: &Version) -> Result<Option<Blame>> {
         let g = self.f.g;
         let cx = g.cx;
         g.tick()?;
-        let body: Option<Vec<u8>> = cx.db(|| {
-            sqlx::query_scalar("SELECT body FROM blame_memo WHERE project_id = $1 AND view_key = $2 AND path_key = $3 AND follow = $4 AND snapshot = $5")
-                .bind(cx.project())
-                .bind(g.vk)
-                .bind(path_key(&v.path))
-                .bind(self.follow)
-                .bind(v.id.hex())
-                .fetch_optional(&cx.hub().db)
+        let row: Option<(Vec<u8>, Vec<String>)> = cx.db(|| {
+            sqlx::query_as(
+                "SELECT m.body, ARRAY(SELECT p.path_key || ':' || p.path FROM blame_paths p \
+                     WHERE p.project_id = m.project_id AND p.path_key = ANY(string_to_array(m.path_keys, ','))) \
+                 FROM blame_memo m WHERE m.project_id = $1 AND m.view_key = $2 AND m.path_key = $3 AND m.follow = $4 AND m.snapshot = $5",
+            )
+            .bind(cx.project())
+            .bind(g.vk)
+            .bind(path_key(&v.path))
+            .bind(self.follow)
+            .bind(v.id.hex())
+            .fetch_optional(&cx.hub().db)
         })?;
-        let Some(body) = body else { return Ok(None) };
-        let want: Vec<String> = Blame::keys(&body)?.into_iter().filter(|k| !self.paths.contains_key(k)).collect::<HashSet<_>>().into_iter().collect();
-        if !want.is_empty() {
-            g.tick()?;
-            let rows: Vec<(String, String)> = cx.db(|| {
-                sqlx::query_as("SELECT path_key, path FROM blame_paths WHERE project_id = $1 AND path_key = ANY($2)")
-                    .bind(cx.project())
-                    .bind(&want)
-                    .fetch_all(&cx.hub().db)
-            })?;
-            self.paths.extend(rows);
+        let Some((body, named)) = row else { return Ok(None) };
+        let mut by_key: HashMap<String, Arc<str>> = HashMap::new();
+        for kp in named {
+            let (k, p) = kp.split_once(':').ok_or_else(|| bad("a stored path"))?;
+            let a = self.intern(p);
+            by_key.insert(k.to_string(), a);
         }
-        let paths = &self.paths;
-        Ok(Some(Blame::decode(&body, MAX_LINES, |k| paths.get(k).cloned())?))
+        let b = Blame::decode(&body, MAX_LINES, |k| by_key.get(k).cloned())?;
+        for (id, _, m) in &b.origins {
+            self.metas.entry(*id).or_insert_with(|| m.clone());
+        }
+        Ok(Some(b))
     }
 
     /// What the walk down needs of version `v`: its change, the versions
@@ -635,6 +681,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         // Up: each version from its parents', each dropped once every
         // version above it is computed; kept as it goes.
         let mut done: HashMap<Version, Done> = HashMap::new();
+        let computed = nodes.values().filter(|n| !n.kept).count() as u64;
         for v in order {
             let (change, parents, kept) = {
                 let n = &nodes[&v];
@@ -655,10 +702,11 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                     Some(text) => {
                         let inputs: Vec<Option<(&Text, &Blame)>> =
                             parents.iter().map(|p| p.as_ref().and_then(|p| done.get(p)).and_then(|d| d.as_ref()).map(|(t, b)| (&**t, &**b))).collect();
-                        let (b, _) = step((v.id, &v.path), &text, &inputs);
+                        let me: Origin = (v.id, self.intern(&v.path), self.meta(&v.id)?);
+                        let (b, _) = step(&me, &text, &inputs);
                         self.f.g.cx.hub().query.blame_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let b = Arc::new(b);
-                        if b.vd % CHECKPOINT == 0 || v == *start {
+                        if b.vd % spacing(computed, b.stored_estimate()) == 0 || v == *start {
                             self.keep(&v, &b);
                         }
                         Some((text, b))
@@ -678,7 +726,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                 }
             }
             done.insert(v.clone(), out);
-            if held + self.pending_bytes > self.limits.held {
+            if held + self.pending_bytes + self.path_bytes + self.metas.len() * 512 > self.limits.held {
                 return Err(too_wide());
             }
             if self.writes.len() >= BATCH_BLAMES || self.pending_bytes >= BATCH_BYTES.min(self.limits.held / 4) {
@@ -692,14 +740,23 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
     fn keep(&mut self, v: &Version, b: &Blame) {
         let raw = b.encode(path_key);
         self.pending_bytes += raw.len() + 128;
-        for (_, p) in &b.origins {
+        let mut named: Vec<String> = Vec::new();
+        let mut seen: HashSet<*const u8> = HashSet::new();
+        for (_, p, _) in &b.origins {
+            if !seen.insert(Arc::as_ptr(p) as *const u8) {
+                continue;
+            }
             let k = path_key(p);
             if !self.write_paths.contains_key(&k) {
                 self.pending_bytes += p.len() + 64;
-                self.write_paths.insert(k, p.clone());
+                self.write_paths.insert(k.clone(), p.to_string());
             }
+            named.push(k);
         }
-        self.writes.push((path_key(&v.path), v.id, raw));
+        named.sort();
+        named.dedup();
+        self.pending_bytes += named.len() * 33;
+        self.writes.push((path_key(&v.path), v.id, raw, named.join(",")));
     }
 
     /// Write the kept blames held: their paths, then the blames; then drop
@@ -723,24 +780,30 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                     .execute(pool)
             })?;
         }
+        // One statement for the batch, then one for the project's cap.
         let now = veil_core::now_millis();
-        for (k, s, body) in &w {
-            cx.db(|| {
-                sqlx::query(
-                    "INSERT INTO blame_memo (project_id, view_key, path_key, follow, snapshot, body, bytes, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING",
-                )
-                .bind(project)
-                .bind(vk)
-                .bind(k)
-                .bind(self.follow)
-                .bind(s.hex())
-                .bind(body)
-                .bind(body.len() as i64)
-                .bind(now)
-                .execute(pool)
-            })?;
-        }
+        let keys: Vec<&str> = w.iter().map(|r| r.0.as_str()).collect();
+        let snaps: Vec<String> = w.iter().map(|r| r.1.hex()).collect();
+        let bodies: Vec<&[u8]> = w.iter().map(|r| r.2.as_slice()).collect();
+        let sizes: Vec<i64> = w.iter().map(|r| r.2.len() as i64).collect();
+        let named: Vec<&str> = w.iter().map(|r| r.3.as_str()).collect();
+        cx.db(|| {
+            sqlx::query(
+                "INSERT INTO blame_memo (project_id, view_key, path_key, follow, snapshot, body, bytes, created_at, path_keys) \
+                 SELECT $1, $2, k, $3, s, b, n, $4, p FROM UNNEST($5::text[], $6::text[], $7::bytea[], $8::bigint[], $9::text[]) AS t(k, s, b, n, p) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(project)
+            .bind(vk)
+            .bind(self.follow)
+            .bind(now)
+            .bind(&keys)
+            .bind(&snaps)
+            .bind(&bodies)
+            .bind(&sizes)
+            .bind(&named)
+            .execute(pool)
+        })?;
         cx.db(|| {
             sqlx::query(
                 "DELETE FROM blame_memo WHERE project_id = $1 AND (view_key, path_key, follow, snapshot) IN ( \
@@ -754,7 +817,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             .bind(self.limits.kept_bytes as i64)
             .execute(pool)
         })?;
-        for (k, s, _) in w {
+        for (k, s, _, _) in w {
             self.kept.entry(k).or_default().insert(s);
         }
         Ok(())
@@ -999,18 +1062,18 @@ async fn leased_job(
 /// `after + 1` on, at most `n`, each with its origin, and the changes they
 /// name, newest first (the viewer's generations).
 #[allow(clippy::too_many_arguments)]
-pub fn blame_json(g: &G, rev: ObjectId, path: &str, follow: bool, text: &Text, b: &Blame, after: usize, n: usize) -> Result<Value> {
+pub fn blame_json(_g: &G, rev: ObjectId, path: &str, follow: bool, text: &Text, b: &Blame, after: usize, n: usize) -> Result<Value> {
     let total = text.lines.len();
     let from = after.min(total);
     let to = from.saturating_add(n).min(total);
     let mut lines = Vec::with_capacity(to - from);
-    let mut snaps: HashMap<ObjectId, Arc<veil_core::object::Snapshot>> = HashMap::new();
+    // What an answer shows of each change is kept with the blame (S14
+    // cycle 3): no snapshot is read here.
+    let mut named: HashMap<ObjectId, Arc<Meta>> = HashMap::new();
     for i in from..to {
         let (id, p, l) = b.origin(i);
-        if !snaps.contains_key(id) {
-            snaps.insert(*id, g.snapshot(id)?);
-        }
-        let s = &snaps[id];
+        let m = b.meta(i);
+        named.entry(*id).or_insert_with(|| m.clone());
         let raw = text.line(i);
         let raw = raw.strip_suffix(b"\n").unwrap_or(raw);
         let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
@@ -1018,29 +1081,26 @@ pub fn blame_json(g: &G, rev: ObjectId, path: &str, follow: bool, text: &Text, b
             "line": i + 1,
             "text": String::from_utf8_lossy(raw),
             "snapshot": id.hex(),
-            "change": s.change_id.to_string(),
-            "change_short": s.change_id.short(),
+            "change": m.change_id,
+            "change_short": m.change_id.get(..8).unwrap_or(&m.change_id),
             "path": p,
             "origin_line": l,
         }));
     }
-    let mut order: Vec<(i64, ObjectId)> = Vec::new();
-    for id in snaps.keys() {
-        order.push((g.get(id)?.generation, *id));
-    }
+    let mut order: Vec<(i64, ObjectId)> = named.iter().map(|(id, m)| (m.generation, *id)).collect();
     order.sort_by(|a, b| b.cmp(a));
     let changes: Vec<Value> = order
         .iter()
         .map(|(_, id)| {
-            let s = &snaps[id];
+            let m = &named[id];
             json!({
                 "snapshot_id": id.hex(),
                 "snapshot_short": id.short(),
-                "change_id": s.change_id.to_string(),
-                "change_short": s.change_id.short(),
-                "author": s.author,
-                "timestamp": s.timestamp,
-                "description": s.description.as_str(),
+                "change_id": m.change_id,
+                "change_short": m.change_id.get(..8).unwrap_or(&m.change_id),
+                "author": m.author,
+                "timestamp": m.timestamp,
+                "summary": m.summary,
             })
         })
         .collect();
