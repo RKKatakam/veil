@@ -222,6 +222,9 @@ struct Inputs {
 #[derive(Clone)]
 struct Record {
     landed: ObjectId,
+    /// The change (its id) it landed, for `landed_changes` (BUG-1522);
+    /// `None` for a record read back or a tip moved from.
+    change: Option<String>,
 }
 
 /// What one entry came to.
@@ -739,7 +742,7 @@ impl Service {
             .bind(on.lineage)
             .fetch_all(&hub.db)
             .await?;
-            rows.into_iter().filter_map(|(s, l)| Some((ObjectId::from_hex(&s).ok()?, Record { landed: ObjectId::from_hex(&l).ok()? }))).collect()
+            rows.into_iter().filter_map(|(s, l)| Some((ObjectId::from_hex(&s).ok()?, Record { landed: ObjectId::from_hex(&l).ok()?, change: None }))).collect()
         };
         Ok(Inputs { entries, attach, memo, origins, landed })
     }
@@ -794,11 +797,14 @@ impl Service {
         // landed as itself, so a submit on any tip an agent read since the
         // service began finds its base in one lookup (`landing::stack`),
         // never walking the branch nor waiting for the deriver.
-        let from = b.old_tip.filter(|_| moved).map(|t| (t, Record { landed: t }));
+        let from = b.old_tip.filter(|_| moved).map(|t| (t, Record { landed: t, change: None }));
         // One row per submitted snapshot.
         let rows: BTreeMap<ObjectId, ObjectId> = b.landings.iter().chain(from.iter()).map(|(s, r)| (*s, r.landed)).collect();
         let ls: Vec<String> = rows.keys().map(ObjectId::hex).collect();
         let ll: Vec<String> = rows.values().map(ObjectId::hex).collect();
+        // Each change landed, by its id, for the branch's lineage: "already
+        // landed" asks it whatever its submitted snapshot (BUG-1522).
+        let (cc, cl): (Vec<String>, Vec<String>) = b.landings.iter().filter_map(|(_, r)| r.change.clone().map(|c| (c, r.landed.hex()))).unzip();
         let lineage = b.after.lineage;
         let mk: Vec<String> = b.memos.iter().map(|m| m.0.clone()).collect();
         let mr: Vec<String> = b.memos.iter().map(|m| m.1.hex()).collect();
@@ -809,7 +815,7 @@ impl Service {
         let notify = hub.caches.notices.load(Ordering::SeqCst);
         let tx_results = results.clone();
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-            let (ls, ll, mc) = (ls.clone(), ll.clone(), mc.clone());
+            let (ls, ll, mc, cc, cl) = (ls.clone(), ll.clone(), mc.clone(), cc.clone(), cl.clone());
             let (branch, holder, old, new, seqs, snapshots, mk, mr, mp, accept, name, mut results) = (
                 branch.clone(),
                 holder.clone(),
@@ -927,6 +933,9 @@ impl Service {
                     .bind(&ll)
                     .execute(&mut *c)
                     .await?;
+                }
+                if !cc.is_empty() {
+                    crate::landing::record_changes(&mut *c, pid, &branch, lineage, &cc, &cl).await?;
                 }
                 if !mk.is_empty() {
                     let stored: Vec<(String, String)> = sqlx::query_as(
@@ -1370,7 +1379,7 @@ fn entry(
         let id = ObjectId::hash(&raw);
         b.object(src, id, raw);
         b.snapshots.push(id);
-        b.landings.push((sid, Record { landed: id }));
+        b.landings.push((sid, Record { landed: id, change: Some(s.change_id.to_string()) }));
         let snap = Arc::new(n);
         // The push's checks again, on the new parents, when what they read
         // may have changed: access (epochs), or the policy file the

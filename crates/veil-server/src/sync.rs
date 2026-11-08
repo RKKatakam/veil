@@ -506,89 +506,130 @@ async fn resolve_stored(hub: &Hub, project: i64, id: &ObjectId) -> Result<Vec<Ob
     Ok(rows.iter().filter_map(|r| ObjectId::from_hex(&r.0).ok()).collect())
 }
 
-/// The real snapshot view `view_key`'s projected id `id` names, the one
-/// to take (BUG-1314, BUG-1407, BUG-1467): itself when it is committed
-/// history; else, in **one statement over that view's own memos only**, of
-/// every real snapshot with that projection (changes hidden from the viewer
-/// share one), a branch tip, then the newest by the derived graph, the
-/// snapshot id breaking ties: never another view's, never by when a memo
-/// was stored, nothing cut before the order. `warming` when that cannot be
-/// told: more than [`NEWEST_BOUND`] of them, or, with no tip among them and
-/// one the deriver has not reached yet, more than one that is no other's
-/// first parent (they are one change and the hidden ones on it: the newest
-/// is the one at the end, read from their objects). `None`: no memo of that view names
-/// it. Every caller checks that its answer projects to what was named
-/// ([`resolve_named`]).
-pub(crate) async fn resolve_newest(hub: &Arc<Hub>, project: i64, view_key: &str, id: &ObjectId) -> Result<Option<ObjectId>> {
-    if *id == root_snapshot_id() || committed(hub, project, id).await? {
+/// The real snapshot `viewer` means by `id` (a snapshot id they were
+/// given), for a change that will go to `branches` (a push's: the branches
+/// it moves; an API commit's: its `onto`; the default branch is always
+/// last): **one resolution for every route** (BUG-1467, BUG-1520), each
+/// answer checked to project to `id` for them now.
+///
+/// 1. Committed history named by its own id: itself, if they see it so.
+/// 2. The tip of one of `branches`, in that order, then of the default
+///    branch, that they see as `id`: the change goes there, so it is made
+///    on what is there.
+/// 3. Of their own view's real snapshots with that projection (changes
+///    hidden from them share one; never another view's, never by when a
+///    memo was stored): when they are one line (one of them is no other's
+///    first parent), its newest; when lines diverge (two branches' hidden
+///    work on one change they see), or there are more than
+///    [`NEWEST_BOUND`], the change they all stand on, the one that did not
+///    collapse into its parent's projection (`projections_own`): it carries
+///    no line's hidden work, and the answer never depends on how much
+///    hidden history there is (BUG-1521).
+///    When no one change stands under diverging lines (two changes alike
+///    for them, on two branches): for a landing (`landing`: its edits land
+///    on the tip, and any of them gives the same edits) the lowest id of
+///    their ends; for anything that moves a branch to it, refused (it
+///    would carry one line's hidden work).
+/// 4. A name from before their access changed: their own change's latest
+///    revision (`change_refs`), if it projects to `id`.
+///
+/// `None`: nothing they can see is `id`.
+pub(crate) async fn resolve_for(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    id: &ObjectId,
+    branches: &[&str],
+    landing: bool,
+) -> Result<Option<ObjectId>> {
+    if *id == root_snapshot_id() {
         return Ok(Some(*id));
     }
-    let row: Option<(String, bool, Option<i64>, i64)> = sqlx::query_as(
-        "WITH c AS (SELECT real_id FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 LIMIT $4) \
-         SELECT c.real_id, EXISTS (SELECT 1 FROM branches b WHERE b.project_id = $1 AND b.target = c.real_id) AS tip, g.generation, \
-         (SELECT count(*) FROM c) AS n FROM c LEFT JOIN graph g ON g.project_id = $1 AND g.snapshot = c.real_id \
-         ORDER BY tip DESC, (g.generation IS NULL) DESC, g.generation DESC, c.real_id LIMIT 1",
+    let seen = |r: ObjectId| async move { Ok::<bool, Error>(projected(hub, project, viewer, r).await? == *id) };
+    if committed(hub, project.id, id).await? {
+        return Ok(seen(*id).await?.then_some(*id));
+    }
+    let mut names: Vec<&str> = branches.to_vec();
+    names.push(&project.default_branch);
+    let tips: Vec<(String, String)> = sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 AND name = ANY($2)")
+        .bind(project.id)
+        .bind(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
+        .fetch_all(&hub.db)
+        .await?;
+    for name in &names {
+        if let Some(t) = tips.iter().find(|(n, _)| n == name).and_then(|(_, t)| ObjectId::from_hex(t).ok()) {
+            if seen(t).await? {
+                return Ok(Some(t));
+            }
+        }
+    }
+    let key = project.view(viewer).key();
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT p.real_id, g.parents FROM projections p LEFT JOIN graph g ON g.project_id = p.project_id AND g.snapshot = p.real_id \
+         WHERE p.project_id = $1 AND p.view_key = $2 AND p.projected_id = $3 LIMIT $4",
     )
-    .bind(project)
-    .bind(view_key)
+    .bind(project.id)
+    .bind(&key)
     .bind(id.hex())
     .bind(NEWEST_BOUND as i64 + 1)
-    .fetch_optional(&hub.db)
+    .fetch_all(&hub.db)
     .await?;
-    let Some((real, tip, generation, n)) = row else { return Ok(None) };
-    if n as usize > NEWEST_BOUND {
-        return Err(crate::query::graph::warming());
-    }
-    if n > 1 && !tip && generation.is_none() {
-        // The deriver has not reached them all: they are one change and
-        // the hidden ones on it (each collapsed into its first parent's
-        // projection), so the newest is the one that is no other's first
-        // parent, when that is one; else it cannot be told.
-        let all: Vec<String> = sqlx::query_scalar("SELECT real_id FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 LIMIT $4")
-            .bind(project)
-            .bind(view_key)
-            .bind(id.hex())
-            .bind(NEWEST_BOUND as i64)
-            .fetch_all(&hub.db)
-            .await?;
-        let all: Vec<ObjectId> = all.iter().filter_map(|a| ObjectId::from_hex(a).ok()).collect();
-        let leaves = blocking(hub, project, move |src| {
-            let mut firsts = HashSet::new();
-            for a in &all {
-                if let Some(p) = src.snapshot(a)?.parents.first() {
-                    firsts.insert(*p);
-                }
+    let own = || async {
+        let own: Vec<String> = sqlx::query_scalar(
+            "SELECT real_id FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed ORDER BY real_id LIMIT 2",
+        )
+        .bind(project.id)
+        .bind(&key)
+        .bind(id.hex())
+        .fetch_all(&hub.db)
+        .await?;
+        Ok::<Option<ObjectId>, Error>(match own.as_slice() {
+            [o] => ObjectId::from_hex(o).ok(),
+            _ => None,
+        })
+    };
+    let pick = if rows.is_empty() {
+        None
+    } else if rows.len() > NEWEST_BOUND {
+        own().await?
+    } else {
+        // Their first parents: the derived graph's, else the objects'.
+        let mut cands: Vec<(ObjectId, Option<ObjectId>)> = Vec::new();
+        let mut unread = Vec::new();
+        for (r, parents) in &rows {
+            let Ok(r) = ObjectId::from_hex(r) else { continue };
+            match parents.as_deref().and_then(|p| serde_json::from_str::<Vec<ObjectId>>(p).ok()) {
+                Some(ps) => cands.push((r, ps.first().copied())),
+                None => unread.push(r),
             }
-            Ok(all.iter().filter(|a| !firsts.contains(a)).copied().collect::<Vec<_>>())
+        }
+        let read = blocking(hub, project.id, move |src| {
+            unread.iter().map(|r| Ok((*r, src.snapshot(r)?.parents.first().copied()))).collect::<Result<Vec<_>>>()
         })
         .await?;
-        return match leaves.as_slice() {
-            [one] => Ok(Some(*one)),
-            _ => Err(crate::query::graph::warming()),
-        };
-    }
-    Ok(ObjectId::from_hex(&real).ok())
-}
-
-/// Most real snapshots of one view's projected id `resolve_newest` orders.
-pub const NEWEST_BOUND: usize = 4_096;
-
-/// The real snapshot `viewer` means by `id` (a snapshot id they were
-/// given), checked: [`resolve_newest`] in their view, which must project
-/// to `id` for them now; else a change of theirs whose latest revision
-/// (`change_refs`) does (a name from before their access changed). `None`
-/// when nothing they can see is `id`.
-pub(crate) async fn resolve_named(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, id: &ObjectId) -> Result<Option<ObjectId>> {
-    let key = project.view(viewer).key();
-    if let Some(r) = resolve_newest(hub, project.id, &key, id).await? {
-        if projected(hub, project, viewer, r).await? == *id {
-            return Ok(Some(r));
+        cands.extend(read);
+        let firsts: HashSet<ObjectId> = cands.iter().filter_map(|c| c.1).collect();
+        let mut leaves: Vec<ObjectId> = cands.iter().map(|c| c.0).filter(|c| !firsts.contains(c)).collect();
+        leaves.sort();
+        match leaves.as_slice() {
+            [one] => Some(*one),
+            _ => match own().await? {
+                Some(o) => Some(o),
+                None if landing => leaves.first().copied(),
+                None => {
+                    return Err(Error::conflict(format!(
+                        "snapshot {} stands for changes on different lines as you see them: make the change on a branch's tip, or land it",
+                        id.short()
+                    )))
+                }
+            },
         }
-        // A real snapshot they see only as another (a hidden part): not a
-        // name of theirs. A memo of their view that no longer projects to
-        // it: their view is changing under them.
-        return match r == *id {
-            true => Ok(None),
+    };
+    if let Some(r) = pick {
+        // A memo of their view that no longer projects to it: their view
+        // is changing under them.
+        return match seen(r).await? {
+            true => Ok(Some(r)),
             false => Err(crate::query::graph::warming()),
         };
     }
@@ -607,10 +648,14 @@ pub(crate) async fn resolve_named(hub: &Arc<Hub>, project: &Project, viewer: &Vi
         .fetch_optional(&hub.db)
         .await?;
     match latest.and_then(|l| ObjectId::from_hex(&l).ok()) {
-        Some(r) if projected(hub, project, viewer, r).await? == *id => Ok(Some(r)),
+        Some(r) if seen(r).await? => Ok(Some(r)),
         _ => Ok(None),
     }
 }
+
+/// Most real snapshots of one view's projected id `resolve_for` orders
+/// as a line; past it, the change they stand on.
+pub const NEWEST_BOUND: usize = 4_096;
 
 /// Branch tips as `viewer` sees them. The branch rows come from this
 /// server's memory for at most `caches::TIPS_TTL`, dropped at every push's
@@ -1445,16 +1490,16 @@ pub(crate) async fn push_with(
         let default_tip = current.get(&project.default_branch).copied();
         blocking(hub, project.id, move |src| crate::landing::protected(src, default_tip)).await?
     };
-    // Only the branches this push moves, and the default branch, are
-    // candidates; a branch this push moves wins over the default branch
-    // (both may look the same to the pusher).
-    let mut tip_projection: HashMap<ObjectId, ObjectId> = HashMap::new();
-    let candidates = std::iter::once(&project.default_branch).chain(req.updates.iter().map(|u| &u.branch));
-    for name in candidates {
-        if let Some(t) = current.get(name) {
-            tip_projection.insert(projected(hub, project, viewer, *t).await?, *t);
-        }
-    }
+    // The branches this push moves come first, then the default branch
+    // (`resolve_for`: one resolution for a push and an API commit).
+    let moved_names: Vec<&str> = req.updates.iter().map(|u| u.branch.as_str()).collect();
+    // Every update lands through the landing service (its edits on the tip),
+    // none moves a branch here.
+    let lands_only = !req.force && req.updates.iter().all(|u| land_all || protected.contains(&u.branch));
+    // What this pusher uploaded (BUG-824): only that may be new here; any
+    // other name is "not uploaded", whether or not the server holds a
+    // snapshot by it they cannot see (BUG-1523).
+    let uploaded = Arc::new(receipted(hub, project.id, person, &req.receipts));
     // 1. The new snapshots: everything the new tips reach that the server
     //    does not hold as history or as a projection.
     let mut known: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
@@ -1465,19 +1510,13 @@ pub(crate) async fn push_with(
         if known.contains_key(&id) || parents_of.contains_key(&id) {
             continue;
         }
-        if let Some(t) = tip_projection.get(&id) {
-            known.insert(id, vec![*t]);
+        // Grafted only on what its pusher saw (BUG-1467, BUG-1520).
+        if let Some(r) = resolve_for(hub, project, viewer, &id, &moved_names, lands_only).await? {
+            known.insert(id, vec![r]);
             continue;
         }
-        // Grafted only on what its pusher saw: their own view's snapshot,
-        // checked to project to what they named (BUG-1467).
-        let r = match viewer.admin {
-            true => resolve_stored(hub, project.id, &id).await?,
-            false => resolve_named(hub, project, viewer, &id).await?.into_iter().collect(),
-        };
-        if !r.is_empty() {
-            known.insert(id, r);
-            continue;
+        if !uploaded.contains(&id) {
+            return Err(Error::bad_request(format!("snapshot {} was not uploaded", id.short())));
         }
         let s = blocking(hub, project.id, move |src| match src.snapshot(&id) {
             Err(VeilError::Missing(_)) => Err(Error::bad_request(format!("snapshot {} was not uploaded", id.short()))),
@@ -1529,13 +1568,11 @@ pub(crate) async fn push_with(
     let mut real_of: HashMap<ObjectId, ObjectId> = HashMap::new();
     real_of.insert(root, root);
     for (id, reals) in &known {
-        let r = tip_projection.get(id).copied().unwrap_or(reals[0]);
+        let r = reals[0];
         real_of.insert(*id, r);
     }
-    // What this pusher uploaded (BUG-824): a push names nothing else that
-    // is not already where it was in a parent.
-    let uploaded = Arc::new(receipted(hub, project.id, person, &req.receipts));
-    // 2. Complete and check each new snapshot.
+    // 2. Complete and check each new snapshot (`uploaded`: a push names
+    // nothing else that is not already where it was in a parent, BUG-824).
     let mut completed: Vec<Completed> = Vec::new();
     // Each new real snapshot's real parents.
     let mut real_parents_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
@@ -1752,6 +1789,29 @@ pub(crate) async fn push_with(
     let origins: Vec<(String, String)> = completed.iter().filter_map(|c| c.origin.map(|o| (c.real.hex(), o.hex()))).collect();
     let memos: Vec<(String, String, String, bool)> =
         deferred.rows.iter().map(|(k, r, p)| (k.clone(), r.hex(), p.hex(), deferred.collapsed.contains(r))).collect();
+    // The changes each moved branch now holds that this push brought, by
+    // change id (`landed_changes`, BUG-1522).
+    let change_of: HashMap<ObjectId, String> =
+        real_of.iter().filter_map(|(pushed, real)| parents_of.get(pushed).map(|s| (*real, s.change_id.to_string()))).collect();
+    let plan_changes: HashMap<String, (Vec<String>, Vec<String>)> = plans
+        .iter()
+        .filter_map(|(branch, _, new, _)| new.map(|n| (branch.clone(), n)))
+        .map(|(branch, n)| {
+            let (mut cs, mut ls) = (Vec::new(), Vec::new());
+            let mut seen = HashSet::new();
+            let mut stack = vec![n];
+            while let Some(x) = stack.pop() {
+                if let (Some(ps), true) = (real_parents_of.get(&x), seen.insert(x)) {
+                    if let Some(cid) = change_of.get(&x) {
+                        cs.push(cid.clone());
+                        ls.push(x.hex());
+                    }
+                    stack.extend(ps.iter().copied());
+                }
+            }
+            (branch, (cs, ls))
+        })
+        .collect();
     let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let pid = project.id;
     let plans2 = plans.clone();
@@ -1766,6 +1826,7 @@ pub(crate) async fn push_with(
     } else {
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let plans = plans2.clone();
+        let plan_changes = plan_changes.clone();
         let new_reals = new_reals.clone();
         let origins = origins.clone();
         let memos = memos.clone();
@@ -1775,29 +1836,38 @@ pub(crate) async fn push_with(
                 crate::landing::insert(&mut *c, pid, &who, q).await?;
             }
             let mut moved = Vec::new();
+            let mut lineages: Vec<(String, i64)> = Vec::new();
             for (branch, cur, new, accept) in plans {
                 let rows = match (cur, new) {
                     // A forced update starts a new lineage (BUG-1300): what the
                     // landing service recorded of the branch no longer counts.
-                    (Some(c0), Some(n)) => sqlx::query(
+                    (Some(c0), Some(n)) => sqlx::query_scalar::<_, i64>(
                         "UPDATE branches SET target = $1, lineage = CASE WHEN $5 THEN nextval('branch_lineages') ELSE lineage END \
-                         WHERE project_id = $2 AND name = $3 AND target = $4",
+                         WHERE project_id = $2 AND name = $3 AND target = $4 RETURNING lineage",
                     )
                         .bind(n.hex())
                         .bind(pid)
                         .bind(&branch)
                         .bind(c0.hex())
                         .bind(force)
-                        .execute(&mut *c)
+                        .fetch_optional(&mut *c)
                         .await?
-                        .rows_affected(),
-                    (None, Some(n)) => sqlx::query("INSERT INTO branches (project_id, name, target) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+                        .map_or(0, |lineage| {
+                            lineages.push((branch.clone(), lineage));
+                            1
+                        }),
+                    (None, Some(n)) => sqlx::query_scalar::<_, i64>(
+                        "INSERT INTO branches (project_id, name, target) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING lineage",
+                    )
                         .bind(pid)
                         .bind(&branch)
                         .bind(n.hex())
-                        .execute(&mut *c)
+                        .fetch_optional(&mut *c)
                         .await?
-                        .rows_affected(),
+                        .map_or(0, |lineage| {
+                            lineages.push((branch.clone(), lineage));
+                            1
+                        }),
                     (Some(c0), None) => sqlx::query("DELETE FROM branches WHERE project_id = $1 AND name = $2 AND target = $3")
                         .bind(pid)
                         .bind(&branch)
@@ -1817,6 +1887,13 @@ pub(crate) async fn push_with(
                     crate::perm::accept_policy(&mut *c, pid, &text).await?;
                 }
                 moved.push(branch);
+            }
+            for (branch, lineage) in &lineages {
+                if let Some((cs, ls)) = plan_changes.get(branch) {
+                    if !cs.is_empty() {
+                        crate::landing::record_changes(&mut *c, pid, branch, *lineage, cs, ls).await?;
+                    }
+                }
             }
             for r in &new_reals {
                 sqlx::query("INSERT INTO snapshots (project_id, id) VALUES ($1, $2) ON CONFLICT DO NOTHING")

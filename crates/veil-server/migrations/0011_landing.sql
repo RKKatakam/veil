@@ -119,3 +119,18 @@ CREATE TABLE IF NOT EXISTS landed_from (
 -- column count as collapsed (the step then reads the run itself, bounded).
 ALTER TABLE projections ADD COLUMN IF NOT EXISTS collapsed BOOLEAN NOT NULL DEFAULT TRUE;
 CREATE INDEX IF NOT EXISTS projections_own ON projections (project_id, view_key, projected_id) WHERE NOT collapsed;
+
+-- Each change landed on a branch, by its change id, within the branch's
+-- lineage then, and the snapshot it is there as (BUG-1522): written by
+-- every route that moves a branch (the landing service, a push of new
+-- snapshots, an API commit `onto`). "Already landed" asks by change id,
+-- whatever its submitted snapshot (a rebase keeps the change id, not the
+-- snapshot), in one lookup no bound limits (BUG-1521). Kept as `snapshots`.
+CREATE TABLE IF NOT EXISTS landed_changes (
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    branch TEXT NOT NULL,
+    lineage BIGINT NOT NULL,
+    change_id TEXT NOT NULL,
+    landed TEXT NOT NULL,
+    PRIMARY KEY (project_id, branch, lineage, change_id)
+);

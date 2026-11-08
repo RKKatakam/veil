@@ -2506,14 +2506,19 @@ for them):
   one; of that view's memos with that projection, the one that did not
   collapse into its parent's: one row of a partial index, however long the
   run, BUG-1468), counting toward nothing (BUG-1409).
-* **"Already landed" answers yes only when the history proves it**
-  (BUG-1408, BUG-1465, BUG-1466): a `landings` row (the change's edits are
-  on the branch, in this lineage) is a fast path whose absence means
-  nothing; the question is whether a snapshot the landing service made
-  from the change (`landed_from`: one row per landed snapshot, kept as
-  `snapshots` are, its condition the change itself, nothing cut before it)
-  is on the branch: yes, no, or, when the bounded ancestry below cannot
-  tell, `warming`; never "no" from a truncated search.
+* **"Already landed" is asked by change id** (BUG-1408, BUG-1465, BUG-1466,
+  BUG-1522): a `landings` row is a fast path whose absence means nothing;
+  the question is the branch's record of its changes in its lineage
+  (`landed_changes`: one row per change landed there, written by every
+  route that moves a branch, the landing service, a push of new snapshots
+  and an API commit `onto`; one lookup no bound limits), the landed
+  revision then asked of the bounded ancestry below (yes, no, or
+  `warming`; never "no" from a truncated search). A rebase keeps the change
+  id, not the snapshot: a revision whose edits are all the landed
+  revision's (the same change, or one rebased on a tip that holds it) is
+  skipped; one that brings further edits is refused ("this change already
+  landed … with other edits: make a new change for the further edits"),
+  never applied again.
 * At most 64 changes the submitter sees land, counted as they are found;
   at most 4,096 they see are read, then `warming`; changes they cannot see
   count toward neither.
@@ -2553,22 +2558,27 @@ then `warming` (the deriver is asked to catch up). An agent's landing on
 its own last one costs the branch's row and one `landings` lookup.
 
 **Which real snapshot a projected id names** (BUG-1314, BUG-1407,
-BUG-1467): several changes hidden from a viewer can share one projection.
-`sync::resolve_newest` answers in **one statement over the caller's own
-view's memos only**: of every real snapshot with that projection (at most
-4,096 read, else `warming`, nothing cut before the order), a branch tip,
-then the newest by the derived graph, the snapshot id breaking ties; with
-no tip among several and one the deriver has not reached, the one that is
-no other's first parent (one change and the hidden ones on it, read from
-their objects), else `warming`.
-**Every caller checks that the answer projects to what was named**
-(`sync::resolve_named`: the API's `base`, a push's parents, a landing's)
-and answers `warming` if not; a name from before the caller's access
-changed resolves only as their own change's latest revision
-(`change_refs`), checked the same way. Never another view's memo, never by
-when a memo was stored. A landing of edits takes the server's memory of
-the caller's view first (any of them gives the same edits), checked the
-same way.
+BUG-1467, BUG-1520, BUG-1521): several changes hidden from a viewer can
+share one projection. **One resolution for every route** (`sync::resolve_for`:
+an API commit's `base`, a push's parents, a landing's), each answer checked
+to project to the name for its caller: committed history named by its own
+id, if they see it so; else the tip of the branch the change goes to (a
+push's branches, an API commit's `onto` or the landing's branch), then the
+default branch's, that they see as the name; else, of their own view's
+real snapshots with that projection (never another view's, never by when a
+memo was stored), the newest when they are one line, and when lines
+diverge (two branches' hidden work on one change they see) or there are
+more than 4,096, the change they all stand on (the one memo that did not
+collapse: `projections_own`), which carries no line's hidden work (with no
+such one change, two alike for them on two lines: a landing takes the
+lowest id of their ends, its edits the same on the tip; anything that moves
+a branch to it is refused); else their own change's latest revision (a
+name from before an access change).
+No bound answers `warming` for ever. A push names as new only what its
+pusher uploaded (their receipts): any other name it cannot resolve is
+"snapshot … was not uploaded", the same for a snapshot that does not exist
+and one they cannot see (BUG-1523). A landing of edits takes the server's
+memory of the caller's view first, checked the same way.
 
 The snapshots become committed history in the submit's commit (they
 resolve and project like any other). With `wait` (the default) the request

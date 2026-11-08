@@ -576,9 +576,23 @@ async fn commit(
     let mv = mv.map(|m| (m.branch, m.cur.hex(), m.keep_on_loss));
     let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let committed: Vec<ObjectId> = restacked.iter().map(|(n, _, _)| *n).chain(std::iter::once(built.real)).collect();
+    // What a move puts on the branch, by change id (`landed_changes`,
+    // BUG-1522): the caller's restacked changes and this one.
+    let on_branch: (Vec<String>, Vec<String>) = match &mv {
+        None => (Vec::new(), Vec::new()),
+        Some(_) => {
+            let ids = committed.clone();
+            let mut cs: Vec<String> = sync::blocking(hub, pid, move |src| {
+                ids.iter().take(ids.len() - 1).map(|n| Ok(src.snapshot(n)?.change_id.to_string())).collect::<Result<Vec<_>>>()
+            })
+            .await?;
+            cs.push(cid.clone());
+            (cs, committed.iter().map(ObjectId::hex).collect())
+        }
+    };
     let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-        let (real, cid, accept, mv, view_key, snaps, moved_refs, land) =
-            (real.clone(), cid.clone(), accept.clone(), mv.clone(), view_key.clone(), snaps.clone(), moved_refs.clone(), land.clone());
+        let (real, cid, accept, mv, view_key, snaps, moved_refs, land, on_branch) =
+            (real.clone(), cid.clone(), accept.clone(), mv.clone(), view_key.clone(), snaps.clone(), moved_refs.clone(), land.clone(), on_branch.clone());
         Box::pin(async move {
             if let Some((w, q)) = &land {
                 crate::landing::insert(&mut *c, pid, w, q).await?;
@@ -586,16 +600,20 @@ async fn commit(
             let now = veil_core::now_millis();
             let mut moved = None;
             if let Some((branch, cur, keep)) = &mv {
-                let rows = sqlx::query("UPDATE branches SET target = $1 WHERE project_id = $2 AND name = $3 AND target = $4")
-                    .bind(&real)
-                    .bind(pid)
-                    .bind(branch)
-                    .bind(cur)
-                    .execute(&mut *c)
-                    .await?
-                    .rows_affected();
+                let lineage: Option<i64> =
+                    sqlx::query_scalar("UPDATE branches SET target = $1 WHERE project_id = $2 AND name = $3 AND target = $4 RETURNING lineage")
+                        .bind(&real)
+                        .bind(pid)
+                        .bind(branch)
+                        .bind(cur)
+                        .fetch_optional(&mut *c)
+                        .await?;
+                let rows = u64::from(lineage.is_some());
                 if rows != 1 && !keep {
                     return Err(Error::conflict(format!("branch '{branch}' moved")));
+                }
+                if let Some(lineage) = lineage {
+                    crate::landing::record_changes(&mut *c, pid, branch, lineage, &on_branch.0, &on_branch.1).await?;
                 }
                 moved = Some(rows == 1);
                 if let (1, Some(text)) = (rows, &accept) {
@@ -708,20 +726,10 @@ async fn tip(hub: &Hub, project: i64, branch: &str) -> Result<Option<ObjectId>> 
 /// see it as `base`, else the newest real snapshot that is `base` for
 /// them. Anything else is not found, as for every snapshot they may not
 /// see (a real id of a snapshot they see only part of included).
-async fn resolve_base(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, base: ObjectId, cur: Option<ObjectId>, landing: bool) -> Result<ObjectId> {
-    if base == sync::root_snapshot_id() {
-        return Ok(base);
-    }
-    if let Some(c) = cur {
-        if sync::projected(hub, project, viewer, c).await? == base {
-            return Ok(c);
-        }
-    }
-    // A projection many hidden-only changes share stands for each of them:
-    // the one in the caller's own view, checked to project to what they
-    // named (BUG-1314, BUG-1467). A landing lands its edits on the tip,
-    // never its parent's hidden files, and any of them gives the same
-    // edits: the server's memory of the caller's view answers first.
+async fn resolve_base(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, base: ObjectId, onto: Option<&str>, landing: bool) -> Result<ObjectId> {
+    // A landing lands its edits on the tip, never its parent's hidden
+    // files, and any snapshot they see as `base` gives the same edits: the
+    // server's memory of their view answers first, checked.
     if landing {
         if let Some(r) = hub.caches.resolved(project.id, &project.view(viewer).key(), &base) {
             if sync::projected(hub, project, viewer, r).await? == base {
@@ -729,10 +737,13 @@ async fn resolve_base(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, base: 
             }
         }
     }
-    if let Some(r) = sync::resolve_named(hub, project, viewer, &base).await? {
-        return Ok(r);
+    // As a push resolves its parents (one function: BUG-1520): the branch
+    // the change goes to first, then the default branch.
+    let branches: Vec<&str> = onto.into_iter().collect();
+    match sync::resolve_for(hub, project, viewer, &base, &branches, landing).await? {
+        Some(r) => Ok(r),
+        None => Err(Error::not_found(format!("no snapshot {} that you can see", base.short()))),
     }
-    Err(Error::not_found(format!("no snapshot {} that you can see", base.short())))
 }
 
 /// Most of the caller's own unlanded changes a change may be stacked on
@@ -826,7 +837,8 @@ pub(crate) async fn create_with(
         Some(o) => Some(tip(hub, project.id, &o.branch).await?.ok_or_else(|| bad(format!("no branch '{}'", o.branch)))?),
         None => None,
     };
-    let base_real = resolve_base(hub, project, viewer, req.base, cur, land.is_some()).await?;
+    let target = onto.as_ref().map(|o| o.branch.clone()).or_else(|| land.as_ref().map(|(_, q)| q.branch.clone()));
+    let base_real = resolve_base(hub, project, viewer, req.base, target.as_deref(), land.is_some()).await?;
     // A new revision of one of the caller's own changes, or a new change.
     let (change_id, predecessors) = match req.change_id {
         Some(cid) => {

@@ -134,6 +134,26 @@ pub async fn insert(c: &mut PgConnection, project: i64, who: &Submitter, q: &Que
     Ok(())
 }
 
+/// Record, in the caller's transaction, that the changes `changes` (their
+/// ids) landed on `branch` in its lineage `lineage` as the snapshots
+/// `landed` (BUG-1522: "already landed" asks by change id, whatever route
+/// moved the branch: the landing service, a push, an API commit `onto`).
+/// The first landing of a change on a lineage is kept.
+pub async fn record_changes(c: &mut PgConnection, project: i64, branch: &str, lineage: i64, changes: &[String], landed: &[String]) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO landed_changes (project_id, branch, lineage, change_id, landed) \
+         SELECT $1, $2, $3, c, l FROM unnest($4::TEXT[], $5::TEXT[]) AS v(c, l) ON CONFLICT DO NOTHING",
+    )
+    .bind(project)
+    .bind(branch)
+    .bind(lineage)
+    .bind(changes)
+    .bind(landed)
+    .execute(&mut *c)
+    .await?;
+    Ok(())
+}
+
 /// The protected branches of a project: the rules of its default branch's
 /// tip `default_tip` (real), if it has one. A `.veilrules` that does not
 /// parse protects nothing (only admins write it, and their push refuses one
@@ -540,9 +560,15 @@ pub const NOTHING_TO_LAND: &str =
 pub const WALK_BUDGET: usize = 4_096;
 /// Most frontier snapshots of that walk the derived graph is asked about.
 const FRONTIER_LIMIT: usize = 64;
-/// Most snapshots made from one change that "already landed" asks about
-/// (one a branch it landed on); past it, `warming`.
-const LANDED_FROM_LIMIT: usize = 64;
+/// Whether a change of a stack landed already ([`Ancestry::landed`]).
+#[derive(Clone, Copy, PartialEq)]
+enum Landed {
+    No,
+    /// With the same edits: skipped.
+    Same,
+    /// A revision with other edits: refused.
+    Other,
+}
 
 /// A stack, and the branch's lineage it was judged under (`branch`:
 /// false when there is no such branch: the service answers so).
@@ -700,7 +726,15 @@ pub async fn stack(
                 }
             }
         }
-        let landed = held && anc.landed(x).await?;
+        let landed = match anc.landed(x, held).await? {
+            Landed::No => false,
+            Landed::Same => true,
+            Landed::Other => {
+                return Ok(Err(format!(
+                    "this change already landed on '{branch}' with other edits: make a new change for the further edits"
+                )))
+            }
+        };
         let lands = !landed
             && (!held || viewer.admin || {
                 let c = match (class, ends) {
@@ -895,41 +929,69 @@ impl Ancestry {
         Ok(v)
     }
 
-    /// Are held change `x`'s edits on the branch already? Yes only when the
-    /// history proves it: `landings` says so (a fast path, `submitted`), or
-    /// a snapshot the landing service made from `x` (`landed_from`: its
-    /// source is `x`, the condition in the statement, nothing cut before it)
-    /// is the tip or below it ([`Ancestry::has`]: `warming` when that cannot
-    /// be told), however long ago, whatever the deriver (BUG-1408,
-    /// BUG-1465, BUG-1466).
-    async fn landed(&mut self, x: ObjectId) -> Result<bool> {
-        let n: Option<i32> =
+    /// Has change `x` landed on the branch already (BUG-1522: by its change
+    /// id, whatever its snapshot: a rebase keeps the change id)? `landings`
+    /// first (a fast path whose absence means nothing), then the branch's
+    /// record of its changes in its lineage (`landed_changes`: one lookup no
+    /// bound limits, BUG-1521), the landed revision then checked to be the
+    /// tip or below it ([`Ancestry::has`]: `warming` when that cannot be
+    /// told). `Same`: its own edits are among the landed revision's (the
+    /// same change, or rebased on a tip that holds it: skip it); `Other`:
+    /// it brings further edits (refused: they are a new change's).
+    async fn landed(&mut self, x: ObjectId, held: bool) -> Result<Landed> {
+        let n: Option<i32> = if !held {
+            None
+        } else {
             sqlx::query_scalar("SELECT 1 FROM landings WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND submitted = $4 LIMIT 1")
                 .bind(self.project)
                 .bind(&self.branch)
                 .bind(self.lineage)
                 .bind(x.hex())
                 .fetch_optional(&self.hub.db)
-                .await?;
+                .await?
+        };
         if n.is_some() {
-            return Ok(true);
+            return Ok(Landed::Same);
         }
-        let made: Vec<String> = sqlx::query_scalar("SELECT landed FROM landed_from WHERE project_id = $1 AND source = $2 ORDER BY landed LIMIT $3")
-            .bind(self.project)
-            .bind(x.hex())
-            .bind(LANDED_FROM_LIMIT as i64 + 1)
-            .fetch_all(&self.hub.db)
-            .await?;
-        // Landed on more branches than are asked about: cannot be told.
-        if made.len() > LANDED_FROM_LIMIT {
-            return Err(crate::query::graph::warming());
+        let cid = crate::sync::blocking(&self.hub, self.project, move |src| Ok(src.snapshot(&x)?.change_id.to_string())).await?;
+        let row: Option<String> =
+            sqlx::query_scalar("SELECT landed FROM landed_changes WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND change_id = $4")
+                .bind(self.project)
+                .bind(&self.branch)
+                .bind(self.lineage)
+                .bind(&cid)
+                .fetch_optional(&self.hub.db)
+                .await?;
+        let Some(r) = row.and_then(|r| ObjectId::from_hex(&r).ok()) else { return Ok(Landed::No) };
+        if r == x {
+            return Ok(Landed::Same);
         }
-        for r in made.iter().filter_map(|r| ObjectId::from_hex(r).ok()) {
-            if self.has(r).await? {
-                return Ok(true);
-            }
+        if !self.has(r).await? {
+            return Ok(Landed::No);
         }
-        Ok(false)
+        // Nothing beyond the landed revision's edits (paths and what they
+        // become), whatever the base: the same change, or one rebased on a
+        // tip that holds it already (no edits of its own).
+        let same = crate::sync::blocking(&self.hub, self.project, move |src| {
+            let own = |id: ObjectId| -> Result<Vec<(String, Option<veil_core::TreeEntry>)>> {
+                let s = src.snapshot(&id)?;
+                let base = s.parents.first().copied().unwrap_or_else(crate::sync::root_snapshot_id);
+                Ok(edits::edit_set(src, s.tree, src.snapshot(&base)?.tree)?.into_iter().map(|c| (c.path, c.new)).collect())
+            };
+            let (a, b) = (own(x)?, own(r)?);
+            Ok(a.iter().all(|p| {
+                b.iter().any(|q| {
+                    p.0 == q.0
+                        && match (&p.1, &q.1) {
+                            (None, None) => true,
+                            (Some(e), Some(f)) => e.same_content(f),
+                            _ => false,
+                        }
+                })
+            }))
+        })
+        .await?;
+        Ok(if same { Landed::Same } else { Landed::Other })
     }
 
     /// The change of `viewer`'s history that held `x` stands for (view key
@@ -950,10 +1012,25 @@ impl Ancestry {
         .bind(px.hex())
         .fetch_all(&self.hub.db)
         .await?;
-        match own.as_slice() {
-            [v] => Ok(ObjectId::from_hex(v).ok()),
-            _ => Ok(None),
+        let Some(v) = (match own.as_slice() {
+            [v] => ObjectId::from_hex(v).ok(),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        if v == x {
+            return Ok(Some(x));
         }
+        // The step goes down, where the derived graph can tell (memos older
+        // than the column count as collapsed, so one row is unique).
+        let below = crate::derive::read(&self.hub, self.project, move |g| {
+            Ok(match (g.row(&x)?, g.row(&v)?) {
+                (Some(_), Some(_)) => g.is_ancestor(v, x)?,
+                _ => true,
+            })
+        })
+        .await?;
+        Ok(below.then_some(v))
     }
 
     /// The shared walk down from the tip, on until it finds `x`, ends, or has

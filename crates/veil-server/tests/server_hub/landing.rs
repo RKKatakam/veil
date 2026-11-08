@@ -3291,7 +3291,6 @@ fn real_of_seen(hub: &TestHub, pid: i64, seen: ObjectId) -> ObjectId {
 /// moved there by someone who cannot see it. A push of the same change
 /// (`push_with`'s tip candidates: the default branch first) is made on H.
 #[test]
-#[ignore = "BUG-1520: an API commit on a name two branch tips share is made on the newer tip (another branch's hidden work), not main's"]
 fn bug_1520_an_api_commit_on_main_as_seen_is_made_on_main_even_when_another_branch_s_tip_looks_the_same() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -3331,7 +3330,6 @@ fn bug_1520_an_api_commit_on_main_as_seen_is_made_on_main_even_when_another_bran
 /// class of BUG-1409), and nothing the dev made on that snapshot is ever
 /// accepted until someone changes a folder they see on top of it.
 #[test]
-#[ignore = "BUG-1521: an API commit or a push on a snapshot more than 4,096 hidden changes share is answered warming for ever"]
 fn bug_1521_a_change_on_a_snapshot_many_hidden_changes_share_is_accepted_as_with_few() {
     for n in [10usize, 4_100] {
         let hub = TestHub::start();
@@ -3374,7 +3372,6 @@ fn bug_1521_a_change_on_a_snapshot_many_hidden_changes_share_is_accepted_as_with
 /// a divergent change for every client); had P's file been undone on main
 /// meanwhile, P2's edits (P's) would land again (BUG-1312's harm).
 #[test]
-#[ignore = "BUG-1522: a rebased revision of a change landed already lands again (a second snapshot of the change on main)"]
 fn bug_1522_a_rebased_revision_of_a_landed_change_is_not_landed_again() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -3432,7 +3429,6 @@ fn bug_1522_a_rebased_revision_of_a_landed_change_is_not_landed_again() {
 /// the dev may not read) where a snapshot that does not exist is "snapshot
 /// … was not uploaded".
 #[test]
-#[ignore = "BUG-1523: a push on a real snapshot its pusher cannot see is read as their upload (answer: a hidden tree's id; a walk of history)"]
 fn bug_1523_a_snapshot_the_caller_cannot_see_is_named_as_one_that_does_not_exist() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -3490,7 +3486,6 @@ fn bug_1523_a_snapshot_the_caller_cannot_see_is_named_as_one_that_does_not_exist
 /// every later landing of a change on it `warming`, for ever. Here the 64
 /// other landings are rows written directly.
 #[test]
-#[ignore = "BUG-1521: a change landed on more than 64 branches makes every landing of a change on it warming for ever"]
 fn bug_1521_a_change_on_one_landed_on_many_branches_lands() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -3656,4 +3651,124 @@ fn a_change_landed_then_merged_back_is_not_landed_again() {
     assert_eq!(real_file(&hub, pid, "src/once/0.rs").as_deref(), Some(&b"0\n"[..]));
     let line = chain(&hub, pid, veil_server::sync::root_snapshot_id());
     assert_eq!(line.iter().filter(|(_, s)| s.change_id == cid).count(), 1, "P's change is on main's line more than once: {body}");
+}
+
+// ---- S17 redesign, cycle 4: guarantees -------------------------------------------------------
+
+/// BUG-1522's rule, the refusal (decided): a revision of a change landed
+/// already that brings further edits never lands them as that change: the
+/// dev lands P, then a revision of P with one more file; landing it is
+/// refused, naming the change's rule, and nothing of it lands.
+#[test]
+fn a_revision_of_a_landed_change_with_further_edits_is_refused() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let first = push_chain(&api, &p.dev, &p.name, "dev-work", "main", 1, Some("src/once"));
+    let v = land_held(&api, &token, &p.name, first, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    let tip = real_tip(&hub, pid);
+    let cid = source(&hub, pid).snapshot(&tip).unwrap().change_id;
+    // A revision of P on main as the dev sees it, with a further file.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/once/more.rs", "more\n");
+    let mut s = Snapshot {
+        parents: vec![c.tip],
+        change_id: cid,
+        tree: c.root,
+        description: Text::Plain("P, amended".into()),
+        author: "chain".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![first],
+        conflicts: vec![],
+        embargo: None,
+        signature: None,
+    };
+    s.sign(&c.identity);
+    let p3 = c.put(O::Snapshot(s));
+    let r = push_new(&c, &[("amended", p3)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let r = land_held(&api, &token, &p.name, p3, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 400, "{body}");
+    assert!(body.contains("already landed") && body.contains("make a new change for the further edits"), "{body}");
+    assert_eq!(real_tip(&hub, pid), tip, "{body}");
+    assert!(real_file(&hub, pid, "src/once/more.rs").is_none());
+}
+
+/// BUG-1520's other route: a push of a change on main as its pusher sees it
+/// is made on main's tip, as the API commit is (one resolution for both),
+/// never on another branch's tip that looks the same to them.
+#[test]
+fn a_push_on_main_as_seen_is_made_on_main_even_when_another_branch_s_tip_looks_the_same() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    let main_tip = c.tip;
+    c.file("src/h.rs", "h\n");
+    let h = crafted_on(&mut c, main_tip, veil_core::ChangeId::random(), "h", "");
+    c.file(&format!("{BILL_DIR}/unlanded.txt"), "fin's unlanded work\n");
+    let d = crafted_on(&mut c, h, veil_core::ChangeId::random(), "d", "");
+    let r = push_new(&c, &[("w2", d)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    move_branch(&api, &p.admin.token(), &p.name, "main", Some(main_tip), Some(h), false);
+    let tips = api.tips(Some(&token), &p.name).unwrap().branches;
+    assert_eq!(tips["main"], tips["w2"], "the dev sees w2 as main");
+    wait_derived(&hub, pid, d);
+    let mut m = Craft::new(&api, &p.dev, &p.name, "main");
+    m.file("src/mine.rs", "the dev's\n");
+    let mine = crafted_on(&mut m, tips["main"], veil_core::ChangeId::random(), "mine", "");
+    let r = push_new(&m, &[("mine", mine)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let real = ObjectId::from_hex(&sql_text(&hub, "SELECT target FROM branches WHERE project_id = $1 AND name = 'mine'", pid)).unwrap();
+    let got = source(&hub, pid).snapshot(&real).unwrap().parents[0];
+    assert_eq!(got, h, "the dev's push on main as they see it is made on {}", if got == d { "w2's tip D".to_string() } else { got.short() });
+}
+
+/// BUG-1524: `landed_changes` is written for what a move brings; a
+/// fast-forward to snapshots the server held already (here main moved to
+/// the tip of another branch) records nothing for them, so a rebased
+/// revision of one of their changes (emptied: main holds its edits) lands
+/// again as an empty change with that change id.
+#[test]
+#[ignore = "BUG-1524: a rebased revision of a change that reached the branch by a fast-forward to held snapshots lands again"]
+fn bug_1524_a_rebased_revision_of_a_change_fast_forwarded_onto_main_is_not_landed_again() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let main0 = tip_for(&hub, &token, &p.name);
+    let first = push_chain(&api, &p.dev, &p.name, "side", "main", 1, Some("src/once"));
+    // main fast-forwards to the side branch's tip (snapshots the server holds).
+    move_branch(&api, &token, &p.name, "main", Some(main0), Some(first), false);
+    let cid = source(&hub, pid).snapshot(&real_tip(&hub, pid)).unwrap().change_id;
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    let mut s = Snapshot {
+        parents: vec![c.tip],
+        change_id: cid,
+        tree: c.root,
+        description: Text::Plain("rebased".into()),
+        author: "chain".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![first],
+        conflicts: vec![],
+        embargo: None,
+        signature: None,
+    };
+    s.sign(&c.identity);
+    let p2 = c.put(O::Snapshot(s));
+    c.file("src/twice/0.rs", "0\n");
+    let q2 = crafted_on(&mut c, p2, veil_core::ChangeId::random(), "q", "");
+    let r = push_new(&c, &[("rebased", q2)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let v = land_held(&api, &token, &p.name, q2, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    let ids: Vec<_> = chain(&hub, pid, veil_server::sync::root_snapshot_id()).into_iter().map(|(_, s)| s.change_id).collect();
+    assert_eq!(ids.iter().filter(|i| **i == cid).count(), 1, "the change is on main twice");
 }
