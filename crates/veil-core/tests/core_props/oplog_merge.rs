@@ -962,6 +962,46 @@ fn split_lists_no_common_operation_as_one_sides() {
     assert_eq!(split.only_b, vec![b]);
 }
 
+/// BUG-1401: the split's walk ends early on timestamps, which presumes a
+/// command's operation is never older than its parents. The clamp
+/// (`Repo::base_time`) makes that so for new operations, but operations
+/// written before it (a clock set back) stay in the log: `n`, written
+/// after `o` with the clock set back, is older than its parent. `a`
+/// reaches `o` through `m` and `n`; `b` reaches `n`, so `o` is common.
+/// The walk reached `o` as `a`'s and ended once only `n` (common, older
+/// than every operation walked as one side's) was queued: `o` is listed as
+/// `a`'s, and what it introduced counts as `a`'s changes (BUG-1297's
+/// symptom).
+#[test]
+#[ignore = "BUG-1401: split lists a common operation as one side's when an operation is older than its parent"]
+fn bug_1401_split_lists_no_common_operation_as_one_sides_with_older_children() {
+    use veil_core::oplog::{OpStore, Operation};
+    let ops = OpStore::new(Arc::new(MemoryBackend::new()));
+    let op = |parents: Vec<ObjectId>, timestamp: i64, description: &str| Operation {
+        parents,
+        timestamp,
+        user: "alice".into(),
+        description: description.into(),
+        view: View::default(),
+        manual_undo: None,
+        undo_of: None,
+        redo_of: None,
+        workspace: None,
+        rewritten: Default::default(),
+    };
+    let o = ops.put(&op(vec![], 100, "o")).unwrap();
+    // The clock set back: `n` is older than its parent.
+    let n = ops.put(&op(vec![o], 1, "n")).unwrap();
+    let m = ops.put(&op(vec![o], 150, "m")).unwrap();
+    let a = ops.put(&op(vec![m, n], 200, "a")).unwrap();
+    let b = ops.put(&op(vec![n], 200, "b")).unwrap();
+    let split = ops.split(&[a], &[b]).unwrap();
+    assert_eq!(split.base, Some(n), "the nearest common operation");
+    assert_eq!(split.only_b, vec![b]);
+    assert!(!split.only_a.contains(&o), "{} is common (an ancestor of {}): {:?}", o.short(), n.short(), split.only_a.iter().map(|i| i.short()).collect::<Vec<_>>());
+    assert_eq!(split.only_a, vec![a, m]);
+}
+
 /// BUG-1296: a tag moved away and back (by `vl tag set` or an undo, which
 /// the merge counts as a change) concurrently with its deletion. Both
 /// sides introduced their value, so the merge compares with the nearest
