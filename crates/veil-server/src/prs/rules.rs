@@ -355,7 +355,7 @@ fn valid_glob(p: &str) -> bool {
     !p.is_empty() && p.len() <= 1024 && p.split('/').all(|n| !n.is_empty() && n != "." && n != ".." && (n == "**" || !n.contains("**")))
 }
 
-/// Does `path` match pattern `p` (see [`valid_glob`])?
+/// Does `path` match pattern `p` (see `valid_glob`)?
 pub fn glob_matches(p: &str, path: &str) -> bool {
     let p = match p.strip_suffix('/') {
         Some(d) => format!("{d}/**"),
