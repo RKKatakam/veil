@@ -771,3 +771,142 @@ fn agent_sessions_never_force_or_delete_and_a_narrowed_one_moves_a_branch_only_w
     assert_eq!(r.status, 200, "{}", body(&r));
     assert_eq!(r.json()["branch"]["status"], "ok", "{}", body(&r));
 }
+
+// ---- S11 review, cycle 2 ---------------------------------------------------------
+
+/// Property 1, by a branch move: an agent session never lands someone
+/// else's change of a file that decides access or review
+/// (`hub::agent::ACCESS_FILES`: "… or a branch move that lands one"). The
+/// admin parks a change of `.veilpolicy` (a tier line: no access line
+/// changes) and of `.veilrules` on a side branch; the admin's agent session
+/// moves `main` onto it, by a fast-forward push and by an API commit on it.
+#[test]
+#[ignore = "BUG-1391: an agent session lands someone else's change of .veilpolicy (tier lines) or .veilrules by moving a branch onto it"]
+fn an_agent_session_never_lands_someone_elses_change_of_an_access_file_by_moving_a_branch() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let atok = p.admin.token();
+    let tip0 = tip(&hub, &atok, &p.name);
+    let policy = std::fs::read_to_string(p.dir.join(".veilpolicy")).unwrap();
+    let mut own = Craft::new(&api, &p.admin, &p.name, "main");
+    own.file(".veilpolicy", &format!("{policy}src/api/generated/  ignore\n"));
+    own.file(".veilrules", "main  2 approvals\n");
+    let r = own.push_to("policy-draft-3e", None);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", body(&r));
+    let side = api.tips(Some(&atok), &p.name).unwrap().branches["policy-draft-3e"];
+    let agent = agent_token(&hub, &atok, &p.name, &[]);
+    let refused = |r: &Reply| {
+        (r.status == 403 && body(r).contains("agent_session"))
+            || (r.status == 200 && (r.json()["results"][0]["ok"] == false || r.json()["branch"]["status"] == "rejected"))
+    };
+    // A fast-forward push of main onto it.
+    let r = api.post_json(Some(&agent), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": tip0.hex(), "new": side.hex()}]}));
+    assert!(refused(&r), "a fast-forward landed the admin's .veilpolicy and .veilrules: {} {}", r.status, body(&r));
+    assert_eq!(tip(&hub, &atok, &p.name), tip0, "main moved onto the draft");
+    // An API commit of its own on the draft, onto main.
+    let r = change(&hub, &agent, &p.name, &json!({"base": side.hex(), "description": "on the draft", "edits": [{"path": "src/api/x.rs", "put": {"text": "x"}}],
+                                                  "onto": {"branch": "main", "expected": tip0.hex()}}));
+    assert!(refused(&r), "an API commit on the draft landed it: {} {}", r.status, body(&r));
+    assert_eq!(tip(&hub, &atok, &p.name), tip0, "main moved onto the draft");
+}
+
+/// Property 2, refusals: a narrowed session is told nothing of what lies
+/// outside its paths. It sees the folders on the way to `src/api` (so the
+/// entry `src/util`) but never what `src/util` holds; a push that replaces
+/// `src/util` by an empty folder is refused, and the refusal must not name
+/// the files there.
+#[test]
+#[ignore = "BUG-1392: a narrowed agent session's refused push names files outside its paths that it cannot list"]
+fn a_narrowed_agent_sessions_refused_push_names_nothing_outside_its_paths() {
+    const NAME: &str = "MARKER-UNLISTED-NAME-6b";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let dev = p.dev.token();
+    let base = tip(&hub, &dev, &p.name);
+    let r = change(&hub, &dev, &p.name, &json!({"base": base.hex(), "description": "util", "onto": {"branch": "main", "expected": base.hex()},
+                                                "edits": [{"path": format!("src/util/{NAME}.rs"), "put": {"text": "u"}}]}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["branch"]["status"], "ok", "{}", body(&r));
+    let narrow = agent_token(&hub, &dev, &p.name, &["src/api"]);
+    // Control: the narrowed session cannot list src/util.
+    let listed = q(&hub, Some(&narrow), &p.name, "tree", "path=src/util");
+    assert!(!body(&listed).contains(NAME), "control: the narrowed session lists src/util: {}", body(&listed));
+    let mut c = Craft::with(&api, narrow.clone(), p.dev.identity(), &p.name, "main");
+    let t = c.tip;
+    let empty = c.put_object(O::Tree(veil_core::object::Tree::default()));
+    c.refer_dir("src/util", empty);
+    let r = c.push_to("main", Some(t));
+    assert_eq!(r.status, 403, "the push is refused: {}", body(&r));
+    assert!(!body(&r).contains(NAME), "the refusal names a file outside the session's paths: {}", body(&r));
+}
+
+/// Property 3, the other way round: a new server never takes a person's
+/// token as an agent session's, nor an agent session's as a person's,
+/// whatever is done to its form; and no stored hash of an agent session is
+/// the previous release's hash of its token (or of its token without the
+/// prefix).
+#[test]
+fn a_token_is_only_ever_the_kind_of_session_it_was_made_as() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let token = p.dev.token();
+    let agent = agent_token(&hub, &token, &p.name, &["src/api"]);
+    let tips = |t: &str| api.get(Some(t), &format!("/v1/projects/{}/tips", p.name)).status;
+    assert_eq!(tips(&token), 200, "control: the person's session");
+    assert_eq!(tips(&agent), 200, "control: the agent session");
+    let bare = agent.strip_prefix(veil_server::auth::AGENT_TOKEN_PREFIX).expect("an agent token starts with agent-");
+    assert_eq!(tips(bare), 401, "an agent token without its prefix");
+    assert_eq!(tips(&format!("{}{token}", veil_server::auth::AGENT_TOKEN_PREFIX)), 401, "a person's token with the agent prefix");
+    // A person's session cannot make an agent session from an agent token.
+    let r = session(&hub, Some(&agent), &json!({"project": p.name, "attribution": {"agent": "x"}}));
+    assert_ne!(r.status, 200, "an agent session made another: {}", body(&r));
+    // Every stored hash: none is the plain BLAKE3 of the token or of its bare part.
+    let rows: Vec<(String, Option<String>)> = hub
+        .rt
+        .block_on(sqlx::query_as("SELECT token_hash, parent_hash FROM sessions WHERE agent IS NOT NULL").fetch_all(&hub.hub().db))
+        .unwrap();
+    assert!(!rows.is_empty(), "the agent session is stored");
+    for (h, _) in &rows {
+        for t in [agent.as_str(), bare] {
+            assert_ne!(*h, veil_server::auth::token_hash(t), "an agent session kept under the previous release's hash");
+        }
+    }
+}
+
+/// Property 5, the other routes: an older `vl` (no `veil-format`) is never
+/// sent a format-10 snapshot by `fetch` (it serves trees and files of a
+/// snapshot, never a snapshot) nor by the object routes, and its history
+/// request is refused before any frame.
+#[test]
+fn an_older_vl_gets_no_format_10_snapshot_by_any_route() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let token = p.dev.token();
+    let agent = agent_token(&hub, &token, &p.name, &[]);
+    let base = tip(&hub, &agent, &p.name);
+    let r = change(&hub, &agent, &p.name, &json!({"base": base.hex(), "description": "by an agent", "edits": [{"path": "src/a.rs", "put": {"text": "a"}}],
+                                                  "onto": {"branch": "main", "expected": base.hex()}}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["branch"]["status"], "ok", "{}", body(&r));
+    let t = tip(&hub, &token, &p.name);
+    let api = hub.api();
+    // History: refused, with no frame.
+    let h = api.post_json(Some(&token), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [t.hex()]}));
+    assert_eq!(h.status, 426, "{}", body(&h));
+    assert!(body(&h).contains("update_vl"), "{}", body(&h));
+    // Fetch, asking for the snapshot itself at the root: not served.
+    let f = api.post_json(Some(&token), &format!("/v1/projects/{}/fetch", p.name), &json!({"snapshot": t.hex(), "objects": [{"path": "", "id": t.hex()}]}));
+    assert_ne!(f.status, 200, "fetch served the snapshot: {}", f.status);
+    // Control: what fetch serves at the root is a tree.
+    let O::Snapshot(s) = O::decode(&api.history(&token, &p.name, &[t]).frames().into_iter().find(|(id, _)| *id == t).unwrap().1).unwrap() else { panic!() };
+    assert!(s.agent.is_some(), "control: the tip is attributed");
+    let f = api.post_json(Some(&token), &format!("/v1/projects/{}/fetch", p.name), &json!({"snapshot": t.hex(), "objects": [{"path": "", "id": s.tree.hex()}]}));
+    assert_eq!(f.status, 200, "{}", body(&f));
+    for (_, raw) in f.frames() {
+        assert!(matches!(O::decode(&raw), Ok(O::Tree(_))), "fetch sent something other than the tree");
+    }
+}

@@ -1307,6 +1307,24 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
 mod tests {
     use super::*;
 
+    /// Property 4 of the S11 review (BUG-1390's class): every rewrite of
+    /// `$VEIL_HOME/hub.json` (`update_entry`: `load_file`, a change,
+    /// `save_file`) keeps the fields this `vl` does not know (a later
+    /// release's, written by it on the same machine), or refuses. The file
+    /// is outside every repository, so no repository format guards it.
+    #[test]
+    #[ignore = "BUG-1393: a rewrite of $VEIL_HOME/hub.json drops the fields this vl does not know"]
+    fn hub_json_keeps_the_fields_this_vl_does_not_know() {
+        let before = br#"{"servers":{"hub.example:443":{"token":"t","expires_at":5,"anchors":{"p":"fp"},"later_trust":{"p":"MARKER-LATER-FIELD-1a"}}},"later_top":"MARKER-LATER-TOP-2b"}"#;
+        let mut f: HubFile = serde_json::from_slice(before).expect("an older vl reads a newer hub.json");
+        // What `update_entry` does: change one entry, write the whole file.
+        f.servers.get_mut("hub.example:443").unwrap().token = Some("renewed".into());
+        let after = String::from_utf8(serde_json::to_vec_pretty(&f).unwrap()).unwrap();
+        assert!(after.contains("renewed"), "the change is written: {after}");
+        assert!(after.contains("MARKER-LATER-FIELD-1a"), "a server entry's unknown field was dropped: {after}");
+        assert!(after.contains("MARKER-LATER-TOP-2b"), "an unknown top-level field was dropped: {after}");
+    }
+
     /// `vl` says it reads encoded frames, and reads both kinds: plain
     /// frames (a server from before S27) and compressed ones.
     #[test]
