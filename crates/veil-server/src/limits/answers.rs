@@ -126,18 +126,47 @@ impl Answers {
     /// refused once the change is made: it goes without a share then.
     pub async fn budget(self: &Arc<Self>, key: Key, resp: Response, refusable: bool) -> Option<Response> {
         let known = hyper::body::Body::size_hint(resp.body()).exact().map(|n| n as usize);
-        let first = match known {
+        let prepaid = resp.extensions().get::<Prepaid>().map(|p| p.0.lock().unwrap().take());
+        let first = match (prepaid, known) {
+            (Some(paid), _) => paid,
+            (None, known) => match known {
             Some(n) if n >= SMALL => match self.clone().take(key, n, Some(tokio::time::Instant::now() + WAIT)).await {
                 Some(h) => Some(h),
                 None if refusable => return None,
                 None => return Some(resp),
             },
             _ => None,
+            },
         };
         let (parts, body) = resp.into_parts();
         let body = Budgeted { inner: body, answers: self.clone(), key, first, waiting: None };
         Some(Response::from_parts(parts, Body::new(body)))
     }
+}
+
+/// Whose answer a route makes ([`super::admit`] sets it on the request),
+/// for a route that takes its answer's share itself ([`prepay`]).
+#[derive(Clone, Copy, Debug)]
+pub struct For(pub Key);
+
+/// A share a route took before making its answer, which [`Answers::budget`]
+/// then uses.
+#[derive(Clone)]
+pub struct Prepaid(Arc<Mutex<Option<Hold>>>);
+
+/// A share for an answer of `n` bytes, taken before the route reads them,
+/// so a refused request reads nothing (an object of known size: BUG-1330):
+/// `busy` if it is not free within [`WAIT`].
+pub async fn prepay(hub: &crate::Hub, asker: Option<For>, n: u64) -> crate::error::Result<Prepaid> {
+    let n = n as usize;
+    let hold = match asker {
+        Some(For(key)) if n >= SMALL => match hub.limits.answers.clone().take(key, n, Some(tokio::time::Instant::now() + WAIT)).await {
+            Some(h) => Some(h),
+            None => return Err(crate::error::Error::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, "busy", "the server is busy; try again")),
+        },
+        _ => None,
+    };
+    Ok(Prepaid(Arc::new(Mutex::new(hold))))
 }
 
 type Taking = Pin<Box<dyn Future<Output = Option<Hold>> + Send>>;

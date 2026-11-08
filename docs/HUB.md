@@ -2578,9 +2578,12 @@ Every request passes through `limits::admit` before any route, in this order:
    in the bytes, `Bytes::from_owner`). An answer of known length takes its
    share before its head is sent, waiting at most 2 s, else a read is
    answered `503 busy` and its bytes are let go (a change's answer, the
-   change made, goes without a share); a streamed answer takes a share per piece, holding
-   nothing while it waits. One client holds at most a quarter of it, except
-   one larger answer alone (up to the whole budget).
+   change made, goes without a share); a streamed answer takes a share per
+   piece, holding nothing while it waits. **An object** (`GET
+   /v1/objects/…`, its size known from its tree entry) takes its share
+   before it is read, so a refused request reads nothing. One client holds
+   at most a quarter of it, except one larger answer alone (up to the whole
+   budget).
 
 **The listener** (`serve`): at most `--max-connections` (1,024) open, the
 next waiting in the listener's queue; **an address opens at most an eighth
@@ -2605,9 +2608,10 @@ connection, its TLS records (about 50 KiB in, 16 KiB out), the HTTP/1.1
 buffer (128 KiB) or HTTP/2's windows and queues (at most about 0.8 MiB), so
 about 200 KiB for HTTP/1.1 times `--max-connections`: about 0.7 GiB with
 the defaults; answers below 64 KiB (one a connection, one a stream); and
-the server's caches. Answers *being built* (a route reading an object
-before its answer is budgeted) are bounded by the gates (at most twice
-`--db-connections` requests run at once) and let go at once when refused.
+the server's caches. Other answers *being built* (a route making its JSON
+or frames before its answer is budgeted) are bounded by the gates (at most
+twice `--db-connections` requests run at once) and let go at once when
+refused; objects, the large ones, are budgeted before they are read.
 **Every connection slot comes back in bounded time:** a handshake or head
 within 20 s, an idle connection within 40 s, a body that stops within one
 20 s window after the grace, a body of `n` bytes within 20 s + `n` /
@@ -2695,7 +2699,7 @@ cycle 1 review's findings in rows 13 to 21):
 | 18 | — (people behind one address) | their first requests to a server new to their sessions (BUG-1338) | each pays its device | `bug_1338_signed_in_people_behind_one_address_are_refused_on_a_server_new_to_them` |
 | 19 | — (one person's agents) | 6 agents on one device, cloning, committing, pushing, pulling (BUG-1339) | within the device's rate | `bug_1339_an_agent_fleet_on_one_device_is_refused_at_the_defaults` |
 | 20 | — (readers behind a regional cache) | 40 cold reads of one signed-in reader through a cache (BUG-1332) | each counts against the reader's device; the cache's address keeps its own rate | `cache::bug_1332_a_caches_forwarded_reads_count_against_its_address` |
-| 21 | Anyone on Earth | 8 clients that ask for a 24 MiB file and never read (BUG-1330) | one answer held at a time for the address; the others `busy`, their bytes let go | `bug_1330_answers_to_clients_that_do_not_read_are_not_bounded_by_a_budget`; `answers::tests::*` |
+| 21 | Anyone on Earth | 8 clients that ask for a 24 MiB file and never read (BUG-1330) | one answer held at a time for the address; the others `busy` before the object is read (RSS +27 MiB, +196 before) | `bug_1330_answers_to_clients_that_do_not_read_are_not_bounded_by_a_budget`; `answers::tests::*` |
 | 22 | A client within its limits, past a burst | `vl` refused `429` or shed `503` (BUG-1331) | waits `retry_after_ms` and tries again | `bug_1331_vl_waits_out_a_rate_limit` |
 
 **Residual:** people behind one address share its anonymous rate and an

@@ -486,7 +486,8 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
 
     // 5: the route, its cache hits counted for its project, its answer
     // under the answers' budget.
-    let req = Request::from_parts(parts, Body::from(bytes));
+    let mut req = Request::from_parts(parts, Body::from(bytes));
+    req.extensions_mut().insert(answers::For(body_key));
     let (resp, layers) = health::LAYERS
         .scope(std::cell::Cell::new(health::Counts::default()), async {
             let r = next.run(req).await;

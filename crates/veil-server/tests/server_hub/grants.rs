@@ -475,7 +475,7 @@ fn bench_object_routes() {
     for (i, (chain, id)) in many.iter().cycle().take(3000).enumerate() {
         let h = headers(chain, id);
         let t = Instant::now();
-        let r = hub.rt.block_on(veil_server::grant::get_object(State(state.clone()), P((p.name.clone(), id.hex())), h)).unwrap();
+        let r = hub.rt.block_on(veil_server::grant::get_object(State(state.clone()), P((p.name.clone(), id.hex())), h, None)).unwrap();
         if i >= 500 {
             times.push(t.elapsed().as_secs_f64() * 1e6);
         }
