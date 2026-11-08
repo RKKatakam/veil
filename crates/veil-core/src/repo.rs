@@ -320,7 +320,7 @@ fn ref_values(view: &View) -> Vec<(RefKey, ObjectId)> {
 }
 
 /// What an operation takes back (see `Repo::retractor`).
-enum Retractor {
+pub(crate) enum Retractor {
     Undo(ObjectId),
     Redo(ObjectId),
     Restore(std::collections::HashSet<ObjectId>),
@@ -328,7 +328,7 @@ enum Retractor {
 
 /// The operations the retractors take back, those taken back themselves
 /// (an undo of a restore, a redo of an undo) taking back nothing.
-fn retracted_commands(retractors: &BTreeMap<ObjectId, Retractor>) -> std::collections::HashSet<ObjectId> {
+pub(crate) fn retracted_commands(retractors: &BTreeMap<ObjectId, Retractor>) -> std::collections::HashSet<ObjectId> {
     let mut out: std::collections::HashSet<ObjectId> = Default::default();
     // A fixed point: each round recomputes from the retractors still in
     // force; an operation only takes back older ones, so it settles.
@@ -580,6 +580,11 @@ impl Repo {
             repo.settle()?;
         }
         drop(reg);
+        // A release a restore or undo took back, stopped before the
+        // take-back itself, is taken back here (BUG-1487).
+        if !repo.remote {
+            repo.take_back_releases_out_of_force()?;
+        }
         Ok(repo)
     }
 
@@ -1156,7 +1161,7 @@ impl Repo {
     /// it undid, a redo the undo it reverts, an op restore every operation
     /// between the restored one and its parents (a restore written before
     /// `restore_of` names the restored operation in its description).
-    fn retractor(&self, o: &crate::oplog::Operation) -> Result<Option<Retractor>> {
+    pub(crate) fn retractor(&self, o: &crate::oplog::Operation) -> Result<Option<Retractor>> {
         if let Some(u) = o.undo_of {
             return Ok(Some(Retractor::Undo(u)));
         }

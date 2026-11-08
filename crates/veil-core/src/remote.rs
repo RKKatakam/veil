@@ -1024,6 +1024,8 @@ pub fn push(
     // Releases staged by `vl embargo release` become permanent before the
     // withheld history is decided: an undo cannot take one back between
     // that decision and the upload (BUG-807).
+    // Only those the op log holds in force (BUG-1487).
+    local.take_back_releases_out_of_force()?;
     let releases_published = local.keys().publish_staged_releases()?;
     let mut report = SyncReport::default();
     let (sendable, withheld) = sendable_tags(local, only_tags, &mut report)?;

@@ -1150,8 +1150,11 @@ fn check_rewrites_follow_through_merges(disk: bool, nw: usize, undo: bool, old_r
                 repo.commit_working_copy(&ws, &format!("{ws} {n}")).map(|_| ())
             }
             4..=7 => {
-                // Describe a visible commit (not a working copy).
-                let wcs: Vec<ObjectId> = repo.view().workspaces.values().map(|w| w.wc).collect();
+                // Describe a visible commit (not a working copy), and not an
+                // old version a landed command rewrote: a second version of
+                // a change is BUG-1488's, not decided yet.
+                let rewritten: std::collections::HashSet<ObjectId> = cmds.iter().filter(|c| c.landed.is_some()).flat_map(|c| c.rewrites.iter().map(|r| r.1)).collect();
+                let wcs: Vec<ObjectId> = repo.view().workspaces.values().map(|w| w.wc).chain(rewritten).collect();
                 let cands: Vec<ObjectId> = repo
                     .exact()
                     .visible()
@@ -1224,6 +1227,15 @@ fn check_rewrites_follow_through_merges(disk: bool, nw: usize, undo: bool, old_r
     Ok(())
 }
 
+/// The range of steps of a model check: `lo..hi`, or `VEIL_PROPS_STEPS`
+/// (`120..300` for the long runs of a review).
+fn steps(lo: usize, hi: usize) -> std::ops::Range<usize> {
+    std::env::var("VEIL_PROPS_STEPS")
+        .ok()
+        .and_then(|v| v.split_once("..").and_then(|(a, b)| Some(a.parse().ok()?..b.parse().ok()?)))
+        .unwrap_or(lo..hi)
+}
+
 fn review_cases(default: u32) -> u32 {
     std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
@@ -1233,7 +1245,7 @@ proptest! {
 
     /// Guarantee 1 of the BUG-1294 review, memory backend, 2 to 5 writers.
     #[test]
-    fn every_write_survives_concurrent_merges_memory(nw in 2usize..6, steps in prop::collection::vec(any::<u16>(), 20..120)) {
+    fn every_write_survives_concurrent_merges_memory(nw in 2usize..6, steps in prop::collection::vec(any::<u16>(), steps(20, 120))) {
         check_every_write_survives(false, nw, false, false, &steps)?;
     }
 }
@@ -1243,7 +1255,7 @@ proptest! {
 
     /// The same on the disk backend.
     #[test]
-    fn every_write_survives_concurrent_merges_disk(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), 20..80)) {
+    fn every_write_survives_concurrent_merges_disk(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), steps(20, 80))) {
         check_every_write_survives(true, nw, false, false, &steps)?;
     }
 }
@@ -1254,7 +1266,7 @@ proptest! {
     /// Auto-rebase through concurrent merges (BUG-1299's class), memory
     /// backend.
     #[test]
-    fn rewrites_follow_through_concurrent_merges_memory(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), 20..100)) {
+    fn rewrites_follow_through_concurrent_merges_memory(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), steps(20, 100))) {
         check_rewrites_follow_through_merges(false, nw, false, false, &steps)?;
     }
 }
@@ -1264,7 +1276,7 @@ proptest! {
 
     /// The same on the disk backend.
     #[test]
-    fn rewrites_follow_through_concurrent_merges_disk(nw in 2usize..4, steps in prop::collection::vec(any::<u16>(), 20..70)) {
+    fn rewrites_follow_through_concurrent_merges_disk(nw in 2usize..4, steps in prop::collection::vec(any::<u16>(), steps(20, 70))) {
         check_rewrites_follow_through_merges(true, nw, false, false, &steps)?;
     }
 }
@@ -1276,7 +1288,7 @@ proptest! {
     /// undoing anything (showing an old snapshot again undoes nothing,
     /// BUG-1434).
     #[test]
-    fn rewrites_follow_with_refs_to_old_versions_memory(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), 20..100)) {
+    fn rewrites_follow_with_refs_to_old_versions_memory(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), steps(20, 100))) {
         check_rewrites_follow_through_merges(false, nw, false, true, &steps)?;
     }
 }
@@ -1286,7 +1298,7 @@ proptest! {
 
     /// The same on the disk backend.
     #[test]
-    fn rewrites_follow_with_refs_to_old_versions_disk(nw in 2usize..4, steps in prop::collection::vec(any::<u16>(), 20..70)) {
+    fn rewrites_follow_with_refs_to_old_versions_disk(nw in 2usize..4, steps in prop::collection::vec(any::<u16>(), steps(20, 70))) {
         check_rewrites_follow_through_merges(true, nw, false, true, &steps)?;
     }
 }
@@ -1298,8 +1310,7 @@ proptest! {
     /// describes concurrent with each other (BUG-1403's reproduction; what
     /// it still finds, now and then, is BUG-1444).
     #[test]
-    #[ignore = "BUG-1444: op restores of part of a command around divergent describes; the merge and the model disagree on whether a rewrite stands, about 1 run in 8 of 64 cases"]
-    fn bug_1444_rewrites_follow_with_undo_restore_and_concurrent_describes(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), 20..100)) {
+    fn bug_1444_rewrites_follow_with_undo_restore_and_concurrent_describes(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), steps(20, 100))) {
         check_rewrites_follow_through_merges(false, nw, true, false, &steps)?;
     }
 }
@@ -1310,7 +1321,7 @@ proptest! {
     /// The model check with `vl undo` and `vl op restore` among the
     /// commands, and writes back to earlier values (memory backend).
     #[test]
-    fn bug_1295_every_write_survives_with_undo_and_restore(nw in 2usize..6, steps in prop::collection::vec(any::<u16>(), 20..120)) {
+    fn bug_1295_every_write_survives_with_undo_and_restore(nw in 2usize..6, steps in prop::collection::vec(any::<u16>(), steps(20, 120))) {
         check_every_write_survives(false, nw, true, true, &steps)?;
     }
 }
@@ -1320,7 +1331,7 @@ proptest! {
 
     /// The same on the disk backend.
     #[test]
-    fn every_write_survives_with_undo_and_restore_disk(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), 20..80)) {
+    fn every_write_survives_with_undo_and_restore_disk(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), steps(20, 80))) {
         check_every_write_survives(true, nw, true, true, &steps)?;
     }
 }
@@ -1627,6 +1638,56 @@ fn bug_1433_the_first_operations_of_the_walk_cost_a_few_reads_with_one_time() {
     assert_eq!(first.len(), 5, "the walk listed five");
     assert_eq!(first[0], head, "newest first");
     assert!(reads <= 20, "the first five of 500 operations of one time read {reads} operations");
+}
+
+/// The walk's order on ties that strictly later command times leave: a
+/// merge has its newest parent's time. `a` (10), `c` on it (11); `m1`
+/// merges `a` and `b` (5), with `a`'s time; `m2` merges `m1` and `c`, with
+/// `c`'s. From `m2`, `a` is reached through `c` while `m1`, which descends
+/// from it with its time, is still queued: `a` must wait for `m1`.
+#[test]
+fn walk_lists_a_merge_before_the_parent_whose_time_it_has() {
+    use veil_core::oplog::{OpStore, Operation};
+    let op = |parents: Vec<ObjectId>, timestamp: i64, description: String| Operation {
+        parents,
+        timestamp,
+        user: "alice".into(),
+        description,
+        view: View::default(),
+        manual_undo: None,
+        undo_of: None,
+        redo_of: None,
+        workspace: None,
+        rewritten: Default::default(),
+        restore_of: None,
+    };
+    let mut cases = 0;
+    for n in 0..400 {
+        let ops = OpStore::new(Arc::new(MemoryBackend::new()));
+        let a = ops.put(&op(vec![], 10, format!("a{n}"))).unwrap();
+        let b = ops.put(&op(vec![], 5, format!("b{n}"))).unwrap();
+        let c = ops.put(&op(vec![a], 11, format!("c{n}"))).unwrap();
+        let mut p1 = vec![a, b];
+        p1.sort();
+        let m1 = ops.put(&op(p1, 10, format!("m1-{n}"))).unwrap();
+        let mut p2 = vec![m1, c];
+        p2.sort();
+        let m2 = ops.put(&op(p2, 11, format!("m2-{n}"))).unwrap();
+        // The id order that lists `a` first among the two of time 10.
+        if a < m1 {
+            continue;
+        }
+        cases += 1;
+        let order: Vec<ObjectId> = ops.walk(&[m2]).map(|r| r.unwrap().0).collect();
+        let at = |id: &ObjectId| order.iter().position(|o| o == id).unwrap();
+        for (child, parent) in [(m2, m1), (m2, c), (c, a), (m1, a), (m1, b)] {
+            assert!(at(&child) < at(&parent), "{} (a child) after {}", child.short(), parent.short());
+        }
+        if cases == 8 {
+            break;
+        }
+    }
+    assert!(cases > 0, "the id order ran");
 }
 
 /// BUG-1296: a tag moved away and back (by `vl tag set` or an undo, which

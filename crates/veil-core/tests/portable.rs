@@ -154,7 +154,9 @@ fn the_installed_clock_stamps_snapshots_and_operations() {
     let op_ts = repo.op_log(1).unwrap()[0].1.timestamp;
     clock::reset_clock();
     assert_eq!(snap_ts, t);
-    assert_eq!(op_ts, t);
+    // The clock stands still: the snapshot's operation is a millisecond
+    // after its parent, the init's (never at or before a parent's time).
+    assert_eq!(op_ts, t + 1);
     assert!(!clock::clock_installed());
 }
 
@@ -359,8 +361,9 @@ fn head_names(fs: &MemoryBackend) -> Vec<String> {
 }
 
 /// The `base_time` clamp (BUG-1297 fix): with the clock set back, the next
-/// operations keep the newest parent's time; a clock set forward moves
-/// them on. Operations stay newest first in the op log either way, and
+/// operations take a millisecond after the newest parent's time (strictly
+/// later, so times still separate a command from its parents, BUG-1485,
+/// BUG-1486); a clock set forward moves them on. Operations stay newest first in the op log either way, and
 /// `vl undo` undoes the last one.
 #[test]
 fn operation_times_never_go_back_and_the_log_stays_in_order() {
@@ -372,7 +375,7 @@ fn operation_times_never_go_back_and_the_log_stays_in_order() {
     let root = repo.root_id();
     repo.set_tag("a", root, false).unwrap();
     let ahead = repo.op_log(1).unwrap()[0].1.timestamp;
-    // Set back an hour: every later operation keeps the time.
+    // Set back an hour: every later operation is a millisecond after its parent.
     now.store(t, std::sync::atomic::Ordering::SeqCst);
     for n in ["b", "c", "d"] {
         repo.set_tag(n, root, false).unwrap();
@@ -387,7 +390,7 @@ fn operation_times_never_go_back_and_the_log_stays_in_order() {
     repo.undo().unwrap();
     let undone = !repo.view().tags.contains_key("e") && repo.view().tags.contains_key("d");
     clock::reset_clock();
-    assert_eq!(times, vec![ahead; 4], "clamped to the newest parent's time");
+    assert_eq!(times, vec![ahead + 3, ahead + 2, ahead + 1, ahead], "a millisecond after the newest parent's time");
     assert!(descs[0].contains("'d'") || descs[0].contains(" d"), "the newest first: {descs:?}");
     assert!(descs[3].contains("'a'") || descs[3].contains(" a"), "the oldest last: {descs:?}");
     assert_eq!(last, t + 7_200_000);
@@ -703,7 +706,6 @@ fn a_release_taken_back_by_a_restore_stays_taken_back_through_undo_redo_and_merg
 /// embargoed fix. Here the restore is committed as `vl op restore`
 /// records it, and the process stops there.
 #[test]
-#[ignore = "BUG-1487: a restore past a staged release that commits but stops before taking the release back leaves it staged for the next push"]
 fn bug_1487_a_restore_that_stops_before_taking_back_a_release_still_takes_it_back() {
     let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
     clock::reset_clock();
@@ -826,7 +828,6 @@ fn same_time_run_with_two_heads(n: usize) -> (Arc<MemoryBackend>, Identity) {
 /// on a run of 500 reads all 500, once per head. On `integration` the
 /// split of the same two heads reads a handful.
 #[test]
-#[ignore = "BUG-1486: with the clock set back, merging two heads reads every operation of the run of one time below them"]
 fn bug_1486_merging_two_heads_with_the_clock_set_back_reads_a_few_operations() {
     let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (disk, me) = same_time_run_with_two_heads(500);
@@ -848,7 +849,6 @@ fn bug_1486_merging_two_heads_with_the_clock_set_back_reads_a_few_operations() {
 /// `vl redo` and `resolve_prefix` read all 500 on every call. BUG-1433's
 /// fix covers a line of operations, not a merge on one.
 #[test]
-#[ignore = "BUG-1485: with the clock set back, the op log's first operations below a merge read every operation of the run of one time"]
 fn bug_1485_the_op_log_below_a_merge_with_the_clock_set_back_reads_a_few_operations() {
     let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (disk, me) = same_time_run_with_two_heads(500);

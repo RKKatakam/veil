@@ -2044,7 +2044,14 @@ the outsiders' view; format 8 removed all of it (FORMAT.md §5). What is left:
      operation's own parents (the `release embargo <id>` operations they
      reach and the restored one does not), never a comparison of times,
      which a clock set back would get wrong (BUG-1400), nor the heads read
-     before the restore's transaction (BUG-1404). Redoing the undo of a release is refused: undo and
+     before the restore's transaction (BUG-1404). And a push publishes a
+     staged release only if the op log holds it in force (its latest
+     `release embargo <id>` operation in the heads' history, not taken
+     back by an undo or op restore in force); the others are taken back
+     first, as they are at open: a restore or undo stopped between its
+     commit and its take-back cannot publish the release (BUG-1487).
+     `vl embargo release` records its operation before it stages the
+     release. Redoing the undo of a release is refused: undo and
      redo never release.
    * **Preview.** `vl embargo release` shows the embargoed merge, the
      withheld history it publishes, the tags that carry it and the remotes
@@ -2483,10 +2490,14 @@ take no lock:
   is) is still judged by the views: not applied when a head that saw it
   shows its old snapshot, or a side shows it where the fold step's shared
   history does not (BUG-1295). On one side, a rewrite replaces an earlier
-  one of the same snapshot only if its operation descends from the
-  earlier one's; two that stand and differ are a divergent change, which
-  nothing follows, and a merge does not revisit that decision when one
-  of them is taken back later (BUG-1444).
+  one of the same snapshot when its operation descends from the earlier
+  one's; two that stand and differ are a divergent change, which nothing
+  follows, and a merge does not revisit that decision when one of them is
+  taken back later (BUG-1444). Open (BUG-1488): when a command that saw
+  a rewrite rewrites the old version again, the merge's answer depends
+  on whether the two rewrites first meet in one fold step (the second
+  replaces the first) or not (divergent); the intended rule is
+  divergence while both versions are visible.
   The confinement check runs against **every side's view**: a rewrite that
   would move a change out of an unreleased embargo either side had it in
   is dropped and its replacement rewritten back, so the change stays
@@ -2495,8 +2506,10 @@ take no lock:
   refused stays on its old
   parents, with what is built on it, and the warning names it (BUG-805).
   Its timestamp is its
-  parents' latest (a command's operation is never older than its parents
-  either, whatever the clock says), its user `veil`, and what it creates derives its change
+  parents' latest (a command's operation is strictly later than its parents,
+  whatever the clock says: a millisecond after the newest when the clock
+  is behind, so times still separate a command from its parents and the
+  op log's walks end near the heads, BUG-1485, BUG-1486), its user `veil`, and what it creates derives its change
   ids from its parents: two processes merging the same heads write the same
   operation, and `create_new` of its head file loses to itself. Merging at
   open, rather than in memory for read-only commands as the design

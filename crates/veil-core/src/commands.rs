@@ -1,12 +1,12 @@
 //! High-level history operations. Each is one transaction → one op-log entry.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     embargo::{normalize_tree, policy_rekeys, NormalizeOptions, NormalizeReport},
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
-    keychain::{ReleaseState, StageOutcome, TakeBack},
+    keychain::{ReleaseState, TakeBack},
     now_millis,
     object::{Snapshot, Text, TreeEntry},
     oplog::Tag,
@@ -904,14 +904,63 @@ impl Repo {
     ///
     /// [`Keychain::stage_release`]: crate::keychain::Keychain::stage_release
     pub fn release_embargo(&mut self, id: &str) -> Result<()> {
-        if self.keys().stage_release(id)? != StageOutcome::Staged {
+        if self.keys().load_embargo(id)?.is_none() {
+            return Err(VeilError::NotFound(format!("embargo '{id}'")));
+        }
+        if self.keys().release_state(id) != ReleaseState::Unreleased {
             return Ok(());
         }
+        // The operation first, then the staged release: stopped in between,
+        // the embargo stays unreleased, and a staged release always has its
+        // operation in the op log, which a push checks (BUG-1487).
         let mut tx = self.transaction(format!("{RELEASE_OP_PREFIX}{id}"))?;
         tx.repository_wide();
         tx.record_always();
         tx.commit()?;
+        self.keys().stage_release(id)?;
         Ok(())
+    }
+
+    /// Take back every staged release the op log does not hold in force:
+    /// its latest `release embargo <id>` operation is not in the heads'
+    /// history, or an undo or op restore in force took it back (a restore
+    /// or undo that stopped before taking the release back itself,
+    /// BUG-1487). Run before a push publishes the staged releases, and at
+    /// open when any is staged: a crash at any point cannot publish a
+    /// release early. Returns the ids taken back.
+    pub fn take_back_releases_out_of_force(&self) -> Result<Vec<String>> {
+        let staged: Vec<String> = self.keys().staged_releases()?.into_iter().map(|(id, _)| id).collect();
+        if staged.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut want: std::collections::BTreeSet<String> = staged.iter().cloned().collect();
+        let mut release_op: BTreeMap<String, ObjectId> = BTreeMap::new();
+        let mut retractors = BTreeMap::new();
+        // Newest first: an operation that takes a release back descends
+        // from it, so it is read before it.
+        for r in self.ops.walk(&self.ops.heads()?) {
+            let (id, op) = r?;
+            if let Some(x) = self.retractor(&op)? {
+                retractors.insert(id, x);
+            }
+            if let Some(e) = op.description.strip_prefix(RELEASE_OP_PREFIX) {
+                if want.remove(e) {
+                    release_op.insert(e.to_string(), id);
+                }
+            }
+            if want.is_empty() {
+                break;
+            }
+        }
+        let retracted = crate::repo::retracted_commands(&retractors);
+        let mut out = Vec::new();
+        for e in staged {
+            let in_force = release_op.get(&e).is_some_and(|o| !retracted.contains(o));
+            if !in_force && self.keys().take_back_release(&e)? == TakeBack::TakenBack {
+                out.push(e);
+            }
+        }
+        Ok(out)
     }
 
     /// Undoing the operation `description`, as far as embargo releases go.

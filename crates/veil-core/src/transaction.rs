@@ -1209,7 +1209,7 @@ impl<'r> Transaction<'r> {
         }
         let (timestamp, user) = match &self.merge {
             Some(m) => (m.timestamp, "veil".to_string()),
-            None => (now_millis().max(self.repo.base_time), self.repo.user.clone()),
+            None => (now_millis().max(self.repo.base_time + 1), self.repo.user.clone()),
         };
         Operation {
             parents,
