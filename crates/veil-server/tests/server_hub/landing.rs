@@ -2806,3 +2806,344 @@ fn bug_1409_a_change_on_more_hidden_changes_than_the_walk_budget_lands_as_it_wou
     assert_eq!(r.json()["state"], "landed", "{body}");
     assert_eq!(real_file(&hub, pid, "src/run.rs").as_deref(), Some(&b"the dev's\n"[..]));
 }
+
+// ---- S17 redesign review, cycle 3 (BUG-1465..1468) ----------------------------
+
+/// Hold the deriver of project `pid` (as another server's, or one behind a
+/// burst of landings, does): the derived graph learns nothing new until
+/// the connection returned is dropped.
+fn hold_deriver(hub: &TestHub, pid: i64) -> sqlx::PgConnection {
+    hub.rt.block_on(async {
+        use sqlx::Connection;
+        let url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+        let mut c = sqlx::PgConnection::connect(&url).await.unwrap();
+        let key: i64 = 0x7665_696c_6472_0000_i64 ^ pid;
+        sqlx::query("SELECT pg_advisory_lock($1)").bind(key).execute(&mut c).await.unwrap();
+        c
+    })
+}
+
+/// Wait until the derived graph holds real snapshot `id`.
+fn wait_derived(hub: &TestHub, pid: i64, id: ObjectId) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while sql_i64_text(hub, "SELECT count(*) FROM graph WHERE project_id = $1 AND snapshot = $2", pid, &id.hex()) == 0 {
+        assert!(std::time::Instant::now() < deadline, "the deriver never reached {}", id.short());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// One snapshot crafted on `parent` with `c`'s tree as it stands and change
+/// id `cid`, signed by `c`'s device; its description varied until its id
+/// starts with `prefix`.
+fn crafted_on(c: &mut Craft<'_>, parent: ObjectId, cid: veil_core::ChangeId, what: &str, prefix: &str) -> ObjectId {
+    for n in 0u64.. {
+        let mut s = Snapshot {
+            parents: vec![parent],
+            change_id: cid,
+            tree: c.root,
+            description: Text::Plain(format!("{what} {n}")),
+            author: "crafter".into(),
+            timestamp: veil_core::now_millis(),
+            predecessors: vec![],
+            conflicts: vec![],
+            embargo: None,
+            signature: None,
+        };
+        s.sign(&c.identity);
+        if ObjectId::hash(&O::Snapshot(s.clone()).encode()).hex().starts_with(prefix) {
+            return c.put(O::Snapshot(s));
+        }
+    }
+    unreachable!()
+}
+
+/// Upload what `c` made, and push `updates` (new branches: name, snapshot).
+fn push_new_branches(c: &Craft<'_>, updates: &[(String, ObjectId)]) {
+    let up = c.api.upload(&c.token, &c.project, &c.objects);
+    assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+    let receipts = up.json()["receipts"].as_array().unwrap().clone();
+    let map: serde_json::Map<String, Value> = c.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+    let updates: Vec<Value> = updates.iter().map(|(b, id)| json!({"branch": b, "expected": null, "new": id.hex()})).collect();
+    let r = c.api.post_json(Some(&c.token), &format!("/v1/projects/{}/push", c.project), &json!({"updates": updates, "receipts": map}));
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    for res in r.json()["results"].as_array().unwrap() {
+        assert_eq!(res["ok"], true, "{body}");
+    }
+}
+
+/// BUG-1465: `Ancestry::landed` takes "not decided" for "not landed". A
+/// revision of the change on the branch counts only when `near` answers
+/// `Some(true)`; while the derived graph does not hold the tip (the deriver
+/// a moment behind a busy branch, or another server's) `near` walks at most
+/// 256 snapshots and answers `None` for one further down, so a change
+/// landed long ago (its `landings` row gone, its landing more than 256
+/// snapshots below the tip) is in the stack again: it lands as its edits a
+/// second time, or (here: main holds its file) is answered `conflict`, and
+/// the dev's change on top never lands.
+#[test]
+#[ignore = "BUG-1465: a change landed long ago lands again while the deriver is behind the tip"]
+fn bug_1465_a_change_landed_long_ago_is_not_landed_again_while_the_deriver_is_behind() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let first = push_chain(&api, &p.dev, &p.name, "dev-work", "main", 1, Some("src/once"));
+    let v = land_held(&api, &token, &p.name, first, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    // Its landing, derived long since (an hour later).
+    wait_derived(&hub, pid, real_tip(&hub, pid));
+    // The deriver a moment behind the tip, after an hour of other work on
+    // main (300 snapshots), and the `landings` rows gone.
+    let lock = hold_deriver(&hub, pid);
+    push_chain(&api, &p.admin, &p.name, "main", "main", 300, None);
+    let second = push_chain(&api, &p.dev, &p.name, "dev-work", "dev-work", 1, Some("src/twice"));
+    let h = hub.hub();
+    hub.rt.block_on(sqlx::query("DELETE FROM landings WHERE project_id = $1").bind(pid).execute(&h.db)).unwrap();
+    let r = land_held(&api, &token, &p.name, second, true);
+    drop(lock);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "landed", "the dev's change on their own change landed an hour ago: {body}");
+    assert_eq!(r.json()["landed"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(real_file(&hub, pid, "src/twice/0.rs").as_deref(), Some(&b"0\n"[..]));
+}
+
+/// BUG-1466: `Ancestry::landed` reads at most 16 revisions of a change, the
+/// smallest snapshot ids first (`ORDER BY snapshot LIMIT 16`), and only
+/// then asks which one was made from it: a change with more than 16 other
+/// revisions on the server (an agent amending and pushing its work) whose
+/// landing's id is not among the 16 smallest is taken for not landed once
+/// its `landings` row is gone, and is in the stack again. Here 16 earlier
+/// revisions (each on a branch, ids starting `000`), the one landed, and,
+/// after the rows' hour, a change on top of it.
+#[test]
+#[ignore = "BUG-1466: more than 16 revisions of a change hide its landing from the already-landed check"]
+fn bug_1466_a_change_with_many_revisions_landed_long_ago_is_not_landed_again() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.admin.token();
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    let base = c.tip;
+    let cid = veil_core::ChangeId::random();
+    c.file("src/once/0.rs", "0\n");
+    let mut updates: Vec<(String, ObjectId)> = (0..16).map(|i| (format!("rev-{i}"), crafted_on(&mut c, base, cid, &format!("revision {i}"), "000"))).collect();
+    let landed_one = crafted_on(&mut c, base, cid, "the revision landed", "");
+    updates.push(("work".to_string(), landed_one));
+    push_new_branches(&c, &updates);
+    let v = land_held(&api, &token, &p.name, landed_one, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    let landing = real_tip(&hub, pid);
+    assert!(!landing.hex().starts_with("000"), "the landing's id is among the revisions' (one chance in 4,096): run again");
+    wait_derived(&hub, pid, landing);
+    for (_, id) in &updates {
+        wait_derived(&hub, pid, *id);
+    }
+    // An hour later: the rows are gone; a change on top of the one landed.
+    let h = hub.hub();
+    hub.rt.block_on(sqlx::query("DELETE FROM landings WHERE project_id = $1").bind(pid).execute(&h.db)).unwrap();
+    let second = push_chain(&api, &p.admin, &p.name, "work", "work", 1, Some("src/twice"));
+    let r = land_held(&api, &token, &p.name, second, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "landed", "a change on one landed an hour ago, with 16 other revisions: {body}");
+    assert_eq!(r.json()["landed"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(real_file(&hub, pid, "src/twice/0.rs").as_deref(), Some(&b"0\n"[..]));
+}
+
+/// BUG-1467: `sync::resolve_newest` still truncates by id before it orders,
+/// for the real snapshots the derived graph does not hold yet (`ORDER BY
+/// p.real_id LIMIT 64`): with the deriver behind a run of more than 64
+/// billing-only changes (all one snapshot for the dev, none a branch tip),
+/// the dev's API commit on that snapshot is grafted on whichever of the 64
+/// smallest ids descends from the others, not on the newest of the run
+/// (BUG-1314's harm: its hidden files are an older state's). The answer
+/// depends on how far the deriver is, so two servers, or one a second
+/// later, answer differently.
+#[test]
+#[ignore = "BUG-1467: resolve_newest truncates by id the candidates the deriver has not reached"]
+fn bug_1467_a_base_shared_by_many_underived_hidden_only_changes_resolves_to_the_newest() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let lock = hold_deriver(&hub, pid);
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file("src/v.rs", "v\n");
+    let main_tip = c.tip;
+    let mut parent = crafted_on(&mut c, main_tip, veil_core::ChangeId::random(), "v", "");
+    let mut run = Vec::new();
+    for i in 0..200 {
+        c.file(&format!("{BILL_DIR}/run.txt"), &format!("{i}\n"));
+        // The newest of the run: an id past every other's, likely.
+        parent = crafted_on(&mut c, parent, veil_core::ChangeId::random(), &format!("billing {i}"), if i == 199 { "f" } else { "" });
+        run.push(parent);
+    }
+    c.file("src/v2.rs", "v2\n");
+    let v2 = crafted_on(&mut c, parent, veil_core::ChangeId::random(), "v2", "");
+    push_new_branches(&c, &[("w".to_string(), v2)]);
+    let newest = *run.last().unwrap();
+    let seen = api.tips(Some(&token), &p.name).unwrap().branches["w"];
+    let base = seen_parent(&api, &token, &p.name, seen);
+    let shared = sql_i64_text(&hub, "SELECT count(DISTINCT real_id) FROM projections WHERE project_id = $1 AND projected_id = $2", pid, &base.hex());
+    assert!(shared > 64, "the dev's snapshot below w's tip stands for {shared} real snapshots");
+    let mine = kept_change(&api, &token, &p.name, base, json!([put("src/lib.rs", "the dev's\n")]));
+    drop(lock);
+    let h = hub.hub();
+    let real: String = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT real_id FROM projections WHERE project_id = $1 AND projected_id = $2 LIMIT 1").bind(pid).bind(mine.hex()).fetch_one(&h.db))
+        .unwrap();
+    let got = source(&hub, pid).snapshot(&ObjectId::from_hex(&real).unwrap()).unwrap().parents[0];
+    let at = run.iter().position(|r| *r == got).map_or("none of the run".to_string(), |i| format!("billing {i}"));
+    assert_eq!(got, newest, "the dev's change, made on what they see below w's tip, is on {at} of 200");
+}
+
+/// BUG-1468: the "one indexed statement" that steps over a hidden run
+/// (`Ancestry::below_hidden`: the lowest real snapshot with the run's
+/// projection by the derived graph) reads every real snapshot with that
+/// projection, and looks each up in `graph`, to find the lowest: its cost
+/// grows with the run (and `sync::resolve_newest`'s three statements read
+/// the same range, of every view). A viewer who sees only a quiet folder
+/// sees a day of other folders' landings as one snapshot: here a run of
+/// 1,500,000 (their `projections` and `graph` rows, written directly), and
+/// the dev's one change on it, which lands in milliseconds with a run of
+/// 50 (`bug_1409_…`'s shape).
+#[test]
+#[ignore = "BUG-1468: stepping over a hidden run reads the whole run"]
+fn bug_1468_stepping_over_a_hidden_run_costs_the_same_however_long_the_run() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    let mut parent = c.tip;
+    for i in 0..50 {
+        c.file(&format!("{BILL_DIR}/run.txt"), &format!("{i}\n"));
+        parent = crafted_on(&mut c, parent, veil_core::ChangeId::random(), &format!("billing {i}"), "");
+    }
+    push_new_branches(&c, &[("billing-run".to_string(), parent)]);
+    let seen = api.tips(Some(&token), &p.name).unwrap().branches["billing-run"];
+    assert_eq!(seen, tip_for(&hub, &token, &p.name), "the dev sees billing-run as main");
+    wait_derived(&hub, pid, parent);
+    // The rest of the run, as the services and the deriver store it.
+    let key = sql_text(&hub, &format!("SELECT view_key FROM projections WHERE project_id = $1 AND real_id = '{}'", parent.hex()), pid);
+    let h = hub.hub();
+    hub.rt.block_on(async {
+        let mut tx = h.db.begin().await.unwrap();
+        sqlx::query("SET LOCAL statement_timeout = 0").execute(&mut *tx).await.unwrap();
+        sqlx::query(
+            "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at) \
+             SELECT $1, $2, md5('r' || i) || md5('s' || i), $3, 0 FROM generate_series(1, 1500000) i",
+        )
+        .bind(pid)
+        .bind(&key)
+        .bind(seen.hex())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO graph (project_id, snapshot, generation, depth, parents, change_id, flags, skip, changed) \
+             SELECT $1, md5('r' || i) || md5('s' || i), 9000000000000000 + i, 100000 + i, '[]', md5('c' || i), 0, '[]', 'none' \
+             FROM generate_series(1, 1500000) i",
+        )
+        .bind(pid)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        sqlx::query("ANALYZE projections").execute(&h.db).await.unwrap();
+        sqlx::query("ANALYZE graph").execute(&h.db).await.unwrap();
+    });
+    let mut c = Craft::new(&api, &p.dev, &p.name, "billing-run");
+    c.file("src/run.rs", "the dev's\n");
+    let r = c.push_to("billing-run", Some(seen));
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let mine = api.tips(Some(&token), &p.name).unwrap().branches["billing-run"];
+    // Rows read from `graph` and `projections` (the database's statistics,
+    // flushed within about 10 s of a connection's last statement).
+    let read = || -> i64 {
+        std::thread::sleep(Duration::from_secs(12));
+        hub.rt
+            .block_on(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT (sum(coalesce(seq_tup_read, 0)) + sum(coalesce(idx_tup_fetch, 0)))::BIGINT FROM pg_stat_user_tables \
+                     WHERE relname IN ('graph', 'projections')",
+                )
+                .fetch_one(&h.db),
+            )
+            .unwrap()
+    };
+    let before = read();
+    let r = land_held(&api, &token, &p.name, mine, false);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "queued", "{body}");
+    let rows = read() - before;
+    hub.rt.block_on(async {
+        sqlx::query("DELETE FROM projections WHERE project_id = $1 AND created_at = 0").bind(pid).execute(&h.db).await.unwrap();
+        sqlx::query("DELETE FROM graph WHERE project_id = $1 AND changed = 'none' AND generation >= 9000000000000000").bind(pid).execute(&h.db).await.unwrap();
+    });
+    assert!(rows < 100_000, "the submit of one change on a hidden run of 1,500,050 read {rows} rows of graph and projections");
+}
+
+/// BUG-1467, another view's candidates first (why `changes::resolve_base`
+/// needed its fallback): `sync::resolve_newest` reads the candidates of
+/// every view and puts a branch tip first even when its row is another
+/// view's, and a push grafts on the first it is given (`real_of`, no check
+/// that it projects to the parent the pusher named). Here a folder only
+/// the devs see (`zz-docs/`): anyone on Earth sees w2's tip D (an edit of
+/// it on H) as the same snapshot as H, the dev does not. The dev's push of
+/// a change on H as they see it is grafted on D, a snapshot they never saw,
+/// and their change deletes D's `zz-docs/d.txt`.
+#[test]
+#[ignore = "BUG-1467: a push is grafted on another view's candidate"]
+fn bug_1467_a_push_on_a_shared_projection_is_grafted_on_what_its_pusher_saw() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    p.admin.ok(&p.dir, &["access", "zz-docs/", "devs"]);
+    p.admin.commit_main(&p.dir, "the devs see zz-docs");
+    p.admin.ok(&p.dir, &["push"]);
+    let token = p.dev.token();
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    let main_tip = c.tip;
+    c.file("src/h.rs", "h\n");
+    let h = crafted_on(&mut c, main_tip, veil_core::ChangeId::random(), "h", "");
+    let h_tree = c.root;
+    c.file("src/t.rs", "t\n");
+    let t = crafted_on(&mut c, h, veil_core::ChangeId::random(), "t", "");
+    let mut c2 = Craft::new(&api, &p.admin, &p.name, "main");
+    c2.objects = c.objects.clone();
+    c2.root = h_tree;
+    c2.file("zz-docs/d.txt", "d\n");
+    let d = crafted_on(&mut c2, h, veil_core::ChangeId::random(), "d", "");
+    push_new_branches(&c2, &[("w".to_string(), t), ("w2".to_string(), d)]);
+    // Anyone on Earth, then the dev, read the branches.
+    api.tips(None, &p.name).unwrap();
+    let seen = api.tips(Some(&token), &p.name).unwrap().branches["w"];
+    let base = seen_parent(&api, &token, &p.name, seen);
+    let views = sql_i64_text(&hub, "SELECT count(DISTINCT view_key) FROM projections WHERE project_id = $1 AND projected_id = $2", pid, &base.hex());
+    assert!(views >= 2, "H looks the same to anyone on Earth and to the dev ({views} view)");
+    let mut m = Craft::new(&api, &p.dev, &p.name, "main");
+    m.tip = base;
+    m.root = m.tree_of(base);
+    m.file("src/mine.rs", "the dev's\n");
+    let mine = crafted_on(&mut m, base, veil_core::ChangeId::random(), "mine", "");
+    push_new_branches(&m, &[("mine".to_string(), mine)]);
+    let real = ObjectId::from_hex(&sql_text(&hub, "SELECT target FROM branches WHERE project_id = $1 AND name = 'mine'", pid)).unwrap();
+    let got = source(&hub, pid).snapshot(&real).unwrap().parents[0];
+    let named = if got == d { "w2's tip D".to_string() } else { got.short() };
+    let src = source(&hub, pid);
+    let docs = |id: ObjectId| {
+        let O::Tree(root) = O::decode(&src.raw(&src.snapshot(&id).unwrap().tree).unwrap()).unwrap() else { panic!("not a tree") };
+        root.get("zz-docs").is_some()
+    };
+    assert_eq!(got, h, "the dev's change on H as they see it is grafted on {named} (zz-docs/d.txt there: {}; in the dev's change: {})", docs(got), docs(real));
+}
