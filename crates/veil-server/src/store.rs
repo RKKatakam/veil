@@ -399,8 +399,9 @@ pub struct Objects {
     packs: crate::pack::Packs,
     /// Requests to the store, for the benchmarks' cost gates
     /// (`storage-and-cost.md` §9): writes, bytes written, reads; of the
-    /// writes, the deriver's in the background (S12: one object per derived
-    /// snapshot, after the landing).
+    /// writes, those no push or upload made (`background_writes`: the
+    /// deriver's, the search index's, the viewer graphs' after a landing,
+    /// and the projected trees a grant stores on a pull).
     pub writes: AtomicU64,
     pub written_bytes: AtomicU64,
     pub reads: AtomicU64,
@@ -670,7 +671,8 @@ impl Objects {
         self.put_encoded(project, id, encode(raw)).await
     }
 
-    /// [`Objects::put`] for the deriver, in the background (counted apart).
+    /// [`Objects::put`] for work that is no push's or upload's (the
+    /// deriver, the search index, grants): counted apart.
     pub async fn put_background(&self, project: i64, id: &ObjectId, raw: Bytes) -> Result<()> {
         BACKGROUND.scope((), self.put(project, id, raw)).await
     }

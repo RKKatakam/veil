@@ -2442,35 +2442,55 @@ server's lookup maps, discarding), `store.rs` (`Objects`: reads through
 packs, staging), `sync.rs` (`upload`, `push`), `migrations/0013_packs.sql`.
 Nothing changes for `vl` or on the wire.
 
+* **Upgrading to S28 is not rolling** (decision, 2026-11-08, BUG-1158):
+  stop every server, run `veil-server migrate`, start them all on S28. A
+  server before S28 reads objects only under their own keys and cannot read
+  packs, so beside an S28 server it would answer "missing object" for
+  everything S28 stored (no leak, no loss: S28 servers serve it). No cheap
+  sign tells an S28 server that an older one still runs, so this is the
+  deployment rule, not a check. Receipts without a pack (from servers
+  before S28) are not accepted.
 * **A pack** is one storage object, `p/<project>/pack/<name>` (`name`: 128
   random bits in hex), never edited in place:
-  `"veilpack1\n" ‖ count u32be ‖ index ‖ entries`. The index, at the front,
-  is `count × (id 32 ‖ offset u64be ‖ len u32be)`, sorted by id; each entry
-  is one object's S27 encoding, as `Objects` stores a loose one. Object ids
-  stay the BLAKE3 of the canonical encoding. The index is read with one
-  ranged `GET` of the first 64 KiB (a second for a larger index); one object
-  with one ranged `GET` of its slot, and decoded and checked against its id
-  like any object (a wrong slot is an error, never other content). S29 merges
-  packs by reading indexes and copying entries, and drops an object by
-  writing a pack without it.
-* **The `packs` table** (migration 13) has one row per pack a transaction
-  **listed** (its objects are the project's) or **discarded** (`listed`
-  false: its storage object is deleted after the row is written). The
-  primary key `(project, name)` decides between the two: whichever row comes
-  first stays, so a listed pack is never deleted and a discarded one never
+  `"veilpack2\n" ‖ count u32be ‖ index ‖ entries`. The index, at the front,
+  is `count × (id 32 ‖ offset u64be ‖ len u32be)`, sorted by id; **each
+  entry is the object's id followed by its S27 encoding**, and the slot
+  spans both. Object ids stay the BLAKE3 of the canonical encoding. The
+  index is read with one ranged `GET` of the first 64 KiB (a second for a
+  larger index); an object with a ranged `GET` of its slot. **Every read
+  checks the id the entry starts with before it uses a byte of it**, a
+  `Range` read too (`pack::entry`; a range far into a large object reads
+  the id first, then the range), so a wrong slot (a damaged index, a
+  merger's mistake) is an error, never another object's bytes (BUG-1154);
+  a whole read is also decoded and checked against the id. S29 merges packs
+  by reading indexes and copying entries, and drops an object by writing a
+  pack without it.
+* **The `packs` table** (migration 13) has a row for every pack in storage:
+  *staged* (an upload's, with its uploader), *listed* (its objects are the
+  project's) or *discarded* (its storage object is deleted after the row
+  says so). A staged row turns listed or discarded once: the push's
+  transaction updates it (locking the row) and a discard updates only a
+  staged row, so a listed pack is never deleted and a discarded one never
   listed.
-* **Uploads are staged** (BUG-930). `POST …/objects` checks each frame as
-  before (S27's decoding bounds, the hash, canonical decoding, the format)
-  and writes the request's objects as **one staged pack**: one storage write
-  per upload request, no database row. Each receipt is
-  `MAC(project ‖ person ‖ id ‖ pack) ‖ "." ‖ pack`: it names the pack, holds
-  for that person only, and cannot be moved to another pack. A staged pack
-  is nobody's: its objects are read only by a push or API commit of that
-  person that shows its receipts, through `Objects::get_staged`, and cached
-  under keys of their own (`Objects::staged_key`, in the object and tree
-  caches), so no read of the project ever answers a staged object. A
-  receipt without a pack (from a server before S28, which stored the object
-  as it came) still names a stored object.
+* **Uploads are staged and recorded** (BUG-930, BUG-1157). `POST …/objects`
+  checks each frame as before (S27's decoding bounds, the hash, canonical
+  decoding, the format), writes a *staged* row for the request's pack
+  (with the uploader; one database commit per upload request, apart from
+  the push's one), then the pack: one storage write per upload request.
+  Each receipt is `MAC(project ‖ person ‖ id ‖ pack) ‖ "." ‖ pack`. A staged
+  pack is nobody's: its objects are read only by a push or API commit of
+  that person that shows its receipts, through `Objects::get_staged`, and
+  cached under keys of their own (`Objects::staged_key`, in the object and
+  tree caches), so no read of the project ever answers a staged object.
+  **An upload of objects that a pack the same person staged on this server
+  holds all of** (a push that lost a race, uploaded again by `vl`'s next
+  try) gets that pack's receipts, with no new pack and no commit.
+* **What counts as uploaded** (BUG-1155): only an object its receipt's
+  pack holds, where that pack is the pusher's and staged or listed (one
+  statement: the rows). A receipt of a discarded upload is worth nothing,
+  and a staged object is read from its pack only, never looked for in the
+  project's store instead, so naming a guess of hidden content with an old
+  receipt gets the answer a wrong guess gets.
 * **A push** reads the staged packs its receipts name (their indexes, from
   memory on the server that took the upload), checks every new snapshot as
   before, and then, when something lands:
@@ -2480,32 +2500,54 @@ Nothing changes for `vl` or on the wire.
     objects the server made (the graft's trees, completed snapshots, the
     pusher's signed projections), into **one pack of its own**;
   * lists them in its one transaction (one statement more), and refuses
-    with 409 if a pack it names was discarded first (`vl` uploads again).
+    with 409 if a pack it names was discarded first (`vl` uploads again);
+  * discards every staged pack it did not list.
   **A push its checks refuse** (a secret in plain text, a path the pusher
   may not write, anything answered before its transaction) discards its
   staged packs and deletes its own, so **a refused upload stays in the
-  store only for the push that refuses it**. A landing push discards a
-  staged pack it did not list. A push that only lost a race (409, or every
-  update not a fast-forward) passed every check: it deletes nothing and
-  commits nothing (BUG-910), and `vl` uploads again. Those uploads, a
-  staged pack no push ever names (a client that stops between upload and
-  push), and those of a request run again after a database or store error
-  (`db::retry_requests`), stay unread until S29's job removes them.
+  store only for the push that refuses it**. **A push that only lost a
+  race** (409, or every update not on the tip) passed every check: its
+  uploads stay staged for the next try (above), and its own pack, if it
+  wrote one, is deleted once the database shows its transaction did not
+  list it.
+* **What storage holds that no push listed** (until S29's job removes
+  what is older than its grace): staged packs, each with its row: of each
+  push that lost every race since (one per upload request, reused by its
+  retries on the same server; one per server a retry reaches), of uploads
+  no push followed, and those of a request run again after a database or
+  store error (`db::retry_requests`). That is at most what each person
+  uploaded, as before S28, and S24's per-person limits bound it. The one
+  storage object the database does not name is a push's own pack between
+  its write and its transaction's end (milliseconds), left behind only if
+  the server process dies right then; S29's job lists storage for those.
 * **An API commit** (S10) reads the objects its receipts name from their
-  staged packs into memory (at most 1 GiB), with the inline text it already
-  held there, stores what it keeps loose once every check passed, as
-  before, and discards the staged packs when it is answered.
+  staged packs, at most 1 GiB, **holding a share of the server-wide bound
+  on decoded bytes** (`store::DECODED_IN_FLIGHT`, 256 MiB for every request
+  together; a commit naming more takes all of it, so such commits run one
+  at a time: BUG-1156); it stores what it keeps loose once every check
+  passed, as before, and discards the staged packs when it is answered
+  (not after a lost race: the caller may try again with the same receipts).
 * **Reads.** `Objects` finds a project's object in its cache, then in the
   listed packs this server knows (an in-memory map per project, object id →
-  pack and slot, built from the indexes; 128 MiB for every project together,
-  projects used least recently dropped first), then loose (objects from
-  before S28, and what grants, API commits and the deriver store). After a
-  miss in both it reads the project's listing again (one statement, unless
-  a listing began after the miss: it holds every pack listed before) and
-  the indexes of packs it does not know, so a server reads what another
-  server's push listed. A push's own packs join the map at its commit.
-  `Range` (S5) is of the object: a plain packed object is read for those
-  bytes only; a compressed one decoded whole, as before.
+  pack and slot, built from the indexes; **128 MiB for every project
+  together, by bytes, each project's entry counted**; projects used least
+  recently dropped first, the one in use last; weights read under one lock,
+  so eviction and additions never miscount), then loose (objects from
+  before S28, and what grants, API commits, the deriver and the search
+  index store). After a miss in both it reads the project's listing again
+  (one statement, unless a listing began after the miss: it holds every
+  pack listed before) and the indexes of packs it does not know, so a
+  server reads what another server's push listed. A push's own packs join
+  the map at its commit. `Range` (S5) is of the object: a plain packed
+  object is read for those bytes only (and its id); a compressed one
+  decoded whole, as before.
+* **Neighbours read together** (BUG-1152). Before it answers, a `fetch`
+  reads the packed objects it will send that are not cached, per pack and
+  by offset, slots at most 64 KiB apart in one ranged request of at most
+  2 MiB (8 at once, each holding a share of the bound on bytes read ahead,
+  or not prefetched), and caches them, each entry's id and each object
+  checked. A clone asks a level of many snapshots at once, whose objects
+  lie in upload order in the same packs.
 * **Permissions are unchanged and per object.** Packs change where objects
   are stored, never who may read them: every route reads one object at a
   time through `Objects` after the same checks (S1's path walk, S5's grant
@@ -2531,12 +2573,14 @@ trusted (with code; never with secrets' plaintext).
 |---|---|---|---|
 | 1 | A pack hands a reader objects of folders they cannot see | no route sends a pack; every object is read one at a time after its path or chain check | `grants::object_routes_serve_only_what_a_grant_reaches`, `leaks::…`, `sync::…` (all on packed objects now) |
 | 2 | Pack membership confirms a hidden object (one in the same pack as a visible one) | lookups answer only what the route's check reached; a hidden object of the same pack gets the answer a random id gets | `grants::object_routes_serve_only_what_a_grant_reaches` |
-| 3 | A refused plain-text secret stays stored (BUG-930) | uploads are staged; the refusing push discards them | `packs::a_refused_push_deletes_its_staged_upload`, `changes::bug_930_…` |
-| 4 | Another person's staged upload read or claimed (a guess of its content confirmed, BUG-824's class) | receipts bind person and pack; staged objects are read only through receipts; never cached as the project's | `packs::receipts_hold_only_for_their_person_and_pack` |
+| 3 | A refused plain-text secret stays stored (BUG-930) | uploads are staged; the refusing push discards them; a landing push discards what it did not list | `packs::a_refused_push_deletes_its_staged_upload`, `packs::an_unread_plain_text_secret_beside_a_landing_push_is_not_kept`, `changes::bug_930_…` |
+| 4 | Another person's staged upload read or claimed, or a discarded upload's receipt used to confirm a guess of hidden content (BUG-824's class, BUG-1155) | receipts bind person and pack; an object counts as uploaded only if its receipt's pack, the pusher's and not discarded, holds it; staged objects are read only from their pack and never cached as the project's | `packs::receipts_hold_only_for_their_person_and_pack`, `packs::bug_1155_…` (a push and an API commit) |
 | 5 | A receipt moved to another pack, or a crafted pack name (`../`) | the MAC covers the pack; names are 32 lowercase hex digits | same |
 | 6 | A race lists a pack another push of the same person discards, or deletes a listed one | the primary key decides; discard deletes only after its row won; a push deletes its own pack directly only if its transaction never began | `pack::…`, `packs::a_refused_push_deletes_its_staged_upload` |
 | 7 | An object a push's checks never read kept in the store (an upload a push names but never checks) | only what the checks read is listed or copied | `packs::a_push_is_one_storage_write_and_reads_come_from_its_pack` (crafted pushes upload superseded trees) |
-| 8 | A damaged or hostile index (counts, offsets past the end, unsorted, overflow) | parsed with every bound checked; every object read is checked against its id | `pack::tests::malformed_indexes_are_refused`, `store::tests::packs_are_read_by_range_and_staged_ones_are_nobodys` |
+| 8 | A damaged or hostile index (counts, offsets past the end, unsorted, overflow, a slot naming another object's entry) | parsed with every bound checked; every read, ranged ones too, checks the id its entry starts with; whole reads are checked against the id | `pack::tests::…`, `store::tests::bug_1154_a_wrong_slot_never_serves_another_objects_range` |
+| 11 | API commits naming large uploads exhaust memory (BUG-1156) | held under the server-wide bound on decoded bytes | `packs::bug_1156_…` (six at once) |
+| 12 | Push attempts that lose races fill storage with copies (BUG-1157) | retries get the earlier upload's receipts; every staged pack recorded | `packs::bug_1157_…` |
 | 9 | Checks run on a guess answer differently from one at a time | a guess is used only when its inputs are the real ones; results and errors in order | `packs::bug_865_…` (an admin's 70 snapshots, every guess right; a developer's 70, every guess wrong), the whole `server_hub` suite |
 | 10 | A server serves a stale "not found" for an object another server just listed | after a miss, the listing is read again | `packs::a_push_is_one_storage_write_and_reads_come_from_its_pack` (a second server) |
 
@@ -2574,7 +2618,8 @@ caching it (`store::owned`).
 
 Revert the merge **only if no server ran it on real data**: a server
 before S28 cannot read packed objects (it finds no loose object), and it
-would read receipts with a pack as invalid. Once a server has listed packs,
+would read receipts with a pack as invalid (and the upgrade is not
+rolling, above). Once a server has listed packs,
 going back needs every listed pack's objects written out loose first; no
 tool does that yet. Migration 13 only adds a table (harmless to an older
 server).

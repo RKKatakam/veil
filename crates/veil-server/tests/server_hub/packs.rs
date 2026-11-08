@@ -340,6 +340,44 @@ fn bug_1155_a_receipt_of_a_discarded_upload_confirms_no_guess() {
     );
 }
 
+/// BUG-1155 through `POST …/changes` (fixed): an API commit putting a
+/// guessed object, shown with the receipt of an upload an earlier, refused
+/// API commit discarded, gets the same answer whether the guess is the
+/// hidden file or not.
+#[test]
+fn bug_1155_an_api_commit_with_a_discarded_upload_confirms_no_guess() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let token = p.dev.token();
+    let hidden_path = format!("{BILL_DIR}/acme/invoice.txt");
+    let real = real_paths(&p.dir).into_iter().find(|(path, _)| *path == hidden_path).unwrap().1;
+    let right = format!("{BILL_MARK}\nsecond").into_bytes();
+    let wrong = b"MARKER-A-WRONG-GUESS-THROUGH-THE-API-9e2d".to_vec();
+    let (rid, rraw) = (ObjectId::hash(&O::Blob(right.clone()).encode()), O::Blob(right.clone()).encode());
+    let (wid, wraw) = (ObjectId::hash(&O::Blob(wrong.clone()).encode()), O::Blob(wrong.clone()).encode());
+    assert_eq!(rid, real, "the guess is the hidden object");
+    let up = api.upload(&token, &p.name, &[(rid, rraw), (wid, wraw)]);
+    assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+    let receipts: Vec<String> = serde_json::from_value(up.json()["receipts"].clone()).unwrap();
+    let base = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+    let change = |body: serde_json::Value| api.post_json(Some(&token), &format!("/v1/projects/{}/changes", p.name), &body);
+    // Refused on purpose (a path the dev may not write): its uploads are
+    // discarded.
+    let both: serde_json::Map<String, serde_json::Value> = [(rid.hex(), json!(receipts[0])), (wid.hex(), json!(receipts[1]))].into_iter().collect();
+    let refused = change(json!({"base": base.hex(), "edits": [{"path": format!("{BILL_DIR}/x.txt"), "put": {"object": rid.hex()}}], "receipts": both}));
+    assert!(refused.status == 403 || refused.status == 400, "{}: {}", refused.status, String::from_utf8_lossy(&refused.body));
+    let mut answers = Vec::new();
+    for (id, receipt) in [(wid, &receipts[1]), (rid, &receipts[0])] {
+        let r = change(json!({"base": base.hex(), "edits": [{"path": "src/guess.txt", "put": {"object": id.hex()}}],
+            "receipts": {id.hex(): receipt}}));
+        // The body names the object's id, which differs: compare the rest.
+        answers.push((r.status, String::from_utf8_lossy(&r.body).replace(&id.hex(), "ID").replace(&id.short(), "ID")));
+    }
+    assert!(answers[0].0 == 400 || answers[0].0 == 404, "a wrong guess: {:?}", answers[0]);
+    assert_eq!(answers[1], answers[0], "a right guess of hidden content got another answer than a wrong one");
+}
+
 /// The refusal (status and message) of pushing `n` new snapshots on
 /// `main`, as `who`, each changing one file; `bad` makes snapshot `i`
 /// refused: a plain-text `.env` (`Some(path)`), or signed by a key no

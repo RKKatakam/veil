@@ -192,8 +192,9 @@ async fn grant_root(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snap: Ob
         return Ok(None);
     };
     for (id, raw) in created {
+        // A pull's write, not a push's: counted apart (`storage-and-cost.md` §9).
         if !hub.objects.exists(project.id, &id).await? {
-            hub.objects.put(project.id, &id, Bytes::from(raw)).await?;
+            hub.objects.put_background(project.id, &id, Bytes::from(raw)).await?;
         }
     }
     hub.grants.stored.insert(memo, (), 64);

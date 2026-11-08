@@ -108,7 +108,8 @@ pub const GATE_STATEMENTS_PER_WARM_PULL: f64 = 5.0;
 /// Storage writes of a push's own requests (S28: its upload's pack, and
 /// the push's own pack when the server completes it), per push attempt (a
 /// landing that lost races pushed, and uploaded, once per try); the
-/// deriver's background writes aside.
+/// background's and pulls' writes aside (the deriver, the search index,
+/// viewer graphs, grants' projected trees).
 pub const GATE_STORAGE_WRITES_PER_PUSH: f64 = 2.0;
 
 /// `objects` through a regional cache: the share of objects it serves from
