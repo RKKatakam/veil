@@ -635,6 +635,9 @@ impl Split {
     }
 }
 
+/// A tag's target and annotation, merged as one unit.
+type TagUnit = (ObjectId, Option<ObjectId>);
+
 /// The values some operations introduced: a key's value in an operation's
 /// view that none of its parents' views has (a new snapshot of a
 /// workspace, a tag set or removed, a head added or dropped). A merge of
@@ -643,7 +646,7 @@ impl Split {
 #[derive(Clone, Debug, Default)]
 pub struct Introduced {
     workspaces: std::collections::HashSet<(String, Option<ObjectId>)>,
-    tags: std::collections::HashSet<(String, Option<(ObjectId, Option<ObjectId>)>)>,
+    tags: std::collections::HashSet<(String, Option<TagUnit>)>,
     remote_tags: std::collections::HashSet<(String, Option<ObjectId>)>,
     heads: std::collections::HashSet<(ObjectId, bool)>,
 }

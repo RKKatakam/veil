@@ -443,9 +443,9 @@ fn check_merges_keep_every_operation(disk: bool, steps: &[u8]) -> Result<(), Tes
     let mut repo = Repo::open(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
     prop_assert_eq!(repo.heads().len(), 1);
     prop_assert_eq!(repo.take_warnings(), Vec::<String>::new());
-    for w in 0..3 {
+    for (w, &done) in done.iter().enumerate() {
         let have = files_of(&repo, &repo.workspace_wc(&format!("w{w}")).unwrap());
-        for n in 0..done[w] {
+        for n in 0..done {
             prop_assert!(have.contains(&format!("f{w}-{n}")), "{}: w{w} lost f{w}-{n}: {:?}", truth.fs.kind(), have);
             let t = repo.view().tags.get(&format!("c{w}-{n}"));
             prop_assert!(t.is_some(), "{}: tag c{w}-{n} was lost", truth.fs.kind());
