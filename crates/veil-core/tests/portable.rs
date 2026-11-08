@@ -865,3 +865,115 @@ fn bug_1485_the_op_log_below_a_merge_with_the_clock_set_back_reads_a_few_operati
     assert!(log[0].1.parents.len() == 2, "the merge first");
     assert!(reads <= 20, "the first five operations, below a merge on a run of 500 of one time, read {reads} operations");
 }
+
+/// BUG-1533 (op log merges review, cycle 4; introduced by BUG-1487's
+/// fix): while a release is staged, every open walks the op log from the
+/// heads down to the release's operation (`take_back_releases_out_of_force`,
+/// run at open whenever a release is staged), reading each operation with
+/// its view: a release staged and not pushed for 1,000 commands makes
+/// every later command read 1,000 operations. Without a staged release the
+/// same open reads a handful.
+#[test]
+#[ignore = "BUG-1533: while a release is staged, every open reads every operation since the release"]
+fn bug_1533_an_open_with_a_staged_release_reads_a_few_operations() {
+    let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clock::reset_clock();
+    let fs = Arc::new(MemoryBackend::new());
+    let me = Identity::generate("alice");
+    let mut repo = Repo::init(fs.clone(), Some(me.clone()), "alice").unwrap();
+    fs.write(&p("auth.rs"), b"fn check() -> bool { true }\n").unwrap();
+    repo.snapshot_workspace("default", &*fs).unwrap();
+    let (main, _) = repo.commit_working_copy("default", "v1").unwrap();
+    repo.create_workspace("fix", vec![main]).unwrap();
+    let ov = repo.workspace_overlay("fix").unwrap();
+    ov.write(&p("auth.rs"), b"fn check() -> bool { verify_signature() }\n").unwrap();
+    let fix = repo.snapshot_workspace("fix", &ov).unwrap().snapshot;
+    let merged = repo.merge("default", main, vec![fix], "merge", Some(veil_core::commands::EmbargoSpec { scope: "team".into(), until: None })).unwrap();
+    let e = merged.embargo.expect("an embargo");
+    repo.release_embargo(&e).unwrap();
+    let root = repo.root_id();
+    for i in 0..1000 {
+        repo.set_tag("t", if i % 2 == 0 { main } else { root }, true).unwrap();
+    }
+    drop(repo);
+    let reads_at_open = |staged: bool| {
+        let counting = Arc::new(CountingOps { inner: fs.fork(), reads: Default::default() });
+        if !staged {
+            Repo::open(counting.clone(), Some(me.clone()), "alice").unwrap().keys().take_back_release(&e).unwrap();
+            counting.reads.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+        let repo = Repo::open(counting.clone(), Some(me.clone()), "alice").unwrap();
+        let state = repo.keys().release_state(&e);
+        (counting.reads.load(std::sync::atomic::Ordering::SeqCst), state)
+    };
+    let (without, state) = reads_at_open(false);
+    assert_eq!(state, veil_core::keychain::ReleaseState::Unreleased, "taken back by hand");
+    let (with, state) = reads_at_open(true);
+    assert_eq!(state, veil_core::keychain::ReleaseState::Staged, "the release stands");
+    assert!(with <= without + 20, "an open with a release staged 1,000 commands ago read {with} operations ({without} without it)");
+}
+
+/// BUG-1485 and BUG-1486 with eight heads (op log merges review, cycle 4):
+/// on a run of 500 operations made with the clock set back, merging eight
+/// concurrent commands at open, and the op log's first operations below
+/// the merge, read a few operations per head, not the run.
+#[test]
+fn merging_eight_heads_with_the_clock_set_back_reads_a_few_operations_per_head() {
+    let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let t = 1_800_000_000_000i64;
+    let now = settable_clock(t + 3_600_000);
+    let me = Identity::generate("alice");
+    let disk = Arc::new(MemoryBackend::new());
+    let (root, other) = {
+        let mut repo = Repo::init(disk.clone(), Some(me.clone()), "alice").unwrap();
+        disk.write(&p("x"), b"x\n").unwrap();
+        repo.snapshot_workspace("default", &*disk).unwrap();
+        let (c, _) = repo.commit_working_copy("default", "x").unwrap();
+        (repo.root_id(), c)
+    };
+    now.store(t, std::sync::atomic::Ordering::SeqCst);
+    {
+        let mut repo = Repo::open(disk.clone(), Some(me.clone()), "alice").unwrap();
+        for i in 0..500 {
+            repo.set_tag("t", if i % 2 == 0 { other } else { root }, true).unwrap();
+        }
+    }
+    let heads = head_names(&disk);
+    let names = ["ha", "hb", "hc", "hd", "he", "hf", "hg", "hh"];
+    let forks: Vec<Arc<MemoryBackend>> = names.iter().map(|_| Arc::new(disk.fork())).collect();
+    for (f, name) in forks.iter().zip(names) {
+        Repo::open(f.clone(), Some(me.clone()), "alice").unwrap().set_tag(name, root, true).unwrap();
+    }
+    for f in &forks {
+        land_fork(&disk, f, &heads);
+    }
+    assert_eq!(head_names(&disk).len(), 8, "eight heads");
+    let counting = Arc::new(CountingOps { inner: disk.fork(), reads: Default::default() });
+    let repo = Repo::open(counting.clone(), Some(me.clone()), "alice");
+    let merge_reads = counting.reads.load(std::sync::atomic::Ordering::SeqCst);
+    let log = repo.as_ref().ok().map(|r| r.op_log(10).map(|l| l.len()));
+    let log_reads = counting.reads.load(std::sync::atomic::Ordering::SeqCst) - merge_reads;
+    clock::reset_clock();
+    let repo = repo.unwrap();
+    assert_eq!(repo.heads().len(), 1, "merged");
+    for n in names {
+        assert!(repo.view().tags.contains_key(n), "{n} kept");
+    }
+    assert_eq!(log.unwrap().unwrap(), 10, "ten listed");
+    assert!(merge_reads <= 8 * 60, "merging eight heads on a run of 500 read {merge_reads} operations");
+    assert!(log_reads <= 8 * 20, "the first ten operations below the merge read {log_reads} operations");
+    // Nine processes wrote with the clock set back: every command is
+    // strictly later than its parents, a merge at its newest parent's time.
+    let all: Vec<ObjectId> = repo.ops().walk(repo.heads()).map(|r| r.unwrap().0).collect();
+    assert!(all.len() > 500, "the whole log walked: {}", all.len());
+    for id in &all {
+        let op = repo.ops().get(id).unwrap();
+        let Some(newest) = op.parents.iter().map(|p| repo.ops().get(p).unwrap().timestamp).max() else { continue };
+        if op.is_merge() {
+            assert_eq!(op.timestamp, newest, "a merge has its newest parent's time");
+        } else {
+            assert!(op.timestamp > newest, "'{}' at {} is not after its parent at {newest}", op.description, op.timestamp);
+        }
+    }
+    eprintln!("eight heads: the merge read {merge_reads}, the log {log_reads}");
+}

@@ -2188,3 +2188,29 @@ fn bug_1489_the_model_check_accepts_a_loser_a_restore_took_back() {
         check_every_write_survives(false, 2, true, true, &steps).unwrap();
     }
 }
+
+/// BUG-1534 (op log merges review, cycle 4): BUG-1444's model check,
+/// un-ignored by `d0952e31`, still fails at its default length on fresh
+/// seeds (1 copy in 8 of the first round, 8 copies at once, the default
+/// 64 cases of 20 to 100 steps), with the default check's restriction for
+/// BUG-1488 in place: a described snapshot is still visible below a
+/// workspace and a head in a command's view. The input proptest shrank
+/// to; the failure depends on more than the input (random identities
+/// and change ids), so it is replayed and must pass every time.
+#[test]
+#[ignore = "BUG-1534: the BUG-1444 model check (undo, op restore, concurrent describes) still fails at its default length on fresh seeds"]
+fn bug_1534_rewrites_follow_with_undo_restore_and_concurrent_describes_replayed() {
+    let steps: Vec<u16> = vec![
+        23264, 46812, 38543, 15785, 26640, 15929, 21122, 9261, 54694, 11624, 56747, 56534, 64520, 9806, 37357, 49583, 3432, 36839, 15965, 10860, 60463, 16525, 40514,
+        57022, 50747, 3648, 51108, 2397, 57319, 561, 50299, 31356, 13164, 52425, 46111, 27490, 19082, 42794, 41270, 15707, 8779, 520, 21579, 22875, 32337, 53278, 29131,
+        31106, 62687, 10664, 17995, 22145, 35556, 2332, 21623, 54787, 31423, 44553, 27785, 63043, 32785, 1767, 15465, 29833, 18441, 41238, 28578, 8449, 33227, 16513,
+        13038, 40022, 32886, 18658, 62862, 28749, 14310, 18757, 46398, 33943, 2473, 19285, 27307, 25735, 13289, 40802, 23655, 45396, 30446, 4545, 38151, 30809,
+    ];
+    let mut failed = Vec::new();
+    for n in 0..60 {
+        if let Err(e) = check_rewrites_follow_through_merges(false, 3, true, false, &steps) {
+            failed.push((n, e.to_string()));
+        }
+    }
+    assert!(failed.is_empty(), "{} replays in 60 failed; the first: {:?}", failed.len(), failed.first());
+}
