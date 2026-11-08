@@ -32,8 +32,11 @@ CREATE TABLE IF NOT EXISTS blame_memo (
     PRIMARY KEY (project_id, view_key, path_key, follow, snapshot)
 );
 -- Walks down to the versions a blame starts from that stopped before
--- they got there (BUG-1212): from a version (snapshot and path), the
--- deeper versions reached (JSON), which the next blame computes first.
+-- they got there (BUG-1212, BUG-1215): from a version (snapshot and path),
+-- the versions it had not expanded yet (`frontier`, JSON) and those it had,
+-- with what blaming them needs (`expanded`, JSON). Requests go on below
+-- them, and blame the expanded versions from this record once the
+-- frontier is done; no walk from a recorded version is made again.
 CREATE TABLE IF NOT EXISTS blame_walks (
     project_id BIGINT NOT NULL,
     view_key TEXT NOT NULL,
@@ -41,6 +44,7 @@ CREATE TABLE IF NOT EXISTS blame_walks (
     follow BOOLEAN NOT NULL,
     snapshot TEXT NOT NULL,
     frontier TEXT NOT NULL,
+    expanded TEXT NOT NULL,
     PRIMARY KEY (project_id, view_key, path_key, follow, snapshot)
 );
 -- Which viewer-graph rows have their file history (S14 writes it before

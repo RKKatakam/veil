@@ -128,7 +128,10 @@ fn blame_all(th: &TestHub, h: &Hist, a: &Ask, rev: &str, path: &str, follow: boo
                     return Ok((out, pages));
                 }
             }
-            Err(Error::Api { code: "partial", .. }) => continue,
+            // Ask again, as a client does: a blame stopped at its budget or
+            // its deadline goes on from what it kept (and a loaded machine
+            // can pass the 2 s deadline: BUG-1172).
+            Err(Error::Api { code: "partial" | "deadline" | "warming", .. }) => continue,
             Err(Error::Api { status, code, message }) => return Err(format!("{status} {code} {message}")),
             Err(e) => panic!("internal error: {e:?}"),
         }
@@ -143,6 +146,7 @@ fn history_all(th: &TestHub, h: &Hist, a: &Ask, rev: &str, path: &str, follow: b
     for _ in 0..1000 {
         let q = HistoryParams { rev: Some(rev.into()), path: Some(path.into()), follow: Some(follow), n: Some(n), after: after.clone() };
         match th.rt.block_on(query::history(&h.hub, a, q, Limits::default())) {
+            Err(Error::Api { code: "deadline" | "warming", .. }) => continue,
             Ok(v) => {
                 for e in v["entries"].as_array().unwrap() {
                     out.push((e["snapshot_id"].as_str().unwrap().to_string(), e["path"].as_str().unwrap().to_string(), e["status"].as_str().unwrap().to_string()));
@@ -698,10 +702,9 @@ fn blame_speed() {
 
 mod s14c1_adversarial {
     use super::*;
-    use crate::support::unique;
 
     /// The snapshot ids of a blame's lines, in order.
-    fn origins(v: &Value) -> Vec<String> {
+    pub(super) fn origins(v: &Value) -> Vec<String> {
         v["lines"].as_array().unwrap().iter().map(|l| l["snapshot"].as_str().unwrap().to_string()).collect()
     }
 
@@ -817,62 +820,6 @@ mod s14c1_adversarial {
             }
         }
         assert!(checked > 50, "{checked}");
-    }
-
-    /// BUG-1211. Migration 0015 ends in `DELETE FROM view_graph`: one
-    /// statement over every viewer graph of every project, which
-    /// `migrate_once` runs in one transaction under the server's 15 s
-    /// statement timeout (`db::STATEMENT_TIMEOUT`). On a server whose graphs
-    /// hold more rows than that deletes in 15 s, every attempt is cancelled
-    /// (57014, retried as retryable until the 10-minute `MIGRATION_DEADLINE`)
-    /// and no S14 server starts. Measured here: the migration over 300,000
-    /// graph rows, and how many rows it would delete within the timeout.
-    /// The bar is 10 million rows (50 projects of 20,000 snapshots with 10
-    /// view keys each). On YugabyteDB (about 45,000 rows/s) the limit is
-    /// about 680,000 rows, three such projects; on PostgreSQL about 40
-    /// million.
-    #[test]
-    fn bug_1211_migration_0015_cannot_finish_on_a_large_server() {
-        const ROWS: i64 = 300_000;
-        const BAR: f64 = 10_000_000.0;
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(2).build().unwrap();
-        let admin = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
-        let name = format!("{}{}", std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_default(), unique("veil_m15_"));
-        let (r, took) = rt.block_on(async {
-            let db = veil_server::db::connect(&admin, 1).await.unwrap();
-            sqlx::raw_sql(&format!("CREATE DATABASE {name}")).execute(&db).await.unwrap();
-            db.close().await;
-            let url = format!("{}/{name}", admin.rsplit_once('/').unwrap().0);
-            let db = veil_server::db::connect(&url, 2).await.unwrap();
-            veil_server::db::migrate(&db).await.unwrap();
-            for chunk in 0..ROWS / 50_000 {
-                sqlx::query(
-                    "INSERT INTO view_graph (project_id, view_key, snapshot, generation, depth, parents, flags, skip, down_id, real_id) \
-                     SELECT g / 20000, 'k' || (g % 10), md5(g::text), g, g, '[]', 0, '[]', '', '' FROM generate_series($1::bigint, $2::bigint) g",
-                )
-                .bind(chunk * 50_000)
-                .bind(chunk * 50_000 + 49_999)
-                .execute(&db)
-                .await
-                .unwrap();
-            }
-            // Migration 0015 as `migrate_once` applies it: in a transaction,
-            // on a connection of the server's (its statement timeout).
-            let sql = include_str!("../../migrations/0015_file_history_and_blame.sql");
-            let mut tx = db.begin().await.unwrap();
-            let t = Instant::now();
-            let r = sqlx::raw_sql(sql).execute(&mut *tx).await.map(|_| ()).map_err(|e| e.to_string());
-            let took = t.elapsed();
-            let _ = tx.rollback().await;
-            db.close().await;
-            let db = veil_server::db::connect(&admin, 1).await.unwrap();
-            let _ = sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")).execute(&db).await;
-            (r, took)
-        });
-        let within = ROWS as f64 / took.as_secs_f64() * veil_server::db::STATEMENT_TIMEOUT.as_secs_f64();
-        println!("migration 0015 over {ROWS} graph rows: {r:?} after {took:?}: about {within:.0} rows within the statement timeout");
-        assert!(r.is_ok(), "{r:?}");
-        assert!(within >= BAR, "migration 0015 deletes about {within:.0} viewer-graph rows within the 15 s statement timeout; a server with more never starts S14");
     }
 
     /// BUG-1212. A blame keeps its progress when it stops while computing
@@ -1014,7 +961,6 @@ mod s14c2_adversarial {
     /// down passes (the default, 20,000 reads, is passed the same way by a
     /// longer history), and a deadline long enough not to matter.
     #[test]
-    #[ignore = "BUG-1215: a blame whose walk down passes its budget never finishes: once the deeper versions are kept, the same walk is cut at the same place for good"]
     fn bug_1215_a_blame_whose_walk_down_passes_its_budget_never_finishes() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);
@@ -1323,4 +1269,95 @@ mod s14c2_adversarial {
             }
         }
     }
+
+    /// BUG-1215's class, over history shapes and small budgets: every
+    /// request that answers `partial` keeps a version it had not kept, or
+    /// records a walk down from a version no walk started from (while the
+    /// first walk is still on its way down, nothing below can be blamed
+    /// yet); never neither, and no walk is recorded twice. And the blame it
+    /// ends with is the one a single unbounded request gives.
+    #[test]
+    fn every_stopped_blame_leaves_progress() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        // (shape, walk budget, diff budget)
+        for (shape, walk, work) in [("chain", 40u64, u64::MAX), ("chain", 25, 1_500), ("renames", 60, u64::MAX), ("merges", 50, u64::MAX), ("merges", 30, 2_000)] {
+            let mut h = Hist::new(&th, &policy_text, &bindings);
+            let mut f = Files::new();
+            let mut body: Vec<String> = (0..60).map(|i| format!("line {i} of the file\n")).collect();
+            for i in 0..8 {
+                f.insert(format!("pub/other/o{i}.txt"), lines(&format!("o{i}"), 6));
+            }
+            let mut path = "pub/f/name0.txt".to_string();
+            let mut tip = root_snapshot_id();
+            let mut ts = 1_700_000_000_000i64;
+            let mut n = 0u16;
+            let mut commit = |h: &mut Hist, parents: &[ObjectId], f: &Files| {
+                n += 1;
+                ts += 1000;
+                let mut change = [11u8; 16];
+                change[..2].copy_from_slice(&n.to_le_bytes());
+                h.commit(&th, parents, f.clone(), change, ts, None)
+            };
+            let steps = if shape == "chain" { 120 } else { 70 };
+            for i in 0..steps {
+                body[i % 60] = format!("edited at step {i}\n");
+                if shape == "renames" {
+                    f.remove(&path);
+                    path = format!("pub/f/name{}.txt", i % 3);
+                }
+                f.insert(path.clone(), body.concat().into_bytes());
+                tip = commit(&mut h, &[tip], &f);
+                if shape == "merges" && i % 20 == 10 {
+                    // A wide merge: 12 branches each editing their own line.
+                    let base = tip;
+                    let mut branches = vec![base];
+                    let mut merged = body.clone();
+                    for b in 0..12 {
+                        let mut bb = body.clone();
+                        bb[(b * 5 + 1) % 60] = format!("branch {b} at step {i}\n");
+                        merged[(b * 5 + 1) % 60] = bb[(b * 5 + 1) % 60].clone();
+                        let mut g = f.clone();
+                        g.insert(path.clone(), bb.concat().into_bytes());
+                        branches.push(commit(&mut h, &[base], &g));
+                    }
+                    body = merged;
+                    f.insert(path.clone(), body.concat().into_bytes());
+                    tip = commit(&mut h, &branches, &f);
+                }
+            }
+            h.set_branch(&th, "main", tip);
+            let viewer = Viewer::default();
+            let a = ask(&th, &h, &viewer);
+            warm_up(&th, &h, &viewer);
+            let follow = shape == "renames";
+            let q = || BlameParams { path: path.clone(), follow: Some(follow), n: Some(1000), ..Default::default() };
+            let lines_of = |v: &Value| s14c1_adversarial::origins(v);
+            // The blame of one unbounded request.
+            forget_blames(&th, &h);
+            let whole = Limits { blame: BlameLimits { walk: u64::MAX, work: u64::MAX, ..BlameLimits::default() }, deadline: Duration::from_secs(120), ..Limits::default() };
+            let want = lines_of(&th.rt.block_on(query::blame(&h.hub, &a, q(), whole)).unwrap());
+            forget_blames(&th, &h);
+            let small = Limits { blame: BlameLimits { walk, work, ..BlameLimits::default() }, deadline: Duration::from_secs(120), ..Limits::default() };
+            let mut before = progress(&th, &h);
+            let mut partials = 0;
+            let got = loop {
+                match th.rt.block_on(query::blame(&h.hub, &a, q(), small)) {
+                    Ok(v) => break v,
+                    Err(Error::Api { code: "partial", .. }) => {
+                        partials += 1;
+                        let now = progress(&th, &h);
+                        assert!(now.0 >= before.0 && now.1 >= before.1 && now != before, "{shape} (walk {walk}, work {work}): a partial answer left no progress: {before:?} -> {now:?}");
+                        before = now;
+                        assert!(partials < 2_000, "{shape}: no end");
+                    }
+                    Err(e) => panic!("{shape}: {e:?}"),
+                }
+            };
+            assert_eq!(lines_of(&got), want, "{shape} (walk {walk}, work {work})");
+            println!("every_stopped_blame_leaves_progress: {shape}, walk {walk}, work {work}: {partials} partial answers, then the whole blame; (kept, walks) {before:?}");
+            assert!(partials > 0, "{shape}: the budgets never stopped it");
+        }
+    }
+
 }

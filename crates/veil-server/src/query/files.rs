@@ -65,8 +65,6 @@ pub const BLAMES_AT_ONCE: usize = 4;
 /// Versions between two kept blames of one file (and every version asked
 /// for is kept too).
 pub const CHECKPOINT: u64 = 32;
-/// Largest kept blame object; above it a blame is computed each time.
-pub const MAX_BLAME_OBJECT: usize = 8 << 20;
 /// Most lines a decoded blame object may hold (a file of at most
 /// [`MAX_TEXT_BYTES`] has at most that many lines).
 const MAX_LINES: usize = MAX_TEXT_BYTES as usize;
@@ -300,6 +298,18 @@ impl<'g, 'a> Files<'g, 'a> {
             return c.map(|c| serde_json::from_str(&c).map(Arc::new).map_err(bad)).transpose();
         }
         let mut w = self.window(path, depth);
+        // Far below the rows read so far: a window of its own, so that
+        // reaching a deep version never costs the rows above it (BUG-1215).
+        let last = w.rows.last().map(|(d, _, _)| *d).unwrap_or(w.top.0);
+        if !w.at.contains_key(&id) && !w.done && last > depth.saturating_add(REANCHOR) {
+            *w = Window {
+                top: top_of(depth),
+                rows: Vec::new(),
+                at: HashMap::new(),
+                done: false,
+                pages: 0,
+            };
+        }
         loop {
             if let Some(&i) = w.at.get(&id) {
                 return Ok(Some(w.rows[i].2.clone()));
@@ -475,17 +485,48 @@ pub struct Blamer<'f, 'g, 'a, 'h, 'b> {
     /// The last version computed and not kept: kept when the blame stops,
     /// so every request that computes something leaves progress.
     last: Option<(Version, Arc<Blame>)>,
-    /// Walks down cut before (`blame_walks`): from a version, the deeper
-    /// versions it reached, which are blamed first.
-    walked: HashMap<Version, Vec<Version>>,
+    /// Walks down cut before (`blame_walks`): from a version, the
+    /// versions it had not expanded yet (its frontier).
+    walked: HashMap<Version, Option<Vec<Version>>>,
     /// Walks cut by this request, to write.
-    cut: Vec<(Version, Vec<Version>)>,
+    cut: Vec<(Version, Cut)>,
+    /// Versions known to hold no plain text (never kept, nothing to blame).
+    textless: HashSet<Version>,
 }
 
-/// Most versions a cut walk keeps as where it got to.
-const MAX_FRONTIER: usize = 64;
-/// Most walks followed down from one version within a request.
+/// A version a cut walk expanded: what blaming it needs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Walked {
+    v: Version,
+    new: Option<TreeEntry>,
+    parents: Vec<Option<Version>>,
+}
+
+/// A walk down cut before it got to the end (BUG-1212, BUG-1215): every
+/// version it expanded, and those it had not (its frontier). Once the
+/// frontier is settled (kept, or no plain text), the expanded versions are
+/// blamed from this record, without walking again.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct Cut {
+    expanded: Vec<Walked>,
+    frontier: Vec<Version>,
+}
+
+/// Most versions one walk expands: a cut walk's record stays small.
+const MAX_SEGMENT: usize = 2_048;
+/// Most records followed down within one request.
 const MAX_RESUMES: usize = 10_000;
+/// A version this far below the rows of its path read so far is read from
+/// a window of its own (not by paging down from where the rows are).
+const REANCHOR: i64 = 256;
+
+/// What a request works on next ([`Blamer::next_work`]).
+enum Work {
+    /// Walk down from a version no cut walk started from, and blame it.
+    Walk(Version),
+    /// Blame the versions a cut walk from it expanded: its frontier is settled.
+    Segment(Version),
+}
 
 impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
     pub fn new(f: &'f Files<'g, 'a>, t: &'f Trees<'h, 'b>, follow: bool, limits: BlameLimits) -> Self {
@@ -500,6 +541,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             last: None,
             walked: HashMap::new(),
             cut: Vec::new(),
+            textless: HashSet::new(),
         }
     }
 
@@ -519,9 +561,10 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                     .bind(self.follow)
                     .fetch_all(&cx.hub().db)
             })?;
+            // One read however many are kept: what reaching recorded
+            // progress costs never grows with it (BUG-1215).
             let mut m = HashMap::new();
             for (s, o) in rows {
-                g.tick()?;
                 m.insert(ObjectId::from_hex(&s).map_err(bad)?, ObjectId::from_hex(&o).map_err(bad)?);
             }
             self.kept.insert(key.clone(), m);
@@ -572,36 +615,80 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         Ok(out)
     }
 
-    /// Blame `start`, first blaming (and keeping) the deepest versions an
-    /// earlier walk down from it reached before it was cut, so that every
-    /// request leaves progress whatever stops it (BUG-1212).
+    /// Blame `start`, going on from what earlier requests left (BUG-1212,
+    /// BUG-1215). A walk down cut before it got to the end recorded what it
+    /// expanded and its frontier; no version a cut walk started from is
+    /// walked from again. Each round works on the deepest unfinished place
+    /// ([`Blamer::next_work`]): it walks down from a frontier version no
+    /// walk started from (and records a deeper cut if this one is cut too),
+    /// or blames the versions of a cut walk whose frontier is settled, from
+    /// its record, keeping them. So every request that stops keeps a version
+    /// or records a walk deeper than any before, and never repeats a walk.
     fn resumed(&mut self, start: &Version) -> Result<Done> {
-        let mut tried: HashSet<Version> = HashSet::new();
         loop {
-            let mut v = start.clone();
-            for _ in 0..MAX_RESUMES {
-                let mut next = None;
-                for x in self.walked_from(&v)? {
-                    if !tried.contains(&x) && self.kept_of(&x)?.is_none() {
-                        next = Some(x);
-                        break;
+            match self.next_work(start)? {
+                Work::Walk(v) => {
+                    let out = self.run(&v)?;
+                    if v == *start {
+                        return Ok(out);
+                    }
+                    if out.is_none() {
+                        self.textless.insert(v);
                     }
                 }
-                match next {
-                    Some(x) => v = x,
-                    None => break,
+                Work::Segment(v) => {
+                    let out = self.segment(&v)?;
+                    if v == *start {
+                        return Ok(out);
+                    }
+                    if out.is_none() {
+                        self.textless.insert(v);
+                    }
                 }
             }
-            if v == *start {
-                return self.run(start);
-            }
-            tried.insert(v.clone());
-            self.run(&v)?;
         }
     }
 
-    /// Where a cut walk down from `v` got to (`blame_walks`).
-    fn walked_from(&mut self, v: &Version) -> Result<Vec<Version>> {
+    /// Is `v` done with: kept, or known to hold no plain text?
+    fn settled(&mut self, v: &Version) -> Result<bool> {
+        if self.textless.contains(v) {
+            return Ok(true);
+        }
+        if self.kept_of(v)?.is_some() {
+            return Ok(true);
+        }
+        let c = self.f.find(&v.path, v.depth, v.id)?.ok_or_else(|| bad(format!("no row for a version at {}", v.id.short())))?;
+        if !texty(&c.new) {
+            self.textless.insert(v.clone());
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// The deepest unfinished place below `start`: down the records of cut
+    /// walks, to a frontier version no walk started from, or to a cut walk
+    /// whose frontier is all settled. One small read per record followed.
+    fn next_work(&mut self, start: &Version) -> Result<Work> {
+        let mut v = start.clone();
+        for _ in 0..MAX_RESUMES {
+            let Some(frontier) = self.walked_from(&v)? else { return Ok(Work::Walk(v)) };
+            let mut next = None;
+            for x in frontier {
+                if !self.settled(&x)? {
+                    next = Some(x);
+                    break;
+                }
+            }
+            match next {
+                Some(x) => v = x,
+                None => return Ok(Work::Segment(v)),
+            }
+        }
+        Err(partial())
+    }
+
+    /// The frontier of the cut walk down from `v` (`blame_walks`), if any.
+    fn walked_from(&mut self, v: &Version) -> Result<Option<Vec<Version>>> {
         if let Some(w) = self.walked.get(v) {
             return Ok(w.clone());
         }
@@ -619,30 +706,83 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             .bind(v.id.hex())
             .fetch_optional(&cx.hub().db)
         })?;
-        let w: Vec<Version> = match row {
-            Some(r) => serde_json::from_str(&r).map_err(bad)?,
-            None => Vec::new(),
-        };
+        let w: Option<Vec<Version>> = row.map(|r| serde_json::from_str(&r).map_err(bad)).transpose()?;
         self.walked.insert(v.clone(), w.clone());
         Ok(w)
     }
 
-    /// Write the walks this request cut.
+    /// Blame the versions the cut walk down from `v` expanded, from its
+    /// record (its frontier is settled), and keep `v`'s.
+    fn segment(&mut self, v: &Version) -> Result<Done> {
+        let g = self.f.g;
+        let cx = g.cx;
+        g.tick()?;
+        let row: Option<String> = cx.db(|| {
+            sqlx::query_scalar(
+                "SELECT expanded FROM blame_walks WHERE project_id = $1 AND view_key = $2 AND path_key = $3 AND follow = $4 AND snapshot = $5",
+            )
+            .bind(cx.project())
+            .bind(g.vk)
+            .bind(path_key(&v.path))
+            .bind(self.follow)
+            .bind(v.id.hex())
+            .fetch_optional(&cx.hub().db)
+        })?;
+        let expanded: Vec<Walked> = serde_json::from_str(&row.ok_or_else(|| bad("a cut walk has no record"))?).map_err(bad)?;
+        let by: HashMap<Version, Walked> = expanded.into_iter().map(|w| (w.v.clone(), w)).collect();
+        // The versions above settled ones, parents first, from `v`.
+        let mut nodes: HashMap<Version, Node> = HashMap::new();
+        let mut order: Vec<Version> = Vec::new();
+        let mut stack: Vec<(Version, bool)> = vec![(v.clone(), false)];
+        while let Some((x, ready)) = stack.pop() {
+            if ready {
+                order.push(x);
+                continue;
+            }
+            if nodes.contains_key(&x) {
+                continue;
+            }
+            let kept = self.kept_of(&x)?;
+            let (new, parents) = match (by.get(&x), kept) {
+                (Some(w), None) => (w.new.clone(), w.parents.clone()),
+                (Some(w), Some(_)) => (w.new.clone(), Vec::new()),
+                // A frontier version: settled, so a leaf.
+                (None, _) => {
+                    let c = self.f.find(&x.path, x.depth, x.id)?.ok_or_else(|| bad(format!("no row for a version at {}", x.id.short())))?;
+                    (c.new.clone(), Vec::new())
+                }
+            };
+            stack.push((x.clone(), true));
+            for p in parents.iter().rev().flatten() {
+                if !nodes.contains_key(p) {
+                    stack.push((p.clone(), false));
+                }
+            }
+            let change = Arc::new(FChange { old: None, new, prev: Vec::new() });
+            nodes.insert(x, Node { change, parents, kept, left: 0 });
+        }
+        self.up(nodes, order, v)
+    }
+
+    /// Write the walks this request cut: each one's frontier, and what it
+    /// expanded.
     fn write_cuts(&mut self) -> Result<()> {
         let cx = self.f.g.cx;
-        for (v, frontier) in std::mem::take(&mut self.cut) {
-            let text = serde_json::to_string(&frontier).map_err(bad)?;
+        for (v, cut) in std::mem::take(&mut self.cut) {
+            let frontier = serde_json::to_string(&cut.frontier).map_err(bad)?;
+            let expanded = serde_json::to_string(&cut.expanded).map_err(bad)?;
             cx.db(|| {
                 sqlx::query(
-                    "INSERT INTO blame_walks (project_id, view_key, path_key, follow, snapshot, frontier) VALUES ($1, $2, $3, $4, $5, $6) \
-                     ON CONFLICT (project_id, view_key, path_key, follow, snapshot) DO UPDATE SET frontier = EXCLUDED.frontier",
+                    "INSERT INTO blame_walks (project_id, view_key, path_key, follow, snapshot, frontier, expanded) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                     ON CONFLICT (project_id, view_key, path_key, follow, snapshot) DO NOTHING",
                 )
                 .bind(cx.project())
                 .bind(self.f.g.vk)
                 .bind(path_key(&v.path))
                 .bind(self.follow)
                 .bind(v.id.hex())
-                .bind(&text)
+                .bind(&frontier)
+                .bind(&expanded)
                 .execute(&cx.hub().db)
             })?;
         }
@@ -665,22 +805,39 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             if nodes.contains_key(&v) {
                 continue;
             }
-            // Stopped (its work, its memory, or the deadline): where it got
-            // to is kept, and blamed first next time (BUG-1212).
-            let over = self.f.g.work() - began > self.limits.walk || held > self.limits.held;
-            let r = if over { Err(partial()) } else { self.expand(&v) };
+            // Stopped (its work, its memory, its size, or the deadline): what
+            // it expanded and where it got to are recorded, and blamed from
+            // the record once the frontier is (BUG-1212, BUG-1215). A version
+            // already kept costs no budget: it ends the walk there.
+            let r = match self.kept_of(&v) {
+                Ok(Some(_)) => self.expand(&v),
+                Ok(None) => {
+                    let over = self.f.g.work() - began > self.limits.walk || held > self.limits.held || nodes.len() >= MAX_SEGMENT;
+                    if over {
+                        Err(partial())
+                    } else {
+                        self.expand(&v)
+                    }
+                }
+                Err(e) => Err(e),
+            };
             let (change, parents, kept) = match r {
                 Ok(x) => x,
                 Err(e) => {
                     stack.push((v, false));
                     let mut frontier: Vec<Version> = Vec::new();
+                    let mut seen: HashSet<&Version> = HashSet::new();
                     for (x, ready) in stack.iter().rev() {
-                        if !ready && !nodes.contains_key(x) && !frontier.contains(x) && *x != *start && frontier.len() < MAX_FRONTIER {
+                        if !ready && !nodes.contains_key(x) && seen.insert(x) {
                             frontier.push(x.clone());
                         }
                     }
-                    if !frontier.is_empty() {
-                        self.cut.push((start.clone(), frontier));
+                    if !nodes.is_empty() {
+                        let expanded = nodes
+                            .iter()
+                            .map(|(x, n)| Walked { v: x.clone(), new: n.change.new.clone(), parents: n.parents.clone() })
+                            .collect();
+                        self.cut.push((start.clone(), Cut { expanded, frontier }));
                     }
                     return Err(e);
                 }
@@ -694,6 +851,14 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             }
             nodes.insert(v, Node { change, parents, kept, left: 0 });
         }
+        self.up(nodes, order, start)
+    }
+
+    /// Blame the versions of `nodes` in `order` (parents first), from their
+    /// parents' blames, keeping `start`'s, the checkpoints, and when it
+    /// stops the last one computed.
+    fn up(&mut self, mut nodes: HashMap<Version, Node>, order: Vec<Version>, start: &Version) -> Result<Done> {
+        let mut held: usize = nodes.keys().map(|v| 256 + v.path.len()).sum();
         let edges: Vec<Version> = nodes.values().flat_map(|n| n.parents.iter().flatten().cloned()).collect();
         for p in edges {
             if let Some(n) = nodes.get_mut(&p) {
@@ -766,12 +931,12 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         Ok(done.remove(start).flatten())
     }
 
-    /// Keep blame `b` of version `v` (unless it is too large to).
+    /// Keep blame `b` of version `v`. Always: a resumed blame relies on
+    /// every version it computed being kept (BUG-1215), and a blame is
+    /// bounded by its file's lines (at most [`MAX_TEXT_BYTES`]).
     fn keep(&mut self, v: &Version, b: &Blame) {
         let raw = b.encode();
-        if raw.len() <= MAX_BLAME_OBJECT {
-            self.writes.push((path_key(&v.path), v.id, ObjectId::hash(&raw), raw));
-        }
+        self.writes.push((path_key(&v.path), v.id, ObjectId::hash(&raw), raw));
     }
 
     /// Write the kept blames computed so far: the objects, then their rows.
