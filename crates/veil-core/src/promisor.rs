@@ -754,6 +754,19 @@ impl ObjectStore {
         Ok(())
     }
 
+    /// Fetch those of `ids` (with the sizes their tree entries give them)
+    /// that neither area holds, in batches: a mounted workspace's folder,
+    /// when one of its files is first read, or its sub-folders' trees when
+    /// it is listed (milestone S8). One the server refuses is left for its
+    /// reader, who finds it hidden. Nothing for any other store.
+    pub fn prefetch(&self, ids: Vec<(ObjectId, u64)>) -> Result<()> {
+        let Some(p) = self.partial.get() else { return Ok(()) };
+        if !self.fetching(p) {
+            return Ok(());
+        }
+        self.ensure_held(p, ids)
+    }
+
     /// Fetch those of `ids` neither area holds, in batches of their
     /// locations; one the server refuses is left for its reader (who finds
     /// it hidden), one without a location is read the ordinary way.

@@ -39,7 +39,7 @@
 //! what it shows.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex, MutexGuard},
     time::SystemTime,
 };
@@ -331,17 +331,39 @@ impl Lower for veil_core::vfs::MemoryBackend {}
 /// A [`TreeView`] lists only what this reader can materialise, but answers
 /// `metadata` (and `read`, with an error) for every entry. Here an entry
 /// this reader cannot read is absent everywhere, as in a checkout.
+///
+/// **In a thin clone** (milestone S8) the tree is what the server gave this
+/// person (their projection: hidden entries are not in it), and objects are
+/// fetched when first needed:
+/// * listing a folder and `stat` never fetch a file's content: sizes are in
+///   the tree entries, and a file not fetched yet whose entry is not
+///   labelled secret is shown (what its object really is decides when it
+///   is read: a secret this reader cannot open reads as `EACCES`). A file
+///   labelled secret is fetched to decide, as its object is the authority;
+/// * listing a folder fetches its sub-folders' trees in one request, and
+///   the first read of a file fetches its folder's small files with it, in
+///   one request ([`ReaderView::prefetch_folder`]);
+/// * the server's own refusal (`Missing`) hides an entry, as everywhere; a
+///   server that cannot be reached, or any other failure, is an error
+///   (`EIO`), never an empty or absent file or folder.
 #[derive(Debug)]
 pub struct ReaderView {
     store: Arc<ObjectStore>,
     view: TreeView,
+    /// The folders (by tree id) whose small files were fetched together.
+    fetched_folders: Mutex<HashSet<ObjectId>>,
 }
+
+/// Files up to this size are fetched with their folder (the first read of
+/// one of them fetches the others in the same request).
+pub const FOLDER_FILE_LIMIT: u64 = 256 << 10;
 
 impl ReaderView {
     pub fn new(store: Arc<ObjectStore>, tree: ObjectId) -> ReaderView {
         ReaderView {
             view: TreeView::new(store.clone(), tree),
             store,
+            fetched_folders: Mutex::new(HashSet::new()),
         }
     }
 
@@ -353,7 +375,7 @@ impl ReaderView {
         match lookup(&self.store, &self.view.root(), path) {
             Ok(Some(e)) if path.is_root() => Ok(Some(e)),
             Ok(Some(e)) if e.kind == EntryKind::Dir => Ok(self.dir_visible(&e)?.then_some(e)),
-            Ok(Some(e)) if self.visible_leaf(&e) => Ok(Some(e)),
+            Ok(Some(e)) if self.visible_leaf(&e)? => Ok(Some(e)),
             Ok(_) => Ok(None),
             Err(e) if e.is_unreadable() => Ok(None),
             Err(e) => Err(e),
@@ -362,20 +384,33 @@ impl ReaderView {
 
     /// Is leaf entry `e` shown to this reader, as checkout would write it?
     /// A conflict with a symlink side as that shown side.
-    fn visible_leaf(&self, e: &TreeEntry) -> bool {
+    fn visible_leaf(&self, e: &TreeEntry) -> VResult<bool> {
         let shown = match e.kind {
             EntryKind::Conflict => match self.store.conflict(&e.id) {
                 Ok(c) if c.has_special_terms() => match veil_core::conflict::shown_side(&c) {
                     Some((_, t)) => t.entry(&e.name),
-                    None => return false,
+                    None => return Ok(false),
                 },
-                _ => return self.store.entry_readable(e),
+                Err(err) if !(err.is_unreadable() || err.is_not_found()) => return Err(err),
+                _ => return Ok(self.store.entry_readable(e)),
             },
             _ => e.clone(),
         };
         match shown.kind {
-            EntryKind::Dir => false,
-            _ => self.store.entry_readable(&shown),
+            EntryKind::Dir => Ok(false),
+            EntryKind::File | EntryKind::Symlink if self.store.is_partial() && !self.store.has(&shown.id) => {
+                // Not fetched yet. A plain entry is shown without fetching
+                // its content; a secret one is decided by its object.
+                if shown.visibility.key_scope().is_none() {
+                    return Ok(true);
+                }
+                match self.store.get_raw(&shown.id) {
+                    Ok(_) => Ok(self.store.entry_readable(&shown)),
+                    Err(err) if err.is_unreadable() => Ok(false),
+                    Err(err) => Err(err),
+                }
+            }
+            _ => Ok(self.store.entry_readable(&shown)),
         }
     }
 
@@ -392,12 +427,43 @@ impl ReaderView {
             for c in tree.entries.iter().rev() {
                 match c.kind {
                     EntryKind::Dir => stack.push(c.id),
-                    _ if self.visible_leaf(c) => return Ok(true),
+                    _ if self.visible_leaf(c)? => return Ok(true),
                     _ => {}
                 }
             }
         }
         Ok(false)
+    }
+
+    /// In a thin clone, fetch together what reading folder `dir` needs
+    /// next: its sub-folders' trees (`trees`), or its small files (once per
+    /// folder). Best effort: a failure here is the reader's to meet, at
+    /// the object it reads.
+    fn prefetch_folder(&self, dir: &VPath, trees: bool) {
+        if !self.store.may_fetch() {
+            return;
+        }
+        let Ok(Some(e)) = lookup(&self.store, &self.view.root(), dir) else { return };
+        if e.kind != EntryKind::Dir {
+            return;
+        }
+        if !trees && !self.fetched_folders.lock().unwrap_or_else(|p| p.into_inner()).insert(e.id) {
+            return;
+        }
+        let Ok(t) = self.store.tree(&e.id) else { return };
+        let want: Vec<(ObjectId, u64)> = t
+            .entries
+            .iter()
+            .filter(|c| match trees {
+                true => c.kind == EntryKind::Dir,
+                false => matches!(c.kind, EntryKind::File | EntryKind::Symlink) && c.size <= FOLDER_FILE_LIMIT,
+            })
+            .filter(|c| !self.store.has(&c.id))
+            .map(|c| (c.id, c.size))
+            .collect();
+        if !want.is_empty() {
+            let _ = self.store.prefetch(want);
+        }
     }
 }
 
@@ -418,7 +484,7 @@ impl Lower for ReaderView {
                     Ok(t) => stack.extend(t.entries.iter().map(|c| (p.join(&c.name), c.clone()))),
                     Err(_) => out.push(p),
                 },
-                _ if self.visible_leaf(&e) => {}
+                _ if self.visible_leaf(&e).unwrap_or(false) => {}
                 _ => out.push(p),
             }
         }
@@ -435,7 +501,12 @@ impl StorageBackend for ReaderView {
 
     fn read(&self, path: &VPath) -> VResult<Vec<u8>> {
         match self.entry(path)? {
-            Some(_) => self.view.read(path),
+            Some(e) => {
+                if self.store.is_partial() && !self.store.has(&e.id) {
+                    self.prefetch_folder(&path.parent().unwrap_or_else(VPath::root), false);
+                }
+                self.view.read(path)
+            }
             None => Err(VeilError::NotFound(path.to_string())),
         }
     }
@@ -469,6 +540,9 @@ impl StorageBackend for ReaderView {
     fn list_dir(&self, path: &VPath) -> VResult<Vec<DirEntry>> {
         if self.entry(path)?.is_none() {
             return Err(VeilError::NotFound(path.to_string()));
+        }
+        if self.store.is_partial() {
+            self.prefetch_folder(path, true);
         }
         let mut out = Vec::new();
         for e in self.view.list_dir(path)? {

@@ -1286,6 +1286,9 @@ pub enum WsCmd {
         /// Run nothing: record what an earlier run left unrecorded (vl was killed, or recording failed).
         #[arg(long, conflicts_with_all = ["ephemeral", "with_isolated", "only", "command"])]
         record_only: bool,
+        /// Run over a mount of the workspace (FUSE) instead of a checkout: ready at once, and a file is read (in a thin clone, fetched from the server) only when the command reads it. Without FUSE here, the sandbox is checked out as without --mount.
+        #[arg(long, conflicts_with_all = ["ephemeral", "with_isolated", "only", "record_only"])]
+        mount: bool,
         #[command(flatten)]
         confine: Box<crate::confine::ConfineArgs>,
         /// Command and arguments.

@@ -1226,7 +1226,7 @@ pub use net::hold_main;
 pub const HOLD_ARG: &str = "__veil-netns-hold";
 
 #[cfg(not(target_os = "linux"))]
-pub fn run(_: &Confine, _: &Path, _: &[String], _: &[(&str, OsString)], _: Option<&Path>) -> Result<i32> {
+pub fn run(_: &Confine, _: &Path, _: &[String], _: &[(&str, OsString)], _: Option<&Path>, _: Option<&Path>) -> Result<i32> {
     bail!("confinement is only built for Linux")
 }
 
@@ -1554,9 +1554,11 @@ mod run {
     /// Run `command` confined by `c`, with `sandbox` at the project's path
     /// and `env` added; writes to the allow-list kept in the layers of
     /// `state` (a persistent sandbox's directory), or thrown away (`None`).
+    /// `socket`: the workspace socket ([`crate::ws_socket`]), shown to the
+    /// command at [`crate::ws_socket::INSIDE`].
     /// The exit status is the command's (128 + n for a
     /// signal); a limit that stopped it is reported.
-    pub fn run(c: &Confine, sandbox: &Path, command: &[String], env: &[(&str, OsString)], state: Option<&Path>) -> Result<i32> {
+    pub fn run(c: &Confine, sandbox: &Path, command: &[String], env: &[(&str, OsString)], state: Option<&Path>, socket: Option<&Path>) -> Result<i32> {
         let unit = format!("veil-exec-{}-{}", std::process::id(), hex::encode(veil_core::crypto::random_bytes::<4>()));
         // The throwaway file copies live until the command has exited.
         let (mut mounts, _copies) = c.layered(state)?;
@@ -1568,6 +1570,32 @@ mod run {
         };
         if let Some(n) = &net {
             mounts.extend(n.bwrap_args());
+        }
+        if let Some(sock) = socket {
+            // The socket, and this `vl` (read-only) first on `PATH`, so the
+            // command's `vl` is one that talks to the socket wherever `vl`
+            // is installed.
+            let inside = std::path::Path::new(crate::ws_socket::INSIDE);
+            let dir = inside.parent().expect("an absolute path");
+            let bin = dir.join("bin");
+            let mut path = bin.as_os_str().to_owned();
+            if let Some(p) = std::env::var_os("PATH").filter(|p| !p.is_empty()) {
+                path.push(":");
+                path.push(p);
+            }
+            mounts.extend([
+                "--dir".into(),
+                dir.as_os_str().to_owned(),
+                "--bind".into(),
+                sock.as_os_str().to_owned(),
+                inside.as_os_str().to_owned(),
+                "--setenv".into(),
+                crate::ws_socket::ENV.into(),
+                inside.as_os_str().to_owned(),
+            ]);
+            if let Ok(exe) = std::env::current_exe() {
+                mounts.extend(["--ro-bind".into(), exe.into_os_string(), bin.join("vl").into_os_string(), "--setenv".into(), "PATH".into(), path]);
+            }
         }
         let (program, args) = c.argv(mounts, sandbox, command, &unit);
         let scoped = program != c.bwrap;

@@ -46,6 +46,7 @@ mod team_secret;
 #[cfg(debug_assertions)]
 mod test_remotes;
 mod thin;
+mod ws_socket;
 
 use std::{
     io::{IsTerminal, Read, Write},
@@ -115,6 +116,13 @@ fn main() -> ExitCode {
     if first.as_ref().is_some_and(|a| a == confine::HOLD_ARG) {
         return confine::hold_main();
     }
+    if first.as_ref().is_some_and(|a| a == ws_socket::COMMAND_ARG) {
+        return run_in_workspace(std::env::args_os().skip(2).collect());
+    }
+    // Inside a `vl ws exec` sandbox: the `vl` outside runs the command.
+    if let Some(socket) = std::env::var_os(ws_socket::ENV).filter(|s| !s.is_empty()) {
+        return ws_socket::client_main(&socket, std::env::args_os().skip(1).collect());
+    }
     let cli = Cli::parse();
     let json = cli.cmd.wants_json();
     render::exit_status(match run(cli) {
@@ -133,6 +141,25 @@ fn main() -> ExitCode {
             if json && !api::json_emitted() {
                 let _ = api::emit_json(&api::ErrorDoc::new(message, hint.map(String::from)));
             }
+            ExitCode::FAILURE
+        }
+    })
+}
+
+/// A command a sandbox's `vl` sent through the workspace socket
+/// ([`ws_socket`]): checked again, then run on that workspace only.
+fn run_in_workspace(args: Vec<std::ffi::OsString>) -> ExitCode {
+    let run = || -> Result<ExitCode> {
+        let (root, ws, cli) = ws_socket::parse_command(args)?;
+        let mut ctx = ws_socket::open(&root, &ws, &cli)?;
+        let code = dispatch(&mut ctx, &cli)?;
+        ctx.finish()?;
+        Ok(code)
+    };
+    render::exit_status(match run() {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("{} {}", red("error:"), safe(&format!("{e:#}")));
             ExitCode::FAILURE
         }
     })
@@ -2168,6 +2195,7 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
             with_isolated,
             only,
             record_only,
+            mount,
             confine,
             command,
         } => {
@@ -2181,6 +2209,7 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
                     with_isolated: *with_isolated,
                     only,
                     record_only: *record_only,
+                    mount: *mount,
                     confine,
                     command,
                 },
