@@ -659,8 +659,11 @@ fn concurrent_reads_and_moves_keep_a_refusal_to_its_path() {
                                 Ok(d) if d == SAME.as_bytes() => good += 1,
                                 r => bad.push(format!("src/shared/same.txt: {:?}", r.map(|d| d.len()))),
                             },
+                            // Refused, or (BUG-1464, rule a) once the readable
+                            // copy's bytes are held, exactly those bytes.
                             _ => match std::fs::read(acme.join("same.txt")) {
                                 Err(e) if matches!(e.raw_os_error(), Some(EACCES) | Some(ENOENT)) => good += 1,
+                                Ok(d) if d == SAME.as_bytes() => good += 1,
                                 r => bad.push(format!("the refused copy: {:?}", r.map(|d| d.len()).map_err(|e| e.to_string()))),
                             },
                         }
@@ -698,7 +701,6 @@ fn concurrent_reads_and_moves_keep_a_refusal_to_its_path() {
 /// so a reader by id asks only there and the thin checkout leaves out the
 /// readable copy.
 #[test]
-#[ignore = "BUG-1462: a thin checkout leaves out a readable file whose folder is the same as a refused folder elsewhere"]
 fn bug_1462_a_thin_checkout_hides_a_readable_copy_of_a_folder_refused_elsewhere() {
     const SAME: &str = "SAME-FOLDER-CHECKOUT-1462-7c03e9b1\n";
     let hub = TestHub::start();
@@ -726,7 +728,6 @@ fn bug_1462_a_thin_checkout_hides_a_readable_copy_of_a_folder_refused_elsewhere(
 /// not kept, so a reader by id never asks there and the thin checkout
 /// leaves it out.
 #[test]
-#[ignore = "BUG-1463: a thin checkout leaves out a readable file whose content is at 9 refused places met before it"]
 fn bug_1463_a_readable_copy_past_the_locators_bound_is_left_out() {
     const SAME: &str = "SAME-CONTENT-BOUND-1463-e41a6d08\n";
     let hub = TestHub::start();
@@ -776,24 +777,28 @@ fn the_mount_reads_a_readable_copy_past_the_locators_bound_and_no_refused_one() 
         assert!(r.as_ref().is_err_and(|e| matches!(e.raw_os_error(), Some(EACCES) | Some(ENOENT))), "same-{i}.txt: {:?}", r.map(|d| d.len()));
     }
     assert_eq!(std::fs::read(m.dir.join("src/shared/same.txt")).unwrap(), SAME.as_bytes());
+    // Once held (BUG-1464, rule a), a refused path naming those bytes
+    // reads them, or stays hidden while its refusal is fresh: never
+    // anything else.
     for i in 0..9 {
         let r = std::fs::read(acme.join(format!("same-{i}.txt")));
-        assert!(r.as_ref().is_err_and(|e| matches!(e.raw_os_error(), Some(EACCES) | Some(ENOENT))), "after the readable read, same-{i}.txt: {:?}", r.map(|d| d.len()));
+        let ok = match &r {
+            Ok(d) => d == SAME.as_bytes(),
+            Err(e) => matches!(e.raw_os_error(), Some(EACCES) | Some(ENOENT)),
+        };
+        assert!(ok, "after the readable read, same-{i}.txt: {:?}", r.map(|d| d.len()));
     }
     m.unmount();
 }
 
-/// BUG-1464: the mount serves content it holds, met at one place in this
-/// process, without asking the server at that path (`answer_for`:
-/// `places_known` counts the places *this store instance* met). Each
-/// recording opens the repository again (`open_repo`, a new store with an
-/// empty locator), as does a new mount: content fetched at a readable path
-/// is then read at a refused path holding the same bytes, never asked
-/// there. Under load the same happens inside one mount, between two reads
-/// a recording separates.
+/// BUG-1464, decided (option a, as S3 serves a file held from before access
+/// was removed): content already on this machine reads at every path that
+/// names it, a refused one included. Removal of access stops new fetches;
+/// the person already holds those bytes. So a refused path holding the same
+/// bytes as a readable copy reads exactly those bytes once they are held,
+/// in the same mount and in a new one, and never anything else.
 #[test]
-#[ignore = "BUG-1464: a mount reads a refused path holding the same bytes as a readable one once those bytes are held"]
-fn bug_1464_a_mount_reads_a_refused_path_once_the_same_bytes_are_held() {
+fn bug_1464_held_content_reads_at_every_path_naming_it() {
     const SAME: &str = "SAME-CONTENT-READABLE-FIRST-s8x-a83d17c4\n";
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
@@ -809,13 +814,14 @@ fn bug_1464_a_mount_reads_a_refused_path_once_the_same_bytes_are_held() {
     // The readable copy first: it reads, and its content is now held.
     assert_eq!(std::fs::read(m.dir.join("src/shared/same.txt")).unwrap(), SAME.as_bytes());
     assert!(fetched(&thin, "src/shared/same.txt"), "the readable read fetched it");
-    let r = std::fs::read(m.dir.join(format!("{BILL_DIR}/acme/same.txt")));
-    assert!(r.as_ref().is_err_and(|e| matches!(e.raw_os_error(), Some(EACCES) | Some(ENOENT))), "in the same mount, the refused copy read: {:?}", r.map(|d| d.len()));
+    // The refused path names the same held bytes: they read, and only they.
+    assert_eq!(std::fs::read(m.dir.join(format!("{BILL_DIR}/acme/same.txt"))).unwrap(), SAME.as_bytes(), "in the same mount");
     m.unmount();
-    // A new mount (as after any recording): the refused path is never asked.
     let m = Mounted::new(&p.fin, &thin, "agent");
-    let r = std::fs::read(m.dir.join(format!("{BILL_DIR}/acme/same.txt")));
-    assert!(r.as_ref().is_err_and(|e| matches!(e.raw_os_error(), Some(EACCES) | Some(ENOENT))), "in a new mount, the refused copy read: {:?}", r.map(|d| d.len()));
+    assert_eq!(std::fs::read(m.dir.join(format!("{BILL_DIR}/acme/same.txt"))).unwrap(), SAME.as_bytes(), "in a new mount");
+    // What was never held stays refused: the billing folder's own file.
+    let e = std::fs::read(m.dir.join(format!("{BILL_DIR}/acme/q2.txt"))).expect_err("a refused file never held");
+    assert!(matches!(e.raw_os_error(), Some(EACCES) | Some(ENOENT)), "{e}");
     m.unmount();
 }
 

@@ -650,13 +650,13 @@ fn prefetch_sync(repo: &Repo, from: Option<&ObjectId>, to: &ObjectId, set: Optio
         match veil_core::tree::lookup(store, to, p)? {
             Some(e) if e.kind == veil_core::object::EntryKind::Dir => {
                 let old = old.filter(|o| o.kind == veil_core::object::EntryKind::Dir).map(|o| o.id);
-                store.prefetch_diff(old.as_ref(), &e.id)?;
+                store.prefetch_diff_below(old.as_ref(), &e.id, to, p)?;
             }
-            Some(e) if old.as_ref().map(|o| o.id) != Some(e.id) => files.push((e.id, e.size)),
+            Some(e) if old.as_ref().map(|o| o.id) != Some(e.id) => files.push((p.clone(), e.id, e.size)),
             _ => {}
         }
     }
-    Ok(store.prefetch(files)?)
+    Ok(store.prefetch_at(to, &files)?)
 }
 
 /// The error of a run whose output could not be recorded: it stays.

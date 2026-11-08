@@ -2902,18 +2902,24 @@ protocol or server change.
     listing or lookup in the process: BUG-1461, open) and when it is read;
     a sealed secret and a conflicted file are read whole when read;
     recording reads changed files as any snapshot does.
-  * the locator keeps every place an object was met at (up to 8 besides
-    the first). A reader by id (a checkout, prefetch, the fallback) asks
-    again at the others before a refusal is final, so content refused at
-    one path is read where it is readable; the mount, a reader by path,
-    asks only at the path it reads, and serves content known at several
-    places at a path only once the server said yes there: a refusal stays
-    with its path (BUG-1460). A batch under a local change is asked under
-    its nearest server ancestor, one request a folder.
-  * refusals are kept by path, and every lookup asks for what it fetches
-    at the path it reads (`place_along`): the same content elsewhere,
-    refused at one path, reads at another (BUG-1367). Fetching is switched
-    off per thread, never for the whole store (BUG-1366).
+  * a reader that knows an entry's path asks at that path: the mount
+    (`read_at`, its folder's prefetch), a checkout and the fallback's
+    prefetch (`prefetch_diff_below`, `prefetch_at`) ask for each file at
+    its own path, one request a folder, and ask again at a file's other
+    paths in the tree they write only if the server refused it at the
+    first. So content refused at one path is written where it is readable
+    there, wherever it was met first (BUG-1460, BUG-1462, BUG-1463). The
+    locator keeps one place an object, for readers by id only. A batch
+    under a local change is asked under its nearest server ancestor.
+  * **content already held reads at every path naming it** (decided,
+    BUG-1464): removal of access stops new fetches; bytes already on a
+    machine stay readable there, at any path naming them, as they are in a
+    full clone made before the removal. A path whose content is not held
+    is asked of the server at that path (`place_along`): the same content
+    refused at one path is fetched at another where it is readable
+    (BUG-1367); a refusal hides that path for 10 s, or until something
+    makes its bytes held. Fetching is switched off per thread, never for
+    the whole store (BUG-1366).
 * **Exact dirty sets:** a mount's recording reuses every unchanged folder
   and file by id and visits only the paths the overlay holds, so it
   fetches nothing; the builder's carrying of what a working copy does not

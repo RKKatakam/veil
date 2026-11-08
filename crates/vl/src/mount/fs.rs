@@ -431,10 +431,6 @@ fn refused(path: &VPath) -> bool {
     }
 }
 
-/// The paths whose content, known at several places, the server served at
-/// that path in this process (BUG-1460): read as held from then on.
-static ALLOWED: std::sync::LazyLock<Mutex<HashSet<(VPath, ObjectId)>>> = std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
-
 /// Large files known to be plain blobs (BUG-1461): decided once a process.
 static PLAIN_LARGE: std::sync::LazyLock<Mutex<HashSet<ObjectId>>> = std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -587,31 +583,19 @@ impl ReaderView {
         }
     }
 
-    /// In a thin clone, have what is at `path` by the server's answer for
-    /// that path (BUG-1460): an object not held is asked for there and
-    /// nowhere else (its folder's small files with it); one held whose
-    /// content this process met at other places too is asked for there
-    /// once (then the answer for the path stands). Content met at one place
-    /// only is read as held. A refusal hides the path (`EACCES` now,
-    /// absent from then on).
+    /// In a thin clone, have what is at `path` (BUG-1460): content already
+    /// on this machine reads at every path naming it (the person holds
+    /// those bytes; removal of access stops new fetches, BUG-1464); an
+    /// object not held is asked for at this path and nowhere else, its
+    /// folder's small files with it. A refusal hides the path (`EACCES`
+    /// now, absent from then on).
     fn answer_for(&self, e: &TreeEntry, path: &VPath) -> VResult<()> {
-        if !self.store.is_partial() || e.kind == EntryKind::Dir {
+        if !self.store.is_partial() || e.kind == EntryKind::Dir || self.store.has(&e.id) {
             return Ok(());
         }
-        let held = self.store.has(&e.id);
-        let shared = self.store.places_known(&e.id) > 1;
-        let key = (path.clone(), e.id);
-        if held && (!shared || ALLOWED.lock().unwrap_or_else(|p| p.into_inner()).contains(&key)) {
-            return Ok(());
-        }
-        if !held {
-            self.prefetch_folder(&path.parent().unwrap_or_else(VPath::root));
-        }
-        match self.store.read_at(&e.id, &self.view.root(), path, shared) {
-            Ok(_) => {
-                ALLOWED.lock().unwrap_or_else(|p| p.into_inner()).insert(key);
-                Ok(())
-            }
+        self.prefetch_folder(&path.parent().unwrap_or_else(VPath::root));
+        match self.store.read_at(&e.id, &self.view.root(), path) {
+            Ok(_) => Ok(()),
             Err(err) => {
                 if err.is_unreadable() && e.visibility.key_scope().is_none() {
                     REFUSED.lock().unwrap_or_else(|p| p.into_inner()).insert(path.clone(), std::time::Instant::now());
