@@ -1336,6 +1336,176 @@ fn walk_lists_every_operation_after_its_descendants() {
     assert!(cases > 0, "the id order ran");
 }
 
+/// BUG-1432 (op log merges review, cycle 2): the walk's order (BUG-1402)
+/// on a log written before operation times were clamped. `x` (time 5,
+/// the clock set back) is older than its parent `y` (50), `z` is on `x`, and
+/// `w` (60), another branch on `y`, is merged with `z` by `m`. The walk
+/// reaches `y` from `w` first, with nothing yet saying `x` is below it, and
+/// lists `y` (and `a`) before `x` and `z`, which descend from it: `vl undo`
+/// in `x`'s workspace, with `w` another workspace's, would undo `y`.
+#[test]
+#[ignore = "BUG-1432: the op log's walk lists an operation before its descendant when that descendant is older and reached by a later path"]
+fn bug_1432_walk_lists_an_operation_after_an_older_descendant_on_another_branch() {
+    use veil_core::oplog::{OpStore, Operation};
+    let op = |parents: Vec<ObjectId>, timestamp: i64, description: &str| Operation {
+        parents,
+        timestamp,
+        user: "alice".into(),
+        description: description.into(),
+        view: View::default(),
+        manual_undo: None,
+        undo_of: None,
+        redo_of: None,
+        workspace: None,
+        rewritten: Default::default(),
+    };
+    let ops = OpStore::new(Arc::new(MemoryBackend::new()));
+    let a = ops.put(&op(vec![], 1, "a")).unwrap();
+    let y = ops.put(&op(vec![a], 50, "y")).unwrap();
+    let w = ops.put(&op(vec![y], 60, "w")).unwrap();
+    let x = ops.put(&op(vec![y], 5, "x")).unwrap();
+    let z = ops.put(&op(vec![x], 6, "z")).unwrap();
+    let mut parents = vec![w, z];
+    parents.sort();
+    let m = ops.put(&op(parents, 60, "m")).unwrap();
+    let order: Vec<ObjectId> = ops.walk(&[m]).map(|r| r.unwrap().0).collect();
+    let names = |o: &ObjectId| ops.get(o).unwrap().description;
+    assert_eq!(order.len(), 6, "each once: {:?}", order.iter().map(names).collect::<Vec<_>>());
+    let at = |id: &ObjectId| order.iter().position(|o| o == id).unwrap();
+    for (child, parent) in [(m, w), (m, z), (w, y), (z, x), (x, y), (y, a)] {
+        assert!(at(&child) < at(&parent), "{} (a child) after {}: {:?}", names(&child), names(&parent), order.iter().map(names).collect::<Vec<_>>());
+    }
+}
+
+/// BUG-1435 (op log merges review, cycle 2): the model check must see a
+/// conflict's loser dropped. A and B snapshot workspace `w` concurrently
+/// (`v1`, `v2`, two versions of its working copy, one change); the view
+/// below holds B's and has lost A's operation (A's objects are there), as a
+/// merge that dropped the loser would leave it. `check_model` counts `v1`
+/// visible because `v2`, a version of the same change, is: the correction
+/// for values a concurrent rewrite moved (BUG-1299) matches by change id,
+/// not by a rewrite the op log records, so it accepts the lost write.
+#[test]
+#[ignore = "BUG-1435: the model check counts a dropped conflict loser visible when another version of its change is"]
+fn bug_1435_the_model_check_sees_a_conflicts_loser_dropped() {
+    let me = Identity::generate("alice");
+    let truth = Device::new(false);
+    {
+        let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        let root = repo.root_id();
+        repo.create_workspace("w", vec![root]).unwrap();
+    }
+    let heads = op_heads(&*truth.fs);
+    let snap = |d: &Device, body: &[u8]| {
+        let mut r = Repo::open(d.fs.clone(), Some(me.clone()), "alice").unwrap();
+        r.set_command_workspace(Some("w".into()));
+        let ov = r.workspace_overlay("w").unwrap();
+        ov.write(&VPath::new("f").unwrap(), body).unwrap();
+        r.snapshot_workspace("w", &ov).unwrap().snapshot
+    };
+    let (a, b) = (truth.fork(&heads), truth.fork(&heads));
+    let v1 = snap(&a, b"from A\n");
+    let v2 = snap(&b, b"from B\n");
+    truth.land(&b, &heads);
+    for f in repo_files(&*a.fs) {
+        if f.as_str().starts_with(".veil/objects/") && !truth.fs.exists(&f).unwrap() {
+            truth.fs.write(&f, &a.fs.read(&f).unwrap()).unwrap();
+        }
+    }
+    let repo = Repo::open(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+    assert_eq!(repo.workspace_wc("w").unwrap(), v2, "B's working copy");
+    assert!(!repo.view().refs().iter().any(|r| *r == v1 || repo.is_ancestor(&v1, r).unwrap()), "A's working copy is gone from the view");
+    assert_eq!(repo.snapshot(&v1).unwrap().change_id, repo.snapshot(&v2).unwrap().change_id, "two versions of one change");
+    let w = Key::Ws("w".into());
+    let cmds = vec![
+        Cmd { forked: 1, landed: Some(3), writes: vec![(w.clone(), Some((v1, None)))], what: "snapshot w (A)".into(), commit: None },
+        Cmd { forked: 2, landed: Some(4), writes: vec![(w, Some((v2, None)))], what: "snapshot w (B)".into(), commit: None },
+    ];
+    assert!(check_model(&cmds, &repo, &Default::default(), "the view").is_err(), "the model check accepted a view that dropped the conflict's loser");
+}
+
+/// A backend that counts the operations read (`.veil/ops/`).
+#[derive(Debug, Default)]
+struct CountingOps {
+    inner: MemoryBackend,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl StorageBackend for CountingOps {
+    fn kind(&self) -> &'static str {
+        "counting"
+    }
+    fn read(&self, path: &VPath) -> veil_core::Result<Vec<u8>> {
+        if path.as_str().starts_with(".veil/ops/") {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.read(path)
+    }
+    fn write(&self, path: &VPath, data: &[u8]) -> veil_core::Result<()> {
+        self.inner.write(path, data)
+    }
+    fn create_new(&self, path: &VPath, data: &[u8]) -> veil_core::Result<bool> {
+        self.inner.create_new(path, data)
+    }
+    fn remove_file(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn create_dir_all(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &VPath) -> veil_core::Result<Vec<veil_core::vfs::DirEntry>> {
+        self.inner.list_dir(path)
+    }
+    fn metadata(&self, path: &VPath) -> veil_core::Result<Option<veil_core::vfs::Metadata>> {
+        self.inner.metadata(path)
+    }
+    fn set_executable(&self, path: &VPath, x: bool) -> veil_core::Result<()> {
+        self.inner.set_executable(path, x)
+    }
+}
+
+/// BUG-1433 (op log merges review, cycle 2): the cost of the op log's walk
+/// with one time for many operations. With the clock set back, every
+/// operation takes its parent's time (the clamp), until the clock catches
+/// up: an hour set back, an hour of operations; a clock once a year ahead,
+/// a year. The walk (BUG-1402) gathers every operation of the newest time
+/// before it lists the first, so `vl op log -n 5`, `vl undo` and `vl redo`
+/// read all of them (2.8 s for 1,000 tag moves in a debug build). The
+/// first few should cost a few reads, as before.
+#[test]
+#[ignore = "BUG-1433: the op log's walk reads every operation of one time before listing the first: vl op log -n 5 and vl undo read every operation since the clock was set back"]
+fn bug_1433_the_first_operations_of_the_walk_cost_a_few_reads_with_one_time() {
+    use veil_core::oplog::{OpStore, Operation};
+    let backend = Arc::new(CountingOps::default());
+    let ops = OpStore::new(backend.clone());
+    let mut last: Option<ObjectId> = None;
+    for i in 0..500 {
+        let op = Operation {
+            parents: last.into_iter().collect(),
+            timestamp: 10,
+            user: "alice".into(),
+            description: format!("tag {i}"),
+            view: View::default(),
+            manual_undo: None,
+            undo_of: None,
+            redo_of: None,
+            workspace: None,
+            rewritten: Default::default(),
+        };
+        last = Some(ops.put(&op).unwrap());
+    }
+    let head = last.unwrap();
+    backend.reads.store(0, std::sync::atomic::Ordering::SeqCst);
+    let first: Vec<ObjectId> = ops.walk(&[head]).take(5).map(|r| r.unwrap().0).collect();
+    let reads = backend.reads.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(first.len(), 5, "the walk listed five");
+    assert_eq!(first[0], head, "newest first");
+    assert!(reads <= 20, "the first five of 500 operations of one time read {reads} operations");
+}
+
 /// BUG-1296: a tag moved away and back (by `vl tag set` or an undo, which
 /// the merge counts as a change) concurrently with its deletion. Both
 /// sides introduced their value, so the merge compares with the nearest

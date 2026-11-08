@@ -589,3 +589,54 @@ fn undo_with_the_clock_set_back_undoes_the_newest_command() {
     clock::reset_clock();
     assert!(cases > 0, "the id order ran");
 }
+
+/// BUG-1404 (op log merges review, cycle 2): `vl op restore` reads which
+/// releases came after the restored operation from the heads this process
+/// read when it opened (`Repo::releases_after`), and the restore's own
+/// transaction reads them again. A release another process (a second
+/// terminal, an agent) staged in between is reached by the restore, which
+/// takes the view back to before it, but is not taken back: it stays
+/// staged and goes out with the next push. Before the fix (times compared)
+/// it was taken back.
+#[test]
+#[ignore = "BUG-1404: op restore keeps a release another process staged after this one read the op log, though the restore reaches it"]
+fn bug_1404_restore_takes_back_a_release_staged_meanwhile_by_another_process() {
+    let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let t = 1_800_000_000_000i64;
+    let now = settable_clock(t);
+    let fs = Arc::new(MemoryBackend::new());
+    let me = Identity::generate("alice");
+    let mut repo = Repo::init(fs.clone(), Some(me.clone()), "alice").unwrap();
+    fs.write(&p("auth.rs"), b"fn check() -> bool { true }\n").unwrap();
+    repo.snapshot_workspace("default", &*fs).unwrap();
+    let (main, _) = repo.commit_working_copy("default", "v1").unwrap();
+    repo.create_workspace("fix", vec![main]).unwrap();
+    let ov = repo.workspace_overlay("fix").unwrap();
+    ov.write(&p("auth.rs"), b"fn check() -> bool { verify_signature() }\n").unwrap();
+    let fix = repo.snapshot_workspace("fix", &ov).unwrap().snapshot;
+    let merged = repo.merge("default", main, vec![fix], "merge", Some(veil_core::commands::EmbargoSpec { scope: "team".into(), until: None }));
+    let e = merged.as_ref().ok().and_then(|m| m.embargo.clone());
+    now.store(t + 60_000, std::sync::atomic::Ordering::SeqCst);
+    let tagged = repo.set_tag("main", main, false);
+    let before = repo.op_id();
+    // `repo` has read the op log; another process releases the embargo now.
+    now.store(t + 120_000, std::sync::atomic::Ordering::SeqCst);
+    let released = e.as_ref().map(|e| Repo::open(fs.clone(), Some(me.clone()), "alice").and_then(|mut other| other.release_embargo(e)));
+    let staged = e.as_ref().map(|e| repo.keys().release_state(e));
+    now.store(t + 180_000, std::sync::atomic::Ordering::SeqCst);
+    let restored = repo.restore_operation(before);
+    let after = e.as_ref().map(|e| repo.keys().release_state(e));
+    // The restore descends from the release (its view is from before it).
+    let reaches = restored.as_ref().ok().map(|r| {
+        let since = repo.ops().split(&[*r], &[before]).unwrap().only_a;
+        since.iter().any(|o| repo.ops().get(o).unwrap().description.starts_with(veil_core::commands::RELEASE_OP_PREFIX))
+    });
+    clock::reset_clock();
+    let e = merged.unwrap().embargo.expect("an embargo");
+    tagged.unwrap();
+    released.unwrap().unwrap();
+    assert_eq!(staged, Some(veil_core::keychain::ReleaseState::Staged), "{e}: the release is staged");
+    restored.unwrap();
+    assert_eq!(reaches, Some(true), "the restore reaches the release operation");
+    assert_eq!(after, Some(veil_core::keychain::ReleaseState::Unreleased), "the restore to before the release took it back");
+}
