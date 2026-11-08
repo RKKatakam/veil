@@ -34,7 +34,7 @@
 //! wins: one written meanwhile with another value rolls the batch back.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
@@ -52,7 +52,7 @@ use veil_core::{
     ObjectId,
 };
 
-use super::{edits, rules::RULES_FILE, LEASE_MS, MAX_BATCH};
+use super::{edits, rules::RULES_FILE, Entry, LEASE_MS, MAX_BATCH};
 use crate::{
     auth::{Caller, Person},
     caches::Epochs,
@@ -85,10 +85,14 @@ pub const ATTACH_BUDGET: usize = 256;
 /// A view key with no memo on the recent line is handed to the background
 /// fill at most this often.
 const PREFILL_EVERY: Duration = Duration::from_secs(5);
-/// Finished queue rows are kept this long (a ticket's outcome), then
-/// deleted, a branch at a time, at most this often.
-const KEEP_DONE_MS: i64 = 24 * 3600 * 1000;
-const CLEAN_EVERY: Duration = Duration::from_secs(60);
+/// Finished queue rows (a ticket's outcome) and `landings` rows are kept
+/// this long, then deleted (BUG-1303): every [`CLEAN_EVERY`], also while the
+/// branch is busy, at most [`CLEAN_CHUNK`] of each table a pass (4,000 rows
+/// a second: four times what 1,000 landings a second add). At 1,000
+/// landings a second, an hour is about 3.6 million rows in each.
+const KEEP_DONE_MS: i64 = 3600 * 1000;
+const CLEAN_EVERY: Duration = Duration::from_secs(5);
+const CLEAN_CHUNK: i64 = 20_000;
 
 /// The database's clock, in milliseconds.
 const DB_NOW: &str = "(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT";
@@ -142,7 +146,9 @@ struct Row {
     ticket: String,
     person: Person,
     /// Each change with its base (`landing::stack`).
-    stack: Vec<(ObjectId, ObjectId)>,
+    stack: Vec<Entry>,
+    /// The branch's lineage its stack was judged under.
+    lineage: i64,
     epochs: (i64, i64),
 }
 
@@ -168,6 +174,8 @@ struct Kept {
 #[derive(Clone, Default)]
 struct State {
     tip: Option<ObjectId>,
+    /// The branch's lineage (BUG-1300): moved only within it.
+    lineage: i64,
     /// The first-parent line ending at `tip`, oldest first, at most
     /// [`RECENT`] long.
     recent: VecDeque<ObjectId>,
@@ -205,8 +213,18 @@ struct Inputs {
     memo: HashMap<(String, ObjectId), ObjectId>,
     /// Origins (`sync::push`) of the stack snapshots that have one.
     origins: HashMap<ObjectId, ObjectId>,
-    /// Stack changes that landed already (`landings`: submitted → landed).
-    landed: HashMap<ObjectId, ObjectId>,
+    /// Stack changes that landed already, in the branch's lineage
+    /// (`landings`).
+    landed: HashMap<ObjectId, Record>,
+}
+
+/// Where a stack change landed already, and how much of it.
+#[derive(Clone)]
+struct Record {
+    landed: ObjectId,
+    /// All of its own edits; else only what `key`'s view showed of it.
+    whole: bool,
+    key: String,
 }
 
 /// What one entry came to.
@@ -229,8 +247,8 @@ struct Built {
     /// what decides whether another entry joins it.
     made: usize,
     snapshots: Vec<ObjectId>,
-    /// Submitted snapshots made again: `(submitted, landed)`.
-    landings: Vec<(ObjectId, ObjectId)>,
+    /// Stack changes landed: `(submitted, landed, record)`.
+    landings: Vec<(ObjectId, Record)>,
     /// New memo rows `(view key, real, projected)`.
     memos: Vec<(String, ObjectId, ObjectId)>,
     old_tip: Option<ObjectId>,
@@ -294,6 +312,7 @@ pub(super) async fn run(hub: &Arc<Hub>, project: i64, branch: &str, wake: Arc<No
         name,
         branch: branch.to_string(),
         epoch,
+        won: Default::default(),
     };
     let r = s.run(wake).await;
     let _ = sqlx::query("UPDATE landing_leases SET expires_at = 0 WHERE project_id = $1 AND branch = $2 AND holder = $3 AND epoch = $4")
@@ -312,6 +331,11 @@ struct Service {
     name: String,
     branch: String,
     epoch: i64,
+    /// Stored memos that won over a batch's own (`MEMO_RACE`): the batch
+    /// built again uses them, so it lands with what is stored instead of
+    /// racing it again (a snapshot made again exactly as one landed before,
+    /// whose projections were stored then).
+    won: Arc<std::sync::Mutex<HashMap<(String, ObjectId), ObjectId>>>,
 }
 
 /// A batch being committed.
@@ -339,6 +363,11 @@ impl Service {
                 }
                 continue;
             }
+            // Retention runs whether or not the branch is busy (BUG-1303).
+            if cleaned.is_none_or(|t| t.elapsed() > CLEAN_EVERY) {
+                self.clean().await?;
+                cleaned = Some(Instant::now());
+            }
             let exclude = inflight.as_ref().map(|f| f.seqs.clone()).unwrap_or_default();
             let rows = self.ready(&exclude).await?;
             if rows.is_empty() {
@@ -347,10 +376,6 @@ impl Service {
                         return Ok(());
                     }
                     continue;
-                }
-                if cleaned.is_none_or(|t| t.elapsed() > CLEAN_EVERY) {
-                    self.clean().await?;
-                    cleaned = Some(Instant::now());
                 }
                 if idle.elapsed() > IDLE {
                     return Ok(());
@@ -418,23 +443,33 @@ impl Service {
             name: self.name.clone(),
             branch: self.branch.clone(),
             epoch: self.epoch,
+            won: self.won.clone(),
         }
     }
 
-    /// Finished rows, and `landings` rows, older than [`KEEP_DONE_MS`] go.
+    /// Finished rows, and `landings` rows, of the whole project (so a
+    /// deleted branch's go too) older than [`KEEP_DONE_MS`] go, at most
+    /// [`CLEAN_CHUNK`] of each.
     async fn clean(&self) -> Result<()> {
         let before = veil_core::now_millis() - KEEP_DONE_MS;
-        sqlx::query("DELETE FROM landing_queue WHERE project_id = $1 AND branch = $2 AND state <> 'queued' AND done_at < $3")
-            .bind(self.project)
-            .bind(&self.branch)
-            .bind(before)
-            .execute(&self.hub.db)
-            .await?;
-        sqlx::query("DELETE FROM landings WHERE project_id = $1 AND at < $2")
-            .bind(self.project)
-            .bind(before)
-            .execute(&self.hub.db)
-            .await?;
+        sqlx::query(
+            "DELETE FROM landing_queue WHERE (project_id, branch, seq) IN (SELECT project_id, branch, seq FROM landing_queue \
+             WHERE project_id = $1 AND done_at < $2 AND state <> 'queued' LIMIT $3)",
+        )
+        .bind(self.project)
+        .bind(before)
+        .bind(CLEAN_CHUNK)
+        .execute(&self.hub.db)
+        .await?;
+        sqlx::query(
+            "DELETE FROM landings WHERE (project_id, branch, lineage, submitted) IN (SELECT project_id, branch, lineage, submitted \
+             FROM landings WHERE project_id = $1 AND at < $2 LIMIT $3)",
+        )
+        .bind(self.project)
+        .bind(before)
+        .bind(CLEAN_CHUNK)
+        .execute(&self.hub.db)
+        .await?;
         Ok(())
     }
 
@@ -464,14 +499,16 @@ impl Service {
 
     /// The branch's tip, from the database (no view key kept yet).
     async fn load(&self) -> Result<State> {
-        let t: Option<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2")
+        let t: Option<(String, i64)> = sqlx::query_as("SELECT target, lineage FROM branches WHERE project_id = $1 AND name = $2")
             .bind(self.project)
             .bind(&self.branch)
             .fetch_optional(&self.hub.db)
             .await?;
-        let tip = t.map(|t| ObjectId::from_hex(&t).map_err(|e| Error::Other(e.into()))).transpose()?;
+        let lineage = t.as_ref().map_or(0, |t| t.1);
+        let tip = t.map(|t| ObjectId::from_hex(&t.0).map_err(|e| Error::Other(e.into()))).transpose()?;
         Ok(State {
             tip,
+            lineage,
             recent: tip.into_iter().collect(),
             ..State::default()
         })
@@ -479,9 +516,9 @@ impl Service {
 
     /// The ready rows, in order, leaving out those being committed.
     async fn ready(&self, exclude: &HashSet<i64>) -> Result<Vec<Row>> {
-        type R = (i64, String, i64, String, String, String, i64, i64);
+        type R = (i64, String, i64, String, String, String, i64, i64, i64);
         let rows: Vec<R> = sqlx::query_as(
-            "SELECT seq, ticket, person_id, person_name, device_key, stack, person_epoch, project_epoch FROM landing_queue \
+            "SELECT seq, ticket, person_id, person_name, device_key, stack, lineage, person_epoch, project_epoch FROM landing_queue \
              WHERE project_id = $1 AND branch = $2 AND state = 'queued' ORDER BY created_at, seq LIMIT $3",
         )
         .bind(self.project)
@@ -490,18 +527,16 @@ impl Service {
         .fetch_all(&self.hub.db)
         .await?;
         let mut out = Vec::new();
-        for (seq, ticket, id, name, device_key, stack, pe, je) in rows {
+        for (seq, ticket, id, name, device_key, stack, lineage, pe, je) in rows {
             if exclude.contains(&seq) {
                 continue;
             }
-            let stack: Vec<[String; 2]> = serde_json::from_str(&stack).map_err(|e| Error::Other(e.into()))?;
-            let hex = |s: &str| ObjectId::from_hex(s).map_err(|e| Error::Other(e.into()));
-            let stack = stack.iter().map(|[s, b]| Ok((hex(s)?, hex(b)?))).collect::<Result<_>>()?;
             out.push(Row {
                 seq,
                 ticket,
                 person: Person { id, name, device_key },
-                stack,
+                stack: super::decode_stack(&stack)?,
+                lineage,
                 epochs: (pe, je),
             });
             if out.len() == MAX_BATCH {
@@ -665,7 +700,7 @@ impl Service {
         // they are), their other parents and predecessors, and of the other
         // parents and predecessors of the recent snapshots an attached key
         // is projected over; and the stack snapshots' origins.
-        let stacks: Vec<ObjectId> = entries.iter().flat_map(|e| e.row.stack.iter().map(|x| x.0)).collect();
+        let stacks: Vec<ObjectId> = entries.iter().flat_map(|e| e.row.stack.iter().map(|x| x.id)).collect();
         let first_gap = attach.iter().map(|a| a.2 + 1).min().unwrap_or(recent.len());
         let gap: Vec<ObjectId> = recent[first_gap.min(recent.len())..].to_vec();
         let (s2, g2) = (stacks.clone(), gap.clone());
@@ -684,26 +719,33 @@ impl Service {
         ids.sort_unstable();
         ids.dedup();
         let keys: Vec<String> = on.keys.keys().cloned().chain(attach.iter().map(|a| a.0.clone())).collect();
-        let memo = match keys.is_empty() || ids.is_empty() {
+        let mut memo = match keys.is_empty() || ids.is_empty() {
             true => HashMap::new(),
             false => memos(hub, self.project, &keys, &ids).await?,
         };
+        memo.extend(self.won.lock().unwrap().drain());
         // (No origins: a projection equal to a pusher's own snapshot is
         // that pusher's view key's, whose memo the push stored.)
         let origins = HashMap::new();
-        // Stack changes another stack landed already (BUG-1270).
-        let landed: HashMap<ObjectId, ObjectId> = if stacks.is_empty() {
+        // Stack changes another stack landed already, in the branch's
+        // lineage (BUG-1270, BUG-1300).
+        let landed: HashMap<ObjectId, Record> = if stacks.is_empty() {
             HashMap::new()
         } else {
             let hex: Vec<String> = stacks.iter().map(ObjectId::hex).collect();
-            let rows: Vec<(String, String)> =
-                sqlx::query_as("SELECT submitted, landed FROM landings WHERE project_id = $1 AND branch = $3 AND submitted = ANY($2)")
-                .bind(self.project)
-                .bind(&hex)
-                .bind(&self.branch)
-                .fetch_all(&hub.db)
-                .await?;
-            rows.into_iter().filter_map(|(s, l)| Some((ObjectId::from_hex(&s).ok()?, ObjectId::from_hex(&l).ok()?))).collect()
+            let rows: Vec<(String, String, bool, String)> = sqlx::query_as(
+                "SELECT submitted, landed, whole, view_key FROM landings WHERE project_id = $1 AND branch = $3 AND lineage = $4 \
+                 AND submitted = ANY($2)",
+            )
+            .bind(self.project)
+            .bind(&hex)
+            .bind(&self.branch)
+            .bind(on.lineage)
+            .fetch_all(&hub.db)
+            .await?;
+            rows.into_iter()
+                .filter_map(|(s, l, whole, key)| Some((ObjectId::from_hex(&s).ok()?, Record { landed: ObjectId::from_hex(&l).ok()?, whole, key })))
+                .collect()
         };
         Ok(Inputs { entries, attach, memo, origins, landed })
     }
@@ -758,8 +800,19 @@ impl Service {
         // landed as itself, so a submit on any tip an agent read since the
         // service began finds its base in one lookup (`landing::stack`),
         // never walking the branch nor waiting for the deriver.
-        let from = b.old_tip.filter(|_| moved).map(|t| (t, t));
-        let (ls, ll): (Vec<String>, Vec<String>) = b.landings.iter().chain(from.iter()).map(|(s, l)| (s.hex(), l.hex())).unzip();
+        let from = b.old_tip.filter(|_| moved).map(|t| (t, Record { landed: t, whole: true, key: String::new() }));
+        // One row per submitted snapshot (the last landing of it wins; it is
+        // whole once any landing of it was).
+        let mut rows: BTreeMap<ObjectId, Record> = BTreeMap::new();
+        for (sid, r) in b.landings.iter().chain(from.iter()) {
+            let whole = r.whole || rows.get(sid).is_some_and(|o| o.whole);
+            rows.insert(*sid, Record { whole, ..r.clone() });
+        }
+        let ls: Vec<String> = rows.keys().map(ObjectId::hex).collect();
+        let ll: Vec<String> = rows.values().map(|r| r.landed.hex()).collect();
+        let lw: Vec<bool> = rows.values().map(|r| r.whole).collect();
+        let lk: Vec<String> = rows.values().map(|r| r.key.clone()).collect();
+        let lineage = b.after.lineage;
         let mk: Vec<String> = b.memos.iter().map(|m| m.0.clone()).collect();
         let mr: Vec<String> = b.memos.iter().map(|m| m.1.hex()).collect();
         let mp: Vec<String> = b.memos.iter().map(|m| m.2.hex()).collect();
@@ -768,7 +821,7 @@ impl Service {
         let notify = hub.caches.notices.load(Ordering::SeqCst);
         let tx_results = results.clone();
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-            let (ls, ll) = (ls.clone(), ll.clone());
+            let (ls, ll, lw, lk) = (ls.clone(), ll.clone(), lw.clone(), lk.clone());
             let (branch, holder, old, new, seqs, snapshots, mk, mr, mp, accept, name, mut results) = (
                 branch.clone(),
                 holder.clone(),
@@ -799,18 +852,30 @@ impl Service {
                 if held != 1 {
                     return Err(Error::conflict(LEASE_LOST));
                 }
-                if moved {
-                    let n = sqlx::query("UPDATE branches SET target = $1 WHERE project_id = $2 AND name = $3 AND target = $4")
+                // The branch is where the batch was judged, in the same
+                // lineage, also when nothing of it moves the branch
+                // (BUG-1304, BUG-1300): else it is built again on the tip.
+                let n = match &old {
+                    Some(_) => sqlx::query("UPDATE branches SET target = $1 WHERE project_id = $2 AND name = $3 AND target = $4 AND lineage = $5")
                         .bind(&new)
                         .bind(pid)
                         .bind(&branch)
                         .bind(&old)
+                        .bind(lineage)
                         .execute(&mut *c)
                         .await?
-                        .rows_affected();
-                    if n != 1 {
-                        return Err(Error::conflict(MOVED));
+                        .rows_affected(),
+                    None => {
+                        let there: Option<i64> = sqlx::query_scalar("SELECT lineage FROM branches WHERE project_id = $1 AND name = $2")
+                            .bind(pid)
+                            .bind(&branch)
+                            .fetch_optional(&mut *c)
+                            .await?;
+                        u64::from(there.is_none())
                     }
+                };
+                if n != 1 {
+                    return Err(Error::conflict(MOVED));
                 }
                 if let Some(text) = &accept {
                     // Bumps the project's access epoch (a trigger): later
@@ -850,14 +915,19 @@ impl Service {
                 }
                 if !ls.is_empty() {
                     sqlx::query(
-                        "INSERT INTO landings (project_id, branch, submitted, landed, at) SELECT $1, $5, s, l, $4 \
-                         FROM unnest($2::TEXT[], $3::TEXT[]) AS v(s, l) ON CONFLICT DO NOTHING",
+                        "INSERT INTO landings (project_id, branch, lineage, submitted, landed, whole, view_key, at) \
+                         SELECT $1, $5, $6, s, l, w, k, $4 FROM unnest($2::TEXT[], $3::TEXT[], $7::BOOL[], $8::TEXT[]) AS v(s, l, w, k) \
+                         ON CONFLICT (project_id, branch, lineage, submitted) DO UPDATE SET landed = EXCLUDED.landed, \
+                         whole = landings.whole OR EXCLUDED.whole, view_key = EXCLUDED.view_key, at = EXCLUDED.at",
                     )
                     .bind(pid)
                     .bind(&ls)
                     .bind(&ll)
                     .bind(veil_core::now_millis())
                     .bind(&branch)
+                    .bind(lineage)
+                    .bind(&lw)
+                    .bind(&lk)
                     .execute(&mut *c)
                     .await?;
                 }
@@ -919,6 +989,11 @@ impl Service {
             Err(Error::Api { code: "conflict", message, .. }) if message == MOVED => return Ok(Committed::Moved),
             Err(Error::Api { code: "conflict", message, .. }) if message == MEMO_RACE => {
                 hub.landing.stats.memo_races.fetch_add(1, Ordering::Relaxed);
+                // What is stored wins: the batch built again projects onto it.
+                let keys: Vec<String> = b.memos.iter().map(|m| m.0.clone()).collect::<BTreeSet<_>>().into_iter().collect();
+                let reals: Vec<ObjectId> = b.memos.iter().map(|m| m.1).collect::<BTreeSet<_>>().into_iter().collect();
+                let stored = memos(hub, self.project, &keys, &reals).await?;
+                self.won.lock().unwrap().extend(stored);
                 return Ok(Committed::Moved);
             }
             Err(e) => return Err(e),
@@ -983,6 +1058,8 @@ async fn memos(hub: &Hub, project: i64, keys: &[String], reals: &[ObjectId]) -> 
 
 const LEASE_LOST: &str = "the landing lease was lost";
 const MOVED: &str = "the branch moved under the landing service";
+/// An entry whose stack was judged under another lineage of the branch.
+const RESET: &str = "the branch was reset since this change was submitted (a forced push, or deleted and made again): submit it again";
 const MEMO_RACE: &str = "a projection memo was stored meanwhile with another value";
 
 fn state_name(s: LandState) -> &'static str {
@@ -1162,7 +1239,7 @@ fn entry(
     b: &mut Built,
     memo: &mut HashMap<(String, ObjectId), ObjectId>,
     origins: &HashMap<ObjectId, ObjectId>,
-    landed_before: &HashMap<ObjectId, ObjectId>,
+    landed_before: &HashMap<ObjectId, Record>,
     before: usize,
 ) -> Result<Option<Outcome>> {
     let Some(tip) = b.after.tip else { return Ok(Some(Outcome::Rejected(format!("there is no branch '{branch}'")))) };
@@ -1173,12 +1250,27 @@ fn entry(
     if p.row.stack.is_empty() {
         return Ok(Some(Outcome::Rejected("nothing to land".into())));
     }
-    let snaps: Vec<Arc<Snapshot>> = p.row.stack.iter().map(|s| src.snapshot(&s.0)).collect::<veil_core::Result<_>>()?;
-    let mut sets: Vec<Vec<Change>> = Vec::new();
-    for (_, base) in &p.row.stack {
-        let base = src.snapshot(base)?;
-        sets.push(edits::edit_set(src, snaps[sets.len()].tree, base.tree)?);
+    // Judged under another lineage: what it took as on the branch may no
+    // longer be (BUG-1300).
+    if p.row.lineage != b.after.lineage {
+        return Ok(Some(Outcome::Rejected(RESET.into())));
     }
+    let snaps: Vec<Arc<Snapshot>> = p.row.stack.iter().map(|e| src.snapshot(&e.id)).collect::<veil_core::Result<_>>()?;
+    // Each change's edits: its diff against its base, as the submitter saw
+    // both at submit when something hidden from them lies between.
+    let mut sets: Vec<Vec<Change>> = Vec::new();
+    let mut base_trees: Vec<ObjectId> = Vec::new();
+    for (e, s) in p.row.stack.iter().zip(&snaps) {
+        let (new, old) = match &e.seen {
+            Some(v) => (v.new, v.old),
+            None => (s.tree, src.snapshot(&e.base)?.tree),
+        };
+        sets.push(edits::edit_set(src, new, old)?);
+        base_trees.push(old);
+    }
+    // A merge whose base is its first parent (as the submitter saw it):
+    // lands as a merge, on the tip it was made on.
+    let as_merge = |s: &Snapshot, base: ObjectId| s.parents.len() > 1 && !s.parents[1..].contains(&base);
     if sets.iter().flatten().any(|c| c.path == POLICY_FILE || c.path == RULES_FILE) {
         if !b.rows.is_empty() {
             return Ok(None);
@@ -1191,17 +1283,18 @@ fn entry(
     // from another parent are the push's checks', below.)
     if p.recheck {
         let view = who.project.view(&who.viewer);
-        for ((s, set), (_, base)) in snaps.iter().zip(&sets).zip(&p.row.stack) {
-            // (A merge landing as it is: its other parents' changes are the
-            // push's checks', below.)
-            if s.parents.len() == 1 || *base != s.parents[0] {
+        for ((s, set), e) in snaps.iter().zip(&sets).zip(&p.row.stack) {
+            if !as_merge(s, e.base) {
                 if let Some(c) = set.iter().find(|c| !view.write(&c.path)) {
                     return Ok(Some(Outcome::Rejected(format!("you may not write '{}'", c.path))));
                 }
             }
         }
     }
-    // The stack, change by change, on the tip.
+    let key = who.key.clone().unwrap_or_default();
+    // The stack, change by change, on the tip: each as a new snapshot, never
+    // the submitted one, so nothing hidden below or inside it shows in the
+    // answer (S17 cycle 3).
     let mut chain = tip;
     let tip_tree = src.snapshot(&tip)?.tree;
     let mut chain_tree = tip_tree;
@@ -1209,95 +1302,108 @@ fn entry(
     // Where each change of the stack is on the branch (a change another
     // stack landed already counts there, BUG-1270).
     let mut reals: Vec<ObjectId> = Vec::new();
-    for (i, (s, set)) in snaps.iter().zip(&sets).enumerate() {
-        let (sid, base) = p.row.stack[i];
-        let earlier = b.landings.iter().find(|l| l.0 == sid).map(|l| l.1).or_else(|| landed_before.get(&sid).copied());
-        if let Some(l) = earlier {
-            // Landed by another stack (this batch's or an earlier one's):
-            // the changes after it are applied on the tip as they are.
-            reals.push(l);
-            continue;
-        }
-        let base_tree = src.snapshot(&base)?.tree;
-        let parent_tree = base_tree;
-        let (id, snap, parents) = if base == s.parents[0] && base == chain {
-            b.landings.push((sid, sid));
-            (sid, s.clone(), s.parents.clone())
-        } else {
-            // A merge lands as it is, on its first parent; a merge with a
-            // parent on the branch lands as its edits against that parent
-            // (`landing::stack`, BUG-1271).
-            if s.parents.len() > 1 && base == s.parents[0] {
-                return Ok(Some(Outcome::Rejected(
-                    "a merge lands only on the tip it was made on: merge the branch's new tip and land again".into(),
-                )));
+    for (i, s) in snaps.iter().enumerate() {
+        let e = &p.row.stack[i];
+        let sid = e.id;
+        let mut set = sets[i].clone();
+        let earlier = b.landings.iter().rev().find(|l| l.0 == sid).map(|l| l.1.clone()).or_else(|| landed_before.get(&sid).cloned());
+        if let Some(r) = &earlier {
+            // Landed whole, or all this submitter sees of it.
+            if r.whole || r.key == key {
+                reals.push(r.landed);
+                continue;
             }
-            if edits::fast_path(src, parent_tree, chain_tree, set)?.is_some() {
-                // Every path of the change that moved (all its own paths).
-                let mut paths = Vec::new();
-                for c in set {
-                    if edits::fast_path(src, parent_tree, chain_tree, std::slice::from_ref(c))?.is_some() {
-                        paths.push(c.path.clone());
-                    }
+            // Landed in part, for another view: what of it the tip holds
+            // counts as landed; the rest lands (or conflicts) as any edit.
+            let mut rest = Vec::new();
+            for c in set {
+                if !edits::holds(src, chain_tree, &c)? {
+                    rest.push(c);
                 }
-                return Ok(Some(Outcome::Conflict { paths }));
             }
-            let mut made = HashMap::new();
-            let tree = match edits::apply(src, chain_tree, set, &mut made)? {
-                Ok(t) => t,
-                Err(edits::Blocked(path)) => return Ok(Some(Outcome::Conflict { paths: vec![path] })),
-            };
-            for (id, (raw, _)) in made {
-                b.object(src, id, Bytes::from(raw));
+            if rest.is_empty() {
+                reals.push(r.landed);
+                continue;
             }
-            b.flush(hub, src, before)?;
-            // The landing check: the new snapshot's diff is exactly the
-            // change's edits.
-            if !edits::same_edits(&edits::edit_set(src, tree, chain_tree)?, set) {
-                eprintln!(
-                    "veil-server: BUG: the landing check failed for ticket {} (snapshot {} onto {}): not landed",
-                    p.row.ticket,
-                    sid.short(),
-                    chain.short()
-                );
-                return Ok(Some(Outcome::Rejected(
-                    "the server could not land this change: its landing check failed (a bug in the server, logged there)".into(),
-                )));
+            set = rest;
+        }
+        let parent_tree = base_trees[i];
+        let merge = as_merge(s, e.base);
+        if merge && e.base != chain {
+            return Ok(Some(Outcome::Rejected(
+                "a merge lands only on the tip it was made on: merge the branch's new tip and land again".into(),
+            )));
+        }
+        if edits::fast_path(src, parent_tree, chain_tree, &set)?.is_some() {
+            // Every path of the change that moved (all its own paths).
+            let mut paths = Vec::new();
+            for c in &set {
+                if edits::fast_path(src, parent_tree, chain_tree, std::slice::from_ref(c))?.is_some() {
+                    paths.push(c.path.clone());
+                }
             }
-            let mut n = Snapshot {
-                parents: vec![chain],
-                change_id: s.change_id,
-                tree,
-                description: s.description.clone(),
-                author: s.author.clone(),
-                timestamp: s.timestamp,
-                predecessors: vec![sid],
-                conflicts: vec![],
-                embargo: None,
-                signature: None,
-            };
-            n.sign(&hub.identity);
-            let raw = Bytes::from(Object::Snapshot(n.clone()).encode());
-            let id = ObjectId::hash(&raw);
-            b.object(src, id, raw);
-            b.snapshots.push(id);
-            b.landings.push((sid, id));
-            (id, Arc::new(n), vec![chain])
+            return Ok(Some(Outcome::Conflict { paths }));
+        }
+        let mut made = HashMap::new();
+        let tree = match edits::apply(src, chain_tree, &set, &mut made)? {
+            Ok(t) => t,
+            Err(edits::Blocked(path)) => return Ok(Some(Outcome::Conflict { paths: vec![path] })),
         };
+        for (id, (raw, _)) in made {
+            b.object(src, id, Bytes::from(raw));
+        }
+        b.flush(hub, src, before)?;
+        // The landing check: the new snapshot's diff is exactly the
+        // change's edits.
+        if !edits::same_edits(&edits::edit_set(src, tree, chain_tree)?, &set) {
+            eprintln!(
+                "veil-server: BUG: the landing check failed for ticket {} (snapshot {} onto {}): not landed",
+                p.row.ticket,
+                sid.short(),
+                chain.short()
+            );
+            return Ok(Some(Outcome::Rejected(
+                "the server could not land this change: its landing check failed (a bug in the server, logged there)".into(),
+            )));
+        }
+        let mut parents = vec![chain];
+        if merge {
+            parents.extend(s.parents[1..].iter().copied());
+        }
+        let mut n = Snapshot {
+            parents: parents.clone(),
+            change_id: s.change_id,
+            tree,
+            description: s.description.clone(),
+            author: s.author.clone(),
+            timestamp: s.timestamp,
+            predecessors: vec![sid],
+            conflicts: vec![],
+            embargo: None,
+            signature: None,
+        };
+        n.sign(&hub.identity);
+        let raw = Bytes::from(Object::Snapshot(n.clone()).encode());
+        let id = ObjectId::hash(&raw);
+        b.object(src, id, raw);
+        b.snapshots.push(id);
+        b.landings.push((sid, Record { landed: id, whole: e.whole(), key: key.clone() }));
+        let snap = Arc::new(n);
         // The push's checks again, on the new parents, when what they read
         // may have changed: access (epochs), or the policy file the
-        // classification reads.
-        let policy_moved = sync::entry_at(src, &parent_tree, POLICY_FILE)? != sync::entry_at(src, &chain_tree, POLICY_FILE)?;
-        if p.recheck || policy_moved {
+        // classification reads; and always for a merge (every parent).
+        let real_base_tree = src.snapshot(&e.base)?.tree;
+        let policy_moved = sync::entry_at(src, &real_base_tree, POLICY_FILE)? != sync::entry_at(src, &chain_tree, POLICY_FILE)?;
+        if p.recheck || policy_moved || merge {
             hub.landing.stats.rechecked.fetch_add(1, Ordering::Relaxed);
-            if let Err(why) = recheck(src, &who, &snap, &parents, set, &hub.identity)? {
+            if let Err(why) = recheck(src, &who, &snap, &parents, &set, &hub.identity)? {
                 return Ok(Some(Outcome::Rejected(why)));
             }
         }
         reals.push(id);
         landed.push((id, snap));
         chain = id;
-        chain_tree = landed.last().expect("pushed").1.tree;
+        chain_tree = tree;
     }
     if branch == who.project.default_branch {
         // A change of who has access: an admin's only (the accepted policy).

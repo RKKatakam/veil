@@ -1445,25 +1445,30 @@ pub(crate) async fn push_with(
             }
             // Every change between the branch's tip and the pushed one: what
             // this push brought, and what the server already held (BUG-1103).
-            let stack = match crate::landing::stack(hub, project, viewer, &u.branch, new_real, cur.expect("checked"), &real_parents_of).await? {
+            let judged = match crate::landing::stack(hub, project, viewer, &u.branch, new_real, &real_parents_of).await? {
+                Ok(s) if !s.branch => {
+                    results.push(refuse(&format!("there is no branch '{}' to land on", u.branch)));
+                    continue;
+                }
                 Ok(s) => s,
                 Err(why) => {
                     results.push(refuse(&why));
                     continue;
                 }
             };
-            if stack.is_empty() {
+            if judged.stack.is_empty() {
                 results.push(refuse("nothing to land: that snapshot is already on the branch"));
                 continue;
             }
-            if stack.iter().any(|(s, _)| parents_of.iter().any(|(pid, n)| real_of.get(pid) == Some(s) && !n.conflicts.is_empty())) {
+            if judged.stack.iter().any(|e| parents_of.iter().any(|(pid, n)| real_of.get(pid) == Some(&e.id) && !n.conflicts.is_empty())) {
                 results.push(refuse("a change with unresolved conflicts never lands: resolve them first"));
                 continue;
             }
             queued.push(crate::landing::Queued {
                 ticket: crate::landing::ticket(),
                 branch: u.branch.clone(),
-                stack,
+                stack: judged.stack,
+                lineage: judged.lineage,
             });
             continue;
         }
@@ -1541,7 +1546,7 @@ pub(crate) async fn push_with(
         }
     }
     for q in &queued {
-        Box::pin(projected_inner(hub, project, viewer, q.stack.last().expect("a stack is never empty").0, Some(&mut deferred))).await?;
+        Box::pin(projected_inner(hub, project, viewer, q.stack.last().expect("a stack is never empty").id, Some(&mut deferred))).await?;
     }
     // Only the snapshots this push made (known ones are recorded already:
     // rewriting their rows made every racing pusher write the same row),
@@ -1549,7 +1554,7 @@ pub(crate) async fn push_with(
     // update's snapshots are no branch's history (BUG-914).
     let landing: HashSet<ObjectId> = {
         let mut seen = HashSet::new();
-        let mut stack: Vec<ObjectId> = plans.iter().filter_map(|p| p.2).chain(queued.iter().filter_map(|q| q.stack.last().map(|e| e.0))).collect();
+        let mut stack: Vec<ObjectId> = plans.iter().filter_map(|p| p.2).chain(queued.iter().filter_map(|q| q.stack.last().map(|e| e.id))).collect();
         while let Some(x) = stack.pop() {
             if let Some(ps) = real_parents_of.get(&x) {
                 if seen.insert(x) {
@@ -1566,6 +1571,7 @@ pub(crate) async fn push_with(
     let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let pid = project.id;
     let plans2 = plans.clone();
+    let force = req.force;
     let (queued2, who2) = (queued.clone(), who.clone());
     // Whoever lands here hears at once (registered before the commit).
     let waiters: Vec<crate::landing::Waiter> = queued.iter().map(|q| hub.landing.register(&q.ticket)).collect();
@@ -1587,11 +1593,17 @@ pub(crate) async fn push_with(
             let mut moved = Vec::new();
             for (branch, cur, new, accept) in plans {
                 let rows = match (cur, new) {
-                    (Some(c0), Some(n)) => sqlx::query("UPDATE branches SET target = $1 WHERE project_id = $2 AND name = $3 AND target = $4")
+                    // A forced update starts a new lineage (BUG-1300): what the
+                    // landing service recorded of the branch no longer counts.
+                    (Some(c0), Some(n)) => sqlx::query(
+                        "UPDATE branches SET target = $1, lineage = CASE WHEN $5 THEN nextval('branch_lineages') ELSE lineage END \
+                         WHERE project_id = $2 AND name = $3 AND target = $4",
+                    )
                         .bind(n.hex())
                         .bind(pid)
                         .bind(&branch)
                         .bind(c0.hex())
+                        .bind(force)
                         .execute(&mut *c)
                         .await?
                         .rows_affected(),

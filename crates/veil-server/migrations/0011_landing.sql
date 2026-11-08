@@ -5,8 +5,9 @@
 -- A queue row is one submitted stack of changes (oldest first), already
 -- checked as a push is: its real snapshots are committed history from the
 -- submit on (`snapshots` rows), so they resolve and project like any other.
--- The edit set of each change is not stored: it is the diff of its snapshot
--- against its first parent, read from the objects (objects are authority).
+-- The edits of each change are not stored: they are its diff against its
+-- base, read from the objects (objects are authority), on the submitter's
+-- projected trees when something they cannot see lies between.
 -- Idempotent (IF NOT EXISTS): YugabyteDB may apply DDL statement by
 -- statement.
 CREATE TABLE IF NOT EXISTS landing_queue (
@@ -20,8 +21,14 @@ CREATE TABLE IF NOT EXISTS landing_queue (
     -- access opens the project as them.
     person_name TEXT NOT NULL,
     device_key TEXT NOT NULL,
-    -- JSON list of the real submitted snapshots, oldest first.
+    -- JSON list of the stack's changes, oldest first: [snapshot, base] (real
+    -- ids), or [snapshot, base, projected tree, projected base tree,
+    -- "whole" | "part"] when the submitter's edits are those of their view
+    -- (`landing::Entry`).
     stack TEXT NOT NULL,
+    -- The branch's lineage the stack was judged under: it lands only under
+    -- that one (BUG-1300).
+    lineage BIGINT NOT NULL,
     -- The access epochs the submit's checks ran under (person, project):
     -- while both are unchanged, those checks still hold.
     person_epoch BIGINT NOT NULL,
@@ -29,7 +36,7 @@ CREATE TABLE IF NOT EXISTS landing_queue (
     -- queued | landed | conflict | rejected
     state TEXT NOT NULL,
     -- JSON: the outcome, with the real snapshots it landed (each answer is
-    -- projected for its asker). Finished rows are deleted after a day.
+    -- projected for its asker). Finished rows are deleted after an hour.
     result TEXT,
     -- Microseconds, on the database's clock: the queue's order (`seq` is
     -- not in commit order across connections on YugabyteDB, whose
@@ -59,21 +66,33 @@ CREATE TABLE IF NOT EXISTS landing_leases (
     PRIMARY KEY (project_id, branch)
 );
 
--- Where each submitted snapshot of a landed stack is on the branch: itself
--- (landed as it was), or the snapshot it was made again as on a newer tip.
--- A later stack on a submitted snapshot does not land its change twice
--- (BUG-1103, BUG-1270). Kept as long as finished queue rows (a day): a push
--- on a submitted snapshot older than that is answered `conflict` for the
--- change it repeats, never landed over.
+-- A branch's lineage (BUG-1300): a new value at every creation (the
+-- default), forced update and deletion (a branch made again starts a new
+-- one); fast-forward moves keep it. What the landing service records about
+-- a branch counts only within its current lineage.
+CREATE SEQUENCE IF NOT EXISTS branch_lineages;
+ALTER TABLE branches ADD COLUMN IF NOT EXISTS lineage BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE branches ALTER COLUMN lineage SET DEFAULT nextval('branch_lineages');
+
+-- Where each change of a landed stack is on the branch (the snapshot it was
+-- made again as on the tip), and each tip a batch moved from (as itself),
+-- within the branch's lineage then. A later stack on a submitted snapshot
+-- does not land its change twice (BUG-1103, BUG-1270), and a submit finds
+-- its base here in one lookup (BUG-1275). `whole`: all of the change's own
+-- edits landed; else only what `view_key`'s view showed of it. Deleted
+-- after an hour, in bounded chunks also while the branch is busy
+-- (BUG-1303).
 CREATE TABLE IF NOT EXISTS landings (
     project_id BIGINT NOT NULL REFERENCES projects(id),
     branch TEXT NOT NULL,
+    lineage BIGINT NOT NULL,
     submitted TEXT NOT NULL,
     landed TEXT NOT NULL,
+    whole BOOLEAN NOT NULL,
+    view_key TEXT NOT NULL,
     at BIGINT NOT NULL,
-    PRIMARY KEY (project_id, branch, submitted)
+    PRIMARY KEY (project_id, branch, lineage, submitted)
 );
 CREATE INDEX IF NOT EXISTS landings_at ON landings (project_id, at);
--- Is a snapshot one the service landed on a branch (`landing::stack`: an
--- agent's next change is on its last landing)?
-CREATE INDEX IF NOT EXISTS landings_landed ON landings (project_id, branch, landed);
+-- Is a snapshot one the service landed on a branch?
+CREATE INDEX IF NOT EXISTS landings_landed ON landings (project_id, branch, lineage, landed);

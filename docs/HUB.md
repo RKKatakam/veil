@@ -2462,29 +2462,72 @@ the graft, write access, access lines and `.veilrules` changed only by
 admins, closure, personal keys, secrets as ciphertext, check 9), and edits
 through `changes::create` (the same `complete`, inline text held in memory
 until the checks pass). Instead of a branch's compare-and-swap, the
-request's transaction inserts one **queue row**: the stack of real
-snapshots (oldest first, at most 64), the submitter, and the access epochs
-its checks ran under. **The stack** (`landing::stack`, for every route: a
-pushed or uploaded snapshot, and edits on a `base`) is every change on its
-first-parent line from the branch's tip up to it (§4.6), each with its
-**base**: those this request brought and those the server already held (on
-another branch, an API commit, a landing answered `conflict`), down to the
-first that is on the branch: the tip; a snapshot the service landed, or
-moved the branch from, or a submitted snapshot that landed (`landings`,
-one indexed lookup: an agent's base is its own last landing, or a tip it
-read); else the derived commit graph when it holds the tip, never waiting
-for the deriver; else a walk (BUG-1275). A merge with a parent on the branch ends the
-stack with that parent as its base: it lands as its edits against it, the
-whole of what the branch lacks (so a change answered `conflict`, with the
-branch merged into it and the file resolved, lands; a fix on top that is
-not such a merge does not: redo the change on the new tip). A held change
-must touch only paths the submitter may read, and hold no conflicts, else
-the submit is refused naming no path: no answer about a stack can name a
-path its submitter could not read. The snapshots become committed history
-in that commit (they resolve and project like any other); the edit set is
-not stored: it is each snapshot's diff against its first parent, read from
-the objects. With `wait` (the default) the request answers once the
-outcome is known, up to 30 s, else at `queued`.
+request's transaction inserts one **queue row**: the stack (oldest first,
+at most 64 changes), the submitter, the access epochs its checks ran under,
+and the branch's **lineage** its stack was judged under (below).
+
+**The stack is the submitter's own history** (`landing::stack`, for every
+route: a pushed or uploaded snapshot, and edits on a `base`; S17 cycle 3).
+It is the changes between the branch and the submitted snapshot **as the
+submitter's projection shows them** (`docs/VISIBILITY.md`: a change they
+cannot see does not exist for them):
+
+* The submitted snapshot's real first-parent line is read down to the first
+  snapshot on the branch (below). A change held there (another branch's,
+  an API commit, a landing answered `conflict`) whose own edits are all at
+  paths the submitter cannot read is **not in their history**: it is left
+  out, and stays unlanded (its author can land it). A held change with
+  unresolved conflicts the submitter can see is refused (naming no path);
+  one they cannot see does not count.
+* Each change left has a **base**: the change below it in the stack, or the
+  snapshot on the branch where the line stops; a merge with a parent on the
+  branch ends the stack with that parent as its base (BUG-1271). Its
+  **edits** are its diff against its base as the submitter saw both at
+  submit: when something they cannot see lies between (a change left out,
+  or hidden edits of its own), the queue row holds their projections of the
+  two trees, and the edits are the diff of those; otherwise the real diff,
+  which is the same.
+* Every change **lands as its edits**: a new snapshot on the tip, signed by
+  the server, predecessor the submitted one, never the submitted snapshot
+  itself (a merge keeps its other parents, and lands only on the tip it was
+  made on). So nothing hidden below, between or inside a change ever changes
+  an answer: its state, the paths a conflict names (the change's own, all
+  readable by the submitter), and the snapshots it lists (as the submitter
+  sees them) are those of the same changes with nothing hidden there.
+* A change whose own edits the submitter saw only in part lands in part;
+  `landings` records it as landed for their view only. Their later stacks
+  skip it; anyone else's lands what of it is not on the branch yet (a path
+  already holding the change's own entry counts as landed), so its author
+  can land the rest.
+
+**"On the branch" is the branch's real ancestry**, with a **lineage guard**
+(BUG-1300): `branches.lineage` is a new value (a sequence) at every
+creation, every forced update and every deletion (a branch made again
+starts a new lineage); fast-forward pushes, API commits and the service
+keep it. `landings` rows carry the lineage they were made under, and only
+rows of the branch's current lineage count; a queue row lands only under
+the lineage its stack was judged under (else it is `rejected`: "the branch
+was reset since this change was submitted: submit it again"); the
+service's compare-and-swap is on tip and lineage. Stale rows can never make
+a change count as landed.
+
+**The base lookup is bounded** (BUG-1275, BUG-1302), cheapest first, in one
+`Ancestry` per submit: the tip itself; the line from the submitted snapshot
+reaching the tip (every change above the tip is a descendant of it, so not
+on the branch: a stack made on the tip asks nothing more); `landings` of
+the current lineage (an agent's base is its own last landing, or a tip it
+read; batches record the tip they move from); the derived commit graph
+when it holds the tip (its jump table, bounded by generation), never
+waiting for the deriver; else one walk down from the tip shared by the
+whole stack, at most 4,096 snapshots a submit (`WALK_BUDGET`), whose
+frontier the derived graph then answers for. Past that the submit is
+answered `warming` (503: try again) instead of walking the history. The
+line itself is read at most 1,024 snapshots deep (`LINE_LIMIT`). No submit
+reads more than about 5,000 snapshots and a few dozen rows.
+
+The snapshots become committed history in the submit's commit (they
+resolve and project like any other). With `wait` (the default) the request
+answers once the outcome is known, up to 30 s, else at `queued`.
 
 **The landing service.** One per branch, on whichever server holds the
 branch's **lease** (`landing_leases`: a holder, a fencing epoch bumped at
@@ -2508,19 +2551,19 @@ for 5 s gives the lease back. Its loop:
   `.veilrules` ends the batch before it and **lands alone**; nothing is
   built after it until it is committed.
 * **For each change of an entry's stack:** landed already by another
-  stack (`landings`, or this batch), it is skipped. On the tip already (its
-  base its first parent, and the tip), it lands as it is (the submitted
-  snapshot). Otherwise **the fast path**: every path of its edit set (its
-  diff against its base) must be, on the tip, what it was in its base: the same
+  stack (`landings` of the current lineage for the submitter's view, or
+  this batch), it is skipped. Otherwise **the fast path**: every path of its
+  edits (above) must be, on the tip, what it was in its base: the same
   entry (kind, content, mode, label), absent in both, or under the same
   non-folder in both. Exact per path: nothing else on the tip matters. Then
   its edits are applied (only the folder listings on the way are rewritten;
   folders are made where needed and dropped once empty) and a **new
-  snapshot** is signed by the server: parent the tip, the change's id,
-  description, author and time, predecessor the submitted snapshot. A merge
-  lands only on the tip it was made on. A path that moved: **`conflict`**,
-  naming the change's own paths that moved (never landed over; content
-  merges are S18). A stack lands all or nothing.
+  snapshot** is signed by the server: parent the tip (a merge: and its other
+  parents), the change's id, description, author and time, predecessor the
+  submitted snapshot. A merge lands only on the tip it was made on, and the
+  push's checks run again on it (every parent). A path that moved:
+  **`conflict`**, naming the change's own paths that moved (never landed
+  over; content merges are S18). A stack lands all or nothing.
 * **The landing check:** each new snapshot's diff against its parent must be
   exactly the change's edit set, path for path; a mismatch rejects the
   entry (and logs a bug, with ids only), never lands it.
@@ -2565,10 +2608,16 @@ for 5 s gives the lease back. Its loop:
   compare-and-swap, an accepted policy, the queue rows (each must still be
   `queued`, else nothing commits: an entry never lands twice), the
   snapshot, `landings` and memo rows, an audit row and the tips notice.
-  Finished queue rows, and `landings` rows (per branch: where each landed
-  stack change is, and each tip a batch moved from), are deleted after a day: a later push on a submitted
-  snapshot older than that is answered `conflict` for the change it would
-  repeat, never landed over.
+  A batch that lands nothing still compares the tip and lineage it judged
+  on (BUG-1304): if the branch moved by another route, its entries are built
+  again on the database's tip.
+* **Retention, also while busy** (BUG-1303): every 5 s the service deletes
+  finished queue rows and `landings` rows older than an hour, at most
+  20,000 of each a pass (4,000 a second, four times what 1,000 landings a
+  second add). At 1,000 landings a second a branch's tables hold about
+  3.6 million rows each in steady state (an hour); a ticket's outcome is
+  readable for that hour, and a base older than it is found by the graph or
+  the walk above.
 
 **Protected branches.** `.veilrules` at the project root (TOML;
 `[branches.NAME] protected = true`; other tables are left to later
@@ -2590,15 +2639,14 @@ landed if it was at REV or below. The working copy stays on REV, a
 predecessor of the landed snapshot with the same content at every path it
 edits; the next change made on it lands the same way.
 
-**Measured** (`docs/design/scale/LOAD.md`, "The landing service"): into one
-`main`, 954 landings/s with 1,000 agents at a 1,000/s target, p50 184 ms
-and **p99 632 ms**, 1.12 database commits and about 16 statements per
-landing; **927/s with 10,000 agents, p50 840 ms, p99 1.47 s** (the 1 s
-target missed there), 1.13 commits per landing; 1,348/s at most. No
-collisions. The object store's synced writes, about 14 per landing, are the
-limit (packs, S28).
+**Measured** (`docs/design/scale/LOAD.md`, "The landing service", after the
+cycle-3 redesign): into one `main`, **993 landings/s with 1,000 agents at a
+1,000/s target, p50 79 ms and p99 327 ms**, 1.14 database commits, about 16
+statements and 14 storage writes per landing; **943/s with 10,000 agents,
+p50 270 ms, p99 1.01 s**; 1,208/s at most. No collisions. The object
+store's synced writes are the limit (packs, S28).
 
-**Limits.** Fair share between people and sessions is FIFO here (S24); a
+**Limits.** When S21 merges, its `prs::state::record_landing` joins the batch's transaction (right after the branch's compare-and-swap) for every move of the default branch, so the review rules in force never lag a landing, and landing onto a protected branch meets S21's review rules by every route (S21's follow-up wires both). Fair share between people and sessions is FIFO here (S24); a
 submitter whose view key no service keeps (a new one after an access
 change) waits, in their own request, for their view's first projection;
 the batch-tip memos for other viewers are S12's.

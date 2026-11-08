@@ -508,6 +508,34 @@ before each point, 24 before the 10,000-agent one, 8 after; `bench16`):
 
 Raw results (not committed): `.scratch/bench-results/server-landing-9f1573e5-20261108T004444Z*` and `…T004755Z*`; the regressed run `…T002111Z*`, `…T002436Z*`.
 
+**After the S17 review's third cycle: the redesign** (2026-11-08, on
+`integration` @ `6fa552c`; `docs/BUGS.md` BUG-1300 to 1305; `HUB.md`
+§13.19: the stack is the submitter's own history, every change lands as a
+new snapshot, "on the branch" within the branch's lineage, a bounded base
+lookup, retention while busy; load average 11 before the first point, 16
+before the 10,000-agent one, 35 after; `bench18`):
+
+| Agents | Target (/s) | Landed (/s) | p50 (ms) | p99 (ms) | Agents that landed | Landings per batch | Prepare (ms/batch) | Build CPU (ms/landing) | Store objects (ms/batch) | Transaction (ms/batch) | DB commits per landing | DB statements per landing | Storage writes per landing |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,000 | 1,000 | **993** | **79** | **327** | 1,000 | 20.5 | 6.4 | 0.27 | 15.4 | 10.2 | **1.14** | 16.2 | 14.1 |
+| 1,000 | 2,000 | 1,208 (the most) | 4,310 | 6,727 | 1,000 | 64.0 | 5.0 | 0.31 | 60.1 | 16.0 | 1.02 | 12.7 | 13.7 |
+| 10,000 | 1,000 | **943** | 270 | 1,012 | 9,969 | 36.8 | 8.4 | 0.39 | 33.1 | 15.1 | **1.13** | 16.2 | 14.5 |
+
+* **1,000 agents: 993/s at p50 79 ms and p99 327 ms, every target met**;
+  10,000 agents: 943/s, p50 270 ms, p99 1.01 s (the 1 s target missed by
+  12 ms). The same statements per landing as cycle 2 (16): the submit
+  reads the branch's tip and lineage and looks its base up in `landings`
+  (2 statements), the batch compares tip and lineage even when nothing
+  moves, and retention adds 2 statements a branch every 5 s.
+* **Caught here first:** an earlier run of the redesign stored each edits
+  submit's objects twice (once before its stack was built, once before its
+  commit): 20.8 storage writes a landing instead of 14, and at the
+  2,000/s target the service fell into the large-batch regime (644/s,
+  `bench17`). Fixed before commit: the objects are stored once, before the
+  stack reads them.
+
+Raw results (not committed): `.scratch/bench-results/server-landing-b1b10f37-20261108T064028Z*` and `…T064348Z*` (the label is the base commit; the binaries were the working tree), the double store `…T061236Z*`, `…T061440Z*`.
+
 
 ## What would raise each ceiling (not built)
 

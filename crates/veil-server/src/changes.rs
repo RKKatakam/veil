@@ -918,17 +918,17 @@ pub(crate) async fn create_with(
             }
         }
         let built = build(hub, &plan, &who, parent, pparent).await?;
-        // A landing of edits: the stack is every change from the branch's
-        // tip up to this one, as for a pushed snapshot (BUG-1112).
+        // Stored before anything reads them (a landing's stack may).
+        sync::put_all(hub, project.id, built.store.clone()).await?;
+        // A landing of edits: the stack is the submitter's history from the
+        // branch up to this one, as for a pushed snapshot (BUG-1112).
         if let Some((_, q)) = land.as_mut() {
             let fresh = HashMap::from([(built.real, vec![parent])]);
-            q.stack = match tip(hub, project.id, &q.branch).await? {
-                Some(t) => match crate::landing::stack(hub, &who.project, &who.viewer, &q.branch, built.real, t, &fresh).await? {
-                    Ok(s) => s,
-                    Err(why) => return Err(bad(why)),
-                },
+            (q.stack, q.lineage) = match crate::landing::stack(hub, &who.project, &who.viewer, &q.branch, built.real, &fresh).await? {
+                Ok(j) if j.branch => (j.stack, j.lineage),
                 // No branch: the service answers so.
-                None => vec![(built.real, parent)],
+                Ok(_) => (vec![crate::landing::Entry::plain(built.real, parent)], 0),
+                Err(why) => return Err(bad(why)),
             };
             if q.stack.is_empty() {
                 return Err(bad("nothing to land: this change is on the branch already"));
@@ -966,7 +966,6 @@ pub(crate) async fn create_with(
             }),
             _ => None,
         };
-        sync::put_all(hub, project.id, built.store.clone()).await?;
         match commit(hub, &plan, &who, &built, &restacked, person.id, mv, land.as_ref()).await {
             Ok(m) => break (built, m),
             // The tip moved during the request: try again on the new one,

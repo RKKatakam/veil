@@ -163,9 +163,10 @@ fn non_overlapping_changes_land_in_batches_each_once_with_exactly_its_edits() {
         assert_eq!(set.len(), 1, "{id}");
         assert_eq!(set[0].path, format!("src/agents/a{i:02}/f.rs"));
         assert!(set[0].old.is_none());
-        // The first was on the tip already, and lands as it was submitted;
-        // the others are made again on it, naming what was submitted.
-        assert_eq!(s.predecessors.len(), usize::from(i > 0), "{i}");
+        // Each is made again on the tip, naming what was submitted (the
+        // first too, though it was on the tip: a change always lands as
+        // its edits, S17 cycle 3).
+        assert_eq!(s.predecessors.len(), 1, "{i}");
         assert!(s.signature_valid() == Some(true));
     }
     let moves = sql_i64(&hub, "SELECT count(*) FROM audit_log WHERE project_id = $1 AND action = 'land'", pid);
@@ -951,8 +952,23 @@ fn bug_1111_a_landing_answer_names_no_path_its_submitter_cannot_read() {
     let theirs = api.tips(Some(&token), &p.name).unwrap().branches["fin-wip"];
     let r = land_held(&api, &token, &p.name, theirs, true);
     let body = String::from_utf8_lossy(&r.body).to_string();
-    eprintln!("{} {body}", r.status);
     assert!(!body.contains(BILL_DIR), "the dev's landing answer names a path under billing, which they cannot read: {body}");
+    // What the dev sees of it lands (S17 cycle 3: the stack is their own
+    // history, as their projection shows it), and nothing they cannot see.
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+    let pid = project_id(&hub, &p.name);
+    assert_eq!(real_file(&hub, pid, "src/fin.rs").as_deref(), Some(&b"fin\n"[..]));
+    assert_eq!(real_file(&hub, pid, &invoice).as_deref(), Some(&b"the admin's edit\n"[..]), "the dev landed an edit they cannot see");
+    // fin, who sees all of it, lands the rest: the invoice moved on main
+    // since fin's base, so that is a conflict (on fin's own path), never
+    // landed over; src/fin.rs is on main already.
+    let ftok = p.fin.token();
+    let mine = api.tips(Some(&ftok), &p.name).unwrap().branches["fin-wip"];
+    let v = land_held(&api, &ftok, &p.name, mine, true).json();
+    assert_eq!(v["state"], "conflict", "{v}");
+    assert_eq!(v["paths"], json!([invoice]), "{v}");
+    assert_eq!(real_file(&hub, pid, &invoice).as_deref(), Some(&b"the admin's edit\n"[..]));
 }
 
 #[test]
@@ -1206,6 +1222,17 @@ fn big_folder_stacks_in_a_child() {
         }
         unsafe { malloc_trim(0) };
     }
+    // The project's deriver is held meanwhile (as another server's would
+    // be): what the deriver and the search index (which follows it) do
+    // with these landings is not the landing service's (BUG-1305).
+    let deriver = hub.rt.block_on(async {
+        use sqlx::Connection;
+        let url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+        let mut c = sqlx::PgConnection::connect(&url).await.unwrap();
+        let key: i64 = 0x7665_696c_6472_0000_i64 ^ pid;
+        sqlx::query("SELECT pg_advisory_lock($1)").bind(key).execute(&mut c).await.unwrap();
+        c
+    });
     std::fs::write("/proc/self/clear_refs", "5").unwrap();
     let (start, _) = rss();
     let trees0 = hub.hub().trees.stats().weight;
@@ -1215,6 +1242,7 @@ fn big_folder_stacks_in_a_child() {
         assert_eq!(outcome(&api, &token, &p.name, t)["state"], "landed");
     }
     let (_, peak) = rss();
+    drop(deriver);
     let trees = hub.hub().trees.stats().weight.saturating_sub(trees0) as u64;
     let grew = peak.saturating_sub(start).saturating_sub(trees) >> 20;
     let batches = sql_i64(&hub, "SELECT count(*) FROM audit_log WHERE project_id = $1 AND action = 'land'", pid);
@@ -1309,6 +1337,7 @@ fn the_service_s_reads_at_an_access_change_and_remote_waiters_stay_bounded() {
             s.spawn(move || {
                 let r = land(bapi, token, name, base, json!([put(&format!("src/remote/{i:03}.rs"), "r\n")]), true);
                 assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                assert_eq!(r.json()["state"], "landed", "a remote waiter: {}", String::from_utf8_lossy(&r.body));
             });
         }
         // Released after 3 s: a's service lands them, b's poller answers.
@@ -1416,7 +1445,6 @@ fn on_branch_file(hub: &TestHub, project: i64, branch: &str, path: &str) -> bool
 /// old `feat` only, must land with B (made on A), or B must be refused;
 /// never "landed" without A.
 #[test]
-#[ignore = "BUG-1300: a landings row outlives the branch history it describes (deleted and made again): B lands without A, answered landed"]
 fn bug_1300_a_branch_made_again_never_takes_the_old_branch_s_landings_for_its_history() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1456,7 +1484,6 @@ fn bug_1300_a_branch_made_again_never_takes_the_old_branch_s_landings_for_its_hi
 /// out), and with the record gone, as it is a day later (`clean`): the
 /// change under B lands again with it.
 #[test]
-#[ignore = "BUG-1300: after a forced move, a stack on a removed landing drops it for a day, then lands it again"]
 fn bug_1300_after_a_forced_move_a_stack_lands_the_same_however_old_the_service_s_record() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1500,7 +1527,6 @@ fn bug_1300_after_a_forced_move_a_stack_lands_the_same_however_old_the_service_s
 /// (docs/VISIBILITY.md). The answer to landing a branch must be the same
 /// whether or not such a change is below what they can see of it.
 #[test]
-#[ignore = "BUG-1301: the BUG-1111 refusal tells the submitter a change they cannot see is below their change"]
 fn bug_1301_a_landing_answer_never_tells_whether_a_hidden_change_is_below() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1639,7 +1665,6 @@ fn a_merge_in_of_a_change_with_hidden_edits_names_no_hidden_path() {
 /// forced push), a change made on the new tip is answered `conflict`
 /// against the old one, though it lands on the branch as it is.
 #[test]
-#[ignore = "BUG-1304: a batch that moves nothing commits answers judged on the service's cached tip"]
 fn bug_1304_a_change_made_on_a_tip_the_service_did_not_make_is_judged_on_that_tip() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1710,7 +1735,6 @@ fn push_chain(api: &Api, person: &Person, project: &str, branch: &str, onto: &st
 /// stack, on the request. Here: main with 5,000 snapshots of history, the
 /// deriver held, and a dev landing their 64-change branch.
 #[test]
-#[ignore = "BUG-1302: a submit walks the branch's whole history once per change it brings when the graph lags"]
 fn bug_1302_a_submit_s_stack_never_walks_the_branch_s_history_per_change() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1753,7 +1777,6 @@ fn bug_1302_a_submit_s_stack_never_walks_the_branch_s_history_per_change() {
 /// go before the backlog is landed (clean runs only once the queue is
 /// empty, so at the 1,000- and 10,000-agent loads, never).
 #[test]
-#[ignore = "BUG-1303: clean runs only when the branch's queue is empty: on a busy branch landings and finished rows are never deleted"]
 fn bug_1303_rows_a_day_old_go_while_the_branch_is_busy() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1771,7 +1794,7 @@ fn bug_1303_rows_a_day_old_go_while_the_branch_is_busy() {
     let old = veil_core::now_millis() - 24 * 3600 * 1000 - 60_000;
     hub.rt.block_on(async {
         sqlx::query("UPDATE landing_queue SET done_at = $2 WHERE project_id = $1 AND ticket = $3").bind(pid).bind(old).bind(first["ticket"].as_str().unwrap()).execute(&h.db).await.unwrap();
-        sqlx::query("INSERT INTO landings (project_id, branch, submitted, landed, at) VALUES ($1, 'main', $2, $2, $3)").bind(pid).bind(ObjectId::hash(b"old").hex()).bind(old).execute(&h.db).await.unwrap();
+        sqlx::query("INSERT INTO landings (project_id, branch, lineage, submitted, landed, whole, view_key, at) VALUES ($1, 'main', 0, $2, $2, true, '', $3)").bind(pid).bind(ObjectId::hash(b"old").hex()).bind(old).execute(&h.db).await.unwrap();
     });
     let base = tip_for(&hub, &token, &p.name);
     std::thread::scope(|s| {
@@ -1818,4 +1841,277 @@ fn bug_1303_rows_a_day_old_go_while_the_branch_is_busy() {
     let landed = count("SELECT count(*) FROM landing_queue WHERE project_id = $1 AND state = 'landed'");
     assert!(landed >= 600, "{landed} landed");
     assert_eq!(cleaned_while_busy, Some(true), "the day-old rows stayed while the branch was busy (until its queue was empty)");
+}
+
+// ---------------------------------------------------------------------
+// S17 cycle 3, the revised design (docs/HUB.md §13.19): the stack is the
+// submitter's own history; "on the branch" within the branch's lineage;
+// a bounded base lookup.
+
+/// A branch `branch` of crafted snapshots on `onto`'s tip as `person` sees
+/// it, one per step (its files, and a seed for its change id), with fixed
+/// metadata (times from `t0`), so the same steps make the same snapshots:
+/// their ids.
+fn crafted_branch(api: &Api, person: &Person, project: &str, onto: &str, branch: &str, steps: &[(&[(&str, &str)], u8)], t0: i64) -> Vec<ObjectId> {
+    let mut c = Craft::new(api, person, project, onto);
+    let mut parent = c.tip;
+    let mut ids = Vec::new();
+    for (files, seed) in steps {
+        for (path, text) in files.iter() {
+            c.file(path, text);
+        }
+        let mut s = Snapshot {
+            parents: vec![parent],
+            change_id: veil_core::ChangeId([*seed; 16]),
+            tree: c.root,
+            description: Text::Plain(format!("step {seed}")),
+            author: "crafter".into(),
+            timestamp: t0 + i64::from(*seed),
+            predecessors: vec![],
+            conflicts: vec![],
+            embargo: None,
+            signature: None,
+        };
+        s.sign(&c.identity);
+        parent = c.put(O::Snapshot(s));
+        ids.push(parent);
+    }
+    let up = c.api.upload(&c.token, &c.project, &c.objects);
+    assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+    let receipts = up.json()["receipts"].as_array().unwrap().clone();
+    let map: serde_json::Map<String, Value> = c.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+    let r = c.api.post_json(
+        Some(&c.token),
+        &format!("/v1/projects/{project}/push"),
+        &json!({"updates": [{"branch": branch, "expected": null, "new": parent.hex()}], "receipts": map}),
+    );
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    ids
+}
+
+/// The first parent of snapshot `id` as `token`'s owner is shown it.
+fn seen_parent(api: &Api, token: &str, project: &str, id: ObjectId) -> ObjectId {
+    let h = api.post_json(Some(token), &format!("/v1/projects/{project}/history"), &json!({"tips": [id.hex()]}));
+    let (_, raw) = h.frames().into_iter().find(|(i, _)| *i == id).unwrap();
+    let O::Snapshot(s) = O::decode(&raw).unwrap() else { panic!("not a snapshot") };
+    s.parents[0]
+}
+
+/// An answer without its ticket (each submit's own).
+fn without_ticket(mut v: Value) -> Value {
+    v.as_object_mut().unwrap().remove("ticket");
+    v
+}
+
+/// Guarantee: answers are identical whether or not changes the submitter
+/// cannot see sit between the changes they land (docs/VISIBILITY.md: such
+/// a change is not in their history). The admin's branch A interleaves
+/// billing-only changes with two src/ changes; branch B holds the same two
+/// src/ changes alone. The dev sees both branches as the same snapshots,
+/// lands A's two points one after the other, then (main reset to where it
+/// was) B's: every answer, and main as the dev sees it, is the same.
+#[test]
+fn answers_are_the_same_whether_or_not_hidden_changes_sit_between_the_changes_landed() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let atok = p.admin.token();
+    let token = p.dev.token();
+    let main0 = tip_for(&hub, &atok, &p.name);
+    let t0 = veil_core::now_millis();
+    let h1 = format!("{BILL_DIR}/hidden-1.txt");
+    let h2 = format!("{BILL_DIR}/hidden-2.txt");
+    let v1: &[(&str, &str)] = &[("src/g/one.rs", "one\n")];
+    let v2: &[(&str, &str)] = &[("src/g/two.rs", "two\n")];
+    crafted_branch(&api, &p.admin, &p.name, "main", "g-a", &[(v1, 1), (&[(&h1, "h1\n")], 2), (v2, 3), (&[(&h2, "h2\n")], 4)], t0);
+    let two = api.tips(Some(&token), &p.name).unwrap().branches["g-a"];
+    let one = seen_parent(&api, &token, &p.name, two);
+    let land_point = |id: ObjectId| {
+        let r = land_held(&api, &token, &p.name, id, true);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        without_ticket(r.json())
+    };
+    let a1 = land_point(one);
+    let a2 = land_point(two);
+    assert_eq!(a1["state"], "landed", "{a1}");
+    assert_eq!(a2["state"], "landed", "{a2}");
+    let main_a = tip_for(&hub, &token, &p.name);
+    assert!(real_file(&hub, pid, &h1).is_none() && real_file(&hub, pid, &h2).is_none(), "a change the dev cannot see landed");
+    // main back where it was; the same two changes, with nothing between.
+    move_branch(&api, &atok, &p.name, "main", Some(tip_for(&hub, &atok, &p.name)), Some(main0), true);
+    crafted_branch(&api, &p.admin, &p.name, "main", "g-b", &[(v1, 1), (v2, 3)], t0);
+    assert_eq!(api.tips(Some(&token), &p.name).unwrap().branches["g-b"], two, "the dev sees the two branches as the same snapshots");
+    let b1 = land_point(one);
+    let b2 = land_point(two);
+    assert_eq!(a1, b1, "landing the first point");
+    assert_eq!(a2, b2, "landing the second point");
+    assert_eq!(tip_for(&hub, &token, &p.name), main_a, "main as the dev sees it");
+}
+
+/// Guarantee: a change lands as the edits its submitter saw. fin's change
+/// edits the invoice (billing) and src/; the dev, who reads src/ only,
+/// lands what they see of it, and it never touches the invoice; fin then
+/// lands the rest (the src/ edit is on main already); the dev landing it
+/// once more lands nothing again.
+#[test]
+fn a_change_seen_in_part_lands_in_part_and_its_author_lands_the_rest() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name]);
+    let invoice = format!("{BILL_DIR}/acme/invoice.txt");
+    let before = real_file(&hub, pid, &invoice);
+    let mut c = Craft::new(&api, &p.fin, &p.name, "main");
+    c.file(&invoice, "fin's edit\n");
+    c.file("src/fin.rs", "fin\n");
+    let r = c.push_to("fin-wip", None);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let token = p.dev.token();
+    let theirs = api.tips(Some(&token), &p.name).unwrap().branches["fin-wip"];
+    let v = land_held(&api, &token, &p.name, theirs, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_eq!(real_file(&hub, pid, "src/fin.rs").as_deref(), Some(&b"fin\n"[..]));
+    assert_eq!(real_file(&hub, pid, &invoice), before, "the dev landed an edit they cannot see");
+    let ftok = p.fin.token();
+    let mine = api.tips(Some(&ftok), &p.name).unwrap().branches["fin-wip"];
+    let v = land_held(&api, &ftok, &p.name, mine, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_eq!(real_file(&hub, pid, &invoice).as_deref(), Some(&b"fin's edit\n"[..]));
+    // One snapshot each: the dev's part, then fin's rest (only the invoice).
+    let tip = real_tip(&hub, pid);
+    let src = source(&hub, pid);
+    let s = src.snapshot(&tip).unwrap();
+    let set = veil_server::landing::edits::edit_set(&src, s.tree, src.snapshot(&s.parents[0]).unwrap().tree).unwrap();
+    assert_eq!(set.iter().map(|c| c.path.clone()).collect::<Vec<_>>(), vec![invoice.clone()]);
+    // The dev again: on the branch already, for them; nothing moves.
+    let r = land_held(&api, &token, &p.name, theirs, true);
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+    assert!(String::from_utf8_lossy(&r.body).contains("nothing to land"), "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(real_tip(&hub, pid), tip);
+}
+
+/// Guarantee: exactly once across a reset. An entry queued before an
+/// admin's forced push moves its branch was judged against a history the
+/// branch no longer has: it is answered so, never landed on what it took
+/// for its base, and lands once when submitted again.
+#[test]
+fn an_entry_queued_before_its_branch_is_reset_lands_only_when_submitted_again() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let atok = p.admin.token();
+    let token = p.dev.token();
+    let t0 = tip_for(&hub, &atok, &p.name);
+    let a = land(&api, &token, &p.name, tip_for(&hub, &token, &p.name), json!([put("src/reset-a.rs", "a\n")]), true).json();
+    assert_eq!(a["state"], "landed", "{a}");
+    hold(&hub, pid);
+    let q = land(&api, &token, &p.name, last_landed(&a), json!([put("src/reset-b.rs", "b\n")]), false).json();
+    assert_eq!(q["state"], "queued", "{q}");
+    // The admin resets main to before A.
+    move_branch(&api, &atok, &p.name, "main", Some(tip_for(&hub, &atok, &p.name)), Some(t0), true);
+    release(&hub, pid);
+    {
+        let _rt = hub.rt.enter();
+        veil_server::landing::ensure(&hub.hub(), pid, "main");
+    }
+    let v = outcome(&api, &token, &p.name, q["ticket"].as_str().unwrap());
+    assert_eq!(v["state"], "rejected", "{v}");
+    assert!(v["message"].as_str().unwrap().contains("reset"), "{v}");
+    assert!(real_file(&hub, pid, "src/reset-b.rs").is_none());
+    // Submitted again on main as it is: A is no longer on it, so B brings A.
+    let again = land(&api, &token, &p.name, last_landed(&a), json!([put("src/reset-b.rs", "b\n")]), true).json();
+    assert_eq!(again["state"], "landed", "{again}");
+    assert!(real_file(&hub, pid, "src/reset-a.rs").is_some() && real_file(&hub, pid, "src/reset-b.rs").is_some());
+    let src = source(&hub, pid);
+    let mut x = real_tip(&hub, pid);
+    let mut adds = 0;
+    while x != t0 {
+        let s = src.snapshot(&x).unwrap();
+        let set = veil_server::landing::edits::edit_set(&src, s.tree, src.snapshot(&s.parents[0]).unwrap().tree).unwrap();
+        adds += set.iter().filter(|c| c.path == "src/reset-b.rs").count();
+        x = s.parents[0];
+    }
+    assert_eq!(adds, 1, "B landed more than once");
+}
+
+/// Guarantee: a submit's cost is bounded. With the derived graph behind the
+/// tip (another server's deriver holds the project) and a base 5,000
+/// snapshots down main that `landings` does not know, the submit reads at
+/// most `WALK_BUDGET` snapshots and is answered `warming` (try again),
+/// never walking the history.
+#[test]
+fn a_submit_whose_base_is_past_its_walk_budget_is_answered_warming() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let atok = p.admin.token();
+    let t0 = tip_for(&hub, &atok, &p.name);
+    let lock = hub.rt.block_on(async {
+        use sqlx::Connection;
+        let url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+        let mut c = sqlx::PgConnection::connect(&url).await.unwrap();
+        let key: i64 = 0x7665_696c_6472_0000_i64 ^ pid;
+        sqlx::query("SELECT pg_advisory_lock($1)").bind(key).execute(&mut c).await.unwrap();
+        c
+    });
+    push_chain(&api, &p.admin, &p.name, "main", "main", 5_000, None);
+    move_branch(&api, &atok, &p.name, "old", None, Some(t0), false);
+    let token = p.dev.token();
+    let mine = push_chain(&api, &p.dev, &p.name, "old-work", "old", 1, Some("src/old"));
+    let t = std::time::Instant::now();
+    let r = land_held(&api, &token, &p.name, mine, false);
+    let took = t.elapsed();
+    drop(lock);
+    assert_eq!(r.status, 503, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["code"], "warming", "{}", String::from_utf8_lossy(&r.body));
+    assert!(took < Duration::from_secs(2), "the submit took {took:?}");
+}
+
+/// BUG-1310: a change landed, its branch reset by an admin, then landed
+/// again, is made again exactly as before (the same snapshot), whose
+/// projections were stored the first time. Meanwhile someone else's view
+/// stored a projection of the submitted change itself, so the batch's own
+/// projection of the snapshot (which now names that one as its
+/// predecessor) differs from the stored one: a stored memo wins, the batch
+/// rolled back, was built again the same way, and lost again, for as long
+/// as anyone waited. It must land, with what is stored.
+#[test]
+fn bug_1310_a_change_landed_again_after_a_reset_lands_with_its_stored_projections() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let atok = p.admin.token();
+    let token = p.dev.token();
+    let t0 = tip_for(&hub, &atok, &p.name);
+    // No one else's view projects the dev's change while it first lands
+    // (the deriver, which keeps every view's tips, is held).
+    let deriver = hub.rt.block_on(async {
+        use sqlx::Connection;
+        let url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+        let mut c = sqlx::PgConnection::connect(&url).await.unwrap();
+        let key: i64 = 0x7665_696c_6472_0000_i64 ^ pid;
+        sqlx::query("SELECT pg_advisory_lock($1)").bind(key).execute(&mut c).await.unwrap();
+        c
+    });
+    let mine = push_chain(&api, &p.dev, &p.name, "dev-work", "main", 1, Some("src/again"));
+    let v = land_held(&api, &token, &p.name, mine, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    drop(deriver);
+    // fin's view projects the change itself (fin reads the dev's branch).
+    let ftok = p.fin.token();
+    let _ = api.tips(Some(&ftok), &p.name).unwrap().branches["dev-work"];
+    // The admin resets main; the dev lands the same change again.
+    move_branch(&api, &atok, &p.name, "main", Some(tip_for(&hub, &atok, &p.name)), Some(t0), true);
+    let t = std::time::Instant::now();
+    let again = land_held(&api, &token, &p.name, mine, true);
+    assert_eq!(again.status, 200, "{}", String::from_utf8_lossy(&again.body));
+    let again = again.json();
+    assert_eq!(again["state"], "landed", "after {:?}: {again}", t.elapsed());
+    assert_eq!(again["landed"], v["landed"], "made again exactly as before");
+    assert!(real_file(&hub, pid, "src/again/0.rs").is_some());
 }

@@ -96,6 +96,17 @@ pub fn fast_path(src: &dyn TreeSource, base: ObjectId, tip: ObjectId, edits: &[C
     Ok(None)
 }
 
+/// Does real tree `tree` hold edit `c`'s outcome already: its new entry
+/// at its path, or nothing there where it deletes? (What of a change landed
+/// in part for another view is on the tip: `service::entry`.)
+pub fn holds(src: &dyn TreeSource, tree: ObjectId, c: &Change) -> Result<bool> {
+    Ok(match (at(src, tree, &c.path)?, &c.new) {
+        (At::Entry(e), Some(n)) => same(Some(&e), Some(n)),
+        (At::Absent | At::Blocked(_), None) => true,
+        _ => false,
+    })
+}
+
 /// Why [`apply`] could not place an edit (a tip the fast path did not
 /// clear): the path.
 #[derive(Debug)]

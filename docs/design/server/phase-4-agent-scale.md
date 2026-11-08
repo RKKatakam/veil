@@ -331,13 +331,20 @@ CREATE TABLE IF NOT EXISTS landing_leases (
     expires_at BIGINT NOT NULL,
     PRIMARY KEY (project_id, branch)
 );
-CREATE TABLE IF NOT EXISTS landings (
+CREATE TABLE IF NOT EXISTS landings (     -- as built (S17 cycle 3, HUB.md §13.19)
     project_id BIGINT NOT NULL,
-    landed TEXT NOT NULL,                  -- the snapshot on main
-    submitted TEXT NOT NULL,
-    batch BIGINT NOT NULL,
-    PRIMARY KEY (project_id, landed)
+    branch TEXT NOT NULL,
+    lineage BIGINT NOT NULL,               -- the branch's lineage when it landed
+    submitted TEXT NOT NULL,               -- a stack change (or the tip a batch moved from)
+    landed TEXT NOT NULL,                  -- where it is on the branch
+    whole BOOLEAN NOT NULL,                -- all its own edits landed
+    view_key TEXT NOT NULL,                -- else: the view it landed for
+    at BIGINT NOT NULL,                    -- deleted after an hour
+    PRIMARY KEY (project_id, branch, lineage, submitted)
 );
+-- branches.lineage: a new value (a sequence) at every creation, forced
+-- update and deletion; landing_queue.lineage: the one a stack was judged
+-- under (it lands only under that one).
 CREATE TABLE IF NOT EXISTS checks (
     project_id BIGINT NOT NULL,
     snapshot TEXT NOT NULL,
@@ -386,6 +393,8 @@ CREATE TABLE IF NOT EXISTS embargo_lines (
     PRIMARY KEY (project_id, embargo_id)
 );
 ```
+
+**The stack, as built (S17 cycle 3):** a landing lands the submitter's own history: the changes between the branch and the submitted snapshot as their projection shows them, each as its edits on projected trees, always as a new snapshot (`HUB.md` §13.19). "On the branch" is the branch's real ancestry within its current lineage, looked up in `landings`, the derived graph, or a walk bounded per submit (past it: `warming`).
 
 `branches` gains a `hidden_for_embargo` column so `tips`, `history` and every listing leave out embargo lines for everyone outside their groups (S1 shows branch names to all participants, `HUB.md` §13.8).
 
