@@ -551,6 +551,7 @@ pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer) -> Result<
 /// The snapshots reachable from `tips` in `viewer`'s projected history,
 /// down to (not including) `stop`, as object frames: as stored, compressed
 /// or not, when the caller reads `encoded` frames.
+#[allow(clippy::too_many_arguments)]
 pub async fn history(
     hub: &Arc<Hub>,
     project: &Project,
@@ -1005,6 +1006,10 @@ enum Visit {
     Found,
 }
 
+/// What [`differs_where`] asks at each entry that differs: its path and
+/// the entry on each side.
+type Visitor<'a> = &'a dyn Fn(&str, Option<&veil_core::TreeEntry>, Option<&veil_core::TreeEntry>) -> Visit;
+
 /// Do real trees `a` and `b` differ anywhere `visit` says [`Visit::Found`]?
 /// Both are walked down at once, only where they differ, and only into
 /// what `visit` descends into: the work is that of the difference.
@@ -1012,7 +1017,7 @@ fn differs_where(
     src: &Source,
     a: ObjectId,
     b: ObjectId,
-    visit: &dyn Fn(&str, Option<&veil_core::TreeEntry>, Option<&veil_core::TreeEntry>) -> Visit,
+    visit: Visitor,
 ) -> Result<bool> {
     use std::collections::{BTreeMap, BTreeSet};
     fn entries(src: &Source, id: Option<ObjectId>) -> Result<BTreeMap<String, veil_core::TreeEntry>> {
@@ -1022,8 +1027,7 @@ fn differs_where(
             Node::Leaf => BTreeMap::new(),
         })
     }
-    type V<'a> = &'a dyn Fn(&str, Option<&veil_core::TreeEntry>, Option<&veil_core::TreeEntry>) -> Visit;
-    fn walk(src: &Source, visit: V, dir: &str, a: Option<ObjectId>, b: Option<ObjectId>, depth: usize) -> Result<bool> {
+    fn walk(src: &Source, visit: Visitor, dir: &str, a: Option<ObjectId>, b: Option<ObjectId>, depth: usize) -> Result<bool> {
         if a == b {
             return Ok(false);
         }
