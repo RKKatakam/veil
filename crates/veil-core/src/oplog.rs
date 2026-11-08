@@ -585,6 +585,7 @@ impl OpStore {
             }
         }
         out.base = base.map(|(_, id)| id);
+        out.ops = ops;
         Ok(out)
     }
 
@@ -614,6 +615,141 @@ pub struct Split {
     pub only_a: Vec<ObjectId>,
     pub only_b: Vec<ObjectId>,
     pub base: Option<ObjectId>,
+    /// The operations the walk read (every one of `only_a` and `only_b`,
+    /// and their parents, but pruned ones).
+    pub(crate) ops: HashMap<ObjectId, Operation>,
+}
+
+impl Split {
+    /// What the operations of `ids` (`only_a` or `only_b`) introduced:
+    /// see [`Introduced`].
+    pub(crate) fn introduced(&self, ids: &[ObjectId]) -> Introduced {
+        let mut out = Introduced::default();
+        for id in ids {
+            if let Some(op) = self.ops.get(id) {
+                let parents: Vec<&View> = op.parents.iter().filter_map(|p| self.ops.get(p)).map(|o| &o.view).collect();
+                out.add(&op.view, &parents);
+            }
+        }
+        out
+    }
+}
+
+/// The values some operations introduced: a key's value in an operation's
+/// view that none of its parents' views has (a new snapshot of a
+/// workspace, a tag set or removed, a head added or dropped). A merge of
+/// concurrent operations introduces only what it rewrote, and what it
+/// takes from one of its parents is that parent's.
+#[derive(Clone, Debug, Default)]
+pub struct Introduced {
+    workspaces: std::collections::HashSet<(String, Option<ObjectId>)>,
+    tags: std::collections::HashSet<(String, Option<(ObjectId, Option<ObjectId>)>)>,
+    remote_tags: std::collections::HashSet<(String, Option<ObjectId>)>,
+    heads: std::collections::HashSet<(ObjectId, bool)>,
+}
+
+impl Introduced {
+    /// Record what `view` introduces over `parents` (an operation without
+    /// known parents introduces all of it).
+    pub fn add(&mut self, view: &View, parents: &[&View]) {
+        let unit = |t: &Tag| (t.target, t.annotation);
+        let names: BTreeSet<&String> = view.workspaces.keys().chain(parents.iter().flat_map(|p| p.workspaces.keys())).collect();
+        for n in names {
+            let v = view.workspaces.get(n).map(|w| w.wc);
+            if parents.iter().all(|p| p.workspaces.get(n).map(|w| w.wc) != v) {
+                self.workspaces.insert((n.clone(), v));
+            }
+        }
+        let names: BTreeSet<&String> = view.tags.keys().chain(parents.iter().flat_map(|p| p.tags.keys())).collect();
+        for n in names {
+            let v = view.tags.get(n).map(unit);
+            if parents.iter().all(|p| p.tags.get(n).map(unit) != v) {
+                self.tags.insert((n.clone(), v));
+            }
+        }
+        let names: BTreeSet<&String> = view.remote_tags.keys().chain(parents.iter().flat_map(|p| p.remote_tags.keys())).collect();
+        for n in names {
+            let v = view.remote_tags.get(n).copied();
+            if parents.iter().all(|p| p.remote_tags.get(n).copied() != v) {
+                self.remote_tags.insert((n.clone(), v));
+            }
+        }
+        let heads: BTreeSet<&ObjectId> = view.heads.iter().chain(parents.iter().flat_map(|p| p.heads.iter())).collect();
+        for h in heads {
+            let v = view.heads.contains(h);
+            if parents.iter().all(|p| p.heads.contains(h) != v) {
+                self.heads.insert((*h, v));
+            }
+        }
+    }
+}
+
+/// The base [`merge_views`] compares `a` and `b` with, for two sides whose
+/// histories share more than their nearest common operation `base` holds
+/// (a criss-cross: two settlers merged some of the same operations, each
+/// with others, BUG-1294). Per key: when one side's value was introduced
+/// by an operation only it reaches (`ia`, `ib`) and the other's was not,
+/// the other's is the shared history's, so it is the base and the change
+/// wins. Otherwise (both sides changed the key, or neither did and they
+/// still differ) the key is `base`'s, and the conflict rules decide.
+/// Without it, a value `base` lacks but both sides' shared history holds
+/// looks changed on both sides, and the conflict rule could keep the side
+/// with the older value: a commit's working copy lost.
+pub fn shared_base(base: &View, a: &View, ia: &Introduced, b: &View, ib: &Introduced) -> View {
+    fn key<T: Clone + PartialEq + Eq + std::hash::Hash, V: Clone>(
+        name: &str,
+        va: Option<&V>,
+        vb: Option<&V>,
+        vbase: Option<&V>,
+        unit: impl Fn(&V) -> T,
+        ia: &std::collections::HashSet<(String, Option<T>)>,
+        ib: &std::collections::HashSet<(String, Option<T>)>,
+    ) -> Option<V> {
+        let (ua, ub) = (va.map(&unit), vb.map(&unit));
+        if ua == ub {
+            return vbase.cloned();
+        }
+        match (ia.contains(&(name.to_string(), ua)), ib.contains(&(name.to_string(), ub))) {
+            (false, true) => va.cloned(),
+            (true, false) => vb.cloned(),
+            _ => vbase.cloned(),
+        }
+    }
+    let mut out = View::default();
+    let names: BTreeSet<&String> = base.workspaces.keys().chain(a.workspaces.keys()).chain(b.workspaces.keys()).collect();
+    for n in names {
+        let v = key(n, a.workspaces.get(n), b.workspaces.get(n), base.workspaces.get(n), |w| w.wc, &ia.workspaces, &ib.workspaces);
+        if let Some(v) = v {
+            out.workspaces.insert(n.clone(), v);
+        }
+    }
+    let names: BTreeSet<&String> = base.tags.keys().chain(a.tags.keys()).chain(b.tags.keys()).collect();
+    for n in names {
+        let v = key(n, a.tags.get(n), b.tags.get(n), base.tags.get(n), |t| (t.target, t.annotation), &ia.tags, &ib.tags);
+        if let Some(v) = v {
+            out.tags.insert(n.clone(), v);
+        }
+    }
+    let names: BTreeSet<&String> = base.remote_tags.keys().chain(a.remote_tags.keys()).chain(b.remote_tags.keys()).collect();
+    for n in names {
+        let v = key(n, a.remote_tags.get(n), b.remote_tags.get(n), base.remote_tags.get(n), |t| *t, &ia.remote_tags, &ib.remote_tags);
+        if let Some(v) = v {
+            out.remote_tags.insert(n.clone(), v);
+        }
+    }
+    let heads: BTreeSet<&ObjectId> = base.heads.iter().chain(a.heads.iter()).chain(b.heads.iter()).collect();
+    for h in heads {
+        let (pa, pb) = (a.heads.contains(h), b.heads.contains(h));
+        let keep = match (pa == pb, ia.heads.contains(&(*h, pa)), ib.heads.contains(&(*h, pb))) {
+            (false, false, true) => pa,
+            (false, true, false) => pb,
+            _ => base.heads.contains(h),
+        };
+        if keep {
+            out.heads.insert(*h);
+        }
+    }
+    out
 }
 
 /// See [`OpStore::walk`].

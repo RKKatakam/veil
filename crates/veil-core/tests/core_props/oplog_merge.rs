@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use proptest::prelude::*;
 use veil_core::{
-    oplog::{merge_views, revert_views, Tag, View, WorkspaceState, OP_HEADS_DIR},
+    oplog::{merge_views, revert_views, shared_base, Introduced, Tag, View, WorkspaceState, OP_HEADS_DIR},
     Identity, MemoryBackend, ObjectId, Repo, StorageBackend, VPath,
 };
 
@@ -251,5 +251,239 @@ fn a_workspace_keeps_its_identity_through_merges_and_undo() {
     let back = revert_views(&gone, &base, &again, &mut no_descent).view;
     if let Some(w) = back.workspaces.get("w") {
         assert!((w.wc == first.wc && w.id == first.id) || (w.wc == later.wc && w.id == later.id), "{w:?}");
+    }
+}
+
+// ---- BUG-1294: settlers that list different heads --------------------------
+
+/// BUG-1294, the interleaving found: from `p` (w = 2), one writer records
+/// w = 3 (`x1`) while another operation (`x2`, newer) leaves w alone. One
+/// settler merges them (`a`, w = 3); another merges them with a third
+/// head, and the writer commits on that (`b`, w = 4). `a` and `b` share
+/// `x1` and `x2`; the newest, `x2`, alone says w = 2, so both sides
+/// looked changed and the first side (`a`, the older w = 3) won.
+#[test]
+fn criss_cross_keeps_the_newer_commit() {
+    let ws = |wc: u8| {
+        let mut v = base_view();
+        v.workspaces.get_mut("w0").unwrap().wc = id(wc);
+        v
+    };
+    let (x1, x2) = (ws(3), ws(2));
+    let (a, b) = (ws(3), ws(4));
+    // Only `a` reaches the merge `a` (its parents x1, x2); only `b`
+    // reaches b's merge of x1, x2 and a third head, and the commit.
+    let mut ia = Introduced::default();
+    ia.add(&a, &[&x1, &x2]);
+    let mut ib = Introduced::default();
+    let b_merge = ws(3);
+    ib.add(&b_merge, &[&x1, &x2, &base_view()]);
+    ib.add(&b, &[&b_merge]);
+    let shared = shared_base(&x2, &a, &ia, &b, &ib);
+    for sides in [[&a, &b], [&b, &a]] {
+        let m = merge_views(&shared, &sides, &mut no_descent);
+        assert_eq!(m.view.workspaces["w0"].wc, id(4), "the newer commit wins");
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+    }
+    // Before the fix, against `x2` alone: the first side won.
+    assert_eq!(merge_views(&x2, &[&a, &b], &mut no_descent).view.workspaces["w0"].wc, id(3));
+    // An undo on one side back to a value the shared history held is a
+    // change too: introduced by the undo.
+    let undone = ws(2);
+    let mut iu = Introduced::default();
+    iu.add(&undone, &[&a]);
+    let shared = shared_base(&x2, &undone, &iu, &a, &Introduced::default());
+    assert_eq!(merge_views(&shared, &[&a, &undone], &mut no_descent).view.workspaces["w0"].wc, id(2));
+}
+
+/// A repository on one backend, as one simulated process sees it: a reader
+/// copies it (`fork`) when it lists the heads, and what it then writes
+/// lands later (`land`), as a slow transaction or settler publishes.
+struct Device {
+    fs: Arc<dyn StorageBackend>,
+    _dir: Option<tempfile::TempDir>,
+}
+
+fn op_heads(fs: &dyn StorageBackend) -> Vec<String> {
+    fs.list_dir(&VPath::new(OP_HEADS_DIR).unwrap()).unwrap().into_iter().map(|e| e.name).collect()
+}
+
+fn repo_files(fs: &dyn StorageBackend) -> Vec<VPath> {
+    let skip = |p: &VPath| p.as_str().starts_with(".veil/objects/incoming") || p.as_str().starts_with(".veil/local");
+    veil_core::vfs::walk_files(fs, &VPath::root(), &skip).unwrap()
+}
+
+impl Device {
+    fn new(disk: bool) -> Device {
+        match disk {
+            true => {
+                let d = tempfile::tempdir().unwrap();
+                Device { fs: Arc::new(veil_core::DiskBackend::new(d.path())), _dir: Some(d) }
+            }
+            false => Device { fs: Arc::new(MemoryBackend::new()), _dir: None },
+        }
+    }
+
+    /// A copy of the repository with only `heads` as its op heads.
+    fn fork(&self, heads: &[String]) -> Device {
+        let out = Device::new(self._dir.is_some());
+        for f in repo_files(&*self.fs) {
+            out.fs.write(&f, &self.fs.read(&f).unwrap()).unwrap();
+        }
+        for h in op_heads(&*out.fs) {
+            if !heads.contains(&h) {
+                out.fs.remove_file(&VPath::new(&format!("{OP_HEADS_DIR}/{h}")).unwrap()).unwrap();
+            }
+        }
+        out
+    }
+
+    /// Publish what `fork` (forked with `heads`) wrote: its operations and
+    /// objects, its new heads, and the removal of the heads it merged.
+    fn land(&self, fork: &Device, heads: &[String]) {
+        for f in repo_files(&*fork.fs) {
+            let s = f.as_str();
+            if (s.starts_with(".veil/objects/") || s.starts_with(".veil/ops/")) && !self.fs.exists(&f).unwrap() {
+                self.fs.write(&f, &fork.fs.read(&f).unwrap()).unwrap();
+            }
+        }
+        let now = op_heads(&*fork.fs);
+        for h in &now {
+            if !heads.contains(h) {
+                self.fs.write(&VPath::new(&format!("{OP_HEADS_DIR}/{h}")).unwrap(), b"").unwrap();
+            }
+        }
+        for h in heads {
+            let p = VPath::new(&format!("{OP_HEADS_DIR}/{h}")).unwrap();
+            if !now.contains(h) && self.fs.exists(&p).unwrap() {
+                self.fs.remove_file(&p).unwrap();
+            }
+        }
+    }
+}
+
+fn files_of(repo: &Repo, snapshot: &ObjectId) -> Vec<String> {
+    veil_core::tree::walk_files(repo.store(), &repo.snapshot(snapshot).unwrap().tree).unwrap().into_iter().map(|(p, _)| p.to_string()).collect()
+}
+
+/// BUG-1294's guarantee, checked over many interleavings: every committed
+/// operation's effects are in every later view. Three writers each commit
+/// new files in their own workspace and tag each commit; settlers merge
+/// random subsets of the heads; every writer and settler publishes after
+/// a random delay (others land meanwhile), which makes criss-crosses: two
+/// merges of overlapping sets of operations. Each writer finds all its
+/// own files in its workspace when it starts, and in the end every tag
+/// names a commit holding all its writer's files so far; no merge reports
+/// a conflict (each key has one writer).
+fn check_merges_keep_every_operation(disk: bool, steps: &[u8]) -> Result<(), TestCaseError> {
+    let me = Identity::generate("alice");
+    let truth = Device::new(disk);
+    {
+        let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        let root = repo.root_id();
+        for w in 0..3 {
+            repo.create_workspace(&format!("w{w}"), vec![root]).unwrap();
+        }
+    }
+    let mut done = [0usize; 3];
+    // (fork, the heads it was forked with, the writer it belongs to)
+    let mut pending: Vec<(Device, Vec<String>, Option<usize>)> = Vec::new();
+    for &b in steps {
+        let heads = op_heads(&*truth.fs);
+        match b % 3 {
+            0 => {
+                let w = (b as usize / 3) % 3;
+                if done[w] == 3 || pending.iter().any(|p| p.2 == Some(w)) {
+                    continue;
+                }
+                let fork = truth.fork(&heads);
+                let mut repo = Repo::open(fork.fs.clone(), Some(me.clone()), "alice").unwrap();
+                let ws = format!("w{w}");
+                let have = files_of(&repo, &repo.workspace_wc(&ws).unwrap());
+                for n in 0..done[w] {
+                    prop_assert!(have.contains(&format!("f{w}-{n}")), "{}: {ws} lost f{w}-{n}: {:?}", truth.fs.kind(), have);
+                }
+                let n = done[w];
+                let ov = repo.workspace_overlay(&ws).unwrap();
+                ov.write(&VPath::new(&format!("f{w}-{n}")).unwrap(), b"x\n").unwrap();
+                repo.snapshot_workspace(&ws, &ov).unwrap();
+                let (c, _) = repo.commit_working_copy(&ws, &format!("{ws} {n}")).unwrap();
+                repo.set_tag(&format!("c{w}-{n}"), c, true).unwrap();
+                // Each key has one writer, and nothing rewrites: a conflict
+                // is a merge that took a shared value for a change.
+                prop_assert_eq!(repo.take_warnings(), Vec::<String>::new());
+                drop(repo);
+                done[w] += 1;
+                pending.push((fork, heads, Some(w)));
+            }
+            1 => {
+                // A settler that listed some of the heads.
+                let pick: Vec<String> = heads.iter().enumerate().filter(|(i, _)| (b >> (2 + i % 6)) & 1 == 1).map(|(_, h)| h.clone()).collect();
+                if pick.len() < 2 {
+                    continue;
+                }
+                let fork = truth.fork(&pick);
+                let mut repo = Repo::open(fork.fs.clone(), Some(me.clone()), "alice").unwrap();
+                prop_assert_eq!(repo.heads().len(), 1, "the settler merged its heads");
+                prop_assert_eq!(repo.take_warnings(), Vec::<String>::new());
+                drop(repo);
+                pending.push((fork, pick, None));
+            }
+            _ => {
+                if !pending.is_empty() {
+                    let (fork, heads, _) = pending.remove(b as usize / 3 % pending.len());
+                    truth.land(&fork, &heads);
+                }
+            }
+        }
+    }
+    for (fork, heads, _) in pending.drain(..) {
+        truth.land(&fork, &heads);
+    }
+    let mut repo = Repo::open(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+    prop_assert_eq!(repo.heads().len(), 1);
+    prop_assert_eq!(repo.take_warnings(), Vec::<String>::new());
+    for w in 0..3 {
+        let have = files_of(&repo, &repo.workspace_wc(&format!("w{w}")).unwrap());
+        for n in 0..done[w] {
+            prop_assert!(have.contains(&format!("f{w}-{n}")), "{}: w{w} lost f{w}-{n}: {:?}", truth.fs.kind(), have);
+            let t = repo.view().tags.get(&format!("c{w}-{n}"));
+            prop_assert!(t.is_some(), "{}: tag c{w}-{n} was lost", truth.fs.kind());
+            let files = files_of(&repo, &t.unwrap().target);
+            for m in 0..=n {
+                prop_assert!(files.contains(&format!("f{w}-{m}")), "{}: c{w}-{n} lacks f{w}-{m}: {:?}", truth.fs.kind(), files);
+            }
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(256),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    /// BUG-1294 on the memory backend (256 cases, a few seconds: without
+    /// the fix, 7 seeds in 8 and the pinned one fail).
+    #[test]
+    fn merges_keep_every_operation_memory(steps in prop::collection::vec(any::<u8>(), 10..60)) {
+        check_merges_keep_every_operation(false, &steps)?;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(16),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    /// BUG-1294 on the disk backend (fewer cases: each syncs; 64 found
+    /// it at the pinned seed without the fix).
+    #[test]
+    fn merges_keep_every_operation_disk(steps in prop::collection::vec(any::<u8>(), 10..60)) {
+        check_merges_keep_every_operation(true, &steps)?;
     }
 }
