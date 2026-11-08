@@ -487,3 +487,530 @@ proptest! {
         check_merges_keep_every_operation(true, &steps)?;
     }
 }
+
+// ---- BUG-1294 review: every write survives, for every kind of key ---------
+
+/// One key of a view, as the per-key model sees it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Key {
+    Ws(String),
+    Tag(String),
+    Rtag(String),
+    Head(ObjectId),
+}
+
+/// A key's value (a workspace's working copy, a tag's target and
+/// annotation, a remote tag's target, a head's presence); `None`: absent.
+type Val = Option<(ObjectId, Option<ObjectId>)>;
+
+fn keys_of(v: &View) -> BTreeMap<Key, (ObjectId, Option<ObjectId>)> {
+    let mut out = BTreeMap::new();
+    for (n, w) in &v.workspaces {
+        out.insert(Key::Ws(n.clone()), (w.wc, None));
+    }
+    for (n, t) in &v.tags {
+        out.insert(Key::Tag(n.clone()), (t.target, t.annotation));
+    }
+    for (n, t) in &v.remote_tags {
+        out.insert(Key::Rtag(n.clone()), (*t, None));
+    }
+    for h in &v.heads {
+        out.insert(Key::Head(*h), (*h, None));
+    }
+    out
+}
+
+/// What a command wrote: every key whose value it changed.
+fn writes(before: &View, after: &View) -> Vec<(Key, Val)> {
+    let (b, a) = (keys_of(before), keys_of(after));
+    let names: std::collections::BTreeSet<&Key> = b.keys().chain(a.keys()).collect();
+    names.into_iter().filter(|k| b.get(k) != a.get(k)).map(|k| (k.clone(), a.get(k).copied())).collect()
+}
+
+/// A command as the model records it: when it read the repository (it saw
+/// every command landed before), when it landed, and what it wrote.
+struct Cmd {
+    forked: usize,
+    landed: Option<usize>,
+    writes: Vec<(Key, Val)>,
+    what: String,
+    /// The commit it made, a tag target for later commands.
+    commit: Option<ObjectId>,
+}
+
+/// The per-key model: the values a view that saw the commands landed by
+/// now may hold for `key`: those of the writes no later landed write of
+/// `key` saw (causal last writer wins; several only for concurrent writes,
+/// where a change beats a removal). `None` when nothing wrote the key.
+fn allowed(cmds: &[Cmd], key: &Key) -> Option<(Vec<Val>, Vec<usize>)> {
+    let landed: Vec<(usize, &Cmd)> = cmds.iter().enumerate().filter(|(_, c)| c.landed.is_some()).collect();
+    let mut last: Vec<(Val, usize)> = Vec::new();
+    for (i, c) in &landed {
+        let Some((_, v)) = c.writes.iter().find(|(k, _)| k == key) else { continue };
+        let superseded = landed.iter().any(|(j, d)| j != i && d.writes.iter().any(|(k, _)| k == key) && c.landed.unwrap() < d.forked);
+        if !superseded {
+            last.push((*v, *i));
+        }
+    }
+    if last.is_empty() {
+        return None;
+    }
+    let mut vals: Vec<Val> = last.iter().map(|(v, _)| *v).collect();
+    // A change (or an added head) beats a concurrent removal.
+    if vals.iter().any(|v| v.is_some()) {
+        vals.retain(|v| v.is_some());
+    }
+    vals.sort();
+    vals.dedup();
+    Some((vals, last.iter().map(|(_, i)| *i).collect()))
+}
+
+/// Were two landed writes of `key` concurrent, to different values (not
+/// a removal)?
+fn conflicted(cmds: &[Cmd], key: &Key) -> bool {
+    let w: Vec<(&Cmd, Val)> = cmds.iter().filter(|c| c.landed.is_some()).filter_map(|c| c.writes.iter().find(|(k, _)| k == key).map(|(_, v)| (c, *v))).collect();
+    w.iter().any(|(c, v)| {
+        w.iter().any(|(d, u)| v.is_some() && u.is_some() && v != u && c.landed.unwrap() >= d.forked && d.landed.unwrap() >= c.forked)
+    })
+}
+
+/// Does `repo`'s view hold, for every key, a value the model allows? A key
+/// with a real conflict may hold any value the model allows, each of which
+/// must stay visible. Heads: a head the model keeps must stay visible; one
+/// it removed may come back only as a written value (a conflict's loser).
+fn check_model(cmds: &[Cmd], repo: &Repo, losers: &std::collections::HashSet<ObjectId>, at: &str) -> Result<(), TestCaseError> {
+    let view = repo.view();
+    let have = keys_of(view);
+    let refs = view.refs();
+    let visible = |v: &ObjectId| refs.iter().any(|r| r == v || repo.is_ancestor(v, r).unwrap());
+    let mut keys: std::collections::BTreeSet<Key> = Default::default();
+    for c in cmds.iter().filter(|c| c.landed.is_some()) {
+        keys.extend(c.writes.iter().map(|(k, _)| k.clone()));
+    }
+    for k in keys {
+        let Some((vals, by)) = allowed(cmds, &k) else { continue };
+        let got = have.get(&k).copied();
+        // Two concurrent writes of different values: a real conflict, where
+        // the first side wins and the loser stays visible (a later removal
+        // that saw only the winner may then remove the key). Every value the
+        // model still allows must be visible.
+        if !matches!(k, Key::Head(_)) && conflicted(cmds, &k) {
+            for v in vals.iter().flatten() {
+                prop_assert!(matches!(k, Key::Rtag(_)) || visible(&v.0), "{}: {:?}: {} was dropped in a conflict", at, k, v.0.short());
+            }
+            continue;
+        }
+        let ok = match &k {
+            // A head the model keeps must stay visible (a head, or below
+            // one: a merge drops a head another ref now covers).
+            Key::Head(h) if vals.contains(&Some((*h, None))) => got.is_some() || visible(h),
+            Key::Head(h) => vals.contains(&got) || losers.contains(h),
+            _ => vals.contains(&got),
+        };
+        let whats: Vec<&str> = by.iter().map(|i| cmds[*i].what.as_str()).collect();
+        prop_assert!(ok, "{}: {:?} is {:?}, the model allows {:?} (last written by {:?})", at, k, got.map(|g| g.0.short()), vals.iter().map(|v| v.map(|v| v.0.short())).collect::<Vec<_>>(), whats);
+    }
+    Ok(())
+}
+
+/// A fork not landed yet: the fork, the heads it was forked with, its
+/// command (none for a settler), and the workspace slots it holds.
+type Pending = (Device, Vec<String>, Option<usize>, Vec<String>);
+
+/// The review's model check of guarantee 1 (BUG-1294 review): `nw`
+/// writers, each committing in its own workspace (one recorder per
+/// workspace at a time, as the workspace lock keeps it); any command moves
+/// and deletes tags (so concurrent tag moves are real conflicts), updates
+/// and drops remote tags, creates and removes extra workspaces, and (with
+/// `undo`) undoes the last command of a workspace or restores an earlier
+/// operation; settlers merge random subsets of the heads; everything
+/// publishes after a random delay. Without `aba`, no tag or remote tag is
+/// written back to a value it held before (BUG-1296). Every command (and
+/// the final view) must see, for every key, the value of the causally last
+/// write (a value of one of several concurrent writes, whose losers stay
+/// visible). No warning unless two writes of a key were concurrent, and a
+/// warning for every conflict still open at the end.
+fn check_every_write_survives(disk: bool, nw: usize, undo: bool, aba: bool, steps: &[u16]) -> Result<(), TestCaseError> {
+    let me = Identity::generate("alice");
+    let truth = Device::new(disk);
+    let mut cmds: Vec<Cmd> = Vec::new();
+    let mut commits: Vec<ObjectId>;
+    {
+        let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        let root = repo.root_id();
+        let before = View::default();
+        for w in 0..nw {
+            repo.create_workspace(&format!("w{w}"), vec![root]).unwrap();
+        }
+        for t in 0..3 {
+            repo.set_tag(&format!("t{t}"), root, true).unwrap();
+        }
+        cmds.push(Cmd { forked: 0, landed: Some(0), writes: writes(&before, repo.view()), what: "init".into(), commit: None });
+        commits = vec![root];
+    }
+    let mut warnings: Vec<String> = Vec::new();
+    let mut losers: std::collections::HashSet<ObjectId> = Default::default();
+    let mut files = vec![0usize; nw];
+    // Without `aba`, no command writes a tag or remote tag back to a value
+    // it held before (BUG-1296): every value a key was written is here.
+    let mut used: std::collections::HashMap<Key, std::collections::HashSet<Val>> = Default::default();
+    for (k, v) in &cmds[0].writes {
+        used.entry(k.clone()).or_default().insert(*v);
+    }
+    let mut pending: Vec<Pending> = Vec::new();
+    for (clock, &b) in steps.iter().enumerate() {
+        let clock = clock + 1;
+        let heads = op_heads(&*truth.fs);
+        let arg = (b / 16) as usize;
+        let kind = b % 16;
+        if kind >= 12 {
+            if kind == 15 {
+                let pick: Vec<String> = heads.iter().enumerate().filter(|(i, _)| (arg >> (i % 10)) & 1 == 1).map(|(_, h)| h.clone()).collect();
+                if pick.len() < 2 {
+                    continue;
+                }
+                let fork = truth.fork(&pick);
+                let mut repo = Repo::open(fork.fs.clone(), Some(me.clone()), "alice").unwrap();
+                prop_assert_eq!(repo.heads().len(), 1, "the settler merged its heads");
+                warnings.extend(repo.take_warnings());
+                drop(repo);
+                pending.push((fork, pick, None, Vec::new()));
+            } else if !pending.is_empty() {
+                let (fork, heads, c, _) = pending.remove(arg % pending.len());
+                truth.land(&fork, &heads);
+                if let Some(c) = c {
+                    cmds[c].landed = Some(clock);
+                    commits.extend(cmds[c].commit);
+                }
+            }
+            continue;
+        }
+        // A command: which workspace slots it holds.
+        // Without undo and op restore (see BUG-1295): those turn into
+        // more tag moves.
+        let kind = match (undo, kind) {
+            (false, 10 | 11) => 9,
+            (_, k) => k,
+        };
+        let w = arg % nw;
+        let x = format!("x{}", arg % 2);
+        let slots: Vec<String> = match kind {
+            0..=3 | 10 => vec![format!("w{w}")],
+            8 => vec![x.clone()],
+            11 => (0..nw).map(|w| format!("w{w}")).chain(["x0".to_string(), "x1".to_string()]).collect(),
+            _ => Vec::new(),
+        };
+        if pending.iter().any(|p| p.3.iter().any(|s| slots.contains(s))) {
+            continue;
+        }
+        let fork = truth.fork(&heads);
+        let mut repo = Repo::open(fork.fs.clone(), Some(me.clone()), "alice").unwrap();
+        warnings.extend(repo.take_warnings());
+        check_model(&cmds, &repo, &losers, &format!("step {clock} (a command's view)"))?;
+        let before = repo.view().clone();
+        let tag = format!("t{}", arg % 3);
+        // A target for `key`: any commit, or (without `aba`) one the key
+        // never had.
+        let fresh = |key: Key, n: usize| -> Option<ObjectId> {
+            let ok = |c: &ObjectId| aba || !used.get(&key).is_some_and(|u| u.contains(&Some((*c, None))));
+            let cands: Vec<ObjectId> = commits.iter().copied().filter(ok).collect();
+            (!cands.is_empty()).then(|| cands[n % cands.len()])
+        };
+        let gone = |key: Key| !aba && used.get(&key).is_some_and(|u| u.contains(&None));
+        let what;
+        let mut new_commit = None;
+        let ok: Result<(), veil_core::VeilError> = match kind {
+            0..=3 => {
+                let ws = format!("w{w}");
+                if !repo.view().workspaces.contains_key(&ws) {
+                    // An op restore to before its creation took it away.
+                    continue;
+                }
+                repo.set_command_workspace(Some(ws.clone()));
+                let n = files[w];
+                files[w] += 1;
+                what = format!("commit {ws} {n}");
+                let ov = repo.workspace_overlay(&ws).unwrap();
+                ov.write(&VPath::new(&format!("f{w}-{n}")).unwrap(), b"x\n").unwrap();
+                repo.snapshot_workspace(&ws, &ov).unwrap();
+                repo.commit_working_copy(&ws, &format!("{ws} {n}")).map(|(c, _)| new_commit = Some(c))
+            }
+            4 | 5 => match fresh(Key::Tag(tag.clone()), arg) {
+                Some(t) => {
+                    what = format!("tag {tag} -> {}", t.short());
+                    repo.set_tag(&tag, t, true)
+                }
+                None => continue,
+            },
+            6 => {
+                what = format!("delete tag {tag}");
+                match repo.view().tags.contains_key(&tag) && !gone(Key::Tag(tag.clone())) {
+                    true => repo.delete_tag(&tag),
+                    false => Err(veil_core::VeilError::repo("no tag")),
+                }
+            }
+            7 => {
+                let name = format!("origin/{tag}");
+                what = format!("remote tag {name}");
+                let drop = arg % 4 == 3;
+                let t = fresh(Key::Rtag(name.clone()), arg);
+                if (drop && (gone(Key::Rtag(name.clone())) || !repo.view().remote_tags.contains_key(&name))) || (!drop && t.is_none()) {
+                    continue;
+                }
+                let mut tx = repo.transaction("pull").unwrap();
+                tx.repository_wide();
+                match (drop, t) {
+                    (true, _) => {
+                        tx.view.remote_tags.remove(&name);
+                    }
+                    (false, t) => {
+                        tx.view.remote_tags.insert(name, t.unwrap());
+                    }
+                }
+                tx.commit().map(|_| ())
+            }
+            8 => match repo.view().workspaces.contains_key(&x) {
+                true => {
+                    what = format!("remove workspace {x}");
+                    repo.remove_workspace(&x)
+                }
+                false => {
+                    what = format!("create workspace {x}");
+                    let t = commits[arg % commits.len()];
+                    repo.create_workspace(&x, vec![t]).map(|_| ())
+                }
+            },
+            9 => {
+                let other = format!("t{}", (arg + 1) % 3);
+                what = format!("tag {tag} and {other}");
+                match (fresh(Key::Tag(tag.clone()), arg), fresh(Key::Tag(other.clone()), arg)) {
+                    (Some(t), Some(u)) => repo.set_tag(&tag, t, true).and_then(|_| repo.set_tag(&other, u, true)),
+                    _ => continue,
+                }
+            }
+            10 => {
+                let ws = format!("w{w}");
+                repo.set_command_workspace(Some(ws.clone()));
+                what = format!("undo in {ws}");
+                repo.undo_keeping_edits(&ws).map(|_| ())
+            }
+            _ => {
+                // Restore the view of an operation a few back.
+                let back = arg % 5 + 1;
+                let target = repo.ops().walk(&[repo.op_id()]).nth(back).map(|r| r.unwrap().0);
+                what = format!("op restore {back} back");
+                match target {
+                    Some(op) => repo.restore_operation_keeping_edits("w0", op).map(|_| ()),
+                    None => Err(veil_core::VeilError::repo("no op")),
+                }
+            }
+        };
+        if ok.is_err() {
+            // Nothing to undo, no tag to delete: nothing ran (the fork is
+            // dropped unpublished).
+            continue;
+        }
+        warnings.extend(repo.take_warnings());
+        let ws = writes(&before, repo.view());
+        for (k, v) in &ws {
+            used.entry(k.clone()).or_default().insert(*v);
+        }
+        drop(repo);
+        cmds.push(Cmd { forked: clock, landed: None, writes: ws, what, commit: new_commit });
+        pending.push((fork, heads, Some(cmds.len() - 1), slots));
+        // A conflict's losing values stay visible as heads.
+        for (k, v) in &cmds.last().unwrap().writes {
+            if let (Key::Ws(_) | Key::Tag(_), Some((t, _))) = (k, v) {
+                losers.insert(*t);
+            }
+        }
+    }
+    let end = steps.len() + 1;
+    for (fork, heads, c, _) in pending.drain(..) {
+        truth.land(&fork, &heads);
+        if let Some(c) = c {
+            cmds[c].landed = Some(end);
+        }
+    }
+    let mut repo = Repo::open(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+    prop_assert_eq!(repo.heads().len(), 1);
+    warnings.extend(repo.take_warnings());
+    check_model(&cmds, &repo, &losers, "the final view")?;
+    // Guarantee 3: a warning only for a real conflict (two concurrent
+    // writes of one workspace or tag, to different values).
+    let concurrent = cmds.iter().enumerate().any(|(i, c)| {
+        cmds.iter().enumerate().any(|(j, d)| {
+            i < j
+                && c.landed.unwrap() >= d.forked
+                && d.landed.unwrap() >= c.forked
+                && c.writes.iter().any(|(k, v)| matches!(k, Key::Ws(_) | Key::Tag(_)) && d.writes.iter().any(|(k2, v2)| k2 == k && v2 != v))
+        })
+    });
+    if !concurrent {
+        prop_assert_eq!(&warnings, &Vec::<String>::new(), "a warning without a conflict");
+    }
+    // And a real conflict that no later write settled is named in a
+    // warning.
+    let mut keys: std::collections::BTreeSet<Key> = Default::default();
+    for c in &cmds {
+        keys.extend(c.writes.iter().map(|(k, _)| k.clone()));
+    }
+    for k in keys {
+        let name = match &k {
+            Key::Ws(n) => format!("workspace '{n}'"),
+            Key::Tag(n) => format!("tag '{n}'"),
+            _ => continue,
+        };
+        // Still two values at the end (no later write settled it).
+        let open = allowed(&cmds, &k).is_some_and(|(v, _)| v.iter().flatten().count() > 1);
+        if open {
+            prop_assert!(warnings.iter().any(|w| w.starts_with(&name)), "{} had concurrent moves and no warning: {:?}", name, warnings);
+        }
+    }
+    Ok(())
+}
+
+fn review_cases(default: u32) -> u32 {
+    std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: review_cases(64), failure_persistence: None, ..ProptestConfig::default() })]
+
+    /// Guarantee 1 of the BUG-1294 review, memory backend, 2 to 5 writers.
+    #[test]
+    fn every_write_survives_concurrent_merges_memory(nw in 2usize..6, steps in prop::collection::vec(any::<u16>(), 20..120)) {
+        check_every_write_survives(false, nw, false, false, &steps)?;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: review_cases(8), failure_persistence: None, ..ProptestConfig::default() })]
+
+    /// The same on the disk backend.
+    #[test]
+    fn every_write_survives_concurrent_merges_disk(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), 20..80)) {
+        check_every_write_survives(true, nw, false, false, &steps)?;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: review_cases(64), failure_persistence: None, ..ProptestConfig::default() })]
+
+    /// The model check with `vl undo` and `vl op restore` among the
+    /// commands, and writes back to earlier values (memory backend).
+    #[test]
+    #[ignore = "BUG-1295, BUG-1296: an undone rewrite re-applied; a write back to the base's value lost"]
+    fn bug_1295_every_write_survives_with_undo_and_restore(nw in 2usize..6, steps in prop::collection::vec(any::<u16>(), 20..120)) {
+        check_every_write_survives(false, nw, true, false, &steps)?;
+    }
+}
+
+
+/// BUG-1296: a tag moved away and back (by `vl tag set` or an undo, which
+/// the merge counts as a change) concurrently with its deletion. Both
+/// sides introduced their value, so the merge compares with the nearest
+/// common operation, which holds the moved-back value: that side looks
+/// unchanged and the deletion wins, though a change beats a removal.
+#[test]
+#[ignore = "BUG-1296: a write back to the merge base's value loses to a concurrent removal"]
+fn bug_1296_a_tag_moved_back_survives_a_concurrent_delete() {
+    let me = Identity::generate("alice");
+    let truth = Device::new(false);
+    let (a, b);
+    {
+        let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+        let ov = repo.workspace_overlay("w").unwrap();
+        ov.write(&VPath::new("f").unwrap(), b"x\n").unwrap();
+        repo.snapshot_workspace("w", &ov).unwrap();
+        a = repo.commit_working_copy("w", "a").unwrap().0;
+        b = repo.root_id();
+        repo.set_tag("t", a, true).unwrap();
+    }
+    let heads = op_heads(&*truth.fs);
+    let (back, del) = (truth.fork(&heads), truth.fork(&heads));
+    {
+        let mut repo = Repo::open(back.fs.clone(), Some(me.clone()), "alice").unwrap();
+        repo.set_tag("t", b, true).unwrap();
+        repo.set_tag("t", a, true).unwrap();
+        assert_eq!(repo.view().tags["t"].target, a);
+    }
+    {
+        let mut repo = Repo::open(del.fs.clone(), Some(me.clone()), "alice").unwrap();
+        repo.delete_tag("t").unwrap();
+        assert!(!repo.view().tags.contains_key("t"));
+    }
+    truth.land(&back, &heads);
+    truth.land(&del, &heads);
+    let repo = Repo::open(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+    assert_eq!(repo.heads().len(), 1, "settled");
+    assert_eq!(repo.view().tags.get("t").map(|t| t.target), Some(a), "the concurrent move (a change) beats the removal");
+}
+
+/// BUG-1295: `vl undo` of a commit, merged with two other heads, one of
+/// which saw the commit and one did not. The fold (in id order) can merge
+/// those two first: the commit's rewrite of the working copy into the
+/// commit is collected there (that side does not show the old working
+/// copy), and then applied to the undo's working copy, which is that old
+/// one: the workspace ends on the commit, the undo lost.
+#[test]
+#[ignore = "BUG-1295: a merge re-applies a rewrite that a third head undid"]
+fn bug_1295_an_undone_commit_stays_undone_through_a_three_way_merge() {
+    let me = Identity::generate("alice");
+    let mut hits = 0;
+    for _ in 0..200 {
+        let truth = Device::new(false);
+        {
+            let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+            repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+        }
+        let p = op_heads(&*truth.fs);
+        // `x`: a command that never saw the commit.
+        let x = truth.fork(&p);
+        {
+            let mut repo = Repo::open(x.fs.clone(), Some(me.clone()), "alice").unwrap();
+            repo.set_tag("x", repo.root_id(), true).unwrap();
+        }
+        {
+            let mut repo = Repo::open(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+            repo.set_command_workspace(Some("w".into()));
+            let ov = repo.workspace_overlay("w").unwrap();
+            ov.write(&VPath::new("f").unwrap(), b"x\n").unwrap();
+            repo.snapshot_workspace("w", &ov).unwrap();
+            repo.commit_working_copy("w", "c").unwrap();
+        }
+        let k = op_heads(&*truth.fs);
+        // `y` saw the commit; `u` undid it.
+        let (y, u) = (truth.fork(&k), truth.fork(&k));
+        let (yid, uid, undone);
+        {
+            let mut repo = Repo::open(y.fs.clone(), Some(me.clone()), "alice").unwrap();
+            repo.set_tag("y", repo.root_id(), true).unwrap();
+            yid = repo.op_id();
+        }
+        {
+            let mut repo = Repo::open(u.fs.clone(), Some(me.clone()), "alice").unwrap();
+            repo.set_command_workspace(Some("w".into()));
+            repo.undo_keeping_edits("w").unwrap();
+            undone = repo.workspace_wc("w").unwrap();
+            uid = repo.op_id();
+        }
+        let xid = Repo::open(x.fs.clone(), Some(me.clone()), "alice").unwrap().op_id();
+        // The fold merges `u` last.
+        if !(uid > xid && uid > yid) {
+            continue;
+        }
+        hits += 1;
+        truth.land(&x, &p);
+        truth.land(&y, &k);
+        truth.land(&u, &k);
+        let repo = Repo::open(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        assert_eq!(repo.heads().len(), 1, "settled");
+        assert_eq!(repo.workspace_wc("w").unwrap(), undone, "the undo of the commit stays undone");
+        if hits == 3 {
+            break;
+        }
+    }
+    assert!(hits > 0, "the interleaving ran");
+}
