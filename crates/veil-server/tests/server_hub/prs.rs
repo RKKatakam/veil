@@ -1167,12 +1167,21 @@ mod s21_adversarial {
                 let (hub, me, id, hs, projects) = (hub.clone(), me.clone(), id.clone(), heads[k].clone(), projects.clone());
                 set.spawn(async move {
                     for (r, head) in hs.iter().enumerate().skip(1) {
-                        let a = Ask { project: projects[(k + r) % 2].clone(), viewer: admin_of(author), policy_version: 1 };
-                        if let Err(e) = prs::add_revision(&hub, &a, &me, &id, RevisionRequest { head: head.hex() }).await {
-                            // A request holding the lines from before a
-                            // change may find the PR's class stale: no PR
-                            // for it, for that moment (never a wrong one).
-                            assert!(e.is_retryable() || matches!(e, Error::Api { code: "conflict" | "not_found", .. }), "{e:?}");
+                        // Until it lands: a request holding the lines from
+                        // before a change may find the PR's class stale (no
+                        // PR for it, for that moment; never a wrong one).
+                        for attempt in 0.. {
+                            let a = Ask { project: projects[(k + r + attempt) % 2].clone(), viewer: admin_of(author), policy_version: 1 };
+                            match prs::add_revision(&hub, &a, &me, &id, RevisionRequest { head: head.hex() }).await {
+                                Ok(_) => break,
+                                // It landed, then answering it found the
+                                // class stale: the retry is told so.
+                                Err(Error::Api { message, .. }) if message.ends_with("already") => break,
+                                Err(e) => {
+                                    assert!(e.is_retryable() || matches!(e, Error::Api { code: "conflict" | "not_found", .. }), "{e:?}");
+                                    assert!(attempt < 200, "revision {r} of PR {k} never landed: {e:?}");
+                                }
+                            }
                         }
                         tokio::time::sleep(Duration::from_millis(3)).await;
                     }
@@ -1211,6 +1220,14 @@ mod s21_adversarial {
             let mut seen: Vec<String> = v["prs"].as_array().unwrap().iter().map(|p| p["title"].as_str().unwrap().to_string()).collect();
             seen.sort();
             let want: Vec<String> = (0..PRS).filter(|k| k % 2 == 0).map(|k| format!("race {k}")).collect();
+            // The PRs whose stored paths touch fin/ (every revision landed).
+            for (k, id) in ids.iter().enumerate() {
+                let paths: Vec<String> = th
+                    .rt
+                    .block_on(sqlx::query_scalar("SELECT path FROM pr_paths WHERE project_id = $1 AND pr = $2").bind(h.id).bind(id).fetch_all(&hub.db))
+                    .unwrap();
+                assert_eq!(paths.iter().any(|p| p.starts_with("fin/")), k % 2 == 1, "race {k}: {paths:?}");
+            }
             assert_eq!(seen, want, "a dev sees exactly the PRs that never touched fin/");
             // Every class under the current lines is the PR's paths' class.
             let key = prs::class::policy_key(&current.policy);
