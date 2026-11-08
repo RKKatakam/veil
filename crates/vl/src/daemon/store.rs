@@ -464,6 +464,27 @@ mod tests {
         assert!(small.counters.not_kept.load(Ordering::Relaxed) > 0);
     }
 
+    /// The daemon never makes a Veil home (§13.29): an object kept while
+    /// its home is being removed (a request in flight in the second before
+    /// the daemon sees the home gone) is not kept, and nothing is made
+    /// again.
+    #[test]
+    #[ignore = "BUG-1513: Store::put makes its folders with create_dir_all, which makes a removed Veil home again"]
+    fn keeping_an_object_never_makes_a_removed_veil_home_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("veil-home");
+        let s = Store::open(&home.join("daemon").join("store"), 1 << 30).unwrap();
+        wait_ready(&s);
+        let (id, raw) = blob(1, 100);
+        let k = key("h", "p", &id);
+        s.put(&k, &id, &raw);
+        assert_eq!(s.read(&k, &id).as_deref(), Some(&raw[..]), "the object was not kept");
+        std::fs::remove_dir_all(&home).unwrap();
+        let (id2, raw2) = blob(2, 100);
+        s.put(&key("h", "p", &id2), &id2, &raw2);
+        assert!(!home.exists(), "keeping an object made the removed Veil home again");
+    }
+
     #[test]
     fn a_damaged_object_is_removed_and_never_read() {
         let dir = tempfile::tempdir().unwrap();

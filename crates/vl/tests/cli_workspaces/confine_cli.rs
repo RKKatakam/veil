@@ -204,6 +204,37 @@ fn the_veil_identity_keys_and_the_real_repository_are_not_visible() {
     }
 }
 
+/// The Veil daemon's store and socket (S6, `docs/HUB.md` §13.29) hold the
+/// objects of every thin clone of this user, and stay hidden from the
+/// command as the Veil home does, also when an allowed folder holds them
+/// (design §4.6: "the sandbox never sees the daemon's socket or its
+/// store"). Without `VEIL_HOME` (the default) they are outside the Veil
+/// home: `~/.cache/veil/daemon/`, the socket in its `run/` without
+/// `XDG_RUNTIME_DIR`.
+#[test]
+#[ignore = "BUG-1512: the daemon's store and socket are not hidden from vl ws exec when an allowed folder holds them"]
+fn the_daemons_store_and_socket_stay_hidden_when_an_allowed_folder_holds_them() {
+    const STORED: &str = "DAEMON-STORE-OBJECT-OF-ANOTHER-PROJECT-3c71e0b5";
+    let t = T::new();
+    // The default layout: the Veil home in XDG_CONFIG_HOME, no VEIL_HOME.
+    let config = t.env.dir("xdg-config");
+    let cp = Command::new("cp").arg("-a").arg(t.env.root.join("home-alice")).arg(config.join("veil")).status().unwrap();
+    assert!(cp.success());
+    let name = "cd".repeat(31);
+    write(&t.home, &format!(".cache/veil/daemon/store/objects/ab/{name}"), STORED);
+    write(&t.home, ".cache/veil/daemon/run/daemon.sock", "");
+    let script = format!("cat ~/.cache/veil/daemon/store/objects/ab/{name}; ls -A ~/.cache/veil/daemon/run; echo end");
+    let cache = t.home.join(".cache").display().to_string();
+    let mut c = t.cmd(&t.proj, &["ws", "exec", "agent", "--allow", &cache, "--", "sh", "-c", &script]);
+    c.env_remove("VEIL_HOME").env_remove("XDG_CACHE_HOME").env_remove("XDG_RUNTIME_DIR").env("XDG_CONFIG_HOME", &config);
+    let o = c.stdin(Stdio::null()).output().unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(out.trim_end().ends_with("end"), "{out}");
+    assert!(!out.contains(STORED), "the daemon's store is visible in the sandbox: {out}");
+    assert!(!out.contains("daemon.sock"), "the daemon's socket is visible in the sandbox: {out}");
+}
+
 #[test]
 fn credentials_inside_allowed_toolchains_stay_hidden() {
     let t = T::new();

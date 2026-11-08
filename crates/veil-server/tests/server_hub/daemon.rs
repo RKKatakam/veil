@@ -574,6 +574,129 @@ fn the_daemon_fails_closed_without_the_server() {
     eprintln!("daemon: fail-closed checked; serving again {back:?} after the server returned");
 }
 
+/// How many rows the server's state tables hold: a request that changes
+/// nothing on the server leaves every count as it was.
+fn state_counts(hub: &TestHub) -> Vec<(&'static str, i64)> {
+    ["audit_log", "access_epochs", "sessions", "devices", "projections", "snapshots", "branches"]
+        .into_iter()
+        .map(|t| {
+            let n: i64 = hub.rt.block_on(sqlx::query_scalar(&format!("SELECT count(*) FROM {t}")).fetch_one(&hub.hub().db)).unwrap();
+            (t, n)
+        })
+        .collect()
+}
+
+/// Guarantee 3 (the resend the daemon renews its confirmations with,
+/// §13.29): a signed request sent again with every object skipped returns
+/// no object and changes nothing on the server; once the device's access
+/// changes, the same recorded request is refused whatever its `skip`, as
+/// the device's own request under that grant is; and a recorded request
+/// cannot be widened (another want, another root) without its signature
+/// failing. What S5's window lets a recording do is only what the device
+/// asked for, while its access holds.
+#[test]
+fn a_resent_request_changes_nothing_and_holds_no_longer_than_the_access() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let server = hub.api();
+    let fin = Reader::new(&server, Path::new("/nonexistent"), &hub.authority(), Some(&p.fin), &p.name);
+    let (chain, id, raw) = server_walk(&server, Some(&p.fin), &p.name)
+        .into_iter()
+        .find(|(_, _, raw)| has_marker(&[(String::new(), raw.clone())], BILL_MARK))
+        .expect("fin reaches the invoice");
+    let g = Grant::verify(&fin.grant, &fin.key).unwrap();
+    let signed = |wants: &[(Vec<ObjectId>, ObjectId)], ts: i64| BatchRequest {
+        grant: fin.grant.clone(),
+        ts,
+        signature: Some(sign_request(fin.id.as_ref().unwrap(), &g, ts, &wants.iter().map(|w| w.1).collect::<Vec<_>>())),
+        wants: wants.iter().map(|(c, i)| ChainWant { chain: c.clone(), id: *i }).collect(),
+        skip: Vec::new(),
+    };
+    let send = |req: &BatchRequest| server.post(None, &format!("/v1/objects/{}:batch", p.name), &serde_json::to_vec(req).unwrap(), true);
+    let recorded = signed(&[(chain.clone(), id)], veil_core::now_millis());
+    let r = send(&recorded);
+    assert_eq!(r.status, 200, "the device's own request");
+    assert_eq!(r.frames(), vec![(id, raw.clone())]);
+    // Sent again with every object skipped: nothing, and no state changes.
+    let resent = BatchRequest { skip: vec![id], ..recorded.clone() };
+    let before = state_counts(&hub);
+    for _ in 0..20 {
+        let r = send(&resent);
+        assert_eq!(r.status, 200, "a resend within the window is accepted");
+        assert!(r.frames().is_empty(), "a resend with every object skipped returns an object");
+    }
+    assert_eq!(state_counts(&hub), before, "resends changed the server's state");
+    // Widened under the recorded signature: refused.
+    let admin_root = real_chains(&p.dir)[0].2;
+    for (what, wants) in [
+        ("another want", vec![(chain.clone(), id), (Vec::new(), fin.root())]),
+        ("another root", vec![(Vec::new(), admin_root)]),
+    ] {
+        let wider = BatchRequest { wants: wants.iter().map(|(c, i)| ChainWant { chain: c.clone(), id: *i }).collect(), ..recorded.clone() };
+        let r = send(&wider);
+        assert_eq!(r.status, 401, "{what}: a recorded signature over other wants");
+        assert!(!has_marker(&[(String::new(), r.body.clone())], BILL_MARK), "{what}");
+    }
+    // Access removed: the recording is refused whatever its skip, as is the
+    // device's own new request under the same grant.
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    for (what, req) in [("resent, all skipped", resent.clone()), ("resent whole", recorded.clone()), ("the device's own, now", signed(&[(chain.clone(), id)], veil_core::now_millis()))] {
+        let r = send(&req);
+        assert_eq!(r.status, 401, "{what}: after the access change");
+        assert!(!has_marker(&[(String::new(), r.body.clone())], BILL_MARK), "{what}");
+    }
+}
+
+/// Guarantee 4: `GET /v1/grant-key` answers anyone the server's public
+/// grant key and nothing else (the same key every tips answer carries, the
+/// same with a session), and a client cannot make the daemon trust another
+/// key: a grant signed by a key of its own, with that key named in the
+/// request, gets nothing from the store, and the daemon serves the real
+/// grant as before.
+#[test]
+fn the_grant_key_route_says_only_the_public_key_and_the_daemon_trusts_no_other() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let server = hub.api();
+    let r = server.get(None, "/v1/grant-key");
+    assert_eq!(r.status, 200, "the route answers anyone");
+    let v = r.json();
+    assert_eq!(v.as_object().map(|o| o.len()), Some(1), "only the key: {v}");
+    let key = v["grant_key"].as_str().expect("the key").to_string();
+    assert_eq!(key, hub.hub().grants.key_hex(), "the grant key's public half");
+    assert!(key.len() == 64 && hex::decode(&key).is_ok(), "{key}");
+    assert_eq!(server.tips(None, &p.name).unwrap().grant_key.as_deref(), Some(key.as_str()));
+    assert_eq!(server.tips(Some(&p.admin.token()), &p.name).unwrap().grant_key.as_deref(), Some(key.as_str()));
+    assert_eq!(server.get(Some(&p.admin.token()), "/v1/grant-key").json(), v, "a session adds nothing");
+    // A grant of another key, for the admin's root, signed by dev's device.
+    let d = Daemon::start(&p.admin, None);
+    let admin = Reader::new(&server, &d.socket, &hub.authority(), Some(&p.admin), &p.name);
+    warm(&d, &admin, &[], &admin.root());
+    let dev = Reader::new(&server, &d.socket, &hub.authority(), Some(&p.dev), &p.name);
+    warm(&d, &dev, &[], &dev.root());
+    let own = veil_core::identity::SeedSigner::from_seed(&veil_core::crypto::random_bytes::<32>());
+    let body = veil_core::hub::grant::GrantBody { root: admin.root(), ..Grant::read_unverified(&dev.grant).unwrap() };
+    let forged = Grant::issue(&own, &body);
+    let fg = Grant::verify(&forged, &own.verifying_hex()).unwrap();
+    let ts = veil_core::now_millis();
+    let req = serde_json::json!({
+        "op": "batch", "upstream": hub.authority(), "project": p.name,
+        "batch": {
+            "grant": forged, "ts": ts, "grant_key": own.verifying_hex(),
+            "signature": sign_request(dev.id.as_ref().unwrap(), &fg, ts, &[admin.root()]),
+            "wants": [{"chain": [], "id": admin.root().hex()}],
+        },
+    });
+    let (got, end) = ask(&d.socket, &req);
+    assert!(got.is_empty(), "a grant of the client's own key was served");
+    let end = end.expect("a whole answer");
+    assert!(end.get("from_store").is_none(), "{end}");
+    assert_eq!(end["status"], 401, "the server's refusal is passed on: {end}");
+    let (got, end) = dev.batch_as(&dev.grant, dev.id.as_ref(), &[(Vec::new(), dev.root())]);
+    assert_eq!(got.len(), 1, "the real grant is still served");
+    assert_eq!(end.expect("a whole answer")["from_store"], 1);
+}
+
 // ---- 3. the same answers with and without the daemon --------------------------------
 
 /// A working copy's files (not `.veil/`), by path relative to it.
@@ -874,6 +997,46 @@ fn vl_works_without_the_daemon() {
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         fake.join().unwrap();
     }
+}
+
+/// Guarantee 5, a daemon that stalls (§13.29: "a daemon that lies, stalls
+/// or is gone changes no answer"): one that takes each connection and never
+/// answers (a daemon wedged, stopped, or its disk hung) costs a `vl` at
+/// most one wait, not one wait for every request it would have sent there.
+#[test]
+#[ignore = "BUG-1514: a stalled daemon costs vl 60 s for every request, so a clone takes minutes"]
+fn a_stalled_daemon_costs_a_vl_at_most_one_wait() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let who = &p.dev;
+    let d = Daemon::start(who, None);
+    who.ok(who.home.path(), &["daemon", "stop"]);
+    std::fs::remove_file(d.dir.join("off")).unwrap();
+    let _ = std::fs::remove_file(&d.socket);
+    let l = std::os::unix::net::UnixListener::bind(&d.socket).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let stalled = std::thread::spawn(move || {
+        l.set_nonblocking(true).unwrap();
+        let mut held = Vec::new();
+        while !stop2.load(std::sync::atomic::Ordering::SeqCst) {
+            match l.accept() {
+                Ok((s, _)) => held.push(s),
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        held.len()
+    });
+    let c = who.dir("stalled");
+    let t = Instant::now();
+    who.ok(who.home.path(), &["clone", &hub.url(&p.name), c.to_str().unwrap()]);
+    let took = t.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let asked = stalled.join().unwrap();
+    assert_eq!(std::fs::read_to_string(c.join("src/lib.rs")).unwrap(), PUBLIC_MARK);
+    assert!(asked > 0, "the clone never asked the daemon");
+    eprintln!("a clone with a stalled daemon: {took:?}, {asked} connection(s)");
+    assert!(took < Duration::from_secs(75), "a clone with a stalled daemon took {took:?} ({asked} connections)");
 }
 
 // ---- 6. its user's alone ------------------------------------------------------------
