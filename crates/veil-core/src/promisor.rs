@@ -257,6 +257,12 @@ pub(crate) struct Partial {
     in_flight: AtomicU64,
     /// Snapshots the server has no page of history for (no further asks).
     refused: Mutex<HashSet<ObjectId>>,
+    /// The id the server's history gives each snapshot asked for: its
+    /// projection in the person's current view (BUG-1509).
+    projections: Mutex<HashMap<ObjectId, ObjectId>>,
+    /// The server named a snapshot of this clone under another id: the
+    /// person's view changed since the clone met it (BUG-1509).
+    view_changed: std::sync::atomic::AtomicBool,
     /// Parents of the held snapshots this process decoded that the main
     /// store did not hold then: history *below* what the clone holds, which
     /// a page may always bring (BUG-1319). Any other snapshot read is a
@@ -318,6 +324,8 @@ impl ObjectStore {
             fetched: AtomicU64::new(0),
             in_flight: AtomicU64::new(0),
             refused: Mutex::new(HashSet::new()),
+            projections: Mutex::new(HashMap::new()),
+            view_changed: std::sync::atomic::AtomicBool::new(false),
             below: Mutex::new(HashSet::new()),
         }));
     }
@@ -624,20 +632,88 @@ impl ObjectStore {
     /// answers for a snapshot it knows; nothing for a commit only this clone
     /// holds. One request a snapshot, remembered for the process.
     fn server_knows(&self, p: &Partial, promisor: &dyn Promisor, s: &ObjectId) -> bool {
-        if p.refused.lock().unwrap_or_else(|e| e.into_inner()).contains(s) {
-            return false;
-        }
-        match promisor.history(&[*s], 1) {
-            Ok(page) if !page.is_empty() => {
+        match self.projection_in(p, promisor, s) {
+            Ok(Some(_)) => {
                 p.server.lock().unwrap_or_else(|e| e.into_inner()).insert(*s);
                 true
             }
-            Ok(_) => {
-                p.refused.lock().unwrap_or_else(|e| e.into_inner()).insert(*s);
-                false
-            }
             // Not reached: not known, and the read that asked says so.
-            Err(_) => false,
+            _ => false,
+        }
+    }
+
+    /// The id of snapshot `s` in its person's current view, as the server's
+    /// history gives it (the server resolves a snapshot of an older view
+    /// through the real one and projects that for the view the person has
+    /// now): `s` itself when the view is the one the clone met it in,
+    /// another id when the person's access changed since (BUG-1509), `None`
+    /// for a snapshot the server does not know (a commit only this clone
+    /// holds). The projection is kept (it is the person's to read). One
+    /// request a snapshot, remembered for the process. `None` in a full
+    /// clone.
+    pub fn current_projection(&self, s: &ObjectId) -> Result<Option<ObjectId>> {
+        let Some(p) = self.partial.get() else { return Ok(None) };
+        let Some(promisor) = self.promisor() else {
+            return Err(VeilError::Unavailable("this thin clone has no connection to its server".into()));
+        };
+        self.projection_in(p, &*promisor, s)
+    }
+
+    fn projection_in(&self, p: &Partial, promisor: &dyn Promisor, s: &ObjectId) -> Result<Option<ObjectId>> {
+        if let Some(n) = p.projections.lock().unwrap_or_else(|e| e.into_inner()).get(s) {
+            return Ok(Some(*n));
+        }
+        if p.refused.lock().unwrap_or_else(|e| e.into_inner()).contains(s) {
+            return Ok(None);
+        }
+        let Some((id, raw)) = promisor.history(&[*s], 1)?.into_iter().next() else {
+            p.refused.lock().unwrap_or_else(|e| e.into_inner()).insert(*s);
+            return Ok(None);
+        };
+        if ObjectId::hash(&raw) != id || !matches!(Object::decode(&raw)?, Object::Snapshot(_)) {
+            return Err(VeilError::Corrupt(id.hex(), "the server sent history that does not match its ids".into()));
+        }
+        if !self.has(&id) {
+            self.put_raw(&id, &raw)?;
+        }
+        self.note_projection(*s, id);
+        Ok(Some(id))
+    }
+
+    /// The server gave snapshot `asked` as `got` (a page of its history):
+    /// another id is a view change (BUG-1509).
+    pub(crate) fn note_projection(&self, asked: ObjectId, got: ObjectId) {
+        let Some(p) = self.partial.get() else { return };
+        p.projections.lock().unwrap_or_else(|e| e.into_inner()).insert(asked, got);
+        if asked != got {
+            p.view_changed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Did the server name a snapshot of this clone under another id in
+    /// this process: has its person's view changed since (BUG-1509)?
+    pub fn view_changed(&self) -> bool {
+        self.partial.get().is_some_and(|p| p.view_changed.load(Ordering::SeqCst))
+    }
+
+    /// Is `s` on the server (not a commit only this clone holds)? Always
+    /// `false` in a full clone.
+    pub fn is_servers(&self, s: &ObjectId) -> bool {
+        let Some(p) = self.partial.get() else { return false };
+        let Some(promisor) = self.promisor() else { return false };
+        self.on_server(p, &*promisor, s)
+    }
+
+    /// The server refused something met under `snapshot`: in a clone whose
+    /// ids are its person's, only a view change does that, so its
+    /// projection is asked for (BUG-1509). Best effort.
+    fn refusal_under(&self, p: &Partial, promisor: &dyn Promisor, snapshot: &ObjectId) {
+        let at = match self.on_server(p, promisor, snapshot) {
+            true => Some(*snapshot),
+            false => self.server_ancestors(p, promisor, snapshot).first().copied(),
+        };
+        if let Some(s) = at {
+            let _ = self.projection_in(p, promisor, &s);
         }
     }
 
@@ -767,6 +843,7 @@ impl ObjectStore {
             if refused_there || self.on_server(p, &*promisor, &snapshot) {
                 // The server's own answer: nothing there that this person
                 // may see.
+                self.refusal_under(p, &*promisor, &snapshot);
                 return Err(VeilError::Missing(*id));
             }
             return Err(VeilError::Unavailable(format!(
@@ -997,6 +1074,9 @@ impl ObjectStore {
                 }
                 refused |= self.names_held(&t, path, id);
             }
+        }
+        if refused {
+            self.refusal_under(p, promisor, &snapshot);
         }
         Ok((got, refused))
     }

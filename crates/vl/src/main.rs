@@ -253,7 +253,28 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let mut ctx = open(&cli)?;
             refuse_bare(&ctx, runs_in_a_bare_repository(&cli.cmd))?;
             let before = hooks::checkout_point(&ctx);
-            let code = dispatch(&mut ctx, &cli)?;
+            // BUG-1509: a push of work that stands on an older view moves
+            // the clone to the current one first; any other command whose
+            // reads showed the view changed moves it after, once, and runs
+            // again if it failed for that.
+            if matches!(cli.cmd, Cmd::Push { .. }) {
+                hub_cmd::move_before_push(&mut ctx)?;
+            }
+            let code = match dispatch(&mut ctx, &cli) {
+                Ok(code) => {
+                    hub_cmd::move_if_view_changed(&mut ctx, &cli.cmd)?;
+                    code
+                }
+                Err(e) => {
+                    if !hub_cmd::move_if_view_changed(&mut ctx, &cli.cmd)? {
+                        return Err(e);
+                    }
+                    ctx.finish()?;
+                    drop(ctx);
+                    ctx = open(&cli)?;
+                    dispatch(&mut ctx, &cli)?
+                }
+            };
             ctx.finish()?;
             hooks::post_checkout(&ctx, &cli.cmd, before);
             if !matches!(cli.cmd, Cmd::Gc { .. }) {

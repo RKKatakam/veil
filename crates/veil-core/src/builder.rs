@@ -1004,6 +1004,17 @@ impl<'a> Builder<'a> {
             });
             let parent_tree = f.parent.as_ref().map(|(t, _)| t.clone());
             let parent_entry = parent_tree.as_deref().and_then(|t| t.get(name));
+            // A folder its person lost access to (BUG-1509): the current
+            // view does not name it, and what the working copy holds there
+            // is theirs: listed, never recorded, never touched.
+            if parent_entry.is_none() && self.opts.materialised.is_some_and(|m| m.lost(&path)) {
+                let files = match kind {
+                    NodeKind::Dir => crate::vfs::walk_files(self.fs, &path, &|_| false)?,
+                    _ => vec![path.clone()],
+                };
+                self.report.not_recorded.extend(files);
+                continue;
+            }
             match kind {
                 NodeKind::Dir => {
                     let class = self.opts.policy.classify(&path, true);

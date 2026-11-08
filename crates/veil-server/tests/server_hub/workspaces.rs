@@ -1200,6 +1200,9 @@ fn bug_1508_readers_show_a_refused_folder_as_hidden_and_succeed() {
     const SAME: &str = "SAME-CONTENT-SHOW-1508-2d9a6f41\n";
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
+    // What each command does in the view that changed (BUG-1508): the
+    // clone stays in it (BUG-1509's move is tested below).
+    p.fin.stay_in_stale_views();
     feature_with(&p, &[("src/shared/same.txt", SAME), (&format!("{BILL_DIR}/acme/same.txt"), SAME)], &[], "same content twice");
     let thin = plain_thin(&p, &hub, "thin");
     for r in ["feature", "feature-"] {
@@ -1238,7 +1241,6 @@ fn bug_1508_readers_show_a_refused_folder_as_hidden_and_succeed() {
 /// and the command fails with "not present", where a clone made after the
 /// removal shows the readable files (`vl pull` brings the new view).
 #[test]
-#[ignore = "BUG-1509: a thin clone made before its person's access changed fails on the history and trees it never fetched"]
 fn bug_1509_a_stale_view_fails_on_what_it_never_fetched() {
     const SAME: &str = "SAME-CONTENT-ROOT-1509-5b1e7c02\n";
     let hub = TestHub::start();
@@ -1249,7 +1251,14 @@ fn bug_1509_a_stale_view_fails_on_what_it_never_fetched() {
     let show = p.fin.ok(&thin, &["show", "feature"]);
     let hunk = show.split("diff --veil").find(|h| h.contains("b/src/shared/same.txt")).unwrap_or_default();
     assert!(hunk.contains(SAME.trim()), "vl show: {show}");
+    // Decided: the clone moved to the current view by itself, once, in one
+    // line; nothing of the folder fin lost is shown.
+    assert_eq!(show.matches(MOVED).count(), 1, "{show}");
+    assert!(!show.contains(&format!("{BILL_DIR}/acme")), "{show}");
 }
+
+/// The line `vl` prints when it moves a clone to its person's current view.
+const MOVED: &str = "your access changed; moved ";
 
 /// A thin clone of fin's with no workspace.
 fn plain_thin(p: &Project, hub: &TestHub, name: &str) -> PathBuf {
@@ -1315,6 +1324,9 @@ fn state(p: &Project, clone: &Path) -> (String, String, BTreeMap<String, Vec<u8>
 fn bug_1508_a_merge_and_a_rebase_keep_a_refused_folder_one_side_changed_by_id() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
+    // What each command does in the view that changed (BUG-1508): the
+    // clone stays in it (BUG-1509's move is tested below).
+    p.fin.stay_in_stale_views();
     let (m, r) = (fin_change_across_a_refused_folder(&p, &hub, "merge", false), fin_change_across_a_refused_folder(&p, &hub, "rebase", false));
     p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
     let theirs = entry_in(&m, "feature", BILL_DIR);
@@ -1346,6 +1358,9 @@ fn bug_1508_a_merge_and_a_rebase_keep_a_refused_folder_one_side_changed_by_id() 
 fn bug_1508_a_merge_and_a_rebase_refuse_a_refused_folder_both_sides_changed() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
+    // What each command does in the view that changed (BUG-1508): the
+    // clone stays in it (BUG-1509's move is tested below).
+    p.fin.stay_in_stale_views();
     let d = fin_change_across_a_refused_folder(&p, &hub, "both", true);
     p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
     let before = state(&p, &d);
@@ -1440,6 +1455,9 @@ fn fin_chain(p: &Project, hub: &TestHub, name: &str) -> PathBuf {
 fn s8h_review_writers_keep_a_refused_folder_by_id() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
+    // What each command does in the view that changed (BUG-1508): the
+    // clone stays in it (BUG-1509's move is tested below).
+    p.fin.stay_in_stale_views();
     p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name, "--confirm", &p.fin.fingerprint()]);
     let d = fin_chain(&p, &hub, "chain");
     p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
@@ -1485,6 +1503,9 @@ fn s8h_review_writers_keep_a_refused_folder_by_id() {
 fn s8h_review_a_left_out_folder_keeps_the_persons_files_and_comes_back_whole() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
+    // What each command does in the view that changed (BUG-1508): the
+    // clone stays in it (BUG-1509's move is tested below).
+    p.fin.stay_in_stale_views();
     let d = left_out_by_a_checkout(&p, &hub, "wc");
     let pem = format!("{BILL_DIR}/acme/deploy.pem");
     let scratch = format!("{BILL_DIR}/acme/invoice.txt~");
@@ -1523,6 +1544,9 @@ fn s8h_review_a_left_out_folder_keeps_the_persons_files_and_comes_back_whole() {
 fn s8h_review_readers_reveal_nothing_inside_a_refused_folder() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
+    // What each command does in the view that changed (BUG-1508): the
+    // clone stays in it (BUG-1509's move is tested below).
+    p.fin.stay_in_stale_views();
     let d = left_out_by_a_checkout(&p, &hub, "wc");
     p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
     p.fin.ok(&d, &["new", "feature"]);
@@ -1567,6 +1591,9 @@ fn s8h_review_readers_reveal_nothing_inside_a_refused_folder() {
 fn bug_1528_a_file_made_in_a_left_out_folder_is_not_recorded_silently() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
+    // What each command does in the view that changed (BUG-1508): the
+    // clone stays in it (BUG-1509's move is tested below).
+    p.fin.stay_in_stale_views();
     let d = left_out_by_a_checkout(&p, &hub, "wc");
     write_files(&d, &[(&format!("{BILL_DIR}/acme/deploy.pem"), "MINE-PEM\n")]);
     p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
@@ -1599,6 +1626,9 @@ fn bug_1528_a_file_made_in_a_left_out_folder_is_not_recorded_silently() {
 fn bug_1529_restore_split_squash_refuse_a_refused_folder_not_asked_for() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
+    // What each command does in the view that changed (BUG-1508): the
+    // clone stays in it (BUG-1509's move is tested below).
+    p.fin.stay_in_stale_views();
     let d = left_out_by_a_checkout(&p, &hub, "wc");
     p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
     p.fin.ok(&d, &["new", "feature"]);
@@ -1642,6 +1672,9 @@ fn bug_1529_restore_split_squash_refuse_a_refused_folder_not_asked_for() {
 fn bug_1530_a_pull_wedges_a_working_copy_carrying_a_refused_folder() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
+    // What each command does in the view that changed (BUG-1508): the
+    // clone stays in it (BUG-1509's move is tested below).
+    p.fin.stay_in_stale_views();
     let d = left_out_by_a_checkout(&p, &hub, "wc");
     p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
     let out = p.fin.ok(&d, &["new", "feature"]);
@@ -1662,7 +1695,6 @@ fn bug_1530_a_pull_wedges_a_working_copy_carrying_a_refused_folder() {
 /// admin's checkout of it holds every billing file of `feature`, byte for
 /// byte.
 #[test]
-#[ignore = "BUG-1509: a change on a stale view that carries a refused folder by id is refused by the push (forbidden)"]
 fn bug_1509_a_change_carrying_a_refused_folder_by_id_cannot_be_pushed() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
@@ -1671,8 +1703,14 @@ fn bug_1509_a_change_carrying_a_refused_folder_by_id_cannot_be_pushed() {
     p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
     let out = p.fin.ok(&d, &["rebase", "-s", "mine", "-d", "feature"]);
     assert!(out.contains("Rebased"), "{out}");
-    assert_eq!(entry_in(&d, "kid", BILL_DIR), entry_in(&d, "feature", BILL_DIR));
-    p.fin.ok(&d, &["push", "-t", "kid"]);
+    // Decided: the rebase met the folder fin lost, and the clone moved to
+    // fin's current view, where the folder is not named at all: `kid`
+    // leaves it as `feature` has it there (the server grafts it back).
+    assert_eq!(out.matches(MOVED).count(), 1, "{out}");
+    assert_eq!(entry_at(&d, "kid", BILL_DIR), None, "kid is in the current view");
+    assert_eq!(entry_at(&d, "feature", BILL_DIR), None, "feature too");
+    let out = p.fin.ok(&d, &["push", "-t", "kid"]);
+    assert!(out.contains("pushed"), "{out}");
     p.admin.ok(&p.dir, &["pull"]);
     p.admin.ok(&p.dir, &["new", "feature"]);
     let want = below(&walk(&p.dir), BILL_DIR);
@@ -1691,6 +1729,9 @@ fn bug_1531_an_edit_kept_through_a_left_out_folder_is_a_conflict_when_access_com
     const MINE: &str = "KEY=MARKER-FINS-OWN-EDIT-3c9a\n";
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
+    // What each command does in the view that changed (BUG-1508): the
+    // clone stays in it (BUG-1509's move is tested below).
+    p.fin.stay_in_stale_views();
     let d = plain_thin(&p, &hub, "wc");
     p.fin.ok(&d, &["new", "feature"]);
     feature_with(&p, &[(&format!("{BILL_DIR}/.env"), "KEY=MARKER-NEW-ENV-a14d\n")], &[], "rotate billing");
@@ -1722,6 +1763,9 @@ fn bug_1531_a_secret_left_on_disk_stays_stale_when_access_comes_back() {
     const NEW_ENV: &str = "KEY=MARKER-NEW-ENV-71c0d2e9\n";
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
+    // What each command does in the view that changed (BUG-1508): the
+    // clone stays in it (BUG-1509's move is tested below).
+    p.fin.stay_in_stale_views();
     let d = plain_thin(&p, &hub, "wc");
     p.fin.ok(&d, &["new", "feature"]);
     feature_with(&p, &[(&format!("{BILL_DIR}/.env"), NEW_ENV), (&format!("{BILL_DIR}/acme/invoice.txt"), "MARKER-NEW-INVOICE-0b8e\n")], &[], "rotate billing");
@@ -1734,4 +1778,256 @@ fn bug_1531_a_secret_left_on_disk_stays_stale_when_access_comes_back() {
     let st = p.fin.ok(&d, &["status"]);
     assert_eq!(std::fs::read_to_string(d.join(format!("{BILL_DIR}/acme/invoice.txt"))).unwrap(), "MARKER-NEW-INVOICE-0b8e\n", "{st}");
     assert_eq!(std::fs::read_to_string(d.join(format!("{BILL_DIR}/.env"))).unwrap(), NEW_ENV, "the folder written whole again: {st}");
+}
+
+// ---- BUG-1509: a clone moves to its person's current view (`s8j`) -----------
+
+/// The entry at `path` in the tree of what `rev` names in `clone`, if any.
+fn entry_at(clone: &Path, rev: &str, path: &str) -> Option<veil_core::TreeEntry> {
+    let tree = tree_of(clone, rev);
+    veil_core::tree::lookup(&open_store(clone), &tree, &veil_core::VPath::new(path).unwrap()).unwrap()
+}
+
+/// What a clone's view refers to: tags, workspaces, heads and remote tags.
+type ViewState = (BTreeMap<String, veil_core::ObjectId>, BTreeMap<String, veil_core::ObjectId>, Vec<veil_core::ObjectId>, BTreeMap<String, veil_core::ObjectId>);
+
+fn view_state(clone: &Path) -> ViewState {
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(clone)), None, "test").unwrap();
+    let v = repo.view();
+    (
+        v.tags.iter().map(|(n, t)| (n.clone(), t.target)).collect(),
+        v.workspaces.iter().map(|(n, w)| (n.clone(), w.wc)).collect(),
+        v.heads.iter().copied().collect(),
+        v.remote_tags.clone(),
+    )
+}
+
+/// The parents of what `rev` names in `clone`.
+fn parents_of(clone: &Path, rev: &str) -> Vec<veil_core::ObjectId> {
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(clone)), None, "test").unwrap();
+    repo.snapshot(&repo.view().tags[rev].target).unwrap().parents.clone()
+}
+
+/// Guarantee: the whole move is one operation, and `vl undo` returns the
+/// clone exactly to before it (every tag, workspace, head and remote tag,
+/// and every file of the working copy).
+#[test]
+fn bug_1509_undo_returns_a_moved_clone_exactly_to_before() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let d = fin_chain(&p, &hub, "chain");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let (before, files) = (view_state(&d), walk(&d));
+    let ops_before = p.fin.ok(&d, &["--no-snapshot", "op", "log", "-n", "100"]).lines().count();
+    let out = p.fin.ok(&d, &["show", "feature"]);
+    assert_eq!(out.matches(MOVED).count(), 1, "{out}");
+    let moved = view_state(&d);
+    assert_ne!(moved.0["mine"], before.0["mine"], "mine moved");
+    assert_ne!(moved.0["kid"], before.0["kid"], "kid moved");
+    let ops = p.fin.ok(&d, &["--no-snapshot", "op", "log", "-n", "100"]).lines().count();
+    assert!(ops > ops_before, "the move is an operation");
+    let out = p.fin.ok(&d, &["undo"]);
+    assert!(!out.contains(MOVED), "undo does not move again: {out}");
+    assert_eq!(view_state(&d), before, "undo returns every reference");
+    assert_eq!(walk(&d), files, "and every file");
+}
+
+/// Guarantee: a change that edited inside a folder its person can no
+/// longer see is refused by name and stays exactly where it is (with what
+/// is built on it); other changes move.
+#[test]
+fn bug_1509_a_change_inside_a_lost_folder_is_refused_and_kept() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let d = plain_thin(&p, &hub, "wc");
+    write_files(&d, &[("src/fine.txt", "a fine change\n")]);
+    p.fin.ok(&d, &["commit", "--no-advance", "-m", "a fine change"]);
+    p.fin.ok(&d, &["tag", "set", "fine", "-r", "@-"]);
+    p.fin.ok(&d, &["new", "main"]);
+    write_files(&d, &[(&format!("{BILL_DIR}/acme/fin.txt"), "fin's billing edit\n")]);
+    p.fin.ok(&d, &["commit", "--no-advance", "-m", "billing edit"]);
+    p.fin.ok(&d, &["tag", "set", "billing", "-r", "@-"]);
+    write_files(&d, &[("src/above.txt", "built on it\n")]);
+    p.fin.ok(&d, &["commit", "--no-advance", "-m", "built on the billing edit"]);
+    p.fin.ok(&d, &["tag", "set", "above", "-r", "@-"]);
+    p.fin.ok(&d, &["new", "main"]);
+    p.fin.ok(&d, &["cat", "-r", "feature", "src/lib.rs"]);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let before = view_state(&d);
+    let out = p.fin.ok(&d, &["pull"]);
+    assert_eq!(out.matches(MOVED).count(), 1, "{out}");
+    assert!(out.contains("kept where it is") && out.contains("billing edit") && out.contains(&format!("{BILL_DIR}/")), "refused by name: {out}");
+    let after = view_state(&d);
+    assert_eq!(after.0["billing"], before.0["billing"], "the change inside the lost folder is never rewritten");
+    assert_eq!(after.0["above"], before.0["above"], "nor what is built on it");
+    assert!(entry_at(&d, "billing", &format!("{BILL_DIR}/acme/fin.txt")).is_some(), "never dropped");
+    assert_ne!(after.0["fine"], before.0["fine"], "the other change moved");
+    assert_eq!(entry_at(&d, "fine", BILL_DIR), None, "into the current view");
+    assert_eq!(entry_at(&d, "fine", "src/fine.txt").map(|e| e.size), Some("a fine change\n".len() as u64));
+}
+
+/// Guarantee: tags, workspaces and the checkout record follow the move; the
+/// person's own file in the lost folder is never touched, never recorded,
+/// and said so; a commit afterwards is in the current view.
+#[test]
+fn bug_1509_tags_workspaces_and_the_checkout_record_follow() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let d = plain_thin(&p, &hub, "wc");
+    p.fin.ok(&d, &["new", "feature"]);
+    write_files(&d, &[("src/work.txt", "work\n")]);
+    p.fin.ok(&d, &["commit", "--no-advance", "-m", "work"]);
+    p.fin.ok(&d, &["tag", "set", "work", "-r", "@-"]);
+    p.fin.ok(&d, &["ws", "new", "agent", "-r", "work"]);
+    write_files(&d, &[(&format!("{BILL_DIR}/acme/mine.pem"), "MINE-PEM\n")]);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let before = view_state(&d);
+    let out = p.fin.ok(&d, &["pull"]);
+    assert_eq!(out.matches(MOVED).count(), 1, "{out}");
+    let after = view_state(&d);
+    assert_ne!(after.0["work"], before.0["work"], "the tag follows");
+    assert_eq!(parents_of(&d, "work"), vec![after.0["feature"]], "onto feature in the current view");
+    assert_ne!(after.0["feature"], before.0["feature"]);
+    for ws in ["default", "agent"] {
+        assert_ne!(after.1[ws], before.1[ws], "workspace {ws} follows");
+        let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&d)), None, "test").unwrap();
+        let tree = repo.snapshot(&after.1[ws]).unwrap().tree;
+        assert_eq!(veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new(BILL_DIR).unwrap()).unwrap(), None, "{ws} is in the current view");
+    }
+    let st = p.fin.ok(&d, &["status"]);
+    assert!(st.contains(&format!("{BILL_DIR}/acme/mine.pem")) && st.contains("not recorded"), "the checkout record follows: {st}");
+    assert_eq!(std::fs::read_to_string(d.join(format!("{BILL_DIR}/acme/mine.pem"))).unwrap(), "MINE-PEM\n");
+    write_files(&d, &[("src/after.txt", "after\n")]);
+    let c = p.fin.ok(&d, &["commit", "-m", "after the move"]);
+    assert!(c.contains("Committed") && !c.contains(MOVED), "{c}");
+    let (wc, parent) = wc_entries(&d, BILL_DIR);
+    assert_eq!((wc, parent), (None, None), "nothing of the lost folder recorded");
+}
+
+/// Guarantee: nothing below a folder the person lost appears anywhere after
+/// the move: not in the commands' output (text or JSON), the op log, the
+/// history, or the working copy.
+#[test]
+fn bug_1509_nothing_below_a_hidden_folder_appears_anywhere() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let d = fin_chain(&p, &hub, "chain");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let held = walk(&d);
+    let mut seen = p.fin.ok(&d, &["show", "feature", "--json"]);
+    assert_eq!(seen.matches(MOVED).count(), 1, "{seen}");
+    for args in [
+        vec!["log", "-n", "50", "--json"],
+        vec!["op", "log", "-n", "20", "--json"],
+        vec!["show", "kid", "--json"],
+        vec!["show", "feature"],
+        vec!["ls", "-r", "feature", "--json"],
+        vec!["diff", "--from", "main", "--to", "kid", "--json"],
+    ] {
+        seen.push_str(&p.fin.ok(&d, &args));
+    }
+    for below in ["acme", "invoice.txt", "q2.txt", BILL_MARK, FEATURE_BILL, ENV_MARK] {
+        assert!(!seen.contains(below), "{below} appeared: {seen}");
+    }
+    // `vl status` names what the person still holds on disk there (never
+    // recorded, BUG-1528), and nothing they never held.
+    let st = p.fin.ok(&d, &["status", "--json"]);
+    for never in ["q2.txt", FEATURE_BILL] {
+        assert!(!st.contains(never), "{never} appeared: {st}");
+    }
+    // Nothing is written there: what is left is what the person held
+    // before, byte for byte (a copy the checkout could not tell as its own).
+    for (path, bytes) in walk(&d) {
+        if path.starts_with(&format!("{BILL_DIR}/")) {
+            assert_eq!(held.get(&path), Some(&bytes), "{path} written in the working copy");
+        }
+    }
+}
+
+/// Guarantee: when access comes back after a move, the clone moves to the
+/// view that names the folder again and writes it whole: a file the
+/// working copy kept there from before is the checkout's own copy where it
+/// holds exactly that version (written over with the new one), and the
+/// person's edit where it does not (kept as it is, and a conflict in `vl
+/// status`), as BUG-1531 decided for a folder left out.
+#[test]
+fn bug_1509_access_back_after_a_move_writes_the_folder_whole_and_keeps_edits() {
+    const NEW_ENV: &str = "KEY=MARKER-NEW-ENV-5e72b0c1\n";
+    const MINE: &str = "KEY=MARKER-FINS-OWN-EDIT-9d04\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let (kept, edited) = (plain_thin(&p, &hub, "kept"), plain_thin(&p, &hub, "edited"));
+    for d in [&kept, &edited] {
+        p.fin.ok(d, &["new", "feature"]);
+    }
+    feature_with(&p, &[(&format!("{BILL_DIR}/.env"), NEW_ENV), (&format!("{BILL_DIR}/acme/invoice.txt"), "MARKER-NEW-INVOICE-77aa\n")], &[], "rotate billing");
+    for d in [&kept, &edited] {
+        p.fin.ok(d, &["pull"]);
+        p.fin.ok(d, &["cat", "-r", "feature", "src/lib.rs"]);
+    }
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    for d in [&kept, &edited] {
+        let out = p.fin.ok(d, &["new", "feature"]);
+        assert_eq!(out.matches(MOVED).count(), 1, "{out}");
+    }
+    let env = |d: &Path| d.join(format!("{BILL_DIR}/.env"));
+    std::fs::write(env(&edited), MINE).unwrap();
+    p.admin.ok(&p.dir, &["group", "add", "finance", &p.fin.name]);
+    for d in [&kept, &edited] {
+        let out = p.fin.ok(d, &["pull"]);
+        assert_eq!(out.matches(MOVED).count(), 1, "access back is a view change too: {out}");
+        assert_eq!(std::fs::read_to_string(d.join(format!("{BILL_DIR}/acme/invoice.txt"))).unwrap(), "MARKER-NEW-INVOICE-77aa\n", "the folder written whole");
+    }
+    assert_eq!(std::fs::read_to_string(env(&kept)).unwrap(), NEW_ENV, "the checkout's own copy written over");
+    assert_eq!(std::fs::read_to_string(env(&edited)).unwrap(), MINE, "the person's edit never touched");
+    let st = p.fin.ok(&edited, &["status"]);
+    let c = st.find("Unresolved conflicts:").expect("a conflict");
+    assert!(st[c..].contains(&format!("{BILL_DIR}/.env")) && st[c..].contains("the recorded version is newer"), "{st}");
+}
+
+
+/// BUG-1562: a **full** clone made before its person's access changed is
+/// not moved to their current view: it holds every object of the view it
+/// was made in, so nothing it reads is refused, and its pull and push do
+/// not ask (the move reads through a thin clone's server reads). A change
+/// on top of the old view is refused by the push.
+#[test]
+#[ignore = "BUG-1562: a full clone is not moved to its person's current view; its push is refused"]
+fn bug_1562_a_full_clone_is_not_moved_and_its_push_is_refused() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name, "--confirm", &p.fin.fingerprint()]);
+    let full = p.fin.dir("full");
+    p.fin.ok(p.fin.home.path(), &["clone", "--full", &hub.url(&p.name), full.to_str().unwrap()]);
+    p.fin.ok(&full, &["identity", "confirm", &p.fp]);
+    write_files(&full, &[("src/full.txt", "full\n")]);
+    p.fin.ok(&full, &["commit", "--no-advance", "-m", "full change"]);
+    p.fin.ok(&full, &["tag", "set", "fullc", "-r", "@-"]);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&full, &["pull"]);
+    assert_eq!(out.matches(MOVED).count(), 1, "{out}");
+    let out = p.fin.ok(&full, &["push", "-t", "fullc"]);
+    assert!(out.contains("pushed"), "{out}");
+}
+
+/// BUG-1563: a change the move kept in the old view (it edits a folder its
+/// person lost) is rewritten by an explicit `vl rebase` onto the current
+/// view, with a conflict at that folder, which no push accepts. Expected:
+/// refused by name, as the move refuses it, and left where it is.
+#[test]
+#[ignore = "BUG-1563: a rebase of a change kept in the old view rewrites it with a conflict at the lost folder"]
+fn bug_1563_a_rebase_of_a_kept_change_is_refused_by_name() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let k = plain_thin(&p, &hub, "kept");
+    write_files(&k, &[(&format!("{BILL_DIR}/acme/fin.txt"), "fin's billing edit\n")]);
+    p.fin.ok(&k, &["commit", "--no-advance", "-m", "billing edit"]);
+    p.fin.ok(&k, &["tag", "set", "billing", "-r", "@-"]);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&k, &["pull"]);
+    assert!(out.contains("kept where it is") && out.contains("billing edit"), "{out}");
+    let before = view_state(&k);
+    let out = p.fin.fails(&k, &["rebase", "-s", "billing", "-d", "main"]);
+    assert!(out.contains("no longer have access") && out.contains("billing edit"), "{out}");
+    assert_eq!(view_state(&k), before, "nothing changed");
 }

@@ -186,6 +186,11 @@ pub struct Person {
     pub name: String,
     pub home: tempfile::TempDir,
     ca: PathBuf,
+    /// This person's `vl` never moves a clone to their current view by
+    /// itself (`VEIL_TEST_NO_VIEW_MOVE`, debug builds): for the tests of
+    /// what each command does in a view that changed (BUG-1508), which the
+    /// move otherwise leaves after the first (BUG-1509).
+    stale: std::sync::atomic::AtomicBool,
 }
 
 pub fn vl_bin() -> PathBuf {
@@ -198,7 +203,13 @@ impl Person {
             name: name.to_string(),
             home: tempfile::Builder::new().prefix("veil-person").tempdir().unwrap(),
             ca: hub.ca.clone(),
+            stale: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// See [`Person::stale`].
+    pub fn stay_in_stale_views(&self) {
+        self.stale.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// `vl args` in `dir` as this person.
@@ -210,6 +221,9 @@ impl Person {
             .env("VEIL_USER", &self.name)
             .env("VEIL_HUB_CA", &self.ca)
             .env("NO_COLOR", "1");
+        if self.stale.load(std::sync::atomic::Ordering::SeqCst) {
+            c.env("VEIL_TEST_NO_VIEW_MOVE", "1");
+        }
         c
     }
 

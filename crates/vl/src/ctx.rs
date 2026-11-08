@@ -435,6 +435,17 @@ impl Ctx {
         &self.checkout.materialised
     }
 
+    /// The working copy's change moved to its person's current view, which
+    /// no longer names `paths` (BUG-1509): recorded before the working copy
+    /// follows, so what it holds there stays the person's, never recorded.
+    pub fn mark_lost(&mut self, paths: &[(VPath, Option<ObjectId>)]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.checkout.materialised.mark_lost(paths.iter().cloned());
+        save_checkout(&self.fs, &self.checkout)
+    }
+
     pub fn wc(&self) -> Result<ObjectId> {
         if self.bare {
             return Err(anyhow!("this is a bare repository (an old path remote): it has no working copy"));

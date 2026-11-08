@@ -428,6 +428,198 @@ impl<'r> Transaction<'r> {
         Ok(id)
     }
 
+    /// Move this clone to its person's current view (BUG-1509), in this
+    /// transaction: after an access change the server names every snapshot
+    /// above a folder the person lost under another id (its projection in
+    /// the view they have now), and serves the old ids no more. Each server
+    /// snapshot the view refers to (a tag, a head, a workspace, the base of
+    /// a change only this clone holds) is replaced by its current
+    /// projection; each change only this clone holds is rebased onto its
+    /// parents' projections (`Repo::rebase_tree`: what the new parent no
+    /// longer names is gone, and the server grafts it back on push).
+    /// Nothing below a folder the person lost is read or written: the
+    /// paths lost are found where the old and new parents differ, and a
+    /// change is only compared with its parent there. A change that edited
+    /// inside one stays exactly where it is, never rewritten, with every
+    /// change connected to it (they cannot move without it), and is named
+    /// in [`ViewMove::kept`]. Tags, workspaces and heads follow at commit.
+    pub fn move_to_view(&mut self) -> Result<ViewMove> {
+        let store = self.repo.store.clone();
+        let root = self.repo.root_id;
+        let mut out = ViewMove::default();
+        if !store.is_partial() {
+            return Ok(out);
+        }
+        // What the view refers to, and the changes only this clone holds.
+        let mut refs: Vec<ObjectId> = self.view.tags.values().filter(|t| t.annotation.is_none()).map(|t| t.target).collect();
+        refs.extend(self.view.workspaces.values().map(|w| w.wc));
+        refs.extend(self.view.heads.iter().copied());
+        refs.sort();
+        refs.dedup();
+        let mut local: HashMap<ObjectId, std::sync::Arc<Snapshot>> = HashMap::new();
+        let mut servers: BTreeSet<ObjectId> = BTreeSet::new();
+        let mut order: Vec<ObjectId> = Vec::new();
+        // Parents first (an explicit post-order: history depth is not
+        // trusted).
+        let mut stack: Vec<(ObjectId, bool)> = refs.iter().map(|r| (*r, false)).collect();
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        while let Some((id, done)) = stack.pop() {
+            if done {
+                order.push(id);
+                continue;
+            }
+            if !seen.insert(id) {
+                continue;
+            }
+            if id == root || store.is_servers(&id) {
+                servers.insert(id);
+                continue;
+            }
+            let snap = self.repo.snapshot(&id)?;
+            stack.push((id, true));
+            stack.extend(snap.parents.iter().map(|p| (*p, false)));
+            local.insert(id, snap);
+        }
+        // Each server snapshot's current projection.
+        let mut map: HashMap<ObjectId, ObjectId> = HashMap::new();
+        for s in &servers {
+            if *s == root {
+                continue;
+            }
+            if let Some(n) = store.current_projection(s)? {
+                if n != *s {
+                    map.insert(*s, n);
+                }
+            }
+        }
+        if map.is_empty() {
+            return Ok(out);
+        }
+        // The paths each base lost, then each change's (its parents').
+        let mut lost: HashMap<ObjectId, Option<Vec<VPath>>> = HashMap::new();
+        for (old, new) in &map {
+            if local.values().any(|c| c.parents.contains(old)) {
+                lost.insert(*old, lost_paths(&store, &self.repo.snapshot(old)?.tree, &self.repo.snapshot(new)?.tree)?);
+            }
+        }
+        let mut refused: HashMap<ObjectId, VPath> = HashMap::new();
+        for id in &order {
+            let c = &local[id];
+            let mut paths: Option<Vec<VPath>> = Some(Vec::new());
+            for p in &c.parents {
+                let from = match lost.get(p) {
+                    Some(l) => l.clone(),
+                    None => Some(Vec::new()),
+                };
+                match (paths.as_mut(), from) {
+                    (Some(all), Some(more)) => all.extend(more),
+                    _ => paths = None,
+                }
+            }
+            // Its own entry at each lost path, against its parents'.
+            let paths = match paths {
+                Some(p) => p,
+                None => {
+                    refused.insert(*id, VPath::root());
+                    lost.insert(*id, None);
+                    continue;
+                }
+            };
+            for r in &paths {
+                let mine = crate::tree::lookup(&store, &c.tree, r).ok();
+                let mut same = false;
+                for p in &c.parents {
+                    let theirs = crate::tree::lookup(&store, &self.repo.snapshot(p)?.tree, r).ok();
+                    same |= mine.is_some() && mine == theirs;
+                }
+                if !same && !refused.contains_key(id) {
+                    refused.insert(*id, r.clone());
+                }
+            }
+            lost.insert(*id, Some(paths));
+        }
+        // What cannot move: every change connected to a refused one.
+        let mut kept: HashSet<ObjectId> = HashSet::new();
+        if !refused.is_empty() {
+            let mut neighbours: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+            for (id, c) in &local {
+                for p in c.parents.iter().filter(|p| local.contains_key(p)) {
+                    neighbours.entry(*id).or_default().push(*p);
+                    neighbours.entry(*p).or_default().push(*id);
+                }
+            }
+            let mut todo: Vec<ObjectId> = refused.keys().copied().collect();
+            while let Some(x) = todo.pop() {
+                if kept.insert(x) {
+                    todo.extend(neighbours.get(&x).into_iter().flatten().copied());
+                }
+            }
+            let mut names: Vec<(ObjectId, VPath)> = refused.into_iter().collect();
+            names.sort();
+            for (id, folder) in names {
+                out.kept.push(KeptChange { id, folder });
+            }
+            out.kept_with = kept.len() - out.kept.len();
+        }
+        // Parents first, onto the projections of theirs.
+        let mut moved: HashMap<ObjectId, ObjectId> = HashMap::new();
+        for id in order.iter().filter(|id| !kept.contains(id)) {
+            let s = &local[id];
+            let parents: Vec<ObjectId> = s.parents.iter().map(|p| *map.get(p).or_else(|| moved.get(p)).unwrap_or(p)).collect();
+            if parents == s.parents {
+                continue;
+            }
+            let merged = self.repo.rebase_tree(&s.parents, &parents, s.tree)?;
+            let mut conflicts: BTreeSet<String> = s.conflicts.iter().cloned().collect();
+            conflicts.extend(merged.conflicts.iter().map(|c| c.to_string()));
+            let mut ns = (**s).clone();
+            ns.parents = parents;
+            ns.tree = merged.tree;
+            ns.predecessors = vec![*id];
+            ns.conflicts = conflicts.into_iter().collect();
+            let ns = self.indexed(ns)?;
+            let nid = store.put_snapshot(&self.sign(&ns))?;
+            self.rewritten.insert(*id, Rewrite::Replaced(nid));
+            self.view.heads.remove(id);
+            self.add_head(nid)?;
+            moved.insert(*id, nid);
+            if let Some(Some(paths)) = lost.get(id) {
+                // With the version the working copy held there, for when
+                // the folder comes back.
+                let held: Vec<(VPath, Option<ObjectId>)> = paths
+                    .iter()
+                    .map(|r| (r.clone(), crate::tree::lookup(&store, &s.tree, r).ok().flatten().filter(|e| e.kind == crate::object::EntryKind::Dir).map(|e| e.id)))
+                    .collect();
+                for (ws, st) in &self.view.workspaces {
+                    if st.wc == *id {
+                        out.lost.insert(ws.clone(), held.clone());
+                    }
+                }
+            }
+        }
+        out.moved = moved.len();
+        // The server's snapshots the view names: their projections.
+        for t in self.view.tags.values_mut().filter(|t| t.annotation.is_none()) {
+            if let Some(n) = map.get(&t.target) {
+                t.target = *n;
+                out.mapped += 1;
+            }
+        }
+        for w in self.view.workspaces.values_mut() {
+            if let Some(n) = map.get(&w.wc) {
+                w.wc = *n;
+                out.mapped += 1;
+            }
+        }
+        let heads: Vec<ObjectId> = self.view.heads.iter().copied().filter(|h| map.contains_key(h)).collect();
+        for h in heads {
+            self.view.heads.remove(&h);
+            self.add_head(map[&h])?;
+            out.mapped += 1;
+        }
+        Ok(out)
+    }
+
     pub fn abandon(&mut self, id: ObjectId) -> Result<()> {
         if id == self.repo.root_id {
             return Err(VeilError::repo("the root snapshot cannot be abandoned"));
@@ -1384,4 +1576,55 @@ impl Drop for Transaction<'_> {
             }
         }
     }
+}
+
+/// What [`Transaction::move_to_view`] did (BUG-1509).
+#[derive(Clone, Debug, Default)]
+pub struct ViewMove {
+    /// References to server snapshots (tags, workspaces, heads) re-pointed
+    /// to their projections.
+    pub mapped: usize,
+    /// Changes only this clone holds, moved onto those.
+    pub moved: usize,
+    /// Changes that edited inside a folder the person can no longer see,
+    /// each with the folder (`/`: the clone could not tell): kept where
+    /// they are.
+    pub kept: Vec<KeptChange>,
+    /// Changes kept with them (connected to one: they cannot move alone).
+    pub kept_with: usize,
+    /// Per workspace whose working-copy change moved: the paths it lost,
+    /// each with the folder's tree as the working copy's change had it.
+    pub lost: BTreeMap<String, Vec<(VPath, Option<ObjectId>)>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct KeptChange {
+    pub id: ObjectId,
+    pub folder: VPath,
+}
+
+/// The paths tree `old` names and tree `new` (the same snapshot, projected
+/// for a view that reads less) no longer does: the topmost of each, never
+/// below (a folder the server refuses is not walked,
+/// `tree::diff_trees_hiding`). `None` when `old`'s root is refused (the
+/// clone cannot tell).
+fn lost_paths(store: &crate::store::ObjectStore, old: &ObjectId, new: &ObjectId) -> Result<Option<Vec<VPath>>> {
+    let (changes, hidden) = crate::tree::diff_trees_hiding(store, Some(old), Some(new))?;
+    if hidden.iter().any(|h| h.path.is_root()) {
+        return Ok(None);
+    }
+    let mut out: BTreeSet<VPath> = BTreeSet::new();
+    let gone = changes.iter().filter(|c| c.new.is_none()).map(|c| &c.path).chain(hidden.iter().filter(|h| h.new.is_none()).map(|h| &h.path));
+    for p in gone {
+        // The topmost ancestor the new tree no longer names.
+        let mut at = VPath::root();
+        for c in p.components() {
+            at = at.join(c);
+            if crate::tree::lookup(store, new, &at)?.is_none() {
+                break;
+            }
+        }
+        out.insert(at);
+    }
+    Ok(Some(out.into_iter().collect()))
 }
