@@ -17,6 +17,14 @@ use veil_core::{
 };
 use veil_server::{tls::TlsSource, Config, Running, Storage};
 
+/// The prefix of databases a test makes: the run's (`VEIL_TEST_DB_PREFIX`,
+/// set by `scripts/verify-server.sh`), or else this process's own,
+/// `r<pid>x`, so the script's clean-up of dead runs finds them even when a
+/// test is run by hand (leftovers had filled the shared YugabyteDB).
+pub fn test_db_prefix() -> String {
+    std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_else(|_| format!("r{}x", std::process::id()))
+}
+
 pub fn unique(prefix: &str) -> String {
     format!("{prefix}{}", hex::encode(veil_core::crypto::random_bytes::<4>()))
 }

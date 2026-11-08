@@ -665,7 +665,7 @@ fn bug_1081_the_epoch_feed_shows_anyone_a_project_with_nothing_public() {
 /// run's (`VEIL_TEST_DB_PREFIX`).
 fn fresh_database(rt: &tokio::runtime::Runtime) -> String {
     let admin = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
-    let name = format!("{}{}", std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_default(), unique("veil_epochs_"));
+    let name = format!("{}{}", crate::support::test_db_prefix(), unique("veil_epochs_"));
     rt.block_on(async {
         let db = veil_server::db::connect(&admin, 1).await.unwrap();
         sqlx::raw_sql(&format!("CREATE DATABASE {name}")).execute(&db).await.unwrap();
