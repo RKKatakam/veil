@@ -3257,3 +3257,403 @@ fn an_api_commit_on_a_shared_projection_is_made_on_what_its_author_saw() {
     let got = source(&hub, pid).snapshot(&ObjectId::from_hex(&real).unwrap()).unwrap().parents[0];
     assert_eq!(got, h, "the dev's API commit on H as they see it is made on {}", if got == d { "w2's tip D".to_string() } else { got.short() });
 }
+
+// ---- S17 redesign review, cycle 4 (BUG-1520..) --------------------------------
+
+/// Upload what `c` made and push `updates` (new branches); the push's reply,
+/// unchecked.
+fn push_new(c: &Craft<'_>, updates: &[(&str, ObjectId)]) -> Reply {
+    let up = c.api.upload(&c.token, &c.project, &c.objects);
+    assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+    let receipts = up.json()["receipts"].as_array().unwrap().clone();
+    let map: serde_json::Map<String, Value> = c.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+    let updates: Vec<Value> = updates.iter().map(|(b, id)| json!({"branch": b, "expected": null, "new": id.hex()})).collect();
+    c.api.post_json(Some(&c.token), &format!("/v1/projects/{}/push", c.project), &json!({"updates": updates, "receipts": map}))
+}
+
+/// The real snapshot `token`'s owner sees as `seen` (their only one).
+fn real_of_seen(hub: &TestHub, pid: i64, seen: ObjectId) -> ObjectId {
+    let h = hub.hub();
+    let real: String = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT real_id FROM projections WHERE project_id = $1 AND projected_id = $2 LIMIT 1").bind(pid).bind(seen.hex()).fetch_one(&h.db))
+        .unwrap();
+    ObjectId::from_hex(&real).unwrap()
+}
+
+/// BUG-1520: `sync::resolve_newest` orders several branch tips that share
+/// the caller's projection by generation, not by the branch they work on.
+/// fin's billing-only change D sits unlanded on `w2`, on main's tip H: the
+/// dev sees both branches as the same snapshot. The dev's API commit on
+/// main's tip as they see it (no `onto`, as an agent makes a change before
+/// moving a branch) is made on D, the newer; their push of it to main is
+/// then a fast-forward over D, and fin's unlanded billing work is on main,
+/// moved there by someone who cannot see it. A push of the same change
+/// (`push_with`'s tip candidates: the default branch first) is made on H.
+#[test]
+#[ignore = "BUG-1520: an API commit on a name two branch tips share is made on the newer tip (another branch's hidden work), not main's"]
+fn bug_1520_an_api_commit_on_main_as_seen_is_made_on_main_even_when_another_branch_s_tip_looks_the_same() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    let main_tip = c.tip;
+    c.file("src/h.rs", "h\n");
+    let h = crafted_on(&mut c, main_tip, veil_core::ChangeId::random(), "h", "");
+    let bill = format!("{BILL_DIR}/unlanded.txt");
+    c.file(&bill, "fin's unlanded work\n");
+    let d = crafted_on(&mut c, h, veil_core::ChangeId::random(), "d", "");
+    let r = push_new(&c, &[("w2", d)]);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    move_branch(&api, &p.admin.token(), &p.name, "main", Some(main_tip), Some(h), false);
+    let tips = api.tips(Some(&token), &p.name).unwrap().branches;
+    assert_eq!(tips["main"], tips["w2"], "the dev sees w2 as main");
+    wait_derived(&hub, pid, d);
+    let seen = tips["main"];
+    let mine = kept_change(&api, &token, &p.name, seen, json!([put("src/mine.rs", "the dev's\n")]));
+    // The dev moves main to their change (a fast-forward, as they see it).
+    move_branch(&api, &token, &p.name, "main", Some(seen), Some(mine), false);
+    let got = source(&hub, pid).snapshot(&real_of_seen(&hub, pid, mine)).unwrap().parents[0];
+    assert!(!on_branch_file(&hub, pid, "main", &bill), "fin's unlanded change on w2 is on main, moved there by the dev, who cannot see it");
+    assert_eq!(got, h, "the dev's change on main as they see it is made on {}", if got == d { "w2's tip D".to_string() } else { got.short() });
+}
+
+/// BUG-1521: `sync::resolve_newest` answers `warming` for ever once more
+/// than 4,096 real snapshots share the caller's projection (`NEWEST_BOUND`):
+/// a run of changes hidden from them above a snapshot they see. The dev's
+/// API commit, and their push, on a snapshot of main they read before a
+/// burst of billing-only landings (4,100 here, then one change they see)
+/// are answered 503 "try again" on every try, and succeed with 10 such
+/// changes: the answer depends on how much hidden history there is (the
+/// class of BUG-1409), and nothing the dev made on that snapshot is ever
+/// accepted until someone changes a folder they see on top of it.
+#[test]
+#[ignore = "BUG-1521: an API commit or a push on a snapshot more than 4,096 hidden changes share is answered warming for ever"]
+fn bug_1521_a_change_on_a_snapshot_many_hidden_changes_share_is_accepted_as_with_few() {
+    for n in [10usize, 4_100] {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        let api = hub.api();
+        let token = p.dev.token();
+        let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+        let mut parent = c.tip;
+        for i in 0..n {
+            c.file(&format!("{BILL_DIR}/run.txt"), &format!("{i}\n"));
+            parent = crafted_on(&mut c, parent, veil_core::ChangeId::random(), &format!("billing {i}"), "");
+        }
+        c.file("src/v.rs", "v\n");
+        let v = crafted_on(&mut c, parent, veil_core::ChangeId::random(), "v", "");
+        let r = push_new(&c, &[("billing-run", v)]);
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        // main moves on (so the snapshot below is no branch's tip).
+        push_chain(&api, &p.admin, &p.name, "main", "main", 1, Some("src/later"));
+        let seen_v = api.tips(Some(&token), &p.name).unwrap().branches["billing-run"];
+        let base = seen_parent(&api, &token, &p.name, seen_v);
+        let r = api.post_json(Some(&token), &format!("/v1/projects/{}/changes", p.name), &json!({"base": base.hex(), "edits": [put("src/old.rs", "the dev's\n")]}));
+        assert_eq!(r.status, 200, "{n} hidden changes: the dev's API commit on a snapshot they read: {}", String::from_utf8_lossy(&r.body));
+        let mut m = Craft::new(&api, &p.dev, &p.name, "main");
+        m.tip = base;
+        m.root = m.tree_of(base);
+        m.file("src/old2.rs", "the dev's\n");
+        let mine = crafted_on(&mut m, base, veil_core::ChangeId::random(), "mine", "");
+        let r = push_new(&m, &[("dev-old", mine)]);
+        assert_eq!(r.status, 200, "{n} hidden changes: the dev's push on a snapshot they read: {}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["results"][0]["ok"], true, "{n}: {}", String::from_utf8_lossy(&r.body));
+    }
+}
+
+/// BUG-1522: "already landed" is keyed on the submitted snapshot's id
+/// (`landed_from.source`), which a rebase changes. The dev lands P; after
+/// pulling, they rebase P (and Q on it) onto main's tip, which holds P's
+/// edits already: P2 is a revision of P (same change id, predecessor P)
+/// with no edits of its own. Landing Q2 lands P2 as well: a second snapshot
+/// of P's change on main (two snapshots with one change id on one branch,
+/// a divergent change for every client); had P's file been undone on main
+/// meanwhile, P2's edits (P's) would land again (BUG-1312's harm).
+#[test]
+#[ignore = "BUG-1522: a rebased revision of a change landed already lands again (a second snapshot of the change on main)"]
+fn bug_1522_a_rebased_revision_of_a_landed_change_is_not_landed_again() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let first = push_chain(&api, &p.dev, &p.name, "dev-work", "main", 1, Some("src/once"));
+    let v = land_held(&api, &token, &p.name, first, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    let start = real_tip(&hub, pid);
+    let cid = source(&hub, pid).snapshot(&start).unwrap().change_id;
+    // The dev's rebase of P and Q onto main as they now see it.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    let tip = c.tip;
+    let mut s = Snapshot {
+        parents: vec![tip],
+        change_id: cid,
+        tree: c.root,
+        description: Text::Plain("chain 0".into()),
+        author: "chain".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![first],
+        conflicts: vec![],
+        embargo: None,
+        signature: None,
+    };
+    s.sign(&c.identity);
+    let p2 = c.put(O::Snapshot(s));
+    c.file("src/twice/0.rs", "0\n");
+    let q2 = crafted_on(&mut c, p2, veil_core::ChangeId::random(), "q", "");
+    let r = push_new(&c, &[("rebased", q2)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let r = land_held(&api, &token, &p.name, q2, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+    assert_eq!(real_file(&hub, pid, "src/twice/0.rs").as_deref(), Some(&b"0\n"[..]));
+    let ids: Vec<_> = chain(&hub, pid, veil_server::sync::root_snapshot_id()).into_iter().map(|(_, s)| s.change_id).collect();
+    let twice = ids.iter().filter(|i| **i == cid).count();
+    assert_eq!(twice, 1, "P's change is on main {twice} times");
+    assert_eq!(r.json()["landed"].as_array().unwrap().len(), 1, "{body}");
+}
+
+/// BUG-1523 (and the guarantee it breaks): naming a real snapshot the
+/// caller cannot see (a change hidden from them, or one they see only in
+/// part) is answered exactly as naming a snapshot that does not exist, by
+/// every route that takes a name: an API commit's `base`, a landing's
+/// `base`, a push's parent and a landing of an uploaded snapshot on it
+/// (status and message, ids aside). The first two hold. A push's parent
+/// that `sync::resolve_named` does not resolve (`None`: "not theirs") is
+/// taken for one the pusher uploads (`push_with`, step 1): the server reads
+/// the hidden snapshot, and every one below it down to one the pusher sees
+/// whole (here to the project's first), as theirs, and answers "missing
+/// object 7717d0c0" (the real root tree of the first snapshot, an object
+/// the dev may not read) where a snapshot that does not exist is "snapshot
+/// … was not uploaded".
+#[test]
+#[ignore = "BUG-1523: a push on a real snapshot its pusher cannot see is read as their upload (answer: a hidden tree's id; a walk of history)"]
+fn bug_1523_a_snapshot_the_caller_cannot_see_is_named_as_one_that_does_not_exist() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let token = p.dev.token();
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    let main_tip = c.tip;
+    c.file(&format!("{BILL_DIR}/hidden.txt"), "fin's\n");
+    let hidden = crafted_on(&mut c, main_tip, veil_core::ChangeId::random(), "hidden", "");
+    c.file("src/part.rs", "part\n");
+    let part = crafted_on(&mut c, hidden, veil_core::ChangeId::random(), "part", "");
+    let r = push_new(&c, &[("w", part)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let seen = api.tips(Some(&token), &p.name).unwrap().branches["w"];
+    assert_ne!(seen, part, "the dev sees w's tip only in part");
+    let nothing = ObjectId::hash(b"no snapshot at all 5d1c");
+    let answers = |x: ObjectId| -> Vec<(u16, String)> {
+        let norm = |r: Reply, ids: &[ObjectId]| {
+            let mut m = String::from_utf8_lossy(&r.body).to_string();
+            for id in ids {
+                m = m.replace(&id.hex(), "<id>").replace(&id.short(), "<id>");
+            }
+            (r.status, m)
+        };
+        let mut out = Vec::new();
+        let r = api.post_json(Some(&token), &format!("/v1/projects/{}/changes", p.name), &json!({"base": x.hex(), "edits": [put("src/n.rs", "n\n")]}));
+        out.push(norm(r, &[x]));
+        out.push(norm(land(&api, &token, &p.name, x, json!([put("src/n.rs", "n\n")]), true), &[x]));
+        let mut m = Craft::new(&api, &p.dev, &p.name, "main");
+        m.file("src/n.rs", "n\n");
+        let s = crafted_on(&mut m, x, veil_core::ChangeId::random(), "on a name", "");
+        out.push(norm(push_new(&m, &[("named", s)]), &[x, s]));
+        let up = api.upload(&token, &p.name, &m.objects);
+        assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+        let receipts = up.json()["receipts"].as_array().unwrap().clone();
+        let map: serde_json::Map<String, Value> = m.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+        let r = api.post_json(Some(&token), &format!("/v1/projects/{}/land", p.name), &json!({"onto": "main", "snapshot": s.hex(), "receipts": map, "wait": true}));
+        out.push(norm(r, &[x, s]));
+        out
+    };
+    let none = answers(nothing);
+    for (what, x) in [("a change hidden from the dev", hidden), ("a change the dev sees in part", part)] {
+        let got = answers(x);
+        for (i, route) in ["API commit", "landing of edits", "push", "landing of a snapshot"].iter().enumerate() {
+            assert!(none[i].0 >= 400, "{route}: a snapshot that does not exist is refused: {:?}", none[i]);
+            assert_eq!(got[i], none[i], "{route}: {what} is answered unlike a snapshot that does not exist");
+        }
+    }
+}
+
+/// BUG-1521, another bound of the class: "already landed" reads at most 64
+/// `landed_from` rows of a change (`LANDED_FROM_LIMIT`) and answers
+/// `warming` past it, and the rows are never deleted: a change landed on
+/// more than 64 branches (a fix landed on every release branch) makes
+/// every later landing of a change on it `warming`, for ever. Here the 64
+/// other landings are rows written directly.
+#[test]
+#[ignore = "BUG-1521: a change landed on more than 64 branches makes every landing of a change on it warming for ever"]
+fn bug_1521_a_change_on_one_landed_on_many_branches_lands() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let first = push_chain(&api, &p.dev, &p.name, "dev-work", "main", 1, Some("src/once"));
+    let v = land_held(&api, &token, &p.name, first, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    let source_id: String = sql_text(&hub, "SELECT source FROM landed_from WHERE project_id = $1 LIMIT 1", pid);
+    let h = hub.hub();
+    hub.rt
+        .block_on(
+            sqlx::query("INSERT INTO landed_from (project_id, source, landed) SELECT $1, $2, md5('l' || i) || md5('m' || i) FROM generate_series(1, 64) i")
+                .bind(pid)
+                .bind(&source_id)
+                .execute(&h.db),
+        )
+        .unwrap();
+    // An hour later: the `landings` rows are gone.
+    hub.rt.block_on(sqlx::query("DELETE FROM landings WHERE project_id = $1").bind(pid).execute(&h.db)).unwrap();
+    let second = push_chain(&api, &p.dev, &p.name, "dev-work", "dev-work", 1, Some("src/twice"));
+    let r = land_held(&api, &token, &p.name, second, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "a change on one landed on 65 branches: {body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+    assert_eq!(r.json()["landed"].as_array().unwrap().len(), 1, "{body}");
+}
+
+/// Guarantee: a change landed long ago is not landed again under a later
+/// one when its submitter's access changed in between (their view key is
+/// another), with the `landings` rows gone and the deriver behind.
+#[test]
+fn a_change_landed_before_its_submitter_s_access_changed_is_not_landed_again() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let first = push_chain(&api, &p.dev, &p.name, "dev-work", "main", 1, Some("src/once"));
+    let v = land_held(&api, &token, &p.name, first, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    wait_derived(&hub, pid, real_tip(&hub, pid));
+    p.admin.ok(&p.dir, &["group", "add", "security", &p.dev.name, "--confirm", &p.dev.fingerprint()]);
+    let lock = hold_deriver(&hub, pid);
+    push_chain(&api, &p.admin, &p.name, "main", "main", 300, None);
+    let second = push_chain(&api, &p.dev, &p.name, "dev-work", "dev-work", 1, Some("src/twice"));
+    let h = hub.hub();
+    hub.rt.block_on(sqlx::query("DELETE FROM landings WHERE project_id = $1").bind(pid).execute(&h.db)).unwrap();
+    let r = land_held(&api, &token, &p.name, second, true);
+    drop(lock);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+    assert_eq!(r.json()["landed"].as_array().unwrap().len(), 1, "P landed again: {body}");
+    assert_eq!(real_file(&hub, pid, "src/once/0.rs").as_deref(), Some(&b"0\n"[..]));
+    assert_eq!(real_file(&hub, pid, "src/twice/0.rs").as_deref(), Some(&b"0\n"[..]));
+}
+
+/// Guarantee: entries queued before the server restarts land after it,
+/// each exactly once (`landing::resume`), and their tickets answer.
+#[test]
+fn entries_queued_before_a_restart_land_once_after_it() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let token = p.dev.token();
+    let start = real_tip(&hub, pid);
+    hold(&hub, pid);
+    let tickets: Vec<String> = {
+        let api = hub.api();
+        let base = tip_for(&hub, &token, &p.name);
+        (0..3)
+            .map(|i| {
+                let r = land(&api, &token, &p.name, base, json!([put(&format!("src/restart/{i}.rs"), "r\n")]), false);
+                assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                assert_eq!(r.json()["state"], "queued", "{}", String::from_utf8_lossy(&r.body));
+                r.json()["ticket"].as_str().unwrap().to_string()
+            })
+            .collect()
+    };
+    let hub = hub.restart(|_| {});
+    release(&hub, pid);
+    let api = hub.api();
+    for t in &tickets {
+        let mut v = outcome(&api, &token, &p.name, t);
+        for _ in 0..20 {
+            if v["state"] != "queued" {
+                break;
+            }
+            v = outcome(&api, &token, &p.name, t);
+        }
+        assert_eq!(v["state"], "landed", "{v}");
+    }
+    let chain = chain(&hub, pid, start);
+    assert_eq!(chain.len(), 3, "each queued change landed once");
+    let ids: HashSet<_> = chain.iter().map(|(_, s)| s.change_id).collect();
+    assert_eq!(ids.len(), 3, "a change landed twice");
+}
+
+/// Guarantee: a change named as its author saw it before their access
+/// changed is landed as exactly their change, or refused; never grafted
+/// on, or landed as, another snapshot.
+#[test]
+fn a_change_named_from_before_an_access_change_lands_as_itself_or_is_refused() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let start = real_tip(&hub, pid);
+    let base = tip_for(&hub, &token, &p.name);
+    let mine = kept_change(&api, &token, &p.name, base, json!([put("src/before.rs", "before\n")]));
+    p.admin.ok(&p.dir, &["group", "add", "security", &p.dev.name, "--confirm", &p.dev.fingerprint()]);
+    let r = land_held(&api, &token, &p.name, mine, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    match r.status {
+        200 => {
+            assert_eq!(r.json()["state"], "landed", "{body}");
+            let chain = chain(&hub, pid, start);
+            assert_eq!(chain.len(), 1, "{body}");
+            assert_eq!(real_file(&hub, pid, "src/before.rs").as_deref(), Some(&b"before\n"[..]));
+        }
+        s => {
+            // (403 today: "signed by a key no device here is registered
+            // with", the old name read as an upload: BUG-1523.)
+            assert!((400..500).contains(&s) || s == 503, "{s}: {body}");
+            assert_eq!(real_tip(&hub, pid), start, "nothing landed: {body}");
+        }
+    }
+    eprintln!("a change named from before an access change: {} {body}", r.status);
+}
+
+/// Guarantee, the merge route: the dev lands P, then merges main (with P's
+/// landing) into their branch and puts Q on the merge; with the `landings`
+/// rows gone, landing Q never lands P again (main's first-parent line holds
+/// P's change once, and P's file as it was).
+#[test]
+fn a_change_landed_then_merged_back_is_not_landed_again() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let first = push_chain(&api, &p.dev, &p.name, "dev-work", "main", 1, Some("src/once"));
+    let v = land_held(&api, &token, &p.name, first, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    let landed_p = real_tip(&hub, pid);
+    let cid = source(&hub, pid).snapshot(&landed_p).unwrap().change_id;
+    let main_seen = tip_for(&hub, &token, &p.name);
+    let mut c = Craft::new(&api, &p.dev, &p.name, "dev-work");
+    c.root = c.tree_of(main_seen);
+    let r = c.push_merge("dev-work", &[main_seen]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let second = push_chain(&api, &p.dev, &p.name, "dev-work", "dev-work", 1, Some("src/twice"));
+    let h = hub.hub();
+    hub.rt.block_on(sqlx::query("DELETE FROM landings WHERE project_id = $1").bind(pid).execute(&h.db)).unwrap();
+    let r = land_held(&api, &token, &p.name, second, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+    assert_eq!(real_file(&hub, pid, "src/twice/0.rs").as_deref(), Some(&b"0\n"[..]));
+    assert_eq!(real_file(&hub, pid, "src/once/0.rs").as_deref(), Some(&b"0\n"[..]));
+    let line = chain(&hub, pid, veil_server::sync::root_snapshot_id());
+    assert_eq!(line.iter().filter(|(_, s)| s.change_id == cid).count(), 1, "P's change is on main's line more than once: {body}");
+}
