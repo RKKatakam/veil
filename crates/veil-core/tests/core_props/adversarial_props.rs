@@ -148,7 +148,7 @@ impl Harness {
     }
 
     fn visible(&self, include_root: bool) -> Vec<ObjectId> {
-        let mut v = self.repo.visible_snapshots().unwrap();
+        let mut v = self.repo.exact().visible().unwrap();
         if !include_root {
             v.retain(|id| *id != self.repo.root_id());
         }

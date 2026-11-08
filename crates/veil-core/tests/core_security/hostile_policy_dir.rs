@@ -29,7 +29,7 @@ fn hostile_policy_dir() -> (Repo, Arc<MemoryBackend>, Arc<MemoryBackend>, Object
     let mut m = Repo::init_for_clone(Arc::new(MemoryBackend::new()), Some(Identity::generate("mallory")), "mallory").unwrap();
     remote::pull(&mut m, "origin", hub.clone()).unwrap();
     let store = m.store().clone();
-    let mut root = (*store.tree(&store.snapshot(&main).unwrap().tree).unwrap()).clone();
+    let mut root = (*store.tree(&m.snapshot(&main).unwrap().tree).unwrap()).clone();
     let inner = raw_tree(&m, vec![file("rules", blob(&m, b"** public!\n"))]);
     root.insert(dir(".veilpolicy", inner));
     root.insert(file("NEWS", blob(&m, b"news\n")));

@@ -35,5 +35,6 @@ mod ring_shares;
 mod round4_keys;
 mod scanner;
 mod scanner_upgrade;
+mod thin_locator_memory;
 mod team_vault;
 mod visibility;

@@ -378,7 +378,12 @@ pub fn upgrade(
     let journal = read_journal(&*backend)?;
     let mut report = UpgradeReport {
         from: journal.as_ref().map_or(config.format, |j| j.from),
-        to: journal.as_ref().map_or(opts.to, |j| j.to),
+        // A thin clone (format 9) is at the newest format: nothing to do
+        // but the ring step below.
+        to: journal.as_ref().map_or(match config.format == crate::repo::PARTIAL_FORMAT {
+            true => config.format.max(opts.to),
+            false => opts.to,
+        }, |j| j.to),
         dry_run: opts.dry_run,
         resumed: journal.is_some(),
         ..Default::default()

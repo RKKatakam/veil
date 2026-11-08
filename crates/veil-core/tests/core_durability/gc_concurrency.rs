@@ -656,7 +656,7 @@ fn a_gc_that_dies_after_deleting_still_makes_carried_ids_checked() {
     assert!(gc(&mut g, &prune_now()).is_err(), "gc dies after deleting");
     drop(g);
     let probe = open(&fs, &id);
-    assert!(probe.store().snapshot(&old).is_err(), "the test needs the snapshot gone");
+    assert!(probe.snapshot(&old).is_err(), "the test needs the snapshot gone");
     drop(probe);
     let mut tx = repo.transaction("tag set").unwrap();
     tx.view.tags.insert("stale".into(), Tag::new(old));

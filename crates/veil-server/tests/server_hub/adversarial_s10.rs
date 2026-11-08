@@ -296,7 +296,7 @@ fn bug_1055_a_renamed_secret_that_vl_keeps_sealed_is_accepted() {
     p.admin.commit_main(&p.dir, "rename the env file");
     // Control: the member's own vl keeps it sealed at the new path.
     let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&p.dir)), None, "test").unwrap();
-    let tree = repo.store().snapshot(&repo.view().tags["main"].target).unwrap().tree;
+    let tree = repo.snapshot(&repo.view().tags["main"].target).unwrap().tree;
     let e = veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new("settings-from-env.txt").unwrap()).unwrap().expect("renamed");
     assert!(!e.visibility.is_public(), "control: vl keeps the renamed secret sealed");
     drop(repo);

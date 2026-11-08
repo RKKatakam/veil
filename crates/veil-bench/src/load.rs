@@ -348,7 +348,7 @@ impl Agent<'_> {
         }
         self.c.requests.fetch_add(1, Ordering::Relaxed);
         let stop: Vec<ObjectId> = self.clone.tip.map(|(t, _)| t).into_iter().collect();
-        let h = self.api.post_json(Some(self.token), &self.path("/history"), &HistoryRequest { tips: vec![tip], stop })?;
+        let h = self.api.post_json(Some(self.token), &self.path("/history"), &HistoryRequest { tips: vec![tip], stop, limit: None })?;
         ok(&h, "history")?;
         let mut new = Vec::new();
         let mut tip_tree = None;

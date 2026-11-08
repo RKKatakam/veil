@@ -234,6 +234,32 @@ impl Hist {
         });
     }
 
+    /// The timestamp at or after `from` at which [`Hist::commit`] of the
+    /// same arguments writes a snapshot whose id (hex) `accept`s (found by
+    /// trying timestamps one by one).
+    pub fn timestamp_for(parents: &[ObjectId], files: &Files, change: [u8; 16], from: i64, embargo: Option<&str>, accept: impl Fn(&str) -> bool) -> i64 {
+        let tree = build_tree(files, &mut Vec::new());
+        let mut timestamp = from;
+        loop {
+            let s = Snapshot {
+                parents: parents.to_vec(),
+                change_id: ChangeId(change),
+                tree,
+                description: Text::Plain(format!("change at {timestamp}")),
+                author: "gen".into(),
+                timestamp,
+                predecessors: vec![],
+                conflicts: vec![],
+                embargo: embargo.map(str::to_string),
+                signature: None,
+            };
+            if accept(&ObjectId::hash(&Object::Snapshot(s).encode()).hex()) {
+                return timestamp;
+            }
+            timestamp += 1;
+        }
+    }
+
     pub fn set_branch(&mut self, th: &TestHub, name: &str, tip: ObjectId) {
         th.rt.block_on(async {
             again(|| sqlx::query(

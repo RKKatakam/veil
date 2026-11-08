@@ -46,6 +46,7 @@ mod shape;
 mod team_secret;
 #[cfg(debug_assertions)]
 mod test_remotes;
+mod thin;
 
 use std::{
     io::{IsTerminal, Read, Write},
@@ -158,8 +159,15 @@ fn open(cli: &Cli) -> Result<Ctx> {
 fn run(cli: Cli) -> Result<ExitCode> {
     match &cli.cmd {
         Cmd::Init { path } => cmd_init(path.as_deref()),
-        Cmd::Clone { source, dest, only } => match hub::HubUrl::parse(source) {
-            Some(url) => hub_cmd::clone(&url?, dest.as_deref(), only.as_deref()),
+        Cmd::Clone { source, dest, only, full, cache_size } => match hub::HubUrl::parse(source) {
+            Some(url) => {
+                let thin = match (*full, cache_size) {
+                    (true, _) => None,
+                    (false, Some(s)) => Some(veil_core::promisor::parse_size(s)?.max(1)),
+                    (false, None) => Some(veil_core::repo::DEFAULT_CACHE_LIMIT),
+                };
+                hub_cmd::clone(&url?, dest.as_deref(), only.as_deref(), thin)
+            }
             #[cfg(debug_assertions)]
             None if test_remotes::enabled() && only.is_none() => test_remotes::clone(source, dest.as_deref()),
             None => bail!("{} is not a Veil server project: vl clones from a server URL, veil://host[:port]/project", safe(source)),
@@ -579,6 +587,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         #[cfg(debug_assertions)]
         Cmd::Pull { remote } if test_remotes::is_path_remote(ctx, remote) => test_remotes::pull(ctx, remote)?,
         Cmd::Pull { remote } => hub_cmd::pull(ctx, remote)?,
+        Cmd::Partial(c) => thin::run(ctx, c)?,
         Cmd::Hooks(c) => return hooks::run(ctx, c),
         Cmd::Gc {
             keep_ops_days,
@@ -1201,7 +1210,9 @@ fn cmd_embargo_release(ctx: &mut Ctx, id: &str, yes: bool) -> Result<()> {
     );
     let mut merges = Vec::new();
     let mut tags = Vec::new();
-    for sid in ctx.repo.visible_snapshots()? {
+    // The embargoed merges, from the history index (it walks only lines
+    // that build on one), exactly.
+    for sid in ctx.repo.exact().visible_embargoed()? {
         let s = ctx.repo.snapshot(&sid)?;
         if s.embargo.as_deref() == Some(id) {
             merges.push((sid, first_line(&ctx.repo.description(&s)).to_string()));

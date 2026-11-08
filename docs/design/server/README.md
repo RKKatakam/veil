@@ -29,7 +29,7 @@ S1 is built. **S2** (secrets at scale: keys per access rule, background wrapping
 
 | # | Phase | Milestone | Depends on |
 |---|---|---|---|
-| S3 | 2 | Fetch on demand in the client (thin clones, bounded cache, no full graph) | S1, simplification pass |
+| S3 | 2 | Fetch on demand in the client (thin clones, bounded cache, no full graph): **built**, `HUB.md` §13.21 | S1, simplification pass |
 | S4 | 2 | **Built** (`HUB.md` §13.14). Request-path caches (permissions, sessions, snapshot resolution, tips invalidated without a hot row), **one database commit per push**, and the cost gates in `veil-bench load` (`storage-and-cost.md` §3–5, §9) | S1 |
 | S5 | 2 | Read grants, the object routes, access epochs (built: `HUB.md` §13.16) | S1 |
 | S6 | 2 | The Veil daemon: shared object cache | S3, S5 |
@@ -90,9 +90,10 @@ The owner's goal: every milestone of phases 1–4 built, reviewed and merged, th
 
 | State | Milestones |
 |---|---|
-| **Merged into `integration`** | S1, S2 (phase 1); S4, S5, S9, S10, S27 (phase 2); S12, S13, S15 (phase 3) |
-| **Built, in review or fixing** | S3 (redesign under review), S28 (final checks), S14 (cycle 2 review), S17 (fixing cycle 2, last cycle next), S21 (fixing cycle 2, last cycle next) |
-| **Not started** | S6, S7, S8, S11, S29 (phase 2); S16 (phase 3); S18, S19, S20, S22, S23, S24, S25, S26 (phase 4); the gate runs G2, G3 (in S16), G4 |
+| **Merged into `integration`** | S1, S2 (phase 1); S3, S4, S5, S9, S10, S27 (phase 2); S12, S13, S15 (phase 3) |
+| **Built, in review or fixing** | S8 (last review), S11 (last review after fixes), S28 (final checks); S14 (redesign, cycle 2 review); S17 and S21 (redesigns, last review next), S24 (cycle 2 review) |
+| **Being built** | S6; S25 part A (paused for memory) |
+| **Not started** | S7, S29 (phase 2); S16 (phase 3); S18, S19, S20, S22, S23, S26 (phase 4); the gate runs G2, G3 (in S16), G4 |
 
 ### Remaining waves
 

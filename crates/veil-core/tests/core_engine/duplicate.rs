@@ -300,6 +300,6 @@ proptest! {
         remote::push(&mut r, mirror.clone(), true, &[], false).unwrap();
         prop_assert!(backend_contains(mirror.as_ref(), b"SECRET-PROP").is_empty());
         let m = Repo::open(mirror, None, "carol").unwrap();
-        prop_assert!(m.snapshot_opt(&tip).unwrap().is_some(), "the copies were pushed");
+        prop_assert!(m.exact().snapshot(&tip).unwrap().is_some(), "the copies were pushed");
     }
 }

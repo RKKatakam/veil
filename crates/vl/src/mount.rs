@@ -243,7 +243,9 @@ impl DiskJournal {
 fn open_repo(root: &Path) -> Result<Repo> {
     let identity = load_identity()?;
     let user = user_for(&identity);
-    Ok(Repo::open(Arc::new(DiskBackend::new(root)), Some(identity), &user)?)
+    let repo = Repo::open(Arc::new(DiskBackend::new(root)), Some(identity.clone()), &user)?;
+    crate::thin::attach(&repo, &identity);
+    Ok(repo)
 }
 
 /// Snapshot `snapshot` as `repo`'s reader sees it now (with the keys

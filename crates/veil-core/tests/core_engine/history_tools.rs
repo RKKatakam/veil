@@ -288,7 +288,7 @@ fn an_embargoed_fix_is_not_attributed_for_readers_without_the_key() {
     assert_eq!(got[9], Some(fix), "the holder sees the fix");
     alice.set_tag("stable", v1, false).unwrap();
     let carol = mirror_of(&mut alice);
-    assert!(carol.snapshot_opt(&m).unwrap().is_none() && carol.snapshot_opt(&fix).unwrap().is_none());
+    assert!(carol.exact().snapshot(&m).unwrap().is_none() && carol.exact().snapshot(&fix).unwrap().is_none());
     assert!(!carol.view().tags.contains_key("main"), "main, moved onto the embargoed merge, was pushed");
     let stable = carol.view().tags["stable"].target;
     assert_eq!(stable, v1);
@@ -371,7 +371,7 @@ fn grep_is_linear_on_hostile_patterns_and_input() {
 
 fn search(r: &Repo, f: LogFilter) -> Vec<(ObjectId, Match)> {
     let mut s = Searcher::new(r, f);
-    r.visible_snapshots().unwrap().into_iter().map(|id| (id, s.check(&id).unwrap())).filter(|(_, m)| *m != Match::No).collect()
+    r.exact().visible().unwrap().into_iter().map(|id| (id, s.check(&id).unwrap())).filter(|(_, m)| *m != Match::No).collect()
 }
 
 fn listed(v: &[(ObjectId, Match)]) -> Vec<ObjectId> {
@@ -582,7 +582,7 @@ proptest! {
         }
         let mallory = outsider_of(fs);
         for (r, reader) in [(&mallory, Reader::Me), (&alice, Reader::Public)] {
-            for rev in r.visible_snapshots().unwrap() {
+            for rev in r.exact().visible().unwrap() {
                 let tree = r.snapshot(&rev).unwrap().tree;
                 for (path, e) in veil_core::tree::walk_files(r.store(), &tree).unwrap() {
                     let o = BlameOptions { reader, ..BlameOptions::default() };

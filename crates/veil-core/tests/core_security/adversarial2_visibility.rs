@@ -111,8 +111,8 @@ fn a_merged_plain_public_rule_cannot_publish_dotenv() {
 /// Every file of every visible snapshot can be read.
 fn all_readable(r: &Repo) -> Result<usize, String> {
     let mut n = 0;
-    for id in r.visible_snapshots().map_err(|e| e.to_string())? {
-        let Some(s) = r.snapshot_opt(&id).map_err(|e| e.to_string())? else { continue };
+    for id in r.exact().visible().map_err(|e| e.to_string())? {
+        let Some(s) = r.exact().snapshot(&id).map_err(|e| e.to_string())? else { continue };
         let files = walk_files(r.store(), &s.tree).map_err(|e| format!("{}: {e}", id.short()))?;
         for (path, e) in files {
             r.store().read_entry(&e).map_err(|err| format!("{} {path}: {err}", id.short()))?;
