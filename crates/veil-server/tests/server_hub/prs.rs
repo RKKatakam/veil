@@ -559,7 +559,7 @@ fn pr_reviews_and_the_gate() {
     let pr = th.rt.block_on(prs::create(&hub, &ask_of(&p.dev), &dev, CreatePr { head: "feature-a1".into(), title: "review me".into(), ..Default::default() })).unwrap();
     let id = pr["id"].as_str().unwrap().to_string();
     assert_eq!(pr["risk"], "normal");
-    assert_eq!(pr["review"]["needs"], json!({"approvals": 1, "people_only": false}));
+    assert_eq!(pr["review"]["needs"], json!({"approvals": 1, "people_only": true}), "normal risk needs a person (BUG-1325's defaults)");
     let sign_for = |who: &Person, pr: &str, patch: &str, verdict: &str| who.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, pr, patch, verdict));
     let sign = |who: &Person, _rev: i64, patch: &str, verdict: &str| sign_for(who, &id, patch, verdict);
     let review = |who: &Person, _rev: i64, patch: &str, verdict: &str, sig: String| {
@@ -604,7 +604,8 @@ fn pr_reviews_and_the_gate() {
     let patch2 = v["patch"].as_str().unwrap().to_string();
     review(&p.admin, 2, &patch2, "request-changes", sign(&p.admin, 2, &patch2, "request-changes")).unwrap();
     // An agent session's approval (S11 sets the flag; written here) counts
-    // for normal risk, never where people are required.
+    // for low risk only (BUG-1325's defaults), never where people are
+    // required.
     let pid = th.rt.block_on(sqlx::query_scalar::<_, i64>("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hub.db)).unwrap();
     let agent = th.hub();
     let (agent_id, agent_name) = person_row(&th, "agent");
@@ -617,9 +618,14 @@ fn pr_reviews_and_the_gate() {
             .bind(pid).bind(&id).bind(agent_id).bind(verdict).bind(&patch2).bind(veil_core::now_millis()).execute(&agent.db)));
     };
     put_agent_review("approve");
+    let set_risk = |r: &str| th.rt.block_on(again(|| sqlx::query("UPDATE prs SET risk = $3 WHERE project_id = $1 AND id = $2").bind(pid).bind(&id).bind(r).execute(&agent.db)));
+    set_risk("low");
     let v = th.rt.block_on(prs::show(&hub, &ask_of(&p.dev), &id)).unwrap();
-    assert_eq!(v["review"]["approvals"], 1, "an agent's approval counts for normal risk: {v}");
+    assert_eq!(v["review"]["approvals"], 1, "an agent's approval counts for low risk: {v}");
     assert_eq!(v["review"]["ready"], false, "the admin asked for changes");
+    set_risk("normal");
+    let v = th.rt.block_on(prs::show(&hub, &ask_of(&p.dev), &id)).unwrap();
+    assert_eq!(v["review"]["approvals"], 0, "an agent's approval does not count for normal risk: {v}");
     review(&p.admin, 2, &patch2, "approve", sign(&p.admin, 2, &patch2, "approve")).unwrap();
     assert!(matches!(land(&p.dev), Err(Error::Api { code: "landing_unavailable", .. })));
     // The same PR at high risk: the agent's approval no longer counts.
@@ -945,13 +951,13 @@ fn pr_rules_from_veilrules() {
     let mk = |head: ObjectId, t: &str| th.rt.block_on(prs::create(&hub, &admin, &me, CreatePr { head: head.hex(), title: t.into(), ..Default::default() })).unwrap();
     let v = mk(normal, "normal");
     let normal_id = v["id"].as_str().unwrap().to_string();
-    assert_eq!((v["risk"].as_str(), v["review"]["needs"].clone()), (Some("normal"), json!({"approvals": 2, "people_only": false})));
+    assert_eq!((v["risk"].as_str(), v["review"]["needs"].clone()), (Some("normal"), json!({"approvals": 2, "people_only": true})));
     let v = mk(high, "high");
     assert_eq!((v["risk"].as_str(), v["review"]["needs"].clone()), (Some("high"), json!({"approvals": 1, "people_only": true})));
     assert!(v["reasons"][0].as_str().unwrap().contains("high_risk_paths"), "{v}");
     let v = mk(low, "low");
-    assert_eq!((v["risk"].as_str(), v["review"]["needs"].clone()), (Some("low"), json!({"approvals": 0, "people_only": false})));
-    assert_eq!(v["review"]["ready"], true, "low risk lands with checks alone");
+    assert_eq!((v["risk"].as_str(), v["review"]["needs"].clone()), (Some("low"), json!({"approvals": 1, "people_only": false})));
+    assert_eq!(v["review"]["ready"], false, "low risk needs one approval by default (BUG-1325)");
     let id = v["id"].as_str().unwrap().to_string();
     // A broken file keeps the last valid rules (normal needs 2, never 1);
     // only admins read why.
@@ -969,10 +975,10 @@ fn pr_rules_from_veilrules() {
     let a = th.rt.block_on(prs::show(&hub, &admin, &id)).unwrap();
     let d = th.rt.block_on(prs::show(&hub, &dev, &id)).unwrap();
     for v in [&a, &d] {
-        assert_eq!(v["review"]["needs"], json!({"approvals": 0, "people_only": false}), "the last valid rules: {v}");
+        assert_eq!(v["review"]["needs"], json!({"approvals": 1, "people_only": false}), "the last valid rules: {v}");
     }
     let n = th.rt.block_on(prs::show(&hub, &dev, &normal_id)).unwrap();
-    assert_eq!(n["review"]["needs"], json!({"approvals": 2, "people_only": false}), "never lowered to one: {n}");
+    assert_eq!(n["review"]["needs"], json!({"approvals": 2, "people_only": true}), "never lowered to one: {n}");
     assert!(a["review"]["reasons"].to_string().contains(".veilrules"), "{a}");
     let shown = d.to_string();
     assert!(!shown.contains("oops") && !shown.contains("5d2e") && !shown.contains("secret-key-name"), "{shown}");
@@ -2042,7 +2048,7 @@ mod s21_cycle3 {
     use super::*;
 
     fn rated(path: &str) -> Risk {
-        classify(&[FileChange { path: path.into(), secret: false, executable: false }], &Review::default()).0
+        classify(&[FileChange { path: path.into(), secret: false, executable: false, regular: true }], &Review::default()).0
     }
 
     /// Guarantee 1, the layouts the new rules get right: build inputs,
@@ -2690,6 +2696,28 @@ mod s21_redesign {
         v["risk"].as_str().unwrap().to_string()
     }
 
+    /// The risk and whether the gate is met (no reviews) of an admin's PR of
+    /// `stack` onto `base`.
+    fn gate_of_stack(base: &[(&str, &str)], stack: &[Step]) -> (String, bool) {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let mut files: Files = base.iter().map(|(p, c)| (p.to_string(), c.as_bytes().to_vec())).collect();
+        let b = commit_with(&th, &mut h, &[root_snapshot_id()], files.clone(), &[], &[], [1; 16], 1_000);
+        h.set_branch(&th, "main", b);
+        let mut tip = b;
+        for (i, (edits, links, exe)) in stack.iter().enumerate() {
+            for (p, c) in edits.iter() {
+                files.insert(p.to_string(), c.as_bytes().to_vec());
+            }
+            tip = commit_with(&th, &mut h, &[tip], files.clone(), links, exe, [2 + i as u8; 16], 2_000 + i as i64);
+        }
+        let (author, name) = person_row(&th, "author");
+        let v = th.rt.block_on(prs::create(&h.hub, &ask_as(&th, &h, &admin_of(author)), &caller(author, &name), CreatePr { head: tip.hex(), title: "risk".into(), ..Default::default() })).unwrap();
+        assert!(v["id"].is_string(), "the PR was made: {v}");
+        (v["risk"].as_str().unwrap().to_string(), v["review"]["ready"] == true)
+    }
+
     /// Guarantee 1, the cases of the corpus that hold: case and Unicode
     /// tricks on `docs/` and `src/`, a `README.md` or `docs/x.md` that is a
     /// folder, a name with a second extension, and an executable bit set in
@@ -2698,7 +2726,7 @@ mod s21_redesign {
     /// filesystem, `BuildReport::name_collisions`.)
     #[test]
     fn low_is_not_reached_by_case_or_shape_tricks() {
-        let rated = |p: &str| veil_server::prs::rules::classify(&[veil_server::prs::rules::FileChange { path: p.into(), secret: false, executable: false }], &Review::default()).0;
+        let rated = |p: &str| veil_server::prs::rules::classify(&[veil_server::prs::rules::FileChange { path: p.into(), secret: false, executable: false, regular: true }], &Review::default()).0;
         for p in [
             "Docs/guide.md", "DOCS/guide.md", "d\u{043e}cs/guide.md", "docs/guide.md.sh", "docs/guide.md ", "docs/a.md/build.rs", "README.md/build.rs",
             "README.md.exe", "README-build.sh", "docs/README.md/x.rs", "tests/pytest.ini", "tests/setup.cfg", "tests/sub/conftest.py", "tests/x.pyw",
@@ -2719,7 +2747,6 @@ mod s21_redesign {
     /// site generators and packagers follow links: the target's content is
     /// published as the page or the package's README.
     #[test]
-    #[ignore = "BUG-1324: a symbolic link named like documentation or a test is low risk"]
     fn bug_1324_a_link_named_like_documentation_is_low_risk() {
         let mut wrong = Vec::new();
         for (path, target) in [("docs/env.md", "/proc/self/environ"), ("README.md", "../../.config/ci/credentials.toml"), ("tests/x.rs", "../src/lib.rs")] {
@@ -2740,7 +2767,6 @@ mod s21_redesign {
     /// on every `npm install` (`postinstall`) is "test source code". Both
     /// are low risk and ready with no review.
     #[test]
-    #[ignore = "BUG-1325: Markdown a doc site compiles, and test files the build runs, are low risk"]
     fn bug_1325_files_the_projects_build_runs_are_low_risk() {
         let site = [
             ("package.json", "{\"scripts\": {\"docs:build\": \"vitepress build docs\", \"postinstall\": \"node test/setup.js\"}, \"devDependencies\": {\"vitepress\": \"1.6.3\"}}\n"),
@@ -2750,13 +2776,16 @@ mod s21_redesign {
         ];
         let mut wrong = Vec::new();
         let script = "# Welcome\n\n<script setup>\nimport { publish } from '../scripts/release.js'\npublish({ token: process.env.NPM_TOKEN })\n</script>\n";
-        let r = risk_of_stack(&site, &[(&[("docs/index.md", script)], &[], &[])]);
-        if r == "low" {
-            wrong.push(format!("docs/index.md with a <script setup> in a VitePress site: {r}"));
+        // The decision (BUG-1325): such files may stay `low`, but low risk
+        // needs one approval by default; only paths the admins list as
+        // `checks_only` need none.
+        let (r, ready) = gate_of_stack(&site, &[(&[("docs/index.md", script)], &[], &[])]);
+        if ready {
+            wrong.push(format!("docs/index.md with a <script setup> in a VitePress site: {r}, ready with no review"));
         }
-        let r = risk_of_stack(&site, &[(&[("test/setup.js", "require('../scripts/release.js').publish()\n")], &[], &[])]);
-        if r == "low" {
-            wrong.push(format!("test/setup.js, run by every npm install (postinstall): {r}"));
+        let (r, ready) = gate_of_stack(&site, &[(&[("test/setup.js", "require('../scripts/release.js').publish()\n")], &[], &[])]);
+        if ready {
+            wrong.push(format!("test/setup.js, run by every npm install (postinstall): {r}, ready with no review"));
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
@@ -2805,7 +2834,6 @@ mod s21_redesign {
     /// writes a change of their own under cy's change id: alice's request
     /// for changes of it holds cy's PR, which she never reviewed.
     #[test]
-    #[ignore = "BUG-1323: holds follow change ids, which the client chooses: a new id escapes, a borrowed one holds another's PR"]
     fn bug_1323_change_ids_are_the_clients_to_choose() {
         let Held { th, mut h, alice, bob, cy, id, team } = held();
         let hub = h.hub.clone();
@@ -2933,7 +2961,6 @@ mod s21_redesign {
     /// files (each keeps the state) while PR requests on two servers read
     /// the rules. Normal risk falls to `strict`'s one approval, for good.
     #[test]
-    #[ignore = "BUG-1322: a PR request racing a landing moves the rules record back, to strict"]
     fn bug_1322_a_reader_racing_a_landing_moves_the_record_back() {
         let th = TestHub::start();
         let th2 = TestHub::beside(&th);
@@ -3006,7 +3033,6 @@ mod s21_redesign {
     /// `.veilrules` (normal risk: 3 approvals back to 1) and the older
     /// `src/lib.rs` (a dev's fix undone). BUG-820's test puts the tip first.
     #[test]
-    #[ignore = "BUG-1321: a merge whose first parent is older takes back files the pusher may not write"]
     fn bug_1321_a_merge_with_an_older_first_parent_takes_back_files_the_pusher_may_not_write() {
         let th = TestHub::start();
         let p = setup_project(&th);
@@ -3139,5 +3165,20 @@ mod s21_redesign {
             pct(&mut pushes, 0.5),
             pct(&mut pushes, 0.99)
         );
+    }
+
+    /// BUG-1325's decision end to end: with the admins' `checks_only`,
+    /// a PR of those paths needs no approval; anything else allow-listed
+    /// low needs one; a link at a listed path is normal.
+    #[test]
+    fn checks_only_paths_need_no_approval() {
+        let rules = "[review]\nchecks_only = [\"docs/**\"]\n";
+        let base = [("pub/keep.rs", "fn keep() {}\n"), (".veilrules", rules)];
+        let (r, ready) = gate_of_stack(&base, &[(&[("docs/guide.md", "# Guide\n")], &[], &[])]);
+        assert_eq!((r.as_str(), ready), ("checks-only", true));
+        let (r, ready) = gate_of_stack(&base, &[(&[("README.md", "# Readme\n")], &[], &[])]);
+        assert_eq!((r.as_str(), ready), ("low", false));
+        let (r, ready) = gate_of_stack(&base, &[(&[("docs/env.md", "/proc/self/environ")], &["docs/env.md"], &[])]);
+        assert_eq!((r.as_str(), ready), ("normal", false));
     }
 }

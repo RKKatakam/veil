@@ -2622,24 +2622,30 @@ answer. The author's verdict never counts. Where the rule says
 count. Agent sessions are S11: the review row records `agent`, and every
 session today is a person's.
 
-**A request for changes is attached to the change ids** of the revision
-it was given on (`pr_holds`: person, change id; BUG-1278).
-* **What it holds:** every PR whose revisions contain any of those change
-  ids, open or reopened, this one or a new one.
-* **What releases it:** that reviewer approving a patch whose stack
-  contains them (the approval releases the change ids of that stack), or
-  an admin dismissing it (`POST prs/{id}/reviews/dismiss {person}`,
-  `vl pr dismiss ID PERSON`: the reviewer's holds on every change id of
-  that PR's revisions).
-* **Nothing else releases it:** not a new revision, a new PR, closing,
-  rebasing, or a change of access (BUG-1259).
+**A request for changes is attached to what the author cannot choose**
+(redesign review, BUG-1323): the PR's author, a person, and the paths the
+PR had touched when the request was given (`pr_holds`: reviewer, author,
+path). Change ids are the client's to write, so they key nothing.
+* **What it holds:** every PR by that author touching any of those paths,
+  open or reopened, this one or a new one, whatever its change ids. It
+  never reaches another person's PR.
+* **What releases it:** that reviewer approving a PR by that author (the
+  approval releases their holds at that PR's paths), or an admin
+  dismissing it (`POST prs/{id}/reviews/dismiss {person}`,
+  `vl pr dismiss ID PERSON`: the reviewer's holds on that PR's author at
+  that PR's paths).
+* **Nothing else releases it:** not a new revision, a new PR, new change
+  ids, closing, rebasing, or a change of access (BUG-1259, BUG-1278).
 * **When the reviewer loses sight of it:** if a later revision touches a
   path the reviewer cannot read, the PR disappears for them, as any PR
   must, and it stays held. Everyone who sees it is told "<name> asked for
   changes", nothing more of the request, and an admin decides.
-* **Stated limits:** an admin may dismiss requests on a PR they wrote
-  (admins can force `main` anyway). A hold reached through another PR
-  that contains the same change ids names only the reviewer.
+* **Stated limits:**
+  * an admin may dismiss requests on a PR they wrote (admins can force
+    `main` anyway);
+  * a hold reached from another PR names only the reviewer;
+  * an author's unrelated PR at a held path stays held until the reviewer
+    approves one of them or an admin dismisses it.
 
 **Reviews in answers are bounded** (pre-existing, fixed with cycle 3).
 The gate reads each reviewer's latest verdict without its body, one row
@@ -2648,7 +2654,9 @@ reviews, with bodies within 256 KiB, read only once chosen, and says how
 many there are.
 
 **Risk** (per revision, from every change's files together) is an
-**allow-list for low; everything else is normal** (BUG-1276, BUG-1277):
+**allow-list for low; everything else is normal** (BUG-1276, BUG-1277).
+Only regular, non-executable files are ever below normal (BUG-1324): a
+symbolic link is rated by what it points at, which its name does not say.
 * **high:** `.veilpolicy`, `.veilrules`, `CODEOWNERS` anywhere, CI or
   container configuration anywhere (`.ci/`, `.github/`, `.gitlab/`,
   `.gitlab-ci*`, `.circleci/`, `.buildkite/`, `Jenkinsfile`, `.travis.yml`,
@@ -2672,8 +2680,21 @@ many there are.
     configuration or Markdown, wherever they sit. Never anything under
     `spec/`, `testdata/` or `fixtures/`, a build file (`conftest.py`,
     `build.rs`, `Makefile`, …), or an executable file;
+* **checks-only:** every file is under a path the admins list in
+  `.veilrules` as `[review] checks_only = ["docs/**", …]` (`*` within a
+  name, `**` for any folders, a trailing `/` for everything below). It
+  needs checks only, no approval (BUG-1325). Nothing is checks-only by
+  default;
 * **normal:** everything else, including every other Markdown file (agent
   instructions, prompts, skill references, Markdown inside `src/`).
+
+**Why low needs an approval** (BUG-1325, decided by the orchestrator under
+the owner's delegation, 2026-11-08). A list of names can't know what the
+project's build runs: VitePress compiles `docs/*.md` to Vue, and a
+`postinstall` script runs `test/setup.js`. So low risk is a lower bar, not
+none: one approval from someone other than the author, where an agent's
+approval counts. Only the admins can make a path need checks only,
+because they know their build.
 
 Whitespace changes are rated like any other (BUG-1256). Comment-only
 changes are not detected (phase-4 open question 4).
@@ -2686,14 +2707,21 @@ low = { approvals = 0 }
 normal = { approvals = 1 }
 high = { approvals = 1, people_only = true }
 high_risk_paths = ["src/auth/", "infra/"]
+checks_only = ["docs/**"]
 ```
 
 * **Two parsers, one file.** S21 parses only `[review]`
   (`prs/rules.rs`, `toml_edit`, already a dependency of `vl`). S17 parses
   its own `[branches.…]`, and neither judges the other's keys.
-* **The defaults** (decision 12) apply with no file: low needs no
-  approval, normal one (an agent's counts unless it is a session of the
-  author), high one person's. `people_only` is forced for high.
+* **The defaults** (decision 12, as revised for BUG-1325) apply with no
+  file:
+  * low needs one approval from someone other than the author, an agent's
+    counting;
+  * normal and high need one person's approval (agents' approvals count
+    for low only);
+  * nothing is checks-only.
+
+  `people_only` is forced for high.
 * **The rules in force are a state recorded at each landing on the default
   branch** (BUG-1279). `pr_review_rules` holds the state and the tip it
   belongs to. The state is one of:
@@ -2711,12 +2739,19 @@ high_risk_paths = ["src/auth/", "infra/"]
   move, or a branch with no state recorded at its old tip, gives `strict`
   until a landing with a valid file, or none, records a state. No history
   is walked, and no older file's text is used.
-* **A reader** applies the state recorded at the tip. A record that lags
-  the tip (the branch moved without a landing: an admin's tools, a branch
-  written directly) is brought up to it on read, by the same rule. A
-  fast-forward is told by one ancestry check, and the write is a
-  compare-and-swap on the record's tip, so a slow server never moves it
-  back.
+* **A reader** reads the tip and the record **in one statement**
+  (BUG-1322). A landing writes both in one transaction, so a reader always
+  sees a pair some landing left, and applies the state recorded at the tip.
+* **A record that lags the tip** (the branch moved without a landing: an
+  admin's tools, a branch written directly) is brought up by the rule of a
+  landing:
+  * the tip's own valid file, or its absence;
+  * for a broken file, the recorded state, only if the record's tip is an
+    ancestor of the tip.
+
+  The write is a compare-and-swap on the record's tip as read. **A read
+  never writes `strict`**: a broken file with no state to keep is answered
+  strict, and the record is left as it is.
 * **Warnings** quote the file, which is the admins' (no access line names
   the root), so only admins read them. Others are told the rules "need an
   admin's attention".
@@ -2762,8 +2797,10 @@ names is S3's client work), and rate limits on PR creation (S24).
 | 16 | — (a race) | an access-line change, a reclassification and a new revision at once | no class of other paths is ever stored under the current lines (BUG-1250) | `s21_cycle2::class_writes_hold_under_scripted_interleavings` (each interleaving scripted; fails with the guard removed), `s21_adversarial::bug_1250_…` |
 | 17 | A member who may write a folder | any change of behaviour rated low: whitespace, a build file, CI, a source or data file in a test-named place, Markdown agents execute or programs include | low is an allow-list: documentation in `docs/` and the root's README-like files, test source code in test folders; everything else normal or high (BUG-1251, 1252, 1256, 1257, 1276, 1277) | `prs::rules::tests::low_is_an_allow_list` (a corpus of layouts), `s21_cycle3::risk_classes_rate_real_layouts`, `bug_1276_…`, `bug_1277_…`, `s21_cycle2::bug_1256_…`, `bug_1257_…` |
 | 21 | Any participant | makes a listing or a revision hold far more than it answers | listings read only the bodies they answer; carrying holds one file's positions at a time: +2 MiB for 2,100 comments of 64 KiB (was 139 MiB), +26 MiB for 64 files of 1 MiB (was 729 MiB for 8) (BUG-1258) | `s21_cycle2::bug_1258_…` (two tests, each in a process of its own) |
-| 22 | The author | grows the PR past a reviewer's access, closes it and opens the same changes again, opens a second or larger PR of them | a request for changes is attached to change ids and holds every PR of them until that reviewer approves or an admin dismisses it (BUG-1259, BUG-1278) | `s21_cycle3::a_request_for_changes_holds_until_its_reviewer_or_an_admin_releases_it`, `a_request_for_changes_follows_its_change_ids_into_every_pr`, `bug_1278_…` |
-| 23 | Anyone who changes the default branch | deletes, breaks, merges, fast-forwards or force-moves past a stricter `.veilrules`, or lands concurrently on several servers | the rules in force are the state recorded at each landing; a broken file keeps the last recorded state (fast-forward) or is strict (BUG-1259, BUG-1279) | `s21_cycle3::the_rules_in_force_are_recorded_at_each_landing` (API commits, two servers), `the_last_valid_rules_hold_across_servers_and_late_records`, `bug_1279_…`, `prs::state::tests` |
+| 22 | The author | grows the PR past a reviewer's access, closes it and opens the same files again (under new change ids too), opens a second or larger PR of them; or anyone borrows someone's change id | a request for changes is attached to the author and the paths, and holds every PR by that author at those paths until that reviewer approves or an admin dismisses it; it never reaches another person's PR (BUG-1259, BUG-1278, BUG-1323) | `s21_redesign::bug_1323_…` (both directions), `s21_cycle3::a_request_for_changes_holds_until_its_reviewer_or_an_admin_releases_it`, `…_follows_its_change_ids_into_every_pr`, `bug_1278_…`, `s21_redesign::a_request_for_changes_survives_revisions_that_drop_its_change`, `a_hold_from_a_hidden_pr_names_only_its_reviewer` |
+| 23 | Anyone who changes the default branch; any PR request | deletes, breaks, merges, fast-forwards or force-moves past a stricter `.veilrules`, lands concurrently on several servers, or reads while a landing commits | the rules in force are the state recorded at each landing; a reader reads tip and record together and never writes `strict` (BUG-1259, BUG-1279, BUG-1322) | `s21_redesign::bug_1322_…` (readers on two servers racing 60 landings, both databases), `s21_cycle3::the_rules_in_force_are_recorded_at_each_landing`, `the_last_valid_rules_hold_across_servers_and_late_records`, `bug_1279_…`, `prs::state::tests` |
+| 25 | A member who may read but not write a path | pushes a merge whose first parent is an older snapshot (a fast-forward of the tip), taking back older files | a merge is checked against every parent: a path that keeps one parent's version over another's is a write unless that side made it (BUG-1321, BUG-820's class; push and API commits, `sync::check_changes`) | `s21_redesign::bug_1321_…` |
+| 26 | A member who may write a folder | a symbolic link named like documentation or a test; a doc site or install script the build runs | only regular, non-executable files are below normal; low needs one approval by default; checks-only only where the admins list it (BUG-1324, BUG-1325) | `s21_redesign::bug_1324_…`, `bug_1325_…`, `checks_only_paths_need_no_approval`, `prs::rules::tests::checks_only_links_and_the_defaults` |
 | 24 | Anyone who sees a PR | makes its answer read every review's text | reviews read without texts; at most 100 shown, texts within 256 KiB (BUG-1320) | `s21_cycle3::reviews_in_answers_are_bounded` |
 | 18 | Any participant | posts many large comments, then has everyone read them | every answer about 1 MiB of comments at most (BUG-1253) | `s21_adversarial::bug_1253_…` |
 | 19 | The author of a PR rebased over hidden changes | asks for the revision they are shown | "that is revision 1 already", their numbering (BUG-1254) | `s21_adversarial::bug_1254_…` |

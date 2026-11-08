@@ -15,9 +15,10 @@
 //!   branch's tip, the real tree. The file is changed like any file at the
 //!   root: by admins (nobody else may write a path no access line names),
 //!   and S17's push check refuses anyone but an admin whatever the lines.
-//! * **The defaults** (no file, or no `[review]`): low risk needs no
-//!   approval, normal one, high one from a person (an agent's never counts
-//!   for high risk). **A file that does not parse** never weakens review:
+//! * **The defaults** (no file, or no `[review]`; BUG-1325): low risk
+//!   needs one approval from someone other than the author, an agent's
+//!   counting; normal and high one person's. Only paths the admins list as
+//!   `checks_only` need none. **A file that does not parse** never weakens review:
 //!   the state recorded at the last landing on the default branch applies
 //!   (`state`: a file, its absence, or strict); with none, every risk needs
 //!   one person's approval. Only admins are told why.
@@ -56,6 +57,9 @@ pub struct Review {
     pub normal: Need,
     pub high: Need,
     pub high_risk_paths: Vec<String>,
+    /// Paths the admins say need checks only (BUG-1325): `*` within a
+    /// name, `**` for any folders, a trailing `/` for everything below.
+    pub checks_only: Vec<String>,
     /// Why the file was not used as written, if it was not.
     pub warnings: Vec<String>,
     /// The file did not parse: these are the strict rules, or the state
@@ -66,10 +70,16 @@ pub struct Review {
 impl Default for Review {
     fn default() -> Self {
         Review {
-            low: Need { approvals: 0, people_only: false },
-            normal: Need { approvals: 1, people_only: false },
+            // Product decision 12 (as decided under the owner's delegation,
+            // 2026-11-08, BUG-1325): low risk needs one approval from
+            // someone other than the author, an agent's counting; normal
+            // and high need a person's. Only the paths the admins list as
+            // `checks_only` need none.
+            low: Need { approvals: 1, people_only: false },
+            normal: Need { approvals: 1, people_only: true },
             high: Need { approvals: 1, people_only: true },
             high_risk_paths: Vec::new(),
+            checks_only: Vec::new(),
             warnings: Vec::new(),
             broken: false,
         }
@@ -78,6 +88,8 @@ impl Default for Review {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Risk {
+    /// Every file is under a path the admins list as `checks_only`.
+    ChecksOnly,
     Low,
     Normal,
     High,
@@ -86,6 +98,7 @@ pub enum Risk {
 impl Risk {
     pub fn name(self) -> &'static str {
         match self {
+            Risk::ChecksOnly => "checks-only",
             Risk::Low => "low",
             Risk::Normal => "normal",
             Risk::High => "high",
@@ -94,6 +107,7 @@ impl Risk {
 
     pub fn parse(s: &str) -> Risk {
         match s {
+            "checks-only" => Risk::ChecksOnly,
             "low" => Risk::Low,
             "normal" => Risk::Normal,
             _ => Risk::High,
@@ -104,6 +118,7 @@ impl Risk {
 impl Review {
     pub fn need(&self, risk: Risk) -> Need {
         match risk {
+            Risk::ChecksOnly => Need { approvals: 0, people_only: false },
             Risk::Low => self.low,
             Risk::Normal => self.normal,
             Risk::High => self.high,
@@ -120,6 +135,7 @@ impl Review {
             normal: one,
             high: one,
             high_risk_paths: Vec::new(),
+            checks_only: Vec::new(),
             warnings: vec![format!("{RULES_FILE}: {why}")],
             broken: true,
         }
@@ -172,6 +188,15 @@ impl Review {
                         }
                     }
                 }
+                "checks_only" => {
+                    let Some(a) = item.as_array() else { return Review::strict("review.checks_only is not a list of paths".into()) };
+                    for v in a.iter() {
+                        match v.as_str().filter(|p| valid_glob(p)) {
+                            Some(p) => out.checks_only.push(p.to_string()),
+                            None => return Review::strict("review.checks_only: an entry is not a path pattern".into()),
+                        }
+                    }
+                }
                 // Keys of later milestones are not this parser's to judge.
                 other => out.warnings.push(format!("{RULES_FILE}: review.{other} is not a review rule; ignored")),
             }
@@ -188,6 +213,9 @@ pub struct FileChange {
     pub secret: bool,
     /// Executable on the new side, in any change.
     pub executable: bool,
+    /// A regular file on every side, in every change (BUG-1324: never a
+    /// link, a folder or a conflict).
+    pub regular: bool,
 }
 
 const MANIFESTS: &[&str] = &[
@@ -319,6 +347,53 @@ fn is_ci(path: &str) -> bool {
         )
 }
 
+/// A `checks_only` pattern: `/`-separated names, `*` within a name, `**`
+/// as a whole name for any folders; a trailing `/` stands for `/**`. No
+/// empty, `.` or `..` names.
+fn valid_glob(p: &str) -> bool {
+    let p = p.strip_suffix('/').unwrap_or(p);
+    !p.is_empty() && p.len() <= 1024 && p.split('/').all(|n| !n.is_empty() && n != "." && n != ".." && (n == "**" || !n.contains("**")))
+}
+
+/// Does `path` match pattern `p` (see [`valid_glob`])?
+pub fn glob_matches(p: &str, path: &str) -> bool {
+    let p = match p.strip_suffix('/') {
+        Some(d) => format!("{d}/**"),
+        None => p.to_string(),
+    };
+    let pat: Vec<&str> = p.split('/').collect();
+    let names: Vec<&str> = path.split('/').collect();
+    fn name_matches(p: &str, n: &str) -> bool {
+        // `*` matches any run of characters within one name.
+        let parts: Vec<&str> = p.split('*').collect();
+        if parts.len() == 1 {
+            return p == n;
+        }
+        let (first, last) = (parts[0], parts[parts.len() - 1]);
+        if !n.starts_with(first) || n.len() < first.len() + last.len() || !n.ends_with(last) {
+            return false;
+        }
+        let mut rest = &n[first.len()..n.len() - last.len()];
+        for mid in &parts[1..parts.len() - 1] {
+            match rest.find(mid) {
+                Some(i) => rest = &rest[i + mid.len()..],
+                None => return false,
+            }
+        }
+        true
+    }
+    fn go(pat: &[&str], names: &[&str]) -> bool {
+        match pat.first() {
+            None => names.is_empty(),
+            // A trailing `**` is everything below: at least one name.
+            Some(&"**") if pat.len() == 1 => !names.is_empty(),
+            Some(&"**") => (0..=names.len()).any(|k| go(&pat[1..], &names[k..])),
+            Some(p) => !names.is_empty() && name_matches(p, names[0]) && go(&pat[1..], &names[1..]),
+        }
+    }
+    go(&pat, &names)
+}
+
 /// Why `f` makes a revision high risk, if it does.
 fn high_reason(f: &FileChange, rules: &Review) -> Option<String> {
     let p = f.path.as_str();
@@ -354,7 +429,13 @@ pub fn classify(files: &[FileChange], rules: &Review) -> (Risk, Vec<String>) {
     // never a build file, agent instructions or anything executable.
     // Everything else is normal. Whitespace changes are rated like any
     // other (BUG-1256: they change what scripts do).
-    let low = |f: &FileChange| !f.executable && !is_build(&f.path) && !is_agent_instructions(&f.path) && (is_docs(&f.path) || is_test(&f.path));
+    // Only regular, non-executable files are ever below normal (BUG-1324:
+    // a link is rated by what it points at, which the name does not say).
+    let plain = |f: &FileChange| f.regular && !f.executable;
+    if files.iter().all(|f| plain(f) && rules.checks_only.iter().any(|p| glob_matches(p, &f.path))) {
+        return (Risk::ChecksOnly, vec!["only paths the admins list as checks_only".into()]);
+    }
+    let low = |f: &FileChange| plain(f) && !is_build(&f.path) && !is_agent_instructions(&f.path) && (is_docs(&f.path) || is_test(&f.path));
     if files.iter().all(low) {
         return (Risk::Low, vec!["only documentation or tests".into()]);
     }
@@ -366,7 +447,7 @@ mod tests {
     use super::*;
 
     fn f(p: &str) -> FileChange {
-        FileChange { path: p.into(), secret: false, executable: false }
+        FileChange { path: p.into(), secret: false, executable: false, regular: true }
     }
 
     #[test]
@@ -477,5 +558,37 @@ mod tests {
         }
         let exe = FileChange { executable: true, ..f("tests/run.py") };
         assert_eq!(classify(&[exe], &rules).0, Risk::Normal);
+    }
+
+    /// BUG-1324, BUG-1325: links are never below normal; `checks_only`
+    /// paths (admins') need checks only; the defaults' low needs one
+    /// approval, an agent's counting, and normal a person's.
+    #[test]
+    fn checks_only_links_and_the_defaults() {
+        let d = Review::default();
+        assert_eq!(d.need(Risk::Low), Need { approvals: 1, people_only: false });
+        assert_eq!(d.need(Risk::Normal), Need { approvals: 1, people_only: true });
+        assert_eq!(d.need(Risk::ChecksOnly), Need { approvals: 0, people_only: false });
+        for p in ["docs/env.md", "README.md", "tests/x.rs"] {
+            let link = FileChange { regular: false, ..f(p) };
+            assert_eq!(classify(&[link], &d).0, Risk::Normal, "a link at {p}");
+        }
+        let r = Review::parse(Some(b"[review]\nchecks_only = [\"docs/**\", \"CHANGELOG.md\", \"site/*.md\", \"assets/\"]\n"));
+        assert!(!r.broken, "{r:?}");
+        for p in ["docs/a.md", "docs/a/b/c.png", "CHANGELOG.md", "site/x.md", "assets/a/b.svg"] {
+            assert_eq!(classify(&[f(p)], &r).0, Risk::ChecksOnly, "{p}");
+        }
+        for p in ["docs", "site/a/x.md", "site/x.mdx", "src/docs/a.md", "CHANGELOG.md.sh"] {
+            assert_ne!(classify(&[f(p)], &r).0, Risk::ChecksOnly, "{p}");
+        }
+        // High wins; one file outside makes it the next class down.
+        assert_eq!(classify(&[f("docs/a.md"), f(".github/CODEOWNERS")], &r).0, Risk::High);
+        assert_eq!(classify(&[f("docs/a.md"), f("src/a.rs")], &r).0, Risk::Normal);
+        let exe = FileChange { executable: true, ..f("docs/run.md") };
+        assert_eq!(classify(&[exe], &r).0, Risk::Normal);
+        for bad in [&b"[review]\nchecks_only = [\"../x\"]\n"[..], b"[review]\nchecks_only = [\"a/**b\"]\n", b"[review]\nchecks_only = \"docs\"\n", b"[review]\nchecks_only = [\"\"]\n"] {
+            assert!(Review::parse(Some(bad)).broken, "{}", String::from_utf8_lossy(bad));
+        }
+        assert!(glob_matches("**", "a/b") && glob_matches("a/**/z.md", "a/z.md") && glob_matches("a/**/z.md", "a/b/c/z.md") && !glob_matches("a/*", "a/b/c"));
     }
 }

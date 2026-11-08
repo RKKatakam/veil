@@ -110,19 +110,20 @@ CREATE TABLE IF NOT EXISTS pr_reviews (
 -- Each reviewer's latest verdict, read without its body (cycle 3).
 CREATE INDEX IF NOT EXISTS pr_reviews_by_person ON pr_reviews (project_id, pr, person, at);
 
--- A request for changes, attached to the change ids of the revision it was
--- given on (BUG-1278): it holds every PR whose revisions contain one of
--- them, until that reviewer approves a patch containing it or an admin
--- dismisses it.
+-- A request for changes (BUG-1278, BUG-1323), attached to what the PR's
+-- author cannot choose: the author (a person) and the paths the PR had
+-- touched when it was given. It holds every PR by that author touching one
+-- of those paths, until that reviewer approves one or an admin dismisses it.
 CREATE TABLE IF NOT EXISTS pr_holds (
     project_id BIGINT NOT NULL,
-    person BIGINT NOT NULL,
-    change_id TEXT NOT NULL,
+    person BIGINT NOT NULL,                -- the reviewer
+    author BIGINT NOT NULL,                -- the author of the PR it was given on
+    path TEXT NOT NULL,
     pr TEXT NOT NULL,                      -- the PR it was given on
     at BIGINT NOT NULL,
-    PRIMARY KEY (project_id, person, change_id)
+    PRIMARY KEY (project_id, person, author, path)
 );
-CREATE INDEX IF NOT EXISTS pr_holds_by_change ON pr_holds (project_id, change_id);
+CREATE INDEX IF NOT EXISTS pr_holds_by_author ON pr_holds (project_id, author, path);
 
 -- The `[review]` rules in force on each project's default branch
 -- (BUG-1279): a state recorded at each landing, in the landing's

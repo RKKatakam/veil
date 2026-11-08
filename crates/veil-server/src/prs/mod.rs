@@ -400,15 +400,6 @@ fn viewer_numbers(revs: &[RevRow], p: &HashMap<ObjectId, ObjectId>) -> Vec<i32> 
     out
 }
 
-/// Every change id any revision holds (what requests for changes are
-/// attached to, BUG-1278).
-fn change_ids_of(revs: &[RevRow]) -> Vec<String> {
-    let mut ids: Vec<String> = revs.iter().flat_map(|r| r.changes.iter().map(|c| c.change.clone())).collect();
-    ids.sort();
-    ids.dedup();
-    ids
-}
-
 /// Every real snapshot the revisions name.
 fn reals_of(revs: &[RevRow]) -> Vec<ObjectId> {
     let mut reals: Vec<ObjectId> = Vec::new();
@@ -439,7 +430,7 @@ pub async fn pr_json(hub: &Arc<Hub>, ask: &Ask, pr: &PrRow) -> Result<Value> {
     let ppl = names(hub, &revs.iter().map(|r| r.pushed_by).collect::<Vec<_>>()).await?;
     let current = revs.iter().find(|r| r.n == pr.revision).ok_or_else(|| Error::Other(anyhow::anyhow!("the PR's revision is missing")))?;
     let rules = rules(hub, ask).await?;
-    let gate = review::gate(hub, &ask.project, &ask.viewer, pr, &current.patch, &change_ids_of(&revs), &rules).await?;
+    let gate = review::gate(hub, &ask.project, &ask.viewer, pr, &current.patch, &rules).await?;
     let mut review = gate.json();
     for r in review["reviews"].as_array_mut().into_iter().flatten() {
         let real = r["revision"].as_i64().unwrap_or(0) as i32;
@@ -1278,8 +1269,7 @@ pub async fn dismiss(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: Di
     }
     let person: Option<i64> = sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&q.person).fetch_optional(&hub.db).await?;
     let person = person.ok_or_else(|| Error::not_found("no such person"))?;
-    let changes = change_ids_of(&revisions(hub, ask.project.id, &pr.id).await?);
-    if review::dismiss(hub, ask.project.id, &pr.id, person, &changes).await? == 0 {
+    if review::dismiss(hub, ask.project.id, &pr, person).await? == 0 {
         return Err(Error::not_found(format!("{} has no request for changes on this PR", q.person)));
     }
     show(hub, ask, id).await
@@ -1307,10 +1297,9 @@ pub async fn land(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Resul
         return Err(Error::forbidden("only the author, or someone who may write every file of this PR, lands it"));
     }
     let revs = revisions(hub, ask.project.id, &pr.id).await?;
-    let changes = change_ids_of(&revs);
     let current = revs.into_iter().find(|r| r.n == pr.revision).ok_or_else(|| Error::Other(anyhow::anyhow!("the PR's revision is missing")))?;
     let rules = rules(hub, ask).await?;
-    let gate = review::gate(hub, &ask.project, &ask.viewer, &pr, &current.patch, &changes, &rules).await?;
+    let gate = review::gate(hub, &ask.project, &ask.viewer, &pr, &current.patch, &rules).await?;
     if !gate.ready {
         return Err(Error::new(StatusCode::CONFLICT, "not_ready", format!("not ready to land: {}", gate.reasons.join("; "))));
     }

@@ -128,23 +128,20 @@ pub async fn verdicts(hub: &Hub, project: i64, pr: &str, patch: &str) -> Result<
     Ok(out)
 }
 
-/// The change ids of revision `n` of a PR.
-async fn change_ids(c: &mut sqlx::PgConnection, project: i64, pr: &str, n: i32) -> Result<Vec<String>> {
-    let changes: Option<String> = sqlx::query_scalar("SELECT changes FROM pr_revisions WHERE project_id = $1 AND pr = $2 AND n = $3")
-        .bind(project)
-        .bind(pr)
-        .bind(n)
-        .fetch_optional(&mut *c)
-        .await?;
-    let stack: Vec<super::revision::StackChange> = changes.as_deref().map(serde_json::from_str).transpose().map_err(|e| crate::error::Error::Other(e.into()))?.unwrap_or_default();
-    Ok(stack.into_iter().map(|c| c.change).collect())
+/// A PR's author and every path it touches (what holds are attached to,
+/// BUG-1323: neither is the author's to choose afresh).
+async fn author_and_paths(c: &mut sqlx::PgConnection, project: i64, pr: &str) -> Result<(i64, Vec<String>)> {
+    let author: i64 = sqlx::query_scalar("SELECT author FROM prs WHERE project_id = $1 AND id = $2").bind(project).bind(pr).fetch_one(&mut *c).await?;
+    let paths: Vec<String> = sqlx::query_scalar("SELECT path FROM pr_paths WHERE project_id = $1 AND pr = $2").bind(project).bind(pr).fetch_all(&mut *c).await?;
+    Ok((author, paths))
 }
 
 /// One verdict, as every verdict is written: the review row, and the holds
-/// (BUG-1278). A request for changes holds every change id of revision
-/// `revision`'s stack; an approval releases that person's holds on them.
-/// With `only_current`, nothing is written unless `revision` is still the
-/// PR's and the PR is open; answers whether it was written.
+/// (BUG-1278, BUG-1323). A request for changes holds every PR by this PR's
+/// author touching any path this PR touches; an approval releases this
+/// reviewer's holds on this author's PRs at those paths. With
+/// `only_current`, nothing is written unless `revision` is still the PR's
+/// and the PR is open; answers whether it was written.
 #[allow(clippy::too_many_arguments)]
 pub async fn put_verdict(
     hub: &Hub,
@@ -190,26 +187,28 @@ pub async fn put_verdict(
             if stored == 0 {
                 return Ok(false);
             }
-            let ids = change_ids(&mut *c, project, &pr, revision).await?;
+            let (author, paths) = author_and_paths(&mut *c, project, &pr).await?;
             match verdict.as_str() {
                 "request-changes" => {
                     sqlx::query(
-                        "INSERT INTO pr_holds (project_id, person, change_id, pr, at) SELECT $1, $2, id, $4, $5 FROM UNNEST($3::text[]) AS id \
-                         ON CONFLICT (project_id, person, change_id) DO UPDATE SET pr = EXCLUDED.pr, at = EXCLUDED.at",
+                        "INSERT INTO pr_holds (project_id, person, author, path, pr, at) SELECT $1, $2, $3, p, $5, $6 FROM UNNEST($4::text[]) AS p \
+                         ON CONFLICT (project_id, person, author, path) DO UPDATE SET pr = EXCLUDED.pr, at = EXCLUDED.at",
                     )
                     .bind(project)
                     .bind(person)
-                    .bind(&ids)
+                    .bind(author)
+                    .bind(&paths)
                     .bind(&pr)
                     .bind(now)
                     .execute(&mut *c)
                     .await?;
                 }
                 "approve" => {
-                    sqlx::query("DELETE FROM pr_holds WHERE project_id = $1 AND person = $2 AND change_id = ANY($3)")
+                    sqlx::query("DELETE FROM pr_holds WHERE project_id = $1 AND person = $2 AND author = $3 AND path = ANY($4)")
                         .bind(project)
                         .bind(person)
-                        .bind(&ids)
+                        .bind(author)
+                        .bind(&paths)
                         .execute(&mut *c)
                         .await?;
                 }
@@ -221,14 +220,16 @@ pub async fn put_verdict(
     .await
 }
 
-/// The people whose requests for changes hold a PR whose revisions hold
-/// `changes` (BUG-1278), by name.
-pub async fn holds_on(hub: &Hub, project: i64, changes: &[String]) -> Result<Vec<String>> {
+/// The people whose requests for changes hold a PR by `author` touching
+/// `paths` (BUG-1323), by name.
+pub async fn holds_on(hub: &Hub, project: i64, author: i64, paths: &[String]) -> Result<Vec<String>> {
     Ok(sqlx::query_scalar(
-        "SELECT DISTINCT pe.name FROM pr_holds h JOIN people pe ON pe.id = h.person WHERE h.project_id = $1 AND h.change_id = ANY($2) ORDER BY pe.name",
+        "SELECT DISTINCT pe.name FROM pr_holds h JOIN people pe ON pe.id = h.person \
+         WHERE h.project_id = $1 AND h.author = $2 AND h.path = ANY($3) ORDER BY pe.name",
     )
     .bind(project)
-    .bind(changes)
+    .bind(author)
+    .bind(paths)
     .fetch_all(&hub.db)
     .await?)
 }
@@ -272,15 +273,15 @@ impl Gate {
 
 /// The review gate of `pr`, whose current revision has `patch`, under
 /// `rules`, as `viewer` is shown it.
-pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, patch: &str, changes: &[String], rules: &Review) -> Result<Gate> {
+pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, patch: &str, rules: &Review) -> Result<Gate> {
     let risk = Risk::parse(&pr.risk);
     let need = rules.need(risk);
     let paths = paths_of(hub, project.id, &pr.id).await?;
     let mut reviews = Vec::new();
     let mut approvals = 0u32;
-    // Requests for changes on any of the PR's change ids, from any PR
-    // (BUG-1278): released only by their reviewer's approval or an admin.
-    let held: Vec<String> = holds_on(hub, project.id, changes).await?;
+    // Requests for changes on this author's PRs at any of these paths
+    // (BUG-1323): released only by their reviewer's approval or an admin.
+    let held: Vec<String> = holds_on(hub, project.id, pr.author, &paths).await?;
     let mut access: HashMap<i64, bool> = HashMap::new();
     for v in verdicts(hub, project.id, &pr.id, patch).await? {
         let reviewer = v.person != pr.author;
@@ -340,22 +341,24 @@ pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, pat
 }
 
 /// An admin dismisses `person`'s requests for changes on the PR (BUG-1259,
-/// BUG-1278): the only way one stops holding but the reviewer's own
-/// approval. Their holds on every change id of the PR's revisions go; their
+/// BUG-1323): the only way one stops holding but the reviewer's own
+/// approval. Their holds on this PR's author at this PR's paths go; their
 /// review rows stay, shown as `dismissed`. Answers how many holds went (one
 /// statement: of two admins at once, one dismisses, the other finds none).
-pub async fn dismiss(hub: &Hub, project: i64, pr: &str, person: i64, changes: &[String]) -> Result<u64> {
-    let gone = sqlx::query("DELETE FROM pr_holds WHERE project_id = $1 AND person = $2 AND change_id = ANY($3)")
+pub async fn dismiss(hub: &Hub, project: i64, pr: &PrRow, person: i64) -> Result<u64> {
+    let paths = paths_of(hub, project, &pr.id).await?;
+    let gone = sqlx::query("DELETE FROM pr_holds WHERE project_id = $1 AND person = $2 AND author = $3 AND path = ANY($4)")
         .bind(project)
         .bind(person)
-        .bind(changes)
+        .bind(pr.author)
+        .bind(&paths)
         .execute(&hub.db)
         .await?
         .rows_affected();
     if gone > 0 {
         sqlx::query("UPDATE pr_reviews SET verdict = 'dismissed' WHERE project_id = $1 AND pr = $2 AND person = $3 AND verdict = 'request-changes'")
             .bind(project)
-            .bind(pr)
+            .bind(&pr.id)
             .bind(person)
             .execute(&hub.db)
             .await?;

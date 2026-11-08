@@ -170,9 +170,11 @@ pub fn compute(cx: &Cx, g: &G, head: ObjectId, onto: ObjectId, rules: &Review) -
             entry_bytes(&mut patch, c.new.as_ref());
             let secret = [&c.old, &c.new].iter().any(|e| e.as_ref().is_some_and(|e| !e.visibility.is_public()));
             let executable = c.new.as_ref().is_some_and(|e| e.executable);
-            let f = files.entry(c.path.clone()).or_insert(FileChange { path: c.path.clone(), secret, executable });
+            let regular = [&c.old, &c.new].iter().all(|e| e.as_ref().is_none_or(|e| e.kind == EntryKind::File));
+            let f = files.entry(c.path.clone()).or_insert(FileChange { path: c.path.clone(), secret, executable, regular });
             f.secret |= secret;
             f.executable |= executable;
+            f.regular &= regular;
             touched.insert(c.path.clone());
         }
         touched.extend(dirs.into_iter().filter(|d| !d.is_empty()));

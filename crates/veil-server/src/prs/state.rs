@@ -13,10 +13,13 @@
 //!   (a forced move, a new branch, no state recorded there) `strict`, until
 //!   a landing with a valid file or none records one. No history is walked
 //!   and no older file's text is ever used.
-//! * **A reader** ([`rules_in_force`]) applies the state recorded at the
-//!   tip; a record behind the tip (the branch moved without a landing) is
-//!   brought up to it by the same rule, a compare-and-swap on the record's
-//!   tip, so a slow server never moves it back.
+//! * **A reader** ([`rules_in_force`]) reads the tip and the record in one
+//!   statement and applies the state recorded at the tip. A record behind
+//!   the tip (the branch moved without a landing) is brought up to it by a
+//!   compare-and-swap on the tip read with it: to the tip's own file (or
+//!   its absence), or, for a broken file, to the recorded state only if the
+//!   record's tip is an ancestor of the tip. A read never writes `strict`
+//!   (BUG-1322).
 
 use std::sync::Arc;
 
@@ -149,30 +152,43 @@ pub async fn record_landing(c: &mut sqlx::PgConnection, project: i64, l: &Landin
 /// The `[review]` rules in force at the tip of `branch` (the default
 /// branch), bringing a record that is behind the tip up to it.
 pub async fn rules_in_force(hub: &Arc<Hub>, project: &crate::perm::Project, branch: &str) -> Result<Review> {
-    let tip: Option<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2")
-        .bind(project.id)
-        .bind(branch)
-        .fetch_optional(&hub.db)
-        .await?;
-    let Some(tip) = tip.and_then(|t| ObjectId::from_hex(&t).ok()) else { return Ok(Review::default()) };
+    // The tip and the record in one statement (BUG-1322): a landing writes
+    // both in one transaction, so this is a state some landing left.
+    type Row = (String, Option<String>, Option<String>);
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT b.target, r.checked, r.state FROM branches b LEFT JOIN pr_review_rules r ON r.project_id = b.project_id \
+         WHERE b.project_id = $1 AND b.name = $2",
+    )
+    .bind(project.id)
+    .bind(branch)
+    .fetch_optional(&hub.db)
+    .await?;
+    let Some((tip, checked, state)) = row else { return Ok(Review::default()) };
+    let Ok(tip) = ObjectId::from_hex(&tip) else { return Ok(Review::default()) };
+    let recorded = match (checked, state) {
+        (Some(c), Some(s)) => Some((c.clone(), ObjectId::from_hex(&c).ok(), serde_json::from_str::<RulesState>(&s).ok())),
+        _ => None,
+    };
     let file = blocking(hub, project.id, move |cx| file_at(&cx.src, cx.src.snapshot(&tip)?.tree)).await?;
-    let row: Option<(String, String)> = sqlx::query_as("SELECT checked, state FROM pr_review_rules WHERE project_id = $1")
-        .bind(project.id)
-        .fetch_optional(&hub.db)
-        .await?;
-    let recorded = row.as_ref().and_then(|(c, s)| Some((ObjectId::from_hex(c).ok()?, serde_json::from_str::<RulesState>(s).ok()?)));
-    if let Some((checked, state)) = &recorded {
-        if *checked == tip {
-            return Ok(review_of(&file, state));
-        }
+    match &recorded {
+        Some((_, Some(checked), Some(state))) if *checked == tip => return Ok(review_of(&file, state)),
+        _ => {}
     }
-    // Behind the tip: the same rule as a landing, from the recorded tip.
-    let prev = match &recorded {
-        Some((checked, state)) if ancestor(hub, project, *checked, tip).await? => Some(state.clone()),
+    // Behind the tip (the branch moved without a landing): the rule of a
+    // landing, from the record read with the tip. A broken file keeps the
+    // recorded state only if the record's tip is an ancestor of the tip
+    // (a fast-forward); a valid file, or none, is the tip's own state. The
+    // write is a compare-and-swap on the record's tip as read, and a read
+    // never writes `strict` (BUG-1322): a broken file with no state to keep
+    // is answered strict, and the record left as it is.
+    let prev = match (&recorded, &file) {
+        (Some((_, Some(checked), Some(state))), RulesFile::Broken(_)) if ancestor(hub, project, *checked, tip).await? => Some(state.clone()),
         _ => None,
     };
     let state = next_state(&file, prev.as_ref());
-    write_record(hub, project.id, row.as_ref().map(|r| r.0.as_str()), tip, &state).await?;
+    if state != RulesState::Strict {
+        write_record(hub, project.id, recorded.as_ref().map(|r| r.0.as_str()), tip, &state).await?;
+    }
     Ok(review_of(&file, &state))
 }
 

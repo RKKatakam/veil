@@ -968,6 +968,34 @@ fn check_changes(
     for p in parents.iter().skip(1) {
         others.push((src.snapshot(p)?.tree, None));
     }
+    // A merge checked against every parent, not only the first (BUG-1321,
+    // BUG-820's class): a path where it differs from another parent `j`,
+    // and not from the first (those are `changes`, below), keeps the first
+    // parent's version over `j`'s. That is a write, unless some other
+    // parent `i` has that version and `i`'s side made it since its common
+    // ancestor with `j` (taking a change someone who could write it made).
+    for (j, pj) in parents.iter().enumerate().skip(1) {
+        let (differ, _) = crate::derive::changes::diff(src, src.snapshot(pj)?.tree, *real_tree)?;
+        for c in differ {
+            if view.write(&c.path) || changes.iter().any(|x| x.path == c.path) {
+                continue;
+            }
+            let mut taken = false;
+            for (i, pi) in parents.iter().enumerate() {
+                if i == j || entry_at(src, &src.snapshot(pi)?.tree, &c.path)? != c.new {
+                    continue;
+                }
+                let base = src.snapshot(&common_ancestor(src, *pi, *pj)?)?.tree;
+                if entry_at(src, &base, &c.path)? != c.new {
+                    taken = true;
+                    break;
+                }
+            }
+            if !taken {
+                return Err(Error::forbidden(format!("you may not write '{}'", c.path)));
+            }
+        }
+    }
     for c in changes {
         // Taken from another parent of a merge, where that parent's side
         // changed it since the common ancestor: the merge takes a change
