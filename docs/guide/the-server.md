@@ -299,9 +299,9 @@ vl pr update pr-4f2a9c1b retry               # a new revision, after more pushes
 - **An approval is for the files as they were.** Change the files and the
   approvals stop counting. A rebase that leaves your files as they are
   keeps them. You cannot approve your own PR. Only people who may write
-  every file of a PR review it. A request for changes holds every PR by
-  that author touching those files (a new PR of them too) until that
-  reviewer approves, or an admin dismisses it (`vl pr dismiss ID PERSON`).
+  every file of a PR review it. A request for changes holds every PR touching
+  those files, whoever opens it, until that reviewer approves that PR, or
+  an admin dismisses it (`vl pr dismiss ID PERSON`).
 - `vl pr land` checks the review rules. Landing through the server's
   landing service comes with that service.
 - Over HTTPS: `/v1/projects/{project}/prs…` ([HUB.md §13.24](../HUB.md)).

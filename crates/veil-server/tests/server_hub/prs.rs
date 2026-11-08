@@ -2482,11 +2482,12 @@ mod s21_cycle3 {
         let v = th.rt.block_on(prs::create(&hub, &member(&th, &h, bob.0), &me, CreatePr { head: "bigger".into(), title: "bigger".into(), ..Default::default() })).unwrap();
         let bigger = pr_id(v.clone());
         assert!(held_by_alice(&h, &bigger), "a stack holding the change is held");
-        // Alice approves the larger stack's patch: every PR of the change is
-        // released.
+        // Alice approves the larger stack: that PR is released, and only it
+        // (BUG-1326: an approval releases the PR approved, nothing else).
         put_review(&th, &h, &bigger, 1, alice.0, "approve", v["patch"].as_str().unwrap());
-        for pr in [&id, &beside, &bigger] {
-            assert!(!held_by_alice(&h, pr), "{pr}: released by alice's approval of a patch holding the change");
+        assert!(!held_by_alice(&h, &bigger), "released by alice's approval of it");
+        for pr in [&id, &beside] {
+            assert!(held_by_alice(&h, pr), "{pr}: still held: alice approved another PR");
         }
     }
 
@@ -3200,7 +3201,6 @@ mod s21_redesign_cycle2 {
     /// the comment is not an approval of the first PR, which must stay
     /// held.
     #[test]
-    #[ignore = "BUG-1326: an approval of another PR at the same paths releases the request for changes on this one"]
     fn bug_1326_an_approval_of_another_pr_releases_the_request_on_this_one() {
         let Held { th, mut h, alice, bob, cy, id, .. } = held();
         let hub = h.hub.clone();
@@ -3226,7 +3226,6 @@ mod s21_redesign_cycle2 {
     /// list it. A PR whose only change is a new empty folder (no file
     /// changes) is rated `checks-only` and is ready with no approval.
     #[test]
-    #[ignore = "BUG-1328: a PR that changes no file is checks-only under the defaults"]
     fn bug_1328_a_pr_of_folders_only_is_checks_only_by_default() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);
@@ -3310,7 +3309,6 @@ mod s21_redesign_cycle2 {
     /// (`sync::common_ancestor`, the first snapshot either walk reaches
     /// that the other has seen) is `A0` here, through `M1`'s second parent.
     #[test]
-    #[ignore = "BUG-1327: the merge check uses a common ancestor that need not be a merge base"]
     fn bug_1327_the_merge_check_uses_a_common_ancestor_that_is_not_a_merge_base() {
         older_version_through_a_merge(false);
     }
@@ -3320,7 +3318,6 @@ mod s21_redesign_cycle2 {
     /// diff) takes the same common ancestor, so this route predates
     /// BUG-1321's fix.
     #[test]
-    #[ignore = "BUG-1327: the merge check uses a common ancestor that need not be a merge base"]
     fn bug_1327_with_the_tip_first() {
         older_version_through_a_merge(true);
     }
@@ -3371,7 +3368,6 @@ mod s21_redesign_cycle2 {
     /// 1,000 paths 2.1 s, 2,000 paths 8.0 s, 4,000 paths 45.7 s; 47 ms for
     /// 4,000 paths without BUG-1321's new loop. The bound here is 3 s.
     #[test]
-    #[ignore = "BUG-1329: the merge check walks the history once per path"]
     fn bug_1329_the_merge_check_walks_the_history_once_per_path() {
         let n: usize = std::env::var("S21_N").ok().and_then(|v| v.parse().ok()).unwrap_or(150);
         let th = TestHub::start();
@@ -3422,5 +3418,46 @@ mod s21_redesign_cycle2 {
         let r = th.rt.block_on(prs::show(&hub, &member(&th, &h, bob.0), &renamed)).unwrap()["review"].clone();
         assert_eq!(r["approvals"], 1, "{r}");
         assert!(r["ready"] == false && r["reasons"].to_string().contains(&format!("{} asked for changes", alice.1)), "held: {r}");
+    }
+
+    /// BUG-1326's decision: a request for changes holds every PR at its
+    /// paths whoever opened it (a colleague who takes the change over is
+    /// held too), is released for a PR only by that reviewer's approval of
+    /// that PR (of its current patch), and leaves a PR at another path, by
+    /// anyone, untouched.
+    #[test]
+    fn a_hold_is_at_its_paths_whoever_opens_the_pr() {
+        let Held { th, mut h, alice, bob, cy, .. } = held();
+        let hub = h.hub.clone();
+        let held_by_alice = |h: &Hist, who: i64, pr: &str| -> bool {
+            let v = th.rt.block_on(prs::show(&hub, &member(&th, h, who), pr)).unwrap();
+            v["review"]["reasons"].to_string().contains(&format!("{} asked for changes", alice.1))
+        };
+        // cy takes the change over: the same file, in a PR of hers.
+        let mut f = h.files[&h.branches["main"]].clone();
+        f.insert("pub/auth.rs".into(), b"fn check() {}\n".to_vec());
+        let s = h.commit(&th, &[h.branches["main"]], f, [8; 16], 7_000, None);
+        h.set_branch(&th, "cy-takes-over", s);
+        let v = th.rt.block_on(prs::create(&hub, &member(&th, &h, cy.0), &caller(cy.0, &cy.1), CreatePr { head: "cy-takes-over".into(), title: "takeover".into(), ..Default::default() })).unwrap();
+        let takeover = pr_id(v.clone());
+        assert!(held_by_alice(&h, cy.0, &takeover), "a colleague's PR at the held path is held");
+        // bob's PR at another path: untouched.
+        let mut f = h.files[&h.branches["main"]].clone();
+        f.insert("pub/elsewhere.rs".into(), b"fn elsewhere() {}\n".to_vec());
+        let s = h.commit(&th, &[h.branches["main"]], f, [9; 16], 8_000, None);
+        h.set_branch(&th, "elsewhere", s);
+        let e = pr_id(th.rt.block_on(prs::create(&hub, &member(&th, &h, bob.0), &caller(bob.0, &bob.1), CreatePr { head: "elsewhere".into(), title: "elsewhere".into(), ..Default::default() })).unwrap());
+        assert!(!held_by_alice(&h, bob.0, &e), "a PR at another path is not held");
+        // Alice approves cy's PR: released for it; an approval of an older
+        // patch does not count after a new revision.
+        put_review(&th, &h, &takeover, 1, alice.0, "approve", v["patch"].as_str().unwrap());
+        assert!(!held_by_alice(&h, cy.0, &takeover), "released by alice's approval of it");
+        let mut f = h.files[&h.branches["main"]].clone();
+        f.insert("pub/auth.rs".into(), b"fn check() { skip() }\n".to_vec());
+        let s = h.commit(&th, &[h.branches["main"]], f, [8; 16], 9_000, None);
+        h.set_branch(&th, "cy-takes-over", s);
+        let v2 = th.rt.block_on(prs::add_revision(&hub, &member(&th, &h, cy.0), &caller(cy.0, &cy.1), &takeover, RevisionRequest { head: "cy-takes-over".into() })).unwrap();
+        assert_eq!(v2["revision"], 2, "{v2}");
+        assert!(held_by_alice(&h, cy.0, &takeover), "a new patch is held again until alice approves it");
     }
 }

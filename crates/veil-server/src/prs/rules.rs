@@ -429,6 +429,11 @@ pub fn classify(files: &[FileChange], rules: &Review) -> (Risk, Vec<String>) {
     // never a build file, agent instructions or anything executable.
     // Everything else is normal. Whitespace changes are rated like any
     // other (BUG-1256: they change what scripts do).
+    // A revision that changes no file (only folders) is never below normal
+    // (BUG-1328): "every file is …" holds for no files at all.
+    if files.is_empty() {
+        return (Risk::Normal, vec!["changes no file".into()]);
+    }
     // Only regular, non-executable files are ever below normal (BUG-1324:
     // a link is rated by what it points at, which the name does not say).
     let plain = |f: &FileChange| f.regular && !f.executable;
@@ -589,6 +594,9 @@ mod tests {
         for bad in [&b"[review]\nchecks_only = [\"../x\"]\n"[..], b"[review]\nchecks_only = [\"a/**b\"]\n", b"[review]\nchecks_only = \"docs\"\n", b"[review]\nchecks_only = [\"\"]\n"] {
             assert!(Review::parse(Some(bad)).broken, "{}", String::from_utf8_lossy(bad));
         }
+        // BUG-1328: no file at all is never checks-only or low.
+        assert_eq!(classify(&[], &r).0, Risk::Normal);
+        assert_eq!(classify(&[], &d).0, Risk::Normal);
         assert!(glob_matches("**", "a/b") && glob_matches("a/**/z.md", "a/z.md") && glob_matches("a/**/z.md", "a/b/c/z.md") && !glob_matches("a/*", "a/b/c"));
     }
 }

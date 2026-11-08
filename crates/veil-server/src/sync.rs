@@ -922,28 +922,79 @@ pub(crate) fn named_ids(src: &Source, e: &veil_core::TreeEntry) -> Result<Vec<Ob
     Ok(out)
 }
 
-/// A common ancestor of real snapshots `a` and `b` (the universal root at
-/// worst): both histories are walked a generation at a time until one
-/// reaches a snapshot the other has seen.
-fn common_ancestor(src: &Source, a: ObjectId, b: ObjectId) -> Result<ObjectId> {
-    let root = root_snapshot_id();
-    let mut seen = [HashSet::new(), HashSet::new()];
-    let mut queue = [std::collections::VecDeque::from([a]), std::collections::VecDeque::from([b])];
-    loop {
-        let mut walked = false;
-        for side in 0..2 {
-            let Some(x) = queue[side].pop_front() else { continue };
-            walked = true;
-            if seen[1 - side].contains(&x) {
-                return Ok(x);
+/// The most snapshots not derived yet that [`merge_bases`] gives rows to
+/// (a push's own, or the derive workers' lag) before it answers busy.
+const UNDERIVED_ROWS: usize = 100_000;
+
+/// The merge bases of real snapshots `a` and `b`: their best common
+/// ancestors, none an ancestor of another (BUG-1327; several after a
+/// criss-cross merge), by the derived commit graph (`derive::graph`, paint
+/// down by generation). Snapshots not derived yet (this push's own, or the
+/// derive workers' lag) get their rows computed here first.
+fn merge_bases(src: &Source, a: ObjectId, b: ObjectId) -> Result<Vec<ObjectId>> {
+    use crate::derive::graph::{Graph, GraphRow};
+    let cx = crate::derive::Cx {
+        src: Source { hub: src.hub.clone(), project: src.project, rt: src.rt.clone(), pending: src.pending.clone() },
+    };
+    let mut g = Graph::new(&cx);
+    let mut made = 0usize;
+    for tip in [a, b] {
+        let mut stack = vec![(tip, false)];
+        while let Some((x, expanded)) = stack.pop() {
+            if g.row(&x)?.is_some() {
+                continue;
             }
-            if seen[side].insert(x) && x != root {
-                queue[side].extend(src.snapshot(&x)?.parents.iter().copied());
+            let s = src.snapshot(&x)?;
+            if !expanded {
+                stack.push((x, true));
+                stack.extend(s.parents.iter().map(|p| (*p, false)));
+                continue;
+            }
+            let parents: Vec<(ObjectId, Arc<GraphRow>)> = s.parents.iter().map(|p| Ok((*p, g.get(p)?))).collect::<Result<_>>()?;
+            g.pending.insert(x, Arc::new(GraphRow::compute(&s, &parents)));
+            made += 1;
+            if made > UNDERIVED_ROWS {
+                return Err(Error::busy());
             }
         }
-        if !walked {
-            return Ok(root);
+    }
+    g.merge_bases(a, b)
+}
+
+/// Did parent `i`'s side make version `new` of `path`, against parent `j`:
+/// does `i` have it and no merge base of `i` and `j` (each pair's bases
+/// found once per merge, BUG-1329) have it?
+struct Sides<'a> {
+    src: &'a Source,
+    parents: &'a [ObjectId],
+    trees: Vec<ObjectId>,
+    bases: HashMap<(usize, usize), Vec<ObjectId>>,
+}
+
+impl<'a> Sides<'a> {
+    fn new(src: &'a Source, parents: &'a [ObjectId]) -> Result<Sides<'a>> {
+        let trees = parents.iter().map(|p| Ok(src.snapshot(p)?.tree)).collect::<Result<_>>()?;
+        Ok(Sides { src, parents, trees, bases: HashMap::new() })
+    }
+
+    fn made(&mut self, i: usize, j: usize, path: &str, new: &Option<veil_core::TreeEntry>) -> Result<bool> {
+        if entry_at(self.src, &self.trees[i], path)? != *new {
+            return Ok(false);
         }
+        let k = (i.min(j), i.max(j));
+        if !self.bases.contains_key(&k) {
+            let mut trees = Vec::new();
+            for b in merge_bases(self.src, self.parents[k.0], self.parents[k.1])? {
+                trees.push(self.src.snapshot(&b)?.tree);
+            }
+            self.bases.insert(k, trees);
+        }
+        for t in &self.bases[&k] {
+            if entry_at(self.src, t, path)? == *new {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -964,29 +1015,22 @@ fn check_changes(
     let policy = Policy::parse(&text);
     // A merge's other parents: their trees, and the tree of a common
     // ancestor with the first parent (found when first needed).
-    let mut others: Vec<(ObjectId, Option<ObjectId>)> = Vec::new();
-    for p in parents.iter().skip(1) {
-        others.push((src.snapshot(p)?.tree, None));
-    }
+    let mut sides = Sides::new(src, parents)?;
     // A merge checked against every parent, not only the first (BUG-1321,
     // BUG-820's class): a path where it differs from another parent `j`,
     // and not from the first (those are `changes`, below), keeps the first
     // parent's version over `j`'s. That is a write, unless some other
-    // parent `i` has that version and `i`'s side made it since its common
-    // ancestor with `j` (taking a change someone who could write it made).
-    for (j, pj) in parents.iter().enumerate().skip(1) {
-        let (differ, _) = crate::derive::changes::diff(src, src.snapshot(pj)?.tree, *real_tree)?;
+    // parent `i`'s side made that version since their merge bases (taking a
+    // change someone who could write it made).
+    for j in 1..parents.len() {
+        let (differ, _) = crate::derive::changes::diff(src, sides.trees[j], *real_tree)?;
         for c in differ {
             if view.write(&c.path) || changes.iter().any(|x| x.path == c.path) {
                 continue;
             }
             let mut taken = false;
-            for (i, pi) in parents.iter().enumerate() {
-                if i == j || entry_at(src, &src.snapshot(pi)?.tree, &c.path)? != c.new {
-                    continue;
-                }
-                let base = src.snapshot(&common_ancestor(src, *pi, *pj)?)?.tree;
-                if entry_at(src, &base, &c.path)? != c.new {
+            for i in 0..parents.len() {
+                if i != j && sides.made(i, j, &c.path, &c.new)? {
                     taken = true;
                     break;
                 }
@@ -998,20 +1042,13 @@ fn check_changes(
     }
     for c in changes {
         // Taken from another parent of a merge, where that parent's side
-        // changed it since the common ancestor: the merge takes a change
+        // changed it since their merge bases: the merge takes a change
         // someone who could write it made. Taking the version the first
         // parent replaced is a revert, a write like any other.
         let mut from_other = false;
         if !view.write(&c.path) {
-            for (i, (tree, base)) in others.iter_mut().enumerate() {
-                if entry_at(src, tree, &c.path)? != c.new {
-                    continue;
-                }
-                let base = match base {
-                    Some(b) => *b,
-                    None => *base.insert(src.snapshot(&common_ancestor(src, parents[0], parents[i + 1])?)?.tree),
-                };
-                if entry_at(src, &base, &c.path)? != c.new {
+            for i in 1..parents.len() {
+                if sides.made(i, 0, &c.path, &c.new)? {
                     from_other = true;
                     break;
                 }
