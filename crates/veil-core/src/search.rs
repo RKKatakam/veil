@@ -180,7 +180,7 @@ impl<'a> Searcher<'a> {
         let parent_trees: Vec<Option<ObjectId>> = s
             .parents
             .iter()
-            .map(|p| repo.snapshot_opt(p).map(|o| o.map(|ps| ps.tree)))
+            .map(|p| repo.exact().snapshot(p).map(|o| o.map(|ps| ps.tree)))
             .collect::<Result<_>>()?;
         // The path filter: changed against every parent (a merge is listed
         // only where it differs from all of them).

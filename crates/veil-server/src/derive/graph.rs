@@ -37,8 +37,9 @@ pub const FLAG_EMBARGO_LINE: i32 = 2;
 
 /// The largest timestamp a generation takes from a snapshot (about 73
 /// million years in milliseconds): far above any real clock, and far
-/// enough below `i64::MAX` that no history can count up to it.
-pub const MAX_STAMP: i64 = i64::MAX / 4;
+/// enough below `i64::MAX` that no history can count up to it. The
+/// clients' value too (`veil_core::graph_index::generation`, BUG-1316).
+pub use veil_core::graph_index::MAX_STAMP;
 
 /// The jump-table levels after the first parent.
 const LEVELS: [i64; 3] = [16, 256, 4096];
@@ -76,8 +77,8 @@ impl GraphRow {
         // The timestamp is the author's choice (BUG-866): clamped, so that
         // 1 plus a parent's generation never overflows, and generations
         // strictly decrease along every edge whatever was pushed.
-        let stamp = s.timestamp.clamp(0, MAX_STAMP);
-        let generation = parents.iter().map(|(_, p)| p.generation.saturating_add(1)).max().unwrap_or(0).max(stamp);
+        // `veil_core`'s one arithmetic, the clients' too (BUG-1316).
+        let generation = veil_core::graph_index::generation(s.timestamp, parents.iter().map(|(_, p)| p.generation as u64)) as i64;
         let mut flags = if s.embargo.is_some() { FLAG_EMBARGO | FLAG_EMBARGO_LINE } else { 0 };
         for (_, p) in parents {
             flags |= p.flags & FLAG_EMBARGO_LINE;

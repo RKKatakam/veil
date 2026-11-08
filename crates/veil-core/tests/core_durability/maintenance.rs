@@ -303,7 +303,7 @@ fn prune_with_clock_steps_beside_writers_keeps_everything_reachable() {
     }
     assert!(runs > 1);
     let r = Repo::open(fs.clone(), Some(id.clone()), "alice").unwrap();
-    for h in r.visible_snapshots().unwrap() {
+    for h in r.exact().visible().unwrap() {
         let tree = r.snapshot(&h).unwrap().tree;
         veil_core::tree::walk_files(r.store(), &tree).unwrap();
     }

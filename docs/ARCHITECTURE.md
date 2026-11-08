@@ -2683,6 +2683,21 @@ snapshot 1, a base its size in bytes. The defaults are 200k tree entries,
 20k snapshots and 64 MiB of bases, adjustable with
 `ObjectStore::set_cache_limits`.
 
+### Thin clones: fetch on demand (`promisor.rs`)
+
+A thin clone of a server project (format 9, `docs/HUB.md` §13.21) keeps
+two object stores: `.veil/objects/` (every snapshot it fetched, and
+everything it made; never evicted) and `.veil/cache/` (trees and files
+fetched from the server; evicted least recently written first, down to 80 %
+of its bound, never what a workspace's working copy or the checkout record
+pins). A read neither holds goes to the server at the snapshot and path
+where the process met the object (recorded as trees are decoded); what
+arrives is re-hashed before use. The server's "not there for you" is
+`Missing`; a server that cannot be reached is `Unavailable`, which no
+caller reads as hidden. Snapshots are never fetched by a read: graph
+queries that reach the clone's boundary fetch history pages and run again
+(`Repo::exact`). gc, fsck and maintenance never fetch.
+
 ### The history index (`graph_index.rs`)
 
 Graph queries that used to read every reachable snapshot (the auto-rebase

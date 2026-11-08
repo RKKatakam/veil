@@ -1864,3 +1864,408 @@ mod s13_adversarial {
         assert!(work <= 2 * limits.work, "a page with a budget of {} read {work} rows and objects", limits.work);
     }
 }
+
+// ---- q/resolve (S3 redesign review, cycle 1): `s3rd_…` ------------------------------
+
+/// `q/resolve` of `prefix` as `a`, as compared.
+fn resolved(th: &TestHub, h: &Hist, a: &Ask, prefix: &str) -> String {
+    th.rt.block_on(async { norm(settled(|| query::resolve_prefix(&h.hub, a, prefix, &[], Limits::default())).await) })
+}
+
+/// Guarantee 2 of the redesign (the cap reveals nothing hidden): a
+/// snapshot id prefix that 16 snapshots of the admin's history match, in
+/// a project that also holds one snapshot on an embargo line with that
+/// prefix (withheld from everyone, admins too, until its release), gets
+/// the same answer as in the same project without it. `resolve_prefix`
+/// reads at most 17 rows of `view_graph` with the prefix, withheld ones
+/// among them, sets `more` from that count, keeps the first 16, and only
+/// then drops the withheld: the embargoed snapshot takes a visible one's
+/// place, and turns `more` on.
+#[test]
+fn s3rd_resolve_caps_reveal_no_withheld_snapshot() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut a = Hist::new(&th, &policy_text, &bindings);
+    let mut b = Hist::new(&th, &policy_text, &bindings);
+    let files = Files::from([("pub/a.rs".to_string(), b"fn a() {}\n".to_vec())]);
+    let (mut ta, mut tb) = (root_snapshot_id(), root_snapshot_id());
+    let mut ts = 1_700_000_000_000;
+    for i in 0..16u8 {
+        let mut f = files.clone();
+        f.insert(format!("pub/f{i}.rs"), vec![b'x'; 8]);
+        // Every visible snapshot's id starts with abcd, and sorts after
+        // abcd0 (the embargoed one's).
+        ts = Hist::timestamp_for(&[ta], &f, [i + 1; 16], ts, None, |h| h.starts_with("abcd") && !h.starts_with("abcd0"));
+        ta = a.commit(&th, &[ta], f.clone(), [i + 1; 16], ts, None);
+        tb = b.commit(&th, &[tb], f, [i + 1; 16], ts, None);
+        assert_eq!(ta, tb);
+        assert!(ta.hex().starts_with("abcd"));
+        ts += 1;
+    }
+    a.set_branch(&th, "main", ta);
+    b.set_branch(&th, "main", tb);
+    // In b only: an embargoed fix on top, whose id sorts first.
+    let mut fixed = files.clone();
+    fixed.insert("pub/fix-embargo-3c11.rs".into(), b"FIX-MARKER-77e0\n".to_vec());
+    let at = Hist::timestamp_for(&[tb], &fixed, [0x77; 16], ts, Some("cve-9"), |h| h.starts_with("abcd0"));
+    let e = b.commit(&th, &[tb], fixed, [0x77; 16], at, Some("cve-9"));
+    b.set_branch(&th, "embargoed", e);
+    let adm = admin();
+    warm_up(&th, &a, &adm);
+    warm_up(&th, &b, &adm);
+    let (xa, xb) = (ask(&th, &a, &adm), ask(&th, &b, &adm));
+    let without = resolved(&th, &a, &xa, "abcd");
+    assert!(without.contains("\"more\":false"), "{without}");
+    assert!(!resolved(&th, &b, &xb, "abcd").contains(&e.hex()), "the withheld snapshot is named");
+    assert_eq!(resolved(&th, &b, &xb, "abcd"), without, "a withheld snapshot changes the answer for a prefix it matches");
+}
+
+/// Guarantee 2 of the redesign: changes the caller cannot see (wholly in a
+/// folder they have no access to) whose change ids share a prefix with a
+/// visible change's do not change the answer for that prefix.
+/// `resolve_prefix` reads at most 64 rows of the real `graph` with the
+/// prefix (hidden changes among them, in no stated order), projects them,
+/// and drops the hidden; `more` says nothing of the rows it did not read:
+/// the visible change is left out, and the answer is "nothing matched".
+#[test]
+fn s3rd_resolve_of_a_change_prefix_ignores_hidden_changes() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut a = Hist::new(&th, &policy_text, &bindings);
+    let mut b = Hist::new(&th, &policy_text, &bindings);
+    let base = Files::from([("pub/a.rs".to_string(), b"fn a() {}\n".to_vec()), ("fin/base.txt".to_string(), b"hidden in both\n".to_vec())]);
+    let root = root_snapshot_id();
+    let v0a = a.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+    let v0b = b.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+    // In b only: 70 changes of fin/ (hidden from devs and anyone), change
+    // ids abcd00…, abcd01…, on a branch of their own.
+    let mut hid = base.clone();
+    let mut th_tip = v0b;
+    for i in 0..70u8 {
+        hid.insert(format!("fin/q{i}.txt"), format!("plan {i}\n").into_bytes());
+        let mut change = [0u8; 16];
+        change[0] = 0xab;
+        change[1] = 0xcd;
+        change[2] = i;
+        th_tip = b.commit(&th, &[th_tip], hid.clone(), change, 2_000 + i64::from(i), None);
+    }
+    b.set_branch(&th, "fin-work", th_tip);
+    // In both: a visible change abcdff….
+    let mut f = base.clone();
+    f.insert("pub/b.rs".into(), b"fn b() {}\n".to_vec());
+    let mut change = [0xffu8; 16];
+    change[0] = 0xab;
+    change[1] = 0xcd;
+    let va = a.commit(&th, &[v0a], f.clone(), change, 3_000, None);
+    let vb = b.commit(&th, &[v0b], f, change, 3_000, None);
+    a.set_branch(&th, "main", va);
+    b.set_branch(&th, "main", vb);
+    a.derive(&th);
+    b.derive(&th);
+    let prefix = veil_core::ChangeId(change).display()[..4].to_string();
+    for (who, viewer) in [("anyone on Earth", Viewer::default()), ("a dev", viewers(1)[1].1.clone())] {
+        warm_up(&th, &a, &viewer);
+        warm_up(&th, &b, &viewer);
+        let (xa, xb) = (ask(&th, &a, &viewer), ask(&th, &b, &viewer));
+        let without = resolved(&th, &a, &xa, &prefix);
+        assert!(!without.contains("\"changes\":[]"), "{who}: the visible change is named: {without}");
+        assert_eq!(resolved(&th, &b, &xb, &prefix), without, "{who}: hidden changes change the answer for {prefix}");
+    }
+}
+
+// ---- q/resolve (S3 redesign review, cycle 2): `s3rd2_…` ---------------------------
+
+/// BUG-1317 (guarantee 1 of cycle 2: errors and timing beyond bounded work
+/// reveal nothing outside the caller's projected, branch-reachable
+/// history). `resolve_prefix`'s change-id step still reads the *real*
+/// `graph`, every snapshot ever derived, hidden changes and old versions
+/// among them, and projects each row it reads (`ensure`) before it drops
+/// what the caller cannot see. A hidden snapshot no branch reaches (the
+/// first version of a rewritten `fin/` change) has no projection for the
+/// caller, so a prefix that matches it starts a fill and waits for it: while
+/// another fill of the caller's view key runs (another server's lease, a
+/// long first fill), the answer is `warming` after the query's deadline,
+/// where the same project without the hidden snapshot answers at once.
+/// What does not count costs work and fills, up to the deadline, in
+/// proportion to the hidden rows with the prefix.
+#[test]
+fn s3rd2_resolve_answers_alike_whatever_hidden_history_it_meets() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut a = Hist::new(&th, &policy_text, &bindings);
+    let mut b = Hist::new(&th, &policy_text, &bindings);
+    let base = Files::from([("pub/a.rs".to_string(), b"fn a() {}\n".to_vec()), ("fin/base.txt".to_string(), b"hidden in both\n".to_vec())]);
+    let root = root_snapshot_id();
+    let v0a = a.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+    let v0b = b.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+    // In b only: a change of fin/ (hidden from security), change id abcd00…,
+    // on a branch of its own, then rewritten: its first version stays in
+    // the real graph, and no branch reaches it.
+    let mut hidden = [0u8; 16];
+    hidden[0] = 0xab;
+    hidden[1] = 0xcd;
+    let mut fin = base.clone();
+    fin.insert("fin/plan.txt".into(), b"plan one\n".to_vec());
+    let h1 = b.commit(&th, &[v0b], fin.clone(), hidden, 2_000, None);
+    b.set_branch(&th, "fin-work", h1);
+    b.derive(&th);
+    fin.insert("fin/plan.txt".into(), b"plan two\n".to_vec());
+    let h2 = b.commit(&th, &[v0b], fin, hidden, 2_001, None);
+    b.set_branch(&th, "fin-work", h2);
+    // In both: a visible change abcdff….
+    let mut f = base.clone();
+    f.insert("pub/b.rs".into(), b"fn b() {}\n".to_vec());
+    let mut change = [0xffu8; 16];
+    change[0] = 0xab;
+    change[1] = 0xcd;
+    let va = a.commit(&th, &[v0a], f.clone(), change, 3_000, None);
+    let vb = b.commit(&th, &[v0b], f, change, 3_000, None);
+    a.set_branch(&th, "main", va);
+    b.set_branch(&th, "main", vb);
+    a.derive(&th);
+    b.derive(&th);
+    // Security: neither anyone's view nor a member's, so no landing fills it.
+    let viewer = viewers(1)[2].1.clone();
+    warm_up(&th, &a, &viewer);
+    warm_up(&th, &b, &viewer);
+    let (xa, xb) = (ask(&th, &a, &viewer), ask(&th, &b, &viewer));
+    let vk = b.project(&th).view(&viewer).key();
+    let vka = a.project(&th).view(&viewer).key();
+    let hub = b.hub.clone();
+    th.rt.block_on(async {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM graph WHERE project_id = $1 AND snapshot = $2")
+            .bind(b.id)
+            .bind(h1.hex())
+            .fetch_one(&hub.db)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "the first version of the hidden change is in the real graph");
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+            .bind(b.id)
+            .bind(&vk)
+            .bind(h1.hex())
+            .fetch_one(&hub.db)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "no fill projected the first version for the viewer");
+        // Another fill of the viewer's graph is running, in both projects.
+        for (pid, key) in [(a.id, vka.clone()), (b.id, vk.clone())] {
+            sqlx::query("INSERT INTO view_fills (project_id, view_key, holder, expires_at) VALUES ($1, $2, 'another-server', $3)")
+                .bind(pid)
+                .bind(key)
+                .bind(veil_core::now_millis() + 600_000)
+                .execute(&hub.db)
+                .await
+                .unwrap();
+        }
+    });
+    let prefix = veil_core::ChangeId(change).display()[..4].to_string();
+    let once = |h: &Hist, x: &Ask| th.rt.block_on(async { norm(query::resolve_prefix(&h.hub, x, &prefix, &[], Limits::default()).await) });
+    let without = once(&a, &xa);
+    assert!(!without.starts_with("error") && !without.contains("\"changes\":[]"), "the visible change is named: {without}");
+    assert_eq!(once(&b, &xb), without, "a hidden snapshot no branch reaches changes the answer for {prefix}");
+}
+
+/// BUG-1319: names and history pages answer two questions, by two rules.
+/// After a rewrite (the change of `old` gets a new version `new`, `main`
+/// moves to it), a *name* means what the branches reach: an id prefix of
+/// the old version is no snapshot (BUG-1268), the new version's is. A
+/// *history page* below a snapshot the caller was sent starts from any
+/// snapshot of their viewer graph, reached or not: the page below the old
+/// version is its history, as a full clone made before the rewrite holds
+/// it. A withheld snapshot (an embargo line) that is no branch tip starts
+/// no page, for anyone. And a name counts what the caller's own snapshots
+/// reach too (`from`: a thin clone's refs, which may stand on the old
+/// version); a snapshot hidden from the caller among them changes nothing.
+#[test]
+fn s3rd2_names_keep_to_the_branches_and_pages_to_the_viewer_graph() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &policy_text, &bindings);
+    let base = Files::from([("pub/a.rs".to_string(), b"fn a() {}\n".to_vec())]);
+    let a = h.commit(&th, &[root_snapshot_id()], base.clone(), [1; 16], 1_000, None);
+    let mut f = base.clone();
+    f.insert("pub/b.rs".into(), b"fn b() {}\n".to_vec());
+    let old = h.commit(&th, &[a], f.clone(), [2; 16], 2_000, None);
+    h.set_branch(&th, "main", old);
+    // Hidden from anyone: a change of fin/ on the old version, on a branch
+    // of its own, then rewritten onto `a`. For anyone, its first version
+    // projects onto the old version, which no branch reaches.
+    let mut fin = f.clone();
+    fin.insert("fin/plan.txt".into(), b"plan\n".to_vec());
+    let hidden = h.commit(&th, &[old], fin.clone(), [5; 16], 2_500, None);
+    h.set_branch(&th, "fin-work", hidden);
+    h.derive(&th);
+    let hidden2 = h.commit(&th, &[a], fin, [5; 16], 2_501, None);
+    h.set_branch(&th, "fin-work", hidden2);
+    for viewer in [admin(), Viewer::default()] {
+        warm_up(&th, &h, &viewer);
+    }
+    // The rewrite: a new version of change 2, `main` on it, and a fix on an
+    // embargo line.
+    f.insert("pub/b.rs".into(), b"fn b() { 2 }\n".to_vec());
+    let new = h.commit(&th, &[a], f.clone(), [2; 16], 2_001, None);
+    f.insert("pub/fix.rs".into(), b"fix\n".to_vec());
+    let e = h.commit(&th, &[new], f.clone(), [3; 16], 3_000, Some("cve-1"));
+    f.insert("pub/after.rs".into(), b"after\n".to_vec());
+    let c = h.commit(&th, &[e], f, [4; 16], 4_000, None);
+    h.set_branch(&th, "main", new);
+    h.set_branch(&th, "embargoed", c);
+    h.derive(&th);
+    for (who, viewer) in [("an admin", admin()), ("anyone on Earth", Viewer::default())] {
+        warm_up(&th, &h, &viewer);
+        let x = ask(&th, &h, &viewer);
+        let project = h.project(&th);
+        let ids = |tip: ObjectId| -> Vec<ObjectId> {
+            let page = th.rt.block_on(veil_server::sync::history(&h.hub, &project, &viewer, &[tip], &[], Some(10), false));
+            veil_core::hub::wire::read_frames(&page.unwrap()).unwrap().into_iter().map(|(id, _)| id).collect()
+        };
+        // Admins' ids are the real ones; anyone's are their projections.
+        let p = |real: ObjectId| -> ObjectId {
+            th.rt.block_on(veil_server::sync::projected(&h.hub, &project, &viewer, real)).unwrap()
+        };
+        let (pa, pold, pnew) = (p(a), p(old), p(new));
+        // Names: the branches' history only.
+        let named = |id: ObjectId| resolved(&th, &h, &x, &id.hex()[..16]);
+        assert!(named(pnew).contains(&pnew.hex()), "{who}: the new version is named: {}", named(pnew));
+        assert!(named(pold).contains("\"snapshots\":[]"), "{who}: an old version is named: {}", named(pold));
+        let named_from = |id: ObjectId, from: &[ObjectId]| {
+            let prefix = id.hex()[..16].to_string();
+            th.rt.block_on(async { norm(settled(|| query::resolve_prefix(&h.hub, &x, &prefix, from, Limits::default())).await) })
+        };
+        assert!(named_from(pold, &[pold]).contains(&pold.hex()), "{who}: the caller's own old version is not named from it");
+        if !viewer.admin {
+            // A hidden snapshot's real id, as a root: unknown to the caller,
+            // though it projects onto the old version (BUG-1070's class).
+            assert_eq!(p(hidden), pold, "{who}");
+            assert_eq!(named_from(pold, &[hidden]), named(pold), "{who}: a hidden root changes the answer");
+        }
+        // Pages: below the old version, its history.
+        let below_old = ids(pold);
+        assert!(below_old.contains(&pold) && below_old.contains(&pa), "{who}: the page below the old version is {below_old:?}");
+        assert!(ids(pnew).contains(&pa), "{who}");
+        if viewer.admin {
+            // Withheld from admins too, until the release: no page starts
+            // there. (A branch tip a clone is sent starts one: sync's own
+            // answer, which this does not change.)
+            assert!(ids(e).is_empty(), "{who}: a page starts from a withheld snapshot");
+        }
+    }
+}
+
+/// BUG-1317's bound: a change id prefix is answered from the caller's own
+/// graph, and each request reads a bounded number of its rows. 200 old
+/// versions with the prefix (a branch's commits, filled into the caller's
+/// graph, then left behind when the branch moved) do not count; with the
+/// default bound the visible change is named, alone; with a bound below
+/// what they take, the request fails asking for more of the prefix, and
+/// never answers from part of them.
+#[test]
+fn s3rd2_resolve_reads_a_bounded_part_of_the_callers_graph() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &policy_text, &bindings);
+    let base = Files::from([("pub/a.rs".to_string(), b"fn a() {}\n".to_vec())]);
+    let a = h.commit(&th, &[root_snapshot_id()], base.clone(), [1; 16], 1_000, None);
+    let mut tip = a;
+    let mut f = base.clone();
+    for i in 0..200u8 {
+        f.insert("pub/b.rs".into(), format!("fn b() {{ {i} }}\n").into_bytes());
+        let mut change = [0u8; 16];
+        change[0] = 0xab;
+        change[1] = 0xcd;
+        change[2] = i;
+        tip = h.commit(&th, &[tip], f.clone(), change, 2_000 + i64::from(i), None);
+    }
+    h.set_branch(&th, "work", tip);
+    h.set_branch(&th, "main", a);
+    let viewer = admin();
+    warm_up(&th, &h, &viewer);
+    // The branch moves on: its 200 commits stay in the caller's graph,
+    // reached by no branch.
+    let mut change = [0xffu8; 16];
+    change[0] = 0xab;
+    change[1] = 0xcd;
+    f.insert("pub/c.rs".into(), b"fn c() {}\n".to_vec());
+    let visible = h.commit(&th, &[a], f, change, 9_000, None);
+    h.set_branch(&th, "work", visible);
+    h.derive(&th);
+    warm_up(&th, &h, &viewer);
+    let x = ask(&th, &h, &viewer);
+    let prefix = veil_core::ChangeId(change).display()[..4].to_string();
+    let answer = resolved(&th, &h, &x, &prefix);
+    assert!(answer.contains(&visible.hex()) && answer.contains("\"more\":false"), "{answer}");
+    let small = Limits { work: 100, ..Limits::default() };
+    let out = th.rt.block_on(async { norm(settled(|| query::resolve_prefix(&h.hub, &x, &prefix, &[], small)).await) });
+    assert!(out.starts_with("error 400") && out.contains("give more of it"), "{out}");
+}
+
+/// Property 1 of the S3 redesign's cycle 3 review: `q/resolve` with `from`
+/// roots shows each viewer only their own history. On random histories,
+/// for every viewer, `from` mixes their own ids (reached by a branch or
+/// not), real ids of snapshots hidden from them, other viewers' ids and
+/// withheld snapshots; each answer (snapshot id and change id prefixes) is
+/// the one their admin gets, with the same `from`, on a copy of the
+/// project built from their projected history alone (where nothing hidden
+/// exists, and the other ids are unknown), and names no hidden real id.
+#[test]
+fn s3rd3_resolve_from_roots_is_projection_equivalent() {
+    let th = TestHub::start();
+    for seed in seeds(&[131, 132]) {
+        let carol = 730_000 + seed as i64;
+        let (policy_text, bindings) = policy(carol);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let mut rng = Rng::new(seed);
+        random_history(&th, &mut h, &mut rng, 40);
+        let project = h.project(&th);
+        let all = viewers(carol);
+        let projs: Vec<HashMap<ObjectId, ObjectId>> = all.iter().map(|(_, v)| projections(&th, &h, &project, v)).collect();
+        let mut compared = 0usize;
+        for (i, (who, viewer)) in all.iter().enumerate() {
+            let p = &projs[i];
+            let copy = copy_for(&th, &h, &project, viewer, p);
+            let mine: Vec<ObjectId> = p.values().copied().collect::<BTreeSet<_>>().into_iter().collect();
+            let hidden_real: Vec<ObjectId> = h.order.iter().copied().filter(|s| p[s] != *s).collect();
+            let others: Vec<ObjectId> = projs
+                .iter()
+                .flat_map(|q| q.values().copied())
+                .filter(|x| !mine.contains(x))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let (mine_ask, copy_ask) = (ask(&th, &h, viewer), ask(&th, &copy, &admin()));
+            warm_up(&th, &h, viewer);
+            warm_up(&th, &copy, &admin());
+            for round in 0..10 {
+                let mut from: Vec<ObjectId> = (0..rng.below(4)).map(|_| mine[rng.below(mine.len())]).collect();
+                if !hidden_real.is_empty() && rng.chance(60) {
+                    from.push(hidden_real[rng.below(hidden_real.len())]);
+                }
+                if !others.is_empty() && rng.chance(60) {
+                    from.push(others[rng.below(others.len())]);
+                }
+                let target = mine[rng.below(mine.len())];
+                let mut prefixes = vec![target.hex()[..4].to_string(), target.hex()[..12].to_string()];
+                if let Some(s) = hidden_real.first() {
+                    prefixes.push(s.hex()[..12].to_string());
+                }
+                let letters = "klmnopqrstuvwxyz".as_bytes();
+                prefixes.push((letters[rng.below(16)] as char).to_string());
+                prefixes.push(format!("{}{}", letters[rng.below(16)] as char, letters[rng.below(16)] as char));
+                for prefix in &prefixes {
+                    let run = |hh: &Hist, a: &Ask| {
+                        th.rt.block_on(async { norm(settled(|| query::resolve_prefix(&hh.hub, a, prefix, &from, Limits::default())).await) })
+                    };
+                    let (real, theirs) = (run(&h, &mine_ask), run(&copy, &copy_ask));
+                    assert!(!real.starts_with("error"), "seed {seed}, {who}, round {round}: q/resolve {prefix} from {from:?} failed: {real}");
+                    assert_eq!(real, theirs, "seed {seed}, {who}, round {round}: q/resolve {prefix} from {from:?}");
+                    for s in &hidden_real {
+                        assert!(!real.contains(&s.hex()), "seed {seed}, {who}: real id {} in {real}", s.short());
+                    }
+                    compared += 1;
+                }
+            }
+        }
+        println!("seed {seed}: {} changes, {compared} answers compared", h.order.len());
+    }
+}

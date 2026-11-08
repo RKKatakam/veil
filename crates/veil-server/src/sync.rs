@@ -667,16 +667,37 @@ pub async fn history(
     viewer: &Viewer,
     tips: &[ObjectId],
     stop: &[ObjectId],
+    limit: Option<usize>,
     encoded: bool,
 ) -> Result<Vec<u8>> {
     let mut starts = Vec::new();
+    let mut reals = Vec::new();
     for t in tips {
         let Some(real) = resolve(hub, project.id, &project.view(viewer).key(), t).await?.into_iter().next() else {
             return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
         };
         starts.push(projected(hub, project, viewer, real).await?);
+        reals.push(real);
     }
     let stop: HashSet<ObjectId> = stop.iter().copied().collect();
+    if let Some(limit) = limit {
+        // A page (a thin clone's): from any snapshot of the viewer's graph
+        // that is not withheld, whether the branches still reach it or not
+        // (an old version a rewrite elsewhere left under the clone's own
+        // work is the person's to read below, BUG-1319). Names keep to what
+        // the branches reach (`q/resolve`, BUG-1268).
+        // (Branch tips, as a clone and a pull ask for, are in it: no
+        // viewer graph is needed for them.)
+        let branch_tips: HashSet<ObjectId> = self::tips(hub, project, viewer).await?.into_iter().map(|(_, t)| t).collect();
+        let starts = match starts.iter().all(|s| branch_tips.contains(s)) {
+            true => starts,
+            false => {
+                let readable = crate::query::page_starts(hub, project, viewer, reals).await?;
+                starts.into_iter().zip(readable).filter(|(_, r)| *r).map(|(s, _)| s).collect()
+            }
+        };
+        return blocking(hub, project.id, move |src| history_page(src, starts, &stop, limit.clamp(1, MAX_HISTORY), encoded)).await;
+    }
     blocking(hub, project.id, move |src| {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
@@ -701,6 +722,45 @@ pub async fn history(
         Ok(out)
     })
     .await
+}
+
+/// One page of [`history`] (S3's thin clones): the tips, then their
+/// ancestors, those of the newest children first, at most `limit`
+/// snapshots in all (and every tip). Any page is a region the client can
+/// hold: what it leaves out is reached by the next page.
+fn history_page(src: &Source, starts: Vec<ObjectId>, stop: &HashSet<ObjectId>, limit: usize, encoded: bool) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut heap: std::collections::BinaryHeap<(bool, i64, ObjectId)> = std::collections::BinaryHeap::new();
+    for t in starts {
+        heap.push((true, i64::MAX, t));
+    }
+    let mut taken = 0;
+    while let Some((tip, _, id)) = heap.pop() {
+        if stop.contains(&id) || !seen.insert(id) {
+            continue;
+        }
+        if !tip && taken >= limit {
+            break;
+        }
+        let raw = src.raw(&id)?;
+        let Object::Snapshot(s) = Object::decode(&raw)? else {
+            return Err(Error::Other(anyhow::anyhow!("projected history holds a non-snapshot")));
+        };
+        match encoded {
+            true => put_frame(&mut out, &id, &src.encoded(&id)?),
+            false => put_frame(&mut out, &id, &raw),
+        }
+        taken += 1;
+        for p in &s.parents {
+            if !seen.contains(p) {
+                // A parent's timestamp is read when it is taken; until then
+                // its child's stands for it (parents are older).
+                heap.push((false, s.timestamp, *p));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Objects `wants` under snapshot `snapshot`, each checked against what

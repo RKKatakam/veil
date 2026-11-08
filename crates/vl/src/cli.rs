@@ -68,6 +68,15 @@ pub enum Cmd {
         /// subtree's objects).
         #[arg(long, value_name = "DIR")]
         only: Option<String>,
+        /// Fetch every snapshot and object you may see. Without it the
+        /// clone is thin: it holds the branch tips and what it checks out,
+        /// and fetches the rest from the server when something reads it.
+        #[arg(long, conflicts_with = "cache_size")]
+        full: bool,
+        /// Bound of a thin clone's object cache (bytes, or with K, M or
+        /// G; default 4G). What is checked out is never evicted.
+        #[arg(long, value_name = "SIZE")]
+        cache_size: Option<String>,
     },
     /// Sign in to a Veil server with this device's identity key.
     ///
@@ -681,6 +690,10 @@ pub enum Cmd {
         #[arg(default_value = "origin")]
         remote: String,
     },
+    /// A thin clone: what it holds, the bound of its object cache, and
+    /// fetching everything (`vl partial full`).
+    #[command(subcommand)]
+    Partial(crate::thin::PartialCmd),
 
     /// Hooks run before commits and pushes; repository-suggested ones only
     /// once this device trusts them (not implemented yet).

@@ -4,8 +4,9 @@
 //! (`docs/design/scale/3-history-index.md`).
 //!
 //! The generation is a *corrected commit date* (Git's generation v2): the
-//! larger of the snapshot's own timestamp (milliseconds, at least 0) and 1
-//! plus the largest generation of its parents present in the store. Along
+//! larger of the snapshot's own timestamp (milliseconds, clamped to 0 ..=
+//! [`MAX_STAMP`]) and 1 plus the largest generation of its parents present
+//! in the store ([`generation`], the server's arithmetic too). Along
 //! every parent edge it strictly decreases, so a walk looking for `a` below
 //! `b` can stop at every snapshot whose generation is below `a`'s: none of
 //! that snapshot's ancestors can be `a`. That is the only property the walks
@@ -62,7 +63,7 @@
 //! Layer encoding (integers little-endian):
 //!
 //! ```text
-//! "VEILCG01" | count u32 | missing u32
+//! "VEILCG02" | count u32 | missing u32
 //! | ids [count × 32], ascending
 //! | records [count × (generation u64 | change id [16] | flags u8)]
 //! | missing parents [missing × 32]
@@ -75,7 +76,7 @@ use std::{
 };
 
 use crate::{
-    error::{Result, VeilError},
+    error::Result,
     id::{ChangeId, ObjectId},
     object::Snapshot,
     repo::Repo,
@@ -83,7 +84,12 @@ use crate::{
     vpath::VPath,
 };
 
-const MAGIC: &[u8; 8] = b"VEILCG01";
+/// `VEILCG02`: generations of [`generation`] (BUG-1316). A `VEILCG01`
+/// layer, of the older arithmetic (no clamp, values up to `u64::MAX - 1`),
+/// voids the index, which is computed again: its values above `i64::MAX`
+/// would give the next entry, capped there, a generation below its
+/// parent's (BUG-1381).
+const MAGIC: &[u8; 8] = b"VEILCG02";
 const DIR: &str = ".veil/index/graph";
 const HEADER: usize = 8 + 4 + 4;
 const REC: usize = 8 + 16 + 1;
@@ -94,6 +100,27 @@ pub const FLAG_EMBARGO_LINE: u8 = 2;
 
 /// A generation (see the module docs).
 pub type Gen = u64;
+
+/// The largest timestamp a generation counts: later ones count as this.
+/// A timestamp is the author's choice (BUG-866), so it is clamped, and
+/// adding one per edge never overflows.
+pub const MAX_STAMP: i64 = i64::MAX / 4;
+
+/// The generation of a snapshot dated `timestamp` whose parents have
+/// generations `parents`: the larger of its clamped timestamp and one more
+/// than its highest parent's (0 for a snapshot with no parents and a
+/// timestamp of 0 or less). Strictly greater than every parent's.
+///
+/// **The one arithmetic** (BUG-1316): the client's history index, the
+/// server's real graph and each viewer's graph all compute it here, so a
+/// thin clone that takes some generations from its server and computes
+/// the rest itself never ranks a parent above its child.
+pub fn generation(timestamp: i64, parents: impl IntoIterator<Item = Gen>) -> Gen {
+    // Never above what the server stores (a signed 64-bit column).
+    const MAX_GEN: Gen = i64::MAX as Gen;
+    let stamp = timestamp.clamp(0, MAX_STAMP) as Gen;
+    parents.into_iter().map(|g| g.saturating_add(1).min(MAX_GEN)).max().unwrap_or(0).max(stamp)
+}
 /// Fresh entries a read-only command persists without waiting for a commit.
 const PERSIST_BATCH: usize = 256;
 /// Layers above this count on the chain are merged even when not geometric.
@@ -212,6 +239,10 @@ struct State {
     fresh_missing: HashSet<ObjectId>,
     /// Missing parents listed by the loaded layers, and by `fresh`.
     missing: HashSet<ObjectId>,
+    /// A thin clone: entries computed with ancestors it does not hold and
+    /// no generation from its server (it could not be reached): lower
+    /// bounds. Never persisted, and invisible to `Exact` walks (BUG-1291).
+    partial: HashSet<ObjectId>,
 }
 
 impl State {
@@ -220,6 +251,14 @@ impl State {
             return Some(*e);
         }
         self.layers.iter().rev().find_map(|l| l.find(id))
+    }
+
+    /// [`State::get`] for an `Exact` walk: a partial entry is none.
+    fn get_for(&self, id: &ObjectId, exact: bool) -> Option<Entry> {
+        if exact && self.partial.contains(id) {
+            return None;
+        }
+        self.get(id)
     }
 
     fn reset(&mut self, epoch: u64) {
@@ -426,7 +465,7 @@ impl GraphIndex {
     fn with<R>(&self, repo: &Repo, f: impl FnOnce(&mut Walker<'_>) -> Result<R>) -> Result<R> {
         let mut st = self.lock();
         self.ensure_loaded(repo, &mut st);
-        let mut w = Walker { repo, st: &mut st };
+        let mut w = Walker { repo, st: &mut st, exact: crate::repo::in_exact() };
         let out = f(&mut w)?;
         if st.fresh.len() >= PERSIST_BATCH {
             self.persist_locked(&mut st);
@@ -457,8 +496,11 @@ impl GraphIndex {
             return;
         }
         for _ in 0..4 {
-            // Entries another appender has persisted meanwhile are dropped.
-            let fresh: Vec<ObjectId> = st.fresh.iter().copied().filter(|id| !st.layers.iter().any(|l| l.find(id).is_some())).collect();
+            // Entries another appender has persisted meanwhile are dropped,
+            // and partial ones are never written (a thin clone's lower
+            // bounds, BUG-1291).
+            let fresh: Vec<ObjectId> =
+                st.fresh.iter().copied().filter(|id| !st.partial.contains(id) && !st.layers.iter().any(|l| l.find(id).is_some())).collect();
             if fresh.is_empty() {
                 st.fresh.clear();
                 st.fresh_missing.clear();
@@ -828,7 +870,7 @@ impl GraphIndex {
 
     /// Snapshots reachable from `roots`, children before parents, newest
     /// first among unrelated snapshots: exactly the order of
-    /// [`Repo::topo_children_first`], produced lazily (an incremental
+    /// [`crate::repo::Held::topo_children_first`], produced lazily (an incremental
     /// topological walk, as Git's `--topo-order` since 2.20).
     pub fn topo_iter<'r>(&'r self, repo: &'r Repo, roots: impl IntoIterator<Item = ObjectId>) -> TopoIter<'r> {
         TopoIter {
@@ -850,34 +892,58 @@ impl GraphIndex {
 struct Walker<'a> {
     repo: &'a Repo,
     st: &'a mut State,
+    /// Inside `Exact::run`: partial entries do not count.
+    exact: bool,
 }
 
 impl Walker<'_> {
     fn snapshot(&mut self, id: &ObjectId) -> Result<Option<Arc<Snapshot>>> {
-        self.repo.snapshot_opt(id)
+        self.repo.held().snapshot(id)
     }
 
     /// The entry of `id`, computing it (and every unindexed ancestor) from
     /// the store if needed; `None` if the store does not hold `id`.
     fn entry(&mut self, id: &ObjectId) -> Result<Option<Entry>> {
-        if let Some(e) = self.st.get(id) {
+        let exact = self.exact;
+        if let Some(e) = self.st.get_for(id, exact) {
             return Ok(Some(e));
         }
         // Post-order over the unindexed ancestors, iterative.
         let mut pending: HashMap<ObjectId, Arc<Snapshot>> = HashMap::new();
         let mut stack = vec![(*id, false)];
         while let Some((x, expanded)) = stack.pop() {
-            if self.st.get(&x).is_some() {
+            if self.st.get_for(&x, exact).is_some() {
                 continue;
             }
             if !expanded {
                 if pending.contains_key(&x) {
                     continue;
                 }
-                let Some(s) = self.repo.snapshot_opt(&x)? else { continue };
+                let Some(s) = self.repo.held().snapshot(&x)? else { continue };
+                // A thin clone, at its boundary (a parent it does not
+                // hold): the generation is the server's (exact), so the
+                // ancestry below is never needed (BUG-1291).
+                if s.parents.iter().any(|p| !self.repo.store().has_main(p)) {
+                    match self.repo.boundary_generation(&x) {
+                        Ok(Some(g)) => {
+                            let flags = if s.embargo.is_some() { FLAG_EMBARGO | FLAG_EMBARGO_LINE } else { 0 };
+                            self.st.mem.insert(x, Entry { generation: g, change_id: s.change_id, flags });
+                            self.st.partial.remove(&x);
+                            self.st.fresh.push(x);
+                            continue;
+                        }
+                        Ok(None) => {}
+                        // The server cannot be reached: an `Exact` walk
+                        // fails; a held one goes on with a lower bound.
+                        Err(e) if exact => return Err(e),
+                        Err(_) => {
+                            self.st.partial.insert(x);
+                        }
+                    }
+                }
                 stack.push((x, true));
                 for p in &s.parents {
-                    if self.st.get(p).is_none() && !pending.contains_key(p) {
+                    if self.st.get_for(p, exact).is_none() && !pending.contains_key(p) {
                         stack.push((*p, false));
                     }
                 }
@@ -885,13 +951,15 @@ impl Walker<'_> {
                 continue;
             }
             let s = pending.remove(&x).expect("expanded snapshots are pending");
-            let mut above: Gen = 0;
+            let mut gens: Vec<Gen> = Vec::with_capacity(s.parents.len());
             let mut flags = if s.embargo.is_some() { FLAG_EMBARGO | FLAG_EMBARGO_LINE } else { 0 };
+            let mut partial = self.st.partial.contains(&x);
             for p in &s.parents {
-                match self.st.get(p) {
+                match self.st.get_for(p, exact) {
                     Some(e) => {
-                        above = above.max(e.generation);
+                        gens.push(e.generation);
                         flags |= e.flags & FLAG_EMBARGO_LINE;
+                        partial |= self.st.partial.contains(p);
                     }
                     None => {
                         self.st.missing.insert(*p);
@@ -899,18 +967,19 @@ impl Walker<'_> {
                     }
                 }
             }
-            let above = above.checked_add(1).filter(|g| *g < Gen::MAX).ok_or_else(|| {
-                VeilError::Unsupported("the history is deeper than the index supports".into())
-            })?;
             let e = Entry {
-                generation: above.max(s.timestamp.max(0) as Gen),
+                generation: generation(s.timestamp, gens),
                 change_id: s.change_id,
                 flags,
             };
             self.st.mem.insert(x, e);
+            match partial {
+                true => self.st.partial.insert(x),
+                false => self.st.partial.remove(&x),
+            };
             self.st.fresh.push(x);
         }
-        Ok(self.st.get(id))
+        Ok(self.st.get_for(id, exact))
     }
 }
 

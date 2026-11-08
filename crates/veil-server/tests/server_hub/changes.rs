@@ -314,9 +314,9 @@ fn rebase_lands_every_racing_change_once_with_exactly_its_edits() {
         // The admin's real snapshot behind the dev's start.
         let mut seen = 0;
         loop {
-            let s = store.snapshot(&cur).unwrap();
+            let s = repo.snapshot(&cur).unwrap();
             let parent = s.parents[0];
-            let diff = veil_core::tree::diff_trees(store, Some(&store.snapshot(&parent).unwrap().tree), Some(&s.tree)).unwrap();
+            let diff = veil_core::tree::diff_trees(store, Some(&repo.snapshot(&parent).unwrap().tree), Some(&s.tree)).unwrap();
             if !s.author.contains(&p.dev.name) {
                 break cur;
             }
@@ -499,7 +499,7 @@ fn a_stack_lands_over_a_hidden_change_which_it_keeps_and_never_shows() {
     let mut cur = repo.view().tags["main"].target;
     let mut seen = Vec::new();
     for _ in 0..3 {
-        let s = repo.store().snapshot(&cur).unwrap();
+        let s = repo.snapshot(&cur).unwrap();
         let veil_core::object::Text::Plain(d) = &s.description;
         seen.push(d.clone());
         cur = s.parents[0];

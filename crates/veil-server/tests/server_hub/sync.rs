@@ -127,12 +127,13 @@ fn people_see_each_others_pushes_and_every_signature_verifies() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
     let d = p.dev.dir("c");
-    p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+    // Full clones: the test walks every snapshot each one holds.
+    p.dev.ok(p.dev.home.path(), &["clone", "--full", &hub.url(&p.name), d.to_str().unwrap()]);
     write_files(&d, &[("src/dev.rs", "fn dev() {}")]);
     p.dev.commit_main(&d, "dev change");
     p.dev.ok(&d, &["push"]);
     let f = p.fin.dir("c");
-    p.fin.ok(p.fin.home.path(), &["clone", &hub.url(&p.name), f.to_str().unwrap()]);
+    p.fin.ok(p.fin.home.path(), &["clone", "--full", &hub.url(&p.name), f.to_str().unwrap()]);
     assert!(f.join("src/dev.rs").exists());
     write_files(&f, &[(&format!("{BILL_DIR}/q.txt") as &str, "q")]);
     p.fin.commit_main(&f, "finance change");
@@ -151,7 +152,7 @@ fn people_see_each_others_pushes_and_every_signature_verifies() {
             if id == repo.root_id() {
                 continue;
             }
-            let s = repo.store().snapshot(&id).unwrap();
+            let s = repo.snapshot(&id).unwrap();
             assert_eq!(s.signature_valid(), Some(true), "{} in {}", id.short(), dir.display());
             stack.extend(s.parents.iter().copied());
             seen += 1;
@@ -163,7 +164,7 @@ fn people_see_each_others_pushes_and_every_signature_verifies() {
     let mine = (|| {
         let mut stack = vec![repo.view().tags["main"].target];
         while let Some(id) = stack.pop() {
-            let s = repo.store().snapshot(&id).unwrap();
+            let s = repo.snapshot(&id).unwrap();
             if matches!(&s.description, veil_core::object::Text::Plain(t) if t.contains("dev change")) {
                 return s;
             }
