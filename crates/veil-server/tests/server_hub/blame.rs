@@ -2314,3 +2314,307 @@ mod s14rd_review {
         assert!(grew as f64 <= held as f64 * 1.5, "a job under a {held}-byte bound grew the process by {grew} bytes");
     }
 }
+
+/// The S14 redesign review, cycle 2 (BUG-1410 to BUG-1414): the
+/// guarantees of the cycle-1 fixes, each as a test.
+mod s14rd2_review {
+    use super::*;
+    use veil_server::derive::changes::path_key;
+
+    fn limits(ms: u64, blame: BlameLimits) -> Limits {
+        Limits { blame, deadline: Duration::from_millis(ms), ..Limits::default() }
+    }
+
+    /// A chain of `n` changes on top of `base`, each editing one line of
+    /// `path` (60 lines), by change ids tagged `tag`; the snapshots, oldest
+    /// first, and the files at the tip.
+    #[allow(clippy::too_many_arguments)]
+    fn chain_on(th: &TestHub, h: &mut Hist, base: ObjectId, mut f: Files, path: &str, n: usize, tag: u8, ts: i64) -> (Vec<ObjectId>, Files) {
+        let mut body: Vec<String> = (0..60).map(|i| format!("line {i} of the file\n")).collect();
+        let mut tip = base;
+        let mut out = Vec::new();
+        for i in 0..n {
+            body[i % 60] = format!("edited at change {i}\n");
+            f.insert(path.to_string(), body.concat().into_bytes());
+            let mut change = [tag; 16];
+            change[..2].copy_from_slice(&(i as u16).to_le_bytes());
+            tip = h.commit(th, &[tip], f.clone(), change, ts + i as i64 * 1000, None);
+            out.push(tip);
+        }
+        (out, f)
+    }
+
+    fn jobs_started(hub: &std::sync::Arc<veil_server::Hub>) -> u64 {
+        hub.query.jobs.started.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// One request: its answer, or its error code.
+    fn once(th: &TestHub, h: &Hist, a: &Ask, q: BlameParams, l: Limits) -> Result<Value, &'static str> {
+        match th.rt.block_on(query::blame(&h.hub, a, q, l)) {
+            Ok(v) => Ok(v),
+            Err(Error::Api { code, .. }) => Err(code),
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+
+    /// Ask until the answer is not `warming` or `deadline`, for at most
+    /// `secs` seconds; the last answer and the requests made.
+    fn until(th: &TestHub, h: &Hist, a: &Ask, q: impl Fn() -> BlameParams, l: Limits, secs: u64) -> (Result<Value, &'static str>, usize) {
+        let t0 = Instant::now();
+        let mut asked = 0;
+        loop {
+            asked += 1;
+            let r = once(th, h, a, q(), l);
+            match r {
+                Err("warming" | "deadline") if t0.elapsed() < Duration::from_secs(secs) => std::thread::sleep(Duration::from_millis(100)),
+                r => return (r, asked),
+            }
+        }
+    }
+
+    fn lease(th: &TestHub, h: &Hist, vk: &str, path: &str, follow: bool, snapshot: &str, expires_at: i64) {
+        th.rt.block_on(async {
+            sqlx::query(
+                "INSERT INTO blame_jobs (project_id, view_key, path_key, follow, snapshot, holder, expires_at) VALUES ($1, $2, $3, $4, $5, 'another server', $6) \
+                 ON CONFLICT (project_id, view_key, path_key, follow, snapshot) DO UPDATE SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at",
+            )
+            .bind(h.id)
+            .bind(vk)
+            .bind(path_key(path))
+            .bind(follow)
+            .bind(snapshot)
+            .bind(expires_at)
+            .execute(&h.hub.db)
+            .await
+            .unwrap();
+        });
+    }
+
+    fn projected(th: &TestHub, h: &Hist, v: &Viewer, real: &[ObjectId]) -> Vec<String> {
+        let p = projections(th, h, &h.project(th), v);
+        real.iter().map(|s| p[s].hex()).collect()
+    }
+
+    fn kept_bytes_of(th: &TestHub, h: &Hist) -> (i64, i64) {
+        th.rt.block_on(async {
+            sqlx::query_as("SELECT COALESCE(SUM(bytes), 0)::BIGINT, COUNT(DISTINCT view_key) FROM blame_memo WHERE project_id = $1").bind(h.id).fetch_one(&h.hub.db).await.unwrap()
+        })
+    }
+
+    /// Property 1 (nothing one viewer does changes what another sees:
+    /// queue shares and slots) and 2 (every blame eventually answers):
+    /// the share of waiting jobs is the project's, shared by every viewer
+    /// of it. Anyone on Earth (any account, or none, in a project with a
+    /// public folder) fills it with 256 blames of a public file (here each
+    /// waiting on another server's lease, as when that server's job is slow
+    /// or queued: up to `BlameLimits::wait`, 600 s, each); then a member of
+    /// finance's first blame of a 10-version file of `fin/` answers
+    /// `warming` at once and queues nothing, for as long as the outsider
+    /// keeps the share full. What the member sees (an at-once refusal, no
+    /// job) is a function of another view key's activity. (Within a
+    /// project, slots are also first come first served across view keys.)
+    #[test]
+    #[ignore = "BUG-1410: one viewer fills their project's share of waiting blame jobs; another viewer's blames are refused"]
+    fn bug_1410_one_viewer_fills_the_projects_job_share_for_every_viewer() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        // fin/ledger.txt: 10 changes, then the public chain on top.
+        let mut f = Files::new();
+        let mut tip = root_snapshot_id();
+        for k in 0..10usize {
+            f.insert("fin/ledger.txt".into(), format!("total {k}\nline two\n").into_bytes());
+            let mut change = [41u8; 16];
+            change[..2].copy_from_slice(&(k as u16).to_le_bytes());
+            tip = h.commit(&th, &[tip], f.clone(), change, 1_600_000_000_000 + k as i64 * 1000, None);
+        }
+        let path = "pub/f/chain.txt";
+        let (snaps, _) = chain_on(&th, &mut h, tip, f, path, 130, 42, 1_700_000_000_000);
+        h.set_branch(&th, "main", *snaps.last().unwrap());
+        let outsider = Viewer::default();
+        let finance = viewers(1).into_iter().find(|(n, _)| *n == "finance").unwrap().1;
+        warm_up(&th, &h, &outsider);
+        warm_up(&th, &h, &finance);
+        let vk = h.project(&th).view(&outsider).key();
+        let ids = projected(&th, &h, &outsider, &snaps);
+        let far = veil_core::now_millis() + 3_600_000;
+        for id in &ids {
+            for follow in [false, true] {
+                lease(&th, &h, &vk, path, follow, id, far);
+            }
+        }
+        // The outsider fills the project's share.
+        let o = ask(&th, &h, &outsider);
+        let started = jobs_started(&h.hub);
+        'fill: for s in &ids {
+            for follow in [false, true] {
+                if (jobs_started(&h.hub) - started) as usize >= veil_server::query::files::MAX_PENDING_JOBS {
+                    break 'fill;
+                }
+                let before = jobs_started(&h.hub);
+                for _ in 0..50 {
+                    let r = once(&th, &h, &o, BlameParams { rev: Some(s.clone()), path: path.into(), follow: Some(follow), n: Some(10), ..Default::default() }, limits(5, BlameLimits::default()));
+                    assert!(matches!(r, Err("warming" | "deadline")), "answered under another server's lease: {r:?}");
+                    if jobs_started(&h.hub) > before {
+                        break;
+                    }
+                }
+            }
+        }
+        assert_eq!((jobs_started(&h.hub) - started) as usize, veil_server::query::files::MAX_PENDING_JOBS, "the outsider's jobs fill the project's share");
+        // A member of finance: an ordinary first blame of a file only
+        // finance (and admins) can read.
+        let fa = ask(&th, &h, &finance);
+        let before = jobs_started(&h.hub);
+        let (r, asked) = until(&th, &h, &fa, || BlameParams { path: "fin/ledger.txt".into(), n: Some(1000), ..Default::default() }, limits(2000, BlameLimits::default()), 30);
+        let member_jobs = jobs_started(&h.hub) - before;
+        println!("bug_1410: finance's blame after {asked} requests in 30 s: {:?}; {member_jobs} jobs of theirs queued", r.as_ref().map(|v| v["line_count"].clone()));
+        th.rt.block_on(async { sqlx::query("DELETE FROM blame_jobs WHERE project_id = $1").bind(h.id).execute(&h.hub.db).await.unwrap() });
+        let v = r.expect("finance's 10-version blame answered within 30 s while anyone on Earth's jobs wait");
+        assert_eq!(v["line_count"], 2);
+    }
+
+    /// Property 2 (every blame eventually answers) and 5 (stated bounds):
+    /// a kept blame larger than its view key's cap (`kept_bytes`) is
+    /// dropped by the very write that keeps it, with every other kept
+    /// blame of the key: the job ends `Kept`, the request finds nothing
+    /// kept and answers `warming`, and each request after starts a new job
+    /// that walks and blames every version again. The blame never answers.
+    /// The stated bounds allow it: a kept blame takes up to 128 + 128 bytes
+    /// a line and 768 a change it names, and a plain-text file of 1 MiB has
+    /// up to 524,288 lines, so a kept blame can take 64 MiB and more, past
+    /// the 32 MiB of `KEPT_BYTES` (some 60,000 lines from as many changes
+    /// with long summaries pass it). Here the cap is made smaller than one
+    /// 60-line blame naming 41 changes.
+    #[test]
+    #[ignore = "BUG-1411: a kept blame larger than its view key's cap is dropped as it is kept; the blame never answers"]
+    fn bug_1411_a_blame_larger_than_its_keys_cap_never_answers() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let path = "pub/f/chain.txt";
+        let (snaps, _) = chain_on(&th, &mut h, root_snapshot_id(), Files::new(), path, 40, 43, 1_700_000_000_000);
+        h.set_branch(&th, "main", *snaps.last().unwrap());
+        let viewer = Viewer::default();
+        warm_up(&th, &h, &viewer);
+        let a = ask(&th, &h, &viewer);
+        // The blame's own size, kept under no cap to speak of.
+        let wide = limits(60_000, BlameLimits::default());
+        let (r, _) = until(&th, &h, &a, || BlameParams { path: path.into(), n: Some(1000), ..Default::default() }, wide, 120);
+        assert_eq!(r.expect("the blame answers under the default cap")["line_count"], 60);
+        let tip = projected(&th, &h, &viewer, &snaps[39..])[0].clone();
+        let size: i64 = th.rt.block_on(async {
+            sqlx::query_scalar("SELECT bytes FROM blame_memo WHERE project_id = $1 AND snapshot = $2").bind(h.id).bind(tip).fetch_one(&h.hub.db).await.unwrap()
+        });
+        let stated = veil_server::derive::blame::BASE_BYTES + 128 * 60 + 768 * 41;
+        assert!(size as usize <= stated, "the kept blame takes {size} bytes, within the stated {stated}");
+        forget_blames(&th, &h);
+        // Under a cap smaller than it.
+        let cap = (size as usize) / 2;
+        let l = limits(60_000, BlameLimits { kept_bytes: cap, ..BlameLimits::default() });
+        let (s0, j0) = (steps(&[&h.hub]), jobs_started(&h.hub));
+        let (r, asked) = until(&th, &h, &a, || BlameParams { path: path.into(), n: Some(1000), ..Default::default() }, l, 30);
+        println!(
+            "bug_1411: a {size}-byte blame under a {cap}-byte cap: {:?} after {asked} requests, {} jobs, {} versions blamed",
+            r.as_ref().map(|v| v["line_count"].clone()),
+            jobs_started(&h.hub) - j0,
+            steps(&[&h.hub]) - s0
+        );
+        assert_eq!(r.expect("a blame within the stated bounds answers")["line_count"], 60);
+    }
+
+    /// Property 4 (`blame_ends` stays correct): whether a job passes its
+    /// memory bound depends on the kept blames below its version (its walk
+    /// stops at them), and those change: a too-wide record is served after
+    /// kept blames below the version would make the walk fit. A 400-version
+    /// file is too wide from nothing under a 96 KiB bound (recorded); the
+    /// viewer then blames it at every 5th version, each answering (each
+    /// kept, so the head's walk would stop 5 versions down); the head's
+    /// blame still answers `too_wide`, from the record, and keeps doing so
+    /// until 4,096 newer records of the view key push it out. Without the
+    /// record it answers.
+    #[test]
+    #[ignore = "BUG-1412: a too-wide record is served after kept blames below the version make the walk fit"]
+    fn bug_1412_a_too_wide_record_outlives_the_kept_blames_that_make_it_fit() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let path = "pub/f/chain.txt";
+        let (snaps, _) = chain_on(&th, &mut h, root_snapshot_id(), Files::new(), path, 400, 44, 1_700_000_000_000);
+        h.set_branch(&th, "main", *snaps.last().unwrap());
+        let viewer = Viewer::default();
+        warm_up(&th, &h, &viewer);
+        let a = ask(&th, &h, &viewer);
+        let small = limits(60_000, BlameLimits { held: 96 << 10, ..BlameLimits::default() });
+        let head = || BlameParams { path: path.into(), n: Some(1000), ..Default::default() };
+        assert_eq!(until(&th, &h, &a, head, small, 120).0.err(), Some("too_wide"), "the head is too wide from nothing");
+        for (i, s) in snaps.iter().enumerate().skip(4).step_by(5).take(79) {
+            let (r, _) = until(&th, &h, &a, || BlameParams { rev: Some(s.hex()), path: path.into(), n: Some(1000), ..Default::default() }, small, 120);
+            assert_eq!(r.unwrap_or_else(|e| panic!("version {i}: {e}"))["line_count"], 60, "version {i}");
+        }
+        let s0 = steps(&[&h.hub]);
+        let (r, _) = until(&th, &h, &a, head, small, 120);
+        let recorded = r.clone().err();
+        let walked = steps(&[&h.hub]) - s0;
+        // The same request with the record gone.
+        th.rt.block_on(async { sqlx::query("DELETE FROM blame_ends WHERE project_id = $1").bind(h.id).execute(&h.hub.db).await.unwrap() });
+        let s1 = steps(&[&h.hub]);
+        let (fresh, _) = until(&th, &h, &a, head, small, 120);
+        println!(
+            "bug_1412: the head, every 5th version below kept: {recorded:?} ({walked} versions blamed); with the record dropped: {:?} ({} versions blamed)",
+            fresh.as_ref().map(|v| v["line_count"].clone()),
+            steps(&[&h.hub]) - s1
+        );
+        assert_eq!(fresh.expect("a fresh job fits once the kept blames below are there")["line_count"], 60);
+        assert_eq!(r.map(|v| v["line_count"].clone()), Ok(Value::from(60)), "the head's blame, kept blames 5 versions below it");
+    }
+
+    /// Property 5 (stated bounds: a project keeps at most 32 MiB of kept
+    /// blames "times the view keys in use"): a policy change gives every
+    /// viewer a new view key, and the old keys' kept blames (and too-wide
+    /// records) stay: nothing drops a key's rows once no viewer has it.
+    /// Before the cap was per view key, the project's cap held them all.
+    /// Here anyone on Earth fills their key's (small) cap, then the policy
+    /// changes 11 times (a rule for a new folder each time), and after each
+    /// change they fill their new key's cap again: the project keeps 12
+    /// caps' worth, though at most 7 keys are in use. (S13's per-key graph rows,
+    /// `view_graph`, have the same lifetime: pre-existing.)
+    #[test]
+    #[ignore = "BUG-1413: kept blames of view keys no longer in use are never dropped; a project's bound grows with every policy change"]
+    fn bug_1413_kept_blames_of_old_view_keys_stay_after_policy_changes() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let path = "pub/f/chain.txt";
+        let (snaps, _) = chain_on(&th, &mut h, root_snapshot_id(), Files::new(), path, 24, 45, 1_700_000_000_000);
+        h.set_branch(&th, "main", *snaps.last().unwrap());
+        let viewer = Viewer::default();
+        let cap = 32usize << 10;
+        let l = limits(60_000, BlameLimits { kept_bytes: cap, ..BlameLimits::default() });
+        let mut text = policy_text.clone();
+        let mut keys = HashSet::new();
+        for version in 1..=12i64 {
+            if version > 1 {
+                text.push_str(&format!("x{version}/ finance\n"));
+                th.rt.block_on(async {
+                    sqlx::query("UPDATE projects SET policy_text = $1, policy_version = $2 WHERE id = $3").bind(&text).bind(version).bind(h.id).execute(&h.hub.db).await.unwrap();
+                });
+            }
+            warm_up(&th, &h, &viewer);
+            let a = Ask { policy_version: version, ..ask(&th, &h, &viewer) };
+            keys.insert(a.project.view(&viewer).key());
+            let ids = projected(&th, &h, &viewer, &snaps);
+            for s in &ids[4..] {
+                let (r, _) = until(&th, &h, &a, || BlameParams { rev: Some(s.clone()), path: path.into(), n: Some(1000), ..Default::default() }, l, 120);
+                assert_eq!(r.expect("each blame answers")["line_count"], 60);
+            }
+        }
+        assert_eq!(keys.len(), 12, "each policy a new view key");
+        // The keys in use under the last policy: every viewer's.
+        let p = h.project(&th);
+        let in_use: HashSet<String> = viewers(1).into_iter().map(|(_, v)| v).chain([admin()]).map(|v| p.view(&v).key()).collect();
+        let (bytes, kept_keys) = kept_bytes_of(&th, &h);
+        println!("bug_1413: {bytes} bytes of kept blames under {kept_keys} view keys; {} keys in use, {cap} bytes a key", in_use.len());
+        assert!(bytes as usize <= cap * in_use.len(), "the project keeps {bytes} bytes of kept blames, past {cap} × the {} view keys in use", in_use.len());
+    }
+}
