@@ -107,8 +107,13 @@ node_modules/            ignore
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
-    if args.next().is_some_and(|a| a == sandbox::REAPER_ARG) {
+    let first = args.next();
+    if first.as_ref().is_some_and(|a| a == sandbox::REAPER_ARG) {
         return sandbox::reaper_main(args.collect());
+    }
+    #[cfg(target_os = "linux")]
+    if first.as_ref().is_some_and(|a| a == confine::HOLD_ARG) {
+        return confine::hold_main();
     }
     let cli = Cli::parse();
     let json = cli.cmd.wants_json();
