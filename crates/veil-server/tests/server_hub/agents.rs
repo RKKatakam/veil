@@ -768,7 +768,7 @@ fn agent_sessions_never_force_or_delete_and_a_narrowed_one_moves_a_branch_only_w
                                                    "onto": {"branch": "main", "expected": base.hex()}}));
     assert_eq!(r.status, 200, "{}", body(&r));
     assert_eq!(r.json()["branch"]["status"], "rejected", "{}", body(&r));
-    assert_eq!(r.json()["branch"]["message"], "this agent session is narrowed: the move would change files outside its paths", "{}", body(&r));
+    assert_eq!(r.json()["branch"]["message"], "this agent session is narrowed: this would change files outside its paths", "{}", body(&r));
     // Its own change inside lands.
     let r = change(&hub, &narrow, &p.name, &json!({"base": base.hex(), "description": "inside", "edits": [{"path": "src/api/m.rs", "put": {"text": "m"}}],
                                                    "onto": {"branch": "main", "expected": base.hex()}}));
@@ -943,7 +943,6 @@ fn a_narrowed_sessions_api_edits_outside_its_paths_get_one_answer_naming_nothing
 /// it; a path-limited log must not tell it which changes touched a path
 /// outside its paths, nor whether such a path ever existed.
 #[test]
-#[ignore = "BUG-1480: q/log's path is not narrowed: a narrowed session learns the history and existence of paths outside its paths"]
 fn a_narrowed_sessions_path_limited_log_tells_nothing_of_paths_outside() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -976,7 +975,6 @@ fn a_narrowed_sessions_path_limited_log_tells_nothing_of_paths_outside() {
 /// `ops/.veilrules`. Moving `main` onto either changes files outside the
 /// session's paths; the answers must be the same.
 #[test]
-#[ignore = "BUG-1481: an agent's access-file move check answers before the narrowing check: a narrowed session learns whether a file that decides access changed outside its paths"]
 fn a_narrowed_sessions_refused_move_says_nothing_of_which_files_outside_changed() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1018,7 +1016,6 @@ fn a_narrowed_sessions_refused_move_says_nothing_of_which_files_outside_changed(
 /// upload: the id of a guess of what that path held in the older parent.
 /// A right guess and a wrong one must get the same answer.
 #[test]
-#[ignore = "BUG-1481: complete's closure check answers before the narrowing refusal: a narrowed session confirms guesses of the content of files outside its paths"]
 fn a_narrowed_sessions_push_cannot_confirm_what_a_file_outside_its_paths_held() {
     const PATH: &str = "src/util/MARKER-GUESS-PATH-8c.rs";
     let hub = TestHub::start();
@@ -1075,7 +1072,6 @@ fn a_narrowed_sessions_push_cannot_confirm_what_a_file_outside_its_paths_held() 
 /// at the admin's draft of both files: it must be refused, as the same move
 /// from an existing tip is (BUG-1391).
 #[test]
-#[ignore = "BUG-1482: an agent session creates the default branch at a change of .veilpolicy tier lines and .veilrules: no old tip, so nothing is compared"]
 fn an_agent_session_never_creates_the_default_branch_at_a_change_of_an_access_file() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1134,4 +1130,201 @@ fn an_agent_sessions_rebased_landing_keeps_its_attribution() {
     assert_eq!(s.agent.as_ref().map(|a| a.agent.as_str()), Some("claude-code/2.3"), "{s:?}");
     assert_eq!(s.agent.as_ref().and_then(|a| a.task.as_deref()), Some("TASK-S11-1"));
     assert_eq!(s.signature_valid(), Some(true));
+}
+
+// ---- S11 cycle 4: one rule per class ----------------------------------------------
+
+/// BUG-1480's class: every query route that takes a path takes it through
+/// `Ask::file_path`, so for a narrowed session a path outside its paths gets
+/// one answer, the same whether it exists or not, on every route.
+#[test]
+fn every_query_route_that_takes_a_path_refuses_one_outside_the_narrowing_the_same_way() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    with_api_folder(&hub, &p);
+    let narrow = agent_token(&hub, &p.dev.token(), &p.name, &["src/api"]);
+    let routes: [(&str, &str); 8] = [
+        ("log", "path={}"),
+        ("show", "path={}"),
+        ("tree", "path={}"),
+        ("file", "path={}"),
+        ("diff", "from=main&base=from&path={}"),
+        ("search", "q=fn&path={}"),
+        ("search", "q=fn&kind=path&path={}"),
+        ("grep", "pattern=fn&path={}"),
+    ];
+    for (route, params) in routes {
+        let mut answers = Vec::new();
+        for path in ["src/other.rs", "src/no-such-path-6f.rs", "src"] {
+            let r = q(&hub, Some(&narrow), &p.name, route, &params.replace("{}", path));
+            assert_eq!(r.status, 403, "{route}?{params} {path}: {}", body(&r));
+            assert!(!body(&r).contains("src/") && !body(&r).contains("api folder"), "{route} {path}: {}", body(&r));
+            answers.push(body(&r));
+        }
+        assert!(answers.windows(2).all(|w| w[0] == w[1]), "{route}: the answers differ: {answers:?}");
+    }
+    // Control: inside its paths, and the whole history (no path) for the log.
+    for (route, params) in [("log", "path=src/api"), ("log", ""), ("file", "path=src/api/h.rs"), ("tree", "path=src/api")] {
+        let r = q(&hub, Some(&narrow), &p.name, route, params);
+        assert_eq!(r.status, 200, "{route}?{params}: {}", body(&r));
+    }
+}
+
+/// BUG-1481's class: every write route of a narrowed session decides
+/// "anything outside its paths?" first, and answers one way naming
+/// nothing, whatever the outside change is: an ordinary file, a file that
+/// decides access, an object it never uploaded, a deletion.
+#[test]
+fn every_write_route_of_a_narrowed_session_answers_one_way_for_any_change_outside() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    with_api_folder(&hub, &p);
+    let api = hub.api();
+    let (dev, atok) = (p.dev.token(), p.admin.token());
+    let narrow = agent_token(&hub, &atok, &p.name, &["src/api"]);
+    let never_uploaded = ObjectId::hash(&O::Blob(b"MARKER-NEVER-UPLOADED-7a".to_vec()).encode());
+    // 1. A pushed snapshot.
+    let mut pushes = Vec::new();
+    for kind in ["file", "access", "missing", "delete"] {
+        let mut c = Craft::with(&api, narrow.clone(), p.admin.identity(), &p.name, "main");
+        let t = c.tip;
+        match kind {
+            "file" => c.file("src/other.rs", "changed"),
+            "access" => c.file("ops/.veilrules", "main  2 approvals\n"),
+            "missing" => c.refer("src/never.rs", never_uploaded, 24),
+            _ => {
+                let empty = c.put_object(O::Tree(veil_core::object::Tree::default()));
+                c.refer_dir("src/util-gone", empty);
+                c.file("src/other.rs", "");
+            }
+        }
+        let r = c.push_to("main", Some(t));
+        assert_eq!(r.status, 403, "push {kind}: {}", body(&r));
+        pushes.push(body(&r));
+    }
+    assert!(pushes.windows(2).all(|w| w[0] == w[1]), "pushes: {pushes:?}");
+    assert!(!pushes[0].contains("src/") && !pushes[0].contains(".veilrules"), "{}", pushes[0]);
+    // 2. A branch move onto an existing snapshot (the admin's drafts).
+    let tip0 = tip(&hub, &atok, &p.name);
+    let mut moves = Vec::new();
+    for (i, kind) in ["file", "access"].iter().enumerate() {
+        let mut d = Craft::new(&api, &p.admin, &p.name, "main");
+        match *kind {
+            "file" => d.file("src/other.rs", "the admin's"),
+            _ => d.file("ops/.veilrules", "main  2 approvals\n"),
+        }
+        let branch = format!("draft-{i}-c4");
+        let r = d.push_to(&branch, None);
+        assert_eq!(r.status, 200, "{}", body(&r));
+        let to = api.tips(Some(&atok), &p.name).unwrap().branches[&branch];
+        let r = api.post_json(Some(&narrow), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": tip0.hex(), "new": to.hex()}]}));
+        assert_eq!(r.status, 200, "move {kind}: {}", body(&r));
+        assert_eq!(r.json()["results"][0]["ok"], false, "move {kind}: {}", body(&r));
+        moves.push(r.json()["results"][0]["message"].clone());
+    }
+    assert_eq!(moves[0], moves[1], "moves: {moves:?}");
+    // 3. API commits.
+    let base = tip(&hub, &narrow, &p.name);
+    let mut commits = Vec::new();
+    for edit in [
+        json!({"path": "src/other.rs", "put": {"text": "x"}}),
+        json!({"path": "ops/.veilrules", "put": {"text": "main  2 approvals\n"}}),
+        json!({"path": "src/never.rs", "put": {"object": never_uploaded.hex()}}),
+        json!({"path": "src/other.rs", "delete": true}),
+    ] {
+        let r = change(&hub, &narrow, &p.name, &json!({"base": base.hex(), "description": "x", "edits": [edit.clone()]}));
+        assert_eq!(r.status, 403, "{edit}: {}", body(&r));
+        commits.push(body(&r));
+    }
+    assert!(commits.windows(2).all(|w| w[0] == w[1]), "commits: {commits:?}");
+    // 4. `onto` a stack of its person's own changes holding an outside change.
+    let mut stacks = Vec::new();
+    for edit in [json!({"path": "src/other.rs", "put": {"text": "s"}}), json!({"path": "ops/.veilrules", "put": {"text": "main  1 approval\n"}})] {
+        let own = change(&hub, &atok, &p.name, &json!({"base": base.hex(), "description": "own", "edits": [edit]}));
+        assert_eq!(own.status, 200, "{}", body(&own));
+        let on = own.json()["snapshot"].as_str().unwrap().to_string();
+        let r = change(&hub, &narrow, &p.name, &json!({"base": on, "description": "on it", "edits": [{"path": "src/api/s.rs", "put": {"text": "s"}}],
+                                                       "onto": {"branch": "main", "expected": base.hex()}}));
+        assert_eq!(r.status, 200, "{}", body(&r));
+        assert_eq!(r.json()["branch"]["status"], "rejected", "{}", body(&r));
+        stacks.push(r.json()["branch"]["message"].clone());
+    }
+    assert_eq!(stacks[0], stacks[1], "stacks: {stacks:?}");
+    assert_eq!(moves[0], stacks[0], "a move and a stack are told differently");
+    let _ = dev;
+}
+
+/// BUG-1482's class, a project made through the API with no `main` yet:
+/// an agent session may create `main` holding no file that decides access
+/// or review beyond the accepted policy (none yet), and may not create it
+/// holding one.
+#[test]
+fn an_agent_session_creates_a_new_projects_default_branch_only_without_access_files() {
+    let hub = TestHub::start();
+    let admin = hub.person("admin");
+    let name = unique("fresh");
+    let api = hub.api();
+    let atok = admin.token();
+    let r = api.post(Some(&atok), &format!("/v1/projects/{name}"), b"", false);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(api.tips(Some(&atok), &name).unwrap().branches.get("main").is_none(), "control: no main yet");
+    let agent = agent_token(&hub, &atok, &name, &[]);
+    let identity = admin.identity();
+    // A first snapshot holding `files`, on the universal root.
+    let first = |files: &[(&str, &str)]| -> (ObjectId, Vec<(ObjectId, Vec<u8>)>) {
+        let mut objects = Vec::new();
+        let mut t = veil_core::object::Tree::default();
+        for (name, text) in files {
+            let raw = O::Blob(text.as_bytes().to_vec()).encode();
+            let id = ObjectId::hash(&raw);
+            objects.push((id, raw));
+            t.insert(veil_core::object::TreeEntry {
+                name: name.to_string(),
+                kind: veil_core::object::EntryKind::File,
+                id,
+                size: text.len() as u64,
+                executable: false,
+                visibility: veil_core::object::Visibility::Public,
+            });
+        }
+        let raw = O::Tree(t).encode_with(veil_core::object::TreeEncoding::Binary);
+        let tree = ObjectId::hash(&raw);
+        objects.push((tree, raw));
+        let mut s = Snapshot {
+            parents: vec![veil_server::sync::root_snapshot_id()],
+            change_id: veil_core::ChangeId::random(),
+            tree,
+            description: Text::Plain("first".into()),
+            author: "admin".into(),
+            timestamp: veil_core::now_millis(),
+            predecessors: vec![],
+            conflicts: vec![],
+            embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
+            signature: None,
+        };
+        s.sign(&identity);
+        let raw = O::Snapshot(s).encode();
+        let id = ObjectId::hash(&raw);
+        objects.push((id, raw));
+        (id, objects)
+    };
+    let push_main = |files: &[(&str, &str)]| -> Reply {
+        let (id, objects) = first(files);
+        let up = api.upload(&agent, &name, &objects);
+        assert_eq!(up.status, 200, "{}", body(&up));
+        let receipts = up.json()["receipts"].as_array().unwrap().clone();
+        let map: serde_json::Map<String, Value> = objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+        api.post_json(Some(&agent), &format!("/v1/projects/{name}/push"), &json!({"updates": [{"branch": "main", "expected": null, "new": id.hex()}], "receipts": map}))
+    };
+    for files in [vec![(".veilrules", "main  2 approvals\n"), ("README", "r")], vec![(".veilpolicy", "src/  public\n"), ("README", "r")]] {
+        let r = push_main(&files);
+        assert!(r.status == 403 && body(&r).contains("agent_session"), "{files:?}: {} {}", r.status, body(&r));
+        assert!(api.tips(Some(&atok), &name).unwrap().branches.get("main").is_none(), "{files:?}: main was created");
+    }
+    let r = push_main(&[("README", "r")]);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "a first main without access files: {}", body(&r));
 }

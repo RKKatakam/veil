@@ -436,8 +436,7 @@ pub async fn search(hub: &Arc<Hub>, ask: &Ask, q: SearchParams, limits: Limits) 
     let deadline = Instant::now() + limits.deadline;
     let text = q.q.clone().unwrap_or_default();
     let terms = Terms::parse(&text)?;
-    let dir = clean_path(q.path.as_deref().unwrap_or(""))?;
-    ask.viewer.narrowed_to(&dir)?;
+    let dir = ask.file_path(q.path.as_deref())?;
     let exts = q.lang.as_deref().map(extensions).transpose()?;
     let names = match q.kind.as_deref().unwrap_or("code") {
         "code" => false,
@@ -695,8 +694,7 @@ impl GrepPage<'_> {
 pub async fn grep(hub: &Arc<Hub>, ask: &Ask, q: GrepParams, limits: Limits) -> Result<Value> {
     let deadline = Instant::now() + limits.deadline;
     let pat = Pattern::parse(&q.pattern, q.i.unwrap_or(false))?;
-    let dir = clean_path(q.path.as_deref().unwrap_or(""))?;
-    ask.viewer.narrowed_to(&dir)?;
+    let dir = ask.file_path(q.path.as_deref())?;
     let after = clean_path(q.after.as_deref().unwrap_or(""))?;
     let want = q.n.unwrap_or(100).clamp(1, 1_000);
     let rev = q.rev.clone().unwrap_or_else(|| ask.project.default_branch.clone());

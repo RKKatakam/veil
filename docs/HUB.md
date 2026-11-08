@@ -2905,11 +2905,26 @@ POST /v1/sessions/agent          (with a person's own session)
   (BUG-1391). It never forces a branch move
   or deletes a branch; a narrowed one moves a branch only when the old and
   new tips differ inside its paths alone, else the move is `rejected`,
-  naming nothing outside them (BUG-1378). Every refusal a narrowed session
-  can get names nothing outside its paths: a write there is refused first,
-  with one message, and an API commit's edit there before anything is read,
-  so a path that exists and one that does not get the same answer
-  (BUG-1392). A new branch removes nothing and
+  naming nothing outside them (BUG-1378). Three rules, each in one place
+  every route calls:
+  * **Every branch tip an agent session sets** (move, forced move, creation,
+    recreation; push, API commit's `onto`, landing) goes through
+    `sync::agent_tip`: compared with what was there before (the old tip's
+    tree; for a default branch that does not exist, nothing but the accepted
+    policy: a root `.veilpolicy` of exactly its text and no other file that
+    decides access or review). For a narrowed session the first question is
+    whether anything outside its paths changes, then the access files.
+    Other new branches decide nothing and are allowed (BUG-1391, BUG-1482).
+  * **Every write of a narrowed session** decides "anything outside its
+    paths?" first and answers one way, naming nothing: a pushed snapshot
+    right after the graft (`sync::narrowing_gate`, before the merge check,
+    the object closure check and every refusal that names a path), an API
+    commit's edits before anything is read, a branch tip in `agent_tip`
+    (BUG-1392, BUG-1481).
+  * **Every query route that takes a path** takes it through
+    `Ask::file_path` (the log through `Ask::log_path`: no path is the whole
+    history, its person's), so a path outside the narrowing gets one
+    answer, the same whether it exists or not (BUG-1480). A new branch removes nothing and
   is allowed.
 * **Narrowing applies to files; history is the person's.** `Viewer::only`
   narrows `View::write` (pushes and API commits write only inside), and the

@@ -895,25 +895,26 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
             }
         }
         let built = build(hub, &plan, &who, parent, pparent).await?;
-        // A narrowed session moves a branch only when the move changes
-        // nothing outside its paths (BUG-1378): a stack of its person's
-        // own changes may hold more.
-        // An agent session never moves a branch onto a change of a file that
-        // decides access or review (BUG-1391), whoever made it.
-        let (outside, access) = match (&onto, cur, &rejected, who.viewer.agent) {
-            (Some(_), Some(c), None, true) => {
-                let (w, to) = (who.clone(), built.real);
+        // The one rule of every tip an agent session sets (`sync::agent_tip`):
+        // for a narrowed one, anything outside its paths first (a stack of
+        // its person's own changes may hold more); then the files that decide
+        // access or review, whoever changed them. Before every other answer.
+        let tip_refused = match (&onto, cur, &rejected) {
+            (Some(o), Some(c), None) => {
                 // What the change made is stored only after: read it from here.
                 let made: HashMap<ObjectId, Bytes> = built.store.iter().cloned().collect();
-                sync::blocking_with(hub, project.id, made, move |src| {
-                    let outside = w.viewer.only.is_some() && sync::changes_outside_narrowing(src, &w.project.view(&w.viewer), c, to)?;
-                    Ok((outside, sync::changes_access_files(src, c, to)?))
-                })
-                .await?
+                sync::agent_tip_of(hub, &who.project, &who.viewer, &o.branch, Some(c), built.real, made).await?
             }
-            _ => (false, false),
+            _ => None,
         };
         let mv = match (&onto, cur, &rejected) {
+            (Some(_), Some(_), None) if tip_refused.is_some() => {
+                rejected = Some(match tip_refused {
+                    Some(sync::AgentTip::Narrowed) => sync::NARROWED_MOVE.into(),
+                    _ => sync::AGENT_ACCESS_MOVE.into(),
+                });
+                None
+            }
             // A change of who has access moves the default branch only for
             // an admin (the push's rule), never for an agent session
             // (BUG-1377); anyone else's change is kept.
@@ -922,14 +923,6 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
                     true => "an agent session never changes who has access (the default branch's .veilpolicy)".into(),
                     false => "only admins may change who has access (the default branch's .veilpolicy)".into(),
                 });
-                None
-            }
-            (Some(_), Some(_), None) if access => {
-                rejected = Some(sync::AGENT_ACCESS_MOVE.into());
-                None
-            }
-            (Some(_), Some(_), None) if outside => {
-                rejected = Some(sync::NARROWED_MOVE.into());
                 None
             }
             (Some(o), Some(c), None) => Some(Move {

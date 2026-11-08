@@ -138,6 +138,28 @@ impl Ask {
     fn key(&self) -> String {
         self.project.view(&self.viewer).key()
     }
+
+    /// The `path` a file route was given, checked (`clean_path`) and, for a
+    /// narrowed agent session, inside its paths (`Viewer::narrowed_to`):
+    /// **every** route that takes a path takes it through here, so none of
+    /// them answers anything about a path outside the narrowing, not even
+    /// whether it exists (BUG-1480). The root (`""`) is a path like any
+    /// other: it is the whole tree.
+    pub fn file_path(&self, raw: Option<&str>) -> Result<String> {
+        let path = clean_path(raw.unwrap_or(""))?;
+        self.viewer.narrowed_to(&path)?;
+        Ok(path)
+    }
+
+    /// [`Ask::file_path`] for the log, where no path is the whole history
+    /// (its person's projection, which a narrowed session reads): a path it
+    /// names is narrowed as every file route's is.
+    pub fn log_path(&self, raw: Option<&str>) -> Result<String> {
+        match raw.unwrap_or("") {
+            "" => Ok(String::new()),
+            p => self.file_path(Some(p)),
+        }
+    }
 }
 
 fn no_revision() -> Error {
@@ -427,7 +449,7 @@ pub struct LogParams {
 pub async fn log(hub: &Arc<Hub>, ask: &Ask, q: LogParams, limits: Limits) -> Result<Value> {
     let deadline = Instant::now() + limits.deadline;
     let n = q.n.unwrap_or(50).min(limits.page);
-    let path = clean_path(q.path.as_deref().unwrap_or(""))?;
+    let path = ask.log_path(q.path.as_deref())?;
     let after = q.after.clone();
     let roots: Vec<ObjectId> = match &after {
         Some(a) if a.starts_with(STORED_CURSOR) => Vec::new(),
@@ -861,8 +883,7 @@ pub struct ShowParams {
 /// A snapshot and the viewer's part of its changes against its first parent.
 pub async fn show(hub: &Arc<Hub>, ask: &Ask, q: ShowParams, limits: Limits) -> Result<Value> {
     let deadline = Instant::now() + limits.deadline;
-    let path = clean_path(q.path.as_deref().unwrap_or(""))?;
-    ask.viewer.narrowed_to(&path)?;
+    let path = ask.file_path(q.path.as_deref())?;
     let id = resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?;
     let content = !q.stat.unwrap_or(false);
     on_graph(hub, ask, deadline, move |g, t| {
@@ -891,8 +912,7 @@ pub struct TreeParams {
 /// A folder of the viewer's projected tree at a revision.
 pub async fn tree(hub: &Arc<Hub>, ask: &Ask, q: TreeParams, limits: Limits) -> Result<Value> {
     let deadline = Instant::now() + limits.deadline;
-    let path = clean_path(q.path.as_deref().unwrap_or(""))?;
-    ask.viewer.narrowed_to(&path)?;
+    let path = ask.file_path(q.path.as_deref())?;
     let id = resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?;
     on_graph(hub, ask, deadline, move |g, t| {
         let root = t.root_of(&*g.get(&id)?)?;
@@ -942,11 +962,10 @@ pub struct FileParams {
 /// which only key holders can open).
 pub async fn file(hub: &Arc<Hub>, ask: &Ask, q: FileParams, limits: Limits) -> Result<(Value, Vec<u8>)> {
     let deadline = Instant::now() + limits.deadline;
-    let path = clean_path(&q.path)?;
+    let path = ask.file_path(Some(&q.path))?;
     if path.is_empty() {
         return Err(no_path());
     }
-    ask.viewer.narrowed_to(&path)?;
     let id = resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?;
     let out = Arc::new(std::sync::Mutex::new(Vec::new()));
     let out2 = out.clone();
@@ -982,8 +1001,7 @@ pub struct DiffParams {
 /// The diff between two revisions, from their merge base by default.
 pub async fn diff(hub: &Arc<Hub>, ask: &Ask, q: DiffParams, limits: Limits) -> Result<Value> {
     let deadline = Instant::now() + limits.deadline;
-    let path = clean_path(q.path.as_deref().unwrap_or(""))?;
-    ask.viewer.narrowed_to(&path)?;
+    let path = ask.file_path(q.path.as_deref())?;
     let merge = match q.base.as_deref().unwrap_or("merge") {
         "merge" => true,
         "from" => false,

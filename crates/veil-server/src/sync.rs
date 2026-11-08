@@ -989,7 +989,7 @@ fn dir_tree(pr: &mut Projector, dirs: &mut Dirs, dir: &str) -> Result<Option<Arc
 
 /// What a narrowed agent session is told when a branch move would change
 /// something outside its paths: it names nothing there.
-pub(crate) const NARROWED_MOVE: &str = "this agent session is narrowed: the move would change files outside its paths";
+pub(crate) const NARROWED_MOVE: &str = NARROWED_WRITE;
 
 /// The refusal of what an agent session may never do (`docs/HUB.md` §13.27).
 pub(crate) fn agent_refusal(m: &str) -> Error {
@@ -1015,7 +1015,7 @@ type Visitor<'a> = &'a dyn Fn(&str, Option<&veil_core::TreeEntry>, Option<&veil_
 /// what `visit` descends into: the work is that of the difference.
 fn differs_where(
     src: &Source,
-    a: ObjectId,
+    a: Option<ObjectId>,
     b: ObjectId,
     visit: Visitor,
 ) -> Result<bool> {
@@ -1054,16 +1054,15 @@ fn differs_where(
         }
         Ok(false)
     }
-    walk(src, visit, "", Some(a), Some(b), 0)
+    walk(src, visit, "", a, Some(b), 0)
 }
 
-/// Does moving a branch from real snapshot `from` to real snapshot `to`
+/// Does going from real tree `from` (`None`: nothing) to real tree `to`
 /// change anything outside `view`'s narrowing (BUG-1378)? Inside it
 /// anything may differ; on the way to it, only folders that are folders on
 /// both sides are looked into; anywhere else nothing may.
-pub(crate) fn changes_outside_narrowing(src: &Source, view: &View, from: ObjectId, to: ObjectId) -> Result<bool> {
-    let (a, b) = (src.snapshot(&from)?.tree, src.snapshot(&to)?.tree);
-    differs_where(src, a, b, &|path, x, y| {
+fn differs_outside_narrowing(src: &Source, view: &View, from: Option<ObjectId>, to: ObjectId) -> Result<bool> {
+    differs_where(src, from, to, &|path, x, y| {
         let dir = |e: Option<&veil_core::TreeEntry>| e.is_none_or(|e| e.kind == EntryKind::Dir);
         if view.within_narrowing(path) {
             Visit::Skip
@@ -1075,16 +1074,24 @@ pub(crate) fn changes_outside_narrowing(src: &Source, view: &View, from: ObjectI
     })
 }
 
-/// Does moving a branch from real snapshot `from` to real snapshot `to`
-/// change a file that decides access or review (`hub::agent::decides_access`),
-/// in any folder, whoever made the change (BUG-1391)? An agent session never
-/// makes such a move, by any route.
-pub(crate) fn changes_access_files(src: &Source, from: ObjectId, to: ObjectId) -> Result<bool> {
-    let (a, b) = (src.snapshot(&from)?.tree, src.snapshot(&to)?.tree);
-    differs_where(src, a, b, &|path, x, y| {
+/// Does going from real tree `from` to real tree `to` change a file that
+/// decides access or review (`hub::agent::decides_access`), in any folder,
+/// whoever made the change (BUG-1391)? From nothing (`from` `None`: a new
+/// default branch), any such file counts but a root `.veilpolicy` whose
+/// text is exactly `accepted`, the project's accepted policy (BUG-1482).
+fn differs_in_access_files(src: &Source, from: Option<ObjectId>, to: ObjectId, accepted: &str) -> Result<bool> {
+    let from_nothing = from.is_none();
+    differs_where(src, from, to, &|path, x, y| {
         let file = |e: Option<&veil_core::TreeEntry>| e.is_some_and(|e| e.kind != EntryKind::Dir);
         if veil_core::hub::agent::decides_access(path) && (file(x) || file(y)) {
-            Visit::Found
+            let as_accepted = from_nothing
+                && path == veil_core::policy::POLICY_FILE
+                && y.is_some_and(|e| matches!(src.raw(&e.id).map(|r| Object::decode(&r)), Ok(Ok(Object::Blob(b))) if b == accepted.as_bytes()));
+            if as_accepted {
+                Visit::Skip
+            } else {
+                Visit::Found
+            }
         } else if x.is_some_and(|e| e.kind == EntryKind::Dir) || y.is_some_and(|e| e.kind == EntryKind::Dir) {
             Visit::Descend
         } else {
@@ -1093,9 +1100,90 @@ pub(crate) fn changes_access_files(src: &Source, from: ObjectId, to: ObjectId) -
     })
 }
 
+/// Why an agent session may not set a branch's tip ([`agent_tip`]).
+pub(crate) enum AgentTip {
+    /// The tip would change files outside a narrowed session's paths
+    /// ([`NARROWED_MOVE`]: naming nothing there).
+    Narrowed,
+    /// The tip would change a file that decides access or review
+    /// ([`AGENT_ACCESS_MOVE`]).
+    Access,
+}
+
+/// **The one rule of every branch tip an agent session sets** (`docs/HUB.md`
+/// §13.27): a move, a forced move, a creation, a recreation after a
+/// deletion, by push, by API commit with `onto`, and by any landing to come
+/// (S17 calls it too). The tip is compared with what was there before:
+/// the old tip's tree, or for a default branch that does not exist, nothing
+/// but the accepted policy (`accepted`). Other new branches decide nothing
+/// and are allowed (`None` with `default` false).
+///
+/// For a narrowed session the first question is whether anything outside
+/// its paths changes: it is answered before any other comparison, so the
+/// answer never tells what changed there (BUG-1481). Then the files that
+/// decide access or review (BUG-1391, BUG-1482). `None`: allowed.
+pub(crate) fn agent_tip(src: &Source, view: &View, accepted: &str, default: bool, cur: Option<ObjectId>, to: ObjectId) -> Result<Option<AgentTip>> {
+    if !view.is_agent() {
+        return Ok(None);
+    }
+    let from = match cur {
+        Some(c) => Some(src.snapshot(&c)?.tree),
+        None if default => None,
+        None => return Ok(None),
+    };
+    let to = src.snapshot(&to)?.tree;
+    if view.is_narrowed() && differs_outside_narrowing(src, view, from, to)? {
+        return Ok(Some(AgentTip::Narrowed));
+    }
+    if differs_in_access_files(src, from, to, accepted)? {
+        return Ok(Some(AgentTip::Access));
+    }
+    Ok(None)
+}
+
+/// [`agent_tip`] for a push or an API commit: off the async runtime.
+pub(crate) async fn agent_tip_of(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    branch: &str,
+    cur: Option<ObjectId>,
+    to: ObjectId,
+    pending: HashMap<ObjectId, Bytes>,
+) -> Result<Option<AgentTip>> {
+    if !viewer.agent {
+        return Ok(None);
+    }
+    let (v, text, bindings) = (viewer.clone(), project.policy_text.clone(), project.bindings.clone());
+    let default = branch == project.default_branch;
+    blocking_with(hub, project.id, pending, move |src| {
+        let p = Project {
+            id: src.project,
+            name: String::new(),
+            default_branch: String::new(),
+            policy: AccessPolicy::parse(&text),
+            policy_text: String::new(),
+            bindings,
+        };
+        agent_tip(src, &p.view(&v), &text, default, cur, to)
+    })
+    .await
+}
+
+/// The first check of every write a narrowed session makes (a pushed
+/// snapshot, an API commit, a landing): does any of `changes` (paths from
+/// the root) lie outside its paths? One answer, naming nothing
+/// ([`NARROWED_WRITE`]). Anyone else passes.
+pub(crate) fn narrowing_gate(view: &View, changes: &[Change]) -> Result<()> {
+    if view.is_narrowed() && changes.iter().any(|c| !view.within_narrowing(&c.path)) {
+        return Err(agent_refusal(NARROWED_WRITE));
+    }
+    Ok(())
+}
+
 /// What a narrowed session is told when it would write outside its paths:
 /// it names nothing there (BUG-1392).
-pub(crate) const NARROWED_WRITE: &str = "this agent session is narrowed: the change writes outside its paths";
+pub(crate) const NARROWED_WRITE: &str = "this agent session is narrowed: this would change files outside its paths";
 
 /// What an agent session is told when a branch move would land a change of
 /// a file that decides access or review (BUG-1391).
@@ -1201,12 +1289,9 @@ fn check_changes(
         others.push((src.snapshot(p)?.tree, None));
     }
     for c in changes {
-        // A narrowed session writes nothing outside its paths, and is told
-        // nothing of what is there: every refusal below names its path
-        // (BUG-1392).
-        if !view.within_narrowing(&c.path) {
-            return Err(agent_refusal(NARROWED_WRITE));
-        }
+        // (A narrowed session's changes outside its paths never get here:
+        // `narrowing_gate` refused them first, naming nothing; every refusal
+        // below names its path.)
         // Taken from another parent of a merge, where that parent's side
         // changed it since the common ancestor: the merge takes a change
         // someone who could write it made. Taking the version the first
@@ -1378,6 +1463,10 @@ pub(crate) fn complete(
     let ptrees: Vec<ObjectId> = rp.iter().map(|p| Ok(src.snapshot(p)?.tree)).collect::<Result<_>>()?;
     let mut g = Graft::new(src, &view).proving(uploaded, ptrees.clone());
     let real_tree = g.root(n.tree, Some(ptrees[0]))?;
+    // A narrowed session: anything outside its paths, decided here, right
+    // after the graft, before any other comparison, object check or lookup,
+    // and answered one way, naming nothing (BUG-1392, BUG-1481).
+    narrowing_gate(&view, &g.changes)?;
     // A merge must not change what the pusher cannot see.
     for other in &ptrees[1..] {
         let mut g2 = Graft::new(src, &view).proving(uploaded, ptrees.clone());
@@ -1669,38 +1758,22 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         if new_real.is_none() && viewer.agent {
             return Err(agent_refusal("an agent session never deletes a branch"));
         }
-        // An agent session never moves a branch onto a change of a file
-        // that decides access or review, whoever made it (BUG-1391).
-        if let (Some(c), Some(n), true) = (cur, new_real, viewer.agent) {
-            if blocking(hub, project.id, move |src| changes_access_files(src, c, n)).await? {
-                return Err(agent_refusal(AGENT_ACCESS_MOVE));
-            }
-        }
-        // A narrowed session moves a branch only when the move changes
-        // nothing outside its paths (BUG-1378); a new branch removes nothing.
-        if let (Some(c), Some(n), true) = (cur, new_real, viewer.only.is_some()) {
-            let v = viewer.clone();
-            let (text, bindings) = (project.policy_text.clone(), project.bindings.clone());
-            let outside = blocking(hub, project.id, move |src| {
-                let p = Project {
-                    id: src.project,
-                    name: String::new(),
-                    default_branch: String::new(),
-                    policy: AccessPolicy::parse(&text),
-                    policy_text: String::new(),
-                    bindings,
-                };
-                changes_outside_narrowing(src, &p.view(&v), c, n)
-            })
-            .await?;
-            if outside {
-                results.push(BranchResult {
-                    branch: u.branch.clone(),
-                    ok: false,
-                    message: Some(NARROWED_MOVE.into()),
-                    tip: cur_seen,
-                });
-                continue;
+        // The one rule of every tip an agent session sets (`agent_tip`):
+        // first, for a narrowed one, anything outside its paths; then the
+        // files that decide access or review, a new default branch included.
+        if let Some(n) = new_real {
+            match agent_tip_of(hub, project, viewer, &u.branch, cur, n, HashMap::new()).await? {
+                Some(AgentTip::Narrowed) => {
+                    results.push(BranchResult {
+                        branch: u.branch.clone(),
+                        ok: false,
+                        message: Some(NARROWED_MOVE.into()),
+                        tip: cur_seen,
+                    });
+                    continue;
+                }
+                Some(AgentTip::Access) => return Err(agent_refusal(AGENT_ACCESS_MOVE)),
+                None => {}
             }
         }
         if let (Some(c), Some(n)) = (cur, new_real) {
