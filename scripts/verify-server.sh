@@ -143,14 +143,17 @@ step clippy cargo clippy -q -p veil-server --all-targets --features containers -
 
 echo "== container suite"
 # The hostile-size reproductions (S12's adversarial pass: millions of
-# rows) run in steps of their own, so that their load never starves the
-# suite's contention-sensitive tests (sign-up under SERIALIZABLE).
-HOSTILE=derived::s12_adversarial
-step postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-pg-$RUN "$BIN" --skip "$HOSTILE"
+# rows; S28's API commits of gigabytes, which measure the process's memory)
+# run in steps of their own, one test at a time, so that their load never
+# starves the suite's contention-sensitive tests (sign-up under
+# SERIALIZABLE) and nothing else counts in their memory.
+HOSTILE=(derived::s12_adversarial packs::hostile_)
+SKIP_HOSTILE=(--skip derived::s12_adversarial --skip packs::hostile_)
+step postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-pg-$RUN "$BIN" "${SKIP_HOSTILE[@]}"
 # YugabyteDB is shared by every run on the machine: 8 tests at a time, so
 # several runs at once do not drown it in servers and pools (each test
 # starts its own); results stay trustworthy under load.
-STEP_LIMIT=1800 step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-yb-$RUN "$BIN" --skip "$HOSTILE" --test-threads=8
+STEP_LIMIT=1800 step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-yb-$RUN "$BIN" "${SKIP_HOSTILE[@]}" --test-threads=8
 # One at a time: on a database other runs share, three at once could keep
 # a statement past its timeout.
 # The hostile-size sets take about half an hour and touch only S12/S13's
@@ -161,11 +164,11 @@ STEP_LIMIT=1800 step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_
 hostile=${VEIL_VERIFY_HOSTILE:-auto}
 if [ "$hostile" = auto ]; then
   base=$(git merge-base HEAD integration 2>/dev/null)
-  if [ -n "$base" ] && git diff --name-only "$base" HEAD -- crates/veil-server/src/derive crates/veil-server/src/query crates/veil-server/tests/server_hub/derived.rs | grep -q .; then hostile=1; else hostile=0; fi
+  if [ -n "$base" ] && git diff --name-only "$base" HEAD -- crates/veil-server/src/derive crates/veil-server/src/query crates/veil-server/src/store.rs crates/veil-server/src/sync.rs crates/veil-server/tests/server_hub/derived.rs crates/veil-server/tests/server_hub/packs.rs | grep -q .; then hostile=1; else hostile=0; fi
 fi
 if [ "$hostile" = 1 ]; then
-  STEP_LIMIT=2400 step hostile-postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-hpg-$RUN "$BIN" "$HOSTILE" --test-threads=1
-  STEP_LIMIT=9000 step hostile-yugabyte flock -w 7200 "${XDG_RUNTIME_DIR:-/tmp}/veil-yb-hostile.lock" env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-hyb-$RUN "$BIN" "$HOSTILE" --test-threads=1
+  STEP_LIMIT=2400 step hostile-postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-hpg-$RUN "$BIN" "${HOSTILE[@]}" --test-threads=1
+  STEP_LIMIT=9000 step hostile-yugabyte flock -w 7200 "${XDG_RUNTIME_DIR:-/tmp}/veil-yb-hostile.lock" env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-hyb-$RUN "$BIN" "${HOSTILE[@]}" --test-threads=1
 else
   echo "   skip  hostile sets (no derive/ or query/ changes; VEIL_VERIFY_HOSTILE=1 runs them)"
 fi

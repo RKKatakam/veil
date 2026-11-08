@@ -579,7 +579,7 @@ fn a_pack_discarded_while_another_server_lists_it_is_listed_or_gone() {
 /// holds its 256 MiB decoded. Before S28 a commit read uploads from the
 /// store as its checks needed them. Hostile size: run alone.
 #[test]
-fn bug_1156_api_commits_hold_their_uploads_within_the_servers_bound() {
+fn hostile_bug_1156_api_commits_hold_their_uploads_within_the_servers_bound() {
     use veil_core::hub::{encoding, wire::put_frame};
     let hub = TestHub::start();
     let p = setup_project(&hub);
