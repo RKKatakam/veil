@@ -209,7 +209,7 @@ impl<'a> SparseView<'a> {
                     });
                     continue;
                 }
-                if !self.set.is_outside(&p) || !self.store.entry_readable(&self.tree.shown(c.clone())) {
+                if !self.set.is_outside(&p) || !self.store.entry_shown(&self.tree.shown(c.clone())) {
                     continue;
                 }
                 out.entries.push(DirEntry {
@@ -388,6 +388,7 @@ impl StorageBackend for SparseView<'_> {
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {

@@ -39,7 +39,7 @@
 //! what it shows.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex, MutexGuard},
     time::SystemTime,
 };
@@ -111,6 +111,12 @@ pub trait UpperFiles: Send + Sync {
     /// Rename upper file `from` to `to`, whose directory the upper layer
     /// has: O(1), holes and all, and an open file follows it.
     fn rename(&self, from: &VPath, to: &VPath) -> std::io::Result<()>;
+    /// Write `src`'s content as the upper file `path` (whose directory the
+    /// upper layer has), atomically and durably, a piece at a time:
+    /// `false` when this layer cannot (write it whole instead).
+    fn put_from(&self, _path: &VPath, _src: &std::fs::File) -> std::io::Result<bool> {
+        Ok(false)
+    }
 }
 
 /// [`UpperFiles`] of an upper layer that is a directory on disk (a real
@@ -176,6 +182,39 @@ impl UpperFiles for DiskFiles {
             }
         }
         Ok(())
+    }
+
+    /// A private temporary file beside it, filled a piece at a time,
+    /// synced, then renamed into place and its directory synced: a crash
+    /// leaves the old state or the whole copy (BUG-1368).
+    fn put_from(&self, path: &VPath, src: &std::fs::File) -> std::io::Result<bool> {
+        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        let to = self.full(path);
+        let dir = to.parent().ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        // A temporary name every listing skips (`is_temp_name`): a copy a
+        // crash leaves is never taken for a file.
+        let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let tmp = dir.join(format!(".{name}.vltmp{}", hex::encode(veil_core::crypto::random_bytes::<4>())));
+        let done = (|| -> std::io::Result<()> {
+            let out = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
+            let mut buf = vec![0u8; 1 << 20];
+            let mut at = 0u64;
+            loop {
+                let n = src.read_at(&mut buf, at)?;
+                if n == 0 {
+                    break;
+                }
+                out.write_all_at(&buf[..n], at)?;
+                at += n as u64;
+            }
+            out.sync_all()?;
+            std::fs::rename(&tmp, &to)?;
+            std::fs::File::open(dir)?.sync_all()
+        })();
+        if done.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        done.map(|()| true)
     }
 }
 
@@ -321,6 +360,20 @@ pub trait Lower: StorageBackend {
     fn unseen_under(&self, _path: &VPath) -> Vec<VPath> {
         Vec::new()
     }
+
+    /// Does reading a file fetch it (a thin clone)? Then `open` reads it:
+    /// the kernel turns any error of a later read into `EIO`, so only at
+    /// `open` can the server's refusal (`EACCES`, and the file hidden from
+    /// then on) be told from a server that cannot be reached (`EIO`).
+    fn fetches(&self) -> bool {
+        false
+    }
+
+    /// Copy the content of file `path` to `out` without holding it whole in
+    /// memory, if this layer can: its length, or `None` (read it whole).
+    fn copy_to(&self, _path: &VPath, _out: &mut std::fs::File) -> VResult<Option<u64>> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -331,17 +384,66 @@ impl Lower for veil_core::vfs::MemoryBackend {}
 /// A [`TreeView`] lists only what this reader can materialise, but answers
 /// `metadata` (and `read`, with an error) for every entry. Here an entry
 /// this reader cannot read is absent everywhere, as in a checkout.
+///
+/// **In a thin clone** (milestone S8) the tree is what the server gave this
+/// person (their projection: hidden entries are not in it), and objects are
+/// fetched when first needed:
+/// * listing a folder and `stat` never fetch a file's content: sizes are in
+///   the tree entries, and a file not fetched yet whose entry is not
+///   labelled secret is shown (what its object really is decides when it
+///   is read: a secret this reader cannot open reads as `EACCES`). A file
+///   labelled secret is fetched to decide, as its object is the authority;
+/// * listing a folder fetches its tree, and nothing below it (a folder not
+///   fetched yet is shown without fetching it: one holding only secrets
+///   this reader cannot open lists as empty); the first read of a file
+///   fetches its folder's small files with it, in one request
+///   ([`ReaderView::prefetch_folder`]);
+/// * the server's own refusal (`Missing`) hides an entry, as everywhere; a
+///   server that cannot be reached, or any other failure, is an error
+///   (`EIO`), never an empty or absent file or folder.
 #[derive(Debug)]
 pub struct ReaderView {
     store: Arc<ObjectStore>,
     view: TreeView,
+    /// The folders (by tree id) whose small files were fetched together.
+    fetched_folders: Mutex<HashSet<ObjectId>>,
 }
+
+/// The paths whose file the server refused (not this person's: access
+/// removed since the tree was listed), with when: absent from listings and
+/// lookups for [`REFUSED_FOR`], whichever view of the tree asks (the
+/// mount's lower layer is made afresh at each recording); asked again after
+/// it, so access given back shows. By path, as the server decides
+/// (BUG-1367): the same content elsewhere (an empty `__init__.py`) is
+/// another file. One mount per process.
+static REFUSED: std::sync::LazyLock<Mutex<HashMap<VPath, std::time::Instant>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+const REFUSED_FOR: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn refused(path: &VPath) -> bool {
+    let mut r = REFUSED.lock().unwrap_or_else(|p| p.into_inner());
+    match r.get(path) {
+        Some(at) if at.elapsed() < REFUSED_FOR => true,
+        Some(_) => {
+            r.remove(path);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Large files known to be plain blobs (BUG-1461): decided once a process.
+static PLAIN_LARGE: std::sync::LazyLock<Mutex<HashSet<ObjectId>>> = std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Files up to this size are fetched with their folder (the first read of
+/// one of them fetches the others in the same request).
+pub const FOLDER_FILE_LIMIT: u64 = 256 << 10;
 
 impl ReaderView {
     pub fn new(store: Arc<ObjectStore>, tree: ObjectId) -> ReaderView {
         ReaderView {
             view: TreeView::new(store.clone(), tree),
             store,
+            fetched_folders: Mutex::new(HashSet::new()),
         }
     }
 
@@ -350,40 +452,88 @@ impl ReaderView {
     /// directory holding nothing this reader can read is absent (checkout
     /// would not create it).
     fn entry(&self, path: &VPath) -> VResult<Option<TreeEntry>> {
+        // What is fetched on the way is asked for at this path, wherever
+        // the same content (a file, a copied folder) was met first: the
+        // server decides by path (BUG-1367).
+        if self.store.is_partial() {
+            self.store.place_along(&self.view.root(), path);
+        }
         match lookup(&self.store, &self.view.root(), path) {
             Ok(Some(e)) if path.is_root() => Ok(Some(e)),
-            Ok(Some(e)) if e.kind == EntryKind::Dir => Ok(self.dir_visible(&e)?.then_some(e)),
-            Ok(Some(e)) if self.visible_leaf(&e) => Ok(Some(e)),
+            Ok(Some(e)) if e.kind == EntryKind::Dir => Ok(self.dir_visible(&e, path)?.then_some(e)),
+            Ok(Some(e)) if self.visible_leaf(&e, path)? => Ok(Some(e)),
             Ok(_) => Ok(None),
             Err(e) if e.is_unreadable() => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    /// Is leaf entry `e` shown to this reader, as checkout would write it?
-    /// A conflict with a symlink side as that shown side.
-    fn visible_leaf(&self, e: &TreeEntry) -> bool {
+    /// Is leaf entry `e`, at `path`, shown to this reader, as checkout
+    /// would write it? A conflict with a symlink side as that shown side.
+    fn visible_leaf(&self, e: &TreeEntry, path: &VPath) -> VResult<bool> {
         let shown = match e.kind {
             EntryKind::Conflict => match self.store.conflict(&e.id) {
                 Ok(c) if c.has_special_terms() => match veil_core::conflict::shown_side(&c) {
                     Some((_, t)) => t.entry(&e.name),
-                    None => return false,
+                    None => return Ok(false),
                 },
-                _ => return self.store.entry_readable(e),
+                Err(err) if !(err.is_unreadable() || err.is_not_found()) => return Err(err),
+                _ => return Ok(self.store.entry_readable(e)),
             },
             _ => e.clone(),
         };
+        if self.store.is_partial() && refused(path) {
+            return Ok(false);
+        }
         match shown.kind {
-            EntryKind::Dir => false,
-            _ => self.store.entry_readable(&shown),
+            EntryKind::Dir => Ok(false),
+            EntryKind::File | EntryKind::Symlink if self.store.is_partial() && !self.store.has(&shown.id) => {
+                // Not fetched yet. A plain entry is shown without fetching
+                // its content (`entry_shown`); a secret one is decided by its
+                // object, fetched now, and a failure to fetch it is an error,
+                // never "hidden".
+                if shown.visibility.key_scope().is_none() {
+                    return Ok(self.store.entry_shown(&shown));
+                }
+                match self.store.get_raw(&shown.id) {
+                    Ok(_) => Ok(self.store.entry_readable(&shown)),
+                    Err(err) if err.is_unreadable() => Ok(false),
+                    Err(err) => Err(err),
+                }
+            }
+            // A large plain file is not read whole to tell (BUG-1368): a
+            // loose one by its first bytes; a packed one is read whole the
+            // first time (BUG-1461, open), and its answer kept for the
+            // process (a plain blob is plain for every reader).
+            EntryKind::File if shown.size > SPILL_AT && shown.visibility.key_scope().is_none() => {
+                if PLAIN_LARGE.lock().unwrap_or_else(|p| p.into_inner()).contains(&shown.id) || self.store.is_loose_blob(&shown.id) {
+                    return Ok(true);
+                }
+                // One read decides: a plain blob is readable (and kept);
+                // anything else as a checkout decides.
+                match self.store.get_raw(&shown.id) {
+                    Ok(raw) if veil_core::object::Object::is_blob_raw(&raw) => {
+                        PLAIN_LARGE.lock().unwrap_or_else(|p| p.into_inner()).insert(shown.id);
+                        Ok(true)
+                    }
+                    _ => Ok(self.store.entry_readable(&shown)),
+                }
+            }
+            _ => Ok(self.store.entry_readable(&shown)),
         }
     }
 
     /// Does directory entry `dir` hold a file this reader can read?
     /// Depth first, stopping at the first one (usually the first entry).
-    fn dir_visible(&self, dir: &TreeEntry) -> VResult<bool> {
-        let mut stack = vec![dir.id];
-        while let Some(id) = stack.pop() {
+    fn dir_visible(&self, dir: &TreeEntry, path: &VPath) -> VResult<bool> {
+        // A folder of a thin clone not fetched yet is shown without fetching
+        // it (`entry_shown`): one that turns out to hold only secrets this
+        // reader cannot open lists as empty.
+        if self.store.is_partial() && !self.store.has(&dir.id) {
+            return Ok(self.store.entry_shown(dir));
+        }
+        let mut stack = vec![(dir.id, path.clone())];
+        while let Some((id, at)) = stack.pop() {
             let tree = match self.store.tree(&id) {
                 Ok(t) => t,
                 Err(e) if e.is_unreadable() || e.is_not_found() => continue,
@@ -391,17 +541,88 @@ impl ReaderView {
             };
             for c in tree.entries.iter().rev() {
                 match c.kind {
-                    EntryKind::Dir => stack.push(c.id),
-                    _ if self.visible_leaf(c) => return Ok(true),
+                    EntryKind::Dir => stack.push((c.id, at.join(&c.name))),
+                    _ if self.visible_leaf(c, &at.join(&c.name))? => return Ok(true),
                     _ => {}
                 }
             }
         }
         Ok(false)
     }
+
+    /// The server's own "not yours" for `e` at `path` (never an unreachable
+    /// one): the file is hidden from now on, as a checkout would leave it
+    /// out.
+    fn note_refusal(&self, e: &TreeEntry, path: &VPath, err: &VeilError) {
+        if err.is_unreadable() && self.store.is_partial() && !self.store.has(&e.id) && e.visibility.key_scope().is_none() {
+            REFUSED.lock().unwrap_or_else(|p| p.into_inner()).insert(path.clone(), std::time::Instant::now());
+        }
+    }
+
+    /// In a thin clone, fetch folder `dir`'s small files together, once per
+    /// folder (the first read of one of them). Best effort: a failure here
+    /// is the reader's to meet, at the object it reads.
+    fn prefetch_folder(&self, dir: &VPath) {
+        if !self.store.may_fetch() {
+            return;
+        }
+        let Ok(Some(e)) = lookup(&self.store, &self.view.root(), dir) else { return };
+        if e.kind != EntryKind::Dir || !self.fetched_folders.lock().unwrap_or_else(|p| p.into_inner()).insert(e.id) {
+            return;
+        }
+        let Ok(t) = self.store.tree(&e.id) else { return };
+        // Each at its own path, a refused one left (BUG-1460).
+        let want: Vec<(VPath, ObjectId, u64)> = t
+            .entries
+            .iter()
+            .filter(|c| matches!(c.kind, EntryKind::File | EntryKind::Symlink) && c.size <= FOLDER_FILE_LIMIT && !self.store.has(&c.id))
+            .map(|c| (dir.join(&c.name), c.id, c.size))
+            .collect();
+        if !want.is_empty() {
+            let _ = self.store.prefetch_at(&self.view.root(), &want);
+        }
+    }
+
+    /// In a thin clone, have what is at `path` (BUG-1460): content already
+    /// on this machine reads at every path naming it (the person holds
+    /// those bytes; removal of access stops new fetches, BUG-1464); an
+    /// object not held is asked for at this path and nowhere else, its
+    /// folder's small files with it. A refusal hides the path (`EACCES`
+    /// now, absent from then on).
+    fn answer_for(&self, e: &TreeEntry, path: &VPath) -> VResult<()> {
+        if !self.store.is_partial() || e.kind == EntryKind::Dir || self.store.has(&e.id) {
+            return Ok(());
+        }
+        self.prefetch_folder(&path.parent().unwrap_or_else(VPath::root));
+        match self.store.read_at(&e.id, &self.view.root(), path) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                if err.is_unreadable() && e.visibility.key_scope().is_none() {
+                    REFUSED.lock().unwrap_or_else(|p| p.into_inner()).insert(path.clone(), std::time::Instant::now());
+                }
+                Err(err)
+            }
+        }
+    }
 }
 
 impl Lower for ReaderView {
+    fn fetches(&self) -> bool {
+        self.store.is_partial()
+    }
+
+    /// A plain file's content, streamed from its loose object (BUG-1368).
+    /// In a thin clone one not fetched yet is fetched first (whole: the
+    /// server sends an object at a time), then streamed from the cache.
+    fn copy_to(&self, path: &VPath, out: &mut std::fs::File) -> VResult<Option<u64>> {
+        let Some(e) = self.entry(path)? else { return Err(VeilError::NotFound(path.to_string())) };
+        if e.kind != EntryKind::File || e.visibility.key_scope().is_some() {
+            return Ok(None);
+        }
+        self.answer_for(&e, path)?;
+        self.store.copy_loose_blob(&e.id, out)
+    }
+
     /// Files of the tree this reader cannot read (when in doubt, the path
     /// itself: being carried is the safe side).
     fn unseen_under(&self, path: &VPath) -> Vec<VPath> {
@@ -418,7 +639,7 @@ impl Lower for ReaderView {
                     Ok(t) => stack.extend(t.entries.iter().map(|c| (p.join(&c.name), c.clone()))),
                     Err(_) => out.push(p),
                 },
-                _ if self.visible_leaf(&e) => {}
+                _ if self.visible_leaf(&e, &p).unwrap_or(false) => {}
                 _ => out.push(p),
             }
         }
@@ -435,7 +656,14 @@ impl StorageBackend for ReaderView {
 
     fn read(&self, path: &VPath) -> VResult<Vec<u8>> {
         match self.entry(path)? {
-            Some(_) => self.view.read(path),
+            Some(e) => {
+                self.answer_for(&e, path)?;
+                let r = self.view.read(path);
+                if let Err(err) = &r {
+                    self.note_refusal(&e, path, err);
+                }
+                r
+            }
             None => Err(VeilError::NotFound(path.to_string())),
         }
     }
@@ -467,14 +695,31 @@ impl StorageBackend for ReaderView {
     }
 
     fn list_dir(&self, path: &VPath) -> VResult<Vec<DirEntry>> {
-        if self.entry(path)?.is_none() {
+        let Some(dir) = self.entry(path)? else {
             return Err(VeilError::NotFound(path.to_string()));
+        };
+        if dir.kind != EntryKind::Dir {
+            return Err(VeilError::InvalidPath(format!("{path} is not a directory")));
         }
+        // From the tree, by this view's rules ([`TreeView`]'s listing reads
+        // every file to decide, which in a thin clone would fetch them).
         let mut out = Vec::new();
-        for e in self.view.list_dir(path)? {
-            if e.kind == NodeKind::File || self.entry(&path.join(&e.name))?.is_some() {
-                out.push(e);
-            }
+        for c in self.store.tree(&dir.id)?.entries.iter() {
+            let kind = match c.kind {
+                EntryKind::Dir if self.dir_visible(c, &path.join(&c.name))? => NodeKind::Dir,
+                EntryKind::Dir => continue,
+                _ if !self.visible_leaf(c, &path.join(&c.name))? => continue,
+                EntryKind::Symlink => NodeKind::Symlink,
+                EntryKind::Conflict => match self.store.conflict(&c.id) {
+                    Ok(cf) if cf.has_special_terms() => match veil_core::conflict::shown_side(&cf) {
+                        Some((_, t)) if t.entry(&c.name).kind == EntryKind::Symlink => NodeKind::Symlink,
+                        _ => NodeKind::File,
+                    },
+                    _ => NodeKind::File,
+                },
+                _ => NodeKind::File,
+            };
+            out.push(DirEntry { name: c.name.clone(), kind });
         }
         Ok(out)
     }
@@ -498,12 +743,119 @@ struct Node {
     open: u32,
     /// While open: the content of a file only the lower layer has, read
     /// once (a read never decrypts a file twice). Never written to.
-    cache: Option<Vec<u8>>,
+    cache: Option<Lowered>,
     /// While open: the upper file, in place, once the upper layer has the
     /// file. Reads and writes go straight to it (BUG-561).
     file: Option<Box<dyn UpperFile>>,
     /// Written since `file` was last synced.
     dirty: bool,
+}
+
+/// Lower-layer content held for open files, in memory, across all of them
+/// (BUG-1365): past it, or for a file larger than [`SPILL_AT`], the content
+/// goes to an anonymous file of the mount's private directory instead.
+pub const HELD: u64 = 64 << 20;
+/// Files larger than this are never held in memory while open.
+pub const SPILL_AT: u64 = 1 << 20;
+
+/// The content of a file only the lower layer has, for an open node: in
+/// memory, or in an anonymous file (no name: nothing of it outlives the
+/// process, a crash included), read from in pieces.
+enum Lowered {
+    Bytes(Vec<u8>),
+    Spilled { file: std::fs::File, len: u64 },
+}
+
+impl Lowered {
+    fn len(&self) -> u64 {
+        match self {
+            Lowered::Bytes(b) => b.len() as u64,
+            Lowered::Spilled { len, .. } => *len,
+        }
+    }
+
+    fn held(&self) -> u64 {
+        match self {
+            Lowered::Bytes(b) => b.len() as u64,
+            Lowered::Spilled { .. } => 0,
+        }
+    }
+
+    /// At most `size` bytes from `offset`.
+    fn read(&self, offset: u64, size: u32) -> std::io::Result<Vec<u8>> {
+        match self {
+            Lowered::Bytes(buf) => {
+                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(buf.len());
+                let end = start.saturating_add(size as usize).min(buf.len());
+                Ok(buf[start..end].to_vec())
+            }
+            Lowered::Spilled { file, len } => {
+                let n = (size as u64).min(len.saturating_sub(offset)) as usize;
+                let mut out = vec![0; n];
+                let mut done = 0;
+                while done < n {
+                    match std::os::unix::fs::FileExt::read_at(file, &mut out[done..], offset + done as u64)? {
+                        0 => break,
+                        k => done += k,
+                    }
+                }
+                out.truncate(done);
+                Ok(out)
+            }
+        }
+    }
+
+    /// The whole content (a copy-up, a copy).
+    fn bytes(&self) -> std::io::Result<Vec<u8>> {
+        match self {
+            Lowered::Bytes(b) => Ok(b.clone()),
+            Lowered::Spilled { len, .. } => self.read(0, u32::try_from(*len).unwrap_or(u32::MAX)).and_then(|b| match b.len() as u64 == *len {
+                true => Ok(b),
+                false => Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            }),
+        }
+    }
+
+    /// `data`, spilled to an anonymous file in `dir`.
+    fn spill(dir: &std::path::Path, data: &[u8]) -> std::io::Result<Lowered> {
+        use std::io::Write;
+        let mut file = anonymous_file(dir)?;
+        file.write_all(data)?;
+        Ok(Lowered::Spilled { file, len: data.len() as u64 })
+    }
+}
+
+/// A new file of `dir` (private) without a name, open for reading and
+/// writing: nothing of it outlives its last handle, a crash included.
+/// `O_TMPFILE` on Linux; where the filesystem has no such thing (NFS, some
+/// FUSE ones) or elsewhere, a file created exclusively and removed at once.
+fn anonymous_file(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(target_os = "linux")]
+    match std::fs::OpenOptions::new().read(true).write(true).mode(0o600).custom_flags(libc::O_TMPFILE).open(dir) {
+        Ok(f) => return Ok(f),
+        Err(e) if !matches!(e.raw_os_error(), Some(libc::EOPNOTSUPP) | Some(libc::EISDIR) | Some(libc::EINVAL) | Some(libc::ENOENT)) || !dir.is_dir() => {
+            return Err(e)
+        }
+        Err(_) => {}
+    }
+    unlinked_file(dir)
+}
+
+/// [`anonymous_file`] where `O_TMPFILE` is not to be had: created
+/// exclusively in `dir` (private), never through a link, then removed.
+fn unlinked_file(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let p = dir.join(format!(".spill-{}", hex::encode(veil_core::crypto::random_bytes::<8>())));
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&p)?;
+    std::fs::remove_file(&p)?;
+    Ok(f)
 }
 
 struct Handle {
@@ -512,6 +864,8 @@ struct Handle {
 }
 
 struct Inner {
+    /// Where large open files' content goes ([`MountFs::with_spill`]).
+    spill: Option<std::path::PathBuf>,
     overlay: OverlayBackend,
     /// The overlay's lower layer, as a [`Lower`].
     lower: Arc<dyn Lower>,
@@ -664,7 +1018,7 @@ impl Inner {
         };
         match self.nodes.get(&ino) {
             Some(Node { path: None, file: Some(f), .. }) => Ok(unlinked(f.len().map_err(|e| io_errno(&e))?)),
-            Some(Node { path: None, cache: Some(c), .. }) => Ok(unlinked(c.len() as u64)),
+            Some(Node { path: None, cache: Some(c), .. }) => Ok(unlinked(c.len())),
             _ => {
                 let p = self.path(ino)?;
                 self.attr(ino, &p)
@@ -698,12 +1052,31 @@ impl Inner {
 
     /// Load the content of open node `ino` (a file only the lower layer
     /// has) into its cache.
-    fn load(&mut self, ino: u64) -> FsResult<&Vec<u8>> {
+    fn load(&mut self, ino: u64) -> FsResult<&Lowered> {
         let need = self.nodes.get(&ino).ok_or(libc::EBADF)?.cache.is_none();
         if need {
             let path = self.path(ino)?;
+            // A large file straight to its spill file, never whole in
+            // memory, where the lower layer can (BUG-1368).
+            if let Some(dir) = self.spill.clone() {
+                if self.meta(&path)?.is_some_and(|m| m.len > SPILL_AT) {
+                    let mut file = anonymous_file(&dir).map_err(|e| io_errno(&e))?;
+                    if let Some(len) = self.lower.copy_to(&path, &mut file).map_err(|e| errno(&e))? {
+                        self.nodes.get_mut(&ino).ok_or(libc::EBADF)?.cache = Some(Lowered::Spilled { file, len });
+                        return Ok(self.nodes.get(&ino).and_then(|n| n.cache.as_ref()).expect("loaded"));
+                    }
+                }
+            }
             let data = self.overlay.read(&path).map_err(|e| errno(&e))?;
-            self.nodes.get_mut(&ino).ok_or(libc::EBADF)?.cache = Some(data);
+            // In memory only while small and under the bound across open
+            // files (BUG-1365).
+            let held: u64 = self.nodes.values().filter_map(|n| n.cache.as_ref()).map(Lowered::held).sum();
+            let len = data.len() as u64;
+            let content = match &self.spill {
+                Some(dir) if len > SPILL_AT || held + len > HELD => Lowered::spill(dir, &data).map_err(|e| io_errno(&e))?,
+                _ => Lowered::Bytes(data),
+            };
+            self.nodes.get_mut(&ino).ok_or(libc::EBADF)?.cache = Some(content);
         }
         Ok(self.nodes.get(&ino).and_then(|n| n.cache.as_ref()).expect("loaded"))
     }
@@ -735,19 +1108,57 @@ impl Inner {
     /// that was never written is written in memory.
     fn writable(&mut self, ino: u64) -> FsResult<&mut Box<dyn UpperFile>> {
         if !self.open_upper(ino)? {
+            // A large lower file is spilled first (read a piece at a time),
+            // then copied up from the spill file (BUG-1368).
+            let unloaded = self.nodes.get(&ino).is_some_and(|n| n.path.is_some() && n.cache.is_none());
+            if unloaded && self.spill.is_some() {
+                self.load(ino)?;
+            }
+            let spill = self.spill.clone();
             let node = self.nodes.get_mut(&ino).ok_or(libc::EBADF)?;
             match node.path.clone() {
-                None => {
-                    let data = node.cache.take().unwrap_or_default();
-                    node.file = Some(Box::new(VecFile(data)));
-                }
+                // Unlinked while open: its content, and what is written to
+                // it from now on, in an anonymous file where the mount has a
+                // spill directory (never in memory: BUG-1368).
+                None => match (spill, node.cache.take()) {
+                    (_, Some(Lowered::Spilled { file, .. })) => node.file = Some(Box::new(DiskFile(file))),
+                    (Some(dir), cache) => {
+                        use std::io::Write;
+                        let mut file = anonymous_file(&dir).map_err(|e| io_errno(&e))?;
+                        if let Some(c) = cache {
+                            file.write_all(&c.bytes().map_err(|e| io_errno(&e))?).map_err(|e| io_errno(&e))?;
+                        }
+                        node.file = Some(Box::new(DiskFile(file)));
+                    }
+                    (None, cache) => {
+                        let data = match cache {
+                            Some(c) => c.bytes().map_err(|e| io_errno(&e))?,
+                            None => Vec::new(),
+                        };
+                        node.file = Some(Box::new(VecFile(data)));
+                    }
+                },
                 Some(path) => {
-                    let data = match node.cache.take() {
-                        Some(d) => d,
-                        None => self.overlay.read(&path).map_err(|e| errno(&e))?,
-                    };
+                    let cache = node.cache.take();
                     let exec = self.meta(&path)?.is_some_and(|m| m.executable);
-                    self.overlay.write(&path, &data).map_err(|e| errno(&e))?;
+                    // A spilled file is copied up a piece at a time where
+                    // the upper layer is on disk (BUG-1368).
+                    let streamed = match &cache {
+                        Some(Lowered::Spilled { file, .. }) => {
+                            if let Some(dir) = path.parent().filter(|d| !d.is_root()) {
+                                self.overlay.create_dir_all(&dir).map_err(|e| errno(&e))?;
+                            }
+                            self.files.put_from(&path, file).map_err(|e| io_errno(&e))?
+                        }
+                        _ => false,
+                    };
+                    if !streamed {
+                        let data = match cache {
+                            Some(d) => d.bytes().map_err(|e| io_errno(&e))?,
+                            None => self.overlay.read(&path).map_err(|e| errno(&e))?,
+                        };
+                        self.overlay.write(&path, &data).map_err(|e| errno(&e))?;
+                    }
                     self.overlay.set_executable(&path, exec).map_err(|e| errno(&e))?;
                     if !self.open_upper(ino)? {
                         return Err(libc::EIO);
@@ -836,7 +1247,7 @@ impl Inner {
                     }
                 } else if self.nodes.get(&ino).is_some_and(|n| n.cache.is_none()) && self.load(ino).is_err() {
                     if let Some(n) = self.nodes.get_mut(&ino) {
-                        n.cache = Some(Vec::new());
+                        n.cache = Some(Lowered::Bytes(Vec::new()));
                     }
                 }
             }
@@ -863,8 +1274,22 @@ impl Inner {
             }
             return self.files.rename(from, to).map_err(|e| io_errno(&e));
         }
+        // A large lower file: a piece at a time, through a spill file
+        // (BUG-1368).
+        if let Some(dir) = self.spill.clone().filter(|_| m.len > SPILL_AT) {
+            let mut file = anonymous_file(&dir).map_err(|e| io_errno(&e))?;
+            if self.lower.copy_to(from, &mut file).map_err(|e| errno(&e))?.is_some() {
+                if let Some(parent) = to.parent().filter(|d| !d.is_root()) {
+                    self.overlay.create_dir_all(&parent).map_err(|e| errno(&e))?;
+                }
+                if self.files.put_from(to, &file).map_err(|e| io_errno(&e))? {
+                    self.overlay.set_executable(to, m.executable).map_err(|e| errno(&e))?;
+                    return Ok(());
+                }
+            }
+        }
         let data = match self.by_path.get(from).and_then(|i| self.nodes.get(i)).and_then(|n| n.cache.as_ref()) {
-            Some(b) => b.clone(),
+            Some(b) => b.bytes().map_err(|e| io_errno(&e))?,
             None => self.overlay.read(from).map_err(|e| errno(&e))?,
         };
         self.overlay.write(to, &data).map_err(|e| errno(&e))?;
@@ -974,6 +1399,7 @@ impl MountFs {
     ) -> MountFs {
         MountFs {
             inner: Mutex::new(Inner {
+                spill: None,
                 overlay: OverlayBackend::with_upper(lower.clone(), upper.clone(), whiteouts),
                 lower,
                 unseen: BTreeSet::new(),
@@ -1005,6 +1431,13 @@ impl MountFs {
     /// backend.
     pub fn with_files(self, files: Arc<dyn UpperFiles>) -> MountFs {
         self.lock().files = files;
+        self
+    }
+
+    /// Keep the content of large open files (and of open files past
+    /// [`HELD`]) in anonymous files of `dir` (private), not in memory.
+    pub fn with_spill(self, dir: std::path::PathBuf) -> MountFs {
+        self.lock().spill = Some(dir);
         self
     }
 
@@ -1126,6 +1559,8 @@ impl MountFs {
                 g.nodes.get_mut(&ino).ok_or(libc::ENOENT)?.cache = None;
             }
             g.touch(&path);
+        } else if g.lower.fetches() && !g.open_upper(ino)? {
+            g.load(ino)?;
         }
         g.nodes.get_mut(&ino).ok_or(libc::ENOENT)?.open += 1;
         let fh = g.next_fh;
@@ -1180,10 +1615,7 @@ impl MountFs {
             out.truncate(done);
             return Ok(out);
         }
-        let buf = g.load(ino)?;
-        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(buf.len());
-        let end = start.saturating_add(size as usize).min(buf.len());
-        Ok(buf[start..end].to_vec())
+        g.load(ino)?.read(offset, size).map_err(|e| io_errno(&e))
     }
 
     pub fn write(&self, fh: u64, offset: u64, data: &[u8]) -> FsResult<u32> {
@@ -1825,6 +2257,81 @@ mod tests {
         assert_eq!(m.fs.lookup(ROOT, os("nope")), Err(libc::ENOENT));
         assert_eq!(m.fs.open(m.ino("a").unwrap(), false, false), Err(libc::EISDIR));
         assert!(m.upper.files().is_empty(), "reading copies nothing up");
+    }
+
+    /// BUG-1365: a large open file's content is in an anonymous file, not
+    /// in memory; it reads in pieces, copies up on a write, keeps its
+    /// content when unlinked while open, and the open files held in memory
+    /// stay under [`HELD`].
+    #[test]
+    fn large_open_files_are_spilled_and_behave_as_held_ones() {
+        let big: Vec<u8> = (0..(SPILL_AT as usize + 4097)).map(|i| (i % 251) as u8).collect();
+        let small = vec![7u8; 600 << 10];
+        let files: Vec<(String, Vec<u8>)> = [("big.bin".to_string(), big.clone()), ("big2.bin".to_string(), big.clone())]
+            .into_iter()
+            .chain((0..120).map(|i| (format!("s/{i}.bin"), small.clone())))
+            .collect();
+        let refs: Vec<(&str, &[u8])> = files.iter().map(|(a, b)| (a.as_str(), b.as_slice())).collect();
+        let spill = tempfile::tempdir().unwrap();
+        let mut m = mem(&refs);
+        m.fs = std::mem::replace(&mut m.fs, MountFs::new(m.lower.clone(), m.upper.clone(), Vec::new(), None)).with_spill(spill.path().to_path_buf());
+        let held = |m: &Mem| -> u64 { m.fs.lock().nodes.values().filter_map(|n| n.cache.as_ref()).map(Lowered::held).sum() };
+        // Read in pieces, spilled.
+        let ino = m.ino("big.bin").unwrap();
+        let fh = m.fs.open(ino, false, false).unwrap();
+        assert_eq!(m.fs.read(fh, 5, 10).unwrap(), &big[5..15]);
+        assert!(matches!(m.fs.lock().nodes[&ino].cache, Some(Lowered::Spilled { .. })));
+        assert_eq!(held(&m), 0);
+        assert_eq!(m.fs.read(fh, big.len() as u64 - 3, 10).unwrap(), &big[big.len() - 3..]);
+        assert!(std::fs::read_dir(spill.path()).unwrap().next().is_none(), "a spilled file has no name");
+        // 120 open small files: memory stays under the bound.
+        let fhs: Vec<u64> = (0..120)
+            .map(|i| {
+                let f = m.fs.open(m.ino(&format!("s/{i}.bin")).unwrap(), false, false).unwrap();
+                assert_eq!(m.fs.read(f, 0, 4).unwrap(), [7, 7, 7, 7]);
+                f
+            })
+            .collect();
+        assert!(held(&m) <= HELD, "{} bytes held", held(&m));
+        // Written through a handle open on the spilled content: copied up whole.
+        let w = m.fs.open(ino, true, false).unwrap();
+        m.fs.write(w, 0, b"XY").unwrap();
+        m.fs.release(w).unwrap();
+        let mut want = big.clone();
+        want[..2].copy_from_slice(b"XY");
+        assert_eq!(m.upper.read(&p("big.bin")).unwrap(), want);
+        // Unlinked while open, held or spilled: the open handle still
+        // reads it, and writes to it reach no path.
+        m.fs.unlink(m.ino("s").unwrap(), os("0.bin")).unwrap();
+        assert_eq!(m.fs.read(fhs[0], 0, 3).unwrap(), [7, 7, 7]);
+        let b2 = m.fs.open(m.ino("big2.bin").unwrap(), true, false).unwrap();
+        assert_eq!(m.fs.read(b2, 1, 2).unwrap(), &big[1..3]);
+        m.fs.unlink(ROOT, os("big2.bin")).unwrap();
+        assert_eq!(m.fs.read(b2, big.len() as u64 - 2, 9).unwrap(), &big[big.len() - 2..]);
+        m.fs.write(b2, 0, b"Q").unwrap();
+        assert_eq!(m.fs.read(b2, 0, 2).unwrap(), [b'Q', big[1]]);
+        m.fs.release(b2).unwrap();
+        assert!(m.upper.read(&p("big2.bin")).is_err() && m.lower.read(&p("big2.bin")).unwrap() == big);
+        for f in fhs {
+            m.fs.release(f).unwrap();
+        }
+        m.fs.release(fh).unwrap();
+    }
+
+    /// The spill files' fallback (a filesystem without `O_TMPFILE`): a file
+    /// that reads and writes, and leaves no name behind.
+    #[test]
+    fn a_spill_file_without_o_tmpfile_leaves_no_name() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        for f in [unlinked_file(dir.path()).unwrap(), anonymous_file(dir.path()).unwrap()] {
+            f.write_all_at(b"spilled", 0).unwrap();
+            let mut b = [0u8; 7];
+            f.read_exact_at(&mut b, 0).unwrap();
+            assert_eq!(&b, b"spilled");
+            assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none(), "a spill file left a name");
+        }
+        assert!(anonymous_file(&dir.path().join("missing")).is_err());
     }
 
     #[test]
