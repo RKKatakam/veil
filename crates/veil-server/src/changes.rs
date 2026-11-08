@@ -783,6 +783,11 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
     }
     let mut pending = HashMap::new();
     let edits = validate(&req, &mut pending)?;
+    // A narrowed session edits nothing outside its paths, and learns nothing
+    // there: not even whether a path exists (BUG-1392).
+    if req.edits.iter().any(|e| !viewer.within_narrowing(&e.path)) {
+        return Err(sync::agent_refusal(sync::NARROWED_WRITE));
+    }
     let onto = req.onto.clone();
     let mut who = Arc::new(Who {
         project: project.clone(),
@@ -893,14 +898,20 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
         // A narrowed session moves a branch only when the move changes
         // nothing outside its paths (BUG-1378): a stack of its person's
         // own changes may hold more.
-        let outside = match (&onto, cur, &rejected, who.viewer.only.is_some()) {
+        // An agent session never moves a branch onto a change of a file that
+        // decides access or review (BUG-1391), whoever made it.
+        let (outside, access) = match (&onto, cur, &rejected, who.viewer.agent) {
             (Some(_), Some(c), None, true) => {
                 let (w, to) = (who.clone(), built.real);
                 // What the change made is stored only after: read it from here.
                 let made: HashMap<ObjectId, Bytes> = built.store.iter().cloned().collect();
-                sync::blocking_with(hub, project.id, made, move |src| sync::changes_outside_narrowing(src, &w.project.view(&w.viewer), c, to)).await?
+                sync::blocking_with(hub, project.id, made, move |src| {
+                    let outside = w.viewer.only.is_some() && sync::changes_outside_narrowing(src, &w.project.view(&w.viewer), c, to)?;
+                    Ok((outside, sync::changes_access_files(src, c, to)?))
+                })
+                .await?
             }
-            _ => false,
+            _ => (false, false),
         };
         let mv = match (&onto, cur, &rejected) {
             // A change of who has access moves the default branch only for
@@ -911,6 +922,10 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
                     true => "an agent session never changes who has access (the default branch's .veilpolicy)".into(),
                     false => "only admins may change who has access (the default branch's .veilpolicy)".into(),
                 });
+                None
+            }
+            (Some(_), Some(_), None) if access => {
+                rejected = Some(sync::AGENT_ACCESS_MOVE.into());
                 None
             }
             (Some(_), Some(_), None) if outside => {

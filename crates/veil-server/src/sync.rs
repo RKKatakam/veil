@@ -910,12 +910,25 @@ pub(crate) fn agent_refusal(m: &str) -> Error {
     Error::new(axum::http::StatusCode::FORBIDDEN, crate::auth::AGENT_SESSION, m.to_string())
 }
 
-/// Does moving a branch from real snapshot `from` to real snapshot `to`
-/// change anything outside `view`'s narrowing (BUG-1378)? The trees are
-/// walked down both at once, only where they differ and only into the
-/// folders on the way to the narrowing: inside it anything may differ,
-/// anywhere else nothing.
-pub(crate) fn changes_outside_narrowing(src: &Source, view: &View, from: ObjectId, to: ObjectId) -> Result<bool> {
+/// What [`differs_where`] does at an entry that differs between the trees.
+enum Visit {
+    /// Nothing to look at here.
+    Skip,
+    /// Look below (the folders, on either side; a file side counts as none).
+    Descend,
+    /// This difference is what was looked for.
+    Found,
+}
+
+/// Do real trees `a` and `b` differ anywhere `visit` says [`Visit::Found`]?
+/// Both are walked down at once, only where they differ, and only into
+/// what `visit` descends into: the work is that of the difference.
+fn differs_where(
+    src: &Source,
+    a: ObjectId,
+    b: ObjectId,
+    visit: &dyn Fn(&str, Option<&veil_core::TreeEntry>, Option<&veil_core::TreeEntry>) -> Visit,
+) -> Result<bool> {
     use std::collections::{BTreeMap, BTreeSet};
     fn entries(src: &Source, id: Option<ObjectId>) -> Result<BTreeMap<String, veil_core::TreeEntry>> {
         let Some(id) = id else { return Ok(BTreeMap::new()) };
@@ -924,7 +937,8 @@ pub(crate) fn changes_outside_narrowing(src: &Source, view: &View, from: ObjectI
             Node::Leaf => BTreeMap::new(),
         })
     }
-    fn walk(src: &Source, view: &View, dir: &str, a: Option<ObjectId>, b: Option<ObjectId>, depth: usize) -> Result<bool> {
+    type V<'a> = &'a dyn Fn(&str, Option<&veil_core::TreeEntry>, Option<&veil_core::TreeEntry>) -> Visit;
+    fn walk(src: &Source, visit: V, dir: &str, a: Option<ObjectId>, b: Option<ObjectId>, depth: usize) -> Result<bool> {
         if a == b {
             return Ok(false);
         }
@@ -938,21 +952,66 @@ pub(crate) fn changes_outside_narrowing(src: &Source, view: &View, from: ObjectI
                 continue;
             }
             let path = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
-            if view.within_narrowing(&path) {
-                continue;
-            }
             let dir_of = |e: Option<&veil_core::TreeEntry>| e.filter(|e| e.kind == EntryKind::Dir).map(|e| e.id);
-            let both_dirs = x.is_none_or(|e| e.kind == EntryKind::Dir) && y.is_none_or(|e| e.kind == EntryKind::Dir);
-            if both_dirs && view.toward_narrowing(&path) && !walk(src, view, &path, dir_of(x), dir_of(y), depth + 1)? {
-                continue;
+            match visit(&path, x, y) {
+                Visit::Skip => {}
+                Visit::Found => return Ok(true),
+                Visit::Descend => {
+                    if walk(src, visit, &path, dir_of(x), dir_of(y), depth + 1)? {
+                        return Ok(true);
+                    }
+                }
             }
-            return Ok(true);
         }
         Ok(false)
     }
-    let (a, b) = (src.snapshot(&from)?.tree, src.snapshot(&to)?.tree);
-    walk(src, view, "", Some(a), Some(b), 0)
+    walk(src, visit, "", Some(a), Some(b), 0)
 }
+
+/// Does moving a branch from real snapshot `from` to real snapshot `to`
+/// change anything outside `view`'s narrowing (BUG-1378)? Inside it
+/// anything may differ; on the way to it, only folders that are folders on
+/// both sides are looked into; anywhere else nothing may.
+pub(crate) fn changes_outside_narrowing(src: &Source, view: &View, from: ObjectId, to: ObjectId) -> Result<bool> {
+    let (a, b) = (src.snapshot(&from)?.tree, src.snapshot(&to)?.tree);
+    differs_where(src, a, b, &|path, x, y| {
+        let dir = |e: Option<&veil_core::TreeEntry>| e.is_none_or(|e| e.kind == EntryKind::Dir);
+        if view.within_narrowing(path) {
+            Visit::Skip
+        } else if dir(x) && dir(y) && view.toward_narrowing(path) {
+            Visit::Descend
+        } else {
+            Visit::Found
+        }
+    })
+}
+
+/// Does moving a branch from real snapshot `from` to real snapshot `to`
+/// change a file that decides access or review (`hub::agent::decides_access`),
+/// in any folder, whoever made the change (BUG-1391)? An agent session never
+/// makes such a move, by any route.
+pub(crate) fn changes_access_files(src: &Source, from: ObjectId, to: ObjectId) -> Result<bool> {
+    let (a, b) = (src.snapshot(&from)?.tree, src.snapshot(&to)?.tree);
+    differs_where(src, a, b, &|path, x, y| {
+        let file = |e: Option<&veil_core::TreeEntry>| e.is_some_and(|e| e.kind != EntryKind::Dir);
+        if veil_core::hub::agent::decides_access(path) && (file(x) || file(y)) {
+            Visit::Found
+        } else if x.is_some_and(|e| e.kind == EntryKind::Dir) || y.is_some_and(|e| e.kind == EntryKind::Dir) {
+            Visit::Descend
+        } else {
+            Visit::Skip
+        }
+    })
+}
+
+/// What a narrowed session is told when it would write outside its paths:
+/// it names nothing there (BUG-1392).
+pub(crate) const NARROWED_WRITE: &str = "this agent session is narrowed: the change writes outside its paths";
+
+/// What an agent session is told when a branch move would land a change of
+/// a file that decides access or review (BUG-1391).
+pub(crate) const AGENT_ACCESS_MOVE: &str =
+    "an agent session never moves a branch onto a change of a file that decides access or review (.veilpolicy, .veilrules)";
 
 /// Names of personal private keys: never accepted, sealed or not
 /// (`docs/VISIBILITY.md`, "Personal private keys never leave your machine").
@@ -1053,6 +1112,12 @@ fn check_changes(
         others.push((src.snapshot(p)?.tree, None));
     }
     for c in changes {
+        // A narrowed session writes nothing outside its paths, and is told
+        // nothing of what is there: every refusal below names its path
+        // (BUG-1392).
+        if !view.within_narrowing(&c.path) {
+            return Err(agent_refusal(NARROWED_WRITE));
+        }
         // Taken from another parent of a merge, where that parent's side
         // changed it since the common ancestor: the merge takes a change
         // someone who could write it made. Taking the version the first
@@ -1514,6 +1579,13 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         }
         if new_real.is_none() && viewer.agent {
             return Err(agent_refusal("an agent session never deletes a branch"));
+        }
+        // An agent session never moves a branch onto a change of a file
+        // that decides access or review, whoever made it (BUG-1391).
+        if let (Some(c), Some(n), true) = (cur, new_real, viewer.agent) {
+            if blocking(hub, project.id, move |src| changes_access_files(src, c, n)).await? {
+                return Err(agent_refusal(AGENT_ACCESS_MOVE));
+            }
         }
         // A narrowed session moves a branch only when the move changes
         // nothing outside its paths (BUG-1378); a new branch removes nothing.

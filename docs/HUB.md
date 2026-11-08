@@ -2514,10 +2514,16 @@ POST /v1/sessions/agent          (with a person's own session)
   (`hub::agent::ACCESS_FILES`: `.veilpolicy`, `.veilrules`, in any folder)
   by any route: its own push or API commit (`View::write`), a merge that
   takes someone else's change of one, or a move of the default branch that
-  would accept new access lines (BUG-1377). It never forces a branch move
+  would accept new access lines (BUG-1377), nor by any branch move whose
+  old and new tips differ in such a file, whoever made the change
+  (BUG-1391). It never forces a branch move
   or deletes a branch; a narrowed one moves a branch only when the old and
   new tips differ inside its paths alone, else the move is `rejected`,
-  naming nothing outside them (BUG-1378). A new branch removes nothing and
+  naming nothing outside them (BUG-1378). Every refusal a narrowed session
+  can get names nothing outside its paths: a write there is refused first,
+  with one message, and an API commit's edit there before anything is read,
+  so a path that exists and one that does not get the same answer
+  (BUG-1392). A new branch removes nothing and
   is allowed.
 * **Narrowing applies to files; history is the person's.** `Viewer::only`
   narrows `View::write` (pushes and API commits write only inside), and the

@@ -114,12 +114,19 @@ struct ServerEntry {
     /// the only `team` key ring of that project it trusts (BUG-845).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     anchors: BTreeMap<String, String>,
+    /// Fields this `vl` does not know (a later release's, on the same
+    /// machine), kept as they are by every rewrite (BUG-1393).
+    #[serde(flatten)]
+    unknown: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct HubFile {
     #[serde(default)]
     servers: BTreeMap<String, ServerEntry>,
+    /// Fields this `vl` does not know, kept as they are (BUG-1393).
+    #[serde(flatten)]
+    unknown: BTreeMap<String, serde_json::Value>,
 }
 
 fn hub_file() -> std::path::PathBuf {
@@ -1313,7 +1320,6 @@ mod tests {
     /// release's, written by it on the same machine), or refuses. The file
     /// is outside every repository, so no repository format guards it.
     #[test]
-    #[ignore = "BUG-1393: a rewrite of $VEIL_HOME/hub.json drops the fields this vl does not know"]
     fn hub_json_keeps_the_fields_this_vl_does_not_know() {
         let before = br#"{"servers":{"hub.example:443":{"token":"t","expires_at":5,"anchors":{"p":"fp"},"later_trust":{"p":"MARKER-LATER-FIELD-1a"}}},"later_top":"MARKER-LATER-TOP-2b"}"#;
         let mut f: HubFile = serde_json::from_slice(before).expect("an older vl reads a newer hub.json");

@@ -781,7 +781,6 @@ fn agent_sessions_never_force_or_delete_and_a_narrowed_one_moves_a_branch_only_w
 /// changes) and of `.veilrules` on a side branch; the admin's agent session
 /// moves `main` onto it, by a fast-forward push and by an API commit on it.
 #[test]
-#[ignore = "BUG-1391: an agent session lands someone else's change of .veilpolicy (tier lines) or .veilrules by moving a branch onto it"]
 fn an_agent_session_never_lands_someone_elses_change_of_an_access_file_by_moving_a_branch() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -818,7 +817,6 @@ fn an_agent_session_never_lands_someone_elses_change_of_an_access_file_by_moving
 /// `src/util` by an empty folder is refused, and the refusal must not name
 /// the files there.
 #[test]
-#[ignore = "BUG-1392: a narrowed agent session's refused push names files outside its paths that it cannot list"]
 fn a_narrowed_agent_sessions_refused_push_names_nothing_outside_its_paths() {
     const NAME: &str = "MARKER-UNLISTED-NAME-6b";
     let hub = TestHub::start();
@@ -909,4 +907,29 @@ fn an_older_vl_gets_no_format_10_snapshot_by_any_route() {
     for (_, raw) in f.frames() {
         assert!(matches!(O::decode(&raw), Ok(O::Tree(_))), "fetch sent something other than the tree");
     }
+}
+
+/// BUG-1392's class through the API: a narrowed session's edits outside its
+/// paths get one refusal, naming nothing, whether the path holds a file or
+/// nothing at all, and whatever the edit is.
+#[test]
+fn a_narrowed_sessions_api_edits_outside_its_paths_get_one_answer_naming_nothing() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    with_api_folder(&hub, &p);
+    let narrow = agent_token(&hub, &p.dev.token(), &p.name, &["src/api"]);
+    let base = tip(&hub, &narrow, &p.name);
+    let mut answers = Vec::new();
+    for edit in [
+        json!({"path": "src/other.rs", "delete": true}),
+        json!({"path": "src/no-such-file-4d.rs", "delete": true}),
+        json!({"path": "src/other.rs", "put": {"text": "x"}}),
+        json!({"path": "src/no-such-dir-4d/x.rs", "put": {"text": "x"}}),
+    ] {
+        let r = change(&hub, &narrow, &p.name, &json!({"base": base.hex(), "description": "x", "edits": [edit.clone()]}));
+        assert_eq!(r.status, 403, "{edit}: {}", body(&r));
+        assert!(!body(&r).contains("src/"), "{edit}: the refusal names a path: {}", body(&r));
+        answers.push(body(&r));
+    }
+    assert!(answers.windows(2).all(|w| w[0] == w[1]), "the answers differ: {answers:?}");
 }
