@@ -331,14 +331,13 @@ CREATE TABLE IF NOT EXISTS landing_leases (
     expires_at BIGINT NOT NULL,
     PRIMARY KEY (project_id, branch)
 );
-CREATE TABLE IF NOT EXISTS landings (     -- as built (S17 cycle 3, HUB.md §13.19)
+CREATE TABLE IF NOT EXISTS landings (     -- as built (S17, HUB.md §13.19)
     project_id BIGINT NOT NULL,
     branch TEXT NOT NULL,
     lineage BIGINT NOT NULL,               -- the branch's lineage when it landed
-    submitted TEXT NOT NULL,               -- a stack change (or the tip a batch moved from)
-    landed TEXT NOT NULL,                  -- where it is on the branch
-    whole BOOLEAN NOT NULL,                -- all its own edits landed
-    view_key TEXT NOT NULL,                -- else: the view it landed for
+    submitted TEXT NOT NULL,               -- a stack change: its edits are on the branch
+    landed TEXT NOT NULL,                  -- the snapshot it landed as (a tip a batch
+                                           -- moved from: itself), on the branch
     at BIGINT NOT NULL,                    -- deleted after an hour
     PRIMARY KEY (project_id, branch, lineage, submitted)
 );
@@ -394,7 +393,7 @@ CREATE TABLE IF NOT EXISTS embargo_lines (
 );
 ```
 
-**The stack, as built (S17 cycle 3):** a landing lands the submitter's own history: the changes between the branch and the submitted snapshot as their projection shows them, each as its edits on projected trees, always as a new snapshot (`HUB.md` §13.19). "On the branch" is the branch's real ancestry within its current lineage, looked up in `landings`, the derived graph, or a walk bounded per submit (past it: `warming`).
+**The stack, as built (S17):** a landing lands the changes between the branch and the submitted snapshot that its submitter sees whole, each as its own edits against its first parent, always as a new snapshot; a change hidden from them or seen in part is left for someone who sees it whole (`HUB.md` §13.19). A `landings` row says a change's edits are on the branch, for every viewer; the line is judged change by change, and ends only at a snapshot on the branch (its real ancestry within its current lineage: `landings`, the derived graph, or a walk bounded per submit, past which the answer is `warming`).
 
 `branches` gains a `hidden_for_embargo` column so `tips`, `history` and every listing leave out embargo lines for everyone outside their groups (S1 shows branch names to all participants, `HUB.md` §13.8).
 

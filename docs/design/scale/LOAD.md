@@ -536,6 +536,28 @@ before the 10,000-agent one, 35 after; `bench18`):
 
 Raw results (not committed): `.scratch/bench-results/server-landing-b1b10f37-20261108T064028Z*` and `…T064348Z*` (the label is the base commit; the binaries were the working tree), the double store `…T061236Z*`, `…T061440Z*`.
 
+**After the redesign's review (the simplified rule, 2026-11-08,** on
+`integration` @ `6b65ed6`; `docs/BUGS.md` BUG-1311 to 1315): the machine
+never got quiet (load 15 at the start of each run, 30–160 during them), so
+the redesign was measured against the commit before it (`b1509930`),
+interleaved, two rounds:
+
+| Agents | Target (/s) | Round 1: before → after (/s) | Round 2: before → after (/s) | Round 2 p99 (ms): before → after | DB statements per landing (round 2) |
+|---:|---:|---:|---:|---:|---:|
+| 1,000 | 1,000 | 964 → 870 | 941 → **1,052** | 1,280 → 1,290 | 14.5 → 15.0 |
+| 10,000 | 1,000 | 707 → 328 | 846 → **888** | 2,774 → 2,029 | 17.0 → 16.9 |
+
+* The cost per landing is unchanged (15–17 statements, about 14 storage
+  writes, 1.0–1.2 commits). Every point is noisier than any run above: the
+  object store took 50–90 ms a batch (15 ms when quiet), and two of the
+  runs fell into the large-batch regime.
+* **Round 1 at 10,000 agents (328/s, 2.7 commits per landing, half the
+  agents finished) is not explained**: it ran at load 47, and the same
+  build gave 888/s (1.16 commits) in round 2 and 905/s in a run before. A
+  quiet re-measurement is owed.
+
+Raw results (not committed): `.scratch/bench-ab7.log`, `.scratch/bench19.log`, `.scratch/bench20.log`.
+
 
 ## What would raise each ceiling (not built)
 

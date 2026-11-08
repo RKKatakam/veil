@@ -6,8 +6,7 @@
 -- checked as a push is: its real snapshots are committed history from the
 -- submit on (`snapshots` rows), so they resolve and project like any other.
 -- The edits of each change are not stored: they are its diff against its
--- base, read from the objects (objects are authority), on the submitter's
--- projected trees when something they cannot see lies between.
+-- first parent, read from the objects (objects are authority).
 -- Idempotent (IF NOT EXISTS): YugabyteDB may apply DDL statement by
 -- statement.
 CREATE TABLE IF NOT EXISTS landing_queue (
@@ -22,9 +21,7 @@ CREATE TABLE IF NOT EXISTS landing_queue (
     person_name TEXT NOT NULL,
     device_key TEXT NOT NULL,
     -- JSON list of the stack's changes, oldest first: [snapshot, base] (real
-    -- ids), or [snapshot, base, projected tree, projected base tree,
-    -- "whole" | "part"] when the submitter's edits are those of their view
-    -- (`landing::Entry`).
+    -- ids; `landing::Entry`).
     stack TEXT NOT NULL,
     -- The branch's lineage the stack was judged under: it lands only under
     -- that one (BUG-1300).
@@ -50,6 +47,9 @@ CREATE INDEX IF NOT EXISTS landing_queue_ready ON landing_queue (project_id, bra
 -- What a branch's poller reads (`landing::poll`: the rows finished since it
 -- last looked).
 CREATE INDEX IF NOT EXISTS landing_queue_done ON landing_queue (project_id, branch, done_at);
+-- What retention reads (`Service::clean`: the project's rows finished an
+-- hour ago), so a pass with nothing to delete reads nothing.
+CREATE INDEX IF NOT EXISTS landing_queue_old ON landing_queue (project_id, done_at);
 -- What a starting server resumes (`landing::resume`: every queued row).
 CREATE INDEX IF NOT EXISTS landing_queue_state ON landing_queue (state, project_id, branch);
 
@@ -74,22 +74,19 @@ CREATE SEQUENCE IF NOT EXISTS branch_lineages;
 ALTER TABLE branches ADD COLUMN IF NOT EXISTS lineage BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE branches ALTER COLUMN lineage SET DEFAULT nextval('branch_lineages');
 
--- Where each change of a landed stack is on the branch (the snapshot it was
--- made again as on the tip), and each tip a batch moved from (as itself),
--- within the branch's lineage then. A later stack on a submitted snapshot
--- does not land its change twice (BUG-1103, BUG-1270), and a submit finds
--- its base here in one lookup (BUG-1275). `whole`: all of the change's own
--- edits landed; else only what `view_key`'s view showed of it. Deleted
--- after an hour, in bounded chunks also while the branch is busy
--- (BUG-1303).
+-- What landed on a branch, within its lineage then: each change of a landed
+-- stack (`submitted`: its edits are on the branch, for every viewer) with
+-- the snapshot it landed as (`landed`: on the branch), and each tip a batch
+-- moved from (as itself). A later stack skips a change landed already and
+-- reads on below it (BUG-1103, BUG-1270, BUG-1311), and a submit finds its
+-- base here in one lookup (BUG-1275). Deleted after an hour, in bounded
+-- chunks also while the branch is busy (BUG-1303).
 CREATE TABLE IF NOT EXISTS landings (
     project_id BIGINT NOT NULL REFERENCES projects(id),
     branch TEXT NOT NULL,
     lineage BIGINT NOT NULL,
     submitted TEXT NOT NULL,
     landed TEXT NOT NULL,
-    whole BOOLEAN NOT NULL,
-    view_key TEXT NOT NULL,
     at BIGINT NOT NULL,
     PRIMARY KEY (project_id, branch, lineage, submitted)
 );

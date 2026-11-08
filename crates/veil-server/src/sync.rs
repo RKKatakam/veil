@@ -495,6 +495,59 @@ async fn resolve_stored(hub: &Hub, project: i64, id: &ObjectId) -> Result<Vec<Ob
     Ok(rows.iter().filter_map(|r| ObjectId::from_hex(&r.0).ok()).collect())
 }
 
+/// [`resolve_stored`], the one to take first first (BUG-1314): the real
+/// snapshots one projected id stands for (changes hidden from a viewer
+/// share their projection) ordered by what the history says, never by when
+/// a memo was stored: a branch tip first, then one that descends from the
+/// others (read down each one's first-parent line, at most
+/// [`NEWEST_WALK`] snapshots), the snapshot id breaking ties. The same
+/// answer on every server.
+pub(crate) async fn resolve_newest(hub: &Arc<Hub>, project: i64, id: &ObjectId) -> Result<Vec<ObjectId>> {
+    let mut ids = resolve_stored(hub, project, id).await?;
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() <= 1 {
+        return Ok(ids);
+    }
+    ids.truncate(NEWEST_CANDIDATES);
+    let hex: Vec<String> = ids.iter().map(ObjectId::hex).collect();
+    let tips: HashSet<ObjectId> = sqlx::query_scalar::<_, String>("SELECT target FROM branches WHERE project_id = $1 AND target = ANY($2)")
+        .bind(project)
+        .bind(&hex)
+        .fetch_all(&hub.db)
+        .await?
+        .iter()
+        .filter_map(|t| ObjectId::from_hex(t).ok())
+        .collect();
+    let all: HashSet<ObjectId> = ids.iter().copied().collect();
+    let cands = ids.clone();
+    let reach: HashMap<ObjectId, usize> = blocking(hub, project, move |src| {
+        let mut out = HashMap::new();
+        for c in &cands {
+            let mut n = 0;
+            let mut x = *c;
+            for _ in 0..NEWEST_WALK {
+                let Some(p) = src.snapshot(&x)?.parents.first().copied() else { break };
+                if p == root_snapshot_id() {
+                    break;
+                }
+                n += usize::from(all.contains(&p));
+                x = p;
+            }
+            out.insert(*c, n);
+        }
+        Ok(out)
+    })
+    .await?;
+    ids.sort_by(|a, b| tips.contains(b).cmp(&tips.contains(a)).then(reach[b].cmp(&reach[a])).then(a.cmp(b)));
+    Ok(ids)
+}
+
+/// Most candidates [`resolve_newest`] orders, and how far down each one's
+/// first-parent line it reads.
+const NEWEST_CANDIDATES: usize = 64;
+const NEWEST_WALK: usize = 256;
+
 /// Branch tips as `viewer` sees them. The branch rows come from this
 /// server's memory for at most `caches::TIPS_TTL`, dropped at every push's
 /// notice; each viewer's projection is of their current view.
@@ -1292,7 +1345,7 @@ pub(crate) async fn push_with(
             known.insert(id, vec![*t]);
             continue;
         }
-        let r = resolve_stored(hub, project.id, &id).await?;
+        let r = resolve_newest(hub, project.id, &id).await?;
         if !r.is_empty() {
             known.insert(id, r);
             continue;
@@ -1457,7 +1510,7 @@ pub(crate) async fn push_with(
                 }
             };
             if judged.stack.is_empty() {
-                results.push(refuse("nothing to land: that snapshot is already on the branch"));
+                results.push(refuse(crate::landing::NOTHING_TO_LAND));
                 continue;
             }
             if judged.stack.iter().any(|e| parents_of.iter().any(|(pid, n)| real_of.get(pid) == Some(&e.id) && !n.conflicts.is_empty())) {

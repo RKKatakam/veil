@@ -2467,38 +2467,44 @@ at most 64 changes), the submitter, the access epochs its checks ran under,
 and the branch's **lineage** its stack was judged under (below).
 
 **The stack is the submitter's own history** (`landing::stack`, for every
-route: a pushed or uploaded snapshot, and edits on a `base`; S17 cycle 3).
-It is the changes between the branch and the submitted snapshot **as the
-submitter's projection shows them** (`docs/VISIBILITY.md`: a change they
-cannot see does not exist for them):
+route: a pushed or uploaded snapshot, and edits on a `base`; S17 cycle 3,
+simplified after its review). **A submitter lands only the changes they
+see whole** (`docs/VISIBILITY.md`: a change they cannot see does not exist
+for them):
 
 * The submitted snapshot's real first-parent line is read down to the first
-  snapshot on the branch (below). A change held there (another branch's,
-  an API commit, a landing answered `conflict`) whose own edits are all at
-  paths the submitter cannot read is **not in their history**: it is left
-  out, and stays unlanded (its author can land it). A held change with
-  unresolved conflicts the submitter can see is refused (naming no path);
-  one they cannot see does not count.
-* Each change left has a **base**: the change below it in the stack, or the
-  snapshot on the branch where the line stops; a merge with a parent on the
-  branch ends the stack with that parent as its base (BUG-1271). Its
-  **edits** are its diff against its base as the submitter saw both at
-  submit: when something they cannot see lies between (a change left out,
-  or hidden edits of its own), the queue row holds their projections of the
-  two trees, and the edits are the diff of those; otherwise the real diff,
-  which is the same.
-* Every change **lands as its edits**: a new snapshot on the tip, signed by
-  the server, predecessor the submitted one, never the submitted snapshot
-  itself (a merge keeps its other parents, and lands only on the tip it was
-  made on). So nothing hidden below, between or inside a change ever changes
-  an answer: its state, the paths a conflict names (the change's own, all
-  readable by the submitter), and the snapshots it lists (as the submitter
-  sees them) are those of the same changes with nothing hidden there.
-* A change whose own edits the submitter saw only in part lands in part;
-  `landings` records it as landed for their view only. Their later stacks
-  skip it; anyone else's lands what of it is not on the branch yet (a path
-  already holding the change's own entry counts as landed), so its author
-  can land the rest.
+  snapshot on the branch (below). Of the changes held there (another
+  branch's, an API commit, a landing answered `conflict`), one whose own
+  edits (against its first parent) are all at paths the submitter can read
+  is theirs to land; one hidden from them, or seen only in part, is left
+  unlanded for someone who sees it whole (its author, an admin), and is not
+  in the stack. A held change with unresolved conflicts the submitter can
+  see is refused (naming no path); one they cannot see does not count.
+* **Each change lands as its own edits**: its diff against its first parent
+  (a merge with a parent on the branch, which ends the stack: against that
+  parent, BUG-1271). As every change landed is seen whole, that real diff is
+  exactly what the submitter saw of it. Its **base** in the stack is the
+  change below it that lands, or where the line stops: a merge lands only on
+  the tip it was made on as the submitter sees it.
+* Every change lands as a new snapshot on the tip, signed by the server,
+  predecessor the submitted one, never the submitted snapshot itself (a
+  merge keeps its other parents). So nothing hidden below or between ever
+  changes an answer: its state, the paths a conflict names (the change's
+  own, all readable by the submitter), and the snapshots it lists (as the
+  submitter sees them) are those of the same changes with nothing hidden
+  there.
+* **A `landings` row means "this change's edits are on the branch, in this
+  lineage"**, true for every viewer (every landing is whole). The line is
+  judged change by change: a change landed already is skipped and the line
+  read on below it (what is below it may not be: a change left out by
+  someone who could not see it); only a snapshot that is on the branch
+  itself (the tip, one the service landed or moved the branch from, or the
+  branch's ancestry) ends it. So whoever sees a change someone else left
+  out brings it with their next landing (BUG-1311).
+* At most 64 changes the submitter sees, counted as the line is read
+  (refused past it); changes they cannot see count toward nothing they are
+  told: the line's reading is bounded by the walk budget below, and past it
+  the answer is `warming`, as for a base still being looked for (BUG-1313).
 
 **"On the branch" is the branch's real ancestry**, with a **lineage guard**
 (BUG-1300): `branches.lineage` is a new value (a sequence) at every
@@ -2520,10 +2526,16 @@ read; batches record the tip they move from); the derived commit graph
 when it holds the tip (its jump table, bounded by generation), never
 waiting for the deriver; else one walk down from the tip shared by the
 whole stack, at most 4,096 snapshots a submit (`WALK_BUDGET`), whose
-frontier the derived graph then answers for. Past that the submit is
-answered `warming` (503: try again) instead of walking the history. The
-line itself is read at most 1,024 snapshots deep (`LINE_LIMIT`). No submit
-reads more than about 5,000 snapshots and a few dozen rows.
+frontier the derived graph then answers for. The line itself is read at
+most as deep (each held change on it diffed once). Past either the submit
+is answered `warming` (503: try again) instead of walking the history. No
+submit reads more than about 8,000 snapshots and a few dozen rows.
+
+**Which real snapshot a projected id names** (BUG-1314): several changes
+hidden from a viewer can share one projection. The API's `base`, and a
+push's parents, resolve to a branch tip among them, else the one that
+descends from the others (read down their first-parent lines, at most 256
+each), the snapshot id breaking ties: never by when a memo was stored.
 
 The snapshots become committed history in the submit's commit (they
 resolve and project like any other). With `wait` (the default) the request
@@ -2551,9 +2563,8 @@ for 5 s gives the lease back. Its loop:
   `.veilrules` ends the batch before it and **lands alone**; nothing is
   built after it until it is committed.
 * **For each change of an entry's stack:** landed already by another
-  stack (`landings` of the current lineage for the submitter's view, or
-  this batch), it is skipped. Otherwise **the fast path**: every path of its
-  edits (above) must be, on the tip, what it was in its base: the same
+  stack (`landings` of the current lineage, or this batch), it is skipped.
+  Otherwise **the fast path**: every path of its edits (above) must be, on the tip, what it was in its base: the same
   entry (kind, content, mode, label), absent in both, or under the same
   non-folder in both. Exact per path: nothing else on the tip matters. Then
   its edits are applied (only the folder listings on the way are rewritten;
@@ -2612,8 +2623,9 @@ for 5 s gives the lease back. Its loop:
   on (BUG-1304): if the branch moved by another route, its entries are built
   again on the database's tip.
 * **Retention, also while busy** (BUG-1303): every 5 s the service deletes
-  finished queue rows and `landings` rows older than an hour, at most
-  20,000 of each a pass (4,000 a second, four times what 1,000 landings a
+  finished queue rows and `landings` rows older than an hour (each by an
+  index on its project and time, so a pass with nothing to delete reads
+  nothing), at most 20,000 of each a pass (4,000 a second, four times what 1,000 landings a
   second add). At 1,000 landings a second a branch's tables hold about
   3.6 million rows each in steady state (an hour); a ticket's outcome is
   readable for that hour, and a base older than it is found by the graph or

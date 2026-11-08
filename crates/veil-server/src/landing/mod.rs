@@ -65,68 +65,33 @@ pub struct Submitter {
     pub epochs: crate::caches::Epochs,
 }
 
-/// One change of a stack ([`stack`]): its real snapshot, its base (the
-/// change below it, or the snapshot on the branch where the stack starts),
-/// and, when something the submitter cannot see lies between the two (a
-/// change left out of their history, or hidden edits of its own), what
-/// they saw of them.
+/// One change of a stack ([`stack`]): its real snapshot, and its base (the
+/// change below it that lands, or the snapshot on the branch where the
+/// stack starts). Its edits are its diff against its first parent (a merge
+/// based on another parent: that one).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
     pub id: ObjectId,
     pub base: ObjectId,
-    pub seen: Option<Seen>,
-}
-
-/// The submitter's projections of an entry's tree and of its base's
-/// (stored at submit): the entry's edits are the diff of these, so it
-/// lands what they saw, under any later access.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Seen {
-    pub new: ObjectId,
-    pub old: ObjectId,
-    /// They saw all of the change's own edits (else it lands in part).
-    pub whole: bool,
 }
 
 impl Entry {
     pub fn plain(id: ObjectId, base: ObjectId) -> Entry {
-        Entry { id, base, seen: None }
-    }
-
-    /// All of the change's own edits land with it.
-    pub fn whole(&self) -> bool {
-        self.seen.is_none_or(|s| s.whole)
+        Entry { id, base }
     }
 }
 
-/// A stack as its queue row holds it: `[snapshot, base]`, or
-/// `[snapshot, base, seen tree, seen base tree, "whole" | "part"]`.
+/// A stack as its queue row holds it: `[snapshot, base]` pairs.
 pub fn encode_stack(stack: &[Entry]) -> String {
-    let rows: Vec<Vec<String>> = stack
-        .iter()
-        .map(|e| match &e.seen {
-            None => vec![e.id.hex(), e.base.hex()],
-            Some(v) => vec![e.id.hex(), e.base.hex(), v.new.hex(), v.old.hex(), (if v.whole { "whole" } else { "part" }).to_string()],
-        })
-        .collect();
+    let rows: Vec<[String; 2]> = stack.iter().map(|e| [e.id.hex(), e.base.hex()]).collect();
     serde_json::to_string(&rows).unwrap_or_default()
 }
 
 /// [`encode_stack`]'s inverse.
 pub fn decode_stack(text: &str) -> Result<Vec<Entry>> {
-    let rows: Vec<Vec<String>> = serde_json::from_str(text).map_err(|e| Error::Other(e.into()))?;
+    let rows: Vec<[String; 2]> = serde_json::from_str(text).map_err(|e| Error::Other(e.into()))?;
     let hex = |s: &str| ObjectId::from_hex(s).map_err(|e| Error::Other(e.into()));
-    rows.iter()
-        .map(|r| match r.as_slice() {
-            [s, b] => Ok(Entry::plain(hex(s)?, hex(b)?)),
-            [s, b, n, o, w] => Ok(Entry {
-                id: hex(s)?,
-                base: hex(b)?,
-                seen: Some(Seen { new: hex(n)?, old: hex(o)?, whole: w == "whole" }),
-            }),
-            _ => Err(Error::Other(anyhow::anyhow!("a queue row's stack entry has {} fields", r.len()))),
-        })
-        .collect()
+    rows.iter().map(|[s, b]| Ok(Entry::plain(hex(s)?, hex(b)?))).collect()
 }
 
 /// One queue row to insert in the submit's transaction.
@@ -562,12 +527,16 @@ pub async fn submit(
     }
 }
 
-/// How deep [`stack`] reads a submitted snapshot's first-parent line (the
-/// changes it may bring, hidden ones among them).
-pub const LINE_LIMIT: usize = 1_024;
-/// Most snapshots one submit's walk down the branch reads (`Ancestry`)
-/// when neither `landings` nor the derived graph answers; past it the
-/// submit is answered `warming`.
+/// The answer to a landing with nothing in it to land: every change is on
+/// the branch already, or one its submitter does not see whole (left for
+/// someone who does).
+pub const NOTHING_TO_LAND: &str =
+    "nothing to land: every change here is on the branch already, or holds edits you cannot see (whoever sees all of it can land it)";
+
+/// Most snapshots one submit reads, of its submitted line and of its walk
+/// down the branch (`Ancestry`), when neither `landings` nor the derived
+/// graph answers; past it the submit is answered `warming` (changes hidden
+/// from the submitter count toward nothing they are told, BUG-1313).
 pub const WALK_BUDGET: usize = 4_096;
 /// Most frontier snapshots of that walk the derived graph is asked about.
 const FRONTIER_LIMIT: usize = 64;
@@ -587,26 +556,27 @@ struct Link {
     /// The server held it before this request (else the request brought it,
     /// checked as this submitter's).
     held: bool,
+    /// `landings` says its edits are on the branch already.
+    landed: bool,
 }
 
 /// The stack a landing of `new` (real) on `branch` lands (§4.6), whichever
-/// route submits it (a push, `vl land`, edits on a base): **the submitter's
-/// own history** between the branch and `new`, oldest first (S17 cycle 3,
-/// `docs/HUB.md` §13.19):
+/// route submits it (a push, `vl land`, edits on a base): the changes
+/// between the branch and `new` **that the submitter sees whole**, oldest
+/// first (`docs/HUB.md` §13.19):
 ///
 /// * `new`'s first-parent line down to the first snapshot on the branch
-///   (`Ancestry`: the branch's real ancestry, in its current lineage);
-///   those this request brought (`fresh`, with their real parents) and those
-///   the server already held. A merge with a parent on the branch ends the
-///   stack, with that parent as its base (BUG-1271).
-/// * A held change whose own edits are all at paths `viewer` cannot read is
-///   not in their history: it is left out (and stays unlanded). One with
-///   unresolved conflicts they can see is refused.
-/// * Each change's base is the change below it in the stack, or where the
-///   stack starts; when something hidden from `viewer` lies between (a
-///   change left out, or hidden edits of its own), the entry holds their
-///   projections of both trees ([`Seen`], stored here), whose diff is its
-///   edits. Nothing they cannot see decides anything else.
+///   (the branch's real ancestry in its current lineage: `Ancestry`), judged
+///   change by change: one whose edits `landings` says are on the branch is
+///   skipped, and the line read on below it (BUG-1311). A merge with a
+///   parent on the branch ends the stack, with that parent as its base
+///   (BUG-1271).
+/// * Those this request brought (`fresh`) are the submitter's; of those the
+///   server held, one whose own edits are all at paths `viewer` can read
+///   lands, and one hidden from them or seen only in part is left for
+///   someone who sees it whole. One with conflicts they can see is refused.
+/// * At most `MAX_LAND_STACK` changes they see, counted as they are found;
+///   the line is read at most [`WALK_BUDGET`] deep, else `warming`.
 ///
 /// `Err(why)` to refuse (naming no path).
 pub async fn stack(
@@ -619,6 +589,7 @@ pub async fn stack(
 ) -> Result<std::result::Result<Judged, String>> {
     let root = crate::sync::root_snapshot_id();
     let pid = project.id;
+    let max = veil_core::hub::land::MAX_LAND_STACK;
     let row: Option<(String, i64)> = sqlx::query_as("SELECT target, lineage FROM branches WHERE project_id = $1 AND name = $2")
         .bind(pid)
         .bind(branch)
@@ -626,22 +597,19 @@ pub async fn stack(
         .await?;
     let Some((tip, lineage)) = row else { return Ok(Ok(Judged { stack: Vec::new(), lineage: 0, branch: false })) };
     let tip = ObjectId::from_hex(&tip).map_err(|e| Error::Other(e.into()))?;
-    let key = if viewer.admin { String::new() } else { project.view(viewer).key() };
-    let mut anc = Ancestry::new(hub.clone(), pid, branch, tip, lineage, key);
-    let too_many = || {
-        Ok(Err(format!(
-            "more than {} changes between the branch's tip and this one: land them in parts, or have an admin push with --force",
-            veil_core::hub::land::MAX_LAND_STACK
-        )))
-    };
-    // 1. The line, down to the tip, the root, or a snapshot `landings` says
-    // is on the branch (looked up in growing groups: the first held one
-    // alone, as an agent's base is its own last landing).
+    let mut anc = Ancestry::new(hub.clone(), pid, branch, tip, lineage);
+    let too_many = || Ok(Err(format!("more than {max} changes between the branch's tip and this one: land them in parts, or have an admin push with --force")));
+    // 1. The line, down to the tip, the root, or a snapshot on the branch by
+    // `landings` (looked up in growing groups: the first held one alone, as
+    // an agent's base is its own last landing).
     let mut line: Vec<Link> = Vec::new();
     let mut reached_tip = false;
+    let mut at_root = false;
+    // Ended at a snapshot on the branch.
     let mut ended = false;
     let mut pending: Vec<usize> = Vec::new();
     let mut group = 1;
+    let mut fresh_seen = 0;
     let mut x = new;
     loop {
         if x == tip {
@@ -649,13 +617,19 @@ pub async fn stack(
             break;
         }
         if x == root {
-            ended = true;
+            at_root = true;
             break;
         }
-        if line.len() == LINE_LIMIT {
-            break;
+        if line.len() == WALK_BUDGET {
+            return Err(crate::query::graph::warming());
         }
         let held = !fresh.contains_key(&x);
+        if !held {
+            fresh_seen += 1;
+            if fresh_seen > max {
+                return too_many();
+            }
+        }
         let parents = match fresh.get(&x) {
             Some(p) => p.clone(),
             None => {
@@ -665,12 +639,12 @@ pub async fn stack(
         };
         let id = x;
         x = parents[0];
-        line.push(Link { id, parents, held });
+        line.push(Link { id, parents, held, landed: false });
         if held {
             pending.push(line.len() - 1);
         }
         if pending.len() >= group {
-            if let Some(i) = anc.recorded_first(&line, &pending).await? {
+            if let Some(i) = anc.look_up(&mut line, &pending).await? {
                 line.truncate(i);
                 ended = true;
                 break;
@@ -680,7 +654,7 @@ pub async fn stack(
         }
     }
     if !reached_tip && !ended && !pending.is_empty() {
-        if let Some(i) = anc.recorded_first(&line, &pending).await? {
+        if let Some(i) = anc.look_up(&mut line, &pending).await? {
             line.truncate(i);
             ended = true;
         }
@@ -691,15 +665,14 @@ pub async fn stack(
     let mut merge_base: Option<ObjectId> = None;
     let mut cut = line.len();
     for i in 0..line.len() {
-        if line[i].held && !reached_tip && anc.has(line[i].id).await? {
+        if line[i].held && !line[i].landed && !reached_tip && anc.has(line[i].id).await? {
             cut = i;
-            ended = true;
             break;
         }
         if line[i].parents.len() > 1 {
             let p0_on = match line.get(i + 1) {
-                Some(next) => next.held && !reached_tip && anc.has(next.id).await?,
-                None => reached_tip || ended,
+                Some(next) => next.held && !next.landed && !reached_tip && anc.has(next.id).await?,
+                None => reached_tip || ended || at_root,
             };
             if !p0_on {
                 let mut found = None;
@@ -712,26 +685,22 @@ pub async fn stack(
                 if let Some(p) = found {
                     merge_base = Some(p);
                     cut = i + 1;
-                    ended = true;
                     break;
                 }
             }
         }
     }
     line.truncate(cut);
-    if !reached_tip && !ended {
-        // Deeper than the line is read, with nothing on the branch found.
-        return too_many();
-    }
-    // 3. The submitter's history in it, oldest first, each with its base.
+    // 3. What of it the submitter lands, counted as it is found (at most
+    // `max` changes they see), each with its base.
     let floor = match (merge_base, line.last()) {
         (Some(p), _) => p,
         (None, Some(l)) => l.parents[0],
         (None, None) => return Ok(Ok(Judged { stack: Vec::new(), lineage, branch: true })),
     };
-    let links: Vec<(ObjectId, Vec<ObjectId>, bool)> = line.iter().rev().map(|l| (l.id, l.parents.clone(), l.held)).collect();
+    let links: Vec<(ObjectId, Vec<ObjectId>, bool, bool)> = line.iter().map(|l| (l.id, l.parents.clone(), l.held, l.landed)).collect();
     let (view_policy, view_bindings, v) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
-    let made = crate::sync::blocking(hub, pid, move |src| {
+    let kept = crate::sync::blocking(hub, pid, move |src| {
         let p = crate::perm::Project {
             id: src.project,
             name: String::new(),
@@ -741,76 +710,69 @@ pub async fn stack(
             bindings: view_bindings,
         };
         let view = p.view(&v);
-        let mut pr = veil_core::hub::project::Projector::new(src, &view);
-        let mut out: Vec<Entry> = Vec::new();
-        let mut base = floor;
-        // Something hidden from the submitter lies between `base` and the
-        // next change kept.
-        let mut hidden_between = false;
-        for (id, parents, held) in &links {
-            let s = src.snapshot(id)?;
-            let mut whole = true;
-            if *held && s.conflicts.iter().any(|c| view.read(c)) {
-                return Ok(Err("a change with unresolved conflicts never lands: resolve them first"));
+        // Top-down: (id, lands).
+        let mut out: Vec<ObjectId> = Vec::new();
+        let n = links.len();
+        for (i, (id, parents, held, landed)) in links.iter().enumerate() {
+            if *landed {
+                continue;
             }
-            if *held && !v.admin {
-                // Its own edits: against its first parent (a merge: against
-                // its base, what it lands as).
-                let against = if parents.len() == 1 { parents[0] } else { base };
-                let own = edits::edit_set(src, s.tree, src.snapshot(&against)?.tree)?;
-                let seen = own.iter().filter(|c| view.read(&c.path)).count();
-                // Not in their history at all.
-                if parents.len() == 1 && !own.is_empty() && seen == 0 {
-                    hidden_between = true;
-                    continue;
+            if *held {
+                let s = src.snapshot(id)?;
+                if s.conflicts.iter().any(|c| view.read(c)) {
+                    return Ok(Err("a change with unresolved conflicts never lands: resolve them first".to_string()));
                 }
-                whole = seen == own.len();
+                if !v.admin {
+                    // Its own edits: against its first parent (the merge
+                    // ending the stack: against its base, what it lands as).
+                    let against = match merge_base {
+                        Some(m) if i + 1 == n => m,
+                        _ => parents[0],
+                    };
+                    let own = edits::edit_set(src, s.tree, src.snapshot(&against)?.tree)?;
+                    if own.iter().any(|c| !view.read(&c.path)) {
+                        continue;
+                    }
+                }
             }
-            let entry = if hidden_between || !whole {
-                let old = src.snapshot(&base)?.tree;
-                Entry {
-                    id: *id,
-                    base,
-                    seen: Some(Seen { new: pr.root(s.tree)?, old: pr.root(old)?, whole }),
-                }
-            } else {
-                Entry::plain(*id, base)
-            };
-            out.push(entry);
-            base = *id;
-            hidden_between = false;
+            out.push(*id);
+            if out.len() > max {
+                return Ok(Err(format!(
+                    "more than {max} changes between the branch's tip and this one: land them in parts, or have an admin push with --force"
+                )));
+            }
         }
-        let created: Vec<(ObjectId, bytes::Bytes)> = pr.created.iter().map(|(id, (_, raw))| (*id, bytes::Bytes::from(raw.clone()))).collect();
-        Ok(Ok((out, created)))
+        Ok(Ok(out))
     })
     .await?;
-    let (stack, created) = match made {
-        Ok(m) => m,
-        Err(why) => return Ok(Err(why.to_string())),
+    let kept = match kept {
+        Ok(k) => k,
+        Err(why) => return Ok(Err(why)),
     };
-    if stack.len() > veil_core::hub::land::MAX_LAND_STACK {
-        return too_many();
+    // Oldest first, each on the one below it that lands (or where the stack
+    // starts).
+    let mut stack = Vec::with_capacity(kept.len());
+    let mut base = floor;
+    for id in kept.into_iter().rev() {
+        stack.push(Entry::plain(id, base));
+        base = id;
     }
-    // What the service reads the edits from.
-    crate::sync::put_all(hub, pid, created).await?;
     Ok(Ok(Judged { stack, lineage, branch: true }))
 }
 
 /// Is a real snapshot on a branch at `tip` (its real ancestry, in its
 /// current `lineage`)? Cheapest first, for one submit ([`stack`]): the tip;
-/// `landings` of the lineage (what the service landed there, the tips it
-/// moved from, and submitted snapshots landed whole or for this view:
-/// `key`); the derived commit graph when it holds the tip; else one walk
-/// down from the tip, shared by every question of the submit, at most
-/// [`WALK_BUDGET`] snapshots, whose frontier the graph then answers for,
-/// else `warming` (BUG-1302).
+/// a snapshot `landings` says is on it (one the service landed, or moved
+/// the branch from); the derived commit graph when it holds the tip; else
+/// one walk down from the tip, shared by every question of the submit, at
+/// most [`WALK_BUDGET`] snapshots, whose frontier the graph then answers
+/// for, else `warming` (BUG-1302).
 pub(crate) struct Ancestry {
     hub: Arc<Hub>,
     project: i64,
     branch: String,
     tip: ObjectId,
     lineage: i64,
-    key: String,
     known: HashMap<ObjectId, bool>,
     /// Does the derived graph hold the tip (asked once)?
     graph: Option<bool>,
@@ -826,49 +788,59 @@ struct Walk {
 }
 
 impl Ancestry {
-    pub(crate) fn new(hub: Arc<Hub>, project: i64, branch: &str, tip: ObjectId, lineage: i64, key: String) -> Ancestry {
+    pub(crate) fn new(hub: Arc<Hub>, project: i64, branch: &str, tip: ObjectId, lineage: i64) -> Ancestry {
         Ancestry {
             hub,
             project,
             branch: branch.to_string(),
             tip,
             lineage,
-            key,
             known: HashMap::new(),
             graph: None,
             walk: None,
         }
     }
 
-    /// Which of `ids` `landings` says are on the branch, in one statement
-    /// (each half by its own index).
-    async fn recorded(&self, ids: &[ObjectId]) -> Result<std::collections::HashSet<ObjectId>> {
+    /// Of `ids`, those on the branch (`landed` rows: a snapshot the service
+    /// landed, or moved the branch from) and those whose edits are on it
+    /// (`submitted` rows), in one statement (each half by its own index).
+    async fn recorded(&self, ids: &[ObjectId]) -> Result<(std::collections::HashSet<ObjectId>, std::collections::HashSet<ObjectId>)> {
         let hex: Vec<String> = ids.iter().map(ObjectId::hex).collect();
-        let rows: Vec<String> = sqlx::query_scalar(
-            "SELECT landed FROM landings WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND landed = ANY($4) \
-             UNION ALL SELECT submitted FROM landings WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND submitted = ANY($4) \
-             AND (whole OR view_key = $5)",
+        let rows: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT landed, true FROM landings WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND landed = ANY($4) \
+             UNION ALL SELECT submitted, false FROM landings WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND submitted = ANY($4)",
         )
         .bind(self.project)
         .bind(&self.branch)
         .bind(self.lineage)
         .bind(&hex)
-        .bind(&self.key)
         .fetch_all(&self.hub.db)
         .await?;
-        Ok(rows.iter().filter_map(|r| ObjectId::from_hex(r).ok()).collect())
+        let (mut on, mut done) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+        for (id, branch) in rows {
+            if let Ok(id) = ObjectId::from_hex(&id) {
+                if branch {
+                    on.insert(id);
+                } else {
+                    done.insert(id);
+                }
+            }
+        }
+        Ok((on, done))
     }
 
-    /// The first (topmost) of `line`'s links at `at` that `landings` says
-    /// is on the branch.
-    async fn recorded_first(&mut self, line: &[Link], at: &[usize]) -> Result<Option<usize>> {
+    /// Look `line`'s links at `at` up: marks those landed already, and
+    /// gives the first (topmost) that is on the branch.
+    async fn look_up(&mut self, line: &mut [Link], at: &[usize]) -> Result<Option<usize>> {
         let ids: Vec<ObjectId> = at.iter().map(|i| line[*i].id).collect();
-        let on = self.recorded(&ids).await?;
+        let (on, done) = self.recorded(&ids).await?;
         for i in at {
-            self.known.entry(line[*i].id).or_insert(on.contains(&line[*i].id));
-            if on.contains(&line[*i].id) {
+            let id = line[*i].id;
+            if on.contains(&id) {
+                self.known.insert(id, true);
                 return Ok(Some(*i));
             }
+            line[*i].landed = done.contains(&id);
         }
         Ok(None)
     }
@@ -878,10 +850,10 @@ impl Ancestry {
         if x == self.tip || x == crate::sync::root_snapshot_id() {
             return Ok(true);
         }
-        if let Some(true) = self.known.get(&x) {
-            return Ok(true);
+        if let Some(v) = self.known.get(&x) {
+            return Ok(*v);
         }
-        if !self.known.contains_key(&x) && self.recorded(&[x]).await?.contains(&x) {
+        if self.recorded(&[x]).await?.0.contains(&x) {
             self.known.insert(x, true);
             return Ok(true);
         }
@@ -899,7 +871,6 @@ impl Ancestry {
         self.known.insert(x, v);
         Ok(v)
     }
-
     /// The shared walk, on until it finds `x`, ends, or spends its budget;
     /// then its frontier by the derived graph, else `warming`.
     async fn walk_to(&mut self, x: ObjectId) -> Result<bool> {
