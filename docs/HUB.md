@@ -2665,6 +2665,13 @@ flooded one (10 agents on 2 projects; a third flooded by closed-loop pulls):
 | `integration` | 200 | 32,961 | 1,655 | 5.59 / 15.3 |
 | `integration` | 1,000 | 29,990 | 310 | 30.5 / 107 |
 
+After the cycle 1 review's fixes (`ab78c65f`; load 29 → 145, so again only
+CPU per request compares): up-to-date pulls 2,905/s and 7,673/s at 10 and
+100 agents, server CPU 0.15 and 0.13 ms a pull; the quiet projects beside
+200 and 1,000 flooding agents p99 20.7 and 52.2 ms. The request path's new
+parts (who can see a project, the answers' budget, the idle limit's
+counting) cost no measurable CPU either.
+
 These floods are CPU-bound (the tips come from the cache, no database), and
 the flooding agents run on the same cores as the server (the load tool used
 up to 63 of them): what slows the quiet projects is the machine, which no
