@@ -1641,3 +1641,36 @@ fn s3rd2_a_rescanned_fetched_file_whose_mode_changed_is_recorded() {
     let d = admin.ok(&thin, &["diff", "--json", "--from", "@--", "--to", "@-"]);
     assert!(d.contains("data/f1.bin"), "the commit does not record the mode change: {d}");
 }
+
+/// BUG-1319 (guarantee 2 of cycle 2: a thin clone answers as a full clone
+/// made at the same time; introduced by the BUG-1268 fix to `history`).
+/// A thin clone and a full clone are made; then the admin rewrites the
+/// first change (`vl describe`, which rewrites everything above it) and
+/// force-pushes. Neither clone has pulled: both still stand on the old
+/// versions. The full clone holds them and shows their history; the thin
+/// clone pages history in from them, and `sync::history` now starts a page
+/// only from snapshots the branches reach (an old version is left out, as
+/// an unknown one is), so the page is empty: `vl log` ends at the old tip,
+/// and `vl show main--` says the revision is not found.
+#[test]
+#[ignore = "BUG-1319: after a force-push, a thin clone cannot page in the history below its own old tip"]
+fn s3rd2_a_thin_clone_reads_its_own_history_after_a_rewrite_elsewhere() {
+    let hub = TestHub::start();
+    let (admin, dir, name) = project_with_history(&hub, 6, 10);
+    let full = admin.dir("full");
+    admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    let first: String = change_of(&admin, &dir, "first").chars().take(12).collect();
+    admin.ok(&dir, &["describe", "-r", &first, "-m", "first, renamed"]);
+    admin.ok(&dir, &["push", "--force"]);
+    let mut diffs = Vec::new();
+    for args in [vec!["log", "--json"], vec!["show", "--json", "main--"], vec!["show", "--json", "main-----"]] {
+        let (want, got) = (answer(&admin, &full, &args), answer(&admin, &thin, &args));
+        assert!(want.0, "`vl {}` fails in the full clone: {}", args.join(" "), want.1);
+        if got != want {
+            diffs.push(format!("`vl {}`:\nfull: {}\nthin ({}): {}", args.join(" "), want.1.chars().take(600).collect::<String>(), got.0, got.1.chars().take(600).collect::<String>()));
+        }
+    }
+    assert!(diffs.is_empty(), "after a rewrite elsewhere, a thin clone reads its own history otherwise than a full clone:\n{}", diffs.join("\n\n"));
+}
