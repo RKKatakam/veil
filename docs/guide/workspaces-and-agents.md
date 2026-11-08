@@ -686,7 +686,9 @@ projection, so folders you may not see are not there, names included.
   after 10 seconds).
 * Open files are held in memory only while small (up to 1 MiB, 64 MiB
   across open files); larger ones are read from a private file without a
-  name, so a mount's memory does not grow with what is open.
+  name, so a mount's memory does not grow with what is open, written,
+  renamed or deleted while open. (A file not fetched yet arrives whole
+  from the server first.)
 * What a mounted workspace has fetched stays in the clone's cache while
   the workspace is on it (`vl partial status`).
 

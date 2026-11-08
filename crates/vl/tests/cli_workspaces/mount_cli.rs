@@ -450,7 +450,6 @@ fn bug_1365_open_files_of_a_mount_are_not_held_in_memory() {
 /// memory (`VecFile`), growing with every write. Either way the confined
 /// command drives memory outside its `--memory`.
 #[test]
-#[ignore = "BUG-1368: opening a large lower file peaks at twice its size, and an unlinked open file is written in memory without bound"]
 fn bug_1368_a_mount_never_holds_a_large_file_whole_in_memory() {
     if !fuse_available() {
         return;
@@ -489,4 +488,44 @@ fn bug_1368_a_mount_never_holds_a_large_file_whole_in_memory() {
         opened < start + 48 && written < before + 48,
         "the mount's peak went from {start} to {opened} MiB for one byte of a 128 MiB file, and from {before} to {written} MiB for 128 MiB written to an unlinked open file"
     );
+}
+
+/// BUG-1368, the whole class: writing into a large lower file (its copy-up)
+/// and renaming one never hold it whole either; the results are exact.
+#[test]
+fn a_mount_writes_and_renames_large_files_without_holding_them() {
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    let big = "w".repeat(128 << 20);
+    let proj = env.project("alice", "proj", &[("a.bin", big.as_str()), ("b.bin", big.as_str()), ("small.txt", "s\n")]);
+    drop(big);
+    env.ok("alice", &proj, &["ws", "new", "agent", "-r", "main"]);
+    let (mnt, _m) = mount(&env, "alice", &proj, "agent");
+    let pid = state_pid(&proj, "agent");
+    let hwm = || -> u64 {
+        let s = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        s.lines().find(|l| l.starts_with("VmHWM:")).unwrap().split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() / 1024
+    };
+    let start = hwm();
+    // One byte written in the middle of a.bin, then a.bin read back.
+    let f = std::fs::OpenOptions::new().write(true).open(mnt.join("a.bin")).unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&f, b"X", 64 << 20).unwrap();
+    drop(f);
+    // b.bin renamed.
+    std::fs::rename(mnt.join("b.bin"), mnt.join("moved.bin")).unwrap();
+    let peak = hwm();
+    let mut b = [0u8; 3];
+    let f = std::fs::File::open(mnt.join("a.bin")).unwrap();
+    std::os::unix::fs::FileExt::read_exact_at(&f, &mut b, (64 << 20) - 1).unwrap();
+    assert_eq!(&b, b"wXw");
+    drop(f);
+    assert_eq!(std::fs::metadata(mnt.join("moved.bin")).unwrap().len(), 128 << 20);
+    assert!(!mnt.join("b.bin").exists());
+    assert!(peak < start + 48, "writing into and renaming 128 MiB files grew the mount from {start} to {peak} MiB");
+    env.ok("alice", &proj, &["ws", "unmount", "agent"]);
+    let a = env.stdout("alice", &proj, &["ws", "cat", "agent", "a.bin"]);
+    assert_eq!((a.len(), &a[(64 << 20) - 1..(64 << 20) + 2]), (128 << 20, "wXw"));
+    assert_eq!(env.stdout("alice", &proj, &["ws", "cat", "agent", "moved.bin"]).len(), 128 << 20);
 }

@@ -942,10 +942,21 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], seeds:
         if !std::fs::metadata(&p).is_ok_and(|m| m.is_file()) {
             continue;
         }
-        if bound.iter().any(|(d, _)| p.starts_with(d)) {
+        // A link (a dotfiles manager's) is never bound over: `bwrap` would
+        // follow it to where the sandbox shows nothing and fail (BUG-1369).
+        // Its target is masked wherever the sandbox shows it (below); where
+        // it does not, the link leads nowhere inside.
+        let linked = std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink());
+        if !linked && bound.iter().any(|(d, _)| p.starts_with(d)) {
             masks.push(("/dev/null", p.clone()));
         }
-        masks.extend(p.canonicalize().iter().flat_map(|c| aliases(c)).map(|a| ("/dev/null", a)));
+        if let Ok(c) = p.canonicalize() {
+            masks.extend(aliases(&c).into_iter().map(|a| ("/dev/null", a)));
+            // Under a folder the sandbox shows read-only, as itself.
+            if linked && READ_ONLY.iter().any(|r| c.starts_with(r)) {
+                masks.push(("/dev/null", c));
+            }
+        }
     }
     // The Veil identity and keys, and the real project.
     if let Some(v) = &vh_real {

@@ -1587,7 +1587,6 @@ fn concurrent_workspaces_keep_their_own_layers() {
 /// confinement does not work on this machine. Expected: the run runs, with
 /// the credentials masked (as they are when the file is a plain file).
 #[test]
-#[ignore = "BUG-1369: a symlinked ~/.cargo/credentials.toml makes every confined run fail as 'confinement does not work on this machine'"]
 fn bug_1369_a_linked_cargo_credentials_file_is_masked_and_the_run_runs() {
     let t = T::new();
     let elsewhere = t.env.dir("dotfiles");
@@ -1598,4 +1597,30 @@ fn bug_1369_a_linked_cargo_credentials_file_is_masked_and_the_run_runs() {
     let out = String::from_utf8_lossy(&o.stdout).into_owned();
     assert!(o.status.success() && out.contains("tool-ran") && out.contains("end"), "{}", text(&o));
     assert!(!out.contains("LINKED-CRATES-IO-TOKEN-1369ab"), "{out}");
+}
+
+/// BUG-1369, the whole class: a linked `~/.cargo` (the whole folder kept
+/// elsewhere), and a link to credentials inside the folder itself, are
+/// masked and the run runs.
+#[test]
+fn a_linked_cargo_home_or_an_inner_link_to_its_credentials_is_masked() {
+    for inner in [false, true] {
+        let t = T::new();
+        let elsewhere = t.env.dir("dotfiles");
+        write(&elsewhere, "cargo/bin/tool", "#!/bin/sh\necho tool-ran\n");
+        std::fs::set_permissions(elsewhere.join("cargo/bin/tool"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        match inner {
+            false => write(&elsewhere, "cargo/credentials.toml", "token = \"LINKED-HOME-TOKEN-1369cd\"\n"),
+            true => {
+                write(&elsewhere, "cargo/secrets/real.toml", "token = \"LINKED-HOME-TOKEN-1369cd\"\n");
+                std::os::unix::fs::symlink("secrets/real.toml", elsewhere.join("cargo/credentials.toml")).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(t.home.join(".cargo")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("cargo"), t.home.join(".cargo")).unwrap();
+        let o = t.exec(&["agent", "--", "sh", "-c", "~/.cargo/bin/tool; cat ~/.cargo/credentials.toml ~/.cargo/secrets/real.toml; echo end"]);
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(o.status.success() && out.contains("tool-ran") && out.contains("end"), "inner={inner}: {}", text(&o));
+        assert!(!out.contains("LINKED-HOME-TOKEN-1369cd"), "inner={inner}: {out}");
+    }
 }

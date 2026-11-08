@@ -514,7 +514,6 @@ fn a_server_refusal_hides_the_file() {
 /// licence, a copied config) that the person may read is absent from the
 /// mount for 10 s, though the server serves it there.
 #[test]
-#[ignore = "BUG-1367: a refusal in a thin clone's mount hides every file with the same content, readable ones included"]
 fn bug_1367_a_refusal_hides_only_the_refused_file_not_its_content_elsewhere() {
     const SAME: &str = "SAME-CONTENT-IN-TWO-FOLDERS-b7e24f19\n";
     let hub = TestHub::start();
@@ -538,5 +537,30 @@ fn bug_1367_a_refusal_hides_only_the_refused_file_not_its_content_elsewhere() {
         Ok(SAME.as_bytes()),
         "a file fin may read is hidden because a file elsewhere with its content was refused"
     );
+    m.unmount();
+}
+
+/// BUG-1367, the whole class: a copied folder (the same tree at two paths)
+/// refused at one path lists and reads at the other.
+#[test]
+fn a_refused_folder_hides_only_itself_not_its_copy_elsewhere() {
+    const SAME: &str = "SAME-FOLDER-CONTENT-41c9e2\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    write_files(&p.dir, &[("src/copy/dup/a.txt", SAME), (&format!("{BILL_DIR}/acme/dup/a.txt"), SAME)]);
+    p.admin.ok(&p.dir, &["commit", "--no-advance", "-m", "the same folder twice"]);
+    p.admin.ok(&p.dir, &["tag", "set", "feature", "-r", "@-"]);
+    p.admin.ok(&p.dir, &["push"]);
+    let thin = thin_with_agent(&p, &hub, &p.fin, "thin");
+    let m = Mounted::new(&p.fin, &thin, "agent");
+    // The billing copy's folder is met first (listed), not its content.
+    let names: Vec<String> = std::fs::read_dir(m.dir.join(format!("{BILL_DIR}/acme"))).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(names.contains(&"dup".to_string()), "{names:?}");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let e = std::fs::read_dir(m.dir.join(format!("{BILL_DIR}/acme/dup"))).map(|rd| rd.count()).err();
+    assert!(e.is_some_and(|e| e.raw_os_error() != Some(EIO)), "the billing copy is refused, never an I/O error");
+    let listed: Vec<String> = std::fs::read_dir(m.dir.join("src/copy/dup")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(listed, ["a.txt"], "the public copy of the folder lists");
+    assert_eq!(std::fs::read(m.dir.join("src/copy/dup/a.txt")).unwrap(), SAME.as_bytes());
     m.unmount();
 }

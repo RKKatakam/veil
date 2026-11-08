@@ -111,6 +111,12 @@ pub trait UpperFiles: Send + Sync {
     /// Rename upper file `from` to `to`, whose directory the upper layer
     /// has: O(1), holes and all, and an open file follows it.
     fn rename(&self, from: &VPath, to: &VPath) -> std::io::Result<()>;
+    /// Write `src`'s content as the upper file `path` (whose directory the
+    /// upper layer has), atomically and durably, a piece at a time:
+    /// `false` when this layer cannot (write it whole instead).
+    fn put_from(&self, _path: &VPath, _src: &std::fs::File) -> std::io::Result<bool> {
+        Ok(false)
+    }
 }
 
 /// [`UpperFiles`] of an upper layer that is a directory on disk (a real
@@ -176,6 +182,39 @@ impl UpperFiles for DiskFiles {
             }
         }
         Ok(())
+    }
+
+    /// A private temporary file beside it, filled a piece at a time,
+    /// synced, then renamed into place and its directory synced: a crash
+    /// leaves the old state or the whole copy (BUG-1368).
+    fn put_from(&self, path: &VPath, src: &std::fs::File) -> std::io::Result<bool> {
+        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        let to = self.full(path);
+        let dir = to.parent().ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        // A temporary name every listing skips (`is_temp_name`): a copy a
+        // crash leaves is never taken for a file.
+        let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let tmp = dir.join(format!(".{name}.vltmp{}", hex::encode(veil_core::crypto::random_bytes::<4>())));
+        let done = (|| -> std::io::Result<()> {
+            let out = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
+            let mut buf = vec![0u8; 1 << 20];
+            let mut at = 0u64;
+            loop {
+                let n = src.read_at(&mut buf, at)?;
+                if n == 0 {
+                    break;
+                }
+                out.write_all_at(&buf[..n], at)?;
+                at += n as u64;
+            }
+            out.sync_all()?;
+            std::fs::rename(&tmp, &to)?;
+            std::fs::File::open(dir)?.sync_all()
+        })();
+        if done.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        done.map(|()| true)
     }
 }
 
@@ -329,6 +368,12 @@ pub trait Lower: StorageBackend {
     fn fetches(&self) -> bool {
         false
     }
+
+    /// Copy the content of file `path` to `out` without holding it whole in
+    /// memory, if this layer can: its length, or `None` (read it whole).
+    fn copy_to(&self, _path: &VPath, _out: &mut std::fs::File) -> VResult<Option<u64>> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -364,20 +409,22 @@ pub struct ReaderView {
     fetched_folders: Mutex<HashSet<ObjectId>>,
 }
 
-/// Objects the server refused at their place (not this person's: access
+/// The paths whose file the server refused (not this person's: access
 /// removed since the tree was listed), with when: absent from listings and
 /// lookups for [`REFUSED_FOR`], whichever view of the tree asks (the
 /// mount's lower layer is made afresh at each recording); asked again after
-/// it, so access given back shows. One mount per process.
-static REFUSED: std::sync::LazyLock<Mutex<HashMap<ObjectId, std::time::Instant>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// it, so access given back shows. By path, as the server decides
+/// (BUG-1367): the same content elsewhere (an empty `__init__.py`) is
+/// another file. One mount per process.
+static REFUSED: std::sync::LazyLock<Mutex<HashMap<VPath, std::time::Instant>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 const REFUSED_FOR: std::time::Duration = std::time::Duration::from_secs(10);
 
-fn refused(id: &ObjectId) -> bool {
+fn refused(path: &VPath) -> bool {
     let mut r = REFUSED.lock().unwrap_or_else(|p| p.into_inner());
-    match r.get(id) {
+    match r.get(path) {
         Some(at) if at.elapsed() < REFUSED_FOR => true,
         Some(_) => {
-            r.remove(id);
+            r.remove(path);
             false
         }
         None => false,
@@ -402,19 +449,25 @@ impl ReaderView {
     /// directory holding nothing this reader can read is absent (checkout
     /// would not create it).
     fn entry(&self, path: &VPath) -> VResult<Option<TreeEntry>> {
+        // What is fetched on the way is asked for at this path, wherever
+        // the same content (a file, a copied folder) was met first: the
+        // server decides by path (BUG-1367).
+        if self.store.is_partial() {
+            self.store.place_along(&self.view.root(), path);
+        }
         match lookup(&self.store, &self.view.root(), path) {
             Ok(Some(e)) if path.is_root() => Ok(Some(e)),
-            Ok(Some(e)) if e.kind == EntryKind::Dir => Ok(self.dir_visible(&e)?.then_some(e)),
-            Ok(Some(e)) if self.visible_leaf(&e)? => Ok(Some(e)),
+            Ok(Some(e)) if e.kind == EntryKind::Dir => Ok(self.dir_visible(&e, path)?.then_some(e)),
+            Ok(Some(e)) if self.visible_leaf(&e, path)? => Ok(Some(e)),
             Ok(_) => Ok(None),
             Err(e) if e.is_unreadable() => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    /// Is leaf entry `e` shown to this reader, as checkout would write it?
-    /// A conflict with a symlink side as that shown side.
-    fn visible_leaf(&self, e: &TreeEntry) -> VResult<bool> {
+    /// Is leaf entry `e`, at `path`, shown to this reader, as checkout
+    /// would write it? A conflict with a symlink side as that shown side.
+    fn visible_leaf(&self, e: &TreeEntry, path: &VPath) -> VResult<bool> {
         let shown = match e.kind {
             EntryKind::Conflict => match self.store.conflict(&e.id) {
                 Ok(c) if c.has_special_terms() => match veil_core::conflict::shown_side(&c) {
@@ -426,7 +479,7 @@ impl ReaderView {
             },
             _ => e.clone(),
         };
-        if self.store.is_partial() && refused(&shown.id) {
+        if self.store.is_partial() && refused(path) {
             return Ok(false);
         }
         match shown.kind {
@@ -445,21 +498,23 @@ impl ReaderView {
                     Err(err) => Err(err),
                 }
             }
+            // A large plain file is not read whole to tell (BUG-1368).
+            EntryKind::File if shown.size > SPILL_AT && self.store.is_loose_blob(&shown.id) => Ok(true),
             _ => Ok(self.store.entry_readable(&shown)),
         }
     }
 
     /// Does directory entry `dir` hold a file this reader can read?
     /// Depth first, stopping at the first one (usually the first entry).
-    fn dir_visible(&self, dir: &TreeEntry) -> VResult<bool> {
+    fn dir_visible(&self, dir: &TreeEntry, path: &VPath) -> VResult<bool> {
         // A folder of a thin clone not fetched yet is shown without fetching
         // it (`entry_shown`): one that turns out to hold only secrets this
         // reader cannot open lists as empty.
         if self.store.is_partial() && !self.store.has(&dir.id) {
             return Ok(self.store.entry_shown(dir));
         }
-        let mut stack = vec![dir.id];
-        while let Some(id) = stack.pop() {
+        let mut stack = vec![(dir.id, path.clone())];
+        while let Some((id, at)) = stack.pop() {
             let tree = match self.store.tree(&id) {
                 Ok(t) => t,
                 Err(e) if e.is_unreadable() || e.is_not_found() => continue,
@@ -467,13 +522,22 @@ impl ReaderView {
             };
             for c in tree.entries.iter().rev() {
                 match c.kind {
-                    EntryKind::Dir => stack.push(c.id),
-                    _ if self.visible_leaf(c)? => return Ok(true),
+                    EntryKind::Dir => stack.push((c.id, at.join(&c.name))),
+                    _ if self.visible_leaf(c, &at.join(&c.name))? => return Ok(true),
                     _ => {}
                 }
             }
         }
         Ok(false)
+    }
+
+    /// The server's own "not yours" for `e` at `path` (never an unreachable
+    /// one): the file is hidden from now on, as a checkout would leave it
+    /// out.
+    fn note_refusal(&self, e: &TreeEntry, path: &VPath, err: &VeilError) {
+        if err.is_unreadable() && self.store.is_partial() && !self.store.has(&e.id) && e.visibility.key_scope().is_none() {
+            REFUSED.lock().unwrap_or_else(|p| p.into_inner()).insert(path.clone(), std::time::Instant::now());
+        }
     }
 
     /// In a thin clone, fetch folder `dir`'s small files together, once per
@@ -505,6 +569,23 @@ impl Lower for ReaderView {
         self.store.is_partial()
     }
 
+    /// A plain file's content, streamed from its loose object (BUG-1368).
+    /// In a thin clone one not fetched yet is fetched first (whole: the
+    /// server sends an object at a time), then streamed from the cache.
+    fn copy_to(&self, path: &VPath, out: &mut std::fs::File) -> VResult<Option<u64>> {
+        let Some(e) = self.entry(path)? else { return Err(VeilError::NotFound(path.to_string())) };
+        if e.kind != EntryKind::File || e.visibility.key_scope().is_some() {
+            return Ok(None);
+        }
+        if self.store.is_partial() && !self.store.has(&e.id) {
+            if let Err(err) = self.store.get_raw(&e.id) {
+                self.note_refusal(&e, path, &err);
+                return Err(err);
+            }
+        }
+        self.store.copy_loose_blob(&e.id, out)
+    }
+
     /// Files of the tree this reader cannot read (when in doubt, the path
     /// itself: being carried is the safe side).
     fn unseen_under(&self, path: &VPath) -> Vec<VPath> {
@@ -521,7 +602,7 @@ impl Lower for ReaderView {
                     Ok(t) => stack.extend(t.entries.iter().map(|c| (p.join(&c.name), c.clone()))),
                     Err(_) => out.push(p),
                 },
-                _ if self.visible_leaf(&e).unwrap_or(false) => {}
+                _ if self.visible_leaf(&e, &p).unwrap_or(false) => {}
                 _ => out.push(p),
             }
         }
@@ -543,13 +624,8 @@ impl StorageBackend for ReaderView {
                     self.prefetch_folder(&path.parent().unwrap_or_else(VPath::root));
                 }
                 let r = self.view.read(path);
-                // The server's own "not yours" (never an unreachable one):
-                // the file is hidden from now on, as a checkout would leave
-                // it out.
                 if let Err(err) = &r {
-                    if err.is_unreadable() && self.store.is_partial() && !self.store.has(&e.id) && e.visibility.key_scope().is_none() {
-                        REFUSED.lock().unwrap_or_else(|p| p.into_inner()).insert(e.id, std::time::Instant::now());
-                    }
+                    self.note_refusal(&e, path, err);
                 }
                 r
             }
@@ -595,9 +671,9 @@ impl StorageBackend for ReaderView {
         let mut out = Vec::new();
         for c in self.store.tree(&dir.id)?.entries.iter() {
             let kind = match c.kind {
-                EntryKind::Dir if self.dir_visible(c)? => NodeKind::Dir,
+                EntryKind::Dir if self.dir_visible(c, &path.join(&c.name))? => NodeKind::Dir,
                 EntryKind::Dir => continue,
-                _ if !self.visible_leaf(c)? => continue,
+                _ if !self.visible_leaf(c, &path.join(&c.name))? => continue,
                 EntryKind::Symlink => NodeKind::Symlink,
                 EntryKind::Conflict => match self.store.conflict(&c.id) {
                     Ok(cf) if cf.has_special_terms() => match veil_core::conflict::shown_side(&cf) {
@@ -707,19 +783,44 @@ impl Lowered {
 
     /// `data`, spilled to an anonymous file in `dir`.
     fn spill(dir: &std::path::Path, data: &[u8]) -> std::io::Result<Lowered> {
-        use std::{io::Write, os::unix::fs::OpenOptionsExt};
-        #[cfg(target_os = "linux")]
-        let mut file = std::fs::OpenOptions::new().read(true).write(true).mode(0o600).custom_flags(libc::O_TMPFILE).open(dir)?;
-        #[cfg(not(target_os = "linux"))]
-        let mut file = {
-            let p = dir.join(format!("spill-{}", hex::encode(veil_core::crypto::random_bytes::<8>())));
-            let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&p)?;
-            std::fs::remove_file(&p)?;
-            f
-        };
+        use std::io::Write;
+        let mut file = anonymous_file(dir)?;
         file.write_all(data)?;
         Ok(Lowered::Spilled { file, len: data.len() as u64 })
     }
+}
+
+/// A new file of `dir` (private) without a name, open for reading and
+/// writing: nothing of it outlives its last handle, a crash included.
+/// `O_TMPFILE` on Linux; where the filesystem has no such thing (NFS, some
+/// FUSE ones) or elsewhere, a file created exclusively and removed at once.
+fn anonymous_file(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(target_os = "linux")]
+    match std::fs::OpenOptions::new().read(true).write(true).mode(0o600).custom_flags(libc::O_TMPFILE).open(dir) {
+        Ok(f) => return Ok(f),
+        Err(e) if !matches!(e.raw_os_error(), Some(libc::EOPNOTSUPP) | Some(libc::EISDIR) | Some(libc::EINVAL) | Some(libc::ENOENT)) || !dir.is_dir() => {
+            return Err(e)
+        }
+        Err(_) => {}
+    }
+    unlinked_file(dir)
+}
+
+/// [`anonymous_file`] where `O_TMPFILE` is not to be had: created
+/// exclusively in `dir` (private), never through a link, then removed.
+fn unlinked_file(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let p = dir.join(format!(".spill-{}", hex::encode(veil_core::crypto::random_bytes::<8>())));
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&p)?;
+    std::fs::remove_file(&p)?;
+    Ok(f)
 }
 
 struct Handle {
@@ -920,6 +1021,17 @@ impl Inner {
         let need = self.nodes.get(&ino).ok_or(libc::EBADF)?.cache.is_none();
         if need {
             let path = self.path(ino)?;
+            // A large file straight to its spill file, never whole in
+            // memory, where the lower layer can (BUG-1368).
+            if let Some(dir) = self.spill.clone() {
+                if self.meta(&path)?.is_some_and(|m| m.len > SPILL_AT) {
+                    let mut file = anonymous_file(&dir).map_err(|e| io_errno(&e))?;
+                    if let Some(len) = self.lower.copy_to(&path, &mut file).map_err(|e| errno(&e))? {
+                        self.nodes.get_mut(&ino).ok_or(libc::EBADF)?.cache = Some(Lowered::Spilled { file, len });
+                        return Ok(self.nodes.get(&ino).and_then(|n| n.cache.as_ref()).expect("loaded"));
+                    }
+                }
+            }
             let data = self.overlay.read(&path).map_err(|e| errno(&e))?;
             // In memory only while small and under the bound across open
             // files (BUG-1365).
@@ -961,22 +1073,57 @@ impl Inner {
     /// that was never written is written in memory.
     fn writable(&mut self, ino: u64) -> FsResult<&mut Box<dyn UpperFile>> {
         if !self.open_upper(ino)? {
+            // A large lower file is spilled first (read a piece at a time),
+            // then copied up from the spill file (BUG-1368).
+            let unloaded = self.nodes.get(&ino).is_some_and(|n| n.path.is_some() && n.cache.is_none());
+            if unloaded && self.spill.is_some() {
+                self.load(ino)?;
+            }
+            let spill = self.spill.clone();
             let node = self.nodes.get_mut(&ino).ok_or(libc::EBADF)?;
             match node.path.clone() {
-                None => {
-                    let data = match node.cache.take() {
-                        Some(c) => c.bytes().map_err(|e| io_errno(&e))?,
-                        None => Vec::new(),
-                    };
-                    node.file = Some(Box::new(VecFile(data)));
-                }
+                // Unlinked while open: its content, and what is written to
+                // it from now on, in an anonymous file where the mount has a
+                // spill directory (never in memory: BUG-1368).
+                None => match (spill, node.cache.take()) {
+                    (_, Some(Lowered::Spilled { file, .. })) => node.file = Some(Box::new(DiskFile(file))),
+                    (Some(dir), cache) => {
+                        use std::io::Write;
+                        let mut file = anonymous_file(&dir).map_err(|e| io_errno(&e))?;
+                        if let Some(c) = cache {
+                            file.write_all(&c.bytes().map_err(|e| io_errno(&e))?).map_err(|e| io_errno(&e))?;
+                        }
+                        node.file = Some(Box::new(DiskFile(file)));
+                    }
+                    (None, cache) => {
+                        let data = match cache {
+                            Some(c) => c.bytes().map_err(|e| io_errno(&e))?,
+                            None => Vec::new(),
+                        };
+                        node.file = Some(Box::new(VecFile(data)));
+                    }
+                },
                 Some(path) => {
-                    let data = match node.cache.take() {
-                        Some(d) => d.bytes().map_err(|e| io_errno(&e))?,
-                        None => self.overlay.read(&path).map_err(|e| errno(&e))?,
-                    };
+                    let cache = node.cache.take();
                     let exec = self.meta(&path)?.is_some_and(|m| m.executable);
-                    self.overlay.write(&path, &data).map_err(|e| errno(&e))?;
+                    // A spilled file is copied up a piece at a time where
+                    // the upper layer is on disk (BUG-1368).
+                    let streamed = match &cache {
+                        Some(Lowered::Spilled { file, .. }) => {
+                            if let Some(dir) = path.parent().filter(|d| !d.is_root()) {
+                                self.overlay.create_dir_all(&dir).map_err(|e| errno(&e))?;
+                            }
+                            self.files.put_from(&path, file).map_err(|e| io_errno(&e))?
+                        }
+                        _ => false,
+                    };
+                    if !streamed {
+                        let data = match cache {
+                            Some(d) => d.bytes().map_err(|e| io_errno(&e))?,
+                            None => self.overlay.read(&path).map_err(|e| errno(&e))?,
+                        };
+                        self.overlay.write(&path, &data).map_err(|e| errno(&e))?;
+                    }
                     self.overlay.set_executable(&path, exec).map_err(|e| errno(&e))?;
                     if !self.open_upper(ino)? {
                         return Err(libc::EIO);
@@ -1091,6 +1238,20 @@ impl Inner {
                 self.overlay.create_dir_all(&dir).map_err(|e| errno(&e))?;
             }
             return self.files.rename(from, to).map_err(|e| io_errno(&e));
+        }
+        // A large lower file: a piece at a time, through a spill file
+        // (BUG-1368).
+        if let Some(dir) = self.spill.clone().filter(|_| m.len > SPILL_AT) {
+            let mut file = anonymous_file(&dir).map_err(|e| io_errno(&e))?;
+            if self.lower.copy_to(from, &mut file).map_err(|e| errno(&e))?.is_some() {
+                if let Some(parent) = to.parent().filter(|d| !d.is_root()) {
+                    self.overlay.create_dir_all(&parent).map_err(|e| errno(&e))?;
+                }
+                if self.files.put_from(to, &file).map_err(|e| io_errno(&e))? {
+                    self.overlay.set_executable(to, m.executable).map_err(|e| errno(&e))?;
+                    return Ok(());
+                }
+            }
         }
         let data = match self.by_path.get(from).and_then(|i| self.nodes.get(i)).and_then(|n| n.cache.as_ref()) {
             Some(b) => b.bytes().map_err(|e| io_errno(&e))?,
@@ -2120,6 +2281,22 @@ mod tests {
             m.fs.release(f).unwrap();
         }
         m.fs.release(fh).unwrap();
+    }
+
+    /// The spill files' fallback (a filesystem without `O_TMPFILE`): a file
+    /// that reads and writes, and leaves no name behind.
+    #[test]
+    fn a_spill_file_without_o_tmpfile_leaves_no_name() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        for f in [unlinked_file(dir.path()).unwrap(), anonymous_file(dir.path()).unwrap()] {
+            f.write_all_at(b"spilled", 0).unwrap();
+            let mut b = [0u8; 7];
+            f.read_exact_at(&mut b, 0).unwrap();
+            assert_eq!(&b, b"spilled");
+            assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none(), "a spill file left a name");
+        }
+        assert!(anonymous_file(&dir.path().join("missing")).is_err());
     }
 
     #[test]

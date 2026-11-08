@@ -166,6 +166,20 @@ impl Locator {
         self.at.insert(key, (u64::from(h) << 32) | u64::from(index));
     }
 
+    /// Record `child` at `(parent, index)`, replacing the place it had.
+    fn place(&mut self, child: ObjectId, parent: ObjectId, index: u32) {
+        let key = short_key(&child);
+        if !self.at.contains_key(&key) && self.at.len() + self.parents.len() >= LOCATOR_CAP {
+            return;
+        }
+        let parents = &mut self.parents;
+        let h = *self.handles.entry(short_key(&parent)).or_insert_with(|| {
+            parents.push(parent);
+            (parents.len() - 1) as u32
+        });
+        self.at.insert(key, (u64::from(h) << 32) | u64::from(index));
+    }
+
     fn get(&self, id: &ObjectId) -> Option<(ObjectId, u32)> {
         self.at.get(&short_key(id)).map(|v| (self.parents[(v >> 32) as usize], *v as u32))
     }
@@ -337,24 +351,28 @@ impl ObjectStore {
         self.partial.get().map_or(0, |p| p.fetched.load(Ordering::Relaxed))
     }
 
-    /// Run `f` with fetching off for the whole store: reads of what neither
-    /// area holds are `Missing` (gc, fsck and maintenance, for which an
-    /// unfetched object is on the server, never local work).
+    /// Run `f` with fetching off on this thread: its reads of what neither
+    /// area holds are `Missing` (gc and maintenance, for which an unfetched
+    /// object is on the server, never local work; a look at what the clone
+    /// holds). **This thread only** (BUG-1366): another thread reading the
+    /// same store meanwhile fetches as ever, and never takes a file the
+    /// server serves for hidden. Every caller reads the store on the thread
+    /// that called it (gc's packing threads only encode what they are
+    /// handed).
     pub fn without_fetching<R>(&self, f: impl FnOnce() -> R) -> R {
-        let Some(p) = self.partial.get() else { return f() };
-        p.no_fetch.fetch_add(1, Ordering::SeqCst);
-        struct Undo<'a>(&'a AtomicUsize);
-        impl Drop for Undo<'_> {
+        NO_FETCH.with(|c| c.set(c.get() + 1));
+        struct Undo;
+        impl Drop for Undo {
             fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::SeqCst);
+                NO_FETCH.with(|c| c.set(c.get() - 1));
             }
         }
-        let _undo = Undo(&p.no_fetch);
+        let _undo = Undo;
         f()
     }
 
-    /// Never fetch from this store (a checker that only reads what is
-    /// local).
+    /// Never fetch from this store, on any thread: only for a store no one
+    /// else reads (`fsck`'s own, opened for the check).
     pub fn never_fetch(&self) {
         if let Some(p) = self.partial.get() {
             p.no_fetch.fetch_add(1, Ordering::SeqCst);
@@ -793,6 +811,27 @@ impl ObjectStore {
         self.entry_readable(e)
     }
 
+    /// Read what is at `path` below `root` (a tree of this clone) at that
+    /// place: record each tree on the way, and the entry at its end, at
+    /// this path, replacing where they were met first. The same object
+    /// can be at several paths (an empty `__init__.py`, a copied folder),
+    /// and the server decides by path: one refused at the place it was met
+    /// first is asked for where it is read (BUG-1367). Trees on the way are
+    /// read as held (nothing is fetched to tell).
+    pub fn place_along(&self, root: &ObjectId, path: &VPath) {
+        let Some(p) = self.partial.get() else { return };
+        let mut tree = *root;
+        for name in path.components() {
+            let Ok(t) = self.without_fetching(|| self.tree_object(&tree)) else { return };
+            let Some((i, e)) = t.entries.iter().enumerate().find(|(_, e)| e.name == name) else { return };
+            p.locator.lock().unwrap_or_else(|e| e.into_inner()).place(e.id, tree, i as u32);
+            if e.kind != EntryKind::Dir {
+                return;
+            }
+            tree = e.id;
+        }
+    }
+
     /// Fetch those of `ids` (with the sizes their tree entries give them)
     /// that neither area holds, in batches: a mounted workspace's folder,
     /// when one of its files is first read (milestone S8). One the server refuses is left for its
@@ -993,14 +1032,10 @@ impl ObjectStore {
             roots.push(st.snapshot);
             roots.extend(st.pending.map(|x| x.snapshot));
         }
-        NO_FETCH.with(|c| c.set(c.get() + 1));
-        struct Undo;
-        impl Drop for Undo {
-            fn drop(&mut self) {
-                NO_FETCH.with(|c| c.set(c.get() - 1));
-            }
-        }
-        let _undo = Undo;
+        self.without_fetching(|| self.pinned_from(p, roots))
+    }
+
+    fn pinned_from(&self, p: &Partial, roots: Vec<ObjectId>) -> Result<HashSet<ObjectId>> {
         let mut out = HashSet::new();
         let mut stack = Vec::new();
         for r in roots {

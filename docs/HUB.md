@@ -2890,7 +2890,20 @@ protocol or server change.
     the nearest server ancestor whose held tree names it there is the
     server's refusal too (`promisor.rs`, `names_held`).
   * an open file's content is in memory only up to 1 MiB, 64 MiB across
-    open files; larger, in an anonymous file (BUG-1365).
+    open files; larger, in an anonymous file (BUG-1365). A file over 1
+    MiB is never read whole by the mount: `stat` decides from the first
+    bytes of its loose object, and opening, writing into (copy-up) and
+    renaming it stream that object to the spill file, checked against its
+    id, and on to the upper layer atomically; an unlinked open file is
+    written to an anonymous file (BUG-1368). **Outside the bound:** a file a
+    thin clone has not fetched arrives whole from the server (an object at
+    a time) before it is spilled; an object the store holds in a pack, a
+    sealed secret and a conflicted file are read whole once; recording
+    reads changed files as any snapshot does.
+  * refusals are kept by path, and every lookup asks for what it fetches
+    at the path it reads (`place_along`): the same content elsewhere,
+    refused at one path, reads at another (BUG-1367). Fetching is switched
+    off per thread, never for the whole store (BUG-1366).
 * **Exact dirty sets:** a mount's recording reuses every unchanged folder
   and file by id and visits only the paths the overlay holds, so it
   fetches nothing; the builder's carrying of what a working copy does not

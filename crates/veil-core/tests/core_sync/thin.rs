@@ -974,7 +974,6 @@ fn s3rd2_no_read_of_history_outside_held_or_exact() {
 /// server's tip, as a checkout's staging threads or `vl grep` do: every one
 /// of them must read.
 #[test]
-#[ignore = "BUG-1366: names_held's without_fetching turns fetching off for every thread of the store, so a concurrent read of a served file is Missing"]
 fn s8r2_a_refusal_met_on_one_thread_never_hides_another_threads_read() {
     let id = Identity::generate("alice");
     let sfs = Arc::new(MemoryBackend::new());
