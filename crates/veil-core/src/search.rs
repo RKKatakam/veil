@@ -31,7 +31,7 @@ use crate::{
     object::{EntryKind, Snapshot, TreeEntry, Visibility},
     rename::{self, RenameOptions},
     repo::Repo,
-    tree::{diff_trees, lookup, prefetch_changes, TreeChange},
+    tree::{diff_trees_hiding, lookup, prefetch_changes, TreeChange},
     vpath::VPath,
 };
 
@@ -218,7 +218,9 @@ impl<'a> Searcher<'a> {
             Some(Some(t)) => Some(*t),
             _ => None,
         };
-        let changes: Vec<TreeChange> = diff_trees(store, base.as_ref(), Some(&s.tree))?
+        // A folder the server refuses is not searched (BUG-1508).
+        let changes: Vec<TreeChange> = diff_trees_hiding(store, base.as_ref(), Some(&s.tree))?
+            .0
             .into_iter()
             .filter(|c| paths.is_empty() || paths.iter().any(|p| c.path == *p || c.path.starts_with(p)))
             .collect();
@@ -321,7 +323,7 @@ impl<'a> Searcher<'a> {
             let mut name = p.clone();
             if let (Some(_), Some(t)) = (&here, tree) {
                 if lookup_entry(self.repo, t, p)?.is_none() {
-                    let changes = diff_trees(store, Some(t), Some(&s.tree))?;
+                    let (changes, _) = diff_trees_hiding(store, Some(t), Some(&s.tree))?;
                     let d = rename::detect(store, Some(t), Some(&s.tree), &changes, self.filter.reader, &self.filter.renames)?;
                     self.stats.add(&d.stats);
                     if let Some(pair) = d.pairs.iter().find(|x| x.to == *p && !x.copy) {
