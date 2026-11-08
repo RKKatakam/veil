@@ -644,44 +644,43 @@ fn a_clean_format_6_or_7_repository_upgrades_keeping_every_id() {
 fn a_format_8_or_9_repository_refuses_format_10_snapshots_and_upgrades_rewriting_nothing() {
     // (A format-9 repository is always a thin clone: the test below, and
     // the server's `thin` tests with a clone of S3's code.)
-    for from in [8] {
-        let (_tmp, root, fs, alice) = written_then_marked(from, |repo, root, fs| {
-            std::fs::write(root.join("README.md"), "hello\n").unwrap();
-            repo.snapshot_workspace("default", &**fs).unwrap();
-            let (c, _) = repo.commit_working_copy("default", "first").unwrap();
-            repo.set_tag("main", c, false).unwrap();
-        });
-        let mut repo = Repo::open(fs.clone(), Some(alice.clone()), "alice").unwrap();
-        assert_eq!(repo.format(), from);
-        repo.set_attribution(Some(veil_core::object::Attribution { agent: "claude-code".into(), task: None, prompt: None, run: None }));
-        std::fs::write(root.join("README.md"), "by an agent\n").unwrap();
-        let err = repo.snapshot_workspace("default", &*fs).unwrap_err();
-        assert!(matches!(err, VeilError::Unsupported(_)), "format {from}: {err}");
-        assert!(err.to_string().contains("vl upgrade"), "format {from}: {err}");
-        // Without attribution the repository works as before.
-        repo.set_attribution(None);
-        let wc = repo.snapshot_workspace("default", &*fs).unwrap().snapshot;
-        let e = repo.drop_attempt(wc, "dead end").unwrap_err();
-        assert!(matches!(e, VeilError::Unsupported(_)), "format {from}: an attempt was stored: {e}");
-        drop(repo);
-        let objects = |r: &Path| veil_files(r).into_iter().filter(|(p, _)| p.to_string_lossy().contains("/objects/")).collect::<Vec<_>>();
-        let before = objects(&root);
-        let r = upgrade(fs.clone(), Some(alice.clone()), &UpgradeOptions::default()).unwrap();
-        assert_eq!((r.from, r.to), (from, REPO_FORMAT));
-        assert!(r.removed.is_empty(), "{:?}", r.removed);
-        assert!(r.notes.iter().any(|n| n.contains("agent attribution")), "{:?}", r.notes);
-        assert_eq!(objects(&root), before, "format {from}: the upgrade rewrote objects");
-        let mut repo = Repo::open(fs.clone(), Some(alice.clone()), "alice").unwrap();
-        assert_eq!(repo.format(), REPO_FORMAT);
-        repo.set_attribution(Some(veil_core::object::Attribution { agent: "claude-code".into(), task: None, prompt: None, run: None }));
-        std::fs::write(root.join("README.md"), "by an agent, after the upgrade\n").unwrap();
-        let wc = repo.snapshot_workspace("default", &*fs).unwrap().snapshot;
-        assert_eq!(repo.snapshot(&wc).unwrap().agent.as_ref().map(|a| a.agent.as_str()), Some("claude-code"));
-        let out = repo.drop_attempt(wc, "dead end").unwrap();
-        assert!(repo.snapshot(&out.attempt).unwrap().abandoned.is_some());
-        drop(repo);
-        assert_fsck_clean(fs, None);
-    }
+    let from = 8;
+    let (_tmp, root, fs, alice) = written_then_marked(from, |repo, root, fs| {
+        std::fs::write(root.join("README.md"), "hello\n").unwrap();
+        repo.snapshot_workspace("default", &**fs).unwrap();
+        let (c, _) = repo.commit_working_copy("default", "first").unwrap();
+        repo.set_tag("main", c, false).unwrap();
+    });
+    let mut repo = Repo::open(fs.clone(), Some(alice.clone()), "alice").unwrap();
+    assert_eq!(repo.format(), from);
+    repo.set_attribution(Some(veil_core::object::Attribution { agent: "claude-code".into(), task: None, prompt: None, run: None }));
+    std::fs::write(root.join("README.md"), "by an agent\n").unwrap();
+    let err = repo.snapshot_workspace("default", &*fs).unwrap_err();
+    assert!(matches!(err, VeilError::Unsupported(_)), "format {from}: {err}");
+    assert!(err.to_string().contains("vl upgrade"), "format {from}: {err}");
+    // Without attribution the repository works as before.
+    repo.set_attribution(None);
+    let wc = repo.snapshot_workspace("default", &*fs).unwrap().snapshot;
+    let e = repo.drop_attempt(wc, "dead end").unwrap_err();
+    assert!(matches!(e, VeilError::Unsupported(_)), "format {from}: an attempt was stored: {e}");
+    drop(repo);
+    let objects = |r: &Path| veil_files(r).into_iter().filter(|(p, _)| p.to_string_lossy().contains("/objects/")).collect::<Vec<_>>();
+    let before = objects(&root);
+    let r = upgrade(fs.clone(), Some(alice.clone()), &UpgradeOptions::default()).unwrap();
+    assert_eq!((r.from, r.to), (from, REPO_FORMAT));
+    assert!(r.removed.is_empty(), "{:?}", r.removed);
+    assert!(r.notes.iter().any(|n| n.contains("agent attribution")), "{:?}", r.notes);
+    assert_eq!(objects(&root), before, "format {from}: the upgrade rewrote objects");
+    let mut repo = Repo::open(fs.clone(), Some(alice.clone()), "alice").unwrap();
+    assert_eq!(repo.format(), REPO_FORMAT);
+    repo.set_attribution(Some(veil_core::object::Attribution { agent: "claude-code".into(), task: None, prompt: None, run: None }));
+    std::fs::write(root.join("README.md"), "by an agent, after the upgrade\n").unwrap();
+    let wc = repo.snapshot_workspace("default", &*fs).unwrap().snapshot;
+    assert_eq!(repo.snapshot(&wc).unwrap().agent.as_ref().map(|a| a.agent.as_str()), Some("claude-code"));
+    let out = repo.drop_attempt(wc, "dead end").unwrap();
+    assert!(repo.snapshot(&out.attempt).unwrap().abandoned.is_some());
+    drop(repo);
+    assert_fsck_clean(fs, None);
 }
 
 /// The format-8 set upgrades to format 10 rewriting nothing, and a
