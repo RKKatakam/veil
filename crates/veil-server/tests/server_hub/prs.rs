@@ -1554,7 +1554,7 @@ mod s21_cycle2 {
     }
 
     /// The peak resident memory of this process since `reset_peak` (kB).
-    fn peak_kb() -> u64 {
+    pub(super) fn peak_kb() -> u64 {
         let s = std::fs::read_to_string("/proc/self/status").unwrap();
         s.lines().find(|l| l.starts_with("VmHWM:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|n| n.parse().ok()).unwrap()
     }
@@ -1567,7 +1567,7 @@ mod s21_cycle2 {
     /// Run test `name` again in a process of its own (it measures this
     /// process's memory, which other tests of the suite share): true in the
     /// parent, which has checked the child passed and should return.
-    fn in_own_process(name: &str) -> bool {
+    pub(super) fn in_own_process(name: &str) -> bool {
         const CHILD: &str = "VEIL_S21_MEMORY_CHILD";
         if std::env::var(CHILD).is_ok() {
             return false;
@@ -1584,7 +1584,7 @@ mod s21_cycle2 {
     }
 
     /// Reset the peak to the current resident size (Linux 4.0+).
-    fn reset_peak() {
+    pub(super) fn reset_peak() {
         std::fs::write("/proc/self/clear_refs", "5").unwrap();
     }
 
@@ -2144,17 +2144,17 @@ mod s21_cycle3 {
     /// A project where alice (who writes `pub/`) asked for changes to bob's
     /// PR (head branch `feature`); cy approved. `team` (alice, bob, cy)
     /// writes `pub/`.
-    struct Held {
-        th: TestHub,
-        h: Hist,
-        alice: (i64, String),
-        bob: (i64, String),
-        cy: (i64, String),
-        id: String,
-        team: i64,
+    pub(super) struct Held {
+        pub(super) th: TestHub,
+        pub(super) h: Hist,
+        pub(super) alice: (i64, String),
+        pub(super) bob: (i64, String),
+        pub(super) cy: (i64, String),
+        pub(super) id: String,
+        pub(super) team: i64,
     }
 
-    fn held() -> Held {
+    pub(super) fn held() -> Held {
         let th = TestHub::start();
         let alice = person_row(&th, "alice");
         let bob = person_row(&th, "bob");
@@ -2190,7 +2190,7 @@ mod s21_cycle3 {
     }
 
     /// `p` as the database says they are now (their groups in this project).
-    fn member(th: &TestHub, h: &Hist, p: i64) -> Ask {
+    pub(super) fn member(th: &TestHub, h: &Hist, p: i64) -> Ask {
         let groups: Vec<i64> = th
             .rt
             .block_on(sqlx::query_scalar("SELECT g.id FROM groups g JOIN group_members m ON m.group_id = g.id WHERE g.project_id = $1 AND m.person_id = $2").bind(h.id).bind(p).fetch_all(&h.hub.db))
@@ -2575,5 +2575,564 @@ mod s21_cycle3 {
         assert!(reviews.len() <= 100, "{}", reviews.len());
         assert!(v["review"]["reviews_total"].as_u64().unwrap() >= 300, "{}", v["review"]["reviews_total"]);
         assert!(text.len() < 512 << 10, "a PR answer of {} bytes", text.len());
+    }
+}
+
+/// Review of the S21 redesign (cycle 1 of the revised design, 2026-11-08):
+/// guarantee tests, and reproductions of BUG-1321..1325, ignored until
+/// fixed (`docs/BUGS.md`, "S21 redesign").
+mod s21_redesign {
+    use std::{
+        collections::BTreeSet,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::{Duration, Instant},
+    };
+
+    use veil_core::object::{EntryKind, Object, Snapshot, Text, Tree, TreeEntry};
+    use veil_server::prs::{
+        rules::{Review, Risk},
+        state::{record_landing, Landing, RulesFile, RulesState},
+    };
+
+    use super::s21_cycle2::{in_own_process, peak_kb, pr_id, put_review, reset_peak};
+    use super::s21_cycle3::{held, member, Held};
+    use super::*;
+
+    /// `files` as trees, with the paths in `links` as symbolic links
+    /// (their content is the target) and those in `exe` executable.
+    fn tree_of(files: &Files, links: &BTreeSet<String>, exe: &BTreeSet<String>, prefix: &str, out: &mut Vec<(ObjectId, Vec<u8>)>) -> ObjectId {
+        let mut here: BTreeMap<String, TreeEntry> = BTreeMap::new();
+        let mut sub: BTreeMap<String, Files> = BTreeMap::new();
+        for (p, c) in files {
+            match p.split_once('/') {
+                Some((d, rest)) => {
+                    sub.entry(d.to_string()).or_default().insert(rest.to_string(), c.clone());
+                }
+                None => {
+                    let raw = Object::Blob(c.clone()).encode();
+                    let id = ObjectId::hash(&raw);
+                    out.push((id, raw));
+                    let full = format!("{prefix}{p}");
+                    let kind = if links.contains(&full) { EntryKind::Symlink } else { EntryKind::File };
+                    here.insert(
+                        p.clone(),
+                        TreeEntry { name: p.clone(), kind, id, size: c.len() as u64, executable: exe.contains(&full), visibility: Default::default() },
+                    );
+                }
+            }
+        }
+        for (d, m) in sub {
+            let id = tree_of(&m, links, exe, &format!("{prefix}{d}/"), out);
+            here.insert(d.clone(), TreeEntry::dir(&d, id));
+        }
+        let raw = Object::Tree(Tree { entries: here.into_values().collect() }).encode();
+        let id = ObjectId::hash(&raw);
+        out.push((id, raw));
+        id
+    }
+
+    /// [`Hist::commit`] with symbolic links and executable files.
+    fn commit_with(th: &TestHub, h: &mut Hist, parents: &[ObjectId], files: Files, links: &[&str], exe: &[&str], change: [u8; 16], ts: i64) -> ObjectId {
+        let mut objects = Vec::new();
+        let links: BTreeSet<String> = links.iter().map(|s| s.to_string()).collect();
+        let exe: BTreeSet<String> = exe.iter().map(|s| s.to_string()).collect();
+        let tree = tree_of(&files, &links, &exe, "", &mut objects);
+        let s = Snapshot {
+            parents: parents.to_vec(),
+            change_id: veil_core::ChangeId(change),
+            tree,
+            description: Text::Plain(format!("change at {ts}")),
+            author: "gen".into(),
+            timestamp: ts,
+            predecessors: vec![],
+            conflicts: vec![],
+            embargo: None,
+            signature: None,
+        };
+        let raw = Object::Snapshot(s).encode();
+        let id = ObjectId::hash(&raw);
+        objects.push((id, raw));
+        h.put(th, objects);
+        th.rt.block_on(again(|| sqlx::query("INSERT INTO snapshots (project_id, id) VALUES ($1, $2) ON CONFLICT DO NOTHING").bind(h.id).bind(id.hex()).execute(&h.hub.db)));
+        h.files.insert(id, files);
+        h.parents.insert(id, parents.to_vec());
+        h.order.push(id);
+        id
+    }
+
+    /// The risk an admin's PR of `stack` (each change: its files, links,
+    /// executables) onto `base` is given.
+    fn risk_of_stack(base: &[(&str, &str)], stack: &[(&[(&str, &str)], &[&str], &[&str])]) -> String {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let mut files: Files = base.iter().map(|(p, c)| (p.to_string(), c.as_bytes().to_vec())).collect();
+        let b = commit_with(&th, &mut h, &[root_snapshot_id()], files.clone(), &[], &[], [1; 16], 1_000);
+        h.set_branch(&th, "main", b);
+        let mut tip = b;
+        for (i, (edits, links, exe)) in stack.iter().enumerate() {
+            for (p, c) in edits.iter() {
+                files.insert(p.to_string(), c.as_bytes().to_vec());
+            }
+            tip = commit_with(&th, &mut h, &[tip], files.clone(), links, exe, [2 + i as u8; 16], 2_000 + i as i64);
+        }
+        let (author, name) = person_row(&th, "author");
+        let v = th.rt.block_on(prs::create(&h.hub, &ask_as(&th, &h, &admin_of(author)), &caller(author, &name), CreatePr { head: tip.hex(), title: "risk".into(), ..Default::default() })).unwrap();
+        assert!(v["id"].is_string(), "the PR was made: {v}");
+        v["risk"].as_str().unwrap().to_string()
+    }
+
+    /// Guarantee 1, the cases of the corpus that hold: case and Unicode
+    /// tricks on `docs/` and `src/`, a `README.md` or `docs/x.md` that is a
+    /// folder, a name with a second extension, and an executable bit set in
+    /// one change of a stack and cleared in the next. (A tree holding both
+    /// `Src/` and `src/` is refused by every checkout on a case-insensitive
+    /// filesystem, `BuildReport::name_collisions`.)
+    #[test]
+    fn low_is_not_reached_by_case_or_shape_tricks() {
+        let rated = |p: &str| veil_server::prs::rules::classify(&[veil_server::prs::rules::FileChange { path: p.into(), secret: false, executable: false }], &Review::default()).0;
+        for p in [
+            "Docs/guide.md", "DOCS/guide.md", "d\u{043e}cs/guide.md", "docs/guide.md.sh", "docs/guide.md ", "docs/a.md/build.rs", "README.md/build.rs",
+            "README.md.exe", "README-build.sh", "docs/README.md/x.rs", "tests/pytest.ini", "tests/setup.cfg", "tests/sub/conftest.py", "tests/x.pyw",
+            "Tests/build.rs", "src/Tests/a.rs",
+        ] {
+            assert_ne!(rated(p), Risk::Low, "{p}");
+        }
+        // A file executable in the first change of a stack and not in the
+        // second: the stack's risk counts it.
+        let r = risk_of_stack(&[("pub/keep.rs", "fn keep() {}\n")], &[(&[("docs/run.md", "#!/bin/sh\nmake deploy\n")], &[], &["docs/run.md"]), (&[("docs/run.md", "#!/bin/sh\nmake deploy\n")], &[], &[])]);
+        assert_eq!(r, "normal", "an executable in any change of the stack");
+    }
+
+    /// BUG-1324: a symbolic link is rated by its name. A link at
+    /// `docs/env.md` or `README.md` pointing anywhere (outside the project:
+    /// a file of the machine that builds the docs or the package; inside:
+    /// any code) is "documentation", low risk, ready with no review. Doc
+    /// site generators and packagers follow links: the target's content is
+    /// published as the page or the package's README.
+    #[test]
+    #[ignore = "BUG-1324: a symbolic link named like documentation or a test is low risk"]
+    fn bug_1324_a_link_named_like_documentation_is_low_risk() {
+        let mut wrong = Vec::new();
+        for (path, target) in [("docs/env.md", "/proc/self/environ"), ("README.md", "../../.config/ci/credentials.toml"), ("tests/x.rs", "../src/lib.rs")] {
+            let r = risk_of_stack(&[("pub/keep.rs", "fn keep() {}\n")], &[(&[(path, target)], &[path], &[])]);
+            if r == "low" {
+                wrong.push(format!("{path} -> {target}: {r}"));
+            }
+        }
+        assert!(wrong.is_empty(), "links rated low:\n{}", wrong.join("\n"));
+    }
+
+    /// BUG-1325: low risk is decided from a path's name, but what runs is
+    /// decided by the project's own build. In a VitePress site (`docs/`
+    /// with `docs/.vitepress/`), every `docs/*.md` is compiled to a Vue
+    /// component: a `<script setup>` block runs at build time on the CI
+    /// and in every reader's browser (Docusaurus does the same with MDX,
+    /// its default for `.md`). A `test/` script that `package.json` runs
+    /// on every `npm install` (`postinstall`) is "test source code". Both
+    /// are low risk and ready with no review.
+    #[test]
+    #[ignore = "BUG-1325: Markdown a doc site compiles, and test files the build runs, are low risk"]
+    fn bug_1325_files_the_projects_build_runs_are_low_risk() {
+        let site = [
+            ("package.json", "{\"scripts\": {\"docs:build\": \"vitepress build docs\", \"postinstall\": \"node test/setup.js\"}, \"devDependencies\": {\"vitepress\": \"1.6.3\"}}\n"),
+            ("docs/.vitepress/config.mts", "export default { title: 'Site' }\n"),
+            ("docs/index.md", "# Welcome\n"),
+            ("test/setup.js", "console.log('fixtures ready')\n"),
+        ];
+        let mut wrong = Vec::new();
+        let script = "# Welcome\n\n<script setup>\nimport { publish } from '../scripts/release.js'\npublish({ token: process.env.NPM_TOKEN })\n</script>\n";
+        let r = risk_of_stack(&site, &[(&[("docs/index.md", script)], &[], &[])]);
+        if r == "low" {
+            wrong.push(format!("docs/index.md with a <script setup> in a VitePress site: {r}"));
+        }
+        let r = risk_of_stack(&site, &[(&[("test/setup.js", "require('../scripts/release.js').publish()\n")], &[], &[])]);
+        if r == "low" {
+            wrong.push(format!("test/setup.js, run by every npm install (postinstall): {r}"));
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Guarantee 2, what holds: a revision that drops the held change
+    /// (revision 2 holds only a new change) keeps the PR held, as the
+    /// union of its revisions' change ids; a split of the stack into a PR
+    /// of its lower change keeps that PR held.
+    #[test]
+    fn a_request_for_changes_survives_revisions_that_drop_its_change() {
+        let Held { th, mut h, alice, bob, cy, id, .. } = held();
+        let hub = h.hub.clone();
+        let me = caller(bob.0, &bob.1);
+        let reasons = |h: &Hist, pr: &str| -> Value { th.rt.block_on(prs::show(&hub, &member(&th, h, bob.0), pr)).unwrap()["review"].clone() };
+        // A split: a stack of the held change and one above it, then a PR
+        // of the held change alone (the feature branch) beside it.
+        let mut f = h.files[&h.branches["feature"]].clone();
+        f.insert("pub/more.rs".into(), b"fn more() {}\n".to_vec());
+        let top = h.commit(&th, &[h.branches["feature"]], f, [4; 16], 5_000, None);
+        h.set_branch(&th, "two", top);
+        let two = pr_id(th.rt.block_on(prs::create(&hub, &member(&th, &h, bob.0), &me, CreatePr { head: "two".into(), title: "two".into(), ..Default::default() })).unwrap());
+        let lower = pr_id(th.rt.block_on(prs::create(&hub, &member(&th, &h, bob.0), &me, CreatePr { head: "feature".into(), title: "lower".into(), ..Default::default() })).unwrap());
+        for pr in [&two, &lower] {
+            let r = reasons(&h, pr);
+            assert!(r["ready"] == false && r["reasons"].to_string().contains(&format!("{} asked for changes", alice.1)), "{pr}: {r}");
+        }
+        // Revision 2 of the first PR drops the held change: a new change
+        // (another id) on main.
+        let mut f2 = h.files[&h.branches["main"]].clone();
+        f2.insert("pub/auth.rs".into(), b"fn check() { verify(); log() }\n".to_vec());
+        let r2 = h.commit(&th, &[h.branches["main"]], f2, [5; 16], 6_000, None);
+        h.set_branch(&th, "feature", r2);
+        let v = th.rt.block_on(prs::add_revision(&hub, &member(&th, &h, bob.0), &me, &id, RevisionRequest { head: "feature".into() })).unwrap();
+        assert_eq!(v["revision"], 2, "{v}");
+        put_review(&th, &h, &id, 2, cy.0, "approve", v["patch"].as_str().unwrap());
+        let r = reasons(&h, &id);
+        assert_eq!(r["approvals"], 1, "cy's approval of revision 2 counts: {r}");
+        assert!(r["ready"] == false && r["reasons"].to_string().contains(&format!("{} asked for changes", alice.1)), "revision 2 dropped the held change: {r}");
+    }
+
+    /// BUG-1323: a request for changes is attached to change ids, and a
+    /// change id is whatever the client writes in its snapshot. (1) The
+    /// author makes the same changes under a new id (`vl duplicate`, or
+    /// any new commit of the same files) and opens a PR of them: cy's one
+    /// approval makes it ready, past alice's request. (2) Someone else
+    /// writes a change of their own under cy's change id: alice's request
+    /// for changes of it holds cy's PR, which she never reviewed.
+    #[test]
+    #[ignore = "BUG-1323: holds follow change ids, which the client chooses: a new id escapes, a borrowed one holds another's PR"]
+    fn bug_1323_change_ids_are_the_clients_to_choose() {
+        let Held { th, mut h, alice, bob, cy, id, team } = held();
+        let hub = h.hub.clone();
+        let mut wrong = Vec::new();
+        // (1) The same files under a new id, in a new PR.
+        let me = caller(bob.0, &bob.1);
+        let closed = th.rt.block_on(prs::close(&hub, &member(&th, &h, bob.0), &me, &id)).unwrap();
+        assert_eq!(closed["state"], "closed", "{closed}");
+        let same = h.files[&h.branches["feature"]].clone();
+        let renewed = h.commit(&th, &[h.branches["main"]], same.clone(), [9; 16], 2_500, None);
+        assert_eq!(h.files[&renewed], h.files[&h.branches["feature"]], "the same files");
+        h.set_branch(&th, "feature-again", renewed);
+        let v = th.rt.block_on(prs::create(&hub, &member(&th, &h, bob.0), &me, CreatePr { head: "feature-again".into(), title: "drop the check".into(), ..Default::default() })).unwrap();
+        let new_pr = pr_id(v.clone());
+        put_review(&th, &h, &new_pr, 1, cy.0, "approve", v["patch"].as_str().unwrap());
+        let r = th.rt.block_on(prs::show(&hub, &member(&th, &h, bob.0), &new_pr)).unwrap()["review"].clone();
+        assert_eq!(r["approvals"], 1, "{r}");
+        if r["ready"] == true {
+            wrong.push(format!("the same changes under a new change id are ready past {}'s request: {r}", alice.1));
+        }
+        // (2) cy's own PR, approved by bob: ready.
+        let mut fv = h.files[&h.branches["main"]].clone();
+        fv.insert("pub/victim.rs".into(), b"fn victim() {}\n".to_vec());
+        let vs = h.commit(&th, &[h.branches["main"]], fv, [7; 16], 5_000, None);
+        h.set_branch(&th, "cy-work", vs);
+        let v = th.rt.block_on(prs::create(&hub, &member(&th, &h, cy.0), &caller(cy.0, &cy.1), CreatePr { head: "cy-work".into(), title: "cy's".into(), ..Default::default() })).unwrap();
+        let cys = pr_id(v.clone());
+        put_review(&th, &h, &cys, 1, bob.0, "approve", v["patch"].as_str().unwrap());
+        let ready = |h: &Hist| th.rt.block_on(prs::show(&hub, &member(&th, h, cy.0), &cys)).unwrap()["review"].clone();
+        assert_eq!(ready(&h)["ready"], true, "before: {}", ready(&h));
+        // mal writes a change of their own under cy's change id; alice
+        // asks for changes of it.
+        let (mal, mal_name) = person_row(&th, "mal");
+        th.rt.block_on(again(|| sqlx::query("INSERT INTO group_members (group_id, person_id) VALUES ($1, $2)").bind(team).bind(mal).execute(&hub.db)));
+        let mut fm = h.files[&h.branches["main"]].clone();
+        fm.insert("pub/junk.rs".into(), b"fn junk() { panic!() }\n".to_vec());
+        let ms = h.commit(&th, &[h.branches["main"]], fm, [7; 16], 6_000, None);
+        h.set_branch(&th, "mal-work", ms);
+        let v = th.rt.block_on(prs::create(&hub, &member(&th, &h, mal), &caller(mal, &mal_name), CreatePr { head: "mal-work".into(), title: "junk".into(), ..Default::default() })).unwrap();
+        let mals = pr_id(v.clone());
+        put_review(&th, &h, &mals, 1, alice.0, "request-changes", v["patch"].as_str().unwrap());
+        let r = ready(&h);
+        if r["ready"] != true {
+            wrong.push(format!("cy's PR, which {} never reviewed, is held by her request on mal's change of the same id: {r}", alice.1));
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Guarantee 5 through holds: a request for changes given on a PR a
+    /// viewer cannot see (it also touches `fin/`) holds a public PR of one
+    /// of its changes; the viewer is told who asked, and nothing of the
+    /// hidden PR: no `fin/` path, no hidden change id, no hidden PR id.
+    #[test]
+    fn a_hold_from_a_hidden_pr_names_only_its_reviewer() {
+        let Held { th, mut h, alice, bob, cy, .. } = held();
+        let hub = h.hub.clone();
+        let main = h.branches["main"];
+        let mut f1 = h.files[&main].clone();
+        f1.insert("pub/shared.rs".into(), b"fn shared() {}\n".to_vec());
+        let c = h.commit(&th, &[main], f1.clone(), [5; 16], 5_000, None);
+        let mut f2 = f1;
+        f2.insert("fin/payroll-7f3a.txt".into(), b"MARKER-PAYROLL-9b1e44c0\n".to_vec());
+        let d = h.commit(&th, &[c], f2, [6; 16], 6_000, None);
+        h.set_branch(&th, "shared", c);
+        h.set_branch(&th, "fin-stack", d);
+        let me = caller(bob.0, &bob.1);
+        let v = th.rt.block_on(prs::create(&hub, &member(&th, &h, bob.0), &me, CreatePr { head: "fin-stack".into(), title: "payroll".into(), ..Default::default() })).unwrap();
+        let hidden = pr_id(v.clone());
+        put_review(&th, &h, &hidden, 1, cy.0, "request-changes", v["patch"].as_str().unwrap());
+        let public = pr_id(th.rt.block_on(prs::create(&hub, &member(&th, &h, bob.0), &me, CreatePr { head: "shared".into(), title: "shared".into(), ..Default::default() })).unwrap());
+        // Alice reads pub/ only.
+        let alice_ask = member(&th, &h, alice.0);
+        assert!(th.rt.block_on(prs::show(&hub, &alice_ask, &hidden)).is_err(), "alice cannot see the payroll PR");
+        let v = th.rt.block_on(prs::show(&hub, &alice_ask, &public)).unwrap();
+        let text = v.to_string();
+        assert!(v["review"]["reasons"].to_string().contains(&format!("{} asked for changes", cy.1)), "{v}");
+        let d_change = veil_core::ChangeId([6; 16]).to_string();
+        for needle in ["fin/", "payroll", "MARKER-PAYROLL-9b1e44c0", hidden.as_str(), d_change.as_str()] {
+            assert!(!text.contains(needle), "{needle} in alice's answer: {text}");
+        }
+    }
+
+    /// A landing on `main` from `old` to `new` with `file`, as the push and
+    /// the API commit write it: the branch's compare-and-swap, then the
+    /// record, in one transaction (again on a retryable error).
+    async fn land(hub: &Arc<veil_server::Hub>, project: i64, old: ObjectId, new: ObjectId, file: RulesFile) {
+        for _ in 0..50 {
+            let r: Result<(), sqlx::Error> = async {
+                let mut tx = hub.db.begin().await?;
+                let n = sqlx::query("UPDATE branches SET target = $1 WHERE project_id = $2 AND name = 'main' AND target = $3")
+                    .bind(new.hex())
+                    .bind(project)
+                    .bind(old.hex())
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                assert_eq!(n, 1, "main moved from {old} to {new}");
+                record_landing(&mut tx, project, &Landing { old: Some(old), new, file: file.clone(), fast_forward: true }).await.map_err(|e| sqlx::Error::Protocol(format!("{e:?}")))?;
+                tx.commit().await
+            }
+            .await;
+            match r {
+                Ok(()) => return,
+                Err(e) => {
+                    eprintln!("landing again: {e}");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+        panic!("the landing never committed");
+    }
+
+    const STRICTER: &str = "[review]\nnormal = { approvals = 3 }\n";
+    const BROKEN: &str = "[review\nnormal = { approvals = 3 }\n";
+
+    /// BUG-1322: a reader brings the record "up" to a tip it read before a
+    /// landing moved both, and moves it back. `rules_in_force` reads the
+    /// branch's tip, then the tip's file, then the record: a landing that
+    /// commits in between leaves it with an old tip and a newer record,
+    /// whose tip is no ancestor of the old one, so it rules `strict` and
+    /// its compare-and-swap (on the record's tip, which it just read)
+    /// succeeds: the record now says `strict` at an older tip, and the
+    /// next landing finds no state at the tip it moved from. Here: the
+    /// admins' `normal = 3`, then a broken file; 60 landings of other
+    /// files (each keeps the state) while PR requests on two servers read
+    /// the rules. Normal risk falls to `strict`'s one approval, for good.
+    #[test]
+    #[ignore = "BUG-1322: a PR request racing a landing moves the rules record back, to strict"]
+    fn bug_1322_a_reader_racing_a_landing_moves_the_record_back() {
+        let th = TestHub::start();
+        let th2 = TestHub::beside(&th);
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let (hub1, hub2) = (h.hub.clone(), th2.hub());
+        let mut base = Files::new();
+        base.insert("pub/keep.rs".into(), b"fn keep() {}\n".to_vec());
+        base.insert(".veilrules".into(), STRICTER.as_bytes().to_vec());
+        let c0 = h.commit(&th, &[root_snapshot_id()], base.clone(), [1; 16], 1_000, None);
+        h.set_branch(&th, "main", c0);
+        let first = th.rt.block_on(prs::rules_of_project(&hub1, h.id, "main")).unwrap();
+        assert_eq!(first.need(Risk::Normal).approvals, 3, "{first:?}");
+        base.insert(".veilrules".into(), BROKEN.as_bytes().to_vec());
+        let mut tips = vec![c0];
+        for i in 0..61u8 {
+            base.insert(format!("pub/l{i}.rs"), b"fn l() {}\n".to_vec());
+            let c = h.commit(&th, &[*tips.last().unwrap()], base.clone(), [10 + i; 16], 2_000 + i as i64, None);
+            tips.push(c);
+        }
+        let broken = RulesFile::Broken(Review::parse(Some(BROKEN.as_bytes())));
+        let id = h.id;
+        let (low, landed_state) = th.rt.block_on(async {
+            land(&hub1, id, tips[0], tips[1], broken.clone()).await;
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut readers = Vec::new();
+            for k in 0..8 {
+                let hub = if k % 2 == 0 { hub1.clone() } else { hub2.clone() };
+                let stop = stop.clone();
+                readers.push(tokio::spawn(async move {
+                    let mut seen = Vec::new();
+                    while !stop.load(Ordering::SeqCst) {
+                        let n = prs::rules_of_project(&hub, id, "main").await.unwrap().need(Risk::Normal).approvals;
+                        if n != 3 {
+                            seen.push(n);
+                        }
+                    }
+                    seen
+                }));
+            }
+            for w in tips[1..].windows(2) {
+                land(&hub1, id, w[0], w[1], broken.clone()).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            stop.store(true, Ordering::SeqCst);
+            let mut low = Vec::new();
+            for r in readers {
+                low.extend(r.await.unwrap());
+            }
+            let state: String = sqlx::query_scalar("SELECT state FROM pr_review_rules WHERE project_id = $1").bind(id).fetch_one(&hub1.db).await.unwrap();
+            (low, state)
+        });
+        let after = th.rt.block_on(prs::rules_of_project(&hub1, h.id, "main")).unwrap().need(Risk::Normal).approvals;
+        let state: RulesState = serde_json::from_str(&landed_state).unwrap();
+        assert!(
+            low.is_empty() && after == 3 && state == RulesState::File { text: STRICTER.into() },
+            "{} PR requests saw normal risk need {:?} approvals (want 3); after the landings it needs {after}; the record says {state:?}",
+            low.len(),
+            low.iter().collect::<BTreeSet<_>>()
+        );
+    }
+
+    /// BUG-1321 (pre-existing: `sync::check_changes`, BUG-820's class): a
+    /// merge's changes are checked against its first parent only, so a
+    /// merge whose *first* parent is an older snapshot takes that
+    /// snapshot's version of every path back, unchecked, and is a
+    /// fast-forward of the tip (its other parent). carol reads the root's
+    /// published `.veilrules` and `src/` (`public devs`) and may write
+    /// neither: she pushes such a merge and `main` gets the older
+    /// `.veilrules` (normal risk: 3 approvals back to 1) and the older
+    /// `src/lib.rs` (a dev's fix undone). BUG-820's test puts the tip first.
+    #[test]
+    #[ignore = "BUG-1321: a merge whose first parent is older takes back files the pusher may not write"]
+    fn bug_1321_a_merge_with_an_older_first_parent_takes_back_files_the_pusher_may_not_write() {
+        let th = TestHub::start();
+        let p = setup_project(&th);
+        let hub = th.hub();
+        let api = th.api();
+        let pid: i64 = th.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hub.db)).unwrap();
+        // The admins publish their review rules (read by all, written by
+        // admins only), then raise them.
+        p.admin.ok(&p.dir, &["access", ".veilrules", "public"]);
+        write_files(&p.dir, &[(".veilrules", "[review]\nnormal = { approvals = 1 }\n")]);
+        p.admin.commit_main(&p.dir, "review rules");
+        p.admin.ok(&p.dir, &["push"]);
+        write_files(&p.dir, &[(".veilrules", STRICTER)]);
+        p.admin.commit_main(&p.dir, "stricter review");
+        p.admin.ok(&p.dir, &["push"]);
+        // A dev's fix of src/lib.rs.
+        let mut f = Craft::new(&api, &p.dev, &p.name, "main");
+        f.file("src/lib.rs", "fixed: MARKER-THE-FIX-77d0");
+        let r = f.push("main", "security fix");
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", String::from_utf8_lossy(&r.body));
+        let rules = || th.rt.block_on(prs::rules_of_project(&hub, pid, "main")).unwrap().need(Risk::Normal).approvals;
+        assert_eq!(rules(), 3, "the admins' rules");
+        // carol: the snapshot before the stricter rules, as she sees it.
+        let token = p.carol.token();
+        let tip = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+        let older = {
+            let mut s = tip;
+            for _ in 0..2 {
+                let h = api.post_json(Some(&token), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [s.hex()]}));
+                let (_, raw) = h.frames().into_iter().find(|(id, _)| *id == s).unwrap();
+                let Object::Snapshot(snap) = Object::decode(&raw).unwrap() else { panic!() };
+                s = snap.parents[0];
+            }
+            s
+        };
+        let older_tree = {
+            let h = api.post_json(Some(&token), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [older.hex()]}));
+            let (_, raw) = h.frames().into_iter().find(|(id, _)| *id == older).unwrap();
+            let Object::Snapshot(snap) = Object::decode(&raw).unwrap() else { panic!() };
+            snap.tree
+        };
+        let mut c = Craft::new(&api, &p.carol, &p.name, "main");
+        c.root = older_tree;
+        let (_, r) = c.push_edited("main", Some(tip), |s| s.parents = vec![older, tip]);
+        assert_eq!(r.status, 403, "carol's merge landed: {}", String::from_utf8_lossy(&r.body));
+        assert_eq!(api.tips(Some(&token), &p.name).unwrap().branches["main"], tip, "main did not move");
+        assert_eq!(rules(), 3, "the rules in force");
+    }
+
+    /// Guarantee 4, measured in a process of its own: a PR answer with
+    /// 2,000 reviewers' current approvals, each with a 64 KiB text, holds
+    /// at most a few MiB more than before it (the texts it reads are
+    /// within 256 KiB), and says how long the gate took (it asks each
+    /// approving reviewer's access once).
+    #[test]
+    fn a_pr_answer_with_many_reviews_holds_little() {
+        if in_own_process("prs::s21_redesign::a_pr_answer_with_many_reviews_holds_little") {
+            return;
+        }
+        let Held { th, h, id, .. } = held();
+        let hub = h.hub.clone();
+        let patch: String = th.rt.block_on(sqlx::query_scalar("SELECT patch FROM pr_revisions WHERE project_id = $1 AND pr = $2 AND n = 1").bind(h.id).bind(&id).fetch_one(&hub.db)).unwrap();
+        let tag = format!("m{}", &id[3..]);
+        th.rt.block_on(again(|| sqlx::query("INSERT INTO people (name, created_at) SELECT $1 || '-' || i, 0 FROM generate_series(1, 2000) AS i ON CONFLICT DO NOTHING").bind(&tag).execute(&hub.db)));
+        th.rt.block_on(again(|| {
+            sqlx::query(
+                "INSERT INTO pr_reviews (project_id, pr, revision, person, verdict, patch, agent, device, signature, body, at) \
+                 SELECT $1, $2, 1, p.id, 'approve', $4, FALSE, '', '', md5(p.id::text) || repeat('r', 65504), p.id FROM people p WHERE p.name LIKE $3 || '-%' \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(h.id)
+            .bind(&id)
+            .bind(&tag)
+            .bind(&patch)
+            .execute(&hub.db)
+        }));
+        let ask = ask_as(&th, &h, &Viewer::default());
+        let warm = th.rt.block_on(prs::show(&hub, &ask, &id)).unwrap();
+        assert!(warm["review"]["reviews_total"].as_u64().unwrap() >= 2000, "{}", warm["review"]["reviews_total"]);
+        reset_peak();
+        let before = peak_kb();
+        let t = Instant::now();
+        let v = th.rt.block_on(prs::show(&hub, &ask, &id)).unwrap();
+        let took = t.elapsed();
+        let grew = peak_kb().saturating_sub(before);
+        assert!(v["review"]["reviews"].as_array().unwrap().len() <= 100, "{}", v["review"]["reviews"].as_array().unwrap().len());
+        eprintln!("a PR answer with 2,000 reviews: grew by {grew} kB, {:?}, {} bytes", took, v.to_string().len());
+        assert!(grew < 16 << 10, "a PR answer grew by {grew} kB");
+    }
+
+    /// Push latency on the default branch (the record is written in every
+    /// landing's transaction): 40 API commits and 40 pushes to `main`,
+    /// p50 and p99 of each. Ignored: a measurement, run by hand on each
+    /// database (`docs/BUGS.md`, "S21 redesign", has the numbers).
+    #[test]
+    #[ignore = "measurement: run by hand"]
+    fn s21_push_latency_on_the_default_branch() {
+        let th = TestHub::start();
+        let p = setup_project(&th);
+        let api = th.api();
+        let admin = p.admin.token();
+        let pct = |v: &mut Vec<Duration>, q: f64| {
+            v.sort();
+            v[((v.len() as f64 - 1.0) * q).round() as usize]
+        };
+        let mut commits = Vec::new();
+        for i in 0..40 {
+            let base = api.tips(Some(&admin), &p.name).unwrap().branches["main"];
+            let t = Instant::now();
+            let r = api.post_json(Some(&admin), &format!("/v1/projects/{}/changes", p.name), &json!({"base": base.hex(), "edits": [{"path": format!("src/c{i}.rs"), "put": {"text": "fn c() {}\n"}}], "onto": {"branch": "main", "expected": "rebase"}}));
+            commits.push(t.elapsed());
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            assert_eq!(r.json()["branch"]["status"], "ok", "{}", String::from_utf8_lossy(&r.body));
+        }
+        let mut pushes = Vec::new();
+        for i in 0..40 {
+            let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+            c.file(&format!("src/p{i}.rs"), "fn p() {}\n");
+            let t = Instant::now();
+            let r = c.push("main", "push");
+            pushes.push(t.elapsed());
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", String::from_utf8_lossy(&r.body));
+        }
+        eprintln!(
+            "S21-LATENCY api commit p50 {:?} p99 {:?}; push p50 {:?} p99 {:?}",
+            pct(&mut commits, 0.5),
+            pct(&mut commits, 0.99),
+            pct(&mut pushes, 0.5),
+            pct(&mut pushes, 0.99)
+        );
     }
 }
