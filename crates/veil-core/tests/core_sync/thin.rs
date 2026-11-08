@@ -470,7 +470,7 @@ fn every_site_that_reads_missing_as_hidden_is_audited() {
         ("gc.rs", 4, "a thin clone's mark skips only a gap of the server's history (classify_gap)"),
         ("hub/project.rs", 2, "the server's own projection"),
         ("maintenance.rs", 2, "fetching off"),
-        ("promisor.rs", 7, "the read path itself; a checkout's prefetch leaves a refused object for its reader, who finds it hidden"),
+        ("promisor.rs", 9, "the read path itself; a checkout's prefetch leaves a refused object for its reader, who finds it hidden; read_at (S8): a mount's read at one path, Missing only from the server's refusal there"),
         ("remote.rs", 9, "transfers between local repositories (test fixtures); the server checks closure itself"),
         ("repo.rs", 2, "snapshot_held: a snapshot beyond the boundary; snapshot reads fetch history pages there"),
         ("sandbox.rs", 3, "a hidden file is not given to the sandbox"),
@@ -492,7 +492,7 @@ fn every_site_that_reads_missing_as_hidden_is_audited() {
 fn every_producer_of_missing_is_audited() {
     const PRODUCERS: &[(&str, usize, &str)] = &[
         ("hub/project.rs", 2, "the server's projection: an object its store lacks"),
-        ("promisor.rs", 3, "fetching off (gc, fsck, maintenance: classified); a snapshot beyond the boundary; the server's refusal under a snapshot on the server"),
+        ("promisor.rs", 5, "fetching off (gc, fsck, maintenance: classified); a snapshot beyond the boundary; the server's refusal under a snapshot on the server; read_at (S8, BUG-1460): fetching off, and the server's refusal at the one place asked"),
         ("repo.rs", 1, "Repo::snapshot: the server has no such snapshot in this person's history (after a page was asked)"),
         ("store.rs", 1, "the main store's read: then the cache, then the server (read_partial)"),
     ];

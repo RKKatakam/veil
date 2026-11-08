@@ -2903,10 +2903,13 @@ protocol or server change.
     a sealed secret and a conflicted file are read whole when read;
     recording reads changed files as any snapshot does.
   * the locator keeps every place an object was met at (up to 8 besides
-    the first), and a refusal at one place is asked again at the others
-    before it is final: every fetch (checkout, prefetch, the fallback, the
-    mount) reads content refused at one path where it is readable
-    (BUG-1460).
+    the first). A reader by id (a checkout, prefetch, the fallback) asks
+    again at the others before a refusal is final, so content refused at
+    one path is read where it is readable; the mount, a reader by path,
+    asks only at the path it reads, and serves content known at several
+    places at a path only once the server said yes there: a refusal stays
+    with its path (BUG-1460). A batch under a local change is asked under
+    its nearest server ancestor, one request a folder.
   * refusals are kept by path, and every lookup asks for what it fetches
     at the path it reads (`place_along`): the same content elsewhere,
     refused at one path, reads at another (BUG-1367). Fetching is switched

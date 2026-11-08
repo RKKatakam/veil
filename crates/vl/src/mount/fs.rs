@@ -431,6 +431,10 @@ fn refused(path: &VPath) -> bool {
     }
 }
 
+/// The paths whose content, known at several places, the server served at
+/// that path in this process (BUG-1460): read as held from then on.
+static ALLOWED: std::sync::LazyLock<Mutex<HashSet<(VPath, ObjectId)>>> = std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
 /// Large files known to be plain blobs (BUG-1461): decided once a process.
 static PLAIN_LARGE: std::sync::LazyLock<Mutex<HashSet<ObjectId>>> = std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -571,14 +575,49 @@ impl ReaderView {
             return;
         }
         let Ok(t) = self.store.tree(&e.id) else { return };
-        let want: Vec<(ObjectId, u64)> = t
+        // Each at its own path, a refused one left (BUG-1460).
+        let want: Vec<(VPath, ObjectId, u64)> = t
             .entries
             .iter()
             .filter(|c| matches!(c.kind, EntryKind::File | EntryKind::Symlink) && c.size <= FOLDER_FILE_LIMIT && !self.store.has(&c.id))
-            .map(|c| (c.id, c.size))
+            .map(|c| (dir.join(&c.name), c.id, c.size))
             .collect();
         if !want.is_empty() {
-            let _ = self.store.prefetch(want);
+            let _ = self.store.prefetch_at(&self.view.root(), &want);
+        }
+    }
+
+    /// In a thin clone, have what is at `path` by the server's answer for
+    /// that path (BUG-1460): an object not held is asked for there and
+    /// nowhere else (its folder's small files with it); one held whose
+    /// content this process met at other places too is asked for there
+    /// once (then the answer for the path stands). Content met at one place
+    /// only is read as held. A refusal hides the path (`EACCES` now,
+    /// absent from then on).
+    fn answer_for(&self, e: &TreeEntry, path: &VPath) -> VResult<()> {
+        if !self.store.is_partial() || e.kind == EntryKind::Dir {
+            return Ok(());
+        }
+        let held = self.store.has(&e.id);
+        let shared = self.store.places_known(&e.id) > 1;
+        let key = (path.clone(), e.id);
+        if held && (!shared || ALLOWED.lock().unwrap_or_else(|p| p.into_inner()).contains(&key)) {
+            return Ok(());
+        }
+        if !held {
+            self.prefetch_folder(&path.parent().unwrap_or_else(VPath::root));
+        }
+        match self.store.read_at(&e.id, &self.view.root(), path, shared) {
+            Ok(_) => {
+                ALLOWED.lock().unwrap_or_else(|p| p.into_inner()).insert(key);
+                Ok(())
+            }
+            Err(err) => {
+                if err.is_unreadable() && e.visibility.key_scope().is_none() {
+                    REFUSED.lock().unwrap_or_else(|p| p.into_inner()).insert(path.clone(), std::time::Instant::now());
+                }
+                Err(err)
+            }
         }
     }
 }
@@ -596,12 +635,7 @@ impl Lower for ReaderView {
         if e.kind != EntryKind::File || e.visibility.key_scope().is_some() {
             return Ok(None);
         }
-        if self.store.is_partial() && !self.store.has(&e.id) {
-            if let Err(err) = self.store.get_raw(&e.id) {
-                self.note_refusal(&e, path, &err);
-                return Err(err);
-            }
-        }
+        self.answer_for(&e, path)?;
         self.store.copy_loose_blob(&e.id, out)
     }
 
@@ -639,9 +673,7 @@ impl StorageBackend for ReaderView {
     fn read(&self, path: &VPath) -> VResult<Vec<u8>> {
         match self.entry(path)? {
             Some(e) => {
-                if self.store.is_partial() && !self.store.has(&e.id) {
-                    self.prefetch_folder(&path.parent().unwrap_or_else(VPath::root));
-                }
+                self.answer_for(&e, path)?;
                 let r = self.view.read(path);
                 if let Err(err) = &r {
                     self.note_refusal(&e, path, err);

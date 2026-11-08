@@ -937,11 +937,95 @@ impl ObjectStore {
         self.ensure_held(p, ids)
     }
 
+    /// [`ObjectStore::prefetch`] of the entries at `paths` below `root`,
+    /// each asked for at its own path, and one refused there left for its
+    /// reader (never asked for at another place: the mount answers by
+    /// path, BUG-1460).
+    pub fn prefetch_at(&self, root: &ObjectId, paths: &[(VPath, ObjectId, u64)]) -> Result<()> {
+        let Some(p) = self.partial.get() else { return Ok(()) };
+        if !self.fetching(p) {
+            return Ok(());
+        }
+        for (path, _, _) in paths {
+            self.place_along(root, path);
+        }
+        self.ensure_held_as(p, paths.iter().map(|(_, id, size)| (*id, *size)).collect(), false)
+    }
+
+    /// `id` asked for at `(snapshot, path)` only: under the snapshot, or, if
+    /// it is a local change, at the same path under its nearest ancestors
+    /// on the server (BUG-1144). The object, or whether the server refused
+    /// it there.
+    fn fetch_here(&self, p: &Partial, promisor: &dyn Promisor, id: &ObjectId, snapshot: ObjectId, path: &str) -> Result<(Option<Vec<u8>>, bool)> {
+        let mut got = promisor.fetch(&[Located { id: *id, snapshot, path: path.to_string() }])?.pop().flatten();
+        let mut refused = got.is_none() && self.on_server(p, promisor, &snapshot);
+        if got.is_none() && !refused {
+            for t in self.server_ancestors(p, promisor, &snapshot) {
+                got = promisor.fetch(&[Located { id: *id, snapshot: t, path: path.to_string() }])?.pop().flatten();
+                if got.is_some() {
+                    break;
+                }
+                refused |= self.names_held(&t, path, id);
+            }
+        }
+        Ok((got, refused))
+    }
+
+    /// How many places this process met `id` at (0 if none recorded).
+    pub fn places_known(&self, id: &ObjectId) -> usize {
+        self.partial.get().map_or(0, |p| p.locator.lock().unwrap_or_else(|e| e.into_inner()).all(id).len())
+    }
+
+    /// The object at `path` below `root` (a tree of this clone), asked of
+    /// the server at that place and nowhere else (the mount's read: the
+    /// server decides by path, so content refused here is not taken from
+    /// another place it was met at, BUG-1460). `ask`: ask even if held (the
+    /// same content is known at other places, and this path has no answer
+    /// yet). The server's refusal there is `Missing`; no answer is
+    /// `Unavailable`.
+    pub fn read_at(&self, id: &ObjectId, root: &ObjectId, path: &VPath, ask: bool) -> Result<Vec<u8>> {
+        let Some(p) = self.partial.get() else { return self.read_raw(id) };
+        if !ask && self.has(id) {
+            return self.read_raw(id);
+        }
+        if !self.fetching(p) {
+            return Err(VeilError::Missing(*id));
+        }
+        self.place_along(root, path);
+        let Some((snapshot, at)) = self.locate(p, id)?.filter(|(_, at)| at == path.as_str()) else {
+            return Err(VeilError::Unavailable(format!("'{path}': its place could not be told; run the command again")));
+        };
+        let Some(promisor) = self.promisor() else {
+            return Err(VeilError::Unavailable(format!("'{path}' needs the server of this thin clone, and this command has no connection to it")));
+        };
+        let (got, refused) = self.fetch_here(p, &*promisor, id, snapshot, &at)?;
+        match got {
+            Some(raw) => {
+                if !self.has(id) {
+                    self.keep_fetched(p, id, &raw)?;
+                    p.fetched.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(raw)
+            }
+            None if refused => Err(VeilError::Missing(*id)),
+            None => Err(VeilError::Unavailable(format!(
+                "'{path}' is not fetched, and the server has no copy of it there; run `vl pull`, or `vl partial full`"
+            ))),
+        }
+    }
+
     /// Fetch those of `ids` neither area holds, in batches of their
     /// locations; one the server refuses is left for its reader (who finds
     /// it hidden), one without a location is read the ordinary way.
     /// `ids` with the sizes tree entries give them (0 where unknown).
     fn ensure_held(&self, p: &Partial, ids: Vec<(ObjectId, u64)>) -> Result<()> {
+        self.ensure_held_as(p, ids, true)
+    }
+
+    /// [`ObjectStore::ensure_held`]; one refused at its place is asked for
+    /// again at its other places when `elsewhere` (a reader by id), else
+    /// left (a reader by path: the mount, whose reader decides).
+    fn ensure_held_as(&self, p: &Partial, ids: Vec<(ObjectId, u64)>, elsewhere: bool) -> Result<()> {
         let _ = (self.ensure_packs(), p.cache.ensure_packs());
         let missing: Vec<(ObjectId, u64)> = ids
             .into_iter()
@@ -956,9 +1040,21 @@ impl ObjectStore {
             ));
         };
         let mut wants = Vec::new();
+        // A place under a local change (a workspace's own `@`) is asked for
+        // under its nearest ancestor on the server whose held tree names the
+        // same object there: the server answers the batch at once instead
+        // of refusing it and being asked object by object.
+        let mut on_server: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
         for (id, size) in missing {
             match self.locate(p, &id)? {
-                Some((snapshot, path)) => wants.push((Located { id, snapshot, path }, size)),
+                Some((snapshot, path)) => {
+                    let ancestors = on_server.entry(snapshot).or_insert_with(|| match self.on_server(p, &*promisor, &snapshot) {
+                        true => vec![snapshot],
+                        false => self.server_ancestors(p, &*promisor, &snapshot),
+                    });
+                    let snapshot = ancestors.iter().copied().find(|a| *a == snapshot || self.names_held(a, &path, &id)).unwrap_or(snapshot);
+                    wants.push((Located { id, snapshot, path }, size))
+                }
                 // Read the ordinary way: `Unavailable` (never hidden).
                 None => {
                     self.read_raw(&id)?;
@@ -1002,11 +1098,22 @@ impl ObjectStore {
             incoming.finish()?;
             flight.landed();
             // Asked again the ordinary way: other places, then `Missing`
-            // (hidden) or `Unavailable`.
+            // (hidden) or `Unavailable`. For a reader by path, at the same
+            // place only (under the server's ancestors of a local change).
             for id in refused {
-                match self.read_raw(&id) {
-                    Ok(_) | Err(VeilError::Missing(_)) => {}
-                    Err(e) => return Err(e),
+                if elsewhere {
+                    match self.read_raw(&id) {
+                        Ok(_) | Err(VeilError::Missing(_)) => {}
+                        Err(e) => return Err(e),
+                    }
+                    continue;
+                }
+                let Some((snapshot, path)) = self.locate(p, &id)? else { continue };
+                if let (Some(raw), _) = self.fetch_here(p, &*promisor, &id, snapshot, &path)? {
+                    if !self.has(&id) {
+                        self.keep_fetched(p, &id, &raw)?;
+                        p.fetched.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
