@@ -960,6 +960,7 @@ fn s3rd2_no_read_of_history_outside_held_or_exact() {
         Err(VeilError::Unavailable(_)) => {}
         r => panic!("a snapshot of the person's history, read outside Held and Exact: {:?}", r.map(|o| o.kind_name())),
     }
+}
 
 // ---- S8 cycle 2 review (`docs/BUGS.md`, "S8 cycle 2") --------------------
 
