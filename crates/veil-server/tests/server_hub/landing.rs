@@ -2115,3 +2115,326 @@ fn bug_1310_a_change_landed_again_after_a_reset_lands_with_its_stored_projection
     assert_eq!(again["landed"], v["landed"], "made again exactly as before");
     assert!(real_file(&hub, pid, "src/again/0.rs").is_some());
 }
+
+// ---- S17 redesign review (cycle 1 of the revised design) ----------------
+
+/// BUG-1311: "the stack is the submitter's own history" also for the next
+/// submitter. The admin's branch holds A (src/), H (billing only) and B
+/// (src/); the dev, who cannot see H, lands B: A and B land, H stays
+/// unlanded (it is not in the dev's history). B is then recorded as landed
+/// "whole" (all of B's own edits landed), and every later stack takes B for
+/// on main, though B's history (its tree) holds H and main does not. The
+/// admin, who sees all three, landing B must land H, or be told it is not
+/// on main; never "nothing to land" with H missing.
+#[test]
+#[ignore = "BUG-1311: a change landed whole for a view that left a change below it out counts as on the branch for everyone"]
+fn bug_1311_a_change_landed_for_a_view_that_left_out_a_change_below_still_brings_it_for_whoever_sees_it() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let atok = p.admin.token();
+    let token = p.dev.token();
+    let t0 = veil_core::now_millis();
+    let hidden = format!("{BILL_DIR}/between.txt");
+    let ids = crafted_branch(
+        &api,
+        &p.admin,
+        &p.name,
+        "main",
+        "hc",
+        &[(&[("src/hc/a.rs", "a\n")], 1), (&[(&hidden, "h\n")], 2), (&[("src/hc/b.rs", "b\n")], 3)],
+        t0,
+    );
+    // The dev lands what they see of the branch: A and B.
+    let seen = api.tips(Some(&token), &p.name).unwrap().branches["hc"];
+    let r = land_held(&api, &token, &p.name, seen, true);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    assert_eq!(v["state"], "landed", "{v}");
+    assert!(real_file(&hub, pid, "src/hc/a.rs").is_some() && real_file(&hub, pid, "src/hc/b.rs").is_some(), "{v}");
+    assert!(real_file(&hub, pid, &hidden).is_none(), "a change the dev cannot see landed");
+    // The admin lands B, whose history holds H.
+    let r = land_held(&api, &atok, &p.name, ids[2], true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "the admin's B, whose history holds H (not on main), was refused: {body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+    assert_eq!(real_file(&hub, pid, &hidden).as_deref(), Some(&b"h\n"[..]), "H is in the admin's history below B and not on main: {body}");
+}
+
+/// fin's change P edits the invoice (billing) and src/fin.rs; the dev, who
+/// reads src/ only, lands P in part (src/fin.rs); fin pushes their change to
+/// fin-wip; `edit` then changes src/fin.rs on main (as any later change of
+/// a busy folder does). The tip of fin-wip as fin sees it.
+fn part_landed_then(hub: &TestHub, p: &Project, edit: Value) -> ObjectId {
+    let pid = project_id(hub, &p.name);
+    let api = hub.api();
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name]);
+    let invoice = format!("{BILL_DIR}/acme/invoice.txt");
+    let mut c = Craft::new(&api, &p.fin, &p.name, "main");
+    c.file(&invoice, "fin's edit\n");
+    c.file("src/fin.rs", "fin\n");
+    let r = c.push_to("fin-wip", None);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let token = p.dev.token();
+    let theirs = api.tips(Some(&token), &p.name).unwrap().branches["fin-wip"];
+    let v = land_held(&api, &token, &p.name, theirs, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_eq!(real_file(hub, pid, "src/fin.rs").as_deref(), Some(&b"fin\n"[..]));
+    let v = land(&api, &token, &p.name, tip_for(hub, &token, &p.name), json!([edit]), true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    api.tips(Some(&p.fin.token()), &p.name).unwrap().branches["fin-wip"]
+}
+
+/// BUG-1312: "its author lands the rest". What of a change landed in part
+/// for another view is on the branch is judged by content ("a path already
+/// holding the change's own entry counts as landed", `edits::holds`), not
+/// by what landed: once a path that landed moved on (src/fin.rs edited
+/// again, as in any busy folder), fin's rest is answered `conflict` on a
+/// path of theirs that landed, and the invoice can never land.
+#[test]
+#[ignore = "BUG-1312: a change landed in part judges its landed part by content: its author's rest conflicts once that part moved on"]
+fn bug_1312_the_author_of_a_change_landed_in_part_lands_the_rest_after_the_landed_part_moved_on() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let mine = part_landed_then(&hub, &p, put("src/fin.rs", "the dev's, later\n"));
+    let r = land_held(&api, &p.fin.token(), &p.name, mine, true);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    assert_eq!(v["state"], "landed", "fin's rest (the invoice) touches nothing that moved since: {v}");
+    assert_eq!(real_file(&hub, pid, &format!("{BILL_DIR}/acme/invoice.txt")).as_deref(), Some(&b"fin's edit\n"[..]));
+    assert_eq!(real_file(&hub, pid, "src/fin.rs").as_deref(), Some(&b"the dev's, later\n"[..]), "the landed part landed again");
+}
+
+/// BUG-1312, the same class: exactly once. src/fin.rs, landed with the
+/// dev's part, is deleted on main afterwards; fin's rest lands it again
+/// (the tip no longer holds P's entry there, and the path is as in P's
+/// base), undoing the deletion.
+#[test]
+#[ignore = "BUG-1312: a change landed in part judges its landed part by content: a landed edit lands again once it was undone"]
+fn bug_1312_a_change_landed_in_part_never_lands_its_landed_part_twice() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let mine = part_landed_then(&hub, &p, json!({"path": "src/fin.rs", "delete": true}));
+    assert!(real_file(&hub, pid, "src/fin.rs").is_none());
+    let r = land_held(&api, &p.fin.token(), &p.name, mine, true);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_eq!(real_file(&hub, pid, &format!("{BILL_DIR}/acme/invoice.txt")).as_deref(), Some(&b"fin's edit\n"[..]));
+    assert!(real_file(&hub, pid, "src/fin.rs").is_none(), "src/fin.rs, landed once and deleted since, landed a second time: {v}");
+}
+
+/// BUG-1313: answers are the same whether or not hidden changes sit below
+/// the submitter's change. `landing::stack` reads the submitted line at
+/// most `LINE_LIMIT` (1,024) snapshots deep, hidden ones included: the dev's
+/// one change on a branch of 1,030 billing-only changes (none of them in
+/// the dev's history: they see the branch as main) is refused with "more
+/// than 64 changes between the branch's tip and this one", while the same
+/// change with nothing hidden below lands.
+#[test]
+#[ignore = "BUG-1313: the line limit counts changes the submitter cannot see: a change on 1,024 hidden ones is refused as too many"]
+fn bug_1313_a_change_on_many_hidden_changes_lands_as_it_would_with_none_below() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    // 1,030 billing-only changes on `billing-run` (one file, edited each time).
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    let mut parent = c.tip;
+    for i in 0..1_030 {
+        c.file(&format!("{BILL_DIR}/run.txt"), &format!("{i}\n"));
+        let mut s = Snapshot {
+            parents: vec![parent],
+            change_id: veil_core::ChangeId::random(),
+            tree: c.root,
+            description: Text::Plain(format!("billing {i}")),
+            author: "fin".into(),
+            timestamp: veil_core::now_millis(),
+            predecessors: vec![],
+            conflicts: vec![],
+            embargo: None,
+            signature: None,
+        };
+        s.sign(&c.identity);
+        parent = c.put(O::Snapshot(s));
+    }
+    let up = c.api.upload(&c.token, &c.project, &c.objects);
+    assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+    let receipts = up.json()["receipts"].as_array().unwrap().clone();
+    let map: serde_json::Map<String, Value> = c.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+    let r = c.api.post_json(
+        Some(&c.token),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "billing-run", "expected": null, "new": parent.hex()}], "receipts": map}),
+    );
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let seen = api.tips(Some(&token), &p.name).unwrap().branches["billing-run"];
+    assert_eq!(seen, tip_for(&hub, &token, &p.name), "the dev sees billing-run as main");
+    // The dev's one change, pushed on billing-run, then landed on main.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "billing-run");
+    c.file("src/run.rs", "the dev's\n");
+    let r = c.push_to("billing-run", Some(seen));
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let mine = api.tips(Some(&token), &p.name).unwrap().branches["billing-run"];
+    let r = land_held(&api, &token, &p.name, mine, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "one change of the dev's, on changes they cannot see: {body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+    assert_eq!(real_file(&hub, pid, "src/run.rs").as_deref(), Some(&b"the dev's\n"[..]));
+}
+
+/// BUG-1314 (pre-existing; the builder's unconfirmed YugabyteDB 403 in
+/// `a_merge_in_fix_never_lets_a_non_admin_change_the_default_branch_rules`):
+/// a projection several hidden-only changes share stands for each of them,
+/// and `changes::resolve_base` takes "the newest real snapshot that is
+/// `base`" from `sync::resolve`, which orders the candidates by their
+/// memo's `created_at` (milliseconds, across every view key): neither the
+/// snapshots' order nor unique. For the dev, main's initial import, the
+/// access lines, the billing-only change and the admin's "devs may edit
+/// the rules file" (a `.veilpolicy` change) all project to one snapshot;
+/// with their memos stored in one millisecond (here: made equal), a server
+/// that has not cached the answer (another server, after a restart) grafts
+/// the dev's change on an older one. Its hidden `.veilpolicy` then differs
+/// from main's, and the merge-in fix is refused at the push's check (403,
+/// "combines changes in folders you cannot see") instead of being judged.
+#[test]
+#[ignore = "BUG-1314: a base several hidden-only changes share resolves by memo time, which ties: a change is grafted on an older real snapshot"]
+fn bug_1314_a_base_shared_by_hidden_only_changes_resolves_to_the_newest_of_them() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    p.admin.ok(&p.dir, &["access", ".veilrules", "devs"]);
+    p.admin.commit_main(&p.dir, "devs may edit the rules file");
+    p.admin.ok(&p.dir, &["push"]);
+    let token = p.dev.token();
+    let base = tip_for(&hub, &token, &p.name);
+    let tip = real_tip(&hub, pid);
+    // Every memo of that projection stored in one millisecond.
+    let h = hub.hub();
+    let n = hub
+        .rt
+        .block_on(sqlx::query("UPDATE projections SET created_at = 1 WHERE project_id = $1 AND projected_id = $2").bind(pid).bind(base.hex()).execute(&h.db))
+        .unwrap()
+        .rows_affected();
+    assert!(n >= 2, "the dev's main stands for {n} real snapshot(s)");
+    // Another server (nothing cached) makes the dev's change on it.
+    let other = TestHub::beside(&hub);
+    let oapi = other.api();
+    let mine = kept_change(&oapi, &token, &p.name, base, json!([put("src/lib.rs", "the dev's\n")]));
+    let real: String = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT real_id FROM projections WHERE project_id = $1 AND projected_id = $2 LIMIT 1").bind(pid).bind(mine.hex()).fetch_one(&h.db))
+        .unwrap();
+    let parent = source(&hub, pid).snapshot(&ObjectId::from_hex(&real).unwrap()).unwrap().parents[0];
+    // The merge-in fix of a_merge_in_fix_… on it.
+    write_files(&p.dir, &[(".veilrules", "[branches.release]\nprotected = true\n"), ("src/lib.rs", "the admin's\n")]);
+    p.admin.commit_main(&p.dir, "the rules, and the admin's lib.rs");
+    p.admin.ok(&p.dir, &["push"]);
+    let main_now = tip_for(&other, &token, &p.name);
+    let mut c = Craft::new(&oapi, &p.dev, &p.name, "main");
+    c.root = c.tree_of(mine);
+    c.tip = mine;
+    c.file("src/lib.rs", "both\n");
+    let r = land_crafted(c, vec![mine, main_now], true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "the dev's change was made on {} (main was {}): {body}", parent.short(), tip.short());
+    assert_eq!(r.json()["state"], "rejected", "{body}");
+    assert!(body.contains("only admins may change the branch rules"), "{body}");
+    assert_eq!(parent, tip, "the dev's change, made on main as they see it, is on an older snapshot");
+}
+
+/// BUG-1315: the partly-landed change stays correct for everyone. fin's
+/// change P (the invoice and src/fin.rs) lands in two parts: the dev's view
+/// of it, then fin's rest. Both parts are new snapshots carrying P's change
+/// id, each with P (not the other part) as its only predecessor, so for
+/// anyone who sees both (fin, an admin) main holds one change twice:
+/// `vl` calls it divergent and refuses to name it by its change id, though
+/// nobody rewrote it.
+#[test]
+#[ignore = "BUG-1315: a change landed in two parts is two unrelated snapshots of one change on main: divergent for whoever sees both"]
+fn bug_1315_a_change_landed_in_two_parts_is_one_change_on_the_branch_for_whoever_sees_both() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name]);
+    let invoice = format!("{BILL_DIR}/acme/invoice.txt");
+    let mut c = Craft::new(&api, &p.fin, &p.name, "main");
+    c.file(&invoice, "fin's edit\n");
+    c.file("src/fin.rs", "fin\n");
+    let r = c.push_to("fin-wip", None);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let token = p.dev.token();
+    let theirs = api.tips(Some(&token), &p.name).unwrap().branches["fin-wip"];
+    let v = land_held(&api, &token, &p.name, theirs, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    let ftok = p.fin.token();
+    let mine = api.tips(Some(&ftok), &p.name).unwrap().branches["fin-wip"];
+    let v = land_held(&api, &ftok, &p.name, mine, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_eq!(real_file(&hub, pid, &invoice).as_deref(), Some(&b"fin's edit\n"[..]));
+    let cid = source(&hub, pid).snapshot(&real_tip(&hub, pid)).unwrap().change_id;
+    let d = p.fin.dir(&unique("parts"));
+    p.fin.ok(p.fin.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+    let out = p.fin.run(&d, &["log", "-r", &cid.to_string()]);
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "fin's own change, landed (in two parts) on main: {text}");
+    assert!(!text.contains("divergent"), "{text}");
+}
+
+
+/// Guarantee (property 4 of the redesign's review): only admins change the
+/// branch rules and access lines, also through a change landed as its
+/// submitter's projected edits. The admin's held change on `rules-wip`
+/// edits `.veilrules`, `.veilpolicy` and src/; a billing-only change of
+/// theirs sits below it (so its edits are the dev's projected ones). The
+/// dev, who may read and edit `.veilrules` but not read `.veilpolicy`,
+/// lands their own change on top: refused for the rules, and nothing of
+/// the stack lands; the access lines never move.
+#[test]
+fn a_change_landed_as_projected_edits_never_lets_a_non_admin_change_the_rules_or_access_lines() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    p.admin.ok(&p.dir, &["access", ".veilrules", "devs"]);
+    p.admin.commit_main(&p.dir, "devs may edit the rules file");
+    p.admin.ok(&p.dir, &["push"]);
+    let tip0 = real_tip(&hub, pid);
+    let policy0 = real_file(&hub, pid, ".veilpolicy");
+    let mut policy = String::from_utf8(policy0.clone().unwrap()).unwrap();
+    policy.push_str("src/open/ devs\n");
+    let t0 = veil_core::now_millis();
+    let hidden = format!("{BILL_DIR}/below.txt");
+    crafted_branch(
+        &api,
+        &p.admin,
+        &p.name,
+        "main",
+        "rules-wip",
+        &[(&[(&hidden, "h\n")], 1), (&[(".veilrules", "[branches.release]\nprotected = true\n"), (".veilpolicy", &policy), ("src/rules.rs", "r\n")], 2)],
+        t0,
+    );
+    let token = p.dev.token();
+    let mut c = Craft::new(&api, &p.dev, &p.name, "rules-wip");
+    c.file("src/mine.rs", "the dev's\n");
+    let seen = c.tip;
+    let r = c.push_to("rules-wip", Some(seen));
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let mine = api.tips(Some(&token), &p.name).unwrap().branches["rules-wip"];
+    let r = land_held(&api, &token, &p.name, mine, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "rejected", "{body}");
+    assert!(body.contains("only admins may change the branch rules"), "{body}");
+    assert_eq!(real_tip(&hub, pid), tip0, "{body}");
+    assert_eq!(real_file(&hub, pid, ".veilpolicy"), policy0);
+    assert!(real_file(&hub, pid, ".veilrules").is_none() && real_file(&hub, pid, "src/mine.rs").is_none());
+}
