@@ -86,6 +86,8 @@ const MAX_CONFIRMS: usize = 1024;
 /// Most projects followed (warm trees), and how long one is kept unused.
 const MAX_FOLLOWS: usize = 64;
 const FOLLOW_KEEP_MS: i64 = 7 * 24 * 3600 * 1000;
+/// The daemon exits after this long with no read or pin through it.
+const IDLE_MS: i64 = 3600 * 1000;
 /// Most connections served at once; the next ones wait in the listener's
 /// queue.
 pub const MAX_CONNECTIONS: usize = 64;
@@ -246,6 +248,10 @@ pub struct Daemon {
     active: (Mutex<usize>, Condvar),
     peak_connections: AtomicUsize,
     socket_ino: AtomicU64,
+    /// When someone last read or pinned through it (unix ms).
+    last_used: std::sync::atomic::AtomicI64,
+    /// Whether its Veil home's identity existed at start.
+    had_identity: bool,
 }
 
 fn now() -> i64 {
@@ -333,6 +339,8 @@ impl Daemon {
             active: (Mutex::new(0), Condvar::new()),
             peak_connections: AtomicUsize::new(0),
             socket_ino: AtomicU64::new(0),
+            last_used: std::sync::atomic::AtomicI64::new(now()),
+            had_identity: crate::ctx::identity_path().exists(),
         }
     }
 
@@ -483,10 +491,12 @@ impl Daemon {
         match req {
             Request::Batch { upstream, project, batch } => {
                 self.stats.requests.fetch_add(1, Ordering::Relaxed);
+                self.last_used.store(now(), Ordering::Relaxed);
                 let head = self.batch(&mut w, &upstream, &project, batch)?;
                 end(&mut w, &head)?;
             }
             Request::Pin { upstream, project, key, roots } => {
+                self.last_used.store(now(), Ordering::Relaxed);
                 let ok = valid_authority(&upstream) && valid_project(&project) && key.len() <= 128 && roots.len() <= 64;
                 let status = match ok && self.store.set_pin(&key, &upstream, &project, roots).is_ok() {
                     true => None,
@@ -704,12 +714,16 @@ impl Daemon {
         }
     }
 
-    /// Stopped, turned off, or its socket or directory gone (a removed
-    /// Veil home, another daemon in its place).
+    /// Stopped, turned off, its socket or directory gone (another daemon
+    /// in its place), its Veil home's identity gone (a removed home), or
+    /// idle for [`IDLE_MS`] (no read or pin through it; the next `vl` that
+    /// needs it starts it again, with its store as it was).
     fn gone(&self) -> bool {
         use std::os::unix::fs::MetadataExt;
         self.stop.load(Ordering::SeqCst)
             || self.paths.off.exists()
+            || (self.had_identity && !crate::ctx::identity_path().exists())
+            || now() - self.last_used.load(Ordering::Relaxed) > IDLE_MS
             || !std::fs::metadata(&self.paths.socket).is_ok_and(|m| m.ino() == self.socket_ino.load(Ordering::SeqCst))
     }
 

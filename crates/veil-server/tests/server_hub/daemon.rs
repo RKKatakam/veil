@@ -911,3 +911,30 @@ fn the_daemons_socket_and_store_are_its_users_alone() {
     assert_eq!(items(&admin.walk()), items(&good), "never wrong bytes");
     assert!(d.status()["store"]["damaged"].as_u64().unwrap() > 0);
 }
+
+/// A daemon never outlives its Veil home: it exits once the home's
+/// identity is gone, and a daemon (or a `vl` starting one) that comes too
+/// late, after the home was removed, makes nothing again (found running the
+/// suites: a removed test home brought back by a daemon starting as it
+/// went, which then ran on with no one to use it).
+#[test]
+fn the_daemon_never_outlives_its_veil_home() {
+    let hub = TestHub::start();
+    let who = hub.person("gone");
+    let d = Daemon::start(&who, None);
+    let pid = d.pid();
+    let alive = |pid: i32| std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| !s.contains(") Z "));
+    assert!(alive(pid));
+    let home = who.home.path().join("veil");
+    std::fs::remove_file(home.join("identity.json")).unwrap();
+    let took = until(Duration::from_secs(5), "the daemon exits once its home's identity is gone", || !alive(pid));
+    eprintln!("daemon: exited {took:?} after its home's identity went");
+    // The whole home removed; then a daemon starting late.
+    std::fs::remove_dir_all(&home).unwrap();
+    let o = who.run(who.home.path(), &["daemon", "run"]);
+    assert!(!o.status.success(), "a daemon of a removed Veil home refuses to run");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("is not there"), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = who.run(who.home.path(), &["daemon", "start"]);
+    assert!(!o.status.success(), "nor is one started");
+    assert!(!home.exists(), "the removed Veil home was made again");
+}

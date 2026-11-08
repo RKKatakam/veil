@@ -46,12 +46,36 @@ pub struct Paths {
     pub socket: PathBuf,
     pub store: PathBuf,
     pub off: PathBuf,
+    /// `VEIL_HOME`, when the daemon lives in it: never created by the
+    /// daemon (one whose home was removed must not bring it back).
+    pub home: Option<PathBuf>,
+}
+
+impl Paths {
+    /// Make the daemon's directories (0700). Inside a Veil home, only below
+    /// one that exists: a daemon or `vl` racing the removal of its Veil
+    /// home never makes it again.
+    pub fn prepare(&self) -> Result<()> {
+        if let Some(h) = &self.home {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                match std::fs::DirBuilder::new().mode(0o700).create(&self.state) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => bail!("the Veil home {} is not there ({e})", h.display()),
+                }
+            }
+        }
+        private_dir(&self.state)?;
+        private_dir(&self.run)
+    }
 }
 
 pub fn paths() -> Paths {
     if let Some(home) = std::env::var_os("VEIL_HOME") {
-        let d = PathBuf::from(home).join("daemon");
-        return Paths { socket: d.join("sock"), store: d.join("store"), off: d.join("off"), run: d.clone(), state: d };
+        let d = PathBuf::from(&home).join("daemon");
+        return Paths { socket: d.join("sock"), store: d.join("store"), off: d.join("off"), run: d.clone(), state: d, home: Some(PathBuf::from(home)) };
     }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".cache")).join("veil").join("daemon");
@@ -59,7 +83,7 @@ pub fn paths() -> Paths {
         Some(r) => PathBuf::from(r).join("veil"),
         None => cache.join("run"),
     };
-    Paths { socket: run.join("daemon.sock"), store: cache.join("store"), off: cache.join("off"), run, state: cache }
+    Paths { socket: run.join("daemon.sock"), store: cache.join("store"), off: cache.join("off"), run, state: cache, home: None }
 }
 
 /// Make `dir` (and its parents) and check it is this user's and no one
@@ -214,7 +238,7 @@ mod client {
         if p.socket.as_os_str().len() > MAX_SOCKET_PATH {
             bail!("the daemon's socket path {} is too long for a socket", p.socket.display());
         }
-        super::private_dir(&p.state)?;
+        p.prepare()?;
         let mut child = spawn_self(&["daemon", "run"], p)?;
         let t = Instant::now();
         while t.elapsed() < Duration::from_secs(2) {
@@ -330,7 +354,7 @@ pub fn run(cmd: &DaemonCmd) -> Result<std::process::ExitCode> {
             DaemonCmd::Run => run_daemon(&p)?,
             DaemonCmd::Follow => follow::run(&p)?,
             DaemonCmd::Start { cache_size } => {
-                private_dir(&p.state)?;
+                p.prepare()?;
                 if let Some(s) = cache_size {
                     let limit = veil_core::promisor::parse_size(s)?;
                     if limit == 0 {
@@ -346,7 +370,7 @@ pub fn run(cmd: &DaemonCmd) -> Result<std::process::ExitCode> {
                 println!("{} the Veil daemon runs (pid {}); vl starts it when a thin clone needs it", green("on:"), s["pid"]);
             }
             DaemonCmd::Stop => {
-                private_dir(&p.state)?;
+                p.prepare()?;
                 std::fs::write(&p.off, b"off\n")?;
                 if let Some(s) = connect() {
                     let _ = request(s, &proto::Request::Stop, &|_| false);
@@ -408,8 +432,7 @@ fn print_status(p: &Paths) {
 #[cfg(unix)]
 fn run_daemon(p: &Paths) -> Result<()> {
     use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
-    private_dir(&p.state)?;
-    private_dir(&p.run)?;
+    p.prepare()?;
     if p.off.exists() {
         return Ok(());
     }

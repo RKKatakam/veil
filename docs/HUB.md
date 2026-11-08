@@ -2889,7 +2889,12 @@ vl daemon status | start [--cache-size SIZE] | stop
   reads through it, and waits at most 2 s for its socket. **`vl daemon
   stop` is the off switch:** it writes `off`, stops the daemon and `vl`
   starts it no more until `vl daemon start`. The daemon exits when its
-  socket or Veil home is removed, or `off` appears.
+  socket is removed or replaced, `off` appears, its Veil home's identity
+  is gone, or nobody read or pinned through it for an hour (the next `vl`
+  that needs it starts it again, its store as it was). It never makes a
+  Veil home: only its own directory, inside one that exists (found running
+  the suites: a test's home, removed while a daemon started, was made
+  again and the daemon ran on; `the_daemon_never_outlives_its_veil_home`).
 * **What the design assumes of the machine** (§4.1: "the machine is
   theirs"): one OS user is one person, or people who may read each other's
   files. The store is that user's files, as each clone's `.veil/cache/`
@@ -2940,7 +2945,8 @@ object skipped (`skip` is not signed; the server checks the grant and
 sends nothing), while that signature is 30 s inside the server's ±5
 minutes. `401` voids those epochs (a later-sent `200` restores them); no
 answer lets them go stale. **So a change committed at time R is refused
-by R + 5 s at the latest** (measured below: 21–37 ms), and **without the
+by R + 5 s at the latest** (measured: 21–37 ms alone, up to 749 ms with
+four suites running at once), and **without the
 server nothing is served from the store after 5 s**, public objects
 included. The replay is what S5 already allows ("a signed request can be
 replayed within ±5 minutes by whoever saw it"; the daemon saw it), and
@@ -3005,13 +3011,14 @@ returns no object.
 | # | Guarantee | Test |
 |---|---|---|
 | 1 | The daemon never serves an object the server would not serve that person's device now: the admin's daemon holds every object; five viewers (anyone on Earth included) asking it with their own grants receive exactly the server's walk, and every real object they do not reach, with every chain they can build (their trees, the admin's real chains, the admin's chains from their root, the admin's root), gets nothing and no store hit; another device's signature, none, a wider root under the signature, a grant signed by the server's identity key, an expired one, one of other epochs, one of another project: nothing from the store; hostile requests refused, the daemon still serving | `the_daemon_serves_only_what_the_server_would` |
-| 2 | A person removed from a group, a project whose policy changed, a device an admin removed: refused within 5 s (21–37 ms), never served again | `a_removed_person_or_device_is_refused_at_the_daemon_within_the_bound` |
+| 2 | A person removed from a group, a project whose policy changed, a device an admin removed: refused within 5 s (21–37 ms alone, up to 749 ms under load), never served again | `a_removed_person_or_device_is_refused_at_the_daemon_within_the_bound` |
 | 2b | Fails closed: the server cut off, nothing from the store 5 s later (public included), `503`; served again once the server answers | `the_daemon_fails_closed_without_the_server` |
 | 3 | A thin clone answers eight commands, and checks out the same files, with the daemon off, cold and warm, for the admin and for a person without `billing/`; that person's daemon never held a restricted marker | `a_thin_clone_answers_the_same_with_and_without_the_daemon`; every S3 test (`thin::`, 46) now runs with the daemon on; the core tests check every `Located::chain` agrees with its path (`core_sync` `thin`) |
 | 4 | The store keeps to `--cache-size 64K` under 200 files of 4 KiB; memory: 24 readers at once of six 12 MiB files, cold and warm, grow the daemon by less than its budget and their connections' buffers (41 MiB measured) | `the_daemons_store_keeps_to_its_bound`, `the_daemons_memory_stays_within_its_budget`; `daemon::store::tests` (pins kept, a full pin set keeps nothing new, damaged files removed, the index rebuilt) |
 | 5 | A `vl` without the daemon works: off is not started again; a daemon killed with `SIGKILL` leaves `vl` working (and is started again); a daemon that answers nothing, or wrong bytes for every object, changes no answer | `vl_works_without_the_daemon` |
 | 6 | Its socket and store are its user's alone (0700, 0600; a 0777 directory narrowed); a damaged object in its store is never served | `the_daemons_socket_and_store_are_its_users_alone` |
 | — | Warm trees: a new tip's trees to depth 3 in the store with no reader, nothing deeper; a new clone reads them from the store | `the_daemon_keeps_the_top_trees_of_followed_projects_warm` |
+| — | It never outlives its Veil home: exits within a second once the identity is gone; in a removed home, `vl daemon run` and `start` refuse and make nothing | `the_daemon_never_outlives_its_veil_home` |
 
 #### Threat review (design §6 rows 1–5, 8, 9, 14, 15, 18, plus this milestone's)
 
