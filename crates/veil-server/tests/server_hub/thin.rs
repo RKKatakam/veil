@@ -1505,3 +1505,172 @@ fn s3rd_status_and_log_after_a_pull_match_a_full_clone() {
     assert_eq!(status(&thin), status(&full));
     assert_eq!(admin.ok(&thin, &["files"]), admin.ok(&full, &["files"]));
 }
+
+// ---- S3 redesign review, cycle 2: `s3rd2_…` -------------------------------------
+
+/// BUG-1316 (guarantee 2 of cycle 2: a thin clone answers as a full clone;
+/// BUG-866's class). A member pushes a snapshot dated `i64::MAX` (the push
+/// accepts any timestamp), then ordinary commits on top. The server's
+/// generations clamp a timestamp to `MAX_STAMP` (`i64::MAX / 4`,
+/// `derive/graph.rs`, `query/graph.rs:105`); the client's history index
+/// does not (`graph_index.rs`, `above.max(s.timestamp.max(0))`). A thin
+/// clone takes its boundary's generations from the server (`q/generations`,
+/// the BUG-1291 fix) and computes the rest itself, so once it pages in the
+/// history below the tip, a parent's generation is above its child's:
+/// `vl describe` of the commit on the far-future one finds no descendant
+/// above it (`Exact::down_to` stops below the rewritten generation) and
+/// leaves `after 1`, `after 2`, `main` and `@` on the old version, where a
+/// full clone rebases them.
+#[test]
+#[ignore = "BUG-1316: past a far-future timestamp, a thin clone's own generations and its server's (clamped) disagree; descendants are lost"]
+fn s3rd2_a_far_future_timestamp_does_not_split_a_thin_clones_history() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    let tip = c.tip;
+    c.file("src/far-future-7d20.txt", "x");
+    let (_, r) = c.push_edited("main", Some(tip), |s| s.timestamp = i64::MAX);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", r.json());
+    for i in 0..3 {
+        let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+        c.file(&format!("src/after-{i}-7d20.txt"), "y");
+        let r = c.push("main", &format!("after {i}"));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", r.json());
+    }
+    let full = p.admin.dir("full");
+    p.admin.ok(p.admin.home.path(), &["clone", "--full", &hub.url(&p.name), full.to_str().unwrap()]);
+    let after0: String = change_of(&p.admin, &full, "after 0").chars().take(12).collect();
+    let known: Vec<String> = json(&p.admin.ok(&full, &["log", "--json"]))["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["current"] != serde_json::json!(true))
+        .filter_map(|e| e["change_id"].as_str().map(str::to_string))
+        .collect();
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+    let reads = vec![s(&["log", "--json", "-r", &format!("{after0}..main")]), s(&["log", "--json", "-r", "::main"])];
+    let mut diffs: Vec<String> = first_difference(&p.admin, &hub, &p.name, &full, &reads, "ff").into_iter().collect();
+    // A rewrite of the commit on the far-future one, in a fresh full clone
+    // and a fresh thin one.
+    let op = ["describe", "-r", after0.as_str(), "-m", "after 0, renamed"];
+    let (f, t) = (p.admin.dir("ff-full"), p.admin.dir("ff-thin"));
+    p.admin.ok(p.admin.home.path(), &["clone", "--full", &hub.url(&p.name), f.to_str().unwrap()]);
+    p.admin.ok(p.admin.home.path(), &["clone", &hub.url(&p.name), t.to_str().unwrap()]);
+    p.admin.ok(&f, &op);
+    p.admin.ok(&t, &op);
+    let (hf, ht) = (history_shape(&p.admin, &f, &known), history_shape(&p.admin, &t, &known));
+    if hf != ht {
+        diffs.push(format!("`vl {}`: history\nfull: {hf:#?}\nthin: {ht:#?}", op.join(" ")));
+    }
+    assert!(diffs.is_empty(), "past a far-future timestamp a thin clone answers otherwise than a full clone:\n{}", diffs.join("\n\n"));
+}
+
+/// Guarantee 5 of cycle 2 (BUG-1292's fix): removing the remote a thin
+/// clone fetches from is refused, naming the way out, and changes nothing;
+/// the way out (`vl partial full`, then `vl remote rm`) works. (The cycle 1
+/// reproduction, `s3rd_removing_a_thin_clones_remote_leaves_it_readable_or_is_refused`,
+/// returns early when the removal is refused, so it asserts nothing now.)
+#[test]
+fn s3rd2_removing_a_thin_clones_own_remote_is_refused_with_the_way_out() {
+    let hub = TestHub::start();
+    let (admin, _dir, name) = project_with_history(&hub, 4, 10);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    let err = admin.fails(&thin, &["remote", "rm", "origin"]);
+    assert!(err.contains("this thin clone fetches what it does not hold from remote 'origin'"), "{err}");
+    assert!(err.contains("vl partial full"), "the refusal names no way out: {err}");
+    assert_eq!(repo_json(&thin)["partial"]["remote"], "origin");
+    assert!(admin.ok(&thin, &["remote", "list"]).contains("origin"));
+    admin.ok(&thin, &["partial", "full"]);
+    admin.ok(&thin, &["remote", "rm", "origin"]);
+    assert!(repo_json(&thin).get("partial").is_none());
+    let o = admin.run(&thin, &["log", "--json"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+/// BUG-1318 (guarantee 5 of cycle 2; BUG-1292's fix, its second half): a
+/// pull from another remote is a full pull: every tree and file its
+/// snapshots reach goes into the main store, even for snapshots the thin
+/// clone already holds (here `big`, a tip the clone fetched, whose 400 KB
+/// of files it never read). The fix walks held snapshots of such a pull
+/// (`hub::pull_with`, `held && !main_only`), but the pull asks only for
+/// the tips the store lacks (`want_tips`: `widen || !store.has(t)`): with
+/// every tip held, as here and in BUG-1292's own reproduction (the same
+/// URL added under another name), it asks for nothing and copies nothing.
+#[test]
+#[ignore = "BUG-1318: a pull from another remote whose tips the thin clone holds fetches nothing (want_tips skips held tips)"]
+fn s3rd2_a_pull_from_another_remote_puts_what_its_snapshots_reach_in_the_main_store() {
+    let hub = TestHub::start();
+    let (admin, name) = project_with_big_branch(&hub);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    let before = du(&thin.join(".veil/objects"));
+    admin.ok(&thin, &["remote", "add", "up", &hub.url(&name)]);
+    admin.ok(&thin, &["pull", "up"]);
+    let after = du(&thin.join(".veil/objects"));
+    assert!(after >= before + 380_000, "a full pull from another remote put only {} bytes into the main store", after.saturating_sub(before));
+    // The clone's own server's history is untouched: still thin, origin's
+    // tips as they were.
+    assert_eq!(repo_json(&thin)["partial"]["remote"], "origin");
+    let o = admin.run(&thin, &["cat", "-r", "origin/big", "big/f07.bin"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+/// Guarantee 4 of cycle 2 (BUG-1293's fix): the unchanged-file shortcut of
+/// a rescan (a directory a `vl ws switch` leaves without a stat cache)
+/// never reuses a file whose mode changed. A fetched file made executable
+/// after a switch round trip is recorded as changed, and executable.
+#[test]
+fn s3rd2_a_rescanned_fetched_file_whose_mode_changed_is_recorded() {
+    use std::os::unix::fs::PermissionsExt;
+    let hub = TestHub::start();
+    let (admin, _dir, name) = project_with_history(&hub, 3, 10);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    admin.ok(&thin, &["ws", "new", "other", "-r", "main"]);
+    admin.ok(&thin, &["ws", "switch", "other"]);
+    admin.ok(&thin, &["ws", "switch", "default"]);
+    let f = thin.join("data/f1.bin");
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let st = admin.ok(&thin, &["status"]);
+    assert!(st.contains("data/f1.bin"), "a mode change is not seen after a rescan: {st}");
+    admin.ok(&thin, &["commit", "-m", "make f1 executable"]);
+    let d = admin.ok(&thin, &["diff", "--json", "--from", "@--", "--to", "@-"]);
+    assert!(d.contains("data/f1.bin"), "the commit does not record the mode change: {d}");
+}
+
+/// BUG-1319 (guarantee 2 of cycle 2: a thin clone answers as a full clone
+/// made at the same time; introduced by the BUG-1268 fix to `history`).
+/// A thin clone and a full clone are made; then the admin rewrites the
+/// first change (`vl describe`, which rewrites everything above it) and
+/// force-pushes. Neither clone has pulled: both still stand on the old
+/// versions. The full clone holds them and shows their history; the thin
+/// clone pages history in from them, and `sync::history` now starts a page
+/// only from snapshots the branches reach (an old version is left out, as
+/// an unknown one is), so the page is empty: `vl log` ends at the old tip,
+/// and `vl show main--` says the revision is not found.
+#[test]
+#[ignore = "BUG-1319: after a force-push, a thin clone cannot page in the history below its own old tip"]
+fn s3rd2_a_thin_clone_reads_its_own_history_after_a_rewrite_elsewhere() {
+    let hub = TestHub::start();
+    let (admin, dir, name) = project_with_history(&hub, 6, 10);
+    let full = admin.dir("full");
+    admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    let first: String = change_of(&admin, &dir, "first").chars().take(12).collect();
+    admin.ok(&dir, &["describe", "-r", &first, "-m", "first, renamed"]);
+    admin.ok(&dir, &["push", "--force"]);
+    let mut diffs = Vec::new();
+    for args in [vec!["log", "--json"], vec!["show", "--json", "main--"], vec!["show", "--json", "main-----"]] {
+        let (want, got) = (answer(&admin, &full, &args), answer(&admin, &thin, &args));
+        assert!(want.0, "`vl {}` fails in the full clone: {}", args.join(" "), want.1);
+        if got != want {
+            diffs.push(format!("`vl {}`:\nfull: {}\nthin ({}): {}", args.join(" "), want.1.chars().take(600).collect::<String>(), got.0, got.1.chars().take(600).collect::<String>()));
+        }
+    }
+    assert!(diffs.is_empty(), "after a rewrite elsewhere, a thin clone reads its own history otherwise than a full clone:\n{}", diffs.join("\n\n"));
+}
