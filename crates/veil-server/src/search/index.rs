@@ -380,9 +380,7 @@ fn put(src: &Source, raw: Vec<u8>, stats: &mut Stats) -> Result<SegRef> {
     stats.segments += 1;
     stats.segment_bytes += bytes;
     src.rt
-        // The index's own writes, after the landing: counted apart from the
-        // push's (BUG-1153).
-        .block_on(src.hub.objects.put_background(src.project, &id, Bytes::from(raw)))
+        .block_on(src.hub.objects.put(src.project, &id, Bytes::from(raw)))
         .map_err(|e| Error::Other(anyhow::anyhow!("storing a search segment: {e}")))?;
     Ok(SegRef { id: id.hex(), bytes })
 }

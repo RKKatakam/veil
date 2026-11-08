@@ -196,9 +196,9 @@ pub fn head_len(first: &[u8]) -> Result<u64> {
 }
 
 /// The index from a pack's first bytes (at least [`head_len`] of them),
-/// checked: ids sorted and distinct, every slot after the index, long
-/// enough for its id and one byte, and, when the pack's length `size` is
-/// known, inside it.
+/// checked: ids sorted and distinct, every slot long enough for its id and
+/// one byte, the slots tiling the entries from the index's end, and, when
+/// the pack's length `size` is known, ending at it.
 pub fn parse_index(first: &[u8], size: Option<u64>) -> Result<Index> {
     let hl = head_len(first)? as usize;
     if first.len() < hl {
@@ -217,6 +217,22 @@ pub fn parse_index(first: &[u8], size: Option<u64>) -> Result<Index> {
             bail!("a pack's index is not sorted");
         }
         entries.push((id, Slot { offset, len }));
+    }
+    // The slots tile the entries exactly, in offset order: each starts where
+    // the one before ends, the first at the index's end, the last at the
+    // pack's end when it is known. So a slot's end is as checked as its start
+    // (the id it starts with): no slot reaches into another (BUG-1394).
+    let mut by_offset: Vec<Slot> = entries.iter().map(|(_, s)| *s).collect();
+    by_offset.sort_unstable_by_key(|s| s.offset);
+    let mut at = hl as u64;
+    for s in &by_offset {
+        if s.offset != at {
+            bail!("a pack's slots do not tile its entries");
+        }
+        at = s.offset + u64::from(s.len);
+    }
+    if size.is_some_and(|size| size != at) {
+        bail!("a pack's slots do not reach its end");
     }
     Ok(Index { entries })
 }
@@ -237,35 +253,47 @@ pub async fn read_index(store: &dyn BlobStore, key: &str) -> Result<Option<(Inde
     Ok(Some((parse_index(&first, Some(size)).with_context(|| format!("reading pack {key}"))?, size)))
 }
 
-/// About the memory one slot takes in a project's lookup map, and a
-/// project's entry with no slot.
-const SLOT_WEIGHT: usize = 80;
+/// The lookup structures' own memory: a project's entry, and each listed
+/// pack it names (its name and bookkeeping); a loaded index weighs
+/// [`Index::weight`] (its entries, exactly: 48 bytes a slot).
 const PROJECT_WEIGHT: usize = 512;
-/// The lookup maps of all projects, together: projects used least recently
-/// are dropped past it (each is read again when next needed), the one in
-/// use last of all. A project whose map alone passes it is dropped too once
-/// it is no longer in use: its lookups then read its listing again.
+const PACK_WEIGHT: usize = 128;
+/// The lookup structures of all projects, together, by their real memory.
+/// Past it, the indexes used least recently are unloaded, those of the
+/// project in use too (BUG-1395, BUG-1396): a lookup that needs an unloaded
+/// index reads it again from storage ([`Packs::find_paged`]), so a project of
+/// any size always reads; then the entries of projects used least
+/// recently, never the one in use.
 pub const LOOKUP_BUDGET: usize = 128 << 20;
+
+/// One listed pack of a project: its index while loaded, and when it was
+/// last searched.
+struct Listed {
+    name: Arc<str>,
+    index: Option<Arc<Index>>,
+    used: AtomicU64,
+}
 
 #[derive(Default)]
 struct Map {
     /// The project's listing was read at least once.
     loaded: bool,
-    packs: HashSet<Arc<str>>,
-    slots: HashMap<ObjectId, (Arc<str>, Slot)>,
+    names: HashSet<Arc<str>>,
+    /// Oldest first.
+    packs: Vec<Listed>,
+}
+
+impl Map {
+    fn weight(&self) -> usize {
+        PROJECT_WEIGHT + self.packs.len() * PACK_WEIGHT + self.packs.iter().filter_map(|l| l.index.as_ref()).map(|i| i.weight()).sum::<usize>()
+    }
 }
 
 struct ProjectPacks {
     /// Serialises listings; when the last one began.
     listing: tokio::sync::Mutex<Option<Instant>>,
     map: RwLock<Map>,
-    used: Mutex<Instant>,
-}
-
-impl ProjectPacks {
-    fn weight(&self) -> usize {
-        PROJECT_WEIGHT + self.map.read().unwrap().slots.len() * SLOT_WEIGHT
-    }
+    used: AtomicU64,
 }
 
 /// What a lookup found.
@@ -273,14 +301,18 @@ pub enum Found {
     At(Arc<str>, Slot),
     /// In no pack this server knows of.
     Absent,
+    /// In no loaded index, and some are unloaded ([`Packs::find_paged`]).
+    Paged,
     /// The project's listing was never read here.
     Unloaded,
 }
 
 /// The uploads a person staged on this server recently, newest first, per
 /// project (a push that lost a race uploads the same objects again: they
-/// get the receipts of the pack that holds them, BUG-1157).
+/// get the receipts of the pack that holds them, BUG-1157); in a bounded
+/// cache (BUG-1396).
 const RECENT_UPLOADS: usize = 8;
+const RECENT_BUDGET: usize = 1 << 20;
 
 /// A person's recent staged packs in a project, newest first.
 type Recent = VecDeque<Arc<str>>;
@@ -292,11 +324,12 @@ pub struct Packs {
     projects: Mutex<HashMap<i64, Arc<ProjectPacks>>>,
     /// [`LOOKUP_BUDGET`] (smaller in tests).
     budget: usize,
+    tick: AtomicU64,
     /// Indexes and lengths of packs staged recently, by name (a push on the
     /// server that took the upload reads them without a storage read);
     /// `None` once discarded here.
     staged: LruCache<Option<(Arc<Index>, u64)>>,
-    recent: Mutex<HashMap<(i64, i64), Recent>>,
+    recent: LruCache<Recent>,
 }
 
 fn name_key(project: i64, name: &str) -> ObjectId {
@@ -307,15 +340,28 @@ fn name_key(project: i64, name: &str) -> ObjectId {
     ObjectId(*h.finalize().as_bytes())
 }
 
+fn person_key(project: i64, person: i64) -> ObjectId {
+    let mut h = blake3::Hasher::new();
+    h.update(b"recent uploads");
+    h.update(&project.to_le_bytes());
+    h.update(&person.to_le_bytes());
+    ObjectId(*h.finalize().as_bytes())
+}
+
 impl Packs {
     pub fn new(db: Option<sqlx::PgPool>) -> Packs {
         Packs {
             db,
             projects: Mutex::new(HashMap::new()),
             budget: LOOKUP_BUDGET,
+            tick: AtomicU64::new(0),
             staged: LruCache::new(32 << 20),
-            recent: Mutex::new(HashMap::new()),
+            recent: LruCache::new(RECENT_BUDGET),
         }
+    }
+
+    fn now(&self) -> u64 {
+        self.tick.fetch_add(1, Ordering::Relaxed)
     }
 
     fn project(&self, project: i64) -> Arc<ProjectPacks> {
@@ -327,26 +373,68 @@ impl Packs {
                 Arc::new(ProjectPacks {
                     listing: tokio::sync::Mutex::new(None),
                     map: RwLock::new(Map::default()),
-                    used: Mutex::new(Instant::now()),
+                    used: AtomicU64::new(0),
                 })
             })
             .clone();
-        *p.used.lock().unwrap() = Instant::now();
+        p.used.store(self.now(), Ordering::Relaxed);
         if fresh {
             Self::evict(&mut g, project, self.budget);
         }
         p
     }
 
-    /// Where object `id` of `project` is, as far as this server knows.
+    /// Where object `id` of `project` is, among the indexes this server
+    /// has loaded (newest pack first).
     pub fn find(&self, project: i64, id: &ObjectId) -> Found {
         let p = self.project(project);
         let m = p.map.read().unwrap();
-        match m.slots.get(id) {
-            Some((n, s)) => Found::At(n.clone(), *s),
-            None if m.loaded => Found::Absent,
-            None => Found::Unloaded,
+        let mut paged = false;
+        for l in m.packs.iter().rev() {
+            match &l.index {
+                Some(index) => {
+                    if let Some(s) = index.get(id) {
+                        l.used.store(self.now(), Ordering::Relaxed);
+                        return Found::At(l.name.clone(), s);
+                    }
+                }
+                None => paged = true,
+            }
         }
+        match (m.loaded, paged) {
+            (false, _) => Found::Unloaded,
+            (true, true) => Found::Paged,
+            (true, false) => Found::Absent,
+        }
+    }
+
+    /// [`Packs::find`] in the indexes of `project` this server unloaded
+    /// (past its budget), read again from storage one at a time, newest
+    /// first; each is loaded again as it is read (and may be unloaded
+    /// again by a later lookup).
+    pub async fn find_paged(&self, store: &Arc<dyn BlobStore>, project: i64, id: &ObjectId, reads: &AtomicU64) -> Result<Option<(Arc<str>, Slot)>> {
+        let p = self.project(project);
+        let unloaded: Vec<Arc<str>> = p.map.read().unwrap().packs.iter().rev().filter(|l| l.index.is_none()).map(|l| l.name.clone()).collect();
+        for name in unloaded {
+            reads.fetch_add(1, Ordering::Relaxed);
+            let Some((index, _)) = read_index(&**store, &key(project, &name)).await? else {
+                bail!("listed pack {name} of project {project} is not in the store");
+            };
+            let index = Arc::new(index);
+            let slot = index.get(id);
+            {
+                let mut m = p.map.write().unwrap();
+                if let Some(l) = m.packs.iter_mut().find(|l| l.name == name) {
+                    l.index = Some(index);
+                    l.used.store(self.now(), Ordering::Relaxed);
+                }
+            }
+            self.evict_now(project);
+            if let Some(s) = slot {
+                return Ok(Some((name, s)));
+            }
+        }
+        Ok(None)
     }
 
     /// Add listed packs to `project`'s map.
@@ -355,36 +443,60 @@ impl Packs {
         {
             let mut m = p.map.write().unwrap();
             for (name, index) in packs {
-                if !m.packs.insert(name.clone()) {
+                if !m.names.insert(name.clone()) {
                     continue;
                 }
-                for (id, s) in index.iter() {
-                    m.slots.insert(*id, (name.clone(), *s));
-                }
+                m.packs.push(Listed { name, index: Some(index), used: AtomicU64::new(self.now()) });
             }
             m.loaded |= loaded;
         }
+        self.evict_now(project);
+    }
+
+    fn evict_now(&self, project: i64) {
         let mut g = self.projects.lock().unwrap();
         Self::evict(&mut g, project, self.budget);
     }
 
-    /// Drop the maps of projects used least recently until the maps fit
-    /// [`LOOKUP_BUDGET`], `last` (the one just used) last of all. Weights
-    /// are read from the maps themselves, under the projects' lock, so an
-    /// add racing an eviction is never counted twice or lost.
-    fn evict(g: &mut HashMap<i64, Arc<ProjectPacks>>, last: i64, budget: usize) {
-        let mut total: usize = g.values().map(|p| p.weight()).sum();
+    /// Fit every project's lookup structures in `budget`, by their real
+    /// memory, read from the maps themselves under the projects' lock (so
+    /// an add racing an eviction is never counted twice or lost): first
+    /// unload the indexes used least recently, of any project; then drop
+    /// the entries of projects used least recently, never `keep`'s (the
+    /// one in use: its listing stays, so its lookups read what they need
+    /// from storage, BUG-1395).
+    fn evict(g: &mut HashMap<i64, Arc<ProjectPacks>>, keep: i64, budget: usize) {
+        let mut total: usize = g.values().map(|p| p.map.read().unwrap().weight()).sum();
         if total <= budget {
             return;
         }
-        let mut by_use: Vec<(bool, Instant, i64)> = g.iter().map(|(k, p)| (*k == last, *p.used.lock().unwrap(), *k)).collect();
+        let mut loaded: Vec<(u64, i64, Arc<str>)> = Vec::new();
+        for (k, p) in g.iter() {
+            for l in p.map.read().unwrap().packs.iter().filter(|l| l.index.is_some()) {
+                loaded.push((l.used.load(Ordering::Relaxed), *k, l.name.clone()));
+            }
+        }
+        loaded.sort();
+        for (_, k, name) in loaded {
+            if total <= budget {
+                return;
+            }
+            let p = &g[&k];
+            let mut m = p.map.write().unwrap();
+            if let Some(l) = m.packs.iter_mut().find(|l| l.name == name) {
+                if let Some(i) = l.index.take() {
+                    total -= i.weight();
+                }
+            }
+        }
+        let mut by_use: Vec<(u64, i64)> = g.iter().filter(|(k, _)| **k != keep).map(|(k, p)| (p.used.load(Ordering::Relaxed), *k)).collect();
         by_use.sort();
-        for (_, _, k) in by_use {
+        for (_, k) in by_use {
             if total <= budget {
                 break;
             }
             if let Some(p) = g.remove(&k) {
-                total -= p.weight();
+                total -= p.map.read().unwrap().weight();
             }
         }
     }
@@ -404,35 +516,35 @@ impl Packs {
             *last = Some(began);
             return Ok(());
         };
-        let rows: Vec<String> = sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND state = $2")
+        let rows: Vec<String> = sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND state = $2 ORDER BY created_at, name")
             .bind(project)
             .bind(LISTED)
             .fetch_all(db)
             .await?;
         let new: Vec<String> = {
             let m = p.map.read().unwrap();
-            rows.into_iter().filter(|n| !m.packs.contains(n.as_str())).collect()
+            rows.into_iter().filter(|n| !m.names.contains(n.as_str())).collect()
         };
-        let mut got = Vec::new();
+        let mut got: Vec<Option<(Arc<str>, Arc<Index>)>> = vec![None; new.len()];
         let mut set = tokio::task::JoinSet::new();
-        let mut it = new.into_iter();
+        let mut it = new.into_iter().enumerate();
         loop {
             while set.len() < 16 {
-                let Some(name) = it.next() else { break };
+                let Some((i, name)) = it.next() else { break };
                 let (k, name): (String, Arc<str>) = (key(project, &name), name.into());
                 reads.fetch_add(1, Ordering::Relaxed);
                 let store = store.clone();
-                set.spawn(async move { (name, read_index(&*store, &k).await) });
+                set.spawn(async move { (i, name, read_index(&*store, &k).await) });
             }
             match set.join_next().await {
-                Some(Ok((name, Ok(Some((index, _)))))) => got.push((name, Arc::new(index))),
-                Some(Ok((name, Ok(None)))) => bail!("listed pack {name} of project {project} is not in the store"),
-                Some(Ok((_, Err(e)))) => return Err(e),
+                Some(Ok((i, name, Ok(Some((index, _)))))) => got[i] = Some((name, Arc::new(index))),
+                Some(Ok((_, name, Ok(None)))) => bail!("listed pack {name} of project {project} is not in the store"),
+                Some(Ok((_, _, Err(e)))) => return Err(e),
                 Some(Err(e)) => return Err(e.into()),
                 None => break,
             }
         }
-        self.add(project, got, true);
+        self.add(project, got.into_iter().flatten().collect(), true);
         *last = Some(began);
         Ok(())
     }
@@ -469,17 +581,19 @@ impl Packs {
     pub fn staged_here(&self, project: i64, person: i64, name: &Arc<str>, index: Arc<Index>, size: u64) {
         let w = index.weight();
         self.staged.insert(name_key(project, name), Some((index, size)), w);
-        let mut r = self.recent.lock().unwrap();
-        let q = r.entry((project, person)).or_default();
+        let k = person_key(project, person);
+        let mut q = self.recent.get(&k).unwrap_or_default();
         q.push_front(name.clone());
         q.truncate(RECENT_UPLOADS);
+        let w = 96 + q.len() * 48;
+        self.recent.insert(k, q, w);
     }
 
     /// A pack `person` staged here recently that holds every one of `ids`
     /// and is still staged or listed (asked of the database): an upload of
     /// those objects again gets its receipts instead of a new pack.
     pub async fn staged_holding(&self, project: i64, person: i64, ids: &[ObjectId]) -> Result<Option<Arc<str>>> {
-        let names: Vec<Arc<str>> = self.recent.lock().unwrap().get(&(project, person)).map(|q| q.iter().cloned().collect()).unwrap_or_default();
+        let names: Vec<Arc<str>> = self.recent.get(&person_key(project, person)).map(|q| q.into_iter().collect()).unwrap_or_default();
         for name in names {
             let Some(Some((index, _))) = self.staged.get(&name_key(project, &name)) else { continue };
             if !ids.iter().all(|id| index.get(id).is_some()) {
@@ -551,22 +665,6 @@ impl Packs {
         Ok(())
     }
 
-    /// Delete a push's own pack `name` of `project` (written before its
-    /// transaction) when the database shows its transaction did not list
-    /// it: no row (an own pack's row is written only in that transaction).
-    pub async fn delete_if_unlisted(&self, store: &dyn BlobStore, project: i64, name: &str) -> Result<()> {
-        if let Some(db) = &self.db {
-            let row: Option<i16> = sqlx::query_scalar("SELECT state FROM packs WHERE project_id = $1 AND name = $2")
-                .bind(project)
-                .bind(name)
-                .fetch_optional(db)
-                .await?;
-            if row.is_some() {
-                return Ok(());
-            }
-        }
-        store.delete(&key(project, name)).await
-    }
 }
 
 #[cfg(test)]
@@ -634,8 +732,12 @@ mod tests {
         assert!(valid_name(&new_name()) && !valid_name("../x") && !valid_name(&"A".repeat(32)));
     }
 
-    /// The lookup maps stay within their budget, every project's entry
-    /// counted; the project in use is dropped last.
+    fn total(packs: &Packs) -> usize {
+        packs.projects.lock().unwrap().values().map(|p| p.map.read().unwrap().weight()).sum()
+    }
+
+    /// The lookup structures stay within their budget, every project's
+    /// entry counted; the project in use keeps its entry.
     #[test]
     fn lookup_maps_are_bounded_by_bytes() {
         let budget = 1 << 20;
@@ -644,48 +746,58 @@ mod tests {
             let objects: Vec<_> = (0..n).map(|i| obj(&format!("{salt} {i}"))).collect();
             Arc::new(build(objects).unwrap().1)
         };
-        let per = budget / SLOT_WEIGHT / 3;
+        let per = budget / 48 / 3;
         for p in 0..5 {
             packs.listed_here(p, vec![(Arc::from(new_name()), index(per, p as usize))]);
-            let g = packs.projects.lock().unwrap();
-            let total: usize = g.values().map(|p| p.weight()).sum();
-            assert!(total <= budget, "{total} bytes after project {p}");
-            assert!(g.contains_key(&p), "the project in use is kept");
-            assert!(g.len() <= 3, "older projects dropped");
+            assert!(total(&packs) <= budget, "{} bytes after project {p}", total(&packs));
+            assert!(packs.projects.lock().unwrap().contains_key(&p), "the project in use is kept");
+            assert!(matches!(packs.find(p, &obj(&format!("{p} 7")).0), Found::At(..)), "the index just used is loaded");
         }
         // Many projects touched once: bounded too.
         for p in 100..100 + (budget / PROJECT_WEIGHT) as i64 + 10 {
             let _ = packs.find(p, &ObjectId::hash(b"x"));
         }
-        let g = packs.projects.lock().unwrap();
-        assert!(g.values().map(|p| p.weight()).sum::<usize>() <= budget);
+        assert!(total(&packs) <= budget);
     }
 
-    /// BUG-1395 (S28 cycle 2): a project whose lookup map alone passes the
-    /// budget is dropped by the eviction that follows adding it, so the
-    /// lookup right after finds a fresh, unloaded map: `refresh` reads the
-    /// listing and every index, `add`s them (`loaded`), and `evict` removes
-    /// the project it just filled; `Objects::in_pack` then asks `find`,
-    /// which makes a new empty map (`Found::Unloaded`), and answers `None`.
-    /// Every packed object of a project with more than about 1.68 million
-    /// of them (`LOOKUP_BUDGET` / `SLOT_WEIGHT`) reads as missing, each read
-    /// after reading every index of the project again (twice: `in_pack` is
-    /// asked again after the loose read). What `refresh` does with the
-    /// listing a database gave, here with a budget of 1 MiB.
-    #[test]
-    #[ignore = "BUG-1395: a project whose lookup map passes the budget is evicted as it is filled: its packed objects read as missing"]
-    fn bug_1395_a_project_past_the_lookup_budget_still_finds_its_objects() {
+    /// BUG-1395 (S28 cycle 2, fixed): a project whose lookup structures
+    /// alone pass the budget lost its map as it was filled, so its packed
+    /// objects read as missing. Now its indexes are unloaded past the budget
+    /// (its listing kept), and a lookup reads them again from storage
+    /// (`Packs::find_paged`): every object of a project of any size is
+    /// found. Here with a budget of 1 MiB and a pack's index of more.
+    #[tokio::test]
+    async fn bug_1395_a_project_past_the_lookup_budget_still_finds_its_objects() {
         let budget = 1 << 20;
         let packs = Packs { budget, ..Packs::new(None) };
-        let n = budget / SLOT_WEIGHT + 100;
+        let n = budget / 48 + 100;
         let objects: Vec<_> = (0..n).map(|i| obj(&format!("big {i}"))).collect();
         let probe = objects[n / 2].0;
-        let index = Arc::new(build(objects).unwrap().1);
+        let (bytes, index) = build(objects).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn BlobStore> = Arc::new(crate::store::FsStore::new(dir.path()));
+        let name: Arc<str> = Arc::from(new_name());
+        store.put(&key(7, &name), bytes).await.unwrap();
         // `refresh`, with the listing a database answered.
-        packs.add(7, vec![(Arc::from(new_name()), index)], true);
-        // `Objects::in_pack`, right after.
-        let found = packs.find(7, &probe);
-        assert!(matches!(found, Found::At(..)), "an object of a listed pack, just read, is not found (unloaded: {})", matches!(found, Found::Unloaded));
+        packs.add(7, vec![(name.clone(), Arc::new(index))], true);
+        assert!(total(&packs) <= budget, "within the budget: {}", total(&packs));
+        assert!(packs.projects.lock().unwrap().contains_key(&7), "the project in use keeps its listing");
+        // `Objects::in_pack`, right after: found, from storage if need be.
+        let reads = AtomicU64::new(0);
+        let found = match packs.find(7, &probe) {
+            Found::At(n, s) => Some((n, s)),
+            Found::Paged => packs.find_paged(&store, 7, &probe, &reads).await.unwrap(),
+            Found::Absent | Found::Unloaded => None,
+        };
+        let (n2, s) = found.expect("an object of a listed pack of a project past the budget is found");
+        assert_eq!(n2, name);
+        let (b, _) = store.get_range(&key(7, &name), s.offset, s.last()).await.unwrap().unwrap();
+        assert!(entry(&probe, &b).is_ok());
+        // An object it does not hold: absent, not an error.
+        let missing = ObjectId::hash(b"not in the pack");
+        if matches!(packs.find(7, &missing), Found::Paged) {
+            assert!(packs.find_paged(&store, 7, &missing, &reads).await.unwrap().is_none());
+        }
     }
 
     /// BUG-1396 (S28 cycle 2), the same class: the recent uploads of each
@@ -694,14 +806,13 @@ mod tests {
     /// unlike the staged indexes beside them (an `LruCache` of 32 MiB), the
     /// map grows with the server's uptime.
     #[test]
-    #[ignore = "BUG-1396: the recent uploads map keeps an entry for every (project, person) that ever uploaded: never bounded"]
     fn bug_1396_recent_uploads_are_bounded() {
         let packs = Packs::new(None);
         let index = Arc::new(build(vec![obj("one")]).unwrap().1);
         for person in 0..200_000 {
             packs.staged_here(1, person, &Arc::from(new_name()), index.clone(), 100);
         }
-        let kept = packs.recent.lock().unwrap().len();
+        let kept = packs.recent.stats().entries;
         assert!(kept <= 10_000, "{kept} people's recent uploads kept, with nothing staged left to name for most");
     }
 
@@ -713,7 +824,6 @@ mod tests {
     /// back to the system): maps the budget allows of projects of 460,000
     /// packed objects each hold about 1.5 times `LOOKUP_BUDGET`.
     #[test]
-    #[ignore = "BUG-1396: the lookup maps hold up to ~1.8x LOOKUP_BUDGET: a slot is counted at 80 bytes, a doubled table holds ~146"]
     fn bug_1396_lookup_maps_stay_within_their_budget_in_memory() {
         const CHILD: &str = "VEIL_TEST_LOOKUP_MAPS_CHILD";
         const NAME: &str = "pack::tests::bug_1396_lookup_maps_stay_within_their_budget_in_memory";
@@ -733,9 +843,8 @@ mod tests {
                 packs.listed_here(p, vec![(Arc::from(new_name()), Arc::new(Index { entries }))]);
             }
             let grew = rss().saturating_sub(before);
-            let g = packs.projects.lock().unwrap();
-            let accounted: usize = g.values().map(|p| p.weight()).sum();
-            println!("LOOKUP-MAPS projects={} accounted={accounted} grew={grew}", g.len());
+            let accounted = total(&packs);
+            println!("LOOKUP-MAPS projects={} accounted={accounted} grew={grew}", packs.projects.lock().unwrap().len());
             return;
         }
         let out = std::process::Command::new(std::env::current_exe().unwrap())

@@ -206,14 +206,14 @@ pub async fn start(config: Config) -> Result<Running> {
     tokio::spawn(caches::listen(hub.clone(), rx.clone()));
     let task = tokio::spawn(serve_tls(listener, tls, app, rx, None));
     if config.catch_up_at_start {
-        tokio::spawn(store::in_background({
+        tokio::spawn({
             let hub = hub.clone();
             async move {
                 derive::resume(hub.clone(), None).await;
                 // The search index follows (S15, BUG-1231).
                 crate::search::index::resume(hub, None).await;
             }
-        }));
+        });
     }
     Ok(Running {
         addr,

@@ -895,16 +895,14 @@ fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, t
     *hub.query.started.lock().unwrap().entry(project.id).or_default() += 1;
     drop(fills);
     let (hub, project, viewer, tips) = (hub.clone(), project.clone(), viewer.clone(), tips.to_vec());
-    // Its writes (the projections it stores) are background work, counted
-    // apart from a push's (`store::in_background`).
-    tokio::spawn(crate::store::in_background(async move {
+    tokio::spawn(async move {
         let r = leased_fill(&hub, &project, &viewer, &key.1, &tips).await;
         if let Err(e) = &r {
             eprintln!("veil-server: filling a viewer graph of project {}: {e:?}", project.id);
         }
         hub.query.fills.lock().unwrap().remove(&key);
         let _ = tx.send(Some(r.map(|_| ()).map_err(|e| format!("{e:?}"))));
-    }));
+    });
     (rx, true)
 }
 

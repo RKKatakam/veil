@@ -58,6 +58,10 @@ pub trait BlobStore: Send + Sync {
     /// Remove the object at `key` (no error if there is none): only packs
     /// that were discarded (`pack::Packs::discard`) are ever removed.
     async fn delete(&self, key: &str) -> Result<()>;
+    /// Every key that starts with `prefix` (a folder of keys, `…/`): what
+    /// the store holds, to compare with the database's rows (the tests;
+    /// S29's job).
+    async fn list(&self, prefix: &str) -> Result<Vec<String>>;
 }
 
 /// Bytes `start..=end` of `b`, clamped.
@@ -157,6 +161,34 @@ impl BlobStore for FsStore {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
             _ => Ok(()),
         }
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        let dir = self.path(prefix.trim_end_matches('/'))?;
+        let prefix = prefix.trim_end_matches('/').to_string();
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let mut out = Vec::new();
+            let mut stack = vec![(dir, prefix)];
+            while let Some((d, k)) = stack.pop() {
+                let rd = match std::fs::read_dir(&d) {
+                    Ok(rd) => rd,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                for e in rd {
+                    let e = e?;
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if e.file_type()?.is_dir() {
+                        stack.push((e.path(), format!("{k}/{name}")));
+                    } else if !name.starts_with(".tmp") {
+                        out.push(format!("{k}/{name}"));
+                    }
+                }
+            }
+            out.sort();
+            Ok(out)
+        })
+        .await?
     }
 }
 
@@ -316,6 +348,32 @@ impl BlobStore for S3Store {
         }
     }
 
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        use rusty_s3::S3Action;
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut action = self.bucket.list_objects_v2(Some(&self.credentials));
+            action.with_prefix(prefix);
+            if let Some(t) = &token {
+                action.with_continuation_token(t.clone());
+            }
+            let url = action.sign(S3_SIGN_FOR);
+            let (status, body) = s3_send(|| self.http.get(url.clone())).await?;
+            if status != 200 {
+                bail!("S3 LIST: HTTP {status}");
+            }
+            let page = rusty_s3::actions::ListObjectsV2::parse_response(&body).map_err(|e| anyhow!("S3 LIST: {e}"))?;
+            out.extend(page.contents.into_iter().map(|c| c.key));
+            match page.next_continuation_token {
+                Some(t) => token = Some(t),
+                None => break,
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     async fn exists(&self, key: &str) -> Result<bool> {
         use rusty_s3::S3Action;
         let url = self.bucket.head_object(Some(&self.credentials), key).sign(S3_SIGN_FOR);
@@ -399,16 +457,15 @@ pub struct Objects {
     packs: crate::pack::Packs,
     /// Requests to the store, for the benchmarks' cost gates
     /// (`storage-and-cost.md` §9): writes, bytes written, reads; of the
-    /// writes, those no push or upload made (`background_writes`: the
-    /// deriver's, the search index's, the viewer graphs' after a landing,
-    /// and the projected trees a grant stores on a pull).
+    /// writes, a push's and an upload's own (`own_writes`: those made in
+    /// their scope, [`own`], counted where they are made: BUG-1398).
     pub writes: AtomicU64,
     pub written_bytes: AtomicU64,
     pub reads: AtomicU64,
-    pub background_writes: AtomicU64,
-    /// Database commits of uploads (each records its staged pack: S28),
-    /// apart from the push's one.
-    pub upload_commits: AtomicU64,
+    pub own_writes: AtomicU64,
+    /// Database commits that record a pack before it is written (an
+    /// upload's, a push's own: S28), apart from a push's transaction.
+    pub pack_rows: AtomicU64,
 }
 
 /// The largest object the store holds, decoded: the largest a frame
@@ -442,14 +499,24 @@ pub fn encode(raw: Bytes) -> Bytes {
 }
 
 tokio::task_local! {
-    /// Set in the deriver's tasks: their writes are counted apart.
-    static BACKGROUND: ();
+    /// Set while a push or an upload runs (not in what it spawns: the
+    /// deriver, the search index, viewer graphs).
+    static OWN: ();
 }
 
-/// Run `f` as the deriver's background work: what it stores is counted in
-/// [`Objects::background_writes`].
-pub async fn in_background<F: std::future::Future>(f: F) -> F::Output {
-    BACKGROUND.scope((), f).await
+/// Run `f` as a push's or an upload's own work: the storage writes made in
+/// it count in [`Objects::own_writes`] (BUG-1398: attributed where they are
+/// made, not by subtracting known kinds of other work).
+pub async fn own<F: std::future::Future>(f: F) -> F::Output {
+    OWN.scope((), f).await
+}
+
+fn count_write(o: &Objects, bytes: usize) {
+    bump(&o.writes);
+    o.written_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    if OWN.try_with(|_| ()).is_ok() {
+        bump(&o.own_writes);
+    }
 }
 
 /// Objects of one pack read together, by offset.
@@ -488,8 +555,8 @@ impl Objects {
             writes: Default::default(),
             written_bytes: Default::default(),
             reads: Default::default(),
-            background_writes: Default::default(),
-            upload_commits: Default::default(),
+            own_writes: Default::default(),
+            pack_rows: Default::default(),
         }
     }
 
@@ -520,19 +587,22 @@ impl Objects {
         ObjectId(*h.finalize().as_bytes())
     }
 
-    /// Where object `id` of `project` is: a listed pack this server knows,
-    /// or (`again`, after a miss everywhere since `since`) one listed since.
+    /// Where object `id` of `project` is: a listed pack whose index this
+    /// server holds; or (`again`, after a miss everywhere since `since`) one
+    /// listed since, or one whose index it unloaded past its budget (read
+    /// again from storage: BUG-1395).
     async fn in_pack(&self, project: i64, id: &ObjectId, again: bool, since: Instant) -> Result<Option<(Arc<str>, Slot)>> {
         match self.packs.find(project, id) {
             Found::At(n, s) => return Ok(Some((n, s))),
-            Found::Absent if !again => return Ok(None),
+            Found::Absent | Found::Paged if !again => return Ok(None),
             _ => {}
         }
         self.packs.refresh(&self.store, project, since, &self.reads).await?;
-        Ok(match self.packs.find(project, id) {
-            Found::At(n, s) => Some((n, s)),
-            _ => None,
-        })
+        match self.packs.find(project, id) {
+            Found::At(n, s) => Ok(Some((n, s))),
+            Found::Paged => self.packs.find_paged(&self.store, project, id, &self.reads).await,
+            Found::Absent | Found::Unloaded => Ok(None),
+        }
     }
 
     /// Bytes `start..=end` of the encoding of object `id` at slot `s` of
@@ -656,7 +726,7 @@ impl Objects {
                 Ok(None) => None,
                 r => Some(r),
             }),
-            Found::Unloaded => None,
+            Found::Paged | Found::Unloaded => None,
         };
         let Some(r) = direct else {
             return rt.block_on(self.get(project, id));
@@ -671,19 +741,9 @@ impl Objects {
         self.put_encoded(project, id, encode(raw)).await
     }
 
-    /// [`Objects::put`] for work that is no push's or upload's (the
-    /// deriver, the search index, grants): counted apart.
-    pub async fn put_background(&self, project: i64, id: &ObjectId, raw: Bytes) -> Result<()> {
-        BACKGROUND.scope((), self.put(project, id, raw)).await
-    }
-
     /// Store `enc`, an encoding of object `id` the caller has checked, loose.
     pub async fn put_encoded(&self, project: i64, id: &ObjectId, enc: Bytes) -> Result<()> {
-        bump(&self.writes);
-        if BACKGROUND.try_with(|_| ()).is_ok() {
-            bump(&self.background_writes);
-        }
-        self.written_bytes.fetch_add(enc.len() as u64, Ordering::Relaxed);
+        count_write(self, enc.len());
         self.store.put(&object_key(project, id), enc.clone()).await?;
         self.cache.insert(Self::cache_key(project, id), enc.clone(), enc.len());
         Ok(())
@@ -695,12 +755,15 @@ impl Objects {
     /// [`Objects::listed_here`] is told.
     /// Its objects are cached under the pack's staged keys (the project's
     /// once listed: [`Objects::listed_here`]).
-    pub async fn put_pack(&self, project: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<(Arc<str>, Arc<Index>, u64)> {
-        self.write_pack(project, objects, None).await
+    /// It is recorded staged for `person` (a row) before it is written, so
+    /// the database names every pack in storage, whatever stops the request
+    /// after (BUG-1399).
+    pub async fn put_pack(&self, project: i64, person: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<(Arc<str>, Arc<Index>, u64)> {
+        self.write_pack(project, objects, Some(person)).await
     }
 
     /// [`Objects::put_pack`]; with `staged_by`, the pack is recorded staged
-    /// for that person before it is written.
+    /// for that person before it is written (without, only in tests).
     async fn write_pack(&self, project: i64, objects: Vec<(ObjectId, Bytes)>, staged_by: Option<i64>) -> Result<(Arc<str>, Arc<Index>, u64)> {
         let name: Arc<str> = crate::pack::new_name().into();
         for (id, enc) in &objects {
@@ -710,10 +773,9 @@ impl Objects {
         let size = bytes.len() as u64;
         if let Some(person) = staged_by {
             self.packs.record_staged(project, person, &name, size, index.len()).await?;
-            bump(&self.upload_commits);
+            bump(&self.pack_rows);
         }
-        bump(&self.writes);
-        self.written_bytes.fetch_add(size, Ordering::Relaxed);
+        count_write(self, size as usize);
         self.store.put(&crate::pack::key(project, &name), bytes).await?;
         Ok((name, Arc::new(index), size))
     }
@@ -773,7 +835,10 @@ impl Objects {
     /// [`PREFETCH_SPAN`] per request; each entry's id checked and each
     /// object checked against its id before it is cached (BUG-1152: a
     /// clone's fetch asked one request per object). A read that fails here
-    /// is only not cached: the object's own read reports it.
+    /// is only not cached: the object's own read reports it. What a request
+    /// reads and what each object decodes to are held under
+    /// [`DECODED_IN_FLIGHT`] (shares taken without waiting: without one,
+    /// nothing is read ahead).
     pub async fn prefetch(&self, project: i64, ids: &[ObjectId]) {
         let mut by_pack: std::collections::HashMap<Arc<str>, Run> = Default::default();
         let mut seen = std::collections::HashSet::new();
@@ -826,12 +891,33 @@ impl Objects {
                     break;
                 }
                 let Ok(enc) = crate::pack::entry(&id, &bytes[from..=to]) else { continue };
+                // Its check decodes it: within a share of the bound on
+                // decoded bytes for what it declares (BUG-1159), or not
+                // read ahead (its own read takes the share and checks it).
+                let declared = encoding::declared_len(&enc[..enc.len().min(encoding::HEADER)], enc.len() as u64).unwrap_or(MAX_OBJECT);
+                let Some(_decoding) = ReadAhead::try_take(declared) else { continue };
                 let enc = Bytes::copy_from_slice(enc);
                 if decoded(&id, &enc).is_ok() {
                     self.cache.insert(Self::cache_key(project, &id), enc.clone(), enc.len());
                 }
             }
         }
+    }
+
+    /// What object `id` at slot `s` of staged pack `name` of `project`
+    /// decodes to, as its encoding declares (S27), from its first bytes
+    /// only (or the cache), its entry's id checked; `None` if the pack is
+    /// gone.
+    pub async fn staged_declared(&self, project: i64, name: &str, s: Slot, id: &ObjectId) -> Result<Option<u64>> {
+        if let Some(enc) = self.cache.get(&Self::staged_key(project, name, id, false)) {
+            return Ok(encoding::declared_len(&enc[..enc.len().min(encoding::HEADER)], enc.len() as u64));
+        }
+        bump(&self.reads);
+        let last = s.last().min(s.offset + crate::pack::ID_LEN + encoding::HEADER as u64 - 1);
+        let Some((b, _)) = self.store.get_range(&crate::pack::key(project, name), s.offset, last).await? else {
+            return Ok(None);
+        };
+        Ok(encoding::declared_len(crate::pack::entry(id, &b)?, s.encoding_len()))
     }
 
     /// The encoding of object `id` at slot `s` of staged pack `name` of
@@ -863,17 +949,6 @@ impl Objects {
             }
         }
         self.packs.listed_here(project, packs);
-    }
-
-    /// Delete a push's own packs `names` of `project` that no transaction
-    /// listed (the database has no row for them: an own pack's row is
-    /// written only by the transaction that lists it). Fresh names no
-    /// receipt carries, so nobody else can list them.
-    pub async fn delete_unlisted(&self, project: i64, names: &[Arc<str>]) -> Result<()> {
-        for n in names {
-            self.packs.delete_if_unlisted(&*self.store, project, n).await?;
-        }
-        Ok(())
     }
 
     /// Discard packs `names` of `project` that no transaction listed
@@ -1011,6 +1086,9 @@ mod tests {
             async fn delete(&self, key: &str) -> Result<()> {
                 self.0.delete(key).await
             }
+            async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+                self.0.list(prefix).await
+            }
         }
         let whole = Whole(FsStore::new(dir.path()));
         let key = object_key(1, &id);
@@ -1147,7 +1225,7 @@ mod tests {
         let (oid, hid) = (ObjectId::hash(&open), ObjectId::hash(&hidden));
         let encs = vec![(oid, encode(open.clone())), (hid, encode(hidden.clone()))];
         assert!(!encoding::is_compressed(&encs[0].1) && !encoding::is_compressed(&encs[1].1), "both stored plain");
-        let (name, index, _) = objects.put_pack(1, encs).await.unwrap();
+        let (name, index, _) = objects.put_pack(1, 7, encs).await.unwrap();
         // The index damaged: the open object's entry names the hidden one's
         // slot (the rest of the pack intact).
         let path = dir.path().join(crate::pack::key(1, &name));
@@ -1158,7 +1236,12 @@ mod tests {
         bytes[at + 40..at + 44].copy_from_slice(&hs.len.to_be_bytes());
         assert_ne!(os, hs);
         std::fs::write(&path, &bytes).unwrap();
-        let damaged = Arc::new(crate::pack::parse_index(&bytes, Some(bytes.len() as u64)).expect("a damaged index that parses"));
+        let damaged = match crate::pack::parse_index(&bytes, Some(bytes.len() as u64)) {
+            // Refused (the slots no longer tile the pack, BUG-1394): nothing
+            // to read, which closes the class.
+            Err(_) => return,
+            Ok(i) => Arc::new(i),
+        };
         // A server that reads the damaged index (nothing cached).
         let fresh = Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20);
         fresh.listed_here(1, vec![(name.clone(), damaged)]);
@@ -1191,7 +1274,6 @@ mod tests {
     /// `head`'s length) are wrong. `parse_index` accepts it: slots are
     /// checked to be inside the pack, not to tile it.
     #[tokio::test]
-    #[ignore = "BUG-1394: a slot longer than its entry passes the id check and a ranged read serves the next entry's bytes"]
     async fn bug_1394_a_slot_too_long_never_serves_its_neighbours_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let objects = Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20);
@@ -1200,7 +1282,7 @@ mod tests {
         let (oid, hid) = (ObjectId::hash(&open), ObjectId::hash(&hidden));
         let encs = vec![(oid, encode(open.clone())), (hid, encode(hidden.clone()))];
         assert!(!encoding::is_compressed(&encs[0].1) && !encoding::is_compressed(&encs[1].1), "both stored plain");
-        let (name, index, _) = objects.put_pack(1, encs).await.unwrap();
+        let (name, index, _) = objects.put_pack(1, 7, encs).await.unwrap();
         let (os, hs) = (index.get(&oid).unwrap(), index.get(&hid).unwrap());
         assert_eq!(os.offset + u64::from(os.len), hs.offset, "the hidden entry follows the open one");
         // The index damaged: the open object's slot as long as both entries.
@@ -1248,7 +1330,7 @@ mod tests {
         let raws: Vec<Bytes> = (0..3).map(|i| Bytes::from(format!("veil:blob\nneighbour {i}: MARKER-NEIGHBOUR-{i}-ab37"))).collect();
         let encs: Vec<(ObjectId, Bytes)> = raws.iter().map(|r| (ObjectId::hash(r), encode(r.clone()))).collect();
         let ids: Vec<ObjectId> = encs.iter().map(|(id, _)| *id).collect();
-        let (name, index, _) = objects.put_pack(1, encs).await.unwrap();
+        let (name, index, _) = objects.put_pack(1, 7, encs).await.unwrap();
         let path = dir.path().join(crate::pack::key(1, &name));
         let mut bytes = std::fs::read(&path).unwrap();
         let mid = index.get(&ids[1]).unwrap();
@@ -1278,7 +1360,6 @@ mod tests {
     /// prefetches at once of two neighbouring objects of 48 MiB that compress
     /// about 52 times hold far more than `DECODED_IN_FLIGHT` decoded.
     #[test]
-    #[ignore = "BUG-1159: a fetch's neighbour reads decode each object outside the server-wide bound on decoded bytes"]
     fn bug_1159_neighbour_reads_decode_within_the_servers_bound() {
         const CHILD: &str = "VEIL_TEST_PREFETCH_CHILD";
         const NAME: &str = "store::tests::bug_1159_neighbour_reads_decode_within_the_servers_bound";
@@ -1305,7 +1386,7 @@ mod tests {
                     encs.push((ObjectId::hash(&raw), enc));
                 }
                 let ids: Vec<ObjectId> = encs.iter().map(|(id, _)| *id).collect();
-                let (name, index, _) = objects.put_pack(1, encs).await.unwrap();
+                let (name, index, _) = objects.put_pack(1, 7, encs).await.unwrap();
                 drop(objects);
                 // A server that has not read them.
                 let fresh = Arc::new(Objects::new(Arc::new(FsStore::new(dir.path())), 64 << 20));

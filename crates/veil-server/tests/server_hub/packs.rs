@@ -33,7 +33,7 @@ fn pack_rows(hub: &TestHub, project: i64) -> (i64, i64) {
 /// Storage writes of requests: the deriver's in the background aside.
 fn writes(hub: &TestHub) -> u64 {
     let o = &hub.hub().objects;
-    o.writes.load(Relaxed) - o.background_writes.load(Relaxed)
+    o.own_writes.load(Relaxed)
 }
 
 fn blob(text: &str) -> (ObjectId, Vec<u8>) {
@@ -470,16 +470,9 @@ fn bug_1157_a_push_that_lost_a_race_leaves_no_copy_of_its_upload() {
         .block_on(sqlx::query_scalar("SELECT state FROM packs WHERE project_id = $1 AND name = $2").bind(pid).bind(&packs[0]).fetch_optional(&hub.hub().db))
         .unwrap();
     assert_eq!(state, Some(0), "the upload is recorded, staged");
-    // Every pack in storage has a row (a directory store: walk it).
-    if let Some(dir) = hub.objects_dir() {
-        let dir = dir.join(format!("p/{pid}/pack"));
-        let rows: Vec<String> =
-            hub.rt.block_on(sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1").bind(pid).fetch_all(&hub.hub().db)).unwrap();
-        for e in std::fs::read_dir(&dir).unwrap().flatten() {
-            let n = e.file_name().to_string_lossy().into_owned();
-            assert!(rows.contains(&n), "pack {n} in storage has no row");
-        }
-    }
+    // Every pack in storage has a row (whatever the storage: S3 or a
+    // directory).
+    assert_eq!(packs_without_rows(&hub, pid), Vec::<String>::new(), "packs in storage with no row");
     // The same objects, landed on the tip: one more try, which lands.
     let mut c2 = Craft::new(&api, &p.dev, &p.name, "main");
     c2.file("src/raced.rs", "MARKER-RACED-UPLOAD-61aa");
@@ -719,24 +712,20 @@ fn settle(hub: &TestHub) {
     }
 }
 
-/// A server whose objects are in a directory (walked below), whatever
-/// `VEIL_TEST_S3_ENDPOINT` says.
-fn hub_on_a_directory() -> TestHub {
-    TestHub::start_with_s3(&std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL"), std::time::Duration::from_secs(3600), None)
+/// The packs in `project`'s storage (listed from the store itself, S3 or a
+/// directory).
+fn packs_in_store(hub: &TestHub, project: i64) -> Vec<String> {
+    let prefix = format!("p/{project}/pack/");
+    let keys = hub.rt.block_on(hub.blob_store().list(&prefix)).unwrap();
+    keys.iter().filter_map(|k| k.strip_prefix(&prefix)).filter(|n| veil_server::pack::valid_name(n)).map(str::to_string).collect()
 }
 
 /// The packs in `project`'s storage that have no row in `packs`.
 fn packs_without_rows(hub: &TestHub, project: i64) -> Vec<String> {
-    let dir = hub.objects_dir().expect("objects in a directory").join(format!("p/{project}/pack"));
     let rows: Vec<String> =
         hub.rt.block_on(sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1").bind(project).fetch_all(&hub.hub().db)).unwrap();
-    let in_store: Vec<String> = std::fs::read_dir(&dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| veil_server::pack::valid_name(n))
-        .collect();
-    assert!(!in_store.is_empty(), "the project has packs in {}", dir.display());
+    let in_store = packs_in_store(hub, project);
+    assert!(!in_store.is_empty(), "the project has packs in storage");
     in_store.into_iter().filter(|n| !rows.contains(n)).collect()
 }
 
@@ -830,7 +819,8 @@ fn a_guess_gets_one_answer_whatever_receipt_it_shows() {
 /// that is refused, every pack in storage has a row.
 #[test]
 fn every_pack_in_storage_has_a_row_after_refusals_races_and_api_commits() {
-    let hub = hub_on_a_directory();
+    // Whatever the storage (S3 or a directory: listed from the store).
+    let hub = TestHub::start();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let api = hub.api();
@@ -893,9 +883,8 @@ fn every_pack_in_storage_has_a_row_after_refusals_races_and_api_commits() {
 /// there. Here the push waits on the upload's row, held by another
 /// transaction, so the client's 3 s run out within it.
 #[test]
-#[ignore = "BUG-1399: a push cancelled by its client's going away leaves its own pack in storage with no row"]
 fn bug_1399_a_push_whose_client_goes_away_leaves_no_pack_without_a_row() {
-    let hub = hub_on_a_directory();
+    let hub = TestHub::start();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let api = hub.api();
@@ -904,6 +893,7 @@ fn bug_1399_a_push_whose_client_goes_away_leaves_no_pack_without_a_row() {
     let mut c = Craft::new(&api, &p.dev, &p.name, "main");
     c.file("src/gone.rs", "MARKER-CLIENT-GONE-3b7e");
     let s = { let t = c.tip; snap(&mut c, vec![t], "the client goes", None) };
+    let before = packs_in_store(&hub, pid);
     let (map, pack) = upload_all(&api, &c);
     let mut lock = hub.rt.block_on(hub.hub().db.begin()).unwrap();
     hub.rt
@@ -915,12 +905,13 @@ fn bug_1399_a_push_whose_client_goes_away_leaves_no_pack_without_a_row() {
     }));
     assert!(gave_up.is_err(), "the client gave up before the push was answered: {:?}", gave_up.map(|r| r.status));
     // The push's own pack is in storage by now (written before its
-    // transaction, which waits on the row).
+    // transaction, which waits on the row), and has a row (BUG-1399's fix).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while packs_without_rows(&hub, pid).is_empty() {
+    while !packs_in_store(&hub, pid).iter().any(|n| *n != pack && !before.contains(n)) {
         assert!(std::time::Instant::now() < deadline, "the push never wrote its own pack");
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    assert_eq!(packs_without_rows(&hub, pid), Vec::<String>::new(), "the push's own pack has its row before it is written");
     hub.rt.block_on(lock.rollback()).unwrap();
     // Whatever the push does now, it has had time to do it.
     std::thread::sleep(std::time::Duration::from_secs(10));
@@ -941,7 +932,6 @@ fn bug_1399_a_push_whose_client_goes_away_leaves_no_pack_without_a_row() {
 /// `veil-bench load` takes `storage_writes - storage_background_writes` as
 /// the pushes' writes; so does `writes` here.
 #[test]
-#[ignore = "BUG-1398: a pull's projections are counted as a push's storage writes (storage_push_writes_per_op)"]
 fn bug_1398_a_pulls_projections_are_not_counted_as_a_pushs_writes() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -966,7 +956,6 @@ fn bug_1398_a_pulls_projections_are_not_counted_as_a_pushs_writes() {
 /// at once: the bound lets one decode at a time, while all of them hold
 /// their encodings. Hostile size: run alone.
 #[test]
-#[ignore = "BUG-1397: API commits read their uploads' encodings before taking their share of the decoded bound"]
 fn hostile_bug_1397_api_commits_read_their_uploads_within_the_servers_bound() {
     use veil_core::hub::{encoding, wire::put_frame};
     let hub = TestHub::start();

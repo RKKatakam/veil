@@ -173,14 +173,6 @@ impl TestHub {
         self.running.as_ref().unwrap().hub.clone()
     }
 
-    /// The directory objects are stored in, when not in S3.
-    pub fn objects_dir(&self) -> Option<PathBuf> {
-        match &self.config.storage {
-            Storage::Dir(d) => Some(d.clone()),
-            Storage::S3 { .. } => None,
-        }
-    }
-
     /// The server's object storage, opened anew (what another server on it
     /// reads).
     pub fn blob_store(&self) -> Arc<dyn veil_server::store::BlobStore> {

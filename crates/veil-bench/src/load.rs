@@ -107,9 +107,9 @@ pub const GATE_COMMITS_PER_PUSH: f64 = 1.0;
 pub const GATE_STATEMENTS_PER_WARM_PULL: f64 = 5.0;
 /// Storage writes of a push's own requests (S28: its upload's pack, and
 /// the push's own pack when the server completes it), per push attempt (a
-/// landing that lost races pushed, and uploaded, once per try); the
-/// background's and pulls' writes aside (the deriver, the search index,
-/// viewer graphs, grants' projected trees).
+/// landing that lost races pushed, and uploaded, once per try), as the
+/// server counts them in their requests (nothing else: the deriver, the
+/// search index, pulls).
 pub const GATE_STORAGE_WRITES_PER_PUSH: f64 = 2.0;
 
 /// `objects` through a regional cache: the share of objects it serves from
@@ -1217,12 +1217,14 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
             "db_per_request": stmts.map(|(n, _)| if requests > 0 { n / requests as f64 } else { f64::NAN }),
             "db_commits_per_op": writes.map(per_op),
             "db_deriver_writes_per_op": deriver.map(per_op),
-            // The push's own: the deriver's aside, and the uploads' (each
-            // records its staged pack, S28: counted by the server).
-            "db_push_commits_per_op": writes.zip(deriver).map(|(w, d)| per_op((w - d - stat("upload_commits").unwrap_or(0.0)).max(0.0))),
-            "db_upload_commits_per_op": stat("upload_commits").map(per_op),
+            // The push's transaction: the deriver's aside, and the rows that
+            // record packs before they are written (uploads', and a push's
+            // own: S28, counted by the server).
+            "db_push_commits_per_op": writes.zip(deriver).map(|(w, d)| per_op((w - d - stat("pack_row_commits").unwrap_or(0.0)).max(0.0))),
+            "db_pack_row_commits_per_op": stat("pack_row_commits").map(per_op),
             "storage_writes_per_op": stat("storage_writes").map(per_op),
-            "storage_push_writes_per_op": stat("storage_writes").zip(stat("storage_background_writes")).map(|(w, b)| per_op(w - b)),
+            // Counted by the server where they are made (BUG-1398).
+            "storage_push_writes_per_op": stat("storage_own_writes").map(per_op),
             "storage_written_bytes_per_op": stat("storage_written_bytes").map(per_op),
             "storage_reads_per_op": stat("storage_reads").map(per_op),
             "session_hit_share": stat("session_hits").zip(stat("session_misses")).map(|(h, m)| h / (h + m)),

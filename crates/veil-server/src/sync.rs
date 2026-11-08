@@ -1406,7 +1406,19 @@ pub(crate) struct Completed {
 /// push's uploads. Staged packs it does not list are discarded once it is
 /// answered, landed or refused (BUG-930), except after an error the request
 /// may be run again for (a database or store error).
-pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i64, mut req: PushRequest) -> Result<PushResult> {
+pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i64, req: PushRequest) -> Result<PushResult> {
+    // In a task of its own: a client that goes away stops the request, not
+    // the push, so its clean-up always runs (BUG-1399); and in the push's
+    // own scope, so the storage writes it makes are counted as its own
+    // (BUG-1398; what it spawns, the deriver and the indexer, are not).
+    let (hub2, project, viewer) = (hub.clone(), project.clone(), viewer.clone());
+    tokio::spawn(crate::store::own(async move { push_to_its_end(&hub2, &project, &viewer, person, req).await }))
+        .await
+        .map_err(|e| Error::Other(e.into()))?
+}
+
+/// [`push`], to its end.
+async fn push_to_its_end(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i64, mut req: PushRequest) -> Result<PushResult> {
     // The receipts (a long history's are tens of megabytes) are not held
     // through the checks once read.
     let receipts = std::mem::take(&mut req.receipts);
@@ -1431,14 +1443,13 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         Err(Error::Api { .. }) if !p.transaction => (st.names(), p.written),
         // A lost race in its transaction (409), or an error the request may
         // be run again for: the uploads stay (as above); its own pack goes
-        // unless its transaction listed it after all.
+        // (it was recorded staged before it was written: a discard leaves
+        // it alone if its transaction listed it after all).
         Err(_) => (Vec::new(), p.written),
     };
-    if let Err(e) = hub.objects.discard(project.id, &staged_gone).await {
-        eprintln!("veil-server: discarding the uploads a push refused: {e:#}");
-    }
-    if let Err(e) = hub.objects.delete_unlisted(project.id, &own_gone).await {
-        eprintln!("veil-server: deleting a refused push's own pack: {e:#}");
+    let gone: Vec<Arc<str>> = staged_gone.into_iter().chain(own_gone).collect();
+    if let Err(e) = hub.objects.discard(project.id, &gone).await {
+        eprintln!("veil-server: discarding what a push did not list: {e:#}");
     }
     r.map(|(res, _)| res)
 }
@@ -1746,7 +1757,7 @@ async fn push_staged(
     // what the server made, in one pack of the push's own.
     let listed = match plans.is_empty() {
         true => Vec::new(),
-        false => packs_to_list(hub, project.id, &st, &touched, &made, progress).await?,
+        false => packs_to_list(hub, project.id, person, &st, &touched, &made, progress).await?,
     };
     let new_reals: Vec<String> = completed.iter().map(|c| c.real.hex()).collect();
     let origins: Vec<(String, String)> = completed.iter().filter_map(|c| c.origin.map(|o| (c.real.hex(), o.hex()))).collect();
@@ -1982,9 +1993,11 @@ async fn complete_one(
 /// it read from any other staged pack and those the server made for it
 /// (`made`). Nothing a check did not read is kept. `progress` records the
 /// pack it writes.
+#[allow(clippy::too_many_arguments)]
 async fn packs_to_list(
     hub: &Arc<Hub>,
     project: i64,
+    person: i64,
     st: &Staged,
     touched: &HashSet<ObjectId>,
     made: &[ObjectId],
@@ -2024,7 +2037,7 @@ async fn packs_to_list(
         own.extend(enc);
     }
     if !own.is_empty() {
-        let (name, index, size) = hub.objects.put_pack(project, own).await.map_err(Error::Other)?;
+        let (name, index, size) = hub.objects.put_pack(project, person, own).await.map_err(Error::Other)?;
         progress.lock().unwrap().written.push(name.clone());
         listed.push((name, index, size));
     }
@@ -2157,34 +2170,39 @@ pub(crate) async fn take_uploads(
 ) -> Result<(HashSet<ObjectId>, HashMap<ObjectId, Bytes>, Option<crate::store::ReadAhead>)> {
     let staged = receipted(hub, project, person, receipts);
     let st = staging(hub, project, person, &staged).await?;
-    // Their encodings (as uploaded: compressed), and what they decode to.
-    let mut encs = Vec::new();
+    // What they decode to, from their first bytes, before anything is read
+    // whole: the share is taken first (BUG-1397).
     let mut total = 0u64;
+    let mut wanted = Vec::new();
     for (id, (name, slot)) in st.at.iter() {
-        let Some(enc) = hub.objects.staged_encoding(project, name, *slot, id).await.map_err(Error::Other)? else { continue };
-        total = total.saturating_add(encoding::declared_len(&enc[..enc.len().min(encoding::HEADER)], enc.len() as u64).unwrap_or(u64::MAX));
+        let Some(declared) = hub.objects.staged_declared(project, name, *slot, id).await.map_err(Error::Other)? else { continue };
+        total = total.saturating_add(declared);
         if total > MAX_API_UPLOADS {
             return Err(Error::bad_request(format!(
                 "a commit through the API names at most {} MiB of uploaded objects: push larger changes with `vl push`",
                 MAX_API_UPLOADS >> 20
             )));
         }
-        encs.push((*id, enc));
+        wanted.push((*id, name.clone(), *slot));
     }
     let held = match total {
         0 => None,
         n => Some(crate::store::ReadAhead::wait(n).await),
     };
-    let out = tokio::task::spawn_blocking(move || -> Result<HashMap<ObjectId, Bytes>> {
-        let mut out = HashMap::new();
-        for (id, enc) in encs {
-            let raw = encoding::decode(&id, &enc, MAX_API_UPLOADS)?;
-            out.insert(id, Bytes::copy_from_slice(&raw));
-        }
-        Ok(out)
-    })
-    .await
-    .map_err(|e| Error::Other(e.into()))??;
+    // Then one at a time: read, decode (within what it declared), keep.
+    let mut out = HashMap::new();
+    for (id, name, slot) in wanted {
+        let Some(enc) = hub.objects.staged_encoding(project, &name, slot, &id).await.map_err(Error::Other)? else { continue };
+        let raw = tokio::task::spawn_blocking(move || -> veil_core::Result<Bytes> {
+            Ok(match encoding::decode(&id, &enc, MAX_API_UPLOADS)? {
+                Cow::Owned(v) => Bytes::from(v),
+                Cow::Borrowed(_) => enc.clone(),
+            })
+        })
+        .await
+        .map_err(|e| Error::Other(e.into()))??;
+        out.insert(id, raw);
+    }
     Ok((out.keys().copied().collect(), out, held))
 }
 
@@ -2285,7 +2303,7 @@ pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limi
     }
     let ids: Vec<ObjectId> = frames.iter().map(|(id, _)| *id).collect();
     // Encodings, checked above: staged as they are, never encoded again.
-    let pack = hub.objects.stage(project, person, frames).await.map_err(Error::Other)?;
+    let pack = crate::store::own(hub.objects.stage(project, person, frames)).await.map_err(Error::Other)?;
     Ok(ids.iter().map(|id| receipt(hub, project, person, id, &pack)).collect())
 }
 
