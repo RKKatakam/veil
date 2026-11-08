@@ -809,6 +809,21 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
         conflicts: {
             // Kept edits of a version left with a folder (BUG-1531).
             for k in ctx.materialised().kept_edits() {
+                // Only while `@`'s parents record exactly the version
+                // written back: once they record anything else (the
+                // person's own version, committed), it is resolved
+                // (BUG-1558). `@` itself is what the working copy holds
+                // (every command snapshots it), so not the person's choice.
+                if let Some(v) = ctx.materialised().kept_version(k) {
+                    let at = |t: &ObjectId| veil_core::tree::lookup(repo.store(), t, k).map(|e| e.map(|e| e.id));
+                    let mut trees = Vec::new();
+                    for p in &s.parents {
+                        trees.push(repo.snapshot(p)?.tree);
+                    }
+                    if trees.iter().any(|t| at(t).is_ok_and(|e| e != v)) {
+                        continue;
+                    }
+                }
                 if !conflicts.iter().any(|c| c.path == k.as_str()) {
                     conflicts.push(Conflict { path: path(k), recorded_on: None, conflict: None, kept_edit: true });
                 }

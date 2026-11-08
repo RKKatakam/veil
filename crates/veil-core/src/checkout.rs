@@ -162,6 +162,10 @@ pub struct Materialised {
     /// where the working copy held the person's own edit of the version
     /// left: kept, and a conflict for `vl status` until written over.
     kept_edits: BTreeSet<VPath>,
+    /// For each kept edit, the version written back there (`None`: no
+    /// file): the edit is a conflict only while `@` and its parents record
+    /// exactly that (BUG-1558).
+    kept_versions: BTreeMap<VPath, Option<ObjectId>>,
     /// Folders the working copy's change no longer names because its person
     /// lost access to them (the clone moved to their current view,
     /// BUG-1509): what the working copy holds there is theirs, never
@@ -191,6 +195,8 @@ struct MaterialisedRaw {
     left: BTreeMap<String, ObjectId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     kept_edits: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    kept_versions: BTreeMap<String, Option<ObjectId>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     lost: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -215,6 +221,7 @@ impl TryFrom<MaterialisedRaw> for Materialised {
             crlf: r.crlf.iter().map(|s| path(s)).collect::<std::result::Result<_, _>>()?,
             left: r.left.iter().map(|(s, id)| Ok((path(s)?, *id))).collect::<std::result::Result<_, String>>()?,
             kept_edits: r.kept_edits.iter().map(|s| path(s)).collect::<std::result::Result<_, _>>()?,
+            kept_versions: r.kept_versions.iter().map(|(s, id)| Ok((path(s)?, *id))).collect::<std::result::Result<_, String>>()?,
             lost: r.lost.iter().map(|s| path(s)).collect::<std::result::Result<_, _>>()?,
             own: r.own.iter().map(|(s, id)| Ok((path(s)?, *id))).collect::<std::result::Result<_, String>>()?,
         })
@@ -230,6 +237,7 @@ impl From<Materialised> for MaterialisedRaw {
             crlf: m.crlf.into_iter().map(|p| p.as_str().to_string()).collect(),
             left: m.left.into_iter().map(|(p, id)| (p.as_str().to_string(), id)).collect(),
             kept_edits: m.kept_edits.into_iter().map(|p| p.as_str().to_string()).collect(),
+            kept_versions: m.kept_versions.into_iter().map(|(p, id)| (p.as_str().to_string(), id)).collect(),
             lost: m.lost.into_iter().map(|p| p.as_str().to_string()).collect(),
             own: m.own.into_iter().map(|(p, id)| (p.as_str().to_string(), id)).collect(),
         }
@@ -335,6 +343,7 @@ impl Materialised {
                 if fs.metadata(&c.path)?.is_some() {
                     let rel = VPath::new(&c.path.as_str()[l.as_str().len() + 1..]).expect("a path below the folder");
                     if !self.own_copy(store, fs, &c.path, old.get(&rel), cache) {
+                        self.kept_versions.insert(c.path.clone(), c.new.as_ref().map(|e| e.id));
                         self.kept_edits.insert(c.path.clone());
                         continue;
                     }
@@ -355,6 +364,12 @@ impl Materialised {
     /// copy kept the person's own edit of the version left (BUG-1531).
     pub fn kept_edits(&self) -> impl Iterator<Item = &VPath> {
         self.kept_edits.iter()
+    }
+
+    /// The version written back where `path`'s edit was kept: `Some(None)`
+    /// for no file, `None` when not recorded (an older record).
+    pub fn kept_version(&self, path: &VPath) -> Option<Option<ObjectId>> {
+        self.kept_versions.get(path).copied()
     }
 
     /// What checkout wrote at `path` instead of the entry itself, if it did
@@ -391,6 +406,7 @@ impl Materialised {
         for c in changes {
             self.hidden.remove(&c.path);
             self.kept_edits.remove(&c.path);
+            self.kept_versions.remove(&c.path);
             if c.new.is_some() {
                 self.own.remove(&c.path);
             }
@@ -473,7 +489,7 @@ impl Materialised {
                         // The checkout's own copy: the bytes it wrote of the
                         // version left (whatever the policy keeps local, a
                         // copy of a version is not the person's file).
-                        let mut kept: Vec<VPath> = Vec::new();
+                        let mut kept: Vec<(VPath, Option<ObjectId>)> = Vec::new();
                         let ours = |path: &VPath, rel: &VPath| self.own_copy(store, fs, path, old.get(rel), cache.as_deref());
                         let mut seen = BTreeSet::new();
                         for (rel, f) in walk_files_hiding(store, &e.id)?.0 {
@@ -481,7 +497,7 @@ impl Materialised {
                             seen.insert(rel.clone());
                             if fs.metadata(&path)?.is_some() {
                                 if !ours(&path, &rel) {
-                                    kept.push(path);
+                                    kept.push((path, Some(f.id)));
                                     continue;
                                 }
                                 fs.remove_file(&path)?;
@@ -493,13 +509,14 @@ impl Materialised {
                             if fs.metadata(&path)?.is_some() {
                                 match ours(&path, rel) {
                                     true => fs.remove_file(&path)?,
-                                    false => {
-                                        kept.push(path);
-                                    }
+                                    false => kept.push((path, None)),
                                 }
                             }
                         }
-                        self.kept_edits.extend(kept);
+                        for (k, v) in kept {
+                            self.kept_versions.insert(k.clone(), v);
+                            self.kept_edits.insert(k);
+                        }
                         self.left.remove(&p);
                         self.hidden.remove(&p);
                     }
@@ -640,11 +657,23 @@ pub fn restore_paths(
 ) -> Result<CheckoutReport> {
     // A folder the server refuses stays as it is: the caller refused a
     // restore that asks for it (BUG-1529).
-    let changes: Vec<TreeChange> = diff_trees_hiding(store, Some(from), Some(to))?
+    let mut changes: Vec<TreeChange> = diff_trees_hiding(store, Some(from), Some(to))?
         .0
         .into_iter()
         .filter(|c| wanted(&c.path))
         .collect();
+    // A kept edit asked for (BUG-1558): its conflict's advice is that a
+    // restore takes the recorded version, also while `@` still records
+    // that version (the edit not yet recorded): written over the edit.
+    let asked: Vec<VPath> = record.kept_edits.iter().filter(|k| wanted(k) && !changes.iter().any(|c| c.path == **k)).cloned().collect();
+    for k in asked {
+        if let Some(e) = lookup(store, to, &k)?.filter(|e| e.kind.is_file_like()) {
+            if fs.metadata(&k)?.is_some() {
+                fs.remove_file(&k)?;
+            }
+            changes.push(TreeChange { path: k, old: None, new: Some(e) });
+        }
+    }
     let report = apply_changes(store, fs, Some(from), to, &changes, cache, Some(&record.crlf))?;
     record.absorb(fs, &changes, &report)?;
     Ok(report)

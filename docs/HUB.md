@@ -2952,8 +2952,10 @@ protocol or server change.
     left-out checkout kept is compared with the version the folder was left
     from (`Materialised::left`): the checkout's own copy is written over;
     the person's edit is kept as it is and is a conflict in `vl status`
-    (`kept_edit` in `veil.status`) until `vl restore` takes the recorded
-    version (BUG-1531).
+    (`kept_edit` in `veil.status`) while `@`'s parents record exactly the
+    version written back: `vl restore PATH` takes that version, and a
+    commit of the person's own resolves it (BUG-1531, BUG-1558). Links the
+    person makes there are named too (BUG-1559).
   * **after an access change the clone moves to the person's current view
     by itself** (decided, BUG-1509; thin clones). The server names every
     snapshot above a folder the person lost under another id, and serves

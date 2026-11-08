@@ -1009,7 +1009,8 @@ impl<'a> Builder<'a> {
             // is theirs: listed, never recorded, never touched.
             if parent_entry.is_none() && self.opts.materialised.is_some_and(|m| m.lost(&path)) {
                 let files = match kind {
-                    NodeKind::Dir => crate::vfs::walk_files(self.fs, &path, &|_| false)?,
+                    // Links too, never followed (BUG-1559).
+                    NodeKind::Dir => crate::vfs::walk_leaves(self.fs, &path, &|_| false)?.into_iter().map(|(p, _)| p).collect(),
                     _ => vec![path.clone()],
                 };
                 self.report.not_recorded.extend(files);
@@ -1067,7 +1068,8 @@ impl<'a> Builder<'a> {
                                 if self.opts.materialised.is_some_and(|m| m.hidden(&path)) {
                                     // What is there is listed, never silently
                                     // left (BUG-1528), and never touched.
-                                    let files = crate::vfs::walk_files(self.fs, &path, &|_| false)?;
+                                    // Links too, never followed (BUG-1559).
+                                    let files: Vec<VPath> = crate::vfs::walk_leaves(self.fs, &path, &|_| false)?.into_iter().map(|(p, _)| p).collect();
                                     self.report.not_recorded.extend(files);
                                     self.report.carried.push(path.clone());
                                     f.out.insert(e.clone());
