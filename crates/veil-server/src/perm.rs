@@ -73,6 +73,22 @@ impl Viewer {
         self.only.as_ref().is_none_or(|o| veil_core::hub::agent::within(o, dir) || veil_core::hub::agent::toward(o, dir))
     }
 
+    /// The key-ring scopes a narrowed session may see (`None`: not
+    /// narrowed, every scope its person sees): those of the secrets at or
+    /// below its paths, by the rule that seals them
+    /// (`policy::rule_scope`): the rule deciding each of its paths, and every
+    /// rule inside them (BUG-1537).
+    pub fn narrowed_scopes(&self, project: &Project) -> Option<HashSet<String>> {
+        let only = self.only.as_ref()?;
+        let mut out: HashSet<String> = only.iter().map(|o| veil_core::policy::rule_scope(&project.policy, o)).collect();
+        for r in &project.policy.rules {
+            if !r.names.is_empty() && veil_core::hub::agent::within(only, &r.path) {
+                out.insert(veil_core::policy::rule_scope_of(&r.path));
+            }
+        }
+        Some(out)
+    }
+
     /// Refuse a file route's `path` outside the narrowing, as a path that
     /// is not there.
     pub fn narrowed_to(&self, path: &str) -> Result<()> {

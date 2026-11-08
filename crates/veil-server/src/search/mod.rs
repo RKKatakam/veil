@@ -189,6 +189,28 @@ impl Opened {
         })
     }
 
+    /// The live searchable documents at or below `only`'s paths, and their
+    /// bytes: a narrowed session's corpus (BUG-1536).
+    fn live_text_in(&self, only: &[String], b: &Budget) -> Result<(i64, i64)> {
+        let (mut docs, mut bytes) = (0i64, 0i64);
+        for (_, segs) in &self.0 {
+            for i in 0..segs.len() {
+                let (seg, newer) = (&segs[i], &segs[i + 1..]);
+                for o in only {
+                    let (lo, hi) = seg.range(o, "");
+                    for d in &seg.docs[lo as usize..hi as usize] {
+                        b.step(1 + newer.len() as u64)?;
+                        if d.searchable() && !newer.iter().any(|n| n.shadows(&d.path)) {
+                            docs += 1;
+                            bytes += d.size as i64;
+                        }
+                    }
+                }
+            }
+        }
+        Ok((docs, bytes))
+    }
+
     /// How many live documents `keep` accepts hold every trigram of
     /// `want`, counting no further than `cap`: the same number whatever
     /// order the segments are counted in, so a saturated count is still a
@@ -467,14 +489,18 @@ pub async fn search(hub: &Arc<Hub>, ask: &Ask, q: SearchParams, limits: Limits) 
     // the viewer's ids, so a landing they cannot see moves nothing).
     let behind = projected.iter().any(|p| *p != tip);
     let version = ask.policy_version;
+    // A narrowed session's scores are a function of its paths alone: every
+    // statistic is taken over them (BUG-1536).
+    let narrowing = ask.viewer.only.clone();
     blocking(hub, ask.project.id, move |cx| {
         let src = &cx.src;
         let work = Work { n: Cell::new(0), deadline };
         let budget = Budget::new(deadline);
         let keep_lang = |p: &str| exts.is_none_or(|e| has_extension(p, e));
         let code = Opened::open(src, code, &budget)?;
+        let only = narrowing.as_deref().map(|o| o.as_slice());
         let (hits, files, complete) = match name_shards {
-            None => code_hits(src, &code, &terms, &dir, &keep_lang, &work, &budget, &limits)?,
+            None => code_hits(src, &code, &terms, &dir, only, &keep_lang, &work, &budget, &limits)?,
             Some(ns) => name_hits(&Opened::open(src, ns, &budget)?, &code, &terms, &dir, &keep_lang, &work, &budget, &limits)?,
         };
         let (results, next) = page(hits, after, n);
@@ -500,21 +526,26 @@ pub async fn search(hub: &Arc<Hub>, ask: &Ask, q: SearchParams, limits: Limits) 
 
 /// Code hits: candidates (live documents holding every word's trigrams) in
 /// tree order, taken until the bounds, scored by BM25 over the viewer's
-/// shards.
+/// shards, or, for a narrowed session (`only`), over the documents at or
+/// below its paths alone: the number of documents, their bytes and each
+/// trigram's document frequency (BUG-1536).
 #[allow(clippy::too_many_arguments)]
 fn code_hits(
     src: &Source,
     code: &Opened,
     terms: &Terms,
     dir: &str,
+    only: Option<&[String]>,
     keep_lang: &dyn Fn(&str) -> bool,
     work: &Work,
     b: &Budget,
     limits: &Limits,
 ) -> Result<(Vec<Hit>, usize, bool)> {
-    let docs: i64 = code.0.iter().map(|(s, _)| s.text_docs).sum();
-    let bytes: i64 = code.0.iter().map(|(s, _)| s.text_bytes).sum();
-    let searchable = |d: &Doc| d.searchable();
+    let (docs, bytes) = match only {
+        None => (code.0.iter().map(|(s, _)| s.text_docs).sum(), code.0.iter().map(|(s, _)| s.text_bytes).sum()),
+        Some(o) => code.live_text_in(o, b)?,
+    };
+    let searchable = |d: &Doc| d.searchable() && only.is_none_or(|o| veil_core::hub::agent::within(o, &d.path));
     let df: Vec<u64> = terms.grams.iter().map(|g| code.count(g, &searchable, DF_CAP, b)).collect::<Result<_>>()?;
     let n = docs.max(0) as f64;
     let avg = if docs > 0 { (bytes as f64 / docs as f64).max(1.0) } else { 1.0 };

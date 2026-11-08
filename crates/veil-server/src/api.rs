@@ -680,6 +680,9 @@ async fn names_of(c: &mut PgConnection, table: &str, id: i64) -> Result<Vec<Stri
 async fn access(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Query(q): Query<PathQuery>) -> Result<Json<AccessInfo>> {
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     let path = q.path.trim_matches('/').to_string();
+    // A narrowed session: the query routes' one answer outside its paths,
+    // before anything else is looked at (BUG-1537).
+    viewer.narrowed_to(&path)?;
     let view = project.view(&viewer);
     // Who has access names groups and people: for the project's own
     // participants only, and only for a path they may read.
@@ -949,11 +952,18 @@ async fn get_rings(State(hub): State<HubState>, caller: Caller, Path(p): Path<St
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
-    let bodies: Vec<String> = sqlx::query_scalar("SELECT body FROM rings WHERE project_id = $1 ORDER BY scope")
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT scope, body FROM rings WHERE project_id = $1 ORDER BY scope")
         .bind(project.id)
         .fetch_all(&hub.db)
         .await?;
-    Ok(Json(bodies.iter().filter_map(|b| serde_json::from_str(b).ok()).collect()))
+    // A narrowed session: only the rings of the secrets in its paths (BUG-1537).
+    let scopes = viewer.narrowed_scopes(&project);
+    Ok(Json(
+        rows.iter()
+            .filter(|(scope, _)| scopes.as_ref().is_none_or(|s| s.contains(scope)))
+            .filter_map(|(_, b)| serde_json::from_str(b).ok())
+            .collect(),
+    ))
 }
 
 async fn get_ring(State(hub): State<HubState>, caller: Caller, Path((p, scope)): Path<(String, String)>) -> Result<Json<serde_json::Value>> {
@@ -962,11 +972,15 @@ async fn get_ring(State(hub): State<HubState>, caller: Caller, Path((p, scope)):
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
-    let body: Option<String> = sqlx::query_scalar("SELECT body FROM rings WHERE project_id = $1 AND scope = $2")
-        .bind(project.id)
-        .bind(&scope)
-        .fetch_optional(&hub.db)
-        .await?;
+    let body: Option<String> = match viewer.narrowed_scopes(&project) {
+        // Outside a narrowed session's paths: as a ring that does not exist.
+        Some(s) if !s.contains(&scope) => None,
+        _ => sqlx::query_scalar("SELECT body FROM rings WHERE project_id = $1 AND scope = $2")
+            .bind(project.id)
+            .bind(&scope)
+            .fetch_optional(&hub.db)
+            .await?,
+    };
     body.and_then(|b| serde_json::from_str(&b).ok()).map(Json).ok_or_else(|| Error::not_found(format!("no key ring '{scope}'")))
 }
 

@@ -94,6 +94,10 @@ pub async fn list(State(hub): State<HubState>, caller: Caller, Path(p): Path<Str
     let mut viewers: HashMap<i64, Viewer> = HashMap::new();
     let mut out = Vec::new();
     for (path, sharer, recipient, version, created_at, updated_at, unshared_at, body, sid, rid) in rows {
+        // A narrowed session: only the shares of files in its paths (BUG-1537).
+        if !viewer.within_narrowing(&path) {
+            continue;
+        }
         for id in [sid, rid] {
             if let std::collections::hash_map::Entry::Vacant(e) = viewers.entry(id) {
                 e.insert(viewer_of(&hub.db, project.id, id).await?);

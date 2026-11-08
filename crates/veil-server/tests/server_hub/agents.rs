@@ -23,6 +23,30 @@ use veil_core::{
 
 use crate::support::*;
 
+/// The exact answers of the agent-session refusals (`sync.rs`), pinned.
+const NARROWED: &str = "this agent session is narrowed: this would change files outside its paths";
+const ACCESS_MOVE: &str = "an agent session never moves a branch onto a change of a file that decides access or review (.veilpolicy, .veilrules)";
+const DEFAULT_BRANCH_REFUSAL: &str = "an agent session never creates the default branch; its person does";
+const NARROWED_READ: &str = "this agent session is narrowed to other paths: ask for a path inside them";
+const PERSON_ONLY: &str = "an agent session cannot do this; only its person can, with their own session";
+const NO_FORCE: &str = "an agent session never forces a branch move";
+const NO_DELETE: &str = "an agent session never deletes a branch";
+/// The refusal of an agent session's change of a file that decides access.
+fn access_file(path: &str) -> String {
+    format!("an agent session never changes '{path}', which decides access or review")
+}
+
+/// A 200 push answer whose one branch result is refused with exactly `message`.
+fn assert_move_refused(r: &Reply, message: &str, what: &str) {
+    assert_eq!(r.status, 200, "{what}: {}", body(r));
+    assert_eq!((r.json()["results"][0]["ok"].clone(), r.json()["results"][0]["message"].clone()), (json!(false), json!(message)), "{what}: {}", body(r));
+}
+
+/// A 403 `agent_session` with exactly `message`.
+fn assert_agent_refusal(r: &Reply, message: &str, what: &str) {
+    assert_eq!((r.status, r.json()["code"].clone(), r.json()["message"].clone()), (403, json!("agent_session"), json!(message)), "{what}: {}", body(r));
+}
+
 fn session(hub: &TestHub, token: Option<&str>, body: &Value) -> Reply {
     hub.api().post_json(token, "/v1/sessions/agent", body)
 }
@@ -87,8 +111,7 @@ fn an_agent_session_comes_from_a_persons_own_session_and_never_outlives_or_widen
     // An agent session makes no session.
     let agent = s["token"].as_str().unwrap();
     let r = session(&hub, Some(agent), &json!({"project": p.name, "attribution": {"agent": "nested"}}));
-    assert_eq!(r.status, 403, "{}", body(&r));
-    assert!(body(&r).contains("agent_session"), "{}", body(&r));
+    assert_agent_refusal(&r, PERSON_ONLY, "a session from an agent session");
     // Signed out, a project nobody can see, hostile input: refused, never echoed.
     assert_eq!(session(&hub, None, &json!({"project": p.name, "attribution": {"agent": "a"}})).status, 401);
     assert_eq!(session(&hub, Some(&token), &json!({"project": "no-such-project-77", "attribution": {"agent": "a"}})).status, 404);
@@ -103,7 +126,12 @@ fn an_agent_session_comes_from_a_persons_own_session_and_never_outlives_or_widen
         json!({"project": p.name, "attribution": {"agent": "a"}, "wider": true}),
     ] {
         let r = session(&hub, Some(&token), &bad);
-        assert!(r.status == 400 || r.status == 422, "{bad}: {} {}", r.status, body(&r));
+        // An unknown field is the JSON parser's 422; every other input is
+        // the route's own refusal.
+        match bad.get("wider") {
+            Some(_) => assert_eq!(r.status, 422, "{bad}: {}", body(&r)),
+            None => assert_eq!((r.status, r.json()["code"].clone()), (400, json!("bad_request")), "{bad}: {}", body(&r)),
+        }
         assert!(!body(&r).contains('\u{1b}'), "{bad}: echoed");
     }
     // A session for one project works in it only, even where its person
@@ -146,14 +174,13 @@ fn an_agent_session_cannot_change_access_devices_invites_rings_shares_or_project
     ];
     for (path, v) in refused {
         let r = api.post_json(Some(&agent), &path, &v);
-        assert_eq!(r.status, 403, "{path}: {}", body(&r));
-        assert!(body(&r).contains("agent_session"), "{path}: {}", body(&r));
+        assert_agent_refusal(&r, PERSON_ONLY, &path);
     }
     // The ones that parse are refused as an agent's, not for their input.
     let r = api.post_json(Some(&agent), &format!("/v1/projects/{pr}/groups/agents"), &json!({}));
-    assert_eq!(r.status, 403, "{}", body(&r));
+    assert_agent_refusal(&r, PERSON_ONLY, "a group");
     let r = api.post(Some(&agent), &format!("/v1/projects/{}", unique("agentmade")), b"", false);
-    assert_eq!(r.status, 403, "{}", body(&r));
+    assert_agent_refusal(&r, PERSON_ONLY, "a project");
     // Control: the admin's own session creates the group.
     let r = api.post(Some(&p.admin.token()), &format!("/v1/projects/{pr}/groups/agents"), b"", false);
     assert_eq!(r.status, 200, "{}", body(&r));
@@ -188,7 +215,7 @@ fn a_narrowed_session_reads_and_writes_only_inside_its_paths_and_its_history_is_
         ("grep", "pattern=MARKER&path=src"),
     ] {
         let r = q(&hub, Some(&agent), &p.name, route, params);
-        assert_eq!(r.status, 403, "{route}?{params}: {} {}", r.status, body(&r));
+        assert_agent_refusal(&r, NARROWED_READ, &format!("{route}?{params}"));
         assert!(!body(&r).contains("MARKER-OUTSIDE-2d") && !body(&r).contains(PUBLIC_MARK), "{route}?{params}");
         // Control: the person reads it.
         if route != "search" && route != "grep" {
@@ -222,7 +249,11 @@ fn a_narrowed_session_reads_and_writes_only_inside_its_paths_and_its_history_is_
     assert_eq!(inside.status, 200, "{}", body(&inside));
     for path in ["src/other.rs", "src/apix.rs", ".veilpolicy", "src/api"] {
         let r = change(&hub, &agent, &p.name, &json!({"base": base.hex(), "description": "outside", "edits": [{"path": path, "put": {"text": "x"}}]}));
-        assert!(r.status == 403 || r.status == 400, "{path}: {} {}", r.status, body(&r));
+        match path {
+            // Inside the narrowing: a file where a folder is, the route's own refusal.
+            "src/api" => assert_eq!((r.status, r.json()["code"].clone()), (400, json!("bad_request")), "{path}: {}", body(&r)),
+            _ => assert_agent_refusal(&r, NARROWED, path),
+        }
     }
     let r = change(&hub, &token, &p.name, &json!({"base": base.hex(), "description": "control", "edits": [{"path": "src/other.rs", "put": {"text": "y"}}]}));
     assert_eq!(r.status, 200, "control: the person writes src/other.rs: {}", body(&r));
@@ -266,7 +297,8 @@ fn api_commits_carry_the_sessions_attribution_and_never_the_callers() {
         &p.name,
         &json!({"base": base.hex(), "description": "forged", "agent": {"agent": "someone-else"}, "edits": [{"path": "src/f.rs", "put": {"text": "f"}}]}),
     );
-    assert!(forged.status == 400 || forged.status == 422, "{} {}", forged.status, body(&forged));
+    // No field for it: the JSON parser's refusal of an unknown field.
+    assert_eq!(forged.status, 422, "{}", body(&forged));
     // The person's own commit carries none.
     let mine = change(&hub, &token, &p.name, &json!({"base": base.hex(), "description": "by the person", "edits": [{"path": "src/m.rs", "put": {"text": "m"}}]}));
     assert_eq!(mine.status, 200, "{}", body(&mine));
@@ -532,8 +564,7 @@ fn an_admins_agent_session_cannot_change_access_through_the_policy_file() {
     let anyone_reads = || q(&hub, None, &p.name, "file", &format!("path={PERSON_DIR}/notes.txt")).status == 200;
     assert!(!anyone_reads(), "control: carol's folder is private");
     let r = edit(&agent);
-    let refused = (r.status == 403 && body(&r).contains("agent_session")) || (r.status == 200 && r.json()["branch"]["status"] == "rejected");
-    assert!(refused, "the admin's agent session changed access: {} {}", r.status, body(&r));
+    assert_agent_refusal(&r, &access_file(".veilpolicy"), "the admin's agent session's commit of .veilpolicy");
     assert!(!anyone_reads(), "carol's folder became public through an agent session");
     // Control: the admin's own session may.
     let r = edit(&atok);
@@ -563,20 +594,13 @@ fn an_admins_narrowed_agent_session_neither_forces_nor_deletes_a_branch() {
     let release = api.tips(Some(&atok), &p.name).unwrap().branches["release-77ab"];
     let agent = agent_token(&hub, &atok, &p.name, &["src/api"]);
     let push = |updates: Value, force: bool| api.post_json(Some(&agent), &format!("/v1/projects/{}/push", p.name), &json!({"updates": updates, "force": force}));
-    let refused = |r: &Reply| r.status == 403 || (r.status == 200 && r.json()["results"].as_array().unwrap().iter().all(|x| x["ok"] == false));
     // Forced back to before `src/other.rs` existed.
     let forced = push(json!([{"branch": "main", "expected": main.hex(), "new": before.hex()}]), true);
     // Deleted.
     let deleted = push(json!([{"branch": "release-77ab", "expected": release.hex(), "new": null}]), false);
     let tips = api.tips(Some(&atok), &p.name).unwrap().branches;
-    assert!(
-        refused(&forced) && refused(&deleted),
-        "forced: {} {}; deleted: {} {}",
-        forced.status,
-        body(&forced),
-        deleted.status,
-        body(&deleted)
-    );
+    assert_agent_refusal(&forced, NO_FORCE, "forced");
+    assert_agent_refusal(&deleted, NO_DELETE, "deleted");
     assert_eq!(tips["main"], main, "main moved back");
     assert_eq!(q(&hub, Some(&atok), &p.name, "file", "path=src/other.rs").status, 200, "src/other.rs left main");
     assert_eq!(tips.get("release-77ab"), Some(&release), "the branch is gone");
@@ -609,7 +633,7 @@ fn a_client_that_predates_format_10_is_told_to_update_not_sent_what_it_calls_cor
         _ => vec![],
     };
     assert_ne!(h.status, 200, "an older vl was sent format-10 snapshots {newer:?}, which it reports as corrupt");
-    assert!(h.status == 400 || h.status == 409 || h.status == 426, "{} {}", h.status, body(&h));
+    assert_eq!((h.status, h.json()["code"].clone()), (426, json!("update_vl")), "{}", body(&h));
     assert!(body(&h).contains("vl"), "the refusal names the release to update to: {}", body(&h));
 }
 
@@ -634,6 +658,7 @@ fn an_agent_session_loses_what_its_person_loses_at_once() {
     assert_eq!(r.status, 200, "{}", body(&r));
     let r = write(&agent, "src/after.rs");
     assert_eq!(r.status, 403, "the agent of a person no longer in devs wrote src/: {}", body(&r));
+    assert_eq!(r.json()["code"], "forbidden", "{}", body(&r));
     // Barred: a device's agent sessions are refused everywhere in the project.
     let fin_agent = agent_token(&hub, &p.fin.token(), &p.name, &[]);
     assert_eq!(hub.api().get(Some(&fin_agent), &format!("/v1/projects/{}/tips", p.name)).status, 200, "control");
@@ -641,6 +666,7 @@ fn an_agent_session_loses_what_its_person_loses_at_once() {
     assert_eq!(r.status, 200, "{}", body(&r));
     let r = hub.api().get(Some(&fin_agent), &format!("/v1/projects/{}/tips", p.name));
     assert_eq!(r.status, 403, "a barred device's agent session: {}", body(&r));
+    assert_eq!(r.json()["code"], "forbidden", "{}", body(&r));
     assert_eq!(q(&hub, Some(&fin_agent), &p.name, "file", &format!("path={BILL_DIR}/acme/invoice.txt")).status, 403, "a file through a barred device's agent session");
 }
 
@@ -685,17 +711,16 @@ fn an_agent_session_never_changes_a_file_that_decides_access_by_any_route() {
     let atok = p.admin.token();
     let agent = agent_token(&hub, &atok, &p.name, &[]);
     let opened = format!("{}{PERSON_DIR}/ public\n", std::fs::read_to_string(p.dir.join(".veilpolicy")).unwrap());
-    let is_agent_refusal = |r: &Reply| r.status == 403 && body(r).contains("agent_session");
     // Its own push, signed by its person's device (the workspace vl holds it).
     let mut c = Craft::with(&api, agent.clone(), p.admin.identity(), &p.name, "main");
     let tip0 = c.tip;
     c.file(".veilpolicy", &opened);
     let r = c.push_to("main", Some(tip0));
-    assert!(is_agent_refusal(&r), "its own push: {} {}", r.status, body(&r));
+    assert_agent_refusal(&r, &access_file(".veilpolicy"), "its own push");
     // Its own API commits: `.veilrules`, and a policy file in a folder.
     for path in [".veilrules", "src/.veilpolicy", ".veilpolicy"] {
         let r = change(&hub, &agent, &p.name, &json!({"base": tip0.hex(), "description": "x", "edits": [{"path": path, "put": {"text": "src/ public\n"}}]}));
-        assert!(r.status == 403, "{path}: {} {}", r.status, body(&r));
+        assert_agent_refusal(&r, &access_file(path), path);
     }
     // Someone else's change of it: the admin's own, on a side branch.
     let mut own = Craft::new(&api, &p.admin, &p.name, "main");
@@ -708,10 +733,10 @@ fn an_agent_session_never_changes_a_file_that_decides_access_by_any_route() {
     let mut m = Craft::with(&api, agent.clone(), p.admin.identity(), &p.name, "main");
     m.file(".veilpolicy", &opened);
     let (_, r) = m.push_edited("agent-side-1a", None, |s| s.parents.push(side));
-    assert!(is_agent_refusal(&r), "a merge taking someone else's change of .veilpolicy: {} {}", r.status, body(&r));
+    assert_agent_refusal(&r, &access_file(".veilpolicy"), "a merge taking someone else's change of .veilpolicy");
     // A move of the default branch that lands it.
     let r = api.post_json(Some(&agent), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": tip0.hex(), "new": side.hex()}]}));
-    assert!(is_agent_refusal(&r), "a fast-forward landing someone else's .veilpolicy: {} {}", r.status, body(&r));
+    assert_agent_refusal(&r, ACCESS_MOVE, "a fast-forward landing someone else's .veilpolicy");
     assert_eq!(q(&hub, None, &p.name, "file", &format!("path={PERSON_DIR}/notes.txt")).status, 404, "carol's folder became public");
     // Control: the admin's own session lands it.
     let r = api.post_json(Some(&atok), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": tip0.hex(), "new": side.hex()}]}));
@@ -740,9 +765,9 @@ fn agent_sessions_never_force_or_delete_and_a_narrowed_one_moves_a_branch_only_w
     // Unnarrowed: never forced, never deleted.
     let wide = agent_token(&hub, &atok, &p.name, &[]);
     let r = push(&wide, json!([{"branch": "main", "expected": main.hex(), "new": before.hex()}]), true);
-    assert!(r.status == 403 && body(&r).contains("agent_session"), "{} {}", r.status, body(&r));
+    assert_agent_refusal(&r, NO_FORCE, "forced");
     let r = push(&wide, json!([{"branch": "release-9c1d", "expected": release.hex(), "new": null}]), false);
-    assert!(r.status == 403 && body(&r).contains("agent_session"), "{} {}", r.status, body(&r));
+    assert_agent_refusal(&r, NO_DELETE, "deleted");
     // Narrowed: someone else's change of src/other.rs, kept on its change
     // ref, is not the narrowed session's to land.
     let dev = p.dev.token();
@@ -800,18 +825,15 @@ fn an_agent_session_never_lands_someone_elses_change_of_an_access_file_by_moving
     assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", body(&r));
     let side = api.tips(Some(&atok), &p.name).unwrap().branches["policy-draft-3e"];
     let agent = agent_token(&hub, &atok, &p.name, &[]);
-    let refused = |r: &Reply| {
-        (r.status == 403 && body(r).contains("agent_session"))
-            || (r.status == 200 && (r.json()["results"][0]["ok"] == false || r.json()["branch"]["status"] == "rejected"))
-    };
     // A fast-forward push of main onto it.
     let r = api.post_json(Some(&agent), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": tip0.hex(), "new": side.hex()}]}));
-    assert!(refused(&r), "a fast-forward landed the admin's .veilpolicy and .veilrules: {} {}", r.status, body(&r));
+    assert_agent_refusal(&r, ACCESS_MOVE, "a fast-forward onto the admin's draft");
     assert_eq!(tip(&hub, &atok, &p.name), tip0, "main moved onto the draft");
     // An API commit of its own on the draft, onto main.
     let r = change(&hub, &agent, &p.name, &json!({"base": side.hex(), "description": "on the draft", "edits": [{"path": "src/api/x.rs", "put": {"text": "x"}}],
                                                   "onto": {"branch": "main", "expected": tip0.hex()}}));
-    assert!(refused(&r), "an API commit on the draft landed it: {} {}", r.status, body(&r));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!((r.json()["branch"]["status"].clone(), r.json()["branch"]["message"].clone()), (json!("rejected"), json!("not a fast-forward: the change is not on the branch's tip, or on your own unlanded changes on it")), "an API commit on the draft (not its own change: refused before the access files are looked at): {}", body(&r));
     assert_eq!(tip(&hub, &atok, &p.name), tip0, "main moved onto the draft");
 }
 
@@ -841,7 +863,7 @@ fn a_narrowed_agent_sessions_refused_push_names_nothing_outside_its_paths() {
     let empty = c.put_object(O::Tree(veil_core::object::Tree::default()));
     c.refer_dir("src/util", empty);
     let r = c.push_to("main", Some(t));
-    assert_eq!(r.status, 403, "the push is refused: {}", body(&r));
+    assert_agent_refusal(&r, NARROWED, "the push");
     assert!(!body(&r).contains(NAME), "the refusal names a file outside the session's paths: {}", body(&r));
 }
 
@@ -865,7 +887,7 @@ fn a_token_is_only_ever_the_kind_of_session_it_was_made_as() {
     assert_eq!(tips(&format!("{}{token}", veil_server::auth::AGENT_TOKEN_PREFIX)), 401, "a person's token with the agent prefix");
     // A person's session cannot make an agent session from an agent token.
     let r = session(&hub, Some(&agent), &json!({"project": p.name, "attribution": {"agent": "x"}}));
-    assert_ne!(r.status, 200, "an agent session made another: {}", body(&r));
+    assert_agent_refusal(&r, PERSON_ONLY, "an agent session made another");
     // Every stored hash: none is the plain BLAKE3 of the token or of its bare part.
     let rows: Vec<(String, Option<String>)> = hub
         .rt
@@ -931,7 +953,7 @@ fn a_narrowed_sessions_api_edits_outside_its_paths_get_one_answer_naming_nothing
         json!({"path": "src/no-such-dir-4d/x.rs", "put": {"text": "x"}}),
     ] {
         let r = change(&hub, &narrow, &p.name, &json!({"base": base.hex(), "description": "x", "edits": [edit.clone()]}));
-        assert_eq!(r.status, 403, "{edit}: {}", body(&r));
+        assert_agent_refusal(&r, NARROWED, &edit.to_string());
         assert!(!body(&r).contains("src/"), "{edit}: the refusal names a path: {}", body(&r));
         answers.push(body(&r));
     }
@@ -962,7 +984,7 @@ fn a_narrowed_sessions_path_limited_log_tells_nothing_of_paths_outside() {
     let mut answers = Vec::new();
     for path in ["src/other.rs", "src/no-such-file-5e.rs"] {
         let r = q(&hub, Some(&narrow), &p.name, "log", &format!("path={path}"));
-        assert_eq!(r.status, 403, "log?path={path} answered: {}", body(&r));
+        assert_agent_refusal(&r, NARROWED_READ, path);
         assert!(!body(&r).contains("api folder"), "{path}: {}", body(&r));
         answers.push(body(&r));
     }
@@ -1002,8 +1024,7 @@ fn a_narrowed_sessions_refused_move_says_nothing_of_which_files_outside_changed(
     let mut answers = Vec::new();
     for draft in ["ops-draft-a7", "ops-draft-b7"] {
         let r = api.post_json(Some(&narrow), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": tip0.hex(), "new": tips[draft].hex()}]}));
-        let refused = r.status == 403 || (r.status == 200 && r.json()["results"][0]["ok"] == false);
-        assert!(refused, "{draft}: the move landed: {}", body(&r));
+        assert_move_refused(&r, NARROWED, draft);
         answers.push(answer(&r));
     }
     assert_eq!(tip(&hub, &atok, &p.name), tip0, "main moved");
@@ -1058,7 +1079,7 @@ fn a_narrowed_sessions_push_cannot_confirm_what_a_file_outside_its_paths_held() 
         let t = c.put_object(O::Tree(t));
         c.refer_dir(dir, t);
         let r = c.push_merge("main", &[old_seen]);
-        assert_ne!(r.status, 200, "{guess}: the push landed: {}", body(&r));
+        assert_agent_refusal(&r, NARROWED, guess);
         answers.push((r.status, body(&r)));
     }
     assert_eq!(tip(&hub, &dev, &p.name), base, "main moved");
@@ -1099,8 +1120,7 @@ fn an_agent_session_never_creates_the_default_branch_at_a_change_of_an_access_fi
     assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "control: {}", body(&r));
     // The default branch: refused.
     let r = api.post_json(Some(&agent), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": null, "new": draft.hex()}]}));
-    let refused = (r.status == 403 && body(&r).contains("agent_session")) || (r.status == 200 && r.json()["results"][0]["ok"] == false);
-    assert!(refused, "the agent created main at the admin's draft of .veilpolicy and .veilrules: {} {}", r.status, body(&r));
+    assert_agent_refusal(&r, DEFAULT_BRANCH_REFUSAL, "the agent created main at the admin's draft");
     assert!(!api.tips(Some(&atok), &p.name).unwrap().branches.contains_key("main"), "main was created");
 }
 
@@ -1157,7 +1177,7 @@ fn every_query_route_that_takes_a_path_refuses_one_outside_the_narrowing_the_sam
         let mut answers = Vec::new();
         for path in ["src/other.rs", "src/no-such-path-6f.rs", "src"] {
             let r = q(&hub, Some(&narrow), &p.name, route, &params.replace("{}", path));
-            assert_eq!(r.status, 403, "{route}?{params} {path}: {}", body(&r));
+            assert_agent_refusal(&r, NARROWED_READ, &format!("{route}?{params} {path}"));
             assert!(!body(&r).contains("src/") && !body(&r).contains("api folder"), "{route} {path}: {}", body(&r));
             answers.push(body(&r));
         }
@@ -1199,7 +1219,7 @@ fn every_write_route_of_a_narrowed_session_answers_one_way_for_any_change_outsid
             }
         }
         let r = c.push_to("main", Some(t));
-        assert_eq!(r.status, 403, "push {kind}: {}", body(&r));
+        assert_agent_refusal(&r, NARROWED, kind);
         pushes.push(body(&r));
     }
     assert!(pushes.windows(2).all(|w| w[0] == w[1]), "pushes: {pushes:?}");
@@ -1233,7 +1253,7 @@ fn every_write_route_of_a_narrowed_session_answers_one_way_for_any_change_outsid
         json!({"path": "src/other.rs", "delete": true}),
     ] {
         let r = change(&hub, &narrow, &p.name, &json!({"base": base.hex(), "description": "x", "edits": [edit.clone()]}));
-        assert_eq!(r.status, 403, "{edit}: {}", body(&r));
+        assert_agent_refusal(&r, NARROWED, &edit.to_string());
         commits.push(body(&r));
     }
     assert!(commits.windows(2).all(|w| w[0] == w[1]), "commits: {commits:?}");
@@ -1254,12 +1274,11 @@ fn every_write_route_of_a_narrowed_session_answers_one_way_for_any_change_outsid
     let _ = dev;
 }
 
-/// BUG-1482's class, a project made through the API with no `main` yet:
-/// an agent session may create `main` holding no file that decides access
-/// or review beyond the accepted policy (none yet), and may not create it
-/// holding one.
+/// BUG-1538, decided, on a project made through the API with no `main`
+/// yet: an agent session never creates the default branch, whatever it
+/// holds; its person does (the control, last).
 #[test]
-fn an_agent_session_creates_a_new_projects_default_branch_only_without_access_files() {
+fn an_agent_session_never_creates_a_new_projects_default_branch() {
     let hub = TestHub::start();
     let admin = hub.person("admin");
     let name = unique("fresh");
@@ -1311,22 +1330,22 @@ fn an_agent_session_creates_a_new_projects_default_branch_only_without_access_fi
         objects.push((id, raw));
         (id, objects)
     };
-    let push_main = |files: &[(&str, &str)]| -> Reply {
+    let push_main = |token: &str, files: &[(&str, &str)]| -> Reply {
         let (id, objects) = first(files);
-        let up = api.upload(&agent, &name, &objects);
+        let up = api.upload(token, &name, &objects);
         assert_eq!(up.status, 200, "{}", body(&up));
         let receipts = up.json()["receipts"].as_array().unwrap().clone();
         let map: serde_json::Map<String, Value> = objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
-        api.post_json(Some(&agent), &format!("/v1/projects/{name}/push"), &json!({"updates": [{"branch": "main", "expected": null, "new": id.hex()}], "receipts": map}))
+        api.post_json(Some(token), &format!("/v1/projects/{name}/push"), &json!({"updates": [{"branch": "main", "expected": null, "new": id.hex()}], "receipts": map}))
     };
-    for files in [vec![(".veilrules", "main  2 approvals\n"), ("README", "r")], vec![(".veilpolicy", "src/  public\n"), ("README", "r")]] {
-        let r = push_main(&files);
-        assert!(r.status == 403 && body(&r).contains("agent_session"), "{files:?}: {} {}", r.status, body(&r));
+    for files in [vec![(".veilrules", "main  2 approvals\n"), ("README", "r")], vec![(".veilpolicy", "src/  public\n"), ("README", "r")], vec![("README", "r")]] {
+        let r = push_main(&agent, &files);
+        assert_eq!((r.status, r.json()["code"].clone(), r.json()["message"].clone()), (403, json!("agent_session"), json!(DEFAULT_BRANCH_REFUSAL)), "{files:?}: {}", body(&r));
         assert!(!api.tips(Some(&atok), &name).unwrap().branches.contains_key("main"), "{files:?}: main was created");
     }
-    let r = push_main(&[("README", "r")]);
+    let r = push_main(&atok, &[("README", "r")]);
     assert_eq!(r.status, 200, "{}", body(&r));
-    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "a first main without access files: {}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "control: the person creates main: {}", body(&r));
 }
 
 // ---- S11 review, cycle 1 of the redesign (BUG-1536..1539) ----------------------------
@@ -1335,7 +1354,6 @@ fn an_agent_session_creates_a_new_projects_default_branch_only_without_access_fi
 /// are a function of what lies inside them alone. A file added outside its
 /// paths (one its person may read) leaves them as they were.
 #[test]
-#[ignore = "BUG-1536: search's ranking counts every document of the person's index, outside the narrowing too"]
 fn a_narrowed_sessions_search_results_do_not_depend_on_files_outside_its_paths() {
     use std::time::{Duration, Instant};
     let hub = TestHub::start();
@@ -1378,7 +1396,6 @@ fn a_narrowed_sessions_search_results_do_not_depend_on_files_outside_its_paths()
 /// the query routes give, whether the person may read it, and whether it
 /// exists.
 #[test]
-#[ignore = "BUG-1537: the access route (and the rings and shares routes) answer a narrowed session about paths outside its paths"]
 fn a_narrowed_sessions_access_route_answers_one_way_outside_its_paths() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1390,7 +1407,7 @@ fn a_narrowed_sessions_access_route_answers_one_way_outside_its_paths() {
     assert_eq!(r.status, 200, "{}", body(&r));
     // The query routes' refusal of a path outside.
     let refusal = q(&hub, Some(&narrow), &p.name, "file", "path=src/other.rs");
-    assert_eq!(refusal.status, 403, "{}", body(&refusal));
+    assert_agent_refusal(&refusal, NARROWED_READ, "q/file");
     for path in ["src/other.rs", "src/no-such-path-6f.rs", BILL_DIR, &format!("src/{NESTED_DIR}")] {
         let r = api.get(Some(&narrow), &format!("/v1/projects/{}/access?path={path}", p.name));
         assert_eq!((r.status, body(&r)), (refusal.status, body(&refusal)), "access?path={path}");
@@ -1402,7 +1419,6 @@ fn a_narrowed_sessions_access_route_answers_one_way_outside_its_paths() {
 /// carried. The accepted text is updated only when access lines change, so
 /// it may be an older text than the branch's (a tier line added since).
 #[test]
-#[ignore = "BUG-1538: a recreated default branch is compared with the last accepted text, which tier-line changes never update"]
 fn an_agent_session_never_recreates_the_default_branch_with_an_older_policy_text() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1425,8 +1441,7 @@ fn an_agent_session_never_recreates_the_default_branch_with_an_older_policy_text
     // tier line: its `.veilpolicy` is not the one main last carried.
     let agent = agent_token(&hub, &atok, &p.name, &[]);
     let r = api.post_json(Some(&agent), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": null, "new": older.hex()}]}));
-    let refused = (r.status == 403 && body(&r).contains("agent_session")) || (r.status == 200 && r.json()["results"][0]["ok"] == false);
-    assert!(refused, "the agent recreated main with an older .veilpolicy: {} {}", r.status, body(&r));
+    assert_agent_refusal(&r, DEFAULT_BRANCH_REFUSAL, "the agent recreated main");
     assert!(!api.tips(Some(&atok), &p.name).unwrap().branches.contains_key("main"), "main was created");
 }
 
@@ -1434,7 +1449,6 @@ fn an_agent_session_never_recreates_the_default_branch_with_an_older_policy_text
 /// snapshot that writes outside its paths gets one answer, whether its
 /// person may read the outside path or not.
 #[test]
-#[ignore = "BUG-1539: the graft's per-path refusal answers before the narrowing gate"]
 fn a_narrowed_sessions_push_outside_gets_one_answer_whatever_its_person_may_read_there() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1447,8 +1461,7 @@ fn a_narrowed_sessions_push_outside_gets_one_answer_whatever_its_person_may_read
         let t = c.tip;
         c.file(&path, "x");
         let r = c.push_to("main", Some(t));
-        assert_eq!(r.status, 403, "{path}: {}", body(&r));
-        assert!(body(&r).contains("agent_session"), "{path}: {}", body(&r));
+        assert_agent_refusal(&r, NARROWED, &path);
         answers.push((path, body(&r)));
     }
     for (path, a) in &answers {
@@ -1456,13 +1469,13 @@ fn a_narrowed_sessions_push_outside_gets_one_answer_whatever_its_person_may_read
     }
 }
 
-/// Rule 3, the comparison itself: a recreated default branch passes only
-/// with a root `.veilpolicy` of exactly the accepted bytes, as a plain file.
-/// A trailing byte, a byte-order mark, another `.veilpolicy` in a folder or
-/// the accepted text as a symbolic link are each refused; the exact text
-/// is allowed (the control, last).
+/// Rule 3, decided (BUG-1538): an agent session never recreates the
+/// default branch, whatever its `.veilpolicy` holds: a trailing byte, a
+/// byte-order mark, another `.veilpolicy` in a folder, the text as a
+/// symbolic link, and no change at all each get the one refusal. The
+/// admin's own session recreates it (the control, last).
 #[test]
-fn a_recreated_default_branch_passes_only_with_the_accepted_policy_byte_for_byte() {
+fn an_agent_session_never_recreates_the_default_branch_whatever_its_policy_text() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
     let api = hub.api();
@@ -1484,7 +1497,10 @@ fn a_recreated_default_branch_passes_only_with_the_accepted_policy_byte_for_byte
     let mut c = craft();
     c.set_kind(".veilpolicy", O::Blob(policy.as_bytes().to_vec()), veil_core::object::EntryKind::Symlink, veil_core::object::Visibility::Public);
     variants.push(("the text as a symbolic link", c));
-    let mut control = craft();
+    let mut c = craft();
+    c.file("src/recreated.rs", "fn r() {}");
+    variants.push(("no change of an access file", c));
+    let mut control = Craft::new(&api, &p.admin, &p.name, "main");
     control.file("src/recreated.rs", "fn r() {}");
     // The admin deletes main.
     let r = api.post_json(Some(&atok), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": tip0.hex(), "new": null}]}));
@@ -1492,12 +1508,12 @@ fn a_recreated_default_branch_passes_only_with_the_accepted_policy_byte_for_byte
     assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "the admin deletes main: {}", body(&r));
     for (what, c) in variants {
         let r = c.push_to("main", None);
-        assert!(r.status == 403, "{what}: {} {}", r.status, body(&r));
+        assert_eq!((r.status, r.json()["code"].clone(), r.json()["message"].clone()), (403, json!("agent_session"), json!(DEFAULT_BRANCH_REFUSAL)), "{what}: {}", body(&r));
         assert!(!api.tips(Some(&atok), &p.name).unwrap().branches.contains_key("main"), "{what}: main was created");
     }
     let r = control.push_to("main", None);
     assert_eq!(r.status, 200, "{}", body(&r));
-    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "control: the accepted text exactly: {}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "control: the admin's own session: {}", body(&r));
 }
 
 /// Rule 1, mechanically: every route the server answers is classified here
@@ -1539,15 +1555,15 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         ("/v1/projects/{p}/objects", "none"),
         ("/v1/projects/{p}/push", "write"),
         ("/v1/projects/{p}/changes", "write"),
-        ("/v1/projects/{p}/access", "open:BUG-1537"),
+        ("/v1/projects/{p}/access", "narrowed"),
         ("/v1/projects/{p}/groups", "none"),
         ("/v1/projects/{p}/groups/{g}", "person"),
         ("/v1/projects/{p}/groups/{g}/members", "person"),
         ("/v1/projects/{p}/groups/{g}/members/remove", "person"),
         ("/v1/projects/{p}/groups/{g}/managers", "person"),
-        ("/v1/projects/{p}/rings", "open:BUG-1537"),
-        ("/v1/projects/{p}/rings/{scope}", "open:BUG-1537"),
-        ("/v1/projects/{p}/shares", "open:BUG-1537"),
+        ("/v1/projects/{p}/rings", "narrowed"),
+        ("/v1/projects/{p}/rings/{scope}", "narrowed"),
+        ("/v1/projects/{p}/shares", "narrowed"),
         ("/v1/projects/{p}/shares/remove", "person"),
         ("/v1/objects/{p}/{id}", "none"),
         ("/v1/objects/{target}", "none"),
@@ -1584,7 +1600,25 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         assert!(b.contains("ask.file_path(") || b.contains("ask.log_path("), "query route {f} takes its path without Ask::file_path");
     }
     assert!(SYNC.contains("let narrowed_dir = !view.within_narrowing(&w.path);"), "fetch serves the tree without the narrowing");
-    assert!(SYNC.contains("narrowing_gate(&view, &g.changes)?"), "complete does not run the narrowing gate after the graft");
+    // Every route that takes or returns a path outside `q/` is narrowed in
+    // its handler (BUG-1537), and no route is left open.
+    assert!(!classes.iter().any(|(_, c)| c.starts_with("open:")), "a route is still open: {classes:?}");
+    let handler = |src: &'static str, name: &str| -> &'static str {
+        let start = src.find(&format!("async fn {name}(")).unwrap_or_else(|| panic!("no fn {name}"));
+        let rest = &src[start + 1..];
+        let end = ["\npub async fn ", "\nasync fn ", "\npub fn ", "\nfn ", "\n#[derive"].iter().filter_map(|m| rest.find(m)).min().unwrap_or(rest.len());
+        &rest[..end]
+    };
+    const SHARES: &str = include_str!("../../src/shares.rs");
+    for (src, f, call) in [
+        (API, "access", "viewer.narrowed_to(&path)?"),
+        (API, "get_rings", "viewer.narrowed_scopes(&project)"),
+        (API, "get_ring", "viewer.narrowed_scopes(&project)"),
+        (SHARES, "list", "viewer.within_narrowing(&path)"),
+    ] {
+        assert!(handler(src, f).contains(call), "route handler {f} is not narrowed ({call})");
+    }
+    assert!(SYNC.contains("narrowing_gate(src, &view, n.tree, &ptrees)?;\n    let mut g = Graft::new"), "complete does not run the narrowing gate on the pushed tree before the graft");
     assert!(body_of(CHANGES, "create").contains("within_narrowing"), "an API commit's edits are not narrowed");
 }
 
@@ -1642,8 +1676,7 @@ fn a_narrowed_sessions_renames_mode_changes_and_merges_outside_get_the_one_refus
     c.file("src/api/m.rs", "m");
     answers.push(("a merge taking theirs", c.push_merge("main", &[draft])));
     let first = body(&answers[0].1);
-    assert_eq!(answers[0].1.status, 403, "{first}");
-    assert!(first.contains("agent_session") && !first.contains("src/"), "{first}");
+    assert_agent_refusal(&answers[0].1, NARROWED, "a file");
     for (what, r) in &answers {
         assert_eq!((r.status, body(r)), (403, first.clone()), "{what}");
     }
@@ -1662,7 +1695,6 @@ fn a_narrowed_sessions_renames_mode_changes_and_merges_outside_get_the_one_refus
 /// finds nothing to do and its change outside never lands. A narrowed
 /// session never decides how changes outside its paths merge.
 #[test]
-#[ignore = "BUG-1540: a narrowed session's merge of a parent whose changes lie outside its paths lands"]
 fn a_narrowed_session_never_merges_a_parent_whose_changes_lie_outside_its_paths() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1679,8 +1711,7 @@ fn a_narrowed_session_never_merges_a_parent_whose_changes_lie_outside_its_paths(
     let mut c = Craft::with(&api, narrow.clone(), p.dev.identity(), &p.name, "main");
     c.file("src/api/m.rs", "m");
     let r = c.push_merge("main", &[draft]);
-    let refused = (r.status == 403 && body(&r).contains("agent_session")) || (r.status == 200 && r.json()["results"][0]["ok"] == false);
-    assert!(refused, "the narrowed session merged the draft, keeping main's side outside: {} {}", r.status, body(&r));
+    assert_agent_refusal(&r, NARROWED, "the narrowed session's merge of the draft");
     let main = tip(&hub, &atok, &p.name);
     let r = hub.api().post_json(Some(&atok), &format!("/v1/projects/{}/q/ancestry", p.name), &json!({"pairs": [[draft.hex(), main.hex()]]}));
     assert_eq!(r.status, 200, "{}", body(&r));

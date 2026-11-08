@@ -1010,24 +1010,36 @@ enum Visit {
 /// the entry on each side.
 type Visitor<'a> = &'a dyn Fn(&str, Option<&veil_core::TreeEntry>, Option<&veil_core::TreeEntry>) -> Visit;
 
-/// Do real trees `a` and `b` differ anywhere `visit` says [`Visit::Found`]?
-/// Both are walked down at once, only where they differ, and only into
-/// what `visit` descends into: the work is that of the difference.
+/// How [`differs_where`] reads a tree: `None` for no tree there.
+type Trees<'a> = &'a dyn Fn(&ObjectId) -> veil_core::Result<Option<Arc<Tree>>>;
+
+/// Real trees from the store.
+fn stored_tree(src: &Source, id: &ObjectId) -> veil_core::Result<Option<Arc<Tree>>> {
+    Ok(match src.node(id)? {
+        Node::Tree(t, _) => Some(t),
+        Node::Leaf => None,
+    })
+}
+
+/// Do trees `a` and `b` (read by `get`) differ anywhere `visit` says
+/// [`Visit::Found`]? Both are walked down at once, only where they differ,
+/// and only into what `visit` descends into: the work is that of the
+/// difference.
 fn differs_where(
-    src: &Source,
+    get: Trees,
     a: Option<ObjectId>,
     b: ObjectId,
     visit: Visitor,
 ) -> Result<bool> {
     use std::collections::{BTreeMap, BTreeSet};
-    fn entries(src: &Source, id: Option<ObjectId>) -> Result<BTreeMap<String, veil_core::TreeEntry>> {
+    fn entries(get: Trees, id: Option<ObjectId>) -> Result<BTreeMap<String, veil_core::TreeEntry>> {
         let Some(id) = id else { return Ok(BTreeMap::new()) };
-        Ok(match src.node(&id)? {
-            Node::Tree(t, _) => t.entries.iter().map(|e| (e.name.clone(), e.clone())).collect(),
-            Node::Leaf => BTreeMap::new(),
+        Ok(match get(&id)? {
+            Some(t) => t.entries.iter().map(|e| (e.name.clone(), e.clone())).collect(),
+            None => BTreeMap::new(),
         })
     }
-    fn walk(src: &Source, visit: Visitor, dir: &str, a: Option<ObjectId>, b: Option<ObjectId>, depth: usize) -> Result<bool> {
+    fn walk(src: Trees, visit: Visitor, dir: &str, a: Option<ObjectId>, b: Option<ObjectId>, depth: usize) -> Result<bool> {
         if a == b {
             return Ok(false);
         }
@@ -1054,15 +1066,15 @@ fn differs_where(
         }
         Ok(false)
     }
-    walk(src, visit, "", a, Some(b), 0)
+    walk(get, visit, "", a, Some(b), 0)
 }
 
-/// Does going from real tree `from` (`None`: nothing) to real tree `to`
-/// change anything outside `view`'s narrowing (BUG-1378)? Inside it
-/// anything may differ; on the way to it, only folders that are folders on
-/// both sides are looked into; anywhere else nothing may.
-fn differs_outside_narrowing(src: &Source, view: &View, from: Option<ObjectId>, to: ObjectId) -> Result<bool> {
-    differs_where(src, from, to, &|path, x, y| {
+/// Does going from tree `from` to tree `to` (read by `get`) change
+/// anything outside `view`'s narrowing (BUG-1378)? Inside it anything may
+/// differ; on the way to it, only folders that are folders on both sides
+/// are looked into; anywhere else nothing may.
+fn differs_outside_narrowing(get: Trees, view: &View, from: ObjectId, to: ObjectId) -> Result<bool> {
+    differs_where(get, Some(from), to, &|path, x, y| {
         let dir = |e: Option<&veil_core::TreeEntry>| e.is_none_or(|e| e.kind == EntryKind::Dir);
         if view.within_narrowing(path) {
             Visit::Skip
@@ -1076,22 +1088,12 @@ fn differs_outside_narrowing(src: &Source, view: &View, from: Option<ObjectId>, 
 
 /// Does going from real tree `from` to real tree `to` change a file that
 /// decides access or review (`hub::agent::decides_access`), in any folder,
-/// whoever made the change (BUG-1391)? From nothing (`from` `None`: a new
-/// default branch), any such file counts but a root `.veilpolicy` whose
-/// text is exactly `accepted`, the project's accepted policy (BUG-1482).
-fn differs_in_access_files(src: &Source, from: Option<ObjectId>, to: ObjectId, accepted: &str) -> Result<bool> {
-    let from_nothing = from.is_none();
-    differs_where(src, from, to, &|path, x, y| {
+/// whoever made the change (BUG-1391)?
+fn differs_in_access_files(src: &Source, from: ObjectId, to: ObjectId) -> Result<bool> {
+    differs_where(&|id| stored_tree(src, id), Some(from), to, &|path, x, y| {
         let file = |e: Option<&veil_core::TreeEntry>| e.is_some_and(|e| e.kind != EntryKind::Dir);
         if veil_core::hub::agent::decides_access(path) && (file(x) || file(y)) {
-            let as_accepted = from_nothing
-                && path == veil_core::policy::POLICY_FILE
-                && y.is_some_and(|e| matches!(src.raw(&e.id).map(|r| Object::decode(&r)), Ok(Ok(Object::Blob(b))) if b == accepted.as_bytes()));
-            if as_accepted {
-                Visit::Skip
-            } else {
-                Visit::Found
-            }
+            Visit::Found
         } else if x.is_some_and(|e| e.kind == EntryKind::Dir) || y.is_some_and(|e| e.kind == EntryKind::Dir) {
             Visit::Descend
         } else {
@@ -1108,34 +1110,41 @@ pub(crate) enum AgentTip {
     /// The tip would change a file that decides access or review
     /// ([`AGENT_ACCESS_MOVE`]).
     Access,
+    /// The tip would create (or recreate) the default branch
+    /// ([`AGENT_DEFAULT_BRANCH`]).
+    DefaultBranch,
 }
+
+/// What an agent session is told when it would create or recreate the
+/// default branch (BUG-1538).
+pub(crate) const AGENT_DEFAULT_BRANCH: &str = "an agent session never creates the default branch; its person does";
 
 /// **The one rule of every branch tip an agent session sets** (`docs/HUB.md`
 /// §13.27): a move, a forced move, a creation, a recreation after a
 /// deletion, by push, by API commit with `onto`, and by any landing to come
-/// (S17 calls it too). The tip is compared with what was there before:
-/// the old tip's tree, or for a default branch that does not exist, nothing
-/// but the accepted policy (`accepted`). Other new branches decide nothing
+/// (S17 calls it too). The tip is compared with the old tip's tree. An
+/// agent session never creates or recreates the default branch (BUG-1538:
+/// there is nothing to compare with); other new branches decide nothing
 /// and are allowed (`None` with `default` false).
 ///
 /// For a narrowed session the first question is whether anything outside
 /// its paths changes: it is answered before any other comparison, so the
 /// answer never tells what changed there (BUG-1481). Then the files that
-/// decide access or review (BUG-1391, BUG-1482). `None`: allowed.
-pub(crate) fn agent_tip(src: &Source, view: &View, accepted: &str, default: bool, cur: Option<ObjectId>, to: ObjectId) -> Result<Option<AgentTip>> {
+/// decide access or review (BUG-1391). `None`: allowed.
+pub(crate) fn agent_tip(src: &Source, view: &View, default: bool, cur: Option<ObjectId>, to: ObjectId) -> Result<Option<AgentTip>> {
     if !view.is_agent() {
         return Ok(None);
     }
     let from = match cur {
-        Some(c) => Some(src.snapshot(&c)?.tree),
-        None if default => None,
+        Some(c) => src.snapshot(&c)?.tree,
+        None if default => return Ok(Some(AgentTip::DefaultBranch)),
         None => return Ok(None),
     };
     let to = src.snapshot(&to)?.tree;
-    if view.is_narrowed() && differs_outside_narrowing(src, view, from, to)? {
+    if view.is_narrowed() && differs_outside_narrowing(&|id| stored_tree(src, id), view, from, to)? {
         return Ok(Some(AgentTip::Narrowed));
     }
-    if differs_in_access_files(src, from, to, accepted)? {
+    if differs_in_access_files(src, from, to)? {
         return Ok(Some(AgentTip::Access));
     }
     Ok(None)
@@ -1165,18 +1174,39 @@ pub(crate) async fn agent_tip_of(
             policy_text: String::new(),
             bindings,
         };
-        agent_tip(src, &p.view(&v), &text, default, cur, to)
+        agent_tip(src, &p.view(&v), default, cur, to)
     })
     .await
 }
 
-/// The first check of every write a narrowed session makes (a pushed
-/// snapshot, an API commit, a landing): does any of `changes` (paths from
-/// the root) lie outside its paths? One answer, naming nothing
-/// ([`NARROWED_WRITE`]). Anyone else passes.
-pub(crate) fn narrowing_gate(view: &View, changes: &[Change]) -> Result<()> {
-    if view.is_narrowed() && changes.iter().any(|c| !view.within_narrowing(&c.path)) {
-        return Err(agent_refusal(NARROWED_WRITE));
+/// **The first check of every write a narrowed session makes** (a pushed
+/// snapshot, an API commit's snapshot, a merge, a landing), before the
+/// graft or any other step: outside its paths, the tree it sends (`pushed`,
+/// in its person's view) must equal **every** parent's content as its
+/// person sees it (`parents`: their real trees, projected here), so it
+/// neither writes there nor decides how changes there merge (BUG-1539,
+/// BUG-1540). One answer, naming nothing ([`NARROWED_WRITE`]). A tree it
+/// did not send reads as none. Anyone else passes.
+pub(crate) fn narrowing_gate(src: &Source, view: &View, pushed: ObjectId, parents: &[ObjectId]) -> Result<()> {
+    if !view.is_narrowed() {
+        return Ok(());
+    }
+    for t in parents {
+        let mut pr = Projector::new(src, view);
+        let seen = pr.root(*t)?;
+        let made = pr.created;
+        let get = |id: &ObjectId| -> veil_core::Result<Option<Arc<Tree>>> {
+            if let Some((t, _)) = made.get(id) {
+                return Ok(Some(t.clone()));
+            }
+            match stored_tree(src, id) {
+                Err(VeilError::Missing(_)) => Ok(None),
+                r => r,
+            }
+        };
+        if differs_outside_narrowing(&get, view, seen, pushed)? {
+            return Err(agent_refusal(NARROWED_WRITE));
+        }
     }
     Ok(())
 }
@@ -1461,12 +1491,13 @@ pub(crate) fn complete(
     let admin = viewer.admin;
     let view = p.view(viewer);
     let ptrees: Vec<ObjectId> = rp.iter().map(|p| Ok(src.snapshot(p)?.tree)).collect::<Result<_>>()?;
+    // A narrowed session: anything outside its paths, decided first, on the
+    // tree it sent against every parent, before the graft, any comparison,
+    // object check or lookup, and answered one way, naming nothing
+    // (BUG-1392, BUG-1481, BUG-1539, BUG-1540).
+    narrowing_gate(src, &view, n.tree, &ptrees)?;
     let mut g = Graft::new(src, &view).proving(uploaded, ptrees.clone());
     let real_tree = g.root(n.tree, Some(ptrees[0]))?;
-    // A narrowed session: anything outside its paths, decided here, right
-    // after the graft, before any other comparison, object check or lookup,
-    // and answered one way, naming nothing (BUG-1392, BUG-1481).
-    narrowing_gate(&view, &g.changes)?;
     // A merge must not change what the pusher cannot see.
     for other in &ptrees[1..] {
         let mut g2 = Graft::new(src, &view).proving(uploaded, ptrees.clone());
@@ -1573,6 +1604,13 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             .await?;
         rows.into_iter().filter_map(|(n, t)| ObjectId::from_hex(&t).ok().map(|t| (n, t))).collect()
     };
+    // An agent session never creates or recreates the default branch
+    // (BUG-1538): decided before anything else of the push, so the answer is
+    // one, whatever the snapshots hold. (`agent_tip` says the same for any
+    // later route.)
+    if viewer.agent && req.updates.iter().any(|u| u.branch == project.default_branch && u.new.is_some() && !current.contains_key(&u.branch)) {
+        return Err(agent_refusal(AGENT_DEFAULT_BRANCH));
+    }
     // Only the branches this push moves, and the default branch, are
     // candidates; a branch this push moves wins over the default branch
     // (both may look the same to the pusher).
@@ -1773,6 +1811,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                     continue;
                 }
                 Some(AgentTip::Access) => return Err(agent_refusal(AGENT_ACCESS_MOVE)),
+                Some(AgentTip::DefaultBranch) => return Err(agent_refusal(AGENT_DEFAULT_BRANCH)),
                 None => {}
             }
         }
