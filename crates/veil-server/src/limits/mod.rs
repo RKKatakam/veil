@@ -125,9 +125,9 @@ impl Limits {
 
     /// Requests running and waiting in the server's gate, and in a
     /// project's (for tests).
-    pub fn load(&self, project: Option<i64>) -> (usize, usize) {
+    pub fn load(&self, project: Option<&str>) -> (usize, usize) {
         match project {
-            Some(p) => self.projects.load(&gate::Key::Project(p)),
+            Some(p) => self.projects.load(&gate::Key::Project(p.to_string())),
             None => self.server.load(),
         }
     }
@@ -318,10 +318,9 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
     }
 
     // 4: the bulkheads.
-    let gate_key = match (&name, project(&hub)) {
-        (_, Some(id)) => gate::Key::Project(id),
-        (Some(_), None) => gate::Key::Unresolved,
-        (None, None) => gate::Key::Server,
+    let gate_key = match &name {
+        Some(n) => gate::Key::Project(n.clone()),
+        None => gate::Key::Server,
     };
     let deadline = tokio::time::Instant::now() + class.wait();
     let Some(_project_place) = limits.projects.place(gate_key, class, deadline).await else {

@@ -2532,8 +2532,10 @@ Every request passes through `limits::admit` before any route, in this order:
 4. **Bulkheads** (`gate.rs`): a gate per project, then one for the server.
    A project runs at most half of `--db-connections` requests at once (so
    another project always finds a connection), the server twice
-   `--db-connections`; names the server does not know yet share one gate
-   (made-up names cannot multiply gates), routes of no project another. A
+   `--db-connections`. Gates are keyed by the name the route names, whether
+   a project of that name exists or not, so how long a request waits says
+   nothing about hidden projects (made-up names get gates of their own, and
+   the server's gate bounds them all); routes of no project share one. A
    gate has a queue per class and hands a free place to the **landings
    first** (`push`, `changes`, uploads, every other change), then pulls and
    reads, then **search and grep last**; a request waits at most 10 s, 2 s
@@ -2593,6 +2595,7 @@ project. With several servers each counts what it served.
 | 9 | A client that goes away while waiting for a place | (a cancelled wait) | its place is never lost: a place handed over just then is given back | `gate::tests::*` (the `Ticket` drop) |
 | 10 | A member, someone outside, anyone on Earth | reads a project's health | `403`, the not-found answer for a hidden project, `401`; an admin's answer counts this project's requests only and names nothing | `health_metrics_are_for_admins_only_and_name_nothing_hidden` |
 | 11 | A client within its limits | its burst at once, then 40/s; sign-in from one address | never refused | `a_client_within_its_limits_is_never_refused`; `bucket::tests::a_client_within_its_rate_is_never_refused` |
+| 12 | Anyone on Earth | floods made-up project names, then times or counts `busy` for a name, to learn whether a private project exists | gates are keyed by name alone, never by whether it exists or is known to the server (the server's gate is shared by all names alike) | `gate::tests::idle_gates_are_forgotten` (gates by name, apart); by construction in `admit` |
 
 **Residual, and open:** one signed-in device can hold the signed-in pool with
 one slow upload larger than its quarter (accountable; for 20 s + `n` /

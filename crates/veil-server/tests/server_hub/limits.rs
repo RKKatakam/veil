@@ -174,7 +174,6 @@ fn a_flooded_project_does_not_starve_a_quiet_one() {
     };
     let base = p99(measure(200));
     let server = hub.hub();
-    let a_id = server.caches.project(&pa).expect("A is known to the server").project.id;
     let stop = Arc::new(AtomicBool::new(false));
     let (served, busy) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let floods: Vec<_> = (0..64)
@@ -194,10 +193,10 @@ fn a_flooded_project_does_not_starve_a_quiet_one() {
         .collect();
     let most = Arc::new(AtomicUsize::new(0));
     let sampler = {
-        let (stop, most, server) = (stop.clone(), most.clone(), server.clone());
+        let (stop, most, server, pa) = (stop.clone(), most.clone(), server.clone(), pa.clone());
         std::thread::spawn(move || {
             while !stop.load(Relaxed) {
-                most.fetch_max(server.limits.load(Some(a_id)).0, Relaxed);
+                most.fetch_max(server.limits.load(Some(&pa)).0, Relaxed);
                 std::thread::sleep(Duration::from_millis(2));
             }
         })

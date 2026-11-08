@@ -189,12 +189,11 @@ impl Drop for Place {
 /// What a project gate is keyed by.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Key {
-    /// A project this server knows (`caches`), by id.
-    Project(i64),
-    /// A name not known here yet (a project's first request since the
-    /// server started, or a name nothing has): they share one gate, so
-    /// made-up names cannot multiply the gates.
-    Unresolved,
+    /// A project, by the name the route names: whether a project of that
+    /// name exists (or this server knows it) changes nothing here, so
+    /// how long a request waits says nothing about hidden projects. Made-up
+    /// names get gates of their own; the server's gate bounds them all.
+    Project(String),
     /// Routes of no project: sign-in, devices, the epoch feeds.
     Server,
 }
@@ -324,9 +323,9 @@ mod tests {
     #[tokio::test]
     async fn idle_gates_are_forgotten() {
         let m = Map::new(1);
-        let a = m.place(Key::Project(1), Class::Read, soon(10)).await.unwrap();
-        assert!(m.place(Key::Project(1), Class::Read, soon(30)).await.is_none());
-        let b = m.place(Key::Project(2), Class::Read, soon(10)).await.unwrap();
+        let a = m.place(Key::Project("a".into()), Class::Read, soon(10)).await.unwrap();
+        assert!(m.place(Key::Project("a".into()), Class::Read, soon(30)).await.is_none());
+        let b = m.place(Key::Project("b".into()), Class::Read, soon(10)).await.unwrap();
         assert_eq!(m.len(), 2);
         drop((a, b));
         assert_eq!(m.len(), 0);
@@ -335,7 +334,7 @@ mod tests {
         for i in 0..64 {
             let m = m.clone();
             tasks.push(tokio::spawn(async move {
-                if let Some(p) = m.place(Key::Project(i % 4), Class::Write, soon(5000)).await {
+                if let Some(p) = m.place(Key::Project(format!("p{}", i % 4)), Class::Write, soon(5000)).await {
                     tokio::time::sleep(Duration::from_millis(2)).await;
                     drop(p);
                     true
