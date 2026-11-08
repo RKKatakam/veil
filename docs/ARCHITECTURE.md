@@ -2048,10 +2048,16 @@ the outsiders' view; format 8 removed all of it (FORMAT.md §5). What is left:
      staged release only if the op log holds it in force (its latest
      `release embargo <id>` operation in the heads' history, not taken
      back by an undo or op restore in force); the others are taken back
-     first, as they are at open: a restore or undo stopped between its
-     commit and its take-back cannot publish the release (BUG-1487).
-     `vl embargo release` records its operation before it stages the
-     release. Redoing the undo of a release is refused: undo and
+     first, and the push names each in a warning with what to run (`vl
+     embargo release <id>`): a restore or undo stopped between its commit
+     and its take-back cannot publish the release, nor can one an older
+     `vl` staged without its operation (BUG-1487). Never silent, never
+     early. The check runs at the push only (and in `vl embargo list`,
+     `vl embargo release` and `vl show --json`, which never say a release
+     the op log took back will publish), not at every open (BUG-1533); gc
+     never prunes the operation of a staged release, nor anything newer,
+     so the check always finds it (BUG-1532). `vl embargo release`
+     records its operation before it stages the release. Redoing the undo of a release is refused: undo and
      redo never release.
    * **Preview.** `vl embargo release` shows the embargoed merge, the
      withheld history it publishes, the tags that carry it and the remotes

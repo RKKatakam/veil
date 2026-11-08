@@ -252,11 +252,14 @@ fn a_release_staged_by_an_older_vl_is_published_only_with_its_operation() {
         }
         drop(alice);
         let mut next = reopen(&fs, &me);
-        let want = if completed { ReleaseState::Staged } else { ReleaseState::Unreleased };
-        assert_eq!(next.keys().release_state(&e), want, "completed: {completed}");
+        // Staged either way until a push checks it (BUG-1533: no check at
+        // open); the push publishes it only with its operation.
+        assert_eq!(next.keys().release_state(&e), ReleaseState::Staged, "completed: {completed}");
         let (published, fix) = push_public(&mut next);
         assert_eq!(published.is_empty(), !completed, "completed: {completed}: published {published:?}");
         assert_eq!(fix, completed, "completed: {completed}: the fix public");
+        let after = if completed { ReleaseState::Released } else { ReleaseState::Unreleased };
+        assert_eq!(next.keys().release_state(&e), after, "completed: {completed}: after the push");
     }
 }
 
@@ -347,7 +350,6 @@ fn a_release_made_while_another_process_opens_the_repository_stands() {
 /// release is lost without a word, and the next push leaves the fix
 /// embargoed.
 #[test]
-#[ignore = "BUG-1532: a staged release whose operation `vl gc --keep-ops-days` pruned is taken back at the next open"]
 fn bug_1532_a_staged_release_stays_staged_when_gc_prunes_its_operation() {
     let (mut alice, e, fs, me) = embargoed_reopenable();
     let main = alice.view().tags["main"].target;

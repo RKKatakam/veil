@@ -62,6 +62,19 @@ pub struct TagCheck {
 /// Description prefix of the operation that releases an embargo.
 pub const RELEASE_OP_PREFIX: &str = "release embargo ";
 
+/// Where a staged release stands by the op log
+/// ([`Repo::staged_release_standing`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// Its operation is in the heads' history, not taken back: a push
+    /// publishes it.
+    InForce,
+    /// An undo or op restore in force took it back: a push does not.
+    TakenBack,
+    /// The op log holds no operation of it: a push does not.
+    Unconfirmed,
+}
+
 #[derive(Debug, Clone)]
 pub struct EmbargoSpec {
     /// Scope whose members can see the merged content before release.
@@ -921,25 +934,25 @@ impl Repo {
         Ok(())
     }
 
-    /// Take back every staged release the op log does not hold in force:
-    /// its latest `release embargo <id>` operation is not in the heads'
-    /// history, or an undo or op restore in force took it back (a restore
-    /// or undo that stopped before taking the release back itself,
-    /// BUG-1487). Run before a push publishes the staged releases, and at
-    /// open when any is staged: a crash at any point cannot publish a
-    /// release early. Returns the ids taken back.
-    pub fn take_back_releases_out_of_force(&self) -> Result<Vec<String>> {
+    /// Where each staged release stands by the op log, and the operations
+    /// read to tell: from the heads, newest first, down to the oldest
+    /// staged release's operation (an operation that takes a release back
+    /// descends from it, so it is read before it). In force: its latest
+    /// `release embargo <id>` operation is in the heads' history and no
+    /// undo or op restore in force took it back.
+    pub fn staged_release_standing(&self) -> Result<(BTreeMap<String, Standing>, Vec<ObjectId>)> {
         let staged: Vec<String> = self.keys().staged_releases()?.into_iter().map(|(id, _)| id).collect();
+        let mut out = BTreeMap::new();
+        let mut read = Vec::new();
         if staged.is_empty() {
-            return Ok(Vec::new());
+            return Ok((out, read));
         }
-        let mut want: std::collections::BTreeSet<String> = staged.iter().cloned().collect();
+        let mut want: BTreeSet<String> = staged.iter().cloned().collect();
         let mut release_op: BTreeMap<String, ObjectId> = BTreeMap::new();
         let mut retractors = BTreeMap::new();
-        // Newest first: an operation that takes a release back descends
-        // from it, so it is read before it.
         for r in self.ops.walk(&self.ops.heads()?) {
             let (id, op) = r?;
+            read.push(id);
             if let Some(x) = self.retractor(&op)? {
                 retractors.insert(id, x);
             }
@@ -953,14 +966,37 @@ impl Repo {
             }
         }
         let retracted = crate::repo::retracted_commands(&retractors);
-        let mut out = Vec::new();
         for e in staged {
-            let in_force = release_op.get(&e).is_some_and(|o| !retracted.contains(o));
-            if !in_force && self.keys().take_back_release(&e)? == TakeBack::TakenBack {
-                out.push(e);
+            let standing = match release_op.get(&e) {
+                Some(o) if retracted.contains(o) => Standing::TakenBack,
+                Some(_) => Standing::InForce,
+                None => Standing::Unconfirmed,
+            };
+            out.insert(e, standing);
+        }
+        Ok((out, read))
+    }
+
+    /// Before a push publishes the staged releases: take back each one the
+    /// op log does not hold in force (BUG-1487: an undo or op restore that
+    /// stopped before taking it back), and say so. One whose operation the
+    /// op log does not hold (an older `vl` staged it without one) is not
+    /// published either; release it again. Never silent, never early.
+    /// Returns a warning per release taken back.
+    pub fn take_back_releases_out_of_force(&self) -> Result<Vec<String>> {
+        let (standing, _) = self.staged_release_standing()?;
+        let mut warnings = Vec::new();
+        for (e, s) in standing {
+            let why = match s {
+                Standing::InForce => continue,
+                Standing::TakenBack => "an undo or op restore took its release back",
+                Standing::Unconfirmed => "its release is not in the op log",
+            };
+            if self.keys().take_back_release(&e)? == TakeBack::TakenBack {
+                warnings.push(format!("embargo {e} was not published: {why}; to publish it, release it again (`vl embargo release {e}`)"));
             }
         }
-        Ok(out)
+        Ok(warnings)
     }
 
     /// Undoing the operation `description`, as far as embargo releases go.

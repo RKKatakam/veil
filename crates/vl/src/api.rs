@@ -1466,7 +1466,9 @@ pub fn show_header(ctx: &Ctx, rev: &str, stat: bool) -> Result<Show> {
             let rec = repo.keys().load_embargo(e)?;
             let (state, until_ms) = match rec {
                 Some(_) if repo.keys().release_state(e) == ReleaseState::Released => ("released", None),
-                Some(_) if repo.keys().release_state(e) == ReleaseState::Staged => ("staged", None),
+                // Staged and in force by the op log (BUG-1487); otherwise
+                // the next push does not publish it: pending.
+                Some(_) if repo.keys().release_state(e) == ReleaseState::Staged && repo.staged_release_standing()?.0.get(e) == Some(&veil_core::commands::Standing::InForce) => ("staged", None),
                 Some(r) => ("pending", r.until),
                 None => ("unknown", None),
             };

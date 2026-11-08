@@ -580,11 +580,6 @@ impl Repo {
             repo.settle()?;
         }
         drop(reg);
-        // A release a restore or undo took back, stopped before the
-        // take-back itself, is taken back here (BUG-1487).
-        if !repo.remote {
-            repo.take_back_releases_out_of_force()?;
-        }
         Ok(repo)
     }
 

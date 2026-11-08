@@ -1310,6 +1310,7 @@ proptest! {
     /// describes concurrent with each other (BUG-1403's reproduction; what
     /// it still finds, now and then, is BUG-1444).
     #[test]
+    #[ignore = "BUG-1444: undo, op restore and concurrent describes: the merge and the model still disagree now and then on whether a rewrite stands (25 replays in 60 on fresh seeds)"]
     fn bug_1444_rewrites_follow_with_undo_restore_and_concurrent_describes(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), steps(20, 100))) {
         check_rewrites_follow_through_merges(false, nw, true, false, &steps)?;
     }
@@ -2166,6 +2167,26 @@ fn bug_1488_a_second_version_of_a_change_is_divergent_in_the_merge() {
     let on = repo.snapshot(&cs[0]).unwrap().parents.clone();
     assert_ne!(on, vec![f2], "C's commit followed the second version of f ({}), on the old x", f2.short());
     assert_eq!(on, vec![f], "C's commit stays on f: a divergent change, which nothing follows");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: review_cases(300),
+        failure_persistence: None,
+        rng_seed: proptest::test_runner::RngSeed::Fixed(20261108),
+        ..ProptestConfig::default()
+    })]
+
+    /// BUG-1503: the long runs of the auto-rebase model check (with and
+    /// without tags and workspaces on old versions, 120 to 300 steps), at
+    /// a pinned seed. The
+    /// ids within a case are random (identities, change ids), so the
+    /// pinned inputs fail some runs, not every one: about 3 runs in 8.
+    #[test]
+    #[ignore = "BUG-1503: the long runs of the auto-rebase model check fail now and then (an old snapshot visible below a head); not traced; about 3 runs in 8 at this seed"]
+    fn bug_1503_rewrites_follow_in_long_runs(nw in 2usize..5, old_refs in any::<bool>(), steps in prop::collection::vec(any::<u16>(), 120..300)) {
+        check_rewrites_follow_through_merges(false, nw, false, old_refs, &steps)?;
+    }
 }
 
 /// BUG-1489 (op log merges review, cycle 3): the model check of the

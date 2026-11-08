@@ -735,10 +735,16 @@ fn bug_1487_a_restore_that_stops_before_taking_back_a_release_still_takes_it_bac
     let (staged, _) = repo.releases_restored(&restore).unwrap();
     assert_eq!(staged, vec![e.clone()], "the op log says the restore went back past the staged release");
     drop(repo);
-    // The next process, before anything is pushed.
+    // The next process pushes: the push checks the staged release against
+    // the op log, which says the restore took it back, so it is not
+    // published, and the push says so (BUG-1487, BUG-1533: checked at the
+    // push, where the guarantee lives, not at every open).
     let mut next = Repo::open(fs.clone(), Some(me.clone()), "alice").unwrap();
     next.set_tag("later", main, false).unwrap();
-    assert_eq!(next.keys().release_state(&e), veil_core::keychain::ReleaseState::Unreleased, "the restore's take-back is not lost with the process");
+    let report = veil_core::remote::push(&mut next, Arc::new(MemoryBackend::new()), true, &[], false).unwrap();
+    assert!(report.releases_published.is_empty(), "the taken-back release was published: {:?}", report.releases_published);
+    assert!(report.warnings.iter().any(|w| w.contains(&e) && w.contains("not published")), "the push said so: {:?}", report.warnings);
+    assert_eq!(next.keys().release_state(&e), veil_core::keychain::ReleaseState::Unreleased, "taken back");
 }
 
 /// A memory backend that counts the operations read (`.veil/ops/`).
@@ -874,7 +880,6 @@ fn bug_1485_the_op_log_below_a_merge_with_the_clock_set_back_reads_a_few_operati
 /// every later command read 1,000 operations. Without a staged release the
 /// same open reads a handful.
 #[test]
-#[ignore = "BUG-1533: while a release is staged, every open reads every operation since the release"]
 fn bug_1533_an_open_with_a_staged_release_reads_a_few_operations() {
     let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
     clock::reset_clock();
