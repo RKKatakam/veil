@@ -2635,6 +2635,7 @@ mod s21_redesign {
     }
 
     /// [`Hist::commit`] with symbolic links and executable files.
+    #[allow(clippy::too_many_arguments)]
     fn commit_with(th: &TestHub, h: &mut Hist, parents: &[ObjectId], files: Files, links: &[&str], exe: &[&str], change: [u8; 16], ts: i64) -> ObjectId {
         let mut objects = Vec::new();
         let links: BTreeSet<String> = links.iter().map(|s| s.to_string()).collect();
@@ -2663,9 +2664,13 @@ mod s21_redesign {
         id
     }
 
+    /// One change of a stack: its edits (path, content), its links, its
+    /// executable files.
+    type Step<'a> = (&'a [(&'a str, &'a str)], &'a [&'a str], &'a [&'a str]);
+
     /// The risk an admin's PR of `stack` (each change: its files, links,
     /// executables) onto `base` is given.
-    fn risk_of_stack(base: &[(&str, &str)], stack: &[(&[(&str, &str)], &[&str], &[&str])]) -> String {
+    fn risk_of_stack(base: &[(&str, &str)], stack: &[Step]) -> String {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);
         let mut h = Hist::new(&th, &policy_text, &bindings);
