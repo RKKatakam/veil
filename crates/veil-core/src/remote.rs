@@ -512,7 +512,8 @@ struct FixLine {
 impl Withheld {
     /// What `local`'s current view withholds.
     pub fn of(local: &Repo) -> Result<Withheld> {
-        Withheld::of_merges(local, &local.visible_embargoed()?, false)
+        // Held: what a thin clone does not hold is the server's already.
+        Withheld::of_merges(local, &local.held().visible_embargoed()?, false)
     }
 
     /// What the embargoed merges `merges` withhold (released embargoes
@@ -545,7 +546,7 @@ impl Withheld {
                 if !seen.insert(p) {
                     continue;
                 }
-                let Some(ps) = local.snapshot_opt(&p)? else { continue };
+                let Some(ps) = local.exact().snapshot(&p)? else { continue };
                 if ps.embargo.as_deref() != Some(e.as_str()) {
                     continue;
                 }
@@ -557,8 +558,8 @@ impl Withheld {
                 if vs.parents.len() < 2 {
                     continue;
                 }
-                for a in local.graph().range(local, &vs.parents[1..], &vs.parents[..1])? {
-                    if let Some(sa) = local.snapshot_opt(&a)? {
+                for a in local.held().range(&vs.parents[1..], &vs.parents[..1])? {
+                    if let Some(sa) = local.exact().snapshot(&a)? {
                         line.changes.insert(sa.change_id);
                         if v == id {
                             line.history.push(a);
@@ -608,7 +609,7 @@ impl Withheld {
                 continue;
             }
             for i in todo {
-                if versions.contains(&ids[i]) || !local.graph().reachable_among(local, [ids[i]], &versions)?.is_empty() {
+                if versions.contains(&ids[i]) || !local.held().reachable_among([ids[i]], &versions)?.is_empty() {
                     out[i] = Some(line.embargo.clone());
                 }
             }
@@ -620,8 +621,8 @@ impl Withheld {
     /// behind its merges' first parents.
     fn versions_in(&self, local: &Repo, line: &FixLine, roots: &[ObjectId]) -> Result<HashSet<ObjectId>> {
         let mut versions = HashSet::new();
-        for y in local.graph().range(local, roots, &line.base)? {
-            if local.snapshot_opt(&y)?.is_some_and(|s| line.changes.contains(&s.change_id)) {
+        for y in local.held().range(roots, &line.base)? {
+            if local.exact().snapshot(&y)?.is_some_and(|s| line.changes.contains(&s.change_id)) {
                 versions.insert(y);
             }
         }
@@ -672,7 +673,7 @@ pub fn embargo_blocks(local: &Repo, targets: &[ObjectId]) -> Result<Vec<Option<S
 /// nothing built on it). Nothing holds their fix back (BUG-1017).
 pub fn withdrawn_embargoes(local: &Repo) -> Result<Vec<String>> {
     let mut carried = HashSet::new();
-    for id in local.visible_embargoed()? {
+    for id in local.held().visible_embargoed()? {
         carried.extend(local.snapshot(&id)?.embargo.clone());
     }
     let mut out: Vec<String> = local
@@ -694,10 +695,10 @@ pub fn withdrawn_warnings(local: &Repo, targets: &[ObjectId]) -> Result<Vec<Stri
     if withdrawn.is_empty() || targets.is_empty() {
         return Ok(Vec::new());
     }
-    let flagged = local.graph().entries_matching(local, local.view().refs(), |_, e| e.flags & crate::graph_index::FLAG_EMBARGO != 0)?;
+    let flagged = local.held().entries_matching(local.view().refs(), |_, e| e.flags & crate::graph_index::FLAG_EMBARGO != 0)?;
     let mut merges = Vec::new();
     for id in flagged {
-        if local.snapshot_opt(&id)?.is_some_and(|s| s.embargo.as_ref().is_some_and(|e| withdrawn.contains(e))) {
+        if local.exact().snapshot(&id)?.is_some_and(|s| s.embargo.as_ref().is_some_and(|e| withdrawn.contains(e))) {
             merges.push(id);
         }
     }
@@ -723,7 +724,7 @@ pub fn embargo_base(local: &Repo, id: &ObjectId) -> Result<Option<ObjectId>> {
     }
     let mut x = *id;
     loop {
-        let Some(s) = local.snapshot_opt(&x)? else { return Ok(Some(local.root_id())) };
+        let Some(s) = local.exact().snapshot(&x)? else { return Ok(Some(local.root_id())) };
         let Some(p) = s.parents.first().copied() else { return Ok(Some(local.root_id())) };
         if withheld.of_snapshot(local, &p)?.is_none() {
             return Ok(Some(p));
@@ -875,6 +876,14 @@ pub fn remove_remote(repo: &mut Repo, name: &str) -> Result<crate::repo::RemoteC
         .get(name)
         .cloned()
         .ok_or_else(|| VeilError::repo(format!("no remote named '{name}'")))?;
+    // A thin clone reads what it has not fetched from this remote's server
+    // (BUG-1292): never left without it.
+    if repo.config().partial.as_ref().is_some_and(|p| p.remote == name) {
+        return Err(VeilError::repo(format!(
+            "this thin clone fetches what it does not hold from remote '{name}'; make it a full clone first \
+             (`vl partial full`), then remove the remote"
+        )));
+    }
     let mut tx = repo.transaction(format!("remove remote {name}"))?;
     tx.repository_wide();
     let prefix = format!("{name}/");

@@ -174,7 +174,7 @@ fn releasing_the_first_embargo_does_not_publish_the_second_fix() {
     // Fix 2 is still under embargo E2.
     let leaked = readable_containing(&anon, b"FIX2");
     assert!(leaked.is_empty(), "objects of the unreleased fix readable on the public mirror: {leaked:?}");
-    assert!(anon.snapshot_opt(&m2).unwrap().is_none(), "the merge under E2 reached the mirror");
+    assert!(anon.exact().snapshot(&m2).unwrap().is_none(), "the merge under E2 reached the mirror");
     // Released, it is pushed.
     t.alice.release_embargo(&e2).unwrap();
     remote::push(&mut t.alice, mirror.clone(), true, &[], false).unwrap();
@@ -230,8 +230,8 @@ fn releasing_the_second_embargo_first_hides_the_first_fix_metadata() {
     remote::push(&mut t.alice, mirror.clone(), true, &[], false).unwrap();
     let anon = reader(mirror, None);
     assert_eq!(t.alice.view().tags["main"].target, t.m1);
-    assert!(anon.snapshot_opt(&t.m1).unwrap().is_none(), "the mirror received E1's merge");
-    assert!(anon.snapshot_opt(&on_e1).unwrap().is_none(), "the mirror received a line built on E1");
+    assert!(anon.exact().snapshot(&t.m1).unwrap().is_none(), "the mirror received E1's merge");
+    assert!(anon.exact().snapshot(&on_e1).unwrap().is_none(), "the mirror received a line built on E1");
     assert!(readable_containing(&anon, b"FIX1").is_empty());
 }
 
@@ -275,7 +275,7 @@ fn lines_under_different_unreleased_embargoes_cannot_be_combined() {
     let r = remote::push(&mut alice, mirror.clone(), true, &[], false).unwrap();
     assert!(r.tags_skipped.iter().any(|(t, why)| t == "main" && why.contains(&e2)), "{r:?}");
     let anon = reader(mirror.clone(), None);
-    assert!(anon.snapshot_opt(&m.snapshot).unwrap().is_none());
+    assert!(anon.exact().snapshot(&m.snapshot).unwrap().is_none());
     assert!(readable_containing(&anon, b"FIX2").is_empty());
     // Both released: everything is pushed.
     alice.release_embargo(&e2).unwrap();
@@ -388,7 +388,7 @@ fn an_embargoed_merge_does_not_name_the_fix_files_in_its_conflict_list() {
     let hits = backend_contains(&*mirror, b"session_token_validation");
     assert!(hits.is_empty(), "the mirror names the fix's file: {hits:?}");
     let anon = reader(mirror, None);
-    assert!(anon.snapshot_opt(&r.snapshot).unwrap().is_none(), "the embargoed merge reached the mirror");
+    assert!(anon.exact().snapshot(&r.snapshot).unwrap().is_none(), "the embargoed merge reached the mirror");
 }
 
 /// Follow-up commits a key holder makes on top of an embargoed merge stay

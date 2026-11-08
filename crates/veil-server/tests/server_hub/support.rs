@@ -17,6 +17,14 @@ use veil_core::{
 };
 use veil_server::{tls::TlsSource, Config, Running, Storage};
 
+/// The prefix of databases a test makes: the run's (`VEIL_TEST_DB_PREFIX`,
+/// set by `scripts/verify-server.sh`), or else this process's own,
+/// `r<pid>x`, so the script's clean-up of dead runs finds them even when a
+/// test is run by hand (leftovers had filled the shared YugabyteDB).
+pub fn test_db_prefix() -> String {
+    std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_else(|_| format!("r{}x", std::process::id()))
+}
+
 pub fn unique(prefix: &str) -> String {
     format!("{prefix}{}", hex::encode(veil_core::crypto::random_bytes::<4>()))
 }
@@ -83,6 +91,22 @@ impl TestHub {
             listen: "127.0.0.1:0".parse().unwrap(),
             ..other.config.clone()
         };
+        TestHub::run(config, dir)
+    }
+
+    /// This server stopped and started again on the same port, data
+    /// directory and storage, its memory empty (as after an upgrade);
+    /// `between` runs while it is down (a migration).
+    pub fn restart(mut self, between: impl FnOnce(&str)) -> TestHub {
+        if let Some(r) = self.running.take() {
+            self.rt.block_on(r.stop());
+        }
+        between(&self.config.database_url);
+        let config = Config {
+            listen: format!("127.0.0.1:{}", self.port).parse().unwrap(),
+            ..self.config.clone()
+        };
+        let dir = std::mem::replace(&mut self._dir, tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap());
         TestHub::run(config, dir)
     }
 
@@ -253,7 +277,9 @@ impl Person {
     /// Clone `url` into `dir` and confirm the project's fingerprint `fp`
     /// (compared with an admin out of band): the clone trusts its keys.
     pub fn clone_trusting(&self, url: &str, dir: &Path, fp: &str) {
-        self.ok(self.home.path(), &["clone", url, dir.to_str().unwrap()]);
+        // A full clone, as the tests written before thin clones (S3)
+        // expect; `thin.rs` tests thin ones.
+        self.ok(self.home.path(), &["clone", "--full", url, dir.to_str().unwrap()]);
         self.ok(dir, &["identity", "confirm", fp]);
     }
 
@@ -519,6 +545,14 @@ pub fn everything_in(clone: &Path) -> Vec<(String, Vec<u8>)> {
                 out.push((format!("object {}", id.short()), raw));
             }
         }
+        // A thin clone's cache area (S3): its packs are compressed.
+        if let Some(cache) = repo.store().cache() {
+            for id in cache.list_objects().unwrap() {
+                if let Ok(raw) = cache.get_raw(&id) {
+                    out.push((format!("cached object {}", id.short()), raw));
+                }
+            }
+        }
     }
     let mut stack = vec![clone.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -665,8 +699,8 @@ pub fn setup_project(hub: &TestHub) -> Project {
 pub fn real_paths(dir: &Path) -> Vec<(String, ObjectId)> {
     let repo = veil_core::Repo::open(Arc::new(veil_core::DiskBackend::new(dir)), None, "test").unwrap();
     let tip = repo.view().tags["main"].target;
-    let mut out = vec![(String::new(), repo.store().snapshot(&tip).unwrap().tree)];
-    let mut stack = vec![(String::new(), repo.store().snapshot(&tip).unwrap().tree)];
+    let mut out = vec![(String::new(), repo.snapshot(&tip).unwrap().tree)];
+    let mut stack = vec![(String::new(), repo.snapshot(&tip).unwrap().tree)];
     while let Some((p, id)) = stack.pop() {
         if let Ok(t) = repo.store().tree(&id) {
             for e in &t.entries {
@@ -691,7 +725,7 @@ pub fn real_snapshots(dir: &Path) -> Vec<ObjectId> {
             continue;
         }
         out.push(id);
-        if let Ok(s) = repo.store().snapshot(&id) {
+        if let Ok(s) = repo.snapshot(&id) {
             stack.extend(s.parents.iter().copied());
         }
     }

@@ -103,7 +103,7 @@ pub(crate) fn clone(hub: &TestHub, p: &Project, who: &Person, name: &str) -> std
 pub(crate) fn sealed_raw(p: &Project, path: &str) -> (ObjectId, Vec<u8>) {
     let repo = veil_core::Repo::open(Arc::new(veil_core::DiskBackend::new(&p.dir)), None, "test").unwrap();
     let tip = repo.view().tags["main"].target;
-    let tree = repo.store().snapshot(&tip).unwrap().tree;
+    let tree = repo.snapshot(&tip).unwrap().tree;
     let e = veil_core::tree::lookup(repo.store(), &tree, &VPath::new(path).unwrap()).unwrap().unwrap();
     (e.id, repo.store().get_raw(&e.id).unwrap())
 }
@@ -679,7 +679,7 @@ fn the_s1_key_moves_to_keys_per_rule_explicitly() {
     let raw = {
         let r = repo();
         let tip = r.view().tags["main"].target;
-        let e = veil_core::tree::lookup(r.store(), &r.store().snapshot(&tip).unwrap().tree, &VPath::new(&format!("{BILL_DIR}/.env")).unwrap()).unwrap().unwrap();
+        let e = veil_core::tree::lookup(r.store(), &r.snapshot(&tip).unwrap().tree, &VPath::new(&format!("{BILL_DIR}/.env")).unwrap()).unwrap().unwrap();
         assert!(matches!(&e.visibility, veil_core::Visibility::Cloaked { scope } if *scope == bill_scope()), "{:?}", e.visibility);
         (e.id, r.store().get_raw(&e.id).unwrap())
     };

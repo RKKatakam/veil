@@ -291,7 +291,7 @@ impl R<'_> {
     pub fn visible_changes(&self) -> Vec<String> {
         let repo = self.core();
         let root = repo.root_id();
-        repo.visible_snapshots()
+        repo.exact().visible()
             .unwrap()
             .into_iter()
             .filter(|i| *i != root)
@@ -303,7 +303,7 @@ impl R<'_> {
     pub fn graph(&self) -> Vec<String> {
         let mut v: Vec<String> = self
             .core()
-            .visible_snapshots()
+            .exact().visible()
             .unwrap()
             .iter()
             .map(|i| i.hex())
@@ -344,7 +344,7 @@ impl R<'_> {
         let repo = self.core_anon();
         let mut hits = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        let mut stack: Vec<_> = repo.visible_snapshots().unwrap();
+        let mut stack: Vec<_> = repo.exact().visible().unwrap();
         // Hidden snapshots too: everything the op log still reaches.
         for (_, op) in repo.op_log(10_000).unwrap() {
             stack.extend(op.view.heads.iter().copied());
@@ -355,7 +355,7 @@ impl R<'_> {
             if !seen.insert(id) {
                 continue;
             }
-            let Some(s) = repo.snapshot_opt(&id).unwrap() else {
+            let Some(s) = repo.exact().snapshot(&id).unwrap() else {
                 continue;
             };
             stack.extend(s.parents.iter().copied());
@@ -403,7 +403,7 @@ pub fn snap_of(repo: &Repo, id: &veil_core::ObjectId) -> Snap {
             .parents
             .iter()
             .map(|p| {
-                repo.snapshot_opt(p)
+                repo.exact().snapshot(p)
                     .unwrap()
                     .map(|x| x.change_id.display())
                     .unwrap_or_default()

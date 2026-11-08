@@ -55,7 +55,7 @@ fn world(theirs_sealed: bool) -> World {
     let theirs = if theirs_sealed {
         // A version sealed for `team` (as a secret file's is), stored as is.
         let store = repo.store();
-        let mut root = (*store.tree(&store.snapshot(&base).unwrap().tree).unwrap()).clone();
+        let mut root = (*store.tree(&repo.snapshot(&base).unwrap().tree).unwrap()).clone();
         let mut e = root.get("f.txt").unwrap().clone();
         e.id = store.store_file(b"a\nTHEIRS\nc\n", &team()).unwrap();
         e.size = "a\nTHEIRS\nc\n".len() as u64;

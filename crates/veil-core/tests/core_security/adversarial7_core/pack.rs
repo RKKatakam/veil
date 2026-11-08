@@ -69,7 +69,7 @@ static ALLOC: Counting = Counting;
 
 /// `f`'s result and the most memory it held at once on this thread above
 /// what was live when it started.
-fn peak_of<T>(f: impl FnOnce() -> T) -> (T, usize) {
+pub(crate) fn peak_of<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let start = LIVE.with(Cell::get);
     PEAK.with(|p| p.set(start));
     let out = f();
@@ -77,6 +77,11 @@ fn peak_of<T>(f: impl FnOnce() -> T) -> (T, usize) {
 }
 
 const MIB: usize = 1 << 20;
+
+/// Bytes live on this thread (the counting allocator's).
+pub(crate) fn live() -> usize {
+    LIVE.with(Cell::get)
+}
 
 // ---- hostile packs ---------------------------------------------------------------
 

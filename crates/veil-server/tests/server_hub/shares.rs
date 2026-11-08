@@ -149,7 +149,7 @@ fn a_share_reaches_its_recipient_only() {
     p.dev.ok(&d, &["commit", "-m", "after receiving"]);
     let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&d)), Some(p.dev.identity()), "test").unwrap();
     let head = repo.view().workspaces["default"].wc;
-    let tree = repo.store().snapshot(&head).unwrap().tree;
+    let tree = repo.snapshot(&head).unwrap().tree;
     assert!(veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new(&env).unwrap()).unwrap().is_none());
     // dev's agent gets it, like any of dev's local-only secrets.
     p.dev.ok(&d, &["ws", "new", "agent"]);
@@ -894,8 +894,8 @@ fn a_received_copy_is_never_recorded_after_the_device_gains_the_key() {
     let held = std::fs::read_dir(d.join(".veil/local/secret-shares-held")).unwrap().count();
     assert_eq!(held, 1);
     let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&d)), Some(p.dev.identity()), "test").unwrap();
-    for snap in repo.ancestors(&repo.view().workspaces["default"].wc).unwrap() {
-        let tree = repo.store().snapshot(&snap).unwrap().tree;
+    for snap in repo.exact().ancestors(&repo.view().workspaces["default"].wc).unwrap() {
+        let tree = repo.snapshot(&snap).unwrap().tree;
         assert!(veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new(&own).unwrap()).unwrap().is_none(), "recorded in {snap}");
     }
 }
@@ -907,7 +907,7 @@ fn a_received_copy_is_never_recorded_after_the_device_gains_the_key() {
 fn wc_parent(dir: &Path) -> String {
     let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(dir)), None, "test").unwrap();
     let wc = repo.view().workspaces["default"].wc;
-    repo.store().snapshot(&wc).unwrap().parents[0].to_string()
+    repo.snapshot(&wc).unwrap().parents[0].to_string()
 }
 
 /// The share of `path` from `sharer` to `recipient`, as stored.
@@ -1015,7 +1015,7 @@ fn bug_1066_a_pass_in_flight_never_brings_back_an_unshare() {
     // in a database of this test's own, so no other test sees them.
     let admin_url = std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL (run scripts/verify-server.sh)");
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    let name = format!("{}{}", std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_default(), unique("veil_fresh_"));
+    let name = format!("{}{}", crate::support::test_db_prefix(), unique("veil_fresh_"));
     let yugabyte = rt.block_on(async {
         let db = veil_server::db::connect(&admin_url, 1).await.unwrap();
         let v: String = sqlx::query_scalar("SELECT version()").fetch_one(&db).await.unwrap();

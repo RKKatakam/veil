@@ -330,8 +330,8 @@ fn a_rename_inside_an_embargo_is_invisible_to_outsiders() {
     let mirror = Arc::new(MemoryBackend::new());
     remote::push(&mut alice, mirror.clone(), true, &[], false).unwrap();
     let carol = Repo::open(mirror.clone(), Some(Identity::generate("carol")), "carol").unwrap();
-    assert!(carol.snapshot_opt(&m.snapshot).unwrap().is_none(), "the embargoed merge reached the mirror");
-    assert!(carol.snapshot_opt(&fix).unwrap().is_none(), "the fix reached the mirror");
+    assert!(carol.exact().snapshot(&m.snapshot).unwrap().is_none(), "the embargoed merge reached the mirror");
+    assert!(carol.exact().snapshot(&fix).unwrap().is_none(), "the fix reached the mirror");
     assert!(backend_contains(&*mirror, b"patched").is_empty(), "the fix's content reached the mirror");
 }
 
