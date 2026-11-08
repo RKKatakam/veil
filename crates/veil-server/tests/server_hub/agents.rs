@@ -134,16 +134,20 @@ fn an_agent_session_cannot_change_access_devices_invites_rings_shares_or_project
         ("/v1/devices/vouch".to_string(), json!({"device": "veil1x", "signature": "00"})),
         ("/v1/devices/remove".to_string(), json!({"device": "veil1x"})),
         (format!("/v1/projects/{}", unique("agentmade")), json!({})),
-        (format!("/v1/projects/{pr}/rings/team"), json!({})),
-        (format!("/v1/projects/{pr}/shares"), json!({})),
-        (format!("/v1/projects/{pr}/shares/remove"), json!({})),
+        // Bodies that parse, so the answer is the route's, not the parser's
+        // (each refused as an agent's before anything in it is read).
+        (format!("/v1/projects/{pr}/rings/team"), json!({"scope": "team"})),
+        (
+            format!("/v1/projects/{pr}/shares"),
+            json!({"expect": 0, "reshare": false, "record": {"format": 1, "project": "00", "path": "billing/.env", "sharer": p.dev.name,
+                   "recipient": p.fin.name, "version": 1, "at": 0, "signer": "00", "sealed": "00", "wraps": [], "signature": "00"}}),
+        ),
+        (format!("/v1/projects/{pr}/shares/remove"), json!({"path": "billing/.env", "recipient": p.fin.name})),
     ];
     for (path, v) in refused {
         let r = api.post_json(Some(&agent), &path, &v);
-        assert!(r.status == 403 || r.status == 422 || r.status == 400, "{path}: {} {}", r.status, body(&r));
-        if r.status == 403 {
-            assert!(body(&r).contains("agent_session"), "{path}: {}", body(&r));
-        }
+        assert_eq!(r.status, 403, "{path}: {}", body(&r));
+        assert!(body(&r).contains("agent_session"), "{path}: {}", body(&r));
     }
     // The ones that parse are refused as an agent's, not for their input.
     let r = api.post_json(Some(&agent), &format!("/v1/projects/{pr}/groups/agents"), &json!({}));
@@ -932,4 +936,202 @@ fn a_narrowed_sessions_api_edits_outside_its_paths_get_one_answer_naming_nothing
         answers.push(body(&r));
     }
     assert!(answers.windows(2).all(|w| w[0] == w[1]), "the answers differ: {answers:?}");
+}
+
+/// BUG-1480: the log's `path` is a file route too. A narrowed session
+/// cannot list `src/other.rs`'s folder contents beyond the way, nor read
+/// it; a path-limited log must not tell it which changes touched a path
+/// outside its paths, nor whether such a path ever existed.
+#[test]
+#[ignore = "BUG-1480: q/log's path is not narrowed: a narrowed session learns the history and existence of paths outside its paths"]
+fn a_narrowed_sessions_path_limited_log_tells_nothing_of_paths_outside() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    with_api_folder(&hub, &p);
+    let token = p.dev.token();
+    let narrow = agent_token(&hub, &token, &p.name, &["src/api"]);
+    // Control: inside its paths the log works, and the person's log of the
+    // outside path holds the change that made it.
+    let inside = q(&hub, Some(&narrow), &p.name, "log", "path=src/api");
+    assert_eq!(inside.status, 200, "{}", body(&inside));
+    assert!(!inside.json()["entries"].as_array().unwrap().is_empty(), "{}", body(&inside));
+    let person = q(&hub, Some(&token), &p.name, "log", "path=src/other.rs");
+    assert_eq!(person.status, 200, "{}", body(&person));
+    assert!(body(&person).contains("api folder"), "control: {}", body(&person));
+    // Outside: refused like every other file route, the same for a path
+    // that exists and one that never did.
+    let mut answers = Vec::new();
+    for path in ["src/other.rs", "src/no-such-file-5e.rs"] {
+        let r = q(&hub, Some(&narrow), &p.name, "log", &format!("path={path}"));
+        assert_eq!(r.status, 403, "log?path={path} answered: {}", body(&r));
+        assert!(!body(&r).contains("api folder"), "{path}: {}", body(&r));
+        answers.push(body(&r));
+    }
+    assert_eq!(answers[0], answers[1]);
+}
+
+/// BUG-1481 (a): a narrowed session's refused branch move says nothing of
+/// what changed outside its paths. Two drafts of the admin's change only
+/// `ops/` (a folder not on the way to `src/api`): one a script, one
+/// `ops/.veilrules`. Moving `main` onto either changes files outside the
+/// session's paths; the answers must be the same.
+#[test]
+#[ignore = "BUG-1481: an agent's access-file move check answers before the narrowing check: a narrowed session learns whether a file that decides access changed outside its paths"]
+fn a_narrowed_sessions_refused_move_says_nothing_of_which_files_outside_changed() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let atok = p.admin.token();
+    let tip0 = tip(&hub, &atok, &p.name);
+    let mut a = Craft::new(&api, &p.admin, &p.name, "main");
+    a.file("ops/run.sh", "echo run");
+    let r = a.push_to("ops-draft-a7", None);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", body(&r));
+    let mut b = Craft::new(&api, &p.admin, &p.name, "main");
+    b.file("ops/.veilrules", "main  2 approvals\n");
+    let r = b.push_to("ops-draft-b7", None);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", body(&r));
+    let tips = api.tips(Some(&atok), &p.name).unwrap().branches;
+    let narrow = agent_token(&hub, &atok, &p.name, &["src/api"]);
+    let answer = |r: &Reply| -> (u16, String) {
+        match r.status {
+            200 => (200, r.json()["results"][0]["message"].as_str().unwrap_or("").to_string()),
+            s => (s, r.json()["message"].as_str().unwrap_or("").to_string()),
+        }
+    };
+    let mut answers = Vec::new();
+    for draft in ["ops-draft-a7", "ops-draft-b7"] {
+        let r = api.post_json(Some(&narrow), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": tip0.hex(), "new": tips[draft].hex()}]}));
+        let refused = r.status == 403 || (r.status == 200 && r.json()["results"][0]["ok"] == false);
+        assert!(refused, "{draft}: the move landed: {}", body(&r));
+        answers.push(answer(&r));
+    }
+    assert_eq!(tip(&hub, &atok, &p.name), tip0, "main moved");
+    assert_eq!(answers[0], answers[1], "the refusals tell an access file's change outside the paths from another change there");
+}
+
+/// BUG-1481 (b): the object-closure check of a push answers before the
+/// narrowing refusal. A narrowed session pushes a merge of `main` with an
+/// older snapshot, naming at a path outside its paths a blob it did not
+/// upload: the id of a guess of what that path held in the older parent.
+/// A right guess and a wrong one must get the same answer.
+#[test]
+#[ignore = "BUG-1481: complete's closure check answers before the narrowing refusal: a narrowed session confirms guesses of the content of files outside its paths"]
+fn a_narrowed_sessions_push_cannot_confirm_what_a_file_outside_its_paths_held() {
+    const PATH: &str = "src/util/MARKER-GUESS-PATH-8c.rs";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let dev = p.dev.token();
+    // `old` holds the path at "guessable-v1"; `main` then moves it to v2.
+    let mut tips = Vec::new();
+    for text in ["guessable-v1", "guessable-v2"] {
+        let base = tip(&hub, &dev, &p.name);
+        let r = change(&hub, &dev, &p.name, &json!({"base": base.hex(), "description": format!("util {text}"), "onto": {"branch": "main", "expected": base.hex()},
+                                                    "edits": [{"path": PATH, "put": {"text": text}}]}));
+        assert_eq!(r.status, 200, "{}", body(&r));
+        assert_eq!(r.json()["branch"]["status"], "ok", "{}", body(&r));
+        tips.push(tip(&hub, &dev, &p.name));
+    }
+    let (old, base) = (tips[0], tips[1]);
+    let narrow = agent_token(&hub, &dev, &p.name, &["src/api"]);
+    // Control: the narrowed session cannot read the path, nor list its folder.
+    assert_eq!(q(&hub, Some(&narrow), &p.name, "file", &format!("path={PATH}")).status, 403);
+    assert_eq!(q(&hub, Some(&narrow), &p.name, "tree", "path=src/util").status, 403);
+    let blob = |t: &str| ObjectId::hash(&O::Blob(t.as_bytes().to_vec()).encode());
+    let (old_seen, tip_seen) = (old, tip(&hub, &narrow, &p.name));
+    assert_ne!(old_seen, tip_seen);
+    let mut answers = Vec::new();
+    for guess in ["guessable-v1", "a-wrong-guess"] {
+        let mut c = Craft::with(&api, narrow.clone(), p.dev.identity(), &p.name, "main");
+        // `src/util` holds only that file: its tree is built here (the
+        // session may not fetch it), naming the guess without uploading it.
+        let (dir, name) = PATH.rsplit_once('/').unwrap();
+        let mut t = veil_core::object::Tree::default();
+        t.insert(veil_core::object::TreeEntry {
+            name: name.into(),
+            kind: veil_core::object::EntryKind::File,
+            id: blob(guess),
+            size: guess.len() as u64,
+            executable: false,
+            visibility: veil_core::object::Visibility::Public,
+        });
+        let t = c.put_object(O::Tree(t));
+        c.refer_dir(dir, t);
+        let r = c.push_merge("main", &[old_seen]);
+        assert_ne!(r.status, 200, "{guess}: the push landed: {}", body(&r));
+        answers.push((r.status, body(&r)));
+    }
+    assert_eq!(tip(&hub, &dev, &p.name), base, "main moved");
+    assert_eq!(answers[0], answers[1], "a right guess and a wrong one get different answers");
+}
+
+/// BUG-1482: "a new branch removes nothing" does not hold for the default
+/// branch, whose `.veilpolicy` decides what every member's `vl` seals,
+/// ignores and scans, and whose `.veilrules` the review rules. With no
+/// `main` (an admin deleted it), the admin's agent session creates `main`
+/// at the admin's draft of both files: it must be refused, as the same move
+/// from an existing tip is (BUG-1391).
+#[test]
+#[ignore = "BUG-1482: an agent session creates the default branch at a change of .veilpolicy tier lines and .veilrules: no old tip, so nothing is compared"]
+fn an_agent_session_never_creates_the_default_branch_at_a_change_of_an_access_file() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let atok = p.admin.token();
+    let tip0 = tip(&hub, &atok, &p.name);
+    let policy = std::fs::read_to_string(p.dir.join(".veilpolicy")).unwrap();
+    let mut own = Craft::new(&api, &p.admin, &p.name, "main");
+    own.file(".veilpolicy", &format!("{policy}src/api/generated/  ignore\n"));
+    own.file(".veilrules", "main  2 approvals\n");
+    let r = own.push_to("policy-draft-9f", None);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", body(&r));
+    let draft = api.tips(Some(&atok), &p.name).unwrap().branches["policy-draft-9f"];
+    // The admin deletes main (their own session).
+    let r = api.post_json(Some(&atok), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": tip0.hex(), "new": null}]}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "the admin deletes main: {}", body(&r));
+    assert!(!api.tips(Some(&atok), &p.name).unwrap().branches.contains_key("main"), "main is gone");
+    // Control: the agent may create another branch there (a new branch
+    // that is not the default one decides nothing).
+    let agent = agent_token(&hub, &atok, &p.name, &[]);
+    let r = api.post_json(Some(&agent), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "agent-copy-9f", "expected": null, "new": draft.hex()}]}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "control: {}", body(&r));
+    // The default branch: refused.
+    let r = api.post_json(Some(&agent), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": null, "new": draft.hex()}]}));
+    let refused = (r.status == 403 && body(&r).contains("agent_session")) || (r.status == 200 && r.json()["results"][0]["ok"] == false);
+    assert!(refused, "the agent created main at the admin's draft of .veilpolicy and .veilrules: {} {}", r.status, body(&r));
+    assert!(!api.tips(Some(&atok), &p.name).unwrap().branches.contains_key("main"), "main was created");
+}
+
+/// Property 3 on the server's rebuilds: an agent session's API commit
+/// rebased by the server onto a moved `main` lands with the session's
+/// attribution, inside the server's signature.
+#[test]
+fn an_agent_sessions_rebased_landing_keeps_its_attribution() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let token = p.dev.token();
+    let agent = agent_token(&hub, &token, &p.name, &[]);
+    let base = tip(&hub, &agent, &p.name);
+    // main moves under the agent.
+    let r = change(&hub, &token, &p.name, &json!({"base": base.hex(), "description": "the person's", "edits": [{"path": "src/p.rs", "put": {"text": "p"}}],
+                                                  "onto": {"branch": "main", "expected": base.hex()}}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["branch"]["status"], "ok", "{}", body(&r));
+    let r = change(&hub, &agent, &p.name, &json!({"base": base.hex(), "description": "the agent's", "edits": [{"path": "src/a.rs", "put": {"text": "a"}}],
+                                                  "onto": {"branch": "main", "expected": "rebase"}}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["branch"]["status"], "ok", "{}", body(&r));
+    assert_eq!(r.json()["branch"]["rebased"], 1, "{}", body(&r));
+    let t = tip(&hub, &token, &p.name);
+    let frames = hub.api().history(&token, &p.name, &[t]).frames();
+    let O::Snapshot(s) = O::decode(&frames.into_iter().find(|(id, _)| *id == t).unwrap().1).unwrap() else { panic!() };
+    assert_eq!(s.agent.as_ref().map(|a| a.agent.as_str()), Some("claude-code/2.3"), "{s:?}");
+    assert_eq!(s.agent.as_ref().and_then(|a| a.task.as_deref()), Some("TASK-S11-1"));
+    assert_eq!(s.signature_valid(), Some(true));
 }
