@@ -947,15 +947,11 @@ impl Repo {
             ps => {
                 let mut sorted = ps.to_vec();
                 sorted.sort();
-                let split = self.ops.split(&sorted[..1], &sorted[1..])?;
-                let base = match split.base {
-                    Some(b) => self.ops.try_get(&b)?.map(|o| o.view).unwrap_or_default(),
-                    None => View::default(),
-                };
-                let views: Vec<View> = sorted.iter().map(|p| self.op_or_pruned(p, "undo").map(|o| o.view)).collect::<Result<_>>()?;
-                let refs: Vec<&View> = views.iter().collect();
-                let mut descends = |a: &ObjectId, b: &ObjectId| self.is_ancestor(b, a).unwrap_or(false);
-                Ok(crate::oplog::merge_views(&base, &refs, &mut descends).view)
+                for p in &sorted {
+                    self.op_or_pruned(p, "undo")?;
+                }
+                // As the merge of concurrent operations does (BUG-1294).
+                Ok(self.merge_plan(&sorted, false)?.view)
             }
         }
     }

@@ -2453,7 +2453,13 @@ take no lock:
 * **Merging (`Repo::settle`).** Several heads are merged into one operation
   at open and before every transaction: folded in id order, each against
   the nearest common operation, by `oplog::merge_views`, a 3-way merge per
-  key (heads: kept if every side kept it or some side added it;
+  key. After a criss-cross (two settlers that listed different heads
+  merged some of the same operations, each with others) the sides share
+  more than that operation holds: a key whose value on one side was
+  introduced by an operation only that side reaches, and on the other
+  side was not, takes the changed side's value (`oplog::shared_base`), so
+  a side still holding the shared history's older value never wins
+  against a newer commit (BUG-1294). Per key (heads: kept if every side kept it or some side added it;
   workspaces, tags, remote tags: one side's change wins, two different
   changes go to the first side and the other target stays a visible head,
   with a warning printed once by the process that writes the merge; a
