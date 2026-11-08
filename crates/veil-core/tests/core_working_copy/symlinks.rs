@@ -1108,10 +1108,11 @@ proptest! {
                 if e.kind != EntryKind::Symlink || r.blocked.contains(&path) || r.kept_local.contains(&path) || r.failed.iter().any(|(q, _)| *q == path) || r.obstructed.iter().any(|(q, _)| *q == path) {
                     continue;
                 }
-                if let Ok(t) = std::fs::read_link(d.root.join(path.as_str())) {
-                    let want = repo.store().read_entry(&e).unwrap();
-                    prop_assert_eq!(t.as_os_str().as_encoded_bytes(), &want[..], "{}", path);
-                }
+                let t = std::fs::read_link(d.root.join(path.as_str()));
+                prop_assert!(t.is_ok(), "{}: an applied link is not a link on disk: {:?}", path, t);
+                let want = repo.store().read_entry(&e).unwrap();
+                let t = t.unwrap();
+                prop_assert_eq!(t.as_os_str().as_encoded_bytes(), &want[..], "{}", path);
             }
             d.assert_outside_untouched();
             from = Some(to);

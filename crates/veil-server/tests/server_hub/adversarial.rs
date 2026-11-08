@@ -461,7 +461,7 @@ fn a_later_device_is_confirmed_by_its_person() {
     let api = hub.api();
     // Pending: anyone on Earth until confirmed.
     let d = laptop.dir("early");
-    let _ = laptop.run(laptop.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+    laptop.ok(laptop.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
     assert_no_marker(&everything_in(&d), &[BILL_MARK, ENV_MARK], "a pending device");
     // fin confirms it from the device they already use.
     let fp = laptop.fingerprint();
@@ -599,18 +599,10 @@ fn bug_834_a_conflict_names_no_hidden_object() {
         },
     );
     let r = c.push("main", "a conflict");
-    if r.status == 200 {
-        let tip = api.tips(Some(&p.dev.token()), &p.name).unwrap().branches["main"];
-        let f = api.post_json(
-            Some(&p.dev.token()),
-            &format!("/v1/projects/{}/fetch", p.name),
-            &json!({"snapshot": tip.hex(), "objects": [{"path": "src/c.txt", "id": real.hex()}]}),
-        );
-        assert!(
-            !String::from_utf8_lossy(&f.body).contains(BILL_MARK),
-            "a hidden file was served through a conflict that names it"
-        );
-    }
+    // Refused: the conflict names an object the pusher cannot see, which
+    // the server answers as it answers one that does not exist.
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["message"], format!("missing object {}", real.short()), "{}", String::from_utf8_lossy(&r.body));
 }
 
 /// BUG-835. Attacker: a compromised server, with a person it will help
@@ -716,7 +708,7 @@ fn a_view_without_the_policy_never_seals_a_local_only_file() {
     p.admin.ok(&p.dir, &["push"]);
     // fin pulls, commits other work, and pushes.
     p.fin.ok(&d, &["pull"]);
-    let _ = p.fin.run(&d, &["new", "main"]);
+    p.fin.ok(&d, &["new", "main"]);
     write_files(&d, &[(&format!("{BILL_DIR}/q.txt") as &str, "q")]);
     if std::fs::read_to_string(d.join(BILL_DIR).join(".netrc")).unwrap_or_default() != mine {
         write_files(&d, &[(&format!("{BILL_DIR}/.netrc") as &str, mine)]);

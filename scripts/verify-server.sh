@@ -147,7 +147,10 @@ echo "== container suite"
 # suite's contention-sensitive tests (sign-up under SERIALIZABLE).
 HOSTILE=derived::s12_adversarial
 step postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-pg-$RUN "$BIN" --skip "$HOSTILE"
-step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-yb-$RUN "$BIN" --skip "$HOSTILE"
+# YugabyteDB is shared by every run on the machine: 8 tests at a time, so
+# several runs at once do not drown it in servers and pools (each test
+# starts its own); results stay trustworthy under load.
+STEP_LIMIT=1800 step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-yb-$RUN "$BIN" --skip "$HOSTILE" --test-threads=8
 # One at a time: on a database other runs share, three at once could keep
 # a statement past its timeout.
 # The hostile-size sets take about half an hour and touch only S12/S13's

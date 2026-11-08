@@ -379,6 +379,7 @@ fn two_contenders_never_both_take_over_a_dead_lock() {
                 b2.gate.signal("c2-releasing");
                 drop(lock);
             } else {
+                b2.gate.signal("c2-refused");
                 b2.gate.signal("c2-acquired"); // (failed) unblock c3
             }
         })
@@ -397,6 +398,12 @@ fn two_contenders_never_both_take_over_a_dead_lock() {
     c2.join().unwrap();
     c3.join().unwrap();
     let g = &backend.gate;
+    // The lock's holder is dead: one contender takes it over.
+    assert!(
+        g.index("c2-releasing").is_some() || g.index("c3-acquired").is_some(),
+        "neither contender took over the dead lock: {:?}",
+        g.state.lock().unwrap()
+    );
     let overlap = match (g.index("c2-acquired"), g.index("c2-releasing"), g.index("c3-acquired")) {
         (Some(a), Some(r), Some(c)) => a < c && c < r,
         _ => false,

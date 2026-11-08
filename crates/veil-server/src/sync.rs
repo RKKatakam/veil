@@ -190,7 +190,17 @@ fn without_signature(s: &Snapshot) -> Snapshot {
 /// The projection of real snapshot `real` for `viewer` (the module docs).
 /// Its predecessors are projected too (BUG-826).
 pub async fn projected(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, real: ObjectId) -> Result<ObjectId> {
-    Box::pin(projected_inner(hub, project, viewer, real, None)).await
+    // Run again on a retryable database error, as a request would
+    // (BUG-1006): callers outside a request (background work, tests) get
+    // neither the transaction retry nor the request middleware's. Safe to
+    // repeat: its only writes are memo rows, `ON CONFLICT DO NOTHING`.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    loop {
+        match Box::pin(projected_inner(hub, project, viewer, real, None)).await {
+            Err(e) if e.is_retryable() && std::time::Instant::now() < deadline => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            r => return r,
+        }
+    }
 }
 
 /// What a push made and has not committed yet: the pusher's projections of

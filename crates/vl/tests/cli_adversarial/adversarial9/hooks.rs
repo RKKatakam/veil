@@ -11,7 +11,7 @@ use std::path::Path;
 
 use super::{
     adversarial_support::{write, Env},
-    markers, U,
+    fails, markers, U,
 };
 
 /// A project whose `.veilhooks` is `veilhooks`, with `files` written, the
@@ -116,12 +116,13 @@ fn a_build_tool_behind_a_launcher_still_pins_its_files() {
     write(&proj, "Makefile", &format!("all:\n\ttouch {}/trusted\n", m.display()));
     env.ok(U, &proj, &["commit", "--no-verify", "-m", "hooks"]);
     // Without --i-understand-indirect, as a user who was never told.
-    let trust = env.vl(U, &proj, &["hooks", "trust", "--yes"]);
-    if trust.status.success() {
-        commit_edit(&env, &proj, 1);
-        assert!(m.join("trusted").exists(), "the trusted hook did not run (is make installed?)");
-        write(&proj, "Makefile", &format!("all:\n\ttouch {}/PWNED\n", m.display()));
-        commit_edit(&env, &proj, 2);
-        assert!(!m.join("PWNED").exists(), "the Makefile changed after `vl hooks trust` and its new recipe ran");
-    }
+    let err = fails(&env, U, &proj, &["hooks", "trust", "--yes"]);
+    assert!(err.contains("--i-understand-indirect") && err.contains("Makefile"), "{err}");
+    // Told, the user trusts it: the Makefile is pinned with it.
+    env.ok(U, &proj, &["hooks", "trust", "--yes", "--i-understand-indirect"]);
+    commit_edit(&env, &proj, 1);
+    assert!(m.join("trusted").exists(), "the trusted hook did not run (is make installed?)");
+    write(&proj, "Makefile", &format!("all:\n\ttouch {}/PWNED\n", m.display()));
+    commit_edit(&env, &proj, 2);
+    assert!(!m.join("PWNED").exists(), "the Makefile changed after `vl hooks trust` and its new recipe ran");
 }
