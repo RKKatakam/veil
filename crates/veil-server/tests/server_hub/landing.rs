@@ -3772,3 +3772,282 @@ fn bug_1524_a_rebased_revision_of_a_change_fast_forwarded_onto_main_is_not_lande
     let ids: Vec<_> = chain(&hub, pid, veil_server::sync::root_snapshot_id()).into_iter().map(|(_, s)| s.change_id).collect();
     assert_eq!(ids.iter().filter(|i| **i == cid).count(), 1, "the change is on main twice");
 }
+
+// ---- S17 re-check (s17r5): guarantees and findings -------------------------------------------
+
+/// A snapshot of `c`'s tree on `parent`, every field given (so two of them
+/// differ only in what their trees hold).
+fn snap_at(c: &mut Craft<'_>, parent: ObjectId, cid: veil_core::ChangeId, what: &str, t: i64, predecessors: Vec<ObjectId>) -> ObjectId {
+    let mut s = Snapshot {
+        parents: vec![parent],
+        change_id: cid,
+        tree: c.root,
+        description: Text::Plain(what.into()),
+        author: "crafter".into(),
+        timestamp: t,
+        predecessors,
+        conflicts: vec![],
+        embargo: None,
+        signature: None,
+    };
+    s.sign(&c.identity);
+    c.put(O::Snapshot(s))
+}
+
+/// Guarantee (`resolve_for`, the "two identical-looking changes on two
+/// lines" rule): the admin's change A (`src/x.rs` and a billing file) is on
+/// `w1`, and A2, the same change with other billing content, on `w2`; the
+/// dev sees both tips as one snapshot N, and no one change stands under
+/// them. A landing of edits on N takes the lowest real id of the two; its
+/// answer and what lands are the same as with only A, or only A2, there
+/// (any of them gives the same edits, and the choice tells nothing). An API
+/// commit on N that is no landing is refused, the same with either lower.
+#[test]
+fn a_landing_on_a_name_two_lines_share_lands_the_same_whichever_is_lower() {
+    let mut answers = Vec::new();
+    for (has1, has2) in [(true, false), (false, true), (true, true), (true, true)] {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        let pid = project_id(&hub, &p.name);
+        let api = hub.api();
+        let token = p.dev.token();
+        let main0 = real_tip(&hub, pid);
+        let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+        let (cid, t) = (veil_core::ChangeId::random(), veil_core::now_millis());
+        c.file("src/x.rs", "x\n");
+        c.file(&format!("{BILL_DIR}/acme/a.txt"), "one\n");
+        let a1 = snap_at(&mut c, main0, cid, "A", t, vec![]);
+        // In the last run A2 is made until the order of the two is the
+        // other way round from the run before.
+        let mut a2;
+        let mut n = 0;
+        loop {
+            c.file(&format!("{BILL_DIR}/acme/a.txt"), &format!("two {n}\n"));
+            a2 = snap_at(&mut c, main0, cid, "A", t, vec![]);
+            if answers.len() < 3 || (a2 < a1) != matches!(answers.last(), Some((_, true))) {
+                break;
+            }
+            n += 1;
+        }
+        let mut ups = Vec::new();
+        if has1 {
+            ups.push(("w1", a1));
+        }
+        if has2 {
+            ups.push(("w2", a2));
+        }
+        let r = push_new(&c, &ups);
+        assert!(r.json()["results"].as_array().unwrap().iter().all(|x| x["ok"] == true), "{}", String::from_utf8_lossy(&r.body));
+        let tips = api.tips(Some(&token), &p.name).unwrap().branches;
+        let seen = tips[if has1 { "w1" } else { "w2" }];
+        if has1 && has2 {
+            assert_eq!(tips["w1"], tips["w2"], "the dev sees the two lines' tips as one snapshot");
+            // Anything that would move a branch to it is refused.
+            let r = api.post_json(Some(&token), &format!("/v1/projects/{}/changes", p.name), &json!({"base": seen.hex(), "edits": [put("src/mine.rs", "m\n")]}));
+            let body = String::from_utf8_lossy(&r.body).to_string();
+            assert_eq!(r.status, 409, "{body}");
+            assert!(body.contains("stands for changes on different lines"), "{body}");
+        }
+        let v = land(&api, &token, &p.name, seen, json!([put("src/mine.rs", "m\n")]), true).json();
+        assert_eq!(v["state"], "landed", "{v}");
+        let mut shown = without_ticket(v);
+        shown.as_object_mut().unwrap().remove("landed");
+        shown.as_object_mut().unwrap().remove("change_id");
+        // What lands: the dev's edit on main's tip, nothing of either line.
+        assert_eq!(real_file(&hub, pid, "src/mine.rs").as_deref(), Some(&b"m\n"[..]));
+        assert!(real_file(&hub, pid, "src/x.rs").is_none());
+        assert!(real_file(&hub, pid, &format!("{BILL_DIR}/acme/a.txt")).is_none());
+        let line = chain(&hub, pid, main0);
+        assert_eq!(line.len(), 1, "one change landed on main0");
+        answers.push((shown, a2 < a1));
+    }
+    assert!(answers[2].1 != answers[3].1, "the two runs with both lines put the lower id on each line once");
+    for a in &answers[1..] {
+        assert_eq!(a.0, answers[0].0, "the answer is the same whatever is on the lines");
+    }
+}
+
+/// BUG-1525: `resolve_for` answers a snapshot the pusher sees whole by its
+/// own id before it looks at the branch tips: a push to main, on main's
+/// tip as the dev sees it, is made on that snapshot, not on the hidden-only
+/// change at main's tip, and is refused as "not a fast-forward" for ever.
+/// The project's billing folder (finance only) is made after its access
+/// line, so the dev sees main's first snapshot whole.
+#[test]
+#[ignore = "BUG-1525: a push on a tip the pusher sees whole, under a hidden-only change at the branch's tip, is grafted below the tip and refused"]
+fn bug_1525_a_push_on_main_as_seen_whole_is_made_on_main_s_tip_over_a_hidden_only_change() {
+    let hub = TestHub::start();
+    let admin = hub.person("admin");
+    let dev = hub.person("dev");
+    let fin = hub.person("fin");
+    let name = unique("acme");
+    let dir = admin.dir("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    admin.ok(&dir, &["init"]);
+    // The access lines are in the first snapshot, so the dev sees it whole.
+    let policy = format!(".veilpolicy {0}\nsrc/ {0}\nbilling/ {1}\n", dev.name, fin.name);
+    write_files(&dir, &[("src/lib.rs", "pub fn a() {}\n"), (".veilpolicy", &policy)]);
+    admin.ok(&dir, &["remote", "add", "origin", &hub.url(&name)]);
+    admin.commit_main(&dir, "initial import");
+    let out = admin.ok(&dir, &["push"]);
+    assert!(out.contains("Created project"), "{out}");
+    let api = hub.api();
+    let pid = project_id(&hub, &name);
+    let h = real_tip(&hub, pid);
+    assert_eq!(tip_for(&hub, &dev.token(), &name), h, "the dev sees main's tip whole");
+    // A billing-only change at main's tip: hidden from the dev.
+    let mut c = Craft::new(&api, &admin, &name, "main");
+    c.file("billing/x.txt", "fin's\n");
+    let r = c.push("main", "billing only");
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let x = real_tip(&hub, pid);
+    assert_ne!(x, h);
+    assert_eq!(tip_for(&hub, &dev.token(), &name), h, "the dev sees main as before");
+    let mut m = Craft::new(&api, &dev, &name, "main");
+    m.file("src/mine.rs", "the dev's\n");
+    let r = m.push("main", "mine");
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let tip = real_tip(&hub, pid);
+    assert_eq!(source(&hub, pid).snapshot(&tip).unwrap().parents, vec![x], "made on main's tip");
+    assert_eq!(real_file(&hub, pid, "billing/x.txt").as_deref(), Some(&b"fin's\n"[..]));
+}
+
+/// BUG-1526: "already landed" (`Ancestry::landed`) compares a held change's
+/// whole edits, hidden paths included, for every change on the
+/// submitter's line, also one they see only in part: the admin's change F
+/// (`src/f.rs` and a billing file) landed; F2, a revision of F on main0
+/// with one more billing file, is on `f2`. The dev, who sees F2 exactly as
+/// F (its `src/f.rs`), lands their change made on `f2`: refused ("already
+/// landed … with other edits"), where with F2 holding no further billing
+/// file it lands. The answer tells the dev whether hidden content of a
+/// revision changed, and blocks their landing on edits they cannot see.
+#[test]
+#[ignore = "BUG-1526: a landing is refused for hidden edits of a change its submitter sees only in part (already landed with other edits)"]
+fn bug_1526_already_landed_never_judges_a_change_by_edits_its_submitter_cannot_see() {
+    let mut answers = Vec::new();
+    for extra in [false, true] {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        let pid = project_id(&hub, &p.name);
+        let api = hub.api();
+        let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+        let main0 = c.tip;
+        let cid = veil_core::ChangeId::random();
+        c.file("src/f.rs", "f\n");
+        c.file(&format!("{BILL_DIR}/acme/f.txt"), "f\n");
+        let f = snap_at(&mut c, main0, cid, "F", veil_core::now_millis(), vec![]);
+        let r = push_new(&c, &[("f1", f)]);
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        let v = land_held(&api, &p.admin.token(), &p.name, f, true).json();
+        assert_eq!(v["state"], "landed", "{v}");
+        if extra {
+            c.file(&format!("{BILL_DIR}/acme/g.txt"), "g\n");
+        }
+        let f2 = snap_at(&mut c, main0, cid, "F, amended", veil_core::now_millis(), vec![f]);
+        let r = push_new(&c, &[("f2", f2)]);
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        let mut m = Craft::new(&api, &p.dev, &p.name, "f2");
+        m.file("src/mine.rs", "the dev's\n");
+        let on = m.tip;
+        let mine = crafted_on(&mut m, on, veil_core::ChangeId::random(), "mine", "");
+        let r = push_new(&m, &[("mine", mine)]);
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        let r = land_held(&api, &p.dev.token(), &p.name, mine, true);
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        assert_eq!(r.status, 200, "extra billing file: {extra}: {body}");
+        let v = r.json();
+        assert_eq!(v["state"], "landed", "extra billing file: {extra}: {v}");
+        assert_eq!(real_file(&hub, pid, "src/mine.rs").as_deref(), Some(&b"the dev's\n"[..]));
+        let mut shown = without_ticket(v);
+        shown.as_object_mut().unwrap().remove("landed");
+        shown.as_object_mut().unwrap().remove("change_id");
+        answers.push(shown);
+    }
+    assert_eq!(answers[0], answers[1], "the answer is the same whatever F2 holds in billing");
+}
+
+/// BUG-1527: "already landed" trusts a change id, which every client
+/// chooses: fin, who reads `src/` but may write only billing, sees the
+/// dev's unlanded change V on `v` and lands a change of their own (a
+/// billing file) under V's change id. The dev's landing of V is then
+/// refused ("already landed … with other edits"), though nothing of V is
+/// on main: fin blocks a change they may not write.
+#[test]
+#[ignore = "BUG-1527: a change landed under another person's change id makes their change unlandable (already landed with other edits)"]
+fn bug_1527_a_change_landed_under_someone_else_s_change_id_never_blocks_theirs() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let mut d = Craft::new(&api, &p.dev, &p.name, "main");
+    let on = d.tip;
+    d.file("src/v.rs", "the dev's\n");
+    let cid = veil_core::ChangeId::random();
+    let v = crafted_on(&mut d, on, cid, "V", "");
+    let r = push_new(&d, &[("v", v)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    // fin sees V on `v`, its change id included.
+    let fin_v = Craft::new(&api, &p.fin, &p.name, "v").tip;
+    let h = api.post_json(Some(&p.fin.token()), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [fin_v.hex()]}));
+    let (_, raw) = h.frames().into_iter().find(|(id, _)| *id == fin_v).unwrap();
+    let O::Snapshot(seen) = O::decode(&raw).unwrap() else { panic!() };
+    assert_eq!(seen.change_id, cid);
+    let mut f2 = Craft::new(&api, &p.fin, &p.name, "main");
+    let on = f2.tip;
+    f2.file(&format!("{BILL_DIR}/acme/s.txt"), "fin's\n");
+    let s = crafted_on(&mut f2, on, seen.change_id, "not V", "");
+    let r = push_new(&f2, &[("s", s)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let w = land_held(&api, &p.fin.token(), &p.name, s, true).json();
+    assert_eq!(w["state"], "landed", "{w}");
+    let r = land_held(&api, &p.dev.token(), &p.name, v, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+    assert_eq!(real_file(&hub, pid, "src/v.rs").as_deref(), Some(&b"the dev's\n"[..]));
+}
+
+/// Guarantee (BUG-1523's rule, the receipts): a push treats as new only a
+/// snapshot its pusher holds a receipt of their own for. fin uploads a
+/// billing change F (never pushed); the dev pushes a change on F with fin's
+/// receipt for it, and another on an id nothing has: both are answered
+/// "snapshot … was not uploaded", the same answer, and nothing moves.
+#[test]
+fn a_push_on_a_snapshot_uploaded_by_someone_else_is_answered_as_one_that_does_not_exist() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let mut f = Craft::new(&api, &p.fin, &p.name, "main");
+    let on = f.tip;
+    f.file(&format!("{BILL_DIR}/acme/up.txt"), "fin's upload\n");
+    let fs = crafted_on(&mut f, on, veil_core::ChangeId::random(), "F", "");
+    let up = api.upload(&f.token, &p.name, &f.objects);
+    assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+    let fin_receipts: Vec<Value> = up.json()["receipts"].as_array().unwrap().clone();
+    let fin_receipt = fin_receipts[f.objects.iter().position(|(id, _)| *id == fs).unwrap()].clone();
+    let mut answers = Vec::new();
+    let nothing = ObjectId::hash(b"no such snapshot, s17r5");
+    for (parent, lend) in [(fs, true), (nothing, false)] {
+        let mut d = Craft::new(&api, &p.dev, &p.name, "main");
+        d.file("src/on.rs", "on\n");
+        let c = crafted_on(&mut d, parent, veil_core::ChangeId::random(), "C", "");
+        let up = api.upload(&d.token, &p.name, &d.objects);
+        assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+        let receipts = up.json()["receipts"].as_array().unwrap().clone();
+        let mut map: serde_json::Map<String, Value> = d.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+        if lend {
+            map.insert(fs.hex(), fin_receipt.clone());
+        }
+        let r = api.post_json(
+            Some(&d.token),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "on-f", "expected": null, "new": c.hex()}], "receipts": map}),
+        );
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        assert_eq!(r.status, 400, "{body}");
+        assert_eq!(r.json()["message"], format!("snapshot {} was not uploaded", parent.short()), "{body}");
+        answers.push(r.json()["code"].clone());
+        assert!(api.tips(Some(&d.token), &p.name).unwrap().branches.get("on-f").is_none());
+    }
+    assert_eq!(answers[0], answers[1]);
+}
