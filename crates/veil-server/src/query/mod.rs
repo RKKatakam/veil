@@ -721,27 +721,39 @@ pub async fn blame(hub: &Arc<Hub>, ask: &Ask, q: BlameParams, limits: Limits) ->
     let id = resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?;
     let follow = q.follow.unwrap_or(false);
     let (after, n) = (q.after.unwrap_or(0), q.n.unwrap_or(limits.blame.lines).min(limits.blame.lines));
-    // One of the process's blames (BUG-1072's lesson: bounded whatever
-    // the number of requests), waited for until the deadline.
-    let _slot = tokio::time::timeout_at(deadline.into(), hub.query.blames.clone().acquire_owned())
-        .await
-        .map_err(|_| graph::too_slow())?
-        .map_err(|e| Error::Other(e.into()))?;
-    on_graph(hub, ask, deadline, move |g, t| {
-        let e = file_entry(g, t, &id, &path)?.ok_or_else(no_path)?;
-        if !e.visibility.is_public() {
-            return Err(Error::bad_request("a secret: its content is encrypted, and the server cannot read it"));
-        }
-        let f = files::Files::new(g);
-        let (depth, x) = f.intro(id, &path)?.ok_or_else(|| Error::Other(anyhow::anyhow!("file history: no version of a file present")))?;
-        let start = files::Version { id: x, depth, path: path.clone() };
-        let mut b = files::Blamer::new(&f, t, follow, limits.blame);
-        let Some((text, bl)) = b.blame(&start)? else {
-            return Err(Error::bad_request("not a plain-text file of at most 1 MiB: nothing to blame line by line"));
-        };
-        files::blame_json(g, id, &path, follow, &text, &bl, after, n)
-    })
-    .await
+    let not_text = || Error::bad_request("not a plain-text file of at most 1 MiB: nothing to blame line by line");
+    // The answer from the kept blame of the version asked for; else the
+    // version, whose blame job the request waits for (S14 cycle 3).
+    let answer = |path: String| {
+        on_graph(hub, ask, deadline, move |g, t| {
+            let e = file_entry(g, t, &id, &path)?.ok_or_else(no_path)?;
+            if !e.visibility.is_public() {
+                return Err(Error::bad_request("a secret: its content is encrypted, and the server cannot read it"));
+            }
+            let f = files::Files::new(g);
+            let (depth, x) = f.intro(id, &path)?.ok_or_else(|| Error::Other(anyhow::anyhow!("file history: no version of a file present")))?;
+            let start = files::Version { id: x, depth, path: path.clone() };
+            match files::kept_answer(&f, t, id, &start, follow, after, n, limits.blame)? {
+                Some(v) => Ok(v),
+                None => Ok(json!({ "pending": start })),
+            }
+        })
+    };
+    let v = answer(path.clone()).await?;
+    let Some(pending) = v.get("pending") else { return Ok(v) };
+    let start: files::Version = serde_json::from_value(pending.clone()).map_err(|e| Error::Other(e.into()))?;
+    match files::wait_for_blame(hub, &ask.project, &ask.viewer, &start, follow, limits.blame, deadline).await? {
+        files::JobEnd::Kept => {}
+        files::JobEnd::NoText => return Err(not_text()),
+        files::JobEnd::Failed(status, code, message) => return Err(Error::Api { status, code, message }),
+    }
+    let v = answer(path).await?;
+    if v.get("pending").is_some() {
+        // Kept, then dropped by the project's cap (or another server's job
+        // found it kept before it was): ask again.
+        return Err(Error::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, "warming", "this blame is being prepared; try again in a few seconds"));
+    }
+    Ok(v)
 }
 
 /// Most bytes of a history cursor handed out in full; a longer one is kept

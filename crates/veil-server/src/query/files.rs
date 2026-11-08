@@ -21,11 +21,16 @@
 //! path the viewer reads continues at the source's version). Each
 //! version's blame is computed from its parents' and one diff each
 //! ([`crate::derive::blame::step`]), so a blame costs the file's visible
-//! versions, never the history's length. Blames are kept as objects
-//! (`blame_memo`, per view key): every [`CHECKPOINT`]th version and every
-//! version asked for, so the next blame of the file starts from the
-//! nearest. A blame that runs out of its budget or deadline keeps what it
-//! computed, and the next request goes on from there.
+//! versions, never the history's length. A request answers from the
+//! **kept blame** of its version (`blame_memo`, per view key); a version
+//! not kept yet is blamed by a **blame job** ([`wait_for_blame`]), one per
+//! (view key, version, `follow`) across servers, in a bounded pool, in
+//! memory, which the request waits for until its deadline (then
+//! `warming`; the job goes on). A job keeps every [`CHECKPOINT`]th version
+//! and the one asked for, so later blames of the file start from the
+//! nearest; nothing else is persisted. Kept blames take at most 64 + 128
+//! bytes a line (paths stored once per project, `blame_paths`) and
+//! [`KEPT_BYTES`] a project.
 //!
 //! **Boundary cuts** (§3.6) need nothing of their own: a source in a
 //! folder the viewer cannot read is absent from their projected trees, so
@@ -36,10 +41,10 @@ use std::{
     cell::RefCell,
     collections::{BinaryHeap, HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
 
 use axum::http::StatusCode;
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use veil_core::{
@@ -59,9 +64,9 @@ use crate::{
     error::{Error, Result},
 };
 
-/// Blames computing at once in one server process: with
-/// [`BlameLimits::held`], what blames hold in all.
-pub const BLAMES_AT_ONCE: usize = 4;
+/// A version this far below the rows of its path read so far is read from
+/// a window of its own (not by paging down from where the rows are).
+const REANCHOR: i64 = 256;
 /// Versions between two kept blames of one file (and every version asked
 /// for is kept too).
 pub const CHECKPOINT: u64 = 32;
@@ -414,42 +419,35 @@ fn parents_of(f: &Files, t: &Trees, v: &Version, c: &FChange, follow: bool, rena
 
 // ---- blame ------------------------------------------------------------------------
 
-/// What one blame may spend.
+/// What one blame job may hold, and a page show.
 #[derive(Clone, Copy, Debug)]
 pub struct BlameLimits {
-    /// Diff work ([`veil_core::blame::map_cost`]); past it the blame
-    /// stops, keeping what it computed.
-    pub work: u64,
-    /// Work of the walk down to the versions a blame starts from (rows,
-    /// objects and trees read: [`G::tick`]); past it the walk stops and
-    /// keeps where it got to, and the next request blames those deeper
-    /// versions first (BUG-1212).
-    pub walk: u64,
-    /// Bytes of texts and blames held at once.
+    /// Bytes a job holds at once: the versions it walked, their texts and
+    /// blames, the paths it interned and the kept blames it has not
+    /// written yet (`too_wide` past it).
     pub held: usize,
     /// Lines a page shows.
     pub lines: usize,
+    /// Bytes of kept blames a project keeps; each write drops its oldest
+    /// past it (BUG-1218).
+    pub kept_bytes: usize,
 }
 
 impl Default for BlameLimits {
     fn default() -> Self {
         BlameLimits {
-            work: veil_core::blame::DEFAULT_WORK_BUDGET,
-            walk: 20_000,
             held: 64 << 20,
             lines: 10_000,
+            kept_bytes: KEPT_BYTES,
         }
     }
 }
 
-/// A blame that stopped at its budget: what it computed is kept.
-pub fn partial() -> Error {
-    Error::new(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "partial",
-        "this file has a long history: part of its blame was computed and kept; ask again to go on",
-    )
-}
+/// Bytes of kept blames one project keeps (oldest dropped first).
+pub const KEPT_BYTES: usize = 256 << 20;
+/// Kept blames written at once: at most this many bytes, or [`BATCH_BLAMES`].
+const BATCH_BYTES: usize = 4 << 20;
+const BATCH_BLAMES: usize = 64;
 
 fn too_wide() -> Error {
     Error::new(
@@ -463,8 +461,8 @@ fn too_wide() -> Error {
 struct Node {
     change: Arc<FChange>,
     parents: Vec<Option<Version>>,
-    /// Its kept blame, if any (then nothing below it is walked).
-    kept: Option<ObjectId>,
+    /// Kept already (then nothing below it is walked).
+    kept: bool,
     /// Versions above it, in this walk, not computed yet.
     left: usize,
 }
@@ -472,60 +470,24 @@ struct Node {
 /// A computed version: its text and blame (`None`: no plain-text version).
 type Done = Option<(Arc<Text>, Arc<Blame>)>;
 
-/// One viewer's blames.
+/// One viewer's blames: a blame job's work (S14 cycle 3), or a request's
+/// reading of a kept blame. Everything a job holds is in memory, within
+/// [`BlameLimits::held`]; nothing but kept blames outlives it.
 pub struct Blamer<'f, 'g, 'a, 'h, 'b> {
     pub f: &'f Files<'g, 'a>,
     pub t: &'f Trees<'h, 'b>,
     pub follow: bool,
     pub limits: BlameLimits,
-    kept: HashMap<String, HashMap<ObjectId, ObjectId>>,
+    /// The versions kept, by path key.
+    kept: HashMap<String, HashSet<ObjectId>>,
+    /// Paths by key, of kept blames read.
+    paths: HashMap<String, String>,
     renames: HashMap<ObjectId, Option<String>>,
-    /// Kept blames to write: `(path key, snapshot, object id, bytes)`.
-    writes: Vec<(String, ObjectId, ObjectId, Vec<u8>)>,
-    /// The last version computed and not kept: kept when the blame stops,
-    /// so every request that computes something leaves progress.
-    last: Option<(Version, Arc<Blame>)>,
-    /// Walks down cut before (`blame_walks`): from a version, the
-    /// versions it had not expanded yet (its frontier).
-    walked: HashMap<Version, Option<Vec<Version>>>,
-    /// Walks cut by this request, to write.
-    cut: Vec<(Version, Cut)>,
-    /// Versions known to hold no plain text (never kept, nothing to blame).
-    textless: HashSet<Version>,
-}
-
-/// A version a cut walk expanded: what blaming it needs.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct Walked {
-    v: Version,
-    new: Option<TreeEntry>,
-    parents: Vec<Option<Version>>,
-}
-
-/// A walk down cut before it got to the end (BUG-1212, BUG-1215): every
-/// version it expanded, and those it had not (its frontier). Once the
-/// frontier is settled (kept, or no plain text), the expanded versions are
-/// blamed from this record, without walking again.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct Cut {
-    expanded: Vec<Walked>,
-    frontier: Vec<Version>,
-}
-
-/// Most versions one walk expands: a cut walk's record stays small.
-const MAX_SEGMENT: usize = 2_048;
-/// Most records followed down within one request.
-const MAX_RESUMES: usize = 10_000;
-/// A version this far below the rows of its path read so far is read from
-/// a window of its own (not by paging down from where the rows are).
-const REANCHOR: i64 = 256;
-
-/// What a request works on next ([`Blamer::next_work`]).
-enum Work {
-    /// Walk down from a version no cut walk started from, and blame it.
-    Walk(Version),
-    /// Blame the versions a cut walk from it expanded: its frontier is settled.
-    Segment(Version),
+    /// Kept blames to write: `(path key, snapshot, bytes)`, and the paths
+    /// they name; [`Blamer::pending_bytes`] of them.
+    writes: Vec<(String, ObjectId, Vec<u8>)>,
+    write_paths: HashMap<String, String>,
+    pending_bytes: usize,
 }
 
 impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
@@ -536,50 +498,74 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             follow,
             limits,
             kept: HashMap::new(),
+            paths: HashMap::new(),
             renames: HashMap::new(),
             writes: Vec::new(),
-            last: None,
-            walked: HashMap::new(),
-            cut: Vec::new(),
-            textless: HashSet::new(),
+            write_paths: HashMap::new(),
+            pending_bytes: 0,
         }
     }
 
-    /// The kept blame of `v`, if any (every kept blame of the path is read
-    /// at once: at most one per [`CHECKPOINT`] versions, plus those asked).
-    fn kept_of(&mut self, v: &Version) -> Result<Option<ObjectId>> {
+    /// Is `v`'s blame kept? (The kept versions of the path are read at
+    /// once, in one statement.)
+    pub fn is_kept(&mut self, v: &Version) -> Result<bool> {
         let key = path_key(&v.path);
         if !self.kept.contains_key(&key) {
             let g = self.f.g;
             let cx = g.cx;
             g.tick()?;
-            let rows: Vec<(String, String)> = cx.db(|| {
-                sqlx::query_as("SELECT snapshot, object FROM blame_memo WHERE project_id = $1 AND view_key = $2 AND path_key = $3 AND follow = $4")
+            let rows: Vec<String> = cx.db(|| {
+                sqlx::query_scalar("SELECT snapshot FROM blame_memo WHERE project_id = $1 AND view_key = $2 AND path_key = $3 AND follow = $4")
                     .bind(cx.project())
                     .bind(g.vk)
                     .bind(&key)
                     .bind(self.follow)
                     .fetch_all(&cx.hub().db)
             })?;
-            // One read however many are kept: what reaching recorded
-            // progress costs never grows with it (BUG-1215).
-            let mut m = HashMap::new();
-            for (s, o) in rows {
-                m.insert(ObjectId::from_hex(&s).map_err(bad)?, ObjectId::from_hex(&o).map_err(bad)?);
-            }
-            self.kept.insert(key.clone(), m);
+            let set = rows.iter().map(|s| ObjectId::from_hex(s).map_err(bad)).collect::<Result<_>>()?;
+            self.kept.insert(key.clone(), set);
         }
-        Ok(self.kept[&key].get(&v.id).copied())
+        Ok(self.kept[&key].contains(&v.id))
+    }
+
+    /// The kept blame of `v`, if it is (still) kept.
+    pub fn kept_blame(&mut self, v: &Version) -> Result<Option<Blame>> {
+        let g = self.f.g;
+        let cx = g.cx;
+        g.tick()?;
+        let body: Option<Vec<u8>> = cx.db(|| {
+            sqlx::query_scalar("SELECT body FROM blame_memo WHERE project_id = $1 AND view_key = $2 AND path_key = $3 AND follow = $4 AND snapshot = $5")
+                .bind(cx.project())
+                .bind(g.vk)
+                .bind(path_key(&v.path))
+                .bind(self.follow)
+                .bind(v.id.hex())
+                .fetch_optional(&cx.hub().db)
+        })?;
+        let Some(body) = body else { return Ok(None) };
+        let want: Vec<String> = Blame::keys(&body)?.into_iter().filter(|k| !self.paths.contains_key(k)).collect::<HashSet<_>>().into_iter().collect();
+        if !want.is_empty() {
+            g.tick()?;
+            let rows: Vec<(String, String)> = cx.db(|| {
+                sqlx::query_as("SELECT path_key, path FROM blame_paths WHERE project_id = $1 AND path_key = ANY($2)")
+                    .bind(cx.project())
+                    .bind(&want)
+                    .fetch_all(&cx.hub().db)
+            })?;
+            self.paths.extend(rows);
+        }
+        let paths = &self.paths;
+        Ok(Some(Blame::decode(&body, MAX_LINES, |k| paths.get(k).cloned())?))
     }
 
     /// What the walk down needs of version `v`: its change, the versions
     /// it came from (none when its blame is kept, or it is not text), and
-    /// its kept blame.
+    /// whether it is kept.
     #[allow(clippy::type_complexity)]
-    fn expand(&mut self, v: &Version) -> Result<(Arc<FChange>, Vec<Option<Version>>, Option<ObjectId>)> {
+    fn expand(&mut self, v: &Version) -> Result<(Arc<FChange>, Vec<Option<Version>>, bool)> {
         let change = self.f.find(&v.path, v.depth, v.id)?.ok_or_else(|| bad(format!("no row for a version at {}", v.id.short())))?;
-        let kept = if texty(&change.new) { self.kept_of(v)? } else { None };
-        let parents = if texty(&change.new) && kept.is_none() {
+        let kept = texty(&change.new) && self.is_kept(v)?;
+        let parents = if texty(&change.new) && !kept {
             parents_of(self.f, self.t, v, &change, self.follow, &mut self.renames)?
         } else {
             Vec::new()
@@ -588,7 +574,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
     }
 
     /// The text of entry `e`, if it is plain text the server may read.
-    fn text(&self, e: &Option<TreeEntry>) -> Result<Option<Arc<Text>>> {
+    pub fn text(&self, e: &Option<TreeEntry>) -> Result<Option<Arc<Text>>> {
         if !texty(e) {
             return Ok(None);
         }
@@ -600,193 +586,16 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         Ok(Some(Text::new(e.id, bytes)))
     }
 
-    /// The text and blame of version `start`; `None` when it is not plain
-    /// text. Kept blames are written, also when it stops.
+    /// A blame job: blame version `start` (and keep it), walking down to
+    /// kept blames or the file's first version and back up, in memory;
+    /// `None` when it is not plain text. What it kept is written, also
+    /// when it fails.
     pub fn blame(&mut self, start: &Version) -> Result<Done> {
-        let r = self.resumed(start);
-        if r.is_err() {
-            if let Some((v, b)) = self.last.take() {
-                self.keep(&v, &b);
-            }
-        }
-        let w = self.write().and_then(|_| self.write_cuts());
+        let r = self.run(start);
+        let w = self.write();
         let out = r?;
         w?;
         Ok(out)
-    }
-
-    /// Blame `start`, going on from what earlier requests left (BUG-1212,
-    /// BUG-1215). A walk down cut before it got to the end recorded what it
-    /// expanded and its frontier; no version a cut walk started from is
-    /// walked from again. Each round works on the deepest unfinished place
-    /// ([`Blamer::next_work`]): it walks down from a frontier version no
-    /// walk started from (and records a deeper cut if this one is cut too),
-    /// or blames the versions of a cut walk whose frontier is settled, from
-    /// its record, keeping them. So every request that stops keeps a version
-    /// or records a walk deeper than any before, and never repeats a walk.
-    fn resumed(&mut self, start: &Version) -> Result<Done> {
-        loop {
-            match self.next_work(start)? {
-                Work::Walk(v) => {
-                    let out = self.run(&v)?;
-                    if v == *start {
-                        return Ok(out);
-                    }
-                    if out.is_none() {
-                        self.textless.insert(v);
-                    }
-                }
-                Work::Segment(v) => {
-                    let out = self.segment(&v)?;
-                    if v == *start {
-                        return Ok(out);
-                    }
-                    if out.is_none() {
-                        self.textless.insert(v);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Is `v` done with: kept, or known to hold no plain text?
-    fn settled(&mut self, v: &Version) -> Result<bool> {
-        if self.textless.contains(v) {
-            return Ok(true);
-        }
-        if self.kept_of(v)?.is_some() {
-            return Ok(true);
-        }
-        let c = self.f.find(&v.path, v.depth, v.id)?.ok_or_else(|| bad(format!("no row for a version at {}", v.id.short())))?;
-        if !texty(&c.new) {
-            self.textless.insert(v.clone());
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    /// The deepest unfinished place below `start`: down the records of cut
-    /// walks, to a frontier version no walk started from, or to a cut walk
-    /// whose frontier is all settled. One small read per record followed.
-    fn next_work(&mut self, start: &Version) -> Result<Work> {
-        let mut v = start.clone();
-        for _ in 0..MAX_RESUMES {
-            let Some(frontier) = self.walked_from(&v)? else { return Ok(Work::Walk(v)) };
-            let mut next = None;
-            for x in frontier {
-                if !self.settled(&x)? {
-                    next = Some(x);
-                    break;
-                }
-            }
-            match next {
-                Some(x) => v = x,
-                None => return Ok(Work::Segment(v)),
-            }
-        }
-        Err(partial())
-    }
-
-    /// The frontier of the cut walk down from `v` (`blame_walks`), if any.
-    fn walked_from(&mut self, v: &Version) -> Result<Option<Vec<Version>>> {
-        if let Some(w) = self.walked.get(v) {
-            return Ok(w.clone());
-        }
-        let g = self.f.g;
-        let cx = g.cx;
-        g.tick()?;
-        let row: Option<String> = cx.db(|| {
-            sqlx::query_scalar(
-                "SELECT frontier FROM blame_walks WHERE project_id = $1 AND view_key = $2 AND path_key = $3 AND follow = $4 AND snapshot = $5",
-            )
-            .bind(cx.project())
-            .bind(g.vk)
-            .bind(path_key(&v.path))
-            .bind(self.follow)
-            .bind(v.id.hex())
-            .fetch_optional(&cx.hub().db)
-        })?;
-        let w: Option<Vec<Version>> = row.map(|r| serde_json::from_str(&r).map_err(bad)).transpose()?;
-        self.walked.insert(v.clone(), w.clone());
-        Ok(w)
-    }
-
-    /// Blame the versions the cut walk down from `v` expanded, from its
-    /// record (its frontier is settled), and keep `v`'s.
-    fn segment(&mut self, v: &Version) -> Result<Done> {
-        let g = self.f.g;
-        let cx = g.cx;
-        g.tick()?;
-        let row: Option<String> = cx.db(|| {
-            sqlx::query_scalar(
-                "SELECT expanded FROM blame_walks WHERE project_id = $1 AND view_key = $2 AND path_key = $3 AND follow = $4 AND snapshot = $5",
-            )
-            .bind(cx.project())
-            .bind(g.vk)
-            .bind(path_key(&v.path))
-            .bind(self.follow)
-            .bind(v.id.hex())
-            .fetch_optional(&cx.hub().db)
-        })?;
-        let expanded: Vec<Walked> = serde_json::from_str(&row.ok_or_else(|| bad("a cut walk has no record"))?).map_err(bad)?;
-        let by: HashMap<Version, Walked> = expanded.into_iter().map(|w| (w.v.clone(), w)).collect();
-        // The versions above settled ones, parents first, from `v`.
-        let mut nodes: HashMap<Version, Node> = HashMap::new();
-        let mut order: Vec<Version> = Vec::new();
-        let mut stack: Vec<(Version, bool)> = vec![(v.clone(), false)];
-        while let Some((x, ready)) = stack.pop() {
-            if ready {
-                order.push(x);
-                continue;
-            }
-            if nodes.contains_key(&x) {
-                continue;
-            }
-            let kept = self.kept_of(&x)?;
-            let (new, parents) = match (by.get(&x), kept) {
-                (Some(w), None) => (w.new.clone(), w.parents.clone()),
-                (Some(w), Some(_)) => (w.new.clone(), Vec::new()),
-                // A frontier version: settled, so a leaf.
-                (None, _) => {
-                    let c = self.f.find(&x.path, x.depth, x.id)?.ok_or_else(|| bad(format!("no row for a version at {}", x.id.short())))?;
-                    (c.new.clone(), Vec::new())
-                }
-            };
-            stack.push((x.clone(), true));
-            for p in parents.iter().rev().flatten() {
-                if !nodes.contains_key(p) {
-                    stack.push((p.clone(), false));
-                }
-            }
-            let change = Arc::new(FChange { old: None, new, prev: Vec::new() });
-            nodes.insert(x, Node { change, parents, kept, left: 0 });
-        }
-        self.up(nodes, order, v)
-    }
-
-    /// Write the walks this request cut: each one's frontier, and what it
-    /// expanded.
-    fn write_cuts(&mut self) -> Result<()> {
-        let cx = self.f.g.cx;
-        for (v, cut) in std::mem::take(&mut self.cut) {
-            let frontier = serde_json::to_string(&cut.frontier).map_err(bad)?;
-            let expanded = serde_json::to_string(&cut.expanded).map_err(bad)?;
-            cx.db(|| {
-                sqlx::query(
-                    "INSERT INTO blame_walks (project_id, view_key, path_key, follow, snapshot, frontier, expanded) VALUES ($1, $2, $3, $4, $5, $6, $7) \
-                     ON CONFLICT (project_id, view_key, path_key, follow, snapshot) DO NOTHING",
-                )
-                .bind(cx.project())
-                .bind(self.f.g.vk)
-                .bind(path_key(&v.path))
-                .bind(self.follow)
-                .bind(v.id.hex())
-                .bind(&frontier)
-                .bind(&expanded)
-                .execute(&cx.hub().db)
-            })?;
-        }
-        Ok(())
     }
 
     fn run(&mut self, start: &Version) -> Result<Done> {
@@ -796,7 +605,6 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         let mut order: Vec<Version> = Vec::new();
         let mut stack: Vec<(Version, bool)> = vec![(start.clone(), false)];
         let mut held = 0usize;
-        let began = self.f.g.work();
         while let Some((v, ready)) = stack.pop() {
             if ready {
                 order.push(v);
@@ -805,44 +613,11 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             if nodes.contains_key(&v) {
                 continue;
             }
-            // Stopped (its work, its memory, its size, or the deadline): what
-            // it expanded and where it got to are recorded, and blamed from
-            // the record once the frontier is (BUG-1212, BUG-1215). A version
-            // already kept costs no budget: it ends the walk there.
-            let r = match self.kept_of(&v) {
-                Ok(Some(_)) => self.expand(&v),
-                Ok(None) => {
-                    let over = self.f.g.work() - began > self.limits.walk || held > self.limits.held || nodes.len() >= MAX_SEGMENT;
-                    if over {
-                        Err(partial())
-                    } else {
-                        self.expand(&v)
-                    }
-                }
-                Err(e) => Err(e),
-            };
-            let (change, parents, kept) = match r {
-                Ok(x) => x,
-                Err(e) => {
-                    stack.push((v, false));
-                    let mut frontier: Vec<Version> = Vec::new();
-                    let mut seen: HashSet<&Version> = HashSet::new();
-                    for (x, ready) in stack.iter().rev() {
-                        if !ready && !nodes.contains_key(x) && seen.insert(x) {
-                            frontier.push(x.clone());
-                        }
-                    }
-                    if !nodes.is_empty() {
-                        let expanded = nodes
-                            .iter()
-                            .map(|(x, n)| Walked { v: x.clone(), new: n.change.new.clone(), parents: n.parents.clone() })
-                            .collect();
-                        self.cut.push((start.clone(), Cut { expanded, frontier }));
-                    }
-                    return Err(e);
-                }
-            };
-            held += 256 + v.path.len();
+            let (change, parents, kept) = self.expand(&v)?;
+            held += 256 + v.path.len() + parents.iter().flatten().map(|p| 96 + p.path.len()).sum::<usize>();
+            if held > self.limits.held {
+                return Err(too_wide());
+            }
             stack.push((v.clone(), true));
             for p in parents.iter().rev().flatten() {
                 if !nodes.contains_key(p) {
@@ -851,14 +626,6 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             }
             nodes.insert(v, Node { change, parents, kept, left: 0 });
         }
-        self.up(nodes, order, start)
-    }
-
-    /// Blame the versions of `nodes` in `order` (parents first), from their
-    /// parents' blames, keeping `start`'s, the checkpoints, and when it
-    /// stops the last one computed.
-    fn up(&mut self, mut nodes: HashMap<Version, Node>, order: Vec<Version>, start: &Version) -> Result<Done> {
-        let mut held: usize = nodes.keys().map(|v| 256 + v.path.len()).sum();
         let edges: Vec<Version> = nodes.values().flat_map(|n| n.parents.iter().flatten().cloned()).collect();
         for p in edges {
             if let Some(n) = nodes.get_mut(&p) {
@@ -866,44 +633,37 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             }
         }
         // Up: each version from its parents', each dropped once every
-        // version above it is computed.
+        // version above it is computed; kept as it goes.
         let mut done: HashMap<Version, Done> = HashMap::new();
-        let mut cost = 0u64;
         for v in order {
             let (change, parents, kept) = {
                 let n = &nodes[&v];
                 (n.change.clone(), n.parents.clone(), n.kept)
             };
-            let out: Done = match kept {
-                Some(obj) => {
-                    self.f.g.tick()?;
-                    let raw = self.f.g.cx.src.raw(&obj)?;
-                    let b = Blame::decode(&raw, MAX_LINES)?;
-                    match self.text(&change.new)? {
-                        Some(t) if t.lines.len() == b.lines.len() => Some((t, Arc::new(b))),
-                        Some(_) => return Err(bad("a kept blame does not match its version")),
-                        None => None,
-                    }
+            let out: Done = if kept {
+                match (self.kept_blame(&v)?, self.text(&change.new)?) {
+                    (Some(b), Some(t)) if t.lines.len() == b.lines.len() => Some((t, Arc::new(b))),
+                    (Some(_), Some(_)) => return Err(bad("a kept blame does not match its version")),
+                    (_, None) => None,
+                    // Dropped since (the project's cap): computed again,
+                    // from scratch below it.
+                    (None, Some(_)) => return Err(Error::new(StatusCode::SERVICE_UNAVAILABLE, "warming", "this blame is being prepared; try again in a few seconds")),
                 }
-                None => match self.text(&change.new)? {
+            } else {
+                match self.text(&change.new)? {
                     None => None,
                     Some(text) => {
-                        let inputs: Vec<Option<(&Text, &Blame)>> = parents
-                            .iter()
-                            .map(|p| p.as_ref().and_then(|p| done.get(p)).and_then(|d| d.as_ref()).map(|(t, b)| (&**t, &**b)))
-                            .collect();
-                        let (b, c) = step((v.id, &v.path), &text, &inputs);
-                        cost = cost.saturating_add(c);
+                        let inputs: Vec<Option<(&Text, &Blame)>> =
+                            parents.iter().map(|p| p.as_ref().and_then(|p| done.get(p)).and_then(|d| d.as_ref()).map(|(t, b)| (&**t, &**b))).collect();
+                        let (b, _) = step((v.id, &v.path), &text, &inputs);
+                        self.f.g.cx.hub().query.blame_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let b = Arc::new(b);
                         if b.vd % CHECKPOINT == 0 || v == *start {
                             self.keep(&v, &b);
-                            self.last = None;
-                        } else {
-                            self.last = Some((v.clone(), b.clone()));
                         }
                         Some((text, b))
                     }
-                },
+                }
             };
             if let Some((t, b)) = &out {
                 held += t.weight() + b.weight();
@@ -918,73 +678,321 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                 }
             }
             done.insert(v.clone(), out);
-            if held > self.limits.held {
+            if held + self.pending_bytes > self.limits.held {
                 return Err(too_wide());
             }
-            if cost > self.limits.work {
-                return Err(partial());
-            }
-            if self.writes.len() >= 32 {
+            if self.writes.len() >= BATCH_BLAMES || self.pending_bytes >= BATCH_BYTES.min(self.limits.held / 4) {
                 self.write()?;
             }
         }
         Ok(done.remove(start).flatten())
     }
 
-    /// Keep blame `b` of version `v`. Always: a resumed blame relies on
-    /// every version it computed being kept (BUG-1215), and a blame is
-    /// bounded by its file's lines (at most [`MAX_TEXT_BYTES`]).
+    /// Keep blame `b` of version `v` (written with the next batch).
     fn keep(&mut self, v: &Version, b: &Blame) {
-        let raw = b.encode();
-        self.writes.push((path_key(&v.path), v.id, ObjectId::hash(&raw), raw));
+        let raw = b.encode(path_key);
+        self.pending_bytes += raw.len() + 128;
+        for (_, p) in &b.origins {
+            let k = path_key(p);
+            if !self.write_paths.contains_key(&k) {
+                self.pending_bytes += p.len() + 64;
+                self.write_paths.insert(k, p.clone());
+            }
+        }
+        self.writes.push((path_key(&v.path), v.id, raw));
     }
 
-    /// Write the kept blames computed so far: the objects, then their rows.
+    /// Write the kept blames held: their paths, then the blames; then drop
+    /// the project's oldest past [`BlameLimits::kept_bytes`] (BUG-1218).
     fn write(&mut self) -> Result<()> {
         if self.writes.is_empty() {
             return Ok(());
         }
         let w = std::mem::take(&mut self.writes);
+        let paths = std::mem::take(&mut self.write_paths);
+        self.pending_bytes = 0;
         let cx = self.f.g.cx;
-        let (hub, project) = (cx.hub().clone(), cx.project());
-        let objects: Vec<(ObjectId, Bytes)> = w.iter().map(|(_, _, o, raw)| (*o, Bytes::from(raw.clone()))).collect();
-        cx.src.rt.block_on(async {
-            let mut set = tokio::task::JoinSet::new();
-            let mut it = objects.into_iter();
-            loop {
-                while set.len() < 16 {
-                    let Some((id, raw)) = it.next() else { break };
-                    let h = hub.clone();
-                    set.spawn(async move { h.objects.put(project, &id, raw).await });
-                }
-                match set.join_next().await {
-                    Some(r) => r.map_err(|e| Error::Other(e.into()))?.map_err(Error::Other)?,
-                    None => break,
-                }
-            }
-            Ok::<(), Error>(())
-        })?;
-        let keys: Vec<&str> = w.iter().map(|r| r.0.as_str()).collect();
-        let snaps: Vec<String> = w.iter().map(|r| r.1.hex()).collect();
-        let objs: Vec<String> = w.iter().map(|r| r.2.hex()).collect();
+        let (pool, project, vk) = (&cx.hub().db, cx.project(), self.f.g.vk);
+        let (pk, pp): (Vec<String>, Vec<String>) = paths.into_iter().unzip();
+        for (k, p) in pk.chunks(ROWS_PER_STATEMENT).zip(pp.chunks(ROWS_PER_STATEMENT)) {
+            cx.db(|| {
+                sqlx::query("INSERT INTO blame_paths (project_id, path_key, path) SELECT $1, * FROM UNNEST($2::text[], $3::text[]) ON CONFLICT DO NOTHING")
+                    .bind(project)
+                    .bind(k)
+                    .bind(p)
+                    .execute(pool)
+            })?;
+        }
+        let now = veil_core::now_millis();
+        for (k, s, body) in &w {
+            cx.db(|| {
+                sqlx::query(
+                    "INSERT INTO blame_memo (project_id, view_key, path_key, follow, snapshot, body, bytes, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING",
+                )
+                .bind(project)
+                .bind(vk)
+                .bind(k)
+                .bind(self.follow)
+                .bind(s.hex())
+                .bind(body)
+                .bind(body.len() as i64)
+                .bind(now)
+                .execute(pool)
+            })?;
+        }
         cx.db(|| {
             sqlx::query(
-                "INSERT INTO blame_memo (project_id, view_key, path_key, follow, snapshot, object) \
-                 SELECT $1, $2, k, $3, s, o FROM UNNEST($4::text[], $5::text[], $6::text[]) AS t(k, s, o) ON CONFLICT DO NOTHING",
+                "DELETE FROM blame_memo WHERE project_id = $1 AND (view_key, path_key, follow, snapshot) IN ( \
+                     SELECT view_key, path_key, follow, snapshot FROM ( \
+                         SELECT view_key, path_key, follow, snapshot, \
+                             SUM(bytes) OVER (ORDER BY created_at DESC, view_key, path_key, follow, snapshot) AS kept \
+                         FROM blame_memo WHERE project_id = $1) t \
+                     WHERE kept > $2)",
             )
             .bind(project)
-            .bind(self.f.g.vk)
-            .bind(self.follow)
-            .bind(&keys)
-            .bind(&snaps)
-            .bind(&objs)
-            .execute(&cx.hub().db)
+            .bind(self.limits.kept_bytes as i64)
+            .execute(pool)
         })?;
-        for (k, s, o, _) in w {
-            self.kept.entry(k).or_default().insert(s, o);
+        for (k, s, _) in w {
+            self.kept.entry(k).or_default().insert(s);
         }
         Ok(())
     }
+}
+
+/// The page of the kept blame of `start` (path `start.path` at the
+/// viewer's snapshot `rev`), if it is kept: what a request answers.
+#[allow(clippy::too_many_arguments)]
+pub fn kept_answer(f: &Files, t: &Trees, rev: ObjectId, start: &Version, follow: bool, after: usize, n: usize, limits: BlameLimits) -> Result<Option<Value>> {
+    let mut b = Blamer::new(f, t, follow, limits);
+    let Some(bl) = b.kept_blame(start)? else { return Ok(None) };
+    let change = f.find(&start.path, start.depth, start.id)?.ok_or_else(|| bad("no row for the version asked"))?;
+    let Some(text) = b.text(&change.new)? else { return Ok(None) };
+    if text.lines.len() != bl.lines.len() {
+        return Err(bad("a kept blame does not match its version"));
+    }
+    blame_json(f.g, rev, &start.path, follow, &text, &bl, after, n).map(Some)
+}
+
+// ---- blame jobs -------------------------------------------------------------------
+
+/// Blame jobs computing at once in one server (each runs its statements
+/// one at a time: at most this many of the pool's connections, and only
+/// while a statement runs).
+pub const BLAME_JOBS: usize = 2;
+/// Blame jobs waiting in one server, past which a request answers
+/// `warming` without queuing one.
+pub const MAX_PENDING_JOBS: usize = 256;
+/// A job's lease on its key: how long it lasts unless renewed, how often
+/// it is, and how long a job waits for another server's.
+const JOB_LEASE: Duration = Duration::from_secs(120);
+const JOB_RENEW: Duration = Duration::from_secs(30);
+const JOB_WAIT: Duration = Duration::from_secs(600);
+
+/// How a blame job ended, for every request waiting on it.
+#[derive(Clone, Debug)]
+pub enum JobEnd {
+    /// Kept (or found kept, by another server's job).
+    Kept,
+    /// The version holds no plain text.
+    NoText,
+    Failed(StatusCode, &'static str, String),
+}
+
+impl JobEnd {
+    fn of(r: Result<bool>) -> JobEnd {
+        match r {
+            Ok(true) => JobEnd::Kept,
+            Ok(false) => JobEnd::NoText,
+            Err(Error::Api { status, code, message }) => JobEnd::Failed(status, code, message),
+            Err(e) => JobEnd::Failed(StatusCode::INTERNAL_SERVER_ERROR, "internal", format!("{e:?}")),
+        }
+    }
+}
+
+/// A job's key: project, view key, path key, `follow`, snapshot.
+pub type JobKey = (i64, String, String, bool, ObjectId);
+type JobRx = tokio::sync::watch::Receiver<Option<JobEnd>>;
+
+/// The blame jobs of one server.
+pub struct Jobs {
+    waiting: std::sync::Mutex<HashMap<JobKey, JobRx>>,
+    slots: Arc<tokio::sync::Semaphore>,
+    /// Jobs started here (the tests count them).
+    pub started: std::sync::atomic::AtomicU64,
+}
+
+impl Default for Jobs {
+    fn default() -> Self {
+        Jobs {
+            waiting: std::sync::Mutex::new(HashMap::new()),
+            slots: Arc::new(tokio::sync::Semaphore::new(BLAME_JOBS)),
+            started: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+fn warming() -> Error {
+    Error::new(StatusCode::SERVICE_UNAVAILABLE, "warming", "this blame is being prepared; try again in a few seconds")
+}
+
+/// Wait, until `deadline`, for the blame of `start` to be kept: start its
+/// job, or join the one running here (and through its lease, another
+/// server's). The job goes on when the wait ends (`warming`).
+pub async fn wait_for_blame(
+    hub: &Arc<crate::Hub>,
+    project: &crate::perm::Project,
+    viewer: &crate::perm::Viewer,
+    start: &Version,
+    follow: bool,
+    limits: BlameLimits,
+    deadline: std::time::Instant,
+) -> Result<JobEnd> {
+    let vk = project.view(viewer).key();
+    let key: JobKey = (project.id, vk, path_key(&start.path), follow, start.id);
+    let mut rx = {
+        let mut w = hub.query.jobs.waiting.lock().unwrap();
+        match w.get(&key) {
+            Some(rx) => rx.clone(),
+            None => {
+                if w.len() >= MAX_PENDING_JOBS {
+                    return Err(warming());
+                }
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                w.insert(key.clone(), rx.clone());
+                hub.query.jobs.started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (hub, project, viewer, start) = (hub.clone(), project.clone(), viewer.clone(), start.clone());
+                tokio::spawn(async move {
+                    let r = leased_job(&hub, &project, &viewer, &key, &start, follow, limits).await;
+                    if let Err(e) = &r {
+                        eprintln!("veil-server: a blame job of project {}: {e:?}", project.id);
+                    }
+                    hub.query.jobs.waiting.lock().unwrap().remove(&key);
+                    let _ = tx.send(Some(JobEnd::of(r)));
+                });
+                rx
+            }
+        }
+    };
+    let done = async { rx.wait_for(|d| d.is_some()).await.ok().and_then(|d| d.clone()) };
+    match tokio::time::timeout_at(deadline.into(), done).await {
+        Ok(Some(end)) => Ok(end),
+        Ok(None) => Err(warming()),
+        Err(_) => Err(warming()),
+    }
+}
+
+/// Is the blame of `start` kept (one statement)?
+async fn kept_now(hub: &crate::Hub, key: &JobKey) -> Result<bool> {
+    let found: Option<String> = sqlx::query_scalar(
+        "SELECT snapshot FROM blame_memo WHERE project_id = $1 AND view_key = $2 AND path_key = $3 AND follow = $4 AND snapshot = $5",
+    )
+    .bind(key.0)
+    .bind(&key.1)
+    .bind(&key.2)
+    .bind(key.3)
+    .bind(key.4.hex())
+    .fetch_optional(&hub.db)
+    .await?;
+    Ok(found.is_some())
+}
+
+/// The job, under its key's lease (`blame_jobs`: one server at a time),
+/// in one of this server's [`BLAME_JOBS`] slots: whether it ended kept
+/// (`false`: no plain text). A job waiting for another server's lease
+/// stops as soon as that server's blame is kept.
+async fn leased_job(
+    hub: &Arc<crate::Hub>,
+    project: &crate::perm::Project,
+    viewer: &crate::perm::Viewer,
+    key: &JobKey,
+    start: &Version,
+    follow: bool,
+    limits: BlameLimits,
+) -> Result<bool> {
+    let holder = hex::encode(veil_core::crypto::random_bytes::<16>());
+    let take = || async {
+        let now = veil_core::now_millis();
+        let got: Option<String> = sqlx::query_scalar(
+            "INSERT INTO blame_jobs (project_id, view_key, path_key, follow, snapshot, holder, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (project_id, view_key, path_key, follow, snapshot) DO UPDATE SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at \
+             WHERE blame_jobs.expires_at < $8 RETURNING holder",
+        )
+        .bind(key.0)
+        .bind(&key.1)
+        .bind(&key.2)
+        .bind(key.3)
+        .bind(key.4.hex())
+        .bind(&holder)
+        .bind(now + JOB_LEASE.as_millis() as i64)
+        .bind(now)
+        .fetch_optional(&hub.db)
+        .await?;
+        Ok::<bool, Error>(got.is_some())
+    };
+    if kept_now(hub, key).await? {
+        return Ok(true);
+    }
+    let wait = tokio::time::Instant::now() + JOB_WAIT;
+    let mut leased = take().await?;
+    while !leased && tokio::time::Instant::now() < wait {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if kept_now(hub, key).await? {
+            return Ok(true);
+        }
+        leased = take().await?;
+    }
+    let renew = leased.then(|| {
+        let (hub, key, holder) = (hub.clone(), key.clone(), holder.clone());
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(JOB_RENEW).await;
+                let _ = sqlx::query(
+                    "UPDATE blame_jobs SET expires_at = $1 WHERE project_id = $2 AND view_key = $3 AND path_key = $4 AND follow = $5 AND snapshot = $6 AND holder = $7",
+                )
+                .bind(veil_core::now_millis() + JOB_LEASE.as_millis() as i64)
+                .bind(key.0)
+                .bind(&key.1)
+                .bind(&key.2)
+                .bind(key.3)
+                .bind(key.4.hex())
+                .bind(&holder)
+                .execute(&hub.db)
+                .await;
+            }
+        })
+    });
+    let r = async {
+        let _slot = hub.query.jobs.slots.clone().acquire_owned().await.map_err(|e| Error::Other(e.into()))?;
+        if kept_now(hub, key).await? {
+            return Ok(true);
+        }
+        let (project, viewer, vk, start) = (project.clone(), viewer.clone(), key.1.clone(), start.clone());
+        super::graph::blocking(hub, project.id, move |cx| {
+            let g = G::new(cx, &vk, None);
+            let view = project.view(&viewer);
+            let t = Trees::new(&g, &view);
+            let f = Files::new(&g);
+            let mut b = Blamer::new(&f, &t, follow, limits);
+            Ok(b.blame(&start)?.is_some())
+        })
+        .await
+    }
+    .await;
+    if let Some(renew) = renew {
+        renew.abort();
+        let _ = sqlx::query("DELETE FROM blame_jobs WHERE project_id = $1 AND view_key = $2 AND path_key = $3 AND follow = $4 AND snapshot = $5 AND holder = $6")
+            .bind(key.0)
+            .bind(&key.1)
+            .bind(&key.2)
+            .bind(key.3)
+            .bind(key.4.hex())
+            .bind(&holder)
+            .execute(&hub.db)
+            .await;
+    }
+    r
 }
 
 /// The JSON of blame `b` of `text` (path `path` at snapshot `rev`): lines

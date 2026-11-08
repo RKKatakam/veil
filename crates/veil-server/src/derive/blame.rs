@@ -28,7 +28,7 @@ use veil_core::{
 
 use crate::error::{Error, Result};
 
-const MAGIC: &[u8] = b"veil-derived blame 1\n";
+const MAGIC: &[u8] = b"veil-derived blame 2\n";
 
 /// One version's blame, in memory: for each line, the index of its origin
 /// in `origins` and its line number there (from 1).
@@ -47,7 +47,9 @@ pub struct Blame {
 }
 
 /// The stored form: runs of lines with one origin and consecutive lines
-/// there, `[count, origin, first line]`.
+/// there, `[count, origin, first line]`; each origin's path by its key
+/// (the paths are stored once per project, beside: BUG-1217), so a kept
+/// blame takes at most [`MAX_BYTES_PER_LINE`] a line, plus a little.
 #[derive(Serialize, Deserialize)]
 struct Stored {
     vd: u64,
@@ -55,6 +57,12 @@ struct Stored {
     origins: Vec<(ObjectId, String)>,
     ranges: Vec<[u32; 3]>,
 }
+
+/// Most bytes a kept blame takes per line of its version (an origin, 64 hex
+/// digits and a 32-digit path key with their JSON, and a range), past
+/// [`BASE_BYTES`].
+pub const MAX_BYTES_PER_LINE: usize = 128;
+pub const BASE_BYTES: usize = 64;
 
 impl Blame {
     /// The bytes it takes in memory, about.
@@ -69,7 +77,8 @@ impl Blame {
         (id, p, l)
     }
 
-    pub fn encode(&self) -> Vec<u8> {
+    /// The stored bytes, origins' paths named by `key`.
+    pub fn encode(&self, key: impl Fn(&str) -> String) -> Vec<u8> {
         let mut ranges: Vec<[u32; 3]> = Vec::new();
         for &(o, l) in &self.lines {
             match ranges.last_mut() {
@@ -80,7 +89,7 @@ impl Blame {
         let s = Stored {
             vd: self.vd,
             coarse: self.coarse,
-            origins: self.origins.clone(),
+            origins: self.origins.iter().map(|(id, p)| (*id, key(p))).collect(),
             ranges,
         };
         let mut out = MAGIC.to_vec();
@@ -88,8 +97,16 @@ impl Blame {
         out
     }
 
-    /// Decode a stored blame; `max_lines` bounds what it may expand to.
-    pub fn decode(raw: &[u8], max_lines: usize) -> Result<Blame> {
+    /// The path keys a stored blame names.
+    pub fn keys(raw: &[u8]) -> Result<Vec<String>> {
+        let body = raw.strip_prefix(MAGIC).ok_or_else(|| Error::Other(anyhow::anyhow!("blame object: not a blame object")))?;
+        let s: Stored = serde_json::from_slice(body).map_err(|e| Error::Other(anyhow::anyhow!("blame object: {e}")))?;
+        Ok(s.origins.into_iter().map(|(_, k)| k).collect())
+    }
+
+    /// Decode a stored blame, its path keys resolved by `path`;
+    /// `max_lines` bounds what it may expand to.
+    pub fn decode(raw: &[u8], max_lines: usize, path: impl Fn(&str) -> Option<String>) -> Result<Blame> {
         let bad = |m: &str| Error::Other(anyhow::anyhow!("blame object: {m}"));
         let body = raw.strip_prefix(MAGIC).ok_or_else(|| bad("not a blame object"))?;
         let s: Stored = serde_json::from_slice(body).map_err(|e| bad(&e.to_string()))?;
@@ -100,10 +117,14 @@ impl Blame {
             }
             lines.extend((0..count).map(|k| (o, first + k)));
         }
+        let mut origins = Vec::with_capacity(s.origins.len());
+        for (id, k) in s.origins {
+            origins.push((id, path(&k).ok_or_else(|| bad("a path it names is not stored"))?));
+        }
         Ok(Blame {
             vd: s.vd,
             coarse: s.coarse,
-            origins: s.origins,
+            origins,
             lines,
         })
     }
@@ -250,9 +271,18 @@ mod tests {
         let (b1, _) = step((id(1), "f"), &v1, &[]);
         let v2 = text("a\nz\nc\nd\n");
         let (b2, _) = step((id(2), "f"), &v2, &[Some((&v1, &b1))]);
-        let raw = b2.encode();
-        assert_eq!(Blame::decode(&raw, 4).unwrap(), b2);
-        assert!(Blame::decode(&raw, 3).is_err(), "more lines than allowed");
-        assert!(Blame::decode(b"veil-derived changed-paths 1\n{}", 10).is_err());
+        let key = |p: &str| format!("k-{p}");
+        let path = |k: &str| k.strip_prefix("k-").map(str::to_string);
+        let raw = b2.encode(key);
+        assert_eq!(Blame::decode(&raw, 4, path).unwrap(), b2);
+        assert_eq!(Blame::keys(&raw).unwrap(), ["k-f", "k-f"]);
+        assert!(Blame::decode(&raw, 3, path).is_err(), "more lines than allowed");
+        assert!(Blame::decode(&raw, 4, |_| None).is_err(), "a path not stored");
+        assert!(Blame::decode(b"veil-derived changed-paths 1\n{}", 10, path).is_err());
+        // Bounded by its lines: 400 lines from 400 origins at a 4 KB path.
+        let long = "d/".repeat(2000);
+        let many = Blame { vd: 1, coarse: false, origins: (0..400).map(|i| (ObjectId([i as u8; 32]), long.clone())).collect(), lines: (0..400).map(|i| (i, 1)).collect() };
+        let raw = many.encode(crate::derive::changes::path_key);
+        assert!(raw.len() <= BASE_BYTES + MAX_BYTES_PER_LINE * 400, "{}", raw.len());
     }
 }

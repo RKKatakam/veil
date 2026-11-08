@@ -19,32 +19,40 @@ CREATE TABLE IF NOT EXISTS view_file_history (
     change TEXT NOT NULL,
     PRIMARY KEY (project_id, view_key, path_key, depth, snapshot)
 );
--- Kept blames: the object (`veil-derived blame 1`, addressed by its hash)
--- holding the blame of the version a snapshot of a viewer's graph
--- introduced at a path, with or without following renames.
+-- Kept blames (S14 cycle 3): the encoded blame (`veil-derived blame 2`,
+-- at most 64 + 128 bytes a line of its version) of the version a snapshot
+-- of a viewer's graph introduced at a path, with or without following
+-- renames; `bytes` its size, `created_at` when written (milliseconds):
+-- a project keeps at most 256 MiB of them, its oldest dropped first.
 CREATE TABLE IF NOT EXISTS blame_memo (
     project_id BIGINT NOT NULL,
     view_key TEXT NOT NULL,
     path_key TEXT NOT NULL,
     follow BOOLEAN NOT NULL,
     snapshot TEXT NOT NULL,
-    object TEXT NOT NULL,
+    body BYTEA NOT NULL,
+    bytes BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
     PRIMARY KEY (project_id, view_key, path_key, follow, snapshot)
 );
--- Walks down to the versions a blame starts from that stopped before
--- they got there (BUG-1212, BUG-1215): from a version (snapshot and path),
--- the versions it had not expanded yet (`frontier`, JSON) and those it had,
--- with what blaming them needs (`expanded`, JSON). Requests go on below
--- them, and blame the expanded versions from this record once the
--- frontier is done; no walk from a recorded version is made again.
-CREATE TABLE IF NOT EXISTS blame_walks (
+-- The paths kept blames name, once per project, by key.
+CREATE TABLE IF NOT EXISTS blame_paths (
+    project_id BIGINT NOT NULL,
+    path_key TEXT NOT NULL,
+    path TEXT NOT NULL,
+    PRIMARY KEY (project_id, path_key)
+);
+-- Who runs the blame job of a version now (one server at a time): a
+-- lease, taken, renewed and given back by single statements, as
+-- `view_fills`; past `expires_at` (milliseconds) it may be taken over.
+CREATE TABLE IF NOT EXISTS blame_jobs (
     project_id BIGINT NOT NULL,
     view_key TEXT NOT NULL,
     path_key TEXT NOT NULL,
     follow BOOLEAN NOT NULL,
     snapshot TEXT NOT NULL,
-    frontier TEXT NOT NULL,
-    expanded TEXT NOT NULL,
+    holder TEXT NOT NULL,
+    expires_at BIGINT NOT NULL,
     PRIMARY KEY (project_id, view_key, path_key, follow, snapshot)
 );
 -- Which viewer-graph rows have their file history (S14 writes it before

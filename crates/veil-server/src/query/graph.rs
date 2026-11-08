@@ -748,10 +748,11 @@ pub struct State {
     started: Mutex<HashMap<i64, u64>>,
     /// One per fill running here: at most [`MAX_FILLS`] at once.
     slots: Arc<tokio::sync::Semaphore>,
-    /// One per blame computing here (S14): at most
-    /// [`super::files::BLAMES_AT_ONCE`] at once, so what blames hold in all
-    /// is bounded whatever the number of requests.
-    pub blames: Arc<tokio::sync::Semaphore>,
+    /// The blame jobs of this server (S14 cycle 3).
+    pub jobs: super::files::Jobs,
+    /// Versions blamed (computed, not read kept) here: the tests count
+    /// them, to show no version is blamed twice.
+    pub blame_steps: std::sync::atomic::AtomicU64,
 }
 
 type Fill = watch::Receiver<Option<std::result::Result<(), String>>>;
@@ -763,7 +764,8 @@ impl Default for State {
             fills: Mutex::new(HashMap::new()),
             started: Mutex::new(HashMap::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_FILLS)),
-            blames: Arc::new(tokio::sync::Semaphore::new(super::files::BLAMES_AT_ONCE)),
+            jobs: super::files::Jobs::default(),
+            blame_steps: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
