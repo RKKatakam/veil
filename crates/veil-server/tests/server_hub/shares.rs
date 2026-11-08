@@ -1015,7 +1015,7 @@ fn bug_1066_a_pass_in_flight_never_brings_back_an_unshare() {
     // in a database of this test's own, so no other test sees them.
     let admin_url = std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL (run scripts/verify-server.sh)");
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    let name = format!("{}{}", std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_default(), unique("veil_fresh_"));
+    let name = format!("{}{}", crate::support::test_db_prefix(), unique("veil_fresh_"));
     let yugabyte = rt.block_on(async {
         let db = veil_server::db::connect(&admin_url, 1).await.unwrap();
         let v: String = sqlx::query_scalar("SELECT version()").fetch_one(&db).await.unwrap();
