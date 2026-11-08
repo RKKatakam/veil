@@ -56,7 +56,7 @@ use crate::{
     repo::Repo,
     store::ObjectStore,
     textmerge,
-    tree::{diff_trees, lookup},
+    tree::{diff_trees, lookup_to_read},
     vpath::VPath,
 };
 
@@ -494,7 +494,7 @@ impl LazyRank<'_> {
 /// The version of the file at `path` in `tree` this reader reads, `None`
 /// when there is no file there; `Err(Hidden)` when it is redacted.
 fn version_at(store: &ObjectStore, tree: &ObjectId, path: &VPath, reader: Reader, stats: &mut ReadStats) -> Result<Option<std::result::Result<Arc<Version>, Hidden>>> {
-    let e = match lookup(store, tree, path) {
+    let e = match lookup_to_read(store, tree, path) {
         Ok(Some(e)) if e.kind != EntryKind::Dir => e,
         Ok(_) => return Ok(None),
         // A directory on the way this reader cannot open.
@@ -523,7 +523,7 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
     let store = repo.store();
     let mut stats = ReadStats::default();
     let top = repo.snapshot(rev)?;
-    let entry = match lookup(store, &top.tree, path)? {
+    let entry = match lookup_to_read(store, &top.tree, path)? {
         Some(e) if e.kind.is_file_like() => e,
         Some(_) => return Err(VeilError::NotFound(format!("{path} is a directory in {}", rev.short()))),
         None => return Err(VeilError::NotFound(format!("{path} does not exist in {}", rev.short()))),
@@ -581,7 +581,7 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
                 // Where did the file come from? Renames in this step only.
                 let changes = diff_trees(store, Some(&ps.tree), Some(&snap.tree))?;
                 if changes.iter().any(|c| c.path == q.path && c.old.is_none()) {
-                    let d = rename::detect(store, &changes, o.reader, &o.renames)?;
+                    let d = rename::detect(store, Some(&ps.tree), Some(&snap.tree), &changes, o.reader, &o.renames)?;
                     result.stats.add(&d.stats);
                     if let Some(pair) = d.pairs.iter().find(|p| p.to == q.path && !p.copy) {
                         ppath = pair.from.clone();
