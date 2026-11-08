@@ -251,12 +251,9 @@ fn restoring_from_an_embargoed_fix_onto_another_line_publishes_nothing() {
     r.tag("fix", "@-");
     r.ok(&["merge", "fix", "--into", "main", "--embargo", "-m", "embargoed"]);
     r.ok(&["new", &v1[..16]]);
-    // Refused, or kept sealed under the embargo: either way not public.
-    let out = r.run(&["restore", "--from", "fix", "FIXNAME-K7.c"]);
-    if out.status.success() {
-        r.ok(&["commit", "-m", "rel"]);
-        r.tag("rel", "@-");
-    }
+    // Refused: a copy outside the embargo would publish the fix.
+    let err = r.fails(&["restore", "--from", "fix", "FIXNAME-K7.c"]);
+    assert!(err.contains("cannot restore from") && err.contains("unreleased embargo"), "{err}");
     let mirror = env.dir("mirror");
     env.run("alice", &mirror, &["init", "--bare"]);
     r.ok(&["remote", "add", "pub", mirror.to_str().unwrap(), "--public"]);

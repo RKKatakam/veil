@@ -327,17 +327,11 @@ fn merging_a_snapshot_into_itself_records_no_duplicate_parent() {
     r.commit("one", &[("f", "1\n")]);
     r.tag("main", "@-");
     r.write("wip.txt", "keep me\n");
-    let out = r.run(&["merge", "main", "--into", "main"]);
-    if out.status.success() {
-        let m = r.snap("main");
-        let mut uniq = m.parents.clone();
-        uniq.dedup();
-        assert_eq!(
-            uniq.len(),
-            m.parents.len(),
-            "duplicate parents recorded: {m:?}"
-        );
-    }
+    let before = r.sid("main");
+    let err = r.fails(&["merge", "main", "--into", "main"]);
+    assert!(err.contains("nothing to merge"), "{err}");
+    assert_eq!(r.sid("main"), before, "a refused merge moved main");
+    assert_eq!(r.read("wip.txt"), "keep me\n");
 }
 
 // Scenario from jj test_new (duplicate parents): `vl new X X` with work in progress.
@@ -348,17 +342,9 @@ fn new_with_a_repeated_parent_records_one_parent() {
     r.commit("one", &[("f", "1\n")]);
     r.tag("one", "@-");
     r.write("wip.txt", "keep me\n");
-    let out = r.run(&["new", "one", "one"]);
-    if out.status.success() {
-        let s = r.snap("@");
-        let mut uniq = s.parents.clone();
-        uniq.dedup();
-        assert_eq!(
-            uniq.len(),
-            s.parents.len(),
-            "duplicate parents recorded: {s:?}"
-        );
-    }
+    r.ok(&["new", "one", "one"]);
+    let s = r.snap("@");
+    assert_eq!(s.parents, vec![r.sid("one")], "duplicate parents recorded: {s:?}");
 }
 
 // Scenario from git t6407-merge-binary.sh: conflicting binary edits keep ours and flag the file.

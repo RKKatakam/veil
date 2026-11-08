@@ -25,6 +25,7 @@ text:
 | [`vl squash`](squash.md) (a write command) | [`veil.squash/2`](#veilsquash2) |
 | [`vl blame`](blame.md) | [`veil.blame/2`](#veilblame2) |
 | [`vl grep`](grep.md) | [`veil.grep/2`](#veilgrep2) |
+| [`vl search`](search.md) | [`veil.search/1`](#veilsearch1) |
 | [`vl duplicate`](duplicate.md), [`vl cherry-pick`](cherry-pick.md) (write commands) | [`veil.duplicate/2`](#veilduplicate2) |
 | [`vl attr check`](attr.md#vl-attr-check) | [`veil.attr-check/1`](#veilattr-check1) |
 | any of them, on failure | [`veil.error/1`](#veilerror1) |
@@ -623,6 +624,33 @@ the text only; the document always lists every match.
 `tier` is `public`, `cloaked` (a sealed secret file, and you hold the
 key) or `embargoed` (an unreleased embargo withholds this version).
 Members see newer content there.
+
+The exit status is 0 when something matched and 1 when nothing did, with
+the document printed either way.
+
+## `veil.search/1`
+
+`vl search --json`: the server's answer to a ranked search
+(`GET /v1/projects/{p}/q/search`, `docs/HUB.md` §13.23), as it sent it. It
+holds only what you may see: counts, scores and pages are computed over the
+files you may read and nothing else.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.search/1` |
+| `kind` | string | `code` (content at a branch tip) or `path` (file names over all of the project's history, `--path`) |
+| `rev` | string | The branch searched |
+| `snapshot_id` | string | Your id of the snapshot whose files were searched (the branch tip the index covers) |
+| `tip_id` | string | Your id of the branch's tip now |
+| `behind` | bool | The index has not caught up with the tip yet (it is being brought up to date): `snapshot_id` (or, for `path`, the history walked) is older than `tip_id` |
+| `query` | string | The words searched for |
+| `files` | number | Files that matched, among those read |
+| `complete` | bool | Every candidate was read (false: the search hit its bounds, and `files` counts the ones read) |
+| `results` | array | The best matches, best first. `code`: `path`, `score`, `size`, `matches` (matching lines), `lines` (the first few: `line`, from 1, and `text`). `path`: `path`, `score`, `at_rev` (bool: the file is at the branch tip) |
+| `truncated` | bool | There are more results |
+| `next` | string or null | The cursor of the next page |
+| `policy_version` | number | The accepted policy the answer was computed under |
+| `work` | number | Files (or names) the server read for it |
 
 The exit status is 0 when something matched and 1 when nothing did, with
 the document printed either way.

@@ -76,12 +76,14 @@ fn init_in_an_unwritable_directory_fails_and_leaves_nothing() {
     let env = Env::new();
     let r = env.bare_dir("ro");
     r.chmod(".", 0o555);
-    let out = r.run(&["init"]);
-    r.chmod(".", 0o755);
-    if out.status.success() {
+    if std::fs::write(r.path("probe"), "").is_ok() {
         // Running as root: permissions do not apply.
+        r.chmod(".", 0o755);
         return;
     }
+    let out = r.run(&["init"]);
+    r.chmod(".", 0o755);
+    assert!(!out.status.success(), "init in an unwritable directory succeeded: {}", text(&out));
     assert!(clean_exit(&out), "{}", text(&out));
     assert!(!r.path(".veil").exists(), "no half-made repository");
 }

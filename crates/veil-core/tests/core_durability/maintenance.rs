@@ -704,11 +704,11 @@ fn a_pulls_remote_loose_objects_are_spooled_and_checked() {
     remote::push(&mut alice, hub.clone(), false, &[], false).unwrap();
     let blob_id = ObjectId::hash(&Object::Blob(b"c-811\n".to_vec()).encode());
     let path = p(&format!(".veil/objects/{}/{}", &blob_id.hex()[..2], &blob_id.hex()[2..]));
-    if hub.exists(&path).unwrap() {
-        hub.write(&path, b"veil:blob\nnot what it should be").unwrap();
-        let _ = remote::pull(&mut bob, "origin", hub.clone());
-        assert!(bob.store().get_raw(&blob_id).map_or(true, |raw| ObjectId::hash(&raw) == blob_id));
-    }
+    assert!(hub.exists(&path).unwrap(), "control: the pushed blob is a loose object on the remote");
+    hub.write(&path, b"veil:blob\nnot what it should be").unwrap();
+    let err = remote::pull(&mut bob, "origin", hub.clone()).unwrap_err().to_string();
+    assert!(err.contains("content does not match its hash"), "{err}");
+    assert!(bob.store().get_raw(&blob_id).map_or(true, |raw| ObjectId::hash(&raw) == blob_id));
     assert_fsck_clean(bfs, &id, "after pulling loose objects");
 }
 
