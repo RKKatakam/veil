@@ -2309,7 +2309,6 @@ fn bug_1314_a_base_shared_by_hidden_only_changes_resolves_to_the_newest_of_them(
     let hub = TestHub::start();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
-    let api = hub.api();
     p.admin.ok(&p.dir, &["access", ".veilrules", "devs"]);
     p.admin.commit_main(&p.dir, "devs may edit the rules file");
     p.admin.ok(&p.dir, &["push"]);
