@@ -1361,3 +1361,635 @@ mod s14c2_adversarial {
     }
 
 }
+
+// ---- S14 cycle 3: review of the cycle-2 fixes (BUG-1215) ------------------------------
+
+mod s14c3_adversarial {
+    use super::*;
+    use veil_server::derive::changes::path_key;
+
+    const ROOT_TS: i64 = 1_700_000_000_000;
+
+    /// Kept blames and recorded walks of the project.
+    fn progress(th: &TestHub, h: &Hist) -> (i64, i64) {
+        th.rt.block_on(async {
+            let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blame_memo WHERE project_id = $1").bind(h.id).fetch_one(&h.hub.db).await.unwrap();
+            let walks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blame_walks WHERE project_id = $1").bind(h.id).fetch_one(&h.hub.db).await.unwrap();
+            (kept, walks)
+        })
+    }
+
+    fn limits(walk: u64, work: u64, held: usize) -> Limits {
+        Limits { blame: BlameLimits { walk, work, held, ..BlameLimits::default() }, deadline: Duration::from_secs(300), ..Limits::default() }
+    }
+
+    fn unbounded() -> Limits {
+        limits(u64::MAX, u64::MAX, BlameLimits::default().held)
+    }
+
+    /// One blame request on `hub`.
+    fn ask_once(th: &TestHub, hub: &std::sync::Arc<veil_server::Hub>, a: &Ask, q: BlameParams, l: Limits) -> Result<Value, Error> {
+        th.rt.block_on(query::blame(hub, a, q, l))
+    }
+
+    /// A history the test writes, one snapshot after another.
+    struct Writer {
+        n: u16,
+        ts: i64,
+        tag: u8,
+    }
+
+    impl Writer {
+        fn new(tag: u8) -> Writer {
+            Writer { n: 0, ts: ROOT_TS, tag }
+        }
+        fn commit(&mut self, th: &TestHub, h: &mut Hist, parents: &[ObjectId], f: &Files) -> ObjectId {
+            self.n += 1;
+            self.ts += 1000;
+            let mut change = [self.tag; 16];
+            change[..2].copy_from_slice(&self.n.to_le_bytes());
+            h.commit(th, parents, f.clone(), change, self.ts, None)
+        }
+    }
+
+    /// A file of `path` edited at each of `n` changes (one line each, in
+    /// turn), as a chain; the snapshots, oldest first.
+    fn chain(th: &TestHub, h: &mut Hist, path: &str, n: usize, tag: u8) -> Vec<ObjectId> {
+        let mut w = Writer::new(tag);
+        let mut f = Files::new();
+        for i in 0..6 {
+            f.insert(format!("pub/other/o{i}.txt"), lines(&format!("o{i}"), 6));
+        }
+        let mut body: Vec<String> = (0..60).map(|i| format!("line {i} of the file\n")).collect();
+        let mut tip = root_snapshot_id();
+        let mut out = Vec::new();
+        for i in 0..n {
+            body[i % 60] = format!("edited at change {i}\n");
+            f.insert(path.to_string(), body.concat().into_bytes());
+            tip = w.commit(th, h, &[tip], &f);
+            out.push(tip);
+        }
+        h.set_branch(th, "main", tip);
+        out
+    }
+
+    /// BUG-1216. The stated invariant says no walk is made twice and that
+    /// reaching recorded progress costs a read per record. But a version a
+    /// request blames on its way (a frontier version walked to the end, or
+    /// a cut walk's versions blamed from its record) is kept only in the
+    /// request's write buffer: the request's view of the kept blames
+    /// (`Blamer::kept`) learns of it only when the buffer is written, every
+    /// 32 kept blames. So the next round of `resumed` finds that version
+    /// unsettled again and walks it (or blames its record) again, and again,
+    /// until 32 kept blames have piled up. Here: a 150-version chain, with
+    /// walk budgets that cut the first walk: the request that finishes
+    /// costs many times what one unbounded request from nothing costs.
+    #[test]
+    #[ignore = "BUG-1216: a resumed blame walks again (or blames again from its record) a version it just blamed, until 32 kept blames are written"]
+    fn bug_1216_a_resumed_blame_walks_again_what_it_just_blamed() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let path = "pub/f/chain.txt";
+        chain(&th, &mut h, path, 150, 21);
+        let viewer = Viewer::default();
+        let a = ask(&th, &h, &viewer);
+        warm_up(&th, &h, &viewer);
+        let q = || BlameParams { path: path.into(), n: Some(1000), ..Default::default() };
+        forget_blames(&th, &h);
+        let whole = ask_once(&th, &h.hub, &a, q(), unbounded()).unwrap();
+        assert_eq!(whole["line_count"], 60);
+        let w0 = whole["work"].as_u64().unwrap();
+        let want = s14c1_adversarial::origins(&whole);
+        let mut costly = Vec::new();
+        let mut cut = 0;
+        for div in [2u64, 3, 4, 6, 8] {
+            forget_blames(&th, &h);
+            let l = limits(w0 / div, u64::MAX, BlameLimits::default().held);
+            let mut partials = 0;
+            let done = loop {
+                match ask_once(&th, &h.hub, &a, q(), l) {
+                    Ok(v) => break v,
+                    Err(Error::Api { code: "partial", .. }) => {
+                        partials += 1;
+                        assert!(partials < 500, "no end");
+                    }
+                    Err(e) => panic!("{e:?}"),
+                }
+            };
+            assert_eq!(s14c1_adversarial::origins(&done), want, "walk budget {}", w0 / div);
+            let wf = done["work"].as_u64().unwrap();
+            println!("bug_1216: walk budget {} ({w0}/{div}): {partials} partial answers, then one of work {wf} (one unbounded request from nothing: {w0})", w0 / div);
+            cut += (partials > 0) as usize;
+            if wf > w0 + w0 / 2 {
+                costly.push((w0 / div, partials, wf));
+            }
+        }
+        assert!(cut > 0, "no budget cut the walk");
+        assert!(costly.is_empty(), "requests that went on from recorded progress cost more than one unbounded request from nothing ({w0}): (walk budget, partial answers before, work of the answer): {costly:?}");
+    }
+
+    /// BUG-1217. The 8 MiB keep cap was dropped because "a blame is bounded
+    /// by its file, at most 1 MiB". It is not: a kept blame holds each
+    /// origin's snapshot id and path, so it grows with the versions its
+    /// lines come from times the path's length, not with the file; and the
+    /// kept blames one request computes wait in its write buffer (32 of
+    /// them) outside the memory bound (`BlameLimits::held`). Here: a file
+    /// of 400 one-line versions at a 3.8 KB path (a 3 KB file): one request
+    /// keeps a blame of about 1.6 MB, and about 11 MB of kept blames in all,
+    /// against a memory bound of 8 MiB it never passed.
+    #[test]
+    #[ignore = "BUG-1217: a kept blame is bounded by its origins' paths, not its file, and kept blames wait outside the memory bound"]
+    fn bug_1217_a_kept_blame_is_not_bounded_by_its_file() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let path = format!("pub/{}f.txt", format!("{}/", "d".repeat(199)).repeat(19));
+        assert!(path.len() > 3_800 && path.len() <= 4096, "{}", path.len());
+        let mut w = Writer::new(22);
+        let mut f = Files::new();
+        let mut body = String::new();
+        let mut tip = root_snapshot_id();
+        for i in 0..400 {
+            body.push_str(&format!("line {i}\n"));
+            f.insert(path.clone(), body.clone().into_bytes());
+            tip = w.commit(&th, &mut h, &[tip], &f);
+        }
+        h.set_branch(&th, "main", tip);
+        let viewer = Viewer::default();
+        let a = ask(&th, &h, &viewer);
+        warm_up(&th, &h, &viewer);
+        forget_blames(&th, &h);
+        let held = 8usize << 20;
+        let v = ask_once(&th, &h.hub, &a, BlameParams { path: path.clone(), n: Some(10), ..Default::default() }, limits(u64::MAX, u64::MAX, held)).unwrap();
+        assert_eq!(v["line_count"], 400);
+        let sizes: Vec<usize> = th.rt.block_on(async {
+            let objects: Vec<String> = sqlx::query_scalar("SELECT object FROM blame_memo WHERE project_id = $1").bind(h.id).fetch_all(&h.hub.db).await.unwrap();
+            let mut out = Vec::new();
+            for o in objects {
+                let raw = h.hub.objects.get(h.id, &ObjectId::from_hex(&o).unwrap()).await.unwrap().expect("a kept blame object");
+                out.push(raw.len());
+            }
+            out
+        });
+        let file = body.len();
+        let largest = sizes.iter().copied().max().unwrap_or(0);
+        let total: usize = sizes.iter().sum();
+        println!("bug_1217: a {file}-byte file at a {}-byte path: {} kept blames, the largest {largest} bytes, {total} bytes in all (memory bound {held})", path.len(), sizes.len());
+        assert!(!sizes.is_empty(), "nothing kept");
+        assert!(largest <= 1 << 20 && total <= held, "kept blames of a {file}-byte file: the largest {largest} bytes (\"bounded by its file, at most 1 MiB\"), {total} bytes held by one request before it wrote them (memory bound {held})");
+    }
+
+    /// BUG-1218. Recorded progress is bounded per viewer, file and version
+    /// a walk started from, but each record now holds every version its
+    /// walk expanded (up to 2,048, each with its path, entry and parents)
+    /// and its whole frontier, and a walk stops only at kept blames, never
+    /// at another record's versions. So anyone on Earth, blaming a file at
+    /// each of its revisions once (nothing below them kept yet), makes the
+    /// server keep one record per revision, each repeating the versions
+    /// below it: quadratic in the file's history, and nothing purges it.
+    /// Here: a chain of 160 versions, a walk budget an eighth of the whole
+    /// walk (by default the cut is at 2,048 versions, so the same holds of
+    /// histories past that), one request at each of the newest 120
+    /// revisions: what is recorded against the viewer's file history of the
+    /// file it walks.
+    #[test]
+    #[ignore = "BUG-1218: one viewer makes the server keep a cut-walk record per revision blamed, each repeating the versions below it"]
+    fn bug_1218_cut_walk_records_grow_with_revisions_blamed_times_history() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let path = format!("pub/{}/f.txt", "r".repeat(100));
+        let snaps = chain(&th, &mut h, &path, 160, 23);
+        let viewer = Viewer::default();
+        let a = ask(&th, &h, &viewer);
+        warm_up(&th, &h, &viewer);
+        let vk = h.project(&th).view(&viewer).key();
+        forget_blames(&th, &h);
+        let whole = ask_once(&th, &h.hub, &a, BlameParams { path: path.clone(), ..Default::default() }, unbounded()).unwrap();
+        let w0 = whole["work"].as_u64().unwrap();
+        forget_blames(&th, &h);
+        let l = limits(w0 / 8, u64::MAX, BlameLimits::default().held);
+        let mut answers = (0, 0);
+        for s in snaps[40..].iter().rev() {
+            match ask_once(&th, &h.hub, &a, BlameParams { rev: Some(s.hex()), path: path.clone(), ..Default::default() }, l) {
+                Ok(_) => answers.0 += 1,
+                Err(Error::Api { code: "partial", .. }) => answers.1 += 1,
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+        assert!(answers.1 > 0, "no walk was cut");
+        let (records, recorded, history): (i64, i64, i64) = th.rt.block_on(async {
+            let (r, b): (i64, i64) = sqlx::query_as(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(frontier) + LENGTH(expanded)), 0)::BIGINT FROM blame_walks WHERE project_id = $1 AND view_key = $2",
+            )
+            .bind(h.id)
+            .bind(&vk)
+            .fetch_one(&h.hub.db)
+            .await
+            .unwrap();
+            let f: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(LENGTH(snapshot) + LENGTH(change) + LENGTH(path_key) + 8), 0)::BIGINT FROM view_file_history WHERE project_id = $1 AND view_key = $2 AND path_key = $3",
+            )
+            .bind(h.id)
+            .bind(&vk)
+            .bind(path_key(&path))
+            .fetch_one(&h.hub.db)
+            .await
+            .unwrap();
+            (r, b, f)
+        });
+        let entries: usize = th.rt.block_on(async {
+            let rows: Vec<String> = sqlx::query_scalar("SELECT expanded FROM blame_walks WHERE project_id = $1 AND view_key = $2").bind(h.id).bind(&vk).fetch_all(&h.hub.db).await.unwrap();
+            rows.iter().map(|r| serde_json::from_str::<Vec<Value>>(r).unwrap().len()).sum()
+        });
+        println!(
+            "bug_1218: {} requests ({} answered, {} partial): {records} records of {entries} versions expanded ({} bytes each), {recorded} bytes, against {history} bytes of the file's history rows ({:.1}x)",
+            answers.0 + answers.1,
+            answers.0,
+            answers.1,
+            recorded / entries.max(1) as i64,
+            recorded as f64 / history as f64
+        );
+        assert!(recorded <= 4 * history, "{records} cut-walk records of {recorded} bytes for one viewer and one file, against {history} bytes of its history rows");
+    }
+
+    /// Every snapshot id and path a recorded walk names (`blame_walks`'
+    /// `frontier` and `expanded`).
+    fn named(frontier: &str, expanded: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut version = |v: &Value| {
+            if !v.is_null() {
+                out.push((v["id"].as_str().unwrap().to_string(), v["path"].as_str().unwrap().to_string()));
+            }
+        };
+        for v in serde_json::from_str::<Vec<Value>>(frontier).unwrap() {
+            version(&v);
+        }
+        for w in serde_json::from_str::<Vec<Value>>(expanded).unwrap() {
+            version(&w["v"]);
+            for p in w["parents"].as_array().unwrap() {
+                version(p);
+            }
+        }
+        out
+    }
+
+    /// Guarantee 2: recorded progress is per view key. Records of three
+    /// viewers' blames (a file renamed out of `fin/` into `pub/` half way,
+    /// with hidden changes between, blamed with `follow`) name only
+    /// snapshots of the viewer's own graph and paths they read; and with
+    /// every other key's records and kept blames made unreadable, each
+    /// viewer (and a finance member removed from finance, whose key
+    /// changed) finishes with the answer one unbounded request gives.
+    #[test]
+    fn s14c3_recorded_progress_is_read_only_under_its_view_key() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let mut w = Writer::new(24);
+        let mut f = Files::new();
+        f.insert("pub/other.txt".into(), lines("other", 5));
+        let mut body: Vec<String> = (0..40).map(|i| format!("line {i} of a file that moves out of fin\n")).collect();
+        let mut tip = root_snapshot_id();
+        let mut path = "fin/doc.txt".to_string();
+        for i in 0..130usize {
+            body[i % 40] = format!("edited at change {i}\n");
+            if i == 30 {
+                f.remove(&path);
+                path = "pub/doc.txt".into();
+            }
+            f.insert(path.clone(), body.concat().into_bytes());
+            tip = w.commit(&th, &mut h, &[tip], &f);
+            // A change only finance sees.
+            f.insert("fin/hidden.txt".into(), format!("hidden {i}\n").into_bytes());
+            tip = w.commit(&th, &mut h, &[tip], &f);
+        }
+        h.set_branch(&th, "main", tip);
+        let finance = viewers(1).into_iter().find(|(n, _)| *n == "finance").unwrap().1;
+        let removed = Viewer { groups: Default::default(), ..finance.clone() };
+        let people = [("anyone on Earth", Viewer::default()), ("finance", finance), ("admin", admin()), ("removed from finance", removed)];
+        let project = h.project(&th);
+        let key = |v: &Viewer| project.view(v).key();
+        assert_ne!(key(&people[1].1), key(&people[3].1), "an access change gives a new key");
+        let q = || BlameParams { path: "pub/doc.txt".into(), follow: Some(true), n: Some(1000), ..Default::default() };
+        let mut want = HashMap::new();
+        for (name, v) in &people {
+            warm_up(&th, &h, v);
+            forget_blames(&th, &h);
+            let r = ask_once(&th, &h.hub, &ask(&th, &h, v), q(), unbounded()).unwrap();
+            assert_eq!(r["line_count"], 40, "{name}");
+            want.insert(*name, s14c1_adversarial::origins(&r));
+        }
+        assert_ne!(want["anyone on Earth"], want["finance"], "the boundary shows");
+        let small = limits(25, u64::MAX, BlameLimits::default().held);
+        for (name, v) in &people {
+            forget_blames(&th, &h);
+            // Every viewer leaves recorded progress.
+            for (other, ov) in &people {
+                // (A viewer whose key another shares goes on from its records.)
+                let r = ask_once(&th, &h.hub, &ask(&th, &h, ov), q(), small);
+                assert!(matches!(r, Ok(_) | Err(Error::Api { code: "partial", .. })), "{other}: {r:?}");
+            }
+            let rows: Vec<(String, String, String, String, String)> = th.rt.block_on(async {
+                sqlx::query_as("SELECT view_key, snapshot, path_key, frontier, expanded FROM blame_walks WHERE project_id = $1").bind(h.id).fetch_all(&h.hub.db).await.unwrap()
+            });
+            for (other, ov) in &people {
+                let keys: Vec<&String> = rows.iter().map(|r| &r.0).collect();
+                assert!(rows.iter().any(|r| r.0 == key(ov)), "{other}'s walk was recorded: {} under {keys:?}", key(ov));
+            }
+            for (vk, snap, _, frontier, expanded) in &rows {
+                let (owner, ov) = people.iter().find(|(_, v)| key(v) == *vk).unwrap();
+                let graph: HashSet<String> = th.rt.block_on(async {
+                    sqlx::query_scalar("SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2").bind(h.id).bind(vk).fetch_all(&h.hub.db).await.unwrap().into_iter().collect()
+                });
+                assert!(graph.contains(snap), "{owner}: a record starts at a snapshot of their own graph");
+                for (id, p) in named(frontier, expanded) {
+                    assert!(graph.contains(&id), "{owner}: a record names {id}, not in their graph");
+                    let reads = p.starts_with("pub/") || (p.starts_with("fin/") && !ov.groups.is_empty()) || ov.admin;
+                    assert!(reads, "{owner}: a record names {p}");
+                }
+            }
+            // Everything kept under other keys, unreadable.
+            let mine = key(v);
+            th.rt.block_on(async {
+                sqlx::query("UPDATE blame_walks SET frontier = 'not json', expanded = 'not json' WHERE project_id = $1 AND view_key <> $2").bind(h.id).bind(&mine).execute(&h.hub.db).await.unwrap();
+                sqlx::query("UPDATE blame_memo SET object = $3 WHERE project_id = $1 AND view_key <> $2").bind(h.id).bind(&mine).bind("00".repeat(32)).execute(&h.hub.db).await.unwrap();
+            });
+            let a = ask(&th, &h, v);
+            let mut partials = 0;
+            let got = loop {
+                match ask_once(&th, &h.hub, &a, q(), small) {
+                    Ok(r) => break r,
+                    Err(Error::Api { code: "partial", .. }) => {
+                        partials += 1;
+                        assert!(partials < 1_000, "{name}: no end");
+                    }
+                    Err(e) => panic!("{name}: {e:?}"),
+                }
+            };
+            let expect = if *name == "removed from finance" { &want["anyone on Earth"] } else { &want[name] };
+            assert_eq!(&s14c1_adversarial::origins(&got), expect, "{name}");
+            println!("s14c3 per key: {name}: {partials} partial answers, then the blame one unbounded request gives");
+        }
+    }
+
+    /// One shape of history for the resumption tests: the history (on
+    /// `main`), the path blamed at the tip, and whether to follow renames.
+    fn shape(th: &TestHub, h: &mut Hist, shape: &str) -> (String, bool) {
+        let mut w = Writer::new(25);
+        let mut f = Files::new();
+        for i in 0..4 {
+            f.insert(format!("pub/other/o{i}.txt"), lines(&format!("o{i}"), 4));
+        }
+        let mut body: Vec<String> = (0..48).map(|i| format!("line {i} of the file\n")).collect();
+        let mut path = "pub/f/name0.txt".to_string();
+        let mut tip = root_snapshot_id();
+        let mut follow = false;
+        match shape {
+            "long chain" => {
+                for i in 0..300 {
+                    body[i % 48] = format!("edited at step {i}\n");
+                    f.insert(path.clone(), body.concat().into_bytes());
+                    tip = w.commit(th, h, &[tip], &f);
+                }
+            }
+            "diamonds" => {
+                // Each step: two changes from one base, each editing its own
+                // line, and their merge.
+                for i in 0..40 {
+                    let base = tip;
+                    let mut sides = Vec::new();
+                    for s in 0..2 {
+                        let mut b = body.clone();
+                        b[(i * 2 + s) % 48] = format!("side {s} at step {i}\n");
+                        let mut g = f.clone();
+                        g.insert(path.clone(), b.concat().into_bytes());
+                        sides.push(w.commit(th, h, &[base], &g));
+                        body[(i * 2 + s) % 48] = b[(i * 2 + s) % 48].clone();
+                    }
+                    f.insert(path.clone(), body.concat().into_bytes());
+                    tip = w.commit(th, h, &sides, &f);
+                }
+            }
+            "renamed merges" => {
+                // Renamed on the main line every few changes (the merges
+                // too), with wide merges of branches that edit it.
+                follow = true;
+                for i in 0..70 {
+                    body[i % 48] = format!("edited at step {i}\n");
+                    if i % 4 == 0 {
+                        f.remove(&path);
+                        path = format!("pub/f/name{}.txt", i % 3);
+                    }
+                    f.insert(path.clone(), body.concat().into_bytes());
+                    tip = w.commit(th, h, &[tip], &f);
+                    if i % 15 == 7 {
+                        let base = tip;
+                        let mut branches = vec![base];
+                        for b in 0..6 {
+                            let mut bb = body.clone();
+                            bb[(b * 7 + 3) % 48] = format!("branch {b} at step {i}\n");
+                            body[(b * 7 + 3) % 48] = bb[(b * 7 + 3) % 48].clone();
+                            let mut g = f.clone();
+                            g.insert(path.clone(), bb.concat().into_bytes());
+                            branches.push(w.commit(th, h, &[base], &g));
+                        }
+                        f.remove(&path);
+                        path = format!("pub/f/merged{i}.txt");
+                        f.insert(path.clone(), body.concat().into_bytes());
+                        tip = w.commit(th, h, &branches, &f);
+                    }
+                }
+            }
+            "deleted and re-added" => {
+                // Deleted twice, and re-added (with its old lines) each time.
+                for i in 0..200 {
+                    body[i % 48] = format!("edited at step {i}\n");
+                    match i {
+                        30 | 60 => {
+                            f.remove(&path);
+                        }
+                        31..=34 | 61..=63 => {}
+                        _ => {
+                            f.insert(path.clone(), body.concat().into_bytes());
+                        }
+                    }
+                    tip = w.commit(th, h, &[tip], &f);
+                }
+            }
+            "memory" => {
+                // A larger file: what blames hold is near the memory bound.
+                let mut big: Vec<String> = (0..1000).map(|i| format!("a longer line {i:>6} here\n")).collect();
+                for i in 0..100 {
+                    big[(i * 37) % 1000] = format!("edited at step {i:>6}\n");
+                    f.insert(path.clone(), big.concat().into_bytes());
+                    tip = w.commit(th, h, &[tip], &f);
+                }
+            }
+            "binary between" => {
+                // Some versions hold a NUL byte (not plain text: they hold
+                // no line), though their entry says a small file.
+                for i in 0..120 {
+                    body[i % 48] = format!("edited at step {i}\n");
+                    let mut text = body.concat().into_bytes();
+                    if i % 20 == 9 {
+                        text.push(0);
+                    }
+                    f.insert(path.clone(), text);
+                    tip = w.commit(th, h, &[tip], &f);
+                }
+            }
+            _ => unreachable!(),
+        }
+        h.set_branch(th, "main", tip);
+        (path, follow)
+    }
+
+    /// Guarantee 1: on every shape, with small walk and diff budgets and a
+    /// small memory bound, every `partial` answer keeps a version or records
+    /// a walk (never neither), so a blame answers within twice its versions'
+    /// count of requests; and the answer is what one unbounded request
+    /// gives.
+    #[test]
+    fn s14c3_every_shape_finishes_with_progress_at_every_partial() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let held_small = 160 << 10;
+        for (name, walk, work, held) in [
+            ("long chain", 30u64, u64::MAX, BlameLimits::default().held),
+            ("long chain", 60, 3_000, BlameLimits::default().held),
+            ("memory", 30, u64::MAX, held_small),
+            ("memory", 40, 40_000, held_small),
+            ("diamonds", 25, u64::MAX, BlameLimits::default().held),
+            ("diamonds", 50, 2_500, BlameLimits::default().held),
+            ("renamed merges", 40, u64::MAX, BlameLimits::default().held),
+            ("renamed merges", 90, 2_000, BlameLimits::default().held),
+            ("deleted and re-added", 30, 1_500, BlameLimits::default().held),
+            ("binary between", 30, u64::MAX, BlameLimits::default().held),
+            ("binary between", 45, 1_500, BlameLimits::default().held),
+        ] {
+            let mut h = Hist::new(&th, &policy_text, &bindings);
+            let (path, follow) = shape(&th, &mut h, name);
+            let viewer = Viewer::default();
+            let a = ask(&th, &h, &viewer);
+            warm_up(&th, &h, &viewer);
+            let vk = h.project(&th).view(&viewer).key();
+            let versions: i64 = th.rt.block_on(async {
+                sqlx::query_scalar("SELECT COUNT(*) FROM view_file_history WHERE project_id = $1 AND view_key = $2").bind(h.id).bind(&vk).fetch_one(&h.hub.db).await.unwrap()
+            });
+            let q = || BlameParams { path: path.clone(), follow: Some(follow), n: Some(1000), ..Default::default() };
+            forget_blames(&th, &h);
+            let want = s14c1_adversarial::origins(&ask_once(&th, &h.hub, &a, q(), unbounded()).unwrap());
+            forget_blames(&th, &h);
+            let l = limits(walk, work, held);
+            let mut before = progress(&th, &h);
+            let mut partials = 0i64;
+            let got = loop {
+                match ask_once(&th, &h.hub, &a, q(), l) {
+                    Ok(v) => break v,
+                    Err(Error::Api { code: "partial", .. }) => {
+                        partials += 1;
+                        let now = progress(&th, &h);
+                        assert!(now.0 >= before.0 && now.1 >= before.1 && now != before, "{name} (walk {walk}, work {work}, held {held}): a partial answer left no progress: {before:?} -> {now:?}");
+                        before = now;
+                        assert!(partials <= 2 * versions + 2, "{name}: more partial answers than twice the viewer's {versions} file-history rows");
+                    }
+                    Err(e) => panic!("{name} (walk {walk}, work {work}, held {held}): {e:?}"),
+                }
+            };
+            assert_eq!(s14c1_adversarial::origins(&got), want, "{name} (walk {walk}, work {work}, held {held})");
+            println!("s14c3 shapes: {name}, walk {walk}, work {work}, held {held}: {partials} partial answers ({versions} file-history rows), then the whole blame; (kept, walks) {before:?}");
+            assert!(partials > 0, "{name}: the budgets never stopped it");
+        }
+    }
+
+    /// Guarantee 4: six requests on two servers resuming the same blames at
+    /// once, each with its own small budgets, all finish with the answer of
+    /// one unbounded request; every version two records name is recorded the
+    /// same (no conflicting walks); and every kept blame is the one an
+    /// unbounded request from nothing keeps for that version.
+    #[test]
+    fn s14c3_blames_resumed_at_once_on_two_servers_keep_only_right_blames() {
+        let th = TestHub::start();
+        let th2 = TestHub::beside(&th);
+        let (policy_text, bindings) = policy(1);
+        for name in ["long chain", "diamonds", "renamed merges"] {
+            let mut h = Hist::new(&th, &policy_text, &bindings);
+            let (path, follow) = shape(&th, &mut h, name);
+            let viewer = Viewer::default();
+            let a = ask(&th, &h, &viewer);
+            warm_up(&th, &h, &viewer);
+            let q = || BlameParams { path: path.clone(), follow: Some(follow), n: Some(1000), ..Default::default() };
+            forget_blames(&th, &h);
+            let want = s14c1_adversarial::origins(&ask_once(&th, &h.hub, &a, q(), unbounded()).unwrap());
+            forget_blames(&th, &h);
+            let hubs = [th.hub(), th2.hub()];
+            let budgets = [(20u64, u64::MAX), (35, 2_000), (50, u64::MAX), (25, 3_000), (45, 1_500), (60, u64::MAX)];
+            let answers: Vec<Vec<String>> = std::thread::scope(|s| {
+                let handles: Vec<_> = budgets
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (walk, work))| {
+                        let (hub, a, q, which) = (hubs[i % 2].clone(), a.clone(), q, if i % 2 == 0 { &th } else { &th2 });
+                        let l = limits(*walk, *work, BlameLimits::default().held);
+                        s.spawn(move || {
+                            for _ in 0..5_000 {
+                                match which.rt.block_on(query::blame(&hub, &a, q(), l)) {
+                                    Ok(v) => return s14c1_adversarial::origins(&v),
+                                    Err(Error::Api { code: "partial", .. }) => continue,
+                                    Err(e) => panic!("{name}: {e:?}"),
+                                }
+                            }
+                            panic!("{name}: no end");
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for got in &answers {
+                assert_eq!(got, &want, "{name}");
+            }
+            // No conflicting records: a version two records expanded is the
+            // same in both.
+            let records: Vec<String> = th.rt.block_on(async {
+                sqlx::query_scalar("SELECT expanded FROM blame_walks WHERE project_id = $1").bind(h.id).fetch_all(&h.hub.db).await.unwrap()
+            });
+            let mut seen: HashMap<String, Value> = HashMap::new();
+            for r in &records {
+                for w in serde_json::from_str::<Vec<Value>>(r).unwrap() {
+                    let k = w["v"].to_string();
+                    if let Some(x) = seen.get(&k) {
+                        assert_eq!(x, &w, "{name}: two records disagree on a version");
+                    }
+                    seen.insert(k, w);
+                }
+            }
+            // Every kept blame is the one a request from nothing keeps.
+            let kept: Vec<(String, bool, String, String)> = th.rt.block_on(async {
+                sqlx::query_as("SELECT path_key, follow, snapshot, object FROM blame_memo WHERE project_id = $1").bind(h.id).fetch_all(&h.hub.db).await.unwrap()
+            });
+            assert!(!kept.is_empty());
+            let paths: HashSet<String> = h.files.values().flat_map(|f| f.keys().cloned()).collect();
+            let by_key: HashMap<String, String> = paths.iter().map(|p| (path_key(p), p.clone())).collect();
+            for (pk, fl, snap, object) in &kept {
+                let p = &by_key[pk];
+                forget_blames(&th, &h);
+                let r = ask_once(&th, &h.hub, &a, BlameParams { rev: Some(snap.clone()), path: p.clone(), follow: Some(*fl), n: Some(1), ..Default::default() }, unbounded());
+                assert!(r.is_ok(), "{name}: {r:?}");
+                let fresh: String = th.rt.block_on(async {
+                    sqlx::query_scalar("SELECT object FROM blame_memo WHERE project_id = $1 AND path_key = $2 AND follow = $3 AND snapshot = $4")
+                        .bind(h.id)
+                        .bind(pk)
+                        .bind(fl)
+                        .bind(snap)
+                        .fetch_one(&h.hub.db)
+                        .await
+                        .unwrap()
+                });
+                assert_eq!(&fresh, object, "{name}: the blame kept for {p} at {snap}");
+            }
+            println!("s14c3 at once: {name}: 6 requests on 2 servers agree; {} records, {} kept blames, each as a request from nothing keeps it", records.len(), kept.len());
+        }
+    }
+}
