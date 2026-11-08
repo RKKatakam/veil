@@ -279,10 +279,18 @@ fn the_command_cannot_reach_the_project_through_vl_or_git() {
         args.extend(["--allow", vl]);
     }
     args.extend(["--", "sh", "-c", &script]);
-    let o = env.vl("alice", &proj, &args);
+    // Without the workspace socket, `vl` finds no repository; with it
+    // (milestone S8) it runs on the sandbox's own workspace, through the
+    // `vl` outside, never on the project directory.
+    let unset = args.iter().map(|a| a.replace(&format!("'{vl}' status"), &format!("env -u VEIL_WORKSPACE_SOCKET '{vl}' status"))).collect::<Vec<_>>();
+    let unset: Vec<&str> = unset.iter().map(String::as_str).collect();
+    let o = env.vl("alice", &proj, &unset);
     let t = text(&o);
     assert!(t.contains("no Veil repository found"), "{t}");
     assert!(!t.contains("vl=0"), "{t}");
+    let o = env.vl("alice", &proj, &args);
+    let t = text(&o);
+    assert!(o.status.success() && t.contains("vl=0") && t.contains("Workspace    : agent"), "{t}");
     if !t.contains("git: not found") {
         assert!(!t.contains("git=0"), "git found the project's repository: {t}");
     }

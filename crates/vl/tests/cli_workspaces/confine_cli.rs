@@ -1577,3 +1577,99 @@ fn concurrent_workspaces_keep_their_own_layers() {
     }
     assert_eq!(snapshot(&t.home, &[]), before, "a real allowed folder changed");
 }
+
+// ---- S8 cycle 2 review (`docs/BUGS.md`, "S8 cycle 2"; pre-existing) ------
+
+/// BUG-1369: cargo's `credentials.toml` kept elsewhere and linked into
+/// `~/.cargo` (a dotfiles manager's way: stow, chezmoi, home-manager) makes
+/// every confined run fail: the mask is bound over the link, which `bwrap`
+/// follows to a target the sandbox does not show, and `vl` says that
+/// confinement does not work on this machine. Expected: the run runs, with
+/// the credentials masked (as they are when the file is a plain file).
+#[test]
+fn bug_1369_a_linked_cargo_credentials_file_is_masked_and_the_run_runs() {
+    let t = T::new();
+    let elsewhere = t.env.dir("dotfiles");
+    write(&elsewhere, "cargo/credentials.toml", "token = \"LINKED-CRATES-IO-TOKEN-1369ab\"\n");
+    std::fs::remove_file(t.home.join(".cargo/credentials.toml")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.join("cargo/credentials.toml"), t.home.join(".cargo/credentials.toml")).unwrap();
+    let o = t.exec(&["agent", "--", "sh", "-c", "~/.cargo/bin/tool; cat ~/.cargo/credentials.toml; echo end"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(o.status.success() && out.contains("tool-ran") && out.contains("end"), "{}", text(&o));
+    assert!(!out.contains("LINKED-CRATES-IO-TOKEN-1369ab"), "{out}");
+}
+
+/// BUG-1369, the whole class: a linked `~/.cargo` (the whole folder kept
+/// elsewhere), and a link to credentials inside the folder itself, are
+/// masked and the run runs.
+#[test]
+fn a_linked_cargo_home_or_an_inner_link_to_its_credentials_is_masked() {
+    for inner in [false, true] {
+        let t = T::new();
+        let elsewhere = t.env.dir("dotfiles");
+        write(&elsewhere, "cargo/bin/tool", "#!/bin/sh\necho tool-ran\n");
+        std::fs::set_permissions(elsewhere.join("cargo/bin/tool"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        match inner {
+            false => write(&elsewhere, "cargo/credentials.toml", "token = \"LINKED-HOME-TOKEN-1369cd\"\n"),
+            true => {
+                write(&elsewhere, "cargo/secrets/real.toml", "token = \"LINKED-HOME-TOKEN-1369cd\"\n");
+                std::os::unix::fs::symlink("secrets/real.toml", elsewhere.join("cargo/credentials.toml")).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(t.home.join(".cargo")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("cargo"), t.home.join(".cargo")).unwrap();
+        let o = t.exec(&["agent", "--", "sh", "-c", "~/.cargo/bin/tool; cat ~/.cargo/credentials.toml ~/.cargo/secrets/real.toml; echo end"]);
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(o.status.success() && out.contains("tool-ran") && out.contains("end"), "inner={inner}: {}", text(&o));
+        assert!(!out.contains("LINKED-HOME-TOKEN-1369cd"), "inner={inner}: {out}");
+    }
+}
+
+/// S8 cycle 3 review, guarantee 4: the credentials stay masked, and the run
+/// runs, whatever way links lead to them: `$HOME` itself a link; a
+/// credentials link with an absolute target through the linked home into
+/// another allowed tool folder (`~/.rustup`); and a linked `CARGO_HOME`
+/// outside the home, allowed by name.
+#[test]
+fn credentials_reached_through_a_linked_home_or_cargo_home_stay_masked() {
+    for case in ["linked-home", "absolute-into-rustup", "linked-cargo-home"] {
+        let t = T::new();
+        let link = t.env.dir("links").join("home");
+        std::os::unix::fs::symlink(&t.home, &link).unwrap();
+        let mut script = "~/.cargo/bin/tool; cat ~/.cargo/credentials.toml; echo end".to_string();
+        let mut extra: Vec<String> = Vec::new();
+        let mut cargo_home: Option<PathBuf> = None;
+        match case {
+            "linked-home" => {}
+            "absolute-into-rustup" => {
+                write(&t.home, ".rustup/kept/creds.toml", CARGO_TOKEN);
+                std::fs::remove_file(t.home.join(".cargo/credentials.toml")).unwrap();
+                std::os::unix::fs::symlink(link.join(".rustup/kept/creds.toml"), t.home.join(".cargo/credentials.toml")).unwrap();
+                script = "~/.cargo/bin/tool; cat ~/.cargo/credentials.toml ~/.rustup/kept/creds.toml; echo end".into();
+            }
+            _ => {
+                let real = t.env.dir("cargo-real");
+                write(&real, "bin/tool", "#!/bin/sh\necho tool-ran\n");
+                std::fs::set_permissions(real.join("bin/tool"), std::fs::Permissions::from_mode(0o755)).unwrap();
+                write(&real, "credentials.toml", CARGO_TOKEN);
+                let ch = t.env.dir("links").join("cargo");
+                std::os::unix::fs::symlink(&real, &ch).unwrap();
+                script = format!("{c}/bin/tool; cat {c}/credentials.toml {r}/credentials.toml; echo end", c = ch.display(), r = real.display());
+                extra = vec!["--allow".into(), ch.display().to_string()];
+                cargo_home = Some(ch);
+            }
+        }
+        let mut args: Vec<&str> = vec!["ws", "exec", "agent"];
+        args.extend(extra.iter().map(String::as_str));
+        args.extend(["--", "sh", "-c", script.as_str()]);
+        let mut c = t.env.cmd("alice", &t.proj, &args);
+        c.env("HOME", &link);
+        if let Some(ch) = &cargo_home {
+            c.env("CARGO_HOME", ch);
+        }
+        let o = c.stdin(Stdio::null()).output().unwrap();
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(o.status.success() && out.contains("tool-ran") && out.contains("end"), "{case}: {}", text(&o));
+        assert!(!out.contains(CARGO_TOKEN), "{case}: {out}");
+    }
+}

@@ -285,11 +285,11 @@ impl Renames {
 
 /// `changes` with renames (and copies) detected as `r` says, in their
 /// order; and whether a limit stopped the inexact pass.
-pub fn detect_renames(repo: &Repo, changes: Vec<TreeChange>, r: &Renames) -> Result<(Vec<Item>, bool)> {
+pub fn detect_renames(repo: &Repo, (from, to): (&ObjectId, &ObjectId), changes: Vec<TreeChange>, r: &Renames) -> Result<(Vec<Item>, bool)> {
     if !r.detect {
         return Ok((changes.into_iter().map(Item::Change).collect(), false));
     }
-    let d = veil_core::rename::detect(repo.store(), &changes, Reader::Me, &r.opts)?;
+    let d = veil_core::rename::detect(repo.store(), Some(from), Some(to), &changes, Reader::Me, &r.opts)?;
     Ok((d.items(), d.truncated))
 }
 
@@ -694,7 +694,7 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
     let s = repo.snapshot(&wc)?;
     let base = repo.parents_tree(&s.parents)?.tree;
     let changes = diff_trees(repo.store(), Some(&base), Some(&s.tree))?;
-    let (changes, _) = detect_renames(repo, changes, &Renames::default())?;
+    let (changes, _) = detect_renames(repo, (&base, &s.tree), changes, &Renames::default())?;
     let report = &ctx.report;
     let embargo = EmbargoTiers::of(repo, &wc)?;
     let mut redacted = Vec::new();
@@ -1213,9 +1213,13 @@ fn entry_info(repo: &Repo, e: &TreeEntry, check_readable: bool) -> EntryInfo {
 }
 
 /// The changes between two trees, each turned into a [`FileDiff`] by
-/// [`item_diff`] (lazily, for the text output).
+/// [`item_diff`] (lazily, for the text output). In a thin clone both sides
+/// are fetched first, each at its own path (BUG-1506): their content and
+/// readability are read by id.
 pub fn diff_changes(repo: &Repo, from: &ObjectId, to: &ObjectId) -> Result<Vec<TreeChange>> {
-    Ok(diff_trees(repo.store(), Some(from), Some(to))?)
+    let changes = diff_trees(repo.store(), Some(from), Some(to))?;
+    veil_core::tree::prefetch_changes(repo.store(), Some(from), Some(to), &changes)?;
+    Ok(changes)
 }
 
 fn file_diff_with(repo: &Repo, c: &TreeChange, stat: bool, check_readable: bool, attrs: &Attrs<'_>) -> FileDiff {
@@ -1345,7 +1349,7 @@ pub struct DiffTrees {
 }
 
 pub fn diff_body_with(repo: &Repo, t: &DiffTrees, stat: bool, r: &Renames) -> Result<DiffBody> {
-    let (items, renames_skipped) = detect_renames(repo, diff_changes(repo, &t.from, &t.to)?, r)?;
+    let (items, renames_skipped) = detect_renames(repo, (&t.from, &t.to), diff_changes(repo, &t.from, &t.to)?, r)?;
     let attrs = diff_attrs(repo);
     let old = EmbargoTiers::of(repo, &t.from_rev)?;
     let new = if t.to_rev == t.from_rev { None } else { Some(EmbargoTiers::of(repo, &t.to_rev)?) };
@@ -2039,10 +2043,11 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
         })
     };
     let mut entries: Vec<(VPath, LsEntry)> = Vec::new();
-    for (p, e) in veil_core::tree::walk_files(repo.store(), &snap.tree)? {
-        if !under(&filters, &p, false) {
-            continue;
-        }
+    let files: Vec<(VPath, TreeEntry)> = veil_core::tree::walk_files(repo.store(), &snap.tree)?.into_iter().filter(|(p, _)| under(&filters, p, false)).collect();
+    // Readability is read by id: in a thin clone, each asked for at its
+    // own path first (BUG-1506).
+    veil_core::tree::prefetch_files(repo.store(), &snap.tree, files.iter().map(|(p, e)| (p, e)))?;
+    for (p, e) in files {
         let looked = look(repo, &e);
         let mut tier = entry_tier_with(repo, &e, looked.as_ref());
         let readable = match &looked {
@@ -2462,7 +2467,7 @@ pub fn blame(ctx: &Ctx, req: &BlameRequest<'_>) -> Result<BlameDoc> {
     let p = ctx.repo_path(req.path)?;
     let tree = repo.snapshot(&id)?.tree;
     let reader = if req.public { Reader::Public } else { Reader::Me };
-    let e = match lookup(repo.store(), &tree, &p)? {
+    let e = match veil_core::tree::lookup_to_read(repo.store(), &tree, &p)? {
         Some(e) if e.kind.is_file_like() => e,
         Some(_) => anyhow::bail!("{} is a directory in {}, not a file", crate::render::safe(p.as_str()), id.short()),
         None => anyhow::bail!("{} does not exist in {}", crate::render::safe(p.as_str()), id.short()),

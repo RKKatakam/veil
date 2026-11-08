@@ -52,6 +52,8 @@
 pub mod attributes;
 pub mod bisect;
 pub mod blame;
+#[cfg(feature = "os")]
+mod blob_stream;
 pub mod builder;
 pub mod cache;
 pub mod checkout;

@@ -13,6 +13,8 @@ mod adversarial_support;
 
 #[cfg(target_os = "linux")]
 mod confine_cli;
+#[cfg(target_os = "linux")]
+mod ports_seed_cli;
 mod guide_library;
 mod mount_cli;
 mod mount_props;
@@ -21,3 +23,5 @@ mod workspace_undo_props;
 mod ws_sandbox_cli;
 mod ws_sandbox_failures_cli;
 mod ws_sparse_cli;
+#[cfg(target_os = "linux")]
+mod ws_socket_cli;
