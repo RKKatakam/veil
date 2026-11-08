@@ -1735,3 +1735,357 @@ fn bug_1531_a_secret_left_on_disk_stays_stale_when_access_comes_back() {
     assert_eq!(std::fs::read_to_string(d.join(format!("{BILL_DIR}/acme/invoice.txt"))).unwrap(), "MARKER-NEW-INVOICE-0b8e\n", "{st}");
     assert_eq!(std::fs::read_to_string(d.join(format!("{BILL_DIR}/.env"))).unwrap(), NEW_ENV, "the folder written whole again: {st}");
 }
+
+// ---- Review of `s8i` (BUG-1528–1531's fixes): guarantee tests -----------
+
+/// The tree of `@` in `clone`.
+fn wc_tree(clone: &Path) -> veil_core::ObjectId {
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(clone)), None, "test").unwrap();
+    repo.snapshot(&repo.view().workspace("default").unwrap().wc).unwrap().tree
+}
+
+/// The entries of directory `dir` ("" for the root) of `tree` in `clone`,
+/// by name.
+fn dir_entries(clone: &Path, tree: &veil_core::ObjectId, dir: &str) -> BTreeMap<String, veil_core::TreeEntry> {
+    let store = open_store(clone);
+    let id = match dir {
+        "" => *tree,
+        d => veil_core::tree::lookup(&store, tree, &veil_core::VPath::new(d).unwrap()).unwrap().unwrap().id,
+    };
+    store.tree(&id).unwrap().entries.iter().map(|e| (e.name.clone(), e.clone())).collect()
+}
+
+/// `vl status --json` of `who` in `clone`, parsed (the command succeeded).
+fn status_json(who: &Person, clone: &Path) -> serde_json::Value {
+    let json = who.ok(clone, &["status", "--json"]);
+    serde_json::from_str(json.lines().next().unwrap()).unwrap()
+}
+
+/// The files on disk below `dir` of `clone`, by path, with their bytes.
+fn disk_below(clone: &Path, dir: &str) -> BTreeMap<String, Vec<u8>> {
+    below(&walk(clone), dir)
+}
+
+/// Guarantee 3 (review of `s8i`): split, squash and restore never move,
+/// empty or drop a refused folder, compared by exact tree ids and entries:
+/// a split's second change keeps the change's exact tree and its first the
+/// base's folder; a squash into the parent (of every path that can be
+/// chosen) keeps the source's exact tree and gives the parent the base's
+/// folder; a squash into a descendant keeps the folder in the source and
+/// the descendant's exact tree; a restore of other paths keeps `@`'s
+/// folder; a restore of every path is refused and changes nothing.
+#[test]
+fn s8ir_review_split_squash_restore_keep_a_refused_folder_exactly() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let d = left_out_by_a_checkout(&p, &hub, "wc");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&d, &["new", "feature"]);
+    assert!(out.contains(&format!("redacted {BILL_DIR}/")), "{out}");
+    let (t, b) = (tree_of(&d, "feature"), tree_of(&d, "feature-"));
+    let (t_root, b_root) = (dir_entries(&d, &t, ""), dir_entries(&d, &b, ""));
+    assert_ne!(t_root[BILL_DIR], b_root[BILL_DIR], "feature's last change changed the billing folder");
+    let more = dir_entries(&d, &t, "src")["more.txt"].clone();
+    // What the first half (or the parent) must be: the base with
+    // `src/more.txt`, nothing else.
+    let check_first = |what: &str| {
+        let f = tree_of(&d, "feature-");
+        let root = dir_entries(&d, &f, "");
+        assert_eq!(root[BILL_DIR], b_root[BILL_DIR], "{what}: the base's folder, by id");
+        for (name, e) in &b_root {
+            if name != "src" {
+                assert_eq!(root.get(name), Some(e), "{what}: {name}");
+            }
+        }
+        assert_eq!(root.len(), b_root.len(), "{what}: {root:?}");
+        let mut want = dir_entries(&d, &b, "src");
+        want.insert("more.txt".into(), more.clone());
+        assert_eq!(dir_entries(&d, &f, "src"), want, "{what}: the base's src/ with src/more.txt");
+    };
+    // The split's second change keeps the exact tree.
+    p.fin.ok(&d, &["split", "-r", "feature", "src/more.txt", "-m", "first"]);
+    assert_eq!(tree_of(&d, "feature"), t, "the split's second change: the change's exact tree");
+    check_first("the split's first change");
+    p.fin.ok(&d, &["undo"]);
+    assert_eq!((tree_of(&d, "feature"), tree_of(&d, "feature-")), (t, b));
+    // A squash of every path that can be chosen into the parent: the source
+    // is not emptied (it still changes the folder) and keeps its tree.
+    let out = p.fin.ok(&d, &["squash", "-r", "feature", "src/more.txt"]);
+    assert!(!out.contains("abandon"), "the source still changes the folder: {out}");
+    assert_eq!(tree_of(&d, "feature"), t, "the squash's source: its exact tree");
+    check_first("the squash's parent");
+    p.fin.ok(&d, &["undo"]);
+    assert_eq!((tree_of(&d, "feature"), tree_of(&d, "feature-")), (t, b));
+    // Into a descendant (`@`, an empty change on `feature`): the folder
+    // stays in the source, `@` keeps its exact tree.
+    let wc = wc_tree(&d);
+    assert_eq!(wc, t);
+    p.fin.ok(&d, &["squash", "-r", "feature", "--into", "@", "src/more.txt"]);
+    assert_eq!(wc_tree(&d), t, "the descendant keeps its exact tree");
+    let src_root = dir_entries(&d, &tree_of(&d, "feature"), "");
+    assert_eq!(src_root[BILL_DIR], t_root[BILL_DIR], "the source keeps the folder it changed, by id");
+    assert!(!dir_entries(&d, &tree_of(&d, "feature"), "src").contains_key("more.txt"), "the chosen path left the source");
+    p.fin.ok(&d, &["undo"]);
+    assert_eq!((tree_of(&d, "feature"), tree_of(&d, "feature-"), wc_tree(&d)), (t, b, t));
+    // A whole squash into the parent (nothing named): the parent gets the
+    // change's exact tree, the folder by id.
+    let parent = p.fin.ok(&d, &["log", "-r", "feature-", "--json"]);
+    let out = p.fin.ok(&d, &["squash", "-r", "feature"]);
+    assert!(out.to_lowercase().contains("squash"), "{out}");
+    assert_eq!(wc_tree(&d), t, "@ keeps its exact tree");
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&d)), None, "test").unwrap();
+    let wc = repo.snapshot(&repo.view().workspace("default").unwrap().wc).unwrap();
+    assert_eq!(repo.snapshot(&wc.parents[0]).unwrap().tree, t, "the parent has the change's exact tree: {parent}");
+    drop(repo);
+    p.fin.ok(&d, &["undo"]);
+    assert_eq!((tree_of(&d, "feature"), tree_of(&d, "feature-"), wc_tree(&d)), (t, b, t));
+    // A restore of another path keeps `@`'s folder (it differs from the
+    // source's).
+    p.fin.ok(&d, &["restore", "--from", "feature-", "src/more.txt"]);
+    let after = wc_tree(&d);
+    assert_eq!(dir_entries(&d, &after, "")[BILL_DIR], t_root[BILL_DIR], "the restore keeps @'s folder, by id");
+    let mut want = dir_entries(&d, &t, "src");
+    want.remove("more.txt");
+    assert_eq!(dir_entries(&d, &after, "src"), want, "only the path asked for was restored");
+    // A restore of every path needs the folder: refused, nothing changed.
+    let before = (p.fin.ok(&d, &["op", "log", "-n", "1", "--json"]), wc_tree(&d));
+    let out = p.fin.fails(&d, &["restore", "--from", "feature-"]);
+    assert!(out.contains(&format!("{BILL_DIR}/ is a folder you no longer have access to")) && out.contains("nothing was changed"), "{out}");
+    assert_eq!((p.fin.ok(&d, &["op", "log", "-n", "1", "--json"]), wc_tree(&d)), before, "the refused restore changed nothing");
+}
+
+/// Guarantees 2 and 4 (review of `s8i`): nothing the person made is lost
+/// or overwritten, before or after access returns, and `vl status` and `vl
+/// commit` name only what the working copy holds below the refused folder.
+/// fin holds the billing folder (two `.env` secrets), keeps a personal key
+/// there (local-only, in no tree: as an ignored file would be; fin's clone
+/// cannot read the root `.veilpolicy`, so no ignore rule reaches it), loses access (the checkout leaves the folder
+/// out), then makes a file, edits one kept secret, deletes the other, moves
+/// to `main` and back, and commits elsewhere; access comes back.
+#[test]
+fn s8ir_review_nothing_the_person_made_is_lost_across_a_left_out_folder() {
+    const ACME_ENV_OLD: &str = "KEY=MARKER-ACME-ENV-OLD-5e1b07c2\n";
+    const ACME_ENV_NEW: &str = "KEY=MARKER-ACME-ENV-NEW-91d4a6f0\n";
+    const ENV_NEW: &str = "KEY=MARKER-BILL-ENV-NEW-2b7c9e13\n";
+    const MY_EDIT: &str = "KEY=MARKER-FINS-EDIT-WHILE-GONE-7aa3\n";
+    const MY_NEW: &str = "MARKER-FINS-NEW-FILE-WHILE-GONE-c40e\n";
+    const MY_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ\n-----END OPENSSH PRIVATE KEY-----\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    feature_with(&p, &[(&format!("{BILL_DIR}/acme/.env"), ACME_ENV_OLD)], &[], "a second secret");
+    let d = plain_thin(&p, &hub, "wc");
+    p.fin.ok(&d, &["new", "feature"]);
+    assert_eq!(std::fs::read_to_string(d.join(format!("{BILL_DIR}/acme/.env"))).unwrap(), ACME_ENV_OLD);
+    // `feature` moves on while fin holds the old version.
+    feature_with(&p, &[(&format!("{BILL_DIR}/.env"), ENV_NEW), (&format!("{BILL_DIR}/acme/.env"), ACME_ENV_NEW), (&format!("{BILL_DIR}/acme/q2.txt"), "MARKER-Q2-NEW-6d02\n")], &[], "rotate billing");
+    p.fin.ok(&d, &["pull"]);
+    p.fin.ok(&d, &["cat", "-r", "feature", "src/lib.rs"]);
+    let key = format!("{BILL_DIR}/acme/id_ed25519");
+    write_files(&d, &[(&key, MY_KEY)]);
+    let st = p.fin.ok(&d, &["status"]);
+    assert!(st.contains(&key) && st.contains("isolated"), "the personal key is local-only: {st}");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&d, &["new", "feature"]);
+    assert!(out.contains(&format!("redacted {BILL_DIR}/")), "{out}");
+    let (env, acme_env, mine) = (format!("{BILL_DIR}/.env"), format!("{BILL_DIR}/acme/.env"), format!("{BILL_DIR}/acme/mine.txt"));
+    assert!(d.join(&env).is_file() && d.join(&acme_env).is_file(), "the checkout kept the secrets it could not tell as its own: {:?}", disk_below(&d, BILL_DIR).keys());
+    // While access is gone: fin edits one kept secret, deletes the other,
+    // moves to `main` and back (`main`'s billing folder is held here, fin
+    // read it before: a checkout of it writes it around fin's files,
+    // BUG-1464), then makes a file.
+    write_files(&d, &[(&env, MY_EDIT)]);
+    std::fs::remove_file(d.join(&acme_env)).unwrap();
+    p.fin.ok(&d, &["new", "main"]);
+    let on_main = disk_below(&d, BILL_DIR);
+    for (k, v) in [(&env, MY_EDIT), (&key, MY_KEY)] {
+        assert_eq!(on_main.get(k).map(Vec::as_slice), Some(v.as_bytes()), "a checkout of main while the folder is refused touched {k}");
+    }
+    p.fin.ok(&d, &["new", "feature"]);
+    write_files(&d, &[(&mine, MY_NEW)]);
+    let held = disk_below(&d, BILL_DIR);
+    let mut want: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for (k, v) in [(&env, MY_EDIT), (&mine, MY_NEW), (&key, MY_KEY)] {
+        want.insert(k.clone(), v.as_bytes().to_vec());
+    }
+    assert_eq!(held, want, "below the folder: only what fin holds");
+    let st = status_json(&p.fin, &d);
+    let named: std::collections::BTreeSet<String> = st["not_recorded"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    for k in [&env, &mine] {
+        assert!(named.contains(k), "{k} is named: {st}");
+    }
+    for k in &named {
+        assert!(held.contains_key(k), "status names only what the working copy holds there, not {k}: {st}");
+    }
+    write_files(&d, &[("src/also.txt", "recorded\n")]);
+    let c = p.fin.ok(&d, &["commit", "-m", "the rest"]);
+    assert!(c.contains("Committed"), "{c}");
+    for k in held.keys() {
+        if c.contains(k.as_str()) {
+            continue;
+        }
+        assert!(k == &key, "commit names {k}: {c}");
+    }
+    assert_eq!(disk_below(&d, BILL_DIR), want, "the commit touched fin's files");
+    // Access comes back.
+    p.admin.ok(&p.dir, &["group", "add", "finance", &p.fin.name]);
+    let st = status_json(&p.fin, &d);
+    let now = disk_below(&d, BILL_DIR);
+    for (k, v) in [(&env, MY_EDIT), (&mine, MY_NEW), (&key, MY_KEY)] {
+        assert_eq!(now.get(k).map(Vec::as_slice), Some(v.as_bytes()), "{k}: fin's file, byte for byte: {st}");
+    }
+    assert_eq!(now.get(&acme_env).map(Vec::as_slice), Some(ACME_ENV_NEW.as_bytes()), "the folder written whole again: {st}");
+    assert!(st["conflicts"].as_array().unwrap().iter().any(|c| c["path"] == env.as_str() && c["kept_edit"] == true), "{st}");
+    assert!(!st["conflicts"].as_array().unwrap().iter().any(|c| c["path"] != env.as_str()), "only the edit is a conflict: {st}");
+    // fin commits: the new file is recorded and stays in history after fin
+    // moves on; the secret's edit stays on disk (a working copy without the
+    // project's `.veilpolicy` keeps a shared secret's edit local, BUG-832),
+    // and so does the personal key.
+    let c = p.fin.ok(&d, &["commit", "-m", "keep my work"]);
+    assert!(c.contains("Committed"), "{c}");
+    p.fin.ok(&d, &["tag", "set", "kept", "-r", "@-"]);
+    assert!(p.fin.ok(&d, &["cat", "-r", "kept", &mine]).starts_with(MY_NEW), "fin's new file is recorded");
+    p.fin.ok(&d, &["new", "feature"]);
+    assert!(p.fin.ok(&d, &["cat", "-r", "kept", &mine]).starts_with(MY_NEW), "fin's new file stays in history");
+    assert_eq!(std::fs::read(d.join(&env)).unwrap(), MY_EDIT.as_bytes(), "fin's edit of the secret, never written over");
+    assert_eq!(std::fs::read(d.join(&key)).unwrap(), MY_KEY.as_bytes());
+}
+
+/// BUG-1531's conflict (review of `s8i`): a file fin made while access was
+/// gone, at a path the version written back has (and the version left
+/// had not), is kept when the
+/// folder is written back, and is a conflict (`kept_edit`). Once fin has
+/// recorded it (the file is fin's version, committed), the conflict is
+/// resolved: `vl status` no longer lists it. Actual: it is listed for good
+/// ("the recorded version is newer: `vl restore …` takes it"), after `vl
+/// commit`, `vl restore` of the path and `vl new`.
+#[test]
+#[ignore = "BUG-1558: a kept_edit conflict stays in vl status after the person records their own version, and vl restore PATH does not clear it"]
+fn bug_1558_a_kept_edit_once_recorded_is_still_a_conflict() {
+    const MINE: &str = "MARKER-FINS-OWN-Q4-WHILE-GONE-d1e2\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let d = left_out_by_a_checkout(&p, &hub, "wc");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&d, &["new", "feature"]);
+    assert!(out.contains(&format!("redacted {BILL_DIR}/")), "{out}");
+    // `q3.txt` is in the version written back (`feature`), not in the
+    // version the folder was left from (fin never held it).
+    let q4 = format!("{BILL_DIR}/acme/q3.txt");
+    write_files(&d, &[(&q4, MINE)]);
+    p.fin.ok(&d, &["status"]);
+    p.admin.ok(&p.dir, &["group", "add", "finance", &p.fin.name]);
+    let st = status_json(&p.fin, &d);
+    assert_eq!(std::fs::read_to_string(d.join(&q4)).unwrap(), MINE, "fin's file kept: {st}");
+    assert!(st["conflicts"].as_array().unwrap().iter().any(|c| c["path"] == q4.as_str() && c["kept_edit"] == true), "{st}");
+    let c = p.fin.ok(&d, &["commit", "-m", "my q4"]);
+    assert!(c.contains("Committed"), "{c}");
+    p.fin.ok(&d, &["tag", "set", "mine-q4", "-r", "@-"]);
+    assert!(p.fin.ok(&d, &["cat", "-r", "mine-q4", &q4]).starts_with(MINE), "fin's version is recorded");
+    let st = status_json(&p.fin, &d);
+    assert!(!st["conflicts"].as_array().unwrap().iter().any(|c| c["path"] == q4.as_str()), "recorded, and still a conflict: {st}");
+    // And `vl restore PATH`, the conflict's own advice, is no way out
+    // either: it restores nothing (`@-` holds fin's version).
+    let r = p.fin.ok(&d, &["restore", &q4]);
+    assert!(r.contains("Restored"), "{r}");
+    let st = status_json(&p.fin, &d);
+    assert!(!st["conflicts"].as_array().unwrap().iter().any(|c| c["path"] == q4.as_str()), "{st}");
+}
+
+/// Guarantee 1 (review of `s8i`): asking the server whether it knows a
+/// snapshot (`server_knows`) costs no request per commit of a local stack.
+/// Two thin clones of fin's, with 2 and 30 local commits on `feature`, are
+/// rebased onto `feature` moved on by one file: the checkout fetches that
+/// file under `@`, a local commit. Expected: about the same number of
+/// requests for both.
+#[test]
+fn s8ir_review_a_local_stack_costs_no_request_a_commit() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let mut clones = Vec::new();
+    for n in [2usize, 30] {
+        let d = plain_thin(&p, &hub, &format!("stack{n}"));
+        p.fin.ok(&d, &["new", "feature"]);
+        for i in 0..n {
+            write_files(&d, &[(&format!("src/stack/c{i:02}.txt"), &format!("commit {i}\n"))]);
+            p.fin.ok(&d, &["commit", "-m", &format!("stack {i}")]);
+            if i == 0 {
+                p.fin.ok(&d, &["tag", "set", "stack-base", "-r", "@-"]);
+            }
+        }
+        clones.push((n, d));
+    }
+    feature_with(&p, &[("src/late.txt", "MARKER-LATE-FILE-0c55e1\n")], &[], "late");
+    let mut cost = Vec::new();
+    for (n, d) in &clones {
+        p.fin.ok(d, &["pull"]);
+        let before = requests(&hub);
+        let out = p.fin.ok(d, &["rebase", "-s", "stack-base", "-d", "origin/feature"]);
+        assert!(out.contains("Rebased"), "{out}");
+        cost.push(requests(&hub) - before);
+        assert_eq!(std::fs::read_to_string(d.join("src/late.txt")).unwrap(), "MARKER-LATE-FILE-0c55e1\n");
+        assert_eq!(std::fs::read_to_string(d.join(format!("src/stack/c{:02}.txt", n - 1))).unwrap(), format!("commit {}\n", n - 1));
+    }
+    eprintln!("s8ir: rebase of a 2-commit stack cost {} requests, of a 30-commit stack {}", cost[0], cost[1]);
+    assert!(cost[1] <= cost[0] + 8, "a 30-commit stack cost {} requests, a 2-commit one {}", cost[1], cost[0]);
+}
+
+/// BUG-1528's class (review of `s8i`): a symbolic link the person makes in
+/// a folder the checkout left out is not recorded either, and must be
+/// named as the files there are. Actual: `not_recorded` lists only the
+/// files (`vfs::walk_files` never lists a link), and `vl commit` says nothing.
+#[test]
+#[ignore = "BUG-1559: a symlink made in a folder the checkout left out is silently not recorded (not in not_recorded)"]
+fn bug_1559_a_link_made_in_a_left_out_folder_is_not_named() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let d = left_out_by_a_checkout(&p, &hub, "wc");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&d, &["new", "feature"]);
+    assert!(out.contains(&format!("redacted {BILL_DIR}/")), "{out}");
+    let link = format!("{BILL_DIR}/acme/latest");
+    std::fs::create_dir_all(d.join(format!("{BILL_DIR}/acme"))).unwrap();
+    std::os::unix::fs::symlink("q2.txt", d.join(&link)).unwrap();
+    let st = status_json(&p.fin, &d);
+    let named: Vec<&str> = st["not_recorded"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+    assert!(named.contains(&link.as_str()), "the link fin made is named as not recorded: {st}");
+    let c = p.fin.ok(&d, &["commit", "-m", "the rest"]);
+    assert!(c.contains("Committed") && c.contains(&link), "{c}");
+}
+
+
+/// Guarantee 1 (review of `s8i`), a read under a local commit: fin's
+/// stack of local commits on `main`, rebased onto `feature` with `@`
+/// elsewhere, names `feature`'s files, which this clone never fetched;
+/// `vl cat` reads one at the stack's tip. The server has no such snapshot;
+/// the clone asks at its nearest ancestor on the server. Expected: about the
+/// same number of requests whether the tip is 2 or 30 local commits above
+/// it.
+#[test]
+fn s8ir_review_a_read_under_a_local_stack_costs_no_request_a_commit() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let file = "src/wide/f1/s0.txt";
+    let mut cost = Vec::new();
+    for n in [2usize, 30] {
+        let d = plain_thin(&p, &hub, &format!("stack{n}"));
+        for i in 0..n {
+            write_files(&d, &[(&format!("src/stack/c{i:02}.txt"), &format!("commit {i}\n"))]);
+            p.fin.ok(&d, &["commit", "-m", &format!("stack {i}")]);
+            if i == 0 {
+                p.fin.ok(&d, &["tag", "set", "stack-base", "-r", "@-"]);
+            }
+        }
+        p.fin.ok(&d, &["tag", "set", "stack-tip", "-r", "@-"]);
+        p.fin.ok(&d, &["new", "stack-base-"]);
+        let out = p.fin.ok(&d, &["rebase", "-s", "stack-base", "-d", "feature"]);
+        assert!(out.contains("Rebased"), "{out}");
+        assert!(!d.join(file).exists(), "@ is not on the stack");
+        let before = requests(&hub);
+        let out = p.fin.run(&d, &["cat", "-r", "stack-tip", file]);
+        cost.push(requests(&hub) - before);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stdout).starts_with(FEATURE_MARK), "{}", String::from_utf8_lossy(&out.stdout));
+    }
+    eprintln!("s8ir: a read at the tip of 2 local commits cost {} requests, of 30 {}", cost[0], cost[1]);
+    assert!(cost[1] <= cost[0] + 8, "at the tip of 30 local commits {} requests, of 2 {}", cost[1], cost[0]);
+}
