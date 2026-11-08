@@ -362,7 +362,7 @@ pub fn diff(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool, r: &Renames
         println!("{}", dim("(no changes)"));
         return Ok(());
     }
-    let (items, skipped) = detect_renames(repo, changes, r)?;
+    let (items, skipped) = detect_renames(repo, (from, to), changes, r)?;
     if skipped {
         crate::render::warn(&format!(
             "rename detection skipped: too many files (limit {}); only exact renames are shown",

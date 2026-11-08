@@ -2868,3 +2868,156 @@ change; nothing new is encrypted.
   searched (`long_lines_skipped`).
 * `vl search WORDS… [--path] [--lang LANG] [-r BRANCH] [-n N] [--json] [-- PATH]`
   prints the server's answer (exit 1 when nothing matched).
+
+### 13.28 S8: workspaces that fetch on first read (as built)
+
+Milestone S8 of `docs/design/server/phase-2-thin-clients.md` (§4.6, §4.8,
+§4.9). Code: `crates/vl/src/mount/fs.rs` (`ReaderView`: a thin clone's
+mount), `crates/vl/src/mount.rs` (`for_exec`), `crates/vl/src/sandbox.rs`
+(`exec_mounted`, `MidRun`), `crates/vl/src/ws_socket.rs` (new),
+`crates/vl/src/confine.rs` (`--private-ports`, `--seed`),
+`veil-core` `ObjectStore::entry_shown` and `prefetch` (`promisor.rs`), used
+by `vfs/sparse.rs` and the builder's carrying (`builder.rs`). No format,
+protocol or server change.
+
+#### The design as built
+
+* **A mount in a thin clone** shows the person's projection (what the
+  server gave them) and fetches on first read through S3's promisor:
+  * listing and `stat` never fetch a file's content (sizes are in the
+    tree); a folder or a plain file not fetched yet is shown without
+    fetching it (`entry_shown`), and its object decides when it is read (a
+    secret this reader cannot open is `EACCES` then). A file labelled
+    secret is decided by its object, fetched to decide. One folder that
+    turns out to hold only secrets this reader cannot open lists as empty
+    (a checkout would not create it).
+  * reading a file fetches its folder's small files (≤ 256 KiB) in the
+    same request, once per folder; listing a folder fetches only its tree.
+  * the server's refusal hides: `EACCES` at `open` (a thin clone's mount
+    fetches at `open`, since the kernel turns any error of a later read
+    into `EIO`), and absent from listings and lookups for 10 s; a server
+    that cannot be reached is `EIO`, never an absent or empty file. An
+    object met under a local change (a workspace's own `@`) and refused at
+    the nearest server ancestor whose held tree names it there is the
+    server's refusal too (`promisor.rs`, `names_held`).
+  * an open file's content is in memory only up to 1 MiB, 64 MiB across
+    open files; larger, in an anonymous file (BUG-1365). A file over 1
+    MiB is never read whole by the mount: `stat` decides from the first
+    bytes of its loose object, and opening, writing into (copy-up) and
+    renaming it stream that object to the spill file, checked against its
+    id, and on to the upper layer atomically; an unlinked open file is
+    written to an anonymous file (BUG-1368). **Outside the bound:** a file a
+    thin clone has not fetched arrives whole from the server (an object at
+    a time) before it is spilled; a large file the store holds in a pack
+    is inflated whole when the mount first looks at it (its first `stat`,
+    listing or lookup in the process: BUG-1461, open) and when it is read;
+    a sealed secret and a conflicted file are read whole when read;
+    recording reads changed files as any snapshot does.
+  * a reader that knows an entry's path asks at that path: the mount
+    (`read_at`, its folder's prefetch), a checkout and the fallback's
+    prefetch (`prefetch_diff_below`, `prefetch_at`) ask for each file at
+    its own path, one request a folder, and ask again at a file's other
+    paths in the tree they write only if the server refused it at the
+    first. So content refused at one path is written where it is readable
+    there, wherever it was met first (BUG-1460, BUG-1462, BUG-1463). Every
+    other reader that walks a tree or looks a path up and then reads by id
+    asks for what it reads at its paths first, a batch a request
+    (`tree::prefetch_files`, `prefetch_changes`, `lookup_to_read`;
+    BUG-1506): `vl grep`, `diff`, `show`, `cat`, `ls`, `files`, `blame`,
+    `log -S`/`-G` and `--follow`, `restore`, `bisect`'s count of unreadable
+    files, the attributes a merge reads, rename detection (what its inexact
+    pass reads), merges (the files both sides changed) and `split`/`squash`
+    by hunk. The locator keeps one place an object, for readers by id only.
+    A batch under a local change is asked under its nearest server
+    ancestor. **Outside this:** a diff whose old side holds a refused
+    folder whose tree this clone does not hold fails with "not present"
+    (BUG-1508, open).
+  * **content already held reads at every path naming it** (decided,
+    BUG-1464): removal of access stops new fetches; bytes already on a
+    machine stay readable there, at any path naming them, as they are in a
+    full clone made before the removal. A path whose content is not held
+    is asked of the server at that path (`place_along`): the same content
+    refused at one path is fetched at another where it is readable
+    (BUG-1367); a refusal hides that path for 10 s, or until something
+    makes its bytes held (BUG-1507). Fetching is switched off per thread, never for
+    the whole store (BUG-1366).
+* **Exact dirty sets:** a mount's recording reuses every unchanged folder
+  and file by id and visits only the paths the overlay holds, so it
+  fetches nothing; the builder's carrying of what a working copy does not
+  show uses the same rule (a deleted file not fetched is a deletion, not
+  "unreadable"). A new workspace (`vl ws new`) is marked scanned by the
+  current scanner rules, so its first recording does not re-read every file
+  (it did: in a thin clone, a fetch of the whole workspace). A re-scan after
+  a rules upgrade still reads everything: BUG-1360.
+* **`vl ws exec --mount`:** the sandbox is a mount of the workspace (a
+  private mountpoint under `$XDG_RUNTIME_DIR`, bound at the project's path
+  when confined), started for the run and unmounted after it, or the mount
+  `vl ws mount` already serves. Without FUSE (`fuse_available`: the build,
+  `/dev/fuse`, `fusermount3`) the run says so and is checked out; in a thin
+  clone the sync fetches what it writes first, in batches, and a sparse
+  sandbox (`--only`) only its paths (`prefetch_sync`; `SparseView` shows
+  what is outside the set without fetching it), so a lost server fails the
+  run before the sandbox is touched.
+* **The workspace socket** (`ws_socket.rs`, `9-confinement.md` item 17):
+  named workspaces' runs, mounted or not, get `$VEIL_WORKSPACE_SOCKET` and
+  `vl` first on `PATH`; a `vl` inside forwards its arguments; the `vl`
+  outside runs `status`, `diff`, `log`, `show`, `blame` (every revision
+  `@` or an ancestor of it, BUG-1361), `commit` (always `--no-advance`,
+  BUG-1362), `describe` (of `@`) and `new` (on `@`) as a child of its own
+  (`__veil-workspace-command`), with its own environment and hooks off, on
+  that workspace only (`Ctx::open_for_workspace`, `Ctx::detached`), after
+  recording the sandbox. Everything else is refused before anything opens.
+  `--ephemeral` runs get none. Attribution (S11) will come from the same
+  `vl` outside.
+* **`--private-ports`** and **`--seed SRC:DEST`**: `9-confinement.md` items
+  15 and 16. `pasta` only (slirp4netns is not used).
+
+#### Measured (2026-11-08)
+
+`server_hub` `workspaces::s8_bench_ready_to_read` through `bench-quiet.sh`
+(the quiet wait ran out: load 64.1 before, 12.0 after, so noisy), a
+release `vl`, the test's debug server, PostgreSQL, ext4 NVMe, no Veil
+daemon (S6). A thin clone holds `main`; the workspace is on a branch it
+never fetched, 100 files a folder.
+
+| Step | 2,000 files | 50,000 files |
+|---|---:|---:|
+| `vl ws new agent -r feature` | 103 ms | 103 ms |
+| `vl ws mount` | 104 ms | 103 ms |
+| `ls wide/` (20 / 500 folders) | 21 ms | 31 ms |
+| first `cat` (one tree, then the folder's files in one request) | 614 ms | 450 ms |
+| **ready, cold** (§4.8: under 2 s) | **841 ms** | **686 ms** |
+| **ready, warm** (mounted again; §4.8: under 300 ms) | **104 ms** | **118 ms** |
+| read 1,000 files of 10 folders, cold | 5.3 s | 4.6 s |
+| `vl ws exec --mount -- cat FILE`, cold / warm | 804 / 103 ms | 1,203 / 103 ms |
+| `vl ws exec` checked out (the fallback), first run | 3.8 s | 164 s |
+
+* Ready is independent of the project's size: nothing proportional to the
+  files or the history is read before the first `cat`.
+* The fallback's numbers are from before its sync fetched in batches
+  (`prefetch_sync`: S3's `prefetch_diff`, within `--only`); it then fetched
+  one file per request. Two later runs, with batches, ran at load 101 and
+  334 to 580 and measured nothing reliable (3,000 files: 60 s, all of it in
+  four batch requests to the debug server); to be measured again on a
+  quiet machine with a release server, as are the cold reads (each folder
+  is two requests to the server, about 230 ms each at that load).
+
+#### Threat review (phase 2's rows 5–7 and 18, and §4.9)
+
+| # | Threat | As built | Test |
+|---|---|---|---|
+| 1 | a mount shows a file or name its person may not see | the tree is the server's projection; visibility as a checkout's | `server_hub` `workspaces::a_mounted_workspace_shows_exactly_its_persons_projection` (dev and admin; mount, `ws exec --mount`, the fallback; equal to a full clone's checkout; no marker in the clone's objects) |
+| 2 | unfetched read as empty or hidden; a refusal read as anything but hidden | `EIO`; a mounted run meets the error; the fallback fails before running; a refusal is `EACCES` at `open`, then absent | `workspaces::an_unreachable_server_is_an_error_in_the_mount_never_a_missing_file`, `workspaces::a_server_refusal_hides_the_file` |
+| 3 | `ls -lR`, an indexer: a fetch storm | listing and `stat` fetch no content; folder prefetch only on reads | `workspaces::listing_fetches_no_file_and_reading_one_fetches_its_folder` |
+| 4 | a dirty set that misses or adds an edit; recording proportional to the project | the overlay is the dirty set; unchanged by id | `workspaces::recording_a_mount_fetches_nothing_and_holds_exactly_its_edits`, `cli_workspaces` `ws_socket_cli::what_a_mounted_command_changes_is_exactly_what_is_recorded_and_the_same_without_fuse` |
+| 5 | the sandbox's `vl` does more than its person may (phase 2, rows 5–7) | the allow-list of commands, its own workspace, the outside `vl`'s identity and environment, no hooks | `ws_socket_cli::*` (6 tests), `workspaces::the_sandboxs_vl_shows_only_what_its_person_may_see` |
+| 6 | a run reaches the host's loopback or another run's ports; shares the host's loopback without `pasta` | own network namespace; `pasta` forwards nothing; fails before running | `ports_seed_cli` (5 tests) |
+| 7 | a seed is written, or one run sees another's layer; a seed shows what the allow-list masks | overlay on a tmpfs of the run's own; one set of masks for every host path shown | `ports_seed_cli` (6 tests, BUG-1363 and 1364's included) |
+| 9 | a mount's memory grows with what is open, outside `--memory` | bounded in memory, the rest in anonymous files | `mount_cli::bug_1365_…`, `mount::fs::tests::large_open_files_are_spilled_and_behave_as_held_ones` |
+| 8 | the fallback without FUSE loses a guarantee | the same tests with `VEIL_TEST_NO_FUSE` | in 1, 2 and 4 |
+
+#### Reverting
+
+Revert the merge commit. Nothing on disk changes format; a workspace
+created meanwhile keeps its `.veil/local/scanned` marker, which the
+reverted `vl` reads as before.

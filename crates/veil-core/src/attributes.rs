@@ -766,6 +766,8 @@ impl AttrSource for AudienceTreeSource<'_> {
         if e.size > MAX_FILE as u64 {
             return Err(too_large());
         }
+        // In a thin clone, asked for at this path (BUG-1506).
+        crate::tree::prefetch_files(self.store, &self.tree, [(&path, &e)]).map_err(|e| e.to_string())?;
         let shown = |v: &crate::object::Visibility| match v {
             crate::object::Visibility::Public => true,
             v => *v == self.audience,

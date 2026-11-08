@@ -66,7 +66,7 @@ fn an_exact_move_is_a_rename_and_leaves_no_deletion_or_addition() {
     let (r, _, _) = new_repo("alice");
     let body = lines("a", 20);
     let changes = vec![deleted(&r, "old/a.rs", &body), added(&r, "new/a.rs", &body), added(&r, "z.rs", "other\n")];
-    let d = detect(r.store(), &changes, Reader::Me, &opts()).unwrap();
+    let d = detect(r.store(), None, None, &changes, Reader::Me, &opts()).unwrap();
     assert_eq!(pairs(&d), [("old/a.rs".into(), "new/a.rs".into(), 100, false)]);
     assert_eq!(d.changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), ["z.rs"]);
     assert!(!d.truncated);
@@ -83,17 +83,17 @@ fn a_moved_and_edited_file_is_an_inexact_rename_with_its_score() {
     let old = lines("a", 10);
     let new = format!("{}changed\n", lines("a", 9));
     let changes = vec![deleted(&r, "a.rs", &old), added(&r, "b.rs", &new)];
-    let d = detect(r.store(), &changes, Reader::Me, &opts()).unwrap();
+    let d = detect(r.store(), None, None, &changes, Reader::Me, &opts()).unwrap();
     let got = pairs(&d);
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!((got[0].0.as_str(), got[0].1.as_str(), got[0].3), ("a.rs", "b.rs", false));
     assert!((80..100).contains(&got[0].2), "{got:?}");
     // Above the threshold: none.
     let strict = RenameOptions { threshold: 95, ..opts() };
-    assert!(detect(r.store(), &changes, Reader::Me, &strict).unwrap().pairs.is_empty());
+    assert!(detect(r.store(), None, None, &changes, Reader::Me, &strict).unwrap().pairs.is_empty());
     // A wholly different file is never a rename.
     let unrelated = vec![deleted(&r, "a.rs", &old), added(&r, "b.rs", &lines("zzz", 10))];
-    assert!(detect(r.store(), &unrelated, Reader::Me, &opts()).unwrap().pairs.is_empty());
+    assert!(detect(r.store(), None, None, &unrelated, Reader::Me, &opts()).unwrap().pairs.is_empty());
 }
 
 #[test]
@@ -102,8 +102,8 @@ fn copies_are_detected_only_when_asked_and_keep_their_source() {
     let body = lines("lib", 30);
     // `lib.rs` is modified and copied to `lib2.rs`.
     let changes = vec![modified(&r, "lib.rs", &body, &format!("{body}more\n")), added(&r, "lib2.rs", &body)];
-    assert!(detect(r.store(), &changes, Reader::Me, &opts()).unwrap().pairs.is_empty());
-    let d = detect(r.store(), &changes, Reader::Me, &copies()).unwrap();
+    assert!(detect(r.store(), None, None, &changes, Reader::Me, &opts()).unwrap().pairs.is_empty());
+    let d = detect(r.store(), None, None, &changes, Reader::Me, &copies()).unwrap();
     assert_eq!(pairs(&d), [("lib.rs".into(), "lib2.rs".into(), 100, true)]);
     assert_eq!(d.changes.len(), 1, "the source's own change stays");
     // From an unchanged file of the old tree (with its tree).
@@ -111,7 +111,7 @@ fn copies_are_detected_only_when_asked_and_keep_their_source() {
     let c = commit_files(&mut r, &*fs, &[("keep.rs", &body)], "v1");
     let tree = r.snapshot(&c).unwrap().tree;
     let changes = vec![added(&r, "copy.rs", &body)];
-    let d = detect_with_sources(r.store(), Some(&tree), &changes, Reader::Me, &copies()).unwrap();
+    let d = detect_with_sources(r.store(), Some(&tree), None, &changes, Reader::Me, &copies()).unwrap();
     assert_eq!(pairs(&d), [("keep.rs".into(), "copy.rs".into(), 100, true)]);
 }
 
@@ -120,10 +120,10 @@ fn a_deleted_source_is_renamed_once_and_otherwise_copied() {
     let (r, _, _) = new_repo("alice");
     let body = lines("x", 10);
     let changes = vec![deleted(&r, "a", &body), added(&r, "b", &body), added(&r, "c", &body)];
-    let d = detect(r.store(), &changes, Reader::Me, &opts()).unwrap();
+    let d = detect(r.store(), None, None, &changes, Reader::Me, &opts()).unwrap();
     assert_eq!(pairs(&d), [("a".into(), "b".into(), 100, false)]);
     assert_eq!(d.changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), ["c"]);
-    let d = detect(r.store(), &changes, Reader::Me, &copies()).unwrap();
+    let d = detect(r.store(), None, None, &changes, Reader::Me, &copies()).unwrap();
     assert_eq!(pairs(&d), [("a".into(), "b".into(), 100, false), ("a".into(), "c".into(), 100, true)]);
     assert!(d.changes.is_empty());
 }
@@ -133,7 +133,7 @@ fn the_same_file_name_is_preferred_among_equal_sources() {
     let (r, _, _) = new_repo("alice");
     let body = lines("x", 10);
     let changes = vec![deleted(&r, "a/one.rs", &body), deleted(&r, "b/two.rs", &body), added(&r, "c/two.rs", &body)];
-    let d = detect(r.store(), &changes, Reader::Me, &opts()).unwrap();
+    let d = detect(r.store(), None, None, &changes, Reader::Me, &opts()).unwrap();
     assert_eq!(pairs(&d), [("b/two.rs".into(), "c/two.rs".into(), 100, false)]);
 }
 
@@ -141,7 +141,7 @@ fn the_same_file_name_is_preferred_among_equal_sources() {
 fn empty_files_never_pair() {
     let (r, _, _) = new_repo("alice");
     let changes = vec![deleted(&r, "a", ""), added(&r, "b", "")];
-    let d = detect(r.store(), &changes, Reader::Me, &copies()).unwrap();
+    let d = detect(r.store(), None, None, &changes, Reader::Me, &copies()).unwrap();
     assert!(d.pairs.is_empty());
     assert_eq!(d.changes.len(), 2);
 }
@@ -156,7 +156,7 @@ fn many_to_one_pairs_are_assigned_greedily_and_linearly() {
     let near = format!("{}tail\n", lines("m", 19));
     let far = format!("{}t1\nt2\nt3\nt4\n", lines("m", 16));
     let changes = vec![deleted(&r, "far", &far), deleted(&r, "near", &near), added(&r, "dst", &base)];
-    let d = detect(r.store(), &changes, Reader::Me, &opts()).unwrap();
+    let d = detect(r.store(), None, None, &changes, Reader::Me, &opts()).unwrap();
     assert_eq!(d.pairs.len(), 1);
     assert_eq!(d.pairs[0].from.as_str(), "near");
     // 10 000 identical copies of one deleted file.
@@ -168,7 +168,7 @@ fn many_to_one_pairs_are_assigned_greedily_and_linearly() {
         changes.push(TreeChange { path: p(&name), old: None, new: Some(entry(&name, id, body.len())) });
     }
     let t = Instant::now();
-    let d = detect(r.store(), &changes, Reader::Me, &copies()).unwrap();
+    let d = detect(r.store(), None, None, &changes, Reader::Me, &copies()).unwrap();
     eprintln!("measured: 10 000 copies of one file: {:?}", t.elapsed());
     assert_eq!(d.pairs.len(), 10_000);
     assert_eq!(d.pairs.iter().filter(|p| !p.copy).count(), 1, "renamed once");
@@ -195,7 +195,7 @@ fn a_hostile_number_of_files_skips_the_inexact_pass() {
     changes.push(TreeChange { path: p("y/same"), old: None, new: Some(entry("same", shared, 17)) });
     changes.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
     let t = Instant::now();
-    let d = detect(r.store(), &changes, Reader::Me, &opts()).unwrap();
+    let d = detect(r.store(), None, None, &changes, Reader::Me, &opts()).unwrap();
     let took = t.elapsed();
     eprintln!("measured: rename detection over 50 000 deletions + 50 000 additions: {took:?}");
     assert!(d.truncated);
@@ -213,11 +213,11 @@ fn the_byte_budget_stops_the_inexact_pass() {
     let new = format!("{}x\n", lines("b", 199));
     let changes = vec![deleted(&r, "a", &old), added(&r, "b", &new)];
     let tight = RenameOptions { budget: 100, ..opts() };
-    let d = detect(r.store(), &changes, Reader::Me, &tight).unwrap();
+    let d = detect(r.store(), None, None, &changes, Reader::Me, &tight).unwrap();
     assert!(d.truncated && d.pairs.is_empty());
     let few = RenameOptions { limit: 0, ..opts() };
-    assert!(detect(r.store(), &changes, Reader::Me, &few).unwrap().truncated);
-    assert_eq!(detect(r.store(), &changes, Reader::Me, &opts()).unwrap().pairs.len(), 1);
+    assert!(detect(r.store(), None, None, &changes, Reader::Me, &few).unwrap().truncated);
+    assert_eq!(detect(r.store(), None, None, &changes, Reader::Me, &opts()).unwrap().pairs.len(), 1);
 }
 
 /// Doubling the number of files about doubles the time of the exact pass
@@ -236,7 +236,7 @@ fn exact_detection_time_is_linear_in_the_files() {
     };
     let time = |c: &[TreeChange]| {
         let t = Instant::now();
-        std::hint::black_box(detect(r.store(), c, Reader::Me, &copies()).unwrap());
+        std::hint::black_box(detect(r.store(), None, None, c, Reader::Me, &copies()).unwrap());
         t.elapsed()
     };
     let (small, large) = (make(4_000), make(32_000));
@@ -277,15 +277,15 @@ fn sealed_content_pairs_only_by_exact_id_without_the_key() {
         TreeChange { path: p("config/a.yml"), old: None, new: Some(sealed_entry("a.yml", sealed)) },
         TreeChange { path: p("config/b.yml"), old: None, new: Some(sealed_entry("b.yml", edited)) },
     ];
-    let d = detect(outsider.store(), &changes, Reader::Me, &opts()).unwrap();
+    let d = detect(outsider.store(), None, None, &changes, Reader::Me, &opts()).unwrap();
     assert_eq!(pairs(&d), [("secrets/a.yml".into(), "config/a.yml".into(), 100, false)]);
     assert_eq!(d.stats.sealed_opened, 0, "{:?}", d.stats);
     assert_eq!(d.stats.open_failed, 0, "{:?}", d.stats);
     // The member reads both and pairs the edit.
-    let d = detect(alice.store(), &changes, Reader::Me, &opts()).unwrap();
+    let d = detect(alice.store(), None, None, &changes, Reader::Me, &opts()).unwrap();
     assert_eq!(d.pairs.len(), 2, "{:?}", pairs(&d));
     // As the public sees it, the member pairs exactly too, and opens nothing.
-    let d = detect(alice.store(), &changes, Reader::Public, &opts()).unwrap();
+    let d = detect(alice.store(), None, None, &changes, Reader::Public, &opts()).unwrap();
     assert_eq!(d.pairs.len(), 1);
     assert_eq!(d.stats.sealed_opened, 0);
 }
@@ -302,7 +302,7 @@ fn conflict_entries_pair_only_by_exact_id() {
         TreeChange { path: p("b"), old: None, new: Some(file("b", id)) },
         TreeChange { path: p("c"), old: None, new: Some(conflict) },
     ];
-    let d = detect(r.store(), &changes, Reader::Me, &copies()).unwrap();
+    let d = detect(r.store(), None, None, &changes, Reader::Me, &copies()).unwrap();
     assert_eq!(pairs(&d), [("a".into(), "c".into(), 100, false)]);
 }
 
@@ -324,7 +324,7 @@ fn a_rename_inside_an_embargo_is_invisible_to_outsiders() {
     let s = alice.snapshot(&m.snapshot).unwrap();
     let first = alice.snapshot(&s.parents[0]).unwrap().tree;
     let changes = diff_trees(alice.store(), Some(&first), Some(&s.tree)).unwrap();
-    let d = detect(alice.store(), &changes, Reader::Me, &opts()).unwrap();
+    let d = detect(alice.store(), None, None, &changes, Reader::Me, &opts()).unwrap();
     assert!(d.pairs.iter().any(|p| p.to.as_str() == "b.c") || d.changes.iter().any(|c| c.path.as_str() == "b.c"), "alice sees the fix");
     // The public mirror.
     let mirror = Arc::new(MemoryBackend::new());
@@ -359,7 +359,7 @@ proptest! {
             changes.push(added(&r, &format!("n{i:02}"), &content(*k)));
         }
         let o = RenameOptions { copies: with_copies, ..RenameOptions::default() };
-        let d = detect(r.store(), &changes, Reader::Me, &o).unwrap();
+        let d = detect(r.store(), None, None, &changes, Reader::Me, &o).unwrap();
         let mut to: Vec<&str> = d.pairs.iter().map(|p| p.to.as_str()).collect();
         to.sort();
         let n = to.len();

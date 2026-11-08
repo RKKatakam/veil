@@ -31,7 +31,7 @@ use crate::{
     object::{EntryKind, Snapshot, TreeEntry, Visibility},
     rename::{self, RenameOptions},
     repo::Repo,
-    tree::{diff_trees, lookup, TreeChange},
+    tree::{diff_trees, lookup, prefetch_changes, TreeChange},
     vpath::VPath,
 };
 
@@ -224,7 +224,10 @@ impl<'a> Searcher<'a> {
             .collect();
         // As Git does, renames are paired first: a moved file changes no
         // count.
-        let d = rename::detect(store, &changes, self.filter.reader, &self.filter.renames)?;
+        // In a thin clone, what the pickaxe and the pairing read, each at
+        // its own path (BUG-1506).
+        prefetch_changes(store, base.as_ref(), Some(&s.tree), changes.iter().filter(|c| [&c.old, &c.new].into_iter().flatten().all(|e| e.size <= MAX_SEARCHED_FILE as u64)))?;
+        let d = rename::detect(store, base.as_ref(), Some(&s.tree), &changes, self.filter.reader, &self.filter.renames)?;
         self.stats.add(&d.stats);
         let changes: Vec<TreeChange> = d
             .items()
@@ -319,7 +322,7 @@ impl<'a> Searcher<'a> {
             if let (Some(_), Some(t)) = (&here, tree) {
                 if lookup_entry(self.repo, t, p)?.is_none() {
                     let changes = diff_trees(store, Some(t), Some(&s.tree))?;
-                    let d = rename::detect(store, &changes, self.filter.reader, &self.filter.renames)?;
+                    let d = rename::detect(store, Some(t), Some(&s.tree), &changes, self.filter.reader, &self.filter.renames)?;
                     self.stats.add(&d.stats);
                     if let Some(pair) = d.pairs.iter().find(|x| x.to == *p && !x.copy) {
                         name = pair.from.clone();
