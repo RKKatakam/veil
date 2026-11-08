@@ -435,3 +435,41 @@ fn hostile_seeds_are_refused_before_anything_runs() {
     assert_eq!(std::fs::read(&manifest).unwrap(), before, "the sandbox was touched");
     assert!(t.cat("agent", "ran.txt").is_none());
 }
+
+/// BUG-1363: a seed shows its source as it is, so cargo's credentials,
+/// which the allow-list masks (`~/.cargo` is allowed without its
+/// `credentials.toml`, explicitly allowed or not), are readable at `DEST`.
+#[test]
+#[ignore = "BUG-1363: --seed shows the credential files the allow-list masks (cargo's credentials.toml)"]
+fn bug_1363_a_seed_never_shows_the_credentials_the_allow_list_masks() {
+    let t = T::new();
+    write(&t.home, ".cargo/credentials.toml", "token = \"CARGO-CRED-TOKEN-5c1e9a07\"\n");
+    write(&t.home, ".cargo/registry/index.txt", "REGISTRY-INDEX\n");
+    // The allow-list masks it.
+    let out = t.ok("agent", &[], "cat ~/.cargo/registry/index.txt; cat ~/.cargo/credentials.toml; echo done");
+    assert!(out.contains("REGISTRY-INDEX") && out.contains("done"), "{out}");
+    assert!(!out.contains("CARGO-CRED-TOKEN-5c1e9a07"), "the allow-list showed cargo's credentials: {out}");
+    // A seed of the same folder (a pre-filled registry for the run).
+    let spec = format!("{}:/tmp/seed-cargo", t.home.join(".cargo").display());
+    let out = t.ok("agent", &["--seed", &spec], "cat /tmp/seed-cargo/registry/index.txt; cat /tmp/seed-cargo/credentials.toml; echo done");
+    assert!(out.contains("REGISTRY-INDEX") && out.contains("done"), "the seed works: {out}");
+    assert!(!out.contains("CARGO-CRED-TOKEN-5c1e9a07"), "the seed showed cargo's credentials: {out}");
+}
+
+/// BUG-1364: a `DEST` under a folder the sandbox shows read-only (`/usr`,
+/// `/etc`, `/opt`) cannot be made, and `vl` says that confinement does not
+/// work on this machine and to install bubblewrap.
+#[test]
+#[ignore = "BUG-1364: --seed at a DEST under a read-only folder fails as 'confinement does not work on this machine'"]
+fn bug_1364_a_seed_where_the_sandbox_is_read_only_is_refused_as_such() {
+    let t = T::new();
+    let src = t.env.dir("seed-src");
+    write(&src, "f.txt", "seeded\n");
+    let spec = format!("{}:/usr/veil-seed-1364", src.display());
+    let o = t.exec("agent", &["--seed", &spec], "echo ran > ran.txt; cat /usr/veil-seed-1364/f.txt");
+    let out = text(&o);
+    assert!(!o.status.success(), "{out}");
+    assert!(out.contains("--seed") && out.contains("/usr/veil-seed-1364"), "the refusal names the seed: {out}");
+    assert!(!out.contains("confinement does not work on this machine"), "{out}");
+    assert!(t.cat("agent", "ran.txt").is_none(), "{out}");
+}

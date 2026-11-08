@@ -363,3 +363,60 @@ fn mount_flags_that_cannot_go_together_are_refused() {
         assert!(!o.status.success() && text(&o).contains("cannot be used with"), "{flags:?}: {}", text(&o));
     }
 }
+
+/// BUG-1361: the reading commands take any revision, so the sandbox's `vl`
+/// reads another workspace's recorded files (`other@`) and the project
+/// directory's (`default@`), which confinement hides from the command.
+#[test]
+#[ignore = "BUG-1361: the sandbox's vl reads other workspaces and the project directory by naming them as revisions"]
+fn bug_1361_the_sandboxs_vl_cannot_read_another_workspace_or_the_project_directory() {
+    let t = T::new();
+    let o = t.cmd(&["ws", "exec", "other", "--", "bash", "-c", "echo OTHER-WORKSPACE-MARKER-4242c > w.txt"]).output().unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    write(&t.proj, "p.txt", "PROJECT-DIR-MARKER-777d\n");
+    t.env.ok("alice", &t.proj, &["status"]);
+    let other = t.wc("other");
+    let reads = [
+        "show other@".to_string(),
+        "diff -r other@".into(),
+        "blame -r other@ w.txt".into(),
+        "diff --from @ --to other@".into(),
+        "show default@".into(),
+        "diff -r default@".into(),
+        format!("show {other}"),
+    ];
+    for flags in [&[][..], &["--mount"]] {
+        let script: String = reads
+            .iter()
+            .map(|c| format!("out=$(vl {c} 2>&1); case \"$out\" in *'inside a sandbox'*) echo \"REFUSED: {c}\";; *) echo \"NOT REFUSED: {c}: $out\";; esac; "))
+            .collect();
+        let out = t.ok(flags, &script);
+        assert_eq!(out.matches("REFUSED: ").count(), reads.len(), "{flags:?}: every read ran and answered: {out}");
+        assert!(!out.contains("NOT REFUSED"), "{flags:?}: the sandbox's vl read outside its workspace: {out}");
+        for m in ["OTHER-WORKSPACE-MARKER-4242c", "PROJECT-DIR-MARKER-777d"] {
+            assert!(!out.contains(m), "{flags:?}: the sandbox read {m}: {out}");
+        }
+    }
+}
+
+/// BUG-1362: `vl commit` through the socket advances the tags at `@-`, so
+/// the sandbox moves `main` to its own change (`vl tag set` is refused).
+#[test]
+#[ignore = "BUG-1362: a commit through the workspace socket moves main (the tags at @-), which tag set is refused for"]
+fn bug_1362_a_commit_from_inside_the_sandbox_moves_no_tag() {
+    for flags in [&[][..], &["--mount"]] {
+        let t = T::new();
+        let main = |t: &T| {
+            let o = t.env.ok("alice", &t.proj, &["log", "-n", "1", "-r", "main", "--json"]);
+            let v: serde_json::Value = serde_json::from_str(o.lines().find(|l| l.starts_with('{')).unwrap()).unwrap();
+            v["entries"][0]["snapshot_id"].as_str().unwrap().to_string()
+        };
+        let before = main(&t);
+        // The workspace is on `main` (`-r @-`): a plain commit there would move it.
+        let out = t.ok(flags, "echo agent-edit >> a.txt && vl commit -m 'agent commit'");
+        assert!(out.contains("Committed"), "{flags:?}: {out}");
+        let log = t.env.ok("alice", &t.proj, &["log", "-n", "3", "-r", "::agent@"]);
+        assert!(log.contains("agent commit"), "{flags:?}: {log}");
+        assert_eq!(main(&t), before, "{flags:?}: the sandbox moved main: {log}");
+    }
+}

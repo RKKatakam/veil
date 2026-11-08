@@ -405,3 +405,41 @@ fn a_quarantined_edit_survives_the_workspace_moving() {
     let upper = proj.join(".veil/local/mounts/agent/upper/a.txt");
     assert_eq!(std::fs::read_to_string(upper).unwrap(), LEAK, "kept for the next mount");
 }
+
+/// BUG-1365: the mount holds the whole content of every open file it has
+/// not copied up, for as long as the file is open; with `vl ws exec
+/// --mount` (S8) a confined command drives it, in a process outside its
+/// `--memory` limit.
+#[test]
+#[ignore = "BUG-1365: a mount holds every open file whole in memory, outside a confined run's --memory"]
+fn bug_1365_open_files_of_a_mount_are_not_held_in_memory() {
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    let big = "x".repeat(32 << 20);
+    let files: Vec<(String, String)> = (0..8).map(|i| (format!("big/f{i}.bin"), format!("{i}{big}"))).collect();
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let proj = env.project("alice", "proj", &refs);
+    env.ok("alice", &proj, &["ws", "new", "agent", "-r", "main"]);
+    let (mnt, _m) = mount(&env, "alice", &proj, "agent");
+    let pid = state_pid(&proj, "agent");
+    let rss_mib = || -> u64 {
+        let s = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        s.lines().find(|l| l.starts_with("VmRSS:")).unwrap().split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() / 1024
+    };
+    let before = rss_mib();
+    // 256 MiB open, one byte read of each.
+    let open: Vec<std::fs::File> = (0..8)
+        .map(|i| {
+            let mut f = std::fs::File::open(mnt.join(format!("big/f{i}.bin"))).unwrap();
+            let mut b = [0u8; 1];
+            std::io::Read::read_exact(&mut f, &mut b).unwrap();
+            assert_eq!(b[0], b'0' + i as u8);
+            f
+        })
+        .collect();
+    let during = rss_mib();
+    drop(open);
+    assert!(during < before + 96, "8 open files of 32 MiB grew the mount from {before} to {during} MiB");
+}
