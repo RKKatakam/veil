@@ -1,7 +1,7 @@
 //! Request bodies read under a memory budget (BUG-1187, `docs/HUB.md`
 //! §13.25). Every body the server holds is counted, in KiB, against one of
 //! two pools: the signed-in pool (a session this server knows) and the
-//! anonymous pool (everyone else, an eighth of the budget), so no number
+//! anonymous pool (everyone else, a quarter of the budget), so no number
 //! of clients holds more than the budget, and anonymous ones cannot take
 //! the signed-in share.
 //!
@@ -18,7 +18,7 @@
 //!
 //! * One client (a device, or an address) holds at most a quarter of its
 //!   pool at once, so one cannot refuse the others: an anonymous body is at
-//!   most a quarter of the anonymous pool (16 MiB by default), and a
+//!   most a quarter of the anonymous pool (32 MiB by default), and a
 //!   signed-in one larger than that (a large file's upload, up to the
 //!   route's 2 GiB) only while its device holds nothing else, taking at
 //!   most the whole pool.
@@ -102,10 +102,10 @@ fn kib(n: u64) -> u32 {
 }
 
 impl Pools {
-    /// `budget` bytes: an eighth for anonymous bodies (at least 4 MiB), the
+    /// `budget` bytes: a quarter for anonymous bodies (at least 4 MiB), the
     /// rest for signed-in ones.
     pub fn new(budget: u64) -> Pools {
-        let anonymous_kib = kib((budget / 8).max(4 << 20));
+        let anonymous_kib = kib((budget / 4).max(4 << 20));
         let signed_kib = kib(budget).saturating_sub(anonymous_kib).max(kib(4 << 20));
         Pools {
             signed: Arc::new(Semaphore::new(signed_kib as usize)),
@@ -161,7 +161,7 @@ impl Pools {
     /// Read `body` (`declared` bytes, if its head said; at most `limit`,
     /// and a quarter of the anonymous pool if not `signed`) for `key`,
     /// under a share of the signed-in or the anonymous pool.
-    pub async fn read(&self, key: Key, signed: bool, mut body: Body, declared: Option<u64>, limit: u64) -> Result<(Bytes, Option<Share>), Refused> {
+    pub async fn read(&self, key: Key, signed: bool, body: &mut Body, declared: Option<u64>, limit: u64) -> Result<(Bytes, Option<Share>), Refused> {
         if declared == Some(0) {
             return Ok((Bytes::new(), None));
         }
@@ -187,7 +187,7 @@ impl Pools {
         let start = tokio::time::Instant::now();
         loop {
             let due = start + GRACE + Duration::from_secs_f64(buf.len() as f64 / MIN_RATE as f64);
-            let chunk = match tokio::time::timeout_at(due, next_chunk(&mut body)).await {
+            let chunk = match tokio::time::timeout_at(due, next_chunk(body)).await {
                 Err(_) => return Err(Refused::Late),
                 Ok(Some(Err(_))) => return Err(Refused::Unreadable),
                 Ok(None) => break,
@@ -219,6 +219,21 @@ impl Pools {
             return Err(Refused::Unreadable);
         }
         Ok((buf.freeze(), Some(share)))
+    }
+}
+
+/// Read and drop what is left of a refused body, at most `most` bytes, at
+/// the minimum rate: the client then reads its refusal instead of a broken
+/// connection, and nothing is held.
+pub async fn drain(body: &mut Body, most: u64) {
+    let start = tokio::time::Instant::now();
+    let mut got = 0u64;
+    while got <= most {
+        let due = start + GRACE + Duration::from_secs_f64(got as f64 / MIN_RATE as f64);
+        match tokio::time::timeout_at(due, next_chunk(body)).await {
+            Ok(Some(Ok(c))) => got += c.len() as u64,
+            _ => return,
+        }
     }
 }
 
@@ -278,19 +293,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn bodies_are_read_only_under_a_share_of_the_budget() {
         let pools = Pools::new(32 << 20);
-        assert_eq!((pools.signed_kib, pools.anonymous_kib), (28 << 10, 4 << 10), "an eighth, at least 4 MiB, for anonymous bodies");
-        let (b, share) = pools.read(D, true, body(&[1 << 20, 1 << 20], true), Some(2 << 20), 64 << 20).await.unwrap();
+        assert_eq!((pools.signed_kib, pools.anonymous_kib), (24 << 10, 8 << 10), "a quarter, at least 4 MiB, for anonymous bodies");
+        let (b, share) = pools.read(D, true, &mut body(&[1 << 20, 1 << 20], true), Some(2 << 20), 64 << 20).await.unwrap();
         assert_eq!(b.len(), 2 << 20);
         assert_eq!(pools.held_kib(), (2048, 0));
         // Four addresses take the anonymous pool, a quarter each; a fifth waits, then is busy.
         let mut held = Vec::new();
         for k in 1..=4 {
-            held.push(pools.read(Key::Ip(10 + k), false, body(&[1 << 20], true), Some(1 << 20), 64 << 20).await.unwrap().1);
+            held.push(pools.read(Key::Ip(10 + k), false, &mut body(&[2 << 20], true), Some(2 << 20), 64 << 20).await.unwrap().1);
         }
-        assert_eq!(pools.held_kib(), (2048, 4096));
-        assert_eq!(pools.read(A, false, body(&[10], true), Some(10), 64 << 20).await.unwrap_err(), Refused::Busy);
+        assert_eq!(pools.held_kib(), (2048, 8192));
+        assert_eq!(pools.read(A, false, &mut body(&[10], true), Some(10), 64 << 20).await.unwrap_err(), Refused::Busy);
         // The signed-in pool is apart.
-        assert!(pools.read(E, true, body(&[10], true), Some(10), 64 << 20).await.is_ok());
+        assert!(pools.read(E, true, &mut body(&[10], true), Some(10), 64 << 20).await.is_ok());
         drop((share, held));
         assert_eq!(pools.held_kib(), (0, 0));
         assert!(pools.held.lock().unwrap().is_empty(), "nothing is kept for clients holding nothing");
@@ -303,17 +318,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn one_client_holds_at_most_a_quarter_of_its_pool() {
         let pools = Pools::new(32 << 20);
-        assert_eq!(pools.anonymous_limit(), 1 << 20);
-        assert_eq!(pools.read(A, false, body(&[], true), Some(2 << 20), 64 << 20).await.unwrap_err(), Refused::TooLarge);
-        let (_, a1) = pools.read(A, false, body(&[600 << 10], true), Some(600 << 10), 64 << 20).await.unwrap();
-        assert_eq!(pools.read(A, false, body(&[600 << 10], true), Some(600 << 10), 64 << 20).await.unwrap_err(), Refused::Busy);
-        assert!(pools.read(B, false, body(&[600 << 10], true), Some(600 << 10), 64 << 20).await.is_ok(), "another address is not refused");
+        assert_eq!(pools.anonymous_limit(), 2 << 20);
+        assert_eq!(pools.read(A, false, &mut body(&[], true), Some(3 << 20), 64 << 20).await.unwrap_err(), Refused::TooLarge);
+        let (_, a1) = pools.read(A, false, &mut body(&[1200 << 10], true), Some(1200 << 10), 64 << 20).await.unwrap();
+        assert_eq!(pools.read(A, false, &mut body(&[1200 << 10], true), Some(1200 << 10), 64 << 20).await.unwrap_err(), Refused::Busy);
+        assert!(pools.read(B, false, &mut body(&[1200 << 10], true), Some(1200 << 10), 64 << 20).await.is_ok(), "another address is not refused");
         drop(a1);
         // A large upload: more than the signed-in pool, alone.
-        let (big, all) = pools.read(D, true, body(&[20 << 20, 20 << 20], true), Some(40 << 20), 2 << 30).await.unwrap();
+        let (big, all) = pools.read(D, true, &mut body(&[20 << 20, 20 << 20], true), Some(40 << 20), 2 << 30).await.unwrap();
         assert_eq!(big.len(), 40 << 20);
-        assert_eq!(pools.held_kib().0, 28 << 10, "the whole pool, no more");
-        assert_eq!(pools.read(D, true, body(&[10], true), Some(10), 64 << 20).await.unwrap_err(), Refused::Busy);
+        assert_eq!(pools.held_kib().0, 24 << 10, "the whole pool, no more");
+        assert_eq!(pools.read(D, true, &mut body(&[10], true), Some(10), 64 << 20).await.unwrap_err(), Refused::Busy);
         drop(all);
         assert_eq!(pools.held_kib(), (0, 0));
     }
@@ -324,19 +339,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn chunked_bodies_grow_their_share_or_are_refused() {
         let pools = Pools::new(32 << 20);
-        let (b, share) = pools.read(A, false, body(&[100 << 10, 100 << 10], true), None, 64 << 20).await.unwrap();
+        let (b, share) = pools.read(A, false, &mut body(&[100 << 10, 100 << 10], true), None, 64 << 20).await.unwrap();
         assert_eq!(b.len(), 200 << 10);
         assert_eq!(pools.held_kib().1, 400, "twice what it holds");
         drop(share);
-        // Past the client's quarter.
-        assert_eq!(pools.read(A, false, body(&[400 << 10, 400 << 10], true), None, 64 << 20).await.unwrap_err(), Refused::Busy);
+        // Past the client's quarter (twice what it holds).
+        assert_eq!(pools.read(A, false, &mut body(&[800 << 10, 800 << 10], true), None, 64 << 20).await.unwrap_err(), Refused::Busy);
         // Past the anonymous limit (a quarter of the pool).
-        assert_eq!(pools.read(A, false, body(&[2 << 20], true), None, 64 << 20).await.unwrap_err(), Refused::TooLarge);
+        assert_eq!(pools.read(A, false, &mut body(&[3 << 20], true), None, 64 << 20).await.unwrap_err(), Refused::TooLarge);
         assert_eq!(pools.held_kib(), (0, 0), "a refused body gives its share back");
-        assert_eq!(pools.read(D, true, body(&[1 << 20, 1 << 20], true), None, 1 << 20).await.unwrap_err(), Refused::TooLarge);
-        assert_eq!(pools.read(D, true, body(&[], true), Some(2 << 20), 1 << 20).await.unwrap_err(), Refused::TooLarge);
+        assert_eq!(pools.read(D, true, &mut body(&[1 << 20, 1 << 20], true), None, 1 << 20).await.unwrap_err(), Refused::TooLarge);
+        assert_eq!(pools.read(D, true, &mut body(&[], true), Some(2 << 20), 1 << 20).await.unwrap_err(), Refused::TooLarge);
         // A declared length the body does not keep to.
-        assert_eq!(pools.read(D, true, body(&[10], true), Some(20), 1 << 20).await.unwrap_err(), Refused::Unreadable);
+        assert_eq!(pools.read(D, true, &mut body(&[10], true), Some(20), 1 << 20).await.unwrap_err(), Refused::Unreadable);
         assert_eq!(pools.held_kib(), (0, 0));
         assert!(pools.held.lock().unwrap().is_empty());
     }
@@ -347,7 +362,7 @@ mod tests {
     async fn a_body_that_stops_is_refused_in_bounded_time() {
         let pools = Pools::new(32 << 20);
         let t = tokio::time::Instant::now();
-        let r = pools.read(A, false, body(&[160 << 10], false), Some(1 << 20), 64 << 20).await;
+        let r = pools.read(A, false, &mut body(&[160 << 10], false), Some(1 << 20), 64 << 20).await;
         assert_eq!(r.unwrap_err(), Refused::Late);
         let took = t.elapsed();
         assert!(took >= GRACE + Duration::from_secs(10) && took < GRACE + Duration::from_secs(11), "{took:?}");

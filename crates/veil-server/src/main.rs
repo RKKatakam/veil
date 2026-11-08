@@ -72,7 +72,7 @@ struct Args {
     #[arg(long, default_value_t = 1024)]
     max_connections: usize,
     /// Most bytes of request bodies held at once, all requests together
-    /// (K, M, G suffixes); an eighth of it for requests without a session.
+    /// (K, M, G suffixes); a quarter of it for requests without a session.
     #[arg(long, default_value = "512M", value_parser = bytes)]
     request_memory: u64,
 }

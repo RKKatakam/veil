@@ -58,7 +58,7 @@ pub struct Settings {
     /// Most connections open at once; an address has at most an eighth of
     /// them. The next waits in the listener's queue.
     pub max_connections: usize,
-    /// Most bytes of request bodies held at once (an eighth of it for
+    /// Most bytes of request bodies held at once (a quarter of it for
     /// requests without a session).
     pub request_memory: u64,
 }
@@ -292,9 +292,16 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
         Who::Device(k) | Who::Charged(Some(k)) => *k,
         _ => Key::ip(ip),
     };
-    let (bytes, _share) = match limits.bodies.read(body_key, signed, body, declared, limit).await {
+    let mut body = body;
+    let (bytes, _share) = match limits.bodies.read(body_key, signed, &mut body, declared, limit).await {
         Ok(b) => b,
         Err(r) => {
+            // What is left of a body refused for its size or a share is read
+            // and dropped (nothing held, at the minimum rate), so the client
+            // reads the refusal; a late or broken body is not.
+            if matches!(r, body::Refused::TooLarge | body::Refused::Busy) {
+                body::drain(&mut body, limit).await;
+            }
             let resp = match r {
                 body::Refused::TooLarge => refuse(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "request body too large", None, true),
                 body::Refused::Late => refuse(StatusCode::REQUEST_TIMEOUT, "timeout", "the request's body did not arrive in time", None, true),

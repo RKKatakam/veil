@@ -2517,18 +2517,20 @@ Every request passes through `limits::admit` before any route, in this order:
    counts against nobody.
 3. **The body, under a memory budget** (`body.rs`, BUG-1187). Every request
    body is counted, in KiB, against one of two pools of `--request-memory`:
-   the signed-in pool, and the anonymous pool (an eighth, at least 4 MiB).
+   the signed-in pool, and the anonymous pool (a quarter, at least 4 MiB).
    A body of declared length takes its whole share in one step before any
    byte is read (waiting at most 10 s, else `503 busy`); a chunked one twice
    what it has received, as its buffer grows, and `busy` the moment there is
    no more. **One client (device or address) holds at most a quarter of its
    pool**: an anonymous body is at most a quarter of the anonymous pool
-   (16 MiB by default); a signed-in body larger than its quarter (a large
+   (32 MiB by default); a signed-in body larger than its quarter (a large
    file's upload, up to the route's 2 GiB) only while its device holds
    nothing else, and it takes at most the whole pool. **A body must arrive
    at 16 KiB/s on average after 20 s** (the cache's rule, BUG-1183), else
    `408` and the connection is closed. The share is held until the answer is
-   made.
+   made. What is left of a body refused for its size or its share is read
+   and dropped (nothing held, at the same minimum rate), so the client reads
+   the refusal instead of a broken connection.
 4. **Bulkheads** (`gate.rs`): a gate per project, then one for the server.
    A project runs at most half of `--db-connections` requests at once (so
    another project always finds a connection), the server twice
@@ -2584,7 +2586,7 @@ project. With several servers each counts what it served.
 
 | # | Attacker | Tries | Result | Test (`server_hub::limits`, unit tests in `limits/`) |
 |---|---|---|---|---|
-| 1 | Anyone on Earth, no session | 8 request bodies of 56 MiB that stop before their end (BUG-1187); any number of them | refused past a quarter of the anonymous pool (16 MiB by default); all of them together hold at most the anonymous pool | `bug_1187_request_bodies_are_buffered_without_a_bound_on_how_many` (and 8 signed-in uploads beside: the accounting never past 64 MiB; RSS +23 MiB, before +470 MiB); `body::tests::*` |
+| 1 | Anyone on Earth, no session | 8 request bodies of 56 MiB that stop before their end (BUG-1187); any number of them | refused past a quarter of the anonymous pool (32 MiB by default); all of them together hold at most the anonymous pool | `bug_1187_request_bodies_are_buffered_without_a_bound_on_how_many` (and 8 signed-in uploads beside: the accounting never past 64 MiB; RSS +23 MiB, before +470 MiB); `body::tests::*` |
 | 2 | Anyone on Earth | sends a body slowly, or a head and nothing | `408` after 20 s + `n` / 16 KiB/s, the slot given back | `every_connection_slot_comes_back_in_bounded_time`; `body::tests::a_body_that_stops_is_refused_in_bounded_time` |
 | 3 | Anyone on Earth, one address | opens every connection | an eighth of them at most; the next closed at once | `every_connection_slot_comes_back_in_bounded_time` |
 | 4 | A signed-in device, or an address | floods requests | `429` past its rate; other devices, on the same address too, are served | `past_its_limits_a_client_is_refused_and_told_when_naming_nothing` |

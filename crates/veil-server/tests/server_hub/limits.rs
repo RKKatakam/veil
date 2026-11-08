@@ -289,7 +289,7 @@ fn bug_1187_request_bodies_are_buffered_without_a_bound_on_how_many() {
         t.join().unwrap();
     }
     eprintln!("server: {n} anonymous request bodies of {} MiB and {n} signed-in of 6 MiB, stopped before their end: {} MiB sent, held {held:?} KiB, RSS +{grew} MiB", len >> 20, sent.load(Relaxed) >> 20);
-    assert!(held.0 <= 56 << 10 && held.1 <= 8 << 10, "{held:?} KiB held, past the 64 MiB budget");
+    assert!(held.0 <= 48 << 10 && held.1 <= 16 << 10, "{held:?} KiB held, past the 64 MiB budget");
     assert!(held.0 > 0, "the signed-in pool was used: the test measured something");
     assert!(grew <= 192, "{} unfinished request bodies grew the server by {grew} MiB", 2 * n);
 }
