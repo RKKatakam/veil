@@ -99,3 +99,23 @@ CREATE INDEX IF NOT EXISTS landings_landed ON landings (project_id, branch, line
 -- one statement; `sync::resolve_newest`: a branch tip, or the newest, among
 -- them), by one index range.
 CREATE INDEX IF NOT EXISTS projections_by_view ON projections (project_id, view_key, projected_id);
+
+-- What each landing was made from (BUG-1465, BUG-1466): one row for each
+-- snapshot the landing service landed (as `snapshots`, never deleted), the
+-- submitted snapshot it was made from as `source`. "Already landed" asks
+-- whether one of a change's rows names a snapshot on the branch, in one
+-- statement whose condition is the change itself, nothing cut before it.
+CREATE TABLE IF NOT EXISTS landed_from (
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    source TEXT NOT NULL,
+    landed TEXT NOT NULL,
+    PRIMARY KEY (project_id, source, landed)
+);
+-- A memo of a change hidden from its view (BUG-1468): it collapsed into its
+-- parent's projection. Of one view's real snapshots with one projected id,
+-- the one not collapsed is the change of that view's history they all
+-- stand for: a run of hidden changes is stepped over by reading that one
+-- row (`projections_own`), however long the run. Rows written before this
+-- column count as collapsed (the step then reads the run itself, bounded).
+ALTER TABLE projections ADD COLUMN IF NOT EXISTS collapsed BOOLEAN NOT NULL DEFAULT TRUE;
+CREATE INDEX IF NOT EXISTS projections_own ON projections (project_id, view_key, projected_id) WHERE NOT collapsed;

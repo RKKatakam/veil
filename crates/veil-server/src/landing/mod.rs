@@ -540,6 +540,9 @@ pub const NOTHING_TO_LAND: &str =
 pub const WALK_BUDGET: usize = 4_096;
 /// Most frontier snapshots of that walk the derived graph is asked about.
 const FRONTIER_LIMIT: usize = 64;
+/// Most snapshots made from one change that "already landed" asks about
+/// (one a branch it landed on); past it, `warming`.
+const LANDED_FROM_LIMIT: usize = 64;
 
 /// A stack, and the branch's lineage it was judged under (`branch`:
 /// false when there is no such branch: the service answers so).
@@ -892,10 +895,13 @@ impl Ancestry {
         Ok(v)
     }
 
-    /// Are held change `x`'s edits on the branch already: `landings` says so
-    /// (`submitted`), or a snapshot on the branch is a revision of it made
-    /// from it (the derived graph's change ids; a landing names what it
-    /// landed as its predecessor), however long ago (BUG-1408)?
+    /// Are held change `x`'s edits on the branch already? Yes only when the
+    /// history proves it: `landings` says so (a fast path, `submitted`), or
+    /// a snapshot the landing service made from `x` (`landed_from`: its
+    /// source is `x`, the condition in the statement, nothing cut before it)
+    /// is the tip or below it ([`Ancestry::has`]: `warming` when that cannot
+    /// be told), however long ago, whatever the deriver (BUG-1408,
+    /// BUG-1465, BUG-1466).
     async fn landed(&mut self, x: ObjectId) -> Result<bool> {
         let n: Option<i32> =
             sqlx::query_scalar("SELECT 1 FROM landings WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND submitted = $4 LIMIT 1")
@@ -908,17 +914,18 @@ impl Ancestry {
         if n.is_some() {
             return Ok(true);
         }
-        let cid = crate::sync::blocking(&self.hub, self.project, move |src| Ok(hex::encode(src.snapshot(&x)?.change_id.0))).await?;
-        let revisions: Vec<String> =
-            sqlx::query_scalar("SELECT snapshot FROM graph WHERE project_id = $1 AND change_id = $2 AND snapshot <> $3 ORDER BY snapshot LIMIT 16")
-                .bind(self.project)
-                .bind(&cid)
-                .bind(x.hex())
-                .fetch_all(&self.hub.db)
-                .await?;
-        for r in revisions.iter().filter_map(|r| ObjectId::from_hex(r).ok()) {
-            let made_from = crate::sync::blocking(&self.hub, self.project, move |src| Ok(src.snapshot(&r)?.predecessors.contains(&x))).await?;
-            if made_from && self.near(r).await? == Some(true) {
+        let made: Vec<String> = sqlx::query_scalar("SELECT landed FROM landed_from WHERE project_id = $1 AND source = $2 ORDER BY landed LIMIT $3")
+            .bind(self.project)
+            .bind(x.hex())
+            .bind(LANDED_FROM_LIMIT as i64 + 1)
+            .fetch_all(&self.hub.db)
+            .await?;
+        // Landed on more branches than are asked about: cannot be told.
+        if made.len() > LANDED_FROM_LIMIT {
+            return Err(crate::query::graph::warming());
+        }
+        for r in made.iter().filter_map(|r| ObjectId::from_hex(r).ok()) {
+            if self.has(r).await? {
                 return Ok(true);
             }
         }
@@ -927,27 +934,26 @@ impl Ancestry {
 
     /// The change of `viewer`'s history that held `x` stands for (view key
     /// `key`): `x` itself when it is one, else (`x` hidden from them) the
-    /// one its projection is, below the run: of the real snapshots with
-    /// `x`'s projection, the lowest by the derived graph, which must be
-    /// below `x` (one indexed statement, whatever the run's length). `None`
-    /// while the graph is behind.
+    /// one its projection is: of that view's real snapshots with `x`'s
+    /// projection, the one that did not collapse into its parent's
+    /// (`projections_own`: one index row, however long the run, BUG-1468).
+    /// `None` when that is not one row (memos older than the column, or two
+    /// changes alike for the view): the caller reads `x` itself.
     async fn below_hidden(&mut self, project: &crate::perm::Project, viewer: &crate::perm::Viewer, key: &str, x: ObjectId) -> Result<Option<ObjectId>> {
         let px = crate::sync::projected(&self.hub, project, viewer, x).await?;
-        let low: Option<String> = sqlx::query_scalar(
-            "SELECT p.real_id FROM projections p JOIN graph g ON g.project_id = p.project_id AND g.snapshot = p.real_id \
-             WHERE p.project_id = $1 AND p.view_key = $2 AND p.projected_id = $3 ORDER BY g.generation, p.real_id LIMIT 1",
+        let own: Vec<String> = sqlx::query_scalar(
+            "SELECT real_id FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed \
+             ORDER BY real_id LIMIT 2",
         )
         .bind(self.project)
         .bind(key)
         .bind(px.hex())
-        .fetch_optional(&self.hub.db)
+        .fetch_all(&self.hub.db)
         .await?;
-        let Some(v) = low.and_then(|v| ObjectId::from_hex(&v).ok()) else { return Ok(None) };
-        if v == x {
-            return Ok(Some(x));
+        match own.as_slice() {
+            [v] => Ok(ObjectId::from_hex(v).ok()),
+            _ => Ok(None),
         }
-        let below = crate::derive::read(&self.hub, self.project, move |g| Ok(g.row(&x)?.is_some() && g.is_ancestor(v, x)?)).await?;
-        Ok(below.then_some(v))
     }
 
     /// The shared walk down from the tip, on until it finds `x`, ends, or has

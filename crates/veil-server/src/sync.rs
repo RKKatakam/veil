@@ -213,6 +213,9 @@ struct Deferred {
     fresh: HashMap<ObjectId, Option<ObjectId>>,
     /// Memo rows `(view key, real, projected)` for the push's transaction.
     rows: Vec<(String, ObjectId, ObjectId)>,
+    /// Those of them whose real snapshot collapsed into its first parent's
+    /// projection (a change hidden from that view).
+    collapsed: HashSet<ObjectId>,
 }
 
 /// Is `id` committed history of `project` (a `snapshots` row; never deleted,
@@ -351,6 +354,7 @@ async fn projected_inner(
         let ppreds = projected_predecessors(hub, project, viewer, &s, deferred.as_deref_mut()).await?;
         let (proj_text, bindings, viewer2) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
         let hub2 = hub.clone();
+        let first_pp = (s.parents.len() == 1).then(|| pparents.first().copied()).flatten();
         let (result, new_obj) = blocking(hub, project.id, move |src| {
             let policy = AccessPolicy::parse(&proj_text);
             let p = Project {
@@ -367,14 +371,20 @@ async fn projected_inner(
         if let Some(raw) = new_obj {
             hub.objects.put(project.id, &result, raw).await?;
         }
+        // A change hidden from this view: it collapsed into its parent's
+        // projection (`projections.collapsed`, BUG-1468).
+        let collapsed = first_pp == Some(result);
         let result = match deferred.as_deref_mut() {
             Some(d) => {
                 d.rows.push((view_key.clone(), x, result));
+                if collapsed {
+                    d.collapsed.insert(x);
+                }
                 result
             }
             None => {
                 let inserted = sqlx::query(
-                    "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at) VALUES ($1, $2, $3, $4, $5) \
+                    "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) VALUES ($1, $2, $3, $4, $5, $6) \
                      ON CONFLICT DO NOTHING",
                 )
                 .bind(project.id)
@@ -382,6 +392,7 @@ async fn projected_inner(
                 .bind(x.hex())
                 .bind(result.hex())
                 .bind(veil_core::now_millis())
+                .bind(collapsed)
                 .execute(&hub.db)
                 .await?
                 .rows_affected();
@@ -495,101 +506,111 @@ async fn resolve_stored(hub: &Hub, project: i64, id: &ObjectId) -> Result<Vec<Ob
     Ok(rows.iter().filter_map(|r| ObjectId::from_hex(&r.0).ok()).collect())
 }
 
-/// The real snapshots projected id `id` may stand for, the one to take
-/// first first (BUG-1314, BUG-1407): itself when it is committed history;
-/// else, of every real snapshot with that projection (changes hidden from a
-/// viewer share one; view `view_key`'s first, as a viewer whose access
-/// changed names snapshots of their former view), branch tips, then the
-/// newest by the derived graph, then those the graph does not hold yet
-/// (newer than it) ordered by which descends from which (read down each
-/// first-parent line, at most [`NEWEST_WALK`]), the snapshot id breaking
-/// ties: never by when a memo was stored, the same answer on every server.
-/// Callers project each for the asker (BUG-915). Each statement reads one
-/// index range and returns at most a few rows, or [`NEWEST_CANDIDATES`].
-pub(crate) async fn resolve_newest(hub: &Arc<Hub>, project: i64, view_key: &str, id: &ObjectId) -> Result<Vec<ObjectId>> {
+/// The real snapshot view `view_key`'s projected id `id` names, the one
+/// to take (BUG-1314, BUG-1407, BUG-1467): itself when it is committed
+/// history; else, in **one statement over that view's own memos only**, of
+/// every real snapshot with that projection (changes hidden from the viewer
+/// share one), a branch tip, then the newest by the derived graph, the
+/// snapshot id breaking ties: never another view's, never by when a memo
+/// was stored, nothing cut before the order. `warming` when that cannot be
+/// told: more than [`NEWEST_BOUND`] of them, or, with no tip among them and
+/// one the deriver has not reached yet, more than one that is no other's
+/// first parent (they are one change and the hidden ones on it: the newest
+/// is the one at the end, read from their objects). `None`: no memo of that view names
+/// it. Every caller checks that its answer projects to what was named
+/// ([`resolve_named`]).
+pub(crate) async fn resolve_newest(hub: &Arc<Hub>, project: i64, view_key: &str, id: &ObjectId) -> Result<Option<ObjectId>> {
     if *id == root_snapshot_id() || committed(hub, project, id).await? {
-        return Ok(vec![*id]);
+        return Ok(Some(*id));
     }
-    let hex = id.hex();
-    let hexes = |rows: Vec<String>| -> Vec<ObjectId> { rows.iter().filter_map(|r| ObjectId::from_hex(r).ok()).collect() };
-    let tips = hexes(
-        sqlx::query_scalar(
-            "SELECT p.real_id FROM projections p JOIN branches b ON b.project_id = p.project_id AND b.target = p.real_id \
-             WHERE p.project_id = $1 AND p.projected_id = $3 GROUP BY p.real_id ORDER BY max(CASE WHEN p.view_key = $2 THEN 1 ELSE 0 END) DESC, p.real_id LIMIT 4",
-        )
-        .bind(project)
-        .bind(view_key)
-        .bind(&hex)
-        .fetch_all(&hub.db)
-        .await?,
-    );
-    let derived = hexes(
-        sqlx::query_scalar(
-            "SELECT p.real_id FROM projections p JOIN graph g ON g.project_id = p.project_id AND g.snapshot = p.real_id \
-             WHERE p.project_id = $1 AND p.projected_id = $3 GROUP BY p.real_id, g.generation \
-             ORDER BY max(CASE WHEN p.view_key = $2 THEN 1 ELSE 0 END) DESC, g.generation DESC, p.real_id LIMIT 4",
-        )
-        .bind(project)
-        .bind(view_key)
-        .bind(&hex)
-        .fetch_all(&hub.db)
-        .await?,
-    );
-    let mut ids = hexes(
-        sqlx::query_scalar(
-            "SELECT p.real_id FROM projections p WHERE p.project_id = $1 AND p.projected_id = $2 \
-             AND NOT EXISTS (SELECT 1 FROM graph g WHERE g.project_id = p.project_id AND g.snapshot = p.real_id) \
-             GROUP BY p.real_id ORDER BY p.real_id LIMIT $3",
-        )
-        .bind(project)
-        .bind(&hex)
-        .bind(NEWEST_CANDIDATES as i64)
-        .fetch_all(&hub.db)
-        .await?,
-    );
-    let mut out: Vec<ObjectId> = tips;
-    let push = |out: &mut Vec<ObjectId>, more: Vec<ObjectId>| {
-        for m in more {
-            if !out.contains(&m) {
-                out.push(m);
-            }
-        }
-    };
-    if ids.is_empty() {
-        push(&mut out, derived);
-        return Ok(out);
-    }
-    ids.extend(derived.first().copied());
-    let all: HashSet<ObjectId> = ids.iter().copied().collect();
-    let cands = ids.clone();
-    let reach: HashMap<ObjectId, usize> = blocking(hub, project, move |src| {
-        let mut out = HashMap::new();
-        for c in &cands {
-            let mut n = 0;
-            let mut x = *c;
-            for _ in 0..NEWEST_WALK {
-                let Some(p) = src.snapshot(&x)?.parents.first().copied() else { break };
-                if p == root_snapshot_id() {
-                    break;
-                }
-                n += usize::from(all.contains(&p));
-                x = p;
-            }
-            out.insert(*c, n);
-        }
-        Ok(out)
-    })
+    let row: Option<(String, bool, Option<i64>, i64)> = sqlx::query_as(
+        "WITH c AS (SELECT real_id FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 LIMIT $4) \
+         SELECT c.real_id, EXISTS (SELECT 1 FROM branches b WHERE b.project_id = $1 AND b.target = c.real_id) AS tip, g.generation, \
+         (SELECT count(*) FROM c) AS n FROM c LEFT JOIN graph g ON g.project_id = $1 AND g.snapshot = c.real_id \
+         ORDER BY tip DESC, (g.generation IS NULL) DESC, g.generation DESC, c.real_id LIMIT 1",
+    )
+    .bind(project)
+    .bind(view_key)
+    .bind(id.hex())
+    .bind(NEWEST_BOUND as i64 + 1)
+    .fetch_optional(&hub.db)
     .await?;
-    ids.sort_by(|a, b| reach[b].cmp(&reach[a]).then(a.cmp(b)));
-    push(&mut out, ids);
-    push(&mut out, derived);
-    Ok(out)
+    let Some((real, tip, generation, n)) = row else { return Ok(None) };
+    if n as usize > NEWEST_BOUND {
+        return Err(crate::query::graph::warming());
+    }
+    if n > 1 && !tip && generation.is_none() {
+        // The deriver has not reached them all: they are one change and
+        // the hidden ones on it (each collapsed into its first parent's
+        // projection), so the newest is the one that is no other's first
+        // parent, when that is one; else it cannot be told.
+        let all: Vec<String> = sqlx::query_scalar("SELECT real_id FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 LIMIT $4")
+            .bind(project)
+            .bind(view_key)
+            .bind(id.hex())
+            .bind(NEWEST_BOUND as i64)
+            .fetch_all(&hub.db)
+            .await?;
+        let all: Vec<ObjectId> = all.iter().filter_map(|a| ObjectId::from_hex(a).ok()).collect();
+        let leaves = blocking(hub, project, move |src| {
+            let mut firsts = HashSet::new();
+            for a in &all {
+                if let Some(p) = src.snapshot(a)?.parents.first() {
+                    firsts.insert(*p);
+                }
+            }
+            Ok(all.iter().filter(|a| !firsts.contains(a)).copied().collect::<Vec<_>>())
+        })
+        .await?;
+        return match leaves.as_slice() {
+            [one] => Ok(Some(*one)),
+            _ => Err(crate::query::graph::warming()),
+        };
+    }
+    Ok(ObjectId::from_hex(&real).ok())
 }
 
-/// Most candidates the derived graph does not hold yet [`resolve_newest`]
-/// orders, and how far down each one's first-parent line it reads.
-const NEWEST_CANDIDATES: usize = 64;
-const NEWEST_WALK: usize = 256;
+/// Most real snapshots of one view's projected id `resolve_newest` orders.
+pub const NEWEST_BOUND: usize = 4_096;
+
+/// The real snapshot `viewer` means by `id` (a snapshot id they were
+/// given), checked: [`resolve_newest`] in their view, which must project
+/// to `id` for them now; else a change of theirs whose latest revision
+/// (`change_refs`) does (a name from before their access changed). `None`
+/// when nothing they can see is `id`.
+pub(crate) async fn resolve_named(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, id: &ObjectId) -> Result<Option<ObjectId>> {
+    let key = project.view(viewer).key();
+    if let Some(r) = resolve_newest(hub, project.id, &key, id).await? {
+        if projected(hub, project, viewer, r).await? == *id {
+            return Ok(Some(r));
+        }
+        // A real snapshot they see only as another (a hidden part): not a
+        // name of theirs. A memo of their view that no longer projects to
+        // it: their view is changing under them.
+        return match r == *id {
+            true => Ok(None),
+            false => Err(crate::query::graph::warming()),
+        };
+    }
+    let named = *id;
+    let cid = blocking(hub, project.id, move |src| match src.snapshot(&named) {
+        Ok(s) => Ok(Some(s.change_id.to_string())),
+        Err(VeilError::Missing(_)) => Ok(None),
+        Err(e) => Err(e.into()),
+    })
+    .await?;
+    let Some(cid) = cid else { return Ok(None) };
+    let latest: Option<String> = sqlx::query_scalar("SELECT snapshot FROM change_refs WHERE project_id = $1 AND change_id = $2 AND created_by = $3")
+        .bind(project.id)
+        .bind(&cid)
+        .bind(viewer.person.unwrap_or(0))
+        .fetch_optional(&hub.db)
+        .await?;
+    match latest.and_then(|l| ObjectId::from_hex(&l).ok()) {
+        Some(r) if projected(hub, project, viewer, r).await? == *id => Ok(Some(r)),
+        _ => Ok(None),
+    }
+}
 
 /// Branch tips as `viewer` sees them. The branch rows come from this
 /// server's memory for at most `caches::TIPS_TTL`, dropped at every push's
@@ -1448,9 +1469,11 @@ pub(crate) async fn push_with(
             known.insert(id, vec![*t]);
             continue;
         }
+        // Grafted only on what its pusher saw: their own view's snapshot,
+        // checked to project to what they named (BUG-1467).
         let r = match viewer.admin {
             true => resolve_stored(hub, project.id, &id).await?,
-            false => resolve_newest(hub, project.id, &project.view(viewer).key(), &id).await?,
+            false => resolve_named(hub, project, viewer, &id).await?.into_iter().collect(),
         };
         if !r.is_empty() {
             known.insert(id, r);
@@ -1698,6 +1721,7 @@ pub(crate) async fn push_with(
     let mut deferred = Deferred {
         fresh: completed.iter().map(|c| (c.real, c.origin)).collect(),
         rows: Vec::new(),
+        collapsed: HashSet::new(),
     };
     for (_, _, new, _) in &plans {
         if let Some(n) = new {
@@ -1726,7 +1750,8 @@ pub(crate) async fn push_with(
     completed.retain(|c| landing.contains(&c.real));
     let new_reals: Vec<String> = completed.iter().map(|c| c.real.hex()).collect();
     let origins: Vec<(String, String)> = completed.iter().filter_map(|c| c.origin.map(|o| (c.real.hex(), o.hex()))).collect();
-    let memos: Vec<(String, String, String)> = deferred.rows.iter().map(|(k, r, p)| (k.clone(), r.hex(), p.hex())).collect();
+    let memos: Vec<(String, String, String, bool)> =
+        deferred.rows.iter().map(|(k, r, p)| (k.clone(), r.hex(), p.hex(), deferred.collapsed.contains(r))).collect();
     let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let pid = project.id;
     let plans2 = plans.clone();
@@ -1811,9 +1836,9 @@ pub(crate) async fn push_with(
             // A row stored first by another request wins (and is not cached
             // here from this push's answer).
             let mut memo_stored = Vec::new();
-            for (view_key, real, projected) in &memos {
+            for (view_key, real, projected, collapsed) in &memos {
                 let n = sqlx::query(
-                    "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at) VALUES ($1, $2, $3, $4, $5) \
+                    "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) VALUES ($1, $2, $3, $4, $5, $6) \
                      ON CONFLICT DO NOTHING",
                 )
                 .bind(pid)
@@ -1821,6 +1846,7 @@ pub(crate) async fn push_with(
                 .bind(real)
                 .bind(projected)
                 .bind(veil_core::now_millis())
+                .bind(collapsed)
                 .execute(&mut *c)
                 .await?
                 .rows_affected();

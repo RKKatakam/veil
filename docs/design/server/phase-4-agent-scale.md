@@ -344,6 +344,15 @@ CREATE TABLE IF NOT EXISTS landings (     -- as built (S17, HUB.md §13.19)
 -- branches.lineage: a new value (a sequence) at every creation, forced
 -- update and deletion; landing_queue.lineage: the one a stack was judged
 -- under (it lands only under that one).
+CREATE TABLE IF NOT EXISTS landed_from (  -- as built: what each landing was made from
+    project_id BIGINT NOT NULL,
+    source TEXT NOT NULL,                  -- the submitted snapshot
+    landed TEXT NOT NULL,                  -- the snapshot landed from it; kept as `snapshots`
+    PRIMARY KEY (project_id, source, landed)
+);
+-- projections.collapsed: the memo's snapshot collapsed into its parent's
+-- projection (hidden from that view); `projections_own`, a partial index of
+-- the others, steps over a hidden run in one row.
 CREATE TABLE IF NOT EXISTS checks (
     project_id BIGINT NOT NULL,
     snapshot TEXT NOT NULL,

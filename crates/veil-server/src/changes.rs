@@ -611,7 +611,8 @@ async fn commit(
                     .await?;
                 if let Some(key) = &view_key {
                     let n = sqlx::query(
-                        "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at) VALUES ($1, $2, $3, $4, $5) \
+                        // The caller's own changes: in their history (never collapsed).
+                        "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) VALUES ($1, $2, $3, $4, $5, false) \
                          ON CONFLICT DO NOTHING",
                     )
                     .bind(pid)
@@ -717,26 +718,19 @@ async fn resolve_base(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, base: 
         }
     }
     // A projection many hidden-only changes share stands for each of them:
-    // the newest by the history, on every server alike (BUG-1314). A
-    // landing lands its edits on the tip, never its parent's hidden files,
-    // and any of them gives the same edits: the server's memory answers.
-    let key = project.view(viewer).key();
-    let candidates = match landing {
-        true => sync::resolve(hub, project.id, &key, &base).await?,
-        false => sync::resolve_newest(hub, project.id, &key, &base).await?,
-    };
-    for r in candidates.into_iter().take(16) {
-        if sync::projected(hub, project, viewer, r).await? == base {
-            return Ok(r);
-        }
-    }
-    // None of those is it for the caller now: whatever the server knows.
-    if !landing {
-        for r in sync::resolve(hub, project.id, &key, &base).await?.into_iter().take(16) {
+    // the one in the caller's own view, checked to project to what they
+    // named (BUG-1314, BUG-1467). A landing lands its edits on the tip,
+    // never its parent's hidden files, and any of them gives the same
+    // edits: the server's memory of the caller's view answers first.
+    if landing {
+        if let Some(r) = hub.caches.resolved(project.id, &project.view(viewer).key(), &base) {
             if sync::projected(hub, project, viewer, r).await? == base {
                 return Ok(r);
             }
         }
+    }
+    if let Some(r) = sync::resolve_named(hub, project, viewer, &base).await? {
+        return Ok(r);
     }
     Err(Error::not_found(format!("no snapshot {} that you can see", base.short())))
 }

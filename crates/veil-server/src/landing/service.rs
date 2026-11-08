@@ -247,7 +247,7 @@ struct Built {
     /// Stack changes landed: `(submitted, landed, record)`.
     landings: Vec<(ObjectId, Record)>,
     /// New memo rows `(view key, real, projected)`.
-    memos: Vec<(String, ObjectId, ObjectId)>,
+    memos: Vec<(String, ObjectId, ObjectId, bool)>,
     old_tip: Option<ObjectId>,
     after: State,
     /// It changed `.veilpolicy` or `.veilrules`: landed alone.
@@ -803,12 +803,13 @@ impl Service {
         let mk: Vec<String> = b.memos.iter().map(|m| m.0.clone()).collect();
         let mr: Vec<String> = b.memos.iter().map(|m| m.1.hex()).collect();
         let mp: Vec<String> = b.memos.iter().map(|m| m.2.hex()).collect();
+        let mc: Vec<bool> = b.memos.iter().map(|m| m.3).collect();
         let accept = b.accept.clone();
         let landed = b.outcomes.iter().filter(|o| matches!(o, Outcome::Landed { .. })).count();
         let notify = hub.caches.notices.load(Ordering::SeqCst);
         let tx_results = results.clone();
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-            let (ls, ll) = (ls.clone(), ll.clone());
+            let (ls, ll, mc) = (ls.clone(), ll.clone(), mc.clone());
             let (branch, holder, old, new, seqs, snapshots, mk, mr, mp, accept, name, mut results) = (
                 branch.clone(),
                 holder.clone(),
@@ -914,11 +915,23 @@ impl Service {
                     .bind(lineage)
                     .execute(&mut *c)
                     .await?;
+                    // What each landing was made from, for good (one row a
+                    // landed snapshot, as `snapshots`): "already landed" is
+                    // read from it, never from rows that expire (BUG-1465).
+                    sqlx::query(
+                        "INSERT INTO landed_from (project_id, source, landed) SELECT $1, s, l FROM unnest($2::TEXT[], $3::TEXT[]) AS v(s, l) \
+                         WHERE s <> l ON CONFLICT DO NOTHING",
+                    )
+                    .bind(pid)
+                    .bind(&ls)
+                    .bind(&ll)
+                    .execute(&mut *c)
+                    .await?;
                 }
                 if !mk.is_empty() {
                     let stored: Vec<(String, String)> = sqlx::query_as(
-                        "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at) \
-                         SELECT $1, k, r, p, $5 FROM unnest($2::TEXT[], $3::TEXT[], $4::TEXT[]) AS v(k, r, p) ON CONFLICT DO NOTHING \
+                        "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) \
+                         SELECT $1, k, r, p, $5, c FROM unnest($2::TEXT[], $3::TEXT[], $4::TEXT[], $6::BOOL[]) AS v(k, r, p, c) ON CONFLICT DO NOTHING \
                          RETURNING view_key, real_id",
                     )
                     .bind(pid)
@@ -926,6 +939,7 @@ impl Service {
                     .bind(&mr)
                     .bind(&mp)
                     .bind(veil_core::now_millis())
+                    .bind(&mc)
                     .fetch_all(&mut *c)
                     .await?;
                     // A memo stored meanwhile (a background fill) wins: if it
@@ -985,7 +999,7 @@ impl Service {
         for s in &b.snapshots {
             hub.caches.put_committed(self.project, s);
         }
-        for (k, real, proj) in &b.memos {
+        for (k, real, proj, _) in &b.memos {
             hub.caches.put_memo(self.project, k, real, proj);
         }
         if moved {
@@ -1136,7 +1150,9 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
                         src.pending.insert(px, raw.clone());
                     }
                     if new {
-                        made.push((*x, px, raw));
+                        // Collapsed into its parent's projection: hidden from
+                        // that view (BUG-1468).
+                        made.push((*x, px, raw, px == p));
                     }
                     p = px;
                 }
@@ -1149,12 +1165,12 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
         if !ok {
             continue;
         }
-        for (x, px, raw) in made {
+        for (x, px, raw, collapsed) in made {
             if let Some(raw) = raw {
                 b.object(&mut src, px, raw);
             }
             memo.insert((k.clone(), x), px);
-            b.memos.push((k.clone(), x, px));
+            b.memos.push((k.clone(), x, px, collapsed));
             hub.landing.stats.projected.fetch_add(1, Ordering::Relaxed);
         }
         b.flush(&hub, &mut src, on.made_bytes)?;
@@ -1406,7 +1422,7 @@ fn entry(
                         src.pending.insert(px, raw.clone());
                     }
                     if new {
-                        new_memos.push((k.clone(), *x, px, raw));
+                        new_memos.push((k.clone(), *x, px, raw, px == kept.at));
                     }
                     memo.insert((k.clone(), *x), px);
                     kept.at = px;
@@ -1419,12 +1435,12 @@ fn entry(
         keys.remove(k);
         hub.landing.stats.dropped.fetch_add(1, Ordering::Relaxed);
     }
-    for (k, x, px, raw) in new_memos {
+    for (k, x, px, raw, collapsed) in new_memos {
         if keys.contains_key(&k) {
             if let Some(raw) = raw {
                 b.object(src, px, raw);
             }
-            b.memos.push((k, x, px));
+            b.memos.push((k, x, px, collapsed));
             hub.landing.stats.projected.fetch_add(1, Ordering::Relaxed);
         }
     }

@@ -2503,13 +2503,17 @@ for them):
   line read on below it (what is below it may not be: a change left out by
   someone who could not see it, BUG-1311); a run of changes hidden from
   the submitter is stepped over in one step (their projection of the first
-  one, and the lowest real snapshot with that projection by the derived
-  graph, one indexed statement), counting toward nothing (BUG-1409).
-* **"Already landed" is read from the history** (BUG-1408): a `landings`
-  row (the change's edits are on the branch, in this lineage, for every
-  viewer) is the fast path; else a snapshot on the branch that is a
-  revision of the change made from it (the derived graph's change ids: a
-  landing names what it landed as its predecessor), however long ago.
+  one; of that view's memos with that projection, the one that did not
+  collapse into its parent's: one row of a partial index, however long the
+  run, BUG-1468), counting toward nothing (BUG-1409).
+* **"Already landed" answers yes only when the history proves it**
+  (BUG-1408, BUG-1465, BUG-1466): a `landings` row (the change's edits are
+  on the branch, in this lineage) is a fast path whose absence means
+  nothing; the question is whether a snapshot the landing service made
+  from the change (`landed_from`: one row per landed snapshot, kept as
+  `snapshots` are, its condition the change itself, nothing cut before it)
+  is on the branch: yes, no, or, when the bounded ancestry below cannot
+  tell, `warming`; never "no" from a truncated search.
 * At most 64 changes the submitter sees land, counted as they are found;
   at most 4,096 they see are read, then `warming`; changes they cannot see
   count toward neither.
@@ -2540,23 +2544,31 @@ for. Past that, `warming` (503: try again).
 statement for the branch, and for each change the submitter sees on the
 line (at most 4,096): a `landings` lookup, a graph lookup or the shared
 walk (at most 4,096 snapshots a submit in all), their projection and one
-indexed statement for the run below it, the change-id lookup (at most 16
-revisions), and one diff of its own edits. A hidden run costs one step,
-however long, once the deriver holds it; while it does not, the run is
-read and diffed, at most 4,096 changes, then `warming` (the deriver is
-asked to catch up). An agent's landing on its own last one costs the
-branch's row and one `landings` lookup.
+row of `projections_own` for the run below it, the `landed_from` lookup (at
+most 64 rows, each asked of the same bounded ancestry), and one diff of its
+own edits. A hidden run costs one row, however long; when its memos do not
+say which change it stands for (memos older than the column, or two changes
+alike for the view), the run is read and diffed, at most 4,096 changes,
+then `warming` (the deriver is asked to catch up). An agent's landing on
+its own last one costs the branch's row and one `landings` lookup.
 
-**Which real snapshot a projected id names** (BUG-1314, BUG-1407): several
-changes hidden from a viewer can share one projection. The API's `base`
-(an API commit), and a push's parents, resolve, among all of that view's
-real snapshots with that projection, to a branch tip (one statement), else
-the newest by the derived graph (one statement), else, of those the graph
-does not hold yet (at most 64), the one that descends from the others
-(read down their first-parent lines, at most 256 each), the snapshot id
-breaking ties: never by when a memo was stored. A landing of edits uses the
-server's memory of the projection (any of them gives the same edits: a
-landing lands them on the tip).
+**Which real snapshot a projected id names** (BUG-1314, BUG-1407,
+BUG-1467): several changes hidden from a viewer can share one projection.
+`sync::resolve_newest` answers in **one statement over the caller's own
+view's memos only**: of every real snapshot with that projection (at most
+4,096 read, else `warming`, nothing cut before the order), a branch tip,
+then the newest by the derived graph, the snapshot id breaking ties; with
+no tip among several and one the deriver has not reached, the one that is
+no other's first parent (one change and the hidden ones on it, read from
+their objects), else `warming`.
+**Every caller checks that the answer projects to what was named**
+(`sync::resolve_named`: the API's `base`, a push's parents, a landing's)
+and answers `warming` if not; a name from before the caller's access
+changed resolves only as their own change's latest revision
+(`change_refs`), checked the same way. Never another view's memo, never by
+when a memo was stored. A landing of edits takes the server's memory of
+the caller's view first (any of them gives the same edits), checked the
+same way.
 
 The snapshots become committed history in the submit's commit (they
 resolve and project like any other). With `wait` (the default) the request

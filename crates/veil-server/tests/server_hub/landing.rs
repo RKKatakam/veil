@@ -2882,7 +2882,6 @@ fn push_new_branches(c: &Craft<'_>, updates: &[(String, ObjectId)]) {
 /// second time, or (here: main holds its file) is answered `conflict`, and
 /// the dev's change on top never lands.
 #[test]
-#[ignore = "BUG-1465: a change landed long ago lands again while the deriver is behind the tip"]
 fn bug_1465_a_change_landed_long_ago_is_not_landed_again_while_the_deriver_is_behind() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -2919,7 +2918,6 @@ fn bug_1465_a_change_landed_long_ago_is_not_landed_again_while_the_deriver_is_be
 /// revisions (each on a branch, ids starting `000`), the one landed, and,
 /// after the rows' hour, a change on top of it.
 #[test]
-#[ignore = "BUG-1466: more than 16 revisions of a change hide its landing from the already-landed check"]
 fn bug_1466_a_change_with_many_revisions_landed_long_ago_is_not_landed_again() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -2964,7 +2962,6 @@ fn bug_1466_a_change_with_many_revisions_landed_long_ago_is_not_landed_again() {
 /// depends on how far the deriver is, so two servers, or one a second
 /// later, answer differently.
 #[test]
-#[ignore = "BUG-1467: resolve_newest truncates by id the candidates the deriver has not reached"]
 fn bug_1467_a_base_shared_by_many_underived_hidden_only_changes_resolves_to_the_newest() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -3014,9 +3011,23 @@ fn bug_1467_a_base_shared_by_many_underived_hidden_only_changes_resolves_to_the_
 /// the dev's one change on it, which lands in milliseconds with a run of
 /// 50 (`bug_1409_…`'s shape).
 #[test]
-#[ignore = "BUG-1468: stepping over a hidden run reads the whole run"]
 fn bug_1468_stepping_over_a_hidden_run_costs_the_same_however_long_the_run() {
-    let hub = TestHub::start();
+    // A database of its own: the rows read are counted per database, and
+    // other tests' statements (whose plans change on a table this size)
+    // are none of this submit's.
+    let admin_url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+    let db_name = format!("{}{}", std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_default(), unique("veil_run_"));
+    let sql = |url: &str, q: String| {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let db = veil_server::db::connect(url, 1).await.unwrap();
+            sqlx::raw_sql(&q).execute(&db).await.unwrap();
+            db.close().await;
+        });
+    };
+    sql(&admin_url, format!("CREATE DATABASE {db_name}"));
+    let url = format!("{}/{db_name}", admin_url.rsplit_once('/').unwrap().0);
+    let hub = TestHub::start_on(&url, Duration::from_secs(3600));
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let api = hub.api();
@@ -3085,10 +3096,9 @@ fn bug_1468_stepping_over_a_hidden_run_costs_the_same_however_long_the_run() {
     assert_eq!(r.status, 200, "{body}");
     assert_eq!(r.json()["state"], "queued", "{body}");
     let rows = read() - before;
-    hub.rt.block_on(async {
-        sqlx::query("DELETE FROM projections WHERE project_id = $1 AND created_at = 0").bind(pid).execute(&h.db).await.unwrap();
-        sqlx::query("DELETE FROM graph WHERE project_id = $1 AND changed = 'none' AND generation >= 9000000000000000").bind(pid).execute(&h.db).await.unwrap();
-    });
+    // (The rows go with the database.)
+    drop(hub);
+    sql(&admin_url, format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"));
     assert!(rows < 100_000, "the submit of one change on a hidden run of 1,500,050 read {rows} rows of graph and projections");
 }
 
@@ -3102,7 +3112,6 @@ fn bug_1468_stepping_over_a_hidden_run_costs_the_same_however_long_the_run() {
 /// a change on H as they see it is grafted on D, a snapshot they never saw,
 /// and their change deletes D's `zz-docs/d.txt`.
 #[test]
-#[ignore = "BUG-1467: a push is grafted on another view's candidate"]
 fn bug_1467_a_push_on_a_shared_projection_is_grafted_on_what_its_pusher_saw() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -3146,4 +3155,105 @@ fn bug_1467_a_push_on_a_shared_projection_is_grafted_on_what_its_pusher_saw() {
         root.get("zz-docs").is_some()
     };
     assert_eq!(got, h, "the dev's change on H as they see it is grafted on {named} (zz-docs/d.txt there: {}; in the dev's change: {})", docs(got), docs(real));
+}
+
+// ---- S17 redesign, cycle 3: guarantees ---------------------------------------------------
+
+/// Guarantee: a change landed by any route, at any depth below the tip, is
+/// never landed again, whatever the deriver and whatever rows expired. The
+/// dev's change P lands by the landing service, by a plain push of it, and
+/// by an API commit `onto` main; then, with the deriver held, 300 more
+/// snapshots go on main and the `landings` rows go; a change of theirs on P
+/// lands alone (one snapshot), P's file once.
+#[test]
+fn a_change_landed_by_any_route_at_any_depth_is_never_landed_again() {
+    for route in ["landing", "push", "api"] {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        let pid = project_id(&hub, &p.name);
+        let api = hub.api();
+        let token = p.dev.token();
+        let first = match route {
+            "landing" => {
+                let first = push_chain(&api, &p.dev, &p.name, "dev-work", "main", 1, Some("src/once"));
+                let v = land_held(&api, &token, &p.name, first, true).json();
+                assert_eq!(v["state"], "landed", "{route}: {v}");
+                first
+            }
+            "push" => {
+                let first = push_chain(&api, &p.dev, &p.name, "main", "main", 1, Some("src/once"));
+                move_branch(&api, &token, &p.name, "dev-work", None, Some(first), false);
+                first
+            }
+            _ => {
+                let base = tip_for(&hub, &token, &p.name);
+                let r = api.post_json(
+                    Some(&token),
+                    &format!("/v1/projects/{}/changes", p.name),
+                    &json!({"base": base.hex(), "edits": [put("src/once/0.rs", "0\n")], "description": "once", "onto": {"branch": "main", "expected": base.hex()}}),
+                );
+                assert_eq!(r.status, 200, "{route}: {}", String::from_utf8_lossy(&r.body));
+                assert_eq!(r.json()["branch"]["status"], "ok", "{route}: {}", String::from_utf8_lossy(&r.body));
+                let first: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+                move_branch(&api, &token, &p.name, "dev-work", None, Some(first), false);
+                first
+            }
+        };
+        let _ = first;
+        wait_derived(&hub, pid, real_tip(&hub, pid));
+        let lock = hold_deriver(&hub, pid);
+        push_chain(&api, &p.admin, &p.name, "main", "main", 300, None);
+        let second = push_chain(&api, &p.dev, &p.name, "dev-work", "dev-work", 1, Some("src/twice"));
+        let h = hub.hub();
+        hub.rt.block_on(sqlx::query("DELETE FROM landings WHERE project_id = $1").bind(pid).execute(&h.db)).unwrap();
+        let r = land_held(&api, &token, &p.name, second, true);
+        drop(lock);
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        assert_eq!(r.status, 200, "{route}: {body}");
+        assert_eq!(r.json()["state"], "landed", "{route}: {body}");
+        assert_eq!(r.json()["landed"].as_array().unwrap().len(), 1, "{route}: P landed again: {body}");
+        assert_eq!(real_file(&hub, pid, "src/twice/0.rs").as_deref(), Some(&b"0\n"[..]), "{route}");
+        assert_eq!(real_file(&hub, pid, "src/once/0.rs").as_deref(), Some(&b"0\n"[..]), "{route}");
+    }
+}
+
+/// Guarantee: an API commit is grafted only on what its author saw (the
+/// push: `bug_1467_a_push_on_a_shared_projection_is_grafted_on_what_its_pusher_saw`).
+/// Anyone on Earth sees w2's tip D (an edit of `zz-docs/`, which only the
+/// devs see) as the same snapshot as H; the dev's API commit on H as they
+/// see it is made on H, never on D.
+#[test]
+fn an_api_commit_on_a_shared_projection_is_made_on_what_its_author_saw() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    p.admin.ok(&p.dir, &["access", "zz-docs/", "devs"]);
+    p.admin.commit_main(&p.dir, "the devs see zz-docs");
+    p.admin.ok(&p.dir, &["push"]);
+    let token = p.dev.token();
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    let main_tip = c.tip;
+    c.file("src/h.rs", "h\n");
+    let h = crafted_on(&mut c, main_tip, veil_core::ChangeId::random(), "h", "");
+    let h_tree = c.root;
+    c.file("src/t.rs", "t\n");
+    let t = crafted_on(&mut c, h, veil_core::ChangeId::random(), "t", "");
+    let mut c2 = Craft::new(&api, &p.admin, &p.name, "main");
+    c2.objects = c.objects.clone();
+    c2.root = h_tree;
+    c2.file("zz-docs/d.txt", "d\n");
+    let d = crafted_on(&mut c2, h, veil_core::ChangeId::random(), "d", "");
+    push_new_branches(&c2, &[("w".to_string(), t), ("w2".to_string(), d)]);
+    api.tips(None, &p.name).unwrap();
+    let seen = api.tips(Some(&token), &p.name).unwrap().branches["w"];
+    let base = seen_parent(&api, &token, &p.name, seen);
+    let mine = kept_change(&api, &token, &p.name, base, json!([put("src/mine.rs", "the dev's\n")]));
+    let h2 = hub.hub();
+    let real: String = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT real_id FROM projections WHERE project_id = $1 AND projected_id = $2 LIMIT 1").bind(pid).bind(mine.hex()).fetch_one(&h2.db))
+        .unwrap();
+    let got = source(&hub, pid).snapshot(&ObjectId::from_hex(&real).unwrap()).unwrap().parents[0];
+    assert_eq!(got, h, "the dev's API commit on H as they see it is made on {}", if got == d { "w2's tip D".to_string() } else { got.short() });
 }
