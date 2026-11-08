@@ -151,12 +151,16 @@ impl Promisor for HubPromisor {
         Err(unavailable(&self.url, "the server kept preparing this history"))
     }
 
-    fn resolve(&self, prefix: &str) -> veil_core::Result<Option<veil_core::hub::wire::Resolved>> {
+    fn resolve(&self, prefix: &str, from: &[ObjectId]) -> veil_core::Result<Option<veil_core::hub::wire::Resolved>> {
         // Only letters and digits reach the URL (a prefix is hex or k–z).
         if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_alphanumeric()) {
             return Ok(Some(Default::default()));
         }
-        let path = format!("/q/resolve?prefix={prefix}");
+        let mut path = format!("/q/resolve?prefix={prefix}");
+        if !from.is_empty() {
+            let from: Vec<String> = from.iter().take(veil_core::hub::wire::MAX_RESOLVE_FROM).map(|f| f.hex()).collect();
+            path.push_str(&format!("&from={}", from.join(",")));
+        }
         // The viewer's graph may still be filling ("warming"): ask again,
         // as any client of the query API does, for about 10 s.
         for attempt in 0..20 {

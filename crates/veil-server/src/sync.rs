@@ -554,26 +554,29 @@ pub async fn history(
     encoded: bool,
 ) -> Result<Vec<u8>> {
     let mut starts = Vec::new();
+    let mut reals = Vec::new();
     for t in tips {
         let Some(real) = resolve(hub, project.id, &project.view(viewer).key(), t).await?.into_iter().next() else {
             return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
         };
         starts.push(projected(hub, project, viewer, real).await?);
+        reals.push(real);
     }
     let stop: HashSet<ObjectId> = stop.iter().copied().collect();
     if let Some(limit) = limit {
-        // A page (a thin clone's): from snapshots the viewer's branches
-        // reach only, as a full clone holds them; any other start (an old
-        // version a rewrite left behind) is left out, as an unknown one is
-        // (S3, BUG-1268).
-        // (Branch tips, as a clone and a pull ask for, are reached: no
+        // A page (a thin clone's): from any snapshot of the viewer's graph
+        // that is not withheld, whether the branches still reach it or not
+        // (an old version a rewrite elsewhere left under the clone's own
+        // work is the person's to read below, BUG-1319). Names keep to what
+        // the branches reach (`q/resolve`, BUG-1268).
+        // (Branch tips, as a clone and a pull ask for, are in it: no
         // viewer graph is needed for them.)
         let branch_tips: HashSet<ObjectId> = self::tips(hub, project, viewer).await?.into_iter().map(|(_, t)| t).collect();
         let starts = match starts.iter().all(|s| branch_tips.contains(s)) {
             true => starts,
             false => {
-                let reached = crate::query::reached_from_branches(hub, project, viewer, starts.clone()).await?;
-                starts.into_iter().zip(reached).filter(|(_, r)| *r).map(|(s, _)| s).collect()
+                let readable = crate::query::page_starts(hub, project, viewer, reals).await?;
+                starts.into_iter().zip(readable).filter(|(_, r)| *r).map(|(s, _)| s).collect()
             }
         };
         return blocking(hub, project.id, move |src| history_page(src, starts, &stop, limit.clamp(1, MAX_HISTORY), encoded)).await;

@@ -2643,8 +2643,9 @@ describe what it replaces.
 
 **1. Names: the server answers what held history cannot decide.**
 
-* **Route** `GET /v1/projects/{p}/q/resolve?prefix=P` (protocol revision
-  5): over the caller's own projected history (the viewer graph of S13,
+* **Route** `GET /v1/projects/{p}/q/resolve?prefix=P[&from=ID,…]` (protocol
+  revision 5; `from` since the redesign's review cycle 2, which an older
+  server ignores): over the caller's own projected history (the viewer graph of S13,
   filled as for every query; `warming` while it fills), the snapshots
   whose id starts with `P` (hex, 4 to 64 digits) or whose change id starts
   with `P` (as written, letters k–z, 4 to 32). At most 16 of each, and
@@ -2727,9 +2728,8 @@ fetch-ahead. Tests: `server_hub` `thin::a_thin_clone_answers_as_a_full_clone`
   order, a chunk at a time, those withheld (in the query), unreached by
   the viewer's branches, or of a change the caller cannot see dropped
   before anything is counted; it stops at 17 that count (BUG-1268, 1269).
-  A history page starts only from snapshots the branches reach (branch
-  tips need no check), so an old version a rewrite left behind is never
-  sent to a thin clone, as a full clone never receives it.
+  (A history page also started only from snapshots the branches reach;
+  cycle 2 replaced that rule, BUG-1319, below.)
 * **Generations at the boundary come from the server** (`POST
   …/q/generations`, protocol revision 6; the viewer graph's, the history
   index's own arithmetic). A thin clone's index then has an exact
@@ -2750,6 +2750,49 @@ fetch-ahead. Tests: `server_hub` `thin::a_thin_clone_answers_as_a_full_clone`
   working-copy snapshot never copies an unchanged fetched file into the
   main store (BUG-1293), and `vl partial full` copies what only the cache
   holds for everything the kept history reaches.
+
+**Revised a third time (S3 redesign review, cycle 2).**
+
+* **Names and pages are two questions, with two rules** (BUG-1319).
+  *Which snapshot a name means* (`q/resolve`) is answered from the
+  caller's projected history as the branches reach it, and as the
+  snapshots the clone names in `from` reach it (its own refs on the
+  server: at most 64, each the caller's own id, else left out as unknown;
+  `Repo::server_roots` finds them, replacing the clone's own commits by
+  their parents). *What is below a snapshot* (a `history` page) is
+  answered from any snapshot of the caller's viewer graph that is not
+  withheld, reached or not: the person was sent it. On the client,
+  `Repo::deepen` asks for a page only where a full clone made now would
+  hold the snapshot (`Repo::may_page`): below a held snapshot (a parent
+  the store saw it lack), or a name the server's branches or the clone's
+  own refs and operation log reach. A predecessor `vl evolog` follows to an
+  old version nothing here reaches is not found, as in a full clone; the
+  history below a clone's old tip after a rewrite elsewhere is read.
+  Divergent change ids choose the version the clone's own heads reach,
+  exactly (`in_local_history`).
+* **One generation arithmetic** (BUG-1316): `graph_index::generation` in
+  `veil-core` (WASM-safe: the timestamp clamped to 0 ..= `MAX_STAMP`, one
+  more than the highest parent, a root 0), used by the client's history
+  index, the server's real graph and every viewer graph. Index layers an
+  older vl wrote stay valid (each entry is computed from its parents'
+  stored values; only a thin clone, new with format 9, compares them with
+  the server's: `docs/FORMAT.md`). A property test checks that the three
+  agree on random histories with far-future, negative and equal timestamps
+  and several roots.
+* **Change id prefixes from the caller's own graph** (BUG-1317): every
+  viewer graph row has a row in `view_changes`, keyed by (project, view
+  key, change id, snapshot), with its flags (migration 19,
+  `view_graph_changes`, a placeholder number; a table rather than an index
+  on `view_graph`, whose online build on YugabyteDB outlasts the statement
+  timeout under load; the viewer graph rows written before it are deleted
+  and filled again, as the cache they are). Fills write it first. So
+  `q/resolve` never reads the real `graph` and starts no fill but the
+  branch tips' every query makes. Each step reads at most `Limits::work`
+  rows of the caller's graph; past it the request fails asking for more of
+  the prefix.
+* A pull from another remote asks for every tip (BUG-1318): what a held
+  tip reaches goes into the main store too, object by object from what it
+  lacks.
 
 #### Not built in S3 (and why)
 

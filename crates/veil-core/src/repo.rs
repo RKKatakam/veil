@@ -613,13 +613,25 @@ impl Repo {
 
     /// Fetch one page of history below `tips` (snapshots this thin clone
     /// lacks) into the main store; returns how many snapshots were new.
+    /// Only tips a full clone made now would hold are asked for (below a
+    /// held snapshot, or a name what the server's branches or this clone's
+    /// own refs reach, BUG-1319); the others are not found, as there.
     pub fn deepen(&self, tips: &[ObjectId], limit: usize) -> Result<usize> {
         let Some(promisor) = self.store.promisor() else {
             return Err(VeilError::Unavailable(
                 "this command needs history this thin clone does not hold, and has no connection to its server".into(),
             ));
         };
-        let page = promisor.history(tips, limit)?;
+        let mut wanted = Vec::with_capacity(tips.len());
+        for t in tips {
+            if self.may_page(t)? {
+                wanted.push(*t);
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(0);
+        }
+        let page = promisor.history(&wanted, limit)?;
         let mut incoming = crate::remote::Incoming::new(&self.store);
         let mut new = 0;
         for (id, raw) in page {
@@ -639,6 +651,107 @@ impl Repo {
             self.graph.revalidate(self);
         }
         Ok(new)
+    }
+
+    /// A thin clone, about to page in snapshot `id`, which it does not
+    /// hold: would a full clone made now hold it? Two questions, two rules
+    /// (BUG-1319, BUG-1268):
+    ///
+    /// * **History below what the clone holds** (a parent of a held
+    ///   snapshot): always. The person was sent the child; what is below
+    ///   is theirs, also when a rewrite elsewhere left it off the branches.
+    /// * **A name** (any other snapshot: a predecessor `vl evolog` follows,
+    ///   an id typed): only if the server's branches reach it (`q/resolve`,
+    ///   which answers from what they reach), or what this clone holds
+    ///   reaches it (its view and its operation log, as a full clone's gc
+    ///   keeps them: a walk down to the server's generation of `id`, which
+    ///   pages in only that range). An old version a rewrite left behind
+    ///   that nothing here reaches is not found, as in a full clone.
+    ///
+    /// A server older than protocol revision 6 cannot tell: the page is
+    /// asked for, as before.
+    fn may_page(&self, id: &ObjectId) -> Result<bool> {
+        if !self.store.is_partial() || self.store.is_below_held(id) {
+            return Ok(true);
+        }
+        let Some(promisor) = self.store.promisor() else { return Ok(true) };
+        let Some((from, whole)) = self.server_roots(true)? else { return Ok(true) };
+        match promisor.resolve(&id.hex(), &from)? {
+            None => return Ok(true),
+            Some(r) if r.snapshots.contains(id) => return Ok(true),
+            // Every root counted: nothing here reaches it.
+            Some(_) if whole => return Ok(false),
+            Some(_) => {}
+        }
+        // More roots than one request names: a walk from all of them,
+        // down to the server's generation of `id` (only that range is
+        // paged in).
+        let floor = match promisor.generations(&[*id])? {
+            None => return Ok(true),
+            Some(g) => match g.first().copied().flatten() {
+                Some(g) => g,
+                // Not in this person's history at all.
+                None => return Ok(false),
+            },
+        };
+        let mut roots: Vec<ObjectId> = self.view.refs();
+        roots.extend(self.store.op_log_heads());
+        roots.sort();
+        roots.dedup();
+        // A walk of its own (inside an `Exact` query, whose hits are put
+        // back): pages in only what is below what it holds.
+        let outer = self.store.take_boundary_hits();
+        let reached = (|| loop {
+            if self.graph.down_to(self, roots.iter().copied(), floor)?.contains_key(id) {
+                return Ok(true);
+            }
+            let below: Vec<ObjectId> = self.store.take_boundary_hits().into_iter().filter(|h| self.store.is_below_held(h)).collect();
+            if below.is_empty() || self.deepen(&below, crate::promisor::HISTORY_PAGE)? == 0 {
+                return Ok(false);
+            }
+        })();
+        let _ = self.store.take_boundary_hits();
+        self.store.restore_boundary_hits(outer);
+        reached
+    }
+
+    /// A thin clone's own refs as its server knows them, for `q/resolve`'s
+    /// `from` (BUG-1319): the view's refs (with `op_log`, every
+    /// operation's too, as a full clone's gc keeps them), each the server
+    /// has no snapshot of (this clone's own work) replaced by its held
+    /// parents. With whether they all fit in one request
+    /// ([`crate::hub::wire::MAX_RESOLVE_FROM`]). `None`: a server older
+    /// than protocol revision 6 (it cannot tell).
+    pub(crate) fn server_roots(&self, op_log: bool) -> Result<Option<(Vec<ObjectId>, bool)>> {
+        use crate::hub::wire::{MAX_GENERATIONS, MAX_RESOLVE_FROM};
+        let Some(promisor) = self.store.promisor() else { return Ok(Some((Vec::new(), true))) };
+        let mut todo: Vec<ObjectId> = self.view.refs();
+        if op_log {
+            todo.extend(self.store.op_log_heads());
+        }
+        let (mut out, mut seen, mut whole) = (Vec::new(), HashSet::new(), true);
+        // Local work is a few commits deep: a few rounds.
+        for _ in 0..16 {
+            todo.retain(|x| seen.insert(*x));
+            if todo.is_empty() {
+                break;
+            }
+            let batch: Vec<ObjectId> = todo.drain(..todo.len().min(MAX_GENERATIONS)).collect();
+            let Some(gens) = promisor.generations(&batch)? else { return Ok(None) };
+            for (x, g) in batch.iter().zip(gens) {
+                match g {
+                    Some(_) => out.push(*x),
+                    None => {
+                        if let Some(s) = self.snapshot_held(x)? {
+                            todo.extend(s.parents.iter().copied());
+                        }
+                    }
+                }
+            }
+        }
+        whole &= todo.is_empty() && out.len() <= MAX_RESOLVE_FROM;
+        out.truncate(MAX_RESOLVE_FROM);
+        Ok(Some((out, whole)))
     }
 
     /// Re-read the operation heads (another process or task may have

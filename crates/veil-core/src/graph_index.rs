@@ -4,8 +4,9 @@
 //! (`docs/design/scale/3-history-index.md`).
 //!
 //! The generation is a *corrected commit date* (Git's generation v2): the
-//! larger of the snapshot's own timestamp (milliseconds, at least 0) and 1
-//! plus the largest generation of its parents present in the store. Along
+//! larger of the snapshot's own timestamp (milliseconds, clamped to 0 ..=
+//! [`MAX_STAMP`]) and 1 plus the largest generation of its parents present
+//! in the store ([`generation`], the server's arithmetic too). Along
 //! every parent edge it strictly decreases, so a walk looking for `a` below
 //! `b` can stop at every snapshot whose generation is below `a`'s: none of
 //! that snapshot's ancestors can be `a`. That is the only property the walks
@@ -75,7 +76,7 @@ use std::{
 };
 
 use crate::{
-    error::{Result, VeilError},
+    error::Result,
     id::{ChangeId, ObjectId},
     object::Snapshot,
     repo::Repo,
@@ -83,6 +84,12 @@ use crate::{
     vpath::VPath,
 };
 
+/// Layers an older vl wrote (a root 1, timestamps unclamped) stay valid
+/// under [`generation`] (BUG-1316): each entry is computed from its
+/// parents' stored values, so any mix keeps generations strictly
+/// decreasing along every edge, the only property the walks rely on, and
+/// values are only compared with each other. Only a thin clone compares
+/// them with the server's, and thin clones (format 9) are new with it.
 const MAGIC: &[u8; 8] = b"VEILCG01";
 const DIR: &str = ".veil/index/graph";
 const HEADER: usize = 8 + 4 + 4;
@@ -94,6 +101,27 @@ pub const FLAG_EMBARGO_LINE: u8 = 2;
 
 /// A generation (see the module docs).
 pub type Gen = u64;
+
+/// The largest timestamp a generation counts: later ones count as this.
+/// A timestamp is the author's choice (BUG-866), so it is clamped, and
+/// adding one per edge never overflows.
+pub const MAX_STAMP: i64 = i64::MAX / 4;
+
+/// The generation of a snapshot dated `timestamp` whose parents have
+/// generations `parents`: the larger of its clamped timestamp and one more
+/// than its highest parent's (0 for a snapshot with no parents and a
+/// timestamp of 0 or less). Strictly greater than every parent's.
+///
+/// **The one arithmetic** (BUG-1316): the client's history index, the
+/// server's real graph and each viewer's graph all compute it here, so a
+/// thin clone that takes some generations from its server and computes
+/// the rest itself never ranks a parent above its child.
+pub fn generation(timestamp: i64, parents: impl IntoIterator<Item = Gen>) -> Gen {
+    // Never above what the server stores (a signed 64-bit column).
+    const MAX_GEN: Gen = i64::MAX as Gen;
+    let stamp = timestamp.clamp(0, MAX_STAMP) as Gen;
+    parents.into_iter().map(|g| g.saturating_add(1).min(MAX_GEN)).max().unwrap_or(0).max(stamp)
+}
 /// Fresh entries a read-only command persists without waiting for a commit.
 const PERSIST_BATCH: usize = 256;
 /// Layers above this count on the chain are merged even when not geometric.
@@ -924,13 +952,13 @@ impl Walker<'_> {
                 continue;
             }
             let s = pending.remove(&x).expect("expanded snapshots are pending");
-            let mut above: Gen = 0;
+            let mut gens: Vec<Gen> = Vec::with_capacity(s.parents.len());
             let mut flags = if s.embargo.is_some() { FLAG_EMBARGO | FLAG_EMBARGO_LINE } else { 0 };
             let mut partial = self.st.partial.contains(&x);
             for p in &s.parents {
                 match self.st.get_for(p, exact) {
                     Some(e) => {
-                        above = above.max(e.generation);
+                        gens.push(e.generation);
                         flags |= e.flags & FLAG_EMBARGO_LINE;
                         partial |= self.st.partial.contains(p);
                     }
@@ -940,11 +968,8 @@ impl Walker<'_> {
                     }
                 }
             }
-            let above = above.checked_add(1).filter(|g| *g < Gen::MAX).ok_or_else(|| {
-                VeilError::Unsupported("the history is deeper than the index supports".into())
-            })?;
             let e = Entry {
-                generation: above.max(s.timestamp.max(0) as Gen),
+                generation: generation(s.timestamp, gens),
                 change_id: s.change_id,
                 flags,
             };

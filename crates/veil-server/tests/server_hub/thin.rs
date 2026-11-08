@@ -1415,16 +1415,13 @@ fn s3rd_gc_completes_across_a_second_remote_pulls_commits_rebases_and_evictions(
     assert!(admin.ok(&thin, &["cat", "-r", &mine, "local/mine.txt"]).contains("local work 4d1e"));
 }
 
-/// Guarantees 4 and 5 for the remote a thin clone fetches from: `vl
-/// remote rm origin` succeeds and leaves the clone's `partial` marker
-/// naming a remote that is gone, so the clone has no server; the same
-/// project added back under another name is "another remote", whose pull
-/// is a full pull (`docs/HUB.md` §13.21) that pulls nothing (its
-/// snapshots are held, their trees and files are not); and from then on a
-/// file of the tip the local work is on, once evicted, cannot be read ("this
-/// command has no connection to the server of this thin clone"), with no
-/// word of what to do, while `vl gc` and `vl fsck` report nothing wrong.
-/// Either the removal is refused, or what the clone holds stays readable.
+/// Guarantees 4 and 5 for the remote a thin clone fetches from (BUG-1292):
+/// `vl remote rm origin` would leave the clone's `partial` marker naming a
+/// remote that is gone, so the clone would have no server and an evicted
+/// file under local work could no longer be read. The removal is refused,
+/// with the remedy, and changes nothing: the remote is still there and the
+/// clone still reads through it. After `vl partial full` (the remedy) the
+/// removal succeeds and everything stays readable without a server.
 #[test]
 fn s3rd_removing_a_thin_clones_remote_leaves_it_readable_or_is_refused() {
     let hub = TestHub::start();
@@ -1434,15 +1431,26 @@ fn s3rd_removing_a_thin_clones_remote_leaves_it_readable_or_is_refused() {
     // Local work on the tip: the tip's own root tree is pinned by nothing.
     write_files(&thin, &[("local/mine.txt", "local work 4d1e\n")]);
     admin.ok(&thin, &["commit", "-m", "local work"]);
-    if !admin.run(&thin, &["remote", "rm", "origin"]).status.success() {
-        return;
-    }
-    admin.ok(&thin, &["remote", "add", "up", &hub.url(&name)]);
-    admin.ok(&thin, &["pull", "up"]);
+    let err = admin.fails(&thin, &["remote", "rm", "origin"]);
+    assert!(
+        err.contains(
+            "this thin clone fetches what it does not hold from remote 'origin'; make it a full clone first (`vl partial full`), then remove the remote"
+        ),
+        "{err}"
+    );
+    assert_eq!(repo_json(&thin)["partial"]["remote"], "origin");
+    assert!(admin.ok(&thin, &["remote", "list"]).contains("origin"));
+    // Still read through it, after an eviction.
     admin.ok(&thin, &["partial", "limit", "10K"]);
-    admin.ok(&thin, &["partial", "limit", "10K"]);
-    let o = admin.run(&thin, &["cat", "-r", "up/main", "data/f5.bin"]);
+    let o = admin.run(&thin, &["cat", "-r", "origin/main", "data/f5.bin"]);
     assert!(o.status.success(), "a file of the checked-out tip is unreadable: {}", String::from_utf8_lossy(&o.stderr));
+    // The remedy: a full clone, whose remote can go.
+    admin.ok(&thin, &["partial", "full"]);
+    admin.ok(&thin, &["remote", "rm", "origin"]);
+    assert!(repo_json(&thin).get("partial").is_none_or(|p| p.is_null()), "{}", repo_json(&thin));
+    let o = admin.run(&thin, &["cat", "-r", "@-", "data/f5.bin"]);
+    assert!(o.status.success(), "a file of the local work is unreadable without a server: {}", String::from_utf8_lossy(&o.stderr));
+    admin.ok(&thin, &["fsck"]);
 }
 
 /// Guarantee 1 (and 3) for `vl serve --local`'s read methods, which
@@ -1522,7 +1530,6 @@ fn s3rd_status_and_log_after_a_pull_match_a_full_clone() {
 /// leaves `after 1`, `after 2`, `main` and `@` on the old version, where a
 /// full clone rebases them.
 #[test]
-#[ignore = "BUG-1316: past a far-future timestamp, a thin clone's own generations and its server's (clamped) disagree; descendants are lost"]
 fn s3rd2_a_far_future_timestamp_does_not_split_a_thin_clones_history() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1601,7 +1608,6 @@ fn s3rd2_removing_a_thin_clones_own_remote_is_refused_with_the_way_out() {
 /// every tip held, as here and in BUG-1292's own reproduction (the same
 /// URL added under another name), it asks for nothing and copies nothing.
 #[test]
-#[ignore = "BUG-1318: a pull from another remote whose tips the thin clone holds fetches nothing (want_tips skips held tips)"]
 fn s3rd2_a_pull_from_another_remote_puts_what_its_snapshots_reach_in_the_main_store() {
     let hub = TestHub::start();
     let (admin, name) = project_with_big_branch(&hub);
@@ -1611,7 +1617,30 @@ fn s3rd2_a_pull_from_another_remote_puts_what_its_snapshots_reach_in_the_main_st
     admin.ok(&thin, &["remote", "add", "up", &hub.url(&name)]);
     admin.ok(&thin, &["pull", "up"]);
     let after = du(&thin.join(".veil/objects"));
-    assert!(after >= before + 380_000, "a full pull from another remote put only {} bytes into the main store", after.saturating_sub(before));
+    // The 400 KB are random hex text, which the main store's packs
+    // compress to about half.
+    assert!(after >= before + 180_000, "a full pull from another remote put only {} bytes into the main store", after.saturating_sub(before));
+    // Exactly: every snapshot `up`'s tips reach, and every tree and file
+    // of each, is in the main store (not the cache).
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&thin)), None, "test").unwrap();
+    let store = repo.store();
+    let mut stack: Vec<veil_core::ObjectId> = repo.view().remote_tags.iter().filter(|(k, _)| k.starts_with("up/")).map(|(_, v)| *v).collect();
+    assert!(stack.len() >= 2, "{:?}", repo.view().remote_tags);
+    let (mut seen, mut objects) = (std::collections::HashSet::new(), Vec::new());
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        objects.push(id);
+        match store.get(&id).unwrap() {
+            Object::Snapshot(s) => stack.extend(s.parents.iter().copied().chain([s.tree])),
+            Object::Tree(t) => stack.extend(t.entries.iter().map(|e| e.id)),
+            _ => {}
+        }
+    }
+    let lacking: Vec<String> = objects.iter().filter(|id| !store.has_main(id)).map(|id| id.short()).collect();
+    assert!(lacking.is_empty(), "{} of {} objects `up` reaches are not in the main store: {lacking:?}", lacking.len(), objects.len());
+    drop(repo);
     // The clone's own server's history is untouched: still thin, origin's
     // tips as they were.
     assert_eq!(repo_json(&thin)["partial"]["remote"], "origin");
@@ -1653,7 +1682,6 @@ fn s3rd2_a_rescanned_fetched_file_whose_mode_changed_is_recorded() {
 /// an unknown one is), so the page is empty: `vl log` ends at the old tip,
 /// and `vl show main--` says the revision is not found.
 #[test]
-#[ignore = "BUG-1319: after a force-push, a thin clone cannot page in the history below its own old tip"]
 fn s3rd2_a_thin_clone_reads_its_own_history_after_a_rewrite_elsewhere() {
     let hub = TestHub::start();
     let (admin, dir, name) = project_with_history(&hub, 6, 10);
@@ -1673,4 +1701,144 @@ fn s3rd2_a_thin_clone_reads_its_own_history_after_a_rewrite_elsewhere() {
         }
     }
     assert!(diffs.is_empty(), "after a rewrite elsewhere, a thin clone reads its own history otherwise than a full clone:\n{}", diffs.join("\n\n"));
+}
+
+/// BUG-1316's class: one arithmetic for generations. A thin clone's history
+/// index mixes the server's generations (its boundary's, `q/generations`)
+/// with its own, so the two must be equal for every snapshot. On random
+/// histories (several roots, equal timestamps, timestamps below 0 and far
+/// in the future, `i64::MAX` among them), the client's history index, the
+/// server's real graph rows and its viewer graph rows give every snapshot
+/// the same generation, strictly above each of its parents'.
+mod one_generation_arithmetic {
+    use std::{collections::HashMap, sync::Arc};
+
+    use proptest::prelude::*;
+    use veil_core::{object::Text, ChangeId, MemoryBackend, ObjectId, Repo, Snapshot, StorageBackend};
+    use veil_server::{derive::graph::GraphRow, query::graph::VRow};
+
+    #[derive(Clone, Debug)]
+    struct Dag {
+        /// Node `i`'s parents (earlier nodes); empty: a root.
+        parents: Vec<Vec<usize>>,
+        times: Vec<i64>,
+    }
+
+    fn dag() -> impl Strategy<Value = Dag> {
+        (2usize..24).prop_flat_map(|n| {
+            let parents = (0..n)
+                .map(|i| match i {
+                    0 => Just(Vec::new()).boxed(),
+                    // About one in eight a root of its own.
+                    _ => prop_oneof![1 => Just(Vec::new()), 7 => proptest::collection::vec(0..i, 1..4)].boxed(),
+                })
+                .collect::<Vec<_>>();
+            let stamp = prop_oneof![
+                4 => 0i64..4,
+                2 => 0i64..1_000,
+                1 => Just(i64::MAX),
+                1 => (i64::MAX / 4 - 3)..=(i64::MAX / 4 + 3),
+                1 => Just(i64::MIN),
+                1 => -5i64..0,
+            ];
+            (parents, proptest::collection::vec(stamp, n))
+        })
+        .prop_map(|(parents, times)| Dag { parents, times })
+    }
+
+    fn snap(parents: Vec<ObjectId>, i: usize, timestamp: i64, tree: ObjectId) -> Snapshot {
+        let mut change = [0u8; 16];
+        change[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+        Snapshot {
+            parents,
+            change_id: ChangeId(change),
+            tree,
+            description: Text::default(),
+            author: "t".into(),
+            timestamp,
+            predecessors: vec![],
+            conflicts: vec![],
+            embargo: None,
+            signature: None,
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(64),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        #[test]
+        fn client_and_server_generations_agree(d in dag()) {
+            let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+            let repo = Repo::init(backend, None, "t").unwrap();
+            let tree = repo.store().empty_tree().unwrap();
+            let mut ids = Vec::new();
+            let mut real: HashMap<ObjectId, Arc<GraphRow>> = HashMap::new();
+            let mut view: HashMap<ObjectId, Arc<VRow>> = HashMap::new();
+            for (i, ps) in d.parents.iter().enumerate() {
+                let mut parents: Vec<ObjectId> = Vec::new();
+                for p in ps {
+                    if !parents.contains(&ids[*p]) {
+                        parents.push(ids[*p]);
+                    }
+                }
+                let s = snap(parents.clone(), i, d.times[i], tree);
+                let id = repo.store().put_snapshot(&s).unwrap();
+                let rp: Vec<(ObjectId, Arc<GraphRow>)> = parents.iter().map(|p| (*p, real[p].clone())).collect();
+                let vp: Vec<(ObjectId, Arc<VRow>)> = parents.iter().map(|p| (*p, view[p].clone())).collect();
+                real.insert(id, Arc::new(GraphRow::compute(&s, &rp)));
+                view.insert(id, Arc::new(VRow::compute(&s, &vp, id)));
+                ids.push(id);
+            }
+            for (i, id) in ids.iter().enumerate() {
+                let client = repo.held().index().generation(&repo, id).unwrap().expect("held");
+                prop_assert_eq!(client, real[id].generation as u64, "node {}: client against the real graph", i);
+                prop_assert_eq!(client, view[id].generation as u64, "node {}: client against the viewer graph", i);
+                for p in &d.parents[i] {
+                    let pg = repo.held().index().generation(&repo, &ids[*p]).unwrap().unwrap();
+                    prop_assert!(client > pg, "node {}: {} not above its parent's {}", i, client, pg);
+                }
+            }
+        }
+    }
+}
+
+/// BUG-1319's second case: a thin clone and a full clone made before a
+/// rewrite elsewhere both pull it. Their old versions are off the branches
+/// now, reached only from what each clone held before (its operation log,
+/// which a full clone's gc keeps). Both show the same: the evolution log
+/// of the rewritten change through its old version, the old versions by
+/// full and by short id, and the history.
+#[test]
+fn s3rd2_a_thin_clone_made_before_a_rewrite_pulls_it_as_a_full_clone() {
+    let hub = TestHub::start();
+    let (admin, dir, name) = project_with_history(&hub, 6, 10);
+    let full = admin.dir("full");
+    admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
+    let thin = admin.dir("thin");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    let first: String = change_of(&admin, &dir, "first").chars().take(12).collect();
+    let old_first = snapshot_of(&admin, &dir, "first");
+    let old_three = snapshot_of(&admin, &dir, "commit 3");
+    admin.ok(&dir, &["describe", "-r", &first, "-m", "first, renamed"]);
+    admin.ok(&dir, &["push", "--force"]);
+    for d in [&full, &thin] {
+        admin.ok(d, &["pull"]);
+    }
+    let mut diffs = Vec::new();
+    for args in [
+        vec!["evolog", "-r", &first],
+        vec!["show", "--json", &old_first],
+        vec!["show", "--json", &old_first[..12]],
+        vec!["show", "--json", &old_three[..12]],
+        vec!["log", "--json"],
+    ] {
+        let (want, got) = (answer(&admin, &full, &args), answer(&admin, &thin, &args));
+        if got != want {
+            diffs.push(format!("`vl {}`:\nfull ({}): {}\nthin ({}): {}", args.join(" "), want.0, want.1.chars().take(600).collect::<String>(), got.0, got.1.chars().take(600).collect::<String>()));
+        }
+    }
+    assert!(diffs.is_empty(), "a thin clone made before a rewrite shows otherwise than a full clone after pulling it:\n{}", diffs.join("\n\n"));
 }

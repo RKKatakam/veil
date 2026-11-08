@@ -1869,7 +1869,7 @@ mod s13_adversarial {
 
 /// `q/resolve` of `prefix` as `a`, as compared.
 fn resolved(th: &TestHub, h: &Hist, a: &Ask, prefix: &str) -> String {
-    th.rt.block_on(async { norm(settled(|| query::resolve_prefix(&h.hub, a, prefix, Limits::default())).await) })
+    th.rt.block_on(async { norm(settled(|| query::resolve_prefix(&h.hub, a, prefix, &[], Limits::default())).await) })
 }
 
 /// Guarantee 2 of the redesign (the cap reveals nothing hidden): a
@@ -1989,7 +1989,6 @@ fn s3rd_resolve_of_a_change_prefix_ignores_hidden_changes() {
 /// What does not count costs work and fills, up to the deadline, in
 /// proportion to the hidden rows with the prefix.
 #[test]
-#[ignore = "BUG-1317: q/resolve reads the real graph by change id; a hidden snapshot no branch reaches makes it wait for a fill"]
 fn s3rd2_resolve_answers_alike_whatever_hidden_history_it_meets() {
     let th = TestHub::start();
     let (policy_text, bindings) = policy(1);
@@ -2061,8 +2060,142 @@ fn s3rd2_resolve_answers_alike_whatever_hidden_history_it_meets() {
         }
     });
     let prefix = veil_core::ChangeId(change).display()[..4].to_string();
-    let once = |h: &Hist, x: &Ask| th.rt.block_on(async { norm(query::resolve_prefix(&h.hub, x, &prefix, Limits::default()).await) });
+    let once = |h: &Hist, x: &Ask| th.rt.block_on(async { norm(query::resolve_prefix(&h.hub, x, &prefix, &[], Limits::default()).await) });
     let without = once(&a, &xa);
     assert!(!without.starts_with("error") && !without.contains("\"changes\":[]"), "the visible change is named: {without}");
     assert_eq!(once(&b, &xb), without, "a hidden snapshot no branch reaches changes the answer for {prefix}");
+}
+
+/// BUG-1319: names and history pages answer two questions, by two rules.
+/// After a rewrite (the change of `old` gets a new version `new`, `main`
+/// moves to it), a *name* means what the branches reach: an id prefix of
+/// the old version is no snapshot (BUG-1268), the new version's is. A
+/// *history page* below a snapshot the caller was sent starts from any
+/// snapshot of their viewer graph, reached or not: the page below the old
+/// version is its history, as a full clone made before the rewrite holds
+/// it. A withheld snapshot (an embargo line) that is no branch tip starts
+/// no page, for anyone. And a name counts what the caller's own snapshots
+/// reach too (`from`: a thin clone's refs, which may stand on the old
+/// version); a snapshot hidden from the caller among them changes nothing.
+#[test]
+fn s3rd2_names_keep_to_the_branches_and_pages_to_the_viewer_graph() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &policy_text, &bindings);
+    let base = Files::from([("pub/a.rs".to_string(), b"fn a() {}\n".to_vec())]);
+    let a = h.commit(&th, &[root_snapshot_id()], base.clone(), [1; 16], 1_000, None);
+    let mut f = base.clone();
+    f.insert("pub/b.rs".into(), b"fn b() {}\n".to_vec());
+    let old = h.commit(&th, &[a], f.clone(), [2; 16], 2_000, None);
+    h.set_branch(&th, "main", old);
+    // Hidden from anyone: a change of fin/ on the old version, on a branch
+    // of its own, then rewritten onto `a`. For anyone, its first version
+    // projects onto the old version, which no branch reaches.
+    let mut fin = f.clone();
+    fin.insert("fin/plan.txt".into(), b"plan\n".to_vec());
+    let hidden = h.commit(&th, &[old], fin.clone(), [5; 16], 2_500, None);
+    h.set_branch(&th, "fin-work", hidden);
+    h.derive(&th);
+    let hidden2 = h.commit(&th, &[a], fin, [5; 16], 2_501, None);
+    h.set_branch(&th, "fin-work", hidden2);
+    for viewer in [admin(), Viewer::default()] {
+        warm_up(&th, &h, &viewer);
+    }
+    // The rewrite: a new version of change 2, `main` on it, and a fix on an
+    // embargo line.
+    f.insert("pub/b.rs".into(), b"fn b() { 2 }\n".to_vec());
+    let new = h.commit(&th, &[a], f.clone(), [2; 16], 2_001, None);
+    f.insert("pub/fix.rs".into(), b"fix\n".to_vec());
+    let e = h.commit(&th, &[new], f.clone(), [3; 16], 3_000, Some("cve-1"));
+    f.insert("pub/after.rs".into(), b"after\n".to_vec());
+    let c = h.commit(&th, &[e], f, [4; 16], 4_000, None);
+    h.set_branch(&th, "main", new);
+    h.set_branch(&th, "embargoed", c);
+    h.derive(&th);
+    for (who, viewer) in [("an admin", admin()), ("anyone on Earth", Viewer::default())] {
+        warm_up(&th, &h, &viewer);
+        let x = ask(&th, &h, &viewer);
+        let project = h.project(&th);
+        let ids = |tip: ObjectId| -> Vec<ObjectId> {
+            let page = th.rt.block_on(veil_server::sync::history(&h.hub, &project, &viewer, &[tip], &[], Some(10), false));
+            veil_core::hub::wire::read_frames(&page.unwrap()).unwrap().into_iter().map(|(id, _)| id).collect()
+        };
+        // Admins' ids are the real ones; anyone's are their projections.
+        let p = |real: ObjectId| -> ObjectId {
+            th.rt.block_on(veil_server::sync::projected(&h.hub, &project, &viewer, real)).unwrap()
+        };
+        let (pa, pold, pnew) = (p(a), p(old), p(new));
+        // Names: the branches' history only.
+        let named = |id: ObjectId| resolved(&th, &h, &x, &id.hex()[..16]);
+        assert!(named(pnew).contains(&pnew.hex()), "{who}: the new version is named: {}", named(pnew));
+        assert!(named(pold).contains("\"snapshots\":[]"), "{who}: an old version is named: {}", named(pold));
+        let named_from = |id: ObjectId, from: &[ObjectId]| {
+            let prefix = id.hex()[..16].to_string();
+            th.rt.block_on(async { norm(settled(|| query::resolve_prefix(&h.hub, &x, &prefix, from, Limits::default())).await) })
+        };
+        assert!(named_from(pold, &[pold]).contains(&pold.hex()), "{who}: the caller's own old version is not named from it");
+        if !viewer.admin {
+            // A hidden snapshot's real id, as a root: unknown to the caller,
+            // though it projects onto the old version (BUG-1070's class).
+            assert_eq!(p(hidden), pold, "{who}");
+            assert_eq!(named_from(pold, &[hidden]), named(pold), "{who}: a hidden root changes the answer");
+        }
+        // Pages: below the old version, its history.
+        let below_old = ids(pold);
+        assert!(below_old.contains(&pold) && below_old.contains(&pa), "{who}: the page below the old version is {below_old:?}");
+        assert!(ids(pnew).contains(&pa), "{who}");
+        if viewer.admin {
+            // Withheld from admins too, until the release: no page starts
+            // there. (A branch tip a clone is sent starts one: sync's own
+            // answer, which this does not change.)
+            assert!(ids(e).is_empty(), "{who}: a page starts from a withheld snapshot");
+        }
+    }
+}
+
+/// BUG-1317's bound: a change id prefix is answered from the caller's own
+/// graph, and each request reads a bounded number of its rows. 200 old
+/// versions with the prefix (a branch's commits, filled into the caller's
+/// graph, then left behind when the branch moved) do not count; with the
+/// default bound the visible change is named, alone; with a bound below
+/// what they take, the request fails asking for more of the prefix, and
+/// never answers from part of them.
+#[test]
+fn s3rd2_resolve_reads_a_bounded_part_of_the_callers_graph() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &policy_text, &bindings);
+    let base = Files::from([("pub/a.rs".to_string(), b"fn a() {}\n".to_vec())]);
+    let a = h.commit(&th, &[root_snapshot_id()], base.clone(), [1; 16], 1_000, None);
+    let mut tip = a;
+    let mut f = base.clone();
+    for i in 0..200u8 {
+        f.insert("pub/b.rs".into(), format!("fn b() {{ {i} }}\n").into_bytes());
+        let mut change = [0u8; 16];
+        change[0] = 0xab;
+        change[1] = 0xcd;
+        change[2] = i;
+        tip = h.commit(&th, &[tip], f.clone(), change, 2_000 + i64::from(i), None);
+    }
+    h.set_branch(&th, "work", tip);
+    h.set_branch(&th, "main", a);
+    let viewer = admin();
+    warm_up(&th, &h, &viewer);
+    // The branch moves on: its 200 commits stay in the caller's graph,
+    // reached by no branch.
+    let mut change = [0xffu8; 16];
+    change[0] = 0xab;
+    change[1] = 0xcd;
+    f.insert("pub/c.rs".into(), b"fn c() {}\n".to_vec());
+    let visible = h.commit(&th, &[a], f, change, 9_000, None);
+    h.set_branch(&th, "work", visible);
+    h.derive(&th);
+    warm_up(&th, &h, &viewer);
+    let x = ask(&th, &h, &viewer);
+    let prefix = veil_core::ChangeId(change).display()[..4].to_string();
+    let answer = resolved(&th, &h, &x, &prefix);
+    assert!(answer.contains(&visible.hex()) && answer.contains("\"more\":false"), "{answer}");
+    let small = Limits { work: 100, ..Limits::default() };
+    let out = th.rt.block_on(async { norm(settled(|| query::resolve_prefix(&h.hub, &x, &prefix, &[], small)).await) });
+    assert!(out.starts_with("error 400") && out.contains("give more of it"), "{out}");
 }

@@ -108,15 +108,17 @@ fn naive_generation(repo: &Repo, id: &ObjectId, memo: &mut HashMap<ObjectId, Opt
     if let Some(g) = memo.get(id) {
         return *g;
     }
-    // A corrected commit date: the timestamp, or one more than the parents.
+    // A corrected commit date: the timestamp (clamped to 0 ..= i64::MAX /
+    // 4), or one more than the highest parent held; 0 for a root dated 0
+    // (the server's arithmetic, BUG-1316).
     let g = repo.exact().snapshot(id).unwrap().map(|s| {
         let mut g = 0;
         for p in &s.parents {
             if let Some(pg) = naive_generation(repo, p, memo) {
-                g = g.max(pg);
+                g = g.max(pg + 1);
             }
         }
-        (g + 1).max(s.timestamp.max(0) as u64)
+        g.max(s.timestamp.clamp(0, i64::MAX / 4) as u64)
     });
     memo.insert(*id, g);
     g

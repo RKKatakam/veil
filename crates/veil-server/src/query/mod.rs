@@ -498,10 +498,19 @@ pub async fn log(hub: &Arc<Hub>, ask: &Ask, q: LogParams, limits: Limits) -> Res
 /// Most matches of each kind a `resolve` answers (two already make a name
 /// ambiguous).
 const RESOLVE_MATCHES: usize = 16;
+fn prefix_too_short() -> Error {
+    Error::bad_request("the prefix matches too much of your history to look up at once; give more of it")
+}
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct ResolveParams {
     pub prefix: String,
+    /// Snapshots of the caller's (their ids, comma-separated, at most
+    /// [`veil_core::hub::wire::MAX_RESOLVE_FROM`]) whose history counts
+    /// too: a thin clone's own refs, which may stand on versions a rewrite
+    /// left off the branches (BUG-1319).
+    #[serde(default)]
+    pub from: Option<String>,
 }
 
 /// The smallest string above every string that starts with `prefix`, in
@@ -531,12 +540,17 @@ fn prefix_end(prefix: &str, digits: &str) -> Option<String> {
 /// the branches reach it (BUG-1268: not an old version a rewrite left
 /// behind) and not withheld (an embargo line). A change the caller cannot
 /// see is not in their history: its projection is its parent's, whose
-/// change id differs. Rows are read in a fixed order a chunk at a time,
-/// and those that do not count are dropped before anything is counted:
-/// the answer, its 16-match bound and `more` depend only on what counts
-/// (BUG-1269); what does not count costs only work, under the query's
-/// deadline.
-pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, limits: Limits) -> Result<Value> {
+/// change id differs. Both steps read the caller's own viewer graph only
+/// (its rows by id, and by change id, BUG-1317), never the real graph, and
+/// start no fill but that of the branch tips every query makes: hidden
+/// history is never read, so it changes neither the answer nor its cost.
+/// Rows are read in a fixed order a chunk at a time, and those that do not
+/// count (old versions, withheld ones) are dropped before anything is
+/// counted: the answer, its 16-match bound and `more` depend only on what
+/// counts (BUG-1269). Each step reads at most `limits.work` rows of the
+/// caller's graph (BUG-1317): past it, the request fails, asking for more of
+/// the prefix.
+pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, from: &[ObjectId], limits: Limits) -> Result<Value> {
     let deadline = Instant::now() + limits.deadline;
     let prefix = prefix.trim().to_ascii_lowercase();
     const HEX: &str = "0123456789abcdef";
@@ -559,12 +573,43 @@ pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, limits: Lim
     if tips.is_empty() {
         return Ok(empty);
     }
-    let ptips = ensure(hub, &ask.project, &ask.viewer, &tips, Some(deadline)).await?;
+    let mut ptips = ensure(hub, &ask.project, &ask.viewer, &tips, Some(deadline)).await?;
     let (vk, project) = (ask.key(), ask.project.id);
-    // Of `ids`, in order, those of the viewer's history as the branches
-    // reach it, not withheld, and (for a change) of a change id with the
-    // prefix.
-    let counted = |ids: Vec<ObjectId>, change: Option<String>| {
+    // The caller's own snapshots whose history counts too: those the
+    // caller has ids for (any other, a hidden one among them, is left out
+    // as unknown), in their graph and not withheld.
+    if from.len() > veil_core::hub::wire::MAX_RESOLVE_FROM {
+        return Err(Error::bad_request(format!("at most {} snapshots to resolve from", veil_core::hub::wire::MAX_RESOLVE_FROM)));
+    }
+    let mut reals = Vec::new();
+    for f in from {
+        if let Some(r) = crate::sync::resolve(hub, project, &vk, f).await?.into_iter().next() {
+            reals.push(r);
+        }
+    }
+    if !reals.is_empty() {
+        // Only the caller's own ids count: a real id of a snapshot hidden
+        // from them (which `sync::resolve` takes, BUG-1070) projects onto
+        // another, and is left out as unknown.
+        let projected = ensure(hub, &ask.project, &ask.viewer, &reals, Some(deadline)).await?;
+        let roots: Vec<ObjectId> = projected.into_iter().filter(|p| from.contains(p)).collect();
+        let vk = vk.clone();
+        let roots: Vec<ObjectId> = blocking(hub, project, move |cx| {
+            let g = G::new(cx, &vk, Some(deadline));
+            let mut out = Vec::new();
+            for r in roots {
+                if g.row(&r)?.is_some_and(|row| !row.withheld()) {
+                    out.push(r);
+                }
+            }
+            Ok(out)
+        })
+        .await?;
+        ptips.extend(roots);
+    }
+    // Of `ids` (rows of the viewer's graph, in order), those of the
+    // viewer's history as the branches (and `from`) reach it, not withheld.
+    let counted = |ids: Vec<ObjectId>| {
         let (vk, ptips) = (vk.clone(), ptips.clone());
         blocking(hub, project, move |cx| {
             let g = G::new(cx, &vk, Some(deadline));
@@ -572,11 +617,6 @@ pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, limits: Lim
             for id in ids {
                 if g.row(&id)?.is_none_or(|r| r.withheld()) {
                     continue;
-                }
-                if let Some(h) = &change {
-                    if !hex::encode(g.snapshot(&id)?.change_id.0).starts_with(h.as_str()) {
-                        continue;
-                    }
                 }
                 let mut reached = false;
                 for t in &ptips {
@@ -597,6 +637,7 @@ pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, limits: Lim
     if snapshot {
         let end = prefix_end(&prefix, HEX);
         let mut after: Option<String> = None;
+        let mut scanned = 0usize;
         while snapshots.len() <= RESOLVE_MATCHES {
             let lo = after.clone().unwrap_or_else(|| prefix.clone());
             let op = if after.is_some() { ">" } else { ">=" };
@@ -612,8 +653,9 @@ pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, limits: Lim
             }
             let found: Vec<String> = q.fetch_all(&hub.db).await?;
             let Some(last) = found.last().cloned() else { break };
+            scanned += found.len();
             let ids: Vec<ObjectId> = found.iter().filter(|s| s.starts_with(&prefix)).filter_map(|s| ObjectId::from_hex(s).ok()).collect();
-            for id in counted(ids, None).await? {
+            for id in counted(ids).await? {
                 if !snapshots.contains(&id) {
                     snapshots.push(id);
                 }
@@ -624,6 +666,9 @@ pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, limits: Lim
             if past() {
                 return Err(graph::too_slow());
             }
+            if scanned as u64 >= limits.work && snapshots.len() <= RESOLVE_MATCHES {
+                return Err(prefix_too_short());
+            }
             after = Some(last);
         }
     }
@@ -631,26 +676,29 @@ pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, limits: Lim
     if let Some(hexp) = change {
         let end = prefix_end(&hexp, HEX);
         let mut after: Option<(String, String)> = None;
+        let mut scanned = 0usize;
         while changes.len() <= RESOLVE_MATCHES {
             let (lo_c, lo_s) = after.clone().unwrap_or_else(|| (hexp.clone(), String::new()));
+            // The caller's own rows by change id (an index of the viewer
+            // graph), withheld ones left out in the query.
             let sql = format!(
-                "SELECT change_id, snapshot FROM graph WHERE project_id = $1 AND (change_id, snapshot) > ($2, $3) {} \
+                "SELECT change_id, snapshot FROM view_changes WHERE project_id = $1 AND view_key = $2 \
+                 AND (change_id, snapshot) > ($3, $4) {} AND (flags & {}) = 0 \
                  ORDER BY change_id, snapshot LIMIT {CHUNK}",
-                if end.is_some() { "AND change_id < $4" } else { "" }
+                if end.is_some() { "AND change_id < $5" } else { "" },
+                crate::derive::graph::FLAG_EMBARGO_LINE
             );
-            let mut q = sqlx::query_as::<_, (String, String)>(&sql).bind(project).bind(&lo_c).bind(&lo_s);
+            let mut q = sqlx::query_as::<_, (String, String)>(&sql).bind(project).bind(&vk).bind(&lo_c).bind(&lo_s);
             if let Some(e) = &end {
                 q = q.bind(e);
             }
             let found: Vec<(String, String)> = q.fetch_all(&hub.db).await?;
             let Some(last) = found.last().cloned() else { break };
-            let reals: Vec<ObjectId> = found.iter().filter(|(c, _)| c.starts_with(&hexp)).filter_map(|(_, s)| ObjectId::from_hex(s).ok()).collect();
-            if !reals.is_empty() {
-                let projected = ensure(hub, &ask.project, &ask.viewer, &reals, Some(deadline)).await?;
-                for id in counted(projected, Some(hexp.clone())).await? {
-                    if !changes.contains(&id) {
-                        changes.push(id);
-                    }
+            scanned += found.len();
+            let ids: Vec<ObjectId> = found.iter().filter(|(c, _)| c.starts_with(&hexp)).filter_map(|(_, s)| ObjectId::from_hex(s).ok()).collect();
+            for id in counted(ids).await? {
+                if !changes.contains(&id) {
+                    changes.push(id);
                 }
             }
             if (found.len() as i64) < CHUNK {
@@ -658,6 +706,9 @@ pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, limits: Lim
             }
             if past() {
                 return Err(graph::too_slow());
+            }
+            if scanned as u64 >= limits.work && changes.len() <= RESOLVE_MATCHES {
+                return Err(prefix_too_short());
             }
             after = Some(last);
         }
@@ -713,46 +764,30 @@ pub async fn generations_route(
     Ok(Json(generations(&hub, &ask, q.snapshots, Limits::default()).await?))
 }
 
-/// Which of `ids` (projected snapshots of `viewer`'s) the viewer's branches
-/// reach: their projected history as a full clone of it holds it (S3: what
-/// a thin clone is told about, never an old version a rewrite left behind,
-/// BUG-1268). The viewer graph, filled as for any query; withheld ones are
-/// not reached.
-pub async fn reached_from_branches(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, ids: Vec<ObjectId>) -> Result<Vec<bool>> {
+/// Which of `reals` (real snapshots the viewer has ids for) a history page
+/// may start from: those in the viewer's graph that are not withheld,
+/// whether the branches reach them now or not (S3, BUG-1319). A snapshot
+/// the person was sent is theirs to read below, also after a rewrite left
+/// it behind; which snapshot a *name* means is another question, answered
+/// from what the branches reach only ([`resolve_prefix`], BUG-1268).
+pub async fn page_starts(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, reals: Vec<ObjectId>) -> Result<Vec<bool>> {
     let deadline = Instant::now() + Limits::default().deadline;
-    let rows: Vec<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1")
-        .bind(project.id)
-        .fetch_all(&hub.db)
-        .await?;
-    let tips: Vec<ObjectId> = rows.iter().filter_map(|t| ObjectId::from_hex(t).ok()).collect();
-    if tips.is_empty() {
-        return Ok(vec![false; ids.len()]);
-    }
-    let ptips = ensure(hub, project, viewer, &tips, Some(deadline)).await?;
+    let ps = ensure(hub, project, viewer, &reals, Some(deadline)).await?;
     let vk = project.view(viewer).key();
     blocking(hub, project.id, move |cx| {
         let g = G::new(cx, &vk, Some(deadline));
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            let mut reached = false;
-            if g.row(&id)?.is_some_and(|r| !r.withheld()) {
-                for t in &ptips {
-                    if g.is_ancestor(id, *t)? {
-                        reached = true;
-                        break;
-                    }
-                }
-            }
-            out.push(reached);
-        }
-        Ok(out)
+        ps.iter().map(|p| Ok(g.row(p)?.is_some_and(|r| !r.withheld()))).collect()
     })
     .await
 }
 
 pub async fn resolve_route(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Query(q): Query<ResolveParams>) -> Result<Json<Value>> {
     let ask = Ask::open(&hub, &p, &caller).await?;
-    Ok(Json(resolve_prefix(&hub, &ask, &q.prefix, Limits::default()).await?))
+    let mut from = Vec::new();
+    for f in q.from.as_deref().unwrap_or("").split(',').filter(|f| !f.is_empty()) {
+        from.push(ObjectId::from_hex(f).map_err(|_| Error::bad_request("`from` lists snapshot ids"))?);
+    }
+    Ok(Json(resolve_prefix(&hub, &ask, &q.prefix, &from, Limits::default()).await?))
 }
 
 // ---- show, tree, file, diff ----------------------------------------------------------

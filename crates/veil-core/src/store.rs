@@ -1409,6 +1409,7 @@ impl ObjectStore {
                 ))
             }
         };
+        self.note_held_snapshot(&s);
         self.snapshots.insert(*id, s.clone(), 1);
         Ok(s)
     }

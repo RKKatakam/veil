@@ -856,7 +856,11 @@ pub fn pull_with(repo: &mut Repo, remote: &str, client: &Client, only: Option<&s
         .map(|(_, v)| *v)
         .filter(|id| store.has(id) && !widen)
         .collect();
-    let mut want_tips: Vec<ObjectId> = tips.branches.values().copied().filter(|t| widen || !store.has(t)).collect();
+    // A pull into the main store (a widening one, or a full pull from
+    // another remote) asks for every tip, held or not: what a held tip
+    // reaches may be in the cache only, or nowhere (BUG-1318). `have` then
+    // skips, object by object, what the main store holds.
+    let mut want_tips: Vec<ObjectId> = tips.branches.values().copied().filter(|t| main_only || !store.has(t)).collect();
     want_tips.sort();
     want_tips.dedup();
     // A repository made for this clone holds only the root snapshot and

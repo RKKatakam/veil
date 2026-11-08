@@ -101,8 +101,8 @@ impl Promisor for Server {
         self.tips.clone()
     }
 
-    /// As the server's viewer graph computes them: the larger of the
-    /// timestamp and 1 plus the parents' largest (0 with none).
+    /// As the server's viewer graph computes them: `veil_core`'s one
+    /// arithmetic (BUG-1316).
     fn generations(&self, snapshots: &[ObjectId]) -> veil_core::Result<Option<Vec<Option<u64>>>> {
         if self.down.load(Ordering::SeqCst) {
             return Err(VeilError::Unavailable("test server: connection refused".into()));
@@ -112,11 +112,11 @@ impl Promisor for Server {
                 return Some(*g);
             }
             let Ok(Object::Snapshot(s)) = store.get(id) else { return None };
-            let mut g = 0u64;
+            let mut parents = Vec::new();
             for p in &s.parents {
-                g = g.max(generation(store, p, memo)? + 1);
+                parents.push(generation(store, p, memo)?);
             }
-            let g = g.max(s.timestamp.max(0) as u64);
+            let g = veil_core::graph_index::generation(s.timestamp, parents);
             memo.insert(*id, g);
             Some(g)
         }

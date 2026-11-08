@@ -161,8 +161,12 @@ fn resolve_base(repo: &Repo, base: &str, ws: &str) -> Result<ObjectId> {
         changes.sort();
         changes.dedup();
         if changes.len() == 1 && matches.len() > 1 {
-            let local = local_history(repo)?;
-            let mine: Vec<ObjectId> = matches.iter().map(|m| m.0).filter(|id| local.contains(id)).collect();
+            let mut mine: Vec<ObjectId> = Vec::new();
+            for m in &matches {
+                if in_local_history(repo, &m.0)? {
+                    mine.push(m.0);
+                }
+            }
             if let [one] = mine.as_slice() {
                 return Ok(*one);
             }
@@ -223,7 +227,10 @@ pub(crate) fn server_names(repo: &Repo, prefix: &str) -> Result<Option<crate::hu
             "this thin clone cannot tell what an id names without its server, and this command has no connection to it".into(),
         ));
     };
-    let Some(r) = promisor.resolve(prefix)? else { return Ok(None) };
+    // Counted from the server's branches and this clone's own refs, as a
+    // full clone holds what they reach (BUG-1319).
+    let from = repo.server_roots(false)?.map(|(f, _)| f).unwrap_or_default();
+    let Some(r) = promisor.resolve(prefix, &from)? else { return Ok(None) };
     for id in r.snapshots.iter().chain(&r.changes) {
         if !store.has(id) {
             repo.deepen(&[*id], 1)?;
@@ -302,10 +309,13 @@ fn recorded_snapshots_with_prefix(repo: &Repo, prefix: &str) -> Result<Vec<Objec
     Ok(found)
 }
 
-/// Snapshots reachable from this repository's own heads and working copies,
-/// as opposed to those only reachable through tags and remote tags (which
-/// `pull` records, and anyone who can push to the remote can set).
-fn local_history(repo: &Repo) -> Result<std::collections::HashSet<ObjectId>> {
+/// Is `id` reachable from this repository's own heads and working copies,
+/// as opposed to only through tags and remote tags (which `pull` records,
+/// and anyone who can push to the remote can set)? Exactly: in a thin
+/// clone the history below its own work may not be held (BUG-1319: work on
+/// versions a rewrite elsewhere left off the branches); the walk stops at
+/// `id`'s generation, so only that range is paged in.
+fn in_local_history(repo: &Repo, id: &ObjectId) -> Result<bool> {
     let view = repo.view();
     let roots: Vec<ObjectId> = view
         .heads
@@ -313,8 +323,8 @@ fn local_history(repo: &Repo) -> Result<std::collections::HashSet<ObjectId>> {
         .copied()
         .chain(view.workspaces.values().map(|w| w.wc))
         .collect();
-    // This repository's own snapshots are held.
-    Ok(repo.held().topo_children_first(roots)?.into_iter().collect())
+    let Some(g) = repo.exact().generation(id)? else { return Ok(false) };
+    Ok(repo.exact().down_to(roots, g)?.contains_key(id))
 }
 
 /// Change ids and snapshot ids of the snapshots reachable from a set of

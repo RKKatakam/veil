@@ -118,9 +118,11 @@ pub trait Promisor: Send + Sync {
     fn server_tips(&self) -> Vec<ObjectId>;
 
     /// The snapshots of this person's history whose id, or change id,
-    /// starts with `prefix` (S3 cycle 3: names held history cannot decide).
-    /// `None`: the server cannot answer (older than protocol revision 5).
-    fn resolve(&self, _prefix: &str) -> Result<Option<crate::hub::wire::Resolved>> {
+    /// starts with `prefix` (S3 cycle 3: names held history cannot decide),
+    /// as the server's branches reach it, and the snapshots `from` (this
+    /// clone's own refs on the server, BUG-1319). `None`: the server cannot
+    /// answer (older than protocol revision 5).
+    fn resolve(&self, _prefix: &str, _from: &[ObjectId]) -> Result<Option<crate::hub::wire::Resolved>> {
         Ok(None)
     }
 
@@ -231,6 +233,11 @@ pub(crate) struct Partial {
     in_flight: AtomicU64,
     /// Snapshots the server has no page of history for (no further asks).
     refused: Mutex<HashSet<ObjectId>>,
+    /// Parents of the held snapshots this process decoded that the main
+    /// store did not hold then: history *below* what the clone holds, which
+    /// a page may always bring (BUG-1319). Any other snapshot read is a
+    /// name ([`crate::Repo::deepen`]).
+    below: Mutex<HashSet<ObjectId>>,
 }
 
 thread_local! {
@@ -287,6 +294,7 @@ impl ObjectStore {
             fetched: AtomicU64::new(0),
             in_flight: AtomicU64::new(0),
             refused: Mutex::new(HashSet::new()),
+            below: Mutex::new(HashSet::new()),
         }));
     }
 
@@ -374,6 +382,29 @@ impl ObjectStore {
         r.contains(id)
     }
 
+    /// A held snapshot was decoded: its parents the main store lacks are
+    /// below what the clone holds.
+    pub(crate) fn note_held_snapshot(&self, s: &crate::object::Snapshot) {
+        let Some(p) = self.partial.get() else { return };
+        let lacking: Vec<ObjectId> = s.parents.iter().filter(|x| !self.has_main(x)).copied().collect();
+        if !lacking.is_empty() {
+            p.below.lock().unwrap_or_else(|e| e.into_inner()).extend(lacking);
+        }
+    }
+
+    /// Is `id` a parent of a held snapshot (history below what the clone
+    /// holds, [`ObjectStore::note_held_snapshot`])?
+    pub(crate) fn is_below_held(&self, id: &ObjectId) -> bool {
+        self.partial.get().is_some_and(|p| p.below.lock().unwrap_or_else(|e| e.into_inner()).contains(id))
+    }
+
+    /// Put back boundary hits taken for a nested walk.
+    pub(crate) fn restore_boundary_hits(&self, ids: Vec<ObjectId>) {
+        if let Some(p) = self.partial.get() {
+            p.hits.lock().unwrap_or_else(|e| e.into_inner()).extend(ids);
+        }
+    }
+
     /// The snapshots reads missed since the last call: the boundary a graph
     /// walk reached ([`crate::repo::Exact::run`]).
     pub fn take_boundary_hits(&self) -> Vec<ObjectId> {
@@ -405,7 +436,7 @@ impl ObjectStore {
 
     /// The heads, working copies and tags of every operation's view (gc's
     /// roots; read here, at an eviction, which is rare).
-    fn op_log_heads(&self) -> Vec<ObjectId> {
+    pub(crate) fn op_log_heads(&self) -> Vec<ObjectId> {
         let ops = crate::oplog::OpStore::new(self.backend().clone());
         ops.set_format(self.format());
         let Ok(raw) = ops.raw_heads() else { return Vec::new() };

@@ -155,6 +155,10 @@ pub struct Generations {
 /// Most snapshots one `q/generations` request names.
 pub const MAX_GENERATIONS: usize = 1_000;
 
+/// Most snapshots a `q/resolve` counts the history of besides the branches
+/// (`from`: a thin clone's own refs on the server, BUG-1319).
+pub const MAX_RESOLVE_FROM: usize = 64;
+
 /// The answer of `GET …/q/resolve?prefix=` (revision 5): the snapshots of
 /// the caller's own history whose id (`snapshots`), or whose change id
 /// (`changes`), starts with the prefix; `more` when either list was cut.

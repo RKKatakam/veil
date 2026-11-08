@@ -199,7 +199,8 @@ fn a_deep_history_is_indexed_iteratively() {
     }
     tx.add_head(parent).unwrap();
     tx.commit().unwrap();
-    assert_eq!(repo.held().index().generation(&repo, &parent).unwrap(), Some(20_001));
+    // The root is 0, each of the 20,000 one more (BUG-1316: the server's arithmetic).
+    assert_eq!(repo.held().index().generation(&repo, &parent).unwrap(), Some(20_000));
     let first: Vec<_> = repo.held().topo_iter([parent]).take(3).map(Result::unwrap).collect();
     assert_eq!(first[0], parent);
     assert_eq!(first.len(), 3);
