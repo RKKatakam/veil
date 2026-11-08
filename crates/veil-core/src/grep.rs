@@ -179,6 +179,8 @@ fn search_one(store: &ObjectStore, path: &VPath, e: &TreeEntry, re: &Regex, o: &
 /// Search the files of `tree` (see the module docs).
 pub fn grep(store: &ObjectStore, tree: &ObjectId, re: &Regex, o: &GrepOptions) -> Result<Grep> {
     let files: Vec<(VPath, TreeEntry)> = walk_files(store, tree)?.into_iter().filter(|(p, e)| e.kind.is_file_like() && under(&o.paths, p)).collect();
+    // In a thin clone, each file asked for at its own path (BUG-1506).
+    crate::tree::prefetch_files(store, tree, files.iter().filter(|(_, e)| e.size <= MAX_FILE as u64).map(|(p, e)| (p, e)))?;
     let threads = if cfg!(feature = "os") { std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8) } else { 1 };
     let next = AtomicUsize::new(0);
     let results: Vec<Mutex<Option<Result<One>>>> = files.iter().map(|_| Mutex::new(None)).collect();

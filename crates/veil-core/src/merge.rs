@@ -112,6 +112,7 @@ fn merge_resolved(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, t
     if Some(ours) == base {
         return Ok(MergeOutcome::clean(theirs));
     }
+    prefetch_merged(store, base, ours, theirs)?;
     // Renames first: the trees with each followed rename applied to the
     // side (and base) that did not make it.
     let plan = match base {
@@ -147,6 +148,27 @@ fn subtree(store: &ObjectStore, e: Option<&TreeEntry>) -> Result<Option<(Arc<Tre
         Some(e) if e.kind == EntryKind::Dir => Ok(Some((store.tree(&e.id)?, e.id))),
         _ => Ok(None),
     }
+}
+
+/// In a thin clone, the content a merge reads (the files both sides
+/// changed), each version asked for at its own path in its own tree, as
+/// the server decides (BUG-1506); with no base, the files that differ.
+fn prefetch_merged(store: &ObjectStore, base: Option<ObjectId>, ours: ObjectId, theirs: ObjectId) -> Result<()> {
+    use crate::tree::{diff_trees, prefetch_changes};
+    if !store.may_fetch() {
+        return Ok(());
+    }
+    let file = |e: &Option<TreeEntry>| e.as_ref().is_some_and(|e| e.kind.is_file_like());
+    let Some(b) = base else {
+        let ot = diff_trees(store, Some(&ours), Some(&theirs))?;
+        return prefetch_changes(store, Some(&ours), Some(&theirs), ot.iter().filter(|c| file(&c.old) && file(&c.new)));
+    };
+    let co = diff_trees(store, Some(&b), Some(&ours))?;
+    let ct = diff_trees(store, Some(&b), Some(&theirs))?;
+    let in_ct: HashSet<&VPath> = ct.iter().filter(|c| file(&c.new)).map(|c| &c.path).collect();
+    let in_co: HashSet<&VPath> = co.iter().filter(|c| file(&c.new)).map(|c| &c.path).collect();
+    prefetch_changes(store, Some(&b), Some(&ours), co.iter().filter(|c| file(&c.new) && in_ct.contains(&c.path)))?;
+    prefetch_changes(store, None, Some(&theirs), ct.iter().filter(|c| file(&c.new) && in_co.contains(&c.path)))
 }
 
 fn read_for_merge(store: &ObjectStore, e: &TreeEntry, path: &VPath) -> Result<Vec<u8>> {
@@ -903,9 +925,9 @@ struct PlannedRename {
 /// content pairs by exact object id only (an equality every reader of the
 /// trees already sees), so the pairing never depends on the merger's keys
 /// and never reads what the merger cannot (threat review 5).
-fn side_renames(store: &ObjectStore, changes: &[TreeChange]) -> Result<BTreeMap<VPath, Pair>> {
+fn side_renames(store: &ObjectStore, base: &ObjectId, side: &ObjectId, changes: &[TreeChange]) -> Result<BTreeMap<VPath, Pair>> {
     let mut out = BTreeMap::new();
-    let d = crate::rename::detect(store, changes, Reader::Public, &RenameOptions::default())?;
+    let d = crate::rename::detect(store, Some(base), Some(side), changes, Reader::Public, &RenameOptions::default())?;
     for p in d.pairs {
         if !p.copy && same_audience(store, &p.old, &p.new)? {
             out.insert(p.from.clone(), p);
@@ -957,8 +979,8 @@ fn follow_renames(store: &ObjectStore, base: ObjectId, ours: ObjectId, theirs: O
     let (po, pt) = {
         let touched_o: HashSet<&VPath> = co.iter().map(|c| &c.path).collect();
         let touched_t: HashSet<&VPath> = ct.iter().map(|c| &c.path).collect();
-        let po = if may_matter(&co, &touched_t) { side_renames(store, &co)? } else { BTreeMap::new() };
-        let pt = if may_matter(&ct, &touched_o) { side_renames(store, &ct)? } else { BTreeMap::new() };
+        let po = if may_matter(&co, &touched_t) { side_renames(store, &base, &ours, &co)? } else { BTreeMap::new() };
+        let pt = if may_matter(&ct, &touched_o) { side_renames(store, &base, &theirs, &ct)? } else { BTreeMap::new() };
         (po, pt)
     };
     if po.is_empty() && pt.is_empty() {
