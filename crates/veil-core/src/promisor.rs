@@ -79,6 +79,9 @@ const PREFETCH_BYTES: u64 = 8 << 20;
 /// [`VeilError::Unavailable`], never as hidden.
 pub(crate) const LOCATOR_CAP: usize = 1_500_000;
 
+/// Places kept for an object besides its first (BUG-1460).
+const MORE_PLACES: usize = 8;
+
 /// Nearest ancestors on the server an object met under a local commit is
 /// asked for under.
 const SERVER_ANCESTORS: usize = 8;
@@ -141,10 +144,18 @@ pub trait Promisor: Send + Sync {
 /// in it. Ids are BLAKE3 hashes, so 8 bytes tell them apart; a collision is
 /// harmless: `ObjectStore::locate` checks that the parent names the object
 /// there, and treats a mismatch as no place.
+///
+/// The same object can be at several places (an empty `__init__.py`, a
+/// copied folder), and the server decides by place: the first place is in
+/// `at`, the others (at most [`MORE_PLACES`] an object) in `others`, so a
+/// refusal at one place is never final for the others (BUG-1460).
 #[derive(Default)]
 pub(crate) struct Locator {
     parents: Vec<ObjectId>,
     handles: HashMap<u64, u32>,
+    others: HashMap<u64, Vec<u64>>,
+    /// Places in `others`, counted in the bound.
+    more: usize,
     at: HashMap<u64, u64>,
 }
 
@@ -153,35 +164,77 @@ fn short_key(id: &ObjectId) -> u64 {
 }
 
 impl Locator {
-    fn note(&mut self, child: ObjectId, parent: ObjectId, index: u32) {
-        let key = short_key(&child);
-        if self.at.len() + self.parents.len() >= LOCATOR_CAP || self.at.contains_key(&key) {
-            return;
-        }
-        let parents = &mut self.parents;
-        let h = *self.handles.entry(short_key(&parent)).or_insert_with(|| {
-            parents.push(parent);
-            (parents.len() - 1) as u32
-        });
-        self.at.insert(key, (u64::from(h) << 32) | u64::from(index));
+    fn full(&self) -> bool {
+        self.at.len() + self.parents.len() + self.more >= LOCATOR_CAP
     }
 
-    /// Record `child` at `(parent, index)`, replacing the place it had.
-    fn place(&mut self, child: ObjectId, parent: ObjectId, index: u32) {
-        let key = short_key(&child);
-        if !self.at.contains_key(&key) && self.at.len() + self.parents.len() >= LOCATOR_CAP {
-            return;
-        }
+    fn packed(&mut self, parent: ObjectId, index: u32) -> u64 {
         let parents = &mut self.parents;
         let h = *self.handles.entry(short_key(&parent)).or_insert_with(|| {
             parents.push(parent);
             (parents.len() - 1) as u32
         });
-        self.at.insert(key, (u64::from(h) << 32) | u64::from(index));
+        (u64::from(h) << 32) | u64::from(index)
+    }
+
+    /// Keep `place` among `key`'s other places (once, within the bounds).
+    fn add_other(&mut self, key: u64, place: u64) {
+        let full = self.full();
+        let list = self.others.entry(key).or_default();
+        if !list.contains(&place) && list.len() < MORE_PLACES && !full {
+            list.push(place);
+            self.more += 1;
+        }
+    }
+
+    fn note(&mut self, child: ObjectId, parent: ObjectId, index: u32) {
+        let key = short_key(&child);
+        if !self.at.contains_key(&key) && self.full() {
+            return;
+        }
+        let place = self.packed(parent, index);
+        match self.at.get(&key) {
+            None => {
+                self.at.insert(key, place);
+            }
+            Some(first) if *first == place => {}
+            Some(_) => self.add_other(key, place),
+        }
+    }
+
+    /// Make `(parent, index)` `child`'s first place; the place it had
+    /// stays among its others.
+    fn place(&mut self, child: ObjectId, parent: ObjectId, index: u32) {
+        let key = short_key(&child);
+        if !self.at.contains_key(&key) && self.full() {
+            return;
+        }
+        let place = self.packed(parent, index);
+        if let Some(old) = self.at.insert(key, place).filter(|o| *o != place) {
+            if let Some(list) = self.others.get_mut(&key) {
+                if let Some(i) = list.iter().position(|x| *x == place) {
+                    list.remove(i);
+                    self.more -= 1;
+                }
+            }
+            self.add_other(key, old);
+        }
+    }
+
+    fn unpack(&self, v: u64) -> (ObjectId, u32) {
+        (self.parents[(v >> 32) as usize], v as u32)
     }
 
     fn get(&self, id: &ObjectId) -> Option<(ObjectId, u32)> {
-        self.at.get(&short_key(id)).map(|v| (self.parents[(v >> 32) as usize], *v as u32))
+        self.at.get(&short_key(id)).map(|v| self.unpack(*v))
+    }
+
+    /// Every place of `id`: the first, then the others.
+    fn all(&self, id: &ObjectId) -> Vec<(ObjectId, u32)> {
+        let key = short_key(id);
+        let mut out: Vec<(ObjectId, u32)> = self.at.get(&key).map(|v| self.unpack(*v)).into_iter().collect();
+        out.extend(self.others.get(&key).into_iter().flatten().map(|v| self.unpack(*v)));
+        out
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -525,10 +578,40 @@ impl ObjectStore {
 
     /// Where `id` was met: a snapshot and the path in its tree.
     fn locate(&self, p: &Partial, id: &ObjectId) -> Result<Option<(ObjectId, String)>> {
+        let first = p.locator.lock().unwrap_or_else(|e| e.into_inner()).get(id);
+        match first {
+            Some(place) => self.climb(p, *id, place),
+            None => Ok(None),
+        }
+    }
+
+    /// Every place `id` was met at, as `(snapshot, path)`: its first, then
+    /// the others (BUG-1460). The folders above each are at their own
+    /// first place.
+    fn locate_all(&self, p: &Partial, id: &ObjectId) -> Result<Vec<(ObjectId, String)>> {
+        let places = p.locator.lock().unwrap_or_else(|e| e.into_inner()).all(id);
+        let mut out: Vec<(ObjectId, String)> = Vec::new();
+        for place in places {
+            if let Some(l) = self.climb(p, *id, place)? {
+                if !out.contains(&l) {
+                    out.push(l);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The `(snapshot, path)` of `id` met at `first`: up through its
+    /// parents' first places.
+    fn climb(&self, p: &Partial, id: ObjectId, first: (ObjectId, u32)) -> Result<Option<(ObjectId, String)>> {
         let mut names: Vec<String> = Vec::new();
-        let mut cur = *id;
+        let mut cur = id;
+        let mut next = Some(first);
         for _ in 0..=crate::tree::MAX_TREE_DEPTH + 2 {
-            let found = p.locator.lock().unwrap_or_else(|e| e.into_inner()).get(&cur);
+            let found = match next.take() {
+                Some(f) => Some(f),
+                None => p.locator.lock().unwrap_or_else(|e| e.into_inner()).get(&cur),
+            };
             let Some((parent, index)) = found else { return Ok(None) };
             match index {
                 ROOT => {
@@ -670,7 +753,10 @@ impl ObjectStore {
             return Err(VeilError::Missing(*id));
         }
         let wanted_snapshot = snapshot;
-        let Some((snapshot, path)) = self.locate(p, id)? else {
+        // Every place it was met at: the server decides by place, so a
+        // refusal at one is never final for the others (BUG-1460).
+        let places = self.locate_all(p, id)?;
+        let Some((_, first_path)) = places.first() else {
             if wanted_snapshot {
                 // A snapshot beyond the boundary: recorded for `Repo::exact`.
                 p.hits.lock().unwrap_or_else(|e| e.into_inner()).insert(*id);
@@ -682,49 +768,56 @@ impl ObjectStore {
                     .into(),
             ));
         };
-        let shown = if path.is_empty() { "/".to_string() } else { path.clone() };
+        let shown = if first_path.is_empty() { "/".to_string() } else { first_path.clone() };
         let Some(promisor) = self.promisor() else {
             return Err(VeilError::Unavailable(format!(
                 "'{shown}' is not fetched yet, and this command has no connection to the server of this thin clone"
             )));
         };
-        let mut got = promisor.fetch(&[Located { id: *id, snapshot, path: path.clone() }])?.pop().flatten();
-        // Refused at a place on the server whose own tree (as this clone
-        // holds it) names this very object there: the server's "not yours"
-        // for it, as much as under a snapshot on the server (milestone S8:
-        // access removed while a workspace on a local change was mounted).
-        let mut refused_there = false;
-        if got.is_none() && !self.on_server(p, &*promisor, &snapshot) {
-            // Met under a snapshot the server does not have (a local
-            // commit): ask at the same path under its nearest ancestors on
-            // the server (BUG-1144), then under the server's tips.
-            let mut places = self.server_ancestors(p, &*promisor, &snapshot);
-            for t in self.server_tips_now(p, &*promisor) {
-                if !places.contains(&t) {
-                    places.push(t);
+        // The server's own "not yours" at some place.
+        let mut refused = false;
+        for (snapshot, path) in &places {
+            let (snapshot, path) = (*snapshot, path.clone());
+            let mut got = promisor.fetch(&[Located { id: *id, snapshot, path: path.clone() }])?.pop().flatten();
+            // Refused at a place on the server whose own tree (as this
+            // clone holds it) names this very object there: the server's
+            // "not yours" for it, as much as under a snapshot on the server
+            // (milestone S8: access removed while a workspace on a local
+            // change was mounted).
+            let mut refused_there = false;
+            if got.is_none() && !self.on_server(p, &*promisor, &snapshot) {
+                // Met under a snapshot the server does not have (a local
+                // commit): ask at the same path under its nearest ancestors
+                // on the server (BUG-1144), then under the server's tips.
+                let mut under = self.server_ancestors(p, &*promisor, &snapshot);
+                for t in self.server_tips_now(p, &*promisor) {
+                    if !under.contains(&t) {
+                        under.push(t);
+                    }
+                }
+                for t in under {
+                    got = promisor.fetch(&[Located { id: *id, snapshot: t, path: path.clone() }])?.pop().flatten();
+                    if got.is_some() {
+                        break;
+                    }
+                    refused_there |= self.names_held(&t, &path, id);
                 }
             }
-            for t in places {
-                got = promisor.fetch(&[Located { id: *id, snapshot: t, path: path.clone() }])?.pop().flatten();
-                if got.is_some() {
-                    break;
-                }
-                refused_there |= self.names_held(&t, &path, id);
+            if let Some(raw) = got {
+                self.keep_fetched(p, id, &raw)?;
+                p.fetched.fetch_add(1, Ordering::Relaxed);
+                return Ok(raw);
             }
+            refused |= refused_there || self.on_server(p, &*promisor, &snapshot);
         }
-        let Some(raw) = got else {
-            if refused_there || self.on_server(p, &*promisor, &snapshot) {
-                // The server's own answer: nothing there that this person
-                // may see.
-                return Err(VeilError::Missing(*id));
-            }
-            return Err(VeilError::Unavailable(format!(
-                "'{shown}' is not fetched, and the server has no copy of it where this clone met it; run `vl pull`, or `vl partial full`"
-            )));
-        };
-        self.keep_fetched(p, id, &raw)?;
-        p.fetched.fetch_add(1, Ordering::Relaxed);
-        Ok(raw)
+        if refused {
+            // The server's own answer: nothing there that this person may
+            // see, at any place this clone met it.
+            return Err(VeilError::Missing(*id));
+        }
+        Err(VeilError::Unavailable(format!(
+            "'{shown}' is not fetched, and the server has no copy of it where this clone met it; run `vl pull`, or `vl partial full`"
+        )))
     }
 
     /// Does snapshot `snap`'s tree name `id` at `path`, as far as this clone

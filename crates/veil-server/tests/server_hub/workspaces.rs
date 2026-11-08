@@ -574,7 +574,6 @@ fn a_refused_folder_hides_only_itself_not_its_copy_elsewhere() {
 /// first place this process met it (the refused folder sorts first), so
 /// the readable copy is left out of the sandbox as "not yours".
 #[test]
-#[ignore = "BUG-1460: without FUSE, a file the person may read is left out of the sandbox when the same content is refused at another path"]
 fn bug_1460_the_fallback_without_fuse_leaves_out_a_readable_copy_of_refused_content() {
     const SAME: &str = "SAME-CONTENT-FALLBACK-1460-9d2e7c51\n";
     let hub = TestHub::start();
@@ -599,6 +598,32 @@ fn bug_1460_the_fallback_without_fuse_leaves_out_a_readable_copy_of_refused_cont
     let o = c.output().unwrap();
     assert!(o.status.success(), "the fallback left out a file fin may read: {}", all(&o));
     assert!(String::from_utf8_lossy(&o.stdout).contains(SAME.trim()), "{}", all(&o));
+}
+
+/// BUG-1460 in a thin clone's own checkout (the root cause is S3's: every
+/// fetch asked at the first place the content was met): the project
+/// directory moved to a revision holding a readable copy of content
+/// refused elsewhere checks the readable copy out.
+#[test]
+fn a_thin_checkout_writes_a_readable_copy_of_content_refused_elsewhere() {
+    const SAME: &str = "SAME-CONTENT-CHECKOUT-1460-4b7a90e3\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    write_files(&p.dir, &[("src/shared/same.txt", SAME), (&format!("{BILL_DIR}/acme/same.txt"), SAME)]);
+    p.admin.ok(&p.dir, &["commit", "--no-advance", "-m", "same content twice"]);
+    p.admin.ok(&p.dir, &["tag", "set", "feature", "-r", "@-"]);
+    p.admin.ok(&p.dir, &["push"]);
+    let thin = thin_with_agent(&p, &hub, &p.fin, "thin");
+    // The billing folder's tree is met first (a mount listed it).
+    let m = Mounted::new(&p.fin, &thin, "agent");
+    let names: Vec<String> = std::fs::read_dir(m.dir.join(format!("{BILL_DIR}/acme"))).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(names.contains(&"same.txt".to_string()), "{names:?}");
+    m.unmount();
+    assert!(!fetched(&thin, "src/shared/same.txt"), "the content is not fetched yet");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&thin, &["new", "feature"]);
+    let got = std::fs::read_to_string(thin.join("src/shared/same.txt"));
+    assert_eq!(got.as_deref().map_err(|e| e.to_string()), Ok(SAME), "the checkout left out a file fin may read: {out}");
 }
 
 /// Guarantee 1 of the S8 cycle 3 review, in the mount: with the same

@@ -2897,9 +2897,16 @@ protocol or server change.
     id, and on to the upper layer atomically; an unlinked open file is
     written to an anonymous file (BUG-1368). **Outside the bound:** a file a
     thin clone has not fetched arrives whole from the server (an object at
-    a time) before it is spilled; an object the store holds in a pack, a
-    sealed secret and a conflicted file are read whole once; recording
-    reads changed files as any snapshot does.
+    a time) before it is spilled; a large file the store holds in a pack
+    is inflated whole when the mount first looks at it (its first `stat`,
+    listing or lookup in the process: BUG-1461, open) and when it is read;
+    a sealed secret and a conflicted file are read whole when read;
+    recording reads changed files as any snapshot does.
+  * the locator keeps every place an object was met at (up to 8 besides
+    the first), and a refusal at one place is asked again at the others
+    before it is final: every fetch (checkout, prefetch, the fallback, the
+    mount) reads content refused at one path where it is readable
+    (BUG-1460).
   * refusals are kept by path, and every lookup asks for what it fetches
     at the path it reads (`place_along`): the same content elsewhere,
     refused at one path, reads at another (BUG-1367). Fetching is switched
