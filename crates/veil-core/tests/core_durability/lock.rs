@@ -146,13 +146,9 @@ fn dead_holder_is_stolen_immediately() {
         let pid = dead_pid();
         for renewed_ago in [0, 60_000] {
             plant(&*fs, &foreign_lock(pid, renewed_ago));
-            let start = Instant::now();
-            let l = RepoLock::acquire_with(fs.clone(), &quick(5000)).unwrap();
-            assert!(
-                start.elapsed() < Duration::from_millis(150),
-                "did not wait for the lease ({:?})",
-                start.elapsed()
-            );
+            let (l, waited) = crate::acquire_counting_wait(&fs, &quick(5000));
+            let l = l.unwrap();
+            assert_eq!(waited, Duration::ZERO, "did not wait for the lease");
             assert_eq!(RepoLock::holder(&*fs).unwrap().unwrap().pid, std::process::id());
             drop(l);
         }
@@ -200,12 +196,9 @@ fn lock_leaked_by_this_process_is_reclaimed_immediately() {
     // A crashed transaction in this process could not delete its lock file.
     let fs: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     plant(&*fs, &foreign_lock(std::process::id(), 0));
-    let start = Instant::now();
-    drop(RepoLock::acquire_with(fs.clone(), &quick(5000)).unwrap());
-    assert!(
-        start.elapsed() < Duration::from_millis(150),
-        "no need to wait for the lease"
-    );
+    let (l, waited) = crate::acquire_counting_wait(&fs, &quick(5000));
+    drop(l.unwrap());
+    assert_eq!(waited, Duration::ZERO, "no need to wait for the lease");
 }
 
 #[test]
@@ -315,10 +308,9 @@ fn a_recorded_start_time_tells_a_reused_pid_from_the_holder() {
         assert!(matches!(err, VeilError::Locked(_)), "{err}");
 
         plant_with(&*fs, &lock_path(), &info, serde_json::json!({ "pid_start": start.id + 1 }));
-        let t = Instant::now();
-        let lock = RepoLock::acquire_with(fs.clone(), &quick(5_000)).unwrap();
-        assert!(t.elapsed() < Duration::from_secs(2), "taken over at once");
-        drop(lock);
+        let (lock, waited) = crate::acquire_counting_wait(&fs, &quick(5_000));
+        drop(lock.unwrap());
+        assert_eq!(waited, Duration::ZERO, "taken over at once");
     }
     let _ = alive.kill();
     let _ = alive.wait();
@@ -365,9 +357,9 @@ fn an_abandoned_lock_is_left_flagged_and_reclaimed() {
         if cfg!(any(target_os = "linux", target_os = "macos")) {
             assert!(v["pid_start"].is_u64(), "holder start time recorded: {v}");
         }
-        let t = Instant::now();
-        drop(RepoLock::acquire_with(fs.clone(), &quick(5_000)).unwrap());
-        assert!(t.elapsed() < Duration::from_secs(2));
+        let (lock, waited) = crate::acquire_counting_wait(&fs, &quick(5_000));
+        drop(lock.unwrap());
+        assert_eq!(waited, Duration::ZERO, "taken over at once");
         assert!(!fs.exists(&lock_path()).unwrap());
     }
 }

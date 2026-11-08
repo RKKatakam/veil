@@ -121,13 +121,9 @@ fn rebase_with_a_repeated_destination_records_one_parent() {
     let env = Env::new();
     let r = chain(&env);
     r.write("wip", "w\n");
-    let out = r.run(&["rebase", "-s", "@", "-d", "a", "-d", "a"]);
-    if out.status.success() {
-        let s = r.snap("@");
-        let mut uniq = s.parents.clone();
-        uniq.dedup();
-        assert_eq!(uniq.len(), s.parents.len(), "duplicate parents: {s:?}");
-    }
+    r.ok(&["rebase", "-s", "@", "-d", "a", "-d", "a"]);
+    let s = r.snap("@");
+    assert_eq!(s.parents, vec![r.sid("a")], "duplicate parents: {s:?}");
 }
 
 // Scenario from git t3425-rebase-topology-merges.sh / jj test_rebase_single_revision_merge_parent: flatten a merge.
@@ -439,7 +435,7 @@ fn squashing_into_the_root_is_refused() {
     let env = Env::new();
     let r = chain(&env);
     let err = r.fails(&["squash", "-r", "a"]);
-    assert!(err.contains("root"), "{err}");
+    assert!(err.contains("root snapshot"), "{err}");
     r.fails(&["squash", "-r", "root"]);
 }
 
@@ -531,7 +527,7 @@ fn abandoning_the_root_is_refused() {
     let env = Env::new();
     let r = chain(&env);
     let err = r.fails(&["abandon", "root"]);
-    assert!(err.contains("root"), "{err}");
+    assert!(err.contains("root snapshot"), "{err}");
 }
 
 // Scenario from jj test_abandon_many (merge): abandoning a merge gives its child both parents.
@@ -616,7 +612,7 @@ fn describing_the_root_is_refused() {
     let env = Env::new();
     let r = env.repo("p");
     let err = r.fails(&["describe", "-r", "root", "-m", "x"]);
-    assert!(err.contains("root"), "{err}");
+    assert!(err.contains("root snapshot"), "{err}");
 }
 
 // Scenario from git t3408-rebase-multi-line.sh: multi-line descriptions survive rewrites.

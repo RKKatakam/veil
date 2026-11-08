@@ -61,6 +61,7 @@ impl<'a> Reader<'a> {
             ts,
             signature: self.signature(grant, ts, &ids),
             wants: wants.iter().map(|(chain, id)| ChainWant { chain: chain.clone(), id: *id }).collect(),
+            skip: Vec::new(),
         };
         self.api.post(None, &format!("/v1/objects/{}:batch", self.project), &serde_json::to_vec(&req).unwrap(), true)
     }
@@ -533,6 +534,7 @@ fn bench_object_routes() {
             ts,
             signature: Some(sign_request(&identity, &g, ts, &ids)),
             wants: many.iter().map(|(c, id)| ChainWant { chain: c.clone(), id: *id }).collect(),
+            skip: Vec::new(),
         };
         let body = axum::body::Bytes::from(serde_json::to_vec(&req).unwrap());
         let t = Instant::now();
@@ -1064,6 +1066,7 @@ fn bug_1087_a_batch_reads_ahead_by_sizes_the_pusher_wrote() {
             ts,
             signature: dev.signature(&dev.grant, ts, &ids),
             wants: ids.iter().map(|id| ChainWant { chain: vec![root, src], id: *id }).collect(),
+            skip: Vec::new(),
         };
         std::thread::sleep(std::time::Duration::from_millis(500));
         reset_peak();

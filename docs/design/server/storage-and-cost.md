@@ -22,7 +22,7 @@ Each of those is also time on the request path. So every item here makes Veil **
 | Landings/s across 100 projects, MinIO | 376 (bound by the object store) | 4,000 (phase 2 gate) |
 | Landings/s into one `main` | about 20 | 100 (phase 2), 1,000 (phase 4, by batching) |
 | Bytes stored and sent | uncompressed | compressed (zstd): **built in S27** (`HUB.md` §13.15) |
-| Server memory, 1 GB project | push 2.4 GB, clone 2.9 GB peak (BUG-864: allocator arenas; fixed with jemalloc, 2026-11-07: push 0.98 GB, clone 1.58 GB, BUG-1000; S27 raised the push to 1.36 GB, BUG-1089) | under 1 GB: **built** (S28: push 0.88 GB, clone 0.94 GB; BUG-1000 and BUG-1089 fixed, `HUB.md` §13.18) |
+| Server memory, 1 GB project | push 2.4 GB, clone 2.9 GB peak (BUG-864: allocator arenas; fixed with jemalloc, 2026-11-07: push 0.98 GB, clone 1.58 GB, BUG-1000; S27 raised the push to 1.36 GB, BUG-1089) | under 1 GB: **built** (S28: push 0.88 GB, clone 0.94 GB; BUG-1000 and BUG-1089 fixed, `HUB.md` §13.20) |
 
 ## 3. One database commit per push (S4)
 
@@ -74,7 +74,7 @@ In each API server's memory, never in the database:
 
 ## 7. Packs: one storage write per push (S28)
 
-> **Built** (S28, `HUB.md` §13.18), with two changes from the text below: (1) **an upload request's objects, large ones included, go up as one pack** (staged: nobody reads it until the push that names it lists it, and a refused push deletes it, BUG-930), so a `vl` push's uploads cost one write per upload request (about 8 MiB) and the push lists them as they are, with no copy; a large object in a pack is read with one ranged `GET`, as a loose one is read with one `GET`. S29 merges only small packs. (2) The index is inside the pack, at its front (one write, never apart from its pack); the database lists each pack (one row, in the push's transaction).
+> **Built** (S28, `HUB.md` §13.20), with two changes from the text below: (1) **an upload request's objects, large ones included, go up as one pack** (staged: nobody reads it until the push that names it lists it, and a refused push deletes it, BUG-930), so a `vl` push's uploads cost one write per upload request (about 8 MiB) and the push lists them as they are, with no copy; a large object in a pack is read with one ranged `GET`, as a loose one is read with one `GET`. S29 merges only small packs. (2) The index is inside the pack, at its front (one write, never apart from its pack); the database lists each pack (one row, in the push's transaction).
 
 **Change from the earlier design:** `OVERVIEW.md` said each file is stored once with no repacking. Packs bring back a background job (§8). In exchange, storage write requests per push fall from about 6 to 1–2. At object-storage prices, per-request charges dominate with millions of small files, and the object store is today's limit across projects (376 landings/s on MinIO).
 

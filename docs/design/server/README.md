@@ -34,22 +34,22 @@ S1 is built. **S2** (secrets at scale: keys per access rule, background wrapping
 | S5 | 2 | Read grants, the object routes, access epochs (built: `HUB.md` §13.16) | S1 |
 | S6 | 2 | The Veil daemon: shared object cache | S3, S5 |
 | S7 | 2 | The daemon's file watcher (`status`/`commit` without a scan) | S6 |
-| S8 | 2 | Workspaces that fetch on first read; the workspace socket for sandboxes | S3; phase 1's isolated sandboxes (S6 for the warm numbers) |
-| S9 | 2 | Regional cache | S5 |
+| S8 | 2 | Workspaces that fetch on first read; the workspace socket for sandboxes; private loopback and seeded layers for full-stack tests (phase 2 §4.9) | S3; phase 1's isolated sandboxes (S6 for the warm numbers) |
+| S9 | 2 | Regional cache (built: `HUB.md` §13.18) | S5 |
 | S10 | 2 | Commits through the API (with the server-side secret scan): **built** (`HUB.md` §13.13) | S1 |
-| S11 | 2 | Agent sessions and attribution | S10, S8 |
+| S11 | 2 | Agent sessions and attribution; attempts (recorded dead ends) on change records | S10, S8 |
 | S27 | 2 | Compressed objects (zstd) in storage and transport (`storage-and-cost.md` §6). **Built** (`HUB.md` §13.15) | S1 |
-| S28 | 2 | Packs: one storage write per push for small objects, index, range reads (`storage-and-cost.md` §7). **Built** (`HUB.md` §13.18), with staged uploads (BUG-930) and checks several at once (BUG-865) | S5, S27 |
+| S28 | 2 | Packs: one storage write per push for small objects, index, range reads (`storage-and-cost.md` §7). **Built** (`HUB.md` §13.20), with staged uploads (BUG-930) and checks several at once (BUG-865) | S5, S27 |
 | S29 | 2 | Merging packs and pack garbage collection (`storage-and-cost.md` §8) | S28 |
 | G2 | 2 | Phase 2 gate run | S3–S11, S27–S29 |
 | S12 | 3 | Derived-data framework, commit graph, changed paths, per-rule lists, eager projection memos at each branch move | S1 |
-| S13 | 3 | Query API with per-viewer projection, and the projection-equivalence harness | S12 |
+| S13 | 3 | Query API with per-viewer projection, and the projection-equivalence harness. **Built** (phase 3 §11) | S12 |
 | S14 | 3 | Blame and file history | S13 |
-| S15 | 3 | Search | S13 |
+| S15 | 3 | Search. **Built** (`HUB.md` §13.23, phase 3 §13) | S13 |
 | S16 | 3 | `vl` over the query API; phase 3 gate run | S3, S13, S14, S15 |
 | S17 | 4 | The landing service (batched, fast path, protected branches, `vl land`) | S4, S10, S12 |
 | S18 | 4 | Content merges, conflicts back to agents, the event stream | S17 |
-| S19 | 4 | CI through the API; land first, test after; `main@tested` | S11, S13, S17 |
+| S19 | 4 | CI through the API; land first, test after; `main@tested`; agents start from `main@tested` | S11, S13, S17 |
 | S20 | 4 | Automatic bisect and revert | S14, S19 |
 | S21 | 4 | PRs and review (visibility classes, risk, approvals) | S13 (S17 to land PRs) |
 | S22 | 4 | Embargoes through the server; the release service | S2, S17 |
@@ -81,6 +81,44 @@ The owner allows many agents at once. Each wave's milestones touch different fil
 **Cost and speed work outside the milestones** (BUG-864 server memory, BUG-865 parallel push checks, commit and clone-one-folder speed): `storage-and-cost.md` §10.
 
 **Memory on the build machine:** each agent's builds take several GB. The owner asked to watch RAM: run at most as many building agents as the machine's memory allows (use `bash ~/.cache/veil-orch/verify-fast.sh`, which deletes `target/` when done), and start the rest when one finishes.
+
+## Plan to the DigitalOcean test (as of 2026-11-08)
+
+The owner's goal: every milestone of phases 1–4 built, reviewed and merged, then one test on DigitalOcean (budget under $100, asked for before anything is rented). Each tier-A milestone goes through the review loop of `.claude/skills/veil-review/SKILL.md` (at most three cycles, then the approach is re-evaluated, as S3's names and fetching were).
+
+### Where each milestone stands
+
+| State | Milestones |
+|---|---|
+| **Merged into `integration`** | S1, S2 (phase 1); S4, S5, S9, S10, S27 (phase 2); S12, S13, S15 (phase 3) |
+| **Built, in review or fixing** | S3 (redesign under review), S28 (final checks), S14 (cycle 2 review), S17 (fixing cycle 2, last cycle next), S21 (fixing cycle 2, last cycle next) |
+| **Not started** | S6, S7, S8, S11, S29 (phase 2); S16 (phase 3); S18, S19, S20, S22, S23, S24, S25, S26 (phase 4); the gate runs G2, G3 (in S16), G4 |
+
+### Remaining waves
+
+| Wave | Starts when | Milestones | What each carries beyond its row |
+|---|---|---|---|
+| **A** | S3 merges | **S6, S8** | S8: `vl ws exec --private-ports` and `--seed SRC:DEST` (phase 2 §4.9, owner idea); S6: the promisor's tips refreshed after every pull (the S3 review's note) |
+| **A** | S28 merges | **S29** | **a retention window for unreferenced objects** (thin clones made by S3 keep no anchors, so garbage collection must keep a deleted object long enough for any clone that still names it); unreferenced search segments (S15) |
+| **A** | S17 merges | **S18, S24**, S21's landing follow-up | S24: BUG-1187 (the server buffers request bodies with no connection cap); S21 follow-up: `vl pr land` submits to S17, and **landing onto a protected branch meets the review rules** by every route (owner decision, `HUB.md` §13.24) |
+| **B** | S6 / S8 merge | **S7, S11** | S11: **attempts, recorded dead ends** (`vl attempt drop --reason`, phase 2 §5.6, owner idea) |
+| **B** | S3, S14, S15 merge | **S16 + G3** | `vl log`/`blame`/`grep` over the query API (thin clones stop paging history for them); BUG-1214 (first blame ≈ 0.8 ms per version, gate 1 s at 10,000: parallel line maps in a bounded pool, or stored line hashes); PR search through S15's index (S21's search misses its 50 ms p99) |
+| **B** | S11, S17 merge | **S19** | **agents start from `main@tested` by default** (phase 4 §4.7, owner idea) |
+| **B** | S17 + S2 | **S22** | |
+| **B** | S21 merges | **S25** | |
+| **C** | S21, S22 | **S23** | |
+| **C** | S14, S19 | **S20** | |
+| **C** | phase 2 in | **G2** | Git beside Veil on the 1 GB profile (thin and full clone, status, log), on a quiet machine |
+| **D** | S17, S18, S24 (landing), S20 (bisect) | **G4** | |
+| — | owner approves | S26 | not in the first web client unless approved (product decision 13) |
+
+### Also on the plan (not milestones)
+
+* **Phase 1's final security pass** over the client, after S3 merges (thin clones change the client's trust surface most).
+* **The test sweep** (tests that pass when their action fails, the `CLAUDE.md` rule of 2026-11-08): run once over all tests, then held by review.
+* **Guide recipe: fork and race** (`vl ws new try-a -r @` … `vl ws exec` in parallel; keep the winner, record the rest as attempts).
+* **Clean-ups filed during reviews:** the search index resumed twice for one project at start (S15 cycle 2 note); the landing batch limit (64) re-measured once packs (S28) land.
+* **The deployment kit, then the DigitalOcean test:** a server image, YugabyteDB or PostgreSQL, object storage, `vl` on agent machines; the gate benchmarks at the real scale. **Asked of the owner before anything is rented.**
 
 ## Product decisions for the owner (from all three documents)
 

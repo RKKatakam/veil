@@ -389,29 +389,34 @@ fn limits_stop_runaways_and_vl_still_records() {
         backends.push("systemd");
     }
     for backend in backends {
-        let run = |flags: &[&str], body: &str, file: &str| -> (String, Duration) {
+        let run = |flags: &[&str], body: &str, file: &str| -> String {
             let script = format!("echo {backend} > {file}; {body}");
             let mut args = vec!["ws", "exec", "agent"];
             args.extend_from_slice(flags);
             args.extend(["--", "sh", "-c", &script]);
-            let start = Instant::now();
             let o = t.cmd(&t.proj, &args).env("VEIL_EXEC_LIMITS_BACKEND", backend).output().unwrap();
             let out = text(&o);
             assert!(out.contains("Recorded") || out.contains("No changes"), "{backend}: not recorded: {out}");
             assert_eq!(t.cat(file).as_deref(), Some(format!("{backend}\n").as_str()), "{backend}: {out}");
-            (out, start.elapsed())
+            out
         };
-        let (out, took) = run(&["--cpu-time", "1s"], "while :; do :; done", "cpu.txt");
+        // What stopped each run is vl's own report, never how long it took
+        // (BUG-1085: wall-clock bounds failed under load).
+        let out = run(&["--cpu-time", "1s"], "while :; do :; done", "cpu.txt");
         assert!(out.contains("stopped: CPU-time limit (1s) reached"), "{backend}: {out}");
-        assert!(took < Duration::from_secs(20), "{backend}: {took:?}");
-        let (out, _) = run(&["--memory", "64M"], "head -c 4G /dev/zero | tail -n 1 > /dev/null", "mem.txt");
+        let out = run(&["--memory", "64M"], "head -c 4G /dev/zero | tail -n 1 > /dev/null", "mem.txt");
         assert!(out.contains("stopped: memory limit (64 MiB) reached"), "{backend}: {out}");
-        let (out, _) = run(&["--timeout", "1s"], "sleep 60", "time.txt");
+        let out = run(&["--timeout", "1s"], "sleep 60", "time.txt");
         assert!(out.contains("stopped: time limit (1s) reached"), "{backend}: {out}");
-        let (out, _) = run(
-            &["--pids", "32", "--timeout", "8s"],
-            // Counted with built-ins as it goes: `sh` gives up at a refused fork.
-            "rm -f count.txt; i=0; while [ $i -lt 400 ]; do sleep 4 & i=$((i+1)); echo $i > count.txt; done 2>/dev/null; wait",
+        let out = run(
+            // The timeout only stops a run whose limit failed (a hang).
+            &["--pids", "32", "--timeout", "60s"],
+            // Each child waits on a FIFO, so they pile up however slowly
+            // the machine forks (no timer to race, BUG-1085). Counted with
+            // built-ins as it goes: the subshell gives up at a refused fork,
+            // and then the children are let go; if every fork succeeded,
+            // the shell waits on the FIFO too until the storm is stopped.
+            "rm -f count.txt f; mkfifo f; (i=0; while [ $i -lt 400 ]; do { read x < f; } & i=$((i+1)); echo $i > count.txt; done) 2>/dev/null && read x < f; : > f; wait",
             "pids.txt",
         );
         match backend {
@@ -1378,7 +1383,7 @@ fn without_overlayfs_the_allow_list_is_read_only_and_vl_says_so() {
     std::fs::write(cargo.join("work"), "not a folder").unwrap();
     let o = t.exec(&["agent", "--", "true"]);
     let out = text(&o);
-    assert!(o.status.success() && out.contains("the allow-list is read-only in this run") && out.contains("work"), "{out}");
+    assert!(o.status.success() && out.contains("the allow-list is read-only in this run") && out.contains("/work"), "{out}");
     assert!(!out.contains("overlayfs does not work"), "the warning blamed overlayfs: {out}");
     let out = text(&t.cmd(&t.proj, &["doctor"]).output().unwrap());
     assert!(out.contains("allow-list: writable"), "{out}");

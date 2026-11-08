@@ -1,4 +1,4 @@
--- Packs (S28, docs/HUB.md §13.18): the storage objects that hold many
+-- Packs (S28, docs/HUB.md §13.20): the storage objects that hold many
 -- objects of a project. One row per pack a transaction listed (`listed`:
 -- its objects are the project's) or discarded (not `listed`: a refused
 -- push's upload, deleted from storage after this row). The primary key

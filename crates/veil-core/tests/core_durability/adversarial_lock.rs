@@ -28,10 +28,15 @@ fn dropping_a_lock_never_releases_someone_elses_lock() {
 #[test]
 fn an_old_stale_lock_is_recovered() {
     let (mut a, fs, _) = new_repo("alice");
-    fs.write(&p(LOCK), format!("999999 {}", now_millis() - 600_000).as_bytes()).unwrap();
-    let start = Instant::now();
+    let stale = format!("999999 {}", now_millis() - 600_000);
+    fs.write(&p(LOCK), stale.as_bytes()).unwrap();
     a.transaction("after crash").unwrap().commit().unwrap();
-    assert!(start.elapsed() < Duration::from_secs(5));
+    // Taken over without waiting (counted on a simulated clock, BUG-970).
+    fs.write(&p(LOCK), stale.as_bytes()).unwrap();
+    let backend: Arc<dyn StorageBackend> = fs.clone();
+    let (l, waited) = crate::acquire_counting_wait(&backend, &veil_core::lock::LockOptions::for_backend(&*backend));
+    drop(l.unwrap());
+    assert_eq!(waited, Duration::ZERO);
 }
 
 #[test]
@@ -47,10 +52,15 @@ fn garbage_lock_file_is_treated_as_stale() {
 fn lock_of_a_dead_process_does_not_block_for_minutes() {
     let (mut a, fs, _) = new_repo("alice");
     // PID 2^22+1 is above Linux's pid_max default and never alive.
-    fs.write(&p(LOCK), format!("4194305 {}", now_millis()).as_bytes()).unwrap();
-    let start = Instant::now();
-    let r = a.transaction("after crash").map(|tx| tx.commit());
-    assert!(r.is_ok() && start.elapsed() < Duration::from_secs(5), "blocked for {:?}: {:?}", start.elapsed(), r.err());
+    let dead = format!("4194305 {}", now_millis());
+    fs.write(&p(LOCK), dead.as_bytes()).unwrap();
+    a.transaction("after crash").unwrap().commit().unwrap();
+    // Taken over without waiting (counted on a simulated clock, BUG-970).
+    fs.write(&p(LOCK), dead.as_bytes()).unwrap();
+    let backend: Arc<dyn StorageBackend> = fs.clone();
+    let (l, waited) = crate::acquire_counting_wait(&backend, &veil_core::lock::LockOptions::for_backend(&*backend));
+    drop(l.unwrap());
+    assert_eq!(waited, Duration::ZERO, "blocked for {waited:?}");
 }
 
 /// Many writers on one backend, each with its own `Repo` handle: every
@@ -124,9 +134,14 @@ fn concurrent_snapshots_of_different_workspaces_are_all_recorded() {
 /// A working copy that is slow to read (huge tree, network FS). Up to format
 /// 5 the snapshot held the lock for its whole duration and a concurrent
 /// writer waited. From format 6 nothing holds a lock: the writer goes
-/// through at once, and both operations are recorded (merged).
+/// through at once, and both operations are recorded (merged). The scan
+/// cannot finish before the writer has committed, so a writer that waited
+/// for it would never commit (BUG-970: no wall-clock bound).
 #[test]
 fn slow_snapshot_serialises_with_a_concurrent_writer() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    static SCANNING: AtomicBool = AtomicBool::new(false);
+    static WRITTEN: AtomicBool = AtomicBool::new(false);
     #[derive(Debug)]
     struct Slow(MemoryBackend);
     impl StorageBackend for Slow {
@@ -134,7 +149,11 @@ fn slow_snapshot_serialises_with_a_concurrent_writer() {
             "slow"
         }
         fn read(&self, p: &veil_core::VPath) -> veil_core::Result<Vec<u8>> {
-            std::thread::sleep(Duration::from_millis(15));
+            SCANNING.store(true, SeqCst);
+            let until = Instant::now() + Duration::from_secs(60);
+            while !WRITTEN.load(SeqCst) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             self.0.read(p)
         }
         fn write(&self, p: &veil_core::VPath, d: &[u8]) -> veil_core::Result<()> {
@@ -171,22 +190,22 @@ fn slow_snapshot_serialises_with_a_concurrent_writer() {
     let other = std::thread::spawn({
         let repo_fs = repo_fs.clone();
         move || {
-            std::thread::sleep(Duration::from_millis(200));
+            let until = Instant::now() + Duration::from_secs(60);
+            while !SCANNING.load(SeqCst) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             let mut r = Repo::open(repo_fs, None, "b").unwrap();
-            let start = Instant::now();
             let mut tx = r.transaction("concurrent tag").unwrap();
             let root = tx.repo().root_id();
             tx.view.tags.insert("b".into(), veil_core::oplog::Tag::new(root));
-            tx.commit().unwrap();
-            start.elapsed()
+            let committed = tx.commit();
+            WRITTEN.store(true, SeqCst);
+            committed.expect("the writer waited for the snapshot");
         }
     });
-    let start = Instant::now();
     let out = repo.snapshot_workspace(WS, &wc).unwrap();
-    let snap_time = start.elapsed();
-    let waited = other.join().unwrap();
-    assert!(out.changed && snap_time > Duration::from_secs(1));
-    assert!(waited < Duration::from_millis(500), "the writer waited for the snapshot ({waited:?})");
+    other.join().unwrap();
+    assert!(out.changed);
     let r = Repo::open(repo_fs, None, "c").unwrap();
     assert!(r.view().tags.contains_key("b"));
     assert_eq!(r.workspace_wc(WS).unwrap(), out.snapshot, "snapshot lost");
@@ -266,10 +285,10 @@ fn a_clean_snapshot_needs_no_lock_and_large_content_still_records() {
     // Someone holds the lock for longer than any wait.
     let held = RepoLock::acquire(fs.clone()).unwrap();
     let mut b = Repo::open(fs.clone(), None, "b").unwrap();
-    let t = Instant::now();
-    let out = b.snapshot_workspace("default", &*fs).unwrap();
+    // The lock is held throughout: a snapshot that took it would fail once
+    // its wait ran out.
+    let out = b.snapshot_workspace("default", &*fs).expect("a clean snapshot waited for the lock");
     assert!(!out.changed);
-    assert!(t.elapsed() < Duration::from_secs(5), "a clean snapshot waited for the lock");
     drop(held);
     // More new content than the staging budget: built under the lock.
     let big: Vec<u8> = (0..veil_core::store::STAGING_BUDGET + 4096).map(|i| (i * 7 % 251) as u8).collect();

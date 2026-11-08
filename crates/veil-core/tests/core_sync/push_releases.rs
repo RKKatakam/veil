@@ -161,7 +161,10 @@ proptest! {
 }
 
 /// Many clients push their own tags to one repository on disk at once:
-/// every push lands (one at a time, under its lock) and it is complete.
+/// every push lands (one at a time, under its lock) and it is complete. A
+/// push that found the lock busy for its whole wait (15 s; twelve pushers
+/// on a loaded machine) says so and is run again, as its user would, until
+/// a deadline (BUG-1010).
 #[test]
 fn many_concurrent_pushers_to_one_repository() {
     let tmp = tempfile::tempdir().unwrap();
@@ -186,7 +189,13 @@ fn many_concurrent_pushers_to_one_repository() {
                     ws.write(&format!("agents/{i}.txt"), &body).unwrap();
                     let (c, _) = me.commit_ephemeral(&ws, "work").unwrap();
                     me.set_tag(&format!("agent-{i}"), c, true).unwrap();
-                    let rep = remote::push(&mut me, hub.clone(), false, &[format!("agent-{i}")], false).unwrap();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+                    let rep = loop {
+                        match remote::push(&mut me, hub.clone(), false, &[format!("agent-{i}")], false) {
+                            Err(veil_core::VeilError::Locked(_)) if std::time::Instant::now() < deadline => continue,
+                            r => break r.unwrap(),
+                        }
+                    };
                     assert!(rep.tags_updated.iter().any(|(t, s)| *t == format!("agent-{i}") && *s == c), "{rep:#?}");
                     tips.push((c, body));
                 }

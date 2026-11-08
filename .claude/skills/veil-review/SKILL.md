@@ -112,6 +112,7 @@ For each lens, read the diff **against the whole codebase and the brief's intent
      - wall-clock ratios;
      - leak checks that grep for a short needle (under ~8 bytes): it turns up by chance in ciphertext and compressed packs. Always grep for the whole marker;
      - asserting that something happened (liveness) before checking nothing leaked (safety).
+   - **Does every test assert that its primary action succeeded (or was refused, for a refusal test) before anything else?** Reject conditional assertions on the action under test (`if ok { … }`, `if let Ok(..)`, `if r.status == 200 { … }`, an early `return` when it failed): such a test passes when the action fails. BUG-1103's reproduction passed while every 2-change stack was refused (BUG-1110). Check new and changed tests for it, and spot-check the tests a fix claims as proof.
    - Do `CLAUDE.md`, the guide, `ARCHITECTURE.md` and `FORMAT.md` still tell the truth? **Docs that lie are a bug.**
 
 **Drop style, formatting and cleanup-only findings.** Clippy and rustdoc enforce those.
@@ -228,6 +229,7 @@ When the owner wants to understand an area, generate an explainer of that exact 
 - **No new dependency without a stated reason.**
 - **Scratch work stays in the worktree's `.scratch/`.** Never `rm -rf` outside the worktree; it stalls agents on an approval.
 - **Tests join an existing binary** per crate (`cli_security`, `core_engine`, …).
+- **Every test asserts a positive outcome for the action under test** (`assert_eq!(status, Landed)`), never `if ok { … }` around its assertions. A test that would pass when the action fails is a finding (tier C on its own; blocking when it is a fix's only proof).
 
 **Skip:**
 - `Cargo.lock`;

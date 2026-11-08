@@ -45,6 +45,7 @@ bash scripts/verify-server.sh
 - Every bug has a `docs/BUGS.md` row and an `#[ignore = "BUG-NNN: …"]` reproduction until fixed.
 - New tests join an existing test binary (`cli_security`, `core_engine`, …).
 - In tests, never name a tag that crosses a pull with only the letters k–z, and never substring-match random change ids.
+- **Every test asserts that the action under test succeeded** (e.g. `assert_eq!(answer, Landed)`, `assert!(out.status.success())`) before checking anything else. Never guard the assertions behind the outcome (`if ok { … }`, `if let Ok(..)`, `if status == 200`): a test that passes when the action fails tests nothing (BUG-1103's test passed while 2-change stacks were broken, BUG-1110). A test of a refusal asserts the refusal just as exactly.
 - Scratch work goes in `.scratch/`, never `rm -rf` outside the worktree, and `target/` is deleted when done.
 - Make the smallest change that closes the bug's whole class. Add no flags, options or abstractions the task doesn't need.
 - Reviews follow the `veil-review` skill (`.claude/skills/veil-review/SKILL.md`).

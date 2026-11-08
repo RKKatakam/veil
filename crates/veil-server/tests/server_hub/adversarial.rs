@@ -461,7 +461,7 @@ fn a_later_device_is_confirmed_by_its_person() {
     let api = hub.api();
     // Pending: anyone on Earth until confirmed.
     let d = laptop.dir("early");
-    let _ = laptop.run(laptop.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+    laptop.ok(laptop.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
     assert_no_marker(&everything_in(&d), &[BILL_MARK, ENV_MARK], "a pending device");
     // fin confirms it from the device they already use.
     let fp = laptop.fingerprint();
@@ -599,18 +599,10 @@ fn bug_834_a_conflict_names_no_hidden_object() {
         },
     );
     let r = c.push("main", "a conflict");
-    if r.status == 200 {
-        let tip = api.tips(Some(&p.dev.token()), &p.name).unwrap().branches["main"];
-        let f = api.post_json(
-            Some(&p.dev.token()),
-            &format!("/v1/projects/{}/fetch", p.name),
-            &json!({"snapshot": tip.hex(), "objects": [{"path": "src/c.txt", "id": real.hex()}]}),
-        );
-        assert!(
-            !String::from_utf8_lossy(&f.body).contains(BILL_MARK),
-            "a hidden file was served through a conflict that names it"
-        );
-    }
+    // Refused: the conflict names an object the pusher cannot see, which
+    // the server answers as it answers one that does not exist.
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["message"], format!("missing object {}", real.short()), "{}", String::from_utf8_lossy(&r.body));
 }
 
 /// BUG-835. Attacker: a compromised server, with a person it will help
@@ -716,7 +708,7 @@ fn a_view_without_the_policy_never_seals_a_local_only_file() {
     p.admin.ok(&p.dir, &["push"]);
     // fin pulls, commits other work, and pushes.
     p.fin.ok(&d, &["pull"]);
-    let _ = p.fin.run(&d, &["new", "main"]);
+    p.fin.ok(&d, &["new", "main"]);
     write_files(&d, &[(&format!("{BILL_DIR}/q.txt") as &str, "q")]);
     if std::fs::read_to_string(d.join(BILL_DIR).join(".netrc")).unwrap_or_default() != mine {
         write_files(&d, &[(&format!("{BILL_DIR}/.netrc") as &str, mine)]);
@@ -728,4 +720,64 @@ fn a_view_without_the_policy_never_seals_a_local_only_file() {
     let got = std::fs::read_to_string(p.dir.join(BILL_DIR).join(".netrc")).unwrap_or_default();
     assert!(!got.contains("MARKER-FINS-OWN-NETRC-5b1e"), "fin's local-only credential was sealed and pushed: {got:?}");
     assert!(got.contains("theirs"), "{got:?}");
+}
+
+/// The server bounds the memory its requests' bodies take, all of them at
+/// once. Each request's body is buffered whole before anything checks it
+/// (`db::retry_requests`, up to 64 MiB a request, `db::body_limit`), and
+/// nothing bounds how many are buffered at once: 8 clients (anyone on
+/// Earth, no session) that each send 56 MiB of a body and stop grow the
+/// server by about 450 MiB. Pre-existing (S1); milestone S24.
+#[test]
+#[ignore = "BUG-1187: the server buffers request bodies of up to 64 MiB each, any number at once"]
+fn bug_1187_request_bodies_are_buffered_without_a_bound_on_how_many() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering::Relaxed},
+        Arc,
+    };
+    struct Stops {
+        left: usize,
+        gate: std::sync::mpsc::Receiver<()>,
+        sent: Arc<AtomicUsize>,
+    }
+    impl Read for Stops {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.left == 0 {
+                let _ = self.gate.recv();
+                return Err(std::io::Error::other("the client went away"));
+            }
+            let n = buf.len().min(self.left).min(64 << 10);
+            buf[..n].fill(b' ');
+            self.left -= n;
+            self.sent.fetch_add(n, Relaxed);
+            Ok(n)
+        }
+    }
+    let rss = || {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        let kib: usize = s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)).unwrap().parse().unwrap();
+        kib << 10
+    };
+    let hub = TestHub::start();
+    let (n, len) = (8, 56usize << 20);
+    let sent = Arc::new(AtomicUsize::new(0));
+    std::thread::sleep(Duration::from_secs(1));
+    let before = rss();
+    let gates: Vec<_> = (0..n)
+        .map(|_| {
+            let (tx, gate) = std::sync::mpsc::channel::<()>();
+            let (api, sent) = (hub.api(), sent.clone());
+            std::thread::spawn(move || drop(api.post_reader("/v1/objects/anything:batch", Stops { left: len, gate, sent })));
+            tx
+        })
+        .collect();
+    let t = Instant::now();
+    while sent.load(Relaxed) < n * len && t.elapsed() < Duration::from_secs(60) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    let grew = rss().saturating_sub(before) >> 20;
+    drop(gates);
+    eprintln!("server: {n} request bodies of {} MiB, stopped before their end: RSS +{grew} MiB", len >> 20);
+    assert!(grew <= 128, "{n} unfinished request bodies grew the server by {grew} MiB");
 }

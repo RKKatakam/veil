@@ -517,7 +517,7 @@ fn the_vault_never_reaches_a_public_remote() {
     assert!(record_files(&*public, "team").is_empty());
     assert!(!public.exists(&VPath::new(TEAM_VAULT_DIR).unwrap()).unwrap());
     // Also after a gc packs everything, and a second push.
-    veil_core::gc::gc(&mut alice.repo, &veil_core::gc::GcOptions::default()).ok();
+    veil_core::gc::gc(&mut alice.repo, &veil_core::gc::GcOptions::default()).unwrap();
     push_public(&mut alice, &public);
     assert!(!public.exists(&VPath::new(TEAM_VAULT_DIR).unwrap()).unwrap());
     // A public remote that holds records (planted, or a team remote added

@@ -11,7 +11,9 @@
 //! | [`sync`] | projected history, fetch by id, push validation, branch CAS |
 //! | [`changes`] | commits through the API: edits on a revision, the push's checks, one commit |
 //! | [`grant`] | read grants, the object routes, the access-epoch feed |
+//! | [`cache`] | the regional cache (`veil-server cache`, S9), and the epoch feed it polls |
 //! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
+//! | [`query`] | the query API: history answered per viewer (S13) |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
 //! | [`store`] | object storage: local directory or S3 |
 //! | [`pack`] | packs: a push's objects in one storage object, read by range (S28) |
@@ -19,6 +21,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod cache;
 pub mod caches;
 pub mod changes;
 pub mod db;
@@ -27,6 +30,8 @@ pub mod error;
 pub mod grant;
 pub mod pack;
 pub mod perm;
+pub mod query;
+pub mod search;
 pub mod shares;
 pub mod store;
 pub mod sync;
@@ -61,6 +66,9 @@ pub struct Hub {
     /// The grant key (`<data>/hub-grant-key`) and what it needs
     /// (`grant`).
     pub grants: grant::Grants,
+    /// The hash of the regional caches' token (`<data>/hub-cache-token`):
+    /// what `POST /v1/cache/epochs` accepts (`cache::feed`).
+    pub cache_token: blake3::Hash,
     pub session_ttl_ms: i64,
     /// The TLS certificate (leaf, DER): sign-in accepts only signatures
     /// for a server name it is valid for.
@@ -69,6 +77,9 @@ pub struct Hub {
     pub caches: caches::Caches,
     /// The derive workers (`derive::landed`).
     pub derive: derive::Workers,
+    /// The query API's caches and the viewer-graph fills running here
+    /// (`query::graph`).
+    pub query: query::graph::State,
 }
 
 pub type HubState = Arc<Hub>;
@@ -152,6 +163,7 @@ pub async fn start(config: Config) -> Result<Running> {
     let identity = server_identity(&config.data_dir)?;
     let receipt_key = receipt_key(&config.data_dir)?;
     let grants = grant::Grants::load(&config.data_dir).context("reading hub-grant-key")?;
+    let cache_token = cache::feed::load_token(&config.data_dir).context("reading hub-cache-token")?;
     let (tls, cert_pem, certificate) = tls::server_config(&config.tls, &config.data_dir)?;
     let db = db::connect(&config.database_url, config.db_connections).await.context("connecting to the database")?;
     db::migrate(&db).await.context("migrating the database")?;
@@ -179,10 +191,12 @@ pub async fn start(config: Config) -> Result<Running> {
         identity,
         receipt_key,
         grants,
+        cache_token,
         session_ttl_ms: config.session_ttl.as_millis() as i64,
         certificate,
         caches: caches::Caches::default(),
         derive: derive::Workers::new(derive_db),
+        query: query::graph::State::default(),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
@@ -190,9 +204,16 @@ pub async fn start(config: Config) -> Result<Running> {
     let app = api::router(hub.clone());
     // Push notices drop other servers' cached tips (`caches::listen`).
     tokio::spawn(caches::listen(hub.clone(), rx.clone()));
-    let task = tokio::spawn(serve_tls(listener, tls, app, rx));
+    let task = tokio::spawn(serve_tls(listener, tls, app, rx, None));
     if config.catch_up_at_start {
-        tokio::spawn(store::in_background(derive::resume(hub.clone(), None)));
+        tokio::spawn(store::in_background({
+            let hub = hub.clone();
+            async move {
+                derive::resume(hub.clone(), None).await;
+                // The search index follows (S15, BUG-1231).
+                crate::search::index::resume(hub, None).await;
+            }
+        }));
     }
     Ok(Running {
         addr,
@@ -207,14 +228,46 @@ pub async fn start(config: Config) -> Result<Running> {
 /// a request's head.
 const IDLE_LIMIT: Duration = Duration::from_secs(20);
 
-async fn serve_tls(
+/// What a regional cache bounds per connection (BUG-1181, BUG-1183), so
+/// that its memory is `--memory` plus `max_connections` times what one
+/// connection holds (`docs/HUB.md` §13.18), and every connection slot is
+/// given back in bounded time.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ConnectionLimits {
+    /// A connection whose writes stall, or fall below the minimum rate, is
+    /// closed.
+    pub pace: cache::deadline::Pace,
+    /// At most this many are open at once; the next waits in the
+    /// listener's queue until one closes.
+    pub max_connections: usize,
+    /// The HTTP layer's read and write buffers per connection. HTTP/1.1
+    /// only: HTTP/2 would keep a send buffer per stream.
+    pub buffer: usize,
+}
+
+/// TLS records waiting to be sent per connection, with [`ConnectionLimits`]:
+/// one record (rustls's default is 64 KiB).
+const TLS_SEND_BUFFER: usize = 16 << 10;
+
+/// Serve `app` over TLS until `stop`, with `limits` (the regional cache's)
+/// or none (the server's).
+pub(crate) async fn serve_tls(
     listener: tokio::net::TcpListener,
     tls: Arc<rustls::ServerConfig>,
     app: axum::Router,
     mut stop: tokio::sync::watch::Receiver<bool>,
+    limits: Option<ConnectionLimits>,
 ) {
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    let open = limits.map(|l| Arc::new(tokio::sync::Semaphore::new(l.max_connections.max(1))));
     loop {
+        let slot = match &open {
+            Some(open) => tokio::select! {
+                s = open.clone().acquire_owned() => s.ok(),
+                _ = stop.changed() => return,
+            },
+            None => None,
+        };
         let (tcp, _) = tokio::select! {
             r = listener.accept() => match r {
                 Ok(c) => c,
@@ -230,12 +283,21 @@ async fn serve_tls(
         let acceptor = acceptor.clone();
         let app = app.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             // A connection that never finishes its handshake, or never sends
             // a request's head, is closed: idle sockets cannot pile up.
-            let Ok(Ok(stream)) = tokio::time::timeout(IDLE_LIMIT, acceptor.accept(tcp)).await else { return };
+            let Ok(Ok(mut stream)) = tokio::time::timeout(IDLE_LIMIT, acceptor.accept(tcp)).await else { return };
+            if limits.is_some() {
+                stream.get_mut().1.set_buffer_limit(Some(TLS_SEND_BUFFER));
+            }
             let service = hyper_util::service::TowerToHyperService::new(app);
             let mut b = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
             b.http1().timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(IDLE_LIMIT);
+            if let Some(l) = limits {
+                b = b.http1_only();
+                b.http1().max_buf_size(l.buffer);
+            }
+            let stream = cache::deadline::WriteDeadline::new(stream, limits.map(|l| l.pace));
             let _ = b.serve_connection(hyper_util::rt::TokioIo::new(stream), service).await;
         });
     }

@@ -1,5 +1,5 @@
 //! Packs (S28, `docs/design/server/storage-and-cost.md` §7, `docs/HUB.md`
-//! §13.18): many objects of a project in one storage object, so a push
+//! §13.20): many objects of a project in one storage object, so a push
 //! costs one storage write instead of one per object.
 //!
 //! **Layout** (one storage object, `p/<project>/pack/<name>`, `name` 32

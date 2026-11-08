@@ -312,7 +312,13 @@ impl Reply {
 
 impl Api {
     fn new(hub: &TestHub) -> Api {
-        let certs: Vec<ureq::tls::Certificate<'static>> = ureq::tls::parse_pem(hub.cert_pem.as_bytes())
+        Api::at(&hub.authority(), &hub.cert_pem)
+    }
+
+    /// A client of the HTTPS server at `authority` (a regional cache, say)
+    /// whose certificate is `cert_pem`.
+    pub fn at(authority: &str, cert_pem: &str) -> Api {
+        let certs: Vec<ureq::tls::Certificate<'static>> = ureq::tls::parse_pem(cert_pem.as_bytes())
             .filter_map(|i| match i {
                 Ok(ureq::tls::PemItem::Certificate(c)) => Some(c),
                 _ => None,
@@ -331,8 +337,8 @@ impl Api {
             .new_agent();
         Api {
             agent,
-            base: format!("https://{}", hub.authority()),
-            authority: hub.authority(),
+            base: format!("https://{authority}"),
+            authority: authority.to_string(),
         }
     }
 
@@ -381,13 +387,46 @@ impl Api {
         Self::finish(r.send(body))
     }
 
+    /// POST JSON with extra headers (a cache's token, …).
+    pub fn post_with(&self, path: &str, body: &[u8], headers: &[(&str, &str)]) -> Reply {
+        let mut r = self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json");
+        for (k, v) in headers {
+            r = r.header(*k, *v);
+        }
+        Self::finish(r.send(body))
+    }
+
     pub fn post_json(&self, token: Option<&str>, path: &str, v: &serde_json::Value) -> Reply {
         self.post(token, path, &serde_json::to_vec(v).unwrap(), true)
+    }
+
+    /// POST JSON, failing the test only after `limit` (instead of the
+    /// agent's 120 s): for requests whose duration a test scales from a
+    /// baseline measured in the same run.
+    pub fn post_json_within(&self, token: &str, path: &str, v: &serde_json::Value, limit: std::time::Duration) -> Reply {
+        let r = self.agent.post(format!("{}{path}", self.base)).header("authorization", &format!("Bearer {token}")).header("content-type", "application/json");
+        Self::finish(r.config().timeout_global(Some(limit)).build().send(&serde_json::to_vec(v).unwrap()[..]))
     }
 
     /// POST JSON, leaving the answer's body unread (a client that stalls).
     pub fn post_unread(&self, path: &str, body: &[u8]) -> ureq::http::Response<ureq::Body> {
         self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json").send(body).unwrap()
+    }
+
+    /// POST a body read from `body` as it is sent (chunked): a client that
+    /// sends slowly, or stops.
+    pub fn post_reader(&self, path: &str, body: impl std::io::Read + Send + 'static) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json").send(ureq::SendBody::from_owned_reader(body))
+    }
+
+    /// GET with extra headers, leaving the answer's body unread (a client
+    /// that stalls).
+    pub fn get_unread(&self, path: &str, headers: &[(&str, &str)]) -> ureq::http::Response<ureq::Body> {
+        let mut r = self.agent.get(format!("{}{path}", self.base));
+        for (k, v) in headers {
+            r = r.header(*k, *v);
+        }
+        r.call().unwrap()
     }
 
     /// POST JSON as a `vl` that reads encoded frames (compressed objects).

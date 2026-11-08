@@ -219,19 +219,28 @@ fn deep_edit_in_a_child() {
 /// Changes within the documented limits (10,000 edits; here 1,000 files
 /// 100 folders deep, 100,000 objects from a 236 KB request) land on an S3
 /// store (MinIO here): the server does not send every object at once.
+/// The deep change is ten times the objects of the flat one and took about
+/// 22 times as long; under load both stretch alike, so the deep change may
+/// take 60 times the flat one's duration, measured first in the same run,
+/// before it counts as hung (with the 120 s of every other request at the
+/// least): a fixed limit failed on a loaded machine.
 #[test]
 fn bug_1053_a_change_of_ten_thousand_files_lands_on_s3() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
     let token = p.dev.token();
     let base = tip(&hub, &token, &p.name);
+    let path = format!("/v1/projects/{}/changes", p.name);
+    let flat: Vec<Value> = (0..10_000).map(|i| put(&format!("src/many/{i}.txt"), &format!("file {i}\n"))).collect();
+    let t = std::time::Instant::now();
+    let r = change(&hub, &token, &p.name, &json!({"base": base.hex(), "edits": flat}));
+    let baseline = t.elapsed();
+    assert_eq!(r.status, 200, "{}", body(&r));
     let chain = vec!["d"; 98].join("/");
     let deep: Vec<Value> = (0..1_000).map(|i| put(&format!("src/deep/{i}/{chain}"), &format!("file {i}\n"))).collect();
-    let flat: Vec<Value> = (0..10_000).map(|i| put(&format!("src/many/{i}.txt"), &format!("file {i}\n"))).collect();
-    for edits in [deep, flat] {
-        let r = change(&hub, &token, &p.name, &json!({"base": base.hex(), "edits": edits}));
-        assert_eq!(r.status, 200, "{}", body(&r));
-    }
+    let limit = (baseline * 60).max(std::time::Duration::from_secs(120));
+    let r = hub.api().post_json_within(&token, &path, &json!({"base": base.hex(), "edits": deep}), limit);
+    assert_eq!(r.status, 200, "{}", body(&r));
 }
 
 /// A member stacks a change on their own unlanded one (as §13.13 says to:

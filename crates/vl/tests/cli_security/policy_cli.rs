@@ -332,10 +332,9 @@ fn access_edits_the_line_that_decides() {
 }
 
 /// BUG-839 (pre-existing). An access line over a folder that holds a
-/// shared secret publishes nothing, yet every snapshot warns that the
-/// policy tries to make the secret public.
+/// shared secret publishes nothing, so no snapshot may warn that the policy
+/// tries to make the secret public; a line that names `public` still warns.
 #[test]
-#[ignore = "BUG-839: an access line over a shared secret warns that it makes it public"]
 fn bug_839_an_access_line_does_not_warn_that_it_publishes_a_secret() {
     let env = Env::new();
     let proj = env.dir("proj");
@@ -344,4 +343,8 @@ fn bug_839_an_access_line_does_not_warn_that_it_publishes_a_secret() {
     write(&proj, "ledger/.env", "TOKEN=LEDGER-SECRET-VALUE-39cc\n");
     let out = env.ok("alice", &proj, &["commit", "-m", "c"]);
     assert!(!out.contains("tries to make built-in secret"), "{out}");
+    env.ok("alice", &proj, &["access", "ledger/", "finance", "public"]);
+    write(&proj, "ledger/b.txt", "b\n");
+    let out = env.ok("alice", &proj, &["commit", "-m", "d"]);
+    assert!(out.contains("tries to make built-in secret path ledger/.env public"), "{out}");
 }

@@ -328,6 +328,11 @@ fn peak_kib() -> u64 {
 #[cfg(target_os = "linux")]
 #[test]
 fn pruning_memory_is_the_inventory_bits_not_the_objects() {
+    // The peak is the process's: alone in one, so no other test's threads
+    // add to it (BUG-970).
+    if !crate::in_own_process("maintenance::pruning_memory_is_the_inventory_bits_not_the_objects") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let fs: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(tmp.path()));
     let id = Identity::generate("alice");
@@ -547,11 +552,11 @@ fn a_dead_transactions_registration_neither_blocks_nor_stays() {
     repo.abandon(old).unwrap();
     let dead = veil_core::lock::owner_tag(&veil_core::lock::HostIdentity::current(), 999_999, 0, veil_core::now_millis());
     fs.create_dir_all(&p(&format!(".veil/objects/incoming/{}{dead}", maintenance::LIVE_PREFIX))).unwrap();
-    let started = std::time::Instant::now();
     let mut g = open(&fs, &id);
     let r = gc(&mut g, &GcOptions { grace: Duration::ZERO, keep_ops: Some(Duration::ZERO), now: Some(veil_core::now_millis() + 60_000), ..GcOptions::default() }).unwrap();
-    assert!(started.elapsed() < Duration::from_secs(3), "gc waited for a dead transaction");
-    assert!(r.deleted > 0 && r.deferred.is_none(), "{r:?}");
+    // A live registration would have kept the fence down until gc gave up
+    // and deferred (BUG-970: no wall-clock bound needed).
+    assert!(r.deleted > 0 && r.deferred.is_none(), "gc waited for a dead transaction: {r:?}");
     assert!(fs.list_dir(&p(".veil/objects/incoming")).map(|v| v.is_empty()).unwrap_or(true));
 }
 
@@ -699,11 +704,11 @@ fn a_pulls_remote_loose_objects_are_spooled_and_checked() {
     remote::push(&mut alice, hub.clone(), false, &[], false).unwrap();
     let blob_id = ObjectId::hash(&Object::Blob(b"c-811\n".to_vec()).encode());
     let path = p(&format!(".veil/objects/{}/{}", &blob_id.hex()[..2], &blob_id.hex()[2..]));
-    if hub.exists(&path).unwrap() {
-        hub.write(&path, b"veil:blob\nnot what it should be").unwrap();
-        let _ = remote::pull(&mut bob, "origin", hub.clone());
-        assert!(bob.store().get_raw(&blob_id).map_or(true, |raw| ObjectId::hash(&raw) == blob_id));
-    }
+    assert!(hub.exists(&path).unwrap(), "control: the pushed blob is a loose object on the remote");
+    hub.write(&path, b"veil:blob\nnot what it should be").unwrap();
+    let err = remote::pull(&mut bob, "origin", hub.clone()).unwrap_err().to_string();
+    assert!(err.contains("content does not match its hash"), "{err}");
+    assert!(bob.store().get_raw(&blob_id).map_or(true, |raw| ObjectId::hash(&raw) == blob_id));
     assert_fsck_clean(bfs, &id, "after pulling loose objects");
 }
 

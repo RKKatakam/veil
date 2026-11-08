@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::{attr_cmd, history, hooks, rewrite_cmd};
+use crate::{attr_cmd, history, hooks, rewrite_cmd, search_cmd};
 
 /// `vl -V`: version, the commit it was built from and the repository format
 /// it reads and writes.
@@ -292,6 +292,14 @@ pub enum Cmd {
     /// skipped. Exits 1
     /// when nothing matches.
     Grep(history::GrepArgs),
+    /// Search the project on its Veil server: code at a branch tip, ranked,
+    /// or file names over all of its history (`--path`).
+    ///
+    /// The server (`origin`) searches only what you may see: folders you
+    /// cannot see are never found, counted or ranked, and secret files are
+    /// found by name, never by content. Every word must occur (in any
+    /// case). Exits 1 when nothing matches.
+    Search(search_cmd::SearchArgs),
     /// Find the change that introduced a problem by binary search.
     ///
     /// `start` checks out the first candidate (as `vl new` does); mark each
@@ -786,6 +794,7 @@ impl Cmd {
             | Cmd::Squash { out, .. }
             | Cmd::Blame(history::BlameArgs { out, .. })
             | Cmd::Grep(history::GrepArgs { out, .. })
+            | Cmd::Search(search_cmd::SearchArgs { out, .. })
             | Cmd::Duplicate(rewrite_cmd::DuplicateArgs { out, .. })
             | Cmd::CherryPick(rewrite_cmd::CherryPickArgs { out, .. })
             | Cmd::Attr(attr_cmd::AttrArgs { cmd: attr_cmd::AttrCmd::Check { out, .. } }) => out,

@@ -292,10 +292,7 @@ fn divergent_change_is_reported_when_used() {
     let old = r.sid("@-");
     r.ok(&["describe", "-r", "@-", "-m", "one, v2"]);
     // Make the old version visible again: a workspace on its snapshot id.
-    let out = r.run(&["ws", "new", "old", "-r", &old]);
-    if !out.status.success() {
-        return; // hidden snapshots are not addressable: no divergence possible this way
-    }
+    r.ok(&["ws", "new", "old", "-r", &old]);
     let err = r.fails(&["show", &change[..8]]);
     assert!(err.contains("divergent"), "{err}");
     let log = r.out(&["log"]);
