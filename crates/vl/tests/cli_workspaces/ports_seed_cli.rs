@@ -440,7 +440,6 @@ fn hostile_seeds_are_refused_before_anything_runs() {
 /// which the allow-list masks (`~/.cargo` is allowed without its
 /// `credentials.toml`, explicitly allowed or not), are readable at `DEST`.
 #[test]
-#[ignore = "BUG-1363: --seed shows the credential files the allow-list masks (cargo's credentials.toml)"]
 fn bug_1363_a_seed_never_shows_the_credentials_the_allow_list_masks() {
     let t = T::new();
     write(&t.home, ".cargo/credentials.toml", "token = \"CARGO-CRED-TOKEN-5c1e9a07\"\n");
@@ -460,7 +459,6 @@ fn bug_1363_a_seed_never_shows_the_credentials_the_allow_list_masks() {
 /// `/etc`, `/opt`) cannot be made, and `vl` says that confinement does not
 /// work on this machine and to install bubblewrap.
 #[test]
-#[ignore = "BUG-1364: --seed at a DEST under a read-only folder fails as 'confinement does not work on this machine'"]
 fn bug_1364_a_seed_where_the_sandbox_is_read_only_is_refused_as_such() {
     let t = T::new();
     let src = t.env.dir("seed-src");
@@ -472,4 +470,23 @@ fn bug_1364_a_seed_where_the_sandbox_is_read_only_is_refused_as_such() {
     assert!(out.contains("--seed") && out.contains("/usr/veil-seed-1364"), "the refusal names the seed: {out}");
     assert!(!out.contains("confinement does not work on this machine"), "{out}");
     assert!(t.cat("agent", "ran.txt").is_none(), "{out}");
+}
+
+/// BUG-1363, the whole class: the masks follow a credential wherever a seed
+/// shows it, here `$CARGO_HOME` inside a seed's source.
+#[test]
+fn a_seed_holding_cargo_home_masks_its_credentials() {
+    let t = T::new();
+    let tools = t.env.dir("toolchains");
+    write(&tools, "cargo/credentials.toml", "token = \"CARGO-HOME-CRED-0d61b2aa\"\n");
+    write(&tools, "cargo/bin/marker", "TOOLCHAIN-MARKER\n");
+    let spec = format!("{}:/srv/tools", tools.display());
+    let o = t
+        .cmd(&["ws", "exec", "agent", "--seed", &spec, "--", "bash", "-c", "cat /srv/tools/cargo/bin/marker; cat /srv/tools/cargo/credentials.toml; echo done"])
+        .env("CARGO_HOME", tools.join("cargo"))
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(o.status.success() && out.contains("TOOLCHAIN-MARKER") && out.contains("done"), "{}", text(&o));
+    assert!(!out.contains("CARGO-HOME-CRED-0d61b2aa"), "a seed showed $CARGO_HOME's credentials: {out}");
 }

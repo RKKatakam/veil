@@ -367,10 +367,15 @@ impl Recorder {
             Err(_) => lower_of(&repo, &repo.workspace_wc(ws)?)?,
         };
         let upper: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(&paths.upper));
+        // Large open files' content: anonymous files here, never in memory
+        // (BUG-1365).
+        let spill = paths.dir.join("spill");
+        private_dir(&spill)?;
         let whiteouts = paths.load_whiteouts();
         let fs = Arc::new(
             MountFs::new(lower, upper, whiteouts, Some(Box::new(DiskJournal { paths: paths.clone() })))
                 .with_files(Arc::new(DiskFiles::new(&paths.upper)))
+                .with_spill(spill)
                 .with_unseen(paths.load_unseen())
                 .with_links(repo.format() >= veil_core::object::GIT_PARITY_REPO_FORMAT),
         );
@@ -1147,6 +1152,9 @@ pub struct ExecMount {
     /// The private directory holding `dir`, when this run mounted it (and
     /// so unmounts it).
     ours: Option<PathBuf>,
+    /// The mount is an earlier `vl ws exec`'s, which did not finish (`vl`
+    /// was killed): what it held was recorded before this run.
+    pub recovered: bool,
 }
 
 /// Mount `ws` for a run in a private directory (`$XDG_RUNTIME_DIR`, or the
@@ -1159,7 +1167,8 @@ pub fn for_exec(root: &Path, ws: &str) -> Result<ExecMount> {
                 // An earlier run's own mount (that run was killed) is this
                 // run's to unmount.
                 let ours = mp.parent().filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(EXEC_PREFIX))).map(Path::to_path_buf);
-                return Ok(ExecMount { root: root.to_path_buf(), ws: ws.to_string(), dir: mp, ours });
+                let recovered = ours.is_some();
+                return Ok(ExecMount { root: root.to_path_buf(), ws: ws.to_string(), dir: mp, ours, recovered });
             }
             (false, Some(old)) if is_mounted(&old) => {
                 let _ = fuse_unmount(&old, true);
@@ -1175,7 +1184,7 @@ pub fn for_exec(root: &Path, ws: &str) -> Result<ExecMount> {
     private_dir(&parent).with_context(|| format!("creating {}", parent.display()))?;
     let made = mountpoint(root, &parent.join("files")).and_then(|dir| start(root, ws, &dir, 0).map(|_| dir));
     match made {
-        Ok(dir) => Ok(ExecMount { root: root.to_path_buf(), ws: ws.to_string(), dir, ours: Some(parent) }),
+        Ok(dir) => Ok(ExecMount { root: root.to_path_buf(), ws: ws.to_string(), dir, ours: Some(parent), recovered: false }),
         Err(e) => {
             let _ = remove_tree(&parent);
             Err(e)
@@ -1184,6 +1193,16 @@ pub fn for_exec(root: &Path, ws: &str) -> Result<ExecMount> {
 }
 
 impl ExecMount {
+    /// Have the mount record what it holds now.
+    pub fn record(&self) -> Result<()> {
+        let st = Paths::new(&self.root, &self.ws).load_state()?.ok_or_else(|| anyhow!("the mount of workspace '{}' has no state", safe(&self.ws)))?;
+        let r = request(&st, "record", Duration::from_secs(600)).ok_or_else(|| anyhow!("the mount process does not answer"))??;
+        match r.error {
+            Some(e) => bail!(e),
+            None => Ok(()),
+        }
+    }
+
     /// After the run: the mount records what it holds into the workspace
     /// (its notes); one this run mounted is then unmounted.
     pub fn finish(self) -> Result<Vec<String>> {

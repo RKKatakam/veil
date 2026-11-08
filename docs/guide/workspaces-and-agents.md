@@ -318,8 +318,10 @@ $ vl ws exec try-a --private-ports --seed ~/seeds/pg16:/var/lib/pg -- ./run-test
   never see each other's writes. The layer lives in memory, and counts
   toward `--memory`. Both paths are absolute; `SRC` may not be `/`, your
   home or a folder holding it, the Veil home, or the project (inside or
-  holding them); `DEST` may not be `/` or where the sandbox shows the
-  project. A Postgres or Redis started inside the run on a seeded data
+  holding them); `DEST` may not be `/`, where the sandbox shows the
+  project, or inside a folder the sandbox shows read-only (`/usr`, `/etc`,
+  `/opt`, …). What the allow-list hides (cargo's `credentials.toml`) stays
+  hidden in a seed too. A Postgres or Redis started inside the run on a seeded data
   directory comes up in about a second.
 * **Fork and race** needs nothing more: `vl ws new try-a -r @` (and
   `try-b`, `try-c`), then `vl ws exec try-a --private-ports -- cargo test`
@@ -678,7 +680,13 @@ projection, so folders you may not see are not there, names included.
   together.
 * **A server that cannot be reached is an error** (`Input/output error`)
   for what was not fetched yet, never a missing or empty file; what was
-  fetched still reads.
+  fetched still reads. **The server's refusal** (your access was removed
+  since the folder was listed) is `Permission denied` when the file is
+  opened, and the file is left out of listings from then on (asked again
+  after 10 seconds).
+* Open files are held in memory only while small (up to 1 MiB, 64 MiB
+  across open files); larger ones are read from a private file without a
+  name, so a mount's memory does not grow with what is open.
 * What a mounted workspace has fetched stays in the clone's cache while
   the workspace is on it (`vl partial status`).
 
@@ -692,8 +700,10 @@ runs each command as you, on that workspace only:
 
 | Through the socket | |
 |---|---|
-| **Runs** | `status`, `diff`, `log`, `show`, `blame`; `commit`; `describe` of `@`; `new` on top of `@` |
-| **Refused** | everything else: access, groups, identity, other workspaces, `push`, `pull`, `undo`, `-R` |
+| **Runs** | `status`, `diff`, `log`, `show`, `blame`, of `@` and its ancestors only; `commit` (moving no tag: `--no-advance`); `describe` of `@`; `new` on top of `@` |
+| **Refused** | everything else: access, groups, identity, other workspaces (their changes too, `vl show other@`), the project directory's (`default@`), `push`, `pull`, `undo`, `-R` |
+
+A plain `vl log` inside shows the workspace's own history (`::@`).
 
 Before each command what the sandbox holds is recorded, so `vl status`
 and `vl commit` see the command's edits. Hooks never run for these

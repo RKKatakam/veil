@@ -321,6 +321,14 @@ pub trait Lower: StorageBackend {
     fn unseen_under(&self, _path: &VPath) -> Vec<VPath> {
         Vec::new()
     }
+
+    /// Does reading a file fetch it (a thin clone)? Then `open` reads it:
+    /// the kernel turns any error of a later read into `EIO`, so only at
+    /// `open` can the server's refusal (`EACCES`, and the file hidden from
+    /// then on) be told from a server that cannot be reached (`EIO`).
+    fn fetches(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -354,6 +362,26 @@ pub struct ReaderView {
     view: TreeView,
     /// The folders (by tree id) whose small files were fetched together.
     fetched_folders: Mutex<HashSet<ObjectId>>,
+}
+
+/// Objects the server refused at their place (not this person's: access
+/// removed since the tree was listed), with when: absent from listings and
+/// lookups for [`REFUSED_FOR`], whichever view of the tree asks (the
+/// mount's lower layer is made afresh at each recording); asked again after
+/// it, so access given back shows. One mount per process.
+static REFUSED: std::sync::LazyLock<Mutex<HashMap<ObjectId, std::time::Instant>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+const REFUSED_FOR: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn refused(id: &ObjectId) -> bool {
+    let mut r = REFUSED.lock().unwrap_or_else(|p| p.into_inner());
+    match r.get(id) {
+        Some(at) if at.elapsed() < REFUSED_FOR => true,
+        Some(_) => {
+            r.remove(id);
+            false
+        }
+        None => false,
+    }
 }
 
 /// Files up to this size are fetched with their folder (the first read of
@@ -398,6 +426,9 @@ impl ReaderView {
             },
             _ => e.clone(),
         };
+        if self.store.is_partial() && refused(&shown.id) {
+            return Ok(false);
+        }
         match shown.kind {
             EntryKind::Dir => Ok(false),
             EntryKind::File | EntryKind::Symlink if self.store.is_partial() && !self.store.has(&shown.id) => {
@@ -470,6 +501,10 @@ impl ReaderView {
 }
 
 impl Lower for ReaderView {
+    fn fetches(&self) -> bool {
+        self.store.is_partial()
+    }
+
     /// Files of the tree this reader cannot read (when in doubt, the path
     /// itself: being carried is the safe side).
     fn unseen_under(&self, path: &VPath) -> Vec<VPath> {
@@ -507,7 +542,16 @@ impl StorageBackend for ReaderView {
                 if self.store.is_partial() && !self.store.has(&e.id) {
                     self.prefetch_folder(&path.parent().unwrap_or_else(VPath::root));
                 }
-                self.view.read(path)
+                let r = self.view.read(path);
+                // The server's own "not yours" (never an unreachable one):
+                // the file is hidden from now on, as a checkout would leave
+                // it out.
+                if let Err(err) = &r {
+                    if err.is_unreadable() && self.store.is_partial() && !self.store.has(&e.id) && e.visibility.key_scope().is_none() {
+                        REFUSED.lock().unwrap_or_else(|p| p.into_inner()).insert(e.id, std::time::Instant::now());
+                    }
+                }
+                r
             }
             None => Err(VeilError::NotFound(path.to_string())),
         }
@@ -588,12 +632,94 @@ struct Node {
     open: u32,
     /// While open: the content of a file only the lower layer has, read
     /// once (a read never decrypts a file twice). Never written to.
-    cache: Option<Vec<u8>>,
+    cache: Option<Lowered>,
     /// While open: the upper file, in place, once the upper layer has the
     /// file. Reads and writes go straight to it (BUG-561).
     file: Option<Box<dyn UpperFile>>,
     /// Written since `file` was last synced.
     dirty: bool,
+}
+
+/// Lower-layer content held for open files, in memory, across all of them
+/// (BUG-1365): past it, or for a file larger than [`SPILL_AT`], the content
+/// goes to an anonymous file of the mount's private directory instead.
+pub const HELD: u64 = 64 << 20;
+/// Files larger than this are never held in memory while open.
+pub const SPILL_AT: u64 = 1 << 20;
+
+/// The content of a file only the lower layer has, for an open node: in
+/// memory, or in an anonymous file (no name: nothing of it outlives the
+/// process, a crash included), read from in pieces.
+enum Lowered {
+    Bytes(Vec<u8>),
+    Spilled { file: std::fs::File, len: u64 },
+}
+
+impl Lowered {
+    fn len(&self) -> u64 {
+        match self {
+            Lowered::Bytes(b) => b.len() as u64,
+            Lowered::Spilled { len, .. } => *len,
+        }
+    }
+
+    fn held(&self) -> u64 {
+        match self {
+            Lowered::Bytes(b) => b.len() as u64,
+            Lowered::Spilled { .. } => 0,
+        }
+    }
+
+    /// At most `size` bytes from `offset`.
+    fn read(&self, offset: u64, size: u32) -> std::io::Result<Vec<u8>> {
+        match self {
+            Lowered::Bytes(buf) => {
+                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(buf.len());
+                let end = start.saturating_add(size as usize).min(buf.len());
+                Ok(buf[start..end].to_vec())
+            }
+            Lowered::Spilled { file, len } => {
+                let n = (size as u64).min(len.saturating_sub(offset)) as usize;
+                let mut out = vec![0; n];
+                let mut done = 0;
+                while done < n {
+                    match std::os::unix::fs::FileExt::read_at(file, &mut out[done..], offset + done as u64)? {
+                        0 => break,
+                        k => done += k,
+                    }
+                }
+                out.truncate(done);
+                Ok(out)
+            }
+        }
+    }
+
+    /// The whole content (a copy-up, a copy).
+    fn bytes(&self) -> std::io::Result<Vec<u8>> {
+        match self {
+            Lowered::Bytes(b) => Ok(b.clone()),
+            Lowered::Spilled { len, .. } => self.read(0, u32::try_from(*len).unwrap_or(u32::MAX)).and_then(|b| match b.len() as u64 == *len {
+                true => Ok(b),
+                false => Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            }),
+        }
+    }
+
+    /// `data`, spilled to an anonymous file in `dir`.
+    fn spill(dir: &std::path::Path, data: &[u8]) -> std::io::Result<Lowered> {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        #[cfg(target_os = "linux")]
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).mode(0o600).custom_flags(libc::O_TMPFILE).open(dir)?;
+        #[cfg(not(target_os = "linux"))]
+        let mut file = {
+            let p = dir.join(format!("spill-{}", hex::encode(veil_core::crypto::random_bytes::<8>())));
+            let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&p)?;
+            std::fs::remove_file(&p)?;
+            f
+        };
+        file.write_all(data)?;
+        Ok(Lowered::Spilled { file, len: data.len() as u64 })
+    }
 }
 
 struct Handle {
@@ -602,6 +728,8 @@ struct Handle {
 }
 
 struct Inner {
+    /// Where large open files' content goes ([`MountFs::with_spill`]).
+    spill: Option<std::path::PathBuf>,
     overlay: OverlayBackend,
     /// The overlay's lower layer, as a [`Lower`].
     lower: Arc<dyn Lower>,
@@ -754,7 +882,7 @@ impl Inner {
         };
         match self.nodes.get(&ino) {
             Some(Node { path: None, file: Some(f), .. }) => Ok(unlinked(f.len().map_err(|e| io_errno(&e))?)),
-            Some(Node { path: None, cache: Some(c), .. }) => Ok(unlinked(c.len() as u64)),
+            Some(Node { path: None, cache: Some(c), .. }) => Ok(unlinked(c.len())),
             _ => {
                 let p = self.path(ino)?;
                 self.attr(ino, &p)
@@ -788,12 +916,20 @@ impl Inner {
 
     /// Load the content of open node `ino` (a file only the lower layer
     /// has) into its cache.
-    fn load(&mut self, ino: u64) -> FsResult<&Vec<u8>> {
+    fn load(&mut self, ino: u64) -> FsResult<&Lowered> {
         let need = self.nodes.get(&ino).ok_or(libc::EBADF)?.cache.is_none();
         if need {
             let path = self.path(ino)?;
             let data = self.overlay.read(&path).map_err(|e| errno(&e))?;
-            self.nodes.get_mut(&ino).ok_or(libc::EBADF)?.cache = Some(data);
+            // In memory only while small and under the bound across open
+            // files (BUG-1365).
+            let held: u64 = self.nodes.values().filter_map(|n| n.cache.as_ref()).map(Lowered::held).sum();
+            let len = data.len() as u64;
+            let content = match &self.spill {
+                Some(dir) if len > SPILL_AT || held + len > HELD => Lowered::spill(dir, &data).map_err(|e| io_errno(&e))?,
+                _ => Lowered::Bytes(data),
+            };
+            self.nodes.get_mut(&ino).ok_or(libc::EBADF)?.cache = Some(content);
         }
         Ok(self.nodes.get(&ino).and_then(|n| n.cache.as_ref()).expect("loaded"))
     }
@@ -828,12 +964,15 @@ impl Inner {
             let node = self.nodes.get_mut(&ino).ok_or(libc::EBADF)?;
             match node.path.clone() {
                 None => {
-                    let data = node.cache.take().unwrap_or_default();
+                    let data = match node.cache.take() {
+                        Some(c) => c.bytes().map_err(|e| io_errno(&e))?,
+                        None => Vec::new(),
+                    };
                     node.file = Some(Box::new(VecFile(data)));
                 }
                 Some(path) => {
                     let data = match node.cache.take() {
-                        Some(d) => d,
+                        Some(d) => d.bytes().map_err(|e| io_errno(&e))?,
                         None => self.overlay.read(&path).map_err(|e| errno(&e))?,
                     };
                     let exec = self.meta(&path)?.is_some_and(|m| m.executable);
@@ -926,7 +1065,7 @@ impl Inner {
                     }
                 } else if self.nodes.get(&ino).is_some_and(|n| n.cache.is_none()) && self.load(ino).is_err() {
                     if let Some(n) = self.nodes.get_mut(&ino) {
-                        n.cache = Some(Vec::new());
+                        n.cache = Some(Lowered::Bytes(Vec::new()));
                     }
                 }
             }
@@ -954,7 +1093,7 @@ impl Inner {
             return self.files.rename(from, to).map_err(|e| io_errno(&e));
         }
         let data = match self.by_path.get(from).and_then(|i| self.nodes.get(i)).and_then(|n| n.cache.as_ref()) {
-            Some(b) => b.clone(),
+            Some(b) => b.bytes().map_err(|e| io_errno(&e))?,
             None => self.overlay.read(from).map_err(|e| errno(&e))?,
         };
         self.overlay.write(to, &data).map_err(|e| errno(&e))?;
@@ -1064,6 +1203,7 @@ impl MountFs {
     ) -> MountFs {
         MountFs {
             inner: Mutex::new(Inner {
+                spill: None,
                 overlay: OverlayBackend::with_upper(lower.clone(), upper.clone(), whiteouts),
                 lower,
                 unseen: BTreeSet::new(),
@@ -1095,6 +1235,13 @@ impl MountFs {
     /// backend.
     pub fn with_files(self, files: Arc<dyn UpperFiles>) -> MountFs {
         self.lock().files = files;
+        self
+    }
+
+    /// Keep the content of large open files (and of open files past
+    /// [`HELD`]) in anonymous files of `dir` (private), not in memory.
+    pub fn with_spill(self, dir: std::path::PathBuf) -> MountFs {
+        self.lock().spill = Some(dir);
         self
     }
 
@@ -1216,6 +1363,8 @@ impl MountFs {
                 g.nodes.get_mut(&ino).ok_or(libc::ENOENT)?.cache = None;
             }
             g.touch(&path);
+        } else if g.lower.fetches() && !g.open_upper(ino)? {
+            g.load(ino)?;
         }
         g.nodes.get_mut(&ino).ok_or(libc::ENOENT)?.open += 1;
         let fh = g.next_fh;
@@ -1270,10 +1419,7 @@ impl MountFs {
             out.truncate(done);
             return Ok(out);
         }
-        let buf = g.load(ino)?;
-        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(buf.len());
-        let end = start.saturating_add(size as usize).min(buf.len());
-        Ok(buf[start..end].to_vec())
+        g.load(ino)?.read(offset, size).map_err(|e| io_errno(&e))
     }
 
     pub fn write(&self, fh: u64, offset: u64, data: &[u8]) -> FsResult<u32> {
@@ -1915,6 +2061,65 @@ mod tests {
         assert_eq!(m.fs.lookup(ROOT, os("nope")), Err(libc::ENOENT));
         assert_eq!(m.fs.open(m.ino("a").unwrap(), false, false), Err(libc::EISDIR));
         assert!(m.upper.files().is_empty(), "reading copies nothing up");
+    }
+
+    /// BUG-1365: a large open file's content is in an anonymous file, not
+    /// in memory; it reads in pieces, copies up on a write, keeps its
+    /// content when unlinked while open, and the open files held in memory
+    /// stay under [`HELD`].
+    #[test]
+    fn large_open_files_are_spilled_and_behave_as_held_ones() {
+        let big: Vec<u8> = (0..(SPILL_AT as usize + 4097)).map(|i| (i % 251) as u8).collect();
+        let small = vec![7u8; 600 << 10];
+        let files: Vec<(String, Vec<u8>)> = [("big.bin".to_string(), big.clone()), ("big2.bin".to_string(), big.clone())]
+            .into_iter()
+            .chain((0..120).map(|i| (format!("s/{i}.bin"), small.clone())))
+            .collect();
+        let refs: Vec<(&str, &[u8])> = files.iter().map(|(a, b)| (a.as_str(), b.as_slice())).collect();
+        let spill = tempfile::tempdir().unwrap();
+        let mut m = mem(&refs);
+        m.fs = std::mem::replace(&mut m.fs, MountFs::new(m.lower.clone(), m.upper.clone(), Vec::new(), None)).with_spill(spill.path().to_path_buf());
+        let held = |m: &Mem| -> u64 { m.fs.lock().nodes.values().filter_map(|n| n.cache.as_ref()).map(Lowered::held).sum() };
+        // Read in pieces, spilled.
+        let ino = m.ino("big.bin").unwrap();
+        let fh = m.fs.open(ino, false, false).unwrap();
+        assert_eq!(m.fs.read(fh, 5, 10).unwrap(), &big[5..15]);
+        assert!(matches!(m.fs.lock().nodes[&ino].cache, Some(Lowered::Spilled { .. })));
+        assert_eq!(held(&m), 0);
+        assert_eq!(m.fs.read(fh, big.len() as u64 - 3, 10).unwrap(), &big[big.len() - 3..]);
+        assert!(std::fs::read_dir(spill.path()).unwrap().next().is_none(), "a spilled file has no name");
+        // 120 open small files: memory stays under the bound.
+        let fhs: Vec<u64> = (0..120)
+            .map(|i| {
+                let f = m.fs.open(m.ino(&format!("s/{i}.bin")).unwrap(), false, false).unwrap();
+                assert_eq!(m.fs.read(f, 0, 4).unwrap(), [7, 7, 7, 7]);
+                f
+            })
+            .collect();
+        assert!(held(&m) <= HELD, "{} bytes held", held(&m));
+        // Written through a handle open on the spilled content: copied up whole.
+        let w = m.fs.open(ino, true, false).unwrap();
+        m.fs.write(w, 0, b"XY").unwrap();
+        m.fs.release(w).unwrap();
+        let mut want = big.clone();
+        want[..2].copy_from_slice(b"XY");
+        assert_eq!(m.upper.read(&p("big.bin")).unwrap(), want);
+        // Unlinked while open, held or spilled: the open handle still
+        // reads it, and writes to it reach no path.
+        m.fs.unlink(m.ino("s").unwrap(), os("0.bin")).unwrap();
+        assert_eq!(m.fs.read(fhs[0], 0, 3).unwrap(), [7, 7, 7]);
+        let b2 = m.fs.open(m.ino("big2.bin").unwrap(), true, false).unwrap();
+        assert_eq!(m.fs.read(b2, 1, 2).unwrap(), &big[1..3]);
+        m.fs.unlink(ROOT, os("big2.bin")).unwrap();
+        assert_eq!(m.fs.read(b2, big.len() as u64 - 2, 9).unwrap(), &big[big.len() - 2..]);
+        m.fs.write(b2, 0, b"Q").unwrap();
+        assert_eq!(m.fs.read(b2, 0, 2).unwrap(), [b'Q', big[1]]);
+        m.fs.release(b2).unwrap();
+        assert!(m.upper.read(&p("big2.bin")).is_err() && m.lower.read(&p("big2.bin")).unwrap() == big);
+        for f in fhs {
+            m.fs.release(f).unwrap();
+        }
+        m.fs.release(fh).unwrap();
     }
 
     #[test]

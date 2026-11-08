@@ -107,6 +107,10 @@ const MASKED: &[&str] = &["credentials", "credentials.toml"];
 
 /// What `vl` says when there is no `bwrap`.
 const INSTALL: &str = "install bubblewrap (`apt install bubblewrap`, `dnf install bubblewrap` or `pacman -S bubblewrap`)";
+/// The computer's folders the sandbox shows read-only (and what bwrap makes
+/// of `/proc` and `/dev`): nothing can be mounted inside them.
+const READ_ONLY: [&str; 11] = ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt", "/nix", "/sys"];
+
 /// What `vl` says when `--private-ports` finds no `pasta`.
 const INSTALL_PASTA: &str =
     "--private-ports needs pasta (from passt), which is not installed: install passt (`apt install passt`, `dnf install passt` or `pacman -S passt`); nothing was run";
@@ -256,6 +260,12 @@ fn seed(spec: &str, root: &Path, home: Option<&Path>) -> Result<(PathBuf, PathBu
     }
     if dest.starts_with(root) || root.starts_with(&dest) {
         bail!("--seed {shown}: DEST is where the sandbox shows the project, inside it, or holds it");
+    }
+    // Nothing can be made there (BUG-1364).
+    if let Some(ro) = READ_ONLY.iter().chain(&["/proc", "/dev"]).find(|r| dest.starts_with(r)) {
+        bail!(
+            "--seed {shown}: DEST is inside {ro}, which the sandbox shows read-only (or as the system's): give a place such as /tmp/NAME, /srv/NAME or ~/NAME"
+        );
     }
     Ok((src, dest))
 }
@@ -459,8 +469,7 @@ impl Confine {
             true => Some(find_program("pasta", Some(&root)).ok_or_else(|| anyhow!(INSTALL_PASTA))?),
             false => None,
         };
-        let mut mounts = base_args(&home, Some(&root), &allow, a.no_network || a.private_ports)?;
-        mounts.seeds = seeds;
+        let mounts = base_args(&home, Some(&root), &allow, &seeds, a.no_network || a.private_ports)?;
         if !mounts.seeds.is_empty() && overlay_probe(&bwrap, mounts.head.clone()).map_or(true, |r| r.is_err()) {
             bail!("--seed needs overlayfs, which does not work here; nothing was run");
         }
@@ -811,14 +820,15 @@ impl Mounts {
                 a.extend(["--overlay-src".into(), src, "--overlay".into(), upper.into_os_string(), work.into_os_string(), dest]);
             }
         }
-        a.extend(self.masks.iter().cloned());
         // Seeds: the source is the lower layer of an overlay whose upper
         // layer is a tmpfs of this run's own mount namespace, so the source
         // is never written, no other run sees the layer, and nothing of it
-        // outlives the run (whatever kills it).
+        // outlives the run (whatever kills it). Mounted before the masks,
+        // which cover what they show too.
         for (src, dest) in &self.seeds {
             a.extend(["--overlay-src".into(), src.as_os_str().to_owned(), "--tmp-overlay".into(), dest.as_os_str().to_owned()]);
         }
+        a.extend(self.masks.iter().cloned());
         Ok(a)
     }
 
@@ -838,7 +848,7 @@ impl Mounts {
 /// allowed link gives them (an allowed `~/src` that links to the disk
 /// holding the project). An allowed path inside the Veil home or the
 /// project is refused.
-fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], no_network: bool) -> Result<Mounts> {
+fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], seeds: &[(PathBuf, PathBuf)], no_network: bool) -> Result<Mounts> {
     let mut a: Vec<OsString> = Vec::new();
     let mut push = |items: &[&std::ffi::OsStr]| a.extend(items.iter().map(|s| s.to_os_string()));
     for f in [
@@ -857,7 +867,7 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], no_net
         push(&["--unshare-net".as_ref()]);
     }
     // The computer's tools, read-only.
-    for d in ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt", "/nix", "/sys"] {
+    for d in READ_ONLY {
         match std::fs::symlink_metadata(d) {
             Ok(m) if m.file_type().is_symlink() => {
                 if let Ok(t) = std::fs::read_link(d) {
@@ -918,9 +928,12 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], no_net
         }
         bound.push((dest, src));
     }
-    // Every name under which the allow-list shows `real` (canonical).
+    // Every name under which the sandbox shows `real` (canonical): through
+    // the allow-list and through every seed. The masks below apply to every
+    // way a host path enters the sandbox (BUG-1363).
+    let shown: Vec<(PathBuf, PathBuf)> = bound.iter().cloned().chain(seeds.iter().map(|(src, dest)| (dest.clone(), src.clone()))).collect();
     let aliases = |real: &Path| -> Vec<PathBuf> {
-        bound.iter().filter_map(|(dest, src)| real.strip_prefix(src).ok().map(|rel| dest.join(rel))).collect()
+        shown.iter().filter_map(|(dest, src)| real.strip_prefix(src).ok().map(|rel| dest.join(rel))).collect()
     };
     let mut masks: Vec<(&str, PathBuf)> = Vec::new();
     // Credential files, as named and wherever an allowed path shows them.
@@ -966,7 +979,7 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], no_net
             Allowed { kind, layer: kind != Kind::Other && !holds_project && !hidden_below, dest, src }
         })
         .collect();
-    Ok(Mounts { head: a, allowed, masks: hide, hidden: done, seeds: Vec::new() })
+    Ok(Mounts { head: a, allowed, masks: hide, hidden: done, seeds: seeds.to_vec() })
 }
 
 /// Run the confinement once with `true`: a missing or unusable `bwrap`
@@ -1184,7 +1197,7 @@ pub fn doctor(root: Option<&Path>) -> Vec<(bool, String, Vec<String>)> {
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
-            let base = base_args(&home, None, &[], false).and_then(|m| m.args(&Layers::ReadOnly));
+            let base = base_args(&home, None, &[], &[], false).and_then(|m| m.args(&Layers::ReadOnly));
             match base.as_ref().map_err(|e| anyhow!("{e:#}")).and_then(|b| probe(&bwrap, b)) {
                 Ok(()) => out.push((true, format!("confinement works ({}): `vl ws exec` runs confined", safe(&version)), Vec::new())),
                 Err(e) => out.push((false, "confinement does not work here".into(), vec![safe(&e.to_string()).into_owned()])),

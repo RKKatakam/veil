@@ -217,8 +217,18 @@ fn exec_mounted(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Confin
             );
         }
     }
-    let before = ctx.repo.workspace_wc(name)?;
     let mount = crate::mount::for_exec(&ctx.root, name)?;
+    if mount.recovered {
+        mount.record().with_context(|| format!("recording what an earlier run left in the mount of workspace {}", safe(name)))?;
+        ctx.repo.reload()?;
+        eprintln!(
+            "{} the output of an earlier `vl ws exec` in workspace {} that did not finish (vl was killed), from its mount: {}",
+            yellow("Recorded"),
+            safe(name),
+            one_line(&ctx.repo, &ctx.repo.workspace_wc(name)?)
+        );
+    }
+    let before = ctx.repo.workspace_wc(name)?;
     print_running(a.command, &mount.dir, confine);
     let layers_dir = paths.dir.join(crate::confine::layers_dir(core::workspace_id(&ctx.repo, name).as_deref()));
     // From here on the mount is recorded (and, if this run made it,

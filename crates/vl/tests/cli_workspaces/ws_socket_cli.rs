@@ -368,7 +368,6 @@ fn mount_flags_that_cannot_go_together_are_refused() {
 /// reads another workspace's recorded files (`other@`) and the project
 /// directory's (`default@`), which confinement hides from the command.
 #[test]
-#[ignore = "BUG-1361: the sandbox's vl reads other workspaces and the project directory by naming them as revisions"]
 fn bug_1361_the_sandboxs_vl_cannot_read_another_workspace_or_the_project_directory() {
     let t = T::new();
     let o = t.cmd(&["ws", "exec", "other", "--", "bash", "-c", "echo OTHER-WORKSPACE-MARKER-4242c > w.txt"]).output().unwrap();
@@ -402,7 +401,6 @@ fn bug_1361_the_sandboxs_vl_cannot_read_another_workspace_or_the_project_directo
 /// BUG-1362: `vl commit` through the socket advances the tags at `@-`, so
 /// the sandbox moves `main` to its own change (`vl tag set` is refused).
 #[test]
-#[ignore = "BUG-1362: a commit through the workspace socket moves main (the tags at @-), which tag set is refused for"]
 fn bug_1362_a_commit_from_inside_the_sandbox_moves_no_tag() {
     for flags in [&[][..], &["--mount"]] {
         let t = T::new();
@@ -419,4 +417,57 @@ fn bug_1362_a_commit_from_inside_the_sandbox_moves_no_tag() {
         assert!(log.contains("agent commit"), "{flags:?}: {log}");
         assert_eq!(main(&t), before, "{flags:?}: the sandbox moved main: {log}");
     }
+}
+
+/// BUG-1361, the whole class: `vl log` too reads only the workspace's own
+/// history. A plain `vl log` shows `@` and its ancestors (not the other
+/// workspaces' changes it lists outside); `-r` naming anything else, or a
+/// set reaching past `@` (`A..`), is refused; one inside it runs.
+#[test]
+fn the_sandboxs_vl_log_shows_only_its_own_history() {
+    let t = T::new();
+    let o = t.cmd(&["ws", "exec", "other", "-m", "OTHER-DESCRIPTION-91fe", "--", "bash", "-c", "echo x > w.txt"]).output().unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let outside = t.env.ok("alice", &t.proj, &["log"]);
+    assert!(outside.contains("OTHER-DESCRIPTION-91fe") && outside.contains("other@"), "{outside}");
+    for flags in [&[][..], &["--mount"]] {
+        let out = t.ok(flags, "vl log; echo END-PLAIN; vl log -r ::@-; echo END-RANGE");
+        assert!(out.contains("END-PLAIN") && out.contains("END-RANGE") && out.contains("agent@"), "{flags:?}: {out}");
+        assert!(!out.contains("OTHER-DESCRIPTION-91fe") && !out.contains("other@") && !out.contains("default@"), "{flags:?}: {out}");
+        for r in ["::other@", "other@", "main..", "root().."] {
+            let o = t.exec(flags, &format!("vl log -r '{r}'"));
+            let all = text(&o);
+            assert!(!o.status.success() && all.contains("inside a sandbox"), "{flags:?} log -r {r}: {all}");
+            assert!(!all.contains("OTHER-DESCRIPTION-91fe"), "{all}");
+        }
+    }
+}
+
+/// A `vl ws exec --mount` killed in the middle leaves its mount serving;
+/// the next run takes it over, says what it recorded of the killed run's
+/// output (never "No changes"), and unmounts it.
+#[test]
+fn the_next_run_records_and_names_what_a_killed_mounted_run_left() {
+    let t = T::new();
+    let mut c = t
+        .cmd(&["ws", "exec", "agent", "--mount", "--", "sh", "-c", "echo left-by-the-killed-run > killed.txt; touch started; sleep 60"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = || {
+        std::fs::read_dir(t.runtime()).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("veil-ws-mnt-") && e.path().join("files/started").exists())
+    };
+    assert!(wait_for(std::time::Duration::from_secs(20), started), "the run did not start");
+    unsafe {
+        libc::kill(c.id() as i32, libc::SIGKILL);
+    }
+    let _ = c.wait();
+    let o = t.exec(&["--mount"], "true");
+    let all = text(&o);
+    assert!(o.status.success(), "{all}");
+    assert!(all.contains("Recorded") && all.contains("did not finish"), "the next run says what it recorded: {all}");
+    assert_eq!(t.cat("agent", "killed.txt").as_deref(), Some("left-by-the-killed-run\n"));
+    let mounted = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    assert!(!mounted.contains(t.runtime().to_str().unwrap()), "the killed run's mount is still mounted");
 }

@@ -411,7 +411,6 @@ fn a_quarantined_edit_survives_the_workspace_moving() {
 /// --mount` (S8) a confined command drives it, in a process outside its
 /// `--memory` limit.
 #[test]
-#[ignore = "BUG-1365: a mount holds every open file whole in memory, outside a confined run's --memory"]
 fn bug_1365_open_files_of_a_mount_are_not_held_in_memory() {
     if !fuse_available() {
         return;

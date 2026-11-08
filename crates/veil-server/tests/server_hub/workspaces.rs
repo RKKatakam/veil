@@ -30,8 +30,10 @@ const SMALL: usize = 20;
 const BIG: usize = 300 << 10;
 const FEATURE_MARK: &str = "MARKER-FEATURE-PUBLIC-5d1c0e77";
 const FEATURE_BILL: &str = "MARKER-FEATURE-BILLING-c3a7e210";
-/// `EIO` on Linux.
+/// `EIO`, `EACCES` and `ENOENT` on Linux.
 const EIO: i32 = 5;
+const EACCES: i32 = 13;
+const ENOENT: i32 = 2;
 
 /// The standard project, plus a `feature` branch the thin clones of it
 /// have not fetched: `wide/fN/` folders, and a billing file.
@@ -271,13 +273,10 @@ fn an_unreachable_server_is_an_error_in_the_mount_never_a_missing_file() {
     // A folder whose tree was never fetched: listing it is an error, and so
     // is looking it up.
     let deep = m.dir.join(format!("{BILL_DIR}/acme"));
-    match std::fs::read_dir(&deep) {
-        Ok(rd) => {
-            let n: Vec<_> = rd.collect();
-            assert!(n.iter().any(|e| e.is_err()) || !n.is_empty(), "an unfetched folder listed as empty");
-        }
-        Err(e) => assert_eq!(e.raw_os_error(), Some(EIO), "{e}"),
-    }
+    let e = std::fs::read_dir(&deep).expect_err("an unfetched folder listed without its server");
+    assert_eq!(e.raw_os_error(), Some(EIO), "{e}");
+    let e = std::fs::metadata(deep.join("q2.txt")).expect_err("a file of an unfetched folder looked up without its server");
+    assert_eq!(e.raw_os_error(), Some(EIO), "{e}");
     // Through a mounted run: the command meets the error.
     let o = p.admin.run(&thin, &["ws", "exec", "agent", "--mount", "--", "sh", "-c", "cat src/wide/f1/s1.txt; echo rc=$?"]);
     let out = all(&o);
@@ -473,4 +472,37 @@ fn s8_bench_ready_to_read() {
         let _ = o;
         eprintln!("[{n} files] ws exec (checked out, the fallback): first run {}", ms(t7));
     }
+}
+
+/// The server's own refusal (access removed after the folder was listed)
+/// hides the file: its content never arrives, the read is refused as not
+/// this person's, never an I/O error, and listings leave it out from then
+/// on.
+#[test]
+fn a_server_refusal_hides_the_file() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let thin = thin_with_agent(&p, &hub, &p.fin, "thin");
+    let m = Mounted::new(&p.fin, &thin, "agent");
+    let acme = m.dir.join(format!("{BILL_DIR}/acme"));
+    let names: Vec<String> = std::fs::read_dir(&acme).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(names.contains(&"q2.txt".to_string()), "{names:?}");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let r = std::fs::read(acme.join("q2.txt"));
+    let e = r.expect_err("a refused file read");
+    assert_eq!(e.raw_os_error(), Some(EACCES), "a refusal is 'not yours', never an unreachable server's EIO: {e}");
+    // (The kernel keeps a lookup for a second.)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let gone = loop {
+        match std::fs::metadata(acme.join("q2.txt")) {
+            Err(e) if e.raw_os_error() == Some(ENOENT) => break true,
+            _ if std::time::Instant::now() > deadline => break false,
+            _ => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    };
+    assert!(gone, "a refused file is still looked up");
+    let names: Vec<String> = std::fs::read_dir(&acme).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+    assert!(!names.contains(&"q2.txt".to_string()), "a refused file is still listed: {names:?}");
+    assert_no_marker(&everything_in(&thin), &[FEATURE_BILL], "fin's clone after the refusal");
+    m.unmount();
 }

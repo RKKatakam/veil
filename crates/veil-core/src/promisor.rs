@@ -671,6 +671,11 @@ impl ObjectStore {
             )));
         };
         let mut got = promisor.fetch(&[Located { id: *id, snapshot, path: path.clone() }])?.pop().flatten();
+        // Refused at a place on the server whose own tree (as this clone
+        // holds it) names this very object there: the server's "not yours"
+        // for it, as much as under a snapshot on the server (milestone S8:
+        // access removed while a workspace on a local change was mounted).
+        let mut refused_there = false;
         if got.is_none() && !self.on_server(p, &*promisor, &snapshot) {
             // Met under a snapshot the server does not have (a local
             // commit): ask at the same path under its nearest ancestors on
@@ -686,10 +691,11 @@ impl ObjectStore {
                 if got.is_some() {
                     break;
                 }
+                refused_there |= self.names_held(&t, &path, id);
             }
         }
         let Some(raw) = got else {
-            if self.on_server(p, &*promisor, &snapshot) {
+            if refused_there || self.on_server(p, &*promisor, &snapshot) {
                 // The server's own answer: nothing there that this person
                 // may see.
                 return Err(VeilError::Missing(*id));
@@ -701,6 +707,19 @@ impl ObjectStore {
         self.keep_fetched(p, id, &raw)?;
         p.fetched.fetch_add(1, Ordering::Relaxed);
         Ok(raw)
+    }
+
+    /// Does snapshot `snap`'s tree name `id` at `path`, as far as this clone
+    /// holds its trees (nothing is fetched to tell)?
+    fn names_held(&self, snap: &ObjectId, path: &str, id: &ObjectId) -> bool {
+        self.without_fetching(|| {
+            let Ok(s) = self.snapshot(snap) else { return false };
+            if path.is_empty() {
+                return s.tree == *id;
+            }
+            let Ok(vp) = VPath::new(path) else { return false };
+            matches!(crate::tree::lookup(self, &s.tree, &vp), Ok(Some(e)) if e.id == *id)
+        })
     }
 
     /// Before a thin clone's working copy moves from tree `from` to `to`:

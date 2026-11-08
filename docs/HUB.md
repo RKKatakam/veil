@@ -2858,9 +2858,7 @@ change; nothing new is encrypted.
 * `vl search WORDS… [--path] [--lang LANG] [-r BRANCH] [-n N] [--json] [-- PATH]`
   prints the server's answer (exit 1 when nothing matched).
 
-### 13.S8 S8: workspaces that fetch on first read (as built)
-
-> Section number: a placeholder; the orchestrator assigns it.
+### 13.28 S8: workspaces that fetch on first read (as built)
 
 Milestone S8 of `docs/design/server/phase-2-thin-clients.md` (§4.6, §4.8,
 §4.9). Code: `crates/vl/src/mount/fs.rs` (`ReaderView`: a thin clone's
@@ -2884,8 +2882,15 @@ protocol or server change.
     (a checkout would not create it).
   * reading a file fetches its folder's small files (≤ 256 KiB) in the
     same request, once per folder; listing a folder fetches only its tree.
-  * the server's refusal hides; a server that cannot be reached is `EIO`,
-    never an absent or empty file.
+  * the server's refusal hides: `EACCES` at `open` (a thin clone's mount
+    fetches at `open`, since the kernel turns any error of a later read
+    into `EIO`), and absent from listings and lookups for 10 s; a server
+    that cannot be reached is `EIO`, never an absent or empty file. An
+    object met under a local change (a workspace's own `@`) and refused at
+    the nearest server ancestor whose held tree names it there is the
+    server's refusal too (`promisor.rs`, `names_held`).
+  * an open file's content is in memory only up to 1 MiB, 64 MiB across
+    open files; larger, in an anonymous file (BUG-1365).
 * **Exact dirty sets:** a mount's recording reuses every unchanged folder
   and file by id and visits only the paths the overlay holds, so it
   fetches nothing; the builder's carrying of what a working copy does not
@@ -2906,8 +2911,9 @@ protocol or server change.
 * **The workspace socket** (`ws_socket.rs`, `9-confinement.md` item 17):
   named workspaces' runs, mounted or not, get `$VEIL_WORKSPACE_SOCKET` and
   `vl` first on `PATH`; a `vl` inside forwards its arguments; the `vl`
-  outside runs `status`, `diff`, `log`, `show`, `blame`, `commit`,
-  `describe` (of `@`) and `new` (on `@`) as a child of its own
+  outside runs `status`, `diff`, `log`, `show`, `blame` (every revision
+  `@` or an ancestor of it, BUG-1361), `commit` (always `--no-advance`,
+  BUG-1362), `describe` (of `@`) and `new` (on `@`) as a child of its own
   (`__veil-workspace-command`), with its own environment and hooks off, on
   that workspace only (`Ctx::open_for_workspace`, `Ctx::detached`), after
   recording the sandbox. Everything else is refused before anything opens.
@@ -2951,12 +2957,13 @@ never fetched, 100 files a folder.
 | # | Threat | As built | Test |
 |---|---|---|---|
 | 1 | a mount shows a file or name its person may not see | the tree is the server's projection; visibility as a checkout's | `server_hub` `workspaces::a_mounted_workspace_shows_exactly_its_persons_projection` (dev and admin; mount, `ws exec --mount`, the fallback; equal to a full clone's checkout; no marker in the clone's objects) |
-| 2 | unfetched read as empty or hidden | `EIO`; a mounted run meets the error; the fallback fails before running | `workspaces::an_unreachable_server_is_an_error_in_the_mount_never_a_missing_file` |
+| 2 | unfetched read as empty or hidden; a refusal read as anything but hidden | `EIO`; a mounted run meets the error; the fallback fails before running; a refusal is `EACCES` at `open`, then absent | `workspaces::an_unreachable_server_is_an_error_in_the_mount_never_a_missing_file`, `workspaces::a_server_refusal_hides_the_file` |
 | 3 | `ls -lR`, an indexer: a fetch storm | listing and `stat` fetch no content; folder prefetch only on reads | `workspaces::listing_fetches_no_file_and_reading_one_fetches_its_folder` |
 | 4 | a dirty set that misses or adds an edit; recording proportional to the project | the overlay is the dirty set; unchanged by id | `workspaces::recording_a_mount_fetches_nothing_and_holds_exactly_its_edits`, `cli_workspaces` `ws_socket_cli::what_a_mounted_command_changes_is_exactly_what_is_recorded_and_the_same_without_fuse` |
 | 5 | the sandbox's `vl` does more than its person may (phase 2, rows 5–7) | the allow-list of commands, its own workspace, the outside `vl`'s identity and environment, no hooks | `ws_socket_cli::*` (6 tests), `workspaces::the_sandboxs_vl_shows_only_what_its_person_may_see` |
 | 6 | a run reaches the host's loopback or another run's ports; shares the host's loopback without `pasta` | own network namespace; `pasta` forwards nothing; fails before running | `ports_seed_cli` (5 tests) |
-| 7 | a seed is written, or one run sees another's layer | overlay on a tmpfs of the run's own | `ports_seed_cli` (3 tests) |
+| 7 | a seed is written, or one run sees another's layer; a seed shows what the allow-list masks | overlay on a tmpfs of the run's own; one set of masks for every host path shown | `ports_seed_cli` (6 tests, BUG-1363 and 1364's included) |
+| 9 | a mount's memory grows with what is open, outside `--memory` | bounded in memory, the rest in anonymous files | `mount_cli::bug_1365_…`, `mount::fs::tests::large_open_files_are_spilled_and_behave_as_held_ones` |
 | 8 | the fallback without FUSE loses a guarantee | the same tests with `VEIL_TEST_NO_FUSE` | in 1, 2 and 4 |
 
 #### Reverting

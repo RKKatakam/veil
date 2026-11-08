@@ -109,15 +109,55 @@ fn command_name(cmd: &Cmd) -> String {
     out
 }
 
-/// `describe` only of the workspace's working-copy change, `new` only on
-/// top of it: neither moves the workspace to another tree, nor rewrites a
-/// change some other workspace may hold.
+/// Every revision a socket command takes is the workspace's working-copy
+/// change (`@`) or one of its ancestors: the sandbox reads only its own
+/// workspace's history, never another workspace's files or the project
+/// directory's (BUG-1361). `describe` only of `@`, `new` only on top of it:
+/// neither moves the workspace to another tree, nor rewrites a change some
+/// other workspace may hold. One exhaustive match, for every command the
+/// socket runs; anything else is refused here too.
 fn check_revisions(ctx: &Ctx, cli: &Cli) -> Result<()> {
     let wc = ctx.wc()?;
-    match &cli.cmd {
-        Cmd::Describe { rev, .. } if ctx.rev(rev)? != wc => {
-            bail!("inside a sandbox, `vl describe` describes the workspace's working-copy change (@) only")
+    let within = |spec: &str, what: &str| -> Result<()> {
+        let id = ctx.rev(spec)?;
+        if id == wc || ctx.repo.is_ancestor(&id, &wc)? {
+            return Ok(());
         }
+        bail!(
+            "inside a sandbox, `vl {what}` reads the workspace's own history only: {} is not @ or one of its ancestors",
+            safe(spec)
+        )
+    };
+    match &cli.cmd {
+        Cmd::Status { .. } | Cmd::Commit { .. } => Ok(()),
+        Cmd::Show { rev, .. } => within(rev, "show"),
+        Cmd::Blame(a) => within(&a.rev, "blame"),
+        Cmd::Diff { rev, from, to, .. } => {
+            for r in [rev, from, to].into_iter().flatten() {
+                within(r, "diff")?;
+            }
+            Ok(())
+        }
+        // `::B`, `A..B`, `..B`: ancestors of B; `X`: X. (`parse_command`
+        // makes a plain `vl log` `::@`.)
+        Cmd::Log { filter, .. } => {
+            let spec = filter.revset.as_deref().unwrap_or("::@").trim();
+            let upper = match spec.strip_prefix("::") {
+                Some(b) => b,
+                None => match spec.split_once("..") {
+                    Some((_, "")) => bail!(
+                        "inside a sandbox, `vl log -r A..` is not available (it names snapshots outside the workspace's history): use `A..@` or `::@`"
+                    ),
+                    Some((_, b)) => b,
+                    None => spec,
+                },
+            };
+            within(upper, "log")
+        }
+        Cmd::Describe { rev, .. } => match ctx.rev(rev)? == wc {
+            true => Ok(()),
+            false => bail!("inside a sandbox, `vl describe` describes the workspace's working-copy change (@) only"),
+        },
         Cmd::New { revs, .. } => {
             for r in revs {
                 if ctx.rev(r)? != wc {
@@ -126,7 +166,7 @@ fn check_revisions(ctx: &Ctx, cli: &Cli) -> Result<()> {
             }
             Ok(())
         }
-        _ => Ok(()),
+        other => bail!("`vl {}` is not available inside a sandbox", command_name(other)),
     }
 }
 
@@ -450,8 +490,16 @@ pub fn parse_command(args: Vec<OsString>) -> Result<(PathBuf, String, Cli)> {
     let ws = ws.into_string().map_err(|_| anyhow!("the workspace name is not valid UTF-8"))?;
     let mut cli = Cli::try_parse_from(std::iter::once(OsString::from("vl")).chain(it))?;
     allowed(&cli)?;
+    // Hooks would run outside the sandbox; a commit moves no tag (the
+    // person's next push would send it: BUG-1362); a plain `vl log` shows
+    // the workspace's own history, not every workspace's (BUG-1361).
     match &mut cli.cmd {
-        Cmd::Commit { hooks, .. } | Cmd::Describe { hooks, .. } => hooks.no_verify = true,
+        Cmd::Commit { hooks, no_advance, .. } => {
+            hooks.no_verify = true;
+            *no_advance = true;
+        }
+        Cmd::Describe { hooks, .. } => hooks.no_verify = true,
+        Cmd::Log { filter, .. } if filter.revset.is_none() => filter.revset = Some("::@".into()),
         _ => {}
     }
     Ok((PathBuf::from(root), ws, cli))
