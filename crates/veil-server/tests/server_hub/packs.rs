@@ -22,7 +22,7 @@ fn pack_rows(hub: &TestHub, project: i64) -> (i64, i64) {
     hub.rt
         .block_on(
             sqlx::query_as::<_, (i64, i64)>(
-                "SELECT count(*) FILTER (WHERE listed), count(*) FILTER (WHERE NOT listed) FROM packs WHERE project_id = $1",
+                "SELECT count(*) FILTER (WHERE state = 1), count(*) FILTER (WHERE state = 2) FROM packs WHERE project_id = $1",
             )
             .bind(project)
             .fetch_one(&hub.hub().db),
@@ -294,7 +294,6 @@ fn push_body(api: &Api, token: &str, project: &str, expected: ObjectId, new: Obj
 /// project); a wrong one is refused as missing. Both must get the same
 /// answer, as before S28 (an upload was stored, so a guess always read).
 #[test]
-#[ignore = "BUG-1155: a receipt of a discarded upload still counts as uploaded and reads the project's store: a guess of hidden content is confirmed"]
 fn bug_1155_a_receipt_of_a_discarded_upload_confirms_no_guess() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -398,14 +397,13 @@ fn guessed_checks_refuse_with_the_first_error_in_order() {
     assert_eq!(hub.api().tips(Some(&p.admin.token()), &p.name).unwrap().branches["main"], tip, "nothing landed");
 }
 
-/// BUG-1157 (S28 cycle 1): a push that lands nothing because every update
-/// lost a race (here: not on the branch's current tip) keeps its staged
-/// upload, unread, until S29 exists; `vl` then uploads everything again
-/// (up to five tries per `vl push`). Before S28 an upload of the same
-/// objects wrote the same keys again; now every try leaves a whole copy,
-/// so storage grows with attempts, not content, with nothing bounding it.
+/// BUG-1157 (S28 cycle 1, fixed): a push that lands nothing because every
+/// update lost a race (here: not on the branch's current tip) keeps its
+/// staged upload, recorded in the database, for the next try; `vl` then
+/// uploads the same objects again (up to five tries per `vl push`), and
+/// they get the receipts of that same pack, so the tries leave one copy,
+/// not one each. Every pack in storage has a row.
 #[test]
-#[ignore = "BUG-1157: every push attempt that loses a race leaves a full staged copy of its upload in storage (no bound until S29)"]
 fn bug_1157_a_push_that_lost_a_race_leaves_no_copy_of_its_upload() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -418,6 +416,7 @@ fn bug_1157_a_push_that_lost_a_race_leaves_no_copy_of_its_upload() {
     write_files(&p.dir, &[("src/first.rs", "first")]);
     p.admin.commit_main(&p.dir, "first");
     p.admin.ok(&p.dir, &["push"]);
+    let w = writes(&hub);
     let mut packs = Vec::new();
     for _ in 0..3 {
         let (map, pack) = upload_all(&api, &c);
@@ -426,8 +425,30 @@ fn bug_1157_a_push_that_lost_a_race_leaves_no_copy_of_its_upload() {
         assert_eq!(r.json()["results"][0]["ok"], json!(false), "{}", String::from_utf8_lossy(&r.body));
         packs.push(pack);
     }
-    let left: Vec<&String> = packs.iter().filter(|n| hub.rt.block_on(hub.hub().objects.staged_index(pid, n)).unwrap().is_some()).collect();
-    assert!(left.is_empty(), "{} of 3 refused attempts left their upload in storage", left.len());
+    assert!(packs.iter().all(|n| *n == packs[0]), "the tries got the receipts of one pack: {packs:?}");
+    assert_eq!(writes(&hub) - w, 1, "one storage write for three tries");
+    let state: Option<i16> = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT state FROM packs WHERE project_id = $1 AND name = $2").bind(pid).bind(&packs[0]).fetch_optional(&hub.hub().db))
+        .unwrap();
+    assert_eq!(state, Some(0), "the upload is recorded, staged");
+    // Every pack in storage has a row (a directory store: walk it).
+    if let Some(dir) = hub.objects_dir() {
+        let dir = dir.join(format!("p/{pid}/pack"));
+        let rows: Vec<String> =
+            hub.rt.block_on(sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1").bind(pid).fetch_all(&hub.hub().db)).unwrap();
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            assert!(rows.contains(&n), "pack {n} in storage has no row");
+        }
+    }
+    // The same objects, landed on the tip: one more try, which lands.
+    let mut c2 = Craft::new(&api, &p.dev, &p.name, "main");
+    c2.file("src/raced.rs", "MARKER-RACED-UPLOAD-61aa");
+    let s2 = { let t = c2.tip; snap(&mut c2, vec![t], "raced, again", None) };
+    let (map, _) = upload_all(&api, &c2);
+    let r = push_body(&api, &c2.token, &p.name, c2.tip, s2, &map);
+    assert_eq!(r.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&r.body));
 }
 
 /// BUG-1153 (S28 × S15 merge): a push's storage writes are its own pack
@@ -437,7 +458,6 @@ fn bug_1157_a_push_that_lost_a_race_leaves_no_copy_of_its_upload() {
 /// `a_push_is_one_storage_write…` fails whenever the indexer runs before
 /// it counts, and `veil-bench load`'s writes-per-push gate counts them.
 #[test]
-#[ignore = "BUG-1153: S15's search segments count as a push's storage writes, not the background's"]
 fn bug_1153_background_indexing_is_not_counted_as_a_pushs_writes() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -521,7 +541,6 @@ fn a_pack_discarded_while_another_server_lists_it_is_listed_or_gone() {
 /// holds its 256 MiB decoded. Before S28 a commit read uploads from the
 /// store as its checks needed them. Hostile size: run alone.
 #[test]
-#[ignore = "BUG-1156: API commits hold up to 1 GiB of decoded uploads each, outside the server-wide bound"]
 fn bug_1156_api_commits_hold_their_uploads_within_the_servers_bound() {
     use veil_core::hub::{encoding, wire::put_frame};
     let hub = TestHub::start();
@@ -591,7 +610,7 @@ fn bug_1156_api_commits_hold_their_uploads_within_the_servers_bound() {
 /// last one is stopped; `HUB.md` §13.20 says how to revert, not that the
 /// upgrade cannot be rolling.
 #[test]
-#[ignore = "BUG-1158: a server before S28 beside an S28 server cannot find any object S28 stored (packs only): a rolling upgrade answers 'missing object' for objects that exist"]
+#[ignore = "BUG-1158 (closed by decision: the upgrade to S28 is not rolling, HUB.md §13.20): a server before S28 cannot find what an S28 server stored"]
 fn bug_1158_a_server_before_s28_finds_what_an_s28_server_stored() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -634,7 +653,7 @@ fn an_unread_plain_text_secret_beside_a_landing_push_is_not_kept() {
     assert!(fresh.rt.block_on(fresh.hub().objects.get(pid, &sid)).unwrap().is_none(), "the unread secret is not the project's");
     // In no listed pack's index.
     let names: Vec<String> =
-        hub.rt.block_on(sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND listed").bind(pid).fetch_all(&h.db)).unwrap();
+        hub.rt.block_on(sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND state = 1").bind(pid).fetch_all(&h.db)).unwrap();
     let store = hub.blob_store();
     for n in &names {
         let (index, _) = hub.rt.block_on(veil_server::pack::read_index(&*store, &veil_server::pack::key(pid, n))).unwrap().unwrap();

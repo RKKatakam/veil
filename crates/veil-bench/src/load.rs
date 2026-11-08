@@ -1216,7 +1216,10 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
             "db_per_request": stmts.map(|(n, _)| if requests > 0 { n / requests as f64 } else { f64::NAN }),
             "db_commits_per_op": writes.map(per_op),
             "db_deriver_writes_per_op": deriver.map(per_op),
-            "db_push_commits_per_op": writes.zip(deriver).map(|(w, d)| per_op((w - d).max(0.0))),
+            // The push's own: the deriver's aside, and the uploads' (each
+            // records its staged pack, S28: counted by the server).
+            "db_push_commits_per_op": writes.zip(deriver).map(|(w, d)| per_op((w - d - stat("upload_commits").unwrap_or(0.0)).max(0.0))),
+            "db_upload_commits_per_op": stat("upload_commits").map(per_op),
             "storage_writes_per_op": stat("storage_writes").map(per_op),
             "storage_push_writes_per_op": stat("storage_writes").zip(stat("storage_background_writes")).map(|(w, b)| per_op(w - b)),
             "storage_written_bytes_per_op": stat("storage_written_bytes").map(per_op),
@@ -1400,7 +1403,7 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
         ));
     }
     out.push_str(
-        "\n| Mode | Projects | Clients | Target rate (/s) | DB commits per op (the deriver's aside) | DB statements per op | DB statements per request | Storage writes per op (the deriver's aside) | Storage reads per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates missed |\n\
+        "\n| Mode | Projects | Clients | Target rate (/s) | DB commits per op (the push's own: the deriver's and uploads' aside) | DB statements per op | DB statements per request | Storage writes per op (the deriver's aside) | Storage reads per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates missed |\n\
          |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|\n",
     );
     let pct = |x: &serde_json::Value| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{:.0} %", v * 100.0)).unwrap_or_else(|| "–".into());

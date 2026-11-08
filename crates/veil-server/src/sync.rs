@@ -160,11 +160,15 @@ impl Source {
                 return Ok(raw.clone());
             }
             if let Some((name, slot)) = st.at.get(id) {
+                // From its staged pack only, never from the project's store
+                // (BUG-1155: that would answer for what the pusher did not
+                // upload).
                 let got = self.rt.block_on(self.hub.objects.get_staged(self.project, name, *slot, id));
-                if let Some((_, raw)) = got.map_err(|e| VeilError::Repo(format!("object store: {e}")))? {
-                    st.touched.lock().unwrap().insert(*id);
-                    return Ok(raw);
-                }
+                let Some((_, raw)) = got.map_err(|e| VeilError::Repo(format!("object store: {e}")))? else {
+                    return Err(VeilError::Missing(*id));
+                };
+                st.touched.lock().unwrap().insert(*id);
+                return Ok(raw);
             }
         }
         self.hub
@@ -741,6 +745,11 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
         check_wants(src, &view, snapshot, &reals, &w2)
     })
     .await?;
+    // Packed objects the answer needs, neighbours read together (BUG-1152).
+    {
+        let ids: Vec<ObjectId> = wants.iter().map(|w| w.id).filter(|id| !created.contains_key(id) && builtin(id).is_none()).collect();
+        hub.objects.prefetch(project.id, &ids).await;
+    }
     // The answer: objects read concurrently (a remote store's latency would
     // otherwise add up one object at a time), at most `FETCH_WINDOW` of
     // them and about `FETCH_WINDOW_BYTES` ahead of the one sent next, each
@@ -1341,26 +1350,29 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     // The receipts (a long history's are tens of megabytes) are not held
     // through the checks once read.
     let receipts = std::mem::take(&mut req.receipts);
-    let (uploaded, staged) = receipted(hub, project.id, person, &receipts);
+    let staged = receipted(hub, project.id, person, &receipts);
     drop(receipts);
-    let st = Arc::new(staging(hub, project.id, &staged).await?);
+    let st = Arc::new(staging(hub, project.id, person, &staged).await?);
     drop(staged);
+    let uploaded: HashSet<ObjectId> = st.at.keys().copied().collect();
     let progress = Mutex::new(Progress::default());
     let r = push_staged(hub, project, viewer, req, person, uploaded, st.clone(), &progress).await;
     let p = progress.into_inner().unwrap();
     let (staged_gone, own_gone): (Vec<Arc<str>>, Vec<Arc<str>>) = match &r {
-        // Landed: an upload it did not list (its checks did not read all of
-        // it; what they read was copied into its own pack).
-        Ok((_, kept)) => (st.names().into_iter().filter(|n| !kept.is_empty() && !kept.contains(n)).collect(), Vec::new()),
+        // Landed: every upload it did not list (one its checks did not read
+        // all of: what they read was copied into its own pack).
+        Ok((_, Some(kept))) => (st.names().into_iter().filter(|n| !kept.contains(n)).collect(), Vec::new()),
+        // Every update lost a race (not on the tip): every check passed, and
+        // the uploads stay for the next try, which gets their receipts again
+        // (BUG-1157). Nothing written, nothing committed (BUG-910).
+        Ok((_, None)) => (Vec::new(), Vec::new()),
         // Refused by its checks, before its transaction: what it was
-        // refused for is deleted (BUG-930), and its own pack was never
-        // listed.
+        // refused for is deleted (BUG-930).
         Err(Error::Api { .. }) if !p.transaction => (st.names(), p.written),
-        // A lost race (409: every check passed, `vl` uploads again) or an
-        // error the request may be run again for: nothing is deleted, and
-        // what no push lists stays unread until S29's job removes it (no
-        // commit for a refused push: BUG-910).
-        Err(_) => (Vec::new(), Vec::new()),
+        // A lost race in its transaction (409), or an error the request may
+        // be run again for: the uploads stay (as above); its own pack goes
+        // unless its transaction listed it after all.
+        Err(_) => (Vec::new(), p.written),
     };
     if let Err(e) = hub.objects.discard(project.id, &staged_gone).await {
         eprintln!("veil-server: discarding the uploads a push refused: {e:#}");
@@ -1388,7 +1400,7 @@ const CHECKS_AT_ONCE: usize = 8;
 const GUESS_WINDOW: usize = 64;
 
 /// [`push`] with its uploads read: the result and the packs it listed
-/// (none if nothing landed). `progress`: what it wrote, how far it got.
+/// (`None` if nothing landed). `progress`: what it wrote, how far it got.
 #[allow(clippy::too_many_arguments)]
 async fn push_staged(
     hub: &Arc<Hub>,
@@ -1399,7 +1411,7 @@ async fn push_staged(
     uploaded: HashSet<ObjectId>,
     st: Arc<Staged>,
     progress: &Mutex<Progress>,
-) -> Result<(PushResult, HashSet<Arc<str>>)> {
+) -> Result<(PushResult, Option<HashSet<Arc<str>>>)> {
     if !project.participant(viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
@@ -1743,19 +1755,25 @@ async fn push_staged(
             // same person discarded first cannot be listed: nothing lands,
             // and `vl` uploads again.
             if !packs.0.is_empty() {
-                let listed: Vec<bool> = sqlx::query_scalar(
-                    "INSERT INTO packs (project_id, name, size, objects, listed, created_at) \
-                     SELECT $1, n, s, o, TRUE, $5 FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]) AS t(n, s, o) \
-                     ON CONFLICT (project_id, name) DO UPDATE SET listed = packs.listed RETURNING listed",
+                // A staged row turns listed (locked by the update: a racing
+                // discard waits, then finds it listed); the push's own pack
+                // gets its row here; a discarded one stays discarded.
+                let states: Vec<i16> = sqlx::query_scalar(
+                    "INSERT INTO packs (project_id, name, state, size, objects, created_at) \
+                     SELECT $1, n, $6, s, o, $5 FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]) AS t(n, s, o) \
+                     ON CONFLICT (project_id, name) DO UPDATE \
+                     SET state = CASE WHEN packs.state = $7 THEN packs.state ELSE $6 END RETURNING state",
                 )
                 .bind(pid)
                 .bind(&packs.0)
                 .bind(&packs.1)
                 .bind(&packs.2)
                 .bind(veil_core::now_millis())
+                .bind(crate::pack::LISTED)
+                .bind(crate::pack::DISCARDED)
                 .fetch_all(&mut *c)
                 .await?;
-                if listed.contains(&false) {
+                if states.contains(&crate::pack::DISCARDED) {
                     return Err(Error::conflict("an upload this push names was discarded; push again"));
                 }
             }
@@ -1852,10 +1870,7 @@ async fn push_staged(
         };
         results.push(BranchResult { branch, ok: true, message: None, tip });
     }
-    let kept = match landed {
-        false => HashSet::new(),
-        true => listed.into_iter().map(|p| p.0).collect(),
-    };
+    let kept = landed.then(|| listed.into_iter().map(|p| p.0).collect());
     Ok((PushResult { results, warnings }, kept))
 }
 
@@ -1981,18 +1996,16 @@ async fn is_ancestor_in(hub: &Arc<Hub>, project: i64, staged: Option<Arc<Staged>
 /// A push shows it for each object it introduces; the server reads the
 /// object from that pack, and only for that person.
 pub fn receipt(hub: &Hub, project: i64, person: i64, id: &ObjectId, pack: &str) -> String {
-    format!("{}.{pack}", mac(hub, project, person, id, Some(pack)))
+    format!("{}.{pack}", mac(hub, project, person, id, pack))
 }
 
-fn mac(hub: &Hub, project: i64, person: i64, id: &ObjectId, pack: Option<&str>) -> String {
+fn mac(hub: &Hub, project: i64, person: i64, id: &ObjectId, pack: &str) -> String {
     let mut h = blake3::Hasher::new_keyed(&hub.receipt_key);
     h.update(&project.to_le_bytes());
     h.update(&person.to_le_bytes());
     h.update(&id.0);
-    if let Some(p) = pack {
-        h.update(b"staged in");
-        h.update(p.as_bytes());
-    }
+    h.update(b"staged in");
+    h.update(pack.as_bytes());
     hex::encode(&h.finalize().as_bytes()[..16])
 }
 
@@ -2001,46 +2014,38 @@ fn same(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// The objects whose receipts in `receipts` are `person`'s, and of those
-/// the staged pack of each one an upload staged. A receipt without a pack
-/// (a server before S28 stored the object as it came) names a stored
-/// object.
-pub(crate) fn receipted(
-    hub: &Hub,
-    project: i64,
-    person: i64,
-    receipts: &std::collections::BTreeMap<ObjectId, String>,
-) -> (HashSet<ObjectId>, HashMap<ObjectId, Arc<str>>) {
-    let mut uploaded = HashSet::new();
+/// The staged pack of each object whose receipt in `receipts` is
+/// `person`'s. A receipt is only a claim: what was uploaded is what
+/// [`staging`] finds in those packs. (Receipts without a pack, from servers
+/// before S28, are not accepted: the upgrade to S28 is not rolling,
+/// BUG-1158.)
+pub(crate) fn receipted(hub: &Hub, project: i64, person: i64, receipts: &std::collections::BTreeMap<ObjectId, String>) -> HashMap<ObjectId, Arc<str>> {
     let mut staged = HashMap::new();
     let mut names: HashMap<&str, Arc<str>> = HashMap::new();
     for (id, r) in receipts {
-        let (m, pack) = match r.split_once('.') {
-            Some((m, p)) if crate::pack::valid_name(p) => (m, Some(p)),
-            Some(_) => continue,
-            None => (r.as_str(), None),
-        };
-        if !same(m, &mac(hub, project, person, id, pack)) {
+        let Some((m, p)) = r.split_once('.') else { continue };
+        if !crate::pack::valid_name(p) || !same(m, &mac(hub, project, person, id, p)) {
             continue;
         }
-        uploaded.insert(*id);
-        if let Some(p) = pack {
-            staged.insert(*id, names.entry(p).or_insert_with(|| Arc::from(p)).clone());
-        }
+        staged.insert(*id, names.entry(p).or_insert_with(|| Arc::from(p)).clone());
     }
-    (uploaded, staged)
+    staged
 }
 
-/// The staged packs `staged` names (from [`receipted`]): each one's index,
-/// and where each object is. A pack no longer in the store (discarded) is
-/// left out: its objects are then missing, as never uploaded.
-async fn staging(hub: &Arc<Hub>, project: i64, staged: &HashMap<ObjectId, Arc<str>>) -> Result<Staged> {
+/// The staged packs `staged` names (from [`receipted`]) that `person`
+/// uploaded and nobody discarded (the database's rows: BUG-1155), each
+/// one's index, and where each object is. **An object counts as uploaded
+/// only if its receipt's pack holds it** ([`Staged::uploaded`]): a receipt
+/// of a discarded upload, or of another pack, is worth nothing, and the
+/// object is never looked for in the project's store instead.
+async fn staging(hub: &Arc<Hub>, project: i64, person: i64, staged: &HashMap<ObjectId, Arc<str>>) -> Result<Staged> {
     let mut names: Vec<Arc<str>> = staged.values().cloned().collect();
     names.sort();
     names.dedup();
+    let usable = hub.objects.usable(project, person, &names).await.map_err(Error::Other)?;
     let mut packs = Vec::new();
     let mut set = tokio::task::JoinSet::new();
-    let mut it = names.into_iter();
+    let mut it = names.into_iter().filter(|n| usable.contains(n));
     loop {
         while set.len() < 16 {
             let Some(n) = it.next() else { break };
@@ -2071,33 +2076,56 @@ async fn staging(hub: &Arc<Hub>, project: i64, staged: &HashMap<ObjectId, Arc<st
     })
 }
 
-/// The objects an API commit's `receipts` name in staged packs (S28), read
-/// into memory for its checks (`changes`: what the commit keeps is stored
-/// once every check passed), at most [`MAX_FRAME_OBJECT`] bytes of them;
-/// and every object the receipts name. [`settle_uploads`] discards the
-/// packs when the commit is answered.
+/// Most bytes of uploaded objects one API commit may name. They are held
+/// decoded for its checks under [`DECODING_IN_FLIGHT`] for every request
+/// together (BUG-1156): a commit naming more than that takes all of it, so
+/// one at a time.
+pub const MAX_API_UPLOADS: u64 = MAX_FRAME_OBJECT as u64;
+
+/// The objects an API commit's `receipts` name in its staged packs (S28),
+/// read into memory for its checks (`changes`: what the commit keeps is
+/// stored once every check passed), at most [`MAX_API_UPLOADS`] bytes of
+/// them decoded, held under the server-wide bound on decoded bytes (the
+/// share returned: keep it while the objects are held, BUG-1156); and the
+/// objects uploaded. [`settle_uploads`] discards the packs when the commit
+/// is answered.
 pub(crate) async fn take_uploads(
     hub: &Arc<Hub>,
     project: i64,
     person: i64,
     receipts: &std::collections::BTreeMap<ObjectId, String>,
-) -> Result<(HashSet<ObjectId>, HashMap<ObjectId, Bytes>)> {
-    let (uploaded, staged) = receipted(hub, project, person, receipts);
-    let st = staging(hub, project, &staged).await?;
-    let mut out = HashMap::new();
+) -> Result<(HashSet<ObjectId>, HashMap<ObjectId, Bytes>, Option<crate::store::ReadAhead>)> {
+    let staged = receipted(hub, project, person, receipts);
+    let st = staging(hub, project, person, &staged).await?;
+    // Their encodings (as uploaded: compressed), and what they decode to.
+    let mut encs = Vec::new();
     let mut total = 0u64;
     for (id, (name, slot)) in st.at.iter() {
-        let Some((_, raw)) = hub.objects.get_staged(project, name, *slot, id).await? else { continue };
-        total += raw.len() as u64;
-        if total > MAX_FRAME_OBJECT as u64 {
+        let Some(enc) = hub.objects.staged_encoding(project, name, *slot, id).await.map_err(Error::Other)? else { continue };
+        total = total.saturating_add(encoding::declared_len(&enc[..enc.len().min(encoding::HEADER)], enc.len() as u64).unwrap_or(u64::MAX));
+        if total > MAX_API_UPLOADS {
             return Err(Error::bad_request(format!(
                 "a commit through the API names at most {} MiB of uploaded objects: push larger changes with `vl push`",
-                MAX_FRAME_OBJECT >> 20
+                MAX_API_UPLOADS >> 20
             )));
         }
-        out.insert(*id, raw);
+        encs.push((*id, enc));
     }
-    Ok((uploaded, out))
+    let held = match total {
+        0 => None,
+        n => Some(crate::store::ReadAhead::wait(n).await),
+    };
+    let out = tokio::task::spawn_blocking(move || -> Result<HashMap<ObjectId, Bytes>> {
+        let mut out = HashMap::new();
+        for (id, enc) in encs {
+            let raw = encoding::decode(&id, &enc, MAX_API_UPLOADS)?;
+            out.insert(id, Bytes::copy_from_slice(&raw));
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| Error::Other(e.into()))??;
+    Ok((out.keys().copied().collect(), out, held))
 }
 
 /// After an API commit with `receipts` was answered with `outcome`: its
@@ -2118,8 +2146,7 @@ pub(crate) async fn settle_uploads<T>(
         Err(Error::Api { status, .. }) if *status != axum::http::StatusCode::CONFLICT => {}
         Err(_) => return,
     }
-    let (_, staged) = receipted(hub, project, person, receipts);
-    let mut names: Vec<Arc<str>> = staged.into_values().collect();
+    let mut names: Vec<Arc<str>> = receipted(hub, project, person, receipts).into_values().collect();
     names.sort();
     names.dedup();
     if let Err(e) = hub.objects.discard(project, &names).await {
@@ -2198,7 +2225,7 @@ pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limi
     }
     let ids: Vec<ObjectId> = frames.iter().map(|(id, _)| *id).collect();
     // Encodings, checked above: staged as they are, never encoded again.
-    let pack = hub.objects.stage(project, frames).await.map_err(Error::Other)?;
+    let pack = hub.objects.stage(project, person, frames).await.map_err(Error::Other)?;
     Ok(ids.iter().map(|id| receipt(hub, project, person, id, &pack)).collect())
 }
 

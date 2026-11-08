@@ -771,7 +771,9 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
     let edits = validate(&req, &mut pending)?;
     // Uploads are staged (S28): read into memory with what the change makes,
     // stored only once every check passed (BUG-930).
-    let (uploaded, staged) = sync::take_uploads(hub, project.id, person.id, &req.receipts).await?;
+    // Held decoded under the server-wide bound while the commit runs
+    // (BUG-1156).
+    let (uploaded, staged, _held) = sync::take_uploads(hub, project.id, person.id, &req.receipts).await?;
     pending.extend(staged);
     let onto = req.onto.clone();
     let mut who = Arc::new(Who {

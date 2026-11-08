@@ -265,6 +265,7 @@ fn stats(hub: &veil_server::Hub, n: u64) -> serde_json::Value {
         "storage_written_bytes": hub.objects.written_bytes.load(Relaxed),
         "storage_reads": hub.objects.reads.load(Relaxed),
         "storage_background_writes": hub.objects.background_writes.load(Relaxed),
+        "upload_commits": hub.objects.upload_commits.load(Relaxed),
         "session_hits": c.session_hits.load(Relaxed),
         "session_misses": c.session_misses.load(Relaxed),
         "permission_hits": c.permission_hits.load(Relaxed),

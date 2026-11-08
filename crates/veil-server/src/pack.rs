@@ -6,37 +6,45 @@
 //! random hex digits; never edited in place):
 //!
 //! ```text
-//! "veilpack1\n"                    10 bytes
+//! "veilpack2\n"                    10 bytes
 //! count u32be
 //! index: count × (id 32 ‖ offset u64be ‖ len u32be), sorted by id, ids distinct
-//! entries: each object's encoding (S27: `v…` or `z…`), at its offset
+//! entries: each object's id (32 bytes) then its encoding (S27: `v…` or
+//!          `z…`); a slot spans both
 //! ```
 //!
 //! The index is at the front, so one read of the first [`FIRST_READ`]
 //! bytes holds it for most packs, without knowing the pack's length. An
-//! entry is read with a range request and decoded and checked against its
-//! id like any object (`store::Objects`), so a wrong index entry is an
-//! error, never other content. A pack is self-describing: S29 merges packs
-//! by reading their indexes and copying entries into a new pack, and drops
-//! an object by writing a pack without it (`storage-and-cost.md` §8).
+//! entry is read with a range request, and **every read checks the id the
+//! entry starts with** ([`entry`]) before any byte of it is used, a ranged
+//! one too: a wrong slot (a damaged index, a merger's mistake) is an error,
+//! never another object's bytes (BUG-1154). Whole reads are also decoded
+//! and checked against the id like any object (`store::Objects`). A pack is
+//! self-describing: S29 merges packs by reading their indexes and copying
+//! entries into a new pack, and drops an object by writing a pack without
+//! it (`storage-and-cost.md` §8).
 //!
-//! **States** (the `packs` table, migration 13): a pack an upload wrote is
-//! *staged*: no row, never read by anyone but the push or API commit whose
-//! receipts name it. A push that lands *lists* it (a row with `listed`) in
-//! its own transaction; a refused one *discards* it (a row without
-//! `listed`, then the storage object is deleted). Whichever row is written
-//! first wins, by the primary key, so a listed pack is never deleted and a
-//! discarded one is never listed.
+//! **States** (the `packs` table, migration 13), one row per pack:
+//! * *staged* (0): an upload's pack, recorded with its uploader **before**
+//!   it is written, so the database knows every upload in storage; read by
+//!   nobody but a push or API commit of that person whose receipts name it;
+//! * *listed* (1): its objects are the project's, set in the transaction of
+//!   the push that lands it (a push's own pack is inserted there);
+//! * *discarded* (2): refused; its storage object is deleted after the row
+//!   says so. A staged row turns listed or discarded once, whichever comes
+//!   first (the row is locked by the update), so a listed pack is never
+//!   deleted and a discarded one is never listed.
 //!
 //! **Lookups.** Each server keeps, per project, the slots of every listed
-//! pack it has read the index of ([`Packs`]): object id → pack and slot.
-//! A miss there and among loose objects reads the project's listing again
-//! (one statement) and the indexes of packs it does not know.
+//! pack it has read the index of ([`Packs`]): object id → pack and slot,
+//! bounded by bytes across projects ([`LOOKUP_BUDGET`]). A miss there and
+//! among loose objects reads the project's listing again (one statement)
+//! and the indexes of packs it does not know.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
     },
     time::Instant,
@@ -49,16 +57,23 @@ use veil_core::{cache::LruCache, ObjectId};
 use crate::store::BlobStore;
 
 /// A pack's first bytes.
-pub const MAGIC: &[u8; 10] = b"veilpack1\n";
+pub const MAGIC: &[u8; 10] = b"veilpack2\n";
 /// The magic and the count.
 const HEAD: usize = MAGIC.len() + 4;
 /// One index entry: id, offset, length.
 const ENTRY: usize = 32 + 8 + 4;
+/// The id each entry starts with.
+pub const ID_LEN: u64 = 32;
 /// What a reader asks for first: the head and, up to about 1,500 objects,
 /// the whole index.
 pub const FIRST_READ: u64 = 64 << 10;
 /// Most objects one pack holds (its index is at most 88 MiB).
 pub const MAX_OBJECTS: usize = 2 << 20;
+
+/// Pack states in the `packs` table.
+pub const STAGED: i16 = 0;
+pub const LISTED: i16 = 1;
+pub const DISCARDED: i16 = 2;
 
 /// The storage key of pack `name` of `project`.
 pub fn key(project: i64, name: &str) -> String {
@@ -75,7 +90,7 @@ pub fn valid_name(s: &str) -> bool {
     s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Where an object's encoding sits in its pack.
+/// Where an object's entry (its id, then its encoding) sits in its pack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Slot {
     pub offset: u64,
@@ -87,6 +102,21 @@ impl Slot {
     pub fn last(&self) -> u64 {
         self.offset + u64::from(self.len.max(1)) - 1
     }
+
+    /// The length of the object's encoding (the entry without its id).
+    pub fn encoding_len(&self) -> u64 {
+        u64::from(self.len).saturating_sub(ID_LEN)
+    }
+}
+
+/// The encoding in `bytes`, an entry's first bytes read from its slot,
+/// once the id it starts with is checked to be `id`: a slot naming another
+/// object's entry is an error, never its bytes.
+pub fn entry<'a>(id: &ObjectId, bytes: &'a [u8]) -> Result<&'a [u8]> {
+    if bytes.len() < ID_LEN as usize || bytes[..ID_LEN as usize] != id.0 {
+        bail!("pack entry for {} holds another object", id.short());
+    }
+    Ok(&bytes[ID_LEN as usize..])
 }
 
 /// A pack's index: sorted by id, ids distinct.
@@ -119,7 +149,7 @@ impl Index {
 }
 
 /// Lay out a pack of the encodings `objects` (the first of each id kept),
-/// in the order given; its index; its length.
+/// in the order given; its index.
 pub fn build(objects: Vec<(ObjectId, Bytes)>) -> Result<(Bytes, Index)> {
     let mut seen = HashSet::with_capacity(objects.len());
     let objects: Vec<(ObjectId, Bytes)> = objects.into_iter().filter(|(id, _)| seen.insert(*id)).collect();
@@ -127,11 +157,11 @@ pub fn build(objects: Vec<(ObjectId, Bytes)>) -> Result<(Bytes, Index)> {
         bail!("at most {MAX_OBJECTS} objects per pack");
     }
     let head = HEAD + objects.len() * ENTRY;
-    let total = head + objects.iter().map(|(_, b)| b.len()).sum::<usize>();
+    let total = head + objects.iter().map(|(_, b)| ID_LEN as usize + b.len()).sum::<usize>();
     let mut entries = Vec::with_capacity(objects.len());
     let mut at = head as u64;
     for (id, b) in &objects {
-        let len = u32::try_from(b.len()).map_err(|_| anyhow!("an object of 4 GiB or more cannot be packed"))?;
+        let len = u32::try_from(ID_LEN as usize + b.len()).map_err(|_| anyhow!("an object of 4 GiB or more cannot be packed"))?;
         entries.push((*id, Slot { offset: at, len }));
         at += u64::from(len);
     }
@@ -144,7 +174,8 @@ pub fn build(objects: Vec<(ObjectId, Bytes)>) -> Result<(Bytes, Index)> {
         out.put_u64(s.offset);
         out.put_u32(s.len);
     }
-    for (_, b) in objects {
+    for (id, b) in objects {
+        out.put_slice(&id.0);
         out.put_slice(&b);
     }
     debug_assert_eq!(out.len(), total);
@@ -165,8 +196,9 @@ pub fn head_len(first: &[u8]) -> Result<u64> {
 }
 
 /// The index from a pack's first bytes (at least [`head_len`] of them),
-/// checked: ids sorted and distinct, every slot after the index and, when
-/// the pack's length `size` is known, inside it.
+/// checked: ids sorted and distinct, every slot after the index, long
+/// enough for its id and one byte, and, when the pack's length `size` is
+/// known, inside it.
 pub fn parse_index(first: &[u8], size: Option<u64>) -> Result<Index> {
     let hl = head_len(first)? as usize;
     if first.len() < hl {
@@ -178,7 +210,7 @@ pub fn parse_index(first: &[u8], size: Option<u64>) -> Result<Index> {
         let offset = u64::from_be_bytes(e[32..40].try_into().expect("8 bytes"));
         let len = u32::from_be_bytes(e[40..44].try_into().expect("4 bytes"));
         let end = offset.checked_add(u64::from(len)).ok_or_else(|| anyhow!("a pack slot past the end"))?;
-        if offset < hl as u64 || len == 0 || size.is_some_and(|s| end > s) {
+        if offset < hl as u64 || u64::from(len) <= ID_LEN || size.is_some_and(|s| end > s) {
             bail!("a pack slot outside its entries");
         }
         if entries.last().is_some_and(|(last, _): &(ObjectId, Slot)| *last >= id) {
@@ -205,18 +237,14 @@ pub async fn read_index(store: &dyn BlobStore, key: &str) -> Result<Option<(Inde
     Ok(Some((parse_index(&first, Some(size)).with_context(|| format!("reading pack {key}"))?, size)))
 }
 
-/// A listed pack's row.
-#[derive(Clone, Debug)]
-pub struct Row {
-    pub name: Arc<str>,
-    pub size: u64,
-    pub objects: u64,
-}
-
-/// About the memory one slot takes in a project's lookup map.
+/// About the memory one slot takes in a project's lookup map, and a
+/// project's entry with no slot.
 const SLOT_WEIGHT: usize = 80;
+const PROJECT_WEIGHT: usize = 512;
 /// The lookup maps of all projects, together: projects used least recently
-/// are dropped past it (each is read again when next needed).
+/// are dropped past it (each is read again when next needed), the one in
+/// use last of all. A project whose map alone passes it is dropped too once
+/// it is no longer in use: its lookups then read its listing again.
 pub const LOOKUP_BUDGET: usize = 128 << 20;
 
 #[derive(Default)]
@@ -234,6 +262,12 @@ struct ProjectPacks {
     used: Mutex<Instant>,
 }
 
+impl ProjectPacks {
+    fn weight(&self) -> usize {
+        PROJECT_WEIGHT + self.map.read().unwrap().slots.len() * SLOT_WEIGHT
+    }
+}
+
 /// What a lookup found.
 pub enum Found {
     At(Arc<str>, Slot),
@@ -243,15 +277,26 @@ pub enum Found {
     Unloaded,
 }
 
-/// Every project's listed packs, as this server knows them.
+/// The uploads a person staged on this server recently, newest first, per
+/// project (a push that lost a race uploads the same objects again: they
+/// get the receipts of the pack that holds them, BUG-1157).
+const RECENT_UPLOADS: usize = 8;
+
+/// A person's recent staged packs in a project, newest first.
+type Recent = VecDeque<Arc<str>>;
+
+/// Every project's listed packs, as this server knows them, and the packs
+/// staged here.
 pub struct Packs {
     db: Option<sqlx::PgPool>,
     projects: Mutex<HashMap<i64, Arc<ProjectPacks>>>,
-    weight: AtomicUsize,
+    /// [`LOOKUP_BUDGET`] (smaller in tests).
+    budget: usize,
     /// Indexes and lengths of packs staged recently, by name (a push on the
     /// server that took the upload reads them without a storage read);
     /// `None` once discarded here.
     staged: LruCache<Option<(Arc<Index>, u64)>>,
+    recent: Mutex<HashMap<(i64, i64), Recent>>,
 }
 
 fn name_key(project: i64, name: &str) -> ObjectId {
@@ -267,13 +312,15 @@ impl Packs {
         Packs {
             db,
             projects: Mutex::new(HashMap::new()),
-            weight: AtomicUsize::new(0),
+            budget: LOOKUP_BUDGET,
             staged: LruCache::new(32 << 20),
+            recent: Mutex::new(HashMap::new()),
         }
     }
 
     fn project(&self, project: i64) -> Arc<ProjectPacks> {
         let mut g = self.projects.lock().unwrap();
+        let fresh = !g.contains_key(&project);
         let p = g
             .entry(project)
             .or_insert_with(|| {
@@ -285,6 +332,9 @@ impl Packs {
             })
             .clone();
         *p.used.lock().unwrap() = Instant::now();
+        if fresh {
+            Self::evict(&mut g, project, self.budget);
+        }
         p
     }
 
@@ -302,7 +352,6 @@ impl Packs {
     /// Add listed packs to `project`'s map.
     fn add(&self, project: i64, packs: Vec<(Arc<str>, Arc<Index>)>, loaded: bool) {
         let p = self.project(project);
-        let mut added = 0;
         {
             let mut m = p.map.write().unwrap();
             for (name, index) in packs {
@@ -310,32 +359,32 @@ impl Packs {
                     continue;
                 }
                 for (id, s) in index.iter() {
-                    if m.slots.insert(*id, (name.clone(), *s)).is_none() {
-                        added += 1;
-                    }
+                    m.slots.insert(*id, (name.clone(), *s));
                 }
             }
             m.loaded |= loaded;
         }
-        let total = self.weight.fetch_add(added * SLOT_WEIGHT, Ordering::Relaxed) + added * SLOT_WEIGHT;
-        if total > LOOKUP_BUDGET {
-            self.evict(project);
-        }
+        let mut g = self.projects.lock().unwrap();
+        Self::evict(&mut g, project, self.budget);
     }
 
-    /// Drop the maps of projects used least recently (never `keep`'s)
-    /// until the maps fit [`LOOKUP_BUDGET`].
-    fn evict(&self, keep: i64) {
-        let mut g = self.projects.lock().unwrap();
-        let mut by_use: Vec<(Instant, i64)> = g.iter().filter(|(k, _)| **k != keep).map(|(k, p)| (*p.used.lock().unwrap(), *k)).collect();
+    /// Drop the maps of projects used least recently until the maps fit
+    /// [`LOOKUP_BUDGET`], `last` (the one just used) last of all. Weights
+    /// are read from the maps themselves, under the projects' lock, so an
+    /// add racing an eviction is never counted twice or lost.
+    fn evict(g: &mut HashMap<i64, Arc<ProjectPacks>>, last: i64, budget: usize) {
+        let mut total: usize = g.values().map(|p| p.weight()).sum();
+        if total <= budget {
+            return;
+        }
+        let mut by_use: Vec<(bool, Instant, i64)> = g.iter().map(|(k, p)| (*k == last, *p.used.lock().unwrap(), *k)).collect();
         by_use.sort();
-        for (_, k) in by_use {
-            if self.weight.load(Ordering::Relaxed) <= LOOKUP_BUDGET {
+        for (_, _, k) in by_use {
+            if total <= budget {
                 break;
             }
             if let Some(p) = g.remove(&k) {
-                let n = p.map.read().unwrap().slots.len();
-                self.weight.fetch_sub(n * SLOT_WEIGHT, Ordering::Relaxed);
+                total -= p.weight();
             }
         }
     }
@@ -355,8 +404,9 @@ impl Packs {
             *last = Some(began);
             return Ok(());
         };
-        let rows: Vec<String> = sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND listed")
+        let rows: Vec<String> = sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND state = $2")
             .bind(project)
+            .bind(LISTED)
             .fetch_all(db)
             .await?;
         let new: Vec<String> = {
@@ -398,10 +448,70 @@ impl Packs {
         }
     }
 
-    /// Remember the index of a pack staged here.
-    pub fn staged_here(&self, project: i64, name: &str, index: Arc<Index>, size: u64) {
+    /// Record staged pack `name` of `project`, uploaded by `person`, before
+    /// it is written: the database knows every upload in storage.
+    pub async fn record_staged(&self, project: i64, person: i64, name: &str, size: u64, objects: usize) -> Result<()> {
+        let Some(db) = &self.db else { return Ok(()) };
+        sqlx::query("INSERT INTO packs (project_id, name, state, person_id, size, objects, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+            .bind(project)
+            .bind(name)
+            .bind(STAGED)
+            .bind(person)
+            .bind(size as i64)
+            .bind(objects as i64)
+            .bind(veil_core::now_millis())
+            .execute(db)
+            .await?;
+        Ok(())
+    }
+
+    /// Remember the index of a pack staged here, by `person`.
+    pub fn staged_here(&self, project: i64, person: i64, name: &Arc<str>, index: Arc<Index>, size: u64) {
         let w = index.weight();
         self.staged.insert(name_key(project, name), Some((index, size)), w);
+        let mut r = self.recent.lock().unwrap();
+        let q = r.entry((project, person)).or_default();
+        q.push_front(name.clone());
+        q.truncate(RECENT_UPLOADS);
+    }
+
+    /// A pack `person` staged here recently that holds every one of `ids`
+    /// and is still staged or listed (asked of the database): an upload of
+    /// those objects again gets its receipts instead of a new pack.
+    pub async fn staged_holding(&self, project: i64, person: i64, ids: &[ObjectId]) -> Result<Option<Arc<str>>> {
+        let names: Vec<Arc<str>> = self.recent.lock().unwrap().get(&(project, person)).map(|q| q.iter().cloned().collect()).unwrap_or_default();
+        for name in names {
+            let Some(Some((index, _))) = self.staged.get(&name_key(project, &name)) else { continue };
+            if !ids.iter().all(|id| index.get(id).is_some()) {
+                continue;
+            }
+            if self.usable(project, person, std::slice::from_ref(&name)).await?.contains(&name) {
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Of packs `names`, those `person` uploaded that are staged or listed
+    /// now (not discarded): the only uploads a receipt may name.
+    pub async fn usable(&self, project: i64, person: i64, names: &[Arc<str>]) -> Result<HashSet<Arc<str>>> {
+        let Some(db) = &self.db else { return Ok(names.iter().cloned().collect()) };
+        if names.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let asked: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM packs WHERE project_id = $1 AND name = ANY($2) AND person_id = $3 AND state IN ($4, $5)",
+        )
+        .bind(project)
+        .bind(&asked)
+        .bind(person)
+        .bind(STAGED)
+        .bind(LISTED)
+        .fetch_all(db)
+        .await?;
+        let rows: HashSet<String> = rows.into_iter().collect();
+        Ok(names.iter().filter(|n| rows.contains(&***n)).cloned().collect())
     }
 
     /// The index and length of staged pack `name`: from memory, or read.
@@ -412,9 +522,9 @@ impl Packs {
         Ok(read_index(store, &key(project, name)).await?.map(|(i, s)| (Arc::new(i), s)))
     }
 
-    /// Discard packs `names` of `project` that no transaction listed: a row
-    /// without `listed` first (so no push can list them after), then the
-    /// storage objects. A pack already listed is left as it is.
+    /// Discard staged packs `names` of `project`: the row turns discarded
+    /// first (so no push can list them after), then the storage objects
+    /// go. A pack already listed is left as it is.
     pub async fn discard(&self, store: &dyn BlobStore, project: i64, names: &[Arc<str>]) -> Result<()> {
         if names.is_empty() {
             return Ok(());
@@ -425,15 +535,13 @@ impl Packs {
         let gone: Vec<String> = match &self.db {
             Some(db) => {
                 let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
-                sqlx::query_scalar(
-                    "INSERT INTO packs (project_id, name, size, objects, listed, created_at) \
-                     SELECT $1, n, 0, 0, FALSE, $3 FROM UNNEST($2::text[]) AS t(n) ON CONFLICT DO NOTHING RETURNING name",
-                )
-                .bind(project)
-                .bind(&names)
-                .bind(veil_core::now_millis())
-                .fetch_all(db)
-                .await?
+                sqlx::query_scalar("UPDATE packs SET state = $3 WHERE project_id = $1 AND name = ANY($2) AND state = $4 RETURNING name")
+                    .bind(project)
+                    .bind(&names)
+                    .bind(DISCARDED)
+                    .bind(STAGED)
+                    .fetch_all(db)
+                    .await?
             }
             None => names.iter().map(|n| n.to_string()).collect(),
         };
@@ -441,6 +549,23 @@ impl Packs {
             store.delete(&key(project, &n)).await?;
         }
         Ok(())
+    }
+
+    /// Delete a push's own pack `name` of `project` (written before its
+    /// transaction) when the database shows its transaction did not list
+    /// it: no row (an own pack's row is written only in that transaction).
+    pub async fn delete_if_unlisted(&self, store: &dyn BlobStore, project: i64, name: &str) -> Result<()> {
+        if let Some(db) = &self.db {
+            let row: Option<i16> = sqlx::query_scalar("SELECT state FROM packs WHERE project_id = $1 AND name = $2")
+                .bind(project)
+                .bind(name)
+                .fetch_optional(db)
+                .await?;
+            if row.is_some() {
+                return Ok(());
+            }
+        }
+        store.delete(&key(project, name)).await
     }
 }
 
@@ -464,7 +589,12 @@ mod tests {
         for (id, raw) in &objects {
             let s = parsed.get(id).unwrap();
             assert_eq!(index.get(id), Some(s));
-            assert_eq!(&pack[s.offset as usize..=s.last() as usize], &raw[..]);
+            let bytes = &pack[s.offset as usize..=s.last() as usize];
+            assert_eq!(entry(id, bytes).unwrap(), &raw[..]);
+            assert_eq!(s.encoding_len(), raw.len() as u64);
+            // Another object's entry is refused, whole or in part.
+            let other = objects.iter().find(|(o, _)| o != id).unwrap().0;
+            assert!(entry(&other, bytes).is_err() && entry(id, &bytes[..10]).is_err());
         }
         assert!(parsed.get(&ObjectId::hash(b"absent")).is_none());
         assert_eq!(head_len(&pack[..HEAD]).unwrap(), (HEAD + 300 * ENTRY) as u64);
@@ -479,7 +609,7 @@ mod tests {
         let (pack, _) = build(vec![obj("a"), obj("b")]).unwrap();
         let size = Some(pack.len() as u64);
         assert!(parse_index(&pack[..HEAD + ENTRY], size).is_err(), "cut short");
-        assert!(parse_index(b"veilpack2\n\0\0\0\0", None).is_err(), "another magic");
+        assert!(parse_index(b"veilpack1\n\0\0\0\0", None).is_err(), "another magic");
         let mut huge = pack.to_vec();
         huge[MAGIC.len()..HEAD].copy_from_slice(&u32::MAX.to_be_bytes());
         assert!(head_len(&huge).is_err(), "a count past the limit");
@@ -498,6 +628,36 @@ mod tests {
         let mut overflow = pack.to_vec();
         overflow[HEAD + 32..HEAD + 40].copy_from_slice(&u64::MAX.to_be_bytes());
         assert!(parse_index(&overflow, None).is_err(), "an offset that overflows");
+        let mut short = pack.to_vec();
+        short[HEAD + 40..HEAD + 44].copy_from_slice(&(ID_LEN as u32).to_be_bytes());
+        assert!(parse_index(&short, size).is_err(), "a slot with room for its id only");
         assert!(valid_name(&new_name()) && !valid_name("../x") && !valid_name(&"A".repeat(32)));
+    }
+
+    /// The lookup maps stay within their budget, every project's entry
+    /// counted; the project in use is dropped last.
+    #[test]
+    fn lookup_maps_are_bounded_by_bytes() {
+        let budget = 1 << 20;
+        let packs = Packs { budget, ..Packs::new(None) };
+        let index = |n: usize, salt: usize| {
+            let objects: Vec<_> = (0..n).map(|i| obj(&format!("{salt} {i}"))).collect();
+            Arc::new(build(objects).unwrap().1)
+        };
+        let per = budget / SLOT_WEIGHT / 3;
+        for p in 0..5 {
+            packs.listed_here(p, vec![(Arc::from(new_name()), index(per, p as usize))]);
+            let g = packs.projects.lock().unwrap();
+            let total: usize = g.values().map(|p| p.weight()).sum();
+            assert!(total <= budget, "{total} bytes after project {p}");
+            assert!(g.contains_key(&p), "the project in use is kept");
+            assert!(g.len() <= 3, "older projects dropped");
+        }
+        // Many projects touched once: bounded too.
+        for p in 100..100 + (budget / PROJECT_WEIGHT) as i64 + 10 {
+            let _ = packs.find(p, &ObjectId::hash(b"x"));
+        }
+        let g = packs.projects.lock().unwrap();
+        assert!(g.values().map(|p| p.weight()).sum::<usize>() <= budget);
     }
 }
