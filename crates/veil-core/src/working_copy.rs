@@ -151,6 +151,9 @@ impl Repo {
         let to = self.snapshot(&target)?.tree;
         let mut record = state.materialised.clone();
         let report = if from != to || !record.is_empty() {
+            // A thin clone fetches what the move reads first: a server that
+            // cannot be reached fails it before anything is written.
+            self.store().prefetch_diff(Some(&from), &to)?;
             // Intent first: from here on, a crash leaves the move to finish.
             state.pending = Some(PendingCheckout {
                 workspace: ws.to_string(),
@@ -264,6 +267,7 @@ impl Repo {
         // `vl undo` in the workspace the directory is now attached to
         // undoes the switch.
         tx.for_workspace(to);
+        tx.attaches(to);
         link(&mut tx);
         tx.view.workspace(to)?;
         tx.manual_undo(format!(

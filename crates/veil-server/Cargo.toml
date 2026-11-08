@@ -64,3 +64,4 @@ containers = []
 
 [dev-dependencies]
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+proptest = "1"

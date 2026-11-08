@@ -286,8 +286,8 @@ fn embargoed_merge_hides_changes_until_release() {
     let public_backend = Arc::new(MemoryBackend::new());
     remote::push(&mut alice, public_backend.clone(), true, &[], false).unwrap();
     let mirror = Repo::open(public_backend.clone(), Some(Identity::generate("public")), "public").unwrap();
-    assert!(mirror.snapshot_opt(&res.snapshot).unwrap().is_none(), "the embargoed merge reached the mirror");
-    assert!(mirror.snapshot_opt(&fix).unwrap().is_none(), "the fix reached the mirror");
+    assert!(mirror.exact().snapshot(&res.snapshot).unwrap().is_none(), "the embargoed merge reached the mirror");
+    assert!(mirror.exact().snapshot(&fix).unwrap().is_none(), "the fix reached the mirror");
     for path in veil_core::vfs::walk_files(&*public_backend, &VPath::root(), &|_| false).unwrap() {
         let data = public_backend.read(&path).unwrap();
         assert!(!data.windows(16).any(|w| w == b"verify_signature"), "{path}");
