@@ -221,7 +221,17 @@ fn exec_mounted(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Confin
     let mount = crate::mount::for_exec(&ctx.root, name)?;
     print_running(a.command, &mount.dir, confine);
     let layers_dir = paths.dir.join(crate::confine::layers_dir(core::workspace_id(&ctx.repo, name).as_deref()));
-    let server = crate::ws_socket::Server::start(&ctx.root, name, &mount.dir, Box::new(crate::ws_socket::Mounted))?;
+    // From here on the mount is recorded (and, if this run made it,
+    // unmounted) whatever happens.
+    let server = match crate::ws_socket::Server::start(&ctx.root, name, &mount.dir, Box::new(crate::ws_socket::Mounted)) {
+        Ok(s) => s,
+        Err(e) => {
+            if let Err(f) = mount.finish() {
+                warn(&format!("{f:#}"));
+            }
+            return Err(e);
+        }
+    };
     let code = run_command(&mount.dir, &paths.dir, a.command, confine, Some(&layers_dir), Some(&server));
     drop(server);
     for n in mount.finish()?.iter().filter(|n| !n.starts_with("Recorded ")) {
