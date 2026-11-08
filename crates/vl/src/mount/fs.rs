@@ -482,7 +482,9 @@ impl ReaderView {
             },
             _ => e.clone(),
         };
-        if self.store.is_partial() && refused(path) {
+        // A refusal hides a path only while its bytes are not held: held
+        // bytes read at every path naming them (BUG-1464, BUG-1507).
+        if self.store.is_partial() && !self.store.has(&shown.id) && refused(path) {
             return Ok(false);
         }
         match shown.kind {

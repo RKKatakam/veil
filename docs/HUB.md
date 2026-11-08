@@ -2908,9 +2908,19 @@ protocol or server change.
     its own path, one request a folder, and ask again at a file's other
     paths in the tree they write only if the server refused it at the
     first. So content refused at one path is written where it is readable
-    there, wherever it was met first (BUG-1460, BUG-1462, BUG-1463). The
-    locator keeps one place an object, for readers by id only. A batch
-    under a local change is asked under its nearest server ancestor.
+    there, wherever it was met first (BUG-1460, BUG-1462, BUG-1463). Every
+    other reader that walks a tree or looks a path up and then reads by id
+    asks for what it reads at its paths first, a batch a request
+    (`tree::prefetch_files`, `prefetch_changes`, `lookup_to_read`;
+    BUG-1506): `vl grep`, `diff`, `show`, `cat`, `ls`, `files`, `blame`,
+    `log -S`/`-G` and `--follow`, `restore`, `bisect`'s count of unreadable
+    files, the attributes a merge reads, rename detection (what its inexact
+    pass reads), merges (the files both sides changed) and `split`/`squash`
+    by hunk. The locator keeps one place an object, for readers by id only.
+    A batch under a local change is asked under its nearest server
+    ancestor. **Outside this:** a diff whose old side holds a refused
+    folder whose tree this clone does not hold fails with "not present"
+    (BUG-1508, open).
   * **content already held reads at every path naming it** (decided,
     BUG-1464): removal of access stops new fetches; bytes already on a
     machine stay readable there, at any path naming them, as they are in a
@@ -2918,7 +2928,7 @@ protocol or server change.
     is asked of the server at that path (`place_along`): the same content
     refused at one path is fetched at another where it is readable
     (BUG-1367); a refusal hides that path for 10 s, or until something
-    makes its bytes held. Fetching is switched off per thread, never for
+    makes its bytes held (BUG-1507). Fetching is switched off per thread, never for
     the whole store (BUG-1366).
 * **Exact dirty sets:** a mount's recording reuses every unchanged folder
   and file by id and visits only the paths the overlay holds, so it

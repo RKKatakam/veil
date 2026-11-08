@@ -327,9 +327,10 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Cat { path, rev } => {
             let id = ctx.rev(rev)?;
             let p = ctx.repo_path(path)?;
+            let tree = ctx.repo.snapshot(&id)?.tree;
             let e = match p.is_root() {
                 true => None,
-                false => lookup(ctx.repo.store(), &ctx.repo.snapshot(&id)?.tree, &p)?,
+                false => lookup(ctx.repo.store(), &tree, &p)?,
             };
             match &e {
                 // A symlink prints its target.
@@ -339,7 +340,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
                 None => bail!("{} does not exist in {}", safe(p.as_str()), id.short()),
             }
             let e = e.expect("a file");
-            let data = read_file(&ctx.repo, &p, &e)?;
+            let data = read_file(&ctx.repo, &tree, &p, &e)?;
             render::Out.write_all(&data)?;
         }
         Cmd::Evolog { rev } => {
@@ -950,6 +951,8 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
     let wanted = |p: &VPath| filters.is_empty() || filters.iter().any(|f| p.starts_with(f));
     let policy_path = VPath::new(POLICY_FILE)?;
     let changes = veil_core::tree::diff_trees(ctx.repo.store(), Some(&wc_tree), Some(&src_tree))?;
+    // In a thin clone, what is put back, each at its own path (BUG-1506).
+    veil_core::tree::prefetch_changes(ctx.repo.store(), None, Some(&src_tree), changes.iter().filter(|c| wanted(&c.path)))?;
     let mut done: std::collections::HashSet<VPath> = changes.iter().filter(|c| wanted(&c.path)).map(|c| c.path.clone()).collect();
     // A version put back keeps its audience: a sealed version, or a
     // conflict, is recorded as the entry it was written from, never as a
@@ -1003,7 +1006,7 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
         let mut carry = None;
         let res = match veil_core::tree::lookup(ctx.repo.store(), &src_tree, &p)? {
             Some(e) if e.kind.is_file_like() => {
-                let data = read_file(&ctx.repo, &p, &e)?;
+                let data = read_file(&ctx.repo, &src_tree, &p, &e)?;
                 if restored_as_recorded(&ctx.repo, &e)? {
                     carry = Some((p.clone(), e.clone()));
                 }
@@ -1017,7 +1020,7 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
             }
             // A quarantined link (a token in its target) put back.
             Some(e) if e.kind == veil_core::EntryKind::Symlink => {
-                let target = read_file(&ctx.repo, &p, &e)?;
+                let target = read_file(&ctx.repo, &src_tree, &p, &e)?;
                 if restored_as_recorded(&ctx.repo, &e)? {
                     carry = Some((p.clone(), e.clone()));
                 }
@@ -1466,13 +1469,14 @@ fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool)
         PolicyFile::Absent => {
             // The working copy's snapshot has recorded the deletion already.
             let wc = ctx.repo.snapshot(&ctx.wc()?)?;
+            let parent = ctx.repo.parents_tree(&wc.parents)?.tree;
             let recorded = match lookup(ctx.repo.store(), &wc.tree, &path)? {
-                Some(e) => Some(e),
-                None => lookup(ctx.repo.store(), &ctx.repo.parents_tree(&wc.parents)?.tree, &path)?,
+                Some(e) => Some((wc.tree, e)),
+                None => lookup(ctx.repo.store(), &parent, &path)?.map(|e| (parent, e)),
             };
             match recorded {
-                Some(e) => {
-                    let b = read_file(&ctx.repo, &path, &e)?;
+                Some((root, e)) => {
+                    let b = read_file(&ctx.repo, &root, &path, &e)?;
                     eprintln!("{} {POLICY_FILE} was missing; restored the recorded version", dim("note:"));
                     String::from_utf8_lossy(&b).into_owned()
                 }

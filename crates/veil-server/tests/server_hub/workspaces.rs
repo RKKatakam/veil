@@ -629,9 +629,10 @@ fn a_thin_checkout_writes_a_readable_copy_of_content_refused_elsewhere() {
 /// Guarantee 1 of the S8 cycle 3 review, in the mount: with the same
 /// content at a refused and a readable path, reads of both on several
 /// threads at once keep each answer to its path (the readable one always
-/// reads, the refused one never does); the refused file cannot be moved
-/// into a readable folder, and nothing of it lands there; the readable copy
-/// moves between folders and reads at its new place.
+/// reads; the refused one is refused, or reads exactly the readable copy's
+/// bytes once they are held, BUG-1464); once held, the refused path's file
+/// moves with exactly those bytes (BUG-1507); the readable copy moves
+/// between folders and reads at its new place.
 #[test]
 fn concurrent_reads_and_moves_keep_a_refusal_to_its_path() {
     const SAME: &str = "SAME-CONTENT-MOVES-s8r3-0b6f4e2a\n";
@@ -679,11 +680,13 @@ fn concurrent_reads_and_moves_keep_a_refusal_to_its_path() {
     });
     assert!(bad.is_empty(), "{bad:?}");
     assert_eq!(good, 90);
-    // The refused copy never moves into a readable place.
+    // The readable copy's bytes are held now (its reads above), so the
+    // refused path names held bytes: they read there and move from there
+    // (BUG-1464, BUG-1507: held bytes read at every path naming them), and
+    // what lands is exactly those bytes, never anything else.
     std::fs::create_dir_all(m.dir.join("src/inbox")).unwrap();
-    let mv = std::fs::rename(acme.join("same.txt"), m.dir.join("src/inbox/taken.txt"));
-    assert!(mv.is_err(), "the refused file was moved");
-    assert!(!m.dir.join("src/inbox/taken.txt").exists(), "a copy of the refused file landed in a readable folder");
+    std::fs::rename(acme.join("same.txt"), m.dir.join("src/inbox/taken.txt")).expect("held bytes move from the refused path");
+    assert_eq!(std::fs::read(m.dir.join("src/inbox/taken.txt")).unwrap(), SAME.as_bytes());
     // The readable copy moves, and reads where it went.
     std::fs::rename(shared.join("same.txt"), m.dir.join("src/inbox/moved.txt")).unwrap();
     assert_eq!(std::fs::read(m.dir.join("src/inbox/moved.txt")).unwrap(), SAME.as_bytes());
@@ -1123,7 +1126,6 @@ fn copies_cost_one_request_a_folder_in_a_checkout_and_a_mount() {
 /// keep one place an object, the first met, so these readers ask only at
 /// the refused path.
 #[test]
-#[ignore = "BUG-1506: vl grep and vl diff leave out a readable file whose content is refused at a path met first"]
 fn bug_1506_readers_by_id_hide_a_readable_copy_of_content_refused_elsewhere() {
     const SAME: &str = "SAME-CONTENT-GREP-1506-a4f2c9e1\n";
     let hub = TestHub::start();
@@ -1151,13 +1153,70 @@ fn bug_1506_readers_by_id_hide_a_readable_copy_of_content_refused_elsewhere() {
     assert!(shown.contains(SAME.trim()), "`vl diff` left out the content of a file fin may read: {shown}");
 }
 
+/// BUG-1506's sweep: every other reader that walks a tree or looks a path
+/// up and then reads by id (`vl cat`, `vl ls`, `vl show`, `vl blame`, `vl
+/// log -S`) reads the readable copy of content whose first place met is
+/// refused. Each in a thin clone of its own (whichever reads first makes
+/// the content held for the rest of its clone).
+#[test]
+fn every_reader_by_path_reads_a_readable_copy_of_content_refused_elsewhere() {
+    const SAME: &str = "SAME-CONTENT-READERS-1506-7c3e19d0\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    feature_with(&p, &[("src/shared/same.txt", SAME), (&format!("{BILL_DIR}/acme/same.txt"), SAME)], &[], "same content twice");
+    let names = ["cat", "ls", "show", "blame", "log"];
+    let clones: Vec<PathBuf> = names.iter().map(|n| thin_with_agent(&p, &hub, &p.fin, &format!("thin-{n}"))).collect();
+    for t in &clones {
+        let m = Mounted::new(&p.fin, t, "agent");
+        assert!(list(&m.dir.join(format!("{BILL_DIR}/acme"))).contains(&"same.txt".to_string()));
+        m.unmount();
+        assert!(!fetched(t, "src/shared/same.txt"), "the content is not fetched yet");
+    }
+    // `vl show` walks the parent's billing folder too: held here, since a
+    // refused folder not held fails the whole diff (BUG-1508, open).
+    p.fin.ok(&clones[2], &["ls", "-r", "feature-", BILL_DIR]);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let cat = p.fin.ok(&clones[0], &["cat", "-r", "feature", "src/shared/same.txt"]);
+    assert_eq!(cat, SAME, "vl cat");
+    let ls = p.fin.ok(&clones[1], &["ls", "-r", "feature", "src/shared"]);
+    let line = ls.lines().find(|l| l.contains("src/shared/same.txt")).unwrap_or_default();
+    assert!(line.contains("public") && !line.contains("redacted"), "vl ls: {ls}");
+    let show = p.fin.ok(&clones[2], &["show", "feature"]);
+    let hunk = show.split("diff --veil").find(|h| h.contains("b/src/shared/same.txt")).unwrap_or_default();
+    assert!(hunk.contains(SAME.trim()), "vl show: {show}");
+    let blame = p.fin.ok(&clones[3], &["blame", "-r", "feature", "src/shared/same.txt"]);
+    assert!(blame.contains(SAME.trim()), "vl blame: {blame}");
+    let log = p.fin.ok(&clones[4], &["log", "-r", "feature", "-S", SAME.trim()]);
+    assert!(log.contains("same content twice"), "vl log -S: {log}");
+}
+
+/// BUG-1508: `vl show` (and `vl diff`) of a change that touches a folder
+/// its person lost access to fails outright in a thin clone whose store
+/// does not hold that folder's tree in the parent: `diff_trees` reads the
+/// parent's tree by id, the server refuses it (rightly), and the refusal is
+/// an error (`object … is not present in this store`), where a full clone
+/// made before the removal shows the diff (S3's guarantee 2) and one made
+/// after it shows the readable files.
+#[test]
+#[ignore = "BUG-1508: vl show of a change touching a refused folder fails in a thin clone that does not hold the parent's tree"]
+fn bug_1508_show_fails_on_a_refused_folder_not_held_in_the_parent() {
+    const SAME: &str = "SAME-CONTENT-SHOW-1508-2d9a6f41\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    feature_with(&p, &[("src/shared/same.txt", SAME), (&format!("{BILL_DIR}/acme/same.txt"), SAME)], &[], "same content twice");
+    let thin = thin_with_agent(&p, &hub, &p.fin, "thin");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let show = p.fin.ok(&thin, &["show", "feature"]);
+    let hunk = show.split("diff --veil").find(|h| h.contains("b/src/shared/same.txt")).unwrap_or_default();
+    assert!(hunk.contains(SAME.trim()), "vl show: {show}");
+}
+
 /// BUG-1507: `HUB.md` §13.28 says "a refusal hides that path for 10 s, or
 /// until something makes its bytes held", and the held rule that held
 /// bytes read at every path naming them. A refused path whose bytes another
 /// path's read then makes held stays hidden for the rest of the 10 s
 /// (`visible_leaf` asks `refused(path)` before `has`).
 #[test]
-#[ignore = "BUG-1507: a refused path stays hidden for 10 s after its bytes are held, though HUB.md says until they are held"]
 fn bug_1507_a_refused_path_stays_hidden_after_its_bytes_are_held() {
     const SAME: &str = "SAME-CONTENT-REFUSED-THEN-HELD-1507-6e0b3d58\n";
     let hub = TestHub::start();

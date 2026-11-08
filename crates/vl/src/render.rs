@@ -452,10 +452,12 @@ pub fn hidden_explanation(repo: &Repo, path: &VPath, e: &TreeEntry) -> Option<St
     })
 }
 
-/// The content of the file entry `e` at `path`, or an error that explains
-/// sealed and withheld secrets instead of the store's
-/// `object … is not present in this store`.
-pub fn read_file(repo: &Repo, path: &VPath, e: &TreeEntry) -> Result<Vec<u8>> {
+/// The content of the file entry `e` at `path` below `root`, or an error
+/// that explains sealed and withheld secrets instead of the store's
+/// `object … is not present in this store`. In a thin clone, asked for at
+/// that path (BUG-1506).
+pub fn read_file(repo: &Repo, root: &ObjectId, path: &VPath, e: &TreeEntry) -> Result<Vec<u8>> {
+    veil_core::tree::prefetch_files(repo.store(), root, [(path, e)])?;
     // A conflict: the file with markers this reader is shown.
     match veil_core::conflict::read_file_like(repo.store(), e) {
         Ok(d) => Ok(d),
@@ -475,7 +477,11 @@ pub fn read_file(repo: &Repo, path: &VPath, e: &TreeEntry) -> Result<Vec<u8>> {
 // `vl status`, `vl diff` and `vl show` are rendered by `api::text`.
 
 pub fn print_files(repo: &Repo, tree: &ObjectId) -> Result<()> {
-    for (path, e) in veil_core::tree::walk_files(repo.store(), tree)? {
+    let files = veil_core::tree::walk_files(repo.store(), tree)?;
+    // Readability is read by id: in a thin clone, each asked for at its
+    // own path first (BUG-1506).
+    veil_core::tree::prefetch_files(repo.store(), tree, files.iter().map(|(p, e)| (p, e)))?;
+    for (path, e) in files {
         if stdout_closed() {
             break;
         }

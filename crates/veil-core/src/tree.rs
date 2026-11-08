@@ -34,6 +34,61 @@ pub fn lookup(store: &ObjectStore, root: &ObjectId, path: &VPath) -> Result<Opti
     unreachable!()
 }
 
+/// Files a reader by path asks for together (each at its own path).
+const PREFETCH_CHUNK: usize = 4096;
+
+/// In a thin clone, have the content of `files` (paths below `root`) that
+/// is not held, each asked for at its own path, a batch a request. A reader
+/// that walks a tree and then reads its files by id calls this first: the
+/// server decides by path, and the store keeps one place an object, so
+/// content refused at the path met first is fetched where it is readable
+/// (BUG-1506). What the server refuses stays unfetched, for the read to
+/// meet as hidden. Nothing happens in a full clone or while fetching is off.
+pub fn prefetch_files<'a>(store: &ObjectStore, root: &ObjectId, files: impl IntoIterator<Item = (&'a VPath, &'a TreeEntry)>) -> Result<()> {
+    if !store.may_fetch() {
+        return Ok(());
+    }
+    let mut want: Vec<(VPath, ObjectId, u64)> = Vec::new();
+    for (p, e) in files {
+        if e.kind != EntryKind::Dir && !store.has(&e.id) {
+            want.push((p.clone(), e.id, e.size));
+        }
+        if want.len() == PREFETCH_CHUNK {
+            store.prefetch_at(root, &std::mem::take(&mut want))?;
+        }
+    }
+    match want.is_empty() {
+        true => Ok(()),
+        false => store.prefetch_at(root, &want),
+    }
+}
+
+/// [`prefetch_files`] for both sides of `changes` (from [`diff_trees`]
+/// between `from` and `to`): each old side at its path in `from`, each
+/// new side at its path in `to`.
+pub fn prefetch_changes<'a>(store: &ObjectStore, from: Option<&ObjectId>, to: Option<&ObjectId>, changes: impl IntoIterator<Item = &'a TreeChange> + Clone) -> Result<()> {
+    if !store.may_fetch() {
+        return Ok(());
+    }
+    if let Some(f) = from {
+        prefetch_files(store, f, changes.clone().into_iter().filter_map(|c| c.old.as_ref().map(|e| (&c.path, e))))?;
+    }
+    if let Some(t) = to {
+        prefetch_files(store, t, changes.into_iter().filter_map(|c| c.new.as_ref().map(|e| (&c.path, e))))?;
+    }
+    Ok(())
+}
+
+/// [`lookup`] for a reader about to read the entry's content: in a thin
+/// clone, content not held is asked for at `path` first (BUG-1506).
+pub fn lookup_to_read(store: &ObjectStore, root: &ObjectId, path: &VPath) -> Result<Option<TreeEntry>> {
+    let e = lookup(store, root, path)?;
+    if let Some(e) = &e {
+        prefetch_files(store, root, [(path, e)])?;
+    }
+    Ok(e)
+}
+
 /// Deepest directory nesting accepted from a remote (see
 /// `remote::Transfer`). Every walk in this module is iterative and copes
 /// with any depth; the bound protects the remaining recursive algorithms
