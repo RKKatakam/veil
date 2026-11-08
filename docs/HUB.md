@@ -2450,8 +2450,11 @@ at the server, with **no full graph**. Code: `veil-core/src/promisor.rs`
   files of the branch it checks out, into `.veil/cache/`. `--only DIR`
   clones keep their S1 form (not thin).
 * **Repository format 9** (`docs/FORMAT.md`): format 8 plus the
-  `partial: {remote, cache_limit}` marker. Only a thin clone is format 9;
-  every other repository stays at 8. An older vl refuses format 9.
+  `partial: {remote, cache_limit}` marker. S3's release wrote thin clones
+  at it (every other repository at 8). Since S11, format 10 has everything
+  9 has: thin clones are format 10 with the marker, and `vl upgrade` brings
+  a format-9 thin clone to 10 keeping it (§13.27). An older vl refuses
+  both by number.
 * **Two areas.** `.veil/objects/` holds every snapshot the clone fetched and
   everything it made; it is never evicted, and `put_raw` always writes it
   (a local write is never skipped because the cache holds the object).
@@ -2621,13 +2624,13 @@ MiB, `log -n 20` 0.03 s against 0.05 s, as in cycle 2.
 | 9 | push from a thin clone leaves the receiver incomplete | the push sends what differs from the parents (S1's `Introduced`); the server checks closure | `server_hub` `thin::a_thin_clone_holds_the_tips_…` (push, then a full clone pulls, checks out and passes `fsck`) |
 | 11 | fetch storms, a thrashing cache | stops at the bound with an error, bytes in flight counted (BUG-1145); a too-large checkout is refused at clone, a too-large move before it is recorded | `thin::a_full_cache_fails_cleanly`, `server_hub` `thin::the_cache_stays_under_its_bound`, `s3r_a_checkout_past_the_cache_bound_fails_before_writing` |
 | 12 | the server is unreachable | fails before writing anything (the checkout fetches ahead, before its journal); local work goes on | `server_hub` `thin::a_lost_server_is_a_clear_error_never_a_hidden_file` |
-| 14 | format and older vl | format 9 with its marker, refused by number; either without the other refused | `thin::the_partial_marker_needs_format_9_and_back`, `format_compat` |
+| 14 | format and older vl | the marker only at format 9 or later, and format 9 only with it; refused by number by an older vl | `thin::the_partial_marker_needs_format_9_and_back`, `format_compat`, `thin::a_format_9_thin_clone_upgrades_to_10_keeping_its_marker_and_still_fetches` |
 | — | no full graph, yet history read as a full clone reads it | snapshot reads fetch history pages at the boundary, the history index never does; ancestry and log page through `history`; without the server, `Unavailable` (BUG-1141); pages are revision 4 (BUG-1140) | `thin::ancestry_beyond_the_boundary_asks_the_server`, `server_hub` `thin::a_thin_clone_answers_as_a_full_clone`, `s3r_each_protocol_revision_announces_one_thing`, `server_hub` `thin::history_answers_pages`, `s3r_show_of_a_snapshot_whose_parent_is_beyond_the_boundary`, `s3r_show_of_a_merge_whose_other_parent_is_beyond_the_boundary`, `s3r_blame_in_a_thin_clone_is_the_full_clones` |
 | — | a local commit's object after the server moved on | asked under the commit's nearest ancestors on the server (BUG-1144) | `thin::s3r_a_local_commits_unchanged_directory_is_found_after_the_server_moved_on` |
 
 #### Reverting
 
-Revert the merge commit. Thin clones made meanwhile are format 9, which
+Revert the merge commit. Thin clones made meanwhile are format 9 (10 since S11), which
 the reverted vl refuses by number (nothing is misread): run `vl partial
 full` in each before reverting, or clone again. The server change (the
 `limit` of `history`, revision 4) is additive: an older client never sends
