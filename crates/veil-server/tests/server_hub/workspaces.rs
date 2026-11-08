@@ -564,3 +564,103 @@ fn a_refused_folder_hides_only_itself_not_its_copy_elsewhere() {
     assert_eq!(std::fs::read(m.dir.join("src/copy/dup/a.txt")).unwrap(), SAME.as_bytes());
     m.unmount();
 }
+
+// ---- S8 cycle 3 review (`docs/BUGS.md`, "S8 cycle 3") --------------------
+
+/// BUG-1460: BUG-1367's class through the fallback without FUSE. The same
+/// content at two paths, its folder at the refused one held from an
+/// earlier mount: the fallback's sync (`prefetch_sync`, S3's
+/// `prefetch_diff`) and the checkout behind it ask for the object at the
+/// first place this process met it (the refused folder sorts first), so
+/// the readable copy is left out of the sandbox as "not yours".
+#[test]
+#[ignore = "BUG-1460: without FUSE, a file the person may read is left out of the sandbox when the same content is refused at another path"]
+fn bug_1460_the_fallback_without_fuse_leaves_out_a_readable_copy_of_refused_content() {
+    const SAME: &str = "SAME-CONTENT-FALLBACK-1460-9d2e7c51\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    write_files(&p.dir, &[("src/shared/same.txt", SAME), (&format!("{BILL_DIR}/acme/same.txt"), SAME)]);
+    p.admin.ok(&p.dir, &["commit", "--no-advance", "-m", "same content twice"]);
+    p.admin.ok(&p.dir, &["tag", "set", "feature", "-r", "@-"]);
+    p.admin.ok(&p.dir, &["push"]);
+    let thin = thin_with_agent(&p, &hub, &p.fin, "thin");
+    // An earlier mount listed the billing folder: its tree is held, not
+    // its files.
+    let m = Mounted::new(&p.fin, &thin, "agent");
+    let names: Vec<String> = std::fs::read_dir(m.dir.join(format!("{BILL_DIR}/acme"))).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(names.contains(&"same.txt".to_string()), "{names:?}");
+    m.unmount();
+    assert!(!fetched(&thin, "src/shared/same.txt"), "the content is not fetched yet");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    // fin still reads src/ (public): the server serves the content there,
+    // as the mount shows (`bug_1367_…`).
+    let mut c = p.fin.command(&thin, &["ws", "exec", "agent", "--mount", "--", "cat", "src/shared/same.txt"]);
+    c.env("VEIL_TEST_NO_FUSE", "1");
+    let o = c.output().unwrap();
+    assert!(o.status.success(), "the fallback left out a file fin may read: {}", all(&o));
+    assert!(String::from_utf8_lossy(&o.stdout).contains(SAME.trim()), "{}", all(&o));
+}
+
+/// Guarantee 1 of the S8 cycle 3 review, in the mount: with the same
+/// content at a refused and a readable path, reads of both on several
+/// threads at once keep each answer to its path (the readable one always
+/// reads, the refused one never does); the refused file cannot be moved
+/// into a readable folder, and nothing of it lands there; the readable copy
+/// moves between folders and reads at its new place.
+#[test]
+fn concurrent_reads_and_moves_keep_a_refusal_to_its_path() {
+    const SAME: &str = "SAME-CONTENT-MOVES-s8r3-0b6f4e2a\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    write_files(&p.dir, &[("src/shared/same.txt", SAME), (&format!("{BILL_DIR}/acme/same.txt"), SAME)]);
+    p.admin.ok(&p.dir, &["commit", "--no-advance", "-m", "same content twice"]);
+    p.admin.ok(&p.dir, &["tag", "set", "feature", "-r", "@-"]);
+    p.admin.ok(&p.dir, &["push"]);
+    let thin = thin_with_agent(&p, &hub, &p.fin, "thin");
+    let m = Mounted::new(&p.fin, &thin, "agent");
+    let (shared, acme) = (m.dir.join("src/shared"), m.dir.join(format!("{BILL_DIR}/acme")));
+    let names: Vec<String> = std::fs::read_dir(&acme).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(names.contains(&"same.txt".to_string()), "{names:?}");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let (good, bad) = std::thread::scope(|s| {
+        let readers: Vec<_> = (0..6)
+            .map(|i| {
+                let (shared, acme) = (&shared, &acme);
+                s.spawn(move || {
+                    let (mut good, mut bad) = (0, Vec::new());
+                    for _ in 0..15 {
+                        match i % 2 {
+                            0 => match std::fs::read(shared.join("same.txt")) {
+                                Ok(d) if d == SAME.as_bytes() => good += 1,
+                                r => bad.push(format!("src/shared/same.txt: {:?}", r.map(|d| d.len()))),
+                            },
+                            _ => match std::fs::read(acme.join("same.txt")) {
+                                Err(e) if matches!(e.raw_os_error(), Some(EACCES) | Some(ENOENT)) => good += 1,
+                                r => bad.push(format!("the refused copy: {:?}", r.map(|d| d.len()).map_err(|e| e.to_string()))),
+                            },
+                        }
+                    }
+                    (good, bad)
+                })
+            })
+            .collect();
+        readers.into_iter().map(|r| r.join().unwrap()).fold((0, Vec::new()), |(g, mut b), (g2, b2)| {
+            b.extend(b2);
+            (g + g2, b)
+        })
+    });
+    assert!(bad.is_empty(), "{bad:?}");
+    assert_eq!(good, 90);
+    // The refused copy never moves into a readable place.
+    std::fs::create_dir_all(m.dir.join("src/inbox")).unwrap();
+    let mv = std::fs::rename(acme.join("same.txt"), m.dir.join("src/inbox/taken.txt"));
+    assert!(mv.is_err(), "the refused file was moved");
+    assert!(!m.dir.join("src/inbox/taken.txt").exists(), "a copy of the refused file landed in a readable folder");
+    // The readable copy moves, and reads where it went.
+    std::fs::rename(shared.join("same.txt"), m.dir.join("src/inbox/moved.txt")).unwrap();
+    assert_eq!(std::fs::read(m.dir.join("src/inbox/moved.txt")).unwrap(), SAME.as_bytes());
+    assert!(!shared.join("same.txt").exists());
+    m.unmount();
+    let rec = p.fin.ok(&thin, &["ws", "cat", "agent", "src/inbox/moved.txt"]);
+    assert!(rec.contains(SAME.trim()), "{rec}");
+}

@@ -529,3 +529,54 @@ fn a_mount_writes_and_renames_large_files_without_holding_them() {
     assert_eq!((a.len(), &a[(64 << 20) - 1..(64 << 20) + 2]), (128 << 20, "wXw"));
     assert_eq!(env.stdout("alice", &proj, &["ws", "cat", "agent", "moved.bin"]).len(), 128 << 20);
 }
+
+/// BUG-1461: BUG-1368's bound covers a large file only while it is a loose
+/// object. Once `vl gc` has packed it (or in any full clone, whose objects
+/// arrive in packs), every lookup, `stat` and listing of it in a mount
+/// inflates it whole to decide its visibility (`visible_leaf` →
+/// `entry_readable` → `id_readable` → `get_raw`), though `HUB.md` §13.28
+/// says such an object is "read whole once". Here three `stat`s of a 128
+/// MiB packed file, nothing opened: the mount's peak grows by the file.
+#[test]
+#[ignore = "BUG-1461: a mount inflates a packed large file whole at each stat or listing, not once"]
+fn bug_1461_a_stat_of_a_packed_large_file_never_reads_it_whole() {
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    let big = "p".repeat(128 << 20);
+    let proj = env.project("alice", "proj", &[("big.bin", big.as_str()), ("small.txt", "s\n")]);
+    drop(big);
+    env.ok("alice", &proj, &["ws", "new", "agent", "-r", "main"]);
+    env.ok("alice", &proj, &["gc"]);
+    let loose: Vec<_> = walk_files(&proj.join(".veil/objects")).into_iter().filter(|p| !p.contains("/pack")).filter(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 64 << 20)).collect();
+    assert!(loose.is_empty(), "gc packs the large object: {loose:?}");
+    let (mnt, _m) = mount(&env, "alice", &proj, "agent");
+    let pid = state_pid(&proj, "agent");
+    let hwm = || -> u64 {
+        let s = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        s.lines().find(|l| l.starts_with("VmHWM:")).unwrap().split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() / 1024
+    };
+    let start = hwm();
+    for _ in 0..3 {
+        assert_eq!(std::fs::metadata(mnt.join("big.bin")).unwrap().len(), 128 << 20);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+    let peak = hwm();
+    assert!(peak < start + 48, "three stats of a packed 128 MiB file grew the mount's peak from {start} to {peak} MiB");
+}
+
+/// Every file below `dir`, as paths.
+fn walk_files(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            match e.file_type().is_ok_and(|t| t.is_dir()) {
+                true => stack.push(e.path()),
+                false => out.push(e.path().display().to_string()),
+            }
+        }
+    }
+    out
+}
