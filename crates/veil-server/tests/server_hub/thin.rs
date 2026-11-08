@@ -1836,6 +1836,7 @@ fn s3rd2_a_thin_clone_made_before_a_rewrite_pulls_it_as_a_full_clone() {
         vec!["log", "--json"],
     ] {
         let (want, got) = (answer(&admin, &full, &args), answer(&admin, &thin, &args));
+        assert!(want.0, "`vl {}` fails in the full clone: {}", args.join(" "), want.1);
         if got != want {
             diffs.push(format!("`vl {}`:\nfull ({}): {}\nthin ({}): {}", args.join(" "), want.0, want.1.chars().take(600).collect::<String>(), got.0, got.1.chars().take(600).collect::<String>()));
         }
@@ -1847,8 +1848,8 @@ fn s3rd2_a_thin_clone_made_before_a_rewrite_pulls_it_as_a_full_clone() {
 /// answers as a full clone; the viewer graph is a cache, refilled when it
 /// is cleared). A thin clone and a full clone made before a rewrite
 /// elsewhere both pull it; their old tip stays a head (its tag diverged).
-/// Then the server is upgraded: migration 19 clears the viewer graph
-/// (`DELETE FROM view_graph`), and the server starts again. A thin clone
+/// Then the server is upgraded: migration 21 clears the viewer graph
+/// (`TRUNCATE view_graph`), and the server starts again. A thin clone
 /// names what its server does not show it from its own refs (`from`,
 /// BUG-1319), sending only those `q/generations` knows
 /// (`Repo::server_roots`); `q/generations` answers from rows already in the
@@ -1858,9 +1859,23 @@ fn s3rd2_a_thin_clone_made_before_a_rewrite_pulls_it_as_a_full_clone() {
 /// root: "revision … not found", where the full clone shows them (and the
 /// thin clone did before the cache was cleared).
 #[test]
-#[ignore = "BUG-1384: after the viewer graph is cleared, a thin clone's old tip is unknown to q/generations and its old versions cannot be named"]
 fn s3rd3_a_thin_clone_names_its_old_versions_after_the_viewer_graph_is_cleared() {
-    let hub = TestHub::start();
+    // A database of its own: the clear below would empty every concurrent
+    // test's viewer graph, whose hubs keep its rows in memory and would
+    // never fill them again.
+    let admin_url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+    let db_name = format!("{}{}", std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_default(), unique("veil_cleared_"));
+    let sql = |url: &str, q: String| {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let db = veil_server::db::connect(url, 1).await.unwrap();
+            sqlx::raw_sql(&q).execute(&db).await.unwrap();
+            db.close().await;
+        });
+    };
+    sql(&admin_url, format!("CREATE DATABASE {db_name}"));
+    let url = format!("{}/{db_name}", admin_url.rsplit_once('/').unwrap().0);
+    let hub = TestHub::start_on(&url, std::time::Duration::from_secs(3600));
     let (admin, dir, name) = project_with_history(&hub, 6, 10);
     let full = admin.dir("full");
     admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
@@ -1877,8 +1892,8 @@ fn s3rd3_a_thin_clone_names_its_old_versions_after_the_viewer_graph_is_cleared()
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let db = veil_server::db::connect(url, 1).await.unwrap();
-            // What migration 19 does (and the new table, which it creates empty).
-            sqlx::raw_sql("DELETE FROM view_graph; DELETE FROM view_changes").execute(&db).await.unwrap();
+            // What migration 21 does (and the new table, which it creates empty).
+            sqlx::raw_sql("TRUNCATE view_graph; TRUNCATE view_changes").execute(&db).await.unwrap();
             db.close().await;
         });
     });
@@ -1892,5 +1907,6 @@ fn s3rd3_a_thin_clone_names_its_old_versions_after_the_viewer_graph_is_cleared()
         }
     }
     drop(hub);
+    sql(&admin_url, format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"));
     assert!(diffs.is_empty(), "after the viewer graph is cleared, a thin clone names its old versions otherwise than a full clone:\n{}", diffs.join("\n"));
 }

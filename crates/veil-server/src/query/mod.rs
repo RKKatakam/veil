@@ -726,8 +726,9 @@ pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, from: &[Obj
 
 /// The generations of `snapshots` in the viewer's own history (S3: a thin
 /// clone's history index takes those of its boundary from here, so it
-/// never needs the ancestry below). The viewer graph's rows, filled as for
-/// any query; `None` for a snapshot it has no row for, or a withheld one.
+/// never needs the ancestry below). The viewer graph's rows, filled for the
+/// branch tips and for each snapshot asked about (BUG-1384); `None` for a
+/// snapshot not in the viewer's history, or a withheld one.
 /// Nothing but numbers of snapshots the caller already names.
 pub async fn generations(hub: &Arc<Hub>, ask: &Ask, snapshots: Vec<ObjectId>, limits: Limits) -> Result<Value> {
     let deadline = Instant::now() + limits.deadline;
@@ -743,6 +744,35 @@ pub async fn generations(hub: &Arc<Hub>, ask: &Ask, snapshots: Vec<ObjectId>, li
         ensure(hub, &ask.project, &ask.viewer, &tips, Some(deadline)).await?;
     }
     let (vk, project) = (ask.key(), ask.project.id);
+    // Asked snapshots the graph has no rows for (an old version no branch
+    // reaches, or a cache cleared since): filled, as a page start is
+    // (`page_starts`), so the answer never depends on what the cache holds
+    // (BUG-1384). Only the caller's own ids get a row of their own: a real
+    // id of a snapshot hidden from them projects onto another, and stays
+    // unanswered.
+    let unfilled: Vec<ObjectId> = {
+        let (vk, ids) = (vk.clone(), snapshots.clone());
+        blocking(hub, project, move |cx| {
+            let g = G::new(cx, &vk, Some(deadline));
+            let mut out = Vec::new();
+            for id in ids {
+                if g.row(&id)?.is_none() {
+                    out.push(id);
+                }
+            }
+            Ok(out)
+        })
+        .await?
+    };
+    let mut reals = Vec::new();
+    for id in &unfilled {
+        if let Some(r) = crate::sync::resolve(hub, project, &vk, id).await?.into_iter().next() {
+            reals.push(r);
+        }
+    }
+    if !reals.is_empty() {
+        ensure(hub, &ask.project, &ask.viewer, &reals, Some(deadline)).await?;
+    }
     blocking(hub, project, move |cx| {
         let g = G::new(cx, &vk, Some(deadline));
         let mut out = Vec::new();

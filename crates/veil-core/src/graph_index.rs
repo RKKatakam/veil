@@ -63,7 +63,7 @@
 //! Layer encoding (integers little-endian):
 //!
 //! ```text
-//! "VEILCG01" | count u32 | missing u32
+//! "VEILCG02" | count u32 | missing u32
 //! | ids [count × 32], ascending
 //! | records [count × (generation u64 | change id [16] | flags u8)]
 //! | missing parents [missing × 32]
@@ -84,13 +84,12 @@ use crate::{
     vpath::VPath,
 };
 
-/// Layers an older vl wrote (a root 1, timestamps unclamped) stay valid
-/// under [`generation`] (BUG-1316): each entry is computed from its
-/// parents' stored values, so any mix keeps generations strictly
-/// decreasing along every edge, the only property the walks rely on, and
-/// values are only compared with each other. Only a thin clone compares
-/// them with the server's, and thin clones (format 9) are new with it.
-const MAGIC: &[u8; 8] = b"VEILCG01";
+/// `VEILCG02`: generations of [`generation`] (BUG-1316). A `VEILCG01`
+/// layer, of the older arithmetic (no clamp, values up to `u64::MAX - 1`),
+/// voids the index, which is computed again: its values above `i64::MAX`
+/// would give the next entry, capped there, a generation below its
+/// parent's (BUG-1381).
+const MAGIC: &[u8; 8] = b"VEILCG02";
 const DIR: &str = ".veil/index/graph";
 const HEADER: usize = 8 + 4 + 4;
 const REC: usize = 8 + 16 + 1;

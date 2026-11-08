@@ -941,6 +941,11 @@ fn newer_object_encodings_are_unsupported_not_corrupt() {
 #[test]
 fn newer_pack_version_is_unsupported() {
     let fx = Fixture::new(8);
+    // Opened once by this vl while its pack reads: the fixture's history
+    // index, an older vl's (`VEILCG01`), is computed again (BUG-1381), and
+    // its two operation heads merged. A repository whose index and pack are
+    // both unreadable cannot settle; this test is of the pack alone.
+    drop(fx.open("alice", Some("alice")));
     let dir = fx.root.join("alice/.veil/objects/pack");
     let idx = std::fs::read_dir(&dir)
         .unwrap()

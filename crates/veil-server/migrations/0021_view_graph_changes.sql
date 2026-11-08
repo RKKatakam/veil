@@ -10,11 +10,12 @@
 -- EXISTS): YugabyteDB may apply DDL statement by statement.
 --
 -- Rows of `view_graph` written before this migration have no change ids.
--- The viewer graph is a cache (0010_view_graph.sql): they are deleted, and
--- filled again the first time a query needs them. (Migrations run under
--- their lock before servers start, so no row of this release is lost.)
---
--- The migration number is a placeholder: S3 was not assigned one.
+-- The viewer graph is a cache (0010_view_graph.sql): it is emptied, and
+-- filled again the first time a query needs it (`q/generations` and page
+-- starts fill what they are asked about, BUG-1384). `TRUNCATE`, whose time
+-- does not grow with the table, so the step finishes under the statement
+-- timeout however large the graph (BUG-1383). (Migrations run under their
+-- lock before servers start, so no row of this release is lost.)
 CREATE TABLE IF NOT EXISTS view_changes (
     project_id BIGINT NOT NULL,
     view_key TEXT NOT NULL,
@@ -23,4 +24,4 @@ CREATE TABLE IF NOT EXISTS view_changes (
     flags INT NOT NULL,
     PRIMARY KEY (project_id, view_key, change_id, snapshot)
 );
-DELETE FROM view_graph;
+TRUNCATE view_graph;

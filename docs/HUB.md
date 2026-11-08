@@ -2773,19 +2773,23 @@ fetch-ahead. Tests: `server_hub` `thin::a_thin_clone_answers_as_a_full_clone`
 * **One generation arithmetic** (BUG-1316): `graph_index::generation` in
   `veil-core` (WASM-safe: the timestamp clamped to 0 ..= `MAX_STAMP`, one
   more than the highest parent, a root 0), used by the client's history
-  index, the server's real graph and every viewer graph. Index layers an
-  older vl wrote stay valid (each entry is computed from its parents'
-  stored values; only a thin clone, new with format 9, compares them with
-  the server's: `docs/FORMAT.md`). A property test checks that the three
+  index, the server's real graph and every viewer graph. Index layers are
+  `VEILCG02`: an older vl's (`VEILCG01`, values up to `u64::MAX - 1`) void
+  the index, which is computed again (BUG-1381: kept, a value above
+  `i64::MAX` gave the next entry, capped there, a generation below its
+  parent's; `docs/FORMAT.md`). A property test checks that the three
   agree on random histories with far-future, negative and equal timestamps
   and several roots.
 * **Change id prefixes from the caller's own graph** (BUG-1317): every
   viewer graph row has a row in `view_changes`, keyed by (project, view
-  key, change id, snapshot), with its flags (migration 19,
-  `view_graph_changes`, a placeholder number; a table rather than an index
-  on `view_graph`, whose online build on YugabyteDB outlasts the statement
-  timeout under load; the viewer graph rows written before it are deleted
-  and filled again, as the cache they are). Fills write it first. So
+  key, change id, snapshot), with its flags (migration 21,
+  `view_graph_changes`; a table rather than an index on `view_graph`, whose
+  online build on YugabyteDB outlasts the statement timeout under load).
+  The migration empties `view_graph` with `TRUNCATE`, in time that does
+  not grow with the table (BUG-1383); it is a cache, filled again as
+  queries need it, and `q/generations` fills each snapshot it is asked
+  about, as a page start is filled, so its answer never depends on what
+  the cache holds (BUG-1384). Fills write `view_changes` first. So
   `q/resolve` never reads the real `graph` and starts no fill but the
   branch tips' every query makes. Each step reads at most `Limits::work`
   rows of the caller's graph; past it the request fails asking for more of

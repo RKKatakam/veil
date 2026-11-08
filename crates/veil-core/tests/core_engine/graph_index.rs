@@ -229,9 +229,9 @@ fn collected_snapshots_do_not_resolve_through_the_index() {
     assert!(err.to_string().contains("not found"), "{err}");
 }
 
-/// Rewrite every index layer as the arithmetic before BUG-1316's fix wrote
-/// it: `new_gen` for each id listed (the layer format is unchanged, only
-/// the values differ), with the checksum made again.
+/// Rewrite every index layer as a vl before BUG-1316's fix wrote it: its
+/// magic, `VEILCG01`, and `new_gen` for each id listed (the layout is
+/// unchanged), with the checksum made again.
 fn as_an_older_vl_wrote_it(backend: &dyn StorageBackend, gens: &[(veil_core::ObjectId, u64)]) -> usize {
     const HEADER: usize = 16;
     const REC: usize = 8 + 16 + 1;
@@ -239,6 +239,7 @@ fn as_an_older_vl_wrote_it(backend: &dyn StorageBackend, gens: &[(veil_core::Obj
     for name in layers(backend) {
         let path = dir().join(&name);
         let mut data = backend.read(&path).unwrap();
+        data[..8].copy_from_slice(b"VEILCG01");
         let count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
         for i in 0..count {
             let id = &data[HEADER + i * 32..HEADER + i * 32 + 32];
@@ -267,7 +268,6 @@ fn as_an_older_vl_wrote_it(backend: &dyn StorageBackend, gens: &[(veil_core::Obj
 /// `is_ancestor(parent, child)` is false, and the history lists the
 /// parent above its child.
 #[test]
-#[ignore = "BUG-1381: an index layer of the older arithmetic above i64::MAX gives a child a generation below its parent's"]
 fn bug_1381_an_older_layer_above_i64_max_keeps_its_children_above_it() {
     let (backend, mut repo) = setup();
     let tree = repo.store().empty_tree().unwrap();
@@ -296,7 +296,10 @@ fn bug_1381_an_older_layer_above_i64_max_keeps_its_children_above_it() {
     let (g_far, g_on) = (i64::MAX as u64, i64::MAX as u64 + 1);
     assert_eq!(as_an_older_vl_wrote_it(&*backend, &[(far, g_far), (on_it, g_on)]), 2, "both entries are in the layers");
     let mut repo = Repo::open(backend.clone(), None, "t").unwrap();
-    assert_eq!(repo.held().index().generation(&repo, &on_it).unwrap(), Some(g_on), "the older layer is read");
+    // The older layer voids the index (BUG-1381): computed again, by this
+    // vl's arithmetic (the timestamp clamped to `i64::MAX / 4`).
+    let g_on = repo.held().index().generation(&repo, &on_it).unwrap().expect("indexed again");
+    assert_eq!(g_on, (i64::MAX / 4) as u64 + 1, "the older layer is dropped, not read");
     // A commit on top, indexed by this vl.
     let mut tx = repo.transaction("on top").unwrap();
     let top = tx.repo().store().put_snapshot(&snap(vec![on_it], 2_000, 3)).unwrap();
