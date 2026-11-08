@@ -213,6 +213,13 @@ impl Server {
             hex::encode(veil_core::crypto::random_bytes::<6>())
         ));
         veil_core::vfs::private_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        // This `vl`, for an unconfined command's `PATH` (a confined one
+        // gets it bound at `/run/veil/bin`).
+        let bin = dir.join("bin");
+        veil_core::vfs::private_dir(&bin)?;
+        if let Ok(exe) = std::env::current_exe() {
+            std::os::unix::fs::symlink(exe, bin.join("vl")).with_context(|| format!("linking vl into {}", bin.display()))?;
+        }
         let path = dir.join("sock");
         let listener = UnixListener::bind(&path).with_context(|| format!("creating the workspace socket {}", path.display()))?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
@@ -245,6 +252,16 @@ impl Server {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// `PATH` for an unconfined command: this `vl` first.
+    pub fn path_env(&self) -> OsString {
+        let mut p = self.dir.join("bin").into_os_string();
+        if let Some(old) = std::env::var_os("PATH").filter(|o| !o.is_empty()) {
+            p.push(":");
+            p.push(old);
+        }
+        p
+    }
 }
 
 impl Drop for Server {
@@ -256,7 +273,7 @@ impl Drop for Server {
             let _ = t.join();
         }
         let _ = std::fs::remove_file(&self.path);
-        let _ = std::fs::remove_dir(&self.dir);
+        let _ = veil_core::vfs::remove_tree(&self.dir);
     }
 }
 
@@ -334,10 +351,13 @@ impl Served {
         }
         // Where the command was run, as a folder of the project.
         let cwd = Path::new(&req.cwd);
-        let rel = [&self.root, &self.sandbox]
+        // The sandbox first: an unconfined command's lies inside the
+        // project (`.veil/local/sandboxes`), a mount's outside it.
+        let rel = [&self.sandbox, &self.root]
             .iter()
             .find_map(|base| cwd.strip_prefix(base).ok())
             .filter(|r| r.components().all(|c| matches!(c, Component::Normal(_))))
+            .filter(|r| !r.components().next().is_some_and(|c| c.as_os_str().to_str().is_some_and(veil_core::object::is_reserved_name)))
             .map(Path::to_path_buf)
             .unwrap_or_default();
         let dir = Some(self.root.join(&rel)).filter(|d| d.is_dir()).unwrap_or_else(|| self.root.clone());

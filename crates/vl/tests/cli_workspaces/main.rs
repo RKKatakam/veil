@@ -23,3 +23,5 @@ mod workspace_undo_props;
 mod ws_sandbox_cli;
 mod ws_sandbox_failures_cli;
 mod ws_sparse_cli;
+#[cfg(target_os = "linux")]
+mod ws_socket_cli;

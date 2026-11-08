@@ -222,7 +222,7 @@ fn exec_mounted(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Confin
     print_running(a.command, &mount.dir, confine);
     let layers_dir = paths.dir.join(crate::confine::layers_dir(core::workspace_id(&ctx.repo, name).as_deref()));
     let server = crate::ws_socket::Server::start(&ctx.root, name, &mount.dir, Box::new(crate::ws_socket::Mounted))?;
-    let code = run_command(&mount.dir, &paths.dir, a.command, confine, Some(&layers_dir), Some(server.path()));
+    let code = run_command(&mount.dir, &paths.dir, a.command, confine, Some(&layers_dir), Some(&server));
     drop(server);
     for n in mount.finish()?.iter().filter(|n| !n.starts_with("Recorded ")) {
         warn(&format!("mount of workspace {}: {n}", safe(name)));
@@ -509,7 +509,7 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
         warn(&format!("could not save the sandbox's stat cache: {e}"));
     }
     let server = crate::ws_socket::Server::start(&ctx.root, name, &paths.files, Box::new(MidRun { root: ctx.root.clone(), name: name.to_string() }))?;
-    let code = run_command(&paths.files, &paths.dir, a.command, confine, layers, Some(server.path()));
+    let code = run_command(&paths.files, &paths.dir, a.command, confine, layers, Some(&server));
     drop(server);
     if let Loaded::Found(saved) = paths.load_manifest() {
         m = *saved;
@@ -1011,20 +1011,20 @@ fn print_running(command: &[String], dir: &Path, confine: Option<&Confine>) {
 /// inside the confinement ([`crate::confine`], which forwards the signals),
 /// and the allow-list's writes are kept in the layers directory `layers` (a
 /// persistent sandbox's) or thrown away (`None`).
-fn run_command(dir: &Path, ceiling: &Path, command: &[String], confine: Option<&Confine>, layers: Option<&Path>, socket: Option<&Path>) -> Result<i32> {
+fn run_command(dir: &Path, ceiling: &Path, command: &[String], confine: Option<&Confine>, layers: Option<&Path>, socket: Option<&crate::ws_socket::Server>) -> Result<i32> {
     let mut ceilings = ceiling.as_os_str().to_owned();
     if let Some(old) = std::env::var_os("GIT_CEILING_DIRECTORIES").filter(|v| !v.is_empty()) {
         ceilings.push(":");
         ceilings.push(old);
     }
     if let Some(c) = confine {
-        return crate::confine::run(c, dir, command, &[("GIT_CEILING_DIRECTORIES", ceilings)], layers, socket);
+        return crate::confine::run(c, dir, command, &[("GIT_CEILING_DIRECTORIES", ceilings)], layers, socket.map(|s| s.path()));
     }
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]).current_dir(dir);
     cmd.env("GIT_CEILING_DIRECTORIES", ceilings);
     match socket {
-        Some(s) => cmd.env(crate::ws_socket::ENV, s),
+        Some(s) => cmd.env(crate::ws_socket::ENV, s.path()).env("PATH", s.path_env()),
         None => cmd.env_remove(crate::ws_socket::ENV),
     };
     let interrupts = Interrupts::to_child(&mut cmd);

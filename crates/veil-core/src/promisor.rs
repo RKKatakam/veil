@@ -754,10 +754,29 @@ impl ObjectStore {
         Ok(())
     }
 
+    /// Can this reader materialise entry `e`? As
+    /// [`ObjectStore::entry_readable`], except that in a thin clone a folder,
+    /// or a file not labelled secret, that is not fetched yet counts as
+    /// shown, without fetching it to decide: the tree is the server's
+    /// projection for this person, and the object decides when something
+    /// reads it (a secret this reader cannot open is refused then). A file
+    /// labelled secret is decided by its object, as everywhere. Mounts,
+    /// sparse sandboxes and the builder's carrying of what a working copy
+    /// does not show use this one rule (milestone S8).
+    pub fn entry_shown(&self, e: &crate::object::TreeEntry) -> bool {
+        if self.is_partial() && !self.has(&e.id) {
+            match e.kind {
+                EntryKind::Dir => return true,
+                EntryKind::File | EntryKind::Symlink if e.visibility.key_scope().is_none() => return true,
+                _ => {}
+            }
+        }
+        self.entry_readable(e)
+    }
+
     /// Fetch those of `ids` (with the sizes their tree entries give them)
     /// that neither area holds, in batches: a mounted workspace's folder,
-    /// when one of its files is first read, or its sub-folders' trees when
-    /// it is listed (milestone S8). One the server refuses is left for its
+    /// when one of its files is first read (milestone S8). One the server refuses is left for its
     /// reader, who finds it hidden. Nothing for any other store.
     pub fn prefetch(&self, ids: Vec<(ObjectId, u64)>) -> Result<()> {
         let Some(p) = self.partial.get() else { return Ok(()) };

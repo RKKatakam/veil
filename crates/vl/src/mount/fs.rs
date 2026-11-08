@@ -340,9 +340,11 @@ impl Lower for veil_core::vfs::MemoryBackend {}
 ///   labelled secret is shown (what its object really is decides when it
 ///   is read: a secret this reader cannot open reads as `EACCES`). A file
 ///   labelled secret is fetched to decide, as its object is the authority;
-/// * listing a folder fetches its sub-folders' trees in one request, and
-///   the first read of a file fetches its folder's small files with it, in
-///   one request ([`ReaderView::prefetch_folder`]);
+/// * listing a folder fetches its tree, and nothing below it (a folder not
+///   fetched yet is shown without fetching it: one holding only secrets
+///   this reader cannot open lists as empty); the first read of a file
+///   fetches its folder's small files with it, in one request
+///   ([`ReaderView::prefetch_folder`]);
 /// * the server's own refusal (`Missing`) hides an entry, as everywhere; a
 ///   server that cannot be reached, or any other failure, is an error
 ///   (`EIO`), never an empty or absent file or folder.
@@ -400,9 +402,11 @@ impl ReaderView {
             EntryKind::Dir => Ok(false),
             EntryKind::File | EntryKind::Symlink if self.store.is_partial() && !self.store.has(&shown.id) => {
                 // Not fetched yet. A plain entry is shown without fetching
-                // its content; a secret one is decided by its object.
+                // its content (`entry_shown`); a secret one is decided by its
+                // object, fetched now, and a failure to fetch it is an error,
+                // never "hidden".
                 if shown.visibility.key_scope().is_none() {
-                    return Ok(true);
+                    return Ok(self.store.entry_shown(&shown));
                 }
                 match self.store.get_raw(&shown.id) {
                     Ok(_) => Ok(self.store.entry_readable(&shown)),
@@ -417,6 +421,12 @@ impl ReaderView {
     /// Does directory entry `dir` hold a file this reader can read?
     /// Depth first, stopping at the first one (usually the first entry).
     fn dir_visible(&self, dir: &TreeEntry) -> VResult<bool> {
+        // A folder of a thin clone not fetched yet is shown without fetching
+        // it (`entry_shown`): one that turns out to hold only secrets this
+        // reader cannot open lists as empty.
+        if self.store.is_partial() && !self.store.has(&dir.id) {
+            return Ok(self.store.entry_shown(dir));
+        }
         let mut stack = vec![dir.id];
         while let Some(id) = stack.pop() {
             let tree = match self.store.tree(&id) {
@@ -435,30 +445,22 @@ impl ReaderView {
         Ok(false)
     }
 
-    /// In a thin clone, fetch together what reading folder `dir` needs
-    /// next: its sub-folders' trees (`trees`), or its small files (once per
-    /// folder). Best effort: a failure here is the reader's to meet, at
-    /// the object it reads.
-    fn prefetch_folder(&self, dir: &VPath, trees: bool) {
+    /// In a thin clone, fetch folder `dir`'s small files together, once per
+    /// folder (the first read of one of them). Best effort: a failure here
+    /// is the reader's to meet, at the object it reads.
+    fn prefetch_folder(&self, dir: &VPath) {
         if !self.store.may_fetch() {
             return;
         }
         let Ok(Some(e)) = lookup(&self.store, &self.view.root(), dir) else { return };
-        if e.kind != EntryKind::Dir {
-            return;
-        }
-        if !trees && !self.fetched_folders.lock().unwrap_or_else(|p| p.into_inner()).insert(e.id) {
+        if e.kind != EntryKind::Dir || !self.fetched_folders.lock().unwrap_or_else(|p| p.into_inner()).insert(e.id) {
             return;
         }
         let Ok(t) = self.store.tree(&e.id) else { return };
         let want: Vec<(ObjectId, u64)> = t
             .entries
             .iter()
-            .filter(|c| match trees {
-                true => c.kind == EntryKind::Dir,
-                false => matches!(c.kind, EntryKind::File | EntryKind::Symlink) && c.size <= FOLDER_FILE_LIMIT,
-            })
-            .filter(|c| !self.store.has(&c.id))
+            .filter(|c| matches!(c.kind, EntryKind::File | EntryKind::Symlink) && c.size <= FOLDER_FILE_LIMIT && !self.store.has(&c.id))
             .map(|c| (c.id, c.size))
             .collect();
         if !want.is_empty() {
@@ -503,7 +505,7 @@ impl StorageBackend for ReaderView {
         match self.entry(path)? {
             Some(e) => {
                 if self.store.is_partial() && !self.store.has(&e.id) {
-                    self.prefetch_folder(&path.parent().unwrap_or_else(VPath::root), false);
+                    self.prefetch_folder(&path.parent().unwrap_or_else(VPath::root));
                 }
                 self.view.read(path)
             }
@@ -538,17 +540,31 @@ impl StorageBackend for ReaderView {
     }
 
     fn list_dir(&self, path: &VPath) -> VResult<Vec<DirEntry>> {
-        if self.entry(path)?.is_none() {
+        let Some(dir) = self.entry(path)? else {
             return Err(VeilError::NotFound(path.to_string()));
+        };
+        if dir.kind != EntryKind::Dir {
+            return Err(VeilError::InvalidPath(format!("{path} is not a directory")));
         }
-        if self.store.is_partial() {
-            self.prefetch_folder(path, true);
-        }
+        // From the tree, by this view's rules ([`TreeView`]'s listing reads
+        // every file to decide, which in a thin clone would fetch them).
         let mut out = Vec::new();
-        for e in self.view.list_dir(path)? {
-            if e.kind == NodeKind::File || self.entry(&path.join(&e.name))?.is_some() {
-                out.push(e);
-            }
+        for c in self.store.tree(&dir.id)?.entries.iter() {
+            let kind = match c.kind {
+                EntryKind::Dir if self.dir_visible(c)? => NodeKind::Dir,
+                EntryKind::Dir => continue,
+                _ if !self.visible_leaf(c)? => continue,
+                EntryKind::Symlink => NodeKind::Symlink,
+                EntryKind::Conflict => match self.store.conflict(&c.id) {
+                    Ok(cf) if cf.has_special_terms() => match veil_core::conflict::shown_side(&cf) {
+                        Some((_, t)) if t.entry(&c.name).kind == EntryKind::Symlink => NodeKind::Symlink,
+                        _ => NodeKind::File,
+                    },
+                    _ => NodeKind::File,
+                },
+                _ => NodeKind::File,
+            };
+            out.push(DirEntry { name: c.name.clone(), kind });
         }
         Ok(out)
     }
