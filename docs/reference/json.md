@@ -164,7 +164,7 @@ Content this reader cannot see, and why. It never carries the content.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `reason` | string | `no_key`: cloaked for a scope you hold no key for; `withheld`: a public remote never delivered it; `unwritable` (`status` only): readable, but this filesystem could not hold the file; `missing`: a public object absent from the store (damage, not a redaction: run `vl fsck`); `error`: the store could not read it |
+| `reason` | string | `no_key`: cloaked for a scope you hold no key for; `withheld`: a public remote never delivered it; `unwritable` (`status` only): readable, but this filesystem could not hold the file; `missing`: a public object absent from the store (damage, not a redaction: run `vl fsck`); `error`: the store could not read it; `no_access` (`ls` and `status`): a folder you no longer have access to (a thin clone: the server refuses its content), kept as recorded |
 | `message` | string | The explanation the text output prints (`cloaked:team; no key`) |
 
 ### Signature
@@ -300,7 +300,9 @@ this command found.
 | `policy_held_back` | array | Local paths that keep the protection you accepted because `.veilpolicy` would weaken it (`vl policy accept` applies it): `path` (with a trailing `/` for a directory), `dir` (bool: a directory held back as a whole), `accepted` and `wanted` (strings: policy keywords such as `isolate`, `cloak ops`, `public!`), `tier` (the [tier](#tier) the accepted classification gives it: `isolated`, `ignored`, `cloaked` or `public`) and `scope` (string or null: of `cloaked`) |
 | `nested` | array of strings | Directories that are repositories of their own; nothing in them is recorded here |
 | `redacted` | array | Files of `@` that are absent on disk because you cannot read them: `path`, `redaction` (a [redaction](#redaction)) and `tier` (`redacted`, or for `unwritable` the file's own [tier](#tier)) |
-| `conflicts` | array | Unresolved conflicts: `path`, `recorded_on` (string or null: the short change id of the parent, a merge, that recorded it with the same version; null if recorded on `@` itself) and `conflict` (a [conflict](#conflict), or null for markers in the file) |
+| `conflicts` | array | Unresolved conflicts: `path`, `recorded_on` (string or null: the short change id of the parent, a merge, that recorded it with the same version; null if recorded on `@` itself) `conflict` (a [conflict](#conflict), or null for markers in the file), and `kept_edit` (optional, true: your own edit of a version you held before you lost access to its folder, kept when the folder was written back again; the recorded version is newer) |
+| `hidden` | array of strings | Omitted when empty. Folders the working-copy change's diff did not compare, as in [`veil.diff/2`](#veildiff2): the server refuses their content |
+| `not_recorded` | array of strings | Omitted when empty. Files the working copy holds in a folder you no longer have access to (a thin clone: the folder is kept as recorded, by id): never recorded and never touched |
 | `renormalizable` | array of strings | Omitted when empty. Files that still hold their recorded version, but whose line endings `.veilattributes` would now convert: `vl renormalize` re-records them (changing `.veilattributes` alone never does) |
 
 ## `veil.log/2`
@@ -354,6 +356,7 @@ what they change is sealed for you; listed in `entries` only with
 | `stat` | bool | `--stat` was given: every file's `content` is null |
 | `files` | array of [file diffs](#file-diff) | The changed files, in path order |
 | `renames_skipped` | bool *(optional)* | Present (and true) when inexact rename detection was skipped because of its limits (too many files): only exact renames are listed |
+| `hidden` | array of strings *(optional)* | Folders not compared, each as its path and `/` (`/` for the root): in a thin clone, the server refuses their content (you no longer have access to them). Nothing inside them is listed. Absent when none |
 
 ## `veil.show/2`
 
@@ -376,7 +379,7 @@ what they change is sealed for you; listed in `entries` only with
 | `agent` | [attribution](#attribution) *(optional)* | The agent that produced the content; absent when none is recorded |
 | `abandoned` | string *(optional)* | This version is a recorded dead end (`vl attempt drop`), for this reason |
 | `attempts` | array *(optional)* | The change's recorded dead ends, oldest first (`Discarded attempts` in the text); absent when there are none. Each: `snapshot_id`, `snapshot_short`, `reason` (string), `agent` ([attribution](#attribution), *optional*), `timestamp` (string or null), `files` (array of strings: what it changed against its own parents) and `missing` (bool, *optional*: present and true when only its id is here, after `vl gc` or before a fetch) |
-| `diff` | object | The snapshot's changes: `stat` (bool) and `files` (array of [file diffs](#file-diff)), as in [`veil.diff/2`](#veildiff2) |
+| `diff` | object | The snapshot's changes: `stat` (bool), `files` (array of [file diffs](#file-diff)) and `hidden` (optional), as in [`veil.diff/2`](#veildiff2) |
 
 ### Attribution
 
@@ -508,7 +511,7 @@ the working copy its local-only files.
 | `all` | bool | `--all`: ignored paths are listed |
 | `entries` | array | In tree order (depth first, by name within a directory), each: |
 | `path` | string | The file (an ignored directory: the directory) |
-| `dir` | bool | An ignored directory, listed as a whole (`--all`; never descended into) |
+| `dir` | bool | A directory listed as a whole, never descended into: an ignored one (`--all`), or a recorded one you no longer have access to (tier `redacted`, `kind` `dir`, reason `no_access`) |
 | `tier` | string | Its [tier](#tier): `public`, `cloaked`, `embargoed`, `redacted`, `isolated`, `quarantined` or `ignored` |
 | `scope` | string or null | The scope of a cloaked file (also when `redacted`) |
 | `recorded` | bool | In the snapshot; false for local-only files |
@@ -519,7 +522,7 @@ the working copy its local-only files.
 | `redaction` | [redaction](#redaction) or null | Why a `redacted` file cannot be read. Never content |
 | `quarantine` | object or null | A `quarantined` file: `rule` (string), `line` (number) and `state` (`never_recorded`, or `held_back`: history keeps the previous, recorded version) |
 | `conflict` | [conflict](#conflict) or null | An unresolved conflict (`conflict: 2 sides` in the text); `tier`, `scope`, `visibility`, `size` and `executable` are those of the file with markers you are shown, `readable` says whether you can read every side |
-| `kind` | string | `file`, `symlink` (repository format 5) or `conflict` |
+| `kind` | string | `file`, `symlink` (repository format 5), `conflict`, or `dir` (a directory listed whole: see `dir`) |
 | `target` | string or null | A symlink's target (`PATH -> TARGET` in the text, escaped), when you can read it; null for a redacted link (its target is sealed content), a local-only link, and anything but a symlink. `size` is the target's length |
 
 ## `veil.resolve.list/2`
@@ -634,7 +637,7 @@ the text only; the document always lists every match.
 | `rev` | [snapshot reference](#snapshot-reference) | The snapshot searched |
 | `matches` | array | Every matching line, by path then line: `path`, `line` (number, from 1), `text` (the line without its break, cut at 1 MiB), `truncated` (bool: it was cut) and `tier` (below) |
 | `files` | array | Every file with a match: `path`, `tier`, `scope` (string or null: of a cloaked file), `count` (number: matching lines, up to `--max-count`), `binary` (bool: its lines are not listed unless `-a`) and `conflict` (bool: an unresolved conflict, searched as the file with markers you are shown) |
-| `skipped` | object | What was not searched: `sealed` (files you cannot read), `binary` (binary files that matched, lines not listed), `too_large` (files over 256 MiB) |
+| `skipped` | object | What was not searched: `sealed` (files you cannot read), `binary` (binary files that matched, lines not listed), `too_large` (files over 256 MiB), and `hidden_folders` (folders you no longer have access to, in a thin clone; absent when none) |
 | `searched` | number | Files of the snapshot considered |
 
 `tier` is `public`, `cloaked` (a sealed secret file, and you hold the

@@ -332,7 +332,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             let tree = ctx.repo.snapshot(&id)?.tree;
             let e = match p.is_root() {
                 true => None,
-                false => lookup(ctx.repo.store(), &tree, &p)?,
+                false => render::lookup_shown(&ctx.repo, &tree, &p)?,
             };
             match &e {
                 // A symlink prints its target.
@@ -391,6 +391,15 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             let c = api::commit(ctx, &message, !*no_advance, !cli.no_snapshot)?;
             println!("Committed {}", one_line(&ctx.repo, &c.result.committed));
             print_tags_kept(&c.result);
+            // Once, here: what the person keeps in a folder they no longer
+            // have access to was not recorded (BUG-1528).
+            if !ctx.report.not_recorded.is_empty() {
+                let files: Vec<String> = ctx.report.not_recorded.iter().map(|p| safe(p.as_str()).into_owned()).collect();
+                render::warn(&format!(
+                    "not recorded, left as they are: {} (in a folder you no longer have access to)",
+                    files.join(", ")
+                ));
+            }
         }
         Cmd::Edit { rev } => {
             let id = ctx.rev(rev)?;
@@ -968,7 +977,15 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
     let filters: Vec<VPath> = paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
     let wanted = |p: &VPath| filters.is_empty() || filters.iter().any(|f| p.starts_with(f));
     let policy_path = VPath::new(POLICY_FILE)?;
-    let changes = veil_core::tree::diff_trees(ctx.repo.store(), Some(&wc_tree), Some(&src_tree))?;
+    // A folder the server refuses stays as `@` has it, unless a path asked
+    // for is in or above it (BUG-1529).
+    let (changes, hidden) = veil_core::tree::diff_trees_hiding(ctx.repo.store(), Some(&wc_tree), Some(&src_tree))?;
+    for h in hidden.iter().map(|h| &h.path) {
+        if filters.is_empty() || filters.iter().any(|f| f.starts_with(h) || h.starts_with(f)) {
+            let asked = if filters.is_empty() { "a restore of every path asks for it".to_string() } else { "a path asked for is in it".into() };
+            return Err(veil_core::tree::no_access(h, &asked).into());
+        }
+    }
     // In a thin clone, what is put back, each at its own path (BUG-1506).
     veil_core::tree::prefetch_changes(ctx.repo.store(), None, Some(&src_tree), changes.iter().filter(|c| wanted(&c.path)))?;
     let mut done: std::collections::HashSet<VPath> = changes.iter().filter(|c| wanted(&c.path)).map(|c| c.path.clone()).collect();

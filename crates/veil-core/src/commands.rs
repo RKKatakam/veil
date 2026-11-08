@@ -170,6 +170,9 @@ pub struct ChangeParts {
     pub base: ObjectId,
     pub tree: ObjectId,
     pub units: Vec<Unit>,
+    /// Folders whose tree the server refuses: kept where they are, never
+    /// units (BUG-1529).
+    pub hidden: Vec<VPath>,
 }
 
 /// What [`Repo::split`] made.
@@ -450,7 +453,7 @@ impl Repo {
         }
         let s = self.snapshot(id)?;
         let base = self.parents_tree(&s.parents)?.tree;
-        let mut units = selection::units(&self.store, &base, &s.tree)?;
+        let (mut units, hidden) = selection::units(&self.store, &base, &s.tree)?;
         if by_hunk {
             // In a thin clone, each side asked for at its own path
             // (BUG-1506).
@@ -459,7 +462,7 @@ impl Repo {
                 selection::classify(&self.store, u, &s.conflicts)?;
             }
         }
-        Ok(ChangeParts { id: *id, base, tree: s.tree, units })
+        Ok(ChangeParts { id: *id, base, tree: s.tree, units, hidden })
     }
 
     /// `vl split`: split change `parts.id` in two. The **first** change, on
@@ -482,7 +485,7 @@ impl Repo {
             return Err(VeilError::Policy("an embargoed merge cannot be split".into()));
         }
         let store = tx.repo().store.clone();
-        let h = selection::halves(&store, &parts.base, &parts.tree, &parts.units, sel)?;
+        let h = selection::halves_hiding(&store, &parts.base, &parts.tree, &parts.units, &parts.hidden, sel)?;
         if !h.any {
             return Err(VeilError::repo(
                 "nothing chosen: the first change would be empty (choose at least one file or hunk; `vl new -B` is not needed to start an empty change before it, `vl new REV-` does that)",
@@ -567,7 +570,7 @@ impl Repo {
                     return Err(VeilError::repo("internal: the selection is of another change"));
                 }
                 check_current(tx.repo(), &[id, dest], parts, &s)?;
-                let h = selection::halves(&store, &parts.base, &parts.tree, &parts.units, sel)?;
+                let h = selection::halves_hiding(&store, &parts.base, &parts.tree, &parts.units, &parts.hidden, sel)?;
                 if !h.any {
                     return Err(VeilError::repo("nothing chosen: nothing to squash"));
                 }
@@ -576,7 +579,7 @@ impl Repo {
             None if into_parent => (tx.repo().snapshot(&dest)?.tree, s.tree, s.tree, true),
             None => {
                 let base = tx.repo().parents_tree(&s.parents)?.tree;
-                check_current(tx.repo(), &[id, dest], &ChangeParts { id, base, tree: s.tree, units: vec![] }, &s)?;
+                check_current(tx.repo(), &[id, dest], &ChangeParts { id, base, tree: s.tree, units: vec![], hidden: vec![] }, &s)?;
                 (base, s.tree, base, true)
             }
         };

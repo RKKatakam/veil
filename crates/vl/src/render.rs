@@ -452,6 +452,18 @@ pub fn hidden_explanation(repo: &Repo, path: &VPath, e: &TreeEntry) -> Option<St
     })
 }
 
+/// The entry at `path` in `tree`, for a reader: a folder on the way whose
+/// tree the server refuses (BUG-1508) is said so, never "not present".
+pub fn lookup_shown(repo: &Repo, tree: &ObjectId, path: &VPath) -> Result<Option<TreeEntry>> {
+    veil_core::tree::lookup_to_read(repo.store(), tree, path).map_err(|err| match veil_core::tree::refused_tree(repo.store(), &err) {
+        true => anyhow::anyhow!(
+            "{} is in a folder you no longer have access to (the server refuses its content)",
+            safe(path.as_str())
+        ),
+        false => err.into(),
+    })
+}
+
 /// The content of the file entry `e` at `path` below `root`, or an error
 /// that explains sealed and withheld secrets instead of the store's
 /// `object … is not present in this store`. In a thin clone, asked for at
@@ -477,7 +489,11 @@ pub fn read_file(repo: &Repo, root: &ObjectId, path: &VPath, e: &TreeEntry) -> R
 // `vl status`, `vl diff` and `vl show` are rendered by `api::text`.
 
 pub fn print_files(repo: &Repo, tree: &ObjectId) -> Result<()> {
-    let files = veil_core::tree::walk_files(repo.store(), tree)?;
+    let (files, hidden) = veil_core::tree::walk_files_hiding(repo.store(), tree)?;
+    // A folder the server refuses (BUG-1508): its path only.
+    for h in &hidden {
+        println!("{} {:>9}  {}{}", dim(&format!("{:<18}", "redacted")), "-", safe(&crate::api::hidden_dir(h)), dim(" (you no longer have access to this folder)"));
+    }
     // Readability is read by id: in a thin clone, each asked for at its
     // own path first (BUG-1506).
     veil_core::tree::prefetch_files(repo.store(), tree, files.iter().map(|(p, e)| (p, e)))?;
@@ -512,7 +528,8 @@ pub fn print_files(repo: &Repo, tree: &ObjectId) -> Result<()> {
 
 /// Paths of every file in a tree (for policy warnings).
 pub fn tree_paths(repo: &Repo, tree: &ObjectId) -> Result<Vec<(VPath, Visibility)>> {
-    Ok(veil_core::tree::walk_files(repo.store(), tree)?
+    Ok(veil_core::tree::walk_files_hiding(repo.store(), tree)?
+        .0
         .into_iter()
         .filter(|(_, e)| e.kind.is_file_like())
         .map(|(p, e)| (p, e.visibility))

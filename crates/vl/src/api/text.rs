@@ -107,8 +107,10 @@ fn change_mark(c: &Change) -> String {
 }
 
 pub fn status(s: &Status) {
-    if s.changes.is_empty() {
+    if s.changes.is_empty() && s.not_recorded.is_empty() {
         println!("The working copy has no changes.");
+    } else if s.changes.is_empty() {
+        println!("The working copy has no changes that can be recorded.");
     } else {
         println!("Working copy changes:");
         changes_summary(&s.changes);
@@ -163,6 +165,12 @@ pub fn status(s: &Status) {
         println!("{}", red("Unresolved conflicts:"));
         for c in &s.conflicts {
             match &c.recorded_on {
+                _ if c.kept_edit => println!(
+                    "  {} {}  (your edit of the version you held before you lost access to its folder; the recorded version is newer: `vl restore {}` takes it)",
+                    red("C"),
+                    safe(&c.path),
+                    safe(&c.path)
+                ),
                 Some(change) => println!("  {} {}  (recorded on {change})", red("C"), safe(&c.path)),
                 None => println!("  {} {}", red("C"), safe(&c.path)),
             }
@@ -171,6 +179,15 @@ pub fn status(s: &Status) {
             "  {} edit the files to resolve the conflict markers (a conflict is resolved once they are gone), or keep one version with `vl resolve PATH --ours|--theirs`. Fold the resolution into the merge with `vl squash`, or `vl commit` it",
             dim("hint:")
         );
+    }
+    for h in &s.hidden {
+        println!("  {} {} {}", yellow("redacted"), safe(h), dim("(you no longer have access to this folder; not compared)"));
+    }
+    if !s.not_recorded.is_empty() {
+        println!("{}", yellow("In a folder you no longer have access to (not recorded; left as they are):"));
+        for p in &s.not_recorded {
+            println!("  {} {}", yellow("U"), safe(p));
+        }
     }
     if !s.renormalizable.is_empty() {
         println!(
@@ -360,9 +377,16 @@ fn log_entry(e: &LogEntry, lanes: &mut Vec<Option<ObjectId>>) {
 /// `vl diff` of the changes between two trees, rendered one file at a time;
 /// stops when stdout goes away.
 pub fn diff(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool, r: &Renames) -> Result<()> {
-    let changes = diff_changes(repo, from, to)?;
+    let (changes, hidden) = diff_changes(repo, from, to)?;
+    // A folder the server refuses: its path only, never what is in it
+    // (BUG-1508), as a checkout reports what it leaves out.
+    for h in &hidden {
+        println!("{} {} {}", yellow("redacted"), safe(&crate::api::hidden_dir(h)), dim("(you no longer have access to this folder; not compared)"));
+    }
     if changes.is_empty() {
-        println!("{}", dim("(no changes)"));
+        if hidden.is_empty() {
+            println!("{}", dim("(no changes)"));
+        }
         return Ok(());
     }
     let (items, skipped) = detect_renames(repo, (from, to), changes, r)?;
@@ -905,6 +929,9 @@ pub fn grep(g: &GrepDoc, style: GrepStyle) {
     }
     if g.skipped.sealed > 0 {
         crate::render::warn(&format!("{} file(s) not searched: sealed for a scope you are not in", g.skipped.sealed));
+    }
+    if g.skipped.hidden_folders > 0 {
+        crate::render::warn(&format!("{} folder(s) not searched: you no longer have access to them", g.skipped.hidden_folders));
     }
     if g.skipped.too_large > 0 {
         crate::render::warn(&format!("{} file(s) over 256 MiB not searched", g.skipped.too_large));
