@@ -347,7 +347,8 @@ const STORED_CURSOR: &str = "frontier-";
 /// (the same frontier written again is the same row, refreshed); and every
 /// write deletes the project's expired rows, then the view key's oldest
 /// rows past `Limits::kept_bytes` (a view key's own: nothing one view key
-/// keeps drops another's, BUG-1308). A cursor so dropped is refused when sent
+/// keeps drops another's, BUG-1308), and those of view keys no viewer has
+/// now (BUG-1413, `files::sweep_keys`). A cursor so dropped is refused when sent
 /// back (`invalid cursor`): the log is asked for again from its start.
 fn keep_cursor(cx: &crate::derive::Cx, vk: &str, id: &str, text: &str, limits: &Limits) -> Result<()> {
     let now = veil_core::now_millis();
@@ -384,7 +385,8 @@ fn keep_cursor(cx: &crate::derive::Cx, vk: &str, id: &str, text: &str, limits: &
         .bind(limits.kept_bytes as i64)
         .execute(pool)
     })?;
-    Ok(())
+    // Rows of view keys out of use since the access changed (BUG-1413).
+    cx.src.rt.block_on(files::sweep_keys(cx.hub(), cx.project()))
 }
 
 /// The text of the cursor kept under `token` for the viewer, while fresh.

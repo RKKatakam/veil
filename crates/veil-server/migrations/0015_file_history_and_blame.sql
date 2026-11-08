@@ -45,6 +45,15 @@ CREATE TABLE IF NOT EXISTS blame_paths (
     path TEXT NOT NULL,
     PRIMARY KEY (project_id, path_key)
 );
+-- What a project's view keys were last found a function of (a digest of
+-- its policy, bindings, admins and members) and when that changed: when
+-- it changes, the rows written before it under view keys no viewer has
+-- (kept blames, too-wide records, kept cursors) are dropped (BUG-1413).
+CREATE TABLE IF NOT EXISTS view_access (
+    project_id BIGINT PRIMARY KEY,
+    access TEXT NOT NULL,
+    changed_at BIGINT NOT NULL
+);
 -- Who runs the blame job of a version now (one server at a time): a
 -- lease, taken, renewed and given back by single statements, as
 -- `view_fills`; past `expires_at` (milliseconds) it may be taken over.
@@ -58,11 +67,15 @@ CREATE TABLE IF NOT EXISTS blame_jobs (
     expires_at BIGINT NOT NULL,
     PRIMARY KEY (project_id, view_key, path_key, follow, snapshot)
 );
--- Blames found too wide (BUG-1309): the job passed a memory bound of
--- `held` bytes, so a request under a bound no larger answers `too_wide`
--- from this row instead of walking again. A version's history below it
--- never changes, and a change of access is a new view key. At most
--- 4,096 rows a view key (its oldest dropped).
+-- Blames found too wide (BUG-1309): the job passed its memory bound
+-- (`held` bytes) or a kept blame's (a quarter of `kept_bytes`, a view
+-- key's cap: BUG-1411), so a request under limits no larger answers
+-- `too_wide` from this row instead of walking again. A version's history
+-- below it never changes, and a change of access is a new view key; what
+-- the walk stopped at, kept blames, does change: a job that keeps blames
+-- of a path drops the view key's rows whose walks reached it (`path_keys`,
+-- comma-separated: BUG-1412). At most 4,096 rows a view key (its oldest
+-- dropped), and none of a view key no viewer has (BUG-1413).
 CREATE TABLE IF NOT EXISTS blame_ends (
     project_id BIGINT NOT NULL,
     view_key TEXT NOT NULL,
@@ -70,6 +83,8 @@ CREATE TABLE IF NOT EXISTS blame_ends (
     follow BOOLEAN NOT NULL,
     snapshot TEXT NOT NULL,
     held BIGINT NOT NULL,
+    kept_bytes BIGINT NOT NULL,
+    path_keys TEXT NOT NULL,
     created_at BIGINT NOT NULL,
     PRIMARY KEY (project_id, view_key, path_key, follow, snapshot)
 );

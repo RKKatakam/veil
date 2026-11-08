@@ -467,6 +467,10 @@ pub struct BlameLimits {
     /// How long a job waits for another server's lease on its key before
     /// it ends `warming` (BUG-1307: it never computes without the lease).
     pub wait: Duration,
+    /// How long a job's lease lasts unless renewed: it is renewed every
+    /// quarter of this, and a holder stops computing a sixth of it before
+    /// its end without a renewal (clocks of servers may differ a little).
+    pub lease: Duration,
 }
 
 impl Default for BlameLimits {
@@ -476,6 +480,7 @@ impl Default for BlameLimits {
             lines: 10_000,
             kept_bytes: KEPT_BYTES,
             wait: JOB_WAIT,
+            lease: JOB_LEASE,
         }
     }
 }
@@ -501,6 +506,11 @@ fn spacing(versions: u64, bytes: usize) -> u64 {
 /// Kept blames written at once: at most this many bytes, or [`BATCH_BLAMES`].
 const BATCH_BYTES: usize = 4 << 20;
 const BATCH_BLAMES: usize = 64;
+
+/// A blame larger than one kept blame may be (BUG-1411).
+fn too_large() -> Error {
+    Error::new(StatusCode::UNPROCESSABLE_ENTITY, "too_wide", "this file's blame is larger than the server keeps for one blame")
+}
 
 fn too_wide() -> Error {
     Error::new(
@@ -543,6 +553,10 @@ pub struct Blamer<'f, 'g, 'a, 'h, 'b> {
     /// A job's lease: once it is not live, the job stops at its next
     /// version (BUG-1307).
     pub lease: Option<Arc<Lease>>,
+    /// The path keys of the versions the walk reached: a too-wide record
+    /// names them, and is dropped when blames of any of them are kept
+    /// (BUG-1412).
+    pub reached: HashSet<String>,
     /// Kept blames to write: `(path key, snapshot, bytes, the path keys
     /// they name)`, and the paths they name; [`Blamer::pending_bytes`] of
     /// them.
@@ -564,6 +578,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             metas: HashMap::new(),
             renames: HashMap::new(),
             lease: None,
+            reached: HashSet::new(),
             writes: Vec::new(),
             write_paths: HashMap::new(),
             pending_bytes: 0,
@@ -716,10 +731,16 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         // shared: each counted once, where it is made), the file-history
         // rows read, the renames found, and the projector's trees (reset
         // after each use).
-        const VERSION: usize = std::mem::size_of::<Version>() + 16;
+        // Containers are counted by their capacity (a hash map or vector
+        // holds up to twice what it has in it).
+        const VERSION: usize = std::mem::size_of::<Version>();
+        const SLOT: usize = std::mem::size_of::<(Version, Node)>() + 1;
         let mut held = 0usize;
         let mut paths: HashSet<*const u8> = HashSet::new();
         let mut path_bytes = 0usize;
+        let walk = |nodes: &HashMap<Version, Node>, order: &Vec<Version>, stack: &Vec<(Version, bool)>, paths: &HashSet<*const u8>| {
+            nodes.capacity() * SLOT + order.capacity() * VERSION + stack.capacity() * (VERSION + 8) + paths.capacity() * 9
+        };
         while let Some((v, ready)) = stack.pop() {
             if ready {
                 order.push(v);
@@ -731,13 +752,18 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             self.stopped()?;
             let (change, parents, kept) = self.expand(&v)?;
             self.t.forget_now();
-            held += 3 * VERSION + std::mem::size_of::<Node>() + 64 + parents.len() * 2 * VERSION;
+            // Each node's parents (its own vector) and their copies in
+            // `edges` below.
+            held += parents.capacity() * std::mem::size_of::<Option<Version>>() + parents.len() * VERSION + 32;
             for p in std::iter::once(&v.path).chain(parents.iter().flatten().map(|p| &p.path)) {
                 if paths.insert(Arc::as_ptr(p) as *const u8) {
                     path_bytes += 32 + p.len();
+                    if self.reached.insert(path_key(p)) {
+                        path_bytes += 96;
+                    }
                 }
             }
-            if held + path_bytes + self.side_bytes() > self.limits.held {
+            if held + path_bytes + walk(&nodes, &order, &stack, &paths) + self.side_bytes() > self.limits.held {
                 return Err(too_wide());
             }
             stack.push((v.clone(), true));
@@ -754,7 +780,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                 n.left += 1;
             }
         }
-        held += path_bytes;
+        held += path_bytes + walk(&nodes, &order, &stack, &paths);
         // Up: each version from its parents', each dropped once every
         // version above it is computed; kept as it goes.
         let mut done: HashMap<Version, Done> = HashMap::new();
@@ -784,8 +810,8 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                         let (b, _) = step(&me, &text, &inputs);
                         self.f.g.cx.hub().query.blame_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let b = Arc::new(b);
-                        if b.vd % spacing(computed, b.stored_estimate()) == 0 || v == *start {
-                            self.keep(&v, &b);
+                        if (b.vd % spacing(computed, b.stored_estimate()) == 0 || v == *start) && !self.keep(&v, &b) && v == *start {
+                            return Err(too_large());
                         }
                         Some((text, b))
                     }
@@ -804,19 +830,37 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                 }
             }
             done.insert(v.clone(), out);
-            if held + self.pending_bytes + self.side_bytes() > self.limits.held {
+            if held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes() > self.limits.held {
                 return Err(too_wide());
             }
-            if self.writes.len() >= BATCH_BLAMES || self.pending_bytes >= BATCH_BYTES.min(self.limits.held / 4) {
+            if self.writes.len() >= BATCH_BLAMES || self.pending_bytes >= self.batch_bytes() {
                 self.write()?;
             }
         }
         Ok(done.remove(start).flatten())
     }
 
-    /// Keep blame `b` of version `v` (written with the next batch).
-    fn keep(&mut self, v: &Version, b: &Blame) {
+    /// Most bytes of one kept blame: a quarter of a view key's cap, so a
+    /// kept blame and the batch written with it never pass the cap
+    /// (BUG-1411).
+    fn one_kept(&self) -> usize {
+        self.limits.kept_bytes / 4
+    }
+
+    /// Bytes of kept blames held before they are written: at most a
+    /// quarter of the memory bound and of a view key's cap, so a batch
+    /// (with the one blame past it) takes at most half the cap.
+    fn batch_bytes(&self) -> usize {
+        BATCH_BYTES.min(self.limits.held / 4).min(self.one_kept())
+    }
+
+    /// Keep blame `b` of version `v` (written with the next batch); `false`
+    /// when it is larger than [`Blamer::one_kept`] (not kept).
+    fn keep(&mut self, v: &Version, b: &Blame) -> bool {
         let raw = b.encode(path_key);
+        if raw.len() > self.one_kept() {
+            return false;
+        }
         self.pending_bytes += raw.len() + 128;
         let mut named: Vec<String> = Vec::new();
         let mut seen: HashSet<*const u8> = HashSet::new();
@@ -835,11 +879,14 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         named.dedup();
         self.pending_bytes += named.len() * 33;
         self.writes.push((path_key(&v.path), v.id, raw, named.join(",")));
+        true
     }
 
     /// Write the kept blames held: their paths, then the blames; then drop
-    /// the view key's oldest past [`BlameLimits::kept_bytes`] (BUG-1218;
-    /// only the view key's own: BUG-1308).
+    /// the view key's too-wide records whose walks reached the paths kept
+    /// (their walks would stop at these now: BUG-1412), and the view key's
+    /// oldest kept blames past [`BlameLimits::kept_bytes`] (BUG-1218; only
+    /// the view key's own: BUG-1308), never one just written (BUG-1411).
     fn write(&mut self) -> Result<()> {
         if self.writes.is_empty() {
             return Ok(());
@@ -859,7 +906,8 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                     .execute(pool)
             })?;
         }
-        // One statement for the batch, then one for the view key's cap.
+        // One statement for the batch, one for the records, one for the
+        // view key's cap.
         let now = veil_core::now_millis();
         let keys: Vec<&str> = w.iter().map(|r| r.0.as_str()).collect();
         let snaps: Vec<String> = w.iter().map(|r| r.1.hex()).collect();
@@ -883,18 +931,39 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             .bind(&named)
             .execute(pool)
         })?;
+        let mut kept_paths: Vec<&str> = keys.clone();
+        kept_paths.sort_unstable();
+        kept_paths.dedup();
+        cx.db(|| {
+            sqlx::query(
+                "DELETE FROM blame_ends WHERE project_id = $1 AND view_key = $2 AND follow = $3 \
+                 AND (path_key = ANY($4::text[]) OR string_to_array(path_keys, ',') && $4::text[])",
+            )
+            .bind(project)
+            .bind(vk)
+            .bind(self.follow)
+            .bind(&kept_paths)
+            .execute(pool)
+        })?;
+        // The rows just written are counted first (newest) and never
+        // dropped: they take at most half the cap (`batch_bytes`).
         cx.db(|| {
             sqlx::query(
                 "DELETE FROM blame_memo WHERE project_id = $1 AND view_key = $2 AND (path_key, follow, snapshot) IN ( \
                      SELECT path_key, follow, snapshot FROM ( \
                          SELECT path_key, follow, snapshot, \
-                             SUM(bytes) OVER (ORDER BY created_at DESC, path_key, follow, snapshot) AS kept \
+                             SUM(bytes) OVER (ORDER BY (follow = $4 AND (path_key, snapshot) IN (SELECT * FROM UNNEST($5::text[], $6::text[]))) DESC, \
+                                 created_at DESC, path_key, follow, snapshot) AS kept, \
+                             (follow = $4 AND (path_key, snapshot) IN (SELECT * FROM UNNEST($5::text[], $6::text[]))) AS mine \
                          FROM blame_memo WHERE project_id = $1 AND view_key = $2) t \
-                     WHERE kept > $3)",
+                     WHERE kept > $3 AND NOT mine)",
             )
             .bind(project)
             .bind(vk)
             .bind(self.limits.kept_bytes as i64)
+            .bind(self.follow)
+            .bind(&keys)
+            .bind(&snaps)
             .execute(pool)
         })?;
         for (k, s, _, _) in w {
@@ -923,23 +992,22 @@ pub fn kept_answer(f: &Files, t: &Trees, rev: ObjectId, start: &Version, follow:
 /// Blame jobs computing at once in one server (each runs its statements
 /// one at a time: at most this many of the pool's connections, and only
 /// while a statement runs). A freed slot goes to the next project in turn
-/// with a job waiting for one (BUG-1306).
+/// with a job waiting for one, and within it to the next view key in turn
+/// (BUG-1306, BUG-1410).
 pub const BLAME_JOBS: usize = 2;
-/// Blame jobs one project may have waiting in one server, past which its
-/// requests answer `warming` without queuing one (BUG-1306: a project
-/// fills its own share only).
+/// Blame jobs one view key of a project may have waiting in one server,
+/// past which its requests answer `warming` without queuing one (BUG-1306,
+/// BUG-1410: a view key fills its own share only, so nothing one viewer
+/// asks for refuses another's).
 pub const MAX_PENDING_JOBS: usize = 256;
-/// Blame jobs waiting in one server, all projects: past it, a project
-/// below its fair share (this ÷ the projects with jobs waiting) still
-/// queues, up to twice this in all.
+/// Blame jobs waiting in one server, all projects and view keys: past it,
+/// a view key below its fair share (this ÷ the view keys with jobs
+/// waiting, across projects) still queues, up to twice this in all.
 pub const MAX_PENDING_ALL: usize = 4096;
-/// A job's lease on its key: how long it lasts unless renewed, how often
-/// it is, how long before its end a holder stops computing (clocks of
-/// servers may differ a little), and how long a job waits for another
-/// server's (then it ends `warming`, never computing: BUG-1307).
+/// A job's lease on its key ([`BlameLimits::lease`]), and how long a job
+/// waits for another server's ([`BlameLimits::wait`]; then it ends
+/// `warming`, never computing: BUG-1307).
 const JOB_LEASE: Duration = Duration::from_secs(120);
-const JOB_RENEW: Duration = Duration::from_secs(30);
-const JOB_MARGIN: Duration = Duration::from_secs(20);
 const JOB_WAIT: Duration = Duration::from_secs(600);
 /// Too-wide records a view key keeps (BUG-1309; its oldest dropped).
 const KEPT_ENDS: i64 = 4096;
@@ -972,6 +1040,8 @@ impl JobEnd {
 /// A job's key: project, view key, path key, `follow`, snapshot.
 pub type JobKey = (i64, String, String, bool, ObjectId);
 type JobRx = tokio::sync::watch::Receiver<Option<JobEnd>>;
+/// Who shares a server's queue and slots: a view key of a project.
+type Sharer = (i64, String);
 
 /// The blame jobs of one server.
 pub struct Jobs {
@@ -984,31 +1054,39 @@ pub struct Jobs {
 #[derive(Default)]
 struct Waiting {
     jobs: HashMap<JobKey, JobRx>,
-    /// Jobs waiting, by project.
-    per: HashMap<i64, usize>,
+    /// Jobs waiting, by project and view key.
+    per: HashMap<Sharer, usize>,
 }
 
 impl Default for Jobs {
     fn default() -> Self {
         Jobs {
             waiting: std::sync::Mutex::new(Waiting::default()),
-            slots: Arc::new(Slots { state: std::sync::Mutex::new(SlotState { free: BLAME_JOBS, queues: std::collections::BTreeMap::new(), last: i64::MIN }) }),
+            slots: Arc::new(Slots::new(BLAME_JOBS)),
             started: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
 
-/// This server's [`BLAME_JOBS`] slots, handed out fairly (BUG-1306): a
-/// freed slot goes to the project after the one last served, in turn,
-/// among those with a job waiting (first come first served within one).
+/// This server's [`BLAME_JOBS`] slots, handed out fairly (BUG-1306,
+/// BUG-1410): a freed slot goes to the project after the one last served,
+/// in turn, among those with a job waiting; within it, to the view key
+/// after the one it last served, in turn; within a view key, first come
+/// first served. So no project holds another back by more than one job a
+/// slot, and within a project no view key holds another back.
 struct Slots {
     state: std::sync::Mutex<SlotState>,
 }
 
+type Waiter = tokio::sync::oneshot::Sender<Slot>;
+
 struct SlotState {
     free: usize,
-    queues: std::collections::BTreeMap<i64, std::collections::VecDeque<tokio::sync::oneshot::Sender<Slot>>>,
+    /// Waiters by project, then view key.
+    queues: std::collections::BTreeMap<i64, std::collections::BTreeMap<String, std::collections::VecDeque<Waiter>>>,
+    /// The project last served, and each project's view key last served.
     last: i64,
+    last_key: HashMap<i64, String>,
 }
 
 /// A slot held; given back (to the next in turn) when dropped.
@@ -1024,8 +1102,21 @@ impl Drop for Slot {
     }
 }
 
+/// The key of `map` after `after` in turn (wrapping), if any.
+fn next_in_turn<K: Ord + Clone, V>(map: &std::collections::BTreeMap<K, V>, after: Option<&K>) -> Option<K> {
+    let past = match after {
+        Some(a) => map.range((std::ops::Bound::Excluded(a.clone()), std::ops::Bound::Unbounded)).next(),
+        None => None,
+    };
+    past.or_else(|| map.iter().next()).map(|(k, _)| k.clone())
+}
+
 impl Slots {
-    async fn take(self: &Arc<Self>, project: i64) -> Slot {
+    fn new(n: usize) -> Slots {
+        Slots { state: std::sync::Mutex::new(SlotState { free: n, queues: Default::default(), last: i64::MIN, last_key: HashMap::new() }) }
+    }
+
+    async fn take(self: &Arc<Self>, project: i64, vk: &str) -> Slot {
         let rx = {
             let mut st = self.state.lock().unwrap();
             // A free slot means nobody (still) waits: a freed one goes to a
@@ -1033,10 +1124,11 @@ impl Slots {
             if st.free > 0 {
                 st.free -= 1;
                 st.last = project;
+                st.last_key.insert(project, vk.to_string());
                 return Slot { slots: Some(self.clone()) };
             }
             let (tx, rx) = tokio::sync::oneshot::channel();
-            st.queues.entry(project).or_default().push_back(tx);
+            st.queues.entry(project).or_default().entry(vk.to_string()).or_default().push_back(tx);
             rx
         };
         // A sender is dropped only once sent (a job's task is never
@@ -1048,17 +1140,28 @@ impl Slots {
         let mut guard = me.state.lock().unwrap();
         let st = &mut *guard;
         loop {
-            let next = st.queues.range(st.last.saturating_add(1)..).next().or_else(|| st.queues.iter().next()).map(|(p, _)| *p);
-            let Some(p) = next else {
+            let last = st.last;
+            let Some(p) = next_in_turn(&st.queues, Some(&last)) else {
                 st.free += 1;
                 return;
             };
-            let q = st.queues.get_mut(&p).unwrap();
+            let keys = st.queues.get_mut(&p).unwrap();
+            let k = next_in_turn(keys, st.last_key.get(&p)).unwrap();
+            let q = keys.get_mut(&k).unwrap();
             let tx = q.pop_front().unwrap();
             if q.is_empty() {
-                st.queues.remove(&p);
+                keys.remove(&k);
+                if keys.is_empty() {
+                    st.queues.remove(&p);
+                }
             }
             st.last = p;
+            st.last_key.insert(p, k);
+            if st.last_key.len() > 4 * MAX_PENDING_ALL {
+                // Turns of projects with nothing waiting are forgotten.
+                let queued: HashSet<i64> = st.queues.keys().copied().collect();
+                st.last_key.retain(|p, _| queued.contains(p));
+            }
             match tx.send(Slot { slots: Some(me.clone()) }) {
                 Ok(()) => return,
                 // The waiter left: the next in turn.
@@ -1069,18 +1172,21 @@ impl Slots {
 }
 
 /// A job's hold of its key's lease (BUG-1307): lost when a renewal finds
-/// the row taken over, or when the lease's end (less `JOB_MARGIN`)
-/// passes without a renewal. A job computes only while it is live, and
-/// checks at every version.
+/// the row taken over, or when the lease's end (less a sixth of the lease,
+/// for clocks) passes without a renewal. A job computes only while it is
+/// live, and checks at every version.
 pub struct Lease {
     lost: std::sync::atomic::AtomicBool,
     /// Milliseconds: past this, the job stops.
     until: std::sync::atomic::AtomicI64,
+    /// How long it lives from a renewal (the lease, less the margin).
+    span: i64,
 }
 
 impl Lease {
-    fn new(now: i64) -> Lease {
-        Lease { lost: Default::default(), until: std::sync::atomic::AtomicI64::new(now + (JOB_LEASE - JOB_MARGIN).as_millis() as i64) }
+    fn new(now: i64, lease: Duration) -> Lease {
+        let span = (lease - lease / 6).as_millis() as i64;
+        Lease { lost: Default::default(), until: std::sync::atomic::AtomicI64::new(now + span), span }
     }
 
     pub fn live(&self) -> bool {
@@ -1106,7 +1212,7 @@ pub async fn wait_for_blame(
     deadline: std::time::Instant,
 ) -> Result<JobEnd> {
     let vk = project.view(viewer).key();
-    let key: JobKey = (project.id, vk, path_key(&start.path), follow, start.id);
+    let key: JobKey = (project.id, vk.clone(), path_key(&start.path), follow, start.id);
     let joined = hub.query.jobs.waiting.lock().unwrap().jobs.get(&key).cloned();
     let mut rx = match joined {
         Some(rx) => rx,
@@ -1118,7 +1224,8 @@ pub async fn wait_for_blame(
             match w.jobs.get(&key) {
                 Some(rx) => rx.clone(),
                 None => {
-                    let mine = w.per.get(&project.id).copied().unwrap_or(0);
+                    let sharer: Sharer = (project.id, vk);
+                    let mine = w.per.get(&sharer).copied().unwrap_or(0);
                     let busy = w.per.len() + usize::from(mine == 0);
                     let all = w.jobs.len();
                     if mine >= MAX_PENDING_JOBS || (all >= MAX_PENDING_ALL && (mine >= MAX_PENDING_ALL / busy || all >= 2 * MAX_PENDING_ALL)) {
@@ -1126,7 +1233,7 @@ pub async fn wait_for_blame(
                     }
                     let (tx, rx) = tokio::sync::watch::channel(None);
                     w.jobs.insert(key.clone(), rx.clone());
-                    *w.per.entry(project.id).or_default() += 1;
+                    *w.per.entry(sharer.clone()).or_default() += 1;
                     drop(w);
                     hub.query.jobs.started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (hub, project, viewer, start) = (hub.clone(), project.clone(), viewer.clone(), start.clone());
@@ -1140,10 +1247,10 @@ pub async fn wait_for_blame(
                         {
                             let mut w = hub.query.jobs.waiting.lock().unwrap();
                             w.jobs.remove(&key);
-                            if let Some(n) = w.per.get_mut(&project.id) {
+                            if let Some(n) = w.per.get_mut(&sharer) {
                                 *n -= 1;
                                 if *n == 0 {
-                                    w.per.remove(&project.id);
+                                    w.per.remove(&sharer);
                                 }
                             }
                         }
@@ -1163,12 +1270,13 @@ pub async fn wait_for_blame(
 }
 
 /// How the job of `key` ended already, if it did (one statement): its
-/// blame kept, or recorded too wide under a bound no smaller than
-/// `limits.held` (BUG-1309).
+/// blame kept, or recorded too wide under limits no smaller than these
+/// (BUG-1309).
 async fn settled(hub: &crate::Hub, key: &JobKey, limits: BlameLimits) -> Result<Option<JobEnd>> {
     let (kept, wide): (bool, bool) = sqlx::query_as(
         "SELECT EXISTS (SELECT 1 FROM blame_memo WHERE project_id = $1 AND view_key = $2 AND path_key = $3 AND follow = $4 AND snapshot = $5), \
-                EXISTS (SELECT 1 FROM blame_ends WHERE project_id = $1 AND view_key = $2 AND path_key = $3 AND follow = $4 AND snapshot = $5 AND held >= $6)",
+                EXISTS (SELECT 1 FROM blame_ends WHERE project_id = $1 AND view_key = $2 AND path_key = $3 AND follow = $4 AND snapshot = $5 \
+                        AND held >= $6 AND kept_bytes >= $7)",
     )
     .bind(key.0)
     .bind(&key.1)
@@ -1176,6 +1284,7 @@ async fn settled(hub: &crate::Hub, key: &JobKey, limits: BlameLimits) -> Result<
     .bind(key.3)
     .bind(key.4.hex())
     .bind(limits.held as i64)
+    .bind(limits.kept_bytes as i64)
     .fetch_one(&hub.db)
     .await?;
     Ok(if kept {
@@ -1187,19 +1296,25 @@ async fn settled(hub: &crate::Hub, key: &JobKey, limits: BlameLimits) -> Result<
     })
 }
 
-/// Record that the blame of `key` passed the memory bound `held`, and
-/// drop the view key's oldest records past [`KEPT_ENDS`].
-async fn record_too_wide(hub: &crate::Hub, key: &JobKey, held: usize) -> Result<()> {
+/// Record that the blame of `key` is too wide under `limits`, naming the
+/// paths its walk reached (`reached`: a kept blame of any of them drops
+/// the record, BUG-1412), and drop the view key's oldest records past
+/// [`KEPT_ENDS`].
+async fn record_too_wide(hub: &crate::Hub, key: &JobKey, limits: BlameLimits, reached: &[String]) -> Result<()> {
     sqlx::query(
-        "INSERT INTO blame_ends (project_id, view_key, path_key, follow, snapshot, held, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7) \
-         ON CONFLICT (project_id, view_key, path_key, follow, snapshot) DO UPDATE SET held = GREATEST(blame_ends.held, EXCLUDED.held), created_at = EXCLUDED.created_at",
+        "INSERT INTO blame_ends (project_id, view_key, path_key, follow, snapshot, held, kept_bytes, path_keys, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         ON CONFLICT (project_id, view_key, path_key, follow, snapshot) DO UPDATE \
+         SET held = EXCLUDED.held, kept_bytes = EXCLUDED.kept_bytes, path_keys = EXCLUDED.path_keys, created_at = EXCLUDED.created_at",
     )
     .bind(key.0)
     .bind(&key.1)
     .bind(&key.2)
     .bind(key.3)
     .bind(key.4.hex())
-    .bind(held as i64)
+    .bind(limits.held as i64)
+    .bind(limits.kept_bytes as i64)
+    .bind(reached.join(","))
     .bind(veil_core::now_millis())
     .execute(&hub.db)
     .await?;
@@ -1214,6 +1329,84 @@ async fn record_too_wide(hub: &crate::Hub, key: &JobKey, held: usize) -> Result<
     .execute(&hub.db)
     .await?;
     Ok(())
+}
+
+/// Drop the kept blames, too-wide records and kept history cursors of
+/// `project`'s view keys that no viewer has, once its access has changed
+/// (BUG-1413): one statement compares what view keys are a function of
+/// (its policy and bindings, its admins and its groups' members, as a
+/// digest) with what `view_access` last recorded; when they differ, the
+/// one server that records the change drops the rows written before it
+/// under keys no viewer has now. A row written after the change under a
+/// key out of use (a request that loaded its viewer before the change) is
+/// dropped at the next change. Run after every write of such rows and at
+/// every landing (`derive::memo_tips`).
+pub async fn sweep_keys(hub: &crate::Hub, project: i64) -> Result<()> {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT md5(p.policy_text || '|' || p.policy_bindings || '|' || \
+             COALESCE((SELECT string_agg(a.person_id::text, ',' ORDER BY a.person_id) FROM project_admins a WHERE a.project_id = p.id), '') || '|' || \
+             COALESCE((SELECT string_agg(m.person_id::text || ':' || m.group_id::text, ',' ORDER BY m.person_id, m.group_id) \
+                       FROM group_members m JOIN groups g ON g.id = m.group_id WHERE g.project_id = p.id), '')), \
+             (SELECT v.access FROM view_access v WHERE v.project_id = p.id) \
+         FROM projects p WHERE p.id = $1",
+    )
+    .bind(project)
+    .fetch_optional(&hub.db)
+    .await?;
+    let Some((access, recorded)) = row else { return Ok(()) };
+    if recorded.as_deref() == Some(access.as_str()) {
+        return Ok(());
+    }
+    let now = veil_core::now_millis();
+    // Recorded by one server (the first look records only: nothing was
+    // written under an access before it).
+    let changed: bool = match &recorded {
+        None => {
+            sqlx::query("INSERT INTO view_access (project_id, access, changed_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+                .bind(project)
+                .bind(&access)
+                .bind(now)
+                .execute(&hub.db)
+                .await?;
+            false
+        }
+        Some(old) => sqlx::query("UPDATE view_access SET access = $2, changed_at = $3 WHERE project_id = $1 AND access = $4")
+            .bind(project)
+            .bind(&access)
+            .bind(now)
+            .bind(old)
+            .execute(&hub.db)
+            .await?
+            .rows_affected()
+            == 1,
+    };
+    if changed {
+        let keys = crate::derive::view_keys(hub, project).await?;
+        drop_out_of_use(hub, project, &keys, now).await?;
+    }
+    Ok(())
+}
+
+/// Drop the kept blames, too-wide records and kept cursors of `project`'s
+/// view keys not in `in_use`, written before `before` (milliseconds).
+async fn drop_out_of_use(hub: &crate::Hub, project: i64, in_use: &HashSet<String>, before: i64) -> Result<()> {
+    let keys: Vec<&str> = in_use.iter().map(String::as_str).collect();
+    for table in ["blame_memo", "blame_ends", "log_cursors"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE project_id = $1 AND view_key <> ALL($2::text[]) AND created_at < $3"))
+            .bind(project)
+            .bind(&keys)
+            .bind(before)
+            .execute(&hub.db)
+            .await?;
+    }
+    Ok(())
+}
+
+/// How a job's computing ended: kept or not plain text, or too wide (the
+/// message, and the path keys its walk reached).
+enum Outcome {
+    Done(bool),
+    TooWide(String, Vec<String>),
 }
 
 /// The job, under its key's lease (`blame_jobs`: one server at a time),
@@ -1247,7 +1440,7 @@ async fn leased_job(
         .bind(key.3)
         .bind(key.4.hex())
         .bind(&holder)
-        .bind(now + JOB_LEASE.as_millis() as i64)
+        .bind(now + limits.lease.as_millis() as i64)
         .bind(now)
         .fetch_optional(&hub.db)
         .await?;
@@ -1276,17 +1469,17 @@ async fn leased_job(
             return ended(end);
         }
     };
-    let lease = Arc::new(Lease::new(taken));
+    let lease = Arc::new(Lease::new(taken, limits.lease));
     let renew = {
         let (hub, key, holder, lease) = (hub.clone(), key.clone(), holder.clone(), lease.clone());
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(JOB_RENEW).await;
+                tokio::time::sleep(limits.lease / 4).await;
                 let now = veil_core::now_millis();
                 let r = sqlx::query(
                     "UPDATE blame_jobs SET expires_at = $1 WHERE project_id = $2 AND view_key = $3 AND path_key = $4 AND follow = $5 AND snapshot = $6 AND holder = $7",
                 )
-                .bind(now + JOB_LEASE.as_millis() as i64)
+                .bind(now + limits.lease.as_millis() as i64)
                 .bind(key.0)
                 .bind(&key.1)
                 .bind(&key.2)
@@ -1296,7 +1489,7 @@ async fn leased_job(
                 .execute(&hub.db)
                 .await;
                 match r {
-                    Ok(r) if r.rows_affected() == 1 => lease.until.store(now + (JOB_LEASE - JOB_MARGIN).as_millis() as i64, std::sync::atomic::Ordering::Relaxed),
+                    Ok(r) if r.rows_affected() == 1 => lease.until.store(now + lease.span, std::sync::atomic::Ordering::Relaxed),
                     // Taken over: stop now. (A failed statement leaves the
                     // job until its lease's end, less the margin.)
                     Ok(_) => {
@@ -1308,10 +1501,10 @@ async fn leased_job(
             }
         })
     };
-    let r = async {
-        let _slot = hub.query.jobs.slots.take(key.0).await;
+    let r: Result<Outcome> = async {
+        let _slot = hub.query.jobs.slots.take(key.0, &key.1).await;
         if let Some(end) = settled(hub, key, limits).await? {
-            return ended(end);
+            return ended(end).map(Outcome::Done);
         }
         if !lease.live() {
             return Err(warming());
@@ -1324,15 +1517,28 @@ async fn leased_job(
             let f = Files::new(&g);
             let mut b = Blamer::new(&f, &t, follow, limits);
             b.lease = Some(lease);
-            Ok(b.blame(&start)?.is_some())
+            match b.blame(&start) {
+                Ok(d) => Ok(Outcome::Done(d.is_some())),
+                Err(Error::Api { code: "too_wide", message, .. }) => {
+                    let mut reached: Vec<String> = b.reached.into_iter().collect();
+                    reached.sort();
+                    Ok(Outcome::TooWide(message, reached))
+                }
+                Err(e) => Err(e),
+            }
         })
         .await
     }
     .await;
     renew.abort();
-    if matches!(r, Err(Error::Api { code: "too_wide", .. })) {
-        record_too_wide(hub, key, limits.held).await?;
-    }
+    let r = match r {
+        Ok(Outcome::TooWide(message, reached)) => {
+            record_too_wide(hub, key, limits, &reached).await?;
+            Err(Error::Api { status: StatusCode::UNPROCESSABLE_ENTITY, code: "too_wide", message })
+        }
+        Ok(Outcome::Done(kept)) => Ok(kept),
+        Err(e) => Err(e),
+    };
     let _ = sqlx::query("DELETE FROM blame_jobs WHERE project_id = $1 AND view_key = $2 AND path_key = $3 AND follow = $4 AND snapshot = $5 AND holder = $6")
         .bind(key.0)
         .bind(&key.1)
@@ -1342,6 +1548,8 @@ async fn leased_job(
         .bind(&holder)
         .execute(&hub.db)
         .await;
+    // Rows of view keys out of use since the access changed (BUG-1413).
+    sweep_keys(hub, key.0).await?;
     r
 }
 
@@ -1544,21 +1752,24 @@ pub fn history_page(
 mod tests {
     use super::*;
 
-    /// BUG-1306: a freed slot goes to the next project in turn, not to the
-    /// project that queued the most first.
+    /// BUG-1306 and BUG-1410: a freed slot goes to the next project in
+    /// turn, and within a project to the next view key in turn, not to
+    /// whoever queued the most first.
     #[test]
-    fn slots_go_to_projects_in_turn() {
+    fn slots_go_to_projects_and_view_keys_in_turn() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            let slots = Arc::new(Slots { state: std::sync::Mutex::new(SlotState { free: 1, queues: Default::default(), last: i64::MIN }) });
-            let held = slots.take(1).await;
+            let slots = Arc::new(Slots::new(1));
+            let held = slots.take(1, "a").await;
             let order = Arc::new(std::sync::Mutex::new(Vec::new()));
             let mut tasks = Vec::new();
-            for p in [1, 1, 1, 2, 3] {
+            // Project 1: three jobs of key "a", then one of "b" and one of
+            // "c"; then project 2 and project 3, one job each.
+            for (p, k) in [(1, "a"), (1, "a"), (1, "a"), (1, "b"), (1, "c"), (2, "a"), (3, "z")] {
                 let (slots, order) = (slots.clone(), order.clone());
                 tasks.push(tokio::spawn(async move {
-                    let s = slots.take(p).await;
-                    order.lock().unwrap().push(p);
+                    let s = slots.take(p, k).await;
+                    order.lock().unwrap().push(format!("{p}{k}"));
                     drop(s);
                 }));
                 tokio::task::yield_now().await;
@@ -1567,19 +1778,19 @@ mod tests {
             for t in tasks {
                 t.await.unwrap();
             }
-            assert_eq!(*order.lock().unwrap(), vec![2, 3, 1, 1, 1]);
+            assert_eq!(*order.lock().unwrap(), ["2a", "3z", "1b", "1c", "1a", "1a", "1a"]);
             assert_eq!(slots.state.lock().unwrap().free, 1, "every slot given back");
         });
     }
 
     /// BUG-1307: a lease not renewed stops being live before it ends (less
-    /// the margin), and a lost one at once.
+    /// a sixth of it), and a lost one at once.
     #[test]
     fn a_lease_not_renewed_is_not_live() {
         let now = veil_core::now_millis();
-        assert!(Lease::new(now).live());
-        assert!(!Lease::new(now - (JOB_LEASE - JOB_MARGIN).as_millis() as i64).live());
-        let l = Lease::new(now);
+        assert!(Lease::new(now, JOB_LEASE).live());
+        assert!(!Lease::new(now - (JOB_LEASE - JOB_LEASE / 6).as_millis() as i64, JOB_LEASE).live());
+        let l = Lease::new(now, JOB_LEASE);
         l.lost.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(!l.live());
     }
