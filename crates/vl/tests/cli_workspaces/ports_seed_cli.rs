@@ -413,7 +413,7 @@ fn hostile_seeds_are_refused_before_anything_runs() {
         (format!("{sd}:/"), "whole machine"),
         (format!("{sd}:{}", t.proj.display()), "project"),
         (format!("{sd}:{}", t.proj.join("db").display()), "project"),
-        (format!("{sd}"), "SRC:DEST"),
+        (sd.clone(), "SRC:DEST"),
         (format!("{sd}:/a:/b"), "SRC:DEST"),
     ];
     for (spec, why) in &cases {

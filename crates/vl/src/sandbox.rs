@@ -406,6 +406,7 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
     let (co, kept, injection) = {
         let _umask = PrivateUmask::set();
         private_dir(&paths.files)?;
+        prefetch_sync(&ctx.repo, m.tree.as_ref(), &synced, set.as_ref())?;
         let co = core::sync_to(&ctx.repo, &fs, &mut m, &synced, set.as_ref(), &mut cache)?;
         core::vouch_written(ctx.repo.store(), &fs, &synced, &co, &mut cache, core::VouchWait::IfCheaper)?;
         if let SetAside::Reimport {
@@ -606,6 +607,36 @@ impl crate::ws_socket::Around for MidRun {
             let _ = paths.save_manifest(&m);
         }
     }
+}
+
+/// In a thin clone, fetch what syncing the sandbox from tree `from` to `to`
+/// reads, in batches (as a checkout of the project directory does), and
+/// only within the sparse set: a lost server fails here, before the sandbox
+/// is touched, and a large sandbox is not fetched a file per request.
+fn prefetch_sync(repo: &Repo, from: Option<&ObjectId>, to: &ObjectId, set: Option<&SparseSet>) -> Result<()> {
+    let store = repo.store();
+    if !store.is_partial() {
+        return Ok(());
+    }
+    let Some(set) = set else {
+        return Ok(store.prefetch_diff(from, to)?);
+    };
+    let mut files = Vec::new();
+    for p in set.paths() {
+        let old = match from {
+            Some(f) => veil_core::tree::lookup(store, f, p)?,
+            None => None,
+        };
+        match veil_core::tree::lookup(store, to, p)? {
+            Some(e) if e.kind == veil_core::object::EntryKind::Dir => {
+                let old = old.filter(|o| o.kind == veil_core::object::EntryKind::Dir).map(|o| o.id);
+                store.prefetch_diff(old.as_ref(), &e.id)?;
+            }
+            Some(e) if old.as_ref().map(|o| o.id) != Some(e.id) => files.push((e.id, e.size)),
+            _ => {}
+        }
+    }
+    Ok(store.prefetch(files)?)
 }
 
 /// The error of a run whose output could not be recorded: it stays.

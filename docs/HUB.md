@@ -2898,9 +2898,11 @@ protocol or server change.
   private mountpoint under `$XDG_RUNTIME_DIR`, bound at the project's path
   when confined), started for the run and unmounted after it, or the mount
   `vl ws mount` already serves. Without FUSE (`fuse_available`: the build,
-  `/dev/fuse`, `fusermount3`) the run says so and is checked out; a sparse
-  sandbox (`--only`) in a thin clone fetches only its paths (`SparseView`
-  shows what is outside the set without fetching it).
+  `/dev/fuse`, `fusermount3`) the run says so and is checked out; in a thin
+  clone the sync fetches what it writes first, in batches, and a sparse
+  sandbox (`--only`) only its paths (`prefetch_sync`; `SparseView` shows
+  what is outside the set without fetching it), so a lost server fails the
+  run before the sandbox is touched.
 * **The workspace socket** (`ws_socket.rs`, `9-confinement.md` item 17):
   named workspaces' runs, mounted or not, get `$VEIL_WORKSPACE_SOCKET` and
   `vl` first on `PATH`; a `vl` inside forwards its arguments; the `vl`
@@ -2913,6 +2915,36 @@ protocol or server change.
   `vl` outside.
 * **`--private-ports`** and **`--seed SRC:DEST`**: `9-confinement.md` items
   15 and 16. `pasta` only (slirp4netns is not used).
+
+#### Measured (2026-11-08)
+
+`server_hub` `workspaces::s8_bench_ready_to_read` through `bench-quiet.sh`
+(the quiet wait ran out: load 64.1 before, 12.0 after, so noisy), a
+release `vl`, the test's debug server, PostgreSQL, ext4 NVMe, no Veil
+daemon (S6). A thin clone holds `main`; the workspace is on a branch it
+never fetched, 100 files a folder.
+
+| Step | 2,000 files | 50,000 files |
+|---|---:|---:|
+| `vl ws new agent -r feature` | 103 ms | 103 ms |
+| `vl ws mount` | 104 ms | 103 ms |
+| `ls wide/` (20 / 500 folders) | 21 ms | 31 ms |
+| first `cat` (one tree, then the folder's files in one request) | 614 ms | 450 ms |
+| **ready, cold** (§4.8: under 2 s) | **841 ms** | **686 ms** |
+| **ready, warm** (mounted again; §4.8: under 300 ms) | **104 ms** | **118 ms** |
+| read 1,000 files of 10 folders, cold | 5.3 s | 4.6 s |
+| `vl ws exec --mount -- cat FILE`, cold / warm | 804 / 103 ms | 1,203 / 103 ms |
+| `vl ws exec` checked out (the fallback), first run | 3.8 s | 164 s |
+
+* Ready is independent of the project's size: nothing proportional to the
+  files or the history is read before the first `cat`.
+* The fallback's numbers are from before its sync fetched in batches
+  (`prefetch_sync`: S3's `prefetch_diff`, within `--only`); it then fetched
+  one file per request. Two later runs, with batches, ran at load 101 and
+  334 to 580 and measured nothing reliable (3,000 files: 60 s, all of it in
+  four batch requests to the debug server); to be measured again on a
+  quiet machine with a release server, as are the cold reads (each folder
+  is two requests to the server, about 230 ms each at that load).
 
 #### Threat review (phase 2's rows 5–7 and 18, and §4.9)
 
