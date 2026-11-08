@@ -1829,7 +1829,7 @@ impl<'a> Builder<'a> {
         if desired.is_public() {
             if let Some(pe) = parent_file {
                 if !self.policy_changed && !self.rescan && pe.id == content && pe.visibility.is_public() && pe.executable == executable {
-                    self.learn(path, meta.as_ref(), content, false, None);
+                    self.learn(path, meta.as_ref(), content, scanned_clean, None);
                     return Ok(Some(pe.clone())); // unchanged; scanned before
                 }
             }
@@ -1895,6 +1895,17 @@ impl<'a> Builder<'a> {
         };
         if let Some(why) = unsealable {
             return self.cannot_seal(path, name, parent_file, format!("{why}; the edit stays local"));
+        }
+        // Unchanged plain content, rescanned (a policy change, a directory
+        // with no stat cache, as one a `ws switch` leaves): the parent's
+        // object at this path, wherever it is held. A thin clone's fetched
+        // file is not local work, and is not copied into the main store
+        // (BUG-1293); new content always is.
+        if let Some(pe) = parent_file {
+            if desired.is_public() && pe.visibility.is_public() && pe.executable == executable && pe.id == content && self.store.has(&content) {
+                self.learn(path, meta.as_ref(), content, scanned_clean, None);
+                return Ok(Some(TreeEntry { name: name.to_string(), ..pe.clone() }));
+            }
         }
         let id = match self.store.store_file(&data, &desired) {
             Ok(id) => id,

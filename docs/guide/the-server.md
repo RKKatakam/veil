@@ -189,11 +189,42 @@ see what.
 ## Cloning, pulling and pushing
 
 ```sh
-vl clone veil://127.0.0.1:8443/acme
+vl clone veil://127.0.0.1:8443/acme                       # thin: the tips and what it checks out
+vl clone veil://127.0.0.1:8443/acme --full                # every snapshot and file you may see
 vl clone veil://127.0.0.1:8443/acme acme-billing --only billing
 vl pull
 vl push
 ```
+
+### Thin clones
+
+`vl clone` is **thin** by default: it fetches the branch tips and the
+files of the branch it checks out (`main`), and nothing of the history
+below. Everything else comes from the server the first time something
+reads it: `vl show` of an old change, `vl diff` against one, moving the
+working copy to another revision. `vl log` shows the whole history, page
+by page from the server, and keeps what it fetched. Status, commits and
+pushes work as in a full clone, and a large project clones in seconds.
+
+- **Always connected.** A thin clone has no offline mode: a command that
+  needs something it has not fetched, while the server cannot be reached,
+  fails and says so (`the Veil server could not be reached: …`) before it
+  changes anything. Nothing is ever shown as hidden because it was not
+  fetched. What you already have keeps working: `vl status`, `vl commit`,
+  `vl diff` of your own changes.
+- **A bounded cache.** Fetched files and folders are kept in `.veil/cache/`,
+  at most 4 GiB by default (`vl clone --cache-size 8G`, or later `vl partial
+  limit 8G`). The oldest are evicted when it fills; what your working copies
+  hold, and everything you made yourself, never are. A checkout larger than
+  the cache is refused with a message, never evicted in a loop.
+- **You still receive only what you may see**, file by file: the clone asks
+  only for what it met in the folders the server gave it, and the server
+  checks every request.
+- `vl partial status` shows the cache and what is pinned; `vl partial full`
+  fetches everything and makes the clone a full one (format 8).
+- A thin clone is repository format 9: a `vl` older than this one refuses
+  it rather than misreading it. `--only` clones are not thin (they keep
+  every snapshot, and only their directory's files).
 
 - **You receive only what you may see.** Folders you cannot see are not in
   your clone at all: no files, no names, no history of changes that touched

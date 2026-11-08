@@ -60,19 +60,23 @@ pub fn verdict(code: i32) -> Verdict {
 }
 
 /// The candidates for `bad` given `good`: children before parents.
+///
+/// Exact (a full clone's answer, BUG-1262): the history index's range from
+/// `bad` down to the good snapshots, so a thin clone pages in only the
+/// range it searches; in the held order (all of it is held by then).
 pub fn candidates(repo: &Repo, bad: &ObjectId, good: &[ObjectId]) -> Result<Vec<ObjectId>> {
-    let mut excluded: HashSet<ObjectId> = HashSet::new();
     for g in good {
-        excluded.extend(repo.ancestors(g)?);
+        if repo.is_ancestor(bad, g)? {
+            return Err(VeilError::Revset(format!(
+                "the bad snapshot {} is an ancestor of (or is) a good one: nothing to search",
+                bad.short()
+            )));
+        }
     }
-    if excluded.contains(bad) {
-        return Err(VeilError::Revset(format!(
-            "the bad snapshot {} is an ancestor of (or is) a good one: nothing to search",
-            bad.short()
-        )));
-    }
-    excluded.insert(repo.root_id());
-    Ok(repo.topo_children_first([*bad])?.into_iter().filter(|id| !excluded.contains(id)).collect())
+    let mut exclude = good.to_vec();
+    exclude.push(repo.root_id());
+    let set = repo.exact().range(&[*bad], &exclude)?;
+    Ok(repo.held().topo_children_first([*bad])?.into_iter().filter(|id| set.contains(id)).collect())
 }
 
 /// How many of `set` each member of `set` has among its ancestors (itself

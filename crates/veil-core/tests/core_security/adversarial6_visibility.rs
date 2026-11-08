@@ -99,7 +99,7 @@ fn mallory_relabels(hub: Arc<MemoryBackend>, alice_main: ObjectId, prepare: impl
     remote::pull(&mut m, "origin", hub.clone()).unwrap();
     let audience = prepare(&m);
     let store = m.store().clone();
-    let root_tree = store.snapshot(&alice_main).unwrap().tree;
+    let root_tree = m.snapshot(&alice_main).unwrap().tree;
     let mut root = (*store.tree(&root_tree).unwrap()).clone();
     let secrets_id = root.get("secrets").unwrap().id;
     let mut secrets = (*store.tree(&secrets_id).unwrap()).clone();
