@@ -1110,6 +1110,10 @@ fn bug_1272_a_stack_of_changes_in_a_big_folder_stays_within_the_batch_bound() {
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["landing::big_folder_stacks_in_a_child", "--exact", "--include-ignored", "--nocapture", "--test-threads", "1"])
         .env("VEIL_S17_CHILD", "1")
+        // What the child's own crafting freed goes back to the system
+        // before it measures (S17 cycle 3 review: glibc kept it, the
+        // service's growth fitted in it unseen, and the child said 0 MiB).
+        .env("VEIL_S17_TRIM", "1")
         .env("MALLOC_ARENA_MAX", "2")
         .output()
         .unwrap();
@@ -1194,6 +1198,14 @@ fn big_folder_stacks_in_a_child() {
     // Main moves first, so both stacks are made again on it.
     let atok = p.admin.token();
     let a = land(&api, &atok, &p.name, tip_for(&hub, &atok, &p.name), json!([put("src/admin.rs", "admin\n")]), false).json();
+    if std::env::var_os("VEIL_S17_TRIM").is_some() {
+        // What the test's own crafting freed goes back to the system, so
+        // the service's growth is not hidden in it (S17 cycle 3 review).
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        unsafe { malloc_trim(0) };
+    }
     std::fs::write("/proc/self/clear_refs", "5").unwrap();
     let (start, _) = rss();
     let trees0 = hub.hub().trees.stats().weight;
@@ -1342,4 +1354,468 @@ fn bug_1275_a_submit_on_a_tip_read_or_its_own_last_landing_never_walks_the_branc
         assert_eq!(r.json()["state"], "landed", "{}", String::from_utf8_lossy(&r.body));
     }
     assert_eq!(walks() - walks0, 0, "a submit on a tip read, or on a landing, asked the graph or walked");
+}
+
+// ---------------------------------------------------------------------
+// S17 cycle 3 review (docs/BUGS.md, "S17 cycle 3"): guarantees 1–5 of the
+// cycle-2 fixes.
+
+/// A branch update as `token`'s owner (an admin here) sends it, naming
+/// snapshots the server holds (no upload): create (`expected` None), move,
+/// force, or delete (`new` None).
+fn move_branch(api: &Api, token: &str, project: &str, branch: &str, expected: Option<ObjectId>, new: Option<ObjectId>, force: bool) -> Value {
+    let r = api.post_json(
+        Some(token),
+        &format!("/v1/projects/{project}/push"),
+        &json!({"updates": [{"branch": branch, "expected": expected.map(|e| e.hex()), "new": new.map(|n| n.hex())}], "force": force, "receipts": {}}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    assert_eq!(v["results"][0]["ok"], true, "the move of {branch}: {v}");
+    v
+}
+
+/// Submit edits on `base` to land on `branch`, waiting.
+fn land_on(api: &Api, token: &str, project: &str, branch: &str, base: ObjectId, edits: Value) -> Value {
+    let r = api.post_json(
+        Some(token),
+        &format!("/v1/projects/{project}/land"),
+        &json!({"onto": branch, "base": base.hex(), "edits": edits, "description": "a landing", "wait": true}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    r.json()
+}
+
+/// The last snapshot an answer says landed (as its submitter sees it).
+fn last_landed(v: &Value) -> ObjectId {
+    serde_json::from_value(v["landed"].as_array().unwrap().last().unwrap().clone()).unwrap()
+}
+
+/// Is `path` in the real tree of `branch`'s tip?
+fn on_branch_file(hub: &TestHub, project: i64, branch: &str, path: &str) -> bool {
+    let h = hub.hub();
+    let t: String = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2").bind(project).bind(branch).fetch_one(&h.db))
+        .unwrap();
+    let src = source(hub, project);
+    let mut id = src.snapshot(&ObjectId::from_hex(&t).unwrap()).unwrap().tree;
+    let parts: Vec<&str> = path.split('/').collect();
+    for part in parts {
+        let O::Tree(t) = O::decode(&src.raw(&id).unwrap()).unwrap() else { return false };
+        let Some(e) = t.get(part) else { return false };
+        id = e.id;
+    }
+    true
+}
+
+/// Guarantee 5: a branch deleted and made again starts a new history. The
+/// service's record of what it landed on the old one (`landings`, keyed by
+/// the branch's name) must not make a submit take a change of the old
+/// history for one the new branch holds: the dev's change A, landed on the
+/// old `feat` only, must land with B (made on A), or B must be refused;
+/// never "landed" without A.
+#[test]
+#[ignore = "BUG-1300: a landings row outlives the branch history it describes (deleted and made again): B lands without A, answered landed"]
+fn bug_1300_a_branch_made_again_never_takes_the_old_branch_s_landings_for_its_history() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let atok = p.admin.token();
+    let t0 = tip_for(&hub, &atok, &p.name);
+    move_branch(&api, &atok, &p.name, "feat", None, Some(t0), false);
+    let token = p.dev.token();
+    let feat0 = api.tips(Some(&token), &p.name).unwrap().branches["feat"];
+    let a = land_on(&api, &token, &p.name, "feat", feat0, json!([put("src/feat-a.rs", "a\n")]));
+    assert_eq!(a["state"], "landed", "{a}");
+    let a_id = last_landed(&a);
+    assert!(on_branch_file(&hub, pid, "feat", "src/feat-a.rs"));
+    // The dev keeps A on a branch of their own (as `vl push` of their work
+    // does), so they can still name it.
+    move_branch(&api, &token, &p.name, "dev-keep", None, Some(a_id), false);
+    // The admin deletes feat, and makes it again on main's tip.
+    let feat = api.tips(Some(&atok), &p.name).unwrap().branches["feat"];
+    move_branch(&api, &atok, &p.name, "feat", Some(feat), None, false);
+    move_branch(&api, &atok, &p.name, "feat", None, Some(t0), false);
+    assert!(!on_branch_file(&hub, pid, "feat", "src/feat-a.rs"));
+    // The dev's next change, B on A, lands on the new feat.
+    let b = land_on(&api, &token, &p.name, "feat", a_id, json!([put("src/feat-b.rs", "b\n")]));
+    assert_eq!(b["state"], "landed", "{b}");
+    assert!(on_branch_file(&hub, pid, "feat", "src/feat-b.rs"), "{b}");
+    assert!(
+        on_branch_file(&hub, pid, "feat", "src/feat-a.rs"),
+        "the new feat got B without A (A was landed only on the old feat), and the answer says landed: {b}"
+    );
+}
+
+/// Guarantee 1 (an admin's forced push removes a landed change): what a
+/// stack on the removed change lands must not depend on whether the
+/// service's record of it is younger than a day. The same sequence twice:
+/// with the record (the change under B is taken as on the branch and left
+/// out), and with the record gone, as it is a day later (`clean`): the
+/// change under B lands again with it.
+#[test]
+#[ignore = "BUG-1300: after a forced move, a stack on a removed landing drops it for a day, then lands it again"]
+fn bug_1300_after_a_forced_move_a_stack_lands_the_same_however_old_the_service_s_record() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let atok = p.admin.token();
+    let token = p.dev.token();
+    let mut kept = Vec::new();
+    for (round, forget) in [(1, false), (2, true)] {
+        let t = tip_for(&hub, &atok, &p.name);
+        let a = land(&api, &token, &p.name, tip_for(&hub, &token, &p.name), json!([put(&format!("src/forced-a{round}.rs"), "a\n")]), true).json();
+        assert_eq!(a["state"], "landed", "{a}");
+        let a_id = last_landed(&a);
+        // The admin's forced push takes A away.
+        move_branch(&api, &atok, &p.name, "main", Some(tip_for(&hub, &atok, &p.name)), Some(t), true);
+        assert!(!on_branch_file(&hub, pid, "main", &format!("src/forced-a{round}.rs")));
+        // Someone else's landing after it (so the service reads the moved
+        // tip; BUG-1304).
+        let o = land(&api, &atok, &p.name, tip_for(&hub, &atok, &p.name), json!([put(&format!("src/other{round}.rs"), "o\n")]), true).json();
+        assert_eq!(o["state"], "landed", "{o}");
+        if forget {
+            // A day later: `clean` removed the service's record.
+            let h = hub.hub();
+            hub.rt.block_on(sqlx::query("DELETE FROM landings WHERE project_id = $1").bind(pid).execute(&h.db)).unwrap();
+        }
+        let b = land(&api, &token, &p.name, a_id, json!([put(&format!("src/forced-b{round}.rs"), "b\n")]), true).json();
+        assert_eq!(b["state"], "landed", "{b}");
+        assert!(on_branch_file(&hub, pid, "main", &format!("src/forced-b{round}.rs")), "{b}");
+        kept.push(on_branch_file(&hub, pid, "main", &format!("src/forced-a{round}.rs")));
+    }
+    assert_eq!(
+        kept[0], kept[1],
+        "the removed change under B: landed again with B {} the record a day old, {} it is fresh",
+        if kept[1] { "once" } else { "not even once" },
+        if kept[0] { "and also while" } else { "but not while" }
+    );
+}
+
+/// Guarantee 2 (the BUG-1111 refusal itself): a change that touched only
+/// folders the dev cannot see is not in their history at all
+/// (docs/VISIBILITY.md). The answer to landing a branch must be the same
+/// whether or not such a change is below what they can see of it.
+#[test]
+#[ignore = "BUG-1301: the BUG-1111 refusal tells the submitter a change they cannot see is below their change"]
+fn bug_1301_a_landing_answer_never_tells_whether_a_hidden_change_is_below() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let invoice = format!("{BILL_DIR}/acme/invoice.txt");
+    // The admin's branch with a billing-only change, then one in src/.
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file(&invoice, "the admin's hidden edit\n");
+    let r = c.push_to("with-hidden", None);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let mut c = Craft::new(&api, &p.admin, &p.name, "with-hidden");
+    c.file("src/visible-1.rs", "1\n");
+    let r = c.push("with-hidden", "visible 1");
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    // And one with the src/ change only.
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file("src/visible-2.rs", "2\n");
+    let r = c.push_to("without", None);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    // The dev sees each branch as one change of src/ on main.
+    let token = p.dev.token();
+    let tips = api.tips(Some(&token), &p.name).unwrap().branches;
+    let without = land_held(&api, &token, &p.name, tips["without"], true);
+    assert_eq!(without.status, 200, "{}", String::from_utf8_lossy(&without.body));
+    let without = without.json();
+    assert_eq!(without["state"], "landed", "{without}");
+    let with = land_held(&api, &token, &p.name, tips["with-hidden"], true);
+    let body = String::from_utf8_lossy(&with.body).to_string();
+    assert!(!body.contains(BILL_DIR), "{body}");
+    assert_eq!(with.status, 200, "the answer differs because of a change the dev cannot see: {} {body}", with.status);
+    assert_eq!(with.json()["state"], without["state"], "the answer differs because of a change the dev cannot see: {body}");
+}
+
+/// Guarantee 1: a fix on top of a conflicted change that is not a merge
+/// of the branch stays `conflict` (the conflicted change is still in its
+/// stack); the merge-in fix lands (bug_1271).
+#[test]
+fn a_fix_on_top_of_a_conflicted_change_that_is_not_a_merge_stays_conflict() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let base = tip_for(&hub, &token, &p.name);
+    let mine = kept_change(&api, &token, &p.name, base, json!([put("src/lib.rs", "the dev's\n")]));
+    write_files(&p.dir, &[("src/lib.rs", "the admin's\n")]);
+    p.admin.commit_main(&p.dir, "the admin's lib.rs");
+    p.admin.ok(&p.dir, &["push"]);
+    let r = land_held(&api, &token, &p.name, mine, true).json();
+    assert_eq!(r["state"], "conflict", "{r}");
+    // A fix on top that edits the file again, without merging main.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.root = c.tree_of(mine);
+    c.tip = mine;
+    c.file("src/lib.rs", "the dev's, fixed\n");
+    c.file("src/fix.rs", "fix\n");
+    let v = land_crafted(c, vec![mine], true).json();
+    assert_eq!(v["state"], "conflict", "{v}");
+    assert_eq!(real_file(&hub, pid, "src/lib.rs").as_deref(), Some(&b"the admin's\n"[..]));
+    assert!(real_file(&hub, pid, "src/fix.rs").is_none());
+}
+
+/// Guarantee 3 on the merge-in route (BUG-1271): a non-admin who may edit
+/// `.veilrules` cannot change the default branch's rules by merging main
+/// into a change of theirs from before the rules (its first parent; it has
+/// no `.veilrules`, so every parent's rules count as "the same" at the
+/// push's check, as in bug_1102): the merge lands as its edits against
+/// main, which remove the rules, and is refused.
+#[test]
+fn a_merge_in_fix_never_lets_a_non_admin_change_the_default_branch_rules() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    p.admin.ok(&p.dir, &["access", ".veilrules", "devs"]);
+    p.admin.commit_main(&p.dir, "devs may edit the rules file");
+    p.admin.ok(&p.dir, &["push"]);
+    let token = p.dev.token();
+    let base = tip_for(&hub, &token, &p.name);
+    // The dev's change of src/lib.rs from before the rules, kept.
+    let mine = kept_change(&api, &token, &p.name, base, json!([put("src/lib.rs", "the dev's\n")]));
+    write_files(&p.dir, &[(".veilrules", "[branches.release]\nprotected = true\n"), ("src/lib.rs", "the admin's\n")]);
+    p.admin.commit_main(&p.dir, "the rules, and the admin's lib.rs");
+    p.admin.ok(&p.dir, &["push"]);
+    let main_now = tip_for(&hub, &token, &p.name);
+    // The merge-in fix: main merged into the dev's change, keeping that
+    // side's (absent) rules.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.root = c.tree_of(mine);
+    c.tip = mine;
+    c.file("src/lib.rs", "both\n");
+    let r = land_crafted(c, vec![mine, main_now], true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "rejected", "{body}");
+    assert!(body.contains("only admins may change the branch rules"), "{body}");
+    assert_eq!(tip_for(&hub, &token, &p.name), main_now, "{body}");
+}
+
+/// Guarantee 2 on the merge-in route: a merge of main into someone else's
+/// change with a billing edit (the dev reads src/, not billing) is refused
+/// at the push's check, naming nothing under billing.
+#[test]
+fn a_merge_in_of_a_change_with_hidden_edits_names_no_hidden_path() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name]);
+    let invoice = format!("{BILL_DIR}/acme/invoice.txt");
+    let mut c = Craft::new(&api, &p.fin, &p.name, "main");
+    c.file(&invoice, "fin's edit\n");
+    c.file("src/lib.rs", "fin's lib\n");
+    let r = c.push_to("fin-wip", None);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    write_files(&p.dir, &[("src/lib.rs", "the admin's lib\n")]);
+    p.admin.commit_main(&p.dir, "the admin's lib.rs");
+    p.admin.ok(&p.dir, &["push"]);
+    let token = p.dev.token();
+    let theirs = api.tips(Some(&token), &p.name).unwrap().branches["fin-wip"];
+    let main_now = tip_for(&hub, &token, &p.name);
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.root = c.tree_of(theirs);
+    c.tip = theirs;
+    c.file("src/lib.rs", "both libs\n");
+    let r = land_crafted(c, vec![theirs, main_now], true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 403, "{body}");
+    assert!(body.contains("combines changes in folders you cannot see"), "{body}");
+    assert!(!body.contains(BILL_DIR), "{body}");
+    assert_eq!(tip_for(&hub, &token, &p.name), main_now, "{body}");
+}
+
+/// Pre-existing (S17 cycle 1): a batch that lands nothing commits its
+/// answers without checking that the branch is still at the tip it judged
+/// them on (only a batch that moves the branch compares). After a move the
+/// service did not make (a plain push to an unprotected branch, an admin's
+/// forced push), a change made on the new tip is answered `conflict`
+/// against the old one, though it lands on the branch as it is.
+#[test]
+#[ignore = "BUG-1304: a batch that moves nothing commits answers judged on the service's cached tip"]
+fn bug_1304_a_change_made_on_a_tip_the_service_did_not_make_is_judged_on_that_tip() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    // A landing starts main's service (it keeps main's tip in memory).
+    let a = land(&api, &token, &p.name, tip_for(&hub, &token, &p.name), json!([put("src/started.rs", "s\n")]), true).json();
+    assert_eq!(a["state"], "landed", "{a}");
+    // The admin pushes main (unprotected) directly: an edit of src/lib.rs.
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file("src/lib.rs", "the admin's\n");
+    let r = c.push("main", "a direct push");
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    // The dev edits src/lib.rs on that tip, at once (the service is still
+    // running, `IDLE`).
+    let v = land(&api, &token, &p.name, tip_for(&hub, &token, &p.name), json!([put("src/lib.rs", "the dev's, on the admin's\n")]), true).json();
+    assert_eq!(v["state"], "landed", "a change made on the branch's tip, answered against a tip the branch left: {v}");
+    assert_eq!(real_file(&hub, pid, "src/lib.rs").as_deref(), Some(&b"the dev's, on the admin's\n"[..]));
+}
+
+/// A chain of `n` new snapshots on `branch`'s tip as `person` sees it,
+/// pushed in one push: each adds `{dir}/{i}.rs` when `dir` is given, else
+/// keeps the tree. The new tip as they see it.
+fn push_chain(api: &Api, person: &Person, project: &str, branch: &str, onto: &str, n: usize, dir: Option<&str>) -> ObjectId {
+    let mut c = Craft::new(api, person, project, onto);
+    let expected = api.tips(Some(&c.token), project).unwrap().branches.get(branch).copied();
+    let mut parent = c.tip;
+    for i in 0..n {
+        if let Some(d) = dir {
+            c.file(&format!("{d}/{i}.rs"), &format!("{i}\n"));
+        }
+        let mut s = Snapshot {
+            parents: vec![parent],
+            change_id: veil_core::ChangeId::random(),
+            tree: c.root,
+            description: Text::Plain(format!("chain {i}")),
+            author: "chain".into(),
+            timestamp: veil_core::now_millis(),
+            predecessors: vec![],
+            conflicts: vec![],
+            embargo: None,
+            signature: None,
+        };
+        s.sign(&c.identity);
+        parent = c.put(O::Snapshot(s));
+    }
+    let up = c.api.upload(&c.token, &c.project, &c.objects);
+    assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+    let receipts = up.json()["receipts"].as_array().unwrap().clone();
+    let map: serde_json::Map<String, Value> = c.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+    let r = c.api.post_json(
+        Some(&c.token),
+        &format!("/v1/projects/{project}/push"),
+        &json!({"updates": [{"branch": branch, "expected": expected.map(|e| e.hex()), "new": parent.hex()}], "receipts": map}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    parent
+}
+
+/// Guarantee 4, the fallback walk: when a submit's base, or a change it
+/// brings, is not in `landings` (older than a day, from before the service
+/// ran, or not on the branch at all) and the derived graph does not hold
+/// the tip (the deriver is behind, or another server's holds the project),
+/// `landing::stack` walks the branch (`sync::is_ancestor`: every snapshot
+/// down to the root when the change is not on it), once per change of the
+/// stack, on the request. Here: main with 5,000 snapshots of history, the
+/// deriver held, and a dev landing their 64-change branch.
+#[test]
+#[ignore = "BUG-1302: a submit walks the branch's whole history once per change it brings when the graph lags"]
+fn bug_1302_a_submit_s_stack_never_walks_the_branch_s_history_per_change() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    // The deriver of the project is held (as by another server's, or
+    // behind): the graph never holds main's tip below.
+    let h = hub.hub();
+    let lock = hub.rt.block_on(async {
+        use sqlx::Connection;
+        let url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+        let mut c = sqlx::PgConnection::connect(&url).await.unwrap();
+        let key: i64 = 0x7665_696c_6472_0000_i64 ^ pid;
+        sqlx::query("SELECT pg_advisory_lock($1)").bind(key).execute(&mut c).await.unwrap();
+        c
+    });
+    let t = std::time::Instant::now();
+    push_chain(&api, &p.admin, &p.name, "main", "main", 5_000, None);
+    eprintln!("5,000 snapshots of history pushed in {:?}", t.elapsed());
+    // The dev's 64 changes on a branch of their own, then landed on main.
+    let token = p.dev.token();
+    let side = push_chain(&api, &p.dev, &p.name, "side", "main", veil_core::hub::land::MAX_LAND_STACK, Some("src/side"));
+    let walks = || h.landing.stats.walks.load(std::sync::atomic::Ordering::Relaxed);
+    let w0 = walks();
+    let t = std::time::Instant::now();
+    let r = land_held(&api, &token, &p.name, side, false);
+    let took = t.elapsed();
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["state"], "queued", "{}", String::from_utf8_lossy(&r.body));
+    eprintln!("the submit of a 64-change stack took {took:?} ({} walks)", walks() - w0);
+    drop(lock);
+    // A submit's own work is bounded by its stack, not by the branch's
+    // history (bug_1275 measured 954 landings/s at 1,000 agents).
+    assert!(took < Duration::from_secs(2), "the submit of a 64-change stack took {took:?} on a branch of 5,000 snapshots ({} walks)", walks() - w0);
+}
+
+/// Guarantee 4, retention: finished queue rows and `landings` rows older
+/// than a day go (`Service::clean`), also while the branch is busy. Here a
+/// backlog of 600 landings, and a row a day old of each table: they must
+/// go before the backlog is landed (clean runs only once the queue is
+/// empty, so at the 1,000- and 10,000-agent loads, never).
+#[test]
+#[ignore = "BUG-1303: clean runs only when the branch's queue is empty: on a busy branch landings and finished rows are never deleted"]
+fn bug_1303_rows_a_day_old_go_while_the_branch_is_busy() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let first = land(&api, &token, &p.name, tip_for(&hub, &token, &p.name), json!([put("src/first.rs", "f\n")]), true).json();
+    assert_eq!(first["state"], "landed", "{first}");
+    let h = hub.hub();
+    // The service stops (idle; its first clean ran), and the lease is held
+    // as nobody's while the old rows and the backlog are made.
+    std::thread::sleep(Duration::from_secs(7));
+    hold(&hub, pid);
+    // A finished row and a `landings` row, each a day and a minute old.
+    let old = veil_core::now_millis() - 24 * 3600 * 1000 - 60_000;
+    hub.rt.block_on(async {
+        sqlx::query("UPDATE landing_queue SET done_at = $2 WHERE project_id = $1 AND ticket = $3").bind(pid).bind(old).bind(first["ticket"].as_str().unwrap()).execute(&h.db).await.unwrap();
+        sqlx::query("INSERT INTO landings (project_id, branch, submitted, landed, at) VALUES ($1, 'main', $2, $2, $3)").bind(pid).bind(ObjectId::hash(b"old").hex()).bind(old).execute(&h.db).await.unwrap();
+    });
+    let base = tip_for(&hub, &token, &p.name);
+    std::thread::scope(|s| {
+        for t in 0..8 {
+            let (api, token, name) = (&api, &token, &p.name);
+            s.spawn(move || {
+                for i in 0..75 {
+                    let r = land(api, token, name, base, json!([put(&format!("src/backlog/{t}-{i:03}.rs"), "b\n")]), false);
+                    assert_eq!(r.json()["state"], "queued", "{}", String::from_utf8_lossy(&r.body));
+                }
+            });
+        }
+    });
+    let count = |q: &str| hub.rt.block_on(sqlx::query_scalar::<_, i64>(q).bind(pid).fetch_one(&h.db)).unwrap();
+    let stale = || {
+        count(&format!("SELECT count(*) FROM landing_queue WHERE project_id = $1 AND done_at < {}", old + 1))
+            + count(&format!("SELECT count(*) FROM landings WHERE project_id = $1 AND at < {}", old + 1))
+    };
+    assert_eq!(stale(), 2);
+    release(&hub, pid);
+    let t = std::time::Instant::now();
+    // Read the old rows first, then the queue: nothing is submitted any
+    // more, so the queue only shrinks, and "the old rows are gone while
+    // entries are still queued" means the clean ran while it was busy.
+    let mut cleaned_while_busy = None;
+    let mut drained = false;
+    while t.elapsed() < Duration::from_secs(120) && !drained {
+        // (No waiter here starts the service: the test does, as a submit
+        // or a waiter's poller would.)
+        {
+            let _rt = hub.rt.enter();
+            veil_server::landing::ensure(&h, pid, "main");
+        }
+        let gone = stale() == 0;
+        let queued = count("SELECT count(*) FROM landing_queue WHERE project_id = $1 AND state = 'queued'");
+        if gone && cleaned_while_busy.is_none() {
+            cleaned_while_busy = Some(queued > 0);
+        }
+        drained = queued == 0;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    eprintln!("the backlog landed after {:?}; the old rows went while entries were queued: {cleaned_while_busy:?}", t.elapsed());
+    assert!(drained, "the backlog landed within 2 minutes");
+    let landed = count("SELECT count(*) FROM landing_queue WHERE project_id = $1 AND state = 'landed'");
+    assert!(landed >= 600, "{landed} landed");
+    assert_eq!(cleaned_while_busy, Some(true), "the day-old rows stayed while the branch was busy (until its queue was empty)");
 }
