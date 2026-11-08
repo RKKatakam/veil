@@ -2629,6 +2629,12 @@ machine (load 13 → 9 and 9 → 11), 2026-11-08; memory is the server's
 | load: database commits per landing, own branches / one `main` (the push's own) | 1.58 / 5.2 | 1.38 / 5.0 |
 | load: storage reads per landing | 0 | 0 |
 
+After S28's cycle 3 (the read and push paths changed: tiled slots, paged
+indexes, the push in a task of its own), `bench-server.sh 1g` @ `7ebc199c`,
+on a busy machine (load 103 → 21, so times are noisy): push 87.8 s and
+890 MiB, full clone 54.5 s and 929 MiB, clone of one directory 8.7 s and
+895 MiB; every case under the gates.
+
 **BUG-1089 and BUG-1000** (bisected: `31639c3` 972 MiB, `d8cf2b2` 967 MiB,
 `b2478b5` 1,356 MiB): objects read from S3 were cached as slices of the HTTP
 client's read buffers, each small object pinning a whole buffer while the
