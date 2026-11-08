@@ -1038,7 +1038,26 @@ impl<'a> Builder<'a> {
                         continue;
                     }
                     let sub = match pdir {
-                        Some(e) => Some((self.store.tree(&e.id)?, e.id)),
+                        Some(e) => match self.store.tree(&e.id) {
+                            Ok(t) => Some((t, e.id)),
+                            // A folder the server refuses (BUG-1508), with
+                            // something in the working copy. Left out by
+                            // checkout, what is there is not an edit of a
+                            // version this reader never saw: the folder is
+                            // carried by id and what is there not recorded.
+                            // Otherwise it cannot be recorded against a
+                            // version this reader cannot read; the folder is
+                            // never left out or emptied either.
+                            Err(err) if crate::tree::refused_tree(self.store, &err) => {
+                                if self.opts.materialised.is_some_and(|m| m.hidden(&path)) {
+                                    self.report.carried.push(path.clone());
+                                    f.out.insert(e.clone());
+                                    continue;
+                                }
+                                return Err(crate::tree::no_access(&path, "the working copy holds files in it (move them out of it to record the rest)"));
+                            }
+                            Err(err) => return Err(err),
+                        },
                         None => None,
                     };
                     let name = name.to_string();

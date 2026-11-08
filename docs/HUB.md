@@ -2918,9 +2918,27 @@ protocol or server change.
     pass reads), merges (the files both sides changed) and `split`/`squash`
     by hunk. The locator keeps one place an object, for readers by id only.
     A batch under a local change is asked under its nearest server
-    ancestor. **Outside this:** a diff whose old side holds a refused
-    folder whose tree this clone does not hold fails with "not present"
-    (BUG-1508, open).
+    ancestor.
+  * **a tree the server refuses is never an error and never silently
+    dropped** (decided, BUG-1508). In a thin clone made before its person
+    lost access to a folder, the folder's tree is refused once it is not
+    held. Readers (`vl show`, `diff`, `log`, `blame`, `grep`, `ls`,
+    `files`, the JSON API and `vl serve`) show it as hidden by the path its
+    parent already named (`redacted bill/`; `hidden` in `veil.diff/2`; a
+    `redacted` directory in `veil.ls`; `hidden_folders` in `vl grep`) and
+    nothing inside it, and succeed (`tree::diff_trees_hiding`,
+    `walk_files_hiding`). Writers carry a refused folder only one side
+    changed by its id without reading it (merge, rebase, the embargo and
+    sealing pass of a merge); a checkout leaves it out of the working copy
+    (`redacted bill/`), removes what it wrote there, and records it, so the
+    builder carries it by id, whatever is left on disk there. One both
+    sides changed (or one a writer must read: a split by hunk, a restore, a
+    working copy folder never left out) is refused by a message naming it
+    and saying the person lacks access, and nothing changes
+    (`tree::no_access`). No writer leaves out or empties it. **Outside
+    this:** what such a clone never fetched of the old view (a snapshot,
+    the root) is not served any more and fails with "not present"
+    (BUG-1509, open; `vl pull` brings the new view).
   * **content already held reads at every path naming it** (decided,
     BUG-1464): removal of access stops new fetches; bytes already on a
     machine stay readable there, at any path naming them, as they are in a

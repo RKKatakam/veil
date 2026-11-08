@@ -1172,8 +1172,8 @@ fn every_reader_by_path_reads_a_readable_copy_of_content_refused_elsewhere() {
         m.unmount();
         assert!(!fetched(t, "src/shared/same.txt"), "the content is not fetched yet");
     }
-    // `vl show` walks the parent's billing folder too: held here, since a
-    // refused folder not held fails the whole diff (BUG-1508, open).
+    // `vl show` reads the parent's snapshot and tree too: held here (what
+    // a clone never fetched of the old view is BUG-1509).
     p.fin.ok(&clones[2], &["ls", "-r", "feature-", BILL_DIR]);
     p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
     let cat = p.fin.ok(&clones[0], &["cat", "-r", "feature", "src/shared/same.txt"]);
@@ -1190,25 +1190,155 @@ fn every_reader_by_path_reads_a_readable_copy_of_content_refused_elsewhere() {
     assert!(log.contains("same content twice"), "vl log -S: {log}");
 }
 
-/// BUG-1508: `vl show` (and `vl diff`) of a change that touches a folder
-/// its person lost access to fails outright in a thin clone whose store
-/// does not hold that folder's tree in the parent: `diff_trees` reads the
-/// parent's tree by id, the server refuses it (rightly), and the refusal is
-/// an error (`object … is not present in this store`), where a full clone
-/// made before the removal shows the diff (S3's guarantee 2) and one made
-/// after it shows the readable files.
+/// BUG-1508, decided: a tree the server refuses is never an error and
+/// never silently dropped. A reader shows a refused folder as hidden, by the
+/// path its parent already named, and nothing inside it. Here: `feature`
+/// changes a folder fin loses access to; fin's thin clone holds the trees
+/// above it (it read a file of `feature` before), not the folder's own.
 #[test]
-#[ignore = "BUG-1508: vl show of a change touching a refused folder fails in a thin clone that does not hold the parent's tree"]
-fn bug_1508_show_fails_on_a_refused_folder_not_held_in_the_parent() {
+fn bug_1508_readers_show_a_refused_folder_as_hidden_and_succeed() {
     const SAME: &str = "SAME-CONTENT-SHOW-1508-2d9a6f41\n";
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
     feature_with(&p, &[("src/shared/same.txt", SAME), (&format!("{BILL_DIR}/acme/same.txt"), SAME)], &[], "same content twice");
-    let thin = thin_with_agent(&p, &hub, &p.fin, "thin");
+    let thin = plain_thin(&p, &hub, "thin");
+    for r in ["feature", "feature-"] {
+        p.fin.ok(&thin, &["cat", "-r", r, "src/lib.rs"]);
+    }
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let hidden_line = format!("redacted {BILL_DIR}/");
+    for args in [vec!["show", "feature"], vec!["diff", "--from", "feature-", "--to", "feature"]] {
+        let out = p.fin.ok(&thin, &args);
+        let hunk = out.split("diff --veil").find(|h| h.contains("b/src/shared/same.txt")).unwrap_or_default();
+        assert!(hunk.contains(SAME.trim()), "vl {args:?}: {out}");
+        assert!(out.contains(&hidden_line), "vl {args:?} names the refused folder: {out}");
+        assert!(!out.contains(&format!("{BILL_DIR}/acme")), "vl {args:?} shows nothing inside the refused folder: {out}");
+    }
+    let json = p.fin.ok(&thin, &["show", "feature", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(json.lines().next().unwrap()).unwrap();
+    assert_eq!(v["diff"]["hidden"], serde_json::json!([format!("{BILL_DIR}/")]), "{json}");
+    let files: Vec<&str> = v["diff"]["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+    assert!(files.contains(&"src/shared/same.txt") && !files.iter().any(|f| f.starts_with(BILL_DIR)), "{files:?}");
+    let ls = p.fin.ok(&thin, &["ls", "-r", "feature"]);
+    assert!(ls.lines().any(|l| l.contains("redacted") && l.contains(&format!("{BILL_DIR}/"))), "vl ls: {ls}");
+    assert!(!ls.contains(&format!("{BILL_DIR}/acme")), "vl ls: {ls}");
+    let log = p.fin.ok(&thin, &["log", "-r", "feature-..feature", "src"]);
+    assert!(log.contains("same content twice"), "vl log: {log}");
+    p.fin.ok(&thin, &["blame", "-r", "feature", "src/shared/same.txt"]);
+    let cat = p.fin.fails(&thin, &["cat", "-r", "feature", &format!("{BILL_DIR}/acme/same.txt")]);
+    assert!(cat.contains("no longer have access") && !cat.contains("not present"), "vl cat: {cat}");
+}
+
+/// BUG-1509: the same, in a thin clone that never fetched what it shows.
+/// Removing fin from `finance` changes fin's projection of history: every
+/// snapshot and every tree above the folder gets a new id in fin's view, and
+/// the clone's ids are the old view's. One it holds reads (and a refused
+/// folder below it is hidden, BUG-1508); one it never fetched (here
+/// `feature`'s parent, needed for `vl show feature`) is no longer served,
+/// and the command fails with "not present", where a clone made after the
+/// removal shows the readable files (`vl pull` brings the new view).
+#[test]
+#[ignore = "BUG-1509: a thin clone made before its person's access changed fails on the history and trees it never fetched"]
+fn bug_1509_a_stale_view_fails_on_what_it_never_fetched() {
+    const SAME: &str = "SAME-CONTENT-ROOT-1509-5b1e7c02\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    feature_with(&p, &[("src/shared/same.txt", SAME), (&format!("{BILL_DIR}/acme/same.txt"), SAME)], &[], "same content twice");
+    let thin = plain_thin(&p, &hub, "thin");
     p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
     let show = p.fin.ok(&thin, &["show", "feature"]);
     let hunk = show.split("diff --veil").find(|h| h.contains("b/src/shared/same.txt")).unwrap_or_default();
     assert!(hunk.contains(SAME.trim()), "vl show: {show}");
+}
+
+/// A thin clone of fin's with no workspace.
+fn plain_thin(p: &Project, hub: &TestHub, name: &str) -> PathBuf {
+    let d = p.fin.dir(name);
+    p.fin.ok(p.fin.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+    p.fin.ok(&d, &["identity", "confirm", &p.fp]);
+    d
+}
+
+/// A thin clone of fin's with change `mine` on `main` (a file in `src/`,
+/// and with `billing`, one in the billing folder too), `@` on top of it,
+/// and `feature`'s root held; then fin loses access to the billing folder,
+/// which `feature` changed.
+fn fin_change_across_a_refused_folder(p: &Project, hub: &TestHub, name: &str, billing: bool) -> PathBuf {
+    let d = plain_thin(p, hub, name);
+    let mut files = vec![("src/mine.txt".to_string(), "fin's change\n".to_string())];
+    if billing {
+        files.push((format!("{BILL_DIR}/acme/mine.txt"), "fin's billing change\n".into()));
+    }
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    write_files(&d, &refs);
+    p.fin.ok(&d, &["commit", "-m", "fin's change"]);
+    p.fin.ok(&d, &["tag", "set", "mine", "-r", "@-"]);
+    p.fin.ok(&d, &["cat", "-r", "feature", "src/lib.rs"]);
+    d
+}
+
+/// The entry at `path` in the tree of what `rev` names in `clone`.
+fn entry_in(clone: &Path, rev: &str, path: &str) -> veil_core::TreeEntry {
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(clone)), None, "test").unwrap();
+    let tree = repo.snapshot(&repo.view().tags[rev].target).unwrap().tree;
+    veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new(path).unwrap()).unwrap().unwrap()
+}
+
+/// What a refused command must leave as it was: the op log's head, the
+/// history and every file of the working copy.
+fn state(p: &Project, clone: &Path) -> (String, String, BTreeMap<String, Vec<u8>>) {
+    let mut files = walk(clone);
+    files.retain(|k, _| !k.starts_with(".veil"));
+    (p.fin.ok(clone, &["op", "log", "-n", "1", "--json"]), p.fin.ok(clone, &["log", "-n", "50", "--json"]), files)
+}
+
+/// BUG-1508, writers: a refused folder only one side changed is carried by
+/// its id without reading it, through a merge and a rebase (exact id
+/// compared), and through the checkout and the snapshots after them.
+#[test]
+fn bug_1508_a_merge_and_a_rebase_keep_a_refused_folder_one_side_changed_by_id() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let (m, r) = (fin_change_across_a_refused_folder(&p, &hub, "merge", false), fin_change_across_a_refused_folder(&p, &hub, "rebase", false));
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let theirs = entry_in(&m, "feature", BILL_DIR);
+    assert_ne!(theirs.id, entry_in(&m, "main", BILL_DIR).id, "feature changed the billing folder");
+    let out = p.fin.ok(&m, &["merge", "feature", "--into", "mine", "-m", "merge across"]);
+    assert!(out.contains("Merged"), "{out}");
+    assert!(out.contains(&format!("redacted {BILL_DIR}/")), "the checkout leaves the folder out: {out}");
+    assert_eq!(entry_in(&m, "mine", BILL_DIR), theirs, "the merge keeps feature's billing folder by id");
+    let out = p.fin.ok(&r, &["rebase", "-s", "mine", "-d", "feature"]);
+    assert!(out.contains("Rebased"), "{out}");
+    assert_eq!(entry_in(&r, "mine", BILL_DIR), theirs, "the rebase keeps feature's billing folder by id");
+    // The working copy carries it as recorded, through every snapshot.
+    for d in [&m, &r] {
+        let st = p.fin.ok(d, &["status"]);
+        assert!(st.contains(BILL_DIR), "vl status names the folder kept as recorded: {st}");
+        std::fs::write(d.join("src/after.txt"), "after\n").unwrap();
+        p.fin.ok(d, &["commit", "-m", "after"]);
+        let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(d)), None, "test").unwrap();
+        let wc = repo.view().workspace("default").unwrap().wc;
+        let tree = repo.snapshot(&repo.snapshot(&wc).unwrap().parents[0]).unwrap().tree;
+        let e = veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new(BILL_DIR).unwrap()).unwrap().unwrap();
+        assert_eq!(e, theirs, "a later commit keeps the folder by id");
+    }
+}
+
+/// BUG-1508, writers: a refused folder both sides changed is refused, by a
+/// message naming it and saying why, and nothing changes.
+#[test]
+fn bug_1508_a_merge_and_a_rebase_refuse_a_refused_folder_both_sides_changed() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let d = fin_change_across_a_refused_folder(&p, &hub, "both", true);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let before = state(&p, &d);
+    for args in [vec!["merge", "feature", "--into", "mine", "-m", "merge across"], vec!["rebase", "-s", "mine", "-d", "feature"]] {
+        let out = p.fin.fails(&d, &args);
+        assert!(out.contains(&format!("{BILL_DIR}/ is a folder you no longer have access to")) && out.contains("nothing was changed"), "vl {args:?}: {out}");
+        assert!(!out.contains("not present"), "vl {args:?}: {out}");
+        assert_eq!(state(&p, &d), before, "vl {args:?} changed the repository");
+    }
 }
 
 /// BUG-1507: `HUB.md` §13.28 says "a refusal hides that path for 10 s, or
@@ -1237,3 +1367,4 @@ fn bug_1507_a_refused_path_stays_hidden_after_its_bytes_are_held() {
     m.unmount();
     assert_eq!(r.as_deref().map_err(|e| e.to_string()), Ok(SAME.as_bytes()), "held bytes, hidden at a path naming them for the rest of the 10 s");
 }
+

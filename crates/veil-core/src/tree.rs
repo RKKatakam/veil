@@ -101,9 +101,39 @@ pub const MAX_TREE_DEPTH: usize = 1024;
 /// directory). Callers that read content check the kind: a symlink's blob
 /// is not file content.
 pub fn walk_files(store: &ObjectStore, root: &ObjectId) -> Result<Vec<(VPath, TreeEntry)>> {
+    walk_files_in(store, root, None)
+}
+
+/// The leaf entries a walk found, and the folders it could not walk.
+pub type WalkHiding = (Vec<(VPath, TreeEntry)>, Vec<VPath>);
+
+/// [`walk_files`] for a reader: a folder whose tree the server refuses (a
+/// thin clone whose person lost access to it) is not walked, listed
+/// instead (BUG-1508), the root included.
+pub fn walk_files_hiding(store: &ObjectStore, root: &ObjectId) -> Result<WalkHiding> {
+    let mut hidden = Vec::new();
+    let files = walk_files_in(store, root, Some(&mut hidden))?;
+    Ok((files, hidden))
+}
+
+fn walk_files_in(store: &ObjectStore, root: &ObjectId, mut hidden: Option<&mut Vec<VPath>>) -> Result<Vec<(VPath, TreeEntry)>> {
     let mut out = Vec::new();
+    let mut open = |id: &ObjectId, path: &VPath| -> Result<Option<Arc<Tree>>> {
+        match store.tree(id) {
+            Ok(t) => Ok(Some(t)),
+            Err(e) if refused_tree(store, &e) => match hidden.as_deref_mut() {
+                Some(h) => {
+                    h.push(path.clone());
+                    Ok(None)
+                }
+                None => Err(no_access(path, "this command needs its content")),
+            },
+            Err(e) => Err(e),
+        }
+    };
+    let Some(top) = open(root, &VPath::root())? else { return Ok(out) };
     // Explicit stack: tree depth is attacker-controlled.
-    let mut stack: Vec<(VPath, Arc<Tree>, usize)> = vec![(VPath::root(), store.tree(root)?, 0)];
+    let mut stack: Vec<(VPath, Arc<Tree>, usize)> = vec![(VPath::root(), top, 0)];
     while let Some((dir, tree, i)) = stack.last_mut() {
         let Some(e) = tree.entries.get(*i) else {
             stack.pop();
@@ -114,8 +144,9 @@ pub fn walk_files(store: &ObjectStore, root: &ObjectId) -> Result<Vec<(VPath, Tr
         match e.kind {
             EntryKind::File | EntryKind::Conflict | EntryKind::Symlink => out.push((p, e.clone())),
             EntryKind::Dir => {
-                let child = store.tree(&e.id)?;
-                stack.push((p, child, 0));
+                if let Some(child) = open(&e.id, &p)? {
+                    stack.push((p, child, 0));
+                }
             }
         }
     }
@@ -141,16 +172,97 @@ impl TreeChange {
 
 /// Leaf-level differences between two trees (files, conflicts, and in
 /// format 5 symlinks). Identical subtrees are skipped
-/// by id without being loaded.
+/// by id without being loaded. For a writer: a folder whose tree the
+/// server refuses (a thin clone whose person lost access to it) is a clear
+/// refusal naming it ([`no_access`]), never "not present"; readers use
+/// [`diff_trees_hiding`].
 pub fn diff_trees(store: &ObjectStore, from: Option<&ObjectId>, to: Option<&ObjectId>) -> Result<Vec<TreeChange>> {
     let mut out = Vec::new();
-    if from == to {
-        return Ok(out);
+    match diff_trees_in(store, from, to, &mut out, None) {
+        Err(Hit::Refused(path)) => Err(no_access(&path, "this command needs its content")),
+        Err(Hit::Error(e)) => Err(e),
+        Ok(()) => Ok(out),
     }
-    let a = from.map(|id| store.tree(id)).transpose()?;
-    let b = to.map(|id| store.tree(id)).transpose()?;
-    diff_dir(store, a, b, &mut out)?;
-    Ok(out)
+}
+
+/// A folder [`diff_trees_hiding`] did not compare: the server refused the
+/// tree of one side (`old` in `from`, `new` in `to`; the directory entries,
+/// whose names the person could already see).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HiddenDir {
+    pub path: VPath,
+    pub old: Option<TreeEntry>,
+    pub new: Option<TreeEntry>,
+}
+
+/// [`diff_trees`] for a reader: a folder whose tree the server refuses is
+/// not compared, listed instead (BUG-1508); nothing inside it is read or
+/// shown. The root itself can be refused (a thin clone made before its
+/// person's access changed, whose root it never fetched): then it is the
+/// one hidden folder.
+pub fn diff_trees_hiding(store: &ObjectStore, from: Option<&ObjectId>, to: Option<&ObjectId>) -> Result<(Vec<TreeChange>, Vec<HiddenDir>)> {
+    let (mut out, mut hidden) = (Vec::new(), Vec::new());
+    match diff_trees_in(store, from, to, &mut out, Some(&mut hidden)) {
+        Err(Hit::Refused(_)) => unreachable!("a hiding diff lists refusals"),
+        Err(Hit::Error(e)) => Err(e),
+        Ok(()) => Ok((out, hidden)),
+    }
+}
+
+/// Did the server refuse this tree to this thin clone? `Missing` while
+/// fetching is the server's own "nothing there for you" (its person lost
+/// access to that folder since its name was met); with fetching off, or in
+/// a full clone, `Missing` is a gap and stays an error.
+pub fn refused_tree(store: &ObjectStore, err: &VeilError) -> bool {
+    matches!(err, VeilError::Missing(_)) && store.may_fetch()
+}
+
+/// The refusal of a writer that needs the content of a folder whose tree
+/// the server refuses (BUG-1508): it names the folder, says why, and that
+/// nothing was changed.
+pub fn no_access(path: &VPath, why: &str) -> VeilError {
+    let shown = if path.is_root() { "/".to_string() } else { format!("{path}/") };
+    VeilError::Policy(format!(
+        "{shown} is a folder you no longer have access to (the server refuses its content) and {why}; nothing was changed. \
+         `vl pull` brings what you may read now"
+    ))
+}
+
+enum Hit {
+    Refused(VPath),
+    Error(VeilError),
+}
+
+impl From<VeilError> for Hit {
+    fn from(e: VeilError) -> Hit {
+        Hit::Error(e)
+    }
+}
+
+fn diff_trees_in(
+    store: &ObjectStore,
+    from: Option<&ObjectId>,
+    to: Option<&ObjectId>,
+    out: &mut Vec<TreeChange>,
+    hidden: Option<&mut Vec<HiddenDir>>,
+) -> std::result::Result<(), Hit> {
+    if from == to {
+        return Ok(());
+    }
+    let root = |id: &ObjectId| TreeEntry::dir("", *id);
+    let a = from.map(|id| store.tree(id)).transpose();
+    let b = to.map(|id| store.tree(id)).transpose();
+    match (a, b) {
+        (Ok(a), Ok(b)) => diff_dir(store, a, b, out, hidden),
+        (Err(e), _) | (_, Err(e)) if refused_tree(store, &e) => match hidden {
+            Some(h) => {
+                h.push(HiddenDir { path: VPath::root(), old: from.map(root), new: to.map(root) });
+                Ok(())
+            }
+            None => Err(Hit::Refused(VPath::root())),
+        },
+        (Err(e), _) | (_, Err(e)) => Err(Hit::Error(e)),
+    }
 }
 
 fn load_dir(store: &ObjectStore, e: Option<&TreeEntry>) -> Result<Option<Arc<Tree>>> {
@@ -178,7 +290,13 @@ fn entry_at(t: &Option<Arc<Tree>>, i: usize) -> Option<&TreeEntry> {
     t.as_ref().and_then(|t| t.entries.get(i))
 }
 
-fn diff_dir(store: &ObjectStore, a: Option<Arc<Tree>>, b: Option<Arc<Tree>>, out: &mut Vec<TreeChange>) -> Result<()> {
+fn diff_dir(
+    store: &ObjectStore,
+    a: Option<Arc<Tree>>,
+    b: Option<Arc<Tree>>,
+    out: &mut Vec<TreeChange>,
+    mut hidden: Option<&mut Vec<HiddenDir>>,
+) -> std::result::Result<(), Hit> {
     // Explicit stack: tree depth is attacker-controlled.
     let mut stack = vec![DiffFrame {
         dir: VPath::root(),
@@ -211,8 +329,17 @@ fn diff_dir(store: &ObjectStore, a: Option<Arc<Tree>>, b: Option<Arc<Tree>>, out
         }
         let name = ea.as_ref().or(eb.as_ref()).map(|e| e.name.as_str()).unwrap_or_default();
         let path = f.dir.join(name);
-        let da = load_dir(store, ea.as_ref())?;
-        let db = load_dir(store, eb.as_ref())?;
+        let (da, db) = match (load_dir(store, ea.as_ref()), load_dir(store, eb.as_ref())) {
+            (Ok(da), Ok(db)) => (da, db),
+            // A folder the server refuses: neither side of it is walked.
+            (Err(e), _) | (_, Err(e)) if refused_tree(store, &e) => {
+                let Some(h) = hidden.as_deref_mut() else { return Err(Hit::Refused(path)) };
+                let dir = |e: &Option<TreeEntry>| e.clone().filter(|e| e.kind == EntryKind::Dir);
+                h.push(HiddenDir { path: path.clone(), old: dir(&ea), new: dir(&eb) });
+                (None, None)
+            }
+            (Err(e), _) | (_, Err(e)) => return Err(Hit::Error(e)),
+        };
         // Every leaf: files, conflicts, and (format 5) symlinks.
         let fa = ea.filter(|e| e.kind != EntryKind::Dir);
         let fb = eb.filter(|e| e.kind != EntryKind::Dir);

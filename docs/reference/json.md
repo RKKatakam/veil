@@ -164,7 +164,7 @@ Content this reader cannot see, and why. It never carries the content.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `reason` | string | `no_key`: cloaked for a scope you hold no key for; `withheld`: a public remote never delivered it; `unwritable` (`status` only): readable, but this filesystem could not hold the file; `missing`: a public object absent from the store (damage, not a redaction: run `vl fsck`); `error`: the store could not read it |
+| `reason` | string | `no_key`: cloaked for a scope you hold no key for; `withheld`: a public remote never delivered it; `unwritable` (`status` only): readable, but this filesystem could not hold the file; `missing`: a public object absent from the store (damage, not a redaction: run `vl fsck`); `error`: the store could not read it; `no_access` (`ls` and `status`): a folder you no longer have access to (a thin clone: the server refuses its content), kept as recorded |
 | `message` | string | The explanation the text output prints (`cloaked:team; no key`) |
 
 ### Signature
@@ -353,6 +353,7 @@ what they change is sealed for you; listed in `entries` only with
 | `stat` | bool | `--stat` was given: every file's `content` is null |
 | `files` | array of [file diffs](#file-diff) | The changed files, in path order |
 | `renames_skipped` | bool *(optional)* | Present (and true) when inexact rename detection was skipped because of its limits (too many files): only exact renames are listed |
+| `hidden` | array of strings *(optional)* | Folders not compared, each as its path and `/` (`/` for the root): in a thin clone, the server refuses their content (you no longer have access to them). Nothing inside them is listed. Absent when none |
 
 ## `veil.show/2`
 
@@ -372,7 +373,7 @@ what they change is sealed for you; listed in `entries` only with
 | `embargo` | object or null | The embargo this merge introduced: `id` (string); `state`: `pending`, `staged` (released here, not pushed yet), `released` or `unknown` (no record of it here); `until` (string or null: when a `pending` embargo is released automatically; null for a manual release) |
 | `conflicts` | array of strings | Paths that still have conflict markers |
 | `description` | string or null | The full description |
-| `diff` | object | The snapshot's changes: `stat` (bool) and `files` (array of [file diffs](#file-diff)), as in [`veil.diff/2`](#veildiff2) |
+| `diff` | object | The snapshot's changes: `stat` (bool), `files` (array of [file diffs](#file-diff)) and `hidden` (optional), as in [`veil.diff/2`](#veildiff2) |
 
 ## `veil.workspace.list/2`
 
@@ -492,7 +493,7 @@ the working copy its local-only files.
 | `all` | bool | `--all`: ignored paths are listed |
 | `entries` | array | In tree order (depth first, by name within a directory), each: |
 | `path` | string | The file (an ignored directory: the directory) |
-| `dir` | bool | An ignored directory, listed as a whole (`--all`; never descended into) |
+| `dir` | bool | A directory listed as a whole, never descended into: an ignored one (`--all`), or a recorded one you no longer have access to (tier `redacted`, `kind` `dir`, reason `no_access`) |
 | `tier` | string | Its [tier](#tier): `public`, `cloaked`, `embargoed`, `redacted`, `isolated`, `quarantined` or `ignored` |
 | `scope` | string or null | The scope of a cloaked file (also when `redacted`) |
 | `recorded` | bool | In the snapshot; false for local-only files |
@@ -503,7 +504,7 @@ the working copy its local-only files.
 | `redaction` | [redaction](#redaction) or null | Why a `redacted` file cannot be read. Never content |
 | `quarantine` | object or null | A `quarantined` file: `rule` (string), `line` (number) and `state` (`never_recorded`, or `held_back`: history keeps the previous, recorded version) |
 | `conflict` | [conflict](#conflict) or null | An unresolved conflict (`conflict: 2 sides` in the text); `tier`, `scope`, `visibility`, `size` and `executable` are those of the file with markers you are shown, `readable` says whether you can read every side |
-| `kind` | string | `file`, `symlink` (repository format 5) or `conflict` |
+| `kind` | string | `file`, `symlink` (repository format 5), `conflict`, or `dir` (a directory listed whole: see `dir`) |
 | `target` | string or null | A symlink's target (`PATH -> TARGET` in the text, escaped), when you can read it; null for a redacted link (its target is sealed content), a local-only link, and anything but a symlink. `size` is the target's length |
 
 ## `veil.resolve.list/2`
@@ -618,7 +619,7 @@ the text only; the document always lists every match.
 | `rev` | [snapshot reference](#snapshot-reference) | The snapshot searched |
 | `matches` | array | Every matching line, by path then line: `path`, `line` (number, from 1), `text` (the line without its break, cut at 1 MiB), `truncated` (bool: it was cut) and `tier` (below) |
 | `files` | array | Every file with a match: `path`, `tier`, `scope` (string or null: of a cloaked file), `count` (number: matching lines, up to `--max-count`), `binary` (bool: its lines are not listed unless `-a`) and `conflict` (bool: an unresolved conflict, searched as the file with markers you are shown) |
-| `skipped` | object | What was not searched: `sealed` (files you cannot read), `binary` (binary files that matched, lines not listed), `too_large` (files over 256 MiB) |
+| `skipped` | object | What was not searched: `sealed` (files you cannot read), `binary` (binary files that matched, lines not listed), `too_large` (files over 256 MiB), and `hidden_folders` (folders you no longer have access to, in a thin clone; absent when none) |
 | `searched` | number | Files of the snapshot considered |
 
 `tier` is `public`, `cloaked` (a sealed secret file, and you hold the

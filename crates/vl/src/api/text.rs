@@ -357,9 +357,16 @@ fn log_entry(e: &LogEntry, lanes: &mut Vec<Option<ObjectId>>) {
 /// `vl diff` of the changes between two trees, rendered one file at a time;
 /// stops when stdout goes away.
 pub fn diff(repo: &Repo, from: &ObjectId, to: &ObjectId, stat: bool, r: &Renames) -> Result<()> {
-    let changes = diff_changes(repo, from, to)?;
+    let (changes, hidden) = diff_changes(repo, from, to)?;
+    // A folder the server refuses: its path only, never what is in it
+    // (BUG-1508), as a checkout reports what it leaves out.
+    for h in &hidden {
+        println!("{} {} {}", yellow("redacted"), safe(&crate::api::hidden_dir(h)), dim("(you no longer have access to this folder; not compared)"));
+    }
     if changes.is_empty() {
-        println!("{}", dim("(no changes)"));
+        if hidden.is_empty() {
+            println!("{}", dim("(no changes)"));
+        }
         return Ok(());
     }
     let (items, skipped) = detect_renames(repo, (from, to), changes, r)?;
@@ -863,6 +870,9 @@ pub fn grep(g: &GrepDoc, style: GrepStyle) {
     }
     if g.skipped.sealed > 0 {
         crate::render::warn(&format!("{} file(s) not searched: sealed for a scope you are not in", g.skipped.sealed));
+    }
+    if g.skipped.hidden_folders > 0 {
+        crate::render::warn(&format!("{} folder(s) not searched: you no longer have access to them", g.skipped.hidden_folders));
     }
     if g.skipped.too_large > 0 {
         crate::render::warn(&format!("{} file(s) over 256 MiB not searched", g.skipped.too_large));

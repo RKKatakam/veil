@@ -67,7 +67,7 @@ use crate::{
     policy::{Policy, Tier},
     statcache::StatCache,
     store::ObjectStore,
-    tree::{diff_trees, lookup, TreeChange, TreeView},
+    tree::{diff_trees, diff_trees_hiding, lookup, refused_tree, walk_files_hiding, TreeChange, TreeView},
     vfs::{NodeKind, StorageBackend},
     vpath::{NameFolding, VPath},
 };
@@ -135,7 +135,9 @@ pub struct CheckoutReport {
 ///
 /// * [`view`](Materialised::view): the tree actually materialised, when it
 ///   is another (a one-directory clone's).
-/// * [`hidden`](Materialised::hidden): file entries left out (unreadable).
+/// * [`hidden`](Materialised::hidden): file entries left out (unreadable),
+///   and folders left out because the server refuses them (BUG-1508), which
+///   the builder carries by id.
 /// * [`from_fallback`](Materialised::from_fallback): conflicts written with
 ///   a version this reader could not read, with the rendering written.
 ///
@@ -282,6 +284,12 @@ impl Materialised {
     fn absorb(&mut self, fs: &dyn StorageBackend, changes: &[TreeChange], report: &CheckoutReport) -> Result<()> {
         for c in changes {
             self.hidden.remove(&c.path);
+            // A folder left out whose files are now written (BUG-1508).
+            let mut up = c.path.parent();
+            while let Some(d) = up.filter(|d| !d.is_root()) {
+                self.hidden.remove(&d);
+                up = d.parent();
+            }
             self.fallback.remove(&c.path);
             self.crlf.remove(&c.path);
         }
@@ -329,6 +337,18 @@ impl Materialised {
         for p in self.hidden.clone() {
             match lookup_opt(store, tree, &p)? {
                 Lookup::Unreadable => {}
+                // A folder left out because the server refused it
+                // (BUG-1508): written once it is readable again.
+                Lookup::Entry(e) if e.kind == EntryKind::Dir => match store.tree(&e.id) {
+                    Ok(_) => {
+                        for (rel, f) in walk_files_hiding(store, &e.id)?.0 {
+                            let path = VPath::new(&format!("{p}/{rel}")).expect("a path below a tree's path");
+                            changes.push(TreeChange { path, old: None, new: Some(f) });
+                        }
+                    }
+                    Err(err) if refused_tree(store, &err) => {}
+                    Err(err) => return Err(err),
+                },
                 Lookup::Entry(e) if e.kind.holds_blob() || e.kind == EntryKind::Conflict => {
                     if store.entry_readable(&e) && (e.kind != EntryKind::Conflict || Form::of(store, &e).entry().is_some_and(|f| f.kind != EntryKind::File && store.entry_readable(f))) {
                         changes.push(TreeChange {
@@ -407,8 +427,9 @@ pub fn checkout_recorded(
     mut cache: Option<&mut StatCache>,
 ) -> Result<CheckoutReport> {
     let shown = record.view.or(from.copied());
-    let changes = diff_trees(store, shown.as_ref(), Some(to))?;
+    let (changes, left_out) = checkout_changes(store, shown.as_ref(), to)?;
     let mut report = apply_changes(store, fs, shown.as_ref(), to, &changes, cache.as_deref_mut(), Some(&record.crlf))?;
+    report.redacted.extend(left_out);
     record.absorb(fs, &changes, &report)?;
     record.view = None;
     report.merge(record.fill_in(store, fs, to, cache)?);
@@ -653,8 +674,53 @@ pub fn checkout_cached(
     to: &ObjectId,
     cache: Option<&mut StatCache>,
 ) -> Result<CheckoutReport> {
-    let changes = diff_trees(store, from, Some(to))?;
-    apply_changes(store, fs, from, to, &changes, cache, None)
+    let (changes, left_out) = checkout_changes(store, from, to)?;
+    let mut report = apply_changes(store, fs, from, to, &changes, cache, None)?;
+    report.redacted.extend(left_out);
+    Ok(report)
+}
+
+/// The changes a checkout from `from` to `to` applies, and the folders it
+/// leaves out: in a thin clone, a folder whose tree the server refuses
+/// (its person lost access to it, BUG-1508) is never read. What checkout
+/// wrote there from `from` is removed (never a readable old version where
+/// hidden content now lives) and the folder is reported, and recorded, as
+/// left out, so the builder carries it by id; a folder readable again is
+/// written whole.
+fn checkout_changes(store: &ObjectStore, from: Option<&ObjectId>, to: &ObjectId) -> Result<(Vec<TreeChange>, Vec<VPath>)> {
+    let (mut changes, hidden) = diff_trees_hiding(store, from, Some(to))?;
+    let mut left_out = Vec::new();
+    let readable = |e: &Option<TreeEntry>| -> Result<Option<ObjectId>> {
+        match e {
+            Some(e) => match store.tree(&e.id) {
+                Ok(_) => Ok(Some(e.id)),
+                Err(err) if refused_tree(store, &err) => Ok(None),
+                Err(err) => Err(err),
+            },
+            None => Ok(None),
+        }
+    };
+    let under = |dir: &VPath, rel: &VPath| if dir.is_root() { rel.clone() } else { VPath::new(&format!("{dir}/{rel}")).expect("a path below a tree's path") };
+    for h in hidden {
+        match (readable(&h.old)?, readable(&h.new)?) {
+            (_, Some(new)) => {
+                for (rel, e) in walk_files_hiding(store, &new)?.0 {
+                    changes.push(TreeChange { path: under(&h.path, &rel), old: None, new: Some(e) });
+                }
+            }
+            (old, None) => {
+                if let Some(old) = old {
+                    for (rel, e) in walk_files_hiding(store, &old)?.0 {
+                        changes.push(TreeChange { path: under(&h.path, &rel), old: Some(e), new: None });
+                    }
+                }
+                if h.new.is_some() {
+                    left_out.push(h.path);
+                }
+            }
+        }
+    }
+    Ok((changes, left_out))
 }
 
 /// What [`holds`] needs to recognise a file checkout wrote with converted
@@ -1161,7 +1227,8 @@ fn sync_parent_later(fs: &dyn StorageBackend, path: &VPath) -> Result<()> {
 /// renamed into place, in the directories of the paths it wrote. Snapshots
 /// ignore them anyway; this only tidies the directory.
 pub fn remove_staging_debris(store: &ObjectStore, fs: &dyn StorageBackend, from: &ObjectId, to: &ObjectId) -> Result<()> {
-    let dirs: BTreeSet<VPath> = diff_trees(store, Some(from), Some(to))?
+    let dirs: BTreeSet<VPath> = diff_trees_hiding(store, Some(from), Some(to))?
+        .0
         .into_iter()
         .filter(|c| c.new.is_some())
         .map(|c| c.path.parent().unwrap_or_else(VPath::root))

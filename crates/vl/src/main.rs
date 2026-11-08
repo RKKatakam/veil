@@ -330,7 +330,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             let tree = ctx.repo.snapshot(&id)?.tree;
             let e = match p.is_root() {
                 true => None,
-                false => lookup(ctx.repo.store(), &tree, &p)?,
+                false => render::lookup_shown(&ctx.repo, &tree, &p)?,
             };
             match &e {
                 // A symlink prints its target.

@@ -152,8 +152,13 @@ fn normalize_dir(
                     return Err(too_deep(&path));
                 }
                 let sub_dest = de.filter(|x| x.kind == EntryKind::Dir).map(|x| x.id);
-                let child = normalize_frame(store, &e.id, sub_dest, path)?;
-                stack.push(child);
+                match normalize_frame(store, &e.id, sub_dest, path) {
+                    Ok(child) => stack.push(child),
+                    // A folder the server refuses (BUG-1508) is kept by id,
+                    // as it is: never emptied, its secrets never resealed.
+                    Err(err) if crate::tree::refused_tree(store, &err) => settle(f, &e, Some(e.clone())),
+                    Err(err) => return Err(err),
+                }
             }
             EntryKind::File | EntryKind::Symlink => {
                 let ne = normalize_file(store, &e, de.as_ref(), &path, opts, report)?;
@@ -316,7 +321,10 @@ fn normalize_file(
 /// policy would widen or move: `(path, current visibility, new visibility)`.
 pub fn policy_rekeys(store: &ObjectStore, tree: &ObjectId, old: &Policy, new: &Policy) -> Result<Vec<(VPath, Visibility, Visibility)>> {
     let mut out = Vec::new();
-    for (path, e) in crate::tree::walk_files(store, tree)? {
+    // A folder the server refuses (BUG-1508) is carried as it is: its
+    // secrets keep their audience, never rekeyed by someone who cannot read
+    // them.
+    for (path, e) in crate::tree::walk_files_hiding(store, tree)?.0 {
         let Visibility::Cloaked { .. } = &e.visibility else { continue };
         if old.classify(&path, false) == new.classify(&path, false) {
             continue;
