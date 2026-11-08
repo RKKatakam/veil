@@ -56,7 +56,8 @@ pub fn resolve_set(repo: &Repo, spec: &str, current_ws: &str) -> Result<Vec<Obje
     let spec = spec.trim();
     if let Some(pattern) = spec.strip_prefix("agent(").and_then(|r| r.strip_suffix(')')) {
         let m = agent_matcher(pattern)?;
-        let all = repo.topo_children_first(repo.view().refs())?;
+        // As a full clone answers: a thin clone pages in what it lacks.
+        let all = repo.exact().topo_children_first(repo.view().refs())?;
         let mut out = Vec::new();
         for id in all {
             let s = repo.snapshot(&id)?;
@@ -68,7 +69,7 @@ pub fn resolve_set(repo: &Repo, spec: &str, current_ws: &str) -> Result<Vec<Obje
     }
     if let Some(b) = spec.strip_prefix("::") {
         let b = resolve(repo, nonempty(b, spec)?, current_ws)?;
-        return repo.topo_children_first([b]);
+        return repo.exact().topo_children_first([b]);
     }
     let Some((a, b)) = spec.split_once("..") else {
         return Ok(vec![resolve(repo, spec, current_ws)?]);
@@ -76,15 +77,18 @@ pub fn resolve_set(repo: &Repo, spec: &str, current_ws: &str) -> Result<Vec<Obje
     if b.contains("..") {
         return Err(VeilError::Revset(format!("'{spec}': one `..` per range")));
     }
-    let excluded: HashSet<ObjectId> = match a.trim() {
-        "" => [repo.root_id()].into_iter().collect(),
-        a => repo.ancestors(&resolve(repo, a, current_ws)?)?,
+    let exclude: Vec<ObjectId> = match a.trim() {
+        "" => vec![repo.root_id()],
+        a => vec![resolve(repo, a, current_ws)?],
     };
     let heads: Vec<ObjectId> = match b.trim() {
         "" => repo.view().refs().into_iter().collect(),
         b => vec![resolve(repo, b, current_ws)?],
     };
-    Ok(repo.topo_children_first(heads)?.into_iter().filter(|id| !excluded.contains(id)).collect())
+    // The range itself, exactly (a thin clone pages in what it reaches and
+    // no more), in the held order (everything in it is held by then).
+    let set = repo.exact().range(&heads, &exclude)?;
+    Ok(repo.held().topo_children_first(heads)?.into_iter().filter(|id| set.contains(id)).collect())
 }
 
 /// Longest pattern `agent(PATTERN)` and `vl log --agent` take.
@@ -172,22 +176,36 @@ fn resolve_base(repo: &Repo, base: &str, ws: &str) -> Result<ObjectId> {
     // walked for, never all history.
     let visible_matching = |keep: &dyn Fn(&ObjectId, &ChangeId) -> bool| -> Result<Vec<ObjectId>> {
         let found: HashSet<ObjectId> =
-            repo.graph().entries_matching(repo, view.refs(), |id, e| keep(id, &e.change_id))?.into_iter().collect();
-        let mut v: Vec<ObjectId> = repo.visible_among(&found)?.into_iter().collect();
+            repo.held().entries_matching(view.refs(), |id, e| keep(id, &e.change_id))?.into_iter().collect();
+        // Held: a thin clone adds the server's answer (`server_names`).
+        let mut v: Vec<ObjectId> = repo.held().visible_among(&found)?.into_iter().collect();
         v.sort();
         Ok(v)
     };
     if let Some(hex) = ChangeId::reverse_hex_to_hex(base) {
         let mut matches: Vec<(ObjectId, ChangeId)> = Vec::new();
-        for id in visible_matching(&|_, c| hex_starts_with(&c.0, &hex))? {
+        let mut ids = visible_matching(&|_, c| hex_starts_with(&c.0, &hex))?;
+        // A thin clone: and the server's matches beyond what it holds.
+        if let Some(r) = server_names(repo, base)? {
+            for id in r.changes {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        for id in ids {
             matches.push((id, repo.snapshot(&id)?.change_id));
         }
         let mut changes: Vec<ChangeId> = matches.iter().map(|m| m.1).collect();
         changes.sort();
         changes.dedup();
         if changes.len() == 1 && matches.len() > 1 {
-            let local = local_history(repo)?;
-            let mine: Vec<ObjectId> = matches.iter().map(|m| m.0).filter(|id| local.contains(id)).collect();
+            let mut mine: Vec<ObjectId> = Vec::new();
+            for m in &matches {
+                if in_local_history(repo, &m.0)? {
+                    mine.push(m.0);
+                }
+            }
             if let [one] = mine.as_slice() {
                 return Ok(*one);
             }
@@ -206,7 +224,15 @@ fn resolve_base(repo: &Repo, base: &str, ws: &str) -> Result<ObjectId> {
     }
     if base.len() >= 4 && base.bytes().all(|b| b.is_ascii_hexdigit()) {
         let lower = base.to_ascii_lowercase();
-        let found = visible_matching(&|id, _| hex_starts_with(&id.0, &lower))?;
+        let mut found = visible_matching(&|id, _| hex_starts_with(&id.0, &lower))?;
+        if let Some(r) = server_names(repo, &lower)? {
+            for id in r.snapshots {
+                if !found.contains(&id) {
+                    found.push(id);
+                }
+            }
+            found.sort();
+        }
         match found.as_slice() {
             [one] => return Ok(*one),
             [] => {}
@@ -221,6 +247,35 @@ fn resolve_base(repo: &Repo, base: &str, ws: &str) -> Result<ObjectId> {
         }
     }
     Err(VeilError::Revset(format!("revision '{base}' not found")))
+}
+
+/// In a thin clone, the server's answer for id prefix `prefix` (a change id
+/// as written, or snapshot id digits) over this person's history, each
+/// snapshot it names held (fetched alone, a page of one): what held history
+/// cannot decide (`docs/HUB.md` §13.21, "Revised: names and fetching";
+/// BUG-1261, 1266). One request; a name that matches nothing fetches
+/// nothing. `None` in any other repository, or from a server older than
+/// protocol revision 5.
+pub(crate) fn server_names(repo: &Repo, prefix: &str) -> Result<Option<crate::hub::wire::Resolved>> {
+    let store = repo.store();
+    if !store.is_partial() || !store.may_fetch() {
+        return Ok(None);
+    }
+    let Some(promisor) = store.promisor() else {
+        return Err(VeilError::Unavailable(
+            "this thin clone cannot tell what an id names without its server, and this command has no connection to it".into(),
+        ));
+    };
+    // Counted from the server's branches and this clone's own refs, as a
+    // full clone holds what they reach (BUG-1319).
+    let from = repo.server_roots(false)?.map(|(f, _)| f).unwrap_or_default();
+    let Some(r) = promisor.resolve(prefix, &from)? else { return Ok(None) };
+    for id in r.snapshots.iter().chain(&r.changes) {
+        if !store.has(id) {
+            repo.deepen(&[*id], 1)?;
+        }
+    }
+    Ok(Some(r))
 }
 
 /// Does the lowercase hex spelling of `bytes` start with `prefix`?
@@ -258,7 +313,9 @@ fn recorded_snapshots_with_prefix(repo: &Repo, prefix: &str) -> Result<Vec<Objec
     candidates.retain(|id| id.hex().starts_with(prefix));
     candidates.sort();
     candidates.dedup();
-    candidates.retain(|id| repo.snapshot(id).is_ok());
+    // Held reads only: a hidden version is this repository's own, held,
+    // and a walk of every view must page in nothing (BUG-1267).
+    candidates.retain(|id| matches!(repo.held().snapshot(id), Ok(Some(_))));
     if candidates.is_empty() {
         return Ok(candidates);
     }
@@ -282,7 +339,7 @@ fn recorded_snapshots_with_prefix(repo: &Repo, prefix: &str) -> Result<Vec<Objec
             }
             // Objects stripped by a public remote, or sealed for a scope
             // this reader lacks, end the walk there.
-            if let Ok(s) = repo.snapshot(&id) {
+            if let Ok(Some(s)) = repo.held().snapshot(&id) {
                 stack.extend(s.parents.iter().chain(&s.predecessors).copied());
             }
         }
@@ -291,10 +348,13 @@ fn recorded_snapshots_with_prefix(repo: &Repo, prefix: &str) -> Result<Vec<Objec
     Ok(found)
 }
 
-/// Snapshots reachable from this repository's own heads and working copies,
-/// as opposed to those only reachable through tags and remote tags (which
-/// `pull` records, and anyone who can push to the remote can set).
-fn local_history(repo: &Repo) -> Result<std::collections::HashSet<ObjectId>> {
+/// Is `id` reachable from this repository's own heads and working copies,
+/// as opposed to only through tags and remote tags (which `pull` records,
+/// and anyone who can push to the remote can set)? Exactly: in a thin
+/// clone the history below its own work may not be held (BUG-1319: work on
+/// versions a rewrite elsewhere left off the branches); the walk stops at
+/// `id`'s generation, so only that range is paged in.
+fn in_local_history(repo: &Repo, id: &ObjectId) -> Result<bool> {
     let view = repo.view();
     let roots: Vec<ObjectId> = view
         .heads
@@ -302,7 +362,8 @@ fn local_history(repo: &Repo) -> Result<std::collections::HashSet<ObjectId>> {
         .copied()
         .chain(view.workspaces.values().map(|w| w.wc))
         .collect();
-    Ok(repo.topo_children_first(roots)?.into_iter().collect())
+    let Some(g) = repo.exact().generation(id)? else { return Ok(false) };
+    Ok(repo.exact().down_to(roots, g)?.contains_key(id))
 }
 
 /// Change ids and snapshot ids of the snapshots reachable from a set of
@@ -323,15 +384,21 @@ impl RevisionNames {
             return Ok(false);
         }
         if self.0.is_none() {
+            // What is held (this clone's own work among it), and below, in a
+            // thin clone, the server's answer for the rest (BUG-1261).
             let mut v = Vec::new();
-            for id in repo.topo_children_first(refs())? {
-                v.push((hex::encode(repo.snapshot(&id)?.change_id.0), id.hex()));
+            for id in repo.held().topo_children_first(refs())? {
+                let Some(s) = repo.held().snapshot(&id)? else { continue };
+                v.push((hex::encode(s.change_id.0), id.hex()));
             }
             self.0 = Some(v);
         }
         let ids = self.0.as_ref().unwrap();
-        Ok(ids.iter().any(|(c, s)| {
+        if ids.iter().any(|(c, s)| {
             change.as_ref().is_some_and(|h| c.starts_with(h.as_str())) || snapshot.as_ref().is_some_and(|h| s.starts_with(h.as_str()))
-        }))
+        }) {
+            return Ok(true);
+        }
+        Ok(server_names(repo, &name.to_ascii_lowercase())?.is_some_and(|r| !r.snapshots.is_empty() || !r.changes.is_empty() || r.more))
     }
 }

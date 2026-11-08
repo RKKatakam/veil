@@ -221,7 +221,7 @@ fn dedup(wants: &[(Vec<ObjectId>, ObjectId)]) -> Vec<ObjectId> {
 fn real_chains(dir: &Path) -> Vec<(String, Vec<ObjectId>, ObjectId)> {
     let repo = veil_core::Repo::open(Arc::new(veil_core::DiskBackend::new(dir)), None, "test").unwrap();
     let tip = repo.view().tags["main"].target;
-    let root = repo.store().snapshot(&tip).unwrap().tree;
+    let root = repo.snapshot(&tip).unwrap().tree;
     let mut out = vec![(String::new(), Vec::new(), root)];
     let mut stack = vec![(String::new(), vec![root])];
     while let Some((p, chain)) = stack.pop() {

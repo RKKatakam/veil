@@ -116,7 +116,7 @@ fn concurrent_tag_sets_all_land() {
     let mut r = open(&fs, &id);
     let won = r.view().tags["main"].target;
     let lost = if won == x { ws } else { x };
-    assert!(r.visible_snapshots().unwrap().contains(&lost), "the losing target was dropped");
+    assert!(r.exact().visible().unwrap().contains(&lost), "the losing target was dropped");
     let w = r.take_warnings();
     assert!(w.iter().any(|w| w.contains("tag 'main'")), "{w:?}");
     assert!(open(&fs, &id).take_warnings().is_empty(), "warned twice");
@@ -137,7 +137,7 @@ fn amend_racing_child_rebases_child() {
     assert_ne!(side_now, side, "the child stayed on the rewritten parent");
     assert_eq!(r.snapshot(&side_now).unwrap().parents, vec![x2], "the child is on the amended parent");
     assert_eq!(r.snapshot(&side_now).unwrap().predecessors, vec![side], "evolog of the moved child");
-    assert!(!r.visible_snapshots().unwrap().contains(&x), "the rewritten parent is still visible");
+    assert!(!r.exact().visible().unwrap().contains(&x), "the rewritten parent is still visible");
     assert_eq!(r.snapshot(&x2).unwrap().change_id, change);
     assert_fsck_clean(fs.clone(), &id, "after the merge");
 }
@@ -191,7 +191,7 @@ fn concurrent_rebase_cannot_escape_embargo() {
         }
     }
     // The child is back on the fix: nothing of it sits outside the embargo.
-    let visible = r.visible_snapshots().unwrap();
+    let visible = r.exact().visible().unwrap();
     for s in &visible {
         let snap = r.snapshot(s).unwrap();
         if snap.change_id == r.snapshot(&child).unwrap().change_id {
@@ -234,7 +234,7 @@ fn chained_rewrite_cannot_escape_embargo() {
     );
     let mut r = open(&fs, &id);
     assert!(r.take_warnings().iter().any(|w| w.contains("was not applied")));
-    for s in r.visible_snapshots().unwrap() {
+    for s in r.exact().visible().unwrap() {
         if r.snapshot(&s).unwrap().change_id == change {
             assert!(r.is_ancestor(&fix, &s).unwrap(), "a copy of the child sits outside the embargo: {}", s.short());
         }

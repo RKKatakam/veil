@@ -38,7 +38,7 @@ pub struct Confinement {
 /// nothing any more: its fix is back to the state before the merge.
 pub fn active_embargoes(repo: &Repo) -> Result<std::collections::HashSet<String>> {
     let mut out = std::collections::HashSet::new();
-    for id in repo.visible_embargoed()? {
+    for id in repo.exact().visible_embargoed()? {
         let s = repo.snapshot(&id)?;
         if let Some(e) = &s.embargo {
             // A merge rewritten down to one parent (its fix abandoned)

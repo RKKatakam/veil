@@ -141,7 +141,7 @@ fn hostile_or_unbounded_attribution_and_attempts_are_corrupt_and_never_written()
         // Copied in as raw bytes (a pull), it is refused when read.
         let id = ObjectId::hash(&raw);
         let _ = r.store().put_raw(&id, &raw);
-        assert!(r.store().snapshot(&id).is_err(), "{what}: read back as a snapshot");
+        assert!(!matches!(r.exact().snapshot(&id), Ok(Some(_))), "{what}: read back as a snapshot");
         // The engine cannot write one either.
         if let Some(v) = value {
             assert!(r.store().put_snapshot(&v).is_err(), "{what}: the engine stored it");
@@ -187,7 +187,7 @@ fn attempts_never_land_and_never_enter_ancestry() {
     let out = r.drop_attempt(tried, "dead end").unwrap();
     let a = out.attempt;
     assert!(!r.view().refs().contains(&a), "the attempt is visible");
-    assert!(!r.ancestors(&out.change).unwrap().contains(&a), "the attempt is an ancestor of its change");
+    assert!(!r.exact().ancestors(&out.change).unwrap().contains(&a), "the attempt is an ancestor of its change");
     let refusal = |e: VeilError| {
         let m = e.to_string();
         assert!(m.contains("abandoned attempt"), "{m}");

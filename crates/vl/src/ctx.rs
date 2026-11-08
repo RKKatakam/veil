@@ -343,9 +343,11 @@ impl Ctx {
         let identity = load_identity()?;
         let user = user_for(&identity);
         let fs = Arc::new(DiskBackend::new(&root));
-        let mut repo = Repo::open(fs.clone(), Some(identity), &user)?;
+        let mut repo = Repo::open(fs.clone(), Some(identity.clone()), &user)?;
         // From this process's own arguments and environment only.
         repo.set_attribution(crate::agent::current()?);
+        // A thin clone reads what it has not fetched from its server.
+        crate::thin::attach(&repo, &identity);
         // A clone of a server project trusts only the key rings of the
         // project fingerprint this device confirmed, before anything seals
         // (BUG-845). (A repository that will create its project, at its first
@@ -413,6 +415,20 @@ impl Ctx {
     }
 
     pub fn rev(&self, spec: &str) -> Result<ObjectId> {
+        // A thin clone: a full snapshot id it does not hold is asked of the
+        // server, and a walk that reaches beyond what it holds goes on
+        // through the server's history pages.
+        if self.repo.is_partial() {
+            if let Ok(id) = veil_core::ObjectId::from_hex(spec.trim().trim_end_matches('-')) {
+                if !self.repo.store().has(&id) {
+                    self.repo.deepen(&[id], 1)?;
+                }
+            }
+        }
+        // (`main-` names a parent the clone may not hold yet: reading it
+        // fetches it, `Exact::snapshot`.)
+        // Names a thin clone's held history cannot decide are asked of the
+        // server (`revset::server_names`); no paging here.
         Ok(revset::resolve(&self.repo, spec, &self.ws)?)
     }
 
@@ -547,6 +563,23 @@ impl Ctx {
             let base = self.checkout.snapshot;
             let base_snap = self.repo.snapshot(&base)?;
             let target_tree = self.repo.snapshot(&view_wc)?.tree;
+            // A thin clone fetches the catch-up's move first. If it cannot
+            // (a full cache, a lost server), the directory stays as it is
+            // and nothing is recorded, so `status`, `undo`, `op restore`
+            // and `partial limit` still run (BUG-1146); a command that
+            // would record the directory as a commit stops instead.
+            if let Err(e) = self.repo.store().prefetch_diff(Some(&base_snap.tree), &target_tree) {
+                if commit.is_some() {
+                    return Err(anyhow::Error::from(e).context(
+                        "the working copy is behind `@` and cannot be brought up to it; run `vl undo`, or raise the cache's bound with `vl partial limit SIZE`",
+                    ));
+                }
+                warn(&format!(
+                    "the working copy stays as it is: moving it to `@` needs what this thin clone cannot fetch now ({e}). \
+                     Nothing in it was recorded; run `vl undo` to go back, or `vl partial limit SIZE` and run any command"
+                ));
+                return Ok(true);
+            }
             // What a command put back (`vl restore`) is judged against the
             // entries it was written from, as in the ordinary snapshot
             // below: a sealed version restored stays sealed (BUG-492).
@@ -858,6 +891,16 @@ impl Ctx {
         }
         let from = self.repo.snapshot(&self.checkout.snapshot)?.tree;
         let to_snap = self.repo.snapshot(&target)?;
+        // A thin clone: a move this command could not fetch for (left by an
+        // earlier one; every move this command published was fetched ahead
+        // before it was) leaves the directory as it is (BUG-1146).
+        if let Err(e) = self.repo.store().prefetch_diff(Some(&from), &to_snap.tree) {
+            warn(&format!(
+                "the working copy stays as it is: moving it to `@` needs what this thin clone cannot fetch now ({e}). \
+                 Run `vl undo` to go back, or `vl partial limit SIZE` and run any command"
+            ));
+            return Ok(());
+        }
         let previous = self.checkout.snapshot;
         let needs_checkout = from != to_snap.tree || !self.checkout.materialised.is_empty();
         // Journalled: a crash half way is finished by the next command.

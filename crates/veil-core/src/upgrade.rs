@@ -387,6 +387,8 @@ pub fn upgrade(
     let journal = read_journal(&*backend)?;
     let mut report = UpgradeReport {
         from: journal.as_ref().map_or(config.format, |j| j.from),
+        // A thin clone (format 9) goes to format 10 too, keeping its
+        // `partial` marker (`RepoConfig::partial`): nothing is rewritten.
         to: journal.as_ref().map_or(opts.to, |j| j.to),
         dry_run: opts.dry_run,
         resumed: journal.is_some(),

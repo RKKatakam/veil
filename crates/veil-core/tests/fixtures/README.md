@@ -79,8 +79,9 @@ release still opens, reads, verifies, `fsck`s, upgrades and syncs it.
   whose first try was kept with `vl attempt drop --reason …`; it reaches both
   remotes. `upgraded/` is the format-8 set after `vl upgrade` (8 → 10,
   nothing rewritten); its one more commit stays in `alice/`, as `main`
-  builds on the unreleased embargo there. Format 9 (thin clones) is S3's,
-  built on its own branch: its set joins with it.
+  builds on the unreleased embargo there. Format 9 has no set: it is only
+  ever a thin clone, made by a clone from a server; the server's `thin`
+  tests make one with S3's clone code and upgrade it to 10.
 
 `encodings.txt` pins the bytes of every object encoding. Append to it (with
 `VEIL_BLESS_ENCODINGS=1`) only together with a new format; see

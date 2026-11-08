@@ -138,7 +138,9 @@ pub fn confirm_device(fingerprint: &str, server: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-pub fn clone(url: &HubUrl, dest: Option<&Path>, only: Option<&str>) -> Result<ExitCode> {
+/// `thin`: a thin clone with this cache bound (S3), or `None` for a full
+/// clone (`--full`).
+pub fn clone(url: &HubUrl, dest: Option<&Path>, only: Option<&str>, thin: Option<u64>) -> Result<ExitCode> {
     if url.project.is_empty() {
         bail!("give a project: veil://host[:port]/project");
     }
@@ -154,10 +156,13 @@ pub fn clone(url: &HubUrl, dest: Option<&Path>, only: Option<&str>) -> Result<Ex
     if dest.exists() && std::fs::read_dir(&dest)?.next().is_some() {
         bail!("destination {} is not empty", dest.display());
     }
+    // A clone of one directory keeps its S1 form (every snapshot, that
+    // directory's files): S3 does not combine it with a thin clone.
+    let thin = if only.is_some() { None } else { thin };
     let created = !dest.exists();
     std::fs::create_dir_all(&dest)?;
     let dest = dest.canonicalize()?;
-    let r = clone_populate(url, &dest, only.as_deref());
+    let r = clone_populate(url, &dest, only.as_deref(), thin);
     if r.is_err() {
         let _ = if created {
             std::fs::remove_dir_all(&dest)
@@ -178,7 +183,7 @@ pub fn clone(url: &HubUrl, dest: Option<&Path>, only: Option<&str>) -> Result<Ex
     r
 }
 
-fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>) -> Result<ExitCode> {
+fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>, mut thin: Option<u64>) -> Result<ExitCode> {
     let identity = load_identity()?;
     let client = Client::new(url, identity.clone())?;
     let fs = Arc::new(DiskBackend::new(dest));
@@ -194,7 +199,18 @@ fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>) -> Result<ExitC
             unknown: Default::default(),
         },
     );
+    // Thin by default (S3): the `partial` marker, at this release's format
+    // (10; S3's release wrote 9), written before anything is fetched, so an
+    // interrupted clone is never read as a full one. A server too old for thin clones gets a full one.
+    if thin.is_some() && client.tips()?.is_some_and(|t| t.revision < crate::hub::HISTORY_PAGES) {
+        println!("  {} the server is older than this vl: making a full clone", yellow("note:"));
+        thin = None;
+    }
+    if let Some(limit) = thin {
+        config.partial = Some(veil_core::repo::PartialConfig { remote: "origin".into(), cache_limit: limit });
+    }
     repo.save_config(config)?;
+    crate::thin::attach(&repo, &identity);
     // The project fingerprint this device confirmed, if any: the only `team`
     // ring it takes (BUG-845).
     repo.keys().set_anchor(&hub::anchor_for(&url.authority, &url.project)?.unwrap_or_default())?;
@@ -224,12 +240,13 @@ fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>) -> Result<ExitC
     let (_, co) = repo.check_out_new(&*fs, DEFAULT_WORKSPACE, wc, partial).context("checking out")?;
     crate::ctx::mark_clone_complete(&fs)?;
     println!(
-        "Cloned {} into {} ({} objects, {} files{})",
+        "Cloned {} into {} ({} objects, {} files{}{})",
         safe(&format!("veil://{}/{}", url.authority, url.project)),
         dest.display(),
         report.objects_copied,
         co.written,
-        only.map(|o| format!(", only {o}/")).unwrap_or_default()
+        only.map(|o| format!(", only {o}/")).unwrap_or_default(),
+        if thin.is_some() { ", thin: the rest is fetched when read" } else { "" }
     );
     if !co.redacted.is_empty() && only.is_none() {
         println!(

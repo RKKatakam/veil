@@ -267,7 +267,7 @@ use veil_core::{hub::wire::FORMAT_HEADER, repo::REPO_FORMAT};
 
 /// The objects of an answer of (encoded or plain) frames, each decoded
 /// (bounded) and checked against its id.
-fn objects_of(body: &[u8]) -> Result<Vec<(ObjectId, Vec<u8>)>> {
+pub(crate) fn objects_of(body: &[u8]) -> Result<Vec<(ObjectId, Vec<u8>)>> {
     Ok(encoding::read_frames(body, ANSWER_LIMIT)?.into_iter().map(|(id, raw)| (id, raw.into_owned())).collect())
 }
 
@@ -485,13 +485,27 @@ impl Client {
         self.json("POST", &self.url.project_path(""), None::<&()>)
     }
 
-    pub fn history(&self, tips: Vec<ObjectId>, stop: Vec<ObjectId>) -> Result<Vec<(ObjectId, Vec<u8>)>> {
+    /// The caller's projected history from `tips` down to `stop`: all of
+    /// it, or one page of at most `limit` snapshots (and every tip; a
+    /// server of revision 3).
+    pub fn history(&self, tips: Vec<ObjectId>, stop: Vec<ObjectId>, limit: Option<usize>) -> Result<Vec<(ObjectId, Vec<u8>)>> {
         let out = self.ok(
             "POST",
             &self.url.project_path("/history"),
-            Some(("application/json", serde_json::to_vec(&HistoryRequest { tips, stop })?)),
+            Some(("application/json", serde_json::to_vec(&HistoryRequest { tips, stop, limit })?)),
         )?;
         objects_of(&out)
+    }
+
+    /// A request whose status the caller interprets: `Err` only when the
+    /// server could not be reached (the connection failed or timed out).
+    pub(crate) fn post_status(&self, path: &str, body: Vec<u8>) -> Result<(u16, Vec<u8>)> {
+        self.call("POST", &self.url.project_path(path), Some(("application/json", body)))
+    }
+
+    /// [`Client::post_status`] of a GET.
+    pub(crate) fn get_status(&self, path: &str) -> Result<(u16, Vec<u8>)> {
+        self.call("GET", &self.url.project_path(path), None)
     }
 
     /// The answer to one fetch request: the object frames of `objects`.
@@ -795,6 +809,21 @@ fn percent(s: &str) -> String {
 
 // ---- pull ---------------------------------------------------------------------------------
 
+/// The server revision from which `history` answers pages
+/// (`HistoryRequest::limit`), which thin clones need (BUG-1140: revision 3
+/// is S5's read grants).
+pub const HISTORY_PAGES: u32 = 4;
+
+/// The branch a clone checks out (`hub_cmd::clone`): `main`, `trunk` or
+/// `master`, else the first by name.
+pub fn checkout_branch(tips: &Tips) -> Option<String> {
+    ["main", "trunk", "master"]
+        .into_iter()
+        .find(|b| tips.branches.contains_key(*b))
+        .map(str::to_string)
+        .or_else(|| tips.branches.keys().next().cloned())
+}
+
 /// Is `path` inside the `only` directory, or a directory on the way to it?
 fn in_scope(only: Option<&str>, path: &str) -> bool {
     let Some(o) = only else { return true };
@@ -808,9 +837,31 @@ fn in_scope(only: Option<&str>, path: &str) -> bool {
 /// trees and files they reach (within `only`), the key rings, then the
 /// remote tags (with the checks of every pull).
 pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) -> Result<SyncReport> {
+    pull_with(repo, remote, client, only, false)
+}
+
+/// [`pull`]; `widen`: in a thin clone, fetch every snapshot and every
+/// object they reach into the main store (`vl partial full`), as a full
+/// clone holds them.
+pub fn pull_with(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>, widen: bool) -> Result<SyncReport> {
     let tips = client
         .tips()?
         .ok_or_else(|| anyhow!("no project '{}' that you can see on {}", client.url.project, client.url.authority))?;
+    // A thin clone (S3) takes the new snapshots (a page at most) and the
+    // content of the branch it checks out only; the rest is fetched when
+    // read.
+    // A thin clone fetches on demand from its own remote's server only: a
+    // pull from another remote is a full one, into the main store (BUG-1265).
+    let own = repo.config().partial.as_ref().is_some_and(|p| p.remote == remote);
+    let thin = own && !widen;
+    // What that pull, and a widening one, takes as held: the main store's.
+    let main_only = widen || (repo.is_partial() && !own);
+    if thin && tips.revision < HISTORY_PAGES {
+        bail!(
+            "the server at {} is older than this vl and cannot serve a thin clone; `vl partial full` makes this a full clone",
+            client.url.authority
+        );
+    }
     let mut tx = repo.transaction(format!("pull from {remote}"))?;
     tx.repository_wide();
     let store: Arc<ObjectStore> = tx.repo().store().clone();
@@ -821,9 +872,13 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
         .iter()
         .filter(|(k, _)| k.starts_with(&prefix))
         .map(|(_, v)| *v)
-        .filter(|id| store.has(id))
+        .filter(|id| store.has(id) && !widen)
         .collect();
-    let mut want_tips: Vec<ObjectId> = tips.branches.values().copied().filter(|t| !store.has(t)).collect();
+    // A pull into the main store (a widening one, or a full pull from
+    // another remote) asks for every tip, held or not: what a held tip
+    // reaches may be in the cache only, or nowhere (BUG-1318). `have` then
+    // skips, object by object, what the main store holds.
+    let mut want_tips: Vec<ObjectId> = tips.branches.values().copied().filter(|t| main_only || !store.has(t)).collect();
     want_tips.sort();
     want_tips.dedup();
     // A repository made for this clone holds only the root snapshot and
@@ -831,26 +886,49 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
     let root = tx.repo().root_id();
     let fresh = stop.is_empty() && tx.view.heads.iter().all(|h| *h == root);
     let empty_tree = tx.repo().snapshot(&root)?.tree;
-    let have = |id: &ObjectId| match fresh {
-        true => *id == root || *id == empty_tree,
-        false => store.has(id),
+    let have = |id: &ObjectId| match (fresh, main_only) {
+        (true, _) => *id == root || *id == empty_tree,
+        (false, true) => store.has_main(id),
+        (false, false) => store.has(id),
     };
     let mut report = SyncReport::default();
     let mut incoming = Incoming::new(&store);
+    // Where trees and files go: the cache area of a thin clone.
+    let content_store: Arc<ObjectStore> = match thin {
+        true => store.cache().expect("a thin clone has a cache").clone(),
+        false => store.clone(),
+    };
+    let mut content = thin.then(|| Incoming::new(&content_store));
+    let checked_out = checkout_branch(&tips).and_then(|b| tips.branches.get(&b).copied());
+    // The cache's bound applies to what goes to the cache (not to `vl
+    // partial full`, which fills the main store).
+    let limit = store.cache_limit().filter(|_| thin).unwrap_or(u64::MAX);
+    let mut content_bytes = 0u64;
     let mut new_snaps = Vec::new();
     if !want_tips.is_empty() {
-        for (id, raw) in client.history(want_tips, stop)? {
-            if have(&id) {
+        // A thin clone takes the tips alone; a later pull, the new
+        // snapshots down to what it has (a page at most).
+        let first = !tx.view.remote_tags.keys().any(|k| k.starts_with(&prefix));
+        let page = thin.then_some(if first { want_tips.len() } else { veil_core::promisor::HISTORY_PAGE });
+        for (id, raw) in client.history(want_tips, stop, page)? {
+            let held = have(&id);
+            // A widening pull, and a full pull from another remote, walk
+            // what each snapshot reaches even when they hold the snapshot:
+            // its trees and files may be in the cache, or not fetched
+            // (BUG-1292).
+            if held && !main_only {
                 continue;
             }
             let Object::Snapshot(s) = Object::decode(&raw)? else {
                 bail!("the server sent a non-snapshot in history");
             };
-            if s.signature_valid() != Some(true) {
+            if s.signature_valid() != Some(true) && !held {
                 report.warnings.push(format!("snapshot {} carries no valid signature", id.short()));
             }
-            new_snaps.push((id, s.tree));
-            if incoming.put(id, raw, "")? {
+            if !thin || Some(id) == checked_out {
+                new_snaps.push((id, s.tree));
+            }
+            if !held && incoming.put(id, raw, "")? {
                 report.objects_copied += 1;
             }
         }
@@ -910,7 +988,19 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
                         next.push((w.snapshot.unwrap_or(snap), p, cid, size));
                     }
                 }
-                if incoming.put(w.id, raw, &w.path)? {
+                content_bytes += raw.len() as u64;
+                if content_bytes > limit {
+                    bail!(
+                        "what this thin clone checks out is larger than its object cache ({}); clone again with a larger \
+                         `--cache-size`, or with `--full`",
+                        veil_core::promisor::human(limit)
+                    );
+                }
+                let written = match content.as_mut() {
+                    Some(c) => c.put(w.id, raw, &w.path)?,
+                    None => incoming.put(w.id, raw, &w.path)?,
+                };
+                if written {
                     report.objects_copied += 1;
                 }
                 Ok(())
@@ -919,6 +1009,18 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
         frontier = next;
     }
     report.packs_written = incoming.finish()?;
+    if let Some(c) = content {
+        report.packs_written += c.finish()?;
+        store.recount_cache();
+        // Down to the cache's bound: least recently written first, never
+        // what the working copies hold.
+        if store.trim_cache()?.full {
+            report.warnings.push(format!(
+                "the object cache is over its bound ({}) with what is checked out alone; raise it with `vl partial limit SIZE`",
+                veil_core::promisor::human(limit)
+            ));
+        }
+    }
     // Key rings of secret scopes: verified and fast-forwarded locally.
     if client.token.borrow().is_some() {
         if let Ok(rings) = client.rings() {
@@ -1220,8 +1322,10 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                 created,
             });
         }
-        // What the server has: everything the remote tags reach.
+        // What the server has: everything the remote tags reach, as held
+        // (beyond a thin clone's boundary it is the server's anyway).
         let store = repo.store().clone();
+        let held = repo.held();
         let mut known: HashSet<ObjectId> = HashSet::new();
         let mut stack: Vec<ObjectId> = view
             .remote_tags
@@ -1234,7 +1338,8 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             if !known.insert(id) {
                 continue;
             }
-            if let Ok(s) = store.snapshot(&id) {
+            if let Ok(Some(s)) = held.snapshot(&id) {
+                // Attempts (format 10) go with their version.
                 stack.extend(s.parents.iter().chain(&s.attempts).copied());
             }
         }
@@ -1245,7 +1350,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             if known.contains(&id) || !seen_snaps.insert(id) {
                 continue;
             }
-            let s = store.snapshot(&id)?;
+            let s = held.snapshot(&id)?.ok_or(veil_core::VeilError::Missing(id))?;
             // Its attempts (format 10) go with it.
             stack.extend(s.parents.iter().chain(&s.attempts).copied());
             new.push((id, s));
@@ -1256,7 +1361,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         let mut up = Uploads { client, compress: revision >= 2, frames: Vec::new(), ids: Vec::new(), receipts: BTreeMap::new() };
         let mut walk = Introduced::new(&store, |id, raw| up.add(&id, &raw));
         for (id, s) in &new {
-            let parents: Vec<ObjectId> = s.parents.iter().filter_map(|p| store.snapshot(p).ok().map(|ps| ps.tree)).collect();
+            let parents: Vec<ObjectId> = s.parents.iter().filter_map(|p| held.snapshot(p).ok().flatten().map(|ps| ps.tree)).collect();
             walk.snapshot(*id, s.tree, parents)?;
         }
         drop(walk);

@@ -445,8 +445,18 @@ pub fn server(b: &mut Bench, server: &crate::server::Server) -> Result<()> {
         b.case(Case::new("push, 1 new snapshot", g, &repo, &["push", "hub"]), |b, _| commit_on_main(b, "one more"))?;
         b.preflight("clone from the server", 2 * tree)?;
         std::fs::create_dir_all(&clone_parent)?;
+        // A thin clone (S3, the default): the tips and what it checks out.
+        let thin = clone_parent.join("t");
+        b.case(Case::new("clone, thin (default)", g, &clone_parent, &["clone", &url, "t"]).runs(1), |_, _| Ok(()))?;
+        if thin.join(".veil").exists() {
+            let (tb, _) = du(&thin.join(".veil"));
+            b.note(format!("thin clone: {:.2} GB in .veil", tb as f64 / 1e9));
+            b.case(Case::new("status in thin clone, clean", g, &thin, &["status"]), |_, _| Ok(()))?;
+            b.case(Case::new("log -n 20 in thin clone", g, &thin, &["log", "-n", "20"]).runs(1), |_, _| Ok(()))?;
+            remove_tree(&thin, &b.dir)?;
+        }
         let clone = clone_parent.join("c");
-        b.case(Case::new("clone, full", g, &clone_parent, &["clone", &url, "c"]).runs(1), |_, _| Ok(()))?;
+        b.case(Case::new("clone, full", g, &clone_parent, &["clone", "--full", &url, "c"]).runs(1), |_, _| Ok(()))?;
         if clone.join(".veil").exists() {
             let (cb, _) = du(&clone);
             b.note(format!("server clone: {:.2} GB on disk", cb as f64 / 1e9));

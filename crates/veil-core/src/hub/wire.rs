@@ -42,8 +42,11 @@ pub const PROTOCOL: u32 = 1;
 /// [`Tips::revision`] tells clients: 1, a fetch names objects of several
 /// snapshots ([`Want::snapshot`]); 2, uploads may carry compressed
 /// objects ([`super::encoding`]); 3, read grants with the tips and the
-/// object routes ([`super::grant`]).
-pub const REVISION: u32 = 3;
+/// object routes ([`super::grant`]); 4, history answers pages
+/// ([`HistoryRequest::limit`]), for thin clones; 5, `q/resolve` names the
+/// snapshots of the caller's history by id prefix ([`Resolved`]); 6,
+/// `q/generations` gives their generations ([`Generations`]).
+pub const REVISION: u32 = 6;
 
 /// The request header in which `vl` says the newest repository format it
 /// reads (`repo::REPO_FORMAT`). A client that sends none is taken to read
@@ -135,6 +138,47 @@ pub struct HistoryRequest {
     /// Snapshots the caller already has: the walk stops there.
     #[serde(default)]
     pub stop: Vec<ObjectId>,
+    /// One page (revision 4): every tip, then their ancestors newest first
+    /// (by timestamp, then id), at most this many snapshots in all. A thin
+    /// clone takes its tips with it, and the history it reaches later page
+    /// by page. Without it, the whole history down to `stop`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// `POST …/q/generations` (revision 6): the snapshots, of the caller's
+/// own history, whose generations a thin clone's history index needs at
+/// its boundary (at most [`MAX_GENERATIONS`]).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GenerationsRequest {
+    pub snapshots: Vec<ObjectId>,
+}
+
+/// Its answer: one generation per snapshot asked, `None` where the caller's
+/// history has no such snapshot (or it is withheld).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Generations {
+    pub generations: Vec<Option<u64>>,
+}
+
+/// Most snapshots one `q/generations` request names.
+pub const MAX_GENERATIONS: usize = 1_000;
+
+/// Most snapshots a `q/resolve` counts the history of besides the branches
+/// (`from`: a thin clone's own refs on the server, BUG-1319).
+pub const MAX_RESOLVE_FROM: usize = 64;
+
+/// The answer of `GET …/q/resolve?prefix=` (revision 5): the snapshots of
+/// the caller's own history whose id (`snapshots`), or whose change id
+/// (`changes`), starts with the prefix; `more` when either list was cut.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Resolved {
+    #[serde(default)]
+    pub snapshots: Vec<ObjectId>,
+    #[serde(default)]
+    pub changes: Vec<ObjectId>,
+    #[serde(default)]
+    pub more: bool,
 }
 
 /// One object a client asks for: its id, and the path where it met it

@@ -122,6 +122,9 @@ pub struct ObjectStore {
     /// This device's diff and merge drivers (`.veilattributes` only names
     /// them; see [`crate::attributes::DeviceDrivers`]).
     drivers: RwLock<Option<Arc<dyn crate::attributes::DeviceDrivers>>>,
+    /// A thin clone's cache area and connection to the server
+    /// ([`crate::promisor`]); unset in every other repository.
+    pub(crate) partial: std::sync::OnceLock<Arc<crate::promisor::Partial>>,
 }
 
 impl fmt::Debug for ObjectStore {
@@ -284,6 +287,7 @@ impl ObjectStore {
             format: AtomicU32::new(crate::repo::REPO_FORMAT),
             tx: Mutex::new(None),
             drivers: RwLock::new(None),
+            partial: std::sync::OnceLock::new(),
         }
     }
 
@@ -839,7 +843,7 @@ impl ObjectStore {
 
     // ---- packs -----------------------------------------------------------
 
-    fn ensure_packs(&self) -> Result<()> {
+    pub(crate) fn ensure_packs(&self) -> Result<()> {
         if !self.packs.read().unwrap().loaded {
             self.reload_packs()?;
         }
@@ -914,7 +918,7 @@ impl ObjectStore {
         Ok(self.packs.read().unwrap().broken.clone())
     }
 
-    fn in_loaded_packs(&self, id: &ObjectId) -> bool {
+    pub(crate) fn in_loaded_packs(&self, id: &ObjectId) -> bool {
         self.packs.read().unwrap().packs.iter().any(|p| p.contains(id))
     }
 
@@ -959,6 +963,12 @@ impl ObjectStore {
     }
 
     pub fn has(&self, id: &ObjectId) -> bool {
+        self.has_main(id) || self.partial.get().is_some_and(|p| p.cache.has(id))
+    }
+
+    /// [`ObjectStore::has`] in this store's own files only (never the cache
+    /// area of a thin clone).
+    pub fn has_main(&self, id: &ObjectId) -> bool {
         if self.staged(id).is_some() {
             return true;
         }
@@ -969,7 +979,9 @@ impl ObjectStore {
         if self.ensure_packs().is_err() {
             return false;
         }
-        self.in_loaded_packs(id) || (self.reload_packs().unwrap_or(false) && self.in_loaded_packs(id)) || self.loose_exists(id)
+        self.in_loaded_packs(id)
+            || (self.reload_packs().unwrap_or(false) && self.in_loaded_packs(id))
+            || self.loose_exists(id)
     }
 
     /// [`ObjectStore::has`], freshening `id` for gc even if this process
@@ -1000,6 +1012,23 @@ impl ObjectStore {
     /// process for those; blobs are hashed on every read (BLAKE3, typically
     /// well above 1 GiB/s, so small next to the I/O and decryption).
     pub(crate) fn read_raw(&self, id: &ObjectId) -> Result<Vec<u8>> {
+        self.read_raw_as(id, false)
+    }
+
+    /// [`ObjectStore::read_raw`]; `snapshot`: the reader asks for a
+    /// snapshot (a thin clone answers one it lacks as beyond its boundary,
+    /// and anything else it cannot place as `Unavailable`).
+    fn read_raw_as(&self, id: &ObjectId, snapshot: bool) -> Result<Vec<u8>> {
+        match self.read_main(id) {
+            // A thin clone: the cache area, then the server (`promisor`).
+            Err(VeilError::Missing(_)) if self.partial.get().is_some() => self.read_partial(id, snapshot),
+            r => r,
+        }
+    }
+
+    /// [`ObjectStore::read_raw`] of this store's own files only (never the
+    /// cache area of a thin clone, never the server).
+    fn read_main(&self, id: &ObjectId) -> Result<Vec<u8>> {
         if let Some(b) = self.staged(id).or_else(|| self.tx_buffered(id)) {
             return Ok(b);
         }
@@ -1056,7 +1085,10 @@ impl ObjectStore {
     /// Is there a copy of `id` that passes verification? Errors other than
     /// "absent" or "corrupt" (I/O) are passed on.
     fn has_verified(&self, id: &ObjectId) -> Result<bool> {
-        match self.read_raw(id) {
+        // This store's own copy: a write is never skipped because the
+        // cache area of a thin clone holds the object (only the main store
+        // is never evicted).
+        match self.read_main(id) {
             Ok(_) => Ok(true),
             Err(VeilError::Missing(_)) | Err(VeilError::Corrupt(..)) => Ok(false),
             Err(e) => Err(e),
@@ -1271,7 +1303,16 @@ impl ObjectStore {
 
     /// Decode without decrypting.
     pub fn get(&self, id: &ObjectId) -> Result<Object> {
-        Object::decode(&self.get_raw(id)?)
+        self.get_as(id, false)
+    }
+
+    fn get_as(&self, id: &ObjectId, snapshot: bool) -> Result<Object> {
+        self.freshen(id);
+        let obj = Object::decode(&self.read_raw_as(id, snapshot)?)?;
+        if self.partial.get().is_some() {
+            self.note_decoded(id, &obj);
+        }
+        Ok(obj)
     }
 
     /// Decode and peel any sealed layers using the keychain.
@@ -1366,11 +1407,14 @@ impl ObjectStore {
         self.put_tree(&Tree::default())
     }
 
-    pub fn snapshot(&self, id: &ObjectId) -> Result<Arc<Snapshot>> {
+    /// Snapshot object `id` as this store holds it (decoded, cached). Inside
+    /// the engine only: history is read through `Repo::held` or
+    /// `Repo::exact`, which say whether a thin clone fetches (BUG-1290).
+    pub(crate) fn snapshot(&self, id: &ObjectId) -> Result<Arc<Snapshot>> {
         if let Some(s) = self.snapshots.get(id) {
             return Ok(s);
         }
-        let s = match self.get(id)? {
+        let s = match self.get_as(id, true)? {
             Object::Snapshot(s) => Arc::new(s),
             o => {
                 return Err(VeilError::Corrupt(
@@ -1379,6 +1423,7 @@ impl ObjectStore {
                 ))
             }
         };
+        self.note_held_snapshot(&s);
         self.snapshots.insert(*id, s.clone(), 1);
         Ok(s)
     }

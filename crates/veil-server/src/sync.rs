@@ -557,17 +557,38 @@ pub async fn history(
     viewer: &Viewer,
     tips: &[ObjectId],
     stop: &[ObjectId],
+    limit: Option<usize>,
     encoded: bool,
     reads: u32,
 ) -> Result<Vec<u8>> {
     let mut starts = Vec::new();
+    let mut reals = Vec::new();
     for t in tips {
         let Some(real) = resolve(hub, project.id, &project.view(viewer).key(), t).await?.into_iter().next() else {
             return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
         };
         starts.push(projected(hub, project, viewer, real).await?);
+        reals.push(real);
     }
     let stop: HashSet<ObjectId> = stop.iter().copied().collect();
+    if let Some(limit) = limit {
+        // A page (a thin clone's): from any snapshot of the viewer's graph
+        // that is not withheld, whether the branches still reach it or not
+        // (an old version a rewrite elsewhere left under the clone's own
+        // work is the person's to read below, BUG-1319). Names keep to what
+        // the branches reach (`q/resolve`, BUG-1268).
+        // (Branch tips, as a clone and a pull ask for, are in it: no
+        // viewer graph is needed for them.)
+        let branch_tips: HashSet<ObjectId> = self::tips(hub, project, viewer).await?.into_iter().map(|(_, t)| t).collect();
+        let starts = match starts.iter().all(|s| branch_tips.contains(s)) {
+            true => starts,
+            false => {
+                let readable = crate::query::page_starts(hub, project, viewer, reals).await?;
+                starts.into_iter().zip(readable).filter(|(_, r)| *r).map(|(s, _)| s).collect()
+            }
+        };
+        return blocking(hub, project.id, move |src| history_page(src, starts, &stop, limit.clamp(1, MAX_HISTORY), encoded, reads)).await;
+    }
     blocking(hub, project.id, move |src| {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
@@ -583,19 +604,7 @@ pub async fn history(
             let Object::Snapshot(s) = Object::decode(&raw)? else {
                 return Err(Error::Other(anyhow::anyhow!("projected history holds a non-snapshot")));
             };
-            // Nothing a client cannot read is sent to it (BUG-1379).
-            if s.has_format_10_fields() && reads < veil_core::object::ATTRIBUTION_REPO_FORMAT {
-                return Err(Error::new(
-                    axum::http::StatusCode::UPGRADE_REQUIRED,
-                    "update_vl",
-                    format!(
-                        "this project holds changes of repository format {} (agent attribution, recorded attempts), which \
-                         this vl does not read: update vl to {} or later",
-                        veil_core::object::ATTRIBUTION_REPO_FORMAT,
-                        veil_core::repo::min_vl_for_format(veil_core::object::ATTRIBUTION_REPO_FORMAT)
-                    ),
-                ));
-            }
+            readable_by(&s, reads)?;
             match encoded {
                 true => put_frame(&mut out, &id, &src.encoded(&id)?),
                 false => put_frame(&mut out, &id, &raw),
@@ -606,6 +615,82 @@ pub async fn history(
         Ok(out)
     })
     .await
+}
+
+/// One page of [`history`] (S3's thin clones): the tips, then their
+/// ancestors, those of the newest children first, at most `limit`
+/// snapshots in all (and every tip). Any page is a region the client can
+/// hold: what it leaves out is reached by the next page.
+/// Refuse to send snapshot `s` to a client that reads repository formats up
+/// to `reads` only (BUG-1379): it is told to update `vl`, never sent what
+/// it would report as a corrupt object. Every route that sends snapshots
+/// calls it.
+fn readable_by(s: &Snapshot, reads: u32) -> Result<()> {
+    if s.has_format_10_fields() && reads < veil_core::object::ATTRIBUTION_REPO_FORMAT {
+        return Err(Error::new(
+            axum::http::StatusCode::UPGRADE_REQUIRED,
+            "update_vl",
+            format!(
+                "this project holds changes of repository format {} (agent attribution, recorded attempts), which \
+                 this vl does not read: update vl to {} or later",
+                veil_core::object::ATTRIBUTION_REPO_FORMAT,
+                veil_core::repo::min_vl_for_format(veil_core::object::ATTRIBUTION_REPO_FORMAT)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn history_page(src: &Source, starts: Vec<ObjectId>, stop: &HashSet<ObjectId>, limit: usize, encoded: bool, reads: u32) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut heap: std::collections::BinaryHeap<(bool, i64, ObjectId)> = std::collections::BinaryHeap::new();
+    for t in starts {
+        heap.push((true, i64::MAX, t));
+    }
+    let mut taken = 0;
+    while let Some((tip, _, id)) = heap.pop() {
+        if stop.contains(&id) || !seen.insert(id) {
+            continue;
+        }
+        if !tip && taken >= limit {
+            break;
+        }
+        let raw = src.raw(&id)?;
+        let Object::Snapshot(s) = Object::decode(&raw)? else {
+            return Err(Error::Other(anyhow::anyhow!("projected history holds a non-snapshot")));
+        };
+        readable_by(&s, reads)?;
+        match encoded {
+            true => put_frame(&mut out, &id, &src.encoded(&id)?),
+            false => put_frame(&mut out, &id, &raw),
+        }
+        taken += 1;
+        // A version's attempts travel with it, in the same page (format 10:
+        // at most 32; a client walks parents, so it never asks for them).
+        for a in &s.attempts {
+            if stop.contains(a) || !seen.insert(*a) {
+                continue;
+            }
+            let raw = src.raw(a)?;
+            let Object::Snapshot(at) = Object::decode(&raw)? else {
+                return Err(Error::Other(anyhow::anyhow!("an attempt is not a snapshot")));
+            };
+            readable_by(&at, reads)?;
+            match encoded {
+                true => put_frame(&mut out, a, &src.encoded(a)?),
+                false => put_frame(&mut out, a, &raw),
+            }
+        }
+        for p in &s.parents {
+            if !seen.contains(p) {
+                // A parent's timestamp is read when it is taken; until then
+                // its child's stands for it (parents are older).
+                heap.push((false, s.timestamp, *p));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Objects `wants` under snapshot `snapshot`, each checked against what

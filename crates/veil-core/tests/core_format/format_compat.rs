@@ -138,9 +138,11 @@ const UNIVERSAL_ROOT: &str = "72edc798";
 fn every_repository_format_has_a_fixture_set() {
     for f in 1..=REPO_FORMAT {
         let dir = fixtures().join(format!("format-{f}"));
-        // Format 9 (thin clones, S3) is built on its own branch, which
-        // brings its set; this branch's format 10 is separate from it.
-        if f == 9 && !dir.exists() {
+        // Format 9 is only ever a thin clone, which only a clone from a
+        // server makes (no set on disk can be made by `generate.sh`): the
+        // server's `thin` tests make one with S3's clone code, numbered as
+        // S3's release wrote it, and upgrade it to 10.
+        if f == veil_core::repo::PARTIAL_FORMAT && !dir.exists() {
             continue;
         }
         let cfg = read_config(&DiskBackend::new(dir.join("alice")))
@@ -633,16 +635,16 @@ fn a_clean_format_6_or_7_repository_upgrades_keeping_every_id() {
 
 // ---- format 10: agent attribution and attempts -----------------------------------
 
-/// A format-8 repository, or a format-9 one without a `partial` marker
-/// (here: written by this build and marked with the older format, as one
-/// is; a thin clone, with the marker, is refused: BUG-1390's test), opens
-/// and works as it is, but
+/// A format-8 repository (here: written by this build and marked with the
+/// older format, as one is) opens and works as it is, but
 /// refuses to store a format-10 snapshot (an attributed one, an attempt)
 /// with what to do; `vl upgrade` then moves it to 10 rewriting nothing,
 /// after which the same commit is stored.
 #[test]
 fn a_format_8_or_9_repository_refuses_format_10_snapshots_and_upgrades_rewriting_nothing() {
-    for from in [8, 9] {
+    // (A format-9 repository is always a thin clone: the test below, and
+    // the server's `thin` tests with a clone of S3's code.)
+    for from in [8] {
         let (_tmp, root, fs, alice) = written_then_marked(from, |repo, root, fs| {
             std::fs::write(root.join("README.md"), "hello\n").unwrap();
             repo.snapshot_workspace("default", &**fs).unwrap();
@@ -773,7 +775,7 @@ fn the_format_8_set_opens_reads_and_verifies() {
     for (path, e) in walk_files(repo.store(), &tree).unwrap() {
         assert!(e.visibility.is_public() || veil_core::policy::names_secret(path.as_str()), "{path} is sealed");
     }
-    for id in repo.topo_children_first([main]).unwrap() {
+    for id in repo.exact().topo_children_first([main]).unwrap() {
         let s = repo.snapshot(&id).unwrap();
         if s.parents.is_empty() {
             continue;
@@ -805,7 +807,7 @@ fn the_format_8_set_keeps_key_generations_and_audiences() {
     let carol = fx.open("alice", Some("carol"));
     assert_eq!(read_str(&carol, &main, "secrets/.env.notes"), None);
     let first = carol
-        .topo_children_first([main])
+        .exact().topo_children_first([main])
         .unwrap()
         .into_iter()
         .find(|id| carol.description(&carol.snapshot(id).unwrap()) == "initial import")
@@ -827,7 +829,7 @@ fn the_format_8_set_remotes_read_and_verify() {
         let r = fx.open(name, None);
         assert_eq!(r.format(), 8);
         assert_fsck_clean(fx.backend(name), None);
-        assert!(r.snapshot_opt(&fix_b).unwrap().is_none(), "{name} holds the unreleased embargo's merge");
+        assert!(r.exact().snapshot(&fix_b).unwrap().is_none(), "{name} holds the unreleased embargo's merge");
         assert!(!r.view().tags.contains_key("main"), "{name}: main builds on the unreleased embargo");
         let links = tag(&r, "links");
         assert_eq!(read_str(&r, &links, "README.md").as_deref(), Some("Fixture project\n"));
@@ -1003,7 +1005,8 @@ fn newer_repository_format_is_refused_with_the_release_it_needs() {
     let fx = Fixture::new(8);
     let fs = fx.backend("alice");
     let mut cfg = read_config(&*fs).unwrap();
-    cfg.format = REPO_FORMAT + 1;
+    // Format 9 is a thin clone's (S3): the first unknown one is past it.
+    cfg.format = veil_core::repo::MAX_REPO_FORMAT + 1;
     cfg.min_vl = None;
     fs.write(&p(".veil/repo.json"), &serde_json::to_vec_pretty(&cfg).unwrap())
         .unwrap();
@@ -1086,6 +1089,11 @@ fn newer_object_encodings_are_unsupported_not_corrupt() {
 #[test]
 fn newer_pack_version_is_unsupported() {
     let fx = Fixture::new(8);
+    // Opened once by this vl while its pack reads: the fixture's history
+    // index, an older vl's (`VEILCG01`), is computed again (BUG-1381), and
+    // its two operation heads merged. A repository whose index and pack are
+    // both unreadable cannot settle; this test is of the pack alone.
+    drop(fx.open("alice", Some("alice")));
     let dir = fx.root.join("alice/.veil/objects/pack");
     let idx = std::fs::read_dir(&dir)
         .unwrap()
@@ -1403,14 +1411,13 @@ fn an_encrypted_conflict_side_of_an_ordinary_file_is_named() {
 
 /// Format 9 is S3's thin clone: its `repo.json` carries the `partial`
 /// marker (`{remote, cache_limit}`), and objects not in the store are
-/// fetched from the server when read (`docs/design/scale/6-partial-clone.md`,
-/// threat 14). The number exists so that a build that does not know the
-/// marker never opens one: it would take every object not fetched yet as
-/// absent. This build does not know it. It must refuse such a repository,
-/// and its `vl upgrade` must neither drop the marker nor move it to a
-/// format whose readers ignore it; nothing may change.
+/// fetched from its server when read. Format 10 has everything format 9
+/// has (BUG-1390's coordination, S3 merged): this build opens such a
+/// repository, and `vl upgrade` brings it to 10 keeping the marker byte for
+/// byte and rewriting no object. (The server's `thin` tests do the same
+/// with a thin clone S3's clone code made, and fetch on demand after.)
 #[test]
-fn a_thin_clone_of_format_9_is_refused_not_opened_or_upgraded_without_its_marker() {
+fn a_thin_clone_of_format_9_opens_and_upgrades_to_10_keeping_its_marker() {
     let (_tmp, root, fs, alice) = written_then_marked(9, |repo, root, fs| {
         std::fs::write(root.join("README.md"), "hello\n").unwrap();
         repo.snapshot_workspace("default", &**fs).unwrap();
@@ -1421,17 +1428,18 @@ fn a_thin_clone_of_format_9_is_refused_not_opened_or_upgraded_without_its_marker
     let mut cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     cfg["partial"] = serde_json::json!({"remote": "origin", "cache_limit": 1u64 << 30});
     std::fs::write(&path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
-    let before = std::fs::read(&path).unwrap();
-    let opened = Repo::open(fs.clone(), Some(alice.clone()), "alice");
-    let upgraded = upgrade(fs.clone(), Some(alice.clone()), &UpgradeOptions::default());
+    let marker = serde_json::to_vec(&cfg["partial"]).unwrap();
+    assert_eq!(Repo::open(fs.clone(), Some(alice.clone()), "alice").map(|r| r.format()).unwrap(), 9);
+    let objects = |r: &Path| veil_files(r).into_iter().filter(|(p, _)| p.to_string_lossy().contains("/objects/")).collect::<Vec<_>>();
+    let before = objects(&root);
+    let r = upgrade(fs.clone(), Some(alice.clone()), &UpgradeOptions::default()).unwrap();
+    assert_eq!((r.from, r.to), (9, REPO_FORMAT));
     let after: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert!(
-        matches!(opened, Err(VeilError::Unsupported(_))) && upgraded.is_err(),
-        "a thin clone was opened ({}) or upgraded ({}); repo.json is now {after}",
-        opened.as_ref().map(|_| "ok".to_string()).unwrap_or_else(|e| e.to_string()),
-        upgraded.as_ref().map(|r| format!("{} -> {}", r.from, r.to)).unwrap_or_else(|e| e.to_string()),
-    );
-    assert_eq!(std::fs::read(&path).unwrap(), before, "repo.json changed");
+    assert_eq!(after["format"], REPO_FORMAT, "{after}");
+    assert_eq!(serde_json::to_vec(&after["partial"]).unwrap(), marker, "the marker changed: {after}");
+    assert_eq!(objects(&root), before, "the upgrade rewrote objects");
+    let repo = Repo::open(fs.clone(), Some(alice), "alice").unwrap();
+    assert!(repo.config().is_partial(), "the upgraded repository is no longer a thin clone");
 }
 
 /// BUG-1390's class: `repo.json` keeps every field this build does not
@@ -1439,13 +1447,16 @@ fn a_thin_clone_of_format_9_is_refused_not_opened_or_upgraded_without_its_marker
 /// configuration is never taken as one this build understands.
 #[test]
 fn repo_json_keeps_the_fields_this_build_does_not_know() {
-    let raw = br#"{"format":9,"repo_id":"ab","remotes":{"origin":{"url":"veil://h/p","later":1}},"partial":{"remote":"origin","cache_limit":5}}"#;
+    let raw = br#"{"format":10,"repo_id":"ab","remotes":{"origin":{"url":"veil://h/p","later":1}},"later_top":{"x":5},"partial":{"remote":"origin","cache_limit":5}}"#;
     let c: veil_core::repo::RepoConfig = serde_json::from_slice(raw).unwrap();
+    assert!(c.is_partial(), "`partial` is a field this build knows");
     let back = serde_json::to_value(&c).unwrap();
+    assert_eq!(back["later_top"], serde_json::json!({"x": 5}), "{back}");
     assert_eq!(back["partial"], serde_json::json!({"remote": "origin", "cache_limit": 5}), "{back}");
     assert_eq!(back["remotes"]["origin"]["later"], 1, "{back}");
     let e = c.check_known().unwrap_err();
-    assert!(matches!(e, VeilError::Unsupported(_)) && e.to_string().contains("\"partial\"") && e.to_string().contains("\"later\""), "{e}");
+    let m = e.to_string();
+    assert!(matches!(e, VeilError::Unsupported(_)) && m.contains("\"later_top\"") && m.contains("\"later\"") && !m.contains("partial"), "{e}");
     let known: veil_core::repo::RepoConfig = serde_json::from_slice(br#"{"format":10,"repo_id":"ab"}"#).unwrap();
     assert!(known.check_known().is_ok());
 }
