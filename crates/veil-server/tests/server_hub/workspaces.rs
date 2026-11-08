@@ -1368,3 +1368,292 @@ fn bug_1507_a_refused_path_stays_hidden_after_its_bytes_are_held() {
     assert_eq!(r.as_deref().map_err(|e| e.to_string()), Ok(SAME.as_bytes()), "held bytes, hidden at a path naming them for the rest of the 10 s");
 }
 
+// ---- Review of `s8h` (BUG-1508's fix): guarantees ----
+
+const Q3: &str = "MARKER-Q3-BILLING-8f2c41aa\n";
+
+/// fin's thin clone with `@` on `feature` (the billing folder written while
+/// fin could read it), then `feature` changes the billing folder again, fin
+/// holds the trees above it, and loses access: the next checkout leaves the
+/// folder out.
+fn left_out_by_a_checkout(p: &Project, hub: &TestHub, name: &str) -> PathBuf {
+    let d = plain_thin(p, hub, name);
+    p.fin.ok(&d, &["new", "feature"]);
+    assert!(d.join(format!("{BILL_DIR}/acme/q2.txt")).is_file(), "fin read the billing folder first");
+    feature_with(p, &[(&format!("{BILL_DIR}/acme/q3.txt"), Q3), ("src/more.txt", "more\n")], &[], "more billing");
+    p.fin.ok(&d, &["pull"]);
+    p.fin.ok(&d, &["cat", "-r", "feature", "src/lib.rs"]);
+    d
+}
+
+/// The entry at `path` in the tree of `@` (snapshotted by the command just
+/// run) and of its parent.
+fn wc_entries(clone: &Path, path: &str) -> (Option<veil_core::TreeEntry>, Option<veil_core::TreeEntry>) {
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(clone)), None, "test").unwrap();
+    let wc = repo.snapshot(&repo.view().workspace("default").unwrap().wc).unwrap();
+    let parent = repo.snapshot(&wc.parents[0]).unwrap();
+    let at = |t: &veil_core::ObjectId| veil_core::tree::lookup(repo.store(), t, &veil_core::VPath::new(path).unwrap()).unwrap();
+    (at(&wc.tree), at(&parent.tree))
+}
+
+/// The files of `files` below `dir/`.
+fn below(files: &BTreeMap<String, Vec<u8>>, dir: &str) -> BTreeMap<String, Vec<u8>> {
+    files.iter().filter(|(k, _)| k.starts_with(&format!("{dir}/"))).map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// Change `mine` (two files in `src/`) and its child `kid` on `main` in a
+/// thin clone of fin's, `@` on top, no tag moved; `feature`'s root held.
+fn fin_chain(p: &Project, hub: &TestHub, name: &str) -> PathBuf {
+    let d = plain_thin(p, hub, name);
+    write_files(&d, &[("src/mine.txt", "fin's change\n"), ("src/mine2.txt", "fin's second file\n")]);
+    p.fin.ok(&d, &["commit", "--no-advance", "-m", "fin's change"]);
+    p.fin.ok(&d, &["tag", "set", "mine", "-r", "@-"]);
+    write_files(&d, &[("src/kid.txt", "kid\n")]);
+    p.fin.ok(&d, &["commit", "--no-advance", "-m", "kid"]);
+    p.fin.ok(&d, &["tag", "set", "kid", "-r", "@-"]);
+    p.fin.ok(&d, &["cat", "-r", "feature", "src/lib.rs"]);
+    d
+}
+
+/// Guarantee 1: no writer loses or changes a refused folder only one side
+/// changed. A rebase with a descendant, a split and a squash by path, a
+/// whole squash and a commit after the checkout left the folder out each
+/// keep `feature`'s billing folder by its exact id (pushing them is
+/// BUG-1509's).
+#[test]
+fn s8h_review_writers_keep_a_refused_folder_by_id() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name, "--confirm", &p.fin.fingerprint()]);
+    let d = fin_chain(&p, &hub, "chain");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let theirs = entry_in(&d, "feature", BILL_DIR);
+    assert_ne!(theirs.id, entry_in(&d, "main", BILL_DIR).id, "feature changed the billing folder");
+    let keeps = |what: &str, tags: &[&str]| {
+        for t in tags {
+            assert_eq!(entry_in(&d, t, BILL_DIR), theirs, "{what}: {t} keeps feature's billing folder by id");
+        }
+    };
+    let out = p.fin.ok(&d, &["rebase", "-s", "mine", "-d", "feature"]);
+    assert!(out.contains("Rebased"), "{out}");
+    assert!(out.contains(&format!("redacted {BILL_DIR}/")), "the checkout leaves the folder out: {out}");
+    keeps("rebase, with a descendant", &["mine", "kid"]);
+    let out = p.fin.ok(&d, &["split", "-r", "mine", "src/mine.txt", "-m", "first"]);
+    assert!(out.contains("first") || out.contains("Split"), "{out}");
+    p.fin.ok(&d, &["tag", "set", "first", "-r", "mine-"]);
+    assert_eq!(p.fin.ok(&d, &["cat", "-r", "first", "src/mine.txt"]), "fin's change\n");
+    keeps("split by path", &["first", "mine", "kid"]);
+    let out = p.fin.ok(&d, &["squash", "-r", "mine", "src/mine2.txt"]);
+    assert!(out.contains("Squashed") || out.contains("Moved"), "{out}");
+    assert_eq!(p.fin.ok(&d, &["cat", "-r", "first", "src/mine2.txt"]), "fin's second file\n");
+    keeps("squash by path", &["first", "kid"]);
+    let out = p.fin.ok(&d, &["squash", "-r", "kid"]);
+    assert!(out.contains("Squashed"), "{out}");
+    keeps("whole squash", &["first"]);
+    write_files(&d, &[("src/after.txt", "after\n")]);
+    p.fin.ok(&d, &["commit", "--no-advance", "-m", "after"]);
+    p.fin.ok(&d, &["tag", "set", "after", "-r", "@-"]);
+    keeps("commit after the checkout left the folder out", &["after"]);
+    // Readers of `after` see the folder hidden, and read the rest.
+    let ls = p.fin.ok(&d, &["ls", "-r", "after"]);
+    assert!(ls.contains(&format!("{BILL_DIR}/")) && ls.contains("src/kid.txt"), "{ls}");
+}
+
+/// Guarantees 2 and 4: the checkout that leaves a folder out removes only
+/// what it wrote there; the person's files (a personal key, which stays on
+/// the device, and an editor's scratch file) are kept byte for byte, an
+/// edit recorded before it is kept in history, and nothing of the refused
+/// version is written. When access comes back the folder is written whole
+/// again: exactly `feature`'s files, with nothing recorded deleted.
+#[test]
+fn s8h_review_a_left_out_folder_keeps_the_persons_files_and_comes_back_whole() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let d = left_out_by_a_checkout(&p, &hub, "wc");
+    let pem = format!("{BILL_DIR}/acme/deploy.pem");
+    let scratch = format!("{BILL_DIR}/acme/invoice.txt~");
+    write_files(&d, &[(&pem, "MINE-PEM-41d0\n"), (&scratch, "MINE-SCRATCH-9a7e\n"), (&format!("{BILL_DIR}/acme/invoice.txt"), "MINE-EDIT-5c2b\n")]);
+    p.fin.ok(&d, &["tag", "set", "edits", "-r", "@"]);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&d, &["new", "feature"]);
+    assert!(out.contains(&format!("redacted {BILL_DIR}/")), "{out}");
+    let files = walk(&d);
+    let mine = |f: &BTreeMap<String, Vec<u8>>| (f.get(&pem).cloned(), f.get(&scratch).cloned());
+    assert_eq!(mine(&files), (Some(b"MINE-PEM-41d0\n".to_vec()), Some(b"MINE-SCRATCH-9a7e\n".to_vec())), "the person's files are kept");
+    for gone in ["acme/invoice.txt", "acme/q2.txt", "acme/q3.txt"] {
+        assert!(!files.contains_key(&format!("{BILL_DIR}/{gone}")), "{gone}: {:?}", below(&files, BILL_DIR).keys().collect::<Vec<_>>());
+    }
+    assert!(files.values().all(|v| !String::from_utf8_lossy(v).contains(Q3.trim())), "nothing of the refused version");
+    assert_eq!(p.fin.ok(&d, &["cat", "-r", "edits", &format!("{BILL_DIR}/acme/invoice.txt")]), "MINE-EDIT-5c2b\n", "the edit is kept in history");
+    let st = p.fin.ok(&d, &["status"]);
+    assert!(st.contains(BILL_DIR) && st.contains("no longer have access"), "vl status says the folder is left out: {st}");
+    let want = entry_in(&d, "feature", BILL_DIR);
+    assert_eq!(wc_entries(&d, BILL_DIR), (Some(want.clone()), Some(want.clone())), "@ carries the folder by id");
+    // Access comes back.
+    p.admin.ok(&p.dir, &["group", "add", "finance", &p.fin.name]);
+    let st = p.fin.ok(&d, &["status"]);
+    assert!(st.contains("no changes"), "nothing recorded deleted or added: {st}");
+    assert_eq!(wc_entries(&d, BILL_DIR).0, Some(want), "@ still holds feature's folder");
+    let mut expected = below(&reference(&p, &hub, &p.fin), BILL_DIR);
+    expected.insert(pem.clone(), b"MINE-PEM-41d0\n".to_vec());
+    expected.insert(scratch.clone(), b"MINE-SCRATCH-9a7e\n".to_vec());
+    assert_eq!(below(&walk(&d), BILL_DIR), expected, "the folder written whole again, nothing duplicated or lost");
+}
+
+/// Guarantee 3: readers show a refused folder by its path only: nothing
+/// below it (names, sizes, ids, content) in text, JSON or errors, and a
+/// path below it reads the same whether or not it exists.
+#[test]
+fn s8h_review_readers_reveal_nothing_inside_a_refused_folder() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let d = left_out_by_a_checkout(&p, &hub, "wc");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    p.fin.ok(&d, &["new", "feature"]);
+    let q3_id = entry_in(&p.dir, "feature", &format!("{BILL_DIR}/acme/q3.txt")).id.to_string();
+    let inside = [format!("{BILL_DIR}/acme"), "q3.txt".into(), "q2.txt".into(), Q3.trim().into(), FEATURE_BILL.into(), q3_id[..16].to_string()];
+    let readers: Vec<Vec<&str>> = vec![
+        vec!["show", "feature"],
+        vec!["show", "feature", "--json"],
+        vec!["show", "feature", "--stat"],
+        vec!["diff", "--from", "feature-", "--to", "feature", "--json"],
+        vec!["ls", "-r", "feature", "--json"],
+        vec!["files", "-r", "feature"],
+        vec!["grep", "-r", "feature", "--json", "MARKER"],
+        vec!["log", "-r", "feature-..feature", "--json"],
+        vec!["log", "-r", "feature-..feature", "-S", "MARKER", "--pickaxe-all"],
+        vec!["status", "--json"],
+    ];
+    for args in &readers {
+        let out = p.fin.ok(&d, args);
+        for n in &inside {
+            assert!(!out.contains(n.as_str()), "vl {args:?} shows {n}: {out}");
+        }
+    }
+    let ls: serde_json::Value = serde_json::from_str(p.fin.ok(&d, &["ls", "-r", "feature", "--json"]).lines().next().unwrap()).unwrap();
+    let e = ls["entries"].as_array().unwrap().iter().find(|e| e["path"].as_str().is_some_and(|x| x.starts_with(BILL_DIR))).expect("the folder is listed");
+    assert_eq!((e["dir"].clone(), e["size"].clone(), e["visibility"].clone()), (serde_json::json!(true), serde_json::Value::Null, serde_json::Value::Null), "{e}");
+    let g: serde_json::Value = serde_json::from_str(p.fin.ok(&d, &["grep", "-r", "feature", "--json", "MARKER"]).lines().next().unwrap()).unwrap();
+    assert_eq!(g["skipped"]["hidden_folders"], 1, "{g}");
+    // A path below it: the same answer whether it exists or not.
+    for cmd in ["cat", "blame"] {
+        let there = p.fin.fails(&d, &[cmd, "-r", "feature", &format!("{BILL_DIR}/acme/q3.txt")]);
+        let absent = p.fin.fails(&d, &[cmd, "-r", "feature", &format!("{BILL_DIR}/acme/q9.txt")]);
+        assert!(there.contains("no longer have access"), "{there}");
+        assert_eq!(there.replace("q3.txt", "q9.txt"), absent, "vl {cmd}: an existence oracle");
+    }
+}
+
+/// BUG-1528: a file the person creates in a folder the checkout left out is
+/// neither recorded nor reported: `vl status` says "no changes", and `vl
+/// commit` records the folder by id without it.
+#[test]
+#[ignore = "BUG-1528: a file created in a folder the checkout left out is silently not recorded, and vl status does not say so"]
+fn bug_1528_a_file_made_in_a_left_out_folder_is_not_recorded_silently() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let d = left_out_by_a_checkout(&p, &hub, "wc");
+    write_files(&d, &[(&format!("{BILL_DIR}/acme/deploy.pem"), "MINE-PEM\n")]);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&d, &["new", "feature"]);
+    assert!(out.contains(&format!("redacted {BILL_DIR}/")), "{out}");
+    write_files(&d, &[(&format!("{BILL_DIR}/acme/after.txt"), "MINE-AFTER\n")]);
+    let st = p.fin.ok(&d, &["status"]);
+    assert!(st.contains(&format!("{BILL_DIR}/acme/after.txt")), "vl status says what became of the new file: {st}");
+}
+
+/// BUG-1529: `vl restore`, `vl split` and `vl squash` by path refuse when a
+/// refused folder differs between the trees they compare, even though the
+/// paths asked for are elsewhere and the folder can be kept by id.
+#[test]
+#[ignore = "BUG-1529: restore, split and squash by path refuse a refused folder that is not among the paths asked for"]
+fn bug_1529_restore_split_squash_refuse_a_refused_folder_not_asked_for() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let d = left_out_by_a_checkout(&p, &hub, "wc");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    p.fin.ok(&d, &["new", "feature"]);
+    let theirs = entry_in(&d, "feature", BILL_DIR);
+    for args in [vec!["restore", "--from", "feature-", "src/lib.rs"], vec!["split", "-r", "feature", "src/more.txt", "-m", "first"], vec!["squash", "-r", "feature", "src/more.txt"]] {
+        let o = p.fin.run(&d, &args);
+        let all = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert!(o.status.success(), "vl {args:?}: {all}");
+    }
+    assert_eq!(entry_in(&d, "feature", BILL_DIR), theirs, "the folder kept by id");
+}
+
+/// BUG-1530: in a thin clone whose working copy carries a refused folder
+/// by id (here: the checkout left it out), `vl pull` (which the refusal's
+/// own message recommends) wedges the working copy: afterwards every
+/// command fails with "the Veil server could not be reached: '…' is not
+/// fetched, and the server has no copy of it where this clone met it; run
+/// `vl pull`", `vl pull` included in the advice, so there is no way out.
+#[test]
+#[ignore = "BUG-1530: after vl pull, every command in a working copy carrying a refused folder fails with 'server could not be reached'"]
+fn bug_1530_a_pull_wedges_a_working_copy_carrying_a_refused_folder() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let d = left_out_by_a_checkout(&p, &hub, "wc");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&d, &["new", "feature"]);
+    assert!(out.contains(&format!("redacted {BILL_DIR}/")), "{out}");
+    p.fin.ok(&d, &["pull"]);
+    let st = p.fin.ok(&d, &["status"]);
+    assert!(st.contains(BILL_DIR) && st.contains("no longer have access"), "{st}");
+    p.fin.ok(&d, &["log", "-n", "3"]);
+    p.fin.ok(&d, &["show", "@-"]);
+}
+
+/// BUG-1509 (another route, found by the review of `s8h`): work that
+/// carries a refused folder by id cannot reach anyone.
+/// fin rebases a change of `src/` onto `feature` (the billing folder, which
+/// fin lost access to, kept by id) and pushes it: the server refuses
+/// ("you do not have access to 'bill-…'"), though the change leaves that
+/// folder exactly as its parent has it. Expected: the push lands, and the
+/// admin's checkout of it holds every billing file of `feature`, byte for
+/// byte.
+#[test]
+#[ignore = "BUG-1509: a change on a stale view that carries a refused folder by id is refused by the push (forbidden)"]
+fn bug_1509_a_change_carrying_a_refused_folder_by_id_cannot_be_pushed() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name, "--confirm", &p.fin.fingerprint()]);
+    let d = fin_chain(&p, &hub, "chain");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&d, &["rebase", "-s", "mine", "-d", "feature"]);
+    assert!(out.contains("Rebased"), "{out}");
+    assert_eq!(entry_in(&d, "kid", BILL_DIR), entry_in(&d, "feature", BILL_DIR));
+    p.fin.ok(&d, &["push", "-t", "kid"]);
+    p.admin.ok(&p.dir, &["pull"]);
+    p.admin.ok(&p.dir, &["new", "feature"]);
+    let want = below(&walk(&p.dir), BILL_DIR);
+    p.admin.ok(&p.dir, &["new", "kid"]);
+    let got = walk(&p.dir);
+    assert_eq!(below(&got, BILL_DIR), want, "every file of the billing folder, byte for byte");
+    assert_eq!(got.get("src/kid.txt").map(Vec::as_slice), Some(b"kid\n".as_slice()));
+}
+
+/// BUG-1531: a secret the checkout kept on disk when it left its folder
+/// out (it could not tell it as its own) stays stale when access comes
+/// back: the folder's other files are filled in, the new `.env` is not, and
+/// the working copy holds the old secret while history holds the new one
+/// ("kept as recorded … its edit is not recorded").
+#[test]
+#[ignore = "BUG-1531: when access comes back, a secret left on disk by the checkout that left its folder out stays stale"]
+fn bug_1531_a_secret_left_on_disk_stays_stale_when_access_comes_back() {
+    const NEW_ENV: &str = "KEY=MARKER-NEW-ENV-71c0d2e9\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let d = plain_thin(&p, &hub, "wc");
+    p.fin.ok(&d, &["new", "feature"]);
+    feature_with(&p, &[(&format!("{BILL_DIR}/.env"), NEW_ENV), (&format!("{BILL_DIR}/acme/invoice.txt"), "MARKER-NEW-INVOICE-0b8e\n")], &[], "rotate billing");
+    p.fin.ok(&d, &["pull"]);
+    p.fin.ok(&d, &["cat", "-r", "feature", "src/lib.rs"]);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&d, &["new", "feature"]);
+    assert!(out.contains(&format!("redacted {BILL_DIR}/")), "{out}");
+    p.admin.ok(&p.dir, &["group", "add", "finance", &p.fin.name]);
+    let st = p.fin.ok(&d, &["status"]);
+    assert_eq!(std::fs::read_to_string(d.join(format!("{BILL_DIR}/acme/invoice.txt"))).unwrap(), "MARKER-NEW-INVOICE-0b8e\n", "{st}");
+    assert_eq!(std::fs::read_to_string(d.join(format!("{BILL_DIR}/.env"))).unwrap(), NEW_ENV, "the folder written whole again: {st}");
+}
