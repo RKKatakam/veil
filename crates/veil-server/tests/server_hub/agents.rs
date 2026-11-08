@@ -1267,7 +1267,7 @@ fn an_agent_session_creates_a_new_projects_default_branch_only_without_access_fi
     let atok = admin.token();
     let r = api.post(Some(&atok), &format!("/v1/projects/{name}"), b"", false);
     assert_eq!(r.status, 200, "{}", body(&r));
-    assert!(api.tips(Some(&atok), &name).unwrap().branches.get("main").is_none(), "control: no main yet");
+    assert!(!api.tips(Some(&atok), &name).unwrap().branches.contains_key("main"), "control: no main yet");
     let agent = agent_token(&hub, &atok, &name, &[]);
     let identity = admin.identity();
     // A first snapshot holding `files`, on the universal root.
@@ -1322,7 +1322,7 @@ fn an_agent_session_creates_a_new_projects_default_branch_only_without_access_fi
     for files in [vec![(".veilrules", "main  2 approvals\n"), ("README", "r")], vec![(".veilpolicy", "src/  public\n"), ("README", "r")]] {
         let r = push_main(&files);
         assert!(r.status == 403 && body(&r).contains("agent_session"), "{files:?}: {} {}", r.status, body(&r));
-        assert!(api.tips(Some(&atok), &name).unwrap().branches.get("main").is_none(), "{files:?}: main was created");
+        assert!(!api.tips(Some(&atok), &name).unwrap().branches.contains_key("main"), "{files:?}: main was created");
     }
     let r = push_main(&[("README", "r")]);
     assert_eq!(r.status, 200, "{}", body(&r));
