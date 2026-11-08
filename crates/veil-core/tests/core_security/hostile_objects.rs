@@ -251,7 +251,7 @@ fn pull_skips_tags_with_hostile_names_or_non_snapshot_targets() {
     assert!(tags.iter().any(|t| *t == "main"), "{tags:?}");
     assert!(!tags.iter().any(|t| t.contains('\x1b') || *t == "points-at-tree"), "{tags:?}");
     assert!(!victim.view().remote_tags.keys().any(|t| t.contains('\x1b') || t.ends_with("points-at-tree")));
-    assert!(victim.visible_snapshots().is_ok());
+    assert!(victim.exact().visible().is_ok());
     assert!(report.warnings.iter().all(|w| !w.contains('\x1b')), "{:?}", report.warnings);
     assert_eq!(report.warnings.iter().filter(|w| w.contains("skipped remote tag")).count(), 2);
 }

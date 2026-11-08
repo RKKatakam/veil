@@ -10,5 +10,5 @@
 use crate::adversarial_support;
 
 mod conflicts;
-mod pack;
+pub(crate) mod pack;
 mod scanner;

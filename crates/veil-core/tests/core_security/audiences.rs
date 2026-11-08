@@ -54,7 +54,7 @@ fn mal_main(alice: &Repo, main: ObjectId) -> ObjectId {
     let mal = Visibility::Cloaked {
         scope: "mal".into(),
     };
-    let mut root = (*store.tree(&store.snapshot(&main).unwrap().tree).unwrap()).clone();
+    let mut root = (*store.tree(&alice.snapshot(&main).unwrap().tree).unwrap()).clone();
     let mut secrets = (*store.tree(&root.get("secrets").unwrap().id).unwrap()).clone();
     let mut e = secrets.get(".env.db").unwrap().clone();
     e.id = store.store_file(THEIRS.as_bytes(), &mal).unwrap();

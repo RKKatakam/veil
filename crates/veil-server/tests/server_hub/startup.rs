@@ -168,3 +168,97 @@ fn requests_survive_a_schema_change() {
     eprintln!("{} requests, {} schema changes", done.load(Ordering::Relaxed), changes.load(Ordering::Relaxed));
     assert!(changes.load(Ordering::Relaxed) >= 4 && done.load(Ordering::Relaxed) > 0);
 }
+
+/// BUG-1383 (S3 redesign, cycle 3; property 4: the migration's cache clear
+/// runs in bounded time on large tables). Migration 21 (19 when it was
+/// filed) cleared the viewer graph with `DELETE FROM view_graph`, one
+/// statement whose time grows with
+/// the table, inside the migration's transaction, under every connection's
+/// `statement_timeout` (`db::STATEMENT_TIMEOUT`, 15 s). Past what the
+/// database deletes in that time (a few million rows on PostgreSQL, far
+/// fewer on YugabyteDB: one row per projected snapshot and view key, so a
+/// large project's graph for a dozen view keys), the statement is cancelled
+/// (`57014`, which `migrate` runs again, the same way, until its ten-minute
+/// deadline), and `veil-server migrate` never finishes: no server of the
+/// release starts. Scaled down here: `VEIL_TEST_GRAPH_ROWS` rows (default
+/// 2,000,000) and a statement timeout of 250 ms, the same ratio of rows to
+/// time as 120 million rows in 15 s, or fewer on a slower disk. A clear
+/// whose time does not grow with the table (`TRUNCATE`) finishes.
+#[test]
+fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
+    let rt = runtime();
+    let (url, name) = fresh_database(&rt);
+    let rows: i64 = std::env::var("VEIL_TEST_GRAPH_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000_000);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 1).await.unwrap();
+        // The schema before migration 21, applied and recorded as `migrate` does.
+        sqlx::raw_sql("CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)")
+            .execute(&db)
+            .await
+            .unwrap();
+        for (version, name, sql) in veil_server::db::MIGRATIONS.iter().filter(|m| m.0 < 21) {
+            // YugabyteDB's catalog is shared: DDL can lose a race with
+            // another database's, and is run again (as `migrate` does).
+            let mut tries = 0;
+            while let Err(e) = sqlx::raw_sql(sql).execute(&db).await {
+                tries += 1;
+                let retryable = e.as_database_error().and_then(|d| d.code()).is_some_and(|c| c == "40001" || c == "40P01");
+                assert!(retryable && tries < 50, "migration {version}: {e}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, 0)")
+                .bind(version)
+                .bind(name)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        assert!(!veil_server::db::schema_current(&db).await.unwrap(), "migration 21 is still to apply");
+        // A large viewer graph, a batch per statement.
+        let batch = 100_000i64;
+        let mut lo = 0i64;
+        while lo < rows {
+            let hi = (lo + batch).min(rows);
+            sqlx::query(
+                "INSERT INTO view_graph (project_id, view_key, snapshot, generation, depth, parents, flags, skip, down_id, real_id) \
+                 SELECT 1 + i % 4, 'k' || (i % 12), md5(i::text) || md5((i + 1)::text), i, i, '[]', 0, '[]', '', '' \
+                 FROM generate_series($1::BIGINT, $2::BIGINT - 1) i",
+            )
+            .bind(lo)
+            .bind(hi)
+            .execute(&db)
+            .await
+            .unwrap();
+            lo = hi;
+        }
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM view_graph").fetch_one(&db).await.unwrap();
+        assert_eq!(n, rows);
+        db.close().await;
+    });
+    let started = std::time::Instant::now();
+    let migrated = rt.block_on(async {
+        let opts: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+        let opts = opts.options([("statement_timeout", "250"), ("lock_timeout", "250")]);
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(60), veil_server::db::migrate(&pool)).await;
+        pool.close().await;
+        r
+    });
+    let took = started.elapsed();
+    assert!(
+        matches!(migrated, Ok(Ok(()))),
+        "migrating {rows} viewer graph rows under a 250 ms statement timeout did not finish within 60 s ({took:?}): {:?}",
+        migrated.map(|r| r.map_err(|e| e.to_string()))
+    );
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 1).await.unwrap();
+        assert!(veil_server::db::schema_current(&db).await.unwrap());
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM view_graph").fetch_one(&db).await.unwrap();
+        assert_eq!(n, 0, "the viewer graph (a cache) is cleared");
+        db.close().await;
+        // The test's own database goes (the shared server keeps no leftovers).
+        let admin = veil_server::db::connect(&std::env::var("VEIL_TEST_DATABASE_URL").unwrap(), 1).await.unwrap();
+        sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")).execute(&admin).await.unwrap();
+        admin.close().await;
+    });
+}

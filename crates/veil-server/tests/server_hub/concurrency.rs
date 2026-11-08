@@ -82,7 +82,7 @@ fn concurrent_pushers_lose_no_update() {
     let mut id = repo.view().tags["main"].target;
     let mut descs = Vec::new();
     loop {
-        let s = repo.store().snapshot(&id).unwrap();
+        let s = repo.snapshot(&id).unwrap();
         let t = s.description.as_str();
         if t.starts_with('w') && t.contains('-') {
             descs.push(t.to_string());

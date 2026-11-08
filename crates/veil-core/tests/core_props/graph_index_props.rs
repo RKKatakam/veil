@@ -108,39 +108,41 @@ fn naive_generation(repo: &Repo, id: &ObjectId, memo: &mut HashMap<ObjectId, Opt
     if let Some(g) = memo.get(id) {
         return *g;
     }
-    // A corrected commit date: the timestamp, or one more than the parents.
-    let g = repo.snapshot_opt(id).unwrap().map(|s| {
+    // A corrected commit date: the timestamp (clamped to 0 ..= i64::MAX /
+    // 4), or one more than the highest parent held; 0 for a root dated 0
+    // (the server's arithmetic, BUG-1316).
+    let g = repo.exact().snapshot(id).unwrap().map(|s| {
         let mut g = 0;
         for p in &s.parents {
             if let Some(pg) = naive_generation(repo, p, memo) {
-                g = g.max(pg);
+                g = g.max(pg + 1);
             }
         }
-        (g + 1).max(s.timestamp.max(0) as u64)
+        g.max(s.timestamp.clamp(0, i64::MAX / 4) as u64)
     });
     memo.insert(*id, g);
     g
 }
 
 fn reachable(repo: &Repo, roots: &[ObjectId]) -> HashSet<ObjectId> {
-    repo.topo_children_first(roots.iter().copied()).unwrap().into_iter().collect()
+    repo.exact().topo_children_first(roots.iter().copied()).unwrap().into_iter().collect()
 }
 
 /// Check every query against the full walks, for some roots and pairs.
 fn check_all(repo: &Repo, nodes: &[ObjectId], pick: &[usize]) {
     let pick: Vec<ObjectId> = pick.iter().map(|i| nodes[i % nodes.len()]).collect();
     let roots: Vec<ObjectId> = pick.iter().take(3).copied().collect();
-    let g = repo.graph();
+    let g = repo.held().index();
     // Order: exactly `topo_children_first`'s (threat 12).
-    let lazy: Vec<ObjectId> = repo.topo_iter(roots.iter().copied()).map(Result::unwrap).collect();
-    assert_eq!(lazy, repo.topo_children_first(roots.iter().copied()).unwrap(), "topo order");
+    let lazy: Vec<ObjectId> = repo.held().topo_iter(roots.iter().copied()).map(Result::unwrap).collect();
+    assert_eq!(lazy, repo.exact().topo_children_first(roots.iter().copied()).unwrap(), "topo order");
     // Every node a root (old tags and branches among the refs).
-    let all: Vec<ObjectId> = repo.topo_iter(nodes.iter().copied()).map(Result::unwrap).collect();
-    assert_eq!(all, repo.topo_children_first(nodes.iter().copied()).unwrap(), "topo order, all roots");
+    let all: Vec<ObjectId> = repo.held().topo_iter(nodes.iter().copied()).map(Result::unwrap).collect();
+    assert_eq!(all, repo.exact().topo_children_first(nodes.iter().copied()).unwrap(), "topo order, all roots");
     let mut memo = HashMap::new();
     for id in nodes {
         // Generations strictly decrease along every edge.
-        if let (Some(gen), Some(s)) = (g.generation(repo, id).unwrap(), repo.snapshot_opt(id).unwrap()) {
+        if let (Some(gen), Some(s)) = (g.generation(repo, id).unwrap(), repo.exact().snapshot(id).unwrap()) {
             for p in &s.parents {
                 if let Some(pg) = g.generation(repo, p).unwrap() {
                     assert!(pg < gen, "generation of a parent below its child's");
@@ -151,9 +153,9 @@ fn check_all(repo: &Repo, nodes: &[ObjectId], pick: &[usize]) {
     }
     for a in &pick {
         for b in &pick {
-            let naive = a == b || repo.ancestors(b).unwrap().contains(a);
+            let naive = a == b || repo.held().ancestors(b).unwrap().contains(a);
             assert_eq!(repo.is_ancestor(a, b).unwrap(), naive, "is_ancestor");
-            assert_eq!(repo.merge_bases(&[*a], &[*b]).unwrap(), repo.merge_bases_naive(&[*a], &[*b]).unwrap(), "merge bases");
+            assert_eq!(repo.merge_bases(&[*a], &[*b]).unwrap(), repo.held().merge_bases_naive(&[*a], &[*b]).unwrap(), "merge bases");
         }
     }
     let (inc, exc) = pick.split_at(pick.len() / 2);
@@ -203,7 +205,7 @@ proptest! {
         // Empty index, computed on the fly.
         check_all(&repo, &ids, &pick);
         // Persisted, then read back by another handle.
-        repo.graph().persist(&repo);
+        repo.held().index().persist(&repo);
         let reopened = Repo::open(backend.clone(), None, "t").unwrap();
         check_all(&reopened, &ids, &pick);
         // The late snapshots arrive: some were missing parents of indexed
@@ -215,9 +217,9 @@ proptest! {
         }
         let later = Repo::open(backend.clone(), None, "t").unwrap();
         check_all(&later, &ids, &pick);
-        later.graph().persist(&later);
+        later.held().index().persist(&later);
         // So must a handle that indexed before they arrived.
-        reopened.graph().revalidate(&reopened);
+        reopened.held().index().revalidate(&reopened);
         check_all(&reopened, &ids, &pick);
         // A damaged layer (threat 5): one byte flipped, or cut short.
         let files = index_files(&*backend);
@@ -249,9 +251,9 @@ proptest! {
             let _ = backend.remove_dir_all(&dir);
             let r = Repo::open(backend.clone(), identity, "t").unwrap();
             for id in &ids {
-                r.graph().generation(&r, id).unwrap();
+                r.held().index().generation(&r, id).unwrap();
             }
-            r.graph().persist(&r);
+            r.held().index().persist(&r);
             index_files(&*backend).into_iter().map(|(_, d)| d).collect::<Vec<_>>()
         };
         let without = build_with(None);

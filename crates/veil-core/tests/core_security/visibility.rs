@@ -95,13 +95,13 @@ fn a_tag_on_the_embargoed_fix_is_not_pushed_until_release() {
     assert!(r.tags_skipped.iter().any(|(t, _)| t == "fix"), "{:?}", r.tags_skipped);
     assert!(r.tags_skipped.iter().any(|(t, _)| t == "main"), "{:?}", r.tags_skipped);
     assert!(backend_contains(&*mirror, b"verify_signature").is_empty());
-    assert!(anon(mirror.clone()).snapshot_opt(&e.fix).unwrap().is_none());
+    assert!(anon(mirror.clone()).exact().snapshot(&e.fix).unwrap().is_none());
 
     e.alice.release_embargo(&e.embargo).unwrap();
     let r = remote::push(&mut e.alice, mirror.clone(), true, &[], false).unwrap();
     assert!(r.tags_skipped.is_empty(), "{:?}", r.tags_skipped);
     let pubrepo = anon(mirror);
-    assert!(pubrepo.snapshot_opt(&e.fix).unwrap().is_some(), "the fix's history follows the release");
+    assert!(pubrepo.exact().snapshot(&e.fix).unwrap().is_some(), "the fix's history follows the release");
     assert!(String::from_utf8(read_at(&pubrepo, &e.fix, "auth.rs")).unwrap().contains("verify_signature"));
 }
 
@@ -127,15 +127,15 @@ fn a_team_remote_does_not_get_a_plaintext_fix_before_release() {
     assert!(backend_contains(&*team, b"verify_signature").is_empty());
     // The embargoed history is withheld from every push, team remotes too.
     let bob = anon(team.clone());
-    assert!(bob.snapshot_opt(&e.fix).unwrap().is_none());
-    assert!(bob.snapshot_opt(&e.merge).unwrap().is_none());
+    assert!(bob.exact().snapshot(&e.fix).unwrap().is_none());
+    assert!(bob.exact().snapshot(&e.merge).unwrap().is_none());
     assert!(bob.view().tags.get("main").is_none_or(|t| t.target == e.main));
     // Released, the team remote receives it.
     e.alice.release_embargo(&e.embargo).unwrap();
     remote::push(&mut e.alice, team.clone(), false, &[], false).unwrap();
     let bob = anon(team);
     assert_eq!(bob.view().tags["main"].target, e.merge);
-    assert!(bob.snapshot_opt(&e.fix).unwrap().is_some());
+    assert!(bob.exact().snapshot(&e.fix).unwrap().is_some());
 }
 
 #[test]
@@ -145,9 +145,9 @@ fn a_clone_of_the_mirror_works_without_the_withheld_history_and_fills_it_on_rele
     let mirror = Arc::new(MemoryBackend::new());
     remote::push(&mut e.alice, mirror.clone(), true, &[], false).unwrap();
     let (mut carol, _cfs) = clone_of("carol", mirror.clone());
-    assert!(!carol.visible_snapshots().unwrap().contains(&e.merge));
-    assert!(carol.snapshot_opt(&e.merge).unwrap().is_none());
-    assert!(carol.visible_snapshots().unwrap().contains(&e.main));
+    assert!(!carol.exact().visible().unwrap().contains(&e.merge));
+    assert!(carol.exact().snapshot(&e.merge).unwrap().is_none());
+    assert!(carol.exact().visible().unwrap().contains(&e.main));
     // gc and fsck on the clone are fine without the withheld history.
     let r = gc(
         &mut carol,
@@ -164,7 +164,7 @@ fn a_clone_of_the_mirror_works_without_the_withheld_history_and_fills_it_on_rele
     e.alice.release_embargo(&e.embargo).unwrap();
     remote::push(&mut e.alice, mirror.clone(), true, &[], false).unwrap();
     remote::pull(&mut carol, "origin", mirror).unwrap();
-    assert!(carol.snapshot_opt(&e.fix).unwrap().is_some());
+    assert!(carol.exact().snapshot(&e.fix).unwrap().is_some());
     assert!(carol.is_ancestor(&e.main, &e.merge).unwrap());
     assert!(String::from_utf8(read_at(&carol, &e.merge, "auth.rs")).unwrap().contains("verify_signature"));
 }
@@ -184,8 +184,8 @@ fn follow_up_commits_stay_under_the_embargo_until_release() {
     let mirror = Arc::new(MemoryBackend::new());
     remote::push(&mut e.alice, mirror.clone(), true, &["main".to_string()], false).unwrap();
     let pubrepo = anon(mirror.clone());
-    assert!(pubrepo.snapshot_opt(&next).unwrap().is_none(), "the follow-up reached the mirror");
-    assert!(pubrepo.snapshot_opt(&e.merge).unwrap().is_none(), "the embargoed merge reached the mirror");
+    assert!(pubrepo.exact().snapshot(&next).unwrap().is_none(), "the follow-up reached the mirror");
+    assert!(pubrepo.exact().snapshot(&e.merge).unwrap().is_none(), "the embargoed merge reached the mirror");
     assert!(backend_contains(&*mirror, b"CVE-2026-0001").is_empty());
 
     e.alice.release_embargo(&e.embargo).unwrap();
@@ -210,7 +210,7 @@ fn merging_into_an_embargoed_line_stays_embargoed() {
     let r = remote::push(&mut e.alice, mirror.clone(), true, &["main".to_string()], false).unwrap();
     assert!(r.tags_skipped.iter().any(|(t, why)| t == "main" && why.contains(&e.embargo)), "{r:?}");
     let pubrepo = anon(mirror.clone());
-    assert!(pubrepo.snapshot_opt(&res.snapshot).unwrap().is_none(), "the merge on the embargoed line reached the mirror");
+    assert!(pubrepo.exact().snapshot(&res.snapshot).unwrap().is_none(), "the merge on the embargoed line reached the mirror");
     assert!(backend_contains(&*mirror, b"verify_signature").is_empty());
     assert!(backend_contains(&*mirror, b"CVE-2026-0001").is_empty());
 
@@ -229,7 +229,7 @@ fn an_outsider_cannot_record_edits_on_top_of_an_embargo_or_merge_it() {
     // The embargoed merge never reaches an outsider: there is nothing to
     // record edits on top of, or to merge into.
     let (carol, _cfs) = clone_of("carol", mirror);
-    assert!(carol.snapshot_opt(&e.merge).unwrap().is_none(), "the embargoed merge reached the mirror");
+    assert!(carol.exact().snapshot(&e.merge).unwrap().is_none(), "the embargoed merge reached the mirror");
 }
 
 #[test]

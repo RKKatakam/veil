@@ -44,10 +44,10 @@ fn commits_append_layers_that_stay_few() {
     let reopened = Repo::open(backend.clone(), None, "t").unwrap();
     let wc = reopened.workspace_wc(WS).unwrap();
     let parent = reopened.snapshot(&wc).unwrap().parents[0];
-    let (g, pg) = (reopened.graph().generation(&reopened, &wc).unwrap(), reopened.graph().generation(&reopened, &parent).unwrap());
+    let (g, pg) = (reopened.held().index().generation(&reopened, &wc).unwrap(), reopened.held().index().generation(&reopened, &parent).unwrap());
     assert!(g.is_some() && pg.is_some() && g > pg, "{g:?} above {pg:?}");
-    let visible: Vec<_> = reopened.visible_iter().map(Result::unwrap).collect();
-    assert_eq!(visible, reopened.visible_snapshots().unwrap());
+    let visible: Vec<_> = reopened.held().visible_iter().map(Result::unwrap).collect();
+    assert_eq!(visible, reopened.exact().visible().unwrap());
 }
 
 /// Counts the layer files created (`create_new` under the index).
@@ -114,7 +114,7 @@ fn a_compaction_writes_one_merged_layer() {
     assert!(!names.is_empty() && names.len() <= 8, "layers: {names:?}");
     let reopened = Repo::open(backend.clone(), None, "t").unwrap();
     let wc = reopened.workspace_wc(WS).unwrap();
-    assert!(reopened.graph().generation(&reopened, &wc).unwrap().is_some());
+    assert!(reopened.held().index().generation(&reopened, &wc).unwrap().is_some());
 }
 
 /// Another process took the next slot first: the appender reads its layer
@@ -133,8 +133,8 @@ fn a_lost_slot_is_retried_after_the_winners_layer() {
     assert!(after.len() >= before.len(), "{before:?} -> {after:?}");
     let fresh = Repo::open(backend.clone(), None, "t").unwrap();
     let wc = fresh.workspace_wc(WS).unwrap();
-    assert!(fresh.graph().generation(&fresh, &wc).unwrap().is_some());
-    assert_eq!(fresh.visible_iter().map(Result::unwrap).collect::<Vec<_>>(), fresh.visible_snapshots().unwrap());
+    assert!(fresh.held().index().generation(&fresh, &wc).unwrap().is_some());
+    assert_eq!(fresh.held().visible_iter().map(Result::unwrap).collect::<Vec<_>>(), fresh.exact().visible().unwrap());
 }
 
 /// A layer of a voided epoch (left by a process that appended while the
@@ -147,7 +147,7 @@ fn layers_of_an_older_epoch_are_ignored() {
     backend.write(&dir().join("L-0-7-7.vcg"), b"not a layer").unwrap();
     backend.create_new(&dir().join("E-1"), b"").unwrap();
     let mut fresh = Repo::open(backend.clone(), None, "t").unwrap();
-    assert_eq!(fresh.visible_iter().map(Result::unwrap).collect::<Vec<_>>(), fresh.visible_snapshots().unwrap());
+    assert_eq!(fresh.held().visible_iter().map(Result::unwrap).collect::<Vec<_>>(), fresh.exact().visible().unwrap());
     fresh.describe(fresh.workspace_wc(WS).unwrap(), "two").unwrap();
     let names = files(&*backend);
     assert!(names.iter().any(|n| n.starts_with("L-1-")), "{names:?}");
@@ -169,7 +169,7 @@ fn a_damaged_index_is_rebuilt_not_an_error() {
     backend.write(&dir().join("L-01-1.vcg"), b"non-canonical name").unwrap();
     let mut fresh = Repo::open(backend.clone(), None, "t").unwrap();
     let wc = fresh.workspace_wc(WS).unwrap();
-    assert!(fresh.graph().generation(&fresh, &wc).unwrap().is_some());
+    assert!(fresh.held().index().generation(&fresh, &wc).unwrap().is_some());
     fresh.describe(wc, "after").unwrap();
     assert!(!layers(&*backend).is_empty());
 }
@@ -199,8 +199,9 @@ fn a_deep_history_is_indexed_iteratively() {
     }
     tx.add_head(parent).unwrap();
     tx.commit().unwrap();
-    assert_eq!(repo.graph().generation(&repo, &parent).unwrap(), Some(20_001));
-    let first: Vec<_> = repo.topo_iter([parent]).take(3).map(Result::unwrap).collect();
+    // The root is 0, each of the 20,000 one more (BUG-1316: the server's arithmetic).
+    assert_eq!(repo.held().index().generation(&repo, &parent).unwrap(), Some(20_000));
+    let first: Vec<_> = repo.held().topo_iter([parent]).take(3).map(Result::unwrap).collect();
     assert_eq!(first[0], parent);
     assert_eq!(first.len(), 3);
 }
@@ -218,12 +219,95 @@ fn collected_snapshots_do_not_resolve_through_the_index() {
     repo.abandon(doomed).unwrap();
     // Indexed (the commits persisted it), then collected: remove the
     // loose object as gc would.
-    assert!(repo.graph().generation(&repo, &doomed).unwrap().is_some());
+    assert!(repo.held().index().generation(&repo, &doomed).unwrap().is_some());
     let hex = doomed.hex();
     backend.remove_file(&VPath::new(&format!(".veil/objects/{}/{}", &hex[..2], &hex[2..])).unwrap()).unwrap();
     let fresh = Repo::open(backend.clone(), None, "t").unwrap();
-    assert!(fresh.snapshot_opt(&doomed).unwrap().is_none(), "collected");
+    assert!(fresh.exact().snapshot(&doomed).unwrap().is_none(), "collected");
     let prefix = &change.to_string()[..8];
     let err = revset::resolve(&fresh, prefix, WS).unwrap_err();
     assert!(err.to_string().contains("not found"), "{err}");
+}
+
+/// Rewrite every index layer as a vl before BUG-1316's fix wrote it: its
+/// magic, `VEILCG01`, and `new_gen` for each id listed (the layout is
+/// unchanged), with the checksum made again.
+fn as_an_older_vl_wrote_it(backend: &dyn StorageBackend, gens: &[(veil_core::ObjectId, u64)]) -> usize {
+    const HEADER: usize = 16;
+    const REC: usize = 8 + 16 + 1;
+    let mut changed = 0;
+    for name in layers(backend) {
+        let path = dir().join(&name);
+        let mut data = backend.read(&path).unwrap();
+        data[..8].copy_from_slice(b"VEILCG01");
+        let count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        for i in 0..count {
+            let id = &data[HEADER + i * 32..HEADER + i * 32 + 32];
+            if let Some((_, g)) = gens.iter().find(|(x, _)| x.0 == id) {
+                let at = HEADER + count * 32 + i * REC;
+                data[at..at + 8].copy_from_slice(&g.to_le_bytes());
+                changed += 1;
+            }
+        }
+        let n = data.len() - 32;
+        let sum = *blake3::hash(&data[..n]).as_bytes();
+        data[n..].copy_from_slice(&sum);
+        backend.write(&path, &data).unwrap();
+    }
+    changed
+}
+
+/// BUG-1381 (S3 redesign, cycle 3; BUG-1316's fix): "index layers of the
+/// older arithmetic stay valid". A full clone made by a vl before the fix
+/// pulled a snapshot dated `i64::MAX` (a timestamp is the author's choice,
+/// BUG-866) and a commit on it: the older arithmetic stored `i64::MAX` and
+/// `i64::MAX + 1` (it did not clamp, and allowed up to `u64::MAX - 1`).
+/// The new arithmetic caps every generation at `i64::MAX`, so the next
+/// commit, indexed by the new vl, gets `i64::MAX`: below its parent's
+/// `i64::MAX + 1`. Every walk that stops by generation then answers wrong:
+/// `is_ancestor(parent, child)` is false, and the history lists the
+/// parent above its child.
+#[test]
+fn bug_1381_an_older_layer_above_i64_max_keeps_its_children_above_it() {
+    let (backend, mut repo) = setup();
+    let tree = repo.store().empty_tree().unwrap();
+    let snap = |parents: Vec<veil_core::ObjectId>, timestamp: i64, i: u8| veil_core::Snapshot {
+        parents,
+        change_id: veil_core::ChangeId([i; 16]),
+        tree,
+        description: veil_core::object::Text::default(),
+        author: "t".into(),
+        timestamp,
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        signature: None,
+    };
+    let mut tx = repo.transaction("far future").unwrap();
+    let far = tx.repo().store().put_snapshot(&snap(vec![tx.repo().root_id()], i64::MAX, 1)).unwrap();
+    let on_it = tx.repo().store().put_snapshot(&snap(vec![far], 1_000, 2)).unwrap();
+    tx.add_head(on_it).unwrap();
+    tx.commit().unwrap();
+    assert!(repo.held().index().generation(&repo, &on_it).unwrap().is_some(), "indexed");
+    // The next commit persists the entries computed since the last one.
+    repo.describe(repo.workspace_wc(WS).unwrap(), "persist").unwrap();
+    drop(repo);
+    // What the older arithmetic stored: max(1 + parent, timestamp).
+    let (g_far, g_on) = (i64::MAX as u64, i64::MAX as u64 + 1);
+    assert_eq!(as_an_older_vl_wrote_it(&*backend, &[(far, g_far), (on_it, g_on)]), 2, "both entries are in the layers");
+    let mut repo = Repo::open(backend.clone(), None, "t").unwrap();
+    // The older layer voids the index (BUG-1381): computed again, by this
+    // vl's arithmetic (the timestamp clamped to `i64::MAX / 4`).
+    let g_on = repo.held().index().generation(&repo, &on_it).unwrap().expect("indexed again");
+    assert_eq!(g_on, (i64::MAX / 4) as u64 + 1, "the older layer is dropped, not read");
+    // A commit on top, indexed by this vl.
+    let mut tx = repo.transaction("on top").unwrap();
+    let top = tx.repo().store().put_snapshot(&snap(vec![on_it], 2_000, 3)).unwrap();
+    tx.add_head(top).unwrap();
+    tx.commit().unwrap();
+    let g_top = repo.held().index().generation(&repo, &top).unwrap().expect("indexed");
+    assert!(g_top > g_on, "the new commit's generation {g_top} is not above its parent's {g_on}");
+    assert!(repo.is_ancestor(&on_it, &top).unwrap(), "the parent is not an ancestor of its child");
+    let order: Vec<_> = repo.held().topo_iter([top]).take(3).map(Result::unwrap).collect();
+    assert_eq!(order, vec![top, on_it, far], "children first");
 }

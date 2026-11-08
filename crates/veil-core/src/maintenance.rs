@@ -840,6 +840,12 @@ pub struct AutoReport {
 /// [`AUTO_PRUNE_REWRITES`] snapshots rewritten since. Only lock-free
 /// repositories.
 pub fn auto(repo: &mut crate::repo::Repo, now: i64) -> Result<Option<AutoReport>> {
+    // A thin clone's maintenance never fetches (see `gc::run`).
+    let store = repo.store.clone();
+    store.without_fetching(|| auto_here(repo, now))
+}
+
+fn auto_here(repo: &mut crate::repo::Repo, now: i64) -> Result<Option<AutoReport>> {
     if !repo.lock_free() {
         return Ok(None);
     }
