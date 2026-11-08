@@ -467,6 +467,11 @@ fn the_identity_file_is_never_world_readable_even_briefly() {
         Ok(o) if o.status.success() => "strace",
         _ => return, // not available: nothing to demonstrate with
     };
+    // Whether strace can attach here, asked of a command other than vl.
+    let probe = std::process::Command::new(strace).args(["-f", "-o", "/dev/null", "true"]).output().unwrap();
+    if !probe.status.success() {
+        return; // ptrace not permitted here
+    }
     let home = env.root.join("home-fresh");
     let out = std::process::Command::new(strace)
         .args(["-f", "-e", "trace=openat,open,creat,chmod,fchmod,fchmodat", "-o"])
@@ -479,9 +484,7 @@ fn the_identity_file_is_never_world_readable_even_briefly() {
         .env("NO_COLOR", "1")
         .output()
         .unwrap();
-    if !out.status.success() || !trace.exists() {
-        return; // ptrace not permitted here
-    }
+    assert!(out.status.success(), "vl identity show under strace: {}", String::from_utf8_lossy(&out.stderr));
     let log = std::fs::read_to_string(&trace).unwrap();
     let creates: Vec<&str> = log
         .lines()
@@ -529,13 +532,15 @@ fn an_interrupted_workspace_switch_does_not_corrupt_the_old_workspace() {
     write(&proj, "default.txt", "default work\n");
     write(&proj, "cfg", "k = \"AKIAIOSFODNN7EXAMPLE\"\n");
     env.ok(U, &proj, &["status"]);
-    let switch = env.vl(U, &proj, &["ws", "switch", "agent"]);
-    let _ = env.vl(U, &proj, &["status"]);
+    // Since BUG-111's fix the file in the way is kept and reported, so the
+    // switch completes (an interrupted one: `core_durability` `crash.rs`).
+    let switch = env.ok(U, &proj, &["ws", "switch", "agent"]);
+    env.ok(U, &proj, &["status"]);
     let default_files = env.stdout(U, &proj, &["files", "-r", "default@"]);
     assert!(
         default_files.contains("default.txt") && !default_files.contains("agent.txt"),
-        "after the failed switch ({}), default's working copy is:\n{default_files}",
-        text(&switch).trim()
+        "after the switch ({}), default's working copy is:\n{default_files}",
+        switch.trim()
     );
 }
 

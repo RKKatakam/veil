@@ -82,18 +82,19 @@ fn bug_841_a_ring_the_server_made_never_seals_a_secret() {
     let admin = p.admin.identity();
     plant_ring(&hub, &p, &server_ring(&scope, &srv, &[(&admin.public_id(), &p.admin.name, Role::Admin)]));
     p.admin.ok(&p.dir, &["group", "create", "ops"]);
-    let _ = p.admin.run(&p.dir, &["access", "infra/", "ops"]);
+    // Refused: the server's ring is not the one `vl access` makes.
+    let err = p.admin.fails(&p.dir, &["access", "infra/", "ops"]);
+    assert!(err.contains("the server refused the key ring"), "{err}");
     write_files(&p.dir, &[("infra/.env", "TOKEN=MARKER-INFRA-SECRET-5d1e0c77\n")]);
     p.admin.commit_main(&p.dir, "infra secrets");
-    let _ = p.admin.run(&p.dir, &["push"]);
-    // What the server holds: the sealed object (if it was recorded at all)
-    // and its own identity.
+    p.admin.ok(&p.dir, &["push"]);
+    // What the server holds, opened with its own identity: no infra/.env
+    // (with no ring of the admin's to seal it under, it is not recorded).
     let repo = veil_core::Repo::open(Arc::new(veil_core::DiskBackend::new(&p.dir)), Some(srv), "test").unwrap();
     let tip = repo.view().tags["main"].target;
     let tree = repo.store().snapshot(&tip).unwrap().tree;
-    if let Some(e) = veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new("infra/.env").unwrap()).unwrap() {
-        assert!(repo.store().read_blob(&e.id).is_err(), "the server's own key opens the admin's new infra/.env");
-    }
+    let e = veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new("infra/.env").unwrap()).unwrap();
+    assert!(e.is_none(), "infra/.env was recorded under a ring the server made: {e:?}");
 }
 
 /// BUG-842. An admin invites someone, changes their mind and removes them
@@ -107,8 +108,9 @@ fn bug_842_removing_an_invited_person_cancels_their_invite() {
     let alice = hub.person("alice");
     let out = p.admin.ok(&p.dir, &["invite", &alice.name, "--to", "finance"]);
     let link = link_in(&out);
-    let _ = p.admin.run(&p.dir, &["group", "remove", "finance", &alice.name]);
-    let _ = alice.run(alice.home.path(), &["join", &link]);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &alice.name]);
+    let err = alice.fails(alice.home.path(), &["join", &link]);
+    assert!(err.contains("no such invite"), "{err}");
     let groups = p.admin.ok(&p.dir, &["group", "list"]);
     let finance = groups.lines().find(|l| l.starts_with("finance")).unwrap_or_default().to_string();
     assert!(!finance.contains(&alice.name), "the removed person joined finance anyway: {finance}");

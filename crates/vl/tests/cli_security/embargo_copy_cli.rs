@@ -260,7 +260,14 @@ fn rebasing_the_embargoed_merge_onto_other_parents_publishes_nothing() {
         for d in dest {
             args.extend(["-d", if *d == "V1" { v1.as_str() } else { d }]);
         }
-        let _ = r.run(&args);
+        // Onto other parents that keep the fix behind it (`-d V1`): done,
+        // still withheld. Parents that change what it withholds: refused.
+        if dest == ["V1"] {
+            r.ok(&args);
+        } else {
+            let err = r.fails(&args);
+            assert!(err.contains("cannot drop, replace or move the embargoed merge"), "{dest:?}: {err}");
+        }
         assert!(r.ok(&["embargo", "list"]).contains("manual release"), "control: the embargo is still pending");
         publishes_nothing(&env, &r);
     }
@@ -320,7 +327,8 @@ fn squashing_the_embargoed_merge_into_the_fix_publishes_nothing() {
         } else {
             "main"
         };
-        let _ = r.run(&["squash", "-r", merge, "--into", "fix"]);
+        let err = r.fails(&["squash", "-r", merge, "--into", "fix"]);
+        assert!(err.contains("cannot drop, replace or move the embargoed merge"), "{err}");
         assert!(r.ok(&["embargo", "list"]).contains("manual release"), "control: the embargo is still pending");
         publishes_nothing(&env, &r);
     }
@@ -351,11 +359,12 @@ fn an_earlier_version_of_the_fix_is_withheld_too() {
         r.ok(&["merge", "fix", "--into", "main", "--embargo", "-m", "embargoed"]);
         if route == "undo" {
             // The user puts the old description back.
-            let _ = r.run(&["undo", "--op", &describe]);
+            r.ok(&["undo", "--op", &describe]);
         } else {
             other(&r, &v1);
             r.ok(&["new", "other"]);
-            let _ = r.run(&["restore", "--from", &earlier]);
+            let err = r.fails(&["restore", "--from", &earlier]);
+            assert!(err.contains("cannot restore from") && err.contains("unreleased embargo"), "{err}");
             r.ok(&["commit", "-m", "rel"]);
             r.tag("rel", "@-");
         }
@@ -437,10 +446,11 @@ fn the_fix_squashed_into_work_on_the_merge_stays_withheld_when_the_merge_goes() 
         r.tag("fu", "@-");
         // Inside the embargo: allowed.
         r.ok(&["squash", "-r", "fix", "--into", "fu"]);
-        let _ = match route {
-            "abandon" => r.run(&["abandon", "main"]),
-            _ => r.run(&["squash", "-r", "main", "--into", "fu"]),
+        let err = match route {
+            "abandon" => r.fails(&["abandon", "main"]),
+            _ => r.fails(&["squash", "-r", "main", "--into", "fu"]),
         };
+        assert!(err.contains("cannot drop, replace or move the embargoed merge"), "{route}: {err}");
         publishes_nothing(&env, &r);
     }
 }

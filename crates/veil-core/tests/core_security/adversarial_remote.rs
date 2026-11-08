@@ -21,7 +21,7 @@ use veil_core::{
     oplog::Tag,
     remote,
     revset::resolve,
-    tree::{lookup, walk_files},
+    tree::lookup,
     DiskBackend, Identity, MemoryBackend, ObjectId, Repo, StorageBackend,
 };
 
@@ -154,7 +154,8 @@ fn dotdot_entry_cannot_escape_the_working_copy() {
         raw_tree(r, vec![dir("..", inner)])
     });
     let (tmp, mut victim, fs) = disk_victim();
-    let _ = try_pull_checkout(&mut victim, &fs, remote);
+    let r = try_pull_checkout(&mut victim, &fs, remote);
+    assert!(r.as_ref().is_err_and(|e| e.contains("invalid entry name \"..\"")), "{r:?}");
     assert_eq!(escaped(&tmp), Vec::<String>::new(), "checkout wrote outside the working copy");
 }
 
@@ -171,7 +172,8 @@ fn dotdot_file_entry_cannot_overwrite_a_sibling_file() {
     std::fs::create_dir_all(&wc).unwrap();
     let fs = Arc::new(DiskBackend::new(&wc));
     let mut victim = Repo::init(fs.clone(), Some(Identity::generate("v")), "v").unwrap();
-    let _ = try_pull_checkout(&mut victim, &fs, remote);
+    let r = try_pull_checkout(&mut victim, &fs, remote);
+    assert!(r.as_ref().is_err_and(|e| e.contains("invalid entry name \"..\"")), "{r:?}");
     assert_eq!(std::fs::read_to_string(tmp.path().join("victim.txt")).unwrap(), "precious\n");
 }
 
@@ -190,7 +192,8 @@ fn remote_tree_cannot_write_into_dot_veil() {
         let veil = raw_tree(r, vec![dir("meta", meta), file("repo.json", cfg)]);
         raw_tree(r, vec![dir(".veil", veil)])
     });
-    let _ = try_pull_checkout(&mut victim, &fs, remote);
+    let r = try_pull_checkout(&mut victim, &fs, remote);
+    assert!(r.as_ref().is_err_and(|e| e.contains("invalid entry name \".veil\"")), "{r:?}");
     assert_eq!(std::fs::read(tmp.path().join("wc/.veil/meta/keyrings/team.json")).unwrap(), ring_before);
     assert_eq!(std::fs::read(tmp.path().join("wc/.veil/repo.json")).unwrap(), cfg_before);
 }
@@ -224,7 +227,7 @@ fn nul_in_entry_name_does_not_escape() {
 
 #[test]
 fn non_canonical_trees_are_rejected_or_consistent() {
-    let (remote, main) = evil_remote(|r| {
+    let (remote, _) = evil_remote(|r| {
         let a = blob(r, b"a\n");
         let b1 = blob(r, b"visible in listings\n");
         let b2 = blob(r, b"second\n");
@@ -232,16 +235,9 @@ fn non_canonical_trees_are_rejected_or_consistent() {
         raw_tree(r, vec![file("c", b1), file("b", b2), file("a", a)])
     });
     let (mut victim, _fs, _) = new_repo("v");
-    if remote::pull(&mut victim, "origin", remote).is_err() {
-        return; // rejecting is fine
-    }
-    let tree = victim.snapshot(&main).unwrap().tree;
-    for (path, _) in walk_files(victim.store(), &tree).unwrap() {
-        assert!(
-            lookup(victim.store(), &tree, &path).unwrap().is_some(),
-            "{path} is listed by walk_files but invisible to lookup/diff/checkout"
-        );
-    }
+    // Refused as it is fetched: a tree's entries must be sorted and unique.
+    let err = remote::pull(&mut victim, "origin", remote).unwrap_err().to_string();
+    assert!(err.contains("entries are not sorted and unique"), "{err}");
 }
 
 #[test]
@@ -365,7 +361,7 @@ fn ring_with_empty_key_id_cannot_replace_existing_scope_key() {
         },
     );
     let remote = remote_with_meta(&[(".veil/meta/keyrings/team.json", serde_json::to_vec(&ring).unwrap())]);
-    let _ = remote::pull(&mut victim, "origin", remote);
+    remote::pull(&mut victim, "origin", remote).unwrap();
     victim.keys().invalidate();
     assert_eq!(victim.keys().key("team").unwrap(), real, "scope key was substituted");
 }
@@ -420,13 +416,11 @@ fn pulled_tag_pointing_at_missing_object_does_not_brick_the_repo() {
     tx.view.tags.insert("main".into(), Tag::new(ObjectId([7; 32])));
     tx.commit().unwrap();
     let (mut victim, _fs, _) = new_repo("v");
-    let pulled = remote::pull(&mut victim, "origin", remote_fs);
-    if pulled.is_ok() {
-        assert!(
-            victim.visible_snapshots().is_ok(),
-            "a dangling remote tag was accepted and now breaks every graph query"
-        );
-    }
+    remote::pull(&mut victim, "origin", remote_fs).unwrap();
+    assert!(
+        victim.visible_snapshots().is_ok(),
+        "a dangling remote tag was accepted and now breaks every graph query"
+    );
 }
 
 #[test]
@@ -434,7 +428,8 @@ fn tag_cannot_point_at_a_non_snapshot_object() {
     let (mut repo, fs, _) = new_repo("alice");
     let c = commit_files(&mut repo, &*fs, &[("a.txt", "a\n")], "c");
     let blob_id = file_entry(&repo, &c, "a.txt").unwrap().id;
-    let _ = repo.set_tag("bad", blob_id, false);
+    let err = repo.set_tag("bad", blob_id, false).unwrap_err().to_string();
+    assert!(err.contains("is not a snapshot"), "{err}");
     assert!(repo.visible_snapshots().is_ok(), "view now references a blob as a tag target");
 }
 

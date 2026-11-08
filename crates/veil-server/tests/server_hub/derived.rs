@@ -2018,18 +2018,8 @@ mod s12_adversarial {
             sqlx::query_scalar("SELECT changed FROM graph WHERE project_id = $1 AND snapshot = $2").bind(id).bind(b.hex()).fetch_one(&hub.db).await.unwrap()
         });
         let changed = changed.unwrap();
-        if let Ok(oid) = ObjectId::from_hex(&changed) {
-            let raw = th.rt.block_on(hub.objects.get(id, &oid)).unwrap().unwrap();
-            let c = Changed::decode(&raw).unwrap();
-            println!("BUG-981: one changed-paths object lists {} paths and {} folders ({} bytes)", c.paths.len(), c.dirs.len(), raw.len());
-            assert!(
-                c.paths.len() + c.dirs.len() <= derive::changes::MAX_PATHS,
-                "the object lists {} entries ({} bytes), above the cap of {}",
-                c.paths.len() + c.dirs.len(),
-                raw.len(),
-                derive::changes::MAX_PATHS
-            );
-        }
+        // Over the cap: no changed-paths object, the snapshot is `many`.
+        assert_eq!(changed, derive::changes::MANY, "the folders are not counted against the cap");
     }
 
     /// BUG-982: since BUG-870's fix a run derives only the branches its
