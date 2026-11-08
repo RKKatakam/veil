@@ -689,3 +689,165 @@ fn concurrent_reads_and_moves_keep_a_refusal_to_its_path() {
     let rec = p.fin.ok(&thin, &["ws", "cat", "agent", "src/inbox/moved.txt"]);
     assert!(rec.contains(SAME.trim()), "{rec}");
 }
+
+// ---- S8 cycle 3 fixes, re-check (`docs/BUGS.md`, "S8 cycle 3 fixes re-check") --
+
+/// BUG-1462: BUG-1460's class one level up. A copied folder (the same tree
+/// at a refused and a readable path): the file below it has one place, in
+/// that tree, and `climb` takes the tree's first place (the refused one),
+/// so a reader by id asks only there and the thin checkout leaves out the
+/// readable copy.
+#[test]
+#[ignore = "BUG-1462: a thin checkout leaves out a readable file whose folder is the same as a refused folder elsewhere"]
+fn bug_1462_a_thin_checkout_hides_a_readable_copy_of_a_folder_refused_elsewhere() {
+    const SAME: &str = "SAME-FOLDER-CHECKOUT-1462-7c03e9b1\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    write_files(&p.dir, &[("src/copy/dup/a.txt", SAME), (&format!("{BILL_DIR}/acme/dup/a.txt"), SAME)]);
+    p.admin.ok(&p.dir, &["commit", "--no-advance", "-m", "the same folder twice"]);
+    p.admin.ok(&p.dir, &["tag", "set", "feature", "-r", "@-"]);
+    p.admin.ok(&p.dir, &["push"]);
+    let thin = thin_with_agent(&p, &hub, &p.fin, "thin");
+    // The billing folder is held from an earlier mount (it sorts first).
+    let m = Mounted::new(&p.fin, &thin, "agent");
+    let names: Vec<String> = std::fs::read_dir(m.dir.join(format!("{BILL_DIR}/acme"))).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(names.contains(&"dup".to_string()), "{names:?}");
+    m.unmount();
+    assert!(!fetched(&thin, "src/copy/dup/a.txt"), "the content is not fetched yet");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&thin, &["new", "feature"]);
+    let got = std::fs::read_to_string(thin.join("src/copy/dup/a.txt"));
+    assert_eq!(got.as_deref().map_err(|e| e.to_string()), Ok(SAME), "the checkout left out a file fin may read: {out}");
+}
+
+/// BUG-1463: the locator's bound. The same content at 9 refused places met
+/// first (an empty `__init__.py` in 9 packages of a refused folder) fills
+/// its first place and its 8 others; the readable copy met after them is
+/// not kept, so a reader by id never asks there and the thin checkout
+/// leaves it out.
+#[test]
+#[ignore = "BUG-1463: a thin checkout leaves out a readable file whose content is at 9 refused places met before it"]
+fn bug_1463_a_readable_copy_past_the_locators_bound_is_left_out() {
+    const SAME: &str = "SAME-CONTENT-BOUND-1463-e41a6d08\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let mut files: Vec<(String, &str)> = (0..9).map(|i| (format!("{BILL_DIR}/acme/same-{i}.txt"), SAME)).collect();
+    files.push(("src/shared/same.txt".into(), SAME));
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), *b)).collect();
+    write_files(&p.dir, &refs);
+    p.admin.ok(&p.dir, &["commit", "--no-advance", "-m", "the same content at ten places"]);
+    p.admin.ok(&p.dir, &["tag", "set", "feature", "-r", "@-"]);
+    p.admin.ok(&p.dir, &["push"]);
+    let thin = thin_with_agent(&p, &hub, &p.fin, "thin");
+    let m = Mounted::new(&p.fin, &thin, "agent");
+    let names: Vec<String> = std::fs::read_dir(m.dir.join(format!("{BILL_DIR}/acme"))).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(names.contains(&"same-8.txt".to_string()), "{names:?}");
+    m.unmount();
+    assert!(!fetched(&thin, "src/shared/same.txt"), "the content is not fetched yet");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&thin, &["new", "feature"]);
+    let got = std::fs::read_to_string(thin.join("src/shared/same.txt"));
+    assert_eq!(got.as_deref().map_err(|e| e.to_string()), Ok(SAME), "the checkout left out a file fin may read: {out}");
+}
+
+/// Guarantees 1 and 2 of the re-check, in the mount, past the bound: the
+/// same content at 9 refused places and a readable one, the refused ones
+/// met first; the readable copy reads, no refused copy does.
+#[test]
+fn the_mount_reads_a_readable_copy_past_the_locators_bound_and_no_refused_one() {
+    const SAME: &str = "SAME-CONTENT-MOUNT-BOUND-s8x-5f2c90d1\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let mut files: Vec<(String, &str)> = (0..9).map(|i| (format!("{BILL_DIR}/acme/same-{i}.txt"), SAME)).collect();
+    files.push(("src/shared/same.txt".into(), SAME));
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), *b)).collect();
+    write_files(&p.dir, &refs);
+    p.admin.ok(&p.dir, &["commit", "--no-advance", "-m", "the same content at ten places"]);
+    p.admin.ok(&p.dir, &["tag", "set", "feature", "-r", "@-"]);
+    p.admin.ok(&p.dir, &["push"]);
+    let thin = thin_with_agent(&p, &hub, &p.fin, "thin");
+    let m = Mounted::new(&p.fin, &thin, "agent");
+    let acme = m.dir.join(format!("{BILL_DIR}/acme"));
+    let names: Vec<String> = std::fs::read_dir(&acme).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(names.contains(&"same-8.txt".to_string()), "{names:?}");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    for i in 0..9 {
+        let r = std::fs::read(acme.join(format!("same-{i}.txt")));
+        assert!(r.as_ref().is_err_and(|e| matches!(e.raw_os_error(), Some(EACCES) | Some(ENOENT))), "same-{i}.txt: {:?}", r.map(|d| d.len()));
+    }
+    assert_eq!(std::fs::read(m.dir.join("src/shared/same.txt")).unwrap(), SAME.as_bytes());
+    for i in 0..9 {
+        let r = std::fs::read(acme.join(format!("same-{i}.txt")));
+        assert!(r.as_ref().is_err_and(|e| matches!(e.raw_os_error(), Some(EACCES) | Some(ENOENT))), "after the readable read, same-{i}.txt: {:?}", r.map(|d| d.len()));
+    }
+    m.unmount();
+}
+
+/// BUG-1464: the mount serves content it holds, met at one place in this
+/// process, without asking the server at that path (`answer_for`:
+/// `places_known` counts the places *this store instance* met). Each
+/// recording opens the repository again (`open_repo`, a new store with an
+/// empty locator), as does a new mount: content fetched at a readable path
+/// is then read at a refused path holding the same bytes, never asked
+/// there. Under load the same happens inside one mount, between two reads
+/// a recording separates.
+#[test]
+#[ignore = "BUG-1464: a mount reads a refused path holding the same bytes as a readable one once those bytes are held"]
+fn bug_1464_a_mount_reads_a_refused_path_once_the_same_bytes_are_held() {
+    const SAME: &str = "SAME-CONTENT-READABLE-FIRST-s8x-a83d17c4\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    write_files(&p.dir, &[("src/shared/same.txt", SAME), (&format!("{BILL_DIR}/acme/same.txt"), SAME)]);
+    p.admin.ok(&p.dir, &["commit", "--no-advance", "-m", "same content twice"]);
+    p.admin.ok(&p.dir, &["tag", "set", "feature", "-r", "@-"]);
+    p.admin.ok(&p.dir, &["push"]);
+    let thin = thin_with_agent(&p, &hub, &p.fin, "thin");
+    let m = Mounted::new(&p.fin, &thin, "agent");
+    let names: Vec<String> = std::fs::read_dir(m.dir.join(format!("{BILL_DIR}/acme"))).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(names.contains(&"same.txt".to_string()), "{names:?}");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    // The readable copy first: it reads, and its content is now held.
+    assert_eq!(std::fs::read(m.dir.join("src/shared/same.txt")).unwrap(), SAME.as_bytes());
+    assert!(fetched(&thin, "src/shared/same.txt"), "the readable read fetched it");
+    let r = std::fs::read(m.dir.join(format!("{BILL_DIR}/acme/same.txt")));
+    assert!(r.as_ref().is_err_and(|e| matches!(e.raw_os_error(), Some(EACCES) | Some(ENOENT))), "in the same mount, the refused copy read: {:?}", r.map(|d| d.len()));
+    m.unmount();
+    // A new mount (as after any recording): the refused path is never asked.
+    let m = Mounted::new(&p.fin, &thin, "agent");
+    let r = std::fs::read(m.dir.join(format!("{BILL_DIR}/acme/same.txt")));
+    assert!(r.as_ref().is_err_and(|e| matches!(e.raw_os_error(), Some(EACCES) | Some(ENOENT))), "in a new mount, the refused copy read: {:?}", r.map(|d| d.len()));
+    m.unmount();
+}
+
+/// Guarantee 5 of the re-check: a stale thin checkout (its billing folder
+/// held from before access was removed) that reads content refused at one
+/// path where it is readable writes only what fin may read: the readable
+/// copy's bytes, and nothing of the refused folder's own content.
+#[test]
+fn a_stale_checkout_writes_nothing_its_person_may_not_read() {
+    const SAME: &str = "SAME-CONTENT-STALE-s8x-3e9b0c72\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    write_files(&p.dir, &[("src/shared/same.txt", SAME), (&format!("{BILL_DIR}/acme/same.txt"), SAME)]);
+    p.admin.ok(&p.dir, &["commit", "--no-advance", "-m", "same content twice"]);
+    p.admin.ok(&p.dir, &["tag", "set", "feature", "-r", "@-"]);
+    p.admin.ok(&p.dir, &["push"]);
+    let thin = thin_with_agent(&p, &hub, &p.fin, "thin");
+    let m = Mounted::new(&p.fin, &thin, "agent");
+    let names: Vec<String> = std::fs::read_dir(m.dir.join(format!("{BILL_DIR}/acme"))).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(names.contains(&"same.txt".to_string()), "{names:?}");
+    m.unmount();
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&thin, &["new", "feature"]);
+    assert_eq!(std::fs::read_to_string(thin.join("src/shared/same.txt")).map_err(|e| e.to_string()).as_deref(), Ok(SAME), "{out}");
+    // Nothing of the refused folder's own content.
+    let files = walk(&thin);
+    assert!(files.values().all(|d| !String::from_utf8_lossy(d).contains(FEATURE_BILL)), "{:?}", files.keys().collect::<Vec<_>>());
+    assert!(!files.contains_key(&format!("{BILL_DIR}/acme/q2.txt")), "{:?}", files.keys().collect::<Vec<_>>());
+    // What the refused path holds, if anything, is the readable copy's bytes.
+    let at = files.get(&format!("{BILL_DIR}/acme/same.txt"));
+    eprintln!("s8x: the refused path in the working copy: {:?}", at.map(|d| String::from_utf8_lossy(d).into_owned()));
+    assert!(at.is_none_or(|d| d == SAME.as_bytes()), "{at:?}");
+    let st = p.fin.ok(&thin, &["status"]);
+    eprintln!("s8x: status: {st}");
+}
