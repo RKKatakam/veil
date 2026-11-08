@@ -939,7 +939,8 @@ impl Repo {
     /// staged release's operation (an operation that takes a release back
     /// descends from it, so it is read before it). In force: its latest
     /// `release embargo <id>` operation is in the heads' history and no
-    /// undo or op restore in force took it back.
+    /// undo or op restore in that history took it back (a take-back is
+    /// permanent, even if the undo or restore was itself taken back since).
     pub fn staged_release_standing(&self) -> Result<(BTreeMap<String, Standing>, Vec<ObjectId>)> {
         let staged: Vec<String> = self.keys().staged_releases()?.into_iter().map(|(id, _)| id).collect();
         let mut out = BTreeMap::new();
@@ -965,10 +966,23 @@ impl Repo {
                 break;
             }
         }
-        let retracted = crate::repo::retracted_commands(&retractors);
+        // A release taken back stays taken back (undo and op restore never
+        // release): an undo or restore that names the release's operation
+        // takes it back for good, even if that undo or restore was itself
+        // taken back since (BUG-1535). A redo only retracts an undo.
+        let mut taken: std::collections::HashSet<ObjectId> = crate::repo::retracted_commands(&retractors);
+        for r in retractors.values() {
+            match r {
+                crate::repo::Retractor::Undo(u) => {
+                    taken.insert(*u);
+                }
+                crate::repo::Retractor::Restore(ops) => taken.extend(ops.iter().copied()),
+                crate::repo::Retractor::Redo(_) => {}
+            }
+        }
         for e in staged {
             let standing = match release_op.get(&e) {
-                Some(o) if retracted.contains(o) => Standing::TakenBack,
+                Some(o) if taken.contains(o) => Standing::TakenBack,
                 Some(_) => Standing::InForce,
                 None => Standing::Unconfirmed,
             };

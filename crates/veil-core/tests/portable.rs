@@ -760,7 +760,6 @@ fn bug_1487_a_restore_that_stops_before_taking_back_a_release_still_takes_it_bac
 /// the release counts as in force and the push publishes the embargoed
 /// fix the user took back.
 #[test]
-#[ignore = "BUG-1535: a restore or undo stopped before taking back a release, then itself undone or restored past, leaves the release in force: the push publishes it"]
 fn bug_1535_a_stopped_take_back_whose_retractor_is_taken_back_still_takes_the_release_back() {
     let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
     for shape in ["undo of the restore", "restore past the undo"] {
