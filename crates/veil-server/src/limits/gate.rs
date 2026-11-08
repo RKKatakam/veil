@@ -30,9 +30,9 @@ impl Class {
     /// The longest a request of the class waits for a place.
     pub fn wait(self) -> Duration {
         match self {
-            Class::Search => Duration::from_millis(250),
-            Class::Read => Duration::from_secs(2),
-            Class::Write => Duration::from_secs(10),
+            Class::Search => Duration::from_secs(1),
+            Class::Read => Duration::from_secs(10),
+            Class::Write => Duration::from_secs(20),
         }
     }
 }

@@ -153,8 +153,8 @@ fn past_its_limits_a_client_is_refused_and_told_when_naming_nothing() {
 /// Guarantee: one project's storm cannot starve another project. 64
 /// clients flood project A with requests that each read the database
 /// (its groups); a quiet client of project B measures its own requests
-/// before and during the flood. A runs at most half the server's 16
-/// connections at once (its gate), so B always finds one.
+/// before and during the flood. A runs at most three quarters of the
+/// server's 16 connections at once (its gate), so B always finds one.
 #[test]
 fn a_flooded_project_does_not_starve_a_quiet_one() {
     let hub = TestHub::start();
@@ -211,7 +211,7 @@ fn a_flooded_project_does_not_starve_a_quiet_one() {
     let (served, busy, most) = (served.load(Relaxed), busy.load(Relaxed), most.load(Relaxed));
     eprintln!("quiet project's p99: {base:?} alone, {flooded:?} beside the flood ({served} served, {busy} busy, at most {most} of A's running)");
     assert!(served > 0, "the flood was served too");
-    assert!(most <= 8, "A ran {most} requests at once: more than half of the 16 connections");
+    assert!(most <= 12, "A ran {most} requests at once: more than three quarters of the 16 connections");
     assert!(flooded <= (base * 20).max(Duration::from_millis(300)), "the quiet project's p99 went from {base:?} to {flooded:?}");
 }
 

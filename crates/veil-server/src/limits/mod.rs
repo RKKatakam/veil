@@ -92,9 +92,9 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// With `db_connections` for requests: a project runs at most half of
-    /// them at once (so another always finds a connection), the server at
-    /// most twice as many requests as it has connections.
+    /// With `db_connections` for requests: a project runs at most three
+    /// quarters of them at once (so another always finds a connection), the
+    /// server at most twice as many requests as it has connections.
     pub fn new(settings: Settings, db_connections: u32) -> Limits {
         let n = db_connections.max(2) as usize;
         Limits {
@@ -102,7 +102,7 @@ impl Limits {
             devices: Buckets::new(settings.device),
             addresses: Buckets::new(settings.anonymous),
             bodies: body::Pools::new(settings.request_memory),
-            projects: gate::Map::new(n / 2),
+            projects: gate::Map::new(n - n / 4),
             server: gate::Gate::new(2 * n),
             health: health::Health::default(),
         }

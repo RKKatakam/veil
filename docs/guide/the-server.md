@@ -370,8 +370,8 @@ vl stats --json      # the server's answer (veil.health/1)
 Each device may send a burst of 60 requests a second within 5,000 an hour;
 requests without a session (anyone on Earth, sign-in) 20 a second within
 1,000 an hour per address. Past it the server answers `429` and says when to
-come back. One busy project never slows another: each runs at most half of
-the server's database connections at once.
+come back. One busy project never slows another: each runs at most three
+quarters of the server's database connections at once.
 
 ## What someone without access sees
 

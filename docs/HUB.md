@@ -2532,16 +2532,16 @@ Every request passes through `limits::admit` before any route, in this order:
    and dropped (nothing held, at the same minimum rate), so the client reads
    the refusal instead of a broken connection.
 4. **Bulkheads** (`gate.rs`): a gate per project, then one for the server.
-   A project runs at most half of `--db-connections` requests at once (so
-   another project always finds a connection), the server twice
+   A project runs at most three quarters of `--db-connections` requests at
+   once (so another project always finds a connection), the server twice
    `--db-connections`. Gates are keyed by the name the route names, whether
    a project of that name exists or not, so how long a request waits says
    nothing about hidden projects (made-up names get gates of their own, and
    the server's gate bounds them all); routes of no project share one. A
    gate has a queue per class and hands a free place to the **landings
    first** (`push`, `changes`, uploads, every other change), then pulls and
-   reads, then **search and grep last**; a request waits at most 10 s, 2 s
-   and 250 ms by class, then `503 busy` with `retry_after_ms` (0.5–1.5 s,
+   reads, then **search and grep last**; a request waits at most 20 s, 10 s
+   and 1 s by class (landings, pulls, search), then `503 busy` with `retry_after_ms` (0.5–1.5 s,
    jittered). **Shedding order** (design §4.11): search and grep give up
    first, then **derive work** (a derive run waits while requests wait for
    the server's gate, at most 10 s a run, so derived history lags but always
@@ -2571,7 +2571,7 @@ besides answers being written (bounded in time by the rule above; not by a
 budget: BUG-1330) and the server's caches. **Every connection slot comes
 back in bounded time:** a handshake or head within 20 s, a body of `n` bytes
 within 20 s + `n` / 16 KiB/s, an answer of `n` bytes within 30 s + `n` /
-16 KiB/s of a stalled client, a place in a gate within 10 s.
+16 KiB/s of a stalled client, a place in a gate within 20 s.
 
 **Health metrics** (`health.rs`): per project, this server's counts since
 it started and over the last whole minute: requests, `429`s, `503`s, `408`s,
@@ -2592,7 +2592,7 @@ project. With several servers each counts what it served.
 | 4 | A signed-in device, or an address | floods requests | `429` past its rate; other devices, on the same address too, are served | `past_its_limits_a_client_is_refused_and_told_when_naming_nothing` |
 | 5 | Anyone | made-up session tokens or grants, to get fresh buckets | a token not known here pays its address first; a grant counts for its device only if its signature verifies | same |
 | 6 | A refused client | reads its refusal for projects it cannot see, or that do not exist | the same answer, naming nothing but its own wait | same |
-| 7 | A runaway agent, or a project's crowd | floods one project | that project runs at most half the connections; another project's p99 stays put (1.1 ms alone, 1.3 ms beside 64 flooding clients) | `a_flooded_project_does_not_starve_a_quiet_one` |
+| 7 | A runaway agent, or a project's crowd | floods one project | that project runs at most three quarters of the connections; another project's p99 stays put (1.1 ms alone, 1.3 ms beside 64 flooding clients) | `a_flooded_project_does_not_starve_a_quiet_one` |
 | 8 | — (overload) | more requests than the server can run | search and grep shed first, derive pauses (at most 10 s a run), pulls next, landings last | `gate::tests::landings_are_let_in_first_and_search_last`, `…::search_is_shed_first_and_landings_last`, `limits::tests::derive_work_waits_while_the_server_sheds_but_not_for_ever` |
 | 9 | A client that goes away while waiting for a place | (a cancelled wait) | its place is never lost: a place handed over just then is given back | `gate::tests::*` (the `Ticket` drop) |
 | 10 | A member, someone outside, anyone on Earth | reads a project's health | `403`, the not-found answer for a hidden project, `401`; an admin's answer counts this project's requests only and names nothing | `health_metrics_are_for_admins_only_and_name_nothing_hidden` |
