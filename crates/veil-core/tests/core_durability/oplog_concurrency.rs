@@ -959,7 +959,6 @@ fn describe_racing_a_commit_on_it_moves_the_commit() {
 /// snapshot alone, so A's undo cancels B's rewrite: the child stays on
 /// `x`, and `x` and B's `x` are both visible.
 #[test]
-#[ignore = "BUG-1299: an undone rewrite on one side cancels another side's rewrite of the same snapshot"]
 fn bug_1299_an_undone_rewrite_does_not_cancel_another_sides_rewrite() {
     let (mut repo, fs, id) = new_repo("alice");
     repo.create_workspace("w", vec![repo.root_id()]).unwrap();

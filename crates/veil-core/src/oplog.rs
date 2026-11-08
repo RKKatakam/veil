@@ -505,17 +505,23 @@ impl OpStore {
     }
 
     /// Operations from `starts` and their ancestors, newest first (by
-    /// timestamp, then id), each once. Pruned operations end their branch.
+    /// time, then id), each once, and never before a descendant: on equal
+    /// times the op log's ancestry orders them, and a parent newer than
+    /// its child comes after it (BUG-1402). Pruned operations end their
+    /// branch ([`OpWalk::pruned`]).
     pub fn walk(&self, starts: &[ObjectId]) -> OpWalk<'_> {
         let mut w = OpWalk {
             ops: self,
             queue: BinaryHeap::new(),
+            key: HashMap::new(),
             loaded: HashMap::new(),
-            seen: std::collections::HashSet::new(),
+            done: Default::default(),
+            ready: Default::default(),
+            pruned: None,
             error: None,
         };
         for s in starts {
-            w.push(*s);
+            w.push(*s, None);
         }
         w
     }
@@ -544,6 +550,10 @@ impl OpStore {
         // The oldest timestamp of an operation walked while one side alone
         // reached it.
         let mut low: Option<i64> = None;
+        // A parent newer than its child (written before operation times
+        // were clamped, with the clock set back): times no longer bound
+        // what is still a descendant, so the walk never ends early (BUG-1401).
+        let mut inverted = false;
         while let Some((ts, id)) = queue.pop() {
             let (m, st) = (marks[&id], stale.contains(&id));
             if done.get(&id) == Some(&(m, st)) {
@@ -561,16 +571,21 @@ impl OpStore {
             // timestamp may still be its descendant (a merge and the parent
             // whose timestamp it has, the parent's id sorting first), which
             // makes it common too (BUG-1297).
-            let below = |t: i64| low.is_none_or(|l| t < l);
-            if m == 3 && below(ts) && queue.iter().all(|(t, q)| marks[q] == 3 && below(*t)) {
-                break;
-            }
             let parents = match self.cached(&mut ops, &id)? {
                 Some(op) => op.parents.clone(),
-                None => continue,
+                None => Vec::new(),
             };
+            let mut known = Vec::new();
             for p in parents {
                 let Some(pts) = self.cached(&mut ops, &p)?.map(|o| o.timestamp) else { continue };
+                inverted |= pts > ts;
+                known.push((p, pts));
+            }
+            let below = |t: i64| low.is_none_or(|l| t < l);
+            if !inverted && m == 3 && below(ts) && queue.iter().all(|(t, q)| marks[q] == 3 && below(*t)) {
+                break;
+            }
+            for (p, pts) in known {
                 let newly_stale = m == 3 && stale.insert(p);
                 let pm = marks.entry(p).or_default();
                 if *pm | m != *pm || newly_stale {
@@ -632,6 +647,37 @@ pub struct Split {
 }
 
 impl Split {
+    /// For each operation of `within` (`only_a` or `only_b`), the operations
+    /// of `within` it descends from.
+    pub(crate) fn ancestors_within(&self, within: &[ObjectId]) -> HashMap<ObjectId, std::collections::HashSet<ObjectId>> {
+        let set: std::collections::HashSet<&ObjectId> = within.iter().collect();
+        let parents = |id: &ObjectId| -> Vec<ObjectId> { self.ops.get(id).map(|o| o.parents.iter().filter(|p| set.contains(p)).copied().collect()).unwrap_or_default() };
+        let mut out: HashMap<ObjectId, std::collections::HashSet<ObjectId>> = HashMap::new();
+        for start in within {
+            // Depth first: an operation is done once its parents are (times
+            // do not order them).
+            let mut stack = vec![(*start, false)];
+            while let Some((id, expanded)) = stack.pop() {
+                if out.contains_key(&id) {
+                    continue;
+                }
+                let ps = parents(&id);
+                if !expanded {
+                    stack.push((id, true));
+                    stack.extend(ps.iter().filter(|p| !out.contains_key(*p)).map(|p| (*p, false)));
+                    continue;
+                }
+                let mut mine = std::collections::HashSet::new();
+                for p in ps {
+                    mine.insert(p);
+                    mine.extend(out.get(&p).into_iter().flatten().copied());
+                }
+                out.insert(id, mine);
+            }
+        }
+        out
+    }
+
     /// What the operations of `ids` (`only_a` or `only_b`) introduced:
     /// see [`Introduced`].
     pub(crate) fn introduced(&self, ids: &[ObjectId]) -> Introduced {
@@ -775,24 +821,130 @@ pub fn shared_base(base: &View, a: &View, ia: &Introduced, b: &View, ib: &Introd
 /// See [`OpStore::walk`].
 pub struct OpWalk<'a> {
     ops: &'a OpStore,
+    /// `(key, id)`: an operation's key is its time, or a child's key if
+    /// that is lower (a parent newer than its child, written before times
+    /// were clamped). Entries whose key was lowered since are stale.
     queue: BinaryHeap<(i64, ObjectId)>,
+    key: HashMap<ObjectId, i64>,
     loaded: HashMap<ObjectId, Operation>,
-    seen: std::collections::HashSet<ObjectId>,
+    /// Emitted, or in `ready`.
+    done: std::collections::HashSet<ObjectId>,
+    /// The current group of one key, children first.
+    ready: std::collections::VecDeque<(ObjectId, i64)>,
+    pruned: Option<ObjectId>,
     error: Option<VeilError>,
 }
 
 impl OpWalk<'_> {
-    fn push(&mut self, id: ObjectId) {
-        if !self.seen.insert(id) {
-            return;
+    /// The newest pruned operation the walk met (where a branch ended).
+    pub fn pruned(&self) -> Option<ObjectId> {
+        self.pruned
+    }
+
+    /// Load `id`; `false` if it is pruned (or failed to read).
+    fn load(&mut self, id: ObjectId) -> bool {
+        if self.loaded.contains_key(&id) {
+            return true;
         }
         match self.ops.try_get(&id) {
             Ok(Some(op)) => {
-                self.queue.push((op.timestamp, id));
                 self.loaded.insert(id, op);
+                true
             }
-            Ok(None) => {}
-            Err(e) => self.error = self.error.take().or(Some(e)),
+            Ok(None) => {
+                self.pruned = Some(id);
+                false
+            }
+            Err(e) => {
+                self.error = self.error.take().or(Some(e));
+                false
+            }
+        }
+    }
+
+    /// Queue `id`, a start (`below` none) or a parent of an operation of
+    /// key `below`. A parent newer than the key is queued at once, with
+    /// that key, and so on down: it must come after the operation, and so
+    /// must its ancestors, though another path may reach them sooner.
+    fn push(&mut self, id: ObjectId, below: Option<i64>) {
+        let mut work = vec![(id, below)];
+        while let Some((id, below)) = work.pop() {
+            if self.done.contains(&id) || !self.load(id) {
+                continue;
+            }
+            let ts = self.loaded[&id].timestamp;
+            let k = below.map_or(ts, |b| b.min(ts));
+            if self.key.get(&id).is_some_and(|old| *old <= k) {
+                continue;
+            }
+            self.key.insert(id, k);
+            self.queue.push((k, id));
+            for p in self.loaded[&id].parents.clone() {
+                if self.done.contains(&p) || !self.load(p) {
+                    continue;
+                }
+                if self.loaded[&p].timestamp > k {
+                    work.push((p, Some(k)));
+                }
+            }
+        }
+    }
+
+    /// The next group: every queued operation of the newest key, and those
+    /// of their ancestors that share it (operations of one time: a merge
+    /// has its newest parent's, and a clock set back gives every operation
+    /// its parent's), ordered children first, then by id (BUG-1402).
+    fn fill(&mut self) {
+        let mut group: Vec<ObjectId> = Vec::new();
+        let mut member: std::collections::HashSet<ObjectId> = Default::default();
+        let mut t = None;
+        while let Some(&(k, id)) = self.queue.peek() {
+            if t.is_some_and(|t| k != t) {
+                break;
+            }
+            self.queue.pop();
+            if self.done.contains(&id) || self.key.get(&id) != Some(&k) || !member.insert(id) {
+                continue;
+            }
+            t = Some(k);
+            group.push(id);
+        }
+        let Some(t) = t else { return };
+        let mut i = 0;
+        while i < group.len() {
+            for p in self.loaded[&group[i]].parents.clone() {
+                if self.done.contains(&p) || member.contains(&p) || !self.load(p) {
+                    continue;
+                }
+                let k = self.key.get(&p).copied().unwrap_or(i64::MAX).min(self.loaded[&p].timestamp).min(t);
+                if k == t {
+                    member.insert(p);
+                    group.push(p);
+                }
+            }
+            i += 1;
+        }
+        let mut children: HashMap<ObjectId, usize> = HashMap::new();
+        for m in &group {
+            for p in &self.loaded[m].parents {
+                if member.contains(p) {
+                    *children.entry(*p).or_default() += 1;
+                }
+            }
+        }
+        let mut free: BTreeSet<ObjectId> = group.iter().filter(|m| !children.contains_key(*m)).copied().collect();
+        while let Some(id) = free.pop_last() {
+            self.done.insert(id);
+            self.key.remove(&id);
+            self.ready.push_back((id, t));
+            for p in &self.loaded[&id].parents {
+                if let Some(n) = children.get_mut(p) {
+                    *n -= 1;
+                    if *n == 0 {
+                        free.insert(*p);
+                    }
+                }
+            }
         }
     }
 }
@@ -801,13 +953,16 @@ impl Iterator for OpWalk<'_> {
     type Item = Result<(ObjectId, Operation)>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.ready.is_empty() {
+            self.fill();
+        }
         if let Some(e) = self.error.take() {
             return Some(Err(e));
         }
-        let (_, id) = self.queue.pop()?;
+        let (id, t) = self.ready.pop_front()?;
         let op = self.loaded.remove(&id)?;
         for p in &op.parents {
-            self.push(*p);
+            self.push(*p, Some(t));
         }
         Some(Ok((id, op)))
     }

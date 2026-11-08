@@ -956,13 +956,27 @@ impl Repo {
     /// published ones stay released.
     ///
     /// [`Keychain::take_back_release`]: crate::keychain::Keychain::take_back_release
+    ///
+    /// "After" is the op log's: the releases recorded by the operations the
+    /// heads reach and `op` does not (`release embargo <id>`), never a
+    /// comparison of times. Operation times are clamped to their parents'
+    /// (a clock set back), a release is stamped with the clock, so times do
+    /// not say which came first (BUG-1400).
     pub fn releases_after(&self, op: &ObjectId) -> Result<(Vec<String>, Vec<String>)> {
-        let at = self.ops.get(op)?.timestamp;
-        let staged: Vec<String> = self.keys().staged_releases()?.into_iter().filter(|(_, t)| *t > at).map(|(id, _)| id).collect();
-        let mut published = Vec::new();
-        for rec in self.keys().embargoes()? {
-            if self.keys().release_state(&rec.id) == ReleaseState::Released && rec.released_at.is_some_and(|t| t > at) {
-                published.push(rec.id);
+        self.ops.get(op)?;
+        let split = self.ops.split(&self.base, &[*op])?;
+        let mut ids = std::collections::BTreeSet::new();
+        for id in &split.only_a {
+            if let Some(e) = split.ops.get(id).and_then(|o| o.description.strip_prefix(RELEASE_OP_PREFIX)) {
+                ids.insert(e.to_string());
+            }
+        }
+        let (mut staged, mut published) = (Vec::new(), Vec::new());
+        for e in ids {
+            match self.keys().release_state(&e) {
+                ReleaseState::Staged => staged.push(e),
+                ReleaseState::Released => published.push(e),
+                ReleaseState::Unreleased => {}
             }
         }
         Ok((staged, published))

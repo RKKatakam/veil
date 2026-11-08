@@ -451,7 +451,6 @@ fn identical_commands_in_one_millisecond_are_one_operation() {
 /// two misses a release staged after the operation, which then stays
 /// staged and goes out with the next push.
 #[test]
-#[ignore = "BUG-1400: op restore misses a release staged after the restored operation once operation times are clamped"]
 fn bug_1400_restore_takes_back_a_release_staged_after_it_with_the_clock_set_back() {
     let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
     let t = 1_800_000_000_000i64;
@@ -482,4 +481,111 @@ fn bug_1400_restore_takes_back_a_release_staged_after_it_with_the_clock_set_back
     assert_eq!(staged, Some(veil_core::keychain::ReleaseState::Staged), "{e}: the release is staged");
     restored.unwrap();
     assert_eq!(after, Some(veil_core::keychain::ReleaseState::Unreleased), "the restore to before the release took it back");
+}
+
+/// BUG-1400's other direction: a release staged with the clock ahead, then
+/// an operation after it with the clock set right. Restoring that
+/// operation keeps the release (it came before), though its time is the
+/// later one.
+#[test]
+fn restore_keeps_a_release_staged_before_it_with_the_clock_ahead() {
+    let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let t = 1_800_000_000_000i64;
+    let now = settable_clock(t);
+    let fs = Arc::new(MemoryBackend::new());
+    let mut repo = Repo::init(fs.clone(), Some(Identity::generate("alice")), "alice").unwrap();
+    fs.write(&p("auth.rs"), b"fn check() -> bool { true }\n").unwrap();
+    repo.snapshot_workspace("default", &*fs).unwrap();
+    let (main, _) = repo.commit_working_copy("default", "v1").unwrap();
+    repo.create_workspace("fix", vec![main]).unwrap();
+    let ov = repo.workspace_overlay("fix").unwrap();
+    ov.write(&p("auth.rs"), b"fn check() -> bool { verify_signature() }\n").unwrap();
+    let fix = repo.snapshot_workspace("fix", &ov).unwrap().snapshot;
+    let merged = repo.merge("default", main, vec![fix], "merge", Some(veil_core::commands::EmbargoSpec { scope: "team".into(), until: None }));
+    let e = merged.as_ref().ok().and_then(|m| m.embargo.clone());
+    // The clock an hour ahead for the release, then set right.
+    now.store(t + 3_600_000, std::sync::atomic::Ordering::SeqCst);
+    let released = e.as_ref().map(|e| repo.release_embargo(e));
+    now.store(t + 60_000, std::sync::atomic::Ordering::SeqCst);
+    let tagged = repo.set_tag("main", main, false);
+    let after_release = repo.op_id();
+    now.store(t + 120_000, std::sync::atomic::Ordering::SeqCst);
+    let tagged2 = repo.set_tag("next", main, false);
+    let restored = repo.restore_operation(after_release);
+    let state = e.as_ref().map(|e| repo.keys().release_state(e));
+    clock::reset_clock();
+    let e = merged.unwrap().embargo.expect("an embargo");
+    released.unwrap().unwrap();
+    tagged.unwrap();
+    tagged2.unwrap();
+    restored.unwrap();
+    assert_eq!(state, Some(veil_core::keychain::ReleaseState::Staged), "{e}: the release, staged before the restored operation, stays");
+}
+
+/// BUG-1402 through `vl undo`: with one time for every operation (the
+/// clock set back, so each takes its parent's), the operation `vl undo`
+/// undoes is the newest by the op log, not the one whose id sorts first.
+/// `a` then `b` are tags set in turn (repository-wide); `o`, concurrent
+/// with `b`, is another workspace's. Merged, undo in `w` undoes `b`.
+#[test]
+fn undo_with_the_clock_set_back_undoes_the_newest_command() {
+    let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let t = 1_800_000_000_000i64;
+    let mut cases = 0;
+    for _ in 0..200 {
+        let now = settable_clock(t + 3_600_000);
+        let me = Identity::generate("alice");
+        let disk = Arc::new(MemoryBackend::new());
+        let root = {
+            let mut repo = Repo::init(disk.clone(), Some(me.clone()), "alice").unwrap();
+            let root = repo.root_id();
+            repo.create_workspace("w", vec![root]).unwrap();
+            repo.create_workspace("v", vec![root]).unwrap();
+            root
+        };
+        now.store(t, std::sync::atomic::Ordering::SeqCst);
+        let (a, b, o);
+        {
+            let mut repo = Repo::open(disk.clone(), Some(me.clone()), "alice").unwrap();
+            repo.set_tag("a", root, false).unwrap();
+            a = repo.op_id();
+        }
+        let heads = head_names(&disk);
+        let (f1, f2) = (Arc::new(disk.fork()), Arc::new(disk.fork()));
+        {
+            let mut repo = Repo::open(f1.clone(), Some(me.clone()), "alice").unwrap();
+            repo.set_tag("b", root, false).unwrap();
+            b = repo.op_id();
+        }
+        {
+            let mut repo = Repo::open(f2.clone(), Some(me.clone()), "alice").unwrap();
+            repo.set_command_workspace(Some("v".into()));
+            let ov = repo.workspace_overlay("v").unwrap();
+            ov.write(&p("v.txt"), b"v\n").unwrap();
+            repo.snapshot_workspace("v", &ov).unwrap();
+            repo.commit_working_copy("v", "v").unwrap();
+            o = repo.op_id();
+        }
+        // The id order that walked `a` before `b`.
+        if !(a > b && o > b) {
+            continue;
+        }
+        cases += 1;
+        land_fork(&disk, &f1, &heads);
+        land_fork(&disk, &f2, &heads);
+        let mut repo = Repo::open(disk.clone(), Some(me.clone()), "alice").unwrap();
+        let settled = repo.heads().len();
+        let undone = repo.undo_keeping_edits("w").map(|(_, d)| d);
+        let tags: Vec<String> = repo.view().tags.keys().cloned().collect();
+        clock::reset_clock();
+        assert_eq!(settled, 1, "settled");
+        let undone = undone.unwrap();
+        assert!(undone.contains("'b'") || undone.contains(" b"), "undid the newest command, not {undone:?}");
+        assert_eq!(tags, vec!["a".to_string()], "b undone, a kept");
+        if cases == 3 {
+            break;
+        }
+    }
+    clock::reset_clock();
+    assert!(cases > 0, "the id order ran");
 }

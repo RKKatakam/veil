@@ -1069,31 +1069,19 @@ impl Repo {
     /// workspace, see [`mount_record_op_description`]), not a merge of
     /// concurrent operations, and of `ws` or of no workspace.
     fn command_at(&self, start: ObjectId, ws: &str) -> Result<ObjectId> {
-        let mut queue = std::collections::BinaryHeap::new();
-        let mut seen = std::collections::HashSet::new();
-        let first = self.op_or_pruned(&start, "undo")?;
-        queue.push((first.timestamp, start));
-        seen.insert(start);
-        let mut pruned = None;
-        while let Some((_, id)) = queue.pop() {
-            let Some(op) = self.ops.try_get(&id)? else {
-                pruned = Some(id);
-                continue;
-            };
+        self.op_or_pruned(&start, "undo")?;
+        // The op log's order (BUG-1402): never an operation before one
+        // that descends from it.
+        let mut walk = self.ops.walk(&[start]);
+        for r in walk.by_ref() {
+            let (id, op) = r?;
             let other_ws = op.workspace.as_deref().is_some_and(|w| w != ws);
             let skip = op.is_merge() || other_ws || (is_automatic_recording(&op.description, ws) && !op.parents.is_empty());
             if !skip {
                 return Ok(id);
             }
-            for p in &op.parents {
-                if seen.insert(*p) {
-                    match self.ops.try_get(p)? {
-                        Some(po) => queue.push((po.timestamp, *p)),
-                        None => pruned = Some(*p),
-                    }
-                }
-            }
         }
+        let pruned = walk.pruned();
         match pruned {
             Some(p) => Err(VeilError::repo(format!(
                 "nothing further to undo: operation {} was pruned by `vl gc --keep-ops-days`",

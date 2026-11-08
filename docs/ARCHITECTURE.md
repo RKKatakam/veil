@@ -1170,7 +1170,10 @@ struct Snapshot {
   jj's model (a history stack and a redo stack). Undos written before
   `undo_of` existed are plain operations: undoing one redoes it, once.
 * **Undo per workspace (format 6).** `Repo::undo_target(ws)` walks the op
-  graph newest first (by timestamp, then id, across merged branches) and
+  graph newest first (by timestamp, then id, across merged branches, and
+  never an operation before one that descends from it: equal times, and
+  an operation older than its parent, follow the op log's ancestry,
+  BUG-1402) and
   skips merges of concurrent operations and other workspaces' commands: it
   takes the newest command whose `workspace` is `ws` or none (tags, push,
   pull, remotes: repository-wide). An agent working in its own workspace
@@ -2034,7 +2037,9 @@ the outsiders' view; format 8 removed all of it (FORMAT.md §5). What is left:
      and nothing reached any remote. Once published, `vl undo` of the
      release is refused, and changes nothing. `vl op restore` to an
      operation before a staged release takes it back too, and warns about
-     published ones. Redoing the undo of a release is refused: undo and
+     published ones; "before" is the op log's (the `release embargo <id>`
+     operations the restored one does not reach), never a comparison of
+     times, which a clock set back would get wrong (BUG-1400). Redoing the undo of a release is refused: undo and
      redo never release.
    * **Preview.** `vl embargo release` shows the embargoed merge, the
      withheld history it publishes, the tags that carry it and the remotes
@@ -2458,11 +2463,16 @@ take no lock:
   a child committed on a snapshot amended meanwhile moves onto the amended
   one); both sides rewriting one snapshot differently is a divergent change,
   and a rewrite that was undone is not applied: its old snapshot is
-  visible again (as a ref or an ancestor of one) on the side that recorded
-  it (BUG-802), on a head merged later that reaches an operation that
-  recorded it, or on a side where the fold step's shared history does not
-  show it (an undo or op restore of a rewrite the shared history holds,
-  recorded again by a merge on the other side, BUG-1295).
+  visible again (as a ref or an ancestor of one) on a head of the side
+  that recorded it (BUG-802), on a head merged later that reaches an
+  operation that recorded it, or, for a rewrite only merges recorded, on a
+  side where the fold step's shared history does not show it (an undo or
+  op restore of a rewrite the shared history holds, recorded again by a
+  merge on the other side, BUG-1295). What was undone is a command (each
+  of its rewrites: the describe and the rebase of what was on it), not a
+  snapshot: another command's rewrite of the same snapshot still applies
+  (BUG-1299). On one side, a rewrite replaces an earlier one of the same
+  snapshot only if its operation descends from the earlier one's.
   The confinement check runs against **every side's view**: a rewrite that
   would move a change out of an unreleased embargo either side had it in
   is dropped and its replacement rewritten back, so the change stays
