@@ -734,6 +734,11 @@ fn prune_store(
         retained.insert(*h);
         retained.extend(repo.ops.get(h)?.parents);
     }
+    // A staged release's operation, and everything newer, stays: the push
+    // reads the op log down to it to tell whether the release is in force
+    // (BUG-1532).
+    let (_, staged_ops) = repo.staged_release_standing()?;
+    retained.extend(staged_ops);
     let cutoff = opts.keep_ops.map(|keep| now.saturating_sub(keep.as_millis() as i64));
     let mut roots: Vec<ObjectId> = vec![repo.root_id];
     let mut annotations = Vec::new();

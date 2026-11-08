@@ -912,3 +912,111 @@ fn many_threads_no_lost_operation() {
     assert_eq!(committed, THREADS * ROUNDS, "an operation is missing from the log");
     assert_fsck_clean(fs, &id, "after many writers");
 }
+
+// ---- op log merges review (BUG-1295 to 1298 fixes) ---------------------------------
+
+/// Write `f` in workspace `ws` and commit it: (the commit, the new working copy).
+fn commit_in(r: &mut Repo, ws: &str, f: &str, body: &str) -> (ObjectId, ObjectId) {
+    r.set_command_workspace(Some(ws.into()));
+    let ov = r.workspace_overlay(ws).unwrap();
+    ov.write(&p(f), body.as_bytes()).unwrap();
+    r.snapshot_workspace(ws, &ov).unwrap();
+    r.commit_working_copy(ws, f).unwrap()
+}
+
+/// Whether the view shows `id`: as a ref, or an ancestor of one.
+fn shows(r: &Repo, id: &ObjectId) -> bool {
+    r.view().refs().iter().any(|x| x == id || r.is_ancestor(id, x).unwrap())
+}
+
+/// BUG-1434 (op log merges review, cycle 2): an undo cancels exactly the
+/// command it undoes, no more. A describes `x` (which rebases `c`, its
+/// child, onto the new `x`), then tags the old `x` (`vl tag set old <id>`,
+/// a pointer to the previous version: nothing undone). B, concurrently,
+/// starts a workspace on `c`. The merge reads A's view showing `x` as A
+/// having undone the describe, and now (BUG-1299's fix) cancels the whole
+/// command: the rebase of `c` too, so B's workspace stays on the old `c`,
+/// and both versions of `c` are visible. Before the fix only the rewrite of
+/// `x` was cancelled, and B's workspace moved onto the new `c`.
+#[test]
+fn bug_1434_a_tag_on_an_old_version_does_not_cancel_the_rebase_of_its_children() {
+    let (mut repo, fs, id) = new_repo("alice");
+    repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+    let (x, _) = commit_in(&mut repo, "w", "x", "1\n");
+    let (c, _) = commit_in(&mut repo, "w", "c", "2\n");
+    let change_c = repo.snapshot(&c).unwrap().change_id;
+    drop(repo);
+    let (c2, b) = concurrently(
+        &fs,
+        &id,
+        |r| {
+            r.describe(x, "x, described").unwrap();
+            let c2: Vec<ObjectId> = r.exact().visible().unwrap().into_iter().filter(|s| *s != c && r.snapshot(s).unwrap().change_id == change_c).collect();
+            r.set_tag("old", x, false).unwrap();
+            assert!(!shows(r, &c), "A's describe moved c");
+            c2
+        },
+        |r| r.create_workspace("b", vec![c]).unwrap(),
+    );
+    assert_eq!(c2.len(), 1, "A's describe rebased c once");
+    let r = open(&fs, &id);
+    assert_merged(&r, 2);
+    let b_now = r.workspace_wc("b").unwrap();
+    assert_eq!(r.snapshot(&b_now).unwrap().change_id, r.snapshot(&b).unwrap().change_id, "B's workspace kept its working copy");
+    assert_eq!(r.snapshot(&b_now).unwrap().parents, c2, "B's workspace is on the rebased c");
+    assert!(!shows(&r, &c), "c, which A's describe rebased, is still visible");
+}
+
+/// Auto-rebase through the new skip rules (BUG-1295): a commit made on
+/// `x` in its workspace while another command describes `x` moves onto
+/// the described `x`, though both sides moved the workspace (the shared
+/// history has no value for it, BUG-1296) and the committing side shows
+/// `x`.
+#[test]
+fn describe_racing_a_commit_on_it_moves_the_commit() {
+    let (mut repo, fs, id) = new_repo("alice");
+    repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+    let (x, _) = commit_in(&mut repo, "w", "x", "1\n");
+    drop(repo);
+    let (x2, (y, _)) = concurrently(&fs, &id, |r| r.describe(x, "x, amended").unwrap(), |r| commit_in(r, "w", "y", "2\n"));
+    let r = open(&fs, &id);
+    assert_merged(&r, 2);
+    let change = r.snapshot(&y).unwrap().change_id;
+    let ys: Vec<ObjectId> = r.exact().visible().unwrap().into_iter().filter(|s| r.snapshot(s).unwrap().description.as_str() == "y").collect();
+    assert_eq!(ys.len(), 1, "one commit y");
+    assert_eq!(r.snapshot(&ys[0]).unwrap().change_id, change);
+    assert_eq!(r.snapshot(&ys[0]).unwrap().parents, vec![x2], "y is on the described x");
+    assert!(!shows(&r, &x), "the rewritten x is still visible");
+}
+
+/// BUG-1299: a rewrite one side recorded and undid makes the merge skip
+/// every rewrite of that snapshot, another side's too. `side` holds a
+/// child of `x`; A describes `x` and undoes it; B describes `x`
+/// concurrently. B's rewrite should move the child (it does on
+/// `integration` @ ebabc15c); `merge_plan` keys `undone` by the old
+/// snapshot alone, so A's undo cancels B's rewrite: the child stays on
+/// `x`, and `x` and B's `x` are both visible.
+#[test]
+fn bug_1299_an_undone_rewrite_does_not_cancel_another_sides_rewrite() {
+    let (mut repo, fs, id) = new_repo("alice");
+    repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+    let (x, _) = commit_in(&mut repo, "w", "x", "1\n");
+    let side = repo.create_workspace("side", vec![x]).unwrap();
+    drop(repo);
+    let (_, x2) = concurrently(
+        &fs,
+        &id,
+        |r| {
+            r.describe(x, "x, by A").unwrap();
+            r.undo().unwrap();
+            assert_eq!(r.snapshot(&r.workspace_wc("side").unwrap()).unwrap().parents, vec![x], "A's undo put the child back on x");
+        },
+        |r| r.describe(x, "x, by B").unwrap(),
+    );
+    let r = open(&fs, &id);
+    assert_merged(&r, 2);
+    let side_now = r.workspace_wc("side").unwrap();
+    assert_eq!(r.snapshot(&side_now).unwrap().change_id, r.snapshot(&side).unwrap().change_id);
+    assert_eq!(r.snapshot(&side_now).unwrap().parents, vec![x2], "the child is on B's described x");
+    assert!(!shows(&r, &x), "x, which B rewrote, is still visible");
+}

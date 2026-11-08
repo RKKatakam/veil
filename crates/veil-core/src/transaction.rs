@@ -59,6 +59,8 @@ struct MergeCtx {
     /// Snapshots the current round left on their old parents, because
     /// rebasing them was refused (with why).
     held: Vec<(ObjectId, String)>,
+    /// Refs the rebase leaves where they are (`MergePlan::pinned`).
+    pinned: BTreeSet<crate::repo::RefKey>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +83,7 @@ pub struct Transaction<'r> {
     attaches: Option<String>,
     undo_of: Option<ObjectId>,
     redo_of: Option<ObjectId>,
+    restore_of: Option<ObjectId>,
     /// The repository lock (format ≤ 5, remotes); `None` when lock-free.
     lock: Option<RepoLock>,
     /// The heads this transaction started from: its operation's parents.
@@ -166,6 +169,7 @@ impl<'r> Transaction<'r> {
             attaches: None,
             undo_of: None,
             redo_of: None,
+            restore_of: None,
             lock,
             workspace,
             expected: Vec::new(),
@@ -187,6 +191,7 @@ impl<'r> Transaction<'r> {
         let crate::repo::MergePlan {
             view,
             rewritten,
+            pinned,
             before,
             timestamp,
             warnings,
@@ -224,6 +229,7 @@ impl<'r> Transaction<'r> {
             timestamp,
             warnings,
             held: Vec::new(),
+            pinned,
         });
         Ok(tx)
     }
@@ -298,6 +304,13 @@ impl<'r> Transaction<'r> {
     pub fn redo_of(&mut self, op: ObjectId) {
         self.record_always = true;
         self.redo_of = Some(op);
+    }
+
+    /// Record this operation as the restore of operation `op`'s view (see
+    /// [`crate::oplog::Operation::restore_of`]).
+    pub fn restore_of(&mut self, op: ObjectId) {
+        self.record_always = true;
+        self.restore_of = Some(op);
     }
 
     pub fn add_head(&mut self, id: ObjectId) -> Result<()> {
@@ -541,8 +554,21 @@ impl<'r> Transaction<'r> {
     }
 
     fn rebase_descendants(&mut self) -> Result<()> {
-        let mut roots = self.start_view.refs();
-        roots.extend(self.view.refs());
+        // A merge leaves the refs it pinned where they are, and what only
+        // they reach (BUG-1434).
+        let pinned = self.merge.as_ref().map(|m| m.pinned.clone()).unwrap_or_default();
+        let unpinned = |v: &View| -> Vec<ObjectId> {
+            if pinned.is_empty() {
+                return v.refs();
+            }
+            let mut out: Vec<ObjectId> = v.heads.iter().filter(|h| !pinned.contains(&crate::repo::RefKey::Head(**h))).copied().collect();
+            out.extend(v.workspaces.iter().filter(|(n, _)| !pinned.contains(&crate::repo::RefKey::Ws((*n).clone()))).map(|(_, w)| w.wc));
+            out.extend(v.tags.iter().filter(|(n, _)| !pinned.contains(&crate::repo::RefKey::Tag((*n).clone()))).map(|(_, t)| t.target));
+            out.extend(v.remote_tags.values().copied());
+            out
+        };
+        let mut roots = unpinned(&self.start_view);
+        roots.extend(unpinned(&self.view));
         // Only descendants of a rewritten snapshot can move, and each has a
         // larger generation than the oldest one: the walk stops there
         // instead of reading all history.
@@ -611,13 +637,21 @@ impl<'r> Transaction<'r> {
             let ns = self.indexed(ns)?;
             let nid = store.put_snapshot(&self.sign(&ns))?;
             self.rewritten.insert(id, Rewrite::Replaced(nid));
-            self.view.heads.remove(&id);
+            if !pinned.contains(&crate::repo::RefKey::Head(id)) {
+                self.view.heads.remove(&id);
+            }
             self.add_head(nid)?;
         }
 
-        // Re-point every reference.
+        // Re-point every reference (but those a merge pinned).
         let heads: Vec<ObjectId> = self.view.heads.iter().copied().collect();
-        self.view.heads = heads.into_iter().flat_map(|h| self.resolve(h).0).collect();
+        self.view.heads = heads
+            .into_iter()
+            .flat_map(|h| match pinned.contains(&crate::repo::RefKey::Head(h)) {
+                true => vec![h],
+                false => self.resolve(h).0,
+            })
+            .collect();
         let root = self.repo.root_id;
         // A release tag (annotated, format 5) is immutable: it stays on the
         // snapshot it was made for, which it keeps visible, and its signed
@@ -625,14 +659,14 @@ impl<'r> Transaction<'r> {
         let tags: Vec<(String, ObjectId)> =
             self.view.tags.iter().filter(|(_, t)| t.annotation.is_none()).map(|(n, t)| (n.clone(), t.target)).collect();
         for (name, target) in tags {
-            if self.rewritten.contains_key(&target) {
+            if self.rewritten.contains_key(&target) && !pinned.contains(&crate::repo::RefKey::Tag(name.clone())) {
                 let r = self.resolve(target).0;
                 self.view.tags.get_mut(&name).unwrap().target = r.first().copied().unwrap_or(root);
             }
         }
         let wss: Vec<(String, ObjectId)> = self.view.workspaces.iter().map(|(n, w)| (n.clone(), w.wc)).collect();
         for (name, wc) in wss {
-            if !self.rewritten.contains_key(&wc) {
+            if !self.rewritten.contains_key(&wc) || pinned.contains(&crate::repo::RefKey::Ws(name.clone())) {
                 continue;
             }
             let (r, abandoned) = self.resolve(wc);
@@ -1175,7 +1209,7 @@ impl<'r> Transaction<'r> {
         }
         let (timestamp, user) = match &self.merge {
             Some(m) => (m.timestamp, "veil".to_string()),
-            None => (now_millis(), self.repo.user.clone()),
+            None => (now_millis().max(self.repo.base_time + 1), self.repo.user.clone()),
         };
         Operation {
             parents,
@@ -1188,6 +1222,7 @@ impl<'r> Transaction<'r> {
             redo_of: self.redo_of,
             workspace: self.workspace.clone().filter(|_| format6),
             rewritten,
+            restore_of: self.restore_of,
         }
     }
 
@@ -1303,14 +1338,14 @@ impl<'r> Transaction<'r> {
             // Fencing: never move the head unless we still hold the lock.
             lock.ensure_held()?;
         }
-        let id = match staged {
+        let (id, time) = match staged {
             Some((id, op, op_file, head)) => {
                 self.repo.ops.publish_staged(&id, &op, &op_file, &head, &self.stale)?;
-                id
+                (id, op.timestamp)
             }
             None => {
                 let op = self.operation();
-                self.repo.ops.publish(&op, &self.stale)?
+                (self.repo.ops.publish(&op, &self.stale)?, op.timestamp)
             }
         };
         if let Some(dir) = self.kept_dir.take() {
@@ -1319,6 +1354,7 @@ impl<'r> Transaction<'r> {
         drop(publishing);
         self.repo.op_id = id;
         self.repo.base = vec![id];
+        self.repo.base_time = time;
         self.repo.raw = RawHeads {
             all: vec![id],
             legacy: None,

@@ -545,9 +545,11 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             }
             let outside = ctx.repo.manual_undo_since(op)?;
             // Releases are not in the view: take back the staged ones made
-            // since, and say which published ones stay (BUG-109).
-            let (staged, published) = ctx.repo.releases_after(&op)?;
-            ctx.repo.restore_operation_keeping_edits(&ws, op)?;
+            // since, and say which published ones stay (BUG-109). Since
+            // the restore's own parents: a release another process staged
+            // while this one ran is behind the restore too (BUG-1404).
+            let restore = ctx.repo.restore_operation_keeping_edits(&ws, op)?;
+            let (staged, published) = ctx.repo.releases_restored(&restore)?;
             for e in &staged {
                 ctx.repo.keys().take_back_release(e)?;
             }
@@ -1208,6 +1210,9 @@ fn cmd_embargo(ctx: &mut Ctx, c: &EmbargoCmd) -> Result<()> {
                 println!("No embargoes.");
             }
             let withdrawn = remote::withdrawn_embargoes(&ctx.repo)?;
+            // Where staged releases stand by the op log (BUG-1487): a push
+            // publishes only those in force.
+            let (standing, _) = ctx.repo.staged_release_standing()?;
             for r in list {
                 let pending = || match r.until {
                     Some(u) => yellow(&format!("until {}", fmt_deadline(u))),
@@ -1215,6 +1220,10 @@ fn cmd_embargo(ctx: &mut Ctx, c: &EmbargoCmd) -> Result<()> {
                 };
                 let state = match ctx.repo.keys().release_state(&r.id) {
                     ReleaseState::Released => green("released"),
+                    ReleaseState::Staged if standing.get(&r.id).is_some_and(|s| *s != veil_core::commands::Standing::InForce) => yellow(&format!(
+                        "not released: an undo or op restore took the release back, or the op log does not hold it; the next push does not publish it (`vl embargo release {}` to release it again)",
+                        safe(&r.id)
+                    )),
                     ReleaseState::Staged => format!(
                         "{} {}",
                         green("released"),
@@ -1241,10 +1250,17 @@ fn cmd_embargo_release(ctx: &mut Ctx, id: &str, yes: bool) -> Result<()> {
     let Some(rec) = keys.load_embargo(id)? else {
         bail!("no embargo '{}' (see `vl embargo list`)", safe(id));
     };
+    let (standing, _) = ctx.repo.staged_release_standing()?;
+    let keys = ctx.repo.keys();
     match keys.release_state(id) {
         ReleaseState::Released => {
             println!("Embargo {} is already released.", safe(id));
             return Ok(());
+        }
+        // Staged, but the op log does not hold it in force: release it
+        // again (BUG-1487).
+        ReleaseState::Staged if standing.get(id).is_some_and(|s| *s != veil_core::commands::Standing::InForce) => {
+            keys.take_back_release(id)?;
         }
         ReleaseState::Staged => {
             println!("Embargo {} is already released here; your next push publishes it (`vl undo` right after the release takes it back).", safe(id));
