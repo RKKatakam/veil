@@ -599,7 +599,6 @@ fn undo_with_the_clock_set_back_undoes_the_newest_command() {
 /// staged and goes out with the next push. Before the fix (times compared)
 /// it was taken back.
 #[test]
-#[ignore = "BUG-1404: op restore keeps a release another process staged after this one read the op log, though the restore reaches it"]
 fn bug_1404_restore_takes_back_a_release_staged_meanwhile_by_another_process() {
     let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
     let t = 1_800_000_000_000i64;

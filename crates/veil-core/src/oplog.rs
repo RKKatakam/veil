@@ -163,6 +163,14 @@ pub struct Operation {
     /// the amended one). Omitted when empty.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rewritten: BTreeMap<ObjectId, Vec<ObjectId>>,
+    /// Set on an operation recorded by `vl op restore`: the operation whose
+    /// view it restored. It takes back every operation between that one
+    /// and its parents, which a merge of concurrent operations reads from
+    /// here, not from what the view shows (BUG-1434). Absent elsewhere, and
+    /// on restores written before it existed (a merge then reads the
+    /// restored operation's id from the description).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_of: Option<ObjectId>,
 }
 
 impl Operation {
@@ -505,10 +513,14 @@ impl OpStore {
     }
 
     /// Operations from `starts` and their ancestors, newest first (by
-    /// time, then id), each once, and never before a descendant: on equal
-    /// times the op log's ancestry orders them, and a parent newer than
-    /// its child comes after it (BUG-1402). Pruned operations end their
-    /// branch ([`OpWalk::pruned`]).
+    /// time, then id), each once, and on a log written since operation
+    /// times were clamped (none older than its parent) never before a
+    /// descendant: on equal times the op log's ancestry orders them,
+    /// reading only the operations of that time below the candidates
+    /// (BUG-1402, BUG-1433). On an older log, a parent newer than its
+    /// child is listed after it, but an operation can still come before an
+    /// older descendant that only a branch not walked yet reaches
+    /// (BUG-1432). Pruned operations end their branch ([`OpWalk::pruned`]).
     pub fn walk(&self, starts: &[ObjectId]) -> OpWalk<'_> {
         let mut w = OpWalk {
             ops: self,
@@ -617,8 +629,13 @@ impl OpStore {
 
     /// Resolve an operation id prefix among the operations the heads reach.
     pub fn resolve_prefix(&self, prefix: &str) -> Result<ObjectId> {
+        self.resolve_prefix_from(&self.heads()?, prefix)
+    }
+
+    /// Resolve an operation id prefix among the operations `starts` reach.
+    pub fn resolve_prefix_from(&self, starts: &[ObjectId], prefix: &str) -> Result<ObjectId> {
         let mut found = Vec::new();
-        for (steps, id) in self.walk(&self.heads()?).enumerate() {
+        for (steps, id) in self.walk(starts).enumerate() {
             let id = id?.0;
             if id.hex().starts_with(prefix) {
                 found.push(id);
@@ -890,62 +907,62 @@ impl OpWalk<'_> {
         }
     }
 
-    /// The next group: every queued operation of the newest key, and those
-    /// of their ancestors that share it (operations of one time: a merge
+    /// The next operation to list: of the newest key, one no other queued
+    /// operation of that key descends from (BUG-1402: times tie; a merge
     /// has its newest parent's, and a clock set back gives every operation
-    /// its parent's), ordered children first, then by id (BUG-1402).
+    /// its parent's). With one such operation queued, as on a line of
+    /// operations of one time, that is it, read nothing more (BUG-1433);
+    /// with several, only the operations of that key below them are read.
     fn fill(&mut self) {
-        let mut group: Vec<ObjectId> = Vec::new();
-        let mut member: std::collections::HashSet<ObjectId> = Default::default();
+        let mut cands: Vec<ObjectId> = Vec::new();
         let mut t = None;
         while let Some(&(k, id)) = self.queue.peek() {
             if t.is_some_and(|t| k != t) {
                 break;
             }
             self.queue.pop();
-            if self.done.contains(&id) || self.key.get(&id) != Some(&k) || !member.insert(id) {
+            if self.done.contains(&id) || self.key.get(&id) != Some(&k) || cands.contains(&id) {
                 continue;
             }
             t = Some(k);
-            group.push(id);
+            cands.push(id);
         }
         let Some(t) = t else { return };
-        let mut i = 0;
-        while i < group.len() {
-            for p in self.loaded[&group[i]].parents.clone() {
-                if self.done.contains(&p) || member.contains(&p) || !self.load(p) {
-                    continue;
-                }
-                let k = self.key.get(&p).copied().unwrap_or(i64::MAX).min(self.loaded[&p].timestamp).min(t);
-                if k == t {
-                    member.insert(p);
-                    group.push(p);
-                }
-            }
-            i += 1;
-        }
-        let mut children: HashMap<ObjectId, usize> = HashMap::new();
-        for m in &group {
-            for p in &self.loaded[m].parents {
-                if member.contains(p) {
-                    *children.entry(*p).or_default() += 1;
-                }
-            }
-        }
-        let mut free: BTreeSet<ObjectId> = group.iter().filter(|m| !children.contains_key(*m)).copied().collect();
-        while let Some(id) = free.pop_last() {
-            self.done.insert(id);
-            self.key.remove(&id);
-            self.ready.push_back((id, t));
-            for p in &self.loaded[&id].parents {
-                if let Some(n) = children.get_mut(p) {
-                    *n -= 1;
-                    if *n == 0 {
-                        free.insert(*p);
+        let pick = match cands.as_slice() {
+            [one] => *one,
+            _ => {
+                // Those another candidate reaches through operations of this
+                // key (an operation below one, of its time or newer, is listed
+                // with its key).
+                let mut reached: std::collections::HashSet<ObjectId> = Default::default();
+                for c in &cands {
+                    let mut stack: Vec<ObjectId> = self.loaded.get(c).map(|o| o.parents.clone()).unwrap_or_default();
+                    let mut seen: std::collections::HashSet<ObjectId> = Default::default();
+                    while let Some(x) = stack.pop() {
+                        if !seen.insert(x) || self.done.contains(&x) || !self.load(x) {
+                            continue;
+                        }
+                        if self.loaded[&x].timestamp < t {
+                            continue;
+                        }
+                        reached.insert(x);
+                        stack.extend(self.loaded[&x].parents.iter().copied());
                     }
                 }
+                let free = cands.iter().filter(|c| !reached.contains(*c)).max().copied();
+                // A cycle cannot happen in the op log; should the data say
+                // otherwise, the highest id goes first rather than none.
+                free.unwrap_or_else(|| *cands.iter().max().expect("a candidate"))
+            }
+        };
+        for c in cands {
+            if c != pick {
+                self.queue.push((t, c));
             }
         }
+        self.done.insert(pick);
+        self.key.remove(&pick);
+        self.ready.push_back((pick, t));
     }
 }
 

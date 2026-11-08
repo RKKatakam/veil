@@ -1171,9 +1171,12 @@ struct Snapshot {
   `undo_of` existed are plain operations: undoing one redoes it, once.
 * **Undo per workspace (format 6).** `Repo::undo_target(ws)` walks the op
   graph newest first (by timestamp, then id, across merged branches, and
-  never an operation before one that descends from it: equal times, and
-  an operation older than its parent, follow the op log's ancestry,
-  BUG-1402) and
+  on a log written since operation times were clamped never an operation
+  before one that descends from it: equal times follow the op log's
+  ancestry, reading only the operations of that time it needs, BUG-1402,
+  BUG-1433; on an older log, with an operation older than its parent, an
+  operation can still come before an older descendant reached only by
+  another branch, BUG-1432) and
   skips merges of concurrent operations and other workspaces' commands: it
   takes the newest command whose `workspace` is `ws` or none (tags, push,
   pull, remotes: repository-wide). An agent working in its own workspace
@@ -2037,9 +2040,11 @@ the outsiders' view; format 8 removed all of it (FORMAT.md §5). What is left:
      and nothing reached any remote. Once published, `vl undo` of the
      release is refused, and changes nothing. `vl op restore` to an
      operation before a staged release takes it back too, and warns about
-     published ones; "before" is the op log's (the `release embargo <id>`
-     operations the restored one does not reach), never a comparison of
-     times, which a clock set back would get wrong (BUG-1400). Redoing the undo of a release is refused: undo and
+     published ones; "before" is the op log's, from the restore
+     operation's own parents (the `release embargo <id>` operations they
+     reach and the restored one does not), never a comparison of times,
+     which a clock set back would get wrong (BUG-1400), nor the heads read
+     before the restore's transaction (BUG-1404). Redoing the undo of a release is refused: undo and
      redo never release.
    * **Preview.** `vl embargo release` shows the embargoed merge, the
      withheld history it publishes, the tags that carry it and the remotes
@@ -2462,17 +2467,26 @@ take no lock:
   the other's new snapshots (`Transaction::for_merge` runs the auto-rebase:
   a child committed on a snapshot amended meanwhile moves onto the amended
   one); both sides rewriting one snapshot differently is a divergent change,
-  and a rewrite that was undone is not applied: its old snapshot is
-  visible again (as a ref or an ancestor of one) on a head of the side
-  that recorded it (BUG-802), on a head merged later that reaches an
-  operation that recorded it, or, for a rewrite only merges recorded, on a
-  side where the fold step's shared history does not show it (an undo or
-  op restore of a rewrite the shared history holds, recorded again by a
-  merge on the other side, BUG-1295). What was undone is a command (each
-  of its rewrites: the describe and the rebase of what was on it), not a
-  snapshot: another command's rewrite of the same snapshot still applies
-  (BUG-1299). On one side, a rewrite replaces an earlier one of the same
-  snapshot only if its operation descends from the earlier one's.
+  and a rewrite that was undone is not applied. What undoes a command's
+  rewrite is read from the op log, never from a view: an operation with
+  `undo_of` takes back the operation it names, an op restore
+  (`restore_of`, or on older restores the operation named in its
+  description) every operation between the restored one and its parents,
+  unless the undo or restore is itself taken back (an undo of the
+  restore, a redo of the undo); each rewrite of the operation taken back
+  goes, and another command's rewrite of the same snapshot still applies
+  (BUG-802, BUG-1299, BUG-1434). Showing an old snapshot again undoes
+  nothing: a ref on it that a command which saw each rewrite of what it
+  shows set (a tag on the old version, a workspace on it, an undo's
+  revert) stays where it is, and every other ref follows the rewrite. A
+  rewrite only merges recorded (the op log does not say which command it
+  is) is still judged by the views: not applied when a head that saw it
+  shows its old snapshot, or a side shows it where the fold step's shared
+  history does not (BUG-1295). On one side, a rewrite replaces an earlier
+  one of the same snapshot only if its operation descends from the
+  earlier one's; two that stand and differ are a divergent change, which
+  nothing follows, and a merge does not revisit that decision when one
+  of them is taken back later (BUG-1444).
   The confinement check runs against **every side's view**: a rewrite that
   would move a change out of an unreleased embargo either side had it in
   is dropped and its replacement rewritten back, so the change stays

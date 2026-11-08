@@ -27,6 +27,7 @@ fn put_op(repo: &veil_core::Repo, parents: Vec<ObjectId>, timestamp: i64, view: 
             redo_of: None,
             workspace: None,
             rewritten: Default::default(),
+            restore_of: None,
         })
         .unwrap()
 }

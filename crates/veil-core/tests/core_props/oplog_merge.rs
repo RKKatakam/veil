@@ -582,19 +582,33 @@ fn check_model(cmds: &[Cmd], repo: &Repo, losers: &std::collections::HashSet<Obj
     let view = repo.view();
     let have = keys_of(view);
     let refs = view.refs();
-    // Visible as a ref or below one; or, moved by a concurrent rewrite (an
-    // amend, the rebase onto one, BUG-1299), as its change.
-    let changes: std::collections::HashSet<_> = repo.exact().visible().unwrap().iter().map(|s| repo.snapshot(s).unwrap().change_id).collect();
-    let visible = |v: &ObjectId| refs.iter().any(|r| r == v || repo.is_ancestor(v, r).unwrap()) || repo.snapshot(v).is_ok_and(|s| changes.contains(&s.change_id));
-    // A value a command's rewrite moved (BUG-1299: the other side's
-    // rewrite applies): its replacement, or for an abandoned working copy
-    // a new one on the same parents.
+    // The rewrites the op log records (old to its replacements).
     let mut rewrites: std::collections::HashMap<ObjectId, Vec<Vec<ObjectId>>> = Default::default();
     for r in repo.ops().walk(repo.heads()) {
         for (old, new) in r.unwrap().1.rewritten {
             rewrites.entry(old).or_default().push(new);
         }
     }
+    // Visible as a ref or below one; or, moved by a concurrent rewrite (an
+    // amend, the rebase onto one, BUG-1299), through the rewrites the op
+    // log records, followed to a visible snapshot. Not by change id: two
+    // concurrent snapshots of one working copy are versions of one change,
+    // and a dropped one is lost (BUG-1435).
+    let shown = |v: &ObjectId| refs.iter().any(|r| r == v || repo.is_ancestor(v, r).unwrap());
+    let visible = |v: &ObjectId| {
+        let mut todo = vec![*v];
+        let mut seen: std::collections::HashSet<ObjectId> = Default::default();
+        while let Some(x) = todo.pop() {
+            if !seen.insert(x) || seen.len() > 256 {
+                continue;
+            }
+            if shown(&x) {
+                return true;
+            }
+            todo.extend(rewrites.get(&x).into_iter().flatten().flatten().copied());
+        }
+        false
+    };
     let moved = |v: &ObjectId, g: &ObjectId| {
         rewrites.get(v).is_some_and(|news| {
             news.iter().any(|n| n.contains(g) || (n.is_empty() && repo.snapshot(g).unwrap().parents == repo.snapshot(v).unwrap().parents))
@@ -905,11 +919,14 @@ struct RwCmd {
     forked: usize,
     landed: Option<usize>,
     ops: std::collections::HashSet<ObjectId>,
-    rewrites: Vec<(ObjectId, ObjectId)>,
-    retracts: Vec<usize>,
-    /// Rewrites (command, old snapshot) it saw and brought back: its view
-    /// shows the old snapshot (an undo's revert wins a conflict, BUG-802).
-    brought_back: Vec<(usize, ObjectId)>,
+    /// Each rewrite with the operation that recorded it: (op, old, new).
+    rewrites: Vec<(ObjectId, ObjectId, ObjectId)>,
+    /// The operations it took back (an undo the one it undid, an op
+    /// restore every one between the restored one and its parents).
+    retracts: Vec<ObjectId>,
+    /// What it wrote (keys and their values, as the per-key model sees
+    /// them).
+    writes: Vec<(Key, Val)>,
     what: String,
 }
 
@@ -923,31 +940,90 @@ struct RwCmd {
 /// nothing follows either, and it stays visible, with what is below and
 /// on it).
 fn check_rewrites_followed(cmds: &[RwCmd], repo: &Repo, at: &str) -> Result<(), TestCaseError> {
-    let refs = repo.view().refs();
-    let retracted = |i: usize, old: &ObjectId| cmds.iter().any(|r| r.landed.is_some() && (r.retracts.contains(&i) || r.brought_back.contains(&(i, *old))));
-    let live: Vec<(usize, &(ObjectId, ObjectId))> = cmds
+    // Taken back by an undo or op restore that is itself in force (not
+    // taken back by an undo of it).
+    fn in_force(cmds: &[RwCmd], r: usize) -> bool {
+        !cmds.iter().enumerate().any(|(x, c)| c.landed.is_some() && c.retracts.iter().any(|o| cmds[r].ops.contains(o)) && in_force(cmds, x))
+    }
+    let retracted = |op: &ObjectId| cmds.iter().enumerate().any(|(r, c)| c.landed.is_some() && c.retracts.contains(op) && in_force(cmds, r));
+    let live: Vec<(usize, (ObjectId, ObjectId))> = cmds
         .iter()
         .enumerate()
         .filter(|(_, c)| c.landed.is_some())
-        .flat_map(|(i, c)| c.rewrites.iter().map(move |r| (i, r)))
-        .filter(|(i, r)| !retracted(*i, &r.0))
+        .flat_map(|(i, c)| c.rewrites.iter().filter(|r| !retracted(&r.0)).map(move |r| (i, (r.1, r.2))))
         .collect();
-    // Snapshots two live rewrites replace differently: nothing follows
-    // either, so they stay where they are, with their ancestors and what is
-    // built on them.
-    let divergent: std::collections::HashSet<ObjectId> = live.iter().filter(|(_, (o, n))| live.iter().any(|(_, (o2, n2))| o2 == o && n2 != n)).map(|(_, (o, _))| *o).collect();
+    // Snapshots two concurrent commands rewrote differently: a divergent
+    // change, nothing follows either, so they stay where they are, with
+    // their ancestors and what is built on them; and a merge does not
+    // revisit that when one is taken back later (only a later merge with
+    // both still to merge would see it).
+    let landed: Vec<(usize, (ObjectId, ObjectId))> =
+        cmds.iter().enumerate().filter(|(_, c)| c.landed.is_some()).flat_map(|(i, c)| c.rewrites.iter().map(move |r| (i, (r.1, r.2)))).collect();
+    let concurrent = |i: usize, j: usize| cmds[i].landed.unwrap() >= cmds[j].forked && cmds[j].landed.unwrap() >= cmds[i].forked;
+    // Or two that both still stand (a command that saw the first rewrote
+    // the old version again: two versions of one change).
+    let mut divergent: std::collections::HashSet<ObjectId> =
+        landed.iter().filter(|(i, (o, n))| landed.iter().any(|(j, (o2, n2))| o2 == o && n2 != n && concurrent(*i, *j))).map(|(_, (o, _))| *o).collect();
+    divergent.extend(live.iter().filter(|(_, (o, n))| live.iter().any(|(_, (o2, n2))| o2 == o && n2 != n)).map(|(_, (o, _))| *o));
     let at_or_above = |a: &ObjectId, b: &ObjectId| a == b || repo.is_ancestor(a, b).unwrap();
+    let have = keys_of(repo.view());
+    // What each snapshot was rewritten from (the op log's records, merges'
+    // rebases included).
+    let mut from: std::collections::HashMap<ObjectId, Vec<ObjectId>> = Default::default();
+    for r in repo.ops().walk(repo.heads()) {
+        for (o, ns) in r.unwrap().1.rewritten {
+            for n in ns {
+                from.entry(n).or_default().push(o);
+            }
+        }
+    }
+    let earlier = |v: &ObjectId| {
+        let mut out = vec![*v];
+        let mut i = 0;
+        while i < out.len() && out.len() < 64 {
+            for o in from.get(&out[i]).into_iter().flatten() {
+                if !out.contains(o) {
+                    out.push(*o);
+                }
+            }
+            i += 1;
+        }
+        out
+    };
     for (i, (old, new)) in &live {
         // On or below a divergent change: nothing follows it, so what is on
         // it stays too.
         if divergent.iter().any(|d| at_or_above(d, old)) {
             continue;
         }
-        let by: Vec<String> = refs
+        // A command that saw the rewrite, or saw it taken back (by an undo
+        // or op restore an undo later took back in turn: what it did
+        // meanwhile was built on the old version, as it would have been in
+        // a sequence of commands).
+        let saw = |j: &RwCmd| {
+            j.landed.is_some()
+                && (cmds[*i].landed.unwrap() < j.forked
+                    || cmds.iter().any(|r| r.landed.is_some_and(|l| l < j.forked) && r.retracts.iter().any(|o| cmds[*i].ops.contains(o))))
+        };
+        let by: Vec<String> = have
             .iter()
-            .filter(|r| at_or_above(old, r))
-            .filter(|r| !divergent.iter().any(|d| at_or_above(d, r) && at_or_above(old, d)))
-            .map(|r| r.short())
+            .filter(|(k, v)| !matches!(k, Key::Rtag(_)) && at_or_above(old, &v.0))
+            .filter(|(_, v)| !divergent.iter().any(|d| at_or_above(d, &v.0) && at_or_above(old, d)))
+            // Set on it by a command that saw the rewrite (a tag on the old
+            // version, a workspace on it, an undo's revert): deliberate, and
+            // so is what a concurrent rewrite of its ancestors made of it.
+            // A conflict's loser stays as a head (BUG-1298), so a written
+            // value counts under any key.
+            // What such a command set or made, or a rebase made of it.
+            .filter(|(k, v)| {
+                let versions = earlier(&v.0);
+                !cmds.iter().any(|j| {
+                    saw(j)
+                        && (j.writes.iter().any(|(k2, w)| w.is_some_and(|w| versions.contains(&w.0)) || (k2 == *k && w.is_some_and(|w| at_or_above(old, &w.0))))
+                            || j.rewrites.iter().any(|(_, _, n)| versions.contains(n)))
+                })
+            })
+            .map(|(k, v)| format!("{k:?}={}", v.0.short()))
             .collect();
         prop_assert!(by.is_empty(), "{}: {} (rewritten into {} by '{}') is still visible, from {:?}", at, old.short(), new.short(), cmds[*i].what, by);
     }
@@ -963,7 +1039,7 @@ fn check_rewrites_followed(cmds: &[RwCmd], repo: &Repo, at: &str) -> Result<(), 
 /// divergent change, BUG-1403); settlers merge random subsets of the
 /// heads; everything publishes after a random delay. Every command's view
 /// and the final one satisfy [`check_rewrites_followed`].
-fn check_rewrites_follow_through_merges(disk: bool, nw: usize, undo: bool, steps: &[u16]) -> Result<(), TestCaseError> {
+fn check_rewrites_follow_through_merges(disk: bool, nw: usize, undo: bool, old_refs: bool, steps: &[u16]) -> Result<(), TestCaseError> {
     let me = Identity::generate("alice");
     let truth = Device::new(disk);
     {
@@ -1005,7 +1081,7 @@ fn check_rewrites_follow_through_merges(disk: bool, nw: usize, undo: bool, steps
         }
         let w = arg % nw;
         let ws = format!("w{w}");
-        // Without `undo` (BUG-1403), undos and op restores turn into more
+        // Without `undo` (BUG-1444), undos and op restores turn into more
         // describes.
         let kind = match (undo, kind) {
             (false, 8..=11) => 4,
@@ -1014,8 +1090,9 @@ fn check_rewrites_follow_through_merges(disk: bool, nw: usize, undo: bool, steps
         let slots: Vec<String> = match kind {
             0..=3 | 8 | 9 => vec![ws.clone()],
             10 => (0..nw).map(|w| format!("w{w}")).collect(),
+            7 if old_refs => vec![format!("o{}", arg % 2)],
             // Without `undo`, one describe at a time: two concurrent
-            // describes of a snapshot make a divergent change (BUG-1403).
+            // describes of a snapshot make a divergent change.
             4..=7 if !undo => vec!["describe".to_string()],
             _ => Vec::new(),
         };
@@ -1026,9 +1103,31 @@ fn check_rewrites_follow_through_merges(disk: bool, nw: usize, undo: bool, steps
         let mut repo = Repo::open(fork.fs.clone(), Some(me.clone()), &format!("alice-{clock}")).unwrap();
         check_rewrites_followed(&cmds, &repo, &format!("step {clock} (a command's view)"))?;
         let start = repo.op_id();
+        let before = repo.view().clone();
         let what;
         let mut retracts = Vec::new();
+        // With `old_refs`, an old version (a snapshot a landed command
+        // rewrote) for a tag or a workspace: showing it again undoes
+        // nothing (BUG-1434).
+        let olds: Vec<ObjectId> = cmds.iter().filter(|c| c.landed.is_some()).flat_map(|c| c.rewrites.iter().map(|r| r.1)).filter(|o| *o != repo.root_id()).collect();
+        let kind = match kind {
+            6 | 7 if old_refs && olds.is_empty() => 4,
+            k => k,
+        };
         let ok: Result<(), veil_core::VeilError> = match kind {
+            6 if old_refs => {
+                let (name, target) = (format!("old{}", arg % 3), olds[arg % olds.len()]);
+                what = format!("tag {name} on the old version {}", target.short());
+                repo.set_tag(&name, target, true)
+            }
+            7 if old_refs => {
+                let (name, target) = (format!("o{}", arg % 2), olds[arg % olds.len()]);
+                if repo.view().workspaces.contains_key(&name) {
+                    continue;
+                }
+                what = format!("workspace {name} on the old version {}", target.short());
+                repo.create_workspace(&name, vec![target]).map(|_| ())
+            }
             0..=3 => {
                 if !repo.view().workspaces.contains_key(&ws) {
                     continue;
@@ -1071,9 +1170,8 @@ fn check_rewrites_follow_through_merges(disk: bool, nw: usize, undo: bool, steps
                 what = format!("op restore {back} back");
                 match target {
                     Some(op) => {
-                        // It takes back every command its view holds since.
-                        let since = repo.ops().split(&[start], &[op]).unwrap().only_a;
-                        retracts = cmds.iter().enumerate().filter(|(_, c)| c.ops.iter().any(|o| since.contains(o))).map(|(i, _)| i).collect();
+                        // It takes back every operation its view holds since.
+                        retracts = repo.ops().split(&[start], &[op]).unwrap().only_a;
                         repo.restore_operation_keeping_edits("w0", op).map(|_| ())
                     }
                     None => Err(veil_core::VeilError::repo("no op")),
@@ -1089,29 +1187,19 @@ fn check_rewrites_follow_through_merges(disk: bool, nw: usize, undo: bool, steps
         for id in &mine {
             let op = repo.ops().get(id).unwrap();
             if let Some(u) = op.undo_of {
-                retracts.extend(cmds.iter().enumerate().filter(|(_, c)| c.ops.contains(&u)).map(|(i, _)| i));
+                retracts.push(u);
             }
             if kind < 8 && !op.is_merge() {
                 for (old, new) in op.rewritten {
                     if let [n] = new.as_slice() {
-                        rewrites.push((old, *n));
+                        rewrites.push((*id, old, *n));
                     }
                 }
             }
         }
-        let mut brought_back = Vec::new();
-        if kind >= 8 {
-            let refs = repo.view().refs();
-            for (i, c) in cmds.iter().enumerate().filter(|(_, c)| c.landed.is_some()) {
-                for (old, _) in &c.rewrites {
-                    if refs.iter().any(|r| r == old || repo.is_ancestor(old, r).unwrap()) {
-                        brought_back.push((i, *old));
-                    }
-                }
-            }
-        }
+        let writes = writes(&before, repo.view());
         drop(repo);
-        cmds.push(RwCmd { forked: clock, landed: None, ops: mine.into_iter().collect(), rewrites, retracts, brought_back, what });
+        cmds.push(RwCmd { forked: clock, landed: None, ops: mine.into_iter().collect(), rewrites, retracts, writes, what });
         pending.push((fork, heads, Some(cmds.len() - 1), slots));
     }
     let end = steps.len() + 1;
@@ -1159,7 +1247,7 @@ proptest! {
     /// backend.
     #[test]
     fn rewrites_follow_through_concurrent_merges_memory(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), 20..100)) {
-        check_rewrites_follow_through_merges(false, nw, false, &steps)?;
+        check_rewrites_follow_through_merges(false, nw, false, false, &steps)?;
     }
 }
 
@@ -1169,18 +1257,42 @@ proptest! {
     /// The same on the disk backend.
     #[test]
     fn rewrites_follow_through_concurrent_merges_disk(nw in 2usize..4, steps in prop::collection::vec(any::<u16>(), 20..70)) {
-        check_rewrites_follow_through_merges(true, nw, false, &steps)?;
+        check_rewrites_follow_through_merges(true, nw, false, false, &steps)?;
     }
 }
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: review_cases(64), failure_persistence: None, ..ProptestConfig::default() })]
 
-    /// The same with `vl undo` and `vl op restore` among the commands.
+    /// The same with tags and workspaces set on old versions, without
+    /// undoing anything (showing an old snapshot again undoes nothing,
+    /// BUG-1434).
     #[test]
-    #[ignore = "BUG-1403: with undo and op restore among concurrent describes, a merge reads a divergent change's old snapshot as undone"]
-    fn bug_1403_rewrites_follow_with_undo_and_restore(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), 20..100)) {
-        check_rewrites_follow_through_merges(false, nw, true, &steps)?;
+    fn rewrites_follow_with_refs_to_old_versions_memory(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), 20..100)) {
+        check_rewrites_follow_through_merges(false, nw, false, true, &steps)?;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: review_cases(8), failure_persistence: None, ..ProptestConfig::default() })]
+
+    /// The same on the disk backend.
+    #[test]
+    fn rewrites_follow_with_refs_to_old_versions_disk(nw in 2usize..4, steps in prop::collection::vec(any::<u16>(), 20..70)) {
+        check_rewrites_follow_through_merges(true, nw, false, true, &steps)?;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: review_cases(64), failure_persistence: None, ..ProptestConfig::default() })]
+
+    /// The same with `vl undo` and `vl op restore` among the commands, and
+    /// describes concurrent with each other (BUG-1403's reproduction; what
+    /// it still finds, now and then, is BUG-1444).
+    #[test]
+    #[ignore = "BUG-1444: op restores of part of a command around divergent describes; the merge and the model disagree on whether a rewrite stands, about 1 run in 8 of 64 cases"]
+    fn bug_1444_rewrites_follow_with_undo_restore_and_concurrent_describes(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), 20..100)) {
+        check_rewrites_follow_through_merges(false, nw, true, false, &steps)?;
     }
 }
 
@@ -1228,6 +1340,7 @@ fn split_lists_no_common_operation_as_one_sides() {
         redo_of: None,
         workspace: None,
         rewritten: Default::default(),
+        restore_of: None,
     };
     // `p`, and `m` on it with its timestamp, `p`'s id sorting after `m`'s.
     let p = ops.put(&op(vec![], 10, "p".into())).unwrap();
@@ -1269,6 +1382,7 @@ fn bug_1401_split_lists_no_common_operation_as_one_sides_with_older_children() {
         redo_of: None,
         workspace: None,
         rewritten: Default::default(),
+        restore_of: None,
     };
     let o = ops.put(&op(vec![], 100, "o")).unwrap();
     // The clock set back: `n` is older than its parent.
@@ -1304,6 +1418,7 @@ fn walk_lists_every_operation_after_its_descendants() {
         redo_of: None,
         workspace: None,
         rewritten: Default::default(),
+        restore_of: None,
     };
     let mut cases = 0;
     for n in 0..400 {
@@ -1344,7 +1459,7 @@ fn walk_lists_every_operation_after_its_descendants() {
 /// lists `y` (and `a`) before `x` and `z`, which descend from it: `vl undo`
 /// in `x`'s workspace, with `w` another workspace's, would undo `y`.
 #[test]
-#[ignore = "BUG-1432: the op log's walk lists an operation before its descendant when that descendant is older and reached by a later path"]
+#[ignore = "BUG-1432 (a documented residual): on a log written before operation times were clamped, the walk can list an operation before an older descendant reached by a later path"]
 fn bug_1432_walk_lists_an_operation_after_an_older_descendant_on_another_branch() {
     use veil_core::oplog::{OpStore, Operation};
     let op = |parents: Vec<ObjectId>, timestamp: i64, description: &str| Operation {
@@ -1358,6 +1473,7 @@ fn bug_1432_walk_lists_an_operation_after_an_older_descendant_on_another_branch(
         redo_of: None,
         workspace: None,
         rewritten: Default::default(),
+        restore_of: None,
     };
     let ops = OpStore::new(Arc::new(MemoryBackend::new()));
     let a = ops.put(&op(vec![], 1, "a")).unwrap();
@@ -1386,7 +1502,6 @@ fn bug_1432_walk_lists_an_operation_after_an_older_descendant_on_another_branch(
 /// for values a concurrent rewrite moved (BUG-1299) matches by change id,
 /// not by a rewrite the op log records, so it accepts the lost write.
 #[test]
-#[ignore = "BUG-1435: the model check counts a dropped conflict loser visible when another version of its change is"]
 fn bug_1435_the_model_check_sees_a_conflicts_loser_dropped() {
     let me = Identity::generate("alice");
     let truth = Device::new(false);
@@ -1476,7 +1591,6 @@ impl StorageBackend for CountingOps {
 /// read all of them (2.8 s for 1,000 tag moves in a debug build). The
 /// first few should cost a few reads, as before.
 #[test]
-#[ignore = "BUG-1433: the op log's walk reads every operation of one time before listing the first: vl op log -n 5 and vl undo read every operation since the clock was set back"]
 fn bug_1433_the_first_operations_of_the_walk_cost_a_few_reads_with_one_time() {
     use veil_core::oplog::{OpStore, Operation};
     let backend = Arc::new(CountingOps::default());
@@ -1494,6 +1608,7 @@ fn bug_1433_the_first_operations_of_the_walk_cost_a_few_reads_with_one_time() {
             redo_of: None,
             workspace: None,
             rewritten: Default::default(),
+            restore_of: None,
         };
         last = Some(ops.put(&op).unwrap());
     }
@@ -1619,6 +1734,87 @@ fn bug_1298_a_conflicts_loser_stays_visible_through_the_fold() {
         }
     }
     assert!(hits > 0, "the interleaving ran");
+}
+
+/// BUG-1298's shape as a property (op log merges review, cycle 2, BUG-1435):
+/// `n` commands move one tag concurrently, each to its own commit that is a
+/// head only (its workspace removed), and `r` op restores to before those
+/// commits drop the heads, all merged in one fold of every head, in an
+/// order the random ids decide. Every target a move wrote stays visible:
+/// the winner as the tag, the losers as heads, though the restores dropped
+/// them (they never saw the moves).
+fn check_losers_stay_visible_through_the_fold(n: usize, r: usize) -> Result<(), TestCaseError> {
+    let me = Identity::generate("alice");
+    let truth = Device::new(false);
+    let (targets, before);
+    {
+        let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        let root = repo.root_id();
+        // `t` on a commit of its own (a commit moves the tags on its
+        // parent, and the targets below are on the root).
+        repo.create_workspace("base", vec![root]).unwrap();
+        repo.set_command_workspace(Some("base".into()));
+        let ov = repo.workspace_overlay("base").unwrap();
+        ov.write(&VPath::new("base").unwrap(), b"b\n").unwrap();
+        repo.snapshot_workspace("base", &ov).unwrap();
+        let (b, _) = repo.commit_working_copy("base", "base").unwrap();
+        repo.set_tag("t", b, true).unwrap();
+        before = repo.op_id();
+        let mut ts = Vec::new();
+        for i in 0..n {
+            let ws = format!("x{i}");
+            repo.create_workspace(&ws, vec![root]).unwrap();
+            repo.set_command_workspace(Some(ws.clone()));
+            let ov = repo.workspace_overlay(&ws).unwrap();
+            ov.write(&VPath::new(&format!("f{i}")).unwrap(), b"x\n").unwrap();
+            repo.snapshot_workspace(&ws, &ov).unwrap();
+            ts.push(repo.commit_working_copy(&ws, &ws).unwrap().0);
+            repo.remove_workspace(&ws).unwrap();
+        }
+        prop_assert!(ts.iter().all(|t| repo.view().heads.contains(t)), "each target is a head");
+        prop_assert_eq!(repo.view().tags["t"].target, b, "t stays on its commit");
+        targets = ts;
+    }
+    let k = op_heads(&*truth.fs);
+    let mut forks = Vec::new();
+    for t in &targets {
+        let f = truth.fork(&k);
+        let mut repo = Repo::open(f.fs.clone(), Some(me.clone()), "alice").unwrap();
+        repo.set_tag("t", *t, true).unwrap();
+        prop_assert_eq!(repo.view().tags["t"].target, *t);
+        drop(repo);
+        forks.push(f);
+    }
+    for _ in 0..r {
+        let f = truth.fork(&k);
+        let mut repo = Repo::open(f.fs.clone(), Some(me.clone()), "alice").unwrap();
+        repo.restore_operation(before).unwrap();
+        prop_assert!(targets.iter().all(|t| !repo.view().heads.contains(t)), "the restore dropped the heads");
+        drop(repo);
+        forks.push(f);
+    }
+    for f in &forks {
+        truth.land(f, &k);
+    }
+    let repo = Repo::open(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+    prop_assert_eq!(repo.heads().len(), 1, "settled");
+    prop_assert!(targets.contains(&repo.view().tags["t"].target), "a move wins");
+    let refs = repo.view().refs();
+    for t in &targets {
+        prop_assert!(refs.iter().any(|x| x == t || repo.is_ancestor(t, x).unwrap()), "{} (a move's target) stays visible", t.short());
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: review_cases(32), failure_persistence: None, ..ProptestConfig::default() })]
+
+    /// A conflict's losers stay visible through a fold of three to seven
+    /// heads (BUG-1298, BUG-1435).
+    #[test]
+    fn losers_stay_visible_through_the_fold(n in 2usize..6, r in 1usize..3) {
+        check_losers_stay_visible_through_the_fold(n, r)?;
+    }
 }
 
 /// BUG-1295: `vl undo` of a commit, merged with two other heads, one of

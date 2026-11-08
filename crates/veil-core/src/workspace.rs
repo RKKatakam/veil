@@ -886,7 +886,7 @@ impl Repo {
         // An embargo release is not in the view (see `check_undo_release`).
         let release = self.check_undo_release(&op.description)?;
         let revert = self.parent_view(&op)?;
-        let link = OpLink::UndoOf(command);
+        let link = OpLink::Undo(command);
         let target = Restore::Revert { base: op.view.clone(), revert };
         // The edits to keep: those recorded since the undone operation
         // while the working copy is still the change it was there, else
@@ -931,7 +931,7 @@ impl Repo {
         };
         // The edits to keep, as for an undo (BUG-1041).
         let last = self.ops.get(&self.last_command_op(ws)?)?.view;
-        let id = self.restore_view_keeping_edits(ws, target, &[undo_op.view.clone(), last], format!("redo: {}", op.description), OpLink::RedoOf(undo))?;
+        let id = self.restore_view_keeping_edits(ws, target, &[undo_op.view.clone(), last], format!("redo: {}", op.description), OpLink::Redo(undo))?;
         Ok((id, op.description))
     }
 
@@ -1022,7 +1022,7 @@ impl Repo {
         let command = self.last_command_op(ws)?;
         let before_edits = self.ops.get(&command)?.view;
         let view = self.ops.get(&op)?.view;
-        self.restore_view_keeping_edits(ws, Restore::Exact(view), &[before_edits], format!("restore to operation {}", op.short()), OpLink::None)
+        self.restore_view_keeping_edits(ws, Restore::Exact(view), &[before_edits], format!("restore to operation {}", op.short()), OpLink::Restore(op))
     }
 
     /// The operations recorded after `op` (that it does not reach) for a
@@ -1142,7 +1142,7 @@ impl Repo {
                         edits.push((base, now, restored));
                     }
                 }
-                None if !matches!(link, OpLink::None) => {
+                None if matches!(link, OpLink::Undo(_) | OpLink::Redo(_)) => {
                     let (verb, what) = description.split_once(": ").unwrap_or(("restore", &description));
                     return Err(VeilError::repo(format!(
                         "cannot {verb} '{what}': it would remove workspace '{name}', which holds edits recorded since. \
@@ -1166,9 +1166,9 @@ impl Repo {
         tx.view = view;
         tx.record_always();
         match link {
-            OpLink::None => {}
-            OpLink::UndoOf(op) => tx.undo_of(op),
-            OpLink::RedoOf(op) => tx.redo_of(op),
+            OpLink::Undo(op) => tx.undo_of(op),
+            OpLink::Redo(op) => tx.redo_of(op),
+            OpLink::Restore(op) => tx.restore_of(op),
         }
         for (base, now, restored) in edits {
             let base_tree = tx.repo().snapshot(&base)?.tree;
@@ -1204,9 +1204,9 @@ impl Repo {
 /// How an operation recorded by [`Repo::restore_view_keeping_edits`]
 /// relates to earlier ones.
 enum OpLink {
-    None,
-    UndoOf(ObjectId),
-    RedoOf(ObjectId),
+    Undo(ObjectId),
+    Redo(ObjectId),
+    Restore(ObjectId),
 }
 
 /// The view [`Repo::restore_view_keeping_edits`] installs.

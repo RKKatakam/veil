@@ -939,7 +939,6 @@ fn shows(r: &Repo, id: &ObjectId) -> bool {
 /// and both versions of `c` are visible. Before the fix only the rewrite of
 /// `x` was cancelled, and B's workspace moved onto the new `c`.
 #[test]
-#[ignore = "BUG-1434: a side that shows a rewritten snapshot again without undoing anything cancels every rewrite of the command"]
 fn bug_1434_a_tag_on_an_old_version_does_not_cancel_the_rebase_of_its_children() {
     let (mut repo, fs, id) = new_repo("alice");
     repo.create_workspace("w", vec![repo.root_id()]).unwrap();

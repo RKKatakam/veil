@@ -503,9 +503,11 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             }
             let outside = ctx.repo.manual_undo_since(op)?;
             // Releases are not in the view: take back the staged ones made
-            // since, and say which published ones stay (BUG-109).
-            let (staged, published) = ctx.repo.releases_after(&op)?;
-            ctx.repo.restore_operation_keeping_edits(&ws, op)?;
+            // since, and say which published ones stay (BUG-109). Since
+            // the restore's own parents: a release another process staged
+            // while this one ran is behind the restore too (BUG-1404).
+            let restore = ctx.repo.restore_operation_keeping_edits(&ws, op)?;
+            let (staged, published) = ctx.repo.releases_restored(&restore)?;
             for e in &staged {
                 ctx.repo.keys().take_back_release(e)?;
             }

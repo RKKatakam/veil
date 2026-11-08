@@ -952,21 +952,25 @@ impl Repo {
         Ok(())
     }
 
-    /// Releases made after operation `op` was recorded, which restoring it
-    /// cannot reach through the view: `(staged, published)` embargo ids.
-    /// Staged ones can be taken back ([`Keychain::take_back_release`]);
-    /// published ones stay released.
+    /// The releases that the op restore `restore` took the view back past,
+    /// which restoring cannot reach through the view: `(staged, published)`
+    /// embargo ids. Staged ones can be taken back
+    /// ([`Keychain::take_back_release`]); published ones stay released.
+    ///
+    /// They are read from the op log, from the restore operation's own
+    /// parents: the `release embargo <id>` operations those reach and the
+    /// restored operation does not. Not from times (a clock set back gets
+    /// them wrong, BUG-1400), and not from the heads read before the
+    /// restore's transaction (a release another process staged in between
+    /// is behind the restore, BUG-1404).
     ///
     /// [`Keychain::take_back_release`]: crate::keychain::Keychain::take_back_release
-    ///
-    /// "After" is the op log's: the releases recorded by the operations the
-    /// heads reach and `op` does not (`release embargo <id>`), never a
-    /// comparison of times. Operation times are clamped to their parents'
-    /// (a clock set back), a release is stamped with the clock, so times do
-    /// not say which came first (BUG-1400).
-    pub fn releases_after(&self, op: &ObjectId) -> Result<(Vec<String>, Vec<String>)> {
-        self.ops.get(op)?;
-        let split = self.ops.split(&self.base, &[*op])?;
+    pub fn releases_restored(&self, restore: &ObjectId) -> Result<(Vec<String>, Vec<String>)> {
+        let r = self.ops.get(restore)?;
+        let Some(op) = r.restore_of else {
+            return Err(VeilError::repo(format!("operation {} is not an op restore", restore.short())));
+        };
+        let split = self.ops.split(&r.parents, &[op])?;
         let mut ids = std::collections::BTreeSet::new();
         for id in &split.only_a {
             if let Some(e) = split.ops.get(id).and_then(|o| o.description.strip_prefix(RELEASE_OP_PREFIX)) {
@@ -1001,21 +1005,22 @@ impl Repo {
             .first()
             .ok_or_else(|| VeilError::repo("nothing to undo"))?;
         tx.view = tx.repo().ops.get(&parent)?.view;
-        tx.record_always();
+        let undone = tx.repo().op_id;
+        tx.undo_of(undone);
         let id = tx.commit()?.expect("recorded");
         self.finish_undo_release(release)?;
         Ok(id)
     }
 
     /// Restore the view as of an earlier operation. Releases staged after
-    /// it are taken back; published ones stay ([`Repo::releases_after`]).
+    /// it are taken back; published ones stay ([`Repo::releases_restored`]).
     pub fn restore_operation(&mut self, op: ObjectId) -> Result<ObjectId> {
-        let (staged, _) = self.releases_after(&op)?;
         let view = self.ops.get(&op)?.view;
         let mut tx = self.transaction(format!("restore to operation {}", op.short()))?;
         tx.view = view;
-        tx.record_always();
+        tx.restore_of(op);
         let id = tx.commit()?.expect("recorded");
+        let (staged, _) = self.releases_restored(&id)?;
         for e in staged {
             self.keys().take_back_release(&e)?;
         }
