@@ -53,6 +53,10 @@ pub struct Viewer {
     /// the file routes let it read, only at or below these paths. Its
     /// history is its person's: [`View::key`] ignores it.
     pub only: Option<std::sync::Arc<Vec<String>>>,
+    /// An agent session (`docs/HUB.md` §13.27): it never changes a file that
+    /// decides access or review, never forces or deletes a branch, and moves
+    /// one only within its narrowing.
+    pub agent: bool,
 }
 
 impl Viewer {
@@ -91,6 +95,7 @@ impl Project {
             None => false,
         })
         .narrowed(viewer.only.as_deref().map(|o| o.as_slice()))
+        .for_agent(viewer.agent)
     }
 
     /// Does `viewer` take part in the project (an admin, in one of its
@@ -156,6 +161,7 @@ pub async fn load_viewer(c: &mut PgConnection, project: i64, person: &Person) ->
             admin,
             groups: groups.into_iter().collect(),
             only: None,
+            agent: false,
         },
         barred,
     ))
@@ -261,6 +267,7 @@ pub async fn open_at(hub: &Hub, name: &str, caller: &Caller) -> Result<(Project,
                     return Err(not_found());
                 }
                 viewer.only = a.only.clone();
+                viewer.agent = true;
             }
             viewer
         }

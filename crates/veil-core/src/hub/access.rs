@@ -162,6 +162,9 @@ pub struct View<'a> {
     /// routes that serve files; the view's history and its [`View::key`]
     /// stay the person's, so narrowed sessions make no new projections.
     only: Option<Vec<String>>,
+    /// An agent session's view ([`View::for_agent`]): it never writes a
+    /// file that decides access or review ([`crate::hub::agent::decides_access`]).
+    agent: bool,
 }
 
 impl<'a> View<'a> {
@@ -176,7 +179,7 @@ impl<'a> View<'a> {
             .map(|(i, r)| r.names.iter().any(|n| is_me(i, n)))
             .collect();
         let read = policy.rules.iter().zip(&write).map(|(r, w)| r.public || *w).collect();
-        View { policy, admin, read, write, only: None }
+        View { policy, admin, read, write, only: None, agent: false }
     }
 
     /// This view, narrowed to `only` (an agent session's `--only`); `None`
@@ -184,6 +187,18 @@ impl<'a> View<'a> {
     pub fn narrowed(mut self, only: Option<&[String]>) -> View<'a> {
         self.only = only.map(|o| o.to_vec());
         self
+    }
+
+    /// This view as an agent session's (`agent`): files that decide access
+    /// or review are never its to write.
+    pub fn for_agent(mut self, agent: bool) -> View<'a> {
+        self.agent = agent;
+        self
+    }
+
+    /// Is this an agent session's view ([`View::for_agent`])?
+    pub fn is_agent(&self) -> bool {
+        self.agent
     }
 
     /// Does the narrowing (if any) let this viewer reach `path`, a file or
@@ -222,7 +237,9 @@ impl<'a> View<'a> {
 
     /// May this viewer write `path`?
     pub fn write(&self, path: &str) -> bool {
-        self.within_narrowing(path) && (self.admin || self.policy.deciding(path).is_some_and(|i| self.write[i]))
+        !(self.agent && crate::hub::agent::decides_access(path))
+            && self.within_narrowing(path)
+            && (self.admin || self.policy.deciding(path).is_some_and(|i| self.write[i]))
     }
 
     /// Is there a rule below directory `dir` (see [`AccessPolicy::rule_below`])?

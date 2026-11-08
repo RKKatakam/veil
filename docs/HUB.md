@@ -2498,7 +2498,11 @@ POST /v1/sessions/agent          (with a person's own session)
   session that is not itself an agent session, and it ends at
   `min(parent's expiry, now + seconds, now + 12 h)`. Removing the device
   ends it with the device's other sessions. Only the token's hash is kept;
-  the token is shown once. `vl session agent [--only PATH…] --agent A
+  the token is shown once. Its token starts with `agent-`, and its hash is
+  a BLAKE3 derived key of its own (`HUB_AGENT_SESSION`), never the plain
+  hash a person's session is kept under: a server that predates agent
+  sessions never finds one, so it never takes one for its person's own
+  session (BUG-1376). `vl session agent [--only PATH…] --agent A
   [--task T] [--prompt-ref R] [--run ID]` prints one for a harness.
 * **At most its person, in one project.** Every request is checked as the
   person's (`perm::open`, the same caches and epochs), in its own project
@@ -2506,6 +2510,15 @@ POST /v1/sessions/agent          (with a person's own session)
   members, managers), devices (vouch, remove), invites, key rings, shares,
   create projects or make sessions (`Caller::person_only`, 403
   `agent_session`): an agent never makes something that outlives its run.
+  Nor does it change a file that decides access or review
+  (`hub::agent::ACCESS_FILES`: `.veilpolicy`, `.veilrules`, in any folder)
+  by any route: its own push or API commit (`View::write`), a merge that
+  takes someone else's change of one, or a move of the default branch that
+  would accept new access lines (BUG-1377). It never forces a branch move
+  or deletes a branch; a narrowed one moves a branch only when the old and
+  new tips differ inside its paths alone, else the move is `rejected`,
+  naming nothing outside them (BUG-1378). A new branch removes nothing and
+  is allowed.
 * **Narrowing applies to files; history is the person's.** `Viewer::only`
   narrows `View::write` (pushes and API commits write only inside), and the
   file routes refuse a path outside: the query API's `tree`, `file`, `show`
@@ -2536,6 +2549,11 @@ POST /v1/sessions/agent          (with a person's own session)
   parent is abandoned, a branch whose new tip is one and an API commit
   whose base is one are refused: attempts never land and never enter
   ancestry.
+* **Older clients.** Every `vl` request says the newest repository format
+  it reads (`veil-format`); one that says nothing reads format 8. `history`,
+  the only route that sends snapshots, answers 426 `update_vl` ("update vl
+  to 1.2.0 or later") before it would send a format-10 snapshot to a client
+  that cannot read it (BUG-1379).
 * **Visibility.** Attribution and reasons are plain text inside snapshots,
   projected with them: seen by exactly the people who see the change. A
   change of folders someone cannot see is not in their history, so they
@@ -2551,6 +2569,9 @@ Threat review (phase 2 §6, rows 5 to 7, and what S11 adds):
 | 2 | Same | writes outside `--only`, `.veilpolicy` | writes more than its task | `View::write` is narrowed, for pushes and API commits alike | same |
 | 3 | Same | makes a session from its session, asks for more than 12 hours, uses it in another project | outlives or widens its person | made only from a person's own live session, in one statement; `LEAST` of the expiries; other projects "not found" | `agents::an_agent_session_comes_from_a_persons_own_session_and_never_outlives_or_widens_it` |
 | 4 | Same | vouches a device, invites, adds group members, posts a ring or share, creates a project | a lasting credential or access change | `person_only` on every such route | `agents::an_agent_session_cannot_change_access_devices_invites_rings_shares_or_projects` |
+| 4a | An admin's agent session | commits or pushes `.veilpolicy` or `.veilrules`, merges or fast-forwards onto someone else's change of one | changes who has access | `decides_access` in `View::write`, in the merge exception and at the default branch's policy acceptance (BUG-1377) | `agents::an_admins_agent_session_cannot_change_access_through_the_policy_file`, `…never_changes_a_file_that_decides_access_by_any_route` |
+| 4b | An admin's agent session, narrowed or not | forces a branch back, deletes one; a narrowed one fast-forwards onto others' work elsewhere | removes or lands content outside its task | no force or delete for agent sessions; narrowed moves compared tip to tip within the narrowing (BUG-1378) | `agents::an_admins_narrowed_agent_session_neither_forces_nor_deletes_a_branch`, `…never_force_or_delete_and_a_narrowed_one_moves_a_branch_only_within_its_paths` |
+| 4c | The holder of an agent token, during a rolling upgrade | presents it to a server that predates agent sessions | its person's full session | agent sessions kept under a hash that server never computes (BUG-1376) | `agents::an_agent_sessions_token_is_never_a_full_session_to_a_server_that_predates_it` |
 | 5 | The caller of an API commit | sends `agent` in the request | forges attribution | no such field; unknown fields refused; the server stamps the session's | `agents::api_commits_carry_the_sessions_attribution_and_never_the_callers` |
 | 6 | A command inside a sandbox | sets `VEIL_AGENT`, writes `.veil-agent`, runs `vl describe` | forges or strips attribution | attribution only from the workspace `vl`'s flags and environment; the sandbox cannot reach the repository | `cli_security` `agent_cli::a_command_inside_the_sandbox_cannot_forge_or_strip_attribution` |
 | 7 | A person without access to a change's folders | reads log, show, history, a clone | learns its task, prompt or an attempt's reason | projected with the snapshot; such a change is not in their history | `agents::task_prompt_and_reasons_reach_exactly_who_sees_the_change`; `core_security` `agent_attribution::task_prompt_and_reasons_are_withheld_with_an_embargoed_change` |
@@ -2560,7 +2581,6 @@ Threat review (phase 2 §6, rows 5 to 7, and what S11 adds):
 
 **Reverting** S11 is not a plain revert once anything was written: format
 10 repositories (every `vl init` and `vl upgrade` from this build) are
-refused by older builds, and migration 20 adds four nullable columns.
-An older server ignores them, so it would take an agent session's token as
-its person's own, unnarrowed: before running one, end every agent session
-(`DELETE FROM sessions WHERE agent IS NOT NULL`).
+refused by older builds, and migration 20 adds four nullable columns,
+which an older server ignores; it never finds an agent session (their
+hashes are not the ones it computes), so their rows are inert there.

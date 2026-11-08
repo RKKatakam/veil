@@ -633,8 +633,10 @@ fn a_clean_format_6_or_7_repository_upgrades_keeping_every_id() {
 
 // ---- format 10: agent attribution and attempts -----------------------------------
 
-/// A format-8 or format-9 repository (here: written by this build and
-/// marked with the older format, as one is) opens and works as it is, but
+/// A format-8 repository, or a format-9 one without a `partial` marker
+/// (here: written by this build and marked with the older format, as one
+/// is; a thin clone, with the marker, is refused: BUG-1390's test), opens
+/// and works as it is, but
 /// refuses to store a format-10 snapshot (an attributed one, an attempt)
 /// with what to do; `vl upgrade` then moves it to 10 rewriting nothing,
 /// after which the same commit is stored.
@@ -1408,7 +1410,6 @@ fn an_encrypted_conflict_side_of_an_ordinary_file_is_named() {
 /// and its `vl upgrade` must neither drop the marker nor move it to a
 /// format whose readers ignore it; nothing may change.
 #[test]
-#[ignore = "BUG-1390: format 9 (a thin clone with its `partial` marker) is opened, and upgraded to 10 dropping the marker"]
 fn a_thin_clone_of_format_9_is_refused_not_opened_or_upgraded_without_its_marker() {
     let (_tmp, root, fs, alice) = written_then_marked(9, |repo, root, fs| {
         std::fs::write(root.join("README.md"), "hello\n").unwrap();
@@ -1431,4 +1432,20 @@ fn a_thin_clone_of_format_9_is_refused_not_opened_or_upgraded_without_its_marker
         upgraded.as_ref().map(|r| format!("{} -> {}", r.from, r.to)).unwrap_or_else(|e| e.to_string()),
     );
     assert_eq!(std::fs::read(&path).unwrap(), before, "repo.json changed");
+}
+
+/// BUG-1390's class: `repo.json` keeps every field this build does not
+/// know, its remotes' included, through a parse and a rewrite, and such a
+/// configuration is never taken as one this build understands.
+#[test]
+fn repo_json_keeps_the_fields_this_build_does_not_know() {
+    let raw = br#"{"format":9,"repo_id":"ab","remotes":{"origin":{"url":"veil://h/p","later":1}},"partial":{"remote":"origin","cache_limit":5}}"#;
+    let c: veil_core::repo::RepoConfig = serde_json::from_slice(raw).unwrap();
+    let back = serde_json::to_value(&c).unwrap();
+    assert_eq!(back["partial"], serde_json::json!({"remote": "origin", "cache_limit": 5}), "{back}");
+    assert_eq!(back["remotes"]["origin"]["later"], 1, "{back}");
+    let e = c.check_known().unwrap_err();
+    assert!(matches!(e, VeilError::Unsupported(_)) && e.to_string().contains("\"partial\"") && e.to_string().contains("\"later\""), "{e}");
+    let known: veil_core::repo::RepoConfig = serde_json::from_slice(br#"{"format":10,"repo_id":"ab"}"#).unwrap();
+    assert!(known.check_known().is_ok());
 }

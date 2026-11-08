@@ -62,8 +62,8 @@ pub fn state_dir(root: &Path) -> std::path::PathBuf {
 /// | 6 | vl 1.1.0 | the lock-free op log: `op_heads/`, `Operation::{workspace, rewritten}` |
 /// | 7 | vl 1.1.0 | key rings of ring format 4: invites, shares by members, a member's removal of their own device (`docs/HUB.md` §13.12) |
 /// | 8 | vl 1.1.0 | only secret files are encrypted: no encrypted descriptions, tag messages, tag names, embargoes, folders or lines of work; plain embargo records (embargo record format 2) |
-/// | 9 | (S3) | thin clones: the `partial` marker (built on its own branch) |
-/// | 10 | vl 1.1.0 | agent attribution and attempts on snapshots (`Snapshot::{agent, abandoned, attempts}`) |
+/// | 9 | vl 1.2.0 (S3) | thin clones: the `partial` marker (built on its own branch) |
+/// | 10 | vl 1.2.0 | agent attribution and attempts on snapshots (`Snapshot::{agent, abandoned, attempts}`) |
 ///
 /// This build writes format 10 and opens formats 8 to 10: a format-8 or 9
 /// repository is read and written as it is, and refuses to store a
@@ -88,7 +88,9 @@ pub fn min_vl_for_format(format: u32) -> &'static str {
     match format {
         0 | 1 => "0.1.0",
         2..=5 => "1.0.0",
-        6..=10 => "1.1.0",
+        6..=8 => "1.1.0",
+        // Format 9 is S3's (thin clones), joining with it.
+        9 | 10 => "1.2.0",
         _ => "a newer release",
     }
 }
@@ -145,6 +147,9 @@ pub struct RemoteConfig {
     /// `repo.json` files keep their bytes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub only: Option<String>,
+    /// Fields this build does not know, kept as they are ([`RepoConfig::unknown`]).
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -160,12 +165,41 @@ pub struct RepoConfig {
     /// of releases that do not know the format yet ("needs vl ≥ X").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_vl: Option<String>,
+    /// Fields of `repo.json` this build does not know (a later release's,
+    /// such as format 9's `partial` marker of a thin clone), kept as they
+    /// are by every rewrite of the file. A repository that has any is never
+    /// opened or upgraded by this build ([`RepoConfig::check_known`]): it
+    /// would be half-understood (BUG-1390).
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, serde_json::Value>,
 }
 
 impl RepoConfig {
+    /// Error unless this build knows every field of `repo.json`, its
+    /// remotes' included: a field it does not know may change what the
+    /// repository means (format 9's `partial`: objects not fetched yet),
+    /// so it neither opens nor upgrades such a repository, and changes
+    /// nothing.
+    pub fn check_known(&self) -> Result<()> {
+        let mut names: Vec<String> = self.unknown.keys().map(|k| format!("{k:?}")).collect();
+        for (r, c) in &self.remotes {
+            names.extend(c.unknown.keys().map(|k| format!("{k:?} of remote {r:?}")));
+        }
+        if names.is_empty() {
+            return Ok(());
+        }
+        names.truncate(8);
+        Err(VeilError::Unsupported(format!(
+            "this repository's .veil/repo.json holds {} which this vl (format {REPO_FORMAT}) does not know; it needs a \
+             newer vl. Nothing was changed",
+            names.join(", ")
+        )))
+    }
+
     /// Error if this build cannot use the repository, naming the vl release
     /// it needs when the configuration says so.
     pub fn check_supported(&self) -> Result<()> {
+        self.check_known()?;
         check_format_supported(self.format).map_err(|e| match (&e, &self.min_vl) {
             (VeilError::Unsupported(_), Some(v)) if self.format > REPO_FORMAT => VeilError::Unsupported(format!(
                 "this repository uses format {} and needs vl {v} or later (this is vl {})",
@@ -307,6 +341,7 @@ impl Repo {
             repo_id: hex::encode(random_bytes::<16>()),
             remotes: BTreeMap::new(),
             min_vl: (format > 1).then(|| min_vl_for_format(format).to_string()),
+            unknown: BTreeMap::new(),
         };
         let has_identity = identity.is_some();
         let keys = Arc::new(Keychain::new(backend.clone(), identity, config.repo_id.clone()));

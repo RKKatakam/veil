@@ -361,6 +361,7 @@ pub fn upgrade(
     // as it was. The check is repeated under the lock.
     let config = read_config(&*backend)?;
     check_format_upgradable(config.format)?;
+    config.check_known()?;
     if !opts.dry_run && config.format < ONLY_SECRETS_REPO_FORMAT {
         let removed = removed_content(&backend)?;
         if !removed.is_empty() {
@@ -382,6 +383,7 @@ pub fn upgrade(
     };
     let mut config = read_config(&*backend)?;
     check_format_upgradable(config.format)?;
+    config.check_known()?;
     let journal = read_journal(&*backend)?;
     let mut report = UpgradeReport {
         from: journal.as_ref().map_or(config.format, |j| j.from),

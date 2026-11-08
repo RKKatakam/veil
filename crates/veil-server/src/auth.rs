@@ -120,6 +120,24 @@ pub fn token_hash(token: &str) -> String {
     blake3::hash(token.as_bytes()).to_hex().to_string()
 }
 
+/// What an agent session's token starts with.
+pub const AGENT_TOKEN_PREFIX: &str = "agent-";
+
+/// The hash a session is kept under: a person's under [`token_hash`], an
+/// agent session's (its token starts with [`AGENT_TOKEN_PREFIX`]) under a
+/// derived key of its own, which a server that predates agent sessions
+/// never computes, so it never finds one (BUG-1376).
+pub fn session_hash(token: &str) -> String {
+    match token.starts_with(AGENT_TOKEN_PREFIX) {
+        true => blake3::Hasher::new_derive_key(veil_core::crypto::domains::HUB_AGENT_SESSION)
+            .update(token.as_bytes())
+            .finalize()
+            .to_hex()
+            .to_string(),
+        false => token_hash(token),
+    }
+}
+
 pub async fn challenge(State(hub): State<HubState>, Json(req): Json<ChallengeRequest>) -> Result<Json<Challenge>> {
     if !valid_key(&req.key) {
         return Err(Error::bad_request("key must be an Ed25519 public key in lowercase hex"));
@@ -365,7 +383,8 @@ impl FromRequestParts<HubState> for Caller {
             .ok()
             .and_then(|a| a.strip_prefix("Bearer "))
             .ok_or_else(|| Error::unauthorized("expected a bearer token"))?;
-        let hash = token_hash(token);
+        let hash = session_hash(token);
+        let agent_token = token.starts_with(AGENT_TOKEN_PREFIX);
         let now = veil_core::now_millis();
         let stats = &hub.caches.stats;
         if let Some(e) = hub.caches.session(&hash).filter(|e| e.expires_at > now) {
@@ -388,11 +407,13 @@ impl FromRequestParts<HubState> for Caller {
              COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $3 AND person_id = 0), 0), \
              s.agent, s.agent_project, s.agent_only \
              FROM sessions s JOIN devices d ON d.id = s.device_id JOIN people p ON p.id = s.person_id \
-             WHERE s.token_hash = $1 AND s.expires_at > $2 AND d.removed_at IS NULL AND NOT d.pending",
+             WHERE s.token_hash = $1 AND s.expires_at > $2 AND d.removed_at IS NULL AND NOT d.pending \
+             AND (s.agent IS NOT NULL) = $4",
         )
         .bind(&hash)
         .bind(now)
         .bind(project.unwrap_or(-1))
+        .bind(agent_token)
         .fetch_optional(&hub.db)
         .await?;
         match row {
@@ -491,7 +512,7 @@ pub async fn agent_session(
         Some(s) if s > 0 => s.saturating_mul(1000).min(MAX_AGENT_SESSION_MS),
         Some(_) => return Err(Error::bad_request("seconds must be positive")),
     };
-    let token = hex::encode(veil_core::crypto::random_bytes::<32>());
+    let token = format!("{AGENT_TOKEN_PREFIX}{}", hex::encode(veil_core::crypto::random_bytes::<32>()));
     let attribution = serde_json::to_string(&req.attribution).map_err(|e| Error::Other(e.into()))?;
     let only_json = (!only.is_empty()).then(|| serde_json::to_string(&only)).transpose().map_err(|e| Error::Other(e.into()))?;
     // The parent's device and expiry are read in the insert itself: a
@@ -504,7 +525,7 @@ pub async fn agent_session(
          AND d.removed_at IS NULL AND NOT d.pending \
          RETURNING expires_at",
     )
-    .bind(token_hash(&token))
+    .bind(session_hash(&token))
     .bind(now + want)
     .bind(&attribution)
     .bind(project.id)

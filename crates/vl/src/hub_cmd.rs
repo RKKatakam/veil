@@ -191,6 +191,7 @@ fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>) -> Result<ExitC
             url: format!("veil://{}/{}", url.authority, url.project),
             public: false,
             only: only.map(str::to_string),
+            unknown: Default::default(),
         },
     );
     repo.save_config(config)?;

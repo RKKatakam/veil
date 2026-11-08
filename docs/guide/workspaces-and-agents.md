@@ -330,8 +330,9 @@ $ vl show                            # Agent, Task, Prompt and Run lines
   repository at all; whatever it puts in its own environment, or in a file,
   never reaches a snapshot. `--agent` and its friends win over the
   `VEIL_AGENT…` environment of the `vl` that runs `ws exec`.
-- **Rebases and duplicates keep each change's own**; the empty change
-  `vl commit` starts gets none (whoever fills it is recorded then).
+- **Rebases and duplicates keep each change's own**; a squash or describe
+  an agent runs carries the agent's (it produced the result); the empty
+  change `vl commit` starts gets none (whoever fills it is recorded then).
 - **Visibility:** plain text, seen by exactly the people who see the
   change, like its description; withheld with it under an embargo.
 - Bounds: an agent name of 1 to 128 printable characters, a task or prompt

@@ -266,7 +266,13 @@ vl session agent --agent "claude-code" --task "TASK-12" --only src/api/    # pri
 - Every commit made with it through the API carries its attribution,
   stamped by the server; a request cannot set one.
 - It cannot change access, groups, devices, invites, key rings or shares,
-  create projects, or make sessions: those are yours alone.
+  create projects, or make sessions: those are yours alone. Nor does it
+  ever change `.veilpolicy` or `.veilrules` (not even by merging or landing
+  someone else's change of one), force a branch back or delete one. With
+  `--only`, it moves a branch only when the move changes nothing outside
+  its paths.
+- Members on an older `vl` are told to update it once the project holds
+  agent-made changes (they cannot read them), instead of a confusing error.
 - `POST /v1/sessions/agent` ([HUB.md §13.27](../HUB.md)).
 
 ## Secrets

@@ -86,6 +86,7 @@ fn bug_913_caches_are_bounded_by_bytes_not_by_what_an_attacker_writes() {
             admin: false,
             groups: (0..250_000).collect(),
             only: None,
+            agent: false,
         };
         c.put_viewer(
             p,

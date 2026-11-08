@@ -255,6 +255,8 @@ const ANSWER_LIMIT: u64 = 4 << 30;
 /// JSON. A server from before S27 ignores it and sends plain frames, which
 /// are encoded frames too.
 const ACCEPT: &str = "application/x-veil-encoded-frames, application/json";
+/// Every request says which repository format this `vl` reads (BUG-1379).
+use veil_core::{hub::wire::FORMAT_HEADER, repo::REPO_FORMAT};
 
 /// The objects of an answer of (encoded or plain) frames, each decoded
 /// (bounded) and checked against its id.
@@ -359,7 +361,7 @@ impl Client {
         let token = if auth { self.token.borrow().clone() } else { None };
         let resp = match (method, body) {
             ("GET", _) => {
-                let mut r = self.agent.get(&url);
+                let mut r = self.agent.get(&url).header(FORMAT_HEADER, &REPO_FORMAT.to_string());
                 if let Some(t) = &token {
                     r = r.header("authorization", &format!("Bearer {t}"));
                 }
@@ -374,7 +376,7 @@ impl Client {
                 if let Some(t) = &token {
                     r = r.header("authorization", &format!("Bearer {t}"));
                 }
-                r = r.header("accept", ACCEPT);
+                r = r.header("accept", ACCEPT).header(FORMAT_HEADER, &REPO_FORMAT.to_string());
                 match body {
                     Some((ct, b)) => r.header("content-type", ct).send(&b[..]),
                     None => r.send_empty(),
@@ -558,7 +560,11 @@ impl Client {
                     let Some(p) = parts.get(i) else { break };
                     let body = (|| -> Option<Vec<u8>> {
                         let body = serde_json::to_vec(&FetchRequest { snapshot, objects: wants[p.clone()].to_vec() }).ok()?;
-                        let mut r = agent.post(url).header("content-type", "application/json").header("accept", ACCEPT);
+                        let mut r = agent
+                            .post(url)
+                            .header("content-type", "application/json")
+                            .header("accept", ACCEPT)
+                            .header(FORMAT_HEADER, &REPO_FORMAT.to_string());
                         if let Some(t) = token {
                             r = r.header("authorization", &format!("Bearer {t}"));
                         }

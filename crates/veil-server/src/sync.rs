@@ -558,6 +558,7 @@ pub async fn history(
     tips: &[ObjectId],
     stop: &[ObjectId],
     encoded: bool,
+    reads: u32,
 ) -> Result<Vec<u8>> {
     let mut starts = Vec::new();
     for t in tips {
@@ -582,6 +583,19 @@ pub async fn history(
             let Object::Snapshot(s) = Object::decode(&raw)? else {
                 return Err(Error::Other(anyhow::anyhow!("projected history holds a non-snapshot")));
             };
+            // Nothing a client cannot read is sent to it (BUG-1379).
+            if s.has_format_10_fields() && reads < veil_core::object::ATTRIBUTION_REPO_FORMAT {
+                return Err(Error::new(
+                    axum::http::StatusCode::UPGRADE_REQUIRED,
+                    "update_vl",
+                    format!(
+                        "this project holds changes of repository format {} (agent attribution, recorded attempts), which \
+                         this vl does not read: update vl to {} or later",
+                        veil_core::object::ATTRIBUTION_REPO_FORMAT,
+                        veil_core::repo::min_vl_for_format(veil_core::object::ATTRIBUTION_REPO_FORMAT)
+                    ),
+                ));
+            }
             match encoded {
                 true => put_frame(&mut out, &id, &src.encoded(&id)?),
                 false => put_frame(&mut out, &id, &raw),
@@ -887,6 +901,59 @@ fn dir_tree(pr: &mut Projector, dirs: &mut Dirs, dir: &str) -> Result<Option<Arc
 
 // ---- push -------------------------------------------------------------------------
 
+/// What a narrowed agent session is told when a branch move would change
+/// something outside its paths: it names nothing there.
+pub(crate) const NARROWED_MOVE: &str = "this agent session is narrowed: the move would change files outside its paths";
+
+/// The refusal of what an agent session may never do (`docs/HUB.md` §13.27).
+pub(crate) fn agent_refusal(m: &str) -> Error {
+    Error::new(axum::http::StatusCode::FORBIDDEN, crate::auth::AGENT_SESSION, m.to_string())
+}
+
+/// Does moving a branch from real snapshot `from` to real snapshot `to`
+/// change anything outside `view`'s narrowing (BUG-1378)? The trees are
+/// walked down both at once, only where they differ and only into the
+/// folders on the way to the narrowing: inside it anything may differ,
+/// anywhere else nothing.
+pub(crate) fn changes_outside_narrowing(src: &Source, view: &View, from: ObjectId, to: ObjectId) -> Result<bool> {
+    use std::collections::{BTreeMap, BTreeSet};
+    fn entries(src: &Source, id: Option<ObjectId>) -> Result<BTreeMap<String, veil_core::TreeEntry>> {
+        let Some(id) = id else { return Ok(BTreeMap::new()) };
+        Ok(match src.node(&id)? {
+            Node::Tree(t, _) => t.entries.iter().map(|e| (e.name.clone(), e.clone())).collect(),
+            Node::Leaf => BTreeMap::new(),
+        })
+    }
+    fn walk(src: &Source, view: &View, dir: &str, a: Option<ObjectId>, b: Option<ObjectId>, depth: usize) -> Result<bool> {
+        if a == b {
+            return Ok(false);
+        }
+        if depth > veil_core::tree::MAX_TREE_DEPTH {
+            return Ok(true);
+        }
+        let (ea, eb) = (entries(src, a)?, entries(src, b)?);
+        for name in ea.keys().chain(eb.keys()).collect::<BTreeSet<_>>() {
+            let (x, y) = (ea.get(name), eb.get(name));
+            if x == y {
+                continue;
+            }
+            let path = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+            if view.within_narrowing(&path) {
+                continue;
+            }
+            let dir_of = |e: Option<&veil_core::TreeEntry>| e.filter(|e| e.kind == EntryKind::Dir).map(|e| e.id);
+            let both_dirs = x.is_none_or(|e| e.kind == EntryKind::Dir) && y.is_none_or(|e| e.kind == EntryKind::Dir);
+            if both_dirs && view.toward_narrowing(&path) && !walk(src, view, &path, dir_of(x), dir_of(y), depth + 1)? {
+                continue;
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+    let (a, b) = (src.snapshot(&from)?.tree, src.snapshot(&to)?.tree);
+    walk(src, view, "", Some(a), Some(b), 0)
+}
+
 /// Names of personal private keys: never accepted, sealed or not
 /// (`docs/VISIBILITY.md`, "Personal private keys never leave your machine").
 fn personal_key(path: &str) -> bool {
@@ -1005,6 +1072,10 @@ fn check_changes(
                     break;
                 }
             }
+        }
+        // Not even by taking someone else's change in a merge (BUG-1377).
+        if view.is_agent() && veil_core::hub::agent::decides_access(&c.path) {
+            return Err(agent_refusal(&format!("an agent session never changes '{}', which decides access or review", c.path)));
         }
         if !view.write(&c.path) && !from_other {
             return Err(Error::forbidden(format!("you may not write '{}'", c.path)));
@@ -1242,6 +1313,9 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     if req.force && !viewer.admin {
         return Err(Error::forbidden("only admins may force a branch move"));
     }
+    if req.force && viewer.agent {
+        return Err(agent_refusal("an agent session never forces a branch move"));
+    }
     if req.updates.len() > MAX_PUSH_UPDATES {
         return Err(Error::bad_request(format!("at most {MAX_PUSH_UPDATES} branch updates per push")));
     }
@@ -1438,6 +1512,36 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         if new_real.is_none() && !viewer.admin {
             return Err(Error::forbidden("only admins may delete a branch"));
         }
+        if new_real.is_none() && viewer.agent {
+            return Err(agent_refusal("an agent session never deletes a branch"));
+        }
+        // A narrowed session moves a branch only when the move changes
+        // nothing outside its paths (BUG-1378); a new branch removes nothing.
+        if let (Some(c), Some(n), true) = (cur, new_real, viewer.only.is_some()) {
+            let v = viewer.clone();
+            let (text, bindings) = (project.policy_text.clone(), project.bindings.clone());
+            let outside = blocking(hub, project.id, move |src| {
+                let p = Project {
+                    id: src.project,
+                    name: String::new(),
+                    default_branch: String::new(),
+                    policy: AccessPolicy::parse(&text),
+                    policy_text: String::new(),
+                    bindings,
+                };
+                changes_outside_narrowing(src, &p.view(&v), c, n)
+            })
+            .await?;
+            if outside {
+                results.push(BranchResult {
+                    branch: u.branch.clone(),
+                    ok: false,
+                    message: Some(NARROWED_MOVE.into()),
+                    tip: cur_seen,
+                });
+                continue;
+            }
+        }
         if let (Some(c), Some(n)) = (cur, new_real) {
             if !req.force && !is_ancestor(hub, project.id, c, n).await? {
                 results.push(BranchResult {
@@ -1458,6 +1562,9 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                 if !incoming.same_rules(&project.policy) {
                     if !viewer.admin {
                         return Err(Error::forbidden("only admins may change who has access (the default branch's .veilpolicy)"));
+                    }
+                    if viewer.agent {
+                        return Err(agent_refusal("an agent session never changes who has access (the default branch's .veilpolicy)"));
                     }
                     accept = Some(text);
                 }

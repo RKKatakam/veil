@@ -27,14 +27,24 @@ There is one **repository format**, a number in `.veil/repo.json`:
 | 6 | 1.1.0 | the lock-free op log: heads in `.veil/op_heads/` instead of `.veil/op_head`, operations gain `workspace` and `rewritten` (§2, §5 "Format 6"). Snapshot attribution moved to format 10, the `partial` marker to format 9 |
 | 7 | 1.1.0 | key rings of ring format 4: invites, shares by members, a member's removal of their own device, and every ring but `team` naming its project (`docs/HUB.md` §13.12). No object encoding changes; the upgrade 6 → 7 rewrites nothing |
 | 8 | 1.1.0 | **only secret files are encrypted.** Removed: sealed descriptions and tag messages (`{"sealed": …}`), cloaked tags and workspaces (`cloak` in views), snapshots on cloaked lines (`Snapshot.cloak`), embargoed tree entries (tier 2) and fallback versions (flag bit 3), sealed directories, embargo keys. Embargo records are plain (embargo record format 2). Decoders refuse what only those wrote; `vl upgrade` brings 6 and 7 to 8 when none of it is there (§5). Formats 1 to 5 are no longer opened |
-| 9 | (S3) | thin clones: the `partial` marker for fetch on demand (`docs/design/scale/6-partial-clone.md`), built on its own branch, which documents it here when it joins |
-| 10 | 1.1.0 | agent attribution and attempts on snapshots: `Snapshot.agent`, `abandoned` and `attempts` (§3.3). No other encoding changes; the upgrades 8 → 10 and 9 → 10 rewrite nothing (§5 "Format 10") |
+| 9 | 1.2.0 (S3) | thin clones: the `partial` marker in `repo.json` for fetch on demand (`docs/design/scale/6-partial-clone.md`), built on its own branch, which documents it here when it joins. This build refuses a repository with the marker (below) |
+| 10 | 1.2.0 | agent attribution and attempts on snapshots: `Snapshot.agent`, `abandoned` and `attempts` (§3.3). No other encoding changes; the upgrades 8 → 10 and 9 → 10 rewrite nothing (§5 "Format 10") |
 
 * `vl init` writes the newest format (`repo::REPO_FORMAT`, 10), and so do
   clones and remotes: this release opens formats 8 to 10
   (`repo::MIN_REPO_FORMAT`). A format-8 or 9 repository is read and
   written as it is, and refuses to store a format-10 snapshot ("upgrade it
   with `vl upgrade`"), so it never holds what its own builds would drop.
+* **`repo.json` keeps what this build does not know.** A field it does not
+  know (a later release's, such as format 9's `partial` marker of a thin
+  clone), in `repo.json` or in one of its remotes, is kept by every rewrite
+  of the file, and the repository is refused (`Unsupported`, "needs a
+  newer vl. Nothing was changed") by opening, `vl upgrade` and `fsck`
+  before anything is read or locked: such a field may change what the
+  rest means (BUG-1390).
+* **The server too:** `vl` says which format it reads (`veil-format` on
+  every request), and the server refuses to send history holding a
+  snapshot of a newer format, telling it to update (BUG-1379).
 * A reader **refuses a newer repository format before reading anything
   else** (`Repo::open`, `fsck`, `vl upgrade`): an older vl never
   half-understands, and never rewrites, newer data. The error names the
@@ -452,8 +462,13 @@ after the format-8 check below): verify, then set-format; nothing is
 rewritten, every id and signature stays. Until then a format-8 or 9
 repository works as it is and refuses to store an attributed snapshot or
 an attempt, naming the fix; a format-8 clone refuses to pull one. Format 9
-(S3's thin clones) and format 10 are separate bumps: a format-9 repository
-upgrades to 10 keeping its `partial` marker, which S3's code reads.
+(S3's thin clones) and format 10 are separate bumps. This build knows
+format 9 only as a number: a format-9 repository without the `partial`
+marker upgrades to 10; a thin clone, with the marker, is refused by
+opening and by `vl upgrade` and left byte for byte, because this build
+does not know the marker (above). Whichever of S3 and S11 merges second
+makes `partial` a known field, so a thin clone then upgrades to 10 with
+its marker.
 
 ### Format 8 (only secret files are encrypted)
 

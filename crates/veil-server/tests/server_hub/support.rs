@@ -396,6 +396,19 @@ impl Api {
         Self::finish(r.send(body))
     }
 
+    /// `POST …/history` as this release's `vl` asks it: saying which
+    /// repository format it reads (BUG-1379).
+    pub fn history(&self, token: &str, project: &str, tips: &[ObjectId]) -> Reply {
+        let body = serde_json::to_vec(&serde_json::json!({"tips": tips.iter().map(|t| t.hex()).collect::<Vec<_>>()})).unwrap();
+        let auth = format!("Bearer {token}");
+        let format = veil_core::repo::REPO_FORMAT.to_string();
+        self.post_with(
+            &format!("/v1/projects/{project}/history"),
+            &body,
+            &[("authorization", &auth), (veil_core::hub::wire::FORMAT_HEADER, &format)],
+        )
+    }
+
     pub fn post_json(&self, token: Option<&str>, path: &str, v: &serde_json::Value) -> Reply {
         self.post(token, path, &serde_json::to_vec(v).unwrap(), true)
     }
@@ -719,7 +732,7 @@ impl<'a> Craft<'a> {
 
     pub fn with(api: &'a Api, token: String, identity: Identity, project: &str, branch: &str) -> Craft<'a> {
         let tip = api.tips(Some(&token), project).unwrap().branches[branch];
-        let h = api.post_json(Some(&token), &format!("/v1/projects/{project}/history"), &serde_json::json!({"tips": [tip.hex()]}));
+        let h = api.history(&token, project, &[tip]);
         let (_, raw) = h.frames().into_iter().find(|(id, _)| *id == tip).unwrap();
         let O::Snapshot(s) = O::decode(&raw).unwrap() else { panic!() };
         Craft {

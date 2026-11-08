@@ -16,6 +16,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::{hub::access::covers, object::Attribution};
 
+/// The names of the files that decide who may see, write or approve
+/// (`.veilpolicy`'s access lines; `.veilrules`, review rules). An agent
+/// session never changes one, by any route: its own commit, a merge that
+/// takes someone else's change, or a branch move that lands one
+/// ([`decides_access`]). A new file of that kind joins this list.
+pub const ACCESS_FILES: &[&str] = &[crate::policy::POLICY_FILE, ".veilrules"];
+
+/// Is `path` (a file, from the project root) a file that decides access or
+/// review, in any folder ([`ACCESS_FILES`])?
+pub fn decides_access(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    ACCESS_FILES.contains(&name)
+}
+
 /// The longest an agent session lasts.
 pub const MAX_AGENT_SESSION_MS: i64 = 12 * 3600 * 1000;
 /// Most paths a session is narrowed to.
@@ -102,6 +116,16 @@ mod tests {
         assert!(!within(&only, "src/apix") && !within(&only, "src") && !within(&only, "") && !within(&only, "docs/a.md.bak"));
         assert!(toward(&only, "") && toward(&only, "src") && toward(&only, "docs"));
         assert!(!toward(&only, "src/api") && !toward(&only, "sr") && !toward(&only, "billing"));
+    }
+
+    #[test]
+    fn access_files_are_known_by_name_in_any_folder() {
+        for p in [".veilpolicy", ".veilrules", "src/.veilpolicy", "a/b/.veilrules"] {
+            assert!(decides_access(p), "{p}");
+        }
+        for p in ["veilpolicy", ".veilpolicy.bak", "src/x.veilpolicy", ".veilpolicy/x"] {
+            assert!(!decides_access(p), "{p}");
+        }
     }
 
     #[test]

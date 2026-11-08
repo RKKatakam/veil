@@ -269,7 +269,16 @@ pub fn fsck(backend: Arc<dyn StorageBackend>, identity: Option<Identity>) -> Res
     let mut report = FsckReport::default();
     let config = backend.read(&vpath(".veil/repo.json"))?;
     let (repo_id, format) = match serde_json::from_slice::<RepoConfig>(&config) {
-        Ok(c) => (c.repo_id, c.format),
+        Ok(c) => {
+            // A field this build does not know: it cannot judge the rest.
+            if let Err(e) = c.check_known() {
+                report.findings.push(Finding {
+                    severity: Severity::Corrupt,
+                    message: e.to_string(),
+                });
+            }
+            (c.repo_id, c.format)
+        }
         Err(e) => {
             report.findings.push(Finding {
                 severity: Severity::Corrupt,

@@ -327,6 +327,7 @@ pub fn viewers(carol: i64) -> Vec<(&'static str, Viewer)> {
         admin: false,
         groups: groups.iter().copied().collect(),
         only: None,
+        agent: false,
     };
     vec![
         ("anyone on Earth", Viewer::default()),
@@ -1067,6 +1068,7 @@ fn derived_on_landing() {
                 admin: false,
                 groups: groups.into_iter().collect(),
                 only: None,
+                agent: false,
             }
         })
     };

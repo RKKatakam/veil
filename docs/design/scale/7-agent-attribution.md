@@ -2,7 +2,7 @@
 
 > **Owner, 2026-11-06:** attribution (`agent`, `task`, `prompt`) is **never encrypted**. It's plain text behind the server's permissions, visible to exactly the people who can see the change. The `Sealed` variants below describe older plans and are dropped.
 
-Status: **built** with S11 (`docs/HUB.md` §13.27), at repository format 10, with these differences: `task` and `prompt` are plain strings; the prompt reference is in the snapshot (no `--prompt-local` side record, no `vl show --prompt`: `vl show` prints it); `vl describe --agent` and `vl blame --agent` are not built; the empty change `vl commit` starts is not stamped. The rest of this document is the design as reviewed (Scion 4.6). It is built with the server's agent work (`docs/design/scion-for-developers.md`, phase 2). Encryption of descriptions and of whole lines of work was removed in repository format 8 (only secret files are encrypted), so attribution is plain text (see "Sealing" below). **Requires format 6:** a new snapshot field. `Snapshot` is decoded without `deny_unknown_fields`, so an older vl would silently drop the field when it rewrites a snapshot (`FORMAT.md` §4 rule 1), and its signature would no longer verify.
+Status: **built** with S11 (`docs/HUB.md` §13.27), at repository format 10, with these differences: `task` and `prompt` are plain strings; the prompt reference is in the snapshot (no `--prompt-local` side record, no `vl show --prompt`: `vl show` prints it); `vl describe --agent` and `vl blame --agent` are not built; the empty change `vl commit` starts is not stamped; a squash or describe by an agent carries the agent's attribution (below). The rest of this document is the design as reviewed (Scion 4.6). It is built with the server's agent work (`docs/design/scion-for-developers.md`, phase 2). Encryption of descriptions and of whole lines of work was removed in repository format 8 (only secret files are encrypted), so attribution is plain text (see "Sealing" below). **Requires format 6:** a new snapshot field. `Snapshot` is decoded without `deny_unknown_fields`, so an older vl would silently drop the field when it rewrites a snapshot (`FORMAT.md` §4 rule 1), and its signature would no longer verify.
 
 ## Design sketch
 
@@ -58,7 +58,7 @@ pub struct Attribution {
 ### Rewrites
 
 - **Kept** on rebase, auto-rebase, describe and `restore` (as `author` is kept).
-- **Squash keeps the destination's attribution.** The sources stay in `predecessors`, so `vl evolog` shows each one's attribution.
+- **An agent's squash or describe carries the agent's attribution** (decided at S11's review): the agent produced the result. A squash or describe by a person (no attribution in `vl`'s environment) keeps the destination's. The sources stay in `predecessors`, so `vl evolog` shows each one's attribution.
 - **`vl describe --agent none`** clears it; `--agent A …` sets it.
 
 ### Reading it

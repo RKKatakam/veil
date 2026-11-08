@@ -356,7 +356,7 @@ fn attempts_never_land_and_a_valid_one_is_kept_projected_and_shown() {
     assert!(!show.body.windows(BILL_DIR.len()).any(|w| w == BILL_DIR.as_bytes()), "the dev saw a hidden name");
     // The attempt travels with the change in the dev's history, projected.
     let t = tip(&hub, &dev, &p.name);
-    let h = api.post_json(Some(&dev), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [t.hex()]}));
+    let h = api.history(&dev, &p.name, &[t]);
     assert_eq!(h.status, 200);
     let frames = h.frames();
     let snaps: Vec<Snapshot> = frames.iter().filter_map(|(_, raw)| match O::decode(raw) { Ok(O::Snapshot(s)) => Some(s), _ => None }).collect();
@@ -414,7 +414,16 @@ fn task_prompt_and_reasons_reach_exactly_who_sees_the_change() {
         }
         if let Some(tips) = api.tips(t, &p.name) {
             let tip = tips.branches["main"];
-            let h = api.post_json(t, &format!("/v1/projects/{}/history", p.name), &json!({"tips": [tip.hex()]}));
+            // As this release's vl asks (it reads format 10).
+            let h = match t {
+                Some(t) => api.history(t, &p.name, &[tip]),
+                None => api.post_with(
+                    &format!("/v1/projects/{}/history", p.name),
+                    &serde_json::to_vec(&json!({"tips": [tip.hex()]})).unwrap(),
+                    &[(veil_core::hub::wire::FORMAT_HEADER, "10")],
+                ),
+            };
+            assert_eq!(h.status, 200, "{who}: {}", body(&h));
             seen.push(("history".into(), h.body));
         }
         let items: Vec<(String, Vec<u8>)> = seen;
@@ -470,7 +479,6 @@ fn a_vl_push_and_pull_carry_attribution_and_attempts() {
 /// it as its person's own session: unnarrowed, in every project, able to
 /// make sessions and change access.
 #[test]
-#[ignore = "BUG-1376: an agent session's token authenticates as its person's full session on a server without migration 20"]
 fn an_agent_sessions_token_is_never_a_full_session_to_a_server_that_predates_it() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -500,7 +508,6 @@ fn an_agent_sessions_token_is_never_a_full_session_to_a_server_that_predates_it(
 /// policy. An admin's agent session making a private folder public through
 /// an API commit is refused; the admin's own session may.
 #[test]
-#[ignore = "BUG-1377: an admin's agent session changes access by committing .veilpolicy through the API"]
 fn an_admins_agent_session_cannot_change_access_through_the_policy_file() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -537,7 +544,6 @@ fn an_admins_agent_session_cannot_change_access_through_the_policy_file() {
 /// neither. Neither needs a new snapshot, so neither needs a device key:
 /// the token is enough.
 #[test]
-#[ignore = "BUG-1378: an admin's narrowed agent session force-moves and deletes branches, removing content outside its paths"]
 fn an_admins_narrowed_agent_session_neither_forces_nor_deletes_a_branch() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -580,7 +586,6 @@ fn an_admins_narrowed_agent_session_neither_forces_nor_deletes_a_branch() {
 /// sends nothing) must be told to update `vl` instead, before anything is
 /// sent.
 #[test]
-#[ignore = "BUG-1379: a vl that predates format 10 is sent attributed snapshots, and its pull fails as a corrupt object"]
 fn a_client_that_predates_format_10_is_told_to_update_not_sent_what_it_calls_corrupt() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -660,4 +665,109 @@ fn the_folders_on_the_way_are_exactly_what_the_person_sees() {
         let items = vec![(path.to_string(), a.body.clone())];
         assert_no_marker(&items, &[BILL_DIR, PERSON_DIR, NESTED_DIR, ROOT_FILE], "a narrowed agent session");
     }
+}
+
+// ---- S11 cycle 2: the classes of BUG-1377 and BUG-1378 -----------------------------
+
+/// BUG-1377's class: an agent session never changes a file that decides
+/// access or review, by any route: its own push, its own API commit (at the
+/// root or in a folder; `.veilrules` as `.veilpolicy`), a merge that takes
+/// someone else's change of one, or a branch move that lands someone else's.
+#[test]
+fn an_agent_session_never_changes_a_file_that_decides_access_by_any_route() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let atok = p.admin.token();
+    let agent = agent_token(&hub, &atok, &p.name, &[]);
+    let opened = format!("{}{PERSON_DIR}/ public\n", std::fs::read_to_string(p.dir.join(".veilpolicy")).unwrap());
+    let is_agent_refusal = |r: &Reply| r.status == 403 && body(r).contains("agent_session");
+    // Its own push, signed by its person's device (the workspace vl holds it).
+    let mut c = Craft::with(&api, agent.clone(), p.admin.identity(), &p.name, "main");
+    let tip0 = c.tip;
+    c.file(".veilpolicy", &opened);
+    let r = c.push_to("main", Some(tip0));
+    assert!(is_agent_refusal(&r), "its own push: {} {}", r.status, body(&r));
+    // Its own API commits: `.veilrules`, and a policy file in a folder.
+    for path in [".veilrules", "src/.veilpolicy", ".veilpolicy"] {
+        let r = change(&hub, &agent, &p.name, &json!({"base": tip0.hex(), "description": "x", "edits": [{"path": path, "put": {"text": "src/ public\n"}}]}));
+        assert!(r.status == 403, "{path}: {} {}", r.status, body(&r));
+    }
+    // Someone else's change of it: the admin's own, on a side branch.
+    let mut own = Craft::new(&api, &p.admin, &p.name, "main");
+    own.file(".veilpolicy", &opened);
+    let r = own.push_to("policy-side-2b", None);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", body(&r));
+    let side = api.tips(Some(&atok), &p.name).unwrap().branches["policy-side-2b"];
+    // A merge that takes it, onto a branch of the agent's.
+    let mut m = Craft::with(&api, agent.clone(), p.admin.identity(), &p.name, "main");
+    m.file(".veilpolicy", &opened);
+    let (_, r) = m.push_edited("agent-side-1a", None, |s| s.parents.push(side));
+    assert!(is_agent_refusal(&r), "a merge taking someone else's change of .veilpolicy: {} {}", r.status, body(&r));
+    // A move of the default branch that lands it.
+    let r = api.post_json(Some(&agent), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": tip0.hex(), "new": side.hex()}]}));
+    assert!(is_agent_refusal(&r), "a fast-forward landing someone else's .veilpolicy: {} {}", r.status, body(&r));
+    assert_eq!(q(&hub, None, &p.name, "file", &format!("path={PERSON_DIR}/notes.txt")).status, 404, "carol's folder became public");
+    // Control: the admin's own session lands it.
+    let r = api.post_json(Some(&atok), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": tip0.hex(), "new": side.hex()}]}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", body(&r));
+}
+
+/// BUG-1378's class: no agent session forces or deletes a branch (narrowed
+/// or not), and a narrowed one moves a branch only when the move changes
+/// nothing outside its paths: not a fast-forward onto someone else's work
+/// elsewhere (refused, naming nothing there), while its own change inside
+/// lands.
+#[test]
+fn agent_sessions_never_force_or_delete_and_a_narrowed_one_moves_a_branch_only_within_its_paths() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let atok = p.admin.token();
+    let push = |tok: &str, updates: Value, force: bool| api.post_json(Some(tok), &format!("/v1/projects/{}/push", p.name), &json!({"updates": updates, "force": force}));
+    let before = tip(&hub, &atok, &p.name);
+    with_api_folder(&hub, &p);
+    let main = tip(&hub, &atok, &p.name);
+    let r = Craft::new(&api, &p.admin, &p.name, "main").push_to("release-9c1d", None);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    let release = api.tips(Some(&atok), &p.name).unwrap().branches["release-9c1d"];
+    // Unnarrowed: never forced, never deleted.
+    let wide = agent_token(&hub, &atok, &p.name, &[]);
+    let r = push(&wide, json!([{"branch": "main", "expected": main.hex(), "new": before.hex()}]), true);
+    assert!(r.status == 403 && body(&r).contains("agent_session"), "{} {}", r.status, body(&r));
+    let r = push(&wide, json!([{"branch": "release-9c1d", "expected": release.hex(), "new": null}]), false);
+    assert!(r.status == 403 && body(&r).contains("agent_session"), "{} {}", r.status, body(&r));
+    // Narrowed: someone else's change of src/other.rs, kept on its change
+    // ref, is not the narrowed session's to land.
+    let dev = p.dev.token();
+    let base = tip(&hub, &dev, &p.name);
+    let theirs = change(&hub, &dev, &p.name, &json!({"base": base.hex(), "description": "elsewhere", "edits": [{"path": "src/other.rs", "put": {"text": "MARKER-ELSEWHERE-5e"}}]}));
+    assert_eq!(theirs.status, 200, "{}", body(&theirs));
+    let theirs = theirs.json()["snapshot"].as_str().unwrap().to_string();
+    let narrow = agent_token(&hub, &dev, &p.name, &["src/api"]);
+    // The same work on a branch of the dev's own: a fast-forward of main.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/other.rs", "MARKER-ELSEWHERE-5e");
+    let r = c.push_to("elsewhere-7f", None);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", body(&r));
+    let elsewhere = api.tips(Some(&dev), &p.name).unwrap().branches["elsewhere-7f"];
+    let r = push(&narrow, json!([{"branch": "main", "expected": base.hex(), "new": elsewhere.hex()}]), false);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["results"][0]["ok"], false, "a narrowed session landed a change outside its paths: {}", body(&r));
+    assert!(!body(&r).contains("other.rs") && !body(&r).contains("src/"), "the refusal names a path: {}", body(&r));
+    assert_eq!(tip(&hub, &dev, &p.name), base, "main moved");
+    // Through the API, `onto` a stack holding the same change: rejected too.
+    let r = change(&hub, &narrow, &p.name, &json!({"base": theirs, "description": "on theirs", "edits": [{"path": "src/api/n.rs", "put": {"text": "n"}}],
+                                                   "onto": {"branch": "main", "expected": base.hex()}}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["branch"]["status"], "rejected", "{}", body(&r));
+    assert_eq!(r.json()["branch"]["message"], "this agent session is narrowed: the move would change files outside its paths", "{}", body(&r));
+    // Its own change inside lands.
+    let r = change(&hub, &narrow, &p.name, &json!({"base": base.hex(), "description": "inside", "edits": [{"path": "src/api/m.rs", "put": {"text": "m"}}],
+                                                   "onto": {"branch": "main", "expected": base.hex()}}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["branch"]["status"], "ok", "{}", body(&r));
 }

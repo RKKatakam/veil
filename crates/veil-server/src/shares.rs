@@ -54,6 +54,7 @@ async fn viewer_of(db: &sqlx::PgPool, project: i64, person: i64) -> Result<Viewe
         admin,
         groups: groups.into_iter().collect(),
         only: None,
+        agent: false,
     })
 }
 

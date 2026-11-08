@@ -580,6 +580,17 @@ fn reads_encoded(headers: &HeaderMap) -> bool {
         .any(|v| v.split(',').any(|t| t.split(';').next().is_some_and(|t| t.trim().eq_ignore_ascii_case(encoding::FRAMES))))
 }
 
+/// The newest repository format the caller's `vl` reads (BUG-1379): what
+/// it says in [`veil_core::hub::wire::FORMAT_HEADER`], or the format of
+/// the releases that say nothing.
+fn reads_format(headers: &HeaderMap) -> u32 {
+    headers
+        .get(veil_core::hub::wire::FORMAT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(veil_core::hub::wire::FORMAT_WITHOUT_HEADER)
+}
+
 /// The content type of an answer of frames.
 fn frames_type(encoded: bool) -> &'static str {
     if encoded {
@@ -598,7 +609,7 @@ async fn history(
 ) -> Result<Response> {
     let encoded = reads_encoded(&headers);
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
-    let body = sync::history(&hub, &project, &viewer, &req.tips, &req.stop, encoded).await?;
+    let body = sync::history(&hub, &project, &viewer, &req.tips, &req.stop, encoded, reads_format(&headers)).await?;
     Ok(([(header::CONTENT_TYPE, frames_type(encoded))], body).into_response())
 }
 

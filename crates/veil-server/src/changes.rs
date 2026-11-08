@@ -741,6 +741,11 @@ async fn stack_on(hub: &Arc<Hub>, who: &Arc<Who>, person: i64, base_real: Object
                     let mut diff = veil_core::hub::project::Graft::new(src, &everything);
                     diff.root(s.tree, Some(src.snapshot(&s.parents[0])?.tree))?;
                     if let Some(c) = diff.changes.iter().find(|c| !view.write(&c.path)) {
+                        // A narrowed session is told nothing of what lies
+                        // outside its paths (BUG-1378).
+                        if !view.within_narrowing(&c.path) {
+                            return Ok(Some(sync::NARROWED_MOVE.to_string()));
+                        }
                         return Ok(Some(format!("a change of yours below this one writes '{}', which you may no longer write", c.path)));
                     }
                 }
@@ -885,11 +890,31 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
             }
         }
         let built = build(hub, &plan, &who, parent, pparent).await?;
+        // A narrowed session moves a branch only when the move changes
+        // nothing outside its paths (BUG-1378): a stack of its person's
+        // own changes may hold more.
+        let outside = match (&onto, cur, &rejected, who.viewer.only.is_some()) {
+            (Some(_), Some(c), None, true) => {
+                let (w, to) = (who.clone(), built.real);
+                // What the change made is stored only after: read it from here.
+                let made: HashMap<ObjectId, Bytes> = built.store.iter().cloned().collect();
+                sync::blocking_with(hub, project.id, made, move |src| sync::changes_outside_narrowing(src, &w.project.view(&w.viewer), c, to)).await?
+            }
+            _ => false,
+        };
         let mv = match (&onto, cur, &rejected) {
             // A change of who has access moves the default branch only for
-            // an admin (the push's rule); anyone else's change is kept.
-            (Some(_), Some(_), None) if built.accept.is_some() && !who.viewer.admin => {
-                rejected = Some("only admins may change who has access (the default branch's .veilpolicy)".into());
+            // an admin (the push's rule), never for an agent session
+            // (BUG-1377); anyone else's change is kept.
+            (Some(_), Some(_), None) if built.accept.is_some() && (!who.viewer.admin || who.viewer.agent) => {
+                rejected = Some(match who.viewer.agent {
+                    true => "an agent session never changes who has access (the default branch's .veilpolicy)".into(),
+                    false => "only admins may change who has access (the default branch's .veilpolicy)".into(),
+                });
+                None
+            }
+            (Some(_), Some(_), None) if outside => {
+                rejected = Some(sync::NARROWED_MOVE.into());
                 None
             }
             (Some(o), Some(c), None) => Some(Move {

@@ -855,6 +855,7 @@ pub fn add_remote(repo: &mut Repo, name: &str, url: &str) -> Result<()> {
                 url: url.to_string(),
                 public: false,
                 only: None,
+                unknown: Default::default(),
             },
         );
         Ok(())

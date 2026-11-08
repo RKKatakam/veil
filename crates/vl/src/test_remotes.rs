@@ -148,7 +148,7 @@ fn clone_populate(backend: Arc<dyn StorageBackend>, url: String, shown: String, 
     ctx::mark_clone_incomplete(&fs)?;
     let mut repo = Repo::init_for_clone_at(fs.clone(), Some(identity.clone()), &user_for(&identity), source_config.format)?;
     let mut config = repo.config().clone();
-    config.remotes.insert("origin".into(), RemoteConfig { url, public: false, only: None });
+    config.remotes.insert("origin".into(), RemoteConfig { url, public: false, only: None, unknown: Default::default() });
     repo.save_config(config)?;
     let report = remote::pull(&mut repo, "origin", backend)?;
     for w in &report.warnings {
