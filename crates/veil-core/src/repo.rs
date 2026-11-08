@@ -197,6 +197,10 @@ pub struct Repo {
     /// The heads the view was read from (ancestors dropped, sorted): the
     /// parents of the next operation.
     pub(crate) base: Vec<ObjectId>,
+    /// The newest timestamp of `base`: the next operation is never older
+    /// than its parents, even with the clock set back (the op log's walks
+    /// visit descendants first, BUG-1297).
+    pub(crate) base_time: i64,
     /// The head files as read.
     pub(crate) raw: RawHeads,
     /// Opened as a remote ([`Repo::open_remote`]): transactions take the
@@ -367,6 +371,7 @@ impl Repo {
             user: user.to_string(),
             root_id,
             base: vec![op_id],
+            base_time: op.timestamp,
             raw: RawHeads {
                 all: vec![op_id],
                 legacy: None,
@@ -419,6 +424,7 @@ impl Repo {
             user: user.to_string(),
             root_id,
             base: Vec::new(),
+            base_time: 0,
             raw: RawHeads::default(),
             remote,
             command_ws: None,
@@ -468,15 +474,19 @@ impl Repo {
             return Ok(false);
         }
         let heads = self.ops.drop_ancestors(&raw.all)?;
-        let (op_id, view) = match heads.as_slice() {
-            [one] => (*one, self.ops.get_head(one)?.view),
+        let (op_id, view, time) = match heads.as_slice() {
+            [one] => {
+                let op = self.ops.get_head(one)?;
+                (*one, op.view, op.timestamp)
+            }
             _ => {
                 let plan = self.merge_plan(&heads, false)?;
-                (self.ops.head()?, plan.view)
+                (self.ops.head()?, plan.view, plan.timestamp)
             }
         };
         self.raw = raw;
         self.base = heads;
+        self.base_time = time;
         self.op_id = op_id;
         self.view = view;
         Ok(true)
@@ -573,6 +583,14 @@ impl Repo {
         let mut warnings = Vec::new();
         let mut rewritten: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
         let mut divergent: std::collections::BTreeSet<ObjectId> = Default::default();
+        // Every rewrite seen, with the operations that recorded it, and
+        // those a head that saw them undid: never applied.
+        let mut recorded: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
+        let mut undone: std::collections::HashSet<ObjectId> = Default::default();
+        // Every step's conflict losers: a later step's removal of the head
+        // (a side that dropped it, unaware of the losing write) never hides
+        // one (BUG-1298).
+        let mut losers: Vec<ObjectId> = Vec::new();
         for h in &heads[1..] {
             let op = self.ops.get(h)?;
             timestamp = timestamp.max(op.timestamp);
@@ -586,32 +604,28 @@ impl Repo {
             let shared = crate::oplog::shared_base(&base, &acc, &split.introduced(&split.only_a), &op.view, &split.introduced(&split.only_b));
             if rewrites {
                 for (ids, side) in [(&split.only_a, &acc), (&split.only_b, &op.view)] {
-                    let refs: std::collections::HashSet<ObjectId> = side.refs().into_iter().collect();
-                    // Oldest first: a later rewrite of a snapshot wins.
-                    let mut side_map: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
+                    // Oldest first: a later rewrite of a snapshot wins. Each
+                    // with the operation that recorded it; one an earlier
+                    // step collected is decided already.
+                    let mut side_map: BTreeMap<ObjectId, (Vec<ObjectId>, ObjectId)> = BTreeMap::new();
                     for id in ids.iter().rev() {
                         if let Some(o) = self.ops.try_get(id)? {
                             for (old, new) in o.rewritten {
-                                side_map.insert(old, new);
+                                side_map.insert(old, (new, *id));
                             }
                         }
                     }
+                    side_map.retain(|old, (_, o)| !recorded.get(old).is_some_and(|ops| ops.contains(o)));
                     // Undone on that side since: it shows `old` again, as
                     // a ref or as an ancestor of one (an undone abandon or
-                    // amend of a parent of `@`). One walk from the refs, down
-                    // to the oldest rewritten snapshot.
-                    let mut floor = crate::graph_index::Gen::MAX;
-                    for old in side_map.keys() {
-                        if let Some(g) = self.graph.generation(self, old)? {
-                            floor = floor.min(g);
-                        }
-                    }
-                    let visible: std::collections::HashSet<ObjectId> = match floor {
-                        crate::graph_index::Gen::MAX => Default::default(),
-                        f => self.graph.down_to(self, refs.iter().copied(), f)?.into_keys().collect(),
-                    };
-                    for (old, new) in side_map {
-                        if refs.contains(&old) || visible.contains(&old) {
+                    // amend of a parent of `@`, BUG-802). Every head of the
+                    // side saw the rewrite (it first appears here).
+                    let olds: Vec<ObjectId> = side_map.keys().copied().collect();
+                    let shown = self.shown(side, &olds)?;
+                    for (old, (new, o)) in side_map {
+                        recorded.entry(old).or_default().push(o);
+                        if shown.contains(&old) {
+                            undone.insert(old);
                             continue;
                         }
                         match rewritten.get(&old) {
@@ -624,19 +638,42 @@ impl Repo {
                         }
                     }
                 }
+                // Undone by a head merged after the step that collected the
+                // rewrite (BUG-1295): a side shows `old` again where the
+                // shared history does not (it brought `old` back: an undo,
+                // an op restore; the rewrite came from the shared history,
+                // and a merge on the other side recorded it again), or this
+                // head saw the rewrite (reaches an operation that recorded
+                // it) and shows `old`.
+                let live: Vec<ObjectId> = rewritten.keys().filter(|o| !undone.contains(*o)).copied().collect();
+                if !live.is_empty() {
+                    let in_shared = self.shown(&shared, &live)?;
+                    let only_a: std::collections::HashSet<&ObjectId> = split.only_a.iter().collect();
+                    for (side, head) in [(&acc, false), (&op.view, true)] {
+                        for old in self.shown(side, &live)? {
+                            let saw = head && recorded.get(&old).is_some_and(|ops| ops.iter().any(|o| !only_a.contains(o)));
+                            if saw || !in_shared.contains(&old) {
+                                undone.insert(old);
+                            }
+                        }
+                    }
+                }
                 before.push(base.clone());
                 before.push(op.view.clone());
             }
             let mut descends = |a: &ObjectId, b: &ObjectId| self.is_ancestor(b, a).unwrap_or(false);
             let merged = crate::oplog::merge_views(&shared, &[&acc, &op.view], &mut descends);
             warnings.extend(merged.warnings);
+            losers.extend(merged.losers);
             acc = merged.view;
             acc_heads.push(*h);
         }
+        acc.heads.extend(losers);
         // Both sides rewrote it differently: a divergent change, both
-        // replacements stay visible and nothing follows either.
-        for d in divergent {
-            rewritten.remove(&d);
+        // replacements stay visible and nothing follows either. Undone by
+        // a head that saw it: not applied to what the others did.
+        for d in divergent.iter().chain(undone.iter()) {
+            rewritten.remove(d);
         }
         Ok(MergePlan {
             view: acc,
@@ -645,6 +682,23 @@ impl Repo {
             timestamp,
             warnings,
         })
+    }
+
+    /// The snapshots of `olds` that `view` shows: as a ref, or as an
+    /// ancestor of one. One walk from the refs, down to the oldest of them.
+    fn shown(&self, view: &View, olds: &[ObjectId]) -> Result<std::collections::HashSet<ObjectId>> {
+        let mut floor = crate::graph_index::Gen::MAX;
+        for old in olds {
+            if let Some(g) = self.graph.generation(self, old)? {
+                floor = floor.min(g);
+            }
+        }
+        let refs: std::collections::HashSet<ObjectId> = view.refs().into_iter().collect();
+        let visible: std::collections::HashSet<ObjectId> = match floor {
+            crate::graph_index::Gen::MAX => Default::default(),
+            f => self.graph.down_to(self, refs.iter().copied(), f)?.into_keys().collect(),
+        };
+        Ok(olds.iter().filter(|o| refs.contains(o) || visible.contains(o)).copied().collect())
     }
 
     /// Set the workspace the operations of this command are for

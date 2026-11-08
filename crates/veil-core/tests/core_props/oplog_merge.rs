@@ -596,7 +596,11 @@ fn check_model(cmds: &[Cmd], repo: &Repo, losers: &std::collections::HashSet<Obj
         // model still allows must be visible.
         if !matches!(k, Key::Head(_)) && conflicted(cmds, &k) {
             for v in vals.iter().flatten() {
-                prop_assert!(matches!(k, Key::Rtag(_)) || visible(&v.0), "{}: {:?}: {} was dropped in a conflict", at, k, v.0.short());
+                // Unless a later command that saw it took its head away (an
+                // undo or op restore of the command that wrote it).
+                let wrote: Vec<&Cmd> = cmds.iter().filter(|c| c.landed.is_some() && c.writes.iter().any(|(k2, v2)| *k2 == k && *v2 == Some(*v))).collect();
+                let removed = cmds.iter().any(|d| d.landed.is_some() && d.writes.contains(&(Key::Head(v.0), None)) && wrote.iter().all(|c| c.landed.unwrap() < d.forked));
+                prop_assert!(matches!(k, Key::Rtag(_)) || removed || visible(&v.0), "{}: {:?}: {} was dropped in a conflict", at, k, v.0.short());
             }
             continue;
         }
@@ -704,7 +708,11 @@ fn check_every_write_survives(disk: bool, nw: usize, undo: bool, aba: bool, step
             continue;
         }
         let fork = truth.fork(&heads);
-        let mut repo = Repo::open(fork.fs.clone(), Some(me.clone()), "alice").unwrap();
+        // Each command as its own user: two commands never write the same
+        // operation (with `aba`, a tag set to the value it has, from the
+        // same head in the same millisecond, would be one operation, and
+        // the model would count two commands).
+        let mut repo = Repo::open(fork.fs.clone(), Some(me.clone()), &format!("alice-{clock}")).unwrap();
         warnings.extend(repo.take_warnings());
         check_model(&cmds, &repo, &losers, &format!("step {clock} (a command's view)"))?;
         let before = repo.view().clone();
@@ -900,12 +908,59 @@ proptest! {
     /// The model check with `vl undo` and `vl op restore` among the
     /// commands, and writes back to earlier values (memory backend).
     #[test]
-    #[ignore = "BUG-1295, BUG-1296: an undone rewrite re-applied; a write back to the base's value lost"]
     fn bug_1295_every_write_survives_with_undo_and_restore(nw in 2usize..6, steps in prop::collection::vec(any::<u16>(), 20..120)) {
-        check_every_write_survives(false, nw, true, false, &steps)?;
+        check_every_write_survives(false, nw, true, true, &steps)?;
     }
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig { cases: review_cases(8), failure_persistence: None, ..ProptestConfig::default() })]
+
+    /// The same on the disk backend.
+    #[test]
+    fn every_write_survives_with_undo_and_restore_disk(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), 20..80)) {
+        check_every_write_survives(true, nw, true, true, &steps)?;
+    }
+}
+
+
+/// BUG-1297: the split of two sides' histories ends its walk once everything
+/// queued is common. A merge has its newest parent's timestamp, so an
+/// operation and a common descendant can share one; when the operation's
+/// id sorts first it is walked first, as one side's, and the walk ended
+/// before the common descendant marked it common: listed as only `a`'s,
+/// its values counted as `a`'s changes (a removal on `b` lost to the
+/// stale value) and its rewrites as new to `b`.
+#[test]
+fn split_lists_no_common_operation_as_one_sides() {
+    use veil_core::oplog::{OpStore, Operation};
+    let ops = OpStore::new(Arc::new(MemoryBackend::new()));
+    let op = |parents: Vec<ObjectId>, timestamp: i64, description: String| Operation {
+        parents,
+        timestamp,
+        user: "alice".into(),
+        description,
+        view: View::default(),
+        manual_undo: None,
+        undo_of: None,
+        redo_of: None,
+        workspace: None,
+        rewritten: Default::default(),
+    };
+    // `p`, and `m` on it with its timestamp, `p`'s id sorting after `m`'s.
+    let p = ops.put(&op(vec![], 10, "p".into())).unwrap();
+    let m = (0..)
+        .map(|n| ops.put(&op(vec![p], 10, format!("m{n}"))).unwrap())
+        .find(|m| *m < p)
+        .unwrap();
+    // `a` reaches `p` and `m`; `b` reaches `m` (so `p` too).
+    let a = ops.put(&op(vec![p, m], 20, "a".into())).unwrap();
+    let b = ops.put(&op(vec![m], 20, "b".into())).unwrap();
+    let split = ops.split(&[a], &[b]).unwrap();
+    assert_eq!(split.base, Some(m), "the nearest common operation");
+    assert_eq!(split.only_a, vec![a], "{} is common", p.short());
+    assert_eq!(split.only_b, vec![b]);
+}
 
 /// BUG-1296: a tag moved away and back (by `vl tag set` or an undo, which
 /// the merge counts as a change) concurrently with its deletion. Both
@@ -913,7 +968,6 @@ proptest! {
 /// common operation, which holds the moved-back value: that side looks
 /// unchanged and the deletion wins, though a change beats a removal.
 #[test]
-#[ignore = "BUG-1296: a write back to the merge base's value loses to a concurrent removal"]
 fn bug_1296_a_tag_moved_back_survives_a_concurrent_delete() {
     let me = Identity::generate("alice");
     let truth = Device::new(false);
@@ -948,6 +1002,81 @@ fn bug_1296_a_tag_moved_back_survives_a_concurrent_delete() {
     assert_eq!(repo.view().tags.get("t").map(|t| t.target), Some(a), "the concurrent move (a change) beats the removal");
 }
 
+/// BUG-1298: a conflict's losing target stays visible through the rest of
+/// the fold. Two commands move tag `t` (from `z` to `x`, a commit that is
+/// a head, and to `y`) while a third restores an operation from before `x`, which
+/// drops the head. When the fold merges the two moves first, `x` loses and
+/// "stays a visible head" (it already was one); the restore, merged next,
+/// dropped that head and the other side kept it unchanged, so the head
+/// went: `x` vanished, though the warning said it stays.
+#[test]
+fn bug_1298_a_conflicts_loser_stays_visible_through_the_fold() {
+    let me = Identity::generate("alice");
+    let mut hits = 0;
+    for _ in 0..200 {
+        let truth = Device::new(false);
+        let (x, y, before);
+        {
+            let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+            let root = repo.root_id();
+            repo.create_workspace("v", vec![root]).unwrap();
+            repo.create_workspace("w", vec![root]).unwrap();
+            let commit = |repo: &mut Repo, ws: &str, f: &str| {
+                repo.set_command_workspace(Some(ws.into()));
+                let ov = repo.workspace_overlay(ws).unwrap();
+                ov.write(&VPath::new(f).unwrap(), b"x\n").unwrap();
+                repo.snapshot_workspace(ws, &ov).unwrap();
+                repo.commit_working_copy(ws, f).unwrap().0
+            };
+            // `t` on `z` (not on a parent a later commit moves it from).
+            y = commit(&mut repo, "v", "y");
+            let z = commit(&mut repo, "v", "z");
+            repo.set_tag("t", z, true).unwrap();
+            before = repo.op_id();
+            x = commit(&mut repo, "w", "x");
+            assert_eq!(repo.view().tags["t"].target, z);
+            repo.remove_workspace("w").unwrap();
+            assert!(repo.view().heads.contains(&x), "x is a head");
+        }
+        let k = op_heads(&*truth.fs);
+        let (a, b, r) = (truth.fork(&k), truth.fork(&k), truth.fork(&k));
+        let mut ids = Vec::new();
+        for (fork, target) in [(&a, x), (&b, y)] {
+            let mut repo = Repo::open(fork.fs.clone(), Some(me.clone()), "alice").unwrap();
+            repo.set_tag("t", target, true).unwrap();
+            assert_eq!(repo.view().tags["t"].target, target);
+            ids.push(repo.op_id());
+        }
+        let rid = {
+            let mut repo = Repo::open(r.fs.clone(), Some(me.clone()), "alice").unwrap();
+            repo.restore_operation(before).unwrap();
+            assert!(!repo.view().heads.contains(&x), "the restore dropped the head");
+            repo.op_id()
+        };
+        // The fold merges the restore last.
+        if !ids.iter().all(|i| rid > *i) {
+            continue;
+        }
+        hits += 1;
+        for f in [&a, &b, &r] {
+            truth.land(f, &k);
+        }
+        let mut repo = Repo::open(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        assert_eq!(repo.heads().len(), 1, "settled");
+        let won = repo.view().tags["t"].target;
+        assert!(won == x || won == y, "a move wins");
+        let refs = repo.view().refs();
+        for c in [x, y] {
+            assert!(refs.iter().any(|r| *r == c || repo.is_ancestor(&c, r).unwrap()), "{} stays visible", c.short());
+        }
+        assert!(repo.take_warnings().iter().any(|w| w.starts_with("tag 't'")), "the conflict is warned of");
+        if hits == 3 {
+            break;
+        }
+    }
+    assert!(hits > 0, "the interleaving ran");
+}
+
 /// BUG-1295: `vl undo` of a commit, merged with two other heads, one of
 /// which saw the commit and one did not. The fold (in id order) can merge
 /// those two first: the commit's rewrite of the working copy into the
@@ -955,7 +1084,6 @@ fn bug_1296_a_tag_moved_back_survives_a_concurrent_delete() {
 /// copy), and then applied to the undo's working copy, which is that old
 /// one: the workspace ends on the commit, the undo lost.
 #[test]
-#[ignore = "BUG-1295: a merge re-applies a rewrite that a third head undid"]
 fn bug_1295_an_undone_commit_stays_undone_through_a_three_way_merge() {
     let me = Identity::generate("alice");
     let mut hits = 0;

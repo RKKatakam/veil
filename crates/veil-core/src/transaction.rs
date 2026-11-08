@@ -1162,7 +1162,7 @@ impl<'r> Transaction<'r> {
         }
         let (timestamp, user) = match &self.merge {
             Some(m) => (m.timestamp, "veil".to_string()),
-            None => (now_millis(), self.repo.user.clone()),
+            None => (now_millis().max(self.repo.base_time), self.repo.user.clone()),
         };
         Operation {
             parents,
@@ -1260,14 +1260,14 @@ impl<'r> Transaction<'r> {
             // Fencing: never move the head unless we still hold the lock.
             lock.ensure_held()?;
         }
-        let id = match staged {
+        let (id, time) = match staged {
             Some((id, op, op_file, head)) => {
                 self.repo.ops.publish_staged(&id, &op, &op_file, &head, &self.stale)?;
-                id
+                (id, op.timestamp)
             }
             None => {
                 let op = self.operation();
-                self.repo.ops.publish(&op, &self.stale)?
+                (self.repo.ops.publish(&op, &self.stale)?, op.timestamp)
             }
         };
         if let Some(dir) = self.kept_dir.take() {
@@ -1276,6 +1276,7 @@ impl<'r> Transaction<'r> {
         drop(publishing);
         self.repo.op_id = id;
         self.repo.base = vec![id];
+        self.repo.base_time = time;
         self.repo.raw = RawHeads {
             all: vec![id],
             legacy: None,

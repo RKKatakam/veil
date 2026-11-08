@@ -541,17 +541,28 @@ impl OpStore {
         }
         // Ancestors of a common operation (never the nearest one).
         let mut stale: std::collections::HashSet<ObjectId> = Default::default();
-        while let Some((_, id)) = queue.pop() {
+        // The oldest timestamp of an operation walked while one side alone
+        // reached it.
+        let mut low: Option<i64> = None;
+        while let Some((ts, id)) = queue.pop() {
             let (m, st) = (marks[&id], stale.contains(&id));
             if done.get(&id) == Some(&(m, st)) {
                 continue;
             }
             done.insert(id, (m, st));
+            if m != 3 {
+                low = Some(low.map_or(ts, |l| l.min(ts)));
+            }
             // Common operations are walked too (the classic merge-base walk): a
             // timestamp out of order (a merge has its newest parent's) may
             // have sent one side below them first. The walk ends once
-            // everything still queued is common.
-            if m == 3 && queue.iter().all(|(_, q)| marks[q] == 3) {
+            // everything still queued is common and older than every
+            // operation walked as one side's: a common operation of the same
+            // timestamp may still be its descendant (a merge and the parent
+            // whose timestamp it has, the parent's id sorting first), which
+            // makes it common too (BUG-1297).
+            let below = |t: i64| low.is_none_or(|l| t < l);
+            if m == 3 && below(ts) && queue.iter().all(|(t, q)| marks[q] == 3 && below(*t)) {
                 break;
             }
             let parents = match self.cached(&mut ops, &id)? {
@@ -693,11 +704,14 @@ impl Introduced {
 /// with others, BUG-1294). Per key: when one side's value was introduced
 /// by an operation only it reaches (`ia`, `ib`) and the other's was not,
 /// the other's is the shared history's, so it is the base and the change
-/// wins. Otherwise (both sides changed the key, or neither did and they
-/// still differ) the key is `base`'s, and the conflict rules decide.
-/// Without it, a value `base` lacks but both sides' shared history holds
-/// looks changed on both sides, and the conflict rule could keep the side
-/// with the older value: a commit's working copy lost.
+/// wins. When both sides introduced theirs, both changed the key: the
+/// base is absent (equal to neither, nor to a value a side wrote back,
+/// BUG-1296), so the conflict rules decide between two changes (a change
+/// beats a removal; two moves keep the loser visible and warn). When
+/// neither did and they still differ, the key is `base`'s. Without it, a
+/// value `base` lacks but both sides' shared history holds looks changed
+/// on both sides, and the conflict rule could keep the side with the
+/// older value: a commit's working copy lost.
 pub fn shared_base(base: &View, a: &View, ia: &Introduced, b: &View, ib: &Introduced) -> View {
     fn key<T: Clone + PartialEq + Eq + std::hash::Hash, V: Clone>(
         name: &str,
@@ -715,7 +729,8 @@ pub fn shared_base(base: &View, a: &View, ia: &Introduced, b: &View, ib: &Introd
         match (ia.contains(&(name.to_string(), ua)), ib.contains(&(name.to_string(), ub))) {
             (false, true) => va.cloned(),
             (true, false) => vb.cloned(),
-            _ => vbase.cloned(),
+            (true, true) => None,
+            (false, false) => vbase.cloned(),
         }
     }
     let mut out = View::default();
@@ -746,6 +761,8 @@ pub fn shared_base(base: &View, a: &View, ia: &Introduced, b: &View, ib: &Introd
         let keep = match (pa == pb, ia.heads.contains(&(*h, pa)), ib.heads.contains(&(*h, pb))) {
             (false, false, true) => pa,
             (false, true, false) => pb,
+            // Added on one side, dropped on the other: the addition wins.
+            (false, true, true) => false,
             _ => base.heads.contains(h),
         };
         if keep {
@@ -805,6 +822,8 @@ pub struct MergedView {
     /// What a conflict decided, for the user (names workspaces and public
     /// tags; a cloaked tag is "a cloaked tag").
     pub warnings: Vec<String>,
+    /// The losing values of those conflicts (heads of `view`).
+    pub losers: Vec<ObjectId>,
 }
 
 /// A deterministic 3-way merge of `sides` against `base`. A key changed on
@@ -918,9 +937,10 @@ fn merge_views_with(base: &View, sides: &[&View], first_wins: bool, descends: &m
             out.view.remote_tags.insert(name.clone(), t);
         }
     }
-    for l in losers {
-        out.view.heads.insert(l);
+    for l in &losers {
+        out.view.heads.insert(*l);
     }
+    out.losers = losers;
     out
 }
 

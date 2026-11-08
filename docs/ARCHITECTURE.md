@@ -2440,18 +2440,29 @@ take no lock:
   introduced by an operation only that side reaches, and on the other
   side was not, takes the changed side's value (`oplog::shared_base`), so
   a side still holding the shared history's older value never wins
-  against a newer commit (BUG-1294). Per key (heads: kept if every side kept it or some side added it;
+  against a newer commit (BUG-1294); a key both sides introduced a value
+  for has no base value, so the two are merged as two changes, even when
+  one is a write back to the common operation's value (BUG-1296). The
+  walk that finds the operations only one side reaches ends only below
+  every operation it walked as one side's: a merge has its newest parent's
+  timestamp, and a common descendant of the same timestamp must still mark
+  its ancestor common (BUG-1297). Per key (heads: kept if every side kept it or some side added it;
   workspaces, tags, remote tags: one side's change wins, two different
-  changes go to the first side and the other target stays a visible head,
-  with a warning printed once by the process that writes the merge; a
+  changes go to the first side and the other target stays a visible head
+  (through the rest of the fold too: a later step's dropped head never
+  hides a loser, BUG-1298), with a warning printed once by the process that writes the merge; a
   removal loses to a change; a workspace's or tag's cloak merges separately
   and a cloaked side wins; a release tag's target and annotation are one
   unit and win over an ordinary tag). Each side's `rewritten` is applied to
   the other's new snapshots (`Transaction::for_merge` runs the auto-rebase:
   a child committed on a snapshot amended meanwhile moves onto the amended
   one); both sides rewriting one snapshot differently is a divergent change,
-  and a rewrite whose old snapshot is still visible on its side (an undo
-  since: as a ref or an ancestor of one) is not applied (BUG-802).
+  and a rewrite that was undone is not applied: its old snapshot is
+  visible again (as a ref or an ancestor of one) on the side that recorded
+  it (BUG-802), on a head merged later that reaches an operation that
+  recorded it, or on a side where the fold step's shared history does not
+  show it (an undo or op restore of a rewrite the shared history holds,
+  recorded again by a merge on the other side, BUG-1295).
   The confinement check runs against **every side's view**: a rewrite that
   would move a change out of an unreleased embargo either side had it in
   is dropped and its replacement rewritten back, so the change stays
@@ -2460,7 +2471,8 @@ take no lock:
   refused stays on its old
   parents, with what is built on it, and the warning names it (BUG-805).
   Its timestamp is its
-  parents' latest, its user `veil`, and what it creates derives its change
+  parents' latest (a command's operation is never older than its parents
+  either, whatever the clock says), its user `veil`, and what it creates derives its change
   ids from its parents: two processes merging the same heads write the same
   operation, and `create_new` of its head file loses to itself. Merging at
   open, rather than in memory for read-only commands as the design
