@@ -2582,6 +2582,44 @@ the project's admins only:** anyone else who can see the project gets
 anyone on Earth `401`. The answer names no person, device, path or other
 project. With several servers each counts what it served.
 
+**Measured** (`scripts/bench-server.sh limits` through
+`bench-quiet.sh`, release builds, PostgreSQL and MinIO, server and agents on
+one 32-thread machine; the agents are one device on 127.0.0.1, so the bench
+starts the server with the rates and the per-address share out of the way;
+the bulkheads and the budget stay). Up-to-date pulls (the tips, from the
+server's cache: almost all request path):
+
+| Server | Load (before → after) | Agents | Pulls/s | p50 / p99 (ms) | Server CPU per pull |
+|---|---|---:|---:|---|---:|
+| S24 | 12 → 111 | 10 | 32,361 | 0.30 / 0.49 | 0.12 ms |
+| S24 | | 100 | 49,116 | 1.68 / 6.87 | 0.12 ms |
+| `integration` (no limits) | 60 → 162 | 10 | 9,817 | 0.80 / 3.77 | 0.14 ms |
+| `integration` | | 100 | 14,089 | 5.77 / 26.2 | 0.13 ms |
+
+The machine was busy for both (the base far more), so throughput and
+latency do not compare; server CPU per request, which load moves least, is
+the same within noise: **the middleware costs no measurable CPU per
+request** (a token, a gate, the body's share). Quiet projects beside a
+flooded one (10 agents on 2 projects; a third flooded by closed-loop pulls):
+
+| Server | Flood agents | Flood pulls/s | Quiet pulls/s | Quiet p50 / p99 (ms) |
+|---|---:|---:|---:|---|
+| S24 | 0 | | 31,993 | 0.31 / 0.48 |
+| S24 | 200 | 43,526 | 3,120 | 1.98 / 13.2 |
+| S24 | 1,000 | 39,699 | 571 | 12.6 / 73.1 |
+| `integration` | 0 | | 21,873 | 0.39 / 1.57 |
+| `integration` | 200 | 32,961 | 1,655 | 5.59 / 15.3 |
+| `integration` | 1,000 | 29,990 | 310 | 30.5 / 107 |
+
+These floods are CPU-bound (the tips come from the cache, no database), and
+the flooding agents run on the same cores as the server (the load tool used
+up to 63 of them): what slows the quiet projects is the machine, which no
+bulkhead fixes. Where a flood takes the database, the bulkhead holds it to
+its share: in the container test (`a_flooded_project_does_not_starve_a_quiet_one`,
+64 clients flooding one project's database reads on a pool of 16), the
+flooded project never ran more than 12 requests at once, and the quiet
+project's p99 went from 1.1 ms to 1.3 ms.
+
 **Threat review** (design §6 rows 13 and 20, plus this milestone's):
 
 | # | Attacker | Tries | Result | Test (`server_hub::limits`, unit tests in `limits/`) |
