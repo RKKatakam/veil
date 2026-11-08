@@ -696,9 +696,11 @@ impl Service {
             HashMap::new()
         } else {
             let hex: Vec<String> = stacks.iter().map(ObjectId::hex).collect();
-            let rows: Vec<(String, String)> = sqlx::query_as("SELECT submitted, landed FROM landings WHERE project_id = $1 AND submitted = ANY($2)")
+            let rows: Vec<(String, String)> =
+                sqlx::query_as("SELECT submitted, landed FROM landings WHERE project_id = $1 AND branch = $3 AND submitted = ANY($2)")
                 .bind(self.project)
                 .bind(&hex)
+                .bind(&self.branch)
                 .fetch_all(&hub.db)
                 .await?;
             rows.into_iter().filter_map(|(s, l)| Some((ObjectId::from_hex(&s).ok()?, ObjectId::from_hex(&l).ok()?))).collect()
@@ -752,7 +754,12 @@ impl Service {
         let new = b.after.tip.map(|t| t.hex());
         let seqs: Vec<i64> = b.rows.iter().map(|r| r.0).collect();
         let snapshots: Vec<String> = b.snapshots.iter().map(ObjectId::hex).collect();
-        let (ls, ll): (Vec<String>, Vec<String>) = b.landings.iter().map(|(s, l)| (s.hex(), l.hex())).unzip();
+        // The tip this batch moves from is on the branch too: recorded as
+        // landed as itself, so a submit on any tip an agent read since the
+        // service began finds its base in one lookup (`landing::stack`),
+        // never walking the branch nor waiting for the deriver.
+        let from = b.old_tip.filter(|_| moved).map(|t| (t, t));
+        let (ls, ll): (Vec<String>, Vec<String>) = b.landings.iter().chain(from.iter()).map(|(s, l)| (s.hex(), l.hex())).unzip();
         let mk: Vec<String> = b.memos.iter().map(|m| m.0.clone()).collect();
         let mr: Vec<String> = b.memos.iter().map(|m| m.1.hex()).collect();
         let mp: Vec<String> = b.memos.iter().map(|m| m.2.hex()).collect();
@@ -843,13 +850,14 @@ impl Service {
                 }
                 if !ls.is_empty() {
                     sqlx::query(
-                        "INSERT INTO landings (project_id, submitted, landed, at) SELECT $1, s, l, $4 FROM unnest($2::TEXT[], $3::TEXT[]) AS v(s, l) \
-                         ON CONFLICT DO NOTHING",
+                        "INSERT INTO landings (project_id, branch, submitted, landed, at) SELECT $1, $5, s, l, $4 \
+                         FROM unnest($2::TEXT[], $3::TEXT[]) AS v(s, l) ON CONFLICT DO NOTHING",
                     )
                     .bind(pid)
                     .bind(&ls)
                     .bind(&ll)
                     .bind(veil_core::now_millis())
+                    .bind(&branch)
                     .execute(&mut *c)
                     .await?;
                 }

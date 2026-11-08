@@ -923,7 +923,7 @@ pub(crate) async fn create_with(
         if let Some((_, q)) = land.as_mut() {
             let fresh = HashMap::from([(built.real, vec![parent])]);
             q.stack = match tip(hub, project.id, &q.branch).await? {
-                Some(t) => match crate::landing::stack(hub, &who.project, &who.viewer, built.real, t, &fresh).await? {
+                Some(t) => match crate::landing::stack(hub, &who.project, &who.viewer, &q.branch, built.real, t, &fresh).await? {
                     Ok(s) => s,
                     Err(why) => return Err(bad(why)),
                 },

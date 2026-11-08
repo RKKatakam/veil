@@ -152,6 +152,9 @@ pub struct Stats {
     pub rechecked: AtomicU64,
     /// Statements the branches' pollers made (`poll`).
     pub polls: AtomicU64,
+    /// Submits whose stack asked the derived graph, or walked, whether a
+    /// change is on the branch: neither its tip nor a landing (BUG-1275).
+    pub walks: AtomicU64,
 }
 
 /// A waiting ticket's answer channel, and the branch it waits on.
@@ -516,6 +519,7 @@ pub async fn stack(
     hub: &Arc<Hub>,
     project: &crate::perm::Project,
     viewer: &crate::perm::Viewer,
+    branch: &str,
     new: ObjectId,
     tip: ObjectId,
     fresh: &HashMap<ObjectId, Vec<ObjectId>>,
@@ -532,7 +536,7 @@ pub async fn stack(
             )));
         }
         let held = !fresh.contains_key(&x);
-        if held && on_branch_or_landed(hub, pid, x, tip).await? {
+        if held && on_branch_or_landed(hub, pid, branch, x, tip).await? {
             break;
         }
         let parents = match fresh.get(&x) {
@@ -545,9 +549,9 @@ pub async fn stack(
         // A merge with a parent on the branch: its edits against that one.
         let mut base = parents[0];
         let mut last = false;
-        if parents.len() > 1 && !on_branch_or_landed(hub, pid, parents[0], tip).await? {
+        if parents.len() > 1 && !on_branch_or_landed(hub, pid, branch, parents[0], tip).await? {
             for p in &parents[1..] {
-                if on_branch_or_landed(hub, pid, *p, tip).await? {
+                if on_branch_or_landed(hub, pid, branch, *p, tip).await? {
                     base = *p;
                     last = true;
                     break;
@@ -590,46 +594,51 @@ pub async fn stack(
     Ok(Ok(out))
 }
 
-/// Is real snapshot `x` on the branch at `tip` (the tip or below it), or a
-/// submitted snapshot whose landing is?
-async fn on_branch_or_landed(hub: &Arc<Hub>, project: i64, x: ObjectId, tip: ObjectId) -> Result<bool> {
-    if on_branch(hub, project, x, tip).await? {
+/// Is real snapshot `x` on `branch` at `tip` (the tip or below it), or a
+/// submitted snapshot whose landing is? Cheapest first: the tip itself; the
+/// service's own record (`landings`: an agent's next change is on its last
+/// landing, so a submit never walks the branch); the derived commit graph;
+/// a walk last.
+///
+/// A landing an admin's forced push took away still counts: the stack then
+/// ends there, and the service lands the change as its diff from that base
+/// onto the tip, its edit set unchanged, every change below it landed (and
+/// checked) when it was.
+async fn on_branch_or_landed(hub: &Arc<Hub>, project: i64, branch: &str, x: ObjectId, tip: ObjectId) -> Result<bool> {
+    if x == tip {
         return Ok(true);
     }
-    let landed: Option<String> = sqlx::query_scalar("SELECT landed FROM landings WHERE project_id = $1 AND submitted = $2")
-        .bind(project)
-        .bind(x.hex())
-        .fetch_optional(&hub.db)
-        .await?;
-    match landed.and_then(|l| ObjectId::from_hex(&l).ok()) {
-        Some(l) if l != x => on_branch(hub, project, l, tip).await,
-        _ => Ok(false),
+    let landed: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM landings WHERE project_id = $1 AND branch = $2 AND (landed = $3 OR submitted = $3) LIMIT 1")
+            .bind(project)
+            .bind(branch)
+            .bind(x.hex())
+            .fetch_optional(&hub.db)
+            .await?;
+    if landed.is_some() {
+        return Ok(true);
     }
+    hub.landing.stats.walks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    on_branch(hub, project, x, tip).await
 }
 
-/// Is real snapshot `x` the branch tip `tip` or below it? From the derived
-/// commit graph (S12; the tip is derived first if the deriver has not yet),
-/// else by walking.
+/// Is real snapshot `x` the branch tip `tip` or below it? The derived commit
+/// graph when it holds the tip (never waiting for the deriver on a
+/// request), else a walk.
 async fn on_branch(hub: &Arc<Hub>, project: i64, x: ObjectId, tip: ObjectId) -> Result<bool> {
     if x == tip {
         return Ok(true);
     }
-    let ask = || {
-        crate::derive::read(hub, project, move |g| {
-            Ok(match g.row(&tip)? {
-                None => None,
-                // Everything below a derived snapshot is derived.
-                Some(_) => Some(g.row(&x)?.is_some() && g.is_ancestor(x, tip)?),
-            })
+    let derived = crate::derive::read(hub, project, move |g| {
+        Ok(match g.row(&tip)? {
+            None => None,
+            // Everything below a derived snapshot is derived.
+            Some(_) => Some(g.row(&x)?.is_some() && g.is_ancestor(x, tip)?),
         })
-    };
-    if let Some(a) = ask().await? {
-        return Ok(a);
-    }
-    crate::derive::ensure(hub, project, tip).await?;
-    match ask().await? {
+    })
+    .await?;
+    match derived {
         Some(a) => Ok(a),
-        // Another server's deriver holds the project.
         None => crate::sync::is_ancestor(hub, project, x, tip).await,
     }
 }

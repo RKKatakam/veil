@@ -1435,7 +1435,7 @@ pub(crate) async fn push_with(
             }
             // Every change between the branch's tip and the pushed one: what
             // this push brought, and what the server already held (BUG-1103).
-            let stack = match crate::landing::stack(hub, project, viewer, new_real, cur.expect("checked"), &real_parents_of).await? {
+            let stack = match crate::landing::stack(hub, project, viewer, &u.branch, new_real, cur.expect("checked"), &real_parents_of).await? {
                 Ok(s) => s,
                 Err(why) => {
                     results.push(refuse(&why));

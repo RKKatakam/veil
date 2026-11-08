@@ -2469,9 +2469,11 @@ pushed or uploaded snapshot, and edits on a `base`) is every change on its
 first-parent line from the branch's tip up to it (§4.6), each with its
 **base**: those this request brought and those the server already held (on
 another branch, an API commit, a landing answered `conflict`), down to the
-first that is on the branch (the tip or below it, by the derived commit
-graph, the tip derived first if the deriver lags; or a submitted snapshot
-that landed: `landings`). A merge with a parent on the branch ends the
+first that is on the branch: the tip; a snapshot the service landed, or
+moved the branch from, or a submitted snapshot that landed (`landings`,
+one indexed lookup: an agent's base is its own last landing, or a tip it
+read); else the derived commit graph when it holds the tip, never waiting
+for the deriver; else a walk (BUG-1275). A merge with a parent on the branch ends the
 stack with that parent as its base: it lands as its edits against it, the
 whole of what the branch lacks (so a change answered `conflict`, with the
 branch merged into it and the file resolved, lands; a fix on top that is
@@ -2563,8 +2565,8 @@ for 5 s gives the lease back. Its loop:
   compare-and-swap, an accepted policy, the queue rows (each must still be
   `queued`, else nothing commits: an entry never lands twice), the
   snapshot, `landings` and memo rows, an audit row and the tips notice.
-  Finished queue rows, and `landings` rows (where each landed stack change
-  is on the branch), are deleted after a day: a later push on a submitted
+  Finished queue rows, and `landings` rows (per branch: where each landed
+  stack change is, and each tip a batch moved from), are deleted after a day: a later push on a submitted
   snapshot older than that is answered `conflict` for the change it would
   repeat, never landed over.
 
@@ -2589,9 +2591,10 @@ predecessor of the landed snapshot with the same content at every path it
 edits; the next change made on it lands the same way.
 
 **Measured** (`docs/design/scale/LOAD.md`, "The landing service"): into one
-`main`, 1,023 landings/s with 1,000 agents at a 1,000/s target, p50 191 ms
-and **p99 718 ms**, 1.03 database commits and about 12 statements per
-landing; 820/s with 10,000 agents on a loaded machine; 1,212/s at most. No
+`main`, 954 landings/s with 1,000 agents at a 1,000/s target, p50 184 ms
+and **p99 632 ms**, 1.12 database commits and about 16 statements per
+landing; **927/s with 10,000 agents, p50 840 ms, p99 1.47 s** (the 1 s
+target missed there), 1.13 commits per landing; 1,348/s at most. No
 collisions. The object store's synced writes, about 14 per landing, are the
 limit (packs, S28).
 

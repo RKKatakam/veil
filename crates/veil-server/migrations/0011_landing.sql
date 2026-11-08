@@ -67,9 +67,13 @@ CREATE TABLE IF NOT EXISTS landing_leases (
 -- change it repeats, never landed over.
 CREATE TABLE IF NOT EXISTS landings (
     project_id BIGINT NOT NULL REFERENCES projects(id),
+    branch TEXT NOT NULL,
     submitted TEXT NOT NULL,
     landed TEXT NOT NULL,
     at BIGINT NOT NULL,
-    PRIMARY KEY (project_id, submitted)
+    PRIMARY KEY (project_id, branch, submitted)
 );
 CREATE INDEX IF NOT EXISTS landings_at ON landings (project_id, at);
+-- Is a snapshot one the service landed on a branch (`landing::stack`: an
+-- agent's next change is on its last landing)?
+CREATE INDEX IF NOT EXISTS landings_landed ON landings (project_id, branch, landed);

@@ -1311,3 +1311,35 @@ fn the_service_s_reads_at_an_access_change_and_remote_waiters_stay_bounded() {
     assert!((n as f64) < secs * 4.0 + 8.0, "{n} polls in {secs:.1} s for 100 waiters");
 }
 
+
+/// BUG-1275: a submit decides which changes it brings from the tip and the
+/// service's own record of what it landed (`landings`), and the tips it
+/// moved from: it never asks the derived graph, nor walks the branch, for
+/// a change on the tip an agent read, nor on its own last landing, however
+/// far the branch moved since (10,000 agents on one tip, the deriver behind).
+#[test]
+fn bug_1275_a_submit_on_a_tip_read_or_its_own_last_landing_never_walks_the_branch() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let token = p.dev.token();
+    let walks = || hub.hub().landing.stats.walks.load(std::sync::atomic::Ordering::Relaxed);
+    let first = tip_for(&hub, &token, &p.name);
+    let walks0 = walks();
+    // Agent A lands on the tip it read, then on its own last landing,
+    // again and again; agent B stays on the first tip; agent C reads the tip
+    // each time.
+    let mut a_last = first;
+    for i in 0..6 {
+        let r = land(&api, &token, &p.name, a_last, json!([put(&format!("src/a/{i}.rs"), "a\n")]), true);
+        let v = r.json();
+        assert_eq!(v["state"], "landed", "{v}");
+        a_last = serde_json::from_value(v["landed"].as_array().unwrap().last().unwrap().clone()).unwrap();
+        let r = land(&api, &token, &p.name, first, json!([put(&format!("src/b/{i}.rs"), "b\n")]), true);
+        assert_eq!(r.json()["state"], "landed", "{}", String::from_utf8_lossy(&r.body));
+        let read = tip_for(&hub, &token, &p.name);
+        let r = land(&api, &token, &p.name, read, json!([put(&format!("src/c/{i}.rs"), "c\n")]), true);
+        assert_eq!(r.json()["state"], "landed", "{}", String::from_utf8_lossy(&r.body));
+    }
+    assert_eq!(walks() - walks0, 0, "a submit on a tip read, or on a landing, asked the graph or walked");
+}

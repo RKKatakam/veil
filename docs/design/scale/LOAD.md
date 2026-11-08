@@ -480,6 +480,34 @@ so read the shape:
 * **The limit is still the object store** (about 14 synced writes per
   landing); packs (S28) are next.
 
+**After the S17 review's second cycle** (2026-11-08, on `integration` @
+`c446dd1`; `docs/BUGS.md` BUG-1110 to 1112, 1270 to 1275; load average 14
+before each point, 24 before the 10,000-agent one, 8 after; `bench16`):
+
+| Agents | Target (/s) | Landed (/s) | p50 (ms) | p99 (ms) | Agents that landed | Landings per batch | Prepare (ms/batch) | Build CPU (ms/landing) | Store objects (ms/batch) | Transaction (ms/batch) | DB commits per landing | DB statements per landing |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,000 | 1,000 | **954** | 184 | **632** | 1,000 | 30.3 | 7.1 | 0.29 | 28.7 | 14.2 | **1.12** | 16.1 |
+| 1,000 | 2,000 | 1,348 (the most) | 3,496 | 5,746 | 1,000 | 64.0 | 4.2 | 0.32 | 51.5 | 14.0 | 1.03 | 12.6 |
+| 10,000 | 1,000 | **927** | 840 | 1,466 | 9,971 | 49.4 | 7.7 | 0.40 | 54.8 | 18.1 | **1.13** | 16.0 |
+
+* **The first re-measurement after the cycle-2 fixes fell to 191/s with
+  1,000 agents and 17/s with 10,000 (BUG-1275).** Every submit of edits now
+  builds its stack (BUG-1112), and asked whether its base is on the branch
+  through the derived graph (waiting for the deriver) or a walk. With
+  10,000 agents on the setup tip and the deriver behind, each first submit
+  queued a database read and a walk on the blocking pool, and starved the
+  service's object writes (982 ms a batch) and the deriver. Now `landings`
+  records each tip a batch moved from too, and a submit's base is found
+  there in one indexed lookup; the graph and the walk are for other bases.
+* **10,000 agents: 927/s at p99 1.47 s, against 820/s at 2.7 s after
+  cycle 1;** 1,000 agents as before (954/s, p99 632 ms). About 4 more
+  statements per landing than cycle 1 (the stack's lookup, the `landings`
+  rows, the already-landed check). The 1 s p99 target is met at 1,000
+  agents, missed at 10,000: batches of about 50 spend 55 ms storing their
+  objects, so the object store is still the limit (packs, S28).
+
+Raw results (not committed): `.scratch/bench-results/server-landing-9f1573e5-20261108T004444Z*` and `…T004755Z*`; the regressed run `…T002111Z*`, `…T002436Z*`.
+
 
 ## What would raise each ceiling (not built)
 
