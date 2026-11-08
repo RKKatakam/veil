@@ -26,6 +26,7 @@ text:
 | [`vl blame`](blame.md) | [`veil.blame/2`](#veilblame2) |
 | [`vl grep`](grep.md) | [`veil.grep/2`](#veilgrep2) |
 | [`vl search`](search.md) | [`veil.search/1`](#veilsearch1) |
+| [`vl stats`](stats.md) | [`veil.health/1`](#veilhealth1) |
 | [`vl duplicate`](duplicate.md), [`vl cherry-pick`](cherry-pick.md) (write commands) | [`veil.duplicate/2`](#veilduplicate2) |
 | [`vl attr check`](attr.md#vl-attr-check) | [`veil.attr-check/1`](#veilattr-check1) |
 | any of them, on failure | [`veil.error/1`](#veilerror1) |
@@ -654,6 +655,33 @@ files you may read and nothing else.
 
 The exit status is 0 when something matched and 1 when nothing did, with
 the document printed either way.
+
+## `veil.health/1`
+
+`vl stats --json`: the server's answer to `GET /v1/projects/{p}/health`
+(`docs/HUB.md` §13.25), as it sent it, for the project's admins only. The
+counts are this server's, for this project only; nothing in it names a
+person, a device, a path or another project.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `veil.health/1` |
+| `project` | string | The project |
+| `server_started_ms` | number | When the server that answered started (unix milliseconds): its counts start then |
+| `since_start` | object | The counts since then (below) |
+| `last_minute` | object | The counts of the last whole minute |
+| `derive` | object | `branches` (the project's branches) and `branches_behind` (those whose derived history is not at their tip yet) |
+
+The counts:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `requests` | number | Requests that named the project |
+| `rate_limited` | number | Refused for their device's or address's rate (`429`) |
+| `busy` | number | Refused `busy` (`503`): shed under load, or the database busy |
+| `timeouts` | number | Request bodies that arrived too slowly (`408`) |
+| `tips_hits`, `tips_misses` | number | Branch tips answered from the server's cache, or read |
+| `permission_hits`, `permission_misses` | number | Permissions answered from the server's cache, or read |
 
 ## `veil.duplicate/2`
 

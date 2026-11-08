@@ -326,6 +326,8 @@ pub async fn landing(hub: &Arc<Hub>, project: i64, branches: Vec<String>) -> Res
     let stats = catch_up(hub, project, Scope::Branches(branches)).await?;
     // Memoising runs on the requests' pool, so under a permit too: at most
     // [`DERIVERS`] of its connections at once (BUG-911).
+    // Derive work is shed second under load (S24): it waits a little.
+    hub.limits.derive_turn().await;
     let permit = hub.derive.permit().await?;
     memo_tips(hub, project, &stats.branches).await?;
     drop(permit);
@@ -421,6 +423,8 @@ async fn locked(hub: &Arc<Hub>, project: i64, scope: Scope) -> Result<Stats> {
     // the lock is (BUG-911): a run waiting for another server's deriver
     // gives both back between tries.
     let (permit, mut c) = loop {
+        // Derive work is shed second under load (S24): it waits a little.
+        hub.limits.derive_turn().await;
         let permit = hub.derive.permit().await?;
         let mut c = hub.derive.db.acquire().await?;
         let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)").bind(key).fetch_one(&mut *c).await?;

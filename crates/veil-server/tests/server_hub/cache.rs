@@ -1714,3 +1714,38 @@ mod s9_cycle2 {
         eprintln!("cache: {batches} random batches and {gets} GETs (4 viewers, 2 projects, skips, ranges) answered as the server answers them");
     }
 }
+
+/// BUG-1332 (S24): what a regional cache forwards for anyone on Earth
+/// counts against the cache's address at the server, as one client's: 40
+/// first reads of public files through a cold cache (40 readers, in a
+/// deployment, each on their own address) at the default anonymous rate
+/// (20 a second) are refused `429` past the burst, and the cache passes it
+/// on.
+#[test]
+#[ignore = "BUG-1332: a regional cache's forwarded requests count against its own address at the server"]
+fn bug_1332_a_caches_forwarded_reads_count_against_its_address() {
+    use veil_server::limits::{bucket::Rate, Settings};
+    let hub = TestHub::start_with_limits(Settings { anonymous: Rate { per_second: 20, per_hour: 100_000 }, ..TestHub::limits() });
+    let p = setup_project(&hub);
+    let files: Vec<(String, String)> = (0..40).map(|i| (format!("src/r{i}.txt"), format!("public {i}"))).collect();
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    write_files(&p.dir, &refs);
+    p.admin.commit_main(&p.dir, "forty public files");
+    p.admin.ok(&p.dir, &["push"]);
+    let server = hub.api();
+    let cache = TestCache::start(&hub, &hub.authority(), 1 << 30);
+    std::thread::sleep(Duration::from_millis(1500));
+    let r = Reader::new(&server, &cache.api, None, &p.name);
+    let root = r.root();
+    let tree = |chain: &[ObjectId], id: &ObjectId| match Object::decode(&r.get(chain, id).body).unwrap() {
+        Object::Tree(t) => t,
+        _ => panic!("not a tree"),
+    };
+    let src = tree(&[], &root).get("src").unwrap().id;
+    let st = tree(&[root], &src);
+    for i in 0..40 {
+        let id = st.get(&format!("r{i}.txt")).unwrap().id;
+        let got = r.get(&[root, src], &id);
+        assert_eq!(got.status, 200, "read {i}: {}", String::from_utf8_lossy(&got.body));
+    }
+}

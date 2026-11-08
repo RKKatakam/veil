@@ -64,3 +64,6 @@ containers = []
 
 [dev-dependencies]
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+# A paused clock for the unit tests of the body time limits (S24): no new
+# crate, a feature of the runtime above.
+tokio = { version = "1.47", features = ["test-util"] }

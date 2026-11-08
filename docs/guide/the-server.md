@@ -29,6 +29,11 @@ to `vl login --ca` once. Objects go to `./hub/objects`, or to S3 with
 `--s3-endpoint URL --s3-bucket NAME` (credentials in `VEIL_S3_ACCESS_KEY` and
 `VEIL_S3_SECRET_KEY`).
 
+Its limits have defaults (`docs/HUB.md` §13.25): `--device-rate 60/5000`
+(a burst a second, the most an hour), `--anonymous-rate 20/1000` per address,
+`--max-connections 1024` and `--request-memory 512M` (all request bodies
+held at once).
+
 ## Signing in
 
 Your device signs in with its identity key (the one `vl identity show`
@@ -349,6 +354,24 @@ You find only what you may see: a folder you cannot see is never found,
 counted or ranked, and a secret file (`.env`) is found by its name, never by
 what it holds. A branch just pushed takes a moment to be indexed; `vl
 search` waits for it.
+
+## The project's health, and the server's limits
+
+As an admin, `vl stats` shows what the server did for the project since it
+started (and over the last minute): requests, how many were refused for
+going too fast (`429`) or shed under load (`busy`), cache hits, and how far
+the derived history lags. Only the project's admins see it.
+
+```
+vl stats
+vl stats --json      # the server's answer (veil.health/1)
+```
+
+Each device may send a burst of 60 requests a second within 5,000 an hour;
+requests without a session (anyone on Earth, sign-in) 20 a second within
+1,000 an hour per address. Past it the server answers `429` and says when to
+come back. One busy project never slows another: each runs at most half of
+the server's database connections at once.
 
 ## What someone without access sees
 

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::{attr_cmd, history, hooks, rewrite_cmd, search_cmd};
+use crate::{attr_cmd, history, hooks, rewrite_cmd, search_cmd, stats_cmd};
 
 /// `vl -V`: version, the commit it was built from and the repository format
 /// it reads and writes.
@@ -300,6 +300,14 @@ pub enum Cmd {
     /// found by name, never by content. Every word must occur (in any
     /// case). Exits 1 when nothing matches.
     Search(search_cmd::SearchArgs),
+    /// Show the project's health on its Veil server (admins only): requests
+    /// and refusals, cache hits and how far derived history lags.
+    ///
+    /// The counts are the server's (`origin`) since it started and over the
+    /// last whole minute, for this project only; with several servers, each
+    /// counts what it served. Only the project's admins may see them, since
+    /// they include work by people and on folders others cannot see.
+    Stats(stats_cmd::StatsArgs),
     /// Find the change that introduced a problem by binary search.
     ///
     /// `start` checks out the first candidate (as `vl new` does); mark each
@@ -795,6 +803,7 @@ impl Cmd {
             | Cmd::Blame(history::BlameArgs { out, .. })
             | Cmd::Grep(history::GrepArgs { out, .. })
             | Cmd::Search(search_cmd::SearchArgs { out, .. })
+            | Cmd::Stats(stats_cmd::StatsArgs { out })
             | Cmd::Duplicate(rewrite_cmd::DuplicateArgs { out, .. })
             | Cmd::CherryPick(rewrite_cmd::CherryPickArgs { out, .. })
             | Cmd::Attr(attr_cmd::AttrArgs { cmd: attr_cmd::AttrCmd::Check { out, .. } }) => out,

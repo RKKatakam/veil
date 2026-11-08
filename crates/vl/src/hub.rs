@@ -747,6 +747,12 @@ impl Client {
         self.json("POST", &self.url.project_path("/shares/remove"), Some(&req))
     }
 
+    /// The project's health metrics (`GET …/health`, admins only; S24,
+    /// `docs/HUB.md` §13.25).
+    pub fn health(&self) -> Result<serde_json::Value> {
+        self.json("GET", &self.url.project_path("/health"), None::<&()>)
+    }
+
     /// A query route (`GET …/q/ROUTE?PARAMS`, `docs/HUB.md` §13.23): its
     /// JSON answer, or the server's error code and message.
     pub fn query(&self, route: &str, params: &[(&str, String)]) -> Result<std::result::Result<serde_json::Value, (String, String)>> {

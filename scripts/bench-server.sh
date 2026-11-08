@@ -9,6 +9,7 @@
 #   scripts/bench-server.sh openscion   # the four OpenScion workloads, 1k and 10k files, Git beside
 #   scripts/bench-server.sh load        # the server's load curves (docs/design/scale/LOAD.md)
 #   scripts/bench-server.sh cache       # reads through a regional cache and straight from the server (S9)
+#   scripts/bench-server.sh limits      # S24: quiet pulls (the middleware's cost), and quiet projects beside a flooded one
 #   scripts/bench-server.sh 1g -- --runs 5   # extra veil-bench flags
 #
 # Environment:
@@ -32,8 +33,8 @@ if [[ "${1:-}" == "--" ]]; then
 fi
 EXTRA=("$@")
 case "$PROFILE" in
-    tiny|small|1g|5g|openscion|load|cache) ;;
-    *) echo "usage: $0 [tiny|small|1g|5g|openscion|load|cache] [-- veil-bench flags]" >&2; exit 2 ;;
+    tiny|small|1g|5g|openscion|load|cache|limits) ;;
+    *) echo "usage: $0 [tiny|small|1g|5g|openscion|load|cache|limits] [-- veil-bench flags]" >&2; exit 2 ;;
 esac
 
 STEP_LIMIT=${STEP_LIMIT:-3600}
@@ -139,6 +140,17 @@ case "$PROFILE" in
         # many agents into one main with the server rebasing.
         run "${L[@]}" --dir "$WORK/api" --mode api --projects 1,10,100 --clients 1 --rates max --out "${OUT%.json}-api.json" "${EXTRA[@]}" || status=$?
         run "${L[@]}" --dir "$WORK/api-hot" --mode api --projects 1 --clients 50 --rates 20,50,100,max --out "${OUT%.json}-api-hot.json" "${EXTRA[@]}" || status=$?
+        ;;
+    limits)
+        # S24 (docs/HUB.md §13.25): up-to-date pulls, whose cost is mostly
+        # the request path (the middleware's cost per request: compare with
+        # SERVER_BIN set to a build without it); then 10 quiet agents on 2
+        # projects beside 0, 200 and 1,000 agents flooding a third.
+        L=("$BENCH" load "${SERVER_ARGS[@]}" --db-container "$PG_ID" --duration 15 --mode pull --background 0)
+        run "${L[@]}" --dir "$WORK/quiet" --projects 1 --clients 10,100 --out "${OUT%.json}-quiet.json" "${EXTRA[@]}" || status=$?
+        for f in 0 200 1000; do
+            run "${L[@]}" --dir "$WORK/flood-$f" --projects 2 --clients 10 --flood "$f" --out "${OUT%.json}-flood-$f.json" "${EXTRA[@]}" || status=$?
+        done
         ;;
     cache)
         # Fresh thin workspaces reading through a regional cache, and

@@ -4,6 +4,8 @@
 //! veil-server --database-url postgres://… --data ./hub [--listen 127.0.0.1:8443]
 //!             [--storage DIR | --s3-endpoint URL --s3-bucket B]
 //!             [--tls-cert cert.pem --tls-key key.pem]   (default: self-signed)
+//!             [--device-rate 60/5000] [--anonymous-rate 20/1000]
+//!             [--max-connections 1024] [--request-memory 512M]   (docs/HUB.md §13.25)
 //! veil-server migrate --database-url postgres://…   (apply migrations, then exit)
 //! veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
 //!             [--listen 127.0.0.1:8444] [--size 10G] [--memory 128M] [--max-connections 1024]
@@ -57,6 +59,26 @@ struct Args {
     /// more of its own).
     #[arg(long, default_value_t = 32)]
     db_connections: u32,
+    /// Requests per signed-in device: a burst a second, then the most an
+    /// hour (`429` with `retry_after_ms` past it).
+    #[arg(long, default_value = "60/5000", value_parser = rate)]
+    device_rate: veil_server::limits::bucket::Rate,
+    /// Requests per address without a session this server knows
+    /// (anonymous reads of public folders, sign-in), as --device-rate.
+    #[arg(long, default_value = "20/1000", value_parser = rate)]
+    anonymous_rate: veil_server::limits::bucket::Rate,
+    /// Most client connections open at once (the next waits until one
+    /// closes; one address opens at most an eighth of them).
+    #[arg(long, default_value_t = 1024)]
+    max_connections: usize,
+    /// Most bytes of request bodies held at once, all requests together
+    /// (K, M, G suffixes); an eighth of it for requests without a session.
+    #[arg(long, default_value = "512M", value_parser = bytes)]
+    request_memory: u64,
+}
+
+fn rate(s: &str) -> Result<veil_server::limits::bucket::Rate, String> {
+    veil_server::limits::bucket::Rate::parse(s)
 }
 
 #[derive(Subcommand)]
@@ -199,6 +221,12 @@ async fn serve() -> anyhow::Result<()> {
         session_ttl: Duration::from_secs(a.session_seconds),
         db_connections: a.db_connections,
         catch_up_at_start: true,
+        limits: veil_server::limits::Settings {
+            device: a.device_rate,
+            anonymous: a.anonymous_rate,
+            max_connections: a.max_connections,
+            request_memory: a.request_memory,
+        },
     })
     .await?;
     println!("veil-server listening on https://{}", running.addr);
