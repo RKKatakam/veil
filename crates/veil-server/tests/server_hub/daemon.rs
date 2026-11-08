@@ -299,6 +299,15 @@ fn real_chains(dir: &Path) -> Vec<(String, Vec<ObjectId>, ObjectId)> {
 
 // ---- 1. only what a grant reaches ---------------------------------------------------
 
+/// A refusal asserted exactly: a whole answer, nothing from the store, and
+/// the server's own `401` passed on (a closed connection would also send
+/// no object).
+fn refused(end: Option<serde_json::Value>, what: &str) {
+    let end = end.unwrap_or_else(|| panic!("{what}: the daemon's answer is unfinished"));
+    assert!(end.get("from_store").is_none(), "{what}: answered from the store: {end}");
+    assert_eq!(end["status"], 401, "{what}: not the server's refusal: {end}");
+}
+
 /// Guarantee 1: the admin's daemon holds every object of the project; each
 /// viewer asking it with their own grant (and every chain they can build,
 /// the admin's real ones included) receives exactly what the server sends
@@ -390,23 +399,28 @@ fn the_daemon_serves_only_what_the_server_would() {
     let mut wider = body.clone();
     wider.root = admin_root;
     let tampered = format!("{}.{}", hex::encode(serde_json::to_vec(&wider).unwrap()), dev.grant.split_once('.').unwrap().1);
-    let (got, _) = dev.batch_as(&tampered, dev.id.as_ref(), &[(Vec::new(), admin_root)]);
+    let (got, end) = dev.batch_as(&tampered, dev.id.as_ref(), &[(Vec::new(), admin_root)]);
     assert!(got.is_empty(), "a wider root under the grant's signature");
+    refused(end, "a wider root under the grant's signature");
     let by_identity = {
         let raw = serde_json::to_vec(&wider).unwrap();
         format!("{}.{}", hex::encode(&raw), hub.hub().identity.sign(veil_core::crypto::domains::SIG_CONTEXT_HUB_GRANT, &raw))
     };
-    let (got, _) = dev.batch_as(&by_identity, dev.id.as_ref(), &[(Vec::new(), admin_root)]);
+    let (got, end) = dev.batch_as(&by_identity, dev.id.as_ref(), &[(Vec::new(), admin_root)]);
     assert!(got.is_empty(), "a grant signed by the server's identity key");
+    refused(end, "a grant signed by the server's identity key");
     let expired = hub.hub().grants.issue(&veil_core::hub::grant::GrantBody { expires: veil_core::now_millis() - 1, ..body.clone() });
-    let (got, _) = dev.batch_as(&expired, dev.id.as_ref(), &[(Vec::new(), dev.root())]);
+    let (got, end) = dev.batch_as(&expired, dev.id.as_ref(), &[(Vec::new(), dev.root())]);
     assert!(got.is_empty(), "an expired grant");
+    refused(end, "an expired grant");
     let stale = hub.hub().grants.issue(&veil_core::hub::grant::GrantBody { epoch: body.epoch + 1, ..body.clone() });
-    let (got, _) = dev.batch_as(&stale, dev.id.as_ref(), &[(Vec::new(), dev.root())]);
+    let (got, end) = dev.batch_as(&stale, dev.id.as_ref(), &[(Vec::new(), dev.root())]);
     assert!(got.is_empty(), "a grant of other epochs");
+    refused(end, "a grant of other epochs");
     let other = Reader { project: unique("other"), ..Reader::new(&server, &d.socket, &hub.authority(), Some(&p.dev), &p.name) };
-    let (got, _) = other.batch_as(&other.grant, other.id.as_ref(), &[(Vec::new(), dev.root())]);
+    let (got, end) = other.batch_as(&other.grant, other.id.as_ref(), &[(Vec::new(), dev.root())]);
     assert!(got.is_empty(), "a grant of another project (nothing, from the store or not)");
+    refused(end, "a grant of another project");
 
     // Hostile requests: refused cleanly, and the daemon keeps serving.
     for bad in [
@@ -574,16 +588,30 @@ fn the_daemon_fails_closed_without_the_server() {
     eprintln!("daemon: fail-closed checked; serving again {back:?} after the server returned");
 }
 
-/// How many rows the server's state tables hold: a request that changes
-/// nothing on the server leaves every count as it was.
-fn state_counts(hub: &TestHub) -> Vec<(&'static str, i64)> {
-    ["audit_log", "access_epochs", "sessions", "devices", "projections", "snapshots", "branches"]
-        .into_iter()
-        .map(|t| {
-            let n: i64 = hub.rt.block_on(sqlx::query_scalar(&format!("SELECT count(*) FROM {t}")).fetch_one(&hub.hub().db)).unwrap();
-            (t, n)
-        })
-        .collect()
+/// The server's state of `project` and of the person of device `device`
+/// (their rows, as text): a request that changes nothing on the server
+/// leaves it as it was. Scoped to them: the suite's other tests share the
+/// database.
+fn server_state(hub: &TestHub, project: &str, device: &str) -> Vec<(&'static str, String)> {
+    let db = &hub.hub().db;
+    let pid: i64 = hub.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(project).fetch_one(db)).unwrap();
+    let person: i64 = hub.rt.block_on(sqlx::query_scalar("SELECT person_id FROM devices WHERE signing_key = $1").bind(device).fetch_one(db)).unwrap();
+    [
+        ("audit_log", "project_id = $1 OR actor = $2"),
+        ("access_epochs", "project_id = $1 OR person_id = $2"),
+        ("sessions", "person_id = $2 AND $1 = $1"),
+        ("devices", "person_id = $2 AND $1 = $1"),
+        ("projections", "project_id = $1 AND $2 = $2"),
+        ("snapshots", "project_id = $1 AND $2 = $2"),
+        ("branches", "project_id = $1 AND $2 = $2"),
+    ]
+    .into_iter()
+    .map(|(t, w)| {
+        let q = format!("SELECT coalesce(string_agg(t::text, '|' ORDER BY t::text), '') FROM {t} t WHERE {w}");
+        let rows: String = hub.rt.block_on(sqlx::query_scalar(&q).bind(pid).bind(person).fetch_one(db)).unwrap();
+        (t, rows)
+    })
+    .collect()
 }
 
 /// Guarantee 3 (the resend the daemon renews its confirmations with,
@@ -619,13 +647,17 @@ fn a_resent_request_changes_nothing_and_holds_no_longer_than_the_access() {
     assert_eq!(r.frames(), vec![(id, raw.clone())]);
     // Sent again with every object skipped: nothing, and no state changes.
     let resent = BatchRequest { skip: vec![id], ..recorded.clone() };
-    let before = state_counts(&hub);
+    let device = g.body.device.clone().expect("fin's grant names a device");
+    let before = server_state(&hub, &p.name, &device);
+    for t in ["sessions", "devices", "snapshots", "branches"] {
+        assert!(before.iter().any(|(n, rows)| *n == t && !rows.is_empty()), "no {t} rows to compare: {before:?}");
+    }
     for _ in 0..20 {
         let r = send(&resent);
         assert_eq!(r.status, 200, "a resend within the window is accepted");
         assert!(r.frames().is_empty(), "a resend with every object skipped returns an object");
     }
-    assert_eq!(state_counts(&hub), before, "resends changed the server's state");
+    assert_eq!(server_state(&hub, &p.name, &device), before, "resends changed the server's state");
     // Widened under the recorded signature: refused.
     let admin_root = real_chains(&p.dir)[0].2;
     for (what, wants) in [
