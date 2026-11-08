@@ -3,7 +3,9 @@
 //! request waits for its project's gate, then the server's, each for at
 //! most its class's wait; a free place goes to the waiting landings first,
 //! then pulls, then search and grep, so under overload search is shed
-//! first and landings last (design §4.11).
+//! first and landings last (design §4.11). A pull that has waited
+//! [`AGE`] goes before landings: a steady stream of them never starves the
+//! pulls agents need to land again (S24 cycle 2).
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -26,6 +28,9 @@ pub enum Class {
     Write = 2,
 }
 
+/// How long a pull waits before it goes ahead of newer landings.
+pub const AGE: Duration = Duration::from_secs(1);
+
 impl Class {
     /// The longest a request of the class waits for a place.
     pub fn wait(self) -> Duration {
@@ -41,7 +46,7 @@ impl Class {
 struct State {
     running: usize,
     /// Waiting requests by class, each with its ticket.
-    queues: [VecDeque<(u64, oneshot::Sender<()>)>; 3],
+    queues: [VecDeque<(u64, oneshot::Sender<()>, tokio::time::Instant)>; 3],
     next: u64,
 }
 
@@ -84,16 +89,20 @@ impl Gate {
         let (tx, rx) = oneshot::channel();
         let t = s.next;
         s.next += 1;
-        s.queues[class as usize].push_back((t, tx));
+        s.queues[class as usize].push_back((t, tx, tokio::time::Instant::now()));
         Enter::Wait(t, rx)
     }
 
-    /// Give a place back: to the first waiting landing, else pull, else
-    /// search; `true` if the gate is now idle.
+    /// Give a place back: to a pull that has waited [`AGE`], else the
+    /// first waiting landing, else pull, else search; `true` if the gate is
+    /// now idle.
     fn leave(&self) -> bool {
         let mut s = self.state.lock().unwrap();
-        for c in (0..3).rev() {
-            while let Some((_, tx)) = s.queues[c].pop_front() {
+        let read = Class::Read as usize;
+        let aged = s.queues[read].front().is_some_and(|(_, _, at)| at.elapsed() >= AGE);
+        let order: &[usize] = if aged { &[read, 2, 1, 0] } else { &[2, 1, 0] };
+        for &c in order {
+            while let Some((_, tx, _)) = s.queues[c].pop_front() {
                 if tx.send(()).is_ok() {
                     return false;
                 }
@@ -141,7 +150,7 @@ impl Ticket {
         }
         let mut s = self.gate.state.lock().unwrap();
         let q = &mut s.queues[self.class as usize];
-        let got = match q.iter().position(|(t, _)| *t == self.id) {
+        let got = match q.iter().position(|(t, _, _)| *t == self.id) {
             Some(i) => {
                 q.remove(i);
                 false
@@ -159,7 +168,7 @@ impl Drop for Ticket {
         let Some(mut rx) = self.rx.take() else { return };
         let mut s = self.gate.state.lock().unwrap();
         let q = &mut s.queues[self.class as usize];
-        if let Some(i) = q.iter().position(|(t, _)| *t == self.id) {
+        if let Some(i) = q.iter().position(|(t, _, _)| *t == self.id) {
             q.remove(i);
             return;
         }
@@ -374,5 +383,30 @@ mod tests {
         gave_up.sort_by_key(|(_, _, at)| *at);
         assert_eq!(gave_up.iter().map(|(c, got, _)| (*c, *got)).collect::<Vec<_>>(), vec![(Class::Search, false), (Class::Read, false), (Class::Write, false)]);
         assert_eq!(g.load(), (1, 0), "no waiter left behind");
+    }
+
+    /// A pull that has waited [`AGE`] goes before a newer landing: a steady
+    /// stream of landings does not starve pulls.
+    #[tokio::test(start_paused = true)]
+    async fn a_pull_that_waited_goes_before_newer_landings() {
+        let g = Gate::new(1);
+        let held = g.place(Class::Write, soon(10)).await.unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for (c, after) in [(Class::Read, 0), (Class::Write, 1500)] {
+            let (g, order) = (g.clone(), order.clone());
+            tasks.push(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(after)).await;
+                let p = g.place(c, soon(30_000)).await.unwrap();
+                order.lock().unwrap().push(c);
+                drop(p);
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        drop(held);
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), vec![Class::Read, Class::Write]);
     }
 }

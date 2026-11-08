@@ -2946,8 +2946,10 @@ Every request passes through `limits::admit` before any route, in this order:
    and exist only while a request is in or waiting; routes of no project
    share one. A gate has a queue per class and hands a free place to the
    **landings first** (`push`, `changes`, uploads, every other change),
-   then pulls and reads, then **search and grep last**; a request waits at
-   most 20 s, 10 s and 1 s by class (landings, pulls, search), then
+   then pulls and reads, then **search and grep last**, except that a pull
+   that has waited 1 s goes before newer landings (a steady stream of
+   landings never starves the pulls agents need to land again); a request
+   waits at most 20 s, 10 s and 1 s by class (landings, pulls, search), then
    `503 busy` with `retry_after_ms` (0.5–1.5 s, jittered). **Shedding
    order** (design §4.11): search and grep give up first, then **derive
    work** (a derive run waits while requests wait for the server's gate, at
@@ -3076,7 +3078,7 @@ cycle 1 review's findings in rows 13 to 21):
 | 5 | Anyone | made-up session tokens or grants, to get fresh buckets | a token not known here is looked up under the address's rate of lookups and, not a session, pays the address; a grant counts for its device only if its signature verifies | same |
 | 6 | A refused client | reads its refusal for projects it cannot see, or that do not exist | the same answer, naming nothing but its own wait | same |
 | 7 | A runaway agent, or a project's crowd | floods one project | that project runs at most three quarters of the connections; another project's p99 stays put (1.1 ms alone, 1.3 ms beside 64 flooding clients) | `a_flooded_project_does_not_starve_a_quiet_one` |
-| 8 | — (overload) | more requests than the server can run | search and grep shed first, derive pauses (at most 10 s a run), pulls next, landings last | `gate::tests::landings_are_let_in_first_and_search_last`, `…::search_is_shed_first_and_landings_last`, `limits::tests::derive_work_waits_while_the_server_sheds_but_not_for_ever` |
+| 8 | — (overload) | more requests than the server can run | search and grep shed first, derive pauses (at most 10 s a run), pulls next, landings last; a pull that waited 1 s goes before newer landings | `gate::tests::landings_are_let_in_first_and_search_last`, `…::search_is_shed_first_and_landings_last`, `…::a_pull_that_waited_goes_before_newer_landings`, `limits::tests::derive_work_waits_while_the_server_sheds_but_not_for_ever` |
 | 9 | A client that goes away while waiting for a place | (a cancelled wait) | its place is never lost: a place handed over just then is given back | `gate::tests::*` (the `Ticket` drop) |
 | 10 | A member, someone outside, anyone on Earth | reads a project's health | `403`, the not-found answer for a hidden project, `401`; an admin's answer counts this project's requests only and names nothing | `health_metrics_are_for_admins_only_and_name_nothing_hidden` |
 | 11 | A client within its limits | its burst at once, then 40/s; sign-in from one address | never refused | `a_client_within_its_limits_is_never_refused`; `bucket::tests::a_client_within_its_rate_is_never_refused` |
