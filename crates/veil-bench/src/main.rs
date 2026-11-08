@@ -22,6 +22,7 @@
 
 mod agents;
 mod content;
+mod daemon;
 mod gen;
 mod load;
 mod openscion;
@@ -93,6 +94,28 @@ enum Cmd {
         #[arg(long)]
         dir: PathBuf,
         /// Repository sizes, in 4 KiB files.
+        #[arg(long, value_delimiter = ',', default_value = "1000,10000")]
+        files: Vec<usize>,
+        /// Repetitions per case (the median is reported).
+        #[arg(long, default_value_t = 5)]
+        runs: usize,
+        /// Results JSON (a Markdown table is written beside it).
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// The Veil daemon's numbers (S6; design §4.8): a fresh workspace's
+    /// first trees and a thin clone, with no daemon, a cold one and a warm
+    /// one.
+    Daemon {
+        /// The `vl` binary (a release build).
+        #[arg(long)]
+        vl: PathBuf,
+        #[command(flatten)]
+        server: server::ServerArgs,
+        /// Bench directory (created; everything is written below it).
+        #[arg(long)]
+        dir: PathBuf,
+        /// Project sizes, in 4 KiB files.
         #[arg(long, value_delimiter = ',', default_value = "1000,10000")]
         files: Vec<usize>,
         /// Repetitions per case (the median is reported).
@@ -368,6 +391,14 @@ fn main() -> Result<()> {
             if !missed.is_empty() {
                 return Err(anyhow!("cost gates missed (docs/design/server/storage-and-cost.md §9):\n  {}", missed.join("\n  ")));
             }
+            Ok(())
+        }
+        Cmd::Daemon { vl, server, dir, files, runs, out } => {
+            let v = daemon::run_all(&daemon::Args { vl, server, dir, sizes: files, runs })?;
+            std::fs::write(&out, serde_json::to_vec_pretty(&v)?)?;
+            let md = daemon::markdown(&v)?;
+            std::fs::write(out.with_extension("md"), &md)?;
+            print!("{md}");
             Ok(())
         }
         Cmd::OpenscionMemory { files, runs, out } => {

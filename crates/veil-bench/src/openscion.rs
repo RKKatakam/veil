@@ -83,7 +83,7 @@ fn files_of(files: usize, seed: u64) -> Vec<(String, String)> {
 }
 
 /// A repository of `files` 4 KiB files in directories of 100.
-fn generate(dir: &Path, files: usize, seed: u64) -> Result<()> {
+pub(crate) fn generate(dir: &Path, files: usize, seed: u64) -> Result<()> {
     for (path, body) in files_of(files, seed) {
         let p = dir.join(path);
         std::fs::create_dir_all(p.parent().expect("in a directory"))?;

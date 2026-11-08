@@ -84,6 +84,7 @@ Global options (accepted by every command):
 | [`vl push`](push.md) | Send tags and their history to the Veil server, which moves each branch only if nobody moved it meanwhile (and checks your access) |
 | [`vl pull`](pull.md) | Fetch tags and history from the Veil server: what you may see |
 | [`vl partial`](partial.md) | A thin clone: what it holds, the bound of its object cache, and fetching everything (`vl partial full`) |
+| [`vl daemon`](daemon.md) | The Veil daemon: one object cache shared by every thin clone on this machine (it runs by default; `vl daemon stop` turns it off) |
 | [`vl hooks`](hooks.md) | Hooks run before commits and pushes; repository-suggested ones only once this device trusts them (not implemented yet) |
 | [`vl gc`](gc.md) | Pack objects and delete those no retained operation can reach |
 | [`vl doctor`](doctor.md) | Check this machine's setup and explain every problem found: identity, VEIL_HOME, the repository and its lock, the stat cache, the filesystem (case sensitivity, fsync, network mounts), the clock, the vault and leftover sandboxes. Exits 1 if anything is broken |
