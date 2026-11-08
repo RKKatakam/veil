@@ -584,7 +584,7 @@ fn check_model(cmds: &[Cmd], repo: &Repo, losers: &std::collections::HashSet<Obj
     let refs = view.refs();
     // Visible as a ref or below one; or, moved by a concurrent rewrite (an
     // amend, the rebase onto one, BUG-1299), as its change.
-    let changes: std::collections::HashSet<_> = repo.visible_snapshots().unwrap().iter().map(|s| repo.snapshot(s).unwrap().change_id).collect();
+    let changes: std::collections::HashSet<_> = repo.exact().visible().unwrap().iter().map(|s| repo.snapshot(s).unwrap().change_id).collect();
     let visible = |v: &ObjectId| refs.iter().any(|r| r == v || repo.is_ancestor(v, r).unwrap()) || repo.snapshot(v).is_ok_and(|s| changes.contains(&s.change_id));
     // A value a command's rewrite moved (BUG-1299: the other side's
     // rewrite applies): its replacement, or for an abandoned working copy
@@ -1046,7 +1046,8 @@ fn check_rewrites_follow_through_merges(disk: bool, nw: usize, undo: bool, steps
                 // Describe a visible commit (not a working copy).
                 let wcs: Vec<ObjectId> = repo.view().workspaces.values().map(|w| w.wc).collect();
                 let cands: Vec<ObjectId> = repo
-                    .visible_snapshots()
+                    .exact()
+                    .visible()
                     .unwrap()
                     .into_iter()
                     .filter(|s| *s != repo.root_id() && !wcs.contains(s))

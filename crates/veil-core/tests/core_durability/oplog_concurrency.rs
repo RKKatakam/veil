@@ -944,7 +944,7 @@ fn describe_racing_a_commit_on_it_moves_the_commit() {
     let r = open(&fs, &id);
     assert_merged(&r, 2);
     let change = r.snapshot(&y).unwrap().change_id;
-    let ys: Vec<ObjectId> = r.visible_snapshots().unwrap().into_iter().filter(|s| r.snapshot(s).unwrap().description.as_str() == "y").collect();
+    let ys: Vec<ObjectId> = r.exact().visible().unwrap().into_iter().filter(|s| r.snapshot(s).unwrap().description.as_str() == "y").collect();
     assert_eq!(ys.len(), 1, "one commit y");
     assert_eq!(r.snapshot(&ys[0]).unwrap().change_id, change);
     assert_eq!(r.snapshot(&ys[0]).unwrap().parents, vec![x2], "y is on the described x");
