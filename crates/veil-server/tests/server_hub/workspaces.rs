@@ -385,3 +385,92 @@ fn bug_1360_a_rules_rescan_fetches_the_whole_thin_workspace() {
     let after = cached(&thin).1;
     assert!(after - before < SMALL, "the recording fetched {} files of the workspace", after - before);
 }
+
+/// §4.8's numbers: a fresh workspace on a branch this thin clone never
+/// fetched, mounted, to the first `ls` and `cat` ("ready"), cold (nothing of
+/// the branch fetched) and warm (mounted again); and reading 1,000 files of
+/// 10 folders cold. `S8_BENCH_FILES` (default `2000,50000`): the branch's
+/// files, 100 a folder. Run through `bench-quiet.sh`, with a release `vl`.
+#[test]
+#[ignore = "benchmark: S8_BENCH_FILES, run by hand through bench-quiet.sh"]
+fn s8_bench_ready_to_read() {
+    use std::time::Instant;
+    let sizes: Vec<usize> = std::env::var("S8_BENCH_FILES")
+        .unwrap_or_else(|_| "2000,50000".into())
+        .split(',')
+        .map(|s| s.trim().parse().unwrap())
+        .collect();
+    let hub = TestHub::start();
+    let ms = |t: Instant| format!("{:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+    for n in sizes {
+        let admin = hub.person("admin");
+        let name = unique("bench");
+        let dir = admin.dir("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        admin.ok(&dir, &["init"]);
+        write_files(&dir, &[("README.md", "bench\n")]);
+        admin.ok(&dir, &["remote", "add", "origin", &hub.url(&name)]);
+        admin.commit_main(&dir, "first");
+        admin.ok(&dir, &["push"]);
+        for i in 0..n {
+            let p = dir.join(format!("wide/d{:04}/f{:02}.txt", i / 100, i % 100));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, format!("file {i} {}\n", "x".repeat(200))).unwrap();
+        }
+        let t = Instant::now();
+        admin.ok(&dir, &["commit", "--no-advance", "-m", "wide"]);
+        admin.ok(&dir, &["tag", "set", "feature", "-r", "@-"]);
+        admin.ok(&dir, &["push"]);
+        eprintln!("[{n} files] import and push: {}", ms(t));
+        let thin = admin.dir("thin");
+        let t = Instant::now();
+        admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+        eprintln!("[{n} files] thin clone (main only): {}", ms(t));
+        // Cold: nothing of `feature` is in the clone.
+        let t0 = Instant::now();
+        admin.ok(&thin, &["ws", "new", "agent", "-r", "feature"]);
+        let t_new = ms(t0);
+        let t1 = Instant::now();
+        let m = Mounted::new(&admin, &thin, "agent");
+        let t_mount = ms(t1);
+        let t2 = Instant::now();
+        let top = std::fs::read_dir(m.dir.join("wide")).unwrap().count();
+        let t_ls = ms(t2);
+        let t3 = Instant::now();
+        let first = std::fs::read(m.dir.join("wide/d0000/f00.txt")).unwrap();
+        let t_cat = ms(t3);
+        assert!(first.starts_with(b"file 0 ") && top == n.div_ceil(100));
+        eprintln!("[{n} files] cold: ws new {t_new}, mount {t_mount}, ls wide/ ({top} folders) {t_ls}, first cat {t_cat}; ready {}", ms(t0));
+        // 1,000 files of 10 folders, cold.
+        let t4 = Instant::now();
+        let mut bytes = 0;
+        for d in 1..=10.min(n / 100 - 1) {
+            for f in 0..100 {
+                bytes += std::fs::read(m.dir.join(format!("wide/d{d:04}/f{f:02}.txt"))).unwrap().len();
+            }
+        }
+        eprintln!("[{n} files] read {} files of 10 folders cold: {} ({bytes} bytes)", 10.min(n / 100 - 1) * 100, ms(t4));
+        m.unmount();
+        // Warm: the same workspace mounted again.
+        let t5 = Instant::now();
+        let m = Mounted::new(&admin, &thin, "agent");
+        let _ = std::fs::read_dir(m.dir.join("wide")).unwrap().count();
+        let again = std::fs::read(m.dir.join("wide/d0000/f00.txt")).unwrap();
+        assert_eq!(again, first);
+        eprintln!("[{n} files] warm: mount, ls, cat: ready {}", ms(t5));
+        m.unmount();
+        // A whole run: `vl ws exec --mount` reading one file, cold and warm.
+        admin.ok(&thin, &["ws", "new", "agent2", "-r", "feature"]);
+        for which in ["cold", "warm"] {
+            let f = if which == "cold" { "wide/d0011/f00.txt" } else { "wide/d0000/f00.txt" };
+            let t6 = Instant::now();
+            let o = admin.ok(&thin, &["ws", "exec", "agent2", "--mount", "--", "cat", f]);
+            assert!(o.contains("file "), "{o}");
+            eprintln!("[{n} files] ws exec --mount -- cat ({which}): {}", ms(t6));
+        }
+        let t7 = Instant::now();
+        let o = admin.ok(&thin, &["ws", "exec", "agent2", "--", "true"]);
+        let _ = o;
+        eprintln!("[{n} files] ws exec (checked out, the fallback): first run {}", ms(t7));
+    }
+}

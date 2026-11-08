@@ -29,6 +29,8 @@ struct T {
     env: Env,
     proj: PathBuf,
     home: PathBuf,
+    /// A runtime directory of this test's own, short enough for sockets.
+    runtime: tempfile::TempDir,
 }
 
 impl T {
@@ -38,13 +40,21 @@ impl T {
         env.ok("alice", &proj, &["ws", "new", "agent", "-r", "@-"]);
         env.ok("alice", &proj, &["ws", "new", "other", "-r", "@-"]);
         let home = env.dir("fakehome");
-        T { env, proj, home }
+        let short = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|d| d.is_dir()).unwrap_or_else(|| PathBuf::from("/tmp"));
+        let runtime = tempfile::Builder::new().prefix("vt-").tempdir_in(short).unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        T { env, proj, home, runtime }
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
         let mut c = self.env.cmd("alice", &self.proj, args);
-        c.env("HOME", &self.home).stdin(Stdio::null());
+        c.env("HOME", &self.home).env("XDG_RUNTIME_DIR", self.runtime()).stdin(Stdio::null());
         c
+    }
+
+    /// This test's own runtime directory (where runs keep their sockets).
+    fn runtime(&self) -> PathBuf {
+        self.runtime.path().to_path_buf()
     }
 
     fn exec(&self, flags: &[&str], script: &str) -> Output {
@@ -286,25 +296,27 @@ print("SOCKET", path)
     assert_eq!(res["escape"][0], serde_json::json!(0), "{res}");
     assert_eq!(res["ok"][0], serde_json::json!(0), "{res}");
     assert!(res["ok"][1].as_str().unwrap().contains("Workspace    : agent"), "{res}");
-    // After the run, no socket is left on the host.
+    // After the run, no socket is left on the host (this test's runs keep
+    // theirs in a runtime directory of their own).
     let inside = stdout.lines().find_map(|l| l.strip_prefix("SOCKET ")).unwrap().to_string();
     assert_eq!(inside, "/run/veil/workspace.sock");
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|d| d.is_dir()).unwrap_or_else(|| t.env.dir("tmp"));
-    let left: Vec<_> = std::fs::read_dir(&runtime)
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with("veil-ws-") && e.path().join("sock").exists())
-        .filter(|e| {
-            // Ours: the server's directory names the vl process, which ended.
-            let pid = e.file_name().to_string_lossy().split('-').nth(2).and_then(|p| p.parse::<u32>().ok());
-            pid.is_some_and(|p| !Path::new(&format!("/proc/{p}")).exists())
-        })
-        .collect();
-    assert!(left.is_empty(), "sockets of ended runs are left: {left:?}");
+    let left = |t: &T| std::fs::read_dir(t.runtime()).unwrap().flatten().map(|e| e.path()).collect::<Vec<_>>();
+    assert_eq!(left(&t), Vec::<PathBuf>::new(), "a socket outlived its run");
     // From the host, an unconfined run's socket answers only while it runs.
     let o = t.ok(&["--unconfined"], "echo $VEIL_WORKSPACE_SOCKET");
     let host_path = PathBuf::from(o.trim());
-    assert!(host_path.is_absolute());
+    assert!(host_path.starts_with(t.runtime()), "{o}");
+    // A `vl` killed in the middle of a run leaves its socket's directory;
+    // the next run removes it.
+    let mut c = t.cmd(&["ws", "exec", "agent", "--", "sh", "-c", "touch started; sleep 60"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    assert!(wait_for(std::time::Duration::from_secs(20), || t.cat("agent", "started").is_some() || t.proj.join(".veil/local/sandboxes/agent/files/started").exists()));
+    unsafe {
+        libc::kill(c.id() as i32, libc::SIGKILL);
+    }
+    let _ = c.wait();
+    assert!(!left(&t).is_empty(), "the killed run's socket directory");
+    t.ok(&[], "rm -f started");
+    assert_eq!(left(&t), Vec::<PathBuf>::new(), "the next run did not sweep the killed run's socket");
     assert!(UnixStream::connect(&host_path).is_err(), "the socket outlived its run");
 }
 

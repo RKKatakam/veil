@@ -2064,8 +2064,14 @@ mod net {
             // `pasta` also quits by itself once the sandbox is gone; this
             // stops it at once, and only if that pid is still our `pasta`.
             if let Some((pid, pasta)) = &self.pasta {
+                // (`pasta` may run itself again as `pasta.avx2`.)
                 let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
-                let ours = exe.is_some_and(|e| pasta.canonicalize().is_ok_and(|p| p == e || e.starts_with(p.with_extension(""))));
+                let ours = exe.is_some_and(|e| {
+                    pasta.canonicalize().is_ok_and(|p| {
+                        let name = |x: &Path| x.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        e.parent() == p.parent() && (name(&e) == name(&p) || name(&e).starts_with(&format!("{}.", name(&p))))
+                    })
+                });
                 if ours {
                     // SAFETY: kill(2) of the pasta this run started.
                     unsafe {

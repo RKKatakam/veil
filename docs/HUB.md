@@ -2857,3 +2857,78 @@ change; nothing new is encrypted.
   searched (`long_lines_skipped`).
 * `vl search WORDS… [--path] [--lang LANG] [-r BRANCH] [-n N] [--json] [-- PATH]`
   prints the server's answer (exit 1 when nothing matched).
+
+### 13.S8 S8: workspaces that fetch on first read (as built)
+
+> Section number: a placeholder; the orchestrator assigns it.
+
+Milestone S8 of `docs/design/server/phase-2-thin-clients.md` (§4.6, §4.8,
+§4.9). Code: `crates/vl/src/mount/fs.rs` (`ReaderView`: a thin clone's
+mount), `crates/vl/src/mount.rs` (`for_exec`), `crates/vl/src/sandbox.rs`
+(`exec_mounted`, `MidRun`), `crates/vl/src/ws_socket.rs` (new),
+`crates/vl/src/confine.rs` (`--private-ports`, `--seed`),
+`veil-core` `ObjectStore::entry_shown` and `prefetch` (`promisor.rs`), used
+by `vfs/sparse.rs` and the builder's carrying (`builder.rs`). No format,
+protocol or server change.
+
+#### The design as built
+
+* **A mount in a thin clone** shows the person's projection (what the
+  server gave them) and fetches on first read through S3's promisor:
+  * listing and `stat` never fetch a file's content (sizes are in the
+    tree); a folder or a plain file not fetched yet is shown without
+    fetching it (`entry_shown`), and its object decides when it is read (a
+    secret this reader cannot open is `EACCES` then). A file labelled
+    secret is decided by its object, fetched to decide. One folder that
+    turns out to hold only secrets this reader cannot open lists as empty
+    (a checkout would not create it).
+  * reading a file fetches its folder's small files (≤ 256 KiB) in the
+    same request, once per folder; listing a folder fetches only its tree.
+  * the server's refusal hides; a server that cannot be reached is `EIO`,
+    never an absent or empty file.
+* **Exact dirty sets:** a mount's recording reuses every unchanged folder
+  and file by id and visits only the paths the overlay holds, so it
+  fetches nothing; the builder's carrying of what a working copy does not
+  show uses the same rule (a deleted file not fetched is a deletion, not
+  "unreadable"). A new workspace (`vl ws new`) is marked scanned by the
+  current scanner rules, so its first recording does not re-read every file
+  (it did: in a thin clone, a fetch of the whole workspace). A re-scan after
+  a rules upgrade still reads everything: BUG-1360.
+* **`vl ws exec --mount`:** the sandbox is a mount of the workspace (a
+  private mountpoint under `$XDG_RUNTIME_DIR`, bound at the project's path
+  when confined), started for the run and unmounted after it, or the mount
+  `vl ws mount` already serves. Without FUSE (`fuse_available`: the build,
+  `/dev/fuse`, `fusermount3`) the run says so and is checked out; a sparse
+  sandbox (`--only`) in a thin clone fetches only its paths (`SparseView`
+  shows what is outside the set without fetching it).
+* **The workspace socket** (`ws_socket.rs`, `9-confinement.md` item 17):
+  named workspaces' runs, mounted or not, get `$VEIL_WORKSPACE_SOCKET` and
+  `vl` first on `PATH`; a `vl` inside forwards its arguments; the `vl`
+  outside runs `status`, `diff`, `log`, `show`, `blame`, `commit`,
+  `describe` (of `@`) and `new` (on `@`) as a child of its own
+  (`__veil-workspace-command`), with its own environment and hooks off, on
+  that workspace only (`Ctx::open_for_workspace`, `Ctx::detached`), after
+  recording the sandbox. Everything else is refused before anything opens.
+  `--ephemeral` runs get none. Attribution (S11) will come from the same
+  `vl` outside.
+* **`--private-ports`** and **`--seed SRC:DEST`**: `9-confinement.md` items
+  15 and 16. `pasta` only (slirp4netns is not used).
+
+#### Threat review (phase 2's rows 5–7 and 18, and §4.9)
+
+| # | Threat | As built | Test |
+|---|---|---|---|
+| 1 | a mount shows a file or name its person may not see | the tree is the server's projection; visibility as a checkout's | `server_hub` `workspaces::a_mounted_workspace_shows_exactly_its_persons_projection` (dev and admin; mount, `ws exec --mount`, the fallback; equal to a full clone's checkout; no marker in the clone's objects) |
+| 2 | unfetched read as empty or hidden | `EIO`; a mounted run meets the error; the fallback fails before running | `workspaces::an_unreachable_server_is_an_error_in_the_mount_never_a_missing_file` |
+| 3 | `ls -lR`, an indexer: a fetch storm | listing and `stat` fetch no content; folder prefetch only on reads | `workspaces::listing_fetches_no_file_and_reading_one_fetches_its_folder` |
+| 4 | a dirty set that misses or adds an edit; recording proportional to the project | the overlay is the dirty set; unchanged by id | `workspaces::recording_a_mount_fetches_nothing_and_holds_exactly_its_edits`, `cli_workspaces` `ws_socket_cli::what_a_mounted_command_changes_is_exactly_what_is_recorded_and_the_same_without_fuse` |
+| 5 | the sandbox's `vl` does more than its person may (phase 2, rows 5–7) | the allow-list of commands, its own workspace, the outside `vl`'s identity and environment, no hooks | `ws_socket_cli::*` (6 tests), `workspaces::the_sandboxs_vl_shows_only_what_its_person_may_see` |
+| 6 | a run reaches the host's loopback or another run's ports; shares the host's loopback without `pasta` | own network namespace; `pasta` forwards nothing; fails before running | `ports_seed_cli` (5 tests) |
+| 7 | a seed is written, or one run sees another's layer | overlay on a tmpfs of the run's own | `ports_seed_cli` (3 tests) |
+| 8 | the fallback without FUSE loses a guarantee | the same tests with `VEIL_TEST_NO_FUSE` | in 1, 2 and 4 |
+
+#### Reverting
+
+Revert the merge commit. Nothing on disk changes format; a workspace
+created meanwhile keeps its `.veil/local/scanned` marker, which the
+reverted `vl` reads as before.

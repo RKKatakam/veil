@@ -191,6 +191,25 @@ impl Around for Mounted {
     fn after(&self) {}
 }
 
+/// The prefix of a socket server's private directory, `PREFIX<pid>-<random>`.
+const PREFIX: &str = "veil-ws-";
+
+/// Remove the socket directories of `vl` processes that are gone (killed
+/// before they could remove their own).
+fn sweep(base: &Path) {
+    let Ok(rd) = std::fs::read_dir(base) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix(PREFIX).and_then(|r| r.split('-').next()).and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+        let ours = e.path().join("sock").exists() || e.path().join("bin").exists();
+        if ours && veil_core::lock::process_alive(pid) == Some(false) {
+            let _ = veil_core::vfs::remove_tree(&e.path());
+        }
+    }
+}
+
 /// A running socket server; stopped when dropped.
 pub struct Server {
     path: PathBuf,
@@ -203,12 +222,17 @@ impl Server {
     /// Serve workspace `ws` of the project at `root`, whose sandbox is the
     /// directory `sandbox` (where an unconfined command runs).
     pub fn start(root: &Path, ws: &str, sandbox: &Path, around: Box<dyn Around>) -> Result<Server> {
-        let base = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .filter(|d| d.is_dir())
-            .unwrap_or_else(std::env::temp_dir);
+        // A socket's path must fit `sun_path` (104 bytes on macOS, whose
+        // `$TMPDIR` alone is long): the first of these where it does.
+        let name_len = PREFIX.len() + 10 + 1 + 12 + "/sock".len();
+        let base = [std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from), Some(std::env::temp_dir()), Some(PathBuf::from("/tmp"))]
+            .into_iter()
+            .flatten()
+            .find(|d| d.is_absolute() && d.is_dir() && d.as_os_str().len() + 1 + name_len < 100)
+            .ok_or_else(|| anyhow!("no directory for the workspace socket: $XDG_RUNTIME_DIR, $TMPDIR and /tmp are too long or missing"))?;
+        sweep(&base);
         let dir = base.join(format!(
-            "veil-ws-{}-{}",
+            "{PREFIX}{}-{}",
             std::process::id(),
             hex::encode(veil_core::crypto::random_bytes::<6>())
         ));
