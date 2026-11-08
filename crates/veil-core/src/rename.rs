@@ -37,7 +37,7 @@ use crate::{
     id::ObjectId,
     object::{EntryKind, Object, TreeEntry},
     store::ObjectStore,
-    tree::{walk_files, TreeChange},
+    tree::{walk_files_hiding, TreeChange},
     vpath::VPath,
 };
 
@@ -195,7 +195,7 @@ fn detect_in(
     if o.copies {
         if let Some(t) = old_tree {
             let changed: HashSet<&VPath> = changes.iter().map(|c| &c.path).collect();
-            for (p, e) in walk_files(store, t)? {
+            for (p, e) in walk_files_hiding(store, t)?.0 {
                 if !changed.contains(&p) {
                     sources.push(Source { path: p, entry: e, deleted: false, change: None });
                 }

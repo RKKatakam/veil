@@ -3212,9 +3212,47 @@ protocol or server change.
     pass reads), merges (the files both sides changed) and `split`/`squash`
     by hunk. The locator keeps one place an object, for readers by id only.
     A batch under a local change is asked under its nearest server
-    ancestor. **Outside this:** a diff whose old side holds a refused
-    folder whose tree this clone does not hold fails with "not present"
-    (BUG-1508, open).
+    ancestor.
+  * **a tree the server refuses is never an error and never silently
+    dropped** (decided, BUG-1508). In a thin clone made before its person
+    lost access to a folder, the folder's tree is refused once it is not
+    held. Readers (`vl show`, `diff`, `log`, `blame`, `grep`, `ls`,
+    `files`, the JSON API and `vl serve`) show it as hidden by the path its
+    parent already named (`redacted bill/`; `hidden` in `veil.diff/2`; a
+    `redacted` directory in `veil.ls`; `hidden_folders` in `vl grep`) and
+    nothing inside it, and succeed (`tree::diff_trees_hiding`,
+    `walk_files_hiding`). Writers carry a refused folder only one side
+    changed by its id without reading it (merge, rebase, the embargo and
+    sealing pass of a merge); a checkout leaves it out of the working copy
+    (`redacted bill/`), removes what it wrote there, and records it, so the
+    builder carries it by id. What the working copy holds there (a file
+    the person made, a copy the checkout could not tell as its own) is
+    never recorded and never touched, and never silent: `vl status` lists
+    it under its own heading, `not_recorded` in `veil.status`, and `vl
+    commit` records the rest and names it once (BUG-1528). One both sides
+    changed, a path asked for in or above it (`vl restore`, `split`,
+    `squash` by path) or a hunk choice that needs it, or a working copy
+    folder never left out, is refused by a message naming it and saying the
+    person lacks access, and nothing changes (`tree::no_access`); a restore,
+    split or squash of other paths keeps it where it is, by id (BUG-1529).
+    No writer leaves out or empties it.
+  * **the refusal is the server's answer at the place asked, whatever the
+    view** (BUG-1530): a snapshot is the server's if the tips reach it or,
+    failing that, if the server's history answers for it (it resolves an
+    older view's snapshot through the real one); an empty answer under it
+    is the refusal (`on_server`, `server_knows`). So a pull after an access
+    change leaves a working copy that carries a refused folder working.
+  * **access back**: the folder is written whole again. A file the
+    left-out checkout kept is compared with the version the folder was left
+    from (`Materialised::left`): the checkout's own copy is written over;
+    the person's edit is kept as it is and is a conflict in `vl status`
+    (`kept_edit` in `veil.status`) until `vl restore` takes the recorded
+    version (BUG-1531).
+  * **Outside this:** what a clone never fetched of the view before an
+    access change (a snapshot, the root) is not served any more and fails
+    with "not present", and work that carries a refused folder by id is
+    refused by a push (BUG-1509, open: the clone moving to the current
+    view by itself is designed, not built).
   * **content already held reads at every path naming it** (decided,
     BUG-1464): removal of access stops new fetches; bytes already on a
     machine stay readable there, at any path naming them, as they are in a

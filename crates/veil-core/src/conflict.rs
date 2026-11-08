@@ -32,7 +32,6 @@ use crate::{
     object::{Conflict, ConflictTerm, EntryKind, Object, TreeEntry, Visibility},
     secrets::looks_binary,
     store::ObjectStore,
-    tree::{diff_trees, walk_files},
     vpath::VPath,
 };
 
@@ -764,7 +763,10 @@ pub fn has_markers(data: &[u8], style: &Style) -> bool {
 
 /// Paths of the conflict entries below `tree`, in order (a full walk).
 pub fn conflict_paths(store: &ObjectStore, tree: &ObjectId) -> Result<Vec<VPath>> {
-    Ok(walk_files(store, tree)?
+    // A folder the server refuses is not walked (BUG-1508): its conflicts
+    // are not this reader's to list.
+    Ok(crate::tree::walk_files_hiding(store, tree)?
+        .0
         .into_iter()
         .filter(|(_, e)| e.kind == EntryKind::Conflict)
         .map(|(p, _)| p)
@@ -800,7 +802,7 @@ pub fn index_conflicts(store: &ObjectStore, tree: &ObjectId, listed: &[String], 
                 }
             }
             now = was.clone();
-            for c in diff_trees(store, Some(bt), Some(tree))? {
+            for c in crate::tree::diff_trees_hiding(store, Some(bt), Some(tree))?.0 {
                 let p = c.path.to_string();
                 if c.old.as_ref().is_some_and(|e| e.kind == EntryKind::Conflict) {
                     was.insert(p.clone());
