@@ -1363,7 +1363,9 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
                 eprintln!("load: {:?} projects={projects} clients={clients} rate={rate:?}{}", a.mode, if via { " via the cache" } else { "" });
                 let mut r = run_one(&cx, a, projects, clients, rate, cache.as_ref().filter(|_| via))?;
                 eprintln!("      {}", line(&r));
-                let missed = missed_gates(&r, a.background);
+                // A flood's work is counted against the quiet runs' operations:
+                // the cost gates do not apply to them.
+                let missed = if a.flood > 0 { Vec::new() } else { missed_gates(&r, a.background) };
                 for m in &missed {
                     eprintln!("      GATE MISSED: {m}");
                 }
