@@ -1396,3 +1396,39 @@ fn an_encrypted_conflict_side_of_an_ordinary_file_is_named() {
         r.removed
     );
 }
+
+// ---- S11 review, cycle 1 ----------------------------------------------------------
+
+/// Format 9 is S3's thin clone: its `repo.json` carries the `partial`
+/// marker (`{remote, cache_limit}`), and objects not in the store are
+/// fetched from the server when read (`docs/design/scale/6-partial-clone.md`,
+/// threat 14). The number exists so that a build that does not know the
+/// marker never opens one: it would take every object not fetched yet as
+/// absent. This build does not know it. It must refuse such a repository,
+/// and its `vl upgrade` must neither drop the marker nor move it to a
+/// format whose readers ignore it; nothing may change.
+#[test]
+#[ignore = "BUG-1390: format 9 (a thin clone with its `partial` marker) is opened, and upgraded to 10 dropping the marker"]
+fn a_thin_clone_of_format_9_is_refused_not_opened_or_upgraded_without_its_marker() {
+    let (_tmp, root, fs, alice) = written_then_marked(9, |repo, root, fs| {
+        std::fs::write(root.join("README.md"), "hello\n").unwrap();
+        repo.snapshot_workspace("default", &**fs).unwrap();
+        repo.commit_working_copy("default", "first").unwrap();
+    });
+    // The marker as S3's `vl clone` writes it (`RepoConfig::partial`).
+    let path = root.join(".veil/repo.json");
+    let mut cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    cfg["partial"] = serde_json::json!({"remote": "origin", "cache_limit": 1u64 << 30});
+    std::fs::write(&path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let opened = Repo::open(fs.clone(), Some(alice.clone()), "alice");
+    let upgraded = upgrade(fs.clone(), Some(alice.clone()), &UpgradeOptions::default());
+    let after: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(
+        matches!(opened, Err(VeilError::Unsupported(_))) && upgraded.is_err(),
+        "a thin clone was opened ({}) or upgraded ({}); repo.json is now {after}",
+        opened.as_ref().map(|_| "ok".to_string()).unwrap_or_else(|e| e.to_string()),
+        upgraded.as_ref().map(|r| format!("{} -> {}", r.from, r.to)).unwrap_or_else(|e| e.to_string()),
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before, "repo.json changed");
+}

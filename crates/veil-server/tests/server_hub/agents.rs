@@ -460,3 +460,204 @@ fn a_vl_push_and_pull_carry_attribution_and_attempts() {
     assert!(show.contains("changed: src/lease.rs"), "{show}");
     p.fin.ok(&f, &["fsck"]);
 }
+
+// ---- S11 review, cycle 1 ---------------------------------------------------------
+
+/// A server of the release before migration 20 finds a session by its
+/// token's hash alone (`auth.rs` of `integration` @ 6fa552c4): in a rolling
+/// upgrade it runs beside servers that make agent sessions, on the same
+/// database. It must never find an agent session's token, or it would take
+/// it as its person's own session: unnarrowed, in every project, able to
+/// make sessions and change access.
+#[test]
+#[ignore = "BUG-1376: an agent session's token authenticates as its person's full session on a server without migration 20"]
+fn an_agent_sessions_token_is_never_a_full_session_to_a_server_that_predates_it() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let token = p.dev.token();
+    let agent = agent_token(&hub, &token, &p.name, &["src/api"]);
+    // The previous release's lookup, verbatim but for the epochs.
+    let old_lookup = |t: &str| -> Option<i64> {
+        hub.rt
+            .block_on(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT p.id FROM sessions s JOIN devices d ON d.id = s.device_id JOIN people p ON p.id = s.person_id \
+                     WHERE s.token_hash = $1 AND s.expires_at > $2 AND d.removed_at IS NULL AND NOT d.pending",
+                )
+                .bind(veil_server::auth::token_hash(t))
+                .bind(veil_core::now_millis())
+                .fetch_optional(&hub.hub().db),
+            )
+            .unwrap()
+    };
+    assert!(old_lookup(&token).is_some(), "control: the older server finds the person's own session");
+    assert_eq!(old_lookup(&agent), None, "an older server takes the agent session for its person's own");
+}
+
+/// An agent session cannot change who has access (`docs/HUB.md` §13.27):
+/// not through the access routes, and not through `.veilpolicy`, the
+/// access lines an admin's commit on the default branch makes the project's
+/// policy. An admin's agent session making a private folder public through
+/// an API commit is refused; the admin's own session may.
+#[test]
+#[ignore = "BUG-1377: an admin's agent session changes access by committing .veilpolicy through the API"]
+fn an_admins_agent_session_cannot_change_access_through_the_policy_file() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let atok = p.admin.token();
+    let agent = agent_token(&hub, &atok, &p.name, &[]);
+    let policy = std::fs::read_to_string(p.dir.join(".veilpolicy")).unwrap();
+    let edit = |tok: &str| {
+        let base = tip(&hub, tok, &p.name);
+        change(
+            &hub,
+            tok,
+            &p.name,
+            &json!({"base": base.hex(), "description": "open carol's folder",
+                    "edits": [{"path": ".veilpolicy", "put": {"text": format!("{policy}{PERSON_DIR}/ public\n")}}],
+                    "onto": {"branch": "main", "expected": base.hex()}}),
+        )
+    };
+    let anyone_reads = || q(&hub, None, &p.name, "file", &format!("path={PERSON_DIR}/notes.txt")).status == 200;
+    assert!(!anyone_reads(), "control: carol's folder is private");
+    let r = edit(&agent);
+    let refused = (r.status == 403 && body(&r).contains("agent_session")) || (r.status == 200 && r.json()["branch"]["status"] == "rejected");
+    assert!(refused, "the admin's agent session changed access: {} {}", r.status, body(&r));
+    assert!(!anyone_reads(), "carol's folder became public through an agent session");
+    // Control: the admin's own session may.
+    let r = edit(&atok);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["branch"]["status"], "ok", "{}", body(&r));
+    assert!(anyone_reads(), "control: the admin's own change opened it");
+}
+
+/// A narrowed session writes only inside its paths (`View::write`). Moving
+/// a branch back (a forced push) or deleting it takes away what others
+/// wrote everywhere else: an admin's session narrowed to `src/api` may do
+/// neither. Neither needs a new snapshot, so neither needs a device key:
+/// the token is enough.
+#[test]
+#[ignore = "BUG-1378: an admin's narrowed agent session force-moves and deletes branches, removing content outside its paths"]
+fn an_admins_narrowed_agent_session_neither_forces_nor_deletes_a_branch() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let atok = p.admin.token();
+    let before = tip(&hub, &atok, &p.name);
+    with_api_folder(&hub, &p);
+    let main = tip(&hub, &atok, &p.name);
+    assert_ne!(main, before);
+    // A branch of the admin's own, for the deletion.
+    let api = hub.api();
+    let r = Craft::new(&api, &p.admin, &p.name, "main").push_to("release-77ab", None);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    let release = api.tips(Some(&atok), &p.name).unwrap().branches["release-77ab"];
+    let agent = agent_token(&hub, &atok, &p.name, &["src/api"]);
+    let push = |updates: Value, force: bool| api.post_json(Some(&agent), &format!("/v1/projects/{}/push", p.name), &json!({"updates": updates, "force": force}));
+    let refused = |r: &Reply| r.status == 403 || (r.status == 200 && r.json()["results"].as_array().unwrap().iter().all(|x| x["ok"] == false));
+    // Forced back to before `src/other.rs` existed.
+    let forced = push(json!([{"branch": "main", "expected": main.hex(), "new": before.hex()}]), true);
+    // Deleted.
+    let deleted = push(json!([{"branch": "release-77ab", "expected": release.hex(), "new": null}]), false);
+    let tips = api.tips(Some(&atok), &p.name).unwrap().branches;
+    assert!(
+        refused(&forced) && refused(&deleted),
+        "forced: {} {}; deleted: {} {}",
+        forced.status,
+        body(&forced),
+        deleted.status,
+        body(&deleted)
+    );
+    assert_eq!(tips["main"], main, "main moved back");
+    assert_eq!(q(&hub, Some(&atok), &p.name, "file", "path=src/other.rs").status, 200, "src/other.rs left main");
+    assert_eq!(tips.get("release-77ab"), Some(&release), "the branch is gone");
+}
+
+/// A `vl` of the release before format 10 decodes every snapshot strictly
+/// (`Object::decode`: "snapshot is not in canonical encoding"), and its
+/// pull stops at the first one it cannot read. Once any change of a project
+/// is attributed, such a client is told its pull found a corrupt object.
+/// A client that does not say it reads format 10 (the previous release
+/// sends nothing) must be told to update `vl` instead, before anything is
+/// sent.
+#[test]
+#[ignore = "BUG-1379: a vl that predates format 10 is sent attributed snapshots, and its pull fails as a corrupt object"]
+fn a_client_that_predates_format_10_is_told_to_update_not_sent_what_it_calls_corrupt() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let token = p.dev.token();
+    let agent = agent_token(&hub, &token, &p.name, &[]);
+    let base = tip(&hub, &agent, &p.name);
+    let r = change(&hub, &agent, &p.name, &json!({"base": base.hex(), "description": "by an agent", "edits": [{"path": "src/a.rs", "put": {"text": "a"}}],
+                                                  "onto": {"branch": "main", "expected": base.hex()}}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["branch"]["status"], "ok", "{}", body(&r));
+    // What the previous release's pull asks for: history from the new tip.
+    let fin = p.fin.token();
+    let t = tip(&hub, &fin, &p.name);
+    let h = hub.api().post_json(Some(&fin), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [t.hex()]}));
+    let newer: Vec<String> = match h.status {
+        200 => h.frames().iter().filter(|(_, raw)| O::min_repo_format(raw) >= veil_core::object::ATTRIBUTION_REPO_FORMAT).map(|(id, _)| id.short()).collect(),
+        _ => vec![],
+    };
+    assert_ne!(h.status, 200, "an older vl was sent format-10 snapshots {newer:?}, which it reports as corrupt");
+    assert!(h.status == 400 || h.status == 409 || h.status == 426, "{} {}", h.status, body(&h));
+    assert!(body(&h).contains("vl"), "the refusal names the release to update to: {}", body(&h));
+}
+
+/// Guarantee 1, revocation: an agent session is checked as its person,
+/// request by request. A person removed from the group that lets them write
+/// `src/` writes nothing there through their agent session; a device an
+/// admin bars from the project takes its agent sessions with it.
+#[test]
+fn an_agent_session_loses_what_its_person_loses_at_once() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let token = p.dev.token();
+    let agent = agent_token(&hub, &token, &p.name, &[]);
+    let write = |tok: &str, path: &str| {
+        let base = tip(&hub, tok, &p.name);
+        change(&hub, tok, &p.name, &json!({"base": base.hex(), "description": "w", "edits": [{"path": path, "put": {"text": "w"}}]}))
+    };
+    let r = write(&agent, "src/before.rs");
+    assert_eq!(r.status, 200, "control: the agent writes src/: {}", body(&r));
+    let atok = p.admin.token();
+    let r = hub.api().post_json(Some(&atok), &format!("/v1/projects/{}/groups/devs/members/remove", p.name), &json!({"people": [p.dev.name]}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    let r = write(&agent, "src/after.rs");
+    assert_eq!(r.status, 403, "the agent of a person no longer in devs wrote src/: {}", body(&r));
+    // Barred: a device's agent sessions are refused everywhere in the project.
+    let fin_agent = agent_token(&hub, &p.fin.token(), &p.name, &[]);
+    assert_eq!(hub.api().get(Some(&fin_agent), &format!("/v1/projects/{}/tips", p.name)).status, 200, "control");
+    let r = hub.api().post_json(Some(&atok), "/v1/devices/remove", &json!({"device": p.fin.identity().public_id(), "project": p.name}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    let r = hub.api().get(Some(&fin_agent), &format!("/v1/projects/{}/tips", p.name));
+    assert_eq!(r.status, 403, "a barred device's agent session: {}", body(&r));
+    assert_eq!(q(&hub, Some(&fin_agent), &p.name, "file", &format!("path={BILL_DIR}/acme/invoice.txt")).status, 403, "a file through a barred device's agent session");
+}
+
+/// Guarantee 3, the builder's residual: a narrowed session is served the
+/// folders on the way to its paths, so it learns the names in them. They
+/// are exactly its person's (the person's projection, the same bytes): no
+/// name the person cannot see, and no file of them.
+#[test]
+fn the_folders_on_the_way_are_exactly_what_the_person_sees() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    with_api_folder(&hub, &p);
+    let token = p.dev.token();
+    let agent = agent_token(&hub, &token, &p.name, &["src/api"]);
+    let snap = tip(&hub, &agent, &p.name);
+    assert_eq!(snap, tip(&hub, &token, &p.name), "the agent's history is the person's");
+    let root = q(&hub, Some(&token), &p.name, "tree", "").json();
+    let src_id = root["entries"].as_array().unwrap().iter().find(|e| e["name"] == "src").unwrap()["id"].as_str().unwrap().to_string();
+    let fetch = |tok: &str, path: &str, id: &str| hub.api().post_json(Some(tok), &format!("/v1/projects/{}/fetch", p.name), &json!({"snapshot": snap.hex(), "objects": [{"path": path, "id": id}]}));
+    for (path, id) in [("", root["id"].as_str().unwrap().to_string()), ("src", src_id)] {
+        let a = fetch(&agent, path, &id);
+        assert_eq!(a.status, 200, "{path}: {}", body(&a));
+        let mine = fetch(&token, path, &id);
+        assert_eq!(mine.status, 200, "{path}: {}", body(&mine));
+        assert_eq!(a.frames(), mine.frames(), "{path:?}: the agent's folder differs from its person's");
+        let items = vec![(path.to_string(), a.body.clone())];
+        assert_no_marker(&items, &[BILL_DIR, PERSON_DIR, NESTED_DIR, ROOT_FILE], "a narrowed agent session");
+    }
+}
