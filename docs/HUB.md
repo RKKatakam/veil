@@ -2462,7 +2462,11 @@ Nothing changes for `vl` or on the wire.
   `Range` read too (`pack::entry`; a range far into a large object reads
   the id first, then the range), so a wrong slot (a damaged index, a
   merger's mistake) is an error, never another object's bytes (BUG-1154);
-  a whole read is also decoded and checked against the id. S29 merges packs
+  a whole read is also decoded and checked against the id. **The slots
+  must tile the pack exactly** (`pack::parse_index`: by offset, each starts
+  where the one before ends, the first at the index's end, the last at the
+  pack's end), so a slot's end is as checked as its start and a read never
+  leaves its slot (BUG-1394). S29 merges packs
   by reading indexes and copying entries, and drops an object by writing a
   pack without it.
 * **The `packs` table** (migration 13) has a row for every pack in storage:
@@ -2510,29 +2514,42 @@ Nothing changes for `vl` or on the wire.
   uploads stay staged for the next try (above), and its own pack, if it
   wrote one, is deleted once the database shows its transaction did not
   list it.
-* **What storage holds that no push listed** (until S29's job removes
-  what is older than its grace): staged packs, each with its row: of each
-  push that lost every race since (one per upload request, reused by its
-  retries on the same server; one per server a retry reaches), of uploads
-  no push followed, and those of a request run again after a database or
-  store error (`db::retry_requests`). That is at most what each person
-  uploaded, as before S28, and S24's per-person limits bound it. The one
-  storage object the database does not name is a push's own pack between
-  its write and its transaction's end (milliseconds), left behind only if
-  the server process dies right then; S29's job lists storage for those.
+* **A push's own pack is recorded too** (staged, the pusher's) before it
+  is written, and its transaction lists it, so **every pack in storage has
+  a row**, whatever stops the request (BUG-1399): one database commit more
+  for a push that writes a pack of its own (the server completed its
+  snapshots or made projections), apart from its one transaction. **A push
+  runs to its end in a task of its own**: a client that goes away (a
+  stopped `vl push`, a dropped connection) stops the request, not the
+  push, whose clean-up then discards what it did not list.
+* **What storage holds that no push listed** (until S29's job removes the
+  staged rows older than its grace, and their packs): staged packs, each
+  with its row: of each push that lost every race since (one per upload
+  request, reused by its retries on the same server; one per server a
+  retry reaches), of uploads no push followed, and those of a request run
+  again after a database or store error (`db::retry_requests`). That is at
+  most what each person uploaded, as before S28, and S24's per-person
+  limits bound it.
 * **An API commit** (S10) reads the objects its receipts name from their
   staged packs, at most 1 GiB, **holding a share of the server-wide bound
   on decoded bytes** (`store::DECODED_IN_FLIGHT`, 256 MiB for every request
   together; a commit naming more takes all of it, so such commits run one
-  at a time: BUG-1156); it stores what it keeps loose once every check
+  at a time: BUG-1156), **taken before it reads them**: what they decode to
+  comes from each entry's first bytes, then the share, then the objects one
+  at a time (BUG-1397); it stores what it keeps loose once every check
   passed, as before, and discards the staged packs when it is answered
   (not after a lost race: the caller may try again with the same receipts).
 * **Reads.** `Objects` finds a project's object in its cache, then in the
-  listed packs this server knows (an in-memory map per project, object id →
-  pack and slot, built from the indexes; **128 MiB for every project
-  together, by bytes, each project's entry counted**; projects used least
-  recently dropped first, the one in use last; weights read under one lock,
-  so eviction and additions never miscount), then loose (objects from
+  indexes of the listed packs this server holds (per project, newest pack
+  first, each a sorted array of 48 bytes a slot, searched by bisection;
+  **128 MiB for every project together, by their real memory**, each
+  project's entry and each pack it names counted). Past the budget the
+  indexes used least recently are unloaded, those of the project in use
+  too, and then the entries of projects used least recently, never the one
+  in use: a lookup that needs an unloaded index reads it again from storage
+  (`pack::Packs::find_paged`), so **a project of any size always reads**
+  (BUG-1395, BUG-1396). Weights are read from the maps under one lock, so
+  eviction and additions never miscount. Then loose (objects from
   before S28, and what grants, API commits, the deriver and the search
   index store). After a miss in both it reads the project's listing again
   (one statement, unless a listing began after the miss: it holds every
@@ -2546,7 +2563,13 @@ Nothing changes for `vl` or on the wire.
   by offset, slots at most 64 KiB apart in one ranged request of at most
   2 MiB (8 at once, each holding a share of the bound on bytes read ahead,
   or not prefetched), and caches them, each entry's id and each object
-  checked. A clone asks a level of many snapshots at once, whose objects
+  checked, **each object's decoding holding a share for what it declares**
+  (or not read ahead: BUG-1159).
+* **What a push stores is counted where it is stored** (BUG-1398): a push
+  and an upload run in a scope of their own (`store::own`), and the writes
+  made in it are theirs (`Objects::own_writes`, `storage_push_writes` for
+  `veil-bench load`); the work they spawn (the deriver, the search index)
+  and every other request (pulls' projections, grants' trees) are not. A clone asks a level of many snapshots at once, whose objects
   lie in upload order in the same packs.
 * **Permissions are unchanged and per object.** Packs change where objects
   are stored, never who may read them: every route reads one object at a
