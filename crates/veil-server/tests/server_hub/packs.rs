@@ -699,3 +699,326 @@ fn an_unread_plain_text_secret_beside_a_landing_push_is_not_kept() {
     }
     assert_eq!(read_file(&fresh.api(), &c.token, &p.name, "src/landed.rs").as_deref(), Some(&b"MARKER-LANDED-BESIDE-A-SECRET-2b7e"[..]));
 }
+
+// ---------------------------------------------------------------------------
+// S28 cycle 2 review (`docs/BUGS.md` "S28 cycle 2").
+
+/// Until the background work is done: no storage write for 3 s.
+fn settle(hub: &TestHub) {
+    let mut last = (u64::MAX, std::time::Instant::now());
+    let start = std::time::Instant::now();
+    loop {
+        let w = hub.hub().objects.writes.load(Relaxed);
+        if w != last.0 {
+            last = (w, std::time::Instant::now());
+        } else if last.1.elapsed() > std::time::Duration::from_secs(3) {
+            return;
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(120), "the background never settled");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// A server whose objects are in a directory (walked below), whatever
+/// `VEIL_TEST_S3_ENDPOINT` says.
+fn hub_on_a_directory() -> TestHub {
+    TestHub::start_with_s3(&std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL"), std::time::Duration::from_secs(3600), None)
+}
+
+/// The packs in `project`'s storage that have no row in `packs`.
+fn packs_without_rows(hub: &TestHub, project: i64) -> Vec<String> {
+    let dir = hub.objects_dir().expect("objects in a directory").join(format!("p/{project}/pack"));
+    let rows: Vec<String> =
+        hub.rt.block_on(sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1").bind(project).fetch_all(&hub.hub().db)).unwrap();
+    let in_store: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| veil_server::pack::valid_name(n))
+        .collect();
+    assert!(!in_store.is_empty(), "the project has packs in {}", dir.display());
+    in_store.into_iter().filter(|n| !rows.contains(n)).collect()
+}
+
+/// Property 1 (S28 cycle 2): a member who cannot see billing names the
+/// hidden invoice (a right guess) or other bytes (a wrong one) in a push and
+/// in an API commit, showing each kind of receipt that is not theirs for
+/// that object in an upload of theirs: another person's, one of theirs for
+/// another object, the form before S28 (no pack), one moved to another of
+/// their packs, none. Every kind gets one answer for both guesses.
+#[test]
+fn a_guess_gets_one_answer_whatever_receipt_it_shows() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let token = p.dev.token();
+    let hidden_path = format!("{BILL_DIR}/acme/invoice.txt");
+    let real = real_paths(&p.dir).into_iter().find(|(path, _)| *path == hidden_path).unwrap().1;
+    let right = format!("{BILL_MARK}\nsecond").into_bytes();
+    let wrong = b"MARKER-A-WRONG-GUESS-OF-EVERY-RECEIPT-4d27".to_vec();
+    let rid = ObjectId::hash(&O::Blob(right.clone()).encode());
+    let wid = ObjectId::hash(&O::Blob(wrong.clone()).encode());
+    assert_eq!(rid, real, "the guess is the hidden object");
+    let receipts_of = |who: &str, objects: &[(ObjectId, Vec<u8>)]| -> Vec<String> {
+        let up = api.upload(who, &p.name, objects);
+        assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+        serde_json::from_value(up.json()["receipts"].clone()).unwrap()
+    };
+    // Carol's receipts for both guesses; two uploads of the dev's own of
+    // something else (two packs).
+    let carols = receipts_of(&p.carol.token(), &[(rid, O::Blob(right.clone()).encode()), (wid, O::Blob(wrong.clone()).encode())]);
+    let (oid, oraw) = blob("MARKER-SOMETHING-ELSE-OF-THE-DEV-1b90");
+    let mine = receipts_of(&token, &[(oid, oraw.clone())]).remove(0);
+    let (o2, o2raw) = blob("MARKER-SOMETHING-ELSE-AGAIN-6e11");
+    let mine2 = receipts_of(&token, &[(o2, o2raw)]).remove(0);
+    let (mac, other_pack) = (mine.split_once('.').unwrap().0.to_string(), mine2.split_once('.').unwrap().1.to_string());
+    type Receipt<'a> = Box<dyn Fn(usize) -> Option<String> + 'a>;
+    let kinds: Vec<(&str, Receipt)> = vec![
+        ("another person's", Box::new(|g| Some(carols[g].clone()))),
+        ("one for another object", Box::new(|_| Some(mine.clone()))),
+        ("before S28 (no pack)", Box::new(|_| Some(mac.clone()))),
+        ("moved to another pack of theirs", Box::new(|_| Some(format!("{mac}.{other_pack}")))),
+        ("none", Box::new(|_| None)),
+    ];
+    let norm = |r: &Reply, ids: &[ObjectId]| {
+        let mut b = String::from_utf8_lossy(&r.body).into_owned();
+        for id in ids {
+            b = b.replace(&id.hex(), "ID").replace(&id.short(), "ID");
+        }
+        (r.status, b)
+    };
+    for (kind, receipt) in &kinds {
+        // A push of a file naming the guess.
+        let mut answers = Vec::new();
+        for (g, (id, content)) in [(wid, &wrong), (rid, &right)].into_iter().enumerate() {
+            let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+            c.set("src/guess.txt", O::Blob(content.clone()), veil_core::object::Visibility::Public);
+            c.objects.retain(|(o, _)| *o != id);
+            let s = { let t = c.tip; snap(&mut c, vec![t], "a guess", None) };
+            let (mut map, _) = upload_all(&api, &c);
+            if let Some(r) = receipt(1 - g) {
+                map.insert(id.hex(), json!(r));
+            }
+            let r = push_body(&api, &c.token, &p.name, c.tip, s, &map);
+            let trees: Vec<ObjectId> = c.objects.iter().map(|(o, _)| *o).collect();
+            answers.push(norm(&r, &[[id, s].as_slice(), &trees].concat()));
+        }
+        assert!(answers[0].0 == 400 || answers[0].0 == 404, "push, {kind}: a wrong guess is refused: {:?}", answers[0]);
+        assert_eq!(answers[1], answers[0], "push, {kind}: a right guess of hidden content got another answer than a wrong one");
+        // An API commit putting the guess.
+        let base = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+        let mut answers = Vec::new();
+        for (g, id) in [wid, rid].into_iter().enumerate() {
+            let mut receipts = serde_json::Map::new();
+            if let Some(r) = receipt(1 - g) {
+                receipts.insert(id.hex(), json!(r));
+            }
+            let r = api.post_json(
+                Some(&token),
+                &format!("/v1/projects/{}/changes", p.name),
+                &json!({"base": base.hex(), "edits": [{"path": "src/guess.txt", "put": {"object": id.hex()}}], "receipts": receipts}),
+            );
+            answers.push(norm(&r, &[id]));
+        }
+        assert!(answers[0].0 == 400 || answers[0].0 == 404, "API commit, {kind}: a wrong guess is refused: {:?}", answers[0]);
+        assert_eq!(answers[1], answers[0], "API commit, {kind}: a right guess of hidden content got another answer than a wrong one");
+    }
+}
+
+/// Property 4 (S28 cycle 2): after a push its checks refuse, a push that
+/// lost a race, its retry that lands, an API commit that lands and one
+/// that is refused, every pack in storage has a row.
+#[test]
+fn every_pack_in_storage_has_a_row_after_refusals_races_and_api_commits() {
+    let hub = hub_on_a_directory();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    // Refused by its checks (a snapshot signed by a key nobody knows): the
+    // upload and the push's own pack go.
+    let stranger = veil_core::Identity::generate("stranger");
+    let mut bad = Craft::new(&api, &p.dev, &p.name, "main");
+    bad.file("src/refused.rs", "MARKER-REFUSED-PUSH-2c8d");
+    let unknown = { let t = bad.tip; snap(&mut bad, vec![t], "unknown key", Some(&stranger)) };
+    let (map, _) = upload_all(&api, &bad);
+    let r = push_body(&api, &bad.token, &p.name, bad.tip, unknown, &map);
+    assert_eq!(r.status, 403, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(packs_without_rows(&hub, pid), Vec::<String>::new(), "after a refused push");
+    // Lost a race, then landed.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/raced.rs", "MARKER-RACED-THEN-LANDED-5f0e");
+    let s = { let t = c.tip; snap(&mut c, vec![t], "raced", None) };
+    write_files(&p.dir, &[("src/first.rs", "first")]);
+    p.admin.commit_main(&p.dir, "first");
+    p.admin.ok(&p.dir, &["push"]);
+    let (map, _) = upload_all(&api, &c);
+    let r = push_body(&api, &c.token, &p.name, c.tip, s, &map);
+    assert_eq!(r.json()["results"][0]["ok"], json!(false), "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(packs_without_rows(&hub, pid), Vec::<String>::new(), "after a lost race");
+    let mut c2 = Craft::new(&api, &p.dev, &p.name, "main");
+    c2.file("src/raced.rs", "MARKER-RACED-THEN-LANDED-5f0e");
+    let s2 = { let t = c2.tip; snap(&mut c2, vec![t], "raced, again", None) };
+    let (map, _) = upload_all(&api, &c2);
+    let r = push_body(&api, &c2.token, &p.name, c2.tip, s2, &map);
+    assert_eq!(r.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(packs_without_rows(&hub, pid), Vec::<String>::new(), "after the retry landed");
+    // API commits: one landed, one refused.
+    let base = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+    for (path, ok) in [("src/api.txt".to_string(), true), (format!("{BILL_DIR}/api.txt"), false)] {
+        let (id, raw) = blob(&format!("MARKER-API-COMMIT-{ok}-77d1"));
+        let up = api.upload(&token, &p.name, &[(id, raw)]);
+        assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+        let receipts: Vec<String> = serde_json::from_value(up.json()["receipts"].clone()).unwrap();
+        let r = api.post_json(
+            Some(&token),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base.hex(), "edits": [{"path": path, "put": {"object": id.hex()}}], "receipts": {id.hex(): receipts[0]}}),
+        );
+        match ok {
+            true => assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body)),
+            false => assert!(r.status == 403 || r.status == 400, "{}: {}", r.status, String::from_utf8_lossy(&r.body)),
+        }
+        assert_eq!(packs_without_rows(&hub, pid), Vec::<String>::new(), "after an API commit (landed: {ok})");
+    }
+}
+
+/// BUG-1399 (S28 cycle 2; BUG-1157's class): a push whose client goes away
+/// while its transaction runs (a `vl push` stopped, a network that drops) is
+/// cancelled by the HTTP server where it stands: the code after
+/// `push_staged` that deletes the push's own pack when its transaction did
+/// not list it (`sync::push`) never runs. The own pack was written before
+/// the transaction and gets its row only in it, so it stays in storage
+/// with no row: nothing (not S29's job, which reads the rows) knows it is
+/// there. Here the push waits on the upload's row, held by another
+/// transaction, so the client's 3 s run out within it.
+#[test]
+#[ignore = "BUG-1399: a push cancelled by its client's going away leaves its own pack in storage with no row"]
+fn bug_1399_a_push_whose_client_goes_away_leaves_no_pack_without_a_row() {
+    let hub = hub_on_a_directory();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    assert_eq!(packs_without_rows(&hub, pid), Vec::<String>::new(), "before");
+    // A developer's push: the server completes it, in a pack of its own.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/gone.rs", "MARKER-CLIENT-GONE-3b7e");
+    let s = { let t = c.tip; snap(&mut c, vec![t], "the client goes", None) };
+    let (map, pack) = upload_all(&api, &c);
+    let mut lock = hub.rt.block_on(hub.hub().db.begin()).unwrap();
+    hub.rt
+        .block_on(sqlx::query("SELECT 1 FROM packs WHERE project_id = $1 AND name = $2 FOR UPDATE").bind(pid).bind(&pack).execute(&mut *lock))
+        .unwrap();
+    let body = json!({"updates": [{"branch": "main", "expected": c.tip.hex(), "new": s.hex()}], "receipts": map});
+    let gave_up = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        api.post_json_within(&c.token, &format!("/v1/projects/{}/push", p.name), &body, std::time::Duration::from_secs(3))
+    }));
+    assert!(gave_up.is_err(), "the client gave up before the push was answered: {:?}", gave_up.map(|r| r.status));
+    // The push's own pack is in storage by now (written before its
+    // transaction, which waits on the row).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while packs_without_rows(&hub, pid).is_empty() {
+        assert!(std::time::Instant::now() < deadline, "the push never wrote its own pack");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    hub.rt.block_on(lock.rollback()).unwrap();
+    // Whatever the push does now, it has had time to do it.
+    std::thread::sleep(std::time::Duration::from_secs(10));
+    let tip = api.tips(Some(&c.token), &p.name).unwrap().branches["main"];
+    let orphans = packs_without_rows(&hub, pid);
+    assert!(orphans.is_empty(), "packs in storage with no row: {orphans:?} (the push landed: {})", tip != c.tip);
+}
+
+/// BUG-1398 (S28 cycle 2; BUG-1153's class): a pull is no push, yet the
+/// projections it stores count as a push's storage writes. `tips` and
+/// `history` project each tip for the viewer (`sync::projected`), and a
+/// projection made then is stored with `Objects::put` (`sync.rs`
+/// `projected_inner`), outside `in_background`; grants' trees were moved
+/// there in cycle 2 (`grant.rs`), these were not. The deriver projects
+/// every view in the background after a landing (`derive::memo_tips`), but
+/// a view can appear without one: here carol joins a group (a new way to
+/// read the project), and her first pull projects the history for it.
+/// `veil-bench load` takes `storage_writes - storage_background_writes` as
+/// the pushes' writes; so does `writes` here.
+#[test]
+#[ignore = "BUG-1398: a pull's projections are counted as a push's storage writes (storage_push_writes_per_op)"]
+fn bug_1398_a_pulls_projections_are_not_counted_as_a_pushs_writes() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "security", &p.carol.name, "--confirm", &p.carol.fingerprint()]);
+    settle(&hub);
+    let w = writes(&hub);
+    let all = hub.hub().objects.writes.load(Relaxed);
+    let tips = hub.api().tips(Some(&p.carol.token()), &p.name).unwrap();
+    assert!(tips.branches.contains_key("main"), "the tips were read");
+    settle(&hub);
+    assert!(hub.hub().objects.writes.load(Relaxed) > all, "the pull stored its projections");
+    assert_eq!(writes(&hub) - w, 0, "a pull's storage writes were counted as a push's");
+}
+
+/// BUG-1397 (S28 cycle 2; BUG-1156's class): an API commit reads every
+/// upload's encoding into memory **before** it takes its share of the
+/// server-wide bound on decoded bytes (`sync::take_uploads`: the
+/// `staged_encoding` loop, then `ReadAhead::wait`). Uploads that do not
+/// compress are stored plain, so an encoding is as large as the object:
+/// every API commit waiting for its share holds what it names (up to
+/// 1 GiB, `MAX_API_UPLOADS`), outside the bound. Eight commits of 192 MiB
+/// at once: the bound lets one decode at a time, while all of them hold
+/// their encodings. Hostile size: run alone.
+#[test]
+#[ignore = "BUG-1397: API commits read their uploads' encodings before taking their share of the decoded bound"]
+fn hostile_bug_1397_api_commits_read_their_uploads_within_the_servers_bound() {
+    use veil_core::hub::{encoding, wire::put_frame};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let token = p.dev.token();
+    let base = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+    let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+    let commits: Vec<serde_json::Value> = (0..8)
+        .map(|n| {
+            let mut edits = Vec::new();
+            let mut receipts = serde_json::Map::new();
+            for i in 0..4 {
+                // 48 MiB that does not compress: stored plain.
+                let mut b = vec![0u8; 48 << 20];
+                for w in b.as_chunks_mut::<8>().0 {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    w.copy_from_slice(&x.to_le_bytes());
+                }
+                let raw = O::Blob(b).encode();
+                let id = ObjectId::hash(&raw);
+                let enc = encoding::encode(&raw).into_owned();
+                assert!(!encoding::is_compressed(&enc), "stored plain");
+                let mut body = Vec::new();
+                put_frame(&mut body, &id, &enc);
+                drop((raw, enc));
+                let up = api.upload_encoded_body(&token, &p.name, &body);
+                assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+                let r: Vec<String> = serde_json::from_value(up.json()["receipts"].clone()).unwrap();
+                receipts.insert(id.hex(), json!(r[0]));
+                edits.push(json!({"path": format!("src/plain{n}/b{i}.bin"), "put": {"object": id.hex()}}));
+            }
+            json!({"base": base.hex(), "description": "large, plain", "edits": edits, "receipts": receipts})
+        })
+        .collect();
+    let vm = |field: &str| -> u64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        let l = s.lines().find(|l| l.starts_with(field)).unwrap();
+        l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() << 10
+    };
+    std::fs::write("/proc/self/clear_refs", "5").unwrap();
+    let before = vm("VmRSS:");
+    let replies: Vec<Reply> = std::thread::scope(|s| {
+        let hs: Vec<_> = commits.iter().map(|c| s.spawn(|| api.post_json_within(&token, &format!("/v1/projects/{}/changes", p.name), c, std::time::Duration::from_secs(1200)))).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for r in &replies {
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    }
+    let grew = vm("VmHWM:").saturating_sub(before);
+    assert!(grew < 1 << 30, "eight API commits at once took the server {} MiB past where it was", grew >> 20);
+}
+

@@ -660,4 +660,96 @@ mod tests {
         let g = packs.projects.lock().unwrap();
         assert!(g.values().map(|p| p.weight()).sum::<usize>() <= budget);
     }
+
+    /// BUG-1395 (S28 cycle 2): a project whose lookup map alone passes the
+    /// budget is dropped by the eviction that follows adding it, so the
+    /// lookup right after finds a fresh, unloaded map: `refresh` reads the
+    /// listing and every index, `add`s them (`loaded`), and `evict` removes
+    /// the project it just filled; `Objects::in_pack` then asks `find`,
+    /// which makes a new empty map (`Found::Unloaded`), and answers `None`.
+    /// Every packed object of a project with more than about 1.68 million
+    /// of them (`LOOKUP_BUDGET` / `SLOT_WEIGHT`) reads as missing, each read
+    /// after reading every index of the project again (twice: `in_pack` is
+    /// asked again after the loose read). What `refresh` does with the
+    /// listing a database gave, here with a budget of 1 MiB.
+    #[test]
+    #[ignore = "BUG-1395: a project whose lookup map passes the budget is evicted as it is filled: its packed objects read as missing"]
+    fn bug_1395_a_project_past_the_lookup_budget_still_finds_its_objects() {
+        let budget = 1 << 20;
+        let packs = Packs { budget, ..Packs::new(None) };
+        let n = budget / SLOT_WEIGHT + 100;
+        let objects: Vec<_> = (0..n).map(|i| obj(&format!("big {i}"))).collect();
+        let probe = objects[n / 2].0;
+        let index = Arc::new(build(objects).unwrap().1);
+        // `refresh`, with the listing a database answered.
+        packs.add(7, vec![(Arc::from(new_name()), index)], true);
+        // `Objects::in_pack`, right after.
+        let found = packs.find(7, &probe);
+        assert!(matches!(found, Found::At(..)), "an object of a listed pack, just read, is not found (unloaded: {})", matches!(found, Found::Unloaded));
+    }
+
+    /// BUG-1396 (S28 cycle 2), the same class: the recent uploads of each
+    /// person in each project (`Packs::recent`, for a retry's receipts) are
+    /// kept for every pair that ever uploaded on this server, never dropped:
+    /// unlike the staged indexes beside them (an `LruCache` of 32 MiB), the
+    /// map grows with the server's uptime.
+    #[test]
+    #[ignore = "BUG-1396: the recent uploads map keeps an entry for every (project, person) that ever uploaded: never bounded"]
+    fn bug_1396_recent_uploads_are_bounded() {
+        let packs = Packs::new(None);
+        let index = Arc::new(build(vec![obj("one")]).unwrap().1);
+        for person in 0..200_000 {
+            packs.staged_here(1, person, &Arc::from(new_name()), index.clone(), 100);
+        }
+        let kept = packs.recent.lock().unwrap().len();
+        assert!(kept <= 10_000, "{kept} people's recent uploads kept, with nothing staged left to name for most");
+    }
+
+    /// BUG-1396 (S28 cycle 2): the lookup maps' weight is counted at 80
+    /// bytes a slot, but a slot is a 64-byte entry of a `HashMap` whose
+    /// table doubles (a power of two of buckets, filled to 7/8 at most):
+    /// just past a doubling, a slot takes about 146 bytes. Measured in a
+    /// child process (`MALLOC_MMAP_THRESHOLD_` fixed, so freed tables go
+    /// back to the system): maps the budget allows of projects of 460,000
+    /// packed objects each hold about 1.5 times `LOOKUP_BUDGET`.
+    #[test]
+    #[ignore = "BUG-1396: the lookup maps hold up to ~1.8x LOOKUP_BUDGET: a slot is counted at 80 bytes, a doubled table holds ~146"]
+    fn bug_1396_lookup_maps_stay_within_their_budget_in_memory() {
+        const CHILD: &str = "VEIL_TEST_LOOKUP_MAPS_CHILD";
+        const NAME: &str = "pack::tests::bug_1396_lookup_maps_stay_within_their_budget_in_memory";
+        if std::env::var_os(CHILD).is_some() {
+            let rss = || -> usize {
+                let s = std::fs::read_to_string("/proc/self/status").unwrap();
+                let l = s.lines().find(|l| l.starts_with("VmRSS:")).unwrap();
+                l.split_whitespace().nth(1).unwrap().parse::<usize>().unwrap() << 10
+            };
+            let packs = Packs::new(None);
+            let before = rss();
+            for p in 0..6i64 {
+                let mut entries: Vec<(ObjectId, Slot)> = (0..460_000u64)
+                    .map(|i| (ObjectId::hash(&[p.to_le_bytes(), i.to_le_bytes()].concat()), Slot { offset: 1 << 30, len: 100 }))
+                    .collect();
+                entries.sort_by_key(|e| e.0);
+                packs.listed_here(p, vec![(Arc::from(new_name()), Arc::new(Index { entries }))]);
+            }
+            let grew = rss().saturating_sub(before);
+            let g = packs.projects.lock().unwrap();
+            let accounted: usize = g.values().map(|p| p.weight()).sum();
+            println!("LOOKUP-MAPS projects={} accounted={accounted} grew={grew}", g.len());
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--nocapture", "--include-ignored", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("MALLOC_MMAP_THRESHOLD_", "131072")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "the child failed: {text}{}", String::from_utf8_lossy(&out.stderr));
+        let line = text.lines().find_map(|l| l.find("LOOKUP-MAPS").map(|at| &l[at..])).unwrap_or_else(|| panic!("no measurement in {text}"));
+        let field = |k: &str| -> usize { line.split_whitespace().find_map(|w| w.strip_prefix(k)).unwrap().parse().unwrap() };
+        let (accounted, grew) = (field("accounted="), field("grew="));
+        assert!(accounted <= LOOKUP_BUDGET, "{line}");
+        assert!(grew <= LOOKUP_BUDGET + (8 << 20), "the lookup maps took {} MiB of memory for a budget of {} MiB ({line})", grew >> 20, LOOKUP_BUDGET >> 20);
+    }
 }

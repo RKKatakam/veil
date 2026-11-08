@@ -1181,6 +1181,174 @@ mod tests {
         }
     }
 
+    /// BUG-1394 (S28 cycle 2; BUG-1154's class): every read checks the id
+    /// an entry **starts** with, but nothing checks where a slot **ends**.
+    /// A slot whose length is too long (a damaged index, a merger's
+    /// mistake: what BUG-1154 is about) starts at its own entry, passes the
+    /// id check, and runs on into the next entry: a ranged read of a plain
+    /// object serves the neighbour's id and bytes after its own. Whole reads
+    /// are decoded and checked against the id, so only ranges (and
+    /// `head`'s length) are wrong. `parse_index` accepts it: slots are
+    /// checked to be inside the pack, not to tile it.
+    #[tokio::test]
+    #[ignore = "BUG-1394: a slot longer than its entry passes the id check and a ranged read serves the next entry's bytes"]
+    async fn bug_1394_a_slot_too_long_never_serves_its_neighbours_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20);
+        let open = Bytes::from_static(b"veil:blob\nan open file, readable by its grant: 0123");
+        let hidden = Bytes::from_static(b"veil:blob\nMARKER-HIDDEN-NEIGHBOUR-OBJECT-8f3a61c2d0");
+        let (oid, hid) = (ObjectId::hash(&open), ObjectId::hash(&hidden));
+        let encs = vec![(oid, encode(open.clone())), (hid, encode(hidden.clone()))];
+        assert!(!encoding::is_compressed(&encs[0].1) && !encoding::is_compressed(&encs[1].1), "both stored plain");
+        let (name, index, _) = objects.put_pack(1, encs).await.unwrap();
+        let (os, hs) = (index.get(&oid).unwrap(), index.get(&hid).unwrap());
+        assert_eq!(os.offset + u64::from(os.len), hs.offset, "the hidden entry follows the open one");
+        // The index damaged: the open object's slot as long as both entries.
+        let path = dir.path().join(crate::pack::key(1, &name));
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = bytes.windows(32).position(|w| w == oid.0).expect("the open object's index entry");
+        bytes[at + 40..at + 44].copy_from_slice(&(os.len + hs.len).to_be_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let damaged = match crate::pack::parse_index(&bytes, Some(bytes.len() as u64)) {
+            // Refusing the index closes the class: nothing to read.
+            Err(_) => return,
+            Ok(i) => Arc::new(i),
+        };
+        let fresh = Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20);
+        fresh.listed_here(1, vec![(name.clone(), damaged)]);
+        assert!(fresh.get(1, &oid).await.is_err(), "a whole read checks the object against its id");
+        let marker = b"MARKER-HIDDEN-NEIGHBOUR-OBJECT";
+        // Ranges from the start, the middle and the end: the object's own
+        // bytes or an error.
+        for (start, end) in [(0, u64::MAX), (20, u64::MAX), (open.len() as u64 - 4, open.len() as u64 + 200)] {
+            match fresh.get_range(1, &oid, start, end).await {
+                Err(_) => {}
+                Ok(Some((part, len))) => {
+                    assert!(
+                        !part.windows(marker.len()).any(|w| w == marker),
+                        "a range {start}..={end} of one object served its neighbour's bytes: {:?}",
+                        String::from_utf8_lossy(&part)
+                    );
+                    assert_eq!(&part[..], &open[(start as usize).min(open.len())..], "a range served other bytes than the object's");
+                    assert_eq!(len, open.len() as u64, "the object's length");
+                }
+                Ok(None) => panic!("a listed object read as absent"),
+            }
+        }
+    }
+
+    /// Property 2 (S28 cycle 2): neighbours read in one ranged request,
+    /// one entry of them damaged in the pack (its id's bytes): the others
+    /// are read and cached, the damaged one is not, and its own read is an
+    /// error, never another object's bytes.
+    #[tokio::test]
+    async fn neighbour_reads_check_every_entry_of_a_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20);
+        let raws: Vec<Bytes> = (0..3).map(|i| Bytes::from(format!("veil:blob\nneighbour {i}: MARKER-NEIGHBOUR-{i}-ab37"))).collect();
+        let encs: Vec<(ObjectId, Bytes)> = raws.iter().map(|r| (ObjectId::hash(r), encode(r.clone()))).collect();
+        let ids: Vec<ObjectId> = encs.iter().map(|(id, _)| *id).collect();
+        let (name, index, _) = objects.put_pack(1, encs).await.unwrap();
+        let path = dir.path().join(crate::pack::key(1, &name));
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = index.get(&ids[1]).unwrap();
+        bytes[mid.offset as usize] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        let fresh = Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20);
+        fresh.listed_here(1, vec![(name, index)]);
+        fresh.prefetch(1, &ids).await;
+        assert_eq!(fresh.reads.load(Ordering::Relaxed), 1, "one ranged request for the three");
+        let cached = |id: &ObjectId| fresh.cache.get(&Objects::cache_key(1, id)).is_some();
+        assert!(cached(&ids[0]) && cached(&ids[2]) && !cached(&ids[1]), "the intact neighbours are cached, the damaged one is not");
+        assert_eq!(fresh.get(1, &ids[0]).await.unwrap(), Some(raws[0].clone()));
+        assert_eq!(fresh.get(1, &ids[2]).await.unwrap(), Some(raws[2].clone()));
+        assert!(fresh.get(1, &ids[1]).await.is_err(), "the damaged entry is an error");
+        assert!(fresh.get_range(1, &ids[1], 0, u64::MAX).await.is_err(), "a range of it too");
+    }
+
+    /// BUG-1159 (S28 cycle 2; BUG-1087's class): the neighbour reads of a
+    /// fetch (`Objects::prefetch`) take a share of the server-wide bound
+    /// for the bytes they **read** (`ReadAhead::try_take(end - start + 1)`,
+    /// at most `PREFETCH_SPAN`), then check each object by decoding it
+    /// whole (`decoded`) outside any share: a compressed object decodes to
+    /// up to 64 times its encoding (`encoding::MAX_RATIO`). Before cycle 2 a
+    /// fetch read each object under a share of its decoded size (BUG-1087).
+    /// Fetches of the same objects, not yet cached, right after a push (a
+    /// fleet of clones) each decode them. Measured in a child process: 32
+    /// prefetches at once of two neighbouring objects of 48 MiB that compress
+    /// about 52 times hold far more than `DECODED_IN_FLIGHT` decoded.
+    #[test]
+    #[ignore = "BUG-1159: a fetch's neighbour reads decode each object outside the server-wide bound on decoded bytes"]
+    fn bug_1159_neighbour_reads_decode_within_the_servers_bound() {
+        const CHILD: &str = "VEIL_TEST_PREFETCH_CHILD";
+        const NAME: &str = "store::tests::bug_1159_neighbour_reads_decode_within_the_servers_bound";
+        if std::env::var_os(CHILD).is_some() {
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(16).enable_all().build().unwrap();
+            rt.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let objects = Objects::new(Arc::new(FsStore::new(dir.path())), 64 << 20);
+                let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+                let mut encs = Vec::new();
+                for side in *b"ab" {
+                    let mut raw = b"veil:blob\n".to_vec();
+                    raw.resize(48 << 20, 0);
+                    for i in (16..raw.len()).step_by(80) {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        raw[i] = x as u8;
+                    }
+                    raw[12] = side;
+                    let raw = Bytes::from(raw);
+                    let enc = encode(raw.clone());
+                    assert!(encoding::is_compressed(&enc) && encoding::within_ratio(&enc), "compressed within the ratio: {}", enc.len());
+                    encs.push((ObjectId::hash(&raw), enc));
+                }
+                let ids: Vec<ObjectId> = encs.iter().map(|(id, _)| *id).collect();
+                let (name, index, _) = objects.put_pack(1, encs).await.unwrap();
+                drop(objects);
+                // A server that has not read them.
+                let fresh = Arc::new(Objects::new(Arc::new(FsStore::new(dir.path())), 64 << 20));
+                fresh.listed_here(1, vec![(name, index)]);
+                let vm = |field: &str| -> u64 {
+                    let s = std::fs::read_to_string("/proc/self/status").unwrap();
+                    let l = s.lines().find(|l| l.starts_with(field)).unwrap();
+                    l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() << 10
+                };
+                std::fs::write("/proc/self/clear_refs", "5").unwrap();
+                let before = vm("VmRSS:");
+                let mut set = tokio::task::JoinSet::new();
+                for _ in 0..32 {
+                    let (f, ids) = (fresh.clone(), ids.clone());
+                    set.spawn(async move { f.prefetch(1, &ids).await });
+                }
+                while let Some(r) = set.join_next().await {
+                    r.unwrap();
+                }
+                let grew = vm("VmHWM:").saturating_sub(before);
+                let reads = fresh.reads.load(Ordering::Relaxed);
+                assert!(fresh.cache.get(&Objects::cache_key(1, &ids[0])).is_some(), "the prefetches read the objects");
+                println!("PREFETCH grew={grew} reads={reads}");
+            });
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--nocapture", "--include-ignored", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "the child failed: {text}{}", String::from_utf8_lossy(&out.stderr));
+        let line = text.lines().find_map(|l| l.find("PREFETCH").map(|at| &l[at..])).unwrap_or_else(|| panic!("no measurement in {text}"));
+        let grew: u64 = line.split_whitespace().find_map(|w| w.strip_prefix("grew=")).unwrap().parse().unwrap();
+        assert!(
+            grew <= u64::from(DECODED_IN_FLIGHT) + (64 << 20),
+            "32 neighbour reads at once held {} MiB, past the {} MiB bound on decoded bytes ({line})",
+            grew >> 20,
+            DECODED_IN_FLIGHT >> 20
+        );
+    }
+
     /// The header of a zstd frame declaring `size` bytes of content (and
     /// one empty raw block): enough for a decoder to refuse it from its
     /// header.
