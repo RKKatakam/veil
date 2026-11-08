@@ -780,9 +780,10 @@ fn the_daemons_memory_stays_within_its_budget() {
     for round in ["cold", "warm"] {
         std::thread::scope(|s| {
             for _ in 0..24 {
+                // One grant for all (24 tips requests at once would test
+                // the server's database pool, not the daemon).
                 s.spawn(|| {
-                    let mine = Reader::new(&server, &d.socket, &hub.authority(), Some(&admin), &name);
-                    let got = mine.batch(&files);
+                    let got = r.batch(&files);
                     assert_eq!(got.len(), 2, "{round}: every file arrives");
                 });
             }
