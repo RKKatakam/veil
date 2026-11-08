@@ -23,7 +23,7 @@
 //!   may grow past its quarter while it is all its device holds, up to the
 //!   whole signed-in pool; past the pool its bytes are not counted (one
 //!   such body at a time).
-//! * **A body must keep arriving** ([`Arrival`]): after a grace of 20 s,
+//! * **A body must keep arriving** (`Arrival`): after a grace of 20 s,
 //!   16 KiB/s on average (the cache's rule, BUG-1183), at least 8 KiB/s in
 //!   every 20 s window, and it may hold at most what it sends in 10 minutes
 //!   at its last window's rate. A slow client therefore holds in proportion
@@ -321,7 +321,7 @@ impl Arrival {
 }
 
 /// Read and drop what is left of a refused body, at most `most` bytes, as
-/// long as it keeps the rules of [`Arrival`]: the client then reads its
+/// long as it keeps the rules of `Arrival`: the client then reads its
 /// refusal instead of a broken connection, and nothing is held.
 pub async fn drain(body: &mut Body, most: u64) {
     let mut arrival = Arrival::new();
