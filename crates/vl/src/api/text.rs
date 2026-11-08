@@ -107,8 +107,10 @@ fn change_mark(c: &Change) -> String {
 }
 
 pub fn status(s: &Status) {
-    if s.changes.is_empty() {
+    if s.changes.is_empty() && s.not_recorded.is_empty() {
         println!("The working copy has no changes.");
+    } else if s.changes.is_empty() {
+        println!("The working copy has no changes that can be recorded.");
     } else {
         println!("Working copy changes:");
         changes_summary(&s.changes);
@@ -163,6 +165,12 @@ pub fn status(s: &Status) {
         println!("{}", red("Unresolved conflicts:"));
         for c in &s.conflicts {
             match &c.recorded_on {
+                _ if c.kept_edit => println!(
+                    "  {} {}  (your edit of the version you held before you lost access to its folder; the recorded version is newer: `vl restore {}` takes it)",
+                    red("C"),
+                    safe(&c.path),
+                    safe(&c.path)
+                ),
                 Some(change) => println!("  {} {}  (recorded on {change})", red("C"), safe(&c.path)),
                 None => println!("  {} {}", red("C"), safe(&c.path)),
             }
@@ -171,6 +179,15 @@ pub fn status(s: &Status) {
             "  {} edit the files to resolve the conflict markers (a conflict is resolved once they are gone), or keep one version with `vl resolve PATH --ours|--theirs`. Fold the resolution into the merge with `vl squash`, or `vl commit` it",
             dim("hint:")
         );
+    }
+    for h in &s.hidden {
+        println!("  {} {} {}", yellow("redacted"), safe(h), dim("(you no longer have access to this folder; not compared)"));
+    }
+    if !s.not_recorded.is_empty() {
+        println!("{}", yellow("In a folder you no longer have access to (not recorded; left as they are):"));
+        for p in &s.not_recorded {
+            println!("  {} {}", yellow("U"), safe(p));
+        }
     }
     if !s.renormalizable.is_empty() {
         println!(

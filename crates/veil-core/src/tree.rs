@@ -223,8 +223,7 @@ pub fn refused_tree(store: &ObjectStore, err: &VeilError) -> bool {
 pub fn no_access(path: &VPath, why: &str) -> VeilError {
     let shown = if path.is_root() { "/".to_string() } else { format!("{path}/") };
     VeilError::Policy(format!(
-        "{shown} is a folder you no longer have access to (the server refuses its content) and {why}; nothing was changed. \
-         `vl pull` brings what you may read now"
+        "{shown} is a folder you no longer have access to (the server refuses its content) and {why}; nothing was changed"
     ))
 }
 

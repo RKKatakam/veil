@@ -579,9 +579,15 @@ fn keyword_tier(keyword: &str) -> (&'static str, Option<String>) {
 /// Why `e` cannot be materialised here, in the words of `vl status`
 /// (`render::hidden_reason`).
 fn redaction_for_listing(repo: &Repo, e: &TreeEntry) -> Option<Redaction> {
-    // A folder carried as recorded: the server refuses it (BUG-1508).
+    // A folder carried as recorded: `no_access` only where the server
+    // refuses it (BUG-1508); one carried for another reason says so.
     if e.kind == EntryKind::Dir {
-        return Some(Redaction { reason: "no_access", message: "you no longer have access to this folder".into() });
+        let store = repo.store();
+        let refused = !store.has(&e.id) && matches!(store.tree(&e.id), Err(err) if veil_core::tree::refused_tree(store, &err));
+        return Some(match refused {
+            true => Redaction { reason: "no_access", message: "you no longer have access to this folder".into() },
+            false => Redaction { reason: "error", message: "its content could not be read here; kept as recorded".into() },
+        });
     }
     if e.kind == EntryKind::Conflict {
         return Some(Redaction {
@@ -638,6 +644,15 @@ pub struct Status {
     /// convert (`vl renormalize` re-records them). Omitted when none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub renormalizable: Vec<String>,
+    /// Files in a folder you no longer have access to (a thin clone; the
+    /// folder is kept as recorded): never recorded, never touched
+    /// (BUG-1528). Omitted when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub not_recorded: Vec<String>,
+    /// Folders the working-copy change's diff did not compare: the server
+    /// refuses them (as in `veil.diff/2`). Omitted when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hidden: Vec<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -692,6 +707,11 @@ pub struct Conflict {
     /// recorded as markers in the file (older formats, embargoes) or a
     /// file moved aside by a file/directory conflict.
     pub conflict: Option<ConflictInfo>,
+    /// Your own edit of a version you held before you lost access to its
+    /// folder, kept when the folder was written back (the recorded version
+    /// is newer, BUG-1531). Absent otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub kept_edit: bool,
 }
 
 pub fn status(ctx: &Ctx) -> Result<Status> {
@@ -699,7 +719,7 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
     let wc = ctx.wc()?;
     let s = repo.snapshot(&wc)?;
     let base = repo.parents_tree(&s.parents)?.tree;
-    let (changes, _) = veil_core::tree::diff_trees_hiding(repo.store(), Some(&base), Some(&s.tree))?;
+    let (changes, hidden) = veil_core::tree::diff_trees_hiding(repo.store(), Some(&base), Some(&s.tree))?;
     let (changes, _) = detect_renames(repo, (&base, &s.tree), changes, &Renames::default())?;
     let report = &ctx.report;
     let embargo = EmbargoTiers::of(repo, &wc)?;
@@ -733,7 +753,7 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
             (ps.conflicts.contains(c) && before.is_some() && before == entry).then(|| ps.change_id.short())
         });
         let conflict = entry.as_ref().and_then(|e| conflict_info(repo, e));
-        conflicts.push(Conflict { path: c.clone(), recorded_on, conflict });
+        conflicts.push(Conflict { path: c.clone(), recorded_on, conflict, kept_edit: false });
     }
     for ps in &parents {
         for c in &ps.conflicts {
@@ -741,7 +761,7 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
             let before = lookup(repo.store(), &ps.tree, &cp)?;
             if before.is_some() && before == lookup(repo.store(), &s.tree, &cp)? && !conflicts.iter().any(|x| x.path == *c) {
                 let conflict = before.as_ref().and_then(|e| conflict_info(repo, e));
-                conflicts.push(Conflict { path: c.clone(), recorded_on: Some(ps.change_id.short()), conflict });
+                conflicts.push(Conflict { path: c.clone(), recorded_on: Some(ps.change_id.short()), conflict, kept_edit: false });
             }
         }
     }
@@ -786,8 +806,18 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
             .collect(),
         nested: report.nested.iter().map(path).collect(),
         redacted,
-        conflicts,
+        conflicts: {
+            // Kept edits of a version left with a folder (BUG-1531).
+            for k in ctx.materialised().kept_edits() {
+                if !conflicts.iter().any(|c| c.path == k.as_str()) {
+                    conflicts.push(Conflict { path: path(k), recorded_on: None, conflict: None, kept_edit: true });
+                }
+            }
+            conflicts
+        },
         renormalizable: report.renormalizable.iter().map(path).collect(),
+        not_recorded: report.not_recorded.iter().map(path).collect(),
+        hidden: hidden.iter().map(|h| hidden_dir(&h.path)).collect(),
     })
 }
 

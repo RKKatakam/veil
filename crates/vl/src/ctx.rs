@@ -430,6 +430,11 @@ impl Ctx {
         &self.cache
     }
 
+    /// The record of what the working copy was materialised from.
+    pub fn materialised(&self) -> &veil_core::checkout::Materialised {
+        &self.checkout.materialised
+    }
+
     pub fn wc(&self) -> Result<ObjectId> {
         if self.bare {
             return Err(anyhow!("this is a bare repository (an old path remote): it has no working copy"));

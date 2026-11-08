@@ -1277,11 +1277,27 @@ fn fin_change_across_a_refused_folder(p: &Project, hub: &TestHub, name: &str, bi
     d
 }
 
+/// The store of `clone`, opened as a test reads it.
+fn open_store(clone: &Path) -> std::sync::Arc<veil_core::store::ObjectStore> {
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(clone)), None, "test").unwrap();
+    repo.store().clone()
+}
+
+/// The tree of what `rev` names in `clone` (a tag, or a tag and `-`).
+fn tree_of(clone: &Path, rev: &str) -> veil_core::ObjectId {
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(clone)), None, "test").unwrap();
+    let (tag, up) = rev.strip_suffix('-').map_or((rev, false), |t| (t, true));
+    let mut s = repo.snapshot(&repo.view().tags[tag].target).unwrap();
+    if up {
+        s = repo.snapshot(&s.parents[0]).unwrap();
+    }
+    s.tree
+}
+
 /// The entry at `path` in the tree of what `rev` names in `clone`.
 fn entry_in(clone: &Path, rev: &str, path: &str) -> veil_core::TreeEntry {
-    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(clone)), None, "test").unwrap();
-    let tree = repo.snapshot(&repo.view().tags[rev].target).unwrap().tree;
-    veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new(path).unwrap()).unwrap().unwrap()
+    let tree = tree_of(clone, rev);
+    veil_core::tree::lookup(&open_store(clone), &tree, &veil_core::VPath::new(path).unwrap()).unwrap().unwrap()
 }
 
 /// What a refused command must leave as it was: the op log's head, the
@@ -1548,7 +1564,6 @@ fn s8h_review_readers_reveal_nothing_inside_a_refused_folder() {
 /// neither recorded nor reported: `vl status` says "no changes", and `vl
 /// commit` records the folder by id without it.
 #[test]
-#[ignore = "BUG-1528: a file created in a folder the checkout left out is silently not recorded, and vl status does not say so"]
 fn bug_1528_a_file_made_in_a_left_out_folder_is_not_recorded_silently() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
@@ -1560,13 +1575,27 @@ fn bug_1528_a_file_made_in_a_left_out_folder_is_not_recorded_silently() {
     write_files(&d, &[(&format!("{BILL_DIR}/acme/after.txt"), "MINE-AFTER\n")]);
     let st = p.fin.ok(&d, &["status"]);
     assert!(st.contains(&format!("{BILL_DIR}/acme/after.txt")), "vl status says what became of the new file: {st}");
+    // Decided: under a heading of its own; `vl commit` records the rest and
+    // says once what it left; the files are never touched.
+    let heading = st.find("no longer have access to (not recorded").expect("the heading");
+    assert!(st[heading..].contains(&format!("{BILL_DIR}/acme/after.txt")) && st[heading..].contains(&format!("{BILL_DIR}/acme/deploy.pem")), "{st}");
+    write_files(&d, &[("src/also.txt", "recorded\n")]);
+    let c = p.fin.ok(&d, &["commit", "-m", "the rest"]);
+    assert!(c.contains("Committed") && c.contains("not recorded") && c.contains(&format!("{BILL_DIR}/acme/after.txt")), "{c}");
+    let (_, parent) = wc_entries(&d, "src/also.txt");
+    assert!(parent.is_some(), "the rest is recorded");
+    let (_, bill) = wc_entries(&d, BILL_DIR);
+    assert_eq!(bill, Some(entry_in(&d, "feature", BILL_DIR)), "the folder kept by id");
+    assert_eq!(std::fs::read_to_string(d.join(format!("{BILL_DIR}/acme/after.txt"))).unwrap(), "MINE-AFTER\n");
+    assert_eq!(std::fs::read_to_string(d.join(format!("{BILL_DIR}/acme/deploy.pem"))).unwrap(), "MINE-PEM\n");
+    let again = p.fin.ok(&d, &["log", "-n", "1"]);
+    assert!(!again.contains("not recorded"), "said once, by commit: {again}");
 }
 
 /// BUG-1529: `vl restore`, `vl split` and `vl squash` by path refuse when a
 /// refused folder differs between the trees they compare, even though the
 /// paths asked for are elsewhere and the folder can be kept by id.
 #[test]
-#[ignore = "BUG-1529: restore, split and squash by path refuse a refused folder that is not among the paths asked for"]
 fn bug_1529_restore_split_squash_refuse_a_refused_folder_not_asked_for() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
@@ -1574,12 +1603,33 @@ fn bug_1529_restore_split_squash_refuse_a_refused_folder_not_asked_for() {
     p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
     p.fin.ok(&d, &["new", "feature"]);
     let theirs = entry_in(&d, "feature", BILL_DIR);
+    let base = entry_in(&d, "feature-", BILL_DIR);
+    assert_ne!(theirs, base, "feature's last change changed the billing folder");
+    // Each from the same start (`vl undo` after it): the split moves
+    // `src/more.txt` out of `feature`, which the squash then names.
     for args in [vec!["restore", "--from", "feature-", "src/lib.rs"], vec!["split", "-r", "feature", "src/more.txt", "-m", "first"], vec!["squash", "-r", "feature", "src/more.txt"]] {
         let o = p.fin.run(&d, &args);
         let all = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         assert!(o.status.success(), "vl {args:?}: {all}");
+        assert_eq!(entry_in(&d, "feature", BILL_DIR), theirs, "vl {args:?}: the folder kept by id in the change");
+        if args[0] == "split" {
+            assert_eq!(entry_in(&d, "feature-", BILL_DIR), base, "the split's first change has the base's folder");
+            assert!(veil_core::tree::lookup(&open_store(&d), &tree_of(&d, "feature-"), &veil_core::VPath::new("src/more.txt").unwrap()).unwrap().is_some(), "and the path asked for");
+        }
+        if args[0] != "restore" {
+            p.fin.ok(&d, &["undo"]);
+        }
     }
     assert_eq!(entry_in(&d, "feature", BILL_DIR), theirs, "the folder kept by id");
+    // Decided (the narrower rule): only a path asked for in the folder
+    // needs its content, and is refused by name; nothing changes.
+    let inside = format!("{BILL_DIR}/acme/q3.txt");
+    for args in [vec!["restore", "--from", "feature-", inside.as_str()], vec!["split", "-r", "feature", inside.as_str(), "-m", "first"]] {
+        let before = p.fin.ok(&d, &["op", "log", "-n", "1", "--json"]);
+        let out = p.fin.fails(&d, &args);
+        assert!(out.contains(&format!("{BILL_DIR}/ is a folder you no longer have access to")) && out.contains("nothing was changed"), "vl {args:?}: {out}");
+        assert_eq!(p.fin.ok(&d, &["op", "log", "-n", "1", "--json"]), before, "vl {args:?} changed nothing");
+    }
 }
 
 /// BUG-1530: in a thin clone whose working copy carries a refused folder
@@ -1589,7 +1639,6 @@ fn bug_1529_restore_split_squash_refuse_a_refused_folder_not_asked_for() {
 /// fetched, and the server has no copy of it where this clone met it; run
 /// `vl pull`", `vl pull` included in the advice, so there is no way out.
 #[test]
-#[ignore = "BUG-1530: after vl pull, every command in a working copy carrying a refused folder fails with 'server could not be reached'"]
 fn bug_1530_a_pull_wedges_a_working_copy_carrying_a_refused_folder() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
@@ -1633,13 +1682,42 @@ fn bug_1509_a_change_carrying_a_refused_folder_by_id_cannot_be_pushed() {
     assert_eq!(got.get("src/kid.txt").map(Vec::as_slice), Some(b"kid\n".as_slice()));
 }
 
+/// BUG-1531, decided: when access comes back, a file kept on disk from the
+/// version a folder was left from is compared with that version: equal, it
+/// is the checkout's own copy, written over (below); different, it is the
+/// person's edit: kept as it is, and a conflict in `vl status`.
+#[test]
+fn bug_1531_an_edit_kept_through_a_left_out_folder_is_a_conflict_when_access_comes_back() {
+    const MINE: &str = "KEY=MARKER-FINS-OWN-EDIT-3c9a\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let d = plain_thin(&p, &hub, "wc");
+    p.fin.ok(&d, &["new", "feature"]);
+    feature_with(&p, &[(&format!("{BILL_DIR}/.env"), "KEY=MARKER-NEW-ENV-a14d\n")], &[], "rotate billing");
+    p.fin.ok(&d, &["pull"]);
+    p.fin.ok(&d, &["cat", "-r", "feature", "src/lib.rs"]);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&d, &["new", "feature"]);
+    assert!(out.contains(&format!("redacted {BILL_DIR}/")), "{out}");
+    let env = d.join(format!("{BILL_DIR}/.env"));
+    assert!(env.is_file(), "the checkout kept the secret it could not tell as its own");
+    std::fs::write(&env, MINE).unwrap();
+    p.admin.ok(&p.dir, &["group", "add", "finance", &p.fin.name]);
+    let st = p.fin.ok(&d, &["status"]);
+    assert_eq!(std::fs::read_to_string(&env).unwrap(), MINE, "the person's edit is never touched: {st}");
+    let c = st.find("Unresolved conflicts:").expect("a conflict");
+    assert!(st[c..].contains(&format!("{BILL_DIR}/.env")) && st[c..].contains("the recorded version is newer"), "{st}");
+    let json = p.fin.ok(&d, &["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(json.lines().next().unwrap()).unwrap();
+    assert!(v["conflicts"].as_array().unwrap().iter().any(|c| c["path"] == format!("{BILL_DIR}/.env") && c["kept_edit"] == true), "{json}");
+}
+
 /// BUG-1531: a secret the checkout kept on disk when it left its folder
 /// out (it could not tell it as its own) stays stale when access comes
 /// back: the folder's other files are filled in, the new `.env` is not, and
 /// the working copy holds the old secret while history holds the new one
 /// ("kept as recorded … its edit is not recorded").
 #[test]
-#[ignore = "BUG-1531: when access comes back, a secret left on disk by the checkout that left its folder out stays stale"]
 fn bug_1531_a_secret_left_on_disk_stays_stale_when_access_comes_back() {
     const NEW_ENV: &str = "KEY=MARKER-NEW-ENV-71c0d2e9\n";
     let hub = TestHub::start();

@@ -656,6 +656,10 @@ pub struct BuildReport {
     pub relabelled: Vec<(VPath, String)>,
     /// Entries carried over because this reader cannot materialise them.
     pub carried: Vec<VPath>,
+    /// Files the working copy holds in a folder carried by id because its
+    /// person no longer has access to it (BUG-1528): never recorded, never
+    /// touched; `vl status` and `vl commit` name them.
+    pub not_recorded: Vec<VPath>,
     pub ignored: usize,
     /// The ignored paths (`vl ls --all`), each with whether it is a
     /// directory (ignored as a whole, never descended into).
@@ -1050,6 +1054,10 @@ impl<'a> Builder<'a> {
                             // never left out or emptied either.
                             Err(err) if crate::tree::refused_tree(self.store, &err) => {
                                 if self.opts.materialised.is_some_and(|m| m.hidden(&path)) {
+                                    // What is there is listed, never silently
+                                    // left (BUG-1528), and never touched.
+                                    let files = crate::vfs::walk_files(self.fs, &path, &|_| false)?;
+                                    self.report.not_recorded.extend(files);
                                     self.report.carried.push(path.clone());
                                     f.out.insert(e.clone());
                                     continue;

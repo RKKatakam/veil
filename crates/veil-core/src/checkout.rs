@@ -153,6 +153,15 @@ pub struct Materialised {
     /// (`eol=crlf`). Whatever the attributes say later, such a file still
     /// holding exactly that rendering is the version, not an edit.
     crlf: BTreeSet<VPath>,
+    /// Folders left out because the server refuses them, with the tree of
+    /// the version the checkout left them from (when it could read it):
+    /// what it may still find of that version on disk once the folder is
+    /// readable again is its own copy (BUG-1531).
+    left: BTreeMap<VPath, ObjectId>,
+    /// Files below such a folder, written back once it was readable again,
+    /// where the working copy held the person's own edit of the version
+    /// left: kept, and a conflict for `vl status` until written over.
+    kept_edits: BTreeSet<VPath>,
 }
 
 /// On-disk form of [`Materialised`]: paths are plain strings, validated when
@@ -167,6 +176,10 @@ struct MaterialisedRaw {
     fallback: BTreeMap<String, ObjectId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     crlf: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    left: BTreeMap<String, ObjectId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    kept_edits: Vec<String>,
 }
 
 impl TryFrom<MaterialisedRaw> for Materialised {
@@ -185,6 +198,8 @@ impl TryFrom<MaterialisedRaw> for Materialised {
                 .map(|(s, id)| Ok((path(s)?, *id)))
                 .collect::<std::result::Result<_, String>>()?,
             crlf: r.crlf.iter().map(|s| path(s)).collect::<std::result::Result<_, _>>()?,
+            left: r.left.iter().map(|(s, id)| Ok((path(s)?, *id))).collect::<std::result::Result<_, String>>()?,
+            kept_edits: r.kept_edits.iter().map(|s| path(s)).collect::<std::result::Result<_, _>>()?,
         })
     }
 }
@@ -196,6 +211,8 @@ impl From<Materialised> for MaterialisedRaw {
             hidden: m.hidden.into_iter().map(|p| p.as_str().to_string()).collect(),
             fallback: m.fallback.into_iter().map(|(p, id)| (p.as_str().to_string(), id)).collect(),
             crlf: m.crlf.into_iter().map(|p| p.as_str().to_string()).collect(),
+            left: m.left.into_iter().map(|(p, id)| (p.as_str().to_string(), id)).collect(),
+            kept_edits: m.kept_edits.into_iter().map(|p| p.as_str().to_string()).collect(),
         }
     }
 }
@@ -225,7 +242,7 @@ impl Materialised {
 
     /// Nothing hidden, nothing from a fallback, nothing converted.
     pub fn is_empty(&self) -> bool {
-        self.view.is_none() && self.hidden.is_empty() && self.fallback.is_empty() && self.crlf.is_empty()
+        self.view.is_none() && self.hidden.is_empty() && self.fallback.is_empty() && self.crlf.is_empty() && self.left.is_empty() && self.kept_edits.is_empty()
     }
 
     /// Did checkout write the file at `path` with CRLF line endings for
@@ -249,6 +266,12 @@ impl Materialised {
     /// Every hidden path, in order.
     pub fn hidden_paths(&self) -> impl Iterator<Item = &VPath> {
         self.hidden.iter()
+    }
+
+    /// Files written back below a folder readable again where the working
+    /// copy kept the person's own edit of the version left (BUG-1531).
+    pub fn kept_edits(&self) -> impl Iterator<Item = &VPath> {
+        self.kept_edits.iter()
     }
 
     /// What checkout wrote at `path` instead of the entry itself, if it did
@@ -284,10 +307,12 @@ impl Materialised {
     fn absorb(&mut self, fs: &dyn StorageBackend, changes: &[TreeChange], report: &CheckoutReport) -> Result<()> {
         for c in changes {
             self.hidden.remove(&c.path);
+            self.kept_edits.remove(&c.path);
             // A folder left out whose files are now written (BUG-1508).
             let mut up = c.path.parent();
             while let Some(d) = up.filter(|d| !d.is_root()) {
                 self.hidden.remove(&d);
+                self.left.remove(&d);
                 up = d.parent();
             }
             self.fallback.remove(&c.path);
@@ -341,10 +366,51 @@ impl Materialised {
                 // (BUG-1508): written once it is readable again.
                 Lookup::Entry(e) if e.kind == EntryKind::Dir => match store.tree(&e.id) {
                     Ok(_) => {
+                        // What is on disk of the version the folder was left
+                        // from is the checkout's own copy where it still
+                        // holds that version (written over), and the
+                        // person's edit where it does not (kept, and a
+                        // conflict for `vl status`, BUG-1531).
+                        let old: BTreeMap<VPath, TreeEntry> = match self.left.get(&p) {
+                            Some(o) => walk_files_hiding(store, o)?.0.into_iter().collect(),
+                            None => BTreeMap::new(),
+                        };
+                        let at = |rel: &VPath| VPath::new(&format!("{p}/{rel}")).expect("a path below a tree's path");
+                        // The checkout's own copy: the bytes it wrote of the
+                        // version left (whatever the policy keeps local, a
+                        // copy of a version is not the person's file).
+                        let ours = |path: &VPath, rel: &VPath| -> bool {
+                            match (old.get(rel), fs.read(path)) {
+                                (Some(o), Ok(disk)) => read_materialised(store, o).is_ok_and(|(want, _)| want == disk),
+                                _ => false,
+                            }
+                        };
+                        let mut seen = BTreeSet::new();
                         for (rel, f) in walk_files_hiding(store, &e.id)?.0 {
-                            let path = VPath::new(&format!("{p}/{rel}")).expect("a path below a tree's path");
+                            let path = at(&rel);
+                            seen.insert(rel.clone());
+                            if fs.metadata(&path)?.is_some() {
+                                if !ours(&path, &rel) {
+                                    self.kept_edits.insert(path);
+                                    continue;
+                                }
+                                fs.remove_file(&path)?;
+                            }
                             changes.push(TreeChange { path, old: None, new: Some(f) });
                         }
+                        for (rel, _) in old.iter().filter(|(rel, _)| !seen.contains(*rel)) {
+                            let path = at(rel);
+                            if fs.metadata(&path)?.is_some() {
+                                match ours(&path, rel) {
+                                    true => fs.remove_file(&path)?,
+                                    false => {
+                                        self.kept_edits.insert(path);
+                                    }
+                                }
+                            }
+                        }
+                        self.left.remove(&p);
+                        self.hidden.remove(&p);
                     }
                     Err(err) if refused_tree(store, &err) => {}
                     Err(err) => return Err(err),
@@ -429,8 +495,15 @@ pub fn checkout_recorded(
     let shown = record.view.or(from.copied());
     let (changes, left_out) = checkout_changes(store, shown.as_ref(), to)?;
     let mut report = apply_changes(store, fs, shown.as_ref(), to, &changes, cache.as_deref_mut(), Some(&record.crlf))?;
-    report.redacted.extend(left_out);
+    report.redacted.extend(left_out.iter().map(|(p, _)| p.clone()));
     record.absorb(fs, &changes, &report)?;
+    // The version each folder was left from, for when it is readable again
+    // (BUG-1531); one left before keeps the version it was left from.
+    for (p, old) in left_out {
+        if let Some(old) = old {
+            record.left.entry(p).or_insert(old);
+        }
+    }
     record.view = None;
     report.merge(record.fill_in(store, fs, to, cache)?);
     Ok(report)
@@ -460,7 +533,10 @@ pub fn restore_paths(
     record: &mut Materialised,
     cache: Option<&mut StatCache>,
 ) -> Result<CheckoutReport> {
-    let changes: Vec<TreeChange> = diff_trees(store, Some(from), Some(to))?
+    // A folder the server refuses stays as it is: the caller refused a
+    // restore that asks for it (BUG-1529).
+    let changes: Vec<TreeChange> = diff_trees_hiding(store, Some(from), Some(to))?
+        .0
         .into_iter()
         .filter(|c| wanted(&c.path))
         .collect();
@@ -676,7 +752,7 @@ pub fn checkout_cached(
 ) -> Result<CheckoutReport> {
     let (changes, left_out) = checkout_changes(store, from, to)?;
     let mut report = apply_changes(store, fs, from, to, &changes, cache, None)?;
-    report.redacted.extend(left_out);
+    report.redacted.extend(left_out.into_iter().map(|(p, _)| p));
     Ok(report)
 }
 
@@ -687,7 +763,11 @@ pub fn checkout_cached(
 /// hidden content now lives) and the folder is reported, and recorded, as
 /// left out, so the builder carries it by id; a folder readable again is
 /// written whole.
-fn checkout_changes(store: &ObjectStore, from: Option<&ObjectId>, to: &ObjectId) -> Result<(Vec<TreeChange>, Vec<VPath>)> {
+/// The changes a checkout applies, and each folder it leaves out with the
+/// tree of the version it was left from (when readable).
+type CheckoutChanges = (Vec<TreeChange>, Vec<(VPath, Option<ObjectId>)>);
+
+fn checkout_changes(store: &ObjectStore, from: Option<&ObjectId>, to: &ObjectId) -> Result<CheckoutChanges> {
     let (mut changes, hidden) = diff_trees_hiding(store, from, Some(to))?;
     let mut left_out = Vec::new();
     let readable = |e: &Option<TreeEntry>| -> Result<Option<ObjectId>> {
@@ -715,7 +795,7 @@ fn checkout_changes(store: &ObjectStore, from: Option<&ObjectId>, to: &ObjectId)
                     }
                 }
                 if h.new.is_some() {
-                    left_out.push(h.path);
+                    left_out.push((h.path, old));
                 }
             }
         }
