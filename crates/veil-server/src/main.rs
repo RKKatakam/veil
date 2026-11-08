@@ -4,7 +4,7 @@
 //! veil-server --database-url postgres://… --data ./hub [--listen 127.0.0.1:8443]
 //!             [--storage DIR | --s3-endpoint URL --s3-bucket B]
 //!             [--tls-cert cert.pem --tls-key key.pem]   (default: self-signed)
-//!             [--device-rate 60/5000] [--anonymous-rate 20/1000]
+//!             [--device-rate 200/50000] [--anonymous-rate 20/1000]
 //!             [--max-connections 1024] [--request-memory 512M]   (docs/HUB.md §13.25)
 //! veil-server migrate --database-url postgres://…   (apply migrations, then exit)
 //! veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
@@ -59,20 +59,23 @@ struct Args {
     /// more of its own).
     #[arg(long, default_value_t = 32)]
     db_connections: u32,
-    /// Requests per signed-in device: a burst a second, then the most an
-    /// hour (`429` with `retry_after_ms` past it).
-    #[arg(long, default_value = "60/5000", value_parser = rate)]
+    /// Requests per signed-in device (one person's agents share it): a
+    /// burst a second, then the most an hour (`429` with `retry_after_ms`
+    /// past it).
+    #[arg(long, default_value = "200/50000", value_parser = rate)]
     device_rate: veil_server::limits::bucket::Rate,
     /// Requests per address without a session this server knows
     /// (anonymous reads of public folders, sign-in), as --device-rate.
     #[arg(long, default_value = "20/1000", value_parser = rate)]
     anonymous_rate: veil_server::limits::bucket::Rate,
     /// Most client connections open at once (the next waits until one
-    /// closes; one address opens at most an eighth of them).
+    /// closes; one address, an IPv6 /64, opens at most an eighth of them,
+    /// a regional cache's as many as it needs).
     #[arg(long, default_value_t = 1024)]
     max_connections: usize,
     /// Most bytes of request bodies held at once, all requests together
-    /// (K, M, G suffixes); a quarter of it for requests without a session.
+    /// (an eighth kept for small bodies, a quarter for requests without a
+    /// session), and as many of answers being written (K, M, G suffixes).
     #[arg(long, default_value = "512M", value_parser = bytes)]
     request_memory: u64,
 }

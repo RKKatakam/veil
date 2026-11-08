@@ -2476,22 +2476,27 @@ change; nothing new is encrypted.
 * `vl search WORDS… [--path] [--lang LANG] [-r BRANCH] [-n N] [--json] [-- PATH]`
   prints the server's answer (exit 1 when nothing matched).
 
-### 13.25 S24, part A: rate limits, request bodies under a budget, bulkheads, shedding, health (built)
+### 13.25 S24, part A: rate limits, request bodies and answers under a budget, bulkheads, shedding, health (built)
 
 Design: `docs/design/server/phase-4-agent-scale.md` §4.11, the S24 row of
 §8, threat rows 13 and 20; §4.7 here. Code: `crates/veil-server/src/limits/`
-(`mod.rs` the middleware, `bucket.rs` token buckets, `body.rs` request
-bodies, `gate.rs` bulkheads, `health.rs` the metrics); the listener in
-`lib.rs` (`serve`); one route and one layer in `api.rs`; `vl stats`
-(`crates/vl/src/stats_cmd.rs`). Everything is in each server's memory: no
-database work per request, no migration. The landing-specific parts
-(outstanding landings per agent session, a person's fair share of a batch,
-landing counters) come with the landing service (S17): it gets its own
-class in the gates, buckets keyed by agent session, and its counters in
-`health::Counts`.
+(`mod.rs` the middleware and the per-address connection share, `bucket.rs`
+token buckets, `body.rs` request bodies, `answers.rs` answers, `gate.rs`
+bulkheads, `health.rs` the metrics); the listener in `lib.rs` (`serve`); one
+route and one layer in `api.rs`; the regional cache passes on who its
+client is (`cache/mod.rs`, `as_cache`); `vl stats`
+(`crates/vl/src/stats_cmd.rs`), and `vl` waits out `retry_after_ms`
+(`crates/vl/src/hub.rs`, `Client::send`). Everything is in each server's
+memory: no database work per request but the session lookup a route makes
+anyway; no migration. Revised by the S24 cycle 1 review (BUG-1330 to
+BUG-1339). The landing-specific parts (outstanding landings per agent
+session, a person's fair share of a batch, landing counters) come with the
+landing service (S17), and per agent session buckets with S11: each agent
+session gets its own bucket at `--device-rate`, under a per-person bucket of
+ten times it.
 
 ```text
-veil-server … [--device-rate 60/5000] [--anonymous-rate 20/1000]
+veil-server … [--device-rate 200/50000] [--anonymous-rate 20/1000]
               [--max-connections 1024] [--request-memory 512M]
 vl stats [--json]
 GET /v1/projects/{p}/health        (the project's admins)
@@ -2500,78 +2505,114 @@ GET /v1/projects/{p}/health        (the project's admins)
 Every request passes through `limits::admit` before any route, in this order:
 
 1. **Who it counts against.** The device of a session this server knows
-   (the session cache, memory only), or of a read grant whose signature
-   verifies (the object routes: the `Veil-Grant` header, or a batch's
-   body); anyone else by address (IPv4, or the IPv6 /64). A bearer token
-   this server does not know yet (a restart, an evicted entry, or not a
-   session) first takes a token from its **address**, then is looked up
-   once as the route would (which caches it for both): made-up tokens reach
-   the database no faster than the address's rate.
+   (the session cache, memory only); a bearer token it does not know yet
+   (another server's session, a restart, an evicted entry, or not a
+   session) is looked up once, as the route would (which caches it for
+   both), under the address's own rate of lookups (`--device-rate`): a
+   session it finds pays its device, anything else the address
+   (BUG-1338). The device of a read grant whose signature verifies (the
+   object routes: the `Veil-Grant` header, or a batch's body). Anyone else
+   by address (IPv4, or the IPv6 /64). **A regional cache's requests**
+   carry the caches' token and its client's address (set by the cache's
+   listener, replacing any the client sent): the server counts them
+   against the grant's device or that client's address, never the
+   cache's (BUG-1332), and its own epoch feed against nobody.
 2. **Rate** (token buckets, `bucket.rs`): a burst of `per_second` refilled
-   at that rate, within `per_hour` an hour: devices 60/s and 5,000/h,
-   addresses without a session 20/s and 1,000/h. Past it, **`429
-   rate_limited`** with `retry_after_ms` (and `Retry-After`): the time until
-   the caller's own next token, the same for every project, hidden or not,
-   naming nothing. Idle buckets (full ones) are forgotten; a shard keeps at
-   most 16,384 keys. The regional caches' epoch feed (by the caches' token)
-   counts against nobody.
-3. **The body, under a memory budget** (`body.rs`, BUG-1187). Every request
-   body is counted, in KiB, against one of two pools of `--request-memory`:
-   the signed-in pool, and the anonymous pool (a quarter, at least 4 MiB).
-   A body of declared length takes its whole share in one step before any
-   byte is read (waiting at most 10 s, else `503 busy`); a chunked one twice
-   what it has received, as its buffer grows, and `busy` the moment there is
-   no more. **One client (device or address) holds at most a quarter of its
-   pool**: an anonymous body is at most a quarter of the anonymous pool
-   (32 MiB by default); a signed-in body larger than its quarter (a large
-   file's upload, up to the route's 2 GiB) only while its device holds
-   nothing else, and it takes at most the whole pool. **A body must arrive
-   at 16 KiB/s on average after 20 s** (the cache's rule, BUG-1183), else
-   `408` and the connection is closed. The share is held until the answer is
-   made. What is left of a body refused for its size or its share is read
-   and dropped (nothing held, at the same minimum rate), so the client reads
-   the refusal instead of a broken connection.
+   at that rate, within `per_hour` an hour: devices 200/s and 50,000/h (the
+   owner's decision: one person's agents share a device until S11; `vl`
+   sends about 18 requests a commit, push and pull, BUG-1339), addresses
+   without a session 20/s and 1,000/h. Past it, **`429 rate_limited`** with
+   `retry_after_ms` (and `Retry-After`): the time until the caller's own
+   next token, the same for every project, hidden or not, naming nothing.
+   `vl` waits it out (and a `503 busy`'s), at most 8 times and 2 minutes in
+   all (BUG-1331). Idle buckets (full ones) are forgotten; a shard keeps at
+   most 16,384 keys.
+3. **The body, under a memory budget** (`body.rs`, BUG-1187, BUG-1333).
+   Every byte of a request body is counted, in KiB, against one of three
+   pools of `--request-memory`: **the reserve** (an eighth) for small bodies
+   (a declared 1 MiB or less: sign-in, most pushes, fetches), which no large
+   body takes; the anonymous pool (a quarter); the signed-in pool (the
+   rest). **A body holds what has arrived**: its share grows with its bytes
+   (twice them for a body of unknown length), so a head that declares a
+   length and sends nothing holds nothing; growth is `503 busy` the moment
+   its pool, or its client's part of it, has no more. **One client (device
+   or address) holds at most a quarter of each pool**: an anonymous body is
+   at most 32 MiB by default; a signed-in body larger than its quarter (a
+   large file's upload, up to the route's 2 GiB) grows past it while it is
+   all its device holds, up to the whole signed-in pool (and waits up to
+   10 s for room there). **A body must keep arriving**: after a 20 s grace,
+   16 KiB/s on average (the cache's rule, BUG-1183), at least 8 KiB/s in
+   every 20 s window, and it holds at most ten minutes of its last window's
+   rate, else `408` and the connection is closed: a client that stops is cut
+   off within one window, and a slow one holds in proportion to its rate.
+   The share is held until the answer is made. What is left of a body
+   refused for its size or its share is read and dropped under the same
+   rules (nothing held), so the client reads the refusal.
 4. **Bulkheads** (`gate.rs`): a gate per project, then one for the server.
    A project runs at most three quarters of `--db-connections` requests at
-   once (so another project always finds a connection), the server twice
-   `--db-connections`. Gates are keyed by the name the route names, whether
-   a project of that name exists or not, so how long a request waits says
-   nothing about hidden projects (made-up names get gates of their own, and
-   the server's gate bounds them all); routes of no project share one. A
-   gate has a queue per class and hands a free place to the **landings
-   first** (`push`, `changes`, uploads, every other change), then pulls and
-   reads, then **search and grep last**; a request waits at most 20 s, 10 s
-   and 1 s by class (landings, pulls, search), then `503 busy` with `retry_after_ms` (0.5–1.5 s,
-   jittered). **Shedding order** (design §4.11): search and grep give up
-   first, then **derive work** (a derive run waits while requests wait for
-   the server's gate, at most 10 s a run, so derived history lags but always
-   progresses), then pulls, and landings last. Gates exist only while a
-   request is in or waiting.
+   once, the server twice `--db-connections`: **one** flooded project
+   leaves the others a quarter of the connections; several at their caps
+   can take them all (each still waits only behind its own, and the
+   server's gate takes landings first). **Only callers this server already
+   knows can see the project wait in its gate** (BUG-1334): a session whose
+   permissions for it are cached and current, a grant for it, or anyone on
+   Earth for a project with `public` folders; anyone else's request goes
+   through the server's gate alone, so its wait and its answer (the
+   not-found one) say nothing about the project or how busy it is. Gates
+   are keyed by the name as the route decodes it (BUG-1335: `%6C` is `l`),
+   and exist only while a request is in or waiting; routes of no project
+   share one. A gate has a queue per class and hands a free place to the
+   **landings first** (`push`, `changes`, uploads, every other change),
+   then pulls and reads, then **search and grep last**; a request waits at
+   most 20 s, 10 s and 1 s by class (landings, pulls, search), then
+   `503 busy` with `retry_after_ms` (0.5–1.5 s, jittered). **Shedding
+   order** (design §4.11): search and grep give up first, then **derive
+   work** (a derive run waits while requests wait for the server's gate, at
+   most 10 s a run, so derived history lags but always progresses), then
+   pulls, and landings last.
 5. **The route**, its status and its cache hits (tips, permissions) added
-   to its project's counts.
+   to its project's counts, and **its answer under the answers' budget**
+   (`answers.rs`, BUG-1330; the cache's rule since its cycle 3): every
+   answer of 64 KiB or more holds a share of a budget of `--request-memory`
+   for its bytes until the connection has written them (the share travels
+   in the bytes, `Bytes::from_owner`). An answer of known length takes its
+   share before its head is sent, waiting at most 2 s, else a read is
+   answered `503 busy` and its bytes are let go (a change's answer, the
+   change made, goes without a share); a streamed answer takes a share per piece, holding
+   nothing while it waits. One client holds at most a quarter of it, except
+   one larger answer alone (up to the whole budget).
 
 **The listener** (`serve`): at most `--max-connections` (1,024) open, the
 next waiting in the listener's queue; **an address opens at most an eighth
-of them** (past that a connection is closed at once). The TLS handshake and
-a request's head within 20 s, and an idle HTTP/1.1 connection closed after
-20 s (BUG-825); **answers** must keep up (the cache's `WriteDeadline`,
-BUG-1183): a write pending 30 s closes the connection, and so does one that
-brings the time writes waited past 30 s plus a second per 16 KiB written.
-HTTP/2 is offered with at most 16 streams, a 256 KiB connection window, a
-64 KiB stream window and 32 KiB queued per stream, and pings an idle
-connection every 20 s.
+of them** (past that a connection is closed at once), an address being an
+IPv4 address or an IPv6 /64, as for the rates (BUG-1336); an address that
+sent the caches' token in the last 5 minutes is a regional cache's and has
+no share. The TLS handshake and a request's head within 20 s; **a
+connection with no request in flight for 20 s is closed**, HTTP/1.1 or
+HTTP/2 (BUG-1337: a graceful close, then at once 20 s later; a request is
+in flight until its answer's body is done); **answers** must keep up (the
+cache's `WriteDeadline`, BUG-1183): a write pending 30 s closes the
+connection, and so does one that brings the time writes waited past 30 s
+plus a second per 16 KiB written. HTTP/2 is offered with at most 16
+streams, a 256 KiB connection window, a 64 KiB stream window and 32 KiB
+queued per stream, and pings a connection every 20 s.
 
 **What the server holds, however many requests arrive:** request bodies at
-most `--request-memory` (512 MiB), except one signed-in body larger than its
-pool, which holds what it is while it is read; per connection, its TLS
-records (about 50 KiB in, 16 KiB out), the HTTP/1.1 buffer (128 KiB) or
-HTTP/2's windows and queues (at most about 0.8 MiB), so about 200 KiB for
-HTTP/1.1 times `--max-connections`: about 0.7 GiB with the defaults,
-besides answers being written (bounded in time by the rule above; not by a
-budget: BUG-1330) and the server's caches. **Every connection slot comes
-back in bounded time:** a handshake or head within 20 s, a body of `n` bytes
-within 20 s + `n` / 16 KiB/s, an answer of `n` bytes within 30 s + `n` /
-16 KiB/s of a stalled client, a place in a gate within 20 s.
+most `--request-memory` (512 MiB), except one signed-in body larger than
+its pool, which holds what has arrived while it is read; answers being
+written at most as much again, except one larger answer alone; per
+connection, its TLS records (about 50 KiB in, 16 KiB out), the HTTP/1.1
+buffer (128 KiB) or HTTP/2's windows and queues (at most about 0.8 MiB), so
+about 200 KiB for HTTP/1.1 times `--max-connections`: about 0.7 GiB with
+the defaults; answers below 64 KiB (one a connection, one a stream); and
+the server's caches. Answers *being built* (a route reading an object
+before its answer is budgeted) are bounded by the gates (at most twice
+`--db-connections` requests run at once) and let go at once when refused.
+**Every connection slot comes back in bounded time:** a handshake or head
+within 20 s, an idle connection within 40 s, a body that stops within one
+20 s window after the grace, a body of `n` bytes within 20 s + `n` /
+16 KiB/s, an answer of `n` bytes within 30 s + `n` / 16 KiB/s of a stalled
+client, a place in a gate within 20 s.
 
 **Health metrics** (`health.rs`): per project, this server's counts since
 it started and over the last whole minute: requests, `429`s, `503`s, `408`s,
@@ -2581,6 +2622,15 @@ the project's admins only:** anyone else who can see the project gets
 `403`, someone who cannot gets what a project that does not exist gets, and
 anyone on Earth `401`. The answer names no person, device, path or other
 project. With several servers each counts what it served.
+
+**Where `vl`'s requests go** (BUG-1339's measurement: 6 agents on one
+device, 6 clones and 24 commit, push and pull cycles, 438 requests, about
+18 a cycle): `fetch` 114, `tips` 54, `history` 30, `shares` 30, `rings`
+(read) 30, ring posts 120 (each push posts all 5 of the project's rings
+again), `push` 24, `objects` (uploads) 24, `keys/pending` 6, one ring read
+6. For the speed work: a push posting only the rings it changed would save
+5 requests a cycle, and a pull fetching in fewer, larger requests some of
+the 4.75 fetches a cycle.
 
 **Measured** (`scripts/bench-server.sh limits` through
 `bench-quiet.sh`, release builds, PostgreSQL and MinIO, server and agents on
@@ -2620,26 +2670,39 @@ its share: in the container test (`a_flooded_project_does_not_starve_a_quiet_one
 flooded project never ran more than 12 requests at once, and the quiet
 project's p99 went from 1.1 ms to 1.3 ms.
 
-**Threat review** (design §6 rows 13 and 20, plus this milestone's):
+**Threat review** (design §6 rows 13 and 20, plus this milestone's; the S24
+cycle 1 review's findings in rows 13 to 21):
 
 | # | Attacker | Tries | Result | Test (`server_hub::limits`, unit tests in `limits/`) |
 |---|---|---|---|---|
-| 1 | Anyone on Earth, no session | 8 request bodies of 56 MiB that stop before their end (BUG-1187); any number of them | refused past a quarter of the anonymous pool (32 MiB by default); all of them together hold at most the anonymous pool | `bug_1187_request_bodies_are_buffered_without_a_bound_on_how_many` (and 8 signed-in uploads beside: the accounting never past 64 MiB; RSS +23 MiB, before +470 MiB); `body::tests::*` |
-| 2 | Anyone on Earth | sends a body slowly, or a head and nothing | `408` after 20 s + `n` / 16 KiB/s, the slot given back | `every_connection_slot_comes_back_in_bounded_time`; `body::tests::a_body_that_stops_is_refused_in_bounded_time` |
+| 1 | Anyone on Earth, no session | 8 request bodies of 56 MiB that stop before their end (BUG-1187); any number of them | refused past a quarter of the anonymous pool (32 MiB by default); all of them together hold at most the anonymous pool | `bug_1187_request_bodies_are_buffered_without_a_bound_on_how_many` (8 signed-in uploads beside: the accounting never past 64 MiB; RSS +48 MiB, before +470 MiB); `body::tests::*` |
+| 2 | Anyone on Earth | sends a body slowly, or a head and nothing | cut off within a window after the grace, the slot given back | `every_connection_slot_comes_back_in_bounded_time`; `body::tests::slow_bodies_are_cut_off_in_proportion_to_their_rate` |
 | 3 | Anyone on Earth, one address | opens every connection | an eighth of them at most; the next closed at once | `every_connection_slot_comes_back_in_bounded_time` |
 | 4 | A signed-in device, or an address | floods requests | `429` past its rate; other devices, on the same address too, are served | `past_its_limits_a_client_is_refused_and_told_when_naming_nothing` |
-| 5 | Anyone | made-up session tokens or grants, to get fresh buckets | a token not known here pays its address first; a grant counts for its device only if its signature verifies | same |
+| 5 | Anyone | made-up session tokens or grants, to get fresh buckets | a token not known here is looked up under the address's rate of lookups and, not a session, pays the address; a grant counts for its device only if its signature verifies | same |
 | 6 | A refused client | reads its refusal for projects it cannot see, or that do not exist | the same answer, naming nothing but its own wait | same |
 | 7 | A runaway agent, or a project's crowd | floods one project | that project runs at most three quarters of the connections; another project's p99 stays put (1.1 ms alone, 1.3 ms beside 64 flooding clients) | `a_flooded_project_does_not_starve_a_quiet_one` |
 | 8 | — (overload) | more requests than the server can run | search and grep shed first, derive pauses (at most 10 s a run), pulls next, landings last | `gate::tests::landings_are_let_in_first_and_search_last`, `…::search_is_shed_first_and_landings_last`, `limits::tests::derive_work_waits_while_the_server_sheds_but_not_for_ever` |
 | 9 | A client that goes away while waiting for a place | (a cancelled wait) | its place is never lost: a place handed over just then is given back | `gate::tests::*` (the `Ticket` drop) |
 | 10 | A member, someone outside, anyone on Earth | reads a project's health | `403`, the not-found answer for a hidden project, `401`; an admin's answer counts this project's requests only and names nothing | `health_metrics_are_for_admins_only_and_name_nothing_hidden` |
 | 11 | A client within its limits | its burst at once, then 40/s; sign-in from one address | never refused | `a_client_within_its_limits_is_never_refused`; `bucket::tests::a_client_within_its_rate_is_never_refused` |
-| 12 | Anyone on Earth | floods made-up project names, then times or counts `busy` for a name, to learn whether a private project exists | gates are keyed by name alone, never by whether it exists or is known to the server (the server's gate is shared by all names alike) | `gate::tests::idle_gates_are_forgotten` (gates by name, apart); by construction in `admit` |
+| 12 | Anyone on Earth | floods made-up project names | each name its own gate; the server's gate bounds them all | `gate::tests::idle_gates_are_forgotten` |
+| 13 | Someone outside a busy private project | times or counts `busy` for its name against a missing one (BUG-1334) | not in its gate: `404` in about the same time as a missing name | `bug_1334_a_busy_private_project_is_told_apart_from_a_missing_one` |
+| 14 | One signed-in person, or four addresses | a slow large upload; heads that declare lengths and send nothing (BUG-1333) | a body holds what has arrived, and only while it keeps arriving; small bodies (sign-in, a small push) have a reserve | `bug_1333_one_slow_large_upload_refuses_every_other_signed_in_body`, `bug_1333_four_addresses_holding_bodies_refuse_every_sign_in`, `a_push_of_one_file_larger_than_the_signed_in_pool_lands`; `body::tests::a_head_without_its_body_holds_nothing`, `…::small_bodies_have_a_reserve` |
+| 15 | A member, or anyone on Earth for a public project | names the project in percent-encoded spellings (BUG-1335) | one gate for every spelling | `bug_1335_a_project_named_in_other_spellings_runs_past_its_bulkhead`; `limits::tests::project_names_are_keyed_as_the_route_decodes_them` |
+| 16 | One host with an IPv6 /64 | opens connections from many of its addresses (BUG-1336) | one share for the /64 | `limits::tests::the_connection_share_groups_addresses_as_the_rates_do` (`bug_1336_…` needs two global IPv6 addresses of one /64 on the machine) |
+| 17 | Anyone on Earth | HTTP/2 connections that answer pings and send nothing (BUG-1337) | closed after 20 s without a request | `bug_1337_an_idle_http2_connection_keeps_its_slot_for_ever` |
+| 18 | — (people behind one address) | their first requests to a server new to their sessions (BUG-1338) | each pays its device | `bug_1338_signed_in_people_behind_one_address_are_refused_on_a_server_new_to_them` |
+| 19 | — (one person's agents) | 6 agents on one device, cloning, committing, pushing, pulling (BUG-1339) | within the device's rate | `bug_1339_an_agent_fleet_on_one_device_is_refused_at_the_defaults` |
+| 20 | — (readers behind a regional cache) | 40 cold reads of one signed-in reader through a cache (BUG-1332) | each counts against the reader's device; the cache's address keeps its own rate | `cache::bug_1332_a_caches_forwarded_reads_count_against_its_address` |
+| 21 | Anyone on Earth | 8 clients that ask for a 24 MiB file and never read (BUG-1330) | one answer held at a time for the address; the others `busy`, their bytes let go | `bug_1330_answers_to_clients_that_do_not_read_are_not_bounded_by_a_budget`; `answers::tests::*` |
+| 22 | A client within its limits, past a burst | `vl` refused `429` or shed `503` (BUG-1331) | waits `retry_after_ms` and tries again | `bug_1331_vl_waits_out_a_rate_limit` |
 
-**Residual, and open:** one signed-in device can hold the signed-in pool with
-one slow upload larger than its quarter (accountable; for 20 s + `n` /
-16 KiB/s); people behind one address share its anonymous rate and an eighth
-of the connections; a regional cache's forwarded requests count against the
-cache's address (BUG-1332); answers are bounded in time, not by a memory
-budget (BUG-1330); `vl` does not wait out `retry_after_ms` yet (BUG-1331).
+**Residual:** people behind one address share its anonymous rate and an
+eighth of the connections; a person whose access was removed may wait in
+the project's gate (not see anything) until this server's cached
+permissions are renewed; a grant's device is charged on its verified grant,
+not on the request's own signature (a copy of a grant, which only its
+device and the caches hold, can spend that device's rate); a body that
+arrives fast and then at 8 KiB/s holds what it received for as long as its
+rate allows it (ten minutes of it).

@@ -246,7 +246,7 @@ fn rss() -> usize {
 /// BUG-1187, and guarantee: server memory stays within a stated bound
 /// however many slow or large requests arrive. 8 clients from anywhere
 /// (no session) send 56 MiB to the batch route, and 8 signed-in devices
-/// 6 MiB uploads (each within its quarter of the pool), and stop before
+/// 4 MiB uploads (each within its quarter of the pool), and stop before
 /// their end. At `--request-memory 64M`, the bodies held never pass the
 /// budget (the accounting, exactly), and the process grows by about that
 /// (before: every body held whole, +470 MiB for the anonymous ones alone).
@@ -267,7 +267,7 @@ fn bug_1187_request_bodies_are_buffered_without_a_bound_on_how_many() {
         let (api, sent) = (hub.api(), sent.clone());
         let (token, path, left) = match i < n {
             true => (None, "/v1/objects/anything:batch".to_string(), len),
-            false => (Some(tokens[i - n].clone()), format!("/v1/projects/{p}/objects"), 6 << 20),
+            false => (Some(tokens[i - n].clone()), format!("/v1/projects/{p}/objects"), 4 << 20),
         };
         threads.push(std::thread::spawn(move || drop(api.post_reader_as(token.as_deref(), &path, Stops { left, gate, sent }))));
         gates.push(tx);
@@ -288,8 +288,8 @@ fn bug_1187_request_bodies_are_buffered_without_a_bound_on_how_many() {
     for t in threads {
         t.join().unwrap();
     }
-    eprintln!("server: {n} anonymous request bodies of {} MiB and {n} signed-in of 6 MiB, stopped before their end: {} MiB sent, held {held:?} KiB, RSS +{grew} MiB", len >> 20, sent.load(Relaxed) >> 20);
-    assert!(held.0 <= 48 << 10 && held.1 <= 16 << 10, "{held:?} KiB held, past the 64 MiB budget");
+    eprintln!("server: {n} anonymous request bodies of {} MiB and {n} signed-in of 4 MiB, stopped before their end: {} MiB sent, held {held:?} KiB, RSS +{grew} MiB", len >> 20, sent.load(Relaxed) >> 20);
+    assert!(held.0 <= 40 << 10 && held.1 <= 16 << 10, "{held:?} KiB held, past the 64 MiB budget");
     assert!(held.0 > 0, "the signed-in pool was used: the test measured something");
     assert!(grew <= 192, "{} unfinished request bodies grew the server by {grew} MiB", 2 * n);
 }
@@ -399,16 +399,17 @@ fn health_metrics_are_for_admins_only_and_name_nothing_hidden() {
     assert!(out.contains("admins"), "{out}");
 }
 
-/// BUG-1330: the server's answers are bounded in time, not by a memory
-/// budget. 8 clients from anywhere ask for a 24 MiB public file and never
-/// read the answer: each answer is held whole until the write deadline
-/// cuts its client off (30 s + 24 MiB at 16 KiB/s: 26 minutes for one that
-/// reads at the minimum), so the server holds about 8 × 24 MiB.
+/// BUG-1330: answers being written are under a memory budget. 8 clients
+/// from anywhere ask for a 24 MiB public file and never read the answer:
+/// before the fix each answer was held whole until the write deadline cut
+/// its client off (30 s + 24 MiB at 16 KiB/s: 26 minutes for one that
+/// reads at the minimum), +196 MiB. At `--request-memory 64M` (a 64 MiB
+/// answers' budget, a quarter of it an address's, one larger answer alone)
+/// the first is sent and the others answered `busy`, their bytes let go.
 #[test]
-#[ignore = "BUG-1330: answers being written are not counted against a memory budget"]
 fn bug_1330_answers_to_clients_that_do_not_read_are_not_bounded_by_a_budget() {
     use veil_core::{hub::grant::Grant, object::Object};
-    let hub = TestHub::start();
+    let hub = TestHub::start_with_limits(Settings { request_memory: 64 << 20, ..TestHub::limits() });
     let p = setup_project(&hub);
     let big: String = "b".repeat(24 << 20);
     write_files(&p.dir, &[("src/big.bin", &big)]);
@@ -435,9 +436,16 @@ fn bug_1330_answers_to_clients_that_do_not_read_are_not_bounded_by_a_budget() {
     let stalled: Vec<_> = (0..8).map(|_| hub.api().get_unread(&format!("/v1/objects/{}/{}", p.name, file.hex()), &[("veil-grant", &grant), ("veil-chain", &chain)])).collect();
     std::thread::sleep(Duration::from_secs(3));
     let grew = rss().saturating_sub(before) >> 20;
+    let held = hub.hub().limits.answers.held_kib();
+    let statuses: Vec<u16> = stalled.iter().map(|r| r.status().as_u16()).collect();
     drop(stalled);
-    eprintln!("8 unread answers of 24 MiB: RSS +{grew} MiB");
-    assert!(grew <= 64, "8 answers nobody reads grew the server by {grew} MiB");
+    eprintln!("8 unread answers of 24 MiB: {statuses:?}, {held} KiB held, RSS +{grew} MiB");
+    assert_eq!(statuses.iter().filter(|s| **s == 200).count(), 1, "one answer at a time for the address: {statuses:?}");
+    assert!(statuses.iter().all(|s| *s == 200 || *s == 503), "{statuses:?}");
+    assert!(held <= 64 << 10, "{held} KiB held");
+    // The refused answers were built (read and decompressed) before the
+    // budget refused them: freed, but kept by this test binary's allocator.
+    assert!(grew <= 128, "8 answers nobody reads grew the server by {grew} MiB (+196 before)");
 }
 
 /// BUG-1331: `vl` does not wait out `retry_after_ms`. A clone at a device
@@ -445,7 +453,6 @@ fn bug_1330_answers_to_clients_that_do_not_read_are_not_bounded_by_a_budget() {
 /// server answers `429 rate_limited` with the time to wait, and `vl` fails
 /// instead of waiting it out.
 #[test]
-#[ignore = "BUG-1331: vl fails on 429 rate_limited and 503 busy instead of waiting retry_after_ms"]
 fn bug_1331_vl_waits_out_a_rate_limit() {
     let device = veil_server::limits::bucket::Rate { per_second: 2, per_hour: 10_000 };
     let hub = TestHub::start_with_limits(Settings { device, ..TestHub::limits() });
@@ -586,7 +593,6 @@ fn spawn_flood(hub: &TestHub, token: &str, paths: Vec<String>, clients: usize, s
 /// pulling 4 times, are refused `429` within seconds; and the hour's 5,000
 /// is about 4.6 such cycles a minute for the whole device.
 #[test]
-#[ignore = "BUG-1339: the default device rate refuses an agent fleet of one device (about 18 requests a commit-push-pull)"]
 fn bug_1339_an_agent_fleet_on_one_device_is_refused_at_the_defaults() {
     let hub = TestHub::start_with_limits(Settings::default());
     let p = setup_project(&hub);
@@ -629,8 +635,10 @@ fn bug_1339_an_agent_fleet_on_one_device_is_refused_at_the_defaults() {
 /// small file, in another project, waits 10 s for its share and is refused
 /// `busy`. At the defaults the same holds for any upload over 384 MiB, for
 /// as long as it takes (a 400 MiB file at 10 Mbit/s: five minutes).
+///
+/// Fixed: a body holds what has arrived (here 256 KiB), and small bodies
+/// have a reserve.
 #[test]
-#[ignore = "BUG-1333: a few slow bodies hold a whole pool of the request budget: every other body on the server is refused busy"]
 fn bug_1333_one_slow_large_upload_refuses_every_other_signed_in_body() {
     use std::io::Write;
     let hub = TestHub::start_with_limits(Settings { request_memory: 64 << 20, ..TestHub::limits() });
@@ -648,7 +656,7 @@ fn bug_1333_one_slow_large_upload_refuses_every_other_signed_in_body() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let held = hub.hub().limits.bodies.held_kib();
-    assert_eq!(held.0, 48 << 10, "the upload holds the whole signed-in pool: {held:?} KiB");
+    assert!(held.0 > 0 && held.0 <= 1 << 10, "the upload holds what has arrived (256 KiB): {held:?} KiB");
     write_files(&p.dir, &[("src/small.txt", "one small file")]);
     p.admin.commit_main(&p.dir, "a small change");
     let t = Instant::now();
@@ -665,14 +673,17 @@ fn bug_1333_one_slow_large_upload_refuses_every_other_signed_in_body() {
 /// challenge, a body of a few bytes) waits 10 s for its share and is
 /// refused `busy`, for as long as the four keep the minimum rate (20 s +
 /// 32 MiB at 16 KiB/s: 35 minutes, 64 KiB/s in all).
+///
+/// Fixed: heads alone hold nothing; four addresses that send their
+/// quarters' bytes do hold the anonymous pool, and a sign-in still goes,
+/// in the reserve kept for small bodies.
 #[test]
-#[ignore = "BUG-1333: a few slow bodies hold a whole pool of the request budget: every other body on the server is refused busy"]
 fn bug_1333_four_addresses_holding_bodies_refuse_every_sign_in() {
     use std::io::Write;
     let hub = TestHub::start();
     let server: std::net::SocketAddr = hub.authority().parse().unwrap();
     let quarter = hub.hub().limits.bodies.anonymous_limit();
-    let held: Vec<_> = (2..=5)
+    let mut held: Vec<_> = (2..=5)
         .map(|i| {
             let mut s = raw::tls(raw::tcp(format!("127.0.0.{i}").parse().unwrap(), server));
             write!(s, "POST /v1/auth/challenge HTTP/1.1\r\nhost: veil\r\ncontent-type: application/json\r\ncontent-length: {quarter}\r\n\r\n").unwrap();
@@ -680,16 +691,23 @@ fn bug_1333_four_addresses_holding_bodies_refuse_every_sign_in() {
             s
         })
         .collect();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(hub.hub().limits.bodies.held_kib().1, 0, "heads alone hold nothing");
+    for s in &mut held {
+        s.write_all(&vec![b' '; quarter as usize - 1]).unwrap();
+        s.flush().unwrap();
+    }
     let t = Instant::now();
-    while u64::from(hub.hub().limits.bodies.held_kib().1) < 4 * (quarter >> 10) && t.elapsed() < Duration::from_secs(5) {
+    while u64::from(hub.hub().limits.bodies.held_kib().1) < 4 * (quarter >> 10) && t.elapsed() < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(u64::from(hub.hub().limits.bodies.held_kib().1), 4 * (quarter >> 10), "four heads hold the anonymous pool");
+    assert_eq!(u64::from(hub.hub().limits.bodies.held_kib().1), 4 * (quarter >> 10), "four bodies hold the anonymous pool");
     let t = Instant::now();
     let r = challenge(&hub.api());
     let took = t.elapsed();
     drop(held);
     assert_eq!(r.status, 200, "a sign-in from another address, after {took:?}: {}", String::from_utf8_lossy(&r.body));
+    assert!(took < Duration::from_secs(1), "{took:?}");
 }
 
 /// BUG-1334 (S24 cycle 1): a project's gate is keyed by the name in the
@@ -701,7 +719,6 @@ fn bug_1333_four_addresses_holding_bodies_refuse_every_sign_in() {
 /// is shed `503 busy`, where a name nobody has is answered `404` at once.
 /// Both must be the not-found answer, in about the same time.
 #[test]
-#[ignore = "BUG-1334: a busy private project's gate tells an outsider it exists (503 after a wait instead of 404)"]
 fn bug_1334_a_busy_private_project_is_told_apart_from_a_missing_one() {
     let hub = TestHub::start();
     let api = hub.api();
@@ -740,7 +757,6 @@ fn bug_1334_a_busy_private_project_is_told_apart_from_a_missing_one() {
 /// bulkhead that keeps a project's storm from starving the others does not
 /// hold against a member, or anyone on Earth for a public project.
 #[test]
-#[ignore = "BUG-1335: a project named in percent-encoded spellings gets a gate per spelling and runs past its bulkhead"]
 fn bug_1335_a_project_named_in_other_spellings_runs_past_its_bulkhead() {
     let hub = TestHub::start();
     let api = hub.api();
@@ -806,7 +822,7 @@ fn two_in_one_64() -> Option<(std::net::Ipv6Addr, std::net::Ipv6Addr)> {
 /// same /64 opens more. Needs two global IPv6 addresses of one /64 on the
 /// machine (two interfaces on one network, or `ip -6 addr add`).
 #[test]
-#[ignore = "BUG-1336: the per-address connection share counts each IPv6 address, not its /64"]
+#[ignore = "needs two global IPv6 addresses of one /64 on this machine (BUG-1336, fixed; limits::tests::the_connection_share_groups_addresses_as_the_rates_do runs everywhere)"]
 fn bug_1336_one_ipv6_subscriber_opens_more_than_an_eighth_of_the_connections() {
     let (a, b) = two_in_one_64().expect("this reproduction needs two global IPv6 addresses of one /64 on this machine");
     let hub = TestHub::start_with_limits_on(std::net::SocketAddr::new(a.into(), 0), Settings { max_connections: 16, ..TestHub::limits() });
@@ -831,7 +847,6 @@ fn bug_1336_one_ipv6_subscriber_opens_more_than_an_eighth_of_the_connections() {
 /// addresses, or one IPv6 /64 by BUG-1336), held at no cost but a ping
 /// every 20 s. Every connection slot must come back in bounded time.
 #[test]
-#[ignore = "BUG-1337: an idle HTTP/2 connection that answers pings keeps its connection slot for ever"]
 fn bug_1337_an_idle_http2_connection_keeps_its_slot_for_ever() {
     use std::io::{Read, Write};
     let hub = TestHub::start_with_limits(Settings { max_connections: 16, ..TestHub::limits() });
@@ -889,7 +904,6 @@ fn bug_1337_an_idle_http2_connection_keeps_its_slot_for_ever() {
 /// requests to a second server, at once, are refused `429` past the 20th,
 /// though each person is far within the device rate.
 #[test]
-#[ignore = "BUG-1338: a known person's first request to a server that has not cached their session is charged to their address"]
 fn bug_1338_signed_in_people_behind_one_address_are_refused_on_a_server_new_to_them() {
     let hub = TestHub::start_with_limits(Settings::default());
     let api = hub.api();
@@ -912,4 +926,33 @@ fn bug_1338_signed_in_people_behind_one_address_are_refused_on_a_server_new_to_t
     let refused = answers.iter().filter(|s| **s == 429).count();
     assert!(answers.iter().all(|s| *s == 200 || *s == 429), "{answers:?}");
     assert_eq!(refused, 0, "{refused} of 40 signed-in people refused on their first request to the second server: {answers:?}");
+}
+
+/// BUG-1333's fix keeps a large upload working: a body larger than the
+/// whole signed-in pool (at the defaults, a file over 384 MiB; here a
+/// 50 MiB file that does not compress, at `--request-memory 64M`: a 40 MiB
+/// pool) grows past its quarter while it is all its device holds, and the
+/// push lands; a clone then reads it back, its answer larger than an
+/// address's quarter of the answers' budget, alone.
+#[test]
+fn a_push_of_one_file_larger_than_the_signed_in_pool_lands() {
+    let hub = TestHub::start_with_limits(Settings { request_memory: 64 << 20, ..TestHub::limits() });
+    let p = setup_project(&hub);
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let big: Vec<u8> = (0..50usize << 20)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    std::fs::write(p.dir.join("src/big.bin"), &big).unwrap();
+    p.admin.commit_main(&p.dir, "a 50 MiB file");
+    let out = p.admin.ok(&p.dir, &["push"]);
+    eprintln!("{out}");
+    let d = p.dev.dir("big-clone");
+    p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+    assert!(std::fs::read(d.join("src/big.bin")).unwrap() == big, "the file arrived whole");
+    assert_eq!((hub.hub().limits.bodies.held_kib(), hub.hub().limits.answers.held_kib()), ((0, 0), 0));
 }

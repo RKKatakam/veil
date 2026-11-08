@@ -1715,14 +1715,14 @@ mod s9_cycle2 {
     }
 }
 
-/// BUG-1332 (S24): what a regional cache forwards for anyone on Earth
-/// counts against the cache's address at the server, as one client's: 40
-/// first reads of public files through a cold cache (40 readers, in a
-/// deployment, each on their own address) at the default anonymous rate
-/// (20 a second) are refused `429` past the burst, and the cache passes it
-/// on.
+/// BUG-1332 (S24): what a regional cache forwards counted against the
+/// cache's own address at the server, as one client's. Fixed: the cache
+/// says it is one (the caches' token) and whose request it passes on (its
+/// client's address); the server counts a signed request against its
+/// device. 40 first reads of public files by one signed-in reader through
+/// a cold cache, at the default anonymous rate (20 a second), are all
+/// served, and the cache's own address keeps its rate for its own clients.
 #[test]
-#[ignore = "BUG-1332: a regional cache's forwarded requests count against its own address at the server"]
 fn bug_1332_a_caches_forwarded_reads_count_against_its_address() {
     use veil_server::limits::{bucket::Rate, Settings};
     let hub = TestHub::start_with_limits(Settings { anonymous: Rate { per_second: 20, per_hour: 100_000 }, ..TestHub::limits() });
@@ -1735,7 +1735,7 @@ fn bug_1332_a_caches_forwarded_reads_count_against_its_address() {
     let server = hub.api();
     let cache = TestCache::start(&hub, &hub.authority(), 1 << 30);
     std::thread::sleep(Duration::from_millis(1500));
-    let r = Reader::new(&server, &cache.api, None, &p.name);
+    let r = Reader::new(&server, &cache.api, Some(&p.dev), &p.name);
     let root = r.root();
     let tree = |chain: &[ObjectId], id: &ObjectId| match Object::decode(&r.get(chain, id).body).unwrap() {
         Object::Tree(t) => t,
@@ -1748,4 +1748,7 @@ fn bug_1332_a_caches_forwarded_reads_count_against_its_address() {
         let got = r.get(&[root, src], &id);
         assert_eq!(got.status, 200, "read {i}: {}", String::from_utf8_lossy(&got.body));
     }
+    assert!(cache.stat("forwarded") >= 40, "every read went to the server");
+    let r = server.post_json(None, "/v1/auth/challenge", &serde_json::json!({"key": Identity::generate("x").verifying_hex()}));
+    assert_eq!(r.status, 200, "the address kept its own rate: {}", String::from_utf8_lossy(&r.body));
 }

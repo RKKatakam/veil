@@ -29,10 +29,10 @@ to `vl login --ca` once. Objects go to `./hub/objects`, or to S3 with
 `--s3-endpoint URL --s3-bucket NAME` (credentials in `VEIL_S3_ACCESS_KEY` and
 `VEIL_S3_SECRET_KEY`).
 
-Its limits have defaults (`docs/HUB.md` §13.25): `--device-rate 60/5000`
+Its limits have defaults (`docs/HUB.md` §13.25): `--device-rate 200/50000`
 (a burst a second, the most an hour), `--anonymous-rate 20/1000` per address,
 `--max-connections 1024` and `--request-memory 512M` (all request bodies
-held at once).
+held at once, and as many of answers being written).
 
 ## Signing in
 
@@ -367,11 +367,12 @@ vl stats
 vl stats --json      # the server's answer (veil.health/1)
 ```
 
-Each device may send a burst of 60 requests a second within 5,000 an hour;
-requests without a session (anyone on Earth, sign-in) 20 a second within
-1,000 an hour per address. Past it the server answers `429` and says when to
-come back. One busy project never slows another: each runs at most three
-quarters of the server's database connections at once.
+Each device may send a burst of 200 requests a second within 50,000 an
+hour (your agents on that device share it); requests without a session
+(anyone on Earth, sign-in) 20 a second within 1,000 an hour per address.
+Past it the server answers `429` and says when to come back, and `vl` waits
+and tries again. One busy project leaves the others room: it runs at most
+three quarters of the server's database connections at once.
 
 ## What someone without access sees
 

@@ -234,6 +234,12 @@ pub struct Client {
     known: bool,
 }
 
+/// How often, how long each time and how long in all [`Client::send`]
+/// waits out a server's `retry_after_ms` (BUG-1331).
+const RETRIES: u32 = 8;
+const RETRY_WAIT: Duration = Duration::from_secs(30);
+const RETRY_FOR: Duration = Duration::from_secs(120);
+
 /// Fewest and most objects, and about the most bytes, per fetch request
 /// when [`Client::fetch_each`] splits them, and how many requests it sends
 /// at once.
@@ -354,7 +360,32 @@ impl Client {
         }
     }
 
+    /// [`Client::send_once`], waiting out a server that says when to come
+    /// back (BUG-1331): past its rate limits (`429`) or shedding load
+    /// (`503`), its answer carries `retry_after_ms`. At most [`RETRIES`]
+    /// waits of at most [`RETRY_WAIT`] each, within [`RETRY_FOR`] in all;
+    /// then the server's last answer.
     fn send(&self, method: &str, path: &str, body: Option<(&str, Vec<u8>)>, auth: bool) -> Result<(u16, Vec<u8>)> {
+        let start = std::time::Instant::now();
+        let mut tries = 0;
+        loop {
+            let (status, out) = self.send_once(method, path, body.as_ref().map(|(ct, b)| (*ct, &b[..])), auth)?;
+            let wait = match status {
+                429 | 503 => serde_json::from_slice::<serde_json::Value>(&out).ok().and_then(|v| v["retry_after_ms"].as_u64()),
+                _ => None,
+            };
+            let Some(ms) = wait else { return Ok((status, out)) };
+            let jitter = u64::from(veil_core::crypto::random_bytes::<1>()[0]);
+            let wait = Duration::from_millis(ms + jitter).min(RETRY_WAIT);
+            if tries >= RETRIES || start.elapsed() + wait > RETRY_FOR {
+                return Ok((status, out));
+            }
+            tries += 1;
+            std::thread::sleep(wait);
+        }
+    }
+
+    fn send_once(&self, method: &str, path: &str, body: Option<(&str, &[u8])>, auth: bool) -> Result<(u16, Vec<u8>)> {
         let url = format!("{}{path}", self.url.base());
         let token = if auth { self.token.borrow().clone() } else { None };
         let resp = match (method, body) {
@@ -376,7 +407,7 @@ impl Client {
                 }
                 r = r.header("accept", ACCEPT);
                 match body {
-                    Some((ct, b)) => r.header("content-type", ct).send(&b[..]),
+                    Some((ct, b)) => r.header("content-type", ct).send(b),
                     None => r.send_empty(),
                 }
             }
