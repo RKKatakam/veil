@@ -937,3 +937,27 @@ fn s3rd_exact_walks_page_in_only_their_range() {
     let over: Vec<_> = costs.iter().filter(|(_, n)| *n > 6).collect();
     assert!(over.is_empty(), "walks of a 6-snapshot range read more pages than it needs (20 pages is the whole history): {costs:?}");
 }
+
+// ---- S3 redesign review, cycle 2: `s3rd2_…` -------------------------------------
+
+/// Guarantee 3 of cycle 2 (nothing outside `repo.rs` reads history without
+/// choosing `Held` or `Exact`). The one public read that still compiles
+/// outside the engine, `ObjectStore::get` (or `get_raw` and
+/// `Object::decode`), asks for an object without saying it is a snapshot:
+/// for a snapshot beyond a thin clone's boundary it fails (`Unavailable`),
+/// never answers held history as the person's (a `Missing`, a redaction),
+/// while `Exact` gives the snapshot.
+#[test]
+fn s3rd2_no_read_of_history_outside_held_or_exact() {
+    let pr = project();
+    let (repo, _fs) = thin(&pr, 1 << 30);
+    let old = pr.commits[0];
+    let read = repo.store().get(&old);
+    let exact = repo.exact().snapshot(&old).unwrap();
+    assert!(exact.is_some(), "the person's history has the snapshot");
+    match read {
+        Ok(Object::Snapshot(s)) => assert_eq!(Some(s), exact.as_deref().cloned()),
+        Err(VeilError::Unavailable(_)) => {}
+        r => panic!("a snapshot of the person's history, read outside Held and Exact: {:?}", r.map(|o| o.kind_name())),
+    }
+}

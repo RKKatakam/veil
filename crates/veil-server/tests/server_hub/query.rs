@@ -1972,3 +1972,97 @@ fn s3rd_resolve_of_a_change_prefix_ignores_hidden_changes() {
         assert_eq!(resolved(&th, &b, &xb, &prefix), without, "{who}: hidden changes change the answer for {prefix}");
     }
 }
+
+// ---- q/resolve (S3 redesign review, cycle 2): `s3rd2_…` ---------------------------
+
+/// BUG-1317 (guarantee 1 of cycle 2: errors and timing beyond bounded work
+/// reveal nothing outside the caller's projected, branch-reachable
+/// history). `resolve_prefix`'s change-id step still reads the *real*
+/// `graph`, every snapshot ever derived, hidden changes and old versions
+/// among them, and projects each row it reads (`ensure`) before it drops
+/// what the caller cannot see. A hidden snapshot no branch reaches (the
+/// first version of a rewritten `fin/` change) has no projection for the
+/// caller, so a prefix that matches it starts a fill and waits for it: while
+/// another fill of the caller's view key runs (another server's lease, a
+/// long first fill), the answer is `warming` after the query's deadline,
+/// where the same project without the hidden snapshot answers at once.
+/// What does not count costs work and fills, up to the deadline, in
+/// proportion to the hidden rows with the prefix.
+#[test]
+#[ignore = "BUG-1317: q/resolve reads the real graph by change id; a hidden snapshot no branch reaches makes it wait for a fill"]
+fn s3rd2_resolve_answers_alike_whatever_hidden_history_it_meets() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut a = Hist::new(&th, &policy_text, &bindings);
+    let mut b = Hist::new(&th, &policy_text, &bindings);
+    let base = Files::from([("pub/a.rs".to_string(), b"fn a() {}\n".to_vec()), ("fin/base.txt".to_string(), b"hidden in both\n".to_vec())]);
+    let root = root_snapshot_id();
+    let v0a = a.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+    let v0b = b.commit(&th, &[root], base.clone(), [1; 16], 1_000, None);
+    // In b only: a change of fin/ (hidden from security), change id abcd00…,
+    // on a branch of its own, then rewritten: its first version stays in
+    // the real graph, and no branch reaches it.
+    let mut hidden = [0u8; 16];
+    hidden[0] = 0xab;
+    hidden[1] = 0xcd;
+    let mut fin = base.clone();
+    fin.insert("fin/plan.txt".into(), b"plan one\n".to_vec());
+    let h1 = b.commit(&th, &[v0b], fin.clone(), hidden, 2_000, None);
+    b.set_branch(&th, "fin-work", h1);
+    b.derive(&th);
+    fin.insert("fin/plan.txt".into(), b"plan two\n".to_vec());
+    let h2 = b.commit(&th, &[v0b], fin, hidden, 2_001, None);
+    b.set_branch(&th, "fin-work", h2);
+    // In both: a visible change abcdff….
+    let mut f = base.clone();
+    f.insert("pub/b.rs".into(), b"fn b() {}\n".to_vec());
+    let mut change = [0xffu8; 16];
+    change[0] = 0xab;
+    change[1] = 0xcd;
+    let va = a.commit(&th, &[v0a], f.clone(), change, 3_000, None);
+    let vb = b.commit(&th, &[v0b], f, change, 3_000, None);
+    a.set_branch(&th, "main", va);
+    b.set_branch(&th, "main", vb);
+    a.derive(&th);
+    b.derive(&th);
+    // Security: neither anyone's view nor a member's, so no landing fills it.
+    let viewer = viewers(1)[2].1.clone();
+    warm_up(&th, &a, &viewer);
+    warm_up(&th, &b, &viewer);
+    let (xa, xb) = (ask(&th, &a, &viewer), ask(&th, &b, &viewer));
+    let vk = b.project(&th).view(&viewer).key();
+    let vka = a.project(&th).view(&viewer).key();
+    let hub = b.hub.clone();
+    th.rt.block_on(async {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM graph WHERE project_id = $1 AND snapshot = $2")
+            .bind(b.id)
+            .bind(h1.hex())
+            .fetch_one(&hub.db)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "the first version of the hidden change is in the real graph");
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+            .bind(b.id)
+            .bind(&vk)
+            .bind(h1.hex())
+            .fetch_one(&hub.db)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "no fill projected the first version for the viewer");
+        // Another fill of the viewer's graph is running, in both projects.
+        for (pid, key) in [(a.id, vka.clone()), (b.id, vk.clone())] {
+            sqlx::query("INSERT INTO view_fills (project_id, view_key, holder, expires_at) VALUES ($1, $2, 'another-server', $3)")
+                .bind(pid)
+                .bind(key)
+                .bind(veil_core::now_millis() + 600_000)
+                .execute(&hub.db)
+                .await
+                .unwrap();
+        }
+    });
+    let prefix = veil_core::ChangeId(change).display()[..4].to_string();
+    let once = |h: &Hist, x: &Ask| th.rt.block_on(async { norm(query::resolve_prefix(&h.hub, x, &prefix, Limits::default()).await) });
+    let without = once(&a, &xa);
+    assert!(!without.starts_with("error") && !without.contains("\"changes\":[]"), "the visible change is named: {without}");
+    assert_eq!(once(&b, &xb), without, "a hidden snapshot no branch reaches changes the answer for {prefix}");
+}
