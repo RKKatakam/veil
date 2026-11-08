@@ -581,6 +581,9 @@ impl Repo {
                 Some(b) => self.ops.try_get(&b)?.map(|o| o.view).unwrap_or_default(),
                 None => View::default(),
             };
+            // What the two sides' shared history holds beyond `base`
+            // (BUG-1294).
+            let shared = crate::oplog::shared_base(&base, &acc, &split.introduced(&split.only_a), &op.view, &split.introduced(&split.only_b));
             if rewrites {
                 for (ids, side) in [(&split.only_a, &acc), (&split.only_b, &op.view)] {
                     let refs: std::collections::HashSet<ObjectId> = side.refs().into_iter().collect();
@@ -625,7 +628,7 @@ impl Repo {
                 before.push(op.view.clone());
             }
             let mut descends = |a: &ObjectId, b: &ObjectId| self.is_ancestor(b, a).unwrap_or(false);
-            let merged = crate::oplog::merge_views(&base, &[&acc, &op.view], &mut descends);
+            let merged = crate::oplog::merge_views(&shared, &[&acc, &op.view], &mut descends);
             warnings.extend(merged.warnings);
             acc = merged.view;
             acc_heads.push(*h);
