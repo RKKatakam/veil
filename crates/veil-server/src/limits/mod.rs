@@ -196,9 +196,10 @@ enum Who {
     /// An address.
     Address(Key),
     /// An address whose token was taken before a session not known here
-    /// yet was looked up: a made-up token costs its address, never a
-    /// database read past the address's rate.
-    Charged(bool),
+    /// yet was looked up (the device it turned out to be, if any): a
+    /// made-up token costs its address, never a database read past the
+    /// address's rate.
+    Charged(Option<Key>),
 }
 
 async fn who(hub: &HubState, parts: &mut axum::http::request::Parts, ip: IpAddr) -> Result<Who, Duration> {
@@ -217,7 +218,7 @@ async fn who(hub: &HubState, parts: &mut axum::http::request::Parts, ip: IpAddr)
             Ok(c) => c.person.and_then(|p| Key::device(&p.device_key)),
             Err(_) => None,
         };
-        return Ok(Who::Charged(found.is_some()));
+        return Ok(Who::Charged(found));
     }
     if let Some(g) = parts.headers.get("veil-grant").and_then(|g| g.to_str().ok()) {
         if let Some(k) = grant_device(hub, g) {
@@ -271,7 +272,7 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
         Ok(w) => w,
         Err(wait) => return finish(&hub, rate_limited(wait)),
     };
-    let signed = matches!(who, Who::Device(_) | Who::Charged(true));
+    let signed = matches!(who, Who::Device(_) | Who::Charged(Some(_)));
     // A batch's grant is in its body: its rate is checked once it is read.
     let deferred = batch && matches!(who, Who::Address(_));
     let taken = match (&who, cache_feed || deferred) {
@@ -288,7 +289,7 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
     let declared = hyper::body::Body::size_hint(&body).exact();
     let limit = crate::db::body_limit(parts.uri.path()) as u64;
     let body_key = match &who {
-        Who::Device(k) => *k,
+        Who::Device(k) | Who::Charged(Some(k)) => *k,
         _ => Key::ip(ip),
     };
     let (bytes, _share) = match limits.bodies.read(body_key, signed, body, declared, limit).await {
