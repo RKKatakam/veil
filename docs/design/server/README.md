@@ -34,10 +34,10 @@ S1 is built. **S2** (secrets at scale: keys per access rule, background wrapping
 | S5 | 2 | Read grants, the object routes, access epochs (built: `HUB.md` §13.16) | S1 |
 | S6 | 2 | The Veil daemon: shared object cache | S3, S5 |
 | S7 | 2 | The daemon's file watcher (`status`/`commit` without a scan) | S6 |
-| S8 | 2 | Workspaces that fetch on first read; the workspace socket for sandboxes | S3; phase 1's isolated sandboxes (S6 for the warm numbers) |
+| S8 | 2 | Workspaces that fetch on first read; the workspace socket for sandboxes; private loopback and seeded layers for full-stack tests (phase 2 §4.9) | S3; phase 1's isolated sandboxes (S6 for the warm numbers) |
 | S9 | 2 | Regional cache (built: `HUB.md` §13.18) | S5 |
 | S10 | 2 | Commits through the API (with the server-side secret scan): **built** (`HUB.md` §13.13) | S1 |
-| S11 | 2 | Agent sessions and attribution | S10, S8 |
+| S11 | 2 | Agent sessions and attribution; attempts (recorded dead ends) on change records | S10, S8 |
 | S27 | 2 | Compressed objects (zstd) in storage and transport (`storage-and-cost.md` §6). **Built** (`HUB.md` §13.15) | S1 |
 | S28 | 2 | Packs: one storage write per push for small objects, index, range reads (`storage-and-cost.md` §7) | S5, S27 |
 | S29 | 2 | Merging packs and pack garbage collection (`storage-and-cost.md` §8) | S28 |
@@ -49,7 +49,7 @@ S1 is built. **S2** (secrets at scale: keys per access rule, background wrapping
 | S16 | 3 | `vl` over the query API; phase 3 gate run | S3, S13, S14, S15 |
 | S17 | 4 | The landing service (batched, fast path, protected branches, `vl land`) | S4, S10, S12 |
 | S18 | 4 | Content merges, conflicts back to agents, the event stream | S17 |
-| S19 | 4 | CI through the API; land first, test after; `main@tested` | S11, S13, S17 |
+| S19 | 4 | CI through the API; land first, test after; `main@tested`; agents start from `main@tested` | S11, S13, S17 |
 | S20 | 4 | Automatic bisect and revert | S14, S19 |
 | S21 | 4 | PRs and review (visibility classes, risk, approvals) | S13 (S17 to land PRs) |
 | S22 | 4 | Embargoes through the server; the release service | S2, S17 |

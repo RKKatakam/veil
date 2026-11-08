@@ -182,6 +182,7 @@ Every viewer without full view needs projected snapshots (`HUB.md` §13.4), and 
 
 * **Checks run on landed snapshots.** A CI machine (§4.10) tests the newest tip of `main` whenever it finishes its previous run, so it skips tips when `main` moves faster than tests run. Results are statuses on snapshots.
 * **`main@tested`** is a server-side pointer: the newest snapshot of `main` on which every required check passed. It only moves forward. Deploys read it (`vl tested`, `GET …/tested/main`).
+* **Agents start from `main@tested` by default** (owner idea, 2026-11-08): an agent session's new workspace is made on `main@tested`, not the raw tip, so no agent builds on a change that is already failing (`vl ws new NAME` takes `-r main` to opt out). The landing service rebases each change onto the tip anyway (§4.2's fast path), so starting a little behind costs a conflict only where the skipped changes touched the same paths. Built with S19.
 * **A failure starts a bisect** between the last tip that passed and the first that failed:
   * **narrowed by paths:** if the failing check declares the paths it depends on (`paths = ["src/api/", "Cargo.lock"]` in the rules), only changes that touched them are candidates (phase 3's file history); usually a handful among thousands;
   * **k-ary:** the bisect service asks for up to `k` checks at once (the project's CI capacity, default 8), dividing the range by `k + 1` each round;
