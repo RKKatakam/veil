@@ -639,3 +639,229 @@ fn bug_1404_restore_takes_back_a_release_staged_meanwhile_by_another_process() {
     assert_eq!(reaches, Some(true), "the restore reaches the release operation");
     assert_eq!(after, Some(veil_core::keychain::ReleaseState::Unreleased), "the restore to before the release took it back");
 }
+
+/// Op log merges review, cycle 3 (guarantee: a staged release is never
+/// published early): a release another process staged, taken back by an
+/// op restore past it (the CLI's path: `restore_operation_keeping_edits`,
+/// then `releases_restored`), stays taken back through an undo of the
+/// restore, a redo of that undo, and their merge with a concurrent
+/// command: undo, redo and merges never release.
+#[test]
+fn a_release_taken_back_by_a_restore_stays_taken_back_through_undo_redo_and_merges() {
+    let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clock::reset_clock();
+    let fs = Arc::new(MemoryBackend::new());
+    let me = Identity::generate("alice");
+    let mut repo = Repo::init(fs.clone(), Some(me.clone()), "alice").unwrap();
+    fs.write(&p("auth.rs"), b"fn check() -> bool { true }\n").unwrap();
+    repo.snapshot_workspace("default", &*fs).unwrap();
+    let (main, _) = repo.commit_working_copy("default", "v1").unwrap();
+    repo.create_workspace("fix", vec![main]).unwrap();
+    let ov = repo.workspace_overlay("fix").unwrap();
+    ov.write(&p("auth.rs"), b"fn check() -> bool { verify_signature() }\n").unwrap();
+    let fix = repo.snapshot_workspace("fix", &ov).unwrap().snapshot;
+    let merged = repo.merge("default", main, vec![fix], "merge", Some(veil_core::commands::EmbargoSpec { scope: "team".into(), until: None })).unwrap();
+    let e = merged.embargo.expect("an embargo");
+    repo.set_tag("main", main, false).unwrap();
+    let before = repo.op_id();
+    // Another process releases it; this one restores past the release.
+    Repo::open(fs.clone(), Some(me.clone()), "alice").unwrap().release_embargo(&e).unwrap();
+    assert_eq!(repo.keys().release_state(&e), veil_core::keychain::ReleaseState::Staged, "staged");
+    let restore = repo.restore_operation_keeping_edits("default", before).unwrap();
+    let (staged, published) = repo.releases_restored(&restore).unwrap();
+    assert_eq!((staged.clone(), published), (vec![e.clone()], vec![]), "the restore took the view back past the staged release");
+    for s in &staged {
+        repo.keys().take_back_release(s).unwrap();
+    }
+    let unreleased = veil_core::keychain::ReleaseState::Unreleased;
+    assert_eq!(repo.keys().release_state(&e), unreleased, "taken back");
+    // Undo of the restore and a redo of that undo, while another process
+    // runs a command; then the merge.
+    let heads = head_names(&fs);
+    let side = Arc::new(fs.fork());
+    Repo::open(side.clone(), Some(me.clone()), "alice").unwrap().set_tag("other", main, false).unwrap();
+    let (_, undone) = repo.undo_keeping_edits("default").unwrap();
+    assert!(undone.starts_with("restore to operation"), "undid the restore: {undone}");
+    assert_eq!(repo.keys().release_state(&e), unreleased, "the undo of the restore does not release");
+    let (_, redone) = repo.redo_keeping_edits("default").unwrap();
+    assert!(redone.contains("restore to operation"), "redid the restore's undo: {redone}");
+    assert_eq!(repo.keys().release_state(&e), unreleased, "nor the redo");
+    land_fork(&fs, &side, &heads);
+    let repo = Repo::open(fs.clone(), Some(me.clone()), "alice").unwrap();
+    assert_eq!(repo.heads().len(), 1, "merged");
+    assert!(repo.view().tags.contains_key("other"), "the concurrent command stays");
+    assert_eq!(repo.keys().release_state(&e), unreleased, "nor the merge");
+}
+
+/// BUG-1487 (op log merges review, cycle 3; pre-existing): `vl op restore`
+/// and `vl undo` commit the restored view first and take back the staged
+/// releases it went back past afterwards (`releases_restored`, then
+/// `take_back_release`; `check_undo_release`, then `finish_undo_release`).
+/// A process that stops between the two (killed, a crash, the machine
+/// off) leaves the release staged although the op log records the restore
+/// past it, and nothing takes it back later: the next push publishes the
+/// embargoed fix. Here the restore is committed as `vl op restore`
+/// records it, and the process stops there.
+#[test]
+#[ignore = "BUG-1487: a restore past a staged release that commits but stops before taking the release back leaves it staged for the next push"]
+fn bug_1487_a_restore_that_stops_before_taking_back_a_release_still_takes_it_back() {
+    let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clock::reset_clock();
+    let fs = Arc::new(MemoryBackend::new());
+    let me = Identity::generate("alice");
+    let mut repo = Repo::init(fs.clone(), Some(me.clone()), "alice").unwrap();
+    fs.write(&p("auth.rs"), b"fn check() -> bool { true }\n").unwrap();
+    repo.snapshot_workspace("default", &*fs).unwrap();
+    let (main, _) = repo.commit_working_copy("default", "v1").unwrap();
+    repo.create_workspace("fix", vec![main]).unwrap();
+    let ov = repo.workspace_overlay("fix").unwrap();
+    ov.write(&p("auth.rs"), b"fn check() -> bool { verify_signature() }\n").unwrap();
+    let fix = repo.snapshot_workspace("fix", &ov).unwrap().snapshot;
+    let merged = repo.merge("default", main, vec![fix], "merge", Some(veil_core::commands::EmbargoSpec { scope: "team".into(), until: None })).unwrap();
+    let e = merged.embargo.expect("an embargo");
+    repo.set_tag("main", main, false).unwrap();
+    let before = repo.op_id();
+    repo.release_embargo(&e).unwrap();
+    assert_eq!(repo.keys().release_state(&e), veil_core::keychain::ReleaseState::Staged, "staged");
+    // The restore's operation, as `vl op restore` commits it; then the
+    // process stops.
+    let view = repo.ops().get(&before).unwrap().view;
+    let mut tx = repo.transaction(format!("restore to operation {}", before.short())).unwrap();
+    tx.view = view;
+    tx.restore_of(before);
+    let restore = tx.commit().unwrap().expect("recorded");
+    let (staged, _) = repo.releases_restored(&restore).unwrap();
+    assert_eq!(staged, vec![e.clone()], "the op log says the restore went back past the staged release");
+    drop(repo);
+    // The next process, before anything is pushed.
+    let mut next = Repo::open(fs.clone(), Some(me.clone()), "alice").unwrap();
+    next.set_tag("later", main, false).unwrap();
+    assert_eq!(next.keys().release_state(&e), veil_core::keychain::ReleaseState::Unreleased, "the restore's take-back is not lost with the process");
+}
+
+/// A memory backend that counts the operations read (`.veil/ops/`).
+#[derive(Debug, Default)]
+struct CountingOps {
+    inner: MemoryBackend,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl StorageBackend for CountingOps {
+    fn kind(&self) -> &'static str {
+        "counting"
+    }
+    fn read(&self, path: &VPath) -> veil_core::Result<Vec<u8>> {
+        if path.as_str().starts_with(".veil/ops/") {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.read(path)
+    }
+    fn write(&self, path: &VPath, data: &[u8]) -> veil_core::Result<()> {
+        self.inner.write(path, data)
+    }
+    fn create_new(&self, path: &VPath, data: &[u8]) -> veil_core::Result<bool> {
+        self.inner.create_new(path, data)
+    }
+    fn remove_file(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn create_dir_all(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &VPath) -> veil_core::Result<Vec<veil_core::vfs::DirEntry>> {
+        self.inner.list_dir(path)
+    }
+    fn metadata(&self, path: &VPath) -> veil_core::Result<Option<veil_core::vfs::Metadata>> {
+        self.inner.metadata(path)
+    }
+    fn set_executable(&self, path: &VPath, x: bool) -> veil_core::Result<()> {
+        self.inner.set_executable(path, x)
+    }
+}
+
+/// An op log of `n` tag moves made with the clock set back an hour (the
+/// `base_time` clamp then stamps them with their parents' time), and two
+/// concurrent commands on it, one from each of two processes: the
+/// repository, with the two heads not merged yet.
+fn same_time_run_with_two_heads(n: usize) -> (Arc<MemoryBackend>, Identity) {
+    let t = 1_800_000_000_000i64;
+    let now = settable_clock(t + 3_600_000);
+    let me = Identity::generate("alice");
+    let disk = Arc::new(MemoryBackend::new());
+    let (root, other) = {
+        let mut repo = Repo::init(disk.clone(), Some(me.clone()), "alice").unwrap();
+        disk.write(&p("x"), b"x\n").unwrap();
+        repo.snapshot_workspace("default", &*disk).unwrap();
+        let (c, _) = repo.commit_working_copy("default", "x").unwrap();
+        (repo.root_id(), c)
+    };
+    now.store(t, std::sync::atomic::Ordering::SeqCst);
+    {
+        let mut repo = Repo::open(disk.clone(), Some(me.clone()), "alice").unwrap();
+        for i in 0..n {
+            repo.set_tag("t", if i % 2 == 0 { other } else { root }, true).unwrap();
+        }
+        assert_eq!(repo.op_log(n).unwrap().len(), n, "every move recorded");
+    }
+    let heads = head_names(&disk);
+    let (f1, f2) = (Arc::new(disk.fork()), Arc::new(disk.fork()));
+    for (f, name) in [(&f1, "a"), (&f2, "b")] {
+        Repo::open(f.clone(), Some(me.clone()), "alice").unwrap().set_tag(name, root, true).unwrap();
+    }
+    land_fork(&disk, &f1, &heads);
+    land_fork(&disk, &f2, &heads);
+    assert_eq!(head_names(&disk).len(), 2, "two heads");
+    (disk, me)
+}
+
+/// BUG-1486 (op log merges review, cycle 3): with the clock set back, a
+/// merge reads the whole run of operations of one time. The clamp stamps
+/// every command with its parents' time while the clock is behind (an
+/// hour set back, an hour of operations), and BUG-1297's fix ends the
+/// split of two heads only below every operation walked as one side's,
+/// which a common operation of the same time never is: merging two heads
+/// on a run of 500 reads all 500, once per head. On `integration` the
+/// split of the same two heads reads a handful.
+#[test]
+#[ignore = "BUG-1486: with the clock set back, merging two heads reads every operation of the run of one time below them"]
+fn bug_1486_merging_two_heads_with_the_clock_set_back_reads_a_few_operations() {
+    let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (disk, me) = same_time_run_with_two_heads(500);
+    let counting = Arc::new(CountingOps { inner: disk.fork(), reads: Default::default() });
+    let repo = Repo::open(counting.clone(), Some(me.clone()), "alice");
+    let reads = counting.reads.load(std::sync::atomic::Ordering::SeqCst);
+    clock::reset_clock();
+    let repo = repo.unwrap();
+    assert_eq!(repo.heads().len(), 1, "merged");
+    assert!(repo.view().tags.contains_key("a") && repo.view().tags.contains_key("b"), "both commands kept");
+    assert!(reads <= 60, "merging two heads on a run of 500 operations of one time read {reads} operations");
+}
+
+/// BUG-1485 (op log merges review, cycle 3): with the clock set back, the
+/// first operations of the op log below a merge cost the whole run of one
+/// time. Once the merge of two concurrent commands is listed, both are
+/// queued with one time, and the walk searches below each for the other,
+/// through every operation of that time: `vl op log -n 5`, `vl undo`,
+/// `vl redo` and `resolve_prefix` read all 500 on every call. BUG-1433's
+/// fix covers a line of operations, not a merge on one.
+#[test]
+#[ignore = "BUG-1485: with the clock set back, the op log's first operations below a merge read every operation of the run of one time"]
+fn bug_1485_the_op_log_below_a_merge_with_the_clock_set_back_reads_a_few_operations() {
+    let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (disk, me) = same_time_run_with_two_heads(500);
+    let merged = Repo::open(disk.clone(), Some(me.clone()), "alice");
+    let counting = Arc::new(CountingOps { inner: disk.fork(), reads: Default::default() });
+    let repo = Repo::open(counting.clone(), Some(me.clone()), "alice");
+    let opened = counting.reads.load(std::sync::atomic::Ordering::SeqCst);
+    let log = repo.as_ref().map(|r| r.op_log(5));
+    let reads = counting.reads.load(std::sync::atomic::Ordering::SeqCst) - opened;
+    clock::reset_clock();
+    assert_eq!(merged.unwrap().heads().len(), 1, "merged");
+    let log = log.unwrap().unwrap();
+    assert_eq!(log.len(), 5, "five listed");
+    assert!(log[0].1.parents.len() == 2, "the merge first");
+    assert!(reads <= 20, "the first five operations, below a merge on a run of 500 of one time, read {reads} operations");
+}

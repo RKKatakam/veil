@@ -631,8 +631,16 @@ fn check_model(cmds: &[Cmd], repo: &Repo, losers: &std::collections::HashSet<Obj
                 // away (of the command that wrote it, or from before it).
                 let wrote: Vec<&Cmd> = cmds.iter().filter(|c| c.landed.is_some() && c.writes.iter().any(|(k2, v2)| *k2 == k && *v2 == Some(*v))).collect();
                 let reverts = |d: &Cmd| d.what.starts_with("undo") || d.what.starts_with("op restore");
-                let removed = cmds.iter().any(|d| d.landed.is_some() && reverts(d) && d.writes.contains(&(Key::Head(v.0), None)) && wrote.iter().all(|c| c.landed.unwrap() < d.forked));
-                prop_assert!(matches!(k, Key::Rtag(_)) || removed || visible(&v.0), "{}: {:?}: {} was dropped in a conflict", at, k, v.0.short());
+                // (its head, or a head it was below: a workspace on it the
+                // revert removed, BUG-1489).
+                let below = |h: &ObjectId| *h == v.0 || repo.is_ancestor(&v.0, h).unwrap();
+                let dropped = |d: &Cmd| d.writes.iter().any(|(k2, w)| matches!(k2, Key::Head(h) if below(h)) && w.is_none());
+                let removed = cmds.iter().any(|d| d.landed.is_some() && reverts(d) && dropped(d) && wrote.iter().all(|c| c.landed.unwrap() < d.forked));
+                // Or abandoned by a concurrent command (an empty working
+                // copy a `ws remove` dropped): the ref moved onto a new
+                // change on its parents, as without a conflict (BUG-1489).
+                let followed = refs.iter().any(|r| moved(&v.0, r));
+                prop_assert!(matches!(k, Key::Rtag(_)) || removed || visible(&v.0) || followed, "{}: {:?}: {} was dropped in a conflict", at, k, v.0.short());
             }
             continue;
         }
@@ -1881,4 +1889,241 @@ fn bug_1295_an_undone_commit_stays_undone_through_a_three_way_merge() {
         }
     }
     assert!(hits > 0, "the interleaving ran");
+}
+
+/// Op log merges review, cycle 3: BUG-1434's class through a rewrite only
+/// a merge recorded. A describes `x`; E, concurrently, builds `e` on `x`
+/// (its own workspace); the settler's merge rebases `e` onto the new `x`
+/// and records `e`'s rewrite. K, who saw that merge, tags the old `e` (a
+/// pointer to the old version, nothing undone). F, who saw E but neither
+/// A nor the merge, builds `f` on `e` in a workspace of its own. After the
+/// last merge F's work sits on the merge's new `e`, not on the old one
+/// nor on a second new version of it: showing an old snapshot again is
+/// never an undo.
+#[test]
+fn a_tag_on_the_old_version_of_a_merge_rebased_snapshot_does_not_cancel_its_rebase() {
+    let me = Identity::generate("alice");
+    let commit = |repo: &mut Repo, ws: &str, file: &str| -> ObjectId {
+        repo.set_command_workspace(Some(ws.into()));
+        let ov = repo.workspace_overlay(ws).unwrap();
+        ov.write(&VPath::new(file).unwrap(), b"x\n").unwrap();
+        repo.snapshot_workspace(ws, &ov).unwrap();
+        repo.commit_working_copy(ws, file).unwrap().0
+    };
+    let mut runs = 0;
+    for _ in 0..6 {
+        let truth = Device::new(false);
+        let x = {
+            let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+            repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+            commit(&mut repo, "w", "x")
+        };
+        let h0 = op_heads(&*truth.fs);
+        let (a, e_dev) = (truth.fork(&h0), truth.fork(&h0));
+        let x2 = Repo::open(a.fs.clone(), Some(me.clone()), "alice").unwrap().describe(x, "x, described").unwrap();
+        let e = {
+            let mut repo = Repo::open(e_dev.fs.clone(), Some(me.clone()), "alice").unwrap();
+            repo.create_workspace("e", vec![x]).unwrap();
+            commit(&mut repo, "e", "e")
+        };
+        truth.land(&e_dev, &h0);
+        let he = op_heads(&*truth.fs);
+        // F saw E only.
+        let f_dev = truth.fork(&he);
+        let f = {
+            let mut repo = Repo::open(f_dev.fs.clone(), Some(me.clone()), "alice").unwrap();
+            repo.create_workspace("g", vec![e]).unwrap();
+            commit(&mut repo, "g", "f")
+        };
+        truth.land(&a, &h0);
+        // The settler's merge rebases `e` onto `x2` and records it.
+        let hae = op_heads(&*truth.fs);
+        assert_eq!(hae.len(), 2, "A and E concurrent");
+        let s = truth.fork(&hae);
+        let e2 = {
+            let repo = Repo::open(s.fs.clone(), Some(me.clone()), "alice").unwrap();
+            assert_eq!(repo.heads().len(), 1, "the settler merged");
+            let merge = repo.ops().get(&repo.op_id()).unwrap();
+            assert!(merge.is_merge(), "a merge");
+            let e2 = merge.rewritten.get(&e).and_then(|n| n.first().copied()).expect("the merge rebased e");
+            assert_eq!(repo.snapshot(&e2).unwrap().parents.clone(), vec![x2], "onto the described x");
+            e2
+        };
+        truth.land(&s, &hae);
+        // K saw the merge, and tags the old `e`.
+        let hm = op_heads(&*truth.fs);
+        let k = truth.fork(&hm);
+        Repo::open(k.fs.clone(), Some(me.clone()), "alice").unwrap().set_tag("old", e, true).unwrap();
+        truth.land(&k, &hm);
+        truth.land(&f_dev, &he);
+        let repo = Repo::open(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        assert_eq!(repo.heads().len(), 1, "settled");
+        assert_eq!(repo.view().tags["old"].target, e, "the tag stays on the old version");
+        let g = repo.workspace_wc("g").unwrap();
+        // F's commit, rebased: its parent is the merge's new `e`.
+        let f2 = repo.snapshot(&g).unwrap().parents.clone();
+        assert_eq!(f2.len(), 1);
+        let f2 = f2[0];
+        assert_ne!(f2, f, "F's commit moved off the old e");
+        assert_eq!(repo.snapshot(&f2).unwrap().parents.clone(), vec![e2], "F's commit sits on the merge's new e ({}), not on another version of it", e2.short());
+        runs += 1;
+    }
+    assert_eq!(runs, 6);
+}
+
+/// Op log merges review, cycle 3 (format): an op restore written before
+/// `restore_of` existed (by an older `vl`: the restored operation named
+/// only in its description) still takes back what it restored past when
+/// it is merged. `x` and its child `c` are committed; a describe of `x`
+/// rebases `c`; `u` restores the operation before the describe; `e`, who
+/// never saw the describe, starts a workspace on `c`. Merged in either
+/// order, `e`'s workspace stays on `c`: the describe was taken back, so
+/// nothing follows its rewrite, as with a restore that records
+/// `restore_of`.
+#[test]
+fn a_restore_written_before_restore_of_still_takes_back_what_it_restored_past() {
+    let me = Identity::generate("alice");
+    let commit = |repo: &mut Repo, file: &str| -> ObjectId {
+        repo.set_command_workspace(Some("w".into()));
+        let ov = repo.workspace_overlay("w").unwrap();
+        ov.write(&VPath::new(file).unwrap(), b"x\n").unwrap();
+        repo.snapshot_workspace("w", &ov).unwrap();
+        repo.commit_working_copy("w", file).unwrap().0
+    };
+    for legacy in [true, false] {
+        let mut orders = std::collections::HashSet::new();
+        for _ in 0..40 {
+            let truth = Device::new(false);
+            let (x, c, before) = {
+                let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+                repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+                let x = commit(&mut repo, "x");
+                let c = commit(&mut repo, "c");
+                (x, c, repo.op_id())
+            };
+            let p = op_heads(&*truth.fs);
+            let e = truth.fork(&p);
+            let eid = {
+                let mut repo = Repo::open(e.fs.clone(), Some(me.clone()), "alice").unwrap();
+                repo.create_workspace("e", vec![c]).unwrap();
+                repo.op_id()
+            };
+            {
+                let mut repo = Repo::open(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+                repo.describe(x, "x, described").unwrap();
+                assert_ne!(repo.snapshot(&repo.workspace_wc("w").unwrap()).unwrap().parents[0], c, "the describe rebased c");
+            }
+            let k = op_heads(&*truth.fs);
+            let u = truth.fork(&k);
+            let uid = {
+                let mut repo = Repo::open(u.fs.clone(), Some(me.clone()), "alice").unwrap();
+                let id = match legacy {
+                    true => {
+                        let view = repo.ops().get(&before).unwrap().view;
+                        let mut tx = repo.transaction(format!("restore to operation {}", before.short())).unwrap();
+                        tx.view = view;
+                        tx.record_always();
+                        tx.commit().unwrap().expect("recorded")
+                    }
+                    false => repo.restore_operation(before).unwrap(),
+                };
+                assert_eq!(repo.ops().get(&id).unwrap().restore_of.is_none(), legacy, "written as {} vl writes it", if legacy { "an older" } else { "this" });
+                assert_eq!(repo.snapshot(&repo.workspace_wc("w").unwrap()).unwrap().parents.clone(), vec![c], "the restore brought c back");
+                id
+            };
+            orders.insert(uid < eid);
+            truth.land(&e, &p);
+            truth.land(&u, &k);
+            let repo = Repo::open(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+            assert_eq!(repo.heads().len(), 1, "settled");
+            let on = repo.snapshot(&repo.workspace_wc("e").unwrap()).unwrap().parents.clone();
+            assert_eq!(on, vec![c], "e's workspace stays on c, the describe taken back (legacy {legacy})");
+            assert_eq!(repo.snapshot(&repo.workspace_wc("w").unwrap()).unwrap().parents.clone(), vec![c], "w stays restored");
+            if orders.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(orders.len(), 2, "both fold orders ran");
+    }
+}
+
+/// BUG-1488 (op log merges review, cycle 3): a command that saw a
+/// rewrite and rewrites the old version again makes a second version of
+/// the change; the model check (`check_rewrites_followed`: "two that both
+/// still stand") and the merge disagree on what follows. `x` and its child
+/// `f` are committed in `w`. C (another process) commits in `w` on `f`.
+/// Meanwhile A describes `x` (rebasing `f` into `f1`), tags the old `f`
+/// (a pointer to the old version) and describes the old `f` (`f2`, on the
+/// old `x`). Both rewrites of `f` stand, and differ: a divergent change,
+/// which nothing follows, so C's commit stays on `f`. The merge instead
+/// lets A's second describe replace the first (its operation descends
+/// from the first's, `Repo::merge_plan`'s `replaced`), and moves C's
+/// commit onto `f2`, the copy on the old `x`. With the two rewrites in
+/// different steps of the fold (a head between them), the same merge
+/// keeps them divergent, so the result depends on the order of the heads:
+/// `rewrites_follow_with_refs_to_old_versions_memory` fails about 1 run
+/// in 8 of 200 cases.
+#[test]
+#[ignore = "BUG-1488: a second rewrite of an old version by a command that saw the first replaces it in the merge, though both stand (a divergent change)"]
+fn bug_1488_a_second_version_of_a_change_is_divergent_in_the_merge() {
+    let me = Identity::generate("alice");
+    let commit = |repo: &mut Repo, file: &str| -> ObjectId {
+        repo.set_command_workspace(Some("w".into()));
+        let ov = repo.workspace_overlay("w").unwrap();
+        ov.write(&VPath::new(file).unwrap(), b"x\n").unwrap();
+        repo.snapshot_workspace("w", &ov).unwrap();
+        repo.commit_working_copy("w", file).unwrap().0
+    };
+    let truth = Device::new(false);
+    let (x, f) = {
+        let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+        let x = commit(&mut repo, "x");
+        (x, commit(&mut repo, "f"))
+    };
+    let h0 = op_heads(&*truth.fs);
+    let c_dev = truth.fork(&h0);
+    let c = commit(&mut Repo::open(c_dev.fs.clone(), Some(me.clone()), "alice").unwrap(), "c");
+    let (f1, f2) = {
+        let mut repo = Repo::open(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        repo.describe(x, "x, described").unwrap();
+        let f1: Vec<ObjectId> = repo.exact().visible().unwrap().into_iter().filter(|s| *s != f && repo.snapshot(s).unwrap().description.as_str() == "f").collect();
+        assert_eq!(f1.len(), 1, "the describe rebased f once");
+        repo.set_tag("old", f, true).unwrap();
+        let f2 = repo.describe(f, "f, second version").unwrap();
+        assert_eq!(repo.snapshot(&f2).unwrap().parents.clone(), vec![x], "the second version is on the old x");
+        (f1[0], f2)
+    };
+    truth.land(&c_dev, &h0);
+    let repo = Repo::open(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+    assert_eq!(repo.heads().len(), 1, "settled");
+    assert!(repo.view().refs().iter().any(|r| *r == f1 || repo.is_ancestor(&f1, r).unwrap()), "the first version stays visible");
+    assert_eq!(repo.view().tags["old"].target, f2, "the tag on the second version");
+    // C's commit, by its description.
+    let cs: Vec<ObjectId> = repo.exact().visible().unwrap().into_iter().filter(|s| repo.snapshot(s).unwrap().description.as_str() == "c").collect();
+    assert_eq!(cs.len(), 1, "one commit c ({})", c.short());
+    let on = repo.snapshot(&cs[0]).unwrap().parents.clone();
+    assert_ne!(on, vec![f2], "C's commit followed the second version of f ({}), on the old x", f2.short());
+    assert_eq!(on, vec![f], "C's commit stays on f: a divergent change, which nothing follows");
+}
+
+/// BUG-1489 (op log merges review, cycle 3): the model check of the
+/// every-write guarantee (`check_model`) reported conflict losers dropped
+/// that a later command had taken away on purpose, as the engine should.
+/// Two concurrent commits each move `t0` (a commit moves the tags on its
+/// working copy's parent), so one commit's value loses and stays visible,
+/// below a workspace a third command creates on that commit; an op
+/// restore that saw both commits restores the other one's view, taking
+/// back the losing commit and the workspace. The check accepted a revert
+/// only when it removed the loser's own head. (The other shape: an empty
+/// working copy restored by an undo, the loser of a conflict, abandoned
+/// by a concurrent `ws remove`: the workspace moves onto a new empty
+/// change on its parents, which the check accepted without a conflict and
+/// not with one.) This input failed 160 replays in 300.
+#[test]
+fn bug_1489_the_model_check_accepts_a_loser_a_restore_took_back() {
+    let steps: Vec<u16> = vec![46400, 64147, 32158, 41390, 43653, 19720, 22388, 35165, 28269, 13147, 7548, 1001];
+    for _ in 0..30 {
+        check_every_write_survives(false, 2, true, true, &steps).unwrap();
+    }
 }
