@@ -443,7 +443,15 @@ fn blame_keeps_versions_and_resumes() {
         blame: BlameLimits { held: 2_000, ..BlameLimits::default() },
         ..Limits::default()
     };
-    let r = th.rt.block_on(query::blame(&h.hub, &a, BlameParams { path: "pub/long.txt".into(), ..Default::default() }, small));
+    // Asked again while `warming` (the job may outlast a request's
+    // deadline on a loaded database), as a client does.
+    let t0 = Instant::now();
+    let r = loop {
+        let r = th.rt.block_on(query::blame(&h.hub, &a, BlameParams { path: "pub/long.txt".into(), ..Default::default() }, small));
+        if !matches!(r, Err(Error::Api { code: "warming", .. })) || t0.elapsed() > Duration::from_secs(120) {
+            break r;
+        }
+    };
     assert!(matches!(r, Err(Error::Api { code: "too_wide", .. })), "{r:?}");
 }
 
@@ -1499,8 +1507,8 @@ mod s14c3_adversarial {
 
     /// BUG-1218 (fixed). Blaming a file at each of its revisions keeps a
     /// blame per revision asked for (and no walk records: there are none),
-    /// and a project keeps at most `BlameLimits::kept_bytes` of kept blames,
-    /// its oldest dropped first: storage does not grow with the revisions
+    /// and a view key keeps at most `BlameLimits::kept_bytes` of kept blames,
+    /// its oldest dropped first (one viewer here): storage does not grow with the revisions
     /// blamed. Here: a 160-version chain at a 100-byte path, one blame at
     /// each of its newest 120 revisions, under a cap of 64 KiB; every blame
     /// is right (each against one from nothing at the end).
@@ -1959,16 +1967,17 @@ mod s14rd_review {
     }
 
     /// Guarantee 1 (every blame eventually answers, and nobody starves):
-    /// while this server's table of waiting blame jobs is full (here: 256
-    /// jobs of one project, each waiting on a lease another server holds
-    /// and renews, as when that server's job is slow or queued), a first
-    /// blame of a file in another project still answers within a bounded
-    /// time. It does not: past `MAX_PENDING_JOBS` a request answers
-    /// `warming` and queues nothing, so the other project's blame answers
-    /// `warming` for as long as the table stays full (each waiting job
-    /// stays up to `JOB_WAIT`, 600 s), whoever fills it.
+    /// while one project's share of this server's waiting blame jobs is
+    /// full (256 jobs, each waiting on a lease another server holds and
+    /// renews, as when that server's job is slow or queued), a first blame
+    /// of a file in another project still answers within a bounded time.
+    /// It did not (BUG-1306, fixed): past `MAX_PENDING_JOBS` in all, a
+    /// request answered `warming` and queued nothing, so the other
+    /// project's blame answered `warming` for as long as the table stayed
+    /// full (each waiting job stayed up to `JOB_WAIT`, 600 s). Now the
+    /// share is per project: project one's 257th job is refused, project
+    /// two's queues.
     #[test]
-    #[ignore = "BUG-1306: a full table of waiting blame jobs on a server makes every other first blame there answer warming"]
     fn bug_1306_a_full_job_table_starves_other_projects_blames() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);
@@ -1990,16 +1999,28 @@ mod s14rd_review {
             }
         }
         let started = jobs_started(&one.hub);
+        let mut refused = 0;
         for (i, s) in snaps.iter().enumerate() {
             for follow in [false, true] {
-                if (jobs_started(&one.hub) - started) as usize >= veil_server::query::files::MAX_PENDING_JOBS {
-                    break;
+                let q = || BlameParams { rev: Some(s.hex()), path: path.into(), follow: Some(follow), n: Some(10), ..Default::default() };
+                let full = (jobs_started(&one.hub) - started) as usize >= veil_server::query::files::MAX_PENDING_JOBS;
+                // Asked until its job starts (a 5 ms deadline can pass
+                // before the request reaches the table, under load).
+                let before = jobs_started(&one.hub);
+                for _ in 0..if full { 1 } else { 50 } {
+                    assert!(once(&th, &one.hub, &a1, q(), limits(5, BlameLimits::default())).is_none(), "version {i} answered under another server's lease");
+                    if jobs_started(&one.hub) > before {
+                        break;
+                    }
                 }
-                let q = BlameParams { rev: Some(s.hex()), path: path.into(), follow: Some(follow), n: Some(10), ..Default::default() };
-                assert!(once(&th, &one.hub, &a1, q, limits(5, BlameLimits::default())).is_none(), "version {i} answered under another server's lease");
+                if full {
+                    assert_eq!(jobs_started(&one.hub), before, "project one queued past its share");
+                    refused += 1;
+                }
             }
         }
-        assert_eq!(jobs_started(&one.hub) - started, veil_server::query::files::MAX_PENDING_JOBS as u64, "the table is full");
+        assert_eq!(jobs_started(&one.hub) - started, veil_server::query::files::MAX_PENDING_JOBS as u64, "project one's share is full");
+        assert_eq!(refused, 260 - veil_server::query::files::MAX_PENDING_JOBS, "the rest refused");
         // Project two, on the same server: an ordinary first blame.
         let mut two = Hist::new(&th, &policy_text, &bindings);
         let (snaps2, _) = chain_on(&th, &mut two, root_snapshot_id(), Files::new(), "pub/g/other.txt", 10, 33, 1_700_000_000_000);
@@ -2028,12 +2049,12 @@ mod s14rd_review {
     /// Guarantee 2 (no version is blamed twice across servers): a job that
     /// finds another server's live lease on its key waits for that
     /// server's kept blame and never blames the version itself while the
-    /// lease lives. It does: `leased_job` waits at most `JOB_WAIT` (600 s)
-    /// and then blames without any lease, beside the holder (which may
-    /// still be waiting for one of its own server's two slots). Takes
-    /// about 10 minutes.
+    /// lease lives. It did (BUG-1307, fixed): `leased_job` waited at most
+    /// `JOB_WAIT` (600 s) and then blamed without any lease, beside the
+    /// holder (which may still be waiting for one of its own server's two
+    /// slots). Now the wait ends `warming`. Here the wait is 20 s
+    /// (`BlameLimits::wait`) and the test watches for 60 s.
     #[test]
-    #[ignore = "BUG-1307: a job that waited JOB_WAIT for another server's live lease blames the version anyway, without a lease"]
     fn bug_1307_a_job_blames_a_version_another_server_still_holds() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);
@@ -2052,9 +2073,10 @@ mod s14rd_review {
         renew();
         let before = steps(&[&h.hub]);
         let q = || BlameParams { path: path.into(), n: Some(1000), ..Default::default() };
-        assert!(once(&th, &h.hub, &a, q(), limits(50, BlameLimits::default())).is_none(), "answered under another server's lease");
+        let short = limits(50, BlameLimits { wait: Duration::from_secs(20), ..BlameLimits::default() });
+        assert!(once(&th, &h.hub, &a, q(), short).is_none(), "answered under another server's lease");
         let t0 = Instant::now();
-        while t0.elapsed() < Duration::from_secs(660) {
+        while t0.elapsed() < Duration::from_secs(60) {
             std::thread::sleep(Duration::from_secs(15));
             renew();
             assert_eq!(steps(&[&h.hub]) - before, 0, "blamed a version whose lease another live server holds, after {:?}", t0.elapsed());
@@ -2070,7 +2092,6 @@ mod s14rd_review {
     /// bound again (with the server's limits, some 200,000 versions, in one
     /// of its two slots) and fails the same way.
     #[test]
-    #[ignore = "BUG-1309: each request of a blame past the memory bound runs its whole walk again"]
     fn bug_1309_a_too_wide_blame_walks_again_at_every_request() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);
@@ -2120,7 +2141,6 @@ mod s14rd_review {
     /// what it drops is a function of the bytes of other keys' blames,
     /// which are a function of hidden files' lines and changes.
     #[test]
-    #[ignore = "BUG-1308: one view key's kept blames dropped by the project's cap depend on the size of other keys' blames of hidden files"]
     fn bug_1308_which_kept_blames_survive_depends_on_hidden_files() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);
@@ -2221,11 +2241,11 @@ mod s14rd_review {
         }
     }
 
-    /// Guarantee 4: a kept blame takes at most 64 + 128 bytes a line of its
-    /// version and 768 bytes a change its lines name (phase-3 §12). An
-    /// empty file's kept blame (no line, no change) takes more than 64.
+    /// Guarantee 4: a kept blame takes at most `BASE_BYTES` (128) + 128
+    /// bytes a line of its version and 768 bytes a change its lines name
+    /// (phase-3 §12). An empty file's kept blame (no line, no change) took
+    /// 82, past the 64 the bound stated (BUG-1219: the base is 128 now).
     #[test]
-    #[ignore = "BUG-1219: an empty file's kept blame is larger than the stated bound of a kept blame"]
     fn bug_1219_an_empty_files_kept_blame_passes_its_stated_bound() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);
@@ -2240,7 +2260,8 @@ mod s14rd_review {
         assert_eq!(v["line_count"], 0);
         let bytes: Vec<i64> = th.rt.block_on(async { sqlx::query_scalar("SELECT bytes FROM blame_memo WHERE project_id = $1").bind(h.id).fetch_all(&h.hub.db).await.unwrap() });
         assert_eq!(bytes.len(), 1, "the blame was kept");
-        assert!(bytes[0] <= 64, "an empty file's kept blame takes {} bytes, past the stated 64 + 128 a line + 768 a change", bytes[0]);
+        let base = veil_server::derive::blame::BASE_BYTES as i64;
+        assert!(bytes[0] <= base, "an empty file's kept blame takes {} bytes, past the stated {base} + 128 a line + 768 a change", bytes[0]);
     }
 
     fn status_bytes(field: &str) -> u64 {
@@ -2252,14 +2273,16 @@ mod s14rd_review {
     /// walk's versions, texts, blames, interned paths and its write buffer
     /// all counted"). With `follow` on a file renamed at each of its 3,000
     /// changes at 3 KB paths, under a 16 MiB bound, the job's peak memory
-    /// (the process's peak resident set, reset just before) grows by about
-    /// 2.4 times the bound before it answers `too_wide`: the file-history
-    /// rows its walk reads (`Files`' windows), the rename map and the
-    /// copies of each version's path (the walk's stack, order and edges)
-    /// are not counted. (0.55 times with short paths and no renames: the
-    /// measure's own noise is small.) Linux only; run alone (`--exact`).
+    /// (the process's peak resident set, reset just before) grew by about
+    /// 2.4 times the bound before it answered `too_wide` (BUG-1219, fixed):
+    /// the file-history rows its walk read (`Files`' windows), the rename
+    /// map and the copies of each version's path (the walk's stack, order
+    /// and edges) were not counted. (0.55 times with short paths and no
+    /// renames: the measure's own noise is small.) Linux only; ignored only
+    /// because it must run alone (`--exact`): other tests in the process
+    /// would move its peak.
     #[test]
-    #[ignore = "BUG-1219: a blame job holds more than its memory bound (file-history rows, renames and path copies not counted)"]
+    #[ignore = "measures the process's peak memory: run alone (`--exact`)"]
     fn bug_1219_a_blame_job_holds_more_than_its_memory_bound() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);

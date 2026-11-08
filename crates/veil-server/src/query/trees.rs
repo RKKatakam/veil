@@ -103,6 +103,15 @@ impl<'g, 'a> Trees<'g, 'a> {
         }
     }
 
+    /// Start afresh now if the projector made any trees: a blame job does
+    /// this between versions, so the trees a rename search made are not
+    /// held through its walk (BUG-1219).
+    pub fn forget_now(&self) {
+        if !self.pr.borrow().created.is_empty() {
+            *self.pr.borrow_mut() = Projector::new(&self.g.cx.src, self.view);
+        }
+    }
+
     /// The projected root tree of the snapshot `row` stands for.
     pub fn root_of(&self, row: &VRow) -> Result<ObjectId> {
         let s = self.g.snapshot(&row.real)?;

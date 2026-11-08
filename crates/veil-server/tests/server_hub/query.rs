@@ -83,12 +83,14 @@ enum Q {
     History(HistoryParams, Limits),
 }
 
-/// Forget every kept blame of project `h` (S14): the harness compares a
-/// viewer's answers with their copy's from the same start, and viewers
-/// who read the same paths share kept blames.
+/// Forget every kept blame of project `h` (S14), and every too-wide
+/// record (BUG-1309): the harness compares a viewer's answers with their
+/// copy's from the same start, and viewers who read the same paths share
+/// kept blames.
 pub(crate) fn forget_blames(th: &TestHub, h: &Hist) {
     th.rt.block_on(async {
         again(|| sqlx::query("DELETE FROM blame_memo WHERE project_id = $1").bind(h.id).execute(&h.hub.db)).await;
+        again(|| sqlx::query("DELETE FROM blame_ends WHERE project_id = $1").bind(h.id).execute(&h.hub.db)).await;
     });
 }
 
@@ -1783,8 +1785,8 @@ mod s13_adversarial {
 
     /// Kept cursors are bounded, whatever anyone asks: anyone on Earth
     /// paging a wide public log over and over, from many places, makes the
-    /// server keep at most `Limits::kept_bytes` of cursors for the project
-    /// after every request (oldest dropped first; one row per request, of
+    /// server keep at most `Limits::kept_bytes` of cursors for the project's
+    /// one view key here (the cap is a view key's) after every request (oldest dropped first; one row per request, of
     /// at most `Limits::frontier` snapshots); the same frontier is kept
     /// once; rows past `Limits::kept_for` are dropped by the next write and
     /// never served.

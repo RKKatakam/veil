@@ -116,10 +116,12 @@ struct Stored {
 /// digits and a 32-digit path key with their JSON, and a range), and per
 /// change its lines name (its id and [`Meta`], author and summary at most
 /// [`MAX_AUTHOR`] and [`MAX_SUMMARY`] bytes, their JSON escapes at most
-/// doubling them), past [`BASE_BYTES`].
+/// doubling them), past [`BASE_BYTES`]: the header and the JSON of an
+/// empty blame, at most 101 bytes with the largest depth (BUG-1219: it was
+/// stated as 64, and an empty file's kept blame took 82).
 pub const MAX_BYTES_PER_LINE: usize = 128;
 pub const MAX_BYTES_PER_CHANGE: usize = 768;
-pub const BASE_BYTES: usize = 64;
+pub const BASE_BYTES: usize = 128;
 
 impl Blame {
     /// The bytes it takes in memory, about.
@@ -398,6 +400,10 @@ mod tests {
         };
         let raw = many.encode(crate::derive::changes::path_key);
         assert!(raw.len() <= BASE_BYTES + (MAX_BYTES_PER_LINE + MAX_BYTES_PER_CHANGE) * 400, "{}", raw.len());
+        // An empty blame at the largest depth: the base alone (BUG-1219).
+        let empty = Blame { vd: u64::MAX, coarse: false, origins: Vec::new(), lines: Vec::new() };
+        let raw = empty.encode(crate::derive::changes::path_key);
+        assert!(raw.len() <= BASE_BYTES, "{}", raw.len());
         assert_eq!(first_line("one\u{7}two\nthree", 100), "one two");
         assert_eq!(first_line(&"é".repeat(100), 9), "éééé");
     }

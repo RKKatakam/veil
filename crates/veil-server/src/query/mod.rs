@@ -87,7 +87,8 @@ pub struct Limits {
     /// ends before a step would pass it.
     pub frontier: usize,
     /// How long a kept cursor lives from its last writing, and the most
-    /// bytes of kept cursors a project holds (oldest dropped first).
+    /// bytes of kept cursors one view key of a project holds (its oldest
+    /// dropped first).
     pub kept_for: Duration,
     pub kept_bytes: usize,
     /// Most ancestry pairs.
@@ -344,8 +345,9 @@ const STORED_CURSOR: &str = "frontier-";
 /// row per request, at most `Limits::frontier` snapshots in it (about
 /// 65 bytes each); a row lives `Limits::kept_for` from its last writing
 /// (the same frontier written again is the same row, refreshed); and every
-/// write deletes the project's expired rows, then its oldest rows past
-/// `Limits::kept_bytes` in all. A cursor so dropped is refused when sent
+/// write deletes the project's expired rows, then the view key's oldest
+/// rows past `Limits::kept_bytes` (a view key's own: nothing one view key
+/// keeps drops another's, BUG-1308). A cursor so dropped is refused when sent
 /// back (`invalid cursor`): the log is asked for again from its start.
 fn keep_cursor(cx: &crate::derive::Cx, vk: &str, id: &str, text: &str, limits: &Limits) -> Result<()> {
     let now = veil_core::now_millis();
@@ -371,13 +373,14 @@ fn keep_cursor(cx: &crate::derive::Cx, vk: &str, id: &str, text: &str, limits: &
     })?;
     cx.db(|| {
         sqlx::query(
-            "DELETE FROM log_cursors WHERE project_id = $1 AND (view_key, id) IN ( \
-                 SELECT view_key, id FROM ( \
-                     SELECT view_key, id, SUM(LENGTH(frontier)) OVER (ORDER BY created_at DESC, view_key, id) AS kept \
-                     FROM log_cursors WHERE project_id = $1) t \
-                 WHERE kept > $2)",
+            "DELETE FROM log_cursors WHERE project_id = $1 AND view_key = $2 AND id IN ( \
+                 SELECT id FROM ( \
+                     SELECT id, SUM(LENGTH(frontier)) OVER (ORDER BY created_at DESC, id) AS kept \
+                     FROM log_cursors WHERE project_id = $1 AND view_key = $2) t \
+                 WHERE kept > $3)",
         )
         .bind(cx.project())
+        .bind(vk)
         .bind(limits.kept_bytes as i64)
         .execute(pool)
     })?;
@@ -732,7 +735,7 @@ pub async fn blame(hub: &Arc<Hub>, ask: &Ask, q: BlameParams, limits: Limits) ->
             }
             let f = files::Files::new(g);
             let (depth, x) = f.intro(id, &path)?.ok_or_else(|| Error::Other(anyhow::anyhow!("file history: no version of a file present")))?;
-            let start = files::Version { id: x, depth, path: path.clone() };
+            let start = files::Version { id: x, depth, path: Arc::from(path.as_str()) };
             match files::kept_answer(&f, t, id, &start, follow, after, n, limits.blame)? {
                 Some(v) => Ok(v),
                 None => Ok(json!({ "pending": start })),
@@ -792,7 +795,7 @@ pub async fn history(hub: &Arc<Hub>, ask: &Ask, q: HistoryParams, limits: Limits
             Ok((id, path)) => {
                 file_entry(g, t, &id, &path)?;
                 let (depth, x) = f.intro(id, &path)?.ok_or_else(no_path)?;
-                vec![files::Version { id: x, depth, path }]
+                vec![files::Version { id: x, depth, path: Arc::from(path) }]
             }
             Err(nodes) => {
                 let nodes = match nodes {
@@ -809,7 +812,7 @@ pub async fn history(hub: &Arc<Hub>, ask: &Ask, q: HistoryParams, limits: Limits
                         Some(r) if !r.withheld() => r,
                         _ => return Err(no_revision()),
                     };
-                    out.push(files::Version { id, depth: r.depth, path });
+                    out.push(files::Version { id, depth: r.depth, path: Arc::from(path) });
                 }
                 out
             }

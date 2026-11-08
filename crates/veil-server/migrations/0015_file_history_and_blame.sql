@@ -58,6 +58,21 @@ CREATE TABLE IF NOT EXISTS blame_jobs (
     expires_at BIGINT NOT NULL,
     PRIMARY KEY (project_id, view_key, path_key, follow, snapshot)
 );
+-- Blames found too wide (BUG-1309): the job passed a memory bound of
+-- `held` bytes, so a request under a bound no larger answers `too_wide`
+-- from this row instead of walking again. A version's history below it
+-- never changes, and a change of access is a new view key. At most
+-- 4,096 rows a view key (its oldest dropped).
+CREATE TABLE IF NOT EXISTS blame_ends (
+    project_id BIGINT NOT NULL,
+    view_key TEXT NOT NULL,
+    path_key TEXT NOT NULL,
+    follow BOOLEAN NOT NULL,
+    snapshot TEXT NOT NULL,
+    held BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (project_id, view_key, path_key, follow, snapshot)
+);
 -- Which viewer-graph rows have their file history (S14 writes it before
 -- the row, and sets `files`; an S13 server, which may still run beside S14
 -- servers in a rolling restart, writes graph rows only and never sets it).
