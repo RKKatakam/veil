@@ -2586,24 +2586,24 @@ trusted (with code; never with secrets' plaintext).
 
 #### Measured
 
-The 1 GB profile (`veil-bench gen --profile 1g --plain`, 10,021 snapshots,
-327,017 objects), generated once and pushed to a fresh server each time
-(PostgreSQL 17 and MinIO in Docker, release builds, the same `vl` from
-`integration` @ `228eb1b` for every server), then cloned whole; times
-under `bench-quiet.sh` (the machine was shared and loaded: load 22 for the
-base, 44 for S28), memory as the server's `VmHWM`. Load: `veil-bench load`,
-one project, 10 agents, 15 s.
+`scripts/bench-server.sh 1g` through `bench-quiet.sh` (PostgreSQL 17 and
+MinIO in Docker, release builds, the same `vl` and `veil-bench`; the base
+server through `SERVER_BIN`), one run each, back to back on a quiet
+machine (load 13 → 9 and 9 → 11), 2026-11-08; memory is the server's
+`VmHWM`. Storage writes and load: the earlier harness and `veil-bench load`
+(one project, 10 agents, 15 s).
 
-| | `integration` @ `228eb1b` | S28 |
+| | `integration` @ `6fa552c4` | S28 (`891ef104`) |
 |---|---:|---:|
-| push: storage writes / bytes written | 327,017 / 977 MB | **110** / 991 MB |
-| push: end to end | 354 s | **138 s** (the server's part 57 s: walk 8 s, checks 47 s) |
-| push: server peak | 1,362 MiB | **879 MiB** |
-| full clone after it: server peak | 1,870 MiB | **943 MiB** |
-| full clone: time | 78 s | 119 s (BUG-1152) |
+| push, initial (10,022 snapshots, 327,017 objects): time | 252.7 s | **99.3 s** |
+| push, initial: server peak | 1,254 MiB ⛔ | **888 MiB** |
+| push, initial: storage writes | 327,017 (one per object) | **110** (one per 8 MiB upload request) |
+| clone, full: time | 68.5 s | **59.8 s** |
+| clone, full: server peak | 1,786 MiB ⛔ | **964 MiB** |
+| clone of one directory: time / server peak | 4.7 s / 1,343 MiB ⛔ | 8.0 s / 895 MiB (BUG-1152) |
 | load, own branches: storage writes per landing (the push's own) | 9.0 | 3.0 (**2.0**) |
-| load, into one `main` (about 8 lost races per landing): per landing (per push) | 66.5 | 15.4 (**1.5**) |
-| load: database commits per landing, own branches / one `main` | 1.58 / 5.2 | 1.38 / 5.0 |
+| load, into one `main` (about 9 lost races per landing): per landing (per push) | 66.5 | 15.4 (**1.5**) |
+| load: database commits per landing, own branches / one `main` (the push's own) | 1.58 / 5.2 | 1.38 / 5.0 |
 | load: storage reads per landing | 0 | 0 |
 
 **BUG-1089 and BUG-1000** (bisected: `31639c3` 972 MiB, `d8cf2b2` 967 MiB,

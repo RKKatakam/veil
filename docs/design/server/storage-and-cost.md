@@ -22,7 +22,7 @@ Each of those is also time on the request path. So every item here makes Veil **
 | Landings/s across 100 projects, MinIO | 376 (bound by the object store) | 4,000 (phase 2 gate) |
 | Landings/s into one `main` | about 20 | 100 (phase 2), 1,000 (phase 4, by batching) |
 | Bytes stored and sent | uncompressed | compressed (zstd): **built in S27** (`HUB.md` §13.15) |
-| Server memory, 1 GB project | push 2.4 GB, clone 2.9 GB peak (BUG-864: allocator arenas; fixed with jemalloc, 2026-11-07: push 0.98 GB, clone 1.58 GB, BUG-1000; S27 raised the push to 1.36 GB, BUG-1089) | under 1 GB: **built** (S28: push 0.88 GB, clone 0.94 GB; BUG-1000 and BUG-1089 fixed, `HUB.md` §13.20) |
+| Server memory, 1 GB project | push 2.4 GB, clone 2.9 GB peak (BUG-864: allocator arenas; fixed with jemalloc, 2026-11-07: push 0.98 GB, clone 1.58 GB, BUG-1000; S27 raised the push to 1.36 GB, BUG-1089) | under 1 GB: **built** (S28: push 0.89 GB, clone 0.96 GB on `bench-server.sh 1g`; BUG-1000 and BUG-1089 fixed, `HUB.md` §13.20) |
 
 ## 3. One database commit per push (S4)
 
@@ -121,7 +121,7 @@ Found by the benchmarks of 2026-11-06. Each is a small fix round, not a mileston
 |---|---|---|
 | Server memory arenas | Done: glibc kept one memory arena per thread (2.4 GB push peak). `veil-server` now uses jemalloc with two arenas (push 984 MiB; measurements in `BASELINE.md`, "The server's allocator"). | BUG-864 (fixed) |
 | Server memory during a clone | Done (S28): objects read from S3 were cached as slices of the HTTP client's read buffers, each pinning a whole buffer; now copied. The full clone peaks at 0.94 GB. | BUG-1000 (fixed) |
-| Push checks one snapshot at a time | Done (S28): up to 8 at once on a guess that a wrong answer undoes. The 1 GB project's first push: 354 → 138 s. | BUG-865 (fixed) |
+| Push checks one snapshot at a time | Done (S28): up to 8 at once on a guess that a wrong answer undoes. The 1 GB project's first push: 253 → 99 s (`bench-server.sh 1g`). | BUG-865 (fixed) |
 | Commit one file | Still 3–4× slower than Git: the scan of every file. Use the stat cache to skip unchanged files (performance round 3); the daemon's file watcher (S7) removes the scan entirely. | `OPENSCION.md` |
 | Clone one folder | About 60 forced disk writes in sequence. Use one durability barrier, as the full clone already does. | `OPENSCION.md` |
 | Merge base of distant branches | 0.7 s at 20,000 snapshots apart. Memoise merge bases, or use a better walk. | S13 |
