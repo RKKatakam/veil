@@ -71,6 +71,8 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/q/ancestry", post(crate::query::ancestry_route))
         .route("/v1/projects/{p}/q/blame", get(crate::query::blame_route))
         .route("/v1/projects/{p}/q/history", get(crate::query::history_route))
+        .route("/v1/projects/{p}/q/search", get(crate::search::search_route))
+        .route("/v1/projects/{p}/q/grep", get(crate::search::grep_route))
         .layer(DefaultBodyLimit::max(crate::db::body_limit("")))
         .layer(axum::middleware::from_fn(crate::db::retry_requests))
         .with_state(hub)

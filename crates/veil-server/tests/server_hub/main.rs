@@ -27,6 +27,7 @@ mod shares;
 mod derived;
 mod query;
 mod blame;
+mod search;
 mod startup;
 mod grants;
 mod caches;

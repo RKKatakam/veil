@@ -2432,6 +2432,7 @@ store for up to one poll after the change (about a second, at most 5 s: the
 owner's bound). Not built: `vl` reading through the
 cache (S3), the Veil daemon (S6), the public CDN URLs of design §4.3.
 
+older snapshots, caches, `vl` reading through these routes (S3, S6).
 
 ### 13.22 S14: blame and file history (built)
 
@@ -2442,3 +2443,45 @@ cache (S3), the Veil daemon (S6), the public CDN URLs of design §4.3.
 * **Boundary cuts:** a file moved out of a folder the caller cannot read is added for them, its lines are the moving change's, and nothing names the hidden folder; a file moved into it is deleted. A secret is never read: its blame is refused, its history lists entries only.
 * **Bounds:** 4 blames compute at once per process, each holding at most 64 MiB; plain-text files of at most 1 MiB; 10,000 lines a page; history pages and cursors as the log's (long cursors kept by the server); the 2 s deadline. A blame or its walk down that stops keeps where it got to, so each request leaves progress.
 * **Beside S13 servers:** a graph row counts as filled only once S14 wrote its file history (`view_graph.files`), so rows an S13 server writes during a rolling restart are filled again, never trusted.
+
+### 13.23 S15: search (built)
+
+Design: `docs/design/server/phase-3-server-history.md` §3.5 and its §13
+(as built, with the threat review and the measurements). Code:
+`crates/veil-server/src/search/` (`index.rs` builds the index, `segment.rs`
+its pieces, `pattern.rs` what a query asks, `mod.rs` the routes), migration
+`0016_search.sql`, two routes in `api.rs`, one call after each landing's
+derivation (`derive::landing`), and `vl search`. No repository format
+change; nothing new is encrypted.
+
+* **Routes** (`/v1/projects/{p}/q/…`, answers carry `policy_version` and
+  `work`): `GET search?q=&rev=&kind=&path=&lang=&n=&after=` ranks files by
+  their content at a branch tip (`kind=code`, `veil.search/1`) or by name
+  over every path the project's history held (`kind=path`);
+  `GET grep?pattern=&rev=&i=&path=&n=&after=` lists the lines matching a
+  regular expression (linear-time `regex`), file by file in tree order,
+  through the index at a branch tip and by a scan of the viewer's tree at
+  any other revision (`veil.hub-grep/1`; S16 renders it as `vl grep`).
+* **Sharded by access line.** The index is derived data on real history,
+  in shards named by S12's line keys: a file's document is in the shard of
+  the line deciding its path. A query opens only the shards of the lines
+  its viewer reads, so every hit, count, ranking statistic (BM25 over the
+  viewer's shards), page and `work` counter is computed from what the
+  viewer may read: the same, byte for byte, as on a copy of the project
+  holding only their projected history.
+* **Secrets** are indexed by path only (their objects are never opened);
+  **embargo lines** are never indexed or walked; who reads a line is not
+  part of its key, so access changes apply at the next request, and a new
+  policy that changes which paths a line decides answers `indexing` (503)
+  until the shards whose keys changed are rebuilt.
+* **Every branch, always caught up** (BUG-1231): each update also takes
+  every branch whose index is behind its tip, and the server resumes them
+  at start; an answer from an index still catching up says so (`behind`,
+  with `tip_id`, in the viewer's ids).
+* **Bounded** (BUG-1230, BUG-1232): candidates are streamed (postings
+  intersected as decoded, segments merged in tree order) and a query stops
+  at its bound; the deadline is checked inside every loop and before each
+  line a grep searches; a line longer than the pattern's size allows is not
+  searched (`long_lines_skipped`).
+* `vl search WORDS… [--path] [--lang LANG] [-r BRANCH] [-n N] [--json] [-- PATH]`
+  prints the server's answer (exit 1 when nothing matched).
