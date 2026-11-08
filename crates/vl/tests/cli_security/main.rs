@@ -12,6 +12,7 @@
 mod adversarial_support;
 
 mod access_cli;
+mod agent_cli;
 mod artefacts_cli;
 mod cloaked_work_cli;
 mod embargo_copy_cli;

@@ -16,6 +16,7 @@
 mod adversarial_support;
 
 mod access;
+mod agent_attribution;
 mod adversarial2_embargo;
 mod adversarial2_scanner;
 mod adversarial2_visibility;

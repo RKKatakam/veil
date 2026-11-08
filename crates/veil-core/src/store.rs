@@ -352,6 +352,13 @@ impl ObjectStore {
     pub(crate) fn check_storable(&self, raw: &[u8]) -> Result<()> {
         let need = Object::min_repo_format(raw);
         let have = self.format();
+        if need > have && need >= crate::object::ATTRIBUTION_REPO_FORMAT {
+            return Err(VeilError::Unsupported(format!(
+                "this repository is at format {have} and cannot store format-{need} snapshots (agent attribution \
+                 or attempts); upgrade it with `vl upgrade` once everyone who uses it runs vl {} or later",
+                crate::repo::min_vl_for_format(need)
+            )));
+        }
         if need > have && need >= crate::object::GIT_PARITY_REPO_FORMAT {
             return Err(self.format_5_refusal());
         }
@@ -1124,6 +1131,13 @@ impl ObjectStore {
             return Err(self.format_5_refusal());
         }
         let raw = self.encode(obj);
+        if let Object::Snapshot(s) = obj {
+            // Engine code cannot write a hostile or unbounded one either.
+            s.validate_format_10()?;
+            if s.has_format_10_fields() {
+                self.check_storable(&raw)?;
+            }
+        }
         let id = ObjectId::hash(&raw);
         self.write_if_absent(&id, &raw)?;
         Ok(id)

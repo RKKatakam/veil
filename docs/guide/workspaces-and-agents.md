@@ -307,6 +307,68 @@ points at. Take it from there with its change id: `vl merge zsspmtrn`,
 `vl tag set codegen -r zsspmtrn`, `vl edit zsspmtrn`, or
 `vl abandon zsspmtrn`.
 
+<a id="attribution"></a>
+## Who made a change: agent attribution
+
+A change an agent made says so. `vl` records the agent, its task, a
+reference to its prompt and the harness's run id on every snapshot it
+creates, from **its own** arguments and environment:
+
+```text
+$ vl ws exec agent --agent "claude-code opus-5.5" --task "fix the parser" --run r-41 -- my-agent "fix the parser bug"
+$ VEIL_AGENT="claude-code" VEIL_AGENT_TASK="TASK-12" vl commit -m "parser fix"   # an agent that drives vl itself
+$ vl log --agent 'claude-*'          # or: vl log -r 'agent(claude-*)'
+○  lqosxltm alice ✓ 2026-11-08 10:12 5b0e44a1
+│  parser fix
+│  agent: claude-code · task: TASK-12
+$ vl show                            # Agent, Task, Prompt and Run lines
+```
+
+- **It is your claim, signed by you.** The attribution is inside the
+  snapshot, so your signature covers it: changing it changes the id.
+- **A command in the sandbox cannot set it.** It cannot reach the
+  repository at all; whatever it puts in its own environment, or in a file,
+  never reaches a snapshot. `--agent` and its friends win over the
+  `VEIL_AGENT…` environment of the `vl` that runs `ws exec`.
+- **Rebases and duplicates keep each change's own**; the empty change
+  `vl commit` starts gets none (whoever fills it is recorded then).
+- **Visibility:** plain text, seen by exactly the people who see the
+  change, like its description; withheld with it under an embargo.
+- Bounds: an agent name of 1 to 128 printable characters, a task or prompt
+  reference of at most 4 KiB, a run id of `A-Z a-z 0-9 . _ : -` (64 at
+  most). Anything else is refused, without being echoed.
+
+<a id="attempts"></a>
+## Recorded dead ends: `vl attempt drop`
+
+When an approach fails, keep it instead of erasing it, so the next agent
+or reviewer sees what was tried and why:
+
+```text
+$ vl attempt drop --reason "deadlocks holding the lease across memo_tips"
+Recorded attempt 6101b472; the change starts again: zsspmtrn 7c5a91e0 lease fix
+$ vl show
+…
+Discarded attempts (1):
+  6101b472 agent: claude-code · task: lease fix
+    deadlocks holding the lease across memo_tips
+    changed: src/lease.rs
+$ vl evolog                          # the attempt, with its reason, in the change's evolution
+```
+
+- `vl attempt drop [REV] --reason …` records REV's content as an
+  abandoned version of the change and starts the change again from its
+  parents (the working copy follows; descendants are rebased).
+- **An attempt never lands:** it is never a head, a workspace's change, a
+  tag's or branch's target or anyone's parent, here or on the server. It
+  travels with its change (push, pull) and goes when the change is
+  abandoned.
+- A change keeps at most 32 attempts, each reason at most 64 KiB.
+- Visibility is the change's: who sees the change sees its attempts'
+  reasons and what they changed (as much of it as they may see).
+- Attribution and attempts need repository format 10: `vl upgrade` moves a
+  format 8 or 9 repository there, rewriting nothing.
+
 <a id="only"></a>
 ## Sparse sandboxes: `--only`
 

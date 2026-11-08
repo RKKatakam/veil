@@ -344,6 +344,8 @@ impl Ctx {
         let user = user_for(&identity);
         let fs = Arc::new(DiskBackend::new(&root));
         let mut repo = Repo::open(fs.clone(), Some(identity), &user)?;
+        // From this process's own arguments and environment only.
+        repo.set_attribution(crate::agent::current()?);
         // A clone of a server project trusts only the key rings of the
         // project fingerprint this device confirmed, before anything seals
         // (BUG-845). (A repository that will create its project, at its first

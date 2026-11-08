@@ -106,6 +106,8 @@ pub struct Transaction<'r> {
     /// staged operation ([`STAGED_OP`]); removed when it is published, or
     /// when the transaction ends without publishing it.
     kept_dir: Option<VPath>,
+    /// [`Transaction::keep_attribution`].
+    keep_attribution: bool,
 }
 
 /// Names of the operation's bytes and of its (empty) head file in a
@@ -171,6 +173,7 @@ impl<'r> Transaction<'r> {
             merge: None,
             done: false,
             kept_dir: None,
+            keep_attribution: false,
         })
     }
 
@@ -304,6 +307,10 @@ impl<'r> Transaction<'r> {
     /// transaction writes passes through here, so whoever *produced* a
     /// snapshot is its signer, including when the auto-rebase rewrites a
     /// snapshot somebody else authored.
+    pub(crate) fn signed(&self, snap: &Snapshot) -> Snapshot {
+        self.sign(snap)
+    }
+
     fn sign(&self, snap: &Snapshot) -> Snapshot {
         let mut s = snap.clone();
         match self.repo.identity() {
@@ -344,8 +351,55 @@ impl<'r> Transaction<'r> {
         Ok(s)
     }
 
+    /// Snapshots this transaction writes keep their own attribution
+    /// instead of taking the process's ([`Repo::set_attribution`]): a
+    /// rebase or a duplicate moves or copies someone's change, it does not
+    /// produce its content.
+    pub fn keep_attribution(&mut self) {
+        self.keep_attribution = true;
+    }
+
+    /// `snap` with the process's attribution, when it has one and this
+    /// transaction produces content ([`Transaction::keep_attribution`]).
+    /// An abandoned attempt keeps the attribution of whoever made it, and
+    /// an empty, undescribed change (the one `vl commit` starts) gets none:
+    /// whoever fills it is stamped then.
+    fn stamped(&self, mut snap: Snapshot) -> Snapshot {
+        let Some(a) = self.repo.attribution() else { return snap };
+        if self.keep_attribution || snap.abandoned.is_some() {
+            return snap;
+        }
+        let empty = snap.description.as_str().is_empty()
+            && match snap.parents.as_slice() {
+                [] => true,
+                [p] => self.repo.snapshot(p).is_ok_and(|ps| ps.tree == snap.tree),
+                _ => false,
+            };
+        if !empty {
+            snap.agent = Some(a.clone());
+        }
+        snap
+    }
+
+    /// Refuse `snap` when a parent of it is an abandoned attempt: attempts
+    /// never enter ancestry (`Snapshot::abandoned`).
+    fn check_parents(&self, snap: &Snapshot) -> Result<()> {
+        for p in &snap.parents {
+            // A parent this clone does not hold (withheld by an embargo) is
+            // no attempt it could build on.
+            if self.repo.snapshot(p).is_ok_and(|s| s.abandoned.is_some()) {
+                return Err(VeilError::repo(format!(
+                    "{} is an abandoned attempt (`vl attempt drop`): nothing is built on it",
+                    p.short()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn write_snapshot(&mut self, snap: &Snapshot) -> Result<ObjectId> {
-        let snap = self.indexed(snap.clone())?;
+        self.check_parents(snap)?;
+        let snap = self.stamped(self.indexed(snap.clone())?);
         let signed = self.sign(&snap);
         let id = self.repo.store.put_snapshot(&signed)?;
         self.add_head(id)?;
@@ -387,6 +441,9 @@ impl<'r> Transaction<'r> {
             predecessors: vec![],
             conflicts,
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         self.write_snapshot(&snap)
@@ -403,7 +460,8 @@ impl<'r> Transaction<'r> {
         // itself, not content: a rewrite that changes nothing else changes
         // nothing (BUG-246).
         let prev = self.repo.snapshot(&old)?;
-        let new = self.indexed(new)?;
+        self.check_parents(&new)?;
+        let new = self.stamped(self.indexed(new)?);
         let mut same = new.clone();
         same.predecessors = prev.predecessors.clone();
         same.timestamp = prev.timestamp;
@@ -1178,6 +1236,27 @@ impl<'r> Transaction<'r> {
         }
     }
 
+    /// No head, workspace, tag or remote tag this transaction adds is an
+    /// abandoned attempt: attempts are reached only through a later
+    /// version's `attempts`, never visible, never landed.
+    fn check_no_abandoned_refs(&self) -> Result<()> {
+        let before: HashSet<ObjectId> = self.start_view.refs().into_iter().collect();
+        for id in self.view.refs() {
+            if before.contains(&id) {
+                continue;
+            }
+            // A ref this reader cannot read (missing, hostile, withheld) is
+            // judged where it is read; here only what is an attempt.
+            if self.repo.snapshot(&id).is_ok_and(|s| s.abandoned.is_some()) {
+                return Err(VeilError::repo(format!(
+                    "{} is an abandoned attempt (`vl attempt drop`): it is never a head, a workspace's change or a tag's target",
+                    id.short()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Finish the transaction. Returns the new operation id, or `None` if
     /// nothing changed.
     pub fn commit(mut self) -> Result<Option<ObjectId>> {
@@ -1196,6 +1275,9 @@ impl<'r> Transaction<'r> {
             if self.view != self.repo.view {
                 self.check_withheld()?;
             }
+        }
+        if self.view != self.start_view {
+            self.check_no_abandoned_refs()?;
         }
         let record = self.view != self.start_view || self.record_always;
         // The operation (format 6), when one is recorded: its bytes and its

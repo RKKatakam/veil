@@ -34,6 +34,7 @@ pub fn router(hub: HubState) -> Router {
     Router::new()
         .route("/v1/auth/challenge", post(auth::challenge))
         .route("/v1/auth/login", post(auth::login))
+        .route("/v1/sessions/agent", post(auth::agent_session))
         .route("/v1/people/{name}/devices", get(devices))
         .route("/v1/people/{name}/pending/{fingerprint}", get(pending_device))
         .route("/v1/devices/vouch", post(vouch))
@@ -242,7 +243,7 @@ const MAX_INVITE_MS: i64 = 30 * 24 * 3600 * 1000;
 /// their devices, vouches, joins and removed devices (participants only).
 /// A hint: the device that shares decides from the key rings.
 async fn pending_keys(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Json<Vec<Devices>>> {
-    caller.signed_in()?;
+    caller.person_only()?;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
@@ -273,7 +274,7 @@ async fn pending_keys(State(hub): State<HubState>, caller: Caller, Path(p): Path
 /// admin does reaches the person's other projects. Key rings revoke it on
 /// the devices that hold them (`vl identity remove`, and in the background).
 async fn remove_device(State(hub): State<HubState>, caller: Caller, Json(req): Json<RemoveDevice>) -> Result<Json<Devices>> {
-    let me = caller.signed_in()?.clone();
+    let me = caller.person_only()?.clone();
     let admin_of = match &req.project {
         Some(p) => {
             let (project, viewer) = perm::open(&hub, p, &caller).await?;
@@ -334,19 +335,19 @@ async fn remove_device(State(hub): State<HubState>, caller: Caller, Json(req): J
         })
     })
     .await?;
-    let own = person == caller.signed_in()?.id;
+    let own = person == caller.person_only()?.id;
     if own {
         queue_key_requests_everywhere(&hub.db, person).await?;
     }
     let what = if own { "remove device" } else { "remove device from project" };
-    crate::audit(&hub.db, admin_of, Some(caller.signed_in()?.id), what, &format!("{name} ({person}): {}", &req.device[..req.device.len().min(69)])).await;
+    crate::audit(&hub.db, admin_of, Some(caller.person_only()?.id), what, &format!("{name} ({person}): {}", &req.device[..req.device.len().min(69)])).await;
     device_list(&hub, &name, if own { None } else { admin_of }).await
 }
 
 /// An admin records an invite: its public key, for whom, into which group,
 /// until when. The invite's secret is never sent (`docs/HUB.md` §13.12).
 async fn create_invite(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<InviteRequest>) -> Result<Json<InviteRequest>> {
-    let me = caller.signed_in()?.id;
+    let me = caller.person_only()?.id;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     require_admin(&viewer)?;
     if !veil_core::keychain::valid_verifying_key(&req.key) || req.key != req.key.to_ascii_lowercase() {
@@ -392,7 +393,7 @@ async fn create_invite(State(hub): State<HubState>, caller: Caller, Path(p): Pat
 /// for the invited person only. The server checks the join's signature too,
 /// but key rings decide keys (`docs/HUB.md` §13.12).
 async fn join(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<JoinRequest>) -> Result<Json<Joined>> {
-    let me = caller.signed_in()?.clone();
+    let me = caller.person_only()?.clone();
     let mut c = hub.db.acquire().await?;
     let project = perm::load_project(&mut c, &p).await?.ok_or_else(|| Error::not_found("no such invite"))?;
     drop(c);
@@ -462,14 +463,14 @@ async fn join(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>
         })
     })
     .await?;
-    crate::audit(&hub.db, Some(pid), Some(caller.signed_in()?.id), "join", &format!("{person} to {group}")).await;
+    crate::audit(&hub.db, Some(pid), Some(caller.person_only()?.id), "join", &format!("{person} to {group}")).await;
     Ok(Json(Joined { project: project.name, group, person }))
 }
 
 /// The signed-in device vouches for another device of its person: the
 /// device becomes active (a pending one may then sign in).
 async fn vouch(State(hub): State<HubState>, caller: Caller, Json(req): Json<VouchRequest>) -> Result<Json<Devices>> {
-    let me = caller.signed_in()?.clone();
+    let me = caller.person_only()?.clone();
     let v = Vouch {
         device: req.device.clone(),
         by: me.device_key.clone(),
@@ -513,7 +514,7 @@ async fn vouch(State(hub): State<HubState>, caller: Caller, Json(req): Json<Vouc
 }
 
 async fn create_project(State(hub): State<HubState>, caller: Caller, Path(name): Path<String>) -> Result<Json<Tips>> {
-    let me = caller.signed_in()?.clone();
+    let me = caller.person_only()?.clone();
     if !perm::valid_project_name(&name) {
         return Err(Error::bad_request("a project name is 1 to 64 lowercase letters, digits, '-', '_' or '.'"));
     }
@@ -745,7 +746,7 @@ fn require_admin(viewer: &Viewer) -> Result<()> {
 }
 
 async fn create_group(State(hub): State<HubState>, caller: Caller, Path((p, g)): Path<(String, String)>) -> Result<Json<GroupInfo>> {
-    let me = caller.signed_in()?.id;
+    let me = caller.person_only()?.id;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     require_admin(&viewer)?;
     if !valid_principal_name(&g) {
@@ -797,7 +798,7 @@ async fn create_group(State(hub): State<HubState>, caller: Caller, Path((p, g)):
 }
 
 async fn delete_group(State(hub): State<HubState>, caller: Caller, Path((p, g)): Path<(String, String)>) -> Result<Json<GroupInfo>> {
-    let me = caller.signed_in()?.id;
+    let me = caller.person_only()?.id;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     require_admin(&viewer)?;
     let pid = project.id;
@@ -843,7 +844,7 @@ enum Op {
 /// Change a group's people. Members: admins and the group's managers, but
 /// a manager never adds themselves (an admin does). Managers: admins.
 async fn change_group(hub: HubState, caller: Caller, p: String, g: String, op: Op, req: GroupChange) -> Result<Json<GroupInfo>> {
-    let me = caller.signed_in()?.id;
+    let me = caller.person_only()?.id;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     let pid = project.id;
     let admin = viewer.admin;
@@ -962,7 +963,7 @@ async fn post_ring(
     Path((p, scope)): Path<(String, String)>,
     Json(ring): Json<KeyRing>,
 ) -> Result<Json<serde_json::Value>> {
-    caller.signed_in()?;
+    caller.person_only()?;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));

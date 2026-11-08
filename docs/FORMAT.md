@@ -24,13 +24,17 @@ There is one **repository format**, a number in `.veil/repo.json`:
 | 3 | 1.0.0 | standard cryptography: AES-SIV sealed objects (`veil:sea2`), HPKE-wrapped ring keys (ring format 3); see [CRYPTO.md](CRYPTO.md) |
 | 4 | 1.0.0 | first-class conflicts: conflict objects (`veil:conf`, §3.6) and conflict entries in binary trees (flag bit 6) |
 | 5 | 1.0.0 | symlink tree entries (flag bit 7 and a kind byte, §3.7) and conflict terms (§3.6), annotated tags (`veil:atag`, §3.8; `Tag.annotation`) |
-| 6 | 1.1.0 | the lock-free op log: heads in `.veil/op_heads/` instead of `.veil/op_head`, operations gain `workspace` and `rewritten` (§2, §5 "Format 6"). Not yet built: snapshot attribution (`Snapshot.agent`) and the `partial` marker for fetch on demand (`docs/design/scale/PLAN.md` §1) |
+| 6 | 1.1.0 | the lock-free op log: heads in `.veil/op_heads/` instead of `.veil/op_head`, operations gain `workspace` and `rewritten` (§2, §5 "Format 6"). Snapshot attribution moved to format 10, the `partial` marker to format 9 |
 | 7 | 1.1.0 | key rings of ring format 4: invites, shares by members, a member's removal of their own device, and every ring but `team` naming its project (`docs/HUB.md` §13.12). No object encoding changes; the upgrade 6 → 7 rewrites nothing |
 | 8 | 1.1.0 | **only secret files are encrypted.** Removed: sealed descriptions and tag messages (`{"sealed": …}`), cloaked tags and workspaces (`cloak` in views), snapshots on cloaked lines (`Snapshot.cloak`), embargoed tree entries (tier 2) and fallback versions (flag bit 3), sealed directories, embargo keys. Embargo records are plain (embargo record format 2). Decoders refuse what only those wrote; `vl upgrade` brings 6 and 7 to 8 when none of it is there (§5). Formats 1 to 5 are no longer opened |
+| 9 | (S3) | thin clones: the `partial` marker for fetch on demand (`docs/design/scale/6-partial-clone.md`), built on its own branch, which documents it here when it joins |
+| 10 | 1.1.0 | agent attribution and attempts on snapshots: `Snapshot.agent`, `abandoned` and `attempts` (§3.3). No other encoding changes; the upgrades 8 → 10 and 9 → 10 rewrite nothing (§5 "Format 10") |
 
-* `vl init` writes the newest format (`repo::REPO_FORMAT`), and so do
-  clones and remotes: this release opens format 8 only
-  (`repo::MIN_REPO_FORMAT`).
+* `vl init` writes the newest format (`repo::REPO_FORMAT`, 10), and so do
+  clones and remotes: this release opens formats 8 to 10
+  (`repo::MIN_REPO_FORMAT`). A format-8 or 9 repository is read and
+  written as it is, and refuses to store a format-10 snapshot ("upgrade it
+  with `vl upgrade`"), so it never holds what its own builds would drop.
 * A reader **refuses a newer repository format before reading anything
   else** (`Repo::open`, `fsck`, `vl upgrade`): an older vl never
   half-understands, and never rewrites, newer data. The error names the
@@ -197,6 +201,25 @@ decodes two), their signature is over the id of their own encoding, and
 their ids are what other systems record (change ids),
 so changing their encoding would cost much and gain little.
 
+Format 10 adds three fields, after `embargo` and before `signature`, each
+omitted when empty (so earlier snapshots keep their bytes and ids):
+
+* `agent` — `{agent, task?, prompt?, run?}`: who produced the content
+  (`docs/design/scale/7-agent-attribution.md`). Plain text, covered by the
+  signature (the signer's claim). `agent` is 1 to 128 characters with no
+  control character; `task` and `prompt` at most 4 KiB with none but
+  newline and tab; `run` 1 to 64 of `A-Z a-z 0-9 . _ : -`; no other field.
+* `abandoned` — a reason (1 to 64 KiB, no control character but newline
+  and tab): this version is a recorded dead end (`vl attempt drop`). It is
+  never a parent, a head, a workspace's change or a tag's target, and has
+  no `attempts` of its own.
+* `attempts` — the ids of the change's abandoned versions, oldest first,
+  at most 32, none twice. Strong references (gc keeps them, pushes and
+  pulls carry them, fsck checks them), never ancestry.
+
+`Snapshot::validate_format_10` checks all of it on every decode (the
+snapshot is otherwise `Corrupt`) and in `ObjectStore::put`.
+
 From this release a snapshot must also be **canonical**: exactly the bytes
 `serde_json` writes for the decoded value. Every snapshot ever written by vl
 already is (fields were only ever appended, with defaults omitted); a
@@ -228,7 +251,8 @@ work, which the engine avoids:
   `check_storable`; the pack sink of incremental sync calls it too), a
   conflict object or a tree holding a conflict entry below format 4, and
   below format 5 a tree holding a symlink, a conflict with
-  such a term and an annotated tag (`ObjectStore::put` checks the same on
+  such a term and an annotated tag, and below format 10 a snapshot with
+  `agent`, `abandoned` or `attempts` (`ObjectStore::put` checks the same on
   the value, so engine code cannot write them either). The
   keychain follows the same format: it wraps keys with HPKE only from
   format 3 and refuses to store a format-3 ring below it. Push and pull copy objects with
@@ -368,7 +392,7 @@ exception, below.
 vl upgrade [--dry-run] [--force]
 ```
 
-1. Checks the repository's format (6 to 8; anything else is refused before
+1. Checks the repository's format (6 to 10; anything else is refused before
    any lock is taken, so nothing changes) and, below format 8, that it
    holds nothing format 8 removed (see "Format 8"). Then takes the gc
    lease and the repository lock (a dry run takes none and writes nothing)
@@ -421,6 +445,16 @@ still waiting for its admin.
 * **Downgrades** are not supported: an older vl refuses a format-2
   repository with a message naming the release it needs.
 
+### Format 10 (agent attribution and attempts)
+
+`vl upgrade` brings a format 8 or 9 repository to 10 (and 6 or 7 too,
+after the format-8 check below): verify, then set-format; nothing is
+rewritten, every id and signature stays. Until then a format-8 or 9
+repository works as it is and refuses to store an attributed snapshot or
+an attempt, naming the fix; a format-8 clone refuses to pull one. Format 9
+(S3's thin clones) and format 10 are separate bumps: a format-9 repository
+upgrades to 10 keeping its `partial` marker, which S3's code reads.
+
 ### Format 8 (only secret files are encrypted)
 
 Owner decision (2026-11-06): **only secret files are ever encrypted**
@@ -439,7 +473,7 @@ signed records) and folders. Format 8 removes all of it.
   decoders refuse them) and must never silently treat as plain (a cloaked
   tag read without its `cloak` field would be pushed to a public remote).
   The format number keeps the two apart: an older vl refuses format 8 by
-  number, and this vl opens only format 8.
+  number, and this vl opens only format 8 and later.
 * **`vl upgrade` from 6 or 7.** Nothing is converted: re-writing an object
   that holds encrypted content changes its id, and with it every tree,
   snapshot id and signature above it, the whole history. Instead the
@@ -604,6 +638,11 @@ its sealed file is the secret `secrets/.env.notes`, its sealed link
 `upgraded/` is skipped (the format-7 set cannot be upgraded: it holds what
 format 8 removed).
 
+From format 10 on, `alice/` also holds `agent-work`: on the released fix, a
+change committed with `VEIL_AGENT…` set whose version lists one attempt
+(`vl attempt drop`), pushed to both remotes; `upgraded/` is the format-8
+set after `vl upgrade` (8 → 10). Format 9's set is S3's.
+
 `tests/core_format/format_compat.rs` and `crates/vl/tests/cli_basic/upgrade_cli.rs` check that
 this build:
 
@@ -619,6 +658,10 @@ this build:
   removed (`--dry-run` lists it);
 * upgrades a format-6 or format-7 repository that holds none of it,
   rewriting nothing;
+* opens the format-10 set and its remotes, reads `agent-work`'s
+  attribution and attempt, verifies their signatures and `fsck`s them;
+  keeps a format-8 or 9 repository working while it refuses to store a
+  format-10 snapshot, and upgrades it to 10 rewriting nothing;
 * refuses newer repository formats, object encodings, flag bits, object
   kinds, pack versions, ring and embargo-record formats as `Unsupported`.
 

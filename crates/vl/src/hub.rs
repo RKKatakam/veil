@@ -608,6 +608,11 @@ impl Client {
     }
 
     /// A commit through the API (`POST …/changes`).
+    /// `POST /v1/sessions/agent` (`docs/HUB.md` §13.27).
+    pub fn agent_session(&self, req: &veil_core::hub::agent::AgentSessionRequest) -> Result<veil_core::hub::agent::AgentSession> {
+        self.json("POST", "/v1/sessions/agent", Some(req))
+    }
+
     pub fn change(&self, req: &veil_core::hub::changes::ChangeRequest) -> Result<veil_core::hub::changes::ChangeResult> {
         self.json("POST", &self.url.project_path("/changes"), Some(req))
     }
@@ -1217,7 +1222,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                 continue;
             }
             if let Ok(s) = store.snapshot(&id) {
-                stack.extend(s.parents.iter().copied());
+                stack.extend(s.parents.iter().chain(&s.attempts).copied());
             }
         }
         let mut new = Vec::new();
@@ -1228,7 +1233,8 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                 continue;
             }
             let s = store.snapshot(&id)?;
-            stack.extend(s.parents.iter().copied());
+            // Its attempts (format 10) go with it.
+            stack.extend(s.parents.iter().chain(&s.attempts).copied());
             new.push((id, s));
         }
         // Upload what the push introduces as the walk finds it, 8 MiB per

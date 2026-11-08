@@ -62,15 +62,23 @@ pub fn state_dir(root: &Path) -> std::path::PathBuf {
 /// | 6 | vl 1.1.0 | the lock-free op log: `op_heads/`, `Operation::{workspace, rewritten}` |
 /// | 7 | vl 1.1.0 | key rings of ring format 4: invites, shares by members, a member's removal of their own device (`docs/HUB.md` §13.12) |
 /// | 8 | vl 1.1.0 | only secret files are encrypted: no encrypted descriptions, tag messages, tag names, embargoes, folders or lines of work; plain embargo records (embargo record format 2) |
+/// | 9 | (S3) | thin clones: the `partial` marker (built on its own branch) |
+/// | 10 | vl 1.1.0 | agent attribution and attempts on snapshots (`Snapshot::{agent, abandoned, attempts}`) |
 ///
-/// This build reads format 8 only. `vl upgrade` brings formats 6 and 7 to
-/// it, after checking that they hold nothing the removed encryption of
-/// non-secret content wrote; formats 1 to 5 are no longer supported. See
-/// `docs/FORMAT.md` and `docs/CRYPTO.md`.
-pub const REPO_FORMAT: u32 = 8;
+/// This build writes format 10 and opens formats 8 to 10: a format-8 or 9
+/// repository is read and written as it is, and refuses to store a
+/// format-10 snapshot ("run `vl upgrade`"). `vl upgrade` brings formats 6
+/// to 9 to it, after checking that 6 and 7 hold nothing the removed
+/// encryption of non-secret content wrote; formats 1 to 5 are no longer
+/// supported. See `docs/FORMAT.md` and `docs/CRYPTO.md`.
+pub const REPO_FORMAT: u32 = 10;
+
+/// The format from which only secret files are encrypted: older ones must
+/// be checked and upgraded before this build opens them.
+pub const ONLY_SECRETS_REPO_FORMAT: u32 = 8;
 
 /// Oldest repository format this build opens.
-pub const MIN_REPO_FORMAT: u32 = REPO_FORMAT;
+pub const MIN_REPO_FORMAT: u32 = ONLY_SECRETS_REPO_FORMAT;
 
 /// Oldest repository format `vl upgrade` brings to [`REPO_FORMAT`].
 pub const MIN_UPGRADE_FORMAT: u32 = 6;
@@ -80,7 +88,7 @@ pub fn min_vl_for_format(format: u32) -> &'static str {
     match format {
         0 | 1 => "0.1.0",
         2..=5 => "1.0.0",
-        6..=8 => "1.1.0",
+        6..=10 => "1.1.0",
         _ => "a newer release",
     }
 }
@@ -91,8 +99,8 @@ pub fn check_format_supported(format: u32) -> Result<()> {
     if format < MIN_REPO_FORMAT {
         return Err(VeilError::Unsupported(format!(
             "this repository uses format {format}, which may hold encrypted descriptions, tags, embargoes or folders; \
-             this vl encrypts secret files only and reads format {REPO_FORMAT}. Run `vl upgrade`: it checks the \
-             repository and moves it to format {REPO_FORMAT}"
+             this vl encrypts secret files only and reads formats {MIN_REPO_FORMAT} to {REPO_FORMAT}. Run `vl upgrade`: \
+             it checks the repository and moves it to format {REPO_FORMAT}"
         )));
     }
     Ok(())
@@ -210,6 +218,8 @@ pub struct Repo {
     /// repositories, [`crate::maintenance::prune_epoch`]): a transaction
     /// that finds it changed checks the ids it carried in (BUG-811).
     pub(crate) prune_epoch: Option<Vec<u8>>,
+    /// [`Repo::set_attribution`].
+    pub(crate) attribution: Option<crate::object::Attribution>,
 }
 
 impl std::fmt::Debug for Repo {
@@ -375,6 +385,7 @@ impl Repo {
             command_ws: None,
             warnings: Vec::new(),
             prune_epoch: None,
+            attribution: None,
         })
     }
 
@@ -424,6 +435,7 @@ impl Repo {
             command_ws: None,
             warnings: Vec::new(),
             prune_epoch: None,
+            attribution: None,
         };
         // Reading the heads walks the op log (and may merge): registered for
         // gc's deletion fence meanwhile, so no operation it reads is pruned
@@ -650,6 +662,19 @@ impl Repo {
     /// command is repository-wide.
     pub fn set_command_workspace(&mut self, ws: Option<String>) {
         self.command_ws = ws;
+    }
+
+    /// The agent attribution every snapshot this process creates carries
+    /// (`Snapshot::agent`): set once by the CLI from `vl`'s own arguments and
+    /// environment, never from anything in the repository or a sandbox.
+    /// Rebases and duplicates keep each change's own.
+    pub fn set_attribution(&mut self, a: Option<crate::object::Attribution>) {
+        self.attribution = a;
+    }
+
+    /// [`Repo::set_attribution`].
+    pub fn attribution(&self) -> Option<&crate::object::Attribution> {
+        self.attribution.as_ref()
     }
 
     /// The workspace set by [`Repo::set_command_workspace`].

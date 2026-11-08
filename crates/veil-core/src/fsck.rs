@@ -523,6 +523,9 @@ impl Checker {
             for (i, p) in s.parents.iter().enumerate().rev() {
                 stack.push((*p, me.clone(), embargoed && i > 0));
             }
+            for a in &s.attempts {
+                stack.push((*a, format!("{me} (an attempt)"), false));
+            }
             for p in &s.predecessors {
                 if !self.store.has(p) {
                     self.missing_predecessors += 1;

@@ -79,11 +79,13 @@ fn bug_913_caches_are_bounded_by_bytes_not_by_what_an_attacker_writes() {
             id: 7,
             name: "attacker".into(),
             device_key: format!("{p:064x}"),
+            agent: None,
         };
         let viewer = Viewer {
             person: Some(7),
             admin: false,
             groups: (0..250_000).collect(),
+            only: None,
         };
         c.put_viewer(
             p,
@@ -162,6 +164,9 @@ fn bug_914_a_partly_refused_push_records_the_refused_updates_snapshots() {
             predecessors: vec![],
             conflicts: vec![],
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         s.sign(&c.identity);

@@ -802,6 +802,9 @@ impl Repo {
             predecessors: vec![],
             conflicts: vec![],
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None, // signed by the transaction
         };
         let id = tx.write_snapshot(&snap)?;

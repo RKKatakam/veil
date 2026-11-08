@@ -318,7 +318,8 @@ async fn projected_inner(
             }
             let s = blocking(hub, project.id, move |src| Ok(src.snapshot(&x)?)).await?;
             stack.push((x, true));
-            for p in s.parents.iter().rev() {
+            // Attempts (format 10) are projected like any version, first.
+            for p in s.parents.iter().chain(&s.attempts).rev() {
                 if !done.contains_key(p) {
                     stack.push((*p, false));
                 }
@@ -349,6 +350,7 @@ async fn projected_inner(
             }
         };
         let ppreds = projected_predecessors(hub, project, viewer, &s, deferred.as_deref_mut()).await?;
+        let pattempts: Vec<ObjectId> = s.attempts.iter().map(|a| done[a]).collect();
         let (proj_text, bindings, viewer2) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
         let hub2 = hub.clone();
         let (result, new_obj) = blocking(hub, project.id, move |src| {
@@ -361,7 +363,7 @@ async fn projected_inner(
                 policy,
                 bindings,
             };
-            project_one(src, &p.view(&viewer2), x, &s, pparents, ppreds, origin, &hub2.identity)
+            project_one(src, &p.view(&viewer2), x, &s, pparents, ppreds, pattempts, origin, &hub2.identity)
         })
         .await?;
         if let Some(raw) = new_obj {
@@ -409,8 +411,10 @@ async fn projected_inner(
 }
 
 /// The projection of real snapshot `s` (id `x`) for a viewer of `view`,
-/// given the projections of its parents (`pparents`) and predecessors
-/// (`ppreds`) and the pusher's own snapshot it was completed from
+/// given the projections of its parents (`pparents`), predecessors
+/// (`ppreds`) and attempts (`pattempts`, one per attempt: an attempt, its
+/// reason and attribution are seen by exactly the people who see the
+/// change) and the pusher's own snapshot it was completed from
 /// (`origin`): its id, and the object to store when the server signed a
 /// new one (the module docs). Pure: [`projected`] memoises the answer, and
 /// a commit through the API (`changes`) records it in its own transaction.
@@ -422,13 +426,15 @@ pub(crate) fn project_one(
     s: &Snapshot,
     pparents: Vec<ObjectId>,
     ppreds: Vec<ObjectId>,
+    pattempts: Vec<ObjectId>,
     origin: Option<ObjectId>,
     identity: &veil_core::Identity,
 ) -> Result<(ObjectId, Option<Bytes>)> {
     let mut pr = Projector::new(src, view);
     let ptree = pr.root(s.tree)?;
     // A change of what the viewer cannot see only: not in their history.
-    if pparents.len() == 1 && !s.parents.is_empty() {
+    // An attempt stays one, whatever it changed: it is never history.
+    if pparents.len() == 1 && !s.parents.is_empty() && s.abandoned.is_none() {
         let pp = src.snapshot(&pparents[0])?;
         let real_changed = s.parents.len() > 1 || src.snapshot(&s.parents[0])?.tree != s.tree;
         if pp.tree == ptree && real_changed {
@@ -440,6 +446,7 @@ pub(crate) fn project_one(
     u.tree = ptree;
     u.parents = pparents;
     u.predecessors = ppreds;
+    u.attempts = pattempts;
     u.conflicts.retain(|c| view_read(c));
     if u == without_signature(s) {
         return Ok((x, None));
@@ -579,7 +586,8 @@ pub async fn history(
                 true => put_frame(&mut out, &id, &src.encoded(&id)?),
                 false => put_frame(&mut out, &id, &raw),
             }
-            stack.extend(s.parents.iter().copied());
+            // A version's attempts travel with it (format 10).
+            stack.extend(s.parents.iter().chain(&s.attempts).copied());
         }
         Ok(out)
     })
@@ -824,12 +832,21 @@ fn check_wants(
         dirs.insert(String::new(), pr.tree(&root)?);
         for &i in group {
             let w = &wants[i];
+            // A narrowed agent session (`docs/HUB.md` §13.27): files inside
+            // its narrowing, and the trees of the folders on the way there.
+            let narrowed_dir = !view.within_narrowing(&w.path);
+            if narrowed_dir && !view.toward_narrowing(&w.path) {
+                return Err(gone());
+            }
             let ok = if w.path.is_empty() {
                 w.id == root
             } else {
                 let (dir, name) = w.path.rsplit_once('/').unwrap_or(("", w.path.as_str()));
                 let tree = dir_tree(&mut pr, &mut dirs, dir)?.ok_or_else(gone)?;
                 let e = tree.get(name).ok_or_else(gone)?;
+                if narrowed_dir && e.kind != EntryKind::Dir {
+                    return Err(gone());
+                }
                 if e.id == w.id && e.kind != EntryKind::Dir {
                     sizes[i] = e.size;
                 }
@@ -1102,7 +1119,10 @@ fn sealed_secret_here(src: &Source, c: &Change, changes: &[Change], parents: &[O
 /// (every object a changed path names was `uploaded` or is the entry at
 /// that path in a parent), checks 2, 8 and 9 ([`check_changes`]) and access
 /// lines changed only by admins. Pushes and commits through the API
-/// (`changes`) both run it. `p` carries the accepted policy.
+/// (`changes`) both run it. `p` carries the accepted policy. `ra` are the
+/// real ids of `n`'s attempts (format 10), each an abandoned version of the
+/// same change; no parent may be one.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn complete(
     src: &Source,
     p: &Project,
@@ -1110,10 +1130,23 @@ pub(crate) fn complete(
     uploaded: &HashSet<ObjectId>,
     n: &Snapshot,
     rp: &[ObjectId],
+    ra: &[ObjectId],
     identity: &veil_core::Identity,
 ) -> Result<Completed> {
     if rp.len() > MAX_PARENTS {
         return Err(Error::bad_request(format!("a snapshot may have at most {MAX_PARENTS} parents")));
+    }
+    // Attempts never enter ancestry (`Snapshot::abandoned`).
+    for p in rp {
+        if src.snapshot(p)?.abandoned.is_some() {
+            return Err(Error::bad_request("a parent is an abandoned attempt: nothing is built on one"));
+        }
+    }
+    for a in ra {
+        let at = src.snapshot(a)?;
+        if at.abandoned.is_none() || at.change_id != n.change_id {
+            return Err(Error::bad_request("an attempt must be an abandoned version of the same change"));
+        }
     }
     let admin = viewer.admin;
     let view = p.view(viewer);
@@ -1171,6 +1204,7 @@ pub(crate) fn complete(
     let mut real = n.clone();
     real.tree = real_tree;
     real.parents = rp.to_vec();
+    real.attempts = ra.to_vec();
     if real == *n {
         return Ok(Completed {
             real: ObjectId::hash(&Object::Snapshot(real).encode()),
@@ -1256,7 +1290,8 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             r => Ok(r?),
         })
         .await?;
-        stack.extend(s.parents.iter().copied());
+        // Its attempts (format 10) are pushed with it, before it.
+        stack.extend(s.parents.iter().chain(&s.attempts).copied());
         parents_of.insert(id, s);
         new.push(id);
         if new.len() > MAX_PUSH_SNAPSHOTS {
@@ -1277,7 +1312,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                 order.push(id);
             } else {
                 st.push((id, true));
-                for p in &parents_of[&id].parents {
+                for p in parents_of[&id].parents.iter().chain(&parents_of[&id].attempts) {
                     st.push((*p, false));
                 }
             }
@@ -1332,9 +1367,12 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             return Err(Error::bad_request("a snapshot without parents (only the root has none)"));
         }
         let real_parents: Vec<ObjectId> = n.parents.iter().map(|p| real_of[p]).collect();
+        let real_attempts: Vec<ObjectId> =
+            n.attempts.iter().map(|a| real_of.get(a).copied().ok_or_else(|| Error::bad_request("an attempt is not a snapshot of this project"))).collect::<Result<_>>()?;
         let (policy_text_acc, bindings, viewer2, n2) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone(), n.clone());
         let hub2 = hub.clone();
         let rp = real_parents.clone();
+        let ra = real_attempts.clone();
         let uploaded = uploaded.clone();
         let c = blocking(hub, project.id, move |src| {
             let p = Project {
@@ -1345,7 +1383,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                 policy_text: policy_text_acc,
                 bindings,
             };
-            complete(src, &p, &viewer2, &uploaded, &n2, &rp, &hub2.identity)
+            complete(src, &p, &viewer2, &uploaded, &n2, &rp, &ra, &hub2.identity)
         })
         .await?;
         let c = Completed {
@@ -1356,7 +1394,8 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             hub.objects.put(project.id, &c.real, raw.clone()).await?;
         }
         real_of.insert(*id, c.real);
-        real_parents_of.insert(c.real, real_parents);
+        // What its landing records: its parents and its attempts.
+        real_parents_of.insert(c.real, real_parents.into_iter().chain(real_attempts).collect());
         completed.push(c);
     }
     // 3. Move the branches: one serialisable transaction of compare-and-swaps.
@@ -1390,6 +1429,12 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             Some(n) => Some(*real_of.get(&n).ok_or_else(|| Error::bad_request("unknown new tip"))?),
             None => None,
         };
+        if let Some(n) = new_real {
+            // An attempt never lands (`Snapshot::abandoned`).
+            if blocking(hub, project.id, move |src| Ok(src.snapshot(&n)?.abandoned.is_some())).await? {
+                return Err(Error::bad_request(format!("branch '{}': an abandoned attempt is never a branch's tip", u.branch)));
+            }
+        }
         if new_real.is_none() && !viewer.admin {
             return Err(Error::forbidden("only admins may delete a branch"));
         }

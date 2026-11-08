@@ -2474,3 +2474,93 @@ change; nothing new is encrypted.
   searched (`long_lines_skipped`).
 * `vl search WORDS… [--path] [--lang LANG] [-r BRANCH] [-n N] [--json] [-- PATH]`
   prints the server's answer (exit 1 when nothing matched).
+
+### 13.27 S11: agent sessions, attribution and attempts (built)
+
+Built 2026-11-08 (`crates/veil-server/src/auth.rs` `agent_session`,
+`perm.rs` narrowing, `changes.rs` stamping, `sync.rs` attempts;
+`veil_core::hub::agent`; migration `0020_agent_sessions`; repository
+format 10). Design: phase 2 §5.6, `docs/design/scale/7-agent-attribution.md`.
+
+```text
+POST /v1/sessions/agent          (with a person's own session)
+{ "project": "acme",
+  "attribution": {"agent": "claude-code/2.3", "task"?: "…", "prompt"?: "…", "run"?: "r-41"},
+  "only"?: ["src/api/"],         // narrow it to these folders or files
+  "seconds"?: 3600 }             // default and most: 12 hours
+→ { "token", "project", "person", "expires_at", "only", "attribution" }
+```
+
+* **An agent session is not an API key.** It is a row of `sessions` with
+  the parent's device and person, `agent` (the attribution, JSON),
+  `agent_project`, `agent_only` and `parent_hash`. It is made in one
+  statement that reads the parent: only from a live, confirmed person's
+  session that is not itself an agent session, and it ends at
+  `min(parent's expiry, now + seconds, now + 12 h)`. Removing the device
+  ends it with the device's other sessions. Only the token's hash is kept;
+  the token is shown once. `vl session agent [--only PATH…] --agent A
+  [--task T] [--prompt-ref R] [--run ID]` prints one for a harness.
+* **At most its person, in one project.** Every request is checked as the
+  person's (`perm::open`, the same caches and epochs), in its own project
+  only (any other answers "not found"). It cannot change access (groups,
+  members, managers), devices (vouch, remove), invites, key rings, shares,
+  create projects or make sessions (`Caller::person_only`, 403
+  `agent_session`): an agent never makes something that outlives its run.
+* **Narrowing applies to files; history is the person's.** `Viewer::only`
+  narrows `View::write` (pushes and API commits write only inside), and the
+  file routes refuse a path outside: the query API's `tree`, `file`, `show`
+  and `diff` (their `path` must be inside), `search` and `grep` (their
+  `path` too), and `fetch` (a want is served only inside the narrowing, or
+  as the tree of a folder on the way to it; a file at such a folder is
+  "not found"). `tips` gives a narrowed session **no grant**: a grant
+  reaches everything below its root, wider than the narrowing (per-folder
+  grants for the daemon and the workspace socket join S6/S8). `View::key`
+  ignores the narrowing: projections, memos and `log`, `history` and
+  `ancestry` answers are the person's, so narrowed sessions add no view
+  keys. The folders on the way are served as the person sees them (their
+  entries' names), never what is below them but the way.
+* **The server stamps API commits.** A commit through `POST …/changes` with
+  an agent session carries the session's attribution in `Snapshot.agent`,
+  inside what the server signs. `ChangeRequest` has no field for one and
+  refuses unknown fields, so a caller can neither set nor forge it.
+  Pushed snapshots carry what their signer's `vl` recorded (the signer's
+  claim, under their device's signature).
+* **Attempts on the server.** A pushed snapshot's `attempts` are walked
+  like parents: each is completed (grafted, checked, stored) before the
+  version that lists it, must be an abandoned snapshot of the same change,
+  and is recorded with it (`snapshots` rows, so `fetch` serves its trees).
+  Projections project attempts like any version (`project_one`), never
+  folded into a parent; `history` sends them with their version; the
+  query API's `show` lists them (`attempts`: projected id, reason,
+  attribution, the paths changed that the viewer sees). A snapshot whose
+  parent is abandoned, a branch whose new tip is one and an API commit
+  whose base is one are refused: attempts never land and never enter
+  ancestry.
+* **Visibility.** Attribution and reasons are plain text inside snapshots,
+  projected with them: seen by exactly the people who see the change. A
+  change of folders someone cannot see is not in their history, so they
+  receive neither. Embargoed merges are refused by the server
+  (§11); `vl` withholds an embargoed line with its attribution and
+  attempts.
+
+Threat review (phase 2 §6, rows 5 to 7, and what S11 adds):
+
+| # | Attacker | Capability | Harm | Mitigation | Test |
+|---|---|---|---|---|---|
+| 1 | An agent (or a harness holding its token) | asks for files outside `--only`: `tree`, `file`, `show`, `diff`, `search`, `grep`, `fetch`, a grant | reads more than its task | every file route checks the narrowing first; no grant for a narrowed session | `server_hub` `agents::a_narrowed_session_reads_and_writes_only_inside_its_paths_and_its_history_is_its_persons` |
+| 2 | Same | writes outside `--only`, `.veilpolicy` | writes more than its task | `View::write` is narrowed, for pushes and API commits alike | same |
+| 3 | Same | makes a session from its session, asks for more than 12 hours, uses it in another project | outlives or widens its person | made only from a person's own live session, in one statement; `LEAST` of the expiries; other projects "not found" | `agents::an_agent_session_comes_from_a_persons_own_session_and_never_outlives_or_widens_it` |
+| 4 | Same | vouches a device, invites, adds group members, posts a ring or share, creates a project | a lasting credential or access change | `person_only` on every such route | `agents::an_agent_session_cannot_change_access_devices_invites_rings_shares_or_projects` |
+| 5 | The caller of an API commit | sends `agent` in the request | forges attribution | no such field; unknown fields refused; the server stamps the session's | `agents::api_commits_carry_the_sessions_attribution_and_never_the_callers` |
+| 6 | A command inside a sandbox | sets `VEIL_AGENT`, writes `.veil-agent`, runs `vl describe` | forges or strips attribution | attribution only from the workspace `vl`'s flags and environment; the sandbox cannot reach the repository | `cli_security` `agent_cli::a_command_inside_the_sandbox_cannot_forge_or_strip_attribution` |
+| 7 | A person without access to a change's folders | reads log, show, history, a clone | learns its task, prompt or an attempt's reason | projected with the snapshot; such a change is not in their history | `agents::task_prompt_and_reasons_reach_exactly_who_sees_the_change`; `core_security` `agent_attribution::task_prompt_and_reasons_are_withheld_with_an_embargoed_change` |
+| 8 | A hostile pusher | an abandoned snapshot as a tip or a parent; a plain snapshot as an attempt | lands a dead end, or hides history in `attempts` | refused at completion and at the branch move | `agents::attempts_never_land_and_a_valid_one_is_kept_projected_and_shown` |
+| 9 | A hostile pusher or server | escapes, overlong fields, 33 attempts, 64 KiB + 1 of reason | corrupts terminals and logs, exhausts storage | `Snapshot::validate_format_10` on every decode and write: the snapshot is `Corrupt` | `agent_attribution::hostile_or_unbounded_attribution_and_attempts_are_corrupt_and_never_written`; `agent_cli::hostile_attribution_in_the_environment_is_refused_without_echoing_it` |
+| 10 | — (an older `vl`) | rewrites an attributed snapshot without the field | silent loss, a broken signature | format 10: format-8 builds refuse the repository; format-8 and 9 repositories refuse to store one ("run `vl upgrade`") | `core_format` `format_compat::a_format_8_or_9_repository_refuses_format_10_snapshots_and_upgrades_rewriting_nothing`, `the_format_8_set_upgrades_to_10_and_a_format_8_clone_refuses_attributed_history`, `the_format_10_set_holds_attribution_and_an_attempt` |
+
+**Reverting** S11 is not a plain revert once anything was written: format
+10 repositories (every `vl init` and `vl upgrade` from this build) are
+refused by older builds, and migration 20 adds four nullable columns.
+An older server ignores them, so it would take an agent session's token as
+its person's own, unnarrowed: before running one, end every agent session
+(`DELETE FROM sessions WHERE agent IS NOT NULL`).

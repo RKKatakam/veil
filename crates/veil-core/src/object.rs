@@ -68,6 +68,10 @@ pub const CONFLICT_REPO_FORMAT: u32 = 4;
 /// symlink tree entries (and conflict terms), annotated tag objects
 /// (`veil:atag`), `Tag::annotation` and `View::remote_release_tags`.
 pub const GIT_PARITY_REPO_FORMAT: u32 = 5;
+/// Lowest repository format that may store snapshots with agent
+/// attribution (`Snapshot::agent`) or attempts (`Snapshot::abandoned`,
+/// `Snapshot::attempts`): `docs/FORMAT.md`, "Format 10".
+pub const ATTRIBUTION_REPO_FORMAT: u32 = 10;
 /// First payload byte of the conflict object encoding.
 pub const ENCODING_CONFLICT: u8 = 0x04;
 /// Most removes (bases) a conflict object may hold: a conflict of more than
@@ -992,6 +996,96 @@ impl Default for Text {
     }
 }
 
+/// Most attempts (recorded dead ends) one change keeps.
+pub const MAX_ATTEMPTS: usize = 32;
+/// Longest reason of an attempt, in bytes.
+pub const MAX_REASON: usize = 64 * 1024;
+/// Longest agent name, in characters.
+pub const MAX_AGENT: usize = 128;
+/// Longest task or prompt reference, in bytes.
+pub const MAX_TASK: usize = 4096;
+/// Longest run id, in bytes.
+pub const MAX_RUN: usize = 64;
+
+/// Who produced a snapshot's content (`Snapshot::agent`, format 10;
+/// `docs/design/scale/7-agent-attribution.md`). Plain text, never
+/// encrypted: it is seen by exactly the people who see the change.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Attribution {
+    /// The agent, e.g. `claude-code/2.3 opus-5.5`: 1 to [`MAX_AGENT`]
+    /// printable characters.
+    pub agent: String,
+    /// A task id or title, at most [`MAX_TASK`] bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// A reference to the prompt (a URL, a transcript id, a digest), at
+    /// most [`MAX_TASK`] bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// The harness's run or session id: `[A-Za-z0-9._:-]`, at most
+    /// [`MAX_RUN`] bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+}
+
+/// Text that is safe to print: no control character but newline and tab.
+fn printable_text(s: &str, what: &str, max: usize) -> std::result::Result<(), String> {
+    if s.len() > max {
+        return Err(format!("{what} is longer than {max} bytes"));
+    }
+    if s.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+        return Err(format!("{what} holds a control character"));
+    }
+    Ok(())
+}
+
+/// The checks of an attempt's reason: 1 to [`MAX_REASON`] bytes of
+/// printable text.
+pub fn validate_reason(reason: &str) -> std::result::Result<(), String> {
+    if reason.trim().is_empty() {
+        return Err("an attempt's reason is empty".into());
+    }
+    printable_text(reason, "an attempt's reason", MAX_REASON)
+}
+
+impl Attribution {
+    /// The checks every reader and writer applies (`Snapshot::validate_format_10`).
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        let n = self.agent.chars().count();
+        if n == 0 || n > MAX_AGENT || self.agent.trim().is_empty() {
+            return Err(format!("an agent name is 1 to {MAX_AGENT} characters"));
+        }
+        if self.agent.chars().any(|c| c.is_control()) {
+            return Err("the agent name holds a control character".into());
+        }
+        if let Some(t) = &self.task {
+            printable_text(t, "the task", MAX_TASK)?;
+        }
+        if let Some(p) = &self.prompt {
+            printable_text(p, "the prompt reference", MAX_TASK)?;
+        }
+        if let Some(r) = &self.run {
+            if r.is_empty() || r.len() > MAX_RUN || !r.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-')) {
+                return Err(format!("a run id is 1 to {MAX_RUN} of A-Z, a-z, 0-9, '.', '_', ':' and '-'"));
+            }
+        }
+        Ok(())
+    }
+
+    /// `agent · task: … · run: …`, on one line (`vl log`, `vl show`).
+    pub fn summary(&self) -> String {
+        let mut out = format!("agent: {}", self.agent);
+        if let Some(t) = &self.task {
+            out.push_str(&format!(" · task: {}", t.replace(['\n', '\t'], " ")));
+        }
+        if let Some(r) = &self.run {
+            out.push_str(&format!(" · run: {r}"));
+        }
+        out
+    }
+}
+
 /// An immutable node of the history DAG.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -1011,6 +1105,26 @@ pub struct Snapshot {
     /// Embargo introduced by this (merge) snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embargo: Option<String>,
+    /// Who produced this change's content: an agent, its task, a reference
+    /// to its prompt and its run (format 10). Plain text, seen by exactly
+    /// the people who see the change, and covered by `signature`: the
+    /// signer's claim. Set only by the `vl` that records the snapshot, from
+    /// its own arguments and environment, or by the server from an agent
+    /// session's record for a commit through the API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<Attribution>,
+    /// Set on a recorded dead end (format 10): this version of the change
+    /// was abandoned, for this reason (`vl attempt drop`). An abandoned
+    /// snapshot is never a parent, never a branch's tip and never lands;
+    /// it lives only in a later version's `attempts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abandoned: Option<String>,
+    /// The change's recorded dead ends (format 10): abandoned snapshots of
+    /// this change, oldest first, at most [`MAX_ATTEMPTS`]. Strong
+    /// references (kept, pushed and projected with the snapshot), never
+    /// ancestry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<ObjectId>,
     /// Ed25519 signature of whoever *produced this exact snapshot* (the
     /// signer), over [`Snapshot::unsigned_id`]. The signer may differ from
     /// `author`: an automatic rebase of Alice's change by Bob yields a
@@ -1035,8 +1149,42 @@ impl Snapshot {
             predecessors: vec![],
             conflicts: vec![],
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         }
+    }
+
+    /// Does this snapshot use a format-10 field (attribution or attempts)?
+    pub fn has_format_10_fields(&self) -> bool {
+        self.agent.is_some() || self.abandoned.is_some() || !self.attempts.is_empty()
+    }
+
+    /// Refuse what no honest writer makes: hostile or overlong
+    /// attribution, an overlong or empty reason, too many attempts, an
+    /// abandoned snapshot that has attempts of its own, an attempt named
+    /// twice. Run on every decode: the snapshot is then `Corrupt`, as a
+    /// hostile tree name makes a tree.
+    pub fn validate_format_10(&self) -> Result<()> {
+        let corrupt = |m: String| VeilError::Corrupt("snapshot".into(), m);
+        if let Some(a) = &self.agent {
+            a.validate().map_err(corrupt)?;
+        }
+        if let Some(r) = &self.abandoned {
+            validate_reason(r).map_err(corrupt)?;
+            if !self.attempts.is_empty() {
+                return Err(corrupt("an abandoned snapshot has no attempts of its own".into()));
+            }
+        }
+        if self.attempts.len() > MAX_ATTEMPTS {
+            return Err(corrupt(format!("more than {MAX_ATTEMPTS} attempts on one change")));
+        }
+        let mut seen = std::collections::HashSet::new();
+        if !self.attempts.iter().all(|a| seen.insert(*a)) {
+            return Err(corrupt("an attempt is named twice".into()));
+        }
+        Ok(())
     }
 
     /// Id this snapshot would have without its signature. This is the value
@@ -1140,6 +1288,7 @@ impl Object {
                     if serde_json::to_vec(&s)? != b {
                         return Err(corrupt("snapshot is not in canonical encoding"));
                     }
+                    s.validate_format_10()?;
                     Ok(Object::Snapshot(s))
                 }
                 Some(v) if *v == ENCODING_BINARY_TREE || ENCODING_RESERVED.contains(v) => {
@@ -1204,6 +1353,11 @@ impl Object {
             }
         } else if raw.starts_with(ATAG_TAG) {
             GIT_PARITY_REPO_FORMAT
+        } else if raw.starts_with(SNAP_TAG) {
+            match Object::decode(raw) {
+                Ok(Object::Snapshot(s)) if s.has_format_10_fields() => ATTRIBUTION_REPO_FORMAT,
+                _ => 1,
+            }
         } else if raw.starts_with(SEAL_AES_SIV_TAG) {
             AES_SIV_REPO_FORMAT
         } else {

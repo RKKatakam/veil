@@ -1119,6 +1119,9 @@ mod s13_adversarial {
             predecessors: vec![],
             conflicts: vec![],
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         let raw = Object::Snapshot(s).encode();

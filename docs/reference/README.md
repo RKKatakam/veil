@@ -32,6 +32,7 @@ Global options (accepted by every command):
 | [`vl change`](change.md) | Commit through the Veil server's API, without a checkout (scripts, CI, agents) |
 | [`vl invite`](invite.md) | Invite a person to a group (admins): prints a one-time link to send them (Slack, email) |
 | [`vl join`](join.md) | Join a project with the link `vl invite` printed: signs this device in (registering the invited name if it is new), confirms it and joins the group |
+| [`vl session`](session.md) | Sessions on the project's server for agents (`vl session agent`) |
 | [`vl access`](access.md) | Who may see a path; with WHO, give a group, a person or `public` access to it |
 | [`vl status`](status.md) | Show working-copy changes, local-only files and conflicts |
 | [`vl log`](log.md) | Show the snapshot graph |
@@ -52,6 +53,7 @@ Global options (accepted by every command):
 | [`vl commit`](commit.md) | Describe the working-copy change and start a new one on top |
 | [`vl edit`](edit.md) | Make REV the working-copy change |
 | [`vl abandon`](abandon.md) | Discard a change; descendants are rebased onto its parent |
+| [`vl attempt`](attempt.md) | Recorded dead ends: keep an abandoned attempt on its change, with why it failed, instead of erasing it |
 | [`vl rebase`](rebase.md) | Move a change (and its descendants) onto new parents |
 | [`vl resolve`](resolve.md) | List unresolved conflicts, or resolve one by keeping one of its versions |
 | [`vl split`](split.md) | Split a change in two: what you choose, then the rest |

@@ -194,6 +194,9 @@ fn a_deep_history_is_indexed_iteratively() {
             conflicts: vec![],
             embargo: None,
             signature: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
         };
         parent = tx.repo().store().put_snapshot(&s).unwrap();
     }

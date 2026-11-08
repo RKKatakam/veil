@@ -245,7 +245,36 @@ fn snapshot_json(id: &ObjectId, s: &Snapshot, empty: bool) -> Value {
         "conflicts": s.conflicts,
         "empty": empty,
         "parents": s.parents.iter().map(|p| json!({ "snapshot_id": p.hex(), "snapshot_short": p.short() })).collect::<Vec<_>>(),
+        // Plain text behind the change's permissions (format 10).
+        "agent": s.agent,
     })
+}
+
+/// The recorded attempts of real snapshot `real` (the viewer's projection
+/// `s` names them by their projected ids, in the same order): each one's
+/// reason, attribution and the paths it changed at or under `under` that
+/// the viewer sees. At most `MAX_ATTEMPTS` by construction.
+fn attempts_json(g: &G, t: &Trees, real: &Snapshot, s: &Snapshot, under: &str) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    for (i, a) in real.attempts.iter().enumerate() {
+        let at = g.snapshot(a)?;
+        let now = t.root(at.tree)?;
+        let before = match at.parents.first() {
+            Some(p) => t.root(g.snapshot(p)?.tree)?,
+            None => veil_core::hub::project::empty_tree_id(),
+        };
+        let files: Vec<String> = t.changes(before, now, under)?.into_iter().map(|c| c.path).collect();
+        let id = s.attempts.get(i).copied().unwrap_or(*a);
+        out.push(json!({
+            "snapshot_id": id.hex(),
+            "snapshot_short": id.short(),
+            "reason": at.abandoned,
+            "agent": at.agent,
+            "timestamp": at.timestamp,
+            "files": files,
+        }));
+    }
+    Ok(out)
 }
 
 // ---- log ---------------------------------------------------------------------------
@@ -506,6 +535,7 @@ pub struct ShowParams {
 pub async fn show(hub: &Arc<Hub>, ask: &Ask, q: ShowParams, limits: Limits) -> Result<Value> {
     let deadline = Instant::now() + limits.deadline;
     let path = clean_path(q.path.as_deref().unwrap_or(""))?;
+    ask.viewer.narrowed_to(&path)?;
     let id = resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?;
     let content = !q.stat.unwrap_or(false);
     on_graph(hub, ask, deadline, move |g, t| {
@@ -514,6 +544,10 @@ pub async fn show(hub: &Arc<Hub>, ask: &Ask, q: ShowParams, limits: Limits) -> R
         let (now, before) = t.roots_of(&row)?;
         let mut v = snapshot_json(&id, &s, s.parents.is_empty() || now == before);
         v["schema"] = json!("veil.show/2");
+        let real = g.snapshot(&row.real)?;
+        if !real.attempts.is_empty() {
+            v["attempts"] = json!(attempts_json(g, t, &real, &s, &path)?);
+        }
         v["diff"] = t.diff(before, now, &path, content, limits.diff)?;
         Ok(v)
     })
@@ -531,6 +565,7 @@ pub struct TreeParams {
 pub async fn tree(hub: &Arc<Hub>, ask: &Ask, q: TreeParams, limits: Limits) -> Result<Value> {
     let deadline = Instant::now() + limits.deadline;
     let path = clean_path(q.path.as_deref().unwrap_or(""))?;
+    ask.viewer.narrowed_to(&path)?;
     let id = resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?;
     on_graph(hub, ask, deadline, move |g, t| {
         let root = t.root_of(&*g.get(&id)?)?;
@@ -584,6 +619,7 @@ pub async fn file(hub: &Arc<Hub>, ask: &Ask, q: FileParams, limits: Limits) -> R
     if path.is_empty() {
         return Err(no_path());
     }
+    ask.viewer.narrowed_to(&path)?;
     let id = resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?;
     let out = Arc::new(std::sync::Mutex::new(Vec::new()));
     let out2 = out.clone();
@@ -620,6 +656,7 @@ pub struct DiffParams {
 pub async fn diff(hub: &Arc<Hub>, ask: &Ask, q: DiffParams, limits: Limits) -> Result<Value> {
     let deadline = Instant::now() + limits.deadline;
     let path = clean_path(q.path.as_deref().unwrap_or(""))?;
+    ask.viewer.narrowed_to(&path)?;
     let merge = match q.base.as_deref().unwrap_or("merge") {
         "merge" => true,
         "from" => false,

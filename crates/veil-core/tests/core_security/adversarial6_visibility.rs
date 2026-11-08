@@ -239,6 +239,9 @@ fn a_pulled_snapshot_with_a_forged_change_id_does_not_make_the_change_divergent(
             conflicts: vec![],
             signature: None,
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
         })
         .unwrap();
     set_remote_tag(&mut m, "evil", evil);

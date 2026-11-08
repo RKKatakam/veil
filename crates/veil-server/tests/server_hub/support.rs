@@ -819,6 +819,9 @@ impl<'a> Craft<'a> {
             predecessors: vec![],
             conflicts: vec![],
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         s.sign(&self.identity);
@@ -843,6 +846,9 @@ impl Craft<'_> {
             predecessors: vec![],
             conflicts: vec![],
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         s.sign(&self.identity);
@@ -864,6 +870,9 @@ impl Craft<'_> {
             predecessors: vec![],
             conflicts: vec![],
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         edit(&mut s);
@@ -955,6 +964,9 @@ impl Craft<'_> {
             predecessors: vec![],
             conflicts: vec![],
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         s.sign(&self.identity);

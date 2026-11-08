@@ -108,6 +108,7 @@ impl Repo {
             false => Placement::Onto(&dest),
         };
         let mut tx = self.transaction("duplicate")?;
+        tx.keep_attribution();
         let done = duplicate_in(&mut tx, sources, &placement, o)?;
         tx.set_description(describe_op("duplicate", &tx, &done)?);
         tx.commit()?;
@@ -279,6 +280,9 @@ fn duplicate_in(tx: &mut Transaction, sources: &[ObjectId], placement: &Placemen
             predecessors: vec![],
             conflicts,
             embargo: None,
+            agent: s.agent.clone(),
+            abandoned: None,
+            attempts: vec![],
             signature: None, // signed by the transaction
         };
         let id = tx.write_snapshot(&snap)?;

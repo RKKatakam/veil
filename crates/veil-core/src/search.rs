@@ -91,6 +91,9 @@ pub struct LogFilter {
     /// Only snapshots changing these files or directories.
     pub paths: Vec<VPath>,
     pub author: Option<Regex>,
+    /// Only snapshots whose agent attribution matches (`vl log --agent`,
+    /// the `agent()` revset's matcher).
+    pub agent: Option<globset::GlobMatcher>,
     /// A member name or member id the snapshot's verified signer must be.
     pub signed_by: Option<String>,
     pub pickaxe: Option<Pickaxe>,
@@ -105,7 +108,7 @@ pub struct LogFilter {
 impl LogFilter {
     /// Does any filter apply?
     pub fn is_empty(&self) -> bool {
-        self.paths.is_empty() && self.author.is_none() && self.signed_by.is_none() && self.pickaxe.is_none()
+        self.paths.is_empty() && self.author.is_none() && self.agent.is_none() && self.signed_by.is_none() && self.pickaxe.is_none()
     }
 }
 
@@ -152,6 +155,12 @@ impl<'a> Searcher<'a> {
         let s = repo.snapshot(id)?;
         if *id == repo.root_id() {
             return Ok(if self.filter.is_empty() { Match::Yes { files: Vec::new() } } else { Match::No });
+        }
+        if let Some(m) = &self.filter.agent {
+            if !crate::revset::agent_matches(&s, m) {
+                self.pass_followed(id, &s);
+                return Ok(Match::No);
+            }
         }
         if let Some(re) = &self.filter.author {
             if !re.is_match(s.author.as_bytes()) {

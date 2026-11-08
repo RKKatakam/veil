@@ -27,6 +27,9 @@
 # encrypted), the sealed file is `secrets/.env.notes` (before: the
 # directory `secrets/` was cloaked), there is no cloaked tag, and embargoed
 # work is an ordinary workspace.
+# From format 10 on, alice/ also holds a change made by an agent (tag
+# `agent-work`, on the released fix: `Snapshot.agent`) whose version lists
+# a recorded attempt (`vl attempt drop`), pushed to both remotes.
 # From format 7 on, alice/ also holds a key ring of ring format 4 (scope
 # `rule-fixture`: an invite, shares by members, a member's removal of their
 # own device), written by the `write_format_7_extras` test before the pushes.
@@ -170,6 +173,22 @@ if [ "$("$VL" --version | sed -n 's/^repository format: //p')" -ge 7 ]; then
     VEIL_FIXTURE_DIR="$OUT" "$VEIL_FIXTURE_EXTRAS" --ignored --exact format_compat::write_format_7_extras >/dev/null
 fi
 
+# Format 10 on: a change made by an agent (its attribution from vl's own
+# environment) with a recorded attempt (`vl attempt drop`), at the tag
+# `agent-work`, pushed with the rest.
+if [ "$("$VL" --version | sed -n 's/^repository format: //p')" -ge 10 ]; then
+    # On the released fix: `main` builds on the unreleased embargo, which
+    # keeps it from the remotes.
+    as alice new fix-a@ >/dev/null
+    printf 'fn hold_lease() { /* deadlocks */ }\n' > src/lease.rs
+    VEIL_AGENT="fixture-agent/1.0" VEIL_AGENT_TASK="lease fix" VEIL_AGENT_RUN="run-10" \
+        as alice attempt drop --reason "deadlocks holding the lease across memo_tips" >/dev/null
+    printf 'fn take_lease() {}\n' > src/lease.rs
+    VEIL_AGENT="fixture-agent/1.0" VEIL_AGENT_TASK="lease fix" VEIL_AGENT_RUN="run-10" \
+        as alice commit -m "lease, second try" >/dev/null
+    as alice tag set agent-work -r @- >/dev/null
+fi
+
 # A tag and a vault secret.
 as alice tag set team-only -r fix-a@ >/dev/null
 as alice secret set API_TOKEN fixture-value >/dev/null
@@ -211,8 +230,13 @@ if [ -n "$PREV" ] && VEIL_HOME="$PREV/home-alice" VEIL_USER=alice "$VL" -R "$PRE
     up alice commit -m "fourth: after the upgrade" >/dev/null
     up alice tag set main -r @- >/dev/null
     # Only `main`: the format-6 set's extras amend `links` after its push,
-    # so its other tags differ from its remote.
-    up alice push origin --tag main >/dev/null 2>&1
+    # so its other tags differ from its remote. From the format-8 set on,
+    # `main` builds on the unreleased embargo: the push withholds it (and
+    # says so), and the commit stays in alice/ only.
+    pushed=$(up alice push origin --tag main 2>&1) || case "$pushed" in
+        *"unreleased embargo"*) ;;
+        *) echo "$pushed" >&2; exit 1 ;;
+    esac
     test ! -e "$U/alice/.veil/lock"
     test ! -e "$U/alice/.veil/upgrade.json"
 fi

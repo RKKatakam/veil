@@ -149,6 +149,9 @@ fn mallory_pushes(hub: Arc<MemoryBackend>, main: ObjectId, alice_pub: &str, mall
             conflicts: vec![],
             signature: None,
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
         })
         .unwrap();
     m.set_tag("main", evil, true).unwrap();

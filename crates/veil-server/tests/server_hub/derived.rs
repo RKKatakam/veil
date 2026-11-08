@@ -196,6 +196,9 @@ impl Hist {
             predecessors: vec![],
             conflicts: vec![],
             embargo: embargo.map(str::to_string),
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         let raw = Object::Snapshot(s).encode();
@@ -323,6 +326,7 @@ pub fn viewers(carol: i64) -> Vec<(&'static str, Viewer)> {
         person: Some(person),
         admin: false,
         groups: groups.iter().copied().collect(),
+        only: None,
     };
     vec![
         ("anyone on Earth", Viewer::default()),
@@ -1062,6 +1066,7 @@ fn derived_on_landing() {
                 person: Some(person),
                 admin: false,
                 groups: groups.into_iter().collect(),
+                only: None,
             }
         })
     };
@@ -1362,6 +1367,9 @@ fn derived_speed() {
             predecessors: vec![],
             conflicts: vec![],
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         let raw = Object::Snapshot(s).encode();
@@ -1576,6 +1584,9 @@ mod s12_adversarial {
             predecessors: vec![],
             conflicts: vec![],
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         let raw = Object::Snapshot(s).encode();

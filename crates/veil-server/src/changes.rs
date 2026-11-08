@@ -364,6 +364,10 @@ struct Plan {
     base_tree: ObjectId,
     /// The branch `onto` names, if it is the default branch.
     default_branch: bool,
+    /// An agent session's attribution (`docs/HUB.md` §13.27): the server
+    /// stamps it from the session's record; the request has no field for
+    /// one, so a caller can never set or forge it.
+    agent: Option<veil_core::object::Attribution>,
 }
 
 /// Build the change on real snapshot `parent` (which the caller sees as
@@ -398,13 +402,16 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, who: &Arc<Who>, parent: ObjectI
             predecessors: p.predecessors.clone(),
             conflicts: vec![],
             embargo: None,
+            agent: p.agent.clone(),
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         let mut known = p.uploaded.clone();
         known.extend(src.pending.keys().copied());
         let (real_id, real, raw) = complete_signed(src, &w, &known, n, parent, &hub2.identity)?;
         let view = w.project.view(&w.viewer);
-        let (mine, mine_raw) = sync::project_one(src, &view, real_id, &real, vec![pparent], p.ppredecessors.clone(), None, &hub2.identity)?;
+        let (mine, mine_raw) = sync::project_one(src, &view, real_id, &real, vec![pparent], p.ppredecessors.clone(), vec![], None, &hub2.identity)?;
         // What the full tree holds of what this change made: the blobs, and
         // the trees of the caller's that are the full tree's (all of them
         // for someone who sees everything there; the graft stored its own).
@@ -449,7 +456,9 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, who: &Arc<Who>, parent: ObjectI
 /// parent `parent`: the full snapshot, its id and encoding.
 fn complete_signed(src: &Source, who: &Who, known: &HashSet<ObjectId>, mut n: Snapshot, parent: ObjectId, identity: &veil_core::Identity) -> Result<(ObjectId, Snapshot, Bytes)> {
     n.sign(identity);
-    let c = sync::complete(src, &who.project, &who.viewer, known, &n, &[parent], identity)?;
+    // A change made again keeps its attempts (real ids already).
+    let attempts = n.attempts.clone();
+    let c = sync::complete(src, &who.project, &who.viewer, known, &n, &[parent], &attempts, identity)?;
     Ok(match c.raw {
         Some(raw) => match Object::decode(&raw)? {
             Object::Snapshot(s) => (c.real, s, raw),
@@ -519,7 +528,7 @@ async fn restack(hub: &Arc<Hub>, who: &Arc<Who>, chain: Vec<ObjectId>, onto: Obj
             // The caller sees it exactly as before (the same id).
             let view = w.project.view(&w.viewer);
             let pm = src.snapshot(&mine)?;
-            let (again, _) = sync::project_one(src, &view, id, &real, pm.parents.clone(), pm.predecessors.clone(), None, &hub2.identity)?;
+            let (again, _) = sync::project_one(src, &view, id, &real, pm.parents.clone(), pm.predecessors.clone(), pm.attempts.clone(), None, &hub2.identity)?;
             if again != mine {
                 return Err(Error::Other(anyhow::anyhow!("a change made again on the tip would show differently")));
             }
@@ -800,7 +809,12 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
     }
     let base_tree = {
         let b = base_real;
-        sync::blocking(hub, project.id, move |src| Ok(src.snapshot(&b)?.tree)).await?
+        let base = sync::blocking(hub, project.id, move |src| Ok(src.snapshot(&b)?)).await?;
+        // Attempts never enter ancestry (`Snapshot::abandoned`).
+        if base.abandoned.is_some() {
+            return Err(bad("the base is an abandoned attempt: nothing is built on it"));
+        }
+        base.tree
     };
     let plan = Arc::new(Plan {
         uploaded: sync::receipted(hub, project.id, person.id, &req.receipts),
@@ -814,6 +828,7 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
         base_tree,
         default_branch: onto.as_ref().is_some_and(|o| o.branch == project.default_branch),
         edits,
+        agent: caller.agent().map(|a| a.attribution.clone()),
     });
 
     // The branch move, when asked: refused at once if the tip is not what

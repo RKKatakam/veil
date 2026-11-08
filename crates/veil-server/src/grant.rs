@@ -132,6 +132,12 @@ pub async fn for_tips(
     epochs: crate::caches::Epochs,
     tips: &BTreeMap<String, ObjectId>,
 ) -> Result<BTreeMap<String, String>> {
+    // A narrowed agent session gets no grant: a grant reaches everything
+    // below its root, wider than the narrowing. It reads through `fetch`
+    // and the query API, which narrow (`docs/HUB.md` §13.27).
+    if viewer.only.is_some() {
+        return Ok(BTreeMap::new());
+    }
     let person = caller.person.as_ref().map(|p| p.id);
     let (epoch, person_epoch) = (epochs.project.map_or(0, |(_, e)| e), person.map_or(0, |_| epochs.person));
     let expires = veil_core::now_millis() + GRANT_TTL_MS;

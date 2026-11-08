@@ -53,6 +53,7 @@ async fn viewer_of(db: &sqlx::PgPool, project: i64, person: i64) -> Result<Viewe
         person: Some(person),
         admin,
         groups: groups.into_iter().collect(),
+        only: None,
     })
 }
 
@@ -145,7 +146,7 @@ async fn stored(db: &sqlx::PgPool, project: i64, path: &str, sharer: i64, recipi
 /// secret file the caller may read, for another participant, and follow the
 /// version stored (`expect`).
 pub async fn put(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<SharePut>) -> Result<Json<ShareInfo>> {
-    let me = caller.signed_in()?.clone();
+    let me = caller.person_only()?.clone();
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
@@ -271,7 +272,7 @@ pub async fn put(State(hub): State<HubState>, caller: Caller, Path(p): Path<Stri
 /// stays for the audit, without the record; its version moves on, so no
 /// update built before brings it back.
 pub async fn remove(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<ShareRemove>) -> Result<Json<ShareInfo>> {
-    let me = caller.signed_in()?.clone();
+    let me = caller.person_only()?.clone();
     let (project, _) = perm::open(&hub, &p, &caller).await?;
     let gone = || Error::not_found(format!("you share no secret '{}' with '{}' here", req.path, req.recipient));
     let recipient = person_id(&hub.db, &req.recipient).await?.ok_or_else(gone)?;

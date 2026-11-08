@@ -157,6 +157,11 @@ pub struct View<'a> {
     read: Vec<bool>,
     /// Per rule: the rule lets this viewer write.
     write: Vec<bool>,
+    /// An agent session's narrowing (`--only PATH…`, [`crate::hub::agent`]):
+    /// it writes only at or below these paths. Reads are narrowed by the
+    /// routes that serve files; the view's history and its [`View::key`]
+    /// stay the person's, so narrowed sessions make no new projections.
+    only: Option<Vec<String>>,
 }
 
 impl<'a> View<'a> {
@@ -171,7 +176,33 @@ impl<'a> View<'a> {
             .map(|(i, r)| r.names.iter().any(|n| is_me(i, n)))
             .collect();
         let read = policy.rules.iter().zip(&write).map(|(r, w)| r.public || *w).collect();
-        View { policy, admin, read, write }
+        View { policy, admin, read, write, only: None }
+    }
+
+    /// This view, narrowed to `only` (an agent session's `--only`); `None`
+    /// leaves it as it is.
+    pub fn narrowed(mut self, only: Option<&[String]>) -> View<'a> {
+        self.only = only.map(|o| o.to_vec());
+        self
+    }
+
+    /// Does the narrowing (if any) let this viewer reach `path`, a file or
+    /// a folder at or below one of its paths?
+    pub fn within_narrowing(&self, path: &str) -> bool {
+        self.only.as_ref().is_none_or(|only| crate::hub::agent::within(only, path))
+    }
+
+    /// Is folder `dir` inside the narrowing or on the way to it (the root,
+    /// a folder above one of its paths)? Only its tree is served then.
+    pub fn toward_narrowing(&self, dir: &str) -> bool {
+        self.only
+            .as_ref()
+            .is_none_or(|only| crate::hub::agent::within(only, dir) || crate::hub::agent::toward(only, dir))
+    }
+
+    /// Is this view narrowed (an agent session's `--only`)?
+    pub fn is_narrowed(&self) -> bool {
+        self.only.is_some()
     }
 
     /// Anyone on Earth: `public` folders only.
@@ -191,7 +222,7 @@ impl<'a> View<'a> {
 
     /// May this viewer write `path`?
     pub fn write(&self, path: &str) -> bool {
-        self.admin || self.policy.deciding(path).is_some_and(|i| self.write[i])
+        self.within_narrowing(path) && (self.admin || self.policy.deciding(path).is_some_and(|i| self.write[i]))
     }
 
     /// Is there a rule below directory `dir` (see [`AccessPolicy::rule_below`])?
@@ -205,7 +236,8 @@ impl<'a> View<'a> {
     }
 
     /// A key that is equal for two viewers exactly when they read the same
-    /// paths: projections are cached under it. Server-side only: it hashes
+    /// paths: projections are cached under it. A narrowing does not change
+    /// it: an agent session's history is its person's projection. Server-side only: it hashes
     /// every rule's path, hidden ones included, so a client holding it could
     /// confirm guesses of hidden folder names (BUG-1080).
     pub fn key(&self) -> String {

@@ -1,8 +1,8 @@
 //! `vl upgrade`: explicit, crash-safe, resumable repository migrations.
 //!
 //! A repository is read and written at the format in `.veil/repo.json`
-//! ([`crate::repo::REPO_FORMAT`] lists them). This build opens format 8
-//! only; `vl upgrade` brings formats 6 and 7 to it (formats 1 to 5 are no
+//! ([`crate::repo::REPO_FORMAT`] lists them). This build opens formats 8
+//! to 10; `vl upgrade` brings formats 6 to 9 to 10 (formats 1 to 5 are no
 //! longer read: an earlier vl upgrades them to 7 first). See
 //! `docs/FORMAT.md`, "Migrations".
 //!
@@ -20,8 +20,8 @@
 //!    in each encoding;
 //! 2. **set-format**: write `repo.json` with the new format, atomically.
 //!    This is the commit point: before it the repository is entirely the old
-//!    format, after it entirely the new one. `6 → 7` and `7 → 8` rewrite
-//!    nothing: every object keeps its bytes and id;
+//!    format, after it entirely the new one. No transition from 6 to 10
+//!    rewrites anything: every object keeps its bytes and id;
 //! 3. `3:hpke-ring-keys`, when one of this identity's rings still has a
 //!    legacy key wrap (BUG-071: a clone of an upgraded remote, or one a
 //!    non-admin upgraded): move every scope this identity administers to
@@ -57,7 +57,7 @@ use crate::{
     lock::RepoLock,
     now_millis,
     object::{EntryKind, Object, TreeEncoding, Visibility},
-    repo::{check_format_upgradable, min_vl_for_format, read_config, write_config, REPO_FORMAT},
+    repo::{check_format_upgradable, min_vl_for_format, read_config, write_config, ONLY_SECRETS_REPO_FORMAT, REPO_FORMAT},
     store::ObjectStore,
     vfs::StorageBackend,
     vpath::VPath,
@@ -195,7 +195,7 @@ fn hpke_ring_keys(backend: &Arc<dyn StorageBackend>, identity: Option<&Identity>
 
 fn notes_for(from: u32, to: u32) -> Vec<String> {
     let mut notes = Vec::new();
-    if from < REPO_FORMAT && to >= REPO_FORMAT {
+    if from < ONLY_SECRETS_REPO_FORMAT && to >= ONLY_SECRETS_REPO_FORMAT {
         notes.push(
             "only secret files are encrypted from now on (`docs/VISIBILITY.md`): descriptions, tags, embargoes \
              and folders are plain text behind the server's permissions; nothing recorded before the upgrade \
@@ -207,6 +207,13 @@ fn notes_for(from: u32, to: u32) -> Vec<String> {
              until they are upgraded (`vl upgrade` there)",
             min_vl_for_format(REPO_FORMAT)
         ));
+    }
+    if from < crate::object::ATTRIBUTION_REPO_FORMAT && to >= crate::object::ATTRIBUTION_REPO_FORMAT {
+        notes.push(
+            "snapshots may now carry agent attribution and recorded attempts (format 10); vl builds that read \
+             only format 8 or 9 refuse this repository"
+                .into(),
+        );
     }
     notes
 }
@@ -222,7 +229,7 @@ fn removed_refusal(removed: &[String]) -> VeilError {
     // One line: the CLI prints errors escaped (a path here is untrusted).
     VeilError::repo(format!(
         "upgrade refused: this repository holds {n} thing(s) encrypted by features vl no longer has \
-         (only secret files are encrypted from format {REPO_FORMAT} on), and converting them would \
+         (only secret files are encrypted from format {ONLY_SECRETS_REPO_FORMAT} on), and converting them would \
          rewrite its whole history. Nothing was changed. Found: {}. Keep using the vl that wrote it \
          (format 7 or earlier), or start a new repository from a checkout of the files",
         list.join("; ")
@@ -354,7 +361,7 @@ pub fn upgrade(
     // as it was. The check is repeated under the lock.
     let config = read_config(&*backend)?;
     check_format_upgradable(config.format)?;
-    if !opts.dry_run && config.format < REPO_FORMAT {
+    if !opts.dry_run && config.format < ONLY_SECRETS_REPO_FORMAT {
         let removed = removed_content(&backend)?;
         if !removed.is_empty() {
             return Err(removed_refusal(&removed));
@@ -456,7 +463,7 @@ pub fn upgrade(
             census(&backend, &mut report)?;
             // First: `fsck` would report what the removed features wrote
             // as damage, without saying what it is.
-            if report.from < REPO_FORMAT {
+            if report.from < ONLY_SECRETS_REPO_FORMAT {
                 report.removed = removed_content(&backend)?;
             }
             if !report.removed.is_empty() && !opts.dry_run {
@@ -507,7 +514,7 @@ pub fn upgrade(
             0,
             format!(
                 "the upgrade would be refused: {} thing(s) here are encrypted by features vl no longer has (only secret \
-                 files are encrypted from format {REPO_FORMAT} on): {}",
+                 files are encrypted from format {ONLY_SECRETS_REPO_FORMAT} on): {}",
                 report.removed.len(),
                 report.removed.iter().take(MAX_REMOVED_LISTED).cloned().collect::<Vec<_>>().join("; ")
             ),

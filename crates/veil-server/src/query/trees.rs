@@ -94,6 +94,11 @@ impl<'g, 'a> Trees<'g, 'a> {
         Ok(self.pr.borrow_mut().root(s.tree)?)
     }
 
+    /// The projected root of real tree `tree`.
+    pub fn root(&self, tree: ObjectId) -> Result<ObjectId> {
+        Ok(self.pr.borrow_mut().root(tree)?)
+    }
+
     /// The projected root trees of the snapshot `row` stands for and of
     /// its first parent (the empty tree for the root).
     pub fn roots_of(&self, row: &VRow) -> Result<(ObjectId, ObjectId)> {

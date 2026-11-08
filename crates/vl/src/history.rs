@@ -165,7 +165,7 @@ pub fn grep(ctx: &mut Ctx, a: &GrepArgs) -> Result<ExitCode> {
 // ---- vl log filters -----------------------------------------------------------
 
 /// The filters `vl log` gains:
-/// `[-r REVSET] [--author PAT] [--signed-by MEMBER] [-S STRING | -G REGEX] [-i] [--pickaxe-all]
+/// `[-r REVSET] [--author PAT] [--signed-by MEMBER] [--agent PATTERN] [-S STRING | -G REGEX] [-i] [--pickaxe-all]
 /// [--show-skipped] [--max-changes N] [--follow] [--] [PATH…]`.
 #[derive(Args, Debug, Clone, Default)]
 pub struct LogFilterArgs {
@@ -183,6 +183,10 @@ pub struct LogFilterArgs {
     /// member id, as verified by your key rings).
     #[arg(long, value_name = "MEMBER")]
     pub signed_by: Option<String>,
+    /// Only snapshots made by an agent whose name matches PATTERN (the name
+    /// exactly, or a glob such as `claude-*`); the same as `-r 'agent(PATTERN)'`.
+    #[arg(long, value_name = "PATTERN")]
+    pub agent: Option<String>,
     /// Only snapshots that change the number of occurrences of STRING in a
     /// file you can read.
     #[arg(short = 'S', value_name = "STRING", conflicts_with = "pickaxe_regex")]
@@ -234,9 +238,11 @@ impl LogFilterArgs {
         }
         let author = self.author.as_deref().map(|a| compile_regex(a, self.ignore_case)).transpose()?;
         let max_changes = self.max_changes.or(pickaxe.is_some().then_some(PICKAXE_MAX_CHANGES));
+        let agent = self.agent.as_deref().map(revset::agent_matcher).transpose()?;
         let filter = LogFilter {
             paths,
             author,
+            agent,
             signed_by: self.signed_by.clone(),
             pickaxe,
             pickaxe_all: self.pickaxe_all,
