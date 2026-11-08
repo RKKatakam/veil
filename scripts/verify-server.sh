@@ -46,8 +46,17 @@ ysql() { D exec "$YB" sh -c "bin/ysqlsh -h \$(hostname -i) -c \"$1\""; }
 ysql_at() { D exec "$YB" sh -c "bin/ysqlsh -h \$(hostname -i) -tAc \"$1\""; }
 # Databases the tests create themselves start with this run's prefix.
 export VEIL_TEST_DB_PREFIX=r${RUN}x
+# Buckets each run makes in the shared MinIO, named after its pid. MinIO keeps
+# one directory per object, so buckets left behind fill the disk's inodes
+# (all 244 million, 2026-11-08): each run removes its own, and the next run
+# removes those of runs that died first.
+BUCKETS="veil-pg veil-yb veil-hpg veil-hyb veil-load-pg veil-load-yb"
+remove_buckets() { # names in the shared MinIO's data directory
+  [ $# -gt 0 ] && D exec "$S3" sh -c 'cd /bitnami/minio/data && for b; do case "$b" in ""|.*|*/*) continue;; esac; rm -rf -- "$b" ".minio.sys/buckets/$b"; done' sh "$@" >/dev/null 2>&1
+}
 cleanup() {
   if [ $SHARED = 1 ]; then
+    remove_buckets $(for k in $BUCKETS; do echo "$k-$RUN"; done)
     local db q="SELECT datname FROM pg_database WHERE datname LIKE 'r${RUN}x%'"
     for db in $PG_DB $(D exec "$PG" psql -U veil -d veil -tAc "$q" 2>/dev/null); do
       D exec "$PG" psql -U veil -d veil -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1
@@ -92,6 +101,12 @@ drop_dead_runs() {
     pid=$(echo "$db" | sed -E 's/^r([0-9]+)x.*/\1/; s/^veil_run_([0-9]+)$/\1/')
     [ -d "/proc/$pid" ] || ysql "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1
   done
+  local b dead=()
+  for b in $(D exec "$S3" ls /bitnami/minio/data 2>/dev/null); do
+    pid=$(echo "$b" | sed -nE 's/^veil-(pg|yb|hpg|hyb|load-pg|load-yb)-([0-9]+)$/\2/p')
+    [ -n "$pid" ] && [ ! -d "/proc/$pid" ] && dead+=("$b")
+  done
+  remove_buckets "${dead[@]}"
 }
 
 if [ $SHARED = 1 ]; then
