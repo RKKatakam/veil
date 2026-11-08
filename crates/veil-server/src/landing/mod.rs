@@ -549,34 +549,53 @@ pub struct Judged {
     pub branch: bool,
 }
 
-/// One snapshot of a submitted first-parent line.
+/// How far the walk down from the tip reads while the line is read (a base
+/// a few landings below a tip the deriver has not reached yet); the rest of
+/// [`WALK_BUDGET`] is spent only once the line is read.
+const NEAR_WALK: usize = 256;
+
+/// One change of a submitted line the submitter sees.
 struct Link {
     id: ObjectId,
-    parents: Vec<ObjectId>,
-    /// The server held it before this request (else the request brought it,
-    /// checked as this submitter's).
     held: bool,
-    /// `landings` says its edits are on the branch already.
-    landed: bool,
+    /// It is theirs to land (seen whole, not landed already).
+    lands: bool,
+    /// Whether it is on the branch was not decided while the line was read
+    /// (the derived graph is behind the tip).
+    unknown: bool,
+}
+
+/// What a held change is to its submitter (its own edits, against its
+/// first parent or the base it lands on).
+enum Class {
+    /// Every edit at a path they cannot read: not in their history.
+    Hidden,
+    /// Seen whole: theirs to land.
+    Whole,
+    /// Seen in part: left for whoever sees it whole.
+    Part,
 }
 
 /// The stack a landing of `new` (real) on `branch` lands (§4.6), whichever
 /// route submits it (a push, `vl land`, edits on a base): the changes
 /// between the branch and `new` **that the submitter sees whole**, oldest
-/// first (`docs/HUB.md` §13.19):
+/// first (`docs/HUB.md` §13.19). `new`'s first-parent line is read change by
+/// change as the submitter sees it:
 ///
-/// * `new`'s first-parent line down to the first snapshot on the branch
-///   (the branch's real ancestry in its current lineage: `Ancestry`), judged
-///   change by change: one whose edits `landings` says are on the branch is
-///   skipped, and the line read on below it (BUG-1311). A merge with a
-///   parent on the branch ends the stack, with that parent as its base
-///   (BUG-1271).
-/// * Those this request brought (`fresh`) are the submitter's; of those the
-///   server held, one whose own edits are all at paths `viewer` can read
-///   lands, and one hidden from them or seen only in part is left for
-///   someone who sees it whole. One with conflicts they can see is refused.
-/// * At most `MAX_LAND_STACK` changes they see, counted as they are found;
-///   the line is read at most [`WALK_BUDGET`] deep, else `warming`.
+/// * a held change on the branch (the branch's real ancestry in its current
+///   lineage: `Ancestry::near`, then `Ancestry::has`) ends it; a merge
+///   with a parent on the branch ends it with that parent as its base
+///   (BUG-1271);
+/// * a run of changes hidden from the submitter is stepped over in one step
+///   by their projection and the derived graph (`Ancestry::below_hidden`),
+///   counting toward nothing (BUG-1409); while the graph is behind it, each
+///   is read, at most [`WALK_BUDGET`], then `warming`;
+/// * a change whose edits are on the branch already (`landings`, or a
+///   revision of it there: `Ancestry::landed`) is skipped (BUG-1408); one
+///   the submitter sees only in part is left for whoever sees it whole; one
+///   with conflicts they can see is refused;
+/// * at most [`WALK_BUDGET`] changes they see are read, and at most
+///   `MAX_LAND_STACK` land.
 ///
 /// `Err(why)` to refuse (naming no path).
 pub async fn stack(
@@ -599,37 +618,22 @@ pub async fn stack(
     let tip = ObjectId::from_hex(&tip).map_err(|e| Error::Other(e.into()))?;
     let mut anc = Ancestry::new(hub.clone(), pid, branch, tip, lineage);
     let too_many = || Ok(Err(format!("more than {max} changes between the branch's tip and this one: land them in parts, or have an admin push with --force")));
-    // 1. The line, down to the tip, the root, or a snapshot on the branch by
-    // `landings` (looked up in growing groups: the first held one alone, as
-    // an agent's base is its own last landing).
+    let key = (!viewer.admin).then(|| project.view(viewer).key());
     let mut line: Vec<Link> = Vec::new();
+    let (mut seen, mut hidden, mut kept) = (0usize, 0usize, 0usize);
     let mut reached_tip = false;
-    let mut at_root = false;
-    // Ended at a snapshot on the branch.
-    let mut ended = false;
-    let mut pending: Vec<usize> = Vec::new();
-    let mut group = 1;
-    let mut fresh_seen = 0;
+    let mut floor = root;
     let mut x = new;
     loop {
         if x == tip {
             reached_tip = true;
+            floor = x;
             break;
         }
         if x == root {
-            at_root = true;
             break;
         }
-        if line.len() == WALK_BUDGET {
-            return Err(crate::query::graph::warming());
-        }
         let held = !fresh.contains_key(&x);
-        if !held {
-            fresh_seen += 1;
-            if fresh_seen > max {
-                return too_many();
-            }
-        }
         let parents = match fresh.get(&x) {
             Some(p) => p.clone(),
             None => {
@@ -637,70 +641,125 @@ pub async fn stack(
                 crate::sync::blocking(hub, pid, move |src| Ok(src.snapshot(&y)?.parents.clone())).await?
             }
         };
-        let id = x;
-        x = parents[0];
-        line.push(Link { id, parents, held, landed: false });
+        let mut unknown = false;
+        let mut class = None;
         if held {
-            pending.push(line.len() - 1);
-        }
-        if pending.len() >= group {
-            if let Some(i) = anc.look_up(&mut line, &pending).await? {
-                line.truncate(i);
-                ended = true;
-                break;
+            match anc.near(x).await? {
+                Some(true) => {
+                    floor = x;
+                    break;
+                }
+                Some(false) => {}
+                None => unknown = true,
             }
-            pending.clear();
-            group = (group * 2).min(64);
-        }
-    }
-    if !reached_tip && !ended && !pending.is_empty() {
-        if let Some(i) = anc.look_up(&mut line, &pending).await? {
-            line.truncate(i);
-            ended = true;
-        }
-    }
-    // 2. Where the branch's history starts on it: the first held change on
-    // the branch (none above the tip is: each is a descendant of it), or a
-    // merge with a parent there.
-    let mut merge_base: Option<ObjectId> = None;
-    let mut cut = line.len();
-    for i in 0..line.len() {
-        if line[i].held && !line[i].landed && !reached_tip && anc.has(line[i].id).await? {
-            cut = i;
-            break;
-        }
-        if line[i].parents.len() > 1 {
-            let p0_on = match line.get(i + 1) {
-                Some(next) => next.held && !next.landed && !reached_tip && anc.has(next.id).await?,
-                None => reached_tip || ended || at_root,
-            };
-            if !p0_on {
-                let mut found = None;
-                for p in &line[i].parents[1..] {
-                    if anc.has(*p).await? {
-                        found = Some(*p);
-                        break;
+            if let Some(k) = &key {
+                match anc.below_hidden(project, viewer, k, x).await? {
+                    // A run hidden from them, stepped over.
+                    Some(v) if v != x => {
+                        x = v;
+                        continue;
+                    }
+                    Some(_) => {}
+                    // The derived graph is behind: the change itself is read.
+                    None => {
+                        let c = classify(hub, project, viewer, x, parents[0]).await?;
+                        match c {
+                            Err(why) => return Ok(Err(why)),
+                            Ok(Class::Hidden) => {
+                                hidden += 1;
+                                if hidden > WALK_BUDGET {
+                                    let h = hub.clone();
+                                    tokio::spawn(async move {
+                                        let _ = crate::derive::ensure(&h, pid, new).await;
+                                    });
+                                    return Err(crate::query::graph::warming());
+                                }
+                                x = parents[0];
+                                continue;
+                            }
+                            Ok(c) => class = Some(c),
+                        }
                     }
                 }
-                if let Some(p) = found {
-                    merge_base = Some(p);
-                    cut = i + 1;
+            }
+        }
+        seen += 1;
+        if seen > WALK_BUDGET {
+            return Err(crate::query::graph::warming());
+        }
+        // A merge with a parent on the branch ends the stack (BUG-1271).
+        let mut ends = None;
+        if parents.len() > 1 && !anc.has(parents[0]).await? {
+            for p in &parents[1..] {
+                if anc.has(*p).await? {
+                    ends = Some(*p);
                     break;
                 }
             }
         }
+        let landed = held && anc.landed(x).await?;
+        let lands = !landed
+            && (!held || viewer.admin || {
+                let c = match (class, ends) {
+                    (Some(c), None) => c,
+                    _ => match classify(hub, project, viewer, x, ends.unwrap_or(parents[0])).await? {
+                        Ok(c) => c,
+                        Err(why) => return Ok(Err(why)),
+                    },
+                };
+                matches!(c, Class::Whole)
+            });
+        if lands {
+            kept += 1;
+            if kept > max && !line.iter().any(|l| l.unknown) && !unknown {
+                return too_many();
+            }
+        }
+        line.push(Link { id: x, held, lands, unknown });
+        if let Some(p) = ends {
+            floor = p;
+            break;
+        }
+        x = parents[0];
     }
-    line.truncate(cut);
-    // 3. What of it the submitter lands, counted as it is found (at most
-    // `max` changes they see), each with its base.
-    let floor = match (merge_base, line.last()) {
-        (Some(p), _) => p,
-        (None, Some(l)) => l.parents[0],
-        (None, None) => return Ok(Ok(Judged { stack: Vec::new(), lineage, branch: true })),
-    };
-    let links: Vec<(ObjectId, Vec<ObjectId>, bool, bool)> = line.iter().map(|l| (l.id, l.parents.clone(), l.held, l.landed)).collect();
+    // Changes whose place was not decided as the line was read: above the
+    // tip none is on the branch; else the first that is cuts the line.
+    if !reached_tip {
+        for i in 0..line.len() {
+            if line[i].unknown && line[i].held && anc.has(line[i].id).await? {
+                floor = line[i].id;
+                line.truncate(i);
+                break;
+            }
+        }
+    }
+    let lands: Vec<ObjectId> = line.iter().filter(|l| l.lands).map(|l| l.id).collect();
+    if lands.len() > max {
+        return too_many();
+    }
+    // Oldest first, each on the one below it that lands (or where the stack
+    // starts).
+    let mut stack = Vec::with_capacity(lands.len());
+    let mut base = floor;
+    for id in lands.into_iter().rev() {
+        stack.push(Entry::plain(id, base));
+        base = id;
+    }
+    Ok(Ok(Judged { stack, lineage, branch: true }))
+}
+
+/// What held change `x` is to `viewer`: its own edits against `against`
+/// (its first parent, or the base a merge lands on). `Err` to refuse it
+/// (conflicts they can see).
+async fn classify(
+    hub: &Arc<Hub>,
+    project: &crate::perm::Project,
+    viewer: &crate::perm::Viewer,
+    x: ObjectId,
+    against: ObjectId,
+) -> Result<std::result::Result<Class, String>> {
     let (view_policy, view_bindings, v) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
-    let kept = crate::sync::blocking(hub, pid, move |src| {
+    crate::sync::blocking(hub, project.id, move |src| {
         let p = crate::perm::Project {
             id: src.project,
             name: String::new(),
@@ -710,54 +769,24 @@ pub async fn stack(
             bindings: view_bindings,
         };
         let view = p.view(&v);
-        // Top-down: (id, lands).
-        let mut out: Vec<ObjectId> = Vec::new();
-        let n = links.len();
-        for (i, (id, parents, held, landed)) in links.iter().enumerate() {
-            if *landed {
-                continue;
-            }
-            if *held {
-                let s = src.snapshot(id)?;
-                if s.conflicts.iter().any(|c| view.read(c)) {
-                    return Ok(Err("a change with unresolved conflicts never lands: resolve them first".to_string()));
-                }
-                if !v.admin {
-                    // Its own edits: against its first parent (the merge
-                    // ending the stack: against its base, what it lands as).
-                    let against = match merge_base {
-                        Some(m) if i + 1 == n => m,
-                        _ => parents[0],
-                    };
-                    let own = edits::edit_set(src, s.tree, src.snapshot(&against)?.tree)?;
-                    if own.iter().any(|c| !view.read(&c.path)) {
-                        continue;
-                    }
-                }
-            }
-            out.push(*id);
-            if out.len() > max {
-                return Ok(Err(format!(
-                    "more than {max} changes between the branch's tip and this one: land them in parts, or have an admin push with --force"
-                )));
-            }
+        let s = src.snapshot(&x)?;
+        if s.conflicts.iter().any(|c| view.read(c)) {
+            return Ok(Err("a change with unresolved conflicts never lands: resolve them first".to_string()));
         }
-        Ok(Ok(out))
+        if v.admin {
+            return Ok(Ok(Class::Whole));
+        }
+        let own = edits::edit_set(src, s.tree, src.snapshot(&against)?.tree)?;
+        let readable = own.iter().filter(|c| view.read(&c.path)).count();
+        Ok(Ok(if s.parents.len() == 1 && !own.is_empty() && readable == 0 {
+            Class::Hidden
+        } else if readable == own.len() {
+            Class::Whole
+        } else {
+            Class::Part
+        }))
     })
-    .await?;
-    let kept = match kept {
-        Ok(k) => k,
-        Err(why) => return Ok(Err(why)),
-    };
-    // Oldest first, each on the one below it that lands (or where the stack
-    // starts).
-    let mut stack = Vec::with_capacity(kept.len());
-    let mut base = floor;
-    for id in kept.into_iter().rev() {
-        stack.push(Entry::plain(id, base));
-        base = id;
-    }
-    Ok(Ok(Judged { stack, lineage, branch: true }))
+    .await
 }
 
 /// Is a real snapshot on a branch at `tip` (its real ancestry, in its
@@ -801,79 +830,129 @@ impl Ancestry {
         }
     }
 
-    /// Of `ids`, those on the branch (`landed` rows: a snapshot the service
-    /// landed, or moved the branch from) and those whose edits are on it
-    /// (`submitted` rows), in one statement (each half by its own index).
-    async fn recorded(&self, ids: &[ObjectId]) -> Result<(std::collections::HashSet<ObjectId>, std::collections::HashSet<ObjectId>)> {
-        let hex: Vec<String> = ids.iter().map(ObjectId::hex).collect();
-        let rows: Vec<(String, bool)> = sqlx::query_as(
-            "SELECT landed, true FROM landings WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND landed = ANY($4) \
-             UNION ALL SELECT submitted, false FROM landings WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND submitted = ANY($4)",
-        )
-        .bind(self.project)
-        .bind(&self.branch)
-        .bind(self.lineage)
-        .bind(&hex)
-        .fetch_all(&self.hub.db)
-        .await?;
-        let (mut on, mut done) = (std::collections::HashSet::new(), std::collections::HashSet::new());
-        for (id, branch) in rows {
-            if let Ok(id) = ObjectId::from_hex(&id) {
-                if branch {
-                    on.insert(id);
-                } else {
-                    done.insert(id);
-                }
-            }
-        }
-        Ok((on, done))
+    /// Is `x` a snapshot `landings` says is on the branch (`landed`: one the
+    /// service landed, or moved the branch from)?
+    async fn recorded(&self, x: ObjectId) -> Result<bool> {
+        let n: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM landings WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND landed = $4 LIMIT 1")
+                .bind(self.project)
+                .bind(&self.branch)
+                .bind(self.lineage)
+                .bind(x.hex())
+                .fetch_optional(&self.hub.db)
+                .await?;
+        Ok(n.is_some())
     }
 
-    /// Look `line`'s links at `at` up: marks those landed already, and
-    /// gives the first (topmost) that is on the branch.
-    async fn look_up(&mut self, line: &mut [Link], at: &[usize]) -> Result<Option<usize>> {
-        let ids: Vec<ObjectId> = at.iter().map(|i| line[*i].id).collect();
-        let (on, done) = self.recorded(&ids).await?;
-        for i in at {
-            let id = line[*i].id;
-            if on.contains(&id) {
-                self.known.insert(id, true);
-                return Ok(Some(*i));
-            }
-            line[*i].landed = done.contains(&id);
+    /// Does the derived graph hold the tip (then it answers every question
+    /// of ancestry, by its jump table)?
+    async fn graph(&mut self) -> Result<bool> {
+        if self.graph.is_none() {
+            let tip = self.tip;
+            self.graph = Some(crate::derive::read(&self.hub, self.project, move |g| Ok(g.row(&tip)?.is_some())).await?);
+        }
+        Ok(self.graph == Some(true))
+    }
+
+    /// Is `x` the tip or below it, as far as a short walk tells while the
+    /// line is read? `None`: not decided yet (`Ancestry::has` decides).
+    async fn near(&mut self, x: ObjectId) -> Result<Option<bool>> {
+        if x == self.tip || x == crate::sync::root_snapshot_id() {
+            return Ok(Some(true));
+        }
+        if let Some(v) = self.known.get(&x) {
+            return Ok(Some(*v));
+        }
+        if self.recorded(x).await? {
+            self.known.insert(x, true);
+            return Ok(Some(true));
+        }
+        self.hub.landing.stats.walks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tip = self.tip;
+        if self.graph().await? {
+            let v = crate::derive::read(&self.hub, self.project, move |g| Ok(g.row(&x)?.is_some() && g.is_ancestor(x, tip)?)).await?;
+            self.known.insert(x, v);
+            return Ok(Some(v));
+        }
+        let (found, done) = self.walk_until(x, NEAR_WALK).await?;
+        if found || done {
+            self.known.insert(x, found);
+            return Ok(Some(found));
         }
         Ok(None)
     }
 
     /// Is `x` the tip or below it?
     pub(crate) async fn has(&mut self, x: ObjectId) -> Result<bool> {
-        if x == self.tip || x == crate::sync::root_snapshot_id() {
-            return Ok(true);
+        if let Some(v) = self.near(x).await? {
+            return Ok(v);
         }
-        if let Some(v) = self.known.get(&x) {
-            return Ok(*v);
-        }
-        if self.recorded(&[x]).await?.0.contains(&x) {
-            self.known.insert(x, true);
-            return Ok(true);
-        }
-        self.hub.landing.stats.walks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tip = self.tip;
-        if self.graph.is_none() {
-            self.graph = Some(crate::derive::read(&self.hub, self.project, move |g| Ok(g.row(&tip)?.is_some())).await?);
-        }
-        let v = if self.graph == Some(true) {
-            // Everything below a derived snapshot is derived.
-            crate::derive::read(&self.hub, self.project, move |g| Ok(g.row(&x)?.is_some() && g.is_ancestor(x, tip)?)).await?
-        } else {
-            self.walk_to(x).await?
-        };
+        let v = self.walk_to(x).await?;
         self.known.insert(x, v);
         Ok(v)
     }
-    /// The shared walk, on until it finds `x`, ends, or spends its budget;
-    /// then its frontier by the derived graph, else `warming`.
-    async fn walk_to(&mut self, x: ObjectId) -> Result<bool> {
+
+    /// Are held change `x`'s edits on the branch already: `landings` says so
+    /// (`submitted`), or a snapshot on the branch is a revision of it made
+    /// from it (the derived graph's change ids; a landing names what it
+    /// landed as its predecessor), however long ago (BUG-1408)?
+    async fn landed(&mut self, x: ObjectId) -> Result<bool> {
+        let n: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM landings WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND submitted = $4 LIMIT 1")
+                .bind(self.project)
+                .bind(&self.branch)
+                .bind(self.lineage)
+                .bind(x.hex())
+                .fetch_optional(&self.hub.db)
+                .await?;
+        if n.is_some() {
+            return Ok(true);
+        }
+        let cid = crate::sync::blocking(&self.hub, self.project, move |src| Ok(hex::encode(src.snapshot(&x)?.change_id.0))).await?;
+        let revisions: Vec<String> =
+            sqlx::query_scalar("SELECT snapshot FROM graph WHERE project_id = $1 AND change_id = $2 AND snapshot <> $3 ORDER BY snapshot LIMIT 16")
+                .bind(self.project)
+                .bind(&cid)
+                .bind(x.hex())
+                .fetch_all(&self.hub.db)
+                .await?;
+        for r in revisions.iter().filter_map(|r| ObjectId::from_hex(r).ok()) {
+            let made_from = crate::sync::blocking(&self.hub, self.project, move |src| Ok(src.snapshot(&r)?.predecessors.contains(&x))).await?;
+            if made_from && self.near(r).await? == Some(true) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The change of `viewer`'s history that held `x` stands for (view key
+    /// `key`): `x` itself when it is one, else (`x` hidden from them) the
+    /// one its projection is, below the run: of the real snapshots with
+    /// `x`'s projection, the lowest by the derived graph, which must be
+    /// below `x` (one indexed statement, whatever the run's length). `None`
+    /// while the graph is behind.
+    async fn below_hidden(&mut self, project: &crate::perm::Project, viewer: &crate::perm::Viewer, key: &str, x: ObjectId) -> Result<Option<ObjectId>> {
+        let px = crate::sync::projected(&self.hub, project, viewer, x).await?;
+        let low: Option<String> = sqlx::query_scalar(
+            "SELECT p.real_id FROM projections p JOIN graph g ON g.project_id = p.project_id AND g.snapshot = p.real_id \
+             WHERE p.project_id = $1 AND p.view_key = $2 AND p.projected_id = $3 ORDER BY g.generation, p.real_id LIMIT 1",
+        )
+        .bind(self.project)
+        .bind(key)
+        .bind(px.hex())
+        .fetch_optional(&self.hub.db)
+        .await?;
+        let Some(v) = low.and_then(|v| ObjectId::from_hex(&v).ok()) else { return Ok(None) };
+        if v == x {
+            return Ok(Some(x));
+        }
+        let below = crate::derive::read(&self.hub, self.project, move |g| Ok(g.row(&x)?.is_some() && g.is_ancestor(v, x)?)).await?;
+        Ok(below.then_some(v))
+    }
+
+    /// The shared walk down from the tip, on until it finds `x`, ends, or has
+    /// read `budget` snapshots in all: (found, ended).
+    async fn walk_until(&mut self, x: ObjectId, budget: usize) -> Result<(bool, bool)> {
         let root = crate::sync::root_snapshot_id();
         let w = self.walk.take().unwrap_or_else(|| Walk {
             seen: std::collections::HashSet::from([self.tip]),
@@ -883,7 +962,7 @@ impl Ancestry {
         });
         let w = crate::sync::blocking(&self.hub, self.project, move |src| {
             let mut w = w;
-            while !w.seen.contains(&x) && !w.done && w.read < WALK_BUDGET {
+            while !w.seen.contains(&x) && !w.done && w.read < budget {
                 let Some(y) = w.todo.pop_front() else {
                     w.done = true;
                     break;
@@ -901,9 +980,16 @@ impl Ancestry {
             Ok(w)
         })
         .await?;
-        let (found, done) = (w.seen.contains(&x), w.done);
-        let frontier: Vec<ObjectId> = w.todo.iter().copied().collect();
+        let out = (w.seen.contains(&x), w.done);
         self.walk = Some(w);
+        Ok(out)
+    }
+
+    /// The shared walk, on until it finds `x`, ends, or spends its budget;
+    /// then its frontier by the derived graph, else `warming`.
+    async fn walk_to(&mut self, x: ObjectId) -> Result<bool> {
+        let (found, done) = self.walk_until(x, WALK_BUDGET).await?;
+        let frontier: Vec<ObjectId> = self.walk.as_ref().map(|w| w.todo.iter().copied().collect()).unwrap_or_default();
         if found || done {
             return Ok(found);
         }

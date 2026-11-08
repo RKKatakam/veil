@@ -558,6 +558,29 @@ interleaved, two rounds:
 
 Raw results (not committed): `.scratch/bench-ab7.log`, `.scratch/bench19.log`, `.scratch/bench20.log`.
 
+**After the redesign's second review** (2026-11-08; BUG-1405 to 1409: the
+line read as the submitter sees it, hidden runs stepped over by the graph,
+"already landed" from the history; `bench21`). **The machine was not
+quiet**: `bench-quiet.sh` waited 520 s for a load below 16, and the load
+rose to 88 during the 10,000-agent point.
+
+| Agents | Target (/s) | Landed (/s) | p50 (ms) | p99 (ms) | Agents that landed | DB commits per landing | DB statements per landing | Storage writes per landing |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,000 | 1,000 | 853 | 1,592 | 2,297 | 1,000 | 1.11 | 14.2 | 14.4 |
+| 1,000 | 2,000 | 1,092 | 4,596 | 8,063 | 1,000 | 1.02 | 15.7 | 13.7 |
+| 10,000 | 1,000 | 508 | 3,219 | 8,149 | 7,553 | 2.00 | 23.1 | 20.6 |
+
+* At 1,000 agents the cost per landing is that of every run above (14–16
+  statements, 14 storage writes); the latencies follow the object store,
+  66 ms a batch here against 15 ms when quiet.
+* The 10,000-agent point has the overloaded signature seen before with
+  both builds (`bench-ab7`: the earlier build gave 1.46 commits per
+  landing at load 58): requests that time out are submitted again (2.0
+  commits and 20.6 storage writes per landing; a quarter of the agents
+  never finished). The quiet measurement is still owed.
+
+Raw results (not committed): `.scratch/bench21.log`, `.scratch/bench-results/server-landing-e56f4848-20261108T142211Z*`, `…T142409Z*`.
+
 
 ## What would raise each ceiling (not built)
 

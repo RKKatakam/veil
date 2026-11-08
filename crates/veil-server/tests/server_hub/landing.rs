@@ -2465,7 +2465,6 @@ fn a_change_landed_as_projected_edits_never_lets_a_non_admin_change_the_rules_or
 /// step below the tip) is answered `warming`, every time, though the graph
 /// (or a walk of two snapshots from the tip) answers at once.
 #[test]
-#[ignore = "BUG-1405: the submitted line ends only at a `landings` row, the tip or the root: a base on the branch that `landings` does not know is answered `warming` for ever"]
 fn bug_1405_a_change_on_a_snapshot_of_the_branch_that_landings_does_not_know_lands() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -2499,9 +2498,10 @@ fn bug_1405_a_change_on_a_snapshot_of_the_branch_that_landings_does_not_know_lan
 /// The dev's view of world `hidden` (a fresh project): the admin's branch
 /// `g` holds one change P of `src/g/p.rs`, and (with `hidden`) of a billing
 /// file too, which the dev cannot read; the dev lands their own change on
-/// top of P (as they see it). What the dev is told, and what main then
-/// shows them: `(status, state, snapshots landed, src/g/p.rs on main)`.
-fn land_on_a_change_seen(hub: &TestHub, hidden: bool) -> (u16, Value, usize, bool) {
+/// top of P (as they see it). The answer (its ticket and the dev's own
+/// change id left out), the snapshots it lists, and whether main then
+/// shows the dev `src/g/p.rs`.
+fn land_on_a_change_seen(hub: &TestHub, hidden: bool) -> (Value, usize, bool) {
     let p = setup_project(hub);
     let pid = project_id(hub, &p.name);
     let api = hub.api();
@@ -2510,40 +2510,44 @@ fn land_on_a_change_seen(hub: &TestHub, hidden: bool) -> (u16, Value, usize, boo
     let bill = format!("{BILL_DIR}/g.txt");
     let mut files: Vec<(&str, &str)> = vec![("src/g/p.rs", "p\n")];
     if hidden {
-        files.push((&bill, "hidden\n"));
+        files.push((&bill, "the hidden edit\n"));
     }
     crafted_branch(&api, &p.admin, &p.name, "main", "g", &[(&files, 1)], t0);
     let seen = api.tips(Some(&token), &p.name).unwrap().branches["g"];
     let r = land(&api, &token, &p.name, seen, json!([put("src/g/mine.rs", "the dev's\n")]), true);
-    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    let v = r.json();
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    for secret in [BILL_DIR, "the hidden edit", "g.txt"] {
+        assert!(!body.contains(secret), "the answer names what the dev cannot see ({secret}): {body}");
+    }
+    let mut v = r.json();
     assert_eq!(v["state"], "landed", "{v}");
     assert_eq!(real_file(hub, pid, "src/g/mine.rs").as_deref(), Some(&b"the dev's\n"[..]));
     assert!(real_file(hub, pid, &bill).is_none(), "a change the dev sees only in part landed");
     let n = v["landed"].as_array().unwrap().len();
-    (r.status, v["state"].clone(), n, real_file(hub, pid, "src/g/p.rs").is_some())
+    let o = v.as_object_mut().unwrap();
+    for k in ["ticket", "change_id", "landed"] {
+        o.remove(k);
+    }
+    (v, n, real_file(hub, pid, "src/g/p.rs").is_some())
 }
 
-/// BUG-1406: answers are the same whether or not a change the submitter
-/// sees also holds edits they cannot see (`docs/HUB.md` §13.19: "nothing
-/// hidden below or between ever changes an answer … those of the same
-/// changes with nothing hidden there"). Two worlds, identical for the dev:
-/// P edits `src/g/p.rs`, and in one of them a billing file too. The dev
-/// lands their change on P: with nothing hidden in P, P and theirs land
-/// (two snapshots, and main shows them `src/g/p.rs`); with the hidden edit,
-/// only theirs lands (one snapshot, no `src/g/p.rs`), so the dev learns that
-/// P touched folders they cannot see. (The same holds for "nothing to land"
-/// against `landed` when P alone is landed, and for a conflict on a path of
-/// P's that the dev's change edits.)
+/// BUG-1406 (decided, `docs/VISIBILITY.md`: that a change you see also
+/// touched folders you cannot see is not secret; what and where is): two
+/// worlds, the same for the dev, where P edits `src/g/p.rs` and in one of
+/// them a billing file too. The dev lands their change on P: with nothing
+/// hidden in P, P lands with theirs; with the hidden edit, P is left for
+/// someone who sees it whole and only theirs lands. That bit is all the
+/// answer tells: the same state and message, no hidden path, name, count or
+/// content in either, one snapshot fewer listed.
 #[test]
-#[ignore = "BUG-1406: a change seen only in part is left out where the same change with nothing hidden lands: the answer tells whether a change has hidden edits"]
-fn bug_1406_answers_are_the_same_whether_or_not_a_change_below_has_edits_the_submitter_cannot_see() {
+fn bug_1406_an_answer_tells_whether_a_change_below_has_hidden_edits_and_nothing_more() {
     let hub = TestHub::start();
-    let plain = land_on_a_change_seen(&hub, false);
-    let part = land_on_a_change_seen(&hub, true);
-    assert_eq!(plain.0, part.0);
-    assert_eq!(plain.1, part.1);
-    assert_eq!(plain, part, "(status, state, snapshots landed, P's visible edit on main) differ with a hidden edit in P");
+    let (plain, plain_n, plain_p) = land_on_a_change_seen(&hub, false);
+    let (part, part_n, part_p) = land_on_a_change_seen(&hub, true);
+    assert_eq!(plain, part, "beyond which snapshots landed, the answers differ");
+    assert_eq!((plain_n, plain_p), (2, true), "P and the dev's change land");
+    assert_eq!((part_n, part_p), (1, false), "P, seen in part, is left for whoever sees it whole");
 }
 
 /// BUG-1407: `sync::resolve_newest` keeps the 64 smallest ids of the real
@@ -2556,7 +2560,6 @@ fn bug_1406_answers_are_the_same_whether_or_not_a_change_below_has_edits_the_sub
 /// main as they see it is grafted on an older one (BUG-1314's harm: its
 /// hidden files are an older main's).
 #[test]
-#[ignore = "BUG-1407: resolve_newest truncates to the 64 smallest ids before ordering: with more hidden-only changes, the tip is dropped"]
 fn bug_1407_a_base_shared_by_many_hidden_only_changes_resolves_to_the_tip() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -2632,7 +2635,6 @@ fn sql_i64_text(hub: &TestHub, q: &str, project: i64, text: &str) -> i64 {
 /// P's file since P landed), so Q never lands; had P's path been undone
 /// meanwhile, P would land a second time.
 #[test]
-#[ignore = "BUG-1408: a change landed more than an hour ago is landed again (conflict on its own paths) when a later change on top of it lands"]
 fn bug_1408_a_change_landed_an_hour_ago_is_not_landed_again_under_a_later_one() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -2748,7 +2750,6 @@ fn a_change_seen_in_part_lands_by_no_route_of_its_viewer_and_its_author_lands_it
 /// more than 4,096 changes they cannot see are there, and they can never
 /// land on that history.
 #[test]
-#[ignore = "BUG-1409: the walk budget counts changes the submitter cannot see: a change on 4,100 hidden ones is answered `warming` for ever"]
 fn bug_1409_a_change_on_more_hidden_changes_than_the_walk_budget_lands_as_it_would_with_none_below() {
     let hub = TestHub::start();
     let p = setup_project(&hub);

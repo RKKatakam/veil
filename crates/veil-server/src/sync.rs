@@ -495,30 +495,71 @@ async fn resolve_stored(hub: &Hub, project: i64, id: &ObjectId) -> Result<Vec<Ob
     Ok(rows.iter().filter_map(|r| ObjectId::from_hex(&r.0).ok()).collect())
 }
 
-/// [`resolve_stored`], the one to take first first (BUG-1314): the real
-/// snapshots one projected id stands for (changes hidden from a viewer
-/// share their projection) ordered by what the history says, never by when
-/// a memo was stored: a branch tip first, then one that descends from the
-/// others (read down each one's first-parent line, at most
-/// [`NEWEST_WALK`] snapshots), the snapshot id breaking ties. The same
-/// answer on every server.
-pub(crate) async fn resolve_newest(hub: &Arc<Hub>, project: i64, id: &ObjectId) -> Result<Vec<ObjectId>> {
-    let mut ids = resolve_stored(hub, project, id).await?;
-    ids.sort_unstable();
-    ids.dedup();
-    if ids.len() <= 1 {
-        return Ok(ids);
+/// The real snapshots projected id `id` may stand for, the one to take
+/// first first (BUG-1314, BUG-1407): itself when it is committed history;
+/// else, of every real snapshot with that projection (changes hidden from a
+/// viewer share one; view `view_key`'s first, as a viewer whose access
+/// changed names snapshots of their former view), branch tips, then the
+/// newest by the derived graph, then those the graph does not hold yet
+/// (newer than it) ordered by which descends from which (read down each
+/// first-parent line, at most [`NEWEST_WALK`]), the snapshot id breaking
+/// ties: never by when a memo was stored, the same answer on every server.
+/// Callers project each for the asker (BUG-915). Each statement reads one
+/// index range and returns at most a few rows, or [`NEWEST_CANDIDATES`].
+pub(crate) async fn resolve_newest(hub: &Arc<Hub>, project: i64, view_key: &str, id: &ObjectId) -> Result<Vec<ObjectId>> {
+    if *id == root_snapshot_id() || committed(hub, project, id).await? {
+        return Ok(vec![*id]);
     }
-    ids.truncate(NEWEST_CANDIDATES);
-    let hex: Vec<String> = ids.iter().map(ObjectId::hex).collect();
-    let tips: HashSet<ObjectId> = sqlx::query_scalar::<_, String>("SELECT target FROM branches WHERE project_id = $1 AND target = ANY($2)")
+    let hex = id.hex();
+    let hexes = |rows: Vec<String>| -> Vec<ObjectId> { rows.iter().filter_map(|r| ObjectId::from_hex(r).ok()).collect() };
+    let tips = hexes(
+        sqlx::query_scalar(
+            "SELECT p.real_id FROM projections p JOIN branches b ON b.project_id = p.project_id AND b.target = p.real_id \
+             WHERE p.project_id = $1 AND p.projected_id = $3 GROUP BY p.real_id ORDER BY max(CASE WHEN p.view_key = $2 THEN 1 ELSE 0 END) DESC, p.real_id LIMIT 4",
+        )
         .bind(project)
+        .bind(view_key)
         .bind(&hex)
         .fetch_all(&hub.db)
-        .await?
-        .iter()
-        .filter_map(|t| ObjectId::from_hex(t).ok())
-        .collect();
+        .await?,
+    );
+    let derived = hexes(
+        sqlx::query_scalar(
+            "SELECT p.real_id FROM projections p JOIN graph g ON g.project_id = p.project_id AND g.snapshot = p.real_id \
+             WHERE p.project_id = $1 AND p.projected_id = $3 GROUP BY p.real_id, g.generation \
+             ORDER BY max(CASE WHEN p.view_key = $2 THEN 1 ELSE 0 END) DESC, g.generation DESC, p.real_id LIMIT 4",
+        )
+        .bind(project)
+        .bind(view_key)
+        .bind(&hex)
+        .fetch_all(&hub.db)
+        .await?,
+    );
+    let mut ids = hexes(
+        sqlx::query_scalar(
+            "SELECT p.real_id FROM projections p WHERE p.project_id = $1 AND p.projected_id = $2 \
+             AND NOT EXISTS (SELECT 1 FROM graph g WHERE g.project_id = p.project_id AND g.snapshot = p.real_id) \
+             GROUP BY p.real_id ORDER BY p.real_id LIMIT $3",
+        )
+        .bind(project)
+        .bind(&hex)
+        .bind(NEWEST_CANDIDATES as i64)
+        .fetch_all(&hub.db)
+        .await?,
+    );
+    let mut out: Vec<ObjectId> = tips;
+    let push = |out: &mut Vec<ObjectId>, more: Vec<ObjectId>| {
+        for m in more {
+            if !out.contains(&m) {
+                out.push(m);
+            }
+        }
+    };
+    if ids.is_empty() {
+        push(&mut out, derived);
+        return Ok(out);
+    }
+    ids.extend(derived.first().copied());
     let all: HashSet<ObjectId> = ids.iter().copied().collect();
     let cands = ids.clone();
     let reach: HashMap<ObjectId, usize> = blocking(hub, project, move |src| {
@@ -539,12 +580,14 @@ pub(crate) async fn resolve_newest(hub: &Arc<Hub>, project: i64, id: &ObjectId) 
         Ok(out)
     })
     .await?;
-    ids.sort_by(|a, b| tips.contains(b).cmp(&tips.contains(a)).then(reach[b].cmp(&reach[a])).then(a.cmp(b)));
-    Ok(ids)
+    ids.sort_by(|a, b| reach[b].cmp(&reach[a]).then(a.cmp(b)));
+    push(&mut out, ids);
+    push(&mut out, derived);
+    Ok(out)
 }
 
-/// Most candidates [`resolve_newest`] orders, and how far down each one's
-/// first-parent line it reads.
+/// Most candidates the derived graph does not hold yet [`resolve_newest`]
+/// orders, and how far down each one's first-parent line it reads.
 const NEWEST_CANDIDATES: usize = 64;
 const NEWEST_WALK: usize = 256;
 
@@ -1345,7 +1388,10 @@ pub(crate) async fn push_with(
             known.insert(id, vec![*t]);
             continue;
         }
-        let r = resolve_newest(hub, project.id, &id).await?;
+        let r = match viewer.admin {
+            true => resolve_stored(hub, project.id, &id).await?,
+            false => resolve_newest(hub, project.id, &project.view(viewer).key(), &id).await?,
+        };
         if !r.is_empty() {
             known.insert(id, r);
             continue;

@@ -707,7 +707,7 @@ async fn tip(hub: &Hub, project: i64, branch: &str) -> Result<Option<ObjectId>> 
 /// see it as `base`, else the newest real snapshot that is `base` for
 /// them. Anything else is not found, as for every snapshot they may not
 /// see (a real id of a snapshot they see only part of included).
-async fn resolve_base(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, base: ObjectId, cur: Option<ObjectId>) -> Result<ObjectId> {
+async fn resolve_base(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, base: ObjectId, cur: Option<ObjectId>, landing: bool) -> Result<ObjectId> {
     if base == sync::root_snapshot_id() {
         return Ok(base);
     }
@@ -717,10 +717,25 @@ async fn resolve_base(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, base: 
         }
     }
     // A projection many hidden-only changes share stands for each of them:
-    // the newest by the history, on every server alike (BUG-1314).
-    for r in sync::resolve_newest(hub, project.id, &base).await?.into_iter().take(16) {
+    // the newest by the history, on every server alike (BUG-1314). A
+    // landing lands its edits on the tip, never its parent's hidden files,
+    // and any of them gives the same edits: the server's memory answers.
+    let key = project.view(viewer).key();
+    let candidates = match landing {
+        true => sync::resolve(hub, project.id, &key, &base).await?,
+        false => sync::resolve_newest(hub, project.id, &key, &base).await?,
+    };
+    for r in candidates.into_iter().take(16) {
         if sync::projected(hub, project, viewer, r).await? == base {
             return Ok(r);
+        }
+    }
+    // None of those is it for the caller now: whatever the server knows.
+    if !landing {
+        for r in sync::resolve(hub, project.id, &key, &base).await?.into_iter().take(16) {
+            if sync::projected(hub, project, viewer, r).await? == base {
+                return Ok(r);
+            }
         }
     }
     Err(Error::not_found(format!("no snapshot {} that you can see", base.short())))
@@ -817,7 +832,7 @@ pub(crate) async fn create_with(
         Some(o) => Some(tip(hub, project.id, &o.branch).await?.ok_or_else(|| bad(format!("no branch '{}'", o.branch)))?),
         None => None,
     };
-    let base_real = resolve_base(hub, project, viewer, req.base, cur).await?;
+    let base_real = resolve_base(hub, project, viewer, req.base, cur, land.is_some()).await?;
     // A new revision of one of the caller's own changes, or a new change.
     let (change_id, predecessors) = match req.change_id {
         Some(cid) => {

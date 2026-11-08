@@ -93,3 +93,9 @@ CREATE TABLE IF NOT EXISTS landings (
 CREATE INDEX IF NOT EXISTS landings_at ON landings (project_id, at);
 -- Is a snapshot one the service landed on a branch?
 CREATE INDEX IF NOT EXISTS landings_landed ON landings (project_id, branch, lineage, landed);
+
+-- The real snapshots of one view's projected id (`landing::Ancestry::
+-- below_hidden`: a run of changes hidden from a submitter stepped over in
+-- one statement; `sync::resolve_newest`: a branch tip, or the newest, among
+-- them), by one index range.
+CREATE INDEX IF NOT EXISTS projections_by_view ON projections (project_id, view_key, projected_id);

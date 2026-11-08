@@ -2488,23 +2488,31 @@ for them):
   the tip it was made on as the submitter sees it.
 * Every change lands as a new snapshot on the tip, signed by the server,
   predecessor the submitted one, never the submitted snapshot itself (a
-  merge keeps its other parents). So nothing hidden below or between ever
-  changes an answer: its state, the paths a conflict names (the change's
-  own, all readable by the submitter), and the snapshots it lists (as the
-  submitter sees them) are those of the same changes with nothing hidden
-  there.
-* **A `landings` row means "this change's edits are on the branch, in this
-  lineage"**, true for every viewer (every landing is whole). The line is
-  judged change by change: a change landed already is skipped and the line
-  read on below it (what is below it may not be: a change left out by
-  someone who could not see it); only a snapshot that is on the branch
-  itself (the tip, one the service landed or moved the branch from, or the
-  branch's ancestry) ends it. So whoever sees a change someone else left
-  out brings it with their next landing (BUG-1311).
-* At most 64 changes the submitter sees, counted as the line is read
-  (refused past it); changes they cannot see count toward nothing they are
-  told: the line's reading is bounded by the walk budget below, and past it
-  the answer is `warming`, as for a base still being looked for (BUG-1313).
+  merge keeps its other parents). So changes hidden from the submitter
+  below or between theirs never change an answer: its state, the paths a
+  conflict names (the change's own, all readable by the submitter), and the
+  snapshots it lists (as the submitter sees them) are those of the same
+  changes with nothing hidden there. **What an answer does tell** (BUG-1406,
+  decided: `docs/VISIBILITY.md`): whether a change the submitter sees also
+  touched folders they cannot see, as it is left for someone who sees it
+  whole (it is not in what lands, "nothing to land … or holds edits you
+  cannot see"); never which folders, which paths, how many, or what.
+* **The line is read change by change, as the submitter sees it**
+  (`landing::stack`): a held change on the branch ends it, as soon as it is
+  met; a change whose edits are on the branch already is skipped, and the
+  line read on below it (what is below it may not be: a change left out by
+  someone who could not see it, BUG-1311); a run of changes hidden from
+  the submitter is stepped over in one step (their projection of the first
+  one, and the lowest real snapshot with that projection by the derived
+  graph, one indexed statement), counting toward nothing (BUG-1409).
+* **"Already landed" is read from the history** (BUG-1408): a `landings`
+  row (the change's edits are on the branch, in this lineage, for every
+  viewer) is the fast path; else a snapshot on the branch that is a
+  revision of the change made from it (the derived graph's change ids: a
+  landing names what it landed as its predecessor), however long ago.
+* At most 64 changes the submitter sees land, counted as they are found;
+  at most 4,096 they see are read, then `warming`; changes they cannot see
+  count toward neither.
 
 **"On the branch" is the branch's real ancestry**, with a **lineage guard**
 (BUG-1300): `branches.lineage` is a new value (a sequence) at every
@@ -2517,25 +2525,38 @@ was reset since this change was submitted: submit it again"); the
 service's compare-and-swap is on tip and lineage. Stale rows can never make
 a change count as landed.
 
-**The base lookup is bounded** (BUG-1275, BUG-1302), cheapest first, in one
-`Ancestry` per submit: the tip itself; the line from the submitted snapshot
-reaching the tip (every change above the tip is a descendant of it, so not
-on the branch: a stack made on the tip asks nothing more); `landings` of
-the current lineage (an agent's base is its own last landing, or a tip it
-read; batches record the tip they move from); the derived commit graph
-when it holds the tip (its jump table, bounded by generation), never
-waiting for the deriver; else one walk down from the tip shared by the
-whole stack, at most 4,096 snapshots a submit (`WALK_BUDGET`), whose
-frontier the derived graph then answers for. The line itself is read at
-most as deep (each held change on it diffed once). Past either the submit
-is answered `warming` (503: try again) instead of walking the history. No
-submit reads more than about 8,000 snapshots and a few dozen rows.
+**Is a snapshot on the branch** (`landing::Ancestry`, one per submit),
+cheapest first: the tip itself; `landings` of the current lineage (an
+agent's base is its own last landing, or a tip it read; batches record the
+tip they move from); the derived commit graph when it holds the tip (its
+jump table, bounded by generation), never waiting for the deriver; else a
+walk down from the tip shared by the whole stack: while the line is read,
+at most 256 snapshots (a base a few landings below a tip the deriver has
+not reached yet: BUG-1405), and once it is read, for what was left
+undecided, at most 4,096, whose frontier the derived graph then answers
+for. Past that, `warming` (503: try again).
 
-**Which real snapshot a projected id names** (BUG-1314): several changes
-hidden from a viewer can share one projection. The API's `base`, and a
-push's parents, resolve to a branch tip among them, else the one that
-descends from the others (read down their first-parent lines, at most 256
-each), the snapshot id breaking ties: never by when a memo was stored.
+**What a submit costs at most, whatever the hidden history**: one
+statement for the branch, and for each change the submitter sees on the
+line (at most 4,096): a `landings` lookup, a graph lookup or the shared
+walk (at most 4,096 snapshots a submit in all), their projection and one
+indexed statement for the run below it, the change-id lookup (at most 16
+revisions), and one diff of its own edits. A hidden run costs one step,
+however long, once the deriver holds it; while it does not, the run is
+read and diffed, at most 4,096 changes, then `warming` (the deriver is
+asked to catch up). An agent's landing on its own last one costs the
+branch's row and one `landings` lookup.
+
+**Which real snapshot a projected id names** (BUG-1314, BUG-1407): several
+changes hidden from a viewer can share one projection. The API's `base`
+(an API commit), and a push's parents, resolve, among all of that view's
+real snapshots with that projection, to a branch tip (one statement), else
+the newest by the derived graph (one statement), else, of those the graph
+does not hold yet (at most 64), the one that descends from the others
+(read down their first-parent lines, at most 256 each), the snapshot id
+breaking ties: never by when a memo was stored. A landing of edits uses the
+server's memory of the projection (any of them gives the same edits: a
+landing lands them on the tip).
 
 The snapshots become committed history in the submit's commit (they
 resolve and project like any other). With `wait` (the default) the request
@@ -2655,7 +2676,9 @@ edits; the next change made on it lands the same way.
 cycle-3 redesign): into one `main`, **993 landings/s with 1,000 agents at a
 1,000/s target, p50 79 ms and p99 327 ms**, 1.14 database commits, about 16
 statements and 14 storage writes per landing; **943/s with 10,000 agents,
-p50 270 ms, p99 1.01 s**; 1,208/s at most. No collisions. The object
+p50 270 ms, p99 1.01 s**; 1,208/s at most. No collisions. (Re-measured after the
+redesign's reviews on a machine that was never quiet: the same cost per
+landing, the latencies of a loaded object store; `LOAD.md`.) The object
 store's synced writes are the limit (packs, S28).
 
 **Limits.** When S21 merges, its `prs::state::record_landing` joins the batch's transaction (right after the branch's compare-and-swap) for every move of the default branch, so the review rules in force never lag a landing, and landing onto a protected branch meets S21's review rules by every route (S21's follow-up wires both). Fair share between people and sessions is FIFO here (S24); a

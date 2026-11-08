@@ -393,7 +393,7 @@ CREATE TABLE IF NOT EXISTS embargo_lines (
 );
 ```
 
-**The stack, as built (S17):** a landing lands the changes between the branch and the submitted snapshot that its submitter sees whole, each as its own edits against its first parent, always as a new snapshot; a change hidden from them or seen in part is left for someone who sees it whole (`HUB.md` §13.19). A `landings` row says a change's edits are on the branch, for every viewer; the line is judged change by change, and ends only at a snapshot on the branch (its real ancestry within its current lineage: `landings`, the derived graph, or a walk bounded per submit, past which the answer is `warming`).
+**The stack, as built (S17):** a landing lands the changes between the branch and the submitted snapshot that its submitter sees whole, each as its own edits against its first parent, always as a new snapshot; a change hidden from them or seen in part is left for someone who sees it whole (`HUB.md` §13.19). The line is read change by change as the submitter sees it: it ends at the first held change on the branch (its real ancestry within its current lineage: `landings`, the derived graph, or a walk bounded per submit), a run of changes hidden from the submitter is stepped over by their projection and the derived graph, and a change is landed already when `landings` or the graph's change ids say a revision made from it is on the branch; past the bounds the answer is `warming`.
 
 `branches` gains a `hidden_for_embargo` column so `tips`, `history` and every listing leave out embargo lines for everyone outside their groups (S1 shows branch names to all participants, `HUB.md` §13.8).
 
