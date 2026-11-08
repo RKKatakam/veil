@@ -367,7 +367,7 @@ fn gc_beside_commits_pushes_pulls_and_ws_exec_loses_nothing() {
     for w in ["agent0", "agent1"] {
         env.ok("alice", &alice, &["ws", "exec", w, "--record-only"]);
     }
-    let _ = env.vl("alice", &alice, &["commit", "-m", "mine"]);
+    env.ok("alice", &alice, &["commit", "-m", "mine"]);
     env.ok("alice", &alice, &["push"]);
     env.ok("bob", &bob, &["pull"]);
     for (dir, who) in [(&alice, "alice"), (&bob, "bob")] {
@@ -398,7 +398,7 @@ fn push_and_pull_work_after_gc_on_both_sides() {
         "after gc\n"
     );
     env.commit("bob", &bob, "bob after gc", &[("b.txt", "b\n")]);
-    let _ = env.vl("bob", &bob, &["rebase", "-d", "main"]);
+    env.ok("bob", &bob, &["rebase", "-d", "main"]);
     env.ok("bob", &bob, &["fsck"]);
 }
 
@@ -441,9 +441,9 @@ fn gc_deletes_nothing_when_history_cannot_be_read() {
     );
     let t = text(&out);
     assert!(exited_cleanly(&out), "{t}");
-    if out.status.success() {
-        assert_eq!(count(&t, "deleted"), 0, "{t}");
-    }
+    // gc goes on (the damage is a warning), and deletes nothing.
+    assert!(out.status.success(), "{t}");
+    assert_eq!(count(&t, "deleted"), 0, "{t}");
     assert!(
         contains(&everything_in(&proj), "abandoned experiment 9090"),
         "deleted although history is damaged ({before} files before): {t}"

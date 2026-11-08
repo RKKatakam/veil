@@ -555,7 +555,7 @@ fn assert_fix_still_withheld(alice: &mut Repo) {
     );
     let blocks = remote::embargo_blocks(alice, &[tip]).unwrap();
     let mirror = Arc::new(MemoryBackend::new());
-    let _ = remote::push(alice, mirror.clone(), true, &[], false);
+    remote::push(alice, mirror.clone(), true, &[], false).unwrap();
     let anon = reader(mirror, None);
     let leaked = readable_containing(&anon, b"SIMPADV-EMBARGOED-FIX-7741");
     assert!(

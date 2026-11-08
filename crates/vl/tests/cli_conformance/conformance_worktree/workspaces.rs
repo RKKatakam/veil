@@ -332,9 +332,7 @@ fn a_missing_checkout_record_is_survivable() {
     r.write("wip.txt", "w\n");
     r.ok(&["status"]);
     let rec = r.path(".veil/local/checkout.json");
-    if !rec.exists() {
-        return; // the layout changed; nothing to test
-    }
+    assert!(rec.exists(), "control: the attachment record is {}", rec.display());
     std::fs::remove_file(&rec).unwrap();
     let out = r.run(&["status"]);
     assert!(clean_exit(&out), "{}", text(&out));

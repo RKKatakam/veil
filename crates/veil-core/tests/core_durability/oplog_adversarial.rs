@@ -390,7 +390,7 @@ fn a_concurrent_abandon_of_the_embargoed_merge_never_unwithholds_its_fix() {
     assert!(veil_core::remote::embargo_blocks(&r, &[w2]).unwrap()[0].is_some(), "the follow-up no longer builds on the embargoed merge");
     r.set_tag("later", w2, false).unwrap();
     let mirror = std::sync::Arc::new(veil_core::MemoryBackend::new());
-    let _ = veil_core::remote::push(&mut r, mirror.clone(), true, &[], false);
+    veil_core::remote::push(&mut r, mirror.clone(), true, &[], false).unwrap();
     for n in ["FIX-NAME-Q5", "FIX-BODY-Q5"] {
         assert!(backend_contains(&*mirror, n.as_bytes()).is_empty(), "{n} reached the public remote");
     }
