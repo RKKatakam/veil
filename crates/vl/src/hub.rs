@@ -665,6 +665,18 @@ impl Client {
         }
     }
 
+    /// Submit a landing (`POST …/land`, `docs/HUB.md` §13.19).
+    pub fn land(&self, req: &veil_core::hub::land::LandRequest) -> Result<veil_core::hub::land::LandResult> {
+        self.json("POST", &self.url.project_path("/land"), Some(req))
+    }
+
+    pub fn land_status(&self, ticket: &str, wait: bool) -> Result<veil_core::hub::land::LandResult> {
+        if ticket.is_empty() || !ticket.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            bail!("not a landing ticket: {}", crate::render::safe(ticket));
+        }
+        self.json("GET", &self.url.project_path(&format!("/land/{ticket}?wait={wait}")), None::<&()>)
+    }
+
     /// A commit through the API (`POST …/changes`).
     /// `POST /v1/sessions/agent` (`docs/HUB.md` §13.27).
     pub fn agent_session(&self, req: &veil_core::hub::agent::AgentSessionRequest) -> Result<veil_core::hub::agent::AgentSession> {
@@ -1355,6 +1367,9 @@ impl Uploads<'_> {
 pub struct PushOutcome {
     pub warnings: Vec<String>,
     pub moved: Vec<(String, ObjectId)>,
+    /// Of `moved`: protected branches, where the server's landing service
+    /// landed the pushed changes (`docs/HUB.md` §13.19).
+    pub landed: Vec<String>,
     pub rejected: Vec<(String, String)>,
     pub uploaded: usize,
     pub created: bool,
@@ -1417,63 +1432,15 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             return Ok(PushOutcome {
                 warnings: vec![],
                 moved: vec![],
+                landed: vec![],
                 rejected: withheld,
                 uploaded: 0,
                 created,
             });
         }
-        // What the server has: everything the remote tags reach, as held
-        // (beyond a thin clone's boundary it is the server's anyway).
-        let store = repo.store().clone();
-        let held = repo.held();
-        let mut known: HashSet<ObjectId> = HashSet::new();
-        let mut stack: Vec<ObjectId> = view
-            .remote_tags
-            .iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(_, v)| *v)
-            .collect();
-        stack.push(repo.root_id());
-        while let Some(id) = stack.pop() {
-            if !known.insert(id) {
-                continue;
-            }
-            if let Ok(Some(s)) = held.snapshot(&id) {
-                // Attempts (format 10) go with their version.
-                stack.extend(s.parents.iter().chain(&s.attempts).copied());
-            }
-        }
-        let mut new = Vec::new();
-        let mut stack: Vec<ObjectId> = updates.iter().filter_map(|u| u.new).collect();
-        let mut seen_snaps = HashSet::new();
-        while let Some(id) = stack.pop() {
-            if known.contains(&id) || !seen_snaps.insert(id) {
-                continue;
-            }
-            let s = held.snapshot(&id)?.ok_or(veil_core::VeilError::Missing(id))?;
-            // Its attempts (format 10) go with it.
-            stack.extend(s.parents.iter().chain(&s.attempts).copied());
-            new.push((id, s));
-        }
-        // Upload what the push introduces as the walk finds it, 8 MiB per
-        // request (BUG-858).
-        // A server of revision 2 reads compressed objects.
-        let mut up = Uploads { client, compress: revision >= 2, frames: Vec::new(), ids: Vec::new(), receipts: BTreeMap::new() };
-        let mut walk = Introduced::new(&store, |id, raw| up.add(&id, &raw));
-        for (id, s) in &new {
-            let parents: Vec<ObjectId> = s.parents.iter().filter_map(|p| held.snapshot(p).ok().flatten().map(|ps| ps.tree)).collect();
-            walk.snapshot(*id, s.tree, parents)?;
-        }
-        drop(walk);
-        up.flush()?;
-        let (uploaded, receipts) = (up.receipts.len(), up.receipts);
-        // Key rings (secret scopes) first, so new members can open what lands
-        // (`team` first of them: it names the project the others belong to).
-        for ring in repo.keys().rings()? {
-            if let Err(e) = client.post_ring(&ring) {
-                crate::render::warn(&format!("key ring '{}' not sent: {e:#}", ring.scope));
-            }
-        }
+        let targets: Vec<ObjectId> = updates.iter().filter_map(|u| u.new).collect();
+        let (uploaded, receipts) = upload_new(repo, remote, client, &targets, revision >= 2)?;
+        let pushed: HashMap<String, ObjectId> = updates.iter().filter_map(|u| Some((u.branch.clone(), u.new?))).collect();
         let Some(result) = client.push(&PushRequest { updates, force, receipts })? else {
             if attempt < 5 {
                 std::thread::sleep(Duration::from_millis(50 * attempt));
@@ -1484,6 +1451,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         let mut out = PushOutcome {
             warnings: withdrawn.iter().cloned().chain(result.warnings.iter().cloned()).collect(),
             moved: vec![],
+            landed: vec![],
             rejected: withheld,
             uploaded,
             created,
@@ -1491,6 +1459,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         let mut tx = repo.transaction(format!("push to {remote}"))?;
         tx.repository_wide();
         let mut missing = false;
+        let mut landed = Vec::new();
         for r in result.results {
             match (r.ok, r.tip) {
                 (true, Some(tip)) => {
@@ -1498,6 +1467,12 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                         tx.view.remote_tags.insert(format!("{prefix}{}", r.branch), tip);
                     } else {
                         missing = true;
+                    }
+                    if r.ticket.is_some() {
+                        out.landed.push(r.branch.clone());
+                        if let Some(n) = pushed.get(&r.branch) {
+                            landed.push((r.branch.clone(), *n, tip));
+                        }
                     }
                     out.moved.push((r.branch, tip));
                 }
@@ -1511,8 +1486,125 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         if missing {
             pull(repo, remote, client, None)?;
         }
+        follow_landed(repo, remote, &landed)?;
         return Ok(out);
     }
+}
+
+/// Upload what the snapshots `targets` reach that the server lacks (what
+/// the remote tags of `remote` do not reach), 8 MiB per request (BUG-858),
+/// then the key rings (secret scopes), so new members can open what lands
+/// (`team` first of them: it names the project the others belong to). The
+/// objects sent, and their receipts.
+/// `compress`: a server of revision 2 reads compressed objects.
+fn upload_new(repo: &Repo, remote: &str, client: &Client, targets: &[ObjectId], compress: bool) -> Result<(usize, BTreeMap<ObjectId, String>)> {
+    let prefix = format!("{remote}/");
+    let view = repo.view().clone();
+    // What the server has: everything the remote tags reach, as held
+    // (beyond a thin clone's boundary it is the server's anyway).
+    let store = repo.store().clone();
+    let held = repo.held();
+    let mut known: HashSet<ObjectId> = HashSet::new();
+    let mut stack: Vec<ObjectId> = view
+        .remote_tags
+        .iter()
+        .filter(|(k, _)| k.starts_with(&prefix))
+        .map(|(_, v)| *v)
+        .collect();
+    stack.push(repo.root_id());
+    while let Some(id) = stack.pop() {
+        if !known.insert(id) {
+            continue;
+        }
+        if let Ok(Some(s)) = held.snapshot(&id) {
+            // Attempts (format 10) go with their version.
+            stack.extend(s.parents.iter().chain(&s.attempts).copied());
+        }
+    }
+    let mut new = Vec::new();
+    let mut stack: Vec<ObjectId> = targets.to_vec();
+    let mut seen_snaps = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if known.contains(&id) || !seen_snaps.insert(id) {
+            continue;
+        }
+        let s = held.snapshot(&id)?.ok_or(veil_core::VeilError::Missing(id))?;
+        // Its attempts (format 10) go with it.
+        stack.extend(s.parents.iter().chain(&s.attempts).copied());
+        new.push((id, s));
+    }
+    // Upload what the push introduces as the walk finds it.
+    let mut up = Uploads { client, compress, frames: Vec::new(), ids: Vec::new(), receipts: BTreeMap::new() };
+    let mut walk = Introduced::new(&store, |id, raw| up.add(&id, &raw));
+    for (id, s) in &new {
+        let parents: Vec<ObjectId> = s.parents.iter().filter_map(|p| held.snapshot(p).ok().flatten().map(|ps| ps.tree)).collect();
+        walk.snapshot(*id, s.tree, parents)?;
+    }
+    drop(walk);
+    up.flush()?;
+    for ring in repo.keys().rings()? {
+        if let Err(e) = client.post_ring(&ring) {
+            crate::render::warn(&format!("key ring '{}' not sent: {e:#}", ring.scope));
+        }
+    }
+    Ok((up.receipts.len(), up.receipts))
+}
+
+/// After a landing: a local tag still where the landed change was (`from`,
+/// or below it) follows it to where it landed (`to`, pulled already). The
+/// server may have made the change again on a newer tip.
+fn follow_landed(repo: &mut Repo, remote: &str, landed: &[(String, ObjectId, ObjectId)]) -> Result<()> {
+    if landed.is_empty() {
+        return Ok(());
+    }
+    let mut tx = repo.transaction(format!("landed on {remote}"))?;
+    tx.repository_wide();
+    for (branch, from, to) in landed {
+        if !tx.repo().store().has(to) {
+            continue;
+        }
+        let follow = match tx.view.tags.get(branch) {
+            None => true,
+            Some(t) if t.annotation.is_some() => false,
+            Some(t) => t.target == *from || tx.repo().is_ancestor(&t.target, from)?,
+        };
+        if follow {
+            tx.view.tags.insert(branch.clone(), Tag { target: *to, annotation: None });
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// What `vl land` came to.
+pub struct LandOutcome {
+    pub result: veil_core::hub::land::LandResult,
+    pub uploaded: usize,
+}
+
+/// `vl land`: upload `rev` and the changes under it the server lacks, submit
+/// them to land on `onto`, and (with `wait`) once they landed, pull and move
+/// the local tag `onto` to where they landed when it was at `rev` or below.
+pub fn land(repo: &mut Repo, remote: &str, client: &Client, rev: ObjectId, onto: &str, wait: bool) -> Result<LandOutcome> {
+    if veil_core::remote::embargo_blocks(repo, &[rev])?.into_iter().flatten().next().is_some() {
+        bail!("this change is under an embargo: it lands only at its release");
+    }
+    let revision = client.tips()?.map_or(0, |t| t.revision);
+    let (uploaded, receipts) = upload_new(repo, remote, client, &[rev], revision >= 2)?;
+    let result = client.land(&veil_core::hub::land::LandRequest {
+        onto: onto.to_string(),
+        snapshot: Some(rev),
+        receipts,
+        wait,
+        ..Default::default()
+    })?;
+    if result.state == veil_core::hub::land::LandState::Landed {
+        if let Some(tip) = result.landed.last() {
+            pull(repo, remote, client, None)?;
+            follow_landed(repo, remote, &[(onto.to_string(), rev, *tip)])?;
+        }
+    }
+    Ok(LandOutcome { result, uploaded })
 }
 
 #[cfg(test)]

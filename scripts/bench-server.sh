@@ -8,6 +8,7 @@
 #   scripts/bench-server.sh small       # the same at 100 MB (tiny: a smoke test)
 #   scripts/bench-server.sh openscion   # the four OpenScion workloads, 1k and 10k files, Git beside
 #   scripts/bench-server.sh load        # the server's load curves (docs/design/scale/LOAD.md)
+#   scripts/bench-server.sh landing     # the landing service: one main, 50 to 10,000 agents (S17)
 #   scripts/bench-server.sh cache       # reads through a regional cache and straight from the server (S9)
 #   scripts/bench-server.sh limits      # S24: quiet pulls (the middleware's cost), and quiet projects beside a flooded one
 #   scripts/bench-server.sh 1g -- --runs 5   # extra veil-bench flags
@@ -33,8 +34,8 @@ if [[ "${1:-}" == "--" ]]; then
 fi
 EXTRA=("$@")
 case "$PROFILE" in
-    tiny|small|1g|5g|openscion|load|cache|limits) ;;
-    *) echo "usage: $0 [tiny|small|1g|5g|openscion|load|cache|limits] [-- veil-bench flags]" >&2; exit 2 ;;
+    tiny|small|1g|5g|openscion|load|landing|cache|limits) ;;
+    *) echo "usage: $0 [tiny|small|1g|5g|openscion|load|landing|cache|limits] [-- veil-bench flags]" >&2; exit 2 ;;
 esac
 
 STEP_LIMIT=${STEP_LIMIT:-3600}
@@ -140,6 +141,13 @@ case "$PROFILE" in
         # many agents into one main with the server rebasing.
         run "${L[@]}" --dir "$WORK/api" --mode api --projects 1,10,100 --clients 1 --rates max --out "${OUT%.json}-api.json" "${EXTRA[@]}" || status=$?
         run "${L[@]}" --dir "$WORK/api-hot" --mode api --projects 1 --clients 50 --rates 20,50,100,max --out "${OUT%.json}-api-hot.json" "${EXTRA[@]}" || status=$?
+        ;;
+    landing)
+        # The landing service (docs/HUB.md §13.19): one project's main, open
+        # loop, 50, 1,000 and 10,000 agents (LANDING_CLIENTS, LANDING_RATES).
+        L=("$BENCH" load "${SERVER_ARGS[@]}" --db-container "$PG_ID" --duration "${DURATION:-15}" --mode landing --projects 1)
+        run "${L[@]}" --dir "$WORK/landing" --clients "${LANDING_CLIENTS:-50,1000,10000}" --rates "${LANDING_RATES:-100,1000}" \
+            --out "${OUT%.json}-landing.json" "${EXTRA[@]}" || status=$?
         ;;
     limits)
         # S24 (docs/HUB.md §13.25): up-to-date pulls, whose cost is mostly

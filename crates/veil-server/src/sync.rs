@@ -213,6 +213,9 @@ struct Deferred {
     fresh: HashMap<ObjectId, Option<ObjectId>>,
     /// Memo rows `(view key, real, projected)` for the push's transaction.
     rows: Vec<(String, ObjectId, ObjectId)>,
+    /// Those of them whose real snapshot collapsed into its first parent's
+    /// projection (a change hidden from that view).
+    collapsed: HashSet<ObjectId>,
 }
 
 /// Is `id` committed history of `project` (a `snapshots` row; never deleted,
@@ -353,6 +356,7 @@ async fn projected_inner(
         let pattempts: Vec<ObjectId> = s.attempts.iter().map(|a| done[a]).collect();
         let (proj_text, bindings, viewer2) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
         let hub2 = hub.clone();
+        let first_pp = (s.parents.len() == 1).then(|| pparents.first().copied()).flatten();
         let (result, new_obj) = blocking(hub, project.id, move |src| {
             let policy = AccessPolicy::parse(&proj_text);
             let p = Project {
@@ -369,14 +373,20 @@ async fn projected_inner(
         if let Some(raw) = new_obj {
             hub.objects.put(project.id, &result, raw).await?;
         }
+        // A change hidden from this view: it collapsed into its parent's
+        // projection (`projections.collapsed`, BUG-1468).
+        let collapsed = first_pp == Some(result);
         let result = match deferred.as_deref_mut() {
             Some(d) => {
                 d.rows.push((view_key.clone(), x, result));
+                if collapsed {
+                    d.collapsed.insert(x);
+                }
                 result
             }
             None => {
                 let inserted = sqlx::query(
-                    "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at) VALUES ($1, $2, $3, $4, $5) \
+                    "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) VALUES ($1, $2, $3, $4, $5, $6) \
                      ON CONFLICT DO NOTHING",
                 )
                 .bind(project.id)
@@ -384,6 +394,7 @@ async fn projected_inner(
                 .bind(x.hex())
                 .bind(result.hex())
                 .bind(veil_core::now_millis())
+                .bind(collapsed)
                 .execute(&hub.db)
                 .await?
                 .rows_affected();
@@ -501,6 +512,160 @@ async fn resolve_stored(hub: &Hub, project: i64, id: &ObjectId) -> Result<Vec<Ob
     }
     Ok(rows.iter().filter_map(|r| ObjectId::from_hex(&r.0).ok()).collect())
 }
+
+/// The real snapshot `viewer` means by `id` (a snapshot id they were
+/// given), for a change that will go to `branches` (a push's: the branches
+/// it moves; an API commit's: its `onto`; the default branch is always
+/// last): **one resolution for every route** (BUG-1467, BUG-1520), each
+/// answer checked to project to `id` for them now.
+///
+/// 1. The tip of one of `branches`, in that order, then of the default
+///    branch, that they see as `id`: the change goes there, so it is made
+///    on what is there (even when `id` is itself committed history they see
+///    whole, below a change hidden from them at the tip: BUG-1525).
+/// 2. Committed history named by its own id: itself, if they see it so.
+/// 3. Of their own view's real snapshots with that projection (changes
+///    hidden from them share one; never another view's, never by when a
+///    memo was stored): when they are one line (one of them is no other's
+///    first parent), its newest; when lines diverge (two branches' hidden
+///    work on one change they see), or there are more than
+///    [`NEWEST_BOUND`], the change they all stand on, the one that did not
+///    collapse into its parent's projection (`projections_own`): it carries
+///    no line's hidden work, and the answer never depends on how much
+///    hidden history there is (BUG-1521).
+///    When no one change stands under diverging lines (two changes alike
+///    for them, on two branches): for a landing (`landing`: its edits land
+///    on the tip, and any of them gives the same edits) the lowest id of
+///    their ends; for anything that moves a branch to it, refused (it
+///    would carry one line's hidden work).
+/// 4. A name from before their access changed: their own change's latest
+///    revision (`change_refs`), if it projects to `id`.
+///
+/// `None`: nothing they can see is `id`.
+pub(crate) async fn resolve_for(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    id: &ObjectId,
+    branches: &[&str],
+    landing: bool,
+) -> Result<Option<ObjectId>> {
+    if *id == root_snapshot_id() {
+        return Ok(Some(*id));
+    }
+    let seen = |r: ObjectId| async move { Ok::<bool, Error>(projected(hub, project, viewer, r).await? == *id) };
+    let mut names: Vec<&str> = branches.to_vec();
+    names.push(&project.default_branch);
+    let tips: Vec<(String, String)> = sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 AND name = ANY($2)")
+        .bind(project.id)
+        .bind(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
+        .fetch_all(&hub.db)
+        .await?;
+    for name in &names {
+        if let Some(t) = tips.iter().find(|(n, _)| n == name).and_then(|(_, t)| ObjectId::from_hex(t).ok()) {
+            if seen(t).await? {
+                return Ok(Some(t));
+            }
+        }
+    }
+    // Committed history named by its own id (after the tips: a snapshot
+    // they see whole under a change hidden from them at the tip, BUG-1525).
+    if committed(hub, project.id, id).await? {
+        return Ok(seen(*id).await?.then_some(*id));
+    }
+    let key = project.view(viewer).key();
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT p.real_id, g.parents FROM projections p LEFT JOIN graph g ON g.project_id = p.project_id AND g.snapshot = p.real_id \
+         WHERE p.project_id = $1 AND p.view_key = $2 AND p.projected_id = $3 LIMIT $4",
+    )
+    .bind(project.id)
+    .bind(&key)
+    .bind(id.hex())
+    .bind(NEWEST_BOUND as i64 + 1)
+    .fetch_all(&hub.db)
+    .await?;
+    let own = || async {
+        let own: Vec<String> = sqlx::query_scalar(
+            "SELECT real_id FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed ORDER BY real_id LIMIT 2",
+        )
+        .bind(project.id)
+        .bind(&key)
+        .bind(id.hex())
+        .fetch_all(&hub.db)
+        .await?;
+        Ok::<Option<ObjectId>, Error>(match own.as_slice() {
+            [o] => ObjectId::from_hex(o).ok(),
+            _ => None,
+        })
+    };
+    let pick = if rows.is_empty() {
+        None
+    } else if rows.len() > NEWEST_BOUND {
+        own().await?
+    } else {
+        // Their first parents: the derived graph's, else the objects'.
+        let mut cands: Vec<(ObjectId, Option<ObjectId>)> = Vec::new();
+        let mut unread = Vec::new();
+        for (r, parents) in &rows {
+            let Ok(r) = ObjectId::from_hex(r) else { continue };
+            match parents.as_deref().and_then(|p| serde_json::from_str::<Vec<ObjectId>>(p).ok()) {
+                Some(ps) => cands.push((r, ps.first().copied())),
+                None => unread.push(r),
+            }
+        }
+        let read = blocking(hub, project.id, move |src| {
+            unread.iter().map(|r| Ok((*r, src.snapshot(r)?.parents.first().copied()))).collect::<Result<Vec<_>>>()
+        })
+        .await?;
+        cands.extend(read);
+        let firsts: HashSet<ObjectId> = cands.iter().filter_map(|c| c.1).collect();
+        let mut leaves: Vec<ObjectId> = cands.iter().map(|c| c.0).filter(|c| !firsts.contains(c)).collect();
+        leaves.sort();
+        match leaves.as_slice() {
+            [one] => Some(*one),
+            _ => match own().await? {
+                Some(o) => Some(o),
+                None if landing => leaves.first().copied(),
+                None => {
+                    return Err(Error::conflict(format!(
+                        "snapshot {} stands for changes on different lines as you see them: make the change on a branch's tip, or land it",
+                        id.short()
+                    )))
+                }
+            },
+        }
+    };
+    if let Some(r) = pick {
+        // A memo of their view that no longer projects to it: their view
+        // is changing under them.
+        return match seen(r).await? {
+            true => Ok(Some(r)),
+            false => Err(crate::query::graph::warming()),
+        };
+    }
+    let named = *id;
+    let cid = blocking(hub, project.id, move |src| match src.snapshot(&named) {
+        Ok(s) => Ok(Some(s.change_id.to_string())),
+        Err(VeilError::Missing(_)) => Ok(None),
+        Err(e) => Err(e.into()),
+    })
+    .await?;
+    let Some(cid) = cid else { return Ok(None) };
+    let latest: Option<String> = sqlx::query_scalar("SELECT snapshot FROM change_refs WHERE project_id = $1 AND change_id = $2 AND created_by = $3")
+        .bind(project.id)
+        .bind(&cid)
+        .bind(viewer.person.unwrap_or(0))
+        .fetch_optional(&hub.db)
+        .await?;
+    match latest.and_then(|l| ObjectId::from_hex(&l).ok()) {
+        Some(r) if seen(r).await? => Ok(Some(r)),
+        _ => Ok(None),
+    }
+}
+
+/// Most real snapshots of one view's projected id `resolve_for` orders
+/// as a line; past it, the change they stand on.
+pub const NEWEST_BOUND: usize = 4_096;
 
 /// Branch tips as `viewer` sees them. The branch rows come from this
 /// server's memory for at most `caches::TIPS_TTL`, dropped at every push's
@@ -1546,6 +1711,29 @@ pub(crate) fn complete(
     if !unchanged && !admin {
         return Err(Error::forbidden("only admins may change access lines in .veilpolicy"));
     }
+    // Branch rules (`.veilrules`, S17): only admins change them, on any
+    // branch, so the default branch's are always an admin's; theirs must
+    // parse.
+    let rules_at = |t: &ObjectId| entry_at(src, t, crate::landing::rules::RULES_FILE);
+    let rules = rules_at(&real_tree)?;
+    let mut same_rules = false;
+    for t in &ptrees {
+        if rules_at(t)?.is_some_and(|e| rules.as_ref().is_some_and(|r| r.same_content(&e))) || (rules.is_none() && rules_at(t)?.is_none()) {
+            same_rules = true;
+        }
+    }
+    if !same_rules {
+        if !admin {
+            return Err(Error::forbidden("only admins may change the branch rules (.veilrules)"));
+        }
+        if let Some(e) = &rules {
+            let text = match Object::decode(&src.raw(&e.id)?)? {
+                Object::Blob(b) if e.kind == EntryKind::File => String::from_utf8_lossy(&b).into_owned(),
+                _ => return Err(Error::bad_request(".veilrules must be a plain-text file")),
+            };
+            crate::landing::rules::Rules::parse(&text).map_err(Error::bad_request)?;
+        }
+    }
     let mut real = n.clone();
     real.tree = real_tree;
     real.parents = rp.to_vec();
@@ -1580,7 +1768,25 @@ pub(crate) struct Completed {
 /// origin, projection memo and audit rows: **one database commit per push**
 /// (`storage-and-cost.md` §3). Other viewers' projections are worked out when
 /// they first ask, as before.
-pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i64, req: PushRequest) -> Result<PushResult> {
+pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, who: &crate::landing::Submitter, req: PushRequest) -> Result<PushResult> {
+    Ok(push_with(hub, project, viewer, who, req, false, true).await?.0)
+}
+
+/// [`push`]. An update of a protected branch (every update, with
+/// `land_all`: `POST …/land` of an uploaded snapshot) is not moved here: the
+/// new snapshots it brings join the landing queue, in the push's one
+/// commit, as one stack (`landing`), and with `wait` the push answers once
+/// they landed. Their outcomes come back too.
+pub(crate) async fn push_with(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    who: &crate::landing::Submitter,
+    req: PushRequest,
+    land_all: bool,
+    wait: bool,
+) -> Result<(PushResult, Vec<veil_core::hub::land::LandResult>)> {
+    let person = who.person.id;
     if !project.participant(viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
@@ -1611,16 +1817,21 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     if viewer.agent && req.updates.iter().any(|u| u.branch == project.default_branch && u.new.is_some() && !current.contains_key(&u.branch)) {
         return Err(agent_refusal(AGENT_DEFAULT_BRANCH));
     }
-    // Only the branches this push moves, and the default branch, are
-    // candidates; a branch this push moves wins over the default branch
-    // (both may look the same to the pusher).
-    let mut tip_projection: HashMap<ObjectId, ObjectId> = HashMap::new();
-    let candidates = std::iter::once(&project.default_branch).chain(req.updates.iter().map(|u| &u.branch));
-    for name in candidates {
-        if let Some(t) = current.get(name) {
-            tip_projection.insert(projected(hub, project, viewer, *t).await?, *t);
-        }
-    }
+    // Branches only the landing service moves (S17).
+    let protected = {
+        let default_tip = current.get(&project.default_branch).copied();
+        blocking(hub, project.id, move |src| crate::landing::protected(src, default_tip)).await?
+    };
+    // The branches this push moves come first, then the default branch
+    // (`resolve_for`: one resolution for a push and an API commit).
+    let moved_names: Vec<&str> = req.updates.iter().map(|u| u.branch.as_str()).collect();
+    // Every update lands through the landing service (its edits on the tip),
+    // none moves a branch here.
+    let lands_only = !req.force && req.updates.iter().all(|u| land_all || protected.contains(&u.branch));
+    // What this pusher uploaded (BUG-824): only that may be new here; any
+    // other name is "not uploaded", whether or not the server holds a
+    // snapshot by it they cannot see (BUG-1523).
+    let uploaded = Arc::new(receipted(hub, project.id, person, &req.receipts));
     // 1. The new snapshots: everything the new tips reach that the server
     //    does not hold as history or as a projection.
     let mut known: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
@@ -1631,14 +1842,13 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         if known.contains_key(&id) || parents_of.contains_key(&id) {
             continue;
         }
-        if let Some(t) = tip_projection.get(&id) {
-            known.insert(id, vec![*t]);
+        // Grafted only on what its pusher saw (BUG-1467, BUG-1520).
+        if let Some(r) = resolve_for(hub, project, viewer, &id, &moved_names, lands_only).await? {
+            known.insert(id, vec![r]);
             continue;
         }
-        let r = resolve_stored(hub, project.id, &id).await?;
-        if !r.is_empty() {
-            known.insert(id, r);
-            continue;
+        if !uploaded.contains(&id) {
+            return Err(Error::bad_request(format!("snapshot {} was not uploaded", id.short())));
         }
         let s = blocking(hub, project.id, move |src| match src.snapshot(&id) {
             Err(VeilError::Missing(_)) => Err(Error::bad_request(format!("snapshot {} was not uploaded", id.short()))),
@@ -1681,8 +1891,8 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         k.dedup();
         k
     };
-    let signers: HashSet<String> =
-        sqlx::query_scalar::<_, String>("SELECT signing_key FROM devices WHERE signing_key = ANY($1) AND removed_at IS NULL AND NOT pending")
+    let signers: HashMap<String, i64> =
+        sqlx::query_as::<_, (String, i64)>("SELECT signing_key, person_id FROM devices WHERE signing_key = ANY($1) AND removed_at IS NULL AND NOT pending")
             .bind(&keys)
             .fetch_all(&hub.db)
             .await?
@@ -1691,16 +1901,15 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     let mut real_of: HashMap<ObjectId, ObjectId> = HashMap::new();
     real_of.insert(root, root);
     for (id, reals) in &known {
-        let r = tip_projection.get(id).copied().unwrap_or(reals[0]);
+        let r = reals[0];
         real_of.insert(*id, r);
     }
-    // What this pusher uploaded (BUG-824): a push names nothing else that
-    // is not already where it was in a parent.
-    let uploaded = Arc::new(receipted(hub, project.id, person, &req.receipts));
-    // 2. Complete and check each new snapshot.
+    // 2. Complete and check each new snapshot (`uploaded`: a push names
+    // nothing else that is not already where it was in a parent, BUG-824).
     let mut completed: Vec<Completed> = Vec::new();
-    // Each new real snapshot's real parents.
-    let mut real_parents_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+    // Each new real snapshot's real parents and signer (`people.id`).
+    let mut real_parents_of: HashMap<ObjectId, (Vec<ObjectId>, i64)> = HashMap::new();
+    let mut real_attempts_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
     for id in &order {
         let n = parents_of[id].clone();
         if n.embargo.is_some() {
@@ -1708,16 +1917,18 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                 "embargoed merges cannot be pushed to the server yet (docs/HUB.md §11)",
             ));
         }
-        match &n.signature {
-            Some(sig) if n.signature_valid() == Some(true) && signers.contains(&sig.key) => {}
-            Some(_) if n.signature_valid() == Some(true) => {
-                return Err(Error::forbidden(format!(
-                    "snapshot {} is signed by a key no device here is registered with",
-                    id.short()
-                )))
-            }
+        let author = match &n.signature {
+            Some(sig) if n.signature_valid() == Some(true) => match signers.get(&sig.key) {
+                Some(&p) => p,
+                None => {
+                    return Err(Error::forbidden(format!(
+                        "snapshot {} is signed by a key no device here is registered with",
+                        id.short()
+                    )))
+                }
+            },
             _ => return Err(Error::forbidden(format!("snapshot {} is unsigned or its signature is invalid", id.short()))),
-        }
+        };
         if n.parents.is_empty() {
             return Err(Error::bad_request("a snapshot without parents (only the root has none)"));
         }
@@ -1749,12 +1960,16 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             hub.objects.put(project.id, &c.real, raw.clone()).await?;
         }
         real_of.insert(*id, c.real);
-        // What its landing records: its parents and its attempts.
-        real_parents_of.insert(c.real, real_parents.into_iter().chain(real_attempts).collect());
+        // What its landing records: its parents and author (S17, BUG-1581);
+        // its attempts (S11) are recorded with it, but are no branch's
+        // history: kept apart, so that no attempt counts as landed.
+        real_parents_of.insert(c.real, (real_parents, author));
+        real_attempts_of.insert(c.real, real_attempts);
         completed.push(c);
     }
     // 3. Move the branches: one serialisable transaction of compare-and-swaps.
     let mut plans = Vec::new();
+    let mut queued: Vec<crate::landing::Queued> = Vec::new();
     let mut results = Vec::new();
     // New branches, against the branches when the push began (concurrent
     // pushes may each add up to the bound).
@@ -1767,6 +1982,64 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             return Err(Error::bad_request(format!("invalid branch name {:?}", u.branch)));
         }
         let cur = current.get(&u.branch).copied();
+        // Landed by the landing service instead of moved here: the new
+        // changes on top of whatever base they have (they need not be on
+        // the tip), as one stack.
+        if !req.force && (land_all || protected.contains(&u.branch)) && (cur.is_some() || land_all) {
+            let Some(n) = u.new else {
+                return Err(Error::forbidden(format!("'{}' is protected: only an admin's forced push deletes it", u.branch)));
+            };
+            let new_real = *real_of.get(&n).ok_or_else(|| Error::bad_request("unknown new tip"))?;
+            let refuse = |m: &str| BranchResult {
+                branch: u.branch.clone(),
+                ok: false,
+                message: Some(m.to_string()),
+                tip: None,
+                ticket: None,
+            };
+            if cur.is_none() {
+                results.push(refuse(&format!("there is no branch '{}' to land on", u.branch)));
+                continue;
+            }
+            if Some(new_real) == cur {
+                results.push(BranchResult { tip: Some(projected(hub, project, viewer, new_real).await?), ok: true, message: None, ..refuse("") });
+                continue;
+            }
+            // Every change between the branch's tip and the pushed one: what
+            // this push brought, and what the server already held (BUG-1103).
+            let judged = match crate::landing::stack(hub, project, viewer, &u.branch, new_real, &real_parents_of).await? {
+                Ok(s) if !s.branch => {
+                    results.push(refuse(&format!("there is no branch '{}' to land on", u.branch)));
+                    continue;
+                }
+                Ok(s) => s,
+                Err(why) => {
+                    results.push(refuse(&why));
+                    continue;
+                }
+            };
+            if judged.stack.is_empty() {
+                let mut msg = crate::landing::NOTHING_TO_LAND.to_string();
+                let skipped = crate::landing::skipped_warnings(hub, project.id, &u.branch, &judged.skipped).await?;
+                if !skipped.is_empty() {
+                    msg = format!("{msg}; {}", skipped.join("; "));
+                }
+                results.push(refuse(&msg));
+                continue;
+            }
+            if judged.stack.iter().any(|e| parents_of.iter().any(|(pid, n)| real_of.get(pid) == Some(&e.id) && !n.conflicts.is_empty())) {
+                results.push(refuse("a change with unresolved conflicts never lands: resolve them first"));
+                continue;
+            }
+            queued.push(crate::landing::Queued {
+                ticket: crate::landing::ticket(),
+                branch: u.branch.clone(),
+                stack: judged.stack,
+                lineage: judged.lineage,
+                skipped: Arc::new(std::sync::Mutex::new(judged.skipped)),
+            });
+            continue;
+        }
         let cur_seen = match cur {
             Some(c) => Some(projected(hub, project, viewer, c).await?),
             None => None,
@@ -1777,6 +2050,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                 ok: false,
                 message: Some("the branch has moved since you last pulled; pull, then push again".into()),
                 tip: cur_seen,
+                ticket: None,
             });
             continue;
         }
@@ -1822,6 +2096,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                     ok: false,
                     message: Some("not a fast-forward; pull and merge, then push again".into()),
                     tip: cur_seen,
+                    ticket: None,
                 });
                 continue;
             }
@@ -1843,6 +2118,19 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                 } else if text != project.policy_text {
                     policy_text_update = Some(text);
                 }
+                // The branch rules likewise: against the tip, never a
+                // parent's (BUG-1102).
+                let changed = blocking(hub, project.id, move |src| {
+                    let t = match cur {
+                        Some(c) => Some(src.snapshot(&c)?.tree),
+                        None => None,
+                    };
+                    crate::landing::rules_changed(src, &src.snapshot(&n)?.tree, t.as_ref())
+                })
+                .await?;
+                if changed && !viewer.admin {
+                    return Err(Error::forbidden("only admins may change the branch rules (.veilrules)"));
+                }
             }
         }
         plans.push((u.branch.clone(), cur, new_real, accept, policy_text_update));
@@ -1852,11 +2140,15 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     let mut deferred = Deferred {
         fresh: completed.iter().map(|c| (c.real, c.origin)).collect(),
         rows: Vec::new(),
+        collapsed: HashSet::new(),
     };
     for (_, _, new, _, _) in &plans {
         if let Some(n) = new {
             Box::pin(projected_inner(hub, project, viewer, *n, Some(&mut deferred))).await?;
         }
+    }
+    for q in &queued {
+        Box::pin(projected_inner(hub, project, viewer, q.stack.last().expect("a stack is never empty").id, Some(&mut deferred))).await?;
     }
     // Only the snapshots this push made (known ones are recorded already:
     // rewriting their rows made every racing pusher write the same row),
@@ -1864,52 +2156,104 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     // update's snapshots are no branch's history (BUG-914).
     let landing: HashSet<ObjectId> = {
         let mut seen = HashSet::new();
-        let mut stack: Vec<ObjectId> = plans.iter().filter_map(|p| p.2).collect();
+        let mut stack: Vec<ObjectId> = plans.iter().filter_map(|p| p.2).chain(queued.iter().filter_map(|q| q.stack.last().map(|e| e.id))).collect();
         while let Some(x) = stack.pop() {
-            if let Some(ps) = real_parents_of.get(&x) {
+            if let Some((ps, _)) = real_parents_of.get(&x) {
                 if seen.insert(x) {
-                    stack.extend(ps.iter().copied());
+                    stack.extend(ps.iter().chain(real_attempts_of.get(&x).into_iter().flatten()).copied());
                 }
             }
         }
         seen
     };
     completed.retain(|c| landing.contains(&c.real));
-    let new_reals: Vec<String> = completed.iter().map(|c| c.real.hex()).collect();
+    let new_reals: Vec<(String, i64)> = completed
+        .iter()
+        .map(|c| (c.real.hex(), real_parents_of.get(&c.real).map_or(0, |(_, a)| *a)))
+        .collect();
     let origins: Vec<(String, String)> = completed.iter().filter_map(|c| c.origin.map(|o| (c.real.hex(), o.hex()))).collect();
-    let memos: Vec<(String, String, String)> = deferred.rows.iter().map(|(k, r, p)| (k.clone(), r.hex(), p.hex())).collect();
+    let memos: Vec<(String, String, String, bool)> =
+        deferred.rows.iter().map(|(k, r, p)| (k.clone(), r.hex(), p.hex(), deferred.collapsed.contains(r))).collect();
+    // The changes each moved branch now holds that this push brought, by
+    // change id and author (`landed_changes`, BUG-1522, BUG-1527).
+    let change_of: HashMap<ObjectId, String> =
+        real_of.iter().filter_map(|(pushed, real)| parents_of.get(pushed).map(|s| (*real, s.change_id.to_string()))).collect();
+    let plan_changes: HashMap<_, _> = plans
+        .iter()
+        .filter_map(|(branch, _, new, _, _)| new.map(|n| (branch.clone(), n)))
+        .map(|(branch, n)| {
+            let (mut cs, mut aus, mut ls) = (Vec::new(), Vec::new(), Vec::new());
+            let mut seen = HashSet::new();
+            let mut stack = vec![n];
+            while let Some(x) = stack.pop() {
+                if let (Some((ps, author)), true) = (real_parents_of.get(&x), seen.insert(x)) {
+                    if let Some(cid) = change_of.get(&x) {
+                        cs.push(cid.clone());
+                        aus.push(*author);
+                        ls.push(x.hex());
+                    }
+                    stack.extend(ps.iter().copied());
+                }
+            }
+            (branch, (cs, aus, ls))
+        })
+        .collect();
     let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let pid = project.id;
     let plans2 = plans.clone();
+    let force = req.force;
+    let (queued2, who2) = (queued.clone(), who.clone());
+    // Whoever lands here hears at once (registered before the commit).
+    let waiters: Vec<crate::landing::Waiter> = queued.iter().map(|q| hub.landing.register(&q.ticket)).collect();
     // Nothing to move (every update refused: the pusher pulls and tries
     // again): no commit, and nothing recorded as history no branch reaches.
-    let (moved, memo_stored) = if plans.is_empty() {
+    let (moved, memo_stored) = if plans.is_empty() && queued.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+        let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let plans = plans2.clone();
+        let plan_changes = plan_changes.clone();
         let new_reals = new_reals.clone();
         let origins = origins.clone();
         let memos = memos.clone();
+        let (queued, who) = (queued2.clone(), who2.clone());
         Box::pin(async move {
+            for q in &queued {
+                crate::landing::insert(&mut *c, pid, &who, q).await?;
+            }
             let mut moved = Vec::new();
+            let mut lineages: Vec<(String, i64)> = Vec::new();
             for (branch, cur, new, accept, policy_text_update) in plans {
                 let rows = match (cur, new) {
-                    (Some(c0), Some(n)) => sqlx::query("UPDATE branches SET target = $1 WHERE project_id = $2 AND name = $3 AND target = $4")
+                    // A forced update starts a new lineage (BUG-1300): what the
+                    // landing service recorded of the branch no longer counts.
+                    (Some(c0), Some(n)) => sqlx::query_scalar::<_, i64>(
+                        "UPDATE branches SET target = $1, lineage = CASE WHEN $5 THEN nextval('branch_lineages') ELSE lineage END \
+                         WHERE project_id = $2 AND name = $3 AND target = $4 RETURNING lineage",
+                    )
                         .bind(n.hex())
                         .bind(pid)
                         .bind(&branch)
                         .bind(c0.hex())
-                        .execute(&mut *c)
+                        .bind(force)
+                        .fetch_optional(&mut *c)
                         .await?
-                        .rows_affected(),
-                    (None, Some(n)) => sqlx::query("INSERT INTO branches (project_id, name, target) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+                        .map_or(0, |lineage| {
+                            lineages.push((branch.clone(), lineage));
+                            1
+                        }),
+                    (None, Some(n)) => sqlx::query_scalar::<_, i64>(
+                        "INSERT INTO branches (project_id, name, target) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING lineage",
+                    )
                         .bind(pid)
                         .bind(&branch)
                         .bind(n.hex())
-                        .execute(&mut *c)
+                        .fetch_optional(&mut *c)
                         .await?
-                        .rows_affected(),
+                        .map_or(0, |lineage| {
+                            lineages.push((branch.clone(), lineage));
+                            1
+                        }),
                     (Some(c0), None) => sqlx::query("DELETE FROM branches WHERE project_id = $1 AND name = $2 AND target = $3")
                         .bind(pid)
                         .bind(&branch)
@@ -1936,10 +2280,18 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                 }
                 moved.push(branch);
             }
-            for r in &new_reals {
-                sqlx::query("INSERT INTO snapshots (project_id, id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+            for (branch, lineage) in &lineages {
+                if let Some((cs, aus, ls)) = plan_changes.get(branch) {
+                    if !cs.is_empty() {
+                        crate::landing::record_changes(&mut *c, pid, branch, *lineage, cs, aus, ls).await?;
+                    }
+                }
+            }
+            for (r, author) in &new_reals {
+                sqlx::query("INSERT INTO snapshots (project_id, id, author) VALUES ($1, $2, $3) ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0")
                     .bind(pid)
                     .bind(r)
+                    .bind(*author)
                     .execute(&mut *c)
                     .await?;
             }
@@ -1954,9 +2306,9 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             // A row stored first by another request wins (and is not cached
             // here from this push's answer).
             let mut memo_stored = Vec::new();
-            for (view_key, real, projected) in &memos {
+            for (view_key, real, projected, collapsed) in &memos {
                 let n = sqlx::query(
-                    "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at) VALUES ($1, $2, $3, $4, $5) \
+                    "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) VALUES ($1, $2, $3, $4, $5, $6) \
                      ON CONFLICT DO NOTHING",
                 )
                 .bind(pid)
@@ -1964,6 +2316,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                 .bind(real)
                 .bind(projected)
                 .bind(veil_core::now_millis())
+                .bind(collapsed)
                 .execute(&mut *c)
                 .await?
                 .rows_affected();
@@ -1987,8 +2340,37 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             Ok((moved, memo_stored))
         })
     })
-    .await?
+    .await;
+        match r {
+            Ok(r) => r,
+            Err(e) => {
+                for w in waiters {
+                    crate::landing::abandon(hub, w);
+                }
+                return Err(e);
+            }
+        }
     };
+    // The landings: their services wake, and with `wait` the push answers
+    // once they are decided.
+    let deadline = tokio::time::Instant::now() + crate::landing::WAIT;
+    let mut landings = Vec::new();
+    for (q, w) in queued.iter().zip(waiters) {
+        crate::landing::ensure(hub, project.id, &q.branch);
+        let mut r = match wait {
+            true => {
+                let r = crate::landing::wait(hub, project.id, person, &q.branch, w, deadline).await?;
+                crate::landing::seen(hub, project, viewer, r).await?
+            }
+            false => {
+                crate::landing::abandon(hub, w);
+                crate::landing::queued(&q.ticket)
+            }
+        };
+        let skipped = q.skipped.lock().unwrap().clone();
+        r.warnings.extend(crate::landing::skipped_warnings(hub, project.id, &q.branch, &skipped).await?);
+        landings.push(r);
+    }
     if !moved.is_empty() {
         hub.caches.tips_changed(project.id);
         for c in &completed {
@@ -2024,9 +2406,30 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             Some(n) => Some(projected(hub, project, viewer, n).await?),
             None => None,
         };
-        results.push(BranchResult { branch, ok: true, message: None, tip });
+        results.push(BranchResult { branch, ok: true, message: None, tip, ticket: None });
     }
-    Ok(PushResult { results, warnings })
+    let mut warnings = warnings;
+    for (q, l) in queued.iter().zip(&landings) {
+        use veil_core::hub::land::LandState;
+        warnings.extend(l.warnings.iter().cloned());
+        results.push(BranchResult {
+            branch: q.branch.clone(),
+            ok: l.state == LandState::Landed,
+            message: match l.state {
+                LandState::Landed => None,
+                LandState::Queued => Some(format!("queued to land as {} (`vl land --status {}`)", l.ticket, l.ticket)),
+                LandState::Conflict => Some(format!(
+                    "conflict: {} changed on '{}' since your change's base; pull, redo it there, and push again",
+                    l.paths.join(", "),
+                    q.branch
+                )),
+                LandState::Rejected => Some(l.message.clone().unwrap_or_default()),
+            },
+            tip: l.landed.last().copied(),
+            ticket: Some(q.ticket.clone()),
+        });
+    }
+    Ok((PushResult { results, warnings }, landings))
 }
 
 /// Is `a` an ancestor of (or equal to) `b` in the real history?

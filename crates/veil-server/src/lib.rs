@@ -12,6 +12,7 @@
 //! | [`changes`] | commits through the API: edits on a revision, the push's checks, one commit |
 //! | [`grant`] | read grants, the object routes, the access-epoch feed |
 //! | [`cache`] | the regional cache (`veil-server cache`, S9), and the epoch feed it polls |
+//! | [`landing`] | the landing service: the queue, leases, batches, the fast path, protected branches (S17) |
 //! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
 //! | [`query`] | the query API: history answered per viewer (S13) |
 //! | [`limits`] | rate limits, request bodies under a budget, per-project bulkheads, shedding, health metrics (S24) |
@@ -28,6 +29,7 @@ pub mod db;
 pub mod derive;
 pub mod error;
 pub mod grant;
+pub mod landing;
 pub mod limits;
 pub mod perm;
 pub mod query;
@@ -80,6 +82,8 @@ pub struct Hub {
     /// The query API's caches and the viewer-graph fills running here
     /// (`query::graph`).
     pub query: query::graph::State,
+    /// The landing services running here, and the submitters waiting here.
+    pub landing: landing::Services,
     /// Rate limits, the request budget, bulkheads and health (S24).
     pub limits: limits::Limits,
 }
@@ -112,8 +116,10 @@ pub struct Config {
     /// `derive::DERIVE_CONNECTIONS` more.
     pub db_connections: u32,
     /// Derive, in the background once serving, every branch a landing left
-    /// underived (`derive::resume`). Servers do; tests that count
-    /// their own derive runs turn it off.
+    /// underived (`derive::resume`), and start the landing services of
+    /// every branch with queued landings (`landing::resume`). Servers do;
+    /// tests that count their own derive runs, or share a database between
+    /// servers with separate object stores, turn it off.
     pub catch_up_at_start: bool,
     /// Rate limits, connections and the request budget (S24).
     pub limits: limits::Settings,
@@ -201,6 +207,7 @@ pub async fn start(config: Config) -> Result<Running> {
         caches: caches::Caches::default(),
         derive: derive::Workers::new(derive_db),
         query: query::graph::State::default(),
+        landing: landing::Services::default(),
         limits: limits::Limits::new(config.limits, config.db_connections),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -221,6 +228,8 @@ pub async fn start(config: Config) -> Result<Running> {
                 crate::search::index::resume(hub, None).await;
             }
         });
+        // Landings queued when a server stopped are landed.
+        tokio::spawn(landing::resume(hub.clone()));
     }
     Ok(Running {
         addr,

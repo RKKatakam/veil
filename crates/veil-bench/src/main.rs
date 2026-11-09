@@ -8,7 +8,7 @@
 //! veil-bench report RESULTS.json
 //! veil-bench openscion --vl PATH --server PATH --database-url URL [--s3-…] --dir DIR --out RESULTS.json
 //! veil-bench openscion-memory --out RESULTS.json
-//! veil-bench load --mode pull|land|branches|api|objects [--via server,cache] (--server PATH --database-url URL | --url URL [--ca PEM])
+//! veil-bench load --mode pull|land|branches|api|landing|objects [--via server,cache] (--server PATH --database-url URL | --url URL [--ca PEM])
 //!                 --projects 1,10 --clients 10,100 [--rates 0.35,3.5,max] --out RESULTS.json
 //! ```
 //!
@@ -122,8 +122,10 @@ enum Cmd {
         /// `pull` (agents pull in a closed loop), `land` (agents land
         /// changes on `main` by pull and push), `branches` (each on a
         /// branch of its own), `api` (agents land them through
-        /// `POST …/changes`, letting the server rebase) or `objects`
-        /// (agents read as fresh thin workspaces through the object routes).
+        /// `POST …/changes`, letting the server rebase), `landing`
+        /// (through the landing service, `POST …/land`: batched, on the
+        /// base each agent last saw) or `objects` (agents read as fresh
+        /// thin workspaces through the object routes).
         #[arg(long)]
         mode: String,
         /// A running server (`https://host:port`); else `--server` starts one here.
@@ -334,8 +336,9 @@ fn main() -> Result<()> {
                 "land" => load::Mode::Land,
                 "branches" => load::Mode::Branches,
                 "api" => load::Mode::Api,
+                "landing" => load::Mode::Landing,
                 "objects" => load::Mode::Objects,
-                m => return Err(anyhow!("--mode {m}: pull, land, branches, api or objects")),
+                m => return Err(anyhow!("--mode {m}: pull, land, branches, api, landing or objects")),
             };
             let vias = via
                 .iter()

@@ -2,7 +2,7 @@
 
 > **Owner decisions (2026-11-06):** every recommended default in the README's product-decision list is approved. **Embargoes are permission-based, not encrypted:** an embargoed change is plain text behind the server's checks, and **the server flips it public at the deadline.** The time-lock and release-machine designs below are not needed; the embargo release service becomes a scheduled server job. The hidden embargo line (decision 8) stays.
 
-> **Status: design, not built** (2026-11-06). Base: `integration` @ `3851159`.
+> **Status: design** (2026-11-06). Base: `integration` @ `3851159`. **S17, the landing service, is built** (2026-11-07, `docs/HUB.md` §13.19): the queue, submit checks, lease and fencing, batches, the fast path, pipelining, the landing check, protected branches (`.veilrules`), `vl land` and `vl push` to a protected branch. Its measurements are in `docs/design/scale/LOAD.md` ("The landing service"). As built, the edit set is not stored (it is read from the objects), and protection is opt-in (decision 9 not applied yet).
 > Sources of truth: `docs/OVERVIEW.md` and `docs/VISIBILITY.md` (including "Who can see a PR"); where this document disagrees with them, they win. The server as built is `docs/HUB.md` §13. PRs are `HUB.md` §7, embargoes §8, the web client §10. The roadmap is `docs/design/scion-for-developers.md`, phase 4 (items 5.1–5.8, 6.1–6.7). The measured limits are `docs/design/scale/LOAD.md`.
 
 ## 1. Goal
@@ -331,13 +331,28 @@ CREATE TABLE IF NOT EXISTS landing_leases (
     expires_at BIGINT NOT NULL,
     PRIMARY KEY (project_id, branch)
 );
-CREATE TABLE IF NOT EXISTS landings (
+CREATE TABLE IF NOT EXISTS landings (     -- as built (S17, HUB.md §13.19)
     project_id BIGINT NOT NULL,
-    landed TEXT NOT NULL,                  -- the snapshot on main
-    submitted TEXT NOT NULL,
-    batch BIGINT NOT NULL,
-    PRIMARY KEY (project_id, landed)
+    branch TEXT NOT NULL,
+    lineage BIGINT NOT NULL,               -- the branch's lineage when it landed
+    submitted TEXT NOT NULL,               -- a stack change: its edits are on the branch
+    landed TEXT NOT NULL,                  -- the snapshot it landed as (a tip a batch
+                                           -- moved from: itself), on the branch
+    at BIGINT NOT NULL,                    -- deleted after an hour
+    PRIMARY KEY (project_id, branch, lineage, submitted)
 );
+-- branches.lineage: a new value (a sequence) at every creation, forced
+-- update and deletion; landing_queue.lineage: the one a stack was judged
+-- under (it lands only under that one).
+CREATE TABLE IF NOT EXISTS landed_from (  -- as built: what each landing was made from
+    project_id BIGINT NOT NULL,
+    source TEXT NOT NULL,                  -- the submitted snapshot
+    landed TEXT NOT NULL,                  -- the snapshot landed from it; kept as `snapshots`
+    PRIMARY KEY (project_id, source, landed)
+);
+-- projections.collapsed: the memo's snapshot collapsed into its parent's
+-- projection (hidden from that view); `projections_own`, a partial index of
+-- the others, steps over a hidden run in one row.
 CREATE TABLE IF NOT EXISTS checks (
     project_id BIGINT NOT NULL,
     snapshot TEXT NOT NULL,
@@ -386,6 +401,8 @@ CREATE TABLE IF NOT EXISTS embargo_lines (
     PRIMARY KEY (project_id, embargo_id)
 );
 ```
+
+**The stack, as built (S17):** a landing lands the changes between the branch and the submitted snapshot that its submitter sees whole, each as its own edits against its first parent, always as a new snapshot; a change hidden from them or seen in part is left for someone who sees it whole (`HUB.md` §13.19). The line is read change by change as the submitter sees it: it ends at the first held change on the branch (its real ancestry within its current lineage: `landings`, the derived graph, or a walk bounded per submit), a run of changes hidden from the submitter is stepped over by their projection and the derived graph, and a change is landed already when `landings` or the graph's change ids say a revision made from it is on the branch; past the bounds the answer is `warming`.
 
 `branches` gains a `hidden_for_embargo` column so `tips`, `history` and every listing leave out embargo lines for everyone outside their groups (S1 shows branch names to all participants, `HUB.md` §13.8).
 

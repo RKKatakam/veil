@@ -249,6 +249,52 @@ pushes work as in a full clone, and a large project clones in seconds.
   and the message names the file, the rule and the line, never the secret.
   Only an admin's `public!` line (test data) turns this off for a folder.
 
+## Landing changes, and protected branches
+
+On a busy branch, many people and agents land at once. `vl land` hands a
+change to the server's **landing service**, which puts it on the newest tip
+for you:
+
+```sh
+vl commit -m "Fix the parser"
+vl land                       # @- onto the default branch; waits for the outcome
+vl land xoruqyku --onto release   # another change (by its id), another branch
+vl land --no-wait             # prints a ticket at once
+vl land --status land-4f2a…   # its outcome later
+```
+
+- **You need not pull first.** The change lands on the branch's newest tip
+  if no path it edits changed there since the snapshot you made it on. The
+  check is exact, path by path: whatever else moved does not matter.
+- **Each change keeps its own snapshot**, one after another, but the server
+  moves the branch once for many changes landing together.
+- **Outcomes:** `landed` (your local tag follows the change to where it
+  landed), `conflict` (it names the paths that changed meanwhile: pull,
+  redo the change on the new tip and land again), or `rejected` (a check
+  refused it; the message says which).
+- **The same checks as a push**, when you submit, and again when it lands
+  if your access changed meanwhile: someone removed from a group, or an
+  access change landed first, is refused at that point.
+- A change that edits `.veilpolicy` or `.veilrules` lands alone, and the
+  changes after it are checked against the new rules.
+
+**Protected branches** move only through the landing service. An admin
+protects one in a `.veilrules` file at the project root:
+
+```toml
+[branches.main]
+protected = true
+```
+
+- `vl push` to a protected branch **lands your new changes instead**: a
+  one-person project notices nothing, and a team never races to push.
+- A commit through the API with `--onto` a protected branch is kept but
+  does not move it: land it instead.
+- Only admins change `.veilrules`, on any branch. An admin's
+  `vl push --force` still moves a protected branch (it is recorded).
+- Over HTTPS: `POST /v1/projects/{project}/land` and
+  `GET /v1/projects/{project}/land/{ticket}` ([HUB.md §13.19](../HUB.md)).
+
 ## Committing without a checkout
 
 Scripts, CI jobs and agents can make a change with no clone at all: send
