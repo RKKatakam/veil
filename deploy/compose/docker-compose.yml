@@ -1,0 +1,147 @@
+# The local rehearsal of Veil's deployment (docs/DEPLOY.md): the same
+# veil-server and veil-bench images as the DigitalOcean test, with
+# PostgreSQL 17 and MinIO standing in for the database droplet and Spaces.
+#
+#   deploy/compose/rehearsal.sh          # build, bring up, run the short gates, tear down
+#
+# Variables (deploy/compose/rehearsal.sh sets them; see .env.example):
+#   TAG           the image tag (deploy/docker/build.sh prints it)
+#   DB_PASSWORD   PostgreSQL password (rehearsal only)
+#   S3_KEY, S3_SECRET   MinIO root credentials (rehearsal only)
+#   HUB_PORT      host port for the server (default 18443), CACHE_PORT (18444)
+#   TLS_DIR       the directory deploy/tls/mkcert.sh wrote (ca.pem, server.pem, server-key.pem)
+#
+# Image versions are pinned; PostgreSQL and MinIO are the ones
+# scripts/verify-server.sh and scripts/bench-server.sh test against.
+services:
+  postgres:
+    image: postgres:17-alpine
+    command: ["postgres", "-c", "max_connections=1000", "-c", "shared_preload_libraries=pg_stat_statements"]
+    environment:
+      POSTGRES_USER: veil
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
+      POSTGRES_DB: veil
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/10-veil.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U veil -d veil && psql -U veil -d veil -tAc 'select 1' >/dev/null"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  minio:
+    # MinIO no longer publishes images on Docker Hub; this is the server
+    # binary as Bitnami last packaged it (docs/HUB.md §13.1).
+    image: bitnamilegacy/minio:latest
+    environment:
+      MINIO_ROOT_USER: ${S3_KEY:?set S3_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET:?set S3_SECRET}
+    volumes:
+      - miniodata:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9000'"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  # The migrations run once, before any server starts (BUG-838).
+  migrate:
+    image: veil-server:${TAG:?set TAG}
+    command: ["migrate"]
+    environment:
+      VEIL_DATABASE_URL: postgres://veil:${DB_PASSWORD}@postgres:5432/veil
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  veil-server:
+    image: veil-server:${TAG}
+    command:
+      - --listen
+      - 0.0.0.0:8443
+      - --data
+      - /var/lib/veil
+      - --db-connections
+      - "64"
+      - --s3-endpoint
+      - http://minio:9000
+      - --s3-bucket
+      - veil-rehearsal
+      - --tls-cert
+      - /tls/server.pem
+      - --tls-key
+      - /tls/server-key.pem
+    environment:
+      VEIL_DATABASE_URL: postgres://veil:${DB_PASSWORD}@postgres:5432/veil
+      VEIL_S3_ACCESS_KEY: ${S3_KEY}
+      VEIL_S3_SECRET_KEY: ${S3_SECRET}
+    volumes:
+      - hubdata:/var/lib/veil
+      - ${TLS_DIR:?set TLS_DIR}:/tls:ro
+    ports:
+      - "127.0.0.1:${HUB_PORT:-18443}:8443"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+
+  # A regional cache in front of the server (docs/HUB.md §13.18). It reads
+  # the server's cache token from the server's data directory (read-only).
+  veil-cache:
+    image: veil-server:${TAG}
+    command:
+      - cache
+      - --upstream
+      - https://veil-server:8443
+      - --upstream-ca
+      - /tls/ca.pem
+      - --token-file
+      - /hub/hub-cache-token
+      - --dir
+      - /var/lib/veil-cache
+      - --listen
+      - 0.0.0.0:8444
+      - --size
+      - 2G
+      - --memory
+      - 128M
+      - --tls-cert
+      - /tls/server.pem
+      - --tls-key
+      - /tls/server-key.pem
+    environment:
+      VEIL_HEALTH_URL: https://127.0.0.1:8444/v1/epochs
+    volumes:
+      - hubdata:/hub:ro
+      - cachedata:/var/lib/veil-cache
+      - ${TLS_DIR}:/tls:ro
+    ports:
+      - "127.0.0.1:${CACHE_PORT:-18444}:8444"
+    depends_on:
+      veil-server:
+        condition: service_healthy
+
+  # The load driver: `docker compose run --rm bench load --url https://veil-server:8443 …`
+  bench:
+    image: veil-bench:${TAG}
+    profiles: ["bench"]
+    environment:
+      VEIL_DATABASE_URL: postgres://veil:${DB_PASSWORD}@postgres:5432/veil
+      VEIL_S3_ACCESS_KEY: ${S3_KEY}
+      VEIL_S3_SECRET_KEY: ${S3_SECRET}
+    volumes:
+      - benchwork:/work
+      - ./results:/work/results
+      - ${TLS_DIR}:/tls:ro
+    depends_on:
+      veil-server:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  miniodata:
+  hubdata:
+  cachedata:
+  benchwork:

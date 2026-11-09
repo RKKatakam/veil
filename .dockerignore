@@ -1,0 +1,13 @@
+# The image build's context is the repository root (deploy/docker/build.sh).
+target/
+.scratch/
+.git/
+deploy/compose/.tls/
+deploy/compose/.env
+deploy/compose/.env.*
+deploy/compose/results/
+deploy/do/state/
+deploy/do/.env
+deploy/do/.env.*
+!deploy/do/.env.example
+deploy/results/
