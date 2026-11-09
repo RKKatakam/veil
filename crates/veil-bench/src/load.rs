@@ -157,6 +157,8 @@ pub struct Args {
     pub warmup: Duration,
     /// Landings per second per project while agents pull.
     pub background: f64,
+    /// Agents flooding one more project (pull mode, not measured).
+    pub flood: usize,
     /// Count only the database processes of this container (an id prefix,
     /// as `/proc/PID/cgroup` names it).
     pub db_container: Option<String>,
@@ -981,7 +983,11 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
     let stop = AtomicBool::new(false);
     // Agents, the background landers (pull mode) and this thread.
     let landers = if matches!(a.mode, Mode::Pull | Mode::Objects) && a.background > 0.0 { projects } else { 0 };
-    let ready = Barrier::new(clients + landers + 1);
+    // The flooded project beside the measured ones (S24).
+    let flood = if a.mode == Mode::Pull { a.flood } else { 0 };
+    let flooded = if flood > 0 { Some(create_project(&setup, cx.admin, cx.admin_token, cx.agent_name, seed)?) } else { None };
+    let fl = Counters::default();
+    let ready = Barrier::new(clients + landers + flood + 1);
     // Open loop: scheduled landings, one queue per project.
     let queues: Vec<(mpsc::Sender<Instant>, Schedule)> = (0..projects)
         .map(|_| {
@@ -1110,6 +1116,44 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
                 }
             })?;
         }
+        for i in 0..flood {
+            let (fl, stop, ready, name) = (&fl, &stop, &ready, flooded.as_ref().expect("a flooded project"));
+            std::thread::Builder::new().stack_size(256 << 10).spawn_scoped(s, move || {
+                let mut agent = match Api::new(cx.base, cx.ca) {
+                    Ok(api) => Agent {
+                        api,
+                        token: cx.agent_token,
+                        identity: cx.agent,
+                        project: name.clone(),
+                        dir: vec!["w".into(), "flood".into(), format!("f{i}")],
+                        branch: "main".into(),
+                        exists: false,
+                        clone: Held::default(),
+                        files: 0,
+                        c: fl,
+                        objects: None,
+                    },
+                    Err(e) => {
+                        fl.error(&e);
+                        ready.wait();
+                        return;
+                    }
+                };
+                let _ = agent.pull();
+                ready.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    match agent.pull() {
+                        Ok(_) => {
+                            fl.ops.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            fl.error(&e);
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                }
+            })?;
+        }
         ready.wait();
         // Open loop: schedule landings at `rate`, round robin over the projects.
         let schedule = |until: Instant, start: Instant, mut k: u64| -> u64 {
@@ -1149,6 +1193,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
             crate::server::reset_peak(pid);
         }
         let req0 = c.requests.load(Ordering::Relaxed);
+        let (flood_ops0, flood_errors0) = (fl.ops.load(Ordering::Relaxed), fl.errors.load(Ordering::Relaxed));
         c.measuring.store(true, Ordering::Relaxed);
         let t0 = Instant::now();
         schedule(t0 + a.duration, start, k);
@@ -1219,6 +1264,10 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
             "background_landings": bg.ops.load(Ordering::Relaxed),
             "background_errors": bg.errors.load(Ordering::Relaxed),
         });
+        result["flood"] = json!(flood);
+        result["flood_ops_per_s"] = json!((fl.ops.load(Ordering::Relaxed) - flood_ops0) as f64 / elapsed);
+        result["flood_errors"] = json!(fl.errors.load(Ordering::Relaxed) - flood_errors0);
+        result["flood_first_error"] = json!(fl.first_error.lock().unwrap().clone());
         if a.mode == Mode::Objects {
             result["via"] = json!(if cache.is_some() { "cache" } else { "server" });
             result["objects_per_op"] = json!(per_op(c.noop.load(Ordering::Relaxed) as f64));
@@ -1320,7 +1369,9 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
                 eprintln!("load: {:?} projects={projects} clients={clients} rate={rate:?}{}", a.mode, if via { " via the cache" } else { "" });
                 let mut r = run_one(&cx, a, projects, clients, rate, cache.as_ref().filter(|_| via))?;
                 eprintln!("      {}", line(&r));
-                let missed = missed_gates(&r, a.background);
+                // A flood's work is counted against the quiet runs' operations:
+                // the cost gates do not apply to them.
+                let missed = if a.flood > 0 { Vec::new() } else { missed_gates(&r, a.background) };
                 for m in &missed {
                     eprintln!("      GATE MISSED: {m}");
                 }
@@ -1386,6 +1437,21 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             f(&r["load_tool_cores"], 1),
             r["errors"],
         ));
+    }
+    let flooded: Vec<&serde_json::Value> = v["runs"].as_array().into_iter().flatten().filter(|r| r["flood"].as_u64().unwrap_or(0) > 0).collect();
+    if !flooded.is_empty() {
+        out.push_str("\n| Quiet projects | Quiet clients | Flood agents (one project) | Flood pulls/s | Flood errors (busy included) | First flood error |\n|---:|---:|---:|---:|---:|---|\n");
+        for r in flooded {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} |\n",
+                r["projects"],
+                r["clients"],
+                r["flood"],
+                f(&r["flood_ops_per_s"], 1),
+                r["flood_errors"],
+                r["flood_first_error"].as_str().unwrap_or("–").chars().take(80).collect::<String>()
+            ));
+        }
     }
     out.push_str(
         "\n| Mode | Projects | Clients | Target rate (/s) | DB commits per op (the deriver's aside) | DB statements per op | DB statements per request | Storage writes per op | Storage reads per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates missed |\n\

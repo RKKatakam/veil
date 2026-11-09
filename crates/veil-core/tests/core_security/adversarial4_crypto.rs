@@ -213,16 +213,14 @@ fn constructions_do_not_cross() {
     // Same body under the legacy tag: XChaCha20 with the SIV as "nonce" fails.
     let mut as_legacy = b"veil:seal\n".to_vec();
     as_legacy.extend_from_slice(&raw[b"veil:sea2\n".len()..]);
-    if let Ok(Object::Sealed(e)) = Object::decode(&as_legacy) {
-        assert!(e.open(&k).is_err());
-    }
+    let Object::Sealed(e) = Object::decode(&as_legacy).unwrap() else { panic!() };
+    assert!(e.open(&k).is_err());
     let legacy = Envelope::seal_deterministic_legacy(&k, "team#00", b"veil:blob\nx").unwrap();
     let raw = Object::Sealed(legacy).encode();
     let mut as_siv = b"veil:sea2\n".to_vec();
     as_siv.extend_from_slice(&raw[b"veil:seal\n".len()..]);
-    if let Ok(Object::Sealed(e)) = Object::decode(&as_siv) {
-        assert!(e.open(&k).is_err());
-    }
+    let Object::Sealed(e) = Object::decode(&as_siv).unwrap() else { panic!() };
+    assert!(e.open(&k).is_err());
     let id = Identity::generate("x");
     let w = wrap_key(&id.public_key(), &k, "team").unwrap();
     assert!(id.unwrap_key(&w, "ops").is_err());
@@ -260,8 +258,9 @@ fn low_order_hpke_encapsulations_are_refused() {
                 ct: h.ct.clone(),
             };
             assert!(id.unwrap_key(&WrappedKey::Hpke(v), "team").is_err(), "{l} top={top}");
-            assert!(wrap_key(&b, &k, "team").is_err() || !veil_core::identity::is_low_order_public_key(&b));
-            assert!(wrap_key_legacy(&b, &k, "team").is_err() || !veil_core::identity::is_low_order_public_key(&b));
+            assert!(veil_core::identity::is_low_order_public_key(&b), "{l} top={top}");
+            assert!(wrap_key(&b, &k, "team").is_err(), "{l} top={top}");
+            assert!(wrap_key_legacy(&b, &k, "team").is_err(), "{l} top={top}");
         }
     }
 }

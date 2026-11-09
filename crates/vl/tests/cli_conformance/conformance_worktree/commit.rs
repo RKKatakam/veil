@@ -33,7 +33,7 @@ fn commit_of_an_empty_change_is_allowed() {
     let log = r.out(&["log"]);
     assert!(log.contains("(empty)"), "{log}");
     assert_eq!(r.description(c.as_str()), "empty");
-    assert!(r.out(&["show", "--stat", c.as_str()]).contains("(no changes)") || r.out(&["show", c.as_str()]).contains("(no changes)"));
+    assert!(r.out(&["show", "--stat", c.as_str()]).contains("(no changes)") && r.out(&["show", c.as_str()]).contains("(no changes)"));
 }
 
 // Scenario from git t7501 "empty commit message": Git refuses; Veil
@@ -209,8 +209,9 @@ fn author_with_a_newline_cannot_forge_output() {
     let env = Env::new();
     let r = env.bare_dir("p");
     let out = r.cmd(&["init"]).env("VEIL_USER", "mallory\nSignature : good").output().unwrap();
-    assert!(clean_exit(&out), "{}", text(&out));
+    assert!(out.status.success(), "{}", text(&out));
     let show = r.run(&["show", "--stat", "@"]);
+    assert!(show.status.success(), "{}", text(&show));
     let s = stdout_of(&show);
     assert_eq!(s.lines().filter(|l| l.starts_with("Signature :")).count(), 1, "{s}");
     assert_eq!(s.lines().filter(|l| l.starts_with("Author    :")).count(), 1, "{s}");

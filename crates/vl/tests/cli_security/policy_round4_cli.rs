@@ -120,5 +120,6 @@ fn cloak_by_a_non_member_asks_for_a_grant_not_a_new_scope() {
 
     // A scope that does not exist: create it.
     let out = env.vl("bob", &bob, &["cloak", "--scope", "ops", "notes.pem"]);
+    assert!(!out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("vl scope create ops"), "{}", text(&out));
 }

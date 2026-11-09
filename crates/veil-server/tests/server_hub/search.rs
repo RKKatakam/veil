@@ -446,9 +446,13 @@ fn search_finds_secrets_by_name_only() {
         assert!(r[0].contains("\"results\":[]") && !without_echo(&r[0]).contains(marker), "{who}: {r:?}");
         for pattern in [marker, "KEY", "."] {
             let r = run(&th, &h, &x, &S::Grep(GrepParams { pattern: pattern.into(), ..Default::default() }, Limits::default()));
-            assert!(!without_echo(&r[0]).contains(marker) && !r[0].contains(".env"), "{who}: {r:?}");
+            assert!(!r[0].starts_with("error") && !without_echo(&r[0]).contains(marker) && !r[0].contains(".env"), "{who}: {r:?}");
             let r = run(&th, &h, &x, &S::Grep(GrepParams { pattern: pattern.into(), rev: Some(id.hex()), ..Default::default() }, Limits::default()));
-            assert!(!without_echo(&r[0]).contains(marker) && !r[0].contains(".env") || r[0].starts_with("error"), "{who}: {r:?}");
+            if sees_fin {
+                assert!(!r[0].starts_with("error") && !without_echo(&r[0]).contains(marker) && !r[0].contains(".env"), "{who}: {r:?}");
+            } else {
+                assert!(r[0].starts_with("error 404"), "{who}: {r:?}");
+            }
         }
         let r = run(&th, &h, &x, &S::Search(SearchParams { q: Some(".env".into()), kind: Some("path".into()), ..Default::default() }, Limits::default()));
         assert!(r[0].contains("\"path\":\"pub/.env\""), "{who}: {r:?}");
@@ -704,7 +708,7 @@ fn search_hostile_inputs_are_bounded() {
     // The deadline fails the query.
     let none = Limits { deadline: Duration::ZERO, ..Limits::default() };
     let r = go(S::Search(SearchParams { q: Some("common".into()), ..Default::default() }, none));
-    assert!(r[0].contains("deadline") || r[0].contains("warming"), "{r:?}");
+    assert!(r[0].contains("deadline"), "{r:?}");
 }
 
 // ---- through the routes, with `vl` -------------------------------------------------
@@ -1119,9 +1123,11 @@ fn bug_1232_candidates_are_collected_past_the_bounds() {
                 }
             })
         };
-        let _ = call();
+        let warm = norm(call());
+        assert!(!warm.starts_with("error") || warm.contains("deadline"), "{warm}");
         let t = Instant::now();
         let r = norm(call());
+        assert!(!r.starts_with("error") || r.contains("deadline"), "{r}");
         took.push((t.elapsed(), r.chars().take(120).collect::<String>()));
     }
     println!("bug_1232: {took:?}");
@@ -1324,9 +1330,11 @@ fn search_every_route_is_bounded_at_scale() {
                 }
             })
         };
-        let _ = call();
+        let warm = norm(call());
+        assert!(!warm.starts_with("error") || warm.contains("deadline"), "{warm}");
         let t = Instant::now();
         let r = norm(call());
+        assert!(!r.starts_with("error") || r.contains("deadline"), "{r}");
         took.push((t.elapsed(), r.chars().take(160).collect::<String>()));
     }
     println!("every route: {took:#?}");

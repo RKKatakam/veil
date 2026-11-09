@@ -133,23 +133,23 @@ fn an_api_commit_is_refused_whatever_a_push_refuses_and_stores_nothing() {
     let hidden = real_paths(&p.dir).into_iter().find(|(path, _)| path.ends_with("acme/invoice.txt")).unwrap().1;
     let token_secret = "AKIAQ7W3EXAMPLEZ4K2M";
     let secret_line = format!("aws_access_key_id = {token_secret}\n");
-    let cases: Vec<(&str, Value, &str)> = vec![
-        ("a folder they cannot see", put(&format!("{BILL_DIR}/x.txt"), "x"), "access"),
-        ("the private root", put("NEW-AT-ROOT.txt", "x"), "access"),
-        ("a nested folder they cannot see", put(&format!("src/{NESTED_DIR}/x.txt"), "x"), "access"),
-        ("an access line", put(".veilpolicy", &format!("{policy}{BILL_DIR}/ devs\n")), "access"),
-        ("a personal key", put("src/id_ed25519", "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n"), "personal"),
-        ("a plain-text shared secret", put("src/.env", "KEY=value\n"), "secret"),
-        ("a secret in an ordinary file", put("src/config.rs", &secret_line), "secret"),
-        ("a hidden object", json!({"path": "src/copy.txt", "put": {"object": hidden.hex()}}), "missing object"),
-        ("an object never uploaded", json!({"path": "src/copy.txt", "put": {"object": ObjectId::hash(b"nothing").hex()}}), "missing object"),
-        ("a hidden file deleted", json!({"path": format!("{BILL_DIR}/acme/invoice.txt"), "delete": true}), "nothing at"),
+    let cases: Vec<(&str, Value, u16, &str)> = vec![
+        ("a folder they cannot see", put(&format!("{BILL_DIR}/x.txt"), "x"), 403, "access"),
+        ("the private root", put("NEW-AT-ROOT.txt", "x"), 403, "access"),
+        ("a nested folder they cannot see", put(&format!("src/{NESTED_DIR}/x.txt"), "x"), 403, "access"),
+        ("an access line", put(".veilpolicy", &format!("{policy}{BILL_DIR}/ devs\n")), 403, "access"),
+        ("a personal key", put("src/id_ed25519", "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n"), 403, "personal"),
+        ("a plain-text shared secret", put("src/.env", "KEY=value\n"), 403, "secret"),
+        ("a secret in an ordinary file", put("src/config.rs", &secret_line), 403, "secret"),
+        ("a hidden object", json!({"path": "src/copy.txt", "put": {"object": hidden.hex()}}), 400, "missing object"),
+        ("an object never uploaded", json!({"path": "src/copy.txt", "put": {"object": ObjectId::hash(b"nothing").hex()}}), 400, "missing object"),
+        ("a hidden file deleted", json!({"path": format!("{BILL_DIR}/acme/invoice.txt"), "delete": true}), 400, "nothing at"),
     ];
-    for (what, edit, expect) in &cases {
+    for (what, edit, status, expect) in &cases {
         for onto in [json!(null), json!({"branch": "main", "expected": "rebase"})] {
             let r = change(&hub, &token, &p.name, &json!({"base": base.hex(), "edits": [edit], "onto": onto}));
             let body = String::from_utf8_lossy(&r.body).to_string();
-            assert!(matches!(r.status, 400 | 403), "{what}: {} {body}", r.status);
+            assert_eq!(r.status, *status, "{what}: {} {body}", r.status);
             assert!(body.to_lowercase().contains(expect), "{what}: {body}");
             assert!(!body.contains(token_secret) && !body.contains("KEY=value"), "{what}: the answer echoes the secret: {body}");
         }
@@ -229,42 +229,42 @@ fn hostile_edit_lists_are_refused() {
     let deep = vec!["d"; 1100].join("/");
     let many: Vec<Value> = (0..10_001).map(|i| put(&format!("src/m/{i}"), "x")).collect();
     let decomposed = "src/cafe\u{301}.txt";
-    let bodies: Vec<(&str, Value)> = vec![
-        ("dot-dot", json!({"base": base.hex(), "edits": [put("src/../x", "x")]})),
-        ("leading slash", json!({"base": base.hex(), "edits": [put("/src/x", "x")]})),
-        ("trailing slash", json!({"base": base.hex(), "edits": [put("src/x/", "x")]})),
-        ("empty component", json!({"base": base.hex(), "edits": [put("src//x", "x")]})),
-        ("dot", json!({"base": base.hex(), "edits": [put("src/./x", "x")]})),
-        (".veil", json!({"base": base.hex(), "edits": [put("src/.veil/x", "x")]})),
-        (".VEIL", json!({"base": base.hex(), "edits": [put("src/.VEIL", "x")]})),
-        (".v\u{200C}eil", json!({"base": base.hex(), "edits": [put("src/.v\u{200C}eil/x", "x")]})),
-        ("NUL", json!({"base": base.hex(), "edits": [put("src/a\u{0}b", "x")]})),
-        ("not NFC", json!({"base": base.hex(), "edits": [put(decomposed, "x")]})),
-        ("too deep", json!({"base": base.hex(), "edits": [put(&format!("src/{deep}"), "x")]})),
-        ("too many", json!({"base": base.hex(), "edits": many})),
-        ("none", json!({"base": base.hex(), "edits": []})),
-        ("twice", json!({"base": base.hex(), "edits": [put("src/a", "1"), put("src/a", "2")]})),
-        ("a file and below it", json!({"base": base.hex(), "edits": [put("src/a", "1"), put("src/a/b", "2")]})),
-        ("put and delete", json!({"base": base.hex(), "edits": [{"path": "src/a", "put": {"text": "x"}, "delete": true}]})),
-        ("neither", json!({"base": base.hex(), "edits": [{"path": "src/a"}]})),
-        ("object and text", json!({"base": base.hex(), "edits": [{"path": "src/a", "put": {"text": "x", "object": base.hex()}}]})),
-        ("unknown field", json!({"base": base.hex(), "edits": [{"path": "src/a", "put": {"text": "x", "mode": 777}}]})),
-        ("a file as a folder", json!({"base": base.hex(), "edits": [put("src/lib.rs/x", "x")]})),
-        ("a folder as a file", json!({"base": base.hex(), "edits": [put("src", "x")]})),
-        ("a snapshot as a file", json!({"base": base.hex(), "edits": [{"path": "src/s", "put": {"object": base.hex()}}]})),
-        ("bad branch", json!({"base": base.hex(), "edits": [put("src/a", "x")], "onto": {"branch": "../main", "expected": "rebase"}})),
-        ("no such branch", json!({"base": base.hex(), "edits": [put("src/a", "x")], "onto": {"branch": "nope", "expected": "rebase"}})),
-        ("bad expected", json!({"base": base.hex(), "edits": [put("src/a", "x")], "onto": {"branch": "main", "expected": "soon"}})),
-        ("someone else's change id", json!({"base": base.hex(), "change_id": veil_core::ChangeId::random().to_string(), "edits": [put("src/a", "x")]})),
+    let bodies: Vec<(&str, u16, Value)> = vec![
+        ("dot-dot", 400, json!({"base": base.hex(), "edits": [put("src/../x", "x")]})),
+        ("leading slash", 400, json!({"base": base.hex(), "edits": [put("/src/x", "x")]})),
+        ("trailing slash", 400, json!({"base": base.hex(), "edits": [put("src/x/", "x")]})),
+        ("empty component", 400, json!({"base": base.hex(), "edits": [put("src//x", "x")]})),
+        ("dot", 400, json!({"base": base.hex(), "edits": [put("src/./x", "x")]})),
+        (".veil", 400, json!({"base": base.hex(), "edits": [put("src/.veil/x", "x")]})),
+        (".VEIL", 400, json!({"base": base.hex(), "edits": [put("src/.VEIL", "x")]})),
+        (".v\u{200C}eil", 400, json!({"base": base.hex(), "edits": [put("src/.v\u{200C}eil/x", "x")]})),
+        ("NUL", 400, json!({"base": base.hex(), "edits": [put("src/a\u{0}b", "x")]})),
+        ("not NFC", 400, json!({"base": base.hex(), "edits": [put(decomposed, "x")]})),
+        ("too deep", 400, json!({"base": base.hex(), "edits": [put(&format!("src/{deep}"), "x")]})),
+        ("too many", 400, json!({"base": base.hex(), "edits": many})),
+        ("none", 400, json!({"base": base.hex(), "edits": []})),
+        ("twice", 400, json!({"base": base.hex(), "edits": [put("src/a", "1"), put("src/a", "2")]})),
+        ("a file and below it", 400, json!({"base": base.hex(), "edits": [put("src/a", "1"), put("src/a/b", "2")]})),
+        ("put and delete", 400, json!({"base": base.hex(), "edits": [{"path": "src/a", "put": {"text": "x"}, "delete": true}]})),
+        ("neither", 400, json!({"base": base.hex(), "edits": [{"path": "src/a"}]})),
+        ("object and text", 400, json!({"base": base.hex(), "edits": [{"path": "src/a", "put": {"text": "x", "object": base.hex()}}]})),
+        ("unknown field", 422, json!({"base": base.hex(), "edits": [{"path": "src/a", "put": {"text": "x", "mode": 777}}]})),
+        ("a file as a folder", 400, json!({"base": base.hex(), "edits": [put("src/lib.rs/x", "x")]})),
+        ("a folder as a file", 400, json!({"base": base.hex(), "edits": [put("src", "x")]})),
+        ("a snapshot as a file", 400, json!({"base": base.hex(), "edits": [{"path": "src/s", "put": {"object": base.hex()}}]})),
+        ("bad branch", 400, json!({"base": base.hex(), "edits": [put("src/a", "x")], "onto": {"branch": "../main", "expected": "rebase"}})),
+        ("no such branch", 400, json!({"base": base.hex(), "edits": [put("src/a", "x")], "onto": {"branch": "nope", "expected": "rebase"}})),
+        ("bad expected", 422, json!({"base": base.hex(), "edits": [put("src/a", "x")], "onto": {"branch": "main", "expected": "soon"}})),
+        ("someone else's change id", 404, json!({"base": base.hex(), "change_id": veil_core::ChangeId::random().to_string(), "edits": [put("src/a", "x")]})),
     ];
-    for (what, body) in &bodies {
+    for (what, status, body) in &bodies {
         let r = change(&hub, &token, &p.name, body);
-        assert!((400..500).contains(&r.status), "{what}: {} {}", r.status, String::from_utf8_lossy(&r.body));
+        assert_eq!(r.status, *status, "{what}: {} {}", r.status, String::from_utf8_lossy(&r.body));
     }
     // More than 64 MiB of inline text.
     let big = "x".repeat((64 << 20) + 1);
     let r = change(&hub, &token, &p.name, &json!({"base": base.hex(), "edits": [put("src/big", &big)]}));
-    assert!(matches!(r.status, 400 | 413), "{}", r.status);
+    assert_eq!(r.status, 413, "{}", r.status);
     assert_eq!(tip_for(&hub, &token, &p.name), base, "nothing landed");
     assert_eq!(change_refs(&hub, project_id(&hub, &p.name)), 0);
 }

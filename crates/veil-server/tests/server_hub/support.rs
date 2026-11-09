@@ -56,6 +56,22 @@ impl TestHub {
     /// A server whose objects are in the S3 store at `endpoint` (MinIO, or
     /// something in front of it), or in a temporary directory.
     pub fn start_with_s3(database_url: &str, ttl: Duration, endpoint: Option<String>) -> TestHub {
+        TestHub::start_with(database_url, ttl, endpoint, TestHub::limits(), "127.0.0.1:0".parse().unwrap())
+    }
+
+    /// A server with `limits` (S24's tests).
+    pub fn start_with_limits(limits: veil_server::limits::Settings) -> TestHub {
+        TestHub::start_with_limits_on("127.0.0.1:0".parse().unwrap(), limits)
+    }
+
+    /// A server with `limits`, listening on `listen` (S24 cycle 1's review:
+    /// an IPv6 address).
+    pub fn start_with_limits_on(listen: std::net::SocketAddr, limits: veil_server::limits::Settings) -> TestHub {
+        let url = std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL (run scripts/verify-server.sh)");
+        TestHub::start_with(&url, Duration::from_secs(3600), std::env::var("VEIL_TEST_S3_ENDPOINT").ok(), limits, listen)
+    }
+
+    fn start_with(database_url: &str, ttl: Duration, endpoint: Option<String>, limits: veil_server::limits::Settings, listen: std::net::SocketAddr) -> TestHub {
         let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
         let storage = match endpoint {
             Some(endpoint) => Storage::S3 {
@@ -68,7 +84,7 @@ impl TestHub {
             None => Storage::Dir(dir.path().join("objects")),
         };
         let config = Config {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen,
             database_url: database_url.to_string(),
             storage,
             tls: TlsSource::SelfSigned,
@@ -78,8 +94,24 @@ impl TestHub {
             // Tests count their own derive runs; `derived.rs` checks the
             // start-up catch-up by calling it.
             catch_up_at_start: false,
+            limits,
         };
         TestHub::run(config, dir)
+    }
+
+    /// The limits of a test's server: the server's defaults, except that
+    /// every person, agent and anyone on Earth of a test comes from
+    /// 127.0.0.1 and many tests drive one device as fast as they can, so
+    /// rates and connections are not the defaults (`limits.rs` tests
+    /// those). Bodies, bulkheads and shedding are.
+    pub fn limits() -> veil_server::limits::Settings {
+        use veil_server::limits::bucket::Rate;
+        veil_server::limits::Settings {
+            device: Rate { per_second: 100_000, per_hour: 100_000_000 },
+            anonymous: Rate { per_second: 100_000, per_hour: 100_000_000 },
+            max_connections: 1 << 14,
+            ..Default::default()
+        }
     }
 
     /// Another server beside `other`, as a deployment runs several: the
@@ -456,6 +488,25 @@ impl Api {
     /// sends slowly, or stops.
     pub fn post_reader(&self, path: &str, body: impl std::io::Read + Send + 'static) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json").send(ureq::SendBody::from_owned_reader(body))
+    }
+
+    /// POST a body read from `body` as it is sent (chunked), as `token`'s
+    /// session or anyone on Earth.
+    pub fn post_reader_as(&self, token: Option<&str>, path: &str, body: impl std::io::Read + Send + 'static) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        let mut r = self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/octet-stream");
+        if let Some(t) = token {
+            r = r.header("authorization", &format!("Bearer {t}"));
+        }
+        r.send(ureq::SendBody::from_owned_reader(body))
+    }
+
+    /// GET as anyone on Earth, the connection's failure an error instead of
+    /// a panic.
+    pub fn try_get(&self, path: &str) -> Result<Reply, ureq::Error> {
+        let r = self.agent.get(format!("{}{path}", self.base)).call()?;
+        let status = r.status().as_u16();
+        let body = r.into_body().with_config().limit(1 << 32).read_to_vec()?;
+        Ok(Reply { status, body })
     }
 
     /// GET with extra headers, leaving the answer's body unread (a client

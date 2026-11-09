@@ -743,9 +743,9 @@ fn errors_are_a_json_document_too() {
     assert!(v["error"]["message"].as_str().unwrap().contains("no-such-rev"), "{v}");
     // Without --json, stdout stays empty; stderr has the error either way.
     let out = env.vl("alice", &proj, &["show", "no-such-rev"]);
-    assert!(out.stdout.is_empty());
+    assert!(!out.status.success() && out.stdout.is_empty());
     let out = env.vl("alice", &proj, &["show", "no-such-rev", "--json"]);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("error:"));
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("error:"));
     // A bare repository refuses `status`: a JSON error, same exit code.
     let team = env.root.join("team");
     env.ok("alice", &proj, &["remote", "add", "origin", team.to_str().unwrap()]);
@@ -767,6 +767,7 @@ fn json_is_escaped_for_terminals_but_decodes_to_the_raw_data() {
     let evil = "evil\x1b]0;pwned\x07\u{202e}\u{9b}name";
     env.ok("alice", &proj, &["describe", "-r", "@-", "-m", evil]);
     let out = env.vl("alice", &proj, &["log", "--json"]);
+    assert!(out.status.success(), "{}", text(&out));
     let raw = String::from_utf8(out.stdout).unwrap();
     assert!(!raw.chars().any(|c| c.is_control() && c != '\n' || c == '\u{202e}'), "raw controls on stdout: {raw:?}");
     let v: Value = serde_json::from_str(&raw).unwrap();

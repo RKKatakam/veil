@@ -245,10 +245,12 @@ pub async fn open_at(hub: &Hub, name: &str, caller: &Caller) -> Result<(Project,
             let v = match hub.caches.viewer(project.id, p).filter(|v| fresh(v)) {
                 Some(v) => {
                     stats.permission_hits.fetch_add(1, Ordering::Relaxed);
+                    crate::limits::health::hit(crate::limits::health::Layer::Permissions, true);
                     v
                 }
                 None => {
                     stats.permission_misses.fetch_add(1, Ordering::Relaxed);
+                    crate::limits::health::hit(crate::limits::health::Layer::Permissions, false);
                     // Read after both epochs were (by the session check, and
                     // with the project row): never tagged newer than its data.
                     let (viewer, barred) = load_viewer(&mut *hub.db.acquire().await?, project.id, p).await?;

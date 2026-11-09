@@ -164,6 +164,7 @@ fn a_backslash_in_a_path_argument_names_that_file() {
     r.commit("both");
     assert_eq!(r.paths("@-").len(), 2);
     let out = r.run(&["cat", "-r", "@-", "back\\slash"]);
+    assert!(out.status.success(), "{}", text(&out));
     assert_eq!(stdout_of(&out), "backslash file\n", "{}", text(&out));
     // Restoring the backslash file must not touch the other one.
     r.write("back\\slash", "edit A\n");

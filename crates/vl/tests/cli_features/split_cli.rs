@@ -136,6 +136,7 @@ fn refusals_say_why() {
     // An empty change has nothing to split.
     env.ok("alice", &proj, &["commit", "-m", "work"]);
     let out = env.vl("alice", &proj, &["split", "a.txt"]);
+    assert!(!out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("has no changes to split"), "{}", text(&out));
 }
 
