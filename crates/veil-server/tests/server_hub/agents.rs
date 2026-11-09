@@ -2051,25 +2051,54 @@ fn a_narrowed_sessions_commit_onto_its_persons_stack_answers_one_way_whatever_la
 /// ring as its person does. `Viewer::narrowed_scopes` takes scopes from the
 /// access rules alone and leaves it out.
 #[test]
-#[ignore = "BUG-1567: narrowed_scopes leaves out the scope a cloak line names for a secret inside the narrowing"]
 fn a_narrowed_session_gets_the_ring_of_a_secret_inside_its_paths_sealed_under_a_named_scope() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
     let a = &p.dir;
     let policy = std::fs::read_to_string(a.join(".veilpolicy")).unwrap();
-    std::fs::write(a.join(".veilpolicy"), format!("{policy}src/api/.env.ops  cloak\n")).unwrap();
-    write_files(a, &[("src/api/.env.ops", "OPS=MARKER-OPS-ENV-3d9a")]);
-    p.admin.commit_main(a, "a secret under a named scope");
+    // `team` seals a secret inside (`src/api/.env.ops  cloak`); `ops` seals
+    // secrets both inside and outside; `out` seals a secret only outside.
+    std::fs::write(
+        a.join(".veilpolicy"),
+        format!(
+            "{policy}\
+             src/api/.env.ops  cloak\n\
+             src/api/.env.shared  cloak ops\n\
+             src/tools/.env.shared  cloak ops\n\
+             src/tools/.env.out  cloak out\n"
+        ),
+    )
+    .unwrap();
+    write_files(
+        a,
+        &[
+            ("src/api/.env.ops", "OPS=MARKER-OPS-ENV-3d9a"),
+            ("src/api/.env.shared", "SHARED_IN=MARKER-SHARED-IN-8b1e"),
+            ("src/tools/.env.shared", "SHARED_OUT=MARKER-SHARED-OUT-4c2f"),
+            ("src/tools/.env.out", "OUT_ONLY=MARKER-OUT-ONLY-9f7d"),
+        ],
+    );
+    for s in ["ops", "out"] {
+        p.admin.ok(a, &["scope", "create", s]);
+    }
+    p.admin.commit_main(a, "secrets under named scopes inside and outside");
     p.admin.ok(a, &["push"]);
     let api = hub.api();
+    for s in ["ops", "out"] {
+        let ring: Value = serde_json::from_slice(&std::fs::read(a.join(format!(".veil/meta/keyrings/{s}.json"))).unwrap()).unwrap();
+        let r = api.post_json(Some(&p.admin.token()), &format!("/v1/projects/{}/rings/{s}", p.name), &ring);
+        assert_eq!(r.status, 200, "{s}: {}", body(&r));
+    }
     let (dev, narrow) = (p.dev.token(), agent_token(&hub, &p.dev.token(), &p.name, &["src/api"]));
     let scopes = |t: &str| -> Vec<String> {
         let r = api.get(Some(t), &format!("/v1/projects/{}/rings", p.name));
         assert_eq!(r.status, 200, "{}", body(&r));
         r.json().as_array().unwrap().iter().map(|r| r["scope"].as_str().unwrap().to_string()).collect()
     };
-    assert!(scopes(&dev).contains(&"team".to_string()), "control: the person's rings: {:?}", scopes(&dev));
-    // The secret is inside the narrowing, sealed under `ops`.
+    for s in ["team", "ops", "out"] {
+        assert!(scopes(&dev).contains(&s.to_string()), "control: the person's rings lack {s}: {:?}", scopes(&dev));
+    }
+    // The secret is inside the narrowing, sealed under `team`.
     let r = q(&hub, Some(&narrow), &p.name, "tree", "path=src/api");
     assert_eq!(r.status, 200, "{}", body(&r));
     assert!(body(&r).contains(".env.ops"), "{}", body(&r));
@@ -2083,7 +2112,19 @@ fn a_narrowed_session_gets_the_ring_of_a_secret_inside_its_paths_sealed_under_a_
         entry = Some(e);
     }
     assert_eq!(entry.unwrap().visibility, veil_core::object::Visibility::Cloaked { scope: "team".into() }, "the secret's scope");
-    assert!(scopes(&narrow).contains(&"team".to_string()), "the narrowed session lacks the ring of its own secret: {:?}", scopes(&narrow));
-    let r = api.get(Some(&narrow), &format!("/v1/projects/{}/rings/team", p.name));
-    assert_eq!(r.status, 200, "{}", body(&r));
+    let ns = scopes(&narrow);
+    assert!(ns.contains(&"team".to_string()), "the narrowed session lacks the ring of its own secret: {ns:?}");
+    assert!(ns.contains(&"ops".to_string()), "a scope sealing secrets both inside and outside gives the ring: {ns:?}");
+    assert!(!ns.contains(&"out".to_string()), "a scope sealing secrets only outside is left out: {ns:?}");
+    for s in ["team", "ops"] {
+        let r = api.get(Some(&narrow), &format!("/v1/projects/{}/rings/{s}", p.name));
+        assert_eq!(r.status, 200, "{s}: {}", body(&r));
+    }
+    let r_out = api.get(Some(&narrow), &format!("/v1/projects/{}/rings/out", p.name));
+    let r_none = api.get(Some(&narrow), &format!("/v1/projects/{}/rings/no-such-scope", p.name));
+    assert_eq!(r_out.status, 404, "{}", body(&r_out));
+    assert_eq!(
+        (r_out.status, body(&r_out).replace("out", "S")),
+        (r_none.status, body(&r_none).replace("no-such-scope", "S"))
+    );
 }

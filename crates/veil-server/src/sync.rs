@@ -1827,7 +1827,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             }
         }
         // The default branch carries the accepted policy.
-        let mut accept = None;
+        let (mut accept, mut policy_text_update) = (None, None);
         if u.branch == project.default_branch {
             if let Some(n) = new_real {
                 let text = blocking(hub, project.id, move |src| policy_text(src, &src.snapshot(&n)?.tree)).await?;
@@ -1840,10 +1840,12 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                         return Err(agent_refusal("an agent session never changes who has access (the default branch's .veilpolicy)"));
                     }
                     accept = Some(text);
+                } else if text != project.policy_text {
+                    policy_text_update = Some(text);
                 }
             }
         }
-        plans.push((u.branch.clone(), cur, new_real, accept));
+        plans.push((u.branch.clone(), cur, new_real, accept, policy_text_update));
     }
     // The pusher's projections of what this push moves branches to, worked
     // out now and written in its transaction (an admin's are the snapshots).
@@ -1851,7 +1853,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         fresh: completed.iter().map(|c| (c.real, c.origin)).collect(),
         rows: Vec::new(),
     };
-    for (_, _, new, _) in &plans {
+    for (_, _, new, _, _) in &plans {
         if let Some(n) = new {
             Box::pin(projected_inner(hub, project, viewer, *n, Some(&mut deferred))).await?;
         }
@@ -1891,7 +1893,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         let memos = memos.clone();
         Box::pin(async move {
             let mut moved = Vec::new();
-            for (branch, cur, new, accept) in plans {
+            for (branch, cur, new, accept, policy_text_update) in plans {
                 let rows = match (cur, new) {
                     (Some(c0), Some(n)) => sqlx::query("UPDATE branches SET target = $1 WHERE project_id = $2 AND name = $3 AND target = $4")
                         .bind(n.hex())
@@ -1925,6 +1927,12 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                     // Bumps the project's access epoch (a trigger): every
                     // server's cached permissions for it are void.
                     crate::perm::accept_policy(&mut *c, pid, &text).await?;
+                } else if let Some(text) = policy_text_update {
+                    sqlx::query("UPDATE projects SET policy_text = $1 WHERE id = $2")
+                        .bind(&text)
+                        .bind(pid)
+                        .execute(&mut *c)
+                        .await?;
                 }
                 moved.push(branch);
             }
@@ -2011,7 +2019,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         true => crate::perm::accepted_listing(project),
         false => Vec::new(),
     };
-    for (branch, _, new, _) in plans {
+    for (branch, _, new, _, _) in plans {
         let tip = match new {
             Some(n) => Some(projected(hub, project, viewer, n).await?),
             None => None,

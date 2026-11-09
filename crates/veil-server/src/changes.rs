@@ -341,6 +341,9 @@ struct Built {
     /// are not the accepted ones: accepted only if the branch moves, and
     /// only from an admin.
     accept: Option<String>,
+    /// The default branch's new `.veilpolicy` text when only non-access lines
+    /// changed.
+    policy_text_update: Option<String>,
 }
 
 /// Who asks, as of one attempt: the project with its accepted policy and
@@ -440,14 +443,20 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, who: &Arc<Who>, parent: ObjectI
         // Access lines are judged against the parent by the push's checks
         // (`complete`); a move of the default branch accepts its lines,
         // which `create` allows only for an admin's move (BUG-1051).
-        let accept = match p.default_branch {
+        let (accept, policy_text_update) = match p.default_branch {
             true => {
                 let text = sync::policy_text(src, &real.tree)?;
-                (!AccessPolicy::parse(&text).same_rules(&w.project.policy)).then_some(text)
+                if !AccessPolicy::parse(&text).same_rules(&w.project.policy) {
+                    (Some(text), None)
+                } else if text != w.project.policy_text {
+                    (None, Some(text))
+                } else {
+                    (None, None)
+                }
             }
-            false => None,
+            false => (None, None),
         };
-        Ok(Built { real: real_id, store, mine, accept })
+        Ok(Built { real: real_id, store, mine, accept, policy_text_update })
     })
     .await
 }
@@ -572,13 +581,13 @@ async fn commit(
     let mut snaps: Vec<(String, String)> = restacked.iter().map(|(n, _, m)| (n.hex(), m.hex())).collect();
     snaps.push((built.real.hex(), built.mine.hex()));
     let moved_refs: Vec<(String, String)> = restacked.iter().map(|(n, o, _)| (n.hex(), o.hex())).collect();
-    let (real, cid, accept) = (built.real.hex(), plan.change_id.to_string(), built.accept.clone());
+    let (real, cid, accept, policy_text_update) = (built.real.hex(), plan.change_id.to_string(), built.accept.clone(), built.policy_text_update.clone());
     let mv = mv.map(|m| (m.branch, m.cur.hex(), m.keep_on_loss));
     let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let committed: Vec<ObjectId> = restacked.iter().map(|(n, _, _)| *n).chain(std::iter::once(built.real)).collect();
     let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-        let (real, cid, accept, mv, view_key, snaps, moved_refs) =
-            (real.clone(), cid.clone(), accept.clone(), mv.clone(), view_key.clone(), snaps.clone(), moved_refs.clone());
+        let (real, cid, accept, policy_text_update, mv, view_key, snaps, moved_refs) =
+            (real.clone(), cid.clone(), accept.clone(), policy_text_update.clone(), mv.clone(), view_key.clone(), snaps.clone(), moved_refs.clone());
         Box::pin(async move {
             let now = veil_core::now_millis();
             let mut moved = None;
@@ -595,8 +604,16 @@ async fn commit(
                     return Err(Error::conflict(format!("branch '{branch}' moved")));
                 }
                 moved = Some(rows == 1);
-                if let (1, Some(text)) = (rows, &accept) {
-                    crate::perm::accept_policy(&mut *c, pid, text).await?;
+                if rows == 1 {
+                    if let Some(text) = &accept {
+                        crate::perm::accept_policy(&mut *c, pid, text).await?;
+                    } else if let Some(text) = &policy_text_update {
+                        sqlx::query("UPDATE projects SET policy_text = $1 WHERE id = $2")
+                            .bind(text)
+                            .bind(pid)
+                            .execute(&mut *c)
+                            .await?;
+                    }
                 }
             }
             for (snap, mine) in &snaps {

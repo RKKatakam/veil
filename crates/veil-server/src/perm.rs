@@ -75,18 +75,12 @@ impl Viewer {
 
     /// The key-ring scopes a narrowed session may see (`None`: not
     /// narrowed, every scope its person sees): those of the secrets at or
-    /// below its paths, by the rule that seals them
-    /// (`policy::rule_scope`): the rule deciding each of its paths, and every
-    /// rule inside them (BUG-1537).
+    /// below its paths, by the `.veilpolicy` classification that seals them
+    /// (`Policy::scopes_within`: `cloak rule`, `cloak`, and `cloak <scope>`;
+    /// BUG-1537, BUG-1567).
     pub fn narrowed_scopes(&self, project: &Project) -> Option<HashSet<String>> {
         let only = self.only.as_ref()?;
-        let mut out: HashSet<String> = only.iter().map(|o| veil_core::policy::rule_scope(&project.policy, o)).collect();
-        for r in &project.policy.rules {
-            if !r.names.is_empty() && veil_core::hub::agent::within(only, &r.path) {
-                out.insert(veil_core::policy::rule_scope_of(&r.path));
-            }
-        }
-        Some(out)
+        Some(veil_core::policy::Policy::parse(&project.policy_text).scopes_within(only))
     }
 
     /// Refuse a file route's `path` outside the narrowing, as a path that
