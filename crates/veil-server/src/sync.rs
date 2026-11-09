@@ -107,12 +107,12 @@ type StagedPack = (Arc<str>, StagedSlots);
 /// on indexes until it joins the lookup maps: BUG-1496). A staged pack
 /// listed as it is has no index in hand: the lookup maps take the
 /// staged-index cache's, or read it when a lookup needs it.
-struct ListedPack {
-    name: Arc<str>,
-    size: u64,
+pub(crate) struct ListedPack {
+    pub(crate) name: Arc<str>,
+    pub(crate) size: u64,
     /// How many objects it holds.
-    objects: usize,
-    held: Option<Held>,
+    pub(crate) objects: usize,
+    pub(crate) held: Option<Held>,
 }
 
 /// What a push's receipts name in staged packs, and the objects the server
@@ -132,6 +132,20 @@ pub struct Staged {
 }
 
 impl Staged {
+    #[cfg(test)]
+    pub(crate) fn from_packs(packs: Vec<StagedPack>, made: HashMap<ObjectId, Bytes>) -> Staged {
+        let at = packs
+            .iter()
+            .flat_map(|(n, sp)| sp.slots.iter().map(move |(id, s)| (*id, (n.clone(), *s))))
+            .collect();
+        Staged {
+            at: Arc::new(at),
+            packs: Arc::new(packs),
+            made: Arc::new(Mutex::new(made)),
+            touched: Mutex::new(HashSet::new()),
+        }
+    }
+
     /// The same uploads and made objects, with reads counted apart (one
     /// snapshot's completion).
     fn child(&self) -> Arc<Staged> {
@@ -1486,10 +1500,10 @@ async fn push_to_its_end(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, per
 
 /// What a push wrote, and whether its transaction began.
 #[derive(Default)]
-struct Progress {
+pub(crate) struct Progress {
     /// Its own packs (fresh names, in no receipt).
-    written: Vec<Arc<str>>,
-    transaction: bool,
+    pub(crate) written: Vec<Arc<str>>,
+    pub(crate) transaction: bool,
 }
 
 /// One new snapshot completed, and what its checks read of the uploads.
@@ -2031,7 +2045,7 @@ async fn complete_one(
 /// (`made`). Nothing a check did not read is kept. `progress` records the
 /// pack it writes.
 #[allow(clippy::too_many_arguments)]
-async fn packs_to_list(
+pub(crate) async fn packs_to_list(
     hub: &Arc<Hub>,
     project: i64,
     person: i64,
@@ -2045,6 +2059,9 @@ async fn packs_to_list(
     for (name, sp) in st.packs.iter() {
         // Every object of the pack: one the receipts name here, and read.
         if sp.objects > 0 && sp.slots.len() == sp.objects && sp.slots.iter().all(|(id, _)| touched.contains(id)) {
+            if hub.objects.staged_index(project, name).await.map_err(Error::Other)?.is_none() {
+                return Err(Error::conflict("an upload this push names was discarded; push again"));
+            }
             kept.extend(sp.slots.iter().map(|(id, _)| *id));
             listed.push(ListedPack { name: name.clone(), size: sp.size, objects: sp.objects, held: None });
         }
@@ -2080,7 +2097,8 @@ async fn packs_to_list(
         } else {
             Vec::new()
         };
-        let (name, held) = hub.objects.put_pack(project, person, own).await.map_err(Error::Other)?;
+        let (name, mut held) = hub.objects.put_pack(project, person, own).await.map_err(Error::Other)?;
+        held.unproject();
         progress.lock().unwrap().written.push(name.clone());
         listed.push(ListedPack { name, size: held.size, objects: held.index.len(), held: Some(held) });
         own = rest;
