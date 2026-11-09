@@ -2128,3 +2128,59 @@ fn a_narrowed_session_gets_the_ring_of_a_secret_inside_its_paths_sealed_under_a_
         (r_none.status, body(&r_none).replace("no-such-scope", "S"))
     );
 }
+
+/// BUG-1567's fix writes `projects.policy_text` itself when the default
+/// branch moves to a `.veilpolicy` whose access lines are unchanged (review
+/// s11r6). Another server beside the first, whose cache already holds the
+/// project, gives a narrowed session the ring of a secret a new tier line
+/// seals inside its paths at once (the access epoch, a trigger on
+/// `policy_text`, voids every server's cached project). Neither an agent
+/// session nor a member who is not an admin moves the default branch to new
+/// tier lines.
+#[test]
+fn a_tier_line_on_the_default_branch_reaches_every_servers_narrowed_rings_and_only_an_admin_writes_it() {
+    let hub = TestHub::start();
+    let beside = TestHub::beside(&hub);
+    let p = setup_project(&hub);
+    let a = &p.dir;
+    p.admin.ok(a, &["scope", "create", "ops"]);
+    p.admin.commit_main(a, "scope ops");
+    p.admin.ok(a, &["push"]);
+    let ring: Value = serde_json::from_slice(&std::fs::read(a.join(".veil/meta/keyrings/ops.json")).unwrap()).unwrap();
+    let r = hub.api().post_json(Some(&p.admin.token()), &format!("/v1/projects/{}/rings/ops", p.name), &ring);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    let narrow = agent_token(&hub, &p.dev.token(), &p.name, &["src/api"]);
+    let ops = |h: &TestHub| h.api().get(Some(&narrow), &format!("/v1/projects/{}/rings/ops", p.name));
+    // Before: `ops` seals nothing inside, on either server (both cache the project).
+    for h in [&hub, &beside] {
+        let r = ops(h);
+        assert_eq!(r.status, 404, "{}", body(&r));
+    }
+    let policy = std::fs::read_to_string(a.join(".veilpolicy")).unwrap();
+    std::fs::write(a.join(".veilpolicy"), format!("{policy}src/api/.env.ops  cloak ops\n")).unwrap();
+    write_files(a, &[("src/api/.env.ops", "OPS=MARKER-OPS-TIER-LINE-5e1c")]);
+    p.admin.commit_main(a, "a tier line sealing a secret inside src/api under ops");
+    p.admin.ok(a, &["push"]);
+    for h in [&beside, &hub] {
+        let r = ops(h);
+        assert_eq!(r.status, 200, "{}", body(&r));
+    }
+    // Who else could move the default branch to new tier lines: an admin's
+    // agent session, and a member who is not an admin. Both are refused,
+    // and the branch stays where it was.
+    let before = tip(&hub, &p.admin.token(), &p.name);
+    let weaker = format!("{policy}src/api/.env.ops  cloak ops\nsrc/api/.env.ops  public!\n");
+    for (who, token) in [("admin's agent", agent_token(&hub, &p.admin.token(), &p.name, &[])), ("member", p.dev.token())] {
+        let base = tip(&hub, &token, &p.name);
+        let r = change(
+            &hub,
+            &token,
+            &p.name,
+            &json!({"base": base.hex(), "edits": [{"path": ".veilpolicy", "put": {"text": weaker}}], "onto": {"branch": "main", "expected": "rebase"}}),
+        );
+        assert_eq!(r.status, 403, "{who}: {}", body(&r));
+    }
+    assert_eq!(tip(&hub, &p.admin.token(), &p.name), before);
+    let r = ops(&beside);
+    assert_eq!(r.status, 200, "{}", body(&r));
+}

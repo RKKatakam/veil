@@ -2005,6 +2005,75 @@ mod tests {
         p.classify(&VPath::new(path).unwrap(), false).tier
     }
 
+    /// BUG-1567 review (s11r6): `scopes_within` gives every scope that seals
+    /// a secret at or below the narrowing, by `classify` itself, and none
+    /// that seals only outside: overrides (`public!`, `isolate`, `ignore`),
+    /// nested folders, globs and braces, and `cloak rule` scopes from an
+    /// access line above the narrowing or inside it.
+    /// BUG-1568: `sample_glob` picks, for a negated class, the first letter
+    /// of `a`..=`z` not written in it, so `[!a-z]` gives `b`, which the
+    /// class excludes: the secret `src/api/.env.1` is sealed under `neg`,
+    /// but a session narrowed to `src/api` is not given `neg`'s ring.
+    #[test]
+    #[ignore = "BUG-1568: scopes_within misses a scope whose tier line has a negated range class"]
+    fn scopes_within_finds_a_scope_behind_a_negated_range_class() {
+        let p = Policy::parse("src/ devs\nsrc/api/.env.[!a-z]  cloak neg\n");
+        assert_eq!(class(&p, "src/api/.env.1"), Tier::Cloaked("neg".into()), "control: the secret inside is sealed under neg");
+        let got = p.scopes_within(&["src/api".to_string()]);
+        assert!(got.contains("neg"), "{got:?}");
+    }
+
+    #[test]
+    fn scopes_within_matches_classify_inside_the_narrowing_only() {
+        let text = format!(
+            "{SYNCED_SECRETS_POLICY}\
+             src/ devs\n\
+             src/api/inner/ security\n\
+             billing/ finance\n\
+             src/api/**/.env.deep  cloak deep\n\
+             src/{{api,web}}/.env.brace  cloak brace\n\
+             src/*/x/.env.star  cloak star\n\
+             deepdir/  cloak dirscope\n\
+             src/api/.env.local  public!\n\
+             src/api/.env.iso  isolate\n\
+             src/api/.env.ign  ignore\n\
+             src/tools/.env.out  cloak outside\n\
+             src/api/.env.over  cloak over\n\
+             src/api/.env.over  public!\n"
+        );
+        let p = Policy::parse(&text);
+        let only = vec!["src/api".to_string()];
+        let got = p.scopes_within(&only);
+        // What classification seals, path by path, at real paths inside.
+        let inside = [
+            "src/api/.env",
+            "src/api/inner/.env",
+            "src/api/a/b/c/.env.deep",
+            "src/api/.env.brace",
+            "src/api/x/.env.star",
+            "src/api/q/deepdir/.env",
+        ];
+        let mut want = std::collections::HashSet::new();
+        for path in inside {
+            match class(&p, path) {
+                Tier::Cloaked(s) => {
+                    want.insert(s);
+                }
+                t => panic!("{path} is not sealed: {t:?}"),
+            }
+        }
+        for path in ["src/api/.env.local", "src/api/.env.iso", "src/api/.env.ign", "src/api/.env.over"] {
+            assert!(!matches!(class(&p, path), Tier::Cloaked(_)), "{path} is not sealed");
+        }
+        assert_eq!(class(&p, "src/tools/.env.out"), Tier::Cloaked("outside".into()));
+        for s in ["deep", "brace", "star", "dirscope"] {
+            assert!(want.contains(s), "control: {s} seals a secret inside: {want:?}");
+        }
+        assert!(want.contains(&rule_scope_of("src")) && want.contains(&rule_scope_of("src/api/inner")), "{want:?}");
+        assert_eq!(got, want, "exactly the scopes sealing a secret inside");
+        assert!(!got.contains("outside") && !got.contains("over") && !got.contains(&rule_scope_of("billing")));
+    }
+
     /// BUG-560: how a command's edit of `.veilpolicy` is judged.
     #[test]
     fn command_edits_are_judged_against_the_recorded_policy() {
