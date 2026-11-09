@@ -1170,7 +1170,13 @@ struct Snapshot {
   jj's model (a history stack and a redo stack). Undos written before
   `undo_of` existed are plain operations: undoing one redoes it, once.
 * **Undo per workspace (format 6).** `Repo::undo_target(ws)` walks the op
-  graph newest first (by timestamp, then id, across merged branches) and
+  graph newest first (by timestamp, then id, across merged branches, and
+  on a log written since operation times were clamped never an operation
+  before one that descends from it: equal times follow the op log's
+  ancestry, reading only the operations of that time it needs, BUG-1402,
+  BUG-1433; on an older log, with an operation older than its parent, an
+  operation can still come before an older descendant reached only by
+  another branch, BUG-1432) and
   skips merges of concurrent operations and other workspaces' commands: it
   takes the newest command whose `workspace` is `ws` or none (tags, push,
   pull, remotes: repository-wide). An agent working in its own workspace
@@ -2034,7 +2040,24 @@ the outsiders' view; format 8 removed all of it (FORMAT.md §5). What is left:
      and nothing reached any remote. Once published, `vl undo` of the
      release is refused, and changes nothing. `vl op restore` to an
      operation before a staged release takes it back too, and warns about
-     published ones. Redoing the undo of a release is refused: undo and
+     published ones; "before" is the op log's, from the restore
+     operation's own parents (the `release embargo <id>` operations they
+     reach and the restored one does not), never a comparison of times,
+     which a clock set back would get wrong (BUG-1400), nor the heads read
+     before the restore's transaction (BUG-1404). And a push publishes a
+     staged release only if the op log holds it in force (its latest
+     `release embargo <id>` operation in the heads' history, not taken
+     back by an undo or op restore in force); the others are taken back
+     first, and the push names each in a warning with what to run (`vl
+     embargo release <id>`): a restore or undo stopped between its commit
+     and its take-back cannot publish the release, nor can one an older
+     `vl` staged without its operation (BUG-1487). Never silent, never
+     early. The check runs at the push only (and in `vl embargo list`,
+     `vl embargo release` and `vl show --json`, which never say a release
+     the op log took back will publish), not at every open (BUG-1533); gc
+     never prunes the operation of a staged release, nor anything newer,
+     so the check always finds it (BUG-1532). `vl embargo release`
+     records its operation before it stages the release. Redoing the undo of a release is refused: undo and
      redo never release.
    * **Preview.** `vl embargo release` shows the embargoed merge, the
      withheld history it publishes, the tags that carry it and the remotes
@@ -2440,18 +2463,47 @@ take no lock:
   introduced by an operation only that side reaches, and on the other
   side was not, takes the changed side's value (`oplog::shared_base`), so
   a side still holding the shared history's older value never wins
-  against a newer commit (BUG-1294). Per key (heads: kept if every side kept it or some side added it;
+  against a newer commit (BUG-1294); a key both sides introduced a value
+  for has no base value, so the two are merged as two changes, even when
+  one is a write back to the common operation's value (BUG-1296). The
+  walk that finds the operations only one side reaches ends only below
+  every operation it walked as one side's: a merge has its newest parent's
+  timestamp, and a common descendant of the same timestamp must still mark
+  its ancestor common (BUG-1297). Per key (heads: kept if every side kept it or some side added it;
   workspaces, tags, remote tags: one side's change wins, two different
-  changes go to the first side and the other target stays a visible head,
-  with a warning printed once by the process that writes the merge; a
+  changes go to the first side and the other target stays a visible head
+  (through the rest of the fold too: a later step's dropped head never
+  hides a loser, BUG-1298), with a warning printed once by the process that writes the merge; a
   removal loses to a change; a workspace's or tag's cloak merges separately
   and a cloaked side wins; a release tag's target and annotation are one
   unit and win over an ordinary tag). Each side's `rewritten` is applied to
   the other's new snapshots (`Transaction::for_merge` runs the auto-rebase:
   a child committed on a snapshot amended meanwhile moves onto the amended
   one); both sides rewriting one snapshot differently is a divergent change,
-  and a rewrite whose old snapshot is still visible on its side (an undo
-  since: as a ref or an ancestor of one) is not applied (BUG-802).
+  and a rewrite that was undone is not applied. What undoes a command's
+  rewrite is read from the op log, never from a view: an operation with
+  `undo_of` takes back the operation it names, an op restore
+  (`restore_of`, or on older restores the operation named in its
+  description) every operation between the restored one and its parents,
+  unless the undo or restore is itself taken back (an undo of the
+  restore, a redo of the undo); each rewrite of the operation taken back
+  goes, and another command's rewrite of the same snapshot still applies
+  (BUG-802, BUG-1299, BUG-1434). Showing an old snapshot again undoes
+  nothing: a ref on it that a command which saw each rewrite of what it
+  shows set (a tag on the old version, a workspace on it, an undo's
+  revert) stays where it is, and every other ref follows the rewrite. A
+  rewrite only merges recorded (the op log does not say which command it
+  is) is still judged by the views: not applied when a head that saw it
+  shows its old snapshot, or a side shows it where the fold step's shared
+  history does not (BUG-1295). On one side, a rewrite replaces an earlier
+  one of the same snapshot when its operation descends from the earlier
+  one's; two that stand and differ are a divergent change, which nothing
+  follows, and a merge does not revisit that decision when one of them is
+  taken back later (BUG-1444). Open (BUG-1488): when a command that saw
+  a rewrite rewrites the old version again, the merge's answer depends
+  on whether the two rewrites first meet in one fold step (the second
+  replaces the first) or not (divergent); the intended rule is
+  divergence while both versions are visible.
   The confinement check runs against **every side's view**: a rewrite that
   would move a change out of an unreleased embargo either side had it in
   is dropped and its replacement rewritten back, so the change stays
@@ -2460,7 +2512,10 @@ take no lock:
   refused stays on its old
   parents, with what is built on it, and the warning names it (BUG-805).
   Its timestamp is its
-  parents' latest, its user `veil`, and what it creates derives its change
+  parents' latest (a command's operation is strictly later than its parents,
+  whatever the clock says: a millisecond after the newest when the clock
+  is behind, so times still separate a command from its parents and the
+  op log's walks end near the heads, BUG-1485, BUG-1486), its user `veil`, and what it creates derives its change
   ids from its parents: two processes merging the same heads write the same
   operation, and `create_new` of its head file loses to itself. Merging at
   open, rather than in memory for read-only commands as the design
@@ -2682,6 +2737,21 @@ weight-bounded LRU caches (`cache.rs`). A tree weighs `entries + 1`, a
 snapshot 1, a base its size in bytes. The defaults are 200k tree entries,
 20k snapshots and 64 MiB of bases, adjustable with
 `ObjectStore::set_cache_limits`.
+
+### Thin clones: fetch on demand (`promisor.rs`)
+
+A thin clone of a server project (format 9, `docs/HUB.md` §13.21) keeps
+two object stores: `.veil/objects/` (every snapshot it fetched, and
+everything it made; never evicted) and `.veil/cache/` (trees and files
+fetched from the server; evicted least recently written first, down to 80 %
+of its bound, never what a workspace's working copy or the checkout record
+pins). A read neither holds goes to the server at the snapshot and path
+where the process met the object (recorded as trees are decoded); what
+arrives is re-hashed before use. The server's "not there for you" is
+`Missing`; a server that cannot be reached is `Unavailable`, which no
+caller reads as hidden. Snapshots are never fetched by a read: graph
+queries that reach the clone's boundary fetch history pages and run again
+(`Repo::exact`). gc, fsck and maintenance never fetch.
 
 ### The history index (`graph_index.rs`)
 
@@ -3397,7 +3467,7 @@ afterwards; textconv input on stdin, output never stored.
 * people outside a folder's access, including others in the same project, and members after they are removed;
 * anything that arrives by push, pull, fetch or merge: trees, names, descriptions, policies, hooks and metadata;
 * the network, and other OS users on the same machine;
-* **a command confined by `vl ws exec`** (Linux, `docs/design/scale/9-confinement.md`; owner, 2026-11-06). It runs as the person, but for files it is outside the trust boundary: it cannot read the person's private files (keys, the rest of the home, the Veil identity, the real repository and other workspaces' sandboxes) or write outside its sandbox, and the files it leaves are untrusted input to `vl`. By the owner's choice it gets the environment variables, and the network unless `--no-network`; what it is given (the environment, injected secrets, the allow-list) it can use and send anywhere; what it writes to the allow-list stays in its workspace's layers, read by that workspace's later confined runs only. An unconfined run (`--unconfined`, or `vl bisect run`) is the person's own deliberate command.
+* **a command confined by `vl ws exec`** (Linux, `docs/design/scale/9-confinement.md`; owner, 2026-11-06). It runs as the person, but for files it is outside the trust boundary: it cannot read the person's private files (keys, the rest of the home, the Veil identity, the real repository and other workspaces' sandboxes) or write outside its sandbox, and the files it leaves are untrusted input to `vl`. By the owner's choice it gets the environment variables, and the network unless `--no-network` (with `--private-ports`, a loopback of its own and outbound access through `pasta`; milestone S8); it reaches its person's `vl` only through the workspace socket, which runs workspace commands on its own workspace as the `vl` outside (`crate::ws_socket`, `9-confinement.md` item 17); what it is given (the environment, injected secrets, the allow-list) it can use and send anywhere; what it writes to the allow-list stays in its workspace's layers, read by that workspace's later confined runs only. An unconfined run (`--unconfined`, or `vl bisect run`) is the person's own deliberate command.
 
 Secret files are sealed for scopes (§3–§4), so teammates outside a secret's scope, and revoked members after their revocation, are not trusted with it. `vl` syncs only through the Veil server; path and SFTP remotes, whose operators were not trusted, were removed in the simplification pass, part 1. The engine still enforces its filters on any repository-to-repository transfer (`remote::push`/`pull`, in process), so they are kept and tested.
 

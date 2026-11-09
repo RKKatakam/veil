@@ -52,6 +52,8 @@
 pub mod attributes;
 pub mod bisect;
 pub mod blame;
+#[cfg(feature = "os")]
+mod blob_stream;
 pub mod builder;
 pub mod cache;
 pub mod checkout;
@@ -79,6 +81,7 @@ pub mod object;
 pub mod oplog;
 pub mod pack;
 pub mod policy;
+pub mod promisor;
 #[cfg(feature = "os")]
 mod prefetch;
 pub mod remote;

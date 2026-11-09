@@ -428,6 +428,12 @@ impl<'a> Reach<'a> {
 
 struct Mark<'a> {
     store: &'a ObjectStore,
+    /// A thin clone: the server's history as the clone holds it. A gap in
+    /// it is on the server; a gap only this clone's own snapshots name is
+    /// lost work, and stops the sweep as in a full clone (BUG-1143).
+    server: Option<std::collections::HashSet<ObjectId>>,
+    /// The snapshot whose tree is being marked.
+    walking: Option<ObjectId>,
     reach: Reach<'a>,
     incomplete: Vec<String>,
 }
@@ -445,11 +451,22 @@ impl Mark<'_> {
                 Ok(s) => {
                     let embargoed = s.embargo.as_deref().is_some_and(|e| !self.store.keys.embargo_released(e));
                     stack.extend(s.parents.iter().enumerate().map(|(i, p)| (*p, embargoed && i > 0)));
+                    self.walking = Some(id);
                     self.tree(s.tree, String::new());
+                    self.walking = None;
                 }
-                Err(VeilError::Missing(_)) if withheld => {}
+                Err(VeilError::Missing(_)) if withheld || self.server.as_ref().is_some_and(|h| h.contains(&id)) => {}
                 Err(e) => self.incomplete.push(format!("snapshot {}: {e}", id.short())),
             }
+        }
+    }
+
+    /// A thin clone: is `id`, missing at `path` of the snapshot being
+    /// marked, the server's (not fetched)?
+    fn servers(&self, id: &ObjectId, path: &str) -> bool {
+        match (&self.server, self.walking) {
+            (Some(server), Some(snap)) => self.store.classify_gap(server, &snap, path, id) == crate::promisor::Gap::Server,
+            _ => false,
         }
     }
 
@@ -461,6 +478,7 @@ impl Mark<'_> {
             }
             let t = match self.store.tree_object(&id) {
                 Ok(t) => t,
+                Err(VeilError::Missing(_)) if self.servers(&id, &path) => continue,
                 Err(e) => {
                     self.incomplete.push(format!("tree {} at '{path}': {e}", id.short()));
                     continue;
@@ -514,6 +532,7 @@ impl Mark<'_> {
                     self.reach.insert(t);
                 }
             }
+            Err(VeilError::Missing(_)) if self.servers(&id, path) => {}
             Err(e) => self.incomplete.push(format!("conflict {} at '{path}': {e}", id.short())),
         }
     }
@@ -586,6 +605,14 @@ pub fn gc(repo: &mut Repo, opts: &GcOptions) -> Result<GcReport> {
 /// `prune`), then consolidate loose objects older than `loose_age`, then
 /// merge packs geometrically.
 pub(crate) fn run(repo: &mut Repo, opts: &GcOptions, prune: bool, loose_age: Duration) -> Result<GcReport> {
+    // A thin clone: gc never fetches. What it does not hold is on the
+    // server, and nothing local sits only below it (threat 5 of the
+    // partial-clone design), so the mark stops there.
+    let store = repo.store.clone();
+    store.without_fetching(|| run_here(repo, opts, prune, loose_age))
+}
+
+fn run_here(repo: &mut Repo, opts: &GcOptions, prune: bool, loose_age: Duration) -> Result<GcReport> {
     let backend = repo.backend.clone();
     // Re-read under the hold: an upgrade since the repository was opened
     // (it takes the gc lease too) changed what this run would write.
@@ -707,6 +734,11 @@ fn prune_store(
         retained.insert(*h);
         retained.extend(repo.ops.get(h)?.parents);
     }
+    // A staged release's operation, and everything newer, stays: the push
+    // reads the op log down to it to tell whether the release is in force
+    // (BUG-1532).
+    let (_, staged_ops) = repo.staged_release_standing()?;
+    retained.extend(staged_ops);
     let cutoff = opts.keep_ops.map(|keep| now.saturating_sub(keep.as_millis() as i64));
     let mut roots: Vec<ObjectId> = vec![repo.root_id];
     let mut annotations = Vec::new();
@@ -741,7 +773,20 @@ fn prune_store(
     // 3. Mark.
     roots.extend(opts.extra_roots.iter().copied());
     roots.extend(checkout_snapshots(&*backend));
+    // A thin clone: snapshots any retained operation saw on a remote.
+    let server = store.is_partial().then(|| {
+        let remote = repo.config.partial.as_ref().map_or(String::new(), |p| p.remote.clone());
+        let mut tips: Vec<ObjectId> = crate::promisor::own_tips(&repo.view.remote_tags, &remote).collect();
+        for id in &retained {
+            if let Ok(Some(op)) = repo.ops.try_get(id) {
+                tips.extend(crate::promisor::own_tips(&op.view.remote_tags, &remote));
+            }
+        }
+        store.server_history(&tips)
+    });
     let mut mark = Mark {
+        server,
+        walking: None,
         store,
         reach: Reach::new(&inv),
         incomplete,

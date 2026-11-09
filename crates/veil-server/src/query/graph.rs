@@ -44,11 +44,11 @@ use std::{
 use tokio::sync::watch;
 
 use axum::http::StatusCode;
-use veil_core::{cache::LruCache, object::Snapshot, ObjectId};
+use veil_core::{cache::LruCache, id::ChangeId, object::Snapshot, ObjectId};
 
 use crate::{
     derive::{
-        graph::{FLAG_EMBARGO, FLAG_EMBARGO_LINE, MAX_STAMP},
+        graph::{FLAG_EMBARGO, FLAG_EMBARGO_LINE},
         Cx,
     },
     error::{Error, Result},
@@ -102,8 +102,8 @@ impl VRow {
     /// `parents` (in order), projecting real snapshot `real`. The same
     /// arithmetic as the real graph (`derive::graph::GraphRow::compute`).
     pub fn compute(s: &Snapshot, parents: &[(ObjectId, Arc<VRow>)], real: ObjectId) -> VRow {
-        let stamp = s.timestamp.clamp(0, MAX_STAMP);
-        let generation = parents.iter().map(|(_, p)| p.generation.saturating_add(1)).max().unwrap_or(0).max(stamp);
+        // `veil_core`'s one arithmetic, the clients' too (BUG-1316).
+        let generation = veil_core::graph_index::generation(s.timestamp, parents.iter().map(|(_, p)| p.generation as u64)) as i64;
         let mut flags = if s.embargo.is_some() { FLAG_EMBARGO | FLAG_EMBARGO_LINE } else { 0 };
         for (_, p) in parents {
             flags |= p.flags & FLAG_EMBARGO_LINE;
@@ -270,18 +270,37 @@ impl<'a> G<'a> {
         Ok(out)
     }
 
-    /// Write `rows` (parents before children) and keep them.
-    fn add(&self, rows: &[(ObjectId, Arc<VRow>)]) -> Result<()> {
+    /// Write `rows` (parents before children, each with its projected
+    /// snapshot's change id) and keep them. Their change ids go first, to
+    /// `view_changes` (`q/resolve`'s change id prefixes from the viewer's
+    /// own rows, BUG-1317): a row of `view_graph` is never there without
+    /// its change id; one written only to `view_changes` is written again
+    /// by the next fill.
+    fn add(&self, rows: &[(ObjectId, Arc<VRow>, ChangeId)]) -> Result<()> {
         let hub = self.cx.hub();
         for chunk in rows.chunks(ROWS_PER_STATEMENT) {
-            let ids: Vec<String> = chunk.iter().map(|(i, _)| i.hex()).collect();
-            let gens: Vec<i64> = chunk.iter().map(|(_, r)| r.generation).collect();
-            let depths: Vec<i64> = chunk.iter().map(|(_, r)| r.depth).collect();
-            let parents: Vec<String> = chunk.iter().map(|(_, r)| serde_json::to_string(&r.parents).unwrap()).collect();
-            let flags: Vec<i32> = chunk.iter().map(|(_, r)| r.flags).collect();
-            let skips: Vec<String> = chunk.iter().map(|(_, r)| serde_json::to_string(&r.skip).unwrap()).collect();
-            let downs: Vec<String> = chunk.iter().map(|(_, r)| r.down.hex()).collect();
-            let reals: Vec<String> = chunk.iter().map(|(_, r)| r.real.hex()).collect();
+            let ids: Vec<String> = chunk.iter().map(|(i, _, _)| i.hex()).collect();
+            let gens: Vec<i64> = chunk.iter().map(|(_, r, _)| r.generation).collect();
+            let depths: Vec<i64> = chunk.iter().map(|(_, r, _)| r.depth).collect();
+            let parents: Vec<String> = chunk.iter().map(|(_, r, _)| serde_json::to_string(&r.parents).unwrap()).collect();
+            let flags: Vec<i32> = chunk.iter().map(|(_, r, _)| r.flags).collect();
+            let skips: Vec<String> = chunk.iter().map(|(_, r, _)| serde_json::to_string(&r.skip).unwrap()).collect();
+            let downs: Vec<String> = chunk.iter().map(|(_, r, _)| r.down.hex()).collect();
+            let reals: Vec<String> = chunk.iter().map(|(_, r, _)| r.real.hex()).collect();
+            let changes: Vec<String> = chunk.iter().map(|(_, _, c)| hex::encode(c.0)).collect();
+            self.cx.db(|| {
+                sqlx::query(
+                    "INSERT INTO view_changes (project_id, view_key, change_id, snapshot, flags) \
+                     SELECT $1, $2, * FROM UNNEST($3::text[], $4::text[], $5::int[]) \
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(self.cx.project())
+                .bind(self.vk)
+                .bind(&changes)
+                .bind(&ids)
+                .bind(&flags)
+                .execute(&hub.db)
+            })?;
             self.cx.db(|| {
                 sqlx::query(
                     "INSERT INTO view_graph (project_id, view_key, snapshot, generation, depth, parents, flags, skip, down_id, real_id) \
@@ -582,8 +601,8 @@ struct Walk<'g, 'a> {
     absent: HashSet<ObjectId>,
     /// Rows computed by this walk.
     rows: HashMap<ObjectId, Arc<VRow>>,
-    /// Rows not written yet, parents first.
-    pending: Vec<(ObjectId, Arc<VRow>)>,
+    /// Rows not written yet, parents first, with their change ids.
+    pending: Vec<(ObjectId, Arc<VRow>, ChangeId)>,
 }
 
 impl Walk<'_, '_> {
@@ -694,7 +713,7 @@ impl Walk<'_, '_> {
             }
             let row = Arc::new(VRow::compute(&ps, &parents, x));
             self.rows.insert(px, row.clone());
-            self.pending.push((px, row));
+            self.pending.push((px, row, ps.change_id));
             if self.pending.len() >= ROWS_PER_STATEMENT {
                 self.flush()?;
             }

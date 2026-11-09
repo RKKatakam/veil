@@ -68,6 +68,15 @@ pub enum Cmd {
         /// subtree's objects).
         #[arg(long, value_name = "DIR")]
         only: Option<String>,
+        /// Fetch every snapshot and object you may see. Without it the
+        /// clone is thin: it holds the branch tips and what it checks out,
+        /// and fetches the rest from the server when something reads it.
+        #[arg(long, conflicts_with = "cache_size")]
+        full: bool,
+        /// Bound of a thin clone's object cache (bytes, or with K, M or
+        /// G; default 4G). What is checked out is never evicted.
+        #[arg(long, value_name = "SIZE")]
+        cache_size: Option<String>,
     },
     /// Sign in to a Veil server with this device's identity key.
     ///
@@ -686,6 +695,10 @@ pub enum Cmd {
         #[arg(default_value = "origin")]
         remote: String,
     },
+    /// A thin clone: what it holds, the bound of its object cache, and
+    /// fetching everything (`vl partial full`).
+    #[command(subcommand)]
+    Partial(crate::thin::PartialCmd),
 
     /// Hooks run before commits and pushes; repository-suggested ones only
     /// once this device trusts them (not implemented yet).
@@ -1403,6 +1416,9 @@ pub enum WsCmd {
         /// Run nothing: record what an earlier run left unrecorded (vl was killed, or recording failed).
         #[arg(long, conflicts_with_all = ["ephemeral", "with_isolated", "only", "command"])]
         record_only: bool,
+        /// Run over a mount of the workspace (FUSE) instead of a checkout: ready at once, and a file is read (in a thin clone, fetched from the server) only when the command reads it. Without FUSE here, the sandbox is checked out as without --mount.
+        #[arg(long, conflicts_with_all = ["ephemeral", "with_isolated", "only", "record_only"])]
+        mount: bool,
         #[command(flatten)]
         confine: Box<crate::confine::ConfineArgs>,
         /// Command and arguments.

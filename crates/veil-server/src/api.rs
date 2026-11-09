@@ -80,6 +80,8 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/prs/{id}/reviews", post(crate::prs::review_route))
         .route("/v1/projects/{p}/prs/{id}/reviews/dismiss", post(crate::prs::dismiss_route))
         .route("/v1/projects/{p}/prs/{id}/land", post(crate::prs::land_route))
+        .route("/v1/projects/{p}/q/resolve", get(crate::query::resolve_route))
+        .route("/v1/projects/{p}/q/generations", post(crate::query::generations_route))
         .route("/v1/projects/{p}/q/search", get(crate::search::search_route))
         .route("/v1/projects/{p}/q/grep", get(crate::search::grep_route))
         .layer(DefaultBodyLimit::max(crate::db::body_limit("")))
@@ -608,7 +610,7 @@ async fn history(
 ) -> Result<Response> {
     let encoded = reads_encoded(&headers);
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
-    let body = sync::history(&hub, &project, &viewer, &req.tips, &req.stop, encoded).await?;
+    let body = sync::history(&hub, &project, &viewer, &req.tips, &req.stop, req.limit, encoded).await?;
     Ok(([(header::CONTENT_TYPE, frames_type(encoded))], body).into_response())
 }
 

@@ -477,7 +477,7 @@ impl Ids {
     fn of(ctx: &Ctx, s: &State) -> Result<Ids> {
         let one = |h: &str| -> Result<ObjectId> {
             let id = ObjectId::from_hex(h).map_err(|_| damaged("names something that is not a snapshot id"))?;
-            match ctx.repo.snapshot_opt(&id) {
+            match ctx.repo.exact().snapshot(&id) {
                 Ok(Some(_)) => Ok(id),
                 _ => Err(anyhow!(
                     "snapshot {} of the bisection is no longer in this repository (abandoned and collected by `vl gc`?); {RESET_HINT}",
@@ -522,7 +522,13 @@ fn note(s: &mut State, action: &str, id: &ObjectId, code: Option<i32>) {
 fn unreadable_files(ctx: &Ctx, tree: &ObjectId) -> Result<usize> {
     let store = ctx.repo.store();
     let mut n = 0;
-    for (_, e) in veil_core::tree::walk_files(store, tree)? {
+    // A folder the server refuses counts as one (BUG-1508).
+    let (files, hidden) = veil_core::tree::walk_files_hiding(store, tree)?;
+    n += hidden.len();
+    // Readability is read by id: in a thin clone, each asked for at its
+    // own path first (BUG-1506).
+    veil_core::tree::prefetch_files(store, tree, files.iter().filter(|(_, e)| e.kind == veil_core::EntryKind::File).map(|(p, e)| (p, e)))?;
+    for (_, e) in files {
         if e.kind == veil_core::EntryKind::File && !store.entry_readable(&e) {
             n += 1;
         }
@@ -715,15 +721,24 @@ pub fn bisect(ctx: &mut Ctx, cmd: &BisectCmd) -> Result<ExitCode> {
             };
             let ws = ctx.ws.clone();
             let from = ObjectId::from_hex(&s.started_from).ok();
-            let visible = ctx.repo.visible_snapshots()?;
-            match from.filter(|f| visible.contains(f)) {
+            // Is the snapshot bisect started from still visible? Asked of the
+            // history above it only (exactly, in a thin clone).
+            let visible = |f: &ObjectId| -> Result<bool> {
+                let want: std::collections::HashSet<ObjectId> = [*f].into_iter().collect();
+                Ok(ctx.repo.exact().visible_among(&want)?.contains(f))
+            };
+            let from = match from {
+                Some(f) if visible(&f)? => Some(f),
+                _ => None,
+            };
+            match from {
                 Some(f) => ctx.repo.edit(&ws, f)?,
                 None => {
                     let parents: Vec<ObjectId> = s
                         .started_parents
                         .iter()
                         .filter_map(|h| ObjectId::from_hex(h).ok())
-                        .filter(|p| ctx.repo.snapshot_opt(p).ok().flatten().is_some())
+                        .filter(|p| ctx.repo.exact().snapshot(p).ok().flatten().is_some())
                         .collect();
                     if !parents.is_empty() {
                         ctx.repo.new_change(&ws, parents, "")?;

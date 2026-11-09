@@ -32,7 +32,7 @@ use crate::{
     lock::RepoLock,
     merge::{merge_trees, virtual_merge_base, MergeOutcome},
     now_millis,
-    object::{Snapshot, Text},
+    object::{Object, Snapshot, Text},
     oplog::{OpStore, Operation, RawHeads, View, WorkspaceState},
     policy::DEFAULT_SCOPE,
     graph_index::GraphIndex,
@@ -43,6 +43,17 @@ use crate::{
 };
 
 pub const VEIL_DIR: &str = ".veil";
+
+thread_local! {
+    /// Depth of [`Repo::exact`] on this thread: nested queries run once,
+    /// inside the outer one's rounds.
+    static EXACT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Is this thread inside [`Exact::run`]?
+pub(crate) fn in_exact() -> bool {
+    EXACT.with(|d| d.get() > 0)
+}
 
 /// The directory holding the Veil repository of the project at `root`:
 /// `<root>/.veil`.
@@ -62,6 +73,7 @@ pub fn state_dir(root: &Path) -> std::path::PathBuf {
 /// | 6 | vl 1.1.0 | the lock-free op log: `op_heads/`, `Operation::{workspace, rewritten}` |
 /// | 7 | vl 1.1.0 | key rings of ring format 4: invites, shares by members, a member's removal of their own device (`docs/HUB.md` §13.12) |
 /// | 8 | vl 1.1.0 | only secret files are encrypted: no encrypted descriptions, tag messages, tag names, embargoes, folders or lines of work; plain embargo records (embargo record format 2) |
+/// | 9 | vl 1.1.0 | a thin clone of a server project ([`PARTIAL_FORMAT`]): the `partial` marker, objects fetched on demand into `.veil/cache/` |
 ///
 /// This build reads format 8 only. `vl upgrade` brings formats 6 and 7 to
 /// it, after checking that they hold nothing the removed encryption of
@@ -72,6 +84,19 @@ pub const REPO_FORMAT: u32 = 8;
 /// Oldest repository format this build opens.
 pub const MIN_REPO_FORMAT: u32 = REPO_FORMAT;
 
+/// The format of a thin clone (`docs/HUB.md` §13.21): format 8 plus the
+/// `partial` marker in `repo.json`. Only `vl clone` writes it, for a thin
+/// clone; every other repository stays at [`REPO_FORMAT`], readable by the
+/// vl releases that read format 8. A vl that does not know format 9 refuses
+/// a thin clone instead of reading its unfetched objects as hidden.
+pub const PARTIAL_FORMAT: u32 = 9;
+
+/// Newest repository format this build opens.
+pub const MAX_REPO_FORMAT: u32 = PARTIAL_FORMAT;
+
+/// Default bound of a thin clone's object cache (`vl clone --cache-size`).
+pub const DEFAULT_CACHE_LIMIT: u64 = 4 << 30;
+
 /// Oldest repository format `vl upgrade` brings to [`REPO_FORMAT`].
 pub const MIN_UPGRADE_FORMAT: u32 = 6;
 
@@ -80,7 +105,7 @@ pub fn min_vl_for_format(format: u32) -> &'static str {
     match format {
         0 | 1 => "0.1.0",
         2..=5 => "1.0.0",
-        6..=8 => "1.1.0",
+        6..=9 => "1.1.0",
         _ => "a newer release",
     }
 }
@@ -99,11 +124,11 @@ pub fn check_format_supported(format: u32) -> Result<()> {
 }
 
 /// `Ok` if `vl upgrade` (and `vl fsck`) can read a repository of `format`:
-/// [`MIN_UPGRADE_FORMAT`] to [`REPO_FORMAT`].
+/// [`MIN_UPGRADE_FORMAT`] to [`MAX_REPO_FORMAT`].
 pub fn check_format_upgradable(format: u32) -> Result<()> {
-    if format > REPO_FORMAT {
+    if format > MAX_REPO_FORMAT {
         return Err(VeilError::Unsupported(format!(
-            "this repository uses format {format}, which needs a newer vl (this is vl {}, which reads format {REPO_FORMAT})",
+            "this repository uses format {format}, which needs a newer vl (this is vl {}, which reads formats {REPO_FORMAT} and {MAX_REPO_FORMAT})",
             env!("CARGO_PKG_VERSION")
         )));
     }
@@ -139,6 +164,17 @@ pub struct RemoteConfig {
     pub only: Option<String>,
 }
 
+/// The `partial` marker of a thin clone (format [`PARTIAL_FORMAT`],
+/// device-local): objects not in the main store are fetched from the
+/// server of remote `remote` when read, into the cache area, which is kept
+/// under `cache_limit` bytes (`docs/HUB.md` §13.21).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartialConfig {
+    pub remote: String,
+    pub cache_limit: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RepoConfig {
     /// Repository format ([`REPO_FORMAT`]). A reader refuses a format newer
@@ -152,6 +188,10 @@ pub struct RepoConfig {
     /// of releases that do not know the format yet ("needs vl ≥ X").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_vl: Option<String>,
+    /// A thin clone (format [`PARTIAL_FORMAT`] only; absent otherwise, so
+    /// other `repo.json` files keep their bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<PartialConfig>,
 }
 
 impl RepoConfig {
@@ -159,14 +199,34 @@ impl RepoConfig {
     /// it needs when the configuration says so.
     pub fn check_supported(&self) -> Result<()> {
         check_format_supported(self.format).map_err(|e| match (&e, &self.min_vl) {
-            (VeilError::Unsupported(_), Some(v)) if self.format > REPO_FORMAT => VeilError::Unsupported(format!(
+            (VeilError::Unsupported(_), Some(v)) if self.format > MAX_REPO_FORMAT => VeilError::Unsupported(format!(
                 "this repository uses format {} and needs vl {v} or later (this is vl {})",
                 self.format,
                 env!("CARGO_PKG_VERSION")
             )),
             _ => e,
         })?;
-        Ok(())
+        self.check_partial()
+    }
+
+    /// The `partial` marker and format 9 go together: a marker in another
+    /// format, or format 9 without one, is a damaged `repo.json` (threat 14
+    /// of `docs/design/scale/6-partial-clone.md`).
+    pub fn check_partial(&self) -> Result<()> {
+        match (&self.partial, self.format == PARTIAL_FORMAT) {
+            (Some(_), false) => Err(VeilError::Corrupt(
+                "repo.json".into(),
+                format!("a `partial` marker in a repository of format {} (only format {PARTIAL_FORMAT} has one)", self.format),
+            )),
+            (None, true) => Err(VeilError::Corrupt("repo.json".into(), format!("format {PARTIAL_FORMAT} without its `partial` marker"))),
+            (Some(p), true) if p.remote.is_empty() => Err(VeilError::Corrupt("repo.json".into(), "a `partial` marker naming no remote".into())),
+            _ => Ok(()),
+        }
+    }
+
+    /// Is this a thin clone?
+    pub fn is_partial(&self) -> bool {
+        self.partial.is_some()
     }
 }
 
@@ -193,10 +253,14 @@ pub struct Repo {
     pub(crate) user: String,
     pub(crate) root_id: ObjectId,
     /// The history index (`graph_index`): generations, to stop walks early.
-    pub(crate) graph: GraphIndex,
+    graph: GraphIndex,
     /// The heads the view was read from (ancestors dropped, sorted): the
     /// parents of the next operation.
     pub(crate) base: Vec<ObjectId>,
+    /// The newest timestamp of `base`: the next operation is never older
+    /// than its parents, even with the clock set back (the op log's walks
+    /// visit descendants first, BUG-1297).
+    pub(crate) base_time: i64,
     /// The head files as read.
     pub(crate) raw: RawHeads,
     /// Opened as a remote ([`Repo::open_remote`]): transactions take the
@@ -228,10 +292,77 @@ fn persists_index(backend: &dyn StorageBackend, view: &View) -> bool {
     !backend.is_network() && !view.workspaces.is_empty()
 }
 
+/// A rewrite: the old snapshot and its replacements (none: abandoned).
+type Rewritten = (ObjectId, Vec<ObjectId>);
+
+/// The operations a merge saw record one rewrite, and those of them that
+/// are commands (not merges recording a rewrite they applied).
+#[derive(Default)]
+struct Recorded {
+    ops: Vec<ObjectId>,
+    commands: Vec<ObjectId>,
+}
+
+/// A ref of a view the merge's rebase re-points: a workspace, a tag, a head.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum RefKey {
+    Ws(String),
+    Tag(String),
+    Head(ObjectId),
+}
+
+/// Each ref of `view` with its value (the snapshot it names).
+fn ref_values(view: &View) -> Vec<(RefKey, ObjectId)> {
+    let mut out: Vec<(RefKey, ObjectId)> = view.workspaces.iter().map(|(n, w)| (RefKey::Ws(n.clone()), w.wc)).collect();
+    out.extend(view.tags.iter().map(|(n, t)| (RefKey::Tag(n.clone()), t.target)));
+    out.extend(view.heads.iter().map(|h| (RefKey::Head(*h), *h)));
+    out
+}
+
+/// What an operation takes back (see `Repo::retractor`).
+pub(crate) enum Retractor {
+    Undo(ObjectId),
+    Redo(ObjectId),
+    Restore(std::collections::HashSet<ObjectId>),
+}
+
+/// The operations the retractors take back, those taken back themselves
+/// (an undo of a restore, a redo of an undo) taking back nothing.
+pub(crate) fn retracted_commands(retractors: &BTreeMap<ObjectId, Retractor>) -> std::collections::HashSet<ObjectId> {
+    let mut out: std::collections::HashSet<ObjectId> = Default::default();
+    // A fixed point: each round recomputes from the retractors still in
+    // force; an operation only takes back older ones, so it settles.
+    for _ in 0..=retractors.len() {
+        let mut next: std::collections::HashSet<ObjectId> = Default::default();
+        for (id, r) in retractors {
+            if out.contains(id) {
+                continue;
+            }
+            match r {
+                Retractor::Undo(u) => {
+                    next.insert(*u);
+                }
+                Retractor::Redo(u) => {
+                    next.insert(*u);
+                }
+                Retractor::Restore(ops) => next.extend(ops.iter().copied()),
+            }
+        }
+        if next == out {
+            break;
+        }
+        out = next;
+    }
+    out
+}
+
 /// See `Repo::merge_plan`.
 pub(crate) struct MergePlan {
     pub(crate) view: View,
     pub(crate) rewritten: BTreeMap<ObjectId, Vec<ObjectId>>,
+    /// Refs the rebase leaves where they are: set on an old snapshot by an
+    /// operation that saw its rewrite (BUG-1434).
+    pub(crate) pinned: std::collections::BTreeSet<RefKey>,
     pub(crate) before: Vec<View>,
     pub(crate) timestamp: i64,
     pub(crate) warnings: Vec<String>,
@@ -297,6 +428,7 @@ impl Repo {
             repo_id: hex::encode(random_bytes::<16>()),
             remotes: BTreeMap::new(),
             min_vl: (format > 1).then(|| min_vl_for_format(format).to_string()),
+            partial: None,
         };
         let has_identity = identity.is_some();
         let keys = Arc::new(Keychain::new(backend.clone(), identity, config.repo_id.clone()));
@@ -348,6 +480,7 @@ impl Repo {
             redo_of: None,
             workspace: None,
             rewritten: Default::default(),
+            restore_of: None,
         };
         let op_id = ops.publish(&op, &RawHeads::default())?;
         // `repo.json` is what makes this a repository, so it is written last:
@@ -367,6 +500,7 @@ impl Repo {
             user: user.to_string(),
             root_id,
             base: vec![op_id],
+            base_time: op.timestamp,
             raw: RawHeads {
                 all: vec![op_id],
                 legacy: None,
@@ -404,6 +538,9 @@ impl Repo {
         let keys = Arc::new(Keychain::new(backend.clone(), identity, config.repo_id.clone()));
         let store = Arc::new(ObjectStore::new(backend.clone(), VPath::new(".veil/objects")?, keys));
         store.set_format(config.format);
+        if let Some(p) = &config.partial {
+            store.set_partial(VPath::new(crate::promisor::CACHE_DIR)?, p.cache_limit);
+        }
         let root_id = store.put_snapshot(&Snapshot::root(store.empty_tree()?))?;
         let ops = OpStore::new(backend.clone());
         ops.set_format(config.format);
@@ -419,6 +556,7 @@ impl Repo {
             user: user.to_string(),
             root_id,
             base: Vec::new(),
+            base_time: 0,
             raw: RawHeads::default(),
             remote,
             command_ws: None,
@@ -468,18 +606,230 @@ impl Repo {
             return Ok(false);
         }
         let heads = self.ops.drop_ancestors(&raw.all)?;
-        let (op_id, view) = match heads.as_slice() {
-            [one] => (*one, self.ops.get_head(one)?.view),
+        let (op_id, view, time) = match heads.as_slice() {
+            [one] => {
+                let op = self.ops.get_head(one)?;
+                (*one, op.view, op.timestamp)
+            }
             _ => {
                 let plan = self.merge_plan(&heads, false)?;
-                (self.ops.head()?, plan.view)
+                (self.ops.head()?, plan.view, plan.timestamp)
             }
         };
         self.raw = raw;
         self.base = heads;
+        self.base_time = time;
         self.op_id = op_id;
         self.view = view;
+        self.pin_working_copies();
         Ok(true)
+    }
+
+    /// A thin clone pins what its workspaces hold (never evicted from the
+    /// cache): called whenever the view changes.
+    pub(crate) fn pin_working_copies(&self) {
+        if self.store.is_partial() {
+            self.store.set_anchor_snapshots(self.view.workspaces.values().map(|w| w.wc).collect());
+            let mut heads: Vec<ObjectId> = self.view.heads.iter().copied().collect();
+            heads.extend(self.view.tags.values().map(|t| t.target));
+            heads.extend(self.view.workspaces.values().map(|w| w.wc));
+            let remote = self.config.partial.as_ref().map_or("", |p| p.remote.as_str());
+            self.store.set_local_heads(heads, crate::promisor::own_tips(&self.view.remote_tags, remote).collect());
+        }
+    }
+
+    /// Is this a thin clone (`docs/HUB.md` §13.21)?
+    pub fn is_partial(&self) -> bool {
+        self.config.partial.is_some()
+    }
+
+    /// Run graph query `f` exactly in a thin clone: when its walk reached
+    /// snapshots this clone does not hold (its boundary), fetch the next
+    /// page of history from the server and run it again, until the walk
+    /// stays inside what is held or the server has no more. In any other
+    /// repository, `f` once. A thin clone that cannot reach the server
+    /// fails with [`VeilError::Unavailable`]; it never answers from the
+    /// part of the graph it holds alone.
+    fn run_exact<R>(&self, mut f: impl FnMut(&Repo) -> Result<R>) -> Result<R> {
+        if !self.store.is_partial() || EXACT.with(|d| d.get() > 0) {
+            return f(self);
+        }
+        EXACT.with(|d| d.set(d.get() + 1));
+        struct Undo;
+        impl Drop for Undo {
+            fn drop(&mut self) {
+                EXACT.with(|d| d.set(d.get() - 1));
+            }
+        }
+        let _undo = Undo;
+        loop {
+            let _ = self.store.take_boundary_hits();
+            // An error too (a revision not found) is answered again once
+            // the history it may be in is here.
+            let out = f(self);
+            let hits = self.store.take_boundary_hits();
+            if hits.is_empty() || self.deepen(&hits, crate::promisor::HISTORY_PAGE)? == 0 {
+                return out;
+            }
+        }
+    }
+
+    /// A thin clone: the generation of snapshot `id` (held, at the boundary)
+    /// as the server's viewer graph has it, the history index's exact value
+    /// without the ancestry below (BUG-1291). `None`: not a thin clone, a
+    /// server older than protocol revision 6, or a snapshot its history
+    /// lacks (one of this clone's own). An error when it cannot be reached.
+    pub(crate) fn boundary_generation(&self, id: &ObjectId) -> Result<Option<u64>> {
+        if !self.store.is_partial() || !self.store.may_fetch() {
+            return Ok(None);
+        }
+        let Some(promisor) = self.store.promisor() else {
+            return Err(VeilError::Unavailable("this thin clone has no connection to its server".into()));
+        };
+        Ok(promisor.generations(&[*id])?.and_then(|g| g.first().copied().flatten()))
+    }
+
+    /// Fetch one page of history below `tips` (snapshots this thin clone
+    /// lacks) into the main store; returns how many snapshots were new.
+    /// Only tips a full clone made now would hold are asked for (below a
+    /// held snapshot, or a name what the server's branches or this clone's
+    /// own refs reach, BUG-1319); the others are not found, as there.
+    pub fn deepen(&self, tips: &[ObjectId], limit: usize) -> Result<usize> {
+        let Some(promisor) = self.store.promisor() else {
+            return Err(VeilError::Unavailable(
+                "this command needs history this thin clone does not hold, and has no connection to its server".into(),
+            ));
+        };
+        let mut wanted = Vec::with_capacity(tips.len());
+        for t in tips {
+            if self.may_page(t)? {
+                wanted.push(*t);
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(0);
+        }
+        let page = promisor.history(&wanted, limit)?;
+        let mut incoming = crate::remote::Incoming::new(&self.store);
+        let mut new = 0;
+        for (id, raw) in page {
+            if ObjectId::hash(&raw) != id {
+                return Err(VeilError::Corrupt(id.hex(), "the server sent history that does not match its ids".into()));
+            }
+            if !matches!(Object::decode(&raw)?, Object::Snapshot(_)) {
+                return Err(VeilError::Corrupt(id.hex(), "the server sent a non-snapshot in history".into()));
+            }
+            if !self.store.has(&id) && incoming.put(id, raw, "")? {
+                new += 1;
+            }
+        }
+        incoming.finish()?;
+        if new > 0 {
+            self.store.forget_server_walk();
+            self.graph.revalidate(self);
+        }
+        Ok(new)
+    }
+
+    /// A thin clone, about to page in snapshot `id`, which it does not
+    /// hold: would a full clone made now hold it? Two questions, two rules
+    /// (BUG-1319, BUG-1268):
+    ///
+    /// * **History below what the clone holds** (a parent of a held
+    ///   snapshot): always. The person was sent the child; what is below
+    ///   is theirs, also when a rewrite elsewhere left it off the branches.
+    /// * **A name** (any other snapshot: a predecessor `vl evolog` follows,
+    ///   an id typed): only if the server's branches reach it (`q/resolve`,
+    ///   which answers from what they reach), or what this clone holds
+    ///   reaches it (its view and its operation log, as a full clone's gc
+    ///   keeps them: a walk down to the server's generation of `id`, which
+    ///   pages in only that range). An old version a rewrite left behind
+    ///   that nothing here reaches is not found, as in a full clone.
+    ///
+    /// A server older than protocol revision 6 cannot tell: the page is
+    /// asked for, as before.
+    fn may_page(&self, id: &ObjectId) -> Result<bool> {
+        if !self.store.is_partial() || self.store.is_below_held(id) {
+            return Ok(true);
+        }
+        let Some(promisor) = self.store.promisor() else { return Ok(true) };
+        let Some((from, whole)) = self.server_roots(true)? else { return Ok(true) };
+        match promisor.resolve(&id.hex(), &from)? {
+            None => return Ok(true),
+            Some(r) if r.snapshots.contains(id) => return Ok(true),
+            // Every root counted: nothing here reaches it.
+            Some(_) if whole => return Ok(false),
+            Some(_) => {}
+        }
+        // More roots than one request names: a walk from all of them,
+        // down to the server's generation of `id` (only that range is
+        // paged in).
+        let floor = match promisor.generations(&[*id])? {
+            None => return Ok(true),
+            Some(g) => match g.first().copied().flatten() {
+                Some(g) => g,
+                // Not in this person's history at all.
+                None => return Ok(false),
+            },
+        };
+        let mut roots: Vec<ObjectId> = self.view.refs();
+        roots.extend(self.store.op_log_heads());
+        roots.sort();
+        roots.dedup();
+        // A walk of its own (inside an `Exact` query, whose hits are put
+        // back): pages in only what is below what it holds.
+        let outer = self.store.take_boundary_hits();
+        let reached = (|| loop {
+            if self.graph.down_to(self, roots.iter().copied(), floor)?.contains_key(id) {
+                return Ok(true);
+            }
+            let below: Vec<ObjectId> = self.store.take_boundary_hits().into_iter().filter(|h| self.store.is_below_held(h)).collect();
+            if below.is_empty() || self.deepen(&below, crate::promisor::HISTORY_PAGE)? == 0 {
+                return Ok(false);
+            }
+        })();
+        let _ = self.store.take_boundary_hits();
+        self.store.restore_boundary_hits(outer);
+        reached
+    }
+
+    /// A thin clone's own refs as its server knows them, for `q/resolve`'s
+    /// `from` (BUG-1319): the view's refs (with `op_log`, every
+    /// operation's too, as a full clone's gc keeps them), each the server
+    /// has no snapshot of (this clone's own work) replaced by its held
+    /// parents. With whether they all fit in one request
+    /// ([`crate::hub::wire::MAX_RESOLVE_FROM`]). `None`: a server older
+    /// than protocol revision 6 (it cannot tell).
+    pub(crate) fn server_roots(&self, op_log: bool) -> Result<Option<(Vec<ObjectId>, bool)>> {
+        use crate::hub::wire::{MAX_GENERATIONS, MAX_RESOLVE_FROM};
+        let Some(promisor) = self.store.promisor() else { return Ok(Some((Vec::new(), true))) };
+        let mut todo: Vec<ObjectId> = self.view.refs();
+        if op_log {
+            todo.extend(self.store.op_log_heads());
+        }
+        let (mut out, mut seen, mut whole) = (Vec::new(), HashSet::new(), true);
+        // Local work is a few commits deep: a few rounds.
+        for _ in 0..16 {
+            todo.retain(|x| seen.insert(*x));
+            if todo.is_empty() {
+                break;
+            }
+            let batch: Vec<ObjectId> = todo.drain(..todo.len().min(MAX_GENERATIONS)).collect();
+            let Some(gens) = promisor.generations(&batch)? else { return Ok(None) };
+            for (x, g) in batch.iter().zip(gens) {
+                match g {
+                    Some(_) => out.push(*x),
+                    None => {
+                        if let Some(s) = self.snapshot_held(x)? {
+                            todo.extend(s.parents.iter().copied());
+                        }
+                    }
+                }
+            }
+        }
+        whole &= todo.is_empty() && out.len() <= MAX_RESOLVE_FROM;
+        out.truncate(MAX_RESOLVE_FROM);
+        Ok(Some((out, whole)))
     }
 
     /// Re-read the operation heads (another process or task may have
@@ -570,9 +920,28 @@ impl Repo {
         let mut timestamp = first.timestamp;
         let mut acc = first.view;
         let mut before = vec![acc.clone()];
+        // The views of the heads merged so far.
+        let mut head_views = vec![acc.clone()];
         let mut warnings = Vec::new();
-        let mut rewritten: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
-        let mut divergent: std::collections::BTreeSet<ObjectId> = Default::default();
+        // Every rewrite seen (old snapshot, its replacements), with the
+        // operations that recorded it, keyed by the rewrite (BUG-1299). A
+        // command's rewrites are taken back only by what the op log says
+        // takes the command back: an undo of it, an op restore past it
+        // (BUG-1434: showing an old snapshot again is never an undo). A
+        // rewrite only merges recorded is judged by the views (`undone`).
+        let mut seen: BTreeMap<Rewritten, Recorded> = BTreeMap::new();
+        let mut undone: std::collections::HashSet<Rewritten> = Default::default();
+        let mut retractors: BTreeMap<ObjectId, Retractor> = BTreeMap::new();
+        // Which command set each ref value (an operation of a side's own
+        // history, not a merge): a ref on an old snapshot set by a command
+        // that saw its rewrite is deliberate, and stays (a tag on the old
+        // version, a workspace on it, an undo's revert).
+        let mut introducers: HashMap<(RefKey, ObjectId), Vec<ObjectId>> = HashMap::new();
+        let mut scanned: std::collections::HashSet<ObjectId> = Default::default();
+        // Every step's conflict losers: a later step's removal of the head
+        // (a side that dropped it, unaware of the losing write) never hides
+        // one (BUG-1298).
+        let mut losers: Vec<ObjectId> = Vec::new();
         for h in &heads[1..] {
             let op = self.ops.get(h)?;
             timestamp = timestamp.max(op.timestamp);
@@ -585,41 +954,106 @@ impl Repo {
             // (BUG-1294).
             let shared = crate::oplog::shared_base(&base, &acc, &split.introduced(&split.only_a), &op.view, &split.introduced(&split.only_b));
             if rewrites {
-                for (ids, side) in [(&split.only_a, &acc), (&split.only_b, &op.view)] {
-                    let refs: std::collections::HashSet<ObjectId> = side.refs().into_iter().collect();
-                    // Oldest first: a later rewrite of a snapshot wins.
-                    let mut side_map: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
-                    for id in ids.iter().rev() {
-                        if let Some(o) = self.ops.try_get(id)? {
-                            for (old, new) in o.rewritten {
-                                side_map.insert(old, new);
+                for (ids, sides) in [(&split.only_a, &head_views[..]), (&split.only_b, std::slice::from_ref(&op.view))] {
+                    // Each rewrite with the operations that recorded it (and
+                    // those that are commands, not merges recording what
+                    // they applied). A rewrite of a snapshot by an operation
+                    // that descends from another's rewrite of it replaces
+                    // that one; concurrent ones (merged on that side as a
+                    // divergent change) all stay. One an earlier step
+                    // collected is decided already.
+                    let mut by_old: BTreeMap<ObjectId, Vec<(Vec<ObjectId>, ObjectId, bool)>> = BTreeMap::new();
+                    for id in ids.iter() {
+                        if let Some(o) = split.ops.get(id) {
+                            for (old, new) in &o.rewritten {
+                                by_old.entry(*old).or_default().push((new.clone(), *id, !o.is_merge()));
                             }
                         }
                     }
-                    // Undone on that side since: it shows `old` again, as
-                    // a ref or as an ancestor of one (an undone abandon or
-                    // amend of a parent of `@`). One walk from the refs, down
-                    // to the oldest rewritten snapshot.
-                    let mut floor = crate::graph_index::Gen::MAX;
-                    for old in side_map.keys() {
-                        if let Some(g) = self.graph.generation(self, old)? {
-                            floor = floor.min(g);
+                    let mut side_map: BTreeMap<Rewritten, Recorded> = BTreeMap::new();
+                    let mut below: Option<HashMap<ObjectId, std::collections::HashSet<ObjectId>>> = None;
+                    for (old, entries) in by_old {
+                        let differ = entries.iter().any(|(n, _, _)| *n != entries[0].0);
+                        for (new, id, command) in &entries {
+                            let replaced = differ && {
+                                let below = below.get_or_insert_with(|| split.ancestors_within(ids));
+                                entries.iter().any(|(n2, id2, _)| n2 != new && below.get(id2).is_some_and(|b| b.contains(id)))
+                            };
+                            if replaced {
+                                continue;
+                            }
+                            let r = side_map.entry((old, new.clone())).or_default();
+                            r.ops.push(*id);
+                            if *command {
+                                r.commands.push(*id);
+                            }
                         }
                     }
-                    let visible: std::collections::HashSet<ObjectId> = match floor {
-                        crate::graph_index::Gen::MAX => Default::default(),
-                        f => self.graph.down_to(self, refs.iter().copied(), f)?.into_keys().collect(),
-                    };
-                    for (old, new) in side_map {
-                        if refs.contains(&old) || visible.contains(&old) {
+                    side_map.retain(|k, r| !seen.get(k).is_some_and(|s| r.ops.iter().all(|o| s.ops.contains(o))));
+                    // Undone on that side since: one of its heads shows
+                    // `old` again, as a ref or as an ancestor of one (an
+                    // undone abandon or amend of a parent of `@`, BUG-802).
+                    // Every head of the side saw the rewrite (it first
+                    // appears here); each is asked, not their merged view,
+                    // where a conflict may have hidden what one shows.
+                    let mut olds: Vec<ObjectId> = side_map.keys().map(|k| k.0).collect();
+                    olds.dedup();
+                    let mut shown = std::collections::HashSet::new();
+                    if !olds.is_empty() {
+                        for v in sides {
+                            shown.extend(self.shown(v, &olds)?);
+                        }
+                    }
+                    for (k, rec) in side_map {
+                        let r = seen.entry(k.clone()).or_default();
+                        r.ops.extend(rec.ops);
+                        r.commands.extend(rec.commands);
+                        if r.commands.is_empty() && shown.contains(&k.0) {
+                            undone.insert(k);
+                        }
+                    }
+                    for id in ids.iter() {
+                        let Some(o) = split.ops.get(id) else { continue };
+                        if !scanned.insert(*id) {
                             continue;
                         }
-                        match rewritten.get(&old) {
-                            Some(prev) if *prev != new => {
-                                divergent.insert(old);
+                        if let Some(r) = self.retractor(o)? {
+                            retractors.insert(*id, r);
+                        }
+                        // A merge sets nothing deliberately (what it adds are
+                        // rebases and a conflict's losers).
+                        if o.is_merge() {
+                            continue;
+                        }
+                        let parents: Vec<std::collections::HashSet<(RefKey, ObjectId)>> =
+                            o.parents.iter().filter_map(|p| split.ops.get(p)).map(|p| ref_values(&p.view).into_iter().collect()).collect();
+                        for kv in ref_values(&o.view) {
+                            if !parents.iter().any(|p| p.contains(&kv)) {
+                                introducers.entry(kv).or_default().push(*id);
                             }
-                            _ => {
-                                rewritten.insert(old, new);
+                        }
+                    }
+                }
+                // A rewrite only merges recorded (the op log does not say
+                // which command it is, so not what took it back), undone by
+                // a head merged after the step that collected it (BUG-1295):
+                // this head saw it and shows `old`; or a side shows `old`
+                // where the shared history does not (a rewrite from the
+                // shared history, recorded again by a settler's merge on the
+                // other side: the side showing `old` brought it back).
+                let live: Vec<Rewritten> = seen.iter().filter(|(k, r)| r.commands.is_empty() && !undone.contains(*k)).map(|(k, _)| k.clone()).collect();
+                if !live.is_empty() {
+                    let mut olds: Vec<ObjectId> = live.iter().map(|k| k.0).collect();
+                    olds.dedup();
+                    let in_shared = self.shown(&shared, &olds)?;
+                    let only_a: std::collections::HashSet<&ObjectId> = split.only_a.iter().collect();
+                    for (side, head) in [(&acc, false), (&op.view, true)] {
+                        let shown = self.shown(side, &olds)?;
+                        for k in live.iter().filter(|k| shown.contains(&k.0)) {
+                            let r = &seen[k];
+                            let saw = head && r.ops.iter().any(|o| !only_a.contains(o));
+                            if saw || !in_shared.contains(&k.0) {
+                                undone.insert(k.clone());
                             }
                         }
                     }
@@ -630,21 +1064,133 @@ impl Repo {
             let mut descends = |a: &ObjectId, b: &ObjectId| self.is_ancestor(b, a).unwrap_or(false);
             let merged = crate::oplog::merge_views(&shared, &[&acc, &op.view], &mut descends);
             warnings.extend(merged.warnings);
+            losers.extend(merged.losers);
             acc = merged.view;
             acc_heads.push(*h);
+            if rewrites {
+                head_views.push(op.view.clone());
+            }
         }
-        // Both sides rewrote it differently: a divergent change, both
-        // replacements stay visible and nothing follows either.
-        for d in divergent {
-            rewritten.remove(&d);
+        acc.heads.extend(losers);
+        // The commands the op log says were taken back: by an undo or op
+        // restore that is not itself taken back (an undo of the restore, a
+        // redo of the undo).
+        let retracted = retracted_commands(&retractors);
+        // A command's rewrite by the op log alone (even if a merge recorded
+        // it first, and the view rule judged it there); one only merges
+        // recorded by the views.
+        let stands = |k: &Rewritten, r: &Recorded| match r.commands.is_empty() {
+            true => !undone.contains(k),
+            false => r.commands.iter().any(|o| !retracted.contains(o)),
+        };
+        // The rewrites nobody undid. Two different ones of a snapshot: a
+        // divergent change, both replacements stay visible and nothing
+        // follows either.
+        let mut rewritten: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
+        let mut divergent: std::collections::BTreeSet<ObjectId> = Default::default();
+        let mut commands_of: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
+        let applied: Vec<(Rewritten, Recorded)> = seen.into_iter().filter(|(k, r)| stands(k, r)).collect();
+        for ((old, new), r) in applied {
+            commands_of.entry(old).or_default().extend(r.commands.iter().filter(|o| !retracted.contains(o)).copied());
+            match rewritten.get(&old) {
+                Some(prev) if *prev != new => {
+                    divergent.insert(old);
+                }
+                _ => {
+                    rewritten.insert(old, new);
+                }
+            }
+        }
+        for d in &divergent {
+            rewritten.remove(d);
+        }
+        // Refs on an old snapshot that a command which saw each rewrite of
+        // what they show set stay where they are (BUG-1434: a tag on the old
+        // version, a workspace on it, an undo's revert); a ref some rewrite
+        // it shows is new to follows the rewrites.
+        let mut pinned: std::collections::BTreeSet<RefKey> = Default::default();
+        if rewrites && !rewritten.is_empty() {
+            for (key, v) in ref_values(&acc) {
+                let mut shows = 0;
+                let mut deliberate = true;
+                for old in rewritten.keys() {
+                    if !(v == *old || self.is_ancestor(old, &v)?) {
+                        continue;
+                    }
+                    shows += 1;
+                    let commands = commands_of.get(old).map(Vec::as_slice).unwrap_or_default();
+                    if commands.is_empty() || !self.set_after(introducers.get(&(key.clone(), v)), commands)? {
+                        deliberate = false;
+                        break;
+                    }
+                }
+                if shows > 0 && deliberate {
+                    pinned.insert(key);
+                }
+            }
         }
         Ok(MergePlan {
             view: acc,
             rewritten,
+            pinned,
             before,
             timestamp,
             warnings,
         })
+    }
+
+    /// Did one of `introducers` (the operations that set a ref value)
+    /// descend from one of `commands`?
+    fn set_after(&self, introducers: Option<&Vec<ObjectId>>, commands: &[ObjectId]) -> Result<bool> {
+        for x in introducers.into_iter().flatten() {
+            for c in commands {
+                if x == c || self.ops.split(&[*x], &[*c])?.only_b.is_empty() {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// What operation `o` takes back, by the op log: an undo the operation
+    /// it undid, a redo the undo it reverts, an op restore every operation
+    /// between the restored one and its parents (a restore written before
+    /// `restore_of` names the restored operation in its description).
+    pub(crate) fn retractor(&self, o: &crate::oplog::Operation) -> Result<Option<Retractor>> {
+        if let Some(u) = o.undo_of {
+            return Ok(Some(Retractor::Undo(u)));
+        }
+        if let Some(u) = o.redo_of {
+            return Ok(Some(Retractor::Redo(u)));
+        }
+        let target = match o.restore_of {
+            Some(t) => Some(t),
+            None => match o.description.strip_prefix("restore to operation ") {
+                Some(prefix) if !o.parents.is_empty() && !o.is_merge() => self.ops.resolve_prefix_from(&o.parents, prefix).ok(),
+                _ => None,
+            },
+        };
+        match target {
+            Some(t) => Ok(Some(Retractor::Restore(self.ops.split(&o.parents, &[t])?.only_a.into_iter().collect()))),
+            None => Ok(None),
+        }
+    }
+
+    /// The snapshots of `olds` that `view` shows: as a ref, or as an
+    /// ancestor of one. One walk from the refs, down to the oldest of them.
+    fn shown(&self, view: &View, olds: &[ObjectId]) -> Result<std::collections::HashSet<ObjectId>> {
+        let mut floor = crate::graph_index::Gen::MAX;
+        for old in olds {
+            if let Some(g) = self.graph.generation(self, old)? {
+                floor = floor.min(g);
+            }
+        }
+        let refs: std::collections::HashSet<ObjectId> = view.refs().into_iter().collect();
+        let visible: std::collections::HashSet<ObjectId> = match floor {
+            crate::graph_index::Gen::MAX => Default::default(),
+            f => self.graph.down_to(self, refs.iter().copied(), f)?.into_keys().collect(),
+        };
+        Ok(olds.iter().filter(|o| refs.contains(o) || visible.contains(o)).copied().collect())
     }
 
     /// Set the workspace the operations of this command are for
@@ -699,10 +1245,6 @@ impl Repo {
     pub fn root_id(&self) -> ObjectId {
         self.root_id
     }
-    /// The history index.
-    pub fn graph(&self) -> &GraphIndex {
-        &self.graph
-    }
     pub fn user(&self) -> &str {
         &self.user
     }
@@ -716,6 +1258,12 @@ impl Repo {
     pub fn save_config(&mut self, config: RepoConfig) -> Result<()> {
         config.check_supported()?;
         write_config(&*self.backend, &config)?;
+        if let Some(p) = &config.partial {
+            match self.store.is_partial() {
+                false => self.store.set_partial(VPath::new(crate::promisor::CACHE_DIR)?, p.cache_limit),
+                true => self.store.set_cache_limit(p.cache_limit),
+            }
+        }
         self.store.set_format(config.format);
         self.ops.set_format(config.format);
         self.config = config;
@@ -740,13 +1288,38 @@ impl Repo {
     }
 
     pub fn snapshot(&self, id: &ObjectId) -> Result<Arc<Snapshot>> {
-        self.store.snapshot(id)
+        self.snapshot_opt(id)?.ok_or(VeilError::Missing(*id))
     }
 
     /// Like [`Repo::snapshot`], but `None` for a snapshot this replica does
     /// not hold. Graph walks use it: a public remote withholds the merged-in
     /// history of an unreleased embargoed merge, so such parents are absent.
-    pub fn snapshot_opt(&self, id: &ObjectId) -> Result<Option<Arc<Snapshot>>> {
+    ///
+    /// **A thin clone** fetches a page of history from the server when the
+    /// snapshot is beyond what it holds (BUG-1141): every command that reads
+    /// a snapshot reads it as a full clone would, and `None` is the
+    /// server's own answer (this person's history has no such snapshot).
+    /// Without the server: `Unavailable`. The one walk that must not fetch
+    /// (the history index computes a generation from every ancestor) reads
+    /// with [`Repo::snapshot_held`].
+    fn snapshot_opt(&self, id: &ObjectId) -> Result<Option<Arc<Snapshot>>> {
+        if let Some(s) = self.snapshot_held(id)? {
+            return Ok(Some(s));
+        }
+        if !self.store.may_fetch() || self.store.history_refused(id, false) {
+            return Ok(None);
+        }
+        let _ = self.store.take_boundary_hits_of_one(id);
+        if self.deepen(&[*id], crate::promisor::HISTORY_PAGE)? == 0 && !self.store.has_main(id) {
+            self.store.history_refused(id, true);
+            return Ok(None);
+        }
+        self.snapshot_held(id)
+    }
+
+    /// [`Repo::snapshot_opt`] of what this replica holds, never fetching:
+    /// `None` beyond a thin clone's boundary (recorded for [`Repo::exact`]).
+    fn snapshot_held(&self, id: &ObjectId) -> Result<Option<Arc<Snapshot>>> {
         match self.store.snapshot(id) {
             Ok(s) => Ok(Some(s)),
             Err(VeilError::Missing(_)) => Ok(None),
@@ -767,7 +1340,7 @@ impl Repo {
 
     /// Snapshots reachable from `roots`, children before parents, newest
     /// first among unrelated snapshots.
-    pub fn topo_children_first(&self, roots: impl IntoIterator<Item = ObjectId>) -> Result<Vec<ObjectId>> {
+    fn topo_children_first(&self, roots: impl IntoIterator<Item = ObjectId>) -> Result<Vec<ObjectId>> {
         let mut nodes: HashMap<ObjectId, Arc<Snapshot>> = HashMap::new();
         let mut stack: Vec<ObjectId> = roots.into_iter().collect();
         while let Some(id) = stack.pop() {
@@ -776,7 +1349,7 @@ impl Repo {
             }
             // A redacted parent (withheld by an unreleased embargo) is simply
             // not part of this replica's graph.
-            let Some(s) = self.snapshot_opt(&id)? else { continue };
+            let Some(s) = self.snapshot_held(&id)? else { continue };
             stack.extend(s.parents.iter().copied());
             nodes.insert(id, s);
         }
@@ -805,18 +1378,18 @@ impl Repo {
         Ok(out)
     }
 
-    pub fn visible_snapshots(&self) -> Result<Vec<ObjectId>> {
+    fn visible_snapshots(&self) -> Result<Vec<ObjectId>> {
         self.topo_children_first(self.view.refs())
     }
 
     /// [`Repo::topo_children_first`] of `roots`, lazily: callers that need
     /// only the first few snapshots read only the history above them.
-    pub fn topo_iter(&self, roots: impl IntoIterator<Item = ObjectId>) -> crate::graph_index::TopoIter<'_> {
+    fn topo_iter(&self, roots: impl IntoIterator<Item = ObjectId>) -> crate::graph_index::TopoIter<'_> {
         self.graph.topo_iter(self, roots)
     }
 
     /// The visible snapshots ([`Repo::visible_snapshots`]), lazily.
-    pub fn visible_iter(&self) -> crate::graph_index::TopoIter<'_> {
+    fn visible_iter(&self) -> crate::graph_index::TopoIter<'_> {
         self.topo_iter(self.view.refs())
     }
 
@@ -824,7 +1397,7 @@ impl Repo {
     /// (generation, then timestamp, then id). Found through the history
     /// index, which walks only lines that build on one: with no embargo in
     /// the history, nothing is walked.
-    pub fn visible_embargoed(&self) -> Result<Vec<ObjectId>> {
+    fn visible_embargoed(&self) -> Result<Vec<ObjectId>> {
         let found = self.graph.embargoed_among(self, self.view.refs())?;
         let mut out = Vec::with_capacity(found.len());
         for id in found {
@@ -837,16 +1410,16 @@ impl Repo {
 
     /// Which of `candidates` are visible (reachable from the view)? Reads
     /// only the history above the oldest candidate.
-    pub fn visible_among(&self, candidates: &HashSet<ObjectId>) -> Result<HashSet<ObjectId>> {
+    fn visible_among(&self, candidates: &HashSet<ObjectId>) -> Result<HashSet<ObjectId>> {
         self.graph.reachable_among(self, self.view.refs(), candidates)
     }
 
-    pub fn ancestors(&self, id: &ObjectId) -> Result<HashSet<ObjectId>> {
+    fn ancestors(&self, id: &ObjectId) -> Result<HashSet<ObjectId>> {
         let mut seen = HashSet::new();
         let mut stack = vec![*id];
         while let Some(x) = stack.pop() {
             if seen.insert(x) {
-                if let Some(s) = self.snapshot_opt(&x)? {
+                if let Some(s) = self.snapshot_held(&x)? {
                     stack.extend(s.parents.iter().copied());
                 }
             }
@@ -857,15 +1430,34 @@ impl Repo {
     /// Is `a` an ancestor of (or equal to) `b`? Reads only the history
     /// between them (the history index stops the walk below `a`).
     pub fn is_ancestor(&self, a: &ObjectId, b: &ObjectId) -> Result<bool> {
-        // A snapshot this replica lacks (a redacted parent) has no
-        // generation; it is an ancestor if some ancestor names it.
-        if a != b && self.snapshot_opt(a)?.is_none() {
-            return Ok(self.ancestors(b)?.contains(a));
-        }
-        self.graph.is_ancestor(self, a, b)
+        // A thin clone answers from the server's history where the walk
+        // reaches what it does not hold.
+        self.run_exact(|r| {
+            // A snapshot this replica lacks (a redacted parent) has no
+            // generation; it is an ancestor if some ancestor names it.
+            if a != b && r.snapshot_opt(a)?.is_none() {
+                // A thin clone asked its server: `a` is in no history of
+                // this person's, so it is no ancestor (never a walk of all
+                // of `b`'s ancestry, BUG-1291).
+                if r.store.is_partial() {
+                    return Ok(false);
+                }
+                return Ok(r.ancestors(b)?.contains(a));
+            }
+            r.graph.is_ancestor(r, a, b)
+        })
     }
 
     pub fn common_ancestor(&self, a: &ObjectId, b: &ObjectId) -> Result<ObjectId> {
+        // A thin clone: the newest merge base, a walk bounded by the history
+        // index (the walk of every ancestor of `a` is not, BUG-1291).
+        if self.store.is_partial() {
+            return Ok(self.merge_bases(&[*a], &[*b])?.last().copied().unwrap_or(self.root_id));
+        }
+        self.run_exact(|r| r.common_ancestor_here(a, b))
+    }
+
+    fn common_ancestor_here(&self, a: &ObjectId, b: &ObjectId) -> Result<ObjectId> {
         let anc = self.ancestors(a)?;
         let mut queue = VecDeque::from([*b]);
         let mut seen = HashSet::new();
@@ -874,7 +1466,7 @@ impl Repo {
                 return Ok(x);
             }
             if seen.insert(x) {
-                if let Some(s) = self.snapshot_opt(&x)? {
+                if let Some(s) = self.snapshot_held(&x)? {
                     queue.extend(s.parents.iter().copied());
                 }
             }
@@ -919,7 +1511,7 @@ impl Repo {
         let mut stack = ids.to_vec();
         while let Some(x) = stack.pop() {
             if seen.insert(x) {
-                if let Some(s) = self.snapshot_opt(&x)? {
+                if let Some(s) = self.snapshot_held(&x)? {
                     stack.extend(s.parents.iter().copied());
                 }
             }
@@ -933,20 +1525,21 @@ impl Repo {
     /// (by timestamp, then id), so the order does not depend on the order
     /// of `a` and `b`. Redacted snapshots are left out.
     pub fn merge_bases(&self, a: &[ObjectId], b: &[ObjectId]) -> Result<Vec<ObjectId>> {
-        let mut best = Vec::new();
-        for c in self.graph.merge_bases(self, a, b)? {
-            if let Some(s) = self.snapshot_opt(&c)? {
-                best.push((s.timestamp, c));
+        self.run_exact(|r| {
+            let mut best = Vec::new();
+            for c in r.graph.merge_bases(r, a, b)? {
+                if let Some(s) = r.snapshot_opt(&c)? {
+                    best.push((s.timestamp, c));
+                }
             }
-        }
-        best.sort();
-        Ok(best.into_iter().map(|(_, id)| id).collect())
+            best.sort();
+            Ok(best.into_iter().map(|(_, id)| id).collect())
+        })
     }
 
     /// [`Repo::merge_bases`] by full ancestor sets, without the history
     /// index: the reference the index is tested against.
-    #[doc(hidden)]
-    pub fn merge_bases_naive(&self, a: &[ObjectId], b: &[ObjectId]) -> Result<Vec<ObjectId>> {
+    fn merge_bases_naive(&self, a: &[ObjectId], b: &[ObjectId]) -> Result<Vec<ObjectId>> {
         let from_a = self.ancestors_of(a)?;
         let common: HashSet<ObjectId> = self.ancestors_of(b)?.into_iter().filter(|x| from_a.contains(x)).collect();
         // Everything below a common ancestor is a common ancestor too, and
@@ -954,13 +1547,13 @@ impl Repo {
         let mut below = HashSet::new();
         let mut stack = Vec::new();
         for c in &common {
-            if let Some(s) = self.snapshot_opt(c)? {
+            if let Some(s) = self.snapshot_held(c)? {
                 stack.extend(s.parents.iter().copied());
             }
         }
         while let Some(x) = stack.pop() {
             if below.insert(x) {
-                if let Some(s) = self.snapshot_opt(&x)? {
+                if let Some(s) = self.snapshot_held(&x)? {
                     stack.extend(s.parents.iter().copied());
                 }
             }
@@ -970,7 +1563,7 @@ impl Repo {
             if below.contains(&c) {
                 continue;
             }
-            if let Some(s) = self.snapshot_opt(&c)? {
+            if let Some(s) = self.snapshot_held(&c)? {
                 best.push((s.timestamp, c));
             }
         }
@@ -1111,5 +1704,210 @@ impl StorageBackend for InitWrites {
     }
     fn set_executable(&self, path: &VPath, executable: bool) -> Result<()> {
         self.0.set_executable(path, executable)
+    }
+}
+
+
+/// Reads of the history this repository **holds** (`Repo::held`): they
+/// never fetch. In a thin clone a walk stops at the snapshots it does not
+/// hold (its boundary), and records where, for [`Exact`]. For bookkeeping
+/// whose answer is about what is here: the history index, gc and
+/// maintenance, the pins of eviction, the pull's check of tag names (with
+/// the server's lookup), this clone's own history (`docs/HUB.md` §13.21,
+/// "Revised: names and fetching").
+#[derive(Clone, Copy)]
+pub struct Held<'r>(&'r Repo);
+
+/// Reads whose answer is a **full clone's** ([`Repo::exact`]): in a thin
+/// clone, a single read fetches a page of history at the boundary, and a
+/// walk is the held walk run again after each page of history the boundary
+/// it reached needs, so it pages in what its own range reaches and no more.
+/// For anything shown to the person or deciding a result: revisions,
+/// bisect, evolog, merges, rebases. In any other repository the same as
+/// [`Held`].
+#[derive(Clone, Copy)]
+pub struct Exact<'r>(&'r Repo);
+
+impl Repo {
+    /// Reads of the history held here ([`Held`]).
+    pub fn held(&self) -> Held<'_> {
+        Held(self)
+    }
+
+    /// Reads that answer as a full clone does ([`Exact`]).
+    pub fn exact(&self) -> Exact<'_> {
+        Exact(self)
+    }
+}
+
+impl<'r> Held<'r> {
+    /// Snapshot `id` if held (`None` beyond a thin clone's boundary, or
+    /// withheld).
+    pub fn snapshot(&self, id: &ObjectId) -> Result<Option<Arc<Snapshot>>> {
+        self.0.snapshot_held(id)
+    }
+
+    /// Every held ancestor of `id` (itself included).
+    pub fn ancestors(&self, id: &ObjectId) -> Result<HashSet<ObjectId>> {
+        self.0.ancestors(id)
+    }
+
+    /// The held snapshots reachable from `roots`, children first.
+    pub fn topo_children_first(&self, roots: impl IntoIterator<Item = ObjectId>) -> Result<Vec<ObjectId>> {
+        self.0.topo_children_first(roots)
+    }
+
+    /// The held snapshots reachable from the view, children first.
+    pub fn visible(&self) -> Result<Vec<ObjectId>> {
+        self.0.visible_snapshots()
+    }
+
+    /// [`Held::topo_children_first`], lazily (the history index).
+    pub fn topo_iter(&self, roots: impl IntoIterator<Item = ObjectId>) -> crate::graph_index::TopoIter<'r> {
+        self.0.topo_iter(roots)
+    }
+
+    /// [`Held::visible`], lazily.
+    pub fn visible_iter(&self) -> crate::graph_index::TopoIter<'r> {
+        self.0.visible_iter()
+    }
+
+    /// Merge bases by full ancestor sets, without the history index: the
+    /// reference the index is tested against.
+    #[doc(hidden)]
+    pub fn merge_bases_naive(&self, a: &[ObjectId], b: &[ObjectId]) -> Result<Vec<ObjectId>> {
+        self.0.merge_bases_naive(a, b)
+    }
+
+    /// The history index itself: held data (its own tests read it).
+    pub fn index(&self) -> &'r crate::graph_index::GraphIndex {
+        &self.0.graph
+    }
+
+    /// Which of `candidates` the view reaches, in held history.
+    pub fn visible_among(&self, candidates: &HashSet<ObjectId>) -> Result<HashSet<ObjectId>> {
+        self.0.visible_among(candidates)
+    }
+
+    /// The held embargoed merges the view reaches (the history index walks
+    /// only lines that build on one).
+    pub fn visible_embargoed(&self) -> Result<Vec<ObjectId>> {
+        self.0.visible_embargoed()
+    }
+
+    /// The held snapshots reachable from `include` and not from `exclude`.
+    pub fn range(&self, include: &[ObjectId], exclude: &[ObjectId]) -> Result<HashSet<ObjectId>> {
+        self.0.graph.range(self.0, include, exclude)
+    }
+
+    /// Which of `wanted` held history reaches from `roots`.
+    pub fn reachable_among(&self, roots: impl IntoIterator<Item = ObjectId>, wanted: &HashSet<ObjectId>) -> Result<HashSet<ObjectId>> {
+        self.0.graph.reachable_among(self.0, roots, wanted)
+    }
+
+    /// Held snapshots reachable from `roots` whose index entry `keep`s,
+    /// after indexing them (candidates for a change-id prefix or a flag;
+    /// the caller confirms what it uses against the store).
+    pub fn entries_matching(
+        &self,
+        roots: impl IntoIterator<Item = ObjectId>,
+        keep: impl FnMut(&ObjectId, &crate::graph_index::Entry) -> bool,
+    ) -> Result<Vec<ObjectId>> {
+        self.0.graph.entries_matching(self.0, roots, keep)
+    }
+
+    /// The held embargoed merges reachable from `roots`.
+    pub fn embargoed_among(&self, roots: impl IntoIterator<Item = ObjectId>) -> Result<HashSet<ObjectId>> {
+        self.0.graph.embargoed_among(self.0, roots)
+    }
+
+    /// The generation of `id` in the history index (`None` if not held).
+    pub fn generation(&self, id: &ObjectId) -> Result<Option<crate::graph_index::Gen>> {
+        self.0.graph.generation(self.0, id)
+    }
+}
+
+impl Exact<'_> {
+    /// Snapshot `id` as a full clone holds it: in a thin clone, a page of
+    /// history is fetched where it is beyond the boundary. `None`: this
+    /// person's history has no such snapshot. Without the server:
+    /// `Unavailable`.
+    pub fn snapshot(&self, id: &ObjectId) -> Result<Option<Arc<Snapshot>>> {
+        self.0.snapshot_opt(id)
+    }
+
+    /// Run `f`, a query over held history, until the boundary it reaches no
+    /// longer changes its answer (each round fetches the next page of
+    /// history there). A thin clone that cannot reach the server fails
+    /// with `Unavailable`, never answers from what it holds alone.
+    pub fn run<R>(&self, f: impl FnMut(&Repo) -> Result<R>) -> Result<R> {
+        self.0.run_exact(f)
+    }
+
+    /// Every ancestor of `id` (itself included).
+    pub fn ancestors(&self, id: &ObjectId) -> Result<HashSet<ObjectId>> {
+        self.run(|r| r.ancestors(id))
+    }
+
+    /// The snapshots reachable from `roots`, children first.
+    pub fn topo_children_first(&self, roots: impl IntoIterator<Item = ObjectId>) -> Result<Vec<ObjectId>> {
+        let roots: Vec<ObjectId> = roots.into_iter().collect();
+        self.run(|r| r.topo_children_first(roots.iter().copied()))
+    }
+
+    /// The snapshots reachable from the view, children first.
+    pub fn visible(&self) -> Result<Vec<ObjectId>> {
+        self.run(|r| r.visible_snapshots())
+    }
+
+    /// The snapshots reachable from `include` and not from `exclude`: the
+    /// history index's walk, which stops once everything left is below
+    /// `exclude`, so only that range is paged in.
+    pub fn range(&self, include: &[ObjectId], exclude: &[ObjectId]) -> Result<HashSet<ObjectId>> {
+        self.run(|r| r.graph.range(r, include, exclude))
+    }
+
+    /// Which of `candidates` the view reaches (the history above the
+    /// oldest of them only).
+    pub fn visible_among(&self, candidates: &HashSet<ObjectId>) -> Result<HashSet<ObjectId>> {
+        self.run(|r| r.visible_among(candidates))
+    }
+
+    /// The embargoed merges the view reaches.
+    pub fn visible_embargoed(&self) -> Result<Vec<ObjectId>> {
+        self.run(|r| r.visible_embargoed())
+    }
+
+    /// The embargoed merges reachable from `roots`.
+    pub fn embargoed_among(&self, roots: impl IntoIterator<Item = ObjectId>) -> Result<HashSet<ObjectId>> {
+        let roots: Vec<ObjectId> = roots.into_iter().collect();
+        self.run(|r| r.graph.embargoed_among(r, roots.iter().copied()))
+    }
+
+    /// The generation of `id` (fetched as `Exact::snapshot` fetches it).
+    pub fn generation(&self, id: &ObjectId) -> Result<Option<crate::graph_index::Gen>> {
+        if self.snapshot(id)?.is_none() {
+            return Ok(None);
+        }
+        self.run(|r| r.graph.generation(r, id))
+    }
+
+    /// Every snapshot reachable from `roots` of generation `floor` or more,
+    /// with its generation and snapshot (the walk stops below `floor`, so a
+    /// thin clone pages in only that part).
+    pub fn down_to(
+        &self,
+        roots: impl IntoIterator<Item = ObjectId>,
+        floor: crate::graph_index::Gen,
+    ) -> Result<HashMap<ObjectId, (crate::graph_index::Gen, Arc<Snapshot>)>> {
+        let roots: Vec<ObjectId> = roots.into_iter().collect();
+        self.run(|r| r.graph.down_to(r, roots.iter().copied(), floor))
+    }
+}
+
+impl Repo {
+    /// Persist the history index's new entries (best effort).
+    pub(crate) fn persist_index(&self) {
+        self.graph.persist(self);
     }
 }

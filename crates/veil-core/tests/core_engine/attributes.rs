@@ -496,7 +496,7 @@ fn an_outsider_with_a_sealed_gitattributes_checks_out_clean() {
     // through the policy: the version is stored as is, as a hostile or
     // earlier writer could).
     let store = alice.store();
-    let mut root = (*store.tree(&store.snapshot(&v1).unwrap().tree).unwrap()).clone();
+    let mut root = (*store.tree(&alice.snapshot(&v1).unwrap().tree).unwrap()).clone();
     let mut e = root.get(".veilattributes").unwrap().clone();
     e.id = store.store_file(b"*.txt eol=crlf\n", &team()).unwrap();
     e.visibility = team();

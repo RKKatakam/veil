@@ -92,7 +92,7 @@ fn bug_841_a_ring_the_server_made_never_seals_a_secret() {
     // (with no ring of the admin's to seal it under, it is not recorded).
     let repo = veil_core::Repo::open(Arc::new(veil_core::DiskBackend::new(&p.dir)), Some(srv), "test").unwrap();
     let tip = repo.view().tags["main"].target;
-    let tree = repo.store().snapshot(&tip).unwrap().tree;
+    let tree = repo.snapshot(&tip).unwrap().tree;
     let e = veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new("infra/.env").unwrap()).unwrap();
     assert!(e.is_none(), "infra/.env was recorded under a ring the server made: {e:?}");
 }
@@ -244,7 +244,7 @@ pub(crate) fn plant_in(hub: &TestHub, project: &str, ring: &KeyRing) {
 pub(crate) fn a_finance_opens(hub: &TestHub, p: &Project, dir: &std::path::Path, path: &str) -> bool {
     let repo = veil_core::Repo::open(Arc::new(veil_core::DiskBackend::new(dir)), None, "test").unwrap();
     let tip = repo.view().tags["main"].target;
-    let tree = repo.store().snapshot(&tip).unwrap().tree;
+    let tree = repo.snapshot(&tip).unwrap().tree;
     let Some(e) = veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new(path).unwrap()).unwrap() else { return false };
     let raw = (e.id, repo.store().get_raw(&e.id).unwrap());
     let f = clone(hub, p, &p.fin, &unique("f"));

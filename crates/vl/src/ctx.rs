@@ -199,6 +199,11 @@ pub struct Ctx {
     /// moved `@` in one operation: what [`Ctx::finish`] reports the move
     /// from (the directory already holds the new `@`).
     committed_from: Option<ObjectId>,
+    /// The command runs for a workspace the project directory is not
+    /// attached to: a `vl` inside a `vl ws exec` sandbox, through the
+    /// workspace socket ([`Ctx::open_for_workspace`]). It never records,
+    /// moves or attaches the project directory.
+    pub detached: bool,
 }
 
 /// Written by `vl clone` before it fetches anything, removed once its
@@ -343,7 +348,9 @@ impl Ctx {
         let identity = load_identity()?;
         let user = user_for(&identity);
         let fs = Arc::new(DiskBackend::new(&root));
-        let mut repo = Repo::open(fs.clone(), Some(identity), &user)?;
+        let mut repo = Repo::open(fs.clone(), Some(identity.clone()), &user)?;
+        // A thin clone reads what it has not fetched from its server.
+        crate::thin::attach(&repo, &identity);
         // A clone of a server project trusts only the key rings of the
         // project fingerprint this device confirmed, before anything seals
         // (BUG-845). (A repository that will create its project, at its first
@@ -369,6 +376,7 @@ impl Ctx {
                 report: BuildReport::default(),
                 bare: true,
                 committed_from: None,
+                detached: false,
             });
         }
         let checkout = load_state(&fs, &repo)?;
@@ -390,6 +398,7 @@ impl Ctx {
             cache,
             bare: false,
             committed_from: None,
+            detached: false,
         };
         if snapshot {
             ctx.snapshot()?;
@@ -397,10 +406,33 @@ impl Ctx {
         Ok(ctx)
     }
 
+    /// The repository at `root`, for a command of workspace `ws` (the
+    /// workspace socket, `crate::ws_socket`): what its mounts hold is
+    /// recorded first, as for any command, and `@` is `ws`'s working-copy
+    /// change. The project directory is left as it is: never recorded,
+    /// moved or attached to `ws`.
+    pub fn open_for_workspace(root: &Path, ws: &str) -> Result<Ctx> {
+        crate::mount::record_live(root);
+        let mut ctx = Ctx::open(Some(root), false)?;
+        if ctx.bare {
+            bail!("{} is a bare repository: it has no workspaces", ctx.root.display());
+        }
+        ctx.repo.workspace_wc(ws)?;
+        ctx.ws = ws.to_string();
+        ctx.repo.set_command_workspace(Some(ctx.ws.clone()));
+        ctx.detached = true;
+        Ok(ctx)
+    }
+
     /// The project directory's stat cache (what its files hold, as far as
     /// the last snapshot verified).
     pub fn stat_cache(&self) -> &StatCache {
         &self.cache
+    }
+
+    /// The record of what the working copy was materialised from.
+    pub fn materialised(&self) -> &veil_core::checkout::Materialised {
+        &self.checkout.materialised
     }
 
     pub fn wc(&self) -> Result<ObjectId> {
@@ -411,6 +443,20 @@ impl Ctx {
     }
 
     pub fn rev(&self, spec: &str) -> Result<ObjectId> {
+        // A thin clone: a full snapshot id it does not hold is asked of the
+        // server, and a walk that reaches beyond what it holds goes on
+        // through the server's history pages.
+        if self.repo.is_partial() {
+            if let Ok(id) = veil_core::ObjectId::from_hex(spec.trim().trim_end_matches('-')) {
+                if !self.repo.store().has(&id) {
+                    self.repo.deepen(&[id], 1)?;
+                }
+            }
+        }
+        // (`main-` names a parent the clone may not hold yet: reading it
+        // fetches it, `Exact::snapshot`.)
+        // Names a thin clone's held history cannot decide are asked of the
+        // server (`revset::server_names`); no paging here.
         Ok(revset::resolve(&self.repo, spec, &self.ws)?)
     }
 
@@ -472,6 +518,16 @@ impl Ctx {
         commit: Option<(&str, bool)>,
         committed: &mut Option<veil_core::commands::CommitResult>,
     ) -> Result<()> {
+        // A detached command records nothing of the directory: its
+        // workspace's files were recorded before it ran (mounts, the
+        // sandbox's).
+        if self.detached {
+            if let Some((message, advance)) = commit {
+                let ws = self.ws.clone();
+                *committed = Some(self.repo.commit(&ws, message, advance)?);
+            }
+            return Ok(());
+        }
         // One recorder of this directory at a time (the lock-free op log
         // has no repository lock to serialise them), judging it by what it
         // holds now (BUG-1084).
@@ -545,6 +601,23 @@ impl Ctx {
             let base = self.checkout.snapshot;
             let base_snap = self.repo.snapshot(&base)?;
             let target_tree = self.repo.snapshot(&view_wc)?.tree;
+            // A thin clone fetches the catch-up's move first. If it cannot
+            // (a full cache, a lost server), the directory stays as it is
+            // and nothing is recorded, so `status`, `undo`, `op restore`
+            // and `partial limit` still run (BUG-1146); a command that
+            // would record the directory as a commit stops instead.
+            if let Err(e) = self.repo.store().prefetch_diff(Some(&base_snap.tree), &target_tree) {
+                if commit.is_some() {
+                    return Err(anyhow::Error::from(e).context(
+                        "the working copy is behind `@` and cannot be brought up to it; run `vl undo`, or raise the cache's bound with `vl partial limit SIZE`",
+                    ));
+                }
+                warn(&format!(
+                    "the working copy stays as it is: moving it to `@` needs what this thin clone cannot fetch now ({e}). \
+                     Nothing in it was recorded; run `vl undo` to go back, or `vl partial limit SIZE` and run any command"
+                ));
+                return Ok(true);
+            }
             // What a command put back (`vl restore`) is judged against the
             // entries it was written from, as in the ordinary snapshot
             // below: a sealed version restored stays sealed (BUG-492).
@@ -824,7 +897,7 @@ impl Ctx {
     /// Bring the project directory in line with the attached workspace.
     pub fn finish(&mut self) -> Result<()> {
         self.print_merge_warnings();
-        if self.bare {
+        if self.bare || self.detached {
             return Ok(());
         }
         // A workspace this command attached the directory to (`vl ws
@@ -856,6 +929,16 @@ impl Ctx {
         }
         let from = self.repo.snapshot(&self.checkout.snapshot)?.tree;
         let to_snap = self.repo.snapshot(&target)?;
+        // A thin clone: a move this command could not fetch for (left by an
+        // earlier one; every move this command published was fetched ahead
+        // before it was) leaves the directory as it is (BUG-1146).
+        if let Err(e) = self.repo.store().prefetch_diff(Some(&from), &to_snap.tree) {
+            warn(&format!(
+                "the working copy stays as it is: moving it to `@` needs what this thin clone cannot fetch now ({e}). \
+                 Run `vl undo` to go back, or `vl partial limit SIZE` and run any command"
+            ));
+            return Ok(());
+        }
         let previous = self.checkout.snapshot;
         let needs_checkout = from != to_snap.tree || !self.checkout.materialised.is_empty();
         // Journalled: a crash half way is finished by the next command.
@@ -870,7 +953,17 @@ impl Ctx {
                 eprintln!("Updated {} files, removed {}", r.written, r.removed);
             }
             for p in &r.redacted {
-                let why = lookup(self.repo.store(), &to_snap.tree, p)?.and_then(|e| render::hidden_reason(&self.repo, &e));
+                let e = lookup(self.repo.store(), &to_snap.tree, p)?;
+                // A folder the server refuses (BUG-1508): its path only.
+                if e.as_ref().is_some_and(|e| e.kind == veil_core::EntryKind::Dir) {
+                    eprintln!(
+                        "  {} {} (you no longer have access to this folder; left out of the working copy, kept in history)",
+                        render::yellow("redacted"),
+                        safe(&crate::api::hidden_dir(p))
+                    );
+                    continue;
+                }
+                let why = e.and_then(|e| render::hidden_reason(&self.repo, &e));
                 eprintln!(
                     "  {} {} ({}; left out of the working copy)",
                     render::yellow("redacted"),

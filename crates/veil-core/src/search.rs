@@ -31,7 +31,7 @@ use crate::{
     object::{EntryKind, Snapshot, TreeEntry, Visibility},
     rename::{self, RenameOptions},
     repo::Repo,
-    tree::{diff_trees, lookup, TreeChange},
+    tree::{diff_trees_hiding, lookup, prefetch_changes, TreeChange},
     vpath::VPath,
 };
 
@@ -180,7 +180,7 @@ impl<'a> Searcher<'a> {
         let parent_trees: Vec<Option<ObjectId>> = s
             .parents
             .iter()
-            .map(|p| repo.snapshot_opt(p).map(|o| o.map(|ps| ps.tree)))
+            .map(|p| repo.exact().snapshot(p).map(|o| o.map(|ps| ps.tree)))
             .collect::<Result<_>>()?;
         // The path filter: changed against every parent (a merge is listed
         // only where it differs from all of them).
@@ -218,13 +218,18 @@ impl<'a> Searcher<'a> {
             Some(Some(t)) => Some(*t),
             _ => None,
         };
-        let changes: Vec<TreeChange> = diff_trees(store, base.as_ref(), Some(&s.tree))?
+        // A folder the server refuses is not searched (BUG-1508).
+        let changes: Vec<TreeChange> = diff_trees_hiding(store, base.as_ref(), Some(&s.tree))?
+            .0
             .into_iter()
             .filter(|c| paths.is_empty() || paths.iter().any(|p| c.path == *p || c.path.starts_with(p)))
             .collect();
         // As Git does, renames are paired first: a moved file changes no
         // count.
-        let d = rename::detect(store, &changes, self.filter.reader, &self.filter.renames)?;
+        // In a thin clone, what the pickaxe and the pairing read, each at
+        // its own path (BUG-1506).
+        prefetch_changes(store, base.as_ref(), Some(&s.tree), changes.iter().filter(|c| [&c.old, &c.new].into_iter().flatten().all(|e| e.size <= MAX_SEARCHED_FILE as u64)))?;
+        let d = rename::detect(store, base.as_ref(), Some(&s.tree), &changes, self.filter.reader, &self.filter.renames)?;
         self.stats.add(&d.stats);
         let changes: Vec<TreeChange> = d
             .items()
@@ -318,8 +323,8 @@ impl<'a> Searcher<'a> {
             let mut name = p.clone();
             if let (Some(_), Some(t)) = (&here, tree) {
                 if lookup_entry(self.repo, t, p)?.is_none() {
-                    let changes = diff_trees(store, Some(t), Some(&s.tree))?;
-                    let d = rename::detect(store, &changes, self.filter.reader, &self.filter.renames)?;
+                    let (changes, _) = diff_trees_hiding(store, Some(t), Some(&s.tree))?;
+                    let d = rename::detect(store, Some(t), Some(&s.tree), &changes, self.filter.reader, &self.filter.renames)?;
                     self.stats.add(&d.stats);
                     if let Some(pair) = d.pairs.iter().find(|x| x.to == *p && !x.copy) {
                         name = pair.from.clone();

@@ -96,7 +96,7 @@ fn mallory_pushes(hub: Arc<MemoryBackend>, main: ObjectId, alice_pub: &str, mall
     let ids = Ids { released };
 
     let store = m.store().clone();
-    let root_tree = store.snapshot(&main).unwrap().tree;
+    let root_tree = m.snapshot(&main).unwrap().tree;
     let mut root = (*store.tree(&root_tree).unwrap()).clone();
     let secrets_id = root.get("secrets").unwrap().id;
     let mut secrets = (*store.tree(&secrets_id).unwrap()).clone();

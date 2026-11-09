@@ -32,4 +32,6 @@ mod grants;
 mod caches;
 mod adversarial_s4;
 mod prs;
+mod thin;
 mod cache;
+mod workspaces;

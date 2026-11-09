@@ -18,7 +18,7 @@
 //!
 //! Lines of the file at the starting snapshot are open until attributed.
 //! Snapshots are visited in topological order, children before parents
-//! ([`Repo::topo_children_first`]), each once, with every line its children
+//! ([`crate::repo::Held::topo_children_first`]), each once, with every line its children
 //! passed it (threat review 5: no snapshot is visited twice, whatever the
 //! timestamps say). A snapshot's version is compared
 //! with each parent's in order; a line the parent holds moves to the first
@@ -56,7 +56,7 @@ use crate::{
     repo::Repo,
     store::ObjectStore,
     textmerge,
-    tree::{diff_trees, lookup},
+    tree::{diff_trees_hiding, lookup_to_read},
     vpath::VPath,
 };
 
@@ -469,7 +469,7 @@ impl PartialOrd for Queued {
     }
 }
 
-/// Topological ranks (children first, as [`Repo::topo_children_first`]
+/// Topological ranks (children first, as [`crate::repo::Held::topo_children_first`]
 /// numbers them), produced only as far as they are asked for.
 struct LazyRank<'r> {
     iter: crate::graph_index::TopoIter<'r>,
@@ -494,7 +494,7 @@ impl LazyRank<'_> {
 /// The version of the file at `path` in `tree` this reader reads, `None`
 /// when there is no file there; `Err(Hidden)` when it is redacted.
 fn version_at(store: &ObjectStore, tree: &ObjectId, path: &VPath, reader: Reader, stats: &mut ReadStats) -> Result<Option<std::result::Result<Arc<Version>, Hidden>>> {
-    let e = match lookup(store, tree, path) {
+    let e = match lookup_to_read(store, tree, path) {
         Ok(Some(e)) if e.kind != EntryKind::Dir => e,
         Ok(_) => return Ok(None),
         // A directory on the way this reader cannot open.
@@ -523,7 +523,7 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
     let store = repo.store();
     let mut stats = ReadStats::default();
     let top = repo.snapshot(rev)?;
-    let entry = match lookup(store, &top.tree, path)? {
+    let entry = match lookup_to_read(store, &top.tree, path)? {
         Some(e) if e.kind.is_file_like() => e,
         Some(_) => return Err(VeilError::NotFound(format!("{path} is a directory in {}", rev.short()))),
         None => return Err(VeilError::NotFound(format!("{path} does not exist in {}", rev.short()))),
@@ -545,7 +545,7 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
     // Children before parents: every line a snapshot will receive has
     // arrived by the time it is popped.
     // Ranks come lazily, as far down as the walk goes (the history index).
-    let mut rank = LazyRank { iter: repo.topo_iter([*rev]), ranks: HashMap::new() };
+    let mut rank = LazyRank { iter: repo.held().topo_iter([*rev]), ranks: HashMap::new() };
     if !open.is_empty() {
         pending.insert((*rev, path.clone()), Pending { lines: open, version: version.clone() });
         heap.push(Queued { rank: 0, id: *rev, path: path.clone() });
@@ -570,7 +570,7 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
             }
             // A parent withheld here (an unreleased embargo on a public
             // clone) is not part of this replica's history.
-            let Some(ps) = repo.snapshot_opt(parent)? else { continue };
+            let Some(ps) = repo.exact().snapshot(parent)? else { continue };
             let Some(prank) = rank.of(parent)? else { continue };
             let mut ppath = q.path.clone();
             let mut pv = match pending.get(&(*parent, ppath.clone())) {
@@ -579,9 +579,9 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
             };
             if pv.is_none() && o.follow {
                 // Where did the file come from? Renames in this step only.
-                let changes = diff_trees(store, Some(&ps.tree), Some(&snap.tree))?;
+                let (changes, _) = diff_trees_hiding(store, Some(&ps.tree), Some(&snap.tree))?;
                 if changes.iter().any(|c| c.path == q.path && c.old.is_none()) {
-                    let d = rename::detect(store, &changes, o.reader, &o.renames)?;
+                    let d = rename::detect(store, Some(&ps.tree), Some(&snap.tree), &changes, o.reader, &o.renames)?;
                     result.stats.add(&d.stats);
                     if let Some(pair) = d.pairs.iter().find(|p| p.to == q.path && !p.copy) {
                         ppath = pair.from.clone();

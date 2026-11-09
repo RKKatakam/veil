@@ -91,3 +91,41 @@ fn op_restore_before_a_staged_release_takes_it_back() {
     assert!(out.contains("release taken back"), "{out}");
     assert!(!released(&env, &proj), "the release survived the restore");
 }
+
+/// Op log merges review, cycle 5: `vl op restore` past a staged release,
+/// stopped before it takes the release back (the staged release written
+/// back by hand, as the stopped process leaves it). Neither `vl embargo
+/// list` nor `vl show --json` says the next push publishes it; the push
+/// does not, and names it with what to run; `vl embargo release` releases
+/// it again, and the next push publishes it.
+#[test]
+fn a_release_the_op_log_took_back_is_never_shown_as_publishing_and_releases_again() {
+    for release_again in [false, true] {
+        let env = Env::new();
+        let (proj, _, id) = embargoed(&env);
+        let log = env.stdout(U, &proj, &["op", "log"]);
+        let before = log.lines().find(|l| l.contains("merge")).unwrap().split_whitespace().next().unwrap().to_string();
+        env.ok(U, &proj, &["embargo", "release", &id, "--yes"]);
+        let out = env.ok(U, &proj, &["op", "restore", &before]);
+        assert!(out.contains("release taken back"), "{out}");
+        std::fs::write(proj.join(".veil/local/releases").join(format!("{id}.json")), b"{\"released_at\": 1}").unwrap();
+        let list = env.stdout(U, &proj, &["embargo", "list"]);
+        assert!(list.contains("not released") && list.contains("does not publish") && !list.contains("not pushed yet"), "{list}");
+        let show: serde_json::Value = serde_json::from_str(&env.stdout(U, &proj, &["show", "main", "--json"])).unwrap();
+        assert_eq!(show["embargo"]["id"], id.as_str(), "{show}");
+        assert_eq!(show["embargo"]["state"], "pending", "{show}");
+        if release_again {
+            let out = env.ok(U, &proj, &["embargo", "release", &id, "--yes"]);
+            assert!(out.contains("`vl undo` takes it back"), "{out}");
+            let list = env.stdout(U, &proj, &["embargo", "list"]);
+            assert!(list.contains("not pushed yet") && !list.contains("not released"), "{list}");
+            let push = env.ok(U, &proj, &["push", "mirror"]);
+            assert!(push.contains(&format!("published embargo {id}")), "{push}");
+        } else {
+            let push = env.ok(U, &proj, &["push", "mirror"]);
+            assert!(!push.contains("published embargo"), "{push}");
+            assert!(push.contains(&format!("embargo {id} was not published")) && push.contains(&format!("vl embargo release {id}")), "{push}");
+            assert!(!released(&env, &proj), "taken back");
+        }
+    }
+}

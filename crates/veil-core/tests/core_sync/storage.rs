@@ -73,7 +73,7 @@ fn assert_history_intact(repo: &Repo) {
         if !seen.insert(id) {
             continue;
         }
-        let s = store
+        let s = repo
             .snapshot(&id)
             .unwrap_or_else(|e| panic!("snapshot {}: {e}", id.short()));
         snaps.extend(s.parents.iter().copied());
@@ -233,7 +233,7 @@ fn other_process_survives_a_repack() {
     fs.write(&p("src/later.txt"), b"later\n").unwrap();
     snap(&mut repo, &fs);
     gc(&mut repo, &now_gc()).unwrap();
-    other.store().snapshot(&repo.workspace_wc(WS).unwrap()).unwrap();
+    other.snapshot(&repo.workspace_wc(WS).unwrap()).unwrap();
     assert!(
         read_file(&other, &wc, "src/m2/f2.txt").is_some(),
         "re-scans packs after they vanish"
@@ -586,7 +586,7 @@ fn tree_and_snapshot_caches_are_bounded() {
     gc(&mut repo, &now_gc()).unwrap();
     for (_, op) in repo.op_log(usize::MAX).unwrap() {
         for s in op.view.refs() {
-            for id in repo.ancestors(&s).unwrap() {
+            for id in repo.exact().ancestors(&s).unwrap() {
                 let t = repo.snapshot(&id).unwrap().tree;
                 lookup(&store, &t, &p("src/m3/f7.txt")).unwrap();
             }

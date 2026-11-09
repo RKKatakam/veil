@@ -243,7 +243,9 @@ impl DiskJournal {
 fn open_repo(root: &Path) -> Result<Repo> {
     let identity = load_identity()?;
     let user = user_for(&identity);
-    Ok(Repo::open(Arc::new(DiskBackend::new(root)), Some(identity), &user)?)
+    let repo = Repo::open(Arc::new(DiskBackend::new(root)), Some(identity.clone()), &user)?;
+    crate::thin::attach(&repo, &identity);
+    Ok(repo)
 }
 
 /// Snapshot `snapshot` as `repo`'s reader sees it now (with the keys
@@ -365,10 +367,15 @@ impl Recorder {
             Err(_) => lower_of(&repo, &repo.workspace_wc(ws)?)?,
         };
         let upper: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(&paths.upper));
+        // Large open files' content: anonymous files here, never in memory
+        // (BUG-1365).
+        let spill = paths.dir.join("spill");
+        private_dir(&spill)?;
         let whiteouts = paths.load_whiteouts();
         let fs = Arc::new(
             MountFs::new(lower, upper, whiteouts, Some(Box::new(DiskJournal { paths: paths.clone() })))
                 .with_files(Arc::new(DiskFiles::new(&paths.upper)))
+                .with_spill(spill)
                 .with_unseen(paths.load_unseen())
                 .with_links(repo.format() >= veil_core::object::GIT_PARITY_REPO_FORMAT),
         );
@@ -1042,6 +1049,14 @@ fn holds_veil(dir: &Path) -> bool {
 
 /// Start the serving process in the background and wait until it serves.
 fn spawn(root: &Path, ws: &str, dir: &Path, record_every: u64) -> Result<std::process::ExitCode> {
+    let pid = start(root, ws, dir, record_every)?;
+    println!("Mounted workspace {} at {} (process {pid})", bold(ws), dir.display());
+    println!("  `vl ws unmount {ws}` records it and unmounts; until then other vl commands record it before they run");
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// [`spawn`], saying nothing: the serving process's pid.
+fn start(root: &Path, ws: &str, dir: &Path, record_every: u64) -> Result<u32> {
     use std::os::unix::process::CommandExt;
     let paths = Paths::new(root, ws);
     private_dir(&paths.dir)?;
@@ -1095,14 +1110,130 @@ fn spawn(root: &Path, ws: &str, dir: &Path, record_every: u64) -> Result<std::pr
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    println!(
-        "Mounted workspace {} at {} (process {})",
-        bold(ws),
-        dir.display(),
-        child.id()
-    );
-    println!("  `vl ws unmount {ws}` records it and unmounts; until then other vl commands record it before they run");
-    Ok(std::process::ExitCode::SUCCESS)
+    Ok(child.id())
+}
+
+// ---- vl ws exec --mount ---------------------------------------------------------------------
+
+/// The prefix of the private directories `vl ws exec --mount` mounts in.
+const EXEC_PREFIX: &str = "veil-ws-mnt-";
+
+/// Can this machine mount a workspace? `Err(why)` when it cannot.
+pub fn fuse_available() -> std::result::Result<(), String> {
+    if !cfg!(vl_fuse) {
+        return Err("this vl was built without FUSE".into());
+    }
+    // Tests of the fallback run where FUSE works.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("VEIL_TEST_NO_FUSE").is_some() {
+        return Err("FUSE is turned off (VEIL_TEST_NO_FUSE)".into());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if std::fs::OpenOptions::new().read(true).write(true).open("/dev/fuse").is_err() {
+            return Err("/dev/fuse cannot be opened".into());
+        }
+        let on_path = |name: &str| {
+            std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.is_absolute() && d.join(name).is_file()))
+        };
+        if !on_path("fusermount3") && !on_path("fusermount") {
+            return Err("fusermount3 is not installed".into());
+        }
+    }
+    Ok(())
+}
+
+/// The mount a `vl ws exec --mount` runs over.
+pub struct ExecMount {
+    root: PathBuf,
+    ws: String,
+    /// Where the workspace is mounted (outside the project).
+    pub dir: PathBuf,
+    /// The private directory holding `dir`, when this run mounted it (and
+    /// so unmounts it).
+    ours: Option<PathBuf>,
+    /// The mount is an earlier `vl ws exec`'s, which did not finish (`vl`
+    /// was killed): what it held was recorded before this run.
+    pub recovered: bool,
+}
+
+/// Mount `ws` for a run in a private directory (`$XDG_RUNTIME_DIR`, or the
+/// temp directory), or use the mount already serving it.
+pub fn for_exec(root: &Path, ws: &str) -> Result<ExecMount> {
+    let paths = Paths::new(root, ws);
+    if let Some(st) = paths.load_state()? {
+        match (served(&paths), st.mountpoint) {
+            (true, Some(mp)) => {
+                // An earlier run's own mount (that run was killed) is this
+                // run's to unmount.
+                let ours = mp.parent().filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(EXEC_PREFIX))).map(Path::to_path_buf);
+                let recovered = ours.is_some();
+                return Ok(ExecMount { root: root.to_path_buf(), ws: ws.to_string(), dir: mp, ours, recovered });
+            }
+            (false, Some(old)) if is_mounted(&old) => {
+                let _ = fuse_unmount(&old, true);
+            }
+            _ => {}
+        }
+    }
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|d| d.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    let parent = base.join(format!("{EXEC_PREFIX}{}-{}", std::process::id(), hex::encode(veil_core::crypto::random_bytes::<6>())));
+    private_dir(&parent).with_context(|| format!("creating {}", parent.display()))?;
+    let made = mountpoint(root, &parent.join("files")).and_then(|dir| start(root, ws, &dir, 0).map(|_| dir));
+    match made {
+        Ok(dir) => Ok(ExecMount { root: root.to_path_buf(), ws: ws.to_string(), dir, ours: Some(parent), recovered: false }),
+        Err(e) => {
+            let _ = remove_tree(&parent);
+            Err(e)
+        }
+    }
+}
+
+impl ExecMount {
+    /// Have the mount record what it holds now.
+    pub fn record(&self) -> Result<()> {
+        let st = Paths::new(&self.root, &self.ws).load_state()?.ok_or_else(|| anyhow!("the mount of workspace '{}' has no state", safe(&self.ws)))?;
+        let r = request(&st, "record", Duration::from_secs(600)).ok_or_else(|| anyhow!("the mount process does not answer"))??;
+        match r.error {
+            Some(e) => bail!(e),
+            None => Ok(()),
+        }
+    }
+
+    /// After the run: the mount records what it holds into the workspace
+    /// (its notes); one this run mounted is then unmounted.
+    pub fn finish(self) -> Result<Vec<String>> {
+        let paths = Paths::new(&self.root, &self.ws);
+        let st = paths.load_state()?.ok_or_else(|| anyhow!("the mount of workspace '{}' has no state", safe(&self.ws)))?;
+        let lost = || anyhow!("the mount process does not answer; `vl ws unmount {}` records what the command wrote", safe(&self.ws));
+        let r = request(&st, "record", Duration::from_secs(600)).ok_or_else(lost)??;
+        if let Some(e) = r.error {
+            bail!("the command's output was not recorded: {e}. It stays in the mount; `vl ws unmount {}` records it", safe(&self.ws));
+        }
+        let mut notes = r.notes;
+        if let Some(parent) = &self.ours {
+            match request(&st, "unmount", Duration::from_secs(600)) {
+                Some(Ok(u)) => {
+                    notes.extend(u.notes);
+                    match u.error {
+                        // Recorded already; something the command left
+                        // running keeps it busy.
+                        Some(e) => notes.push(format!("the mount stays: {e}")),
+                        None => {
+                            let _ = std::fs::remove_dir(&self.dir);
+                            let _ = std::fs::remove_dir(parent);
+                        }
+                    }
+                }
+                Some(Err(e)) => notes.push(format!("the mount stays: {e}")),
+                None => {}
+            }
+        }
+        Ok(notes)
+    }
 }
 
 /// Signals that ask the foreground server to unmount (Ctrl-C, SIGTERM).
