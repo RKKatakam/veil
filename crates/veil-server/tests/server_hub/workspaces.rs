@@ -2614,7 +2614,10 @@ fn s8jr_the_move_rebases_stacks_merges_workspaces_and_divergent_changes() {
         p.admin.ok(&p.dir, &["new", like]);
         let want = below(&walk(&p.dir), BILL_DIR);
         assert!(!want.is_empty());
-        p.admin.ok(&p.dir, &["new", tag]);
+        // By its remote tag (BUG-1572): `w` is made of the letters of change
+        // ids, so the pull creates no local tag `w` when a change of the
+        // admin's starts with it (BUG-105), and `w` then names that change.
+        p.admin.ok(&p.dir, &["new", &format!("origin/{tag}")]);
         assert_eq!(below(&walk(&p.dir), BILL_DIR), want, "{tag}: every billing file, byte for byte");
     }
 }
@@ -2654,4 +2657,230 @@ fn s8jr_a_push_costs_no_request_a_tag() {
     }
     eprintln!("s8jr: a push with 2 tags cost {} requests, with 40 tags {}", cost[0], cost[1]);
     assert!(cost[1] <= cost[0] + 8, "with 40 tags {} requests, with 2 {}", cost[1], cost[0]);
+}
+
+// ---- Review of `s8k` (BUG-1564, BUG-1565, the retry limit) -------------------
+
+/// The change id of `clone`'s working-copy change, as `vl log` shows it.
+fn wc_change(clone: &Path) -> String {
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(clone)), None, "test").unwrap();
+    repo.snapshot(&repo.view().workspaces["default"].wc).unwrap().change_id.display()
+}
+
+/// BUG-1572 (review of `s8k`), the cause, made deterministic: the push of
+/// a moved clone is grafted right; the test read it back wrong. A pull
+/// creates no local tag whose name is also a change-id prefix of the
+/// repository (BUG-105): `w` is made of change-id letters, so when one of
+/// the admin's changes starts with `w`, `vl new w` names that change (here
+/// the admin's working copy on `main`, with `main`'s billing folder), or is
+/// ambiguous. The server's branch `w`, read as `origin/w`, holds every
+/// billing file of `feature`.
+#[test]
+fn bug_1572_a_pulled_tag_named_like_a_change_id_is_read_through_its_remote_tag() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name, "--confirm", &p.fin.fingerprint()]);
+    let d = plain_thin(&p, &hub, "kz");
+    p.fin.ok(&d, &["new", "feature"]);
+    write_files(&d, &[("src/w.txt", "w\n")]);
+    p.fin.ok(&d, &["commit", "--no-advance", "-m", "w"]);
+    p.fin.ok(&d, &["tag", "set", "w", "-r", "@-"]);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&d, &["push", "-t", "w"]);
+    assert!(out.contains("pushed"), "{out}");
+    assert_eq!(out.matches(MOVED).count(), 1, "the push moved the clone first: {out}");
+    // The admin's working copy: a change on `main` whose id starts with `w`
+    // (one in 16 does).
+    for _ in 0..400 {
+        if wc_change(&p.dir).starts_with('w') {
+            break;
+        }
+        p.admin.ok(&p.dir, &["new", "main"]);
+    }
+    assert!(wc_change(&p.dir).starts_with('w'));
+    let pulled = p.admin.ok(&p.dir, &["pull"]);
+    assert!(pulled.contains("no local tag created for remote tag 'w'"), "{pulled}");
+    let pushed = view_state(&p.dir).3["origin/w"];
+    {
+        let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&p.dir)), None, "test").unwrap();
+        let w = veil_core::revset::resolve(&repo, "w", "default");
+        assert!(w.as_ref().ok() != Some(&pushed), "`w` names another change than the push (or is ambiguous): {w:?}");
+    }
+    p.admin.ok(&p.dir, &["new", "feature"]);
+    let want = below(&walk(&p.dir), BILL_DIR);
+    assert!(want.contains_key(&format!("{BILL_DIR}/acme/q2.txt")), "{:?}", want.keys());
+    p.admin.ok(&p.dir, &["new", "origin/w"]);
+    let got = walk(&p.dir);
+    assert_eq!(below(&got, BILL_DIR), want, "the push as grafted: every billing file of `feature`, byte for byte");
+    assert_eq!(got.get("src/w.txt").map(Vec::as_slice), Some(b"w\n".as_slice()));
+}
+
+/// Guarantees 2 and 3 (review of `s8k`): a push whose work stands on the
+/// view its person had before is what moves the clone (the first command
+/// after the access change, nothing moved it before), once; the push lands
+/// on the current view's `feature`, and the server grafts every billing
+/// file back. The pre-push hook (a command of the person's, outside the
+/// repository) runs exactly once.
+#[test]
+fn s8kr_a_push_moves_first_and_runs_its_hook_once() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name, "--confirm", &p.fin.fingerprint()]);
+    let d = plain_thin(&p, &hub, "hooked");
+    let counter = p.fin.home.path().join("pre-push-runs");
+    let hook = d.join(".veil/hooks/pre-push");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, format!("#!/bin/sh\ncat > /dev/null\necho ran >> '{}'\n", counter.display())).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    p.fin.ok(&d, &["new", "feature"]);
+    write_files(&d, &[("src/pushme.txt", "pushme\n")]);
+    p.fin.ok(&d, &["commit", "--no-advance", "-m", "pushme"]);
+    p.fin.ok(&d, &["tag", "set", "pushme", "-r", "@-"]);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let out = p.fin.ok(&d, &["push", "-t", "pushme"]);
+    assert!(out.contains("pushed"), "{out}");
+    assert_eq!(out.matches(MOVED).count(), 1, "{out}");
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "ran\n", "the pre-push hook ran once");
+    let fresh = plain_thin(&p, &hub, "fresh");
+    assert_eq!(parents_of(&d, "pushme"), vec![tags_of(&fresh)["feature"]], "on the current view's `feature`");
+    p.admin.ok(&p.dir, &["pull"]);
+    p.admin.ok(&p.dir, &["new", "feature"]);
+    let want = below(&walk(&p.dir), BILL_DIR);
+    p.admin.ok(&p.dir, &["new", "origin/pushme"]);
+    let got = walk(&p.dir);
+    assert_eq!(below(&got, BILL_DIR), want, "every billing file of `feature`, byte for byte");
+    assert_eq!(got.get("src/pushme.txt").map(Vec::as_slice), Some(b"pushme\n".as_slice()));
+}
+
+/// Guarantee 2 (review of `s8k`): the check before a push costs about the
+/// same with 2 tags and workspaces as with 40, also for `vl push` without
+/// `-t` (every tag the remote does not have) after someone else pushed
+/// since the clone's last pull. No access change. The check's own cost is
+/// the push's requests less those of the same push with the check off
+/// (`VEIL_TEST_NO_VIEW_MOVE=1`, in a twin clone).
+#[test]
+fn s8kr_a_push_after_the_server_moved_costs_no_request_a_tag() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name, "--confirm", &p.fin.fingerprint()]);
+    for i in 0..40 {
+        write_files(&p.dir, &[(&format!("src/n/{i:02}.txt"), &format!("n {i}\n"))]);
+        p.admin.commit_main(&p.dir, &format!("n {i}"));
+    }
+    p.admin.ok(&p.dir, &["push"]);
+    let mut cost = Vec::new();
+    for n in [2usize, 40] {
+        let clones: Vec<(PathBuf, String)> = ["c", "o"].iter().map(|k| (plain_thin(&p, &hub, &format!("moved{k}{n}")), format!("{k}{n}t"))).collect();
+        for (d, pre) in &clones {
+            p.fin.ok(d, &["tag", "set", &format!("{pre}0"), "-r", "main"]);
+            p.fin.ok(d, &["ws", "new", &format!("{pre}ws0"), "-r", "main"]);
+            for i in 1..n {
+                p.fin.ok(d, &["tag", "set", &format!("{pre}{i}"), "-r", &format!("{pre}{}-", i - 1)]);
+                p.fin.ok(d, &["ws", "new", &format!("{pre}ws{i}"), "-r", &format!("{pre}{i}")]);
+            }
+        }
+        // Someone else pushes after these clones' last pull.
+        write_files(&p.dir, &[(&format!("src/later{n}.txt"), "later\n")]);
+        p.admin.commit_main(&p.dir, &format!("later {n}"));
+        p.admin.ok(&p.dir, &["push"]);
+        let mut each = Vec::new();
+        for (i, (d, _)) in clones.iter().enumerate() {
+            let before = requests(&hub);
+            let mut c = p.fin.command(d, &["push"]);
+            if i == 1 {
+                c.env("VEIL_TEST_NO_VIEW_MOVE", "1");
+            }
+            let o = c.output().unwrap();
+            let all = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+            assert!(o.status.success() && all.contains("pushed"), "{all}");
+            assert!(!all.contains(MOVED), "{all}");
+            each.push(requests(&hub) - before);
+        }
+        eprintln!("s8kr: `vl push` of {n} tags after the server moved: {} requests, {} without the check", each[0], each[1]);
+        cost.push(each[0].saturating_sub(each[1]));
+    }
+    assert!(cost[1] <= cost[0] + 8, "the check cost {} requests with 40 tags, {} with 2", cost[1], cost[0]);
+}
+
+/// Guarantee 3 (review of `s8k`): `vl ws exec` never runs its command
+/// twice across a move. fin's workspace `agent` stands on `feature` in the
+/// view fin had; fin loses the billing folder; the command (appending a
+/// line to a file of the sandbox's) writes inside the folder fin lost, and
+/// its run is recorded. The command runs once and the clone moves once,
+/// whether the move comes after the run (today: its recording fails on
+/// the history fin no longer reads, BUG-1573, and the command is not run
+/// again) or before it.
+#[test]
+fn s8kr_ws_exec_never_runs_its_command_twice_across_a_move() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name, "--confirm", &p.fin.fingerprint()]);
+    let d = thin_with_agent(&p, &hub, &p.fin, "exec");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let script = format!("echo ran >> ran.txt; mkdir -p {BILL_DIR}/acme && echo mine > {BILL_DIR}/acme/exec.txt");
+    let o = p.fin.run(&d, &["ws", "exec", "agent", "--", "sh", "-c", &script]);
+    let all = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let ran = std::fs::read_to_string(d.join(".veil/local/sandboxes/agent/files/ran.txt")).unwrap_or_else(|e| panic!("the command ran: {e}\n{all}"));
+    assert_eq!(ran, "ran\n", "the command ran once: {all}");
+    assert_eq!(all.matches(MOVED).count(), 1, "the clone moved, once: {all}");
+}
+
+/// BUG-1573 (review of `s8k`): a workspace whose change stands on a server
+/// snapshot this thin clone never fetched (`vl ws new agent -r feature`,
+/// never run yet), after its person loses a folder. The server refuses the
+/// old root, so the first `vl ws exec agent` runs the command in an empty
+/// sandbox, then fails to record it; the move that follows keeps the
+/// workspace's change (empty: it edits nothing) "where it is" because it
+/// cannot tell what its old parent held (`lost_paths` gives `None`), so
+/// every later `vl ws exec agent` does the same.
+#[test]
+#[ignore = "BUG-1573: a workspace on a snapshot the thin clone never fetched runs its command in an empty sandbox after an access change, for ever"]
+fn bug_1573_a_workspace_never_synced_runs_on_the_current_view_after_an_access_change() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name, "--confirm", &p.fin.fingerprint()]);
+    let d = thin_with_agent(&p, &hub, &p.fin, "never");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let want = format!("{FEATURE_MARK} 0 0");
+    for run in 0..2 {
+        let o = p.fin.run(&d, &["ws", "exec", "agent", "--", "sh", "-c", "cat src/wide/f0/s0.txt; echo out > out.txt"]);
+        let all = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert!(o.status.success() && all.contains(&want), "run {run}: the command runs on feature's files, and is recorded: {all}");
+        assert_eq!(all.matches(MOVED).count(), if run == 0 { 1 } else { 0 }, "run {run}: {all}");
+        assert!(!all.contains("kept where it is"), "run {run}: an empty change edits nothing: {all}");
+        assert!(!all.contains(FEATURE_BILL) && !all.contains(BILL_MARK), "run {run}: {all}");
+    }
+}
+
+/// BUG-1574 (review of `s8k`): a sandbox synced to a tree whose root the
+/// server refuses (here: a workspace never synced, in a view that changed,
+/// with the move off so the record is the sync's alone) records the root
+/// as hidden and refused (`""`), which the record's reader rejects
+/// (`Materialised`'s `TryFrom`: no root). The manifest is then
+/// "unreadable": the run's error says to run `--record-only`, which answers
+/// that the sandbox holds no unrecorded run though the output is there,
+/// and the next run sets the files aside as of an unreadable manifest.
+#[test]
+#[ignore = "BUG-1574: a sandbox whose root tree the server refuses writes a materialisation record it cannot read back (`--record-only` says there is nothing to record)"]
+fn bug_1574_a_sandbox_whose_root_the_server_refuses_keeps_a_readable_record() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name, "--confirm", &p.fin.fingerprint()]);
+    let d = thin_with_agent(&p, &hub, &p.fin, "rootless");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    p.fin.stay_in_stale_views();
+    let o = p.fin.run(&d, &["ws", "exec", "agent", "--", "sh", "-c", "echo ran >> ran.txt"]);
+    let all = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let sb = d.join(".veil/local/sandboxes/agent");
+    assert!(sb.join("files/ran.txt").exists(), "the command ran: {all}");
+    let manifest = std::fs::read_to_string(sb.join("manifest.json")).unwrap();
+    let r = p.fin.run(&d, &["ws", "exec", "agent", "--record-only"]);
+    let rall = format!("{}{}", String::from_utf8_lossy(&r.stdout), String::from_utf8_lossy(&r.stderr));
+    assert!(!rall.contains("holds no unrecorded run"), "the run's output is in the sandbox ({all}); its record reads back ({manifest}): {rall}");
+    let again = p.fin.run(&d, &["ws", "exec", "agent", "--", "true"]);
+    let aall = format!("{}{}", String::from_utf8_lossy(&again.stdout), String::from_utf8_lossy(&again.stderr));
+    assert!(!aall.contains("its manifest is unreadable"), "{manifest}\n{aall}");
 }

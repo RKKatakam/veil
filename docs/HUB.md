@@ -2991,8 +2991,10 @@ protocol or server change.
     as a conflict where it is the person's edit (BUG-1531). What each
     command does in a view that changed (BUG-1508) still holds for the
     command that finds it. **Outside this:** a full clone is not moved
-    (BUG-1562), and an explicit rebase of a change kept in the old view
-    rewrites it with a conflict at the lost folder (BUG-1563).
+    (BUG-1562), an explicit rebase of a change kept in the old view
+    rewrites it with a conflict at the lost folder (BUG-1563), and a
+    workspace on a snapshot the clone never fetched is kept in the old
+    view, its `vl ws exec` running on no files (BUG-1573).
   * **content already held reads at every path naming it** (decided,
     BUG-1464): removal of access stops new fetches; bytes already on a
     machine stay readable there, at any path naming them, as they are in a
