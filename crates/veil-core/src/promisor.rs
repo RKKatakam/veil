@@ -600,9 +600,10 @@ impl ObjectStore {
         if p.server.lock().unwrap_or_else(|e| e.into_inner()).contains(s) {
             return true;
         }
-        // Walked since the last snapshots arrived: the set is whole.
+        // Walked since the last snapshots arrived: the set is whole for
+        // what the tips reach; the server may still know it.
         if p.server_walked.load(Ordering::SeqCst) {
-            return false;
+            return self.server_knows(p, promisor, s);
         }
         let mut seen = HashSet::new();
         let mut stack = self.server_tips_now(p, promisor);
@@ -621,7 +622,33 @@ impl ObjectStore {
         let _ = self.take_boundary_hits_of(&seen);
         p.server.lock().unwrap_or_else(|e| e.into_inner()).extend(seen);
         p.server_walked.store(true, Ordering::SeqCst);
-        found
+        found || self.server_knows(p, promisor, s)
+    }
+
+    /// Does the server know snapshot `s` for this person, whatever the view
+    /// this clone met it in? The tips reach only the current view's history:
+    /// after an access change (and a pull), snapshots of the view before it
+    /// are reached by no tip, yet the server resolves them through the real
+    /// snapshot and answers for them, so an empty answer under one is its
+    /// refusal there, never "the server has no copy" (BUG-1530). Its history
+    /// answers for a snapshot it knows; nothing for a commit only this clone
+    /// holds. One request a snapshot, remembered for the process.
+    fn server_knows(&self, p: &Partial, promisor: &dyn Promisor, s: &ObjectId) -> bool {
+        if p.refused.lock().unwrap_or_else(|e| e.into_inner()).contains(s) {
+            return false;
+        }
+        match promisor.history(&[*s], 1) {
+            Ok(page) if !page.is_empty() => {
+                p.server.lock().unwrap_or_else(|e| e.into_inner()).insert(*s);
+                true
+            }
+            Ok(_) => {
+                p.refused.lock().unwrap_or_else(|e| e.into_inner()).insert(*s);
+                false
+            }
+            // Not reached: not known, and the read that asked says so.
+            Err(_) => false,
+        }
     }
 
     /// The remotes' tips as the view has them now (every view change sets

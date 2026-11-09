@@ -336,6 +336,7 @@ fn golden_operation() -> veil_core::oplog::Operation {
         redo_of: None,
         workspace: Some("agent-1".into()),
         rewritten,
+        restore_of: None,
     }
 }
 

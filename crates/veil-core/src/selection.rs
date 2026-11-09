@@ -42,7 +42,7 @@ use crate::{
     policy::POLICY_FILE,
     secrets::looks_binary,
     store::ObjectStore,
-    tree::{diff_trees, TreeChange, MAX_TREE_DEPTH},
+    tree::{TreeChange, MAX_TREE_DEPTH},
     vpath::VPath,
 };
 
@@ -142,7 +142,7 @@ pub struct Unit {
     /// The file, or for a swap the name both kinds share.
     pub path: VPath,
     /// The file-level changes it covers (one, except for a swap), in
-    /// [`diff_trees`] order.
+    /// [`diff_trees`](crate::tree::diff_trees) order.
     pub changes: Vec<TreeChange>,
     pub content: Content,
 }
@@ -201,8 +201,14 @@ pub type Selection = BTreeMap<VPath, Pick>;
 /// The file-level changes from `from` to `to`, as units, without reading
 /// any content (every unit [`Content::Pending`], or whole for a
 /// file/directory swap; see [`classify`]).
-pub fn units(store: &ObjectStore, from: &ObjectId, to: &ObjectId) -> Result<Vec<Unit>> {
-    let changes = diff_trees(store, Some(from), Some(to))?;
+/// Also the folders whose tree the server refuses (BUG-1508): never units,
+/// each kept where it is, a whole by id (a split's first change has the
+/// base's, its second the change's; a squash's rest is a merge in which
+/// only one side changed it), unless a choice names a path in it
+/// ([`check_hidden`], BUG-1529).
+pub fn units(store: &ObjectStore, from: &ObjectId, to: &ObjectId) -> Result<(Vec<Unit>, Vec<VPath>)> {
+    let (changes, hidden) = crate::tree::diff_trees_hiding(store, Some(from), Some(to))?;
+    let hidden: Vec<VPath> = hidden.into_iter().map(|h| h.path).collect();
     let file_paths: BTreeSet<VPath> = changes.iter().map(|c| c.path.clone()).collect();
     // The highest changed path that is a proper ancestor of `p`: `p` is
     // part of that file/directory swap.
@@ -240,7 +246,19 @@ pub fn units(store: &ObjectStore, from: &ObjectId, to: &ObjectId) -> Result<Vec<
             u.content = Content::Whole(Whole::TypeChange);
         }
     }
-    Ok(out)
+    Ok((out, hidden))
+}
+
+/// A choice that names a path in (or above) a folder the server refuses
+/// needs that folder's content: refused, naming it (BUG-1529). Any other
+/// choice leaves the folder where it is.
+pub fn check_hidden(hidden: &[VPath], specs: &[Spec]) -> Result<()> {
+    for s in specs {
+        if let Some(h) = hidden.iter().find(|h| s.path.starts_with(h) || h.starts_with(&s.path)) {
+            return Err(crate::tree::no_access(h, &format!("{} is asked for", display(&s.path))));
+        }
+    }
+    Ok(())
 }
 
 /// Decide how `unit` can be chosen, reading its versions if needed (see
@@ -331,10 +349,17 @@ pub struct Halves {
 /// everything (or nothing) is chosen, the halves are `tree` and `base`
 /// themselves.
 pub fn halves(store: &ObjectStore, base: &ObjectId, tree: &ObjectId, units: &[Unit], sel: &Selection) -> Result<Halves> {
+    halves_hiding(store, base, tree, units, &[], sel)
+}
+
+/// [`halves`] of a change that also changes the folders `hidden`, whose
+/// tree the server refuses (BUG-1529): never chosen, each stays with the
+/// rest as the change has it, by id; the chosen half has the base's.
+pub fn halves_hiding(store: &ObjectStore, base: &ObjectId, tree: &ObjectId, units: &[Unit], hidden: &[VPath], sel: &Selection) -> Result<Halves> {
     let none = Pick::default();
     let picks: Vec<&Pick> = units.iter().map(|u| sel.get(&u.path).unwrap_or(&none)).collect();
     let any = units.iter().zip(&picks).any(|(u, p)| !u.is_none(p));
-    let all = units.iter().zip(&picks).all(|(u, p)| u.is_all(p));
+    let all = hidden.is_empty() && units.iter().zip(&picks).all(|(u, p)| u.is_all(p));
     if all {
         return Ok(Halves { chosen: *tree, rest: *base, any: !units.is_empty(), all: true });
     }
@@ -342,6 +367,12 @@ pub fn halves(store: &ObjectStore, base: &ObjectId, tree: &ObjectId, units: &[Un
         return Ok(Halves { chosen: *base, rest: *tree, any: false, all: false });
     }
     let (mut chosen, mut rest) = (Vec::new(), Vec::new());
+    for h in hidden {
+        if h.is_root() {
+            return Err(crate::tree::no_access(h, "the change cannot be divided without it"));
+        }
+        rest.push((h.clone(), crate::tree::lookup(store, tree, h)?));
+    }
     for (u, pick) in units.iter().zip(picks) {
         let (to_chosen, to_rest) = if u.is_all(pick) {
             (true, false)

@@ -504,6 +504,7 @@ fn every_site_that_reads_missing_as_hidden_is_audited() {
         ("selection.rs", 2, "a hidden file is not selectable"),
         ("store.rs", 4, "the read path: Missing only after every local area"),
         ("transaction.rs", 2, "tolerated: an entry kept by id; the fetch-ahead of a move from a snapshot no longer held"),
+        ("tree.rs", 1, "refused_tree (BUG-1508): a tree the server refuses while fetching; readers list it hidden, writers carry it by id or refuse naming it (no_access); with fetching off it stays an error"),
         ("wc_policy.rs", 1, "an unreadable policy"),
     ];
     let found = count_in_src(|t| t.matches("is_unreadable()").count() + t.matches("VeilError::Missing(").count());

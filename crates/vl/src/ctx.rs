@@ -454,6 +454,11 @@ impl Ctx {
         &self.cache
     }
 
+    /// The record of what the working copy was materialised from.
+    pub fn materialised(&self) -> &veil_core::checkout::Materialised {
+        &self.checkout.materialised
+    }
+
     pub fn wc(&self) -> Result<ObjectId> {
         if self.bare {
             return Err(anyhow!("this is a bare repository (an old path remote): it has no working copy"));
@@ -972,7 +977,17 @@ impl Ctx {
                 eprintln!("Updated {} files, removed {}", r.written, r.removed);
             }
             for p in &r.redacted {
-                let why = lookup(self.repo.store(), &to_snap.tree, p)?.and_then(|e| render::hidden_reason(&self.repo, &e));
+                let e = lookup(self.repo.store(), &to_snap.tree, p)?;
+                // A folder the server refuses (BUG-1508): its path only.
+                if e.as_ref().is_some_and(|e| e.kind == veil_core::EntryKind::Dir) {
+                    eprintln!(
+                        "  {} {} (you no longer have access to this folder; left out of the working copy, kept in history)",
+                        render::yellow("redacted"),
+                        safe(&crate::api::hidden_dir(p))
+                    );
+                    continue;
+                }
+                let why = e.and_then(|e| render::hidden_reason(&self.repo, &e));
                 eprintln!(
                     "  {} {} ({}; left out of the working copy)",
                     render::yellow("redacted"),
