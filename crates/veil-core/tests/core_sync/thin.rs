@@ -478,7 +478,7 @@ fn every_site_that_reads_missing_as_hidden_is_audited() {
         ("selection.rs", 2, "a hidden file is not selectable"),
         ("store.rs", 4, "the read path: Missing only after every local area"),
         ("transaction.rs", 2, "tolerated: an entry kept by id; the fetch-ahead of a move from a snapshot no longer held"),
-        ("tree.rs", 1, "refused_tree (BUG-1508): a tree the server refuses while fetching; readers list it hidden, writers carry it by id or refuse naming it (no_access); with fetching off it stays an error"),
+        ("tree.rs", 2, "refused_tree (BUG-1508): a tree the server refuses while fetching; readers list it hidden, writers carry it by id or refuse naming it (no_access); with fetching off it stays an error; is_view_error (BUG-1509): only such a failure is run again after a move"),
         ("wc_policy.rs", 1, "an unreadable policy"),
     ];
     let found = count_in_src(|t| t.matches("is_unreadable()").count() + t.matches("VeilError::Missing(").count());
@@ -1116,7 +1116,6 @@ impl Promisor for Projecting {
 /// failed request fails the move, which changes nothing (the command, or
 /// the next one, moves).
 #[test]
-#[ignore = "BUG-1564: a transient error during the move to the current view rewrites a server change as local work"]
 fn s8jr_a_transient_error_during_the_move_never_rewrites_a_server_change() {
     // The older view: `c1` (src/ and bill/), then `c2` (src/ only).
     let id = Identity::generate("alice");

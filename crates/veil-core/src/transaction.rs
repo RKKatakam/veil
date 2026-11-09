@@ -484,7 +484,9 @@ impl<'r> Transaction<'r> {
             if !seen.insert(id) {
                 continue;
             }
-            if id == root || store.is_servers(&id) {
+            // A request that fails stops the move, nothing changed: never
+            // a server snapshot taken for local work (BUG-1564).
+            if id == root || store.is_servers(&id)? {
                 servers.insert(id);
                 continue;
             }

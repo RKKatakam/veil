@@ -2966,7 +2966,11 @@ protocol or server change.
     snapshot, `vl` moves the clone once, in one operation with a pull
     (`Transaction::move_to_view`, `hub::pull_moving`), reports it in one
     line ("your access changed; moved N changes to your current view"),
-    and runs a command that failed for it again. Every server snapshot a
+    and runs a command again only if the view change made it fail (never
+    a `vl ws exec`). A request that fails on the way stops the move with
+    nothing changed, a warning, and the next command tries again
+    (BUG-1564); before a push it asks only about what the push sends and
+    the server's current tips do not reach (BUG-1565). Every server snapshot a
     tag, head or workspace names, or that a change only this clone holds
     stands on, is replaced by its current projection, and each such change
     is rebased onto its parents' (`Repo::rebase_tree`): what the new parent

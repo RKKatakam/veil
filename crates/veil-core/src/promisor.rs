@@ -595,13 +595,18 @@ impl ObjectStore {
     /// Is snapshot `s` on the server: one of its tips as last pulled, or
     /// an ancestor of one that this clone holds?
     fn on_server(&self, p: &Partial, promisor: &dyn Promisor, s: &ObjectId) -> bool {
+        self.tips_reach(p, promisor, s) || self.server_knows(p, promisor, s)
+    }
+
+    /// Do the remotes' tips (as the view has them) reach `s`, through what
+    /// this clone holds? No request.
+    fn tips_reach(&self, p: &Partial, promisor: &dyn Promisor, s: &ObjectId) -> bool {
         if p.server.lock().unwrap_or_else(|e| e.into_inner()).contains(s) {
             return true;
         }
-        // Walked since the last snapshots arrived: the set is whole for
-        // what the tips reach; the server may still know it.
+        // Walked since the last snapshots arrived: the set is whole.
         if p.server_walked.load(Ordering::SeqCst) {
-            return self.server_knows(p, promisor, s);
+            return false;
         }
         let mut seen = HashSet::new();
         let mut stack = self.server_tips_now(p, promisor);
@@ -620,7 +625,7 @@ impl ObjectStore {
         let _ = self.take_boundary_hits_of(&seen);
         p.server.lock().unwrap_or_else(|e| e.into_inner()).extend(seen);
         p.server_walked.store(true, Ordering::SeqCst);
-        found || self.server_knows(p, promisor, s)
+        found
     }
 
     /// Does the server know snapshot `s` for this person, whatever the view
@@ -632,11 +637,10 @@ impl ObjectStore {
     /// answers for a snapshot it knows; nothing for a commit only this clone
     /// holds. One request a snapshot, remembered for the process.
     fn server_knows(&self, p: &Partial, promisor: &dyn Promisor, s: &ObjectId) -> bool {
+        // (Remembered with the projection; never in the tips' set, which
+        // holds only what the tips reach.)
         match self.projection_in(p, promisor, s) {
-            Ok(Some(_)) => {
-                p.server.lock().unwrap_or_else(|e| e.into_inner()).insert(*s);
-                true
-            }
+            Ok(Some(_)) => true,
             // Not reached: not known, and the read that asked says so.
             _ => false,
         }
@@ -698,10 +702,37 @@ impl ObjectStore {
 
     /// Is `s` on the server (not a commit only this clone holds)? Always
     /// `false` in a full clone.
-    pub fn is_servers(&self, s: &ObjectId) -> bool {
-        let Some(p) = self.partial.get() else { return false };
-        let Some(promisor) = self.promisor() else { return false };
-        self.on_server(p, &*promisor, s)
+    /// "Could not ask" is never "not the server's" (BUG-1564): a request
+    /// that fails is an error, and the move it decides stops with nothing
+    /// changed. `false` in a full clone.
+    pub fn is_servers(&self, s: &ObjectId) -> Result<bool> {
+        let Some(p) = self.partial.get() else { return Ok(false) };
+        let Some(promisor) = self.promisor() else {
+            return Err(VeilError::Unavailable("this thin clone has no connection to its server".into()));
+        };
+        if self.tips_reach(p, &*promisor, s) {
+            return Ok(true);
+        }
+        Ok(self.projection_in(p, &*promisor, s)?.is_some())
+    }
+
+    /// The snapshots `tips` reach through what this clone holds (no request,
+    /// nothing fetched): the server's current tips' history, which needs no
+    /// question about its view (BUG-1565).
+    pub fn reached_by(&self, tips: &[ObjectId]) -> HashSet<ObjectId> {
+        self.without_fetching(|| {
+            let mut seen = HashSet::new();
+            let mut stack: Vec<ObjectId> = tips.iter().copied().filter(|t| self.has(t)).collect();
+            while let Some(x) = stack.pop() {
+                if !seen.insert(x) {
+                    continue;
+                }
+                if let Ok(snap) = self.snapshot(&x) {
+                    stack.extend(snap.parents.iter().copied().filter(|p| self.has(p)));
+                }
+            }
+            seen
+        })
     }
 
     /// The server refused something met under `snapshot`: in a clone whose

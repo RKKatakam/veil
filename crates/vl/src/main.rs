@@ -257,16 +257,37 @@ fn run(cli: Cli) -> Result<ExitCode> {
             // the clone to the current one first; any other command whose
             // reads showed the view changed moves it after, once, and runs
             // again if it failed for that.
-            if matches!(cli.cmd, Cmd::Push { .. }) {
-                hub_cmd::move_before_push(&mut ctx)?;
+            // A move that cannot finish (the server not reached on the way)
+            // changes nothing and is a warning: the next command tries
+            // again (BUG-1564).
+            let moved = |r: Result<bool>| match r {
+                Ok(m) => m,
+                Err(e) => {
+                    render::warn(&format!("could not move this clone to your current view (the next command tries again): {e:#}"));
+                    false
+                }
+            };
+            if let Cmd::Push { remote, tag, .. } = &cli.cmd {
+                moved(hub_cmd::move_before_push(&mut ctx, remote.as_deref().unwrap_or("origin"), tag));
             }
             let code = match dispatch(&mut ctx, &cli) {
                 Ok(code) => {
-                    hub_cmd::move_if_view_changed(&mut ctx, &cli.cmd)?;
+                    moved(hub_cmd::move_if_view_changed(&mut ctx, &cli.cmd));
                     code
                 }
                 Err(e) => {
-                    if !hub_cmd::move_if_view_changed(&mut ctx, &cli.cmd)? {
+                    // Run again only what the view change made fail, and
+                    // never a sandbox's command, which may have run
+                    // already.
+                    let view = e.chain().any(|c| c.downcast_ref::<veil_core::VeilError>().is_some_and(veil_core::tree::is_view_error));
+                    let exec = matches!(cli.cmd, Cmd::Workspace(WsCmd::Exec { .. }));
+                    if !moved(hub_cmd::move_if_view_changed(&mut ctx, &cli.cmd)) {
+                        return Err(e);
+                    }
+                    if !view || exec {
+                        // Moved: the working copy follows; the failure is
+                        // the command's own.
+                        let _ = ctx.finish();
                         return Err(e);
                     }
                     ctx.finish()?;

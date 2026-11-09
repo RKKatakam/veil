@@ -2627,7 +2627,6 @@ fn s8jr_the_move_rebases_stacks_merges_workspaces_and_divergent_changes() {
 /// distinct server snapshots, push one change each. Expected: about the
 /// same number of requests.
 #[test]
-#[ignore = "BUG-1565: every push from a thin clone costs one history request per server snapshot its tags and workspaces name"]
 fn s8jr_a_push_costs_no_request_a_tag() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);

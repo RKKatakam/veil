@@ -310,20 +310,38 @@ pub fn move_if_view_changed(ctx: &mut Ctx, cmd: &crate::cli::Cmd) -> Result<bool
 /// in a view its person no longer has? Then the clone moves first, and the
 /// push sends the work as the current view has it, which the server grafts
 /// (BUG-1509).
-pub fn move_before_push(ctx: &mut Ctx) -> Result<bool> {
+pub fn move_before_push(ctx: &mut Ctx, remote: &str, only_tags: &[String]) -> Result<bool> {
     if !moves() || MOVED.load(std::sync::atomic::Ordering::SeqCst) || !ctx.repo.is_partial() {
         return Ok(false);
     }
+    if ctx.repo.config().partial.as_ref().is_none_or(|p| p.remote != remote) {
+        return Ok(false);
+    }
+    // What the push sends: the tags it names (all, without `-t`) that are
+    // not where the remote has them (BUG-1565).
     let store = ctx.repo.store().clone();
     let v = ctx.repo.view();
-    let mut stack: Vec<veil_core::ObjectId> = v.tags.values().map(|t| t.target).chain(v.workspaces.values().map(|w| w.wc)).collect();
+    let mut stack: Vec<veil_core::ObjectId> = v
+        .tags
+        .iter()
+        .filter(|(n, _)| only_tags.is_empty() || only_tags.contains(n))
+        .filter(|(n, t)| v.remote_tags.get(&format!("{remote}/{n}")) != Some(&t.target))
+        .map(|(_, t)| t.target)
+        .collect();
+    if stack.is_empty() {
+        return Ok(false);
+    }
+    // What the server's current tips reach needs no question.
+    let (client, _) = client_for(ctx, remote)?;
+    let current: Vec<veil_core::ObjectId> = client.tips()?.map(|t| t.branches.values().copied().collect()).unwrap_or_default();
+    let reached = store.reached_by(&current);
     let mut seen = std::collections::HashSet::new();
     let root = ctx.repo.root_id();
     while let Some(id) = stack.pop() {
-        if id == root || !seen.insert(id) || seen.len() > 10_000 {
+        if id == root || reached.contains(&id) || !seen.insert(id) || seen.len() > 10_000 {
             continue;
         }
-        if store.is_servers(&id) {
+        if store.is_servers(&id)? {
             if store.current_projection(&id)?.is_some_and(|n| n != id) {
                 return move_now(ctx, hub::MoveView::Always);
             }
