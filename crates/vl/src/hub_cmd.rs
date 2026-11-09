@@ -331,9 +331,17 @@ pub fn move_before_push(ctx: &mut Ctx, remote: &str, only_tags: &[String]) -> Re
     if stack.is_empty() {
         return Ok(false);
     }
-    // What the server's current tips reach needs no question.
+    // What the server's current tips reach needs no question. A tip this
+    // clone does not hold (someone pushed since its last pull) is paged in
+    // first, once for all of them, as a pull would: else nothing is reached
+    // and every server snapshot the push stands on is asked about, one
+    // request a tag (BUG-1575).
     let (client, _) = client_for(ctx, remote)?;
     let current: Vec<veil_core::ObjectId> = client.tips()?.map(|t| t.branches.values().copied().collect()).unwrap_or_default();
+    let unheld: Vec<veil_core::ObjectId> = current.iter().copied().filter(|t| !store.has(t)).collect();
+    if !unheld.is_empty() {
+        ctx.repo.deepen(&unheld, veil_core::promisor::HISTORY_PAGE)?;
+    }
     let reached = store.reached_by(&current);
     let mut seen = std::collections::HashSet::new();
     let root = ctx.repo.root_id();

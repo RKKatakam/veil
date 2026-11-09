@@ -2764,15 +2764,17 @@ fn s8kr_a_push_moves_first_and_runs_its_hook_once() {
 #[test]
 fn s8kr_a_push_after_the_server_moved_costs_no_request_a_tag() {
     let hub = TestHub::start();
-    let p = project_with_feature(&hub);
-    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name, "--confirm", &p.fin.fingerprint()]);
-    for i in 0..40 {
-        write_files(&p.dir, &[(&format!("src/n/{i:02}.txt"), &format!("n {i}\n"))]);
-        p.admin.commit_main(&p.dir, &format!("n {i}"));
-    }
-    p.admin.ok(&p.dir, &["push"]);
     let mut cost = Vec::new();
+    // A project a round: a tag pushed in one round is a server tip the next
+    // round's clones hold, which would reach every base and hide the cost.
     for n in [2usize, 40] {
+        let p = project_with_feature(&hub);
+        p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name, "--confirm", &p.fin.fingerprint()]);
+        for i in 0..40 {
+            write_files(&p.dir, &[(&format!("src/n/{i:02}.txt"), &format!("n {i}\n"))]);
+            p.admin.commit_main(&p.dir, &format!("n {i}"));
+        }
+        p.admin.ok(&p.dir, &["push"]);
         let clones: Vec<(PathBuf, String)> = ["c", "o"].iter().map(|k| (plain_thin(&p, &hub, &format!("moved{k}{n}")), format!("{k}{n}t"))).collect();
         for (d, pre) in &clones {
             p.fin.ok(d, &["tag", "set", &format!("{pre}0"), "-r", "main"]);
