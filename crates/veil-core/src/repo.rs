@@ -257,6 +257,10 @@ pub struct Repo {
     /// The heads the view was read from (ancestors dropped, sorted): the
     /// parents of the next operation.
     pub(crate) base: Vec<ObjectId>,
+    /// The newest timestamp of `base`: the next operation is never older
+    /// than its parents, even with the clock set back (the op log's walks
+    /// visit descendants first, BUG-1297).
+    pub(crate) base_time: i64,
     /// The head files as read.
     pub(crate) raw: RawHeads,
     /// Opened as a remote ([`Repo::open_remote`]): transactions take the
@@ -288,10 +292,77 @@ fn persists_index(backend: &dyn StorageBackend, view: &View) -> bool {
     !backend.is_network() && !view.workspaces.is_empty()
 }
 
+/// A rewrite: the old snapshot and its replacements (none: abandoned).
+type Rewritten = (ObjectId, Vec<ObjectId>);
+
+/// The operations a merge saw record one rewrite, and those of them that
+/// are commands (not merges recording a rewrite they applied).
+#[derive(Default)]
+struct Recorded {
+    ops: Vec<ObjectId>,
+    commands: Vec<ObjectId>,
+}
+
+/// A ref of a view the merge's rebase re-points: a workspace, a tag, a head.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum RefKey {
+    Ws(String),
+    Tag(String),
+    Head(ObjectId),
+}
+
+/// Each ref of `view` with its value (the snapshot it names).
+fn ref_values(view: &View) -> Vec<(RefKey, ObjectId)> {
+    let mut out: Vec<(RefKey, ObjectId)> = view.workspaces.iter().map(|(n, w)| (RefKey::Ws(n.clone()), w.wc)).collect();
+    out.extend(view.tags.iter().map(|(n, t)| (RefKey::Tag(n.clone()), t.target)));
+    out.extend(view.heads.iter().map(|h| (RefKey::Head(*h), *h)));
+    out
+}
+
+/// What an operation takes back (see `Repo::retractor`).
+pub(crate) enum Retractor {
+    Undo(ObjectId),
+    Redo(ObjectId),
+    Restore(std::collections::HashSet<ObjectId>),
+}
+
+/// The operations the retractors take back, those taken back themselves
+/// (an undo of a restore, a redo of an undo) taking back nothing.
+pub(crate) fn retracted_commands(retractors: &BTreeMap<ObjectId, Retractor>) -> std::collections::HashSet<ObjectId> {
+    let mut out: std::collections::HashSet<ObjectId> = Default::default();
+    // A fixed point: each round recomputes from the retractors still in
+    // force; an operation only takes back older ones, so it settles.
+    for _ in 0..=retractors.len() {
+        let mut next: std::collections::HashSet<ObjectId> = Default::default();
+        for (id, r) in retractors {
+            if out.contains(id) {
+                continue;
+            }
+            match r {
+                Retractor::Undo(u) => {
+                    next.insert(*u);
+                }
+                Retractor::Redo(u) => {
+                    next.insert(*u);
+                }
+                Retractor::Restore(ops) => next.extend(ops.iter().copied()),
+            }
+        }
+        if next == out {
+            break;
+        }
+        out = next;
+    }
+    out
+}
+
 /// See `Repo::merge_plan`.
 pub(crate) struct MergePlan {
     pub(crate) view: View,
     pub(crate) rewritten: BTreeMap<ObjectId, Vec<ObjectId>>,
+    /// Refs the rebase leaves where they are: set on an old snapshot by an
+    /// operation that saw its rewrite (BUG-1434).
+    pub(crate) pinned: std::collections::BTreeSet<RefKey>,
     pub(crate) before: Vec<View>,
     pub(crate) timestamp: i64,
     pub(crate) warnings: Vec<String>,
@@ -409,6 +480,7 @@ impl Repo {
             redo_of: None,
             workspace: None,
             rewritten: Default::default(),
+            restore_of: None,
         };
         let op_id = ops.publish(&op, &RawHeads::default())?;
         // `repo.json` is what makes this a repository, so it is written last:
@@ -428,6 +500,7 @@ impl Repo {
             user: user.to_string(),
             root_id,
             base: vec![op_id],
+            base_time: op.timestamp,
             raw: RawHeads {
                 all: vec![op_id],
                 legacy: None,
@@ -483,6 +556,7 @@ impl Repo {
             user: user.to_string(),
             root_id,
             base: Vec::new(),
+            base_time: 0,
             raw: RawHeads::default(),
             remote,
             command_ws: None,
@@ -532,15 +606,19 @@ impl Repo {
             return Ok(false);
         }
         let heads = self.ops.drop_ancestors(&raw.all)?;
-        let (op_id, view) = match heads.as_slice() {
-            [one] => (*one, self.ops.get_head(one)?.view),
+        let (op_id, view, time) = match heads.as_slice() {
+            [one] => {
+                let op = self.ops.get_head(one)?;
+                (*one, op.view, op.timestamp)
+            }
             _ => {
                 let plan = self.merge_plan(&heads, false)?;
-                (self.ops.head()?, plan.view)
+                (self.ops.head()?, plan.view, plan.timestamp)
             }
         };
         self.raw = raw;
         self.base = heads;
+        self.base_time = time;
         self.op_id = op_id;
         self.view = view;
         self.pin_working_copies();
@@ -847,9 +925,28 @@ impl Repo {
         let mut timestamp = first.timestamp;
         let mut acc = first.view;
         let mut before = vec![acc.clone()];
+        // The views of the heads merged so far.
+        let mut head_views = vec![acc.clone()];
         let mut warnings = Vec::new();
-        let mut rewritten: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
-        let mut divergent: std::collections::BTreeSet<ObjectId> = Default::default();
+        // Every rewrite seen (old snapshot, its replacements), with the
+        // operations that recorded it, keyed by the rewrite (BUG-1299). A
+        // command's rewrites are taken back only by what the op log says
+        // takes the command back: an undo of it, an op restore past it
+        // (BUG-1434: showing an old snapshot again is never an undo). A
+        // rewrite only merges recorded is judged by the views (`undone`).
+        let mut seen: BTreeMap<Rewritten, Recorded> = BTreeMap::new();
+        let mut undone: std::collections::HashSet<Rewritten> = Default::default();
+        let mut retractors: BTreeMap<ObjectId, Retractor> = BTreeMap::new();
+        // Which command set each ref value (an operation of a side's own
+        // history, not a merge): a ref on an old snapshot set by a command
+        // that saw its rewrite is deliberate, and stays (a tag on the old
+        // version, a workspace on it, an undo's revert).
+        let mut introducers: HashMap<(RefKey, ObjectId), Vec<ObjectId>> = HashMap::new();
+        let mut scanned: std::collections::HashSet<ObjectId> = Default::default();
+        // Every step's conflict losers: a later step's removal of the head
+        // (a side that dropped it, unaware of the losing write) never hides
+        // one (BUG-1298).
+        let mut losers: Vec<ObjectId> = Vec::new();
         for h in &heads[1..] {
             let op = self.ops.get(h)?;
             timestamp = timestamp.max(op.timestamp);
@@ -862,41 +959,106 @@ impl Repo {
             // (BUG-1294).
             let shared = crate::oplog::shared_base(&base, &acc, &split.introduced(&split.only_a), &op.view, &split.introduced(&split.only_b));
             if rewrites {
-                for (ids, side) in [(&split.only_a, &acc), (&split.only_b, &op.view)] {
-                    let refs: std::collections::HashSet<ObjectId> = side.refs().into_iter().collect();
-                    // Oldest first: a later rewrite of a snapshot wins.
-                    let mut side_map: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
-                    for id in ids.iter().rev() {
-                        if let Some(o) = self.ops.try_get(id)? {
-                            for (old, new) in o.rewritten {
-                                side_map.insert(old, new);
+                for (ids, sides) in [(&split.only_a, &head_views[..]), (&split.only_b, std::slice::from_ref(&op.view))] {
+                    // Each rewrite with the operations that recorded it (and
+                    // those that are commands, not merges recording what
+                    // they applied). A rewrite of a snapshot by an operation
+                    // that descends from another's rewrite of it replaces
+                    // that one; concurrent ones (merged on that side as a
+                    // divergent change) all stay. One an earlier step
+                    // collected is decided already.
+                    let mut by_old: BTreeMap<ObjectId, Vec<(Vec<ObjectId>, ObjectId, bool)>> = BTreeMap::new();
+                    for id in ids.iter() {
+                        if let Some(o) = split.ops.get(id) {
+                            for (old, new) in &o.rewritten {
+                                by_old.entry(*old).or_default().push((new.clone(), *id, !o.is_merge()));
                             }
                         }
                     }
-                    // Undone on that side since: it shows `old` again, as
-                    // a ref or as an ancestor of one (an undone abandon or
-                    // amend of a parent of `@`). One walk from the refs, down
-                    // to the oldest rewritten snapshot.
-                    let mut floor = crate::graph_index::Gen::MAX;
-                    for old in side_map.keys() {
-                        if let Some(g) = self.graph.generation(self, old)? {
-                            floor = floor.min(g);
+                    let mut side_map: BTreeMap<Rewritten, Recorded> = BTreeMap::new();
+                    let mut below: Option<HashMap<ObjectId, std::collections::HashSet<ObjectId>>> = None;
+                    for (old, entries) in by_old {
+                        let differ = entries.iter().any(|(n, _, _)| *n != entries[0].0);
+                        for (new, id, command) in &entries {
+                            let replaced = differ && {
+                                let below = below.get_or_insert_with(|| split.ancestors_within(ids));
+                                entries.iter().any(|(n2, id2, _)| n2 != new && below.get(id2).is_some_and(|b| b.contains(id)))
+                            };
+                            if replaced {
+                                continue;
+                            }
+                            let r = side_map.entry((old, new.clone())).or_default();
+                            r.ops.push(*id);
+                            if *command {
+                                r.commands.push(*id);
+                            }
                         }
                     }
-                    let visible: std::collections::HashSet<ObjectId> = match floor {
-                        crate::graph_index::Gen::MAX => Default::default(),
-                        f => self.graph.down_to(self, refs.iter().copied(), f)?.into_keys().collect(),
-                    };
-                    for (old, new) in side_map {
-                        if refs.contains(&old) || visible.contains(&old) {
+                    side_map.retain(|k, r| !seen.get(k).is_some_and(|s| r.ops.iter().all(|o| s.ops.contains(o))));
+                    // Undone on that side since: one of its heads shows
+                    // `old` again, as a ref or as an ancestor of one (an
+                    // undone abandon or amend of a parent of `@`, BUG-802).
+                    // Every head of the side saw the rewrite (it first
+                    // appears here); each is asked, not their merged view,
+                    // where a conflict may have hidden what one shows.
+                    let mut olds: Vec<ObjectId> = side_map.keys().map(|k| k.0).collect();
+                    olds.dedup();
+                    let mut shown = std::collections::HashSet::new();
+                    if !olds.is_empty() {
+                        for v in sides {
+                            shown.extend(self.shown(v, &olds)?);
+                        }
+                    }
+                    for (k, rec) in side_map {
+                        let r = seen.entry(k.clone()).or_default();
+                        r.ops.extend(rec.ops);
+                        r.commands.extend(rec.commands);
+                        if r.commands.is_empty() && shown.contains(&k.0) {
+                            undone.insert(k);
+                        }
+                    }
+                    for id in ids.iter() {
+                        let Some(o) = split.ops.get(id) else { continue };
+                        if !scanned.insert(*id) {
                             continue;
                         }
-                        match rewritten.get(&old) {
-                            Some(prev) if *prev != new => {
-                                divergent.insert(old);
+                        if let Some(r) = self.retractor(o)? {
+                            retractors.insert(*id, r);
+                        }
+                        // A merge sets nothing deliberately (what it adds are
+                        // rebases and a conflict's losers).
+                        if o.is_merge() {
+                            continue;
+                        }
+                        let parents: Vec<std::collections::HashSet<(RefKey, ObjectId)>> =
+                            o.parents.iter().filter_map(|p| split.ops.get(p)).map(|p| ref_values(&p.view).into_iter().collect()).collect();
+                        for kv in ref_values(&o.view) {
+                            if !parents.iter().any(|p| p.contains(&kv)) {
+                                introducers.entry(kv).or_default().push(*id);
                             }
-                            _ => {
-                                rewritten.insert(old, new);
+                        }
+                    }
+                }
+                // A rewrite only merges recorded (the op log does not say
+                // which command it is, so not what took it back), undone by
+                // a head merged after the step that collected it (BUG-1295):
+                // this head saw it and shows `old`; or a side shows `old`
+                // where the shared history does not (a rewrite from the
+                // shared history, recorded again by a settler's merge on the
+                // other side: the side showing `old` brought it back).
+                let live: Vec<Rewritten> = seen.iter().filter(|(k, r)| r.commands.is_empty() && !undone.contains(*k)).map(|(k, _)| k.clone()).collect();
+                if !live.is_empty() {
+                    let mut olds: Vec<ObjectId> = live.iter().map(|k| k.0).collect();
+                    olds.dedup();
+                    let in_shared = self.shown(&shared, &olds)?;
+                    let only_a: std::collections::HashSet<&ObjectId> = split.only_a.iter().collect();
+                    for (side, head) in [(&acc, false), (&op.view, true)] {
+                        let shown = self.shown(side, &olds)?;
+                        for k in live.iter().filter(|k| shown.contains(&k.0)) {
+                            let r = &seen[k];
+                            let saw = head && r.ops.iter().any(|o| !only_a.contains(o));
+                            if saw || !in_shared.contains(&k.0) {
+                                undone.insert(k.clone());
                             }
                         }
                     }
@@ -907,21 +1069,133 @@ impl Repo {
             let mut descends = |a: &ObjectId, b: &ObjectId| self.is_ancestor(b, a).unwrap_or(false);
             let merged = crate::oplog::merge_views(&shared, &[&acc, &op.view], &mut descends);
             warnings.extend(merged.warnings);
+            losers.extend(merged.losers);
             acc = merged.view;
             acc_heads.push(*h);
+            if rewrites {
+                head_views.push(op.view.clone());
+            }
         }
-        // Both sides rewrote it differently: a divergent change, both
-        // replacements stay visible and nothing follows either.
-        for d in divergent {
-            rewritten.remove(&d);
+        acc.heads.extend(losers);
+        // The commands the op log says were taken back: by an undo or op
+        // restore that is not itself taken back (an undo of the restore, a
+        // redo of the undo).
+        let retracted = retracted_commands(&retractors);
+        // A command's rewrite by the op log alone (even if a merge recorded
+        // it first, and the view rule judged it there); one only merges
+        // recorded by the views.
+        let stands = |k: &Rewritten, r: &Recorded| match r.commands.is_empty() {
+            true => !undone.contains(k),
+            false => r.commands.iter().any(|o| !retracted.contains(o)),
+        };
+        // The rewrites nobody undid. Two different ones of a snapshot: a
+        // divergent change, both replacements stay visible and nothing
+        // follows either.
+        let mut rewritten: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
+        let mut divergent: std::collections::BTreeSet<ObjectId> = Default::default();
+        let mut commands_of: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
+        let applied: Vec<(Rewritten, Recorded)> = seen.into_iter().filter(|(k, r)| stands(k, r)).collect();
+        for ((old, new), r) in applied {
+            commands_of.entry(old).or_default().extend(r.commands.iter().filter(|o| !retracted.contains(o)).copied());
+            match rewritten.get(&old) {
+                Some(prev) if *prev != new => {
+                    divergent.insert(old);
+                }
+                _ => {
+                    rewritten.insert(old, new);
+                }
+            }
+        }
+        for d in &divergent {
+            rewritten.remove(d);
+        }
+        // Refs on an old snapshot that a command which saw each rewrite of
+        // what they show set stay where they are (BUG-1434: a tag on the old
+        // version, a workspace on it, an undo's revert); a ref some rewrite
+        // it shows is new to follows the rewrites.
+        let mut pinned: std::collections::BTreeSet<RefKey> = Default::default();
+        if rewrites && !rewritten.is_empty() {
+            for (key, v) in ref_values(&acc) {
+                let mut shows = 0;
+                let mut deliberate = true;
+                for old in rewritten.keys() {
+                    if !(v == *old || self.is_ancestor(old, &v)?) {
+                        continue;
+                    }
+                    shows += 1;
+                    let commands = commands_of.get(old).map(Vec::as_slice).unwrap_or_default();
+                    if commands.is_empty() || !self.set_after(introducers.get(&(key.clone(), v)), commands)? {
+                        deliberate = false;
+                        break;
+                    }
+                }
+                if shows > 0 && deliberate {
+                    pinned.insert(key);
+                }
+            }
         }
         Ok(MergePlan {
             view: acc,
             rewritten,
+            pinned,
             before,
             timestamp,
             warnings,
         })
+    }
+
+    /// Did one of `introducers` (the operations that set a ref value)
+    /// descend from one of `commands`?
+    fn set_after(&self, introducers: Option<&Vec<ObjectId>>, commands: &[ObjectId]) -> Result<bool> {
+        for x in introducers.into_iter().flatten() {
+            for c in commands {
+                if x == c || self.ops.split(&[*x], &[*c])?.only_b.is_empty() {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// What operation `o` takes back, by the op log: an undo the operation
+    /// it undid, a redo the undo it reverts, an op restore every operation
+    /// between the restored one and its parents (a restore written before
+    /// `restore_of` names the restored operation in its description).
+    pub(crate) fn retractor(&self, o: &crate::oplog::Operation) -> Result<Option<Retractor>> {
+        if let Some(u) = o.undo_of {
+            return Ok(Some(Retractor::Undo(u)));
+        }
+        if let Some(u) = o.redo_of {
+            return Ok(Some(Retractor::Redo(u)));
+        }
+        let target = match o.restore_of {
+            Some(t) => Some(t),
+            None => match o.description.strip_prefix("restore to operation ") {
+                Some(prefix) if !o.parents.is_empty() && !o.is_merge() => self.ops.resolve_prefix_from(&o.parents, prefix).ok(),
+                _ => None,
+            },
+        };
+        match target {
+            Some(t) => Ok(Some(Retractor::Restore(self.ops.split(&o.parents, &[t])?.only_a.into_iter().collect()))),
+            None => Ok(None),
+        }
+    }
+
+    /// The snapshots of `olds` that `view` shows: as a ref, or as an
+    /// ancestor of one. One walk from the refs, down to the oldest of them.
+    fn shown(&self, view: &View, olds: &[ObjectId]) -> Result<std::collections::HashSet<ObjectId>> {
+        let mut floor = crate::graph_index::Gen::MAX;
+        for old in olds {
+            if let Some(g) = self.graph.generation(self, old)? {
+                floor = floor.min(g);
+            }
+        }
+        let refs: std::collections::HashSet<ObjectId> = view.refs().into_iter().collect();
+        let visible: std::collections::HashSet<ObjectId> = match floor {
+            crate::graph_index::Gen::MAX => Default::default(),
+            f => self.graph.down_to(self, refs.iter().copied(), f)?.into_keys().collect(),
+        };
+        Ok(olds.iter().filter(|o| refs.contains(o) || visible.contains(o)).copied().collect())
     }
 
     /// Set the workspace the operations of this command are for

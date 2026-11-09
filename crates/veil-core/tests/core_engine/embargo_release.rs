@@ -150,3 +150,343 @@ fn deleting_and_putting_back_the_fix_never_publishes_it() {
     remote::push(&mut alice, mirror.clone(), true, &[], false).unwrap();
     assert!(mirror_has_fix(&mirror));
 }
+
+// ---- Op log merges review, cycle 4 (re-check of BUG-1487's fix): a
+// staged release is published only if the user released it and nothing in
+// force took it back; and nothing else takes it back.
+
+/// [`embargoed`], with what reopening the repository needs: a public
+/// mirror for the pushes, and Alice's identity.
+fn embargoed_reopenable() -> (Repo, String, Arc<MemoryBackend>, Identity) {
+    let (mut alice, fs, me) = new_repo("alice");
+    let main = commit_files(&mut alice, &*fs, &[("auth.rs", "fn check() -> bool { true }\n")], "v1");
+    alice.set_tag("main", main, false).unwrap();
+    alice.create_workspace("fix", vec![main]).unwrap();
+    let ov = alice.workspace_overlay("fix").unwrap();
+    ov.write(&p("auth.rs"), b"fn check() -> bool { verify_signature() }\n").unwrap();
+    let fix = alice.snapshot_workspace("fix", &ov).unwrap().snapshot;
+    let r = alice
+        .merge(WS, main, vec![fix], "merge", Some(EmbargoSpec { scope: "team".into(), until: None }))
+        .unwrap();
+    alice.set_tag("main", r.snapshot, true).unwrap();
+    (alice, r.embargo.unwrap(), fs, me)
+}
+
+fn reopen(fs: &Arc<MemoryBackend>, me: &Identity) -> Repo {
+    Repo::open(fs.clone(), Some(me.clone()), "alice").unwrap()
+}
+
+/// Push to a new public mirror: the published releases, and whether the
+/// fix reached it.
+fn push_public(repo: &mut Repo) -> (Vec<String>, bool) {
+    let mirror = Arc::new(MemoryBackend::new());
+    let rep = remote::push(repo, mirror.clone(), true, &[], false).unwrap();
+    (rep.releases_published, mirror_has_fix(&mirror))
+}
+
+/// `vl embargo release` stopped after its operation, before it staged the
+/// release: the embargo stays unreleased, nothing publishes it, and
+/// releasing again works and publishes it.
+#[test]
+fn a_release_stopped_after_its_operation_is_never_published_and_can_be_released_again() {
+    let (mut alice, e, fs, me) = embargoed_reopenable();
+    let mut tx = alice.transaction(format!("{}{e}", veil_core::commands::RELEASE_OP_PREFIX)).unwrap();
+    tx.repository_wide();
+    tx.record_always();
+    assert!(tx.commit().unwrap().is_some(), "the release's operation recorded");
+    drop(alice);
+    let mut next = reopen(&fs, &me);
+    assert_eq!(next.keys().release_state(&e), ReleaseState::Unreleased, "stopped before staging: unreleased");
+    let (published, fix) = push_public(&mut next);
+    assert!(published.is_empty() && !fix, "published {published:?}, fix public: {fix}");
+    next.release_embargo(&e).unwrap();
+    assert_eq!(next.keys().release_state(&e), ReleaseState::Staged, "released again");
+    let mut last = reopen(&fs, &me);
+    assert_eq!(last.keys().release_state(&e), ReleaseState::Staged, "the open's check keeps it");
+    let (published, fix) = push_public(&mut last);
+    assert_eq!(published, vec![e.clone()]);
+    assert!(fix, "the released fix is public");
+}
+
+/// `vl undo` of a release stopped after its operation, before taking the
+/// release back: the next process takes it back; and a push by a process
+/// that opened before the undo (so its open saw the release in force)
+/// does not publish it either.
+#[test]
+fn an_undo_of_a_release_stopped_before_its_take_back_is_never_published() {
+    for pusher_opened_first in [false, true] {
+        let (mut alice, e, fs, me) = embargoed_reopenable();
+        alice.release_embargo(&e).unwrap();
+        let release = alice.op_id();
+        let mut pusher = pusher_opened_first.then(|| reopen(&fs, &me));
+        // The undo, as `Repo::undo` commits it; then the process stops.
+        let parent = alice.ops().get(&release).unwrap().parents[0];
+        let view = alice.ops().get(&parent).unwrap().view;
+        let mut tx = alice.transaction(format!("undo: {}{e}", veil_core::commands::RELEASE_OP_PREFIX)).unwrap();
+        tx.view = view;
+        tx.undo_of(release);
+        assert!(tx.commit().unwrap().is_some(), "the undo recorded");
+        assert_eq!(alice.keys().release_state(&e), ReleaseState::Staged, "stopped before the take-back");
+        drop(alice);
+        let mut pusher = pusher.take().unwrap_or_else(|| reopen(&fs, &me));
+        let (published, fix) = push_public(&mut pusher);
+        assert!(published.is_empty() && !fix, "opened first: {pusher_opened_first}; published {published:?}, fix public: {fix}");
+        assert_eq!(pusher.keys().release_state(&e), ReleaseState::Unreleased, "taken back");
+    }
+}
+
+/// A release staged by an older `vl` (which staged it, then recorded its
+/// operation) is published; one that stopped between the two (staged,
+/// with no operation) is taken back, never published.
+#[test]
+fn a_release_staged_by_an_older_vl_is_published_only_with_its_operation() {
+    for completed in [true, false] {
+        let (alice, e, fs, me) = embargoed_reopenable();
+        let mut alice = alice;
+        assert_eq!(alice.keys().stage_release(&e).unwrap(), veil_core::keychain::StageOutcome::Staged);
+        if completed {
+            let mut tx = alice.transaction(format!("{}{e}", veil_core::commands::RELEASE_OP_PREFIX)).unwrap();
+            tx.repository_wide();
+            tx.record_always();
+            assert!(tx.commit().unwrap().is_some(), "the release's operation recorded");
+        }
+        drop(alice);
+        let mut next = reopen(&fs, &me);
+        // Staged either way until a push checks it (BUG-1533: no check at
+        // open); the push publishes it only with its operation.
+        assert_eq!(next.keys().release_state(&e), ReleaseState::Staged, "completed: {completed}");
+        let (published, fix) = push_public(&mut next);
+        assert_eq!(published.is_empty(), !completed, "completed: {completed}: published {published:?}");
+        assert_eq!(fix, completed, "completed: {completed}: the fix public");
+        let after = if completed { ReleaseState::Released } else { ReleaseState::Unreleased };
+        assert_eq!(next.keys().release_state(&e), after, "completed: {completed}: after the push");
+    }
+}
+
+/// What the check never takes back: a release whose operation stands
+/// after an undo and redo of a later command, an op restore to after it,
+/// and a release made again after an undo or a restore took the first back.
+#[test]
+fn the_check_keeps_every_release_that_stands() {
+    for case in 0..4 {
+        let (mut alice, e, fs, me) = embargoed_reopenable();
+        let main = alice.view().tags["main"].target;
+        let before = alice.op_id();
+        alice.release_embargo(&e).unwrap();
+        match case {
+            0 => {
+                alice.set_tag("later", main, false).unwrap();
+                alice.undo().unwrap();
+                assert!(!alice.view().tags.contains_key("later"), "undone");
+                let (_, redone) = alice.redo_keeping_edits(WS).unwrap();
+                assert!(redone.contains("later"), "redid the tag: {redone}");
+            }
+            1 => {
+                alice.set_tag("later", main, false).unwrap();
+                let after_release = alice.ops().get(&alice.op_id()).unwrap().parents[0];
+                alice.set_tag("later2", main, false).unwrap();
+                alice.restore_operation(after_release).unwrap();
+            }
+            2 => {
+                alice.undo().unwrap();
+                assert_eq!(alice.keys().release_state(&e), ReleaseState::Unreleased, "the undo took it back");
+                alice.release_embargo(&e).unwrap();
+            }
+            _ => {
+                alice.restore_operation(before).unwrap();
+                assert_eq!(alice.keys().release_state(&e), ReleaseState::Unreleased, "the restore took it back");
+                alice.undo().unwrap();
+                assert_eq!(alice.keys().release_state(&e), ReleaseState::Unreleased, "the undo of the restore does not release");
+                alice.release_embargo(&e).unwrap();
+            }
+        }
+        assert_eq!(alice.keys().release_state(&e), ReleaseState::Staged, "case {case}: staged");
+        drop(alice);
+        let mut next = reopen(&fs, &me);
+        assert_eq!(next.keys().release_state(&e), ReleaseState::Staged, "case {case}: the open's check keeps it");
+        let (published, fix) = push_public(&mut next);
+        assert_eq!(published, vec![e.clone()], "case {case}");
+        assert!(fix, "case {case}: the released fix is public");
+    }
+}
+
+/// Two processes: one runs `vl embargo release` while the other opens the
+/// repository over and over (each open runs the check). The release is
+/// never taken back, and the next push publishes it.
+#[test]
+fn a_release_made_while_another_process_opens_the_repository_stands() {
+    for round in 0..12 {
+        let (alice, e, fs, me) = embargoed_reopenable();
+        drop(alice);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let opener = {
+            let (fs, me, done) = (fs.clone(), me.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut opens = 0;
+                while !done.load(std::sync::atomic::Ordering::SeqCst) || opens == 0 {
+                    let _ = reopen(&fs, &me);
+                    opens += 1;
+                }
+                opens
+            })
+        };
+        let mut releaser = reopen(&fs, &me);
+        releaser.release_embargo(&e).unwrap();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(opener.join().unwrap() > 0, "the other process opened");
+        assert_eq!(releaser.keys().release_state(&e), ReleaseState::Staged, "round {round}: staged");
+        let mut next = reopen(&fs, &me);
+        assert_eq!(next.keys().release_state(&e), ReleaseState::Staged, "round {round}: kept");
+        let (published, fix) = push_public(&mut next);
+        assert_eq!(published, vec![e.clone()], "round {round}");
+        assert!(fix, "round {round}: public");
+    }
+}
+
+/// BUG-1532 (op log merges review, cycle 4; introduced by BUG-1487's
+/// fix): `vl gc --keep-ops-days` prunes the operation of a release staged
+/// before the window, and the check at open, which looks for that
+/// operation in the heads' history, takes the release back: the user's
+/// release is lost without a word, and the next push leaves the fix
+/// embargoed.
+#[test]
+fn bug_1532_a_staged_release_stays_staged_when_gc_prunes_its_operation() {
+    let (mut alice, e, fs, me) = embargoed_reopenable();
+    let main = alice.view().tags["main"].target;
+    alice.release_embargo(&e).unwrap();
+    for n in ["a", "b", "c"] {
+        alice.set_tag(n, main, false).unwrap();
+    }
+    let report = veil_core::gc::gc(
+        &mut alice,
+        &veil_core::gc::GcOptions { keep_ops: Some(std::time::Duration::ZERO), now: Some(veil_core::now_millis() + 60_000), ..Default::default() },
+    )
+    .unwrap();
+    assert!(report.ops_before > 3, "gc ran over the op log");
+    assert_eq!(alice.keys().release_state(&e), ReleaseState::Staged, "staged after gc");
+    drop(alice);
+    let mut next = reopen(&fs, &me);
+    assert_eq!(next.keys().release_state(&e), ReleaseState::Staged, "the release the user made is kept");
+    let (published, fix) = push_public(&mut next);
+    assert_eq!(published, vec![e.clone()]);
+    assert!(fix, "the released fix is public");
+}
+
+/// `vl gc --keep-ops-days 0`, an hour on: the operations it leaves.
+fn gc_all_ops(repo: &mut Repo) -> usize {
+    let r = veil_core::gc::gc(
+        repo,
+        &veil_core::gc::GcOptions { keep_ops: Some(std::time::Duration::ZERO), now: Some(veil_core::now_millis() + 3_600_000), ..Default::default() },
+    )
+    .unwrap();
+    assert!(r.ops_before > 0, "gc ran over the op log");
+    r.ops_before - r.ops_pruned
+}
+
+/// `vl op restore <before>` as it commits its operation, the process
+/// stopping before it takes the release back (BUG-1487).
+fn stopped_restore(repo: &mut Repo, before: veil_core::ObjectId) {
+    let view = repo.ops().get(&before).unwrap().view;
+    let mut tx = repo.transaction(format!("restore to operation {}", before.short())).unwrap();
+    tx.view = view;
+    tx.restore_of(before);
+    tx.commit().unwrap().expect("recorded");
+}
+
+/// Op log merges review, cycle 5 (guarantee 2): what `vl gc
+/// --keep-ops-days 0` keeps while a release is staged is exactly what the
+/// push's check reads (the op log from the heads down to the release's
+/// operation), and nothing more once the release is published or taken
+/// back; without a staged release it keeps what it always kept.
+#[test]
+fn gc_keeps_exactly_what_the_push_check_reads_and_frees_it_after() {
+    let (mut alice, e, fs, me) = embargoed_reopenable();
+    let main = alice.view().tags["main"].target;
+    for n in ["a", "b", "c", "d"] {
+        alice.set_tag(n, main, false).unwrap();
+    }
+    let floor = gc_all_ops(&mut alice);
+    assert!(floor <= 3, "without a staged release gc keeps the heads and their parents: {floor}");
+    alice.release_embargo(&e).unwrap();
+    for n in ["f", "g", "h", "i", "j"] {
+        alice.set_tag(n, main, false).unwrap();
+    }
+    let (standing, read) = alice.staged_release_standing().unwrap();
+    assert_eq!(standing.get(&e), Some(&veil_core::commands::Standing::InForce), "in force");
+    assert_eq!(read.len(), 6, "the check reads the release's operation and the five since");
+    let kept = gc_all_ops(&mut alice);
+    assert_eq!(kept, read.len(), "gc keeps what the check reads, and no more");
+    let (after, read_after) = reopen(&fs, &me).staged_release_standing().unwrap();
+    assert_eq!((after, read_after), (standing, read), "the check reads the same after gc");
+    assert_eq!(gc_all_ops(&mut alice), kept, "a second gc keeps the same");
+    // Published: freed.
+    let mut next = reopen(&fs, &me);
+    let (published, fix) = push_public(&mut next);
+    assert_eq!(published, vec![e.clone()], "published");
+    assert!(fix, "the fix is public");
+    assert!(gc_all_ops(&mut next) <= floor, "freed once published");
+    // Taken back by an undo: freed.
+    let (mut bob, e2, _, _) = embargoed_reopenable();
+    bob.release_embargo(&e2).unwrap();
+    bob.undo().unwrap();
+    assert_eq!(bob.keys().release_state(&e2), ReleaseState::Unreleased, "the undo took it back");
+    let main2 = bob.view().tags["main"].target;
+    for n in ["f", "g", "h", "i", "j"] {
+        bob.set_tag(n, main2, false).unwrap();
+    }
+    assert!(gc_all_ops(&mut bob) <= floor, "freed once taken back");
+}
+
+/// Op log merges review, cycle 5 (guarantee 1): a restore past a staged
+/// release that stopped before taking it back, then `vl gc
+/// --keep-ops-days 0` (which prunes the restored operation, older than
+/// the release): the push still does not publish it, and says so.
+#[test]
+fn a_release_a_stopped_restore_took_back_stays_unpublished_through_gc() {
+    let (mut alice, e, fs, me) = embargoed_reopenable();
+    let main = alice.view().tags["main"].target;
+    let before = alice.op_id();
+    alice.set_tag("a", main, false).unwrap();
+    alice.release_embargo(&e).unwrap();
+    stopped_restore(&mut alice, before);
+    drop(alice);
+    let mut next = reopen(&fs, &me);
+    next.set_tag("later", main, false).unwrap();
+    gc_all_ops(&mut next);
+    assert!(next.ops().try_get(&before).unwrap().is_none(), "gc pruned the restored operation");
+    assert_eq!(next.keys().release_state(&e), ReleaseState::Staged, "staged until the push checks it");
+    let mirror = Arc::new(MemoryBackend::new());
+    let rep = remote::push(&mut next, mirror.clone(), true, &[], false).unwrap();
+    assert!(rep.releases_published.is_empty(), "not published: {:?}", rep.releases_published);
+    assert!(!mirror_has_fix(&mirror), "the fix stays embargoed");
+    assert!(rep.warnings.iter().any(|w| w.contains(&e) && w.contains("not published")), "the push says so: {:?}", rep.warnings);
+    assert_eq!(next.keys().release_state(&e), ReleaseState::Unreleased, "taken back");
+}
+
+/// Op log merges review, cycle 5 (guarantee 3): the push's warning and
+/// the release's standing name only the releases this person staged.
+/// Bob, a member who pulled Alice's embargo, sees no standing for it and
+/// no warning, while Alice's own push names it.
+#[test]
+fn the_push_warning_and_standing_name_only_ones_own_staged_releases() {
+    let bob = Identity::generate("bob");
+    let (mut alice, e, hub) = embargoed(&[&bob]);
+    let before = alice.op_id();
+    alice.release_embargo(&e).unwrap();
+    stopped_restore(&mut alice, before);
+    let (mut bobs, _) = repo_for("bob", &bob);
+    remote::pull(&mut bobs, "alice", alice.backend().clone()).unwrap();
+    remote::pull(&mut bobs, "hub", hub.clone()).unwrap();
+    assert!(bobs.keys().load_embargo(&e).unwrap().is_some(), "Bob holds the embargo's record");
+    let (standing, read) = bobs.staged_release_standing().unwrap();
+    assert!(standing.is_empty() && read.is_empty(), "Bob staged nothing: {standing:?}");
+    let rep = remote::push(&mut bobs, Arc::new(MemoryBackend::new()), true, &[], false).unwrap();
+    assert!(!rep.warnings.iter().any(|w| w.contains(&e)), "Bob's push names Alice's embargo: {:?}", rep.warnings);
+    let (standing, _) = alice.staged_release_standing().unwrap();
+    assert_eq!(standing.keys().cloned().collect::<Vec<_>>(), vec![e.clone()], "Alice's standing: her release only");
+    let rep = remote::push(&mut alice, Arc::new(MemoryBackend::new()), true, &[], false).unwrap();
+    assert!(rep.releases_published.is_empty(), "not published: {:?}", rep.releases_published);
+    let named: Vec<&String> = rep.warnings.iter().filter(|w| w.contains("was not published")).collect();
+    assert_eq!(named.len(), 1, "one warning, for her release: {:?}", rep.warnings);
+    assert!(named[0].contains(&e), "it names her embargo: {named:?}");
+}
