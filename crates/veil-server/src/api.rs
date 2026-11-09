@@ -75,8 +75,13 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/q/generations", post(crate::query::generations_route))
         .route("/v1/projects/{p}/q/search", get(crate::search::search_route))
         .route("/v1/projects/{p}/q/grep", get(crate::search::grep_route))
+        // Health metrics, for the project's admins (S24).
+        .route("/v1/projects/{p}/health", get(crate::limits::health::route))
         .layer(DefaultBodyLimit::max(crate::db::body_limit("")))
         .layer(axum::middleware::from_fn(crate::db::retry_requests))
+        // Rate limits, bodies under the budget, bulkheads (S24): before
+        // anything else runs.
+        .layer(axum::middleware::from_fn_with_state(hub.clone(), crate::limits::admit))
         .with_state(hub)
 }
 

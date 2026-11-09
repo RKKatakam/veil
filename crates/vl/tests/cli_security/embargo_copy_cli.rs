@@ -64,7 +64,6 @@ fn refused(r: &R, args: &[&str]) -> String {
 /// content or descriptions are there.
 fn publishes_nothing(env: &Env, r: &R) {
     let mirror = env.dir("mirror");
-    env.run(U, &mirror, &["init", "--bare"]);
     r.ok(&["remote", "add", "pub", mirror.to_str().unwrap(), "--public"]);
     r.ok(&["push", "pub"]);
     for needle in ["FIXNAME-K7", "FIX2-K7", "FIXBODY-K7", "FIXDESC-K7", "CHILDDESC-K7"] {
@@ -108,7 +107,7 @@ fn restore_from_the_fix_inside_its_embargo_works() {
     r.ok(&["restore", "--from", &v1]);
     // On the embargoed line, the fix is already there: not this refusal.
     r.ok(&["new", "main"]);
-    let t = text(&r.run(&["restore", "--from", "fix", "FIXNAME-K7.c"]));
+    let t = r.ok(&["restore", "--from", "fix", "FIXNAME-K7.c"]);
     assert!(!t.contains("a copy outside the embargo"), "{t}");
     publishes_nothing(&env, &r);
 }
@@ -282,7 +281,7 @@ fn rebasing_the_embargoed_merge_onto_other_parents_publishes_nothing() {
 fn blame_public_never_shows_an_unreleased_embargo_as_public() {
     let env = Env::new();
     let (r, _) = embargoed(&env);
-    let out = text(&r.run(&["blame", "FIXNAME-K7.c", "-r", "main", "--public", "--json"]));
+    let out = r.fails(&["blame", "FIXNAME-K7.c", "-r", "main", "--public", "--json"]);
     assert!(!out.contains("FIXBODY-K7") && !out.contains("FIXDESC-K7"), "the public view shows the withheld fix: {out}");
 }
 
@@ -385,7 +384,7 @@ fn a_withdrawn_embargo_is_not_listed_as_pending() {
     let (r, _) = embargoed(&env);
     r.ok(&["undo"]);
     let list = r.ok(&["embargo", "list"]);
-    assert!(!list.contains("manual release") || list.contains("withdrawn"), "nothing withholds the fix, yet: {list}");
+    assert!(!list.contains("manual release") && list.contains("withdrawn"), "nothing withholds the fix, yet: {list}");
 }
 
 // ---- the withholding rule, randomized -----------------------------------------
@@ -507,7 +506,6 @@ fn random_embargo_cases(seed: u64, cases: usize, steps: usize) -> usize {
         r.tag("fu", "@-");
         other(&r, &v1);
         let mirror = env.dir("mirror");
-        env.run(U, &mirror, &["init", "--bare"]);
         r.ok(&["remote", "add", "pub", mirror.to_str().unwrap(), "--public"]);
         let mut revs: Vec<String> = ["fix", "main", "main-", "fixchild", "other", "@", "@-", v1.as_str(), "fu"].iter().map(|s| s.to_string()).collect();
         for n in ["fix", "main", "fixchild"] {
@@ -557,7 +555,9 @@ fn random_embargo_cases(seed: u64, cases: usize, steps: usize) -> usize {
                     }
                 }
             }
-            let push = text(&r.run(&["push", "pub"]));
+            let push_out = r.run(&["push", "pub"]);
+            let push = text(&push_out);
+            assert!(push_out.status.success() || push.contains("remote has diverged: not a fast-forward"), "{push}");
             let leaked: Vec<&str> = markers.iter().copied().filter(|m| !store_contains(&mirror, m.as_bytes()).is_empty()).collect();
             if !leaked.is_empty() {
                 let list = r.ok(&["embargo", "list"]);

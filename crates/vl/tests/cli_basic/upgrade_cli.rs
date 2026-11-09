@@ -83,8 +83,9 @@ fn upgrade_from_the_cli() {
 
     let e = err(&vl(&home, &alice, &["cat", "README.md", "-r", "main"]));
     assert!(e.contains("format 7") && e.contains("vl upgrade"), "{e}");
-    let dry = vl(&home, &alice, &["upgrade", "--dry-run"]);
-    let dry = String::from_utf8_lossy(&dry.stdout).into_owned();
+    let dry_out = vl(&home, &alice, &["upgrade", "--dry-run"]);
+    assert!(!dry_out.status.success());
+    let dry = String::from_utf8_lossy(&dry_out.stdout).into_owned();
     assert!(dry.contains(&format!("Would upgrade this repository from format 7 to format {}", veil_core::repo::REPO_FORMAT)), "{dry}");
     assert!(dry.contains("The upgrade would be refused"), "{dry}");
     let e = err(&vl(&home, &alice, &["upgrade"]));
