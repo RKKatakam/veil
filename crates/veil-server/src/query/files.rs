@@ -991,18 +991,19 @@ pub fn kept_answer(f: &Files, t: &Trees, rev: ObjectId, start: &Version, follow:
 
 /// Blame jobs computing at once in one server (each runs its statements
 /// one at a time: at most this many of the pool's connections, and only
-/// while a statement runs). A freed slot goes to the next project in turn
-/// with a job waiting for one, and within it to the next view key in turn
-/// (BUG-1306, BUG-1410).
+/// while a statement runs). A freed slot goes to the next requester in
+/// turn with a job waiting for one (BUG-1306, BUG-1410, BUG-1553).
 pub const BLAME_JOBS: usize = 2;
-/// Blame jobs one view key of a project may have waiting in one server,
-/// past which its requests answer `warming` without queuing one (BUG-1306,
-/// BUG-1410: a view key fills its own share only, so nothing one viewer
-/// asks for refuses another's).
+/// Blame jobs one requester (a signed-in person; every caller without an
+/// account together) may have waiting in one server, all its projects and
+/// view keys together; past it, its requests answer `warming` without
+/// queuing one. That is the only at-once refusal, so it is a function of
+/// the requester's own jobs alone (BUG-1553, BUG-1554).
 pub const MAX_PENDING_JOBS: usize = 256;
-/// Blame jobs waiting in one server, all projects and view keys: past it,
-/// a view key below its fair share (this ÷ the view keys with jobs
-/// waiting, across projects) still queues, up to twice this in all.
+/// Blame jobs waiting in one server in all: at this ceiling a new job
+/// takes the place of the newest waiting job (not computing) of the
+/// requester with the most waiting, the furthest past its fair share
+/// (this ÷ the requesters waiting), which ends `warming` (BUG-1554).
 pub const MAX_PENDING_ALL: usize = 4096;
 /// A job's lease on its key ([`BlameLimits::lease`]), and how long a job
 /// waits for another server's ([`BlameLimits::wait`]; then it ends
@@ -1040,8 +1041,11 @@ impl JobEnd {
 /// A job's key: project, view key, path key, `follow`, snapshot.
 pub type JobKey = (i64, String, String, bool, ObjectId);
 type JobRx = tokio::sync::watch::Receiver<Option<JobEnd>>;
-/// Who shares a server's queue and slots: a view key of a project.
-type Sharer = (i64, String);
+/// Who shares a server's queue and slots: the signed-in person who asked
+/// first for a job, or `None` for every caller without an account
+/// together (BUG-1553: a view key is shared by many people, and one person
+/// has many).
+pub type Requester = Option<i64>;
 
 /// The blame jobs of one server.
 pub struct Jobs {
@@ -1051,11 +1055,91 @@ pub struct Jobs {
     pub started: std::sync::atomic::AtomicU64,
 }
 
+/// A job waiting or computing here.
+struct Entry {
+    rx: JobRx,
+    requester: Requester,
+    /// Its place in the order jobs were queued.
+    seq: u64,
+    ticket: Arc<Ticket>,
+}
+
+/// What a job and the table share: whether it was refused at the ceiling
+/// (it then ends `warming` where it waits: for a lease, or for a slot),
+/// and whether it computes (then it is never refused). Both change only
+/// under the table's lock.
+#[derive(Default)]
+struct Ticket {
+    refused: std::sync::atomic::AtomicBool,
+    computing: std::sync::atomic::AtomicBool,
+    wake: tokio::sync::Notify,
+}
+
+impl Ticket {
+    fn refused(&self) -> bool {
+        self.refused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[derive(Default)]
 struct Waiting {
-    jobs: HashMap<JobKey, JobRx>,
-    /// Jobs waiting, by project and view key.
-    per: HashMap<Sharer, usize>,
+    jobs: HashMap<JobKey, Entry>,
+    /// Jobs waiting, by requester.
+    per: HashMap<Requester, usize>,
+    seq: u64,
+}
+
+impl Waiting {
+    /// Whether a new job of `who` may queue, with `per` jobs a requester
+    /// and `all` in all: `None` when `who` has `per` waiting already (the
+    /// only refusal); else the job it takes the place of at the ceiling,
+    /// if any (removed here): the newest job not computing of the
+    /// requester with the most waiting.
+    fn admit(&mut self, who: Requester, per: usize, all: usize) -> Option<Option<(JobKey, Entry)>> {
+        if self.per.get(&who).copied().unwrap_or(0) >= per {
+            return None;
+        }
+        if self.jobs.len() < all {
+            return Some(None);
+        }
+        let mut most: Vec<(usize, Requester)> = self.per.iter().map(|(r, n)| (*n, *r)).collect();
+        most.sort_unstable_by(|a, b| b.cmp(a));
+        for (_, r) in most {
+            let newest = self
+                .jobs
+                .iter()
+                .filter(|(_, e)| e.requester == r && !e.ticket.computing.load(std::sync::atomic::Ordering::Relaxed))
+                .max_by_key(|(_, e)| e.seq)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = newest {
+                let e = self.remove(&k).unwrap();
+                e.ticket.refused.store(true, std::sync::atomic::Ordering::Relaxed);
+                e.ticket.wake.notify_one();
+                return Some(Some((k, e)));
+            }
+        }
+        // Every job computes: more than `all` slots (never so).
+        None
+    }
+
+    fn insert(&mut self, key: JobKey, rx: JobRx, requester: Requester) -> (u64, Arc<Ticket>) {
+        self.seq += 1;
+        let ticket = Arc::new(Ticket::default());
+        *self.per.entry(requester).or_default() += 1;
+        self.jobs.insert(key, Entry { rx, requester, seq: self.seq, ticket: ticket.clone() });
+        (self.seq, ticket)
+    }
+
+    fn remove(&mut self, key: &JobKey) -> Option<Entry> {
+        let e = self.jobs.remove(key)?;
+        if let Some(n) = self.per.get_mut(&e.requester) {
+            *n -= 1;
+            if *n == 0 {
+                self.per.remove(&e.requester);
+            }
+        }
+        Some(e)
+    }
 }
 
 impl Default for Jobs {
@@ -1069,11 +1153,11 @@ impl Default for Jobs {
 }
 
 /// This server's [`BLAME_JOBS`] slots, handed out fairly (BUG-1306,
-/// BUG-1410): a freed slot goes to the project after the one last served,
-/// in turn, among those with a job waiting; within it, to the view key
-/// after the one it last served, in turn; within a view key, first come
-/// first served. So no project holds another back by more than one job a
-/// slot, and within a project no view key holds another back.
+/// BUG-1410, BUG-1553): a freed slot goes to the requester after the one
+/// last served, in turn, among those with a job waiting for one; within a
+/// requester, first come first served. So no requester holds another back
+/// by more than one job a slot, whatever projects and view keys they ask
+/// in.
 struct Slots {
     state: std::sync::Mutex<SlotState>,
 }
@@ -1082,11 +1166,10 @@ type Waiter = tokio::sync::oneshot::Sender<Slot>;
 
 struct SlotState {
     free: usize,
-    /// Waiters by project, then view key.
-    queues: std::collections::BTreeMap<i64, std::collections::BTreeMap<String, std::collections::VecDeque<Waiter>>>,
-    /// The project last served, and each project's view key last served.
-    last: i64,
-    last_key: HashMap<i64, String>,
+    /// Waiters by requester.
+    queues: std::collections::BTreeMap<Requester, std::collections::VecDeque<Waiter>>,
+    /// The requester last served.
+    last: Option<Requester>,
 }
 
 /// A slot held; given back (to the next in turn) when dropped.
@@ -1113,26 +1196,26 @@ fn next_in_turn<K: Ord + Clone, V>(map: &std::collections::BTreeMap<K, V>, after
 
 impl Slots {
     fn new(n: usize) -> Slots {
-        Slots { state: std::sync::Mutex::new(SlotState { free: n, queues: Default::default(), last: i64::MIN, last_key: HashMap::new() }) }
+        Slots { state: std::sync::Mutex::new(SlotState { free: n, queues: Default::default(), last: None }) }
     }
 
-    async fn take(self: &Arc<Self>, project: i64, vk: &str) -> Slot {
+    /// A slot for `who`; a waiter that leaves before its turn (a job
+    /// refused at the ceiling) gives its turn to the next.
+    async fn take(self: &Arc<Self>, who: Requester) -> Slot {
         let rx = {
             let mut st = self.state.lock().unwrap();
             // A free slot means nobody (still) waits: a freed one goes to a
             // waiter first.
             if st.free > 0 {
                 st.free -= 1;
-                st.last = project;
-                st.last_key.insert(project, vk.to_string());
+                st.last = Some(who);
                 return Slot { slots: Some(self.clone()) };
             }
             let (tx, rx) = tokio::sync::oneshot::channel();
-            st.queues.entry(project).or_default().entry(vk.to_string()).or_default().push_back(tx);
+            st.queues.entry(who).or_default().push_back(tx);
             rx
         };
-        // A sender is dropped only once sent (a job's task is never
-        // cancelled while it waits).
+        // A sender is dropped only once sent.
         rx.await.expect("a blame slot")
     }
 
@@ -1140,28 +1223,16 @@ impl Slots {
         let mut guard = me.state.lock().unwrap();
         let st = &mut *guard;
         loop {
-            let last = st.last;
-            let Some(p) = next_in_turn(&st.queues, Some(&last)) else {
+            let Some(r) = next_in_turn(&st.queues, st.last.as_ref()) else {
                 st.free += 1;
                 return;
             };
-            let keys = st.queues.get_mut(&p).unwrap();
-            let k = next_in_turn(keys, st.last_key.get(&p)).unwrap();
-            let q = keys.get_mut(&k).unwrap();
+            let q = st.queues.get_mut(&r).unwrap();
             let tx = q.pop_front().unwrap();
             if q.is_empty() {
-                keys.remove(&k);
-                if keys.is_empty() {
-                    st.queues.remove(&p);
-                }
+                st.queues.remove(&r);
             }
-            st.last = p;
-            st.last_key.insert(p, k);
-            if st.last_key.len() > 4 * MAX_PENDING_ALL {
-                // Turns of projects with nothing waiting are forgotten.
-                let queued: HashSet<i64> = st.queues.keys().copied().collect();
-                st.last_key.retain(|p, _| queued.contains(p));
-            }
+            st.last = Some(r);
             match tx.send(Slot { slots: Some(me.clone()) }) {
                 Ok(()) => return,
                 // The waiter left: the next in turn.
@@ -1212,8 +1283,8 @@ pub async fn wait_for_blame(
     deadline: std::time::Instant,
 ) -> Result<JobEnd> {
     let vk = project.view(viewer).key();
-    let key: JobKey = (project.id, vk.clone(), path_key(&start.path), follow, start.id);
-    let joined = hub.query.jobs.waiting.lock().unwrap().jobs.get(&key).cloned();
+    let key: JobKey = (project.id, vk, path_key(&start.path), follow, start.id);
+    let joined = hub.query.jobs.waiting.lock().unwrap().jobs.get(&key).map(|e| e.rx.clone());
     let mut rx = match joined {
         Some(rx) => rx,
         None => {
@@ -1222,23 +1293,22 @@ pub async fn wait_for_blame(
             }
             let mut w = hub.query.jobs.waiting.lock().unwrap();
             match w.jobs.get(&key) {
-                Some(rx) => rx.clone(),
+                Some(e) => e.rx.clone(),
                 None => {
-                    let sharer: Sharer = (project.id, vk);
-                    let mine = w.per.get(&sharer).copied().unwrap_or(0);
-                    let busy = w.per.len() + usize::from(mine == 0);
-                    let all = w.jobs.len();
-                    if mine >= MAX_PENDING_JOBS || (all >= MAX_PENDING_ALL && (mine >= MAX_PENDING_ALL / busy || all >= 2 * MAX_PENDING_ALL)) {
+                    let who: Requester = viewer.person;
+                    // At the ceiling the job whose place this one takes is
+                    // told so (it ends `warming` where it waits); its task
+                    // leaves the table as it is.
+                    if w.admit(who, MAX_PENDING_JOBS, MAX_PENDING_ALL).is_none() {
                         return Err(warming());
                     }
                     let (tx, rx) = tokio::sync::watch::channel(None);
-                    w.jobs.insert(key.clone(), rx.clone());
-                    *w.per.entry(sharer.clone()).or_default() += 1;
+                    let (seq, ticket) = w.insert(key.clone(), rx.clone(), who);
                     drop(w);
                     hub.query.jobs.started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (hub, project, viewer, start) = (hub.clone(), project.clone(), viewer.clone(), start.clone());
                     tokio::spawn(async move {
-                        let r = leased_job(&hub, &project, &viewer, &key, &start, follow, limits).await;
+                        let r = leased_job(&hub, &project, &viewer, &key, &start, follow, limits, &ticket).await;
                         if let Err(e) = &r {
                             if !matches!(e, Error::Api { code: "warming" | "too_wide", .. }) {
                                 eprintln!("veil-server: a blame job of project {}: {e:?}", project.id);
@@ -1246,12 +1316,8 @@ pub async fn wait_for_blame(
                         }
                         {
                             let mut w = hub.query.jobs.waiting.lock().unwrap();
-                            w.jobs.remove(&key);
-                            if let Some(n) = w.per.get_mut(&sharer) {
-                                *n -= 1;
-                                if *n == 0 {
-                                    w.per.remove(&sharer);
-                                }
+                            if w.jobs.get(&key).is_some_and(|e| e.seq == seq) {
+                                w.remove(&key);
                             }
                         }
                         let _ = tx.send(Some(JobEnd::of(r)));
@@ -1299,11 +1365,19 @@ async fn settled(hub: &crate::Hub, key: &JobKey, limits: BlameLimits) -> Result<
 /// Record that the blame of `key` is too wide under `limits`, naming the
 /// paths its walk reached (`reached`: a kept blame of any of them drops
 /// the record, BUG-1412), and drop the view key's oldest records past
-/// [`KEPT_ENDS`].
-async fn record_too_wide(hub: &crate::Hub, key: &JobKey, limits: BlameLimits, reached: &[String]) -> Result<()> {
+/// [`KEPT_ENDS`]. Only if no blame of the view key, `follow` and a path
+/// reached was kept at or after `since` (the job's start, less a margin
+/// for clocks), in the same statement: the job's own checkpoints, or
+/// another job's of the key, cut the next walk short, which then goes
+/// further (BUG-1555).
+async fn record_too_wide(hub: &crate::Hub, key: &JobKey, limits: BlameLimits, reached: &[String], since: i64) -> Result<()> {
+    let mut paths: Vec<&str> = reached.iter().map(String::as_str).collect();
+    paths.push(&key.2);
     sqlx::query(
         "INSERT INTO blame_ends (project_id, view_key, path_key, follow, snapshot, held, kept_bytes, path_keys, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9 \
+         WHERE NOT EXISTS (SELECT 1 FROM blame_memo WHERE project_id = $1 AND view_key = $2 AND follow = $4 \
+                           AND path_key = ANY($10::text[]) AND created_at >= $11) \
          ON CONFLICT (project_id, view_key, path_key, follow, snapshot) DO UPDATE \
          SET held = EXCLUDED.held, kept_bytes = EXCLUDED.kept_bytes, path_keys = EXCLUDED.path_keys, created_at = EXCLUDED.created_at",
     )
@@ -1316,6 +1390,8 @@ async fn record_too_wide(hub: &crate::Hub, key: &JobKey, limits: BlameLimits, re
     .bind(limits.kept_bytes as i64)
     .bind(reached.join(","))
     .bind(veil_core::now_millis())
+    .bind(&paths)
+    .bind(since)
     .execute(&hub.db)
     .await?;
     sqlx::query(
@@ -1417,6 +1493,7 @@ enum Outcome {
 /// renewal fails; a job waiting for another server's lease stops as soon
 /// as that server's job ends, and after [`BlameLimits::wait`] ends
 /// `warming`.
+#[allow(clippy::too_many_arguments)]
 async fn leased_job(
     hub: &Arc<crate::Hub>,
     project: &crate::perm::Project,
@@ -1425,6 +1502,7 @@ async fn leased_job(
     start: &Version,
     follow: bool,
     limits: BlameLimits,
+    ticket: &Ticket,
 ) -> Result<bool> {
     let holder = hex::encode(veil_core::crypto::random_bytes::<16>());
     let take = || async {
@@ -1463,7 +1541,13 @@ async fn leased_job(
         if tokio::time::Instant::now() >= wait {
             return Err(warming());
         }
-        tokio::time::sleep(pause).await;
+        tokio::select! {
+            _ = tokio::time::sleep(pause) => {}
+            _ = ticket.wake.notified() => {}
+        }
+        if ticket.refused() {
+            return Err(warming());
+        }
         pause = (pause * 2).min(Duration::from_secs(4));
         if let Some(end) = settled(hub, key, limits).await? {
             return ended(end);
@@ -1501,14 +1585,33 @@ async fn leased_job(
             }
         })
     };
+    let mut since = i64::MAX;
     let r: Result<Outcome> = async {
-        let _slot = hub.query.jobs.slots.take(key.0, &key.1).await;
+        let who: Requester = viewer.person;
+        let _slot = tokio::select! {
+            s = hub.query.jobs.slots.take(who) => s,
+            // Refused at the ceiling while it waits for a slot.
+            _ = ticket.wake.notified() => return Err(warming()),
+        };
         if let Some(end) = settled(hub, key, limits).await? {
             return ended(end).map(Outcome::Done);
         }
         if !lease.live() {
             return Err(warming());
         }
+        // It computes from here, unless it was refused first (both under
+        // the table's lock, where refusals are made).
+        {
+            let _w = hub.query.jobs.waiting.lock().unwrap();
+            if ticket.refused() {
+                return Err(warming());
+            }
+            ticket.computing.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Kept blames written from here on are this job's or another's of
+        // the same key: a too-wide record is written only if none of a path
+        // the walk reached was (BUG-1555); the margin is for clocks.
+        since = veil_core::now_millis() - (limits.lease / 6).as_millis() as i64;
         let (project, viewer, vk, start, lease) = (project.clone(), viewer.clone(), key.1.clone(), start.clone(), lease.clone());
         super::graph::blocking(hub, project.id, move |cx| {
             let g = G::new(cx, &vk, None);
@@ -1533,7 +1636,7 @@ async fn leased_job(
     renew.abort();
     let r = match r {
         Ok(Outcome::TooWide(message, reached)) => {
-            record_too_wide(hub, key, limits, &reached).await?;
+            record_too_wide(hub, key, limits, &reached, since).await?;
             Err(Error::Api { status: StatusCode::UNPROCESSABLE_ENTITY, code: "too_wide", message })
         }
         Ok(Outcome::Done(kept)) => Ok(kept),
@@ -1752,24 +1855,24 @@ pub fn history_page(
 mod tests {
     use super::*;
 
-    /// BUG-1306 and BUG-1410: a freed slot goes to the next project in
-    /// turn, and within a project to the next view key in turn, not to
-    /// whoever queued the most first.
+    /// BUG-1306, BUG-1410 and BUG-1553: a freed slot goes to the next
+    /// requester in turn, not to whoever queued the most first, whatever
+    /// projects and view keys they ask in.
     #[test]
-    fn slots_go_to_projects_and_view_keys_in_turn() {
+    fn slots_go_to_requesters_in_turn() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let slots = Arc::new(Slots::new(1));
-            let held = slots.take(1, "a").await;
+            let held = slots.take(Some(1)).await;
             let order = Arc::new(std::sync::Mutex::new(Vec::new()));
             let mut tasks = Vec::new();
-            // Project 1: three jobs of key "a", then one of "b" and one of
-            // "c"; then project 2 and project 3, one job each.
-            for (p, k) in [(1, "a"), (1, "a"), (1, "a"), (1, "b"), (1, "c"), (2, "a"), (3, "z")] {
+            // Person 1: three jobs; then everyone without an account, and
+            // person 2, one each.
+            for who in [Some(1), Some(1), Some(1), None, Some(2)] {
                 let (slots, order) = (slots.clone(), order.clone());
                 tasks.push(tokio::spawn(async move {
-                    let s = slots.take(p, k).await;
-                    order.lock().unwrap().push(format!("{p}{k}"));
+                    let s = slots.take(who).await;
+                    order.lock().unwrap().push(who);
                     drop(s);
                 }));
                 tokio::task::yield_now().await;
@@ -1778,9 +1881,44 @@ mod tests {
             for t in tasks {
                 t.await.unwrap();
             }
-            assert_eq!(*order.lock().unwrap(), ["2a", "3z", "1b", "1c", "1a", "1a", "1a"]);
+            assert_eq!(*order.lock().unwrap(), [Some(2), None, Some(1), Some(1), Some(1)]);
             assert_eq!(slots.state.lock().unwrap().free, 1, "every slot given back");
         });
+    }
+
+    /// BUG-1553 and BUG-1554: a requester is refused at once only when it
+    /// has its share waiting itself; at the ceiling a new job takes the
+    /// place of the newest waiting job (not computing) of the requester
+    /// with the most waiting.
+    #[test]
+    fn the_queue_refuses_only_on_the_requesters_own_jobs() {
+        let mut w = Waiting::default();
+        let key = |i: u8| -> JobKey { (1, "k".into(), format!("p{i}"), false, ObjectId::hash(&[i])) };
+        let rx = || tokio::sync::watch::channel(None).1;
+        let (per, all) = (3, 5);
+        // Person 1 takes its share of 3; a fourth is refused, whoever else
+        // waits.
+        for i in 0..3 {
+            assert!(matches!(w.admit(Some(1), per, all), Some(None)));
+            w.insert(key(i), rx(), Some(1));
+        }
+        assert!(w.admit(Some(1), per, all).is_none(), "past its own share");
+        // Person 2 and everyone without an account fill the ceiling of 5.
+        assert!(matches!(w.admit(Some(2), per, all), Some(None)));
+        w.insert(key(3), rx(), Some(2));
+        assert!(matches!(w.admit(None, per, all), Some(None)));
+        w.insert(key(4), rx(), None);
+        // Person 3 at the ceiling: person 1's newest waiting job goes (its
+        // ticket is told), not one computing.
+        w.jobs[&key(2)].ticket.computing.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (gone, e) = w.admit(Some(3), per, all).unwrap().expect("a place taken");
+        assert_eq!(gone, key(1), "person 1's newest job not computing");
+        assert!(e.ticket.refused(), "told");
+        w.insert(key(5), rx(), Some(3));
+        assert_eq!(w.jobs.len(), all, "the ceiling holds");
+        assert_eq!(w.per[&Some(1)], 2);
+        // Person 2, below its share, is admitted too.
+        assert!(matches!(w.admit(Some(2), per, all), Some(Some(_))));
     }
 
     /// BUG-1307: a lease not renewed stops being live before it ends (less

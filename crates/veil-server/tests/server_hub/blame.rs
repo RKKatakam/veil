@@ -2022,12 +2022,15 @@ mod s14rd_review {
         }
         assert_eq!(jobs_started(&one.hub) - started, veil_server::query::files::MAX_PENDING_JOBS as u64, "project one's share is full");
         assert_eq!(refused, 260 - veil_server::query::files::MAX_PENDING_JOBS, "the rest refused");
-        // Project two, on the same server: an ordinary first blame.
+        // Project two, on the same server: an ordinary first blame, by a
+        // signed-in person (callers without an account share one share,
+        // which project one's filled: BUG-1553).
         let mut two = Hist::new(&th, &policy_text, &bindings);
         let (snaps2, _) = chain_on(&th, &mut two, root_snapshot_id(), Files::new(), "pub/g/other.txt", 10, 33, 1_700_000_000_000);
         two.set_branch(&th, "main", *snaps2.last().unwrap());
-        warm_up(&th, &two, &viewer);
-        let a2 = ask(&th, &two, &viewer);
+        let person = Viewer { person: Some(800_956), ..Viewer::default() };
+        warm_up(&th, &two, &person);
+        let a2 = ask(&th, &two, &person);
         let q2 = || BlameParams { path: "pub/g/other.txt".into(), n: Some(1000), ..Default::default() };
         let t0 = Instant::now();
         let mut answer = None;
@@ -2861,7 +2864,6 @@ mod s14rd3_review {
     /// outsider denies the whole world's first blames on the server, and
     /// the at-once refusal shows another viewer's activity.
     #[test]
-    #[ignore = "BUG-1553: one outsider fills anyone on Earth's job share for every other outsider"]
     fn bug_1553_one_outsider_fills_the_job_share_of_every_outsider() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);
@@ -2917,36 +2919,37 @@ mod s14rd3_review {
     }
 
     /// Property 1, the server-wide limit and the same person under many
-    /// view keys: the fair share past `MAX_PENDING_ALL` (4,096) admits a
-    /// view key below it only while fewer than twice that wait. Every
-    /// project's admins are a view key of their own, and any signed-in
-    /// person may create projects, so one person with 45 projects of 128
-    /// files each (each blame waiting on another server's lease, as in
-    /// BUG-1410's reproduction) brings the server to 8,192 waiting jobs,
-    /// each within its key's share; then every other project's first
-    /// blame on that server answers `warming` at once and queues nothing.
+    /// view keys: the fair share past `MAX_PENDING_ALL` (4,096) admitted a
+    /// view key below it only while fewer than twice that waited, and every
+    /// project's admins are a view key of their own, which any signed-in
+    /// person can make (a project), so one person's 45 projects of 128
+    /// files brought the server to 8,192 waiting jobs and every other
+    /// first blame on it answered `warming` at once. Fixed: shares are a
+    /// requester's (BUG-1553). One person's jobs stop at their share of
+    /// 256, whatever projects and view keys they ask in; 16 people's
+    /// shares fill the ceiling; and a 17th person's first blame still
+    /// answers, taking the place of the newest waiting job of one of the
+    /// 16.
     #[test]
-    #[ignore = "BUG-1554: one person's view keys fill the server-wide job limit for every project"]
     fn bug_1554_one_persons_projects_fill_the_server_wide_job_limit() {
         let th = TestHub::start();
         let hub = th.hub();
-        let admin = admin();
         let files_per = 128usize;
-        let max_all = veil_server::query::files::MAX_PENDING_ALL;
-        let started = jobs_started(&hub);
-        let mut filled = 0usize;
-        let mut projects = 0usize;
-        while filled < 2 * max_all {
-            assert!(projects < 60, "45 view keys reach the limit; {filled} jobs after {projects}");
+        let (per, max_all) = (veil_server::query::files::MAX_PENDING_JOBS, veil_server::query::files::MAX_PENDING_ALL);
+        // A project of `files_per` files whose every blame (with and
+        // without `follow`) waits on another server's lease; the jobs
+        // admin `who` queues asking each.
+        let project = |who: i64, n: usize| -> usize {
             let mut h = Hist::new(&th, "", &Default::default());
             let mut f = Files::new();
             for i in 0..files_per {
-                f.insert(format!("d/f{i}.txt"), format!("file {i}\nof project {projects}\n").into_bytes());
+                f.insert(format!("d/f{i}.txt"), format!("file {i}\nof project {n}\n").into_bytes());
             }
             let mut change = [53u8; 16];
-            change[..2].copy_from_slice(&(projects as u16).to_le_bytes());
+            change[..2].copy_from_slice(&(n as u16).to_le_bytes());
             let tip = h.commit(&th, &[root_snapshot_id()], f, change, 1_700_000_000_000, None);
             h.set_branch(&th, "main", tip);
+            let admin = Viewer { person: Some(who), ..admin() };
             warm_up(&th, &h, &admin);
             let vk = h.project(&th).view(&admin).key();
             let snap = projected(&th, &h, &admin, &[tip])[0].clone();
@@ -2956,7 +2959,7 @@ mod s14rd3_review {
             // Every key at once (32 at a time); a request past its
             // deadline before it reached the queue (a loaded machine) is
             // asked again. A `warming` answer is final: queued, or past
-            // the key's share.
+            // the requester's share.
             let before = jobs_started(&hub);
             std::thread::scope(|sc| {
                 for part in keys.chunks(keys.len().div_ceil(32)) {
@@ -2974,15 +2977,23 @@ mod s14rd3_review {
                     });
                 }
             });
-            let mine = (jobs_started(&hub) - before) as usize;
-            println!("bug_1554: project {projects}: {mine} jobs queued, {} in all", filled + mine);
-            assert!(mine > 0, "project {projects}: none of its jobs queued, {filled} waiting");
+            (jobs_started(&hub) - before) as usize
+        };
+        // One person, admin of two projects (two view keys of their own,
+        // 512 blames): their share of 256, no more.
+        let first = 801_000i64;
+        assert_eq!(project(first, 0), per, "the first project's jobs: the person's share");
+        assert_eq!(project(first, 1), 0, "the same person's second project queues nothing past their share");
+        // 15 more people fill the ceiling.
+        let mut filled = per;
+        for k in 1..max_all / per {
+            let mine = project(first + k as i64, 1 + k);
+            assert_eq!(mine, per, "person {k}'s share");
             filled += mine;
-            projects += 1;
         }
-        assert_eq!((jobs_started(&hub) - started) as usize, 2 * max_all, "{projects} projects' jobs wait");
+        assert_eq!(filled, max_all, "the ceiling is reached");
         // Someone else's project: an ordinary first blame of a 10-version
-        // file.
+        // file, by a 17th person.
         let (policy_text, bindings) = policy(1);
         let mut h = Hist::new(&th, &policy_text, &bindings);
         let mut f = Files::new();
@@ -2994,13 +3005,13 @@ mod s14rd3_review {
             tip = h.commit(&th, &[tip], f.clone(), change, 1_600_000_000_000 + k as i64 * 1000, None);
         }
         h.set_branch(&th, "main", tip);
-        let outsider = Viewer::default();
-        warm_up(&th, &h, &outsider);
-        let oa = ask(&th, &h, &outsider);
+        let other = Viewer { person: Some(802_000), ..Viewer::default() };
+        warm_up(&th, &h, &other);
+        let oa = ask(&th, &h, &other);
         let before = jobs_started(&hub);
         let (r, asked) = until(&th, &h, &oa, || BlameParams { path: "pub/g/other.txt".into(), n: Some(1000), ..Default::default() }, limits(2000, BlameLimits::default()), 30);
         let theirs = jobs_started(&hub) - before;
-        println!("bug_1554: {projects} projects of one person, {filled} jobs waiting; another project's blame after {asked} requests in 30 s: {:?}; {theirs} jobs of it queued", r.as_ref().map(|v| v["line_count"].clone()));
+        println!("bug_1554: {filled} jobs of 16 people waiting; a 17th person's blame after {asked} requests in 30 s: {:?}; {theirs} jobs of it queued", r.as_ref().map(|v| v["line_count"].clone()));
         // End the waiting jobs: each finds its key recorded too wide at
         // its next look.
         th.rt.block_on(async {
@@ -3013,7 +3024,7 @@ mod s14rd3_review {
             .await
             .unwrap();
         });
-        let v = r.expect("another project's 10-version blame answers within 30 s while one person's jobs wait");
+        let v = r.expect("another person's 10-version blame answers within 30 s at the ceiling");
         assert_eq!(v["line_count"], 2);
     }
 
@@ -3029,9 +3040,10 @@ mod s14rd3_review {
     /// job keeping blames of the path while this one walks leaves its
     /// record the same way. Here a 600-version chain from nothing under an
     /// 800,000-byte bound: the first job blames about 180 versions and
-    /// keeps 5 checkpoints before it passes the bound.
+    /// keeps 5 checkpoints before it passes the bound. Fixed: the record
+    /// is written only if no blame of a path the walk reached was kept
+    /// since the job started, in the same statement.
     #[test]
-    #[ignore = "BUG-1555: a too-wide record written after its own job's checkpoints outlives them"]
     fn bug_1555_a_too_wide_record_outlives_its_own_jobs_checkpoints() {
         let th = TestHub::start();
         let (policy_text, bindings) = policy(1);
@@ -3054,9 +3066,12 @@ mod s14rd3_review {
         println!("bug_1555: the head from nothing: {:?} after {blamed} versions blamed; {kept} checkpoints kept, {recorded} records", r.as_ref().err());
         assert_eq!(r.err(), Some("too_wide"), "the head is too wide from nothing (tune the bound)");
         assert!(blamed > 0 && kept > 0, "the job got past its walk down and kept checkpoints (tune the bound)");
-        assert_eq!(recorded, 1, "recorded");
-        // Asked again, as a client does after `too_wide` (each job from
-        // the checkpoints the last kept): the record answers, no job.
+        // Fixed: a job that kept blames of a path its walk reached writes
+        // no record (it was 1).
+        assert_eq!(recorded, 0, "not recorded: its own checkpoints cut the next walk short");
+        // Asked again, as a client does after `too_wide`: each job goes on
+        // from the checkpoints the last kept (the record answered, no job,
+        // before the fix).
         let mut again = Err("too_wide");
         for _ in 0..10 {
             again = until(&th, &h, &a, head, small, 300).0;
