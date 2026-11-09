@@ -62,10 +62,14 @@ pub struct Computed {
     /// Bottom first.
     pub changes: Vec<StackChange>,
     pub touched: BTreeSet<String>,
-    pub files: usize,
+    /// The file changes risk reads, kept with the revision (BUG-1424).
+    pub files: Vec<FileChange>,
     pub patch: String,
+    /// `files` rated under `rules` (its `risk_key`): the first value of
+    /// the revision's cache.
     pub risk: Risk,
     pub reasons: Vec<String>,
+    pub rules_key: String,
 }
 
 fn refuse(m: impl Into<String>) -> Error {
@@ -194,10 +198,11 @@ pub fn compute(cx: &Cx, g: &G, head: ObjectId, onto: ObjectId, rules: &Review) -
         head,
         changes: out,
         touched,
-        files: files.len(),
+        files,
         patch: patch.finalize().to_hex().to_string(),
         risk,
         reasons,
+        rules_key: rules.risk_key(),
     })
 }
 

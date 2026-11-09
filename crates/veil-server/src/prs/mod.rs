@@ -64,7 +64,7 @@ use veil_core::{
 
 use self::{
     revision::{Computed, StackChange},
-    rules::Review,
+    rules::{classify, FileChange, Review, Risk},
     threads::{Anchor, AnchorRequest, At},
 };
 use crate::{
@@ -109,12 +109,13 @@ pub struct PrRow {
     pub body: String,
     pub state: String,
     pub revision: i32,
-    pub risk: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
-/// One revision's row.
+/// One revision's row. `risk` and `reasons` are the revision's files rated
+/// under the rules whose key is `rules_key` ([`Review::risk_key`]): a cache,
+/// which `rated` brings to the rules in force (BUG-1424).
 #[derive(Clone, Debug)]
 pub struct RevRow {
     pub n: i32,
@@ -124,6 +125,7 @@ pub struct RevRow {
     pub patch: String,
     pub risk: String,
     pub reasons: Vec<String>,
+    pub rules_key: String,
     pub files: i32,
     pub pushed_by: i64,
     pub at: i64,
@@ -146,9 +148,9 @@ pub async fn visible(hub: &Hub, ask: &Ask, id: &str) -> Result<PrRow> {
     if !valid_pr_id(id) {
         return Err(no_pr());
     }
-    type Row = (String, i64, String, String, String, String, i32, String, i64, i64, String, String);
+    type Row = (String, i64, String, String, String, String, i32, i64, i64, String, String);
     let row: Option<Row> = sqlx::query_as(
-        "SELECT p.target, p.author, pe.name, p.title, p.body, p.state, p.revision, p.risk, p.created_at, p.updated_at, c.lines, c.embargo \
+        "SELECT p.target, p.author, pe.name, p.title, p.body, p.state, p.revision, p.created_at, p.updated_at, c.lines, c.embargo \
          FROM prs p JOIN pr_classes c ON c.project_id = p.project_id AND c.class_id = p.class_id JOIN people pe ON pe.id = p.author \
          WHERE p.project_id = $1 AND p.id = $2 AND p.policy_key = $3",
     )
@@ -157,7 +159,7 @@ pub async fn visible(hub: &Hub, ask: &Ask, id: &str) -> Result<PrRow> {
     .bind(class::policy_key(&ask.project.policy))
     .fetch_optional(&hub.db)
     .await?;
-    let Some((target, author, author_name, title, body, state, revision, risk, created_at, updated_at, lines, embargo)) = row else {
+    let Some((target, author, author_name, title, body, state, revision, created_at, updated_at, lines, embargo)) = row else {
         return Err(no_pr());
     };
     let lines: BTreeSet<String> = serde_json::from_str(&lines).unwrap_or_else(|_| BTreeSet::from([String::new()]));
@@ -173,23 +175,23 @@ pub async fn visible(hub: &Hub, ask: &Ask, id: &str) -> Result<PrRow> {
         body,
         state,
         revision,
-        risk,
         created_at,
         updated_at,
     })
 }
 
+/// The PR's revisions, with their risk as last rated (see [`rated`]).
 async fn revisions(hub: &Hub, project: i64, pr: &str) -> Result<Vec<RevRow>> {
-    type Row = (i32, String, String, String, String, String, String, i32, i64, i64);
+    type Row = (i32, String, String, String, String, String, String, String, i32, i64, i64);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT n, base, head, changes, patch, risk, reasons, files, pushed_by, at FROM pr_revisions WHERE project_id = $1 AND pr = $2 ORDER BY n",
+        "SELECT n, base, head, changes, patch, risk, reasons, rules_key, files_count, pushed_by, at FROM pr_revisions WHERE project_id = $1 AND pr = $2 ORDER BY n",
     )
     .bind(project)
     .bind(pr)
     .fetch_all(&hub.db)
     .await?;
     rows.into_iter()
-        .map(|(n, base, head, changes, patch, risk, reasons, files, pushed_by, at)| {
+        .map(|(n, base, head, changes, patch, risk, reasons, rules_key, files, pushed_by, at)| {
             Ok(RevRow {
                 n,
                 base: hex_id(&base)?,
@@ -198,12 +200,76 @@ async fn revisions(hub: &Hub, project: i64, pr: &str) -> Result<Vec<RevRow>> {
                 patch,
                 risk,
                 reasons: serde_json::from_str(&reasons).unwrap_or_default(),
+                rules_key,
                 files,
                 pushed_by,
                 at,
             })
         })
         .collect()
+}
+
+/// Rate revisions `which` of `pr` (each with the key its stored class was
+/// rated under) under `rules`, the rules in force (BUG-1424): the files of
+/// every revision whose key differs are read and classified again, and
+/// the cache is replaced (only while it still holds what was read: two
+/// raters under different rules never overwrite each other's newer
+/// rating). Answers, per revision in `which`, the risk and its reasons.
+async fn rate(hub: &Hub, project: i64, pr: &str, which: &[(i32, String, Vec<String>, String)], rules: &Review) -> Result<Vec<(Risk, Vec<String>)>> {
+    let key = rules.risk_key();
+    let stale: Vec<i32> = which.iter().filter(|(_, _, _, k)| *k != key).map(|(n, ..)| *n).collect();
+    let mut fresh: HashMap<i32, (Risk, Vec<String>)> = HashMap::new();
+    if !stale.is_empty() {
+        let rows: Vec<(i32, String, String)> = sqlx::query_as("SELECT n, files, rules_key FROM pr_revisions WHERE project_id = $1 AND pr = $2 AND n = ANY($3)")
+            .bind(project)
+            .bind(pr)
+            .bind(&stale)
+            .fetch_all(&hub.db)
+            .await?;
+        for (n, files, was) in rows {
+            let files: Vec<FileChange> = serde_json::from_str(&files).map_err(|e| Error::Other(e.into()))?;
+            let (risk, reasons) = classify(&files, rules);
+            sqlx::query("UPDATE pr_revisions SET risk = $1, reasons = $2, rules_key = $3 WHERE project_id = $4 AND pr = $5 AND n = $6 AND rules_key = $7")
+                .bind(risk.name())
+                .bind(serde_json::to_string(&reasons).expect("strings"))
+                .bind(&key)
+                .bind(project)
+                .bind(pr)
+                .bind(n)
+                .bind(&was)
+                .execute(&hub.db)
+                .await?;
+            fresh.insert(n, (risk, reasons));
+        }
+    }
+    Ok(which
+        .iter()
+        .map(|(n, risk, reasons, _)| fresh.remove(n).unwrap_or_else(|| (Risk::parse(risk), reasons.clone())))
+        .collect())
+}
+
+/// The PR's revisions, every one rated under `rules` (the rules in force).
+async fn rated(hub: &Hub, project: i64, pr: &str, rules: &Review) -> Result<Vec<RevRow>> {
+    let mut revs = revisions(hub, project, pr).await?;
+    let which: Vec<_> = revs.iter().map(|r| (r.n, r.risk.clone(), r.reasons.clone(), r.rules_key.clone())).collect();
+    for (r, (risk, reasons)) in revs.iter_mut().zip(rate(hub, project, pr, &which, rules).await?) {
+        r.risk = risk.name().to_string();
+        r.reasons = reasons;
+        r.rules_key = rules.risk_key();
+    }
+    Ok(revs)
+}
+
+/// The review gate of `pr` now: the rules in force on the default branch,
+/// its revisions rated under them, and the gate of the current one. The
+/// one function every answer about readiness goes through, and S17's
+/// landing will (BUG-1424).
+pub async fn gate(hub: &Arc<Hub>, ask: &Ask, pr: &PrRow) -> Result<(Vec<RevRow>, review::Gate)> {
+    let rules = rules(hub, ask).await?;
+    let revs = rated(hub, ask.project.id, &pr.id, &rules).await?;
+    let current = revs.iter().find(|r| r.n == pr.revision).ok_or_else(|| Error::Other(anyhow::anyhow!("the PR's revision is missing")))?;
+    let gate = review::gate(hub, &ask.project, &ask.viewer, pr, &current.patch, Risk::parse(&current.risk), &rules).await?;
+    Ok((revs, gate))
 }
 
 async fn names(hub: &Hub, ids: &[i64]) -> Result<HashMap<i64, String>> {
@@ -338,8 +404,8 @@ fn random_id() -> String {
 /// Write a new revision's rows (and the PR's paths and class) in `c`.
 async fn write_revision(c: &mut sqlx::PgConnection, project: i64, pr: &str, n: i32, r: &Computed, by: i64, at: i64) -> Result<()> {
     sqlx::query(
-        "INSERT INTO pr_revisions (project_id, pr, n, base, head, changes, patch, risk, reasons, files, pushed_by, at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        "INSERT INTO pr_revisions (project_id, pr, n, base, head, changes, patch, files, risk, reasons, rules_key, files_count, pushed_by, at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
     )
     .bind(project)
     .bind(pr)
@@ -348,9 +414,11 @@ async fn write_revision(c: &mut sqlx::PgConnection, project: i64, pr: &str, n: i
     .bind(r.head.hex())
     .bind(serde_json::to_string(&r.changes).expect("strings"))
     .bind(&r.patch)
+    .bind(serde_json::to_string(&r.files).expect("strings"))
     .bind(r.risk.name())
     .bind(serde_json::to_string(&r.reasons).expect("strings"))
-    .bind(r.files as i32)
+    .bind(&r.rules_key)
+    .bind(r.files.len() as i32)
     .bind(by)
     .bind(at)
     .execute(&mut *c)
@@ -418,6 +486,12 @@ fn reals_of(revs: &[RevRow]) -> Vec<ObjectId> {
 /// the viewer's number of each.
 async fn viewer_revisions(hub: &Arc<Hub>, ask: &Ask, pr: &str) -> Result<(Vec<RevRow>, HashMap<ObjectId, ObjectId>, HashMap<i32, i32>)> {
     let revs = revisions(hub, ask.project.id, pr).await?;
+    numbered(hub, ask, revs).await
+}
+
+/// `revs` with the viewer's ids of every snapshot they name, and the
+/// viewer's number of each.
+async fn numbered(hub: &Arc<Hub>, ask: &Ask, revs: Vec<RevRow>) -> Result<(Vec<RevRow>, HashMap<ObjectId, ObjectId>, HashMap<i32, i32>)> {
     let p = projected(hub, ask, &reals_of(&revs)).await?;
     let numbers = viewer_numbers(&revs, &p);
     let map = revs.iter().zip(&numbers).map(|(r, v)| (r.n, *v)).collect();
@@ -426,11 +500,10 @@ async fn viewer_revisions(hub: &Arc<Hub>, ask: &Ask, pr: &str) -> Result<(Vec<Re
 
 /// The PR as `ask`'s viewer sees it.
 pub async fn pr_json(hub: &Arc<Hub>, ask: &Ask, pr: &PrRow) -> Result<Value> {
-    let (revs, p, vn) = viewer_revisions(hub, ask, &pr.id).await?;
+    let (revs, gate) = gate(hub, ask, pr).await?;
+    let (revs, p, vn) = numbered(hub, ask, revs).await?;
     let ppl = names(hub, &revs.iter().map(|r| r.pushed_by).collect::<Vec<_>>()).await?;
     let current = revs.iter().find(|r| r.n == pr.revision).ok_or_else(|| Error::Other(anyhow::anyhow!("the PR's revision is missing")))?;
-    let rules = rules(hub, ask).await?;
-    let gate = review::gate(hub, &ask.project, &ask.viewer, pr, &current.patch, &rules).await?;
     let mut review = gate.json();
     for r in review["reviews"].as_array_mut().into_iter().flatten() {
         let real = r["revision"].as_i64().unwrap_or(0) as i32;
@@ -470,7 +543,7 @@ pub async fn pr_json(hub: &Arc<Hub>, ask: &Ask, pr: &PrRow) -> Result<Value> {
         "author": pr.author_name,
         "target": pr.target,
         "state": pr.state,
-        "risk": pr.risk,
+        "risk": current.risk,
         "reasons": current.reasons,
         "revision": vn[&pr.revision],
         "patch": current.patch,
@@ -519,8 +592,8 @@ pub async fn create(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr) -> 
             Box::pin(async move {
                 let class = class::put_class(&mut *c, project, &key, &lines).await?;
                 let inserted = sqlx::query(
-                    "INSERT INTO prs (project_id, id, class_id, policy_key, target, author, title, body, state, revision, risk, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', 1, $9, $10, $10) ON CONFLICT (project_id, id) DO NOTHING",
+                    "INSERT INTO prs (project_id, id, class_id, policy_key, target, author, title, body, state, revision, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', 1, $9, $9) ON CONFLICT (project_id, id) DO NOTHING",
                 )
                 .bind(project)
                 .bind(&id)
@@ -530,7 +603,6 @@ pub async fn create(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr) -> 
                 .bind(me)
                 .bind(&title)
                 .bind(&body)
-                .bind(r.risk.name())
                 .bind(now)
                 .execute(&mut *c)
                 .await?
@@ -593,16 +665,20 @@ pub async fn list(hub: &Arc<Hub>, ask: &Ask, q: ListParams) -> Result<Value> {
     class::reclassify(hub, &ask.project).await?;
     let classes = class::satisfied(hub, &ask.project, &ask.viewer).await?;
     let states: Vec<String> = if state.is_empty() { vec!["open".into(), "closed".into(), "landed".into()] } else { vec![state] };
-    type Row = (String, String, String, String, String, String, i64);
+    // Each PR's current revision's risk as last rated, with the key of the
+    // rules it was rated under: rated again under the rules in force where
+    // they differ (BUG-1424).
+    type Row = (String, String, String, String, String, String, i64, i32, String, String);
     let (rows, count): (Vec<Row>, i64) = if like.is_empty() {
         // Newest first without sorting the classes' PRs: one ordered scan
         // of `prs_by_class` per (class, state), at most a page each, merged.
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT p.id, p.title, pe.name, p.state, p.risk, p.target, p.created_at \
+            "SELECT p.id, p.title, pe.name, p.state, r.risk, p.target, p.created_at, p.revision, r.reasons, r.rules_key \
              FROM UNNEST($2::text[]) AS c(class_id) CROSS JOIN UNNEST($3::text[]) AS s(state), \
              LATERAL (SELECT * FROM prs q WHERE q.project_id = $1 AND q.class_id = c.class_id AND q.state = s.state \
                       AND ($4::BIGINT IS NULL OR q.created_at < $4 OR (q.created_at = $4 AND q.id < $5)) \
                       ORDER BY q.created_at DESC, q.id DESC LIMIT $6) p \
+             JOIN pr_revisions r ON r.project_id = p.project_id AND r.pr = p.id AND r.n = p.revision \
              JOIN people pe ON pe.id = p.author \
              ORDER BY p.created_at DESC, p.id DESC LIMIT $6",
         )
@@ -624,13 +700,14 @@ pub async fn list(hub: &Arc<Hub>, ask: &Ask, q: ListParams) -> Result<Value> {
     } else {
         // A search reads every PR of the satisfied classes once: the page
         // and the count from one scan.
-        type Counted = (String, String, String, String, String, String, i64, i64);
+        type Counted = (String, String, String, String, String, String, i64, i32, String, String, i64);
         let rows: Vec<Counted> = sqlx::query_as(
-            "SELECT p.id, p.title, pe.name, p.state, p.risk, p.target, p.created_at, p.total FROM ( \
+            "SELECT p.id, p.title, pe.name, p.state, r.risk, p.target, p.created_at, p.revision, r.reasons, r.rules_key, p.total FROM ( \
                  SELECT q.*, COUNT(*) OVER () AS total, \
                         ($4::BIGINT IS NULL OR q.created_at < $4 OR (q.created_at = $4 AND q.id < $5)) AS after_cursor \
                  FROM prs q WHERE q.project_id = $1 AND q.class_id = ANY($2) AND q.state = ANY($3) \
                  AND (q.title ILIKE $7 OR q.body ILIKE $7)) p \
+             JOIN pr_revisions r ON r.project_id = p.project_id AND r.pr = p.id AND r.n = p.revision \
              JOIN people pe ON pe.id = p.author WHERE p.after_cursor \
              ORDER BY p.created_at DESC, p.id DESC LIMIT $6",
         )
@@ -644,7 +721,7 @@ pub async fn list(hub: &Arc<Hub>, ask: &Ask, q: ListParams) -> Result<Value> {
         .fetch_all(&hub.db)
         .await?;
         let count = match rows.first() {
-            Some(r) => r.7,
+            Some(r) => r.10,
             // An empty page (past the end) still counts every match.
             None => sqlx::query_scalar(
                 "SELECT COUNT(*) FROM prs WHERE project_id = $1 AND class_id = ANY($2) AND state = ANY($3) AND (title ILIKE $4 OR body ILIKE $4)",
@@ -656,16 +733,22 @@ pub async fn list(hub: &Arc<Hub>, ask: &Ask, q: ListParams) -> Result<Value> {
             .fetch_one(&hub.db)
             .await?,
         };
-        (rows.into_iter().map(|r| (r.0, r.1, r.2, r.3, r.4, r.5, r.6)).collect(), count)
+        (rows.into_iter().map(|r| (r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9)).collect(), count)
     };
     let more = rows.len() as i64 > n;
     let rows = &rows[..rows.len().min(n as usize)];
     let next = more.then(|| rows.last().map(|r| format!("{}:{}", r.6, r.0))).flatten();
+    let rules = rules(hub, ask).await?;
+    let mut risks = Vec::with_capacity(rows.len());
+    for (id, _, _, _, risk, _, _, revision, reasons, rules_key) in rows {
+        let which = [(*revision, risk.clone(), serde_json::from_str(reasons).unwrap_or_default(), rules_key.clone())];
+        risks.push(rate(hub, ask.project.id, id, &which, &rules).await?.remove(0).0);
+    }
     Ok(json!({
         "schema": "veil.prs/1",
         "count": count,
-        "prs": rows.iter().map(|(id, title, author, state, risk, target, created_at)| json!({
-            "id": id, "title": title, "author": author, "state": state, "risk": risk,
+        "prs": rows.iter().zip(&risks).map(|((id, title, author, state, _, target, created_at, ..), risk)| json!({
+            "id": id, "title": title, "author": author, "state": state, "risk": risk.name(),
             "target": target, "created_at": created_at,
         })).collect::<Vec<_>>(),
         "next": next,
@@ -795,13 +878,12 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
             let class = class::put_class(&mut *c, project, &key, &lines).await?;
             // The compare-and-swap: two new revisions at once, one wins.
             let moved_on = sqlx::query(
-                "UPDATE prs SET revision = $1, class_id = $2, policy_key = $3, risk = $4, updated_at = $5 \
-                 WHERE project_id = $6 AND id = $7 AND revision = $8 AND state = 'open'",
+                "UPDATE prs SET revision = $1, class_id = $2, policy_key = $3, updated_at = $4 \
+                 WHERE project_id = $5 AND id = $6 AND revision = $7 AND state = 'open'",
             )
             .bind(n)
             .bind(&class)
             .bind(&key)
-            .bind(r.risk.name())
             .bind(now)
             .bind(project)
             .bind(&prid)
@@ -1296,10 +1378,7 @@ pub async fn land(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Resul
     if pr.author != me && !review::writes_all(&ask.project, &ask.viewer, &paths) {
         return Err(Error::forbidden("only the author, or someone who may write every file of this PR, lands it"));
     }
-    let revs = revisions(hub, ask.project.id, &pr.id).await?;
-    let current = revs.into_iter().find(|r| r.n == pr.revision).ok_or_else(|| Error::Other(anyhow::anyhow!("the PR's revision is missing")))?;
-    let rules = rules(hub, ask).await?;
-    let gate = review::gate(hub, &ask.project, &ask.viewer, &pr, &current.patch, &rules).await?;
+    let (_, gate) = gate(hub, ask, &pr).await?;
     if !gate.ready {
         return Err(Error::new(StatusCode::CONFLICT, "not_ready", format!("not ready to land: {}", gate.reasons.join("; "))));
     }

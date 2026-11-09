@@ -29,7 +29,6 @@ CREATE TABLE IF NOT EXISTS prs (
     body TEXT NOT NULL,
     state TEXT NOT NULL,                   -- open | closed | landed
     revision INT NOT NULL,                 -- the current revision
-    risk TEXT NOT NULL,                    -- the current revision's
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL,
     PRIMARY KEY (project_id, id)
@@ -56,9 +55,14 @@ CREATE TABLE IF NOT EXISTS pr_revisions (
     head TEXT NOT NULL,
     changes TEXT NOT NULL,                 -- JSON [{change, snapshot, parent}], bottom first
     patch TEXT NOT NULL,                   -- hash of every file change of the stack
+    files TEXT NOT NULL,                   -- JSON list of the file changes risk reads (path, secret, executable, regular)
+    -- The risk and its reasons are a cache (BUG-1424): `files` rated under
+    -- the rules whose risk key (`Review::risk_key`) is `rules_key`; a view
+    -- under other rules rates `files` again and replaces them.
     risk TEXT NOT NULL,
     reasons TEXT NOT NULL,                 -- JSON list: why the risk
-    files INT NOT NULL,
+    rules_key TEXT NOT NULL,
+    files_count INT NOT NULL,
     pushed_by BIGINT NOT NULL,
     at BIGINT NOT NULL,
     PRIMARY KEY (project_id, pr, n)

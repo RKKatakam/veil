@@ -6,8 +6,9 @@
 //!   and is not its author. A review is a verdict on the current revision,
 //!   signed by the reviewer's device (`veil_core::hub::pr::review_message`)
 //!   and bound to the revision's patch.
-//! * **What counts** ([`gate`]): each reviewer's latest verdict on any
-//!   revision with the current patch (a rebase over unrelated changes keeps
+//! * **What counts** ([`gate`]): the current revision's files are rated
+//!   under the rules in force now (BUG-1424), and each reviewer's latest
+//!   verdict on any revision with the current patch counts (a rebase over unrelated changes keeps
 //!   approvals; any change to the files dismisses them), checked again
 //!   against the reviewer's access now. Approvals from agent sessions never
 //!   count where the rule says `people_only` (always for high risk). The
@@ -255,10 +256,10 @@ impl Gate {
     }
 }
 
-/// The review gate of `pr`, whose current revision has `patch`, under
-/// `rules`, as `viewer` is shown it.
-pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, patch: &str, rules: &Review) -> Result<Gate> {
-    let risk = Risk::parse(&pr.risk);
+/// The review gate of `pr`, whose current revision has `patch` and risk
+/// `risk` (rated under `rules`, the rules in force: BUG-1424), as
+/// `viewer` is shown it. Every route asks through [`super::gate`].
+pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, patch: &str, risk: Risk, rules: &Review) -> Result<Gate> {
     let need = rules.need(risk);
     let paths = paths_of(hub, project.id, &pr.id).await?;
     let mut reviews = Vec::new();

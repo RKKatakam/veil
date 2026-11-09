@@ -982,43 +982,106 @@ pub(crate) fn named_ids(src: &Source, e: &veil_core::TreeEntry) -> Result<Vec<Ob
     Ok(out)
 }
 
-/// The most snapshots not derived yet that [`merge_bases`] gives rows to
-/// (a push's own, or the derive workers' lag) before it answers busy.
+/// The most snapshots not derived yet that one push's merge checks read
+/// (the push's own, or the derive workers' lag) before they answer busy
+/// (BUG-1425: the snapshots read are counted, not the rows made, over
+/// the whole push).
 const UNDERIVED_ROWS: usize = 100_000;
+
+/// The graph rows one push's checks compute (BUG-1425): one set for the
+/// whole push. `complete` adds each accepted snapshot's row, and
+/// `merge_bases` keeps the rows its walk makes, so a later merge's walk
+/// stops at the push's earlier snapshots and at anything an earlier walk
+/// gave a row, instead of reading every snapshot below it again. `read`
+/// counts the snapshots not derived yet that the push has read.
+#[derive(Default)]
+pub struct PushRows {
+    rows: HashMap<ObjectId, Arc<crate::derive::graph::GraphRow>>,
+    read: usize,
+}
+
+impl PushRows {
+    /// The row of `id`, from this push or the derived graph.
+    fn row(&self, src: &Source, id: &ObjectId) -> Result<Option<Arc<crate::derive::graph::GraphRow>>> {
+        if let Some(r) = self.rows.get(id) {
+            return Ok(Some(r.clone()));
+        }
+        if *id == root_snapshot_id() {
+            return Ok(Some(Arc::new(crate::derive::graph::GraphRow::root())));
+        }
+        graph_cx(src).stored_row(id)
+    }
+
+    /// Add the row of accepted snapshot `s`, stored as `id`, on real
+    /// `parents`, when every parent has a row (otherwise a walk that needs
+    /// it makes it).
+    fn add(&mut self, src: &Source, id: ObjectId, s: &Snapshot, parents: &[ObjectId]) -> Result<()> {
+        let mut rows = Vec::with_capacity(parents.len());
+        for p in parents {
+            match self.row(src, p)? {
+                Some(r) => rows.push((*p, r)),
+                None => return Ok(()),
+            }
+        }
+        self.rows.insert(id, Arc::new(crate::derive::graph::GraphRow::compute(s, &rows)));
+        Ok(())
+    }
+}
+
+/// A derive context on `src`'s project for graph rows (no pending
+/// objects: rows come from the database, the snapshots from `src`).
+fn graph_cx(src: &Source) -> crate::derive::Cx {
+    crate::derive::Cx {
+        src: Source { hub: src.hub.clone(), project: src.project, rt: src.rt.clone(), pending: HashMap::new() },
+    }
+}
 
 /// The merge bases of real snapshots `a` and `b`: their best common
 /// ancestors, none an ancestor of another (BUG-1327; several after a
 /// criss-cross merge), by the derived commit graph (`derive::graph`, paint
 /// down by generation). Snapshots not derived yet (this push's own, or the
-/// derive workers' lag) get their rows computed here first.
-fn merge_bases(src: &Source, a: ObjectId, b: ObjectId) -> Result<Vec<ObjectId>> {
+/// derive workers' lag) get their rows computed here first, kept in `rows`
+/// for the rest of the push (BUG-1425); past [`UNDERIVED_ROWS`] snapshots
+/// read, the push is answered busy rather than left to run on.
+fn merge_bases(src: &Source, rows: &mut PushRows, a: ObjectId, b: ObjectId) -> Result<Vec<ObjectId>> {
     use crate::derive::graph::{Graph, GraphRow};
-    let cx = crate::derive::Cx {
-        src: Source { hub: src.hub.clone(), project: src.project, rt: src.rt.clone(), pending: src.pending.clone() },
-    };
+    let cx = graph_cx(src);
     let mut g = Graph::new(&cx);
-    let mut made = 0usize;
-    for tip in [a, b] {
-        let mut stack = vec![(tip, false)];
-        while let Some((x, expanded)) = stack.pop() {
-            if g.row(&x)?.is_some() {
-                continue;
-            }
-            let s = src.snapshot(&x)?;
-            if !expanded {
-                stack.push((x, true));
-                stack.extend(s.parents.iter().map(|p| (*p, false)));
-                continue;
-            }
-            let parents: Vec<(ObjectId, Arc<GraphRow>)> = s.parents.iter().map(|p| Ok((*p, g.get(p)?))).collect::<Result<_>>()?;
-            g.pending.insert(x, Arc::new(GraphRow::compute(&s, &parents)));
-            made += 1;
-            if made > UNDERIVED_ROWS {
-                return Err(Error::busy());
+    g.pending = std::mem::take(&mut rows.rows);
+    let walked = (|| -> Result<Vec<ObjectId>> {
+        for tip in [a, b] {
+            // Depth first, parents before their child; a snapshot is read
+            // once (it travels with its stack entry) and gets its row when
+            // it is reached again with its parents' rows made.
+            let mut stack: Vec<(ObjectId, Option<Arc<Snapshot>>)> = vec![(tip, None)];
+            while let Some((x, read)) = stack.pop() {
+                match read {
+                    None => {
+                        if g.row(&x)?.is_some() {
+                            continue;
+                        }
+                        rows.read += 1;
+                        if rows.read > UNDERIVED_ROWS {
+                            return Err(Error::busy());
+                        }
+                        let s = src.snapshot(&x)?;
+                        stack.push((x, Some(s.clone())));
+                        stack.extend(s.parents.iter().map(|p| (*p, None)));
+                    }
+                    Some(s) => {
+                        if g.pending.contains_key(&x) {
+                            continue;
+                        }
+                        let parents: Vec<(ObjectId, Arc<GraphRow>)> = s.parents.iter().map(|p| Ok((*p, g.get(p)?))).collect::<Result<_>>()?;
+                        g.pending.insert(x, Arc::new(GraphRow::compute(&s, &parents)));
+                    }
+                }
             }
         }
-    }
-    g.merge_bases(a, b)
+        g.merge_bases(a, b)
+    })();
+    rows.rows = std::mem::take(&mut g.pending);
+    walked
 }
 
 /// Did parent `i`'s side make version `new` of `path`, against parent `j`:
@@ -1026,15 +1089,16 @@ fn merge_bases(src: &Source, a: ObjectId, b: ObjectId) -> Result<Vec<ObjectId>> 
 /// found once per merge, BUG-1329) have it?
 struct Sides<'a> {
     src: &'a Source,
+    rows: &'a mut PushRows,
     parents: &'a [ObjectId],
     trees: Vec<ObjectId>,
     bases: HashMap<(usize, usize), Vec<ObjectId>>,
 }
 
 impl<'a> Sides<'a> {
-    fn new(src: &'a Source, parents: &'a [ObjectId]) -> Result<Sides<'a>> {
+    fn new(src: &'a Source, rows: &'a mut PushRows, parents: &'a [ObjectId]) -> Result<Sides<'a>> {
         let trees = parents.iter().map(|p| Ok(src.snapshot(p)?.tree)).collect::<Result<_>>()?;
-        Ok(Sides { src, parents, trees, bases: HashMap::new() })
+        Ok(Sides { src, rows, parents, trees, bases: HashMap::new() })
     }
 
     fn made(&mut self, i: usize, j: usize, path: &str, new: &Option<veil_core::TreeEntry>) -> Result<bool> {
@@ -1044,7 +1108,7 @@ impl<'a> Sides<'a> {
         let k = (i.min(j), i.max(j));
         if !self.bases.contains_key(&k) {
             let mut trees = Vec::new();
-            for b in merge_bases(self.src, self.parents[k.0], self.parents[k.1])? {
+            for b in merge_bases(self.src, self.rows, self.parents[k.0], self.parents[k.1])? {
                 trees.push(self.src.snapshot(&b)?.tree);
             }
             self.bases.insert(k, trees);
@@ -1061,9 +1125,12 @@ impl<'a> Sides<'a> {
 /// Check the paths one snapshot changes: write access, personal keys,
 /// secrets sealed, nothing local-only, no secret in a plain-text file
 /// (`docs/HUB.md` §4.5, checks 2, 8 and 9). `parents` are the snapshot's
-/// real parents; `accepted` is the project's accepted `.veilpolicy`.
+/// real parents; `accepted` is the project's accepted `.veilpolicy`;
+/// `rows` are the push's graph rows (BUG-1425).
+#[allow(clippy::too_many_arguments)]
 fn check_changes(
     src: &Source,
+    rows: &mut PushRows,
     view: &View,
     changes: &[Change],
     real_tree: &ObjectId,
@@ -1075,7 +1142,7 @@ fn check_changes(
     let policy = Policy::parse(&text);
     // A merge's other parents: their trees, and the tree of a common
     // ancestor with the first parent (found when first needed).
-    let mut sides = Sides::new(src, parents)?;
+    let mut sides = Sides::new(src, rows, parents)?;
     // A merge checked against every parent, not only the first (BUG-1321,
     // BUG-820's class): a path where it differs from another parent `j`,
     // and not from the first (those are `changes`, below), keeps the first
@@ -1227,7 +1294,9 @@ fn sealed_secret_here(src: &Source, c: &Change, changes: &[Change], parents: &[O
 /// (every object a changed path names was `uploaded` or is the entry at
 /// that path in a parent), checks 2, 8 and 9 ([`check_changes`]) and access
 /// lines changed only by admins. Pushes and commits through the API
-/// (`changes`) both run it. `p` carries the accepted policy.
+/// (`changes`) both run it. `p` carries the accepted policy; `rows` are
+/// the push's graph rows, which the accepted snapshot joins (BUG-1425).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn complete(
     src: &Source,
     p: &Project,
@@ -1236,6 +1305,7 @@ pub(crate) fn complete(
     n: &Snapshot,
     rp: &[ObjectId],
     identity: &veil_core::Identity,
+    rows: &mut PushRows,
 ) -> Result<Completed> {
     if rp.len() > MAX_PARENTS {
         return Err(Error::bad_request(format!("a snapshot may have at most {MAX_PARENTS} parents")));
@@ -1281,7 +1351,7 @@ pub(crate) fn complete(
             return Err(VeilError::Missing(id).into());
         }
     }
-    check_changes(src, &view, &g.changes, &real_tree, rp, &Policy::parse(&p.policy_text), admin)?;
+    check_changes(src, rows, &view, &g.changes, &real_tree, rp, &Policy::parse(&p.policy_text), admin)?;
     // Access lines: only admins change them.
     let mine = AccessPolicy::parse(&policy_text(src, &real_tree)?);
     let mut unchanged = false;
@@ -1297,16 +1367,16 @@ pub(crate) fn complete(
     real.tree = real_tree;
     real.parents = rp.to_vec();
     if real == *n {
-        return Ok(Completed {
-            real: ObjectId::hash(&Object::Snapshot(real).encode()),
-            raw: None,
-            origin: None,
-        });
+        let id = ObjectId::hash(&Object::Snapshot(real.clone()).encode());
+        rows.add(src, id, &real, rp)?;
+        return Ok(Completed { real: id, raw: None, origin: None });
     }
     real.sign(identity);
-    let raw = Object::Snapshot(real).encode();
+    let raw = Object::Snapshot(real.clone()).encode();
+    let id = ObjectId::hash(&raw);
+    rows.add(src, id, &real, rp)?;
     Ok(Completed {
-        real: ObjectId::hash(&raw),
+        real: id,
         raw: Some(Bytes::from(raw)),
         origin: None,
     })
@@ -1436,6 +1506,9 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     let mut completed: Vec<Completed> = Vec::new();
     // Each new real snapshot's real parents.
     let mut real_parents_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+    // The graph rows of this push's snapshots, carried from one check to
+    // the next (BUG-1425).
+    let mut rows = PushRows::default();
     for id in &order {
         let n = parents_of[id].clone();
         if n.embargo.is_some() {
@@ -1461,7 +1534,8 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
         let hub2 = hub.clone();
         let rp = real_parents.clone();
         let uploaded = uploaded.clone();
-        let c = blocking(hub, project.id, move |src| {
+        let mut push_rows = rows;
+        let (c, back) = blocking(hub, project.id, move |src| {
             let p = Project {
                 id: src.project,
                 name: String::new(),
@@ -1470,9 +1544,11 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                 policy_text: policy_text_acc,
                 bindings,
             };
-            complete(src, &p, &viewer2, &uploaded, &n2, &rp, &hub2.identity)
+            let c = complete(src, &p, &viewer2, &uploaded, &n2, &rp, &hub2.identity, &mut push_rows)?;
+            Ok((c, push_rows))
         })
         .await?;
+        rows = back;
         let c = Completed {
             origin: c.raw.as_ref().map(|_| *id),
             ..c

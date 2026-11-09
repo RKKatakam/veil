@@ -456,7 +456,7 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, who: &Arc<Who>, parent: ObjectI
 /// parent `parent`: the full snapshot, its id and encoding.
 fn complete_signed(src: &Source, who: &Who, known: &HashSet<ObjectId>, mut n: Snapshot, parent: ObjectId, identity: &veil_core::Identity) -> Result<(ObjectId, Snapshot, Bytes)> {
     n.sign(identity);
-    let c = sync::complete(src, &who.project, &who.viewer, known, &n, &[parent], identity)?;
+    let c = sync::complete(src, &who.project, &who.viewer, known, &n, &[parent], identity, &mut sync::PushRows::default())?;
     Ok(match c.raw {
         Some(raw) => match Object::decode(&raw)? {
             Object::Snapshot(s) => (c.real, s, raw),

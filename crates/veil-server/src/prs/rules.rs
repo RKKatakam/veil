@@ -116,6 +116,22 @@ impl Risk {
 }
 
 impl Review {
+    /// What a revision's risk class depends on ([`classify`] reads only
+    /// `high_risk_paths` and `checks_only`): the key a stored class is
+    /// cached under (BUG-1424). Two rules with the same key rate every
+    /// revision the same.
+    pub fn risk_key(&self) -> String {
+        let mut h = blake3::Hasher::new_derive_key("veil 2026 hub pr risk rules v1");
+        for list in [&self.high_risk_paths, &self.checks_only] {
+            h.update(&(list.len() as u64).to_le_bytes());
+            for p in list {
+                h.update(&(p.len() as u64).to_le_bytes());
+                h.update(p.as_bytes());
+            }
+        }
+        h.finalize().to_hex().to_string()
+    }
+
     pub fn need(&self, risk: Risk) -> Need {
         match risk {
             Risk::ChecksOnly => Need { approvals: 0, people_only: false },
@@ -205,8 +221,9 @@ impl Review {
     }
 }
 
-/// One changed file of a revision, as risk sees it.
-#[derive(Clone, Debug)]
+/// One changed file of a revision, as risk sees it (kept with the revision,
+/// so that it can be rated under the rules in force later: BUG-1424).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileChange {
     pub path: String,
     /// A secret (sealed) on either side.

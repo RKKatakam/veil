@@ -3041,6 +3041,16 @@ many there are.
 
 **Risk** (per revision, from every change's files together) is an
 **allow-list for low; everything else is normal** (BUG-1276, BUG-1277).
+**It is rated under the rules in force at each answer** (BUG-1424): a
+revision keeps the file changes risk reads (path, secret, executable,
+regular; `pr_revisions.files`), and every view of its risk (`show`, its
+revisions, the list, the gate, S17's landing) rates the current revision
+under the rules in force now, so rules the admins land later (a
+`high_risk_paths` entry, a dropped `checks_only`, a broken file) reach
+every open PR. The stored class is a cache keyed by the rules' risk key
+(their `high_risk_paths` and `checks_only`, all the classification
+reads), replaced when a view finds other rules in force. `prs::gate` is
+the one function every answer about readiness goes through.
 Only regular, non-executable files are ever below normal (BUG-1324): a
 symbolic link is rated by what it points at, which its name does not say.
 * **high:** `.veilpolicy`, `.veilrules`, `CODEOWNERS` anywhere, CI or
@@ -3150,8 +3160,9 @@ checks_only = ["docs/**"]
 **Landing** is S17's. When the gate is met, `POST prs/{id}/land` answers
 `501 landing_unavailable`, and nothing moves. The follow-up, once S17 is
 merged, submits the stack to `POST …/land` one change at a time, bottom
-first, onto the target, re-checks the gate in the same request, and marks
-the PR `landed`. **Decided (owner, 2026-11-07): landing onto a protected
+first, onto the target, re-checks the gate (`prs::gate`: the rules in
+force, the risk rated under them, the approvals) in the same request,
+and marks the PR `landed`. **Decided (owner, 2026-11-07): landing onto a protected
 branch meets the same review rules whichever way it comes,** `vl pr land`,
 `vl land` or a push that lands; otherwise review is bypassable. The landing
 service enforces it once S17 merges, and that is part of the follow-up.
@@ -3186,8 +3197,8 @@ names is S3's client work), and rate limits on PR creation (S24).
 | 21 | Any participant | makes a listing or a revision hold far more than it answers | listings read only the bodies they answer; carrying holds one file's positions at a time: +2 MiB for 2,100 comments of 64 KiB (was 139 MiB), +26 MiB for 64 files of 1 MiB (was 729 MiB for 8) (BUG-1258) | `s21_cycle2::bug_1258_…` (two tests, each in a process of its own) |
 | 22 | The author, or a colleague | grows the PR past a reviewer's access; closes it and opens the same files again (under new change ids too); opens a second or larger PR of them; takes the change over in a PR of their own; gets the reviewer to approve another PR at the same paths | a request for changes holds every PR at its paths, whoever opened it, released for a PR only by that reviewer's approval of that PR or for all by an admin (BUG-1259, 1278, 1323, 1326) | `s21_redesign_cycle2::bug_1326_…`, `a_hold_is_at_its_paths_whoever_opens_the_pr`, `s21_redesign_cycle3::a_hold_given_after_an_approval_holds_that_pr_again`, `a_hold_follows_a_renamed_file`, `s21_redesign::bug_1323_…`, `s21_cycle3::…_holds_until_its_reviewer_or_an_admin_releases_it`, `…_follows_its_change_ids_into_every_pr`, `bug_1278_…` |
 | 23 | Anyone who changes the default branch; any PR request | deletes, breaks, merges, fast-forwards or force-moves past a stricter `.veilrules`, lands concurrently on several servers, or reads while a landing commits | the rules in force are the state recorded at each landing; a reader reads tip and record together and never writes `strict` (BUG-1259, BUG-1279, BUG-1322) | `s21_redesign::bug_1322_…` (readers on two servers racing 60 landings, both databases), `s21_cycle3::the_rules_in_force_are_recorded_at_each_landing`, `the_last_valid_rules_hold_across_servers_and_late_records`, `bug_1279_…`, `prs::state::tests` |
-| 25 | A member who may read but not write a path | pushes a merge whose first parent is an older snapshot, or first a no-op merge that brings an older snapshot into the history, then a merge taking back an older file | a merge is checked against every parent, against their real merge bases (best common ancestors, by the derived graph, found once per pair): a path that keeps one parent's version over another's is a write unless that side made it (BUG-1321, 1327, 1329; push and API commits, `sync::check_changes`) | `s21_redesign::bug_1321_…`, `s21_redesign_cycle2::bug_1327_…` (both parent orders), `bug_1329_…` (4,000 paths: 49 ms, was 45.7 s), `s21_redesign_cycle3::a_criss_cross_merge_is_judged_against_every_merge_base` |
-| 26 | A member who may write a folder | a symbolic link named like documentation or a test; a doc site or install script the build runs; a PR that changes no file | only regular, non-executable files are below normal; low needs one approval by default; checks-only only where the admins list it; a PR of no file is normal (BUG-1324, 1325, 1328) | `s21_redesign::bug_1324_…`, `bug_1325_…`, `checks_only_paths_need_no_approval`, `s21_redesign_cycle2::bug_1328_…`, `prs::rules::tests::checks_only_links_and_the_defaults`, `s21_redesign_cycle3::risk_is_not_lowered_by_renames_or_modes` |
+| 25 | A member who may read but not write a path | pushes a merge whose first parent is an older snapshot, or first a no-op merge that brings an older snapshot into the history, then a merge taking back an older file; or one push of thousands of merges | a merge is checked against every parent, against their real merge bases (best common ancestors, by the derived graph, found once per pair): a path that keeps one parent's version over another's is a write unless that side made it (BUG-1321, 1327, 1329; push and API commits, `sync::check_changes`); the graph rows of a push's snapshots are kept for the whole push, so its work is linear, and the snapshots read that are not derived yet are bounded (BUG-1425) | `s21_redesign::bug_1321_…`, `s21_redesign_cycle2::bug_1327_…` (both parent orders), `bug_1329_…` (4,000 paths: 49 ms, was 45.7 s), `s21_redesign_cycle3::a_criss_cross_merge_is_judged_against_every_merge_base`, `bug_1425_…` (600 merges: 7.3 s, was 115 s), `s21_c4::a_merge_is_judged_against_a_base_of_the_same_push` |
+| 26 | A member who may write a folder | a symbolic link named like documentation or a test; a doc site or install script the build runs; a PR that changes no file; a PR opened under lenient rules, kept open while the admins tighten them | only regular, non-executable files are below normal; low needs one approval by default; checks-only only where the admins list it; a PR of no file is normal (BUG-1324, 1325, 1328); the risk is rated under the rules in force at each answer, never the rules of the revision (BUG-1424) | `s21_redesign::bug_1324_…`, `bug_1325_…`, `checks_only_paths_need_no_approval`, `s21_redesign_cycle2::bug_1328_…`, `prs::rules::tests::checks_only_links_and_the_defaults`, `s21_redesign_cycle3::risk_is_not_lowered_by_renames_or_modes`, `bug_1424_…`, `s21_c4::every_view_of_the_risk_follows_the_rules_in_force` |
 | 24 | Anyone who sees a PR | makes its answer read every review's text | reviews read without texts; at most 100 shown, texts within 256 KiB (BUG-1320) | `s21_cycle3::reviews_in_answers_are_bounded` |
 | 18 | Any participant | posts many large comments, then has everyone read them | every answer about 1 MiB of comments at most (BUG-1253) | `s21_adversarial::bug_1253_…` |
 | 19 | The author of a PR rebased over hidden changes | asks for the revision they are shown | "that is revision 1 already", their numbering (BUG-1254) | `s21_adversarial::bug_1254_…` |
@@ -3202,10 +3213,6 @@ names is S3's client work), and rate limits on PR creation (S24).
 * Opening a PR from a stack that holds a change the caller cannot see is
   refused, which says only that (the §13.4 precedent).
 * PR creation has no rate limit until S24.
-* Open (S21 redesign, cycle 3): a PR's risk is fixed under the rules of its
-  revision, so rules landed later never reach an open PR (BUG-1424; to fix
-  before S17's landing follow-up), and a push of many merges finds merge
-  bases with work quadratic in the push (BUG-1425).
 
 #### Measured
 
