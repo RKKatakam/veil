@@ -4079,3 +4079,363 @@ fn a_change_left_out_as_landed_already_is_named_in_the_answer() {
         "the change left out is not named: {v}"
     );
 }
+
+// ---- S17 re-check (s17r6): guarantees and findings -------------------------------------------
+
+/// A signed snapshot on `parent` with `c`'s tree, change id `cid` and
+/// `predecessors`, that is never uploaded: what `vl` records for each
+/// working-copy snapshot, `describe` or rebase on the device, and never
+/// pushes (a push uploads what parents reach, not predecessors).
+fn local_only(c: &Craft<'_>, parent: ObjectId, cid: veil_core::ChangeId, what: &str, predecessors: Vec<ObjectId>) -> ObjectId {
+    let mut s = Snapshot {
+        parents: vec![parent],
+        change_id: cid,
+        tree: c.root,
+        description: Text::Plain(what.into()),
+        author: "crafter".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors,
+        conflicts: vec![],
+        embargo: None,
+        signature: None,
+    };
+    s.sign(&c.identity);
+    ObjectId::hash(&O::Snapshot(s).encode())
+}
+
+/// BUG-1547: `Ancestry::landed` relates a landed revision to a change by
+/// one level of the change's recorded predecessors (and two of the landed
+/// revision's): a real revision of a landed change two rewrites on (here P
+/// described on the device, then amended with one more file: each rewrite
+/// names only the one before it) counts as unrelated, and lands again as a
+/// second change with P's change id, where one rewrite on is refused
+/// (`a_revision_of_a_landed_change_with_further_edits_is_refused`).
+#[test]
+#[ignore = "BUG-1547: a revision of a landed change two rewrites on (each naming only the one before) is not related to its landing, and lands again"]
+fn bug_1547_a_revision_two_rewrites_past_a_landed_change_is_refused_like_one_rewrite_past() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let first = push_chain(&api, &p.dev, &p.name, "dev-work", "main", 1, Some("src/once"));
+    let v = land_held(&api, &token, &p.name, first, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    let tip = real_tip(&hub, pid);
+    let cid = source(&hub, pid).snapshot(&tip).unwrap().change_id;
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    let on = c.tip;
+    // P described on the device (never pushed), then amended.
+    let described = local_only(&c, on, cid, "P, described", vec![first]);
+    c.file("src/once/more.rs", "more\n");
+    let p3 = snap_at(&mut c, on, cid, "P, amended", veil_core::now_millis(), vec![described]);
+    let r = push_new(&c, &[("amended", p3)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let r = land_held(&api, &token, &p.name, p3, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 400, "{body}");
+    assert!(body.contains("already landed") && body.contains("make a new change for the further edits"), "{body}");
+    assert_eq!(real_tip(&hub, pid), tip, "{body}");
+    let ids: Vec<_> = chain(&hub, pid, veil_server::sync::root_snapshot_id()).into_iter().map(|(_, s)| s.change_id).collect();
+    assert_eq!(ids.iter().filter(|i| **i == cid).count(), 1, "P's change is on main twice");
+}
+
+/// BUG-1548: `Ancestry::landed` projects the landed revision's recorded
+/// history for the submitter, and a snapshot in it the server never stored
+/// (any `vl`-made snapshot names its working-copy predecessor, which is
+/// never pushed) fails the whole landing. BUG-1527's squat then still
+/// blocks: fin lands a billing change under the dev's change id V, its
+/// snapshot naming a predecessor fin never uploaded; the dev's landing of V
+/// is answered with an error, for ever, though nothing of V is on main.
+/// With no predecessor (`bug_1527_…`) V lands.
+#[test]
+#[ignore = "BUG-1548: a landed revision whose recorded history names a snapshot the server never stored fails Ancestry::landed: a change landed under someone else's change id still blocks theirs"]
+fn bug_1548_a_squat_naming_an_unstored_predecessor_never_blocks_the_change_it_squats() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let mut d = Craft::new(&api, &p.dev, &p.name, "main");
+    let on = d.tip;
+    d.file("src/v.rs", "the dev's\n");
+    let cid = veil_core::ChangeId::random();
+    let v = crafted_on(&mut d, on, cid, "V", "");
+    let r = push_new(&d, &[("v", v)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let mut f = Craft::new(&api, &p.fin, &p.name, "main");
+    let on = f.tip;
+    f.file(&format!("{BILL_DIR}/acme/s.txt"), "fin's\n");
+    let wc = local_only(&f, on, cid, "fin's working copy", vec![]);
+    let s = snap_at(&mut f, on, cid, "not V", veil_core::now_millis(), vec![wc]);
+    let r = push_new(&f, &[("s", s)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let w = land_held(&api, &p.fin.token(), &p.name, s, true).json();
+    assert_eq!(w["state"], "landed", "{w}");
+    let r = land_held(&api, &p.dev.token(), &p.name, v, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+    assert_eq!(real_file(&hub, pid, "src/v.rs").as_deref(), Some(&b"the dev's\n"[..]));
+}
+
+/// BUG-1549: the answer names the changes left out as landed already only
+/// when something else lands. A landing whose every change landed already
+/// (P rebased on main, which holds P) is answered "nothing to land: every
+/// change here is on the branch already, or holds edits you cannot see",
+/// naming none: the submitter cannot tell which of the two it was, and the
+/// skipped change is not named (HUB.md §13.19: "never silent").
+#[test]
+#[ignore = "BUG-1549: a landing whose every change landed already answers \"nothing to land\" without naming the changes it left out as landed"]
+fn bug_1549_a_landing_whose_every_change_landed_already_names_them() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let first = push_chain(&api, &p.dev, &p.name, "dev-work", "main", 1, Some("src/once"));
+    let v = land_held(&api, &token, &p.name, first, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    let tip = real_tip(&hub, pid);
+    let cid = source(&hub, pid).snapshot(&tip).unwrap().change_id;
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    let on = c.tip;
+    let p2 = snap_at(&mut c, on, cid, "P, rebased", veil_core::now_millis(), vec![first]);
+    let r = push_new(&c, &[("again", p2)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let r = land_held(&api, &token, &p.name, p2, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 400, "{body}");
+    assert!(body.contains("nothing to land"), "{body}");
+    assert_eq!(real_tip(&hub, pid), tip, "{body}");
+    assert!(body.contains(&cid.to_string()) && body.contains("already landed"), "the change left out is not named: {body}");
+}
+
+/// Guarantees 1 and 4 (BUG-1526's rule, the skipped line and the admin
+/// exemption): the admin's change F (`src/f.rs` and a billing file) landed;
+/// F2, its revision on main0, is on `f2` with or without one more billing
+/// file. The dev's landing of their change on `f2` lands, the same answer in
+/// both worlds, and never names F as landed already (they see F2 in part).
+/// The admin, who sees F2 whole, is judged by it: with nothing further F2 is
+/// left out and named; with the further billing file the landing is refused.
+#[test]
+fn a_change_seen_in_part_is_never_named_as_landed_already_and_only_an_admin_is_judged_by_its_hidden_edits() {
+    let mut answers = Vec::new();
+    for extra in [false, true] {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        let pid = project_id(&hub, &p.name);
+        let api = hub.api();
+        let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+        let main0 = c.tip;
+        let cid = veil_core::ChangeId::random();
+        c.file("src/f.rs", "f\n");
+        c.file(&format!("{BILL_DIR}/acme/f.txt"), "f\n");
+        let f = snap_at(&mut c, main0, cid, "F", veil_core::now_millis(), vec![]);
+        let r = push_new(&c, &[("f1", f)]);
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        let v = land_held(&api, &p.admin.token(), &p.name, f, true).json();
+        assert_eq!(v["state"], "landed", "{v}");
+        if extra {
+            c.file(&format!("{BILL_DIR}/acme/g.txt"), "g\n");
+        }
+        let f2 = snap_at(&mut c, main0, cid, "F, amended", veil_core::now_millis(), vec![f]);
+        let r = push_new(&c, &[("f2", f2)]);
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        // The dev's change on F2.
+        let mut m = Craft::new(&api, &p.dev, &p.name, "f2");
+        m.file("src/mine.rs", "the dev's\n");
+        let on = m.tip;
+        let mine = crafted_on(&mut m, on, veil_core::ChangeId::random(), "mine", "");
+        let r = push_new(&m, &[("mine", mine)]);
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        let r = land_held(&api, &p.dev.token(), &p.name, mine, true);
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        assert_eq!(r.status, 200, "extra: {extra}: {body}");
+        let v = r.json();
+        assert_eq!(v["state"], "landed", "extra: {extra}: {v}");
+        assert!(!body.contains(&cid.to_string()) && !body.contains("already landed"), "extra: {extra}: F is named to the dev: {body}");
+        let mut shown = without_ticket(v);
+        shown.as_object_mut().unwrap().remove("landed");
+        shown.as_object_mut().unwrap().remove("change_id");
+        answers.push(shown);
+        // The admin's change on F2: judged by all of F2.
+        let mut a = Craft::new(&api, &p.admin, &p.name, "f2");
+        a.file("src/admins.rs", "the admin's\n");
+        let on = a.tip;
+        let theirs = crafted_on(&mut a, on, veil_core::ChangeId::random(), "the admin's", "");
+        let r = push_new(&a, &[("admins", theirs)]);
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        let r = land_held(&api, &p.admin.token(), &p.name, theirs, true);
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        if extra {
+            assert_eq!(r.status, 400, "{body}");
+            assert!(body.contains("already landed") && body.contains("other edits"), "{body}");
+            assert!(real_file(&hub, pid, "src/admins.rs").is_none());
+        } else {
+            assert_eq!(r.status, 200, "{body}");
+            assert_eq!(r.json()["state"], "landed", "{body}");
+            assert!(body.contains(&cid.to_string()) && body.contains("already landed"), "F2 is not named: {body}");
+            assert_eq!(real_file(&hub, pid, "src/admins.rs").as_deref(), Some(&b"the admin's\n"[..]));
+        }
+    }
+    assert_eq!(answers[0], answers[1], "the dev's answer is the same whatever F2 holds in billing");
+}
+
+/// Guarantee 1, the skipped line: the admin's change F (`src/f.rs` and a
+/// billing file, whose content differs between the two worlds) landed. The
+/// dev's revision of F as they see it (only `src/f.rs`, unchanged), with
+/// their change Q on it, lands Q and names F as landed already: the same
+/// answer, and the same line, whatever F holds in billing.
+#[test]
+fn the_skipped_line_is_the_same_whatever_the_landed_revision_holds_hidden() {
+    let mut answers = Vec::new();
+    for bill in ["one\n", "two\n"] {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        let pid = project_id(&hub, &p.name);
+        let api = hub.api();
+        let mut d = Craft::new(&api, &p.dev, &p.name, "main");
+        let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+        let main0 = c.tip;
+        let cid = veil_core::ChangeId::random();
+        c.file("src/f.rs", "f\n");
+        c.file(&format!("{BILL_DIR}/acme/f.txt"), bill);
+        let f = snap_at(&mut c, main0, cid, "F", veil_core::now_millis(), vec![]);
+        let r = push_new(&c, &[("f1", f)]);
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        let seen_f = Craft::new(&api, &p.dev, &p.name, "f1").tip;
+        let v = land_held(&api, &p.admin.token(), &p.name, f, true).json();
+        assert_eq!(v["state"], "landed", "{v}");
+        let on = d.tip;
+        d.file("src/f.rs", "f\n");
+        let f3 = snap_at(&mut d, on, cid, "F, as the dev sees it", veil_core::now_millis(), vec![seen_f]);
+        d.file("src/q.rs", "q\n");
+        let q = crafted_on(&mut d, f3, veil_core::ChangeId::random(), "Q", "");
+        let r = push_new(&d, &[("q", q)]);
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        let r = land_held(&api, &p.dev.token(), &p.name, q, true);
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        assert_eq!(r.status, 200, "{body}");
+        let v = r.json();
+        assert_eq!(v["state"], "landed", "{v}");
+        assert_eq!(v["landed"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(real_file(&hub, pid, "src/q.rs").as_deref(), Some(&b"q\n"[..]));
+        let ids: Vec<_> = chain(&hub, pid, main0).into_iter().map(|(_, s)| s.change_id).collect();
+        assert_eq!(ids.iter().filter(|i| **i == cid).count(), 1, "F's change is on main twice");
+        assert!(body.contains(&cid.to_string()) && body.contains("already landed"), "F is not named: {body}");
+        let mut shown = without_ticket(v);
+        shown.as_object_mut().unwrap().remove("landed");
+        shown.as_object_mut().unwrap().remove("change_id");
+        answers.push(shown.to_string().replace(&cid.to_string(), "CID"));
+    }
+    assert_eq!(answers[0], answers[1], "the answer is the same whatever F holds in billing");
+}
+
+/// Guarantee 2 (`resolve_for`'s order, BUG-1525's class, every route): the
+/// dev sees main's first snapshot H whole, and main's tip X is the admin's
+/// billing-only change on it. Whatever the route that names H (a push to
+/// main, a push of a new branch, an API commit kept or `onto` main, a
+/// landing of an uploaded snapshot), the dev's change is made on X, never
+/// on H below it, and X's billing file stays; a landing of edits on H lands.
+#[test]
+fn every_route_naming_a_snapshot_seen_whole_under_a_hidden_only_tip_is_made_on_the_tip() {
+    for route in ["push", "side", "kept", "onto", "land-snapshot", "land-edits"] {
+        let hub = TestHub::start();
+        let admin = hub.person("admin");
+        let dev = hub.person("dev");
+        let fin = hub.person("fin");
+        let name = unique("acme");
+        let dir = admin.dir("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        admin.ok(&dir, &["init"]);
+        let policy = format!(".veilpolicy {0}\nsrc/ {0}\nbilling/ {1}\n", dev.name, fin.name);
+        write_files(&dir, &[("src/lib.rs", "pub fn a() {}\n"), (".veilpolicy", &policy)]);
+        admin.ok(&dir, &["remote", "add", "origin", &hub.url(&name)]);
+        admin.commit_main(&dir, "initial import");
+        let out = admin.ok(&dir, &["push"]);
+        assert!(out.contains("Created project"), "{out}");
+        let api = hub.api();
+        let pid = project_id(&hub, &name);
+        let token = dev.token();
+        let h = real_tip(&hub, pid);
+        assert_eq!(tip_for(&hub, &token, &name), h, "the dev sees main's tip whole");
+        let mut c = Craft::new(&api, &admin, &name, "main");
+        c.file("billing/x.txt", "fin's\n");
+        let r = c.push("main", "billing only");
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        let x = real_tip(&hub, pid);
+        assert_ne!(x, h);
+        assert_eq!(tip_for(&hub, &token, &name), h, "the dev sees main as before");
+        let parent_of = |id: ObjectId| source(&hub, pid).snapshot(&id).unwrap().parents.clone();
+        let made = match route {
+            "push" | "side" => {
+                let mut m = Craft::new(&api, &dev, &name, "main");
+                m.file("src/mine.rs", "the dev's\n");
+                let mine = crafted_on(&mut m, h, veil_core::ChangeId::random(), "mine", "");
+                let branch = if route == "push" { "main" } else { "side" };
+                let up = api.upload(&m.token, &name, &m.objects);
+                assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+                let receipts = up.json()["receipts"].as_array().unwrap().clone();
+                let map: serde_json::Map<String, Value> = m.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+                let expected = if route == "push" { Some(h.hex()) } else { None };
+                let r = api.post_json(
+                    Some(&token),
+                    &format!("/v1/projects/{name}/push"),
+                    &json!({"updates": [{"branch": branch, "expected": expected, "new": mine.hex()}], "receipts": map}),
+                );
+                assert_eq!(r.status, 200, "{route}: {}", String::from_utf8_lossy(&r.body));
+                assert_eq!(r.json()["results"][0]["ok"], true, "{route}: {}", String::from_utf8_lossy(&r.body));
+                let t: String = hub
+                    .rt
+                    .block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2").bind(pid).bind(branch).fetch_one(&hub.hub().db))
+                    .unwrap();
+                ObjectId::from_hex(&t).unwrap()
+            }
+            "kept" | "onto" => {
+                let mut body = json!({"base": h.hex(), "edits": [put("src/mine.rs", "the dev's\n")]});
+                if route == "onto" {
+                    body["onto"] = json!({"branch": "main", "expected": h.hex()});
+                }
+                let r = api.post_json(Some(&token), &format!("/v1/projects/{name}/changes"), &body);
+                assert_eq!(r.status, 200, "{route}: {}", String::from_utf8_lossy(&r.body));
+                let seen: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+                if route == "onto" {
+                    real_tip(&hub, pid)
+                } else {
+                    real_of_seen(&hub, pid, seen)
+                }
+            }
+            "land-snapshot" => {
+                let mut m = Craft::new(&api, &dev, &name, "main");
+                m.file("src/mine.rs", "the dev's\n");
+                let mine = crafted_on(&mut m, h, veil_core::ChangeId::random(), "mine", "");
+                let up = api.upload(&m.token, &name, &m.objects);
+                assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+                let receipts = up.json()["receipts"].as_array().unwrap().clone();
+                let map: serde_json::Map<String, Value> = m.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+                let r = api.post_json(
+                    Some(&token),
+                    &format!("/v1/projects/{name}/land"),
+                    &json!({"onto": "main", "snapshot": mine.hex(), "receipts": map, "wait": true}),
+                );
+                assert_eq!(r.status, 200, "{route}: {}", String::from_utf8_lossy(&r.body));
+                assert_eq!(r.json()["state"], "landed", "{route}: {}", String::from_utf8_lossy(&r.body));
+                // The submitted snapshot, as the server completed it.
+                source(&hub, pid).snapshot(&real_tip(&hub, pid)).unwrap().predecessors[0]
+            }
+            _ => {
+                let v = land(&api, &token, &name, h, json!([put("src/mine.rs", "the dev's\n")]), true).json();
+                assert_eq!(v["state"], "landed", "{route}: {v}");
+                assert_eq!(parent_of(real_tip(&hub, pid)), vec![x], "{route}: landed on the tip");
+                real_tip(&hub, pid)
+            }
+        };
+        if route != "land-edits" {
+            assert_eq!(parent_of(made), vec![x], "{route}: made on main's tip, not on H below it");
+        }
+        if matches!(route, "push" | "onto" | "land-snapshot" | "land-edits") {
+            assert_eq!(real_file(&hub, pid, "billing/x.txt").as_deref(), Some(&b"fin's\n"[..]), "{route}");
+            assert_eq!(real_file(&hub, pid, "src/mine.rs").as_deref(), Some(&b"the dev's\n"[..]), "{route}");
+        }
+    }
+}
