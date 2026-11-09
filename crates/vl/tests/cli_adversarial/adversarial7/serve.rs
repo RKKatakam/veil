@@ -77,6 +77,7 @@ fn a_moved_repositorys_server_never_serves_another_repository() {
     // Past the server's once-a-second socket check.
     std::thread::sleep(Duration::from_millis(2500));
     let out = env.vl(U, &moved, &["serve", "--call", "commit", r#"{"message":"meant for old"}"#]);
+    assert!(!out.status.success(), "{}", text(&out));
     let log = env.stdout(U, &newcomer, &["--no-snapshot", "log"]);
     drop(server);
     assert!(!log.contains("meant for old"), "the request was carried out in another repository:\n{}\n{log}", text(&out));
