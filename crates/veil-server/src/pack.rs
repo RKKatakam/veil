@@ -1297,4 +1297,290 @@ mod tests {
         assert!(matches!(packs.find(7, &ids[0]), Found::At(..)), "and loaded into the lookup maps");
         assert_eq!(bound.available(), total, "the lookup maps' indexes are bounded by the lookup budget, not the bound");
     }
+
+    /// Objects listed so far in one project: each id and its pack.
+    type Known = Arc<Mutex<Vec<(ObjectId, Arc<str>)>>>;
+
+    /// Write pack `k` of `project` (`per` objects) and list it as
+    /// `Packs::refresh` does with a listing in hand ([`Packs::load_listed`]);
+    /// then make its objects known.
+    async fn list_pack(packs: &Packs, store: &Arc<dyn BlobStore>, project: i64, k: usize, per: usize, known: &Known) {
+        let objects: Vec<_> = (0..per).map(|i| obj(&format!("project {project} pack {k} object {i}"))).collect();
+        let ids: Vec<ObjectId> = objects.iter().map(|(id, _)| *id).collect();
+        let (bytes, _) = build(objects).unwrap();
+        let name: Arc<str> = Arc::from(new_name());
+        store.put(&key(project, &name), bytes).await.unwrap();
+        let reads = AtomicU64::new(0);
+        packs.load_listed(&packs.project(project), store, project, vec![name.to_string()], &reads).await.unwrap();
+        known.lock().unwrap().extend(ids.into_iter().map(|id| (id, name.clone())));
+    }
+
+    /// `lookups` lookups of known objects of `project`, each as
+    /// `Objects::in_pack` runs one (`again` after a miss): found (in its own
+    /// pack, its entry checked), or with `tight` refused for want of a share
+    /// of the bound; never answered missing. How many were found, refused.
+    async fn look_up_known(packs: Arc<Packs>, store: Arc<dyn BlobStore>, known: Known, project: i64, seed: u64, lookups: usize, tight: bool) -> (usize, usize) {
+        let (mut found, mut refused, mut x) = (0, 0, seed);
+        let reads = AtomicU64::new(0);
+        for _ in 0..lookups {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let (id, name) = {
+                let k = known.lock().unwrap();
+                k[(x >> 33) as usize % k.len()].clone()
+            };
+            let since = Instant::now();
+            let r = match packs.locate(&store, project, &id, false, since, &reads).await {
+                Ok(None) => packs.locate(&store, project, &id, true, since, &reads).await,
+                r => r,
+            };
+            match r {
+                Ok(Some((n, s))) => {
+                    assert_eq!(n, name, "found in another pack");
+                    let (b, _) = store.get_range(&key(project, &n), s.offset, s.last()).await.unwrap().unwrap();
+                    entry(&id, s, &b).expect("the slot found is the object's entry");
+                    found += 1;
+                }
+                Ok(None) => panic!("an object of a listed pack of project {project} answered missing (tight bound: {tight})"),
+                Err(e) if tight && indexes_full(&e) => refused += 1,
+                Err(e) => panic!("{e:#}"),
+            }
+            tokio::task::yield_now().await;
+        }
+        (found, refused)
+    }
+
+    /// Review s28r4 (S28 guarantee 2, cycle 4's BUG-1495 fix under load):
+    /// no lookup answers "missing" for a stored object, whatever other
+    /// lookups page in and out and packs are listed meanwhile. Twelve tasks
+    /// look up objects of a project whose indexes never fit the budget
+    /// together (about two of ten do: each lookup pages one in and another
+    /// out), three look up another project's (paging this one's out), and
+    /// one lists new packs (`load_listed`, what `refresh` does with a
+    /// listing) while they run, on eight threads. Every lookup finds its
+    /// object in its pack. Then the same with the bound on indexes held
+    /// outside the maps tight (room to read one index, a short wait): a
+    /// lookup finds its object or is refused (`IndexesFull`, 503), never
+    /// answers it missing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn s28r4_no_lookup_answers_missing_while_others_page_in_out_and_list() {
+        const PER: usize = 2_000;
+        const LOOKUPS: usize = 150;
+        for tight in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn BlobStore> = Arc::new(crate::store::FsStore::new(dir.path()));
+            let budget = 2 * Index::weight_of(PER) + 16 * PACK_WEIGHT + 2 * PROJECT_WEIGHT + 4096;
+            let mut packs = Packs { budget, ..Packs::new(None) };
+            if tight {
+                let total = 300_000;
+                packs.bound = Bound { most: total, wait: Duration::from_millis(5), ..Bound::new(total) };
+            }
+            let packs = Arc::new(packs);
+            let (known7, known8): (Known, Known) = Default::default();
+            for k in 0..4 {
+                list_pack(&packs, &store, 7, k, PER, &known7).await;
+            }
+            for k in 0..2 {
+                list_pack(&packs, &store, 8, k, PER, &known8).await;
+            }
+            let mut set = tokio::task::JoinSet::new();
+            for t in 0..15u64 {
+                let (project, known) = if t < 12 { (7, known7.clone()) } else { (8, known8.clone()) };
+                set.spawn(look_up_known(packs.clone(), store.clone(), known, project, t + 1, LOOKUPS, tight));
+            }
+            let lister = {
+                let (packs, store, known) = (packs.clone(), store.clone(), known7.clone());
+                tokio::spawn(async move {
+                    for k in 4..10 {
+                        tokio::time::sleep(Duration::from_millis(3)).await;
+                        list_pack(&packs, &store, 7, k, PER, &known).await;
+                    }
+                })
+            };
+            let (mut found, mut refused) = (0, 0);
+            while let Some(r) = set.join_next().await {
+                let (f, r) = r.expect("no lookup panicked (none answered missing)");
+                found += f;
+                refused += r;
+            }
+            lister.await.unwrap();
+            println!("tight bound {tight}: {found} found, {refused} refused");
+            assert_eq!(found + refused, 15 * LOOKUPS);
+            if tight {
+                assert!(found > 0, "some lookups found their objects");
+            } else {
+                assert_eq!(refused, 0);
+                assert!(total(&packs) <= budget, "within the budget: {}", total(&packs));
+            }
+            assert_eq!(packs.bound.available(), if tight { 300_000 } else { INDEXES_HELD }, "every share given back");
+        }
+    }
+
+    /// BUG-1620 (review s28r4): the bound on indexes held outside the lookup
+    /// maps ([`INDEXES_HELD`]) is one queue for the whole server, first come
+    /// first served (a fair semaphore), with no share per project or
+    /// person, and a request that waits for it 10 s ([`INDEX_WAIT`]) is
+    /// answered 503. So one person's requests can starve every other
+    /// project's uploads (`Objects::write_pack`), pushes (`staged_slots`)
+    /// and paged lookups (`find_paged`), however small their own index:
+    /// - the staged-index cache holds up to 32 MiB of shares, and fills with
+    ///   the person's own small uploads (another upload that would evict
+    ///   them needs a share first, so cannot);
+    /// - a push reads the index of every staged pack its receipts name, 16
+    ///   at once (`sync::staging`); an index the cache does not hold (one
+    ///   past 32 MiB, about 700,000 objects, never is) is read from storage
+    ///   each time, under a share of 64 MiB: all the cache leaves;
+    /// - so while such reads queue, every other request waits behind them
+    ///   with nothing beside them to take: past 10 s of queued reads (16 a
+    ///   push, about a second each on an object store) it is answered 503.
+    ///
+    /// One participant of a project of their own uploads a few such packs
+    /// once, then keeps a few pushes of a few hundred bytes in flight, each
+    /// naming one receipt of each (losing their race, so the uploads stay
+    /// staged). S24's limits (200 requests a second per device, per-project
+    /// bulkheads, 512 MiB of bodies) do not stop it. Here at a small scale
+    /// with the server's proportions (a bound of 1 MiB; the cache holding
+    /// what leaves one holder the most it may take; a wait shorter than one
+    /// large read): four tasks of one project read a large staged index in
+    /// a loop (a store that takes 600 ms to read an index past its first
+    /// bytes); another project's three lookups of a 10-object pack, one
+    /// after another, are refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "BUG-1620: one person's requests can hold the server-wide bound on pack indexes, so every other project's uploads, pushes and paged lookups wait 10 s and are answered 503"]
+    async fn bug_1620_one_persons_index_reads_never_starve_another_projects_lookup() {
+        struct Slow(crate::store::FsStore);
+        #[async_trait::async_trait]
+        impl BlobStore for Slow {
+            async fn get(&self, key: &str) -> Result<Option<Bytes>> {
+                self.0.get(key).await
+            }
+            async fn put(&self, key: &str, data: Bytes) -> Result<()> {
+                self.0.put(key, data).await
+            }
+            async fn exists(&self, key: &str) -> Result<bool> {
+                self.0.exists(key).await
+            }
+            async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Option<(Bytes, u64)>> {
+                if end >= FIRST_READ {
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                }
+                self.0.get_range(key, start, end).await
+            }
+            async fn delete(&self, key: &str) -> Result<()> {
+                self.0.delete(key).await
+            }
+            async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+                self.0.list(prefix).await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn BlobStore> = Arc::new(Slow(crate::store::FsStore::new(dir.path())));
+        // The participant's small upload, which the staged-index cache keeps
+        // (the cache full: on the server 32 MiB of 96).
+        let cached: Vec<_> = (0..5_000).map(|i| obj(&format!("cached {i}"))).collect();
+        let cached_name: Arc<str> = Arc::from(new_name());
+        let (bytes, index) = build(cached).unwrap();
+        let w = index.weight();
+        store.put(&key(1, &cached_name), bytes).await.unwrap();
+        // The server's proportions: one holder takes at most what the cache
+        // leaves (on the server 64 MiB), a wait shorter than a large read.
+        let total = 1 << 20;
+        let bound = Bound { most: total - w, wait: Duration::from_millis(200), ..Bound::new(total) };
+        let packs = Arc::new(Packs { bound, ..Packs::new(None) });
+        let held = read_index(&*store, &key(1, &cached_name), &packs.bound).await.unwrap().unwrap();
+        packs.staged_here(1, 1, &cached_name, held);
+        assert_eq!(packs.bound.available(), total - w, "the cache holds its index's share");
+        assert!(packs.staged_cached(1, &cached_name).is_some());
+        // The participant's large staged upload: 20,000 objects, an index
+        // the cache does not hold, read under the largest share.
+        let big: Vec<_> = (0..20_000).map(|i| obj(&format!("staged {i}"))).collect();
+        let probe = big[0].0;
+        let big_name: Arc<str> = Arc::from(new_name());
+        store.put(&key(1, &big_name), build(big).unwrap().0).await.unwrap();
+        // Other projects' listed packs of 10 objects, their indexes unloaded.
+        let mut wanted = Vec::new();
+        for project in 2..5 {
+            let small: Vec<_> = (0..10).map(|i| obj(&format!("project {project} object {i}"))).collect();
+            let id = small[3].0;
+            let name: Arc<str> = Arc::from(new_name());
+            store.put(&key(project, &name), build(small).unwrap().0).await.unwrap();
+            packs.add(project, vec![(name.clone(), None)], true);
+            wanted.push((project, id, name));
+        }
+        // Success first: with nothing else held, a lookup finds its object.
+        let reads = AtomicU64::new(0);
+        let (p0, id0, name0) = wanted.remove(0);
+        let found = packs.find_paged(&store, p0, &id0, &reads).await.unwrap();
+        assert_eq!(found.map(|(n, _)| n), Some(name0), "an idle server finds it");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut pushes = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let (packs, store, stop, name) = (packs.clone(), store.clone(), stop.clone(), big_name.clone());
+            pushes.spawn(async move {
+                let mut n = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(Some(s)) = packs.staged_slots(&*store, 1, &name, &[probe]).await {
+                        assert_eq!(s.slots.len(), 1);
+                        n += 1;
+                    }
+                }
+                n
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut answers = Vec::new();
+        for (project, id, name) in &wanted {
+            let t = Instant::now();
+            answers.push((packs.find_paged(&store, *project, id, &reads).await, t.elapsed(), name.clone()));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let mut read = 0;
+        while let Some(n) = pushes.join_next().await {
+            read += n.unwrap();
+        }
+        assert!(read > 0, "the participant's pushes read their staged index");
+        for (r, waited, name) in answers {
+            let found = r.unwrap_or_else(|e| panic!("another project's lookup of a 10-object pack was refused after {waited:?} ({e:#}), while one project's {read} reads of its staged index held the bound"));
+            assert_eq!(found.map(|(n, _)| n), Some(name));
+        }
+        assert_eq!(packs.bound.available(), total - w, "every share but the cache's given back");
+    }
+
+    /// BUG-1621 (review s28r4): a share of the bound on indexes is clamped
+    /// at what one holder may take ([`Bound::permits`]: 64 MiB, so that a
+    /// share for any index can always come free), but a pack may hold
+    /// [`MAX_OBJECTS`] (2^21) objects: reading its index holds 216 MiB (its
+    /// 88 MiB of bytes, the parsed 96 MiB and the parse's 32 MiB working
+    /// copy) and holding it 96 MiB, under a share of 64 MiB. With the
+    /// staged-index cache's 32 MiB that is about 250 MiB of indexes outside
+    /// the lookup maps, against `INDEXES_HELD` (96 MiB, `HUB.md` §13.20: "96
+    /// MiB for every request together"). Writing a pack is counted short the
+    /// same way: `Objects::write_pack` takes a share for the parsed index
+    /// only, while `build` also holds the pack's index bytes (44 bytes a
+    /// slot) and its set of ids seen (about 2^22 slots of 33 bytes for 2^21
+    /// objects). An upload of a million tiny objects (the hostile test of
+    /// BUG-1496 sends two) reaches this. Here at a small scale with the same
+    /// proportions (a 96 KiB bound, 64 KiB at most for one holder, an index
+    /// of 96 KiB), then at the server's sizes.
+    #[tokio::test]
+    #[ignore = "BUG-1621: a share of the bound on pack indexes is clamped at 64 MiB, while a pack's index may need 216 MiB to read and 96 MiB to hold"]
+    async fn bug_1621_an_index_held_outside_the_lookup_maps_holds_a_share_of_all_it_holds() {
+        let total = 96 << 10;
+        let bound = Bound { most: 64 << 10, wait: Duration::from_millis(100), ..Bound::new(total) };
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::FsStore::new(dir.path());
+        let n = 2_048;
+        let (bytes, _) = build((0..n).map(|i| obj(&format!("full {i}"))).collect()).unwrap();
+        store.put(&key(7, "full"), bytes).await.unwrap();
+        let held = read_index(&store, &key(7, "full"), &bound).await.unwrap().expect("the pack is stored");
+        assert_eq!(held.index.len(), n, "the index is read");
+        let share = total - bound.available();
+        assert!(share >= held.index.weight(), "an index of {} bytes held under a share of {share}", held.index.weight());
+        // The server's sizes.
+        let packs = Packs::new(None);
+        let n = MAX_OBJECTS;
+        let read = (HEAD + n * ENTRY + Index::weight_of(n) + n * std::mem::size_of::<Slot>()) as u64;
+        let hold = Index::weight_of(n) as u64;
+        let (r, h) = (u64::from(packs.bound.permits(read)), u64::from(packs.bound.permits(hold)));
+        assert!(r >= read && h >= hold, "reading the index of a full pack takes a share of {} MiB for {} MiB, holding it {} MiB for {} MiB", r >> 20, read >> 20, h >> 20, hold >> 20);
+    }
 }

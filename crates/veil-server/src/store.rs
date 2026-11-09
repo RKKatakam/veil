@@ -1750,4 +1750,136 @@ mod tests {
         }
         assert!(moved >= 40, "boundaries moved: {moved}");
     }
+
+    /// The damage tests' objects as a pack before cycle 4 wrote them
+    /// (`veilpack2`: each entry its id then its encoding, each slot 32 bytes
+    /// plus the encoding).
+    fn veilpack2(objs: &[(ObjectId, Bytes, Bytes)]) -> Vec<u8> {
+        let mut at = (PACK_HEAD + objs.len() * PACK_ENTRY) as u64;
+        let mut slots: Vec<(ObjectId, u64, u32)> = Vec::new();
+        for (id, _, enc) in objs {
+            slots.push((*id, at, 32 + enc.len() as u32));
+            at += 32 + enc.len() as u64;
+        }
+        slots.sort_by_key(|s| s.0);
+        let mut out = b"veilpack2\n".to_vec();
+        out.extend((objs.len() as u32).to_be_bytes());
+        for (id, offset, len) in &slots {
+            out.extend(id.0);
+            out.extend(offset.to_be_bytes());
+            out.extend(len.to_be_bytes());
+        }
+        for (id, _, enc) in objs {
+            out.extend(id.0);
+            out.extend(&enc[..]);
+        }
+        out
+    }
+
+    /// Review s28r4 (S28 guarantee 1, cycle 4's `veilpack3`): what the
+    /// cycle 3 property test never damaged, the entries in the pack itself.
+    /// An entry whose stated length lies (one byte, four, an entry head's
+    /// length, zero, the largest, one bit), or whose id is damaged, under an
+    /// intact index: that object's every read (whole, encoded, ranged,
+    /// neighbour, blocking) refuses, and every other object's answers
+    /// exactly. A `veilpack2` pack (no lengths) is refused by the new code:
+    /// listed, its every read is an error; with its magic rewritten to
+    /// `veilpack3` its index parses, and no read of it answers.
+    #[tokio::test]
+    async fn s28r4_entries_whose_head_lies_and_packs_before_cycle_4_are_refused_never_misread() {
+        let dir = tempfile::tempdir().unwrap();
+        let objs = damage_objects();
+        let (name, intact, index) = damage_pack(dir.path(), &objs).await;
+        let path = dir.path().join(crate::pack::key(1, &name));
+        let n = objs.len();
+        let all = reads_answer_their_own_objects(dir.path(), &name, &index, &objs, "intact").await;
+        assert_eq!(all, n * 9, "every read of an intact pack answers");
+        let mut cases = 0;
+        for (i, (id, _, enc)) in objs.iter().enumerate() {
+            let at = index.get(id).unwrap().offset as usize;
+            let stated = enc.len() as u32;
+            assert_eq!(intact[at..at + 32], id.0, "the entry starts with its id");
+            assert_eq!(intact[at + 32..at + ENTRY_HEAD], stated.to_be_bytes(), "then states its encoding's length");
+            let lies = [stated + 1, stated - 1, stated + 4, stated - 4, stated + 36, stated - 36, 0, u32::MAX, stated ^ (1 << 24)];
+            for k in 0..lies.len() + 2 {
+                let mut bytes = intact.clone();
+                match lies.get(k) {
+                    Some(lie) => bytes[at + 32..at + ENTRY_HEAD].copy_from_slice(&lie.to_be_bytes()),
+                    None if k == lies.len() => bytes[at] ^= 1,
+                    None => bytes[at + 31] ^= 0x80,
+                }
+                std::fs::write(&path, &bytes).unwrap();
+                let answered = reads_answer_their_own_objects(dir.path(), &name, &index, &objs, &format!("entry {i}, damage {k}")).await;
+                assert_eq!(answered, (n - 1) * 9, "entry {i}, damage {k}: the damaged entry's every read refuses, every other object's answers");
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, n * 11);
+        // A pack written before cycle 4.
+        let v2 = veilpack2(&objs);
+        assert!(crate::pack::parse_index(&v2, Some(v2.len() as u64)).is_err(), "veilpack2 is not a pack to this reader");
+        std::fs::write(&path, &v2).unwrap();
+        let o = Objects::new(Arc::new(FsStore::new(dir.path())), 64 << 20);
+        o.listed(1, vec![(name.clone(), None)]);
+        for (id, _, _) in &objs {
+            assert!(o.get(1, id).await.is_err(), "a whole read of a veilpack2 entry is refused");
+            assert!(o.get_encoded(1, id).await.is_err(), "an encoded read too");
+            assert!(o.get_range(1, id, 0, u64::MAX).await.is_err(), "a ranged read too");
+            assert!(o.exists(1, id).await.is_err(), "and the lookup itself");
+        }
+        let mut relabelled = v2.clone();
+        relabelled[..crate::pack::MAGIC.len()].copy_from_slice(crate::pack::MAGIC);
+        std::fs::write(&path, &relabelled).unwrap();
+        let old = Arc::new(crate::pack::parse_index(&relabelled, Some(relabelled.len() as u64)).expect("the old layout tiles its pack"));
+        assert_eq!(old.len(), n);
+        assert_eq!(reads_answer_their_own_objects(dir.path(), &name, &old, &objs, "veilpack2 relabelled").await, 0, "no read of an entry without its length answers");
+    }
+
+    /// BUG-1622 (review s28r4): a read that finds no share of the bound on
+    /// pack indexes free within 10 s is to be answered 503 `busy` ("try
+    /// again", `HUB.md` §13.20; `error.rs` maps `IndexesFull` so), but every
+    /// read through `sync::Source` (a push's checks, projections for tips,
+    /// history and the query API, the deriver) turns the store's error into
+    /// text (`VeilError::Repo(format!("object store: {e}"))`), so the answer
+    /// is 500 `internal`, which `vl` does not try again. Here the bound is
+    /// held whole (by other requests' indexes) and a listed pack's index is
+    /// not loaded: `Source::raw` of an object in it is refused, as it must
+    /// be, and the refusal is answered 500.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "BUG-1622: an object read through sync::Source that finds the bound on pack indexes full is answered 500 internal, not 503 busy"]
+    async fn bug_1622_a_full_bound_on_indexes_is_answered_busy_through_every_reader() {
+        use axum::response::IntoResponse;
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let objects = Arc::new(Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20));
+        let raw = Bytes::from_static(b"veil:blob\nMARKER-READ-WHEN-THE-BOUND-IS-FULL-5c1e");
+        let id = ObjectId::hash(&raw);
+        let (name, held) = objects.put_pack(1, 7, vec![(id, encode(raw.clone()))]).await.unwrap();
+        drop(held);
+        // Listed, its index read when a lookup needs it.
+        objects.listed(1, vec![(name, None)]);
+        let db = crate::db::connect_lazy("postgres://veil@127.0.0.1:9/none", 1).unwrap();
+        let hub = Arc::new(crate::Hub {
+            db: db.clone(),
+            objects: objects.clone(),
+            trees: LruCache::new(1 << 20),
+            identity: veil_core::Identity::generate("hub"),
+            receipt_key: [0; 32],
+            grants: crate::grant::Grants::load(data.path()).unwrap(),
+            cache_token: crate::cache::feed::load_token(data.path()).unwrap(),
+            session_ttl_ms: 0,
+            certificate: rustls::pki_types::CertificateDer::from(Vec::new()),
+            caches: Default::default(),
+            derive: crate::derive::Workers::new(db),
+            query: Default::default(),
+        });
+        let bound = objects.packs.bound();
+        let _held = (bound.take(crate::pack::INDEXES_HELD as u64).await.unwrap(), bound.take(bound.available() as u64).await.unwrap());
+        assert_eq!(bound.available(), 0, "every share held");
+        let src = crate::sync::Source { hub: hub.clone(), project: 1, rt: tokio::runtime::Handle::current(), pending: Default::default(), staged: None };
+        let got = tokio::task::spawn_blocking(move || src.raw(&id)).await.unwrap();
+        let e = got.expect_err("no share of the bound: the read is refused");
+        let status = crate::error::Error::from(e).into_response().status();
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "a read refused for want of a share of the bound on indexes is answered {status}");
+    }
 }
