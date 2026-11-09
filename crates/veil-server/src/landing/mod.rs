@@ -104,6 +104,20 @@ pub struct Queued {
     /// The branch's lineage the stack was judged under: it lands only under
     /// that one (BUG-1300).
     pub lineage: i64,
+    /// Changes of the line left out as landed already with the same edits
+    /// (`Judged::skipped`; not stored): the submit's answer names them.
+    pub skipped: Arc<Mutex<Vec<ObjectId>>>,
+}
+
+/// What an answer says of the changes a stack left out as landed already
+/// with the same edits: never silent.
+pub async fn skipped_warnings(hub: &Arc<Hub>, project: i64, branch: &str, skipped: &[ObjectId]) -> Result<Vec<String>> {
+    if skipped.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = skipped.to_vec();
+    let cids = crate::sync::blocking(hub, project, move |src| ids.iter().map(|x| Ok(src.snapshot(x)?.change_id.to_string())).collect::<Result<Vec<_>>>()).await?;
+    Ok(cids.into_iter().map(|c| format!("change {c} already landed on '{branch}' with the same edits: not landed again")).collect())
 }
 
 /// A new random ticket.
@@ -515,6 +529,7 @@ pub async fn submit(
                 branch: req.onto.clone(),
                 stack: Vec::new(),
                 lineage: 0,
+                skipped: Default::default(),
             };
             let w = hub.landing.register(&q.ticket);
             let change = ChangeRequest {
@@ -541,6 +556,8 @@ pub async fn submit(
                 }
             };
             r.change_id = Some(made.change_id);
+            let skipped = q.skipped.lock().unwrap().clone();
+            r.warnings.extend(skipped_warnings(hub, project.id, &q.branch, &skipped).await?);
             seen(hub, project, viewer, r).await
         }
         _ => Err(Error::bad_request("a landing names either an uploaded `snapshot`, or `edits` on a `base`")),
@@ -560,6 +577,10 @@ pub const NOTHING_TO_LAND: &str =
 pub const WALK_BUDGET: usize = 4_096;
 /// Most frontier snapshots of that walk the derived graph is asked about.
 const FRONTIER_LIMIT: usize = 64;
+/// Most snapshots of a landed revision's history (it, what it was made
+/// from, theirs) `Ancestry::landed` projects to relate it to a change.
+const RELATED_LIMIT: usize = 16;
+
 /// Whether a change of a stack landed already ([`Ancestry::landed`]).
 #[derive(Clone, Copy, PartialEq)]
 enum Landed {
@@ -576,6 +597,9 @@ pub struct Judged {
     pub stack: Vec<Entry>,
     pub lineage: i64,
     pub branch: bool,
+    /// Changes of the line landed already with the same edits, left out
+    /// (real ids): the answer names them, never silent.
+    pub skipped: Vec<ObjectId>,
 }
 
 /// How far the walk down from the tip reads while the line is read (a base
@@ -643,12 +667,14 @@ pub async fn stack(
         .bind(branch)
         .fetch_optional(&hub.db)
         .await?;
-    let Some((tip, lineage)) = row else { return Ok(Ok(Judged { stack: Vec::new(), lineage: 0, branch: false })) };
+    let Some((tip, lineage)) = row else { return Ok(Ok(Judged { stack: Vec::new(), lineage: 0, branch: false, skipped: Vec::new() })) };
     let tip = ObjectId::from_hex(&tip).map_err(|e| Error::Other(e.into()))?;
     let mut anc = Ancestry::new(hub.clone(), pid, branch, tip, lineage);
     let too_many = || Ok(Err(format!("more than {max} changes between the branch's tip and this one: land them in parts, or have an admin push with --force")));
     let key = (!viewer.admin).then(|| project.view(viewer).key());
     let mut line: Vec<Link> = Vec::new();
+    // Changes landed already with the same edits, left out (and said so).
+    let mut skipped: Vec<ObjectId> = Vec::new();
     let (mut seen, mut hidden, mut kept) = (0usize, 0usize, 0usize);
     let mut reached_tip = false;
     let mut floor = root;
@@ -726,17 +752,12 @@ pub async fn stack(
                 }
             }
         }
-        let landed = match anc.landed(x, held).await? {
-            Landed::No => false,
-            Landed::Same => true,
-            Landed::Other => {
-                return Ok(Err(format!(
-                    "this change already landed on '{branch}' with other edits: make a new change for the further edits"
-                )))
-            }
-        };
-        let lands = !landed
-            && (!held || viewer.admin || {
+        // Theirs to land: a change seen whole (their own, or held and seen
+        // whole); one seen in part or hidden is left out, and is never
+        // judged as landed by edits they cannot see (BUG-1526).
+        let whole = !held
+            || viewer.admin
+            || {
                 let c = match (class, ends) {
                     (Some(c), None) => c,
                     _ => match classify(hub, project, viewer, x, ends.unwrap_or(parents[0])).await? {
@@ -745,7 +766,21 @@ pub async fn stack(
                     },
                 };
                 matches!(c, Class::Whole)
-            });
+            };
+        let landed = whole
+            && match anc.landed(project, viewer, x, held).await? {
+                Landed::No => false,
+                Landed::Same => {
+                    skipped.push(x);
+                    true
+                }
+                Landed::Other => {
+                    return Ok(Err(format!(
+                        "this change already landed on '{branch}' with other edits: make a new change for the further edits"
+                    )))
+                }
+            };
+        let lands = whole && !landed;
         if lands {
             kept += 1;
             if kept > max && !line.iter().any(|l| l.unknown) && !unknown {
@@ -782,7 +817,7 @@ pub async fn stack(
         stack.push(Entry::plain(id, base));
         base = id;
     }
-    Ok(Ok(Judged { stack, lineage, branch: true }))
+    Ok(Ok(Judged { stack, lineage, branch: true, skipped }))
 }
 
 /// What held change `x` is to `viewer`: its own edits against `against`
@@ -938,7 +973,7 @@ impl Ancestry {
     /// told). `Same`: its own edits are among the landed revision's (the
     /// same change, or rebased on a tip that holds it: skip it); `Other`:
     /// it brings further edits (refused: they are a new change's).
-    async fn landed(&mut self, x: ObjectId, held: bool) -> Result<Landed> {
+    async fn landed(&mut self, project: &crate::perm::Project, viewer: &crate::perm::Viewer, x: ObjectId, held: bool) -> Result<Landed> {
         let n: Option<i32> = if !held {
             None
         } else {
@@ -965,6 +1000,37 @@ impl Ancestry {
         let Some(r) = row.and_then(|r| ObjectId::from_hex(&r).ok()) else { return Ok(Landed::No) };
         if r == x {
             return Ok(Landed::Same);
+        }
+        // A change id is the client's choice: the landing counts only for a
+        // change whose revisions it belongs to (BUG-1527): it, or what it was
+        // made from, is the change or one of its recorded predecessors, as the
+        // submitter names them.
+        let (mine, theirs) = crate::sync::blocking(&self.hub, self.project, move |src| {
+            let s = src.snapshot(&x)?;
+            let mut mine: std::collections::HashSet<ObjectId> = s.predecessors.iter().copied().collect();
+            mine.insert(x);
+            let rs = src.snapshot(&r)?;
+            let mut theirs = vec![r];
+            for p in &rs.predecessors {
+                theirs.push(*p);
+                if let Ok(ps) = src.snapshot(p) {
+                    theirs.extend(ps.predecessors.iter().copied());
+                }
+            }
+            Ok((mine, theirs))
+        })
+        .await?;
+        let mut related = theirs.iter().any(|t| mine.contains(t));
+        if !related {
+            for t in theirs.iter().take(RELATED_LIMIT) {
+                if mine.contains(&crate::sync::projected(&self.hub, project, viewer, *t).await?) {
+                    related = true;
+                    break;
+                }
+            }
+        }
+        if !related {
+            return Ok(Landed::No);
         }
         if !self.has(r).await? {
             return Ok(Landed::No);

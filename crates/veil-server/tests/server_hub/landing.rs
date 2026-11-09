@@ -3874,7 +3874,6 @@ fn a_landing_on_a_name_two_lines_share_lands_the_same_whichever_is_lower() {
 /// The project's billing folder (finance only) is made after its access
 /// line, so the dev sees main's first snapshot whole.
 #[test]
-#[ignore = "BUG-1525: a push on a tip the pusher sees whole, under a hidden-only change at the branch's tip, is grafted below the tip and refused"]
 fn bug_1525_a_push_on_main_as_seen_whole_is_made_on_main_s_tip_over_a_hidden_only_change() {
     let hub = TestHub::start();
     let admin = hub.person("admin");
@@ -3922,7 +3921,6 @@ fn bug_1525_a_push_on_main_as_seen_whole_is_made_on_main_s_tip_over_a_hidden_onl
 /// file it lands. The answer tells the dev whether hidden content of a
 /// revision changed, and blocks their landing on edits they cannot see.
 #[test]
-#[ignore = "BUG-1526: a landing is refused for hidden edits of a change its submitter sees only in part (already landed with other edits)"]
 fn bug_1526_already_landed_never_judges_a_change_by_edits_its_submitter_cannot_see() {
     let mut answers = Vec::new();
     for extra in [false, true] {
@@ -3973,7 +3971,6 @@ fn bug_1526_already_landed_never_judges_a_change_by_edits_its_submitter_cannot_s
 /// refused ("already landed … with other edits"), though nothing of V is
 /// on main: fin blocks a change they may not write.
 #[test]
-#[ignore = "BUG-1527: a change landed under another person's change id makes their change unlandable (already landed with other edits)"]
 fn bug_1527_a_change_landed_under_someone_else_s_change_id_never_blocks_theirs() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -4050,4 +4047,35 @@ fn a_push_on_a_snapshot_uploaded_by_someone_else_is_answered_as_one_that_does_no
         assert!(!api.tips(Some(&d.token), &p.name).unwrap().branches.contains_key("on-f"));
     }
     assert_eq!(answers[0], answers[1]);
+}
+
+/// Never silent: a change left out of a stack as landed already (its edits
+/// the landed revision's: here P rebased on main, which holds P) is named in
+/// the answer, by its change id.
+#[test]
+fn a_change_left_out_as_landed_already_is_named_in_the_answer() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let first = push_chain(&api, &p.dev, &p.name, "dev-work", "main", 1, Some("src/once"));
+    let v = land_held(&api, &token, &p.name, first, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    let cid = source(&hub, pid).snapshot(&real_tip(&hub, pid)).unwrap().change_id;
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    let tip = c.tip;
+    let p2 = snap_at(&mut c, tip, cid, "P, rebased", veil_core::now_millis(), vec![first]);
+    c.file("src/twice/0.rs", "0\n");
+    let q2 = crafted_on(&mut c, p2, veil_core::ChangeId::random(), "q", "");
+    let r = push_new(&c, &[("rebased", q2)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let v = land_held(&api, &token, &p.name, q2, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_eq!(v["landed"].as_array().unwrap().len(), 1, "{v}");
+    let warnings = v["warnings"].as_array().cloned().unwrap_or_default();
+    assert!(
+        warnings.iter().any(|w| w.as_str().is_some_and(|w| w.contains(&cid.to_string()) && w.contains("already landed"))),
+        "the change left out is not named: {v}"
+    );
 }

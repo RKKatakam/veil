@@ -945,7 +945,10 @@ pub(crate) async fn create_with(
         if let Some((_, q)) = land.as_mut() {
             let fresh = HashMap::from([(built.real, vec![parent])]);
             (q.stack, q.lineage) = match crate::landing::stack(hub, &who.project, &who.viewer, &q.branch, built.real, &fresh).await? {
-                Ok(j) if j.branch => (j.stack, j.lineage),
+                Ok(j) if j.branch => {
+                    *q.skipped.lock().unwrap() = j.skipped;
+                    (j.stack, j.lineage)
+                }
                 // No branch: the service answers so.
                 Ok(_) => (vec![crate::landing::Entry::plain(built.real, parent)], 0),
                 Err(why) => return Err(bad(why)),

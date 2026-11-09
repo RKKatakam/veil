@@ -2506,19 +2506,26 @@ for them):
   one; of that view's memos with that projection, the one that did not
   collapse into its parent's: one row of a partial index, however long the
   run, BUG-1468), counting toward nothing (BUG-1409).
-* **"Already landed" is asked by change id** (BUG-1408, BUG-1465, BUG-1466,
-  BUG-1522): a `landings` row is a fast path whose absence means nothing;
+* **"Already landed" is asked by change id, of changes the submitter sees
+  whole** (BUG-1408, BUG-1465, BUG-1466, BUG-1522, BUG-1526; one seen in part
+  is left out, never judged by edits they cannot see): a `landings` row is a
+  fast path whose absence means nothing;
   the question is the branch's record of its changes in its lineage
   (`landed_changes`: one row per change landed there, written by every
   route that moves a branch, the landing service, a push of new snapshots
   and an API commit `onto`; one lookup no bound limits), the landed
   revision then asked of the bounded ancestry below (yes, no, or
-  `warming`; never "no" from a truncated search). A rebase keeps the change
-  id, not the snapshot: a revision whose edits are all the landed
+  `warming`; never "no" from a truncated search). A change id is the
+  client's choice, so a row counts only for a change whose revisions the
+  landing belongs to: the landed revision, or what it was made from, is the
+  change or one of its recorded predecessors, as the submitter names them
+  (BUG-1527). A rebase keeps the change id, not the snapshot: a revision whose edits are all the landed
   revision's (the same change, or one rebased on a tip that holds it) is
   skipped; one that brings further edits is refused ("this change already
   landed … with other edits: make a new change for the further edits"),
-  never applied again.
+  never applied again. The answer names every change left out as landed
+  already ("change … already landed on … with the same edits: not landed
+  again"): never silent.
 * At most 64 changes the submitter sees land, counted as they are found;
   at most 4,096 they see are read, then `warming`; changes they cannot see
   count toward neither.
@@ -2561,10 +2568,12 @@ its own last one costs the branch's row and one `landings` lookup.
 BUG-1467, BUG-1520, BUG-1521): several changes hidden from a viewer can
 share one projection. **One resolution for every route** (`sync::resolve_for`:
 an API commit's `base`, a push's parents, a landing's), each answer checked
-to project to the name for its caller: committed history named by its own
-id, if they see it so; else the tip of the branch the change goes to (a
-push's branches, an API commit's `onto` or the landing's branch), then the
-default branch's, that they see as the name; else, of their own view's
+to project to the name for its caller: the tip of the branch the change
+goes to (a push's branches, an API commit's `onto` or the landing's
+branch), then the default branch's, that they see as the name (also when
+the name is a snapshot they see whole under a change hidden from them at
+the tip, BUG-1525); else committed history named by its own id, if they see
+it so; else, of their own view's
 real snapshots with that projection (never another view's, never by when a
 memo was stored), the newest when they are one line, and when lines
 diverge (two branches' hidden work on one change they see) or there are

@@ -512,10 +512,11 @@ async fn resolve_stored(hub: &Hub, project: i64, id: &ObjectId) -> Result<Vec<Ob
 /// last): **one resolution for every route** (BUG-1467, BUG-1520), each
 /// answer checked to project to `id` for them now.
 ///
-/// 1. Committed history named by its own id: itself, if they see it so.
-/// 2. The tip of one of `branches`, in that order, then of the default
+/// 1. The tip of one of `branches`, in that order, then of the default
 ///    branch, that they see as `id`: the change goes there, so it is made
-///    on what is there.
+///    on what is there (even when `id` is itself committed history they see
+///    whole, below a change hidden from them at the tip: BUG-1525).
+/// 2. Committed history named by its own id: itself, if they see it so.
 /// 3. Of their own view's real snapshots with that projection (changes
 ///    hidden from them share one; never another view's, never by when a
 ///    memo was stored): when they are one line (one of them is no other's
@@ -546,9 +547,6 @@ pub(crate) async fn resolve_for(
         return Ok(Some(*id));
     }
     let seen = |r: ObjectId| async move { Ok::<bool, Error>(projected(hub, project, viewer, r).await? == *id) };
-    if committed(hub, project.id, id).await? {
-        return Ok(seen(*id).await?.then_some(*id));
-    }
     let mut names: Vec<&str> = branches.to_vec();
     names.push(&project.default_branch);
     let tips: Vec<(String, String)> = sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 AND name = ANY($2)")
@@ -562,6 +560,11 @@ pub(crate) async fn resolve_for(
                 return Ok(Some(t));
             }
         }
+    }
+    // Committed history named by its own id (after the tips: a snapshot
+    // they see whole under a change hidden from them at the tip, BUG-1525).
+    if committed(hub, project.id, id).await? {
+        return Ok(seen(*id).await?.then_some(*id));
     }
     let key = project.view(viewer).key();
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
@@ -1688,6 +1691,7 @@ pub(crate) async fn push_with(
                 branch: u.branch.clone(),
                 stack: judged.stack,
                 lineage: judged.lineage,
+                skipped: Arc::new(std::sync::Mutex::new(judged.skipped)),
             });
             continue;
         }
@@ -1964,7 +1968,7 @@ pub(crate) async fn push_with(
     let mut landings = Vec::new();
     for (q, w) in queued.iter().zip(waiters) {
         crate::landing::ensure(hub, project.id, &q.branch);
-        landings.push(match wait {
+        let mut r = match wait {
             true => {
                 let r = crate::landing::wait(hub, project.id, person, &q.branch, w, deadline).await?;
                 crate::landing::seen(hub, project, viewer, r).await?
@@ -1973,7 +1977,10 @@ pub(crate) async fn push_with(
                 crate::landing::abandon(hub, w);
                 crate::landing::queued(&q.ticket)
             }
-        });
+        };
+        let skipped = q.skipped.lock().unwrap().clone();
+        r.warnings.extend(crate::landing::skipped_warnings(hub, project.id, &q.branch, &skipped).await?);
+        landings.push(r);
     }
     if !moved.is_empty() {
         hub.caches.tips_changed(project.id);
