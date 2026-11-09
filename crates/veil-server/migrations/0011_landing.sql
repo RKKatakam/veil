@@ -123,11 +123,13 @@ CREATE INDEX IF NOT EXISTS projections_own ON projections (project_id, view_key,
 -- Each change landed on a branch, by its change id and author (the person
 -- whose signature is on the change), within the branch's lineage then, and
 -- the snapshot it is there as (BUG-1522, BUG-1527, BUG-1547, BUG-1548,
--- BUG-1579, BUG-1580): written by every route that moves a branch (the
--- landing service, a push of new snapshots, an API commit `onto`).
+-- BUG-1579, BUG-1580, BUG-1581): written by every route that moves a branch
+-- (the landing service, a push of new snapshots, an API commit `onto`).
 -- "Already landed" asks by change id and author, whatever its submitted
 -- snapshot or predecessors, in one lookup no bound limits (BUG-1521).
 -- Kept as `snapshots`.
+ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS author BIGINT NOT NULL DEFAULT 0;
+
 CREATE TABLE IF NOT EXISTS landed_changes (
     project_id BIGINT NOT NULL REFERENCES projects(id),
     branch TEXT NOT NULL,

@@ -511,6 +511,12 @@ async fn run_worker(hub: &Arc<Hub>, job: Job) -> Result<()> {
             change_id,
         } => {
             sync::put_all(hub, job.project, objects).await?;
+            let empty_fresh = HashMap::new();
+            let mut snap_authors = Vec::with_capacity(origins.len());
+            for (_, o) in &origins {
+                let a = super::snapshot_author(hub, job.project, *o, &empty_fresh).await?.unwrap_or(job.person.id);
+                snap_authors.push(a);
+            }
             let snap_hex: Vec<String> = snapshots.iter().map(ObjectId::hex).collect();
             let orig_real: Vec<String> = origins.iter().map(|(r, _)| r.hex()).collect();
             let orig_src: Vec<String> = origins.iter().map(|(_, o)| o.hex()).collect();
@@ -520,8 +526,9 @@ async fn run_worker(hub: &Arc<Hub>, job: Job) -> Result<()> {
             let seq = job.seq;
             let max_merges = i64::from(MAX_MERGES);
             let new_merges: Option<i64> = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-                let (snap_hex, orig_real, orig_src, encoded, branch) = (
+                let (snap_hex, snap_authors, orig_real, orig_src, encoded, branch) = (
                     snap_hex.clone(),
+                    snap_authors.clone(),
                     orig_real.clone(),
                     orig_src.clone(),
                     encoded.clone(),
@@ -529,11 +536,15 @@ async fn run_worker(hub: &Arc<Hub>, job: Job) -> Result<()> {
                 );
                 Box::pin(async move {
                     if !snap_hex.is_empty() {
-                        sqlx::query("INSERT INTO snapshots (project_id, id) SELECT $1, unnest($2::TEXT[]) ON CONFLICT DO NOTHING")
-                            .bind(pid)
-                            .bind(&snap_hex)
-                            .execute(&mut *c)
-                            .await?;
+                        sqlx::query(
+                            "INSERT INTO snapshots (project_id, id, author) SELECT $1, s, a FROM unnest($2::TEXT[], $3::BIGINT[]) AS v(s, a) \
+                             ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0",
+                        )
+                        .bind(pid)
+                        .bind(&snap_hex)
+                        .bind(&snap_authors)
+                        .execute(&mut *c)
+                        .await?;
                     }
                     if !orig_real.is_empty() {
                         sqlx::query(

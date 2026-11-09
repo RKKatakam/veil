@@ -288,6 +288,7 @@ pub async fn open(
         }
     }
 
+    crate::limits::leave_gates();
     let body = StreamBody {
         hub: hub.clone(),
         sub,

@@ -180,66 +180,51 @@ pub async fn record_changes(
     Ok(())
 }
 
-/// The person (`people.id`) whose signature is on change `x` (or on what the
-/// server made `x` from: its `origins` row from a partial-view push, its
-/// submitted snapshot when the landing service built `x`, or its `change_refs`
-/// creator for an API commit).
+/// The person (`people.id`) whose change `x` is: recorded in `snapshots`
+/// by `x`'s own id whenever the server commits a snapshot (a push, an API
+/// commit, the landing service, BUG-1581; `fresh` before the commit), or
+/// from `x`'s own device signature (or its `origins` row's). Answered in
+/// one lookup with no bound, and never by change id alone.
 pub(crate) async fn snapshot_author(
     hub: &Arc<Hub>,
     project: i64,
     x: ObjectId,
     fresh: &HashMap<ObjectId, (Vec<ObjectId>, i64)>,
 ) -> Result<Option<i64>> {
-    let mut cur = x;
-    let server_key = hub.identity.verifying_hex();
-    for _ in 0..4 {
-        if let Some((_, a)) = fresh.get(&cur) {
-            return Ok(Some(*a));
-        }
-        let y = cur;
-        let (cid, key, pred) = crate::sync::blocking(hub, project, move |src| {
-            let s = src.snapshot(&y)?;
-            Ok((
-                s.change_id.to_string(),
-                s.signature.as_ref().map(|g| g.key.clone()),
-                s.predecessors.first().copied(),
-            ))
-        })
+    if let Some((_, a)) = fresh.get(&x) {
+        return Ok(Some(*a));
+    }
+    let a: Option<i64> = sqlx::query_scalar("SELECT author FROM snapshots WHERE project_id = $1 AND id = $2 AND author <> 0")
+        .bind(project)
+        .bind(x.hex())
+        .fetch_optional(&hub.db)
         .await?;
-        let Some(k) = key else { return Ok(None) };
-        if k != server_key {
+    if a.is_some() {
+        return Ok(a);
+    }
+    let server_key = hub.identity.verifying_hex();
+    let key = crate::sync::blocking(hub, project, move |src| Ok(src.snapshot(&x)?.signature.as_ref().map(|g| g.key.clone()))).await?;
+    let Some(k) = key else { return Ok(None) };
+    if k != server_key {
+        let p: Option<i64> = sqlx::query_scalar("SELECT person_id FROM devices WHERE signing_key = $1")
+            .bind(&k)
+            .fetch_optional(&hub.db)
+            .await?;
+        return Ok(p);
+    }
+    let orig: Option<String> = sqlx::query_scalar("SELECT origin_id FROM origins WHERE project_id = $1 AND real_id = $2")
+        .bind(project)
+        .bind(x.hex())
+        .fetch_optional(&hub.db)
+        .await?;
+    if let Some(orig) = orig.and_then(|o| ObjectId::from_hex(&o).ok()) {
+        let okey = crate::sync::blocking(hub, project, move |src| Ok(src.snapshot(&orig)?.signature.as_ref().map(|g| g.key.clone()))).await?;
+        if let Some(ok) = okey {
             let p: Option<i64> = sqlx::query_scalar("SELECT person_id FROM devices WHERE signing_key = $1")
-                .bind(&k)
+                .bind(&ok)
                 .fetch_optional(&hub.db)
                 .await?;
             return Ok(p);
-        }
-        let orig: Option<String> = sqlx::query_scalar("SELECT origin_id FROM origins WHERE project_id = $1 AND real_id = $2")
-            .bind(project)
-            .bind(cur.hex())
-            .fetch_optional(&hub.db)
-            .await?;
-        if let Some(orig) = orig.and_then(|o| ObjectId::from_hex(&o).ok()) {
-            let okey = crate::sync::blocking(hub, project, move |src| Ok(src.snapshot(&orig)?.signature.as_ref().map(|g| g.key.clone()))).await?;
-            if let Some(ok) = okey {
-                let p: Option<i64> = sqlx::query_scalar("SELECT person_id FROM devices WHERE signing_key = $1")
-                    .bind(&ok)
-                    .fetch_optional(&hub.db)
-                    .await?;
-                return Ok(p);
-            }
-        }
-        let by: Option<i64> = sqlx::query_scalar("SELECT created_by FROM change_refs WHERE project_id = $1 AND change_id = $2")
-            .bind(project)
-            .bind(&cid)
-            .fetch_optional(&hub.db)
-            .await?;
-        if by.is_some() {
-            return Ok(by);
-        }
-        match pred {
-            Some(p) if p != cur => cur = p,
-            _ => break,
         }
     }
     Ok(None)
@@ -340,6 +325,10 @@ impl Default for Services {
         }
     }
 }
+
+/// Most landings waiting for their outcome on one server at once (they hold
+/// no bulkhead place while they wait, BUG-1635); the rest answer at once.
+pub const MAX_WAITING: usize = 10_000;
 
 /// A submitter's wait for its ticket, registered before the submit commits
 /// so that the outcome is never missed.
@@ -527,8 +516,20 @@ pub fn queued(ticket: &str) -> LandResult {
 /// the branch finished since it last looked, in one statement (every
 /// 250 ms while another server runs the branch's service, every 5 s as a
 /// fallback while this one does): its cost follows the landings, never the
-/// number of waiters (BUG-1108).
+/// number of waiters (BUG-1108). Gives the request's bulkhead places back
+/// before waiting (BUG-1635), so the waiters here are bounded by
+/// [`MAX_WAITING`] instead: past it, the answer is the row as it is now
+/// (`queued` and its ticket, for `vl land --status`), without a wait.
 pub async fn wait(hub: &Arc<Hub>, project: i64, person: i64, branch: &str, mut w: Waiter, deadline: tokio::time::Instant) -> Result<LandResult> {
+    if hub.landing.waiters.lock().unwrap().len() > MAX_WAITING {
+        let out = match read(hub, project, person, &w.ticket).await? {
+            Some((_, r)) => r,
+            None => queued(&w.ticket),
+        };
+        hub.landing.forget(&w.ticket);
+        return Ok(out);
+    }
+    crate::limits::leave_gates();
     if let Some(e) = hub.landing.waiters.lock().unwrap().get_mut(&w.ticket) {
         e.1 = Some((project, branch.to_string()));
     }
@@ -539,7 +540,6 @@ pub async fn wait(hub: &Arc<Hub>, project: i64, person: i64, branch: &str, mut w
         }
     }
     poll(hub, project, branch);
-    crate::limits::release_places();
     let out = match tokio::time::timeout_at(deadline, &mut w.rx).await {
         Ok(Ok(r)) => r,
         // The deadline: the row as it is now.

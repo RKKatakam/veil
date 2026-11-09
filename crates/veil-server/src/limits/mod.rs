@@ -215,6 +215,22 @@ impl Limits {
 /// The longest one derive run waits for the server to stop shedding.
 pub const DERIVE_PAUSE: Duration = Duration::from_secs(10);
 
+tokio::task_local! {
+    /// The bulkhead places held by the request being served: dropped when
+    /// the route answers, or sooner ([`leave_gates`]) before a wait for
+    /// something other than the request's own work (BUG-1635).
+    static PLACES: std::cell::RefCell<Option<(Option<gate::Place>, gate::Place)>>;
+}
+
+/// Give back the bulkhead places of the request being served before it
+/// waits for something other than its own work (a landing's outcome, a
+/// ticket, BUG-1635; nothing outside a request).
+pub fn leave_gates() {
+    let _ = PLACES.try_with(|p| {
+        p.borrow_mut().take();
+    });
+}
+
 /// `s` percent-decoded, as the routes' `Path` decodes it; `None` if it does
 /// not decode to UTF-8.
 fn decoded(s: &str) -> Option<String> {
@@ -508,18 +524,6 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
     c.permission_misses = layers.permission_misses;
     record(&hub, c);
     resp
-}
-
-tokio::task_local! {
-    static PLACES: std::cell::RefCell<Option<(Option<gate::Place>, gate::Place)>>;
-}
-
-/// Release this request's bulkhead places once its database and object-store
-/// work is done and it only waits on a channel (e.g. `landing::wait`).
-pub fn release_places() {
-    let _ = PLACES.try_with(|c| {
-        let _ = c.borrow_mut().take();
-    });
 }
 
 #[cfg(test)]

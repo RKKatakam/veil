@@ -4680,6 +4680,360 @@ fn a_change_by_one_author_never_lands_twice_across_devices_or_submitters_and_ign
     assert!(body.contains(&cid.to_string()) && body.contains("already landed"), "{body}");
 }
 
+
+/// Land a snapshot the server already holds onto `branch`.
+fn land_held_onto(api: &Api, token: &str, project: &str, branch: &str, snapshot: ObjectId) -> Reply {
+    api.post_json(
+        Some(token),
+        &format!("/v1/projects/{project}/land"),
+        &json!({"onto": branch, "snapshot": snapshot.hex(), "receipts": {}, "wait": true}),
+    )
+}
+
+/// BUG-1581 (BUG-1527's class, another route): `snapshot_author` takes the
+/// author of a server-signed snapshot with no `origins` row from
+/// `change_refs` by its change id alone, before the snapshot it was made
+/// from. Every snapshot the landing service lands is server-signed (made
+/// from the submitted one, `predecessors: [submitted]`), so fin's change
+/// landed under the change id of the dev's API change counts, re-landed on
+/// another branch, as the dev's: the dev's change is then refused there
+/// ("already landed … make a new change"), though nothing of it is there.
+#[test]
+fn bug_1581_a_squat_landed_by_the_service_never_counts_as_the_api_change_whose_change_id_it_takes() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    // `release`, cut at main.
+    let a = Craft::new(&api, &p.admin, &p.name, "main");
+    push_new_branches(&a, &[("release".into(), a.tip)]);
+    // The dev's change V, made through the API (an agent's), kept on no branch.
+    let dev_main0 = Craft::new(&api, &p.dev, &p.name, "main").tip;
+    let r = api.post_json(
+        Some(&p.dev.token()),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({"base": dev_main0.hex(), "edits": [put("src/v.rs", "the dev's\n")]}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+    let cid = source(&hub, pid).snapshot(&real_of_seen(&hub, pid, v)).unwrap().change_id;
+    // fin lands a billing-only change S under V's change id on main: the
+    // service makes S' (server-signed) of it.
+    let mut f = Craft::new(&api, &p.fin, &p.name, "main");
+    let on = f.tip;
+    f.file(&format!("{BILL_DIR}/acme/s.txt"), "fin's\n");
+    let s = snap_at(&mut f, on, cid, "not V", veil_core::now_millis(), vec![]);
+    let r = push_new(&f, &[("s", s)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let w = land_held(&api, &p.fin.token(), &p.name, s, true).json();
+    assert_eq!(w["state"], "landed", "{w}");
+    // fin lands S' (main's tip) onto release.
+    let s_seen = Craft::new(&api, &p.fin, &p.name, "main").tip;
+    let r = land_held_onto(&api, &p.fin.token(), &p.name, "release", s_seen);
+    assert_eq!(r.json()["state"], "landed", "{}", String::from_utf8_lossy(&r.body));
+    // The dev lands V onto release: nothing of V is there, so it lands.
+    let r = land_held_onto(&api, &p.dev.token(), &p.name, "release", v);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+}
+
+/// BUG-1581: a change re-landed by the service across five branches (five
+/// server-signed hops from the original snapshot) keeps its author at every
+/// hop (`snapshots.author`, read in one lookup with no bound), so on the
+/// fifth branch a revision with further edits is refused and one with the
+/// same edits is skipped, never landing twice.
+#[test]
+fn a_change_relanded_across_five_branches_keeps_its_author_and_never_lands_twice() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let a = Craft::new(&api, &p.admin, &p.name, "main");
+    let branches = ["b1", "b2", "b3", "b4", "b5"];
+    let init: Vec<(String, ObjectId)> = branches.iter().map(|b| ((*b).to_string(), a.tip)).collect();
+    push_new_branches(&a, &init);
+
+    // The dev lands change C on main, then re-lands each landed snapshot
+    // onto the next branch: main -> b1 -> b2 -> b3 -> b4 -> b5.
+    let on = Craft::new(&api, &p.dev, &p.name, "main").tip;
+    let w = land(&api, &token, &p.name, on, json!([put("src/five.rs", "five\n")]), true).json();
+    assert_eq!(w["state"], "landed", "{w}");
+    let cid = source(&hub, pid).snapshot(&real_tip(&hub, pid)).unwrap().change_id;
+    let mut from = "main";
+    for b in branches {
+        let seen = Craft::new(&api, &p.dev, &p.name, from).tip;
+        let r = land_held_onto(&api, &token, &p.name, b, seen);
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        assert_eq!(r.status, 200, "{b}: {body}");
+        assert_eq!(r.json()["state"], "landed", "{b}: {body}");
+        from = b;
+    }
+
+    // On b5, the landed snapshot's author is the dev, and `landed_changes`
+    // recorded it for b5.
+    let b5_real = Craft::new(&api, &p.admin, &p.name, "b5").tip;
+    let dev_id: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&p.dev.name).fetch_one(&hub.hub().db))
+        .unwrap();
+    let recorded_author: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT author FROM snapshots WHERE project_id = $1 AND id = $2")
+                .bind(pid)
+                .bind(b5_real.hex())
+                .fetch_one(&hub.hub().db),
+        )
+        .unwrap();
+    assert_eq!(recorded_author, dev_id);
+
+    // A revision of C with further edits onto b5 is refused.
+    let mut d = Craft::new(&api, &p.dev, &p.name, "b5");
+    d.file("src/five.rs", "five\n");
+    d.file("src/extra.rs", "extra\n");
+    let more = snap_at(&mut d, on, cid, "C, more", veil_core::now_millis(), vec![]);
+    let r = push_new(&d, &[("more", more)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let r = land_held_onto(&api, &token, &p.name, "b5", more);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 400, "{body}");
+    assert!(body.contains("already landed on 'b5' with other edits"), "{body}");
+
+    // A revision of C with the same edits under Q onto b5 is skipped and named;
+    // C never lands twice on b5.
+    let mut d = Craft::new(&api, &p.dev, &p.name, "b5");
+    let base = d.tip;
+    let same = snap_at(&mut d, base, cid, "C, again", veil_core::now_millis(), vec![]);
+    d.file("src/after_five.rs", "after\n");
+    let q = crafted_on(&mut d, same, veil_core::ChangeId::random(), "Q", "");
+    let r = push_new(&d, &[("q5", q)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let r = land_held_onto(&api, &token, &p.name, "b5", q);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+    assert_eq!(r.json()["landed"].as_array().unwrap().len(), 1, "{body}");
+    assert!(body.contains(&cid.to_string()) && body.contains("already landed"), "{body}");
+}
+
+/// Guarantee (agent sessions, S11's attribution: an agent acts with its
+/// person's identity): the dev's change E, made and landed through the API
+/// (as an agent does), and the dev's own signed revision of E pushed from
+/// their device, are one author's: the revision with further edits is
+/// refused, and one with the same edits is skipped and named.
+#[test]
+fn an_api_landing_and_its_persons_pushed_revision_are_one_author_and_never_land_twice() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let on = Craft::new(&api, &p.dev, &p.name, "main").tip;
+    let w = land(&api, &token, &p.name, on, json!([put("src/e.rs", "e\n")]), true).json();
+    assert_eq!(w["state"], "landed", "{w}");
+    let tip = real_tip(&hub, pid);
+    let cid = source(&hub, pid).snapshot(&tip).unwrap().change_id;
+    assert_eq!(w["change_id"].as_str(), Some(cid.to_string().as_str()), "{w}");
+    // A revision with further edits, signed on the dev's device: refused.
+    let mut d = Craft::new(&api, &p.dev, &p.name, "main");
+    d.file("src/e.rs", "e\n");
+    d.file("src/more.rs", "more\n");
+    let x = snap_at(&mut d, on, cid, "E, more", veil_core::now_millis(), vec![]);
+    let r = push_new(&d, &[("x", x)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let r = land_held(&api, &token, &p.name, x, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 400, "{body}");
+    assert!(body.contains("already landed") && body.contains("make a new change for the further edits"), "{body}");
+    assert_eq!(real_tip(&hub, pid), tip, "{body}");
+    // The same edits, under Q: E skipped and named, Q lands.
+    let mut d = Craft::new(&api, &p.dev, &p.name, "main");
+    let base = d.tip;
+    let same = snap_at(&mut d, base, cid, "E, again", veil_core::now_millis(), vec![]);
+    d.file("src/q.rs", "q\n");
+    let q = crafted_on(&mut d, same, veil_core::ChangeId::random(), "Q", "");
+    let r = push_new(&d, &[("q", q)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let r = land_held(&api, &token, &p.name, q, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+    assert_eq!(r.json()["landed"].as_array().unwrap().len(), 1, "{body}");
+    assert!(body.contains(&cid.to_string()) && body.contains("already landed"), "{body}");
+    let ids: Vec<_> = chain(&hub, pid, veil_server::sync::root_snapshot_id()).into_iter().map(|(_, s)| s.change_id).collect();
+    assert_eq!(ids.iter().filter(|i| **i == cid).count(), 1, "E is on main twice");
+}
+
+/// Guarantee (`snapshot_author`, a removed device): the dev's revision P2
+/// of P, signed on a device of theirs that is removed before it is
+/// submitted, is still the dev's: after P landed, the admin's landing of P2
+/// (further edits) is refused, and P is not landed twice.
+#[test]
+fn a_revision_signed_on_a_since_removed_device_is_still_its_persons() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let laptop = hub.new_device_of(&p.dev);
+    p.dev.ok(p.dev.home.path(), &["identity", "confirm", &laptop.fingerprint()]);
+    laptop.ok(laptop.home.path(), &["login", &format!("veil://{}", hub.authority()), "--ca", hub.ca.to_str().unwrap()]);
+    let cid = veil_core::ChangeId::random();
+    // P2 on the laptop: pushed, not landed.
+    let mut l = Craft::new(&api, &laptop, &p.name, "main");
+    let on = l.tip;
+    l.file("src/p.rs", "p\n");
+    l.file("src/more.rs", "more\n");
+    let p2 = snap_at(&mut l, on, cid, "P2", veil_core::now_millis(), vec![]);
+    let r = push_new(&l, &[("p2", p2)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    // P on the first device: landed.
+    let mut d = Craft::new(&api, &p.dev, &p.name, "main");
+    d.file("src/p.rs", "p\n");
+    let p1 = snap_at(&mut d, on, cid, "P", veil_core::now_millis(), vec![]);
+    let r = push_new(&d, &[("p1", p1)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let v = land_held(&api, &p.dev.token(), &p.name, p1, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    let tip = real_tip(&hub, pid);
+    // The laptop is removed; the admin lands P2 (as they see it on `p2`).
+    p.dev.ok(p.dev.home.path(), &["identity", "remove", &laptop.fingerprint()]);
+    let p2_admin = Craft::new(&api, &p.admin, &p.name, "p2").tip;
+    let r = land_held(&api, &p.admin.token(), &p.name, p2_admin, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 400, "{body}");
+    assert!(body.contains("already landed") && body.contains("make a new change for the further edits"), "{body}");
+    assert_eq!(real_tip(&hub, pid), tip, "{body}");
+}
+
+/// BUG-1635 (the merge of S17 with S24): a landing submitted with `wait`
+/// keeps its place in the project's bulkhead (S24, `limits::gate`: 12
+/// places with the tests' 16 database connections) for as long as it waits
+/// for its outcome (up to `landing::WAIT`), so 12 agents waiting on their
+/// landings fill it, and every other request on the project, a pull of its
+/// tips included, is answered `503 busy` once its class's wait runs out.
+/// Here the landing lease is held elsewhere, so 12 landings wait their
+/// whole 30 s; a read of the project's tips meanwhile must still answer.
+#[test]
+fn bug_1635_landings_waiting_for_their_outcome_never_fill_the_projects_bulkhead() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let token = p.dev.token();
+    let base = tip_for(&hub, &token, &p.name);
+    let h = hub.hub();
+    hub.rt
+        .block_on(
+            sqlx::query("INSERT INTO landing_leases (project_id, branch, holder, epoch, expires_at) VALUES ($1, 'main', 'elsewhere', 1, $2)")
+                .bind(pid)
+                .bind(i64::MAX / 2)
+                .execute(&h.db),
+        )
+        .unwrap();
+    std::thread::scope(|s| {
+        let landers: Vec<_> = (0..12)
+            .map(|i| {
+                let (hub, token, name) = (&hub, &token, &p.name);
+                s.spawn(move || {
+                    let r = land(&hub.api(), token, name, base, json!([put(&format!("src/w/{i:02}.rs"), "w\n")]), true);
+                    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_secs(3));
+        let r = hub.api().get(Some(&token), &format!("/v1/projects/{}/tips", p.name));
+        assert_eq!(r.status, 200, "a read of the project while 12 landings wait: {}", String::from_utf8_lossy(&r.body));
+        for l in landers {
+            l.join().unwrap();
+        }
+    });
+}
+
+/// BUG-1635: 50 waiting landings (across both `POST …/land` with `wait: true`
+/// and `GET …/land/{ticket}`, more than both the project's 12 bulkhead places
+/// and the server's 32) leave the project's pulls answering normally with 0
+/// places held while waiting.
+#[test]
+fn fifty_waiting_landings_leave_the_projects_pulls_answering_normally() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let token = p.dev.token();
+    let base = tip_for(&hub, &token, &p.name);
+    let h = hub.hub();
+    hub.rt
+        .block_on(
+            sqlx::query("INSERT INTO landing_leases (project_id, branch, holder, epoch, expires_at) VALUES ($1, 'main', 'elsewhere', 1, $2)")
+                .bind(pid)
+                .bind(i64::MAX / 2)
+                .execute(&h.db),
+        )
+        .unwrap();
+    // Queue 10 with wait: false so they wait on `GET …/land/{ticket}`, and
+    // 40 with `POST …/land` (`wait: true`), 50 waiting in all.
+    let mut tickets = Vec::new();
+    let api = hub.api();
+    for i in 0..10 {
+        let r = land(&api, &token, &p.name, base, json!([put(&format!("src/q50/{i:02}.rs"), "q\n")]), false);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        tickets.push(r.json()["ticket"].as_str().unwrap().to_string());
+    }
+    std::thread::scope(|s| {
+        let mut waiters = Vec::new();
+        for t in &tickets {
+            let (hub, token, name) = (&hub, &token, &p.name);
+            waiters.push(s.spawn(move || {
+                let r = hub.api().get(Some(token), &format!("/v1/projects/{name}/land/{t}"));
+                assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                assert_eq!(r.json()["state"], "landed");
+            }));
+        }
+        for i in 10..50 {
+            let (hub, token, name) = (&hub, &token, &p.name);
+            waiters.push(s.spawn(move || {
+                let r = land(&hub.api(), token, name, base, json!([put(&format!("src/q50/{i:02}.rs"), "q\n")]), true);
+                assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                assert_eq!(r.json()["state"], "landed");
+            }));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let queued: i64 = hub
+                .rt
+                .block_on(sqlx::query_scalar("SELECT COUNT(*) FROM landing_queue WHERE project_id = $1 AND state = 'queued'").bind(pid).fetch_one(&h.db))
+                .unwrap();
+            if queued == 50 && h.limits.load(Some(&p.name)) == (0, 0) && h.limits.load(None) == (0, 0) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "queued={queued}, project={:?}, server={:?}", h.limits.load(Some(&p.name)), h.limits.load(None));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Pulls of the project answer quickly while all 50 landings wait.
+        for _ in 0..5 {
+            let r = api.get(Some(&token), &format!("/v1/projects/{}/tips", p.name));
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            let r = api.post_json(
+                Some(&token),
+                &format!("/v1/projects/{}/history", p.name),
+                &json!({"tips": [base.hex()], "have": []}),
+            );
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        }
+        let d = p.dev.dir("pull-while-50-wait");
+        p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+        p.dev.ok(&d, &["pull"]);
+        // Let the landing service run so all 50 finish and land.
+        hub.rt
+            .block_on(sqlx::query("DELETE FROM landing_leases WHERE project_id = $1").bind(pid).execute(&h.db))
+            .unwrap();
+        veil_server::landing::ensure(&h, pid, "main");
+        for w in waiters {
+            w.join().unwrap();
+        }
+    });
+}
+
 // ---- S18: Content merges, re-queue, conflict reports, and event stream -----------------------
 
 /// Parse SSE events (`event: <name>\ndata: <json>\n\n`) from a reader until
