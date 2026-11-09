@@ -327,7 +327,7 @@ server keeps the shape and replaces the lock with the compare-and-swap.
 
 | Limit | Default | Why |
 |---|---|---|
-| Requests per device / per IP | 60 / s burst, 5,000 / h | abuse |
+| Requests per device / per address | 200 / s burst, 50,000 / h a device (one person's agents share it until S11); 20 / s, 1,000 / h an address without a session (`--device-rate`, `--anonymous-rate`; §13.25, BUG-1339) | abuse |
 | Pack size per upload | 2 GiB (larger: split) | memory |
 | Single object | 4 GiB | `VEIL_MAX_OBJECT` today |
 | Tree depth | 1,024 | `MAX_TREE_DEPTH` |

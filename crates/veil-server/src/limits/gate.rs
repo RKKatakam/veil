@@ -385,6 +385,40 @@ mod tests {
         assert_eq!(g.load(), (1, 0), "no waiter left behind");
     }
 
+    /// Guarantee (design §4.11): landings are shed last. A steady stream of
+    /// pulls whose waits all pass [`AGE`] (the queue is longer than a
+    /// second's worth of places) must not keep every free place from the
+    /// landings: a landing waits for at most a few pulls' turns, not for
+    /// the stream to end.
+    #[tokio::test(start_paused = true)]
+    #[ignore = "BUG-1630: a stream of aged pulls takes every free place; a landing waits behind all of them"]
+    async fn a_stream_of_aged_pulls_does_not_starve_landings() {
+        let g = Gate::new(1);
+        let held = g.place(Class::Write, soon(10)).await.unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        // 40 pulls queue up at once; a landing comes half a second later.
+        for (i, (c, after)) in (0..40).map(|i| (Class::Read, 0u64)).chain([(Class::Write, 500)]).enumerate() {
+            let (g, order) = (g.clone(), order.clone());
+            tasks.push(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(after)).await;
+                let p = g.place(c, soon(60_000)).await.unwrap();
+                order.lock().unwrap().push((i, c));
+                // Each request runs 100 ms: forty pulls are four seconds.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                drop(p);
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        drop(held);
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let order = order.lock().unwrap().clone();
+        let landing_at = order.iter().position(|(_, c)| *c == Class::Write).unwrap();
+        assert!(landing_at <= 2, "the landing ran {landing_at}th, after {} aged pulls: {order:?}", landing_at);
+    }
+
     /// A pull that has waited [`AGE`] goes before a newer landing: a steady
     /// stream of landings does not starve pulls.
     #[tokio::test(start_paused = true)]
