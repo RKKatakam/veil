@@ -1374,15 +1374,16 @@ fn s6r2_a_daemon_that_stalls_after_its_acknowledgement_costs_a_vl_one_short_wait
 }
 
 /// Guarantee 3 of the S6 review, cycle 3: a daemon that acknowledges and
-/// then only says it is working, forever, costs a `vl` one short wait too.
-/// This is what the real daemon does once wedged after its acknowledgement
-/// (its store on a hung disk, a budget never granted): its progress thread
-/// keeps sending `P` every 0.1 s while the request's thread never answers
-/// (BUG-1582); and what a lying same-user process on its socket may do
-/// (`docs/HUB.md` §13.29, threat row 8). The clone and `vl status` must
-/// end within the bound of a daemon that stalls silently.
+/// then only says it is working, forever, costs a `vl` one wait (between
+/// whole objects, 35 s), not forever. This is what the real daemon does
+/// once wedged after its acknowledgement (its store on a hung disk, a
+/// budget never granted): its progress thread keeps sending `P` every 0.1 s
+/// while the request's thread never answers (BUG-1582); and what a lying
+/// same-user process on its socket may do (`docs/HUB.md` §13.29, threat row
+/// 8). The clone (which would send several requests across its walk) and
+/// `vl status` must each end after one between-objects wait, well inside
+/// two.
 #[test]
-#[ignore = "BUG-1582: a daemon that acknowledges and then sends only progress messages holds every vl process forever (a clone and `vl status` never end; BUG-1518's fix made a wedged daemon look alive)"]
 fn s6r3_a_daemon_that_only_reports_progress_costs_a_vl_one_short_wait() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1418,7 +1419,7 @@ fn s6r3_a_daemon_that_only_reports_progress_costs_a_vl_one_short_wait() {
         let cmd = who.command(cwd, args);
         let t = Instant::now();
         let o = std::process::Command::new("timeout")
-            .arg("40")
+            .arg("60")
             .arg(cmd.get_program())
             .args(cmd.get_args())
             .envs(cmd.get_envs().filter_map(|(k, v)| Some((k, v?))))
@@ -1437,19 +1438,18 @@ fn s6r3_a_daemon_that_only_reports_progress_costs_a_vl_one_short_wait() {
     let asked = beating.join().unwrap();
     assert!(asked > 0, "the clone never asked the daemon");
     eprintln!("a daemon that only reports progress: a clone {took:?}, `vl status` {took_status:?}, {asked} request(s)");
-    assert!(took_status < Duration::from_secs(5), "`vl status` in a thin clone took {took_status:?}");
-    // The same bound as a daemon that stalls silently
-    // (`s6r2_a_daemon_that_stalls_after_its_acknowledgement_costs_a_vl_one_short_wait`).
-    assert!(took < Duration::from_secs(15), "a clone with a daemon that only reports progress took {took:?} ({asked} requests)");
+    // One 35 s wait per process (not one per request: two requests in the
+    // clone would take >= 70 s).
+    assert!(took_status < Duration::from_secs(50), "`vl status` in a thin clone took {took_status:?}");
+    assert!(took < Duration::from_secs(50), "a clone with a daemon that only reports progress took {took:?} ({asked} requests)");
 }
 
 /// BUG-1582's class, its other route: the bound is on each gap, not on the
 /// answer. A daemon that acknowledges and then sends one object a byte at
 /// a time (every 0.3 s, inside the 0.5 s gap) holds a `vl` for as long as
-/// the object lasts; this one never ends it. The clone must end within the
-/// bound of a daemon that stalls silently.
+/// the object lasts; this one never ends it. The clone must end after one
+/// between-objects wait (35 s), well inside two.
 #[test]
-#[ignore = "BUG-1582: a daemon that trickles one object a byte at a time holds a vl for as long as it likes (the client bounds each gap, not the answer)"]
 fn s6r3_a_daemon_that_trickles_an_object_costs_a_vl_one_short_wait() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1484,7 +1484,7 @@ fn s6r3_a_daemon_that_trickles_an_object_costs_a_vl_one_short_wait() {
     let t = Instant::now();
     // `timeout` ends a `vl` that never returns, so the test can say so.
     let o = std::process::Command::new("timeout")
-        .arg("40")
+        .arg("60")
         .arg(cmd.get_program())
         .args(cmd.get_args())
         .envs(cmd.get_envs().filter_map(|(k, v)| Some((k, v?))))
@@ -1497,7 +1497,8 @@ fn s6r3_a_daemon_that_trickles_an_object_costs_a_vl_one_short_wait() {
     assert!(o.status.success(), "a clone with a daemon that trickles an object failed or never ended ({took:?}): {}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(std::fs::read_to_string(c.join("src/lib.rs")).unwrap(), PUBLIC_MARK);
     assert!(asked > 0, "the clone never asked the daemon");
-    assert!(took < Duration::from_secs(15), "a clone with a daemon that trickles an object took {took:?}");
+    eprintln!("a daemon that trickles an object: a clone {took:?}, {asked} request(s)");
+    assert!(took < Duration::from_secs(50), "a clone with a daemon that trickles an object took {took:?}");
 }
 
 /// Guarantee 3 and the threat model ("Other OS users share nothing with

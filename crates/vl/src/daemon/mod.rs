@@ -316,10 +316,15 @@ mod client {
     /// The longest a request waits for any message of the daemon's: the
     /// acknowledgement, an object, the end, or the progress message the
     /// daemon sends every 0.1 s while it works (its store, the server, its
-    /// budgets). One rule (BUG-1518): any gap longer than this, whatever
-    /// the daemon is doing (stopped, wedged, its store on a hung disk),
-    /// costs the process this once.
+    /// budgets). Any gap longer than this, whatever the daemon is doing
+    /// (stopped, wedged, its store on a hung disk), costs the process this
+    /// once (BUG-1518).
     const ACK_WAIT: Duration = Duration::from_millis(500);
+    /// The longest a request waits between two whole objects (or from the
+    /// acknowledgement to the first object or the end), whatever progress
+    /// messages or partial bytes arrive meanwhile: the daemon's own 30 s
+    /// read of the server and a margin (BUG-1582).
+    const BETWEEN_OBJECTS: Duration = Duration::from_secs(35);
 
     fn give_up() {
         UNUSABLE.store(true, Ordering::SeqCst);
@@ -374,10 +379,11 @@ mod client {
     /// answer is unfinished).
     ///
     /// A daemon that leaves a gap of more than [`ACK_WAIT`] before any
-    /// message (its acknowledgement included), sends anything but what was
-    /// asked, or speaks another version, is not asked again by this
-    /// process; one older than this `vl` is stopped, so the next `vl`
-    /// starts its own.
+    /// message (its acknowledgement included), takes longer than
+    /// [`BETWEEN_OBJECTS`] between whole objects (or the end), sends
+    /// anything but what was asked, or speaks another version, is not asked
+    /// again by this process; one older than this `vl` is stopped, so the
+    /// next `vl` starts its own.
     pub fn request(mut s: UnixStream, req: &Request, wanted: &dyn Fn(&ObjectId) -> bool) -> (Vec<(ObjectId, Vec<u8>)>, Option<Head>) {
         let mut got = Vec::new();
         let Ok(json) = serde_json::to_vec(req) else { return (got, None) };
@@ -403,13 +409,17 @@ mod client {
             }
         }
         let mut seen = std::collections::HashSet::new();
+        let mut since_object = Instant::now();
         let failed = |got| {
             give_up();
             (got, None)
         };
         loop {
+            if since_object.elapsed() > BETWEEN_OBJECTS {
+                return failed(got);
+            }
             let Ok((kind, len)) = proto::read_head(&mut r, MAX_OBJECT + 32) else { return failed(got) };
-            let Ok(payload) = proto::read_payload(&mut r, len) else { return failed(got) };
+            let Ok(payload) = proto::read_object(&mut r, len, since_object + BETWEEN_OBJECTS) else { return failed(got) };
             match kind {
                 proto::P => {}
                 proto::O => {
@@ -420,6 +430,7 @@ mod client {
                         return failed(got);
                     }
                     got.push((id, raw));
+                    since_object = Instant::now();
                 }
                 proto::E => match serde_json::from_slice(&payload) {
                     Ok(h) => return (got, Some(h)),

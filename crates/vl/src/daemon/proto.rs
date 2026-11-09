@@ -18,9 +18,12 @@
 //! version keeps as it is, naming the sender's version: only an older
 //! daemon obeys it), so the next `vl` starts its own. While it works on an
 //! answer the daemon sends [`P`] every 0.1 s; a client waits at most 0.5 s
-//! for any message.
+//! for any message, and at most 35 s between whole objects (or the end).
 
-use std::io::{Read, Write};
+use std::{
+    io::{Read, Write},
+    time::Instant,
+};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -38,8 +41,9 @@ pub const A: u8 = b'A';
 /// daemon of an older one (BUG-1517).
 pub const S: u8 = b'S';
 /// Progress, empty: the daemon is working on the answer (sent every 0.1 s
-/// until it ends; a client takes any gap of more than 0.5 s for a failed
-/// daemon, BUG-1518).
+/// until it ends; a client takes any gap of more than 0.5 s, or more than
+/// 35 s without a whole object or the end, for a failed daemon, BUG-1518,
+/// BUG-1582).
 pub const P: u8 = b'P';
 /// One object: its id (32 bytes), then its bytes.
 pub const O: u8 = b'O';
@@ -120,6 +124,23 @@ pub fn read_head(r: &mut impl Read, max: usize) -> Result<(u8, usize)> {
 pub fn read_payload(r: &mut impl Read, len: usize) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Read `len` bytes before `deadline` (BUG-1582: an object trickled a byte
+/// at a time inside the per-read gap still passes `deadline`).
+pub fn read_object(r: &mut impl Read, len: usize, deadline: Instant) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    let mut n = 0;
+    while n < len {
+        if Instant::now() > deadline {
+            bail!("an object took too long");
+        }
+        match r.read(&mut buf[n..])? {
+            0 => bail!("the stream ended inside a message"),
+            k => n += k,
+        }
+    }
     Ok(buf)
 }
 
