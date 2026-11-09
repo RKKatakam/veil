@@ -1194,11 +1194,21 @@ fn sample_glob(pat: &str, empty_star: bool) -> String {
                     }
                     class.push(ch);
                 }
-                let pick = if neg {
-                    ('a'..='z').find(|x| !class.contains(x)).unwrap_or('x')
-                } else {
-                    class.first().copied().unwrap_or('x')
-                };
+                // Ask the class itself (ranges included, BUG-1568). A
+                // negated class is compiled case-insensitively, so what it
+                // admits is admitted under either case setting; a plain
+                // class case-sensitively, for the same reason.
+                let text: String = class.iter().collect();
+                let compiled = GlobBuilder::new(&format!("[{}{text}]", if neg { "!" } else { "" }))
+                    .backslash_escape(true)
+                    .case_insensitive(neg)
+                    .build()
+                    .ok()
+                    .map(|g| g.compile_matcher());
+                let fallback = if neg { 'x' } else { class.first().copied().unwrap_or('x') };
+                let pick = compiled
+                    .and_then(|m| "xabcdefghijklmnopqrstuvwyz0123456789_-.~+=@,".chars().find(|c| m.is_match(c.to_string())))
+                    .unwrap_or(fallback);
                 out.push(pick);
             }
             c => out.push(c),
@@ -2010,17 +2020,20 @@ mod tests {
     /// that seals only outside: overrides (`public!`, `isolate`, `ignore`),
     /// nested folders, globs and braces, and `cloak rule` scopes from an
     /// access line above the narrowing or inside it.
-    /// BUG-1568: `sample_glob` picks, for a negated class, the first letter
-    /// of `a`..=`z` not written in it, so `[!a-z]` gives `b`, which the
-    /// class excludes: the secret `src/api/.env.1` is sealed under `neg`,
-    /// but a session narrowed to `src/api` is not given `neg`'s ring.
+    /// BUG-1568 (fixed): `sample_glob` picked, for a negated class, the
+    /// first letter of `a`..=`z` not written in it, so `[!a-z]` gave `b`,
+    /// which the class excludes: the secret `src/api/.env.1` was sealed
+    /// under `neg`, but a session narrowed to `src/api` was not given
+    /// `neg`'s ring. Now the compiled class picks its sample.
     #[test]
-    #[ignore = "BUG-1568: scopes_within misses a scope whose tier line has a negated range class"]
     fn scopes_within_finds_a_scope_behind_a_negated_range_class() {
-        let p = Policy::parse("src/ devs\nsrc/api/.env.[!a-z]  cloak neg\n");
+        let p = Policy::parse("src/ devs\nsrc/api/.env.[!a-z]  cloak neg\nsrc/api/.env.[!0-9a-z_]  cloak neg2\nsrc/api/.env.[b-d]  cloak pos\n");
         assert_eq!(class(&p, "src/api/.env.1"), Tier::Cloaked("neg".into()), "control: the secret inside is sealed under neg");
+        assert_eq!(class(&p, "src/api/.env.c"), Tier::Cloaked("pos".into()), "control: the secret inside is sealed under pos");
         let got = p.scopes_within(&["src/api".to_string()]);
-        assert!(got.contains("neg"), "{got:?}");
+        for scope in ["neg", "neg2", "pos"] {
+            assert!(got.contains(scope), "{scope}: {got:?}");
+        }
     }
 
     #[test]
