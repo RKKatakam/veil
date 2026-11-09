@@ -222,7 +222,9 @@ fn the_daemons_store_and_socket_stay_hidden_when_an_allowed_folder_holds_them() 
     let name = "cd".repeat(31);
     write(&t.home, &format!(".cache/veil/daemon/store/objects/ab/{name}"), STORED);
     write(&t.home, ".cache/veil/daemon/run/daemon.sock", "");
-    let script = format!("cat ~/.cache/veil/daemon/store/objects/ab/{name}; ls -A ~/.cache/veil/daemon/run; echo end");
+    // Proof the allowed folder is shown (S6 review, cycle 2).
+    write(&t.home, ".cache/pip/shown.txt", S6R2_SHOWN);
+    let script = format!("cat ~/.cache/pip/shown.txt; cat ~/.cache/veil/daemon/store/objects/ab/{name}; ls -A ~/.cache/veil/daemon/run; echo end");
     let cache = t.home.join(".cache").display().to_string();
     let mut c = t.cmd(&t.proj, &["ws", "exec", "agent", "--allow", &cache, "--", "sh", "-c", &script]);
     c.env_remove("VEIL_HOME").env_remove("XDG_CACHE_HOME").env_remove("XDG_RUNTIME_DIR").env("XDG_CONFIG_HOME", &config);
@@ -230,6 +232,7 @@ fn the_daemons_store_and_socket_stay_hidden_when_an_allowed_folder_holds_them() 
     assert!(o.status.success(), "{}", text(&o));
     let out = String::from_utf8_lossy(&o.stdout).into_owned();
     assert!(out.trim_end().ends_with("end"), "{out}");
+    assert!(out.contains(S6R2_SHOWN), "the allowed folder is not shown: {out}");
     assert!(!out.contains(STORED), "the daemon's store is visible in the sandbox: {out}");
     assert!(!out.contains("daemon.sock"), "the daemon's socket is visible in the sandbox: {out}");
 }
@@ -1702,4 +1705,201 @@ fn credentials_reached_through_a_linked_home_or_cargo_home_stay_masked() {
         assert!(o.status.success() && out.contains("tool-ran") && out.contains("end"), "{case}: {}", text(&o));
         assert!(!out.contains(CARGO_TOKEN), "{case}: {out}");
     }
+}
+
+// ---- S6 review, cycle 2: the daemon's folders by every route --------------------------
+
+const S6R2_STORED: &str = "S6R2-DAEMON-STORE-OBJECT-OF-ANOTHER-PROJECT-9e4a51c7";
+const S6R2_SOCKET: &str = "s6r2-daemon-sock-name-0d83";
+/// Beside the daemon's folders in each allowed folder: proof it is shown.
+const S6R2_SHOWN: &str = "S6R2-ALLOWED-FOLDER-IS-SHOWN-71b2f04e";
+
+/// The Veil home of [`T`] copied to `<dir>/veil`, for the default layout
+/// (`XDG_CONFIG_HOME=<dir>`, no `VEIL_HOME`).
+fn s6r2_config(t: &T) -> PathBuf {
+    let config = t.env.dir("xdg-config");
+    let cp = Command::new("cp").arg("-a").arg(t.env.root.join("home-alice")).arg(config.join("veil")).status().unwrap();
+    assert!(cp.success());
+    config
+}
+
+/// `vl ws exec agent [--allow A]… -- sh -c script` with `env` set (an empty
+/// value removes the variable): its stdout, after asserting it succeeded
+/// and ran to its end.
+fn s6r2_run(t: &T, allow: &[String], env: &[(&str, Option<&Path>)], script: &str) -> String {
+    let mut args = vec!["ws", "exec", "agent"];
+    for a in allow {
+        args.extend(["--allow", a.as_str()]);
+    }
+    let script = format!("{script}; echo end");
+    args.extend(["--", "sh", "-c", &script]);
+    let mut c = t.cmd(&t.proj, &args);
+    for (k, v) in env {
+        match v {
+            Some(v) => c.env(k, v),
+            None => c.env_remove(k),
+        };
+    }
+    let o = c.stdin(Stdio::null()).output().unwrap();
+    assert!(o.status.success(), "{allow:?} {env:?}: {}", text(&o));
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(out.trim_end().ends_with("end"), "{allow:?}: the command did not run to its end: {out}");
+    out
+}
+
+/// Guarantee 1 of the S6 review, cycle 2: no confined command reaches the
+/// daemon's store or socket through an allowed parent named through a link
+/// or `/proc/self/root`, an allowed folder that holds the project too,
+/// `XDG_RUNTIME_DIR` or `XDG_CACHE_HOME` inside an allowed folder, or a
+/// `VEIL_HOME` inside one; and an allowed path inside one is refused.
+#[test]
+fn s6r2_the_daemons_folders_stay_hidden_by_every_route() {
+    let t = T::new();
+    let config = s6r2_config(&t);
+    let name = "ef".repeat(31);
+    let obj = format!("veil/daemon/store/objects/ab/{name}");
+    let h = t.home.display().to_string();
+    let default_env: Vec<(&str, Option<&Path>)> = vec![("VEIL_HOME", None), ("XDG_CACHE_HOME", None), ("XDG_RUNTIME_DIR", None), ("XDG_CONFIG_HOME", Some(&config))];
+    write(&t.home.join(".cache"), &obj, S6R2_STORED);
+    write(&t.home.join(".cache"), &format!("veil/daemon/run/{S6R2_SOCKET}"), "");
+    write(&t.home.join(".cache"), "pip/shown.txt", S6R2_SHOWN);
+    let look = |base: &str| format!("cat {base}/pip/shown.txt; cat {base}/{obj}; ls -A {base}/veil/daemon/run; ls -AR {base}/veil 2>&1 | head -40");
+    // An allowed parent named through a link, and through /proc/self/root.
+    std::os::unix::fs::symlink(t.home.join(".cache"), t.home.join("cache-link")).unwrap();
+    // `(allowed, looked at, shown there)`. A path through /proc/self/root
+    // is resolved by bwrap before its pivot: shown nowhere, nothing leaks.
+    for (allow, base, shown) in [
+        (format!("{h}/cache-link"), format!("{h}/cache-link"), true),
+        (format!("/proc/self/root{h}/.cache"), format!("/proc/self/root{h}/.cache"), false),
+        (format!("/proc/self/root{h}/.cache"), format!("{h}/.cache"), false),
+        // Holding the project too (shown read-only, no layer).
+        (t.env.root.display().to_string(), format!("{h}/.cache"), true),
+    ] {
+        let out = s6r2_run(&t, std::slice::from_ref(&allow), &default_env, &look(&base));
+        assert_eq!(out.contains(S6R2_SHOWN), shown, "--allow {allow}: the allowed folder shown at {base}: {out}");
+        assert!(!out.contains(S6R2_STORED), "--allow {allow}: the store is visible at {base}: {out}");
+        assert!(!out.contains(S6R2_SOCKET), "--allow {allow}: the socket's folder is visible at {base}: {out}");
+        assert!(!out.contains(&name), "--allow {allow}: the store's names are visible at {base}: {out}");
+    }
+    // XDG_RUNTIME_DIR and XDG_CACHE_HOME inside an allowed folder.
+    let odd = t.env.dir("odd");
+    write(&odd, &format!("rt/veil/{S6R2_SOCKET}"), "");
+    write(&odd, &format!("xc/{obj}"), S6R2_STORED);
+    write(&odd, "shown.txt", S6R2_SHOWN);
+    let (rt, xc) = (odd.join("rt"), odd.join("xc"));
+    let env: Vec<(&str, Option<&Path>)> = vec![("VEIL_HOME", None), ("XDG_CACHE_HOME", Some(&xc)), ("XDG_RUNTIME_DIR", Some(&rt)), ("XDG_CONFIG_HOME", Some(&config))];
+    let o = odd.display().to_string();
+    let out = s6r2_run(&t, std::slice::from_ref(&o), &env, &format!("cat {o}/shown.txt {o}/xc/{obj}; ls -A {o}/rt/veil; ls -AR {o}"));
+    assert!(out.contains(S6R2_SHOWN), "the allowed folder is not shown: {out}");
+    assert!(!out.contains(S6R2_STORED) && !out.contains(&name), "XDG_CACHE_HOME in an allowed folder: the store is visible: {out}");
+    assert!(!out.contains(S6R2_SOCKET), "XDG_RUNTIME_DIR in an allowed folder: the socket's folder is visible: {out}");
+    // A VEIL_HOME inside an allowed folder: the home and its daemon.
+    let vh = odd.join("vh");
+    let cp = Command::new("cp").arg("-a").arg(t.env.root.join("home-alice")).arg(&vh).status().unwrap();
+    assert!(cp.success());
+    let identity = std::fs::read_to_string(vh.join("identity.json")).unwrap();
+    write(&vh, &format!("daemon/store/objects/ab/{name}"), S6R2_STORED);
+    let env: Vec<(&str, Option<&Path>)> = vec![("VEIL_HOME", Some(&vh)), ("XDG_CACHE_HOME", None), ("XDG_RUNTIME_DIR", None)];
+    let out = s6r2_run(&t, std::slice::from_ref(&o), &env, &format!("cat {o}/shown.txt {v}/identity.json {v}/daemon/store/objects/ab/{name}; ls -AR {v}", v = vh.display()));
+    assert!(out.contains(S6R2_SHOWN), "the allowed folder is not shown: {out}");
+    assert!(!out.contains(identity.trim()) && !out.contains("identity.json"), "a VEIL_HOME in an allowed folder is visible: {out}");
+    assert!(!out.contains(S6R2_STORED) && !out.contains(&name), "the daemon's store in a VEIL_HOME in an allowed folder is visible: {out}");
+    // An allowed path inside the daemon's folder: refused, nothing run.
+    let inside = t.home.join(".cache/veil/daemon/store").display().to_string();
+    let o2 = t.cmd(&t.proj, &["ws", "exec", "agent", "--allow", &inside, "--", "sh", "-c", "echo RAN-INSIDE"]).envs([("XDG_CONFIG_HOME", &config)]).env_remove("VEIL_HOME").env_remove("XDG_CACHE_HOME").env_remove("XDG_RUNTIME_DIR").stdin(Stdio::null()).output().unwrap();
+    assert!(!o2.status.success(), "an allowed path inside the daemon's folder was accepted: {}", text(&o2));
+    assert!(text(&o2).contains("Veil daemon's folders"), "{}", text(&o2));
+    assert!(!String::from_utf8_lossy(&o2.stdout).contains("RAN-INSIDE"));
+}
+
+/// Guarantee 1, a path made after the sandbox starts: the daemon's folder
+/// removed on the host during a run (the person clears `~/.cache`, which
+/// the run allows) and made again, with a new store, by the next `vl`.
+/// The confined command must not see the new store.
+#[test]
+#[ignore = "BUG-1516: a daemon folder removed and made again during a confined run is visible through an allowed folder"]
+fn s6r2_a_daemon_folder_made_again_during_a_run_stays_hidden() {
+    let t = T::new();
+    let config = s6r2_config(&t);
+    let name = "ef".repeat(31);
+    let cache = t.home.join(".cache");
+    write(&cache, "veil/daemon/store/objects/ab/old", "old");
+    write(&cache, "pip/shown.txt", S6R2_SHOWN);
+    let started = t.files("agent").join(".started");
+    let script = format!(
+        "cat {c}/pip/shown.txt; touch .started; i=0; while [ $i -lt 150 ]; do cat {c}/veil/daemon/store/objects/ab/{name} 2>/dev/null && break; i=$((i+1)); sleep 0.1; done; ls -AR {c}/veil; echo end",
+        c = cache.display()
+    );
+    let allow = cache.display().to_string();
+    let run = t
+        .cmd(&t.proj, &["ws", "exec", "agent", "--allow", &allow, "--", "sh", "-c", &script])
+        .env("XDG_CONFIG_HOME", &config)
+        .env_remove("VEIL_HOME")
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_RUNTIME_DIR")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert!(wait_for(Duration::from_secs(30), || started.exists()), "the confined command never started");
+    // On the host: the cache cleared, then the daemon's folder made again
+    // (as `Paths::prepare` does) and an object kept in it.
+    std::fs::remove_dir_all(cache.join("veil")).unwrap();
+    write(&cache, &format!("veil/daemon/store/objects/ab/{name}"), S6R2_STORED);
+    let o = run.wait_with_output().unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(out.trim_end().ends_with("end"), "{out}");
+    assert!(out.contains(S6R2_SHOWN), "the allowed folder is not shown: {out}");
+    assert!(!out.contains(S6R2_STORED), "the daemon's new store is visible in the sandbox: {out}");
+    assert!(!out.contains(&name), "the daemon's new store's names are visible in the sandbox: {out}");
+}
+
+/// Guarantee 1, a bind-mount alias: the folder holding the Veil home and
+/// the daemon's store is mounted a second time elsewhere (an fstab `bind`
+/// entry, a data disk mounted twice), and the run allows the second path.
+/// The masks know names and links, not mounts: the Veil identity and the
+/// store must stay hidden there too. Needs root, to make the second mount
+/// (in a mount namespace of the test's own).
+#[test]
+#[ignore = "BUG-1519: a second mount of a folder holding Veil's private folders shows them to a confined command; needs root"]
+fn s6r2_a_bind_mount_alias_never_shows_veils_folders() {
+    let root = Command::new("id").arg("-u").output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&root.stdout).trim(), "0", "this reproduction needs root (a second mount): run it with sudo -E");
+    let t = T::new();
+    let config = s6r2_config(&t);
+    let identity = std::fs::read_to_string(config.join("veil/identity.json")).unwrap();
+    let name = "ef".repeat(31);
+    write(&t.home.join(".cache"), &format!("veil/daemon/store/objects/ab/{name}"), S6R2_STORED);
+    write(&t.home.join(".cache"), "pip/shown.txt", S6R2_SHOWN);
+    let alias = t.env.dir("alias");
+    let a = alias.display().to_string();
+    let rel = |p: &Path| p.strip_prefix(&t.env.root).unwrap().display().to_string();
+    let script = format!(
+        "cat {a}/{h}/.cache/pip/shown.txt {a}/{h}/.cache/veil/daemon/store/objects/ab/{name} {a}/{c}/veil/identity.json; ls -AR {a}/{h}/.cache/veil {a}/{c}/veil; echo end",
+        h = rel(&t.home),
+        c = rel(&config)
+    );
+    let vl = t.cmd(&t.proj, &["ws", "exec", "agent", "--allow", &a, "--", "sh", "-c", &script]);
+    let o = Command::new("unshare")
+        .args(["-m", "--propagation", "private", "sh", "-c", "mount --bind \"$1\" \"$2\" && shift 2 && exec \"$@\"", "sh"])
+        .arg(&t.env.root)
+        .arg(&alias)
+        .arg(vl.get_program())
+        .args(vl.get_args())
+        .envs(vl.get_envs().filter_map(|(k, v)| Some((k, v?))))
+        .env("XDG_CONFIG_HOME", &config)
+        .env_remove("VEIL_HOME")
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_RUNTIME_DIR")
+        .current_dir(&t.proj)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(out.trim_end().ends_with("end") && out.contains(S6R2_SHOWN), "the alias is not shown: {out}");
+    assert!(!out.contains(identity.trim()) && !out.contains("identity.json"), "the Veil home is visible through a second mount: {out}");
+    assert!(!out.contains(S6R2_STORED) && !out.contains(&name), "the daemon's store is visible through a second mount: {out}");
 }

@@ -1217,3 +1217,238 @@ fn the_daemon_never_outlives_its_veil_home() {
     assert!(!o.status.success(), "nor is one started");
     assert!(!home.exists(), "the removed Veil home was made again");
 }
+
+// ---- S6 review, cycle 2 -----------------------------------------------------------
+
+/// One message from a fake daemon's connection: its kind and payload.
+fn s6r2_read_msg(s: &mut UnixStream) -> Option<(u8, Vec<u8>)> {
+    let mut head = [0u8; 5];
+    s.read_exact(&mut head).ok()?;
+    let mut body = vec![0u8; u32::from_be_bytes(head[1..].try_into().unwrap()) as usize];
+    s.read_exact(&mut body).ok()?;
+    Some((head[0], body))
+}
+
+/// The daemon's socket of `who` taken over by the test: the real daemon
+/// stopped, `off` removed, the socket's path free.
+fn s6r2_take_socket(who: &Person) -> Daemon {
+    let d = Daemon::start(who, None);
+    who.ok(who.home.path(), &["daemon", "stop"]);
+    std::fs::remove_file(d.dir.join("off")).unwrap();
+    let _ = std::fs::remove_file(&d.socket);
+    d
+}
+
+/// Guarantee 3 of the S6 review, cycle 2: stopping an older daemon never
+/// stops the one that replaced it. A `vl` meets a daemon of an older
+/// version and stops it; meanwhile (between its acknowledgement and the
+/// stop) another `vl` stopped that daemon and started one of this version
+/// at the same socket. The stop must not reach the newer daemon.
+#[test]
+#[ignore = "BUG-1517: the stop of an older daemon is sent on a new connection, to whatever daemon then holds the socket"]
+fn s6r2_stopping_an_older_daemon_never_stops_the_one_that_replaced_it() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let who = &p.dev;
+    let d = s6r2_take_socket(who);
+    let older = std::os::unix::net::UnixListener::bind(&d.socket).unwrap();
+    let socket = d.socket.clone();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done2 = done.clone();
+    let fake = std::thread::spawn(move || {
+        older.set_nonblocking(true).unwrap();
+        let t = Instant::now();
+        let mut first = loop {
+            match older.accept() {
+                Ok((s, _)) => break s,
+                Err(_) if t.elapsed() < Duration::from_secs(60) && !done2.load(std::sync::atomic::Ordering::SeqCst) => std::thread::sleep(Duration::from_millis(5)),
+                Err(_) => return None,
+            }
+        };
+        first.set_nonblocking(false).unwrap();
+        let (kind, _) = s6r2_read_msg(&mut first).expect("the first request");
+        // Replaced, before it answers: the older daemon is gone and one of
+        // this version holds the socket.
+        drop(older);
+        std::fs::remove_file(&socket).unwrap();
+        let newer = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // The older daemon's acknowledgement: version 0.
+        let _ = first.write_all(&[b'A', 0, 0, 0, 1, 0]);
+        drop(first);
+        // The newer daemon: acknowledges as this version and serves
+        // nothing (a whole, empty answer: the rest from the server).
+        newer.set_nonblocking(true).unwrap();
+        let mut kinds = vec![kind];
+        while !done2.load(std::sync::atomic::Ordering::SeqCst) {
+            let Ok((mut s, _)) = newer.accept() else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            s.set_nonblocking(false).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let Some((k, _)) = s6r2_read_msg(&mut s) else { continue };
+            kinds.push(k);
+            if k == b'Q' {
+                let _ = s.write_all(&[b'A', 0, 0, 0, 1, PROTOCOL, b'E', 0, 0, 0, 2, b'{', b'}']);
+            }
+        }
+        Some(kinds)
+    });
+    let c = who.dir("replaced");
+    who.ok(who.home.path(), &["clone", &hub.url(&p.name), c.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(c.join("src/lib.rs")).unwrap(), PUBLIC_MARK);
+    // A second `vl` meanwhile (it asks the newer daemon).
+    who.ok(&c, &["cat", "-r", "main", "src/lib.rs"]);
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    let kinds = fake.join().unwrap().expect("the clone never asked the daemon");
+    assert_eq!(kinds[0], b'Q', "the older daemon was asked first: {kinds:?}");
+    assert!(!kinds[1..].contains(&b'S'), "the stop meant for the older daemon stopped the newer one: {:?}", kinds.iter().map(|k| *k as char).collect::<String>());
+}
+
+/// Guarantee 3, a daemon that acknowledges and then stalls (its store on a
+/// hung disk, wedged after reading the request, or a same-user process on
+/// its socket that lies): a `vl` waits at most one short wait for it.
+#[test]
+#[ignore = "BUG-1518: a daemon that acknowledges and then stalls costs every vl process 35 s"]
+fn s6r2_a_daemon_that_stalls_after_its_acknowledgement_costs_a_vl_one_short_wait() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let who = &p.dev;
+    let d = s6r2_take_socket(who);
+    let l = std::os::unix::net::UnixListener::bind(&d.socket).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let stalled = std::thread::spawn(move || {
+        l.set_nonblocking(true).unwrap();
+        let mut held = Vec::new();
+        while !stop2.load(std::sync::atomic::Ordering::SeqCst) {
+            let Ok((mut s, _)) = l.accept() else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            s.set_nonblocking(false).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            if let Some((b'Q', _)) = s6r2_read_msg(&mut s) {
+                // Acknowledged at once, as the daemon does; then nothing.
+                let _ = s.write_all(&[b'A', 0, 0, 0, 1, PROTOCOL]);
+            }
+            held.push(s);
+        }
+        held.len()
+    });
+    let c = who.dir("stalled-after-ack");
+    let t = Instant::now();
+    who.ok(who.home.path(), &["clone", &hub.url(&p.name), c.to_str().unwrap()]);
+    let took = t.elapsed();
+    assert_eq!(std::fs::read_to_string(c.join("src/lib.rs")).unwrap(), PUBLIC_MARK);
+    // A local command in the thin clone (it only pins its working copy's
+    // trees at the daemon).
+    let t = Instant::now();
+    let status = who.ok(&c, &["status"]);
+    let took_status = t.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let asked = stalled.join().unwrap();
+    assert!(asked > 0, "the clone never asked the daemon");
+    eprintln!("a daemon stalled after acknowledging: a clone {took:?}, `vl status` {took_status:?}, {asked} connection(s): {status}");
+    assert!(took_status < Duration::from_secs(5), "`vl status` in a thin clone took {took_status:?}");
+    // The same bound as a daemon that never acknowledges
+    // (`a_stalled_daemon_costs_a_vl_at_most_one_wait`).
+    assert!(took < Duration::from_secs(15), "a clone with a daemon stalled after its acknowledgement took {took:?} ({asked} connections)");
+}
+
+/// Guarantee 3 and the threat model ("Other OS users share nothing with
+/// it"): a `vl` never sends a request (its grant and its device's
+/// signature, which the server accepts again for ±5 minutes) to a socket
+/// another OS user listens on. Here `XDG_RUNTIME_DIR` is a folder every
+/// user can write (as `/tmp` is, where some setups point it), and another
+/// OS user made `veil/daemon.sock` there first. Needs root, to be another
+/// OS user (the listener runs as `nobody`).
+#[test]
+#[ignore = "BUG-1515: vl sends its signed requests to a daemon socket of another OS user (no peer check on the client side); needs root"]
+fn s6r2_a_vl_never_asks_another_os_users_daemon() {
+    let root = std::process::Command::new("id").arg("-u").output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&root.stdout).trim(), "0", "this reproduction needs root (a second OS user): run it with sudo -E");
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let who = &p.dev;
+    // The default layout (no VEIL_HOME): the socket in XDG_RUNTIME_DIR.
+    // As `/tmp` is: a folder every user can reach and write.
+    let tmp = tempfile::Builder::new().prefix("veil-s6r2-").tempdir_in("/tmp").unwrap();
+    let shared = tmp.path().to_path_buf();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let log = shared.join("veil/got");
+    let listener = format!(
+        "import socket,os\nos.mkdir({dir:?})\nos.chmod({dir:?},0o777)\ns=socket.socket(socket.AF_UNIX)\ns.bind({sock:?})\nos.chmod({sock:?},0o777)\ns.listen(64)\nopen({ready:?},'w').close()\n\
+         while True:\n  c,_=s.accept()\n  b=c.recv(1<<20)\n  open({log:?},'ab').write(b[:1])\n  c.close()\n",
+        dir = shared.join("veil").display().to_string(),
+        sock = shared.join("veil/daemon.sock").display().to_string(),
+        ready = shared.join("veil/ready").display().to_string(),
+        log = log.display().to_string()
+    );
+    let mut other = std::process::Command::new("setpriv").args(["--reuid=nobody", "--regid=nogroup", "--clear-groups", "python3", "-c", &listener]).spawn().unwrap();
+    until(Duration::from_secs(10), "the other user's listener is up", || shared.join("veil/ready").exists());
+    let c = who.dir("other-user");
+    let cmd = who.command(who.home.path(), &["clone", &hub.url(&p.name), c.to_str().unwrap()]);
+    let o = std::process::Command::new(cmd.get_program())
+        .args(cmd.get_args())
+        .envs(cmd.get_envs().filter_map(|(k, v)| Some((k, v?))))
+        .env_remove("VEIL_HOME")
+        .env("XDG_CONFIG_HOME", who.home.path())
+        .env("XDG_CACHE_HOME", who.home.path().join("cache"))
+        .env("XDG_RUNTIME_DIR", &shared)
+        .current_dir(who.home.path())
+        .output()
+        .unwrap();
+    // A process this test started, by its own handle.
+    let _ = other.kill();
+    let _ = other.wait();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(std::fs::read_to_string(c.join("src/lib.rs")).unwrap(), PUBLIC_MARK);
+    let got = std::fs::read(&log).unwrap_or_default();
+    assert!(!got.contains(&b'Q'), "the clone sent {} request(s) to another OS user's socket", got.iter().filter(|b| **b == b'Q').count());
+}
+
+/// BUG-1515's class without a second OS user: the daemon's place is taken
+/// from the environment as it is. An empty `XDG_CACHE_HOME` and
+/// `XDG_RUNTIME_DIR` (the XDG rules: empty or relative means unset) must
+/// leave the daemon in its default place, never a folder made where `vl`
+/// happens to run (here a thin clone's working copy).
+#[test]
+#[ignore = "BUG-1515: an empty XDG_CACHE_HOME or XDG_RUNTIME_DIR puts the daemon's folders in the directory vl runs in"]
+fn s6r2_an_empty_xdg_variable_never_puts_the_daemon_where_vl_runs() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let who = &p.dev;
+    let home = who.home.path();
+    let run = |cwd: &Path, args: &[&str]| {
+        let cmd = who.command(cwd, args);
+        let o = std::process::Command::new("timeout")
+            .arg("120")
+            .arg(cmd.get_program())
+            .args(cmd.get_args())
+            .envs(cmd.get_envs().filter_map(|(k, v)| Some((k, v?))))
+            .env_remove("VEIL_HOME")
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home)
+            .env("XDG_CACHE_HOME", "")
+            .env("XDG_RUNTIME_DIR", "")
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "vl {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    let work = who.dir("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let c = work.join("clone");
+    run(&work, &["clone", &hub.url(&p.name), c.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(c.join("src/lib.rs")).unwrap(), PUBLIC_MARK);
+    let t = Instant::now();
+    assert_eq!(run(&c, &["cat", "-r", "main", "src/lib.rs"]).trim(), PUBLIC_MARK);
+    let took = t.elapsed();
+    for dir in [&work, &c] {
+        assert!(!dir.join("veil").exists(), "the daemon's folders were made in {}", dir.display());
+    }
+    assert!(home.join(".cache/veil/daemon").is_dir(), "the daemon is not in its default place");
+    assert!(took < Duration::from_secs(2), "a command in the clone took {took:?}");
+}
