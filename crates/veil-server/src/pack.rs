@@ -168,7 +168,7 @@ impl Index {
     }
 
     /// [`Index::weight`] of an index of `count` slots.
-    fn weight_of(count: usize) -> usize {
+    pub fn weight_of(count: usize) -> usize {
         64 + count * std::mem::size_of::<(ObjectId, Slot)>()
     }
 }
@@ -961,11 +961,15 @@ mod tests {
             let s = parsed.get(id).unwrap();
             assert_eq!(index.get(id), Some(s));
             let bytes = &pack[s.offset as usize..=s.last() as usize];
-            assert_eq!(entry(id, bytes).unwrap(), &raw[..]);
+            assert_eq!(entry(id, s, bytes).unwrap(), &raw[..]);
             assert_eq!(s.encoding_len(), raw.len() as u64);
-            // Another object's entry is refused, whole or in part.
+            // Another object's entry is refused, whole or in part; so is a
+            // slot that does not end where the entry says it does (BUG-1497).
             let other = objects.iter().find(|(o, _)| o != id).unwrap().0;
-            assert!(entry(&other, bytes).is_err() && entry(id, &bytes[..10]).is_err());
+            assert!(entry(&other, s, bytes).is_err() && entry(id, s, &bytes[..10]).is_err());
+            let longer = Slot { len: s.len + 1, ..s };
+            let shorter = Slot { len: s.len - 1, ..s };
+            assert!(entry(id, longer, bytes).is_err() && entry(id, shorter, bytes).is_err(), "a slot of another length than the entry states");
         }
         assert!(parsed.get(&ObjectId::hash(b"absent")).is_none());
         assert_eq!(head_len(&pack[..HEAD]).unwrap(), (HEAD + 300 * ENTRY) as u64);
@@ -1000,8 +1004,9 @@ mod tests {
         overflow[HEAD + 32..HEAD + 40].copy_from_slice(&u64::MAX.to_be_bytes());
         assert!(parse_index(&overflow, None).is_err(), "an offset that overflows");
         let mut short = pack.to_vec();
-        short[HEAD + 40..HEAD + 44].copy_from_slice(&(ID_LEN as u32).to_be_bytes());
-        assert!(parse_index(&short, size).is_err(), "a slot with room for its id only");
+        short[HEAD + 40..HEAD + 44].copy_from_slice(&(ENTRY_HEAD as u32).to_be_bytes());
+        assert!(parse_index(&short, size).is_err(), "a slot with room for its entry's head only");
+        assert!(parse_index(b"veilpack2\n\0\0\0\0", None).is_err(), "a pack before cycle 4 (entries without their length) is not a pack");
         assert!(valid_name(&new_name()) && !valid_name("../x") && !valid_name(&"A".repeat(32)));
     }
 
@@ -1052,7 +1057,7 @@ mod tests {
         let name: Arc<str> = Arc::from(new_name());
         store.put(&key(7, &name), bytes).await.unwrap();
         // `refresh`, with the listing a database answered.
-        packs.add(7, vec![(name.clone(), Arc::new(index))], true);
+        packs.add(7, vec![(name.clone(), Some(Arc::new(index)))], true);
         assert!(total(&packs) <= budget, "within the budget: {}", total(&packs));
         assert!(packs.projects.lock().unwrap().contains_key(&7), "the project in use keeps its listing");
         // `Objects::in_pack`, right after: found, from storage if need be.
@@ -1065,7 +1070,7 @@ mod tests {
         let (n2, s) = found.expect("an object of a listed pack of a project past the budget is found");
         assert_eq!(n2, name);
         let (b, _) = store.get_range(&key(7, &name), s.offset, s.last()).await.unwrap().unwrap();
-        assert!(entry(&probe, &b).is_ok());
+        assert!(entry(&probe, s, &b).is_ok());
         // An object it does not hold: absent, not an error.
         let missing = ObjectId::hash(b"not in the pack");
         if matches!(packs.find(7, &missing), Found::Paged) {
@@ -1080,9 +1085,11 @@ mod tests {
     /// same project that pages the object's index in between (a clone's
     /// concurrent reads past the budget do) makes it loaded, so neither call
     /// searches it, and an object of a listed pack reads as missing. Here
-    /// the two lookups are interleaved by hand, as two tasks can be.
+    /// the two lookups are interleaved by hand, as two tasks can be. Fixed
+    /// (cycle 4): `find_paged` searches the loaded indexes and names the
+    /// unloaded ones under one read of the map, so together they cover every
+    /// listed pack, whatever pages in or out between the two calls.
     #[tokio::test]
-    #[ignore = "BUG-1495: a lookup racing another lookup's page-in reads a listed object as missing"]
     async fn bug_1495_a_lookup_racing_a_page_in_still_finds_its_object() {
         let budget = 1 << 20;
         let packs = Packs { budget, ..Packs::new(None) };
@@ -1120,9 +1127,10 @@ mod tests {
     /// is documented (`HUB.md` §13.20) to remove staged rows' packs, not
     /// discarded ones'. What a refused push uploaded (a plain-text secret,
     /// BUG-930) then stays stored. A server stopped between the update and
-    /// the deletes leaves the same.
+    /// the deletes leaves the same. Fixed (cycle 4): every delete is tried,
+    /// and S29's sweep removes discarded rows' packs
+    /// (`storage-and-cost.md` §8).
     #[tokio::test]
-    #[ignore = "BUG-1498: a failed delete stops a discard, and discarded packs left in storage are removed by nothing"]
     async fn bug_1498_a_failed_delete_leaves_no_other_discarded_pack_stored() {
         struct FailsOnce(crate::store::FsStore, std::sync::atomic::AtomicBool);
         #[async_trait::async_trait]
@@ -1156,7 +1164,8 @@ mod tests {
         let r = packs.discard(&store, 1, &names).await;
         assert!(r.is_err(), "the first delete fails");
         let left = store.list("p/1/pack/").await.unwrap();
-        assert!(left.len() <= 1, "packs discarded but left in storage after one failed delete: {left:?}");
+        assert_eq!(left.len(), 1, "every other discarded pack is deleted whatever one delete answers: {left:?}");
+        assert!(store.1.load(Ordering::SeqCst));
     }
 
     /// BUG-1396 (S28 cycle 2), the same class: the recent uploads of each
@@ -1164,13 +1173,15 @@ mod tests {
     /// kept for every pair that ever uploaded on this server, never dropped:
     /// unlike the staged indexes beside them (an `LruCache` of 32 MiB), the
     /// map grows with the server's uptime.
-    #[test]
-    fn bug_1396_recent_uploads_are_bounded() {
+    #[tokio::test]
+    async fn bug_1396_recent_uploads_are_bounded() {
         let packs = Packs::new(None);
         let index = Arc::new(build(vec![obj("one")]).unwrap().1);
         for person in 0..200_000 {
-            packs.staged_here(1, person, &Arc::from(new_name()), index.clone(), 100);
+            let held = Held::new(index.clone(), 100, packs.bound.take(index.weight() as u64).await.unwrap());
+            packs.staged_here(1, person, &Arc::from(new_name()), held);
         }
+        assert_eq!(packs.bound.available(), INDEXES_HELD - packs.staged.stats().weight, "the cache's indexes hold their shares, dropped ones gave theirs back");
         let kept = packs.recent.stats().entries;
         assert!(kept <= 10_000, "{kept} people's recent uploads kept, with nothing staged left to name for most");
     }
@@ -1219,5 +1230,71 @@ mod tests {
         let (accounted, grew) = (field("accounted="), field("grew="));
         assert!(accounted <= LOOKUP_BUDGET, "{line}");
         assert!(grew <= LOOKUP_BUDGET + (8 << 20), "the lookup maps took {} MiB of memory for a budget of {} MiB ({line})", grew >> 20, LOOKUP_BUDGET >> 20);
+    }
+
+    /// BUG-1496 (cycle 4 guarantee): every index held in memory outside
+    /// the lookup maps holds a share of one server-wide bound, taken before
+    /// it is read: one being read ([`read_index`]), the staged-index
+    /// cache's, a push's. Past the bound a read waits for a share and is
+    /// then answered [`IndexesFull`] (`warming`), never with an index held
+    /// outside it; `refresh` leaves a pack it has no share for unloaded, for
+    /// a lookup to read once one is free; a push keeps of a staged index only
+    /// the slots its receipts name ([`Packs::staged_slots`]), holding the
+    /// index itself only while it is read; and an index the cache drops gives
+    /// its share back.
+    #[tokio::test]
+    async fn indexes_held_outside_the_lookup_maps_share_one_bound() {
+        let total = 64 << 10;
+        let bound = Bound { most: total, wait: Duration::from_millis(100), ..Bound::new(total) };
+        let packs = Packs { bound: bound.clone(), ..Packs::new(None) };
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn BlobStore> = Arc::new(crate::store::FsStore::new(dir.path()));
+        // 1,000 objects: an index of 48 KiB, which with the parse's working
+        // copy and the bytes read takes more than half the bound.
+        let objects: Vec<_> = (0..1_000).map(|i| obj(&format!("held {i}"))).collect();
+        let ids: Vec<ObjectId> = objects.iter().map(|(id, _)| *id).collect();
+        let (bytes, _) = build(objects).unwrap();
+        let name: Arc<str> = Arc::from(new_name());
+        store.put(&key(7, &name), bytes.clone()).await.unwrap();
+        let held = read_index(&*store, &key(7, &name), &bound).await.unwrap().unwrap();
+        let weight = held.index.weight();
+        assert_eq!(bound.available(), total - weight, "an index read holds exactly its weight once parsed");
+        // A second read finds no share in time: refused, in about the wait.
+        let t = Instant::now();
+        let e = read_index(&*store, &key(7, &name), &bound).await.err().expect("no share is free for a second index");
+        assert!(indexes_full(&e), "{e:#}");
+        assert!(t.elapsed() < Duration::from_secs(5));
+        // Kept by the staged-index cache: the share stays with it, and a
+        // push reading the index from the cache takes none of its own,
+        // keeping only the slots its receipts name.
+        packs.staged_here(7, 1, &name, held);
+        assert_eq!(bound.available(), total - weight);
+        let slots = packs.staged_slots(&*store, 7, &name, &ids[..3]).await.unwrap().unwrap();
+        assert_eq!((slots.objects, slots.size, slots.slots.len()), (1_000, bytes.len() as u64, 3));
+        assert!(slots.slots.iter().all(|(id, _)| ids[..3].contains(id)));
+        assert_eq!(bound.available(), total - weight, "a push holds no index of its own");
+        // Dropped by the cache (evicted): its share comes back.
+        packs.staged.clear();
+        assert_eq!(bound.available(), total, "an index the cache dropped gave its share back");
+        // A push reading an index the cache does not hold: read under a
+        // share, kept only while the slots are taken.
+        let slots = packs.staged_slots(&*store, 7, &name, &ids[..3]).await.unwrap().unwrap();
+        assert_eq!((slots.objects, slots.slots.len()), (1_000, 3));
+        assert_eq!(bound.available(), total, "the index is not held once the slots are");
+        // `refresh` (its listing in hand) while another holder has the whole
+        // bound: the pack enters the map unloaded, nothing is read into
+        // memory, and a lookup pages it in once a share is free.
+        let other = bound.take(total as u64).await.unwrap();
+        let p = packs.project(7);
+        let reads = AtomicU64::new(0);
+        packs.load_listed(&p, &store, 7, vec![name.to_string()], &reads).await.unwrap();
+        assert!(matches!(packs.find(7, &ids[0]), Found::Paged), "the pack is listed and unloaded");
+        let e = packs.find_paged(&store, 7, &ids[0], &reads).await.expect_err("no share: the lookup is refused (warming)");
+        assert!(indexes_full(&e), "{e:#}");
+        drop(other);
+        let found = packs.find_paged(&store, 7, &ids[0], &reads).await.unwrap();
+        assert_eq!(found.map(|(n, _)| n), Some(name.clone()), "found once a share is free");
+        assert!(matches!(packs.find(7, &ids[0]), Found::At(..)), "and loaded into the lookup maps");
+        assert_eq!(bound.available(), total, "the lookup maps' indexes are bounded by the lookup budget, not the bound");
     }
 }

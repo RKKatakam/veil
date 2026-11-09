@@ -126,6 +126,12 @@ impl IntoResponse for Error {
                 eprintln!("veil-server: database error [{code}]: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error".to_string())
             }
+            // No share of the server's bound on pack indexes came free in
+            // time (BUG-1496): the caller may try again.
+            Error::Other(e) if crate::pack::indexes_full(&e) => {
+                eprintln!("veil-server: {e:#}");
+                return Error::new(StatusCode::SERVICE_UNAVAILABLE, "busy", e.to_string()).into_response();
+            }
             Error::Other(e) => {
                 eprintln!("veil-server: error: {e:#}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error".to_string())

@@ -687,8 +687,9 @@ fn an_unread_plain_text_secret_beside_a_landing_push_is_not_kept() {
         hub.rt.block_on(sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND state = 1").bind(pid).fetch_all(&h.db)).unwrap();
     let store = hub.blob_store();
     for n in &names {
-        let (index, _) = hub.rt.block_on(veil_server::pack::read_index(&*store, &veil_server::pack::key(pid, n))).unwrap().unwrap();
-        assert!(index.get(&sid).is_none(), "the unread secret is in listed pack {n}");
+        let bound = veil_server::pack::Bound::new(veil_server::pack::INDEXES_HELD);
+        let held = hub.rt.block_on(veil_server::pack::read_index(&*store, &veil_server::pack::key(pid, n), &bound)).unwrap().unwrap();
+        assert!(held.index.get(&sid).is_none(), "the unread secret is in listed pack {n}");
     }
     assert_eq!(read_file(&fresh.api(), &c.token, &p.name, "src/landed.rs").as_deref(), Some(&b"MARKER-LANDED-BESIDE-A-SECRET-2b7e"[..]));
 }
@@ -1025,9 +1026,11 @@ fn hostile_bug_1397_api_commits_read_their_uploads_within_the_servers_bound() {
 /// while it reads them). The same class: `Packs::refresh` holds every index
 /// of a project it has not read before it adds any (the first lookup of a
 /// large project on a server), `Packs::find_paged` one per lookup, with any
-/// number at once. Hostile size: run alone.
+/// number at once. Fixed (cycle 4): every index held outside the lookup
+/// maps holds a share of one server-wide bound (`pack::INDEXES_HELD`, 96
+/// MiB), taken before it is read; a push keeps only the slots its receipts
+/// name; `refresh` loads each index as it is read. Hostile size: run alone.
 #[test]
-#[ignore = "BUG-1496: a push holds every staged index its receipts name, outside any bound on memory"]
 fn hostile_bug_1496_pushes_hold_the_staged_indexes_they_name_within_a_bound() {
     let hub = TestHub::start();
     let p = setup_project(&hub);

@@ -834,7 +834,7 @@ fn an_uploaded_frame_of_raw_blocks_round_trips_to_its_id() {
     // encoding; not the project's until a push lists it.
     let receipt = r.json()["receipts"][0].as_str().unwrap().to_string();
     let pack = receipt.split_once('.').unwrap().1.to_string();
-    let (index, _) = hub.rt.block_on(hubref.objects.staged_index(pid, &pack)).unwrap().unwrap();
+    let index = hub.rt.block_on(hubref.objects.staged_index(pid, &pack)).unwrap().unwrap().index.clone();
     let (stored, got) = hub.rt.block_on(hubref.objects.get_staged(pid, &pack, index.get(&id).unwrap(), &id)).unwrap().unwrap();
     assert_eq!(&stored[..], &encoding::encode(&raw)[..], "stored as the server's own encoding");
     assert_eq!(&*encoding::decode(&id, &stored, 1 << 20).unwrap(), &raw[..]);

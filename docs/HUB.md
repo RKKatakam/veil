@@ -2452,23 +2452,27 @@ Nothing changes for `vl` or on the wire.
   before S28) are not accepted.
 * **A pack** is one storage object, `p/<project>/pack/<name>` (`name`: 128
   random bits in hex), never edited in place:
-  `"veilpack2\n" ‖ count u32be ‖ index ‖ entries`. The index, at the front,
+  `"veilpack3\n" ‖ count u32be ‖ index ‖ entries`. The index, at the front,
   is `count × (id 32 ‖ offset u64be ‖ len u32be)`, sorted by id; **each
-  entry is the object's id followed by its S27 encoding**, and the slot
-  spans both. Object ids stay the BLAKE3 of the canonical encoding. The
-  index is read with one ranged `GET` of the first 64 KiB (a second for a
-  larger index); an object with a ranged `GET` of its slot. **Every read
-  checks the id the entry starts with before it uses a byte of it**, a
-  `Range` read too (`pack::entry`; a range far into a large object reads
-  the id first, then the range), so a wrong slot (a damaged index, a
-  merger's mistake) is an error, never another object's bytes (BUG-1154);
-  a whole read is also decoded and checked against the id. **The slots
-  must tile the pack exactly** (`pack::parse_index`: by offset, each starts
-  where the one before ends, the first at the index's end, the last at the
-  pack's end), so a slot's end is as checked as its start and a read never
-  leaves its slot (BUG-1394). S29 merges packs
-  by reading indexes and copying entries, and drops an object by writing a
-  pack without it.
+  entry is the object's id, the length of its encoding (u32be), then its
+  S27 encoding**, and the slot spans all three. Object ids stay the BLAKE3
+  of the canonical encoding. The index is read with one ranged `GET` of
+  the first 64 KiB (a second for a larger index); an object with a ranged
+  `GET` of its slot. **Every read checks the id and the length the entry
+  starts with against its slot before it uses a byte of it**, a `Range`
+  read too (`pack::entry`; a range far into a large object reads the
+  entry's head first, then the range): the id ties the slot's start to the
+  object, the stated length its end, so a wrong slot (a damaged index, a
+  merger's mistake, a boundary moved between two neighbours) is an error,
+  never another object's bytes (BUG-1154, BUG-1394, BUG-1497); a whole
+  read is also decoded and checked against the id. **The slots must tile
+  the pack exactly** (`pack::parse_index`: by offset, each starts where
+  the one before ends, the first at the index's end, the last at the
+  pack's end), and each entry's stated length says where that boundary
+  must be, so a read never leaves its slot. `veilpack2` (S28 before cycle
+  4: entries without their length; never deployed) is not a pack to this
+  reader. S29 merges packs by reading indexes and copying entries, and
+  drops an object by writing a pack without it.
 * **The `packs` table** (migration 13) has a row for every pack in storage:
   *staged* (an upload's, with its uploader), *listed* (its objects are the
   project's) or *discarded* (its storage object is deleted after the row
@@ -2505,7 +2509,8 @@ Nothing changes for `vl` or on the wire.
     pusher's signed projections), into **one pack of its own**;
   * lists them in its one transaction (one statement more), and refuses
     with 409 if a pack it names was discarded first (`vl` uploads again);
-  * discards every staged pack it did not list.
+  * discards every staged pack it did not list (every delete tried,
+    whatever another answers: BUG-1498).
   **A push its checks refuse** (a secret in plain text, a path the pusher
   may not write, anything answered before its transaction) discards its
   staged packs and deletes its own, so **a refused upload stays in the
@@ -2523,7 +2528,9 @@ Nothing changes for `vl` or on the wire.
   stopped `vl push`, a dropped connection) stops the request, not the
   push, whose clean-up then discards what it did not list.
 * **What storage holds that no push listed** (until S29's job removes the
-  staged rows older than its grace, and their packs): staged packs, each
+  staged rows older than its grace, and their packs, and the packs of
+  discarded rows that a failed delete or a stopped server left in storage:
+  BUG-1498, `storage-and-cost.md` §8): staged packs, each
   with its row: of each push that lost every race since (one per upload
   request, reused by its retries on the same server; one per server a
   retry reaches), of uploads no push followed, and those of a request run
@@ -2549,7 +2556,22 @@ Nothing changes for `vl` or on the wire.
   in use: a lookup that needs an unloaded index reads it again from storage
   (`pack::Packs::find_paged`), so **a project of any size always reads**
   (BUG-1395, BUG-1396). Weights are read from the maps under one lock, so
-  eviction and additions never miscount. Then loose (objects from
+  eviction and additions never miscount. Such a lookup searches the loaded
+  indexes and names the unloaded ones **under one read of the map**, then
+  reads those from storage, so together they cover every listed pack and
+  **no lookup answers "missing" for a stored object**, whatever other
+  lookups page in or out meanwhile (BUG-1495). **Every pack index held in
+  memory outside the lookup maps holds a share of one server-wide bound**
+  (`pack::INDEXES_HELD`, 96 MiB for every request together, of which the
+  staged-index cache may hold 32 MiB), taken before the index is read or
+  built: one being read for a lookup or a listing, the pack a push writes,
+  and a push's staged uploads' (a push keeps of each only the slots its
+  receipts name and the index's object count; the index itself is held
+  while it is read). A listing loads each index as it is read and leaves
+  the rest unloaded when the bound is full (a lookup reads them later);
+  a request that gets no share within 10 s is answered 503 `busy` (try
+  again), never with an index held outside the bound (BUG-1496). Then
+  loose (objects from
   before S28, and what grants, API commits, the deriver and the search
   index store). After a miss in both it reads the project's listing again
   (one statement, unless a listing began after the miss: it holds every
@@ -2633,7 +2655,11 @@ After S28's cycle 3 (the read and push paths changed: tiled slots, paged
 indexes, the push in a task of its own), `bench-server.sh 1g` @ `7ebc199c`,
 on a busy machine (load 103 → 21, so times are noisy): push 87.8 s and
 890 MiB, full clone 54.5 s and 929 MiB, clone of one directory 8.7 s and
-895 MiB; every case under the gates.
+895 MiB; every case under the gates. After cycle 4 (`veilpack3` entry lengths,
+held indexes bounded under `pack::INDEXES_HELD`), on an isolated 8-vCPU, 16 GB
+Boat machine: push 157.5 s and 905 MiB, thin clone 21.5 s and 853 MiB, full
+clone 98.6 s and 904 MiB, clone of one directory 16.4 s and 840 MiB; every case
+under the gates.
 
 **BUG-1089 and BUG-1000** (bisected: `31639c3` 972 MiB, `d8cf2b2` 967 MiB,
 `b2478b5` 1,356 MiB): objects read from S3 were cached as slices of the HTTP

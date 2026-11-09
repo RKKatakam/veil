@@ -590,7 +590,7 @@ pub fn stored_bytes(path: &Path) -> Vec<u8> {
         let index = veil_server::pack::parse_index(&b, Some(b.len() as u64)).expect("a pack the server wrote");
         let mut out = Vec::new();
         for (id, s) in index.iter() {
-            let enc = veil_server::pack::entry(id, &b[s.offset as usize..=s.last() as usize]).expect("an entry starts with its id");
+            let enc = veil_server::pack::entry(id, *s, &b[s.offset as usize..=s.last() as usize]).expect("an entry starts with its id and its length");
             out.extend_from_slice(&encoding::decode(id, enc, u64::MAX).expect("a packed object matches its id"));
         }
         return out;

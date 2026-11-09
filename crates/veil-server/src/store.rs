@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use veil_core::{cache::LruCache, hub::encoding, ObjectId};
 
-use crate::pack::{Found, Index, Slot};
+use crate::pack::{Found, Held, Index, Slot, StagedSlots};
 
 #[async_trait]
 pub trait BlobStore: Send + Sync {
@@ -1190,7 +1190,7 @@ mod tests {
         // Staged: not the project's, whatever the cache holds.
         assert!(objects.get(1, &pid).await.unwrap().is_none());
         assert!(!objects.exists(1, &bid).await.unwrap());
-        let (index, _) = objects.staged_index(1, &name).await.unwrap().unwrap();
+        let index = objects.staged_index(1, &name).await.unwrap().unwrap().index.clone();
         let (_, raw) = objects.get_staged(1, &name, index.get(&bid).unwrap(), &bid).await.unwrap().unwrap();
         assert_eq!(raw, big);
         // A slot that names another object's bytes is refused (read from
@@ -1244,7 +1244,8 @@ mod tests {
         let (oid, hid) = (ObjectId::hash(&open), ObjectId::hash(&hidden));
         let encs = vec![(oid, encode(open.clone())), (hid, encode(hidden.clone()))];
         assert!(!encoding::is_compressed(&encs[0].1) && !encoding::is_compressed(&encs[1].1), "both stored plain");
-        let (name, index, _) = objects.put_pack(1, 7, encs).await.unwrap();
+        let (name, held) = objects.put_pack(1, 7, encs).await.unwrap();
+        let index = held.index.clone();
         // The index damaged: the open object's entry names the hidden one's
         // slot (the rest of the pack intact).
         let path = dir.path().join(crate::pack::key(1, &name));
@@ -1301,7 +1302,8 @@ mod tests {
         let (oid, hid) = (ObjectId::hash(&open), ObjectId::hash(&hidden));
         let encs = vec![(oid, encode(open.clone())), (hid, encode(hidden.clone()))];
         assert!(!encoding::is_compressed(&encs[0].1) && !encoding::is_compressed(&encs[1].1), "both stored plain");
-        let (name, index, _) = objects.put_pack(1, 7, encs).await.unwrap();
+        let (name, held) = objects.put_pack(1, 7, encs).await.unwrap();
+        let index = held.index.clone();
         let (os, hs) = (index.get(&oid).unwrap(), index.get(&hid).unwrap());
         assert_eq!(os.offset + u64::from(os.len), hs.offset, "the hidden entry follows the open one");
         // The index damaged: the open object's slot as long as both entries.
@@ -1349,7 +1351,8 @@ mod tests {
         let raws: Vec<Bytes> = (0..3).map(|i| Bytes::from(format!("veil:blob\nneighbour {i}: MARKER-NEIGHBOUR-{i}-ab37"))).collect();
         let encs: Vec<(ObjectId, Bytes)> = raws.iter().map(|r| (ObjectId::hash(r), encode(r.clone()))).collect();
         let ids: Vec<ObjectId> = encs.iter().map(|(id, _)| *id).collect();
-        let (name, index, _) = objects.put_pack(1, 7, encs).await.unwrap();
+        let (name, held) = objects.put_pack(1, 7, encs).await.unwrap();
+        let index = held.index.clone();
         let path = dir.path().join(crate::pack::key(1, &name));
         let mut bytes = std::fs::read(&path).unwrap();
         let mid = index.get(&ids[1]).unwrap();
@@ -1405,8 +1408,9 @@ mod tests {
                     encs.push((ObjectId::hash(&raw), enc));
                 }
                 let ids: Vec<ObjectId> = encs.iter().map(|(id, _)| *id).collect();
-                let (name, index, _) = objects.put_pack(1, 7, encs).await.unwrap();
-                drop(objects);
+                let (name, held) = objects.put_pack(1, 7, encs).await.unwrap();
+                let index = held.index.clone();
+                drop((held, objects));
                 // A server that has not read them.
                 let fresh = Arc::new(Objects::new(Arc::new(FsStore::new(dir.path())), 64 << 20));
                 fresh.listed_here(1, vec![(name, index)]);
@@ -1477,9 +1481,11 @@ mod tests {
         }
     }
 
-    /// The pack's head: the magic and the count; one index entry.
+    /// The pack's head: the magic and the count; one index entry; what an
+    /// entry in the pack starts with (its id and its length).
     const PACK_HEAD: usize = 14;
     const PACK_ENTRY: usize = 44;
+    const ENTRY_HEAD: usize = crate::pack::ENTRY_HEAD as usize;
 
     /// The objects of the damage tests (id, object, encoding): plain ones
     /// of one length (so slots can be swapped), compressed ones, and a large
@@ -1570,18 +1576,18 @@ mod tests {
     /// A pack of the damage tests in `dir`: its name, bytes and index.
     async fn damage_pack(dir: &std::path::Path, objs: &[(ObjectId, Bytes, Bytes)]) -> (Arc<str>, Vec<u8>, Arc<Index>) {
         let objects = Objects::new(Arc::new(FsStore::new(dir)), 1 << 20);
-        let (name, index, _) = objects.put_pack(1, 7, objs.iter().map(|(id, _, enc)| (*id, enc.clone())).collect()).await.unwrap();
+        let (name, held) = objects.put_pack(1, 7, objs.iter().map(|(id, _, enc)| (*id, enc.clone())).collect()).await.unwrap();
         let bytes = std::fs::read(dir.join(crate::pack::key(1, &name))).unwrap();
-        (name, bytes, index)
+        (name, bytes, held.index.clone())
     }
 
     /// Guarantee 1 of S28 (cycle 3 review): a read of one packed object
     /// answers exactly that object, or refuses, however the pack or its
     /// index is damaged: any byte of the index, slots of other entries,
     /// ids of other entries, the pack truncated before or after its index
-    /// was read, entries swapped in the pack. Whole, encoded, ranged,
-    /// neighbour and blocking reads. (A boundary moved between two
-    /// neighbouring slots is BUG-1497, below.)
+    /// was read, entries swapped in the pack, a boundary moved between two
+    /// neighbouring slots (BUG-1497; also its own test, below). Whole,
+    /// encoded, ranged, neighbour and blocking reads.
     #[tokio::test]
     async fn packed_reads_answer_their_own_object_or_refuse_whatever_the_damage() {
         let dir = tempfile::tempdir().unwrap();
@@ -1594,10 +1600,10 @@ mod tests {
         let hl = PACK_HEAD + objs.len() * PACK_ENTRY;
         let mut rng = Rng(0x2545_f491_4f6c_dd1d);
         let (mut parsed, mut refused) = (0, 0);
-        for case in 0..240 {
+        for case in 0..280 {
             let mut bytes = intact.clone();
             let mut stale: Option<Vec<u8>> = None;
-            let kind = case % 6;
+            let kind = case % 7;
             let e = |i: u64| PACK_HEAD + i as usize * PACK_ENTRY;
             let n = objs.len() as u64;
             match kind {
@@ -1631,11 +1637,35 @@ mod tests {
                     stale = Some(bytes.clone());
                     bytes.truncate(hl + rng.below((intact.len() - hl) as u64) as usize);
                 }
+                // A boundary moved between two neighbouring slots: the first
+                // longer by `d`, the next starting `d` later and shorter by
+                // `d`, so the slots still tile the pack (BUG-1497).
+                5 => {
+                    let slot = |i: usize| {
+                        let at = e(i as u64);
+                        (u64::from_be_bytes(bytes[at + 32..at + 40].try_into().unwrap()), u32::from_be_bytes(bytes[at + 40..at + 44].try_into().unwrap()))
+                    };
+                    let mut by_offset: Vec<usize> = (0..n as usize).collect();
+                    by_offset.sort_by_key(|&i| slot(i).0);
+                    let w = rng.below(n - 1) as usize;
+                    let (a, b) = (by_offset[w], by_offset[w + 1]);
+                    let ((oa, la), (ob, lb)) = (slot(a), slot(b));
+                    let d = rng.below(120) as i64 - 60;
+                    let (la2, lb2) = (i64::from(la) + d, i64::from(lb) - d);
+                    if d == 0 || la2 <= ENTRY_HEAD as i64 || lb2 <= ENTRY_HEAD as i64 {
+                        continue;
+                    }
+                    let (ea, eb) = (e(a as u64), e(b as u64));
+                    bytes[ea + 40..ea + 44].copy_from_slice(&(la2 as u32).to_be_bytes());
+                    bytes[eb + 32..eb + 40].copy_from_slice(&((ob as i64 + d) as u64).to_be_bytes());
+                    bytes[eb + 40..eb + 44].copy_from_slice(&(lb2 as u32).to_be_bytes());
+                    assert_eq!(oa + la2 as u64, (ob as i64 + d) as u64);
+                }
                 // Two slots of the same length swapped in the index (the
                 // plain objects, all of one length), or their entries swapped
                 // in the pack.
                 _ => {
-                    let plain: Vec<u64> = (0..n).filter(|i| u32::from_be_bytes(bytes[e(*i) + 40..e(*i) + 44].try_into().unwrap()) as usize == 32 + objs[0].2.len()).collect();
+                    let plain: Vec<u64> = (0..n).filter(|i| u32::from_be_bytes(bytes[e(*i) + 40..e(*i) + 44].try_into().unwrap()) as usize == ENTRY_HEAD + objs[0].2.len()).collect();
                     assert!(plain.len() >= 2, "plain objects of one length");
                     let (a, b) = (plain[rng.below(plain.len() as u64) as usize], plain[rng.below(plain.len() as u64) as usize]);
                     let (oa, ob) = (e(a), e(b));
@@ -1645,7 +1675,7 @@ mod tests {
                         bytes[ob + 32..ob + 40].copy_from_slice(&sa);
                     } else {
                         let off = |o: usize| u64::from_be_bytes(intact[o + 32..o + 40].try_into().unwrap()) as usize;
-                        let l = 32 + objs[0].2.len();
+                        let l = ENTRY_HEAD + objs[0].2.len();
                         let (pa, pb) = (off(oa), off(ob));
                         let (ea, eb) = (intact[pa..pa + l].to_vec(), intact[pb..pb + l].to_vec());
                         bytes[pa..pa + l].copy_from_slice(&eb);
@@ -1666,7 +1696,7 @@ mod tests {
             reads_answer_their_own_objects(dir.path(), &name, &damaged, &objs, &format!("case {case} (kind {kind})")).await;
         }
         println!("damage cases: {parsed} indexes accepted and read, {refused} refused");
-        assert!(parsed >= 40 && refused >= 40, "both kinds of outcome are exercised: {parsed} read, {refused} refused");
+        assert!(parsed >= 60 && refused >= 40, "both kinds of outcome are exercised: {parsed} read, {refused} refused");
     }
 
     /// BUG-1497 (S28 cycle 3 review; BUG-1394's class, a route the fix did
@@ -1677,9 +1707,11 @@ mod tests {
     /// by `d`: a merger's off-by-`d`, BUG-1154's model) and the slots still
     /// tile: the first passes its id check, and a ranged read of a plain
     /// object serves its own bytes and then the next entry's id and bytes
-    /// (or, moved the other way, a length that is not the object's).
+    /// (or, moved the other way, a length that is not the object's). Fixed
+    /// (cycle 4, `veilpack3`): each entry states its encoding's length after
+    /// its id, and every read checks both against its slot (`pack::entry`),
+    /// so a slot is tied to its entry at both ends.
     #[tokio::test]
-    #[ignore = "BUG-1497: a boundary moved between two neighbouring slots passes the tiling check, and a range serves the neighbour's bytes"]
     async fn bug_1497_a_boundary_moved_between_neighbours_never_serves_the_neighbours_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let objs = damage_objects();
@@ -1701,10 +1733,10 @@ mod tests {
         let mut moved = 0;
         for w in by_offset.windows(2) {
             let (a, b) = (w[0], w[1]);
-            for d in [48i64, 33, 32, 31, 1, -1, -8] {
+            for d in [48i64, 37, 36, 35, 33, 32, 31, 4, 1, -1, -4, -8, -36] {
                 let ((oa, la), (ob, lb)) = (slot(&intact, a), slot(&intact, b));
                 let (la2, lb2) = (i64::from(la) + d, i64::from(lb) - d);
-                if la2 <= 32 || lb2 <= 32 {
+                if la2 <= ENTRY_HEAD as i64 || lb2 <= ENTRY_HEAD as i64 {
                     continue;
                 }
                 let mut bytes = intact.clone();

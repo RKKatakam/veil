@@ -48,7 +48,7 @@ use veil_core::{
 
 use crate::{
     error::{Error, Result},
-    pack::{Index, Slot},
+    pack::{Held, Slot, StagedSlots},
     perm::{Project, Viewer},
     Hub,
 };
@@ -97,8 +97,23 @@ pub struct Source {
     pub staged: Option<Arc<Staged>>,
 }
 
-/// A pack's name, index and length.
-type StagedPack = (Arc<str>, Arc<Index>, u64);
+/// A staged pack a push's receipts name: its name, and what the push
+/// keeps of its index (BUG-1496): how many objects it holds, its length
+/// and the slots of the objects the receipts name.
+type StagedPack = (Arc<str>, StagedSlots);
+
+/// A pack a landing push lists: its name, its length and, for the pack
+/// it wrote itself, its index (held under its share of the server's bound
+/// on indexes until it joins the lookup maps: BUG-1496). A staged pack
+/// listed as it is has no index in hand: the lookup maps take the
+/// staged-index cache's, or read it when a lookup needs it.
+struct ListedPack {
+    name: Arc<str>,
+    size: u64,
+    /// How many objects it holds.
+    objects: usize,
+    held: Option<Held>,
+}
 
 /// What a push's receipts name in staged packs, and the objects the server
 /// made for it (S28). None of it is the project's until the push's
@@ -108,7 +123,7 @@ type StagedPack = (Arc<str>, Arc<Index>, u64);
 pub struct Staged {
     /// Each receipted object in a staged pack: the pack and its slot.
     at: Arc<HashMap<ObjectId, (Arc<str>, Slot)>>,
-    /// The staged packs: index and length.
+    /// The staged packs: what the push keeps of each index.
     packs: Arc<Vec<StagedPack>>,
     /// Objects the server made for the push (canonical encodings).
     made: Arc<Mutex<HashMap<ObjectId, Bytes>>>,
@@ -1766,9 +1781,9 @@ async fn push_staged(
     let pid = project.id;
     let plans2 = plans.clone();
     let packs: (Vec<String>, Vec<i64>, Vec<i64>) = (
-        listed.iter().map(|p| p.0.to_string()).collect(),
-        listed.iter().map(|p| p.2 as i64).collect(),
-        listed.iter().map(|p| p.1.len() as i64).collect(),
+        listed.iter().map(|p| p.name.to_string()).collect(),
+        listed.iter().map(|p| p.size as i64).collect(),
+        listed.iter().map(|p| p.objects as i64).collect(),
     );
     // Nothing to move (every update refused: the pusher pulls and tries
     // again): no commit, and nothing recorded as history no branch reaches.
@@ -1903,7 +1918,7 @@ async fn push_staged(
     };
     if !moved.is_empty() {
         // Before anything reads what it stored.
-        hub.objects.listed_here(project.id, listed.iter().map(|p| (p.0.clone(), p.1.clone())).collect());
+        hub.objects.listed(project.id, listed.iter().map(|p| (p.name.clone(), p.held.as_ref().map(|h| h.index.clone()))).collect());
         hub.caches.tips_changed(project.id);
         for c in &completed {
             hub.caches.put_committed(project.id, &c.real);
@@ -1941,7 +1956,7 @@ async fn push_staged(
         };
         results.push(BranchResult { branch, ok: true, message: None, tip });
     }
-    let kept = landed.then(|| listed.into_iter().map(|p| p.0).collect());
+    let kept = landed.then(|| listed.into_iter().map(|p| p.name).collect());
     Ok((PushResult { results, warnings }, kept))
 }
 
@@ -2002,18 +2017,19 @@ async fn packs_to_list(
     touched: &HashSet<ObjectId>,
     made: &[ObjectId],
     progress: &Mutex<Progress>,
-) -> Result<Vec<StagedPack>> {
+) -> Result<Vec<ListedPack>> {
     let mut listed = Vec::new();
     let mut kept: HashSet<ObjectId> = HashSet::new();
-    for (name, index, size) in st.packs.iter() {
-        if !index.is_empty() && index.iter().all(|(id, _)| touched.contains(id)) {
-            kept.extend(index.iter().map(|(id, _)| *id));
-            listed.push((name.clone(), index.clone(), *size));
+    for (name, sp) in st.packs.iter() {
+        // Every object of the pack: one the receipts name here, and read.
+        if sp.objects > 0 && sp.slots.len() == sp.objects && sp.slots.iter().all(|(id, _)| touched.contains(id)) {
+            kept.extend(sp.slots.iter().map(|(id, _)| *id));
+            listed.push(ListedPack { name: name.clone(), size: sp.size, objects: sp.objects, held: None });
         }
     }
     let mut own: Vec<(ObjectId, Bytes)> = Vec::new();
-    for (name, index, _) in st.packs.iter() {
-        for (id, slot) in index.iter() {
+    for (name, sp) in st.packs.iter() {
+        for (id, slot) in sp.slots.iter() {
             if touched.contains(id) && kept.insert(*id) {
                 let (enc, _) = hub
                     .objects
@@ -2037,9 +2053,9 @@ async fn packs_to_list(
         own.extend(enc);
     }
     if !own.is_empty() {
-        let (name, index, size) = hub.objects.put_pack(project, person, own).await.map_err(Error::Other)?;
+        let (name, held) = hub.objects.put_pack(project, person, own).await.map_err(Error::Other)?;
         progress.lock().unwrap().written.push(name.clone());
-        listed.push((name, index, size));
+        listed.push(ListedPack { name, size: held.size, objects: held.index.len(), held: Some(held) });
     }
     Ok(listed)
 }
@@ -2106,40 +2122,46 @@ pub(crate) fn receipted(hub: &Hub, project: i64, person: i64, receipts: &std::co
 }
 
 /// The staged packs `staged` names (from [`receipted`]) that `person`
-/// uploaded and nobody discarded (the database's rows: BUG-1155), each
-/// one's index, and where each object is. **An object counts as uploaded
-/// only if its receipt's pack holds it** ([`Staged::uploaded`]): a receipt
-/// of a discarded upload, or of another pack, is worth nothing, and the
-/// object is never looked for in the project's store instead.
+/// uploaded and nobody discarded (the database's rows: BUG-1155), what
+/// the push keeps of each one's index (its object count, its length and
+/// the slots of the objects the receipts name in it: the index itself is
+/// held, under its share of the server's bound on indexes, only while it
+/// is read, BUG-1496), and where each object is. **An object counts as
+/// uploaded only if its receipt's pack holds it** ([`Staged::uploaded`]):
+/// a receipt of a discarded upload, or of another pack, is worth nothing,
+/// and the object is never looked for in the project's store instead.
 async fn staging(hub: &Arc<Hub>, project: i64, person: i64, staged: &HashMap<ObjectId, Arc<str>>) -> Result<Staged> {
-    let mut names: Vec<Arc<str>> = staged.values().cloned().collect();
+    let mut by_pack: HashMap<Arc<str>, Vec<ObjectId>> = HashMap::new();
+    for (id, n) in staged {
+        by_pack.entry(n.clone()).or_default().push(*id);
+    }
+    let mut names: Vec<Arc<str>> = by_pack.keys().cloned().collect();
     names.sort();
-    names.dedup();
     let usable = hub.objects.usable(project, person, &names).await.map_err(Error::Other)?;
-    let mut packs = Vec::new();
+    let mut packs: Vec<StagedPack> = Vec::new();
     let mut set = tokio::task::JoinSet::new();
     let mut it = names.into_iter().filter(|n| usable.contains(n));
     loop {
         while set.len() < 16 {
             let Some(n) = it.next() else { break };
             let h = hub.clone();
+            let ids = by_pack.remove(&n).unwrap_or_default();
             set.spawn(async move {
-                let r = h.objects.staged_index(project, &n).await;
+                let r = h.objects.staged_slots(project, &n, &ids).await;
                 (n, r)
             });
         }
         match set.join_next().await {
-            Some(Ok((n, Ok(Some((index, size)))))) => packs.push((n, index, size)),
+            Some(Ok((n, Ok(Some(slots))))) => packs.push((n, slots)),
             Some(Ok((_, Ok(None)))) => {}
             Some(Ok((_, Err(e)))) => return Err(Error::Other(e)),
             Some(Err(e)) => return Err(Error::Other(e.into())),
             None => break,
         }
     }
-    let by_name: HashMap<&str, &Arc<Index>> = packs.iter().map(|(n, i, _)| (&**n, i)).collect();
-    let at = staged
+    let at = packs
         .iter()
-        .filter_map(|(id, n)| Some((*id, (n.clone(), by_name.get(&**n)?.get(id)?))))
+        .flat_map(|(n, sp)| sp.slots.iter().map(move |(id, s)| (*id, (n.clone(), *s))))
         .collect();
     Ok(Staged {
         at: Arc::new(at),
