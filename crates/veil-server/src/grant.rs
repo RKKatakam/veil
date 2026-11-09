@@ -411,19 +411,29 @@ pub(crate) fn parse_range(h: &HeaderMap) -> Option<(u64, u64)> {
 /// at the end of `Veil-Chain`, the request signed in `Veil-Signature`;
 /// `Range` supported (a dropped download resumes), reading only the bytes
 /// asked for.
-pub async fn get_object(State(hub): State<HubState>, Path((p, id)): Path<(String, String)>, headers: HeaderMap) -> Result<Response> {
+pub async fn get_object(
+    State(hub): State<HubState>,
+    Path((p, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    asker: Option<axum::Extension<crate::limits::answers::For>>,
+) -> Result<Response> {
     let token = header(&headers, "veil-grant").ok_or_else(grant_invalid)?;
     let id = ObjectId::from_hex(&id).map_err(|_| Error::bad_request("an object id is 64 hex digits"))?;
     let chain = parse_chain(&headers)?;
     let (ts, sig) = parse_signature(&headers)?;
     let (grant, project) = check(&hub, &p, token, ts, sig.as_deref(), &[id]).await?;
-    if reached(&hub, project, &grant, vec![(chain, id)]).await?.is_empty() {
+    let Some(&(_, size)) = reached(&hub, project, &grant, vec![(chain, id)]).await?.first() else {
         return Err(not_reached());
-    }
+    };
     let octets = (header::CONTENT_TYPE, "application/octet-stream".to_string());
     let Some((start, end)) = parse_range(&headers) else {
+        // Its share of the answers' budget before it is read (S24,
+        // BUG-1330): a request refused reads nothing.
+        let paid = crate::limits::answers::prepay(&hub, asker.map(|e| e.0), size).await?;
         let raw = read(&hub, project, &id).await?.ok_or_else(not_reached)?;
-        return Ok(([octets], raw).into_response());
+        let mut resp = ([octets], raw).into_response();
+        resp.extensions_mut().insert(paid);
+        return Ok(resp);
     };
     let (part, len) = match sync::builtin(&id) {
         Some(b) => (crate::store::slice(&b, start, end), b.len() as u64),

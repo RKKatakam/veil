@@ -36,6 +36,7 @@ fn a_chain_of_links_never_reaches_the_projects_isolated_files() {
     assert!(ls.contains("s1/s2/s3/s4/u ->") && ls.contains("s1/s2/s3/s4/x ->"), "{ls}");
     env.ok(U, &proj, &["ws", "new", "agent", "-r", "@-"]);
     let out = env.vl(U, &proj, &["ws", "exec", "agent", "--", "cat", "s1/s2/s3/s4/x"]);
+    assert!(!out.status.success(), "{}", text(&out));
     assert!(!text(&out).contains(SECRET), "the sandboxed command read the isolated .netrc through the links:\n{}", text(&out));
 }
 
@@ -50,6 +51,7 @@ fn control_a_single_escaping_link_is_blocked() {
     env.ok(U, &proj, &["commit", "-m", "link"]);
     env.ok(U, &proj, &["ws", "new", "agent", "-r", "@-"]);
     let out = env.vl(U, &proj, &["ws", "exec", "agent", "--", "cat", "x"]);
+    assert!(!out.status.success(), "{}", text(&out));
     assert!(!text(&out).contains(SECRET), "{}", text(&out));
 }
 
@@ -72,6 +74,7 @@ fn a_proc_self_link_never_reaches_the_projects_isolated_files() {
     env.ok(U, &proj, &["commit", "-m", "link"]);
     env.ok(U, &proj, &["ws", "new", "agent", "-r", "@-"]);
     let out = env.vl(U, &proj, &["ws", "exec", "agent", "--", "cat", "x"]);
+    assert!(!out.status.success(), "{}", text(&out));
     assert!(!text(&out).contains(SECRET), "the sandboxed command read the isolated .netrc through /proc/self/cwd:\n{}", text(&out));
 }
 
@@ -110,6 +113,7 @@ fn sparse_and_ephemeral_sandboxes_never_reach_the_projects_isolated_files() {
         args.push("--");
         args.extend(&cat);
         let out = env.vl(U, &proj, &args);
+        assert!(!out.status.success(), "{how:?}: {}", text(&out));
         assert!(!text(&out).contains(SECRET), "{how:?}: the sandboxed command read the isolated .netrc:\n{}", text(&out));
         // The command ran, and found none of the refused links.
         assert!(text(&out).contains("cat: s1/s2/s3/s4/x5: No such file"), "{how:?}:\n{}", text(&out));

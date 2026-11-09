@@ -183,6 +183,11 @@ enum Cmd {
         /// `pull`: landings per second per project moving `main` meanwhile.
         #[arg(long, default_value_t = 2.0)]
         background: f64,
+        /// `pull`: also flood one more project with this many agents pulling
+        /// in a closed loop, not measured (S24's bulkheads: the measured
+        /// projects are the quiet ones beside it).
+        #[arg(long, default_value_t = 0)]
+        flood: usize,
         /// Count only this container's database processes (a container id prefix).
         #[arg(long)]
         db_container: Option<String>,
@@ -341,6 +346,7 @@ fn main() -> Result<()> {
             duration,
             warmup,
             background,
+            flood,
             db_container,
             via,
             dir,
@@ -380,6 +386,7 @@ fn main() -> Result<()> {
                 duration: Duration::from_secs_f64(duration),
                 warmup: Duration::from_secs_f64(warmup),
                 background,
+                flood,
                 db_container,
                 vias,
             })?;
