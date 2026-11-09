@@ -167,9 +167,8 @@ fn editor_artefacts_of_protected_files_keep_their_protection() {
     r.ok(&["status"]);
     let files = r.files("@");
     assert!(!files.iter().any(|f| f.path.starts_with(".netrc")), "{files:?}");
-    if let Some(f) = files.iter().find(|f| f.path == "secrets/plan.pem.orig") {
-        assert_eq!(f.vis, "cloaked:team");
-    }
+    let f = files.iter().find(|f| f.path == "secrets/plan.pem.orig").unwrap();
+    assert_eq!(f.vis, "cloaked:team");
     assert_no_plaintext(&r, "after editor artefacts");
 }
 
@@ -237,7 +236,7 @@ fn a_non_members_edit_of_a_cloaked_file_is_kept_local() {
     assert!(!contains_bytes(&o, SECRET_PLAN));
     // bob's restore cannot write what he cannot read, and does not crash.
     let out = bob.run(&["restore", "--from", c.as_str(), "secrets/plan.pem"]);
-    assert!(clean_exit(&out), "{}", text(&out));
+    assert!(out.status.success() && text(&out).contains("Restored 0 path(s)"), "{}", text(&out));
     let diff = bob.ok(&["diff", "-r", c.as_str()]);
     assert!(!diff.contains(SECRET_PLAN) && diff.contains("content hidden"), "{diff}");
 }

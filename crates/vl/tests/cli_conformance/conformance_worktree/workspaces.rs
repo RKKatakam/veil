@@ -104,7 +104,7 @@ fn ws_switch_to_the_attached_workspace_changes_nothing() {
     let (r, _) = based(&env);
     r.write("wip.txt", "w\n");
     let out = r.run(&["ws", "switch", "default"]);
-    assert!(clean_exit(&out), "{}", text(&out));
+    assert!(out.status.success(), "{}", text(&out));
     assert_eq!(r.read("wip.txt"), "w\n");
     assert!(r.changes().contains(&"A wip.txt".to_string()));
 }
@@ -314,8 +314,8 @@ fn two_workspaces_on_one_base_are_independent() {
     let (r, base) = based(&env);
     r.ok(&["ws", "new", "one", "-r", base.as_str()]);
     r.ok(&["ws", "new", "two", "-r", base.as_str()]);
-    r.run(&["ws", "exec", "one", "--", "sh", "-c", "echo 1 > a.txt"]);
-    r.run(&["ws", "exec", "two", "--", "sh", "-c", "echo 2 > a.txt"]);
+    r.ok(&["ws", "exec", "one", "--", "sh", "-c", "echo 1 > a.txt"]);
+    r.ok(&["ws", "exec", "two", "--", "sh", "-c", "echo 2 > a.txt"]);
     assert_eq!(r.out(&["ws", "cat", "one", "a.txt"]), "1\n");
     assert_eq!(r.out(&["ws", "cat", "two", "a.txt"]), "2\n");
     assert_eq!(r.read("a.txt"), "a\n");
@@ -335,6 +335,6 @@ fn a_missing_checkout_record_is_survivable() {
     assert!(rec.exists(), "control: the attachment record is {}", rec.display());
     std::fs::remove_file(&rec).unwrap();
     let out = r.run(&["status"]);
-    assert!(clean_exit(&out), "{}", text(&out));
+    assert!(out.status.success(), "{}", text(&out));
     assert_eq!(r.read("wip.txt"), "w\n");
 }
