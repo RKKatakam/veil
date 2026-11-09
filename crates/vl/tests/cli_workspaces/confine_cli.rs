@@ -1927,3 +1927,76 @@ fn s6r2_a_bind_mount_alias_never_shows_veils_folders() {
     assert!(!out.contains(identity.trim()) && !out.contains("identity.json"), "the Veil home is visible through a second mount: {out}");
     assert!(!out.contains(S6R2_STORED) && !out.contains(&name), "the daemon's store is visible through a second mount: {out}");
 }
+
+/// Guarantees 1 and 2 of the S6 review, cycle 3, the routes the other
+/// tests leave out. `HOME` named through a link: an allowed parent of the
+/// daemon's folder is refused by the name `HOME` gives it and by the
+/// resolved one, and a folder beside it is shown with nothing of the
+/// daemon's. Unusual `XDG_*` values (BUG-1515: the XDG rules): a relative
+/// `XDG_CACHE_HOME` is unset, so the daemon stays in `~/.cache` (refused
+/// there) and nothing of its is made where `vl` runs; an `XDG_RUNTIME_DIR`
+/// that is not this user's 0700 folder (0755, or a link to a 0700 one) is
+/// not used, so allowing the folder that holds it is fine and no `veil/`
+/// is made in it. Every refusal names only the person's own paths.
+#[test]
+fn s6r3_a_linked_home_and_unusual_xdg_values_never_show_or_misplace_the_daemon() {
+    let t = T::new();
+    let config = s6r2_config(&t);
+    let name = "ab".repeat(31);
+    let obj = format!("veil/daemon/store/objects/ab/{name}");
+    write(&t.home.join(".cache"), &obj, S6R2_STORED);
+    write(&t.home.join(".cache"), "pip/shown.txt", S6R2_SHOWN);
+    // `HOME` through a link.
+    let hl = t.env.root.join("home-link");
+    std::os::unix::fs::symlink(&t.home, &hl).unwrap();
+    let linked: Vec<(&str, Option<&Path>)> = vec![("HOME", Some(&hl)), ("VEIL_HOME", None), ("XDG_CACHE_HOME", None), ("XDG_RUNTIME_DIR", None), ("XDG_CONFIG_HOME", Some(&config))];
+    let (h, l) = (t.home.display().to_string(), hl.display().to_string());
+    for allow in [format!("{l}/.cache"), format!("{h}/.cache"), l.clone(), h.clone()] {
+        s6r2_refused(&t, &allow, &linked, "holds the Veil daemon's folder");
+    }
+    let out = s6r2_run(&t, &[format!("{l}/.cache/pip")], &linked, &format!("cat {l}/.cache/pip/shown.txt {h}/.cache/{obj} {l}/.cache/{obj}; ls -AR {l}/.cache {h}/.cache 2>&1 | head -40"));
+    assert!(out.contains(S6R2_SHOWN), "the allowed folder is not shown: {out}");
+    assert!(!out.contains(S6R2_STORED) && !out.contains(&name), "the daemon's store is visible beside an allowed folder under a linked HOME: {out}");
+    // A relative XDG_CACHE_HOME: unset, so the daemon is in `~/.cache`, and
+    // nothing of its is made where `vl` runs (the project).
+    let rel_cache = Path::new("cache-rel");
+    let env: Vec<(&str, Option<&Path>)> = vec![("VEIL_HOME", None), ("XDG_CACHE_HOME", Some(rel_cache)), ("XDG_RUNTIME_DIR", None), ("XDG_CONFIG_HOME", Some(&config))];
+    s6r2_refused(&t, &format!("{h}/.cache"), &env, "holds the Veil daemon's folder");
+    assert!(!t.proj.join("cache-rel").exists() && !t.proj.join("veil").exists(), "a relative XDG_CACHE_HOME made the daemon's folder where vl runs");
+    // An XDG_RUNTIME_DIR that is not this user's 0700 folder: not used.
+    let odd = t.env.dir("odd");
+    write(&odd, "shown.txt", S6R2_SHOWN);
+    let wide = odd.join("rt755");
+    std::fs::create_dir_all(&wide).unwrap();
+    std::fs::set_permissions(&wide, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tight = odd.join("rt700");
+    std::fs::create_dir_all(&tight).unwrap();
+    std::fs::set_permissions(&tight, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let link = odd.join("rt-link");
+    std::os::unix::fs::symlink(&tight, &link).unwrap();
+    let o = odd.display().to_string();
+    for rt in [&wide, &link] {
+        let env: Vec<(&str, Option<&Path>)> = vec![("VEIL_HOME", None), ("XDG_CACHE_HOME", None), ("XDG_RUNTIME_DIR", Some(rt)), ("XDG_CONFIG_HOME", Some(&config))];
+        let out = s6r2_run(&t, std::slice::from_ref(&o), &env, &format!("cat {o}/shown.txt; ls -AR {o} 2>&1 | head -40"));
+        assert!(out.contains(S6R2_SHOWN), "XDG_RUNTIME_DIR={}: the allowed folder is not shown: {out}", rt.display());
+        assert!(!out.lines().any(|l| l.trim() == "veil") && !out.contains("daemon.sock"), "XDG_RUNTIME_DIR={}: something of the daemon's is in the allowed folder: {out}", rt.display());
+        assert!(!wide.join("veil").exists() && !tight.join("veil").exists(), "XDG_RUNTIME_DIR={}: vl made the daemon's folder in a runtime folder it must not use", rt.display());
+        // And the daemon's folders are still refused there.
+        s6r2_refused(&t, &format!("{h}/.cache"), &env, "holds the Veil daemon's folder");
+    }
+    // The refusal names only the person's own paths: the folder allowed,
+    // Veil's folder in it and the narrower folders suggested.
+    let mut c = t.cmd(&t.proj, &["ws", "exec", "agent", "--allow", &h, "--", "true"]);
+    c.env_remove("VEIL_HOME").env_remove("XDG_CACHE_HOME").env_remove("XDG_RUNTIME_DIR").env("XDG_CONFIG_HOME", &config);
+    let out = c.stdin(Stdio::null()).output().unwrap();
+    assert!(!out.status.success(), "{}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    // Veil's folder named; the folder on the way to it (`~/.cache`, which
+    // would be refused too) not suggested, others are.
+    assert!(err.contains(&format!("({h}/.cache/veil/daemon)")) && err.contains(&format!("--allow {h}/.cargo")), "{err}");
+    assert!(!err.contains(&format!("--allow {h}/.cache ")) && !err.ends_with(&format!("--allow {h}/.cache)\n")), "{err}");
+    let root = t.env.root.display().to_string();
+    for word in err.split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == ',' || c == ';').filter(|w| w.starts_with('/')) {
+        assert!(word.starts_with(&root), "the refusal names a path that is not the person's: {word}\n{err}");
+    }
+}
