@@ -473,14 +473,14 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
         Some(_) => None,
         None => Some(gate::Key::Server),
     };
-    let _project_place = match gate_key {
+    let project_place = match gate_key {
         Some(k) => match limits.projects.place(k, class, deadline).await {
             Some(p) => Some(p),
             None => return finish(&hub, busy(false)),
         },
         None => None,
     };
-    let Some(_server_place) = limits.server.place(class, deadline).await else {
+    let Some(server_place) = limits.server.place(class, deadline).await else {
         return finish(&hub, busy(false));
     };
 
@@ -488,11 +488,14 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
     // under the answers' budget.
     let mut req = Request::from_parts(parts, Body::from(bytes));
     req.extensions_mut().insert(answers::For(body_key));
-    let (resp, layers) = health::LAYERS
-        .scope(std::cell::Cell::new(health::Counts::default()), async {
-            let r = next.run(req).await;
-            (r, health::LAYERS.with(|c| c.get()))
-        })
+    let (resp, layers) = PLACES
+        .scope(
+            std::cell::RefCell::new(Some((project_place, server_place))),
+            health::LAYERS.scope(std::cell::Cell::new(health::Counts::default()), async {
+                let r = next.run(req).await;
+                (r, health::LAYERS.with(|c| c.get()))
+            }),
+        )
         .await;
     let resp = match limits.answers.budget(body_key, resp, class != Class::Write).await {
         Some(r) => r,
@@ -505,6 +508,18 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
     c.permission_misses = layers.permission_misses;
     record(&hub, c);
     resp
+}
+
+tokio::task_local! {
+    static PLACES: std::cell::RefCell<Option<(Option<gate::Place>, gate::Place)>>;
+}
+
+/// Release this request's bulkhead places once its database and object-store
+/// work is done and it only waits on a channel (e.g. `landing::wait`).
+pub fn release_places() {
+    let _ = PLACES.try_with(|c| {
+        let _ = c.borrow_mut().take();
+    });
 }
 
 #[cfg(test)]

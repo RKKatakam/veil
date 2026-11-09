@@ -50,6 +50,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/changes", post(changes))
         .route("/v1/projects/{p}/land", post(land))
         .route("/v1/projects/{p}/land/{ticket}", get(land_status))
+        .route("/v1/projects/{p}/events", get(crate::events::route))
         .route("/v1/projects/{p}/access", get(access))
         .route("/v1/projects/{p}/groups", get(list_groups))
         .route("/v1/projects/{p}/groups/{g}", post(create_group).delete(delete_group))

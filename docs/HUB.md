@@ -3605,3 +3605,102 @@ never fetched, 100 files a folder.
 Revert the merge commit. Nothing on disk changes format; a workspace
 created meanwhile keeps its `.veil/local/scanned` marker, which the
 reverted `vl` reads as before.
+
+### 13.30 S18: content merges, conflict reports and the event stream (as built)
+
+Milestone S18 of `docs/design/server/phase-4-agent-scale.md` (§5.1–5.5,
+§6, §9): content merges by worker pool, bounded re-queue (`merges` in
+`0022_landing_merge.sql`), visibility-redacted conflict reports, and the
+project event stream (`GET /v1/projects/{p}/events`). Code:
+`crates/veil-server/src/landing/merge.rs`, `crates/veil-server/src/events.rs`,
+and `crates/veil-core/src/hub/land.rs`.
+
+#### The design as built
+
+* **Merge workers (`landing/merge.rs`):** when a queued change cannot take
+  S17's fast path (`edits::fast_path`), `merge::can_merge` checks whether the
+  entry is a single-change submission with `merges < MAX_MERGES` (`3`) whose
+  shifted paths can all be content-merged cleanly:
+  * **Visibility gate first:** every shifted path must be readable and
+    writable by the submitter on both the base and the tip, and every folder
+    along the path on both trees must be whole for the submitter
+    (`path_whole_for_submitter`: no redacted or unreadable sibling in any
+    containing folder). A submission touching `.veilpolicy` or `.veilrules`,
+    a multi-change stack, an already-merged commit (`parents.len() > 1`), or
+    a path failing the visibility gate is never handed to a merge worker.
+  * **State transition (`queued -> merging`):** the batch's commit transitions
+    eligible rows to `state = 'merging'` inside the batch transaction (guarded
+    by `AND state = 'queued'`) and only spawns a background merge worker on a
+    bounded semaphore (`WORKERS = 16`) after the batch commits.
+  * **3-way content merge (`run_job`):** the worker loads the tip's
+    `.veilattributes` (falling back to the base's), verifies the submitter may
+    still read and write every shifted path and see every containing folder
+    whole on the current tip, and runs a 3-way merge per shifted path:
+    * paths matched by `-merge` or `binary` in `.veilattributes`, non-files,
+      mode mismatches, label mismatches, or files missing in any of
+      `(base, tip, yours)` fail the content merge and produce a conflict
+      report;
+    * paths matched by `merge=union` merge via
+      `veil_core::attributes::union_merge`;
+    * all other UTF-8 text files merge via `veil_core::textmerge::merge`.
+  * **Re-queue (`merging -> queued`):** when every shifted path merges cleanly
+    with no `<<<<` markers, the worker stores the merged blob objects, builds
+    the updated `EditSet` against the tip it merged onto, and atomically
+    updates the row (`SET state = 'queued', base = $3, edits = $4,
+    submit_epoch = $5, project_epoch = $6, merges = merges + 1 WHERE
+    project_id = $1 AND ticket = $2 AND state = 'merging'`), emits a
+    `land.requeued` event on the submitter's stream, and wakes the branch's
+    landing service. At most `MAX_MERGES` (`3`) merge passes run per ticket;
+    a fourth overlap finishes as `conflict`.
+* **Conflict reports (`ConflictReport`, `LandResult::conflict`):** when
+  `can_merge` is false or a merge worker finds an unmergeable overlap,
+  `merge::build_conflict` builds a visibility-checked report:
+  * **Hidden-path redaction:** if any shifted path is not readable or writable
+    by the submitter on the base or tip, or any folder along it is not whole
+    for the submitter, the entire report collapses to
+    `reason: Some("conflicts with changes you can't see")`, `paths: []`,
+    `conflicts: []`, `onto: None`, `base: None`, and `landed_since: []`. No
+    hidden path, name, count, or content is ever placed in the database
+    outcome, HTTP response, or event stream.
+  * **Visible conflict details:** when every shifted path is visible and whole
+    to the submitter, the report populates `paths` (sorted), `onto` (the
+    submitter's projection of the tip), `base` (the submitter's projection of
+    the submission's base), `conflicts` (`Vec<ConflictPath { path, base, main,
+    yours }>` with object IDs from the base, tip, and submitted edits), and
+    `landed_since` (up to `MAX_LANDED_SINCE = 64` first-parent commits on the
+    branch since the base, projected for the submitter so commits touching
+    only hidden paths are omitted).
+* **The event stream (`GET /v1/projects/{p}/events`, `events.rs`):** an SSE
+  (`text/event-stream`) endpoint authenticated with `Scope::Read` (with
+  optional `?ticket=`, `?branch=`, and `?types=` filters):
+  * **Events:** `land.requeued`, `land.landed`, `land.conflict`, and
+    `land.rejected` are routed only to streams owned by that ticket's
+    submitter (`emit_ticket`), carrying the submitter's projected snapshot IDs
+    and redacted conflict fields; `main.moved` is broadcast to connected
+    project streams (`emit_moved`), projecting `(from, to)` per viewer's
+    `ViewKey` and skipping any viewer for whom `from_proj == to_proj` (a move
+    whose edits were entirely in paths hidden from that viewer). Every
+    emission reads current access epochs (`caches::read_epochs`) before
+    opening the subscriber's `Viewer` (BUG-1640), so permission revocations
+    take effect on the very next emitted event and never populate the viewer
+    cache with stale zero epochs.
+  * **Bounds per connection and per person:** each connection key (`X-Forwarded-For` / peer / auth token hash) may hold at most `MAX_STREAMS_PER_CONNECTION` (`8`) concurrent streams, and each person may hold at most `MAX_STREAMS_PER_PERSON` (`8`) concurrent streams; a 9th open returns `429 Too Many Requests`.
+  * **Slow or absent readers evicted immediately:** each stream holds an
+    in-memory channel of at most `MAX_QUEUE_PER_STREAM` (`64`) frames and tracks
+    queued payload bytes up to `MAX_BYTES_PER_STREAM` (`64 KiB`). Emit uses
+    `try_send` and checks the byte cap first; if a reader's queue is full or
+    would exceed `64 KiB`, the hub drops that stream's sender and slot
+    immediately in `emit_ticket` / `emit_moved`, closing the response body and
+    freeing its memory without blocking landing or merge workers.
+
+#### Threat review (phase 4 §6 and S18 guarantees)
+
+| # | Threat | Mitigation | Test |
+|---|---|---|---|
+| 1 | A content merge incorporates or overwrites a sibling or path the submitter cannot see whole | `path_whole_for_submitter` checks read/write access and verifies every folder along the path on both base and tip has no redacted entries before and during merge | `server_hub` `landing::a_merge_never_lands_anything_its_submitter_could_not_see_whole` |
+| 2 | A conflict report or SSE event leaks a hidden path, name, count, file ID, or hidden commit on `main` | Any hidden or non-whole shifted path collapses the report to `"conflicts with changes you can't see"` with empty `paths`, `conflicts`, and `landed_since`; `main.moved` skips viewers whose projection did not change | `server_hub` `landing::no_event_or_report_reveals_hidden_paths_names_counts_or_content` |
+| 3 | A re-queued change lands twice under concurrent workers or batches | State transitions (`queued -> merging -> queued -> landed`) are guarded by atomic `WHERE state = …` clauses in Postgres; `landings` records the change in the branch lineage | `server_hub` `landing::a_requeued_change_lands_at_most_once` |
+| 4 | A client opens unbounded SSE streams to exhaust file descriptors or hub slots | `MAX_STREAMS_PER_CONNECTION = 8` and `MAX_STREAMS_PER_PERSON = 8` enforced atomically on open; RAII `StreamGuard` decrements on drop | `server_hub` `landing::the_event_stream_is_bounded_per_connection_and_per_person` |
+| 5 | A slow or stalled SSE reader buffers unbounded events in server memory | Per-stream queue bounded at 64 events and 64 KiB; overflow drops the sender and evicts the subscriber immediately on emit | `server_hub` `landing::a_slow_or_absent_reader_never_holds_server_memory` |
+| 6 | Repeatedly conflicting changes loop between the queue and merge workers forever, or ignore `.veilattributes` | `merges` column capped at `MAX_MERGES = 3`; `.veilattributes` (`merge=union`, `-merge`, `binary`) loaded from the tip and honoured by workers | `server_hub` `landing::merge_attempts_cap_at_three_and_veilattributes_govern_content_merge` |
+

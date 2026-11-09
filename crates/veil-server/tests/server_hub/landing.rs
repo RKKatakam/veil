@@ -4680,3 +4680,595 @@ fn a_change_by_one_author_never_lands_twice_across_devices_or_submitters_and_ign
     assert!(body.contains(&cid.to_string()) && body.contains("already landed"), "{body}");
 }
 
+// ---- S18: Content merges, re-queue, conflict reports, and event stream -----------------------
+
+/// Parse SSE events (`event: <name>\ndata: <json>\n\n`) from a reader until
+/// `count` data events arrive or `timeout` elapses.
+fn read_sse_events(resp: ureq::http::Response<ureq::Body>, count: usize, timeout: Duration) -> Vec<(String, Value)> {
+    use std::io::{BufRead, BufReader};
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(resp.into_body().into_reader());
+        let mut event_name = String::new();
+        let mut data_buf = String::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+                    if trimmed.is_empty() {
+                        if !data_buf.is_empty() {
+                            if let Ok(v) = serde_json::from_str::<Value>(&data_buf) {
+                                let ev = if event_name.is_empty() {
+                                    v["event"].as_str().unwrap_or("").to_string()
+                                } else {
+                                    std::mem::take(&mut event_name)
+                                };
+                                data_buf.clear();
+                                if tx.send((ev, v)).is_err() {
+                                    break;
+                                }
+                            } else {
+                                event_name.clear();
+                                data_buf.clear();
+                            }
+                        }
+                    } else if let Some(rest) = trimmed.strip_prefix("event:") {
+                        event_name = rest.trim().to_string();
+                    } else if let Some(rest) = trimmed.strip_prefix("data:") {
+                        if !data_buf.is_empty() {
+                            data_buf.push('\n');
+                        }
+                        data_buf.push_str(rest.trim());
+                    }
+                }
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let mut out = Vec::new();
+    while out.len() < count {
+        let rem = deadline.saturating_duration_since(std::time::Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(rem) {
+            Ok(ev) => out.push(ev),
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// S18 Guarantee 1: A merge never lands anything its submitter couldn't see whole.
+///
+/// 1. Two non-overlapping edits to the same plain-text file (`src/lib.rs`) on
+///    the same base are content-merged by a merge worker, re-queued, and
+///    landed cleanly with both edits intact.
+/// 2. If a queued change that needs a content merge on `src/lib.rs` also
+///    carries an edit to a path its submitter can no longer see when the
+///    merge runs (e.g. `dev` was in `finance` when submitting an edit touching
+///    both `src/lib.rs` and `billing/acme/invoice.txt`, then `dev` was removed
+///    from `finance` while `src/lib.rs` moved on `main`), the merge worker
+///    never lands the partial/hidden change, never touches `billing/`, and
+///    names no hidden path.
+#[test]
+fn a_merge_never_lands_anything_its_submitter_could_not_see_whole() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+
+    // Seed a multi-line plain-text file so top and bottom edits merge cleanly.
+    let initial = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n";
+    let base0 = tip_for(&hub, &admin_tok, &p.name);
+    let s = land(&api, &admin_tok, &p.name, base0, json!([put("src/lib.rs", initial)]), true).json();
+    assert_eq!(s["state"], "landed", "{s}");
+
+    // 1. Clean 3-way content merge on non-overlapping hunks of src/lib.rs.
+    let admin_base = tip_for(&hub, &admin_tok, &p.name);
+    let dev_base = tip_for(&hub, &dev_tok, &p.name);
+    let top_edit = "TOP 1\nline 2\nline 3\nline 4\nline 5\nline 6\n";
+    let bottom_edit = "line 1\nline 2\nline 3\nline 4\nline 5\nBOTTOM 6\n";
+    let a = land(&api, &admin_tok, &p.name, admin_base, json!([put("src/lib.rs", top_edit)]), true).json();
+    assert_eq!(a["state"], "landed", "{a}");
+    let b = land(&api, &dev_tok, &p.name, dev_base, json!([put("src/lib.rs", bottom_edit)]), true).json();
+    assert_eq!(b["state"], "landed", "clean content merge should re-queue and land: {b}");
+    assert_eq!(
+        real_file(&hub, pid, "src/lib.rs").as_deref(),
+        Some(&b"TOP 1\nline 2\nline 3\nline 4\nline 5\nBOTTOM 6\n"[..]),
+    );
+
+    // 2. Now grant dev temporary access to finance, queue a change touching both
+    // src/lib.rs (bottom) and billing/acme/invoice.txt while holding the branch
+    // lease, revoke dev's finance access and move src/lib.rs (top) on main, then
+    // release the lease so the merge worker runs on the change.
+    p.admin.ok(&p.dir, &["group", "add", "finance", &p.dev.name]);
+    let base2 = tip_for(&hub, &dev_tok, &p.name);
+    let invoice = format!("{BILL_DIR}/acme/invoice.txt");
+    let before_invoice = real_file(&hub, pid, &invoice);
+
+    // Hold the branch lease briefly so dev's submission stays queued while we
+    // revoke finance access and advance main's top line of src/lib.rs.
+    let h = hub.hub();
+    hub.rt.block_on(async {
+        sqlx::query(
+            "INSERT INTO landing_leases (project_id, branch, holder, epoch, expires_at) VALUES ($1, 'main', 'test-hold', 999, $2) \
+             ON CONFLICT (project_id, branch) DO UPDATE SET holder = 'test-hold', epoch = landing_leases.epoch + 1, expires_at = $2",
+        )
+        .bind(pid)
+        .bind(veil_core::now_millis() + 60_000)
+        .execute(&h.db)
+        .await
+        .unwrap();
+    });
+
+    let sub = land(
+        &api,
+        &dev_tok,
+        &p.name,
+        base2,
+        json!([
+            put("src/lib.rs", "TOP 1\nline 2\nline 3\nline 4\nline 5\nDEV BOTTOM\n"),
+            put(&invoice, "dev secret invoice\n")
+        ]),
+        false,
+    )
+    .json();
+    assert_eq!(sub["state"], "queued", "{sub}");
+    let ticket = sub["ticket"].as_str().unwrap().to_string();
+
+    // Remove dev from finance and advance main's top line of src/lib.rs directly.
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.dev.name]);
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file("src/lib.rs", "ADMIN TOP 2\nline 2\nline 3\nline 4\nline 5\nBOTTOM 6\n");
+    let pr = c.push("main", "admin moves top line");
+    assert_eq!(pr.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&pr.body));
+
+    // Release the lease and wake the landing service.
+    hub.rt.block_on(async {
+        sqlx::query("UPDATE landing_leases SET expires_at = 0 WHERE project_id = $1 AND branch = 'main'")
+            .bind(pid)
+            .execute(&h.db)
+            .await
+            .unwrap();
+        veil_server::landing::ensure(&h, pid, "main");
+    });
+
+    let out = outcome(&api, &dev_tok, &p.name, &ticket);
+    let out_str = out.to_string();
+    assert_ne!(out["state"], "landed", "must never land a change its submitter cannot see whole: {out}");
+    assert!(!out_str.contains(BILL_DIR) && !out_str.contains("invoice.txt"), "must not name hidden path: {out}");
+    assert_eq!(real_file(&hub, pid, &invoice), before_invoice, "billing file must be untouched");
+}
+
+/// S18 Guarantee 2: No event or report reveals hidden paths, names, counts or content.
+#[test]
+fn no_event_or_report_reveals_hidden_paths_names_counts_or_content() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+    let fin_tok = p.fin.token();
+
+    // Seed src/lib.rs and a rule hiding src/sub/vault/* for finance only
+    // (leaving src/sub absent in dev_base).
+    write_files(
+        &p.dir,
+        &[
+            ("src/lib.rs", "line 1\nline 2\nline 3\n"),
+        ],
+    );
+    p.admin.ok(&p.dir, &["access", "src/sub/vault/", "finance"]);
+    p.admin.commit_main(&p.dir, "seed vault rule");
+    p.admin.ok(&p.dir, &["push"]);
+
+    let dev_base = tip_for(&hub, &dev_tok, &p.name);
+
+    // Open an SSE stream as dev before further landings happen.
+    let stream_resp = api.get_unread(
+        &format!("/v1/projects/{}/events", p.name),
+        &[("authorization", &format!("Bearer {dev_tok}"))],
+    );
+    assert_eq!(stream_resp.status().as_u16(), 200);
+
+    // 1. fin lands a billing-only change: completely hidden from dev.
+    let fin_base = tip_for(&hub, &fin_tok, &p.name);
+    let secret_invoice = format!("{BILL_DIR}/acme/secret-99.txt");
+    let fin_landed = land(
+        &api,
+        &fin_tok,
+        &p.name,
+        fin_base,
+        json!([put(&secret_invoice, "CLASSIFIED-AMOUNT-9999\n")]),
+        true,
+    )
+    .json();
+    assert_eq!(fin_landed["state"], "landed", "{fin_landed}");
+
+    // 2. admin lands a visible change to src/other.rs AND a hidden file under src/sub/vault/key.txt.
+    let admin_base2 = tip_for(&hub, &admin_tok, &p.name);
+    let admin_landed = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        admin_base2,
+        json!([
+            put("src/other.rs", "visible\n"),
+            put("src/sub/vault/key.txt", "VAULT-SECRET-KEY\n")
+        ]),
+        true,
+    )
+    .json();
+    assert_eq!(admin_landed["state"], "landed", "{admin_landed}");
+
+    // 3. dev tries to create a file at src/sub on dev_base. On main, src/sub is now
+    // a folder holding src/sub/vault/key.txt, which dev cannot see!
+    let conflict_out = land(
+        &api,
+        &dev_tok,
+        &p.name,
+        dev_base,
+        json!([put("src/sub", "file instead of dir\n")]),
+        true,
+    )
+    .json();
+    let report_str = conflict_out.to_string();
+    assert_eq!(conflict_out["state"], "conflict", "{report_str}");
+    assert_eq!(
+        conflict_out["message"].as_str(),
+        Some("conflicts with changes you can't see"),
+        "conflict in hidden folder must report only 'conflicts with changes you can't see': {report_str}"
+    );
+    assert!(
+        conflict_out["paths"].as_array().is_none_or(|a| a.is_empty()),
+        "hidden path must never appear in paths: {report_str}"
+    );
+    assert!(
+        conflict_out["conflicts"].as_array().is_none_or(|a| a.is_empty()),
+        "hidden path must never appear in conflicts: {report_str}"
+    );
+    // landed_since must contain only the 1 visible change (src/other.rs), never the billing-only change!
+    if let Some(since) = conflict_out["landed_since"].as_array() {
+        assert_eq!(since.len(), 1, "landed_since must not count or include hidden-only changes: {report_str}");
+    }
+    for forbidden in [BILL_DIR, "secret-99", "CLASSIFIED-AMOUNT", "vault", "key.txt", "VAULT-SECRET-KEY"] {
+        assert!(!report_str.contains(forbidden), "report leaked {forbidden}: {report_str}");
+    }
+
+    // 4. Also check a visible conflict report has onto, base, conflicts[{path, base, main, yours}], and landed_since.
+    let vis_conflict = land(
+        &api,
+        &dev_tok,
+        &p.name,
+        dev_base,
+        json!([put("src/other.rs", "dev conflicting content\n")]),
+        true,
+    )
+    .json();
+    assert_eq!(vis_conflict["state"], "conflict", "{vis_conflict}");
+    assert_eq!(vis_conflict["paths"], json!(["src/other.rs"]), "{vis_conflict}");
+    assert!(vis_conflict["onto"].is_string(), "conflict report must name onto: {vis_conflict}");
+    assert_eq!(vis_conflict["base"], json!(dev_base.hex()), "conflict report must name base: {vis_conflict}");
+    assert_eq!(vis_conflict["conflicts"][0]["path"], json!("src/other.rs"), "{vis_conflict}");
+    assert!(vis_conflict["conflicts"][0]["main"].is_string(), "{vis_conflict}");
+    assert!(vis_conflict["conflicts"][0]["yours"].is_string(), "{vis_conflict}");
+    assert_eq!(
+        vis_conflict["landed_since"].as_array().map(|a| a.len()),
+        Some(1),
+        "landed_since must list only the 1 visible change since dev_base: {vis_conflict}"
+    );
+
+    // Read the events dev received on GET /v1/projects/{p}/events.
+    let events = read_sse_events(stream_resp, 2, Duration::from_secs(5));
+    assert!(!events.is_empty(), "dev should receive events for its submissions");
+    for (ev, data) in &events {
+        let s = format!("{ev}:{data}");
+        for forbidden in [BILL_DIR, "secret-99", "CLASSIFIED-AMOUNT", "vault", "key.txt", "VAULT-SECRET-KEY"] {
+            assert!(!s.contains(forbidden), "event leaked {forbidden}: {s}");
+        }
+    }
+    let _ = pid;
+}
+
+/// S18 Guarantee 3: A re-queued change lands at most once.
+#[test]
+fn a_requeued_change_lands_at_most_once() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+
+    let initial = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n";
+    let base0 = tip_for(&hub, &admin_tok, &p.name);
+    let s = land(&api, &admin_tok, &p.name, base0, json!([put("src/lib.rs", initial)]), true).json();
+    assert_eq!(s["state"], "landed", "{s}");
+    let main0 = real_tip(&hub, pid);
+
+    // Subscribe to events as dev to observe `requeued` then `landed`.
+    let stream_resp = api.get_unread(
+        &format!("/v1/projects/{}/events", p.name),
+        &[("authorization", &format!("Bearer {dev_tok}"))],
+    );
+    assert_eq!(stream_resp.status().as_u16(), 200);
+
+    let admin_base = tip_for(&hub, &admin_tok, &p.name);
+    let base = tip_for(&hub, &dev_tok, &p.name);
+    // Admin lands an edit to line 1 of src/lib.rs on `admin_base`.
+    let a = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        admin_base,
+        json!([put("src/lib.rs", "ADMIN 1\nline 2\nline 3\nline 4\nline 5\nline 6\n")]),
+        true,
+    )
+    .json();
+    assert_eq!(a["state"], "landed", "{a}");
+
+    // Dev submits a crafted change with a known change_id editing line 6 on `base`.
+    let mut d = Craft::new(&api, &p.dev, &p.name, "main");
+    d.tip = base;
+    d.root = d.tree_of(base);
+    d.file("src/lib.rs", "line 1\nline 2\nline 3\nline 4\nline 5\nDEV 6\n");
+    let cid = veil_core::ChangeId::random();
+    let snap = snap_at(&mut d, base, cid, "dev bottom edit", veil_core::now_millis(), vec![]);
+    let up = d.api.upload(&d.token, &d.project, &d.objects);
+    assert_eq!(up.status, 200);
+    let receipts = up.json()["receipts"].as_array().unwrap().clone();
+    let map: serde_json::Map<String, Value> = d.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "snapshot": snap.hex(), "receipts": map, "wait": true}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    assert_eq!(v["state"], "landed", "re-queued change should land: {v}");
+
+    // Verify the change landed on main exactly once.
+    let landed_cids: Vec<_> = chain(&hub, pid, main0).into_iter().map(|(_, s)| s.change_id).collect();
+    assert_eq!(
+        landed_cids.iter().filter(|c| **c == cid).count(),
+        1,
+        "re-queued change must land at most once: {landed_cids:?}"
+    );
+
+    // Re-submitting the original snapshot is recognized as already landed and never lands again.
+    let r2 = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "snapshot": snap.hex(), "receipts": map, "wait": true}),
+    );
+    assert_eq!(r2.status, 400, "{}", String::from_utf8_lossy(&r2.body));
+    let landed_cids_after: Vec<_> = chain(&hub, pid, main0).into_iter().map(|(_, s)| s.change_id).collect();
+    assert_eq!(
+        landed_cids_after.iter().filter(|c| **c == cid).count(),
+        1,
+        "re-submitted change must still be on main only once"
+    );
+
+    // Verify dev's event stream saw `requeued` and `landed`.
+    let events = read_sse_events(stream_resp, 10, Duration::from_secs(3));
+    let states: Vec<&str> = events.iter().filter_map(|(_, d)| d["state"].as_str()).collect();
+    assert!(
+        states.contains(&"requeued") && states.contains(&"landed"),
+        "expected requeued and landed events, got: {events:?}"
+    );
+}
+
+/// S18 Guarantee 4: The event stream is bounded per connection and per person.
+#[test]
+fn the_event_stream_is_bounded_per_connection_and_per_person() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let dev_tok = p.dev.token();
+    let fin_tok = p.fin.token();
+    let max_per_person = veil_server::events::MAX_STREAMS_PER_PERSON;
+
+    let mut open = Vec::new();
+    for i in 0..max_per_person {
+        let resp = api.get_unread(
+            &format!("/v1/projects/{}/events", p.name),
+            &[("authorization", &format!("Bearer {dev_tok}"))],
+        );
+        assert_eq!(resp.status().as_u16(), 200, "stream {i} within per-person cap should open");
+        open.push(resp);
+    }
+
+    // One more stream for the same person is refused (429 rate_limited).
+    let over = api.get(Some(&dev_tok), &format!("/v1/projects/{}/events", p.name));
+    assert_eq!(over.status, 429, "stream past per-person cap must be refused: {}", String::from_utf8_lossy(&over.body));
+
+    // Another person (fin) is unaffected and can open their stream.
+    let fin_stream = api.get_unread(
+        &format!("/v1/projects/{}/events", p.name),
+        &[("authorization", &format!("Bearer {fin_tok}"))],
+    );
+    assert_eq!(fin_stream.status().as_u16(), 200, "another person's stream must succeed");
+
+    // Dropping one of dev's streams frees their slot so dev can open one again.
+    open.pop();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut reopened = false;
+    while std::time::Instant::now() < deadline {
+        let r = api.get_unread(
+            &format!("/v1/projects/{}/events", p.name),
+            &[("authorization", &format!("Bearer {dev_tok}"))],
+        );
+        if r.status().as_u16() == 200 {
+            reopened = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(reopened, "dropping a stream must release the per-person slot");
+}
+
+/// S18 Guarantee 5: A slow or absent reader never holds server memory.
+#[test]
+fn a_slow_or_absent_reader_never_holds_server_memory() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+    let h = hub.hub();
+
+    // Dev opens an SSE stream and never reads a single byte from it.
+    let _slow = api.get_unread(
+        &format!("/v1/projects/{}/events", p.name),
+        &[("authorization", &format!("Bearer {dev_tok}"))],
+    );
+    assert_eq!(h.events.open_total(), 1);
+
+    for i in 0..8 {
+        let base = tip_for(&hub, &admin_tok, &p.name);
+        let v = land(
+            &api,
+            &admin_tok,
+            &p.name,
+            base,
+            json!([put(&format!("src/f{i}.rs"), &format!("v{i}\n"))]),
+            true,
+        )
+        .json();
+        assert_eq!(v["state"], "landed", "{v}");
+        assert!(
+            h.events.held_bytes() <= veil_server::events::MAX_BYTES_PER_STREAM,
+            "held event bytes {} exceeded cap {}",
+            h.events.held_bytes(),
+            veil_server::events::MAX_BYTES_PER_STREAM
+        );
+    }
+    let cur = real_tip(&hub, pid);
+
+    // Emit 16 KiB events while the slow reader is not reading until its
+    // socket buffer and bounded per-stream queue (64 KiB) overflow and evict it.
+    let dev_id: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&p.dev.name).fetch_one(&h.db))
+        .unwrap();
+    let mut big = veil_server::landing::queued("land-slow");
+    big.state = veil_core::hub::land::LandState::Landed;
+    big.landed = vec![cur];
+    big.warnings = vec!["w".repeat(16 << 10)];
+    hub.rt.block_on(async {
+        for _ in 0..512 {
+            if h.events.open_total() == 0 {
+                break;
+            }
+            veil_server::events::emit_ticket(&h, pid, "main", dev_id, "land.landed", "landed", big.clone()).await;
+            assert!(
+                h.events.held_bytes() <= veil_server::events::MAX_BYTES_PER_STREAM,
+                "held event bytes {} exceeded cap {}",
+                h.events.held_bytes(),
+                veil_server::events::MAX_BYTES_PER_STREAM
+            );
+        }
+    });
+
+    // Once the slow reader overflowed its bounded queue, it was evicted and holds 0 bytes.
+    assert_eq!(h.events.open_total(), 0, "evicted slow reader must be removed from active subscribers");
+    assert_eq!(h.events.held_bytes(), 0, "evicted slow reader must hold 0 bytes in server memory");
+}
+
+/// Content merges respect `.veilattributes` (`-merge` / `binary` vs `merge=union`)
+/// and re-queue at most `MAX_MERGES` (3) times before answering `conflict`.
+#[test]
+fn merge_attempts_cap_at_three_and_veilattributes_govern_content_merge() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+
+    let base0 = tip_for(&hub, &admin_tok, &p.name);
+    let s = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        base0,
+        json!([
+            put(".veilattributes", "*.lock -merge\nCHANGELOG.md merge=union\n"),
+            put("src/app.lock", "dep-a = 1\ndep-b = 1\ndep-c = 1\ndep-d = 1\ndep-e = 1\n"),
+            put("src/CHANGELOG.md", "v1\n"),
+        ]),
+        true,
+    )
+    .json();
+    assert_eq!(s["state"], "landed", "{s}");
+
+    // 1. `.veilattributes` `-merge` on `*.lock`: even non-overlapping lines are not content-merged.
+    let admin_base = tip_for(&hub, &admin_tok, &p.name);
+    let dev_base = tip_for(&hub, &dev_tok, &p.name);
+    let a = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        admin_base,
+        json!([put("src/app.lock", "dep-a = 2\ndep-b = 1\ndep-c = 1\ndep-d = 1\ndep-e = 1\n")]),
+        true,
+    )
+    .json();
+    assert_eq!(a["state"], "landed", "{a}");
+    let b = land(
+        &api,
+        &dev_tok,
+        &p.name,
+        dev_base,
+        json!([put("src/app.lock", "dep-a = 1\ndep-b = 1\ndep-c = 1\ndep-d = 1\ndep-e = 2\n")]),
+        true,
+    )
+    .json();
+    assert_eq!(b["state"], "conflict", "path with -merge must not be content-merged: {b}");
+    assert_eq!(b["paths"], json!(["src/app.lock"]), "{b}");
+
+    // 2. `.veilattributes` `merge=union` on `CHANGELOG.md`: adjacent/overlapping appends merge cleanly.
+    let admin_base_u = tip_for(&hub, &admin_tok, &p.name);
+    let dev_base_u = tip_for(&hub, &dev_tok, &p.name);
+    let u1 = land(&api, &admin_tok, &p.name, admin_base_u, json!([put("src/CHANGELOG.md", "v1\n- admin entry\n")]), true).json();
+    assert_eq!(u1["state"], "landed", "{u1}");
+    let u2 = land(&api, &dev_tok, &p.name, dev_base_u, json!([put("src/CHANGELOG.md", "v1\n- dev entry\n")]), true).json();
+    assert_eq!(u2["state"], "landed", "merge=union should cleanly merge: {u2}");
+    assert_eq!(u2["merges"], 1, "{u2}");
+    let chlog = String::from_utf8(real_file(&hub, pid, "src/CHANGELOG.md").unwrap()).unwrap();
+    assert!(chlog.contains("- admin entry") && chlog.contains("- dev entry"), "{chlog}");
+
+    // 3. `MAX_MERGES` cap (3): a queued row that has already been merged 3 times is not merged a 4th time.
+    let dev_base_cap = tip_for(&hub, &dev_tok, &p.name);
+    let admin_base_cap = tip_for(&hub, &admin_tok, &p.name);
+    let _ = land(&api, &admin_tok, &p.name, admin_base_cap, json!([put("src/CHANGELOG.md", &format!("{chlog}- admin cap\n"))]), true).json();
+    hold(&hub, pid);
+    let queued = land(&api, &dev_tok, &p.name, dev_base_cap, json!([put("src/CHANGELOG.md", &format!("{chlog}- dev cap\n"))]), false).json();
+    let cap_ticket = queued["ticket"].as_str().unwrap().to_string();
+    let h = hub.hub();
+    hub.rt
+        .block_on(
+            sqlx::query("UPDATE landing_queue SET merges = $1 WHERE project_id = $2 AND ticket = $3")
+                .bind(veil_server::landing::merge::MAX_MERGES as i64)
+                .bind(pid)
+                .bind(&cap_ticket)
+                .execute(&h.db),
+        )
+        .unwrap();
+    release(&hub, pid);
+    let capped = outcome(&api, &dev_tok, &p.name, &cap_ticket);
+    assert_eq!(capped["state"], "conflict", "4th merge attempt past MAX_MERGES must conflict: {capped}");
+    assert_eq!(capped["merges"], veil_server::landing::merge::MAX_MERGES, "{capped}");
+}
+
+
+

@@ -20,6 +20,7 @@
 //! a push to one lands its new changes instead.
 
 pub mod edits;
+pub mod merge;
 pub mod rules;
 mod service;
 pub use service::ATTACH_BUDGET;
@@ -319,6 +320,8 @@ pub struct Services {
     waiters: Mutex<HashMap<String, Waiting>>,
     /// The branches whose waiters here a poller answers (`poll`).
     pollers: Mutex<std::collections::HashSet<(i64, String)>>,
+    /// Content merge workers running on this server (S18).
+    pub merges: merge::Workers,
     pub stats: Stats,
 }
 
@@ -332,6 +335,7 @@ impl Default for Services {
             held_elsewhere: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
             pollers: Mutex::new(Default::default()),
+            merges: merge::Workers::default(),
             stats: Stats::default(),
         }
     }
@@ -415,6 +419,9 @@ pub fn ensure(hub: &Arc<Hub>, project: i64, branch: &str) {
 /// Start the services of every branch with queued entries (a server
 /// starting after another stopped).
 pub async fn resume(hub: Arc<Hub>) {
+    let _ = sqlx::query("UPDATE landing_queue SET state = 'queued' WHERE state = 'merging'")
+        .execute(&hub.db)
+        .await;
     let rows: std::result::Result<Vec<(i64, String)>, _> =
         sqlx::query_as("SELECT DISTINCT project_id, branch FROM landing_queue WHERE state = 'queued'").fetch_all(&hub.db).await;
     match rows {
@@ -427,7 +434,8 @@ pub async fn resume(hub: Arc<Hub>) {
     }
 }
 
-/// `r` as `viewer` sees it: the snapshots it landed, projected. (Outcomes
+/// `r` as `viewer` sees it: the snapshots it landed, projected, and any
+/// conflict report filtered and projected for `viewer` (S18). (Outcomes
 /// hold real snapshots; each answer is projected for its asker, from the
 /// memo the landing stored where it kept their view key, else as a pull
 /// would, in the asker's own request.)
@@ -437,22 +445,60 @@ pub async fn seen(hub: &Arc<Hub>, project: &crate::perm::Project, viewer: &crate
         out.push(crate::sync::projected(hub, project, viewer, *x).await?);
     }
     r.landed = out;
+    if let Some(onto) = r.onto {
+        r.onto = Some(crate::sync::projected(hub, project, viewer, onto).await?);
+    }
+    if let Some(base) = r.base {
+        r.base = Some(crate::sync::projected(hub, project, viewer, base).await?);
+    }
+    if !r.landed_since.is_empty() {
+        let mut since = Vec::with_capacity(r.landed_since.len());
+        for x in &r.landed_since {
+            let px = crate::sync::projected(hub, project, viewer, *x).await?;
+            if !viewer.admin {
+                let y = *x;
+                let p0 = crate::sync::blocking(hub, project.id, move |src| Ok(src.snapshot(&y)?.parents.first().copied())).await?;
+                if let Some(p0) = p0 {
+                    let pp0 = crate::sync::projected(hub, project, viewer, p0).await?;
+                    if px == pp0 {
+                        continue;
+                    }
+                }
+            }
+            if !since.contains(&px) {
+                since.push(px);
+            }
+        }
+        r.landed_since = since;
+    }
+    if !viewer.admin {
+        let view = project.view(viewer);
+        if r.paths.iter().any(|p| !view.read(p)) || r.conflicts.iter().any(|c| !view.read(&c.path)) {
+            r.paths.clear();
+            r.conflicts.clear();
+            r.message = Some(merge::HIDDEN_CONFLICT.to_string());
+        }
+    }
     Ok(r)
 }
 
 /// The outcome of `ticket` as stored (real snapshots: [`seen`]), if it is
 /// `person`'s.
 pub async fn read(hub: &Hub, project: i64, person: i64, ticket: &str) -> Result<Option<(String, LandResult)>> {
-    let row: Option<(String, String, Option<String>)> =
-        sqlx::query_as("SELECT branch, state, result FROM landing_queue WHERE ticket = $1 AND project_id = $2 AND person_id = $3")
+    let row: Option<(String, String, Option<String>, i64)> =
+        sqlx::query_as("SELECT branch, state, result, merges FROM landing_queue WHERE ticket = $1 AND project_id = $2 AND person_id = $3")
             .bind(ticket)
             .bind(project)
             .bind(person)
             .fetch_optional(&hub.db)
             .await?;
-    let Some((branch, state, result)) = row else { return Ok(None) };
+    let Some((branch, state, result, merges)) = row else { return Ok(None) };
     let r = match (state.as_str(), result) {
-        ("queued", _) | (_, None) => queued(ticket),
+        ("queued" | "merging", _) | (_, None) => {
+            let mut q = queued(ticket);
+            q.merges = merges as u32;
+            q
+        }
         (_, Some(r)) => serde_json::from_str(&r).map_err(|e| Error::Other(e.into()))?,
     };
     Ok(Some((branch, r)))
@@ -467,6 +513,11 @@ pub fn queued(ticket: &str) -> LandResult {
         landed: Vec::new(),
         message: None,
         paths: Vec::new(),
+        onto: None,
+        base: None,
+        conflicts: Vec::new(),
+        landed_since: Vec::new(),
+        merges: 0,
         warnings: Vec::new(),
     }
 }
@@ -481,7 +532,14 @@ pub async fn wait(hub: &Arc<Hub>, project: i64, person: i64, branch: &str, mut w
     if let Some(e) = hub.landing.waiters.lock().unwrap().get_mut(&w.ticket) {
         e.1 = Some((project, branch.to_string()));
     }
+    if let Some((_, r)) = read(hub, project, person, &w.ticket).await? {
+        if r.state != LandState::Queued {
+            hub.landing.forget(&w.ticket);
+            return Ok(r);
+        }
+    }
     poll(hub, project, branch);
+    crate::limits::release_places();
     let out = match tokio::time::timeout_at(deadline, &mut w.rx).await {
         Ok(Ok(r)) => r,
         // The deadline: the row as it is now.
