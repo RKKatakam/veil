@@ -1024,8 +1024,12 @@ pub fn push(
     // Releases staged by `vl embargo release` become permanent before the
     // withheld history is decided: an undo cannot take one back between
     // that decision and the upload (BUG-807).
+    // Only those the op log holds in force (BUG-1487); the others are
+    // taken back, and named.
+    let not_published = local.take_back_releases_out_of_force()?;
     let releases_published = local.keys().publish_staged_releases()?;
     let mut report = SyncReport::default();
+    report.warnings.extend(not_published);
     let (sendable, withheld) = sendable_tags(local, only_tags, &mut report)?;
     let selected = accepted_tags(local, sendable, &tx.view.tags, force, &mut report)?;
     let tips: Vec<ObjectId> = selected.iter().map(|(_, t)| t.target).collect();
