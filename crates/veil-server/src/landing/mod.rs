@@ -322,6 +322,10 @@ impl Default for Services {
     }
 }
 
+/// Most landings waiting for their outcome on one server at once (they hold
+/// no bulkhead place while they wait, BUG-1635); the rest answer at once.
+pub const MAX_WAITING: usize = 10_000;
+
 /// A submitter's wait for its ticket, registered before the submit commits
 /// so that the outcome is never missed.
 pub struct Waiter {
@@ -462,8 +466,18 @@ pub fn queued(ticket: &str) -> LandResult {
 /// 250 ms while another server runs the branch's service, every 5 s as a
 /// fallback while this one does): its cost follows the landings, never the
 /// number of waiters (BUG-1108). Gives the request's bulkhead places back
-/// before waiting (BUG-1635).
+/// before waiting (BUG-1635), so the waiters here are bounded by
+/// [`MAX_WAITING`] instead: past it, the answer is the row as it is now
+/// (`queued` and its ticket, for `vl land --status`), without a wait.
 pub async fn wait(hub: &Arc<Hub>, project: i64, person: i64, branch: &str, mut w: Waiter, deadline: tokio::time::Instant) -> Result<LandResult> {
+    if hub.landing.waiters.lock().unwrap().len() > MAX_WAITING {
+        let out = match read(hub, project, person, &w.ticket).await? {
+            Some((_, r)) => r,
+            None => queued(&w.ticket),
+        };
+        hub.landing.forget(&w.ticket);
+        return Ok(out);
+    }
     crate::limits::leave_gates();
     if let Some(e) = hub.landing.waiters.lock().unwrap().get_mut(&w.ticket) {
         e.1 = Some((project, branch.to_string()));
