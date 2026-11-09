@@ -3101,7 +3101,12 @@ permissions are renewed; a grant's device is charged on its verified grant,
 not on the request's own signature (a copy of a grant, which only its
 device and the caches hold, can spend that device's rate); a body that
 arrives fast and then at 8 KiB/s holds what it received for as long as its
-rate allows it (ten minutes of it).
+rate allows it (ten minutes of it). A bearer token this server does not know
+is looked up (one indexed statement) before any gate, at the device rate
+per address (BUG-1338): made-up tokens from one address cost the database
+ten times what its anonymous rate admits, outside the bulkheads (about 160
+addresses at that rate would fill a pool of 32); a token found is cached,
+one not found is not (S24 cycle 2 review).
 
 ### 13.28 S8: workspaces that fetch on first read (as built)
 
