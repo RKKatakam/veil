@@ -2506,26 +2506,29 @@ for them):
   one; of that view's memos with that projection, the one that did not
   collapse into its parent's: one row of a partial index, however long the
   run, BUG-1468), counting toward nothing (BUG-1409).
-* **"Already landed" is asked by change id, of changes the submitter sees
-  whole** (BUG-1408, BUG-1465, BUG-1466, BUG-1522, BUG-1526; one seen in part
-  is left out, never judged by edits they cannot see): a `landings` row is a
-  fast path whose absence means nothing;
-  the question is the branch's record of its changes in its lineage
-  (`landed_changes`: one row per change landed there, written by every
+* **"Already landed" is asked by change id and author, of changes the
+  submitter sees whole** (BUG-1408, BUG-1465, BUG-1466, BUG-1522, BUG-1526,
+  BUG-1527, BUG-1547, BUG-1548, BUG-1579, BUG-1580; one seen in part is left
+  out, never judged by edits they cannot see): a `landings` row is a fast
+  path whose absence means nothing; the question is the branch's record of
+  its changes in its lineage (`landed_changes`, keyed by `(project, branch,
+  lineage, change_id, author)` and indexed by `(project, branch, change_id,
+  author)`: one row per change and author landed there, written by every
   route that moves a branch, the landing service, a push of new snapshots
   and an API commit `onto`; one lookup no bound limits), the landed
-  revision then asked of the bounded ancestry below (yes, no, or
-  `warming`; never "no" from a truncated search). A change id is the
-  client's choice, so a row counts only for a change whose revisions the
-  landing belongs to: the landed revision, or what it was made from, is the
-  change or one of its recorded predecessors, as the submitter names them
-  (BUG-1527). A rebase keeps the change id, not the snapshot: a revision whose edits are all the landed
-  revision's (the same change, or one rebased on a tip that holds it) is
-  skipped; one that brings further edits is refused ("this change already
-  landed … with other edits: make a new change for the further edits"),
-  never applied again. The answer names every change left out as landed
-  already ("change … already landed on … with the same edits: not landed
-  again"): never silent.
+  revision then asked of the bounded ancestry below (yes, no, or `warming`;
+  never "no" from a truncated search). The author is the person whose
+  signature is on the change, and on the landed revision (its device key,
+  its `origins` row, or its `change_refs` creator); **no predecessor list is
+  read at all**, and a row with the same change id by another author is
+  ignored completely. A rebase or rewrite keeps the change id and author,
+  not the snapshot: a revision whose edits are all the landed revision's
+  (the same change, or one rebased on a tip that holds it) is skipped; one
+  that brings further edits is refused ("this change already landed … with
+  other edits: make a new change for the further edits"), never applied
+  again. Every answer, including "nothing to land", names every change left
+  out as landed already ("change … already landed on … with the same edits:
+  not landed again", BUG-1549): never silent.
 * At most 64 changes the submitter sees land, counted as they are found;
   at most 4,096 they see are read, then `warming`; changes they cannot see
   count toward neither.
@@ -2534,12 +2537,12 @@ for them):
 (BUG-1300): `branches.lineage` is a new value (a sequence) at every
 creation, every forced update and every deletion (a branch made again
 starts a new lineage); fast-forward pushes, API commits and the service
-keep it. `landings` rows carry the lineage they were made under, and only
-rows of the branch's current lineage count; a queue row lands only under
-the lineage its stack was judged under (else it is `rejected`: "the branch
-was reset since this change was submitted: submit it again"); the
-service's compare-and-swap is on tip and lineage. Stale rows can never make
-a change count as landed.
+keep it. `landings` and `landed_changes` rows carry the lineage they were
+made under, and only rows of the branch's current lineage count; a queue row
+lands only under the lineage its stack was judged under (else it is
+`rejected`: "the branch was reset since this change was submitted: submit it
+again"); the service's compare-and-swap is on tip and lineage. Stale rows
+can never make a change count as landed.
 
 **Is a snapshot on the branch** (`landing::Ancestry`, one per submit),
 cheapest first: the tip itself; `landings` of the current lineage (an
@@ -2556,13 +2559,14 @@ for. Past that, `warming` (503: try again).
 statement for the branch, and for each change the submitter sees on the
 line (at most 4,096): a `landings` lookup, a graph lookup or the shared
 walk (at most 4,096 snapshots a submit in all), their projection and one
-row of `projections_own` for the run below it, the `landed_from` lookup (at
-most 64 rows, each asked of the same bounded ancestry), and one diff of its
-own edits. A hidden run costs one row, however long; when its memos do not
-say which change it stands for (memos older than the column, or two changes
-alike for the view), the run is read and diffed, at most 4,096 changes,
-then `warming` (the deriver is asked to catch up). An agent's landing on
-its own last one costs the branch's row and one `landings` lookup.
+row of `projections_own` for the run below it, one `landed_changes` lookup
+by `(project, branch, lineage, change_id, author)` (asked of the same
+bounded ancestry), and one diff of its own edits. A hidden run costs one
+row, however long; when its memos do not say which change it stands for
+(memos older than the column, or two changes alike for the view), the run is
+read and diffed, at most 4,096 changes, then `warming` (the deriver is asked
+to catch up). An agent's landing on its own last one costs the branch's row
+and one `landings` lookup.
 
 **Which real snapshot a projected id names** (BUG-1314, BUG-1407,
 BUG-1467, BUG-1520, BUG-1521): several changes hidden from a viewer can

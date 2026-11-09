@@ -576,10 +576,11 @@ async fn commit(
     let mv = mv.map(|m| (m.branch, m.cur.hex(), m.keep_on_loss));
     let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let committed: Vec<ObjectId> = restacked.iter().map(|(n, _, _)| *n).chain(std::iter::once(built.real)).collect();
-    // What a move puts on the branch, by change id (`landed_changes`,
-    // BUG-1522): the caller's restacked changes and this one.
-    let on_branch: (Vec<String>, Vec<String>) = match &mv {
-        None => (Vec::new(), Vec::new()),
+    // What a move puts on the branch, by change id and author
+    // (`landed_changes`, BUG-1522, BUG-1527): the caller's restacked changes
+    // and this one.
+    let on_branch: (Vec<String>, Vec<i64>, Vec<String>) = match &mv {
+        None => (Vec::new(), Vec::new(), Vec::new()),
         Some(_) => {
             let ids = committed.clone();
             let mut cs: Vec<String> = sync::blocking(hub, pid, move |src| {
@@ -587,7 +588,8 @@ async fn commit(
             })
             .await?;
             cs.push(cid.clone());
-            (cs, committed.iter().map(ObjectId::hex).collect())
+            let aus = vec![person; cs.len()];
+            (cs, aus, committed.iter().map(ObjectId::hex).collect())
         }
     };
     let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
@@ -613,7 +615,7 @@ async fn commit(
                     return Err(Error::conflict(format!("branch '{branch}' moved")));
                 }
                 if let Some(lineage) = lineage {
-                    crate::landing::record_changes(&mut *c, pid, branch, lineage, &on_branch.0, &on_branch.1).await?;
+                    crate::landing::record_changes(&mut *c, pid, branch, lineage, &on_branch.0, &on_branch.1, &on_branch.2).await?;
                 }
                 moved = Some(rows == 1);
                 if let (1, Some(text)) = (rows, &accept) {
@@ -943,7 +945,7 @@ pub(crate) async fn create_with(
         // A landing of edits: the stack is the submitter's history from the
         // branch up to this one, as for a pushed snapshot (BUG-1112).
         if let Some((_, q)) = land.as_mut() {
-            let fresh = HashMap::from([(built.real, vec![parent])]);
+            let fresh = HashMap::from([(built.real, (vec![parent], person.id))]);
             (q.stack, q.lineage) = match crate::landing::stack(hub, &who.project, &who.viewer, &q.branch, built.real, &fresh).await? {
                 Ok(j) if j.branch => {
                     *q.skipped.lock().unwrap() = j.skipped;
@@ -954,7 +956,13 @@ pub(crate) async fn create_with(
                 Err(why) => return Err(bad(why)),
             };
             if q.stack.is_empty() {
-                return Err(bad("nothing to land: this change is on the branch already"));
+                let skipped = q.skipped.lock().unwrap().clone();
+                let mut msg = "nothing to land: this change is on the branch already".to_string();
+                let named = crate::landing::skipped_warnings(hub, project.id, &q.branch, &skipped).await?;
+                if !named.is_empty() {
+                    msg = format!("{msg}; {}", named.join("; "));
+                }
+                return Err(bad(msg));
             }
         }
         // The branch rules: a move of the default branch changes them only

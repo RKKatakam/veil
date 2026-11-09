@@ -1561,8 +1561,8 @@ pub(crate) async fn push_with(
         k.dedup();
         k
     };
-    let signers: HashSet<String> =
-        sqlx::query_scalar::<_, String>("SELECT signing_key FROM devices WHERE signing_key = ANY($1) AND removed_at IS NULL AND NOT pending")
+    let signers: HashMap<String, i64> =
+        sqlx::query_as::<_, (String, i64)>("SELECT signing_key, person_id FROM devices WHERE signing_key = ANY($1) AND removed_at IS NULL AND NOT pending")
             .bind(&keys)
             .fetch_all(&hub.db)
             .await?
@@ -1577,8 +1577,8 @@ pub(crate) async fn push_with(
     // 2. Complete and check each new snapshot (`uploaded`: a push names
     // nothing else that is not already where it was in a parent, BUG-824).
     let mut completed: Vec<Completed> = Vec::new();
-    // Each new real snapshot's real parents.
-    let mut real_parents_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+    // Each new real snapshot's real parents and signer (`people.id`).
+    let mut real_parents_of: HashMap<ObjectId, (Vec<ObjectId>, i64)> = HashMap::new();
     for id in &order {
         let n = parents_of[id].clone();
         if n.embargo.is_some() {
@@ -1586,16 +1586,18 @@ pub(crate) async fn push_with(
                 "embargoed merges cannot be pushed to the server yet (docs/HUB.md §11)",
             ));
         }
-        match &n.signature {
-            Some(sig) if n.signature_valid() == Some(true) && signers.contains(&sig.key) => {}
-            Some(_) if n.signature_valid() == Some(true) => {
-                return Err(Error::forbidden(format!(
-                    "snapshot {} is signed by a key no device here is registered with",
-                    id.short()
-                )))
-            }
+        let author = match &n.signature {
+            Some(sig) if n.signature_valid() == Some(true) => match signers.get(&sig.key) {
+                Some(&p) => p,
+                None => {
+                    return Err(Error::forbidden(format!(
+                        "snapshot {} is signed by a key no device here is registered with",
+                        id.short()
+                    )))
+                }
+            },
             _ => return Err(Error::forbidden(format!("snapshot {} is unsigned or its signature is invalid", id.short()))),
-        }
+        };
         if n.parents.is_empty() {
             return Err(Error::bad_request("a snapshot without parents (only the root has none)"));
         }
@@ -1624,7 +1626,7 @@ pub(crate) async fn push_with(
             hub.objects.put(project.id, &c.real, raw.clone()).await?;
         }
         real_of.insert(*id, c.real);
-        real_parents_of.insert(c.real, real_parents);
+        real_parents_of.insert(c.real, (real_parents, author));
         completed.push(c);
     }
     // 3. Move the branches: one serialisable transaction of compare-and-swaps.
@@ -1679,7 +1681,12 @@ pub(crate) async fn push_with(
                 }
             };
             if judged.stack.is_empty() {
-                results.push(refuse(crate::landing::NOTHING_TO_LAND));
+                let mut msg = crate::landing::NOTHING_TO_LAND.to_string();
+                let skipped = crate::landing::skipped_warnings(hub, project.id, &u.branch, &judged.skipped).await?;
+                if !skipped.is_empty() {
+                    msg = format!("{msg}; {}", skipped.join("; "));
+                }
+                results.push(refuse(&msg));
                 continue;
             }
             if judged.stack.iter().any(|e| parents_of.iter().any(|(pid, n)| real_of.get(pid) == Some(&e.id) && !n.conflicts.is_empty())) {
@@ -1780,7 +1787,7 @@ pub(crate) async fn push_with(
         let mut seen = HashSet::new();
         let mut stack: Vec<ObjectId> = plans.iter().filter_map(|p| p.2).chain(queued.iter().filter_map(|q| q.stack.last().map(|e| e.id))).collect();
         while let Some(x) = stack.pop() {
-            if let Some(ps) = real_parents_of.get(&x) {
+            if let Some((ps, _)) = real_parents_of.get(&x) {
                 if seen.insert(x) {
                     stack.extend(ps.iter().copied());
                 }
@@ -1794,26 +1801,27 @@ pub(crate) async fn push_with(
     let memos: Vec<(String, String, String, bool)> =
         deferred.rows.iter().map(|(k, r, p)| (k.clone(), r.hex(), p.hex(), deferred.collapsed.contains(r))).collect();
     // The changes each moved branch now holds that this push brought, by
-    // change id (`landed_changes`, BUG-1522).
+    // change id and author (`landed_changes`, BUG-1522, BUG-1527).
     let change_of: HashMap<ObjectId, String> =
         real_of.iter().filter_map(|(pushed, real)| parents_of.get(pushed).map(|s| (*real, s.change_id.to_string()))).collect();
-    let plan_changes: HashMap<String, (Vec<String>, Vec<String>)> = plans
+    let plan_changes: HashMap<_, _> = plans
         .iter()
         .filter_map(|(branch, _, new, _)| new.map(|n| (branch.clone(), n)))
         .map(|(branch, n)| {
-            let (mut cs, mut ls) = (Vec::new(), Vec::new());
+            let (mut cs, mut aus, mut ls) = (Vec::new(), Vec::new(), Vec::new());
             let mut seen = HashSet::new();
             let mut stack = vec![n];
             while let Some(x) = stack.pop() {
-                if let (Some(ps), true) = (real_parents_of.get(&x), seen.insert(x)) {
+                if let (Some((ps, author)), true) = (real_parents_of.get(&x), seen.insert(x)) {
                     if let Some(cid) = change_of.get(&x) {
                         cs.push(cid.clone());
+                        aus.push(*author);
                         ls.push(x.hex());
                     }
                     stack.extend(ps.iter().copied());
                 }
             }
-            (branch, (cs, ls))
+            (branch, (cs, aus, ls))
         })
         .collect();
     let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
@@ -1893,9 +1901,9 @@ pub(crate) async fn push_with(
                 moved.push(branch);
             }
             for (branch, lineage) in &lineages {
-                if let Some((cs, ls)) = plan_changes.get(branch) {
+                if let Some((cs, aus, ls)) = plan_changes.get(branch) {
                     if !cs.is_empty() {
-                        crate::landing::record_changes(&mut *c, pid, branch, *lineage, cs, ls).await?;
+                        crate::landing::record_changes(&mut *c, pid, branch, *lineage, cs, aus, ls).await?;
                     }
                 }
             }

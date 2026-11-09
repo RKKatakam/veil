@@ -149,24 +149,101 @@ pub async fn insert(c: &mut PgConnection, project: i64, who: &Submitter, q: &Que
 }
 
 /// Record, in the caller's transaction, that the changes `changes` (their
-/// ids) landed on `branch` in its lineage `lineage` as the snapshots
-/// `landed` (BUG-1522: "already landed" asks by change id, whatever route
-/// moved the branch: the landing service, a push, an API commit `onto`).
-/// The first landing of a change on a lineage is kept.
-pub async fn record_changes(c: &mut PgConnection, project: i64, branch: &str, lineage: i64, changes: &[String], landed: &[String]) -> Result<()> {
+/// ids, by `authors`: the person whose signature is on each) landed on
+/// `branch` in its lineage `lineage` as the snapshots `landed` (BUG-1522,
+/// BUG-1527, BUG-1547, BUG-1548, BUG-1579, BUG-1580: "already landed" asks
+/// by change id and author, whatever route moved the branch: the landing
+/// service, a push, an API commit `onto`). The first landing of a change by
+/// an author on a lineage is kept.
+pub async fn record_changes(
+    c: &mut PgConnection,
+    project: i64,
+    branch: &str,
+    lineage: i64,
+    changes: &[String],
+    authors: &[i64],
+    landed: &[String],
+) -> Result<()> {
     sqlx::query(
-        "INSERT INTO landed_changes (project_id, branch, lineage, change_id, landed) \
-         SELECT $1, $2, $3, c, l FROM unnest($4::TEXT[], $5::TEXT[]) AS v(c, l) ON CONFLICT DO NOTHING",
+        "INSERT INTO landed_changes (project_id, branch, lineage, change_id, author, landed) \
+         SELECT $1, $2, $3, c, a, l FROM unnest($4::TEXT[], $5::BIGINT[], $6::TEXT[]) AS v(c, a, l) ON CONFLICT DO NOTHING",
     )
     .bind(project)
     .bind(branch)
     .bind(lineage)
     .bind(changes)
+    .bind(authors)
     .bind(landed)
     .execute(&mut *c)
     .await?;
     Ok(())
 }
+
+/// The person (`people.id`) whose signature is on change `x` (or on what the
+/// server made `x` from: its `origins` row from a partial-view push, its
+/// submitted snapshot when the landing service built `x`, or its `change_refs`
+/// creator for an API commit).
+pub(crate) async fn snapshot_author(
+    hub: &Arc<Hub>,
+    project: i64,
+    x: ObjectId,
+    fresh: &HashMap<ObjectId, (Vec<ObjectId>, i64)>,
+) -> Result<Option<i64>> {
+    let mut cur = x;
+    let server_key = hub.identity.verifying_hex();
+    for _ in 0..4 {
+        if let Some((_, a)) = fresh.get(&cur) {
+            return Ok(Some(*a));
+        }
+        let y = cur;
+        let (cid, key, pred) = crate::sync::blocking(hub, project, move |src| {
+            let s = src.snapshot(&y)?;
+            Ok((
+                s.change_id.to_string(),
+                s.signature.as_ref().map(|g| g.key.clone()),
+                s.predecessors.first().copied(),
+            ))
+        })
+        .await?;
+        let Some(k) = key else { return Ok(None) };
+        if k != server_key {
+            let p: Option<i64> = sqlx::query_scalar("SELECT person_id FROM devices WHERE signing_key = $1")
+                .bind(&k)
+                .fetch_optional(&hub.db)
+                .await?;
+            return Ok(p);
+        }
+        let orig: Option<String> = sqlx::query_scalar("SELECT origin_id FROM origins WHERE project_id = $1 AND real_id = $2")
+            .bind(project)
+            .bind(cur.hex())
+            .fetch_optional(&hub.db)
+            .await?;
+        if let Some(orig) = orig.and_then(|o| ObjectId::from_hex(&o).ok()) {
+            let okey = crate::sync::blocking(hub, project, move |src| Ok(src.snapshot(&orig)?.signature.as_ref().map(|g| g.key.clone()))).await?;
+            if let Some(ok) = okey {
+                let p: Option<i64> = sqlx::query_scalar("SELECT person_id FROM devices WHERE signing_key = $1")
+                    .bind(&ok)
+                    .fetch_optional(&hub.db)
+                    .await?;
+                return Ok(p);
+            }
+        }
+        let by: Option<i64> = sqlx::query_scalar("SELECT created_by FROM change_refs WHERE project_id = $1 AND change_id = $2")
+            .bind(project)
+            .bind(&cid)
+            .fetch_optional(&hub.db)
+            .await?;
+        if by.is_some() {
+            return Ok(by);
+        }
+        match pred {
+            Some(p) if p != cur => cur = p,
+            _ => break,
+        }
+    }
+    Ok(None)
+}
+
 
 /// The protected branches of a project: the rules of its default branch's
 /// tip `default_tip` (real), if it has one. A `.veilrules` that does not
@@ -575,11 +652,8 @@ pub const NOTHING_TO_LAND: &str =
 /// graph answers; past it the submit is answered `warming` (changes hidden
 /// from the submitter count toward nothing they are told, BUG-1313).
 pub const WALK_BUDGET: usize = 4_096;
-/// Most frontier snapshots of that walk the derived graph is asked about.
+///Most frontier snapshots of that walk the derived graph is asked about.
 const FRONTIER_LIMIT: usize = 64;
-/// Most snapshots of a landed revision's history (it, what it was made
-/// from, theirs) `Ancestry::landed` projects to relate it to a change.
-const RELATED_LIMIT: usize = 16;
 
 /// Whether a change of a stack landed already ([`Ancestry::landed`]).
 #[derive(Clone, Copy, PartialEq)]
@@ -644,9 +718,9 @@ enum Class {
 ///   counting toward nothing (BUG-1409); while the graph is behind it, each
 ///   is read, at most [`WALK_BUDGET`], then `warming`;
 /// * a change whose edits are on the branch already (`landings`, or a
-///   revision of it there: `Ancestry::landed`) is skipped (BUG-1408); one
-///   the submitter sees only in part is left for whoever sees it whole; one
-///   with conflicts they can see is refused;
+///   revision of it there by the same author: `Ancestry::landed`) is skipped
+///   (BUG-1408); one the submitter sees only in part is left for whoever sees
+///   it whole; one with conflicts they can see is refused;
 /// * at most [`WALK_BUDGET`] changes they see are read, and at most
 ///   `MAX_LAND_STACK` land.
 ///
@@ -657,7 +731,7 @@ pub async fn stack(
     viewer: &crate::perm::Viewer,
     branch: &str,
     new: ObjectId,
-    fresh: &HashMap<ObjectId, Vec<ObjectId>>,
+    fresh: &HashMap<ObjectId, (Vec<ObjectId>, i64)>,
 ) -> Result<std::result::Result<Judged, String>> {
     let root = crate::sync::root_snapshot_id();
     let pid = project.id;
@@ -690,7 +764,7 @@ pub async fn stack(
         }
         let held = !fresh.contains_key(&x);
         let parents = match fresh.get(&x) {
-            Some(p) => p.clone(),
+            Some((p, _)) => p.clone(),
             None => {
                 let y = x;
                 crate::sync::blocking(hub, pid, move |src| Ok(src.snapshot(&y)?.parents.clone())).await?
@@ -768,7 +842,7 @@ pub async fn stack(
                 matches!(c, Class::Whole)
             };
         let landed = whole
-            && match anc.landed(project, viewer, x, held).await? {
+            && match anc.landed(x, held, fresh).await? {
                 Landed::No => false,
                 Landed::Same => {
                     skipped.push(x);
@@ -964,16 +1038,19 @@ impl Ancestry {
         Ok(v)
     }
 
-    /// Has change `x` landed on the branch already (BUG-1522: by its change
-    /// id, whatever its snapshot: a rebase keeps the change id)? `landings`
-    /// first (a fast path whose absence means nothing), then the branch's
-    /// record of its changes in its lineage (`landed_changes`: one lookup no
-    /// bound limits, BUG-1521), the landed revision then checked to be the
+    /// Has change `x` landed on the branch already (BUG-1522, BUG-1527,
+    /// BUG-1547, BUG-1548, BUG-1579, BUG-1580: by its change id and author,
+    /// whatever its snapshot or predecessors)? `landings` first (a fast path
+    /// whose absence means nothing), then the branch's record of its changes
+    /// in its lineage (`landed_changes` keyed on `(project, branch, lineage,
+    /// change_id, author)`: one lookup no bound limits, BUG-1521; no
+    /// predecessor list is read), the landed revision then checked to be the
     /// tip or below it ([`Ancestry::has`]: `warming` when that cannot be
     /// told). `Same`: its own edits are among the landed revision's (the
     /// same change, or rebased on a tip that holds it: skip it); `Other`:
-    /// it brings further edits (refused: they are a new change's).
-    async fn landed(&mut self, project: &crate::perm::Project, viewer: &crate::perm::Viewer, x: ObjectId, held: bool) -> Result<Landed> {
+    /// it brings further edits (refused: they are a new change's). A row
+    /// with another author is ignored (`No`).
+    async fn landed(&mut self, x: ObjectId, held: bool, fresh: &HashMap<ObjectId, (Vec<ObjectId>, i64)>) -> Result<Landed> {
         let n: Option<i32> = if !held {
             None
         } else {
@@ -988,49 +1065,21 @@ impl Ancestry {
         if n.is_some() {
             return Ok(Landed::Same);
         }
+        let Some(author) = snapshot_author(&self.hub, self.project, x, fresh).await? else { return Ok(Landed::No) };
         let cid = crate::sync::blocking(&self.hub, self.project, move |src| Ok(src.snapshot(&x)?.change_id.to_string())).await?;
-        let row: Option<String> =
-            sqlx::query_scalar("SELECT landed FROM landed_changes WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND change_id = $4")
-                .bind(self.project)
-                .bind(&self.branch)
-                .bind(self.lineage)
-                .bind(&cid)
-                .fetch_optional(&self.hub.db)
-                .await?;
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT landed FROM landed_changes WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND change_id = $4 AND author = $5",
+        )
+        .bind(self.project)
+        .bind(&self.branch)
+        .bind(self.lineage)
+        .bind(&cid)
+        .bind(author)
+        .fetch_optional(&self.hub.db)
+        .await?;
         let Some(r) = row.and_then(|r| ObjectId::from_hex(&r).ok()) else { return Ok(Landed::No) };
         if r == x {
             return Ok(Landed::Same);
-        }
-        // A change id is the client's choice: the landing counts only for a
-        // change whose revisions it belongs to (BUG-1527): it, or what it was
-        // made from, is the change or one of its recorded predecessors, as the
-        // submitter names them.
-        let (mine, theirs) = crate::sync::blocking(&self.hub, self.project, move |src| {
-            let s = src.snapshot(&x)?;
-            let mut mine: std::collections::HashSet<ObjectId> = s.predecessors.iter().copied().collect();
-            mine.insert(x);
-            let rs = src.snapshot(&r)?;
-            let mut theirs = vec![r];
-            for p in &rs.predecessors {
-                theirs.push(*p);
-                if let Ok(ps) = src.snapshot(p) {
-                    theirs.extend(ps.predecessors.iter().copied());
-                }
-            }
-            Ok((mine, theirs))
-        })
-        .await?;
-        let mut related = theirs.iter().any(|t| mine.contains(t));
-        if !related {
-            for t in theirs.iter().take(RELATED_LIMIT) {
-                if mine.contains(&crate::sync::projected(&self.hub, project, viewer, *t).await?) {
-                    related = true;
-                    break;
-                }
-            }
-        }
-        if !related {
-            return Ok(Landed::No);
         }
         if !self.has(r).await? {
             return Ok(Landed::No);

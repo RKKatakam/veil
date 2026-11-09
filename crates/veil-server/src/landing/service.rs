@@ -802,9 +802,20 @@ impl Service {
         let rows: BTreeMap<ObjectId, ObjectId> = b.landings.iter().chain(from.iter()).map(|(s, r)| (*s, r.landed)).collect();
         let ls: Vec<String> = rows.keys().map(ObjectId::hex).collect();
         let ll: Vec<String> = rows.values().map(ObjectId::hex).collect();
-        // Each change landed, by its id, for the branch's lineage: "already
-        // landed" asks it whatever its submitted snapshot (BUG-1522).
-        let (cc, cl): (Vec<String>, Vec<String>) = b.landings.iter().filter_map(|(_, r)| r.change.clone().map(|c| (c, r.landed.hex()))).unzip();
+        // Each change landed, by its id and author, for the branch's lineage:
+        // "already landed" asks it whatever its submitted snapshot (BUG-1522,
+        // BUG-1527).
+        let empty_fresh = HashMap::new();
+        let (mut cc, mut ca, mut cl) = (Vec::new(), Vec::new(), Vec::new());
+        for (sid, r) in &b.landings {
+            if let Some(c) = &r.change {
+                if let Some(a) = super::snapshot_author(hub, self.project, *sid, &empty_fresh).await? {
+                    cc.push(c.clone());
+                    ca.push(a);
+                    cl.push(r.landed.hex());
+                }
+            }
+        }
         let lineage = b.after.lineage;
         let mk: Vec<String> = b.memos.iter().map(|m| m.0.clone()).collect();
         let mr: Vec<String> = b.memos.iter().map(|m| m.1.hex()).collect();
@@ -815,7 +826,7 @@ impl Service {
         let notify = hub.caches.notices.load(Ordering::SeqCst);
         let tx_results = results.clone();
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-            let (ls, ll, mc, cc, cl) = (ls.clone(), ll.clone(), mc.clone(), cc.clone(), cl.clone());
+            let (ls, ll, mc, cc, ca, cl) = (ls.clone(), ll.clone(), mc.clone(), cc.clone(), ca.clone(), cl.clone());
             let (branch, holder, old, new, seqs, snapshots, mk, mr, mp, accept, name, mut results) = (
                 branch.clone(),
                 holder.clone(),
@@ -935,7 +946,7 @@ impl Service {
                     .await?;
                 }
                 if !cc.is_empty() {
-                    crate::landing::record_changes(&mut *c, pid, &branch, lineage, &cc, &cl).await?;
+                    crate::landing::record_changes(&mut *c, pid, &branch, lineage, &cc, &ca, &cl).await?;
                 }
                 if !mk.is_empty() {
                     let stored: Vec<(String, String)> = sqlx::query_as(

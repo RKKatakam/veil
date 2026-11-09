@@ -4111,7 +4111,6 @@ fn local_only(c: &Craft<'_>, parent: ObjectId, cid: veil_core::ChangeId, what: &
 /// second change with P's change id, where one rewrite on is refused
 /// (`a_revision_of_a_landed_change_with_further_edits_is_refused`).
 #[test]
-#[ignore = "BUG-1547: a revision of a landed change two rewrites on (each naming only the one before) is not related to its landing, and lands again"]
 fn bug_1547_a_revision_two_rewrites_past_a_landed_change_is_refused_like_one_rewrite_past() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -4149,7 +4148,6 @@ fn bug_1547_a_revision_two_rewrites_past_a_landed_change_is_refused_like_one_rew
 /// is answered with an error, for ever, though nothing of V is on main.
 /// With no predecessor (`bug_1527_…`) V lands.
 #[test]
-#[ignore = "BUG-1548: a landed revision whose recorded history names a snapshot the server never stored fails Ancestry::landed: a change landed under someone else's change id still blocks theirs"]
 fn bug_1548_a_squat_naming_an_unstored_predecessor_never_blocks_the_change_it_squats() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -4185,7 +4183,6 @@ fn bug_1548_a_squat_naming_an_unstored_predecessor_never_blocks_the_change_it_sq
 /// naming none: the submitter cannot tell which of the two it was, and the
 /// skipped change is not named (HUB.md §13.19: "never silent").
 #[test]
-#[ignore = "BUG-1549: a landing whose every change landed already answers \"nothing to land\" without naming the changes it left out as landed"]
 fn bug_1549_a_landing_whose_every_change_landed_already_names_them() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -4197,17 +4194,57 @@ fn bug_1549_a_landing_whose_every_change_landed_already_names_them() {
     assert_eq!(v["state"], "landed", "{v}");
     let tip = real_tip(&hub, pid);
     let cid = source(&hub, pid).snapshot(&tip).unwrap().change_id;
+    let r = land(
+        &api,
+        &p.admin.token(),
+        &p.name,
+        tip,
+        json!([put(".veilrules", "[branches.main]\nprotected = true\n")]),
+        true,
+    );
+    assert_eq!(r.json()["state"], "landed", "{}", String::from_utf8_lossy(&r.body));
+    let tip = real_tip(&hub, pid);
     let mut c = Craft::new(&api, &p.dev, &p.name, "main");
     let on = c.tip;
     let p2 = snap_at(&mut c, on, cid, "P, rebased", veil_core::now_millis(), vec![first]);
     let r = push_new(&c, &[("again", p2)]);
     assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
-    let r = land_held(&api, &token, &p.name, p2, true);
+    for route in ["snapshot", "push"] {
+        let r = match route {
+            "snapshot" => land_held(&api, &token, &p.name, p2, true),
+            _ => api.post_json(
+                Some(&token),
+                &format!("/v1/projects/{}/push", p.name),
+                &json!({"updates": [{"branch": "main", "expected": on.hex(), "new": p2.hex()}]}),
+            ),
+        };
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        if route == "push" {
+            assert_eq!(r.status, 200, "{route}: {body}");
+            assert_eq!(r.json()["results"][0]["ok"], false, "{route}: {body}");
+        } else {
+            assert_eq!(r.status, 400, "{route}: {body}");
+        }
+        assert!(body.contains("nothing to land"), "{route}: {body}");
+        assert_eq!(real_tip(&hub, pid), tip, "{route}: {body}");
+        assert!(body.contains(&cid.to_string()) && body.contains("already landed"), "{route}: the change left out is not named: {body}");
+    }
+    // And a landing of edits (`POST …/land` with `base` and `edits`) whose
+    // change is skipped as landed already with the same edits: named too.
+    let w = land(&api, &token, &p.name, on, json!([put("src/e.rs", "e\n")]), true).json();
+    assert_eq!(w["state"], "landed", "{w}");
+    let ecid = w["change_id"].as_str().unwrap().to_string();
+    let tip2 = real_tip(&hub, pid);
+    let r = api.post_json(
+        Some(&token),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "base": on.hex(), "change_id": ecid, "edits": [put("src/e.rs", "e\n")], "description": "E again", "wait": true}),
+    );
     let body = String::from_utf8_lossy(&r.body).to_string();
-    assert_eq!(r.status, 400, "{body}");
-    assert!(body.contains("nothing to land"), "{body}");
-    assert_eq!(real_tip(&hub, pid), tip, "{body}");
-    assert!(body.contains(&cid.to_string()) && body.contains("already landed"), "the change left out is not named: {body}");
+    assert_eq!(r.status, 400, "edits: {body}");
+    assert!(body.contains("nothing to land"), "edits: {body}");
+    assert_eq!(real_tip(&hub, pid), tip2, "edits: {body}");
+    assert!(body.contains(&ecid) && body.contains("already landed"), "edits: the change left out is not named: {body}");
 }
 
 /// Guarantees 1 and 4 (BUG-1526's rule, the skipped line and the admin
@@ -4281,11 +4318,12 @@ fn a_change_seen_in_part_is_never_named_as_landed_already_and_only_an_admin_is_j
     assert_eq!(answers[0], answers[1], "the dev's answer is the same whatever F2 holds in billing");
 }
 
-/// Guarantee 1, the skipped line: the admin's change F (`src/f.rs` and a
-/// billing file, whose content differs between the two worlds) landed. The
-/// dev's revision of F as they see it (only `src/f.rs`, unchanged), with
-/// their change Q on it, lands Q and names F as landed already: the same
-/// answer, and the same line, whatever F holds in billing.
+/// Guarantee 1, the skipped line: the dev's change F (`src/f.rs`) landed,
+/// and a hidden billing change of the admin's (whose content differs between
+/// the two worlds) landed on it. The dev's revision of F on main0 (with no
+/// predecessors recorded), with their change Q on it, lands Q and names F as
+/// landed already: the same answer, and the same line, whatever is hidden on
+/// main.
 #[test]
 fn the_skipped_line_is_the_same_whatever_the_landed_revision_holds_hidden() {
     let mut answers = Vec::new();
@@ -4295,20 +4333,23 @@ fn the_skipped_line_is_the_same_whatever_the_landed_revision_holds_hidden() {
         let pid = project_id(&hub, &p.name);
         let api = hub.api();
         let mut d = Craft::new(&api, &p.dev, &p.name, "main");
-        let mut c = Craft::new(&api, &p.admin, &p.name, "main");
-        let main0 = c.tip;
-        let cid = veil_core::ChangeId::random();
-        c.file("src/f.rs", "f\n");
-        c.file(&format!("{BILL_DIR}/acme/f.txt"), bill);
-        let f = snap_at(&mut c, main0, cid, "F", veil_core::now_millis(), vec![]);
-        let r = push_new(&c, &[("f1", f)]);
-        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
-        let seen_f = Craft::new(&api, &p.dev, &p.name, "f1").tip;
-        let v = land_held(&api, &p.admin.token(), &p.name, f, true).json();
-        assert_eq!(v["state"], "landed", "{v}");
         let on = d.tip;
+        let cid = veil_core::ChangeId::random();
         d.file("src/f.rs", "f\n");
-        let f3 = snap_at(&mut d, on, cid, "F, as the dev sees it", veil_core::now_millis(), vec![seen_f]);
+        let f = snap_at(&mut d, on, cid, "F", veil_core::now_millis(), vec![]);
+        let r = push_new(&d, &[("f1", f)]);
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        let v = land_held(&api, &p.dev.token(), &p.name, f, true).json();
+        assert_eq!(v["state"], "landed", "{v}");
+        let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+        let main1 = c.tip;
+        c.file(&format!("{BILL_DIR}/acme/f.txt"), bill);
+        let b = snap_at(&mut c, main1, veil_core::ChangeId::random(), "B", veil_core::now_millis(), vec![]);
+        let r = push_new(&c, &[("b1", b)]);
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        let v = land_held(&api, &p.admin.token(), &p.name, b, true).json();
+        assert_eq!(v["state"], "landed", "{v}");
+        let f3 = snap_at(&mut d, on, cid, "F, rewritten", veil_core::now_millis(), vec![]);
         d.file("src/q.rs", "q\n");
         let q = crafted_on(&mut d, f3, veil_core::ChangeId::random(), "Q", "");
         let r = push_new(&d, &[("q", q)]);
@@ -4320,7 +4361,7 @@ fn the_skipped_line_is_the_same_whatever_the_landed_revision_holds_hidden() {
         assert_eq!(v["state"], "landed", "{v}");
         assert_eq!(v["landed"].as_array().unwrap().len(), 1, "{v}");
         assert_eq!(real_file(&hub, pid, "src/q.rs").as_deref(), Some(&b"q\n"[..]));
-        let ids: Vec<_> = chain(&hub, pid, main0).into_iter().map(|(_, s)| s.change_id).collect();
+        let ids: Vec<_> = chain(&hub, pid, veil_server::sync::root_snapshot_id()).into_iter().map(|(_, s)| s.change_id).collect();
         assert_eq!(ids.iter().filter(|i| **i == cid).count(), 1, "F's change is on main twice");
         assert!(body.contains(&cid.to_string()) && body.contains("already landed"), "F is not named: {body}");
         let mut shown = without_ticket(v);
@@ -4328,7 +4369,7 @@ fn the_skipped_line_is_the_same_whatever_the_landed_revision_holds_hidden() {
         shown.as_object_mut().unwrap().remove("change_id");
         answers.push(shown.to_string().replace(&cid.to_string(), "CID"));
     }
-    assert_eq!(answers[0], answers[1], "the answer is the same whatever F holds in billing");
+    assert_eq!(answers[0], answers[1], "the answer is the same whatever is hidden on main");
 }
 
 /// Guarantee 2 (`resolve_for`'s order, BUG-1525's class, every route): the
@@ -4440,21 +4481,18 @@ fn every_route_naming_a_snapshot_seen_whole_under_a_hidden_only_tip_is_made_on_t
     }
 }
 
-/// Guarantee 3, the bound (BUG-1579, BUG-1547's class): `Ancestry::landed`
-/// projects at most 16 of the landed revision's recorded history
-/// (`RELATED_LIMIT`) to relate it to a change, and answers "not landed" past
-/// them, so the order of a predecessor list decides whether a change lands
-/// twice. The admin's change F (`src/f.rs` and a billing file) is on `f1`;
-/// the dev sees it as F' (in part). The admin lands S, a revision of F (its
-/// change id) whose predecessors name F first, or after 16 pushed
-/// snapshots. The dev amends F' (its edit moved to another file) and lands
-/// it: refused "already landed … with other edits" when F is named first
-/// (the raw ids differ, F projects to F'); with F named 17th, F's change
-/// lands twice.
+/// Guarantee 3, the bound (BUG-1579, BUG-1547's class): "already landed"
+/// keys on `(project, branch, lineage, change_id, author)` and reads no
+/// predecessor list at all. The dev's change F (`src/f.rs`) is on `f1`; the
+/// dev lands S, a revision of F (its change id) whose predecessors name F
+/// first, after 16 pushed snapshots, or not at all. When the dev amends F
+/// (its edit moved to another file) and lands it, it is refused ("already
+/// landed … with other edits") in every case; when another author (the
+/// admin) landed S under F's change id instead, the row is ignored and the
+/// dev's change lands.
 #[test]
-#[ignore = "BUG-1579: a landed revision whose recorded history names the change past the 16th entry is taken as unrelated to it, and a revision of the change lands again"]
 fn bug_1579_a_revision_of_a_landed_change_is_refused_however_long_the_landed_revision_s_predecessor_list() {
-    for f_first in [true, false] {
+    for mode in ["first", "17th", "none", "other-author"] {
         let hub = TestHub::start();
         let p = setup_project(&hub);
         let pid = project_id(&hub, &p.name);
@@ -4473,46 +4511,48 @@ fn bug_1579_a_revision_of_a_landed_change_is_refused_however_long_the_landed_rev
             z = src.snapshot(&z).unwrap().parents[0];
         }
         assert_eq!(zs.len(), 16);
-        // F: src/f.rs and a billing file, on f1; the dev sees it in part.
         let cid = veil_core::ChangeId::random();
-        let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+        let mut c = Craft::new(&api, &p.dev, &p.name, "main");
         c.file("src/f.rs", "f\n");
-        c.file(&format!("{BILL_DIR}/acme/f.txt"), "f\n");
-        let f = snap_at(&mut c, main0, cid, "F", veil_core::now_millis(), vec![]);
+        let f = snap_at(&mut c, dev_main0, cid, "F", veil_core::now_millis(), vec![]);
         let r = push_new(&c, &[("f1", f)]);
         assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
-        let seen_f = Craft::new(&api, &p.dev, &p.name, "f1").tip;
-        assert_ne!(seen_f, f, "the dev sees F in part");
-        // S: the same edits, a revision of F whose predecessor list names F
-        // first or 17th; landed by the admin.
         let mut preds = zs.clone();
-        if f_first {
-            preds.insert(0, f);
-        } else {
-            preds.push(f);
+        match mode {
+            "first" => preds.insert(0, f),
+            "17th" => preds.push(f),
+            _ => preds.clear(),
         }
-        let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+        let s_author = if mode == "other-author" { &p.admin } else { &p.dev };
+        let mut c = Craft::new(&api, s_author, &p.name, "main");
+        let s_base = c.tip;
         c.file("src/f.rs", "f\n");
-        c.file(&format!("{BILL_DIR}/acme/f.txt"), "f\n");
-        let s = snap_at(&mut c, main0, cid, "S", veil_core::now_millis(), preds);
+        let s = snap_at(&mut c, s_base, cid, "S", veil_core::now_millis(), preds);
         let r = push_new(&c, &[("s", s)]);
+        let s_seen = ObjectId::from_hex(r.json()["results"][0]["tip"].as_str().unwrap()).unwrap();
         assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
-        let v = land_held(&api, &p.admin.token(), &p.name, s, true).json();
+        let v = land_held(&api, &s_author.token(), &p.name, s_seen, true).json();
         assert_eq!(v["state"], "landed", "{v}");
         let tip = real_tip(&hub, pid);
-        // The dev's revision of F as they see it: its edit moved to another
-        // file (no path of S's, so nothing conflicts with S on main).
+        // The dev's revision of F: its edit moved to another file (no path
+        // of S's, so nothing conflicts with S on main).
         d.file("src/more.rs", "f\n");
-        let x = snap_at(&mut d, dev_main0, cid, "F, amended", veil_core::now_millis(), vec![seen_f]);
+        let x = snap_at(&mut d, dev_main0, cid, "F, amended", veil_core::now_millis(), vec![f]);
         let r = push_new(&d, &[("x", x)]);
         assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
         let r = land_held(&api, &p.dev.token(), &p.name, x, true);
         let body = String::from_utf8_lossy(&r.body).to_string();
-        assert_eq!(r.status, 400, "F named first: {f_first}: {body}");
-        assert!(body.contains("already landed") && body.contains("make a new change for the further edits"), "F named first: {f_first}: {body}");
-        assert_eq!(real_tip(&hub, pid), tip, "F named first: {f_first}: {body}");
-        let ids: Vec<_> = chain(&hub, pid, main0).into_iter().map(|(_, s)| s.change_id).collect();
-        assert_eq!(ids.iter().filter(|i| **i == cid).count(), 1, "F named first: {f_first}: F's change is on main twice");
+        if mode == "other-author" {
+            assert_eq!(r.status, 200, "{mode}: {body}");
+            assert_eq!(r.json()["state"], "landed", "{mode}: {body}");
+            assert_eq!(real_file(&hub, pid, "src/more.rs").as_deref(), Some(&b"f\n"[..]), "{mode}");
+        } else {
+            assert_eq!(r.status, 400, "{mode}: {body}");
+            assert!(body.contains("already landed") && body.contains("make a new change for the further edits"), "{mode}: {body}");
+            assert_eq!(real_tip(&hub, pid), tip, "{mode}: {body}");
+            let ids: Vec<_> = chain(&hub, pid, main0).into_iter().map(|(_, s)| s.change_id).collect();
+            assert_eq!(ids.iter().filter(|i| **i == cid).count(), 1, "{mode}: F's change is on main twice");
+        }
     }
 }
 
@@ -4529,7 +4569,6 @@ fn bug_1579_a_revision_of_a_landed_change_is_refused_however_long_the_landed_rev
 /// though nothing of V is on main: fin blocks a change they may not write,
 /// as before BUG-1527's fix.
 #[test]
-#[ignore = "BUG-1580: a change landed under someone else's change id, naming their change's predecessor as its own, still blocks theirs"]
 fn bug_1580_a_squat_naming_the_predecessor_of_the_change_it_squats_never_blocks_it() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -4564,3 +4603,80 @@ fn bug_1580_a_squat_naming_the_predecessor_of_the_change_it_squats_never_blocks_
     assert_eq!(r.json()["state"], "landed", "{body}");
     assert_eq!(real_file(&hub, pid, "src/v.rs").as_deref(), Some(&b"the dev's\n"[..]));
 }
+
+/// Guarantee: "same author" means the person whose signature is on the
+/// change and on the landed revision, even across two devices of that
+/// person, or when another person pushes and lands a snapshot the author
+/// signed; and another author's row under the same change id is ignored
+/// completely even when both exist on the branch.
+#[test]
+fn a_change_by_one_author_never_lands_twice_across_devices_or_submitters_and_ignores_other_authors() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    // A second confirmed device of the dev.
+    let laptop = hub.new_device_of(&p.dev);
+    p.dev.ok(p.dev.home.path(), &["identity", "confirm", &laptop.fingerprint()]);
+    laptop.ok(laptop.home.path(), &["login", &format!("veil://{}", hub.authority()), "--ca", hub.ca.to_str().unwrap()]);
+
+    let cid = veil_core::ChangeId::random();
+    // fin lands a squat under cid first (naming unstored and hidden ids).
+    let mut f = Craft::new(&api, &p.fin, &p.name, "main");
+    let f_base = f.tip;
+    f.file(&format!("{BILL_DIR}/acme/squat.txt"), "fin's\n");
+    let hidden_unpushed = local_only(&f, f_base, cid, "hidden", vec![]);
+    let squat = snap_at(&mut f, f_base, cid, "squat", veil_core::now_millis(), vec![hidden_unpushed]);
+    let r = push_new(&f, &[("squat", squat)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let w = land_held(&api, &p.fin.token(), &p.name, squat, true).json();
+    assert_eq!(w["state"], "landed", "{w}");
+
+    // The dev signs P on their first device; the admin lands it on main (by
+    // the real id the admin sees on `p1`).
+    let mut d1 = Craft::new(&api, &p.dev, &p.name, "main");
+    let d1_base = d1.tip;
+    d1.file("src/p.rs", "p\n");
+    let p1 = snap_at(&mut d1, d1_base, cid, "P", veil_core::now_millis(), vec![]);
+    let r = push_new(&d1, &[("p1", p1)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let p1_admin = Craft::new(&api, &p.admin, &p.name, "p1").tip;
+    // Ignores fin's row under cid and lands P.
+    let v = land_held(&api, &p.admin.token(), &p.name, p1_admin, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    let tip = real_tip(&hub, pid);
+
+    // On their second device (laptop), with no predecessors recorded, the
+    // dev makes a revision of P with further edits: refused.
+    let mut d2 = Craft::new(&api, &laptop, &p.name, "main");
+    let d2_base = d2.tip;
+    d2.file("src/p.rs", "p\n");
+    d2.file("src/more.rs", "more\n");
+    let p_more = snap_at(&mut d2, d2_base, cid, "P, more", veil_core::now_millis(), vec![]);
+    let r = push_new(&d2, &[("p-more", p_more)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let r = land_held(&api, &laptop.token(), &p.name, p_more, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 400, "{body}");
+    assert!(body.contains("already landed") && body.contains("make a new change for the further edits"), "{body}");
+    assert!(!body.contains(&hidden_unpushed.short()) && !body.contains(&squat.short()), "{body}");
+    assert_eq!(real_tip(&hub, pid), tip, "{body}");
+
+    // And a revision on the second device with no further edits is skipped
+    // and named when stacked under Q.
+    let mut d3 = Craft::new(&api, &laptop, &p.name, "main");
+    let d3_base = d3.tip;
+    let p_same = snap_at(&mut d3, d3_base, cid, "P, rebased", veil_core::now_millis(), vec![]);
+    d3.file("src/q.rs", "q\n");
+    let q = crafted_on(&mut d3, p_same, veil_core::ChangeId::random(), "Q", "");
+    let r = push_new(&d3, &[("q", q)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let r = land_held(&api, &laptop.token(), &p.name, q, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    let v = r.json();
+    assert_eq!(v["state"], "landed", "{body}");
+    assert_eq!(v["landed"].as_array().unwrap().len(), 1, "{body}");
+    assert!(body.contains(&cid.to_string()) && body.contains("already landed"), "{body}");
+}
+
