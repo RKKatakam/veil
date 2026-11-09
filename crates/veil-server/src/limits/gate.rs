@@ -398,7 +398,7 @@ mod tests {
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = Vec::new();
         // 40 pulls queue up at once; a landing comes half a second later.
-        for (i, (c, after)) in (0..40).map(|i| (Class::Read, 0u64)).chain([(Class::Write, 500)]).enumerate() {
+        for (i, (c, after)) in (0..40).map(|_| (Class::Read, 0u64)).chain([(Class::Write, 500)]).enumerate() {
             let (g, order) = (g.clone(), order.clone());
             tasks.push(tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(after)).await;
