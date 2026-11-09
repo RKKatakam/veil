@@ -45,8 +45,8 @@ fn challenge(api: &Api) -> Reply {
 }
 
 /// Guarantee: a client within its limits is never refused. At the
-/// server's defaults (60/s burst and 5,000/h a device, 20/s and 1,000/h an
-/// address), one device sends its whole burst at once and then 40 a
+/// server's defaults (200/s burst and 50,000/h a device, 20/s and 1,000/h an
+/// address), one device sends a burst at once and then 40 a
 /// second, and anyone on Earth signs in from one address 15 at once and
 /// then 10 a second: every request is served.
 #[test]

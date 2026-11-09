@@ -1749,6 +1749,17 @@ fn bug_1332_a_caches_forwarded_reads_count_against_its_address() {
         assert_eq!(got.status, 200, "read {i}: {}", String::from_utf8_lossy(&got.body));
     }
     assert!(cache.stat("forwarded") >= 40, "every read went to the server");
+    // And 25 cold batch reads through a fresh cache: each batch's grant is in
+    // its body (`deferred` in `limits::admit`), and counts against the
+    // reader's device, not the cache's address.
+    let cache2 = TestCache::start(&hub, &hub.authority(), 1 << 30);
+    let r2 = Reader::new(&server, &cache2.api, Some(&p.dev), &p.name);
+    for i in 0..25 {
+        let id = st.get(&format!("r{i}.txt")).unwrap().id;
+        let frames = r2.batch(&[(vec![root, src], id)]);
+        assert_eq!(frames.len(), 1, "batch {i}");
+    }
+    assert!(cache2.stat("forwarded") >= 25, "every batch went to the server");
     let r = server.post_json(None, "/v1/auth/challenge", &serde_json::json!({"key": Identity::generate("x").verifying_hex()}));
     assert_eq!(r.status, 200, "the address kept its own rate: {}", String::from_utf8_lossy(&r.body));
 }
