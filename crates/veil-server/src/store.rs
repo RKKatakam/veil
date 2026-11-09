@@ -590,27 +590,20 @@ impl Objects {
     /// Where object `id` of `project` is: a listed pack whose index this
     /// server holds; or (`again`, after a miss everywhere since `since`) one
     /// listed since, or one whose index it unloaded past its budget (read
-    /// again from storage: BUG-1395).
+    /// again from storage: BUG-1395), whatever other lookups page in or out
+    /// meanwhile (BUG-1495).
     async fn in_pack(&self, project: i64, id: &ObjectId, again: bool, since: Instant) -> Result<Option<(Arc<str>, Slot)>> {
-        match self.packs.find(project, id) {
-            Found::At(n, s) => return Ok(Some((n, s))),
-            Found::Absent | Found::Paged if !again => return Ok(None),
-            _ => {}
-        }
-        self.packs.refresh(&self.store, project, since, &self.reads).await?;
-        match self.packs.find(project, id) {
-            Found::At(n, s) => Ok(Some((n, s))),
-            Found::Paged => self.packs.find_paged(&self.store, project, id, &self.reads).await,
-            Found::Absent | Found::Unloaded => Ok(None),
-        }
+        self.packs.locate(&self.store, project, id, again, since, &self.reads).await
     }
 
     /// Bytes `start..=end` of the encoding of object `id` at slot `s` of
-    /// pack `name` (clamped), read with a range request, **after the id the
-    /// entry starts with is checked** (BUG-1154): with the bytes asked for
-    /// when they start near the entry's start (one request), else apart.
+    /// pack `name` (clamped), read with a range request, **after the head
+    /// the entry starts with is checked against the slot** (its id and its
+    /// length: BUG-1154, BUG-1497): with the bytes asked for when they start
+    /// near the entry's start (one request), else apart.
     async fn pack_range(&self, project: i64, name: &str, id: &ObjectId, s: Slot, start: u64, end: u64) -> Result<Bytes> {
         const ONE_READ: u64 = 1 << 20;
+        const HEAD: u64 = crate::pack::ENTRY_HEAD;
         let len = s.encoding_len();
         let last = end.min(len.saturating_sub(1));
         let key = crate::pack::key(project, name);
@@ -624,16 +617,16 @@ impl Objects {
             Ok::<Bytes, anyhow::Error>(b)
         };
         if start > last || len == 0 {
-            crate::pack::entry(id, &read(s.offset, s.offset + crate::pack::ID_LEN - 1).await?)?;
+            crate::pack::entry(id, s, &read(s.offset, s.offset + HEAD - 1).await?)?;
             return Ok(Bytes::new());
         }
         if start <= ONE_READ {
-            let b = read(s.offset, s.offset + crate::pack::ID_LEN + last).await?;
-            crate::pack::entry(id, &b)?;
-            return Ok(b.slice((crate::pack::ID_LEN + start) as usize..));
+            let b = read(s.offset, s.offset + HEAD + last).await?;
+            crate::pack::entry(id, s, &b)?;
+            return Ok(b.slice((HEAD + start) as usize..));
         }
-        crate::pack::entry(id, &read(s.offset, s.offset + crate::pack::ID_LEN - 1).await?)?;
-        read(s.offset + crate::pack::ID_LEN + start, s.offset + crate::pack::ID_LEN + last).await
+        crate::pack::entry(id, s, &read(s.offset, s.offset + HEAD - 1).await?)?;
+        read(s.offset + HEAD + start, s.offset + HEAD + last).await
     }
 
     /// The encoding of `id` of `project` from the store, unchecked: from a
@@ -715,8 +708,8 @@ impl Objects {
             Found::At(n, s) => self.store.get_range_blocking(&crate::pack::key(project, &n), s.offset, s.last()).map(|r| {
                 r.and_then(|got| match got {
                     Some((b, _)) if b.len() == s.len as usize => {
-                        crate::pack::entry(id, &b)?;
-                        Ok(Some(b.slice(crate::pack::ID_LEN as usize..)))
+                        crate::pack::entry(id, s, &b)?;
+                        Ok(Some(b.slice(crate::pack::ENTRY_HEAD as usize..)))
                     }
                     _ => Err(anyhow!("pack {n} is shorter than its index")),
                 })
@@ -757,14 +750,16 @@ impl Objects {
     /// once listed: [`Objects::listed_here`]).
     /// It is recorded staged for `person` (a row) before it is written, so
     /// the database names every pack in storage, whatever stops the request
-    /// after (BUG-1399).
-    pub async fn put_pack(&self, project: i64, person: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<(Arc<str>, Arc<Index>, u64)> {
+    /// after (BUG-1399). Its index is held under a share of the server's
+    /// bound on indexes (BUG-1496), taken before it is built.
+    pub async fn put_pack(&self, project: i64, person: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<(Arc<str>, Held)> {
         self.write_pack(project, objects, Some(person)).await
     }
 
     /// [`Objects::put_pack`]; with `staged_by`, the pack is recorded staged
     /// for that person before it is written (without, only in tests).
-    async fn write_pack(&self, project: i64, objects: Vec<(ObjectId, Bytes)>, staged_by: Option<i64>) -> Result<(Arc<str>, Arc<Index>, u64)> {
+    async fn write_pack(&self, project: i64, objects: Vec<(ObjectId, Bytes)>, staged_by: Option<i64>) -> Result<(Arc<str>, Held)> {
+        let share = self.packs.bound().take(Index::weight_of(objects.len()) as u64).await?;
         let name: Arc<str> = crate::pack::new_name().into();
         for (id, enc) in &objects {
             self.cache.insert(Self::staged_key(project, &name, id, false), enc.clone(), enc.len());
@@ -777,7 +772,7 @@ impl Objects {
         }
         count_write(self, size as usize);
         self.store.put(&crate::pack::key(project, &name), bytes).await?;
-        Ok((name, Arc::new(index), size))
+        Ok((name, Held::new(Arc::new(index), size, share)))
     }
 
     /// Stage `objects` (checked encodings `person` uploaded) as one pack,
@@ -790,8 +785,8 @@ impl Objects {
         if let Some(name) = self.packs.staged_holding(project, person, &ids).await? {
             return Ok(name);
         }
-        let (name, index, size) = self.write_pack(project, objects, Some(person)).await?;
-        self.packs.staged_here(project, person, &name, index, size);
+        let (name, held) = self.write_pack(project, objects, Some(person)).await?;
+        self.packs.staged_here(project, person, &name, held);
         Ok(name)
     }
 
@@ -801,10 +796,19 @@ impl Objects {
         self.packs.usable(project, person, names).await
     }
 
-    /// The index and length of staged pack `name` of `project`; `None` if
-    /// it is not in the store (discarded).
-    pub async fn staged_index(&self, project: i64, name: &str) -> Result<Option<(Arc<Index>, u64)>> {
+    /// The index and length of staged pack `name` of `project`, held under
+    /// its share of the bound on indexes; `None` if it is not in the store
+    /// (discarded).
+    pub async fn staged_index(&self, project: i64, name: &str) -> Result<Option<Arc<Held>>> {
         self.packs.staged_index(&*self.store, project, name).await
+    }
+
+    /// What a push or API commit keeps of staged pack `name` of `project`:
+    /// its object count, length and the slots of `ids`
+    /// ([`crate::pack::Packs::staged_slots`]); `None` if it is not in the
+    /// store (discarded).
+    pub async fn staged_slots(&self, project: i64, name: &str, ids: &[ObjectId]) -> Result<Option<StagedSlots>> {
+        self.packs.staged_slots(&*self.store, project, name, ids).await
     }
 
     /// Object `id` at slot `s` of staged pack `name` of `project`: its
@@ -823,7 +827,7 @@ impl Objects {
         if b.len() != s.len as usize {
             return Ok(None);
         }
-        let enc = Bytes::copy_from_slice(crate::pack::entry(id, &b)?);
+        let enc = Bytes::copy_from_slice(crate::pack::entry(id, s, &b)?);
         let raw = decoded(id, &enc)?;
         self.cache.insert(ck, enc.clone(), enc.len());
         Ok(Some((enc, raw)))
@@ -890,7 +894,7 @@ impl Objects {
                 if to >= bytes.len() {
                     break;
                 }
-                let Ok(enc) = crate::pack::entry(&id, &bytes[from..=to]) else { continue };
+                let Ok(enc) = crate::pack::entry(&id, s, &bytes[from..=to]) else { continue };
                 // Its check decodes it: within a share of the bound on
                 // decoded bytes for what it declares (BUG-1159), or not
                 // read ahead (its own read takes the share and checks it).
@@ -906,24 +910,24 @@ impl Objects {
 
     /// What object `id` at slot `s` of staged pack `name` of `project`
     /// decodes to, as its encoding declares (S27), from its first bytes
-    /// only (or the cache), its entry's id checked; `None` if the pack is
+    /// only (or the cache), its entry's head checked; `None` if the pack is
     /// gone.
     pub async fn staged_declared(&self, project: i64, name: &str, s: Slot, id: &ObjectId) -> Result<Option<u64>> {
         if let Some(enc) = self.cache.get(&Self::staged_key(project, name, id, false)) {
             return Ok(encoding::declared_len(&enc[..enc.len().min(encoding::HEADER)], enc.len() as u64));
         }
         bump(&self.reads);
-        let last = s.last().min(s.offset + crate::pack::ID_LEN + encoding::HEADER as u64 - 1);
+        let last = s.last().min(s.offset + crate::pack::ENTRY_HEAD + encoding::HEADER as u64 - 1);
         let Some((b, _)) = self.store.get_range(&crate::pack::key(project, name), s.offset, last).await? else {
             return Ok(None);
         };
-        Ok(encoding::declared_len(crate::pack::entry(id, &b)?, s.encoding_len()))
+        Ok(encoding::declared_len(crate::pack::entry(id, s, &b)?, s.encoding_len()))
     }
 
     /// The encoding of object `id` at slot `s` of staged pack `name` of
-    /// `project`, its entry's id checked but not decoded (the caller decodes
-    /// it, checked against the id, within its share of the bound on decoded
-    /// bytes); `None` if the pack is gone.
+    /// `project`, its entry's head checked but not decoded (the caller
+    /// decodes it, checked against the id, within its share of the bound on
+    /// decoded bytes); `None` if the pack is gone.
     pub async fn staged_encoding(&self, project: i64, name: &str, s: Slot, id: &ObjectId) -> Result<Option<Bytes>> {
         if let Some(enc) = self.cache.get(&Self::staged_key(project, name, id, false)) {
             return Ok(Some(enc));
@@ -935,20 +939,35 @@ impl Objects {
         if b.len() != s.len as usize {
             return Ok(None);
         }
-        Ok(Some(Bytes::copy_from_slice(crate::pack::entry(id, &b)?)))
+        Ok(Some(Bytes::copy_from_slice(crate::pack::entry(id, s, &b)?)))
     }
 
     /// Packs of `project` a transaction listed and committed: their objects
     /// are the project's from now on (cached ones under the project's keys).
     pub fn listed_here(&self, project: i64, packs: Vec<(Arc<str>, Arc<Index>)>) {
+        self.listed(project, packs.into_iter().map(|(n, i)| (n, Some(i))).collect());
+    }
+
+    /// [`Objects::listed_here`], where a pack's index may not be in hand (a
+    /// push keeps only the slots its receipts name, BUG-1496): it is the
+    /// staged-index cache's if that holds it, else read when a lookup needs
+    /// it.
+    pub fn listed(&self, project: i64, packs: Vec<(Arc<str>, Option<Arc<Index>>)>) {
+        let packs: Vec<(Arc<str>, Option<Arc<Index>>)> = packs
+            .into_iter()
+            .map(|(name, index)| {
+                let index = index.or_else(|| self.packs.staged_cached(project, &name));
+                (name, index)
+            })
+            .collect();
         for (name, index) in &packs {
-            for (id, _) in index.iter() {
+            for (id, _) in index.iter().flat_map(|i| i.iter()) {
                 if let Some(enc) = self.cache.get(&Self::staged_key(project, name, id, false)) {
                     self.cache.insert(Self::cache_key(project, id), enc.clone(), enc.len());
                 }
             }
         }
-        self.packs.listed_here(project, packs);
+        self.packs.listed(project, packs);
     }
 
     /// Discard packs `names` of `project` that no transaction listed

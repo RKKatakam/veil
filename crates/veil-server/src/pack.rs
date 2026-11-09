@@ -6,23 +6,28 @@
 //! random hex digits; never edited in place):
 //!
 //! ```text
-//! "veilpack2\n"                    10 bytes
+//! "veilpack3\n"                    10 bytes
 //! count u32be
 //! index: count × (id 32 ‖ offset u64be ‖ len u32be), sorted by id, ids distinct
-//! entries: each object's id (32 bytes) then its encoding (S27: `v…` or
-//!          `z…`); a slot spans both
+//! entries: each object's id (32 bytes), the length of its encoding
+//!          (u32be), then its encoding (S27: `v…` or `z…`); a slot spans
+//!          all three
 //! ```
 //!
 //! The index is at the front, so one read of the first [`FIRST_READ`]
 //! bytes holds it for most packs, without knowing the pack's length. An
-//! entry is read with a range request, and **every read checks the id the
-//! entry starts with** ([`entry`]) before any byte of it is used, a ranged
-//! one too: a wrong slot (a damaged index, a merger's mistake) is an error,
-//! never another object's bytes (BUG-1154). Whole reads are also decoded
-//! and checked against the id like any object (`store::Objects`). A pack is
-//! self-describing: S29 merges packs by reading their indexes and copying
-//! entries into a new pack, and drops an object by writing a pack without
-//! it (`storage-and-cost.md` §8).
+//! entry is read with a range request, and **every read checks the id and
+//! the length the entry starts with against its slot** ([`entry`]) before
+//! any byte of it is used, a ranged one too: the id ties the slot's start
+//! to the object, the length its end, so a wrong slot (a damaged index, a
+//! merger's mistake, a boundary moved between neighbours) is an error,
+//! never another object's bytes (BUG-1154, BUG-1394, BUG-1497). Whole reads
+//! are also decoded and checked against the id like any object
+//! (`store::Objects`). A pack is self-describing: S29 merges packs by
+//! reading their indexes and copying entries into a new pack, and drops an
+//! object by writing a pack without it (`storage-and-cost.md` §8).
+//! `veilpack2` (entries without their length, never merged: S28 before its
+//! cycle 4) is not a pack to this reader.
 //!
 //! **States** (the `packs` table, migration 13), one row per pack:
 //! * *staged* (0): an upload's pack, recorded with its uploader **before**
@@ -35,11 +40,15 @@
 //!   first (the row is locked by the update), so a listed pack is never
 //!   deleted and a discarded one is never listed.
 //!
-//! **Lookups.** Each server keeps, per project, the slots of every listed
-//! pack it has read the index of ([`Packs`]): object id → pack and slot,
-//! bounded by bytes across projects ([`LOOKUP_BUDGET`]). A miss there and
-//! among loose objects reads the project's listing again (one statement)
-//! and the indexes of packs it does not know.
+//! **Lookups.** Each server keeps, per project, the indexes of the listed
+//! packs it has read ([`Packs`]), bounded by bytes across projects
+//! ([`LOOKUP_BUDGET`]); past it an index is unloaded, and a lookup that
+//! needs it reads it again. A miss there and among loose objects reads the
+//! project's listing again (one statement) and the indexes of packs it
+//! does not know. **Every other index held in memory** (one being read, a
+//! push's staged uploads', the staged-index cache's) holds a share of one
+//! server-wide bound ([`INDEXES_HELD`], [`Held`]) while it is held, taken
+//! before it is read (BUG-1496).
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -47,7 +56,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -57,13 +66,15 @@ use veil_core::{cache::LruCache, ObjectId};
 use crate::store::BlobStore;
 
 /// A pack's first bytes.
-pub const MAGIC: &[u8; 10] = b"veilpack2\n";
+pub const MAGIC: &[u8; 10] = b"veilpack3\n";
 /// The magic and the count.
 const HEAD: usize = MAGIC.len() + 4;
 /// One index entry: id, offset, length.
 const ENTRY: usize = 32 + 8 + 4;
 /// The id each entry starts with.
-pub const ID_LEN: u64 = 32;
+const ID_LEN: u64 = 32;
+/// What each entry starts with: its id and the length of its encoding.
+pub const ENTRY_HEAD: u64 = ID_LEN + 4;
 /// What a reader asks for first: the head and, up to about 1,500 objects,
 /// the whole index.
 pub const FIRST_READ: u64 = 64 << 10;
@@ -90,7 +101,8 @@ pub fn valid_name(s: &str) -> bool {
     s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Where an object's entry (its id, then its encoding) sits in its pack.
+/// Where an object's entry (its id, its encoding's length, then its
+/// encoding) sits in its pack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Slot {
     pub offset: u64,
@@ -103,20 +115,28 @@ impl Slot {
         self.offset + u64::from(self.len.max(1)) - 1
     }
 
-    /// The length of the object's encoding (the entry without its id).
+    /// The length of the object's encoding (the entry without its head).
     pub fn encoding_len(&self) -> u64 {
-        u64::from(self.len).saturating_sub(ID_LEN)
+        u64::from(self.len).saturating_sub(ENTRY_HEAD)
     }
 }
 
-/// The encoding in `bytes`, an entry's first bytes read from its slot,
-/// once the id it starts with is checked to be `id`: a slot naming another
-/// object's entry is an error, never its bytes.
-pub fn entry<'a>(id: &ObjectId, bytes: &'a [u8]) -> Result<&'a [u8]> {
-    if bytes.len() < ID_LEN as usize || bytes[..ID_LEN as usize] != id.0 {
+/// The encoding in `bytes`, an entry's first bytes read from slot `s`
+/// (at most the slot), once the entry's head is checked against the slot:
+/// the id it starts with is `id` (the slot's start is the object's entry),
+/// and the length it states is the slot's (the slot ends where the entry
+/// does). A slot that is not exactly the object's entry is an error, never
+/// another object's bytes (BUG-1154, BUG-1497).
+pub fn entry<'a>(id: &ObjectId, s: Slot, bytes: &'a [u8]) -> Result<&'a [u8]> {
+    let head = ENTRY_HEAD as usize;
+    if bytes.len() < head || bytes[..ID_LEN as usize] != id.0 {
         bail!("pack entry for {} holds another object", id.short());
     }
-    Ok(&bytes[ID_LEN as usize..])
+    let stated = u32::from_be_bytes(bytes[ID_LEN as usize..head].try_into().expect("4 bytes"));
+    if u64::from(stated) != s.encoding_len() || bytes.len() as u64 > u64::from(s.len) {
+        bail!("pack entry for {} does not fill its slot", id.short());
+    }
+    Ok(&bytes[head..])
 }
 
 /// A pack's index: sorted by id, ids distinct.
@@ -144,7 +164,12 @@ impl Index {
 
     /// About the memory it holds.
     pub fn weight(&self) -> usize {
-        64 + self.entries.capacity() * std::mem::size_of::<(ObjectId, Slot)>()
+        Self::weight_of(self.entries.capacity())
+    }
+
+    /// [`Index::weight`] of an index of `count` slots.
+    fn weight_of(count: usize) -> usize {
+        64 + count * std::mem::size_of::<(ObjectId, Slot)>()
     }
 }
 
@@ -157,11 +182,11 @@ pub fn build(objects: Vec<(ObjectId, Bytes)>) -> Result<(Bytes, Index)> {
         bail!("at most {MAX_OBJECTS} objects per pack");
     }
     let head = HEAD + objects.len() * ENTRY;
-    let total = head + objects.iter().map(|(_, b)| ID_LEN as usize + b.len()).sum::<usize>();
+    let total = head + objects.iter().map(|(_, b)| ENTRY_HEAD as usize + b.len()).sum::<usize>();
     let mut entries = Vec::with_capacity(objects.len());
     let mut at = head as u64;
     for (id, b) in &objects {
-        let len = u32::try_from(ID_LEN as usize + b.len()).map_err(|_| anyhow!("an object of 4 GiB or more cannot be packed"))?;
+        let len = u32::try_from(ENTRY_HEAD as usize + b.len()).map_err(|_| anyhow!("an object of 4 GiB or more cannot be packed"))?;
         entries.push((*id, Slot { offset: at, len }));
         at += u64::from(len);
     }
@@ -176,6 +201,7 @@ pub fn build(objects: Vec<(ObjectId, Bytes)>) -> Result<(Bytes, Index)> {
     }
     for (id, b) in objects {
         out.put_slice(&id.0);
+        out.put_u32(b.len() as u32);
         out.put_slice(&b);
     }
     debug_assert_eq!(out.len(), total);
@@ -196,9 +222,10 @@ pub fn head_len(first: &[u8]) -> Result<u64> {
 }
 
 /// The index from a pack's first bytes (at least [`head_len`] of them),
-/// checked: ids sorted and distinct, every slot long enough for its id and
-/// one byte, the slots tiling the entries from the index's end, and, when
-/// the pack's length `size` is known, ending at it.
+/// checked: ids sorted and distinct, every slot long enough for its entry's
+/// head and one byte, the slots tiling the entries from the index's end,
+/// and, when the pack's length `size` is known, ending at it. (Where each
+/// entry really ends is checked by every read of it: [`entry`].)
 pub fn parse_index(first: &[u8], size: Option<u64>) -> Result<Index> {
     let hl = head_len(first)? as usize;
     if first.len() < hl {
@@ -210,7 +237,7 @@ pub fn parse_index(first: &[u8], size: Option<u64>) -> Result<Index> {
         let offset = u64::from_be_bytes(e[32..40].try_into().expect("8 bytes"));
         let len = u32::from_be_bytes(e[40..44].try_into().expect("4 bytes"));
         let end = offset.checked_add(u64::from(len)).ok_or_else(|| anyhow!("a pack slot past the end"))?;
-        if offset < hl as u64 || u64::from(len) <= ID_LEN || size.is_some_and(|s| end > s) {
+        if offset < hl as u64 || u64::from(len) <= ENTRY_HEAD || size.is_some_and(|s| end > s) {
             bail!("a pack slot outside its entries");
         }
         if entries.last().is_some_and(|(last, _): &(ObjectId, Slot)| *last >= id) {
@@ -220,8 +247,9 @@ pub fn parse_index(first: &[u8], size: Option<u64>) -> Result<Index> {
     }
     // The slots tile the entries exactly, in offset order: each starts where
     // the one before ends, the first at the index's end, the last at the
-    // pack's end when it is known. So a slot's end is as checked as its start
-    // (the id it starts with): no slot reaches into another (BUG-1394).
+    // pack's end when it is known (BUG-1394). That two neighbours' boundary
+    // is where the first entry ends is checked by reading it: the length
+    // each entry states (BUG-1497).
     let mut by_offset: Vec<Slot> = entries.iter().map(|(_, s)| *s).collect();
     by_offset.sort_unstable_by_key(|s| s.offset);
     let mut at = hl as u64;
@@ -237,11 +265,119 @@ pub fn parse_index(first: &[u8], size: Option<u64>) -> Result<Index> {
     Ok(Index { entries })
 }
 
+/// Bytes of pack indexes one server holds in memory outside its lookup
+/// maps (BUG-1496), for every request together: indexes being read
+/// (`Packs::refresh`, `Packs::find_paged`), what a push or API commit reads
+/// of its staged uploads' indexes (`Packs::staged_slots`: it keeps only the
+/// slots its receipts name), the index of a pack being written, and the
+/// staged-index cache's ([`STAGED_INDEXES`] of it at most). Each takes its
+/// share before it reads or builds the index, and holds it while the index
+/// is held ([`Held`]); an index larger than what the cache leaves takes
+/// all of that. A lookup's index joins the lookup maps once read (bounded
+/// by [`LOOKUP_BUDGET`]).
+pub const INDEXES_HELD: usize = 96 << 20;
+/// What the staged-index cache may hold of [`INDEXES_HELD`].
+pub const STAGED_INDEXES: usize = 32 << 20;
+/// How long a request waits for its share of [`INDEXES_HELD`] before it is
+/// answered [`IndexesFull`] (`warming`: try again).
+const INDEX_WAIT: Duration = Duration::from_secs(10);
+
+/// No share of [`INDEXES_HELD`] came free in time: the request is answered
+/// `warming` (503, try again), never with an index held outside the bound.
+#[derive(Debug)]
+pub struct IndexesFull;
+
+impl std::fmt::Display for IndexesFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the server holds as many pack indexes as it may; try again in a few seconds")
+    }
+}
+
+impl std::error::Error for IndexesFull {}
+
+/// Is `e` (or what it wraps, an I/O error's inner one included) [`IndexesFull`]?
+pub fn indexes_full(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<IndexesFull>() || c.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()).is_some_and(|i| i.is::<IndexesFull>()))
+}
+
+/// A server-wide bound on bytes of indexes held ([`INDEXES_HELD`]).
+#[derive(Clone)]
+pub struct Bound {
+    sem: Arc<tokio::sync::Semaphore>,
+    /// The largest share one holder takes.
+    most: usize,
+    wait: Duration,
+}
+
+impl Bound {
+    pub fn new(total: usize) -> Bound {
+        Bound { sem: Arc::new(tokio::sync::Semaphore::new(total)), most: total, wait: INDEX_WAIT }
+    }
+
+    fn permits(&self, bytes: u64) -> u32 {
+        bytes.clamp(1, self.most as u64) as u32
+    }
+
+    /// A share of `bytes`, waiting for it at most this bound's wait (only
+    /// by a holder of none, so holders never wait on one another in a cycle).
+    pub async fn take(&self, bytes: u64) -> Result<Share> {
+        match tokio::time::timeout(self.wait, self.sem.clone().acquire_many_owned(self.permits(bytes))).await {
+            Ok(Ok(p)) => Ok(Share(p)),
+            _ => Err(anyhow::Error::new(IndexesFull)),
+        }
+    }
+
+    /// The same bound, for a holder that does not wait.
+    fn now(&self) -> Bound {
+        Bound { wait: Duration::ZERO, ..self.clone() }
+    }
+
+    /// Bytes not held now.
+    pub fn available(&self) -> usize {
+        self.sem.available_permits()
+    }
+}
+
+/// A share of a [`Bound`], given back when dropped.
+pub struct Share(tokio::sync::OwnedSemaphorePermit);
+
+impl Share {
+    /// Give back what is held beyond `bytes`.
+    fn keep(&mut self, bytes: usize) {
+        let n = self.0.num_permits();
+        if n > bytes.max(1) {
+            drop(self.0.split(n - bytes.max(1)));
+        }
+    }
+}
+
+/// An index held in memory with its share of the server's bound on
+/// indexes (BUG-1496): the share goes back when the last holder drops it.
+pub struct Held {
+    pub index: Arc<Index>,
+    /// The pack's length.
+    pub size: u64,
+    _share: Share,
+}
+
+impl Held {
+    pub(crate) fn new(index: Arc<Index>, size: u64, mut share: Share) -> Held {
+        share.keep(index.weight());
+        Held { index, size, _share: share }
+    }
+}
+
 /// Read the index of the pack at `key` (one read for most packs, two for a
-/// large index); its length.
-pub async fn read_index(store: &dyn BlobStore, key: &str) -> Result<Option<(Index, u64)>> {
+/// large index), holding a share of `bound` (BUG-1496) taken before
+/// anything sized by the index is read or made: its bytes, the parsed
+/// index and the parse's working copy of the slots; kept, once parsed, for
+/// the index alone. (Only the first [`FIRST_READ`] bytes, which say how
+/// large the index is, are read before.)
+pub async fn read_index(store: &dyn BlobStore, key: &str, bound: &Bound) -> Result<Option<Held>> {
     let Some((first, size)) = store.get_range(key, 0, FIRST_READ - 1).await? else { return Ok(None) };
     let hl = head_len(&first).with_context(|| format!("reading pack {key}"))?;
+    let count = (hl as usize - HEAD) / ENTRY;
+    let share = bound.take(hl + (Index::weight_of(count) + count * std::mem::size_of::<Slot>()) as u64).await?;
     let first = if (first.len() as u64) < hl {
         match store.get_range(key, 0, hl - 1).await? {
             Some((b, _)) => b,
@@ -250,7 +386,9 @@ pub async fn read_index(store: &dyn BlobStore, key: &str) -> Result<Option<(Inde
     } else {
         first
     };
-    Ok(Some((parse_index(&first, Some(size)).with_context(|| format!("reading pack {key}"))?, size)))
+    let index = parse_index(&first, Some(size)).with_context(|| format!("reading pack {key}"))?;
+    drop(first);
+    Ok(Some(Held::new(Arc::new(index), size, share)))
 }
 
 /// The lookup structures' own memory: a project's entry, and each listed
@@ -325,10 +463,12 @@ pub struct Packs {
     /// [`LOOKUP_BUDGET`] (smaller in tests).
     budget: usize,
     tick: AtomicU64,
+    /// [`INDEXES_HELD`]: every index held outside the lookup maps.
+    bound: Bound,
     /// Indexes and lengths of packs staged recently, by name (a push on the
-    /// server that took the upload reads them without a storage read);
-    /// `None` once discarded here.
-    staged: LruCache<Option<(Arc<Index>, u64)>>,
+    /// server that took the upload reads them without a storage read), each
+    /// holding its share of `bound`; `None` once discarded here.
+    staged: LruCache<Option<Arc<Held>>>,
     recent: LruCache<Recent>,
 }
 
@@ -348,6 +488,15 @@ fn person_key(project: i64, person: i64) -> ObjectId {
     ObjectId(*h.finalize().as_bytes())
 }
 
+/// What a push or API commit keeps of a staged pack's index (BUG-1496):
+/// how many objects it holds, its length, and the slots of the objects its
+/// receipts name.
+pub struct StagedSlots {
+    pub objects: usize,
+    pub size: u64,
+    pub slots: Vec<(ObjectId, Slot)>,
+}
+
 impl Packs {
     pub fn new(db: Option<sqlx::PgPool>) -> Packs {
         Packs {
@@ -355,9 +504,17 @@ impl Packs {
             projects: Mutex::new(HashMap::new()),
             budget: LOOKUP_BUDGET,
             tick: AtomicU64::new(0),
-            staged: LruCache::new(32 << 20),
+            // One holder takes at most what the staged-index cache leaves,
+            // so a share for any index can always come free.
+            bound: Bound { most: INDEXES_HELD - STAGED_INDEXES, ..Bound::new(INDEXES_HELD) },
+            staged: LruCache::new(STAGED_INDEXES),
             recent: LruCache::new(RECENT_BUDGET),
         }
+    }
+
+    /// The server's bound on indexes held outside the lookup maps.
+    pub fn bound(&self) -> &Bound {
+        &self.bound
     }
 
     fn now(&self) -> u64 {
@@ -387,7 +544,10 @@ impl Packs {
     /// Where object `id` of `project` is, among the indexes this server
     /// has loaded (newest pack first).
     pub fn find(&self, project: i64, id: &ObjectId) -> Found {
-        let p = self.project(project);
+        self.find_in(&self.project(project), id)
+    }
+
+    fn find_in(&self, p: &ProjectPacks, id: &ObjectId) -> Found {
         let m = p.map.read().unwrap();
         let mut paged = false;
         for l in m.packs.iter().rev() {
@@ -408,28 +568,61 @@ impl Packs {
         }
     }
 
-    /// [`Packs::find`] in the indexes of `project` this server unloaded
-    /// (past its budget), read again from storage one at a time, newest
-    /// first; each is loaded again as it is read (and may be unloaded
-    /// again by a later lookup).
-    pub async fn find_paged(&self, store: &Arc<dyn BlobStore>, project: i64, id: &ObjectId, reads: &AtomicU64) -> Result<Option<(Arc<str>, Slot)>> {
+    /// Where object `id` of `project` is stored in a listed pack: in the
+    /// indexes this server holds; or (`again`, after a miss everywhere
+    /// since `since`) in one listed since, or one whose index it unloaded
+    /// past its budget, read again from storage. One project entry serves
+    /// the whole lookup, so an eviction of the project's entry meanwhile
+    /// (another project's lookup) never empties it (BUG-1495's class).
+    pub async fn locate(&self, store: &Arc<dyn BlobStore>, project: i64, id: &ObjectId, again: bool, since: Instant, reads: &AtomicU64) -> Result<Option<(Arc<str>, Slot)>> {
         let p = self.project(project);
-        let unloaded: Vec<Arc<str>> = p.map.read().unwrap().packs.iter().rev().filter(|l| l.index.is_none()).map(|l| l.name.clone()).collect();
-        for name in unloaded {
-            reads.fetch_add(1, Ordering::Relaxed);
-            let Some((index, _)) = read_index(&**store, &key(project, &name)).await? else {
-                bail!("listed pack {name} of project {project} is not in the store");
-            };
-            let index = Arc::new(index);
-            let slot = index.get(id);
-            {
-                let mut m = p.map.write().unwrap();
-                if let Some(l) = m.packs.iter_mut().find(|l| l.name == name) {
-                    l.index = Some(index);
-                    l.used.store(self.now(), Ordering::Relaxed);
+        match self.find_in(&p, id) {
+            Found::At(n, s) => return Ok(Some((n, s))),
+            Found::Absent | Found::Paged if !again => return Ok(None),
+            _ => {}
+        }
+        self.refresh_in(&p, store, project, since, reads).await?;
+        self.find_paged_in(&p, store, project, id, reads).await
+    }
+
+    /// [`Packs::find`] in every listed pack of `project` this server knows:
+    /// the loaded indexes are searched and the unloaded ones named **under
+    /// one read of the map**, then those are read again from storage, one
+    /// at a time, newest first, each loaded as it is read (BUG-1495: a
+    /// lookup that only searched the indexes unloaded when it began missed
+    /// one another lookup paged in meanwhile). So whatever pages in or out
+    /// concurrently, every pack is searched: loaded ones then, unloaded
+    /// ones from storage.
+    pub async fn find_paged(&self, store: &Arc<dyn BlobStore>, project: i64, id: &ObjectId, reads: &AtomicU64) -> Result<Option<(Arc<str>, Slot)>> {
+        self.find_paged_in(&self.project(project), store, project, id, reads).await
+    }
+
+    async fn find_paged_in(&self, p: &Arc<ProjectPacks>, store: &Arc<dyn BlobStore>, project: i64, id: &ObjectId, reads: &AtomicU64) -> Result<Option<(Arc<str>, Slot)>> {
+        let unloaded: Vec<Arc<str>> = {
+            let m = p.map.read().unwrap();
+            let mut unloaded = Vec::new();
+            for l in m.packs.iter().rev() {
+                match &l.index {
+                    Some(index) => {
+                        if let Some(s) = index.get(id) {
+                            l.used.store(self.now(), Ordering::Relaxed);
+                            return Ok(Some((l.name.clone(), s)));
+                        }
+                    }
+                    None => unloaded.push(l.name.clone()),
                 }
             }
-            self.evict_now(project);
+            unloaded
+        };
+        for name in unloaded {
+            reads.fetch_add(1, Ordering::Relaxed);
+            // Held under its share of the bound while it is read and
+            // searched; then the lookup maps' (BUG-1496).
+            let Some(held) = read_index(&**store, &key(project, &name), &self.bound).await? else {
+                bail!("listed pack {name} of project {project} is not in the store");
+            };
+            let slot = held.index.get(id);
+            self.load(p, project, &name, &held.index);
             if let Some(s) = slot {
                 return Ok(Some((name, s)));
             }
@@ -437,8 +630,28 @@ impl Packs {
         Ok(None)
     }
 
-    /// Add listed packs to `project`'s map.
-    fn add(&self, project: i64, packs: Vec<(Arc<str>, Arc<Index>)>, loaded: bool) {
+    /// Load `index`, just read, as pack `name`'s in `p`'s map, if `p` is
+    /// still the project's entry (an entry evicted meanwhile is only this
+    /// lookup's: what it holds is not loaded into it).
+    fn load(&self, p: &Arc<ProjectPacks>, project: i64, name: &str, index: &Arc<Index>) {
+        if !self.projects.lock().unwrap().get(&project).is_some_and(|q| Arc::ptr_eq(q, p)) {
+            return;
+        }
+        {
+            let mut m = p.map.write().unwrap();
+            if let Some(l) = m.packs.iter_mut().find(|l| &*l.name == name) {
+                if l.index.is_none() {
+                    l.index = Some(index.clone());
+                }
+                l.used.store(self.now(), Ordering::Relaxed);
+            }
+        }
+        self.evict_now(project);
+    }
+
+    /// Add listed packs to `project`'s map (an index `None`: unloaded, read
+    /// when a lookup needs it).
+    fn add(&self, project: i64, packs: Vec<(Arc<str>, Option<Arc<Index>>)>, loaded: bool) {
         let p = self.project(project);
         {
             let mut m = p.map.write().unwrap();
@@ -446,7 +659,7 @@ impl Packs {
                 if !m.names.insert(name.clone()) {
                     continue;
                 }
-                m.packs.push(Listed { name, index: Some(index), used: AtomicU64::new(self.now()) });
+                m.packs.push(Listed { name, index, used: AtomicU64::new(self.now()) });
             }
             m.loaded |= loaded;
         }
@@ -505,7 +718,10 @@ impl Packs {
     /// server does not know, unless a listing began after `since` (it
     /// holds every pack listed before then).
     pub async fn refresh(&self, store: &Arc<dyn BlobStore>, project: i64, since: Instant, reads: &AtomicU64) -> Result<()> {
-        let p = self.project(project);
+        self.refresh_in(&self.project(project), store, project, since, reads).await
+    }
+
+    async fn refresh_in(&self, p: &Arc<ProjectPacks>, store: &Arc<dyn BlobStore>, project: i64, since: Instant, reads: &AtomicU64) -> Result<()> {
         let mut last = p.listing.lock().await;
         if last.is_some_and(|t| t >= since) {
             return Ok(());
@@ -521,36 +737,58 @@ impl Packs {
             .bind(LISTED)
             .fetch_all(db)
             .await?;
-        let new: Vec<String> = {
-            let m = p.map.read().unwrap();
-            rows.into_iter().filter(|n| !m.names.contains(n.as_str())).collect()
-        };
-        let mut got: Vec<Option<(Arc<str>, Arc<Index>)>> = vec![None; new.len()];
-        let mut set = tokio::task::JoinSet::new();
-        let mut it = new.into_iter().enumerate();
-        loop {
-            while set.len() < 16 {
-                let Some((i, name)) = it.next() else { break };
-                let (k, name): (String, Arc<str>) = (key(project, &name), name.into());
-                reads.fetch_add(1, Ordering::Relaxed);
-                let store = store.clone();
-                set.spawn(async move { (i, name, read_index(&*store, &k).await) });
-            }
-            match set.join_next().await {
-                Some(Ok((i, name, Ok(Some((index, _)))))) => got[i] = Some((name, Arc::new(index))),
-                Some(Ok((_, name, Ok(None)))) => bail!("listed pack {name} of project {project} is not in the store"),
-                Some(Ok((_, _, Err(e)))) => return Err(e),
-                Some(Err(e)) => return Err(e.into()),
-                None => break,
-            }
-        }
-        self.add(project, got.into_iter().flatten().collect(), true);
+        self.load_listed(p, store, project, rows, reads).await?;
         *last = Some(began);
         Ok(())
     }
 
-    /// Packs this server listed in a transaction that committed.
-    pub fn listed_here(&self, project: i64, packs: Vec<(Arc<str>, Arc<Index>)>) {
+    /// Join packs `names` (listed, oldest first) to `p`'s map and mark its
+    /// listing read: each one this server does not know is entered
+    /// unloaded, then its index is read (16 at once, each under its share of
+    /// the bound, taken without waiting) and **loaded as it is read**, so no
+    /// more is held than the lookup budget and the bound allow (BUG-1496:
+    /// all of them were collected before any was added). An index the bound
+    /// has no room for now stays unloaded, for a lookup to read.
+    async fn load_listed(&self, p: &Arc<ProjectPacks>, store: &Arc<dyn BlobStore>, project: i64, names: Vec<String>, reads: &AtomicU64) -> Result<()> {
+        let new: Vec<Arc<str>> = {
+            let mut m = p.map.write().unwrap();
+            let mut new = Vec::new();
+            for n in names {
+                let n: Arc<str> = n.into();
+                if m.names.insert(n.clone()) {
+                    m.packs.push(Listed { name: n.clone(), index: None, used: AtomicU64::new(self.now()) });
+                    new.push(n);
+                }
+            }
+            new
+        };
+        let bound = self.bound.now();
+        let mut set = tokio::task::JoinSet::new();
+        let mut it = new.into_iter();
+        loop {
+            while set.len() < 16 {
+                let Some(name) = it.next() else { break };
+                let (k, store, bound) = (key(project, &name), store.clone(), bound.clone());
+                reads.fetch_add(1, Ordering::Relaxed);
+                set.spawn(async move { (name, read_index(&*store, &k, &bound).await) });
+            }
+            match set.join_next().await {
+                Some(Ok((name, Ok(Some(held))))) => self.load(p, project, &name, &held.index),
+                Some(Ok((name, Ok(None)))) => bail!("listed pack {name} of project {project} is not in the store"),
+                // The rest stay unloaded (the tasks still running stop).
+                Some(Ok((_, Err(e)))) if indexes_full(&e) => break,
+                Some(Ok((_, Err(e)))) => return Err(e),
+                Some(Err(e)) => return Err(e.into()),
+                None => break,
+            }
+        }
+        p.map.write().unwrap().loaded = true;
+        Ok(())
+    }
+
+    /// Packs this server listed in a transaction that committed (an index
+    /// `None`: loaded when a lookup needs it).
+    pub fn listed(&self, project: i64, packs: Vec<(Arc<str>, Option<Arc<Index>>)>) {
         // Only into a map that is loaded: an unloaded one reads the whole
         // listing when first used. Without a database, what this process
         // lists is the listing.
@@ -558,6 +796,11 @@ impl Packs {
         if loaded {
             self.add(project, packs, self.db.is_none());
         }
+    }
+
+    /// [`Packs::listed`], with every index in hand.
+    pub fn listed_here(&self, project: i64, packs: Vec<(Arc<str>, Arc<Index>)>) {
+        self.listed(project, packs.into_iter().map(|(n, i)| (n, Some(i))).collect());
     }
 
     /// Record staged pack `name` of `project`, uploaded by `person`, before
@@ -577,10 +820,12 @@ impl Packs {
         Ok(())
     }
 
-    /// Remember the index of a pack staged here, by `person`.
-    pub fn staged_here(&self, project: i64, person: i64, name: &Arc<str>, index: Arc<Index>, size: u64) {
-        let w = index.weight();
-        self.staged.insert(name_key(project, name), Some((index, size)), w);
+    /// Remember the index of a pack staged here, by `person`, with its
+    /// share of the bound (given back when the cache drops it, or now if
+    /// the cache does not keep it).
+    pub fn staged_here(&self, project: i64, person: i64, name: &Arc<str>, held: Held) {
+        let w = held.index.weight();
+        self.staged.insert(name_key(project, name), Some(Arc::new(held)), w);
         let k = person_key(project, person);
         let mut q = self.recent.get(&k).unwrap_or_default();
         q.push_front(name.clone());
@@ -589,14 +834,20 @@ impl Packs {
         self.recent.insert(k, q, w);
     }
 
+    /// The index of pack `name` of `project` if the staged-index cache
+    /// holds it (a listed upload's, for the lookup maps).
+    pub fn staged_cached(&self, project: i64, name: &str) -> Option<Arc<Index>> {
+        self.staged.get(&name_key(project, name)).flatten().map(|h| h.index.clone())
+    }
+
     /// A pack `person` staged here recently that holds every one of `ids`
     /// and is still staged or listed (asked of the database): an upload of
     /// those objects again gets its receipts instead of a new pack.
     pub async fn staged_holding(&self, project: i64, person: i64, ids: &[ObjectId]) -> Result<Option<Arc<str>>> {
         let names: Vec<Arc<str>> = self.recent.get(&person_key(project, person)).map(|q| q.into_iter().collect()).unwrap_or_default();
         for name in names {
-            let Some(Some((index, _))) = self.staged.get(&name_key(project, &name)) else { continue };
-            if !ids.iter().all(|id| index.get(id).is_some()) {
+            let Some(Some(held)) = self.staged.get(&name_key(project, &name)) else { continue };
+            if !ids.iter().all(|id| held.index.get(id).is_some()) {
                 continue;
             }
             if self.usable(project, person, std::slice::from_ref(&name)).await?.contains(&name) {
@@ -628,17 +879,33 @@ impl Packs {
         Ok(names.iter().filter(|n| rows.contains(&***n)).cloned().collect())
     }
 
-    /// The index and length of staged pack `name`: from memory, or read.
-    pub async fn staged_index(&self, store: &dyn BlobStore, project: i64, name: &str) -> Result<Option<(Arc<Index>, u64)>> {
+    /// The index and length of staged pack `name`, with its share of the
+    /// bound: from the staged-index cache, or read under a share of its own;
+    /// `None` if it is not in the store (discarded).
+    pub async fn staged_index(&self, store: &dyn BlobStore, project: i64, name: &str) -> Result<Option<Arc<Held>>> {
         if let Some(i) = self.staged.get(&name_key(project, name)) {
             return Ok(i);
         }
-        Ok(read_index(store, &key(project, name)).await?.map(|(i, s)| (Arc::new(i), s)))
+        Ok(read_index(store, &key(project, name), &self.bound).await?.map(Arc::new))
+    }
+
+    /// What a push or API commit keeps of staged pack `name` (BUG-1496):
+    /// its object count, its length and the slots of `ids` in it; the index
+    /// itself is held, under its share of the bound, only while it is read.
+    /// `None` if the pack is not in the store (discarded).
+    pub async fn staged_slots(&self, store: &dyn BlobStore, project: i64, name: &str, ids: &[ObjectId]) -> Result<Option<StagedSlots>> {
+        let Some(held) = self.staged_index(store, project, name).await? else { return Ok(None) };
+        let slots = ids.iter().filter_map(|id| Some((*id, held.index.get(id)?))).collect();
+        Ok(Some(StagedSlots { objects: held.index.len(), size: held.size, slots }))
     }
 
     /// Discard staged packs `names` of `project`: the row turns discarded
     /// first (so no push can list them after), then the storage objects
-    /// go. A pack already listed is left as it is.
+    /// go, **every one tried** whatever another's delete answers (BUG-1498;
+    /// the first error is returned once all were tried). A pack already
+    /// listed is left as it is. A discarded row whose pack is still stored
+    /// (a failed delete, a server stopped in between) is S29's job's to
+    /// delete (`storage-and-cost.md` §8).
     pub async fn discard(&self, store: &dyn BlobStore, project: i64, names: &[Arc<str>]) -> Result<()> {
         if names.is_empty() {
             return Ok(());
@@ -659,12 +926,18 @@ impl Packs {
             }
             None => names.iter().map(|n| n.to_string()).collect(),
         };
-        for n in gone {
-            store.delete(&key(project, &n)).await?;
+        let (mut first, mut failed) = (None, 0);
+        for n in &gone {
+            if let Err(e) = store.delete(&key(project, n)).await {
+                failed += 1;
+                first.get_or_insert(e);
+            }
         }
-        Ok(())
+        match first {
+            Some(e) => Err(e.context(format!("{failed} of {} discarded packs of project {project} are still stored", gone.len()))),
+            None => Ok(()),
+        }
     }
-
 }
 
 #[cfg(test)]
