@@ -4699,7 +4699,6 @@ fn land_held_onto(api: &Api, token: &str, project: &str, branch: &str, snapshot:
 /// another branch, as the dev's: the dev's change is then refused there
 /// ("already landed … make a new change"), though nothing of it is there.
 #[test]
-#[ignore = "BUG-1581: a landed snapshot of fin's change under the change id of the dev's API change is taken as the dev's (change_refs by change id first), and blocks the dev's change on another branch"]
 fn bug_1581_a_squat_landed_by_the_service_never_counts_as_the_api_change_whose_change_id_it_takes() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -4737,6 +4736,86 @@ fn bug_1581_a_squat_landed_by_the_service_never_counts_as_the_api_change_whose_c
     let body = String::from_utf8_lossy(&r.body).to_string();
     assert_eq!(r.status, 200, "{body}");
     assert_eq!(r.json()["state"], "landed", "{body}");
+}
+
+/// BUG-1581: a change re-landed by the service across five branches (five
+/// server-signed hops from the original snapshot) keeps its author at every
+/// hop (`snapshots.author`, read in one lookup with no bound), so on the
+/// fifth branch a revision with further edits is refused and one with the
+/// same edits is skipped, never landing twice.
+#[test]
+fn a_change_relanded_across_five_branches_keeps_its_author_and_never_lands_twice() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let a = Craft::new(&api, &p.admin, &p.name, "main");
+    let branches = ["b1", "b2", "b3", "b4", "b5"];
+    let init: Vec<(String, ObjectId)> = branches.iter().map(|b| ((*b).to_string(), a.tip)).collect();
+    push_new_branches(&a, &init);
+
+    // The dev lands change C on main, then re-lands each landed snapshot
+    // onto the next branch: main -> b1 -> b2 -> b3 -> b4 -> b5.
+    let on = Craft::new(&api, &p.dev, &p.name, "main").tip;
+    let w = land(&api, &token, &p.name, on, json!([put("src/five.rs", "five\n")]), true).json();
+    assert_eq!(w["state"], "landed", "{w}");
+    let cid = source(&hub, pid).snapshot(&real_tip(&hub, pid)).unwrap().change_id;
+    let mut from = "main";
+    for b in branches {
+        let seen = Craft::new(&api, &p.dev, &p.name, from).tip;
+        let r = land_held_onto(&api, &token, &p.name, b, seen);
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        assert_eq!(r.status, 200, "{b}: {body}");
+        assert_eq!(r.json()["state"], "landed", "{b}: {body}");
+        from = b;
+    }
+
+    // On b5, the landed snapshot's author is the dev, and `landed_changes`
+    // recorded it for b5.
+    let b5_real = Craft::new(&api, &p.admin, &p.name, "b5").tip;
+    let dev_id: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&p.dev.name).fetch_one(&hub.hub().db))
+        .unwrap();
+    let recorded_author: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT author FROM snapshots WHERE project_id = $1 AND id = $2")
+                .bind(pid)
+                .bind(b5_real.hex())
+                .fetch_one(&hub.hub().db),
+        )
+        .unwrap();
+    assert_eq!(recorded_author, dev_id);
+
+    // A revision of C with further edits onto b5 is refused.
+    let mut d = Craft::new(&api, &p.dev, &p.name, "b5");
+    d.file("src/five.rs", "five\n");
+    d.file("src/extra.rs", "extra\n");
+    let more = snap_at(&mut d, on, cid, "C, more", veil_core::now_millis(), vec![]);
+    let r = push_new(&d, &[("more", more)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let r = land_held_onto(&api, &token, &p.name, "b5", more);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 400, "{body}");
+    assert!(body.contains("already landed on 'b5' with other edits"), "{body}");
+
+    // A revision of C with the same edits under Q onto b5 is skipped and named;
+    // C never lands twice on b5.
+    let mut d = Craft::new(&api, &p.dev, &p.name, "b5");
+    let base = d.tip;
+    let same = snap_at(&mut d, base, cid, "C, again", veil_core::now_millis(), vec![]);
+    d.file("src/after_five.rs", "after\n");
+    let q = crafted_on(&mut d, same, veil_core::ChangeId::random(), "Q", "");
+    let r = push_new(&d, &[("q5", q)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let r = land_held_onto(&api, &token, &p.name, "b5", q);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+    assert_eq!(r.json()["landed"].as_array().unwrap().len(), 1, "{body}");
+    assert!(body.contains(&cid.to_string()) && body.contains("already landed"), "{body}");
 }
 
 /// Guarantee (agent sessions, S11's attribution: an agent acts with its
@@ -4837,7 +4916,6 @@ fn a_revision_signed_on_a_since_removed_device_is_still_its_persons() {
 /// Here the landing lease is held elsewhere, so 12 landings wait their
 /// whole 30 s; a read of the project's tips meanwhile must still answer.
 #[test]
-#[ignore = "BUG-1635: landings waiting for their outcome (`wait: true`) hold the project's bulkhead places, and the project's other requests are refused 503"]
 fn bug_1635_landings_waiting_for_their_outcome_never_fill_the_projects_bulkhead() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -4871,3 +4949,88 @@ fn bug_1635_landings_waiting_for_their_outcome_never_fill_the_projects_bulkhead(
         }
     });
 }
+
+/// BUG-1635: 50 waiting landings (across both `POST …/land` with `wait: true`
+/// and `GET …/land/{ticket}`, more than both the project's 12 bulkhead places
+/// and the server's 32) leave the project's pulls answering normally with 0
+/// places held while waiting.
+#[test]
+fn fifty_waiting_landings_leave_the_projects_pulls_answering_normally() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let token = p.dev.token();
+    let base = tip_for(&hub, &token, &p.name);
+    let h = hub.hub();
+    hub.rt
+        .block_on(
+            sqlx::query("INSERT INTO landing_leases (project_id, branch, holder, epoch, expires_at) VALUES ($1, 'main', 'elsewhere', 1, $2)")
+                .bind(pid)
+                .bind(i64::MAX / 2)
+                .execute(&h.db),
+        )
+        .unwrap();
+    // Queue 10 with wait: false so they wait on `GET …/land/{ticket}`, and
+    // 40 with `POST …/land` (`wait: true`), 50 waiting in all.
+    let mut tickets = Vec::new();
+    let api = hub.api();
+    for i in 0..10 {
+        let r = land(&api, &token, &p.name, base, json!([put(&format!("src/q50/{i:02}.rs"), "q\n")]), false);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        tickets.push(r.json()["ticket"].as_str().unwrap().to_string());
+    }
+    std::thread::scope(|s| {
+        let mut waiters = Vec::new();
+        for t in &tickets {
+            let (hub, token, name) = (&hub, &token, &p.name);
+            waiters.push(s.spawn(move || {
+                let r = hub.api().get(Some(token), &format!("/v1/projects/{name}/land/{t}"));
+                assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                assert_eq!(r.json()["state"], "landed");
+            }));
+        }
+        for i in 10..50 {
+            let (hub, token, name) = (&hub, &token, &p.name);
+            waiters.push(s.spawn(move || {
+                let r = land(&hub.api(), token, name, base, json!([put(&format!("src/q50/{i:02}.rs"), "q\n")]), true);
+                assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                assert_eq!(r.json()["state"], "landed");
+            }));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let queued: i64 = hub
+                .rt
+                .block_on(sqlx::query_scalar("SELECT COUNT(*) FROM landing_queue WHERE project_id = $1 AND state = 'queued'").bind(pid).fetch_one(&h.db))
+                .unwrap();
+            if queued == 50 && h.limits.load(Some(&p.name)) == (0, 0) && h.limits.load(None) == (0, 0) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "queued={queued}, project={:?}, server={:?}", h.limits.load(Some(&p.name)), h.limits.load(None));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Pulls of the project answer quickly while all 50 landings wait.
+        for _ in 0..5 {
+            let r = api.get(Some(&token), &format!("/v1/projects/{}/tips", p.name));
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            let r = api.post_json(
+                Some(&token),
+                &format!("/v1/projects/{}/history", p.name),
+                &json!({"tips": [base.hex()], "have": []}),
+            );
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        }
+        let d = p.dev.dir("pull-while-50-wait");
+        p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+        p.dev.ok(&d, &["pull"]);
+        // Let the landing service run so all 50 finish and land.
+        hub.rt
+            .block_on(sqlx::query("DELETE FROM landing_leases WHERE project_id = $1").bind(pid).execute(&h.db))
+            .unwrap();
+        veil_server::landing::ensure(&h, pid, "main");
+        for w in waiters {
+            w.join().unwrap();
+        }
+    });
+}
+

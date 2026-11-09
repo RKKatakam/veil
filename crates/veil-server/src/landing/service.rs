@@ -806,16 +806,19 @@ impl Service {
         // "already landed" asks it whatever its submitted snapshot (BUG-1522,
         // BUG-1527).
         let empty_fresh = HashMap::new();
+        let mut snap_authors: HashMap<ObjectId, i64> = HashMap::new();
         let (mut cc, mut ca, mut cl) = (Vec::new(), Vec::new(), Vec::new());
         for (sid, r) in &b.landings {
             if let Some(c) = &r.change {
                 if let Some(a) = super::snapshot_author(hub, self.project, *sid, &empty_fresh).await? {
+                    snap_authors.insert(r.landed, a);
                     cc.push(c.clone());
                     ca.push(a);
                     cl.push(r.landed.hex());
                 }
             }
         }
+        let snapshot_authors: Vec<i64> = b.snapshots.iter().map(|s| snap_authors.get(s).copied().unwrap_or(0)).collect();
         let lineage = b.after.lineage;
         let mk: Vec<String> = b.memos.iter().map(|m| m.0.clone()).collect();
         let mr: Vec<String> = b.memos.iter().map(|m| m.1.hex()).collect();
@@ -826,7 +829,8 @@ impl Service {
         let notify = hub.caches.notices.load(Ordering::SeqCst);
         let tx_results = results.clone();
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-            let (ls, ll, mc, cc, ca, cl) = (ls.clone(), ll.clone(), mc.clone(), cc.clone(), ca.clone(), cl.clone());
+            let (ls, ll, mc, cc, ca, cl, snapshot_authors) =
+                (ls.clone(), ll.clone(), mc.clone(), cc.clone(), ca.clone(), cl.clone(), snapshot_authors.clone());
             let (branch, holder, old, new, seqs, snapshots, mk, mr, mp, accept, name, mut results) = (
                 branch.clone(),
                 holder.clone(),
@@ -912,11 +916,15 @@ impl Service {
                     return Err(Error::conflict(MOVED));
                 }
                 if !snapshots.is_empty() {
-                    sqlx::query("INSERT INTO snapshots (project_id, id) SELECT $1, unnest($2::TEXT[]) ON CONFLICT DO NOTHING")
-                        .bind(pid)
-                        .bind(&snapshots)
-                        .execute(&mut *c)
-                        .await?;
+                    sqlx::query(
+                        "INSERT INTO snapshots (project_id, id, author) SELECT $1, s, a FROM unnest($2::TEXT[], $3::BIGINT[]) AS v(s, a) \
+                         ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0",
+                    )
+                    .bind(pid)
+                    .bind(&snapshots)
+                    .bind(&snapshot_authors)
+                    .execute(&mut *c)
+                    .await?;
                 }
                 if !ls.is_empty() {
                     sqlx::query(
