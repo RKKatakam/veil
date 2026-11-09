@@ -36,7 +36,7 @@ use veil_core::{
     policy::{Policy, Tier},
     attributes::Attrs,
     secrets::{self, looks_binary},
-    tree::{diff_trees, lookup, TreeChange},
+    tree::{lookup, TreeChange},
     vfs::walk_files,
     ObjectId, Repo, StorageBackend, TreeEntry, VPath,
 };
@@ -177,6 +177,8 @@ impl Vis {
 #[derive(Serialize, Debug, Clone)]
 pub struct Redaction {
     /// `no_key` (cloaked for a scope you hold no key for, or unreadable),
+    /// `no_access` (a folder the server refuses: you no longer have access
+    /// to it, BUG-1508),
     /// `withheld` (never received: a public mirror never delivers it),
     /// `unwritable` (readable, but this
     /// filesystem could not hold the file), `missing` (a public object
@@ -577,6 +579,16 @@ fn keyword_tier(keyword: &str) -> (&'static str, Option<String>) {
 /// Why `e` cannot be materialised here, in the words of `vl status`
 /// (`render::hidden_reason`).
 fn redaction_for_listing(repo: &Repo, e: &TreeEntry) -> Option<Redaction> {
+    // A folder carried as recorded: `no_access` only where the server
+    // refuses it (BUG-1508); one carried for another reason says so.
+    if e.kind == EntryKind::Dir {
+        let store = repo.store();
+        let refused = !store.has(&e.id) && matches!(store.tree(&e.id), Err(err) if veil_core::tree::refused_tree(store, &err));
+        return Some(match refused {
+            true => Redaction { reason: "no_access", message: "you no longer have access to this folder".into() },
+            false => Redaction { reason: "error", message: "its content could not be read here; kept as recorded".into() },
+        });
+    }
     if e.kind == EntryKind::Conflict {
         return Some(Redaction {
             reason: "conflict_side",
@@ -632,6 +644,15 @@ pub struct Status {
     /// convert (`vl renormalize` re-records them). Omitted when none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub renormalizable: Vec<String>,
+    /// Files in a folder you no longer have access to (a thin clone; the
+    /// folder is kept as recorded): never recorded, never touched
+    /// (BUG-1528). Omitted when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub not_recorded: Vec<String>,
+    /// Folders the working-copy change's diff did not compare: the server
+    /// refuses them (as in `veil.diff/2`). Omitted when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hidden: Vec<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -686,6 +707,11 @@ pub struct Conflict {
     /// recorded as markers in the file (older formats, embargoes) or a
     /// file moved aside by a file/directory conflict.
     pub conflict: Option<ConflictInfo>,
+    /// Your own edit of a version you held before you lost access to its
+    /// folder, kept when the folder was written back (the recorded version
+    /// is newer, BUG-1531). Absent otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub kept_edit: bool,
 }
 
 pub fn status(ctx: &Ctx) -> Result<Status> {
@@ -693,7 +719,7 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
     let wc = ctx.wc()?;
     let s = repo.snapshot(&wc)?;
     let base = repo.parents_tree(&s.parents)?.tree;
-    let changes = diff_trees(repo.store(), Some(&base), Some(&s.tree))?;
+    let (changes, hidden) = veil_core::tree::diff_trees_hiding(repo.store(), Some(&base), Some(&s.tree))?;
     let (changes, _) = detect_renames(repo, (&base, &s.tree), changes, &Renames::default())?;
     let report = &ctx.report;
     let embargo = EmbargoTiers::of(repo, &wc)?;
@@ -727,7 +753,7 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
             (ps.conflicts.contains(c) && before.is_some() && before == entry).then(|| ps.change_id.short())
         });
         let conflict = entry.as_ref().and_then(|e| conflict_info(repo, e));
-        conflicts.push(Conflict { path: c.clone(), recorded_on, conflict });
+        conflicts.push(Conflict { path: c.clone(), recorded_on, conflict, kept_edit: false });
     }
     for ps in &parents {
         for c in &ps.conflicts {
@@ -735,7 +761,7 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
             let before = lookup(repo.store(), &ps.tree, &cp)?;
             if before.is_some() && before == lookup(repo.store(), &s.tree, &cp)? && !conflicts.iter().any(|x| x.path == *c) {
                 let conflict = before.as_ref().and_then(|e| conflict_info(repo, e));
-                conflicts.push(Conflict { path: c.clone(), recorded_on: Some(ps.change_id.short()), conflict });
+                conflicts.push(Conflict { path: c.clone(), recorded_on: Some(ps.change_id.short()), conflict, kept_edit: false });
             }
         }
     }
@@ -780,8 +806,18 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
             .collect(),
         nested: report.nested.iter().map(path).collect(),
         redacted,
-        conflicts,
+        conflicts: {
+            // Kept edits of a version left with a folder (BUG-1531).
+            for k in ctx.materialised().kept_edits() {
+                if !conflicts.iter().any(|c| c.path == k.as_str()) {
+                    conflicts.push(Conflict { path: path(k), recorded_on: None, conflict: None, kept_edit: true });
+                }
+            }
+            conflicts
+        },
         renormalizable: report.renormalizable.iter().map(path).collect(),
+        not_recorded: report.not_recorded.iter().map(path).collect(),
+        hidden: hidden.iter().map(|h| hidden_dir(&h.path)).collect(),
     })
 }
 
@@ -1116,6 +1152,11 @@ pub struct DiffBody {
     /// renames are shown). Absent otherwise.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub renames_skipped: bool,
+    /// Folders not compared: in a thin clone, the server refuses their
+    /// content (you no longer have access to them, BUG-1508). Only their
+    /// paths, which their parents already named. Absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hidden: Vec<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -1216,10 +1257,21 @@ fn entry_info(repo: &Repo, e: &TreeEntry, check_readable: bool) -> EntryInfo {
 /// [`item_diff`] (lazily, for the text output). In a thin clone both sides
 /// are fetched first, each at its own path (BUG-1506): their content and
 /// readability are read by id.
-pub fn diff_changes(repo: &Repo, from: &ObjectId, to: &ObjectId) -> Result<Vec<TreeChange>> {
-    let changes = diff_trees(repo.store(), Some(from), Some(to))?;
+pub fn diff_changes(repo: &Repo, from: &ObjectId, to: &ObjectId) -> Result<(Vec<TreeChange>, Vec<VPath>)> {
+    // A folder the server refuses is listed, never compared (BUG-1508).
+    let (changes, hidden) = veil_core::tree::diff_trees_hiding(repo.store(), Some(from), Some(to))?;
     veil_core::tree::prefetch_changes(repo.store(), Some(from), Some(to), &changes)?;
-    Ok(changes)
+    Ok((changes, hidden.into_iter().map(|h| h.path).collect()))
+}
+
+/// A folder a diff did not compare, as shown: its path and a slash (`/`
+/// for the root).
+pub fn hidden_dir(p: &VPath) -> String {
+    if p.is_root() {
+        "/".to_string()
+    } else {
+        format!("{p}/")
+    }
 }
 
 fn file_diff_with(repo: &Repo, c: &TreeChange, stat: bool, check_readable: bool, attrs: &Attrs<'_>) -> FileDiff {
@@ -1349,7 +1401,8 @@ pub struct DiffTrees {
 }
 
 pub fn diff_body_with(repo: &Repo, t: &DiffTrees, stat: bool, r: &Renames) -> Result<DiffBody> {
-    let (items, renames_skipped) = detect_renames(repo, (&t.from, &t.to), diff_changes(repo, &t.from, &t.to)?, r)?;
+    let (changes, hidden) = diff_changes(repo, &t.from, &t.to)?;
+    let (items, renames_skipped) = detect_renames(repo, (&t.from, &t.to), changes, r)?;
     let attrs = diff_attrs(repo);
     let old = EmbargoTiers::of(repo, &t.from_rev)?;
     let new = if t.to_rev == t.from_rev { None } else { Some(EmbargoTiers::of(repo, &t.to_rev)?) };
@@ -1369,7 +1422,7 @@ pub fn diff_body_with(repo: &Repo, t: &DiffTrees, stat: bool, r: &Renames) -> Re
         }
         files.push(f);
     }
-    Ok(DiffBody { stat, files, renames_skipped })
+    Ok(DiffBody { stat, files, renames_skipped, hidden: hidden.iter().map(hidden_dir).collect() })
 }
 
 /// `vl diff --json` with rename detection on (the default).
@@ -1470,7 +1523,9 @@ pub fn show_header(ctx: &Ctx, rev: &str, stat: bool) -> Result<Show> {
             let rec = repo.keys().load_embargo(e)?;
             let (state, until_ms) = match rec {
                 Some(_) if repo.keys().release_state(e) == ReleaseState::Released => ("released", None),
-                Some(_) if repo.keys().release_state(e) == ReleaseState::Staged => ("staged", None),
+                // Staged and in force by the op log (BUG-1487); otherwise
+                // the next push does not publish it: pending.
+                Some(_) if repo.keys().release_state(e) == ReleaseState::Staged && repo.staged_release_standing()?.0.get(e) == Some(&veil_core::commands::Standing::InForce) => ("staged", None),
                 Some(r) => ("pending", r.until),
                 None => ("unknown", None),
             };
@@ -1496,7 +1551,7 @@ pub fn show_header(ctx: &Ctx, rev: &str, stat: bool) -> Result<Show> {
         embargo,
         conflicts: s.conflicts.clone(),
         description,
-        diff: DiffBody { stat, files: Vec::new(), renames_skipped: false },
+        diff: DiffBody { stat, files: Vec::new(), renames_skipped: false, hidden: Vec::new() },
         base_tree: base,
         tree: s.tree,
         timestamp_ms: s.timestamp,
@@ -1965,7 +2020,9 @@ pub struct Ls {
 #[derive(Serialize, Debug)]
 pub struct LsEntry {
     pub path: String,
-    /// An ignored directory, listed as a whole (never descended into).
+    /// A directory listed as a whole (never descended into): an ignored
+    /// one, or a recorded one you no longer have access to (`kind` `dir`,
+    /// BUG-1508).
     pub dir: bool,
     /// `public`, `cloaked`, `embargoed` (withheld by an unreleased embargo), `redacted` (recorded, but sealed for someone
     /// else or withheld here), `isolated`, `ignored` or
@@ -2043,7 +2100,30 @@ pub fn ls(ctx: &Ctx, rev: &str, paths: &[String], all: bool, local_files: bool) 
         })
     };
     let mut entries: Vec<(VPath, LsEntry)> = Vec::new();
-    let files: Vec<(VPath, TreeEntry)> = veil_core::tree::walk_files(repo.store(), &snap.tree)?.into_iter().filter(|(p, _)| under(&filters, p, false)).collect();
+    let (files, hidden) = veil_core::tree::walk_files_hiding(repo.store(), &snap.tree)?;
+    let files: Vec<(VPath, TreeEntry)> = files.into_iter().filter(|(p, _)| under(&filters, p, false)).collect();
+    // A folder the server refuses (BUG-1508): listed whole, by its path only.
+    for h in hidden.into_iter().filter(|h| under(&filters, h, true)) {
+        entries.push((
+            h.clone(),
+            LsEntry {
+                path: path(&h),
+                dir: true,
+                tier: "redacted",
+                scope: None,
+                recorded: true,
+                visibility: None,
+                size: None,
+                executable: false,
+                readable: false,
+                redaction: Some(Redaction { reason: "no_access", message: "you no longer have access to this folder".into() }),
+                quarantine: None,
+                conflict: None,
+                kind: EntryKind::Dir.name(),
+                target: None,
+            },
+        ));
+    }
     // Readability is read by id: in a thin clone, each asked for at its
     // own path first (BUG-1506).
     veil_core::tree::prefetch_files(repo.store(), &snap.tree, files.iter().map(|(p, e)| (p, e)))?;
@@ -2467,7 +2547,7 @@ pub fn blame(ctx: &Ctx, req: &BlameRequest<'_>) -> Result<BlameDoc> {
     let p = ctx.repo_path(req.path)?;
     let tree = repo.snapshot(&id)?.tree;
     let reader = if req.public { Reader::Public } else { Reader::Me };
-    let e = match veil_core::tree::lookup_to_read(repo.store(), &tree, &p)? {
+    let e = match crate::render::lookup_shown(repo, &tree, &p)? {
         Some(e) if e.kind.is_file_like() => e,
         Some(_) => anyhow::bail!("{} is a directory in {}, not a file", crate::render::safe(p.as_str()), id.short()),
         None => anyhow::bail!("{} does not exist in {}", crate::render::safe(p.as_str()), id.short()),
@@ -2615,6 +2695,14 @@ pub struct GrepSkipped {
     pub binary: usize,
     /// Files over 256 MiB.
     pub too_large: usize,
+    /// Folders not searched: you no longer have access to them (a thin
+    /// clone; the server refuses their content). Absent when none.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub hidden_folders: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// What `vl grep` searches.
@@ -2660,7 +2748,7 @@ pub fn grep(ctx: &Ctx, req: GrepRequest<'_>) -> Result<GrepDoc> {
         rev: snapshot_ref(repo, &id),
         matches,
         files,
-        skipped: GrepSkipped { sealed: g.skipped.sealed, binary: g.skipped.binary, too_large: g.skipped.too_large },
+        skipped: GrepSkipped { sealed: g.skipped.sealed, binary: g.skipped.binary, too_large: g.skipped.too_large, hidden_folders: g.skipped.hidden_folders },
         searched: g.searched,
     })
 }

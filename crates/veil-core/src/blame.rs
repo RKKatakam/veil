@@ -56,7 +56,7 @@ use crate::{
     repo::Repo,
     store::ObjectStore,
     textmerge,
-    tree::{diff_trees, lookup_to_read},
+    tree::{diff_trees_hiding, lookup_to_read},
     vpath::VPath,
 };
 
@@ -669,7 +669,7 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
             };
             if pv.is_none() && o.follow {
                 // Where did the file come from? Renames in this step only.
-                let changes = diff_trees(store, Some(&ps.tree), Some(&snap.tree))?;
+                let (changes, _) = diff_trees_hiding(store, Some(&ps.tree), Some(&snap.tree))?;
                 if changes.iter().any(|c| c.path == q.path && c.old.is_none()) {
                     let d = rename::detect(store, Some(&ps.tree), Some(&snap.tree), &changes, o.reader, &o.renames)?;
                     result.stats.add(&d.stats);

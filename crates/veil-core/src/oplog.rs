@@ -163,6 +163,14 @@ pub struct Operation {
     /// the amended one). Omitted when empty.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rewritten: BTreeMap<ObjectId, Vec<ObjectId>>,
+    /// Set on an operation recorded by `vl op restore`: the operation whose
+    /// view it restored. It takes back every operation between that one
+    /// and its parents, which a merge of concurrent operations reads from
+    /// here, not from what the view shows (BUG-1434). Absent elsewhere, and
+    /// on restores written before it existed (a merge then reads the
+    /// restored operation's id from the description).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_of: Option<ObjectId>,
 }
 
 impl Operation {
@@ -505,17 +513,27 @@ impl OpStore {
     }
 
     /// Operations from `starts` and their ancestors, newest first (by
-    /// timestamp, then id), each once. Pruned operations end their branch.
+    /// time, then id), each once, and on a log written since operation
+    /// times were clamped (none older than its parent) never before a
+    /// descendant: on equal times the op log's ancestry orders them,
+    /// reading only the operations of that time below the candidates
+    /// (BUG-1402, BUG-1433). On an older log, a parent newer than its
+    /// child is listed after it, but an operation can still come before an
+    /// older descendant that only a branch not walked yet reaches
+    /// (BUG-1432). Pruned operations end their branch ([`OpWalk::pruned`]).
     pub fn walk(&self, starts: &[ObjectId]) -> OpWalk<'_> {
         let mut w = OpWalk {
             ops: self,
             queue: BinaryHeap::new(),
+            key: HashMap::new(),
             loaded: HashMap::new(),
-            seen: std::collections::HashSet::new(),
+            done: Default::default(),
+            ready: Default::default(),
+            pruned: None,
             error: None,
         };
         for s in starts {
-            w.push(*s);
+            w.push(*s, None);
         }
         w
     }
@@ -541,25 +559,45 @@ impl OpStore {
         }
         // Ancestors of a common operation (never the nearest one).
         let mut stale: std::collections::HashSet<ObjectId> = Default::default();
-        while let Some((_, id)) = queue.pop() {
+        // The oldest timestamp of an operation walked while one side alone
+        // reached it.
+        let mut low: Option<i64> = None;
+        // A parent newer than its child (written before operation times
+        // were clamped, with the clock set back): times no longer bound
+        // what is still a descendant, so the walk never ends early (BUG-1401).
+        let mut inverted = false;
+        while let Some((ts, id)) = queue.pop() {
             let (m, st) = (marks[&id], stale.contains(&id));
             if done.get(&id) == Some(&(m, st)) {
                 continue;
             }
             done.insert(id, (m, st));
+            if m != 3 {
+                low = Some(low.map_or(ts, |l| l.min(ts)));
+            }
             // Common operations are walked too (the classic merge-base walk): a
             // timestamp out of order (a merge has its newest parent's) may
             // have sent one side below them first. The walk ends once
-            // everything still queued is common.
-            if m == 3 && queue.iter().all(|(_, q)| marks[q] == 3) {
-                break;
-            }
+            // everything still queued is common and older than every
+            // operation walked as one side's: a common operation of the same
+            // timestamp may still be its descendant (a merge and the parent
+            // whose timestamp it has, the parent's id sorting first), which
+            // makes it common too (BUG-1297).
             let parents = match self.cached(&mut ops, &id)? {
                 Some(op) => op.parents.clone(),
-                None => continue,
+                None => Vec::new(),
             };
+            let mut known = Vec::new();
             for p in parents {
                 let Some(pts) = self.cached(&mut ops, &p)?.map(|o| o.timestamp) else { continue };
+                inverted |= pts > ts;
+                known.push((p, pts));
+            }
+            let below = |t: i64| low.is_none_or(|l| t < l);
+            if !inverted && m == 3 && below(ts) && queue.iter().all(|(t, q)| marks[q] == 3 && below(*t)) {
+                break;
+            }
+            for (p, pts) in known {
                 let newly_stale = m == 3 && stale.insert(p);
                 let pm = marks.entry(p).or_default();
                 if *pm | m != *pm || newly_stale {
@@ -591,8 +629,13 @@ impl OpStore {
 
     /// Resolve an operation id prefix among the operations the heads reach.
     pub fn resolve_prefix(&self, prefix: &str) -> Result<ObjectId> {
+        self.resolve_prefix_from(&self.heads()?, prefix)
+    }
+
+    /// Resolve an operation id prefix among the operations `starts` reach.
+    pub fn resolve_prefix_from(&self, starts: &[ObjectId], prefix: &str) -> Result<ObjectId> {
         let mut found = Vec::new();
-        for (steps, id) in self.walk(&self.heads()?).enumerate() {
+        for (steps, id) in self.walk(starts).enumerate() {
             let id = id?.0;
             if id.hex().starts_with(prefix) {
                 found.push(id);
@@ -621,6 +664,37 @@ pub struct Split {
 }
 
 impl Split {
+    /// For each operation of `within` (`only_a` or `only_b`), the operations
+    /// of `within` it descends from.
+    pub(crate) fn ancestors_within(&self, within: &[ObjectId]) -> HashMap<ObjectId, std::collections::HashSet<ObjectId>> {
+        let set: std::collections::HashSet<&ObjectId> = within.iter().collect();
+        let parents = |id: &ObjectId| -> Vec<ObjectId> { self.ops.get(id).map(|o| o.parents.iter().filter(|p| set.contains(p)).copied().collect()).unwrap_or_default() };
+        let mut out: HashMap<ObjectId, std::collections::HashSet<ObjectId>> = HashMap::new();
+        for start in within {
+            // Depth first: an operation is done once its parents are (times
+            // do not order them).
+            let mut stack = vec![(*start, false)];
+            while let Some((id, expanded)) = stack.pop() {
+                if out.contains_key(&id) {
+                    continue;
+                }
+                let ps = parents(&id);
+                if !expanded {
+                    stack.push((id, true));
+                    stack.extend(ps.iter().filter(|p| !out.contains_key(*p)).map(|p| (*p, false)));
+                    continue;
+                }
+                let mut mine = std::collections::HashSet::new();
+                for p in ps {
+                    mine.insert(p);
+                    mine.extend(out.get(&p).into_iter().flatten().copied());
+                }
+                out.insert(id, mine);
+            }
+        }
+        out
+    }
+
     /// What the operations of `ids` (`only_a` or `only_b`) introduced:
     /// see [`Introduced`].
     pub(crate) fn introduced(&self, ids: &[ObjectId]) -> Introduced {
@@ -693,11 +767,14 @@ impl Introduced {
 /// with others, BUG-1294). Per key: when one side's value was introduced
 /// by an operation only it reaches (`ia`, `ib`) and the other's was not,
 /// the other's is the shared history's, so it is the base and the change
-/// wins. Otherwise (both sides changed the key, or neither did and they
-/// still differ) the key is `base`'s, and the conflict rules decide.
-/// Without it, a value `base` lacks but both sides' shared history holds
-/// looks changed on both sides, and the conflict rule could keep the side
-/// with the older value: a commit's working copy lost.
+/// wins. When both sides introduced theirs, both changed the key: the
+/// base is absent (equal to neither, nor to a value a side wrote back,
+/// BUG-1296), so the conflict rules decide between two changes (a change
+/// beats a removal; two moves keep the loser visible and warn). When
+/// neither did and they still differ, the key is `base`'s. Without it, a
+/// value `base` lacks but both sides' shared history holds looks changed
+/// on both sides, and the conflict rule could keep the side with the
+/// older value: a commit's working copy lost.
 pub fn shared_base(base: &View, a: &View, ia: &Introduced, b: &View, ib: &Introduced) -> View {
     fn key<T: Clone + PartialEq + Eq + std::hash::Hash, V: Clone>(
         name: &str,
@@ -715,7 +792,8 @@ pub fn shared_base(base: &View, a: &View, ia: &Introduced, b: &View, ib: &Introd
         match (ia.contains(&(name.to_string(), ua)), ib.contains(&(name.to_string(), ub))) {
             (false, true) => va.cloned(),
             (true, false) => vb.cloned(),
-            _ => vbase.cloned(),
+            (true, true) => None,
+            (false, false) => vbase.cloned(),
         }
     }
     let mut out = View::default();
@@ -746,6 +824,8 @@ pub fn shared_base(base: &View, a: &View, ia: &Introduced, b: &View, ib: &Introd
         let keep = match (pa == pb, ia.heads.contains(&(*h, pa)), ib.heads.contains(&(*h, pb))) {
             (false, false, true) => pa,
             (false, true, false) => pb,
+            // Added on one side, dropped on the other: the addition wins.
+            (false, true, true) => false,
             _ => base.heads.contains(h),
         };
         if keep {
@@ -758,25 +838,131 @@ pub fn shared_base(base: &View, a: &View, ia: &Introduced, b: &View, ib: &Introd
 /// See [`OpStore::walk`].
 pub struct OpWalk<'a> {
     ops: &'a OpStore,
+    /// `(key, id)`: an operation's key is its time, or a child's key if
+    /// that is lower (a parent newer than its child, written before times
+    /// were clamped). Entries whose key was lowered since are stale.
     queue: BinaryHeap<(i64, ObjectId)>,
+    key: HashMap<ObjectId, i64>,
     loaded: HashMap<ObjectId, Operation>,
-    seen: std::collections::HashSet<ObjectId>,
+    /// Emitted, or in `ready`.
+    done: std::collections::HashSet<ObjectId>,
+    /// The current group of one key, children first.
+    ready: std::collections::VecDeque<(ObjectId, i64)>,
+    pruned: Option<ObjectId>,
     error: Option<VeilError>,
 }
 
 impl OpWalk<'_> {
-    fn push(&mut self, id: ObjectId) {
-        if !self.seen.insert(id) {
-            return;
+    /// The newest pruned operation the walk met (where a branch ended).
+    pub fn pruned(&self) -> Option<ObjectId> {
+        self.pruned
+    }
+
+    /// Load `id`; `false` if it is pruned (or failed to read).
+    fn load(&mut self, id: ObjectId) -> bool {
+        if self.loaded.contains_key(&id) {
+            return true;
         }
         match self.ops.try_get(&id) {
             Ok(Some(op)) => {
-                self.queue.push((op.timestamp, id));
                 self.loaded.insert(id, op);
+                true
             }
-            Ok(None) => {}
-            Err(e) => self.error = self.error.take().or(Some(e)),
+            Ok(None) => {
+                self.pruned = Some(id);
+                false
+            }
+            Err(e) => {
+                self.error = self.error.take().or(Some(e));
+                false
+            }
         }
+    }
+
+    /// Queue `id`, a start (`below` none) or a parent of an operation of
+    /// key `below`. A parent newer than the key is queued at once, with
+    /// that key, and so on down: it must come after the operation, and so
+    /// must its ancestors, though another path may reach them sooner.
+    fn push(&mut self, id: ObjectId, below: Option<i64>) {
+        let mut work = vec![(id, below)];
+        while let Some((id, below)) = work.pop() {
+            if self.done.contains(&id) || !self.load(id) {
+                continue;
+            }
+            let ts = self.loaded[&id].timestamp;
+            let k = below.map_or(ts, |b| b.min(ts));
+            if self.key.get(&id).is_some_and(|old| *old <= k) {
+                continue;
+            }
+            self.key.insert(id, k);
+            self.queue.push((k, id));
+            for p in self.loaded[&id].parents.clone() {
+                if self.done.contains(&p) || !self.load(p) {
+                    continue;
+                }
+                if self.loaded[&p].timestamp > k {
+                    work.push((p, Some(k)));
+                }
+            }
+        }
+    }
+
+    /// The next operation to list: of the newest key, one no other queued
+    /// operation of that key descends from (BUG-1402: times tie; a merge
+    /// has its newest parent's, and a clock set back gives every operation
+    /// its parent's). With one such operation queued, as on a line of
+    /// operations of one time, that is it, read nothing more (BUG-1433);
+    /// with several, only the operations of that key below them are read.
+    fn fill(&mut self) {
+        let mut cands: Vec<ObjectId> = Vec::new();
+        let mut t = None;
+        while let Some(&(k, id)) = self.queue.peek() {
+            if t.is_some_and(|t| k != t) {
+                break;
+            }
+            self.queue.pop();
+            if self.done.contains(&id) || self.key.get(&id) != Some(&k) || cands.contains(&id) {
+                continue;
+            }
+            t = Some(k);
+            cands.push(id);
+        }
+        let Some(t) = t else { return };
+        let pick = match cands.as_slice() {
+            [one] => *one,
+            _ => {
+                // Those another candidate reaches through operations of this
+                // key (an operation below one, of its time or newer, is listed
+                // with its key).
+                let mut reached: std::collections::HashSet<ObjectId> = Default::default();
+                for c in &cands {
+                    let mut stack: Vec<ObjectId> = self.loaded.get(c).map(|o| o.parents.clone()).unwrap_or_default();
+                    let mut seen: std::collections::HashSet<ObjectId> = Default::default();
+                    while let Some(x) = stack.pop() {
+                        if !seen.insert(x) || self.done.contains(&x) || !self.load(x) {
+                            continue;
+                        }
+                        if self.loaded[&x].timestamp < t {
+                            continue;
+                        }
+                        reached.insert(x);
+                        stack.extend(self.loaded[&x].parents.iter().copied());
+                    }
+                }
+                let free = cands.iter().filter(|c| !reached.contains(*c)).max().copied();
+                // A cycle cannot happen in the op log; should the data say
+                // otherwise, the highest id goes first rather than none.
+                free.unwrap_or_else(|| *cands.iter().max().expect("a candidate"))
+            }
+        };
+        for c in cands {
+            if c != pick {
+                self.queue.push((t, c));
+            }
+        }
+        self.done.insert(pick);
+        self.key.remove(&pick);
+        self.ready.push_back((pick, t));
     }
 }
 
@@ -784,13 +970,16 @@ impl Iterator for OpWalk<'_> {
     type Item = Result<(ObjectId, Operation)>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.ready.is_empty() {
+            self.fill();
+        }
         if let Some(e) = self.error.take() {
             return Some(Err(e));
         }
-        let (_, id) = self.queue.pop()?;
+        let (id, t) = self.ready.pop_front()?;
         let op = self.loaded.remove(&id)?;
         for p in &op.parents {
-            self.push(*p);
+            self.push(*p, Some(t));
         }
         Some(Ok((id, op)))
     }
@@ -805,6 +994,8 @@ pub struct MergedView {
     /// What a conflict decided, for the user (names workspaces and public
     /// tags; a cloaked tag is "a cloaked tag").
     pub warnings: Vec<String>,
+    /// The losing values of those conflicts (heads of `view`).
+    pub losers: Vec<ObjectId>,
 }
 
 /// A deterministic 3-way merge of `sides` against `base`. A key changed on
@@ -918,9 +1109,10 @@ fn merge_views_with(base: &View, sides: &[&View], first_wins: bool, descends: &m
             out.view.remote_tags.insert(name.clone(), t);
         }
     }
-    for l in losers {
-        out.view.heads.insert(l);
+    for l in &losers {
+        out.view.heads.insert(*l);
     }
+    out.losers = losers;
     out
 }
 
