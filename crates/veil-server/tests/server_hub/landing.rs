@@ -4827,3 +4827,47 @@ fn a_revision_signed_on_a_since_removed_device_is_still_its_persons() {
     assert!(body.contains("already landed") && body.contains("make a new change for the further edits"), "{body}");
     assert_eq!(real_tip(&hub, pid), tip, "{body}");
 }
+
+/// BUG-1635 (the merge of S17 with S24): a landing submitted with `wait`
+/// keeps its place in the project's bulkhead (S24, `limits::gate`: 12
+/// places with the tests' 16 database connections) for as long as it waits
+/// for its outcome (up to `landing::WAIT`), so 12 agents waiting on their
+/// landings fill it, and every other request on the project, a pull of its
+/// tips included, is answered `503 busy` once its class's wait runs out.
+/// Here the landing lease is held elsewhere, so 12 landings wait their
+/// whole 30 s; a read of the project's tips meanwhile must still answer.
+#[test]
+#[ignore = "BUG-1635: landings waiting for their outcome (`wait: true`) hold the project's bulkhead places, and the project's other requests are refused 503"]
+fn bug_1635_landings_waiting_for_their_outcome_never_fill_the_projects_bulkhead() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let token = p.dev.token();
+    let base = tip_for(&hub, &token, &p.name);
+    let h = hub.hub();
+    hub.rt
+        .block_on(
+            sqlx::query("INSERT INTO landing_leases (project_id, branch, holder, epoch, expires_at) VALUES ($1, 'main', 'elsewhere', 1, $2)")
+                .bind(pid)
+                .bind(i64::MAX / 2)
+                .execute(&h.db),
+        )
+        .unwrap();
+    std::thread::scope(|s| {
+        let landers: Vec<_> = (0..12)
+            .map(|i| {
+                let (hub, token, name) = (&hub, &token, &p.name);
+                s.spawn(move || {
+                    let r = land(&hub.api(), token, name, base, json!([put(&format!("src/w/{i:02}.rs"), "w\n")]), true);
+                    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_secs(3));
+        let r = hub.api().get(Some(&token), &format!("/v1/projects/{}/tips", p.name));
+        assert_eq!(r.status, 200, "a read of the project while 12 landings wait: {}", String::from_utf8_lossy(&r.body));
+        for l in landers {
+            l.join().unwrap();
+        }
+    });
+}
