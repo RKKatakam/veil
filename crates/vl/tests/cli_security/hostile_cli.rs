@@ -30,6 +30,7 @@ fn hostile_file_names_and_authors_are_escaped() {
     let dest = work.join("dest");
     for args in [&["files", "-r", "main"][..], &["show", "main"], &["status"], &["log"]] {
         let out = env.vl("victim", &dest, args);
+        assert!(out.status.success(), "{args:?}: {}", text(&out));
         assert!(!text(&out).contains('\x1b'), "{args:?}: {:?}", text(&out));
         assert!(!text(&out).contains('\x07'), "{args:?}: {:?}", text(&out));
         if args[0] == "files" {

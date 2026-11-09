@@ -66,7 +66,7 @@ fn a_remote_in_a_newer_format_is_refused_without_writing() {
     let before = listing(&hub);
     env.commit("alice", &alice, "two", &[("a", "a2\n")]);
     let out = env.fails("alice", &alice, &["push"]);
-    assert!(out.contains("format") || out.contains("upgrade"), "{out}");
+    assert!(out.contains("format 99"), "{out}");
     env.fails("alice", &alice, &["pull"]);
     env.fails("bob", &env.root, &["clone", hub.to_str().unwrap(), "bob"]);
     assert!(!env.path("bob").exists());

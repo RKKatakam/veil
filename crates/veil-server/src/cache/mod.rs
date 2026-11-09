@@ -950,11 +950,26 @@ impl Cache {
         }
     }
 
-    async fn post_batch(&self, project: &str, req: &Forwarded<'_>) -> Result<reqwest::Response, Error> {
+    /// The headers that tell the server a request is this cache's, for
+    /// `client` (S24, BUG-1332): the caches' token, and the client's
+    /// address, so the server's limits count the client, not the cache.
+    fn as_cache(&self, client: Option<&str>) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&self.token) {
+            h.insert(feed::TOKEN_HEADER, v);
+        }
+        if let Some(v) = client.and_then(|c| reqwest::header::HeaderValue::from_str(c).ok()) {
+            h.insert(crate::limits::CLIENT_ADDRESS, v);
+        }
+        h
+    }
+
+    async fn post_batch(&self, project: &str, req: &Forwarded<'_>, client: Option<&str>) -> Result<reqwest::Response, Error> {
         self.stats.forwarded.fetch_add(1, Relaxed);
         let body = serde_json::to_vec(req).map_err(|e| Error::Other(e.into()))?;
         self.up
             .post(format!("{}/v1/objects/{}:batch", self.base, project))
+            .headers(self.as_cache(client))
             .header(header::CONTENT_TYPE, "application/json")
             .body(body)
             .send()
@@ -1076,9 +1091,11 @@ async fn batch(State(cache): State<Arc<Cache>>, Path(target): Path<String>, head
         return Error::not_found("no such route").into_response();
     };
     let p = p.to_string();
+    // Its client's address, for the server's limits (S24, BUG-1332).
+    let client = header(&headers, crate::limits::CLIENT_ADDRESS).map(str::to_string);
     let declared = header(&headers, header::CONTENT_LENGTH.as_str()).and_then(|v| v.parse::<u64>().ok());
     if declared.is_some_and(|n| n > LOCAL_BODY as u64) {
-        return forward_streamed(&cache, &p, None, body, Arrival { start: Instant::now(), got: 0 }).await;
+        return forward_streamed(&cache, &p, client.as_deref(), None, body, Arrival { start: Instant::now(), got: 0 }).await;
     }
     // Its share for the bytes it declared (or a slice's, for a body of
     // unknown length), in one step, holding nothing else.
@@ -1100,7 +1117,7 @@ async fn batch(State(cache): State<Arc<Cache>>, Path(target): Path<String>, head
                 let grown = more == 0 || cache.requests.clone().try_acquire_many_owned(more as u32).map(|m| share.merge(m)).is_ok();
                 if raw.len() > LOCAL_BODY || !grown {
                     let first = Bytes::from_owner(Held { bytes: raw, _share: Some(share) });
-                    return forward_streamed(&cache, &p, Some(first), body, arrival).await;
+                    return forward_streamed(&cache, &p, client.as_deref(), Some(first), body, arrival).await;
                 }
             }
             Ok(None) => break,
@@ -1138,7 +1155,7 @@ async fn batch(State(cache): State<Arc<Cache>>, Path(target): Path<String>, head
     let resp = if upstream {
         skip.extend(plan.iter().filter(|p| matches!(p.1, Plan::Local(_))).map(|p| p.0));
         let fwd = Forwarded { grant: &grant, ts, signature: signature.as_deref(), wants: &wants, skip: skip.iter().copied().collect() };
-        match cache.post_batch(&p, &fwd).await {
+        match cache.post_batch(&p, &fwd, client.as_deref()).await {
             Ok(r) if r.status() == reqwest::StatusCode::OK => Some(r),
             // Nothing is sent yet: the server's refusal, as it is.
             Ok(r) => return pass_on(&cache, r),
@@ -1163,7 +1180,7 @@ async fn batch(State(cache): State<Arc<Cache>>, Path(target): Path<String>, head
 /// arrive, still due at the client's minimum rate, and the server's answer
 /// is passed on as it is. The cache holds a chunk of it at a time. Past the
 /// server's own limit it stops reading, and the server refuses what it got.
-async fn forward_streamed(cache: &Arc<Cache>, p: &str, first: Option<Bytes>, mut body: axum::body::Body, mut arrival: Arrival) -> Response {
+async fn forward_streamed(cache: &Arc<Cache>, p: &str, client: Option<&str>, first: Option<Bytes>, mut body: axum::body::Body, mut arrival: Arrival) -> Response {
     cache.stats.forwarded.fetch_add(1, Relaxed);
     let (tx, rx) = tokio::sync::mpsc::channel::<Item>(1);
     let (late_tx, mut late) = tokio::sync::oneshot::channel::<Error>();
@@ -1192,6 +1209,7 @@ async fn forward_streamed(cache: &Arc<Cache>, p: &str, first: Option<Bytes>, mut
     let sent = cache
         .up
         .post(format!("{}/v1/objects/{}:batch", cache.base, p))
+        .headers(cache.as_cache(client))
         .header(header::CONTENT_TYPE, "application/json")
         .body(reqwest::Body::wrap(Chunks(rx)))
         .send()
@@ -1333,7 +1351,7 @@ fn local_head(len: u64, range: Option<(u64, u64)>) -> (StatusCode, HeaderMap, Op
 /// mark is let go once it is kept, or the server's answer has passed.
 async fn forward_get(cache: Arc<Cache>, p: String, id: ObjectId, headers: HeaderMap, ranged: bool, flight: Option<Flight>) -> Response {
     cache.stats.forwarded.fetch_add(1, Relaxed);
-    let mut r = cache.up.get(format!("{}/v1/objects/{}/{}", cache.base, p, id.hex()));
+    let mut r = cache.up.get(format!("{}/v1/objects/{}/{}", cache.base, p, id.hex())).headers(cache.as_cache(header(&headers, crate::limits::CLIENT_ADDRESS)));
     for h in ["veil-grant", "veil-chain", "veil-signature", "range"] {
         if let Some(v) = header(&headers, h) {
             r = r.header(h, v);

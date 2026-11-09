@@ -389,26 +389,26 @@ fn limits_stop_runaways_and_vl_still_records() {
         backends.push("systemd");
     }
     for backend in backends {
-        let run = |flags: &[&str], body: &str, file: &str| -> String {
+        let run = |flags: &[&str], body: &str, file: &str| -> (bool, String) {
             let script = format!("echo {backend} > {file}; {body}");
             let mut args = vec!["ws", "exec", "agent"];
             args.extend_from_slice(flags);
             args.extend(["--", "sh", "-c", &script]);
             let o = t.cmd(&t.proj, &args).env("VEIL_EXEC_LIMITS_BACKEND", backend).output().unwrap();
             let out = text(&o);
-            assert!(out.contains("Recorded") || out.contains("No changes"), "{backend}: not recorded: {out}");
+            assert!(out.contains("Recorded"), "{backend}: not recorded: {out}");
             assert_eq!(t.cat(file).as_deref(), Some(format!("{backend}\n").as_str()), "{backend}: {out}");
-            out
+            (o.status.success(), out)
         };
         // What stopped each run is vl's own report, never how long it took
         // (BUG-1085: wall-clock bounds failed under load).
-        let out = run(&["--cpu-time", "1s"], "while :; do :; done", "cpu.txt");
-        assert!(out.contains("stopped: CPU-time limit (1s) reached"), "{backend}: {out}");
-        let out = run(&["--memory", "64M"], "head -c 4G /dev/zero | tail -n 1 > /dev/null", "mem.txt");
-        assert!(out.contains("stopped: memory limit (64 MiB) reached"), "{backend}: {out}");
-        let out = run(&["--timeout", "1s"], "sleep 60", "time.txt");
-        assert!(out.contains("stopped: time limit (1s) reached"), "{backend}: {out}");
-        let out = run(
+        let (ok, out) = run(&["--cpu-time", "1s"], "while :; do :; done", "cpu.txt");
+        assert!(!ok && out.contains("stopped: CPU-time limit (1s) reached"), "{backend}: {out}");
+        let (ok, out) = run(&["--memory", "64M"], "head -c 4G /dev/zero | tail -n 1 > /dev/null", "mem.txt");
+        assert!(!ok && out.contains("stopped: memory limit (64 MiB) reached"), "{backend}: {out}");
+        let (ok, out) = run(&["--timeout", "1s"], "sleep 60", "time.txt");
+        assert!(!ok && out.contains("stopped: time limit (1s) reached"), "{backend}: {out}");
+        let (ok, out) = run(
             // The timeout only stops a run whose limit failed (a hang).
             &["--pids", "32", "--timeout", "60s"],
             // Each child waits on a FIFO, so they pile up however slowly
@@ -422,12 +422,13 @@ fn limits_stop_runaways_and_vl_still_records() {
         match backend {
             // Forks beyond the limit fail.
             "systemd" => {
+                assert!(ok, "{backend}: {out}");
                 let n: u64 = t.cat("count.txt").unwrap_or_default().trim().parse().unwrap_or(999);
                 assert!((1..=32).contains(&n), "{backend}: {n} processes ran under --pids 32: {out}");
                 assert!(out.contains("process limit (32)"), "{backend}: {out}");
             }
             // The storm is stopped when seen.
-            _ => assert!(out.contains("stopped: process limit (32) reached"), "{backend}: {out}"),
+            _ => assert!(!ok && out.contains("stopped: process limit (32) reached"), "{backend}: {out}"),
         }
     }
 }
@@ -612,6 +613,7 @@ fn hostile_flags_home_and_configuration_are_refused_or_contained() {
     // Limits from the configuration apply.
     std::fs::write(&cfg, "[exec.limits]\ntimeout = \"1s\"\n").unwrap();
     let o = run(&["--", "sleep", "30"], &[]);
+    assert!(!o.status.success(), "{}", text(&o));
     assert!(text(&o).contains("stopped: time limit (1s)"), "{}", text(&o));
     std::fs::remove_file(&cfg).unwrap();
 }
@@ -619,11 +621,15 @@ fn hostile_flags_home_and_configuration_are_refused_or_contained() {
 #[test]
 fn doctor_says_whether_confinement_works() {
     let t = T::new();
-    let out = text(&t.cmd(&t.proj, &["doctor"]).output().unwrap());
+    let o = t.cmd(&t.proj, &["doctor"]).output().unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let out = text(&o);
     assert!(out.contains("confinement works (bubblewrap"), "{out}");
     assert!(out.contains("resource limits:"), "{out}");
     let empty = t.env.dir("empty-path");
-    let out = text(&t.cmd(&t.proj, &["doctor"]).env("PATH", &empty).output().unwrap());
+    let o = t.cmd(&t.proj, &["doctor"]).env("PATH", &empty).output().unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let out = text(&o);
     assert!(out.contains("bubblewrap is not installed"), "{out}");
 }
 
@@ -699,7 +705,9 @@ fn doctor_never_runs_a_bwrap_from_inside_the_project() {
         std::fs::set_permissions(bin.join(prog), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
-    let out = text(&t.cmd(&t.proj.join("src"), &["doctor"]).env("PATH", &path).output().unwrap());
+    let o = t.cmd(&t.proj.join("src"), &["doctor"]).env("PATH", &path).output().unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let out = text(&o);
     assert!(!marker.exists(), "vl doctor ran the project's own program: {out}");
     assert!(out.contains("confinement works (bubblewrap"), "{out}");
 }
@@ -1374,7 +1382,9 @@ fn without_overlayfs_the_allow_list_is_read_only_and_vl_says_so() {
         assert!(out.contains("the allow-list is read-only in this run") && out.contains("overlay mount") && out.contains("cargo cannot download crates"), "{args:?}: {out}");
         assert!(out.contains("Read-only file system"), "{args:?}: {out}");
     }
-    let out = text(&t.cmd(&t.proj, &["doctor"]).env("PATH", &path).output().unwrap());
+    let o = t.cmd(&t.proj, &["doctor"]).env("PATH", &path).output().unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let out = text(&o);
     assert!(out.contains("allow-list: read-only, overlayfs does not work here"), "{out}");
     // A layer that cannot be used is named as the cause, not overlayfs.
     run_out(&t, &["agent", "--", "true"]);
@@ -1385,7 +1395,9 @@ fn without_overlayfs_the_allow_list_is_read_only_and_vl_says_so() {
     let out = text(&o);
     assert!(o.status.success() && out.contains("the allow-list is read-only in this run") && out.contains("/work"), "{out}");
     assert!(!out.contains("overlayfs does not work"), "the warning blamed overlayfs: {out}");
-    let out = text(&t.cmd(&t.proj, &["doctor"]).output().unwrap());
+    let o = t.cmd(&t.proj, &["doctor"]).output().unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let out = text(&o);
     assert!(out.contains("allow-list: writable"), "{out}");
 }
 

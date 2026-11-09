@@ -351,7 +351,7 @@ fn undo_reverts_the_last_command_and_keeps_edits() {
     let disk_tree = wc_tree(&repo);
 
     let (_, undone) = repo.undo_keeping_edits(WS).unwrap();
-    assert!(undone.starts_with("new change") || !undone.starts_with("snapshot"), "undid {undone}");
+    assert!(undone.starts_with("new change"), "undid {undone}");
     materialise(&repo, &fs, &disk_tree);
     assert_eq!(fs.read(&p("b.txt")).unwrap(), b"b2\n", "the undone command is reverted");
     assert_eq!(fs.read(&p("new-work.txt")).unwrap(), b"an hour of work\n", "edits survive");

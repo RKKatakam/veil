@@ -159,10 +159,11 @@ fn ws_write_of_an_isolated_path_does_not_claim_it_was_recorded() {
     child.stdin.take().unwrap().write_all(b"SECRET=abc\n").unwrap();
     let out = child.wait_with_output().unwrap();
     let t = text(&out);
+    assert!(!out.status.success(), "{t}");
     let cat = env.vl(U, &proj, &["ws", "cat", "agent", ".netrc"]);
-    let recorded = cat.status.success();
+    assert!(!cat.status.success(), "{}", text(&cat));
     assert!(
-        recorded || !t.contains("Recorded .netrc") || t.contains("isolat") || t.contains("local-only"),
+        !t.contains("Recorded .netrc") && (t.contains("isolat") || t.contains("local-only")),
         "the file was dropped but the command said:\n{t}"
     );
 }
@@ -217,6 +218,7 @@ fn a_copied_text_secret_is_quarantined_in_the_sandbox() {
     env.ok(U, &proj, &["status"]);
     env.ok(U, &proj, &["ws", "new", "agent"]);
     let out = env.vl(U, &proj, &["ws", "exec", "agent", "--with-isolated", "--", "sh", "-c", "cp .netrc leaked.txt"]);
+    assert!(out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("quarantined"), "{}", text(&out));
     assert!(!env.stdout(U, &proj, &["files", "-r", "agent@"]).contains("leaked.txt"));
 }
@@ -233,6 +235,7 @@ fn a_copied_keystore_is_quarantined_in_the_sandbox() {
     env.ok(U, &proj, &["status"]);
     env.ok(U, &proj, &["ws", "new", "agent"]);
     let out = env.vl(U, &proj, &["ws", "exec", "agent", "--with-isolated", "--", "sh", "-c", "cp server.p12 dist/bundle.bin 2>/dev/null || (mkdir dist && cp server.p12 dist/bundle.bin)"]);
+    assert!(out.status.success(), "{}", text(&out));
     let files = env.stdout(U, &proj, &["files", "-r", "agent@"]);
     assert!(
         !files.contains("bundle.bin"),
@@ -406,6 +409,7 @@ fn checkout_does_not_delete_a_local_only_directory_to_place_a_file() {
         assert!(child.wait_with_output().unwrap().status.success());
     }
     let out = env.vl(U, &proj, &["new", "t@"]);
+    assert!(out.status.success(), "{}", text(&out));
     assert!(
         proj.join("private/notes.md").is_file() && read(&proj, "private/notes.md") == "my private notes\n",
         "the isolated directory was deleted by the checkout ({})",

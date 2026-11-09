@@ -378,7 +378,7 @@ fn bug_1125_renormalize_waits_for_a_live_move_of_the_directory() {
     drop(l_default);
     let out = child.wait_with_output().unwrap();
     let t = text(&out);
-    assert!(blocked, "{t}");
+    assert!(blocked && out.status.success(), "{t}");
     assert!(!recorded_meanwhile, "renormalize recorded the directory while another `vl` held its lock: {t}");
     assert!(
         !env.vl("alice", &proj, &["cat", "-r", "other@", "d.txt"]).status.success(),
@@ -435,8 +435,8 @@ fn bug_1126_finish_prints_the_merge_it_wrote() {
     let out = child.wait_with_output().unwrap();
     let mut t = text(&out);
     assert!(blocked && out.status.success(), "{t}");
-    t.push_str(&text(&env.vl("alice", &proj, &["--no-snapshot", "log"])));
-    t.push_str(&text(&env.vl("alice", &proj, &["status"])));
+    t.push_str(&env.ok("alice", &proj, &["--no-snapshot", "log"]));
+    t.push_str(&env.ok("alice", &proj, &["status"]));
     assert!(t.contains("moved by concurrent commands"), "the merge's warning was never printed: {t}");
 }
 
