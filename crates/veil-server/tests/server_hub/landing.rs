@@ -4439,3 +4439,79 @@ fn every_route_naming_a_snapshot_seen_whole_under_a_hidden_only_tip_is_made_on_t
         }
     }
 }
+
+/// Guarantee 3, the bound (BUG-1579, BUG-1547's class): `Ancestry::landed`
+/// projects at most 16 of the landed revision's recorded history
+/// (`RELATED_LIMIT`) to relate it to a change, and answers "not landed" past
+/// them, so the order of a predecessor list decides whether a change lands
+/// twice. The admin's change F (`src/f.rs` and a billing file) is on `f1`;
+/// the dev sees it as F' (in part). The admin lands S, a revision of F (its
+/// change id) whose predecessors name F first, or after 16 pushed
+/// snapshots. The dev amends F' (its edit moved to another file) and lands
+/// it: refused "already landed … with other edits" when F is named first
+/// (the raw ids differ, F projects to F'); with F named 17th, F's change
+/// lands twice.
+#[test]
+#[ignore = "BUG-1579: a landed revision whose recorded history names the change past the 16th entry is taken as unrelated to it, and a revision of the change lands again"]
+fn bug_1579_a_revision_of_a_landed_change_is_refused_however_long_the_landed_revision_s_predecessor_list() {
+    for f_first in [true, false] {
+        let hub = TestHub::start();
+        let p = setup_project(&hub);
+        let pid = project_id(&hub, &p.name);
+        let api = hub.api();
+        let main0 = Craft::new(&api, &p.admin, &p.name, "main").tip;
+        // The dev's crafter, rooted at main as it is now (before S lands).
+        let mut d = Craft::new(&api, &p.dev, &p.name, "main");
+        let dev_main0 = d.tip;
+        // 16 stored snapshots on a branch of their own.
+        let z_tip = push_chain(&api, &p.admin, &p.name, "zs", "main", 16, Some("src/zs"));
+        let mut zs = Vec::new();
+        let src = source(&hub, pid);
+        let mut z = z_tip;
+        while z != main0 {
+            zs.push(z);
+            z = src.snapshot(&z).unwrap().parents[0];
+        }
+        assert_eq!(zs.len(), 16);
+        // F: src/f.rs and a billing file, on f1; the dev sees it in part.
+        let cid = veil_core::ChangeId::random();
+        let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+        c.file("src/f.rs", "f\n");
+        c.file(&format!("{BILL_DIR}/acme/f.txt"), "f\n");
+        let f = snap_at(&mut c, main0, cid, "F", veil_core::now_millis(), vec![]);
+        let r = push_new(&c, &[("f1", f)]);
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        let seen_f = Craft::new(&api, &p.dev, &p.name, "f1").tip;
+        assert_ne!(seen_f, f, "the dev sees F in part");
+        // S: the same edits, a revision of F whose predecessor list names F
+        // first or 17th; landed by the admin.
+        let mut preds = zs.clone();
+        if f_first {
+            preds.insert(0, f);
+        } else {
+            preds.push(f);
+        }
+        let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+        c.file("src/f.rs", "f\n");
+        c.file(&format!("{BILL_DIR}/acme/f.txt"), "f\n");
+        let s = snap_at(&mut c, main0, cid, "S", veil_core::now_millis(), preds);
+        let r = push_new(&c, &[("s", s)]);
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        let v = land_held(&api, &p.admin.token(), &p.name, s, true).json();
+        assert_eq!(v["state"], "landed", "{v}");
+        let tip = real_tip(&hub, pid);
+        // The dev's revision of F as they see it: its edit moved to another
+        // file (no path of S's, so nothing conflicts with S on main).
+        d.file("src/more.rs", "f\n");
+        let x = snap_at(&mut d, dev_main0, cid, "F, amended", veil_core::now_millis(), vec![seen_f]);
+        let r = push_new(&d, &[("x", x)]);
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        let r = land_held(&api, &p.dev.token(), &p.name, x, true);
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        assert_eq!(r.status, 400, "F named first: {f_first}: {body}");
+        assert!(body.contains("already landed") && body.contains("make a new change for the further edits"), "F named first: {f_first}: {body}");
+        assert_eq!(real_tip(&hub, pid), tip, "F named first: {f_first}: {body}");
+        let ids: Vec<_> = chain(&hub, pid, main0).into_iter().map(|(_, s)| s.change_id).collect();
+        assert_eq!(ids.iter().filter(|i| **i == cid).count(), 1, "F named first: {f_first}: F's change is on main twice");
+    }
+}
