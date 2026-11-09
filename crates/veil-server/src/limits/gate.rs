@@ -48,6 +48,10 @@ struct State {
     /// Waiting requests by class, each with its ticket.
     queues: [VecDeque<(u64, oneshot::Sender<()>, tokio::time::Instant)>; 3],
     next: u64,
+    /// The last place went to an aged pull: the next goes by the normal
+    /// order, so aged pulls and landings alternate and neither starves the
+    /// other (BUG-1630).
+    aged_turn: bool,
 }
 
 impl State {
@@ -93,21 +97,23 @@ impl Gate {
         Enter::Wait(t, rx)
     }
 
-    /// Give a place back: to a pull that has waited [`AGE`], else the
-    /// first waiting landing, else pull, else search; `true` if the gate is
-    /// now idle.
+    /// Give a place back: to a pull that has waited [`AGE`] (unless the last
+    /// place went to one: then by the normal order), else the first waiting
+    /// landing, else pull, else search; `true` if the gate is now idle.
     fn leave(&self) -> bool {
         let mut s = self.state.lock().unwrap();
         let read = Class::Read as usize;
-        let aged = s.queues[read].front().is_some_and(|(_, _, at)| at.elapsed() >= AGE);
+        let aged = !s.aged_turn && s.queues[read].front().is_some_and(|(_, _, at)| at.elapsed() >= AGE);
         let order: &[usize] = if aged { &[read, 2, 1, 0] } else { &[2, 1, 0] };
         for &c in order {
             while let Some((_, tx, _)) = s.queues[c].pop_front() {
                 if tx.send(()).is_ok() {
+                    s.aged_turn = aged && c == read;
                     return false;
                 }
             }
         }
+        s.aged_turn = false;
         s.running -= 1;
         s.running == 0
     }
@@ -391,7 +397,6 @@ mod tests {
     /// landings: a landing waits for at most a few pulls' turns, not for
     /// the stream to end.
     #[tokio::test(start_paused = true)]
-    #[ignore = "BUG-1630: a stream of aged pulls takes every free place; a landing waits behind all of them"]
     async fn a_stream_of_aged_pulls_does_not_starve_landings() {
         let g = Gate::new(1);
         let held = g.place(Class::Write, soon(10)).await.unwrap();
