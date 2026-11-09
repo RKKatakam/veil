@@ -158,6 +158,11 @@ pub struct Materialised {
     /// what it may still find of that version on disk once the folder is
     /// readable again is its own copy (BUG-1531).
     left: BTreeMap<VPath, ObjectId>,
+    /// Hidden folders the checkout left out because the server refused
+    /// them (BUG-1508): only these are written once readable again. Any
+    /// other hidden folder (a one-directory clone's) is never fetched or
+    /// written by checkout (BUG-1566).
+    refused: BTreeSet<VPath>,
     /// Files below such a folder, written back once it was readable again,
     /// where the working copy held the person's own edit of the version
     /// left: kept, and a conflict for `vl status` until written over.
@@ -179,6 +184,8 @@ struct MaterialisedRaw {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     left: BTreeMap<String, ObjectId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    refused: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     kept_edits: Vec<String>,
 }
 
@@ -199,6 +206,7 @@ impl TryFrom<MaterialisedRaw> for Materialised {
                 .collect::<std::result::Result<_, String>>()?,
             crlf: r.crlf.iter().map(|s| path(s)).collect::<std::result::Result<_, _>>()?,
             left: r.left.iter().map(|(s, id)| Ok((path(s)?, *id))).collect::<std::result::Result<_, String>>()?,
+            refused: r.refused.iter().map(|s| path(s)).collect::<std::result::Result<_, _>>()?,
             kept_edits: r.kept_edits.iter().map(|s| path(s)).collect::<std::result::Result<_, _>>()?,
         })
     }
@@ -212,6 +220,7 @@ impl From<Materialised> for MaterialisedRaw {
             fallback: m.fallback.into_iter().map(|(p, id)| (p.as_str().to_string(), id)).collect(),
             crlf: m.crlf.into_iter().map(|p| p.as_str().to_string()).collect(),
             left: m.left.into_iter().map(|(p, id)| (p.as_str().to_string(), id)).collect(),
+            refused: m.refused.into_iter().map(|p| p.as_str().to_string()).collect(),
             kept_edits: m.kept_edits.into_iter().map(|p| p.as_str().to_string()).collect(),
         }
     }
@@ -242,7 +251,7 @@ impl Materialised {
 
     /// Nothing hidden, nothing from a fallback, nothing converted.
     pub fn is_empty(&self) -> bool {
-        self.view.is_none() && self.hidden.is_empty() && self.fallback.is_empty() && self.crlf.is_empty() && self.left.is_empty() && self.kept_edits.is_empty()
+        self.view.is_none() && self.hidden.is_empty() && self.fallback.is_empty() && self.crlf.is_empty() && self.left.is_empty() && self.refused.is_empty() && self.kept_edits.is_empty()
     }
 
     /// Did checkout write the file at `path` with CRLF line endings for
@@ -313,6 +322,7 @@ impl Materialised {
             while let Some(d) = up.filter(|d| !d.is_root()) {
                 self.hidden.remove(&d);
                 self.left.remove(&d);
+                self.refused.remove(&d);
                 up = d.parent();
             }
             self.fallback.remove(&c.path);
@@ -364,7 +374,7 @@ impl Materialised {
                 Lookup::Unreadable => {}
                 // A folder left out because the server refused it
                 // (BUG-1508): written once it is readable again.
-                Lookup::Entry(e) if e.kind == EntryKind::Dir => match store.tree(&e.id) {
+                Lookup::Entry(e) if e.kind == EntryKind::Dir && self.refused.contains(&p) => match store.tree(&e.id) {
                     Ok(_) => {
                         // What is on disk of the version the folder was left
                         // from is the checkout's own copy where it still
@@ -410,6 +420,7 @@ impl Materialised {
                             }
                         }
                         self.left.remove(&p);
+                        self.refused.remove(&p);
                         self.hidden.remove(&p);
                     }
                     Err(err) if refused_tree(store, &err) => {}
@@ -500,6 +511,7 @@ pub fn checkout_recorded(
     // The version each folder was left from, for when it is readable again
     // (BUG-1531); one left before keeps the version it was left from.
     for (p, old) in left_out {
+        record.refused.insert(p.clone());
         if let Some(old) = old {
             record.left.entry(p).or_insert(old);
         }
