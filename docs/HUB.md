@@ -3071,10 +3071,17 @@ vl daemon status | start [--cache-size SIZE] | stop
 * **One per Veil home.** By default one per OS user: the socket in
   `$XDG_RUNTIME_DIR/veil/daemon.sock` (else `~/.cache/veil/daemon/run/`),
   the store and state in `~/.cache/veil/daemon/`; with `VEIL_HOME` set,
-  all of it in `$VEIL_HOME/daemon/`. Every directory is made 0700 (a wider
-  one of this user's is narrowed; one of another user's is refused), the
-  socket 0600, and every connection's peer uid (`SO_PEERCRED`,
-  `getpeereid`) must be the daemon's. A lock keeps one daemon per home.
+  all of it in `$VEIL_HOME/daemon/` (made absolute, and passed so to the
+  daemon it starts). The XDG variables count only as the XDG rules allow:
+  absolute (an empty or relative one is unset), and `XDG_RUNTIME_DIR` only
+  when it is a folder of this user's with mode 0700, else the socket goes
+  in the daemon's own folder; `HOME` only when absolute, else the
+  account's (BUG-1515). Every directory is made 0700 (a wider one of this
+  user's is narrowed; one of another user's is refused), the socket 0600,
+  and **both ends check the other's uid** (`SO_PEERCRED`, `getpeereid`): the
+  daemon serves only its own user, and a `vl` sends nothing to a socket
+  another user listens on (BUG-1515: its signed requests could be
+  replayed for ±5 minutes). A lock keeps one daemon per home.
 * **On by default** (decision 5): a thin clone's `vl` starts it (`vl
   daemon run`, detached, its errors to `daemon.log`) the first time it
   reads through it, and waits at most 2 s for its socket. **`vl daemon
@@ -3099,10 +3106,15 @@ vl daemon status | start [--cache-size SIZE] | stop
   commands (`vl ws exec`) see neither the socket nor the store**: the
   daemon's folders are Veil's own private folders, listed with the Veil
   home in one place (`ctx::veil_private_dirs`), which the confinement
-  hides wherever a sandbox could show them (under every allowed path or
-  seed that holds them, an allowed path inside one refused) and Veil's
-  sandboxes never write through a link into (BUG-1512: `--allow
-  ~/.cache` showed the store, which is outside the Veil home by default).
+  never shows: an allowed folder or seed that holds one, as named or
+  resolved (`--allow ~/.cache`, `--allow ~`), is refused, naming narrower
+  folders to allow, and so is an allowed path inside one (BUG-1512:
+  `--allow ~/.cache` showed the store; BUG-1516: a mask covers a folder
+  as it is at the start, so one removed and made again during a run
+  showed through; refusing by name holds for the whole run). Veil's
+  sandboxes never write through a link into one. **Residual
+  (BUG-1519):** a second mount of a folder that holds them (made by root)
+  is not known by name, and an allowed path through it shows them.
 
 #### The decision, per request
 
@@ -3202,19 +3214,26 @@ returns no object.
   325 MiB peak in the test below; after: 69 MiB).
 * **Time:** a request within 20 s of connecting, each write within 30 s;
   to the server, connecting within 5 s and each read within 30 s. The
-  daemon acknowledges a request as soon as it has read it; a client waits
-  at most 0.5 s for that and 35 s between two messages of an answer.
-  **A daemon that fails a process once** (no acknowledgement, an answer
-  that stalls, ends unfinished or sends what was not asked, another
-  version) **is not asked again by that process**, which reads from the
-  server (BUG-1514: a stalled daemon cost every request a full wait, a
-  small clone 184 s; now one wait of 0.5 s).
+  daemon acknowledges a request as soon as it has read it, then sends a
+  progress message every 0.1 s until its answer ends (its store, the
+  server and its budgets may each take long). **One rule for the client:
+  any gap of more than 0.5 s** (before the acknowledgement or between any
+  two messages, pins and status included) **marks the daemon failed for
+  the process**, which reads from the server from then on, as it does for
+  an answer that ends unfinished, sends what was not asked, or another
+  version (BUG-1514: a stalled daemon cost every request a full wait, a
+  small clone 184 s; BUG-1518: one that acknowledged and then stalled
+  cost every process 35 s, `vl status` 36.6 s; now 0.5 s once: a clone
+  0.9 s, `vl status` 0.7 s).
 * **Versions:** every request names the socket protocol's version and every
   acknowledgement the daemon's (`proto::PROTOCOL`, now 1). A daemon serves
   nothing to a request of another version (`426` with its own); a `vl`
   that meets a daemon of another version reads from the server, and stops
-  an older one (the empty stop message is the same in every version), so
-  the next `vl` starts its own.
+  an older one, so the next `vl` starts its own. The stop message is the
+  same in every version: empty, it stops any daemon (`vl daemon stop`);
+  naming the sender's version, it stops only a daemon of an older one, so
+  a stop meant for an older daemon never stops the newer one that
+  replaced it meanwhile (BUG-1517).
 
 #### Guarantees and their tests (`server_hub::daemon`)
 
@@ -3229,7 +3248,8 @@ returns no object.
 | 6 | Its socket and store are its user's alone (0700, 0600; a 0777 directory narrowed); a damaged object in its store is never served | `the_daemons_socket_and_store_are_its_users_alone` |
 | — | Warm trees: a new tip's trees to depth 3 in the store with no reader, nothing deeper; a new clone reads them from the store | `the_daemon_keeps_the_top_trees_of_followed_projects_warm` |
 | — | It never outlives its Veil home: exits within a second once the identity is gone; in a removed home, `vl daemon run` and `start` refuse and make nothing; nor does keeping an object | `the_daemon_never_outlives_its_veil_home`, `daemon::store::tests::keeping_an_object_never_makes_a_removed_veil_home_again` (BUG-1513) |
-| — | A stalled daemon costs a process one short wait; a `vl` and a daemon of other versions agree | `a_stalled_daemon_costs_a_vl_at_most_one_wait` (BUG-1514), `a_vl_and_a_daemon_of_other_versions_agree` |
+| — | A stalled daemon costs a process one short wait, before or after its acknowledgement; a `vl` and a daemon of other versions agree, and a stop never reaches a newer daemon | `a_stalled_daemon_costs_a_vl_at_most_one_wait` (BUG-1514), `s6r2_a_daemon_that_stalls_after_its_acknowledgement_costs_a_vl_one_short_wait` (BUG-1518), `a_vl_and_a_daemon_of_other_versions_agree`, `s6r2_stopping_an_older_daemon_never_stops_the_one_that_replaced_it` (BUG-1517) |
+| — | The daemon's place follows the XDG rules; a `vl` asks only its own user's daemon | `s6r2_an_empty_xdg_variable_never_puts_the_daemon_where_vl_runs`; `s6r2_a_vl_never_asks_another_os_users_daemon` (needs root) (BUG-1515) |
 
 #### Threat review (design §6 rows 1–5, 8, 9, 14, 15, 18, plus this milestone's)
 
@@ -3239,7 +3259,8 @@ returns no object.
 | 2 | Same | a real grant with a chain through another snapshot's or the admin's trees | chains start at the grant's root, each step from the hash-checked store | guarantee 1 |
 | 3 | A same-user process | hands the daemon its own grant key and a grant it signed | no such field: the daemon checks under the key it fetched from the server | by construction; guarantee 1 (a grant signed by another key) |
 | 4 | A person or device removed | keeps using a grant | refused within 5 s | guarantee 2 |
-| 5 | A sandboxed agent (`vl ws exec`) | connects to the socket, reads the store, also through an allowed folder that holds them (`--allow ~/.cache`) | both hidden as the Veil home is, wherever the sandbox could show them (BUG-1512); without the device key it could not sign a request anyway | `cli_workspaces` `confine_cli::the_daemons_store_and_socket_stay_hidden_when_an_allowed_folder_holds_them` |
+| 5 | A sandboxed agent (`vl ws exec`) | connects to the socket, reads the store, also through an allowed folder that holds them (`--allow ~/.cache`), or after the folder is removed and made again during the run | an allowed folder or seed holding one of Veil's folders is refused, so none is ever shown (BUG-1512, BUG-1516); a second mount made by root is residual (BUG-1519); without the device key it could not sign a request anyway | `cli_workspaces` `confine_cli::the_daemons_store_and_socket_stay_hidden_when_an_allowed_folder_holds_them`, `s6r2_the_daemons_folders_stay_hidden_by_every_route`, `s6r2_a_daemon_folder_made_again_during_a_run_stays_hidden` |
+| 5b | Another OS user | listens first at the daemon's socket path (a shared `XDG_RUNTIME_DIR`) | a `vl` checks its peer's uid and sends nothing; a runtime folder not this user's 0700 one is not used (BUG-1515) | `s6r2_a_vl_never_asks_another_os_users_daemon` (needs root) |
 | 6 | Another OS user | connects to the socket, reads the store | the directories are 0700 and the peer's uid is checked | guarantee 6 (modes; a second uid needs root to test) |
 | 7 | A local process, a torn write | changes bytes in the store | the object fails its id check, is removed, comes from the server | guarantee 6, `store::tests` |
 | 8 | A lying or broken daemon (a same-user process on its socket) | answers nothing, wrong bytes, another object, one object without end | the client checks each object's id, that it was asked for and arrives once; the rest from the server | guarantee 5 |

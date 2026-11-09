@@ -258,7 +258,8 @@ vl daemon start [--cache-size 8G]  turn it on again (default size: 20 GiB or a t
 - **It is yours alone**: its socket and cache are in folders only your OS
   user can open (`$XDG_RUNTIME_DIR/veil/` and `~/.cache/veil/daemon/`, or
   `$VEIL_HOME/daemon/`), and it refuses connections from other users.
-  Commands run with `vl ws exec` cannot see either. Secret files are in its
+  Commands run with `vl ws exec` cannot see either: an `--allow` of a
+  folder that holds them (`~/.cache`, `~`) is refused. Secret files are in its
   cache only as ciphertext. People who must not read each other's files
   need separate OS users, as for any file on the machine.
 - **It is bounded**: least recently used objects go first when the cache

@@ -596,6 +596,27 @@ impl Confine {
     }
 }
 
+/// A suggestion of narrower `--allow`s for allowed folder `dest` (resolved:
+/// `src`) that holds Veil's private folder `private`: up to three of its
+/// other entries.
+fn narrower(dest: &Path, src: &Path, private: &Path) -> String {
+    let on_the_way = private.strip_prefix(src).ok().and_then(|r| r.components().next()).map(|c| c.as_os_str().to_owned());
+    let mut others: Vec<String> = std::fs::read_dir(src)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name())
+        .filter(|n| Some(n) != on_the_way.as_ref())
+        .map(|n| dest.join(n).to_string_lossy().into_owned())
+        .collect();
+    others.sort();
+    others.truncate(3);
+    match others.is_empty() {
+        true => String::new(),
+        false => format!(" (for example {})", others.iter().map(|o| format!("--allow {}", safe(o))).collect::<Vec<_>>().join(" ")),
+    }
+}
+
 /// The default allow-list under `home`, as `(path, explicit)`. None
 /// without a usable `HOME`: the stand-in `/tmp/home` is anyone's to create.
 fn default_allow(home: Option<&Path>) -> Vec<(PathBuf, bool)> {
@@ -894,13 +915,10 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], seeds:
     push(&["--tmpfs".as_ref(), home.as_os_str()]);
     // Veil's own state (the Veil home, the daemon's folders: one list,
     // `ctx::veil_private_dirs`), as named and resolved.
-    let private: Vec<(PathBuf, PathBuf)> = crate::ctx::veil_private_dirs()
-        .into_iter()
-        .filter_map(|v| {
-            let real = v.canonicalize().ok().filter(|r| r.is_dir() && r != Path::new("/"))?;
-            Some((v, real))
-        })
-        .collect();
+    let vh = crate::ctx::veil_home();
+    let named: Vec<(PathBuf, Option<PathBuf>)> =
+        crate::ctx::veil_private_dirs().into_iter().map(|v| (v.clone(), v.canonicalize().ok().filter(|r| r != Path::new("/")))).collect();
+    let private: Vec<(PathBuf, PathBuf)> = named.iter().filter_map(|(v, r)| Some((v.clone(), r.clone().filter(|r| r.is_dir())?))).collect();
     // What an allowed path may not be inside of.
     let inside: Vec<(&Path, &str)> = private
         .iter()
@@ -931,6 +949,27 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], seeds:
                     false => continue 'allow,
                 }
             }
+        }
+        // A folder that holds one of Veil's own, as named or resolved, is
+        // never shown (BUG-1516): a mask covers a folder as it is at the
+        // start, and one removed and made again during the run (the
+        // daemon's, in a cleared `~/.cache`) would show through. Refused
+        // by name, for the whole run.
+        for (v, real) in &named {
+            let held = real.as_ref().is_some_and(|r| r.starts_with(&src)) || normal(v).is_some_and(|n| n.starts_with(&dest) || n.starts_with(&src));
+            if !held {
+                continue;
+            }
+            if !*explicit {
+                continue 'allow;
+            }
+            let what = if *v == vh { "the Veil home" } else { "the Veil daemon's folder" };
+            bail!(
+                "--allow {}: that folder holds {what} ({}), which stays hidden from the command; allow only the folders inside it that the command needs{}",
+                safe(&p.to_string_lossy()),
+                safe(&v.to_string_lossy()),
+                narrower(&dest, &src, real.as_deref().unwrap_or(v))
+            );
         }
         if bound.iter().any(|(d, _)| *d == dest) {
             continue;

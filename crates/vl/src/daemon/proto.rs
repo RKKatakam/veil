@@ -15,7 +15,10 @@
 //! status 426 and its version, and serves nothing. A `vl` that meets a
 //! daemon of another version reads from the server for the rest of the
 //! process; one newer than the daemon stops it ([`S`], the one message every
-//! version keeps as it is: an empty stop), so the next `vl` starts its own.
+//! version keeps as it is, naming the sender's version: only an older
+//! daemon obeys it), so the next `vl` starts its own. While it works on an
+//! answer the daemon sends [`P`] every 0.1 s; a client waits at most 0.5 s
+//! for any message.
 
 use std::io::{Read, Write};
 
@@ -30,8 +33,14 @@ pub const Q: u8 = b'Q';
 /// The acknowledgement, sent as soon as a request is read: the daemon's
 /// version.
 pub const A: u8 = b'A';
-/// Stop, empty: the same in every version.
+/// Stop: the same in every version. Empty, it stops any daemon (`vl
+/// daemon stop`); with one byte, the sender's version, it stops only a
+/// daemon of an older one (BUG-1517).
 pub const S: u8 = b'S';
+/// Progress, empty: the daemon is working on the answer (sent every 0.1 s
+/// until it ends; a client takes any gap of more than 0.5 s for a failed
+/// daemon, BUG-1518).
+pub const P: u8 = b'P';
 /// One object: its id (32 bytes), then its bytes.
 pub const O: u8 = b'O';
 /// The end of a whole answer (JSON: [`Head`]).

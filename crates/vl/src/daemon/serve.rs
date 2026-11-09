@@ -100,6 +100,8 @@ pub const MEMORY: u64 = REQUESTS + TREES + ANSWERS;
 /// 30 s.
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often a connection says it is still working on its answer.
+const PROGRESS: Duration = Duration::from_millis(100);
 /// Slices an oversized object from the server is skipped in.
 const SLICE: usize = 64 << 10;
 
@@ -484,7 +486,12 @@ impl Daemon {
         let (kind, len) = proto::read_head(&mut s, MAX_REQUEST)?;
         match kind {
             proto::S => {
-                self.stop_now();
+                // Empty: any daemon stops (`vl daemon stop`); naming the
+                // sender's version: only an older daemon (BUG-1517).
+                let sender = proto::read_payload(&mut s, len.min(1))?;
+                if sender.first().is_none_or(|v| proto::PROTOCOL < *v) {
+                    self.stop_now();
+                }
                 return Ok(());
             }
             proto::Q => {}
@@ -495,17 +502,30 @@ impl Daemon {
         let Some((&version, json)) = payload.split_first() else { bail!("an empty request") };
         // At once: a client that hears nothing soon asks the server instead.
         proto::write_msg(&mut s, proto::A, &[proto::PROTOCOL])?;
-        let mut w = BufWriter::with_capacity(SLICE, s);
+        let w = Arc::new(Out { w: Mutex::new(BufWriter::with_capacity(SLICE, s)) });
         if version != proto::PROTOCOL {
-            return end(&mut w, &Head { status: Some(426), body: Some(json!({ "version": proto::PROTOCOL })), ..Default::default() });
+            return w.end(&Head { status: Some(426), body: Some(json!({ "version": proto::PROTOCOL })), ..Default::default() });
         }
+        // Progress every 0.1 s until the answer ends (BUG-1518: a client
+        // takes any longer gap for a failed daemon).
+        let (working, done) = std::sync::mpsc::channel::<()>();
+        let beat = w.clone();
+        std::thread::Builder::new().stack_size(64 << 10).spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = done.recv_timeout(PROGRESS) {
+                if beat.progress().is_err() {
+                    break;
+                }
+            }
+        })?;
+        let _working = working;
         let req: Request = serde_json::from_slice(json)?;
+        let w = &*w;
         match req {
             Request::Batch { upstream, project, batch } => {
                 self.stats.requests.fetch_add(1, Ordering::Relaxed);
                 self.last_used.store(now(), Ordering::Relaxed);
-                let head = self.batch(&mut w, &upstream, &project, batch)?;
-                end(&mut w, &head)?;
+                let head = self.batch(w, &upstream, &project, batch)?;
+                w.end(&head)?;
             }
             Request::Pin { upstream, project, key, roots } => {
                 self.last_used.store(now(), Ordering::Relaxed);
@@ -514,13 +534,13 @@ impl Daemon {
                     true => None,
                     false => Some(400),
                 };
-                end(&mut w, &Head { status, body: None, ..Default::default() })?;
+                w.end(&Head { status, body: None, ..Default::default() })?;
             }
             Request::Follows => {
                 let f: Vec<(String, String)> = self.follows.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
-                end(&mut w, &Head { status: None, body: Some(json!(f)), ..Default::default() })?;
+                w.end(&Head { status: None, body: Some(json!(f)), ..Default::default() })?;
             }
-            Request::Status => end(&mut w, &Head { status: None, body: Some(self.status()), ..Default::default() })?,
+            Request::Status => w.end(&Head { status: None, body: Some(self.status()), ..Default::default() })?,
         }
         Ok(())
     }
@@ -561,7 +581,7 @@ impl Daemon {
 
     /// Answer a batch: what the store may serve, then what the server
     /// sends for the rest. Returns the answer's end.
-    fn batch(&self, w: &mut impl Write, authority: &str, project: &str, req: BatchRequest) -> Result<Head> {
+    fn batch(&self, w: &Out, authority: &str, project: &str, req: BatchRequest) -> Result<Head> {
         if !valid_authority(authority) || !valid_project(project) || req.wants.len() > MAX_WANTS || req.skip.len() > MAX_WANTS {
             return Ok(Head { status: Some(400), body: None, ..Default::default() });
         }
@@ -575,7 +595,7 @@ impl Daemon {
             let k = store::key(authority, project, &id);
             let _share = self.answers.take(size);
             if let Some(raw) = self.store.read(&k, &id) {
-                proto::write_object(w, &id, &raw)?;
+                w.object(&id, &raw)?;
                 sent.insert(id);
                 self.stats.from_store.fetch_add(1, Ordering::Relaxed);
             }
@@ -635,7 +655,7 @@ impl Daemon {
 
     /// Pass the request on to the server, as the client signed it, leaving
     /// out what was sent; check, keep and pass on what it sends.
-    fn forward(&self, w: &mut impl Write, up: &Upstream, project: &str, req: BatchRequest, checked: Option<&EpochKey>, sent: &HashSet<ObjectId>) -> Result<Head> {
+    fn forward(&self, w: &Out, up: &Upstream, project: &str, req: BatchRequest, checked: Option<&EpochKey>, sent: &HashSet<ObjectId>) -> Result<Head> {
         self.stats.forwarded.fetch_add(1, Ordering::Relaxed);
         let wanted: HashSet<ObjectId> = req.wants.iter().map(|w| w.id).collect();
         let mut skip = req.skip.clone();
@@ -696,7 +716,7 @@ impl Daemon {
                 bail!("the server sent an object that does not match its id");
             }
             self.store.put(&store::key(&up.authority, project, &id), &id, &raw);
-            proto::write_object(w, &id, &raw)?;
+            w.object(&id, &raw)?;
             self.stats.from_upstream.fetch_add(1, Ordering::Relaxed);
         }
         Ok(Head::default())
@@ -808,8 +828,32 @@ fn read_full(r: &mut impl Read, buf: &mut [u8]) -> Result<usize> {
     Ok(n)
 }
 
-fn end(w: &mut BufWriter<UnixStream>, head: &Head) -> Result<()> {
-    proto::write_msg(w, proto::E, &serde_json::to_vec(head)?)?;
-    w.flush()?;
-    Ok(())
+/// A connection's answer, written a whole message at a time: by its
+/// request's thread, and a progress message every [`PROGRESS`] by a thread
+/// of its own, never inside another message.
+struct Out {
+    w: Mutex<BufWriter<UnixStream>>,
+}
+
+impl Out {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BufWriter<UnixStream>> {
+        self.w.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn object(&self, id: &ObjectId, raw: &[u8]) -> std::io::Result<()> {
+        proto::write_object(&mut *self.lock(), id, raw)
+    }
+
+    fn progress(&self) -> std::io::Result<()> {
+        let mut w = self.lock();
+        proto::write_msg(&mut *w, proto::P, &[])?;
+        w.flush()
+    }
+
+    fn end(&self, head: &Head) -> Result<()> {
+        let mut w = self.lock();
+        proto::write_msg(&mut *w, proto::E, &serde_json::to_vec(head)?)?;
+        w.flush()?;
+        Ok(())
+    }
 }

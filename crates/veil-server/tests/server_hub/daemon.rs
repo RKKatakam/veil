@@ -73,6 +73,8 @@ fn ask_as(s: &mut UnixStream, version: u8, req: &serde_json::Value) -> (Vec<(Obj
                 assert_eq!(payload, [PROTOCOL], "the daemon's version");
                 acked = true;
             }
+            // Progress, while the daemon works (every 0.1 s).
+            b'P' => assert!(acked, "progress before the acknowledgement"),
             b'O' => {
                 assert!(acked, "an object before the acknowledgement");
                 let id = ObjectId(payload[..32].try_into().unwrap());
@@ -1120,6 +1122,19 @@ fn a_vl_and_a_daemon_of_other_versions_agree() {
     let end: serde_json::Value = serde_json::from_slice(&all[11..]).unwrap();
     assert_eq!((all[6], end["status"].as_u64(), end["body"]["version"].as_u64()), (b'E', Some(426), Some(PROTOCOL as u64)), "{end}");
     assert_eq!(r.batch(&[(Vec::new(), r.root())]).len(), 1, "a request of this version is still served");
+    // A stop naming this version (meant for an older daemon) is ignored;
+    // an empty one (`vl daemon stop`) stops it (BUG-1517).
+    let pid = d.pid();
+    let mut s = UnixStream::connect(&d.socket).unwrap();
+    s.write_all(&[b'S', 0, 0, 0, 1, PROTOCOL]).unwrap();
+    drop(s);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(d.pid(), pid, "a stop meant for an older daemon stopped this one");
+    let mut s = UnixStream::connect(&d.socket).unwrap();
+    s.write_all(&[b'S', 0, 0, 0, 0]).unwrap();
+    drop(s);
+    until(Duration::from_secs(5), "an empty stop stops the daemon", || UnixStream::connect(&d.socket).is_err());
+    let d = Daemon::start(who, None);
     // An older daemon: acknowledges with version 0. The clone stops it
     // (the empty `S`, the same in every version) and reads from the server.
     who.ok(who.home.path(), &["daemon", "stop"]);
@@ -1245,7 +1260,6 @@ fn s6r2_take_socket(who: &Person) -> Daemon {
 /// stop) another `vl` stopped that daemon and started one of this version
 /// at the same socket. The stop must not reach the newer daemon.
 #[test]
-#[ignore = "BUG-1517: the stop of an older daemon is sent on a new connection, to whatever daemon then holds the socket"]
 fn s6r2_stopping_an_older_daemon_never_stops_the_one_that_replaced_it() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1286,8 +1300,12 @@ fn s6r2_stopping_an_older_daemon_never_stops_the_one_that_replaced_it() {
             };
             s.set_nonblocking(false).unwrap();
             s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let Some((k, _)) = s6r2_read_msg(&mut s) else { continue };
-            kinds.push(k);
+            let Some((k, payload)) = s6r2_read_msg(&mut s) else { continue };
+            // A stop a daemon of this version obeys: empty, or naming a
+            // newer version than its own (BUG-1517: the stop names its
+            // sender's version, and only an older daemon obeys it).
+            let obeyed = k == b'S' && payload.first().is_none_or(|v| *v > PROTOCOL);
+            kinds.push(if obeyed { b'!' } else { k });
             if k == b'Q' {
                 let _ = s.write_all(&[b'A', 0, 0, 0, 1, PROTOCOL, b'E', 0, 0, 0, 2, b'{', b'}']);
             }
@@ -1302,14 +1320,13 @@ fn s6r2_stopping_an_older_daemon_never_stops_the_one_that_replaced_it() {
     done.store(true, std::sync::atomic::Ordering::SeqCst);
     let kinds = fake.join().unwrap().expect("the clone never asked the daemon");
     assert_eq!(kinds[0], b'Q', "the older daemon was asked first: {kinds:?}");
-    assert!(!kinds[1..].contains(&b'S'), "the stop meant for the older daemon stopped the newer one: {:?}", kinds.iter().map(|k| *k as char).collect::<String>());
+    assert!(!kinds[1..].contains(&b'!'), "the stop meant for the older daemon stopped the newer one: {:?}", kinds.iter().map(|k| *k as char).collect::<String>());
 }
 
 /// Guarantee 3, a daemon that acknowledges and then stalls (its store on a
 /// hung disk, wedged after reading the request, or a same-user process on
 /// its socket that lies): a `vl` waits at most one short wait for it.
 #[test]
-#[ignore = "BUG-1518: a daemon that acknowledges and then stalls costs every vl process 35 s"]
 fn s6r2_a_daemon_that_stalls_after_its_acknowledgement_costs_a_vl_one_short_wait() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1364,7 +1381,7 @@ fn s6r2_a_daemon_that_stalls_after_its_acknowledgement_costs_a_vl_one_short_wait
 /// OS user made `veil/daemon.sock` there first. Needs root, to be another
 /// OS user (the listener runs as `nobody`).
 #[test]
-#[ignore = "BUG-1515: vl sends its signed requests to a daemon socket of another OS user (no peer check on the client side); needs root"]
+#[ignore = "needs root (a second OS user): run it with sudo -E; BUG-1515 is fixed (a vl connects only to a socket its own user listens on)"]
 fn s6r2_a_vl_never_asks_another_os_users_daemon() {
     let root = std::process::Command::new("id").arg("-u").output().unwrap();
     assert_eq!(String::from_utf8_lossy(&root.stdout).trim(), "0", "this reproduction needs root (a second OS user): run it with sudo -E");
@@ -1414,12 +1431,17 @@ fn s6r2_a_vl_never_asks_another_os_users_daemon() {
 /// leave the daemon in its default place, never a folder made where `vl`
 /// happens to run (here a thin clone's working copy).
 #[test]
-#[ignore = "BUG-1515: an empty XDG_CACHE_HOME or XDG_RUNTIME_DIR puts the daemon's folders in the directory vl runs in"]
 fn s6r2_an_empty_xdg_variable_never_puts_the_daemon_where_vl_runs() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
     let who = &p.dev;
-    let home = who.home.path();
+    // A short HOME of its own (the default socket, `~/.cache/veil/daemon/
+    // run/daemon.sock`, must fit a socket address: under a long TMPDIR the
+    // person's home is too long, and no daemon starts); the Veil home stays
+    // the person's (`XDG_CONFIG_HOME`).
+    let short = tempfile::Builder::new().prefix("vh").tempdir_in("/tmp").unwrap();
+    let home = short.path();
+    let config = who.home.path();
     let run = |cwd: &Path, args: &[&str]| {
         let cmd = who.command(cwd, args);
         let o = std::process::Command::new("timeout")
@@ -1429,7 +1451,7 @@ fn s6r2_an_empty_xdg_variable_never_puts_the_daemon_where_vl_runs() {
             .envs(cmd.get_envs().filter_map(|(k, v)| Some((k, v?))))
             .env_remove("VEIL_HOME")
             .env("HOME", home)
-            .env("XDG_CONFIG_HOME", home)
+            .env("XDG_CONFIG_HOME", config)
             .env("XDG_CACHE_HOME", "")
             .env("XDG_RUNTIME_DIR", "")
             .current_dir(cwd)

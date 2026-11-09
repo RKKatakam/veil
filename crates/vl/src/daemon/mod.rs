@@ -68,17 +68,74 @@ impl Paths {
 }
 
 pub fn paths() -> Paths {
-    if let Some(home) = std::env::var_os("VEIL_HOME") {
-        let d = PathBuf::from(&home).join("daemon");
-        return Paths { socket: d.join("sock"), store: d.join("store"), off: d.join("off"), run: d.clone(), state: d, home: Some(PathBuf::from(home)) };
+    if let Some(home) = std::env::var_os("VEIL_HOME").filter(|h| !h.is_empty()) {
+        // Absolute, so that the daemon (started in its own folder) and
+        // every `vl` agree on it.
+        let home = absolute(PathBuf::from(home));
+        let d = home.join("daemon");
+        return Paths { socket: d.join("sock"), store: d.join("store"), off: d.join("off"), run: d.clone(), state: d, home: Some(home) };
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".cache")).join("veil").join("daemon");
-    let run = match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(r) => PathBuf::from(r).join("veil"),
+    let home = user_home().unwrap_or_else(|| PathBuf::from("/nonexistent"));
+    let cache = xdg_var("XDG_CACHE_HOME").unwrap_or_else(|| home.join(".cache")).join("veil").join("daemon");
+    let run = match runtime_dir() {
+        Some(r) => r.join("veil"),
         None => cache.join("run"),
     };
     Paths { socket: run.join("daemon.sock"), store: cache.join("store"), off: cache.join("off"), run, state: cache, home: None }
+}
+
+fn absolute(p: PathBuf) -> PathBuf {
+    match p.is_absolute() {
+        true => p,
+        false => std::env::current_dir().map(|d| d.join(&p)).unwrap_or(p),
+    }
+}
+
+/// A directory an XDG variable names, as the XDG rules take it: set and
+/// absolute; empty or relative counts as unset (BUG-1515: an empty one put
+/// the daemon in whatever directory `vl` ran in).
+fn xdg_var(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).map(PathBuf::from).filter(|p| p.is_absolute())
+}
+
+/// This user's home: `HOME` if absolute, else the account's.
+fn user_home() -> Option<PathBuf> {
+    if let Some(h) = std::env::var_os("HOME").map(PathBuf::from).filter(|p| p.is_absolute()) {
+        return Some(h);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf = vec![0 as libc::c_char; 16 << 10];
+        // SAFETY: `pw` and `buf` are valid for writes of the sizes given;
+        // `res` is set to null or to `pw`.
+        let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut res: *mut libc::passwd = std::ptr::null_mut();
+        let r = unsafe { libc::getpwuid_r(my_uid(), &mut pw, buf.as_mut_ptr(), buf.len(), &mut res) };
+        if r == 0 && !res.is_null() && !pw.pw_dir.is_null() {
+            // SAFETY: `pw_dir` points into `buf`, NUL-terminated.
+            let dir = unsafe { std::ffi::CStr::from_ptr(pw.pw_dir) };
+            let p = PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()));
+            return p.is_absolute().then_some(p);
+        }
+    }
+    None
+}
+
+/// `XDG_RUNTIME_DIR`, only as the XDG rules allow it: absolute, a folder
+/// owned by this user, mode 0700 (BUG-1515: a shared one, `/tmp`, let
+/// another user listen where `vl` connects). Else none: the daemon's
+/// socket then goes in its own folder (`~/.cache/veil/daemon/run`).
+fn runtime_dir() -> Option<PathBuf> {
+    let r = xdg_var("XDG_RUNTIME_DIR")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(&r).ok()?;
+        (m.is_dir() && m.uid() == my_uid() && m.mode() & 0o777 == 0o700).then_some(r)
+    }
+    #[cfg(not(unix))]
+    Some(r)
 }
 
 /// Make `dir` (and its parents) and check it is this user's and no one
@@ -184,6 +241,10 @@ pub(crate) fn spawn_self(args: &[&str], p: &Paths) -> Result<std::process::Child
     let log = std::fs::OpenOptions::new().create(true).append(true).open(p.state.join("daemon.log"))?;
     let mut c = std::process::Command::new(std::env::current_exe()?);
     c.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(log).current_dir(&p.state);
+    // The Veil home as this process resolved it (it runs elsewhere).
+    if let Some(h) = &p.home {
+        c.env("VEIL_HOME", h);
+    }
     // SAFETY: setsid is async-signal-safe.
     unsafe {
         c.pre_exec(|| {
@@ -224,16 +285,26 @@ mod client {
         connect_at(&paths())
     }
 
+    /// A connection to the daemon at `p`'s socket, only if this user's
+    /// process listens there (BUG-1515: whoever listens receives the
+    /// device's signed requests). Every caller goes through it: requests,
+    /// pins, status, stops.
     fn connect_at(p: &Paths) -> Option<UnixStream> {
         let s = UnixStream::connect(&p.socket).ok()?;
+        if super::peer_uid(&s) != Some(super::my_uid()) {
+            return None;
+        }
         s.set_write_timeout(Some(Duration::from_secs(2))).ok()?;
         Some(s)
     }
 
-    /// Stop the running daemon, whatever its version ([`proto::S`]).
-    pub fn stop_running() {
+    /// Stop the running daemon ([`proto::S`]): `older_than` `None` stops
+    /// any (`vl daemon stop`); `Some(v)` only one whose version is older
+    /// than `v` (BUG-1517: the stop meant for an older daemon must not stop
+    /// the newer one that may have replaced it since).
+    pub fn stop_running(older_than: Option<u8>) {
         if let Some(mut s) = connect() {
-            let _ = proto::write_msg(&mut s, proto::S, &[]);
+            let _ = proto::write_msg(&mut s, proto::S, older_than.as_slice());
         }
     }
 
@@ -242,13 +313,13 @@ mod client {
     /// protocol version): the process reads from the server directly from
     /// then on (BUG-1514: a stalled daemon cost every request a full wait).
     static UNUSABLE: AtomicBool = AtomicBool::new(false);
-    /// How long a request waits for the daemon's acknowledgement (it is
-    /// sent as soon as the request is read: a daemon that is stopped,
-    /// wedged or on a hung disk costs this, once).
+    /// The longest a request waits for any message of the daemon's: the
+    /// acknowledgement, an object, the end, or the progress message the
+    /// daemon sends every 0.1 s while it works (its store, the server, its
+    /// budgets). One rule (BUG-1518): any gap longer than this, whatever
+    /// the daemon is doing (stopped, wedged, its store on a hung disk),
+    /// costs the process this once.
     const ACK_WAIT: Duration = Duration::from_millis(500);
-    /// How long a request waits between two messages of an answer: the
-    /// daemon's own wait for the server's next bytes (30 s) and a margin.
-    const BETWEEN: Duration = Duration::from_secs(35);
 
     fn give_up() {
         UNUSABLE.store(true, Ordering::SeqCst);
@@ -302,10 +373,11 @@ mod client {
     /// and asked for), and the answer's end if it arrived (`None`: the
     /// answer is unfinished).
     ///
-    /// A daemon that does not acknowledge within [`ACK_WAIT`], stalls
-    /// [`BETWEEN`] messages, sends anything but what was asked, or speaks
-    /// another version, is not asked again by this process; one older than
-    /// this `vl` is stopped, so the next `vl` starts its own.
+    /// A daemon that leaves a gap of more than [`ACK_WAIT`] before any
+    /// message (its acknowledgement included), sends anything but what was
+    /// asked, or speaks another version, is not asked again by this
+    /// process; one older than this `vl` is stopped, so the next `vl`
+    /// starts its own.
     pub fn request(mut s: UnixStream, req: &Request, wanted: &dyn Fn(&ObjectId) -> bool) -> (Vec<(ObjectId, Vec<u8>)>, Option<Head>) {
         let mut got = Vec::new();
         let Ok(json) = serde_json::to_vec(req) else { return (got, None) };
@@ -320,7 +392,7 @@ mod client {
             Ok((proto::A, v)) if v == [proto::PROTOCOL] => {}
             Ok((proto::A, v)) => {
                 if v.first().is_some_and(|d| *d < proto::PROTOCOL) {
-                    stop_running();
+                    stop_running(Some(proto::PROTOCOL));
                 }
                 give_up();
                 return (got, None);
@@ -329,10 +401,6 @@ mod client {
                 give_up();
                 return (got, None);
             }
-        }
-        if r.get_ref().set_read_timeout(Some(BETWEEN)).is_err() {
-            give_up();
-            return (got, None);
         }
         let mut seen = std::collections::HashSet::new();
         let failed = |got| {
@@ -343,6 +411,7 @@ mod client {
             let Ok((kind, len)) = proto::read_head(&mut r, MAX_OBJECT + 32) else { return failed(got) };
             let Ok(payload) = proto::read_payload(&mut r, len) else { return failed(got) };
             match kind {
+                proto::P => {}
                 proto::O => {
                     let Ok((id, raw)) = proto::object_of(payload) else { return failed(got) };
                     // Never wrong bytes: an object that is not what was
@@ -448,7 +517,7 @@ pub fn run(cmd: &DaemonCmd) -> Result<std::process::ExitCode> {
             DaemonCmd::Stop => {
                 p.prepare()?;
                 std::fs::write(&p.off, b"off\n")?;
-                stop_running();
+                stop_running(None);
                 let t = std::time::Instant::now();
                 while connect().is_some() {
                     if t.elapsed() > std::time::Duration::from_secs(5) {

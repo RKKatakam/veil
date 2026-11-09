@@ -64,7 +64,7 @@ fn via_daemon(socket: &Path, authority: &str, project: &str, batch: &BatchReques
         let mut payload = vec![0u8; u32::from_be_bytes(head[1..].try_into()?) as usize];
         s.read_exact(&mut payload)?;
         match head[0] {
-            b'A' => {}
+            b'A' | b'P' => {}
             b'O' => out.push((ObjectId(payload[..32].try_into()?), payload[32..].to_vec())),
             b'E' => return Ok(out),
             k => bail!("an unknown message {k}"),
