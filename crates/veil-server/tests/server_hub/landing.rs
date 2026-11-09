@@ -4515,3 +4515,52 @@ fn bug_1579_a_revision_of_a_landed_change_is_refused_however_long_the_landed_rev
         assert_eq!(ids.iter().filter(|i| **i == cid).count(), 1, "F named first: {f_first}: F's change is on main twice");
     }
 }
+
+// ---- S17 re-check (s17r7): findings ---------------------------------------------------------
+
+/// BUG-1580 (BUG-1527's class, another route): a recorded predecessor is the
+/// client's choice too, and a projection passes it on as it is. The dev's
+/// change V (change id Cv) names V0, a working-copy snapshot of theirs never
+/// pushed, as its predecessor (as every snapshot `vl` commits does). fin, who
+/// reads `src/` but may write only billing, reads V's predecessors in their
+/// own history and lands a billing-only change S under Cv naming V0 too.
+/// `Ancestry::landed` takes S as a revision of V (they share V0), and the
+/// dev's landing of V is refused ("already landed … with other edits"),
+/// though nothing of V is on main: fin blocks a change they may not write,
+/// as before BUG-1527's fix.
+#[test]
+#[ignore = "BUG-1580: a change landed under someone else's change id, naming their change's predecessor as its own, still blocks theirs"]
+fn bug_1580_a_squat_naming_the_predecessor_of_the_change_it_squats_never_blocks_it() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let mut d = Craft::new(&api, &p.dev, &p.name, "main");
+    let on = d.tip;
+    d.file("src/v.rs", "the dev's\n");
+    let cid = veil_core::ChangeId::random();
+    let v0 = local_only(&d, on, cid, "V, working copy", vec![]);
+    let v = snap_at(&mut d, on, cid, "V", veil_core::now_millis(), vec![v0]);
+    let r = push_new(&d, &[("v", v)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    // What fin reads of V: its change id and its recorded predecessors.
+    let fin_v = Craft::new(&api, &p.fin, &p.name, "v").tip;
+    let h = api.post_json(Some(&p.fin.token()), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [fin_v.hex()]}));
+    let (_, raw) = h.frames().into_iter().find(|(id, _)| *id == fin_v).unwrap();
+    let O::Snapshot(seen) = O::decode(&raw).unwrap() else { panic!() };
+    assert_eq!(seen.change_id, cid);
+    assert_eq!(seen.predecessors, vec![v0], "fin reads V's predecessors");
+    let mut f = Craft::new(&api, &p.fin, &p.name, "main");
+    let on = f.tip;
+    f.file(&format!("{BILL_DIR}/acme/s.txt"), "fin's\n");
+    let s = snap_at(&mut f, on, seen.change_id, "not V", veil_core::now_millis(), seen.predecessors.clone());
+    let r = push_new(&f, &[("s", s)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let w = land_held(&api, &p.fin.token(), &p.name, s, true).json();
+    assert_eq!(w["state"], "landed", "{w}");
+    let r = land_held(&api, &p.dev.token(), &p.name, v, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+    assert_eq!(real_file(&hub, pid, "src/v.rs").as_deref(), Some(&b"the dev's\n"[..]));
+}
