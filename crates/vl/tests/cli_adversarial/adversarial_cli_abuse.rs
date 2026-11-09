@@ -212,6 +212,7 @@ fn huge_and_binary_files_roundtrip_exactly() {
     env.ok("alice", &proj, &["commit", "-m", "big"]);
     env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
     let out = env.vl("alice", &proj, &["cat", "all-bytes.bin", "-r", "@-"]);
+    assert!(out.status.success(), "{}", text(&out));
     assert_eq!(out.stdout, binary);
     let dest = roundtrip_via_clone(&env, &proj, "big");
     assert_eq!(std::fs::read(dest.join("big.bin")).unwrap(), big);
@@ -314,7 +315,8 @@ fn checkout_never_writes_through_a_symlinked_directory() {
     std::os::unix::fs::symlink(&shared, bob.join("vendor")).unwrap();
     env.ok("bob", &bob, &["remote", "add", "origin", remote.to_str().unwrap()]);
     env.ok("bob", &bob, &["pull", "origin"]);
-    env.vl("bob", &bob, &["new", "origin/main"]);
+    let out = env.vl("bob", &bob, &["new", "origin/main"]);
+    assert!(out.status.success(), "{}", text(&out));
     assert!(!shared.join("postinstall.sh").exists(), "checkout wrote into {}", shared.display());
 }
 
@@ -336,7 +338,7 @@ fn read_only_files_and_directories_do_not_corrupt_state() {
     env.ok("alice", &proj, &["commit", "-m", "v3"]);
     std::fs::set_permissions(proj.join("dir"), std::fs::Permissions::from_mode(0o555)).unwrap();
     let out = env.vl("alice", &proj, &["new", &v1]);
-    assert!(exited_cleanly(&out), "{}", text(&out));
+    assert!(out.status.success() && text(&out).contains("failed dir/f.txt"), "{}", text(&out));
     std::fs::set_permissions(proj.join("dir"), std::fs::Permissions::from_mode(0o755)).unwrap();
     env.ok("alice", &proj, &["status"]);
     env.ok("alice", &proj, &["new", &v1]);
@@ -466,12 +468,15 @@ fn cloaking_a_file_with_glob_metacharacters_cloaks_that_file() {
     env.ok("alice", &proj, &["commit", "-m", "c"]);
     let files = env.stdout("alice", &proj, &["files", "-r", "@-"]);
     assert!(files.contains("config[prod].pem") && files.contains("app/[id]/token?.pem"), "{files}");
+    let mut matched = 0;
     for line in files.lines() {
         if line.contains("config[prod]") || line.contains("token?") {
             assert!(line.starts_with("cloaked"), "told it was cloaked, recorded as: {line}");
+            matched += 1;
         }
         assert!(!line.contains("notes{1}"), "told it was isolated, recorded as: {line}");
     }
+    assert_eq!(matched, 2, "{files}");
 }
 
 #[test]

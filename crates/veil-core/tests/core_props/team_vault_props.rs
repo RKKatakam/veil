@@ -70,11 +70,24 @@ proptest! {
         // Every record ever written, never compacted.
         let archive = MemoryBackend::new();
         let mut revoked = false;
+        let mut carol_knows_revoked = false;
         for s in steps {
             match s {
                 Step::Write { who, name, value } => {
+                    let key = format!("N{name}");
                     let v = value.map(|v| format!("v{v}-{who}"));
-                    let _ = repos[who].keys().team_secret_write("team", &format!("N{name}"), v.as_deref());
+                    if who == 2 && carol_knows_revoked {
+                        let res = repos[who].keys().team_secret_write("team", &key, v.as_deref());
+                        assert!(res.is_err(), "revoked member wrote team secret: {res:?}");
+                    } else {
+                        let had = state(&repos[who]).get(&key).and_then(|v| v.as_ref()).is_some();
+                        let res = repos[who].keys().team_secret_write("team", &key, v.as_deref());
+                        if v.is_none() && !had {
+                            assert!(matches!(res, Err(veil_core::VeilError::NotFound(_))), "{res:?}");
+                        } else {
+                            res.unwrap();
+                        }
+                    }
                     copy_records(&**repos[who].backend(), &archive);
                 }
                 Step::Push(who) => {
@@ -82,6 +95,9 @@ proptest! {
                 }
                 Step::Pull(who) => {
                     remote::pull(&mut repos[who], "origin", remote.clone()).unwrap();
+                    if who == 2 && revoked {
+                        carol_knows_revoked = true;
+                    }
                 }
                 Step::RevokeLast if !revoked => {
                     // Alice revokes Carol (re-signing what Carol last set).

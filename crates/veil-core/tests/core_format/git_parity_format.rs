@@ -377,7 +377,7 @@ fn merges_never_merge_link_targets_by_line() {
     let e = lookup(alice.store(), &alice.snapshot(&m.snapshot).unwrap().tree, &p("l")).unwrap().unwrap();
     assert_eq!(e.kind, EntryKind::Conflict);
     let c = alice.store().conflict(&e.id).unwrap();
-    assert!(c.interleaved().flatten().all(|t| t.kind == TermKind::Symlink));
+    assert!(!c.adds.is_empty() && c.interleaved().flatten().all(|t| t.kind == TermKind::Symlink));
     // Checkout writes our side as it is: a link, no markers.
     let r = alice.checkout_tree(&*fs, None, &alice.snapshot(&m.snapshot).unwrap().tree).unwrap();
     assert!(r.failed.is_empty(), "{:?}", r.failed);

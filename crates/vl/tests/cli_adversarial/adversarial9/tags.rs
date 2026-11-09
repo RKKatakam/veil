@@ -54,7 +54,9 @@ fn pull_never_moves_a_local_release_tag() {
 /// replaced by a push, BUG-710), then the remote's tag is re-pointed in
 /// place.
 fn move_on_remote(env: &Env, theirs: &std::path::Path, remote: &std::path::Path, name: &str) {
-    let _ = env.vl("mallory", theirs, &["push", "origin"]);
+    let pushed = env.vl("mallory", theirs, &["push", "origin"]);
+    let pushed_text = super::adversarial_support::text(&pushed);
+    assert!(!pushed.status.success() && pushed_text.contains(&format!("rejected {name}")), "{pushed_text}");
     let target = veil_core::ObjectId::from_hex(&tag_target(env, theirs, "tags", name)).unwrap();
     let mut r = veil_core::Repo::open_remote(std::sync::Arc::new(veil_core::DiskBackend::new(remote))).unwrap();
     assert!(r.store().has(&target), "the teammate's snapshot reached the remote");
@@ -93,7 +95,7 @@ fn a_moved_release_tag_is_reported_recorded_and_taken_only_with_force() {
 
     let ours = tag_target(&env, &alice, "tags", "v1.0");
     for _ in 0..2 {
-        let pull = super::adversarial_support::text(&env.vl(U, &alice, &["pull", "origin"]));
+        let pull = env.ok(U, &alice, &["pull", "origin"]);
         assert!(pull.contains("moved release tag v1.0") && pull.contains("stays at"), "{pull}");
         assert_eq!(tag_target(&env, &alice, "tags", "v1.0"), ours, "{pull}");
     }

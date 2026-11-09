@@ -153,6 +153,7 @@ fn doctor_describes_a_legacy_lock_with_a_bad_time_sensibly() {
     // A legacy "<pid> <time>" file whose time is in nanoseconds.
     std::fs::write(proj.join(".veil/lock"), "999999999 1793763700901071512").unwrap();
     let out = env.vl("alice", &proj, &["doctor"]);
+    assert!(out.status.success(), "{}", text(&out));
     let all = text(&out);
     assert!(all.contains("lease renewal time unreadable") && all.contains("legacy lock file"), "{all}");
     assert!(!all.contains("s ago") && !all.contains("-1793"), "{all}");
@@ -189,6 +190,7 @@ fn reading_a_cloaked_file_without_a_key_says_to_ask_for_a_grant() {
     assert!(out.contains("1 cloaked file(s) (scope 'team') you hold no key for"), "{out}");
     let bob = env.root.join("bob");
     let out = env.vl("bob", &bob, &["cat", "internal/.env.plan", "-r", "main"]);
+    assert!(!out.status.success(), "{}", text(&out));
     let err = stderr(&out);
     assert!(err.contains("you hold no key") && err.contains("vl scope grant team"), "{err}");
     let show = env.stdout("bob", &bob, &["show", "main"]);
@@ -215,6 +217,7 @@ fn an_embargoed_merge_reports_files_as_public_on_release_and_an_absolute_deadlin
     assert!(all.contains("the merge and the history it brings in stay with") && all.contains("pushes hold them back"), "{all}");
 
     let out = env.cmd("alice", &proj, &["embargo", "list"]).env("TZ", "CET-1").output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("until 2099-12-01 10:00:00 +01:00 (09:00:00 UTC)"), "{}", text(&out));
     assert!(text(&out).lines().all(|l| l == l.trim_end()), "no trailing spaces: {:?}", text(&out));
 

@@ -249,9 +249,8 @@ fn a_workspace_keeps_its_identity_through_merges_and_undo() {
     let mut again = View::default();
     again.workspaces.insert("w".into(), later.clone());
     let back = revert_views(&gone, &base, &again, &mut no_descent).view;
-    if let Some(w) = back.workspaces.get("w") {
-        assert!((w.wc == first.wc && w.id == first.id) || (w.wc == later.wc && w.id == later.id), "{w:?}");
-    }
+    let w = &back.workspaces["w"];
+    assert_eq!((w.wc, &w.id), (first.wc, &first.id), "{w:?}");
 }
 
 // ---- BUG-1294: settlers that list different heads --------------------------

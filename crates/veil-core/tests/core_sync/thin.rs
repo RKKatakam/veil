@@ -956,11 +956,11 @@ fn s3rd2_no_read_of_history_outside_held_or_exact() {
     let read = repo.store().get(&old);
     let exact = repo.exact().snapshot(&old).unwrap();
     assert!(exact.is_some(), "the person's history has the snapshot");
-    match read {
-        Ok(Object::Snapshot(s)) => assert_eq!(Some(s), exact.as_deref().cloned()),
-        Err(VeilError::Unavailable(_)) => {}
-        r => panic!("a snapshot of the person's history, read outside Held and Exact: {:?}", r.map(|o| o.kind_name())),
-    }
+    assert!(
+        matches!(read, Err(VeilError::Unavailable(_))),
+        "a snapshot beyond the thin boundary, read outside Held and Exact: {:?}",
+        read.map(|o| o.kind_name())
+    );
 }
 
 // ---- S8 cycle 2 review (`docs/BUGS.md`, "S8 cycle 2") --------------------

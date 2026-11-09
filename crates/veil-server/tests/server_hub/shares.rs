@@ -543,7 +543,7 @@ fn removed_devices_people_and_access() {
     assert!(out.contains("paused") && out.contains("may no longer read"), "{out}");
     let v = row(&hub, &p, &env, &p.dev.name).unwrap().0;
     write_files(&f, &[(&env, "KEY=after-losing-access\n")]);
-    p.fin.run(&f, &["share-keys"]);
+    p.fin.fails(&f, &["share-keys"]);
     assert_eq!(row(&hub, &p, &env, &p.dev.name).unwrap().0, v);
     p.dev.ok(&d, &["pull"]);
     assert_eq!(read(&d, &env).unwrap(), "KEY=later\n");

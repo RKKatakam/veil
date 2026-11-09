@@ -151,7 +151,7 @@ fn a_held_back_sandbox_edit_applies_once_the_member_accepts_it() {
     assert!(!out.contains("vl policy accept"), "{out}");
     // Nothing left to accept.
     let o = env.vl(U, &proj, &["policy", "accept", "--workspace", "agent"]);
-    assert!(!o.status.success() || text(&o).contains("nothing"), "{}", text(&o));
+    assert!(!o.status.success() && text(&o).contains("nothing"), "{}", text(&o));
 }
 
 #[test]

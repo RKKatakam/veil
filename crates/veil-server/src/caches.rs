@@ -344,6 +344,7 @@ impl Caches {
         if let Some((at, rows, _)) = &slot.rows {
             if at.elapsed() < TIPS_TTL {
                 self.stats.tips_hits.fetch_add(1, Ordering::Relaxed);
+                crate::limits::health::hit(crate::limits::health::Layer::Tips, true);
                 return TipsLookup::Hit(rows.clone());
             }
         }
@@ -353,6 +354,7 @@ impl Caches {
             }
         }
         self.stats.tips_misses.fetch_add(1, Ordering::Relaxed);
+        crate::limits::health::hit(crate::limits::health::Layer::Tips, false);
         let done = Arc::new(tokio::sync::Notify::new());
         slot.reading = Some((Instant::now(), done.clone()));
         TipsLookup::Read(TipsRead {

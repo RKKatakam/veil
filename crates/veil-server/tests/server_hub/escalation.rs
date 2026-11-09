@@ -70,7 +70,7 @@ fn group_self_adds_and_manager_overreach_are_refused() {
         vec!["group", "create", "newgroup"],
     ] {
         let out = p.dev.fails(&d, &args);
-        assert!(out.contains("only an admin") || out.contains("forbidden"), "{args:?}: {out}");
+        assert!(out.contains("only an admin"), "{args:?}: {out}");
     }
     // A manager adds and removes other people, never themselves, and
     // cannot choose managers or create groups.
@@ -120,7 +120,7 @@ fn writes_into_folders_without_access_are_refused() {
         write_files(&d, &[(&path, "x")]);
         who.commit_main(&d, "try");
         let out = who.fails(&d, &["push"]);
-        assert!(out.contains("you do not have access") || out.contains("may not write"), "{path}: {out}");
+        assert!(out.contains("you do not have access"), "{path}: {out}");
         who.ok(&d, &["tag", "set", "main", "-r", "origin/main", "--force"]);
         who.ok(&d, &["new", "main"]);
         let _ = std::fs::remove_file(d.join(&path));
@@ -157,7 +157,7 @@ fn forced_and_deleting_branch_moves_need_an_admin() {
     let out = p.dev.fails(&d, &["push", "--force"]);
     assert!(out.contains("only admins may force"), "{out}");
     let out = p.dev.fails(&d, &["push"]);
-    assert!(out.contains("fast-forward") || out.contains("moved"), "{out}");
+    assert!(out.contains("not a fast-forward"), "{out}");
     let api = hub.api();
     let t = tip(&hub, &p);
     let r = api.post_json(

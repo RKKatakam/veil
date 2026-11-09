@@ -322,6 +322,7 @@ fn outsider_blame_of_a_sealed_file_is_refused() {
     assert_eq!(v["lines"][1]["text"], CLOAKED_LINE);
     // --public: as the mirror sees it.
     let out = w.env.vl("alice", &w.alice, &["blame", PLAN, "-r", "plan@", "--public", "--json"]);
+    assert!(!out.status.success(), "{}", text(&out));
     assert!(!text(&out).contains(CLOAKED_LINE), "{}", text(&out));
 }
 
@@ -371,6 +372,7 @@ fn pickaxe_on_cloaked_text_needs_the_key() {
     assert!(e.iter().any(|e| e["change_short"] == cloaked.as_str() && e["not_searched"][0]["scope"] == "team"), "{v}");
     assert!(v["search"]["skipped"].as_u64().unwrap() >= 1);
     let out = w.env.vl("bob", &w.bob, &["log", "-S", CLOAKED_LINE]);
+    assert!(out.status.success(), "{}", text(&out));
     assert!(String::from_utf8_lossy(&out.stderr).contains("not searched"), "{}", text(&out));
 }
 
@@ -435,7 +437,7 @@ fn blame_refuses_bad_input_and_escapes_what_it_prints() {
     let out = env.stdout("alice", &dir, &["blame", "f.txt"]);
     assert!(!out.contains('\x1b') && !out.contains('\u{202e}') && !out.contains('\x07'), "{out:?}");
     assert!(out.contains("\\x1b]52;"), "{out}");
-    let raw = String::from_utf8(env.vl("alice", &dir, &["blame", "f.txt", "--json"]).stdout).unwrap();
+    let raw = env.stdout("alice", &dir, &["blame", "f.txt", "--json"]);
     assert!(!raw.contains('\x1b') && !raw.contains('\u{202e}'), "{raw:?}");
     let v: Value = serde_json::from_str(&raw).unwrap();
     assert!(v["lines"][1]["text"].as_str().unwrap().contains("\x1b]52;"), "JSON decodes to the raw line");
@@ -486,10 +488,10 @@ fn grep_refuses_bad_patterns_and_escapes_what_it_prints() {
     let out = env.vl("alice", &dir, &["grep", &huge]);
     assert_eq!(out.status.code(), Some(1));
     assert!(text(&out).contains("at most"), "{}", &text(&out)[..200.min(text(&out).len())]);
-    let out = stdout_of(&env.vl("alice", &dir, &["grep", "evil"]));
+    let out = env.stdout("alice", &dir, &["grep", "evil"]);
     assert!(!out.contains('\x1b') && !out.contains('\u{202e}'), "{out:?}");
     assert!(out.contains("\\u{202e}"), "{out}");
-    let raw = stdout_of(&env.vl("alice", &dir, &["grep", "evil", "--json"]));
+    let raw = env.stdout("alice", &dir, &["grep", "evil", "--json"]);
     assert!(!raw.contains('\u{202e}') && raw.contains("\\u202e"), "{raw}");
 }
 
@@ -775,6 +777,7 @@ fn a_damaged_bisect_state_stops_only_bisect() {
     // A symlink or a directory in its place is never followed.
     std::os::unix::fs::symlink("/etc/passwd", &state).unwrap();
     let out = env.vl("alice", &dir, &["bisect", "log"]);
+    assert!(!out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("not a regular file"), "{}", text(&out));
     env.ok("alice", &dir, &["bisect", "reset"]);
     assert!(std::fs::symlink_metadata(&state).is_err());
@@ -809,6 +812,7 @@ fn bisect_run_aborts_cleanly() {
     let env = Env::new();
     let (dir, changes) = bisect_project(&env);
     let out = env.vl("alice", &dir, &["bisect", "good"]);
+    assert!(!out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("no bisection in progress"), "{}", text(&out));
     env.ok("alice", &dir, &["bisect", "start", "--bad", &changes[11], "--good", &changes[0]]);
     let out = env.vl("alice", &dir, &["bisect", "run", "--", "/no/such/command"]);
@@ -816,9 +820,11 @@ fn bisect_run_aborts_cleanly() {
     assert!(text(&out).contains("failed to run"), "{}", text(&out));
     let kill = script(&env.root, "kill.sh", "kill -9 $$");
     let out = env.vl("alice", &dir, &["bisect", "run", "--", &kill]);
+    assert!(!out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("exited with 137"), "{}", text(&out));
     let high = script(&env.root, "high.sh", "exit 200");
     let out = env.vl("alice", &dir, &["bisect", "run", "--", &high]);
+    assert!(!out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("exited with 200"), "{}", text(&out));
     // A hostile TMPDIR (a file, not a directory): refused cleanly.
     let not_a_dir = env.root.join("tmpfile");
@@ -833,6 +839,7 @@ fn bisect_run_aborts_cleanly() {
     env.ok("alice", &dir, &["ws", "new", "other", "-r", "@-"]);
     env.ok("alice", &dir, &["ws", "switch", "other"]);
     let out = env.vl("alice", &dir, &["bisect", "log"]);
+    assert!(!out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("runs in workspace default"), "{}", text(&out));
     env.ok("alice", &dir, &["ws", "switch", "default"]);
     env.ok("alice", &dir, &["bisect", "reset"]);
@@ -849,7 +856,8 @@ fn concurrent_bisect_commands_keep_the_state_valid() {
     env.ok("alice", &dir, &["bisect", "start", "--bad", &changes[11], "--good", &changes[0]]);
     let kids: Vec<Child> = (0..4).map(|i| env.spawn("alice", &dir, &["bisect", if i % 2 == 0 { "good" } else { "skip" }, "--discard"])).collect();
     for k in kids {
-        let _ = k.wait_with_output().unwrap();
+        let out = k.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", text(&out));
     }
     let s: Value = serde_json::from_str(&std::fs::read_to_string(dir.join(".veil/local/bisect.json")).unwrap()).unwrap();
     assert_eq!(s["version"], 1);

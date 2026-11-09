@@ -388,10 +388,9 @@ fn gc_that_cannot_open_a_sealed_tree_deletes_nothing() {
     let garbage = bob.store().put(&Object::Blob(b"bob's garbage".to_vec())).unwrap();
     let before = ids(&bob);
     let r = gc(&mut bob, &GcOptions { grace: Duration::ZERO, keep_ops: Some(Duration::ZERO), ..GcOptions::default() }).unwrap();
-    if !r.incomplete.is_empty() {
-        assert_eq!(r.deleted, 0, "{r:?}");
-        assert!(ids(&bob).contains(&garbage));
-    }
+    assert!(r.incomplete.is_empty(), "{r:?}");
+    assert_eq!(r.deleted, 1, "{r:?}");
+    assert!(!ids(&bob).contains(&garbage));
     for i in before.iter().filter(|i| **i != garbage) {
         assert!(ids(&bob).contains(i), "{} was deleted", i.short());
     }

@@ -342,10 +342,10 @@ impl Harness {
                             "clone",
                         )?;
                         remote::pull(&mut clone, "origin", self.remote.clone())?;
-                        for (name, tag) in &clone.view().tags {
-                            if self.repo.view().tags.get(name).map(|t| t.target) == Some(tag.target) {
-                                assert_eq!(files_of(&clone, &tag.target), files_of(&self.repo, &tag.target), "push lost content");
-                            }
+                        assert_eq!(clone.view().remote_tags.len(), self.repo.view().tags.len());
+                        for (name, tag) in &self.repo.view().tags {
+                            assert_eq!(clone.view().remote_tags.get(&format!("origin/{name}")), Some(&tag.target));
+                            assert_eq!(files_of(&clone, &tag.target), files_of(&self.repo, &tag.target), "push lost content");
                         }
                     }
                 }
