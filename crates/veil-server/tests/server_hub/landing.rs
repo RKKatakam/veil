@@ -4934,10 +4934,10 @@ fn no_event_or_report_reveals_hidden_paths_names_counts_or_content() {
         conflict_out["conflicts"].as_array().is_none_or(|a| a.is_empty()),
         "hidden path must never appear in conflicts: {report_str}"
     );
-    // landed_since must contain only the 1 visible change (src/other.rs), never the billing-only change!
-    if let Some(since) = conflict_out["landed_since"].as_array() {
-        assert_eq!(since.len(), 1, "landed_since must not count or include hidden-only changes: {report_str}");
-    }
+    assert!(
+        conflict_out["landed_since"].as_array().is_none_or(|a| a.is_empty()),
+        "hidden conflict must not list landed_since: {report_str}"
+    );
     for forbidden in [BILL_DIR, "secret-99", "CLASSIFIED-AMOUNT", "vault", "key.txt", "VAULT-SECRET-KEY"] {
         assert!(!report_str.contains(forbidden), "report leaked {forbidden}: {report_str}");
     }
@@ -5250,9 +5250,11 @@ fn merge_attempts_cap_at_three_and_veilattributes_govern_content_merge() {
     // 3. `MAX_MERGES` cap (3): a queued row that has already been merged 3 times is not merged a 4th time.
     let dev_base_cap = tip_for(&hub, &dev_tok, &p.name);
     let admin_base_cap = tip_for(&hub, &admin_tok, &p.name);
-    let _ = land(&api, &admin_tok, &p.name, admin_base_cap, json!([put("src/CHANGELOG.md", &format!("{chlog}- admin cap\n"))]), true).json();
+    let cap_setup = land(&api, &admin_tok, &p.name, admin_base_cap, json!([put("src/CHANGELOG.md", &format!("{chlog}- admin cap\n"))]), true).json();
+    assert_eq!(cap_setup["state"], "landed", "{cap_setup}");
     hold(&hub, pid);
     let queued = land(&api, &dev_tok, &p.name, dev_base_cap, json!([put("src/CHANGELOG.md", &format!("{chlog}- dev cap\n"))]), false).json();
+    assert_eq!(queued["state"], "queued", "{queued}");
     let cap_ticket = queued["ticket"].as_str().unwrap().to_string();
     let h = hub.hub();
     hub.rt

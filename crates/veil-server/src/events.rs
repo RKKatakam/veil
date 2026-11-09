@@ -390,9 +390,9 @@ pub async fn emit_ticket(
         return;
     }
     for sub in subs {
-        // BUG-1640: Read current access epochs from the database before
-        // opening the subscriber's view so permission changes are seen at
-        // once and never poison the viewer cache with epoch 0.
+        // Read current access epochs from the database before opening the
+        // subscriber's view so permission changes are seen at once and never
+        // poison the viewer cache with epoch 0.
         let Ok(epochs) = crate::caches::read_epochs(&hub.db, sub.person.id, Some(project_id)).await else {
             continue;
         };
