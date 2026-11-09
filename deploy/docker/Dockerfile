@@ -41,13 +41,14 @@ USER veil:veil
 WORKDIR /var/lib/veil
 VOLUME ["/var/lib/veil"]
 EXPOSE 8443
-# Healthy when the server answers HTTPS on its port (any status: the route
-# needs a grant, so an unauthenticated 4xx still means "up"). A cache sets
-# VEIL_HEALTH_URL to its own port. HTTP/1.1: the cache advertises h2 but
-# serves HTTP/1 only, which breaks an HTTP/2 client's stream (BUG-1592).
+# Healthy when the server answers HTTPS on its port with 2xx or 4xx (the
+# route needs a grant, so an unauthenticated 401 means "up", while 000 or
+# 5xx fails). A cache sets VEIL_HEALTH_URL to its own port. HTTP/1.1: the
+# cache advertises h2 but serves HTTP/1 only, which breaks an HTTP/2
+# client's stream (BUG-1592).
 ENV VEIL_HEALTH_URL=https://127.0.0.1:8443/v1/epochs
 HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=3 \
-    CMD curl -ksS --http1.1 -o /dev/null --max-time 2 "$VEIL_HEALTH_URL" || exit 1
+    CMD case "$(curl -ksS --http1.1 -o /dev/null -w '%{http_code}' --max-time 2 "$VEIL_HEALTH_URL")" in 2*|4*) exit 0;; *) exit 1;; esac
 ENTRYPOINT ["/usr/local/bin/veil-server"]
 
 # ---- bench: the load driver (veil-bench, vl, veil-server, git) ----

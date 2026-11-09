@@ -11,6 +11,11 @@ DO_ROOT=$(cd "$DO_HERE/../.." && pwd)
 ENV_FILE=${VEIL_DO_ENV:-$DO_HERE/.env}
 # Variables already in the environment win over the file (VEIL_DO_NAME=x deploy/do/create.sh).
 if [ -f "$ENV_FILE" ]; then
+    mode=$(stat -c %a "$ENV_FILE" 2>/dev/null || stat -f %Lp "$ENV_FILE")
+    case "$mode" in
+        ?00) ;;
+        *) echo "do: $ENV_FILE has mode $mode; refusing a group- or world-readable .env (run: chmod 600 $ENV_FILE)" >&2; exit 2 ;;
+    esac
     saved=$(env | grep '^VEIL_DO_' || true)
     set -a; . "$ENV_FILE"; set +a
     while IFS= read -r kv; do [ -n "$kv" ] && export "$kv"; done <<<"$saved"
@@ -26,13 +31,18 @@ YB_NODES=${VEIL_DO_YB_NODES:-0}
 WITH_CACHE=${VEIL_DO_WITH_CACHE:-0}
 SIZE_CACHE=${VEIL_DO_SIZE_CACHE:-s-4vcpu-8gb}
 HOURS=${VEIL_DO_HOURS:-8}
+[[ "$NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]] || { echo "do: invalid VEIL_DO_NAME '$NAME' (use letters, digits and hyphens)" >&2; exit 2; }
+[[ "$REGION" =~ ^[a-z0-9-]+$ ]] || { echo "do: invalid VEIL_DO_REGION '$REGION'" >&2; exit 2; }
+[[ "$DRIVERS" =~ ^[1-9][0-9]*$ ]] || { echo "do: invalid VEIL_DO_DRIVERS '$DRIVERS'" >&2; exit 2; }
+[[ "$YB_NODES" =~ ^[0-9]+$ ]] || { echo "do: invalid VEIL_DO_YB_NODES '$YB_NODES'" >&2; exit 2; }
+[[ "$WITH_CACHE" =~ ^[01]$ ]] || { echo "do: invalid VEIL_DO_WITH_CACHE '$WITH_CACHE' (0 or 1)" >&2; exit 2; }
+[[ "$HOURS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "do: invalid VEIL_DO_HOURS '$HOURS'" >&2; exit 2; }
 IMAGE=ubuntu-24-04-x64
 STATE=$DO_HERE/state/$NAME
-mkdir -p "$STATE"; chmod 700 "$(dirname "$STATE")" "$STATE"
 STATE_FILE=$STATE/state.env
 [ -f "$STATE_FILE" ] && . "$STATE_FILE"
 BUCKET=${VEIL_DO_BUCKET:-${BUCKET:-}}
-SPACES_ENDPOINT=https://$REGION.digitaloceanspaces.com
+SPACES_ENDPOINT=${VEIL_DO_SPACES_ENDPOINT:-https://$REGION.digitaloceanspaces.com}
 
 # The approval gate. Nothing is created, changed or deleted at
 # DigitalOcean without `--approve` on the command line.
@@ -76,11 +86,26 @@ copy_from() { # host, remote path, local
         scp -q -r -i "$STATE/id_ed25519" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE/known_hosts" "root@$1:$2" "$3"
     else echo "would copy $1:$2 to $3" >&2; fi
 }
+ensure_state_dir() {
+    mkdir -p "$STATE"; chmod 700 "$(dirname "$STATE")" "$STATE"
+}
 save_state() { # KEY VALUE: remembered across scripts
+    ensure_state_dir
     touch "$STATE_FILE"; chmod 600 "$STATE_FILE"
     grep -v "^$1=" "$STATE_FILE" > "$STATE_FILE.tmp" || true
     printf '%s=%q\n' "$1" "$2" >> "$STATE_FILE.tmp"; mv "$STATE_FILE.tmp" "$STATE_FILE"; chmod 600 "$STATE_FILE"
-    eval "$1=\$2"
+    printf -v "$1" '%s' "$2"
+}
+require_created() { # require a finished create.sh before configure/bench/logs --approve
+    [ -f "$STATE_FILE" ] && [ -f "$STATE/id_ed25519" ] && [ -n "${BUCKET:-}" ] || {
+        echo "do: no complete state for '$NAME' ($STATE_FILE); run deploy/do/create.sh --approve first" >&2; exit 2
+    }
+    local role name size
+    while read -r role name size; do
+        [ -n "$(ip_of "$name")" ] && [ -n "$(priv_of "$name")" ] || {
+            echo "do: missing address for '$name' in $STATE_FILE; create.sh did not finish (run destroy.sh --approve first)" >&2; exit 2
+        }
+    done < <(droplets)
 }
 # The droplets of this topology: role, name, size.
 droplets() {
@@ -101,16 +126,18 @@ database_url() {
     else echo "postgres://veil:${VEIL_DO_DB_PASSWORD:-}@$(priv_of "$NAME-db"):5432/veil"; fi
 }
 # Hourly list prices (USD) of the sizes the kit uses, DigitalOcean's
-# published monthly price divided by 672 hours. **Check them against
-# `doctl compute size list` (PriceHourly) before approving**: estimate.sh
-# --live does that for you once a token is present.
+# published monthly price divided by 672 hours, rounded up to the
+# millidollar so the estimate is never below the list price. **Check them
+# against `doctl compute size list` (PriceHourly) before approving**:
+# estimate.sh --live does that for you once a token is present.
 price_of() {
     case "$1" in
         c-4) echo 0.125 ;; c-8) echo 0.250 ;; c-16) echo 0.500 ;; c-32) echo 1.000 ;;
-        c2-8vcpu-16gb) echo 0.286 ;; c2-16vcpu-32gb) echo 0.571 ;;
+        c2-8vcpu-16gb) echo 0.286 ;; c2-16vcpu-32gb) echo 0.572 ;;
         g-8vcpu-32gb) echo 0.375 ;; g-16vcpu-64gb) echo 0.750 ;;
-        s-1vcpu-2gb) echo 0.018 ;; s-2vcpu-4gb) echo 0.036 ;; s-4vcpu-8gb) echo 0.071 ;; s-8vcpu-16gb) echo 0.143 ;;
+        s-1vcpu-2gb) echo 0.018 ;; s-2vcpu-4gb) echo 0.036 ;; s-4vcpu-8gb) echo 0.072 ;; s-8vcpu-16gb) echo 0.143 ;;
         *) echo "" ;;
     esac
 }
 SPACES_MONTHLY=5.00   # the Spaces subscription: $5 a month flat (250 GiB, 1 TiB out) while any bucket exists
+BUDGET_MAX=100.00     # owner's rule: the budget is under $100

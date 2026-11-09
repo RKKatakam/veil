@@ -2,11 +2,18 @@
 # A stand-in for doctl used by deploy/do/test/test.sh: records every call
 # in $FAKE_DOCTL_LOG and answers with made-up ids and addresses. It never
 # talks to DigitalOcean. Not for real use.
+set -euo pipefail
 echo "doctl $*" >> "${FAKE_DOCTL_LOG:?}"
+[ "${FAKE_DOCTL_FAIL:-0}" = 1 ] && { echo "fake-doctl: simulated API failure" >&2; exit 1; }
 case "$*" in
     "compute ssh-key import"*)       echo 4242 ;;
     "compute firewall create"*)      echo fw-0001 ;;
-    "compute droplet create"*)       n=$(grep -c "compute droplet create" "$FAKE_DOCTL_LOG"); echo $((1000 + n)) ;;
+    "compute droplet create"*)
+        n=$(grep -c "compute droplet create" "$FAKE_DOCTL_LOG" || true)
+        if [ -n "${FAKE_DOCTL_MAX_DROPLETS:-}" ] && [ "$n" -gt "$FAKE_DOCTL_MAX_DROPLETS" ]; then
+            echo "fake-doctl: droplet limit exceeded" >&2; exit 1
+        fi
+        echo $((1000 + n)) ;;
     "compute droplet get"*)          echo active ;;
     "compute droplet list --tag-name"*"--format ID,Name,PublicIPv4,PrivateIPv4"*)
         state=${FAKE_DOCTL_STATE:-created}
@@ -15,9 +22,13 @@ case "$*" in
             for name in $FAKE_DROPLETS; do i=$((i+1)); echo "$((1000+i)) $name 203.0.113.$i 10.10.0.$i"; done
         fi ;;
     "compute droplet list --tag-name"*)  [ "${FAKE_DOCTL_STATE:-created}" = created ] && for name in $FAKE_DROPLETS; do echo 1; done; true ;;
-    "compute droplet delete"*)       echo "deleted" >&2; echo "$FAKE_DOCTL_STATE_FILE" >/dev/null; [ -n "${FAKE_DOCTL_STATE_FILE:-}" ] && echo destroyed > "$FAKE_DOCTL_STATE_FILE"; true ;;
+    "compute droplet delete"*)       echo "deleted" >&2; [ -n "${FAKE_DOCTL_STATE_FILE:-}" ] && echo destroyed > "$FAKE_DOCTL_STATE_FILE"; true ;;
+    "compute firewall list --format Name"*) [ "${FAKE_DOCTL_STATE:-created}" = created ] && echo "${FAKE_NAME:-veil-test}"; true ;;
     "compute firewall list"*)        [ "${FAKE_DOCTL_STATE:-created}" = created ] && echo "fw-0001 ${FAKE_NAME:-veil-test}"; true ;;
+    "compute ssh-key list --format Name"*)  [ "${FAKE_DOCTL_STATE:-created}" = created ] && echo "${FAKE_NAME:-veil-test}"; true ;;
     "compute ssh-key list"*)         [ "${FAKE_DOCTL_STATE:-created}" = created ] && echo "4242 ${FAKE_NAME:-veil-test}"; true ;;
+    "compute volume list"*)          [ -n "${FAKE_VOLUMES:-}" ] && printf '%s\n' "$FAKE_VOLUMES"; true ;;
+    "compute reserved-ip list"*)     [ -n "${FAKE_RESERVED_IPS:-}" ] && printf '%s\n' "$FAKE_RESERVED_IPS"; true ;;
     "compute size list"*)            printf 'c-16 0.5\nc-8 0.25\n' ;;
-    *) ;;  # tag create/delete, firewall delete, ssh-key delete, volume/snapshot/reserved-ip/load-balancer list: nothing
+    *) ;;  # tag create/delete, firewall delete, ssh-key delete, snapshot/load-balancer list: nothing
 esac

@@ -14,11 +14,12 @@
 # of version control (.gitignore covers deploy/compose/.tls and deploy/do/state).
 set -euo pipefail
 OUT=${1:?output directory}; shift
-[ $# -gt 0 ] || { echo "mkcert: give at least one name or IP" >&2; exit 2; }
+[[ "$OUT" != -* ]] && [ $# -gt 0 ] || { echo "mkcert: usage: mkcert.sh OUT_DIR NAME_OR_IP..." >&2; exit 2; }
 umask 077
 mkdir -p "$OUT"; chmod 755 "$OUT"
 san=""
 for n in "$@"; do
+    [[ "$n" != -* ]] || { echo "mkcert: invalid name or IP '$n'" >&2; exit 2; }
     if [[ "$n" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$n" == *:* ]]; then san+="IP:$n,"; else san+="DNS:$n,"; fi
 done
 san=${san%,}

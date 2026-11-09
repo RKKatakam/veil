@@ -23,7 +23,7 @@ pub struct ServerArgs {
     /// The `veil-server` binary (a release build).
     #[arg(long)]
     pub server: Option<PathBuf>,
-    /// PostgreSQL (or YugabyteDB) for the server.
+    /// PostgreSQL (or YugabyteDB) for the server (default: VEIL_DATABASE_URL).
     #[arg(long)]
     pub database_url: Option<String>,
     /// Keep the server's objects in S3 at this endpoint (MinIO); else in
@@ -32,6 +32,12 @@ pub struct ServerArgs {
     pub s3_endpoint: Option<String>,
     #[arg(long)]
     pub s3_bucket: Option<String>,
+}
+
+impl ServerArgs {
+    pub fn db_url(&self) -> Option<String> {
+        self.database_url.clone().or_else(|| std::env::var("VEIL_DATABASE_URL").ok().filter(|s| !s.is_empty()))
+    }
 }
 
 pub struct Server {
@@ -53,11 +59,11 @@ impl Server {
     /// Migrate the database, start the server with its data in `data`
     /// (its log beside it, `data.log`), and wait until it listens.
     pub fn start(a: &ServerArgs, data: &Path, db_connections: u32) -> Result<Server> {
-        let (Some(bin), Some(url)) = (&a.server, &a.database_url) else {
-            bail!("starting a server needs --server and --database-url");
+        let (Some(bin), Some(url)) = (&a.server, a.db_url()) else {
+            bail!("starting a server needs --server and --database-url (or VEIL_DATABASE_URL)");
         };
         std::fs::create_dir_all(data)?;
-        let st = Command::new(bin).args(["migrate", "--database-url", url]).stdout(Stdio::null()).status().context("veil-server migrate")?;
+        let st = Command::new(bin).arg("migrate").env("VEIL_DATABASE_URL", &url).stdout(Stdio::null()).status().context("veil-server migrate")?;
         if !st.success() {
             bail!("veil-server migrate failed ({st})");
         }
@@ -68,7 +74,8 @@ impl Server {
         let mut cmd = Command::new(bin);
         cmd.args(["--listen", "127.0.0.1:0", "--data"])
             .arg(data)
-            .args(["--database-url", url, "--db-connections", &db_connections.to_string()]);
+            .args(["--db-connections", &db_connections.to_string()])
+            .env("VEIL_DATABASE_URL", &url);
         if let (Some(e), Some(b)) = (&a.s3_endpoint, &a.s3_bucket) {
             cmd.args(["--s3-endpoint", e, "--s3-bucket", b]);
         }

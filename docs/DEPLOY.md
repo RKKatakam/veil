@@ -93,8 +93,8 @@ prices):
 | bandwidth (pooled transfer included with the droplets) | 0 | 0 | 0 |
 | **default total** | **1.257** | **15.00** | **35.00** |
 | + YugabyteDB, 3 × `c-8` instead of the db droplet | +0.500 | +4.00 | +12.00 |
-| + cache `s-4vcpu-8gb` | +0.071 | +0.57 | +1.70 |
-| **everything on, 8 h** | 1.821 | **19.57** | 48.70 |
+| + cache `s-4vcpu-8gb` | +0.072 | +0.58 | +1.73 |
+| **everything on, 8 h** | 1.829 | **19.58** | 48.73 |
 
 The planned test is about 8 hours of machines: an hour to create and
 configure, five for the gates (§6), an hour for logs and teardown, one

@@ -19,11 +19,13 @@
 # Results: deploy/compose/results/<stamp>/ (JSON and Markdown per gate,
 # server and cache logs). Everything else this script writes lives under
 # deploy/compose/.tls, deploy/compose/.env.<name> and the worktree's .scratch/.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")"
 HERE=$PWD
 ROOT=$(cd ../.. && pwd)
+[ $# -le 1 ] && [[ "${1:-}" != -* ]] || { echo "rehearsal: usage: rehearsal.sh [NAME]" >&2; exit 2; }
 NAME=${1:-${USER:-rehearsal}}
+[[ "$NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] || { echo "rehearsal: invalid NAME '$NAME'" >&2; exit 2; }
 PROJECT=veil-rehearsal-$NAME
 DURATION=${DURATION:-10}
 GATES=${GATES:-pull land branches api objects openscion scale}
@@ -40,6 +42,7 @@ if [ "${SKIP_BUILD:-0}" != 1 ]; then
 fi
 
 # 2. Certificates and secrets for this run (never committed; see .gitignore).
+mkdir -p "$HERE/.tls"; chmod 700 "$HERE/.tls"
 TLS_DIR=$HERE/.tls/$NAME
 "$ROOT/deploy/tls/mkcert.sh" "$TLS_DIR" veil-server veil-cache localhost 127.0.0.1 || exit 1
 ENV_FILE=$HERE/.env.$NAME
@@ -68,7 +71,7 @@ cleanup() {
         return
     else
         echo "== tearing down $PROJECT (containers, network, volumes)"
-        C down -v --remove-orphans --timeout 20 >/dev/null 2>&1
+        C down -v --remove-orphans --timeout 20 >/dev/null 2>&1 || true
         D volume ls -q --filter "label=com.docker.compose.project=$PROJECT" | grep -q . && echo "rehearsal: WARNING volumes remain" || echo "   nothing of $PROJECT remains"
     fi
     rm -f "$ENV_FILE"
@@ -80,7 +83,7 @@ echo "== bringing up $PROJECT (tag $TAG, hub on 127.0.0.1:$HUB_PORT)"
 diagnose() { # everything a failed start can say
     C ps -a; C logs --no-color --tail 40 migrate veil-server veil-cache
     for svc in veil-server veil-cache; do
-        id=$(C ps -aq "$svc" 2>/dev/null | head -1); [ -n "$id" ] && D inspect -f "   $svc health: {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}} {{range .State.Health.Log}}| exit {{.ExitCode}}: {{.Output}}{{end}}{{end}}" "$id"
+        id=$(C ps -aq "$svc" 2>/dev/null | head -1); [ -n "$id" ] && D inspect -f "   $svc health: {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}} {{range .State.Health.Log}}| exit {{.ExitCode}}: {{.Output}}{{end}}{{end}}" "$id" || true
     done
 }
 if ! C up -d --wait --wait-timeout 300 postgres minio migrate veil-server; then
@@ -92,13 +95,13 @@ echo "== smoke: the server and the cache answer HTTPS with the rehearsal certifi
 for p in $HUB_PORT $([ "${CACHE:-1}" = 1 ] && echo "$CACHE_PORT"); do
     code=000
     for i in $(seq 30); do
-        code=$(curl -s --http1.1 -o /dev/null -w '%{http_code}' --max-time 3 --cacert "$TLS_DIR/ca.pem" --resolve "veil-server:$p:127.0.0.1" "https://veil-server:$p/v1/epochs")
+        code=$(curl -s --http1.1 -o /dev/null -w '%{http_code}' --max-time 3 --cacert "$TLS_DIR/ca.pem" --resolve "veil-server:$p:127.0.0.1" "https://veil-server:$p/v1/epochs" || echo 000)
         [ "$code" != 000 ] && break; sleep 1
     done
     echo "   :$p /v1/epochs -> HTTP $code (a 4xx is expected: the route needs a grant)"
-    case "$code" in 000) echo "rehearsal: no HTTPS answer on :$p"; diagnose; exit 1;; esac
+    case "$code" in 2*|4*) ;; *) echo "rehearsal: unexpected HTTPS answer ($code) on :$p"; diagnose; exit 1;; esac
 done
-diagnose | grep "health:"
+diagnose | grep "health:" || true
 
 # Run a command with a deadline (a function, so `timeout` cannot wrap it):
 # only the process started here is ever killed.
@@ -106,16 +109,16 @@ bounded() { # seconds, command...
     local limit=$1; shift
     "$@" & local pid=$! waited=0
     while kill -0 "$pid" 2>/dev/null; do
-        if [ "$waited" -ge "$limit" ]; then kill "$pid" 2>/dev/null; sleep 5; kill -9 "$pid" 2>/dev/null; wait "$pid"; return 124; fi
+        if [ "$waited" -ge "$limit" ]; then kill "$pid" 2>/dev/null || true; sleep 5; kill -9 "$pid" 2>/dev/null || true; wait "$pid" || true; return 124; fi
         sleep 1; waited=$((waited + 1))
     done
     wait "$pid"
 }
 
 # 4. The gates, short. Each is bounded; a missed gate is reported, not fatal.
-DB_URL=postgres://veil:$DB_PASSWORD@postgres:5432/veil
-LOAD=(load --url https://veil-server:8443 --ca /tls/ca.pem --database-url "$DB_URL" --duration "$DURATION" --warmup 1)
-OWN=(--server /usr/local/bin/veil-server --database-url "$DB_URL" --s3-endpoint http://minio:9000)
+# VEIL_DATABASE_URL is passed through the bench service's environment, never the command line.
+LOAD=(load --url https://veil-server:8443 --ca /tls/ca.pem --duration "$DURATION" --warmup 1)
+OWN=(--server /usr/local/bin/veil-server --s3-endpoint http://minio:9000)
 status=0; summary=()
 gate() { # name, veil-bench arguments...
     local name=$1; shift
@@ -123,12 +126,12 @@ gate() { # name, veil-bench arguments...
     local t0=$SECONDS
     if bounded "$STEP_LIMIT" C run --rm -T --no-deps bench "$@" > "$OUT/$name.log" 2>&1; then r=ok; else
         r="FAIL (exit $?; 124 is the ${STEP_LIMIT}s limit)"; status=1
-        { echo "--- after the failure:"; C ps; C logs --no-color --tail 20 veil-server; } >> "$OUT/$name.log" 2>&1
+        { echo "--- after the failure:"; C ps; C logs --no-color --tail 20 veil-server; } >> "$OUT/$name.log" 2>&1 || true
     fi
     echo "   $r in $((SECONDS - t0))s  ($OUT/$name.log)"
     summary+=("$name: $r")
-    for md in "$OUT/$name"*.md; do [ -f "$md" ] && sed 's/^/   /' "$md"; done
-    grep -iE 'gate|missed|error|after the failure|veil-server-1' "$OUT/$name.log" | head -20 | sed 's/^/   | /'
+    for md in "$OUT/$name"*.md; do [ -f "$md" ] && sed 's/^/   /' "$md" || true; done
+    grep -iE 'gate|missed|error|after the failure|veil-server-1' "$OUT/$name.log" | head -20 | sed 's/^/   | /' || true
 }
 R=/work/results/$STAMP
 for g in $GATES; do

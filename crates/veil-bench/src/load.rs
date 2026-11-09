@@ -1281,6 +1281,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
     let admin_token = api.login(&admin, &unique("admin-"))?;
     let agent_token = api.login(&agent, &agent_name)?;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let db_url = a.server.db_url();
     let cx = Ctx {
         base: &base,
         ca: ca.as_deref(),
@@ -1290,7 +1291,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
         agent_name: &agent_name,
         agent_token: &agent_token,
         server_pid,
-        stats: a.server.database_url.as_deref().map(|u| (&rt, u)),
+        stats: db_url.as_deref().map(|u| (&rt, u)),
         server_stats: _server.as_ref().map(|s: &crate::server::Server| (s.pid(), a.dir.join("server").join("stats.json"))),
     };
     let rates = match a.mode {

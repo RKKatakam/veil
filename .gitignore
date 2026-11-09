@@ -5,5 +5,7 @@ deploy/compose/.env
 deploy/compose/.env.*
 deploy/compose/results/
 deploy/do/.env
+deploy/do/.env.*
+!deploy/do/.env.example
 deploy/do/state/
 deploy/results/
