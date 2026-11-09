@@ -217,13 +217,22 @@ pub fn refused_tree(store: &ObjectStore, err: &VeilError) -> bool {
     matches!(err, VeilError::Missing(_)) && store.may_fetch()
 }
 
+/// Is `e` what a view change makes a command fail with (a refusal, or a
+/// writer's [`no_access`])? Only such a failure is run again after the
+/// clone moved to its person's current view (BUG-1509).
+pub fn is_view_error(e: &VeilError) -> bool {
+    e.is_unreadable() || matches!(e, VeilError::Policy(m) if m.contains(NO_ACCESS))
+}
+
+const NO_ACCESS: &str = "is a folder you no longer have access to";
+
 /// The refusal of a writer that needs the content of a folder whose tree
 /// the server refuses (BUG-1508): it names the folder, says why, and that
 /// nothing was changed.
 pub fn no_access(path: &VPath, why: &str) -> VeilError {
     let shown = if path.is_root() { "/".to_string() } else { format!("{path}/") };
     VeilError::Policy(format!(
-        "{shown} is a folder you no longer have access to (the server refuses its content) and {why}; nothing was changed"
+        "{shown} {NO_ACCESS} (the server refuses its content) and {why}; nothing was changed"
     ))
 }
 

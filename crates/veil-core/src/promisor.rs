@@ -257,6 +257,12 @@ pub(crate) struct Partial {
     in_flight: AtomicU64,
     /// Snapshots the server has no page of history for (no further asks).
     refused: Mutex<HashSet<ObjectId>>,
+    /// The id the server's history gives each snapshot asked for: its
+    /// projection in the person's current view (BUG-1509).
+    projections: Mutex<HashMap<ObjectId, ObjectId>>,
+    /// The server named a snapshot of this clone under another id: the
+    /// person's view changed since the clone met it (BUG-1509).
+    view_changed: std::sync::atomic::AtomicBool,
     /// Parents of the held snapshots this process decoded that the main
     /// store did not hold then: history *below* what the clone holds, which
     /// a page may always bring (BUG-1319). Any other snapshot read is a
@@ -318,6 +324,8 @@ impl ObjectStore {
             fetched: AtomicU64::new(0),
             in_flight: AtomicU64::new(0),
             refused: Mutex::new(HashSet::new()),
+            projections: Mutex::new(HashMap::new()),
+            view_changed: std::sync::atomic::AtomicBool::new(false),
             below: Mutex::new(HashSet::new()),
         }));
     }
@@ -587,13 +595,18 @@ impl ObjectStore {
     /// Is snapshot `s` on the server: one of its tips as last pulled, or
     /// an ancestor of one that this clone holds?
     fn on_server(&self, p: &Partial, promisor: &dyn Promisor, s: &ObjectId) -> bool {
+        self.tips_reach(p, promisor, s) || self.server_knows(p, promisor, s)
+    }
+
+    /// Do the remotes' tips (as the view has them) reach `s`, through what
+    /// this clone holds? No request.
+    fn tips_reach(&self, p: &Partial, promisor: &dyn Promisor, s: &ObjectId) -> bool {
         if p.server.lock().unwrap_or_else(|e| e.into_inner()).contains(s) {
             return true;
         }
-        // Walked since the last snapshots arrived: the set is whole for
-        // what the tips reach; the server may still know it.
+        // Walked since the last snapshots arrived: the set is whole.
         if p.server_walked.load(Ordering::SeqCst) {
-            return self.server_knows(p, promisor, s);
+            return false;
         }
         let mut seen = HashSet::new();
         let mut stack = self.server_tips_now(p, promisor);
@@ -612,7 +625,7 @@ impl ObjectStore {
         let _ = self.take_boundary_hits_of(&seen);
         p.server.lock().unwrap_or_else(|e| e.into_inner()).extend(seen);
         p.server_walked.store(true, Ordering::SeqCst);
-        found || self.server_knows(p, promisor, s)
+        found
     }
 
     /// Does the server know snapshot `s` for this person, whatever the view
@@ -624,20 +637,114 @@ impl ObjectStore {
     /// answers for a snapshot it knows; nothing for a commit only this clone
     /// holds. One request a snapshot, remembered for the process.
     fn server_knows(&self, p: &Partial, promisor: &dyn Promisor, s: &ObjectId) -> bool {
-        if p.refused.lock().unwrap_or_else(|e| e.into_inner()).contains(s) {
-            return false;
-        }
-        match promisor.history(&[*s], 1) {
-            Ok(page) if !page.is_empty() => {
-                p.server.lock().unwrap_or_else(|e| e.into_inner()).insert(*s);
-                true
-            }
-            Ok(_) => {
-                p.refused.lock().unwrap_or_else(|e| e.into_inner()).insert(*s);
-                false
-            }
+        // (Remembered with the projection; never in the tips' set, which
+        // holds only what the tips reach.)
+        match self.projection_in(p, promisor, s) {
+            Ok(Some(_)) => true,
             // Not reached: not known, and the read that asked says so.
-            Err(_) => false,
+            _ => false,
+        }
+    }
+
+    /// The id of snapshot `s` in its person's current view, as the server's
+    /// history gives it (the server resolves a snapshot of an older view
+    /// through the real one and projects that for the view the person has
+    /// now): `s` itself when the view is the one the clone met it in,
+    /// another id when the person's access changed since (BUG-1509), `None`
+    /// for a snapshot the server does not know (a commit only this clone
+    /// holds). The projection is kept (it is the person's to read). One
+    /// request a snapshot, remembered for the process. `None` in a full
+    /// clone.
+    pub fn current_projection(&self, s: &ObjectId) -> Result<Option<ObjectId>> {
+        let Some(p) = self.partial.get() else { return Ok(None) };
+        let Some(promisor) = self.promisor() else {
+            return Err(VeilError::Unavailable("this thin clone has no connection to its server".into()));
+        };
+        self.projection_in(p, &*promisor, s)
+    }
+
+    fn projection_in(&self, p: &Partial, promisor: &dyn Promisor, s: &ObjectId) -> Result<Option<ObjectId>> {
+        if let Some(n) = p.projections.lock().unwrap_or_else(|e| e.into_inner()).get(s) {
+            return Ok(Some(*n));
+        }
+        if p.refused.lock().unwrap_or_else(|e| e.into_inner()).contains(s) {
+            return Ok(None);
+        }
+        let Some((id, raw)) = promisor.history(&[*s], 1)?.into_iter().next() else {
+            p.refused.lock().unwrap_or_else(|e| e.into_inner()).insert(*s);
+            return Ok(None);
+        };
+        if ObjectId::hash(&raw) != id || !matches!(Object::decode(&raw)?, Object::Snapshot(_)) {
+            return Err(VeilError::Corrupt(id.hex(), "the server sent history that does not match its ids".into()));
+        }
+        if !self.has(&id) {
+            self.put_raw(&id, &raw)?;
+        }
+        self.note_projection(*s, id);
+        Ok(Some(id))
+    }
+
+    /// The server gave snapshot `asked` as `got` (a page of its history):
+    /// another id is a view change (BUG-1509).
+    pub(crate) fn note_projection(&self, asked: ObjectId, got: ObjectId) {
+        let Some(p) = self.partial.get() else { return };
+        p.projections.lock().unwrap_or_else(|e| e.into_inner()).insert(asked, got);
+        if asked != got {
+            p.view_changed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Did the server name a snapshot of this clone under another id in
+    /// this process: has its person's view changed since (BUG-1509)?
+    pub fn view_changed(&self) -> bool {
+        self.partial.get().is_some_and(|p| p.view_changed.load(Ordering::SeqCst))
+    }
+
+    /// Is `s` on the server (not a commit only this clone holds)? Always
+    /// `false` in a full clone.
+    /// "Could not ask" is never "not the server's" (BUG-1564): a request
+    /// that fails is an error, and the move it decides stops with nothing
+    /// changed. `false` in a full clone.
+    pub fn is_servers(&self, s: &ObjectId) -> Result<bool> {
+        let Some(p) = self.partial.get() else { return Ok(false) };
+        let Some(promisor) = self.promisor() else {
+            return Err(VeilError::Unavailable("this thin clone has no connection to its server".into()));
+        };
+        if self.tips_reach(p, &*promisor, s) {
+            return Ok(true);
+        }
+        Ok(self.projection_in(p, &*promisor, s)?.is_some())
+    }
+
+    /// The snapshots `tips` reach through what this clone holds (no request,
+    /// nothing fetched): the server's current tips' history, which needs no
+    /// question about its view (BUG-1565).
+    pub fn reached_by(&self, tips: &[ObjectId]) -> HashSet<ObjectId> {
+        self.without_fetching(|| {
+            let mut seen = HashSet::new();
+            let mut stack: Vec<ObjectId> = tips.iter().copied().filter(|t| self.has(t)).collect();
+            while let Some(x) = stack.pop() {
+                if !seen.insert(x) {
+                    continue;
+                }
+                if let Ok(snap) = self.snapshot(&x) {
+                    stack.extend(snap.parents.iter().copied().filter(|p| self.has(p)));
+                }
+            }
+            seen
+        })
+    }
+
+    /// The server refused something met under `snapshot`: in a clone whose
+    /// ids are its person's, only a view change does that, so its
+    /// projection is asked for (BUG-1509). Best effort.
+    fn refusal_under(&self, p: &Partial, promisor: &dyn Promisor, snapshot: &ObjectId) {
+        let at = match self.on_server(p, promisor, snapshot) {
+            true => Some(*snapshot),
+            false => self.server_ancestors(p, promisor, snapshot).first().copied(),
+        };
+        if let Some(s) = at {
+            let _ = self.projection_in(p, promisor, &s);
         }
     }
 
@@ -767,6 +874,7 @@ impl ObjectStore {
             if refused_there || self.on_server(p, &*promisor, &snapshot) {
                 // The server's own answer: nothing there that this person
                 // may see.
+                self.refusal_under(p, &*promisor, &snapshot);
                 return Err(VeilError::Missing(*id));
             }
             return Err(VeilError::Unavailable(format!(
@@ -997,6 +1105,9 @@ impl ObjectStore {
                 }
                 refused |= self.names_held(&t, path, id);
             }
+        }
+        if refused {
+            self.refusal_under(p, promisor, &snapshot);
         }
         Ok((got, refused))
     }

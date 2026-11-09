@@ -1004,6 +1004,18 @@ impl<'a> Builder<'a> {
             });
             let parent_tree = f.parent.as_ref().map(|(t, _)| t.clone());
             let parent_entry = parent_tree.as_deref().and_then(|t| t.get(name));
+            // A folder its person lost access to (BUG-1509): the current
+            // view does not name it, and what the working copy holds there
+            // is theirs: listed, never recorded, never touched.
+            if parent_entry.is_none() && self.opts.materialised.is_some_and(|m| m.lost(&path)) {
+                let files = match kind {
+                    // Links too, never followed (BUG-1559).
+                    NodeKind::Dir => crate::vfs::walk_leaves(self.fs, &path, &|_| false)?.into_iter().map(|(p, _)| p).collect(),
+                    _ => vec![path.clone()],
+                };
+                self.report.not_recorded.extend(files);
+                continue;
+            }
             match kind {
                 NodeKind::Dir => {
                     let class = self.opts.policy.classify(&path, true);
@@ -1056,7 +1068,8 @@ impl<'a> Builder<'a> {
                                 if self.opts.materialised.is_some_and(|m| m.hidden(&path)) {
                                     // What is there is listed, never silently
                                     // left (BUG-1528), and never touched.
-                                    let files = crate::vfs::walk_files(self.fs, &path, &|_| false)?;
+                                    // Links too, never followed (BUG-1559).
+                                    let files: Vec<VPath> = crate::vfs::walk_leaves(self.fs, &path, &|_| false)?.into_iter().map(|(p, _)| p).collect();
                                     self.report.not_recorded.extend(files);
                                     self.report.carried.push(path.clone());
                                     f.out.insert(e.clone());

@@ -484,7 +484,7 @@ fn every_site_that_reads_missing_as_hidden_is_audited() {
         ("selection.rs", 2, "a hidden file is not selectable"),
         ("store.rs", 4, "the read path: Missing only after every local area"),
         ("transaction.rs", 2, "tolerated: an entry kept by id; the fetch-ahead of a move from a snapshot no longer held"),
-        ("tree.rs", 1, "refused_tree (BUG-1508): a tree the server refuses while fetching; readers list it hidden, writers carry it by id or refuse naming it (no_access); with fetching off it stays an error"),
+        ("tree.rs", 2, "refused_tree (BUG-1508): a tree the server refuses while fetching; readers list it hidden, writers carry it by id or refuse naming it (no_access); with fetching off it stays an error; is_view_error (BUG-1509): only such a failure is run again after a move"),
         ("wc_policy.rs", 1, "an unreadable policy"),
     ];
     let found = count_in_src(|t| t.matches("is_unreadable()").count() + t.matches("VeilError::Missing(").count());
@@ -1053,4 +1053,207 @@ fn s8r2_a_refusal_met_on_one_thread_never_hides_another_threads_read() {
         h
     });
     assert!(hidden.is_empty(), "{} of 600 files the server serves read as Missing (hidden) while another thread met a refusal: {:?}", hidden.len(), &hidden[..hidden.len().min(10)]);
+}
+
+// ---- Review of `s8j` (BUG-1509's move to the current view) ----
+
+/// Copy snapshot `s`, its ancestors and every object their trees name from
+/// `from` to `to` (a second view's history on the same test server).
+fn copy_closure(from: &ObjectStore, to: &ObjectStore, s: ObjectId) {
+    let mut stack = vec![s];
+    let mut seen = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        to.put_raw(&id, &from.get_raw(&id).unwrap()).unwrap();
+        match from.get(&id).unwrap() {
+            Object::Snapshot(snap) => {
+                stack.extend(snap.parents.iter().copied());
+                stack.push(snap.tree);
+            }
+            Object::Tree(t) => stack.extend(t.entries.iter().map(|e| e.id)),
+            _ => {}
+        }
+    }
+}
+
+/// A server whose person's view changed: `history` answers each snapshot of
+/// the older view with its projection in the current one (as the Veil
+/// server does, `sync::history`), and fails once, as a transient error,
+/// for the snapshots in `flaky`; it refuses (an empty answer, as the Veil
+/// server's 404) those in `refused`, and answers every request `delay`
+/// late.
+struct Projecting {
+    inner: Arc<Server>,
+    map: std::collections::HashMap<ObjectId, ObjectId>,
+    flaky: Mutex<HashSet<ObjectId>>,
+    refused: HashSet<ObjectId>,
+    delay: std::time::Duration,
+    tips: Vec<ObjectId>,
+}
+
+impl Promisor for Projecting {
+    fn fetch(&self, wants: &[Located]) -> veil_core::Result<Vec<Option<Vec<u8>>>> {
+        self.inner.fetch(wants)
+    }
+
+    fn history(&self, tips: &[ObjectId], limit: usize) -> veil_core::Result<Vec<(ObjectId, Vec<u8>)>> {
+        std::thread::sleep(self.delay);
+        if let [t] = tips {
+            if self.flaky.lock().unwrap().remove(t) {
+                return Err(VeilError::Unavailable("test server: 502 bad gateway".into()));
+            }
+            if self.refused.contains(t) {
+                return Ok(Vec::new());
+            }
+        }
+        let tips: Vec<ObjectId> = tips.iter().map(|t| *self.map.get(t).unwrap_or(t)).collect();
+        self.inner.history(&tips, limit)
+    }
+
+    fn server_tips(&self) -> Vec<ObjectId> {
+        self.tips.clone()
+    }
+
+    fn generations(&self, snapshots: &[ObjectId]) -> veil_core::Result<Option<Vec<Option<u64>>>> {
+        self.inner.generations(snapshots)
+    }
+}
+
+/// BUG-1564 (review of `s8j`): a transient error from the server while the
+/// clone moves to its person's current view is taken for "this snapshot is
+/// only this clone's" (`ObjectStore::is_servers` is `false` on any failed
+/// request), so the move rewrites the server's own change as if it were
+/// local work: `main` is left on a local copy of the admin's commit,
+/// divergent from the server's, instead of its projection. Expected: a
+/// failed request fails the move, which changes nothing (the command, or
+/// the next one, moves).
+#[test]
+fn s8jr_a_transient_error_during_the_move_never_rewrites_a_server_change() {
+    // The older view: `c1` (src/ and bill/), then `c2` (src/ only).
+    let id = Identity::generate("alice");
+    let sfs = Arc::new(MemoryBackend::new());
+    let mut srepo = Repo::init(sfs.clone(), Some(id.clone()), "alice").unwrap();
+    let c1 = commit_files(&mut srepo, &*sfs, &[("src/a.txt", "a one\n"), ("bill/x.txt", "billing\n")], "one");
+    let c2 = commit_files(&mut srepo, &*sfs, &[("src/a.txt", "a two\n")], "two");
+    // `main` was rewritten on the server since: the remote tag names `c2b`,
+    // and no remote tag reaches `c2`, which the person's work stands on.
+    checkout(&mut srepo, &sfs, c1);
+    let c2b = commit_files(&mut srepo, &*sfs, &[("src/a.txt", "a two, again\n")], "two again");
+    // The current view, without bill/: the same commits projected.
+    let pfs = Arc::new(MemoryBackend::new());
+    let mut prepo = Repo::init(pfs.clone(), Some(id.clone()), "alice").unwrap();
+    let n1 = commit_files(&mut prepo, &*pfs, &[("src/a.txt", "a one\n")], "one");
+    let n2 = commit_files(&mut prepo, &*pfs, &[("src/a.txt", "a two\n")], "two");
+    copy_closure(prepo.store(), srepo.store(), n2);
+    let server = Arc::new(Server {
+        store: srepo.store().clone(),
+        tips: vec![c2b],
+        down: AtomicBool::new(false),
+        tamper: AtomicBool::new(false),
+        refuse: Mutex::new(HashSet::new()),
+        asked: Mutex::new(Vec::new()),
+        pages: Mutex::new(0),
+    });
+    let pr = Project { server: server.clone(), commits: vec![c1, c2, c2b], tip: c2b, id };
+    let (mut repo, fs) = thin(&pr, 1 << 30);
+    // History as a clone pages it in: the snapshots below its tips.
+    for s in [c1, c2] {
+        repo.store().put_raw(&s, &pr.server.store.get_raw(&s).unwrap()).unwrap();
+    }
+    checkout(&mut repo, &fs, c2);
+    let mine = commit_files(&mut repo, &*fs, &[("src/mine.txt", "mine\n")], "mine");
+    repo.set_tag("main", c2, true).unwrap();
+    repo.set_tag("mine", mine, true).unwrap();
+    // The person's access changed; the next command (a new process) moves
+    // the clone, and one history request fails on the way.
+    drop(repo);
+    let mut repo = Repo::open(fs.clone(), Some(pr.id.clone()), "alice").unwrap();
+    repo.store().set_promisor(Arc::new(Projecting {
+        inner: server.clone(),
+        map: [(c1, n1), (c2, n2)].into_iter().collect(),
+        flaky: Mutex::new(HashSet::from([c2])),
+        refused: HashSet::new(),
+        delay: std::time::Duration::ZERO,
+        tips: vec![c2b],
+    }));
+    let before = repo.view().tags.clone();
+    let mut tx = repo.transaction("pull").unwrap();
+    // Actual: `Ok` with 3 changes moved, `c2` among them; at commit `main`
+    // names a snapshot of the clone's own, `c2` rewritten onto `n1` and
+    // signed by the clone (its predecessor `c2`), not `n2`.
+    let r = tx.move_to_view();
+    let err = r.expect_err("a failed request must fail the move");
+    assert!(matches!(err, VeilError::Unavailable(_)), "{err:?}");
+    drop(tx);
+    assert_eq!(repo.view().tags, before, "nothing changed");
+}
+
+/// Guarantee 1 (review of `s8k`): neither slow answers nor the server's
+/// refusal of another snapshot make the move take a server change for the
+/// clone's own work. As in BUG-1564's test (`main` names `c2`, which the
+/// server's tips no longer reach and a change of the clone's own stands
+/// on), but no request fails: every history request is answered late, as
+/// under load, and the server refuses one other snapshot the clone tags
+/// (`other`: an empty answer, its 404). Expected: the move succeeds, `main`
+/// names `c2`'s projection `n2`, the clone's change stands on `n2`, and no
+/// snapshot the move made is a rewrite of `c2`.
+#[test]
+fn s8kr_slow_answers_and_another_refusal_never_rewrite_a_server_change() {
+    let id = Identity::generate("alice");
+    let sfs = Arc::new(MemoryBackend::new());
+    let mut srepo = Repo::init(sfs.clone(), Some(id.clone()), "alice").unwrap();
+    let c1 = commit_files(&mut srepo, &*sfs, &[("src/a.txt", "a one\n"), ("bill/x.txt", "billing\n")], "one");
+    let c2 = commit_files(&mut srepo, &*sfs, &[("src/a.txt", "a two\n")], "two");
+    checkout(&mut srepo, &sfs, c1);
+    let c2b = commit_files(&mut srepo, &*sfs, &[("src/a.txt", "a two, again\n")], "two again");
+    checkout(&mut srepo, &sfs, c1);
+    let other = commit_files(&mut srepo, &*sfs, &[("src/other.txt", "other\n")], "other");
+    let pfs = Arc::new(MemoryBackend::new());
+    let mut prepo = Repo::init(pfs.clone(), Some(id.clone()), "alice").unwrap();
+    let n1 = commit_files(&mut prepo, &*pfs, &[("src/a.txt", "a one\n")], "one");
+    let n2 = commit_files(&mut prepo, &*pfs, &[("src/a.txt", "a two\n")], "two");
+    copy_closure(prepo.store(), srepo.store(), n2);
+    let server = Arc::new(Server {
+        store: srepo.store().clone(),
+        tips: vec![c2b],
+        down: AtomicBool::new(false),
+        tamper: AtomicBool::new(false),
+        refuse: Mutex::new(HashSet::new()),
+        asked: Mutex::new(Vec::new()),
+        pages: Mutex::new(0),
+    });
+    let pr = Project { server: server.clone(), commits: vec![c1, c2, c2b, other], tip: c2b, id };
+    let (mut repo, fs) = thin(&pr, 1 << 30);
+    for s in [c1, c2, other] {
+        repo.store().put_raw(&s, &pr.server.store.get_raw(&s).unwrap()).unwrap();
+    }
+    checkout(&mut repo, &fs, c2);
+    let mine = commit_files(&mut repo, &*fs, &[("src/mine.txt", "mine\n")], "mine");
+    repo.set_tag("main", c2, true).unwrap();
+    repo.set_tag("mine", mine, true).unwrap();
+    repo.set_tag("other", other, true).unwrap();
+    drop(repo);
+    let mut repo = Repo::open(fs.clone(), Some(pr.id.clone()), "alice").unwrap();
+    repo.store().set_promisor(Arc::new(Projecting {
+        inner: server.clone(),
+        map: [(c1, n1), (c2, n2)].into_iter().collect(),
+        flaky: Mutex::new(HashSet::new()),
+        refused: HashSet::from([other]),
+        delay: std::time::Duration::from_millis(150),
+        tips: vec![c2b],
+    }));
+    let mut tx = repo.transaction("pull").unwrap();
+    let m = tx.move_to_view().expect("slow answers and another snapshot's refusal do not stop the move");
+    assert!(m.moved >= 1, "the clone's change moved: {m:?}");
+    tx.commit().unwrap();
+    let tags = repo.view().tags.clone();
+    assert_eq!(tags["main"].target, n2, "`main` names c2's projection, not a copy of c2");
+    assert_eq!(repo.snapshot(&tags["mine"].target).unwrap().parents, vec![n2], "the clone's change stands on c2's projection");
+    let mut made: Vec<ObjectId> = repo.view().heads.iter().copied().collect();
+    made.extend(tags.values().map(|t| t.target));
+    for h in made {
+        assert!(!repo.snapshot(&h).unwrap().predecessors.contains(&c2), "{} rewrites the server's c2", h.short());
+    }
 }

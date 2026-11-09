@@ -756,6 +756,11 @@ impl Repo {
             return Ok(0);
         }
         let page = promisor.history(&wanted, limit)?;
+        // One snapshot asked for: the page starts with it as the person's
+        // current view has it; another id is a view change (BUG-1509).
+        if let ([asked], Some((first, _))) = (wanted.as_slice(), page.first()) {
+            self.store.note_projection(*asked, *first);
+        }
         let mut incoming = crate::remote::Incoming::new(&self.store);
         let mut new = 0;
         for (id, raw) in page {

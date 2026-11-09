@@ -260,7 +260,12 @@ fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>, mut thin: Optio
 
 pub fn pull(ctx: &mut Ctx, remote: &str) -> Result<()> {
     let (client, cfg) = client_for(ctx, remote)?;
-    let r = hub::pull(&mut ctx.repo, remote, &client, cfg.only.as_deref())?;
+    let mv = if moves() { hub::MoveView::IfChanged } else { hub::MoveView::No };
+    let (r, moved) = hub::pull_moving(&mut ctx.repo, remote, &client, cfg.only.as_deref(), false, mv)?;
+    MOVED.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(m) = moved {
+        report_move(ctx, &m)?;
+    }
     for (t, id) in &r.tags_updated {
         println!("  {} {} → {}", green("updated"), cyan(&safe(t)), id.short());
     }
@@ -269,6 +274,124 @@ pub fn pull(ctx: &mut Ctx, remote: &str) -> Result<()> {
     }
     println!("Pulled {} object(s) from {remote}", r.objects_copied);
     crate::share_cmd::after_pull(ctx, &client);
+    Ok(())
+}
+
+/// Whether this process moved its clone to the person's current view
+/// already (or pulled, which does when needed): at most once a command
+/// (BUG-1509).
+static MOVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Debug builds only: `VEIL_TEST_NO_VIEW_MOVE` keeps a clone in the view it
+/// has, for the tests of what each command does in a view that changed
+/// (BUG-1508), which the move otherwise leaves after the first.
+fn moves() -> bool {
+    !(cfg!(debug_assertions) && std::env::var_os("VEIL_TEST_NO_VIEW_MOVE").is_some())
+}
+
+/// After a command: if what it read showed that the person's view changed
+/// (the server named a snapshot of this clone under another id), move the
+/// clone to their current view, once, in one operation (BUG-1509). `true`
+/// when it moved. Never after `vl undo`, `vl redo` or `vl op`: those go
+/// where the person asked, a move included.
+pub fn move_if_view_changed(ctx: &mut Ctx, cmd: &crate::cli::Cmd) -> Result<bool> {
+    use crate::cli::Cmd;
+    if !moves() || matches!(cmd, Cmd::Undo { .. } | Cmd::Redo | Cmd::Op(..) | Cmd::Pull { .. }) || MOVED.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(false);
+    }
+    if !ctx.repo.store().view_changed() {
+        return Ok(false);
+    }
+    move_now(ctx, hub::MoveView::Always)
+}
+
+/// Before a push: what it sends stands on server snapshots this clone met
+/// in a view its person no longer has? Then the clone moves first, and the
+/// push sends the work as the current view has it, which the server grafts
+/// (BUG-1509).
+pub fn move_before_push(ctx: &mut Ctx, remote: &str, only_tags: &[String]) -> Result<bool> {
+    if !moves() || MOVED.load(std::sync::atomic::Ordering::SeqCst) || !ctx.repo.is_partial() {
+        return Ok(false);
+    }
+    if ctx.repo.config().partial.as_ref().is_none_or(|p| p.remote != remote) {
+        return Ok(false);
+    }
+    // What the push sends: the tags it names (all, without `-t`) that are
+    // not where the remote has them (BUG-1565).
+    let store = ctx.repo.store().clone();
+    let v = ctx.repo.view();
+    let mut stack: Vec<veil_core::ObjectId> = v
+        .tags
+        .iter()
+        .filter(|(n, _)| only_tags.is_empty() || only_tags.contains(n))
+        .filter(|(n, t)| v.remote_tags.get(&format!("{remote}/{n}")) != Some(&t.target))
+        .map(|(_, t)| t.target)
+        .collect();
+    if stack.is_empty() {
+        return Ok(false);
+    }
+    // What the server's current tips reach needs no question. A tip this
+    // clone does not hold (someone pushed since its last pull) is paged in
+    // first, once for all of them, as a pull would: else nothing is reached
+    // and every server snapshot the push stands on is asked about, one
+    // request a tag (BUG-1575).
+    let (client, _) = client_for(ctx, remote)?;
+    let current: Vec<veil_core::ObjectId> = client.tips()?.map(|t| t.branches.values().copied().collect()).unwrap_or_default();
+    let unheld: Vec<veil_core::ObjectId> = current.iter().copied().filter(|t| !store.has(t)).collect();
+    if !unheld.is_empty() {
+        ctx.repo.deepen(&unheld, veil_core::promisor::HISTORY_PAGE)?;
+    }
+    let reached = store.reached_by(&current);
+    let mut seen = std::collections::HashSet::new();
+    let root = ctx.repo.root_id();
+    while let Some(id) = stack.pop() {
+        if id == root || reached.contains(&id) || !seen.insert(id) || seen.len() > 10_000 {
+            continue;
+        }
+        if store.is_servers(&id)? {
+            if store.current_projection(&id)?.is_some_and(|n| n != id) {
+                return move_now(ctx, hub::MoveView::Always);
+            }
+            continue;
+        }
+        stack.extend(ctx.repo.snapshot(&id)?.parents.iter().copied());
+    }
+    Ok(false)
+}
+
+fn move_now(ctx: &mut Ctx, mv: hub::MoveView) -> Result<bool> {
+    MOVED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let Some(remote) = ctx.repo.config().partial.as_ref().map(|p| p.remote.clone()) else { return Ok(false) };
+    let (client, cfg) = client_for(ctx, &remote)?;
+    let (_, moved) = hub::pull_moving(&mut ctx.repo, &remote, &client, cfg.only.as_deref(), false, mv)?;
+    match moved {
+        Some(m) => {
+            report_move(ctx, &m)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// The one line a move prints, what it kept and why, and the folders the
+/// working copy's change lost, recorded before the working copy follows.
+fn report_move(ctx: &mut Ctx, m: &veil_core::transaction::ViewMove) -> Result<()> {
+    eprintln!(
+        "{}",
+        yellow(&format!("your access changed; moved {} change{} to your current view", m.moved, if m.moved == 1 { "" } else { "s" }))
+    );
+    for k in &m.kept {
+        let folder = if k.folder.is_root() { "a folder it cannot tell".to_string() } else { format!("{}/", safe(k.folder.as_str())) };
+        eprintln!(
+            "  {} {} (it edits {folder}, which you no longer have access to){}",
+            yellow("kept where it is:"),
+            crate::render::one_line(&ctx.repo, &k.id),
+            if m.kept_with > 0 { format!("; {} change(s) built with it stay too", m.kept_with) } else { String::new() }
+        );
+    }
+    if let Some(paths) = m.lost.get(&ctx.ws).cloned() {
+        ctx.mark_lost(&paths)?;
+    }
     Ok(())
 }
 

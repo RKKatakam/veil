@@ -881,6 +881,31 @@ pub fn pull(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>) 
 /// object they reach into the main store (`vl partial full`), as a full
 /// clone holds them.
 pub fn pull_with(repo: &mut Repo, remote: &str, client: &Client, only: Option<&str>, widen: bool) -> Result<SyncReport> {
+    Ok(pull_moving(repo, remote, client, only, widen, MoveView::No)?.0)
+}
+
+/// When a pull also moves a thin clone to its person's current view
+/// (BUG-1509).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MoveView {
+    No,
+    /// When the server names a snapshot this clone met under another id
+    /// (a tip it last pulled, or anything this process read).
+    IfChanged,
+    /// The command saw the view change: move whatever it finds.
+    Always,
+}
+
+/// [`pull_with`], and in the same operation (one `vl undo` reverts both)
+/// the move to the person's current view `mv` asks for.
+pub fn pull_moving(
+    repo: &mut Repo,
+    remote: &str,
+    client: &Client,
+    only: Option<&str>,
+    widen: bool,
+    mv: MoveView,
+) -> Result<(SyncReport, Option<veil_core::transaction::ViewMove>)> {
     let tips = client
         .tips()?
         .ok_or_else(|| anyhow!("no project '{}' that you can see on {}", client.url.project, client.url.authority))?;
@@ -1075,9 +1100,47 @@ pub fn pull_with(repo: &mut Repo, remote: &str, client: &Client, only: Option<&s
             )
         })
         .collect();
+    let old_tips: Vec<ObjectId> = tx.view.remote_tags.iter().filter(|(k, _)| k.starts_with(&prefix)).map(|(_, v)| *v).collect();
     apply_remote_tags(&mut tx, remote, tags, None, &mut report)?;
+    // The person's view changed since this clone last pulled: a tip it had
+    // is named under another id now (BUG-1509).
+    let moving = thin
+        && match mv {
+            MoveView::No => false,
+            MoveView::Always => true,
+            MoveView::IfChanged => {
+                let mut changed = store.view_changed();
+                for t in old_tips.iter().filter(|t| !tips.branches.values().any(|n| n == *t)) {
+                    if changed {
+                        break;
+                    }
+                    changed = store.current_projection(t)?.is_some_and(|n| n != *t);
+                }
+                changed
+            }
+        };
+    let moved = match moving {
+        true => {
+            let m = tx.move_to_view()?;
+            // Something moved: the warnings of tags the pull found diverged
+            // and the move put on their remote tags are gone.
+            if m.moved > 0 || m.mapped > 0 {
+                tx.set_description(format!("pull from {remote}; your access changed: moved {} change(s) to your current view", m.moved));
+                let now: Vec<String> = tx
+                    .view
+                    .tags
+                    .iter()
+                    .filter(|(n, t)| tx.view.remote_tags.get(&format!("{remote}/{n}")) == Some(&t.target))
+                    .map(|(n, _)| format!("tag '{n}' has diverged from {remote}/{n}"))
+                    .collect();
+                report.warnings.retain(|w| !now.iter().any(|n| w.starts_with(n.as_str())));
+            }
+            Some(m).filter(|m| m.moved > 0 || m.mapped > 0)
+        }
+        false => None,
+    };
     tx.commit()?;
-    Ok(report)
+    Ok((report, moved))
 }
 
 /// For a clone of one directory: `tree` with only the path to `only` and

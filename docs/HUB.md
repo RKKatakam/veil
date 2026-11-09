@@ -3342,13 +3342,50 @@ protocol or server change.
     left-out checkout kept is compared with the version the folder was left
     from (`Materialised::left`): the checkout's own copy is written over;
     the person's edit is kept as it is and is a conflict in `vl status`
-    (`kept_edit` in `veil.status`) until `vl restore` takes the recorded
-    version (BUG-1531).
-  * **Outside this:** what a clone never fetched of the view before an
-    access change (a snapshot, the root) is not served any more and fails
-    with "not present", and work that carries a refused folder by id is
-    refused by a push (BUG-1509, open: the clone moving to the current
-    view by itself is designed, not built).
+    (`kept_edit` in `veil.status`) while `@`'s parents record exactly the
+    version written back: `vl restore PATH` takes that version, and a
+    commit of the person's own resolves it (BUG-1531, BUG-1558). Links the
+    person makes there are named too (BUG-1559).
+  * **after an access change the clone moves to the person's current view
+    by itself** (decided, BUG-1509; thin clones). The server names every
+    snapshot above a folder the person lost under another id, and serves
+    the old ids no more. When a command's reads show it (a refusal under a
+    server snapshot, or a page of history that names a snapshot under
+    another id: `ObjectStore::current_projection`), when `vl pull` finds a
+    tip it had named so, or before a push whose work stands on such a
+    snapshot, `vl` moves the clone once, in one operation with a pull
+    (`Transaction::move_to_view`, `hub::pull_moving`), reports it in one
+    line ("your access changed; moved N changes to your current view"),
+    and runs a command again only if the view change made it fail (never
+    a `vl ws exec`). A request that fails on the way stops the move with
+    nothing changed, a warning, and the next command tries again
+    (BUG-1564); before a push it asks only about what the push sends and
+    the server's current tips do not reach (BUG-1565), paging in the tips
+    it does not hold yet once, as a pull would (BUG-1575). Every server snapshot a
+    tag, head or workspace names, or that a change only this clone holds
+    stands on, is replaced by its current projection, and each such change
+    is rebased onto its parents' (`Repo::rebase_tree`): what the new parent
+    no longer names is gone from it, and the server grafts it back on push.
+    Nothing below a lost folder is read or written: the paths lost are
+    where the old and new parents differ, and a change is compared with
+    its parent only there. A change that edited inside one is refused by
+    name ("kept where it is: … (it edits bill/, which you no longer have
+    access to)") and stays exactly where it is, never rewritten, with every
+    change connected to it. Tags, workspaces and heads follow; `vl undo`
+    returns the clone exactly to before (and `vl undo`, `redo` and `op`
+    never move it). The working copy follows its change: the folder is
+    recorded as lost (`Materialised::lost`), what the working copy holds
+    there is the person's, never recorded (`vl status`, BUG-1528), and
+    when access comes back (another move) the folder is written whole, a
+    file left there written over where it is the checkout's own copy (by
+    its bytes, `Materialised::own`, without the old version's key) and kept
+    as a conflict where it is the person's edit (BUG-1531). What each
+    command does in a view that changed (BUG-1508) still holds for the
+    command that finds it. **Outside this:** a full clone is not moved
+    (BUG-1562), an explicit rebase of a change kept in the old view
+    rewrites it with a conflict at the lost folder (BUG-1563), and a
+    workspace on a snapshot the clone never fetched is kept in the old
+    view, its `vl ws exec` running on no files (BUG-1573).
   * **content already held reads at every path naming it** (decided,
     BUG-1464): removal of access stops new fetches; bytes already on a
     machine stay readable there, at any path naming them, as they are in a

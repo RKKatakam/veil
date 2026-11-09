@@ -167,6 +167,21 @@ pub struct Materialised {
     /// where the working copy held the person's own edit of the version
     /// left: kept, and a conflict for `vl status` until written over.
     kept_edits: BTreeSet<VPath>,
+    /// For each kept edit, the version written back there (`None`: no
+    /// file): the edit is a conflict only while `@` and its parents record
+    /// exactly that (BUG-1558).
+    kept_versions: BTreeMap<VPath, Option<ObjectId>>,
+    /// Folders the working copy's change no longer names because its person
+    /// lost access to them (the clone moved to their current view,
+    /// BUG-1509): what the working copy holds there is theirs, never
+    /// recorded, never touched.
+    lost: BTreeSet<VPath>,
+    /// Files a checkout removed a version of but had to leave on disk (a
+    /// secret the policy keeps local) while they held exactly what it wrote:
+    /// the plaintext id of that content, so a folder coming back writes over
+    /// them without the old version's key, which its person may no longer
+    /// hold, and keeps them if edited since (BUG-1509, BUG-1531).
+    own: BTreeMap<VPath, ObjectId>,
 }
 
 /// On-disk form of [`Materialised`]: paths are plain strings, validated when
@@ -187,6 +202,12 @@ struct MaterialisedRaw {
     refused: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     kept_edits: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    kept_versions: BTreeMap<String, Option<ObjectId>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    lost: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    own: BTreeMap<String, ObjectId>,
 }
 
 impl TryFrom<MaterialisedRaw> for Materialised {
@@ -208,6 +229,9 @@ impl TryFrom<MaterialisedRaw> for Materialised {
             left: r.left.iter().map(|(s, id)| Ok((path(s)?, *id))).collect::<std::result::Result<_, String>>()?,
             refused: r.refused.iter().map(|s| path(s)).collect::<std::result::Result<_, _>>()?,
             kept_edits: r.kept_edits.iter().map(|s| path(s)).collect::<std::result::Result<_, _>>()?,
+            kept_versions: r.kept_versions.iter().map(|(s, id)| Ok((path(s)?, *id))).collect::<std::result::Result<_, String>>()?,
+            lost: r.lost.iter().map(|s| path(s)).collect::<std::result::Result<_, _>>()?,
+            own: r.own.iter().map(|(s, id)| Ok((path(s)?, *id))).collect::<std::result::Result<_, String>>()?,
         })
     }
 }
@@ -222,6 +246,9 @@ impl From<Materialised> for MaterialisedRaw {
             left: m.left.into_iter().map(|(p, id)| (p.as_str().to_string(), id)).collect(),
             refused: m.refused.into_iter().map(|p| p.as_str().to_string()).collect(),
             kept_edits: m.kept_edits.into_iter().map(|p| p.as_str().to_string()).collect(),
+            kept_versions: m.kept_versions.into_iter().map(|(p, id)| (p.as_str().to_string(), id)).collect(),
+            lost: m.lost.into_iter().map(|p| p.as_str().to_string()).collect(),
+            own: m.own.into_iter().map(|(p, id)| (p.as_str().to_string(), id)).collect(),
         }
     }
 }
@@ -251,7 +278,7 @@ impl Materialised {
 
     /// Nothing hidden, nothing from a fallback, nothing converted.
     pub fn is_empty(&self) -> bool {
-        self.view.is_none() && self.hidden.is_empty() && self.fallback.is_empty() && self.crlf.is_empty() && self.left.is_empty() && self.refused.is_empty() && self.kept_edits.is_empty()
+        self.view.is_none() && self.hidden.is_empty() && self.fallback.is_empty() && self.crlf.is_empty() && self.left.is_empty() && self.refused.is_empty() && self.kept_edits.is_empty() && self.lost.is_empty() && self.own.is_empty()
     }
 
     /// Did checkout write the file at `path` with CRLF line endings for
@@ -277,10 +304,81 @@ impl Materialised {
         self.hidden.iter()
     }
 
+    /// Is the file at `path` the checkout's own copy of version `old` (what
+    /// it wrote, or what it recorded as its own when it had to leave it)?
+    fn own_copy(&self, store: &ObjectStore, fs: &dyn StorageBackend, path: &VPath, old: Option<&TreeEntry>, cache: Option<&StatCache>) -> bool {
+        old.is_some_and(|o| holds_version(store, fs, path, o, cache, &self.crlf))
+            || self.own.get(path).is_some_and(|id| fs.read(path).is_ok_and(|d| Object::blob_id(&d) == *id))
+    }
+
+    /// Mark `paths` as folders the working copy's change no longer names
+    /// because its person lost access to them (BUG-1509).
+    pub fn mark_lost(&mut self, paths: impl IntoIterator<Item = (VPath, Option<ObjectId>)>) {
+        for (p, was) in paths.into_iter().filter(|(p, _)| !p.is_root()) {
+            if let Some(w) = was {
+                self.left.entry(p.clone()).or_insert(w);
+            }
+            self.lost.insert(p);
+        }
+    }
+
+    /// A checkout writing a folder lost before (access came back, and the
+    /// clone moved to a view that names it again, BUG-1509): a file on
+    /// disk there is the checkout's own copy of the version the folder was
+    /// lost from where it holds exactly that (written over), and the
+    /// person's edit where it does not (kept, and a conflict for `vl
+    /// status`), as for a folder left out (BUG-1531).
+    fn refill_lost(&mut self, store: &ObjectStore, fs: &dyn StorageBackend, changes: Vec<TreeChange>, cache: Option<&StatCache>) -> Result<Vec<TreeChange>> {
+        let lost: Vec<VPath> = self.lost.iter().filter(|l| changes.iter().any(|c| c.new.is_some() && c.path.starts_with(l))).cloned().collect();
+        if lost.is_empty() {
+            return Ok(changes);
+        }
+        let mut versions: Vec<(VPath, BTreeMap<VPath, TreeEntry>)> = Vec::new();
+        for l in &lost {
+            let old = match self.left.remove(l) {
+                Some(o) => match walk_files_hiding(store, &o) {
+                    Ok((files, _)) => files.into_iter().collect(),
+                    Err(err) if refused_tree(store, &err) => BTreeMap::new(),
+                    Err(err) => return Err(err),
+                },
+                None => BTreeMap::new(),
+            };
+            versions.push((l.clone(), old));
+        }
+        let mut out = Vec::with_capacity(changes.len());
+        for c in changes {
+            let at = versions.iter().find(|(l, _)| c.path.starts_with(l));
+            if let (Some((l, old)), Some(_), None) = (at, &c.new, &c.old) {
+                if fs.metadata(&c.path)?.is_some() {
+                    let rel = VPath::new(&c.path.as_str()[l.as_str().len() + 1..]).expect("a path below the folder");
+                    if !self.own_copy(store, fs, &c.path, old.get(&rel), cache) {
+                        self.kept_versions.insert(c.path.clone(), c.new.as_ref().map(|e| e.id));
+                        self.kept_edits.insert(c.path.clone());
+                        continue;
+                    }
+                    fs.remove_file(&c.path)?;
+                }
+            }
+            out.push(c);
+        }
+        Ok(out)
+    }
+
+    /// Is `path` a folder its person lost access to (BUG-1509)?
+    pub fn lost(&self, path: &VPath) -> bool {
+        self.lost.contains(path)
+    }
+
     /// Files written back below a folder readable again where the working
     /// copy kept the person's own edit of the version left (BUG-1531).
     pub fn kept_edits(&self) -> impl Iterator<Item = &VPath> {
         self.kept_edits.iter()
+    }
+
+    /// The version written back where `path`'s edit was kept: `Some(None)`
+    /// for no file, `None` when not recorded (an older record).
+    pub fn kept_version(&self, path: &VPath) -> Option<Option<ObjectId>> {
+        self.kept_versions.get(path).copied()
     }
 
     /// What checkout wrote at `path` instead of the entry itself, if it did
@@ -317,13 +415,25 @@ impl Materialised {
         for c in changes {
             self.hidden.remove(&c.path);
             self.kept_edits.remove(&c.path);
-            // A folder left out whose files are now written (BUG-1508).
+            self.kept_versions.remove(&c.path);
+            if c.new.is_some() {
+                self.own.remove(&c.path);
+            }
+            // A folder left out whose files are now written (BUG-1508); one
+            // lost is named again only when something is written below it
+            // (the move's own checkout removes what it wrote there).
             let mut up = c.path.parent();
             while let Some(d) = up.filter(|d| !d.is_root()) {
                 self.hidden.remove(&d);
                 self.left.remove(&d);
                 self.refused.remove(&d);
+                if c.new.is_some() {
+                    self.lost.remove(&d);
+                }
                 up = d.parent();
+            }
+            if c.new.is_some() {
+                self.lost.remove(&c.path);
             }
             self.fallback.remove(&c.path);
             self.crlf.remove(&c.path);
@@ -389,19 +499,15 @@ impl Materialised {
                         // The checkout's own copy: the bytes it wrote of the
                         // version left (whatever the policy keeps local, a
                         // copy of a version is not the person's file).
-                        let ours = |path: &VPath, rel: &VPath| -> bool {
-                            match (old.get(rel), fs.read(path)) {
-                                (Some(o), Ok(disk)) => read_materialised(store, o).is_ok_and(|(want, _)| want == disk),
-                                _ => false,
-                            }
-                        };
+                        let mut kept: Vec<(VPath, Option<ObjectId>)> = Vec::new();
+                        let ours = |path: &VPath, rel: &VPath| self.own_copy(store, fs, path, old.get(rel), cache.as_deref());
                         let mut seen = BTreeSet::new();
                         for (rel, f) in walk_files_hiding(store, &e.id)?.0 {
                             let path = at(&rel);
                             seen.insert(rel.clone());
                             if fs.metadata(&path)?.is_some() {
                                 if !ours(&path, &rel) {
-                                    self.kept_edits.insert(path);
+                                    kept.push((path, Some(f.id)));
                                     continue;
                                 }
                                 fs.remove_file(&path)?;
@@ -413,11 +519,13 @@ impl Materialised {
                             if fs.metadata(&path)?.is_some() {
                                 match ours(&path, rel) {
                                     true => fs.remove_file(&path)?,
-                                    false => {
-                                        self.kept_edits.insert(path);
-                                    }
+                                    false => kept.push((path, None)),
                                 }
                             }
+                        }
+                        for (k, v) in kept {
+                            self.kept_versions.insert(k.clone(), v);
+                            self.kept_edits.insert(k);
                         }
                         self.left.remove(&p);
                         self.refused.remove(&p);
@@ -505,12 +613,26 @@ pub fn checkout_recorded(
 ) -> Result<CheckoutReport> {
     let shown = record.view.or(from.copied());
     let (changes, left_out) = checkout_changes(store, shown.as_ref(), to)?;
+    let changes = record.refill_lost(store, fs, changes, cache.as_deref())?;
     let mut report = apply_changes(store, fs, shown.as_ref(), to, &changes, cache.as_deref_mut(), Some(&record.crlf))?;
+    // A version's file the checkout had to leave on disk though it held
+    // exactly what it wrote: remembered as its own (see `Materialised::own`).
+    for c in changes.iter().filter(|c| c.new.is_none()) {
+        if let Some(o) = &c.old {
+            if fs.metadata(&c.path)?.is_some() && holds_version(store, fs, &c.path, o, cache.as_deref(), &record.crlf) {
+                if let Ok(d) = fs.read(&c.path) {
+                    record.own.insert(c.path.clone(), Object::blob_id(&d));
+                }
+            }
+        }
+    }
     report.redacted.extend(left_out.iter().map(|(p, _)| p.clone()));
     record.absorb(fs, &changes, &report)?;
     // The version each folder was left from, for when it is readable again
     // (BUG-1531); one left before keeps the version it was left from.
     for (p, old) in left_out {
+        // Named by the tree again (an undo of a move, BUG-1509): not lost.
+        record.lost.remove(&p);
         record.refused.insert(p.clone());
         if let Some(old) = old {
             record.left.entry(p).or_insert(old);
@@ -547,11 +669,23 @@ pub fn restore_paths(
 ) -> Result<CheckoutReport> {
     // A folder the server refuses stays as it is: the caller refused a
     // restore that asks for it (BUG-1529).
-    let changes: Vec<TreeChange> = diff_trees_hiding(store, Some(from), Some(to))?
+    let mut changes: Vec<TreeChange> = diff_trees_hiding(store, Some(from), Some(to))?
         .0
         .into_iter()
         .filter(|c| wanted(&c.path))
         .collect();
+    // A kept edit asked for (BUG-1558): its conflict's advice is that a
+    // restore takes the recorded version, also while `@` still records
+    // that version (the edit not yet recorded): written over the edit.
+    let asked: Vec<VPath> = record.kept_edits.iter().filter(|k| wanted(k) && !changes.iter().any(|c| c.path == **k)).cloned().collect();
+    for k in asked {
+        if let Some(e) = lookup(store, to, &k)?.filter(|e| e.kind.is_file_like()) {
+            if fs.metadata(&k)?.is_some() {
+                fs.remove_file(&k)?;
+            }
+            changes.push(TreeChange { path: k, old: None, new: Some(e) });
+        }
+    }
     let report = apply_changes(store, fs, Some(from), to, &changes, cache, Some(&record.crlf))?;
     record.absorb(fs, &changes, &report)?;
     Ok(report)
@@ -775,6 +909,14 @@ pub fn checkout_cached(
 /// hidden content now lives) and the folder is reported, and recorded, as
 /// left out, so the builder carries it by id; a folder readable again is
 /// written whole.
+/// Does the file at `path` hold exactly what checkout wrote for version
+/// `e` (its own copy, never the person's file)? As [`holds`] decides it:
+/// a sealed version is recognised by what the stat cache recorded there,
+/// without its key (which the person may no longer hold).
+fn holds_version(store: &ObjectStore, fs: &dyn StorageBackend, path: &VPath, e: &TreeEntry, cache: Option<&StatCache>, crlf: &BTreeSet<VPath>) -> bool {
+    holds(store, fs, path, Some(e), cache, &Eol { from: None, crlf: Some(crlf) }).unwrap_or(false)
+}
+
 /// The changes a checkout applies, and each folder it leaves out with the
 /// tree of the version it was left from (when readable).
 type CheckoutChanges = (Vec<TreeChange>, Vec<(VPath, Option<ObjectId>)>);
