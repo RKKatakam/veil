@@ -1581,6 +1581,9 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         ("/v1/projects/{p}/q/grep", "path"),
         // S24: counts for the project's admins, no path or revision (merge s11r6).
         ("/v1/projects/{p}/health", "none"),
+        // S6: the server's public key that grants verify under, for the Veil
+        // daemon; no path or revision (merge of S6).
+        ("/v1/grant-key", "none"),
     ];
     let routes: Vec<&str> = API.split(".route(\"").skip(1).map(|s| s.split('"').next().unwrap()).collect();
     assert!(routes.len() >= 40, "the router was not read: {routes:?}");
