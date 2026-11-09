@@ -1921,6 +1921,83 @@ mod tests {
         assert!(matches!(w.admit(Some(2), per, all), Some(Some(_))));
     }
 
+    /// Guarantee 3: a computing job is never displaced at the ceiling, and
+    /// a waiter that leaves `Slots` before its turn (displaced at the
+    /// ceiling while waiting for a slot) gives its turn and releases the
+    /// slot cleanly.
+    #[test]
+    fn a_computing_job_is_never_displaced_and_a_refused_waiter_releases_its_slot() {
+        let mut w = Waiting::default();
+        let key = |i: u8| -> JobKey { (1, "k".into(), format!("p{i}"), false, ObjectId::hash(&[i])) };
+        let rx = || tokio::sync::watch::channel(None).1;
+        let (per, all) = (2, 2);
+        // Person 1 has 2 jobs, filling the ceiling of 2; both are marked
+        // computing under the lock.
+        for i in 0..2 {
+            assert!(matches!(w.admit(Some(1), per, all), Some(None)));
+            let (_, ticket) = w.insert(key(i), rx(), Some(1));
+            ticket.computing.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Neither computing job is displaced: admit returns None and leaves
+        // both tickets unrefused.
+        assert!(w.admit(Some(2), per, all).is_none(), "computing jobs are never displaced");
+        for i in 0..2 {
+            assert!(!w.jobs[&key(i)].ticket.refused(), "computing job {i} not refused");
+        }
+        // If only the newest job of the requester with the most waiting (2)
+        // is computing, its older non-computing job is displaced first; if
+        // all of that requester's jobs are computing, the next requester in
+        // `most` with a non-computing job gives its newest waiting place;
+        // and a requester with fewer waiting jobs (`Some(99)` with 1 job) is
+        // never displaced while any requester with more waiting jobs (`Some(2)`
+        // with 2 waiting jobs) has a non-computing job.
+        let mut w2 = Waiting::default();
+        let (per2, all2) = (3, 5);
+        let (_, t0) = w2.insert(key(0), rx(), Some(1));
+        let (_, t1) = w2.insert(key(1), rx(), Some(1));
+        let (_, t_few) = w2.insert(key(9), rx(), Some(99));
+        let (_, t2) = w2.insert(key(2), rx(), Some(2));
+        let (_, t3) = w2.insert(key(3), rx(), Some(2));
+        t0.computing.store(true, std::sync::atomic::Ordering::Relaxed);
+        t1.computing.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (gone, _) = w2.admit(Some(99), per2, all2).unwrap().expect("a waiting job gives its place");
+        assert_eq!(gone, key(3), "newest non-computing job of the requester with the most waiting gives its place");
+        assert!(!t0.refused() && !t1.refused() && !t_few.refused() && !t2.refused() && t3.refused());
+
+        // In `Slots`, a waiter cancelled before its turn (as when `ticket.wake`
+        // wins the `select!` in `leased_job`) drops its receiver; when the
+        // held slot drops, `Slots::give` skips the cancelled waiter, hands
+        // the slot to the next requester in turn, and ends with all slots free.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let slots = Arc::new(Slots::new(1));
+            let held = slots.take(Some(1)).await;
+            let cancel = Arc::new(tokio::sync::Notify::new());
+            let (slots2, cancel2) = (slots.clone(), cancel.clone());
+            let displaced = tokio::spawn(async move {
+                tokio::select! {
+                    _ = slots2.take(Some(2)) => panic!("displaced waiter should not take a slot"),
+                    _ = cancel2.notified() => "warming",
+                }
+            });
+            tokio::task::yield_now().await;
+            let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (slots3, order3) = (slots.clone(), order.clone());
+            let third = tokio::spawn(async move {
+                let s = slots3.take(Some(3)).await;
+                order3.lock().unwrap().push(3);
+                drop(s);
+            });
+            tokio::task::yield_now().await;
+            cancel.notify_one();
+            assert_eq!(displaced.await.unwrap(), "warming");
+            drop(held);
+            third.await.unwrap();
+            assert_eq!(*order.lock().unwrap(), [3]);
+            assert_eq!(slots.state.lock().unwrap().free, 1, "slot released cleanly after a displaced waiter");
+        });
+    }
+
     /// BUG-1307: a lease not renewed stops being live before it ends (less
     /// a sixth of it), and a lost one at once.
     #[test]

@@ -3337,4 +3337,77 @@ mod s14rd3_review {
         }
         assert_eq!(hubs.iter().map(jobs_started).sum::<u64>(), j0, "no job: every row of the key in use stayed");
     }
+
+    /// Guarantee 3: every job (whether it finishes or fails with `too_wide`)
+    /// deletes its `blame_jobs` lease row and releases its slot so later
+    /// jobs take the slots and answer.
+    #[test]
+    fn displacement_spares_few_jobs_and_computing_jobs_and_releases_leases_and_slots() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let path = "pub/f/chain.txt";
+        let (snaps, _) = chain_on(&th, &mut h, root_snapshot_id(), Files::new(), path, 80, 62, 1_700_000_000_000);
+        h.set_branch(&th, "main", *snaps.last().unwrap());
+        let viewer = Viewer::default();
+        warm_up(&th, &h, &viewer);
+        let a = ask(&th, &h, &viewer);
+        let small = limits(60_000, BlameLimits { held: 24 << 10, ..BlameLimits::default() });
+        let ids = projected(&th, &h, &viewer, &snaps);
+        for s in [&ids[79], &ids[78]] {
+            let (r, _) = until(&th, &h, &a, || BlameParams { rev: Some(s.clone()), path: path.into(), n: Some(100), ..Default::default() }, small, 30);
+            assert_eq!(r.err(), Some("too_wide"));
+        }
+        for s in [&ids[5], &ids[10]] {
+            let (r, _) = until(&th, &h, &a, || BlameParams { rev: Some(s.clone()), path: path.into(), n: Some(100), ..Default::default() }, limits(60_000, BlameLimits::default()), 30);
+            assert_eq!(r.expect("blamed")["line_count"], 60);
+        }
+        let leases_left: i64 = th.rt.block_on(async {
+            sqlx::query_scalar("SELECT COUNT(*) FROM blame_jobs WHERE project_id = $1").bind(h.id).fetch_one(&h.hub.db).await.unwrap()
+        });
+        assert_eq!(leases_left, 0, "every finished or failed job released its blame_jobs lease");
+    }
+
+    /// Guarantee 4 (BUG-1555's second route): a job that fails with
+    /// `too_wide` on its walk down (keeping no checkpoints of its own)
+    /// writes no `blame_ends` record if another job of the view key kept a
+    /// blame of a path its walk reached after this job started.
+    #[test]
+    fn a_too_wide_walk_down_records_nothing_when_another_job_kept_a_reached_path() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let path = "pub/f/chain.txt";
+        let (snaps, _) = chain_on(&th, &mut h, root_snapshot_id(), Files::new(), path, 120, 64, 1_700_000_000_000);
+        h.set_branch(&th, "main", *snaps.last().unwrap());
+        let viewer = Viewer::default();
+        warm_up(&th, &h, &viewer);
+        let a = ask(&th, &h, &viewer);
+        let vk = h.project(&th).view(&viewer).key();
+        let ids = projected(&th, &h, &viewer, &snaps);
+        // First, keep a checkpoint at version 100 by blaming it under the
+        // default bound, and stamp its `created_at` slightly in the future
+        // (simulating a concurrent job that kept a blame of `path` after our
+        // walk-down job read `is_kept`, or delete it during the walk and
+        // re-insert it before `record_too_wide`).
+        // Even better: in `record_too_wide`, `WHERE NOT EXISTS (SELECT 1
+        // FROM blame_memo ... AND created_at >= $11)` checks `since`
+        // (`now_millis() - lease / 6`). If a blame of `path` was kept
+        // within that window (for example, just before or while the job
+        // walked down, at a revision below where the walk failed), the
+        // walk-down job does not record `too_wide`.
+        // Let's blame version 10 (near the bottom, so the walk from 119
+        // under a 24 KiB bound fails on the way down before reaching version
+        // 10!). Version 10's kept blame has `created_at = now_millis()`,
+        // which is `>= since`, and its `path_key` is in `reached`!
+        let (r10, _) = until(&th, &h, &a, || BlameParams { rev: Some(ids[10].clone()), path: path.into(), n: Some(1000), ..Default::default() }, limits(60_000, BlameLimits::default()), 60);
+        assert_eq!(r10.expect("version 10 answers")["line_count"], 60);
+        let small = limits(60_000, BlameLimits { held: 24 << 10, ..BlameLimits::default() });
+        let (r_head, _) = until(&th, &h, &a, || BlameParams { path: path.into(), n: Some(1000), ..Default::default() }, small, 60);
+        assert_eq!(r_head.err(), Some("too_wide"), "the head fails on the walk down before version 10");
+        let recorded: i64 = th.rt.block_on(async {
+            sqlx::query_scalar("SELECT COUNT(*) FROM blame_ends WHERE project_id = $1 AND view_key = $2").bind(h.id).bind(&vk).fetch_one(&h.hub.db).await.unwrap()
+        });
+        assert_eq!(recorded, 0, "no too_wide record written when a blame of the reached path was kept since the job's window");
+    }
 }
