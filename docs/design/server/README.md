@@ -90,10 +90,10 @@ The owner's goal: every milestone of phases 1–4 built, reviewed and merged, th
 
 | State | Milestones |
 |---|---|
-| **Merged into `integration`** | S1, S2 (phase 1); S3, S4, S5, S8, S9, S10, S27 (phase 2); S12, S13, S15 (phase 3); S24 part A (phase 4) |
-| **Built, in final review or fixing** | S6, S11, S28 (phase 2); S14 (phase 3); S17, S21 (phase 4); the deployment kit |
-| **Being built** | — (S25 part A paused) |
-| **Not started** | S7, S29 (phase 2); S16 (phase 3); S18, S19, S20, S22, S23, S24 part B, S26 (phase 4); the gate runs G2, G3 (in S16), G4 |
+| **Merged into `integration`** | S1, S2 (phase 1); S3, S4, S5, S8, S9, S10, S11, S27 (phase 2); S12, S13, S15 (phase 3); S24 part A (phase 4) |
+| **Built, in final review or fixing** | S6, S28 (phase 2); S14 (phase 3); S17, S21 (phase 4); the deployment kit |
+| **Being built** | S18, S22 (phase 4, on S17's branch; S25 part A paused) |
+| **Not started** | S7, S29 (phase 2); S16 (phase 3); S19, S20, S23, S24 part B, S26 (phase 4); the gate runs G2, G3 (in S16), G4 |
 
 ### Remaining waves
 
