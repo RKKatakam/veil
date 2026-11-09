@@ -106,6 +106,7 @@ fn reads_writes_and_unmount_records_through_the_policy() {
     std::fs::write(mnt.join("run.sh"), "#!/bin/sh\necho ran-in-mount\n").unwrap();
     std::fs::set_permissions(mnt.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
     let out = Command::new(mnt.join("run.sh")).output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ran-in-mount\n");
     let f = std::fs::OpenOptions::new().write(true).open(mnt.join("new.txt")).unwrap();
     f.set_len(2).unwrap();
@@ -206,7 +207,9 @@ fn a_killed_mount_loses_nothing() {
     // SAFETY: plain kill(2).
     unsafe { libc::kill(state_pid(&proj, "agent"), libc::SIGKILL) };
     assert!(wait_for(Duration::from_secs(5), || std::fs::read_dir(&mnt).is_err()), "the dead mount still answers");
-    let doctor = text(&env.vl("alice", &proj, &["doctor"]));
+    let d_out = env.vl("alice", &proj, &["doctor"]);
+    assert!(d_out.status.success(), "{}", text(&d_out));
+    let doctor = text(&d_out);
     assert!(doctor.contains("lost its process"), "{doctor}");
     // A switch to it is refused while the dead mount is not cleaned up.
     let o = env.vl("alice", &proj, &["ws", "switch", "agent"]);

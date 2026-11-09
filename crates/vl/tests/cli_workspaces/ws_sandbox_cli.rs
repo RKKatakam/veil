@@ -285,6 +285,7 @@ fn the_command_cannot_reach_the_project_through_vl_or_git() {
     let unset = args.iter().map(|a| a.replace(&format!("'{vl}' status"), &format!("env -u VEIL_WORKSPACE_SOCKET '{vl}' status"))).collect::<Vec<_>>();
     let unset: Vec<&str> = unset.iter().map(String::as_str).collect();
     let o = env.vl("alice", &proj, &unset);
+    assert!(o.status.success(), "{}", text(&o));
     let t = text(&o);
     assert!(t.contains("no Veil repository found"), "{t}");
     assert!(!t.contains("vl=0"), "{t}");
@@ -366,7 +367,7 @@ fn doctor_reports_sandboxes_of_removed_workspaces() {
     exec(&env, &proj, &["--", "true"]);
     let orphan = proj.join(".veil/local/sandboxes/ghost/files");
     std::fs::create_dir_all(&orphan).unwrap();
-    let out = text(&env.vl("alice", &proj, &["doctor"]));
+    let out = env.ok("alice", &proj, &["doctor"]);
     assert!(out.contains("1 `ws exec` sandbox(es) in .veil/local/sandboxes"), "{out}");
     assert!(out.contains("ghost") && out.contains("no longer exists"), "{out}");
 }
