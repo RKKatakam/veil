@@ -2483,9 +2483,11 @@ Nothing changes for `vl` or on the wire.
   listed.
 * **Uploads are staged and recorded** (BUG-930, BUG-1157). `POST …/objects`
   checks each frame as before (S27's decoding bounds, the hash, canonical
-  decoding, the format), writes a *staged* row for the request's pack
-  (with the uploader; one database commit per upload request, apart from
-  the push's one), then the pack: one storage write per upload request.
+  decoding, the format), writes a *staged* row for each pack of the request
+  (at most `pack::MAX_OBJECTS`, 262,144 objects a pack, with the uploader;
+  one database commit per pack, so one per `vl` upload request, apart from
+  the push's one), then the pack: one storage write per pack (one per `vl`
+  upload request).
   Each receipt is `MAC(project ‖ person ‖ id ‖ pack) ‖ "." ‖ pack`. A staged
   pack is nobody's: its objects are read only by a push or API commit of
   that person that shows its receipts, through `Objects::get_staged`, and
@@ -2501,13 +2503,15 @@ Nothing changes for `vl` or on the wire.
   project's store instead, so naming a guess of hidden content with an old
   receipt gets the answer a wrong guess gets.
 * **A push** reads the staged packs its receipts name (their indexes, from
-  memory on the server that took the upload), checks every new snapshot as
+  memory on the server that took the upload, or by bisecting the sorted
+  index in storage with 64 KiB ranged reads), checks every new snapshot as
   before, and then, when something lands:
   * lists a staged pack **as it is** if its checks read every object in it
     (what a `vl` push uploads is exactly what the checks read: §13.5);
   * puts the objects the checks read from any other staged pack, and the
     objects the server made (the graft's trees, completed snapshots, the
-    pusher's signed projections), into **one pack of its own**;
+    pusher's signed projections), into **one pack of its own** (split at
+    `pack::MAX_OBJECTS`, 262,144 objects a pack);
   * lists them in its one transaction (one statement more), and refuses
     with 409 if a pack it names was discarded first (`vl` uploads again);
   * discards every staged pack it did not list (every delete tried,
@@ -2523,11 +2527,11 @@ Nothing changes for `vl` or on the wire.
 * **A push's own pack is recorded too** (staged, the pusher's) before it
   is written, and its transaction lists it, so **every pack in storage has
   a row**, whatever stops the request (BUG-1399): one database commit more
-  for a push that writes a pack of its own (the server completed its
-  snapshots or made projections), apart from its one transaction. **A push
-  runs to its end in a task of its own**: a client that goes away (a
-  stopped `vl push`, a dropped connection) stops the request, not the
-  push, whose clean-up then discards what it did not list.
+  per own pack for a push that writes a pack of its own (the server
+  completed its snapshots or made projections), apart from its one
+  transaction. **A push runs to its end in a task of its own**: a client
+  that goes away (a stopped `vl push`, a dropped connection) stops the
+  request, not the push, whose clean-up then discards what it did not list.
 * **What storage holds that no push listed** (until S29's job removes the
   staged rows older than its grace, and their packs, and the packs of
   discarded rows that a failed delete or a stopped server left in storage:

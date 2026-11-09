@@ -2019,4 +2019,291 @@ mod tests {
         assert!(accounted <= INDEXES_HELD, "{line}");
         assert!(peak <= INDEXES_HELD, "indexes outside the lookup maps took {} MiB at peak against the {} MiB bound ({line})", peak >> 20, INDEXES_HELD >> 20);
     }
+
+    /// S28r5 review (guarantees 1 and 3): on a valid pack spanning several
+    /// [`FIRST_READ`] windows, `staged_slots` (`lookup_slice` + `bisect_slots`)
+    /// returns the exact slots a full `read_index` (`parse_index`) does for
+    /// present and absent ids across every window boundary, never returns
+    /// another object's slot, never reads a byte at or past `hl` (once the
+    /// index is past [`FIRST_READ`]), and concurrent readers and writers across
+    /// every path (`read_index`, `find_paged`, `staged_slots`, `write_weight_of`)
+    /// stay within [`INDEXES_HELD`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn s28r5_bisect_slots_matches_full_read_never_returns_another_slot_or_reads_past_index() {
+        struct Guarded {
+            inner: crate::store::FsStore,
+            hl: AtomicU64,
+            max_end: AtomicU64,
+        }
+        #[async_trait::async_trait]
+        impl BlobStore for Guarded {
+            async fn get(&self, key: &str) -> Result<Option<Bytes>> {
+                panic!("staged_slots must use ranged reads, not get({key})");
+            }
+            async fn put(&self, key: &str, data: Bytes) -> Result<()> {
+                self.inner.put(key, data).await
+            }
+            async fn exists(&self, key: &str) -> Result<bool> {
+                self.inner.exists(key).await
+            }
+            async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Option<(Bytes, u64)>> {
+                let hl = self.hl.load(Ordering::Relaxed);
+                if hl > 0 {
+                    assert!(
+                        end < hl,
+                        "ranged read {start}..={end} read at or past index end hl={hl}"
+                    );
+                }
+                self.max_end.fetch_max(end, Ordering::Relaxed);
+                self.inner.get_range(key, start, end).await
+            }
+            async fn delete(&self, key: &str) -> Result<()> {
+                self.inner.delete(key).await
+            }
+            async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+                self.inner.list(prefix).await
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Guarded {
+            inner: crate::store::FsStore::new(dir.path()),
+            hl: AtomicU64::new(0),
+            max_end: AtomicU64::new(0),
+        });
+        let count = 6_000usize; // > 4 * WINDOW_ENTRIES (1,489), sohl > FIRST_READ
+        let items: Vec<_> = (0..count).map(|i| obj(&format!("item-{i}"))).collect();
+        let (bytes, full_index) = build(items.clone()).unwrap();
+        let hl = head_len(&bytes).unwrap();
+        assert!(hl > FIRST_READ, "index ({hl} B) spans multiple FIRST_READ windows");
+        store.put(&key(1, "big"), bytes.clone()).await.unwrap();
+        store.hl.store(hl, Ordering::Relaxed);
+
+        let mut sorted: Vec<ObjectId> = items.iter().map(|(id, _)| *id).collect();
+        sorted.sort_unstable();
+        let in_first = ((FIRST_READ as usize) - HEAD) / ENTRY;
+        let mut boundary_indices = vec![
+            0,
+            1,
+            in_first - 1,
+            in_first,
+            in_first + 1,
+            in_first + WINDOW_ENTRIES / 2,
+            in_first + WINDOW_ENTRIES - 1,
+            in_first + WINDOW_ENTRIES,
+            count / 2,
+            count - 2,
+            count - 1,
+        ];
+        boundary_indices.sort_unstable();
+        boundary_indices.dedup();
+        let mut query: Vec<ObjectId> = boundary_indices.iter().map(|&i| sorted[i]).collect();
+        // Interleave absent IDs before the first entry, between entries, and after the last entry.
+        query.push(ObjectId([0u8; 32]));
+        query.push(ObjectId([0xffu8; 32]));
+        for k in 0..20u32 {
+            query.push(ObjectId::hash(format!("absent-{k}").as_bytes()));
+        }
+        // Duplicate wanted IDs and reverse order to exercise deduplication and ordering.
+        let dup = query[3];
+        query.push(dup);
+        query.reverse();
+
+        let packs = Arc::new(Packs::new(None));
+        let got = packs.staged_slots(&*store, 1, "big", &query).await.unwrap().unwrap();
+        assert_eq!(got.objects, count);
+        assert_eq!(got.size, bytes.len() as u64);
+        assert!(store.max_end.load(Ordering::Relaxed) < hl);
+        let expected: Vec<(ObjectId, Slot)> = query.iter().filter_map(|id| Some((*id, full_index.get(id)?))).collect();
+        assert_eq!(got.slots, expected, "bisect_slots must return the exact slots a full read does");
+        for (id, slot) in &got.slots {
+            let raw_entry = entry(id, *slot, &bytes[slot.offset as usize..(slot.offset + u64::from(slot.len)) as usize]).unwrap();
+            let orig = &items.iter().find(|(oid, _)| oid == id).unwrap().1;
+            assert_eq!(raw_entry, &orig[..], "slot must decode to its own object, never another's");
+        }
+
+        // Also check all 6,000 objects in one call.
+        let all = packs.staged_slots(&*store, 1, "big", &sorted).await.unwrap().unwrap();
+        assert_eq!(all.slots.len(), count);
+        for id in &sorted {
+            let s = all.slots.iter().find(|(oid, _)| oid == id).unwrap().1;
+            assert_eq!(Some(s), full_index.get(id));
+        }
+
+        // Concurrency check across every index-bound path: accounted permits never exceed INDEXES_HELD.
+        store.hl.store(0, Ordering::Relaxed);
+        let dyn_store: Arc<dyn BlobStore> = store;
+        for p in 2..=6i64 {
+            dyn_store.put(&key(p, "big"), bytes.clone()).await.unwrap();
+            packs.add(p, vec![(Arc::from("big"), None)], true);
+        }
+        let peak_used = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let present_id = sorted[0];
+        let mut tasks = tokio::task::JoinSet::new();
+        for t in 0..12usize {
+            let (packs, dyn_store, peak_used, q) = (packs.clone(), dyn_store.clone(), peak_used.clone(), query.clone());
+            tasks.spawn(async move {
+                for round in 0..8usize {
+                    let p = ((t + round) % 5 + 2) as i64;
+                    match (t + round) % 3 {
+                        0 => {
+                            let s = packs.staged_slots(&*dyn_store, 1, "big", &q).await.unwrap().unwrap();
+                            assert_eq!(s.objects, count);
+                        }
+                        1 => {
+                            let reads = AtomicU64::new(0);
+                            let found = packs.find_paged(&dyn_store, p, &present_id, &reads).await.unwrap();
+                            assert!(found.is_some());
+                        }
+                        _ => {
+                            let _w = packs.bound.take_for(Some(p), Index::write_weight_of(10_000) as u64).await.unwrap();
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    let used = INDEXES_HELD - packs.bound.available();
+                    peak_used.fetch_max(used, Ordering::Relaxed);
+                }
+            });
+        }
+        while let Some(r) = tasks.join_next().await {
+            r.unwrap();
+        }
+        assert!(peak_used.load(Ordering::Relaxed) <= INDEXES_HELD);
+        assert_eq!(packs.bound.available(), INDEXES_HELD);
+    }
+
+    /// BUG-1499 (review s28r5, Guarantee 1): `Packs::staged_slots` (`lookup_slice`
+    /// + `bisect_slots`) must return the same answer as a full `read_index`
+    /// (`parse_index`) and refuse an index that is unsorted, duplicated, or
+    /// does not tile the pack (`hl..size`). Because `lookup_slice` and
+    /// `bisect_slots` omit `parse_index`'s tiling check and only inspect the
+    /// 64 KiB windows along the binary-search path for `ids`:
+    /// 1. an untiled pack (overlapping slots, gaps between slots, or trailing
+    ///    unindexed bytes after the last slot) is accepted by `staged_slots`
+    ///    even when the whole index fits in the first 64 KiB read, and when all
+    ///    its objects are touched by a landing push `sync::packs_to_list` lists
+    ///    the damaged staged pack as-is without ever running `parse_index`;
+    /// 2. duplicate or unsorted entries outside the bisected windows are
+    ///    accepted; and
+    /// 3. an out-of-order entry for a wanted object causes `bisect_slots` to
+    ///    search the wrong half and return `Ok` with the object silently missing
+    ///    from `slots` instead of refusing the unsorted index.
+    #[tokio::test]
+    #[ignore = "BUG-1499: staged_slots / bisect_slots accepts untiled, duplicated, and unsorted indexes that parse_index refuses"]
+    async fn bug_1499_staged_slots_refuses_unsorted_duplicated_and_untiled_indexes_like_a_full_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::FsStore::new(dir.path());
+        let packs = Packs::new(None);
+
+        // Success first: on a valid pack, both `read_index` and `staged_slots` succeed and agree.
+        let valid_items: Vec<_> = (0..2_000).map(|i| obj(&format!("valid-{i}"))).collect();
+        let (valid_bytes, valid_idx) = build(valid_items.clone()).unwrap();
+        store.put(&key(1, "valid"), valid_bytes.clone()).await.unwrap();
+        let mut sorted_ids: Vec<ObjectId> = valid_items.iter().map(|(id, _)| *id).collect();
+        sorted_ids.sort_unstable();
+        let probe = *sorted_ids.last().unwrap();
+        let full = read_index(&store, &key(1, "valid"), &packs.bound).await.unwrap().unwrap();
+        let got = packs.staged_slots(&store, 1, "valid", &[ sorted_ids[0], probe ]).await.unwrap().unwrap();
+        assert_eq!(got.slots, vec![(sorted_ids[0], full.index.get(&sorted_ids[0]).unwrap()), (probe, valid_idx.get(&probe).unwrap())]);
+
+        // Case 1: Untiled pack (trailing byte / gap between slots / overlapping slots), even in a small 2-object pack.
+        let small_items = vec![obj("small-a"), obj("small-b")];
+        let (small_bytes, _) = build(small_items.clone()).unwrap();
+        let mut trailing = small_bytes.to_vec();
+        trailing.push(0u8); // pack ends 1 byte past the last slot (`at != size`)
+        let trailing = Bytes::from(trailing);
+        assert!(parse_index(&trailing, Some(trailing.len() as u64)).is_err(), "parse_index refuses a pack whose slots do not tile to size");
+        store.put(&key(1, "untiled"), trailing).await.unwrap();
+        let untiled_res = packs.staged_slots(&store, 1, "untiled", &[small_items[0].0, small_items[1].0]).await;
+
+        // Case 2: Duplicate or unsorted entry outside the bisected window, and an out-of-order wanted entry.
+        let mut damaged = valid_bytes.to_vec();
+        // Swap entries 1,600 and 1,601 (past FIRST_READ = 1,489 entries), making the index unsorted and placing `sorted_ids[1601]` before `sorted_ids[1600]`.
+        let e1600 = HEAD + 1600 * ENTRY;
+        let e1601 = HEAD + 1601 * ENTRY;
+        let (left, right) = damaged.split_at_mut(e1601);
+        left[e1600..e1600 + ENTRY].swap_with_slice(&mut right[..ENTRY]);
+        let damaged = Bytes::from(damaged);
+        assert!(parse_index(&damaged, Some(damaged.len() as u64)).is_err(), "parse_index refuses an unsorted index");
+        store.put(&key(1, "unsorted"), damaged).await.unwrap();
+        let unsorted_res = packs.staged_slots(&store, 1, "unsorted", &[sorted_ids[0]]).await;
+        assert!(
+            untiled_res.is_err() && unsorted_res.is_err(),
+            "staged_slots must refuse untiled and unsorted indexes as a full read would, but returned untiled={:?}, unsorted={:?}",
+            untiled_res.map(|o| o.map(|s| s.slots.len())),
+            unsorted_res.map(|o| o.map(|s| s.slots.len())),
+        );
+    }
+
+    /// BUG-1623 (review s28r5, Guarantees 2 and 4): `Bound::take_for` has two
+    /// flaws in its per-project share and yielding rules:
+    /// 1. `s.last_large` is set to `Some(p)` when project `p` takes a share
+    ///    above `quarter`, and is never cleared when another project takes a
+    ///    share `<= quarter`; meanwhile `s.waiting` counts a project even when
+    ///    that project is only waiting on its own `quarter` cap while `self.sem`
+    ///    has plenty of free permits. Project 2 holding its own `quarter` with
+    ///    one more request of Project 2 waiting on Project 2's own `quarter`
+    ///    keeps `other_waiting == true` and `last_large == Some(1)`, starving
+    ///    Project 1's next large share for the whole `wait` and answering 503
+    ///    `IndexesFull` while 75% of `most` is free.
+    /// 2. When a push splits `own` at `MAX_OBJECTS` (`sync::packs_to_list`), it
+    ///    holds the first pack's `Held` share (`Index::weight_of(MAX_OBJECTS)` =
+    ///    12 MiB, still charged to `s.held[project]` because `put_pack` does
+    ///    not call `unproject()`) while calling `put_pack` for the next chunk
+    ///    in the same task. Whenever the next chunk needs `> 4 MiB` (>= 45,589
+    ///    objects, so `cur + want > quarter` while `cur > 0`), `take_for`
+    ///    deadlocks against the caller's own first pack and fails with
+    ///    `IndexesFull` (503).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "BUG-1623: Bound::take_for starves a project's second large share and self-deadlocks when splitting packs at MAX_OBJECTS"]
+    async fn bug_1623_yielding_and_per_project_shares_never_starve_a_large_share_or_split_pack() {
+        let bound = Arc::new(Bound {
+            most: 64 << 20,
+            wait: Duration::from_millis(200),
+            ..Bound::new(INDEXES_HELD)
+        });
+        let quarter = (bound.most / 4) as u64; // 16 MiB
+        let large = Index::read_weight_of(MAX_OBJECTS) as u64; // ~27 MiB (> quarter)
+
+        // Success first: Project 1 can take a large share, drop it, and take it again when idle.
+        let s1 = bound.take_for(Some(1), large).await.expect("first large share succeeds");
+        drop(s1);
+        let s2 = bound.take_for(Some(1), large).await.expect("second large share succeeds when no other project waits");
+        drop(s2);
+
+        // Route 1: Project 2 holds its own 16 MiB quarter and queues a second request of its own
+        // (blocked only by Project 2's own per-project quarter cap, leaving 80 MiB of 96 MiB free).
+        let p2_held = bound.take_for(Some(2), quarter).await.expect("project 2 takes its quarter");
+        let b_wait = bound.clone();
+        let p2_waiter = tokio::spawn(async move {
+            // Waits on Project 2's own quarter cap for longer than Project 1's attempt.
+            let b_long = Bound { wait: Duration::from_millis(500), ..(*b_wait).clone() };
+            let _ = b_long.take_for(Some(2), FIRST_READ).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Project 1 now asks for a large share (27 MiB out of 80 MiB free).
+        // Because `last_large == Some(1)` and `other_waiting` sees Project 2's self-blocked waiter,
+        // Project 1 is starved until timeout and answered 503 IndexesFull!
+        let p1_again = bound.take_for(Some(1), large).await;
+        drop(p2_held);
+        let _ = p2_waiter.await;
+
+        // Route 2: Splitting a push's own pack at MAX_OBJECTS (262,144 + 50,000 objects) in one task,
+        // as `sync::packs_to_list` does (`put_pack` shrinks to `Index::weight_of(MAX_OBJECTS)` = 12 MiB
+        // and keeps it in `listed` while writing the second pack of 50,000 objects, `write_weight_of` = 4.6 MiB).
+        let mut first_pack = bound
+            .take_for(Some(3), Index::write_weight_of(MAX_OBJECTS) as u64)
+            .await
+            .expect("first split pack write share succeeds");
+        first_pack.keep(Index::weight_of(MAX_OBJECTS)); // 12 MiB held on project 3, as `put_pack` does
+        let second_pack = bound
+            .take_for(Some(3), Index::write_weight_of(50_000) as u64)
+            .await;
+        assert!(
+            p1_again.is_ok() && second_pack.is_ok(),
+            "Bound::take_for answered 503 IndexesFull: route1 (cross-project yield starvation)={:?}, route2 (split-pack self-deadlock)={:?}",
+            p1_again.err(),
+            second_pack.err()
+        );
+    }
 }

@@ -1876,7 +1876,7 @@ mod tests {
         let bound = objects.packs.bound();
         let first_share = bound.take(64 << 20).await.unwrap();
         let second_share = bound.take(bound.available() as u64).await.unwrap();
-        let _held = (first_share, second_share);
+        let held = (first_share, second_share);
         assert_eq!(bound.available(), 0, "every share held");
         let src = crate::sync::Source { hub: hub.clone(), project: 1, rt: tokio::runtime::Handle::current(), pending: Default::default(), staged: None };
         let src2 = crate::sync::Source { hub: hub.clone(), project: 1, rt: tokio::runtime::Handle::current(), pending: Default::default(), staged: None };
@@ -1897,5 +1897,14 @@ mod tests {
             assert_eq!(json["code"], "busy", "{which}: {json}");
             assert!(json["retry_after_ms"].as_u64().unwrap_or(0) >= 500, "{which}: missing retry_after_ms in {json}");
         }
+        // Once the shares are given back, both readers succeed and return the object.
+        drop(held);
+        let src_ok = crate::sync::Source { hub, project: 1, rt: tokio::runtime::Handle::current(), pending: Default::default(), staged: None };
+        tokio::task::spawn_blocking(move || {
+            assert_eq!(src_ok.raw(&id).expect("Source::raw succeeds once the bound has room"), raw.as_ref());
+            assert!(!src_ok.encoded(&id).expect("Source::encoded succeeds once the bound has room").is_empty());
+        })
+        .await
+        .unwrap();
     }
 }

@@ -1080,3 +1080,80 @@ fn hostile_bug_1496_pushes_hold_the_staged_indexes_they_name_within_a_bound() {
         grew >> 20
     );
 }
+
+/// BUG-1624 (review s28r5; BUG-1153's and BUG-1398's class, and the root cause
+/// of `packs::bug_1157_a_push_that_lost_a_race_leaves_no_copy_of_its_upload`
+/// failing 7 of 10 runs on YugabyteDB): `sync::push` runs `push_to_its_end`
+/// inside `store::own(...)` (`sync.rs:1445`), where every `Objects::put`
+/// increments `Objects::own_writes` (`storage_push_writes`). Inside
+/// `push_staged` (`sync.rs:1543`, `1707`), the push projects the branch's
+/// already-committed current tip for the viewer via `projected(hub, project,
+/// viewer, *t)` (`deferred = None`), which stores any un-memoized projected
+/// snapshot loose via `hub.objects.put` (`sync.rs:521`). When a non-admin push
+/// runs before an earlier push's background deriver (`derive::memo_tips`) has
+/// memoized that viewer's projection of the committed tip (as happens 7/10
+/// times on YugabyteDB right after `p.admin`'s push in `bug_1157_…`, or
+/// deterministically after a group change before any pull), that lazy
+/// projection of already-committed history is counted as the push's own
+/// storage write—even when the push loses its race and lands nothing.
+#[test]
+#[ignore = "BUG-1624: push_staged projects already-committed branch tips with deferred=None inside store::own, counting lazy view projections as the push's own writes"]
+fn bug_1624_a_push_projecting_a_committed_tip_does_not_count_it_as_its_own_storage_write() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let settle = || {
+        let mut last = (u64::MAX, std::time::Instant::now());
+        let start = std::time::Instant::now();
+        loop {
+            let w = hub.hub().objects.writes.load(Relaxed);
+            if w != last.0 {
+                last = (w, std::time::Instant::now());
+            } else if last.1.elapsed() > std::time::Duration::from_secs(1) {
+                return;
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(60), "the background never settled");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+    // Success first: when the viewer's tip projection is already memoized, a raced push adds 0 writes after its 1 upload write.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/dev_raced.rs", "MARKER-DEV-RACED-1624");
+    let s = {
+        let t = c.tip;
+        snap(&mut c, vec![t], "dev raced", None)
+    };
+    write_files(&p.dir, &[("src/admin_first.rs", "admin landed first")]);
+    p.admin.commit_main(&p.dir, "admin first");
+    p.admin.ok(&p.dir, &["push"]);
+    settle();
+
+    let (map, _) = upload_all(&api, &c);
+    let w_memoized = writes(&hub);
+    let r = push_body(&api, &c.token, &p.name, c.tip, s, &map);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], json!(false));
+    assert_eq!(writes(&hub) - w_memoized, 0, "with the tip projection already memoized, a push that lost a race writes nothing");
+
+    // When a push runs before `derive::memo_tips` has memoized the viewer's projection of the
+    // committed tip in `projections` (as happens 7/10 times on YugabyteDB right after `p.admin`'s
+    // push in `bug_1157_…`, or on another server replica before the memo row lands), `push_staged`
+    // projects the committed tip with `deferred = None` inside `store::own`:
+    let pid = project_id(&hub, &p.name);
+    let other = TestHub::beside(&hub);
+    let other_api = other.api();
+    let (map2, _) = upload_all(&other_api, &c);
+    hub.rt
+        .block_on(sqlx::query("DELETE FROM projections WHERE project_id = $1").bind(pid).execute(&hub.hub().db))
+        .unwrap();
+    let w_before = writes(&other);
+    let r2 = push_body(&other_api, &c.token, &p.name, c.tip, s, &map2);
+    assert_eq!(r2.status, 200, "{}", String::from_utf8_lossy(&r2.body));
+    assert_eq!(r2.json()["results"][0]["ok"], json!(false));
+    assert_eq!(
+        writes(&other) - w_before,
+        0,
+        "a push that lost a race must not count projecting an already-committed tip as its own storage write"
+    );
+}
+
