@@ -1,1 +1,9 @@
 target/
+# Deployment kit: certificates, secrets, state and results of a run are never committed.
+deploy/compose/.tls/
+deploy/compose/.env
+deploy/compose/.env.*
+deploy/compose/results/
+deploy/do/.env
+deploy/do/state/
+deploy/results/

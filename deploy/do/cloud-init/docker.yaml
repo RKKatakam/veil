@@ -1,0 +1,16 @@
+#cloud-config
+# Every droplet of the Veil test: Docker from Ubuntu's repository, zstd for
+# the image transfer, and the directories the scripts use. No secrets here
+# (user-data is readable from the droplet's metadata service); configure.sh
+# copies secrets over SSH afterwards, as root-only files.
+package_update: true
+packages:
+  - docker.io
+  - zstd
+  - chrony
+runcmd:
+  - systemctl enable --now docker
+  - mkdir -p /etc/veil/tls /srv/bench /srv/metrics
+  - chmod 700 /etc/veil
+  - sysctl -w net.core.somaxconn=4096 net.ipv4.ip_local_port_range="10000 65000" fs.file-max=2097152
+  - sh -c 'echo "* soft nofile 1048576" >> /etc/security/limits.conf; echo "* hard nofile 1048576" >> /etc/security/limits.conf'

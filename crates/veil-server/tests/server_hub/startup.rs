@@ -262,3 +262,24 @@ fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
         admin.close().await;
     });
 }
+
+/// BUG-1590: the server cannot use a database that requires TLS (managed
+/// PostgreSQL services do: DigitalOcean's, for one). `veil-server`'s sqlx
+/// is built without a TLS feature, so `sslmode=require` fails with "TLS
+/// upgrade is not supported" before the handshake. Needs a database with
+/// `ssl = on` (the shared `postgres:17-alpine` container has it off), so
+/// its fix brings a TLS-enabled database into `scripts/verify-server.sh`.
+#[test]
+#[ignore = "BUG-1590: veil-server's sqlx has no TLS feature, so a database that requires TLS (every managed PostgreSQL) is unusable"]
+fn bug_1590_the_server_connects_to_a_database_that_requires_tls() {
+    let rt = runtime();
+    let (url, _) = fresh_database(&rt);
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let url = format!("{url}{sep}sslmode=require");
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 1).await.expect("connects over TLS");
+        let one: (i64,) = sqlx::query_as("SELECT 1").fetch_one(&db).await.unwrap();
+        assert_eq!(one.0, 1);
+        db.close().await;
+    });
+}

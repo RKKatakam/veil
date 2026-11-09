@@ -563,3 +563,28 @@ fn main() -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BUG-1591: `veil-bench load --mode objects --via cache` can measure
+    /// only a regional cache the tool starts itself beside a server it
+    /// starts (`--server`): with `--url` (a running, remote server) there is
+    /// no way to name a running cache, so the regional-cache gate cannot be
+    /// run against a deployment's cache droplet (`docs/DEPLOY.md`). The
+    /// fix takes the cache's address and certificate (`--cache-url`,
+    /// `--cache-ca`) and reads its counters from its `stats.json` where it
+    /// can, reporting the hit share as unknown otherwise.
+    #[test]
+    #[ignore = "BUG-1591: veil-bench load --via cache cannot measure a running (remote) regional cache: no --cache-url"]
+    fn bug_1591_the_objects_mode_takes_a_running_cache() {
+        let parsed = Cli::try_parse_from([
+            "veil-bench", "load", "--mode", "objects", "--via", "cache",
+            "--url", "https://hub.example:8443", "--ca", "ca.pem",
+            "--cache-url", "https://cache.example:8444", "--cache-ca", "ca.pem",
+            "--dir", "d", "--out", "o.json",
+        ]);
+        assert!(parsed.is_ok(), "{:?}", parsed.err().map(|e| e.to_string()));
+    }
+}

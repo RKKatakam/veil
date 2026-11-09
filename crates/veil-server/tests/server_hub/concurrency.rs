@@ -284,3 +284,55 @@ fn bug_847_concurrent_sign_ups_all_succeed() {
     });
     assert_eq!((signed.load(Ordering::Relaxed), pending.load(Ordering::Relaxed)), (1, 7));
 }
+
+/// BUG-1593: the cost gate "1 database commit per landing"
+/// (`docs/design/server/storage-and-cost.md` §9, S4) is missed on
+/// `integration` `ae3d57ed`: `scripts/bench-server.sh load` measures 9 to
+/// 13 commits per landing at 1 agent (about 1.5 at 100), on every landing
+/// route (`land`, `branches`, `api`). Found by the deployment kit's
+/// rehearsal, 2026-11-09, then confirmed by the canonical benchmark. This
+/// counts the transactions that committed while one person lands 40
+/// changes in turn, and allows one more per landing for the deriver's
+/// background write (the benchmark subtracts those exactly, through
+/// `pg_stat_statements`, which the shared test database lacks). Run alone:
+/// transaction ids are counted for the whole database server.
+#[test]
+#[ignore = "BUG-1593: 9-13 database commits per landing on integration (gate: 1, the deriver's aside)"]
+fn bug_1593_a_landing_is_one_database_commit() {
+    const LANDINGS: usize = 40;
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    p.admin.ok(&p.dir, &["new", "main"]);
+    write_files(&p.dir, &[("doc/0.txt", "0")]);
+    p.admin.commit_main(&p.dir, "first");
+    p.admin.ok(&p.dir, &["push"]);
+    let url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+    let xmax = || {
+        hub.rt.block_on(async {
+            let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(&url).await.unwrap();
+            sqlx::query_scalar::<_, i64>("SELECT pg_snapshot_xmax(pg_current_snapshot())::text::bigint").fetch_one(&mut c).await.unwrap()
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_secs(2)); // the first landing's background work
+    let from = xmax();
+    for i in 1..=LANDINGS {
+        write_files(&p.dir, &[("doc/0.txt", &i.to_string())]);
+        p.admin.commit_main(&p.dir, &format!("landing {i}"));
+        p.admin.ok(&p.dir, &["push"]);
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2)); // let the deriver finish
+    let to = xmax();
+    let committed: i64 = hub.rt.block_on(async {
+        let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(&url).await.unwrap();
+        sqlx::query_scalar("SELECT count(*) FROM generate_series($1::bigint, $2::bigint - 1) x WHERE txid_status(x) = 'committed'")
+            .bind(from)
+            .bind(to)
+            .fetch_one(&mut c)
+            .await
+            .unwrap()
+    });
+    let per_landing = committed as f64 / LANDINGS as f64;
+    // 1 for the landing, at most 1 for the deriver, and a few for the
+    // database's own maintenance.
+    assert!(committed <= (2 * LANDINGS + 20) as i64, "{committed} transactions committed for {LANDINGS} landings ({per_landing:.2} per landing; the gate is 1, the deriver's aside)");
+}

@@ -119,7 +119,7 @@ The owner's goal: every milestone of phases 1–4 built, reviewed and merged, th
 * **The test sweep** (tests that pass when their action fails, the `CLAUDE.md` rule of 2026-11-08): run once over all tests, then held by review.
 * **Guide recipe: fork and race** (`vl ws new try-a -r @` … `vl ws exec` in parallel; keep the winner, record the rest as attempts).
 * **Clean-ups filed during reviews:** the search index resumed twice for one project at start (S15 cycle 2 note); the landing batch limit (64) re-measured once packs (S28) land.
-* **The deployment kit, then the DigitalOcean test:** a server image, YugabyteDB or PostgreSQL, object storage, `vl` on agent machines; the gate benchmarks at the real scale. **Asked of the owner before anything is rented.**
+* **The deployment kit, then the DigitalOcean test:** a server image, YugabyteDB or PostgreSQL, object storage, `vl` on agent machines; the gate benchmarks at the real scale. **Asked of the owner before anything is rented.** The kit is built (`deploy/`, runbook `docs/DEPLOY.md`, 2026-11-09): images, a Compose rehearsal, `doctl` scripts that are dry runs without `--approve`, and the cost estimate (about $15 for the planned 8 hours).
 
 ## Product decisions for the owner (from all three documents)
 

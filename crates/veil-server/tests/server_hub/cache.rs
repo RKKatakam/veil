@@ -1714,3 +1714,36 @@ mod s9_cycle2 {
         eprintln!("cache: {batches} random batches and {gets} GETs (4 viewers, 2 projects, skips, ranges) answered as the server answers them");
     }
 }
+
+/// BUG-1592: the cache's TLS advertises HTTP/2 (ALPN `h2`, `tls.rs` sets it
+/// for the server and the cache alike) while its connections are served
+/// HTTP/1-only (`serve_tls` with connection limits), so an HTTP/2 client
+/// (curl, reqwest with http2) negotiates h2 and gets a broken stream:
+/// `curl: (18) HTTP/2 stream 1 was not closed cleanly` (found by the
+/// deployment kit's health check; `vl` and `veil-bench` use HTTP/1.1 and
+/// never saw it). A listener that speaks HTTP/1 only must offer only
+/// `http/1.1`.
+#[test]
+#[ignore = "BUG-1592: the cache advertises h2 in ALPN but serves HTTP/1 only, so HTTP/2 clients fail"]
+fn bug_1592_the_cache_offers_only_the_protocol_it_serves() {
+    use rustls::pki_types::pem::PemObject;
+    let hub = TestHub::start();
+    let c = TestCache::start(&hub, &hub.authority(), 1 << 30);
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls::pki_types::CertificateDer::pem_slice_iter(c.running.cert_pem.as_bytes()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+    let mut conn = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+    let mut tcp = std::net::TcpStream::connect(c.running.addr).unwrap();
+    while conn.is_handshaking() {
+        conn.complete_io(&mut tcp).expect("the handshake completes");
+    }
+    assert_eq!(conn.alpn_protocol(), Some(&b"http/1.1"[..]), "a client offering h2 and http/1.1 must get http/1.1, the only protocol the cache serves");
+}
