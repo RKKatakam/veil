@@ -132,6 +132,10 @@ Options:
 | `--pids <N>` | Limit on the number of processes and threads |
 | `--timeout <DURATION>` | Wall-clock limit, e.g. 45m: at the deadline everything in the sandbox is stopped |
 | `--limits <MODE>` | best-effort (the default): run, saying which limits are soft here; strict: refuse unless the kernel enforces every limit (one of `best-effort`, `strict`) |
+| `--agent <AGENT>` | Record the run as made by this agent (e.g. "claude-code opus-5.5"); also $VEIL_AGENT |
+| `--task <TASK>` | The agent's task: an id or title (with --agent); also $VEIL_AGENT_TASK |
+| `--prompt-ref <REF>` | A reference to the agent's prompt: a URL, transcript id or digest (with --agent); also $VEIL_AGENT_PROMPT_REF |
+| `--run <ID>` | The harness's run or session id (with --agent); also $VEIL_AGENT_RUN |
 
 ## `vl workspace cat`
 

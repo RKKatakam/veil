@@ -395,7 +395,8 @@ fn an_object_met_under_a_local_commit_is_found_under_the_servers_tips() {
     assert_eq!(read_at(&again, &mine, "doc/r.md"), b"readme\n");
 }
 
-/// Threat 14: the marker and format 9 go together.
+/// Threat 14: the marker needs format 9 or later (format 10 has everything
+/// 9 has: S11), and format 9 needs the marker.
 #[test]
 fn the_partial_marker_needs_format_9_and_back() {
     let fs = Arc::new(MemoryBackend::new());
@@ -404,7 +405,12 @@ fn the_partial_marker_needs_format_9_and_back() {
     drop(repo);
     let path = p(".veil/repo.json");
     let mut c: serde_json::Value = serde_json::from_slice(&fs.read(&path).unwrap()).unwrap();
+    // A thin clone of this release: format 10 with the marker, opened.
     c["partial"] = serde_json::json!({"remote": "origin", "cache_limit": 1024});
+    fs.write(&path, &serde_json::to_vec(&c).unwrap()).unwrap();
+    assert!(Repo::open(fs.clone(), Some(id.clone()), "alice").is_ok_and(|r| r.config().is_partial()));
+    // The marker on format 8: corrupt.
+    c["format"] = serde_json::json!(8);
     fs.write(&path, &serde_json::to_vec(&c).unwrap()).unwrap();
     let err = Repo::open(fs.clone(), Some(id.clone()), "alice").err().unwrap();
     assert!(matches!(err, VeilError::Corrupt(..)), "{err:?}");
@@ -417,7 +423,7 @@ fn the_partial_marker_needs_format_9_and_back() {
     fs.write(&path, &serde_json::to_vec(&c).unwrap()).unwrap();
     assert!(Repo::open(fs.clone(), Some(id.clone()), "alice").is_err(), "unknown fields in the marker are refused");
     // A format newer than this build reads is refused before anything else.
-    c["format"] = serde_json::json!(PARTIAL_FORMAT + 1);
+    c["format"] = serde_json::json!(veil_core::repo::MAX_REPO_FORMAT + 1);
     c["partial"] = serde_json::json!({"remote": "origin", "cache_limit": 1024});
     fs.write(&path, &serde_json::to_vec(&c).unwrap()).unwrap();
     let err = Repo::open(fs, Some(id), "alice").err().unwrap();

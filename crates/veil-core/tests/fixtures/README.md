@@ -71,6 +71,18 @@ release still opens, reads, verifies, `fsck`s, upgrades and syncs it.
   only (`generate.sh` now pushes `--tag main` there: the format-6 extras amend
   `links` after that set's push). No object encoding changed.
 
+* `format-10/`: agent attribution and attempts (`Snapshot.agent`,
+  `abandoned`, `attempts`), generated with `VEIL_FIXTURE_EXTRAS=<core_format
+  test binary> generate.sh target/debug/vl …/format-10 …/format-8` (a debug
+  build of the same sources). On the released fix, `agent-work` is a change
+  committed with `VEIL_AGENT`, `VEIL_AGENT_TASK` and `VEIL_AGENT_RUN` set,
+  whose first try was kept with `vl attempt drop --reason …`; it reaches both
+  remotes. `upgraded/` is the format-8 set after `vl upgrade` (8 → 10,
+  nothing rewritten); its one more commit stays in `alice/`, as `main`
+  builds on the unreleased embargo there. Format 9 has no set: it is only
+  ever a thin clone, made by a clone from a server; the server's `thin`
+  tests make one with S3's clone code and upgrade it to 10.
+
 `encodings.txt` pins the bytes of every object encoding. Append to it (with
 `VEIL_BLESS_ENCODINGS=1`) only together with a new format; see
 `docs/FORMAT.md` §4 and §6.

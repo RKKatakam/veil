@@ -25,6 +25,7 @@ use veil_core::{
     id::ChangeId,
     object::{EntryKind, Object, Snapshot, Text, Tree, TreeEncoding, TreeEntry, Visibility},
     pack::{IDX_MAGIC, PACK_MAGIC},
+    remote,
     keychain::{RingOp, RING_FORMAT},
     repo::{read_config, MIN_REPO_FORMAT, MIN_UPGRADE_FORMAT, REPO_FORMAT},
     tree::{lookup, walk_files},
@@ -137,6 +138,13 @@ const UNIVERSAL_ROOT: &str = "72edc798";
 fn every_repository_format_has_a_fixture_set() {
     for f in 1..=REPO_FORMAT {
         let dir = fixtures().join(format!("format-{f}"));
+        // Format 9 is only ever a thin clone, which only a clone from a
+        // server makes (no set on disk can be made by `generate.sh`): the
+        // server's `thin` tests make one with S3's clone code, numbered as
+        // S3's release wrote it, and upgrade it to 10.
+        if f == veil_core::repo::PARTIAL_FORMAT && !dir.exists() {
+            continue;
+        }
         let cfg = read_config(&DiskBackend::new(dir.join("alice")))
             .unwrap_or_else(|e| panic!("format {f} has no fixture set at {} ({e}); run tests/fixtures/generate.sh with the release that introduces it", dir.display()));
         assert_eq!(
@@ -216,9 +224,35 @@ fn sample_snapshot() -> Snapshot {
         predecessors: vec![ObjectId([6; 32])],
         conflicts: vec!["a.txt".into()],
         embargo: Some("0123456789".into()),
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
         signature: None,
     };
     s.sign(&identity.unwrap());
+    s
+}
+
+/// Format 10: [`sample_snapshot`] made by an agent, listing an attempt; or
+/// (`abandoned`) the attempt itself.
+fn golden_attributed(abandoned: bool) -> Snapshot {
+    let identity = Identity::from_json(
+        r#"{"name":"golden","public":"veil1d0b0f3eacb2e8ab6c7b4b0d8f1b05f0a4c8a7d6e1c0e2f9b3a2a1c4d5e6f7081","secret":"0101010101010101010101010101010101010101010101010101010101010101"}"#,
+    )
+    .unwrap();
+    let mut s = sample_snapshot();
+    s.embargo = None;
+    s.agent = Some(veil_core::object::Attribution {
+        agent: "claude-code/2.3 opus-5.5".into(),
+        task: Some("fix the bounds check".into()),
+        prompt: Some("transcript:7f3a".into()),
+        run: Some("run-41".into()),
+    });
+    match abandoned {
+        true => s.abandoned = Some("deadlocks holding the lease across memo_tips".into()),
+        false => s.attempts = vec![ObjectId([5; 32])],
+    }
+    s.sign(&identity);
     s
 }
 
@@ -297,6 +331,10 @@ fn golden_encodings() -> Vec<(String, Vec<u8>)> {
         ("snapshot-full-8".into(), Object::Snapshot(sample_snapshot()).encode()),
         ("conflict-8".into(), Object::Conflict(golden_conflict()).encode()),
         ("tree-v2-binary-symlink-8".into(), Object::Tree(golden_special_tree(EntryKind::Symlink)).encode_with(TreeEncoding::Binary)),
+        // Format 10: a snapshot with agent attribution and an attempt, and
+        // the abandoned snapshot that records an attempt.
+        ("snapshot-agent-attempts-10".into(), Object::Snapshot(golden_attributed(false)).encode()),
+        ("snapshot-abandoned-10".into(), Object::Snapshot(golden_attributed(true)).encode()),
         // An operation (not an object: `.veil/ops/<id>`, its id the BLAKE3
         // of these bytes) with a workspace and rewrites (format 6), and a
         // merge of two concurrent operations.
@@ -508,7 +546,7 @@ fn universal_root_id_never_changes() {
 /// cloaked directory), each of which the refusal names.
 #[test]
 fn every_set_before_format_8_is_refused_and_left_unchanged() {
-    for f in 1..REPO_FORMAT {
+    for f in 1..veil_core::repo::ONLY_SECRETS_REPO_FORMAT {
         let fx = Fixture::new(f);
         let root = fx.root.join("alice");
         let before = veil_files(&root);
@@ -594,6 +632,115 @@ fn a_clean_format_6_or_7_repository_upgrades_keeping_every_id() {
         assert!(read_str(&repo, &c, ".env").unwrap().contains("9911"));
         assert_fsck_clean(fs, None);
     }
+}
+
+// ---- format 10: agent attribution and attempts -----------------------------------
+
+/// A format-8 repository (here: written by this build and marked with the
+/// older format, as one is) opens and works as it is, but
+/// refuses to store a format-10 snapshot (an attributed one, an attempt)
+/// with what to do; `vl upgrade` then moves it to 10 rewriting nothing,
+/// after which the same commit is stored.
+#[test]
+fn a_format_8_or_9_repository_refuses_format_10_snapshots_and_upgrades_rewriting_nothing() {
+    // (A format-9 repository is always a thin clone: the test below, and
+    // the server's `thin` tests with a clone of S3's code.)
+    let from = 8;
+    let (_tmp, root, fs, alice) = written_then_marked(from, |repo, root, fs| {
+        std::fs::write(root.join("README.md"), "hello\n").unwrap();
+        repo.snapshot_workspace("default", &**fs).unwrap();
+        let (c, _) = repo.commit_working_copy("default", "first").unwrap();
+        repo.set_tag("main", c, false).unwrap();
+    });
+    let mut repo = Repo::open(fs.clone(), Some(alice.clone()), "alice").unwrap();
+    assert_eq!(repo.format(), from);
+    repo.set_attribution(Some(veil_core::object::Attribution { agent: "claude-code".into(), task: None, prompt: None, run: None }));
+    std::fs::write(root.join("README.md"), "by an agent\n").unwrap();
+    let err = repo.snapshot_workspace("default", &*fs).unwrap_err();
+    assert!(matches!(err, VeilError::Unsupported(_)), "format {from}: {err}");
+    assert!(err.to_string().contains("vl upgrade"), "format {from}: {err}");
+    // Without attribution the repository works as before.
+    repo.set_attribution(None);
+    let wc = repo.snapshot_workspace("default", &*fs).unwrap().snapshot;
+    let e = repo.drop_attempt(wc, "dead end").unwrap_err();
+    assert!(matches!(e, VeilError::Unsupported(_)), "format {from}: an attempt was stored: {e}");
+    drop(repo);
+    let objects = |r: &Path| veil_files(r).into_iter().filter(|(p, _)| p.to_string_lossy().contains("/objects/")).collect::<Vec<_>>();
+    let before = objects(&root);
+    let r = upgrade(fs.clone(), Some(alice.clone()), &UpgradeOptions::default()).unwrap();
+    assert_eq!((r.from, r.to), (from, REPO_FORMAT));
+    assert!(r.removed.is_empty(), "{:?}", r.removed);
+    assert!(r.notes.iter().any(|n| n.contains("agent attribution")), "{:?}", r.notes);
+    assert_eq!(objects(&root), before, "format {from}: the upgrade rewrote objects");
+    let mut repo = Repo::open(fs.clone(), Some(alice.clone()), "alice").unwrap();
+    assert_eq!(repo.format(), REPO_FORMAT);
+    repo.set_attribution(Some(veil_core::object::Attribution { agent: "claude-code".into(), task: None, prompt: None, run: None }));
+    std::fs::write(root.join("README.md"), "by an agent, after the upgrade\n").unwrap();
+    let wc = repo.snapshot_workspace("default", &*fs).unwrap().snapshot;
+    assert_eq!(repo.snapshot(&wc).unwrap().agent.as_ref().map(|a| a.agent.as_str()), Some("claude-code"));
+    let out = repo.drop_attempt(wc, "dead end").unwrap();
+    assert!(repo.snapshot(&out.attempt).unwrap().abandoned.is_some());
+    drop(repo);
+    assert_fsck_clean(fs, None);
+}
+
+/// The format-8 set upgrades to format 10 rewriting nothing, and a
+/// format-8 clone refuses to pull an attributed snapshot, naming the fix.
+#[test]
+fn the_format_8_set_upgrades_to_10_and_a_format_8_clone_refuses_attributed_history() {
+    let fx = Fixture::new(8);
+    let root = fx.root.join("alice");
+    let objects = |r: &Path| veil_files(r).into_iter().filter(|(p, _)| p.to_string_lossy().contains("/objects/")).collect::<Vec<_>>();
+    let before = objects(&root);
+    let r = upgrade(fx.backend("alice"), Some(fx.identity("alice")), &UpgradeOptions::default()).unwrap();
+    assert_eq!((r.from, r.to), (8, REPO_FORMAT));
+    assert_eq!(objects(&root), before);
+    assert_fsck_clean(fx.backend("alice"), Some(fx.identity("alice")));
+    // An attributed snapshot on a format-10 remote; a format-8 clone pulls.
+    let remote = Arc::new(MemoryBackend::new());
+    let alice = Identity::generate("alice");
+    let mut a = Repo::init(Arc::new(MemoryBackend::new()), Some(alice.clone()), "alice").unwrap();
+    a.set_attribution(Some(veil_core::object::Attribution { agent: "claude-code".into(), task: Some("TASK-61".into()), prompt: None, run: None }));
+    let wc = a.workspace_wc("default").unwrap();
+    let base = a.snapshot(&wc).unwrap().parents[0];
+    let c = a.new_change("default", vec![base], "made by an agent").unwrap();
+    a.set_tag("main", c, false).unwrap();
+    remote::push(&mut a, remote.clone(), false, &["main".into()], false).unwrap();
+    let mut old = Repo::init_for_clone_at(Arc::new(MemoryBackend::new()), Some(Identity::generate("bob")), "bob", 8).unwrap();
+    let err = remote::pull(&mut old, "origin", remote).unwrap_err();
+    assert!(matches!(err, VeilError::Unsupported(_)) && err.to_string().contains("vl upgrade"), "{err}");
+    assert!(!old.view().remote_tags.contains_key("origin/main"), "the refused pull moved a tag");
+}
+
+/// The format-10 set: alice's `agent-work` carries the agent's
+/// attribution, signed, and lists one attempt with its reason; both remotes
+/// received both; every repository `fsck`s clean, and `upgraded/` (the
+/// format-8 set after `vl upgrade`) opens at format 10.
+#[test]
+fn the_format_10_set_holds_attribution_and_an_attempt() {
+    let fx = Fixture::new(10);
+    for (name, who) in [("alice", Some("alice")), ("team-remote", None), ("public-mirror", None)] {
+        let repo = fx.open(name, who);
+        assert_eq!(repo.format(), 10, "{name}");
+        let c = tag(&repo, "agent-work");
+        let s = repo.snapshot(&c).unwrap();
+        let a = s.agent.as_ref().unwrap_or_else(|| panic!("{name}: no attribution"));
+        assert_eq!((a.agent.as_str(), a.task.as_deref(), a.run.as_deref()), ("fixture-agent/1.0", Some("lease fix"), Some("run-10")), "{name}");
+        assert_eq!(s.signature_valid(), Some(true), "{name}");
+        assert_eq!(s.attempts.len(), 1, "{name}");
+        let at = repo.snapshot(&s.attempts[0]).unwrap();
+        assert_eq!(at.abandoned.as_deref(), Some("deadlocks holding the lease across memo_tips"), "{name}");
+        assert_eq!(at.change_id, s.change_id, "{name}");
+        assert_eq!(at.signature_valid(), Some(true), "{name}");
+        assert!(!repo.view().refs().contains(&s.attempts[0]), "{name}: the attempt is visible");
+        drop(repo);
+        assert_fsck_clean(fx.backend(name), who.map(|w| fx.identity(w)));
+    }
+    let id = Identity::from_json(&std::fs::read_to_string(fx.root.join("upgraded/home-alice/identity.json")).unwrap()).unwrap();
+    let up = Repo::open(Arc::new(DiskBackend::new(fx.root.join("upgraded/alice"))), Some(id.clone()), "alice").unwrap();
+    assert_eq!(up.format(), 10);
+    drop(up);
+    assert_fsck_clean(Arc::new(DiskBackend::new(fx.root.join("upgraded/alice"))), Some(id));
 }
 
 // ---- the format-8 set ------------------------------------------------------------
@@ -1244,6 +1391,9 @@ fn an_encrypted_conflict_side_of_an_ordinary_file_is_named() {
             predecessors: vec![],
             conflicts: vec!["billing/report.txt".into()],
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         let id = store.put_snapshot(&s).unwrap();
@@ -1255,4 +1405,58 @@ fn an_encrypted_conflict_side_of_an_ordinary_file_is_named() {
         "the encrypted side of billing/report.txt was not named: {:?}",
         r.removed
     );
+}
+
+// ---- S11 review, cycle 1 ----------------------------------------------------------
+
+/// Format 9 is S3's thin clone: its `repo.json` carries the `partial`
+/// marker (`{remote, cache_limit}`), and objects not in the store are
+/// fetched from its server when read. Format 10 has everything format 9
+/// has (BUG-1390's coordination, S3 merged): this build opens such a
+/// repository, and `vl upgrade` brings it to 10 keeping the marker byte for
+/// byte and rewriting no object. (The server's `thin` tests do the same
+/// with a thin clone S3's clone code made, and fetch on demand after.)
+#[test]
+fn a_thin_clone_of_format_9_opens_and_upgrades_to_10_keeping_its_marker() {
+    let (_tmp, root, fs, alice) = written_then_marked(9, |repo, root, fs| {
+        std::fs::write(root.join("README.md"), "hello\n").unwrap();
+        repo.snapshot_workspace("default", &**fs).unwrap();
+        repo.commit_working_copy("default", "first").unwrap();
+    });
+    // The marker as S3's `vl clone` writes it (`RepoConfig::partial`).
+    let path = root.join(".veil/repo.json");
+    let mut cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    cfg["partial"] = serde_json::json!({"remote": "origin", "cache_limit": 1u64 << 30});
+    std::fs::write(&path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+    let marker = serde_json::to_vec(&cfg["partial"]).unwrap();
+    assert_eq!(Repo::open(fs.clone(), Some(alice.clone()), "alice").map(|r| r.format()).unwrap(), 9);
+    let objects = |r: &Path| veil_files(r).into_iter().filter(|(p, _)| p.to_string_lossy().contains("/objects/")).collect::<Vec<_>>();
+    let before = objects(&root);
+    let r = upgrade(fs.clone(), Some(alice.clone()), &UpgradeOptions::default()).unwrap();
+    assert_eq!((r.from, r.to), (9, REPO_FORMAT));
+    let after: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(after["format"], REPO_FORMAT, "{after}");
+    assert_eq!(serde_json::to_vec(&after["partial"]).unwrap(), marker, "the marker changed: {after}");
+    assert_eq!(objects(&root), before, "the upgrade rewrote objects");
+    let repo = Repo::open(fs.clone(), Some(alice), "alice").unwrap();
+    assert!(repo.config().is_partial(), "the upgraded repository is no longer a thin clone");
+}
+
+/// BUG-1390's class: `repo.json` keeps every field this build does not
+/// know, its remotes' included, through a parse and a rewrite, and such a
+/// configuration is never taken as one this build understands.
+#[test]
+fn repo_json_keeps_the_fields_this_build_does_not_know() {
+    let raw = br#"{"format":10,"repo_id":"ab","remotes":{"origin":{"url":"veil://h/p","later":1}},"later_top":{"x":5},"partial":{"remote":"origin","cache_limit":5}}"#;
+    let c: veil_core::repo::RepoConfig = serde_json::from_slice(raw).unwrap();
+    assert!(c.is_partial(), "`partial` is a field this build knows");
+    let back = serde_json::to_value(&c).unwrap();
+    assert_eq!(back["later_top"], serde_json::json!({"x": 5}), "{back}");
+    assert_eq!(back["partial"], serde_json::json!({"remote": "origin", "cache_limit": 5}), "{back}");
+    assert_eq!(back["remotes"]["origin"]["later"], 1, "{back}");
+    let e = c.check_known().unwrap_err();
+    let m = e.to_string();
+    assert!(matches!(e, VeilError::Unsupported(_)) && m.contains("\"later_top\"") && m.contains("\"later\"") && !m.contains("partial"), "{e}");
+    let known: veil_core::repo::RepoConfig = serde_json::from_slice(br#"{"format":10,"repo_id":"ab"}"#).unwrap();
+    assert!(known.check_known().is_ok());
 }

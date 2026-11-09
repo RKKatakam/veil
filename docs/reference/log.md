@@ -23,6 +23,7 @@ Options:
 | `-r, --rev <REVSET>` | Snapshots to show: `X`, `A..B`, `::B`, `..B` or `A..` |
 | `--author <PAT>` | Only snapshots whose author matches this regular expression. The author is a claim anyone who can push writes; --signed-by is the authenticated filter |
 | `--signed-by <MEMBER>` | Only snapshots with a good signature by MEMBER (a member name or member id, as verified by your key rings) |
+| `--agent <PATTERN>` | Only snapshots made by an agent whose name matches PATTERN (the name exactly, or a glob such as `claude-*`); the same as `-r 'agent(PATTERN)'` |
 | `-S <STRING>` | Only snapshots that change the number of occurrences of STRING in a file you can read |
 | `-G <REGEX>` | Only snapshots that add or remove a line matching REGEX in a file you can read |
 | `-i, --ignore-case` | Match -S, -G and --author case-insensitively |

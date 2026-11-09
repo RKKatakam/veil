@@ -19,7 +19,7 @@
 //!    inventory in a small set of their own), from the views of every
 //!    retained operation, the universal root, the project directory's
 //!    checkout pointer, keep markers and `extra_roots`: snapshot →
-//!    parents and tree; tree → entries, and a subtree already marked is
+//!    parents, attempts and tree; tree → entries, and a subtree already marked is
 //!    not entered again; file entry → object.
 //!    Snapshot `predecessors` (the evolution log) are weak references.
 //!    Memory is the bitmap, the walk stack, the packs' index tables and
@@ -451,6 +451,9 @@ impl Mark<'_> {
                 Ok(s) => {
                     let embargoed = s.embargo.as_deref().is_some_and(|e| !self.store.keys.embargo_released(e));
                     stack.extend(s.parents.iter().enumerate().map(|(i, p)| (*p, embargoed && i > 0)));
+                    // Attempts are strong references (format 10): kept as
+                    // long as the change that lists them.
+                    stack.extend(s.attempts.iter().map(|a| (*a, false)));
                     self.walking = Some(id);
                     self.tree(s.tree, String::new());
                     self.walking = None;

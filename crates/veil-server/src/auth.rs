@@ -35,7 +35,12 @@ use veil_core::{
     identity::verify_signature,
 };
 
-use std::sync::atomic::Ordering;
+use std::sync::{atomic::Ordering, Arc};
+
+use veil_core::{
+    hub::agent::{normalize_only, AgentSession, AgentSessionRequest, MAX_AGENT_SESSION_MS},
+    object::Attribution,
+};
 
 use crate::{
     caches::Epochs,
@@ -87,7 +92,25 @@ pub struct Person {
     pub name: String,
     /// The signed-in device's Ed25519 key (hex).
     pub device_key: String,
+    /// Set when the session is an agent session (`docs/HUB.md` §13.27):
+    /// every request is checked as the person's, then narrowed.
+    pub agent: Option<Arc<AgentGrant>>,
 }
+
+/// What an agent session is: made from its person's own session, for one
+/// project, maybe narrowed, with the attribution its commits through the
+/// API carry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentGrant {
+    pub project: i64,
+    /// `--only`: the paths its files are narrowed to (`None`: all its
+    /// person sees).
+    pub only: Option<Arc<Vec<String>>>,
+    pub attribution: Attribution,
+}
+
+/// The code of the refusal of what an agent session may not do.
+pub const AGENT_SESSION: &str = "agent_session";
 
 fn valid_key(key: &str) -> bool {
     key.len() == 64 && key.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -95,6 +118,24 @@ fn valid_key(key: &str) -> bool {
 
 pub fn token_hash(token: &str) -> String {
     blake3::hash(token.as_bytes()).to_hex().to_string()
+}
+
+/// What an agent session's token starts with.
+pub const AGENT_TOKEN_PREFIX: &str = "agent-";
+
+/// The hash a session is kept under: a person's under [`token_hash`], an
+/// agent session's (its token starts with [`AGENT_TOKEN_PREFIX`]) under a
+/// derived key of its own, which a server that predates agent sessions
+/// never computes, so it never finds one (BUG-1376).
+pub fn session_hash(token: &str) -> String {
+    match token.starts_with(AGENT_TOKEN_PREFIX) {
+        true => blake3::Hasher::new_derive_key(veil_core::crypto::domains::HUB_AGENT_SESSION)
+            .update(token.as_bytes())
+            .finalize()
+            .to_hex()
+            .to_string(),
+        false => token_hash(token),
+    }
 }
 
 pub async fn challenge(State(hub): State<HubState>, Json(req): Json<ChallengeRequest>) -> Result<Json<Challenge>> {
@@ -342,7 +383,8 @@ impl FromRequestParts<HubState> for Caller {
             .ok()
             .and_then(|a| a.strip_prefix("Bearer "))
             .ok_or_else(|| Error::unauthorized("expected a bearer token"))?;
-        let hash = token_hash(token);
+        let hash = session_hash(token);
+        let agent_token = token.starts_with(AGENT_TOKEN_PREFIX);
         let now = veil_core::now_millis();
         let stats = &hub.caches.stats;
         if let Some(e) = hub.caches.session(&hash).filter(|e| e.expires_at > now) {
@@ -358,21 +400,26 @@ impl FromRequestParts<HubState> for Caller {
         stats.session_misses.fetch_add(1, Ordering::Relaxed);
         // The session and the person's epoch in one statement: the entry is
         // never tagged with an epoch newer than what it was read with.
-        let row: Option<(i64, String, String, i64, i64, i64)> = sqlx::query_as(
+        type Row = (i64, String, String, i64, i64, i64, Option<String>, Option<i64>, Option<String>);
+        let row: Option<Row> = sqlx::query_as(
             "SELECT p.id, p.name, d.signing_key, s.expires_at, \
              COALESCE((SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = p.id), 0), \
-             COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $3 AND person_id = 0), 0) \
+             COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $3 AND person_id = 0), 0), \
+             s.agent, s.agent_project, s.agent_only \
              FROM sessions s JOIN devices d ON d.id = s.device_id JOIN people p ON p.id = s.person_id \
-             WHERE s.token_hash = $1 AND s.expires_at > $2 AND d.removed_at IS NULL AND NOT d.pending",
+             WHERE s.token_hash = $1 AND s.expires_at > $2 AND d.removed_at IS NULL AND NOT d.pending \
+             AND (s.agent IS NOT NULL) = $4",
         )
         .bind(&hash)
         .bind(now)
         .bind(project.unwrap_or(-1))
+        .bind(agent_token)
         .fetch_optional(&hub.db)
         .await?;
         match row {
-            Some((id, name, device_key, expires_at, person_epoch, project_epoch)) => {
-                let person = Person { id, name, device_key };
+            Some((id, name, device_key, expires_at, person_epoch, project_epoch, agent, agent_project, agent_only)) => {
+                let agent = agent_grant(agent, agent_project, agent_only)?;
+                let person = Person { id, name, device_key, agent };
                 hub.caches.put_session(
                     &hash,
                     crate::caches::SessionEntry {
@@ -395,8 +442,107 @@ impl FromRequestParts<HubState> for Caller {
     }
 }
 
+/// An agent session's record, as stored; a malformed one fails closed.
+fn agent_grant(agent: Option<String>, project: Option<i64>, only: Option<String>) -> Result<Option<Arc<AgentGrant>>> {
+    let Some(agent) = agent else { return Ok(None) };
+    let damaged = || Error::unauthorized("this agent session's record is damaged; make a new one");
+    let attribution: Attribution = serde_json::from_str(&agent).map_err(|_| damaged())?;
+    let only = match only {
+        Some(o) => Some(Arc::new(serde_json::from_str::<Vec<String>>(&o).map_err(|_| damaged())?)),
+        None => None,
+    };
+    Ok(Some(Arc::new(AgentGrant {
+        project: project.ok_or_else(damaged)?,
+        only,
+        attribution,
+    })))
+}
+
 impl Caller {
     pub fn signed_in(&self) -> Result<&Person> {
         self.person.as_ref().ok_or_else(|| Error::unauthorized("sign in first (`vl login`)"))
     }
+
+    /// [`Caller::signed_in`], refusing an agent session: changes of who
+    /// has access, of devices, invites, key rings, shares, new projects and
+    /// new sessions are the person's own, never an agent's (an agent session
+    /// could otherwise make something that outlives it).
+    pub fn person_only(&self) -> Result<&Person> {
+        let p = self.signed_in()?;
+        if p.agent.is_some() {
+            return Err(Error::new(
+                axum::http::StatusCode::FORBIDDEN,
+                AGENT_SESSION,
+                "an agent session cannot do this; only its person can, with their own session",
+            ));
+        }
+        Ok(p)
+    }
+
+    /// The agent session's record, if this is one.
+    pub fn agent(&self) -> Option<&AgentGrant> {
+        self.person.as_ref().and_then(|p| p.agent.as_deref())
+    }
+}
+
+/// `POST /v1/sessions/agent`: an agent session from the caller's own
+/// session (`docs/HUB.md` §13.27). It lasts at most 12 hours and never past
+/// the session it is made from, works in one project the person can see,
+/// and is never wider than its person: narrowing only takes away. Nothing
+/// is shown to anyone but the caller, and only the token's hash is kept.
+pub async fn agent_session(
+    State(hub): State<HubState>,
+    headers: HeaderMap,
+    caller: Caller,
+    Json(req): Json<AgentSessionRequest>,
+) -> Result<Json<AgentSession>> {
+    let me = caller.person_only()?.clone();
+    req.attribution.validate().map_err(Error::bad_request)?;
+    let only = normalize_only(&req.only).map_err(Error::bad_request)?;
+    let (project, _viewer) = crate::perm::open(&hub, &req.project, &caller).await?;
+    let parent = headers
+        .get("authorization")
+        .and_then(|a| a.to_str().ok())
+        .and_then(|a| a.strip_prefix("Bearer "))
+        .map(token_hash)
+        .ok_or_else(|| Error::unauthorized("expected a bearer token"))?;
+    let now = veil_core::now_millis();
+    let want = match req.seconds {
+        None => MAX_AGENT_SESSION_MS,
+        Some(s) if s > 0 => s.saturating_mul(1000).min(MAX_AGENT_SESSION_MS),
+        Some(_) => return Err(Error::bad_request("seconds must be positive")),
+    };
+    let token = format!("{AGENT_TOKEN_PREFIX}{}", hex::encode(veil_core::crypto::random_bytes::<32>()));
+    let attribution = serde_json::to_string(&req.attribution).map_err(|e| Error::Other(e.into()))?;
+    let only_json = (!only.is_empty()).then(|| serde_json::to_string(&only)).transpose().map_err(|e| Error::Other(e.into()))?;
+    // The parent's device and expiry are read in the insert itself: a
+    // parent that ended (its device removed) makes nothing.
+    let expires_at: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO sessions (token_hash, device_id, person_id, expires_at, agent, agent_project, agent_only, parent_hash) \
+         SELECT $1, s.device_id, s.person_id, LEAST(s.expires_at, $2), $3, $4, $5, s.token_hash \
+         FROM sessions s JOIN devices d ON d.id = s.device_id \
+         WHERE s.token_hash = $6 AND s.person_id = $7 AND s.agent IS NULL AND s.expires_at > $8 \
+         AND d.removed_at IS NULL AND NOT d.pending \
+         RETURNING expires_at",
+    )
+    .bind(session_hash(&token))
+    .bind(now + want)
+    .bind(&attribution)
+    .bind(project.id)
+    .bind(&only_json)
+    .bind(&parent)
+    .bind(me.id)
+    .bind(now)
+    .fetch_optional(&hub.db)
+    .await?;
+    let expires_at = expires_at.ok_or_else(|| Error::unauthorized("session expired or unknown; sign in again"))?;
+    crate::audit(&hub.db, Some(project.id), Some(me.id), "agent session", &format!("for {}", req.attribution.agent.escape_debug())).await;
+    Ok(Json(AgentSession {
+        token,
+        project: project.name,
+        person: me.name,
+        expires_at,
+        only,
+        attribution: req.attribution,
+    }))
 }

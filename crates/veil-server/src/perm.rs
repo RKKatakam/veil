@@ -49,6 +49,58 @@ pub struct Viewer {
     pub person: Option<i64>,
     pub admin: bool,
     pub groups: HashSet<i64>,
+    /// An agent session's narrowing (`docs/HUB.md` §13.27): it writes, and
+    /// the file routes let it read, only at or below these paths. Its
+    /// history is its person's: [`View::key`] ignores it.
+    pub only: Option<std::sync::Arc<Vec<String>>>,
+    /// An agent session (`docs/HUB.md` §13.27): it never changes a file that
+    /// decides access or review, never forces or deletes a branch, and moves
+    /// one only within its narrowing.
+    pub agent: bool,
+}
+
+impl Viewer {
+    /// May this viewer reach file or folder `path` through the routes that
+    /// serve files? Always, but for a narrowed agent session.
+    pub fn within_narrowing(&self, path: &str) -> bool {
+        self.only.as_ref().is_none_or(|o| veil_core::hub::agent::within(o, path))
+    }
+
+    /// May this viewer have the tree of folder `dir`: inside the narrowing,
+    /// or on the way to it (its entries then name what the person sees
+    /// there, never what is below them).
+    pub fn toward_narrowing(&self, dir: &str) -> bool {
+        self.only.as_ref().is_none_or(|o| veil_core::hub::agent::within(o, dir) || veil_core::hub::agent::toward(o, dir))
+    }
+
+    /// The key-ring scopes a narrowed session may see (`None`: not
+    /// narrowed, every scope its person sees): those of the secrets at or
+    /// below its paths, by the rule that seals them
+    /// (`policy::rule_scope`): the rule deciding each of its paths, and every
+    /// rule inside them (BUG-1537).
+    pub fn narrowed_scopes(&self, project: &Project) -> Option<HashSet<String>> {
+        let only = self.only.as_ref()?;
+        let mut out: HashSet<String> = only.iter().map(|o| veil_core::policy::rule_scope(&project.policy, o)).collect();
+        for r in &project.policy.rules {
+            if !r.names.is_empty() && veil_core::hub::agent::within(only, &r.path) {
+                out.insert(veil_core::policy::rule_scope_of(&r.path));
+            }
+        }
+        Some(out)
+    }
+
+    /// Refuse a file route's `path` outside the narrowing, as a path that
+    /// is not there.
+    pub fn narrowed_to(&self, path: &str) -> Result<()> {
+        if self.within_narrowing(path) {
+            return Ok(());
+        }
+        Err(Error::new(
+            axum::http::StatusCode::FORBIDDEN,
+            crate::auth::AGENT_SESSION,
+            "this agent session is narrowed to other paths: ask for a path inside them",
+        ))
+    }
 }
 
 impl Project {
@@ -58,6 +110,8 @@ impl Project {
             Some(Binding::Person(p)) => viewer.person == Some(*p),
             None => false,
         })
+        .narrowed(viewer.only.as_deref().map(|o| o.as_slice()))
+        .for_agent(viewer.agent)
     }
 
     /// Does `viewer` take part in the project (an admin, in one of its
@@ -122,6 +176,8 @@ pub async fn load_viewer(c: &mut PgConnection, project: i64, person: &Person) ->
             person: Some(person.id),
             admin,
             groups: groups.into_iter().collect(),
+            only: None,
+            agent: false,
         },
         barred,
     ))
@@ -220,7 +276,16 @@ pub async fn open_at(hub: &Hub, name: &str, caller: &Caller) -> Result<(Project,
                 ));
             }
             person_epoch = v.person_epoch;
-            v.viewer.clone()
+            let mut viewer = v.viewer.clone();
+            // An agent session works in its own project only, narrowed.
+            if let Some(a) = &p.agent {
+                if a.project != project.id {
+                    return Err(not_found());
+                }
+                viewer.only = a.only.clone();
+                viewer.agent = true;
+            }
+            viewer
         }
     };
     if !project.view(&viewer).sees_anything() && !project.participant(&viewer) {

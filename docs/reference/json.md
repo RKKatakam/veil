@@ -325,6 +325,7 @@ An entry:
 | `root` | bool | The universal root, `root()`: its `author`, `timestamp` and `signature` are null |
 | `current` | bool | The working copy of the current workspace (`@`) |
 | `author` | string or null | Who made the change |
+| `agent` | [attribution](#attribution) *(optional)* | The agent that produced the content (the `agent: …` line in the text); absent when none is recorded |
 | `timestamp` | string or null | When this snapshot was made |
 | `signature` | [signature](#signature) or null | Its signature |
 | `workspaces` | array of strings | Workspaces whose working copy this is (`name@` in the text) |
@@ -375,7 +376,22 @@ what they change is sealed for you; listed in `entries` only with
 | `embargo` | object or null | The embargo this merge introduced: `id` (string); `state`: `pending`, `staged` (released here, not pushed yet), `released` or `unknown` (no record of it here); `until` (string or null: when a `pending` embargo is released automatically; null for a manual release) |
 | `conflicts` | array of strings | Paths that still have conflict markers |
 | `description` | string or null | The full description |
+| `agent` | [attribution](#attribution) *(optional)* | The agent that produced the content; absent when none is recorded |
+| `abandoned` | string *(optional)* | This version is a recorded dead end (`vl attempt drop`), for this reason |
+| `attempts` | array *(optional)* | The change's recorded dead ends, oldest first (`Discarded attempts` in the text); absent when there are none. Each: `snapshot_id`, `snapshot_short`, `reason` (string), `agent` ([attribution](#attribution), *optional*), `timestamp` (string or null), `files` (array of strings: what it changed against its own parents) and `missing` (bool, *optional*: present and true when only its id is here, after `vl gc` or before a fetch) |
 | `diff` | object | The snapshot's changes: `stat` (bool), `files` (array of [file diffs](#file-diff)) and `hidden` (optional), as in [`veil.diff/2`](#veildiff2) |
+
+### Attribution
+
+Who produced a snapshot's content (repository format 10): plain text, seen
+by exactly the people who see the change, and covered by its signature.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `agent` | string | The agent, e.g. `claude-code/2.3 opus-5.5` |
+| `task` | string *(optional)* | Its task: an id or a title |
+| `prompt` | string *(optional)* | A reference to its prompt (a URL, a transcript id, a digest) |
+| `run` | string *(optional)* | The harness's run or session id |
 
 ## `veil.workspace.list/2`
 

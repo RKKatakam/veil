@@ -164,6 +164,9 @@ pub fn evil_remote_on_disk(dest: &Path, description: &str, tags: &[&str], build:
             conflicts: vec![],
             signature: None,
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
         })
         .unwrap();
     let mut tx = r.transaction("evil").unwrap();

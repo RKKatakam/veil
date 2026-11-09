@@ -203,6 +203,9 @@ pub fn raw_snapshot(repo: &Repo, parents: Vec<ObjectId>, tree: ObjectId, desc: &
             conflicts: vec![],
             signature: None,
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
         })
         .unwrap()
 }

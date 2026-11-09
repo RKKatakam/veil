@@ -1115,9 +1115,28 @@ struct Snapshot {
     predecessors: Vec<ObjectId>,   // evolution log
     conflicts: Vec<String>,        // conflicted paths (format 4: an index of the tree's conflict entries)
     embargo: Option<String>,       // embargo introduced here
+    agent: Option<Attribution>,    // format 10: {agent, task?, prompt?, run?}
+    abandoned: Option<String>,     // format 10: a recorded dead end, and why
+    attempts: Vec<ObjectId>,       // format 10: the change's dead ends (≤ 32)
 }
 ```
 
+* **Agent attribution** (`Snapshot.agent`, format 10) is set only by the
+  process: `Repo::set_attribution`, which `vl` fills from its own
+  `VEIL_AGENT…` environment and `ws exec --agent` flags
+  (`crates/vl/src/agent.rs`), and the server from an agent session's
+  record for API commits (`docs/HUB.md` §13.27). `Transaction` stamps what
+  the transaction produces (`write_snapshot`, `rewrite`), except an empty
+  undescribed change and an abandoned attempt; `keep_attribution` (rebase,
+  duplicate) keeps each change's own. It is inside the signed encoding.
+* **Attempts** (`vl attempt drop`, `Repo::drop_attempt`): the version is
+  copied with `abandoned` set (and stored without becoming a head), and the
+  change starts again from its parents, listing it in `attempts` and
+  naming it as its predecessor. `Transaction::check_parents` and
+  `check_no_abandoned_refs` (at commit) keep abandoned snapshots out of
+  parents, heads, workspaces and tags; gc, fsck, pushes and pulls follow
+  `attempts` like parents. Validation is `Snapshot::validate_format_10`, on
+  every decode and write.
 * **There is a universal root** (all-zero change id, empty tree, timestamp 0),
   so every repository shares it and unrelated histories can be exchanged.
 * **Change ids** are 128-bit random values, shown in reverse-hex (`z…k`) so

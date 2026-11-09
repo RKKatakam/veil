@@ -270,6 +270,10 @@ pub fn fsck(backend: Arc<dyn StorageBackend>, identity: Option<Identity>) -> Res
     let config = backend.read(&vpath(".veil/repo.json"))?;
     let (repo_id, format, partial) = match serde_json::from_slice::<RepoConfig>(&config) {
         Ok(c) => {
+            // A field this build does not know: it cannot judge the rest.
+            if let Err(e) = c.check_known() {
+                report.findings.push(Finding { severity: Severity::Corrupt, message: e.to_string() });
+            }
             if let Err(e) = c.check_partial() {
                 report.findings.push(Finding { severity: Severity::Corrupt, message: e.to_string() });
             }
@@ -586,6 +590,9 @@ impl Checker {
                 .is_some_and(|e| !self.embargoes.get(e).copied().unwrap_or(false));
             for (i, p) in s.parents.iter().enumerate().rev() {
                 stack.push((*p, me.clone(), embargoed && i > 0));
+            }
+            for a in &s.attempts {
+                stack.push((*a, format!("{me} (an attempt)"), false));
             }
             for p in &s.predecessors {
                 if !self.store.has(p) {

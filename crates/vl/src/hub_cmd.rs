@@ -196,18 +196,17 @@ fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>, mut thin: Optio
             url: format!("veil://{}/{}", url.authority, url.project),
             public: false,
             only: only.map(str::to_string),
+            unknown: Default::default(),
         },
     );
-    // Thin by default (S3): format 9 and the `partial` marker, written
-    // before anything is fetched, so an interrupted clone is never read as
-    // a full one. A server too old for thin clones gets a full one.
+    // Thin by default (S3): the `partial` marker, at this release's format
+    // (10; S3's release wrote 9), written before anything is fetched, so an
+    // interrupted clone is never read as a full one. A server too old for thin clones gets a full one.
     if thin.is_some() && client.tips()?.is_some_and(|t| t.revision < crate::hub::HISTORY_PAGES) {
         println!("  {} the server is older than this vl: making a full clone", yellow("note:"));
         thin = None;
     }
     if let Some(limit) = thin {
-        config.format = veil_core::repo::PARTIAL_FORMAT;
-        config.min_vl = Some(veil_core::repo::min_vl_for_format(config.format).to_string());
         config.partial = Some(veil_core::repo::PartialConfig { remote: "origin".into(), cache_limit: limit });
     }
     repo.save_config(config)?;

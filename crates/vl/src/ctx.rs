@@ -349,6 +349,8 @@ impl Ctx {
         let user = user_for(&identity);
         let fs = Arc::new(DiskBackend::new(&root));
         let mut repo = Repo::open(fs.clone(), Some(identity.clone()), &user)?;
+        // From this process's own arguments and environment only.
+        repo.set_attribution(crate::agent::current()?);
         // A thin clone reads what it has not fetched from its server.
         crate::thin::attach(&repo, &identity);
         // A clone of a server project trusts only the key rings of the

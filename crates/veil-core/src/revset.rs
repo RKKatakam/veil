@@ -20,6 +20,8 @@
 //! A..B         ancestors of B (B included) that are not ancestors of A
 //! ..B          root()..B
 //! A..          visible snapshots that are not ancestors of A
+//! agent(PAT)   visible snapshots whose agent attribution matches PAT
+//!              (the name exactly, or a glob: `claude-*`)
 //! ```
 //!
 //! Tag names never contain `..` or `:` (`commands::validate_tag_name`), so
@@ -52,6 +54,19 @@ use crate::{
 /// (an unreleased embargo on a public clone) are not part of the set.
 pub fn resolve_set(repo: &Repo, spec: &str, current_ws: &str) -> Result<Vec<ObjectId>> {
     let spec = spec.trim();
+    if let Some(pattern) = spec.strip_prefix("agent(").and_then(|r| r.strip_suffix(')')) {
+        let m = agent_matcher(pattern)?;
+        // As a full clone answers: a thin clone pages in what it lacks.
+        let all = repo.exact().topo_children_first(repo.view().refs())?;
+        let mut out = Vec::new();
+        for id in all {
+            let s = repo.snapshot(&id)?;
+            if agent_matches(&s, &m) {
+                out.push(id);
+            }
+        }
+        return Ok(out);
+    }
     if let Some(b) = spec.strip_prefix("::") {
         let b = resolve(repo, nonempty(b, spec)?, current_ws)?;
         return repo.exact().topo_children_first([b]);
@@ -74,6 +89,30 @@ pub fn resolve_set(repo: &Repo, spec: &str, current_ws: &str) -> Result<Vec<Obje
     // no more), in the held order (everything in it is held by then).
     let set = repo.exact().range(&heads, &exclude)?;
     Ok(repo.held().topo_children_first(heads)?.into_iter().filter(|id| set.contains(id)).collect())
+}
+
+/// Longest pattern `agent(PATTERN)` and `vl log --agent` take.
+pub const MAX_AGENT_PATTERN: usize = 256;
+
+/// The matcher of `agent(PATTERN)`: a glob (`*`, `?`, `[…]`; no regular
+/// expressions), at most [`MAX_AGENT_PATTERN`] bytes.
+pub fn agent_matcher(pattern: &str) -> Result<globset::GlobMatcher> {
+    let pattern = pattern.trim();
+    if pattern.is_empty() || pattern.len() > MAX_AGENT_PATTERN {
+        return Err(VeilError::Revset(format!(
+            "agent(PATTERN) takes a name or glob of 1 to {MAX_AGENT_PATTERN} bytes"
+        )));
+    }
+    globset::GlobBuilder::new(pattern)
+        .literal_separator(false)
+        .build()
+        .map(|g| g.compile_matcher())
+        .map_err(|e| VeilError::Revset(format!("agent({pattern:?}): {}", e.kind())))
+}
+
+/// Does snapshot `s` carry an attribution whose agent `m` matches?
+pub fn agent_matches(s: &crate::object::Snapshot, m: &globset::GlobMatcher) -> bool {
+    s.agent.as_ref().is_some_and(|a| m.is_match(&a.agent))
 }
 
 fn nonempty<'a>(s: &'a str, spec: &str) -> Result<&'a str> {

@@ -114,12 +114,19 @@ struct ServerEntry {
     /// the only `team` key ring of that project it trusts (BUG-845).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     anchors: BTreeMap<String, String>,
+    /// Fields this `vl` does not know (a later release's, on the same
+    /// machine), kept as they are by every rewrite (BUG-1393).
+    #[serde(flatten)]
+    unknown: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct HubFile {
     #[serde(default)]
     servers: BTreeMap<String, ServerEntry>,
+    /// Fields this `vl` does not know, kept as they are (BUG-1393).
+    #[serde(flatten)]
+    unknown: BTreeMap<String, serde_json::Value>,
 }
 
 fn hub_file() -> std::path::PathBuf {
@@ -255,6 +262,8 @@ const ANSWER_LIMIT: u64 = 4 << 30;
 /// JSON. A server from before S27 ignores it and sends plain frames, which
 /// are encoded frames too.
 const ACCEPT: &str = "application/x-veil-encoded-frames, application/json";
+/// Every request says which repository format this `vl` reads (BUG-1379).
+use veil_core::{hub::wire::FORMAT_HEADER, repo::REPO_FORMAT};
 
 /// The objects of an answer of (encoded or plain) frames, each decoded
 /// (bounded) and checked against its id.
@@ -359,7 +368,7 @@ impl Client {
         let token = if auth { self.token.borrow().clone() } else { None };
         let resp = match (method, body) {
             ("GET", _) => {
-                let mut r = self.agent.get(&url);
+                let mut r = self.agent.get(&url).header(FORMAT_HEADER, &REPO_FORMAT.to_string());
                 if let Some(t) = &token {
                     r = r.header("authorization", &format!("Bearer {t}"));
                 }
@@ -374,7 +383,7 @@ impl Client {
                 if let Some(t) = &token {
                     r = r.header("authorization", &format!("Bearer {t}"));
                 }
-                r = r.header("accept", ACCEPT);
+                r = r.header("accept", ACCEPT).header(FORMAT_HEADER, &REPO_FORMAT.to_string());
                 match body {
                     Some((ct, b)) => r.header("content-type", ct).send(&b[..]),
                     None => r.send_empty(),
@@ -572,7 +581,11 @@ impl Client {
                     let Some(p) = parts.get(i) else { break };
                     let body = (|| -> Option<Vec<u8>> {
                         let body = serde_json::to_vec(&FetchRequest { snapshot, objects: wants[p.clone()].to_vec() }).ok()?;
-                        let mut r = agent.post(url).header("content-type", "application/json").header("accept", ACCEPT);
+                        let mut r = agent
+                            .post(url)
+                            .header("content-type", "application/json")
+                            .header("accept", ACCEPT)
+                            .header(FORMAT_HEADER, &REPO_FORMAT.to_string());
                         if let Some(t) = token {
                             r = r.header("authorization", &format!("Bearer {t}"));
                         }
@@ -622,6 +635,11 @@ impl Client {
     }
 
     /// A commit through the API (`POST …/changes`).
+    /// `POST /v1/sessions/agent` (`docs/HUB.md` §13.27).
+    pub fn agent_session(&self, req: &veil_core::hub::agent::AgentSessionRequest) -> Result<veil_core::hub::agent::AgentSession> {
+        self.json("POST", "/v1/sessions/agent", Some(req))
+    }
+
     pub fn change(&self, req: &veil_core::hub::changes::ChangeRequest) -> Result<veil_core::hub::changes::ChangeResult> {
         self.json("POST", &self.url.project_path("/changes"), Some(req))
     }
@@ -1321,7 +1339,8 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                 continue;
             }
             if let Ok(Some(s)) = held.snapshot(&id) {
-                stack.extend(s.parents.iter().copied());
+                // Attempts (format 10) go with their version.
+                stack.extend(s.parents.iter().chain(&s.attempts).copied());
             }
         }
         let mut new = Vec::new();
@@ -1332,7 +1351,8 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                 continue;
             }
             let s = held.snapshot(&id)?.ok_or(veil_core::VeilError::Missing(id))?;
-            stack.extend(s.parents.iter().copied());
+            // Its attempts (format 10) go with it.
+            stack.extend(s.parents.iter().chain(&s.attempts).copied());
             new.push((id, s));
         }
         // Upload what the push introduces as the walk finds it, 8 MiB per
@@ -1398,6 +1418,23 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Property 4 of the S11 review (BUG-1390's class): every rewrite of
+    /// `$VEIL_HOME/hub.json` (`update_entry`: `load_file`, a change,
+    /// `save_file`) keeps the fields this `vl` does not know (a later
+    /// release's, written by it on the same machine), or refuses. The file
+    /// is outside every repository, so no repository format guards it.
+    #[test]
+    fn hub_json_keeps_the_fields_this_vl_does_not_know() {
+        let before = br#"{"servers":{"hub.example:443":{"token":"t","expires_at":5,"anchors":{"p":"fp"},"later_trust":{"p":"MARKER-LATER-FIELD-1a"}}},"later_top":"MARKER-LATER-TOP-2b"}"#;
+        let mut f: HubFile = serde_json::from_slice(before).expect("an older vl reads a newer hub.json");
+        // What `update_entry` does: change one entry, write the whole file.
+        f.servers.get_mut("hub.example:443").unwrap().token = Some("renewed".into());
+        let after = String::from_utf8(serde_json::to_vec_pretty(&f).unwrap()).unwrap();
+        assert!(after.contains("renewed"), "the change is written: {after}");
+        assert!(after.contains("MARKER-LATER-FIELD-1a"), "a server entry's unknown field was dropped: {after}");
+        assert!(after.contains("MARKER-LATER-TOP-2b"), "an unknown top-level field was dropped: {after}");
+    }
 
     /// `vl` says it reads encoded frames, and reads both kinds: plain
     /// frames (a server from before S27) and compressed ones.

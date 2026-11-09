@@ -318,7 +318,8 @@ async fn projected_inner(
             }
             let s = blocking(hub, project.id, move |src| Ok(src.snapshot(&x)?)).await?;
             stack.push((x, true));
-            for p in s.parents.iter().rev() {
+            // Attempts (format 10) are projected like any version, first.
+            for p in s.parents.iter().chain(&s.attempts).rev() {
                 if !done.contains_key(p) {
                     stack.push((*p, false));
                 }
@@ -349,6 +350,7 @@ async fn projected_inner(
             }
         };
         let ppreds = projected_predecessors(hub, project, viewer, &s, deferred.as_deref_mut()).await?;
+        let pattempts: Vec<ObjectId> = s.attempts.iter().map(|a| done[a]).collect();
         let (proj_text, bindings, viewer2) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
         let hub2 = hub.clone();
         let (result, new_obj) = blocking(hub, project.id, move |src| {
@@ -361,7 +363,7 @@ async fn projected_inner(
                 policy,
                 bindings,
             };
-            project_one(src, &p.view(&viewer2), x, &s, pparents, ppreds, origin, &hub2.identity)
+            project_one(src, &p.view(&viewer2), x, &s, pparents, ppreds, pattempts, origin, &hub2.identity)
         })
         .await?;
         if let Some(raw) = new_obj {
@@ -409,8 +411,10 @@ async fn projected_inner(
 }
 
 /// The projection of real snapshot `s` (id `x`) for a viewer of `view`,
-/// given the projections of its parents (`pparents`) and predecessors
-/// (`ppreds`) and the pusher's own snapshot it was completed from
+/// given the projections of its parents (`pparents`), predecessors
+/// (`ppreds`) and attempts (`pattempts`, one per attempt: an attempt, its
+/// reason and attribution are seen by exactly the people who see the
+/// change) and the pusher's own snapshot it was completed from
 /// (`origin`): its id, and the object to store when the server signed a
 /// new one (the module docs). Pure: [`projected`] memoises the answer, and
 /// a commit through the API (`changes`) records it in its own transaction.
@@ -422,13 +426,15 @@ pub(crate) fn project_one(
     s: &Snapshot,
     pparents: Vec<ObjectId>,
     ppreds: Vec<ObjectId>,
+    pattempts: Vec<ObjectId>,
     origin: Option<ObjectId>,
     identity: &veil_core::Identity,
 ) -> Result<(ObjectId, Option<Bytes>)> {
     let mut pr = Projector::new(src, view);
     let ptree = pr.root(s.tree)?;
     // A change of what the viewer cannot see only: not in their history.
-    if pparents.len() == 1 && !s.parents.is_empty() {
+    // An attempt stays one, whatever it changed: it is never history.
+    if pparents.len() == 1 && !s.parents.is_empty() && s.abandoned.is_none() {
         let pp = src.snapshot(&pparents[0])?;
         let real_changed = s.parents.len() > 1 || src.snapshot(&s.parents[0])?.tree != s.tree;
         if pp.tree == ptree && real_changed {
@@ -440,6 +446,7 @@ pub(crate) fn project_one(
     u.tree = ptree;
     u.parents = pparents;
     u.predecessors = ppreds;
+    u.attempts = pattempts;
     u.conflicts.retain(|c| view_read(c));
     if u == without_signature(s) {
         return Ok((x, None));
@@ -544,6 +551,7 @@ pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer) -> Result<
 /// The snapshots reachable from `tips` in `viewer`'s projected history,
 /// down to (not including) `stop`, as object frames: as stored, compressed
 /// or not, when the caller reads `encoded` frames.
+#[allow(clippy::too_many_arguments)]
 pub async fn history(
     hub: &Arc<Hub>,
     project: &Project,
@@ -552,6 +560,7 @@ pub async fn history(
     stop: &[ObjectId],
     limit: Option<usize>,
     encoded: bool,
+    reads: u32,
 ) -> Result<Vec<u8>> {
     let mut starts = Vec::new();
     let mut reals = Vec::new();
@@ -579,7 +588,7 @@ pub async fn history(
                 starts.into_iter().zip(readable).filter(|(_, r)| *r).map(|(s, _)| s).collect()
             }
         };
-        return blocking(hub, project.id, move |src| history_page(src, starts, &stop, limit.clamp(1, MAX_HISTORY), encoded)).await;
+        return blocking(hub, project.id, move |src| history_page(src, starts, &stop, limit.clamp(1, MAX_HISTORY), encoded, reads)).await;
     }
     blocking(hub, project.id, move |src| {
         let mut out = Vec::new();
@@ -596,11 +605,13 @@ pub async fn history(
             let Object::Snapshot(s) = Object::decode(&raw)? else {
                 return Err(Error::Other(anyhow::anyhow!("projected history holds a non-snapshot")));
             };
+            readable_by(&s, reads)?;
             match encoded {
                 true => put_frame(&mut out, &id, &src.encoded(&id)?),
                 false => put_frame(&mut out, &id, &raw),
             }
-            stack.extend(s.parents.iter().copied());
+            // A version's attempts travel with it (format 10).
+            stack.extend(s.parents.iter().chain(&s.attempts).copied());
         }
         Ok(out)
     })
@@ -611,7 +622,27 @@ pub async fn history(
 /// ancestors, those of the newest children first, at most `limit`
 /// snapshots in all (and every tip). Any page is a region the client can
 /// hold: what it leaves out is reached by the next page.
-fn history_page(src: &Source, starts: Vec<ObjectId>, stop: &HashSet<ObjectId>, limit: usize, encoded: bool) -> Result<Vec<u8>> {
+/// Refuse to send snapshot `s` to a client that reads repository formats up
+/// to `reads` only (BUG-1379): it is told to update `vl`, never sent what
+/// it would report as a corrupt object. Every route that sends snapshots
+/// calls it.
+fn readable_by(s: &Snapshot, reads: u32) -> Result<()> {
+    if s.has_format_10_fields() && reads < veil_core::object::ATTRIBUTION_REPO_FORMAT {
+        return Err(Error::new(
+            axum::http::StatusCode::UPGRADE_REQUIRED,
+            "update_vl",
+            format!(
+                "this project holds changes of repository format {} (agent attribution, recorded attempts), which \
+                 this vl does not read: update vl to {} or later",
+                veil_core::object::ATTRIBUTION_REPO_FORMAT,
+                veil_core::repo::min_vl_for_format(veil_core::object::ATTRIBUTION_REPO_FORMAT)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn history_page(src: &Source, starts: Vec<ObjectId>, stop: &HashSet<ObjectId>, limit: usize, encoded: bool, reads: u32) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let mut heap: std::collections::BinaryHeap<(bool, i64, ObjectId)> = std::collections::BinaryHeap::new();
@@ -630,11 +661,28 @@ fn history_page(src: &Source, starts: Vec<ObjectId>, stop: &HashSet<ObjectId>, l
         let Object::Snapshot(s) = Object::decode(&raw)? else {
             return Err(Error::Other(anyhow::anyhow!("projected history holds a non-snapshot")));
         };
+        readable_by(&s, reads)?;
         match encoded {
             true => put_frame(&mut out, &id, &src.encoded(&id)?),
             false => put_frame(&mut out, &id, &raw),
         }
         taken += 1;
+        // A version's attempts travel with it, in the same page (format 10:
+        // at most 32; a client walks parents, so it never asks for them).
+        for a in &s.attempts {
+            if stop.contains(a) || !seen.insert(*a) {
+                continue;
+            }
+            let raw = src.raw(a)?;
+            let Object::Snapshot(at) = Object::decode(&raw)? else {
+                return Err(Error::Other(anyhow::anyhow!("an attempt is not a snapshot")));
+            };
+            readable_by(&at, reads)?;
+            match encoded {
+                true => put_frame(&mut out, a, &src.encoded(a)?),
+                false => put_frame(&mut out, a, &raw),
+            }
+        }
         for p in &s.parents {
             if !seen.contains(p) {
                 // A parent's timestamp is read when it is taken; until then
@@ -884,12 +932,21 @@ fn check_wants(
         dirs.insert(String::new(), pr.tree(&root)?);
         for &i in group {
             let w = &wants[i];
+            // A narrowed agent session (`docs/HUB.md` §13.27): files inside
+            // its narrowing, and the trees of the folders on the way there.
+            let narrowed_dir = !view.within_narrowing(&w.path);
+            if narrowed_dir && !view.toward_narrowing(&w.path) {
+                return Err(gone());
+            }
             let ok = if w.path.is_empty() {
                 w.id == root
             } else {
                 let (dir, name) = w.path.rsplit_once('/').unwrap_or(("", w.path.as_str()));
                 let tree = dir_tree(&mut pr, &mut dirs, dir)?.ok_or_else(gone)?;
                 let e = tree.get(name).ok_or_else(gone)?;
+                if narrowed_dir && e.kind != EntryKind::Dir {
+                    return Err(gone());
+                }
                 if e.id == w.id && e.kind != EntryKind::Dir {
                     sizes[i] = e.size;
                 }
@@ -929,6 +986,239 @@ fn dir_tree(pr: &mut Projector, dirs: &mut Dirs, dir: &str) -> Result<Option<Arc
 }
 
 // ---- push -------------------------------------------------------------------------
+
+/// What a narrowed agent session is told when a branch move would change
+/// something outside its paths: it names nothing there.
+pub(crate) const NARROWED_MOVE: &str = NARROWED_WRITE;
+
+/// The refusal of what an agent session may never do (`docs/HUB.md` §13.27).
+pub(crate) fn agent_refusal(m: &str) -> Error {
+    Error::new(axum::http::StatusCode::FORBIDDEN, crate::auth::AGENT_SESSION, m.to_string())
+}
+
+/// What [`differs_where`] does at an entry that differs between the trees.
+enum Visit {
+    /// Nothing to look at here.
+    Skip,
+    /// Look below (the folders, on either side; a file side counts as none).
+    Descend,
+    /// This difference is what was looked for.
+    Found,
+}
+
+/// What [`differs_where`] asks at each entry that differs: its path and
+/// the entry on each side.
+type Visitor<'a> = &'a dyn Fn(&str, Option<&veil_core::TreeEntry>, Option<&veil_core::TreeEntry>) -> Visit;
+
+/// How [`differs_where`] reads a tree: `None` for no tree there.
+type Trees<'a> = &'a dyn Fn(&ObjectId) -> veil_core::Result<Option<Arc<Tree>>>;
+
+/// Real trees from the store.
+fn stored_tree(src: &Source, id: &ObjectId) -> veil_core::Result<Option<Arc<Tree>>> {
+    Ok(match src.node(id)? {
+        Node::Tree(t, _) => Some(t),
+        Node::Leaf => None,
+    })
+}
+
+/// Do trees `a` and `b` (read by `get`) differ anywhere `visit` says
+/// [`Visit::Found`]? Both are walked down at once, only where they differ,
+/// and only into what `visit` descends into: the work is that of the
+/// difference.
+fn differs_where(
+    get: Trees,
+    a: Option<ObjectId>,
+    b: ObjectId,
+    visit: Visitor,
+) -> Result<bool> {
+    use std::collections::{BTreeMap, BTreeSet};
+    fn entries(get: Trees, id: Option<ObjectId>) -> Result<BTreeMap<String, veil_core::TreeEntry>> {
+        let Some(id) = id else { return Ok(BTreeMap::new()) };
+        Ok(match get(&id)? {
+            Some(t) => t.entries.iter().map(|e| (e.name.clone(), e.clone())).collect(),
+            None => BTreeMap::new(),
+        })
+    }
+    fn walk(src: Trees, visit: Visitor, dir: &str, a: Option<ObjectId>, b: Option<ObjectId>, depth: usize) -> Result<bool> {
+        if a == b {
+            return Ok(false);
+        }
+        if depth > veil_core::tree::MAX_TREE_DEPTH {
+            return Ok(true);
+        }
+        let (ea, eb) = (entries(src, a)?, entries(src, b)?);
+        for name in ea.keys().chain(eb.keys()).collect::<BTreeSet<_>>() {
+            let (x, y) = (ea.get(name), eb.get(name));
+            if x == y {
+                continue;
+            }
+            let path = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+            let dir_of = |e: Option<&veil_core::TreeEntry>| e.filter(|e| e.kind == EntryKind::Dir).map(|e| e.id);
+            match visit(&path, x, y) {
+                Visit::Skip => {}
+                Visit::Found => return Ok(true),
+                Visit::Descend => {
+                    if walk(src, visit, &path, dir_of(x), dir_of(y), depth + 1)? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+    walk(get, visit, "", a, Some(b), 0)
+}
+
+/// Does going from tree `from` to tree `to` (read by `get`) change
+/// anything outside `view`'s narrowing (BUG-1378)? Inside it anything may
+/// differ; on the way to it, only folders that are folders on both sides
+/// are looked into; anywhere else nothing may.
+fn differs_outside_narrowing(get: Trees, view: &View, from: ObjectId, to: ObjectId) -> Result<bool> {
+    differs_where(get, Some(from), to, &|path, x, y| {
+        let dir = |e: Option<&veil_core::TreeEntry>| e.is_none_or(|e| e.kind == EntryKind::Dir);
+        if view.within_narrowing(path) {
+            Visit::Skip
+        } else if dir(x) && dir(y) && view.toward_narrowing(path) {
+            Visit::Descend
+        } else {
+            Visit::Found
+        }
+    })
+}
+
+/// Does going from real tree `from` to real tree `to` change a file that
+/// decides access or review (`hub::agent::decides_access`), in any folder,
+/// whoever made the change (BUG-1391)?
+fn differs_in_access_files(src: &Source, from: ObjectId, to: ObjectId) -> Result<bool> {
+    differs_where(&|id| stored_tree(src, id), Some(from), to, &|path, x, y| {
+        let file = |e: Option<&veil_core::TreeEntry>| e.is_some_and(|e| e.kind != EntryKind::Dir);
+        if veil_core::hub::agent::decides_access(path) && (file(x) || file(y)) {
+            Visit::Found
+        } else if x.is_some_and(|e| e.kind == EntryKind::Dir) || y.is_some_and(|e| e.kind == EntryKind::Dir) {
+            Visit::Descend
+        } else {
+            Visit::Skip
+        }
+    })
+}
+
+/// Why an agent session may not set a branch's tip ([`agent_tip`]).
+pub(crate) enum AgentTip {
+    /// The tip would change files outside a narrowed session's paths
+    /// ([`NARROWED_MOVE`]: naming nothing there).
+    Narrowed,
+    /// The tip would change a file that decides access or review
+    /// ([`AGENT_ACCESS_MOVE`]).
+    Access,
+    /// The tip would create (or recreate) the default branch
+    /// ([`AGENT_DEFAULT_BRANCH`]).
+    DefaultBranch,
+}
+
+/// What an agent session is told when it would create or recreate the
+/// default branch (BUG-1538).
+pub(crate) const AGENT_DEFAULT_BRANCH: &str = "an agent session never creates the default branch; its person does";
+
+/// **The one rule of every branch tip an agent session sets** (`docs/HUB.md`
+/// §13.27): a move, a forced move, a creation, a recreation after a
+/// deletion, by push, by API commit with `onto`, and by any landing to come
+/// (S17 calls it too). The tip is compared with the old tip's tree. An
+/// agent session never creates or recreates the default branch (BUG-1538:
+/// there is nothing to compare with); other new branches decide nothing
+/// and are allowed (`None` with `default` false).
+///
+/// For a narrowed session the first question is whether anything outside
+/// its paths changes: it is answered before any other comparison, so the
+/// answer never tells what changed there (BUG-1481). Then the files that
+/// decide access or review (BUG-1391). `None`: allowed.
+pub(crate) fn agent_tip(src: &Source, view: &View, default: bool, cur: Option<ObjectId>, to: ObjectId) -> Result<Option<AgentTip>> {
+    if !view.is_agent() {
+        return Ok(None);
+    }
+    let from = match cur {
+        Some(c) => src.snapshot(&c)?.tree,
+        None if default => return Ok(Some(AgentTip::DefaultBranch)),
+        None => return Ok(None),
+    };
+    let to = src.snapshot(&to)?.tree;
+    if view.is_narrowed() && differs_outside_narrowing(&|id| stored_tree(src, id), view, from, to)? {
+        return Ok(Some(AgentTip::Narrowed));
+    }
+    if differs_in_access_files(src, from, to)? {
+        return Ok(Some(AgentTip::Access));
+    }
+    Ok(None)
+}
+
+/// [`agent_tip`] for a push or an API commit: off the async runtime.
+pub(crate) async fn agent_tip_of(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    branch: &str,
+    cur: Option<ObjectId>,
+    to: ObjectId,
+    pending: HashMap<ObjectId, Bytes>,
+) -> Result<Option<AgentTip>> {
+    if !viewer.agent {
+        return Ok(None);
+    }
+    let (v, text, bindings) = (viewer.clone(), project.policy_text.clone(), project.bindings.clone());
+    let default = branch == project.default_branch;
+    blocking_with(hub, project.id, pending, move |src| {
+        let p = Project {
+            id: src.project,
+            name: String::new(),
+            default_branch: String::new(),
+            policy: AccessPolicy::parse(&text),
+            policy_text: String::new(),
+            bindings,
+        };
+        agent_tip(src, &p.view(&v), default, cur, to)
+    })
+    .await
+}
+
+/// **The first check of every write a narrowed session makes** (a pushed
+/// snapshot, an API commit's snapshot, a merge, a landing), before the
+/// graft or any other step: outside its paths, the tree it sends (`pushed`,
+/// in its person's view) must equal **every** parent's content as its
+/// person sees it (`parents`: their real trees, projected here), so it
+/// neither writes there nor decides how changes there merge (BUG-1539,
+/// BUG-1540). One answer, naming nothing ([`NARROWED_WRITE`]). A tree it
+/// did not send reads as none. Anyone else passes.
+pub(crate) fn narrowing_gate(src: &Source, view: &View, pushed: ObjectId, parents: &[ObjectId]) -> Result<()> {
+    if !view.is_narrowed() {
+        return Ok(());
+    }
+    for t in parents {
+        let mut pr = Projector::new(src, view);
+        let seen = pr.root(*t)?;
+        let made = pr.created;
+        let get = |id: &ObjectId| -> veil_core::Result<Option<Arc<Tree>>> {
+            if let Some((t, _)) = made.get(id) {
+                return Ok(Some(t.clone()));
+            }
+            match stored_tree(src, id) {
+                Err(VeilError::Missing(_)) => Ok(None),
+                r => r,
+            }
+        };
+        if differs_outside_narrowing(&get, view, seen, pushed)? {
+            return Err(agent_refusal(NARROWED_WRITE));
+        }
+    }
+    Ok(())
+}
+
+/// What a narrowed session is told when it would write outside its paths:
+/// it names nothing there (BUG-1392).
+pub(crate) const NARROWED_WRITE: &str = "this agent session is narrowed: this would change files outside its paths";
+
+/// What an agent session is told when a branch move would land a change of
+/// a file that decides access or review (BUG-1391).
+pub(crate) const AGENT_ACCESS_MOVE: &str =
+    "an agent session never moves a branch onto a change of a file that decides access or review (.veilpolicy, .veilrules)";
 
 /// Names of personal private keys: never accepted, sealed or not
 /// (`docs/VISIBILITY.md`, "Personal private keys never leave your machine").
@@ -1029,6 +1319,9 @@ fn check_changes(
         others.push((src.snapshot(p)?.tree, None));
     }
     for c in changes {
+        // (A narrowed session's changes outside its paths never get here:
+        // `narrowing_gate` refused them first, naming nothing; every refusal
+        // below names its path.)
         // Taken from another parent of a merge, where that parent's side
         // changed it since the common ancestor: the merge takes a change
         // someone who could write it made. Taking the version the first
@@ -1048,6 +1341,10 @@ fn check_changes(
                     break;
                 }
             }
+        }
+        // Not even by taking someone else's change in a merge (BUG-1377).
+        if view.is_agent() && veil_core::hub::agent::decides_access(&c.path) {
+            return Err(agent_refusal(&format!("an agent session never changes '{}', which decides access or review", c.path)));
         }
         if !view.write(&c.path) && !from_other {
             return Err(Error::forbidden(format!("you may not write '{}'", c.path)));
@@ -1162,7 +1459,10 @@ fn sealed_secret_here(src: &Source, c: &Change, changes: &[Change], parents: &[O
 /// (every object a changed path names was `uploaded` or is the entry at
 /// that path in a parent), checks 2, 8 and 9 ([`check_changes`]) and access
 /// lines changed only by admins. Pushes and commits through the API
-/// (`changes`) both run it. `p` carries the accepted policy.
+/// (`changes`) both run it. `p` carries the accepted policy. `ra` are the
+/// real ids of `n`'s attempts (format 10), each an abandoned version of the
+/// same change; no parent may be one.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn complete(
     src: &Source,
     p: &Project,
@@ -1170,14 +1470,32 @@ pub(crate) fn complete(
     uploaded: &HashSet<ObjectId>,
     n: &Snapshot,
     rp: &[ObjectId],
+    ra: &[ObjectId],
     identity: &veil_core::Identity,
 ) -> Result<Completed> {
     if rp.len() > MAX_PARENTS {
         return Err(Error::bad_request(format!("a snapshot may have at most {MAX_PARENTS} parents")));
     }
+    // Attempts never enter ancestry (`Snapshot::abandoned`).
+    for p in rp {
+        if src.snapshot(p)?.abandoned.is_some() {
+            return Err(Error::bad_request("a parent is an abandoned attempt: nothing is built on one"));
+        }
+    }
+    for a in ra {
+        let at = src.snapshot(a)?;
+        if at.abandoned.is_none() || at.change_id != n.change_id {
+            return Err(Error::bad_request("an attempt must be an abandoned version of the same change"));
+        }
+    }
     let admin = viewer.admin;
     let view = p.view(viewer);
     let ptrees: Vec<ObjectId> = rp.iter().map(|p| Ok(src.snapshot(p)?.tree)).collect::<Result<_>>()?;
+    // A narrowed session: anything outside its paths, decided first, on the
+    // tree it sent against every parent, before the graft, any comparison,
+    // object check or lookup, and answered one way, naming nothing
+    // (BUG-1392, BUG-1481, BUG-1539, BUG-1540).
+    narrowing_gate(src, &view, n.tree, &ptrees)?;
     let mut g = Graft::new(src, &view).proving(uploaded, ptrees.clone());
     let real_tree = g.root(n.tree, Some(ptrees[0]))?;
     // A merge must not change what the pusher cannot see.
@@ -1231,6 +1549,7 @@ pub(crate) fn complete(
     let mut real = n.clone();
     real.tree = real_tree;
     real.parents = rp.to_vec();
+    real.attempts = ra.to_vec();
     if real == *n {
         return Ok(Completed {
             real: ObjectId::hash(&Object::Snapshot(real).encode()),
@@ -1268,6 +1587,9 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
     if req.force && !viewer.admin {
         return Err(Error::forbidden("only admins may force a branch move"));
     }
+    if req.force && viewer.agent {
+        return Err(agent_refusal("an agent session never forces a branch move"));
+    }
     if req.updates.len() > MAX_PUSH_UPDATES {
         return Err(Error::bad_request(format!("at most {MAX_PUSH_UPDATES} branch updates per push")));
     }
@@ -1282,6 +1604,13 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             .await?;
         rows.into_iter().filter_map(|(n, t)| ObjectId::from_hex(&t).ok().map(|t| (n, t))).collect()
     };
+    // An agent session never creates or recreates the default branch
+    // (BUG-1538): decided before anything else of the push, so the answer is
+    // one, whatever the snapshots hold. (`agent_tip` says the same for any
+    // later route.)
+    if viewer.agent && req.updates.iter().any(|u| u.branch == project.default_branch && u.new.is_some() && !current.contains_key(&u.branch)) {
+        return Err(agent_refusal(AGENT_DEFAULT_BRANCH));
+    }
     // Only the branches this push moves, and the default branch, are
     // candidates; a branch this push moves wins over the default branch
     // (both may look the same to the pusher).
@@ -1316,7 +1645,8 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             r => Ok(r?),
         })
         .await?;
-        stack.extend(s.parents.iter().copied());
+        // Its attempts (format 10) are pushed with it, before it.
+        stack.extend(s.parents.iter().chain(&s.attempts).copied());
         parents_of.insert(id, s);
         new.push(id);
         if new.len() > MAX_PUSH_SNAPSHOTS {
@@ -1337,7 +1667,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                 order.push(id);
             } else {
                 st.push((id, true));
-                for p in &parents_of[&id].parents {
+                for p in parents_of[&id].parents.iter().chain(&parents_of[&id].attempts) {
                     st.push((*p, false));
                 }
             }
@@ -1392,9 +1722,12 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             return Err(Error::bad_request("a snapshot without parents (only the root has none)"));
         }
         let real_parents: Vec<ObjectId> = n.parents.iter().map(|p| real_of[p]).collect();
+        let real_attempts: Vec<ObjectId> =
+            n.attempts.iter().map(|a| real_of.get(a).copied().ok_or_else(|| Error::bad_request("an attempt is not a snapshot of this project"))).collect::<Result<_>>()?;
         let (policy_text_acc, bindings, viewer2, n2) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone(), n.clone());
         let hub2 = hub.clone();
         let rp = real_parents.clone();
+        let ra = real_attempts.clone();
         let uploaded = uploaded.clone();
         let c = blocking(hub, project.id, move |src| {
             let p = Project {
@@ -1405,7 +1738,7 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                 policy_text: policy_text_acc,
                 bindings,
             };
-            complete(src, &p, &viewer2, &uploaded, &n2, &rp, &hub2.identity)
+            complete(src, &p, &viewer2, &uploaded, &n2, &rp, &ra, &hub2.identity)
         })
         .await?;
         let c = Completed {
@@ -1416,7 +1749,8 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             hub.objects.put(project.id, &c.real, raw.clone()).await?;
         }
         real_of.insert(*id, c.real);
-        real_parents_of.insert(c.real, real_parents);
+        // What its landing records: its parents and its attempts.
+        real_parents_of.insert(c.real, real_parents.into_iter().chain(real_attempts).collect());
         completed.push(c);
     }
     // 3. Move the branches: one serialisable transaction of compare-and-swaps.
@@ -1450,8 +1784,36 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
             Some(n) => Some(*real_of.get(&n).ok_or_else(|| Error::bad_request("unknown new tip"))?),
             None => None,
         };
+        if let Some(n) = new_real {
+            // An attempt never lands (`Snapshot::abandoned`).
+            if blocking(hub, project.id, move |src| Ok(src.snapshot(&n)?.abandoned.is_some())).await? {
+                return Err(Error::bad_request(format!("branch '{}': an abandoned attempt is never a branch's tip", u.branch)));
+            }
+        }
         if new_real.is_none() && !viewer.admin {
             return Err(Error::forbidden("only admins may delete a branch"));
+        }
+        if new_real.is_none() && viewer.agent {
+            return Err(agent_refusal("an agent session never deletes a branch"));
+        }
+        // The one rule of every tip an agent session sets (`agent_tip`):
+        // first, for a narrowed one, anything outside its paths; then the
+        // files that decide access or review, a new default branch included.
+        if let Some(n) = new_real {
+            match agent_tip_of(hub, project, viewer, &u.branch, cur, n, HashMap::new()).await? {
+                Some(AgentTip::Narrowed) => {
+                    results.push(BranchResult {
+                        branch: u.branch.clone(),
+                        ok: false,
+                        message: Some(NARROWED_MOVE.into()),
+                        tip: cur_seen,
+                    });
+                    continue;
+                }
+                Some(AgentTip::Access) => return Err(agent_refusal(AGENT_ACCESS_MOVE)),
+                Some(AgentTip::DefaultBranch) => return Err(agent_refusal(AGENT_DEFAULT_BRANCH)),
+                None => {}
+            }
         }
         if let (Some(c), Some(n)) = (cur, new_real) {
             if !req.force && !is_ancestor(hub, project.id, c, n).await? {
@@ -1473,6 +1835,9 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, person: i6
                 if !incoming.same_rules(&project.policy) {
                     if !viewer.admin {
                         return Err(Error::forbidden("only admins may change who has access (the default branch's .veilpolicy)"));
+                    }
+                    if viewer.agent {
+                        return Err(agent_refusal("an agent session never changes who has access (the default branch's .veilpolicy)"));
                     }
                     accept = Some(text);
                 }
