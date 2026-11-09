@@ -199,7 +199,7 @@ What the command sees:
 | **`HOME`, `/tmp`, `/var/tmp`** | empty and private, gone after the run. `~/.ssh`, `~/.gnupg`, cloud credentials, other projects and the Veil identity are not there. |
 | **The allow-list** | toolchains and agents' own configuration: `~/.cargo` (without its `credentials.toml`), `~/.rustup`, `~/.local/bin`, `~/.local/share/claude`, `~/.nvm`, `~/.pyenv`, `~/.volta`, `~/.bun`, `~/.deno`, `~/.claude`, `~/.claude.json`, `~/.codex`, `~/.gemini`, those that exist. **Writable, but never your real folders:** what the command writes there (cargo's downloads, an agent's settings and sessions, an `npm -g` install) goes to the workspace's own layer, and its next runs see it. |
 | **Processes** | only its own: it cannot see or signal your other programs, or another workspace's run. |
-| **Network** | on (agents call their model's API); `--no-network` leaves only a private loopback. |
+| **Network** | on (agents call their model's API); `--no-network` leaves only a private loopback; `--private-ports` gives the run a loopback of its own and keeps outbound access (below). |
 
 * **More of the machine:** `--allow PATH` (repeatable), or for
   every run, in `.veil/local/config.toml` (this repository) or
@@ -290,6 +290,42 @@ What the command sees:
   the allow-list) anywhere, and reach abstract Unix sockets (X11's);
   kernel bugs. Give risky agents test keys and `--no-network`.
 * **macOS** runs unconfined for now (`vl doctor` says so).
+
+### Full-stack tests: `--private-ports` and `--seed`
+
+Fifty agents running integration tests on one machine collide on ports
+and on databases. Two flags close that, for any language or tool:
+
+```text
+$ vl ws exec try-a --private-ports --seed ~/seeds/pg16:/var/lib/pg -- ./run-tests.sh
+```
+
+* **`--private-ports`**: the run gets a network of its own. Every run can
+  bind `127.0.0.1:5432` or `:8080` at the same time; nothing it binds is
+  reachable from your machine or from another run, and your machine's own
+  loopback services (a local database, `ssh-agent` forwarding, a dev
+  server) are not reachable from it. Outbound connections (the model's
+  API, package registries) still work, through **pasta** (from the
+  `passt` package: `apt install passt`, `dnf install passt`, `pacman -S
+  passt`); name lookups go through your machine's resolver. Without pasta
+  the flag fails before anything runs: it never falls back to sharing your
+  loopback. The network stays on by default without the flag, as before.
+* **`--seed SRC:DEST`** (repeatable): the directory `SRC` (a migrated
+  database's data directory, fixtures) appears at `DEST` with a writable
+  layer of the run's own on top. Every run starts from `SRC` as it is,
+  nothing is copied, `SRC` is never written, and what the run writes there
+  vanishes when it exits, whatever stops it. Two runs on the same seed
+  never see each other's writes. The layer lives in memory, and counts
+  toward `--memory`. Both paths are absolute; `SRC` may not be `/`, your
+  home or a folder holding it, the Veil home, or the project (inside or
+  holding them); `DEST` may not be `/`, where the sandbox shows the
+  project, or inside a folder the sandbox shows read-only (`/usr`, `/etc`,
+  `/opt`, …). What the allow-list hides (cargo's `credentials.toml`) stays
+  hidden in a seed too. A Postgres or Redis started inside the run on a seeded data
+  directory comes up in about a second.
+* **Fork and race** needs nothing more: `vl ws new try-a -r @` (and
+  `try-b`, `try-c`), then `vl ws exec try-a --private-ports -- cargo test`
+  in parallel; keep the winner, `vl ws rm` the rest.
 
 ## One-shot runs: `--ephemeral`
 
@@ -610,6 +646,72 @@ package), nothing else; `vl` mounts without libfuse. macOS: install
 `cargo build --release --features macfuse` (release builds for macOS are
 made without it, so they need no kernel extension). A `vl` built without
 FUSE says so.
+
+### `vl ws exec --mount`: a sandbox in milliseconds
+
+```text
+$ vl ws new agent-17 -r main
+$ vl ws exec agent-17 --mount -- cargo test
+```
+
+With `--mount`, the run's sandbox is a mount of the workspace (at the
+project's path when confined) instead of a checkout: it is ready at once,
+whatever the project's size, and a file is read only when the command
+reads it. Everything the command writes is in the mount's overlay, so
+what is recorded afterwards is exactly what it changed, with no scan. A
+mount `vl ws mount` already serves is used as it is; otherwise the run
+mounts the workspace in a private directory and unmounts it afterwards.
+Not with `--ephemeral`, `--with-isolated`, `--only` or `--record-only`.
+**Without FUSE** (a container without `/dev/fuse`, macOS without
+macFUSE), `--mount` says so and the sandbox is checked out as without it;
+`--only PATHS` then checks out less.
+
+### Mounts in a thin clone
+
+In a thin clone (`vl clone` of a server project), a mount fetches what is
+read from the Veil server, as you may see it: the tree is your
+projection, so folders you may not see are not there, names included.
+
+* **Listing and `stat` fetch no file:** sizes are in the tree. `ls -lR`
+  or an indexer walking the mount fetches folders' listings only.
+* **Reading a file fetches its folder's small files with it** (up to 256
+  KiB each), in one request: a build reading a folder makes one request,
+  not one per file. Listing a folder fetches its sub-folders' listings
+  together.
+* **A server that cannot be reached is an error** (`Input/output error`)
+  for what was not fetched yet, never a missing or empty file; what was
+  fetched still reads. **The server's refusal** (your access was removed
+  since the folder was listed) is `Permission denied` when the file is
+  opened, and the file is left out of listings from then on (asked again
+  after 10 seconds).
+* Open files are held in memory only while small (up to 1 MiB, 64 MiB
+  across open files); larger ones are read from a private file without a
+  name, so a mount's memory does not grow with what is open, written,
+  renamed or deleted while open. (A file not fetched yet arrives whole
+  from the server first.)
+* What a mounted workspace has fetched stays in the clone's cache while
+  the workspace is on it (`vl partial status`).
+
+### `vl` inside a sandbox: the workspace socket
+
+A `vl` run by the command inside `vl ws exec` (named workspaces, with or
+without `--mount`) works: `vl ws exec` puts itself first on the command's
+`PATH` and serves a socket (`$VEIL_WORKSPACE_SOCKET`) for as long as the
+command runs. The sandbox holds no key and no session; the `vl` outside
+runs each command as you, on that workspace only:
+
+| Through the socket | |
+|---|---|
+| **Runs** | `status`, `diff`, `log`, `show`, `blame`, of `@` and its ancestors only; `commit` (moving no tag: `--no-advance`); `describe` of `@`; `new` on top of `@` |
+| **Refused** | everything else: access, groups, identity, other workspaces (their changes too, `vl show other@`), the project directory's (`default@`), `push`, `pull`, `undo`, `-R` |
+
+A plain `vl log` inside shows the workspace's own history (`::@`).
+
+Before each command what the sandbox holds is recorded, so `vl status`
+and `vl commit` see the command's edits. Hooks never run for these
+commands (they would run outside the sandbox), and nothing the command
+sets in its environment (`VEIL_USER`, `VEIL_HOME`) changes who runs them.
+`--ephemeral` runs get no socket.
 
 ## Agents in the library: in-memory workspaces
 

@@ -213,7 +213,10 @@ pub fn split(ctx: &mut Ctx, rev: &str, choice: &Choice, message: Option<&str>, p
     }
     let sel = match picker {
         Some(pick) => pick(&parts.units, &choice.paths)?,
-        None => selection::select(&parts.units, &choice.all_specs())?,
+        None => {
+            selection::check_hidden(&parts.hidden, &choice.all_specs())?;
+            selection::select(&parts.units, &choice.all_specs())?
+        }
     };
     let r = ctx.repo.split(&parts, &sel, message)?;
     let repo = &ctx.repo;
@@ -252,7 +255,10 @@ pub fn squash(ctx: &mut Ctx, rev: &str, into: Option<&str>, choice: &Choice, pic
         let parts = ctx.repo.change_parts(&id, picker.is_some() || choice.reads_hunks())?;
         let sel = match picker {
             Some(pick) => pick(&parts.units, &choice.paths)?,
-            None => selection::select(&parts.units, &choice.all_specs())?,
+            None => {
+                selection::check_hidden(&parts.hidden, &choice.all_specs())?;
+                selection::select(&parts.units, &choice.all_specs())?
+            }
         };
         let r = ctx.repo.squash_into(id, into, Some((&parts, &sel)))?;
         (r, taken(&parts.units, &sel))

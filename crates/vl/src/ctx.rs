@@ -199,6 +199,11 @@ pub struct Ctx {
     /// moved `@` in one operation: what [`Ctx::finish`] reports the move
     /// from (the directory already holds the new `@`).
     committed_from: Option<ObjectId>,
+    /// The command runs for a workspace the project directory is not
+    /// attached to: a `vl` inside a `vl ws exec` sandbox, through the
+    /// workspace socket ([`Ctx::open_for_workspace`]). It never records,
+    /// moves or attaches the project directory.
+    pub detached: bool,
 }
 
 /// Written by `vl clone` before it fetches anything, removed once its
@@ -371,6 +376,7 @@ impl Ctx {
                 report: BuildReport::default(),
                 bare: true,
                 committed_from: None,
+                detached: false,
             });
         }
         let checkout = load_state(&fs, &repo)?;
@@ -392,6 +398,7 @@ impl Ctx {
             cache,
             bare: false,
             committed_from: None,
+            detached: false,
         };
         if snapshot {
             ctx.snapshot()?;
@@ -399,10 +406,33 @@ impl Ctx {
         Ok(ctx)
     }
 
+    /// The repository at `root`, for a command of workspace `ws` (the
+    /// workspace socket, `crate::ws_socket`): what its mounts hold is
+    /// recorded first, as for any command, and `@` is `ws`'s working-copy
+    /// change. The project directory is left as it is: never recorded,
+    /// moved or attached to `ws`.
+    pub fn open_for_workspace(root: &Path, ws: &str) -> Result<Ctx> {
+        crate::mount::record_live(root);
+        let mut ctx = Ctx::open(Some(root), false)?;
+        if ctx.bare {
+            bail!("{} is a bare repository: it has no workspaces", ctx.root.display());
+        }
+        ctx.repo.workspace_wc(ws)?;
+        ctx.ws = ws.to_string();
+        ctx.repo.set_command_workspace(Some(ctx.ws.clone()));
+        ctx.detached = true;
+        Ok(ctx)
+    }
+
     /// The project directory's stat cache (what its files hold, as far as
     /// the last snapshot verified).
     pub fn stat_cache(&self) -> &StatCache {
         &self.cache
+    }
+
+    /// The record of what the working copy was materialised from.
+    pub fn materialised(&self) -> &veil_core::checkout::Materialised {
+        &self.checkout.materialised
     }
 
     pub fn wc(&self) -> Result<ObjectId> {
@@ -488,6 +518,16 @@ impl Ctx {
         commit: Option<(&str, bool)>,
         committed: &mut Option<veil_core::commands::CommitResult>,
     ) -> Result<()> {
+        // A detached command records nothing of the directory: its
+        // workspace's files were recorded before it ran (mounts, the
+        // sandbox's).
+        if self.detached {
+            if let Some((message, advance)) = commit {
+                let ws = self.ws.clone();
+                *committed = Some(self.repo.commit(&ws, message, advance)?);
+            }
+            return Ok(());
+        }
         // One recorder of this directory at a time (the lock-free op log
         // has no repository lock to serialise them), judging it by what it
         // holds now (BUG-1084).
@@ -857,7 +897,7 @@ impl Ctx {
     /// Bring the project directory in line with the attached workspace.
     pub fn finish(&mut self) -> Result<()> {
         self.print_merge_warnings();
-        if self.bare {
+        if self.bare || self.detached {
             return Ok(());
         }
         // A workspace this command attached the directory to (`vl ws
@@ -913,7 +953,17 @@ impl Ctx {
                 eprintln!("Updated {} files, removed {}", r.written, r.removed);
             }
             for p in &r.redacted {
-                let why = lookup(self.repo.store(), &to_snap.tree, p)?.and_then(|e| render::hidden_reason(&self.repo, &e));
+                let e = lookup(self.repo.store(), &to_snap.tree, p)?;
+                // A folder the server refuses (BUG-1508): its path only.
+                if e.as_ref().is_some_and(|e| e.kind == veil_core::EntryKind::Dir) {
+                    eprintln!(
+                        "  {} {} (you no longer have access to this folder; left out of the working copy, kept in history)",
+                        render::yellow("redacted"),
+                        safe(&crate::api::hidden_dir(p))
+                    );
+                    continue;
+                }
+                let why = e.and_then(|e| render::hidden_reason(&self.repo, &e));
                 eprintln!(
                     "  {} {} ({}; left out of the working copy)",
                     render::yellow("redacted"),
