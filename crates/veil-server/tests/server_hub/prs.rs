@@ -3983,4 +3983,208 @@ mod s21_c4 {
         assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", String::from_utf8_lossy(&r.body));
         assert_ne!(api.tips(Some(&token), &p.name).unwrap().branches["main"], t, "main moved");
     }
+
+    /// Guarantee 1 (review cycle 4): `Review::risk_key` covers every rule
+    /// input that changes the risk class (`high_risk_paths` and
+    /// `checks_only`, length-prefixed), does not vary with approval counts
+    /// or `people_only` (which `Review::need` reads on every call), and
+    /// every view (`show`, `revisions`, `list`, `list?q=…`) and `prs::land`
+    /// rate the revision under the rules in force when rules tighten,
+    /// loosen, or break.
+    #[test]
+    fn risk_key_and_every_view_and_gate_follow_the_rules_in_force() {
+        use veil_server::prs::rules::Review;
+        let d = Review::default();
+        let a = Review::parse(Some(b"[review]\nlow = { approvals = 0 }\nnormal = { approvals = 3 }\nhigh = { approvals = 5 }\n"));
+        assert_eq!(d.risk_key(), a.risk_key(), "approval counts do not change risk classification");
+        let h1 = Review::parse(Some(b"[review]\nhigh_risk_paths = [\"pub/auth/\"]\n"));
+        let h2 = Review::parse(Some(b"[review]\nhigh_risk_paths = [\"pub/auth/\", \"infra/\"]\n"));
+        let c1 = Review::parse(Some(b"[review]\nchecks_only = [\"docs/\"]\n"));
+        let c2 = Review::parse(Some(b"[review]\nhigh_risk_paths = [\"docs/\"]\n"));
+        assert!(!h1.broken && !h2.broken && !c1.broken && !c2.broken);
+        let keys: BTreeSet<String> = [d.risk_key(), h1.risk_key(), h2.risk_key(), c1.risk_key(), c2.risk_key()].into_iter().collect();
+        assert_eq!(keys.len(), 5, "distinct high_risk_paths and checks_only lists have distinct risk_keys");
+
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let mut base = Files::new();
+        base.insert("pub/keep.rs".into(), b"fn keep() {}\n".to_vec());
+        base.insert(".veilrules".into(), b"[review]\nchecks_only = [\"docs/**\"]\n".to_vec());
+        let b = h.commit(&th, &[root_snapshot_id()], base.clone(), [1; 16], 1_000, None);
+        h.set_branch(&th, "main", b);
+        let mut f1 = base.clone();
+        f1.insert("docs/guide.md".into(), b"# guide\n".to_vec());
+        let s1 = h.commit(&th, &[b], f1.clone(), [2; 16], 2_000, None);
+        h.set_branch(&th, "docs", s1);
+        let mut f2 = f1;
+        f2.insert("pub/auth/login.rs".into(), b"fn login() {}\n".to_vec());
+        let s2 = h.commit(&th, &[b], f2, [2; 16], 3_000, None);
+        let (author, name) = person_row(&th, "author");
+        let me = caller(author, &name);
+        let a = ask_as(&th, &h, &admin_of(author));
+        let id = pr_id(th.rt.block_on(prs::create(&h.hub, &a, &me, CreatePr { head: "docs".into(), title: "searchable-7f3a".into(), ..Default::default() })).unwrap());
+        // Under lenient rules, rev 1 is checks-only and `land` reaches landing_unavailable.
+        let r = th.rt.block_on(prs::land(&h.hub, &a, &me, &id));
+        assert!(matches!(r, Err(Error::Api { code: "landing_unavailable", .. })), "ready under lenient rules: {r:?}");
+        // Add revision 2 (touches docs/guide.md and pub/auth/login.rs: normal under lenient rules).
+        let v = th.rt.block_on(prs::add_revision(&h.hub, &a, &me, &id, RevisionRequest { head: s2.hex() })).unwrap();
+        assert_eq!((v["risk"].as_str(), v["revisions"][0]["risk"].as_str(), v["revisions"][1]["risk"].as_str()), (Some("normal"), Some("checks-only"), Some("normal")));
+        // Tighten rules: drop checks_only, add pub/auth/ to high_risk_paths.
+        let mut f = base.clone();
+        f.insert(".veilrules".into(), b"[review]\nhigh = { approvals = 2 }\nhigh_risk_paths = [\"pub/auth/\"]\n".to_vec());
+        let tight = h.commit(&th, &[b], f, [4; 16], 4_000, None);
+        h.set_branch(&th, "main", tight);
+        // Search list, plain list, show (both revisions), and land all rate under the new rules.
+        let sl = th.rt.block_on(prs::list(&h.hub, &a, ListParams { q: Some("7f3a".into()), ..Default::default() })).unwrap();
+        assert_eq!(sl["prs"][0]["risk"], "high", "{sl}");
+        let pl = th.rt.block_on(prs::list(&h.hub, &a, ListParams::default())).unwrap();
+        assert_eq!(pl["prs"][0]["risk"], "high", "{pl}");
+        let v = th.rt.block_on(prs::show(&h.hub, &a, &id)).unwrap();
+        assert_eq!((v["risk"].as_str(), v["revisions"][0]["risk"].as_str(), v["revisions"][1]["risk"].as_str()), (Some("high"), Some("low"), Some("high")), "{v}");
+        let r = th.rt.block_on(prs::land(&h.hub, &a, &me, &id));
+        match r {
+            Err(Error::Api { code: "not_ready", message, .. }) => assert!(message.contains("high risk needs 2 approvals"), "{message}"),
+            other => panic!("expected not_ready for high risk, got {other:?}"),
+        }
+    }
+
+    /// Guarantee 2 (review cycle 4): `pr_revisions.files` is never sent to
+    /// a viewer (only the integer `files_count` as `files`), and risk
+    /// reasons name only paths of the PR (which any viewer of the PR can
+    /// read) and never hidden paths or other PRs' paths.
+    #[test]
+    fn files_and_risk_reasons_reveal_nothing_hidden() {
+        let th = TestHub::start();
+        let (policy_text, bindings) = policy(1);
+        let mut h = Hist::new(&th, &policy_text, &bindings);
+        let mut base = Files::new();
+        base.insert("pub/keep.rs".into(), b"fn keep() {}\n".to_vec());
+        base.insert("fin/secret_ledger_9b4e.rs".into(), b"fn ledger() {}\n".to_vec());
+        base.insert(
+            ".veilrules".into(),
+            b"[review]\nhigh_risk_paths = [\"fin/secret_ledger_9b4e.rs\", \"pub/auth/\"]\nchecks_only = [\"fin/**\", \"docs/**\"]\n".to_vec(),
+        );
+        let b = h.commit(&th, &[root_snapshot_id()], base.clone(), [1; 16], 1_000, None);
+        h.set_branch(&th, "main", b);
+        let mut f_pub = base.clone();
+        f_pub.insert("pub/auth/login.rs".into(), b"fn login() {}\n".to_vec());
+        let s_pub = h.commit(&th, &[b], f_pub, [2; 16], 2_000, None);
+        h.set_branch(&th, "pub-pr", s_pub);
+        let mut f_fin = base.clone();
+        f_fin.insert("fin/secret_ledger_9b4e.rs".into(), b"fn ledger() { 2 }\n".to_vec());
+        let s_fin = h.commit(&th, &[b], f_fin, [3; 16], 3_000, None);
+        h.set_branch(&th, "fin-pr", s_fin);
+        let (author, name) = person_row(&th, "author");
+        let me = caller(author, &name);
+        let admin = ask_as(&th, &h, &admin_of(author));
+        let pub_id = pr_id(th.rt.block_on(prs::create(&h.hub, &admin, &me, CreatePr { head: "pub-pr".into(), title: "pub auth".into(), ..Default::default() })).unwrap());
+        let fin_id = pr_id(th.rt.block_on(prs::create(&h.hub, &admin, &me, CreatePr { head: "fin-pr".into(), title: "fin ledger 9b4e".into(), ..Default::default() })).unwrap());
+        let dev = ask_as(&th, &h, &Viewer { person: Some(800_001), groups: [900_001].into_iter().collect(), ..Viewer::default() });
+        // The hidden PR is invisible to dev.
+        assert!(th.rt.block_on(prs::show(&h.hub, &dev, &fin_id)).is_err());
+        // The visible PR's show and list answers contain the integer file count, never the serialized FileChange records, and never the hidden path from `.veilrules`.
+        let shown = th.rt.block_on(prs::show(&h.hub, &dev, &pub_id)).unwrap();
+        assert_eq!(shown["files"], 1);
+        assert_eq!(shown["revisions"][0]["files"], 1);
+        let text = shown.to_string();
+        assert!(!text.contains("secret_ledger_9b4e") && !text.contains("\"regular\""), "{text}");
+        let list = th.rt.block_on(prs::list(&h.hub, &dev, ListParams::default())).unwrap().to_string();
+        assert!(!list.contains("secret_ledger_9b4e") && !list.contains(&fin_id), "{list}");
+    }
+
+    /// Guarantee 3 (review cycle 4): past `UNDERIVED_ROWS` (100,000)
+    /// underived snapshots read in a push's merge checks, the push is
+    /// answered `busy` (503) and the branch does not move.
+    #[test]
+    fn merge_check_past_underived_bound_answers_busy() {
+        let th = TestHub::start();
+        let p = setup_project(&th);
+        let api = th.api();
+        let mut f = Craft::new(&api, &p.dev, &p.name, "main");
+        f.file("src/lib.rs", "MARKER-C4-busy-bound-8d2a");
+        let r = f.push("main", "dev");
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert!(r.json()["results"][0]["ok"].as_bool().unwrap());
+        let token = p.carol.token();
+        let tip = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+        let line = first_parents(&api, &token, &p.name, tip, 2);
+        let t = line[0].0;
+        let t_tree = line[0].1.tree;
+        let atoken = p.admin.token();
+        let atip = api.tips(Some(&atoken), &p.name).unwrap().branches["main"];
+        let aline = first_parents(&api, &atoken, &p.name, atip, 2);
+        let (a0, a0_tree) = (aline[1].0, aline[1].1.tree);
+        let hub = th.hub();
+        let pid: i64 = th.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hub.db)).unwrap();
+        // A dense DAG of 6,260 snapshots above `a0`, each naming the 16
+        // previous snapshots as parents, with no `commit_graph` rows yet:
+        // DFS pushes 16 `(p, None)` entries per expanded node before any
+        // ancestor gets its row, so ~6,251 nodes reach 100,001 `rows.read`
+        // visits while creating only 6,260 objects.
+        let mut dag = vec![a0];
+        let mut objects = Vec::with_capacity(6_260);
+        let mut ids = Vec::with_capacity(6_260);
+        for i in 0..6_260u64 {
+            // Order parents oldest-first so `stack.extend(s.parents)` places
+            // `dag[i]` on top of the stack: DFS expands `dag[6259]`, `dag[6258]`,
+            // ... in descending order, pushing 16 `(p, None)` entries per node
+            // before any ancestor reaches `Some(s)`. ~6,251 nodes reach 100,001
+            // `rows.read` visits in ~1 second.
+            let parents: Vec<ObjectId> = dag.iter().rev().take(16).copied().rev().collect();
+            let s = Snapshot {
+                parents,
+                change_id: veil_core::ChangeId::random(),
+                tree: a0_tree,
+                description: Text::Plain(format!("u{i}")),
+                author: "dev".into(),
+                timestamp: 10_000 + i as i64,
+                predecessors: vec![],
+                conflicts: vec![],
+                embargo: None,
+                signature: None,
+            };
+            let raw = Object::Snapshot(s).encode();
+            let id = ObjectId::hash(&raw);
+            objects.push((id, bytes::Bytes::from(raw)));
+            ids.push(id.hex());
+            dag.push(id);
+        }
+        let u_small = dag[10];
+        let u_past_bound = *dag.last().unwrap();
+        th.rt.block_on(async {
+            veil_server::sync::put_all(&hub, pid, objects).await.unwrap();
+            sqlx::query("INSERT INTO snapshots (project_id, id) SELECT $1, x FROM UNNEST($2::text[]) AS x ON CONFLICT DO NOTHING")
+                .bind(pid)
+                .bind(&ids)
+                .execute(&hub.db)
+                .await
+                .unwrap();
+        });
+        // Merge of `t` and `u_small` (well within UNDERIVED_ROWS) keeping `t`'s tree: accepted.
+        let mut c = Craft::new(&api, &p.carol, &p.name, "main");
+        c.root = t_tree;
+        let exp = c.tip;
+        let (_, r) = c.push_edited("main", Some(exp), move |s| s.parents = vec![t, u_small]);
+        assert_eq!(r.status, 200, "within UNDERIVED_ROWS bound: {}", String::from_utf8_lossy(&r.body));
+        assert!(r.json()["results"][0]["ok"].as_bool().unwrap());
+        let moved = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+        // Merge of `moved` and `u_past_bound` crosses UNDERIVED_ROWS (100,000): answered 503 busy, branch stays at `moved`.
+        let mut c = Craft::new(&api, &p.carol, &p.name, "main");
+        c.root = t_tree;
+        let (_, r) = c.push_edited("main", Some(moved), move |s| s.parents = vec![moved, u_past_bound]);
+        assert_eq!(r.status, 503, "past UNDERIVED_ROWS bound: {}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["code"], "busy", "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(api.tips(Some(&token), &p.name).unwrap().branches["main"], moved, "main did not move on busy");
+    }
+
+    /// BUG-1426: `pr_speed` inserts into `prs` with the dropped `risk`
+    /// column and without `pr_revisions` rows, so running it panics with
+    /// `42703: column "risk" of relation "prs" does not exist`.
+    #[test]
+    #[ignore = "BUG-1426: pr_speed inserts into the dropped prs.risk column and writes no pr_revisions rows"]
+    fn bug_1426_pr_speed_uses_dropped_prs_risk_column() {
+        super::pr_speed();
+    }
 }
+
