@@ -36,7 +36,7 @@ HOURS=${VEIL_DO_HOURS:-8}
 [[ "$DRIVERS" =~ ^[1-9][0-9]*$ ]] || { echo "do: invalid VEIL_DO_DRIVERS '$DRIVERS'" >&2; exit 2; }
 [[ "$YB_NODES" =~ ^[0-9]+$ ]] || { echo "do: invalid VEIL_DO_YB_NODES '$YB_NODES'" >&2; exit 2; }
 [[ "$WITH_CACHE" =~ ^[01]$ ]] || { echo "do: invalid VEIL_DO_WITH_CACHE '$WITH_CACHE' (0 or 1)" >&2; exit 2; }
-[[ "$HOURS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "do: invalid VEIL_DO_HOURS '$HOURS'" >&2; exit 2; }
+[[ "$HOURS" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [ "$(echo "$HOURS > 0" | bc -l)" = 1 ] || { echo "do: invalid VEIL_DO_HOURS '$HOURS' (must be > 0)" >&2; exit 2; }
 IMAGE=ubuntu-24-04-x64
 STATE=$DO_HERE/state/$NAME
 STATE_FILE=$STATE/state.env

@@ -128,9 +128,13 @@ echo "== 3. topology options and cost bounds"
 out=$(VEIL_DO_YB_NODES=3 VEIL_DO_WITH_CACHE=1 VEIL_DO_NAME=veil-kit-yb "$T/do/create.sh" 2>&1)
 check "YB_NODES=3 replaces the db droplet with three nodes, WITH_CACHE adds a cache" '[ "$(grep -c "would run: doctl compute droplet create veil-kit-yb-yb" <<<"$out")" = 3 ] && [[ "$out" != *"create veil-kit-yb-db "* ]] && [[ "$out" == *"create veil-kit-yb-cache --region nyc3 --size s-4vcpu-8gb"* ]]'
 out=$(VEIL_DO_YB_NODES=3 "$T/do/estimate.sh" 2>/dev/null); check "estimate prices the YugabyteDB topology and Spaces flat fee" '[[ "$out" == *"veil-kit-test-yb3 (yb)"* && "$out" == *"hourly rate (droplets):      \$1.750"* && "$out" == *"planned 8 hours + Spaces:    \$19.00"* && "$out" == *"24 hours left running:       \$47.00"* ]]'
-check "estimate and create refuse an unknown droplet size or a plan >= \$100" '
+check "estimate and create refuse an unknown droplet size, hours <= 0, or a plan >= \$100" '
     ! VEIL_DO_SIZE_HUB=c-999 "$T/do/estimate.sh" >/dev/null 2>&1 &&
     ! VEIL_DO_SIZE_HUB=c-999 "$T/do/create.sh" >/dev/null 2>&1 &&
+    ! VEIL_DO_HOURS=0 "$T/do/estimate.sh" >/dev/null 2>&1 &&
+    ! VEIL_DO_HOURS=0 "$T/do/create.sh" >/dev/null 2>&1 &&
+    ! VEIL_DO_HOURS=76 "$T/do/estimate.sh" >/dev/null 2>&1 &&
+    ! VEIL_DO_HOURS=76 "$T/do/create.sh" >/dev/null 2>&1 &&
     ! VEIL_DO_HOURS=80 "$T/do/estimate.sh" >/dev/null 2>&1 &&
     ! VEIL_DO_HOURS=80 "$T/do/create.sh" >/dev/null 2>&1
 '
