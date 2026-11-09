@@ -4047,7 +4047,7 @@ fn a_push_on_a_snapshot_uploaded_by_someone_else_is_answered_as_one_that_does_no
         assert_eq!(r.status, 400, "{body}");
         assert_eq!(r.json()["message"], format!("snapshot {} was not uploaded", parent.short()), "{body}");
         answers.push(r.json()["code"].clone());
-        assert!(api.tips(Some(&d.token), &p.name).unwrap().branches.get("on-f").is_none());
+        assert!(!api.tips(Some(&d.token), &p.name).unwrap().branches.contains_key("on-f"));
     }
     assert_eq!(answers[0], answers[1]);
 }
