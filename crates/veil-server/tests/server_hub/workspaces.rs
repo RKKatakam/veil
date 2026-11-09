@@ -2886,3 +2886,56 @@ fn bug_1574_a_sandbox_whose_root_the_server_refuses_keeps_a_readable_record() {
     let aall = format!("{}{}", String::from_utf8_lossy(&again.stdout), String::from_utf8_lossy(&again.stderr));
     assert!(!aall.contains("its manifest is unreadable"), "{manifest}\n{aall}");
 }
+
+/// BUG-1625 (review of `s8k` / `s8kr`): `hub_cmd::move_before_push` pages
+/// in the server's current tips that the clone does not hold via
+/// `Repo::deepen(&unheld, HISTORY_PAGE)` without deduplicating `unheld`,
+/// and `Repo::deepen` calls `Repo::may_page` (`server_roots` ->
+/// `generations`, plus `resolve`) for every entry in `unheld` before
+/// fetching the page of history (`crates/veil-core/src/repo.rs:704`). When
+/// someone else pushed `n` branches (even all pointing to the same new
+/// commit on `main`) since this thin clone's last pull, `vl push` of one
+/// tag costs two requests per moved server branch.
+#[test]
+#[ignore = "BUG-1625: move_before_push calls Repo::deepen on unheld server tips without deduplicating and through may_page, costing two requests per moved server branch"]
+fn bug_1625_a_push_after_many_server_branches_moved_costs_no_request_a_branch() {
+    let hub = TestHub::start();
+    let mut cost = Vec::new();
+    for n in [2usize, 40] {
+        let p = project_with_feature(&hub);
+        p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name, "--confirm", &p.fin.fingerprint()]);
+        let clones: Vec<PathBuf> = ["c", "o"].iter().map(|k| plain_thin(&p, &hub, &format!("br{k}{n}"))).collect();
+        for (i, d) in clones.iter().enumerate() {
+            write_files(d, &[("src/mine.txt", "mine\n")]);
+            p.fin.ok(d, &["commit", "--no-advance", "-m", "mine"]);
+            p.fin.ok(d, &["tag", "set", &format!("pushed{i}"), "-r", "@-"]);
+        }
+        write_files(&p.dir, &[(&format!("src/later{n}.txt"), "later\n")]);
+        p.admin.commit_main(&p.dir, &format!("later {n}"));
+        {
+            let mut repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&p.dir)), None, "test").unwrap();
+            let head = repo.view().tags["main"].target;
+            for i in 0..n {
+                repo.set_tag(&format!("b{i}"), head, true).unwrap();
+            }
+        }
+        p.admin.ok(&p.dir, &["push"]);
+        let mut each = Vec::new();
+        for (i, d) in clones.iter().enumerate() {
+            let before = requests(&hub);
+            let mut c = p.fin.command(d, &["push", "-t", &format!("pushed{i}")]);
+            if i == 1 {
+                c.env("VEIL_TEST_NO_VIEW_MOVE", "1");
+            }
+            let o = c.output().unwrap();
+            let all = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+            assert!(o.status.success() && all.contains("pushed"), "{all}");
+            assert!(!all.contains(MOVED), "{all}");
+            each.push(requests(&hub) - before);
+        }
+        eprintln!("s8kr5: `vl push -t pushed` after {n} server branches moved: {} requests, {} without the check", each[0], each[1]);
+        cost.push(each[0].saturating_sub(each[1]));
+    }
+    assert!(cost[1] <= cost[0] + 8, "the check cost {} requests with 40 moved server branches, {} with 2", cost[1], cost[0]);
+}
+
