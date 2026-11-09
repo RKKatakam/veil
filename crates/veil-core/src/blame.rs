@@ -259,7 +259,7 @@ fn hidden(store: &ObjectStore, e: &TreeEntry, reader: Reader) -> Hidden {
 
 /// Byte ranges of the lines of `data`, as diffy splits them (each with its
 /// `\n`; a last line without one is a line too).
-pub(crate) fn line_ranges(data: &[u8]) -> Vec<(usize, usize)> {
+pub fn line_ranges(data: &[u8]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut start = 0;
     for l in data.split_inclusive(|b| *b == b'\n') {
@@ -271,22 +271,95 @@ pub(crate) fn line_ranges(data: &[u8]) -> Vec<(usize, usize)> {
 
 /// Where each line of `new` comes from in `old` (`None`: not there), and
 /// whether the diff was past its work limit (then only the lines both
-/// share at the start and at the end are mapped).
-pub(crate) fn map_lines(old: &[u8], new: &[u8], new_lines: usize) -> (Vec<Option<u32>>, bool) {
+/// share at the start and at the end are mapped). The server's blame
+/// (`veil-server`, `derive::blame`) maps lines with it too, so both
+/// attribute a line alike.
+///
+/// The lines both texts share at the start and at the end are mapped
+/// before the diff, which then sees only the rest (most edits change a few
+/// lines of a long file). The answer is the diff's of the whole texts: the
+/// trimmed start and end stop at a line that occurs nowhere in the rest,
+/// so the diff's compaction, which slides an edit only past lines equal to
+/// its own, could not have moved an edit into them (`trimming_keeps_the_diff`).
+pub fn map_lines(old: &[u8], new: &[u8], new_lines: usize) -> (Vec<Option<u32>>, bool) {
     let mut map: Vec<Option<u32>> = vec![None; new_lines];
-    if !textmerge::fits(old, new) {
-        let a: Vec<&[u8]> = old.split_inclusive(|b| *b == b'\n').collect();
-        let b: Vec<&[u8]> = new.split_inclusive(|b| *b == b'\n').collect();
-        let p = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
-        let s = a[p..].iter().rev().zip(b[p..].iter().rev()).take_while(|(x, y)| x == y).count();
-        for (i, m) in map.iter_mut().enumerate().take(p) {
-            *m = Some(i as u32);
-        }
-        for k in 0..s {
-            map[b.len() - 1 - k] = Some((a.len() - 1 - k) as u32);
-        }
-        return (map, true);
+    let a: Vec<&[u8]> = old.split_inclusive(|b| *b == b'\n').collect();
+    let b: Vec<&[u8]> = new.split_inclusive(|b| *b == b'\n').collect();
+    if b.len() != new_lines {
+        let coarse = !textmerge::fits(old, new);
+        return if coarse { (ends_map(&a, &b, new_lines), true) } else { (diff_map(old, new, new_lines), false) };
     }
+    let p0 = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let s0 = a[p0..].iter().rev().zip(b[p0..].iter().rev()).take_while(|(x, y)| x == y).count();
+    let bytes = |l: &[&[u8]]| l.iter().map(|x| x.len()).sum::<usize>();
+    let middle = |p: usize, s: usize| {
+        let (oa, ob) = (bytes(&a[..p]), old.len() - bytes(&a[a.len() - s..]));
+        let (na, nb) = (bytes(&b[..p]), new.len() - bytes(&b[b.len() - s..]));
+        (&old[oa..ob], &new[na..nb])
+    };
+    let (om, nm) = middle(p0, s0);
+    if !textmerge::fits_middle(om, nm, a.len() + b.len()) {
+        return (ends_map(&a, &b, new_lines), true);
+    }
+    let (p, s) = trimmed(&a, &b, p0, s0);
+    let (om, nm) = middle(p, s);
+    let mid = diff_map(om, nm, b.len() - p - s);
+    for (i, m) in map.iter_mut().enumerate().take(p) {
+        *m = Some(i as u32);
+    }
+    for (i, m) in mid.into_iter().enumerate() {
+        map[p + i] = m.map(|j| j + p as u32);
+    }
+    for k in 0..s {
+        map[b.len() - 1 - k] = Some((a.len() - 1 - k) as u32);
+    }
+    (map, false)
+}
+
+/// Past the diff's work limit: only the lines both texts share at the
+/// start and at the end are mapped.
+fn ends_map(a: &[&[u8]], b: &[&[u8]], new_lines: usize) -> Vec<Option<u32>> {
+    let mut map: Vec<Option<u32>> = vec![None; new_lines];
+    let p = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let s = a[p..].iter().rev().zip(b[p..].iter().rev()).take_while(|(x, y)| x == y).count();
+    for (i, m) in map.iter_mut().enumerate().take(p.min(new_lines)) {
+        *m = Some(i as u32);
+    }
+    for k in 0..s {
+        if let Some(m) = map.get_mut(b.len() - 1 - k) {
+            *m = Some((a.len() - 1 - k) as u32);
+        }
+    }
+    map
+}
+
+/// Of the lines `a` and `b` share at the start (`p`) and, of the rest, at
+/// the end (`s`), how many to map before the diff: each cut back until the line at its edge occurs nowhere in the
+/// lines between: no edit of the diff can slide past it.
+fn trimmed(a: &[&[u8]], b: &[&[u8]], p: usize, s: usize) -> (usize, usize) {
+    let (mut p, mut s) = (p, s);
+    let mut rest: std::collections::HashSet<&[u8]> = a[p..a.len() - s].iter().chain(&b[p..b.len() - s]).copied().collect();
+    loop {
+        let mut moved = false;
+        if p > 0 && rest.contains(a[p - 1]) {
+            p -= 1;
+            rest.insert(a[p]);
+            moved = true;
+        }
+        if s > 0 && rest.contains(a[a.len() - s]) {
+            rest.insert(a[a.len() - s]);
+            s -= 1;
+            moved = true;
+        }
+        if !moved {
+            return (p, s);
+        }
+    }
+}
+
+/// [`map_lines`] by the diff of the whole texts (within its work limit).
+fn diff_map(old: &[u8], new: &[u8], new_lines: usize) -> Vec<Option<u32>> {
+    let mut map: Vec<Option<u32>> = vec![None; new_lines];
     let patch = diffy::DiffOptions::new().set_context_len(0).create_patch_bytes(old, new);
     // Lines outside hunks are equal, in order.
     let (mut oi, mut ni) = (0usize, 0usize);
@@ -318,7 +391,24 @@ pub(crate) fn map_lines(old: &[u8], new: &[u8], new_lines: usize) -> (Vec<Option
         ni += 1;
         oi += 1;
     }
-    (map, false)
+    map
+}
+
+
+/// What one [`map_lines`] cost, in the work units of
+/// [`BlameOptions::work_budget`]: the lines read, plus the diff's search
+/// (past its limit the whole limit was spent measuring; within it, about
+/// `D²` for `D` differing lines).
+pub fn map_cost(old_lines: usize, map: &[Option<u32>], coarse: bool) -> u64 {
+    let lines = (old_lines + map.len()) as u64;
+    let search = if coarse {
+        textmerge::work_limit(lines as usize)
+    } else {
+        let kept = map.iter().filter(|m| m.is_some()).count() as u64;
+        let d = lines.saturating_sub(2 * kept);
+        d.saturating_mul(d)
+    };
+    lines.saturating_add(search)
 }
 
 // ---- blame -------------------------------------------------------------------------
@@ -612,18 +702,8 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
                     pending.insert((q.id, q.path.clone()), Pending { lines: open, version: cur });
                     break 'walk;
                 }
-                let lines = (pver.lines.len() + cur.lines.len()) as u64;
                 let (map, coarse) = map_lines(&pver.data, &cur.data, cur.lines.len());
-                // What the diff cost: past its limit the whole limit was
-                // spent measuring; within it, about D² for D edits.
-                let search = if coarse {
-                    textmerge::work_limit(lines as usize)
-                } else {
-                    let kept = map.iter().filter(|m| m.is_some()).count() as u64;
-                    let d = lines.saturating_sub(2 * kept);
-                    d.saturating_mul(d)
-                };
-                work = work.saturating_add(lines).saturating_add(search);
+                work = work.saturating_add(map_cost(pver.lines.len(), &map, coarse));
                 result.coarse |= coarse;
                 let mut passed = Vec::new();
                 open.retain(|&(fin, local)| match map.get(local as usize).copied().flatten() {
@@ -693,6 +773,66 @@ mod tests {
         assert_eq!(mapped("1\n2\n3\n4\n5\n6\n", "1\nX\n3\n4\nY\n6\nZ\n"), vec![Some(0), None, Some(2), Some(3), None, Some(5), None]);
     }
 
+    /// Trimming the shared start and end gives exactly the diff of the
+    /// whole texts, on texts of few distinct lines (where edits can slide).
+    #[test]
+    fn trimming_keeps_the_diff() {
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..20_000 {
+            let alphabet = 1 + rnd() % 4;
+            let n = (rnd() % 40) as usize;
+            let old: Vec<String> = (0..n).map(|_| format!("{}\n", rnd() % alphabet)).collect();
+            let mut new = old.clone();
+            for _ in 0..1 + rnd() % 3 {
+                let at = (rnd() as usize) % (new.len() + 1);
+                match rnd() % 3 {
+                    0 => new.insert(at, format!("{}\n", rnd() % alphabet)),
+                    1 if at < new.len() => {
+                        new.remove(at);
+                    }
+                    _ if at < new.len() => new[at] = format!("{}\n", rnd() % (alphabet + 1)),
+                    _ => {}
+                }
+            }
+            let (mut o, mut nw) = (old.concat(), new.concat());
+            if case % 7 == 0 {
+                o.pop();
+            }
+            if case % 5 == 0 {
+                nw.pop();
+            }
+            let lines = line_ranges(nw.as_bytes()).len();
+            let whole = diff_map(o.as_bytes(), nw.as_bytes(), lines);
+            assert!(textmerge::fits(o.as_bytes(), nw.as_bytes()));
+            assert_eq!(map_lines(o.as_bytes(), nw.as_bytes(), lines), (whole, false), "{o:?} -> {nw:?}");
+        }
+    }
+
+    /// Whether a diff is past its work limit is decided as on the whole
+    /// texts (`textmerge::fits`), on both sides of the limit.
+    #[test]
+    fn coarse_decision_matches_the_whole_texts() {
+        let (mut seen_coarse, mut seen_fine) = (false, false);
+        for k in [10usize, 300, 2_000, 4_000, 8_000, 16_000] {
+            let shared: String = (0..2_000).map(|i| format!("shared {i}\n")).collect();
+            let old = format!("{shared}{}{shared}", (0..k).map(|i| format!("old {i}\n")).collect::<String>());
+            let new = format!("{shared}{}{shared}", (0..k).map(|i| format!("new {i}\n")).collect::<String>());
+            let lines = line_ranges(new.as_bytes()).len();
+            let (map, coarse) = map_lines(old.as_bytes(), new.as_bytes(), lines);
+            assert_eq!(coarse, !textmerge::fits(old.as_bytes(), new.as_bytes()), "{k}");
+            assert_eq!(map.iter().filter(|m| m.is_some()).count(), 4_000, "{k}");
+            seen_coarse |= coarse;
+            seen_fine |= !coarse;
+        }
+        assert!(seen_coarse && seen_fine);
+    }
+
     /// Every mapped line is equal to the line it maps to, and the mapping
     /// is increasing (a property of any diff), on random edits.
     #[test]
@@ -721,5 +861,110 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// S14 cycle 2 (review): `map_lines` with its trimmed ends answers
+    /// exactly what it answered before the trim (the diff of the whole
+    /// texts within the work limit, the shared ends past it), on
+    /// adversarially repetitive texts: few distinct lines, runs of the
+    /// edge lines inside the middle, CRLF and bare CR, empty texts, a last
+    /// line without its newline; and on texts straddling the work limit,
+    /// where the coarse decision must equal `textmerge::fits` on the whole.
+    #[test]
+    fn s14c2_trimmed_map_lines_equals_the_whole_texts_diff() {
+        fn reference(old: &[u8], new: &[u8], n: usize) -> (Vec<Option<u32>>, bool) {
+            let a: Vec<&[u8]> = old.split_inclusive(|b| *b == b'\n').collect();
+            let b: Vec<&[u8]> = new.split_inclusive(|b| *b == b'\n').collect();
+            if !textmerge::fits(old, new) {
+                (ends_map(&a, &b, n), true)
+            } else {
+                (diff_map(old, new, n), false)
+            }
+        }
+        let mut seed = 0x51c2_7a3d_9e01_44b5u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        const TOKENS: [&str; 9] = ["a\n", "b\n", "a\r\n", "\n", "\r\n", "a", "a\r", "e\n", "e\r\n"];
+        let mut cases = 0;
+        for case in 0..40_000u64 {
+            let k = 1 + (rnd() % TOKENS.len() as u64) as usize;
+            let tok = |r: u64| TOKENS[(r % k as u64) as usize];
+            let edge = tok(rnd()).to_string();
+            let mid = |rnd: &mut dyn FnMut() -> u64| -> String {
+                let n = (rnd() % 12) as usize;
+                (0..n).map(|_| if rnd().is_multiple_of(3) { edge.clone() } else { tok(rnd()).to_string() }).collect()
+            };
+            let (pre, suf) = (edge.repeat((rnd() % 6) as usize), edge.repeat((rnd() % 6) as usize));
+            let base = format!("{pre}{}{suf}", mid(&mut rnd));
+            let mut old = base.clone();
+            let mut new = match rnd() % 4 {
+                0 => format!("{pre}{}{suf}", mid(&mut rnd)),
+                1 => String::new(),
+                _ => {
+                    // Edits of the base: blocks of the edge line or tokens,
+                    // inserted, deleted or replaced anywhere.
+                    let mut v: Vec<String> = base.split_inclusive('\n').map(str::to_string).collect();
+                    for _ in 0..1 + rnd() % 3 {
+                        let at = (rnd() as usize) % (v.len() + 1);
+                        let block: Vec<String> = (0..1 + rnd() % 3).map(|_| if rnd().is_multiple_of(2) { edge.clone() } else { tok(rnd()).to_string() }).collect();
+                        match rnd() % 3 {
+                            0 => {
+                                v.splice(at..at, block);
+                            }
+                            1 if at < v.len() => {
+                                let end = (at + 1 + (rnd() as usize) % 3).min(v.len());
+                                v.drain(at..end);
+                            }
+                            _ if at < v.len() => v[at] = block.concat(),
+                            _ => {}
+                        }
+                    }
+                    v.concat()
+                }
+            };
+            if case.is_multiple_of(11) {
+                old.clear();
+            }
+            if case.is_multiple_of(7) {
+                new.pop();
+            }
+            if case.is_multiple_of(13) {
+                old.pop();
+            }
+            let n = line_ranges(new.as_bytes()).len();
+            assert_eq!(map_lines(old.as_bytes(), new.as_bytes(), n), reference(old.as_bytes(), new.as_bytes(), n), "{old:?} -> {new:?}");
+            cases += 1;
+        }
+        // Around the work limit: shared ends of repeated edge lines (which
+        // also occur in the middle, so the trim is cut back) around middles
+        // of two lines in random order, whose diff costs about the square
+        // of their length; the length straddles where `fits` flips.
+        let (mut coarse, mut fine) = (0, 0);
+        for len in (1_000..9_000).step_by(500) {
+            for ends in [3usize, 2_000] {
+                let pick = |r: u64| if r.is_multiple_of(2) { "x\n" } else { "e\n" };
+                let o: String = (0..len).map(|_| pick(rnd())).collect();
+                let w: String = (0..len).map(|_| pick(rnd())).collect();
+                let e = "e\n".repeat(ends);
+                let (old, new) = (format!("{e}{o}{e}"), format!("{e}{w}y{e}"));
+                let n = line_ranges(new.as_bytes()).len();
+                let got = map_lines(old.as_bytes(), new.as_bytes(), n);
+                let want = reference(old.as_bytes(), new.as_bytes(), n);
+                assert_eq!(got.1, want.1, "coarse decision, {len} lines in the middle, {ends} at each end");
+                assert!(got == want, "mapping, {len} lines in the middle, {ends} at each end");
+                if got.1 {
+                    coarse += 1;
+                } else {
+                    fine += 1;
+                }
+                cases += 1;
+            }
+        }
+        assert!(coarse > 0 && fine > 0, "both sides of the limit: {coarse} coarse, {fine} fine");
+        assert!(cases > 40_000);
     }
 }

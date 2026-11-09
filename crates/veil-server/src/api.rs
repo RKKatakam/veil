@@ -70,6 +70,8 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/q/file", get(crate::query::file_route))
         .route("/v1/projects/{p}/q/diff", get(crate::query::diff_route))
         .route("/v1/projects/{p}/q/ancestry", post(crate::query::ancestry_route))
+        .route("/v1/projects/{p}/q/blame", get(crate::query::blame_route))
+        .route("/v1/projects/{p}/q/history", get(crate::query::history_route))
         .route("/v1/projects/{p}/q/resolve", get(crate::query::resolve_route))
         .route("/v1/projects/{p}/q/generations", post(crate::query::generations_route))
         .route("/v1/projects/{p}/q/search", get(crate::search::search_route))

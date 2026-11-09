@@ -77,14 +77,38 @@ fn join(dir: &str, name: &str) -> String {
 /// One viewer's projected trees.
 pub struct Trees<'g, 'a> {
     pub g: &'g G<'a>,
+    view: &'g View<'g>,
     pr: RefCell<Projector<'g>>,
 }
+
+/// Trees a long-lived [`Trees`] (a fill's) keeps created before it starts
+/// afresh ([`Trees::forget`]).
+const KEPT_CREATED: usize = 4096;
 
 impl<'g, 'a> Trees<'g, 'a> {
     pub fn new(g: &'g G<'a>, view: &'g View<'g>) -> Trees<'g, 'a> {
         Trees {
             g,
+            view,
             pr: RefCell::new(Projector::new(&g.cx.src, view)),
+        }
+    }
+
+    /// Start afresh once the projector holds many created trees, so a
+    /// fill's memory stays bounded. Only between uses: no projected id
+    /// handed out before may be looked up after.
+    pub fn forget(&self) {
+        if self.pr.borrow().created.len() > KEPT_CREATED {
+            *self.pr.borrow_mut() = Projector::new(&self.g.cx.src, self.view);
+        }
+    }
+
+    /// Start afresh now if the projector made any trees: a blame job does
+    /// this between versions, so the trees a rename search made are not
+    /// held through its walk (BUG-1219).
+    pub fn forget_now(&self) {
+        if !self.pr.borrow().created.is_empty() {
+            *self.pr.borrow_mut() = Projector::new(&self.g.cx.src, self.view);
         }
     }
 
@@ -223,21 +247,7 @@ impl<'g, 'a> Trees<'g, 'a> {
     pub fn diff(&self, old: ObjectId, new: ObjectId, under: &str, content: bool, limits: DiffLimits) -> Result<Value> {
         let ch = self.changes(old, new, under)?;
         let (from, _capped, similar) = changes::sources_with(&self.g.cx.src, &ch, &|| self.g.tick())?;
-        // An added file whose best source the change deleted is a rename
-        // (once per source); with any other source, a copy.
-        let deleted: std::collections::HashMap<&str, usize> =
-            ch.iter().enumerate().filter(|(_, c)| c.new.is_none()).map(|(i, c)| (c.path.as_str(), i)).collect();
-        let mut claimed = vec![false; ch.len()];
-        let mut pairs: Vec<Option<(usize, u32, bool)>> = vec![None; ch.len()];
-        for (i, f) in from.iter().enumerate() {
-            let Some(best) = f.first() else { continue };
-            let src = ch.iter().position(|c| c.path == best.path).expect("a source is a change of the same diff");
-            let rename = deleted.contains_key(best.path.as_str()) && !claimed[src];
-            if rename {
-                claimed[src] = true;
-            }
-            pairs[i] = Some((src, best.score, rename));
-        }
+        let (pairs, claimed) = pairs(&ch, &from);
         let mut files = Vec::new();
         let mut budget = limits.content_bytes;
         let mut truncated = false;
@@ -339,6 +349,30 @@ impl<'g, 'a> Trees<'g, 'a> {
         *budget -= size;
         Ok(json!({ "binary": false, "hunks": hunks }))
     }
+}
+
+/// An added file's best source: `(source index, score, rename)`.
+pub type Pair = (usize, u32, bool);
+
+/// Each added file's best source among `changes` (`from`, as
+/// [`changes::sources`] ranks them): `(source index, score, rename)`, a
+/// rename when the change deleted the source and no added file before it
+/// (in path order) took it; and which changes a rename took (a diff lists
+/// them once, as the renamed file).
+pub fn pairs(changes: &[Change], from: &[Vec<changes::From>]) -> (Vec<Option<Pair>>, Vec<bool>) {
+    let index: std::collections::HashMap<&str, usize> = changes.iter().enumerate().map(|(i, c)| (c.path.as_str(), i)).collect();
+    let mut claimed = vec![false; changes.len()];
+    let mut out: Vec<Option<Pair>> = vec![None; changes.len()];
+    for (i, f) in from.iter().enumerate() {
+        let Some(best) = f.first() else { continue };
+        let src = *index.get(best.path.as_str()).expect("a source is a change of the same diff");
+        let rename = changes[src].new.is_none() && !claimed[src];
+        if rename {
+            claimed[src] = true;
+        }
+        out[i] = Some((src, best.score, rename));
+    }
+    (out, claimed)
 }
 
 impl TreeSource for Trees<'_, '_> {

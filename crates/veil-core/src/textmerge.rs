@@ -223,6 +223,20 @@ pub fn fits(old: &[u8], new: &[u8]) -> bool {
     fits_within(old, new, None)
 }
 
+/// [`fits`] of two texts that share `lines - lines(old_mid) -
+/// lines(new_mid)` lines at their start and end, given only what lies
+/// between (`old_mid`, `new_mid`) and the texts' line count in all
+/// (`lines`): the search skips shared lines anyway, and its limit counts
+/// them. The same answer, without reading the shared lines (blame's
+/// `map_lines`).
+pub fn fits_middle(old_mid: &[u8], new_mid: &[u8], lines: usize) -> bool {
+    if old_mid == new_mid {
+        return true;
+    }
+    let [a, b] = classify([old_mid, new_mid]);
+    ids_fit(&a, &b, work_limit(lines))
+}
+
 fn fits_within(old: &[u8], new: &[u8], limit: Option<u64>) -> bool {
     if old == new {
         return true;

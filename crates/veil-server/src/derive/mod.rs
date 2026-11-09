@@ -44,6 +44,7 @@
 //! extends with the projections. [`read`] and [`view`] stay the internal
 //! reads of blame, file history and search (S14, S15).
 
+pub mod blame;
 pub mod changes;
 pub mod graph;
 pub mod lines;
@@ -966,9 +967,46 @@ impl<'a> Batch<'a> {
 /// queued here and run in the background (`query::graph::prefill`). Only
 /// the branches named (a landing's) are touched (BUG-870).
 pub async fn memo_tips(hub: &Arc<Hub>, project_id: i64, branches: &[String]) -> Result<()> {
+    let Some((project, viewers)) = viewers_of(hub, project_id).await? else { return Ok(()) };
+    let branches: Vec<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = ANY($2)")
+        .bind(project_id)
+        .bind(branches)
+        .fetch_all(&hub.db)
+        .await?;
+    let tips: Vec<ObjectId> = branches.iter().map(|t| ObjectId::from_hex(t).map_err(bad)).collect::<Result<_>>()?;
+    let mut keys = HashSet::new();
+    let mut failed = Ok(());
+    for v in viewers {
+        let view = project.view(&v);
+        if !view.sees_anything() || !keys.insert(view.key()) {
+            continue;
+        }
+        // Queue the fill that memoises the projections and extends the
+        // viewer's graph (`query::graph::prefill`: the one fill of this
+        // view key, which a query that needs it joins). Never waited for
+        // here: the deriver holds nothing while fills run (BUG-911).
+        if let Err(e) = crate::query::graph::prefill(hub, &project, &v, &tips).await {
+            if failed.is_ok() {
+                failed = Err(e);
+            }
+        }
+    }
+    // What view keys no viewer has now keep is dropped (BUG-1413).
+    if let Err(e) = crate::query::files::sweep_keys(hub, project_id).await {
+        if failed.is_ok() {
+            failed = Err(e);
+        }
+    }
+    failed
+}
+
+/// The project `project_id` and its viewers: anyone on Earth, each person
+/// in one of its groups or named by a rule (not an admin), and the admins.
+async fn viewers_of(hub: &Hub, project_id: i64) -> Result<Option<(crate::perm::Project, Vec<crate::perm::Viewer>)>> {
     let mut c = hub.db.acquire().await?;
-    let name: String = sqlx::query_scalar("SELECT name FROM projects WHERE id = $1").bind(project_id).fetch_one(&mut *c).await?;
-    let Some(project) = crate::perm::load_project(&mut c, &name).await? else { return Ok(()) };
+    let name: Option<String> = sqlx::query_scalar("SELECT name FROM projects WHERE id = $1").bind(project_id).fetch_optional(&mut *c).await?;
+    let Some(name) = name else { return Ok(None) };
+    let Some(project) = crate::perm::load_project(&mut c, &name).await? else { return Ok(None) };
     let admins: HashSet<i64> = sqlx::query_scalar("SELECT person_id FROM project_admins WHERE project_id = $1")
         .bind(project_id)
         .fetch_all(&mut *c)
@@ -980,11 +1018,6 @@ pub async fn memo_tips(hub: &Arc<Hub>, project_id: i64, branches: &[String]) -> 
             .bind(project_id)
             .fetch_all(&mut *c)
             .await?;
-    let branches: Vec<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = ANY($2)")
-        .bind(project_id)
-        .bind(branches)
-        .fetch_all(&mut *c)
-        .await?;
     drop(c);
     let mut people: HashMap<i64, HashSet<i64>> = HashMap::new();
     for (p, g) in members {
@@ -1007,28 +1040,22 @@ pub async fn memo_tips(hub: &Arc<Hub>, project_id: i64, branches: &[String]) -> 
             });
         }
     }
-    let tips: Vec<ObjectId> = branches.iter().map(|t| ObjectId::from_hex(t).map_err(bad)).collect::<Result<_>>()?;
     // The admins' graph of the query API too (S13): it holds real history.
     viewers.push(crate::perm::Viewer {
         admin: true,
         ..Default::default()
     });
-    let mut keys = HashSet::new();
-    let mut failed = Ok(());
-    for v in viewers {
-        let view = project.view(&v);
-        if !view.sees_anything() || !keys.insert(view.key()) {
-            continue;
-        }
-        // Queue the fill that memoises the projections and extends the
-        // viewer's graph (`query::graph::prefill`: the one fill of this
-        // view key, which a query that needs it joins). Never waited for
-        // here: the deriver holds nothing while fills run (BUG-911).
-        if let Err(e) = crate::query::graph::prefill(hub, &project, &v, &tips).await {
-            if failed.is_ok() {
-                failed = Err(e);
-            }
-        }
-    }
-    failed
+    Ok(Some((project, viewers)))
+}
+
+/// The view keys of `project_id`'s viewers now (those who see anything):
+/// the keys whose per-key rows the query API keeps (BUG-1413).
+pub async fn view_keys(hub: &Hub, project_id: i64) -> Result<HashSet<String>> {
+    let Some((project, viewers)) = viewers_of(hub, project_id).await? else { return Ok(HashSet::new()) };
+    Ok(viewers
+        .iter()
+        .map(|v| project.view(v))
+        .filter(|v| v.sees_anything())
+        .map(|v| v.key())
+        .collect())
 }

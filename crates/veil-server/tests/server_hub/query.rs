@@ -18,7 +18,7 @@ use veil_core::ObjectId;
 use veil_server::{
     error::Error,
     perm::Viewer,
-    query::{self, Ask, DiffParams, FileParams, Limits, LogParams, ShowParams, TreeParams},
+    query::{self, Ask, BlameParams, DiffParams, FileParams, HistoryParams, Limits, LogParams, ShowParams, TreeParams},
     sync::root_snapshot_id,
 };
 
@@ -27,14 +27,14 @@ use crate::{
     support::*,
 };
 
-fn seeds(default: &[u64]) -> Vec<u64> {
+pub(crate) fn seeds(default: &[u64]) -> Vec<u64> {
     match std::env::var("VEIL_QUERY_SEED").ok().and_then(|s| s.parse::<u64>().ok()) {
         Some(s) => (s..s + default.len() as u64).collect(),
         None => default.to_vec(),
     }
 }
 
-fn ask(th: &TestHub, h: &Hist, viewer: &Viewer) -> Ask {
+pub(crate) fn ask(th: &TestHub, h: &Hist, viewer: &Viewer) -> Ask {
     Ask {
         project: h.project(th),
         viewer: viewer.clone(),
@@ -44,12 +44,12 @@ fn ask(th: &TestHub, h: &Hist, viewer: &Viewer) -> Ask {
 
 /// Fill `viewer`'s graph of `h` up to its branches (as a landing does), so
 /// that no query of the test meets a first fill.
-fn warm_up(th: &TestHub, h: &Hist, viewer: &Viewer) {
+pub(crate) fn warm_up(th: &TestHub, h: &Hist, viewer: &Viewer) {
     let tips: Vec<ObjectId> = h.branches.values().copied().collect();
     th.rt.block_on(query::graph::ensure(&h.hub, &h.project(th), viewer, &tips, None)).unwrap();
 }
 
-fn admin() -> Viewer {
+pub(crate) fn admin() -> Viewer {
     Viewer {
         admin: true,
         ..Viewer::default()
@@ -58,7 +58,7 @@ fn admin() -> Viewer {
 
 /// An answer as compared: the JSON without the policy version (the copy has
 /// its own), or the error's status, code and message.
-fn norm(r: veil_server::error::Result<Value>) -> String {
+pub(crate) fn norm(r: veil_server::error::Result<Value>) -> String {
     match r {
         Ok(mut v) => {
             v.as_object_mut().unwrap().remove("policy_version");
@@ -78,6 +78,20 @@ enum Q {
     File(FileParams),
     Diff(DiffParams),
     Ancestry(Vec<(String, String)>),
+    /// S14: followed through every page.
+    Blame(BlameParams, Limits),
+    History(HistoryParams, Limits),
+}
+
+/// Forget every kept blame of project `h` (S14), and every too-wide
+/// record (BUG-1309): the harness compares a viewer's answers with their
+/// copy's from the same start, and viewers who read the same paths share
+/// kept blames.
+pub(crate) fn forget_blames(th: &TestHub, h: &Hist) {
+    th.rt.block_on(async {
+        again(|| sqlx::query("DELETE FROM blame_memo WHERE project_id = $1").bind(h.id).execute(&h.hub.db)).await;
+        again(|| sqlx::query("DELETE FROM blame_ends WHERE project_id = $1").bind(h.id).execute(&h.hub.db)).await;
+    });
 }
 
 /// Ask again while the answer is `warming` or `deadline`, as a client does
@@ -126,6 +140,41 @@ fn run(th: &TestHub, h: &Hist, a: &Ask, q: &Q) -> Vec<String> {
             }))],
             Q::Diff(p) => vec![norm(settled(|| query::diff(&hub, a, p.clone(), Limits::default())).await)],
             Q::Ancestry(pairs) => vec![norm(settled(|| query::ancestry(&hub, a, query::AncestryRequest { pairs: pairs.clone() }, Limits::default())).await)],
+            Q::Blame(p, limits) => {
+                // A long deadline: a blame cut by it keeps what it computed,
+                // so its answers' `work` would depend on the machine's speed.
+                let limits = Limits { deadline: Duration::from_secs(120), ..*limits };
+                let mut out = Vec::new();
+                let mut p = p.clone();
+                for _ in 0..60 {
+                    let r = settled(|| query::blame(&hub, a, p.clone(), limits)).await;
+                    // A blame stopped at its budget goes on from what it kept.
+                    let partial = matches!(&r, Err(Error::Api { code: "partial", .. }));
+                    let next = r.as_ref().ok().and_then(|v| v["next"].as_u64());
+                    out.push(norm(r));
+                    match next {
+                        Some(n) => p.after = Some(n as usize),
+                        None if partial => {}
+                        None => break,
+                    }
+                }
+                out
+            }
+            Q::History(p, limits) => {
+                let limits = Limits { deadline: Duration::from_secs(120), ..*limits };
+                let mut out = Vec::new();
+                let mut p = p.clone();
+                for _ in 0..60 {
+                    let r = settled(|| query::history(&hub, a, p.clone(), limits)).await;
+                    let next = r.as_ref().ok().and_then(|v| v["next"].as_str().map(str::to_string));
+                    out.push(norm(r));
+                    match next {
+                        Some(n) => p.after = Some(n),
+                        None => break,
+                    }
+                }
+                out
+            }
         }
     })
 }
@@ -169,6 +218,22 @@ fn queries(rng: &mut Rng, revs: &[String], paths: &[String]) -> Vec<Q> {
     }
     let pairs: Vec<(String, String)> = (0..8).map(|_| (pick(rng, revs), pick(rng, revs))).collect();
     out.push(Q::Ancestry(pairs));
+    // S14: blame and file history, with and without following renames,
+    // in small pages, and with budgets small enough to stop and go on.
+    let tiny = Limits {
+        blame: query::files::BlameLimits { lines: 3, ..Default::default() },
+        work: 6,
+        ..Limits::default()
+    };
+    for _ in 0..14 {
+        let rev = pick(rng, revs);
+        let path = pick(rng, paths);
+        let follow = Some(rng.chance(50));
+        let limits = if rng.chance(40) { tiny } else { Limits::default() };
+        out.push(Q::Blame(BlameParams { rev: Some(rev.clone()), path: path.clone(), follow, n: rng.chance(30).then_some(4), ..Default::default() }, limits));
+        let n = Some([1, 2, 50][rng.below(3)]);
+        out.push(Q::History(HistoryParams { rev: Some(rev), path: Some(path), follow, n, ..Default::default() }, limits));
+    }
     out
 }
 
@@ -204,6 +269,7 @@ fn query_projection_equivalence() {
                 revs.push(s.hex());
             }
             let (mine_ask, copy_ask) = (ask(&th, &h, &viewer), ask(&th, &copy, &admin()));
+            forget_blames(&th, &h);
             warm_up(&th, &h, &viewer);
             warm_up(&th, &copy, &admin());
             // The log's order and cursors come from the viewer's own graph:
@@ -383,7 +449,7 @@ fn query_graph_matches_direct_walks() {
 /// history), computed from its snapshot objects alone: newest first by the
 /// generation of that graph (timestamps clamped as the graphs clamp them,
 /// raised above the parents'), ties by id.
-fn model_log(th: &TestHub, copy: &Hist, tip: ObjectId) -> Vec<String> {
+pub(crate) fn model_log(th: &TestHub, copy: &Hist, tip: ObjectId) -> Vec<String> {
     let (hub, id) = (copy.hub.clone(), copy.id);
     th.rt
         .block_on(veil_server::sync::blocking(&hub, id, move |src| {
@@ -507,6 +573,27 @@ fn query_hidden_and_withheld_are_missing() {
     for rev in ["embargoed".to_string(), e.hex(), c.hex()] {
         assert_eq!(one(&adm, log(&rev)), no_rev, "admin, {rev}");
     }
+    // Blame and file history (S14) of the fix, at the embargo line: no
+    // such revision for anyone; at main: no such path, as a missing one.
+    for a in [&anyone, &adm] {
+        for rev in ["embargoed".to_string(), e.hex(), c.hex()] {
+            let b = Q::Blame(BlameParams { rev: Some(rev.clone()), path: "pub/fix-embargo-77c1e0.rs".into(), ..Default::default() }, Limits::default());
+            assert_eq!(one(a, b), no_rev, "{rev}");
+            let hq = Q::History(HistoryParams { rev: Some(rev.clone()), path: Some("pub/fix-embargo-77c1e0.rs".into()), follow: Some(true), ..Default::default() }, Limits::default());
+            assert_eq!(one(a, hq), no_rev, "{rev}");
+        }
+        let hq = |p: &str| Q::History(HistoryParams { rev: Some("main".into()), path: Some(p.into()), ..Default::default() }, Limits::default());
+        assert_eq!(one(a, hq("pub/fix-embargo-77c1e0.rs")), one(a, hq("pub/nothing-4c1.rs")));
+    }
+    let rows: i64 = th.rt.block_on(async {
+        sqlx::query_scalar("SELECT COUNT(*) FROM view_file_history WHERE project_id = $1 AND snapshot = ANY($2)")
+            .bind(h.id)
+            .bind(vec![e.hex(), c.hex()])
+            .fetch_one(&h.hub.db)
+            .await
+            .unwrap()
+    });
+    assert_eq!(rows, 0, "an embargo line has no file history until its release");
     let main_log = one(&adm, log("main"));
     assert!(main_log.contains(&hidden.hex()) && !main_log.contains(&e.hex()), "{main_log}");
     // Paths: hidden, missing, and missing under a hidden folder.
@@ -830,7 +917,18 @@ fn query_routes_serve_each_person_their_part() {
         for path in [format!("src/{NESTED_DIR}/key.txt"), format!("{BILL_DIR}/acme/invoice.txt"), format!("{PERSON_DIR}/notes.txt"), ROOT_FILE.to_string(), "src/lib.rs".into()] {
             let f = get(&api, t, &format!("{base}/file?rev={tip}&path={path}"));
             bodies.push(f.body);
+            // S14: blame and file history, following renames or not.
+            for follow in [false, true] {
+                bodies.push(get(&api, t, &format!("{base}/blame?rev={tip}&path={path}&follow={follow}")).body);
+                bodies.push(get(&api, t, &format!("{base}/history?rev={tip}&path={path}&follow={follow}")).body);
+            }
         }
+        let blame = get(&api, t, &format!("{base}/blame?path=src/lib.rs"));
+        assert_eq!(blame.status, 200, "{who}: {}", String::from_utf8_lossy(&blame.body));
+        assert!(has_marker(&[(String::new(), blame.body.clone())], PUBLIC_MARK), "{who}");
+        let history = get(&api, t, &format!("{base}/history?path=src/lib.rs&follow=true"));
+        assert_eq!(history.status, 200, "{who}: {}", String::from_utf8_lossy(&history.body));
+        assert!(!history.json()["entries"].as_array().unwrap().is_empty(), "{who}");
         bodies.push(get(&api, t, &format!("{base}/tree?path={BILL_DIR}")).body);
         let anc = api.post_json(t, &format!("{base}/ancestry"), &json!({ "pairs": [[tip, "main"]] }));
         assert_eq!(anc.status, 200, "{who}: {}", String::from_utf8_lossy(&anc.body));
@@ -845,12 +943,25 @@ fn query_routes_serve_each_person_their_part() {
     let env = get(&api, tok(&p.fin).as_deref(), &format!("{base}/file?path={BILL_DIR}/.env"));
     assert_eq!(env.status, 200, "{}", String::from_utf8_lossy(&env.body));
     assert!(!env.body.is_empty() && !has_marker(&[(String::new(), env.body.clone())], ENV_MARK));
+    // A secret is never read by the server: no blame of it (row 7).
+    let env_blame = get(&api, tok(&p.fin).as_deref(), &format!("{base}/blame?path={BILL_DIR}/.env"));
+    assert_eq!(env_blame.status, 400, "{}", String::from_utf8_lossy(&env_blame.body));
+    assert!(String::from_utf8_lossy(&env_blame.body).contains("a secret"));
+    let env_history = get(&api, tok(&p.fin).as_deref(), &format!("{base}/history?path={BILL_DIR}/.env"));
+    assert_eq!(env_history.status, 200);
+    assert!(!has_marker(&[(String::new(), env_history.body)], ENV_MARK));
     // A hidden path and a missing one, a hidden revision and a missing
     // one: the same bodies, byte for byte.
     let dev = tok(&p.dev);
     let a = get(&api, dev.as_deref(), &format!("{base}/file?path={BILL_DIR}/acme/invoice.txt"));
     let b = get(&api, dev.as_deref(), &format!("{base}/file?path=nothing/here.txt"));
     assert_eq!((a.status, &a.body), (b.status, &b.body));
+    for route in ["blame", "history"] {
+        let a = get(&api, dev.as_deref(), &format!("{base}/{route}?path={BILL_DIR}/acme/invoice.txt&follow=true"));
+        let b = get(&api, dev.as_deref(), &format!("{base}/{route}?path=nothing/here.txt&follow=true"));
+        assert_eq!((a.status, &a.body), (b.status, &b.body), "{route}");
+        assert_eq!(a.status, 404, "{route}");
+    }
     let real_hidden = entries.iter().find(|e| e["description"].as_str().unwrap_or("").contains(DESC_MARK)).unwrap()["snapshot_id"].as_str().unwrap().to_string();
     let a = get(&api, dev.as_deref(), &format!("{base}/show?rev={real_hidden}"));
     let b = get(&api, dev.as_deref(), &format!("{base}/show?rev={}", ObjectId([7; 32]).hex()));
@@ -859,10 +970,15 @@ fn query_routes_serve_each_person_their_part() {
     // Row 9: the admin removes fin from finance; billing goes at once.
     let fin_tree = |t: Option<&str>| get(&api, t, &format!("{base}/tree?path={BILL_DIR}"));
     assert_eq!(fin_tree(tok(&p.fin).as_deref()).status, 200);
+    let fin_blame = |t: Option<&str>| get(&api, t, &format!("{base}/blame?path={BILL_DIR}/acme/invoice.txt"));
+    let before = fin_blame(tok(&p.fin).as_deref());
+    assert_eq!(before.status, 200, "{}", String::from_utf8_lossy(&before.body));
     p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
     let after = fin_tree(tok(&p.fin).as_deref());
     let missing = get(&api, tok(&p.fin).as_deref(), &format!("{base}/tree?path=nothing/here"));
     assert_eq!((after.status, &after.body), (404, &missing.body));
+    let (blamed, missing) = (fin_blame(tok(&p.fin).as_deref()), get(&api, tok(&p.fin).as_deref(), &format!("{base}/blame?path=nothing/here.txt")));
+    assert_eq!((blamed.status, &blamed.body), (404, &missing.body), "a removed reader's blame");
     let log = get(&api, tok(&p.fin).as_deref(), &format!("{base}/log?n=100"));
     assert!(!has_marker(&[(String::new(), log.body)], DESC_MARK));
     // Row 7: the viewer graphs hold ids and numbers, nothing of any file.
@@ -1672,8 +1788,8 @@ mod s13_adversarial {
 
     /// Kept cursors are bounded, whatever anyone asks: anyone on Earth
     /// paging a wide public log over and over, from many places, makes the
-    /// server keep at most `Limits::kept_bytes` of cursors for the project
-    /// after every request (oldest dropped first; one row per request, of
+    /// server keep at most `Limits::kept_bytes` of cursors for the project's
+    /// one view key here (the cap is a view key's) after every request (oldest dropped first; one row per request, of
     /// at most `Limits::frontier` snapshots); the same frontier is kept
     /// once; rows past `Limits::kept_for` are dropped by the next write and
     /// never served.

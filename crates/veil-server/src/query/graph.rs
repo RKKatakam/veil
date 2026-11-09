@@ -46,6 +46,7 @@ use tokio::sync::watch;
 use axum::http::StatusCode;
 use veil_core::{cache::LruCache, id::ChangeId, object::Snapshot, ObjectId};
 
+use super::{files::Fill as FileFill, trees::Trees};
 use crate::{
     derive::{
         graph::{FLAG_EMBARGO, FLAG_EMBARGO_LINE},
@@ -217,7 +218,7 @@ impl<'a> G<'a> {
         let row: Option<Row> = self.cx.db(|| {
             sqlx::query_as(
                 "SELECT generation, depth, parents, flags, skip, down_id, real_id FROM view_graph \
-                 WHERE project_id = $1 AND view_key = $2 AND snapshot = $3",
+                 WHERE project_id = $1 AND view_key = $2 AND snapshot = $3 AND files IS TRUE",
             )
             .bind(self.cx.project())
             .bind(self.vk)
@@ -237,6 +238,12 @@ impl<'a> G<'a> {
         hub.query.rows.insert(k, r.clone(), 320);
         self.local.borrow_mut().insert(*id, r.clone());
         Ok(Some(r))
+    }
+
+    /// Keep `row` of `id`, computed and not written yet (a fill's), for
+    /// the walks of this reader.
+    pub fn keep(&self, id: ObjectId, row: Arc<VRow>) {
+        self.local.borrow_mut().insert(id, row);
     }
 
     /// The row of `id`, which the viewer's graph must have (a parent of a
@@ -260,7 +267,7 @@ impl<'a> G<'a> {
         }
         let hub = self.cx.hub();
         let found: Vec<String> = self.cx.db(|| {
-            sqlx::query_scalar("SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = ANY($3)")
+            sqlx::query_scalar("SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = ANY($3) AND files IS TRUE")
                 .bind(self.cx.project())
                 .bind(self.vk)
                 .bind(&ask)
@@ -271,11 +278,14 @@ impl<'a> G<'a> {
     }
 
     /// Write `rows` (parents before children, each with its projected
-    /// snapshot's change id) and keep them. Their change ids go first, to
-    /// `view_changes` (`q/resolve`'s change id prefixes from the viewer's
-    /// own rows, BUG-1317): a row of `view_graph` is never there without
-    /// its change id; one written only to `view_changes` is written again
-    /// by the next fill.
+    /// snapshot's change id) and keep them, marked as having their file
+    /// history (`files`, S14: written before them). Their change ids go
+    /// first, to `view_changes` (`q/resolve`'s change id prefixes from the
+    /// viewer's own rows, BUG-1317): a row of `view_graph` is never there
+    /// without its change id; one written only to `view_changes` is
+    /// written again by the next fill. A row without the `files` mark (an
+    /// S13 server's, which writes graph rows only: BUG-1210) is not read as
+    /// present; filling it again marks it.
     fn add(&self, rows: &[(ObjectId, Arc<VRow>, ChangeId)]) -> Result<()> {
         let hub = self.cx.hub();
         for chunk in rows.chunks(ROWS_PER_STATEMENT) {
@@ -303,9 +313,9 @@ impl<'a> G<'a> {
             })?;
             self.cx.db(|| {
                 sqlx::query(
-                    "INSERT INTO view_graph (project_id, view_key, snapshot, generation, depth, parents, flags, skip, down_id, real_id) \
-                     SELECT $1, $2, * FROM UNNEST($3::text[], $4::bigint[], $5::bigint[], $6::text[], $7::int[], $8::text[], $9::text[], $10::text[]) \
-                     ON CONFLICT DO NOTHING",
+                    "INSERT INTO view_graph (project_id, view_key, snapshot, generation, depth, parents, flags, skip, down_id, real_id, files) \
+                     SELECT $1, $2, *, TRUE FROM UNNEST($3::text[], $4::bigint[], $5::bigint[], $6::text[], $7::int[], $8::text[], $9::text[], $10::text[]) \
+                     ON CONFLICT (project_id, view_key, snapshot) DO UPDATE SET files = TRUE WHERE view_graph.files IS NOT TRUE",
                 )
                 .bind(self.cx.project())
                 .bind(self.vk)
@@ -563,10 +573,15 @@ pub async fn extend(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[
     let vk = project.view(viewer).key();
     let admin = viewer.admin;
     let pairs: Vec<(ObjectId, ObjectId)> = tips.iter().copied().zip(ps.iter().copied()).collect();
+    let (project, viewer) = (project.clone(), viewer.clone());
     blocking(hub, project.id, move |cx| {
         let g = G::new(cx, &vk, None);
+        let view = project.view(&viewer);
+        let t = Trees::new(&g, &view);
         let mut w = Walk {
             g: &g,
+            t: &t,
+            fill: FileFill::default(),
             admin,
             pmap: HashMap::from([(root(), root())]),
             present: HashSet::new(),
@@ -590,9 +605,13 @@ pub async fn extend(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[
     Ok(ps)
 }
 
-/// One extension of a viewer's graph.
-struct Walk<'g, 'a> {
+/// One extension of a viewer's graph, with its file history (S14:
+/// `files::Fill`, the rows of each snapshot's changed paths, written
+/// before the graph rows).
+struct Walk<'w, 'g, 'a> {
     g: &'g G<'a>,
+    t: &'w Trees<'g, 'a>,
+    fill: FileFill,
     admin: bool,
     /// Real snapshot → its projection (the memo's).
     pmap: HashMap<ObjectId, ObjectId>,
@@ -605,7 +624,7 @@ struct Walk<'g, 'a> {
     pending: Vec<(ObjectId, Arc<VRow>, ChangeId)>,
 }
 
-impl Walk<'_, '_> {
+impl Walk<'_, '_, '_> {
     fn has(&mut self, p: &ObjectId) -> Result<bool> {
         if self.rows.contains_key(p) || self.present.contains(p) {
             return Ok(true);
@@ -712,9 +731,11 @@ impl Walk<'_, '_> {
                 parents.push((*q, r));
             }
             let row = Arc::new(VRow::compute(&ps, &parents, x));
+            self.g.keep(px, row.clone());
             self.rows.insert(px, row.clone());
+            self.fill.add(self.g, self.t, px, &row)?;
             self.pending.push((px, row, ps.change_id));
-            if self.pending.len() >= ROWS_PER_STATEMENT {
+            if self.pending.len() >= ROWS_PER_STATEMENT || self.fill.pending.len() >= 4 * ROWS_PER_STATEMENT {
                 self.flush()?;
             }
         }
@@ -725,6 +746,9 @@ impl Walk<'_, '_> {
         if self.pending.is_empty() {
             return Ok(());
         }
+        // File history first: a graph row's presence means its file
+        // history is there.
+        self.fill.flush(self.g)?;
         self.g.add(&self.pending)?;
         self.pending.clear();
         Ok(())
@@ -743,6 +767,11 @@ pub struct State {
     started: Mutex<HashMap<i64, u64>>,
     /// One per fill running here: at most [`MAX_FILLS`] at once.
     slots: Arc<tokio::sync::Semaphore>,
+    /// The blame jobs of this server (S14 cycle 3).
+    pub jobs: super::files::Jobs,
+    /// Versions blamed (computed, not read kept) here: the tests count
+    /// them, to show no version is blamed twice.
+    pub blame_steps: std::sync::atomic::AtomicU64,
 }
 
 type Fill = watch::Receiver<Option<std::result::Result<(), String>>>;
@@ -754,6 +783,8 @@ impl Default for State {
             fills: Mutex::new(HashMap::new()),
             started: Mutex::new(HashMap::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_FILLS)),
+            jobs: super::files::Jobs::default(),
+            blame_steps: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -863,7 +894,7 @@ async fn warm(hub: &Arc<Hub>, project: i64, vk: &str, admin: bool, tips: &[Objec
         };
         let cached = p == root() || hub.query.rows.get(&cache_key(project, vk, &p)).is_some();
         if !cached {
-            let found: Option<String> = sqlx::query_scalar("SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = $3")
+            let found: Option<String> = sqlx::query_scalar("SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = $3 AND files IS TRUE")
                 .bind(project)
                 .bind(vk)
                 .bind(p.hex())
