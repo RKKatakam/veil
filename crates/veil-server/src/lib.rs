@@ -14,6 +14,7 @@
 //! | [`cache`] | the regional cache (`veil-server cache`, S9), and the epoch feed it polls |
 //! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
 //! | [`query`] | the query API: history answered per viewer (S13) |
+//! | [`limits`] | rate limits, request bodies under a budget, per-project bulkheads, shedding, health metrics (S24) |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
 //! | [`store`] | object storage: local directory or S3 |
 //! | [`pack`] | packs: a push's objects in one storage object, read by range (S28) |
@@ -28,6 +29,7 @@ pub mod db;
 pub mod derive;
 pub mod error;
 pub mod grant;
+pub mod limits;
 pub mod pack;
 pub mod perm;
 pub mod query;
@@ -80,6 +82,8 @@ pub struct Hub {
     /// The query API's caches and the viewer-graph fills running here
     /// (`query::graph`).
     pub query: query::graph::State,
+    /// Rate limits, the request budget, bulkheads and health (S24).
+    pub limits: limits::Limits,
 }
 
 pub type HubState = Arc<Hub>;
@@ -113,6 +117,8 @@ pub struct Config {
     /// underived (`derive::resume`). Servers do; tests that count
     /// their own derive runs turn it off.
     pub catch_up_at_start: bool,
+    /// Rate limits, connections and the request budget (S24).
+    pub limits: limits::Settings,
 }
 
 /// A running server.
@@ -197,6 +203,7 @@ pub async fn start(config: Config) -> Result<Running> {
         caches: caches::Caches::default(),
         derive: derive::Workers::new(derive_db),
         query: query::graph::State::default(),
+        limits: limits::Limits::new(config.limits, config.db_connections),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
@@ -204,7 +211,9 @@ pub async fn start(config: Config) -> Result<Running> {
     let app = api::router(hub.clone());
     // Push notices drop other servers' cached tips (`caches::listen`).
     tokio::spawn(caches::listen(hub.clone(), rx.clone()));
-    let task = tokio::spawn(serve_tls(listener, tls, app, rx, None));
+    let pace = cache::deadline::Pace { stall: ANSWER_STALL, grace: ANSWER_STALL, min_rate: limits::body::MIN_RATE };
+    let connections = ConnectionLimits { pace, max_connections: config.limits.max_connections, buffer: HTTP_BUFFER };
+    let task = tokio::spawn(serve(listener, tls, app, rx, Some(connections), Some(hub.limits.connections.clone())));
     if config.catch_up_at_start {
         tokio::spawn({
             let hub = hub.clone();
@@ -249,14 +258,104 @@ pub(crate) struct ConnectionLimits {
 /// one record (rustls's default is 64 KiB).
 const TLS_SEND_BUFFER: usize = 16 << 10;
 
-/// Serve `app` over TLS until `stop`, with `limits` (the regional cache's)
-/// or none (the server's).
+/// The server's answers (S24, as the regional cache's, BUG-1183): a write
+/// pending this long closes the connection, and so does one that brings
+/// the time writes waited past this plus a second per 16 KiB written.
+const ANSWER_STALL: Duration = Duration::from_secs(30);
+/// The server's HTTP/1.1 buffer per connection: a request head with the
+/// longest `Veil-Chain` (`MAX_CHAIN` ids, about 67 KB) fits.
+const HTTP_BUFFER: usize = 128 << 10;
+/// HTTP/2 per connection (S24): streams at once, and the bytes a client
+/// may send ahead on the connection and on one stream, and the answer bytes
+/// queued per stream.
+const H2_STREAMS: u32 = 16;
+const H2_CONNECTION_WINDOW: u32 = 256 << 10;
+const H2_STREAM_WINDOW: u32 = 64 << 10;
+const H2_SEND_BUFFER: usize = 32 << 10;
+
+/// Serve `app` over TLS until `stop`, with `limits` (the regional cache's,
+/// HTTP/1.1 only) or none.
 pub(crate) async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    tls: Arc<rustls::ServerConfig>,
+    app: axum::Router,
+    stop: tokio::sync::watch::Receiver<bool>,
+    limits: Option<ConnectionLimits>,
+) {
+    serve(listener, tls, app, stop, limits, None).await
+}
+
+/// Requests of one connection whose answers are not finished, and since
+/// when it has had none: what the idle limit reads (BUG-1337).
+struct Activity(std::sync::Mutex<(usize, tokio::time::Instant)>);
+
+/// One request's part of [`Activity`], until its answer's body is done.
+struct Active(Arc<Activity>);
+
+impl Activity {
+    fn start(self: &Arc<Self>) -> Active {
+        self.0.lock().unwrap().0 += 1;
+        Active(self.clone())
+    }
+
+    fn idle_for(&self) -> Duration {
+        let (n, since) = *self.0.lock().unwrap();
+        if n > 0 {
+            Duration::ZERO
+        } else {
+            since.elapsed()
+        }
+    }
+}
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        let mut a = self.0 .0.lock().unwrap();
+        a.0 -= 1;
+        a.1 = tokio::time::Instant::now();
+    }
+}
+
+/// An answer's body that keeps its request [`Active`] until it is done.
+struct Answering {
+    body: axum::body::Body,
+    _active: Active,
+}
+
+impl hyper::body::Body for Answering {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Result<hyper::body::Frame<bytes::Bytes>, axum::Error>>> {
+        std::pin::Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+/// Serve `app` over TLS until `stop`. With `limits`: at most
+/// `max_connections` open, bounded buffers, answers that must keep the
+/// minimum rate, and a connection with no request in flight for
+/// [`IDLE_LIMIT`] closed, HTTP/1.1 or HTTP/2 (BUG-1337: a graceful close,
+/// then at once after as long again). With `server` (the Veil server's
+/// listener, S24): HTTP/2 too (bounded per connection by [`H2_STREAMS`] and
+/// its windows), and an address opens at most its share of the connections
+/// (`limits::Connections`; past it a connection is closed at once).
+/// Without (a regional cache): HTTP/1.1 only, and each request carries its
+/// client's address to the cache's routes (`limits::CLIENT_ADDRESS`).
+pub(crate) async fn serve(
     listener: tokio::net::TcpListener,
     tls: Arc<rustls::ServerConfig>,
     app: axum::Router,
     mut stop: tokio::sync::watch::Receiver<bool>,
     limits: Option<ConnectionLimits>,
+    server: Option<Arc<limits::Connections>>,
 ) {
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);
     let open = limits.map(|l| Arc::new(tokio::sync::Semaphore::new(l.max_connections.max(1))));
@@ -268,7 +367,7 @@ pub(crate) async fn serve_tls(
             },
             None => None,
         };
-        let (tcp, _) = tokio::select! {
+        let (tcp, peer) = tokio::select! {
             r = listener.accept() => match r {
                 Ok(c) => c,
                 // Out of file descriptors, say: back off instead of spinning.
@@ -280,25 +379,87 @@ pub(crate) async fn serve_tls(
             _ = stop.changed() => return,
         };
         let _ = tcp.set_nodelay(true);
+        let address = match &server {
+            Some(c) => match c.open(peer.ip()) {
+                Some(a) => Some(a),
+                // Past its address's share: closed at once.
+                None => continue,
+            },
+            None => None,
+        };
         let acceptor = acceptor.clone();
         let app = app.clone();
+        let h2 = server.is_some();
         tokio::spawn(async move {
-            let _slot = slot;
+            let _slot = (slot, address);
             // A connection that never finishes its handshake, or never sends
             // a request's head, is closed: idle sockets cannot pile up.
             let Ok(Ok(mut stream)) = tokio::time::timeout(IDLE_LIMIT, acceptor.accept(tcp)).await else { return };
             if limits.is_some() {
                 stream.get_mut().1.set_buffer_limit(Some(TLS_SEND_BUFFER));
             }
+            // Each request knows its client's address (`limits::Peer`); a
+            // cache's routes pass it on to the server.
+            let ip = peer.ip();
+            let app = tower::ServiceExt::map_request(app, move |mut r: axum::http::Request<hyper::body::Incoming>| {
+                r.extensions_mut().insert(limits::Peer(ip));
+                if !h2 {
+                    if let Ok(v) = axum::http::HeaderValue::from_str(&ip.to_string()) {
+                        r.headers_mut().insert(limits::CLIENT_ADDRESS, v);
+                    }
+                }
+                r
+            });
+            let activity = Arc::new(Activity(std::sync::Mutex::new((0, tokio::time::Instant::now()))));
+            let counting = activity.clone();
+            let app = tower::ServiceExt::map_future(app, move |answer| {
+                let active = counting.start();
+                async move {
+                    let r: Result<axum::response::Response, std::convert::Infallible> = answer.await;
+                    r.map(|resp| resp.map(|body| axum::body::Body::new(Answering { body, _active: active })))
+                }
+            });
             let service = hyper_util::service::TowerToHyperService::new(app);
             let mut b = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
             b.http1().timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(IDLE_LIMIT);
             if let Some(l) = limits {
-                b = b.http1_only();
                 b.http1().max_buf_size(l.buffer);
+                if h2 {
+                    b.http2()
+                        .timer(hyper_util::rt::TokioTimer::new())
+                        .max_concurrent_streams(H2_STREAMS)
+                        .initial_connection_window_size(H2_CONNECTION_WINDOW)
+                        .initial_stream_window_size(H2_STREAM_WINDOW)
+                        .max_send_buf_size(H2_SEND_BUFFER)
+                        .max_header_list_size(HTTP_BUFFER as u32)
+                        .keep_alive_interval(Some(IDLE_LIMIT))
+                        .keep_alive_timeout(IDLE_LIMIT);
+                } else {
+                    b = b.http1_only();
+                }
             }
             let stream = cache::deadline::WriteDeadline::new(stream, limits.map(|l| l.pace));
-            let _ = b.serve_connection(hyper_util::rt::TokioIo::new(stream), service).await;
+            let conn = b.serve_connection(hyper_util::rt::TokioIo::new(stream), service);
+            tokio::pin!(conn);
+            if limits.is_none() {
+                let _ = conn.await;
+                return;
+            }
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            let mut closing: Option<tokio::time::Instant> = None;
+            loop {
+                tokio::select! {
+                    _ = conn.as_mut() => return,
+                    _ = tick.tick() => match closing {
+                        None if activity.idle_for() >= IDLE_LIMIT => {
+                            conn.as_mut().graceful_shutdown();
+                            closing = Some(tokio::time::Instant::now());
+                        }
+                        Some(t) if t.elapsed() >= IDLE_LIMIT => return,
+                        _ => {}
+                    },
+                }
+            }
         });
     }
 }

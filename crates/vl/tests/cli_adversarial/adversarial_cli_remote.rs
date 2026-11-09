@@ -18,6 +18,7 @@ fn clone_cannot_write_outside_the_destination() {
     });
     let work = env.dir("work");
     let out = env.vl("victim", &work, &["clone", remote.to_str().unwrap(), "dest"]);
+    assert!(!out.status.success(), "{}", text(&out));
     let escaped: Vec<String> = tree_listing(&env.root)
         .into_iter()
         .filter(|p| p.ends_with("PWNED.sh"))
@@ -35,8 +36,9 @@ fn pull_and_new_cannot_write_outside_the_working_copy() {
         raw_tree(r, vec![dir("..", inner)])
     });
     env.ok("victim", &proj, &["remote", "add", "origin", remote.to_str().unwrap()]);
-    env.vl("victim", &proj, &["pull", "origin"]);
-    env.vl("victim", &proj, &["new", "upstream"]);
+    let pull = env.vl("victim", &proj, &["pull", "origin"]);
+    let new = env.vl("victim", &proj, &["new", "upstream"]);
+    assert!(!pull.status.success() || !new.status.success(), "{}\n{}", text(&pull), text(&new));
     assert!(!env.root.join("victim-home-file").exists(), "checkout escaped the project directory");
 }
 
@@ -50,14 +52,11 @@ fn clone_cannot_overwrite_repository_metadata() {
     });
     let work = env.dir("work");
     let out = env.vl("victim", &work, &["clone", remote.to_str().unwrap(), "dest"]);
+    assert!(!out.status.success(), "{}", text(&out));
     let cfg = std::fs::read_to_string(work.join("dest/.veil/repo.json")).unwrap_or_default();
     assert!(!cfg.contains("attacker-controlled"), "remote rewrote .veil/repo.json:\n{cfg}\n{}", text(&out));
-    // A refused clone removes its destination; only a clone that exists
-    // can hold a configuration to check.
-    if work.join("dest").exists() {
-        let remotes = env.vl("victim", &work.join("dest"), &["remote", "list"]);
-        assert!(!text(&remotes).contains("attacker"), "{}", text(&remotes));
-    }
+    // A refused clone removes its destination.
+    assert!(!work.join("dest").exists(), "a refused clone left its destination behind:\n{}", text(&out));
 }
 
 #[test]
@@ -74,8 +73,8 @@ fn deeply_nested_remote_tree_does_not_crash_clone() {
     let work = env.dir("work");
     let out = env.vl("victim", &work, &["clone", remote.to_str().unwrap(), "dest"]);
     assert!(
-        out.status.code().is_some(),
-        "vl was killed by a signal ({:?}): {}",
+        out.status.code().is_some() && !out.status.success(),
+        "vl was killed by a signal or succeeded ({:?}): {}",
         out.status,
         text(&out).lines().last().unwrap_or("")
     );
@@ -98,6 +97,7 @@ fn remote_metadata_cannot_inject_terminal_escapes() {
         outputs.push(env.vl("victim", &dest, args));
     }
     for o in &outputs {
+        assert!(o.status.success(), "{}", text(o));
         assert!(!text(o).contains('\x1b'), "raw ESC from the remote reached the terminal:\n{:?}", text(o));
     }
 }

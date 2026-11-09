@@ -38,6 +38,7 @@ mod picker;
 mod render;
 mod rewrite_cmd;
 mod search_cmd;
+mod stats_cmd;
 mod sandbox;
 mod serve;
 mod share_cmd;
@@ -360,6 +361,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Blame(a) => return history::blame(ctx, a),
         Cmd::Grep(a) => return history::grep(ctx, a),
         Cmd::Search(a) => return search_cmd::search(ctx, a),
+        Cmd::Stats(a) => return stats_cmd::stats(ctx, a),
         Cmd::Bisect(c) => return history::bisect(ctx, c),
         // Shared with `vl serve --local` (`api`, write methods).
         Cmd::Describe { rev, message, hooks } => {

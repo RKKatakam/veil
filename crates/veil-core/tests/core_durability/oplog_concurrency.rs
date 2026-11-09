@@ -192,12 +192,16 @@ fn concurrent_rebase_cannot_escape_embargo() {
     }
     // The child is back on the fix: nothing of it sits outside the embargo.
     let visible = r.exact().visible().unwrap();
+    let child_change = r.snapshot(&child).unwrap().change_id;
+    let mut found = 0;
     for s in &visible {
         let snap = r.snapshot(s).unwrap();
-        if snap.change_id == r.snapshot(&child).unwrap().change_id {
+        if snap.change_id == child_change {
             assert!(r.is_ancestor(&fix, s).unwrap(), "a copy of the child sits outside the embargo: {}", s.short());
+            found += 1;
         }
     }
+    assert!(found > 0, "the child change was not found in visible snapshots");
     // Later commands succeed and do not warn again (threat 18).
     let (c, _) = r.commit_working_copy(WS, "later").unwrap();
     r.set_tag("later", c, false).unwrap();
@@ -234,11 +238,14 @@ fn chained_rewrite_cannot_escape_embargo() {
     );
     let mut r = open(&fs, &id);
     assert!(r.take_warnings().iter().any(|w| w.contains("was not applied")));
+    let mut found = 0;
     for s in r.exact().visible().unwrap() {
         if r.snapshot(&s).unwrap().change_id == change {
             assert!(r.is_ancestor(&fix, &s).unwrap(), "a copy of the child sits outside the embargo: {}", s.short());
+            found += 1;
         }
     }
+    assert!(found > 0, "the child change was not found in visible snapshots");
     let mirror = Arc::new(MemoryBackend::new());
     remote::push(&mut r, mirror.clone(), true, &[], false).unwrap();
     for n in FIX_NAMES {

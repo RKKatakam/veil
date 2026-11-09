@@ -82,7 +82,7 @@ fn rename_rename_to_two_names_conflicts_at_both() {
     r.ok(&["resolve", "right.txt", "left.txt", "--ours"]);
     assert_eq!(r.read("right.txt"), base);
     assert!(!r.exists("left.txt"));
-    assert!(r.out(&["resolve", "--list"]).trim().is_empty() || !r.out(&["resolve", "--list"]).contains(".txt"));
+    assert!(!r.out(&["resolve", "--list"]).contains(".txt"));
 }
 
 // Scenario from git t6422-merge-rename-corner-cases.sh (rename/add): a rename onto a name the other side added is not followed; the merge does what it did before.
@@ -203,6 +203,7 @@ fn rename_following_can_be_switched_off_and_respects_the_threshold() {
     // disables it silently).
     r.ok(&["undo"]);
     let out = env.cmd("alice", &r.dir, &["merge", "left", "-m", "merge"]).env("VEIL_MERGE_RENAMES", "\u{1b}[31mno").output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("followed rename"), "{}", text(&out));
     // A file rewritten past the threshold (50%) is not a rename.
     let env = Env::new();

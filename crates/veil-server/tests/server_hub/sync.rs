@@ -674,9 +674,9 @@ fn squashing_the_embargoed_merge_into_the_fix_never_reaches_the_server() {
     p.admin.ok(&p.dir, &["new", "main"]);
     write_files(&p.dir, &[("src/follow.rs", "follow-up")]);
     p.admin.ok(&p.dir, &["commit", "-m", "follow-up"]);
-    let _ = p.admin.run(&p.dir, &["squash", "-r", "main-", "--into", "fixline"]);
+    p.admin.fails(&p.dir, &["squash", "-r", "main-", "--into", "fixline"]);
     p.admin.ok(&p.dir, &["tag", "delete", "fixline"]);
-    let _ = p.admin.run(&p.dir, &["push"]);
+    p.admin.fails(&p.dir, &["push"]);
     let d = p.dev.dir("c");
     p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
     assert_no_marker(&everything_in(&d), &[FIX], "dev");

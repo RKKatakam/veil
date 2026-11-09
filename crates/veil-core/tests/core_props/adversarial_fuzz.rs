@@ -327,14 +327,15 @@ fn wrapped_key_moved_between_scopes_or_recipients_fails() {
 #[test]
 fn envelope_encoding_roundtrips_or_refuses_long_scopes() {
     let k = random_key();
-    let scope = "s".repeat(70_000);
-    match Envelope::seal(&k, &scope, b"hi", true) {
-        Err(_) => {}
-        Ok(env) => {
-            let back = Envelope::from_bytes(&env.to_bytes());
-            assert_eq!(back.ok(), Some(env), "encoding is not a bijection");
-        }
-    }
+    let over = "s".repeat(70_000);
+    assert!(Envelope::seal(&k, &over, b"hi", true).is_err());
+    let max = "s".repeat(u16::MAX as usize);
+    let env = Envelope::seal(&k, &max, b"hi", false).unwrap();
+    let back = Envelope::from_bytes(&env.to_bytes());
+    assert_eq!(back.ok(), Some(env), "encoding is not a bijection");
+    let det = Envelope::seal(&k, &max, b"hi", true).unwrap();
+    let back_det = Envelope::from_bytes_aes_siv(&det.to_bytes());
+    assert_eq!(back_det.ok(), Some(det), "encoding is not a bijection");
 }
 
 #[test]

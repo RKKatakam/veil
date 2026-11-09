@@ -33,5 +33,6 @@ mod caches;
 mod adversarial_s4;
 mod thin;
 mod cache;
+mod limits;
 mod packs;
 mod workspaces;

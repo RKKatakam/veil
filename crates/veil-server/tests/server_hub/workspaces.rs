@@ -340,7 +340,7 @@ fn the_sandboxs_vl_shows_only_what_its_person_may_see() {
     let o = p.dev.run(&thin, &["ws", "exec", "agent", "--mount", "--", "sh", "-c", &script]);
     let out = all(&o);
     assert!(o.status.success() && out.contains("end"), "{out}");
-    assert!(out.contains(FEATURE_MARK) || out.contains("src/wide"), "the sandbox's vl answers: {out}");
+    assert!(out.contains(FEATURE_MARK) && out.contains("src/wide"), "the sandbox's vl answers: {out}");
     // (The script names the billing folder itself, and `vl` echoes it:
     // only what is inside counts.)
     for m in [&restricted_markers()[..], &[FEATURE_BILL]].concat().into_iter().filter(|m| *m != BILL_DIR) {
@@ -1455,12 +1455,12 @@ fn s8h_review_writers_keep_a_refused_folder_by_id() {
     assert!(out.contains(&format!("redacted {BILL_DIR}/")), "the checkout leaves the folder out: {out}");
     keeps("rebase, with a descendant", &["mine", "kid"]);
     let out = p.fin.ok(&d, &["split", "-r", "mine", "src/mine.txt", "-m", "first"]);
-    assert!(out.contains("first") || out.contains("Split"), "{out}");
+    assert!(out.contains("First part:") && out.contains("first"), "{out}");
     p.fin.ok(&d, &["tag", "set", "first", "-r", "mine-"]);
     assert_eq!(p.fin.ok(&d, &["cat", "-r", "first", "src/mine.txt"]), "fin's change\n");
     keeps("split by path", &["first", "mine", "kid"]);
     let out = p.fin.ok(&d, &["squash", "-r", "mine", "src/mine2.txt"]);
-    assert!(out.contains("Squashed") || out.contains("Moved"), "{out}");
+    assert!(out.contains("Squashed"), "{out}");
     assert_eq!(p.fin.ok(&d, &["cat", "-r", "first", "src/mine2.txt"]), "fin's second file\n");
     keeps("squash by path", &["first", "kid"]);
     let out = p.fin.ok(&d, &["squash", "-r", "kid"]);

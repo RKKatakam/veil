@@ -798,7 +798,7 @@ fn format_8_fixture_ring_of_format_4_verifies() {
     let ring = fx.open("alice", Some("alice")).keys().load_ring(FORMAT_7_SCOPE).unwrap().expect("the set has the format-4 ring");
     assert_eq!(ring.format, veil_core::keychain::RING_FORMAT_SHARES);
     let st = ring.verify().unwrap();
-    assert!(st.invites.values().all(|i| i.used));
+    assert!(!st.invites.is_empty() && st.invites.values().all(|i| i.used));
     assert!(matches!(ring.log.last().unwrap().op, RingOp::RevokeOwn { .. }));
     assert_eq!(st.members.values().filter(|m| m.name == "bob").count(), 1);
     let bob = fx.open("alice", Some("bob"));

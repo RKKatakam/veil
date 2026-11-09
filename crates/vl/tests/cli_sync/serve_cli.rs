@@ -164,6 +164,7 @@ impl Conn {
 
 fn cli_json(env: &Env, user: &str, dir: &Path, args: &[&str]) -> Value {
     let out = env.vl(user, dir, args);
+    assert!(out.status.success(), "vl {args:?}: {}", text(&out));
     let s = String::from_utf8(out.stdout.clone()).unwrap();
     assert_eq!(s.lines().count(), 1, "vl {args:?}: {}", text(&out));
     serde_json::from_str(&s).unwrap()
@@ -324,9 +325,16 @@ fn scan_gate_policy_must_lie_inside_the_repository() {
     assert_eq!(c.ok("scan", json!({"policy_from": "policy.txt"})), want);
     write(&env.root, "outside.txt", "");
     std::os::unix::fs::symlink(env.root.join("outside.txt"), alice.join("link.txt")).unwrap();
-    for bad in ["/etc/passwd", "../outside.txt", "link.txt", ".veil/repo.json", ".veil/local", "missing.txt"] {
+    for (bad, want_code) in [
+        ("/etc/passwd", -32602),
+        ("../outside.txt", -32602),
+        ("link.txt", -32602),
+        (".veil/repo.json", -32602),
+        (".veil/local", -32602),
+        ("missing.txt", -32000),
+    ] {
         let (code, e) = c.err("scan", json!({"policy_from": bad}));
-        assert!(code == -32602 || code == -32000, "{bad}: {e}");
+        assert_eq!(code, want_code, "{bad}: {e}");
     }
     let (code, _) = c.err("scan", json!({"policy_from": "policy.txt", "snapshot": true}));
     assert_eq!(code, -32602);
@@ -864,6 +872,7 @@ fn bug_360_concurrent_first_uses_share_one_identity() {
             .into_iter()
             .map(|k| {
                 let out = k.wait_with_output().unwrap();
+                assert!(out.status.success(), "{}", text(&out));
                 String::from_utf8_lossy(&out.stdout).lines().find(|l| l.starts_with("public key")).unwrap_or_default().to_string()
             })
             .collect();
