@@ -2882,7 +2882,7 @@ mod s14rd3_review {
         let (snaps, _) = chain_on(&th, &mut h, tip, f, path, 130, 52, 1_700_000_000_000);
         h.set_branch(&th, "main", *snaps.last().unwrap());
         let first = Viewer::default();
-        let second = Viewer { person: Some(800_953), admin: false, groups: HashSet::new() };
+        let second = Viewer { person: Some(800_953), admin: false, groups: HashSet::new(), only: None, agent: false };
         let p = h.project(&th);
         let vk = p.view(&first).key();
         assert_eq!(p.view(&second).key(), vk, "both outsiders have anyone on Earth's view key");
