@@ -211,11 +211,15 @@ What the command sees:
   ```
 
   Only these two device-local files count: nothing in the repository (a
-  teammate's tracked `config.toml`) can widen what an agent sees. The Veil
-  home, your project directory and cargo's credentials stay hidden even
-  inside an allowed folder, or behind an allowed link to one; a path
-  inside the Veil home or the project cannot be allowed. The command can
-  reach sockets and FIFOs in an allowed folder.
+  teammate's tracked `config.toml`) can widen what an agent sees. Your
+  project directory and cargo's credentials stay hidden even inside an
+  allowed folder, or behind an allowed link to one. **Veil's own folders**
+  (the Veil home, and the Veil daemon's store and socket, in `~/.cache/veil`
+  by default) are never shown: a folder that holds one (`--allow ~/.cache`,
+  `--allow ~`) is refused, and the message names narrower folders to allow
+  instead (`--allow ~/.cache/pip`); a path inside one, or inside the
+  project, cannot be allowed either. The command can reach sockets and
+  FIFOs in an allowed folder.
 * **Writes to the allow-list stay with the workspace.** Each allowed folder
   is shown through an overlay: your real `~/.cargo` underneath, unchanged,
   and the workspace's own layer on top, in
@@ -317,8 +321,8 @@ $ vl ws exec try-a --private-ports --seed ~/seeds/pg16:/var/lib/pg -- ./run-test
   vanishes when it exits, whatever stops it. Two runs on the same seed
   never see each other's writes. The layer lives in memory, and counts
   toward `--memory`. Both paths are absolute; `SRC` may not be `/`, your
-  home or a folder holding it, the Veil home, or the project (inside or
-  holding them); `DEST` may not be `/`, where the sandbox shows the
+  home or a folder holding it, the Veil home or the Veil daemon's folders,
+  or the project (inside or holding them); `DEST` may not be `/`, where the sandbox shows the
   project, or inside a folder the sandbox shows read-only (`/usr`, `/etc`,
   `/opt`, …). What the allow-list hides (cargo's `credentials.toml`) stays
   hidden in a seed too. A Postgres or Redis started inside the run on a seeded data

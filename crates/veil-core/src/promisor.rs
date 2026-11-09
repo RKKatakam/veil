@@ -96,6 +96,11 @@ pub struct Located {
     pub id: ObjectId,
     pub snapshot: ObjectId,
     pub path: String,
+    /// The same place as a chain of tree ids (S6, the Veil daemon): from
+    /// the snapshot's root tree down to the tree (or conflict) naming `id`,
+    /// empty for the root tree itself (`hub::grant::Chains`). `None` where
+    /// the place was not met in trees (an ancestor's or a tip's path).
+    pub chain: Option<Vec<ObjectId>>,
 }
 
 /// The connection of a thin clone to its server (`vl` implements it over
@@ -533,8 +538,9 @@ impl ObjectStore {
         }
     }
 
-    /// Where `id` was met: a snapshot and the path in its tree.
-    fn locate(&self, p: &Partial, id: &ObjectId) -> Result<Option<(ObjectId, String)>> {
+    /// Where `id` was met: a snapshot, the path in its tree, and the chain
+    /// of trees from its root ([`Located::chain`]).
+    fn locate(&self, p: &Partial, id: &ObjectId) -> Result<Option<(ObjectId, String, Vec<ObjectId>)>> {
         let first = p.locator.lock().unwrap_or_else(|e| e.into_inner()).get(id);
         match first {
             Some(place) => self.climb(p, *id, place),
@@ -542,10 +548,11 @@ impl ObjectStore {
         }
     }
 
-    /// The `(snapshot, path)` of `id` met at `first`: up through its
+    /// The `(snapshot, path, chain)` of `id` met at `first`: up through its
     /// parents' first places.
-    fn climb(&self, p: &Partial, id: ObjectId, first: (ObjectId, u32)) -> Result<Option<(ObjectId, String)>> {
+    fn climb(&self, p: &Partial, id: ObjectId, first: (ObjectId, u32)) -> Result<Option<(ObjectId, String, Vec<ObjectId>)>> {
         let mut names: Vec<String> = Vec::new();
+        let mut chain: Vec<ObjectId> = Vec::new();
         let mut cur = id;
         let mut next = Some(first);
         for _ in 0..=crate::tree::MAX_TREE_DEPTH + 2 {
@@ -562,12 +569,14 @@ impl ObjectStore {
                         return Ok(None);
                     }
                     names.reverse();
-                    return Ok(Some((parent, names.join("/"))));
+                    chain.reverse();
+                    return Ok(Some((parent, names.join("/"), chain)));
                 }
                 TERM => {
                     if self.conflict(&parent).map_or(true, |c| !c.referenced_ids().contains(&cur)) {
                         return Ok(None);
                     }
+                    chain.push(parent);
                     cur = parent
                 }
                 i => {
@@ -577,6 +586,7 @@ impl ObjectStore {
                     let t = self.tree_object(&parent)?;
                     let Some(e) = t.entries.get(i as usize).filter(|e| e.id == cur) else { return Ok(None) };
                     names.push(e.name.clone());
+                    chain.push(parent);
                     cur = parent;
                 }
             }
@@ -721,7 +731,7 @@ impl ObjectStore {
             return Err(VeilError::Missing(*id));
         }
         let wanted_snapshot = snapshot;
-        let Some((snapshot, path)) = self.locate(p, id)? else {
+        let Some((snapshot, path, chain)) = self.locate(p, id)? else {
             if wanted_snapshot {
                 // A snapshot beyond the boundary: recorded for `Repo::exact`.
                 p.hits.lock().unwrap_or_else(|e| e.into_inner()).insert(*id);
@@ -739,7 +749,7 @@ impl ObjectStore {
                 "'{shown}' is not fetched yet, and this command has no connection to the server of this thin clone"
             )));
         };
-        let mut got = promisor.fetch(&[Located { id: *id, snapshot, path: path.clone() }])?.pop().flatten();
+        let mut got = promisor.fetch(&[Located { id: *id, snapshot, path: path.clone(), chain: Some(chain) }])?.pop().flatten();
         // Refused at a place on the server whose own tree (as this clone
         // holds it) names this very object there: the server's "not yours"
         // for it, as much as under a snapshot on the server (milestone S8:
@@ -756,7 +766,7 @@ impl ObjectStore {
                 }
             }
             for t in places {
-                got = promisor.fetch(&[Located { id: *id, snapshot: t, path: path.clone() }])?.pop().flatten();
+                got = promisor.fetch(&[Located { id: *id, snapshot: t, path: path.clone(), chain: self.chain_held(&t, &path, id) }])?.pop().flatten();
                 if got.is_some() {
                     break;
                 }
@@ -776,6 +786,35 @@ impl ObjectStore {
         self.keep_fetched(p, id, &raw)?;
         p.fetched.fetch_add(1, Ordering::Relaxed);
         Ok(raw)
+    }
+
+    /// The chain of trees from snapshot `snap`'s root to the tree naming
+    /// `id` at `path` ([`Located::chain`]), as far as this clone holds its
+    /// trees (nothing is fetched to tell); `None` if they do not name it.
+    fn chain_held(&self, snap: &ObjectId, path: &str, id: &ObjectId) -> Option<Vec<ObjectId>> {
+        self.without_fetching(|| {
+            let s = self.snapshot(snap).ok()?;
+            let mut chain = Vec::new();
+            let mut cur = s.tree;
+            if !path.is_empty() {
+                for name in VPath::new(path).ok()?.components() {
+                    let t = self.tree_object(&cur).ok()?;
+                    let e = t.entries.iter().find(|e| e.name == name)?;
+                    chain.push(cur);
+                    cur = e.id;
+                }
+            }
+            if cur == *id {
+                return Some(chain);
+            }
+            // A conflict's term, served at the conflict's path: the chain
+            // ends with the conflict object.
+            let c = self.conflict(&cur).ok()?;
+            c.referenced_ids().contains(id).then(|| {
+                chain.push(cur);
+                chain
+            })
+        })
     }
 
     /// Does snapshot `snap`'s tree name `id` at `path`, as far as this clone
@@ -801,7 +840,7 @@ impl ObjectStore {
         if !self.fetching(p) {
             return Ok(());
         }
-        let at = self.locate(p, to)?;
+        let at = self.locate(p, to)?.map(|(snapshot, path, _)| (snapshot, path));
         self.prefetch_diff_from(p, from, to, at)
     }
 
@@ -815,7 +854,7 @@ impl ObjectStore {
         }
         let at = self
             .locate(p, root)?
-            .map(|(snapshot, base)| (snapshot, if base.is_empty() { path.as_str().to_string() } else { format!("{base}/{path}") }));
+            .map(|(snapshot, base, _)| (snapshot, if base.is_empty() { path.as_str().to_string() } else { format!("{base}/{path}") }));
         self.prefetch_diff_from(p, from, to, at)
     }
 
@@ -905,7 +944,7 @@ impl ObjectStore {
         while !by_id.is_empty() {
             let wants: Vec<(Located, u64)> = by_id
                 .iter()
-                .filter_map(|(id, size, paths)| paths.get(round).map(|path| (Located { id: *id, snapshot, path: path.clone() }, *size)))
+                .filter_map(|(id, size, paths)| paths.get(round).map(|path| (Located { id: *id, snapshot, path: path.clone(), chain: None }, *size)))
                 .collect();
             if wants.is_empty() {
                 break;
@@ -969,7 +1008,7 @@ impl ObjectStore {
             return Ok(());
         }
         match self.locate(p, root)? {
-            Some((snapshot, base)) => {
+            Some((snapshot, base, _)) => {
                 let join = |rel: &VPath| if base.is_empty() { rel.as_str().to_string() } else { format!("{base}/{rel}") };
                 self.ensure_at_paths(p, snapshot, paths.iter().map(|(path, id, size)| (*id, *size, join(path))).collect())
             }
@@ -987,11 +1026,11 @@ impl ObjectStore {
     /// on the server (BUG-1144). The object, or whether the server refused
     /// it there.
     fn fetch_here(&self, p: &Partial, promisor: &dyn Promisor, id: &ObjectId, snapshot: ObjectId, path: &str) -> Result<(Option<Vec<u8>>, bool)> {
-        let mut got = promisor.fetch(&[Located { id: *id, snapshot, path: path.to_string() }])?.pop().flatten();
+        let mut got = promisor.fetch(&[Located { id: *id, snapshot, path: path.to_string(), chain: self.chain_held(&snapshot, path, id) }])?.pop().flatten();
         let mut refused = got.is_none() && self.on_server(p, promisor, &snapshot);
         if got.is_none() && !refused {
             for t in self.server_ancestors(p, promisor, &snapshot) {
-                got = promisor.fetch(&[Located { id: *id, snapshot: t, path: path.to_string() }])?.pop().flatten();
+                got = promisor.fetch(&[Located { id: *id, snapshot: t, path: path.to_string(), chain: self.chain_held(&t, path, id) }])?.pop().flatten();
                 if got.is_some() {
                     break;
                 }
@@ -1015,7 +1054,7 @@ impl ObjectStore {
             return Err(VeilError::Missing(*id));
         }
         self.place_along(root, path);
-        let Some((snapshot, at)) = self.locate(p, id)?.filter(|(_, at)| at == path.as_str()) else {
+        let Some((snapshot, at, _)) = self.locate(p, id)?.filter(|(_, at, _)| at == path.as_str()) else {
             return Err(VeilError::Unavailable(format!("'{path}': its place could not be told; run the command again")));
         };
         let Some(promisor) = self.promisor() else {
@@ -1058,7 +1097,7 @@ impl ObjectStore {
         let mut wants = Vec::new();
         for (id, size) in missing {
             match self.locate(p, &id)? {
-                Some((snapshot, path)) => wants.push((Located { id, snapshot, path }, size)),
+                Some((snapshot, path, chain)) => wants.push((Located { id, snapshot, path, chain: Some(chain) }, size)),
                 // Read the ordinary way: `Unavailable` (never hidden).
                 None => {
                     self.read_raw(&id)?;
@@ -1092,7 +1131,13 @@ impl ObjectStore {
                     false => self.server_ancestors(p, promisor, &w.snapshot),
                 });
                 let snapshot = ancestors.iter().copied().find(|a| *a == w.snapshot || self.names_held(a, &w.path, &w.id)).unwrap_or(w.snapshot);
-                (Located { snapshot, ..w }, size)
+                // The chain the Veil daemon checks (S6), from the snapshot
+                // asked under, as this clone holds its trees.
+                let chain = match (&w.chain, snapshot == w.snapshot) {
+                    (Some(c), true) => Some(c.clone()),
+                    _ => self.chain_held(&snapshot, &w.path, &w.id),
+                };
+                (Located { snapshot, chain, ..w }, size)
             })
             .collect();
         wants.sort_by_key(|(w, _)| w.snapshot);

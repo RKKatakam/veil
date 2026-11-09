@@ -32,6 +32,30 @@ use veil_core::{
 
 use crate::render::{self, safe, warn, warn_untrusted};
 
+/// Every folder where Veil keeps a person's own state outside a project:
+/// the Veil home (identity, keys, sessions) and the Veil daemon's folders
+/// (its store of every object this user's thin clones read, and its
+/// socket; S6). **Confinement hides each of them** wherever a sandbox could
+/// show it (`confine.rs`: masked under every alias, an allowed path or a
+/// seed inside one refused), and Veil's own sandboxes never write through
+/// a link into one (`sandbox.rs`). A new Veil-owned location is added here,
+/// and only here (BUG-1512: the daemon's folders, outside the Veil home by
+/// default, were not hidden).
+///
+/// The daemon's folders are made (0700) if missing, so that a mask covers
+/// them before anything is put there.
+pub fn veil_private_dirs() -> Vec<PathBuf> {
+    let d = crate::daemon::paths();
+    let _ = d.prepare();
+    let all = [veil_home(), d.state, d.run];
+    // One inside another (the daemon's folders in a `VEIL_HOME`) is hidden
+    // with it.
+    let mut v: Vec<PathBuf> = all.iter().filter(|p| !all.iter().any(|q| q != *p && p.starts_with(q))).cloned().collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 pub fn veil_home() -> PathBuf {
     if let Some(h) = std::env::var_os("VEIL_HOME") {
         return PathBuf::from(h);

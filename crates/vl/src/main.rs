@@ -25,6 +25,7 @@ mod auto_gc;
 mod cli;
 mod confine;
 mod ctx;
+mod daemon;
 mod doctor;
 #[cfg(test)]
 mod docgen;
@@ -210,6 +211,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Identity(c) => cmd_identity(c),
         Cmd::Fsck { verbose } => cmd_fsck(cli.repository.as_deref(), *verbose),
         Cmd::Doctor => doctor::run(cli.repository.as_deref()),
+        Cmd::Daemon(c) => daemon::run(c),
         Cmd::Completions { shell } => {
             clap_complete::generate(*shell, &mut Cli::command(), "vl", &mut render::Out);
             Ok(ExitCode::SUCCESS)
@@ -299,6 +301,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         | Cmd::Identity(_)
         | Cmd::Fsck { .. }
         | Cmd::Doctor
+        | Cmd::Daemon(_)
         | Cmd::Completions { .. }
         | Cmd::Man { .. }
         | Cmd::Upgrade { .. }
