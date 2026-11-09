@@ -69,6 +69,9 @@ fn snap(parents: Vec<ObjectId>, i: usize, ts: i64, tree: ObjectId) -> Snapshot {
         predecessors: vec![],
         conflicts: vec![],
         embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
         signature: None,
     }
 }

@@ -1,0 +1,15 @@
+{
+  "format": 10,
+  "repo_id": "3675eb9c271a360419ad2e8ecf3280fb",
+  "remotes": {
+    "mirror": {
+      "url": "../public-mirror",
+      "public": true
+    },
+    "origin": {
+      "url": "../team-remote",
+      "public": false
+    }
+  },
+  "min_vl": "1.1.0"
+}

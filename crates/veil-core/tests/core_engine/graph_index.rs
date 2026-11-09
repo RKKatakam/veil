@@ -193,6 +193,9 @@ fn a_deep_history_is_indexed_iteratively() {
             predecessors: vec![],
             conflicts: vec![],
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         parent = tx.repo().store().put_snapshot(&s).unwrap();
@@ -281,6 +284,9 @@ fn bug_1381_an_older_layer_above_i64_max_keeps_its_children_above_it() {
         predecessors: vec![],
         conflicts: vec![],
         embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
         signature: None,
     };
     let mut tx = repo.transaction("far future").unwrap();

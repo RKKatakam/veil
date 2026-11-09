@@ -74,25 +74,34 @@ pub fn state_dir(root: &Path) -> std::path::PathBuf {
 /// | 7 | vl 1.1.0 | key rings of ring format 4: invites, shares by members, a member's removal of their own device (`docs/HUB.md` §13.12) |
 /// | 8 | vl 1.1.0 | only secret files are encrypted: no encrypted descriptions, tag messages, tag names, embargoes, folders or lines of work; plain embargo records (embargo record format 2) |
 /// | 9 | vl 1.1.0 | a thin clone of a server project ([`PARTIAL_FORMAT`]): the `partial` marker, objects fetched on demand into `.veil/cache/` |
+/// | 10 | vl 1.2.0 | agent attribution and attempts on snapshots (`Snapshot::{agent, abandoned, attempts}`); 1.2.0, because builds that already call themselves 1.1.0 read only up to format 9 (BUG-1379) |
 ///
-/// This build reads format 8 only. `vl upgrade` brings formats 6 and 7 to
-/// it, after checking that they hold nothing the removed encryption of
-/// non-secret content wrote; formats 1 to 5 are no longer supported. See
-/// `docs/FORMAT.md` and `docs/CRYPTO.md`.
-pub const REPO_FORMAT: u32 = 8;
+/// This build writes format 10 and opens formats 8 to 10: a format-8 or 9
+/// repository is read and written as it is, and refuses to store a
+/// format-10 snapshot ("run `vl upgrade`"). `vl upgrade` brings formats 6
+/// to 9 to it, after checking that 6 and 7 hold nothing the removed
+/// encryption of non-secret content wrote; formats 1 to 5 are no longer
+/// supported. See `docs/FORMAT.md` and `docs/CRYPTO.md`.
+pub const REPO_FORMAT: u32 = 10;
+
+/// The format from which only secret files are encrypted: older ones must
+/// be checked and upgraded before this build opens them.
+pub const ONLY_SECRETS_REPO_FORMAT: u32 = 8;
 
 /// Oldest repository format this build opens.
-pub const MIN_REPO_FORMAT: u32 = REPO_FORMAT;
+pub const MIN_REPO_FORMAT: u32 = ONLY_SECRETS_REPO_FORMAT;
 
-/// The format of a thin clone (`docs/HUB.md` §13.21): format 8 plus the
-/// `partial` marker in `repo.json`. Only `vl clone` writes it, for a thin
-/// clone; every other repository stays at [`REPO_FORMAT`], readable by the
-/// vl releases that read format 8. A vl that does not know format 9 refuses
-/// a thin clone instead of reading its unfetched objects as hidden.
+/// The first format that may hold the `partial` marker of a thin clone
+/// (`docs/HUB.md` §13.21): format 9 is format 8 plus the marker (S3's
+/// release wrote thin clones at it, and a format-9 repository always has
+/// one); format 10 has everything 9 has, so this release writes a thin
+/// clone at [`REPO_FORMAT`] with the marker. A vl that does not know format
+/// 9 refuses a thin clone by its number instead of reading its unfetched
+/// objects as hidden.
 pub const PARTIAL_FORMAT: u32 = 9;
 
 /// Newest repository format this build opens.
-pub const MAX_REPO_FORMAT: u32 = PARTIAL_FORMAT;
+pub const MAX_REPO_FORMAT: u32 = REPO_FORMAT;
 
 /// Default bound of a thin clone's object cache (`vl clone --cache-size`).
 pub const DEFAULT_CACHE_LIMIT: u64 = 4 << 30;
@@ -106,6 +115,7 @@ pub fn min_vl_for_format(format: u32) -> &'static str {
         0 | 1 => "0.1.0",
         2..=5 => "1.0.0",
         6..=9 => "1.1.0",
+        10 => "1.2.0",
         _ => "a newer release",
     }
 }
@@ -116,8 +126,8 @@ pub fn check_format_supported(format: u32) -> Result<()> {
     if format < MIN_REPO_FORMAT {
         return Err(VeilError::Unsupported(format!(
             "this repository uses format {format}, which may hold encrypted descriptions, tags, embargoes or folders; \
-             this vl encrypts secret files only and reads format {REPO_FORMAT}. Run `vl upgrade`: it checks the \
-             repository and moves it to format {REPO_FORMAT}"
+             this vl encrypts secret files only and reads formats {MIN_REPO_FORMAT} to {REPO_FORMAT}. Run `vl upgrade`: \
+             it checks the repository and moves it to format {REPO_FORMAT}"
         )));
     }
     Ok(())
@@ -128,7 +138,7 @@ pub fn check_format_supported(format: u32) -> Result<()> {
 pub fn check_format_upgradable(format: u32) -> Result<()> {
     if format > MAX_REPO_FORMAT {
         return Err(VeilError::Unsupported(format!(
-            "this repository uses format {format}, which needs a newer vl (this is vl {}, which reads formats {REPO_FORMAT} and {MAX_REPO_FORMAT})",
+            "this repository uses format {format}, which needs a newer vl (this is vl {}, which reads formats {MIN_REPO_FORMAT} to {MAX_REPO_FORMAT})",
             env!("CARGO_PKG_VERSION")
         )));
     }
@@ -162,9 +172,12 @@ pub struct RemoteConfig {
     /// `repo.json` files keep their bytes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub only: Option<String>,
+    /// Fields this build does not know, kept as they are ([`RepoConfig::unknown`]).
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, serde_json::Value>,
 }
 
-/// The `partial` marker of a thin clone (format [`PARTIAL_FORMAT`],
+/// The `partial` marker of a thin clone (format [`PARTIAL_FORMAT`] or later,
 /// device-local): objects not in the main store are fetched from the
 /// server of remote `remote` when read, into the cache area, which is kept
 /// under `cache_limit` bytes (`docs/HUB.md` §13.21).
@@ -188,16 +201,44 @@ pub struct RepoConfig {
     /// of releases that do not know the format yet ("needs vl ≥ X").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_vl: Option<String>,
-    /// A thin clone (format [`PARTIAL_FORMAT`] only; absent otherwise, so
-    /// other `repo.json` files keep their bytes).
+    /// A thin clone (format [`PARTIAL_FORMAT`] or later; absent otherwise,
+    /// so other `repo.json` files keep their bytes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial: Option<PartialConfig>,
+    /// Fields of `repo.json` this build does not know (a later release's),
+    /// kept as they are by every rewrite of the file. A repository that has
+    /// any is never opened or upgraded by this build
+    /// ([`RepoConfig::check_known`]): it would be half-understood (BUG-1390).
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, serde_json::Value>,
 }
 
 impl RepoConfig {
+    /// Error unless this build knows every field of `repo.json`, its
+    /// remotes' included: a field it does not know may change what the
+    /// repository means (format 9's `partial`: objects not fetched yet),
+    /// so it neither opens nor upgrades such a repository, and changes
+    /// nothing.
+    pub fn check_known(&self) -> Result<()> {
+        let mut names: Vec<String> = self.unknown.keys().map(|k| format!("{k:?}")).collect();
+        for (r, c) in &self.remotes {
+            names.extend(c.unknown.keys().map(|k| format!("{k:?} of remote {r:?}")));
+        }
+        if names.is_empty() {
+            return Ok(());
+        }
+        names.truncate(8);
+        Err(VeilError::Unsupported(format!(
+            "this repository's .veil/repo.json holds {} which this vl (format {REPO_FORMAT}) does not know; it needs a \
+             newer vl. Nothing was changed",
+            names.join(", ")
+        )))
+    }
+
     /// Error if this build cannot use the repository, naming the vl release
     /// it needs when the configuration says so.
     pub fn check_supported(&self) -> Result<()> {
+        self.check_known()?;
         check_format_supported(self.format).map_err(|e| match (&e, &self.min_vl) {
             (VeilError::Unsupported(_), Some(v)) if self.format > MAX_REPO_FORMAT => VeilError::Unsupported(format!(
                 "this repository uses format {} and needs vl {v} or later (this is vl {})",
@@ -213,13 +254,13 @@ impl RepoConfig {
     /// format, or format 9 without one, is a damaged `repo.json` (threat 14
     /// of `docs/design/scale/6-partial-clone.md`).
     pub fn check_partial(&self) -> Result<()> {
-        match (&self.partial, self.format == PARTIAL_FORMAT) {
-            (Some(_), false) => Err(VeilError::Corrupt(
+        match (&self.partial, self.format) {
+            (Some(_), f) if f < PARTIAL_FORMAT => Err(VeilError::Corrupt(
                 "repo.json".into(),
-                format!("a `partial` marker in a repository of format {} (only format {PARTIAL_FORMAT} has one)", self.format),
+                format!("a `partial` marker in a repository of format {f} (it needs format {PARTIAL_FORMAT} or later)"),
             )),
-            (None, true) => Err(VeilError::Corrupt("repo.json".into(), format!("format {PARTIAL_FORMAT} without its `partial` marker"))),
-            (Some(p), true) if p.remote.is_empty() => Err(VeilError::Corrupt("repo.json".into(), "a `partial` marker naming no remote".into())),
+            (None, PARTIAL_FORMAT) => Err(VeilError::Corrupt("repo.json".into(), format!("format {PARTIAL_FORMAT} without its `partial` marker"))),
+            (Some(p), _) if p.remote.is_empty() => Err(VeilError::Corrupt("repo.json".into(), "a `partial` marker naming no remote".into())),
             _ => Ok(()),
         }
     }
@@ -274,6 +315,8 @@ pub struct Repo {
     /// repositories, [`crate::maintenance::prune_epoch`]): a transaction
     /// that finds it changed checks the ids it carried in (BUG-811).
     pub(crate) prune_epoch: Option<Vec<u8>>,
+    /// [`Repo::set_attribution`].
+    pub(crate) attribution: Option<crate::object::Attribution>,
 }
 
 impl std::fmt::Debug for Repo {
@@ -429,6 +472,7 @@ impl Repo {
             remotes: BTreeMap::new(),
             min_vl: (format > 1).then(|| min_vl_for_format(format).to_string()),
             partial: None,
+            unknown: BTreeMap::new(),
         };
         let has_identity = identity.is_some();
         let keys = Arc::new(Keychain::new(backend.clone(), identity, config.repo_id.clone()));
@@ -509,6 +553,7 @@ impl Repo {
             command_ws: None,
             warnings: Vec::new(),
             prune_epoch: None,
+            attribution: None,
         })
     }
 
@@ -562,6 +607,7 @@ impl Repo {
             command_ws: None,
             warnings: Vec::new(),
             prune_epoch: None,
+            attribution: None,
         };
         // Reading the heads walks the op log (and may merge): registered for
         // gc's deletion fence meanwhile, so no operation it reads is pruned
@@ -1199,6 +1245,19 @@ impl Repo {
     /// command is repository-wide.
     pub fn set_command_workspace(&mut self, ws: Option<String>) {
         self.command_ws = ws;
+    }
+
+    /// The agent attribution every snapshot this process creates carries
+    /// (`Snapshot::agent`): set once by the CLI from `vl`'s own arguments and
+    /// environment, never from anything in the repository or a sandbox.
+    /// Rebases and duplicates keep each change's own.
+    pub fn set_attribution(&mut self, a: Option<crate::object::Attribution>) {
+        self.attribution = a;
+    }
+
+    /// [`Repo::set_attribution`].
+    pub fn attribution(&self) -> Option<&crate::object::Attribution> {
+        self.attribution.as_ref()
     }
 
     /// The workspace set by [`Repo::set_command_workspace`].

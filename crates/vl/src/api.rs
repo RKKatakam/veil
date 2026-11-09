@@ -860,6 +860,10 @@ pub struct LogEntry {
     /// The working-copy snapshot of the current workspace (`@`).
     pub current: bool,
     pub author: Option<String>,
+    /// Who produced the content: an agent, its task, prompt reference and
+    /// run (*optional*: absent when no agent is recorded).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<veil_core::object::Attribution>,
     pub timestamp: Option<String>,
     pub signature: Option<Sig>,
     /// Workspaces whose working copy this is.
@@ -1105,6 +1109,7 @@ impl LogEntries<'_> {
             root,
             current: Some(id) == self.current,
             author: (!root).then(|| s.author.clone()),
+            agent: s.agent.clone(),
             timestamp: if root { None } else { rfc3339(s.timestamp) },
             signature: (!root).then(|| sig(&repo.keys().snapshot_status_with(&s, &self.signers), &s)),
             workspaces: self.workspaces.remove(&id).unwrap_or_default(),
@@ -1472,6 +1477,17 @@ pub struct Show {
     pub embargo: Option<EmbargoInfo>,
     pub conflicts: Vec<String>,
     pub description: Option<String>,
+    /// Who produced the content (*optional*: absent when no agent is
+    /// recorded).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<veil_core::object::Attribution>,
+    /// This version is an abandoned attempt, for this reason (*optional*).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abandoned: Option<String>,
+    /// The change's recorded dead ends, oldest first (*optional*: absent
+    /// when there are none).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<AttemptInfo>,
     /// The snapshot's changes against its parents.
     pub diff: DiffBody,
     /// The merged parents' tree and the snapshot's tree.
@@ -1485,6 +1501,54 @@ pub struct Show {
     pub(crate) signature_status: Option<SignatureStatus>,
     #[serde(skip)]
     pub(crate) snapshot: Option<std::sync::Arc<Snapshot>>,
+}
+
+/// One recorded dead end of a change (`vl attempt drop`).
+#[derive(Serialize, Debug)]
+pub struct AttemptInfo {
+    pub snapshot_id: String,
+    pub snapshot_short: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<veil_core::object::Attribution>,
+    pub timestamp: Option<String>,
+    /// The paths the attempt changed, against its own parents.
+    pub files: Vec<String>,
+    /// Removed by `vl gc` or never fetched: only its id is known.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub missing: bool,
+}
+
+/// The attempts snapshot `s` lists, with what each changed.
+pub fn attempts_of(repo: &Repo, s: &Snapshot) -> Result<Vec<AttemptInfo>> {
+    let mut out = Vec::new();
+    for a in &s.attempts {
+        // As a full clone answers: a thin clone fetches an attempt it lacks.
+        let Some(at) = repo.exact().snapshot(a)? else {
+            out.push(AttemptInfo {
+                snapshot_id: a.hex(),
+                snapshot_short: a.short(),
+                reason: String::new(),
+                agent: None,
+                timestamp: None,
+                files: vec![],
+                missing: true,
+            });
+            continue;
+        };
+        let base = repo.parents_tree(&at.parents)?.tree;
+        let diff = diff_body_with(repo, &DiffTrees { from: base, to: at.tree, from_rev: *a, to_rev: *a }, true, &Renames::default())?;
+        out.push(AttemptInfo {
+            snapshot_id: a.hex(),
+            snapshot_short: a.short(),
+            reason: at.abandoned.clone().unwrap_or_default(),
+            agent: at.agent.clone(),
+            timestamp: rfc3339(at.timestamp),
+            files: diff.files.into_iter().map(|f| f.path).collect(),
+            missing: false,
+        });
+    }
+    Ok(out)
 }
 
 #[derive(Serialize, Debug)]
@@ -1551,6 +1615,9 @@ pub fn show_header(ctx: &Ctx, rev: &str, stat: bool) -> Result<Show> {
         embargo,
         conflicts: s.conflicts.clone(),
         description,
+        agent: s.agent.clone(),
+        abandoned: s.abandoned.clone(),
+        attempts: attempts_of(repo, &s)?,
         diff: DiffBody { stat, files: Vec::new(), renames_skipped: false, hidden: Vec::new() },
         base_tree: base,
         tree: s.tree,

@@ -19,6 +19,7 @@ macro_rules! eprintln {
     };
 }
 
+mod agent;
 mod api;
 mod attr_cmd;
 mod auto_gc;
@@ -38,6 +39,7 @@ mod picker;
 mod render;
 mod rewrite_cmd;
 mod search_cmd;
+mod session_cmd;
 mod stats_cmd;
 mod sandbox;
 mod serve;
@@ -355,6 +357,16 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
                     r => r?,
                 };
                 println!("{}  {}", dim(&fmt_time(s.timestamp)), one_line(&ctx.repo, &id));
+                if let Some(a) = &s.agent {
+                    println!("    {}", dim(&render::safe(&a.summary())));
+                }
+                // A recorded dead end (`vl attempt drop`), with its reason.
+                if let Some(r) = &s.abandoned {
+                    println!("    {}", render::yellow("abandoned attempt:"));
+                    for l in render::safe_lines(r) {
+                        println!("      {l}");
+                    }
+                }
                 cur = s.predecessors.first().copied();
             }
         }
@@ -402,6 +414,12 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             ctx.repo.abandon(id)?;
             println!("Abandoned {line}");
         }
+        Cmd::Attempt(AttemptCmd::Drop { rev, reason }) => {
+            let id = ctx.rev(rev)?;
+            let out = ctx.repo.drop_attempt(id, reason)?;
+            println!("Recorded attempt {}; the change starts again: {}", out.attempt.short(), one_line(&ctx.repo, &out.change));
+        }
+        Cmd::Session(SessionCmd::Agent { only, attribution }) => return session_cmd::agent(ctx, only, attribution),
         Cmd::Rebase { source, destination } => {
             let src = ctx.rev(source)?;
             let dest = destination.iter().map(|d| ctx.rev(d)).collect::<Result<Vec<_>>>()?;
@@ -2236,8 +2254,13 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
             record_only,
             mount,
             confine,
+            attribution,
             command,
         } => {
+            // The recorded snapshot carries the harness's attribution: from
+            // this process's own flags, never from the sandbox.
+            agent::set_from_args(attribution)?;
+            ctx.repo.set_attribution(agent::current()?);
             return sandbox::exec(
                 ctx,
                 &sandbox::Exec {

@@ -454,6 +454,19 @@ impl Api {
         Self::finish(r.send(body))
     }
 
+    /// `POST …/history` as this release's `vl` asks it: saying which
+    /// repository format it reads (BUG-1379).
+    pub fn history(&self, token: &str, project: &str, tips: &[ObjectId]) -> Reply {
+        let body = serde_json::to_vec(&serde_json::json!({"tips": tips.iter().map(|t| t.hex()).collect::<Vec<_>>()})).unwrap();
+        let auth = format!("Bearer {token}");
+        let format = veil_core::repo::REPO_FORMAT.to_string();
+        self.post_with(
+            &format!("/v1/projects/{project}/history"),
+            &body,
+            &[("authorization", &auth), (veil_core::hub::wire::FORMAT_HEADER, &format)],
+        )
+    }
+
     pub fn post_json(&self, token: Option<&str>, path: &str, v: &serde_json::Value) -> Reply {
         self.post(token, path, &serde_json::to_vec(v).unwrap(), true)
     }
@@ -804,7 +817,7 @@ impl<'a> Craft<'a> {
 
     pub fn with(api: &'a Api, token: String, identity: Identity, project: &str, branch: &str) -> Craft<'a> {
         let tip = api.tips(Some(&token), project).unwrap().branches[branch];
-        let h = api.post_json(Some(&token), &format!("/v1/projects/{project}/history"), &serde_json::json!({"tips": [tip.hex()]}));
+        let h = api.history(&token, project, &[tip]);
         let (_, raw) = h.frames().into_iter().find(|(id, _)| *id == tip).unwrap();
         let O::Snapshot(s) = O::decode(&raw).unwrap() else { panic!() };
         Craft {
@@ -904,6 +917,9 @@ impl<'a> Craft<'a> {
             predecessors: vec![],
             conflicts: vec![],
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         s.sign(&self.identity);
@@ -928,6 +944,9 @@ impl Craft<'_> {
             predecessors: vec![],
             conflicts: vec![],
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         s.sign(&self.identity);
@@ -949,6 +968,9 @@ impl Craft<'_> {
             predecessors: vec![],
             conflicts: vec![],
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         edit(&mut s);
@@ -1017,6 +1039,41 @@ impl Craft<'_> {
         self.root = self.set_at("", Some(self.root), &parts, entry);
     }
 
+    /// The entry at `path` in the crafter's tree, if any.
+    pub fn entry(&self, path: &str) -> Option<TreeEntry> {
+        let parts: Vec<&str> = path.split('/').collect();
+        let (mut dir, mut id) = (String::new(), self.root);
+        for (i, part) in parts.iter().enumerate() {
+            let e = self.tree(&dir, id).get(part).cloned()?;
+            if i + 1 == parts.len() {
+                return Some(e);
+            }
+            dir = if dir.is_empty() { part.to_string() } else { format!("{dir}/{part}") };
+            id = e.id;
+        }
+        None
+    }
+
+    /// Remove the entry at `path` (a file or a folder) from the crafter's tree.
+    pub fn remove(&mut self, path: &str) {
+        let parts: Vec<&str> = path.split('/').collect();
+        self.root = self.remove_at("", self.root, &parts);
+    }
+
+    fn remove_at(&mut self, dir: &str, tree: ObjectId, parts: &[&str]) -> ObjectId {
+        let mut t = self.tree(dir, tree);
+        if parts.len() > 1 {
+            let child = t.get(parts[0]).filter(|e| e.kind == K::Dir).map(|e| e.id).expect("a folder on the way");
+            let sub = if dir.is_empty() { parts[0].to_string() } else { format!("{dir}/{}", parts[0]) };
+            let id = self.remove_at(&sub, child, &parts[1..]);
+            t.remove(parts[0]);
+            t.insert(TreeEntry::dir(parts[0], id));
+        } else {
+            assert!(t.remove(parts[0]).is_some(), "nothing at {dir}/{}", parts[0]);
+        }
+        self.put(O::Tree(t))
+    }
+
     /// The root tree of snapshot `id` (one the crafter was given).
     pub fn tree_of(&self, id: ObjectId) -> ObjectId {
         let h = self.api.post_json(Some(&self.token), &format!("/v1/projects/{}/history", self.project), &serde_json::json!({"tips": [id.hex()]}));
@@ -1040,6 +1097,9 @@ impl Craft<'_> {
             predecessors: vec![],
             conflicts: vec![],
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         s.sign(&self.identity);

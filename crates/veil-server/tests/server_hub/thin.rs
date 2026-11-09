@@ -72,11 +72,12 @@ fn a_thin_clone_holds_the_tips_and_reads_the_rest_when_asked() {
     assert!(out.contains("thin"), "{out}");
     let full = admin.dir("full");
     admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
-    // Format 9 with its marker; the full clone stays at format 8.
+    // The newest format (10: S11; S3's release wrote 9) with the marker; the
+    // full clone at the same format without one.
     let c = repo_json(&thin);
-    assert_eq!(c["format"], 9, "{c}");
+    assert_eq!(c["format"], veil_core::repo::REPO_FORMAT, "{c}");
     assert_eq!(c["partial"]["remote"], "origin", "{c}");
-    assert_eq!(repo_json(&full)["format"], 8);
+    assert_eq!(repo_json(&full)["format"], veil_core::repo::REPO_FORMAT);
     assert!(repo_json(&full).get("partial").is_none());
     // No full graph: the main store holds the tip's snapshot, not the
     // history; no tree or file of an older snapshot was fetched.
@@ -118,6 +119,66 @@ fn a_thin_clone_holds_the_tips_and_reads_the_rest_when_asked() {
     let o = admin.run(&thin, &["fsck"]);
     let all = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
     assert!(o.status.success(), "{all}");
+}
+
+/// Every file under `dir`, with the BLAKE3 of its bytes.
+fn files_of(dir: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            if e.file_type().unwrap().is_dir() {
+                stack.push(e.path());
+            } else {
+                out.push((e.path().strip_prefix(dir).unwrap().display().to_string(), blake3::hash(&std::fs::read(e.path()).unwrap()).to_hex().to_string()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// S11 over S3 (BUG-1390's coordination): a thin clone of S3's release, at
+/// format 9 (a clone this release's clone code made, numbered as S3's
+/// release numbered it: the marker and everything fetched are its), is
+/// upgraded to format 10 by `vl upgrade`, keeping its `partial` marker byte
+/// for byte, its objects and its cache unchanged, and still reads what it
+/// has not fetched from the server.
+#[test]
+fn a_format_9_thin_clone_upgrades_to_10_keeping_its_marker_and_still_fetches() {
+    let hub = TestHub::start();
+    let (admin, _dir, name) = project_with_history(&hub, 12, 2_000);
+    let thin = admin.dir("thin9");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    let full = admin.dir("full9");
+    admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
+    let path = thin.join(".veil/repo.json");
+    let mut c = repo_json(&thin);
+    assert!(c["partial"].is_object(), "control: a thin clone: {c}");
+    c["format"] = serde_json::json!(veil_core::repo::PARTIAL_FORMAT);
+    c["min_vl"] = serde_json::json!(veil_core::repo::min_vl_for_format(veil_core::repo::PARTIAL_FORMAT));
+    std::fs::write(&path, serde_json::to_vec_pretty(&c).unwrap()).unwrap();
+    let marker = serde_json::to_vec(&c["partial"]).unwrap();
+    let stored = |d: &Path| [files_of(&d.join(".veil/objects")), files_of(&d.join(".veil/cache"))];
+    // Format 9 works as it is; then the upgrade.
+    admin.ok(&thin, &["status"]);
+    let before = stored(&thin);
+    assert!(!before[1].is_empty(), "control: the thin clone's cache holds what the checkout fetched");
+    let out = admin.ok(&thin, &["upgrade"]);
+    assert!(out.contains("10"), "{out}");
+    let after = repo_json(&thin);
+    assert_eq!(after["format"], veil_core::repo::REPO_FORMAT, "{after}");
+    assert_eq!(serde_json::to_vec(&after["partial"]).unwrap(), marker, "the marker changed: {after}");
+    assert_eq!(stored(&thin), before, "the upgrade rewrote or dropped an object");
+    // What it has not fetched (an old snapshot's trees and files) it reads
+    // from the server, as a full clone shows it.
+    let ids = log_ids(&admin, &full);
+    let first = &ids[ids.len() - 2];
+    assert_eq!(admin.ok(&thin, &["show", first]), admin.ok(&full, &["show", first]));
+    assert_ne!(stored(&thin), before, "nothing was fetched for the old snapshot");
+    let o = admin.run(&thin, &["fsck"]);
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
 }
 
 /// Offline is not a mode: with the server gone, what needs it fails with a
@@ -167,7 +228,7 @@ fn a_thin_clone_receives_nothing_its_person_may_not_see() {
     assert_no_marker(&items, &restricted_markers(), "dev's thin clone");
     assert!(has_marker(&items, PUBLIC_MARK), "the thin clone holds what dev may see");
     p.dev.ok(&d, &["partial", "full"]);
-    assert_eq!(repo_json(&d)["format"], 8);
+    assert_eq!(repo_json(&d)["format"], veil_core::repo::REPO_FORMAT);
     assert_no_marker(&everything_in(&d), &restricted_markers(), "dev's widened clone");
     // A thin clone of an outsider: public folders only.
     let anyone = hub.anyone();
@@ -210,7 +271,7 @@ fn the_cache_stays_under_its_bound() {
     assert!(st.contains("object cache"), "{st}");
 }
 
-/// `vl partial full`: every snapshot and object, then format 8; local work
+/// `vl partial full`: every snapshot and object, then the newest format (10); local work
 /// kept; the clone then needs no server for history.
 #[test]
 fn partial_full_makes_an_ordinary_clone() {
@@ -222,7 +283,7 @@ fn partial_full_makes_an_ordinary_clone() {
     admin.ok(&thin, &["commit", "-m", "not pushed"]);
     admin.ok(&thin, &["partial", "full"]);
     let c = repo_json(&thin);
-    assert_eq!(c["format"], 8, "{c}");
+    assert_eq!(c["format"], veil_core::repo::REPO_FORMAT, "{c}");
     assert!(c.get("partial").is_none(), "{c}");
     assert!(!thin.join(".veil/cache").exists());
     let ids = log_ids(&admin, &thin);
@@ -258,7 +319,7 @@ fn history_answers_pages() {
 
 // ---- S3 cycle 1 review (`docs/BUGS.md`, "S3 cycle 1") --------------------
 
-/// `vl partial full` leaves a format-8 clone holding every object its
+/// `vl partial full` leaves a full clone (format 10) holding every object its
 /// history reaches (after it, nothing is fetched and a missing object reads
 /// as hidden), even when the working copy's snapshots rebuilt a tree the
 /// server has (the widening pull does not walk a tree the main store holds)
@@ -284,7 +345,7 @@ fn partial_full_keeps_what_a_rebuilt_tree_reaches() {
     admin.commit_main(&thin, "drop data");
     admin.ok(&thin, &["push"]);
     admin.ok(&thin, &["partial", "full"]);
-    assert_eq!(repo_json(&thin)["format"], 8);
+    assert_eq!(repo_json(&thin)["format"], veil_core::repo::REPO_FORMAT);
     drop(hub);
     let o = admin.run(&thin, &["fsck"]);
     let fsck = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
@@ -1740,6 +1801,9 @@ mod one_generation_arithmetic {
             predecessors: vec![],
             conflicts: vec![],
             embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         }
     }

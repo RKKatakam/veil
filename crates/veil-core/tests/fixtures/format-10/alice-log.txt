@@ -1,0 +1,31 @@
+@  uvpksxtq alice ✓ 2026-11-08 03:33:38 default@ 4d842ec8 (empty)
+│  (no description set)
+○  qnwkwlxw alice ✓ 2026-11-08 03:33:38 agent-work mirror/agent-work origin/agent-work 1e533dfd
+│  lease, second try
+│  agent: fixture-agent/1.0 · task: lease fix · run: run-10
+│ ○  yuswptky alice ✓ 2026-11-08 03:33:36 main a8e96bb1 (empty) [embargo:0abbaf49c4]
+│ │ │  Fix B (embargoed)  ⇠ merges opqysqqw, kutyvzpz
+│ │ ○  kutyvzpz alice ✓ 2026-11-08 03:33:36 fix-b@ 02cd356b
+│ │ │  (no description set)
+│ │ │ ×  vqowoxos alice ✓ 2026-11-08 03:33:36 link-conflict mirror/link-conflict origin/link-conflict ce3bec49 (conflict)
+│ │ │ │  a link/file conflict
+│ │ │ ○  lqxsquku alice ✓ 2026-11-08 03:33:36 links team-release v5.0 mirror/links mirror/team-release mirror/v5.0 origin/links origin/team-release origin/v5.0 b8939fbb
+│ │ │ │  format 5: symlinks
+│ │ │ │ ×  rmwoqpqz alice ✓ 2026-11-08 03:33:35 conflicted mirror/conflicted origin/conflicted 5caf2153 (conflict)
+│ │ │ │ │ │  keep side b's strings.rs  ⇠ merges opzuxsyt, ywpoxovp
+│ │ │ │ │ ○  ywpoxovp alice ✓ 2026-11-08 03:33:35 side-b@ 22f052eb
+│ │ │ │ │ │  (no description set)
+│ │ │ │ ○ │  opzuxsyt alice ✓ 2026-11-08 03:33:35 side-a@ b40414d2
+│ │ │ │ │ │  (no description set)
+│ ○          opqysqqw alice ✓ 2026-11-08 03:33:35 7659e6ed
+│ │  third: loose objects
+│ ○  nloqzkmv alice ✓ 2026-11-08 03:33:35 cc069cb2 (empty) [embargo:14a1d6175a released]
+│ │  Fix A (released)  ⇠ merges uqxsynyv, ynzuwlso
+○ │  ynzuwlso alice ✓ 2026-11-08 03:33:34 fix-a@ team-only mirror/team-only origin/team-only 4281e072
+│ │  (no description set)
+○    uqxsynyv alice ✓ 2026-11-08 03:33:34 11bb815d
+│  second: edit docs and notes
+○  rzkpnxus alice ✓ 2026-11-08 03:33:33 467eeb88
+│  initial import
+◆  zzzzzzzz 72edc798
+   root()

@@ -332,6 +332,7 @@ fn a_view_carries_the_epochs_it_was_built_under() {
                 id: person,
                 name: p.fin.name.clone(),
                 device_key: device_key.clone(),
+                agent: None,
             }),
             epochs,
         }

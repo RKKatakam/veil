@@ -47,6 +47,15 @@ pub const PROTOCOL: u32 = 1;
 /// snapshots of the caller's history by id prefix ([`Resolved`]); 6,
 /// `q/generations` gives their generations ([`Generations`]).
 pub const REVISION: u32 = 6;
+
+/// The request header in which `vl` says the newest repository format it
+/// reads (`repo::REPO_FORMAT`). A client that sends none is taken to read
+/// format 8 (the releases before format 10): the server refuses to send it
+/// history holding a newer snapshot, and says to update `vl`, instead of
+/// sending what it would report as a corrupt object (BUG-1379).
+pub const FORMAT_HEADER: &str = "veil-format";
+/// What a client that sends no [`FORMAT_HEADER`] reads.
+pub const FORMAT_WITHOUT_HEADER: u32 = 8;
 /// Largest object a frame may carry.
 pub const MAX_FRAME_OBJECT: usize = 1 << 30;
 /// Most objects one fetch request may name.

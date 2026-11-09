@@ -1002,6 +1002,8 @@ pub async fn memo_tips(hub: &Arc<Hub>, project_id: i64, branches: &[String]) -> 
                 person: Some(person),
                 admin: false,
                 groups,
+                only: None,
+                agent: false,
             });
         }
     }

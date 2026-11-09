@@ -12,7 +12,7 @@ pub const VERSION: &str = concat!(
     env!("VL_GIT_COMMIT"),
     ", repository format ",
     // Kept in step with `veil_core::repo::REPO_FORMAT_VERSION` by a test.
-    "8",
+    "10",
     ")"
 );
 
@@ -21,7 +21,7 @@ pub const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\ncommit: ",
     env!("VL_GIT_COMMIT"),
-    "\nrepository format: 8",
+    "\nrepository format: 10",
     "\ntarget: ",
     env!("VL_TARGET"),
 );
@@ -131,6 +131,9 @@ pub enum Cmd {
         /// or `-` to read it from standard input (safer on a shared machine).
         link: String,
     },
+    /// Sessions on the project's server for agents (`vl session agent`).
+    #[command(subcommand)]
+    Session(SessionCmd),
     /// One pass of the background key sharing (run by vl itself).
     #[command(hide = true)]
     ShareKeys,
@@ -372,6 +375,10 @@ pub enum Cmd {
         #[arg(default_value = "@")]
         rev: String,
     },
+    /// Recorded dead ends: keep an abandoned attempt on its change, with
+    /// why it failed, instead of erasing it.
+    #[command(subcommand)]
+    Attempt(AttemptCmd),
     /// Move a change (and its descendants) onto new parents.
     Rebase {
         /// Change to move; its descendants follow.
@@ -1214,6 +1221,49 @@ pub enum ScopeCmd {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum AttemptCmd {
+    /// Record REV's content as an abandoned attempt, with its reason, and
+    /// start the change again from its parents.
+    ///
+    /// The attempt stays on the change: `vl show` lists it ("Discarded
+    /// attempts"), `vl evolog` shows it, and it is pushed and seen by
+    /// exactly the people who see the change, so a later agent or reviewer
+    /// sees what was tried and why it failed. It never lands and is never
+    /// built on. A change keeps at most 32 attempts, each reason at most
+    /// 64 KiB; they go when the change is abandoned.
+    Drop {
+        /// The change whose attempt to drop.
+        #[arg(default_value = "@")]
+        rev: String,
+        /// Why the attempt failed.
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+/// `vl session`.
+#[derive(Subcommand, Debug)]
+pub enum SessionCmd {
+    /// Make an agent session on the project's server (origin), for a
+    /// harness, and print it as JSON.
+    ///
+    /// The session is made from yours: it lasts at most 12 hours (never
+    /// past your own session), sees at most what you see in this project,
+    /// and with --only less (files are read and written only at or below
+    /// those paths; history is yours). Commits through the API with it
+    /// carry its attribution, which the server stamps. Nobody stores or
+    /// rotates it: make a new one per run. An agent session cannot change
+    /// access, devices, invites, key rings or shares, nor make sessions.
+    Agent {
+        /// Narrow the session to these folders or files (from the project root).
+        #[arg(long, value_name = "PATH", num_args = 1..)]
+        only: Vec<String>,
+        #[command(flatten)]
+        attribution: crate::agent::AgentArgs,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum WsCmd {
     /// List workspaces.
     List {
@@ -1300,6 +1350,8 @@ pub enum WsCmd {
         mount: bool,
         #[command(flatten)]
         confine: Box<crate::confine::ConfineArgs>,
+        #[command(flatten)]
+        attribution: crate::agent::AgentArgs,
         /// Command and arguments.
         #[arg(last = true, required_unless_present = "record_only")]
         command: Vec<String>,

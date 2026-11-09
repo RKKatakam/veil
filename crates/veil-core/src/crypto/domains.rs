@@ -214,6 +214,13 @@ pub const POLICY_RULE_SCOPE: &str = "veil 2026 policy rule-scope v1";
 /// hex): part of the share's labels. Not secret.
 pub const HUB_SHARE_ID: &str = "veil 2026 hub share-id v1";
 
+/// BLAKE3 `derive_key` context of the hash under which a Veil server keeps
+/// an agent session's token (`docs/HUB.md` §13.27). A person's session is
+/// kept under the plain BLAKE3 of its token: a server that predates agent
+/// sessions, looking a token up that way, never finds an agent session's
+/// row, so it never takes one for its person's own session (BUG-1376).
+pub const HUB_AGENT_SESSION: &str = "veil 2026 hub agent-session v1";
+
 /// Every BLAKE3 `derive_key` context, for the uniqueness test.
 pub const BLAKE3_CONTEXTS: &[&str] = &[
     LEGACY_SIV_NONCE,
@@ -231,6 +238,7 @@ pub const BLAKE3_CONTEXTS: &[&str] = &[
     POLICY_RULE_SCOPE,
     HUB_PROJECT_FINGERPRINT,
     HUB_SHARE_ID,
+    HUB_AGENT_SESSION,
 ];
 
 #[cfg(test)]
@@ -254,7 +262,8 @@ mod tests {
                 "veil 2026 hub invite-key v1",
                 "veil 2026 policy rule-scope v1",
                 "veil 2026 hub project-fingerprint v1",
-                "veil 2026 hub share-id v1"
+                "veil 2026 hub share-id v1",
+                "veil 2026 hub agent-session v1"
             ],
             "a context changed or was reordered"
         );

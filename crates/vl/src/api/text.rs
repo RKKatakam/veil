@@ -362,6 +362,9 @@ fn log_entry(e: &LogEntry, lanes: &mut Vec<Option<ObjectId>>) {
             String::new()
         };
         println!("{line2_prefix} {desc}{merge}");
+        if let Some(a) = &e.agent {
+            println!("{line2_prefix} {}", dim(&safe(&a.summary())));
+        }
         if let Some(files) = &e.files {
             let shown: Vec<String> = files.iter().map(|f| safe(f).into_owned()).collect();
             println!("{line2_prefix} {}", dim(&format!("matched in: {}", shown.join(", "))));
@@ -525,6 +528,21 @@ pub fn show(repo: &Repo, s: &Show, r: &Renames) -> Result<()> {
     println!("Change ID : {}", bold(&magenta(&s.change_id)));
     println!("Snapshot  : {}", blue(&s.snapshot_id));
     println!("Author    : {} at {}", safe(&s.author), fmt_time(s.timestamp_ms));
+    if let Some(a) = &s.agent {
+        println!("Agent     : {}", safe(&a.agent));
+        if let Some(t) = &a.task {
+            println!("Task      : {}", safe(&t.replace(['\n', '\t'], " ")));
+        }
+        if let Some(p) = &a.prompt {
+            println!("Prompt    : {}", safe(&p.replace(['\n', '\t'], " ")));
+        }
+        if let Some(r) = &a.run {
+            println!("Run       : {}", safe(r));
+        }
+    }
+    if let Some(r) = &s.abandoned {
+        println!("Abandoned : {}", yellow(&safe(&first_line(r))));
+    }
     if let (Some(st), Some(snap)) = (&s.signature_status, &s.snapshot) {
         println!("Signature : {}", signature_detail(st, snap));
     }
@@ -562,7 +580,31 @@ pub fn show(repo: &Repo, s: &Show, r: &Renames) -> Result<()> {
         }
     }
     println!();
+    if !s.attempts.is_empty() {
+        println!("Discarded attempts ({}):", s.attempts.len());
+        for a in &s.attempts {
+            attempt_line(a);
+        }
+        println!();
+    }
     diff(repo, &s.base_tree, &s.tree, s.diff.stat, r)
+}
+
+/// One recorded attempt, as `vl show` and `vl evolog` list it.
+pub fn attempt_line(a: &AttemptInfo) {
+    if a.missing {
+        println!("  {} {}", blue(&a.snapshot_short), dim("(removed by `vl gc`, or not fetched)"));
+        return;
+    }
+    let who = a.agent.as_ref().map(|g| format!(" {}", dim(&safe(&g.summary())))).unwrap_or_default();
+    println!("  {}{who}", blue(&a.snapshot_short));
+    for l in safe_lines(&a.reason) {
+        println!("    {l}");
+    }
+    if !a.files.is_empty() {
+        let shown: Vec<String> = a.files.iter().map(|f| safe(f).into_owned()).collect();
+        println!("    {}", dim(&format!("changed: {}", shown.join(", "))));
+    }
 }
 
 // ---- lists -----------------------------------------------------------------------

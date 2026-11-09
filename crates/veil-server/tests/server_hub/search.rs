@@ -419,6 +419,9 @@ fn search_finds_secrets_by_name_only() {
         predecessors: vec![],
         conflicts: vec![],
         embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
         signature: None,
     };
     let raw = Object::Snapshot(s).encode();

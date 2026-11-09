@@ -189,6 +189,15 @@ pub struct ChangeParts {
 }
 
 /// What [`Repo::split`] made.
+/// What [`Repo::drop_attempt`] wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DroppedAttempt {
+    /// The abandoned snapshot that records the attempt.
+    pub attempt: ObjectId,
+    /// The change's new version, started again from its parents.
+    pub change: ObjectId,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SplitResult {
     /// The new change with the chosen part, on the original's parents.
@@ -309,6 +318,54 @@ impl Repo {
         Ok(new)
     }
 
+    /// Record change `id`'s content as an abandoned attempt with `reason`,
+    /// and start the change again from its parents (`vl attempt drop`,
+    /// `docs/design/server/phase-2-thin-clients.md` §5.6).
+    ///
+    /// The attempt is a copy of the version `id` with `abandoned` set
+    /// (signed by this identity, its attribution kept); the change's new
+    /// version has its parents' content, names the attempt as its
+    /// predecessor and lists it, after the attempts it had, in `attempts`.
+    /// Descendants are rebased onto the new version. At most
+    /// [`crate::object::MAX_ATTEMPTS`] attempts per change.
+    pub fn drop_attempt(&mut self, id: ObjectId, reason: &str) -> Result<DroppedAttempt> {
+        if id == self.root_id {
+            return Err(VeilError::repo("the root snapshot has no attempts"));
+        }
+        crate::object::validate_reason(reason).map_err(VeilError::repo)?;
+        let mut tx = self.transaction("attempt drop")?;
+        let s = tx.repo().snapshot(&id)?;
+        if s.attempts.len() >= crate::object::MAX_ATTEMPTS {
+            return Err(VeilError::repo(format!(
+                "change {} already keeps {} attempts, the most a change keeps; start a new change (`vl new`) \
+                 or abandon this one (`vl abandon`)",
+                s.change_id.short(),
+                crate::object::MAX_ATTEMPTS
+            )));
+        }
+        let base = tx.repo().parents_tree(&s.parents)?;
+        if base.tree == s.tree {
+            return Err(VeilError::repo(format!(
+                "change {} is empty: there is no attempt to drop",
+                s.change_id.short()
+            )));
+        }
+        let mut attempt = (*s).clone();
+        attempt.abandoned = Some(reason.to_string());
+        attempt.attempts = vec![];
+        let attempt_id = tx.repo.store.put_snapshot(&tx.signed(&attempt))?;
+        let mut ns = (*s).clone();
+        ns.tree = base.tree;
+        ns.conflicts = base.conflicts.iter().map(|p| p.to_string()).collect();
+        ns.predecessors = vec![attempt_id];
+        ns.attempts.push(attempt_id);
+        ns.timestamp = now_millis();
+        let new = tx.rewrite(id, ns)?;
+        tx.set_description(format!("drop an attempt of change {}", s.change_id.short()));
+        tx.commit()?;
+        Ok(DroppedAttempt { attempt: attempt_id, change: new })
+    }
+
     /// Describe the working copy and start a fresh change on top of it,
     /// moving tags as [`Repo::commit`] does with `advance`. Returns
     /// `(committed, new working copy)`.
@@ -377,6 +434,7 @@ impl Repo {
             }
         }
         let mut tx = self.transaction("rebase")?;
+        tx.keep_attribution();
         let s = tx.repo().snapshot(&source)?;
         let out = tx.repo().rebase_tree(&s.parents, &dest, s.tree)?;
         let mut ns = (*s).clone();
@@ -461,6 +519,9 @@ impl Repo {
             predecessors: vec![id],
             conflicts: moved_conflicts(&store, &s, &h.chosen),
             embargo: None,
+            agent: s.agent.clone(),
+            abandoned: None,
+            attempts: vec![],
             signature: None,
         };
         let first_id = tx.write_snapshot(&first)?;
@@ -721,6 +782,9 @@ impl Repo {
             predecessors: vec![],
             conflicts: conflicts.clone(),
             embargo: embargo_id.clone(),
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
             signature: None, // signed by the transaction
         };
         let m = tx.write_snapshot(&snap)?;

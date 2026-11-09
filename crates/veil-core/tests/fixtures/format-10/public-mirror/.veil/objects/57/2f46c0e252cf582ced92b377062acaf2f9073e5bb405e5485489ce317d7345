@@ -1,0 +1,2 @@
+veil:atag
+{"name":"team-release","target":"b8939fbb980f9057558894d1d915a9e2b740045183f54eb2513492269b05b10f","kind":"annotated","message":{"plain":"team-only release notes: the acme merger\n"},"tagger":"alice","timestamp":1794108816415,"signature":{"signer":"veil1a8d32d59d66b4e82d1bc90f3f146fa097f0eb3f9cee3bd1016c68aa188d9e57d","key":"e4535c8574e6cf3c695a86bc6ecf9bb2d79f6c83693f3b82acb7950a6b03fd7f","sig":"8f6946ad28d8e21995cceadd40e846db84256d08873781842fae253f2647343ae9bf1a6d3f346625c9f714bbb077d490afe847b721e244919f7d7fdf03ad2e02"}}

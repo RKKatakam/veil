@@ -207,7 +207,16 @@ fn viewer_bytes(v: &Viewer) -> usize {
 }
 
 fn session_bytes(e: &SessionEntry) -> usize {
-    ENTRY + 64 + string_bytes(&e.person.name) + string_bytes(&e.person.device_key)
+    let agent = e.person.agent.as_ref().map_or(0, |a| {
+        let t = &a.attribution;
+        ENTRY
+            + string_bytes(&t.agent)
+            + t.task.as_ref().map_or(0, |x| string_bytes(x))
+            + t.prompt.as_ref().map_or(0, |x| string_bytes(x))
+            + t.run.as_ref().map_or(0, |x| string_bytes(x))
+            + a.only.as_ref().map_or(0, |o| o.iter().map(|x| string_bytes(x) + 24).sum())
+    });
+    ENTRY + 64 + string_bytes(&e.person.name) + string_bytes(&e.person.device_key) + agent
 }
 
 /// What a project's branch rows hold.
@@ -507,6 +516,7 @@ mod tests {
             id,
             name: format!("p{id}"),
             device_key: device.into(),
+            agent: None,
         }
     }
 

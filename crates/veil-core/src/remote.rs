@@ -454,7 +454,8 @@ pub(crate) fn ancestors_in(store: &ObjectStore, tips: &[ObjectId]) -> Result<Vec
             continue;
         }
         match store.snapshot(&id) {
-            Ok(s) => stack.extend(s.parents.iter().copied()),
+            // Attempts (format 10) travel with the version that lists them.
+            Ok(s) => stack.extend(s.parents.iter().chain(&s.attempts).copied()),
             Err(VeilError::Missing(_)) => continue,
             Err(e) => return Err(e),
         }
@@ -754,7 +755,7 @@ pub(crate) fn push_closure(local: &Repo, tips: &[ObjectId], withheld: &Withheld)
             Err(VeilError::Missing(_)) => continue,
             Err(e) => return Err(e),
         };
-        stack.extend(s.parents.iter().copied());
+        stack.extend(s.parents.iter().chain(&s.attempts).copied());
         out.push(id);
     }
     Ok(Ok(out))
@@ -855,6 +856,7 @@ pub fn add_remote(repo: &mut Repo, name: &str, url: &str) -> Result<()> {
                 url: url.to_string(),
                 public: false,
                 only: None,
+                unknown: Default::default(),
             },
         );
         Ok(())
