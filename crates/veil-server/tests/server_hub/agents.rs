@@ -1717,3 +1717,373 @@ fn a_narrowed_session_never_merges_a_parent_whose_changes_lie_outside_its_paths(
     assert_eq!(r.status, 200, "{}", body(&r));
     assert_eq!(r.json()["results"][0]["is_ancestor"], false, "the draft is now merged into main without its change");
 }
+
+// ---- S11 redesign review, cycle 2 (s11r5): guarantees of the five fixes -----------------
+
+/// Rule 1 for `rings`, `rings/{scope}` and `shares`, with one scope whose
+/// secrets lie both inside and outside a narrowing (`src/`'s rule decides
+/// `src/api/.env` and `src/tools/.env`): the narrowed session gets that
+/// scope's ring exactly as its person does (its secrets inside need it),
+/// no other scope (billing's is answered as a ring that does not exist),
+/// and only the shares of files inside its paths. Its person gets them all
+/// (the control).
+#[test]
+fn a_narrowed_sessions_rings_and_shares_are_its_persons_limited_to_its_paths() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let (a, api) = (&p.dir, hub.api());
+    write_files(a, &[("src/api/.env", "API=MARKER-API-ENV-5b1e"), ("src/tools/.env", "TOOLS=MARKER-TOOLS-ENV-7c2f")]);
+    p.admin.commit_main(a, "two secrets under src/");
+    p.admin.ok(a, &["push"]);
+    let bill_env = format!("{BILL_DIR}/.env");
+    for path in ["src/api/.env", "src/tools/.env", bill_env.as_str()] {
+        p.admin.ok(a, &["secret", "share", path, "--with", &p.dev.name]);
+    }
+    let policy = veil_core::hub::access::AccessPolicy::parse(&std::fs::read_to_string(a.join(".veilpolicy")).unwrap());
+    let (src_scope, bill_scope) = (veil_core::policy::rule_scope(&policy, "src/api/.env"), veil_core::policy::rule_scope(&policy, &bill_env));
+    assert_eq!(src_scope, veil_core::policy::rule_scope(&policy, "src/tools/.env"), "one scope inside and outside the narrowing");
+    assert_ne!(src_scope, bill_scope);
+    let (dev, narrow) = (p.dev.token(), agent_token(&hub, &p.dev.token(), &p.name, &["src/api"]));
+    let rings = |t: &str| -> Vec<Value> {
+        let r = api.get(Some(t), &format!("/v1/projects/{}/rings", p.name));
+        assert_eq!(r.status, 200, "{}", body(&r));
+        r.json().as_array().unwrap().clone()
+    };
+    let scopes = |v: &[Value]| v.iter().map(|r| r["scope"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let (mine, its) = (rings(&dev), rings(&narrow));
+    assert!(scopes(&mine).contains(&src_scope) && scopes(&mine).contains(&bill_scope), "control: the person's rings: {:?}", scopes(&mine));
+    assert_eq!(scopes(&its), vec![src_scope.clone()], "the narrowed session's rings");
+    assert_eq!(its[0], mine.iter().find(|r| r["scope"] == src_scope.as_str()).unwrap().clone(), "the ring differs from its person's");
+    // `rings/{scope}`: inside, the person's ring; outside, as one that does not exist.
+    let ring = |t: &str, s: &str| api.get(Some(t), &format!("/v1/projects/{}/rings/{s}", p.name));
+    let r = ring(&narrow, &src_scope);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json(), its[0]);
+    let r = ring(&dev, &bill_scope);
+    assert_eq!(r.status, 200, "control: the person reads billing's ring: {}", body(&r));
+    let none = "rule-00000000000000000000";
+    let (outside, missing) = (ring(&narrow, &bill_scope), ring(&narrow, none));
+    assert_eq!(missing.status, 404, "{}", body(&missing));
+    assert_eq!((outside.status, body(&outside).replace(&bill_scope, "S")), (missing.status, body(&missing).replace(none, "S")), "billing's ring is told from one that does not exist");
+    // `shares`: only those of files inside.
+    let shares = |t: &str| -> Vec<String> {
+        let r = api.get(Some(t), &format!("/v1/projects/{}/shares", p.name));
+        assert_eq!(r.status, 200, "{}", body(&r));
+        let mut v: Vec<String> = r.json().as_array().unwrap().iter().map(|s| s["path"].as_str().unwrap().to_string()).collect();
+        v.sort();
+        v
+    };
+    let mut all = vec![bill_env.clone(), "src/api/.env".to_string(), "src/tools/.env".to_string()];
+    all.sort();
+    assert_eq!(shares(&dev), all, "control: the person's shares");
+    assert_eq!(shares(&narrow), vec!["src/api/.env".to_string()], "the narrowed session's shares");
+}
+
+/// Rule 1 for search, grep and the name search, whole answers: what a
+/// narrowed session is told about its paths (results, scores, counts, the
+/// complete and truncated flags, the cursor, the work done) is the same
+/// before and after its person adds files outside them that match the same
+/// words and names.
+#[test]
+fn a_narrowed_sessions_search_grep_and_name_answers_are_unchanged_by_files_outside() {
+    use std::time::{Duration, Instant};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    with_api_folder(&hub, &p);
+    let token = p.dev.token();
+    // Two more files inside, so that n=1 pages are truncated.
+    let base = tip(&hub, &token, &p.name);
+    let r = change(&hub, &token, &p.name, &json!({"base": base.hex(), "description": "inside", "onto": {"branch": "main", "expected": base.hex()},
+        "edits": [{"path": "src/api/h2.rs", "put": {"text": "marker-inside-1c hh\n".repeat(3)}}, {"path": "src/api/hh3.rs", "put": {"text": "x marker-inside-1c\n"}}]}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["branch"]["status"], "ok", "{}", body(&r));
+    let narrow = agent_token(&hub, &token, &p.name, &["src/api"]);
+    let asks = [
+        ("search", "q=marker-inside-1c&path=src/api"),
+        ("search", "q=marker-inside-1c&path=src/api&n=1"),
+        ("search", "q=hh&kind=path&path=src/api"),
+        ("search", "q=hh&kind=path&path=src/api&n=1"),
+        ("grep", "pattern=marker-inside-1c&path=src/api"),
+        ("grep", "pattern=marker-inside-1c&path=src/api&n=1"),
+    ];
+    // Every answer, once the index covers the tip (`old`: not this one).
+    let settled = |old: Option<&str>| -> Vec<Value> {
+        let end = Instant::now() + Duration::from_secs(120);
+        loop {
+            let all: Vec<Reply> = asks.iter().map(|(r, a)| q(&hub, Some(&narrow), &p.name, r, a)).collect();
+            let ready = all.iter().all(|r| r.status == 200 && r.json()["behind"] == false && old.is_none_or(|t| r.json()["tip_id"] != t));
+            if ready {
+                return all
+                    .iter()
+                    .map(|r| {
+                        let mut v = r.json();
+                        let o = v.as_object_mut().unwrap();
+                        o.remove("tip_id");
+                        o.remove("snapshot_id");
+                        v
+                    })
+                    .collect();
+            }
+            assert!(Instant::now() < end, "never indexed: {:?}", all.iter().map(body).collect::<Vec<_>>());
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    let before = settled(Some(&base.hex()));
+    for (i, v) in before.iter().enumerate() {
+        let n = v["results"].as_array().or(v["files"].as_array()).map_or(0, |a| a.len());
+        assert!(n >= 1, "{:?}: nothing found: {v}", asks[i]);
+    }
+    assert_eq!(before[1]["truncated"], true, "{}", before[1]);
+    assert_eq!(before[5]["truncated"], true, "{}", before[5]);
+    let old = tip(&hub, &token, &p.name);
+    let r = change(&hub, &token, &p.name, &json!({"base": old.hex(), "description": "outside", "onto": {"branch": "main", "expected": old.hex()},
+        "edits": [{"path": "src/hh-outside.rs", "put": {"text": "marker-inside-1c marker-inside-1c\n".repeat(40)}},
+                  {"path": "src/apiary/hh.rs", "put": {"text": "marker-inside-1c\n"}},
+                  {"path": "src/api-hh.rs", "put": {"text": "marker-inside-1c hh\n"}}]}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["branch"]["status"], "ok", "{}", body(&r));
+    let after = settled(Some(&old.hex()));
+    for (i, (b, a)) in before.iter().zip(&after).enumerate() {
+        assert_eq!(b, a, "{:?}: the answer changed with files outside the narrowing", asks[i]);
+    }
+}
+
+/// Rule 2, a merge parent that differs outside the narrowing in each way
+/// (a file added, deleted, renamed, its mode changed, the same content at
+/// another path): the narrowed session's merge gets the one refusal a
+/// plain write outside gets, whether its tree keeps its own side outside or
+/// takes the other parent's. A merge of a parent that differs only inside,
+/// and a stack of two snapshots inside, land (the controls, last).
+#[test]
+fn a_narrowed_sessions_merge_of_a_parent_differing_outside_in_any_way_gets_the_one_refusal() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    with_api_folder(&hub, &p);
+    let api = hub.api();
+    let (atok, dev) = (p.admin.token(), p.dev.token());
+    let narrow = agent_token(&hub, &dev, &p.name, &["src/api"]);
+    let main0 = tip(&hub, &dev, &p.name);
+    // `src/other.rs`'s content (`with_api_folder`).
+    const OTHER: &str = "fn o() {} // MARKER-OUTSIDE-2d";
+    // The admin's drafts, one per kind of difference outside.
+    let draft = |name: &str, edit: &dyn Fn(&mut Craft)| -> ObjectId {
+        let mut d = Craft::new(&api, &p.admin, &p.name, "main");
+        edit(&mut d);
+        let r = d.push_to(name, None);
+        assert_eq!(r.status, 200, "{}", body(&r));
+        assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{name}: {}", body(&r));
+        api.tips(Some(&atok), &p.name).unwrap().branches[name]
+    };
+    let kinds: Vec<(&str, ObjectId)> = vec![
+        ("added", draft("d-added-r5", &|d| d.file("src/added-r5.rs", "fn a() {}"))),
+        ("deleted", draft("d-deleted-r5", &|d| d.remove("src/other.rs"))),
+        ("renamed", draft("d-renamed-r5", &|d| {
+            d.remove("src/other.rs");
+            d.file("src/renamed-r5.rs", OTHER);
+        })),
+        ("mode", draft("d-mode-r5", &|d| {
+            d.file("src/other.rs", OTHER);
+            let mut e = d.entry("src/other.rs").unwrap();
+            e.executable = true;
+            d.set_entry("src/other.rs", e);
+        })),
+        ("same content elsewhere", draft("d-copy-r5", &|d| d.file("src/copy-r5.rs", OTHER))),
+    ];
+    // The reference: a plain write outside.
+    let mut c = Craft::with(&api, narrow.clone(), p.dev.identity(), &p.name, "main");
+    c.file("src/other.rs", "changed");
+    let reference = c.push_to("main", Some(main0));
+    assert_agent_refusal(&reference, NARROWED, "a plain write outside");
+    for (kind, d) in &kinds {
+        // Its own side outside, and a file inside.
+        let mut ours = Craft::with(&api, dev.clone(), p.dev.identity(), &p.name, "main");
+        ours.file("src/api/m.rs", "m");
+        ours.token = narrow.clone();
+        // The other parent's side outside (its person's view of it), and a file inside.
+        let mut theirs = Craft::with(&api, dev.clone(), p.dev.identity(), &p.name, &format!("d-{}-r5", match *kind { "same content elsewhere" => "copy", k => k }));
+        theirs.file("src/api/m.rs", "m");
+        theirs.tip = main0;
+        theirs.token = narrow.clone();
+        for (side, r) in [("ours", ours.push_merge("main", &[*d])), ("theirs", theirs.push_merge("main", &[*d]))] {
+            assert_eq!((r.status, body(&r)), (reference.status, body(&reference)), "{kind}, {side}");
+        }
+        assert_eq!(tip(&hub, &dev, &p.name), main0, "{kind}: main moved");
+    }
+    // Control 1: a parent that differs only inside merges.
+    let inside = draft("d-inside-r5", &|d| d.file("src/api/d.rs", "fn d() {}"));
+    let mut m = Craft::with(&api, dev.clone(), p.dev.identity(), &p.name, "d-inside-r5");
+    m.file("src/api/m.rs", "m");
+    m.tip = main0;
+    m.token = narrow.clone();
+    let r = m.push_merge("main", &[inside]);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "control: an inside-only merge: {}", body(&r));
+    let main1 = tip(&hub, &dev, &p.name);
+    let inside_seen = api.tips(Some(&dev), &p.name).unwrap().branches["d-inside-r5"];
+    let r = api.post_json(Some(&dev), &format!("/v1/projects/{}/q/ancestry", p.name), &json!({"pairs": [[inside_seen.hex(), main1.hex()]]}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["results"][0]["is_ancestor"], true, "the inside-only parent is merged");
+    // Control 2: a stack of two snapshots inside, pushed at once.
+    let mut s = Craft::with(&api, narrow.clone(), p.dev.identity(), &p.name, "main");
+    s.file("src/api/s1.rs", "fn s1() {}");
+    let mut first = Snapshot {
+        parents: vec![main1],
+        change_id: veil_core::ChangeId::random(),
+        tree: s.root,
+        description: Text::Plain("s1".into()),
+        author: "dev".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    first.sign(&p.dev.identity());
+    let s1 = s.put_object(O::Snapshot(first));
+    s.file("src/api/s2.rs", "fn s2() {}");
+    let (s2, r) = s.push_edited("main", Some(main1), |snap| snap.parents = vec![s1]);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "control: a stack of two inside: {}", body(&r));
+    assert_eq!(tip(&hub, &narrow, &p.name), s2);
+}
+
+/// Rule 3 by every route that sets a tip: an agent session never creates
+/// the default branch, narrowed or not, alone or beside another branch in
+/// one push (nothing of that push lands), and an API commit's `onto` never
+/// creates a branch for anyone. Another new branch is allowed (the control).
+#[test]
+fn an_agent_session_never_creates_the_default_branch_by_any_route() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    with_api_folder(&hub, &p);
+    let api = hub.api();
+    let atok = p.admin.token();
+    let tip0 = tip(&hub, &atok, &p.name);
+    let agent = agent_token(&hub, &atok, &p.name, &[]);
+    let narrow = agent_token(&hub, &atok, &p.name, &["src/api"]);
+    // Built while main exists; pushed once it is gone.
+    let mut both = Craft::with(&api, agent.clone(), p.admin.identity(), &p.name, "main");
+    both.file("src/api/b.rs", "fn b() {}");
+    let mut narrowed = Craft::with(&api, narrow.clone(), p.admin.identity(), &p.name, "main");
+    narrowed.file("src/other.rs", "outside");
+    let mut feature = Craft::with(&api, agent.clone(), p.admin.identity(), &p.name, "main");
+    feature.file("src/api/f.rs", "fn f() {}");
+    let r = api.post_json(Some(&atok), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "main", "expected": tip0.hex(), "new": null}]}));
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "the admin deletes main: {}", body(&r));
+    let branches = || api.tips(Some(&atok), &p.name).unwrap().branches;
+    // Beside another new branch, in one push.
+    let (_, r) = both.push_edited("feature-a-r5", None, |_| {});
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", body(&r));
+    let fa = branches()["feature-a-r5"];
+    let r = api.post_json(Some(&agent), &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "feature-b-r5", "expected": null, "new": fa.hex()}, {"branch": "main", "expected": null, "new": fa.hex()}]}));
+    assert_agent_refusal(&r, DEFAULT_BRANCH_REFUSAL, "main beside another branch");
+    assert!(!branches().contains_key("main") && !branches().contains_key("feature-b-r5"), "part of the push landed: {:?}", branches().keys());
+    // A narrowed session, with a write outside: the default branch's answer first.
+    let r = narrowed.push_to("main", None);
+    assert_agent_refusal(&r, DEFAULT_BRANCH_REFUSAL, "a narrowed session's main");
+    assert!(!branches().contains_key("main"));
+    // An API commit `onto` the absent default branch: refused, for the person as for the agent.
+    let mut answers = Vec::new();
+    for t in [&agent, &atok] {
+        let r = change(&hub, t, &p.name, &json!({"base": fa.hex(), "description": "x", "edits": [{"path": "src/api/c.rs", "put": {"text": "c"}}],
+                                                 "onto": {"branch": "main", "expected": fa.hex()}}));
+        assert_eq!(r.status, 400, "{}", body(&r));
+        answers.push(body(&r));
+        assert!(!branches().contains_key("main"), "an API commit created main");
+    }
+    assert_eq!(answers[0], answers[1]);
+    // Control: another new branch.
+    let r = feature.push_to("feature-c-r5", None);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "control: another new branch: {}", body(&r));
+}
+
+/// Rule 2 for an API commit `onto` a stack of its person's own changes
+/// that holds a change outside the narrowing: one answer, whether or not a
+/// change its person cannot see landed on the branch since (then the stack
+/// is made again on the tip, BUG-1054). Neither the outside change nor the
+/// landing it cannot see may show in the answer.
+#[test]
+fn a_narrowed_sessions_commit_onto_its_persons_stack_answers_one_way_whatever_landed_unseen() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    with_api_folder(&hub, &p);
+    let api = hub.api();
+    let (dev, atok) = (p.dev.token(), p.admin.token());
+    let narrow = agent_token(&hub, &dev, &p.name, &["src/api"]);
+    let mut answers = Vec::new();
+    for unseen in [false, true] {
+        let base = tip(&hub, &dev, &p.name);
+        // The person's own change outside the narrowing, not landed.
+        let own = change(&hub, &dev, &p.name, &json!({"base": base.hex(), "description": "own", "edits": [{"path": "src/other.rs", "put": {"text": format!("own {unseen}")}}]}));
+        assert_eq!(own.status, 200, "{}", body(&own));
+        let on = own.json()["snapshot"].as_str().unwrap().to_string();
+        if unseen {
+            // The admin lands a change of billing, which dev cannot see.
+            let mut d = Craft::new(&api, &p.admin, &p.name, "main");
+            let t = d.tip;
+            d.file(&format!("{BILL_DIR}/unseen-r5.txt"), "unseen");
+            let r = d.push_to("main", Some(t));
+            assert_eq!(r.status, 200, "{}", body(&r));
+            assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", body(&r));
+            assert_eq!(tip(&hub, &dev, &p.name), base, "dev sees the tip as before");
+        }
+        let r = change(&hub, &narrow, &p.name, &json!({"base": on, "description": "on it", "edits": [{"path": "src/api/s.rs", "put": {"text": format!("s {unseen}")}}],
+                                                       "onto": {"branch": "main", "expected": base.hex()}}));
+        let v = r.json();
+        answers.push((r.status, v["code"].clone(), v["message"].clone(), v["branch"]["status"].clone(), v["branch"]["message"].clone()));
+        let _ = &atok;
+    }
+    assert_eq!(answers[0].0, 200, "{:?}", answers[0]);
+    assert_eq!(answers[0].3, "rejected", "{:?}", answers[0]);
+    assert_eq!(answers[0], answers[1], "the answer tells whether a change dev cannot see landed");
+}
+
+/// BUG-1567: a secret inside a narrowing sealed under a scope a `cloak`
+/// line names (a plain `cloak` line names `team`; `cloak ops` names `ops`)
+/// is a secret inside its paths, so the narrowed session gets that scope's
+/// ring as its person does. `Viewer::narrowed_scopes` takes scopes from the
+/// access rules alone and leaves it out.
+#[test]
+#[ignore = "BUG-1567: narrowed_scopes leaves out the scope a cloak line names for a secret inside the narrowing"]
+fn a_narrowed_session_gets_the_ring_of_a_secret_inside_its_paths_sealed_under_a_named_scope() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let a = &p.dir;
+    let policy = std::fs::read_to_string(a.join(".veilpolicy")).unwrap();
+    std::fs::write(a.join(".veilpolicy"), format!("{policy}src/api/.env.ops  cloak\n")).unwrap();
+    write_files(a, &[("src/api/.env.ops", "OPS=MARKER-OPS-ENV-3d9a")]);
+    p.admin.commit_main(a, "a secret under a named scope");
+    p.admin.ok(a, &["push"]);
+    let api = hub.api();
+    let (dev, narrow) = (p.dev.token(), agent_token(&hub, &p.dev.token(), &p.name, &["src/api"]));
+    let scopes = |t: &str| -> Vec<String> {
+        let r = api.get(Some(t), &format!("/v1/projects/{}/rings", p.name));
+        assert_eq!(r.status, 200, "{}", body(&r));
+        r.json().as_array().unwrap().iter().map(|r| r["scope"].as_str().unwrap().to_string()).collect()
+    };
+    assert!(scopes(&dev).contains(&"team".to_string()), "control: the person's rings: {:?}", scopes(&dev));
+    // The secret is inside the narrowing, sealed under `ops`.
+    let r = q(&hub, Some(&narrow), &p.name, "tree", "path=src/api");
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert!(body(&r).contains(".env.ops"), "{}", body(&r));
+    // It is sealed under `team` (the admin's own tree says so).
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(a)), None, "test").unwrap();
+    let main = repo.snapshot(&repo.view().tags["main"].target).unwrap().tree;
+    let (mut id, mut entry) = (main, None);
+    for part in ["src", "api", ".env.ops"] {
+        let e = repo.store().tree(&id).unwrap().entries.iter().find(|e| e.name == part).unwrap().clone();
+        id = e.id;
+        entry = Some(e);
+    }
+    assert_eq!(entry.unwrap().visibility, veil_core::object::Visibility::Cloaked { scope: "team".into() }, "the secret's scope");
+    assert!(scopes(&narrow).contains(&"team".to_string()), "the narrowed session lacks the ring of its own secret: {:?}", scopes(&narrow));
+    let r = api.get(Some(&narrow), &format!("/v1/projects/{}/rings/team", p.name));
+    assert_eq!(r.status, 200, "{}", body(&r));
+}
