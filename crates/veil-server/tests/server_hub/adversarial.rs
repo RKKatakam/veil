@@ -643,8 +643,7 @@ fn bug_835_a_confirmed_device_is_recorded_under_its_persons_name() {
     // two's device under one.
     move_device(&one.name);
     let fp = two.fingerprint();
-    let out = p.admin.run(&p.dir, &["group", "add", "finance", &one.name, &two.name, "--confirm", &fp]);
-    let out = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let out = p.admin.fails(&p.dir, &["group", "add", "finance", &one.name, &two.name, "--confirm", &fp]);
     move_device(&two.name);
     let ring = || {
         let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&p.dir)), None, "test").unwrap();
@@ -652,9 +651,7 @@ fn bug_835_a_confirmed_device_is_recorded_under_its_persons_name() {
     };
     let member = two.identity().public_hex();
     assert!(out.contains("one at a time"), "{out}");
-    if let Some(m) = ring().members.get(&member) {
-        assert_eq!(m.name, two.name, "two's device was recorded under another name: {out}");
-    }
+    assert!(!ring().members.contains_key(&member), "two's device was recorded despite the refusal: {out}");
     // Removing two (the server hides two's device) leaves two no key.
     move_device(&one.name);
     p.admin.ok(&p.dir, &["group", "remove", "finance", &two.name]);

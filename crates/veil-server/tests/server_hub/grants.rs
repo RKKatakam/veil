@@ -613,6 +613,7 @@ fn bug_1080_a_grants_view_key_confirms_a_guess_of_hidden_folder_names() {
         );
         if let Some(t) = &token {
             let f = api.get(Some(t), &format!("/v1/epochs?projects={}", p.name));
+            assert_eq!(f.status, 200);
             assert!(!has_marker(&[(String::new(), f.body)], &right), "{who}'s epochs");
         }
     }
