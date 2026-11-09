@@ -560,6 +560,11 @@ impl Objects {
         }
     }
 
+    /// The server's bound on pack indexes held outside the lookup maps.
+    pub fn index_bound(&self) -> &crate::pack::Bound {
+        self.packs.bound()
+    }
+
     /// Key of decoded tree `id` of `project` in [`crate::Hub::trees`].
     pub fn tree_key(project: i64, id: &ObjectId) -> ObjectId {
         let mut h = blake3::Hasher::new();

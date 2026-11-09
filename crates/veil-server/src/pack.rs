@@ -2283,6 +2283,85 @@ mod tests {
         );
     }
 
+    /// BUG-1626 (review s28r7, Guarantee 3): every index the server reads
+    /// (`Packs::staged_slots` in both branches, `bisect_slots`) must be
+    /// refused iff a full `parse_index` would refuse it, and no wanted object
+    /// is ever answered missing while the index holds it, nor present when it
+    /// doesn't. Two remaining divergences in `staged_slots` when `in_first < count`:
+    /// 1. When `ids` is a subset (or empty) on a multi-window pack (`count > 1,489`),
+    ///    `staged_slots` never runs `parse_index` (`pack.rs:1151-1171`), so an
+    ///    untiled multi-window index (trailing bytes, gaps, overlapping slots)
+    ///    or an index with duplicate/unsorted entries outside the bisected
+    ///    64 KiB windows is accepted (`Ok(Some(..))`), whereas `parse_index`
+    ///    refuses it (`Err`).
+    /// 2. `bisect_slots` ends with `ensure!(wanted.iter().all(|id| found.contains_key(id)), "a pack's index is not sorted")`
+    ///    (`pack.rs:1319`), unconditionally refusing any valid sorted multi-window
+    ///    pack whenever a wanted ID past `last_first` is simply absent from the
+    ///    pack (`Err`), whereas `parse_index` (and `staged_slots` when cached,
+    ///    when `in_first == count`, or when the absent ID sorts `<= last_first`)
+    ///    succeeds (`Ok(Some(StagedSlots))`) and omits the absent ID from `slots`.
+    #[tokio::test]
+    #[ignore = "BUG-1626: staged_slots when in_first < count accepts untiled/unsorted/duplicated multi-window indexes that parse_index refuses, and bisect_slots refuses valid sorted indexes when a wanted id is absent"]
+    async fn bug_1626_staged_slots_matches_parse_index_on_multi_window_packs_and_absent_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::FsStore::new(dir.path());
+        let packs = Packs::new(None);
+
+        // Success first: on a valid multi-window pack (2,000 objects, > FIRST_READ = 1,489 entries),
+        // `read_index` (`parse_index`) and `staged_slots` for a present ID both succeed and return the same slot.
+        let valid_items: Vec<_> = (0..2_000).map(|i| obj(&format!("valid-1626-{i}"))).collect();
+        let (valid_bytes, valid_idx) = build(valid_items.clone()).unwrap();
+        store.put(&key(1, "valid"), valid_bytes.clone()).await.unwrap();
+        let mut sorted_ids: Vec<ObjectId> = valid_items.iter().map(|(id, _)| *id).collect();
+        sorted_ids.sort_unstable();
+        let probe = sorted_ids[0];
+        let full = read_index(&store, &key(1, "valid"), &packs.bound).await.unwrap().unwrap();
+        let got_present = packs.staged_slots(&store, 1, "valid", &[probe]).await.unwrap().unwrap();
+        assert_eq!(got_present.slots, vec![(probe, full.index.get(&probe).unwrap())]);
+        assert_eq!(got_present.slots[0].1, valid_idx.get(&probe).unwrap());
+
+        // Divergence 1a: Multi-window pack with trailing unindexed byte (untiled: `size != at`).
+        // `parse_index` refuses it, but `staged_slots` with `ids = &[probe]` (or `&[]`) accepts it (`Ok(Some(..))`).
+        let mut untiled_multi = valid_bytes.to_vec();
+        untiled_multi.push(0u8);
+        let untiled_multi = Bytes::from(untiled_multi);
+        assert!(parse_index(&untiled_multi, Some(untiled_multi.len() as u64)).is_err(), "parse_index refuses untiled multi-window pack");
+        store.put(&key(1, "untiled_multi"), untiled_multi).await.unwrap();
+        let untiled_subset_res = packs.staged_slots(&store, 1, "untiled_multi", &[probe]).await;
+        let untiled_empty_res = packs.staged_slots(&store, 1, "untiled_multi", &[]).await;
+
+        // Divergence 1b: Multi-window pack with unsorted / duplicate entries outside the bisected window (at entries 1,600..1,602)
+        // when querying `probe` (`sorted_ids[0]`, in the first window).
+        // `parse_index` refuses it, but `staged_slots` accepts it (`Ok(Some(..))`).
+        let mut unsorted_outside = valid_bytes.to_vec();
+        let e1600 = HEAD + 1600 * ENTRY;
+        let e1601 = HEAD + 1601 * ENTRY;
+        let (left, right) = unsorted_outside.split_at_mut(e1601);
+        left[e1600..e1600 + ENTRY].swap_with_slice(&mut right[..ENTRY]);
+        let unsorted_outside = Bytes::from(unsorted_outside);
+        assert!(parse_index(&unsorted_outside, Some(unsorted_outside.len() as u64)).is_err(), "parse_index refuses unsorted multi-window pack");
+        store.put(&key(1, "unsorted_outside"), unsorted_outside).await.unwrap();
+        let unsorted_outside_res = packs.staged_slots(&store, 1, "unsorted_outside", &[probe]).await;
+
+        // Divergence 2: Valid sorted multi-window pack queried with `[probe, absent_high]` where `absent_high` (`[0xff; 32]`)
+        // is not in the pack and sorts past `last_first`. `parse_index` succeeds and `valid_idx.get(&absent_high)` is `None`,
+        // so `staged_slots` must return `Ok(Some(StagedSlots))` with `slots == [(probe, slot)]`, never `Err`.
+        let absent_high = ObjectId([0xffu8; 32]);
+        let valid_with_absent_res = packs.staged_slots(&store, 1, "valid", &[probe, absent_high]).await;
+
+        assert!(
+            untiled_subset_res.is_err()
+                && untiled_empty_res.is_err()
+                && unsorted_outside_res.is_err()
+                && valid_with_absent_res.as_ref().is_ok_and(|o| o.as_ref().is_some_and(|s| s.slots.len() == 1 && s.slots[0].0 == probe)),
+            "staged_slots diverged from parse_index: untiled_subset={:?}, untiled_empty={:?}, unsorted_outside={:?}, valid_with_absent={:?}",
+            untiled_subset_res.map(|o| o.map(|s| s.slots.len())),
+            untiled_empty_res.map(|o| o.map(|s| s.slots.len())),
+            unsorted_outside_res.map(|o| o.map(|s| s.slots.len())),
+            valid_with_absent_res.map(|o| o.map(|s| s.slots.len())),
+        );
+    }
+
     /// BUG-1623 (review s28r5, Guarantees 2 and 4): `Bound::take_for` has two
     /// flaws in its per-project share and yielding rules:
     /// 1. `s.last_large` is set to `Some(p)` when project `p` takes a share
@@ -2393,5 +2472,28 @@ mod tests {
         let listed = split_res.unwrap();
         assert_eq!(listed.len(), 2, "MAX_OBJECTS + 50,000 objects split into 2 packs");
         assert_eq!(listed[0].objects + listed[1].objects, total_objs);
+        assert!(objects.index_bound().available() < INDEXES_HELD, "listed packs hold their index shares until listed()");
+        let for_cache: Vec<_> = listed.into_iter().map(|p| (p.name, p.held.map(|h| h.index))).collect();
+        objects.listed(3, for_cache);
+        assert_eq!(objects.index_bound().available(), INDEXES_HELD, "all shares released once split packs join the lookup maps");
+
+        // Failure path: if `packs_to_list` fails (e.g. a discarded staged pack named after writing the first pack, or an error during `packs_to_list`), all shares are released when `packs_to_list` returns.
+        let mut touched_fail = HashSet::new();
+        let missing_id = ObjectId::hash(b"missing-from-store");
+        touched_fail.insert(missing_id);
+        let st_fail = crate::sync::Staged::from_packs(
+            vec![(
+                Arc::from("vanished"),
+                StagedSlots {
+                    objects: 2,
+                    size: 200,
+                    slots: vec![(missing_id, Slot { offset: HEAD as u64 + 2 * ENTRY as u64, len: 50 })],
+                },
+            )],
+            HashMap::new(),
+        );
+        let fail_res = crate::sync::packs_to_list(&hub, 3, 7, &st_fail, &touched_fail, &made_ids, &Mutex::new(Default::default())).await;
+        assert!(fail_res.is_err(), "packs_to_list fails when a touched staged pack vanished");
+        assert_eq!(objects.index_bound().available(), INDEXES_HELD, "all shares released when packs_to_list fails");
     }
 }

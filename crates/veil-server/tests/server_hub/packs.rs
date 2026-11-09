@@ -1157,3 +1157,127 @@ fn bug_1624_a_push_projecting_a_committed_tip_does_not_count_it_as_its_own_stora
     );
 }
 
+/// S28 cycle 7 review (Guarantee 1): a push of more than `MAX_OBJECTS` small
+/// objects (where `sync::packs_to_list` splits `own` across multiple packs)
+/// lands without waiting on its own earlier pack's share, and releases all its
+/// index shares when it ends, whether the push succeeds or fails.
+#[test]
+fn a_push_of_more_than_max_objects_lands_and_releases_every_share() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+
+    let count = veil_server::pack::MAX_OBJECTS + 48_000;
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    let tip = c.tip;
+
+    let mut frames = Vec::with_capacity((count + 16) * 56);
+    let mut obj_ids = Vec::with_capacity(count + 16);
+
+    // Put an unread object at the very start of the first `MAX_OBJECTS` chunk so neither staged pack is
+    // listed as-is (`sp.slots.len() < sp.objects` on both), forcing `packs_to_list` to copy all `count`
+    // touched objects into `own` and split `own` across two `put_pack` calls.
+    let (unread0_id, unread0_raw) = blob("MARKER-UNREAD-FIRST-PACK");
+    put_frame(&mut frames, &unread0_id, &unread0_raw);
+    obj_ids.push(unread0_id);
+
+    let mut dir_entries = Vec::with_capacity(count);
+    for i in 0..count {
+        let mut raw = [0u8; 18];
+        raw[..10].copy_from_slice(b"veil:blob\n");
+        raw[10..18].copy_from_slice(&(i as u64).to_le_bytes());
+        let id = ObjectId::hash(&raw);
+        put_frame(&mut frames, &id, &raw);
+        obj_ids.push(id);
+        dir_entries.push(veil_core::TreeEntry {
+            name: format!("b{i:06}"),
+            id,
+            kind: veil_core::object::EntryKind::File,
+            executable: false,
+            size: 8,
+            visibility: veil_core::object::Visibility::Public,
+        });
+    }
+    let (unread1_id, unread1_raw) = blob("MARKER-UNREAD-SECOND-PACK");
+    put_frame(&mut frames, &unread1_id, &unread1_raw);
+    obj_ids.push(unread1_id);
+
+    let sub_tree = O::Tree(veil_core::Tree { entries: dir_entries }).encode_with(veil_core::object::TreeEncoding::Binary);
+    let sub_tree_id = ObjectId::hash(&sub_tree);
+    put_frame(&mut frames, &sub_tree_id, &sub_tree);
+    obj_ids.push(sub_tree_id);
+
+    c.refer_dir("src/many", sub_tree_id);
+    for (id, raw) in &c.objects {
+        put_frame(&mut frames, id, raw);
+        obj_ids.push(*id);
+    }
+
+    let snap_id = snap(&mut c, vec![tip], "more than MAX_OBJECTS", None);
+    let snap_raw = c.objects.iter().find(|(id, _)| *id == snap_id).unwrap().1.clone();
+    put_frame(&mut frames, &snap_id, &snap_raw);
+    obj_ids.push(snap_id);
+
+    // Clear any staged-index cache entries from setup_project so `available()` reflects this push's shares only.
+    let initial_staged: Vec<std::sync::Arc<str>> = hub
+        .rt
+        .block_on(sqlx::query_scalar::<_, String>("SELECT name FROM packs WHERE project_id = $1").bind(pid).fetch_all(&hub.hub().db))
+        .unwrap()
+        .into_iter()
+        .map(std::sync::Arc::from)
+        .collect();
+    let _ = hub.rt.block_on(hub.hub().objects.discard(pid, &initial_staged));
+    assert_eq!(hub.hub().objects.index_bound().available(), veil_server::pack::INDEXES_HELD, "idle bound before push");
+
+    // 1. Success first: upload and push > MAX_OBJECTS small objects; it splits `own` into 2 packs,
+    //    lands without waiting on its own earlier pack's share, and releases every share when done.
+    let (listed_before, _) = pack_rows(&hub, pid);
+    let up = api.upload_encoded_body(&c.token, &p.name, &frames);
+    assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body[..up.body.len().min(400)]));
+    let receipts: Vec<String> = serde_json::from_value(up.json()["receipts"].clone()).unwrap();
+    assert_eq!(receipts.len(), obj_ids.len());
+    let mut map = serde_json::Map::new();
+    for (id, r) in obj_ids.iter().zip(&receipts) {
+        if *id != unread0_id && *id != unread1_id {
+            map.insert(id.hex(), json!(r));
+        }
+    }
+    let r = push_body(&api, &c.token, &p.name, tip, snap_id, &map);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&r.body));
+    let (listed_after, _) = pack_rows(&hub, pid);
+    assert!(listed_after - listed_before >= 2, "push of > MAX_OBJECTS listed {} packs", listed_after - listed_before);
+    assert_eq!(
+        hub.hub().objects.index_bound().available(),
+        veil_server::pack::INDEXES_HELD,
+        "all index shares released after a landing push of > MAX_OBJECTS (discarded staged uploads evicted from staged cache, listed own packs moved to lookup maps)"
+    );
+
+    // 2. Failure path: a refused push (unsigned/unknown-signer snapshot) with > MAX_OBJECTS receipts
+    //    also releases all its shares when it ends.
+    let new_tip = api.tips(Some(&c.token), &p.name).unwrap().branches["main"];
+    let stranger = veil_core::Identity::generate("stranger");
+    let bad_snap_id = snap(&mut c, vec![new_tip], "bad signer", Some(&stranger));
+    let bad_snap_raw = c.objects.iter().find(|(id, _)| *id == bad_snap_id).unwrap().1.clone();
+    let mut bad_frames = Vec::new();
+    let (bad_b_id, bad_b_raw) = blob("MARKER-BAD-PUSH-UPLOAD");
+    put_frame(&mut bad_frames, &bad_b_id, &bad_b_raw);
+    put_frame(&mut bad_frames, &bad_snap_id, &bad_snap_raw);
+    let up_bad = api.upload_encoded_body(&c.token, &p.name, &bad_frames);
+    assert_eq!(up_bad.status, 200);
+    let bad_receipts: Vec<String> = serde_json::from_value(up_bad.json()["receipts"].clone()).unwrap();
+    let mut bad_map = serde_json::Map::new();
+    bad_map.insert(bad_b_id.hex(), json!(bad_receipts[0]));
+    bad_map.insert(bad_snap_id.hex(), json!(bad_receipts[1]));
+    let r_bad = push_body(&api, &c.token, &p.name, new_tip, bad_snap_id, &bad_map);
+    assert_eq!(r_bad.status, 403, "refused push: {}", String::from_utf8_lossy(&r_bad.body));
+    assert_eq!(
+        hub.hub().objects.index_bound().available(),
+        veil_server::pack::INDEXES_HELD,
+        "all index shares released after a failed push"
+    );
+}
+
+
+
