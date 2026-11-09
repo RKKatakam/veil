@@ -59,7 +59,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
 use veil_core::{cache::LruCache, ObjectId};
 
@@ -78,8 +78,9 @@ pub const ENTRY_HEAD: u64 = ID_LEN + 4;
 /// What a reader asks for first: the head and, up to about 1,500 objects,
 /// the whole index.
 pub const FIRST_READ: u64 = 64 << 10;
-/// Most objects one pack holds (its index is at most 88 MiB).
-pub const MAX_OBJECTS: usize = 2 << 20;
+/// Most objects one pack holds (its index is at most 11 MiB on disk, 12 MiB
+/// in memory, and 27 MiB while read and parsed: BUG-1621).
+pub const MAX_OBJECTS: usize = 256 << 10;
 
 /// Pack states in the `packs` table.
 pub const STAGED: i16 = 0;
@@ -89,6 +90,10 @@ pub const DISCARDED: i16 = 2;
 /// The storage key of pack `name` of `project`.
 pub fn key(project: i64, name: &str) -> String {
     format!("p/{project}/pack/{name}")
+}
+
+fn project_of_key(key: &str) -> Option<i64> {
+    key.strip_prefix("p/")?.split('/').next()?.parse().ok()
 }
 
 /// A fresh pack name: 128 random bits, in lowercase hex.
@@ -171,26 +176,61 @@ impl Index {
     pub fn weight_of(count: usize) -> usize {
         64 + count * std::mem::size_of::<(ObjectId, Slot)>()
     }
+
+    /// Memory held while reading and parsing an index of `count` slots
+    /// (BUG-1621): its bytes, the parsed index and the parse's working copy.
+    pub fn read_weight_of(count: usize) -> usize {
+        HEAD + count * ENTRY + Self::weight_of(count) + count * std::mem::size_of::<Slot>()
+    }
+
+    /// Memory held for the index while laying out a pack of `count` objects
+    /// (BUG-1621): the pack's index bytes and the parsed index.
+    pub fn write_weight_of(count: usize) -> usize {
+        HEAD + count * ENTRY + Self::weight_of(count)
+    }
 }
 
 /// Lay out a pack of the encodings `objects` (the first of each id kept),
-/// in the order given; its index.
-pub fn build(objects: Vec<(ObjectId, Bytes)>) -> Result<(Bytes, Index)> {
-    let mut seen = HashSet::with_capacity(objects.len());
-    let objects: Vec<(ObjectId, Bytes)> = objects.into_iter().filter(|(id, _)| seen.insert(*id)).collect();
-    if objects.len() > MAX_OBJECTS {
-        bail!("at most {MAX_OBJECTS} objects per pack");
-    }
-    let head = HEAD + objects.len() * ENTRY;
-    let total = head + objects.iter().map(|(_, b)| ENTRY_HEAD as usize + b.len()).sum::<usize>();
+/// in the order given; its index. Deduplicates in place using the sorted
+/// index entries so no separate `HashSet` or second object vector is held
+/// alongside the index (BUG-1621).
+pub fn build(mut objects: Vec<(ObjectId, Bytes)>) -> Result<(Bytes, Index)> {
     let mut entries = Vec::with_capacity(objects.len());
-    let mut at = head as u64;
+    let mut at = (HEAD + objects.len() * ENTRY) as u64;
     for (id, b) in &objects {
         let len = u32::try_from(ENTRY_HEAD as usize + b.len()).map_err(|_| anyhow!("an object of 4 GiB or more cannot be packed"))?;
         entries.push((*id, Slot { offset: at, len }));
         at += u64::from(len);
     }
-    entries.sort_unstable_by_key(|a| a.0);
+    entries.sort_unstable_by_key(|(id, s)| (*id, s.offset));
+    if entries.windows(2).any(|w| w[0].0 == w[1].0) {
+        entries.dedup_by_key(|(id, _)| *id);
+        entries.sort_unstable_by_key(|(_, s)| s.offset);
+        let mut cur = (HEAD + objects.len() * ENTRY) as u64;
+        let mut keep = entries.iter();
+        let mut next_off = keep.next().map(|(_, s)| s.offset);
+        objects.retain(|(_, b)| {
+            let off = cur;
+            cur += ENTRY_HEAD + b.len() as u64;
+            if next_off == Some(off) {
+                next_off = keep.next().map(|(_, s)| s.offset);
+                true
+            } else {
+                false
+            }
+        });
+        let mut at = (HEAD + entries.len() * ENTRY) as u64;
+        for (_, s) in &mut entries {
+            s.offset = at;
+            at += u64::from(s.len);
+        }
+        entries.sort_unstable_by_key(|(id, _)| *id);
+    }
+    if objects.len() > MAX_OBJECTS {
+        bail!("at most {MAX_OBJECTS} objects per pack");
+    }
+    let head = HEAD + objects.len() * ENTRY;
+    let total = head + objects.iter().map(|(_, b)| ENTRY_HEAD as usize + b.len()).sum::<usize>();
     let mut out = BytesMut::with_capacity(total);
     out.put_slice(MAGIC);
     out.put_u32(entries.len() as u32);
@@ -221,6 +261,17 @@ pub fn head_len(first: &[u8]) -> Result<u64> {
     Ok((HEAD + count * ENTRY) as u64)
 }
 
+fn parse_entry(e: &[u8; ENTRY], hl: u64, size: Option<u64>) -> Result<(ObjectId, Slot)> {
+    let id = ObjectId(e[..32].try_into().expect("32 bytes"));
+    let offset = u64::from_be_bytes(e[32..40].try_into().expect("8 bytes"));
+    let len = u32::from_be_bytes(e[40..44].try_into().expect("4 bytes"));
+    let end = offset.checked_add(u64::from(len)).ok_or_else(|| anyhow!("a pack slot past the end"))?;
+    if offset < hl || u64::from(len) <= ENTRY_HEAD || size.is_some_and(|s| end > s) {
+        bail!("a pack slot outside its entries");
+    }
+    Ok((id, Slot { offset, len }))
+}
+
 /// The index from a pack's first bytes (at least [`head_len`] of them),
 /// checked: ids sorted and distinct, every slot long enough for its entry's
 /// head and one byte, the slots tiling the entries from the index's end,
@@ -233,17 +284,11 @@ pub fn parse_index(first: &[u8], size: Option<u64>) -> Result<Index> {
     }
     let mut entries = Vec::with_capacity((hl - HEAD) / ENTRY);
     for e in first[HEAD..hl].as_chunks::<ENTRY>().0 {
-        let id = ObjectId(e[..32].try_into().expect("32 bytes"));
-        let offset = u64::from_be_bytes(e[32..40].try_into().expect("8 bytes"));
-        let len = u32::from_be_bytes(e[40..44].try_into().expect("4 bytes"));
-        let end = offset.checked_add(u64::from(len)).ok_or_else(|| anyhow!("a pack slot past the end"))?;
-        if offset < hl as u64 || u64::from(len) <= ENTRY_HEAD || size.is_some_and(|s| end > s) {
-            bail!("a pack slot outside its entries");
-        }
+        let (id, slot) = parse_entry(e, hl as u64, size)?;
         if entries.last().is_some_and(|(last, _): &(ObjectId, Slot)| *last >= id) {
             bail!("a pack's index is not sorted");
         }
-        entries.push((id, Slot { offset, len }));
+        entries.push((id, slot));
     }
     // The slots tile the entries exactly, in offset order: each starts where
     // the one before ends, the first at the index's end, the last at the
@@ -268,13 +313,13 @@ pub fn parse_index(first: &[u8], size: Option<u64>) -> Result<Index> {
 /// Bytes of pack indexes one server holds in memory outside its lookup
 /// maps (BUG-1496), for every request together: indexes being read
 /// (`Packs::refresh`, `Packs::find_paged`), what a push or API commit reads
-/// of its staged uploads' indexes (`Packs::staged_slots`: it keeps only the
-/// slots its receipts name), the index of a pack being written, and the
-/// staged-index cache's ([`STAGED_INDEXES`] of it at most). Each takes its
-/// share before it reads or builds the index, and holds it while the index
-/// is held ([`Held`]); an index larger than what the cache leaves takes
-/// all of that. A lookup's index joins the lookup maps once read (bounded
-/// by [`LOOKUP_BUDGET`]).
+/// of its staged uploads' indexes (`Packs::staged_slots`: it bisects by
+/// range and keeps only the slots its receipts name, BUG-1620), the index
+/// of a pack being written, and the staged-index cache's
+/// ([`STAGED_INDEXES`] of it at most). Each takes its share before it reads
+/// or builds the index, and holds it while the index is held ([`Held`]).
+/// A lookup's index joins the lookup maps once read (bounded by
+/// [`LOOKUP_BUDGET`]).
 pub const INDEXES_HELD: usize = 96 << 20;
 /// What the staged-index cache may hold of [`INDEXES_HELD`].
 pub const STAGED_INDEXES: usize = 32 << 20;
@@ -283,7 +328,7 @@ pub const STAGED_INDEXES: usize = 32 << 20;
 const INDEX_WAIT: Duration = Duration::from_secs(10);
 
 /// No share of [`INDEXES_HELD`] came free in time: the request is answered
-/// `warming` (503, try again), never with an index held outside the bound.
+/// `busy` (503, try again), never with an index held outside the bound.
 #[derive(Debug)]
 pub struct IndexesFull;
 
@@ -295,35 +340,141 @@ impl std::fmt::Display for IndexesFull {
 
 impl std::error::Error for IndexesFull {}
 
-/// Is `e` (or what it wraps, an I/O error's inner one included) [`IndexesFull`]?
+/// Is `e` (or what it wraps, an I/O error's inner chain included) [`IndexesFull`]?
 pub fn indexes_full(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.is::<IndexesFull>() || c.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()).is_some_and(|i| i.is::<IndexesFull>()))
+    e.chain().any(|c| {
+        c.is::<IndexesFull>()
+            || c.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()).is_some_and(|i| {
+                let mut cur: &(dyn std::error::Error + 'static) = i;
+                loop {
+                    if cur.is::<IndexesFull>() {
+                        return true;
+                    }
+                    match cur.source() {
+                        Some(s) => cur = s,
+                        None => return false,
+                    }
+                }
+            })
+    })
 }
 
-/// A server-wide bound on bytes of indexes held ([`INDEXES_HELD`]).
+#[derive(Default)]
+struct BoundState {
+    held: HashMap<i64, usize>,
+    waiting: HashMap<i64, usize>,
+    last_large: Option<i64>,
+}
+
+/// A server-wide bound on bytes of indexes held ([`INDEXES_HELD`]), with a
+/// fair share per project (BUG-1620) and no clamping below what a holder
+/// actually allocates (BUG-1621).
 #[derive(Clone)]
 pub struct Bound {
     sem: Arc<tokio::sync::Semaphore>,
-    /// The largest share one holder takes.
+    state: Arc<Mutex<BoundState>>,
+    notify: Arc<tokio::sync::Notify>,
+    /// The largest share one holder may take (what the staged-index cache
+    /// leaves of [`INDEXES_HELD`]).
     most: usize,
     wait: Duration,
 }
 
 impl Bound {
     pub fn new(total: usize) -> Bound {
-        Bound { sem: Arc::new(tokio::sync::Semaphore::new(total)), most: total, wait: INDEX_WAIT }
+        Bound {
+            sem: Arc::new(tokio::sync::Semaphore::new(total)),
+            state: Arc::new(Mutex::new(BoundState::default())),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            most: total,
+            wait: INDEX_WAIT,
+        }
     }
 
     fn permits(&self, bytes: u64) -> u32 {
-        bytes.clamp(1, self.most as u64) as u32
+        bytes.max(1).min(u32::MAX as u64) as u32
     }
 
-    /// A share of `bytes`, waiting for it at most this bound's wait (only
-    /// by a holder of none, so holders never wait on one another in a cycle).
+    /// A share of `bytes`, not tied to one project.
     pub async fn take(&self, bytes: u64) -> Result<Share> {
-        match tokio::time::timeout(self.wait, self.sem.clone().acquire_many_owned(self.permits(bytes))).await {
-            Ok(Ok(p)) => Ok(Share(p)),
-            _ => Err(anyhow::Error::new(IndexesFull)),
+        self.take_for(None, bytes).await
+    }
+
+    /// A share of `bytes` for `project`, waiting at most this bound's wait
+    /// (only by a holder of none, so holders never wait on one another in a
+    /// cycle). One project holds at most a quarter of `most` across
+    /// concurrent shares, or one larger share alone (up to `most`, yielding
+    /// after one when another project waits: BUG-1620); a share past `most`
+    /// is refused (BUG-1621).
+    pub async fn take_for(&self, project: Option<i64>, bytes: u64) -> Result<Share> {
+        let want = self.permits(bytes) as usize;
+        if want > self.most {
+            return Err(anyhow::Error::new(IndexesFull));
+        }
+        struct Waiting<'a> {
+            project: Option<i64>,
+            state: &'a Mutex<BoundState>,
+            registered: bool,
+        }
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                if self.registered {
+                    if let Some(p) = self.project {
+                        let mut s = self.state.lock().unwrap();
+                        if let Some(w) = s.waiting.get_mut(&p) {
+                            *w = w.saturating_sub(1);
+                            if *w == 0 {
+                                s.waiting.remove(&p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let quarter = (self.most / 4).max(1);
+        let deadline = tokio::time::Instant::now() + self.wait;
+        let mut guard = Waiting { project, state: &self.state, registered: false };
+        loop {
+            let notified = self.notify.notified();
+            {
+                let mut s = self.state.lock().unwrap();
+                let can_take = match project {
+                    None => true,
+                    Some(p) => {
+                        let cur = s.held.get(&p).copied().unwrap_or(0);
+                        let other_waiting = s.waiting.iter().any(|(k, v)| *k != p && *v > 0);
+                        cur + want <= quarter || (cur == 0 && (!other_waiting || s.last_large != Some(p)))
+                    }
+                };
+                if can_take {
+                    if let Ok(permit) = self.sem.clone().try_acquire_many_owned(want as u32) {
+                        if let Some(p) = project {
+                            *s.held.entry(p).or_default() += want;
+                            if want > quarter {
+                                s.last_large = Some(p);
+                            }
+                        }
+                        return Ok(Share {
+                            permit: Some(permit),
+                            project,
+                            state: self.state.clone(),
+                            notify: self.notify.clone(),
+                        });
+                    }
+                }
+                if !guard.registered {
+                    if let Some(p) = project {
+                        *s.waiting.entry(p).or_default() += 1;
+                    }
+                    guard.registered = true;
+                }
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(anyhow::Error::new(IndexesFull));
+            }
+            let sleep_for = (deadline - now).min(Duration::from_millis(5));
+            let _ = tokio::time::timeout(sleep_for, notified).await;
         }
     }
 
@@ -339,15 +490,68 @@ impl Bound {
 }
 
 /// A share of a [`Bound`], given back when dropped.
-pub struct Share(tokio::sync::OwnedSemaphorePermit);
+pub struct Share {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    project: Option<i64>,
+    state: Arc<Mutex<BoundState>>,
+    notify: Arc<tokio::sync::Notify>,
+}
 
 impl Share {
     /// Give back what is held beyond `bytes`.
     fn keep(&mut self, bytes: usize) {
-        let n = self.0.num_permits();
-        if n > bytes.max(1) {
-            drop(self.0.split(n - bytes.max(1)));
+        let Some(permit) = &mut self.permit else { return };
+        let n = permit.num_permits();
+        let keep = bytes.max(1);
+        if n > keep {
+            let give_back = n - keep;
+            if let Some(p) = self.project {
+                let mut s = self.state.lock().unwrap();
+                if let Some(cur) = s.held.get_mut(&p) {
+                    *cur = cur.saturating_sub(give_back);
+                    if *cur == 0 {
+                        s.held.remove(&p);
+                    }
+                }
+            }
+            drop(permit.split(give_back));
+            self.notify.notify_waiters();
         }
+    }
+
+    /// Detach this share from its project's active quota when the index
+    /// enters the server-wide staged-index cache (which has its own
+    /// [`STAGED_INDEXES`] share of [`INDEXES_HELD`]).
+    fn unproject(&mut self) {
+        if let Some(p) = self.project.take() {
+            let n = self.permit.as_ref().map_or(0, |p| p.num_permits());
+            let mut s = self.state.lock().unwrap();
+            if let Some(cur) = s.held.get_mut(&p) {
+                *cur = cur.saturating_sub(n);
+                if *cur == 0 {
+                    s.held.remove(&p);
+                }
+            }
+            drop(s);
+            self.notify.notify_waiters();
+        }
+    }
+}
+
+impl Drop for Share {
+    fn drop(&mut self) {
+        let n = self.permit.as_ref().map_or(0, |p| p.num_permits());
+        if let Some(p) = self.project.take() {
+            let mut s = self.state.lock().unwrap();
+            if let Some(cur) = s.held.get_mut(&p) {
+                *cur = cur.saturating_sub(n);
+                if *cur == 0 {
+                    s.held.remove(&p);
+                }
+            }
+        }
+        drop(self.permit.take());
+        self.notify.notify_waiters();
     }
 }
 
@@ -365,26 +569,38 @@ impl Held {
         share.keep(index.weight());
         Held { index, size, _share: share }
     }
+
+    fn unproject(&mut self) {
+        self._share.unproject();
+    }
 }
 
 /// Read the index of the pack at `key` (one read for most packs, two for a
-/// large index), holding a share of `bound` (BUG-1496) taken before
-/// anything sized by the index is read or made: its bytes, the parsed
-/// index and the parse's working copy of the slots; kept, once parsed, for
-/// the index alone. (Only the first [`FIRST_READ`] bytes, which say how
-/// large the index is, are read before.)
+/// large index), holding a share of `bound` (BUG-1496, BUG-1621) taken
+/// before the first [`FIRST_READ`] bytes are read, then resized for the
+/// index bytes, the parsed index and the parse's working copy of the slots;
+/// kept, once parsed, for the index alone.
 pub async fn read_index(store: &dyn BlobStore, key: &str, bound: &Bound) -> Result<Option<Held>> {
+    let project = project_of_key(key);
+    let first_share = bound.take_for(project, FIRST_READ.min(bound.most as u64)).await?;
     let Some((first, size)) = store.get_range(key, 0, FIRST_READ - 1).await? else { return Ok(None) };
     let hl = head_len(&first).with_context(|| format!("reading pack {key}"))?;
     let count = (hl as usize - HEAD) / ENTRY;
-    let share = bound.take(hl + (Index::weight_of(count) + count * std::mem::size_of::<Slot>()) as u64).await?;
-    let first = if (first.len() as u64) < hl {
-        match store.get_range(key, 0, hl - 1).await? {
+    let need = Index::read_weight_of(count) as u64;
+    let whole = (first.len() as u64) >= hl;
+    let first = if whole { Some(first) } else { None };
+    let share = if need <= FIRST_READ.min(bound.most as u64) {
+        first_share
+    } else {
+        drop(first_share);
+        bound.take_for(project, need).await?
+    };
+    let first = match first {
+        Some(b) => b,
+        None => match store.get_range(key, 0, hl - 1).await? {
             Some((b, _)) => b,
             None => return Ok(None),
-        }
-    } else {
-        first
+        },
     };
     let index = parse_index(&first, Some(size)).with_context(|| format!("reading pack {key}"))?;
     drop(first);
@@ -823,7 +1039,8 @@ impl Packs {
     /// Remember the index of a pack staged here, by `person`, with its
     /// share of the bound (given back when the cache drops it, or now if
     /// the cache does not keep it).
-    pub fn staged_here(&self, project: i64, person: i64, name: &Arc<str>, held: Held) {
+    pub fn staged_here(&self, project: i64, person: i64, name: &Arc<str>, mut held: Held) {
+        held.unproject();
         let w = held.index.weight();
         self.staged.insert(name_key(project, name), Some(Arc::new(held)), w);
         let k = person_key(project, person);
@@ -889,14 +1106,51 @@ impl Packs {
         Ok(read_index(store, &key(project, name), &self.bound).await?.map(Arc::new))
     }
 
-    /// What a push or API commit keeps of staged pack `name` (BUG-1496):
-    /// its object count, its length and the slots of `ids` in it; the index
-    /// itself is held, under its share of the bound, only while it is read.
-    /// `None` if the pack is not in the store (discarded).
+    /// What a push or API commit keeps of staged pack `name` (BUG-1496,
+    /// BUG-1620): its object count, its length and the slots of `ids` in it.
+    /// If the staged-index cache holds the index, it is searched there;
+    /// otherwise the sorted index on disk is bisected with ranged reads of
+    /// at most [`FIRST_READ`] bytes, under a [`FIRST_READ`] share of the
+    /// bound, never reading or holding the whole index. `None` if the pack
+    /// is not in the store (discarded).
     pub async fn staged_slots(&self, store: &dyn BlobStore, project: i64, name: &str, ids: &[ObjectId]) -> Result<Option<StagedSlots>> {
-        let Some(held) = self.staged_index(store, project, name).await? else { return Ok(None) };
-        let slots = ids.iter().filter_map(|id| Some((*id, held.index.get(id)?))).collect();
-        Ok(Some(StagedSlots { objects: held.index.len(), size: held.size, slots }))
+        if let Some(cached) = self.staged.get(&name_key(project, name)) {
+            let Some(held) = cached else { return Ok(None) };
+            let slots = ids.iter().filter_map(|id| Some((*id, held.index.get(id)?))).collect();
+            return Ok(Some(StagedSlots { objects: held.index.len(), size: held.size, slots }));
+        }
+        let _share = self.bound.take_for(Some(project), FIRST_READ.min(self.bound.most as u64)).await?;
+        let k = key(project, name);
+        let Some((first, size)) = store.get_range(&k, 0, FIRST_READ - 1).await? else { return Ok(None) };
+        let hl = head_len(&first).with_context(|| format!("reading pack {k}"))?;
+        if size < hl {
+            bail!("a pack's index is cut short");
+        }
+        let count = (hl as usize - HEAD) / ENTRY;
+        if ids.is_empty() || count == 0 {
+            return Ok(Some(StagedSlots { objects: count, size, slots: Vec::new() }));
+        }
+        let in_first = ((first.len().min(hl as usize) - HEAD) / ENTRY).min(count);
+        let mut wanted: Vec<ObjectId> = ids.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut found: HashMap<ObjectId, Slot> = HashMap::with_capacity(wanted.len());
+        let last_first = lookup_slice(&first[HEAD..HEAD + in_first * ENTRY], hl, size, None, None, &wanted, &mut found)
+            .with_context(|| format!("reading pack {k}"))?;
+        drop(first);
+        if in_first < count {
+            let rem_start = match last_first {
+                Some(last_id) => wanted.partition_point(|id| *id <= last_id),
+                None => 0,
+            };
+            if rem_start < wanted.len() {
+                bisect_slots(store, &k, hl, size, in_first, count, last_first, None, &wanted[rem_start..], &mut found)
+                    .await
+                    .with_context(|| format!("reading pack {k}"))?;
+            }
+        }
+        let slots = ids.iter().filter_map(|id| Some((*id, *found.get(id)?))).collect();
+        Ok(Some(StagedSlots { objects: count, size, slots }))
     }
 
     /// Discard staged packs `names` of `project`: the row turns discarded
@@ -938,6 +1192,113 @@ impl Packs {
             None => Ok(()),
         }
     }
+}
+
+const WINDOW_ENTRIES: usize = (FIRST_READ as usize) / ENTRY;
+
+/// Validate a contiguous slice of index entries against `hl` and `size`, and
+/// record any entries whose object id is in sorted `wanted` into `found`.
+/// Returns the last entry's `(end_offset, id)`.
+fn lookup_slice(
+    slice: &[u8],
+    hl: u64,
+    size: u64,
+    prev_id: Option<ObjectId>,
+    next_id: Option<ObjectId>,
+    wanted: &[ObjectId],
+    found: &mut HashMap<ObjectId, Slot>,
+) -> Result<Option<ObjectId>> {
+    ensure!(slice.len().is_multiple_of(ENTRY), "pack index slice is not a whole number of entries");
+    let mut prev = prev_id;
+    let mut last = None;
+    for chunk in slice.as_chunks::<ENTRY>().0 {
+        let (id, slot) = parse_entry(chunk, hl, Some(size))?;
+        if let Some(p) = prev {
+            ensure!(id > p, "a pack's index is not sorted");
+        }
+        if wanted.binary_search(&id).is_ok() {
+            found.insert(id, slot);
+        }
+        prev = Some(id);
+        last = Some(id);
+    }
+    if let (Some(last_id), Some(n)) = (last, next_id) {
+        ensure!(last_id < n, "a pack's index is not sorted");
+    }
+    Ok(last)
+}
+
+type BisectStep<'a> = (usize, usize, Option<ObjectId>, Option<ObjectId>, &'a [ObjectId]);
+
+/// Find `wanted` (sorted, deduplicated) in entries `lo..hi` of a pack index in
+/// `store` by bisecting with ranged reads of at most [`WINDOW_ENTRIES`]
+/// entries (within one [`FIRST_READ`] buffer).
+#[allow(clippy::too_many_arguments)]
+async fn bisect_slots(
+    store: &dyn BlobStore,
+    key: &str,
+    hl: u64,
+    size: u64,
+    lo: usize,
+    hi: usize,
+    prev_before_lo: Option<ObjectId>,
+    next_after_hi: Option<ObjectId>,
+    wanted: &[ObjectId],
+    found: &mut HashMap<ObjectId, Slot>,
+) -> Result<()> {
+    let mut work: Vec<BisectStep<'_>> = vec![(lo, hi, prev_before_lo, next_after_hi, wanted)];
+    while let Some((lo, hi, prev_lo, next_hi, sub)) = work.pop() {
+        if lo >= hi || sub.is_empty() {
+            continue;
+        }
+        let span = hi - lo;
+        let (w_lo, w_hi) = if span <= WINDOW_ENTRIES {
+            (lo, hi)
+        } else {
+            let half = WINDOW_ENTRIES / 2;
+            let w_lo = (lo + span / 2).saturating_sub(half).max(lo);
+            let w_hi = (w_lo + WINDOW_ENTRIES).min(hi);
+            (w_lo, w_hi)
+        };
+        let start = HEAD as u64 + (w_lo * ENTRY) as u64;
+        let want_bytes = (w_hi - w_lo) * ENTRY;
+        let end = start + want_bytes as u64 - 1;
+        let (bytes, total) = store.get_range(key, start, end).await?.context("pack vanished while bisecting its index")?;
+        ensure!(total == size && bytes.len() == want_bytes, "pack index truncated at {start}..={end}");
+        let first_id = ObjectId(bytes[..32].try_into().unwrap());
+        if let Some(p) = prev_lo {
+            ensure!(first_id > p, "pack index is not sorted");
+        }
+        if let Some(n) = next_hi {
+            ensure!(first_id < n, "pack index is not sorted");
+        }
+        let last_id = lookup_slice(
+            &bytes,
+            hl,
+            size,
+            if w_lo == lo { prev_lo } else { None },
+            if w_hi == hi { next_hi } else { None },
+            sub,
+            found,
+        )?
+        .expect("window is non-empty");
+        if let Some(n) = next_hi {
+            ensure!(last_id < n, "pack index is not sorted");
+        }
+        if w_hi < hi {
+            let right_start = sub.partition_point(|id| *id <= last_id);
+            if right_start < sub.len() {
+                work.push((w_hi, hi, Some(last_id), next_hi, &sub[right_start..]));
+            }
+        }
+        if w_lo > lo {
+            let left_end = sub.partition_point(|id| *id < first_id);
+            if left_end > 0 {
+                work.push((lo, w_lo, prev_lo, Some(first_id), &sub[..left_end]));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1244,13 +1605,13 @@ mod tests {
     /// its share back.
     #[tokio::test]
     async fn indexes_held_outside_the_lookup_maps_share_one_bound() {
-        let total = 64 << 10;
+        let total = 128 << 10;
         let bound = Bound { most: total, wait: Duration::from_millis(100), ..Bound::new(total) };
         let packs = Packs { bound: bound.clone(), ..Packs::new(None) };
         let dir = tempfile::tempdir().unwrap();
         let store: Arc<dyn BlobStore> = Arc::new(crate::store::FsStore::new(dir.path()));
         // 1,000 objects: an index of 48 KiB, which with the parse's working
-        // copy and the bytes read takes more than half the bound.
+        // copy and the bytes read (108 KiB) takes more than half the bound.
         let objects: Vec<_> = (0..1_000).map(|i| obj(&format!("held {i}"))).collect();
         let ids: Vec<ObjectId> = objects.iter().map(|(id, _)| *id).collect();
         let (bytes, _) = build(objects).unwrap();
@@ -1433,19 +1794,12 @@ mod tests {
     ///   with nothing beside them to take: past 10 s of queued reads (16 a
     ///   push, about a second each on an object store) it is answered 503.
     ///
-    /// One participant of a project of their own uploads a few such packs
-    /// once, then keeps a few pushes of a few hundred bytes in flight, each
-    /// naming one receipt of each (losing their race, so the uploads stay
-    /// staged). S24's limits (200 requests a second per device, per-project
-    /// bulkheads, 512 MiB of bodies) do not stop it. Here at a small scale
-    /// with the server's proportions (a bound of 1 MiB; the cache holding
-    /// what leaves one holder the most it may take; a wait shorter than one
-    /// large read): four tasks of one project read a large staged index in
-    /// a loop (a store that takes 600 ms to read an index past its first
-    /// bytes); another project's three lookups of a 10-object pack, one
-    /// after another, are refused.
+    /// Fixed (cycle 5): (a) `staged_slots` bisects an uncached staged index
+    /// with ranged reads under one `FIRST_READ` (64 KiB) share rather than
+    /// reading and parsing the whole index, and (b) `Bound` gives each
+    /// project its own fair share so one project's concurrent reads/writes
+    /// can never starve another project's.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    #[ignore = "BUG-1620: one person's requests can hold the server-wide bound on pack indexes, so every other project's uploads, pushes and paged lookups wait 10 s and are answered 503"]
     async fn bug_1620_one_persons_index_reads_never_starve_another_projects_lookup() {
         struct Slow(crate::store::FsStore);
         #[async_trait::async_trait]
@@ -1491,11 +1845,19 @@ mod tests {
         assert_eq!(packs.bound.available(), total - w, "the cache holds its index's share");
         assert!(packs.staged_cached(1, &cached_name).is_some());
         // The participant's large staged upload: 20,000 objects, an index
-        // the cache does not hold, read under the largest share.
+        // the cache does not hold.
         let big: Vec<_> = (0..20_000).map(|i| obj(&format!("staged {i}"))).collect();
-        let probe = big[0].0;
+        let mut sorted_ids: Vec<ObjectId> = big.iter().map(|(id, _)| *id).collect();
+        sorted_ids.sort_unstable();
+        // Pick an id near the end of the sorted index so bisection must range-read past FIRST_READ,
+        // and verify staged_slots finds ids across start, middle, and end.
+        let probe = *sorted_ids.last().unwrap();
+        let sample = [sorted_ids[0], sorted_ids[sorted_ids.len() / 2], probe, ObjectId::hash(b"absent")];
         let big_name: Arc<str> = Arc::from(new_name());
         store.put(&key(1, &big_name), build(big).unwrap().0).await.unwrap();
+        let check = packs.staged_slots(&*store, 1, &big_name, &sample).await.unwrap().unwrap();
+        assert_eq!(check.objects, 20_000);
+        assert_eq!(check.slots.len(), 3, "start, middle, and end ids found by ranged bisection");
         // Other projects' listed packs of 10 objects, their indexes unloaded.
         let mut wanted = Vec::new();
         for project in 2..5 {
@@ -1513,13 +1875,19 @@ mod tests {
         assert_eq!(found.map(|(n, _)| n), Some(name0), "an idle server finds it");
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut pushes = tokio::task::JoinSet::new();
-        for _ in 0..4 {
+        for i in 0..4 {
             let (packs, store, stop, name) = (packs.clone(), store.clone(), stop.clone(), big_name.clone());
             pushes.spawn(async move {
                 let mut n = 0;
                 while !stop.load(Ordering::Relaxed) {
-                    if let Ok(Some(s)) = packs.staged_slots(&*store, 1, &name, &[probe]).await {
-                        assert_eq!(s.slots.len(), 1);
+                    // Half run staged_slots, half hold project 1's full fair share via take_for(Some(1), ...)
+                    if i < 2 {
+                        if let Ok(Some(s)) = packs.staged_slots(&*store, 1, &name, &[probe]).await {
+                            assert_eq!(s.slots.len(), 1);
+                            n += 1;
+                        }
+                    } else if let Ok(_s) = packs.bound.take_for(Some(1), (192 << 10) as u64).await {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                         n += 1;
                     }
                 }
@@ -1531,6 +1899,8 @@ mod tests {
         for (project, id, name) in &wanted {
             let t = Instant::now();
             answers.push((packs.find_paged(&store, *project, id, &reads).await, t.elapsed(), name.clone()));
+            // Another project's upload share (`take_for`) and `staged_slots` also succeed immediately.
+            let _upload = packs.bound.take_for(Some(*project), Index::write_weight_of(10) as u64).await.expect("other project's upload share is never starved");
         }
         stop.store(true, Ordering::Relaxed);
         let mut read = 0;
@@ -1556,31 +1926,97 @@ mod tests {
     /// MiB for every request together"). Writing a pack is counted short the
     /// same way: `Objects::write_pack` takes a share for the parsed index
     /// only, while `build` also holds the pack's index bytes (44 bytes a
-    /// slot) and its set of ids seen (about 2^22 slots of 33 bytes for 2^21
-    /// objects). An upload of a million tiny objects (the hostile test of
-    /// BUG-1496 sends two) reaches this. Here at a small scale with the same
-    /// proportions (a 96 KiB bound, 64 KiB at most for one holder, an index
-    /// of 96 KiB), then at the server's sizes.
+    /// slot). Fixed (cycle 5): `Bound::permits` never clamps a share below
+    /// what it holds; `MAX_OBJECTS` is 262,144 (`256 << 10`), whose index
+    /// takes 27 MiB to read and parse, 23 MiB to build, and 12 MiB to hold;
+    /// `write_pack` takes `Index::write_weight_of`; and `build` deduplicates
+    /// in place without a hash set. Measured in a child process against
+    /// `INDEXES_HELD` (96 MiB).
     #[tokio::test]
-    #[ignore = "BUG-1621: a share of the bound on pack indexes is clamped at 64 MiB, while a pack's index may need 216 MiB to read and 96 MiB to hold"]
     async fn bug_1621_an_index_held_outside_the_lookup_maps_holds_a_share_of_all_it_holds() {
+        const CHILD: &str = "VEIL_TEST_BUG_1621_CHILD";
+        const NAME: &str = "pack::tests::bug_1621_an_index_held_outside_the_lookup_maps_holds_a_share_of_all_it_holds";
+        if std::env::var_os(CHILD).is_some() {
+            let rss = || -> usize {
+                let s = std::fs::read_to_string("/proc/self/status").unwrap();
+                let l = s.lines().find(|l| l.starts_with("VmRSS:")).unwrap();
+                l.split_whitespace().nth(1).unwrap().parse::<usize>().unwrap() << 10
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let store = crate::store::FsStore::new(dir.path());
+            for (p, count) in [(1i64, MAX_OBJECTS), (2, MAX_OBJECTS), (3, 140_000), (4, MAX_OBJECTS), (5, MAX_OBJECTS)] {
+                let items: Vec<_> = (0..count)
+                    .map(|i| {
+                        let id = ObjectId::hash(&[p.to_le_bytes(), (i as u64).to_le_bytes()].concat());
+                        (id, Bytes::from_static(b"x"))
+                    })
+                    .collect();
+                let (bytes, _) = build(items).unwrap();
+                store.put(&key(p, "full"), bytes).await.unwrap();
+            }
+            let packs = Packs::new(None);
+            let before = rss();
+            let mut peak = 0usize;
+            // Fill the 32 MiB staged-index cache with 3 packs (~31 MiB).
+            for p in 1..=3i64 {
+                let held = read_index(&store, &key(p, "full"), &packs.bound).await.unwrap().unwrap();
+                peak = peak.max(rss().saturating_sub(before));
+                packs.staged_here(p, 1, &Arc::from("full"), held);
+                peak = peak.max(rss().saturating_sub(before));
+            }
+            // Read two full MAX_OBJECTS indexes concurrently while the staged-index cache holds ~31 MiB.
+            let (k4, k5) = (key(4, "full"), key(5, "full"));
+            let (h4, h5) = tokio::join!(
+                read_index(&store, &k4, &packs.bound),
+                read_index(&store, &k5, &packs.bound),
+            );
+            let (h4, h5) = (h4.unwrap().unwrap(), h5.unwrap().unwrap());
+            peak = peak.max(rss().saturating_sub(before));
+            let accounted = INDEXES_HELD - packs.bound.available();
+            drop((h4, h5));
+            println!("INDEX-BOUND accounted={accounted} peak={peak} staged={}", packs.staged.stats().weight);
+            return;
+        }
         let total = 96 << 10;
         let bound = Bound { most: 64 << 10, wait: Duration::from_millis(100), ..Bound::new(total) };
         let dir = tempfile::tempdir().unwrap();
         let store = crate::store::FsStore::new(dir.path());
-        let n = 2_048;
+        // An oversized index (2,048 objects needs 216 KiB to read > 64 KiB `most`) is refused, never clamped to a smaller share.
+        assert!(bound.take(Index::read_weight_of(2_048) as u64).await.is_err(), "a share above `most` is refused, never clamped");
+        let n = MAX_OBJECTS >> 10;
         let (bytes, _) = build((0..n).map(|i| obj(&format!("full {i}"))).collect()).unwrap();
         store.put(&key(7, "full"), bytes).await.unwrap();
         let held = read_index(&store, &key(7, "full"), &bound).await.unwrap().expect("the pack is stored");
         assert_eq!(held.index.len(), n, "the index is read");
         let share = total - bound.available();
         assert!(share >= held.index.weight(), "an index of {} bytes held under a share of {share}", held.index.weight());
-        // The server's sizes.
+        drop(held);
+        // The server's sizes: read, write, and held shares cover every byte they use.
         let packs = Packs::new(None);
         let n = MAX_OBJECTS;
-        let read = (HEAD + n * ENTRY + Index::weight_of(n) + n * std::mem::size_of::<Slot>()) as u64;
+        let read = Index::read_weight_of(n) as u64;
+        let write = Index::write_weight_of(n) as u64;
         let hold = Index::weight_of(n) as u64;
-        let (r, h) = (u64::from(packs.bound.permits(read)), u64::from(packs.bound.permits(hold)));
-        assert!(r >= read && h >= hold, "reading the index of a full pack takes a share of {} MiB for {} MiB, holding it {} MiB for {} MiB", r >> 20, read >> 20, h >> 20, hold >> 20);
+        let (r, w, h) = (
+            u64::from(packs.bound.permits(read)),
+            u64::from(packs.bound.permits(write)),
+            u64::from(packs.bound.permits(hold)),
+        );
+        assert!(r >= read && w >= write && h >= hold && (r as usize) <= packs.bound.most, "reading the index of a full pack takes a share of {} MiB for {} MiB, writing {} MiB for {} MiB, holding {} MiB for {} MiB", r >> 20, read >> 20, w >> 20, write >> 20, h >> 20, hold >> 20);
+        // Measure real peak memory in a child process against `INDEXES_HELD` (96 MiB).
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--nocapture", "--include-ignored", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("MALLOC_MMAP_THRESHOLD_", "131072")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "the child failed: {text}{}", String::from_utf8_lossy(&out.stderr));
+        let line = text.lines().find_map(|l| l.find("INDEX-BOUND").map(|at| &l[at..])).unwrap_or_else(|| panic!("no measurement in {text}"));
+        println!("{line}");
+        let field = |k: &str| -> usize { line.split_whitespace().find_map(|w| w.strip_prefix(k)).unwrap().parse().unwrap() };
+        let (accounted, peak) = (field("accounted="), field("peak="));
+        assert!(accounted <= INDEXES_HELD, "{line}");
+        assert!(peak <= INDEXES_HELD, "indexes outside the lookup maps took {} MiB at peak against the {} MiB bound ({line})", peak >> 20, INDEXES_HELD >> 20);
     }
 }

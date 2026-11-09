@@ -746,7 +746,7 @@ pub struct State {
     slots: Arc<tokio::sync::Semaphore>,
 }
 
-type Fill = watch::Receiver<Option<std::result::Result<(), String>>>;
+type Fill = watch::Receiver<Option<std::result::Result<(), (bool, String)>>>;
 
 impl Default for State {
     fn default() -> Self {
@@ -824,7 +824,10 @@ pub async fn ensure(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[
             Some(d) => tokio::time::timeout_at(d.into(), done).await.map_err(|_| warming())?,
             None => done.await,
         };
-        if let Some(Err(e)) = outcome {
+        if let Some(Err((full, e))) = outcome {
+            if full {
+                return Err(Error::Other(anyhow::Error::new(crate::pack::IndexesFull)));
+            }
             return Err(Error::Other(anyhow::anyhow!("filling a viewer graph: {e}")));
         }
         ours_done = started;
@@ -901,7 +904,10 @@ fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, t
             eprintln!("veil-server: filling a viewer graph of project {}: {e:?}", project.id);
         }
         hub.query.fills.lock().unwrap().remove(&key);
-        let _ = tx.send(Some(r.map(|_| ()).map_err(|e| format!("{e:?}"))));
+        let _ = tx.send(Some(r.map(|_| ()).map_err(|e| {
+            let full = matches!(&e, Error::Other(a) if crate::pack::indexes_full(a));
+            (full, format!("{e:?}"))
+        })));
     });
     (rx, true)
 }

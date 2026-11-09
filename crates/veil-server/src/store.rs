@@ -759,7 +759,7 @@ impl Objects {
     /// [`Objects::put_pack`]; with `staged_by`, the pack is recorded staged
     /// for that person before it is written (without, only in tests).
     async fn write_pack(&self, project: i64, objects: Vec<(ObjectId, Bytes)>, staged_by: Option<i64>) -> Result<(Arc<str>, Held)> {
-        let share = self.packs.bound().take(Index::weight_of(objects.len()) as u64).await?;
+        let share = self.packs.bound().take_for(Some(project), Index::write_weight_of(objects.len()) as u64).await?;
         let name: Arc<str> = crate::pack::new_name().into();
         for (id, enc) in &objects {
             self.cache.insert(Self::staged_key(project, &name, id, false), enc.clone(), enc.len());
@@ -1846,7 +1846,6 @@ mod tests {
     /// not loaded: `Source::raw` of an object in it is refused, as it must
     /// be, and the refusal is answered 500.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "BUG-1622: an object read through sync::Source that finds the bound on pack indexes full is answered 500 internal, not 503 busy"]
     async fn bug_1622_a_full_bound_on_indexes_is_answered_busy_through_every_reader() {
         use axum::response::IntoResponse;
         let dir = tempfile::tempdir().unwrap();
@@ -1872,14 +1871,31 @@ mod tests {
             caches: Default::default(),
             derive: crate::derive::Workers::new(db),
             query: Default::default(),
+            limits: crate::limits::Limits::new(Default::default(), 1),
         });
         let bound = objects.packs.bound();
-        let _held = (bound.take(crate::pack::INDEXES_HELD as u64).await.unwrap(), bound.take(bound.available() as u64).await.unwrap());
+        let first_share = bound.take(64 << 20).await.unwrap();
+        let second_share = bound.take(bound.available() as u64).await.unwrap();
+        let _held = (first_share, second_share);
         assert_eq!(bound.available(), 0, "every share held");
         let src = crate::sync::Source { hub: hub.clone(), project: 1, rt: tokio::runtime::Handle::current(), pending: Default::default(), staged: None };
-        let got = tokio::task::spawn_blocking(move || src.raw(&id)).await.unwrap();
-        let e = got.expect_err("no share of the bound: the read is refused");
-        let status = crate::error::Error::from(e).into_response().status();
-        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "a read refused for want of a share of the bound on indexes is answered {status}");
+        let src2 = crate::sync::Source { hub: hub.clone(), project: 1, rt: tokio::runtime::Handle::current(), pending: Default::default(), staged: None };
+        let (got_raw, got_enc) = tokio::join!(
+            tokio::task::spawn_blocking(move || src.raw(&id)),
+            tokio::task::spawn_blocking(move || src2.encoded(&id)),
+        );
+        for (which, e) in [
+            ("Source::raw", crate::error::Error::from(got_raw.unwrap().expect_err("no share of the bound: raw read is refused"))),
+            ("Source::encoded", crate::error::Error::from(got_enc.unwrap().expect_err("no share of the bound: encoded read is refused"))),
+        ] {
+            let resp = e.into_response();
+            let status = resp.status();
+            assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{which}: a read refused for want of a share of the bound on indexes is answered {status}");
+            assert!(resp.headers().get(axum::http::header::RETRY_AFTER).is_some(), "{which}: missing Retry-After header");
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["code"], "busy", "{which}: {json}");
+            assert!(json["retry_after_ms"].as_u64().unwrap_or(0) >= 500, "{which}: missing retry_after_ms in {json}");
+        }
     }
 }

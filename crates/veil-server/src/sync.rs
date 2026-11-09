@@ -179,7 +179,7 @@ impl Source {
                 // (BUG-1155: that would answer for what the pusher did not
                 // upload).
                 let got = self.rt.block_on(self.hub.objects.get_staged(self.project, name, *slot, id));
-                let Some((_, raw)) = got.map_err(|e| VeilError::Repo(format!("object store: {e}")))? else {
+                let Some((_, raw)) = got.map_err(store_err)? else {
                     return Err(VeilError::Missing(*id));
                 };
                 st.touched.lock().unwrap().insert(*id);
@@ -189,7 +189,7 @@ impl Source {
         self.hub
             .objects
             .get_blocking(&self.rt, self.project, id)
-            .map_err(|e| VeilError::Repo(format!("object store: {e}")))?
+            .map_err(store_err)?
             .ok_or(VeilError::Missing(*id))
     }
 
@@ -200,7 +200,7 @@ impl Source {
         }
         self.rt
             .block_on(self.hub.objects.get_encoded(self.project, id))
-            .map_err(|e| VeilError::Repo(format!("object store: {e}")))?
+            .map_err(store_err)?
             .ok_or(VeilError::Missing(*id))
     }
 
@@ -209,6 +209,21 @@ impl Source {
             Object::Snapshot(s) => Ok(Arc::new(s)),
             o => Err(VeilError::Corrupt(id.hex(), format!("expected a snapshot, found a {}", o.kind_name()))),
         }
+    }
+}
+
+/// Keep a store error's cause (`pack::IndexesFull` included: BUG-1622)
+/// through [`VeilError`].
+fn store_err(e: anyhow::Error) -> VeilError {
+    VeilError::Io {
+        path: "object store".into(),
+        source: match e.downcast::<crate::pack::IndexesFull>() {
+            Ok(full) => std::io::Error::other(full),
+            Err(e) => match e.downcast::<std::io::Error>() {
+                Ok(io) => io,
+                Err(e) => std::io::Error::other(e),
+            },
+        },
     }
 }
 
@@ -1916,14 +1931,23 @@ async fn push_staged(
     })
     .await?
     };
-    if !moved.is_empty() {
-        // Before anything reads what it stored.
-        hub.objects.listed(project.id, listed.iter().map(|p| (p.name.clone(), p.held.as_ref().map(|h| h.index.clone()))).collect());
+    let kept = if !moved.is_empty() {
+        // Before anything reads what it stored; the push's share of the
+        // index bound goes back as soon as its index enters the lookup map.
+        let (for_cache, names): (Vec<_>, HashSet<_>) = listed
+            .into_iter()
+            .map(|p| ((p.name.clone(), p.held.map(|h| h.index)), p.name))
+            .unzip();
+        hub.objects.listed(project.id, for_cache);
         hub.caches.tips_changed(project.id);
         for c in &completed {
             hub.caches.put_committed(project.id, &c.real);
         }
-    }
+        Some(names)
+    } else {
+        drop(listed);
+        None
+    };
     for ((view_key, real, projected), stored) in deferred.rows.iter().zip(memo_stored) {
         if stored {
             hub.caches.put_memo(project.id, view_key, real, projected);
@@ -1931,7 +1955,6 @@ async fn push_staged(
     }
     // Derived history data for the branches moved, in the background: the
     // push never waits.
-    let landed = !moved.is_empty();
     crate::derive::landed(hub, project.id, moved);
     // The tips as the pusher sees them now (their own snapshots, where the
     // server's projection gives them back).
@@ -1956,7 +1979,6 @@ async fn push_staged(
         };
         results.push(BranchResult { branch, ok: true, message: None, tip });
     }
-    let kept = landed.then(|| listed.into_iter().map(|p| p.name).collect());
     Ok((PushResult { results, warnings }, kept))
 }
 
@@ -2052,10 +2074,16 @@ async fn packs_to_list(
             .map_err(|e| Error::Other(e.into()))?;
         own.extend(enc);
     }
-    if !own.is_empty() {
+    while !own.is_empty() {
+        let rest = if own.len() > crate::pack::MAX_OBJECTS {
+            own.split_off(crate::pack::MAX_OBJECTS)
+        } else {
+            Vec::new()
+        };
         let (name, held) = hub.objects.put_pack(project, person, own).await.map_err(Error::Other)?;
         progress.lock().unwrap().written.push(name.clone());
         listed.push(ListedPack { name, size: held.size, objects: held.index.len(), held: Some(held) });
+        own = rest;
     }
     Ok(listed)
 }
@@ -2273,7 +2301,7 @@ pub(crate) async fn settle_uploads<T>(
 pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limit: u64) -> Result<Vec<String>> {
     // The checks, decoding and compressing on a blocking thread.
     let rt = Handle::current();
-    let frames: Vec<(ObjectId, Bytes)> = tokio::task::spawn_blocking(move || -> Result<Vec<(ObjectId, Bytes)>> {
+    let mut frames: Vec<(ObjectId, Bytes)> = tokio::task::spawn_blocking(move || -> Result<Vec<(ObjectId, Bytes)>> {
         let mut left = limit;
         let mut out = Vec::new();
         for (id, enc) in encoding::split_frames(&body)? {
@@ -2323,10 +2351,20 @@ pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limi
     if frames.is_empty() {
         return Ok(Vec::new());
     }
-    let ids: Vec<ObjectId> = frames.iter().map(|(id, _)| *id).collect();
-    // Encodings, checked above: staged as they are, never encoded again.
-    let pack = crate::store::own(hub.objects.stage(project, person, frames)).await.map_err(Error::Other)?;
-    Ok(ids.iter().map(|id| receipt(hub, project, person, id, &pack)).collect())
+    let mut receipts = Vec::with_capacity(frames.len());
+    while !frames.is_empty() {
+        let rest = if frames.len() > crate::pack::MAX_OBJECTS {
+            frames.split_off(crate::pack::MAX_OBJECTS)
+        } else {
+            Vec::new()
+        };
+        let ids: Vec<ObjectId> = frames.iter().map(|(id, _)| *id).collect();
+        // Encodings, checked above: staged as they are, never encoded again.
+        let pack = crate::store::own(hub.objects.stage(project, person, frames)).await.map_err(Error::Other)?;
+        receipts.extend(ids.iter().map(|id| receipt(hub, project, person, id, &pack)));
+        frames = rest;
+    }
+    Ok(receipts)
 }
 
 /// Store `objects` (canonical encodings; compressed by the store) in

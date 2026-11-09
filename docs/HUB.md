@@ -2564,14 +2564,26 @@ Nothing changes for `vl` or on the wire.
   lookups page in or out meanwhile (BUG-1495). **Every pack index held in
   memory outside the lookup maps holds a share of one server-wide bound**
   (`pack::INDEXES_HELD`, 96 MiB for every request together, of which the
-  staged-index cache may hold 32 MiB), taken before the index is read or
-  built: one being read for a lookup or a listing, the pack a push writes,
-  and a push's staged uploads' (a push keeps of each only the slots its
-  receipts name and the index's object count; the index itself is held
-  while it is read). A listing loads each index as it is read and leaves
-  the rest unloaded when the bound is full (a lookup reads them later);
-  a request that gets no share within 10 s is answered 503 `busy` (try
-  again), never with an index held outside the bound (BUG-1496). Then
+  staged-index cache may hold 32 MiB), taken before the first bytes are
+  read or the index is built and covering all memory the operation holds
+  (the index bytes, the parsed index and the parse's working copy for
+  `read_index`; the index bytes and parsed index for `write_pack`, with
+  `pack::MAX_OBJECTS` at 262,144 so a full pack's index takes at most 27
+  MiB to read, 23 MiB to build and 12 MiB to hold, never clamped:
+  BUG-1621): one being read for a lookup or a listing, the pack a push
+  writes (its share released as soon as `listed()` enters the index in the
+  lookup map, before `projected()`), and a push's staged uploads' (when not
+  in the staged-index cache, `pack::Packs::staged_slots` bisects the sorted
+  stored index by 64 KiB ranged reads under one 64 KiB share and keeps only
+  the slots its receipts name and the object count, never reading the whole
+  index; each project also has its own fair share of the active bound so
+  one project's load can never starve another's: BUG-1620). A listing loads
+  each index as it is read and leaves the rest unloaded when the bound is
+  full (a lookup reads them later); a request that gets no share within
+  10 s is answered 503 `busy` with `retry_after_ms` (and `Retry-After`)
+  across every reader (`sync::Source`, projections, viewer-graph fills,
+  queries, search), never 500 and never with an index held outside the
+  bound (BUG-1496, BUG-1622). Then
   loose (objects from
   before S28, and what grants, API commits, the deriver and the search
   index store). After a miss in both it reads the project's listing again
