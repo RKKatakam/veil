@@ -1048,3 +1048,129 @@ fn s8r2_a_refusal_met_on_one_thread_never_hides_another_threads_read() {
     });
     assert!(hidden.is_empty(), "{} of 600 files the server serves read as Missing (hidden) while another thread met a refusal: {:?}", hidden.len(), &hidden[..hidden.len().min(10)]);
 }
+
+// ---- Review of `s8j` (BUG-1509's move to the current view) ----
+
+/// Copy snapshot `s`, its ancestors and every object their trees name from
+/// `from` to `to` (a second view's history on the same test server).
+fn copy_closure(from: &ObjectStore, to: &ObjectStore, s: ObjectId) {
+    let mut stack = vec![s];
+    let mut seen = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        to.put_raw(&id, &from.get_raw(&id).unwrap()).unwrap();
+        match from.get(&id).unwrap() {
+            Object::Snapshot(snap) => {
+                stack.extend(snap.parents.iter().copied());
+                stack.push(snap.tree);
+            }
+            Object::Tree(t) => stack.extend(t.entries.iter().map(|e| e.id)),
+            _ => {}
+        }
+    }
+}
+
+/// A server whose person's view changed: `history` answers each snapshot of
+/// the older view with its projection in the current one (as the Veil
+/// server does, `sync::history`), and fails once, as a transient error,
+/// for the snapshots in `flaky`.
+struct Projecting {
+    inner: Arc<Server>,
+    map: std::collections::HashMap<ObjectId, ObjectId>,
+    flaky: Mutex<HashSet<ObjectId>>,
+    tips: Vec<ObjectId>,
+}
+
+impl Promisor for Projecting {
+    fn fetch(&self, wants: &[Located]) -> veil_core::Result<Vec<Option<Vec<u8>>>> {
+        self.inner.fetch(wants)
+    }
+
+    fn history(&self, tips: &[ObjectId], limit: usize) -> veil_core::Result<Vec<(ObjectId, Vec<u8>)>> {
+        if let [t] = tips {
+            if self.flaky.lock().unwrap().remove(t) {
+                return Err(VeilError::Unavailable("test server: 502 bad gateway".into()));
+            }
+        }
+        let tips: Vec<ObjectId> = tips.iter().map(|t| *self.map.get(t).unwrap_or(t)).collect();
+        self.inner.history(&tips, limit)
+    }
+
+    fn server_tips(&self) -> Vec<ObjectId> {
+        self.tips.clone()
+    }
+
+    fn generations(&self, snapshots: &[ObjectId]) -> veil_core::Result<Option<Vec<Option<u64>>>> {
+        self.inner.generations(snapshots)
+    }
+}
+
+/// BUG-1564 (review of `s8j`): a transient error from the server while the
+/// clone moves to its person's current view is taken for "this snapshot is
+/// only this clone's" (`ObjectStore::is_servers` is `false` on any failed
+/// request), so the move rewrites the server's own change as if it were
+/// local work: `main` is left on a local copy of the admin's commit,
+/// divergent from the server's, instead of its projection. Expected: a
+/// failed request fails the move, which changes nothing (the command, or
+/// the next one, moves).
+#[test]
+#[ignore = "BUG-1564: a transient error during the move to the current view rewrites a server change as local work"]
+fn s8jr_a_transient_error_during_the_move_never_rewrites_a_server_change() {
+    // The older view: `c1` (src/ and bill/), then `c2` (src/ only).
+    let id = Identity::generate("alice");
+    let sfs = Arc::new(MemoryBackend::new());
+    let mut srepo = Repo::init(sfs.clone(), Some(id.clone()), "alice").unwrap();
+    let c1 = commit_files(&mut srepo, &*sfs, &[("src/a.txt", "a one\n"), ("bill/x.txt", "billing\n")], "one");
+    let c2 = commit_files(&mut srepo, &*sfs, &[("src/a.txt", "a two\n")], "two");
+    // `main` was rewritten on the server since: the remote tag names `c2b`,
+    // and no remote tag reaches `c2`, which the person's work stands on.
+    checkout(&mut srepo, &sfs, c1);
+    let c2b = commit_files(&mut srepo, &*sfs, &[("src/a.txt", "a two, again\n")], "two again");
+    // The current view, without bill/: the same commits projected.
+    let pfs = Arc::new(MemoryBackend::new());
+    let mut prepo = Repo::init(pfs.clone(), Some(id.clone()), "alice").unwrap();
+    let n1 = commit_files(&mut prepo, &*pfs, &[("src/a.txt", "a one\n")], "one");
+    let n2 = commit_files(&mut prepo, &*pfs, &[("src/a.txt", "a two\n")], "two");
+    copy_closure(prepo.store(), srepo.store(), n2);
+    let server = Arc::new(Server {
+        store: srepo.store().clone(),
+        tips: vec![c2b],
+        down: AtomicBool::new(false),
+        tamper: AtomicBool::new(false),
+        refuse: Mutex::new(HashSet::new()),
+        asked: Mutex::new(Vec::new()),
+        pages: Mutex::new(0),
+    });
+    let pr = Project { server: server.clone(), commits: vec![c1, c2, c2b], tip: c2b, id };
+    let (mut repo, fs) = thin(&pr, 1 << 30);
+    // History as a clone pages it in: the snapshots below its tips.
+    for s in [c1, c2] {
+        repo.store().put_raw(&s, &pr.server.store.get_raw(&s).unwrap()).unwrap();
+    }
+    checkout(&mut repo, &fs, c2);
+    let mine = commit_files(&mut repo, &*fs, &[("src/mine.txt", "mine\n")], "mine");
+    repo.set_tag("main", c2, true).unwrap();
+    repo.set_tag("mine", mine, true).unwrap();
+    // The person's access changed; the next command (a new process) moves
+    // the clone, and one history request fails on the way.
+    drop(repo);
+    let mut repo = Repo::open(fs.clone(), Some(pr.id.clone()), "alice").unwrap();
+    repo.store().set_promisor(Arc::new(Projecting {
+        inner: server.clone(),
+        map: [(c1, n1), (c2, n2)].into_iter().collect(),
+        flaky: Mutex::new(HashSet::from([c2])),
+        tips: vec![c2b],
+    }));
+    let before = repo.view().tags.clone();
+    let mut tx = repo.transaction("pull").unwrap();
+    // Actual: `Ok` with 3 changes moved, `c2` among them; at commit `main`
+    // names a snapshot of the clone's own, `c2` rewritten onto `n1` and
+    // signed by the clone (its predecessor `c2`), not `n2`.
+    let r = tx.move_to_view();
+    let err = r.expect_err("a failed request must fail the move");
+    assert!(matches!(err, VeilError::Unavailable(_)), "{err:?}");
+    drop(tx);
+    assert_eq!(repo.view().tags, before, "nothing changed");
+}

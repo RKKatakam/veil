@@ -2419,3 +2419,240 @@ fn bug_1558_restore_takes_the_recorded_version_of_a_kept_edit() {
     let st = status_json(&p.fin, &d);
     assert!(!st["conflicts"].as_array().unwrap().iter().any(|c| c["path"] == q3.as_str()), "{st}");
 }
+
+// ---- Review of `s8j` (BUG-1509's move to the current view): guarantees -------
+
+/// The tags of `clone`, by name.
+fn tags_of(clone: &Path) -> BTreeMap<String, veil_core::ObjectId> {
+    view_state(clone).0
+}
+
+/// The parents of snapshot `id` in `clone`.
+fn parents_by_id(clone: &Path, id: &veil_core::ObjectId) -> Vec<veil_core::ObjectId> {
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(clone)), None, "test").unwrap();
+    repo.snapshot(id).unwrap().parents.clone()
+}
+
+/// Guarantee 1 (review of `s8j`): `vl undo` returns a moved clone exactly
+/// to before with a dirty working copy: an uncommitted edit (recorded by
+/// the command before the move), ignored files in `src/` and below the lost
+/// folder, and the folder's secret `.env`, every file byte for byte.
+#[test]
+fn s8jr_undo_after_a_move_returns_a_dirty_working_copy_byte_for_byte() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let d = fin_chain(&p, &hub, "chain");
+    p.fin.ok(&d, &["ignore", "*.log"]);
+    let scratch = format!("{BILL_DIR}/acme/scratch.log");
+    write_files(&d, &[("src/build.log", "IGNORED-SRC-LOG\n"), (&scratch, "IGNORED-BILL-LOG\n"), ("src/lib.rs", "fin's uncommitted edit\n")]);
+    let env = d.join(format!("{BILL_DIR}/.env"));
+    assert!(std::fs::read_to_string(&env).unwrap().contains(ENV_MARK), "fin held the folder's secret");
+    // The edit recorded in `@` while fin could read everything.
+    p.fin.ok(&d, &["status"]);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let (before, files) = (view_state(&d), walk(&d));
+    let out = p.fin.ok(&d, &["show", "feature"]);
+    assert_eq!(out.matches(MOVED).count(), 1, "{out}");
+    assert_ne!(view_state(&d), before, "the clone moved");
+    assert_eq!(std::fs::read_to_string(d.join("src/lib.rs")).unwrap(), "fin's uncommitted edit\n", "the edit moved with `@`");
+    assert_eq!(std::fs::read_to_string(d.join(&scratch)).unwrap(), "IGNORED-BILL-LOG\n", "an ignored file below the lost folder is never touched");
+    let out = p.fin.ok(&d, &["undo"]);
+    assert!(!out.contains(MOVED), "{out}");
+    assert_eq!(view_state(&d), before, "every reference as before");
+    assert_eq!(walk(&d), files, "every file as before, byte for byte");
+}
+
+/// Guarantee 1 (review of `s8j`): an edit inside the lost folder that is
+/// only in the working copy (recorded in `@` before the access changed)
+/// keeps `@` where it is, with the stack it stands on, never rewritten;
+/// the edit stays on disk, and the next command does not report a move
+/// again.
+#[test]
+fn s8jr_a_working_copy_edit_in_the_lost_folder_keeps_at_and_its_stack() {
+    const EDIT: &str = "MARKER-FINS-UNCOMMITTED-BILLING-5a90\n";
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    let d = fin_chain(&p, &hub, "chain");
+    let invoice = format!("{BILL_DIR}/acme/invoice.txt");
+    write_files(&d, &[(&invoice, EDIT)]);
+    p.fin.ok(&d, &["status"]);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let before = view_state(&d);
+    let out = p.fin.ok(&d, &["show", "feature"]);
+    assert_eq!(out.matches(MOVED).count(), 1, "{out}");
+    assert!(out.contains("kept where it is") && out.contains(&format!("{BILL_DIR}/")), "{out}");
+    let after = view_state(&d);
+    assert_eq!(after.1["default"], before.1["default"], "`@` is never rewritten");
+    assert_eq!((after.0["mine"], after.0["kid"]), (before.0["mine"], before.0["kid"]), "nor the stack it stands on");
+    assert_eq!(std::fs::read_to_string(d.join(&invoice)).unwrap(), EDIT, "the edit stays on disk");
+    let out = p.fin.ok(&d, &["log", "-n", "5"]);
+    assert!(!out.contains(MOVED), "reported once: {out}");
+    assert_eq!(view_state(&d).1["default"], before.1["default"]);
+}
+
+/// Guarantee 3 (review of `s8j`): without an access change nothing moves:
+/// a person who never had the billing folder pushes work the server grafts
+/// it into, pulls, rebases and pushes again, and reads; a person who has
+/// it does the same. No command prints the move's line or rewrites a
+/// change by itself.
+#[test]
+fn s8jr_no_access_change_never_moves_the_clone() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name, "--confirm", &p.fin.fingerprint()]);
+    for (who, name) in [(&p.dev, "dev"), (&p.fin, "fin")] {
+        let d = who.dir(&format!("nomove-{name}"));
+        who.ok(who.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
+        who.ok(&d, &["identity", "confirm", &p.fp]);
+        let mut seen = String::new();
+        write_files(&d, &[(&format!("src/{name}.txt"), "work\n")]);
+        seen.push_str(&who.ok(&d, &["commit", "--no-advance", "-m", "work"]));
+        seen.push_str(&who.ok(&d, &["tag", "set", &format!("w-{name}"), "-r", "@-"]));
+        let out = who.ok(&d, &["push", "-t", &format!("w-{name}")]);
+        assert!(out.contains("pushed"), "{out}");
+        seen.push_str(&out);
+        feature_with(&p, &[(&format!("{BILL_DIR}/acme/later-{name}.txt"), "later\n"), (&format!("src/later-{name}.txt"), "later\n")], &[], "later");
+        let tag_before = tags_of(&d)[&format!("w-{name}")];
+        for args in [
+            vec!["pull"],
+            vec!["log", "-n", "20"],
+            vec!["show", "feature"],
+            vec!["show", &format!("w-{name}")],
+            vec!["rebase", "-s", &format!("w-{name}"), "-d", "feature"],
+            vec!["tag", "set", &format!("r-{name}"), "-r", &format!("w-{name}")],
+            vec!["push", "-t", &format!("r-{name}")],
+            vec!["pull"],
+            vec!["new", "feature"],
+            vec!["diff", "--from", "main", "--to", "feature", "--stat"],
+            vec!["status"],
+        ] {
+            let out = who.ok(&d, &args);
+            seen.push_str(&out);
+        }
+        assert!(!seen.contains(MOVED), "{name}: {seen}");
+        assert_ne!(tags_of(&d)[&format!("w-{name}")], tag_before, "{name}: the rebase ran");
+        assert_eq!(parents_of(&d, &format!("w-{name}")), vec![tags_of(&d)["feature"]], "{name}");
+    }
+}
+
+/// Guarantee 4 (review of `s8j`): the move rebases all local work, each
+/// change onto its parents' projections: a stack, a merge with a server
+/// branch, a change in another workspace on another base, a divergent
+/// change (two versions, both visible), and a tag on an old version; the
+/// ids are the ones a clone made after the change has. A push afterwards
+/// is accepted, and the admin's checkout of each pushed change holds every
+/// file of the billing folder, byte for byte.
+#[test]
+fn s8jr_the_move_rebases_stacks_merges_workspaces_and_divergent_changes() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name, "--confirm", &p.fin.fingerprint()]);
+    let d = plain_thin(&p, &hub, "all");
+    write_files(&d, &[("src/a.txt", "a\n")]);
+    p.fin.ok(&d, &["commit", "--no-advance", "-m", "a"]);
+    p.fin.ok(&d, &["tag", "set", "a", "-r", "@-"]);
+    write_files(&d, &[("src/b.txt", "b\n")]);
+    p.fin.ok(&d, &["commit", "--no-advance", "-m", "b"]);
+    p.fin.ok(&d, &["tag", "set", "b", "-r", "@-"]);
+    p.fin.ok(&d, &["new", "b", "feature"]);
+    write_files(&d, &[("src/m.txt", "m\n")]);
+    p.fin.ok(&d, &["commit", "--no-advance", "-m", "merge"]);
+    p.fin.ok(&d, &["tag", "set", "m", "-r", "@-"]);
+    // A divergent change on main: two versions of `x`, both visible.
+    p.fin.ok(&d, &["new", "main"]);
+    write_files(&d, &[("src/x.txt", "x\n")]);
+    p.fin.ok(&d, &["commit", "--no-advance", "-m", "x one"]);
+    p.fin.ok(&d, &["tag", "set", "x", "-r", "@-"]);
+    let x_old = tags_of(&d)["x"];
+    p.fin.ok(&d, &["describe", "-r", "x", "-m", "x two"]);
+    p.fin.ok(&d, &["ws", "new", "oldx", "-r", &x_old.hex()]);
+    // Another workspace, on `feature`.
+    p.fin.ok(&d, &["ws", "new", "agent", "-r", "feature"]);
+    p.fin.ok(&d, &["ws", "switch", "agent"]);
+    write_files(&d, &[("src/w.txt", "w\n")]);
+    p.fin.ok(&d, &["commit", "--no-advance", "-m", "w"]);
+    p.fin.ok(&d, &["tag", "set", "w", "-r", "@-"]);
+    p.fin.ok(&d, &["ws", "switch", "default"]);
+    p.fin.ok(&d, &["tag", "set", "old", "-r", "main-"]);
+    p.fin.ok(&d, &["cat", "-r", "feature", "src/lib.rs"]);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let before = view_state(&d);
+    let out = p.fin.ok(&d, &["pull"]);
+    assert_eq!(out.matches(MOVED).count(), 1, "{out}");
+    assert!(!out.contains("kept where it is"), "{out}");
+    // The current view's ids, as a clone made now has them.
+    let fresh = plain_thin(&p, &hub, "fresh");
+    p.fin.ok(&fresh, &["tag", "set", "old", "-r", "main-"]);
+    let (now, want) = (view_state(&d), tags_of(&fresh));
+    let t = &now.0;
+    assert_eq!((t["main"], t["feature"]), (want["main"], want["feature"]), "server tags: their projections");
+    assert_ne!(t["old"], before.0["old"], "a tag on an old version follows");
+    assert_eq!(entry_at(&d, "old", BILL_DIR), None, "into the current view");
+    assert_eq!(parents_of(&d, "a"), vec![t["main"]], "the stack's base");
+    assert_eq!(parents_of(&d, "b"), vec![t["a"]], "the stack");
+    assert_eq!(parents_of(&d, "m"), vec![t["b"], t["feature"]], "the merge");
+    assert_eq!(parents_of(&d, "w"), vec![t["feature"]], "the other workspace's change");
+    assert_eq!(parents_of(&d, "x"), vec![t["main"]], "x, the newer version");
+    let old_ws = now.1["oldx"];
+    let x_was = parents_by_id(&d, &old_ws);
+    assert_eq!(x_was.len(), 1);
+    assert_ne!(x_was[0], x_old, "the older version of x moved too");
+    assert_ne!(x_was[0], t["x"], "and stays its own version (divergent)");
+    assert_eq!(parents_by_id(&d, &x_was[0]), vec![t["main"]]);
+    for (tag, file) in [("a", "src/a.txt"), ("b", "src/b.txt"), ("m", "src/m.txt"), ("m", "src/b.txt"), ("w", "src/w.txt"), ("x", "src/x.txt")] {
+        assert!(entry_at(&d, tag, file).is_some(), "{tag} keeps {file}");
+        assert_eq!(entry_at(&d, tag, BILL_DIR), None, "{tag} is in the current view");
+    }
+    // (`m` is not pushed: the server refuses a merge by someone who cannot
+    // see a folder its parents differ in, whatever the clone's view.)
+    for tag in ["b", "w"] {
+        let out = p.fin.ok(&d, &["push", "-t", tag]);
+        assert!(out.contains("pushed"), "{tag}: {out}");
+    }
+    p.admin.ok(&p.dir, &["pull"]);
+    for (tag, like) in [("w", "feature"), ("b", "main")] {
+        p.admin.ok(&p.dir, &["new", like]);
+        let want = below(&walk(&p.dir), BILL_DIR);
+        assert!(!want.is_empty());
+        p.admin.ok(&p.dir, &["new", tag]);
+        assert_eq!(below(&walk(&p.dir), BILL_DIR), want, "{tag}: every billing file, byte for byte");
+    }
+}
+
+/// BUG-1565 (review of `s8j`): every `vl push` from a thin clone asks the
+/// server for the current projection of each server snapshot a tag or
+/// workspace names (`hub_cmd::move_before_push`: one history request per
+/// snapshot, `ObjectStore::current_projection`), with no access change: a
+/// push costs a request per tag. Two thin clones, with 2 and 40 tags on
+/// distinct server snapshots, push one change each. Expected: about the
+/// same number of requests.
+#[test]
+#[ignore = "BUG-1565: every push from a thin clone costs one history request per server snapshot its tags and workspaces name"]
+fn s8jr_a_push_costs_no_request_a_tag() {
+    let hub = TestHub::start();
+    let p = project_with_feature(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name, "--confirm", &p.fin.fingerprint()]);
+    for i in 0..40 {
+        write_files(&p.dir, &[(&format!("src/n/{i:02}.txt"), &format!("n {i}\n"))]);
+        p.admin.commit_main(&p.dir, &format!("n {i}"));
+    }
+    p.admin.ok(&p.dir, &["push"]);
+    let mut cost = Vec::new();
+    for n in [2usize, 40] {
+        let d = plain_thin(&p, &hub, &format!("tags{n}"));
+        p.fin.ok(&d, &["tag", "set", "t0", "-r", "main"]);
+        for i in 1..n {
+            p.fin.ok(&d, &["tag", "set", &format!("t{i}"), "-r", &format!("t{}-", i - 1)]);
+        }
+        write_files(&d, &[(&format!("src/push{n}.txt"), "push\n")]);
+        let tag = format!("pushed{n}");
+        p.fin.ok(&d, &["commit", "--no-advance", "-m", "pushed"]);
+        p.fin.ok(&d, &["tag", "set", &tag, "-r", "@-"]);
+        let before = requests(&hub);
+        let out = p.fin.ok(&d, &["push", "-t", &tag]);
+        assert!(out.contains("pushed"), "{out}");
+        cost.push(requests(&hub) - before);
+    }
+    eprintln!("s8jr: a push with 2 tags cost {} requests, with 40 tags {}", cost[0], cost[1]);
+    assert!(cost[1] <= cost[0] + 8, "with 40 tags {} requests, with 2 {}", cost[1], cost[0]);
+}
