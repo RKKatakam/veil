@@ -1443,6 +1443,63 @@ fn s6r3_a_daemon_that_only_reports_progress_costs_a_vl_one_short_wait() {
     assert!(took < Duration::from_secs(15), "a clone with a daemon that only reports progress took {took:?} ({asked} requests)");
 }
 
+/// BUG-1582's class, its other route: the bound is on each gap, not on the
+/// answer. A daemon that acknowledges and then sends one object a byte at
+/// a time (every 0.3 s, inside the 0.5 s gap) holds a `vl` for as long as
+/// the object lasts; this one never ends it. The clone must end within the
+/// bound of a daemon that stalls silently.
+#[test]
+#[ignore = "BUG-1582: a daemon that trickles one object a byte at a time holds a vl for as long as it likes (the client bounds each gap, not the answer)"]
+fn s6r3_a_daemon_that_trickles_an_object_costs_a_vl_one_short_wait() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let who = &p.dev;
+    let d = s6r2_take_socket(who);
+    let l = std::os::unix::net::UnixListener::bind(&d.socket).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let trickling = std::thread::spawn(move || {
+        l.set_nonblocking(true).unwrap();
+        let mut conns: Vec<UnixStream> = Vec::new();
+        let mut asked = 0;
+        while !stop2.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Ok((mut s, _)) = l.accept() {
+                s.set_nonblocking(false).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                if let Some((b'Q', _)) = s6r2_read_msg(&mut s) {
+                    // Acknowledged, then an object of 32 + 2^20 bytes begun.
+                    let len = (32u32 + (1 << 20)).to_be_bytes();
+                    let _ = s.write_all(&[b'A', 0, 0, 0, 1, PROTOCOL, b'O', len[0], len[1], len[2], len[3]]);
+                    asked += 1;
+                    conns.push(s);
+                }
+            }
+            conns.retain_mut(|s| s.write_all(&[0]).is_ok());
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        asked
+    });
+    let c = who.dir("trickled");
+    let cmd = who.command(who.home.path(), &["clone", &hub.url(&p.name), c.to_str().unwrap()]);
+    let t = Instant::now();
+    // `timeout` ends a `vl` that never returns, so the test can say so.
+    let o = std::process::Command::new("timeout")
+        .arg("40")
+        .arg(cmd.get_program())
+        .args(cmd.get_args())
+        .envs(cmd.get_envs().filter_map(|(k, v)| Some((k, v?))))
+        .current_dir(who.home.path())
+        .output()
+        .unwrap();
+    let took = t.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let asked = trickling.join().unwrap();
+    assert!(o.status.success(), "a clone with a daemon that trickles an object failed or never ended ({took:?}): {}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(std::fs::read_to_string(c.join("src/lib.rs")).unwrap(), PUBLIC_MARK);
+    assert!(asked > 0, "the clone never asked the daemon");
+    assert!(took < Duration::from_secs(15), "a clone with a daemon that trickles an object took {took:?}");
+}
+
 /// Guarantee 3 and the threat model ("Other OS users share nothing with
 /// it"): a `vl` never sends a request (its grant and its device's
 /// signature, which the server accepts again for ±5 minutes) to a socket
@@ -1544,3 +1601,4 @@ fn s6r2_an_empty_xdg_variable_never_puts_the_daemon_where_vl_runs() {
     assert!(home.join(".cache/veil/daemon").is_dir(), "the daemon is not in its default place");
     assert!(took < Duration::from_secs(2), "a command in the clone took {took:?}");
 }
+
