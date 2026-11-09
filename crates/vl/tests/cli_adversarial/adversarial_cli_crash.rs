@@ -43,11 +43,14 @@ fn concurrent_vl_processes_do_not_corrupt_the_repository() {
     env.ok("alice", &proj, &["status"]);
     let log = env.ok("alice", &proj, &["log"]);
     let ops = env.ok("alice", &proj, &["op", "log", "-n", "1000"]);
+    let mut new_ok = 0;
     for (i, o) in outs.iter().enumerate() {
         if o.status.success() && i % 3 == 0 {
-            assert!(log.contains(&format!("new-{i}")) || ops.contains("new change"), "lost `vl new` #{i}");
+            assert!(log.contains(&format!("new-{i}")) && ops.contains("new change"), "lost `vl new` #{i}");
+            new_ok += 1;
         }
     }
+    assert!(new_ok > 0, "no `vl new` command succeeded");
     assert!(!log.contains("recovered working-copy edits"), "spurious recovery change:\n{log}");
     assert_eq!(read(&proj, "a.txt"), "a\n");
 }
@@ -265,6 +268,7 @@ fn ws_exec_cleans_up_and_never_records_isolated_files() {
     assert!(files.contains("out.txt"));
     assert!(!files.lines().any(|l| l.ends_with(" .netrc")), "isolated file recorded:\n{files}");
     let cat = env.vl("alice", &proj, &["ws", "cat", "agent", "out.txt"]);
+    assert!(cat.status.success(), "{}", text(&cat));
     assert_eq!(String::from_utf8_lossy(&cat.stdout), "new\n");
 }
 
@@ -302,6 +306,7 @@ fn ws_exec_cannot_launder_isolated_secrets_into_history() {
     );
     assert!(o.status.success(), "{}", text(&o));
     let cat = env.vl("alice", &proj, &["ws", "cat", "agent", "config.txt"]);
+    assert!(!cat.status.success(), "{}", text(&cat));
     assert!(
         !String::from_utf8_lossy(&cat.stdout).contains("super-secret-isolated-value"),
         "isolated secret recorded in the agent workspace's history"

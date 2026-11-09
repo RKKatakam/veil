@@ -240,7 +240,7 @@ fn a_huge_truncate_does_not_kill_the_mount() {
     drop(open);
     assert!(alive_now, "the mount process died on a 1 TiB truncate (set_len: {r:?})");
     assert!(close.is_ok(), "{close:?}");
-    let _ = env.vl(U, &proj, &["ws", "unmount", "agent"]);
+    env.ok(U, &proj, &["ws", "unmount", "agent"]);
 }
 
 /// The same through `pwrite` at a 1 TiB offset.
@@ -259,7 +259,7 @@ fn a_write_at_a_huge_offset_does_not_kill_the_mount() {
     drop(f);
     std::thread::sleep(Duration::from_millis(500));
     assert!(alive(pid), "the mount process died on a write at 1 TiB ({r:?})");
-    let _ = env.vl(U, &proj, &["ws", "unmount", "agent"]);
+    env.ok(U, &proj, &["ws", "unmount", "agent"]);
 }
 
 /// A kernel-reported memory figure of process `pid` (`VmHWM`: peak RSS;
@@ -362,7 +362,7 @@ fn a_sealed_conflict_side_never_reaches_a_non_member_through_the_mount() {
     for (p, c) in super::walk(&mnt).iter().filter_map(|p| std::fs::read(mnt.join(p)).ok().map(|c| (p.clone(), c))) {
         assert!(!String::from_utf8_lossy(&c).contains("SEALED-SIDE"), "{p:?}");
     }
-    let _ = text(&env.vl("carol", &carol, &["ws", "unmount", "view"]));
+    env.ok("carol", &carol, &["ws", "unmount", "view"]);
 }
 
 // ---- where the mount may be ---------------------------------------------------
@@ -417,7 +417,7 @@ fn deleting_while_listing_skips_nothing() {
     }
     let r = std::fs::remove_dir_all(mnt.join("many"));
     let left = std::fs::read_dir(mnt.join("many")).map(|d| d.count()).unwrap_or(0);
-    let _ = env.vl(U, &proj, &["ws", "unmount", "agent"]);
+    env.ok(U, &proj, &["ws", "unmount", "agent"]);
     assert!(r.is_ok() && left == 0, "remove_dir_all: {r:?}; {left} entries left");
 }
 
@@ -441,7 +441,7 @@ fn undo_never_throws_away_the_mounts_new_work() {
     let out = env.ok(U, &proj, &["undo"]);
     std::thread::sleep(Duration::from_secs(3));
     let shown = std::fs::read_to_string(mnt.join("work.txt")).ok();
-    let _ = env.vl(U, &proj, &["ws", "unmount", "agent"]);
+    env.ok(U, &proj, &["ws", "unmount", "agent"]);
     let kept = env.vl(U, &proj, &["ws", "cat", "agent", "work.txt"]);
     assert_eq!(shown.as_deref(), Some("agent work\n"), "the mount's work vanished: {out}");
     assert!(kept.status.success(), "{out}\n{}", text(&kept));

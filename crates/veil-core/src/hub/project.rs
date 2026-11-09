@@ -733,10 +733,11 @@ mod tests {
                 prop_assert_eq!(&seen, &readable);
                 // Every name in a projected tree leads to something readable.
                 for raw in created.values() {
-                    if let Ok(Object::Tree(t)) = Object::decode(raw) {
-                        for e in &t.entries {
-                            prop_assert!(seen.keys().any(|k| k.split('/').any(|c| c == e.name)), "{} named", e.name);
-                        }
+                    let Object::Tree(t) = Object::decode(raw).unwrap() else {
+                        panic!("projected non-tree object");
+                    };
+                    for e in &t.entries {
+                        prop_assert!(seen.keys().any(|k| k.split('/').any(|c| c == e.name)), "{} named", e.name);
                     }
                 }
                 // Unchanged: the real tree itself.

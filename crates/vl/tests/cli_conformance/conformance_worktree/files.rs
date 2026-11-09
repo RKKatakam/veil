@@ -103,7 +103,9 @@ fn cat_prints_the_exact_bytes() {
     r.write("nonl", "no newline");
     r.write("empty", "");
     r.commit("bytes");
-    assert_eq!(r.run(&["cat", "-r", "@-", "bin"]).stdout, bin);
+    let out = r.run(&["cat", "-r", "@-", "bin"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(out.stdout, bin);
     assert_eq!(r.cat("nonl", "@-"), "no newline");
     let out = r.run(&["cat", "-r", "@-", "empty"]);
     assert!(out.status.success() && out.stdout.is_empty());
@@ -154,8 +156,10 @@ fn cat_paths_are_relative_to_the_current_directory() {
     r.write("top.txt", "top\n");
     r.commit("one");
     let out = r.run_in("sub", &["cat", "-r", "@-", "f.txt"]);
+    assert!(out.status.success(), "{}", text(&out));
     assert_eq!(stdout_of(&out), "sub file\n", "{}", text(&out));
     let out = r.run_in("sub", &["cat", "-r", "@-", "../top.txt"]);
+    assert!(out.status.success(), "{}", text(&out));
     assert_eq!(stdout_of(&out), "top\n", "{}", text(&out));
 }
 
@@ -192,7 +196,9 @@ fn sizes_are_exact_for_large_files() {
     r.write("big.bin", &big);
     let f = r.files("@").into_iter().find(|f| f.path == "big.bin").unwrap();
     assert_eq!(f.size, big.len() as u64);
-    assert_eq!(r.run(&["cat", "big.bin"]).stdout, big);
+    let out = r.run(&["cat", "big.bin"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(out.stdout, big);
 }
 
 // Scenario from jj test_file_list_command.rs with a non-member: cloaked

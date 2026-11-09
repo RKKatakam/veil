@@ -73,7 +73,9 @@ fn a_killed_snapshot_leaves_the_repository_usable() {
         rev.push('-');
     }
     assert!(found, "big.bin is recorded somewhere on the line");
-    assert_eq!(r.run(&["cat", "-r", rev.as_str(), "big.bin"]).stdout.len(), big.len());
+    let cat = r.run(&["cat", "-r", rev.as_str(), "big.bin"]);
+    assert!(cat.status.success(), "{}", text(&cat));
+    assert_eq!(cat.stdout.len(), big.len());
     let fsck = r.run(&["fsck"]);
     assert!(fsck.status.success(), "{}", text(&fsck));
 }
@@ -221,7 +223,7 @@ fn concurrent_checkout_and_snapshot() {
         .collect();
     for k in kids {
         let out = k.wait_with_output().unwrap();
-        assert!(clean_exit(&out), "{}", text(&out));
+        assert!(out.status.success(), "{}", text(&out));
     }
     let out = r.run(&["status"]);
     assert!(out.status.success(), "{}", text(&out));
