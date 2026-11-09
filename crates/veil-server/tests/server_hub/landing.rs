@@ -4680,3 +4680,150 @@ fn a_change_by_one_author_never_lands_twice_across_devices_or_submitters_and_ign
     assert!(body.contains(&cid.to_string()) && body.contains("already landed"), "{body}");
 }
 
+
+/// Land a snapshot the server already holds onto `branch`.
+fn land_held_onto(api: &Api, token: &str, project: &str, branch: &str, snapshot: ObjectId) -> Reply {
+    api.post_json(
+        Some(token),
+        &format!("/v1/projects/{project}/land"),
+        &json!({"onto": branch, "snapshot": snapshot.hex(), "receipts": {}, "wait": true}),
+    )
+}
+
+/// BUG-1581 (BUG-1527's class, another route): `snapshot_author` takes the
+/// author of a server-signed snapshot with no `origins` row from
+/// `change_refs` by its change id alone, before the snapshot it was made
+/// from. Every snapshot the landing service lands is server-signed (made
+/// from the submitted one, `predecessors: [submitted]`), so fin's change
+/// landed under the change id of the dev's API change counts, re-landed on
+/// another branch, as the dev's: the dev's change is then refused there
+/// ("already landed … make a new change"), though nothing of it is there.
+#[test]
+#[ignore = "BUG-1581: a landed snapshot of fin's change under the change id of the dev's API change is taken as the dev's (change_refs by change id first), and blocks the dev's change on another branch"]
+fn bug_1581_a_squat_landed_by_the_service_never_counts_as_the_api_change_whose_change_id_it_takes() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    // `release`, cut at main.
+    let a = Craft::new(&api, &p.admin, &p.name, "main");
+    push_new_branches(&a, &[("release".into(), a.tip)]);
+    // The dev's change V, made through the API (an agent's), kept on no branch.
+    let dev_main0 = Craft::new(&api, &p.dev, &p.name, "main").tip;
+    let r = api.post_json(
+        Some(&p.dev.token()),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({"base": dev_main0.hex(), "edits": [put("src/v.rs", "the dev's\n")]}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+    let cid = source(&hub, pid).snapshot(&real_of_seen(&hub, pid, v)).unwrap().change_id;
+    // fin lands a billing-only change S under V's change id on main: the
+    // service makes S' (server-signed) of it.
+    let mut f = Craft::new(&api, &p.fin, &p.name, "main");
+    let on = f.tip;
+    f.file(&format!("{BILL_DIR}/acme/s.txt"), "fin's\n");
+    let s = snap_at(&mut f, on, cid, "not V", veil_core::now_millis(), vec![]);
+    let r = push_new(&f, &[("s", s)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let w = land_held(&api, &p.fin.token(), &p.name, s, true).json();
+    assert_eq!(w["state"], "landed", "{w}");
+    // fin lands S' (main's tip) onto release.
+    let s_seen = Craft::new(&api, &p.fin, &p.name, "main").tip;
+    let r = land_held_onto(&api, &p.fin.token(), &p.name, "release", s_seen);
+    assert_eq!(r.json()["state"], "landed", "{}", String::from_utf8_lossy(&r.body));
+    // The dev lands V onto release: nothing of V is there, so it lands.
+    let r = land_held_onto(&api, &p.dev.token(), &p.name, "release", v);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+}
+
+/// Guarantee (agent sessions, S11's attribution: an agent acts with its
+/// person's identity): the dev's change E, made and landed through the API
+/// (as an agent does), and the dev's own signed revision of E pushed from
+/// their device, are one author's: the revision with further edits is
+/// refused, and one with the same edits is skipped and named.
+#[test]
+fn an_api_landing_and_its_persons_pushed_revision_are_one_author_and_never_land_twice() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let on = Craft::new(&api, &p.dev, &p.name, "main").tip;
+    let w = land(&api, &token, &p.name, on, json!([put("src/e.rs", "e\n")]), true).json();
+    assert_eq!(w["state"], "landed", "{w}");
+    let tip = real_tip(&hub, pid);
+    let cid = source(&hub, pid).snapshot(&tip).unwrap().change_id;
+    assert_eq!(w["change_id"].as_str(), Some(cid.to_string().as_str()), "{w}");
+    // A revision with further edits, signed on the dev's device: refused.
+    let mut d = Craft::new(&api, &p.dev, &p.name, "main");
+    d.file("src/e.rs", "e\n");
+    d.file("src/more.rs", "more\n");
+    let x = snap_at(&mut d, on, cid, "E, more", veil_core::now_millis(), vec![]);
+    let r = push_new(&d, &[("x", x)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let r = land_held(&api, &token, &p.name, x, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 400, "{body}");
+    assert!(body.contains("already landed") && body.contains("make a new change for the further edits"), "{body}");
+    assert_eq!(real_tip(&hub, pid), tip, "{body}");
+    // The same edits, under Q: E skipped and named, Q lands.
+    let mut d = Craft::new(&api, &p.dev, &p.name, "main");
+    let base = d.tip;
+    let same = snap_at(&mut d, base, cid, "E, again", veil_core::now_millis(), vec![]);
+    d.file("src/q.rs", "q\n");
+    let q = crafted_on(&mut d, same, veil_core::ChangeId::random(), "Q", "");
+    let r = push_new(&d, &[("q", q)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let r = land_held(&api, &token, &p.name, q, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+    assert_eq!(r.json()["landed"].as_array().unwrap().len(), 1, "{body}");
+    assert!(body.contains(&cid.to_string()) && body.contains("already landed"), "{body}");
+    let ids: Vec<_> = chain(&hub, pid, veil_server::sync::root_snapshot_id()).into_iter().map(|(_, s)| s.change_id).collect();
+    assert_eq!(ids.iter().filter(|i| **i == cid).count(), 1, "E is on main twice");
+}
+
+/// Guarantee (`snapshot_author`, a removed device): the dev's revision P2
+/// of P, signed on a device of theirs that is removed before it is
+/// submitted, is still the dev's: after P landed, the admin's landing of P2
+/// (further edits) is refused, and P is not landed twice.
+#[test]
+fn a_revision_signed_on_a_since_removed_device_is_still_its_persons() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let laptop = hub.new_device_of(&p.dev);
+    p.dev.ok(p.dev.home.path(), &["identity", "confirm", &laptop.fingerprint()]);
+    laptop.ok(laptop.home.path(), &["login", &format!("veil://{}", hub.authority()), "--ca", hub.ca.to_str().unwrap()]);
+    let cid = veil_core::ChangeId::random();
+    // P2 on the laptop: pushed, not landed.
+    let mut l = Craft::new(&api, &laptop, &p.name, "main");
+    let on = l.tip;
+    l.file("src/p.rs", "p\n");
+    l.file("src/more.rs", "more\n");
+    let p2 = snap_at(&mut l, on, cid, "P2", veil_core::now_millis(), vec![]);
+    let r = push_new(&l, &[("p2", p2)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    // P on the first device: landed.
+    let mut d = Craft::new(&api, &p.dev, &p.name, "main");
+    d.file("src/p.rs", "p\n");
+    let p1 = snap_at(&mut d, on, cid, "P", veil_core::now_millis(), vec![]);
+    let r = push_new(&d, &[("p1", p1)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let v = land_held(&api, &p.dev.token(), &p.name, p1, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    let tip = real_tip(&hub, pid);
+    // The laptop is removed; the admin lands P2 (as they see it on `p2`).
+    p.dev.ok(p.dev.home.path(), &["identity", "remove", &laptop.fingerprint()]);
+    let p2_admin = Craft::new(&api, &p.admin, &p.name, "p2").tip;
+    let r = land_held(&api, &p.admin.token(), &p.name, p2_admin, true);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 400, "{body}");
+    assert!(body.contains("already landed") && body.contains("make a new change for the further edits"), "{body}");
+    assert_eq!(real_tip(&hub, pid), tip, "{body}");
+}
