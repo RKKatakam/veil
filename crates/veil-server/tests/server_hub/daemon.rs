@@ -1720,12 +1720,12 @@ fn bug_1680_no_idle_renewals_warm_store_after_idle_and_server_backoff() {
     assert_eq!(lim_d.stat("forwarded"), fwd_before + 1, "the client's request was forwarded to the server");
 }
 
-/// BUG-1681: `vl daemon follow` (`crates/vl/src/daemon/follow.rs`) sends
-/// `GET /v1/projects/{p}/tips` once a second for every project in
-/// `follow.json` (kept for 7 days after a single thin clone read), even
-/// when nothing is being read through the daemon.
+/// BUG-1681 (fixed): `vl daemon follow` asked for a followed project's
+/// tips once a second for the 7 days it is followed, idle or not. Now an
+/// unchanged answer doubles the interval (1 s, 2 s, 4 s, … at most 60 s):
+/// between 25 s and 40 s after the clone, idle, at most two such requests
+/// arrive (there were 15).
 #[test]
-#[ignore = "BUG-1681: vl daemon follow polls GET /tips every second for 7 days while idle"]
 fn bug_1681_daemon_follow_polls_tips_every_second_while_idle() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1733,17 +1733,21 @@ fn bug_1681_daemon_follow_polls_tips_every_second_while_idle() {
     let admin = p.admin.token();
     let health_requests = || {
         let r = api.get(Some(&admin), &format!("/v1/projects/{}/health", p.name));
-        assert_eq!(r.status, 200);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
         r.json()["since_start"]["requests"].as_u64().unwrap()
     };
-    let _d = Daemon::start(&p.dev, None);
+    let d = Daemon::start(&p.dev, None);
     let thin = p.dev.dir("thin-idle");
     p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), thin.to_str().unwrap()]);
-    std::thread::sleep(STALE + Duration::from_millis(1500));
+    assert_eq!(d.stat("follows"), 1, "the project is followed");
+    std::thread::sleep(Duration::from_secs(25));
     let before = health_requests();
-    std::thread::sleep(Duration::from_secs(4));
+    std::thread::sleep(Duration::from_secs(15));
     let after = health_requests();
-    assert_eq!(after - before, 1, "only the health check itself should hit the server while idle (got {} extra requests)", after - before - 1);
+    // The first health check is counted in `after`; the rest are the
+    // follower's requests.
+    let polls = after - before - 1;
+    assert!(polls <= 2, "{polls} requests from the follower in 15 s while idle");
 }
 
 
