@@ -101,6 +101,8 @@ pub struct Exec<'a> {
     pub only: &'a [String],
     /// `--record-only`: record what an earlier run left unrecorded, run nothing.
     pub record_only: bool,
+    /// `--mount`: run over a mount of the workspace ([`crate::mount::for_exec`]).
+    pub mount: bool,
     /// Confinement and limits ([`crate::confine`]).
     pub confine: &'a crate::confine::ConfineArgs,
     pub command: &'a [String],
@@ -171,7 +173,94 @@ pub fn exec(ctx: &mut Ctx, a: &Exec<'_>) -> Result<ExitCode> {
     }
     ctx.repo.workspace_wc(name)?;
     let c = confine(ctx)?;
+    if a.mount {
+        match crate::mount::fuse_available() {
+            Ok(()) => return exec_mounted(ctx, name, a, c.as_ref()),
+            Err(why) => eprintln!(
+                "{} no mount here ({why}): the sandbox is checked out instead (in a thin clone, fetched from the server; \
+                 `--only PATHS` checks out less)",
+                yellow("note:")
+            ),
+        }
+    }
     exec_persistent(ctx, name, a, c.as_ref())
+}
+
+// ---- mounted sandboxes ------------------------------------------------------
+
+/// `vl ws exec --mount`: the command runs over a mount of the workspace
+/// (at the project's path when confined). Nothing is checked out: a file is
+/// read, and in a thin clone fetched, when the command reads it. The
+/// mount's overlay sees every write, so what is recorded afterwards is
+/// exactly what the command changed. The sandbox's lock is held throughout,
+/// as for a checked-out run.
+fn exec_mounted(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Confine>) -> Result<ExitCode> {
+    let paths = SandboxPaths::new(&ctx.root, name);
+    let base_dir = core::sandboxes_dir(&ctx.root);
+    private_dir(&base_dir).with_context(|| format!("creating {}", base_dir.display()))?;
+    private_dir(&paths.dir).with_context(|| format!("creating {}", paths.dir.display()))?;
+    let _lock = SandboxLock::acquire(&paths.lock, || {
+        eprintln!(
+            "{} another `vl ws exec` is running in workspace {}; waiting for it to finish",
+            dim("waiting:"),
+            safe(name)
+        )
+    })
+    .with_context(|| format!("locking {}", paths.lock.display()))?;
+    ctx.repo.reload()?;
+    ctx.repo.workspace_wc(name)?;
+    if let Loaded::Found(m) = paths.load_manifest() {
+        if m.pending.is_some() {
+            bail!(
+                "the sandbox of workspace {n} holds the output of an earlier run that is not recorded; `vl ws exec {n} --record-only` records it first",
+                n = safe(name)
+            );
+        }
+    }
+    let mount = crate::mount::for_exec(&ctx.root, name)?;
+    if mount.recovered {
+        mount.record().with_context(|| format!("recording what an earlier run left in the mount of workspace {}", safe(name)))?;
+        ctx.repo.reload()?;
+        eprintln!(
+            "{} the output of an earlier `vl ws exec` in workspace {} that did not finish (vl was killed), from its mount: {}",
+            yellow("Recorded"),
+            safe(name),
+            one_line(&ctx.repo, &ctx.repo.workspace_wc(name)?)
+        );
+    }
+    let before = ctx.repo.workspace_wc(name)?;
+    print_running(a.command, &mount.dir, confine);
+    let layers_dir = paths.dir.join(crate::confine::layers_dir(core::workspace_id(&ctx.repo, name).as_deref()));
+    // From here on the mount is recorded (and, if this run made it,
+    // unmounted) whatever happens.
+    let server = match crate::ws_socket::Server::start(&ctx.root, name, &mount.dir, Box::new(crate::ws_socket::Mounted)) {
+        Ok(s) => s,
+        Err(e) => {
+            if let Err(f) = mount.finish() {
+                warn(&format!("{f:#}"));
+            }
+            return Err(e);
+        }
+    };
+    let code = run_command(&mount.dir, &paths.dir, a.command, confine, Some(&layers_dir), Some(&server));
+    drop(server);
+    for n in mount.finish()?.iter().filter(|n| !n.starts_with("Recorded ")) {
+        warn(&format!("mount of workspace {}: {n}", safe(name)));
+    }
+    ctx.repo.reload()?;
+    let after = ctx.repo.workspace_wc(name)?;
+    if after == before {
+        eprintln!("No changes in {}", one_line(&ctx.repo, &after));
+    } else {
+        if !a.message.is_empty() {
+            if let Err(e) = ctx.repo.describe(after, a.message) {
+                warn(&format!("the result was recorded, but could not be described: {e}"));
+            }
+        }
+        eprintln!("Recorded {}", one_line(&ctx.repo, &ctx.repo.workspace_wc(name)?));
+    }
+    let code = code?;
+    Ok(ExitCode::from(code.clamp(0, 255) as u8))
 }
 
 // ---- persistent sandboxes --------------------------------------------------
@@ -337,6 +426,7 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
     let (co, kept, injection) = {
         let _umask = PrivateUmask::set();
         private_dir(&paths.files)?;
+        prefetch_sync(&ctx.repo, m.tree.as_ref(), &synced, set.as_ref())?;
         let co = core::sync_to(&ctx.repo, &fs, &mut m, &synced, set.as_ref(), &mut cache)?;
         core::vouch_written(ctx.repo.store(), &fs, &synced, &co, &mut cache, core::VouchWait::IfCheaper)?;
         if let SetAside::Reimport {
@@ -433,13 +523,140 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
     // outside its files outlives it.
     let layers_dir = paths.dir.join(crate::confine::layers_dir(core::workspace_id(&ctx.repo, name).as_deref()));
     let layers = injection.is_none().then_some(layers_dir.as_path());
-    let code = run_command(&paths.files, &paths.dir, a.command, confine, layers);
+    // The command's own `vl` asks this one (the workspace socket); before
+    // each of its commands the sandbox's files are recorded, so the record
+    // on disk, not `m`, is the run's from here on.
+    if let Err(e) = paths.save_cache(&mut cache) {
+        warn(&format!("could not save the sandbox's stat cache: {e}"));
+    }
+    let server = crate::ws_socket::Server::start(&ctx.root, name, &paths.files, Box::new(MidRun { root: ctx.root.clone(), name: name.to_string() }))?;
+    let code = run_command(&paths.files, &paths.dir, a.command, confine, layers, Some(&server));
+    drop(server);
+    if let Loaded::Found(saved) = paths.load_manifest() {
+        m = *saved;
+    }
+    cache = paths.load_cache();
     // Nothing may have run (the command was not found): recording finds no
     // change and the injected files are taken out as after any run.
     finish(ctx, name, &paths, &mut m, &mut cache, &fs, injection.as_ref(), Some(&kept))?;
     run.finish();
     let code = code?;
     Ok(ExitCode::from(code.clamp(0, 255) as u8))
+}
+
+/// The workspace socket's recording of a checked-out sandbox while its
+/// command runs: before each command from inside, the sandbox's files are
+/// recorded into the workspace, as the run's end would (the policy, the
+/// secret scanner and the guard of injected secrets apply), and the run's
+/// record is moved on to what was recorded; after it, a working copy that
+/// moved to the same tree (`vl commit`, `vl new`, `vl describe`) is what
+/// the run continues from.
+struct MidRun {
+    root: std::path::PathBuf,
+    name: String,
+}
+
+impl MidRun {
+    fn open(&self) -> Result<(Ctx, SandboxPaths, veil_core::lock::WcLock)> {
+        let ctx = Ctx::open(Some(&self.root), false)?;
+        let wc = veil_core::lock::WcLock::acquire(&veil_core::repo::state_dir(&self.root), &self.name)?;
+        let paths = SandboxPaths::new(&self.root, &self.name);
+        Ok((ctx, paths, wc))
+    }
+}
+
+impl crate::ws_socket::Around for MidRun {
+    fn before(&self) -> Result<()> {
+        let (mut ctx, paths, _wc) = self.open()?;
+        ctx.repo.set_command_workspace(Some(self.name.clone()));
+        let Loaded::Found(mut m) = paths.load_manifest() else { bail!("the sandbox's manifest cannot be read") };
+        let Some(p) = m.pending.clone() else { return Ok(()) };
+        let store = ctx.repo.store().clone();
+        let synced = m.tree.ok_or_else(|| anyhow!("the sandbox's manifest names no tree"))?;
+        let set = m.only_set()?;
+        let guard = paths.load_guard(&ctx.repo)?;
+        let secrets = guard.as_ref().map(core::Guard::secrets);
+        let mut cache = paths.load_cache();
+        let fs = SandboxFs::new(&paths.files, None, false).with_forbidden_targets([self.root.clone(), crate::ctx::veil_home()]);
+        let pin = core::PolicyPin::new(&fs, &store, &synced)?;
+        let view = set.as_ref().map(|s| SparseView::new(&pin, store.clone(), synced, s));
+        let recorded_fs: &dyn StorageBackend = match &view {
+            Some(v) => v,
+            None => &pin,
+        };
+        let out = ctx.repo.snapshot_workspace_with(
+            &self.name,
+            recorded_fs,
+            SnapshotOptions {
+                cache: Some(&mut cache),
+                injected: secrets.as_ref(),
+                materialised: Some(&m.materialised),
+                expected_wc: Some(p.base),
+                policy_from_command: true,
+                ..Default::default()
+            },
+        )?;
+        if out.superseded {
+            bail!(
+                "workspace '{}' moved outside the sandbox while the command ran; its files are recorded when the command ends",
+                safe(&self.name)
+            );
+        }
+        print_build_warnings(&out.report);
+        print_working_copy_warnings(&out.report);
+        let tree = ctx.repo.snapshot(&out.snapshot)?.tree;
+        if let Some(pp) = &mut m.pending {
+            pp.base = out.snapshot;
+        }
+        m.tree = Some(tree);
+        m.snapshot = Some(out.snapshot);
+        paths.save_manifest(&m)?;
+        let _ = paths.save_cache(&mut cache);
+        Ok(())
+    }
+
+    fn after(&self) {
+        let Ok((ctx, paths, _wc)) = self.open() else { return };
+        let Loaded::Found(mut m) = paths.load_manifest() else { return };
+        let (Some(p), Some(tree), Ok(wc)) = (m.pending.as_mut(), m.tree, ctx.repo.workspace_wc(&self.name)) else { return };
+        // Only a move to the very tree the files hold: anything else is
+        // a move from outside, which the run's end deals with.
+        if wc != p.base && ctx.repo.snapshot(&wc).is_ok_and(|s| s.tree == tree) {
+            p.base = wc;
+            m.snapshot = Some(wc);
+            let _ = paths.save_manifest(&m);
+        }
+    }
+}
+
+/// In a thin clone, fetch what syncing the sandbox from tree `from` to `to`
+/// reads, in batches (as a checkout of the project directory does), and
+/// only within the sparse set: a lost server fails here, before the sandbox
+/// is touched, and a large sandbox is not fetched a file per request.
+fn prefetch_sync(repo: &Repo, from: Option<&ObjectId>, to: &ObjectId, set: Option<&SparseSet>) -> Result<()> {
+    let store = repo.store();
+    if !store.is_partial() {
+        return Ok(());
+    }
+    let Some(set) = set else {
+        return Ok(store.prefetch_diff(from, to)?);
+    };
+    let mut files = Vec::new();
+    for p in set.paths() {
+        let old = match from {
+            Some(f) => veil_core::tree::lookup(store, f, p)?,
+            None => None,
+        };
+        match veil_core::tree::lookup(store, to, p)? {
+            Some(e) if e.kind == veil_core::object::EntryKind::Dir => {
+                let old = old.filter(|o| o.kind == veil_core::object::EntryKind::Dir).map(|o| o.id);
+                store.prefetch_diff_below(old.as_ref(), &e.id, to, p)?;
+            }
+            Some(e) if old.as_ref().map(|o| o.id) != Some(e.id) => files.push((p.clone(), e.id, e.size)),
+            _ => {}
+        }
+    }
+    Ok(store.prefetch_at(to, &files)?)
 }
 
 /// The error of a run whose output could not be recorded: it stays.
@@ -845,18 +1062,22 @@ fn print_running(command: &[String], dir: &Path, confine: Option<&Confine>) {
 /// inside the confinement ([`crate::confine`], which forwards the signals),
 /// and the allow-list's writes are kept in the layers directory `layers` (a
 /// persistent sandbox's) or thrown away (`None`).
-fn run_command(dir: &Path, ceiling: &Path, command: &[String], confine: Option<&Confine>, layers: Option<&Path>) -> Result<i32> {
+fn run_command(dir: &Path, ceiling: &Path, command: &[String], confine: Option<&Confine>, layers: Option<&Path>, socket: Option<&crate::ws_socket::Server>) -> Result<i32> {
     let mut ceilings = ceiling.as_os_str().to_owned();
     if let Some(old) = std::env::var_os("GIT_CEILING_DIRECTORIES").filter(|v| !v.is_empty()) {
         ceilings.push(":");
         ceilings.push(old);
     }
     if let Some(c) = confine {
-        return crate::confine::run(c, dir, command, &[("GIT_CEILING_DIRECTORIES", ceilings)], layers);
+        return crate::confine::run(c, dir, command, &[("GIT_CEILING_DIRECTORIES", ceilings)], layers, socket.map(|s| s.path()));
     }
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]).current_dir(dir);
     cmd.env("GIT_CEILING_DIRECTORIES", ceilings);
+    match socket {
+        Some(s) => cmd.env(crate::ws_socket::ENV, s.path()).env("PATH", s.path_env()),
+        None => cmd.env_remove(crate::ws_socket::ENV),
+    };
     let interrupts = Interrupts::to_child(&mut cmd);
     let status = cmd
         .spawn()
@@ -1030,7 +1251,7 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>, confine: Option<&Confine>) -> Res
         }
         sb.make_private()?;
         print_running(a.command, &dir, confine);
-        let code = run_command(&dir, &dir, a.command, confine, None)?;
+        let code = run_command(&dir, &dir, a.command, confine, None, None)?;
         // A deleted or unreadable `.veilpolicy` keeps the recorded one.
         let pin = core::PolicyPin::new(&sandbox, ctx.repo.store(), &tree)?;
         let view = set.as_ref().map(|s| SparseView::new(&pin, ctx.repo.store().clone(), tree, s));

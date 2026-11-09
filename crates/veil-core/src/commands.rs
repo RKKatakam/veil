@@ -1,12 +1,12 @@
 //! High-level history operations. Each is one transaction → one op-log entry.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     embargo::{normalize_tree, policy_rekeys, NormalizeOptions, NormalizeReport},
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
-    keychain::{ReleaseState, StageOutcome, TakeBack},
+    keychain::{ReleaseState, TakeBack},
     now_millis,
     object::{Snapshot, Text, TreeEntry},
     oplog::Tag,
@@ -61,6 +61,19 @@ pub struct TagCheck {
 
 /// Description prefix of the operation that releases an embargo.
 pub const RELEASE_OP_PREFIX: &str = "release embargo ";
+
+/// Where a staged release stands by the op log
+/// ([`Repo::staged_release_standing`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// Its operation is in the heads' history, not taken back: a push
+    /// publishes it.
+    InForce,
+    /// An undo or op restore in force took it back: a push does not.
+    TakenBack,
+    /// The op log holds no operation of it: a push does not.
+    Unconfirmed,
+}
 
 #[derive(Debug, Clone)]
 pub struct EmbargoSpec {
@@ -170,6 +183,9 @@ pub struct ChangeParts {
     pub base: ObjectId,
     pub tree: ObjectId,
     pub units: Vec<Unit>,
+    /// Folders whose tree the server refuses: kept where they are, never
+    /// units (BUG-1529).
+    pub hidden: Vec<VPath>,
 }
 
 /// What [`Repo::split`] made.
@@ -392,13 +408,16 @@ impl Repo {
         }
         let s = self.snapshot(id)?;
         let base = self.parents_tree(&s.parents)?.tree;
-        let mut units = selection::units(&self.store, &base, &s.tree)?;
+        let (mut units, hidden) = selection::units(&self.store, &base, &s.tree)?;
         if by_hunk {
+            // In a thin clone, each side asked for at its own path
+            // (BUG-1506).
+            crate::tree::prefetch_changes(&self.store, Some(&base), Some(&s.tree), units.iter().flat_map(|u| &u.changes))?;
             for u in &mut units {
                 selection::classify(&self.store, u, &s.conflicts)?;
             }
         }
-        Ok(ChangeParts { id: *id, base, tree: s.tree, units })
+        Ok(ChangeParts { id: *id, base, tree: s.tree, units, hidden })
     }
 
     /// `vl split`: split change `parts.id` in two. The **first** change, on
@@ -421,7 +440,7 @@ impl Repo {
             return Err(VeilError::Policy("an embargoed merge cannot be split".into()));
         }
         let store = tx.repo().store.clone();
-        let h = selection::halves(&store, &parts.base, &parts.tree, &parts.units, sel)?;
+        let h = selection::halves_hiding(&store, &parts.base, &parts.tree, &parts.units, &parts.hidden, sel)?;
         if !h.any {
             return Err(VeilError::repo(
                 "nothing chosen: the first change would be empty (choose at least one file or hunk; `vl new -B` is not needed to start an empty change before it, `vl new REV-` does that)",
@@ -503,7 +522,7 @@ impl Repo {
                     return Err(VeilError::repo("internal: the selection is of another change"));
                 }
                 check_current(tx.repo(), &[id, dest], parts, &s)?;
-                let h = selection::halves(&store, &parts.base, &parts.tree, &parts.units, sel)?;
+                let h = selection::halves_hiding(&store, &parts.base, &parts.tree, &parts.units, &parts.hidden, sel)?;
                 if !h.any {
                     return Err(VeilError::repo("nothing chosen: nothing to squash"));
                 }
@@ -512,7 +531,7 @@ impl Repo {
             None if into_parent => (tx.repo().snapshot(&dest)?.tree, s.tree, s.tree, true),
             None => {
                 let base = tx.repo().parents_tree(&s.parents)?.tree;
-                check_current(tx.repo(), &[id, dest], &ChangeParts { id, base, tree: s.tree, units: vec![] }, &s)?;
+                check_current(tx.repo(), &[id, dest], &ChangeParts { id, base, tree: s.tree, units: vec![], hidden: vec![] }, &s)?;
                 (base, s.tree, base, true)
             }
         };
@@ -904,14 +923,100 @@ impl Repo {
     ///
     /// [`Keychain::stage_release`]: crate::keychain::Keychain::stage_release
     pub fn release_embargo(&mut self, id: &str) -> Result<()> {
-        if self.keys().stage_release(id)? != StageOutcome::Staged {
+        if self.keys().load_embargo(id)?.is_none() {
+            return Err(VeilError::NotFound(format!("embargo '{id}'")));
+        }
+        if self.keys().release_state(id) != ReleaseState::Unreleased {
             return Ok(());
         }
+        // The operation first, then the staged release: stopped in between,
+        // the embargo stays unreleased, and a staged release always has its
+        // operation in the op log, which a push checks (BUG-1487).
         let mut tx = self.transaction(format!("{RELEASE_OP_PREFIX}{id}"))?;
         tx.repository_wide();
         tx.record_always();
         tx.commit()?;
+        self.keys().stage_release(id)?;
         Ok(())
+    }
+
+    /// Where each staged release stands by the op log, and the operations
+    /// read to tell: from the heads, newest first, down to the oldest
+    /// staged release's operation (an operation that takes a release back
+    /// descends from it, so it is read before it). In force: its latest
+    /// `release embargo <id>` operation is in the heads' history and no
+    /// undo or op restore in that history took it back (a take-back is
+    /// permanent, even if the undo or restore was itself taken back since).
+    pub fn staged_release_standing(&self) -> Result<(BTreeMap<String, Standing>, Vec<ObjectId>)> {
+        let staged: Vec<String> = self.keys().staged_releases()?.into_iter().map(|(id, _)| id).collect();
+        let mut out = BTreeMap::new();
+        let mut read = Vec::new();
+        if staged.is_empty() {
+            return Ok((out, read));
+        }
+        let mut want: BTreeSet<String> = staged.iter().cloned().collect();
+        let mut release_op: BTreeMap<String, ObjectId> = BTreeMap::new();
+        let mut retractors = BTreeMap::new();
+        for r in self.ops.walk(&self.ops.heads()?) {
+            let (id, op) = r?;
+            read.push(id);
+            if let Some(x) = self.retractor(&op)? {
+                retractors.insert(id, x);
+            }
+            if let Some(e) = op.description.strip_prefix(RELEASE_OP_PREFIX) {
+                if want.remove(e) {
+                    release_op.insert(e.to_string(), id);
+                }
+            }
+            if want.is_empty() {
+                break;
+            }
+        }
+        // A release taken back stays taken back (undo and op restore never
+        // release): an undo or restore that names the release's operation
+        // takes it back for good, even if that undo or restore was itself
+        // taken back since (BUG-1535). A redo only retracts an undo.
+        let mut taken: std::collections::HashSet<ObjectId> = crate::repo::retracted_commands(&retractors);
+        for r in retractors.values() {
+            match r {
+                crate::repo::Retractor::Undo(u) => {
+                    taken.insert(*u);
+                }
+                crate::repo::Retractor::Restore(ops) => taken.extend(ops.iter().copied()),
+                crate::repo::Retractor::Redo(_) => {}
+            }
+        }
+        for e in staged {
+            let standing = match release_op.get(&e) {
+                Some(o) if taken.contains(o) => Standing::TakenBack,
+                Some(_) => Standing::InForce,
+                None => Standing::Unconfirmed,
+            };
+            out.insert(e, standing);
+        }
+        Ok((out, read))
+    }
+
+    /// Before a push publishes the staged releases: take back each one the
+    /// op log does not hold in force (BUG-1487: an undo or op restore that
+    /// stopped before taking it back), and say so. One whose operation the
+    /// op log does not hold (an older `vl` staged it without one) is not
+    /// published either; release it again. Never silent, never early.
+    /// Returns a warning per release taken back.
+    pub fn take_back_releases_out_of_force(&self) -> Result<Vec<String>> {
+        let (standing, _) = self.staged_release_standing()?;
+        let mut warnings = Vec::new();
+        for (e, s) in standing {
+            let why = match s {
+                Standing::InForce => continue,
+                Standing::TakenBack => "an undo or op restore took its release back",
+                Standing::Unconfirmed => "its release is not in the op log",
+            };
+            if self.keys().take_back_release(&e)? == TakeBack::TakenBack {
+                warnings.push(format!("embargo {e} was not published: {why}; to publish it, release it again (`vl embargo release {e}`)"));
+            }
+        }
+        Ok(warnings)
     }
 
     /// Undoing the operation `description`, as far as embargo releases go.
@@ -952,19 +1057,37 @@ impl Repo {
         Ok(())
     }
 
-    /// Releases made after operation `op` was recorded, which restoring it
-    /// cannot reach through the view: `(staged, published)` embargo ids.
-    /// Staged ones can be taken back ([`Keychain::take_back_release`]);
-    /// published ones stay released.
+    /// The releases that the op restore `restore` took the view back past,
+    /// which restoring cannot reach through the view: `(staged, published)`
+    /// embargo ids. Staged ones can be taken back
+    /// ([`Keychain::take_back_release`]); published ones stay released.
+    ///
+    /// They are read from the op log, from the restore operation's own
+    /// parents: the `release embargo <id>` operations those reach and the
+    /// restored operation does not. Not from times (a clock set back gets
+    /// them wrong, BUG-1400), and not from the heads read before the
+    /// restore's transaction (a release another process staged in between
+    /// is behind the restore, BUG-1404).
     ///
     /// [`Keychain::take_back_release`]: crate::keychain::Keychain::take_back_release
-    pub fn releases_after(&self, op: &ObjectId) -> Result<(Vec<String>, Vec<String>)> {
-        let at = self.ops.get(op)?.timestamp;
-        let staged: Vec<String> = self.keys().staged_releases()?.into_iter().filter(|(_, t)| *t > at).map(|(id, _)| id).collect();
-        let mut published = Vec::new();
-        for rec in self.keys().embargoes()? {
-            if self.keys().release_state(&rec.id) == ReleaseState::Released && rec.released_at.is_some_and(|t| t > at) {
-                published.push(rec.id);
+    pub fn releases_restored(&self, restore: &ObjectId) -> Result<(Vec<String>, Vec<String>)> {
+        let r = self.ops.get(restore)?;
+        let Some(op) = r.restore_of else {
+            return Err(VeilError::repo(format!("operation {} is not an op restore", restore.short())));
+        };
+        let split = self.ops.split(&r.parents, &[op])?;
+        let mut ids = std::collections::BTreeSet::new();
+        for id in &split.only_a {
+            if let Some(e) = split.ops.get(id).and_then(|o| o.description.strip_prefix(RELEASE_OP_PREFIX)) {
+                ids.insert(e.to_string());
+            }
+        }
+        let (mut staged, mut published) = (Vec::new(), Vec::new());
+        for e in ids {
+            match self.keys().release_state(&e) {
+                ReleaseState::Staged => staged.push(e),
+                ReleaseState::Released => published.push(e),
+                ReleaseState::Unreleased => {}
             }
         }
         Ok((staged, published))
@@ -987,21 +1110,22 @@ impl Repo {
             .first()
             .ok_or_else(|| VeilError::repo("nothing to undo"))?;
         tx.view = tx.repo().ops.get(&parent)?.view;
-        tx.record_always();
+        let undone = tx.repo().op_id;
+        tx.undo_of(undone);
         let id = tx.commit()?.expect("recorded");
         self.finish_undo_release(release)?;
         Ok(id)
     }
 
     /// Restore the view as of an earlier operation. Releases staged after
-    /// it are taken back; published ones stay ([`Repo::releases_after`]).
+    /// it are taken back; published ones stay ([`Repo::releases_restored`]).
     pub fn restore_operation(&mut self, op: ObjectId) -> Result<ObjectId> {
-        let (staged, _) = self.releases_after(&op)?;
         let view = self.ops.get(&op)?.view;
         let mut tx = self.transaction(format!("restore to operation {}", op.short()))?;
         tx.view = view;
-        tx.record_always();
+        tx.restore_of(op);
         let id = tx.commit()?.expect("recorded");
+        let (staged, _) = self.releases_restored(&id)?;
         for e in staged {
             self.keys().take_back_release(&e)?;
         }

@@ -48,7 +48,7 @@ use crate::render::{safe, warn};
 #[derive(Args, Debug, Clone, Default)]
 pub struct ConfineArgs {
     /// Run without confinement: the command can read and change everything your user can.
-    #[arg(long, conflicts_with_all = ["allow", "no_network", "memory", "cpus", "cpu_time", "pids", "timeout", "limits"])]
+    #[arg(long, conflicts_with_all = ["allow", "no_network", "private_ports", "seed", "memory", "cpus", "cpu_time", "pids", "timeout", "limits"])]
     pub unconfined: bool,
     /// Also show PATH (a folder or file of this machine) to the command; its writes go to the workspace's own layer, never to PATH. Repeatable.
     #[arg(long, value_name = "PATH")]
@@ -56,6 +56,12 @@ pub struct ConfineArgs {
     /// No network: the command gets only a private loopback.
     #[arg(long)]
     pub no_network: bool,
+    /// A private loopback that keeps outbound access: the command gets its own network, so every run can bind 127.0.0.1:5432 or :8080 at once, and reaches the outside through pasta (from passt). The host's loopback is not reachable from it.
+    #[arg(long, conflicts_with = "no_network")]
+    pub private_ports: bool,
+    /// Mount the directory SRC at DEST (absolute paths) with a writable layer of this run's own on top: every run starts from SRC as it is, nothing is copied, SRC is never written, and the run's writes vanish when it exits. Repeatable.
+    #[arg(long, value_name = "SRC:DEST")]
+    pub seed: Vec<String>,
     /// Memory limit, e.g. 4G or 512M.
     #[arg(long, value_name = "SIZE")]
     pub memory: Option<String>,
@@ -101,6 +107,13 @@ const MASKED: &[&str] = &["credentials", "credentials.toml"];
 
 /// What `vl` says when there is no `bwrap`.
 const INSTALL: &str = "install bubblewrap (`apt install bubblewrap`, `dnf install bubblewrap` or `pacman -S bubblewrap`)";
+/// The computer's folders the sandbox shows read-only (and what bwrap makes
+/// of `/proc` and `/dev`): nothing can be mounted inside them.
+const READ_ONLY: [&str; 11] = ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt", "/nix", "/sys"];
+
+/// What `vl` says when `--private-ports` finds no `pasta`.
+const INSTALL_PASTA: &str =
+    "--private-ports needs pasta (from passt), which is not installed: install passt (`apt install passt`, `dnf install passt` or `pacman -S passt`); nothing was run";
 /// The opt-out, as offered in errors.
 const OPT_OUT: &str =
     "or run with --unconfined (the command can then read and change everything your user can)";
@@ -207,6 +220,54 @@ fn normal(p: &Path) -> Option<PathBuf> {
         }
     }
     Some(out)
+}
+
+/// One `--seed SRC:DEST`, checked: `SRC` an existing directory of its own,
+/// never the whole machine, the home or anything holding it, the Veil home
+/// or the project (inside or holding them); `DEST` an absolute path
+/// without `..`, never `/` and never where the sandbox appears.
+fn seed(spec: &str, root: &Path, home: Option<&Path>) -> Result<(PathBuf, PathBuf)> {
+    let shown = safe(spec);
+    let (src, dest) = match spec.split(':').collect::<Vec<_>>()[..] {
+        [s, d] if !s.is_empty() && !d.is_empty() => (Path::new(s), Path::new(d)),
+        _ => bail!("--seed {shown}: give SRC:DEST, two absolute paths (neither may hold ':')"),
+    };
+    if !src.is_absolute() {
+        bail!("--seed {shown}: SRC must be an absolute path");
+    }
+    let src = match src.canonicalize() {
+        Ok(s) if s.is_dir() => s,
+        Ok(_) => bail!("--seed {shown}: SRC is not a directory"),
+        Err(_) => bail!("--seed {shown}: SRC: no such directory"),
+    };
+    let overlaps = |p: &Path| src.starts_with(p) || p.starts_with(&src);
+    if src == Path::new("/") {
+        bail!("--seed {shown}: SRC is the whole machine");
+    }
+    if home.and_then(|h| h.canonicalize().ok()).is_some_and(|h| h.starts_with(&src)) {
+        bail!("--seed {shown}: SRC is your home, or holds it (keys, other projects); seed a directory of its own");
+    }
+    let vh = crate::ctx::veil_home();
+    if [Some(vh.clone()), vh.canonicalize().ok()].iter().flatten().any(|v| overlaps(v)) {
+        bail!("--seed {shown}: SRC is the Veil home, inside it, or holds it");
+    }
+    if overlaps(root) {
+        bail!("--seed {shown}: SRC is the project, inside it, or holds it; the sandbox already shows the project's files");
+    }
+    let dest = normal(dest).ok_or_else(|| anyhow!("--seed {shown}: DEST must be an absolute path without '..'"))?;
+    if dest == Path::new("/") {
+        bail!("--seed {shown}: DEST is the whole machine");
+    }
+    if dest.starts_with(root) || root.starts_with(&dest) {
+        bail!("--seed {shown}: DEST is where the sandbox shows the project, inside it, or holds it");
+    }
+    // Nothing can be made there (BUG-1364).
+    if let Some(ro) = READ_ONLY.iter().chain(&["/proc", "/dev"]).find(|r| dest.starts_with(r)) {
+        bail!(
+            "--seed {shown}: DEST is inside {ro}, which the sandbox shows read-only (or as the system's): give a place such as /tmp/NAME, /srv/NAME or ~/NAME"
+        );
+    }
+    Ok((src, dest))
 }
 
 // ---- limits ----------------------------------------------------------------
@@ -348,6 +409,8 @@ pub struct Confine {
     home: PathBuf,
     limits: Limits,
     backend: Backend,
+    /// `--private-ports`: the `pasta` that gives the run its network.
+    pasta: Option<PathBuf>,
 }
 
 /// Whether this build confines `vl ws exec` at all.
@@ -368,9 +431,11 @@ impl Confine {
             return Ok(None);
         }
         if !BUILT {
-            let asked = !a.allow.is_empty() || a.no_network || Limits::new(a, &BTreeMap::new())?.any();
+            let asked = !a.allow.is_empty() || a.no_network || a.private_ports || !a.seed.is_empty() || Limits::new(a, &BTreeMap::new())?.any();
             if asked {
-                bail!("confinement and limits are only built for Linux so far; run without --allow, --no-network and the limits");
+                bail!(
+                    "confinement and limits are only built for Linux so far; run without --allow, --no-network, --private-ports, --seed and the limits"
+                );
             }
             return Ok(None);
         }
@@ -389,9 +454,25 @@ impl Confine {
         }
         allow.extend(cfg.allow.into_iter().map(|p| (p, true)));
         allow.extend(default_allow(home.as_deref()));
+        let seeds = a.seed.iter().map(|s| seed(s, &root, home.as_deref())).collect::<Result<Vec<_>>>()?;
+        for (i, (_, d)) in seeds.iter().enumerate() {
+            if let Some((_, e)) = seeds[..i].iter().find(|(_, e)| d.starts_with(e) || e.starts_with(d)) {
+                bail!("--seed: {} and {} overlap; give each seed a place of its own", d.display(), e.display());
+            }
+        }
         let home = home.unwrap_or_else(|| PathBuf::from("/tmp/home"));
         let bwrap = find_program("bwrap", Some(&root)).ok_or_else(|| anyhow!("confinement needs bubblewrap, which is not installed: {INSTALL}, {OPT_OUT}"))?;
-        let mounts = base_args(&home, Some(&root), &allow, a.no_network)?;
+        // Looked for before anything is touched: without it the run would
+        // either have no network or share the host's loopback, and neither
+        // is what was asked.
+        let pasta = match a.private_ports {
+            true => Some(find_program("pasta", Some(&root)).ok_or_else(|| anyhow!(INSTALL_PASTA))?),
+            false => None,
+        };
+        let mounts = base_args(&home, Some(&root), &allow, &seeds, a.no_network || a.private_ports)?;
+        if !mounts.seeds.is_empty() && overlay_probe(&bwrap, mounts.head.clone()).map_or(true, |r| r.is_err()) {
+            bail!("--seed needs overlayfs, which does not work here; nothing was run");
+        }
         probe(&bwrap, &mounts.args(&Layers::ReadOnly)?)?;
         let backend = backend(&limits, &root)?;
         let (soft, unavailable) = weak_limits(&limits, &backend);
@@ -409,7 +490,7 @@ impl Confine {
             }
             warn(&format!("limits: {} ({why})", parts.join("; ")));
         }
-        Ok(Some(Confine { bwrap, mounts, root, rel, home, limits, backend }))
+        Ok(Some(Confine { bwrap, mounts, root, rel, home, limits, backend, pasta }))
     }
 
     /// Where the command starts, inside the confinement: the sub-folder
@@ -482,8 +563,13 @@ impl Confine {
     /// One line for `running … in …`.
     pub fn describe(&self, sandbox: &Path) -> String {
         let mut what = vec![format!("confined at {}", self.start_dir(sandbox).display())];
-        if self.mounts.head.iter().any(|a| a == "--unshare-net") {
+        if self.pasta.is_some() {
+            what.push("private ports".into());
+        } else if self.mounts.head.iter().any(|a| a == "--unshare-net") {
             what.push("no network".into());
+        }
+        for (src, dest) in &self.mounts.seeds {
+            what.push(format!("seed {} at {}", src.display(), dest.display()));
         }
         let read_only: Vec<String> = self.mounts.allowed.iter().filter(|a| !a.layer).map(|a| a.dest.display().to_string()).collect();
         if !read_only.is_empty() {
@@ -559,6 +645,8 @@ struct Mounts {
     masks: Vec<OsString>,
     /// Where the masks are.
     hidden: Vec<PathBuf>,
+    /// `--seed`: `(SRC, DEST)`, mounted last, each with a throwaway layer.
+    seeds: Vec<(PathBuf, PathBuf)>,
 }
 
 /// What an allowed path is.
@@ -732,6 +820,14 @@ impl Mounts {
                 a.extend(["--overlay-src".into(), src, "--overlay".into(), upper.into_os_string(), work.into_os_string(), dest]);
             }
         }
+        // Seeds: the source is the lower layer of an overlay whose upper
+        // layer is a tmpfs of this run's own mount namespace, so the source
+        // is never written, no other run sees the layer, and nothing of it
+        // outlives the run (whatever kills it). Mounted before the masks,
+        // which cover what they show too.
+        for (src, dest) in &self.seeds {
+            a.extend(["--overlay-src".into(), src.as_os_str().to_owned(), "--tmp-overlay".into(), dest.as_os_str().to_owned()]);
+        }
         a.extend(self.masks.iter().cloned());
         Ok(a)
     }
@@ -752,7 +848,7 @@ impl Mounts {
 /// allowed link gives them (an allowed `~/src` that links to the disk
 /// holding the project). An allowed path inside the Veil home or the
 /// project is refused.
-fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], no_network: bool) -> Result<Mounts> {
+fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], seeds: &[(PathBuf, PathBuf)], no_network: bool) -> Result<Mounts> {
     let mut a: Vec<OsString> = Vec::new();
     let mut push = |items: &[&std::ffi::OsStr]| a.extend(items.iter().map(|s| s.to_os_string()));
     for f in [
@@ -771,7 +867,7 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], no_net
         push(&["--unshare-net".as_ref()]);
     }
     // The computer's tools, read-only.
-    for d in ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt", "/nix", "/sys"] {
+    for d in READ_ONLY {
         match std::fs::symlink_metadata(d) {
             Ok(m) if m.file_type().is_symlink() => {
                 if let Ok(t) = std::fs::read_link(d) {
@@ -832,9 +928,12 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], no_net
         }
         bound.push((dest, src));
     }
-    // Every name under which the allow-list shows `real` (canonical).
+    // Every name under which the sandbox shows `real` (canonical): through
+    // the allow-list and through every seed. The masks below apply to every
+    // way a host path enters the sandbox (BUG-1363).
+    let shown: Vec<(PathBuf, PathBuf)> = bound.iter().cloned().chain(seeds.iter().map(|(src, dest)| (dest.clone(), src.clone()))).collect();
     let aliases = |real: &Path| -> Vec<PathBuf> {
-        bound.iter().filter_map(|(dest, src)| real.strip_prefix(src).ok().map(|rel| dest.join(rel))).collect()
+        shown.iter().filter_map(|(dest, src)| real.strip_prefix(src).ok().map(|rel| dest.join(rel))).collect()
     };
     let mut masks: Vec<(&str, PathBuf)> = Vec::new();
     // Credential files, as named and wherever an allowed path shows them.
@@ -843,10 +942,21 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], no_net
         if !std::fs::metadata(&p).is_ok_and(|m| m.is_file()) {
             continue;
         }
-        if bound.iter().any(|(d, _)| p.starts_with(d)) {
+        // A link (a dotfiles manager's) is never bound over: `bwrap` would
+        // follow it to where the sandbox shows nothing and fail (BUG-1369).
+        // Its target is masked wherever the sandbox shows it (below); where
+        // it does not, the link leads nowhere inside.
+        let linked = std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink());
+        if !linked && bound.iter().any(|(d, _)| p.starts_with(d)) {
             masks.push(("/dev/null", p.clone()));
         }
-        masks.extend(p.canonicalize().iter().flat_map(|c| aliases(c)).map(|a| ("/dev/null", a)));
+        if let Ok(c) = p.canonicalize() {
+            masks.extend(aliases(&c).into_iter().map(|a| ("/dev/null", a)));
+            // Under a folder the sandbox shows read-only, as itself.
+            if linked && READ_ONLY.iter().any(|r| c.starts_with(r)) {
+                masks.push(("/dev/null", c));
+            }
+        }
     }
     // The Veil identity and keys, and the real project.
     if let Some(v) = &vh_real {
@@ -880,7 +990,7 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], no_net
             Allowed { kind, layer: kind != Kind::Other && !holds_project && !hidden_below, dest, src }
         })
         .collect();
-    Ok(Mounts { head: a, allowed, masks: hide, hidden: done })
+    Ok(Mounts { head: a, allowed, masks: hide, hidden: done, seeds: seeds.to_vec() })
 }
 
 /// Run the confinement once with `true`: a missing or unusable `bwrap`
@@ -1098,7 +1208,7 @@ pub fn doctor(root: Option<&Path>) -> Vec<(bool, String, Vec<String>)> {
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
-            let base = base_args(&home, None, &[], false).and_then(|m| m.args(&Layers::ReadOnly));
+            let base = base_args(&home, None, &[], &[], false).and_then(|m| m.args(&Layers::ReadOnly));
             match base.as_ref().map_err(|e| anyhow!("{e:#}")).and_then(|b| probe(&bwrap, b)) {
                 Ok(()) => out.push((true, format!("confinement works ({}): `vl ws exec` runs confined", safe(&version)), Vec::new())),
                 Err(e) => out.push((false, "confinement does not work here".into(), vec![safe(&e.to_string()).into_owned()])),
@@ -1132,9 +1242,15 @@ pub fn doctor(root: Option<&Path>) -> Vec<(bool, String, Vec<String>)> {
 
 #[cfg(target_os = "linux")]
 pub use run::{run, stop_leftovers};
+#[cfg(target_os = "linux")]
+pub use net::hold_main;
+
+/// Hidden first argument that turns `vl` into the holder of a confined
+/// run's user namespace while `pasta` joins it ([`net`]).
+pub const HOLD_ARG: &str = "__veil-netns-hold";
 
 #[cfg(not(target_os = "linux"))]
-pub fn run(_: &Confine, _: &Path, _: &[String], _: &[(&str, OsString)], _: Option<&Path>) -> Result<i32> {
+pub fn run(_: &Confine, _: &Path, _: &[String], _: &[(&str, OsString)], _: Option<&Path>, _: Option<&Path>) -> Result<i32> {
     bail!("confinement is only built for Linux")
 }
 
@@ -1462,12 +1578,49 @@ mod run {
     /// Run `command` confined by `c`, with `sandbox` at the project's path
     /// and `env` added; writes to the allow-list kept in the layers of
     /// `state` (a persistent sandbox's directory), or thrown away (`None`).
+    /// `socket`: the workspace socket ([`crate::ws_socket`]), shown to the
+    /// command at [`crate::ws_socket::INSIDE`].
     /// The exit status is the command's (128 + n for a
     /// signal); a limit that stopped it is reported.
-    pub fn run(c: &Confine, sandbox: &Path, command: &[String], env: &[(&str, OsString)], state: Option<&Path>) -> Result<i32> {
+    pub fn run(c: &Confine, sandbox: &Path, command: &[String], env: &[(&str, OsString)], state: Option<&Path>, socket: Option<&Path>) -> Result<i32> {
         let unit = format!("veil-exec-{}-{}", std::process::id(), hex::encode(veil_core::crypto::random_bytes::<4>()));
         // The throwaway file copies live until the command has exited.
-        let (mounts, _copies) = c.layered(state)?;
+        let (mut mounts, _copies) = c.layered(state)?;
+        // `--private-ports`: `bwrap` says the sandbox's pid on one pipe and
+        // waits on another until `pasta` has given it its network.
+        let mut net = match &c.pasta {
+            Some(_) => Some(super::net::Pending::new()?),
+            None => None,
+        };
+        if let Some(n) = &net {
+            mounts.extend(n.bwrap_args());
+        }
+        if let Some(sock) = socket {
+            // The socket, and this `vl` (read-only) first on `PATH`, so the
+            // command's `vl` is one that talks to the socket wherever `vl`
+            // is installed.
+            let inside = std::path::Path::new(crate::ws_socket::INSIDE);
+            let dir = inside.parent().expect("an absolute path");
+            let bin = dir.join("bin");
+            let mut path = bin.as_os_str().to_owned();
+            if let Some(p) = std::env::var_os("PATH").filter(|p| !p.is_empty()) {
+                path.push(":");
+                path.push(p);
+            }
+            mounts.extend([
+                "--dir".into(),
+                dir.as_os_str().to_owned(),
+                "--bind".into(),
+                sock.as_os_str().to_owned(),
+                inside.as_os_str().to_owned(),
+                "--setenv".into(),
+                crate::ws_socket::ENV.into(),
+                inside.as_os_str().to_owned(),
+            ]);
+            if let Ok(exe) = std::env::current_exe() {
+                mounts.extend(["--ro-bind".into(), exe.into_os_string(), bin.join("vl").into_os_string(), "--setenv".into(), "PATH".into(), path]);
+            }
+        }
         let (program, args) = c.argv(mounts, sandbox, command, &unit);
         let scoped = program != c.bwrap;
         let signals = Signals::install()?;
@@ -1482,10 +1635,16 @@ mod run {
             _ => None,
         };
         let vl = std::process::id() as libc::pid_t;
-        // SAFETY: only prctl(2), getppid(2), signal(2) and setrlimit(2),
-        // which are async-signal-safe, between fork and exec.
+        let keep: Vec<libc::c_int> = net.as_ref().map(|n| n.child_fds()).unwrap_or_default();
+        // SAFETY: only prctl(2), getppid(2), signal(2), setrlimit(2) and
+        // fcntl(2), which are async-signal-safe, between fork and exec.
         unsafe {
             cmd.pre_exec(move || {
+                for fd in &keep {
+                    if libc::fcntl(*fd, libc::F_SETFD, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 // `vl` dying at any moment kills `systemd-run` or `bwrap`
                 // (and so the sandbox): `bwrap`'s own `--die-with-parent`
                 // only holds once it has started. It survives both execs.
@@ -1503,6 +1662,20 @@ mod run {
             });
         }
         let mut child = cmd.spawn().with_context(|| format!("failed to run {}", program.display()))?;
+        // The run's own network, before the command starts; any failure
+        // stops the sandbox before its command ran (never a run on the
+        // host's network).
+        let _network = match net.take() {
+            Some(n) => match n.start(c.pasta.as_deref().expect("pasta with a pending network"), &mut child) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e.context("--private-ports: the run's own network could not be set up; nothing was run"));
+                }
+            },
+            None => None,
+        };
         let outer = child.id() as i32;
         let pidfd = Pinned::open(outer);
         let started = Instant::now();
@@ -1680,6 +1853,264 @@ mod run {
             return Ok(128 + sig);
         }
         Ok(status.code().unwrap_or(1))
+    }
+}
+
+/// `--private-ports`: the run's own network namespace (`bwrap
+/// --unshare-net`, with its private loopback), given outbound access by
+/// `pasta` before the command starts.
+///
+/// `bwrap` makes two user namespaces: the network namespace belongs to the
+/// outer one, which no process stays in. `pasta` must join that one, by a
+/// `/proc/PID/ns/user` path: a holder (this binary, [`HOLD_ARG`]) joins it
+/// (`NS_GET_USERNS` on the network namespace) and lives until `pasta` has
+/// set the network up. `pasta` is told to forward nothing in either
+/// direction (`-t none -u none -T none -U none`) and not to map its gateway
+/// to the host (`--no-map-gw`), so the host's loopback is not reachable from
+/// the run and the run's ports are not reachable from the host or from any
+/// other run. Name lookups go to `pasta`'s DNS forwarder (a private
+/// `resolv.conf` naming it), which asks the host's resolver.
+#[cfg(target_os = "linux")]
+mod net {
+    use std::{
+        ffi::OsString,
+        io::{Read, Write},
+        os::{
+            fd::{AsRawFd, FromRawFd, OwnedFd},
+            unix::process::CommandExt,
+        },
+        path::{Path, PathBuf},
+        process::{Child, Command, Stdio},
+        time::{Duration, Instant},
+    };
+
+    use anyhow::{anyhow, bail, Context, Result};
+
+    /// The address the run's `resolv.conf` names: `pasta` forwards DNS
+    /// sent to it to the host's resolver.
+    const DNS: &str = "169.254.1.1";
+    /// The longest setting the network up may take.
+    const WAIT: Duration = Duration::from_secs(20);
+    /// `ioctl(NS_GET_USERNS)`: the user namespace owning a namespace.
+    const NS_GET_USERNS: libc::c_ulong = 0xb701;
+
+    fn pipe() -> Result<(OwnedFd, OwnedFd)> {
+        let mut fds = [0; 2];
+        // SAFETY: pipe2 fills both descriptors, which we then own.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: both were just created.
+        Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    }
+
+    /// The pipes and files of a network about to be set up.
+    pub struct Pending {
+        info: (OwnedFd, OwnedFd),
+        block: (OwnedFd, OwnedFd),
+        /// Private: the run's `resolv.conf` and `pasta`'s pid file.
+        dir: crate::sandbox::Sandbox,
+        resolv: Option<(PathBuf, PathBuf)>,
+    }
+
+    impl Pending {
+        pub fn new() -> Result<Pending> {
+            let dir = crate::sandbox::Sandbox::create("net")?;
+            // Where `/etc/resolv.conf` leads (often into `/run`, which the
+            // sandbox binds read-only): over it, a file naming `pasta`'s
+            // forwarder, with the host's search domains and options.
+            let resolv = match std::fs::read_to_string("/etc/resolv.conf") {
+                Ok(text) => {
+                    let mut out = format!("nameserver {DNS}\n");
+                    for l in text.lines().filter(|l| l.starts_with("search ") || l.starts_with("options ")) {
+                        out.push_str(l);
+                        out.push('\n');
+                    }
+                    let file = dir.path().join("resolv.conf");
+                    std::fs::write(&file, out).with_context(|| format!("writing {}", file.display()))?;
+                    let at = std::fs::canonicalize("/etc/resolv.conf").unwrap_or_else(|_| PathBuf::from("/etc/resolv.conf"));
+                    Some((file, at))
+                }
+                Err(_) => None,
+            };
+            Ok(Pending { info: pipe()?, block: pipe()?, dir, resolv })
+        }
+
+        /// The descriptors `bwrap` inherits.
+        pub fn child_fds(&self) -> Vec<libc::c_int> {
+            vec![self.info.1.as_raw_fd(), self.block.0.as_raw_fd()]
+        }
+
+        pub fn bwrap_args(&self) -> Vec<OsString> {
+            let mut a: Vec<OsString> = vec![
+                "--info-fd".into(),
+                self.info.1.as_raw_fd().to_string().into(),
+                "--block-fd".into(),
+                self.block.0.as_raw_fd().to_string().into(),
+            ];
+            if let Some((file, at)) = &self.resolv {
+                a.extend(["--ro-bind".into(), file.as_os_str().to_owned(), at.as_os_str().to_owned()]);
+            }
+            a
+        }
+
+        /// `bwrap` was started: give its sandbox the network, then let its
+        /// command start.
+        pub fn start(self, pasta: &Path, bwrap: &mut Child) -> Result<Network> {
+            let Pending { info: (info, info_w), block: (block_r, block), dir, .. } = self;
+            drop((info_w, block_r));
+            let pid = sandbox_pid(info, bwrap)?;
+            let netns = std::fs::File::open(format!("/proc/{pid}/ns/net")).context("opening the sandbox's network namespace")?;
+            // SAFETY: the ioctl returns a new descriptor (close-on-exec), or -1.
+            let owner = unsafe { libc::ioctl(netns.as_raw_fd(), NS_GET_USERNS as _) };
+            if owner < 0 {
+                return Err(anyhow!(std::io::Error::last_os_error()).context("finding the user namespace of the sandbox's network"));
+            }
+            // SAFETY: just returned to us.
+            let owner = unsafe { OwnedFd::from_raw_fd(owner) };
+            let mut holder = hold(&owner)?;
+            let pid_file = dir.path().join("pasta.pid");
+            let got = run_pasta(pasta, holder.id(), pid, &pid_file, &dir.path().join("pasta.log"));
+            drop(holder.stdin.take());
+            let _ = holder.kill();
+            let _ = holder.wait();
+            got?;
+            let daemon = std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<i32>().ok());
+            let network = Network { pasta: daemon.map(|p| (p, pasta.to_path_buf())), _dir: dir };
+            std::fs::File::from(block).write_all(b"1").context("starting the command")?;
+            Ok(network)
+        }
+    }
+
+    /// The sandbox's pid, from `bwrap --info-fd`.
+    fn sandbox_pid(info: OwnedFd, bwrap: &mut Child) -> Result<i32> {
+        let mut f = std::fs::File::from(info);
+        let mut text = String::new();
+        let deadline = Instant::now() + super::SETUP_WAIT;
+        let mut buf = [0u8; 512];
+        loop {
+            let mut fds = libc::pollfd { fd: f.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                bail!("the sandbox did not start within {} s", super::SETUP_WAIT.as_secs());
+            }
+            // SAFETY: polls our own descriptor.
+            unsafe { libc::poll(&mut fds, 1, left.as_millis().min(500) as i32) };
+            if fds.revents == 0 {
+                if let Some(s) = bwrap.try_wait()? {
+                    bail!("bubblewrap exited ({s}) before the sandbox started");
+                }
+                continue;
+            }
+            let n = f.read(&mut buf)?;
+            text.push_str(&String::from_utf8_lossy(&buf[..n]));
+            if let Some(pid) = child_pid(&text) {
+                return Ok(pid);
+            }
+            if n == 0 {
+                bail!("bubblewrap exited before the sandbox started");
+            }
+        }
+    }
+
+    /// `"child-pid": N` in `bwrap`'s info document.
+    fn child_pid(text: &str) -> Option<i32> {
+        let v: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+        let pid = v.get("child-pid")?.as_i64()?;
+        (pid > 1).then_some(pid as i32)
+    }
+
+    /// The holder: this binary, in the user namespace `owner`, until its
+    /// stdin closes.
+    fn hold(owner: &OwnedFd) -> Result<Child> {
+        let fd = owner.as_raw_fd();
+        let mut cmd = Command::new(std::env::current_exe()?);
+        cmd.arg(super::HOLD_ARG).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+        // SAFETY: setns(2) and prctl(2) are async-signal-safe; the forked
+        // child is single-threaded, as setns into a user namespace needs.
+        unsafe {
+            cmd.pre_exec(move || {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                if libc::setns(fd, libc::CLONE_NEWUSER) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        cmd.spawn().context("joining the sandbox's user namespace")
+    }
+
+    /// `pasta`, joined to the sandbox's network: it configures the network
+    /// and goes to the background (its pid in `pid_file`, what it says in
+    /// `log`).
+    fn run_pasta(pasta: &Path, holder: u32, sandbox: i32, pid_file: &Path, log: &Path) -> Result<()> {
+        let err = std::fs::File::create(log).with_context(|| format!("creating {}", log.display()))?;
+        let mut cmd = Command::new(pasta);
+        cmd.args(["--quiet", "--config-net", "-t", "none", "-u", "none", "-T", "none", "-U", "none", "--no-map-gw", "--dns-forward", DNS])
+            .arg("--userns")
+            .arg(format!("/proc/{holder}/ns/user"))
+            .arg("--netns")
+            .arg(format!("/proc/{sandbox}/ns/net"))
+            .arg("--pid")
+            .arg(pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(err);
+        let mut child = cmd.spawn().with_context(|| format!("running {}", pasta.display()))?;
+        let deadline = Instant::now() + WAIT;
+        let status = loop {
+            if let Some(s) = child.try_wait()? {
+                break s;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("pasta did not set the network up within {} s", WAIT.as_secs());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        if !status.success() {
+            let err = std::fs::read_to_string(log).unwrap_or_default();
+            let last = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("it failed without a message");
+            bail!("pasta failed ({status}): {}", crate::render::safe(last.trim()));
+        }
+        Ok(())
+    }
+
+    /// A run's network: `pasta`, stopped with the run.
+    pub struct Network {
+        pasta: Option<(i32, PathBuf)>,
+        _dir: crate::sandbox::Sandbox,
+    }
+
+    impl Drop for Network {
+        fn drop(&mut self) {
+            // `pasta` also quits by itself once the sandbox is gone; this
+            // stops it at once, and only if that pid is still our `pasta`.
+            if let Some((pid, pasta)) = &self.pasta {
+                // (`pasta` may run itself again as `pasta.avx2`.)
+                let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+                let ours = exe.is_some_and(|e| {
+                    pasta.canonicalize().is_ok_and(|p| {
+                        let name = |x: &Path| x.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        e.parent() == p.parent() && (name(&e) == name(&p) || name(&e).starts_with(&format!("{}.", name(&p))))
+                    })
+                });
+                if ours {
+                    // SAFETY: kill(2) of the pasta this run started.
+                    unsafe {
+                        libc::kill(*pid, libc::SIGTERM);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The holder's whole life: wait for stdin to close.
+    pub fn hold_main() -> std::process::ExitCode {
+        let mut sink = [0u8; 64];
+        while std::io::stdin().read(&mut sink).is_ok_and(|n| n > 0) {}
+        std::process::ExitCode::SUCCESS
     }
 }
 

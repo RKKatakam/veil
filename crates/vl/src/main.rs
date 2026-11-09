@@ -47,6 +47,7 @@ mod team_secret;
 #[cfg(debug_assertions)]
 mod test_remotes;
 mod thin;
+mod ws_socket;
 
 use std::{
     io::{IsTerminal, Read, Write},
@@ -108,8 +109,20 @@ node_modules/            ignore
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
-    if args.next().is_some_and(|a| a == sandbox::REAPER_ARG) {
+    let first = args.next();
+    if first.as_ref().is_some_and(|a| a == sandbox::REAPER_ARG) {
         return sandbox::reaper_main(args.collect());
+    }
+    #[cfg(target_os = "linux")]
+    if first.as_ref().is_some_and(|a| a == confine::HOLD_ARG) {
+        return confine::hold_main();
+    }
+    if first.as_ref().is_some_and(|a| a == ws_socket::COMMAND_ARG) {
+        return run_in_workspace(std::env::args_os().skip(2).collect());
+    }
+    // Inside a `vl ws exec` sandbox: the `vl` outside runs the command.
+    if let Some(socket) = std::env::var_os(ws_socket::ENV).filter(|s| !s.is_empty()) {
+        return ws_socket::client_main(&socket, std::env::args_os().skip(1).collect());
     }
     let cli = Cli::parse();
     let json = cli.cmd.wants_json();
@@ -129,6 +142,25 @@ fn main() -> ExitCode {
             if json && !api::json_emitted() {
                 let _ = api::emit_json(&api::ErrorDoc::new(message, hint.map(String::from)));
             }
+            ExitCode::FAILURE
+        }
+    })
+}
+
+/// A command a sandbox's `vl` sent through the workspace socket
+/// ([`ws_socket`]): checked again, then run on that workspace only.
+fn run_in_workspace(args: Vec<std::ffi::OsString>) -> ExitCode {
+    let run = || -> Result<ExitCode> {
+        let (root, ws, cli) = ws_socket::parse_command(args)?;
+        let mut ctx = ws_socket::open(&root, &ws, &cli)?;
+        let code = dispatch(&mut ctx, &cli)?;
+        ctx.finish()?;
+        Ok(code)
+    };
+    render::exit_status(match run() {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("{} {}", red("error:"), safe(&format!("{e:#}")));
             ExitCode::FAILURE
         }
     })
@@ -296,9 +328,10 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Cat { path, rev } => {
             let id = ctx.rev(rev)?;
             let p = ctx.repo_path(path)?;
+            let tree = ctx.repo.snapshot(&id)?.tree;
             let e = match p.is_root() {
                 true => None,
-                false => lookup(ctx.repo.store(), &ctx.repo.snapshot(&id)?.tree, &p)?,
+                false => render::lookup_shown(&ctx.repo, &tree, &p)?,
             };
             match &e {
                 // A symlink prints its target.
@@ -308,7 +341,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
                 None => bail!("{} does not exist in {}", safe(p.as_str()), id.short()),
             }
             let e = e.expect("a file");
-            let data = read_file(&ctx.repo, &p, &e)?;
+            let data = read_file(&ctx.repo, &tree, &p, &e)?;
             render::Out.write_all(&data)?;
         }
         Cmd::Evolog { rev } => {
@@ -348,6 +381,15 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             let c = api::commit(ctx, &message, !*no_advance, !cli.no_snapshot)?;
             println!("Committed {}", one_line(&ctx.repo, &c.result.committed));
             print_tags_kept(&c.result);
+            // Once, here: what the person keeps in a folder they no longer
+            // have access to was not recorded (BUG-1528).
+            if !ctx.report.not_recorded.is_empty() {
+                let files: Vec<String> = ctx.report.not_recorded.iter().map(|p| safe(p.as_str()).into_owned()).collect();
+                render::warn(&format!(
+                    "not recorded, left as they are: {} (in a folder you no longer have access to)",
+                    files.join(", ")
+                ));
+            }
         }
         Cmd::Edit { rev } => {
             let id = ctx.rev(rev)?;
@@ -505,9 +547,11 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             }
             let outside = ctx.repo.manual_undo_since(op)?;
             // Releases are not in the view: take back the staged ones made
-            // since, and say which published ones stay (BUG-109).
-            let (staged, published) = ctx.repo.releases_after(&op)?;
-            ctx.repo.restore_operation_keeping_edits(&ws, op)?;
+            // since, and say which published ones stay (BUG-109). Since
+            // the restore's own parents: a release another process staged
+            // while this one ran is behind the restore too (BUG-1404).
+            let restore = ctx.repo.restore_operation_keeping_edits(&ws, op)?;
+            let (staged, published) = ctx.repo.releases_restored(&restore)?;
             for e in &staged {
                 ctx.repo.keys().take_back_release(e)?;
             }
@@ -919,7 +963,17 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
     let filters: Vec<VPath> = paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
     let wanted = |p: &VPath| filters.is_empty() || filters.iter().any(|f| p.starts_with(f));
     let policy_path = VPath::new(POLICY_FILE)?;
-    let changes = veil_core::tree::diff_trees(ctx.repo.store(), Some(&wc_tree), Some(&src_tree))?;
+    // A folder the server refuses stays as `@` has it, unless a path asked
+    // for is in or above it (BUG-1529).
+    let (changes, hidden) = veil_core::tree::diff_trees_hiding(ctx.repo.store(), Some(&wc_tree), Some(&src_tree))?;
+    for h in hidden.iter().map(|h| &h.path) {
+        if filters.is_empty() || filters.iter().any(|f| f.starts_with(h) || h.starts_with(f)) {
+            let asked = if filters.is_empty() { "a restore of every path asks for it".to_string() } else { "a path asked for is in it".into() };
+            return Err(veil_core::tree::no_access(h, &asked).into());
+        }
+    }
+    // In a thin clone, what is put back, each at its own path (BUG-1506).
+    veil_core::tree::prefetch_changes(ctx.repo.store(), None, Some(&src_tree), changes.iter().filter(|c| wanted(&c.path)))?;
     let mut done: std::collections::HashSet<VPath> = changes.iter().filter(|c| wanted(&c.path)).map(|c| c.path.clone()).collect();
     // A version put back keeps its audience: a sealed version, or a
     // conflict, is recorded as the entry it was written from, never as a
@@ -973,7 +1027,7 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
         let mut carry = None;
         let res = match veil_core::tree::lookup(ctx.repo.store(), &src_tree, &p)? {
             Some(e) if e.kind.is_file_like() => {
-                let data = read_file(&ctx.repo, &p, &e)?;
+                let data = read_file(&ctx.repo, &src_tree, &p, &e)?;
                 if restored_as_recorded(&ctx.repo, &e)? {
                     carry = Some((p.clone(), e.clone()));
                 }
@@ -987,7 +1041,7 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
             }
             // A quarantined link (a token in its target) put back.
             Some(e) if e.kind == veil_core::EntryKind::Symlink => {
-                let target = read_file(&ctx.repo, &p, &e)?;
+                let target = read_file(&ctx.repo, &src_tree, &p, &e)?;
                 if restored_as_recorded(&ctx.repo, &e)? {
                     carry = Some((p.clone(), e.clone()));
                 }
@@ -1158,6 +1212,9 @@ fn cmd_embargo(ctx: &mut Ctx, c: &EmbargoCmd) -> Result<()> {
                 println!("No embargoes.");
             }
             let withdrawn = remote::withdrawn_embargoes(&ctx.repo)?;
+            // Where staged releases stand by the op log (BUG-1487): a push
+            // publishes only those in force.
+            let (standing, _) = ctx.repo.staged_release_standing()?;
             for r in list {
                 let pending = || match r.until {
                     Some(u) => yellow(&format!("until {}", fmt_deadline(u))),
@@ -1165,6 +1222,10 @@ fn cmd_embargo(ctx: &mut Ctx, c: &EmbargoCmd) -> Result<()> {
                 };
                 let state = match ctx.repo.keys().release_state(&r.id) {
                     ReleaseState::Released => green("released"),
+                    ReleaseState::Staged if standing.get(&r.id).is_some_and(|s| *s != veil_core::commands::Standing::InForce) => yellow(&format!(
+                        "not released: an undo or op restore took the release back, or the op log does not hold it; the next push does not publish it (`vl embargo release {}` to release it again)",
+                        safe(&r.id)
+                    )),
                     ReleaseState::Staged => format!(
                         "{} {}",
                         green("released"),
@@ -1191,10 +1252,17 @@ fn cmd_embargo_release(ctx: &mut Ctx, id: &str, yes: bool) -> Result<()> {
     let Some(rec) = keys.load_embargo(id)? else {
         bail!("no embargo '{}' (see `vl embargo list`)", safe(id));
     };
+    let (standing, _) = ctx.repo.staged_release_standing()?;
+    let keys = ctx.repo.keys();
     match keys.release_state(id) {
         ReleaseState::Released => {
             println!("Embargo {} is already released.", safe(id));
             return Ok(());
+        }
+        // Staged, but the op log does not hold it in force: release it
+        // again (BUG-1487).
+        ReleaseState::Staged if standing.get(id).is_some_and(|s| *s != veil_core::commands::Standing::InForce) => {
+            keys.take_back_release(id)?;
         }
         ReleaseState::Staged => {
             println!("Embargo {} is already released here; your next push publishes it (`vl undo` right after the release takes it back).", safe(id));
@@ -1436,13 +1504,14 @@ fn cmd_policy_rules(ctx: &mut Ctx, patterns: &[String], tier: Tier, force: bool)
         PolicyFile::Absent => {
             // The working copy's snapshot has recorded the deletion already.
             let wc = ctx.repo.snapshot(&ctx.wc()?)?;
+            let parent = ctx.repo.parents_tree(&wc.parents)?.tree;
             let recorded = match lookup(ctx.repo.store(), &wc.tree, &path)? {
-                Some(e) => Some(e),
-                None => lookup(ctx.repo.store(), &ctx.repo.parents_tree(&wc.parents)?.tree, &path)?,
+                Some(e) => Some((wc.tree, e)),
+                None => lookup(ctx.repo.store(), &parent, &path)?.map(|e| (parent, e)),
             };
             match recorded {
-                Some(e) => {
-                    let b = read_file(&ctx.repo, &path, &e)?;
+                Some((root, e)) => {
+                    let b = read_file(&ctx.repo, &root, &path, &e)?;
                     eprintln!("{} {POLICY_FILE} was missing; restored the recorded version", dim("note:"));
                     String::from_utf8_lossy(&b).into_owned()
                 }
@@ -2165,6 +2234,7 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
             with_isolated,
             only,
             record_only,
+            mount,
             confine,
             command,
         } => {
@@ -2178,6 +2248,7 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
                     with_isolated: *with_isolated,
                     only,
                     record_only: *record_only,
+                    mount: *mount,
                     confine,
                     command,
                 },

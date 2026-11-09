@@ -522,7 +522,13 @@ fn note(s: &mut State, action: &str, id: &ObjectId, code: Option<i32>) {
 fn unreadable_files(ctx: &Ctx, tree: &ObjectId) -> Result<usize> {
     let store = ctx.repo.store();
     let mut n = 0;
-    for (_, e) in veil_core::tree::walk_files(store, tree)? {
+    // A folder the server refuses counts as one (BUG-1508).
+    let (files, hidden) = veil_core::tree::walk_files_hiding(store, tree)?;
+    n += hidden.len();
+    // Readability is read by id: in a thin clone, each asked for at its
+    // own path first (BUG-1506).
+    veil_core::tree::prefetch_files(store, tree, files.iter().filter(|(_, e)| e.kind == veil_core::EntryKind::File).map(|(p, e)| (p, e)))?;
+    for (_, e) in files {
         if e.kind == veil_core::EntryKind::File && !store.entry_readable(&e) {
             n += 1;
         }

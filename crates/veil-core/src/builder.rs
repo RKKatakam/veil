@@ -656,6 +656,10 @@ pub struct BuildReport {
     pub relabelled: Vec<(VPath, String)>,
     /// Entries carried over because this reader cannot materialise them.
     pub carried: Vec<VPath>,
+    /// Files the working copy holds in a folder carried by id because its
+    /// person no longer has access to it (BUG-1528): never recorded, never
+    /// touched; `vl status` and `vl commit` name them.
+    pub not_recorded: Vec<VPath>,
     pub ignored: usize,
     /// The ignored paths (`vl ls --all`), each with whether it is a
     /// directory (ignored as a whole, never descended into).
@@ -1038,7 +1042,30 @@ impl<'a> Builder<'a> {
                         continue;
                     }
                     let sub = match pdir {
-                        Some(e) => Some((self.store.tree(&e.id)?, e.id)),
+                        Some(e) => match self.store.tree(&e.id) {
+                            Ok(t) => Some((t, e.id)),
+                            // A folder the server refuses (BUG-1508), with
+                            // something in the working copy. Left out by
+                            // checkout, what is there is not an edit of a
+                            // version this reader never saw: the folder is
+                            // carried by id and what is there not recorded.
+                            // Otherwise it cannot be recorded against a
+                            // version this reader cannot read; the folder is
+                            // never left out or emptied either.
+                            Err(err) if crate::tree::refused_tree(self.store, &err) => {
+                                if self.opts.materialised.is_some_and(|m| m.hidden(&path)) {
+                                    // What is there is listed, never silently
+                                    // left (BUG-1528), and never touched.
+                                    let files = crate::vfs::walk_files(self.fs, &path, &|_| false)?;
+                                    self.report.not_recorded.extend(files);
+                                    self.report.carried.push(path.clone());
+                                    f.out.insert(e.clone());
+                                    continue;
+                                }
+                                return Err(crate::tree::no_access(&path, "the working copy holds files in it (move them out of it to record the rest)"));
+                            }
+                            Err(err) => return Err(err),
+                        },
                         None => None,
                     };
                     let name = name.to_string();
@@ -1274,7 +1301,8 @@ impl<'a> Builder<'a> {
                     // Readable and absent is a deletion, unless it was never
                     // materialised (it became readable since checkout).
                     let never_materialised = b.opts.materialised.is_some_and(|m| m.hidden(path));
-                    let readable = b.store.entry_readable(e);
+                    // In a thin clone, not fetched is shown (S8): absent is a deletion.
+                    let readable = b.store.entry_shown(e);
                     if readable && !never_materialised {
                         Ok(Err(None))
                     } else {
@@ -1305,7 +1333,8 @@ impl<'a> Builder<'a> {
                 // a deletion (a removed link).
                 EntryKind::Symlink => {
                     let never_materialised = b.opts.materialised.is_some_and(|m| m.hidden(path));
-                    let readable = b.store.entry_readable(e);
+                    // In a thin clone, not fetched is shown (S8): absent is a deletion.
+                    let readable = b.store.entry_shown(e);
                     if b.links && readable && !never_materialised {
                         Ok(Err(None))
                     } else {

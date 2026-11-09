@@ -820,6 +820,11 @@ impl Repo {
         let wc = tx.new_change(bases, "")?;
         tx.view.workspaces.insert(name.to_string(), WorkspaceState::new(wc));
         tx.commit()?;
+        // Its working copy is snapshots already recorded, nothing of this
+        // device's: nothing for the current scanner rules to look at again.
+        // (Otherwise its first recording would read every file, and in a
+        // thin clone fetch the whole workspace: milestone S8.)
+        mark_scanned(&*self.backend, name)?;
         Ok(wc)
     }
 
@@ -886,7 +891,7 @@ impl Repo {
         // An embargo release is not in the view (see `check_undo_release`).
         let release = self.check_undo_release(&op.description)?;
         let revert = self.parent_view(&op)?;
-        let link = OpLink::UndoOf(command);
+        let link = OpLink::Undo(command);
         let target = Restore::Revert { base: op.view.clone(), revert };
         // The edits to keep: those recorded since the undone operation
         // while the working copy is still the change it was there, else
@@ -931,7 +936,7 @@ impl Repo {
         };
         // The edits to keep, as for an undo (BUG-1041).
         let last = self.ops.get(&self.last_command_op(ws)?)?.view;
-        let id = self.restore_view_keeping_edits(ws, target, &[undo_op.view.clone(), last], format!("redo: {}", op.description), OpLink::RedoOf(undo))?;
+        let id = self.restore_view_keeping_edits(ws, target, &[undo_op.view.clone(), last], format!("redo: {}", op.description), OpLink::Redo(undo))?;
         Ok((id, op.description))
     }
 
@@ -1022,7 +1027,7 @@ impl Repo {
         let command = self.last_command_op(ws)?;
         let before_edits = self.ops.get(&command)?.view;
         let view = self.ops.get(&op)?.view;
-        self.restore_view_keeping_edits(ws, Restore::Exact(view), &[before_edits], format!("restore to operation {}", op.short()), OpLink::None)
+        self.restore_view_keeping_edits(ws, Restore::Exact(view), &[before_edits], format!("restore to operation {}", op.short()), OpLink::Restore(op))
     }
 
     /// The operations recorded after `op` (that it does not reach) for a
@@ -1069,31 +1074,19 @@ impl Repo {
     /// workspace, see [`mount_record_op_description`]), not a merge of
     /// concurrent operations, and of `ws` or of no workspace.
     fn command_at(&self, start: ObjectId, ws: &str) -> Result<ObjectId> {
-        let mut queue = std::collections::BinaryHeap::new();
-        let mut seen = std::collections::HashSet::new();
-        let first = self.op_or_pruned(&start, "undo")?;
-        queue.push((first.timestamp, start));
-        seen.insert(start);
-        let mut pruned = None;
-        while let Some((_, id)) = queue.pop() {
-            let Some(op) = self.ops.try_get(&id)? else {
-                pruned = Some(id);
-                continue;
-            };
+        self.op_or_pruned(&start, "undo")?;
+        // The op log's order (BUG-1402): never an operation before one
+        // that descends from it.
+        let mut walk = self.ops.walk(&[start]);
+        for r in walk.by_ref() {
+            let (id, op) = r?;
             let other_ws = op.workspace.as_deref().is_some_and(|w| w != ws);
             let skip = op.is_merge() || other_ws || (is_automatic_recording(&op.description, ws) && !op.parents.is_empty());
             if !skip {
                 return Ok(id);
             }
-            for p in &op.parents {
-                if seen.insert(*p) {
-                    match self.ops.try_get(p)? {
-                        Some(po) => queue.push((po.timestamp, *p)),
-                        None => pruned = Some(*p),
-                    }
-                }
-            }
         }
+        let pruned = walk.pruned();
         match pruned {
             Some(p) => Err(VeilError::repo(format!(
                 "nothing further to undo: operation {} was pruned by `vl gc --keep-ops-days`",
@@ -1154,7 +1147,7 @@ impl Repo {
                         edits.push((base, now, restored));
                     }
                 }
-                None if !matches!(link, OpLink::None) => {
+                None if matches!(link, OpLink::Undo(_) | OpLink::Redo(_)) => {
                     let (verb, what) = description.split_once(": ").unwrap_or(("restore", &description));
                     return Err(VeilError::repo(format!(
                         "cannot {verb} '{what}': it would remove workspace '{name}', which holds edits recorded since. \
@@ -1178,9 +1171,9 @@ impl Repo {
         tx.view = view;
         tx.record_always();
         match link {
-            OpLink::None => {}
-            OpLink::UndoOf(op) => tx.undo_of(op),
-            OpLink::RedoOf(op) => tx.redo_of(op),
+            OpLink::Undo(op) => tx.undo_of(op),
+            OpLink::Redo(op) => tx.redo_of(op),
+            OpLink::Restore(op) => tx.restore_of(op),
         }
         for (base, now, restored) in edits {
             let base_tree = tx.repo().snapshot(&base)?.tree;
@@ -1216,9 +1209,9 @@ impl Repo {
 /// How an operation recorded by [`Repo::restore_view_keeping_edits`]
 /// relates to earlier ones.
 enum OpLink {
-    None,
-    UndoOf(ObjectId),
-    RedoOf(ObjectId),
+    Undo(ObjectId),
+    Redo(ObjectId),
+    Restore(ObjectId),
 }
 
 /// The view [`Repo::restore_view_keeping_edits`] installs.

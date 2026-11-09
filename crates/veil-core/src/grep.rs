@@ -2,7 +2,7 @@
 //! this reader may see them.
 //!
 //! * **Snapshots only.** The files searched are those of a recorded tree
-//!   ([`walk_files`]), so isolated, quarantined and ignored files, which
+//!   ([`walk_files`](crate::tree::walk_files)), so isolated, quarantined and ignored files, which
 //!   never enter a snapshot, are never searched, and not counted either
 //!   (no existence oracle). There is no option to read the disk.
 //! * **One reader.** Content is read through [`readable_version`](crate::blame::readable_version):
@@ -31,7 +31,7 @@ use crate::{
     search::compile_regex,
     secrets::looks_binary,
     store::ObjectStore,
-    tree::walk_files,
+    tree::walk_files_hiding,
     vpath::VPath,
 };
 
@@ -114,6 +114,9 @@ pub struct Skipped {
     /// Binary files that matched (their lines are not shown).
     pub binary: usize,
     pub too_large: usize,
+    /// Folders not searched: the server refuses them to this thin clone
+    /// (its person lost access since their names were met, BUG-1508).
+    pub hidden_folders: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -178,7 +181,11 @@ fn search_one(store: &ObjectStore, path: &VPath, e: &TreeEntry, re: &Regex, o: &
 
 /// Search the files of `tree` (see the module docs).
 pub fn grep(store: &ObjectStore, tree: &ObjectId, re: &Regex, o: &GrepOptions) -> Result<Grep> {
-    let files: Vec<(VPath, TreeEntry)> = walk_files(store, tree)?.into_iter().filter(|(p, e)| e.kind.is_file_like() && under(&o.paths, p)).collect();
+    let (files, hidden) = walk_files_hiding(store, tree)?;
+    let hidden_folders = hidden.iter().filter(|h| under(&o.paths, h) || o.paths.iter().any(|f| f.starts_with(h))).count();
+    let files: Vec<(VPath, TreeEntry)> = files.into_iter().filter(|(p, e)| e.kind.is_file_like() && under(&o.paths, p)).collect();
+    // In a thin clone, each file asked for at its own path (BUG-1506).
+    crate::tree::prefetch_files(store, tree, files.iter().filter(|(_, e)| e.size <= MAX_FILE as u64).map(|(p, e)| (p, e)))?;
     let threads = if cfg!(feature = "os") { std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8) } else { 1 };
     let next = AtomicUsize::new(0);
     let results: Vec<Mutex<Option<Result<One>>>> = files.iter().map(|_| Mutex::new(None)).collect();
@@ -202,6 +209,7 @@ pub fn grep(store: &ObjectStore, tree: &ObjectId, re: &Regex, o: &GrepOptions) -
         });
     }
     let mut out = Grep { searched: files.len(), stats: all_stats.into_inner().unwrap(), ..Grep::default() };
+    out.skipped.hidden_folders = hidden_folders;
     for r in results {
         match r.into_inner().unwrap().expect("every file searched")? {
             One::Hit(f) => {
