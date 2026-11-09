@@ -161,7 +161,7 @@ fn a_thin_clone_receives_nothing_its_person_may_not_see() {
     p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap()]);
     p.dev.ok(&d, &["identity", "confirm", &p.fp]);
     for rev in log_ids(&p.dev, &d) {
-        p.dev.run(&d, &["show", &rev]);
+        p.dev.ok(&d, &["show", &rev]);
     }
     let items = everything_in(&d);
     assert_no_marker(&items, &restricted_markers(), "dev's thin clone");
@@ -174,7 +174,7 @@ fn a_thin_clone_receives_nothing_its_person_may_not_see() {
     let o = anyone.dir("thin-anyone");
     anyone.ok(anyone.home.path(), &["clone", &hub.url(&p.name), o.to_str().unwrap()]);
     for rev in log_ids(&anyone, &o) {
-        anyone.run(&o, &["show", &rev]);
+        anyone.ok(&o, &["show", &rev]);
     }
     assert_no_marker(&everything_in(&o), &restricted_markers(), "anyone's thin clone");
 }
@@ -202,7 +202,7 @@ fn the_cache_stays_under_its_bound() {
     let ids = log_ids(&admin, &thin);
     let mut most = 0;
     for rev in ids.iter().rev() {
-        admin.run(&thin, &["show", rev]);
+        admin.ok(&thin, &["show", rev]);
         most = most.max(du(&thin.join(".veil/cache")));
     }
     assert!(most <= limit + 64 * 1024, "the cache reached {most} bytes, over its bound {limit}");
@@ -418,14 +418,10 @@ fn s3r_a_checkout_past_the_cache_bound_fails_before_writing() {
     admin.ok(admin.home.path(), &["clone", "--cache-size", "100K", &hub.url(&name), thin.to_str().unwrap()]);
     let o = admin.run(&thin, &["new", "big"]);
     let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(!o.status.success(), "`vl new big` past the cache bound succeeded:\n{out}");
     let st = std::fs::read_to_string(thin.join(".veil/local/checkout.json")).unwrap();
     let written = (0..20).filter(|i| thin.join(format!("big/f{i:02}.bin")).exists()).count();
-    if o.status.success() {
-        let cache = du(&thin.join(".veil/cache"));
-        assert!(written == 20 && cache <= 100 * 1024 + 64 * 1024, "the checkout left {cache} bytes in a cache bounded at 100 KiB:\n{out}");
-    } else {
-        assert!(!st.contains("pending") && written == 0, "a failed checkout wrote {written} of 20 files and left {st}:\n{out}");
-    }
+    assert!(!st.contains("pending") && written == 0, "a failed checkout wrote {written} of 20 files and left {st}:\n{out}");
     admin.ok(&thin, &["status"]);
 }
 
@@ -456,15 +452,11 @@ fn project_with_big_branch(hub: &TestHub) -> (Person, String) {
 }
 
 /// After `cmd` ran in thin clone `thin` (bounded at 100 KiB) and tried to
-/// move the working copy onto `big`'s 400 KB: either it moved, within the
-/// bound, or it failed and recorded nothing, so the next command works.
+/// move the working copy onto `big`'s 400 KB: it failed and recorded nothing,
+/// so the next command works.
 fn assert_a_failed_move_records_nothing(admin: &Person, thin: &Path, cmd: &[&str], o: std::process::Output) {
     let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-    if o.status.success() {
-        let cache = du(&thin.join(".veil/cache"));
-        assert!(cache <= 100 * 1024 + 64 * 1024, "`vl {}` left {cache} bytes in a cache bounded at 100 KiB:\n{out}", cmd.join(" "));
-        return;
-    }
+    assert!(!o.status.success(), "`vl {}` past the cache bound succeeded:\n{out}", cmd.join(" "));
     let st = admin.run(thin, &["status"]);
     let status = format!("{}{}", String::from_utf8_lossy(&st.stdout), String::from_utf8_lossy(&st.stderr));
     // What the person would try next (shown on failure).
@@ -489,8 +481,7 @@ fn clone_that_visited_big(admin: &Person, hub: &TestHub, name: &str) -> (std::pa
     let thin = admin.dir("thin");
     admin.ok(admin.home.path(), &["clone", &hub.url(name), thin.to_str().unwrap()]);
     admin.ok(&thin, &["new", "big"]);
-    let o = admin.run(&thin, &["op", "log", "--json"]);
-    let ops = json(&String::from_utf8_lossy(&o.stdout));
+    let ops = json(&admin.ok(&thin, &["op", "log", "--json"]));
     let on_big = ops["operations"][0]["op_id"].as_str().unwrap().to_string();
     admin.ok(&thin, &["new", "main"]);
     admin.ok(&thin, &["partial", "limit", "100K"]);
@@ -733,7 +724,7 @@ fn s3r3_a_pulled_tag_never_hides_the_id_of_a_change_the_thin_clone_does_not_hold
             let o = admin.run(clone, &["show", &first]);
             let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
             assert!(
-                out.contains("first") && !out.contains("commit 5"),
+                o.status.success() && out.contains("first") && !out.contains("commit 5"),
                 "a thin clone after {what} ({when}): `vl show {first}` names another change than a full clone:\n{pulled}\n{out}"
             );
             admin.ok(clone, &["log"]);
@@ -774,8 +765,7 @@ fn s3r3_a_directory_behind_at_that_cannot_catch_up_still_runs_status_undo_op_res
     admin.ok(&thin, &["new", "big"]);
     let on_big = veil_core::ObjectId::from_hex(&log_ids(&admin, &thin)[0]).unwrap();
     admin.ok(&thin, &["new", "main"]);
-    let o = admin.run(&thin, &["op", "log", "--json"]);
-    let before = json(&String::from_utf8_lossy(&o.stdout))["operations"][0]["op_id"].as_str().unwrap().to_string();
+    let before = json(&admin.ok(&thin, &["op", "log", "--json"]))["operations"][0]["op_id"].as_str().unwrap().to_string();
     {
         let mut repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&thin)), None, "test").unwrap();
         let mut tx = repo.transaction("new big (killed before the directory moved)").unwrap();
@@ -807,11 +797,9 @@ fn s3r3_a_directory_behind_at_that_cannot_catch_up_still_runs_status_undo_op_res
         let o = admin.run(&copy, &["status"]);
         let after = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         assert!(o.status.success(), "`vl status` after `vl {}`:\n{out}\n{after}", cmd.join(" "));
-        // The edit is in the directory, or saved in a change.
+        // The edit is in the directory.
         let on_disk = std::fs::read_to_string(copy.join("src/lib.rs")).unwrap_or_default().contains("edited_while_behind");
-        let o = admin.run(&copy, &["log", "-p"]);
-        let logged = String::from_utf8_lossy(&o.stdout).contains("edited_while_behind");
-        assert!(on_disk || logged, "`vl {}` lost the edit made while the directory was behind `@`:\n{out}\n{after}", cmd.join(" "));
+        assert!(on_disk, "`vl {}` lost the edit made while the directory was behind `@`:\n{out}\n{after}", cmd.join(" "));
     }
 }
 
@@ -880,26 +868,12 @@ fn s3r3_a_workspace_switch_past_the_cache_bound_switches_or_records_nothing() {
     admin.ok(&thin, &["ws", "new", "other", "-r", "big"]);
     let o = admin.run(&thin, &["ws", "switch", "other"]);
     let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(!o.status.success(), "`vl ws switch other` past the cache bound succeeded:\n{out}");
     let attached = json(&std::fs::read_to_string(thin.join(".veil/local/checkout.json")).unwrap())["workspace"].as_str().unwrap().to_string();
-    let o2 = admin.run(&thin, &["op", "log", "-n", "1"]);
-    let head = String::from_utf8_lossy(&o2.stdout).to_string();
-    if o.status.success() {
-        assert!(
-            attached == "other" && thin.join("big/f00.bin").exists(),
-            "`vl ws switch other` succeeded, yet the directory is attached to '{attached}':\n{out}\n{head}"
-        );
-    } else {
-        assert!(!head.contains("switch the project directory"), "a failed switch was recorded:\n{out}\n{head}");
-    }
-    // What the warning advises undoes the switch, nothing else. (A switch
-    // that failed recorded nothing and advises `vl partial limit`; `vl undo`
-    // then rightly undoes the last operation there is, the `ws new`.)
-    if o.status.success() {
-        let undo = admin.ok(&thin, &["undo"]);
-        assert!(!undo.contains("create workspace"), "`vl undo` undid an unrelated operation:\n{out}\n{undo}");
-    } else {
-        assert!(out.contains("partial limit"), "a failed switch says how to make room:\n{out}");
-    }
+    assert_eq!(attached, "default", "`vl ws switch other` failed, yet moved attachment:\n{out}");
+    let head = admin.ok(&thin, &["op", "log", "-n", "1"]);
+    assert!(!head.contains("switch the project directory"), "a failed switch was recorded:\n{out}\n{head}");
+    assert!(out.contains("partial limit"), "a failed switch says how to make room:\n{out}");
 }
 
 
@@ -1326,7 +1300,7 @@ fn s3rd_redo_of_a_switch_past_the_cache_bound_records_nothing() {
     assert!(cache <= 100 * 1024 + 64 * 1024, "big's files were evicted: {cache} bytes in the cache");
     admin.ok(&thin, &["redo"]);
     let mut seen = Vec::new();
-    for cmd in [&["redo"][..], &["redo"][..], &["undo"][..]] {
+    for cmd in [&["redo"][..], &["redo"][..]] {
         let o = admin.run(&thin, cmd);
         seen.push(format!("`vl {}`: {}{}", cmd.join(" "), String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)));
         assert_a_failed_move_records_nothing(&admin, &thin, cmd, o);
@@ -1334,6 +1308,13 @@ fn s3rd_redo_of_a_switch_past_the_cache_bound_records_nothing() {
         let attached = json(&std::fs::read_to_string(thin.join(".veil/local/checkout.json")).unwrap())["workspace"].as_str().unwrap().to_string();
         assert_eq!(attached == "other", thin.join("big/f00.bin").exists(), "attached to {attached}:\n{}", seen.join("\n"));
     }
+    let undo = admin.ok(&thin, &["undo"]);
+    seen.push(format!("`vl undo`: {undo}"));
+    let cache = du(&thin.join(".veil/cache"));
+    assert!(cache <= 100 * 1024 + 64 * 1024, "`vl undo` left {cache} bytes in a cache bounded at 100 KiB:\n{undo}");
+    admin.ok(&thin, &["status"]);
+    let attached = json(&std::fs::read_to_string(thin.join(".veil/local/checkout.json")).unwrap())["workspace"].as_str().unwrap().to_string();
+    assert_eq!(attached == "other", thin.join("big/f00.bin").exists(), "attached to {attached}:\n{}", seen.join("\n"));
     eprintln!("{}", seen.join("\n"));
 }
 

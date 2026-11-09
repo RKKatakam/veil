@@ -215,17 +215,50 @@ fn transaction_whose_base_was_pruned_does_not_merge_against_nothing() {
             now: Some(veil_core::now_millis() + 60_000),
             ..Default::default()
         };
-        veil_core::gc::gc(&mut g, &opts).unwrap();
+        let r = veil_core::gc::gc(&mut g, &opts).unwrap();
+        // While `tx` holds its registration, gc's fence waits and defers pruning.
+        assert!(r.deferred.is_some(), "{r:?}");
+        assert_eq!(r.ops_pruned, 0, "{r:?}");
     }
-    let committed = tx.commit();
-    if let Err(e) = &committed {
-        assert!(e.to_string().contains("run the command again"), "{e}");
-    }
+    let committed = tx.commit().unwrap();
+    assert!(committed.is_some());
     drop(long);
     let r = open(&fs, &id);
     let tags = &r.view().tags;
     assert!(!tags.contains_key("withdrawn"), "a deleted tag came back (commit: {committed:?})");
-    assert!(tags.contains_key("a"));
+    assert!(tags.contains_key("a") && tags.contains_key("pulled"));
+
+    // And if the base operation actually WAS pruned while a transaction was in
+    // flight (e.g. its registration was missing), `recheck` refuses to publish
+    // an operation whose parent is gone.
+    let mut long2 = open(&fs, &id);
+    let mut tx2 = long2.transaction("pull again").unwrap();
+    tx2.view.tags.insert("pulled2".into(), Tag::new(base));
+    for e in fs.list_dir(&p(".veil/objects/incoming")).unwrap_or_default() {
+        if e.name.starts_with(veil_core::maintenance::LIVE_PREFIX) {
+            fs.remove_dir_all(&p(&format!(".veil/objects/incoming/{}", e.name))).unwrap();
+        }
+    }
+    {
+        let mut other = open(&fs, &id);
+        other.set_tag("b", base, false).unwrap();
+        other.set_tag("c", base, false).unwrap();
+        let (fs2, id2) = (fs.clone(), id.clone());
+        let r = std::thread::spawn(move || {
+            let mut g = open(&fs2, &id2);
+            let opts = veil_core::gc::GcOptions {
+                keep_ops: Some(std::time::Duration::ZERO),
+                now: Some(veil_core::now_millis() + 120_000),
+                ..Default::default()
+            };
+            veil_core::gc::gc(&mut g, &opts).unwrap()
+        })
+        .join()
+        .unwrap();
+        assert!(r.ops_pruned > 0, "{r:?}");
+    }
+    let e = tx2.commit().unwrap_err();
+    assert!(e.to_string().contains("run the command again"), "{e}");
 }
 
 // ---- the compare-and-swap of a recording is not atomic -----------------------------

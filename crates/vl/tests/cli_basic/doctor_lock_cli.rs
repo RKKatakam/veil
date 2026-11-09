@@ -41,13 +41,13 @@ fn doctor_removes_stale_takeover_guards() {
     std::fs::write(&sub, dead_guard()).unwrap();
     std::fs::write(proj.join(STEAL_PATH), dead_guard()).unwrap();
 
-    let fsck = text(&env.vl("alice", &proj, &["fsck", "--verbose"]));
+    let fsck = env.ok("alice", &proj, &["fsck", "--verbose"]);
     assert!(fsck.contains(".veil/lock.steal.0123456789abcdef present") && fsck.contains("stale"), "{fsck}");
 
-    let out = text(&env.vl("alice", &proj, &["doctor"]));
+    let out = env.ok("alice", &proj, &["doctor"]);
     assert!(out.contains("removed 2 stale lock takeover guard(s)"), "{out}");
     assert!(!sub.exists() && !proj.join(STEAL_PATH).exists(), "{out}");
     assert!(!proj.join(".veil/lock").exists(), "{out}");
-    let again = text(&env.vl("alice", &proj, &["doctor"]));
+    let again = env.ok("alice", &proj, &["doctor"]);
     assert!(!again.contains("lock.steal"), "{again}");
 }

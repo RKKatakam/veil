@@ -77,12 +77,14 @@ fn through_vl(hub: &TestHub, who: &Person, project: &str, only: &[&str]) -> Vec<
     who.ok(who.home.path(), &["clone", &hub.url(project), dir.to_str().unwrap()]);
     for args in [&["log"][..], &["files", "-r", "main"], &["show", "main"], &["status"], &["ls", "-r", "main"]] {
         let o = who.run(&dir, args);
+        assert!(o.status.success(), "vl {args:?}: {}", String::from_utf8_lossy(&o.stderr));
         out.push((format!("vl {args:?}"), [o.stdout, o.stderr].concat()));
     }
     out.extend(everything_in(&dir));
     for (i, o) in only.iter().enumerate() {
         let d = who.dir(&format!("only{i}"));
         let r = who.run(who.home.path(), &["clone", &hub.url(project), d.to_str().unwrap(), "--only", o]);
+        assert_eq!(r.status.success(), d.exists());
         // The clone's own message repeats the name the caller typed: only
         // what the server sent counts.
         let said = String::from_utf8_lossy(&[r.stdout, r.stderr].concat()).replace(o, "<asked>");

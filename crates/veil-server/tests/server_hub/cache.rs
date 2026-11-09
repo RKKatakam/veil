@@ -1747,3 +1747,52 @@ fn bug_1592_the_cache_offers_only_the_protocol_it_serves() {
     }
     assert_eq!(conn.alpn_protocol(), Some(&b"http/1.1"[..]), "a client offering h2 and http/1.1 must get http/1.1, the only protocol the cache serves");
 }
+
+/// BUG-1332 (S24): what a regional cache forwards counted against the
+/// cache's own address at the server, as one client's. Fixed: the cache
+/// says it is one (the caches' token) and whose request it passes on (its
+/// client's address); the server counts a signed request against its
+/// device. 40 first reads of public files by one signed-in reader through
+/// a cold cache, at the default anonymous rate (20 a second), are all
+/// served, and the cache's own address keeps its rate for its own clients.
+#[test]
+fn bug_1332_a_caches_forwarded_reads_count_against_its_address() {
+    use veil_server::limits::{bucket::Rate, Settings};
+    let hub = TestHub::start_with_limits(Settings { anonymous: Rate { per_second: 20, per_hour: 100_000 }, ..TestHub::limits() });
+    let p = setup_project(&hub);
+    let files: Vec<(String, String)> = (0..40).map(|i| (format!("src/r{i}.txt"), format!("public {i}"))).collect();
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    write_files(&p.dir, &refs);
+    p.admin.commit_main(&p.dir, "forty public files");
+    p.admin.ok(&p.dir, &["push"]);
+    let server = hub.api();
+    let cache = TestCache::start(&hub, &hub.authority(), 1 << 30);
+    std::thread::sleep(Duration::from_millis(1500));
+    let r = Reader::new(&server, &cache.api, Some(&p.dev), &p.name);
+    let root = r.root();
+    let tree = |chain: &[ObjectId], id: &ObjectId| match Object::decode(&r.get(chain, id).body).unwrap() {
+        Object::Tree(t) => t,
+        _ => panic!("not a tree"),
+    };
+    let src = tree(&[], &root).get("src").unwrap().id;
+    let st = tree(&[root], &src);
+    for i in 0..40 {
+        let id = st.get(&format!("r{i}.txt")).unwrap().id;
+        let got = r.get(&[root, src], &id);
+        assert_eq!(got.status, 200, "read {i}: {}", String::from_utf8_lossy(&got.body));
+    }
+    assert!(cache.stat("forwarded") >= 40, "every read went to the server");
+    // And 25 cold batch reads through a fresh cache: each batch's grant is in
+    // its body (`deferred` in `limits::admit`), and counts against the
+    // reader's device, not the cache's address.
+    let cache2 = TestCache::start(&hub, &hub.authority(), 1 << 30);
+    let r2 = Reader::new(&server, &cache2.api, Some(&p.dev), &p.name);
+    for i in 0..25 {
+        let id = st.get(&format!("r{i}.txt")).unwrap().id;
+        let frames = r2.batch(&[(vec![root, src], id)]);
+        assert_eq!(frames.len(), 1, "batch {i}");
+    }
+    assert!(cache2.stat("forwarded") >= 25, "every batch went to the server");
+    let r = server.post_json(None, "/v1/auth/challenge", &serde_json::json!({"key": Identity::generate("x").verifying_hex()}));
+    assert_eq!(r.status, 200, "the address kept its own rate: {}", String::from_utf8_lossy(&r.body));
+}

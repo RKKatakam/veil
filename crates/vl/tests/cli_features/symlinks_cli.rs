@@ -101,8 +101,10 @@ fn a_cloaked_links_target_is_never_shown_without_the_key() {
     assert_eq!((e["kind"].as_str(), e["target"].as_str(), e["tier"].as_str()), (Some("symlink"), None, Some("redacted")));
     assert!(std::fs::symlink_metadata(bob.join("private/.env.current")).is_err(), "a link bob cannot read was written");
     let out = env.vl("bob", &bob, &["diff", "-r", "main"]);
+    assert!(out.status.success(), "{}", text(&out));
     assert!(!text(&out).contains(TARGET), "{}", text(&out));
     let st = env.vl("bob", &bob, &["status"]);
+    assert!(st.status.success(), "{}", text(&st));
     assert!(!text(&st).contains(TARGET));
     for f in tree_listing(&mirror) {
         let data = std::fs::read(mirror.join(&f)).unwrap_or_default();
@@ -125,6 +127,7 @@ fn ws_exec_never_hands_its_command_a_link_out_of_the_sandbox() {
     env.ok("alice", &proj, &["ws", "new", "agent", "-r", "@-"]);
     for link in ["x", "abs"] {
         let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--", "cat", link]);
+        assert!(!out.status.success(), "{}", text(&out));
         let all = text(&out);
         assert!(!all.contains("super-secret-isolated-value"), "{link}: the sandbox handed out the isolated file: {all}");
         assert!(all.contains(link), "{all}");
@@ -137,6 +140,7 @@ fn ws_exec_never_hands_its_command_a_link_out_of_the_sandbox() {
         args.extend_from_slice(extra);
         args.extend(["--", "cat", "x"]);
         let out = env.vl("alice", &proj, &args);
+        assert!(!out.status.success(), "{extra:?}: {}", text(&out));
         assert!(!text(&out).contains("super-secret-isolated-value"), "{extra:?}: {}", text(&out));
     }
     // The recorded links are untouched by the run.

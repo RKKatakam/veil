@@ -601,8 +601,10 @@ fn latin1_text_is_diffed() {
         text(&out)
     );
     assert_eq!(r.read_bytes("l1.txt"), b"caf\xe9 au lait\n");
+    let cat = r.run(&["cat", "l1.txt", "-r", "@-"]);
+    assert!(cat.status.success(), "{}", text(&cat));
     assert_eq!(
-        r.run(&["cat", "l1.txt", "-r", "@-"]).stdout,
+        cat.stdout,
         b"caf\xe9\n",
         "cat must return the raw bytes"
     );

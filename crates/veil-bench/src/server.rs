@@ -79,6 +79,16 @@ impl Server {
         if let (Some(e), Some(b)) = (&a.s3_endpoint, &a.s3_bucket) {
             cmd.args(["--s3-endpoint", e, "--s3-bucket", b]);
         }
+        // Every agent of a run is one device on 127.0.0.1 (`load.rs`): the
+        // per-device and per-address limits (S24, docs/HUB.md §13.25) would
+        // measure themselves, so they are out of the way; the bulkheads and
+        // the request budget stay. An older server (SERVER_BIN) has no such
+        // flags.
+        let help = Command::new(bin).arg("--help").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        if help.contains("--device-rate") {
+            let unlimited = "1000000000/1000000000";
+            cmd.args(["--device-rate", unlimited, "--anonymous-rate", unlimited, "--max-connections", "65536"]);
+        }
         let log = data.with_extension("log");
         let mut child = cmd
             .stdin(Stdio::null())

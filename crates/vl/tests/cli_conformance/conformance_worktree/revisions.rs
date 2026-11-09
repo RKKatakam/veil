@@ -237,7 +237,13 @@ fn evolog_snapshot_ids_resolve_as_revisions() {
         let out = r.run(&["--no-snapshot", "show", "--stat", id]);
         assert!(out.status.success(), "evolog id {id}: {}", text(&out));
     }
-    assert!(versions.iter().any(|id| r.run(&["cat", "-r", id, "a.txt"]).stdout == b"v1\n"), "{evolog}");
+    assert!(
+        versions.iter().any(|id| {
+            let out = r.run(&["cat", "-r", id, "a.txt"]);
+            out.status.success() && out.stdout == b"v1\n"
+        }),
+        "{evolog}"
+    );
 }
 
 // Scenario from git t1500-rev-parse.sh `--verify` of a non-snapshot

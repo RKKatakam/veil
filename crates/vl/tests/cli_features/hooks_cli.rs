@@ -211,9 +211,11 @@ fn only_trusted_bytes_ever_run_while_the_script_is_swapped() {
     let started = Instant::now();
     let mut i = 0;
     while marked(&m).matches("trusted").count() < 3 && started.elapsed() < Duration::from_secs(120) {
-        let _ = env.vl(U, &proj, &["commit", "-m", &format!("r{i}")]);
+        let out = env.vl(U, &proj, &["commit", "-m", &format!("r{i}")]);
+        assert!(adversarial_support::exited_cleanly(&out), "{}", text(&out));
         // The pre-push command runs the script itself (exec of the copy).
-        let _ = env.vl(U, &proj, &["push"]);
+        let out = env.vl(U, &proj, &["push"]);
+        assert!(adversarial_support::exited_cleanly(&out), "{}", text(&out));
         i += 1;
     }
     stop.store(true, Ordering::Relaxed);

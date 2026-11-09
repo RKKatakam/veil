@@ -170,12 +170,10 @@ fn a_file_that_grows_large_and_shrinks_to_empty() {
     env.ok("alice", &alice, &["commit", "-m", "shrink"]);
     env.ok("alice", &alice, &["push"]);
     env.ok("bob", &bob, &["pull"]);
-    assert_eq!(
-        env.vl("bob", &bob, &["cat", "f.bin", "-r", "main-"]).stdout,
-        noise(2 * MIB, 5)
-    );
-    assert_eq!(
-        env.vl("bob", &bob, &["cat", "f.bin", "-r", "main"]).stdout,
-        Vec::<u8>::new()
-    );
+    let cat_grow = env.vl("bob", &bob, &["cat", "f.bin", "-r", "main-"]);
+    assert!(cat_grow.status.success());
+    assert_eq!(cat_grow.stdout, noise(2 * MIB, 5));
+    let cat_shrink = env.vl("bob", &bob, &["cat", "f.bin", "-r", "main"]);
+    assert!(cat_shrink.status.success());
+    assert_eq!(cat_shrink.stdout, Vec::<u8>::new());
 }

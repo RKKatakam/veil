@@ -46,6 +46,7 @@ fn run_injects_an_ordinary_team_secret() {
     env.ok("bob", &bob, &["push"]);
     env.ok("alice", &proj, &["pull"]);
     let out = env.vl("alice", &proj, &["run", "--scope", "team", "--", "/bin/sh", "-c", "printf %s \"$STAGING_URL\""]);
+    assert!(out.status.success(), "{}", text(&out));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "https://staging.example", "{}", text(&out));
 }
 
@@ -68,6 +69,7 @@ fn a_team_member_cannot_take_over_vl_run_through_loader_variables() {
     env.ok("alice", &proj, &["pull"]);
     let out = env.vl("alice", &proj, &["run", "--", "/bin/bash", "-c", "printf '%s|%s' \"$LD_PRELOAD\" \"$PATH\""]);
     let all = text(&out);
+    assert!(out.status.success(), "{all}");
     assert!(
         !all.contains("EXFIL:prod-canary-6b1f"),
         "Bob's BASH_ENV script ran inside Alice's `vl run` and read scope prod's secret:\n{all}"

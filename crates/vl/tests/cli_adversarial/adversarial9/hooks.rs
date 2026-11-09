@@ -31,7 +31,7 @@ fn trusted_project(env: &Env, veilhooks: &str, files: &[(&str, &str)]) -> std::p
 /// Commit an edit (running pre-commit hooks), whatever they do.
 fn commit_edit(env: &Env, proj: &Path, n: u32) {
     write(proj, "work.txt", &format!("{n}\n"));
-    let _ = env.vl(U, proj, &["commit", "-m", &format!("work {n}")]);
+    env.ok(U, proj, &["commit", "-m", &format!("work {n}")]);
 }
 
 /// Control: the trusted hook runs as trusted, and a change to the script
