@@ -53,6 +53,25 @@ impl Server {
             _ => false,
         }
     }
+
+    /// Does `w.chain` (S6: the chain the Veil daemon checks) reach `w.id`
+    /// from the snapshot's root tree, as the server's grant check does?
+    fn chain_reaches(&self, w: &Located, chain: &[ObjectId]) -> bool {
+        struct Src<'a>(&'a ObjectStore);
+        impl veil_core::hub::grant::ChainSource for Src<'_> {
+            fn tree(&self, id: &ObjectId) -> veil_core::Result<Option<Arc<veil_core::object::Tree>>> {
+                Ok(match self.0.get(id) {
+                    Ok(Object::Tree(t)) => Some(Arc::new(t)),
+                    _ => None,
+                })
+            }
+            fn conflict_terms(&self, id: &ObjectId) -> veil_core::Result<Option<Vec<(ObjectId, u64)>>> {
+                Ok(self.0.conflict(id).ok().map(|c| c.referenced_ids().into_iter().map(|t| (t, 0)).collect()))
+            }
+        }
+        let Ok(Object::Snapshot(s)) = self.store.get(&w.snapshot) else { return false };
+        veil_core::hub::grant::Chains::new(&Src(&self.store), s.tree).allows(chain, &w.id).unwrap()
+    }
 }
 
 impl Promisor for Server {
@@ -61,6 +80,13 @@ impl Promisor for Server {
             return Err(VeilError::Unavailable("test server: connection refused".into()));
         }
         self.asked.lock().unwrap().extend(wants.iter().cloned());
+        // Every place met in trees also names its chain, and the chain and
+        // the path agree (the daemon checks the one, the server the other).
+        for w in wants {
+            if let Some(chain) = &w.chain {
+                assert_eq!(self.chain_reaches(w, chain), self.there(w), "chain {chain:?} and path {:?} of {}", w.path, w.id.short());
+            }
+        }
         Ok(wants
             .iter()
             .map(|w| {

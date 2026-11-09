@@ -3486,3 +3486,292 @@ never fetched, 100 files a folder.
 Revert the merge commit. Nothing on disk changes format; a workspace
 created meanwhile keeps its `.veil/local/scanned` marker, which the
 reverted `vl` reads as before.
+
+### 13.29 S6: the Veil daemon, a shared object cache (built)
+
+Design: `docs/design/server/phase-2-thin-clients.md` §4.1, §4.3–§4.6, the
+S6 row of §9, product decisions 1 (removal at caches within 5 s) and 5
+(the daemon runs by default, with an off switch). Code:
+`crates/vl/src/daemon/` (`mod.rs` the paths, the client side and `vl
+daemon`; `serve.rs` the decision, forwarding and confirmations;
+`store.rs` the store; `follow.rs` warm trees; `proto.rs` the socket's
+messages). Touched elsewhere, minimally: S3's promisor (`Located::chain`,
+the chain where an object was met, from the locator's own walk; the
+`thin.rs` promisor asks the daemon first; the thin pull's content fetch
+asks it first, `hub.rs`), one server route (`GET /v1/grant-key`), and
+`veil-bench daemon`. No migration, no protocol revision, no repository
+format.
+
+```text
+vl daemon status | start [--cache-size SIZE] | stop
+```
+
+* **One per Veil home.** By default one per OS user: the socket in
+  `$XDG_RUNTIME_DIR/veil/daemon.sock` (else `~/.cache/veil/daemon/run/`),
+  the store and state in `~/.cache/veil/daemon/`; with `VEIL_HOME` set,
+  all of it in `$VEIL_HOME/daemon/` (made absolute, and passed so to the
+  daemon it starts). The XDG variables count only as the XDG rules allow:
+  absolute (an empty or relative one is unset), and `XDG_RUNTIME_DIR` only
+  when it is a folder of this user's with mode 0700, else the socket goes
+  in the daemon's own folder; `HOME` only when absolute, else the
+  account's (BUG-1515). Every directory is made 0700 (a wider one of this
+  user's is narrowed; one of another user's is refused), the socket 0600,
+  and **both ends check the other's uid** (`SO_PEERCRED`, `getpeereid`): the
+  daemon serves only its own user, and a `vl` sends nothing to a socket
+  another user listens on (BUG-1515: its signed requests could be
+  replayed for ±5 minutes). A lock keeps one daemon per home.
+* **On by default** (decision 5): a thin clone's `vl` starts it (`vl
+  daemon run`, detached, its errors to `daemon.log`) the first time it
+  reads through it, and waits at most 2 s for its socket. **`vl daemon
+  stop` is the off switch:** it writes `off`, stops the daemon and `vl`
+  starts it no more until `vl daemon start`. The daemon exits when its
+  socket is removed or replaced, `off` appears, its Veil home's identity
+  is gone, or nobody read or pinned through it for an hour (the next `vl`
+  that needs it starts it again, its store as it was). It never makes a
+  Veil home: only its own directory, inside one that exists, and below it
+  one folder at a time, never their parents (found running the suites: a
+  test's home, removed while a daemon started, was made again and the
+  daemon ran on, `the_daemon_never_outlives_its_veil_home`; and an object
+  kept while its home was removed made it again, BUG-1513).
+* **What the design assumes of the machine** (§4.1: "the machine is
+  theirs"): one OS user is one person, or people who may read each other's
+  files. The store is that user's files, as each clone's `.veil/cache/`
+  is; people who must not see each other's files need separate OS users,
+  whose daemons share no socket, store or process. Within one OS user every
+  request is still checked by its own grant and device signature, which is
+  what keeps another Veil home's device, and later a narrower agent
+  session (S11), to its own projection through the socket. **Sandboxed
+  commands (`vl ws exec`) see neither the socket nor the store**: the
+  daemon's folders are Veil's own private folders, listed with the Veil
+  home in one place (`ctx::veil_private_dirs`), which the confinement
+  never shows: an allowed folder or seed that holds one, as named or
+  resolved (`--allow ~/.cache`, `--allow ~`), is refused, naming narrower
+  folders to allow, and so is an allowed path inside one (BUG-1512:
+  `--allow ~/.cache` showed the store; BUG-1516: a mask covers a folder
+  as it is at the start, so one removed and made again during a run
+  showed through; refusing by name holds for the whole run). Veil's
+  sandboxes never write through a link into one. **Residual
+  (BUG-1519):** a second view of a folder that holds them (a bind mount, a
+  disk mounted twice, a FUSE mirror such as `bindfs`: made by the person or
+  by root, both inside the trust boundary; a confined command cannot make
+  one) is not known by name, and an allowed path through it shows them.
+
+#### The decision, per request
+
+The daemon answers the S5 batch (`BatchRequest`, as the client signed it)
+for a server and project the request names. It serves an object **from
+its store** only if, in this order, nothing looked up before its turn:
+
+1. the grant verifies under the server's grant key, which the daemon
+   fetched itself (`GET /v1/grant-key` over the server's TLS as this Veil
+   home trusts it), never a key a client sent;
+2. the grant is for this project and not expired, and the request is
+   signed by the grant's device (`request_signed`, ±5 minutes);
+3. the server confirmed the grant's access epochs (its project's and its
+   device's person's, for that device) at most 5 s ago and has not
+   refused them since;
+4. the want's chain starts at the grant's root and each step is an entry
+   of a tree in the daemon's store, each tree re-hashed against its id
+   (`veil_core::hub::grant::Chains`, the server's own check); only then is
+   the object looked up, and it is re-hashed when read.
+
+**Everything else is passed to the server as the client signed it**, with
+`skip` naming what the daemon sent itself: no grant key yet, an invalid
+grant or signature (the server answers), epochs not confirmed, a tree of
+the chain or the object not in the store. What the server sends is
+checked against its id and the request's wants, kept (objects of at most
+16 MiB) and passed on; a larger one is left out and its reader asks the
+server. A refusal ends the answer with its status.
+
+**Confirmations without a session.** The design has daemons poll an epoch
+feed, but the daemon holds no session (the feed of S5 needs one) and no
+cache token (S9's feed is the server's caches'). So it confirms epochs by
+the server's own answers: every request it passes on that the server
+answers `200` confirms that grant's epochs at the time it was **sent**
+(the server checks the grant's epochs and device before anything else);
+and once a second, for each grant read through the daemon in the last 5 s
+(`ACTIVE_MS`, kept in memory for 15 minutes), it sends again the latest
+request of at most 256 objects signed under it, every object skipped
+(`skip` is not signed; the server checks the grant and sends nothing),
+while that signature is 30 s inside the server's ±5 minutes. Once nothing
+has been read through a grant for 5 s, background renewals stop (zero idle
+traffic); when a read arrives for a grant whose confirmation is stale and
+the store holds at least one of its wants, the daemon confirms once on
+demand before reading its store (using the recorded replay if still inside
+the ±5-minute window, or the client's own request with every want in
+`skip`, then serving from the store on `200`), so a warm store after idle
+costs one small confirmation request instead of re-fetching the objects
+(BUG-1680). When a server answers `429` or `503` with `retry_after_ms`,
+the daemon sends nothing more on its own account to that server until that
+time has passed; reads it cannot confirm meanwhile go to the server as the
+client signed them. `401` voids those epochs (a later-sent `200` restores
+them); no answer lets them go stale. **So a change committed at time R is
+refused by R + 5 s at the latest** (measured: 21–37 ms alone, up to 749 ms
+with four suites running at once), and **without the server nothing is
+served from the store after 5 s**, public objects included. The replay is
+what S5 already allows ("a signed request can be replayed within ±5
+minutes by whoever saw it"; the daemon saw it), and returns no object.
+
+#### The client side
+
+* **Thin clones read through it** (S3's promisor): every place the locator
+  records now carries its chain (`Located::chain`, `None` where a place was
+  not met in trees: a local commit's ancestor or a tip), and a want whose
+  chain starts at the root of a grant this process holds (from its pull's
+  tips, else one tips request per process) is asked of the daemon first,
+  up to 8 requests at once. **Whatever does not arrive is asked of the
+  server as before** (S1's `fetch`), so only the server's own refusal is
+  ever `Missing`, and a daemon that lies, stalls or is gone changes no
+  answer: every object it sends is checked against its id and against
+  what was asked, once each, and anything else ends its answer. The thin
+  pull (clone and later pulls) fetches each level the same way.
+* **Pins.** Each `vl` in a thin clone tells a running daemon (it does not
+  start one for this) the trees its workspaces check out and their parents
+  (at most 64, by repository id); eviction keeps them and everything below
+  them that the store holds (at most 1,000,000 objects marked per
+  eviction). Nothing local is ever in the daemon's store: a repository's
+  own work stays in its main store (S3), so eviction costs at most a
+  second download.
+* **Warm trees** (§4.6, "Warm start"). The daemon remembers each project
+  read through it (at most 64, for 7 days, `follow.json`) and keeps `vl
+  daemon follow` running, a `vl` of the same Veil home (it holds the
+  device key and a session; the daemon process never does): once a second
+  it asks the server for each followed project's tips (without retrying a
+  `429` or `503`, backing off for that server until `retry_after_ms` has
+  passed; BUG-1680), and when the default branch's projected root changes,
+  reads its trees down to depth 3 (at most 4,000) through the daemon, which
+  keeps them. Measured: a new tip's top trees in the store 0.6 s after the
+  push returned.
+
+#### Bounds
+
+* **Disk:** `--cache-size` (default 20 GiB or a tenth of the store's file
+  system, whichever is less) and at most 500,000 objects; past either, the
+  least recently used unpinned objects go, down to 80 %. When what is
+  pinned fills it, a new object is not kept (it is still passed on): never
+  an eviction loop.
+* **Memory:** 64 MiB of budgets: requests 16 MiB (three times a request's
+  length, taken before it is read; at most 4 MiB a request), trees read
+  for chain checks 16 MiB (three times each tree's length, never waited
+  for: past it the rest of the request goes to the server) and answers
+  32 MiB (each object held, from the store or the server, from before it
+  is read until it is written). A request waits for a pool only while
+  holding none of it, and pools are taken in the order requests, trees,
+  answers, so waits never cycle. Besides: the index (about 56 bytes an
+  object, at most 28 MiB), and per connection its buffers (64 KiB to the
+  client, the server's TLS and HTTP buffers, a 64 KiB slice for skipping
+  an oversized object), at most 64 connections at once (the next wait in
+  the listener's queue). The daemon sets glibc's mmap threshold to 256 KiB
+  and at most 4 arenas, so what the budgets free is given back (before:
+  325 MiB peak in the test below; after: 69 MiB).
+* **Time:** a request within 20 s of connecting, each write within 30 s;
+  to the server, connecting within 5 s and each read within 30 s. The
+  daemon acknowledges a request as soon as it has read it, then sends a
+  progress message every 0.1 s until its answer ends (its store, the
+  server and its budgets may each take long). **For the client: any gap of
+  more than 0.5 s** (before the acknowledgement or between any two
+  messages, pins and status included), **or more than 35 s between whole
+  objects (or the answer's end)** whatever progress messages or partial
+  bytes arrive meanwhile, **marks the daemon failed for the process**,
+  which reads from the server from then on, as it does for an answer that
+  ends unfinished, sends what was not asked, or another version (BUG-1514:
+  a stalled daemon cost every request a full wait, a small clone 184 s;
+  BUG-1518: one that acknowledged and then stalled cost every process
+  35 s, `vl status` 36.6 s; now 0.5 s once: a clone 0.9 s, `vl status`
+  0.7 s; BUG-1582: one that only sends progress messages or trickles an
+  object costs 35 s once instead of holding the process forever).
+* **Versions:** every request names the socket protocol's version and every
+  acknowledgement the daemon's (`proto::PROTOCOL`, now 1). A daemon serves
+  nothing to a request of another version (`426` with its own); a `vl`
+  that meets a daemon of another version reads from the server, and stops
+  an older one, so the next `vl` starts its own. The stop message is the
+  same in every version: empty, it stops any daemon (`vl daemon stop`);
+  naming the sender's version, it stops only a daemon of an older one, so
+  a stop meant for an older daemon never stops the newer one that
+  replaced it meanwhile (BUG-1517).
+
+#### Guarantees and their tests (`server_hub::daemon`)
+
+| # | Guarantee | Test |
+|---|---|---|
+| 1 | The daemon never serves an object the server would not serve that person's device now: the admin's daemon holds every object; five viewers (anyone on Earth included) asking it with their own grants receive exactly the server's walk, and every real object they do not reach, with every chain they can build (their trees, the admin's real chains, the admin's chains from their root, the admin's root), gets nothing and no store hit; another device's signature, none, a wider root under the signature, a grant signed by the server's identity key, an expired one, one of other epochs, one of another project: nothing from the store; hostile requests refused, the daemon still serving | `the_daemon_serves_only_what_the_server_would` |
+| 2 | A person removed from a group, a project whose policy changed, a device an admin removed: refused within 5 s (21–37 ms alone, up to 749 ms under load), never served again | `a_removed_person_or_device_is_refused_at_the_daemon_within_the_bound` |
+| 2b | Fails closed: the server cut off, nothing from the store 5 s later (public included), `503`; served again once the server answers | `the_daemon_fails_closed_without_the_server` |
+| 2c | Renewals only while reading; warm store after idle; server back-off respected: zero background polls once a grant has not been read for 5 s; a read arriving after idle re-confirms once with a skipped request and serves from the store (or voids on `401` if access changed while idle); on `429`/`503` with `retry_after_ms` the daemon sends nothing on its own account until that time has passed while forwarding unconfirmed client reads as signed | `bug_1680_no_idle_renewals_warm_store_after_idle_and_server_backoff` (BUG-1680) |
+| 3 | A thin clone answers eight commands, and checks out the same files, with the daemon off, cold and warm, for the admin and for a person without `billing/`; that person's daemon never held a restricted marker | `a_thin_clone_answers_the_same_with_and_without_the_daemon`; every S3 test (`thin::`, 46) now runs with the daemon on; the core tests check every `Located::chain` agrees with its path (`core_sync` `thin`) |
+| 4 | The store keeps to `--cache-size 64K` under 200 files of 4 KiB; memory: 24 readers at once of two 12 MiB files, cold and warm, grow the daemon by less than its budget and their connections' buffers (36–41 MiB measured, alone and four suites at once; held outside the budget, at least 288 MiB) | `the_daemons_store_keeps_to_its_bound`, `the_daemons_memory_stays_within_its_budget`; `daemon::store::tests` (pins kept, a full pin set keeps nothing new, damaged files removed, the index rebuilt) |
+| 5 | A `vl` without the daemon works: off is not started again; a daemon killed with `SIGKILL` leaves `vl` working (and is started again); a daemon that answers nothing, or wrong bytes for every object, changes no answer | `vl_works_without_the_daemon` |
+| 6 | Its socket and store are its user's alone (0700, 0600; a 0777 directory narrowed); a damaged object in its store is never served | `the_daemons_socket_and_store_are_its_users_alone` |
+| — | Warm trees: a new tip's trees to depth 3 in the store with no reader, nothing deeper; a new clone reads them from the store | `the_daemon_keeps_the_top_trees_of_followed_projects_warm` |
+| — | It never outlives its Veil home: exits within a second once the identity is gone; in a removed home, `vl daemon run` and `start` refuse and make nothing; nor does keeping an object | `the_daemon_never_outlives_its_veil_home`, `daemon::store::tests::keeping_an_object_never_makes_a_removed_veil_home_again` (BUG-1513) |
+| — | A stalled daemon costs a process one wait, before or after its acknowledgement, or when it only reports progress or trickles an object; a `vl` and a daemon of other versions agree, and a stop never reaches a newer daemon | `a_stalled_daemon_costs_a_vl_at_most_one_wait` (BUG-1514), `s6r2_a_daemon_that_stalls_after_its_acknowledgement_costs_a_vl_one_short_wait` (BUG-1518), `s6r3_a_daemon_that_only_reports_progress_costs_a_vl_one_short_wait`, `s6r3_a_daemon_that_trickles_an_object_costs_a_vl_one_short_wait` (BUG-1582), `a_vl_and_a_daemon_of_other_versions_agree`, `s6r2_stopping_an_older_daemon_never_stops_the_one_that_replaced_it` (BUG-1517) |
+| — | The daemon's place follows the XDG rules; a `vl` asks only its own user's daemon | `s6r2_an_empty_xdg_variable_never_puts_the_daemon_where_vl_runs`; `s6r2_a_vl_never_asks_another_os_users_daemon` (needs root) (BUG-1515) |
+
+#### Threat review (design §6 rows 1–5, 8, 9, 14, 15, 18, plus this milestone's)
+
+| # | Attacker | Tries | Result | Test |
+|---|---|---|---|---|
+| 1 | A person without access to a folder, on the same OS user (another Veil home) | asks the daemon, which holds every object, for every real id with every chain | nothing; the server's own answers for what forwards | guarantee 1 |
+| 2 | Same | a real grant with a chain through another snapshot's or the admin's trees | chains start at the grant's root, each step from the hash-checked store | guarantee 1 |
+| 3 | A same-user process | hands the daemon its own grant key and a grant it signed | no such field: the daemon checks under the key it fetched from the server | by construction; guarantee 1 (a grant signed by another key) |
+| 4 | A person or device removed | keeps using a grant | refused within 5 s | guarantee 2 |
+| 5 | A sandboxed agent (`vl ws exec`) | connects to the socket, reads the store, also through an allowed folder that holds them (`--allow ~/.cache`), or after the folder is removed and made again during the run | an allowed folder or seed holding one of Veil's folders is refused, so none is ever shown (BUG-1512, BUG-1516); a second view made by the person or by root (both inside the trust boundary; a confined command cannot make one) is residual (BUG-1519); without the device key it could not sign a request anyway | `cli_workspaces` `confine_cli::the_daemons_store_and_socket_stay_hidden_when_an_allowed_folder_holds_them`, `s6r2_the_daemons_folders_stay_hidden_by_every_route`, `s6r2_a_daemon_folder_made_again_during_a_run_stays_hidden`, `s6r3_a_linked_home_and_unusual_xdg_values_never_show_or_misplace_the_daemon` (a `HOME` through a link; a relative `XDG_CACHE_HOME`; an `XDG_RUNTIME_DIR` not this user's 0700 folder) |
+| 5b | Another OS user | listens first at the daemon's socket path (a shared `XDG_RUNTIME_DIR`) | a `vl` checks its peer's uid and sends nothing; a runtime folder not this user's 0700 one is not used (BUG-1515) | `s6r2_a_vl_never_asks_another_os_users_daemon` (needs root) |
+| 6 | Another OS user | connects to the socket, reads the store | the directories are 0700 and the peer's uid is checked | guarantee 6 (modes; a second uid needs root to test) |
+| 7 | A local process, a torn write | changes bytes in the store | the object fails its id check, is removed, comes from the server | guarantee 6, `store::tests` |
+| 8 | A lying or broken daemon (a same-user process on its socket) | answers nothing, wrong bytes, another object, one object without end; or acknowledges and then only reports progress, or trickles an object | the client checks each object's id, that it was asked for and arrives once, and bounds both each gap (0.5 s) and the time between whole objects or the end (35 s); past either, the daemon is not asked again by the process and the rest comes from the server (BUG-1514, BUG-1518, BUG-1582) | guarantee 5; `s6r3_a_daemon_that_only_reports_progress_costs_a_vl_one_short_wait`, `s6r3_a_daemon_that_trickles_an_object_costs_a_vl_one_short_wait` |
+| 9 | The partitioned daemon | serves after the server is gone | nothing from the store 5 s after its last confirmation | guarantee 2b |
+| 10 | A same-user process | floods the socket (64 connections, 4 MiB requests, stalls) | budgets and time limits; same-user processes can stop the daemon anyway (it is theirs) | guarantee 4 |
+| 11 | Hostile input | bad JSON, unknown ops, a project or server name with `/` or `..`, 10⁵+1 wants, 65 pins, junk on the socket | refused cleanly; still serving | guarantee 1 |
+| 12 | Anyone on Earth | times the daemon | as at a regional cache (design row 14): only objects the asker may read are looked up; residual accepted | by construction |
+
+**Residual:** the daemon passes requests it cannot decide to the server,
+so a same-user process can make it send requests to any HTTPS server it
+names (each with its own store namespace, by server and project); it can
+do the same itself. A grant voided by an access change is served from the
+store for up to one renewal after the change (about a second, 5 s at the
+most). Concurrent cold reads of one object are not coalesced (S9's are):
+each forwards, and later readers find it in the store.
+
+#### Measured
+
+`bash ~/.cache/veil-orch/bench-quiet.sh scripts/bench-server.sh daemon`
+(2026-11-08, release builds, PostgreSQL and MinIO, server, daemon and
+clients on one 32-thread machine; load 16.0 before, 91.9 after: the
+machine filled during the run, so the clone times are noisy). Medians of 5.
+"Workspace ready" is §4.8 rows 1–2: the tips and grant from the server,
+then the root and every top-level tree (11 and 101 trees); the FUSE mount
+(10–50 ms) is S8's. "Warm" is the daemon after one clone read the project.
+
+| Files | Case | No daemon | Cold daemon | Warm daemon | Target (warm) |
+|---:|---|---:|---:|---:|---:|
+| 1,000 | workspace ready | 3.4 ms | 5.1 ms | **1.5 ms** | 300 ms |
+| 10,000 | workspace ready | 4.5 ms | 7.8 ms | **2.3 ms** | 300 ms |
+| 1,000 | thin clone (every tree and file) | 193 ms | 435 ms | 196 ms | |
+| 10,000 | thin clone (every tree and file) | 813 ms | 824 ms | 713 ms | |
+
+* The warm target is met by two orders of magnitude: the trees come from
+  the daemon's disk, and only the tips request reaches the server.
+* A cold daemon costs a second hop (the client to the daemon, the daemon to
+  the server) and the start of the daemon itself: at 1,000 files the first
+  clone takes about twice as long; at 10,000 the hop is lost in the
+  transfer.
+* After the run the daemon had served 83.5 % of objects from its store.
+
+#### Not built in S6 (and why)
+
+* The file watcher (S7) and mounts (S8) use this process and socket
+  later; nothing of either is here.
+* Coalescing concurrent cold reads of one object, and decoded trees cached
+  across requests: not needed for the guarantees; to measure first.
+* "Every tree read in the last day" in the warm set (§4.6): the depth-3
+  set only; the LRU store keeps recently read trees anyway.
+* `vl doctor` does not report the daemon yet (`vl daemon status` does).
+
+#### Reverting
+
+Revert the merge commit. Nothing persistent changes format: thin clones
+are unchanged, the daemon's store is a cache (delete `~/.cache/veil/daemon`
+or `$VEIL_HOME/daemon`), and the server's `GET /v1/grant-key` is additive.
+Stop running daemons first (`vl daemon stop`), or they exit when their
+socket is removed.

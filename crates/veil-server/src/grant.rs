@@ -476,6 +476,15 @@ pub async fn batch(State(hub): State<HubState>, Path(target): Path<String>, body
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], body).into_response())
 }
 
+/// `GET /v1/grant-key` (S6, `docs/HUB.md` §13.29): the public half of the
+/// server's grant key, to anyone. The Veil daemon holds no session, and
+/// checks the grants its clients present under the key it fetched itself,
+/// so a client cannot hand it a key of its own. A public key, already in
+/// every tips answer, anyone on Earth's included.
+pub async fn grant_key(State(hub): State<HubState>) -> Json<veil_core::hub::grant::GrantKey> {
+    Json(veil_core::hub::grant::GrantKey { grant_key: hub.grants.key_hex().to_string() })
+}
+
 #[derive(Deserialize)]
 pub struct EpochsQuery {
     /// Project names, separated by commas.

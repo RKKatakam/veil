@@ -62,6 +62,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/objects/{p}/{id}", get(crate::grant::get_object))
         .route("/v1/objects/{target}", post(crate::grant::batch))
         .route("/v1/epochs", get(crate::grant::epochs))
+        .route("/v1/grant-key", get(crate::grant::grant_key))
         .route("/v1/cache/epochs", post(crate::cache::feed::epochs))
         // The query API (S13).
         .route("/v1/projects/{p}/q/log", get(crate::query::log_route))

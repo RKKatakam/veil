@@ -35,5 +35,6 @@ mod adversarial_s4;
 mod thin;
 mod cache;
 mod agents;
+mod daemon;
 mod limits;
 mod workspaces;

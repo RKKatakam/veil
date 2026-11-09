@@ -329,6 +329,14 @@ pub struct BatchRequest {
     pub skip: Vec<ObjectId>,
 }
 
+/// `GET /v1/grant-key` (S6): the server's grant key (hex), for the Veil
+/// daemon, which checks grants under the key it fetched itself.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantKey {
+    pub grant_key: String,
+}
+
 /// `GET /v1/epochs?projects=a,b` (signed in): the current access epochs
 /// of the caller (`person`) and of each named project the caller can see
 /// (`projects`, by name); a project left out cannot be seen by the caller,

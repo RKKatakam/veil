@@ -231,6 +231,45 @@ pushes work as in a full clone, and a large project clones in seconds.
   it rather than misreading it. `--only` clones are not thin (they keep
   every snapshot, and only their directory's files).
 
+### The Veil daemon: one cache for the whole machine
+
+Every thin clone and workspace on your machine shares one object cache,
+kept by a small background process, the **Veil daemon**. `vl` starts it
+the first time a thin clone needs something. Once one clone or agent
+has read a file, the others on the machine read it from the daemon, not
+the server (agents that ask for the same new file at the same moment
+each fetch it: those first reads are not combined), and a new clone finds
+the project's top folders already there (the daemon keeps the top
+folders of `main` of the projects you use up to date).
+
+```text
+vl daemon status                 its cache, what it served, the servers it reads from
+vl daemon stop                   stop it and keep it off: vl reads from the server directly
+vl daemon start [--cache-size 8G]  turn it on again (default size: 20 GiB or a tenth of the disk)
+```
+
+- **It never gives anyone more than the server would.** It holds no key
+  and no session. Every read names the server's signed grant for what you
+  may see, signed by your device, and the daemon checks both, and that the
+  file is inside that grant, before it looks at its cache. Within 5 seconds
+  of someone losing access (removed from a group, a folder no longer
+  public, a device removed), the daemon stops serving them; if it cannot
+  reach the server for 5 seconds it serves nothing from its cache at all.
+- **It changes no answer.** Whatever it does not send, `vl` asks the server
+  for, and only the server's answer ever means "not there for you". With
+  the daemon off, or stopped, or broken, `vl` works exactly as before: a
+  daemon that does not answer within half a second, or speaks another
+  version, is passed over for the rest of that command.
+- **It is yours alone**: its socket and cache are in folders only your OS
+  user can open (`$XDG_RUNTIME_DIR/veil/` and `~/.cache/veil/daemon/`, or
+  `$VEIL_HOME/daemon/`), and it refuses connections from other users.
+  Commands run with `vl ws exec` cannot see either: an `--allow` of a
+  folder that holds them (`~/.cache`, `~`) is refused. Secret files are in its
+  cache only as ciphertext. People who must not read each other's files
+  need separate OS users, as for any file on the machine.
+- **It is bounded**: least recently used objects go first when the cache
+  is full, except what your working copies check out.
+
 - **You receive only what you may see.** Folders you cannot see are not in
   your clone at all: no files, no names, no history of changes that touched
   only them.

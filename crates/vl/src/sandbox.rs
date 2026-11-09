@@ -394,7 +394,7 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
         Some(CloneSources::new((*ctx.fs).clone(), ctx.stat_cache().clone())),
         true,
     )
-    .with_forbidden_targets([ctx.root.clone(), crate::ctx::veil_home()]);
+    .with_forbidden_targets(std::iter::once(ctx.root.clone()).chain(crate::ctx::veil_private_dirs()));
     // The output of an earlier run that was never recorded (`vl` was
     // killed, or recording it failed) is recorded first, as it is.
     let recovered = m.pending.is_some();
@@ -577,7 +577,7 @@ impl crate::ws_socket::Around for MidRun {
         let guard = paths.load_guard(&ctx.repo)?;
         let secrets = guard.as_ref().map(core::Guard::secrets);
         let mut cache = paths.load_cache();
-        let fs = SandboxFs::new(&paths.files, None, false).with_forbidden_targets([self.root.clone(), crate::ctx::veil_home()]);
+        let fs = SandboxFs::new(&paths.files, None, false).with_forbidden_targets(std::iter::once(self.root.clone()).chain(crate::ctx::veil_private_dirs()));
         let pin = core::PolicyPin::new(&fs, &store, &synced)?;
         let view = set.as_ref().map(|s| SparseView::new(&pin, store.clone(), synced, s));
         let recorded_fs: &dyn StorageBackend = match &view {
@@ -1225,7 +1225,7 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>, confine: Option<&Confine>) -> Res
     let set = sparse_set(ctx, a.only, &tree, &safe(a.rev))?;
     let sb = Sandbox::create("ephemeral")?;
     let dir = sb.path().to_path_buf();
-    let sandbox = SandboxFs::new(&dir, None, false).with_forbidden_targets([ctx.root.clone(), crate::ctx::veil_home()]);
+    let sandbox = SandboxFs::new(&dir, None, false).with_forbidden_targets(std::iter::once(ctx.root.clone()).chain(crate::ctx::veil_private_dirs()));
     let result = (|| -> Result<i32> {
         let to = match &set {
             Some(s) => restrict_tree(ctx.repo.store(), &tree, s)?,
