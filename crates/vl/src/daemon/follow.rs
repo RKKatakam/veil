@@ -40,6 +40,7 @@ pub fn run(_p: &Paths) -> Result<()> {
     let identity = crate::ctx::load_identity()?;
     let mut warmed: HashMap<(String, String), ObjectId> = HashMap::new();
     let mut clients: HashMap<(String, String), Client> = HashMap::new();
+    let mut backoff_until: HashMap<String, i64> = HashMap::new();
     loop {
         let tick = Instant::now();
         let Some(s) = super::connect() else { return Ok(()) };
@@ -49,6 +50,9 @@ pub fn run(_p: &Paths) -> Result<()> {
             .and_then(|b| serde_json::from_value(b).ok())
             .unwrap_or_default();
         for (authority, project) in follows {
+            if backoff_until.get(&authority).is_some_and(|until| veil_core::now_millis() < *until) {
+                continue;
+            }
             let k = (authority.clone(), project.clone());
             if !clients.contains_key(&k) {
                 let Some(Ok(url)) = HubUrl::parse(&format!("veil://{authority}/{project}")) else { continue };
@@ -56,7 +60,12 @@ pub fn run(_p: &Paths) -> Result<()> {
                 clients.insert(k.clone(), c);
             }
             let c = &clients[&k];
-            let Ok(Some(tips)) = c.tips() else { continue };
+            let Ok((tips, wait_ms)) = c.tips_once() else { continue };
+            if wait_ms > 0 {
+                backoff_until.insert(authority, veil_core::now_millis().saturating_add(wait_ms.min(300_000)));
+                continue;
+            }
+            let Some(tips) = tips else { continue };
             let (Some(token), Some(key)) = (tips.grants.get(&tips.default_branch), tips.grant_key.as_ref()) else { continue };
             let Some(g) = Grant::verify(token, key) else { continue };
             if warmed.get(&k) == Some(&g.body.root) {

@@ -516,6 +516,30 @@ impl Client {
         }
     }
 
+    /// One background [`Client::tips`] check without waiting out a rate
+    /// limit (`vl daemon follow`, BUG-1680): returns `(Some(tips), 0)` on
+    /// `200`, `(None, ms)` on `429` or `503` with `retry_after_ms`, and
+    /// `(None, 0)` otherwise.
+    pub(crate) fn tips_once(&self) -> Result<(Option<Tips>, i64)> {
+        if self.token.borrow().is_none() && self.known {
+            self.login(None)?;
+        }
+        let path = self.url.project_path("/tips");
+        let (mut status, mut out) = self.send_once("GET", &path, None, true)?;
+        if status == 401 && self.known {
+            self.login(None)?;
+            (status, out) = self.send_once("GET", &path, None, true)?;
+        }
+        match status {
+            200 => Ok((Some(serde_json::from_slice(&out)?), 0)),
+            429 | 503 => {
+                let ms = serde_json::from_slice::<serde_json::Value>(&out).ok().and_then(|v| v["retry_after_ms"].as_i64()).unwrap_or(5_000).max(5_000);
+                Ok((None, ms))
+            }
+            _ => Ok((None, 0)),
+        }
+    }
+
     pub fn create_project(&self) -> Result<Tips> {
         self.json("POST", &self.url.project_path(""), None::<&()>)
     }

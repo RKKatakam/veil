@@ -24,13 +24,21 @@
 //!
 //! **Confirmations without a session.** The daemon holds no device key and
 //! no session. It confirms epochs by the server's own answers: every request
-//! it passes on that the server answers `200` confirms, and once a second it
-//! sends again, for each grant used in the last 15 minutes, the latest small
-//! request signed under it (within the signature's 5 minutes), every object
-//! skipped: the server checks the grant, its epochs and the device, and
-//! sends nothing. `401` voids the epochs; no answer leaves them to go stale,
-//! so without the server nothing is served from the store after 5 s (fail
-//! closed), public objects included.
+//! it passes on that the server answers `200` confirms as of its send time;
+//! while a grant is being read (for [`ACTIVE_MS`] after a request under it),
+//! once a second it sends again the latest small request signed under it
+//! (within the signature's 5 minutes), every object skipped, so the server
+//! checks the grant, its epochs and the device and sends nothing; and when a
+//! read arrives after idle with the confirmation stale, it sends one such
+//! skipped request first (`skip` naming every want) and, on `200`, serves the
+//! batch from its store without re-fetching the objects. When nothing has
+//! been read through a grant for [`ACTIVE_MS`], the daemon sends no renewal
+//! requests for it at all. When the server answers `429` or `503` with
+//! `retry_after_ms`, the daemon sends nothing more on its own account to that
+//! server until that time has passed (reads it cannot confirm go to the
+//! server as the client signed them). `401` voids the epochs; no answer
+//! leaves them to go stale, so without the server nothing is served from the
+//! store after 5 s (fail closed), public objects included.
 //!
 //! **Memory** ([`MEMORY`] in all, besides the store's index and each
 //! connection's buffers): requests are read under a share of their pool
@@ -48,7 +56,7 @@ use std::{
     io::{BufWriter, Read, Write},
     os::unix::net::{UnixListener, UnixStream},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
@@ -72,10 +80,15 @@ use super::{
 /// How long a confirmation of a grant's epochs holds (the owner's bound,
 /// product decision 1 of the phase-2 design).
 pub const STALE_MS: i64 = 5_000;
-/// How often confirmations are renewed.
+/// How often confirmations are renewed while a grant is being read.
 const POLL: Duration = Duration::from_secs(1);
-/// Grants confirmed again for this long after their last use.
+/// How long after a read a grant's confirmation is renewed in the background
+/// (BUG-1680: no renewal traffic while idle).
+const ACTIVE_MS: i64 = STALE_MS;
+/// How long an entry in [`Daemon::confirms`] is kept after its last use.
 const KEEP_MS: i64 = 15 * 60 * 1000;
+/// Longest a server's `retry_after_ms` holds back the daemon's own requests.
+const MAX_BACKOFF_MS: i64 = 300_000;
 /// A request kept for renewing confirmations names at most this many
 /// objects; it is sent again only while its signature's time is this far
 /// inside the server's skew.
@@ -162,6 +175,9 @@ struct Upstream {
     agent: ureq::Agent,
     /// The grant key and when it was fetched (or last failed to be).
     key: Mutex<(Option<String>, Option<Instant>)>,
+    /// Until when (unix ms) the daemon sends nothing on its own account to
+    /// this server after a `429` or `503` with `retry_after_ms` (BUG-1680).
+    backoff_until: AtomicI64,
 }
 
 impl Upstream {
@@ -169,23 +185,55 @@ impl Upstream {
         format!("https://{}{path}", self.authority)
     }
 
+    fn backed_off(&self) -> bool {
+        now() < self.backoff_until.load(Ordering::Relaxed)
+    }
+
+    /// Record a `429` or `503` answer's `retry_after_ms`, if any.
+    fn note_backoff(&self, status: u16, resp: ureq::http::Response<ureq::Body>) {
+        if !matches!(status, 429 | 503) {
+            return;
+        }
+        let Some(ms) = resp
+            .into_body()
+            .with_config()
+            .limit(4096)
+            .read_to_vec()
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v["retry_after_ms"].as_i64())
+            .filter(|ms| *ms > 0)
+        else {
+            return;
+        };
+        let until = now().saturating_add(ms.clamp(POLL.as_millis() as i64, MAX_BACKOFF_MS));
+        self.backoff_until.fetch_max(until, Ordering::Relaxed);
+    }
+
     /// The server's grant key, fetched by the daemon itself (at most every
     /// 10 minutes; after a failure, not again for 5 s).
     fn grant_key(&self) -> Option<String> {
         let mut k = self.key.lock().unwrap_or_else(|e| e.into_inner());
         let fresh = |at: Option<Instant>, d: u64| at.is_some_and(|t| t.elapsed() < Duration::from_secs(d));
-        if k.0.is_some() && fresh(k.1, 600) || k.0.is_none() && fresh(k.1, 5) {
+        if k.0.is_some() && fresh(k.1, 600) || k.0.is_none() && fresh(k.1, 5) || self.backed_off() {
             return k.0.clone();
         }
-        let got = self
-            .agent
-            .get(&self.url("/v1/grant-key"))
-            .call()
-            .ok()
-            .filter(|r| r.status() == 200)
-            .and_then(|r| r.into_body().with_config().limit(4096).read_to_vec().ok())
-            .and_then(|b| serde_json::from_slice::<GrantKey>(&b).ok())
-            .map(|g| g.grant_key);
+        let resp = self.agent.get(&self.url("/v1/grant-key")).call().ok();
+        let got = match resp {
+            Some(r) if r.status() == 200 => r
+                .into_body()
+                .with_config()
+                .limit(4096)
+                .read_to_vec()
+                .ok()
+                .and_then(|b| serde_json::from_slice::<GrantKey>(&b).ok())
+                .map(|g| g.grant_key),
+            Some(r) => {
+                self.note_backoff(r.status().as_u16(), r);
+                None
+            }
+            None => None,
+        };
         // A key that stops being fetchable is kept until it is replaced.
         if got.is_some() || k.0.is_none() {
             k.0 = got;
@@ -354,7 +402,12 @@ impl Daemon {
         if u.len() >= 64 {
             bail!("too many servers");
         }
-        let x = Arc::new(Upstream { authority: authority.to_string(), agent: upstream_agent(authority)?, key: Mutex::new((None, None)) });
+        let x = Arc::new(Upstream {
+            authority: authority.to_string(),
+            agent: upstream_agent(authority)?,
+            key: Mutex::new((None, None)),
+            backoff_until: AtomicI64::new(0),
+        });
         u.insert(authority.to_string(), x.clone());
         Ok(x)
     }
@@ -407,6 +460,28 @@ impl Daemon {
                 skip: req.wants.iter().map(|w| w.id).collect(),
             });
             c.replay_expires = expires;
+        }
+    }
+
+    /// Send one skipped request (`skip` naming every want) under `k` to
+    /// confirm its epochs with the server.
+    fn poll_one(&self, up: &Upstream, k: &EpochKey, r: &BatchRequest) {
+        if up.backed_off() {
+            return;
+        }
+        let Ok(body) = serde_json::to_vec(r) else { return };
+        let sent_at = now();
+        self.stats.polls.fetch_add(1, Ordering::Relaxed);
+        match up.agent.post(&up.url(&format!("/v1/objects/{}:batch", k.project))).header("content-type", "application/json").send(&body[..]) {
+            Ok(resp) if resp.status() == 200 => self.verdict(k, sent_at, true),
+            Ok(resp) if resp.status() == 401 => self.verdict(k, sent_at, false),
+            Ok(resp) => {
+                up.note_backoff(resp.status().as_u16(), resp);
+                self.stats.poll_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.stats.poll_errors.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -537,7 +612,14 @@ impl Daemon {
                 w.end(&Head { status, body: None, ..Default::default() })?;
             }
             Request::Follows => {
-                let f: Vec<(String, String)> = self.follows.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
+                let f: Vec<(String, String)> = self
+                    .follows
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .keys()
+                    .filter(|(a, _)| !self.upstream(a).is_ok_and(|u| u.backed_off()))
+                    .cloned()
+                    .collect();
                 w.end(&Head { status: None, body: Some(json!(f)), ..Default::default() })?;
             }
             Request::Status => w.end(&Head { status: None, body: Some(self.status()), ..Default::default() })?,
@@ -586,7 +668,6 @@ impl Daemon {
             return Ok(Head { status: Some(400), body: None, ..Default::default() });
         }
         let up = self.upstream(authority)?;
-        self.follow(authority, project);
         let ids: Vec<ObjectId> = req.wants.iter().map(|w| w.id).collect();
         let (checked, from_store) = self.decide(&up, project, &req, &ids);
         // From the store, each under its share of the answers' budget.
@@ -605,6 +686,9 @@ impl Daemon {
             true => Head::default(),
             false => self.forward(w, &up, project, req, checked.as_ref(), &sent)?,
         };
+        if !sent.is_empty() || head.status.is_none() {
+            self.follow(authority, project);
+        }
         head.from_store = sent.len();
         Ok(head)
     }
@@ -627,8 +711,37 @@ impl Daemon {
             person_epoch: g.body.person_epoch,
         };
         self.used(&k, req, g.body.expires);
-        if !self.confirmed(&k) || !self.store.ready() {
+        if !self.store.ready() {
             return (Some(k), Vec::new());
+        }
+        if !self.confirmed(&k) {
+            // Confirm before serving a warm store after idle (BUG-1680):
+            // one small skipped request, only when its epochs were confirmed
+            // before and not refused, and the store has at least one of the
+            // request's wants.
+            let probe = {
+                let cs = self.confirms();
+                cs.get(&k).filter(|c| !c.void && c.confirmed > 0).and_then(|c| {
+                    c.replay
+                        .clone()
+                        .filter(|r| r.ts.abs_diff(t) as i64 <= veil_core::hub::grant::REQUEST_SKEW_MS - REPLAY_MARGIN_MS)
+                        .or_else(|| {
+                            (!req.wants.is_empty()).then(|| BatchRequest {
+                                grant: req.grant.clone(),
+                                ts: req.ts,
+                                signature: req.signature.clone(),
+                                wants: req.wants.clone(),
+                                skip: ids.to_vec(),
+                            })
+                        })
+                })
+            };
+            if let Some(r) = probe.filter(|_| req.wants.iter().any(|w| self.store.size(&store::key(&up.authority, project, &w.id)).is_some())) {
+                self.poll_one(up, &k, &r);
+            }
+            if !self.confirmed(&k) {
+                return (Some(k), Vec::new());
+            }
         }
         let src = StoreSource { d: self, authority: &up.authority, project, shares: Default::default() };
         let mut chains = Chains::new(&src, g.body.root);
@@ -681,6 +794,7 @@ impl Daemon {
             }
         }
         if status != 200 {
+            up.note_backoff(status, resp);
             self.stats.refused_upstream.fetch_add(1, Ordering::Relaxed);
             return Ok(Head { status: Some(status), body: None, ..Default::default() });
         }
@@ -762,7 +876,8 @@ impl Daemon {
             || !std::fs::metadata(&self.paths.socket).is_ok_and(|m| m.ino() == self.socket_ino.load(Ordering::SeqCst))
     }
 
-    /// Renew the confirmation of every grant's epochs used recently.
+    /// Renew the confirmation of every grant's epochs read in the last
+    /// [`ACTIVE_MS`] (BUG-1680: no renewal traffic while idle).
     fn renew(&self) {
         let t = now();
         let mut due: Vec<(EpochKey, BatchRequest)> = Vec::new();
@@ -770,6 +885,9 @@ impl Daemon {
             let mut cs = self.confirms();
             cs.retain(|_, c| t - c.used <= KEEP_MS);
             for (k, c) in cs.iter() {
+                if c.void || c.confirmed == 0 || t - c.used > ACTIVE_MS || t - c.confirmed < POLL.as_millis() as i64 {
+                    continue;
+                }
                 let Some(r) = &c.replay else { continue };
                 if r.ts.abs_diff(t) as i64 > veil_core::hub::grant::REQUEST_SKEW_MS - REPLAY_MARGIN_MS || c.replay_expires <= t + 1000 {
                     continue;
@@ -779,16 +897,7 @@ impl Daemon {
         }
         for (k, r) in due {
             let Ok(up) = self.upstream(&k.authority) else { continue };
-            let Ok(body) = serde_json::to_vec(&r) else { continue };
-            let sent_at = now();
-            self.stats.polls.fetch_add(1, Ordering::Relaxed);
-            match up.agent.post(&up.url(&format!("/v1/objects/{}:batch", k.project))).header("content-type", "application/json").send(&body[..]) {
-                Ok(resp) if resp.status() == 200 => self.verdict(&k, sent_at, true),
-                Ok(resp) if resp.status() == 401 => self.verdict(&k, sent_at, false),
-                _ => {
-                    self.stats.poll_errors.fetch_add(1, Ordering::Relaxed);
-                }
-            }
+            self.poll_one(&up, &k, &r);
         }
     }
 

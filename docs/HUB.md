@@ -3401,18 +3401,28 @@ cache token (S9's feed is the server's caches'). So it confirms epochs by
 the server's own answers: every request it passes on that the server
 answers `200` confirms that grant's epochs at the time it was **sent**
 (the server checks the grant's epochs and device before anything else);
-and once a second, for each grant used in the last 15 minutes, it sends
-again the latest request of at most 256 objects signed under it, every
-object skipped (`skip` is not signed; the server checks the grant and
-sends nothing), while that signature is 30 s inside the server's ±5
-minutes. `401` voids those epochs (a later-sent `200` restores them); no
-answer lets them go stale. **So a change committed at time R is refused
-by R + 5 s at the latest** (measured: 21–37 ms alone, up to 749 ms with
-four suites running at once), and **without the
-server nothing is served from the store after 5 s**, public objects
-included. The replay is what S5 already allows ("a signed request can be
-replayed within ±5 minutes by whoever saw it"; the daemon saw it), and
-returns no object.
+and once a second, for each grant read through the daemon in the last 5 s
+(`ACTIVE_MS`, kept in memory for 15 minutes), it sends again the latest
+request of at most 256 objects signed under it, every object skipped
+(`skip` is not signed; the server checks the grant and sends nothing),
+while that signature is 30 s inside the server's ±5 minutes. Once nothing
+has been read through a grant for 5 s, background renewals stop (zero idle
+traffic); when a read arrives for a grant whose confirmation is stale and
+the store holds at least one of its wants, the daemon confirms once on
+demand before reading its store (using the recorded replay if still inside
+the ±5-minute window, or the client's own request with every want in
+`skip`, then serving from the store on `200`), so a warm store after idle
+costs one small confirmation request instead of re-fetching the objects
+(BUG-1680). When a server answers `429` or `503` with `retry_after_ms`,
+the daemon sends nothing more on its own account to that server until that
+time has passed; reads it cannot confirm meanwhile go to the server as the
+client signed them. `401` voids those epochs (a later-sent `200` restores
+them); no answer lets them go stale. **So a change committed at time R is
+refused by R + 5 s at the latest** (measured: 21–37 ms alone, up to 749 ms
+with four suites running at once), and **without the server nothing is
+served from the store after 5 s**, public objects included. The replay is
+what S5 already allows ("a signed request can be replayed within ±5
+minutes by whoever saw it"; the daemon saw it), and returns no object.
 
 #### The client side
 
@@ -3438,10 +3448,12 @@ returns no object.
   read through it (at most 64, for 7 days, `follow.json`) and keeps `vl
   daemon follow` running, a `vl` of the same Veil home (it holds the
   device key and a session; the daemon process never does): once a second
-  it asks the server for each followed project's tips, and when the
-  default branch's projected root changes, reads its trees down to depth 3
-  (at most 4,000) through the daemon, which keeps them. Measured: a new
-  tip's top trees in the store 0.6 s after the push returned.
+  it asks the server for each followed project's tips (without retrying a
+  `429` or `503`, backing off for that server until `retry_after_ms` has
+  passed; BUG-1680), and when the default branch's projected root changes,
+  reads its trees down to depth 3 (at most 4,000) through the daemon, which
+  keeps them. Measured: a new tip's top trees in the store 0.6 s after the
+  push returned.
 
 #### Bounds
 
@@ -3497,6 +3509,7 @@ returns no object.
 | 1 | The daemon never serves an object the server would not serve that person's device now: the admin's daemon holds every object; five viewers (anyone on Earth included) asking it with their own grants receive exactly the server's walk, and every real object they do not reach, with every chain they can build (their trees, the admin's real chains, the admin's chains from their root, the admin's root), gets nothing and no store hit; another device's signature, none, a wider root under the signature, a grant signed by the server's identity key, an expired one, one of other epochs, one of another project: nothing from the store; hostile requests refused, the daemon still serving | `the_daemon_serves_only_what_the_server_would` |
 | 2 | A person removed from a group, a project whose policy changed, a device an admin removed: refused within 5 s (21–37 ms alone, up to 749 ms under load), never served again | `a_removed_person_or_device_is_refused_at_the_daemon_within_the_bound` |
 | 2b | Fails closed: the server cut off, nothing from the store 5 s later (public included), `503`; served again once the server answers | `the_daemon_fails_closed_without_the_server` |
+| 2c | Renewals only while reading; warm store after idle; server back-off respected: zero background polls once a grant has not been read for 5 s; a read arriving after idle re-confirms once with a skipped request and serves from the store (or voids on `401` if access changed while idle); on `429`/`503` with `retry_after_ms` the daemon sends nothing on its own account until that time has passed while forwarding unconfirmed client reads as signed | `bug_1680_no_idle_renewals_warm_store_after_idle_and_server_backoff` (BUG-1680) |
 | 3 | A thin clone answers eight commands, and checks out the same files, with the daemon off, cold and warm, for the admin and for a person without `billing/`; that person's daemon never held a restricted marker | `a_thin_clone_answers_the_same_with_and_without_the_daemon`; every S3 test (`thin::`, 46) now runs with the daemon on; the core tests check every `Located::chain` agrees with its path (`core_sync` `thin`) |
 | 4 | The store keeps to `--cache-size 64K` under 200 files of 4 KiB; memory: 24 readers at once of two 12 MiB files, cold and warm, grow the daemon by less than its budget and their connections' buffers (36–41 MiB measured, alone and four suites at once; held outside the budget, at least 288 MiB) | `the_daemons_store_keeps_to_its_bound`, `the_daemons_memory_stays_within_its_budget`; `daemon::store::tests` (pins kept, a full pin set keeps nothing new, damaged files removed, the index rebuilt) |
 | 5 | A `vl` without the daemon works: off is not started again; a daemon killed with `SIGKILL` leaves `vl` working (and is started again); a daemon that answers nothing, or wrong bytes for every object, changes no answer | `vl_works_without_the_daemon` |

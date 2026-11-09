@@ -1603,3 +1603,147 @@ fn s6r2_an_empty_xdg_variable_never_puts_the_daemon_where_vl_runs() {
     assert!(took < Duration::from_secs(2), "a command in the clone took {took:?}");
 }
 
+// ---- BUG-1680: renewals only while reading; re-confirm after idle; server back-off ----
+
+/// BUG-1680 (guarantees 2, 3 and 4):
+/// - **No idle traffic:** once nothing has been read through a grant for a
+///   few seconds (`ACTIVE_MS`, 5 s), the daemon sends no renewal polls for
+///   it at all (`polls` and the server's `requests` counter stop moving).
+/// - **The cache still works after idle:** when a read arrives after the
+///   confirmation went stale, the daemon confirms once with a skipped
+///   request (`polls` +1, `forwarded` +0, `from_upstream` +0) and serves
+///   the walk from its store (`from_store` grows by every object of the
+///   walk); if access was revoked while idle, that confirmation gets `401`,
+///   voids the grant (`voided` +1) and serves nothing from the store.
+/// - **The server's back-off is respected:** when the server answers `429`
+///   with `retry_after_ms`, the daemon sends nothing more on its own
+///   account (`polls` does not move) until that time has passed, while a
+///   read it cannot confirm still goes to the server as the client signed
+///   it (`forwarded` +1, answered with the server's `429`).
+#[test]
+fn bug_1680_no_idle_renewals_warm_store_after_idle_and_server_backoff() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let server = hub.api();
+    let d = Daemon::start(&p.fin, None);
+    let fin = Reader::new(&server, &d.socket, &hub.authority(), Some(&p.fin), &p.name);
+    let cold = fin.walk();
+    assert!(!cold.is_empty(), "the cold walk succeeded");
+    warm(&d, &fin, &[], &fin.root());
+    assert!(d.stat("confirmed") >= 1, "fin's grant is confirmed");
+
+    // 1. No idle traffic: wait past ACTIVE_MS (5 s); background polls stop
+    // completely, and 5 s after the last poll the confirmation is stale.
+    std::thread::sleep(STALE + Duration::from_millis(1200));
+    let polls_idle = d.stat("polls");
+    std::thread::sleep(STALE);
+    assert_eq!(d.stat("polls"), polls_idle, "the daemon sent renewal polls while idle");
+    assert_eq!(d.stat("confirmed"), 0, "the confirmation went stale while idle");
+
+    // 2. Cache still works after idle: a full walk after the confirmation is
+    // stale sends one skipped confirmation poll (`polls` +1, `forwarded` +0,
+    // `from_upstream` +0) and serves every object from the store.
+    let (before_store, before_up, before_fwd, before_polls) = (d.stat("from_store"), d.stat("from_upstream"), d.stat("forwarded"), d.stat("polls"));
+    let after_idle = fin.walk();
+    assert_eq!(items(&after_idle), items(&cold), "the walk after idle succeeded and matches");
+    assert_eq!(d.stat("polls"), before_polls + 1, "one confirmation request re-confirmed the stale grant");
+    assert_eq!(d.stat("forwarded"), before_fwd, "no batch was forwarded upstream after idle");
+    assert_eq!(d.stat("from_upstream"), before_up, "no object was re-fetched from upstream after idle");
+    assert!(d.stat("from_store") >= before_store + after_idle.len() as u64, "every object came from the store after idle");
+
+    // 3. Unchanged access rule after idle: let the confirmation go stale
+    // again, revoke fin's access while idle, then ask for the invoice; the
+    // on-demand confirmation gets 401 and nothing is served from the store.
+    let (chain, id) = invoice(&fin);
+    std::thread::sleep(2 * STALE + Duration::from_millis(1200));
+    assert_eq!(d.stat("confirmed"), 0, "stale again before revocation");
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let before_store = d.stat("from_store");
+    let before_voided = d.stat("voided");
+    let (got, end) = fin.batch_as(&fin.grant, fin.id.as_ref(), &[(chain, id)]);
+    assert!(got.is_empty(), "revoked object served after idle");
+    refused(end, "revoked while idle");
+    assert_eq!(d.stat("from_store"), before_store, "nothing served from the store after revocation");
+    assert!(d.stat("voided") > before_voided, "the 401 voided the epochs");
+
+    // 4. Server back-off respected: on a server whose device limit is 100/s
+    // and 20/hour, exhausting the device's 20/hour budget makes the server
+    // answer 429 with a long `retry_after_ms`. The daemon records the
+    // back-off and sends no more polls on its own account, while a client's
+    // unconfirmed read still forwards as signed and receives the 429.
+    let device = veil_server::limits::bucket::Rate { per_second: 100, per_hour: 20 };
+    let lim_hub = TestHub::start_with_limits(veil_server::limits::Settings { device, ..TestHub::limits() });
+    let lim_api = lim_hub.api();
+    let lim_admin = lim_hub.person("limadmin");
+    let proj = unique("limproj");
+    let pdir = lim_admin.dir("proj");
+    std::fs::create_dir_all(&pdir).unwrap();
+    lim_admin.ok(&pdir, &["init"]);
+    write_files(&pdir, &[("a.txt", "hello")]);
+    lim_admin.ok(&pdir, &["remote", "add", "origin", &lim_hub.url(&proj)]);
+    lim_admin.commit_main(&pdir, "init");
+    lim_admin.ok(&pdir, &["push"]);
+    let lim_d = Daemon::start(&lim_admin, None);
+    let token = lim_admin.token();
+    let dev_r = Reader::new(&lim_api, &lim_d.socket, &lim_hub.authority(), Some(&lim_admin), &proj);
+    // First read: fetches grant-key (anonymous) and forwards the batch,
+    // caching the root and confirming the grant.
+    let (got, end) = dev_r.batch_as(&dev_r.grant, dev_r.id.as_ref(), &[(Vec::new(), dev_r.root())]);
+    assert_eq!(got.len(), 1, "first read succeeded: {end:?}");
+    assert!(end.expect("whole answer")["status"].is_null());
+    let errs_before = lim_d.stat("poll_errors");
+    // Spend the remaining device tokens and trigger 429 on the server.
+    let mut saw_429 = false;
+    for _ in 0..30 {
+        let r = lim_api.get(Some(&token), &format!("/v1/projects/{proj}/tips"));
+        if r.status == 429 {
+            saw_429 = true;
+            break;
+        }
+    }
+    assert!(saw_429, "the device budget is exhausted (429)");
+    // The next background renewal poll hits 429 with `retry_after_ms` and
+    // backs off the upstream; after that, `polls` stops moving.
+    until(Duration::from_secs(4), "a renewal poll sees the 429", || lim_d.stat("poll_errors") > errs_before);
+    let polls_after_429 = lim_d.stat("polls");
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(lim_d.stat("polls"), polls_after_429, "the daemon kept polling a server that answered 429 retry_after_ms");
+    // Wait for the confirmation to expire; while backed off, an unconfirmed
+    // read is not polled by the daemon (`polls` unchanged), and is forwarded
+    // to the server as the client signed it (`forwarded` +1, status 429).
+    std::thread::sleep(STALE);
+    let (polls_before, fwd_before) = (lim_d.stat("polls"), lim_d.stat("forwarded"));
+    let (got, end) = dev_r.batch_as(&dev_r.grant, dev_r.id.as_ref(), &[(Vec::new(), dev_r.root())]);
+    assert!(got.is_empty(), "unconfirmed read during backoff must not serve from store");
+    assert_eq!(end.expect("whole answer")["status"], 429, "client's signed request forwarded and answered 429");
+    assert_eq!(lim_d.stat("polls"), polls_before, "no daemon poll sent while backed off");
+    assert_eq!(lim_d.stat("forwarded"), fwd_before + 1, "the client's request was forwarded to the server");
+}
+
+/// BUG-1681: `vl daemon follow` (`crates/vl/src/daemon/follow.rs`) sends
+/// `GET /v1/projects/{p}/tips` once a second for every project in
+/// `follow.json` (kept for 7 days after a single thin clone read), even
+/// when nothing is being read through the daemon.
+#[test]
+#[ignore = "BUG-1681: vl daemon follow polls GET /tips every second for 7 days while idle"]
+fn bug_1681_daemon_follow_polls_tips_every_second_while_idle() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let admin = p.admin.token();
+    let health_requests = || {
+        let r = api.get(Some(&admin), &format!("/v1/projects/{}/health", p.name));
+        assert_eq!(r.status, 200);
+        r.json()["since_start"]["requests"].as_u64().unwrap()
+    };
+    let _d = Daemon::start(&p.dev, None);
+    let thin = p.dev.dir("thin-idle");
+    p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), thin.to_str().unwrap()]);
+    std::thread::sleep(STALE + Duration::from_millis(1500));
+    let before = health_requests();
+    std::thread::sleep(Duration::from_secs(4));
+    let after = health_requests();
+    assert_eq!(after - before, 1, "only the health check itself should hit the server while idle (got {} extra requests)", after - before - 1);
+}
+
+
