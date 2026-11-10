@@ -369,17 +369,24 @@ pub async fn tested_route(
 }
 
 /// `<branch>@tested` as `viewer` sees it (`None` when the branch does not
-/// exist or has no tested snapshot in its current lineage).
+/// exist, is a hidden embargo line invisible to `viewer`, or has no tested
+/// snapshot in its current lineage).
 pub async fn tested_for(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, branch: &str) -> Result<Option<ObjectId>> {
-    let row: Option<String> = sqlx::query_scalar(
-        "SELECT t.snapshot FROM tested t JOIN branches b ON b.project_id = t.project_id AND b.name = t.branch \
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT t.snapshot, b.hidden_for_embargo FROM tested t \
+         JOIN branches b ON b.project_id = t.project_id AND b.name = t.branch \
          WHERE t.project_id = $1 AND t.branch = $2 AND t.lineage = b.lineage",
     )
     .bind(project.id)
     .bind(branch)
     .fetch_optional(&hub.db)
     .await?;
-    let Some(hex) = row else { return Ok(None) };
+    let Some((hex, hidden)) = row else { return Ok(None) };
+    if let Some(eid) = hidden {
+        if !crate::embargo::can_see(hub, project, viewer, &eid).await? {
+            return Ok(None);
+        }
+    }
     let Ok(real) = ObjectId::from_hex(&hex) else { return Ok(None) };
     let proj = sync::projected(hub, project, viewer, real).await?;
     Ok(Some(proj))
@@ -388,15 +395,21 @@ pub async fn tested_for(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, bran
 /// All `<branch>@tested` pointers in `project` as `viewer` sees them, for
 /// [`veil_core::hub::wire::Tips::tested`].
 pub async fn all_tested_for(hub: &Arc<Hub>, project: &Project, viewer: &Viewer) -> Result<BTreeMap<String, ObjectId>> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT t.branch, t.snapshot FROM tested t JOIN branches b ON b.project_id = t.project_id AND b.name = t.branch \
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT t.branch, t.snapshot, b.hidden_for_embargo FROM tested t \
+         JOIN branches b ON b.project_id = t.project_id AND b.name = t.branch \
          WHERE t.project_id = $1 AND t.lineage = b.lineage ORDER BY t.branch",
     )
     .bind(project.id)
     .fetch_all(&hub.db)
     .await?;
     let mut out = BTreeMap::new();
-    for (branch, hex) in rows {
+    for (branch, hex, hidden) in rows {
+        if let Some(eid) = hidden {
+            if !crate::embargo::can_see(hub, project, viewer, &eid).await? {
+                continue;
+            }
+        }
         if let Ok(real) = ObjectId::from_hex(&hex) {
             let proj = sync::projected(hub, project, viewer, real).await?;
             out.insert(branch, proj);
@@ -522,6 +535,9 @@ async fn resolve_snapshot_for_write(
     if *id == sync::root_snapshot_id() {
         return Ok(Some(*id));
     }
+    if crate::embargo::is_withheld_from_viewer(hub, project, viewer, id).await? {
+        return Ok(None);
+    }
     if let Some(tip) = branch_tip(hub, project.id, &project.default_branch).await? {
         if sync::projected(hub, project, viewer, tip).await? == *id {
             return Ok(Some(tip));
@@ -532,7 +548,10 @@ async fn resolve_snapshot_for_write(
         .bind(id.hex())
         .fetch_optional(&hub.db)
         .await?;
-    if has_real.is_some() && sync::projected(hub, project, viewer, *id).await? == *id {
+    if has_real.is_some()
+        && !crate::embargo::is_withheld_from_viewer(hub, project, viewer, id).await?
+        && sync::projected(hub, project, viewer, *id).await? == *id
+    {
         return Ok(Some(*id));
     }
     let key = project.view(viewer).key();
@@ -545,7 +564,9 @@ async fn resolve_snapshot_for_write(
     .fetch_optional(&hub.db)
     .await?;
     if let Some(real) = own.and_then(|h| ObjectId::from_hex(&h).ok()) {
-        if sync::projected(hub, project, viewer, real).await? == *id {
+        if !crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await?
+            && sync::projected(hub, project, viewer, real).await? == *id
+        {
             return Ok(Some(real));
         }
     }
@@ -565,15 +586,24 @@ async fn resolve_rev_for_read(
         return Err(Error::not_found("no such revision that you can see"));
     }
     if let Some(branch) = rev.strip_suffix("@tested") {
-        let row: Option<String> = sqlx::query_scalar(
-            "SELECT t.snapshot FROM tested t JOIN branches b ON b.project_id = t.project_id AND b.name = t.branch \
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT t.snapshot, b.hidden_for_embargo FROM tested t \
+             JOIN branches b ON b.project_id = t.project_id AND b.name = t.branch \
              WHERE t.project_id = $1 AND t.branch = $2 AND t.lineage = b.lineage",
         )
         .bind(project.id)
         .bind(branch)
         .fetch_optional(&hub.db)
         .await?;
-        let Some(real) = row.and_then(|h| ObjectId::from_hex(&h).ok()) else {
+        let Some((hex, hidden)) = row else {
+            return Err(Error::not_found(format!("branch '{branch}' has no tested snapshot yet")));
+        };
+        if let Some(eid) = hidden {
+            if !crate::embargo::can_see(hub, project, viewer, &eid).await? {
+                return Err(Error::not_found(format!("branch '{branch}' has no tested snapshot yet")));
+            }
+        }
+        let Some(real) = ObjectId::from_hex(&hex).ok() else {
             return Err(Error::not_found(format!("branch '{branch}' has no tested snapshot yet")));
         };
         let proj_id = sync::projected(hub, project, viewer, real).await?;
@@ -603,7 +633,7 @@ async fn resolve_rev_for_read(
             return Ok((proj_id, out));
         }
     }
-    let Some(tip) = branch_tip(hub, project.id, rev).await? else {
+    let Some(tip) = visible_branch_tip(hub, project, viewer, rev).await? else {
         return Err(Error::not_found("no such revision that you can see"));
     };
     let proj_id = sync::projected(hub, project, viewer, tip).await?;
@@ -617,12 +647,31 @@ async fn resolve_rev_for_read(
 }
 
 async fn branch_tip(hub: &Arc<Hub>, project: i64, branch: &str) -> Result<Option<ObjectId>> {
-    let target: Option<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2")
-        .bind(project)
-        .bind(branch)
-        .fetch_optional(&hub.db)
-        .await?;
+    let target: Option<String> = sqlx::query_scalar(
+        "SELECT target FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL",
+    )
+    .bind(project)
+    .bind(branch)
+    .fetch_optional(&hub.db)
+    .await?;
     Ok(target.and_then(|t| ObjectId::from_hex(&t).ok()))
+}
+
+async fn visible_branch_tip(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, branch: &str) -> Result<Option<ObjectId>> {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT target, hidden_for_embargo FROM branches WHERE project_id = $1 AND name = $2",
+    )
+    .bind(project.id)
+    .bind(branch)
+    .fetch_optional(&hub.db)
+    .await?;
+    let Some((target, hidden)) = row else { return Ok(None) };
+    if let Some(eid) = hidden {
+        if !crate::embargo::can_see(hub, project, viewer, &eid).await? {
+            return Ok(None);
+        }
+    }
+    Ok(ObjectId::from_hex(&target).ok())
 }
 
 /// Most first-parent steps walked above `<branch>@tested` (or the root) when
@@ -633,11 +682,12 @@ const MAX_TESTED_WALK: usize = 1024;
 /// `tested` monotonically to the newest snapshot on the branch's
 /// first-parent chain whose required checks have all passed.
 pub async fn advance_tested(hub: &Arc<Hub>, project: &Project) -> Result<()> {
-    let branches: Vec<(String, String, i64)> =
-        sqlx::query_as("SELECT name, target, lineage FROM branches WHERE project_id = $1 ORDER BY name")
-            .bind(project.id)
-            .fetch_all(&hub.db)
-            .await?;
+    let branches: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT name, target, lineage FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL ORDER BY name",
+    )
+    .bind(project.id)
+    .fetch_all(&hub.db)
+    .await?;
     if branches.is_empty() {
         return Ok(());
     }

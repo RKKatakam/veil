@@ -36,6 +36,7 @@
 //! read.
 
 pub mod class;
+pub mod embargo;
 pub mod review;
 pub mod revision;
 pub mod rules;
@@ -111,6 +112,8 @@ pub struct PrRow {
     pub revision: i32,
     pub created_at: i64,
     pub updated_at: i64,
+    pub embargo: String,
+    pub land_at_release: bool,
 }
 
 /// One revision's row. `risk` and `reasons` are the revision's files rated
@@ -148,9 +151,10 @@ pub async fn visible(hub: &Hub, ask: &Ask, id: &str) -> Result<PrRow> {
     if !valid_pr_id(id) {
         return Err(no_pr());
     }
-    type Row = (String, i64, String, String, String, String, i32, i64, i64, String, String);
+    type Row = (String, i64, String, String, String, String, i32, i64, i64, String, bool, String, String);
     let row: Option<Row> = sqlx::query_as(
-        "SELECT p.target, p.author, pe.name, p.title, p.body, p.state, p.revision, p.created_at, p.updated_at, c.lines, c.embargo \
+        "SELECT p.target, p.author, pe.name, p.title, p.body, p.state, p.revision, p.created_at, p.updated_at, \
+                p.embargo, p.land_at_release, c.lines, c.embargo \
          FROM prs p JOIN pr_classes c ON c.project_id = p.project_id AND c.class_id = p.class_id JOIN people pe ON pe.id = p.author \
          WHERE p.project_id = $1 AND p.id = $2 AND p.policy_key = $3",
     )
@@ -159,11 +163,19 @@ pub async fn visible(hub: &Hub, ask: &Ask, id: &str) -> Result<PrRow> {
     .bind(class::policy_key(&ask.project.policy))
     .fetch_optional(&hub.db)
     .await?;
-    let Some((target, author, author_name, title, body, state, revision, created_at, updated_at, lines, embargo)) = row else {
+    let Some((target, author, author_name, title, body, state, revision, created_at, updated_at, pr_embargo, land_at_release, lines, class_embargo)) = row else {
         return Err(no_pr());
     };
     let lines: BTreeSet<String> = serde_json::from_str(&lines).unwrap_or_else(|_| BTreeSet::from([String::new()]));
-    if !class::satisfies(&ask.project.view(&ask.viewer), &lines, &embargo) {
+    let vis_emb = if class_embargo.is_empty() && pr_embargo.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        embargo::visible_embargoes(hub, &ask.project, &ask.viewer).await?
+    };
+    let view = ask.project.view(&ask.viewer);
+    if !class::satisfies_with_embargoes(&view, &lines, &class_embargo, &vis_emb)
+        || (!pr_embargo.is_empty() && !vis_emb.contains(&pr_embargo))
+    {
         return Err(no_pr());
     }
     if ask.viewer.only.is_some() {
@@ -183,6 +195,8 @@ pub async fn visible(hub: &Hub, ask: &Ask, id: &str) -> Result<PrRow> {
         revision,
         created_at,
         updated_at,
+        embargo: pr_embargo,
+        land_at_release,
     })
 }
 
@@ -283,15 +297,6 @@ async fn names(hub: &Hub, ids: &[i64]) -> Result<HashMap<i64, String>> {
     Ok(rows.into_iter().collect())
 }
 
-/// The real tip of `branch`, if it exists and is not a hidden embargo line.
-async fn tip(hub: &Hub, project: i64, branch: &str) -> Result<Option<ObjectId>> {
-    let t: Option<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL")
-        .bind(project)
-        .bind(branch)
-        .fetch_optional(&hub.db)
-        .await?;
-    t.map(|t| hex_id(&t)).transpose()
-}
 
 /// The review rules of the default branch's tip.
 async fn rules(hub: &Arc<Hub>, ask: &Ask) -> Result<Review> {
@@ -442,7 +447,10 @@ async fn write_revision(c: &mut sqlx::PgConnection, project: i64, pr: &str, n: i
 // ---- answers ------------------------------------------------------------------
 
 /// The viewer's ids of `reals` (their projections), in one fill.
-async fn projected(hub: &Arc<Hub>, ask: &Ask, reals: &[ObjectId]) -> Result<HashMap<ObjectId, ObjectId>> {
+async fn projected(hub: &Arc<Hub>, ask: &Ask, embargo: &str, reals: &[ObjectId]) -> Result<HashMap<ObjectId, ObjectId>> {
+    if !embargo.is_empty() {
+        return embargo::projected(hub, ask, embargo, reals).await;
+    }
     let ps = ensure(hub, &ask.project, &ask.viewer, reals, Some(Instant::now() + DEADLINE)).await?;
     Ok(reals.iter().copied().zip(ps).collect())
 }
@@ -490,15 +498,15 @@ fn reals_of(revs: &[RevRow]) -> Vec<ObjectId> {
 
 /// The PR's revisions, the viewer's ids of every snapshot they name, and
 /// the viewer's number of each.
-async fn viewer_revisions(hub: &Arc<Hub>, ask: &Ask, pr: &str) -> Result<(Vec<RevRow>, HashMap<ObjectId, ObjectId>, HashMap<i32, i32>)> {
+async fn viewer_revisions(hub: &Arc<Hub>, ask: &Ask, pr: &str, embargo: &str) -> Result<(Vec<RevRow>, HashMap<ObjectId, ObjectId>, HashMap<i32, i32>)> {
     let revs = revisions(hub, ask.project.id, pr).await?;
-    numbered(hub, ask, revs).await
+    numbered(hub, ask, embargo, revs).await
 }
 
 /// `revs` with the viewer's ids of every snapshot they name, and the
 /// viewer's number of each.
-async fn numbered(hub: &Arc<Hub>, ask: &Ask, revs: Vec<RevRow>) -> Result<(Vec<RevRow>, HashMap<ObjectId, ObjectId>, HashMap<i32, i32>)> {
-    let p = projected(hub, ask, &reals_of(&revs)).await?;
+async fn numbered(hub: &Arc<Hub>, ask: &Ask, embargo: &str, revs: Vec<RevRow>) -> Result<(Vec<RevRow>, HashMap<ObjectId, ObjectId>, HashMap<i32, i32>)> {
+    let p = projected(hub, ask, embargo, &reals_of(&revs)).await?;
     let numbers = viewer_numbers(&revs, &p);
     let map = revs.iter().zip(&numbers).map(|(r, v)| (r.n, *v)).collect();
     Ok((revs, p, map))
@@ -507,7 +515,7 @@ async fn numbered(hub: &Arc<Hub>, ask: &Ask, revs: Vec<RevRow>) -> Result<(Vec<R
 /// The PR as `ask`'s viewer sees it.
 pub async fn pr_json(hub: &Arc<Hub>, ask: &Ask, pr: &PrRow) -> Result<Value> {
     let (revs, gate) = gate(hub, ask, pr).await?;
-    let (revs, p, vn) = numbered(hub, ask, revs).await?;
+    let (revs, p, vn) = numbered(hub, ask, &pr.embargo, revs).await?;
     let ppl = names(hub, &revs.iter().map(|r| r.pushed_by).collect::<Vec<_>>()).await?;
     let current = revs.iter().find(|r| r.n == pr.revision).ok_or_else(|| Error::Other(anyhow::anyhow!("the PR's revision is missing")))?;
     let mut review = gate.json();
@@ -549,7 +557,7 @@ pub async fn pr_json(hub: &Arc<Hub>, ask: &Ask, pr: &PrRow) -> Result<Value> {
             "at": r.at,
         }));
     }
-    Ok(json!({
+    let mut out = json!({
         "schema": "veil.pr/1",
         "id": pr.id,
         "title": pr.title,
@@ -568,7 +576,12 @@ pub async fn pr_json(hub: &Arc<Hub>, ask: &Ask, pr: &PrRow) -> Result<Value> {
         "checks": checks,
         "revisions": shown,
         "policy_version": ask.policy_version,
-    }))
+    });
+    if !pr.embargo.is_empty() {
+        out["embargo"] = json!(pr.embargo);
+        out["land_at_release"] = json!(pr.land_at_release);
+    }
+    Ok(out)
 }
 
 // ---- operations (the routes call these; the tests call them directly) ------------
@@ -582,6 +595,11 @@ pub struct CreatePr {
 }
 
 pub async fn create(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr) -> Result<Value> {
+    let _ = participant(ask, caller)?;
+    create_with(hub, ask, caller, q, false).await
+}
+
+pub async fn create_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr, land_at_release: bool) -> Result<Value> {
     let me = participant(ask, caller)?;
     let title = check_title(&q.title)?;
     let body = q.body.unwrap_or_default();
@@ -589,10 +607,18 @@ pub async fn create(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr) -> 
     let onto = q.onto.unwrap_or_else(|| ask.project.default_branch.clone());
     let deadline = Instant::now() + DEADLINE;
     // The target is a branch, named as the caller names it.
-    query::resolve(hub, ask, &onto, deadline).await?;
-    let onto_tip = tip(hub, ask.project.id, &onto).await?.ok_or_else(|| Error::not_found("no such revision that you can see"))?;
-    let (_, head) = query::resolve_real(hub, ask, &q.head, deadline).await?;
-    let r = compute(hub, ask, head, onto_tip).await?;
+    let (onto_tip, onto_emb) = embargo::resolve_onto(hub, ask, &onto, deadline).await?;
+    let (head, head_emb) = embargo::resolve_head(hub, ask, &q.head, deadline).await?;
+    let pr_embargo = embargo::combine_embargo(ask, head_emb, onto_emb.clone())?;
+    if land_at_release && pr_embargo.is_empty() {
+        return Err(Error::bad_request("land_at_release applies only to an embargoed PR"));
+    }
+    let r = if pr_embargo.is_empty() {
+        compute(hub, ask, head, onto_tip).await?
+    } else {
+        let rules = rules(hub, ask).await?;
+        embargo::compute(hub, ask, head, onto_tip, onto_emb.is_some(), &pr_embargo, rules).await?
+    };
     readable_by(ask, &r.touched)?;
     if ask.viewer.only.is_some() && r.touched.iter().any(|p| !ask.viewer.within_narrowing(p)) {
         return Err(crate::sync::agent_refusal(crate::sync::NARROWED_MOVE));
@@ -602,19 +628,50 @@ pub async fn create(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr) -> 
     }
     let key = class::policy_key(&ask.project.policy);
     let lines = class::lines_of(&ask.project.policy, r.touched.iter().map(String::as_str));
-    let (project, r) = (ask.project.id, Arc::new(r));
+    let (project, r, pr_emb) = (ask.project.id, Arc::new(r), pr_embargo.clone());
     let mut made = None;
     for _ in 0..5 {
         let id = random_id();
         let now = veil_core::now_millis();
-        let (r, key, lines, title, body, onto, id2) = (r.clone(), key.clone(), lines.clone(), title.clone(), body.clone(), onto.clone(), id.clone());
+        let (r, key, lines, title, body, onto, pr_emb, id2) = (
+            r.clone(),
+            key.clone(),
+            lines.clone(),
+            title.clone(),
+            body.clone(),
+            onto.clone(),
+            pr_emb.clone(),
+            id.clone(),
+        );
         let fresh = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
-            let (r, key, lines, title, body, onto, id) = (r.clone(), key.clone(), lines.clone(), title.clone(), body.clone(), onto.clone(), id2.clone());
+            let (r, key, lines, title, body, onto, pr_emb, id) = (
+                r.clone(),
+                key.clone(),
+                lines.clone(),
+                title.clone(),
+                body.clone(),
+                onto.clone(),
+                pr_emb.clone(),
+                id2.clone(),
+            );
             Box::pin(async move {
-                let class = class::put_class(&mut *c, project, &key, &lines).await?;
+                if !pr_emb.is_empty() {
+                    let locked = sqlx::query(
+                        "UPDATE embargo_lines SET has_pr = TRUE WHERE project_id = $1 AND embargo_id = $2 AND released_at IS NULL",
+                    )
+                    .bind(project)
+                    .bind(&pr_emb)
+                    .execute(&mut *c)
+                    .await?
+                    .rows_affected();
+                    if locked == 0 {
+                        return Err(Error::conflict("the embargo has already been released; open an ordinary PR"));
+                    }
+                }
+                let class = class::put_class_for(&mut *c, project, &key, &lines, &pr_emb).await?;
                 let inserted = sqlx::query(
-                    "INSERT INTO prs (project_id, id, class_id, policy_key, target, author, title, body, state, revision, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', 1, $9, $9) ON CONFLICT (project_id, id) DO NOTHING",
+                    "INSERT INTO prs (project_id, id, class_id, policy_key, target, author, title, body, state, revision, created_at, updated_at, embargo, land_at_release) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', 1, $9, $9, $10, $11) ON CONFLICT (project_id, id) DO NOTHING",
                 )
                 .bind(project)
                 .bind(&id)
@@ -625,6 +682,8 @@ pub async fn create(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr) -> 
                 .bind(&title)
                 .bind(&body)
                 .bind(now)
+                .bind(&pr_emb)
+                .bind(land_at_release && !pr_emb.is_empty())
                 .execute(&mut *c)
                 .await?
                 .rows_affected();
@@ -642,6 +701,7 @@ pub async fn create(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr) -> 
         }
     }
     let id = made.ok_or_else(|| Error::Other(anyhow::anyhow!("no free PR id after 5 tries")))?;
+    crate::events::emit_pr(hub, ask.project.id, &id, "pr.opened").await;
     let pr = visible(hub, ask, &id).await?;
     pr_json(hub, ask, &pr).await
 }
@@ -691,12 +751,12 @@ pub async fn list(hub: &Arc<Hub>, ask: &Ask, q: ListParams) -> Result<Value> {
     // Each PR's current revision's risk as last rated, with the key of the
     // rules it was rated under: rated again under the rules in force where
     // they differ (BUG-1424).
-    type Row = (String, String, String, String, String, String, i64, i32, String, String);
+    type Row = (String, String, String, String, String, String, i64, i32, String, String, String, bool);
     let (rows, count): (Vec<Row>, i64) = if like.is_empty() {
         // Newest first without sorting the classes' PRs: one ordered scan
         // of `prs_by_class` per (class, state), at most a page each, merged.
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT p.id, p.title, pe.name, p.state, r.risk, p.target, p.created_at, p.revision, r.reasons, r.rules_key \
+            "SELECT p.id, p.title, pe.name, p.state, r.risk, p.target, p.created_at, p.revision, r.reasons, r.rules_key, p.embargo, p.land_at_release \
              FROM UNNEST($2::text[]) AS c(class_id) CROSS JOIN UNNEST($3::text[]) AS s(state), \
              LATERAL (SELECT * FROM prs q WHERE q.project_id = $1 AND q.class_id = c.class_id AND q.state = s.state \
                       AND ($4::BIGINT IS NULL OR q.created_at < $4 OR (q.created_at = $4 AND q.id < $5)) \
@@ -733,9 +793,9 @@ pub async fn list(hub: &Arc<Hub>, ask: &Ask, q: ListParams) -> Result<Value> {
     } else {
         // A search reads every PR of the satisfied classes once: the page
         // and the count from one scan.
-        type Counted = (String, String, String, String, String, String, i64, i32, String, String, i64);
+        type Counted = (String, String, String, String, String, String, i64, i32, String, String, String, bool, i64);
         let rows: Vec<Counted> = sqlx::query_as(
-            "SELECT p.id, p.title, pe.name, p.state, r.risk, p.target, p.created_at, p.revision, r.reasons, r.rules_key, p.total FROM ( \
+            "SELECT p.id, p.title, pe.name, p.state, r.risk, p.target, p.created_at, p.revision, r.reasons, r.rules_key, p.embargo, p.land_at_release, p.total FROM ( \
                  SELECT q.*, COUNT(*) OVER () AS total, \
                         ($4::BIGINT IS NULL OR q.created_at < $4 OR (q.created_at = $4 AND q.id < $5)) AS after_cursor \
                  FROM prs q WHERE q.project_id = $1 AND q.class_id = ANY($2) AND q.state = ANY($3) \
@@ -758,7 +818,7 @@ pub async fn list(hub: &Arc<Hub>, ask: &Ask, q: ListParams) -> Result<Value> {
         .fetch_all(&hub.db)
         .await?;
         let count = match rows.first() {
-            Some(r) => r.10,
+            Some(r) => r.12,
             // An empty page (past the end) still counts every match.
             None => sqlx::query_scalar(
                 "SELECT COUNT(*) FROM prs q WHERE q.project_id = $1 AND q.class_id = ANY($2) AND q.state = ANY($3) AND (q.title ILIKE $4 OR q.body ILIKE $4) \
@@ -774,24 +834,31 @@ pub async fn list(hub: &Arc<Hub>, ask: &Ask, q: ListParams) -> Result<Value> {
             .fetch_one(&hub.db)
             .await?,
         };
-        (rows.into_iter().map(|r| (r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9)).collect(), count)
+        (rows.into_iter().map(|r| (r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9, r.10, r.11)).collect(), count)
     };
     let more = rows.len() as i64 > n;
     let rows = &rows[..rows.len().min(n as usize)];
     let next = more.then(|| rows.last().map(|r| format!("{}:{}", r.6, r.0))).flatten();
     let rules = rules(hub, ask).await?;
     let mut risks = Vec::with_capacity(rows.len());
-    for (id, _, _, _, risk, _, _, revision, reasons, rules_key) in rows {
+    for (id, _, _, _, risk, _, _, revision, reasons, rules_key, ..) in rows {
         let which = [(*revision, risk.clone(), serde_json::from_str(reasons).unwrap_or_default(), rules_key.clone())];
         risks.push(rate(hub, ask.project.id, id, &which, &rules).await?.remove(0).0);
     }
     Ok(json!({
         "schema": "veil.prs/1",
         "count": count,
-        "prs": rows.iter().zip(&risks).map(|((id, title, author, state, _, target, created_at, ..), risk)| json!({
-            "id": id, "title": title, "author": author, "state": state, "risk": risk.name(),
-            "target": target, "created_at": created_at,
-        })).collect::<Vec<_>>(),
+        "prs": rows.iter().zip(&risks).map(|((id, title, author, state, _, target, created_at, _, _, _, embargo, land_at_release), risk)| {
+            let mut item = json!({
+                "id": id, "title": title, "author": author, "state": state, "risk": risk.name(),
+                "target": target, "created_at": created_at,
+            });
+            if !embargo.is_empty() {
+                item["embargo"] = json!(embargo);
+                item["land_at_release"] = json!(land_at_release);
+            }
+            item
+        }).collect::<Vec<_>>(),
         "next": next,
         "policy_version": ask.policy_version,
     }))
@@ -813,7 +880,7 @@ pub struct PrDiffParams {
 /// S13 computes it on the viewer's projected history.
 pub async fn diff(hub: &Arc<Hub>, ask: &Ask, id: &str, q: PrDiffParams) -> Result<Value> {
     let pr = visible(hub, ask, id).await?;
-    let (revs, _, vn) = viewer_revisions(hub, ask, &pr.id).await?;
+    let (revs, _, vn) = viewer_revisions(hub, ask, &pr.id, &pr.embargo).await?;
     // The viewer's number: the first real revision of that run.
     let n = q.revision.unwrap_or(vn[&pr.revision]);
     let r = revs.into_iter().find(|r| vn[&r.n] == n).ok_or_else(|| Error::not_found("no such revision of this PR"))?;
@@ -824,8 +891,12 @@ pub async fn diff(hub: &Arc<Hub>, ask: &Ask, id: &str, q: PrDiffParams) -> Resul
             (c.parent_id(), c.snapshot_id())
         }
     };
-    let p = projected(hub, ask, &[from, to]).await?;
-    let mut v = query::diff_pr(hub, ask, p[&from], p[&to], q.stat, Limits::default()).await?;
+    let p = projected(hub, ask, &pr.embargo, &[from, to]).await?;
+    let mut v = if !pr.embargo.is_empty() {
+        embargo::diff(hub, ask, from, to, p[&from], p[&to], q.stat).await?
+    } else {
+        query::diff_pr(hub, ask, p[&from], p[&to], q.stat, Limits::default()).await?
+    };
     v["pr"] = json!(pr.id);
     v["revision"] = json!(n);
     Ok(v)
@@ -857,17 +928,38 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
         return Err(Error::bad_request(format!("a PR has at most {MAX_REVISIONS} revisions; open a new one")));
     }
     let deadline = Instant::now() + DEADLINE;
-    let (_, head) = query::resolve_real(hub, ask, &q.head, deadline).await?;
+    let (head, head_emb) = embargo::resolve_head(hub, ask, &q.head, deadline).await?;
     // The target as the caller sees it (never a withheld one), then its tip.
-    query::resolve(hub, ask, &pr.target, deadline).await.map_err(|_| Error::conflict(format!("the target {} no longer exists", pr.target)))?;
-    let onto = tip(hub, ask.project.id, &pr.target).await?.ok_or_else(|| Error::conflict(format!("the target {} no longer exists", pr.target)))?;
-    let r = compute(hub, ask, head, onto).await?;
-    let (revs, _, vn) = viewer_revisions(hub, ask, &pr.id).await?;
+    let (onto, onto_emb) = embargo::resolve_onto(hub, ask, &pr.target, deadline)
+        .await
+        .map_err(|_| Error::conflict(format!("the target {} no longer exists", pr.target)))?;
+    if pr.embargo.is_empty() {
+        if head_emb.is_some() || onto_emb.is_some() {
+            return Err(Error::conflict("an ordinary PR cannot be updated to an embargoed revision; open an embargoed PR"));
+        }
+    } else {
+        for e in [&head_emb, &onto_emb].into_iter().flatten() {
+            if e != &pr.embargo {
+                return Err(if ask.viewer.admin {
+                    Error::bad_request("a PR belongs to at most one embargo")
+                } else {
+                    not_a_pr()
+                });
+            }
+        }
+    }
+    let r = if pr.embargo.is_empty() {
+        compute(hub, ask, head, onto).await?
+    } else {
+        let rules = rules(hub, ask).await?;
+        embargo::compute(hub, ask, head, onto, onto_emb.is_some(), &pr.embargo, rules).await?
+    };
+    let (revs, _, vn) = viewer_revisions(hub, ask, &pr.id, &pr.embargo).await?;
     let current = revs.iter().find(|x| x.n == pr.revision).cloned().ok_or_else(|| Error::Other(anyhow::anyhow!("the PR's revision is missing")))?;
     // The same revision to the caller (BUG-1254): named by their number,
     // and refused, as a revision only hidden content tells apart would be
     // shown to them as this one anyway.
-    let p = projected(hub, ask, &[current.base, current.head, r.base, r.head]).await?;
+    let p = projected(hub, ask, &pr.embargo, &[current.base, current.head, r.base, r.head]).await?;
     if p[&current.head] == p[&r.head] && p[&current.base] == p[&r.base] {
         return Err(Error::bad_request(format!("that is revision {} already", vn[&pr.revision])));
     }
@@ -905,16 +997,16 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
     .await?;
     let key = class::policy_key(&ask.project.policy);
     let lines = class::lines_of(&ask.project.policy, all.iter().map(String::as_str));
-    let (project, prid, r, old_rev) = (ask.project.id, pr.id.clone(), Arc::new(r), pr.revision);
+    let (project, prid, pr_emb, r, old_rev) = (ask.project.id, pr.id.clone(), pr.embargo.clone(), Arc::new(r), pr.revision);
     let now = veil_core::now_millis();
     let ok = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
-        let (key, lines, prid, r, moved) = (key.clone(), lines.clone(), prid.clone(), r.clone(), moved.clone());
+        let (key, lines, prid, pr_emb, r, moved) = (key.clone(), lines.clone(), prid.clone(), pr_emb.clone(), r.clone(), moved.clone());
         Box::pin(async move {
-            let class = class::put_class(&mut *c, project, &key, &lines).await?;
+            let class = class::put_class_for(&mut *c, project, &key, &lines, &pr_emb).await?;
             // The compare-and-swap: two new revisions at once, one wins.
             let moved_on = sqlx::query(
                 "UPDATE prs SET revision = $1, class_id = $2, policy_key = $3, updated_at = $4 \
-                 WHERE project_id = $5 AND id = $6 AND revision = $7 AND state = 'open'",
+                 WHERE project_id = $5 AND id = $6 AND revision = $7 AND embargo = $8 AND state = 'open'",
             )
             .bind(n)
             .bind(&class)
@@ -923,6 +1015,7 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
             .bind(project)
             .bind(&prid)
             .bind(old_rev)
+            .bind(&pr_emb)
             .execute(&mut *c)
             .await?
             .rows_affected();
@@ -946,6 +1039,7 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
     if !ok {
         return Err(Error::conflict("the PR changed meanwhile; look at it again (`vl pr show`)"));
     }
+    crate::events::emit_pr(hub, ask.project.id, &pr.id, "pr.revision").await;
     show(hub, ask, id).await
 }
 
@@ -953,12 +1047,16 @@ pub async fn close(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Resu
     let me = participant(ask, caller)?;
     let pr = visible(hub, ask, id).await?;
     owner_or_admin(ask, me, &pr)?;
-    sqlx::query("UPDATE prs SET state = 'closed', updated_at = $1 WHERE project_id = $2 AND id = $3 AND state = 'open'")
+    let n = sqlx::query("UPDATE prs SET state = 'closed', updated_at = $1 WHERE project_id = $2 AND id = $3 AND state = 'open'")
         .bind(veil_core::now_millis())
         .bind(ask.project.id)
         .bind(&pr.id)
         .execute(&hub.db)
-        .await?;
+        .await?
+        .rows_affected();
+    if n > 0 {
+        crate::events::emit_pr(hub, ask.project.id, &pr.id, "pr.closed").await;
+    }
     show(hub, ask, id).await
 }
 
@@ -1061,7 +1159,7 @@ async fn people_of(hub: &Hub, ts: &[ThreadMeta], cs: &[CommentMeta]) -> Result<H
 pub async fn threads_json(hub: &Arc<Hub>, ask: &Ask, id: &str, after: Option<&str>) -> Result<Value> {
     let (after_at, after_id) = cursor(after)?;
     let pr = visible(hub, ask, id).await?;
-    let (_, _, vn) = viewer_revisions(hub, ask, &pr.id).await?;
+    let (_, _, vn) = viewer_revisions(hub, ask, &pr.id, &pr.embargo).await?;
     let ts: Vec<ThreadMeta> = sqlx::query_as(
         "SELECT id, anchor, now_at, state, author, created_at FROM pr_threads WHERE project_id = $1 AND pr = $2 \
          AND (created_at > $3 OR (created_at = $3 AND id > $4)) ORDER BY created_at, id LIMIT $5",
@@ -1141,7 +1239,7 @@ pub async fn thread_json(hub: &Arc<Hub>, ask: &Ask, id: &str, thread: &str, afte
     if thread.len() != 12 || !thread.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Error::not_found("no such thread in this PR"));
     }
-    let (_, _, vn) = viewer_revisions(hub, ask, &pr.id).await?;
+    let (_, _, vn) = viewer_revisions(hub, ask, &pr.id, &pr.embargo).await?;
     let t: Option<ThreadMeta> =
         sqlx::query_as("SELECT id, anchor, now_at, state, author, created_at FROM pr_threads WHERE project_id = $1 AND pr = $2 AND id = $3")
             .bind(ask.project.id)
@@ -1246,6 +1344,7 @@ pub async fn new_thread(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q:
     if !made {
         return Err(Error::bad_request(format!("a PR has at most {MAX_THREADS} threads")));
     }
+    crate::events::emit_pr(hub, ask.project.id, &pr.id, "pr.comment").await;
     thread_json(hub, ask, id, &tid_out, None).await
 }
 
@@ -1269,6 +1368,7 @@ pub async fn update_thread(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str,
     if q.body.is_none() && state.is_none() {
         return Err(Error::bad_request("reply with a body, or set the state"));
     }
+    let has_body = q.body.is_some();
     let (project, prid, tid, body, cid) = (ask.project.id, pr.id.clone(), thread.to_string(), q.body.clone(), random_short());
     let now = veil_core::now_millis();
     let found = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
@@ -1318,7 +1418,12 @@ pub async fn update_thread(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str,
     })
     .await?;
     match found {
-        Some(true) => thread_json(hub, ask, id, thread, None).await,
+        Some(true) => {
+            if has_body {
+                crate::events::emit_pr(hub, ask.project.id, &pr.id, "pr.comment").await;
+            }
+            thread_json(hub, ask, id, thread, None).await
+        }
         Some(false) => Err(Error::not_found("no such thread in this PR")),
         None => Err(Error::bad_request(format!("a thread has at most {MAX_COMMENTS} comments"))),
     }
@@ -1373,6 +1478,7 @@ pub async fn add_review(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q:
     if !stored {
         return Err(Error::conflict("the PR changed meanwhile: look at it again"));
     }
+    crate::events::emit_pr(hub, ask.project.id, &pr.id, "pr.review").await;
     show(hub, ask, id).await
 }
 
@@ -1480,7 +1586,7 @@ pub async fn check_landing_review(
         "SELECT p.id, p.author, pe.name, p.title, p.body, p.revision, p.created_at, p.updated_at \
          FROM prs p JOIN pr_revisions r ON r.project_id = p.project_id AND r.pr = p.id AND r.n = p.revision \
          JOIN people pe ON pe.id = p.author \
-         WHERE p.project_id = $1 AND p.target = $2 AND p.state = 'open' AND r.patch = $3 \
+         WHERE p.project_id = $1 AND p.target = $2 AND p.state = 'open' AND p.embargo = '' AND r.patch = $3 \
          ORDER BY p.updated_at DESC, p.id DESC",
     )
     .bind(project.id)
@@ -1505,6 +1611,8 @@ pub async fn check_landing_review(
             revision,
             created_at,
             updated_at,
+            embargo: String::new(),
+            land_at_release: false,
         };
         let revs = rated(hub, project.id, &pr.id, &rules).await?;
         let pr_risk = revs
@@ -1559,12 +1667,28 @@ pub async fn check_landing_review(
     ))
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct LandPr {
+    pub at_release: Option<bool>,
+}
+
 /// Land `pr` through the landing service (S17), after checking its review
 /// gate (S21) and S11's agent rules (`landing::agent_stack`).
 pub async fn land(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Result<Value> {
+    let _ = participant(ask, caller)?;
+    land_with(hub, ask, caller, id, LandPr::default()).await
+}
+
+pub async fn land_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: LandPr) -> Result<Value> {
     let me = participant(ask, caller)?;
     let person = signed_in(caller)?.clone();
     let pr = visible(hub, ask, id).await?;
+    if !pr.embargo.is_empty() {
+        return embargo::land_embargoed(hub, ask, me, &pr, q.at_release).await;
+    }
+    if q.at_release.is_some() {
+        return Err(Error::bad_request("at_release applies only to an embargoed PR"));
+    }
     let paths = review::paths_of(hub, ask.project.id, &pr.id).await?;
     if pr.author != me && !review::writes_all(&ask.project, &ask.viewer, &paths) {
         return Err(Error::forbidden("only the author, or someone who may write every file of this PR, lands it"));
@@ -1588,12 +1712,16 @@ pub async fn land(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Resul
     }
     if judged.stack.is_empty() {
         let now = veil_core::now_millis();
-        sqlx::query("UPDATE prs SET state = 'landed', updated_at = $1 WHERE project_id = $2 AND id = $3 AND state = 'open'")
+        let n = sqlx::query("UPDATE prs SET state = 'landed', updated_at = $1 WHERE project_id = $2 AND id = $3 AND state = 'open'")
             .bind(now)
             .bind(ask.project.id)
             .bind(&pr.id)
             .execute(&hub.db)
-            .await?;
+            .await?
+            .rows_affected();
+        if n > 0 {
+            crate::events::emit_pr(hub, ask.project.id, &pr.id, "pr.landed").await;
+        }
         return show(hub, ask, id).await;
     }
     let who = crate::landing::Submitter {
@@ -1630,12 +1758,16 @@ pub async fn land(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Resul
     match r.state {
         LandState::Landed => {
             let now = veil_core::now_millis();
-            sqlx::query("UPDATE prs SET state = 'landed', updated_at = $1 WHERE project_id = $2 AND id = $3 AND state = 'open'")
+            let n = sqlx::query("UPDATE prs SET state = 'landed', updated_at = $1 WHERE project_id = $2 AND id = $3 AND state = 'open'")
                 .bind(now)
                 .bind(ask.project.id)
                 .bind(&pr.id)
                 .execute(&hub.db)
-                .await?;
+                .await?
+                .rows_affected();
+            if n > 0 {
+                crate::events::emit_pr(hub, ask.project.id, &pr.id, "pr.landed").await;
+            }
             let mut v = show(hub, ask, id).await?;
             v["landing"] = serde_json::to_value(&r).unwrap_or_default();
             Ok(v)
@@ -1662,14 +1794,22 @@ pub async fn land(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Resul
 
 // ---- routes ------------------------------------------------------------------------
 
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct CreatePrRoute {
+    #[serde(flatten)]
+    pub inner: CreatePr,
+    #[serde(default)]
+    pub land_at_release: bool,
+}
+
 pub async fn list_route(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Query(q): Query<ListParams>) -> Result<Json<Value>> {
     let ask = open(&hub, &p, &caller).await?;
     Ok(Json(list(&hub, &ask, q).await?))
 }
 
-pub async fn create_route(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(q): Json<CreatePr>) -> Result<Json<Value>> {
+pub async fn create_route(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(q): Json<CreatePrRoute>) -> Result<Json<Value>> {
     let ask = open(&hub, &p, &caller).await?;
-    Ok(Json(create(&hub, &ask, &caller, q).await?))
+    Ok(Json(create_with(&hub, &ask, &caller, q.inner, q.land_at_release).await?))
 }
 
 pub async fn show_route(State(hub): State<HubState>, caller: Caller, Path((p, id)): Path<(String, String)>) -> Result<Json<Value>> {
@@ -1752,7 +1892,17 @@ pub async fn review_route(
     Ok(Json(add_review(&hub, &ask, &caller, &id, q).await?))
 }
 
-pub async fn land_route(State(hub): State<HubState>, caller: Caller, Path((p, id)): Path<(String, String)>) -> Result<Json<Value>> {
+pub async fn land_route(
+    State(hub): State<HubState>,
+    caller: Caller,
+    Path((p, id)): Path<(String, String)>,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>> {
     let ask = open(&hub, &p, &caller).await?;
-    Ok(Json(land(&hub, &ask, &caller, &id).await?))
+    let q = if body.iter().all(|b| b.is_ascii_whitespace()) {
+        LandPr::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| Error::bad_request(format!("invalid JSON: {e}")))?
+    };
+    Ok(Json(land_with(&hub, &ask, &caller, &id, q).await?))
 }

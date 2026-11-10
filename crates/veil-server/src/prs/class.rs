@@ -67,21 +67,45 @@ pub fn class_id(policy_key: &str, lines: &BTreeSet<String>, embargo: &str) -> St
 
 /// Does the viewer satisfy a class of these lines (and no embargo)?
 pub fn satisfies(view: &View, lines: &BTreeSet<String>, embargo: &str) -> bool {
-    // An embargoed class is S23's: visible to nobody until it is built.
     embargo.is_empty() && (view.admin || lines.iter().all(|l| !l.is_empty() && view.read(l)))
 }
 
-/// Make sure the class row exists (in the caller's transaction).
+/// Does the viewer satisfy a class whose embargo (if non-empty) is in
+/// `visible_embargoes`? Even admins only satisfy an embargoed class when
+/// `embargo` is a real server embargo in `embargo_lines`.
+pub fn satisfies_with_embargoes(
+    view: &View,
+    lines: &BTreeSet<String>,
+    embargo: &str,
+    visible_embargoes: &std::collections::HashSet<String>,
+) -> bool {
+    (embargo.is_empty() || visible_embargoes.contains(embargo))
+        && (view.admin || lines.iter().all(|l| !l.is_empty() && view.read(l)))
+}
+
+/// Make sure the plain (non-embargoed) class row exists (in the caller's transaction).
 pub async fn put_class(c: &mut sqlx::PgConnection, project: i64, policy_key: &str, lines: &BTreeSet<String>) -> Result<String> {
-    let id = class_id(policy_key, lines, "");
+    put_class_for(c, project, policy_key, lines, "").await
+}
+
+/// Make sure the class row (with `embargo`, `""` for none) exists.
+pub async fn put_class_for(
+    c: &mut sqlx::PgConnection,
+    project: i64,
+    policy_key: &str,
+    lines: &BTreeSet<String>,
+    embargo: &str,
+) -> Result<String> {
+    let id = class_id(policy_key, lines, embargo);
     sqlx::query(
-        "INSERT INTO pr_classes (project_id, class_id, policy_key, lines, embargo) VALUES ($1, $2, $3, $4, '') \
+        "INSERT INTO pr_classes (project_id, class_id, policy_key, lines, embargo) VALUES ($1, $2, $3, $4, $5) \
          ON CONFLICT (project_id, class_id) DO NOTHING",
     )
     .bind(project)
     .bind(&id)
     .bind(policy_key)
     .bind(serde_json::to_string(lines).expect("strings"))
+    .bind(embargo)
     .execute(&mut *c)
     .await?;
     Ok(id)
@@ -96,12 +120,17 @@ pub async fn satisfied(hub: &Hub, project: &Project, viewer: &Viewer) -> Result<
             .bind(&key)
             .fetch_all(&hub.db)
             .await?;
+    let visible_embargoes = if rows.iter().any(|(_, _, e)| !e.is_empty()) {
+        super::embargo::visible_embargoes(hub, project, viewer).await?
+    } else {
+        std::collections::HashSet::new()
+    };
     let view = project.view(viewer);
     Ok(rows
         .into_iter()
         .filter(|(_, lines, embargo)| {
             let lines: BTreeSet<String> = serde_json::from_str(lines).unwrap_or_else(|_| BTreeSet::from([String::new()]));
-            satisfies(&view, &lines, embargo)
+            satisfies_with_embargoes(&view, &lines, embargo, &visible_embargoes)
         })
         .map(|(id, _, _)| id)
         .collect())
@@ -115,22 +144,22 @@ const RECLASSIFY_BATCH: i64 = 200;
 /// does nothing unless the lines changed (two empty range scans).
 ///
 /// **Every write of a class is conditional on the inputs it was computed
-/// from** (BUG-1250): the key of the lines it replaces and the PR's
-/// revision, the one thing that changes its paths (only a new revision adds
-/// paths, and it always moves `revision`). A row that changed meanwhile
-/// is left as it is: stale, so visible to nobody until the next request
-/// computes it again; never a class of other paths under these lines.
+/// from** (BUG-1250): the key of the lines it replaces, the PR's revision,
+/// and its `embargo` (S23: a concurrent release clearing `embargo` is never
+/// reverted). A row that changed meanwhile is left as it is: stale, so
+/// visible to nobody until the next request computes it again; never a class
+/// of other paths under these lines.
 /// One pass in id order, so servers that briefly disagree on the lines
 /// never chase each other's writes.
 pub async fn reclassify(hub: &Hub, project: &Project) -> Result<()> {
     let key = policy_key(&project.policy);
     let mut after = String::new();
     loop {
-        let stale: Vec<(String, String, i32)> =
+        let stale: Vec<(String, String, i32, String)> =
             // Range scans of `prs_by_policy`, empty unless the lines changed
             // (`<>` would read every PR's entry).
             sqlx::query_as(
-                "SELECT id, policy_key, revision FROM prs WHERE project_id = $1 AND (policy_key < $2 OR policy_key > $2) AND id > $3 \
+                "SELECT id, policy_key, revision, embargo FROM prs WHERE project_id = $1 AND (policy_key < $2 OR policy_key > $2) AND id > $3 \
                  ORDER BY id LIMIT $4",
             )
             .bind(project.id)
@@ -154,18 +183,22 @@ pub async fn reclassify(hub: &Hub, project: &Project) -> Result<()> {
             by_pr.entry(pr.as_str()).or_default().push(path.as_str());
         }
         let mut c = hub.db.acquire().await?;
-        for (id, old, revision) in &stale {
+        for (id, old, revision, embargo) in &stale {
             let lines = lines_of(&project.policy, by_pr.get(id.as_str()).cloned().unwrap_or_default());
-            let class = put_class(&mut c, project.id, &key, &lines).await?;
-            sqlx::query("UPDATE prs SET class_id = $1, policy_key = $2 WHERE project_id = $3 AND id = $4 AND policy_key = $5 AND revision = $6")
-                .bind(&class)
-                .bind(&key)
-                .bind(project.id)
-                .bind(id)
-                .bind(old)
-                .bind(revision)
-                .execute(&mut *c)
-                .await?;
+            let class = put_class_for(&mut c, project.id, &key, &lines, embargo).await?;
+            sqlx::query(
+                "UPDATE prs SET class_id = $1, policy_key = $2 \
+                 WHERE project_id = $3 AND id = $4 AND policy_key = $5 AND revision = $6 AND embargo = $7",
+            )
+            .bind(&class)
+            .bind(&key)
+            .bind(project.id)
+            .bind(id)
+            .bind(old)
+            .bind(revision)
+            .bind(embargo)
+            .execute(&mut *c)
+            .await?;
         }
     }
 }

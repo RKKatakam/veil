@@ -43,5 +43,6 @@ mod packs;
 mod workspaces;
 mod ci;
 mod embargo;
+mod embargo_prs;
 mod bisect;
 mod pack_gc;
