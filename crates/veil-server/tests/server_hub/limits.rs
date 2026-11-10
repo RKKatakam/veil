@@ -1111,6 +1111,7 @@ fn a_flood_of_landings_from_one_person_or_session_never_delays_another_beyond_th
         project: pid,
         rt: hub.rt.handle().clone(),
         pending: Default::default(),
+        staged: None,
     };
     let tip_hex: String = hub
         .rt
