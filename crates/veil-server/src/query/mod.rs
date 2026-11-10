@@ -1202,13 +1202,7 @@ pub async fn blame(hub: &Arc<Hub>, ask: &Ask, q: BlameParams, limits: Limits) ->
     let start: files::Version = serde_json::from_value(pending.clone()).map_err(|e| Error::Other(e.into()))?;
     let win = seeded_win.lock().unwrap().take();
     match files::wait_for_blame(hub, &ask.project, &ask.viewer, &start, follow, limits.blame, deadline, win).await? {
-        files::JobEnd::Kept(Some((text, bl))) => {
-            let mut ans = files::blame_json_direct(id, &path, follow, &text, &bl, after, n)?;
-            ans["policy_version"] = json!(ask.policy_version);
-            ans["work"] = v["work"].clone();
-            return Ok(ans);
-        }
-        files::JobEnd::Kept(None) => {}
+        files::JobEnd::Kept => {}
         files::JobEnd::NoText => return Err(not_text()),
         files::JobEnd::Failed(status, code, message) => return Err(Error::Api { status, code, message }),
     }

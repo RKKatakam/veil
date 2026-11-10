@@ -1683,19 +1683,18 @@ const KEPT_ENDS: i64 = 4096;
 /// How a blame job ended, for every request waiting on it.
 #[derive(Clone, Debug)]
 pub enum JobEnd {
-    /// Kept (with the in-memory text and blame when computed here, or `None`
-    /// when found already kept in the database).
-    Kept(Option<(Arc<Text>, Arc<Blame>)>),
+    /// Kept in `blame_memo` (re-read by the caller: BUG-1715).
+    Kept,
     /// The version holds no plain text.
     NoText,
     Failed(StatusCode, &'static str, String),
 }
 
 impl JobEnd {
-    fn of(r: Result<Option<Done>>) -> JobEnd {
+    fn of(r: Result<bool>) -> JobEnd {
         match r {
-            Ok(Some(direct)) => JobEnd::Kept(direct),
-            Ok(None) => JobEnd::NoText,
+            Ok(true) => JobEnd::Kept,
+            Ok(false) => JobEnd::NoText,
             Err(Error::Api { status, code, message }) => JobEnd::Failed(status, code, message),
             Err(e) => JobEnd::Failed(StatusCode::INTERNAL_SERVER_ERROR, "internal", format!("{e:?}")),
         }
@@ -2024,7 +2023,7 @@ async fn settled(hub: &crate::Hub, key: &JobKey, limits: BlameLimits) -> Result<
     .fetch_one(&hub.db)
     .await?;
     Ok(if kept {
-        Some(JobEnd::Kept(None))
+        Some(JobEnd::Kept)
     } else if wide {
         Some(JobEnd::too_wide())
     } else {
@@ -2151,14 +2150,13 @@ async fn drop_out_of_use(hub: &crate::Hub, project: i64, in_use: &HashSet<String
 /// How a job's computing ended: kept or not plain text, or too wide (the
 /// message, and the path keys its walk reached).
 enum Outcome {
-    Done(Option<Option<(Arc<Text>, Arc<Blame>)>>),
+    Done(bool),
     TooWide(String, Vec<String>),
 }
 
 /// The job, under its key's lease (`blame_jobs`: one server at a time),
 /// in one of this server's [`BLAME_JOBS`] slots: whether it ended kept
-/// (`None`: no plain text; `Some(Some(_))`: computed here; `Some(None)`:
-/// found already kept in the database). It computes only while it holds the lease
+/// (`false`: no plain text). It computes only while it holds the lease
 /// (BUG-1307): it takes the lease first, keeps renewing it while it waits
 /// for a slot and while it computes, and stops at its next version once a
 /// renewal fails; a job waiting for another server's lease stops as soon
@@ -2175,7 +2173,7 @@ async fn leased_job(
     limits: BlameLimits,
     ticket: &Ticket,
     mut seeded_window: Option<(Window, usize)>,
-) -> Result<Option<Option<(Arc<Text>, Arc<Blame>)>>> {
+) -> Result<bool> {
     let holder = hex::encode(veil_core::crypto::random_bytes::<16>());
     let take = || async {
         let now = veil_core::now_millis();
@@ -2197,8 +2195,8 @@ async fn leased_job(
         Ok::<Option<i64>, Error>(got.map(|_| now))
     };
     let ended = |end: JobEnd| match end {
-        JobEnd::Kept(direct) => Ok(Some(direct)),
-        JobEnd::NoText => Ok(None),
+        JobEnd::Kept => Ok(true),
+        JobEnd::NoText => Ok(false),
         JobEnd::Failed(status, code, message) => Err(Error::Api { status, code, message }),
     };
     let wait = tokio::time::Instant::now() + limits.wait;
@@ -2269,9 +2267,9 @@ async fn leased_job(
         };
         if waited_lease || waited_slot {
             seeded_window = None;
-            if let Some(end) = settled(hub, key, limits).await? {
-                return ended(end).map(Outcome::Done);
-            }
+        }
+        if let Some(end) = settled(hub, key, limits).await? {
+            return ended(end).map(Outcome::Done);
         }
         if !lease.live() {
             return Err(warming());
@@ -2305,7 +2303,7 @@ async fn leased_job(
             let mut b = Blamer::new(&f, &t, follow, limits);
             b.lease = Some(lease);
             match b.blame(&start) {
-                Ok(d) => Ok(Outcome::Done(d.map(Some))),
+                Ok(d) => Ok(Outcome::Done(d.is_some())),
                 Err(Error::Api { code: "too_wide", message, .. }) => {
                     let mut reached: Vec<String> = b.reached.into_iter().collect();
                     reached.sort();
@@ -2345,11 +2343,6 @@ async fn leased_job(
 /// name, newest first (the viewer's generations).
 #[allow(clippy::too_many_arguments)]
 pub fn blame_json(_g: &G, rev: ObjectId, path: &str, follow: bool, text: &Text, b: &Blame, after: usize, n: usize) -> Result<Value> {
-    blame_json_direct(rev, path, follow, text, b, after, n)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn blame_json_direct(rev: ObjectId, path: &str, follow: bool, text: &Text, b: &Blame, after: usize, n: usize) -> Result<Value> {
     let total = text.lines.len();
     let from = after.min(total);
     let to = from.saturating_add(n).min(total);

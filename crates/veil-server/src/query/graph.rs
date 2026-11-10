@@ -268,10 +268,9 @@ impl<'a> G<'a> {
     }
 
     /// Keep `row` of `id`, computed and not written yet (a fill's), for
-    /// the walks of this reader.
+    /// the walks of this reader only (BUG-1714: `hub.query.rows` holds only
+    /// rows whose `view_file_history` and `view_graph` rows are written).
     pub fn keep(&self, id: ObjectId, row: Arc<VRow>) {
-        let k = cache_key(self.cx.project(), self.vk, &id);
-        self.cx.hub().query.rows.insert(k, row.clone(), 320);
         self.local.borrow_mut().insert(id, row);
     }
 
@@ -358,6 +357,10 @@ impl<'a> G<'a> {
                 .bind(&reals)
                 .execute(&hub.db)
             })?;
+            for (i, r, _) in chunk {
+                let k = cache_key(self.cx.project(), self.vk, i);
+                hub.query.rows.insert(k, r.clone(), 320);
+            }
         }
         Ok(())
     }
