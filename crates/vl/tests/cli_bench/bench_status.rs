@@ -111,41 +111,75 @@ fn status_on_20k_files() {
     // Commit, so `status` measures snapshotting a clean working copy rather
     // than listing 20,000 added files.
     let commit = timed(&home, &root, &["commit", "-m", "base"]);
-    let first = timed(&home, &root, &["status"]);
+
+    // 1. Without the watcher (`vl daemon stop`).
+    vl(&home, &root, &["daemon", "stop"]);
+    let first_scan = timed(&home, &root, &["status"]);
     // Let the files written above age past any racy-mtime window.
     std::thread::sleep(Duration::from_millis(2500));
-    let second = timed(&home, &root, &["status"]);
+    let second_scan = timed(&home, &root, &["status"]);
 
-    let unchanged: Vec<Duration> = (0..RUNS).map(|_| timed(&home, &root, &["status"])).collect();
+    let unchanged_scan: Vec<Duration> = (0..RUNS).map(|_| timed(&home, &root, &["status"])).collect();
 
-    let mut touched = Vec::new();
+    let mut touched_scan = Vec::new();
     for rev in 1..=RUNS {
         let p = root.join("src/m100/s2/f07.rs");
         std::fs::write(&p, file_body(100, 2, 7, rev)).unwrap();
-        touched.push(timed(&home, &root, &["status"]));
+        touched_scan.push(timed(&home, &root, &["status"]));
     }
-    let mut touched_cloaked = Vec::new();
+    let mut touched_cloaked_scan = Vec::new();
     for rev in 1..=RUNS {
         let p = root.join("src/m003/s1/f11.rs");
         std::fs::write(&p, file_body(3, 1, 11, rev)).unwrap();
-        touched_cloaked.push(timed(&home, &root, &["status"]));
+        touched_cloaked_scan.push(timed(&home, &root, &["status"]));
+    }
+    let mut commit_scan = Vec::new();
+    for rev in 1..=RUNS {
+        let p = root.join("src/m100/s2/f07.rs");
+        std::fs::write(&p, file_body(100, 2, 7, 100 + rev)).unwrap();
+        commit_scan.push(timed(&home, &root, &["commit", "-m", &format!("scan {rev}")]));
     }
 
+    // 2. With the watcher (`vl daemon start`).
+    vl(&home, &root, &["daemon", "start"]);
+    // First status registers the working copy's watches with the daemon.
+    let register_watch = timed(&home, &root, &["status"]);
+    let unchanged_watched: Vec<Duration> = (0..RUNS).map(|_| timed(&home, &root, &["status"])).collect();
+
+    let mut touched_watched = Vec::new();
+    for rev in 1..=RUNS {
+        let p = root.join("src/m100/s2/f07.rs");
+        std::fs::write(&p, file_body(100, 2, 7, 200 + rev)).unwrap();
+        touched_watched.push(timed(&home, &root, &["status"]));
+    }
+    let mut touched_cloaked_watched = Vec::new();
+    for rev in 1..=RUNS {
+        let p = root.join("src/m003/s1/f11.rs");
+        std::fs::write(&p, file_body(3, 1, 11, 200 + rev)).unwrap();
+        touched_cloaked_watched.push(timed(&home, &root, &["status"]));
+    }
+    let mut commit_watched = Vec::new();
+    for rev in 1..=RUNS {
+        let p = root.join("src/m100/s2/f07.rs");
+        std::fs::write(&p, file_body(100, 2, 7, 300 + rev)).unwrap();
+        commit_watched.push(timed(&home, &root, &["commit", "-m", &format!("watched {rev}")]));
+    }
+    vl(&home, &root, &["daemon", "stop"]);
+
     eprintln!();
-    eprintln!("vl init (first snapshot)        {:8.1} ms", init.as_secs_f64() * 1000.0);
-    eprintln!(
-        "vl commit -m base               {:8.1} ms",
-        commit.as_secs_f64() * 1000.0
-    );
-    eprintln!(
-        "first vl status after commit    {:8.1} ms",
-        first.as_secs_f64() * 1000.0
-    );
-    eprintln!(
-        "second vl status (files aged)   {:8.1} ms",
-        second.as_secs_f64() * 1000.0
-    );
-    eprintln!("status, unchanged tree          {}", stats(unchanged));
-    eprintln!("status, 1 public file edited    {}", stats(touched));
-    eprintln!("status, 1 restricted file edited {}", stats(touched_cloaked));
+    eprintln!("vl init (first snapshot)                  {:8.1} ms", init.as_secs_f64() * 1000.0);
+    eprintln!("vl commit -m base                         {:8.1} ms", commit.as_secs_f64() * 1000.0);
+    eprintln!("first vl status after commit (no watcher) {:8.1} ms", first_scan.as_secs_f64() * 1000.0);
+    eprintln!("second vl status (files aged, no watcher) {:8.1} ms", second_scan.as_secs_f64() * 1000.0);
+    eprintln!("--- Without watcher (full scan) ---");
+    eprintln!("status, unchanged tree                    {}", stats(unchanged_scan));
+    eprintln!("status, 1 public file edited              {}", stats(touched_scan));
+    eprintln!("status, 1 restricted file edited          {}", stats(touched_cloaked_scan));
+    eprintln!("commit, 1 public file edited              {}", stats(commit_scan));
+    eprintln!("--- With watcher (daemon) ---");
+    eprintln!("first status (registers 1,202 watches)    {:8.1} ms", register_watch.as_secs_f64() * 1000.0);
+    eprintln!("status, unchanged tree (watched)          {}", stats(unchanged_watched));
+    eprintln!("status, 1 public file edited (watched)    {}", stats(touched_watched));
+    eprintln!("status, 1 restricted file edited (watched){}", stats(touched_cloaked_watched));
+    eprintln!("commit, 1 public file edited (watched)    {}", stats(commit_watched));
 }

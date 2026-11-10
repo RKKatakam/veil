@@ -45,6 +45,16 @@ use crate::{
 /// Where the CLI keeps the record of the project directory.
 pub const CHECKOUT_STATE_PATH: &str = ".veil/local/checkout.json";
 
+/// What the Veil daemon's file watcher vouched for when `snapshot` was
+/// recorded (or checked out), and the directories whose [`crate::builder::BuildReport`]
+/// items must be rechecked even when unchanged on disk.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct WatchRecord {
+    pub token: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recheck: Vec<VPath>,
+}
+
 /// Which workspace the project directory is attached to, which snapshot was
 /// last materialised there, and what was materialised from what (files left
 /// out because they were unreadable; see [`Materialised`]). Device-local.
@@ -59,6 +69,9 @@ pub struct CheckoutState {
     /// `snapshot` and the target, and belongs to the target's workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<PendingCheckout>,
+    /// The daemon's file-watcher token for `snapshot`, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WatchRecord>,
 }
 
 /// The target of an unfinished move of the project directory.
@@ -75,6 +88,7 @@ impl CheckoutState {
             snapshot,
             materialised,
             pending: None,
+            watch: None,
         }
     }
 
@@ -176,7 +190,14 @@ impl Repo {
         } else {
             CheckoutReport::default()
         };
-        *state = CheckoutState::new(ws, target, record);
+        let keep_watch = (from == to && report.written == 0 && report.removed == 0).then(|| state.watch.take()).flatten();
+        *state = CheckoutState {
+            workspace: ws.to_string(),
+            snapshot: target,
+            materialised: record,
+            pending: None,
+            watch: keep_watch,
+        };
         state.save(fs)?;
         Ok(report)
     }
