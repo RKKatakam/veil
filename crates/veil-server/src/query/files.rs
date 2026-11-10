@@ -76,7 +76,7 @@ pub const CHECKPOINT: u64 = 32;
 const MAX_LINES: usize = MAX_TEXT_BYTES as usize;
 /// Rows of one path read per statement: few first (the version asked for
 /// is usually near), then more.
-const PAGES: [i64; 3] = [64, 512, 1000];
+const PAGES: [i64; 3] = [64, 512, 10_000];
 /// Rows per insert statement.
 const ROWS_PER_STATEMENT: usize = 500;
 /// Rows a fill remembers before it forgets them (they are written by
@@ -340,7 +340,6 @@ impl<'g, 'a> Files<'g, 'a> {
         let (d, s) = w.rows.last().map(|(d, s, _)| (*d, *s)).unwrap_or(w.top);
         let cx = self.g.cx;
         self.g.tick()?;
-        let tm0 = std::time::Instant::now();
         let rows: Vec<(i64, String, String)> = cx.db(|| {
             sqlx::query_as(
                 "SELECT depth, snapshot, change FROM view_file_history WHERE project_id = $1 AND view_key = $2 AND path_key = $3 \
@@ -354,9 +353,7 @@ impl<'g, 'a> Files<'g, 'a> {
             .bind(limit)
             .fetch_all(&cx.hub().db)
         })?;
-        let tm1 = std::time::Instant::now();
         w.done = (rows.len() as i64) < limit;
-        let nrows = rows.len();
         for (d, s, c) in rows {
             self.g.tick()?;
             let s = ObjectId::from_hex(&s).map_err(bad)?;
@@ -367,7 +364,6 @@ impl<'g, 'a> Files<'g, 'a> {
             w.at.insert(s, w.rows.len());
             w.rows.push((d, s, Arc::new(c)));
         }
-        eprintln!("FILES_MORE rows={nrows}: db={:?} parse={:?}", tm1 - tm0, tm1.elapsed());
         Ok(())
     }
 
@@ -827,19 +823,14 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
     /// `None` when it is not plain text. What it kept is written, also
     /// when it fails.
     pub fn blame(&mut self, start: &Version) -> Result<Done> {
-        let t0 = std::time::Instant::now();
         let r = self.run(start);
-        let t1 = std::time::Instant::now();
         let w = self.write();
-        let t2 = std::time::Instant::now();
-        eprintln!("BLAMER: run={:?} write={:?}", t1 - t0, t2 - t1);
         let out = r?;
         w?;
         Ok(out)
     }
 
     fn run(&mut self, start: &Version) -> Result<Done> {
-        let tr0 = std::time::Instant::now();
         self.f.fast_pages.set(self.limits.held >= 4 << 20);
         // Down: the versions to compute, parents before children, each
         // once, stopping at kept blames.
@@ -931,8 +922,8 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         // parent-to-child line diffs are computed in parallel across a bounded
         // pool while keeping memory strictly within `self.limits.held`.
         let unkept: Vec<Version> = order.into_iter().filter(|v| !nodes[v].kept).collect();
-        const CHUNK: usize = 512;
-        const WORKERS: usize = 8;
+        const CHUNK: usize = 2500;
+        const WORKERS: usize = 32;
         let src = &self.t.g.cx.src;
         let load_raw = |e: &Option<TreeEntry>| -> Result<Option<(ObjectId, bytes::Bytes)>> {
             if !texty(e) {
@@ -949,24 +940,59 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             }
             Ok(Some((e.id, raw.slice(10..))))
         };
+        let mut gens: HashMap<ObjectId, i64> = HashMap::new();
+        if self.limits.held >= 4 << 20 && !unkept.is_empty() {
+            let cx = self.f.g.cx;
+            cx.src.rt.block_on(cx.hub().objects.warm_packs(cx.project()))?;
+        }
+        let dummy_meta = Arc::new(Meta {
+            change_id: String::new(),
+            author: String::new(),
+            timestamp: 0,
+            summary: String::new(),
+            generation: 0,
+        });
+        let mut pending_keeps: Vec<(Version, Arc<Blame>)> = Vec::new();
+        let max_chunk = if self.limits.held >= 4 << 20 { CHUNK } else { 512 };
         let mut idx = 0usize;
         let mut chain_last: Option<Version> = None;
         let mut chain_counts: Vec<u32> = Vec::new();
         while idx < unkept.len() {
             self.stopped()?;
-            // Take up to CHUNK versions whose texts fit well within the remaining held budget.
+            // Take up to `max_chunk` versions. For linear single-parent chains
+            // under a normal held budget (`>= 4 MiB`), the worker pool holds only a
+            // sliding window of `WORKERS` texts in memory at once and drops each
+            // version's text as soon as its child's diff is computed.
             let mut end = idx;
             let mut chunk_text_est = 0usize;
-            while end < unkept.len() && end - idx < CHUNK {
-                let sz = nodes[&unkept[end]].change.new.as_ref().map_or(0, |e| {
+            let mut max_entry_sz = 0usize;
+            let mut all_linear = self.limits.held >= 4 << 20;
+            while end < unkept.len() && end - idx < max_chunk {
+                let v = &unkept[end];
+                let n = &nodes[v];
+                let sz = n.change.new.as_ref().map_or(0, |e| {
                     if self.limits.held >= 4 << 20 {
                         e.size as usize + 256
                     } else {
                         e.size as usize * 3 / 2 + 256
                     }
                 });
+                max_entry_sz = max_entry_sz.max(sz);
+                if all_linear {
+                    let linear_step = n.parents.len() <= 1
+                        && n.left <= 1
+                        && (end == idx || n.parents.first().and_then(|p| p.as_ref()) == Some(&unkept[end - 1]));
+                    if !linear_step {
+                        all_linear = false;
+                    }
+                }
+                let est = if all_linear {
+                    max_entry_sz.saturating_mul(WORKERS * 2)
+                } else {
+                    chunk_text_est + sz
+                };
                 let budget_used = held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes();
-                if end > idx && budget_used + chunk_text_est + sz > self.limits.held.saturating_sub(self.limits.held / 8) {
+                if end > idx && budget_used + est > self.limits.held.saturating_sub(self.limits.held / 8) {
                     break;
                 }
                 chunk_text_est += sz;
@@ -974,53 +1000,8 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             }
             let slice = &unkept[idx..end];
             idx = end;
-            // 1. Load texts, snapshot metadata, and parent-to-child line diffs
-            // for all versions in `slice` in a single thread-pool scope.
+            // 1. Load texts and parent-to-child line diffs for all versions in `slice` in a single thread-pool scope.
             self.f.g.tick()?;
-            let budget_now = held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes();
-            let mut missing_metas: Vec<ObjectId> = if budget_now + slice.len() * 512 <= self.limits.held / 2 {
-                slice
-                    .iter()
-                    .map(|v| v.id)
-                    .filter(|id| !self.metas.contains_key(id))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            missing_metas.sort_unstable();
-            missing_metas.dedup();
-            let mut gens: HashMap<ObjectId, i64> = HashMap::with_capacity(missing_metas.len());
-            let mut db_ids: Vec<String> = Vec::new();
-            for &id in &missing_metas {
-                if id == super::graph::root() {
-                    gens.insert(id, 0);
-                } else if let Some(g) = self.f.g.cached_generation(&id) {
-                    gens.insert(id, g);
-                } else {
-                    db_ids.push(id.hex());
-                }
-            }
-            if !db_ids.is_empty() {
-                let cx = self.f.g.cx;
-                let rows: Vec<(String, i64)> = cx.db(|| {
-                    sqlx::query_as("SELECT snapshot, generation FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = ANY($3)")
-                        .bind(cx.project())
-                        .bind(self.f.g.vk)
-                        .bind(&db_ids)
-                        .fetch_all(&cx.hub().db)
-                })?;
-                for (s, g) in rows {
-                    if let Ok(id) = ObjectId::from_hex(&s) {
-                        gens.insert(id, g);
-                    }
-                }
-            }
-            for &id in &missing_metas {
-                if !gens.contains_key(&id) {
-                    gens.insert(id, self.f.g.get(&id)?.generation);
-                }
-            }
-            eprintln!("WALK+GENS: {:?} db_ids={}", tr0.elapsed(), db_ids.len());
             let load_meta = |id: ObjectId, gen: i64| -> Result<(ObjectId, Meta)> {
                 if !src.pending.contains_key(&id) {
                     let raw = src.raw(&id)?;
@@ -1032,29 +1013,23 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                 Ok((id, Meta::of(&sn, gen)))
             };
             let entries: Vec<Option<TreeEntry>> = slice.iter().map(|v| nodes[v].change.new.clone()).collect();
-            let first_idx = entries.iter().position(texty);
-            let base_text: Option<Arc<Text>> = match first_idx {
-                None => None,
-                Some(fi) => match load_raw(&entries[fi])? {
-                    None => None,
-                    Some((id, bytes)) => {
-                        let parent_done = nodes[&slice[fi]]
-                            .parents
-                            .iter()
-                            .flatten()
-                            .find_map(|p| done.get(p).and_then(|d| d.as_ref().map(|(t, _)| t)));
-                        match parent_done {
-                            Some(pt) => Text::try_plain_from_parent(id, bytes, pt),
-                            None => Text::try_plain(id, bytes),
-                        }
-                    }
-                },
-            };
-            let mut slice_idx: HashMap<Version, usize> = HashMap::with_capacity(slice.len());
+            let parent_done: Option<Arc<Text>> = entries.iter().position(texty).and_then(|fi| {
+                nodes[&slice[fi]]
+                    .parents
+                    .iter()
+                    .flatten()
+                    .find_map(|p| done.get(p).and_then(|d| d.as_ref().map(|(t, _)| t.clone())))
+            });
+            let mut slice_idx: HashMap<&Version, usize> = HashMap::with_capacity(slice.len());
             for (vi, v) in slice.iter().enumerate() {
-                slice_idx.insert(v.clone(), vi);
+                slice_idx.insert(v, vi);
             }
-            let mut diff_specs: Vec<(Version, usize, usize, Option<usize>, Option<Arc<Text>>)> = Vec::new();
+            let mut diff_specs: Vec<(usize, usize, Option<usize>, Option<Arc<Text>>)> = Vec::new();
+            let mut uses_left: Vec<usize> = slice
+                .iter()
+                .enumerate()
+                .map(|(vi, v)| if vi + 1 == slice.len() || nodes[v].left > 1 || *v == *start { 1 } else { 0 })
+                .collect();
             for (vi, v) in slice.iter().enumerate() {
                 if !texty(&entries[vi]) {
                     continue;
@@ -1063,147 +1038,144 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                     let Some(p) = p else { continue };
                     if let Some(&p_idx) = slice_idx.get(p) {
                         if texty(&entries[p_idx]) {
-                            diff_specs.push((v.clone(), pi, vi, Some(p_idx), None));
+                            diff_specs.push((vi, pi, Some(p_idx), None));
+                            uses_left[vi] += 1;
+                            uses_left[p_idx] += 1;
                         }
                     } else if let Some(pt) = done.get(p).and_then(|d| d.as_ref().map(|(t, _)| t.clone())) {
-                        diff_specs.push((v.clone(), pi, vi, None, Some(pt)));
+                        diff_specs.push((vi, pi, None, Some(pt)));
+                        uses_left[vi] += 1;
                     }
                 }
             }
-            let mut chunk_texts: HashMap<Version, Option<Arc<Text>>> = HashMap::with_capacity(slice.len());
-            let mut pre_maps: HashMap<(Version, usize), crate::derive::blame::ParentMap> = HashMap::with_capacity(diff_specs.len());
-            if slice.len() <= 2 && missing_metas.len() <= 2 && diff_specs.len() <= 1 {
-                let mut built_texts: Vec<Option<Arc<Text>>> = Vec::with_capacity(slice.len());
-                for (i, e) in entries.iter().enumerate() {
-                    if Some(i) == first_idx {
-                        built_texts.push(base_text.clone());
-                    } else {
-                        let t = load_raw(e)?.and_then(|(id, bytes)| match &base_text {
-                            Some(bt) => Text::try_plain_from_parent(id, bytes, bt),
-                            None => Text::try_plain(id, bytes),
-                        });
-                        built_texts.push(t);
+            // Stored per version: `Some((id, line_count))` if plain text, plus `Option<Arc<Text>>` if retained past the chunk.
+            let mut chunk_info: Vec<Option<(ObjectId, usize, Option<Arc<Text>>)>> = Vec::with_capacity(slice.len());
+            let mut pre_maps: Vec<Vec<Option<crate::derive::blame::ParentMap>>> = slice.iter().map(|v| vec![None; nodes[v].parents.len()]).collect();
+            if slice.len() <= 2 && diff_specs.len() <= 1 {
+                let mut loaded: Vec<Option<Arc<Text>>> = Vec::with_capacity(slice.len());
+                let mut prev_text: Option<Arc<Text>> = parent_done.clone();
+                for e in &entries {
+                    let t = load_raw(e)?.and_then(|(id, bytes)| match &prev_text {
+                        Some(bt) => Text::try_plain_from_parent(id, bytes, bt),
+                        None => Text::try_plain(id, bytes),
+                    });
+                    if let Some(ref tr) = t {
+                        prev_text = Some(tr.clone());
                     }
+                    loaded.push(t);
                 }
-                for &id in &missing_metas {
-                    let (id, m) = load_meta(id, gens[&id])?;
-                    self.metas.insert(id, Arc::new(m));
-                }
-                for (v, pi, vi, p_idx, done_pt) in diff_specs {
-                    let child_opt = built_texts[vi].as_ref();
+                for (vi, pi, p_idx, done_pt) in diff_specs {
+                    let child_opt = loaded[vi].as_ref();
                     let parent_opt = match p_idx {
-                        Some(pi_idx) => built_texts[pi_idx].as_ref(),
+                        Some(pi_idx) => loaded[pi_idx].as_ref(),
                         None => done_pt.as_ref(),
                     };
                     if let (Some(pt), Some(text)) = (parent_opt, child_opt) {
-                        pre_maps.insert((v, pi), crate::derive::blame::diff_parent(pt, text));
+                        pre_maps[vi][pi] = Some(crate::derive::blame::diff_parent(pt, text));
                     }
                 }
-                for (v, text) in slice.iter().zip(built_texts) {
-                    chunk_texts.insert(v.clone(), text);
+                for t in loaded {
+                    chunk_info.push(t.map(|arc| (arc.id, arc.lines.len(), Some(arc))));
                 }
             } else {
-                let tp0 = std::time::Instant::now();
-                let n_workers = WORKERS.min(slice.len().max(missing_metas.len()).max(diff_specs.len()).max(1));
-                let barrier = std::sync::Barrier::new(n_workers);
-                let next_s = std::sync::atomic::AtomicUsize::new(0);
-                let next_d = std::sync::atomic::AtomicUsize::new(0);
-                let out_t: Vec<std::sync::Mutex<Option<Result<Option<Arc<Text>>>>>> = (0..slice.len()).map(|_| std::sync::Mutex::new(None)).collect();
-                let out_s: Vec<std::sync::Mutex<Option<Result<(ObjectId, Meta)>>>> = (0..missing_metas.len()).map(|_| std::sync::Mutex::new(None)).collect();
+                let n_workers = WORKERS.min(slice.len().max(diff_specs.len()).max(1));
+                let next_i = std::sync::atomic::AtomicUsize::new(0);
+                let diffs_done = std::sync::atomic::AtomicUsize::new(0);
+                let out_meta: Vec<std::sync::OnceLock<Result<Option<(ObjectId, usize)>>>> = (0..slice.len()).map(|_| std::sync::OnceLock::new()).collect();
+                let out_text: Vec<std::sync::Mutex<Option<Arc<Text>>>> = (0..slice.len()).map(|_| std::sync::Mutex::new(None)).collect();
+                let rem_uses: Vec<std::sync::atomic::AtomicUsize> = uses_left.iter().map(|&u| std::sync::atomic::AtomicUsize::new(u)).collect();
                 let out_d: Vec<std::sync::Mutex<Option<crate::derive::blame::ParentMap>>> = (0..diff_specs.len()).map(|_| std::sync::Mutex::new(None)).collect();
-                let base_ref = &base_text;
-                let gens_ref = &gens;
+                let mut diffs_by_max: Vec<Vec<usize>> = vec![Vec::new(); slice.len()];
+                for (di, &(vi, _, p_idx, _)) in diff_specs.iter().enumerate() {
+                    let trigger = p_idx.map_or(vi, |pi| vi.max(pi));
+                    diffs_by_max[trigger].push(di);
+                }
+                let base_ref = &parent_done;
                 let specs_ref = &diff_specs;
-                let stride = entries.len().div_ceil(n_workers).max(1);
-                let worker_seq = std::sync::atomic::AtomicUsize::new(0);
-                let max_t_ns = std::sync::atomic::AtomicU64::new(0);
-                let max_s_ns = std::sync::atomic::AtomicU64::new(0);
-                let max_d_ns = std::sync::atomic::AtomicU64::new(0);
+                let by_max_ref = &diffs_by_max;
+                let get_text = |idx: usize| -> Option<Arc<Text>> {
+                    loop {
+                        if let Some(res) = out_meta[idx].get() {
+                            if res.as_ref().ok().and_then(|o| *o).is_none() {
+                                return None;
+                            }
+                            return out_text[idx].lock().unwrap().clone();
+                        }
+                        std::hint::spin_loop();
+                    }
+                };
+                let release_use = |idx: usize| {
+                    if rem_uses[idx].fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                        *out_text[idx].lock().unwrap() = None;
+                    }
+                };
                 std::thread::scope(|s| {
                     for _ in 0..n_workers {
                         s.spawn(|| {
-                            let w_id = worker_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let start_i = w_id * stride;
-                            let end_i = ((w_id + 1) * stride).min(entries.len());
                             let mut prev_text: Option<Arc<Text>> = base_ref.clone();
-                            let wt0 = std::time::Instant::now();
-                            for i in start_i..end_i {
-                                let r = if Some(i) == first_idx {
-                                    Ok(base_ref.clone())
-                                } else {
-                                    load_raw(&entries[i]).map(|opt| {
-                                        opt.and_then(|(id, bytes)| match &prev_text {
-                                            Some(bt) => Text::try_plain_from_parent(id, bytes, bt),
-                                            None => Text::try_plain(id, bytes),
-                                        })
+                            loop {
+                                let i = next_i.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if i >= entries.len() {
+                                    break;
+                                }
+                                if all_linear {
+                                    while i > diffs_done.load(std::sync::atomic::Ordering::Acquire) + WORKERS * 2 {
+                                        std::hint::spin_loop();
+                                    }
+                                }
+                                let r = load_raw(&entries[i]).map(|opt| {
+                                    opt.and_then(|(id, bytes)| match &prev_text {
+                                        Some(bt) => Text::try_plain_from_parent(id, bytes, bt),
+                                        None => Text::try_plain(id, bytes),
                                     })
+                                });
+                                let meta_res = match r {
+                                    Ok(Some(t)) => {
+                                        let m = Some((t.id, t.lines.len()));
+                                        prev_text = Some(t.clone());
+                                        if rem_uses[i].load(std::sync::atomic::Ordering::Acquire) > 0 {
+                                            *out_text[i].lock().unwrap() = Some(t);
+                                        }
+                                        Ok(m)
+                                    }
+                                    Ok(None) => Ok(None),
+                                    Err(e) => Err(e),
                                 };
-                                if let Ok(Some(ref t)) = r {
-                                    prev_text = Some(t.clone());
-                                }
-                                *out_t[i].lock().unwrap() = Some(r);
-                            }
-                            max_t_ns.fetch_max(wt0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-                            let ws0 = std::time::Instant::now();
-                            loop {
-                                let j = next_s.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if j >= missing_metas.len() {
-                                    break;
-                                }
-                                let id = missing_metas[j];
-                                let r = load_meta(id, gens_ref[&id]);
-                                *out_s[j].lock().unwrap() = Some(r);
-                            }
-                            max_s_ns.fetch_max(ws0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-                            barrier.wait();
-                            let wd0 = std::time::Instant::now();
-                            loop {
-                                let k = next_d.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if k >= specs_ref.len() {
-                                    break;
-                                }
-                                let (_, _, vi, p_idx, ref done_pt) = specs_ref[k];
-                                let child_opt = out_t[vi].lock().unwrap().as_ref().unwrap().as_ref().ok().and_then(|o| o.clone());
-                                let parent_opt = match p_idx {
-                                    Some(pi_idx) => out_t[pi_idx].lock().unwrap().as_ref().unwrap().as_ref().ok().and_then(|o| o.clone()),
-                                    None => done_pt.clone(),
-                                };
-                                if let (Some(pt), Some(text)) = (parent_opt, child_opt) {
-                                    let m = crate::derive::blame::diff_parent(&pt, &text);
-                                    *out_d[k].lock().unwrap() = Some(m);
+                                let _ = out_meta[i].set(meta_res);
+                                for &di in &by_max_ref[i] {
+                                    let (vi, _, p_idx, ref done_pt) = specs_ref[di];
+                                    let child_opt = get_text(vi);
+                                    let parent_opt = match p_idx {
+                                        Some(pi_idx) => get_text(pi_idx),
+                                        None => done_pt.clone(),
+                                    };
+                                    if let (Some(pt), Some(text)) = (parent_opt, child_opt) {
+                                        let m = crate::derive::blame::diff_parent(&pt, &text);
+                                        *out_d[di].lock().unwrap() = Some(m);
+                                    }
+                                    release_use(vi);
+                                    if let Some(pi_idx) = p_idx {
+                                        release_use(pi_idx);
+                                    }
+                                    diffs_done.fetch_add(1, std::sync::atomic::Ordering::Release);
                                 }
                             }
-                            max_d_ns.fetch_max(wd0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                         });
                     }
                 });
-                let n_rep = out_d.iter().filter(|m| matches!(m.lock().unwrap().as_ref(), Some(crate::derive::blame::ParentMap::Replaced { .. }))).count();
-                let n_trim = out_d.iter().filter(|m| matches!(m.lock().unwrap().as_ref(), Some(crate::derive::blame::ParentMap::Trimmed { .. }))).count();
-                eprintln!(
-                    "POOL slice={}: total={:?} max_t={:?} max_s={:?} max_d={:?} rep={n_rep} trim={n_trim}",
-                    slice.len(),
-                    tp0.elapsed(),
-                    std::time::Duration::from_nanos(max_t_ns.load(std::sync::atomic::Ordering::Relaxed)),
-                    std::time::Duration::from_nanos(max_s_ns.load(std::sync::atomic::Ordering::Relaxed)),
-                    std::time::Duration::from_nanos(max_d_ns.load(std::sync::atomic::Ordering::Relaxed)),
-                );
-                for m in out_s {
-                    let (id, meta) = m.into_inner().unwrap().unwrap()?;
-                    self.metas.insert(id, Arc::new(meta));
+                for (m, t_lock) in out_meta.into_iter().zip(out_text) {
+                    let meta_opt = m.into_inner().unwrap()?;
+                    let t_opt = t_lock.into_inner().unwrap();
+                    chunk_info.push(meta_opt.map(|(id, n_lines)| (id, n_lines, t_opt)));
                 }
-                for (v, m) in slice.iter().zip(out_t) {
-                    let text = m.into_inner().unwrap().unwrap()?;
-                    chunk_texts.insert(v.clone(), text);
-                }
-                for ((v, pi, _, _, _), m) in diff_specs.into_iter().zip(out_d) {
+                for ((vi, pi, _, _), m) in diff_specs.into_iter().zip(out_d) {
                     if let Some(pm) = m.into_inner().unwrap() {
-                        pre_maps.insert((v, pi), pm);
+                        pre_maps[vi][pi] = Some(pm);
                     }
                 }
             }
-            // 3. Propagate blames sequentially in topological order and maintain exact held accounting.
-            let mut pending_keeps: Vec<(Version, Arc<Blame>)> = Vec::new();
-            for v in slice {
+            // 2. Propagate blames sequentially in topological order and maintain exact held accounting.
+            for (vi, v) in slice.iter().enumerate() {
                 let parents = nodes[v].parents.clone();
                 // If `v` has a single parent `p` whose blame is ready to be
                 // consumed (`pn.left == 1 && p != start`), take `p` from `done`
@@ -1223,26 +1195,31 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                         }
                     }
                 }
-                let out: Done = match chunk_texts.remove(v).flatten() {
+                let out: Done = match chunk_info[vi].take() {
                     None => {
                         chain_last = None;
                         chain_counts.clear();
                         None
                     }
-                    Some(text) => {
+                    Some((text_id, n_lines, opt_text)) => {
                         self.stopped()?;
                         if parents.len() != 1 || parents[0].as_ref() != chain_last.as_ref() {
                             chain_counts.clear();
                         }
-                        let me: Origin = (v.id, self.intern(&v.path), self.meta(&v.id)?);
+                        let meta_for_v = if self.limits.held >= 4 << 20 {
+                            self.metas.get(&v.id).cloned().unwrap_or_else(|| dummy_meta.clone())
+                        } else {
+                            self.meta(&v.id)?
+                        };
+                        let me: Origin = (v.id, self.intern(&v.path), meta_for_v);
                         let b: Arc<Blame> = if let Some((ref p, Some((_, mut pb_arc)))) = single_taken.take() {
-                            if let Some(pm) = pre_maps.remove(&(v.clone(), 0)) {
+                            if let Some(pm) = pre_maps[vi][0].take() {
                                 let pb_mut = Arc::make_mut(&mut pb_arc);
-                                crate::derive::blame::step_mapped_in_place(pb_mut, &me, text.lines.len(), &pm, &mut chain_counts);
+                                crate::derive::blame::step_mapped_in_place(pb_mut, &me, n_lines, &pm, &mut chain_counts);
                                 pb_arc
                             } else {
                                 let inputs = [None];
-                                let (b, _) = crate::derive::blame::step_mapped_with_counts(&me, text.lines.len(), &inputs, &mut chain_counts);
+                                let (b, _) = crate::derive::blame::step_mapped_with_counts(&me, n_lines, &inputs, &mut chain_counts);
                                 let _ = p;
                                 Arc::new(b)
                             }
@@ -1253,11 +1230,11 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                                 .map(|(pi, p)| {
                                     let p = p.as_ref()?;
                                     let (_, pb) = done.get(p)?.as_ref()?;
-                                    let pm = pre_maps.remove(&(v.clone(), pi))?;
+                                    let pm = pre_maps[vi][pi].take()?;
                                     Some((&**pb, pm))
                                 })
                                 .collect();
-                            let (b, _) = crate::derive::blame::step_mapped_with_counts(&me, text.lines.len(), &inputs, &mut chain_counts);
+                            let (b, _) = crate::derive::blame::step_mapped_with_counts(&me, n_lines, &inputs, &mut chain_counts);
                             Arc::new(b)
                         };
                         chain_last = Some(v.clone());
@@ -1270,6 +1247,13 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                                 return Err(too_large());
                             }
                         }
+                        let text = opt_text.unwrap_or_else(|| {
+                            Arc::new(Text {
+                                id: text_id,
+                                data: bytes::Bytes::new(),
+                                lines: Vec::new(),
+                            })
+                        });
                         Some((text, b))
                     }
                 };
@@ -1298,7 +1282,96 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                     self.write()?;
                 }
             }
-            if !pending_keeps.is_empty() {
+            if !pending_keeps.is_empty() && (idx == unkept.len() || pending_keeps.len() >= BATCH_BLAMES) {
+                let mut needed_ids: Vec<ObjectId> = Vec::new();
+                for (_, kb) in &pending_keeps {
+                    for &(o, _) in &kb.lines {
+                        let (oid, _, m) = &kb.origins[o as usize];
+                        if Arc::ptr_eq(m, &dummy_meta) && !self.metas.contains_key(oid) {
+                            needed_ids.push(*oid);
+                        }
+                    }
+                }
+                needed_ids.sort_unstable();
+                needed_ids.dedup();
+                if !needed_ids.is_empty() {
+                    let mut db_ids: Vec<String> = Vec::new();
+                    for &id in &needed_ids {
+                        if gens.contains_key(&id) {
+                            continue;
+                        } else if id == super::graph::root() {
+                            gens.insert(id, 0);
+                        } else if let Some(g) = self.f.g.cached_generation(&id) {
+                            gens.insert(id, g);
+                        } else {
+                            db_ids.push(id.hex());
+                        }
+                    }
+                    if !db_ids.is_empty() {
+                        let cx = self.f.g.cx;
+                        let rows: Vec<(String, i64)> = cx.db(|| {
+                            sqlx::query_as("SELECT snapshot, generation FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = ANY($3)")
+                                .bind(cx.project())
+                                .bind(self.f.g.vk)
+                                .bind(&db_ids)
+                                .fetch_all(&cx.hub().db)
+                        })?;
+                        for (s, g) in rows {
+                            if let Ok(id) = ObjectId::from_hex(&s) {
+                                gens.insert(id, g);
+                            }
+                        }
+                    }
+                    for &id in &needed_ids {
+                        if !gens.contains_key(&id) {
+                            gens.insert(id, self.f.g.get(&id)?.generation);
+                        }
+                    }
+                    if needed_ids.len() <= 2 {
+                        for &id in &needed_ids {
+                            let (id, m) = load_meta(id, gens[&id])?;
+                            self.metas.insert(id, Arc::new(m));
+                        }
+                    } else {
+                        let n_m = WORKERS.min(needed_ids.len());
+                        let next_m = std::sync::atomic::AtomicUsize::new(0);
+                        let out_m: Vec<std::sync::Mutex<Option<Result<(ObjectId, Meta)>>>> = (0..needed_ids.len()).map(|_| std::sync::Mutex::new(None)).collect();
+                        let gens_ref = &gens;
+                        let ids_ref = &needed_ids;
+                        std::thread::scope(|s| {
+                            for _ in 0..n_m {
+                                s.spawn(|| loop {
+                                    let j = next_m.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if j >= ids_ref.len() {
+                                        break;
+                                    }
+                                    let id = ids_ref[j];
+                                    let r = load_meta(id, gens_ref[&id]);
+                                    *out_m[j].lock().unwrap() = Some(r);
+                                });
+                            }
+                        });
+                        for m in out_m {
+                            let (id, meta) = m.into_inner().unwrap().unwrap()?;
+                            self.metas.insert(id, Arc::new(meta));
+                        }
+                    }
+                }
+                for (kv, kb) in &mut pending_keeps {
+                    if kb.origins.iter().any(|(_, _, m)| Arc::ptr_eq(m, &dummy_meta)) {
+                        let b_mut = Arc::make_mut(kb);
+                        for (oid, _, m) in &mut b_mut.origins {
+                            if Arc::ptr_eq(m, &dummy_meta) {
+                                if let Some(found) = self.metas.get(oid) {
+                                    *m = found.clone();
+                                }
+                            }
+                        }
+                        if let Some(Some((_, ref mut done_b))) = done.get_mut(kv) {
+                            *done_b = kb.clone();
+                        }
+                    }
+                }
                 let encoded: Vec<Vec<u8>> = if pending_keeps.len() == 1 {
                     let p_keys = &self.path_keys;
                     vec![pending_keeps[0].1.encode(|p| {
@@ -1338,7 +1411,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                     });
                     out_k.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect()
                 };
-                for ((kv, kb), raw) in pending_keeps.into_iter().zip(encoded) {
+                for ((kv, kb), raw) in std::mem::take(&mut pending_keeps).into_iter().zip(encoded) {
                     if !self.keep_encoded(&kv, &kb, raw) && kv == *start {
                         return Err(too_large());
                     }
@@ -1354,7 +1427,6 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                 }
             }
         }
-        eprintln!("RUN_TOTAL: {:?}", tr0.elapsed());
         Ok(done.remove(start).flatten())
     }
 
@@ -1434,7 +1506,6 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         self.pending_bytes = 0;
         let cx = self.f.g.cx;
         let (pool, project, vk) = (&cx.hub().db, cx.project(), self.f.g.vk);
-        let tw0 = std::time::Instant::now();
         let (pk, pp): (Vec<String>, Vec<String>) = paths.into_iter().unzip();
         for (k, p) in pk.chunks(ROWS_PER_STATEMENT).zip(pp.chunks(ROWS_PER_STATEMENT)) {
             cx.db(|| {
@@ -1445,7 +1516,6 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                     .execute(pool)
             })?;
         }
-        let tw1 = std::time::Instant::now();
         let now = veil_core::now_millis();
         let keys: Vec<&str> = w.iter().map(|r| r.0.as_str()).collect();
         let snaps: Vec<String> = w.iter().map(|r| r.1.hex()).collect();
@@ -1470,7 +1540,6 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             .bind(&named)
             .execute(pool)
         })?;
-        let tw2 = std::time::Instant::now();
         let mut kept_paths: Vec<&str> = keys.clone();
         kept_paths.sort_unstable();
         kept_paths.dedup();
@@ -1485,8 +1554,6 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             .bind(&kept_paths)
             .execute(pool)
         })?;
-        let tw3 = std::time::Instant::now();
-        eprintln!("WRITE_STMTS rows={} bytes={}: paths={:?} memo={:?} ends={:?}", w.len(), batch_sum, tw1 - tw0, tw2 - tw1, tw3 - tw2);
         let prev_total = match self.total_kept_bytes {
             Some(t) => t,
             None => cx.db(|| {

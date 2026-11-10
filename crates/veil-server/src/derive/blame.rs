@@ -556,6 +556,23 @@ pub fn step_mapped_in_place(
         for &(o, _) in &cur.lines {
             counts[o as usize] += 1;
         }
+        if cur.origins.len() > 1 && counts.iter().any(|&c| c == 0) {
+            let mut remap = vec![0u32; cur.origins.len()];
+            let mut new_origins = Vec::with_capacity(cur.origins.len());
+            let mut new_counts = Vec::with_capacity(cur.origins.len());
+            for (old_o, orig) in std::mem::take(&mut cur.origins).into_iter().enumerate() {
+                if counts[old_o] > 0 {
+                    remap[old_o] = new_origins.len() as u32;
+                    new_origins.push(orig);
+                    new_counts.push(counts[old_o]);
+                }
+            }
+            for (lo, _) in &mut cur.lines {
+                *lo = remap[*lo as usize];
+            }
+            cur.origins = new_origins;
+            *counts = new_counts;
+        }
     }
     match pm {
         ParentMap::Same if cur.lines.len() == n => {

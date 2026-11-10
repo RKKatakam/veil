@@ -626,6 +626,15 @@ impl Objects {
         self.packs.locate(&self.store, project, id, again, since, &self.reads).await
     }
 
+    /// Ensure `project`'s listed packs have been loaded at least once on this
+    /// server so concurrent lookups do not queue on the listing mutex.
+    pub async fn warm_packs(&self, project: i64) -> Result<()> {
+        if matches!(self.packs.find(project, &ObjectId([0; 32])), Found::Unloaded) {
+            self.packs.refresh(&self.store, project, Instant::now(), &self.reads).await?;
+        }
+        Ok(())
+    }
+
     /// Bytes `start..=end` of the encoding of object `id` at slot `s` of
     /// pack `name` (clamped), read with a range request, **after the head
     /// the entry starts with is checked against the slot** (its id and its
