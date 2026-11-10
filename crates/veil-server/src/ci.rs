@@ -65,7 +65,7 @@ pub async fn ci_session(
         if let Some(check) = &req.check {
             let (project, _) = perm::open(&hub, &req.project, &caller).await?;
             let default_tip = branch_tip(&hub, project.id, &project.default_branch).await?;
-            let rules = sync::blocking(&hub, project.id, move |src| crate::landing::rules(&src, default_tip)).await?;
+            let rules = sync::blocking(&hub, project.id, move |src| crate::landing::rules(src, default_tip)).await?;
             if let Some(paths) = rules.checks.get(check) {
                 only = paths.clone();
             }
@@ -395,7 +395,7 @@ async fn readable_footprint(
     let mut effective_only: Option<Vec<String>> = viewer.only.as_ref().map(|o| (**o).clone());
     if effective_only.is_none() {
         let default_tip = branch_tip(hub, project.id, &project.default_branch).await?;
-        let rules = sync::blocking(hub, project.id, move |src| crate::landing::rules(&src, default_tip)).await?;
+        let rules = sync::blocking(hub, project.id, move |src| crate::landing::rules(src, default_tip)).await?;
         if let Some(paths) = rules.checks.get(check_name) {
             if !paths.is_empty() {
                 effective_only = Some(paths.clone());
@@ -431,7 +431,7 @@ async fn readable_footprint(
             let tree_id = src.snapshot(&real_id)?.tree;
             let mut present = Vec::new();
             for rp in &rule_paths {
-                if crate::sync::entry_at(&src, &tree_id, rp)?.is_some() {
+                if crate::sync::entry_at(src, &tree_id, rp)?.is_some() {
                     present.push(rp.clone());
                 }
             }
@@ -638,7 +638,7 @@ pub async fn advance_tested(hub: &Arc<Hub>, project: &Project) -> Result<()> {
     let branches_for_walk = branches.clone();
     let cur_for_walk = cur_map.clone();
     let (rules, chains) = sync::blocking(hub, project.id, move |src| {
-        let rules = crate::landing::rules(&src, default_tip)?;
+        let rules = crate::landing::rules(src, default_tip)?;
         let root = sync::root_snapshot_id();
         let mut chains: BTreeMap<String, (i64, Vec<(ObjectId, i64)>)> = BTreeMap::new();
         for (name, target_hex, lineage) in branches_for_walk {
@@ -688,7 +688,7 @@ pub async fn advance_tested(hub: &Arc<Hub>, project: &Project) -> Result<()> {
     .await?;
 
     let mut all_cands: HashSet<String> = HashSet::new();
-    for (_, (_, chain)) in &chains {
+    for (_, chain) in chains.values() {
         for (id, _) in chain {
             all_cands.insert(id.hex());
         }
