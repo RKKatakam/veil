@@ -457,13 +457,70 @@ mod client {
         request(s, &req, &|id| wanted.contains(id)).0
     }
 
+    /// Read `watch` (`bool` or `[watch]`) from `$VEIL_HOME/config.toml` and
+    /// `.veil/local/config.toml` (where the repository's setting wins).
+    /// Returns `None` when watching is turned off (`watch = false` or
+    /// `watch.enabled = false`), else `(max_dirs, max_dirty_paths)`.
+    fn watch_config(root: &std::path::Path) -> Option<(Option<usize>, Option<usize>)> {
+        let mut enabled = true;
+        let mut max_dirs = None;
+        let mut max_dirty_paths = None;
+        let files = [
+            crate::ctx::veil_home().join(crate::attr_cmd::CONFIG_FILE),
+            veil_core::repo::state_dir(root).join("local").join(crate::attr_cmd::CONFIG_FILE),
+        ];
+        for file in files {
+            let Ok(meta) = std::fs::symlink_metadata(&file) else { continue };
+            if !meta.is_file() || meta.len() > 1 << 20 {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&file) else { continue };
+            let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else { continue };
+            let Some(item) = doc.get("watch") else { continue };
+            if let Some(b) = item.as_bool() {
+                enabled = b;
+                continue;
+            }
+            if let Some(t) = item.as_table_like() {
+                if let Some(b) = t.get("enabled").and_then(|v| v.as_bool()) {
+                    enabled = b;
+                }
+                if let Some(n) = t.get("max_dirs").or_else(|| t.get("max-dirs")).and_then(|v| v.as_integer()) {
+                    if let Ok(u) = usize::try_from(n) {
+                        max_dirs = Some(u);
+                    }
+                }
+                if let Some(n) = t
+                    .get("max_dirty_paths")
+                    .or_else(|| t.get("max-dirty-paths"))
+                    .or_else(|| t.get("max_dirty"))
+                    .or_else(|| t.get("max-dirty"))
+                    .and_then(|v| v.as_integer())
+                {
+                    if let Ok(u) = usize::try_from(n) {
+                        max_dirty_paths = Some(u);
+                    }
+                }
+            }
+        }
+        if !enabled {
+            return None;
+        }
+        if let Some(n) = std::env::var("VEIL_WATCH_MAX_DIRS").ok().and_then(|v| v.parse().ok()) {
+            max_dirs = Some(n);
+        }
+        if let Some(n) = std::env::var("VEIL_WATCH_MAX_DIRTY").ok().and_then(|v| v.parse().ok()) {
+            max_dirty_paths = Some(n);
+        }
+        Some((max_dirs, max_dirty_paths))
+    }
+
     /// Ask the daemon (starting it if needed, unless turned off with `vl
-    /// daemon stop`) to watch working copy `root` and report what changed
-    /// since `token`.
-    pub fn watch(root: & std::path::Path, token: Option<&str>) -> Option<super::watch::WatchReply> {
+    /// daemon stop` or `watch = false` in `config.toml`) to watch working
+    /// copy `root` and report what changed since `token`.
+    pub fn watch(root: &std::path::Path, token: Option<&str>) -> Option<super::watch::WatchReply> {
+        let (max_dirs, max_dirty_paths) = watch_config(root)?;
         let s = connect_or_start()?;
-        let max_dirs = std::env::var("VEIL_WATCH_MAX_DIRS").ok().and_then(|v| v.parse().ok());
-        let max_dirty_paths = std::env::var("VEIL_WATCH_MAX_DIRTY").ok().and_then(|v| v.parse().ok());
         let req = Request::Watch {
             root: root.to_path_buf(),
             token: token.map(str::to_string),
