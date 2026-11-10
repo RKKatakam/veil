@@ -46,6 +46,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (11, "landing", include_str!("../migrations/0011_landing.sql")),
     (15, "file_history_and_blame", include_str!("../migrations/0015_file_history_and_blame.sql")),
     (16, "search", include_str!("../migrations/0016_search.sql")),
+    (17, "prs", include_str!("../migrations/0017_prs.sql")),
     (20, "agent_sessions", include_str!("../migrations/0020_agent_sessions.sql")),
     (21, "view_graph_changes", include_str!("../migrations/0021_view_graph_changes.sql")),
     (22, "landing_merge", include_str!("../migrations/0022_landing_merge.sql")),

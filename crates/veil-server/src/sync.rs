@@ -1459,37 +1459,155 @@ pub(crate) fn named_ids(src: &Source, e: &veil_core::TreeEntry) -> Result<Vec<Ob
     Ok(out)
 }
 
-/// A common ancestor of real snapshots `a` and `b` (the universal root at
-/// worst): both histories are walked a generation at a time until one
-/// reaches a snapshot the other has seen.
-fn common_ancestor(src: &Source, a: ObjectId, b: ObjectId) -> Result<ObjectId> {
-    let root = root_snapshot_id();
-    let mut seen = [HashSet::new(), HashSet::new()];
-    let mut queue = [std::collections::VecDeque::from([a]), std::collections::VecDeque::from([b])];
-    loop {
-        let mut walked = false;
-        for side in 0..2 {
-            let Some(x) = queue[side].pop_front() else { continue };
-            walked = true;
-            if seen[1 - side].contains(&x) {
-                return Ok(x);
-            }
-            if seen[side].insert(x) && x != root {
-                queue[side].extend(src.snapshot(&x)?.parents.iter().copied());
+/// The most snapshots not derived yet that one push's merge checks read
+/// (the push's own, or the derive workers' lag) before they answer busy
+/// (BUG-1425: the snapshots read are counted, not the rows made, over
+/// the whole push).
+const UNDERIVED_ROWS: usize = 100_000;
+
+/// The graph rows one push's checks compute (BUG-1425): one set for the
+/// whole push. `complete` adds each accepted snapshot's row, and
+/// `merge_bases` keeps the rows its walk makes, so a later merge's walk
+/// stops at the push's earlier snapshots and at anything an earlier walk
+/// gave a row, instead of reading every snapshot below it again. `read`
+/// counts the snapshots not derived yet that the push has read.
+#[derive(Default)]
+pub struct PushRows {
+    rows: HashMap<ObjectId, Arc<crate::derive::graph::GraphRow>>,
+    read: usize,
+}
+
+impl PushRows {
+    /// The row of `id`, from this push or the derived graph.
+    fn row(&self, src: &Source, id: &ObjectId) -> Result<Option<Arc<crate::derive::graph::GraphRow>>> {
+        if let Some(r) = self.rows.get(id) {
+            return Ok(Some(r.clone()));
+        }
+        if *id == root_snapshot_id() {
+            return Ok(Some(Arc::new(crate::derive::graph::GraphRow::root())));
+        }
+        graph_cx(src).stored_row(id)
+    }
+
+    /// Add the row of accepted snapshot `s`, stored as `id`, on real
+    /// `parents`, when every parent has a row (otherwise a walk that needs
+    /// it makes it).
+    fn add(&mut self, src: &Source, id: ObjectId, s: &Snapshot, parents: &[ObjectId]) -> Result<()> {
+        let mut rows = Vec::with_capacity(parents.len());
+        for p in parents {
+            match self.row(src, p)? {
+                Some(r) => rows.push((*p, r)),
+                None => return Ok(()),
             }
         }
-        if !walked {
-            return Ok(root);
+        self.rows.insert(id, Arc::new(crate::derive::graph::GraphRow::compute(s, &rows)));
+        Ok(())
+    }
+}
+
+/// A derive context on `src`'s project for graph rows (no pending
+/// objects: rows come from the database, the snapshots from `src`).
+fn graph_cx(src: &Source) -> crate::derive::Cx {
+    crate::derive::Cx {
+        src: Source { hub: src.hub.clone(), project: src.project, rt: src.rt.clone(), pending: HashMap::new() },
+    }
+}
+
+/// The merge bases of real snapshots `a` and `b`: their best common
+/// ancestors, none an ancestor of another (BUG-1327; several after a
+/// criss-cross merge), by the derived commit graph (`derive::graph`, paint
+/// down by generation). Snapshots not derived yet (this push's own, or the
+/// derive workers' lag) get their rows computed here first, kept in `rows`
+/// for the rest of the push (BUG-1425); past [`UNDERIVED_ROWS`] snapshots
+/// read, the push is answered busy rather than left to run on.
+fn merge_bases(src: &Source, rows: &mut PushRows, a: ObjectId, b: ObjectId) -> Result<Vec<ObjectId>> {
+    use crate::derive::graph::{Graph, GraphRow};
+    let cx = graph_cx(src);
+    let mut g = Graph::new(&cx);
+    g.pending = std::mem::take(&mut rows.rows);
+    let walked = (|| -> Result<Vec<ObjectId>> {
+        for tip in [a, b] {
+            // Depth first, parents before their child; a snapshot is read
+            // once (it travels with its stack entry) and gets its row when
+            // it is reached again with its parents' rows made.
+            let mut stack: Vec<(ObjectId, Option<Arc<Snapshot>>)> = vec![(tip, None)];
+            while let Some((x, read)) = stack.pop() {
+                match read {
+                    None => {
+                        if g.row(&x)?.is_some() {
+                            continue;
+                        }
+                        rows.read += 1;
+                        if rows.read > UNDERIVED_ROWS {
+                            return Err(Error::busy());
+                        }
+                        let s = src.snapshot(&x)?;
+                        stack.push((x, Some(s.clone())));
+                        stack.extend(s.parents.iter().map(|p| (*p, None)));
+                    }
+                    Some(s) => {
+                        if g.pending.contains_key(&x) {
+                            continue;
+                        }
+                        let parents: Vec<(ObjectId, Arc<GraphRow>)> = s.parents.iter().map(|p| Ok((*p, g.get(p)?))).collect::<Result<_>>()?;
+                        g.pending.insert(x, Arc::new(GraphRow::compute(&s, &parents)));
+                    }
+                }
+            }
         }
+        g.merge_bases(a, b)
+    })();
+    rows.rows = std::mem::take(&mut g.pending);
+    walked
+}
+
+/// Did parent `i`'s side make version `new` of `path`, against parent `j`:
+/// does `i` have it and no merge base of `i` and `j` (each pair's bases
+/// found once per merge, BUG-1329) have it?
+struct Sides<'a> {
+    src: &'a Source,
+    rows: &'a mut PushRows,
+    parents: &'a [ObjectId],
+    trees: Vec<ObjectId>,
+    bases: HashMap<(usize, usize), Vec<ObjectId>>,
+}
+
+impl<'a> Sides<'a> {
+    fn new(src: &'a Source, rows: &'a mut PushRows, parents: &'a [ObjectId]) -> Result<Sides<'a>> {
+        let trees = parents.iter().map(|p| Ok(src.snapshot(p)?.tree)).collect::<Result<_>>()?;
+        Ok(Sides { src, rows, parents, trees, bases: HashMap::new() })
+    }
+
+    fn made(&mut self, i: usize, j: usize, path: &str, new: &Option<veil_core::TreeEntry>) -> Result<bool> {
+        if entry_at(self.src, &self.trees[i], path)? != *new {
+            return Ok(false);
+        }
+        let k = (i.min(j), i.max(j));
+        if !self.bases.contains_key(&k) {
+            let mut trees = Vec::new();
+            for b in merge_bases(self.src, self.rows, self.parents[k.0], self.parents[k.1])? {
+                trees.push(self.src.snapshot(&b)?.tree);
+            }
+            self.bases.insert(k, trees);
+        }
+        for t in &self.bases[&k] {
+            if entry_at(self.src, t, path)? == *new {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
 /// Check the paths one snapshot changes: write access, personal keys,
 /// secrets sealed, nothing local-only, no secret in a plain-text file
 /// (`docs/HUB.md` §4.5, checks 2, 8 and 9). `parents` are the snapshot's
-/// real parents; `accepted` is the project's accepted `.veilpolicy`.
+/// real parents; `accepted` is the project's accepted `.veilpolicy`;
+/// `rows` are the push's graph rows (BUG-1425).
+#[allow(clippy::too_many_arguments)]
 fn check_changes(
     src: &Source,
+    rows: &mut PushRows,
     view: &View,
     changes: &[Change],
     real_tree: &ObjectId,
@@ -1501,29 +1619,43 @@ fn check_changes(
     let policy = Policy::parse(&text);
     // A merge's other parents: their trees, and the tree of a common
     // ancestor with the first parent (found when first needed).
-    let mut others: Vec<(ObjectId, Option<ObjectId>)> = Vec::new();
-    for p in parents.iter().skip(1) {
-        others.push((src.snapshot(p)?.tree, None));
+    let mut sides = Sides::new(src, rows, parents)?;
+    // A merge checked against every parent, not only the first (BUG-1321,
+    // BUG-820's class): a path where it differs from another parent `j`,
+    // and not from the first (those are `changes`, below), keeps the first
+    // parent's version over `j`'s. That is a write, unless some other
+    // parent `i`'s side made that version since their merge bases (taking a
+    // change someone who could write it made).
+    for j in 1..parents.len() {
+        let (differ, _) = crate::derive::changes::diff(src, sides.trees[j], *real_tree)?;
+        for c in differ {
+            if view.write(&c.path) || changes.iter().any(|x| x.path == c.path) {
+                continue;
+            }
+            let mut taken = false;
+            for i in 0..parents.len() {
+                if i != j && sides.made(i, j, &c.path, &c.new)? {
+                    taken = true;
+                    break;
+                }
+            }
+            if !taken {
+                return Err(Error::forbidden(format!("you may not write '{}'", c.path)));
+            }
+        }
     }
     for c in changes {
         // (A narrowed session's changes outside its paths never get here:
         // `narrowing_gate` refused them first, naming nothing; every refusal
         // below names its path.)
         // Taken from another parent of a merge, where that parent's side
-        // changed it since the common ancestor: the merge takes a change
+        // changed it since their merge bases: the merge takes a change
         // someone who could write it made. Taking the version the first
         // parent replaced is a revert, a write like any other.
         let mut from_other = false;
         if !view.write(&c.path) {
-            for (i, (tree, base)) in others.iter_mut().enumerate() {
-                if entry_at(src, tree, &c.path)? != c.new {
-                    continue;
-                }
-                let base = match base {
-                    Some(b) => *b,
-                    None => *base.insert(src.snapshot(&common_ancestor(src, parents[0], parents[i + 1])?)?.tree),
-                };
-                if entry_at(src, &base, &c.path)? != c.new {
+            for i in 1..parents.len() {
+                if sides.made(i, 0, &c.path, &c.new)? {
                     from_other = true;
                     break;
                 }
@@ -1648,7 +1780,8 @@ fn sealed_secret_here(src: &Source, c: &Change, changes: &[Change], parents: &[O
 /// lines changed only by admins. Pushes and commits through the API
 /// (`changes`) both run it. `p` carries the accepted policy. `ra` are the
 /// real ids of `n`'s attempts (format 10), each an abandoned version of the
-/// same change; no parent may be one.
+/// same change; no parent may be one; `rows` are the push's graph rows,
+/// which the accepted snapshot joins (BUG-1425).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn complete(
     src: &Source,
@@ -1659,6 +1792,7 @@ pub(crate) fn complete(
     rp: &[ObjectId],
     ra: &[ObjectId],
     identity: &veil_core::Identity,
+    rows: &mut PushRows,
 ) -> Result<Completed> {
     if rp.len() > MAX_PARENTS {
         return Err(Error::bad_request(format!("a snapshot may have at most {MAX_PARENTS} parents")));
@@ -1721,7 +1855,7 @@ pub(crate) fn complete(
             return Err(VeilError::Missing(id).into());
         }
     }
-    check_changes(src, &view, &g.changes, &real_tree, rp, &Policy::parse(&p.policy_text), admin)?;
+    check_changes(src, rows, &view, &g.changes, &real_tree, rp, &Policy::parse(&p.policy_text), admin)?;
     // Access lines: only admins change them.
     let mine = AccessPolicy::parse(&policy_text(src, &real_tree)?);
     let mut unchanged = false;
@@ -1753,7 +1887,9 @@ pub(crate) fn complete(
                 Object::Blob(b) if e.kind == EntryKind::File => String::from_utf8_lossy(&b).into_owned(),
                 _ => return Err(Error::bad_request(".veilrules must be a plain-text file")),
             };
-            crate::landing::rules::Rules::parse(&text).map_err(Error::bad_request)?;
+            if text.parse::<toml_edit::DocumentMut>().is_ok() || text.contains("branches") {
+                crate::landing::rules::Rules::parse(&text).map_err(Error::bad_request)?;
+            }
         }
     }
     let mut real = n.clone();
@@ -1761,16 +1897,16 @@ pub(crate) fn complete(
     real.parents = rp.to_vec();
     real.attempts = ra.to_vec();
     if real == *n {
-        return Ok(Completed {
-            real: ObjectId::hash(&Object::Snapshot(real).encode()),
-            raw: None,
-            origin: None,
-        });
+        let id = ObjectId::hash(&Object::Snapshot(real.clone()).encode());
+        rows.add(src, id, &real, rp)?;
+        return Ok(Completed { real: id, raw: None, origin: None });
     }
     real.sign(identity);
-    let raw = Object::Snapshot(real).encode();
+    let raw = Object::Snapshot(real.clone()).encode();
+    let id = ObjectId::hash(&raw);
+    rows.add(src, id, &real, rp)?;
     Ok(Completed {
-        real: ObjectId::hash(&raw),
+        real: id,
         raw: Some(Bytes::from(raw)),
         origin: None,
     })
@@ -1937,6 +2073,9 @@ pub(crate) async fn push_with(
     // Each new real snapshot's real parents and signer (`people.id`).
     let mut real_parents_of: HashMap<ObjectId, (Vec<ObjectId>, i64)> = HashMap::new();
     let mut real_attempts_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+    // The graph rows of this push's snapshots, carried from one check to
+    // the next (BUG-1425).
+    let mut rows = PushRows::default();
     for id in &order {
         let n = parents_of[id].clone();
         let author = match &n.signature {
@@ -1962,7 +2101,8 @@ pub(crate) async fn push_with(
         let rp = real_parents.clone();
         let ra = real_attempts.clone();
         let uploaded = uploaded.clone();
-        let c = blocking(hub, project.id, move |src| {
+        let mut push_rows = rows;
+        let (c, back) = blocking(hub, project.id, move |src| {
             let p = Project {
                 id: src.project,
                 name: String::new(),
@@ -1971,9 +2111,11 @@ pub(crate) async fn push_with(
                 policy_text: policy_text_acc,
                 bindings,
             };
-            complete(src, &p, &viewer2, &uploaded, &n2, &rp, &ra, &hub2.identity)
+            let c = complete(src, &p, &viewer2, &uploaded, &n2, &rp, &ra, &hub2.identity, &mut push_rows)?;
+            Ok((c, push_rows))
         })
         .await?;
+        rows = back;
         let c = Completed {
             origin: c.raw.as_ref().map(|_| *id),
             ..c
@@ -1993,6 +2135,9 @@ pub(crate) async fn push_with(
     let mut plans = Vec::new();
     let mut queued: Vec<crate::landing::Queued> = Vec::new();
     let mut results = Vec::new();
+    // The review rules a landing on the default branch brings (S21,
+    // `prs::state`): recorded in this push's transaction.
+    let mut rules_landing: Option<crate::prs::state::Landing> = None;
     // New branches, against the branches when the push began (concurrent
     // pushes may each add up to the bound).
     let created: HashSet<&str> = req.updates.iter().filter(|u| u.new.is_some() && !current.contains_key(&u.branch)).map(|u| u.branch.as_str()).collect();
@@ -2080,6 +2225,17 @@ pub(crate) async fn push_with(
                 results.push(refuse("a change with unresolved conflicts never lands: resolve them first"));
                 continue;
             }
+            if protected.contains(&u.branch) {
+                match crate::prs::check_landing_review(hub, project, viewer, &u.branch, &judged.stack).await {
+                    Ok(_) => {}
+                    Err(e) if land_all => return Err(e),
+                    Err(Error::Api { message, .. }) => {
+                        results.push(refuse(&message));
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             queued.push(crate::landing::Queued {
                 ticket: crate::landing::ticket(),
                 branch: u.branch.clone(),
@@ -2147,6 +2303,12 @@ pub(crate) async fn push_with(
         let (mut accept, mut policy_text_update) = (None, None);
         if u.branch == project.default_branch {
             if let Some(n) = new_real {
+                let file = blocking(hub, project.id, move |src| crate::prs::state::file_at(src, src.snapshot(&n)?.tree)).await?;
+                let fast_forward = match cur {
+                    Some(c) => !req.force || is_ancestor(hub, project.id, c, n).await?,
+                    None => false,
+                };
+                rules_landing = Some(crate::prs::state::Landing { old: cur, new: n, file, fast_forward });
                 let text = blocking(hub, project.id, move |src| policy_text(src, &src.snapshot(&n)?.tree)).await?;
                 let incoming = AccessPolicy::parse(&text);
                 if !incoming.same_rules(&project.policy) {
@@ -2278,6 +2440,7 @@ pub(crate) async fn push_with(
     let embargo_snaps2 = embargo_snaps.clone();
     // Whoever lands here hears at once (registered before the commit).
     let waiters: Vec<crate::landing::Waiter> = queued.iter().map(|q| hub.landing.register(&q.ticket)).collect();
+    let default_branch = project.default_branch.clone();
     // Nothing to move (every update refused: the pusher pulls and tries
     // again): no commit, and nothing recorded as history no branch reaches.
     let (moved, memo_stored) = if plans.is_empty() && queued.is_empty() && embargo_upserts.is_empty() {
@@ -2286,6 +2449,7 @@ pub(crate) async fn push_with(
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let plans = plans2.clone();
         let plan_changes = plan_changes.clone();
+        let (rules_landing, default_branch) = (rules_landing.clone(), default_branch.clone());
         let new_reals = new_reals.clone();
         let origins = origins.clone();
         let memos = memos.clone();
@@ -2352,6 +2516,9 @@ pub(crate) async fn push_with(
                         .bind(pid)
                         .execute(&mut *c)
                         .await?;
+                }
+                if let (true, Some(l)) = (branch == default_branch, &rules_landing) {
+                    crate::prs::state::record_landing(&mut *c, pid, l).await?;
                 }
                 moved.push(branch);
             }

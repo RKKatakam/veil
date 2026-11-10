@@ -396,6 +396,65 @@ vl session agent --agent "claude-code" --task "TASK-12" --only src/api/    # pri
   agent-made changes (they cannot read them), instead of a confusing error.
 - `POST /v1/sessions/agent` ([HUB.md §13.27](../HUB.md)).
 
+## PRs and review
+
+A PR asks for review of a stack of changes you pushed. It lives on the
+server; its title, description, comments and reviews are plain text that
+only the right people can see.
+
+```sh
+vl commit --no-advance -m "Retry failed payments"
+vl tag set retry -r @-
+vl push
+vl pr create retry --title "Retry failed payments" --body "Three tries, then give up."
+#   Created pr-4f2a9c1b
+vl pr list                                   # open PRs you may see
+vl pr show pr-4f2a9c1b --threads             # revisions, risk, review, comments
+vl pr diff pr-4f2a9c1b                       # or one change: --change CHANGE_ID
+vl pr comment pr-4f2a9c1b --path src/pay.rs --line 12 -m "Why three?"
+vl pr review pr-4f2a9c1b --approve           # signed by this device
+vl pr update pr-4f2a9c1b retry               # a new revision, after more pushes
+```
+
+- **Who sees a PR:** only people who can see **every file it touches**, in
+  every revision. If one revision touched `billing/`, people who cannot see
+  `billing/` never see the PR: not in `vl pr list`, not in a count or a
+  search, and its id answers "no such PR" for them.
+- **PR ids are random** (`pr-4f2a9c1b`), so nobody can count hidden PRs from
+  gaps.
+- **Revisions follow change ids.** Rewrite or rebase your changes, push,
+  and run `vl pr update`: the PR keeps its comments, and a comment on a line
+  moves with that line, or is marked outdated if the line changed.
+- **Risk and approvals.** Each revision is `low` only if every file is
+  documentation (in the top-level `docs/` folder, or the root's `README`,
+  `LICENSE`, `CHANGELOG`, `CONTRIBUTING`) or test source code (in a `tests/`
+  folder outside `src/`, or Go's `*_test.go`). It is `high` for access lines,
+  `.veilrules`, `CODEOWNERS`, CI and container configuration, dependency
+  manifests and lock files, secrets, or paths your admins mark. Everything
+  else is `normal`, including other Markdown such as agent instructions.
+  By default low needs one approval from someone
+  other than the author (an agent's counts), and normal and high need one
+  from a person. Symbolic links are never low. Admins change this in
+  `.veilrules`, and may list the paths that need checks only (no
+  approval):
+
+  ```toml
+  [review]
+  normal = { approvals = 2 }
+  high_risk_paths = ["src/auth/"]
+  checks_only = ["docs/**"]
+  ```
+
+- **An approval is for the files as they were.** Change the files and the
+  approvals stop counting. A rebase that leaves your files as they are
+  keeps them. You cannot approve your own PR. Only people who may write
+  every file of a PR review it. A request for changes holds every PR touching
+  those files, whoever opens it, until that reviewer approves that PR, or
+  an admin dismisses it (`vl pr dismiss ID PERSON`).
+- `vl pr land` checks the review rules. Landing through the server's
+  landing service comes with that service.
+- Over HTTPS: `/v1/projects/{project}/prs…` ([HUB.md §13.24](../HUB.md)).
+
 ## Secrets
 
 - **New repositories encrypt shared secrets** (`.env`, `.env.*`, `.envrc`,

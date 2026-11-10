@@ -1643,6 +1643,17 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         // S22: embargo release lands the hidden line onto its target branch
         // through `landing::agent_stack` (merge of S22).
         ("/v1/projects/{p}/embargoes/{id}/release", "write"),
+        // S21: PRs and review (visibility classes, risk, approvals; narrowed in `prs`).
+        ("/v1/projects/{p}/prs", "narrowed"),
+        ("/v1/projects/{p}/prs/{id}", "narrowed"),
+        ("/v1/projects/{p}/prs/{id}/diff", "narrowed"),
+        ("/v1/projects/{p}/prs/{id}/revisions", "narrowed"),
+        ("/v1/projects/{p}/prs/{id}/close", "narrowed"),
+        ("/v1/projects/{p}/prs/{id}/threads", "narrowed"),
+        ("/v1/projects/{p}/prs/{id}/threads/{t}", "narrowed"),
+        ("/v1/projects/{p}/prs/{id}/reviews", "narrowed"),
+        ("/v1/projects/{p}/prs/{id}/reviews/dismiss", "person"),
+        ("/v1/projects/{p}/prs/{id}/land", "narrowed"),
     ];
     let routes: Vec<&str> = API.split(".route(\"").skip(1).map(|s| s.split('"').next().unwrap()).collect();
     assert!(routes.len() >= 40, "the router was not read: {routes:?}");

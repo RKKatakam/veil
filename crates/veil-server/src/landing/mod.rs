@@ -311,6 +311,8 @@ pub struct Services {
     /// waits) the branch it lands on, for that branch's poller.
     waiters: Mutex<HashMap<String, Waiting>>,
     next_waiter: AtomicU64,
+    /// How many tickets each person currently has actively waiting in [`wait`].
+    waiting_by_person: Mutex<HashMap<i64, usize>>,
     /// The branches whose waiters here a poller answers (`poll`).
     pollers: Mutex<std::collections::HashSet<(i64, String)>>,
     /// Content merge workers running on this server (S18).
@@ -328,6 +330,7 @@ impl Default for Services {
             held_elsewhere: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
             next_waiter: AtomicU64::new(1),
+            waiting_by_person: Mutex::new(HashMap::new()),
             pollers: Mutex::new(Default::default()),
             merges: merge::Workers::default(),
             stats: Stats::default(),
@@ -338,6 +341,9 @@ impl Default for Services {
 /// Most landings waiting for their outcome on one server at once (they hold
 /// no bulkhead place while they wait, BUG-1635); the rest answer at once.
 pub const MAX_WAITING: usize = 10_000;
+/// Most landings one person may have waiting for their outcome on one server
+/// at once (S24).
+pub const MAX_WAITING_PER_PERSON: usize = 128;
 
 /// A submitter's wait for its ticket, registered before the submit commits
 /// so that the outcome is never missed.
@@ -590,9 +596,42 @@ pub fn queued(ticket: &str) -> LandResult {
 /// [`MAX_WAITING`] instead: past it, the answer is the row as it is now
 /// (`queued` and its ticket, for `vl land --status`), without a wait.
 pub async fn wait(hub: &Arc<Hub>, project: i64, person: i64, branch: &str, mut w: Waiter, deadline: tokio::time::Instant) -> Result<LandResult> {
+    let over_person = {
+        let mut by_p = hub.landing.waiting_by_person.lock().unwrap();
+        let n = by_p.entry(person).or_insert(0);
+        if *n >= MAX_WAITING_PER_PERSON {
+            true
+        } else {
+            *n += 1;
+            false
+        }
+    };
+    struct PersonWaitGuard<'a> {
+        s: &'a Services,
+        person: i64,
+        active: bool,
+    }
+    impl Drop for PersonWaitGuard<'_> {
+        fn drop(&mut self) {
+            if self.active {
+                let mut by_p = self.s.waiting_by_person.lock().unwrap();
+                if let Some(n) = by_p.get_mut(&self.person) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        by_p.remove(&self.person);
+                    }
+                }
+            }
+        }
+    }
+    let _person_guard = PersonWaitGuard {
+        s: &hub.landing,
+        person,
+        active: !over_person,
+    };
     // Waiters, not tickets: several may wait on one ticket (an embargo's
     // release, S22).
-    if hub.landing.waiters.lock().unwrap().values().map(|(txs, _)| txs.len()).sum::<usize>() > MAX_WAITING {
+    if over_person || hub.landing.waiters.lock().unwrap().values().map(|(txs, _)| txs.len()).sum::<usize>() > MAX_WAITING {
         let out = match read(hub, project, person, &w.ticket).await? {
             Some((_, r)) => r,
             None => queued(&w.ticket),
