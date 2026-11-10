@@ -88,6 +88,7 @@ pub fn run(repo_arg: Option<&Path>) -> Result<ExitCode> {
     r.section("Setup");
     check_veil_home(&mut r);
     let identity = check_identity(&mut r);
+    check_daemon(&mut r);
     check_sandboxes(&mut r);
 
     let start = match repo_arg {
@@ -268,6 +269,23 @@ fn check_confinement(r: &mut Report, root: Option<&Path>) {
         match works {
             true => r.item(Level::Ok, &line, &detail),
             false => r.warn(line, &detail),
+        }
+    }
+}
+
+fn check_daemon(r: &mut Report) {
+    #[cfg(unix)]
+    {
+        let p = crate::daemon::paths();
+        if let Some(s) = crate::daemon::status() {
+            let pid = s["pid"].as_u64().unwrap_or(0);
+            let wcs = s["watching"].as_array().map_or(0, Vec::len);
+            let dirs = s["watched_dirs"].as_u64().unwrap_or(0);
+            r.ok(format!("Veil daemon running (pid {pid}): watching {wcs} working cop(ies), {dirs} director(ies)"));
+        } else if p.off.exists() {
+            r.note("Veil daemon is off (`vl daemon start` turns it on)", &[]);
+        } else {
+            r.note("Veil daemon is not running (started automatically on first use)", &[]);
         }
     }
 }

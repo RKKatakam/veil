@@ -707,6 +707,94 @@ pub struct BuildReport {
     pub renormalizable: Vec<VPath>,
 }
 
+/// Directories the Veil daemon's file watcher says may have changed since
+/// `parent_tree` was recorded, plus those whose [`BuildReport`] findings
+/// must be rechecked.
+///
+/// A directory in `subtrees` is walked with all its descendants (a
+/// subdirectory was created, renamed or removed there). A directory in
+/// `dirs` has its own entries inspected, while any tracked subdirectory
+/// inside it that is neither in `dirs`/`subtrees` nor an ancestor of one
+/// keeps its entry from `parent_tree` without being opened.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WatchPlan {
+    dirs: HashSet<VPath>,
+    subtrees: Vec<VPath>,
+    ancestors: HashSet<VPath>,
+}
+
+impl WatchPlan {
+    pub fn new(
+        dirty_dirs: impl IntoIterator<Item = VPath>,
+        dirty_subtrees: impl IntoIterator<Item = VPath>,
+        recheck_dirs: impl IntoIterator<Item = VPath>,
+    ) -> Self {
+        let mut dirs: HashSet<VPath> = dirty_dirs.into_iter().chain(recheck_dirs).collect();
+        let mut subtrees: Vec<VPath> = dirty_subtrees.into_iter().collect();
+        subtrees.sort();
+        subtrees.dedup();
+        // Compact `subtrees` so no entry is inside another.
+        let mut compact: Vec<VPath> = Vec::with_capacity(subtrees.len());
+        for s in subtrees {
+            if compact.last().is_none_or(|prev| !s.starts_with(prev)) {
+                compact.push(s);
+            }
+        }
+        dirs.retain(|d| !compact.iter().any(|s| d.starts_with(s)));
+        let mut ancestors = HashSet::new();
+        for p in dirs.iter().chain(compact.iter()) {
+            if !p.is_root() {
+                ancestors.insert(VPath::root());
+                for a in p.ancestors() {
+                    ancestors.insert(a);
+                }
+            }
+        }
+        WatchPlan {
+            dirs,
+            subtrees: compact,
+            ancestors,
+        }
+    }
+
+    /// Nothing changed anywhere and nothing needs rechecking.
+    pub fn is_clean(&self) -> bool {
+        self.dirs.is_empty() && self.subtrees.is_empty()
+    }
+
+    /// Must `dir` and all its descendants be walked?
+    pub fn in_dirty_subtree(&self, dir: &VPath) -> bool {
+        self.subtrees.iter().any(|s| dir.starts_with(s))
+    }
+
+    /// Must `dir` itself be opened and listed?
+    pub fn must_open(&self, dir: &VPath) -> bool {
+        self.dirs.contains(dir) || self.ancestors.contains(dir) || self.in_dirty_subtree(dir)
+    }
+
+    /// Must `dir`'s own leaf entries be inspected (rather than carried from
+    /// `parent_tree`)?
+    pub fn inspect_leaves(&self, dir: &VPath) -> bool {
+        self.dirs.contains(dir) || self.in_dirty_subtree(dir)
+    }
+
+    /// Direct child directory names of `dir` (when `!self.inspect_leaves(dir)`)
+    /// that must be opened.
+    pub fn must_open_children(&self, dir: &VPath) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .dirs
+            .iter()
+            .chain(self.subtrees.iter())
+            .chain(self.ancestors.iter())
+            .filter(|p| p.parent().as_ref() == Some(dir))
+            .map(|p| p.file_name().to_string())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+}
+
 impl BuildReport {
     /// Paths that exist locally but are not in the tree.
     pub fn local_only(&self) -> Vec<VPath> {
@@ -716,6 +804,101 @@ impl BuildReport {
         v.sort();
         v.dedup();
         v
+    }
+
+    /// Directories that produced any local-only file, held-back edit, or
+    /// warning during this build: a later watched build includes them so
+    /// that its [`BuildReport`] matches a full scan.
+    pub fn recheck_dirs(&self) -> Vec<VPath> {
+        let mut dirs: HashSet<VPath> = HashSet::new();
+        fn add(dirs: &mut HashSet<VPath>, p: &VPath) {
+            dirs.insert(p.parent().unwrap_or_else(VPath::root));
+        }
+        for p in &self.isolated {
+            add(&mut dirs, p);
+        }
+        for (p, _) in &self.quarantined {
+            add(&mut dirs, p);
+        }
+        for p in &self.quarantine_kept {
+            add(&mut dirs, p);
+        }
+        for p in &self.blocked_exposures {
+            add(&mut dirs, p);
+        }
+        for h in &self.policy_held_back {
+            add(&mut dirs, &h.path);
+        }
+        for (p, _) in &self.cloak_failures {
+            add(&mut dirs, p);
+        }
+        for (p, _) in &self.relabelled {
+            add(&mut dirs, p);
+        }
+        for p in &self.carried {
+            add(&mut dirs, p);
+        }
+        for p in &self.not_recorded {
+            add(&mut dirs, p);
+            dirs.insert(VPath::root());
+            for a in p.ancestors() {
+                dirs.insert(a);
+            }
+        }
+        for (p, _) in &self.unreadable {
+            add(&mut dirs, p);
+            dirs.insert(p.clone());
+        }
+        for s in &self.unrepresentable {
+            let name = s.split(" (").next().unwrap_or(s);
+            match name.rfind('/') {
+                Some(i) => {
+                    if let Ok(d) = VPath::new(&name[..i]) {
+                        dirs.insert(d);
+                    } else {
+                        dirs.insert(VPath::root());
+                    }
+                }
+                None => {
+                    dirs.insert(VPath::root());
+                }
+            }
+        }
+        for p in &self.shadowed {
+            add(&mut dirs, p);
+        }
+        for (p, _) in &self.link_warnings {
+            add(&mut dirs, p);
+        }
+        for (a, b) in &self.name_collisions {
+            add(&mut dirs, a);
+            add(&mut dirs, b);
+        }
+        for p in &self.nested {
+            add(&mut dirs, p);
+            dirs.insert(p.clone());
+        }
+        for (p, _) in &self.line_endings {
+            add(&mut dirs, p);
+        }
+        for p in &self.renormalizable {
+            add(&mut dirs, p);
+        }
+        if !self.policy_warnings.is_empty() {
+            for w in &self.policy_warnings {
+                if let Some((path, _)) = w.split_once(": ") {
+                    if let Ok(vp) = VPath::new(path) {
+                        add(&mut dirs, &vp);
+                    }
+                }
+            }
+        }
+        if self.policy_edit_pending || self.policy_edit_held.is_some() {
+            dirs.insert(VPath::root());
+        }
+        let mut out: Vec<VPath> = dirs.into_iter().collect();
+        out.sort();
+        out
     }
 }
 
@@ -750,6 +933,9 @@ struct Builder<'a> {
     /// What was learnt of the leaf about to be built as its directory was
     /// listed (used instead of asking again, for that path only).
     listed: Option<Listed>,
+    /// When set, the daemon's file watcher vouches that only these
+    /// directories changed since `parent_tree`.
+    watch: Option<&'a WatchPlan>,
     /// Listings made ahead of the walk, on other threads.
     #[cfg(feature = "os")]
     prefetch: Option<&'a crate::prefetch::Prefetch<'a>>,
@@ -769,6 +955,18 @@ pub fn build_tree_cached(
     fs: &dyn StorageBackend,
     opts: &BuildOptions,
     cache: Option<&mut StatCache>,
+) -> Result<(ObjectId, BuildReport)> {
+    build_tree_watched(store, fs, opts, cache, None)
+}
+
+/// [`build_tree_cached`] guided by `watch` when the daemon's file watcher
+/// vouches for which directories changed since `opts.parent_tree`.
+pub fn build_tree_watched(
+    store: &ObjectStore,
+    fs: &dyn StorageBackend,
+    opts: &BuildOptions,
+    cache: Option<&mut StatCache>,
+    watch: Option<&WatchPlan>,
 ) -> Result<(ObjectId, BuildReport)> {
     #[cfg(feature = "os")]
     secrets::prepare();
@@ -796,16 +994,36 @@ pub fn build_tree_cached(
     // The cache only works on backends whose stamps can be trusted. The
     // clock is read before any file is stat'ed (see `statcache`).
     let mut cache = cache;
-    let run = match (cache.as_deref_mut(), fs.stat_clock()) {
+    let mut run = match (cache.as_deref_mut(), fs.stat_clock()) {
         (Some(c), Some(clock)) => Some(c.begin_run(CacheKey::compute(fs, &store.keys, clock)?, clock)),
         _ => None,
     };
+    // The watcher's plan applies only when we have a parent tree, policy and
+    // keys have not changed, no unaccepted policy guards the working copy,
+    // no scanner rescan or renormalization is requested, and no sandbox
+    // secrets are injected.
+    let watch = watch.filter(|_| {
+        parent.is_some()
+            && !policy_changed
+            && opts.policy.accepted().is_none()
+            && !opts.policy.own_edit_pending
+            && !opts.rescan
+            && opts.injected.is_none()
+            && matches!(opts.line_endings, LineEndings::Convert)
+            && !run.as_ref().is_some_and(|r| r.key_changed)
+    });
+    if watch.is_some() {
+        if let Some(r) = run.as_mut() {
+            r.enable_partial();
+        }
+    }
     // Large working copies on a disk are listed ahead of the walk (see
     // `prefetch`), from now on: after the clock reading the cache run
-    // took.
+    // took. With a watcher plan we only list the dirty directories, so
+    // background full-tree prefetching stays off.
     #[cfg(feature = "os")]
-    let prefetch = match (fs.kind(), run.as_ref().map(CacheRun::len)) {
-        ("disk", Some(files)) if crate::prefetch::workers_for(files) > 0 => {
+    let prefetch = match (watch.is_none(), fs.kind(), run.as_ref().map(CacheRun::len)) {
+        (true, "disk", Some(files)) if crate::prefetch::workers_for(files) > 0 => {
             Some((crate::prefetch::Prefetch::new(fs, store, opts.policy, opts.parent_tree), crate::prefetch::workers_for(files)))
         }
         _ => None,
@@ -840,6 +1058,7 @@ pub fn build_tree_cached(
         attrs: None,
         eol_now: None,
         listed: None,
+        watch,
         #[cfg(feature = "os")]
         prefetch: prefetch.as_ref().map(|(p, _)| p),
     };
@@ -1043,6 +1262,12 @@ impl<'a> Builder<'a> {
                             f.out.insert(pe.clone());
                             continue;
                         }
+                        if self.watch.is_some_and(|w| !w.must_open(&path)) {
+                            f.out.insert(pe.clone());
+                            continue;
+                        }
+                    } else if self.watch.is_some_and(|w| !w.must_open(&path)) {
+                        continue;
                     }
                     if depth >= MAX_TREE_DEPTH {
                         self.report
@@ -1092,6 +1317,13 @@ impl<'a> Builder<'a> {
                     }
                 }
                 NodeKind::File => {
+                    if self.watch.is_some_and(|w| !w.inspect_leaves(&f.dir)) {
+                        if let Some(pe) = parent_entry.filter(|e| e.kind != EntryKind::Dir) {
+                            self.report.files += 1;
+                            f.out.insert(pe.clone());
+                        }
+                        continue;
+                    }
                     if let Some(e) = self.file_entry(&path, name, parent_entry, EntryKind::File)? {
                         self.report.files += 1;
                         f.out.insert(e);
@@ -1110,6 +1342,13 @@ impl<'a> Builder<'a> {
                     }
                 }
                 NodeKind::Symlink => {
+                    if self.watch.is_some_and(|w| !w.inspect_leaves(&f.dir)) {
+                        if let Some(pe) = parent_entry.filter(|e| e.kind != EntryKind::Dir) {
+                            self.report.files += 1;
+                            f.out.insert(pe.clone());
+                        }
+                        continue;
+                    }
                     if let Some(e) = self.file_entry(&path, name, parent_entry, EntryKind::Symlink)? {
                         self.report.files += 1;
                         f.out.insert(e);
@@ -1122,12 +1361,58 @@ impl<'a> Builder<'a> {
     /// List `dir` and start its frame, or finish at once (vanished or
     /// unreadable directory).
     fn open_dir(&mut self, dir: VPath, parent: Option<(Arc<Tree>, ObjectId)>) -> Result<Opened> {
+        if self.watch.is_some_and(|w| !w.must_open(&dir)) {
+            return Ok(Opened::Done(parent.map(|(_, id)| id)));
+        }
+        if let Some(w) = self.watch.filter(|w| !w.inspect_leaves(&dir)) {
+            let children = w.must_open_children(&dir);
+            let mut out = Tree::default();
+            let mut kept_special = Vec::new();
+            if let Some((p, _)) = &parent {
+                for e in &p.entries {
+                    if children.binary_search(&e.name).is_err() {
+                        if e.kind != EntryKind::Dir {
+                            self.report.files += 1;
+                        }
+                        kept_special.push(e.name.clone());
+                        out.insert(e.clone());
+                    }
+                }
+            }
+            let entries = children
+                .into_iter()
+                .map(|name| crate::vfs::DirEntry { name, kind: NodeKind::Dir })
+                .collect();
+            return Ok(Opened::Frame(BuildFrame {
+                dir,
+                parent,
+                entries,
+                stats: Vec::new(),
+                classes: Vec::new(),
+                next: 0,
+                out,
+                kept_special,
+                waiting: None,
+            }));
+        }
         let (listing, classes) = match self.list_dir(&dir, parent.as_ref().map(|(t, _)| &**t)) {
             // Names may change: classified again, under the names recorded.
             Ok((l, _)) if self.folding.folds() => (self.canonical_names(&dir, l, parent.as_ref().map(|(t, _)| &**t)), Vec::new()),
             Ok(l) => l,
-            // Vanished while we were building: a deletion like any other.
-            Err(e) if e.is_not_found() && !dir.is_root() => return Ok(Opened::Done(None)),
+            // Vanished while we were building (or never materialised): carry
+            // any unreadable entries from `parent`, as `finish_dir` does.
+            Err(e) if e.is_not_found() && !dir.is_root() => {
+                if let Some(run) = self.cache.as_mut() {
+                    run.note_deleted_dir(dir.clone());
+                }
+                let carried = match parent {
+                    Some((_, id)) => self
+                        .carry_unreadable(&TreeEntry::dir(dir.file_name(), id), &dir)?
+                        .map(|e| e.id),
+                    None => None,
+                };
+                return Ok(Opened::Done(carried));
+            }
             // Unreadable (e.g. permission denied): keep what was tracked.
             Err(VeilError::Io { source, .. }) if !dir.is_root() => {
                 self.report.unreadable.push((dir.clone(), source.to_string()));
@@ -1135,8 +1420,14 @@ impl<'a> Builder<'a> {
             }
             Err(e) => return Err(e),
         };
+        if let Some(run) = self.cache.as_mut() {
+            run.note_visited_dir(&dir);
+        }
         // A repository of its own: none of it is ours to record (BUG-200).
         if !dir.is_root() && crate::vfs::holds_repository(&listing) {
+            if let Some(run) = self.cache.as_mut() {
+                run.note_deleted_dir(dir.clone());
+            }
             self.report.nested.push(dir);
             return Ok(Opened::Done(None));
         }
@@ -1205,7 +1496,13 @@ impl<'a> Builder<'a> {
         if let Some((p, _)) = &parent {
             for e in &p.entries {
                 if !seen(&e.name) {
-                    if let Some(c) = self.carry_unreadable(e, &dir.join(&e.name))? {
+                    let cpath = dir.join(&e.name);
+                    if e.kind == EntryKind::Dir {
+                        if let Some(run) = self.cache.as_mut() {
+                            run.note_deleted_dir(cpath.clone());
+                        }
+                    }
+                    if let Some(c) = self.carry_unreadable(e, &cpath)? {
                         out.insert(c);
                     }
                 }

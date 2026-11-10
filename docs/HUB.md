@@ -4207,3 +4207,77 @@ and `crates/veil-core/src/hub/land.rs`.
 | 5 | A slow or stalled SSE reader buffers unbounded events in server memory | Per-stream queue bounded at 64 frames and 64 KiB (`MAX_BYTES_PER_STREAM`); overflow calls `Events::evict` immediately on emit and frees held bytes to 0 | `server_hub` `landing::a_slow_or_absent_reader_never_holds_server_memory` |
 | 6 | Repeatedly conflicting changes loop between the queue and merge workers forever, or ignore `.veilattributes` | `merges` column capped at `MAX_MERGES = 3`; `.veilattributes` (`merge=union`, `-merge`, `binary`) loaded from the tip via `ServerAttrSource` and honoured by workers | `server_hub` `landing::merge_attempts_cap_at_three_and_veilattributes_govern_content_merge` |
 | 7 | A queued or re-queued agent-session change escapes its session narrowing, touches an access/review file, lands after the session is revoked, loses its attribution/attempts on content merge, or learns paths outside its narrowing via conflict reports or SSE events (BUG-1685) | `landing_queue.agent_session` persisted and verified at prepare, merge, re-queue, and commit (`auth::load_agent_session`); `merge_stack` and `service::entry` enforce `sync::agent_tip` and `decides_access` and preserve `agent`/`attempts`; `build_conflict`, `collect_landed_since`, and `landing::seen` redact anything outside `within_narrowing` | `server_hub` `landing::a_narrowed_agent_sessions_change_that_needs_a_content_merge_lands_within_its_paths`, `landing::a_narrowed_agent_sessions_change_whose_merge_touches_outside_its_paths_or_an_access_file_is_refused`, `landing::a_session_revoked_while_its_change_waits_in_the_queue_never_lands`, `landing::a_landed_merged_snapshot_keeps_the_sessions_attribution_and_attempts`, `landing::a_narrowed_sessions_events_and_conflict_reports_name_nothing_outside_its_paths` |
+
+### 13.33 S7: the Veil daemon's file watcher (built)
+
+Design: `docs/design/server/phase-2-thin-clients.md` §4.7, the S7 row of §9,
+and product decision 5 (the daemon runs by default and watches working
+copies, with `vl daemon stop` and `watch = false` in `.veil/local/config.toml`
+or `$VEIL_HOME/config.toml` as off switches). Code: `crates/vl/src/daemon/watch.rs`
+(the watcher, `openat(..., O_NOFOLLOW | O_DIRECTORY)` tree walk, inotify
+event draining, tokens and bounds), `crates/vl/src/daemon/{mod,proto,serve}.rs`
+(`Request::Watch`, `config.toml` `watch` settings, `vl daemon status`),
+`crates/vl/src/doctor.rs`, `crates/vl/src/ctx.rs` (watcher queries in
+`record_once` and full-scan fallback for `vl ls --all`), and
+`crates/veil-core/src/{builder,statcache,working_copy,workspace}.rs`
+(`WatchPlan`, `build_tree_watched`, partial `StatCache` updates, and
+`WatchRecord` in `.veil/local/checkout.json`). `veil-core` stays portable to
+`wasm32-unknown-unknown`.
+
+* **Advisory, never authoritative.** The watcher only narrows which
+  directories `build_tree_watched` opens and lists; every inspected path
+  still goes through the stat cache, racy-mtime window, secret scanner and
+  sealing checks (`verify_sealing`, `protect_moves`). Directories that
+  produced warnings, quarantined/isolated files or held-back edits in the
+  previous snapshot are recorded in `checkout.json` (`WatchRecord::recheck`)
+  and re-inspected on the next build so `BuildReport` and `vl status` match
+  a full scan.
+* **When the watcher cannot vouch, `vl` scans.** The daemon answers
+  `known: false` on the first command in a working copy, after a daemon
+  restart or working-copy move (`st_dev`/`st_ino` mismatch), on an unknown
+  or stale token, on kernel queue overflow (`IN_Q_OVERFLOW`) or unmount
+  (`IN_UNMOUNT`), when `.veilpolicy` or `.veilattributes` is modified, or
+  when a directory or dirty-path bound is exceeded. `vl` also bypasses the
+  watcher plan whenever `.veilpolicy` or keys changed, an unaccepted policy
+  guards the working copy, or a command rewrites the working copy (`vl
+  restore`, `vl ws switch`, `vl renormalize`, `vl ls --all`).
+* **Confined to the working copy.** Every watched directory is opened step
+  by step from the working copy root with `openat(..., O_RDONLY |
+  O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)`, verified with `fstat` to belong
+  to the OS user (`st_uid == geteuid()`) and stay on the root filesystem
+  (`st_dev == root_dev`), checked not to hold `.veil`, and registered via
+  `/proc/self/fd/{fd}`. Symlinks and mount boundaries are never followed.
+* **Bounded.** One daemon watches at most 64 working copies (LRU-evicted);
+  each working copy watches at most `max_dirs` directories (default 65,536)
+  and buffers at most `max_dirty_paths` dirty paths (default 16,384) and
+  1 MiB of path strings. Past any bound, the working copy's watches are
+  dropped, the daemon returns a notice, and `vl` warns and falls back to
+  full scanning.
+
+#### Guarantees and tests (`crates/vl/tests/cli_basic/working_copy_cli.rs`)
+
+| # | Guarantee | Test |
+|---|---|---|
+| 1 | `vl status` and `vl commit` give the exact same answer with the watcher as with a full scan across edits, adds, deletes, renames, mode changes, racy-window commits, daemon restarts, tampered tokens, and `.veilpolicy` edits | `working_copy_cli::s7_watcher::s7_g1_status_and_commit_with_watcher_match_full_scan_across_all_changes_and_restarts` |
+| 2 | Never reads or reports anything outside the working copy, never follows symlinks out of it, and never descends into nested `.veil` repositories | `working_copy_cli::s7_watcher::s7_g2_watcher_never_follows_symlinks_or_escapes_working_copy`, `s7_hostile_watch_inputs_never_escape_or_crash_daemon` |
+| 3 | Bounded watched directories and dirty paths per working copy; past them it drops watches, warns, and falls back to scanning | `working_copy_cli::s7_watcher::s7_g3_watcher_bounds_fall_back_to_scanning_and_warn` |
+| 4 | Off when the daemon is stopped (`vl daemon stop`) or `watch = false` in `config.toml`, and `vl` works identically without it | `working_copy_cli::s7_watcher::s7_g4_watcher_is_off_when_daemon_stopped_or_disabled_in_config` |
+| 5 | Secret files (`.env.*`) are sealed and secret leaks in plain files are quarantined on commit with the watcher active exactly as with a scan | `working_copy_cli::s7_watcher::s7_g5_secrets_are_sealed_and_leaks_quarantined_with_watcher` |
+
+#### Measured (20,500 files, 1,202 directories)
+
+`bash ~/.cache/veil-orch/bench-quiet.sh cargo test --release -p vl --test cli_bench -- --ignored --nocapture bench_status::status_on_20k_files`
+(release build, 10 runs each, machine load 14.77 before, 14.95 after):
+
+| Case (20,500 files) | Without watcher (scan) | With watcher (daemon) | Speedup |
+|---|---:|---:|---:|
+| `vl status`, unchanged tree | 41.3 ms (min 29.5) | **11.0 ms** (min 10.1) | **3.8×** |
+| `vl status`, 1 public file edited | 48.1 ms (min 41.7) | **27.2 ms** (min 14.8) | **1.8×** |
+| `vl status`, 1 restricted file edited | 54.7 ms (min 42.8) | **25.6 ms** (min 17.4) | **2.1×** |
+| `vl commit`, 1 public file edited | 54.6 ms (min 47.6) | **32.5 ms** (min 19.9) | **1.7×** |
+
+#### Reverting
+
+Revert the merge commit. The `watch` field in `.veil/local/checkout.json` is
+optional (`#[serde(default)]`) and ignored by older `vl` builds; `Request::Watch`
+is additive on the daemon socket.

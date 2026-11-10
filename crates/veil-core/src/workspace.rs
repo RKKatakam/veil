@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use crate::{
-    builder::{build_tree_cached, BuildOptions, BuildReport, InjectedSecrets, LineEndings},
+    builder::{build_tree_cached, build_tree_watched, BuildOptions, BuildReport, InjectedSecrets, LineEndings, WatchPlan},
     checkout::{checkout_cached, checkout_recorded, CheckoutReport, Materialised},
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
@@ -81,6 +81,9 @@ pub struct SnapshotOptions<'a> {
     /// takes back as one): `(message, advance)` as [`Repo::commit`] takes
     /// them. The result is [`WcSnapshot::committed`].
     pub commit: Option<(&'a str, bool)>,
+    /// Directories the daemon's file watcher says may have changed since
+    /// [`SnapshotOptions::expected_wc`] was recorded.
+    pub watch: Option<&'a WatchPlan>,
 }
 
 #[derive(Debug, Clone)]
@@ -219,6 +222,7 @@ struct BuildParams<'a> {
     policy_from_command: bool,
     carried: &'a [(VPath, crate::object::TreeEntry)],
     line_endings: LineEndings<'a>,
+    watch: Option<&'a WatchPlan>,
 }
 
 /// A tree built from a working copy, with the policy that classified it.
@@ -271,7 +275,7 @@ fn build_wc_tree(
     let (wp, command_edit) = recording_policy(repo, fs, &parent_tree, p.policy_from_command, || {
         repo.snapshot_policy(fs, (!p.policy_incoming).then_some(&wc.tree))
     })?;
-    let (tree, mut report) = build_tree_cached(
+    let (tree, mut report) = build_tree_watched(
         &store,
         fs,
         &BuildOptions {
@@ -283,6 +287,7 @@ fn build_wc_tree(
             line_endings: p.line_endings,
         },
         cache,
+        p.watch,
     )?;
     let tree = hold_command_edit(&store, tree, &parent_tree, command_edit, &mut report)?;
     Ok(Built { tree, report, wp })
@@ -377,6 +382,7 @@ impl Repo {
                     carried: opts.carried,
                     line_endings: opts.line_endings,
                     commit: opts.commit,
+                    watch: opts.watch,
                 };
                 let out = self.snapshot_once(ws, fs, again)?;
                 if !out.superseded {
@@ -402,6 +408,7 @@ impl Repo {
             carried,
             line_endings,
             commit,
+            watch,
         } = opts;
         let mut cache = cache;
         let params = BuildParams {
@@ -411,6 +418,7 @@ impl Repo {
             policy_from_command,
             carried,
             line_endings,
+            watch,
         };
         // 1. Scan without the lock. Lock-free repositories (format 6) take
         // no lock: they build inside the transaction, with the objects

@@ -22,6 +22,7 @@
 
 use std::{
     io::{Read, Write},
+    path::PathBuf,
     time::Instant,
 };
 
@@ -68,6 +69,17 @@ pub enum Request {
     /// checks out: the trees `roots` and everything below them that the
     /// store holds. Replaces that key's earlier roots; no roots removes it.
     Pin { upstream: String, project: String, key: String, roots: Vec<ObjectId> },
+    /// Watch working copy `root` and answer what changed since `token`
+    /// (milestone S7).
+    Watch {
+        root: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_dirs: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_dirty_paths: Option<usize>,
+    },
     /// The projects followed (for `vl daemon follow`).
     Follows,
     Status,
