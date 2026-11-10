@@ -23,6 +23,7 @@ mod agent;
 mod api;
 mod attr_cmd;
 mod auto_gc;
+mod ci_cmd;
 mod cli;
 mod confine;
 mod ctx;
@@ -468,6 +469,9 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             println!("Recorded attempt {}; the change starts again: {}", out.attempt.short(), one_line(&ctx.repo, &out.change));
         }
         Cmd::Session(SessionCmd::Agent { only, attribution }) => return session_cmd::agent(ctx, only, attribution),
+        Cmd::Session(SessionCmd::Ci { check, only, attribution }) => {
+            return session_cmd::ci(ctx, check.as_deref(), only, attribution)
+        }
         Cmd::Rebase { source, destination } => {
             let src = ctx.rev(source)?;
             let dest = destination.iter().map(|d| ctx.rev(d)).collect::<Result<Vec<_>>>()?;
@@ -700,6 +704,27 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         #[cfg(debug_assertions)]
         Cmd::Pull { remote } if test_remotes::is_path_remote(ctx, remote) => test_remotes::pull(ctx, remote)?,
         Cmd::Pull { remote } => hub_cmd::pull(ctx, remote)?,
+        Cmd::Checks {
+            rev,
+            name,
+            state,
+            summary,
+            url,
+            log,
+            out,
+        } => {
+            return ci_cmd::checks(
+                ctx,
+                rev.as_deref(),
+                name.as_deref(),
+                state.as_deref(),
+                summary.as_deref(),
+                url.as_deref(),
+                log.as_deref(),
+                out.json,
+            )
+        }
+        Cmd::Tested { branch, out } => return ci_cmd::tested(ctx, branch, out.json),
         Cmd::Partial(c) => thin::run(ctx, c)?,
         Cmd::Hooks(c) => return hooks::run(ctx, c),
         Cmd::Gc {
@@ -2184,7 +2209,10 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
         WsCmd::New { name, rev } => {
             let bases = match rev {
                 Some(r) => vec![ctx.rev(r)?],
-                None => ctx.repo.snapshot(&ctx.wc()?)?.parents.clone(),
+                None => match ci_cmd::default_ws_base(ctx)? {
+                    Some(tested) => vec![tested],
+                    None => ctx.repo.snapshot(&ctx.wc()?)?.parents.clone(),
+                },
             };
             let wc = ctx.repo.create_workspace(name, bases)?;
             println!("Created virtual workspace {} at {}", bold(name), one_line(&ctx.repo, &wc));

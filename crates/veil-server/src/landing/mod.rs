@@ -16,7 +16,7 @@
 //! per batch, in one transaction. A change that overlaps is answered
 //! `conflict`, never landed over (content merges are S18).
 //!
-//! **Protected branches** ([`rules`]): only the landing service moves them;
+//! **Protected branches** ([`mod@rules`]): only the landing service moves them;
 //! a push to one lands its new changes instead.
 
 pub mod edits;
@@ -232,20 +232,26 @@ pub(crate) async fn snapshot_author(
 }
 
 
+/// The rules of a project: `.veilrules` at its default branch's tip
+/// `default_tip` (real), if it has one.
+pub fn rules(src: &Source, default_tip: Option<ObjectId>) -> Result<rules::Rules> {
+    let Some(tip) = default_tip else { return Ok(Default::default()) };
+    let tree = src.snapshot(&tip)?.tree;
+    Ok(match crate::sync::entry_at(src, &tree, rules::RULES_FILE)? {
+        Some(e) if e.kind == veil_core::object::EntryKind::File => match veil_core::object::Object::decode(&src.raw(&e.id)?)? {
+            veil_core::object::Object::Blob(b) => rules::Rules::parse(&String::from_utf8_lossy(&b)).unwrap_or_default(),
+            _ => Default::default(),
+        },
+        _ => Default::default(),
+    })
+}
+
 /// The protected branches of a project: the rules of its default branch's
 /// tip `default_tip` (real), if it has one. A `.veilrules` that does not
 /// parse protects nothing (only admins write it, and their push refuses one
 /// that does not parse; an older project's may predate the rules).
 pub fn protected(src: &Source, default_tip: Option<ObjectId>) -> Result<std::collections::BTreeSet<String>> {
-    let Some(tip) = default_tip else { return Ok(Default::default()) };
-    let tree = src.snapshot(&tip)?.tree;
-    Ok(match crate::sync::entry_at(src, &tree, rules::RULES_FILE)? {
-        Some(e) if e.kind == veil_core::object::EntryKind::File => match veil_core::object::Object::decode(&src.raw(&e.id)?)? {
-            veil_core::object::Object::Blob(b) => rules::Rules::parse(&String::from_utf8_lossy(&b)).map(|r| r.protected).unwrap_or_default(),
-            _ => Default::default(),
-        },
-        _ => Default::default(),
-    })
+    Ok(rules(src, default_tip)?.protected)
 }
 
 /// Counters for the benchmarks (`DATA/stats.json`).
@@ -703,7 +709,8 @@ pub async fn submit(
                 )),
             }
         }
-        (None, Some(base)) => {
+        (None, base) if base.is_some() || !req.edits.is_empty() => {
+            let base = base.unwrap_or(ObjectId([0; 32]));
             let q = Queued {
                 ticket: ticket(),
                 branch: req.onto.clone(),

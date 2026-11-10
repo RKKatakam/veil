@@ -35,6 +35,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/auth/challenge", post(auth::challenge))
         .route("/v1/auth/login", post(auth::login))
         .route("/v1/sessions/agent", post(auth::agent_session))
+        .route("/v1/sessions/ci", post(crate::ci::ci_session))
         .route("/v1/people/{name}/devices", get(devices))
         .route("/v1/people/{name}/pending/{fingerprint}", get(pending_device))
         .route("/v1/devices/vouch", post(vouch))
@@ -52,6 +53,8 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/land", post(land))
         .route("/v1/projects/{p}/land/{ticket}", get(land_status))
         .route("/v1/projects/{p}/events", get(crate::events::route))
+        .route("/v1/projects/{p}/checks", post(crate::ci::post_check_route).get(crate::ci::list_checks_route))
+        .route("/v1/projects/{p}/tested/{branch}", get(crate::ci::tested_route))
         .route("/v1/projects/{p}/access", get(access))
         .route("/v1/projects/{p}/groups", get(list_groups))
         .route("/v1/projects/{p}/groups/{g}", post(create_group).delete(delete_group))
@@ -571,11 +574,13 @@ async fn tips(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>
     // change voids the grants made with them.
     let (project, viewer, epochs) = perm::open_at(&hub, &p, &caller).await?;
     let branches = sync::tips(&hub, &project, &viewer).await?.into_iter().collect();
+    let tested = crate::ci::all_tested_for(&hub, &project, &viewer).await?;
     let grants = crate::grant::for_tips(&hub, &project, &viewer, &caller, epochs, &branches).await?;
     Ok(Json(Tips {
         grants,
         grant_key: Some(hub.grants.key_hex().to_string()),
         branches,
+        tested,
         default_branch: project.default_branch,
         you: caller.person.map(|p| p.name),
         admin: viewer.admin,
@@ -642,7 +647,7 @@ async fn objects(
     Path(p): Path<String>,
     body: Bytes,
 ) -> Result<Json<veil_core::hub::wire::Uploaded>> {
-    let me = caller.signed_in()?.id;
+    let me = caller.not_runner()?.id;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
@@ -655,7 +660,7 @@ async fn objects(
 }
 
 async fn push(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<PushRequest>) -> Result<Json<PushResult>> {
-    let person = caller.signed_in()?.clone();
+    let person = caller.not_runner()?.clone();
     let (project, viewer, epochs) = perm::open_at(&hub, &p, &caller).await?;
     let who = crate::landing::Submitter { person, epochs };
     Ok(Json(sync::push(&hub, &project, &viewer, &who, req).await?))
@@ -668,7 +673,7 @@ async fn land(
     Path(p): Path<String>,
     Json(req): Json<veil_core::hub::land::LandRequest>,
 ) -> Result<Json<veil_core::hub::land::LandResult>> {
-    let person = caller.signed_in()?.clone();
+    let person = caller.not_runner()?.clone();
     let (project, viewer, epochs) = perm::open_at(&hub, &p, &caller).await?;
     let who = crate::landing::Submitter { person, epochs };
     Ok(Json(crate::landing::submit(&hub, &project, &viewer, &caller, who, req).await?))
@@ -714,7 +719,7 @@ async fn changes(
     Path(p): Path<String>,
     Json(req): Json<veil_core::hub::changes::ChangeRequest>,
 ) -> Result<Json<veil_core::hub::changes::ChangeResult>> {
-    caller.signed_in()?;
+    caller.not_runner()?;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     Ok(Json(crate::changes::create(&hub, &project, &viewer, &caller, req).await?))
 }

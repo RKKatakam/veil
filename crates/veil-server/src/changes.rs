@@ -765,7 +765,17 @@ async fn tip(hub: &Hub, project: i64, branch: &str) -> Result<Option<ObjectId>> 
 /// see it as `base`, else the newest real snapshot that is `base` for
 /// them. Anything else is not found, as for every snapshot they may not
 /// see (a real id of a snapshot they see only part of included).
-async fn resolve_base(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, base: ObjectId, onto: Option<&str>, landing: bool) -> Result<ObjectId> {
+async fn resolve_base(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, mut base: ObjectId, onto: Option<&str>, landing: bool) -> Result<ObjectId> {
+    if base == ObjectId([0; 32]) {
+        let branch = onto.unwrap_or(&project.default_branch);
+        if let Some(tested) = crate::ci::tested_for(hub, project, viewer, branch).await? {
+            base = tested;
+        } else if let Some(t) = tip(hub, project.id, branch).await? {
+            base = sync::projected(hub, project, viewer, t).await?;
+        } else {
+            return Err(Error::not_found(format!("no branch '{branch}' that you can see")));
+        }
+    }
     // A landing lands its edits on the tip, never its parent's hidden
     // files, and any snapshot they see as `base` gives the same edits: the
     // server's memory of their view answers first, checked.
@@ -863,7 +873,7 @@ pub(crate) async fn create_with(
     req: ChangeRequest,
     mut land: Option<(crate::landing::Submitter, crate::landing::Queued)>,
 ) -> Result<ChangeResult> {
-    let person = caller.signed_in()?.clone();
+    let person = caller.not_runner()?.clone();
     if land.is_some() && req.onto.is_some() {
         return Err(bad("a landing names its branch once (`onto` of the landing)"));
     }
@@ -888,6 +898,11 @@ pub(crate) async fn create_with(
     };
     let target = onto.as_ref().map(|o| o.branch.clone()).or_else(|| land.as_ref().map(|(_, q)| q.branch.clone()));
     let base_real = resolve_base(hub, project, viewer, req.base, target.as_deref(), land.is_some()).await?;
+    let base_proj = if req.base == ObjectId([0; 32]) {
+        sync::projected(hub, project, viewer, base_real).await?
+    } else {
+        req.base
+    };
     // A new revision of one of the caller's own changes, or a new change.
     let (change_id, predecessors) = match req.change_id {
         Some(cid) => {
@@ -944,7 +959,7 @@ pub(crate) async fn create_with(
             rejected = Some(format!("'{}' is protected: land the change instead (`vl land`, `POST …/land`)", o.branch));
         }
     }
-    let (mut parent, mut pparent) = (base_real, req.base);
+    let (mut parent, mut pparent) = (base_real, base_proj);
     let mut restacked = Vec::new();
     if let (Some(o), Some(c)) = (&onto, cur) {
         if let Expected::Tip(t) = o.expected {
