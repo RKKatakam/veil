@@ -437,6 +437,7 @@ const STORED_CURSOR: &str = "frontier-";
 /// now (BUG-1413, `files::sweep_keys`). A cursor so dropped is refused when sent
 /// back (`invalid cursor`): the log is asked for again from its start.
 fn keep_cursor(cx: &crate::derive::Cx, vk: &str, id: &str, text: &str, limits: &Limits) -> Result<()> {
+    cx.src.rt.block_on(files::sweep_keys(cx.hub(), cx.project()))?;
     let now = veil_core::now_millis();
     let pool = &cx.hub().db;
     cx.db(|| {

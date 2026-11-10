@@ -2598,13 +2598,16 @@ mod s14rd2_review {
         let (policy_text, bindings) = policy(1);
         let mut h = Hist::new(&th, &policy_text, &bindings);
         let path = "pub/f/long.txt";
-        let n = 2000usize;
+        let n = 1200usize;
+        let lines = 2400usize;
         let mut f = Files::new();
-        let mut body: Vec<String> = (0..400).map(|i| format!("line {i} of a long file\n")).collect();
+        let mut body: Vec<String> = (0..lines).map(|i| format!("line {i} of a long file\n")).collect();
         let mut tip = root_snapshot_id();
         let mut snaps = Vec::new();
         for i in 0..n {
-            body[(i * 7) % 400] = format!("edited at change {i}\n");
+            for k in 0..600 {
+                body[(i + k * 4) % lines] = format!("edited at change {i} slot {k}\n");
+            }
             f.insert(path.to_string(), body.concat().into_bytes());
             let mut change = [46u8; 16];
             change[..2].copy_from_slice(&(i as u16).to_le_bytes());
@@ -2649,7 +2652,7 @@ mod s14rd2_review {
         // The other server's lease ends: a new job answers.
         th.rt.block_on(async { sqlx::query("DELETE FROM blame_jobs WHERE project_id = $1").bind(h.id).execute(&h.hub.db).await.unwrap() });
         let (r, _) = until(&th, &h, &a, q, limits(2000, BlameLimits::default()), 300);
-        assert_eq!(r.expect("the blame answers once the lease is free")["line_count"], 400);
+        assert_eq!(r.expect("the blame answers once the lease is free")["line_count"], lines);
     }
 
     /// Property 4 (`blame_ends` stays correct): whether a job passes its

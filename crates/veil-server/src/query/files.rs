@@ -1051,10 +1051,12 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             // Stored per version: `Some((id, line_count))` if plain text, plus `Option<Arc<Text>>` if retained past the chunk.
             let mut chunk_info: Vec<Option<(ObjectId, usize, Option<Arc<Text>>)>> = Vec::with_capacity(slice.len());
             let mut pre_maps: Vec<Vec<Option<crate::derive::blame::ParentMap>>> = slice.iter().map(|v| vec![None; nodes[v].parents.len()]).collect();
-            if slice.len() <= 2 && diff_specs.len() <= 1 {
+            let used_pool = !(slice.len() <= 2 && diff_specs.len() <= 1);
+            if !used_pool {
                 let mut loaded: Vec<Option<Arc<Text>>> = Vec::with_capacity(slice.len());
                 let mut prev_text: Option<Arc<Text>> = parent_done.clone();
                 for e in &entries {
+                    self.stopped()?;
                     let t = load_raw(e)?.and_then(|(id, bytes)| match &prev_text {
                         Some(bt) => Text::try_plain_from_parent(id, bytes, bt),
                         None => Text::try_plain(id, bytes),
@@ -1090,6 +1092,9 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                     let trigger = p_idx.map_or(vi, |pi| vi.max(pi));
                     diffs_by_max[trigger].push(di);
                 }
+                let aborted = std::sync::atomic::AtomicBool::new(false);
+                let lease_ref = self.lease.as_deref();
+                let steps_counter = &self.f.g.cx.hub().query.blame_steps;
                 let base_ref = &parent_done;
                 let specs_ref = &diff_specs;
                 let by_max_ref = &diffs_by_max;
@@ -1100,6 +1105,9 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                                 return None;
                             }
                             return out_text[idx].lock().unwrap().clone();
+                        }
+                        if aborted.load(std::sync::atomic::Ordering::Acquire) {
+                            return None;
                         }
                         std::hint::spin_loop();
                     }
@@ -1114,12 +1122,20 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                         s.spawn(|| {
                             let mut prev_text: Option<Arc<Text>> = base_ref.clone();
                             loop {
+                                if aborted.load(std::sync::atomic::Ordering::Acquire) || lease_ref.is_some_and(|l| !l.live()) {
+                                    aborted.store(true, std::sync::atomic::Ordering::Release);
+                                    return;
+                                }
                                 let i = next_i.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 if i >= entries.len() {
                                     break;
                                 }
                                 if all_linear {
                                     while i > diffs_done.load(std::sync::atomic::Ordering::Acquire) + WORKERS * 2 {
+                                        if aborted.load(std::sync::atomic::Ordering::Acquire) || lease_ref.is_some_and(|l| !l.live()) {
+                                            aborted.store(true, std::sync::atomic::Ordering::Release);
+                                            return;
+                                        }
                                         std::hint::spin_loop();
                                     }
                                 }
@@ -1129,6 +1145,10 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                                         None => Text::try_plain(id, bytes),
                                     })
                                 });
+                                if aborted.load(std::sync::atomic::Ordering::Acquire) || lease_ref.is_some_and(|l| !l.live()) {
+                                    aborted.store(true, std::sync::atomic::Ordering::Release);
+                                    return;
+                                }
                                 let meta_res = match r {
                                     Ok(Some(t)) => {
                                         let m = Some((t.id, t.lines.len()));
@@ -1141,8 +1161,13 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                                     Ok(None) => Ok(None),
                                     Err(e) => Err(e),
                                 };
+                                let is_text = matches!(meta_res, Ok(Some(_)));
                                 let _ = out_meta[i].set(meta_res);
                                 for &di in &by_max_ref[i] {
+                                    if aborted.load(std::sync::atomic::Ordering::Acquire) || lease_ref.is_some_and(|l| !l.live()) {
+                                        aborted.store(true, std::sync::atomic::Ordering::Release);
+                                        return;
+                                    }
                                     let (vi, _, p_idx, ref done_pt) = specs_ref[di];
                                     let child_opt = get_text(vi);
                                     let parent_opt = match p_idx {
@@ -1151,6 +1176,10 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                                     };
                                     if let (Some(pt), Some(text)) = (parent_opt, child_opt) {
                                         let m = crate::derive::blame::diff_parent(&pt, &text);
+                                        if aborted.load(std::sync::atomic::Ordering::Acquire) || lease_ref.is_some_and(|l| !l.live()) {
+                                            aborted.store(true, std::sync::atomic::Ordering::Release);
+                                            return;
+                                        }
                                         *out_d[di].lock().unwrap() = Some(m);
                                     }
                                     release_use(vi);
@@ -1159,10 +1188,21 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                                     }
                                     diffs_done.fetch_add(1, std::sync::atomic::Ordering::Release);
                                 }
+                                if aborted.load(std::sync::atomic::Ordering::Acquire) || lease_ref.is_some_and(|l| !l.live()) {
+                                    aborted.store(true, std::sync::atomic::Ordering::Release);
+                                    return;
+                                }
+                                if is_text {
+                                    steps_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
                             }
                         });
                     }
                 });
+                if aborted.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(warming());
+                }
+                self.stopped()?;
                 for (m, t_lock) in out_meta.into_iter().zip(out_text) {
                     let meta_opt = m.into_inner().unwrap()?;
                     let t_opt = t_lock.into_inner().unwrap();
@@ -1176,6 +1216,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             }
             // 2. Propagate blames sequentially in topological order and maintain exact held accounting.
             for (vi, v) in slice.iter().enumerate() {
+                self.stopped()?;
                 let parents = nodes[v].parents.clone();
                 // If `v` has a single parent `p` whose blame is ready to be
                 // consumed (`pn.left == 1 && p != start`), take `p` from `done`
@@ -1238,7 +1279,9 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                             Arc::new(b)
                         };
                         chain_last = Some(v.clone());
-                        self.f.g.cx.hub().query.blame_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if !used_pool {
+                            self.f.g.cx.hub().query.blame_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         let should_keep = *v == *start || (b.vd % CHECKPOINT == 0 && b.vd % spacing(computed, b.stored_estimate()) == 0);
                         if should_keep {
                             if self.limits.held >= 4 << 20 {
@@ -1283,6 +1326,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                 }
             }
             if !pending_keeps.is_empty() && (idx == unkept.len() || pending_keeps.len() >= BATCH_BLAMES) {
+                self.stopped()?;
                 let mut needed_ids: Vec<ObjectId> = Vec::new();
                 for (_, kb) in &pending_keeps {
                     for &(o, _) in &kb.lines {
@@ -1501,6 +1545,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         if self.writes.is_empty() {
             return Ok(());
         }
+        self.stopped()?;
         let w = std::mem::take(&mut self.writes);
         let paths = std::mem::take(&mut self.write_paths);
         self.pending_bytes = 0;
@@ -2240,6 +2285,10 @@ async fn leased_job(
             }
             ticket.computing.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        // Sweep any prior access change before writing under this job's key,
+        // so the post-job sweep does not record an earlier change after the
+        // write and drop rows written after that change (BUG-1711).
+        sweep_keys(hub, key.0).await?;
         // Kept blames written from here on are this job's or another's of
         // the same key: a too-wide record is written only if none of a path
         // the walk reached was (BUG-1555); the margin is for clocks.
