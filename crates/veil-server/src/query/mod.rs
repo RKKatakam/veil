@@ -193,6 +193,9 @@ pub async fn resolve(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instant) ->
     };
     let real = match parse_id(rev) {
         Some(id) => {
+            if let Some(r) = graph::cached_row(hub, project, &vk, &id) {
+                return if r.withheld() { Err(no_revision()) } else { Ok(id) };
+            }
             if let Some(r) = row_of(id).await? {
                 return if r.withheld() { Err(no_revision()) } else { Ok(id) };
             }
@@ -231,6 +234,13 @@ pub async fn resolve(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instant) ->
         }
     };
     let p = ensure(hub, &ask.project, &ask.viewer, &[real], Some(deadline)).await?[0];
+    if let Some(r) = graph::cached_row(hub, project, &vk, &p) {
+        return if !r.withheld() && (parse_id(rev).is_none() || parse_id(rev) == Some(p)) {
+            Ok(p)
+        } else {
+            Err(no_revision())
+        };
+    }
     match row_of(p).await? {
         Some(r) if !r.withheld() && (parse_id(rev).is_none() || parse_id(rev) == Some(p)) => Ok(p),
         _ => Err(no_revision()),
@@ -1128,30 +1138,49 @@ pub async fn blame(hub: &Arc<Hub>, ask: &Ask, q: BlameParams, limits: Limits) ->
     let not_text = || Error::bad_request("not a plain-text file of at most 1 MiB: nothing to blame line by line");
     // The answer from the kept blame of the version asked for; else the
     // version, whose blame job the request waits for (S14 cycle 3).
-    let answer = |path: String| {
+    let seeded_win = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let answer = |path: String, take_win: bool| {
+        let seeded_win = seeded_win.clone();
         on_graph(hub, ask, deadline, move |g, t| {
             let e = file_entry(g, t, &id, &path)?.ok_or_else(no_path)?;
             if !e.visibility.is_public() {
                 return Err(Error::bad_request("a secret: its content is encrypted, and the server cannot read it"));
             }
             let f = files::Files::new(g);
+            f.set_fast_pages(take_win && limits.blame.held >= 4 << 20);
             let (depth, x) = f.intro(id, &path)?.ok_or_else(|| Error::Other(anyhow::anyhow!("file history: no version of a file present")))?;
             let start = files::Version { id: x, depth, path: Arc::from(path.as_str()) };
             match files::kept_answer(&f, t, id, &start, follow, after, n, limits.blame)? {
                 Some(v) => Ok(v),
-                None => Ok(json!({ "pending": start })),
+                None => {
+                    if take_win && limits.blame.held >= 4 << 20 {
+                        *seeded_win.lock().unwrap() = f.take_window(&path);
+                    }
+                    Ok(json!({ "pending": start }))
+                }
             }
         })
     };
-    let v = answer(path.clone()).await?;
+    let t_b0 = Instant::now();
+    let v = answer(path.clone(), true).await?;
+    let t_b1 = Instant::now();
     let Some(pending) = v.get("pending") else { return Ok(v) };
     let start: files::Version = serde_json::from_value(pending.clone()).map_err(|e| Error::Other(e.into()))?;
-    match files::wait_for_blame(hub, &ask.project, &ask.viewer, &start, follow, limits.blame, deadline).await? {
-        files::JobEnd::Kept => {}
+    let win = seeded_win.lock().unwrap().take();
+    match files::wait_for_blame(hub, &ask.project, &ask.viewer, &start, follow, limits.blame, deadline, win).await? {
+        files::JobEnd::Kept(Some((text, bl))) => {
+            let t_b2 = Instant::now();
+            let mut ans = files::blame_json_direct(id, &path, follow, &text, &bl, after, n)?;
+            ans["policy_version"] = json!(ask.policy_version);
+            ans["work"] = v["work"].clone();
+            eprintln!("BLAME: answer1={:?} wait={:?} json={:?}", t_b1 - t_b0, t_b2 - t_b1, t_b2.elapsed());
+            return Ok(ans);
+        }
+        files::JobEnd::Kept(None) => {}
         files::JobEnd::NoText => return Err(not_text()),
         files::JobEnd::Failed(status, code, message) => return Err(Error::Api { status, code, message }),
     }
-    let v = answer(path).await?;
+    let v = answer(path, false).await?;
     if v.get("pending").is_some() {
         // Kept, then dropped by the project's cap (or another server's job
         // found it kept before it was): ask again.

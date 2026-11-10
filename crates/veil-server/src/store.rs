@@ -348,6 +348,9 @@ pub struct Objects {
     store: Arc<dyn BlobStore>,
     /// Encodings, checked against their ids.
     cache: LruCache<Bytes>,
+    /// Decoded canonical bytes for objects up to [`RAW_CACHE_MAX_OBJECT`],
+    /// checked against their ids.
+    raw_cache: LruCache<Bytes>,
     /// Requests to the store, for the benchmarks' cost gates
     /// (`storage-and-cost.md` §9): writes, bytes written, reads.
     pub writes: std::sync::atomic::AtomicU64,
@@ -358,6 +361,8 @@ pub struct Objects {
 /// The largest object the store holds, decoded: the largest a frame
 /// carries.
 const MAX_OBJECT: u64 = veil_core::hub::wire::MAX_FRAME_OBJECT as u64;
+/// Largest decoded object cached in [`Objects::raw_cache`].
+const RAW_CACHE_MAX_OBJECT: usize = 1 << 20;
 
 /// The object `id` decoded from its encoding `enc`, checked.
 fn decoded(id: &ObjectId, enc: &Bytes) -> Result<Bytes> {
@@ -367,11 +372,23 @@ fn decoded(id: &ObjectId, enc: &Bytes) -> Result<Bytes> {
     }
 }
 
+/// [`decoded`] for an entry in [`Objects::cache`], which was already checked
+/// against `id` before insertion.
+fn decoded_cached(id: &ObjectId, enc: &Bytes) -> Result<Bytes> {
+    match encoding::decode_trusted(id, enc, MAX_OBJECT).map_err(|_| anyhow!("stored object {} does not match its id", id.short()))? {
+        Cow::Borrowed(_) => Ok(enc.clone()),
+        Cow::Owned(raw) => Ok(Bytes::from(raw)),
+    }
+}
+
 impl Objects {
     pub fn new(store: Arc<dyn BlobStore>, cache_bytes: usize) -> Objects {
+        let raw_bytes = (cache_bytes / 4).max(1);
+        let enc_bytes = cache_bytes.saturating_sub(raw_bytes).max(1);
         Objects {
             store,
-            cache: LruCache::new(cache_bytes),
+            cache: LruCache::new(enc_bytes),
+            raw_cache: LruCache::new(raw_bytes),
             writes: Default::default(),
             written_bytes: Default::default(),
             reads: Default::default(),
@@ -388,17 +405,29 @@ impl Objects {
     }
 
     fn cache_key(project: i64, id: &ObjectId) -> ObjectId {
-        let mut h = blake3::Hasher::new();
-        h.update(&project.to_le_bytes());
-        h.update(&id.0);
-        ObjectId(*h.finalize().as_bytes())
+        let mut out = id.0;
+        let p = project.to_le_bytes();
+        for i in 0..8 {
+            out[i] ^= p[i];
+        }
+        ObjectId(out)
     }
 
     /// The object `id` of `project` (its canonical encoding), checked
     /// against its id.
     pub async fn get(&self, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
-        match self.cache.get(&Self::cache_key(project, id)) {
-            Some(enc) => decoded(id, &enc).map(Some),
+        let ck = Self::cache_key(project, id);
+        if let Some(raw) = self.raw_cache.get(&ck) {
+            return Ok(Some(raw));
+        }
+        match self.cache.get(&ck) {
+            Some(enc) => {
+                let raw = decoded_cached(id, &enc)?;
+                if raw.len() <= RAW_CACHE_MAX_OBJECT {
+                    self.raw_cache.insert(ck, raw.clone(), raw.len());
+                }
+                Ok(Some(raw))
+            }
             None => {
                 self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.load(project, id, self.store.get(&object_key(project, id)).await?)
@@ -417,8 +446,11 @@ impl Objects {
         let Some(enc) = self.store.get(&object_key(project, id)).await? else {
             return Ok(None);
         };
-        decoded(id, &enc)?;
+        let raw = decoded(id, &enc)?;
         self.cache.insert(ck, enc.clone(), enc.len());
+        if raw.len() <= RAW_CACHE_MAX_OBJECT {
+            self.raw_cache.insert(ck, raw.clone(), raw.len());
+        }
         Ok(Some(enc))
     }
 
@@ -426,15 +458,27 @@ impl Objects {
     fn load(&self, project: i64, id: &ObjectId, enc: Option<Bytes>) -> Result<Option<Bytes>> {
         let Some(enc) = enc else { return Ok(None) };
         let raw = decoded(id, &enc)?;
-        self.cache.insert(Self::cache_key(project, id), enc.clone(), enc.len());
+        let ck = Self::cache_key(project, id);
+        self.cache.insert(ck, enc.clone(), enc.len());
+        if raw.len() <= RAW_CACHE_MAX_OBJECT {
+            self.raw_cache.insert(ck, raw.clone(), raw.len());
+        }
         Ok(Some(raw))
     }
 
     /// [`Objects::get`] from a blocking thread: a local store is read
     /// directly; any other through `rt`.
     pub fn get_blocking(&self, rt: &tokio::runtime::Handle, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
-        if let Some(enc) = self.cache.get(&Self::cache_key(project, id)) {
-            return decoded(id, &enc).map(Some);
+        let ck = Self::cache_key(project, id);
+        if let Some(raw) = self.raw_cache.get(&ck) {
+            return Ok(Some(raw));
+        }
+        if let Some(enc) = self.cache.get(&ck) {
+            let raw = decoded_cached(id, &enc)?;
+            if raw.len() <= RAW_CACHE_MAX_OBJECT {
+                self.raw_cache.insert(ck, raw.clone(), raw.len());
+            }
+            return Ok(Some(raw));
         }
         let Some(r) = self.store.get_blocking(&object_key(project, id)) else {
             return rt.block_on(self.get(project, id));
@@ -446,6 +490,9 @@ impl Objects {
     /// Store object `id` (its canonical encoding `raw`), compressed when
     /// that is smaller.
     pub async fn put(&self, project: i64, id: &ObjectId, raw: Bytes) -> Result<()> {
+        if raw.len() <= RAW_CACHE_MAX_OBJECT {
+            self.raw_cache.insert(Self::cache_key(project, id), raw.clone(), raw.len());
+        }
         let enc = match encoding::encode(&raw) {
             Cow::Borrowed(_) => raw,
             Cow::Owned(z) => Bytes::from(z),

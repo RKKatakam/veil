@@ -155,13 +155,23 @@ pub fn too_slow() -> Error {
 }
 
 fn cache_key(project: i64, vk: &str, id: &ObjectId) -> ObjectId {
-    let mut h = blake3::Hasher::new();
-    h.update(b"view-graph");
-    h.update(&project.to_le_bytes());
-    h.update(&(vk.len() as u64).to_le_bytes());
-    h.update(vk.as_bytes());
-    h.update(&id.0);
-    ObjectId(*h.finalize().as_bytes())
+    let mut k = id.0;
+    let p = project.to_le_bytes();
+    for i in 0..8 {
+        k[i] ^= p[i];
+    }
+    for (i, &b) in vk.as_bytes().iter().enumerate() {
+        k[8 + (i % 24)] ^= b.wrapping_add(i as u8);
+    }
+    ObjectId(k)
+}
+
+/// Return a cached [`VRow`] if already present in `hub.query.rows`.
+pub fn cached_row(hub: &crate::Hub, project: i64, vk: &str, id: &ObjectId) -> Option<Arc<VRow>> {
+    if *id == root() {
+        return Some(Arc::new(VRow::root()));
+    }
+    hub.query.rows.get(&cache_key(project, vk, id))
 }
 
 /// Reads of one viewer's graph, on a blocking thread.
@@ -240,9 +250,28 @@ impl<'a> G<'a> {
         Ok(Some(r))
     }
 
+    /// The cached generation of `id`, if already in `local` or `hub.query.rows`.
+    pub fn cached_generation(&self, id: &ObjectId) -> Option<i64> {
+        if *id == root() {
+            return Some(0);
+        }
+        if let Some(r) = self.local.borrow().get(id) {
+            return Some(r.generation);
+        }
+        let k = cache_key(self.cx.project(), self.vk, id);
+        if let Some(r) = self.cx.hub().query.rows.get(&k) {
+            let g = r.generation;
+            self.local.borrow_mut().insert(*id, r);
+            return Some(g);
+        }
+        None
+    }
+
     /// Keep `row` of `id`, computed and not written yet (a fill's), for
     /// the walks of this reader.
     pub fn keep(&self, id: ObjectId, row: Arc<VRow>) {
+        let k = cache_key(self.cx.project(), self.vk, &id);
+        self.cx.hub().query.rows.insert(k, row.clone(), 320);
         self.local.borrow_mut().insert(id, row);
     }
 

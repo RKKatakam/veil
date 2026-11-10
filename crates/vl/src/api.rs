@@ -956,7 +956,7 @@ pub struct LogEntry {
     pub(crate) timestamp_ms: i64,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 pub struct TagLabel {
     pub name: String,
 }
@@ -1138,7 +1138,7 @@ fn thin_query_log<'a>(
     mut workspaces: HashMap<ObjectId, Vec<String>>,
     current: Option<ObjectId>,
     root: ObjectId,
-) -> Result<LogEntries<'a>> {
+) -> Result<Option<LogEntries<'a>>> {
     // Partition the view's visible heads (or `explicit_roots`) into commits
     // only this clone holds and snapshots on the server (including server
     // bases below local commits).
@@ -1295,6 +1295,7 @@ fn thin_query_log<'a>(
                     }
                     let v = match promisor.query("history", &params)? {
                         Ok(v) => v,
+                        Err((code, msg)) if code == "not_found" && msg.contains("revision") => return Ok(None),
                         Err((code, _)) if code == "no_path" || code == "not_found" => break,
                         Err((code, msg)) => anyhow::bail!("{msg} (server: {code})"),
                     };
@@ -1341,6 +1342,7 @@ fn thin_query_log<'a>(
                     }
                     let v = match promisor.query("log", &params)? {
                         Ok(v) => v,
+                        Err((code, msg)) if code == "not_found" && msg.contains("revision") => return Ok(None),
                         Err((code, _)) if code == "no_path" || code == "not_found" => break,
                         Err((code, msg)) => anyhow::bail!("{msg} (server: {code})"),
                     };
@@ -1525,7 +1527,7 @@ fn thin_query_log<'a>(
     helper.truncated = truncated;
     helper.precomputed_search = path_filter.map(|_| LogSearch { searched, skipped: 0, stopped: false });
     helper.precomputed = Some(entries.into_iter());
-    Ok(helper)
+    Ok(Some(helper))
 }
 
 pub fn log_entries_with<'a>(repo: &'a Repo, ws: &str, mut q: LogQuery) -> Result<LogEntries<'a>> {
@@ -1551,20 +1553,22 @@ pub fn log_entries_with<'a>(repo: &'a Repo, ws: &str, mut q: LogQuery) -> Result
                 .store()
                 .promisor()
                 .ok_or_else(|| veil_core::VeilError::Unavailable("this thin clone has no connection to its server".into()))?;
-            return thin_query_log(
+            if let Some(entries) = thin_query_log(
                 repo,
                 &*promisor,
-                q.roots,
+                q.roots.clone(),
                 path_filter,
                 q.limit,
                 q.show_skipped,
-                signers,
-                tags,
-                remote_tags,
-                workspaces,
+                signers.clone(),
+                tags.clone(),
+                remote_tags.clone(),
+                workspaces.clone(),
                 current,
                 root,
-            );
+            )? {
+                return Ok(entries);
+            }
         }
     }
 
@@ -3257,6 +3261,7 @@ fn thin_query_blame(
         let v = match promisor.query("blame", &params)? {
             Ok(v) => v,
             Err((code, _)) if code == "bad_request" => return Ok(None),
+            Err((code, msg)) if code == "not_found" && msg.contains("revision") => return Ok(None),
             Err((code, _)) if code == "no_path" || code == "not_found" => {
                 anyhow::bail!("{} does not exist in {}", crate::render::safe(p.as_str()), id.short());
             }
@@ -3627,6 +3632,7 @@ fn thin_query_grep(
         }
         let v = match promisor.query("grep", &params)? {
             Ok(v) => v,
+            Err((code, msg)) if code == "not_found" && msg.contains("revision") => return Ok(None),
             Err((code, _)) if code == "no_path" || code == "not_found" => break,
             Err((code, msg)) => anyhow::bail!("{msg} (server: {code})"),
         };

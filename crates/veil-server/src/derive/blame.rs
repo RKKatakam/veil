@@ -93,6 +93,28 @@ impl Meta {
             generation,
         }
     }
+
+    /// Decode only the metadata fields needed by blame from a trusted
+    /// canonical `veil:snap\n` payload, skipping parents, tree, and signature
+    /// hex decoding.
+    pub fn from_raw_snapshot(raw: &[u8], generation: i64) -> Option<Meta> {
+        #[derive(Deserialize)]
+        struct RawSnap {
+            change_id: String,
+            description: veil_core::object::Text,
+            author: String,
+            timestamp: i64,
+        }
+        let body = raw.strip_prefix(b"veil:snap\n")?;
+        let s: RawSnap = serde_json::from_slice(body).ok()?;
+        Some(Meta {
+            change_id: s.change_id,
+            author: first_line(&s.author, MAX_AUTHOR),
+            timestamp: s.timestamp,
+            summary: first_line(s.description.as_str(), MAX_SUMMARY),
+            generation,
+        })
+    }
 }
 
 /// The stored form: runs of lines with one origin and consecutive lines
@@ -120,6 +142,81 @@ pub const MAX_BYTES_PER_LINE: usize = 128;
 pub const MAX_BYTES_PER_CHANGE: usize = 768;
 pub const BASE_BYTES: usize = 128;
 
+fn write_hex(out: &mut String, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 64];
+    for (i, &b) in bytes.iter().enumerate() {
+        buf[2 * i] = HEX[(b >> 4) as usize];
+        buf[2 * i + 1] = HEX[(b & 0xf) as usize];
+    }
+    out.push_str(std::str::from_utf8(&buf[..bytes.len() * 2]).unwrap());
+}
+
+fn write_u64(out: &mut String, mut v: u64) {
+    if v == 0 {
+        out.push('0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 20;
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    out.push_str(std::str::from_utf8(&buf[i..]).unwrap());
+}
+
+fn write_i64(out: &mut String, v: i64) {
+    if v < 0 {
+        out.push('-');
+        write_u64(out, v.unsigned_abs());
+    } else {
+        write_u64(out, v as u64);
+    }
+}
+
+fn write_json_str(out: &mut String, s: &str) {
+    out.push('"');
+    let bytes = s.as_bytes();
+    if !bytes.iter().any(|&b| b == b'"' || b == b'\\' || b < 0x20) {
+        out.push_str(s);
+        out.push('"');
+        return;
+    }
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let esc = match b {
+            b'"' => "\\\"",
+            b'\\' => "\\\\",
+            b'\x08' => "\\b",
+            b'\x0c' => "\\f",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            b'\t' => "\\t",
+            0x00..=0x1f => {
+                if start < i {
+                    out.push_str(&s[start..i]);
+                }
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{b:04x}");
+                start = i + 1;
+                continue;
+            }
+            _ => continue,
+        };
+        if start < i {
+            out.push_str(&s[start..i]);
+        }
+        out.push_str(esc);
+        start = i + 1;
+    }
+    if start < s.len() {
+        out.push_str(&s[start..]);
+    }
+    out.push('"');
+}
+
 impl Blame {
     /// The bytes it takes in memory, about.
     /// (Paths and metadata are shared: counted once, by their owner.)
@@ -129,9 +226,30 @@ impl Blame {
 
     /// About the bytes its stored form takes (for spacing checkpoints).
     pub fn stored_estimate(&self) -> usize {
-        let runs = 1 + self.lines.windows(2).filter(|w| w[1].0 != w[0].0 || w[1].1 != w[0].1 + 1).count();
-        let changes: std::collections::HashSet<&ObjectId> = self.origins.iter().map(|o| &o.0).collect();
-        BASE_BYTES + 16 * runs + 104 * self.origins.len() + 160 * changes.len()
+        let mut ranges = 0usize;
+        let mut i = 0;
+        let len = self.lines.len();
+        while i < len {
+            let (o, l0) = self.lines[i];
+            let mut count = 1u32;
+            while i + (count as usize) < len {
+                let (no, nl) = self.lines[i + (count as usize)];
+                if no == o && nl == l0 + count {
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+            ranges += 1;
+            i += count as usize;
+        }
+        let mut origins_bytes = 0usize;
+        let mut changes_bytes = 0usize;
+        for (_, _, m) in &self.origins {
+            origins_bytes += 104;
+            changes_bytes += 126 + m.change_id.len() + m.author.len() + m.summary.len();
+        }
+        40 + 18 * ranges + origins_bytes + changes_bytes
     }
 
     /// The origin of line `i` (from 0): snapshot, path, line there.
@@ -149,27 +267,76 @@ impl Blame {
     /// The stored bytes, origins' paths named by `key`.
     pub fn encode(&self, key: impl Fn(&str) -> String) -> Vec<u8> {
         let mut ranges: Vec<[u32; 3]> = Vec::new();
-        for &(o, l) in &self.lines {
-            match ranges.last_mut() {
-                Some(r) if r[1] == o && r[2] + r[0] == l => r[0] += 1,
-                _ => ranges.push([1, o, l]),
+        let mut i = 0;
+        let len = self.lines.len();
+        while i < len {
+            let (o, l0) = self.lines[i];
+            let mut count = 1u32;
+            while i + (count as usize) < len {
+                let (no, nl) = self.lines[i + (count as usize)];
+                if no == o && nl == l0 + count {
+                    count += 1;
+                } else {
+                    break;
+                }
             }
+            ranges.push([count, o, l0]);
+            i += count as usize;
         }
-        let s = Stored {
-            vd: self.vd,
-            coarse: self.coarse,
-            origins: self.origins.iter().map(|(id, p, _)| (*id, key(p))).collect(),
-            ranges,
-            changes: {
-                let mut c: Vec<(ObjectId, Meta)> = self.origins.iter().map(|(id, _, m)| (*id, (**m).clone())).collect();
-                c.sort_by_key(|a| a.0);
-                c.dedup_by(|a, b| a.0 == b.0);
-                c
-            },
-        };
-        let mut out = MAGIC.to_vec();
-        out.extend(serde_json::to_vec(&s).expect("a blame serialises"));
-        out
+        let mut changes: Vec<(ObjectId, &Meta)> = self.origins.iter().map(|(id, _, m)| (*id, &**m)).collect();
+        changes.sort_unstable_by_key(|a| a.0);
+        changes.dedup_by(|a, b| a.0 == b.0);
+        let mut out = String::with_capacity(BASE_BYTES + 24 * ranges.len() + 264 * self.origins.len());
+        out.push_str(std::str::from_utf8(MAGIC).unwrap());
+        out.push_str("{\"vd\":");
+        write_u64(&mut out, self.vd);
+        out.push_str(",\"coarse\":");
+        out.push_str(if self.coarse { "true" } else { "false" });
+        out.push_str(",\"origins\":[");
+        for (idx, (id, p, _)) in self.origins.iter().enumerate() {
+            if idx > 0 {
+                out.push(',');
+            }
+            out.push_str("[\"");
+            write_hex(&mut out, &id.0);
+            out.push_str("\",\"");
+            out.push_str(&key(p));
+            out.push_str("\"]");
+        }
+        out.push_str("],\"ranges\":[");
+        for (idx, &[c, o, l0]) in ranges.iter().enumerate() {
+            if idx > 0 {
+                out.push(',');
+            }
+            out.push('[');
+            write_u64(&mut out, c as u64);
+            out.push(',');
+            write_u64(&mut out, o as u64);
+            out.push(',');
+            write_u64(&mut out, l0 as u64);
+            out.push(']');
+        }
+        out.push_str("],\"changes\":[");
+        for (idx, (id, m)) in changes.iter().enumerate() {
+            if idx > 0 {
+                out.push(',');
+            }
+            out.push_str("[\"");
+            write_hex(&mut out, &id.0);
+            out.push_str("\",{\"c\":");
+            write_json_str(&mut out, &m.change_id);
+            out.push_str(",\"a\":");
+            write_json_str(&mut out, &m.author);
+            out.push_str(",\"t\":");
+            write_i64(&mut out, m.timestamp);
+            out.push_str(",\"s\":");
+            write_json_str(&mut out, &m.summary);
+            out.push_str(",\"g\":");
+            write_i64(&mut out, m.generation);
+            out.push_str("}]");
+        }
+        out.push_str("]}");
+        out.into_bytes()
     }
 
     /// The path keys a stored blame names.
@@ -209,16 +376,33 @@ impl Blame {
 }
 
 /// A version's plain text, split in lines.
+#[derive(Debug)]
 pub struct Text {
     pub id: ObjectId,
-    pub data: Vec<u8>,
+    pub data: bytes::Bytes,
     pub lines: Vec<(usize, usize)>,
 }
 
 impl Text {
-    pub fn new(id: ObjectId, data: Vec<u8>) -> Arc<Text> {
+    pub fn new(id: ObjectId, data: impl Into<bytes::Bytes>) -> Arc<Text> {
+        let data = data.into();
         let lines = line_ranges(&data);
         Arc::new(Text { id, data, lines })
+    }
+
+    /// Construct [`Text`] if `data` contains no NUL byte and is valid UTF-8,
+    /// scanning for NUL, UTF-8, and line boundaries in a single pass.
+    pub fn try_plain(id: ObjectId, data: impl Into<bytes::Bytes>) -> Option<Arc<Text>> {
+        let data = data.into();
+        let lines = veil_core::blame::plain_text_line_ranges(&data)?;
+        Some(Arc::new(Text { id, data, lines }))
+    }
+
+    /// Construct [`Text`] reusing unchanged prefix and suffix line ranges from `parent`.
+    pub fn try_plain_from_parent(id: ObjectId, data: impl Into<bytes::Bytes>, parent: &Text) -> Option<Arc<Text>> {
+        let data = data.into();
+        let lines = veil_core::blame::plain_text_line_ranges_from_parent(&data, &parent.data, &parent.lines)?;
+        Some(Arc::new(Text { id, data, lines }))
     }
 
     pub fn line(&self, i: usize) -> &[u8] {
@@ -352,10 +536,97 @@ fn compact_origins_if_needed(out: &mut Blame, candidates: &[u32]) {
 
 /// [`step`] when each parent's [`ParentMap`] has already been computed.
 pub fn step_mapped(me: &Origin, n: usize, parents: &[Option<(&Blame, ParentMap)>]) -> (Blame, u64) {
-    // Fast path for the overwhelmingly common single-parent edit case:
-    // copy the parent's blame and patch only the differing lines!
+    let mut counts = Vec::new();
+    step_mapped_with_counts(me, n, parents, &mut counts)
+}
+
+/// [`step_mapped_with_counts`], mutating `cur` in place when stepping from a
+/// single parent (`cur` itself) via `Same` or `Replaced` so neither `lines`
+/// nor `origins` is cloned unless a checkpoint needs an `Arc<Blame>`.
+pub fn step_mapped_in_place(
+    cur: &mut Blame,
+    me: &Origin,
+    n: usize,
+    pm: &ParentMap,
+    counts: &mut Vec<u32>,
+) -> u64 {
+    if counts.len() != cur.origins.len() {
+        counts.clear();
+        counts.resize(cur.origins.len(), 0);
+        for &(o, _) in &cur.lines {
+            counts[o as usize] += 1;
+        }
+    }
+    match pm {
+        ParentMap::Same if cur.lines.len() == n => {
+            cur.vd += 1;
+            return 0;
+        }
+        ParentMap::Replaced { len, diffs, cost } if *len == cur.lines.len() && *len == n => {
+            cur.vd += 1;
+            let o = if let Some(pos) = cur.origins.iter().position(|x| x.0 == me.0 && Arc::ptr_eq(&x.1, &me.1)) {
+                pos as u32
+            } else {
+                let idx = cur.origins.len() as u32;
+                cur.origins.push(me.clone());
+                counts.push(0);
+                idx
+            };
+            let mut any_dead = false;
+            for &d in diffs {
+                let old_o = cur.lines[d].0;
+                counts[old_o as usize] -= 1;
+                if counts[old_o as usize] == 0 {
+                    any_dead = true;
+                }
+                counts[o as usize] += 1;
+                cur.lines[d] = (o, d as u32 + 1);
+            }
+            if any_dead && cur.origins.len() > 1 {
+                let mut remap = vec![0u32; cur.origins.len()];
+                let mut new_origins = Vec::with_capacity(cur.origins.len());
+                let mut new_counts = Vec::with_capacity(cur.origins.len());
+                for (old_o, orig) in std::mem::take(&mut cur.origins).into_iter().enumerate() {
+                    if counts[old_o] > 0 {
+                        remap[old_o] = new_origins.len() as u32;
+                        new_origins.push(orig);
+                        new_counts.push(counts[old_o]);
+                    }
+                }
+                for (lo, _) in &mut cur.lines {
+                    *lo = remap[*lo as usize];
+                }
+                cur.origins = new_origins;
+                *counts = new_counts;
+            }
+            return *cost;
+        }
+        _ => {}
+    }
+    let inputs = [Some((&*cur, pm.clone()))];
+    let (next, cost) = step_mapped_with_counts(me, n, &inputs, counts);
+    *cur = next;
+    cost
+}
+
+/// [`step_mapped`], maintaining `counts[o]` (how many lines of the current
+/// single-parent chain reference `origins[o]`) across sequential single-parent
+/// steps so dead origins are detected in `O(1)` without scanning `out.lines`.
+pub fn step_mapped_with_counts(
+    me: &Origin,
+    n: usize,
+    parents: &[Option<(&Blame, ParentMap)>],
+    counts: &mut Vec<u32>,
+) -> (Blame, u64) {
     if parents.len() == 1 {
         if let Some((pb, pm)) = &parents[0] {
+            if counts.len() != pb.origins.len() {
+                counts.clear();
+                counts.resize(pb.origins.len(), 0);
+                for &(o, _) in &pb.lines {
+                    counts[o as usize] += 1;
+                }
+            }
             match pm {
                 ParentMap::Same if pb.lines.len() == n => {
                     let mut out = (*pb).clone();
@@ -374,20 +645,40 @@ pub fn step_mapped(me: &Origin, n: usize, parents: &[Option<(&Blame, ParentMap)>
                     } else {
                         let idx = out.origins.len() as u32;
                         out.origins.push(me.clone());
+                        counts.push(0);
                         idx
                     };
-                    let mut replaced_origins: Vec<u32> = Vec::with_capacity(diffs.len());
+                    let mut any_dead = false;
                     for &d in diffs {
                         let old_o = out.lines[d].0;
-                        if !replaced_origins.contains(&old_o) {
-                            replaced_origins.push(old_o);
+                        counts[old_o as usize] -= 1;
+                        if counts[old_o as usize] == 0 {
+                            any_dead = true;
                         }
+                        counts[o as usize] += 1;
                         out.lines[d] = (o, d as u32 + 1);
                     }
-                    compact_origins_if_needed(&mut out, &replaced_origins);
+                    if any_dead && out.origins.len() > 1 {
+                        let mut remap = vec![0u32; out.origins.len()];
+                        let mut new_origins = Vec::with_capacity(out.origins.len());
+                        let mut new_counts = Vec::with_capacity(out.origins.len());
+                        for (old_o, orig) in std::mem::take(&mut out.origins).into_iter().enumerate() {
+                            if counts[old_o] > 0 {
+                                remap[old_o] = new_origins.len() as u32;
+                                new_origins.push(orig);
+                                new_counts.push(counts[old_o]);
+                            }
+                        }
+                        for (lo, _) in &mut out.lines {
+                            *lo = remap[*lo as usize];
+                        }
+                        out.origins = new_origins;
+                        *counts = new_counts;
+                    }
                     return (out, *cost);
                 }
                 ParentMap::Trimmed { old_len, p, mid, s, coarse, cost } if *old_len == pb.lines.len() => {
+                    counts.clear();
                     let mut out = Blame {
                         vd: pb.vd + 1,
                         coarse: pb.coarse || *coarse,
@@ -435,6 +726,7 @@ pub fn step_mapped(me: &Origin, n: usize, parents: &[Option<(&Blame, ParentMap)>
             }
         }
     }
+    counts.clear();
     let mut out = Blame {
         vd: 1 + parents.iter().flatten().map(|(b, _)| b.vd).max().unwrap_or(0),
         coarse: parents.iter().flatten().any(|(b, pm)| b.coarse || pm.coarse()),

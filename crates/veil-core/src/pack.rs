@@ -630,6 +630,12 @@ pub(crate) fn decompress(data: &[u8], raw_len: u64, dict: Option<&[u8]>, id: &Ob
     Ok(out)
 }
 
+/// [`decompress`] for an encoding already checked against `id`: decodes into a
+/// buffer of `raw_len` in a single bulk pass without streaming into BLAKE3 first.
+pub(crate) fn decompress_trusted(data: &[u8], raw_len: u64, dict: Option<&[u8]>) -> std::result::Result<Vec<u8>, String> {
+    decompress_bulk(data, raw_len, dict)
+}
+
 #[cfg(feature = "zstd")]
 fn decompress_bulk(data: &[u8], raw_len: u64, dict: Option<&[u8]>) -> std::result::Result<Vec<u8>, String> {
     let frame_len = zstd::bulk::Decompressor::upper_bound(data);
@@ -649,7 +655,9 @@ fn decompress_bulk(data: &[u8], raw_len: u64, dict: Option<&[u8]>) -> std::resul
             *slot = Some(zstd::bulk::Decompressor::new().map_err(|e| e.to_string())?);
         }
         let d = slot.as_mut().unwrap();
-        d.set_dictionary(dict.unwrap_or(&[])).map_err(|e| e.to_string())?;
+        if let Some(dict) = dict {
+            d.set_dictionary(dict).map_err(|e| e.to_string())?;
+        }
         let out = d.decompress(data, raw_len as usize).map_err(|e| e.to_string());
         if dict.is_some() {
             d.set_dictionary(&[]).map_err(|e| e.to_string())?;

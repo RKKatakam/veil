@@ -98,6 +98,86 @@ pub struct FChange {
     pub prev: Vec<Option<(i64, ObjectId)>>,
 }
 
+impl FChange {
+    fn parse(s: &str) -> Result<FChange> {
+        if let Some(fc) = Self::parse_fast(s) {
+            return Ok(fc);
+        }
+        serde_json::from_str(s).map_err(bad)
+    }
+
+    fn parse_fast(s: &str) -> Option<FChange> {
+        let rest = s.strip_prefix("{\"old\":")?;
+        let (old, rest) = Self::parse_opt_entry(rest)?;
+        let rest = rest.strip_prefix(",\"new\":")?;
+        let (new, rest) = Self::parse_opt_entry(rest)?;
+        let rest = rest.strip_prefix(",\"prev\":[")?;
+        let rest = rest.strip_suffix("]}")?;
+        let mut prev = Vec::with_capacity(1);
+        if !rest.is_empty() {
+            for item in rest.split("],[") {
+                let item = item.trim_start_matches('[').trim_end_matches(']');
+                if item == "null" {
+                    prev.push(None);
+                } else {
+                    let (d_str, id_str) = item.split_once(',')?;
+                    let d: i64 = d_str.parse().ok()?;
+                    let hex = id_str.strip_prefix('"')?.strip_suffix('"')?;
+                    let id = ObjectId::from_hex(hex).ok()?;
+                    prev.push(Some((d, id)));
+                }
+            }
+        }
+        Some(FChange { old, new, prev })
+    }
+
+    fn parse_opt_entry(s: &str) -> Option<(Option<TreeEntry>, &str)> {
+        if let Some(rest) = s.strip_prefix("null") {
+            return Some((None, rest));
+        }
+        let rest = s.strip_prefix("{\"name\":\"")?;
+        let name_end = rest.find('"')?;
+        let name = &rest[..name_end];
+        if name.as_bytes().contains(&b'\\') {
+            return None;
+        }
+        let rest = &rest[name_end + 1..];
+        let rest = rest.strip_prefix(",\"kind\":\"")?;
+        let kind_end = rest.find('"')?;
+        let kind = match &rest[..kind_end] {
+            "file" => EntryKind::File,
+            "dir" => EntryKind::Dir,
+            "symlink" => EntryKind::Symlink,
+            _ => return None,
+        };
+        let rest = &rest[kind_end + 1..];
+        let rest = rest.strip_prefix(",\"id\":\"")?;
+        if rest.len() < 65 || rest.as_bytes()[64] != b'"' {
+            return None;
+        }
+        let id = ObjectId::from_hex(&rest[..64]).ok()?;
+        let mut rest = &rest[65..];
+        let mut size = 0u64;
+        if let Some(r) = rest.strip_prefix(",\"size\":") {
+            let end = r.find([',', '}'])?;
+            size = r[..end].parse().ok()?;
+            rest = &r[end..];
+        }
+        let rest = rest.strip_prefix('}')?;
+        Some((
+            Some(TreeEntry {
+                name: name.to_string(),
+                kind,
+                id,
+                size,
+                executable: false,
+                visibility: veil_core::object::Visibility::Public,
+            }),
+            rest,
+        ))
+    }
+}
+
 // ---- filling ----------------------------------------------------------------------
 
 /// The file-history rows of one fill of a viewer's graph (`graph::extend`).
@@ -202,7 +282,8 @@ impl Fill {
 // ---- reading ----------------------------------------------------------------------
 
 /// Rows of one path read so far, from below `top` down, deepest first.
-struct Window {
+#[derive(Clone)]
+pub struct Window {
     top: (i64, ObjectId),
     rows: Vec<(i64, ObjectId, Arc<FChange>)>,
     at: HashMap<ObjectId, usize>,
@@ -217,6 +298,9 @@ pub struct Files<'g, 'a> {
     /// About the bytes of the rows its windows hold (a blame job counts
     /// them against its bound: BUG-1219).
     loaded: std::cell::Cell<usize>,
+    /// Start windows at page size `PAGES[1]` (512 rows) instead of `PAGES[0]` (64)
+    /// when a blame job has ample memory budget.
+    fast_pages: std::cell::Cell<bool>,
 }
 
 fn top_of(depth: i64) -> (i64, ObjectId) {
@@ -229,16 +313,34 @@ impl<'g, 'a> Files<'g, 'a> {
             g,
             windows: RefCell::new(HashMap::new()),
             loaded: std::cell::Cell::new(0),
+            fast_pages: std::cell::Cell::new(false),
         }
+    }
+
+    pub fn set_fast_pages(&self, fast: bool) {
+        self.fast_pages.set(fast);
+    }
+
+    pub fn take_window(&self, path: &str) -> Option<(Window, usize)> {
+        let key = path_key(path);
+        self.windows.borrow_mut().remove(&key).map(|w| (w, self.loaded.get()))
+    }
+
+    pub fn seed_window(&self, path: &str, w: Window, loaded: usize) {
+        let key = path_key(path);
+        self.loaded.set(self.loaded.get() + loaded);
+        self.windows.borrow_mut().insert(key, w);
     }
 
     /// Read the next page of `path`'s window.
     fn more(&self, w: &mut Window, key: &str) -> Result<()> {
-        let limit = PAGES[w.pages.min(PAGES.len() - 1)];
+        let p_idx = if self.fast_pages.get() { PAGES.len() - 1 } else { w.pages.min(PAGES.len() - 1) };
+        let limit = PAGES[p_idx];
         w.pages += 1;
         let (d, s) = w.rows.last().map(|(d, s, _)| (*d, *s)).unwrap_or(w.top);
         let cx = self.g.cx;
         self.g.tick()?;
+        let tm0 = std::time::Instant::now();
         let rows: Vec<(i64, String, String)> = cx.db(|| {
             sqlx::query_as(
                 "SELECT depth, snapshot, change FROM view_file_history WHERE project_id = $1 AND view_key = $2 AND path_key = $3 \
@@ -252,17 +354,20 @@ impl<'g, 'a> Files<'g, 'a> {
             .bind(limit)
             .fetch_all(&cx.hub().db)
         })?;
+        let tm1 = std::time::Instant::now();
         w.done = (rows.len() as i64) < limit;
+        let nrows = rows.len();
         for (d, s, c) in rows {
             self.g.tick()?;
             let s = ObjectId::from_hex(&s).map_err(bad)?;
             // The row as held: its entries' names, its parents and the
             // window's slot and index entry.
             self.loaded.set(self.loaded.get() + 192 + c.len());
-            let c: FChange = serde_json::from_str(&c).map_err(bad)?;
+            let c = FChange::parse(&c)?;
             w.at.insert(s, w.rows.len());
             w.rows.push((d, s, Arc::new(c)));
         }
+        eprintln!("FILES_MORE rows={nrows}: db={:?} parse={:?}", tm1 - tm0, tm1.elapsed());
         Ok(())
     }
 
@@ -315,7 +420,7 @@ impl<'g, 'a> Files<'g, 'a> {
                 .bind(id.hex())
                 .fetch_optional(&cx.hub().db)
             })?;
-            return c.map(|c| serde_json::from_str(&c).map(Arc::new).map_err(bad)).transpose();
+            return c.map(|c| FChange::parse(&c).map(Arc::new)).transpose();
         }
         let mut w = self.window(path, depth);
         // Far below the rows read so far: a window of its own, so that
@@ -546,6 +651,8 @@ pub struct Blamer<'f, 'g, 'a, 'h, 'b> {
     /// Every path the job's blames name, interned once (S14 cycle 3), and
     /// the bytes they take.
     paths: HashMap<String, Arc<str>>,
+    /// Cached `path_key` per interned path pointer.
+    path_keys: HashMap<*const u8, String>,
     path_bytes: usize,
     /// What an answer shows of each snapshot the job's blames name.
     metas: HashMap<ObjectId, Arc<Meta>>,
@@ -563,6 +670,7 @@ pub struct Blamer<'f, 'g, 'a, 'h, 'b> {
     writes: Vec<(String, ObjectId, Vec<u8>, String)>,
     write_paths: HashMap<String, String>,
     pending_bytes: usize,
+    total_kept_bytes: Option<i64>,
 }
 
 impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
@@ -574,6 +682,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             limits,
             kept: HashMap::new(),
             paths: HashMap::new(),
+            path_keys: HashMap::new(),
             path_bytes: 0,
             metas: HashMap::new(),
             renames: HashMap::new(),
@@ -582,6 +691,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             writes: Vec::new(),
             write_paths: HashMap::new(),
             pending_bytes: 0,
+            total_kept_bytes: None,
         }
     }
 
@@ -601,6 +711,9 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                     .bind(self.follow)
                     .fetch_all(&cx.hub().db)
             })?;
+            if self.total_kept_bytes.is_none() && rows.is_empty() && self.kept.is_empty() {
+                self.total_kept_bytes = Some(0);
+            }
             let set = rows.iter().map(|s| ObjectId::from_hex(s).map_err(bad)).collect::<Result<_>>()?;
             self.kept.insert(key.clone(), set);
         }
@@ -631,6 +744,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         }
         let a: Arc<str> = Arc::from(p);
         self.path_bytes += 64 + p.len();
+        self.path_keys.insert(Arc::as_ptr(&a) as *const u8, path_key(p));
         self.paths.insert(p.to_string(), a.clone());
         a
     }
@@ -702,10 +816,10 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         }
         let e = e.as_ref().unwrap();
         let (blob, bytes) = self.t.content(&e.id)?;
-        if !blob || bytes.len() as u64 > MAX_TEXT_BYTES || std::ffi::CStr::from_bytes_until_nul(&bytes).is_ok() || std::str::from_utf8(&bytes).is_err() {
+        if !blob || bytes.len() as u64 > MAX_TEXT_BYTES {
             return Ok(None);
         }
-        Ok(Some(Text::new(e.id, bytes)))
+        Ok(Text::try_plain(e.id, bytes))
     }
 
     /// A blame job: blame version `start` (and keep it), walking down to
@@ -713,14 +827,20 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
     /// `None` when it is not plain text. What it kept is written, also
     /// when it fails.
     pub fn blame(&mut self, start: &Version) -> Result<Done> {
+        let t0 = std::time::Instant::now();
         let r = self.run(start);
+        let t1 = std::time::Instant::now();
         let w = self.write();
+        let t2 = std::time::Instant::now();
+        eprintln!("BLAMER: run={:?} write={:?}", t1 - t0, t2 - t1);
         let out = r?;
         w?;
         Ok(out)
     }
 
     fn run(&mut self, start: &Version) -> Result<Done> {
+        let tr0 = std::time::Instant::now();
+        self.f.fast_pages.set(self.limits.held >= 4 << 20);
         // Down: the versions to compute, parents before children, each
         // once, stopping at kept blames.
         let mut nodes: HashMap<Version, Node> = HashMap::new();
@@ -811,10 +931,10 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         // parent-to-child line diffs are computed in parallel across a bounded
         // pool while keeping memory strictly within `self.limits.held`.
         let unkept: Vec<Version> = order.into_iter().filter(|v| !nodes[v].kept).collect();
-        const CHUNK: usize = 128;
+        const CHUNK: usize = 512;
         const WORKERS: usize = 8;
         let src = &self.t.g.cx.src;
-        let load_text = |e: &Option<TreeEntry>| -> Result<Option<Arc<Text>>> {
+        let load_raw = |e: &Option<TreeEntry>| -> Result<Option<(ObjectId, bytes::Bytes)>> {
             if !texty(e) {
                 return Ok(None);
             }
@@ -823,22 +943,28 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             if !veil_core::object::Object::is_blob_raw(&raw) {
                 return Ok(None);
             }
-            let veil_core::object::Object::Blob(bytes) = veil_core::object::Object::decode(&raw)? else {
-                return Ok(None);
-            };
-            if bytes.len() as u64 > MAX_TEXT_BYTES || std::ffi::CStr::from_bytes_until_nul(&bytes).is_ok() || std::str::from_utf8(&bytes).is_err() {
+            let body_len = raw.len() - 10;
+            if body_len as u64 > MAX_TEXT_BYTES {
                 return Ok(None);
             }
-            Ok(Some(Text::new(e.id, bytes)))
+            Ok(Some((e.id, raw.slice(10..))))
         };
         let mut idx = 0usize;
+        let mut chain_last: Option<Version> = None;
+        let mut chain_counts: Vec<u32> = Vec::new();
         while idx < unkept.len() {
             self.stopped()?;
             // Take up to CHUNK versions whose texts fit well within the remaining held budget.
             let mut end = idx;
             let mut chunk_text_est = 0usize;
             while end < unkept.len() && end - idx < CHUNK {
-                let sz = nodes[&unkept[end]].change.new.as_ref().map_or(0, |e| e.size as usize * 2 + 256);
+                let sz = nodes[&unkept[end]].change.new.as_ref().map_or(0, |e| {
+                    if self.limits.held >= 4 << 20 {
+                        e.size as usize + 256
+                    } else {
+                        e.size as usize * 3 / 2 + 256
+                    }
+                });
                 let budget_used = held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes();
                 if end > idx && budget_used + chunk_text_est + sz > self.limits.held.saturating_sub(self.limits.held / 8) {
                     break;
@@ -848,13 +974,19 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             }
             let slice = &unkept[idx..end];
             idx = end;
-            // 1. Load texts and snapshot metadata for all versions in `slice` in parallel.
+            // 1. Load texts, snapshot metadata, and parent-to-child line diffs
+            // for all versions in `slice` in a single thread-pool scope.
             self.f.g.tick()?;
-            let mut missing_metas: Vec<ObjectId> = slice
-                .iter()
-                .map(|v| v.id)
-                .filter(|id| !self.metas.contains_key(id))
-                .collect();
+            let budget_now = held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes();
+            let mut missing_metas: Vec<ObjectId> = if budget_now + slice.len() * 512 <= self.limits.held / 2 {
+                slice
+                    .iter()
+                    .map(|v| v.id)
+                    .filter(|id| !self.metas.contains_key(id))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             missing_metas.sort_unstable();
             missing_metas.dedup();
             let mut gens: HashMap<ObjectId, i64> = HashMap::with_capacity(missing_metas.len());
@@ -862,6 +994,8 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             for &id in &missing_metas {
                 if id == super::graph::root() {
                     gens.insert(id, 0);
+                } else if let Some(g) = self.f.g.cached_generation(&id) {
+                    gens.insert(id, g);
                 } else {
                     db_ids.push(id.hex());
                 }
@@ -881,123 +1015,260 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                     }
                 }
             }
+            for &id in &missing_metas {
+                if !gens.contains_key(&id) {
+                    gens.insert(id, self.f.g.get(&id)?.generation);
+                }
+            }
+            eprintln!("WALK+GENS: {:?} db_ids={}", tr0.elapsed(), db_ids.len());
+            let load_meta = |id: ObjectId, gen: i64| -> Result<(ObjectId, Meta)> {
+                if !src.pending.contains_key(&id) {
+                    let raw = src.raw(&id)?;
+                    if let Some(m) = Meta::from_raw_snapshot(&raw, gen) {
+                        return Ok((id, m));
+                    }
+                }
+                let sn = src.snapshot(&id)?;
+                Ok((id, Meta::of(&sn, gen)))
+            };
             let entries: Vec<Option<TreeEntry>> = slice.iter().map(|v| nodes[v].change.new.clone()).collect();
-            let (loaded_texts, loaded_snaps): (Vec<Result<Option<Arc<Text>>>>, Vec<Result<(ObjectId, Arc<veil_core::object::Snapshot>)>>) =
-                if slice.len() <= 2 && missing_metas.len() <= 2 {
-                    (
-                        entries.iter().map(&load_text).collect(),
-                        missing_metas.iter().map(|&id| Ok((id, src.snapshot(&id)?))).collect(),
-                    )
-                } else {
-                    let next_t = std::sync::atomic::AtomicUsize::new(0);
-                    let next_s = std::sync::atomic::AtomicUsize::new(0);
-                    let out_t: Vec<std::sync::Mutex<Option<Result<Option<Arc<Text>>>>>> = (0..slice.len()).map(|_| std::sync::Mutex::new(None)).collect();
-                    let out_s: Vec<std::sync::Mutex<Option<Result<(ObjectId, Arc<veil_core::object::Snapshot>)>>>> =
-                        (0..missing_metas.len()).map(|_| std::sync::Mutex::new(None)).collect();
-                    std::thread::scope(|s| {
-                        for _ in 0..WORKERS.min(slice.len() + missing_metas.len()) {
-                            s.spawn(|| {
-                                loop {
-                                    let i = next_t.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if i >= entries.len() {
-                                        break;
-                                    }
-                                    let r = load_text(&entries[i]);
-                                    *out_t[i].lock().unwrap() = Some(r);
-                                }
-                                loop {
-                                    let j = next_s.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if j >= missing_metas.len() {
-                                        break;
-                                    }
-                                    let id = missing_metas[j];
-                                    let r = src.snapshot(&id).map(|sn| (id, sn)).map_err(Error::from);
-                                    *out_s[j].lock().unwrap() = Some(r);
-                                }
-                            });
+            let first_idx = entries.iter().position(texty);
+            let base_text: Option<Arc<Text>> = match first_idx {
+                None => None,
+                Some(fi) => match load_raw(&entries[fi])? {
+                    None => None,
+                    Some((id, bytes)) => {
+                        let parent_done = nodes[&slice[fi]]
+                            .parents
+                            .iter()
+                            .flatten()
+                            .find_map(|p| done.get(p).and_then(|d| d.as_ref().map(|(t, _)| t)));
+                        match parent_done {
+                            Some(pt) => Text::try_plain_from_parent(id, bytes, pt),
+                            None => Text::try_plain(id, bytes),
                         }
-                    });
-                    (
-                        out_t.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect(),
-                        out_s.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect(),
-                    )
-                };
-            for r in loaded_snaps {
-                let (id, sn) = r?;
-                let gen = match gens.get(&id).copied() {
-                    Some(g) => g,
-                    None => self.f.g.get(&id)?.generation,
-                };
-                self.metas.insert(id, Arc::new(Meta::of(&sn, gen)));
+                    }
+                },
+            };
+            let mut slice_idx: HashMap<Version, usize> = HashMap::with_capacity(slice.len());
+            for (vi, v) in slice.iter().enumerate() {
+                slice_idx.insert(v.clone(), vi);
             }
-            let mut chunk_texts: HashMap<Version, Option<Arc<Text>>> = HashMap::with_capacity(slice.len());
-            for (v, r) in slice.iter().zip(loaded_texts) {
-                chunk_texts.insert(v.clone(), r?);
-            }
-            // 2. Precompute parent-to-child line diffs in parallel for all versions in `slice`.
-            let mut diff_jobs: Vec<(Version, usize, Arc<Text>, Arc<Text>)> = Vec::new();
-            for v in slice {
-                let Some(Some(text)) = chunk_texts.get(v) else { continue };
+            let mut diff_specs: Vec<(Version, usize, usize, Option<usize>, Option<Arc<Text>>)> = Vec::new();
+            for (vi, v) in slice.iter().enumerate() {
+                if !texty(&entries[vi]) {
+                    continue;
+                }
                 for (pi, p) in nodes[v].parents.iter().enumerate() {
                     let Some(p) = p else { continue };
-                    let pt = chunk_texts
-                        .get(p)
-                        .and_then(|t| t.as_ref())
-                        .or_else(|| done.get(p).and_then(|d| d.as_ref().map(|(t, _)| t)));
-                    if let Some(pt) = pt {
-                        diff_jobs.push((v.clone(), pi, pt.clone(), text.clone()));
+                    if let Some(&p_idx) = slice_idx.get(p) {
+                        if texty(&entries[p_idx]) {
+                            diff_specs.push((v.clone(), pi, vi, Some(p_idx), None));
+                        }
+                    } else if let Some(pt) = done.get(p).and_then(|d| d.as_ref().map(|(t, _)| t.clone())) {
+                        diff_specs.push((v.clone(), pi, vi, None, Some(pt)));
                     }
                 }
             }
-            let mut pre_maps: HashMap<(Version, usize), crate::derive::blame::ParentMap> = HashMap::with_capacity(diff_jobs.len());
-            if diff_jobs.len() <= 1 {
-                for (v, pi, pt, text) in diff_jobs {
-                    pre_maps.insert((v, pi), crate::derive::blame::diff_parent(&pt, &text));
+            let mut chunk_texts: HashMap<Version, Option<Arc<Text>>> = HashMap::with_capacity(slice.len());
+            let mut pre_maps: HashMap<(Version, usize), crate::derive::blame::ParentMap> = HashMap::with_capacity(diff_specs.len());
+            if slice.len() <= 2 && missing_metas.len() <= 2 && diff_specs.len() <= 1 {
+                let mut built_texts: Vec<Option<Arc<Text>>> = Vec::with_capacity(slice.len());
+                for (i, e) in entries.iter().enumerate() {
+                    if Some(i) == first_idx {
+                        built_texts.push(base_text.clone());
+                    } else {
+                        let t = load_raw(e)?.and_then(|(id, bytes)| match &base_text {
+                            Some(bt) => Text::try_plain_from_parent(id, bytes, bt),
+                            None => Text::try_plain(id, bytes),
+                        });
+                        built_texts.push(t);
+                    }
+                }
+                for &id in &missing_metas {
+                    let (id, m) = load_meta(id, gens[&id])?;
+                    self.metas.insert(id, Arc::new(m));
+                }
+                for (v, pi, vi, p_idx, done_pt) in diff_specs {
+                    let child_opt = built_texts[vi].as_ref();
+                    let parent_opt = match p_idx {
+                        Some(pi_idx) => built_texts[pi_idx].as_ref(),
+                        None => done_pt.as_ref(),
+                    };
+                    if let (Some(pt), Some(text)) = (parent_opt, child_opt) {
+                        pre_maps.insert((v, pi), crate::derive::blame::diff_parent(pt, text));
+                    }
+                }
+                for (v, text) in slice.iter().zip(built_texts) {
+                    chunk_texts.insert(v.clone(), text);
                 }
             } else {
-                let next = std::sync::atomic::AtomicUsize::new(0);
-                let out: Vec<std::sync::Mutex<Option<crate::derive::blame::ParentMap>>> = (0..diff_jobs.len()).map(|_| std::sync::Mutex::new(None)).collect();
+                let tp0 = std::time::Instant::now();
+                let n_workers = WORKERS.min(slice.len().max(missing_metas.len()).max(diff_specs.len()).max(1));
+                let barrier = std::sync::Barrier::new(n_workers);
+                let next_s = std::sync::atomic::AtomicUsize::new(0);
+                let next_d = std::sync::atomic::AtomicUsize::new(0);
+                let out_t: Vec<std::sync::Mutex<Option<Result<Option<Arc<Text>>>>>> = (0..slice.len()).map(|_| std::sync::Mutex::new(None)).collect();
+                let out_s: Vec<std::sync::Mutex<Option<Result<(ObjectId, Meta)>>>> = (0..missing_metas.len()).map(|_| std::sync::Mutex::new(None)).collect();
+                let out_d: Vec<std::sync::Mutex<Option<crate::derive::blame::ParentMap>>> = (0..diff_specs.len()).map(|_| std::sync::Mutex::new(None)).collect();
+                let base_ref = &base_text;
+                let gens_ref = &gens;
+                let specs_ref = &diff_specs;
+                let stride = entries.len().div_ceil(n_workers).max(1);
+                let worker_seq = std::sync::atomic::AtomicUsize::new(0);
+                let max_t_ns = std::sync::atomic::AtomicU64::new(0);
+                let max_s_ns = std::sync::atomic::AtomicU64::new(0);
+                let max_d_ns = std::sync::atomic::AtomicU64::new(0);
                 std::thread::scope(|s| {
-                    for _ in 0..WORKERS.min(diff_jobs.len()) {
-                        s.spawn(|| loop {
-                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if i >= diff_jobs.len() {
-                                break;
+                    for _ in 0..n_workers {
+                        s.spawn(|| {
+                            let w_id = worker_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let start_i = w_id * stride;
+                            let end_i = ((w_id + 1) * stride).min(entries.len());
+                            let mut prev_text: Option<Arc<Text>> = base_ref.clone();
+                            let wt0 = std::time::Instant::now();
+                            for i in start_i..end_i {
+                                let r = if Some(i) == first_idx {
+                                    Ok(base_ref.clone())
+                                } else {
+                                    load_raw(&entries[i]).map(|opt| {
+                                        opt.and_then(|(id, bytes)| match &prev_text {
+                                            Some(bt) => Text::try_plain_from_parent(id, bytes, bt),
+                                            None => Text::try_plain(id, bytes),
+                                        })
+                                    })
+                                };
+                                if let Ok(Some(ref t)) = r {
+                                    prev_text = Some(t.clone());
+                                }
+                                *out_t[i].lock().unwrap() = Some(r);
                             }
-                            let (_, _, ref pt, ref text) = diff_jobs[i];
-                            let m = crate::derive::blame::diff_parent(pt, text);
-                            *out[i].lock().unwrap() = Some(m);
+                            max_t_ns.fetch_max(wt0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                            let ws0 = std::time::Instant::now();
+                            loop {
+                                let j = next_s.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if j >= missing_metas.len() {
+                                    break;
+                                }
+                                let id = missing_metas[j];
+                                let r = load_meta(id, gens_ref[&id]);
+                                *out_s[j].lock().unwrap() = Some(r);
+                            }
+                            max_s_ns.fetch_max(ws0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                            barrier.wait();
+                            let wd0 = std::time::Instant::now();
+                            loop {
+                                let k = next_d.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if k >= specs_ref.len() {
+                                    break;
+                                }
+                                let (_, _, vi, p_idx, ref done_pt) = specs_ref[k];
+                                let child_opt = out_t[vi].lock().unwrap().as_ref().unwrap().as_ref().ok().and_then(|o| o.clone());
+                                let parent_opt = match p_idx {
+                                    Some(pi_idx) => out_t[pi_idx].lock().unwrap().as_ref().unwrap().as_ref().ok().and_then(|o| o.clone()),
+                                    None => done_pt.clone(),
+                                };
+                                if let (Some(pt), Some(text)) = (parent_opt, child_opt) {
+                                    let m = crate::derive::blame::diff_parent(&pt, &text);
+                                    *out_d[k].lock().unwrap() = Some(m);
+                                }
+                            }
+                            max_d_ns.fetch_max(wd0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                         });
                     }
                 });
-                for ((v, pi, _, _), m) in diff_jobs.into_iter().zip(out) {
-                    pre_maps.insert((v, pi), m.into_inner().unwrap().unwrap());
+                let n_rep = out_d.iter().filter(|m| matches!(m.lock().unwrap().as_ref(), Some(crate::derive::blame::ParentMap::Replaced { .. }))).count();
+                let n_trim = out_d.iter().filter(|m| matches!(m.lock().unwrap().as_ref(), Some(crate::derive::blame::ParentMap::Trimmed { .. }))).count();
+                eprintln!(
+                    "POOL slice={}: total={:?} max_t={:?} max_s={:?} max_d={:?} rep={n_rep} trim={n_trim}",
+                    slice.len(),
+                    tp0.elapsed(),
+                    std::time::Duration::from_nanos(max_t_ns.load(std::sync::atomic::Ordering::Relaxed)),
+                    std::time::Duration::from_nanos(max_s_ns.load(std::sync::atomic::Ordering::Relaxed)),
+                    std::time::Duration::from_nanos(max_d_ns.load(std::sync::atomic::Ordering::Relaxed)),
+                );
+                for m in out_s {
+                    let (id, meta) = m.into_inner().unwrap().unwrap()?;
+                    self.metas.insert(id, Arc::new(meta));
+                }
+                for (v, m) in slice.iter().zip(out_t) {
+                    let text = m.into_inner().unwrap().unwrap()?;
+                    chunk_texts.insert(v.clone(), text);
+                }
+                for ((v, pi, _, _, _), m) in diff_specs.into_iter().zip(out_d) {
+                    if let Some(pm) = m.into_inner().unwrap() {
+                        pre_maps.insert((v, pi), pm);
+                    }
                 }
             }
             // 3. Propagate blames sequentially in topological order and maintain exact held accounting.
+            let mut pending_keeps: Vec<(Version, Arc<Blame>)> = Vec::new();
             for v in slice {
                 let parents = nodes[v].parents.clone();
+                // If `v` has a single parent `p` whose blame is ready to be
+                // consumed (`pn.left == 1 && p != start`), take `p` from `done`
+                // up front so we can mutate its `Blame` in place via
+                // `Arc::make_mut` without cloning `lines` or `origins`.
+                let mut single_taken: Option<(Version, Done)> = None;
+                if parents.len() == 1 {
+                    if let Some(p) = &parents[0] {
+                        if nodes[p].left == 1 && p != start {
+                            if let Some(d) = done.remove(p) {
+                                if let Some((ref t, ref b)) = d {
+                                    held -= t.weight() + b.weight();
+                                }
+                                nodes.get_mut(p).unwrap().left = 0;
+                                single_taken = Some((p.clone(), d));
+                            }
+                        }
+                    }
+                }
                 let out: Done = match chunk_texts.remove(v).flatten() {
-                    None => None,
+                    None => {
+                        chain_last = None;
+                        chain_counts.clear();
+                        None
+                    }
                     Some(text) => {
                         self.stopped()?;
-                        let inputs: Vec<Option<(&Blame, crate::derive::blame::ParentMap)>> = parents
-                            .iter()
-                            .enumerate()
-                            .map(|(pi, p)| {
-                                let p = p.as_ref()?;
-                                let (_, pb) = done.get(p)?.as_ref()?;
-                                let pm = pre_maps.remove(&(v.clone(), pi))?;
-                                Some((&**pb, pm))
-                            })
-                            .collect();
+                        if parents.len() != 1 || parents[0].as_ref() != chain_last.as_ref() {
+                            chain_counts.clear();
+                        }
                         let me: Origin = (v.id, self.intern(&v.path), self.meta(&v.id)?);
-                        let (b, _) = crate::derive::blame::step_mapped(&me, text.lines.len(), &inputs);
+                        let b: Arc<Blame> = if let Some((ref p, Some((_, mut pb_arc)))) = single_taken.take() {
+                            if let Some(pm) = pre_maps.remove(&(v.clone(), 0)) {
+                                let pb_mut = Arc::make_mut(&mut pb_arc);
+                                crate::derive::blame::step_mapped_in_place(pb_mut, &me, text.lines.len(), &pm, &mut chain_counts);
+                                pb_arc
+                            } else {
+                                let inputs = [None];
+                                let (b, _) = crate::derive::blame::step_mapped_with_counts(&me, text.lines.len(), &inputs, &mut chain_counts);
+                                let _ = p;
+                                Arc::new(b)
+                            }
+                        } else {
+                            let inputs: Vec<Option<(&Blame, crate::derive::blame::ParentMap)>> = parents
+                                .iter()
+                                .enumerate()
+                                .map(|(pi, p)| {
+                                    let p = p.as_ref()?;
+                                    let (_, pb) = done.get(p)?.as_ref()?;
+                                    let pm = pre_maps.remove(&(v.clone(), pi))?;
+                                    Some((&**pb, pm))
+                                })
+                                .collect();
+                            let (b, _) = crate::derive::blame::step_mapped_with_counts(&me, text.lines.len(), &inputs, &mut chain_counts);
+                            Arc::new(b)
+                        };
+                        chain_last = Some(v.clone());
                         self.f.g.cx.hub().query.blame_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let b = Arc::new(b);
                         let should_keep = *v == *start || (b.vd % CHECKPOINT == 0 && b.vd % spacing(computed, b.stored_estimate()) == 0);
-                        if should_keep && !self.keep(v, &b) && *v == *start {
-                            return Err(too_large());
+                        if should_keep {
+                            if self.limits.held >= 4 << 20 {
+                                pending_keeps.push((v.clone(), b.clone()));
+                            } else if !self.keep(v, &b) && *v == *start {
+                                return Err(too_large());
+                            }
                         }
                         Some((text, b))
                     }
@@ -1007,14 +1278,19 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                 }
                 for p in parents.iter().flatten() {
                     let pn = nodes.get_mut(p).unwrap();
-                    pn.left -= 1;
-                    if pn.left == 0 && p != start {
-                        if let Some(Some((t, b))) = done.remove(p) {
-                            held -= t.weight() + b.weight();
+                    if pn.left > 0 {
+                        pn.left -= 1;
+                        if pn.left == 0 && p != start {
+                            if let Some(Some((t, b))) = done.remove(p) {
+                                held -= t.weight() + b.weight();
+                            }
                         }
                     }
                 }
                 done.insert(v.clone(), out);
+                if held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes() > self.limits.held && !self.writes.is_empty() {
+                    self.write()?;
+                }
                 if held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes() > self.limits.held {
                     return Err(too_wide());
                 }
@@ -1022,7 +1298,63 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                     self.write()?;
                 }
             }
+            if !pending_keeps.is_empty() {
+                let encoded: Vec<Vec<u8>> = if pending_keeps.len() == 1 {
+                    let p_keys = &self.path_keys;
+                    vec![pending_keeps[0].1.encode(|p| {
+                        p_keys
+                            .get(&(p.as_ptr()))
+                            .cloned()
+                            .unwrap_or_else(|| path_key(p))
+                    })]
+                } else {
+                    let mut pk_by_str: HashMap<&str, &str> = HashMap::with_capacity(self.paths.len());
+                    for (s, arc) in &self.paths {
+                        if let Some(k) = self.path_keys.get(&(Arc::as_ptr(arc) as *const u8)) {
+                            pk_by_str.insert(s.as_str(), k.as_str());
+                        }
+                    }
+                    let n_enc = WORKERS.min(pending_keeps.len());
+                    let next_k = std::sync::atomic::AtomicUsize::new(0);
+                    let out_k: Vec<std::sync::Mutex<Option<Vec<u8>>>> = (0..pending_keeps.len()).map(|_| std::sync::Mutex::new(None)).collect();
+                    let keeps_ref = &pending_keeps;
+                    let pk_ref = &pk_by_str;
+                    std::thread::scope(|s| {
+                        for _ in 0..n_enc {
+                            s.spawn(|| loop {
+                                let k = next_k.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if k >= keeps_ref.len() {
+                                    break;
+                                }
+                                let raw = keeps_ref[k].1.encode(|p| {
+                                    pk_ref
+                                        .get(p)
+                                        .map(|&s| s.to_string())
+                                        .unwrap_or_else(|| path_key(p))
+                                });
+                                *out_k[k].lock().unwrap() = Some(raw);
+                            });
+                        }
+                    });
+                    out_k.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect()
+                };
+                for ((kv, kb), raw) in pending_keeps.into_iter().zip(encoded) {
+                    if !self.keep_encoded(&kv, &kb, raw) && kv == *start {
+                        return Err(too_large());
+                    }
+                    if held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes() > self.limits.held && !self.writes.is_empty() {
+                        self.write()?;
+                    }
+                    if held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes() > self.limits.held {
+                        return Err(too_wide());
+                    }
+                    if self.writes.len() >= BATCH_BLAMES || self.pending_bytes >= self.batch_bytes() {
+                        self.write()?;
+                    }
+                }
+            }
         }
+        eprintln!("RUN_TOTAL: {:?}", tr0.elapsed());
         Ok(done.remove(start).flatten())
     }
 
@@ -1043,7 +1375,17 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
     /// Keep blame `b` of version `v` (written with the next batch); `false`
     /// when it is larger than [`Blamer::one_kept`] (not kept).
     fn keep(&mut self, v: &Version, b: &Blame) -> bool {
-        let raw = b.encode(path_key);
+        let p_keys = &self.path_keys;
+        let raw = b.encode(|p| {
+            p_keys
+                .get(&(p.as_ptr()))
+                .cloned()
+                .unwrap_or_else(|| path_key(p))
+        });
+        self.keep_encoded(v, b, raw)
+    }
+
+    fn keep_encoded(&mut self, v: &Version, b: &Blame, raw: Vec<u8>) -> bool {
         if raw.len() > self.one_kept() {
             return false;
         }
@@ -1051,10 +1393,15 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         let mut named: Vec<String> = Vec::new();
         let mut seen: HashSet<*const u8> = HashSet::new();
         for (_, p, _) in &b.origins {
-            if !seen.insert(Arc::as_ptr(p) as *const u8) {
+            let ptr = Arc::as_ptr(p) as *const u8;
+            if !seen.insert(ptr) {
                 continue;
             }
-            let k = path_key(p);
+            let k = self
+                .path_keys
+                .get(&ptr)
+                .cloned()
+                .unwrap_or_else(|| path_key(p));
             if !self.write_paths.contains_key(&k) {
                 self.pending_bytes += p.len() + 64;
                 self.write_paths.insert(k.clone(), p.to_string());
@@ -1064,7 +1411,12 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         named.sort();
         named.dedup();
         self.pending_bytes += named.len() * 33;
-        self.writes.push((path_key(&v.path), v.id, raw, named.join(",")));
+        let vk = self
+            .path_keys
+            .get(&(Arc::as_ptr(&v.path) as *const u8))
+            .cloned()
+            .unwrap_or_else(|| path_key(&v.path));
+        self.writes.push((vk, v.id, raw, named.join(",")));
         true
     }
 
@@ -1082,6 +1434,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         self.pending_bytes = 0;
         let cx = self.f.g.cx;
         let (pool, project, vk) = (&cx.hub().db, cx.project(), self.f.g.vk);
+        let tw0 = std::time::Instant::now();
         let (pk, pp): (Vec<String>, Vec<String>) = paths.into_iter().unzip();
         for (k, p) in pk.chunks(ROWS_PER_STATEMENT).zip(pp.chunks(ROWS_PER_STATEMENT)) {
             cx.db(|| {
@@ -1092,13 +1445,13 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                     .execute(pool)
             })?;
         }
-        // One statement for the batch, one for the records, one for the
-        // view key's cap.
+        let tw1 = std::time::Instant::now();
         let now = veil_core::now_millis();
         let keys: Vec<&str> = w.iter().map(|r| r.0.as_str()).collect();
         let snaps: Vec<String> = w.iter().map(|r| r.1.hex()).collect();
         let bodies: Vec<&[u8]> = w.iter().map(|r| r.2.as_slice()).collect();
         let sizes: Vec<i64> = w.iter().map(|r| r.2.len() as i64).collect();
+        let batch_sum: i64 = sizes.iter().sum();
         let named: Vec<&str> = w.iter().map(|r| r.3.as_str()).collect();
         cx.db(|| {
             sqlx::query(
@@ -1117,6 +1470,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             .bind(&named)
             .execute(pool)
         })?;
+        let tw2 = std::time::Instant::now();
         let mut kept_paths: Vec<&str> = keys.clone();
         kept_paths.sort_unstable();
         kept_paths.dedup();
@@ -1131,27 +1485,42 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             .bind(&kept_paths)
             .execute(pool)
         })?;
+        let tw3 = std::time::Instant::now();
+        eprintln!("WRITE_STMTS rows={} bytes={}: paths={:?} memo={:?} ends={:?}", w.len(), batch_sum, tw1 - tw0, tw2 - tw1, tw3 - tw2);
+        let prev_total = match self.total_kept_bytes {
+            Some(t) => t,
+            None => cx.db(|| {
+                sqlx::query_scalar("SELECT COALESCE(SUM(bytes)::bigint, 0) FROM blame_memo WHERE project_id = $1 AND view_key = $2")
+                    .bind(project)
+                    .bind(vk)
+                    .fetch_one(pool)
+            })?,
+        };
+        let new_total = if self.total_kept_bytes.is_some() { prev_total + batch_sum } else { prev_total };
+        self.total_kept_bytes = Some(new_total.min(self.limits.kept_bytes as i64));
         // The rows just written are counted first (newest) and never
         // dropped: they take at most half the cap (`batch_bytes`).
-        cx.db(|| {
-            sqlx::query(
-                "DELETE FROM blame_memo WHERE project_id = $1 AND view_key = $2 AND (path_key, follow, snapshot) IN ( \
-                     SELECT path_key, follow, snapshot FROM ( \
-                         SELECT path_key, follow, snapshot, \
-                             SUM(bytes) OVER (ORDER BY (follow = $4 AND (path_key, snapshot) IN (SELECT * FROM UNNEST($5::text[], $6::text[]))) DESC, \
-                                 created_at DESC, path_key, follow, snapshot) AS kept, \
-                             (follow = $4 AND (path_key, snapshot) IN (SELECT * FROM UNNEST($5::text[], $6::text[]))) AS mine \
-                         FROM blame_memo WHERE project_id = $1 AND view_key = $2) t \
-                     WHERE kept > $3 AND NOT mine)",
-            )
-            .bind(project)
-            .bind(vk)
-            .bind(self.limits.kept_bytes as i64)
-            .bind(self.follow)
-            .bind(&keys)
-            .bind(&snaps)
-            .execute(pool)
-        })?;
+        if new_total > self.limits.kept_bytes as i64 {
+            cx.db(|| {
+                sqlx::query(
+                    "DELETE FROM blame_memo WHERE project_id = $1 AND view_key = $2 AND (path_key, follow, snapshot) IN ( \
+                         SELECT path_key, follow, snapshot FROM ( \
+                             SELECT path_key, follow, snapshot, \
+                                 SUM(bytes) OVER (ORDER BY (follow = $4 AND (path_key, snapshot) IN (SELECT * FROM UNNEST($5::text[], $6::text[]))) DESC, \
+                                     created_at DESC, path_key, follow, snapshot) AS kept, \
+                                 (follow = $4 AND (path_key, snapshot) IN (SELECT * FROM UNNEST($5::text[], $6::text[]))) AS mine \
+                             FROM blame_memo WHERE project_id = $1 AND view_key = $2) t \
+                         WHERE kept > $3 AND NOT mine)",
+                )
+                .bind(project)
+                .bind(vk)
+                .bind(self.limits.kept_bytes as i64)
+                .bind(self.follow)
+                .bind(&keys)
+                .bind(&snaps)
+                .execute(pool)
+            })?;
+        }
         for (k, s, _, _) in w {
             self.kept.entry(k).or_default().insert(s);
         }
@@ -1202,18 +1571,19 @@ const KEPT_ENDS: i64 = 4096;
 /// How a blame job ended, for every request waiting on it.
 #[derive(Clone, Debug)]
 pub enum JobEnd {
-    /// Kept (or found kept, by another server's job).
-    Kept,
+    /// Kept (with the in-memory text and blame when computed here, or `None`
+    /// when found already kept in the database).
+    Kept(Option<(Arc<Text>, Arc<Blame>)>),
     /// The version holds no plain text.
     NoText,
     Failed(StatusCode, &'static str, String),
 }
 
 impl JobEnd {
-    fn of(r: Result<bool>) -> JobEnd {
+    fn of(r: Result<Option<Option<(Arc<Text>, Arc<Blame>)>>>) -> JobEnd {
         match r {
-            Ok(true) => JobEnd::Kept,
-            Ok(false) => JobEnd::NoText,
+            Ok(Some(direct)) => JobEnd::Kept(direct),
+            Ok(None) => JobEnd::NoText,
             Err(Error::Api { status, code, message }) => JobEnd::Failed(status, code, message),
             Err(e) => JobEnd::Failed(StatusCode::INTERNAL_SERVER_ERROR, "internal", format!("{e:?}")),
         }
@@ -1387,7 +1757,7 @@ impl Slots {
 
     /// A slot for `who`; a waiter that leaves before its turn (a job
     /// refused at the ceiling) gives its turn to the next.
-    async fn take(self: &Arc<Self>, who: Requester) -> Slot {
+    async fn take(self: &Arc<Self>, who: Requester) -> (Slot, bool) {
         let rx = {
             let mut st = self.state.lock().unwrap();
             // A free slot means nobody (still) waits: a freed one goes to a
@@ -1395,14 +1765,14 @@ impl Slots {
             if st.free > 0 {
                 st.free -= 1;
                 st.last = Some(who);
-                return Slot { slots: Some(self.clone()) };
+                return (Slot { slots: Some(self.clone()) }, false);
             }
             let (tx, rx) = tokio::sync::oneshot::channel();
             st.queues.entry(who).or_default().push_back(tx);
             rx
         };
         // A sender is dropped only once sent.
-        rx.await.expect("a blame slot")
+        (rx.await.expect("a blame slot"), true)
     }
 
     fn give(me: Arc<Self>) {
@@ -1459,6 +1829,7 @@ fn warming() -> Error {
 /// from a record that it is too wide (BUG-1309), or start its job, or join
 /// the one running here (and through its lease, another server's). The
 /// job goes on when the wait ends (`warming`).
+#[allow(clippy::too_many_arguments)]
 pub async fn wait_for_blame(
     hub: &Arc<crate::Hub>,
     project: &crate::perm::Project,
@@ -1467,6 +1838,7 @@ pub async fn wait_for_blame(
     follow: bool,
     limits: BlameLimits,
     deadline: std::time::Instant,
+    seeded_window: Option<(Window, usize)>,
 ) -> Result<JobEnd> {
     let vk = project.view(viewer).key();
     let key: JobKey = (project.id, vk, path_key(&start.path), follow, start.id);
@@ -1494,7 +1866,7 @@ pub async fn wait_for_blame(
                     hub.query.jobs.started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (hub, project, viewer, start) = (hub.clone(), project.clone(), viewer.clone(), start.clone());
                     tokio::spawn(async move {
-                        let r = leased_job(&hub, &project, &viewer, &key, &start, follow, limits, &ticket).await;
+                        let r = leased_job(&hub, &project, &viewer, &key, &start, follow, limits, &ticket, seeded_window).await;
                         if let Err(e) = &r {
                             if !matches!(e, Error::Api { code: "warming" | "too_wide", .. }) {
                                 eprintln!("veil-server: a blame job of project {}: {e:?}", project.id);
@@ -1540,7 +1912,7 @@ async fn settled(hub: &crate::Hub, key: &JobKey, limits: BlameLimits) -> Result<
     .fetch_one(&hub.db)
     .await?;
     Ok(if kept {
-        Some(JobEnd::Kept)
+        Some(JobEnd::Kept(None))
     } else if wide {
         Some(JobEnd::too_wide())
     } else {
@@ -1667,13 +2039,14 @@ async fn drop_out_of_use(hub: &crate::Hub, project: i64, in_use: &HashSet<String
 /// How a job's computing ended: kept or not plain text, or too wide (the
 /// message, and the path keys its walk reached).
 enum Outcome {
-    Done(bool),
+    Done(Option<Option<(Arc<Text>, Arc<Blame>)>>),
     TooWide(String, Vec<String>),
 }
 
 /// The job, under its key's lease (`blame_jobs`: one server at a time),
 /// in one of this server's [`BLAME_JOBS`] slots: whether it ended kept
-/// (`false`: no plain text). It computes only while it holds the lease
+/// (`None`: no plain text; `Some(Some(_))`: computed here; `Some(None)`:
+/// found already kept in the database). It computes only while it holds the lease
 /// (BUG-1307): it takes the lease first, keeps renewing it while it waits
 /// for a slot and while it computes, and stops at its next version once a
 /// renewal fails; a job waiting for another server's lease stops as soon
@@ -1689,7 +2062,8 @@ async fn leased_job(
     follow: bool,
     limits: BlameLimits,
     ticket: &Ticket,
-) -> Result<bool> {
+    mut seeded_window: Option<(Window, usize)>,
+) -> Result<Option<Option<(Arc<Text>, Arc<Blame>)>>> {
     let holder = hex::encode(veil_core::crypto::random_bytes::<16>());
     let take = || async {
         let now = veil_core::now_millis();
@@ -1711,18 +2085,20 @@ async fn leased_job(
         Ok::<Option<i64>, Error>(got.map(|_| now))
     };
     let ended = |end: JobEnd| match end {
-        JobEnd::Kept => Ok(true),
-        JobEnd::NoText => Ok(false),
+        JobEnd::Kept(direct) => Ok(Some(direct)),
+        JobEnd::NoText => Ok(None),
         JobEnd::Failed(status, code, message) => Err(Error::Api { status, code, message }),
     };
-    if let Some(end) = settled(hub, key, limits).await? {
-        return ended(end);
-    }
     let wait = tokio::time::Instant::now() + limits.wait;
     let mut pause = Duration::from_millis(250);
+    let mut waited_lease = false;
     let taken = loop {
         if let Some(at) = take().await? {
             break at;
+        }
+        waited_lease = true;
+        if let Some(end) = settled(hub, key, limits).await? {
+            return ended(end);
         }
         if tokio::time::Instant::now() >= wait {
             return Err(warming());
@@ -1774,13 +2150,16 @@ async fn leased_job(
     let mut since = i64::MAX;
     let r: Result<Outcome> = async {
         let who: Requester = viewer.person;
-        let _slot = tokio::select! {
+        let (_slot, waited_slot) = tokio::select! {
             s = hub.query.jobs.slots.take(who) => s,
             // Refused at the ceiling while it waits for a slot.
             _ = ticket.wake.notified() => return Err(warming()),
         };
-        if let Some(end) = settled(hub, key, limits).await? {
-            return ended(end).map(Outcome::Done);
+        if waited_lease || waited_slot {
+            seeded_window = None;
+            if let Some(end) = settled(hub, key, limits).await? {
+                return ended(end).map(Outcome::Done);
+            }
         }
         if !lease.live() {
             return Err(warming());
@@ -1804,10 +2183,13 @@ async fn leased_job(
             let view = project.view(&viewer);
             let t = Trees::new(&g, &view);
             let f = Files::new(&g);
+            if let Some((w, loaded)) = seeded_window {
+                f.seed_window(&start.path, w, loaded);
+            }
             let mut b = Blamer::new(&f, &t, follow, limits);
             b.lease = Some(lease);
             match b.blame(&start) {
-                Ok(d) => Ok(Outcome::Done(d.is_some())),
+                Ok(d) => Ok(Outcome::Done(d.map(Some))),
                 Err(Error::Api { code: "too_wide", message, .. }) => {
                     let mut reached: Vec<String> = b.reached.into_iter().collect();
                     reached.sort();
@@ -1847,27 +2229,33 @@ async fn leased_job(
 /// name, newest first (the viewer's generations).
 #[allow(clippy::too_many_arguments)]
 pub fn blame_json(_g: &G, rev: ObjectId, path: &str, follow: bool, text: &Text, b: &Blame, after: usize, n: usize) -> Result<Value> {
+    blame_json_direct(rev, path, follow, text, b, after, n)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn blame_json_direct(rev: ObjectId, path: &str, follow: bool, text: &Text, b: &Blame, after: usize, n: usize) -> Result<Value> {
     let total = text.lines.len();
     let from = after.min(total);
     let to = from.saturating_add(n).min(total);
     let mut lines = Vec::with_capacity(to - from);
     // What an answer shows of each change is kept with the blame (S14
     // cycle 3): no snapshot is read here.
-    let mut named: HashMap<ObjectId, Arc<Meta>> = HashMap::new();
+    let mut named: HashMap<ObjectId, Arc<Meta>> = HashMap::with_capacity(b.origins.len());
+    let origin_hex: Vec<String> = b.origins.iter().map(|(id, _, _)| id.hex()).collect();
     for i in from..to {
-        let (id, p, l) = b.origin(i);
-        let m = b.meta(i);
+        let (o, l) = b.lines[i];
+        let (id, p, m) = &b.origins[o as usize];
         named.entry(*id).or_insert_with(|| m.clone());
         let raw = text.line(i);
         let raw = raw.strip_suffix(b"\n").unwrap_or(raw);
         let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
         lines.push(json!({
             "line": i + 1,
-            "text": String::from_utf8_lossy(raw),
-            "snapshot": id.hex(),
-            "change": m.change_id,
+            "text": std::str::from_utf8(raw).unwrap_or(""),
+            "snapshot": &origin_hex[o as usize],
+            "change": &m.change_id,
             "change_short": m.change_id.get(..8).unwrap_or(&m.change_id),
-            "path": p,
+            "path": &**p,
             "origin_line": l,
         }));
     }
@@ -1877,14 +2265,15 @@ pub fn blame_json(_g: &G, rev: ObjectId, path: &str, follow: bool, text: &Text, 
         .iter()
         .map(|(_, id)| {
             let m = &named[id];
+            let hex = id.hex();
             json!({
-                "snapshot_id": id.hex(),
-                "snapshot_short": id.short(),
-                "change_id": m.change_id,
+                "snapshot_id": &hex,
+                "snapshot_short": &hex[..8],
+                "change_id": &m.change_id,
                 "change_short": m.change_id.get(..8).unwrap_or(&m.change_id),
-                "author": m.author,
+                "author": &m.author,
                 "timestamp": m.timestamp,
-                "summary": m.summary,
+                "summary": &m.summary,
             })
         })
         .collect();
