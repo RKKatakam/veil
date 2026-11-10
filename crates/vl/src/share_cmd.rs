@@ -547,7 +547,7 @@ fn secret_path(ctx: &Ctx, path: &str) -> std::result::Result<VPath, String> {
     if named.is_ok() {
         return named;
     }
-    match Policy::load(&*ctx.fs) {
+    match ctx.repo.effective_policy(&*ctx.fs) {
         Ok(p) => shareable(&p, path).map_err(|_| named.unwrap_err()),
         Err(_) => named,
     }
@@ -584,7 +584,7 @@ fn receive(ctx: &Ctx, me: &str, shares: &[ShareInfo]) -> Vec<String> {
         Err(e) => return vec![format!("{} secret share(s) for you not received: {e:#}", mine.len())],
     };
     let rings = local_states(ctx);
-    let policy = Policy::load(&*ctx.fs).ok();
+    let policy = ctx.repo.effective_policy(&*ctx.fs).ok();
     let only = ctx.repo.config().remotes.get("origin").and_then(|r| r.only.clone());
     // Decided on the record as it is now; recorded under the lock, keeping
     // only what moves forward (BUG-1066).
@@ -728,7 +728,7 @@ pub fn hold_back_received(ctx: &Ctx) {
     if st.received.is_empty() {
         return;
     }
-    let policy = Policy::load(&*ctx.fs).ok();
+    let policy = ctx.repo.effective_policy(&*ctx.fs).ok();
     let tree = ctx.repo.view().workspaces.get(&ctx.ws).and_then(|w| ctx.repo.snapshot(&w.wc).ok()).map(|s| s.tree);
     for rec in st.received.values() {
         let Ok(vp) = VPath::new(&rec.path) else { continue };

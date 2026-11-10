@@ -1438,6 +1438,8 @@ impl<'a, F: FnMut(ObjectId, Vec<u8>) -> Result<()>> Introduced<'a, F> {
             } else if before.iter().any(|pe| pe.id == e.id && pe.kind == e.kind) {
                 // Names exactly what that parent's entry names.
                 continue;
+            } else if veil_core::secret_share::personal_key(&p) {
+                bail!("'{}' is a personal private key: it never leaves your device", crate::render::safe(&p));
             }
             let mut known = HashSet::new();
             for pe in &before {
@@ -1761,12 +1763,21 @@ fn upload_new(repo: &Repo, remote: &str, client: &Client, targets: &[ObjectId], 
         stack.extend(s.parents.iter().chain(&s.attempts).copied());
         new.push((id, s));
     }
+    let tree_pairs: Vec<(ObjectId, Vec<ObjectId>)> = new
+        .iter()
+        .map(|(_, s)| {
+            let parents = s.parents.iter().filter_map(|p| held.snapshot(p).ok().flatten().map(|ps| ps.tree)).collect();
+            (s.tree, parents)
+        })
+        .collect();
+    if let Err(why) = veil_core::remote::check_no_personal_keys(&store, &tree_pairs) {
+        bail!("{why}");
+    }
     // Upload what the push introduces as the walk finds it.
     let mut up = Uploads { client, compress, frames: Vec::new(), ids: Vec::new(), receipts: BTreeMap::new() };
     let mut walk = Introduced::new(&store, |id, raw| up.add(&id, &raw));
-    for (id, s) in &new {
-        let parents: Vec<ObjectId> = s.parents.iter().filter_map(|p| held.snapshot(p).ok().flatten().map(|ps| ps.tree)).collect();
-        walk.snapshot(*id, s.tree, parents)?;
+    for ((id, _), (tree, parents)) in new.iter().zip(tree_pairs) {
+        walk.snapshot(*id, tree, parents)?;
     }
     drop(walk);
     up.flush()?;

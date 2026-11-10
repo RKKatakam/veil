@@ -2314,7 +2314,8 @@ impl<'a> Builder<'a> {
     /// this very snapshot reclassifies the path (as in
     /// [`Builder::audience`]).
     fn keeps_sealing(&self, path: &VPath, class: &Classification, parent_file: Option<&TreeEntry>) -> bool {
-        parent_file.is_some_and(|pe| matches!(pe.visibility, Visibility::Cloaked { .. }))
+        !crate::secret_share::personal_key(path.as_str())
+            && parent_file.is_some_and(|pe| matches!(pe.visibility, Visibility::Cloaked { .. }))
             && !self.parent_policy.as_ref().is_some_and(|old| old.classify(path, false) != *class)
     }
 

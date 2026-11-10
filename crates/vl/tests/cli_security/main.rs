@@ -19,6 +19,7 @@ mod embargo_copy_cli;
 mod embargo_release_cli;
 mod hostile_cli;
 mod identity_cli;
+mod p1pass_cli;
 mod policy_cli;
 mod policy_round4_cli;
 mod policy_routes_cli;

@@ -625,15 +625,30 @@ pub fn change(repository: Option<&Path>, cmd: &crate::cli::ChangeCmd) -> Result<
     let mut list: Vec<Edit> = serde_json::from_str(&text).context("the edits: a JSON list of {\"path\", \"put\": {\"text\"}} or {\"path\", \"delete\": true}")?;
     let client = Client::new(&url, load_identity()?)?;
     let policy = match &clone {
-        Some(c) => Policy::parse(&crate::hub_keys::policy_text(c)),
+        Some(c) => {
+            let checked_out_from = c
+                .wc()
+                .ok()
+                .and_then(|wc| c.repo.snapshot(&wc).ok())
+                .map(|s| s.tree);
+            c.repo.effective_policy_from(&*c.fs, checked_out_from.as_ref())?
+        }
         None => Policy::builtin(),
     };
     let mut frames = Vec::new();
     let mut sealed = Vec::new();
     for e in &mut list {
+        let path = VPath::new(&e.path)
+            .ok()
+            .filter(|p| !p.components().any(veil_core::object::is_reserved_name))
+            .ok_or_else(|| anyhow!("'{}' is not a valid path", safe(&e.path)))?;
         let Some(put) = &mut e.put else { continue };
-        let Some(content) = put.text.as_ref() else { continue };
-        let path = VPath::new(&e.path).map_err(|_| anyhow!("'{}' is not a valid path", safe(&e.path)))?;
+        if veil_core::secret_share::personal_key(path.as_str()) {
+            bail!("'{}' is a personal private key: it never leaves your device", safe(&e.path));
+        }
+        if put.text.is_some() == put.object.is_some() {
+            bail!("'{}': put must name either 'text' or 'object'", safe(&e.path));
+        }
         let class = policy.classify(&path, false);
         match class.tier {
             Tier::Isolated | Tier::Ignored => bail!(
@@ -643,26 +658,37 @@ pub fn change(repository: Option<&Path>, cmd: &crate::cli::ChangeCmd) -> Result<
             ),
             Tier::Cloaked(scope) => {
                 let c = clone.as_ref().expect("only a clone's policy shares secrets");
-                let obj = c
-                    .repo
-                    .store()
-                    .seal(&Object::Blob(content.as_bytes().to_vec()), &scope)
-                    .with_context(|| format!("'{}' is a secret: this clone has no key to encrypt it", safe(&e.path)))?;
-                let raw = obj.encode();
-                let id = ObjectId::hash(&raw);
-                veil_core::hub::wire::put_frame(&mut frames, &id, &raw);
-                sealed.push(id);
-                put.object = Some(id);
-                put.text = None;
+                if let Some(obj_id) = put.object {
+                    if let Ok(raw) = c.repo.store().get_raw(&obj_id) {
+                        if Object::sealed_scope(&raw).as_deref() != Some(scope.as_str()) {
+                            bail!("'{}' is a secret file: object {} is not sealed for scope '{}'", safe(&e.path), obj_id.short(), safe(&scope));
+                        }
+                    }
+                }
+                if let Some(content) = put.text.as_ref() {
+                    let obj = c
+                        .repo
+                        .store()
+                        .seal(&Object::Blob(content.as_bytes().to_vec()), &scope)
+                        .with_context(|| format!("'{}' is a secret: this clone has no key to encrypt it", safe(&e.path)))?;
+                    let raw = obj.encode();
+                    let id = ObjectId::hash(&raw);
+                    veil_core::hub::wire::put_frame(&mut frames, &id, &raw);
+                    sealed.push(id);
+                    put.object = Some(id);
+                    put.text = None;
+                }
             }
             Tier::Public if !class.allow_secrets => {
-                if let Some(f) = veil_core::secrets::scan(content.as_bytes()).first() {
-                    bail!(
-                        "'{}' looks like it holds a secret ({}, line {}): put secrets in a secret file such as .env",
-                        safe(&e.path),
-                        f.rule,
-                        f.line
-                    );
+                if let Some(content) = put.text.as_ref() {
+                    if let Some(f) = veil_core::secrets::scan(content.as_bytes()).first() {
+                        bail!(
+                            "'{}' looks like it holds a secret ({}, line {}): put secrets in a secret file such as .env",
+                            safe(&e.path),
+                            f.rule,
+                            f.line
+                        );
+                    }
                 }
             }
             Tier::Public => {}

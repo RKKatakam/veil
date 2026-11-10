@@ -63,14 +63,31 @@ impl SecretRing {
     }
 }
 
-/// The working copy's `.veilpolicy`.
-pub fn policy_text(ctx: &Ctx) -> String {
+/// The working copy's raw `.veilpolicy` text (only for rewriting `.veilpolicy` in place).
+fn raw_policy_text(ctx: &Ctx) -> String {
     String::from_utf8_lossy(&ctx.fs.read(&VPath::new(POLICY_FILE).unwrap()).unwrap_or_default()).into_owned()
+}
+
+/// The accepted policy of this clone (`Repo::effective_policy_from`'s accepted
+/// pin when an unaccepted `.veilpolicy` edit is held back, with the member's
+/// own uncommitted `.veilpolicy` edit folded in).
+fn accepted_policy(ctx: &Ctx) -> Result<Policy> {
+    let checked_out_from = ctx
+        .wc()
+        .ok()
+        .and_then(|wc| ctx.repo.snapshot(&wc).ok())
+        .map(|s| s.tree);
+    let eff = ctx.repo.effective_policy_from(&*ctx.fs, checked_out_from.as_ref())?;
+    Ok(eff.accepted().cloned().unwrap_or(eff))
 }
 
 /// Does the project seal shared secrets per access line (`cloak rule`)?
 pub fn per_rule(text: &str) -> bool {
-    Policy::parse(text).rules().iter().any(|r| r.tier == Tier::Cloaked(RULE_SCOPE.into()))
+    per_rule_policy(&Policy::parse(text))
+}
+
+fn per_rule_policy(policy: &Policy) -> bool {
+    policy.rules().iter().any(|r| r.tier == Tier::Cloaked(RULE_SCOPE.into()))
 }
 
 /// The rings of a per-rule project: `team`, and one for each path whose
@@ -96,10 +113,10 @@ pub fn rule_rings(access: &AccessPolicy) -> Vec<SecretRing> {
 /// The scopes of `cloak SCOPE` lines (milestone S1's way: everyone an admin
 /// adds to a group gets them). In a per-rule project, `team` is the admins'
 /// and is not among them.
-fn cloak_scopes(text: &str) -> Vec<String> {
-    let rule = per_rule(text);
+fn cloak_scopes_policy(policy: &Policy) -> Vec<String> {
+    let rule = per_rule_policy(policy);
     let mut out: Vec<String> = Vec::new();
-    for r in Policy::parse(text).rules() {
+    for r in policy.rules() {
         if let Tier::Cloaked(s) = &r.tier {
             if s != RULE_SCOPE && !(rule && s == DEFAULT_SCOPE) && !out.contains(s) {
                 out.push(s.clone());
@@ -598,14 +615,14 @@ fn print_outcome(ring: &SecretRing, o: &Outcome) {
 /// After `vl group add GROUP PEOPLE`: an admin's device grants the keys of
 /// the rules naming the group to the people's confirmed devices.
 pub fn group_added(ctx: &mut Ctx, client: &Client, group: &str, people: &[String], confirm: &[String]) -> Result<()> {
-    let text = policy_text(ctx);
+    let policy = accepted_policy(ctx)?;
     let devices = person_devices(ctx, client, people, confirm)?;
     let mut any_admin = false;
     let admin = is_admin(client);
-    if per_rule(&text) && admin {
+    if per_rule_policy(&policy) && admin {
         let groups = client.groups()?;
         let admins = admins(client).unwrap_or_default();
-        for ring in rule_rings(&AccessPolicy::parse(&text)) {
+        for ring in rule_rings(policy.access_policy()) {
             let Some(rule) = &ring.rule else { continue };
             if !rule.names.iter().any(|n| n == group) {
                 continue;
@@ -617,7 +634,7 @@ pub fn group_added(ctx: &mut Ctx, client: &Client, group: &str, people: &[String
             }
         }
     }
-    any_admin |= legacy_grant(ctx, client, &text, &devices, true)?;
+    any_admin |= legacy_grant(ctx, client, &policy, &devices, true)?;
     // Their device takes the project's key rings only once it knows the
     // project's fingerprint (BUG-845): the same comparison, the other way.
     if !confirm.is_empty() {
@@ -654,12 +671,12 @@ fn is_admin(client: &Client) -> bool {
 /// gives them to (by ring member names: a device the server hides is
 /// revoked too), and says who keeps one and why.
 pub fn group_removed(ctx: &mut Ctx, client: &Client, group: &str, people: &[String]) -> Result<()> {
-    let text = policy_text(ctx);
+    let policy = accepted_policy(ctx)?;
     let groups = client.groups()?;
     let mut any_admin = false;
-    if per_rule(&text) && is_admin(client) {
+    if per_rule_policy(&policy) && is_admin(client) {
         let admins = admins(client).unwrap_or_default();
-        for ring in rule_rings(&AccessPolicy::parse(&text)) {
+        for ring in rule_rings(policy.access_policy()) {
             let Some(rule) = &ring.rule else { continue };
             if !rule.names.iter().any(|n| n == group) {
                 continue;
@@ -687,7 +704,7 @@ pub fn group_removed(ctx: &mut Ctx, client: &Client, group: &str, people: &[Stri
     let gone: Vec<String> = people.iter().filter(|p| !groups.iter().any(|g| g.members.contains(p))).cloned().collect();
     for person in people.iter().filter(|p| !gone.contains(p)) {
         let other: Vec<&str> = groups.iter().filter(|g| g.members.contains(person)).map(|g| g.name.as_str()).collect();
-        if !cloak_scopes(&text).is_empty() {
+        if !cloak_scopes_policy(&policy).is_empty() {
             println!(
                 "  {} {} is still in {}: the secret key was not rotated away from them",
                 yellow("keys:"),
@@ -698,7 +715,7 @@ pub fn group_removed(ctx: &mut Ctx, client: &Client, group: &str, people: &[Stri
     }
     if !gone.is_empty() {
         let devices = person_devices(ctx, client, &gone, &[])?;
-        any_admin |= legacy_grant(ctx, client, &text, &devices, false)?;
+        any_admin |= legacy_grant(ctx, client, &policy, &devices, false)?;
     }
     // A manager's clone may not read `.veilpolicy`: the server's rings say
     // whether the project has secret keys at all.
@@ -715,10 +732,10 @@ pub fn group_removed(ctx: &mut Ctx, client: &Client, group: &str, people: &[Stri
 /// Milestone S1's scopes (`cloak SCOPE` lines): granted to every person an
 /// admin adds to a group, revoked (by ring member names) from people in no
 /// group. `true` if this device administers one of them.
-fn legacy_grant(ctx: &mut Ctx, client: &Client, text: &str, devices: &[PersonDevices], grant: bool) -> Result<bool> {
+fn legacy_grant(ctx: &mut Ctx, client: &Client, policy: &Policy, devices: &[PersonDevices], grant: bool) -> Result<bool> {
     let me = load_identity()?;
     let mut any = false;
-    for scope in cloak_scopes(text) {
+    for scope in cloak_scopes_policy(policy) {
         let Some(Ok(st)) = ctx.repo.keys().ring_state(&scope)? else { continue };
         if !st.is_admin(&me.public_hex(), &me.verifying_hex()) {
             continue;
@@ -767,12 +784,11 @@ fn legacy_grant(ctx: &mut Ctx, client: &Client, text: &str, devices: &[PersonDev
 /// Before the project is on the server, the ring is created here only and
 /// goes up with the first push.
 pub fn access_changed(ctx: &mut Ctx, client: Option<&Client>, path: &str) -> Result<()> {
-    let text = policy_text(ctx);
-    if !per_rule(&text) {
+    let policy = accepted_policy(ctx)?;
+    if !per_rule_policy(&policy) {
         return Ok(());
     }
-    let access = AccessPolicy::parse(&text);
-    let Some(ring) = rule_rings(&access).into_iter().find(|r| r.rule.as_ref().is_some_and(|l| l.path == path)) else {
+    let Some(ring) = rule_rings(policy.access_policy()).into_iter().find(|r| r.rule.as_ref().is_some_and(|l| l.path == path)) else {
         return Ok(());
     };
     // Created here only before the project is on a server (its creator's
@@ -814,8 +830,8 @@ pub fn invite(ctx: &mut Ctx, client: &Client, person: &str, group: &str) -> Resu
     if !valid_principal_name(person) {
         bail!("'{person}' is not a person's name (lowercase letters, digits, '-', '_', '.')");
     }
-    let text = policy_text(ctx);
-    if !per_rule(&text) {
+    let policy = accepted_policy(ctx)?;
+    if !per_rule_policy(&policy) {
         bail!("this project still seals every secret with one key: an admin runs `vl upgrade --rule-keys` first");
     }
     // The link names the project's `team` ring, so the invitee's device
@@ -838,7 +854,7 @@ pub fn invite(ctx: &mut Ctx, client: &Client, person: &str, group: &str) -> Resu
     let groups = client.groups()?;
     let admins = admins(client)?;
     let mut rules = Vec::new();
-    for ring in rule_rings(&AccessPolicy::parse(&text)) {
+    for ring in rule_rings(policy.access_policy()) {
         if !ring.rule.as_ref().is_some_and(|r| r.names.iter().any(|n| n == group)) {
             continue;
         }
@@ -959,8 +975,8 @@ pub fn share_pass(ctx: &mut Ctx, client: &Client) -> Result<Vec<(String, String,
     if pending.is_empty() {
         return Ok(vec![]);
     }
-    let text = policy_text(ctx);
-    let labels: BTreeMap<String, String> = rule_rings(&AccessPolicy::parse(&text)).into_iter().map(|r| (r.scope.clone(), r.label())).collect();
+    let policy = accepted_policy(ctx)?;
+    let labels: BTreeMap<String, String> = rule_rings(policy.access_policy()).into_iter().map(|r| (r.scope.clone(), r.label())).collect();
     let me = load_identity()?;
     let mut done = Vec::new();
     let scopes: Vec<String> = ctx.repo.keys().rings()?.into_iter().map(|r| r.scope).collect();
@@ -1263,8 +1279,8 @@ pub fn remove_device(fingerprint: &str, server: Option<&str>) -> Result<()> {
         return Ok(());
     };
     let member = parse_public_identity(&device)?.member_id();
-    let text = policy_text(c);
-    let labels: BTreeMap<String, String> = rule_rings(&AccessPolicy::parse(&text)).into_iter().map(|r| (r.scope.clone(), r.label())).collect();
+    let policy = accepted_policy(c)?;
+    let labels: BTreeMap<String, String> = rule_rings(policy.access_policy()).into_iter().map(|r| (r.scope.clone(), r.label())).collect();
     let scopes: Vec<String> = c.repo.keys().rings()?.into_iter().map(|r| r.scope).collect();
     for scope in scopes {
         let holds = c.repo.keys().ring_state(&scope)?.and_then(|s| s.ok()).is_some_and(|st| st.members.contains_key(&member));
@@ -1298,8 +1314,13 @@ pub fn remove_device(fingerprint: &str, server: Option<&str>) -> Result<()> {
 /// non-admin from `team`. The next commit re-seals each secret.
 pub fn upgrade_rule_keys(ctx: &mut Ctx, dry_run: bool) -> Result<std::process::ExitCode> {
     // Rewrites `.veilpolicy` in the directory (BUG-1125).
-    let _wc = ctx.lock_dir(None)?;
-    let text = policy_text(ctx);
+    let wc = ctx.lock_dir(None)?;
+    if ctx.repo.effective_policy(&*ctx.fs)?.accepted().is_some() {
+        bail!(
+            "{POLICY_FILE} has unaccepted changes (`vl policy show`): run `vl policy accept` or restore {POLICY_FILE} before upgrading rule keys"
+        );
+    }
+    let text = raw_policy_text(ctx);
     // Already rewritten (also by a run that stopped before its keys were
     // moved, BUG-844): the keys are still brought up to date below.
     let already = per_rule(&text);
@@ -1368,6 +1389,7 @@ pub fn upgrade_rule_keys(ctx: &mut Ctx, dry_run: bool) -> Result<std::process::E
     if !already {
         ctx.fs.write(&VPath::new(POLICY_FILE)?, new_text.as_bytes())?;
     }
+    drop(wc);
     let people: Vec<String> = rings.iter().flat_map(|r| targets(r, &groups, &admins).0).collect::<BTreeSet<_>>().into_iter().collect();
     let devices = person_devices(ctx, &client, &people, &[])?;
     for ring in &rings {
