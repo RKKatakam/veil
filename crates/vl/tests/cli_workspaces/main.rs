@@ -14,6 +14,8 @@ mod adversarial_support;
 #[cfg(target_os = "linux")]
 mod confine_cli;
 #[cfg(target_os = "linux")]
+mod p1pass_confine_cli;
+#[cfg(target_os = "linux")]
 mod ports_seed_cli;
 mod guide_library;
 mod mount_cli;
