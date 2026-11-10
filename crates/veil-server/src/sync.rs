@@ -553,14 +553,20 @@ pub(crate) async fn resolve_for(
     if *id == root_snapshot_id() {
         return Ok(Some(*id));
     }
-    if crate::embargo::is_withheld_from_viewer(hub, project, viewer, id).await? {
-        return Ok(None);
-    }
+    let withheld = |r: ObjectId| async move {
+        if crate::embargo::is_withheld_from_viewer(hub, project, viewer, id).await? {
+            return Ok::<bool, Error>(true);
+        }
+        if r != *id && crate::embargo::is_withheld_from_viewer(hub, project, viewer, &r).await? {
+            return Ok(true);
+        }
+        Ok(false)
+    };
     let seen = |r: ObjectId| async move {
-        if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &r).await? {
+        if projected(hub, project, viewer, r).await? != *id {
             return Ok::<bool, Error>(false);
         }
-        Ok(projected(hub, project, viewer, r).await? == *id)
+        Ok(!withheld(r).await?)
     };
     let mut names: Vec<&str> = branches.to_vec();
     names.push(&project.default_branch);
@@ -645,9 +651,12 @@ pub(crate) async fn resolve_for(
         }
     };
     if let Some(r) = pick {
+        if withheld(r).await? {
+            return Ok(None);
+        }
         // A memo of their view that no longer projects to it: their view
         // is changing under them.
-        return match seen(r).await? {
+        return match projected(hub, project, viewer, r).await? == *id {
             true => Ok(Some(r)),
             false => Err(crate::query::graph::warming()),
         };
