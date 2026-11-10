@@ -598,6 +598,8 @@ async fn commit(
     snaps.push((built.real.hex(), built.mine.hex()));
     let moved_refs: Vec<(String, String)> = restacked.iter().map(|(n, o, _)| (n.hex(), o.hex())).collect();
     let (real, cid, accept, policy_text_update) = (built.real.hex(), plan.change_id.to_string(), built.accept.clone(), built.policy_text_update.clone());
+    let (agent_session, narrowed) = (who.viewer.agent || who.viewer.only.is_some(), who.viewer.only.is_some());
+    let expected_prev = plan.predecessors.first().map(ObjectId::hex);
     // A change onto the tip is a fast-forward from it.
     let rules_landing = match (&built.rules_file, &mv) {
         (Some(file), Some(m)) => Some(crate::prs::state::Landing { old: Some(m.cur), new: built.real, file: file.clone(), fast_forward: true }),
@@ -623,7 +625,7 @@ async fn commit(
         }
     };
     let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-        let (real, cid, accept, policy_text_update, mv, view_key, snaps, moved_refs, land, on_branch) = (
+        let (real, cid, accept, policy_text_update, mv, view_key, snaps, moved_refs, land, on_branch, expected_prev) = (
             real.clone(),
             cid.clone(),
             accept.clone(),
@@ -634,6 +636,7 @@ async fn commit(
             moved_refs.clone(),
             land.clone(),
             on_branch.clone(),
+            expected_prev.clone(),
         );
         let rules_landing = rules_landing.clone();
         Box::pin(async move {
@@ -712,21 +715,70 @@ async fn commit(
                     .execute(&mut *c)
                     .await?;
             }
-            // Only its creator makes new revisions of a change.
-            let rows = sqlx::query(
-                "INSERT INTO change_refs (project_id, change_id, snapshot, created_by, created_at) VALUES ($1, $2, $3, $4, $5) \
-                 ON CONFLICT (project_id, change_id) DO UPDATE SET snapshot = EXCLUDED.snapshot WHERE change_refs.created_by = EXCLUDED.created_by",
-            )
-            .bind(pid)
-            .bind(&cid)
-            .bind(&real)
-            .bind(person)
-            .bind(now)
-            .execute(&mut *c)
-            .await?
-            .rows_affected();
-            if rows != 1 {
-                return Err(Error::not_found(format!("no change {cid} of yours")));
+            // Only its creator makes new revisions of a change; an agent or
+            // narrowed session also binds the exact snapshot `resolve_change`
+            // verified so a concurrent out-of-scope update is never clobbered.
+            if agent_session {
+                if let Some(prev) = &expected_prev {
+                    let cur_expected = moved_refs
+                        .iter()
+                        .find(|(_, o)| o == prev)
+                        .map_or(prev.as_str(), |(n, _)| n.as_str());
+                    let rows = sqlx::query(
+                        "UPDATE change_refs SET snapshot = $1 WHERE project_id = $2 AND change_id = $3 AND created_by = $4 AND snapshot = $5",
+                    )
+                    .bind(&real)
+                    .bind(pid)
+                    .bind(&cid)
+                    .bind(person)
+                    .bind(cur_expected)
+                    .execute(&mut *c)
+                    .await?
+                    .rows_affected();
+                    if rows != 1 {
+                        return if narrowed {
+                            Err(sync::agent_refusal(sync::NARROWED_WRITE))
+                        } else {
+                            Err(Error::conflict(format!("change {cid} moved while this request ran; try again")))
+                        };
+                    }
+                } else {
+                    let rows = sqlx::query(
+                        "INSERT INTO change_refs (project_id, change_id, snapshot, created_by, created_at) VALUES ($1, $2, $3, $4, $5) \
+                         ON CONFLICT (project_id, change_id) DO NOTHING",
+                    )
+                    .bind(pid)
+                    .bind(&cid)
+                    .bind(&real)
+                    .bind(person)
+                    .bind(now)
+                    .execute(&mut *c)
+                    .await?
+                    .rows_affected();
+                    if rows != 1 {
+                        return if narrowed {
+                            Err(sync::agent_refusal(sync::NARROWED_WRITE))
+                        } else {
+                            Err(Error::not_found(format!("no change {cid} of yours")))
+                        };
+                    }
+                }
+            } else {
+                let rows = sqlx::query(
+                    "INSERT INTO change_refs (project_id, change_id, snapshot, created_by, created_at) VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT (project_id, change_id) DO UPDATE SET snapshot = EXCLUDED.snapshot WHERE change_refs.created_by = EXCLUDED.created_by",
+                )
+                .bind(pid)
+                .bind(&cid)
+                .bind(&real)
+                .bind(person)
+                .bind(now)
+                .execute(&mut *c)
+                .await?
+                .rows_affected();
+                if rows != 1 {
+                    return Err(Error::not_found(format!("no change {cid} of yours")));
+                }
             }
             let what = match (&mv, moved) {
                 (Some((b, _, _)), Some(true)) => format!("change {cid}, onto {b}"),
@@ -803,6 +855,83 @@ async fn resolve_base(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, mut ba
         Some(r) => Ok(r),
         None => Err(Error::not_found(format!("no snapshot {} that you can see", base.short()))),
     }
+}
+
+/// Resolve an existing `change_id` (`change_refs`) for a revision rewrite. An
+/// agent session may resolve or rewrite a change only when its existing
+/// snapshot lies within the session's narrowing (`within_narrowing`) and
+/// touches no access or review file (`decides_access`); outside its narrowing,
+/// the refusal is identical whether or not the change exists (BUG-1784).
+async fn resolve_change(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    person_id: i64,
+    cid: ChangeId,
+) -> Result<(ChangeId, Vec<ObjectId>)> {
+    let row: Option<(String, i64)> =
+        sqlx::query_as("SELECT snapshot, created_by FROM change_refs WHERE project_id = $1 AND change_id = $2")
+            .bind(project.id)
+            .bind(cid.to_string())
+            .fetch_optional(&hub.db)
+            .await?;
+    let narrowed = viewer.only.is_some();
+    let Some((s_hex, by)) = row else {
+        return if narrowed {
+            Err(sync::agent_refusal(sync::NARROWED_WRITE))
+        } else {
+            Err(Error::not_found(format!("no change {cid} of yours")))
+        };
+    };
+    if by != person_id {
+        return if narrowed {
+            Err(sync::agent_refusal(sync::NARROWED_WRITE))
+        } else {
+            Err(Error::not_found(format!("no change {cid} of yours")))
+        };
+    }
+    let prev = ObjectId::from_hex(&s_hex).map_err(|e| Error::Other(e.into()))?;
+    if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &prev).await? {
+        return if narrowed {
+            Err(sync::agent_refusal(sync::NARROWED_WRITE))
+        } else {
+            Err(Error::not_found(format!("no change {cid} of yours")))
+        };
+    }
+    if viewer.agent || narrowed {
+        let v = viewer.clone();
+        sync::blocking(hub, project.id, move |src| {
+            let s = src.snapshot(&prev)?;
+            let policy = AccessPolicy::default();
+            let everything = veil_core::hub::access::View::admin(&policy);
+            let parent_trees: Vec<Option<ObjectId>> = if s.parents.is_empty() {
+                vec![None]
+            } else {
+                s.parents
+                    .iter()
+                    .map(|p| Ok(Some(src.snapshot(p)?.tree)))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            for pt in parent_trees {
+                let mut diff = veil_core::hub::project::Graft::new(src, &everything);
+                diff.root(s.tree, pt)?;
+                if diff.changes.iter().any(|c| !v.within_narrowing(&c.path)) {
+                    return Err(sync::agent_refusal(sync::NARROWED_WRITE));
+                }
+                if v.agent {
+                    if let Some(c) = diff.changes.iter().find(|c| veil_core::hub::agent::decides_access(&c.path)) {
+                        return Err(sync::agent_refusal(&format!(
+                            "an agent session never changes '{}', which decides access or review",
+                            c.path
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await?;
+    }
+    Ok((cid, vec![prev]))
 }
 
 /// Most of the caller's own unlanded changes a change may be stacked on
@@ -921,17 +1050,7 @@ pub(crate) async fn create_with(
     };
     // A new revision of one of the caller's own changes, or a new change.
     let (change_id, predecessors) = match req.change_id {
-        Some(cid) => {
-            let row: Option<(String, i64)> = sqlx::query_as("SELECT snapshot, created_by FROM change_refs WHERE project_id = $1 AND change_id = $2")
-                .bind(project.id)
-                .bind(cid.to_string())
-                .fetch_optional(&hub.db)
-                .await?;
-            match row {
-                Some((s, by)) if by == person.id => (cid, vec![ObjectId::from_hex(&s).map_err(|e| Error::Other(e.into()))?]),
-                _ => return Err(Error::not_found(format!("no change {cid} of yours"))),
-            }
-        }
+        Some(cid) => resolve_change(hub, project, viewer, person.id, cid).await?,
         None => (ChangeId::random(), vec![]),
     };
     let mut ppredecessors = Vec::new();

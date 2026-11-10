@@ -1407,19 +1407,21 @@ fn bug_1783_checks_routes_bypass_embargo_withholding_leaking_unreleased_checks_a
 /// clobbering `change_refs` so the person's subsequent `stack_on` loses their
 /// out-of-scope edits!
 #[test]
-#[ignore = "BUG-1784: POST /v1/projects/{p}/changes lets a narrowed agent session hijack and overwrite its person's out-of-scope change_id in change_refs"]
 fn bug_1784_narrowed_agent_session_overwrites_persons_out_of_scope_change_id() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
     let api = hub.api();
     let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
 
     write_files(&p.dir, &[("src/api/mod.rs", "pub fn a() {}\n")]);
     p.admin.commit_main(&p.dir, "add src/api");
     p.admin.ok(&p.dir, &["push"]);
     let main_tip = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+    let dev_tip = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
 
-    // 1. Admin creates an unlanded S10 change `cid` modifying `BILL_DIR/secret_plan.txt` (outside `src/api`).
+    // 1. Admin creates an unlanded S10 change `cid` modifying `BILL_DIR/secret_plan.txt` (outside `src/api`),
+    //    an unlanded `rules_cid` modifying `.veilrules` (`decides_access`), and `dev` creates `other_cid`.
     let c_person = api.post_json(
         Some(&admin_tok),
         &format!("/v1/projects/{}/changes", p.name),
@@ -1431,9 +1433,35 @@ fn bug_1784_narrowed_agent_session_overwrites_persons_out_of_scope_change_id() {
     );
     assert_eq!(c_person.status, 200, "person creates billing change: {}", body(&c_person));
     let cid = c_person.json()["change_id"].as_str().unwrap().to_string();
+    let s_person = ObjectId::from_hex(c_person.json()["snapshot"].as_str().unwrap()).unwrap();
 
-    // 2. Narrowed agent session (`--only src/api`) updates `change_id: cid` from `base: main_tip`!
-    // MUST be refused (`403`/`404`) because `cid`'s existing snapshot touched `BILL_DIR/` outside `src/api`!
+    let c_rules = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": main_tip.hex(),
+            "description": "admin rules change",
+            "edits": [{"path": ".veilrules", "put": {"text": "[branches.main]\n"}}]
+        }),
+    );
+    assert_eq!(c_rules.status, 200, "person creates rules change: {}", body(&c_rules));
+    let rules_cid = c_rules.json()["change_id"].as_str().unwrap().to_string();
+
+    let c_other = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": dev_tip.hex(),
+            "description": "dev change",
+            "edits": [{"path": "src/api/mod.rs", "put": {"text": "pub fn dev() {}\n"}}]
+        }),
+    );
+    assert_eq!(c_other.status, 200, "dev creates change: {}", body(&c_other));
+    let other_cid = c_other.json()["change_id"].as_str().unwrap().to_string();
+    let missing_cid = veil_core::ChangeId::random().to_string();
+
+    // 2. Narrowed agent session (`--only src/api`) gets the exact same `403` narrowed refusal on
+    //    person's out-of-scope `cid`, person's `.veilrules` `rules_cid`, `dev`'s `other_cid`, and `missing_cid`!
     let agent = agent_token(&hub, &admin_tok, &p.name, &["src/api"]);
     let hijack = api.post_json(
         Some(&agent),
@@ -1445,7 +1473,87 @@ fn bug_1784_narrowed_agent_session_overwrites_persons_out_of_scope_change_id() {
             "edits": [{"path": "src/api/mod.rs", "put": {"text": "pub fn hijacked() {}\n"}}]
         }),
     );
-    assert_ne!(hijack.status, 200, "narrowed agent hijacked out-of-scope change_id {cid}: {}", body(&hijack));
+    assert_eq!(hijack.status, 403, "narrowed agent hijacked out-of-scope change_id {cid}: {}", body(&hijack));
+    assert_eq!(hijack.json()["code"], json!("agent_session"));
+    assert_eq!(
+        hijack.json()["message"],
+        json!("this agent session is narrowed: this would change files outside its paths")
+    );
+    for (label, target_cid) in [("rules_cid", &rules_cid), ("other_cid", &other_cid), ("missing_cid", &missing_cid)] {
+        let r = api.post_json(
+            Some(&agent),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({
+                "base": main_tip.hex(),
+                "change_id": target_cid,
+                "description": "probe",
+                "edits": [{"path": "src/api/mod.rs", "put": {"text": "pub fn hijacked() {}\n"}}]
+            }),
+        );
+        assert_eq!((r.status, body(&r)), (403, body(&hijack)), "{label} refusal differed from out-of-scope change");
+    }
+
+    // 3. Un-narrowed agent session cannot rewrite `rules_cid` touching `.veilrules` (`decides_access`).
+    let wide_agent = agent_token(&hub, &admin_tok, &p.name, &[]);
+    let r_access = api.post_json(
+        Some(&wide_agent),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": main_tip.hex(),
+            "change_id": rules_cid,
+            "description": "agent rewrites rules change",
+            "edits": [{"path": "src/api/mod.rs", "put": {"text": "pub fn ok() {}\n"}}]
+        }),
+    );
+    assert_eq!(r_access.status, 403, "wide agent rewrote decides_access change: {}", body(&r_access));
+    assert_eq!(r_access.json()["code"], json!("agent_session"));
+    assert!(
+        r_access.json()["message"].as_str().unwrap().contains("decides access or review"),
+        "{}",
+        body(&r_access)
+    );
+
+    // 4. Control: narrowed agent CAN create and rewrite an in-scope `change_id`, and `cid` was not clobbered.
+    let c_in = api.post_json(
+        Some(&agent),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": main_tip.hex(),
+            "description": "agent v1",
+            "edits": [{"path": "src/api/mod.rs", "put": {"text": "pub fn v1() {}\n"}}]
+        }),
+    );
+    assert_eq!(c_in.status, 200, "narrowed agent creates in-scope change: {}", body(&c_in));
+    let in_cid = c_in.json()["change_id"].as_str().unwrap().to_string();
+    let c_in2 = api.post_json(
+        Some(&agent),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": main_tip.hex(),
+            "change_id": in_cid,
+            "description": "agent v2",
+            "edits": [{"path": "src/api/mod.rs", "put": {"text": "pub fn v2() {}\n"}}]
+        }),
+    );
+    assert_eq!(c_in2.status, 200, "narrowed agent rewrites in-scope change: {}", body(&c_in2));
+
+    // Verify admin's original `cid` still points to `s_person` by stacking a change onto an unprotected branch!
+    let c_admin2 = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": main_tip.hex(),
+            "change_id": cid,
+            "description": "admin billing plan v2",
+            "edits": [{"path": format!("{BILL_DIR}/secret_plan.txt"), "put": {"text": "CONFIDENTIAL-PLAN-V2\n"}}]
+        }),
+    );
+    assert_eq!(c_admin2.status, 200, "{}", body(&c_admin2));
+    let s_person2 = ObjectId::from_hex(c_admin2.json()["snapshot"].as_str().unwrap()).unwrap();
+    let hist = api.post_json(Some(&admin_tok), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [s_person2.hex()]}));
+    let (_, raw) = hist.frames().into_iter().find(|(id, _)| *id == s_person2).unwrap();
+    let Object::Snapshot(snap2) = Object::decode(&raw).unwrap() else { panic!() };
+    assert_eq!(snap2.predecessors, vec![s_person], "cid kept original billing predecessor");
 }
 
 /// BUG-1785 (non-blocking DoS / memory bound gap): `GET /v1/objects/{p}/{id}`
