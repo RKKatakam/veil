@@ -37,8 +37,14 @@ impl Rate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Key {
     /// A signed-in device (its Ed25519 key), whichever session or grant it
-    /// came with. Agent sessions (S11) get a key of their own here.
+    /// came with.
     Device([u8; 32]),
+    /// An agent session (S11, `docs/HUB.md` §13.32): its stored session
+    /// hash, at [`Settings::device`]'s rate.
+    Session([u8; 32]),
+    /// A signed-in person (`people.id`): the 10× umbrella bucket over all
+    /// of their devices and agent sessions.
+    Person(i64),
     /// An address without a known session: IPv4, or an IPv6 /64 (one
     /// subscriber's usual allocation).
     Ip(u128),
@@ -60,6 +66,21 @@ impl Key {
         let mut k = [0u8; 32];
         hex::decode_to_slice(hex_key, &mut k).ok()?;
         Some(Key::Device(k))
+    }
+
+    /// An agent session by its stored hash in hex; `None` if it is not one.
+    pub fn session(hex_hash: &str) -> Option<Key> {
+        let mut k = [0u8; 32];
+        hex::decode_to_slice(hex_hash, &mut k).ok()?;
+        Some(Key::Session(k))
+    }
+
+    /// A person's own session (`Key::Device`) or agent session (`Key::Session`).
+    pub fn of_person(person: &crate::auth::Person) -> Option<Key> {
+        match &person.agent {
+            Some(a) => Key::session(&a.session),
+            None => Key::device(&person.device_key),
+        }
     }
 }
 

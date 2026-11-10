@@ -972,3 +972,498 @@ fn a_push_of_one_file_larger_than_the_signed_in_pool_lands() {
     assert!(std::fs::read(d.join("src/big.bin")).unwrap() == big, "the file arrived whole");
     assert_eq!((hub.hub().limits.bodies.held_kib(), hub.hub().limits.answers.held_kib()), ((0, 0), 0));
 }
+
+// ---- S24 part B: limits on the landing service -------------------------------------
+
+fn agent_session_token(api: &Api, token: &str, project: &str, run: &str) -> String {
+    let r = api.post_json(
+        Some(token),
+        "/v1/sessions/agent",
+        &serde_json::json!({"project": project, "attribution": {"agent": "claude-code/2.3", "task": "TASK-S24", "run": run}}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    r.json()["token"].as_str().unwrap().to_string()
+}
+
+fn land_edit(api: &Api, token: &str, project: &str, branch: &str, base: veil_core::ObjectId, path: &str, text: &str, wait: bool) -> Reply {
+    api.post_json(
+        Some(token),
+        &format!("/v1/projects/{project}/land"),
+        &serde_json::json!({"onto": branch, "base": base.hex(), "edits": [{"path": path, "put": {"text": text}}], "description": format!("land {path}"), "wait": wait}),
+    )
+}
+
+fn wait_ticket(api: &Api, token: &str, project: &str, ticket: &str) -> serde_json::Value {
+    for _ in 0..20 {
+        let r = api.get(Some(token), &format!("/v1/projects/{project}/land/{ticket}"));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let v = r.json();
+        if v["state"] != "queued" {
+            return v;
+        }
+    }
+    panic!("ticket {ticket} still queued");
+}
+
+fn project_id_of(hub: &TestHub, name: &str) -> i64 {
+    let h = hub.hub();
+    hub.rt
+        .block_on(sqlx::query_scalar::<_, i64>("SELECT id FROM projects WHERE name = $1").bind(name).fetch_one(&h.db))
+        .unwrap()
+}
+
+fn hold_branch(hub: &TestHub, project: i64, branch: &str) {
+    let h = hub.hub();
+    hub.rt
+        .block_on(
+            sqlx::query(
+                "INSERT INTO landing_leases (project_id, branch, holder, epoch, expires_at) VALUES ($1, $2, 'test', 1, $3) \
+                 ON CONFLICT (project_id, branch) DO UPDATE SET holder = 'test', epoch = landing_leases.epoch + 1, expires_at = $3",
+            )
+            .bind(project)
+            .bind(branch)
+            .bind(veil_core::now_millis() + 600_000)
+            .execute(&h.db),
+        )
+        .unwrap();
+}
+
+fn release_branch(hub: &TestHub, project: i64, branch: &str) {
+    let h = hub.hub();
+    hub.rt
+        .block_on(
+            sqlx::query("UPDATE landing_leases SET expires_at = 0 WHERE project_id = $1 AND branch = $2 AND holder = 'test'")
+                .bind(project)
+                .bind(branch)
+                .execute(&h.db),
+        )
+        .unwrap();
+}
+
+/// Guarantee 1 (S24 part B, BUG-1663): each submitter gets a fair share of
+/// a batch (round-robin over people, then over each person's sessions), so
+/// a flood of landings from one person or one session never makes another
+/// person's landing wait longer than its fair share.
+///
+/// Measured: `dev` queues 120 landings across two agent sessions (90 from
+/// session A, 30 from session B) while the lease is held, and a second
+/// developer `dev2` queues 1 landing after all 120. Without fair sharing,
+/// `dev2`'s landing is 121st in FIFO order and waits for the first two
+/// 64-entry batches of `dev`'s flood before landing in the 3rd batch; with
+/// two-level round-robin (over people, then over each person's sessions),
+/// `dev2`'s landing is taken in the very first batch (at position 2 on the
+/// branch chain, right after `dev`'s first entry), and within `dev`'s
+/// share sessions A and B alternate instead of session A starving B.
+#[test]
+fn a_flood_of_landings_from_one_person_or_session_never_delays_another_beyond_their_fair_share() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    let api = hub.api();
+    let dev_tok = p.dev.token();
+    let admin_tok = p.admin.token();
+    let sess_a = agent_session_token(&api, &dev_tok, &p.name, "flood-a");
+    let sess_b = agent_session_token(&api, &dev_tok, &p.name, "flood-b");
+    let real_base = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+    let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+
+    hold_branch(&hub, pid, "main");
+    let mut flood_a = Vec::new();
+    for i in 0..90 {
+        let r = land_edit(&api, &sess_a, &p.name, "main", base, &format!("src/flood/a/{i:03}.rs"), &format!("a {i}\n"), false);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        flood_a.push(r.json()["ticket"].as_str().unwrap().to_string());
+    }
+    let mut flood_b = Vec::new();
+    for i in 0..30 {
+        let r = land_edit(&api, &sess_b, &p.name, "main", base, &format!("src/flood/b/{i:03}.rs"), &format!("b {i}\n"), false);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        flood_b.push(r.json()["ticket"].as_str().unwrap().to_string());
+    }
+    // A second person (`admin`) arrives after all 120 queued entries from `dev`.
+    let fair_path = "src/fair.rs";
+    let r2 = land_edit(&api, &admin_tok, &p.name, "main", real_base, fair_path, "admin fair\n", false);
+    assert_eq!(r2.status, 200, "{}", String::from_utf8_lossy(&r2.body));
+    let t_dev2 = r2.json()["ticket"].as_str().unwrap().to_string();
+
+    let released_at = Instant::now();
+    release_branch(&hub, pid, "main");
+    let v_dev2 = wait_ticket(&api, &admin_tok, &p.name, &t_dev2);
+    let dev2_wait = released_at.elapsed();
+    assert_eq!(v_dev2["state"], "landed", "{v_dev2}");
+
+    // Wait for all 120 of `dev`'s entries to finish so we can inspect the
+    // exact landing order on `main`'s first-parent chain.
+    for t in &flood_a {
+        let v = wait_ticket(&api, &sess_a, &p.name, t);
+        assert_eq!(v["state"], "landed", "{v}");
+    }
+    for t in &flood_b {
+        let v = wait_ticket(&api, &sess_b, &p.name, t);
+        assert_eq!(v["state"], "landed", "{v}");
+    }
+    let flood_wait = released_at.elapsed();
+
+    // Walk `main` from its real tip down to `real_base` (oldest first).
+    let src = veil_server::sync::Source {
+        hub: hub.hub(),
+        project: pid,
+        rt: hub.rt.handle().clone(),
+        pending: Default::default(),
+    };
+    let tip_hex: String = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'main'").bind(pid).fetch_one(&hub.hub().db))
+        .unwrap();
+    let mut cur = veil_core::ObjectId::from_hex(&tip_hex).unwrap();
+    let mut descs = Vec::new();
+    while cur != real_base {
+        let snap = src.snapshot(&cur).unwrap();
+        descs.push(snap.description.as_str().to_string());
+        cur = snap.parents[0];
+    }
+    descs.reverse();
+    assert_eq!(descs.len(), 121);
+    let want_fin = format!("land {fair_path}");
+    let pos_dev2 = descs.iter().position(|d| d == &want_fin).expect("dev2 landed");
+    let pos_b0 = descs.iter().position(|d| d == "land src/flood/b/000.rs").expect("sess_b[0] landed");
+    let pos_b29 = descs.iter().position(|d| d == "land src/flood/b/029.rs").expect("sess_b[29] landed");
+    eprintln!(
+        "fair share: dev2 landed at position {pos_dev2}/121 in {dev2_wait:?} (whole flood finished in {flood_wait:?}); \
+         sess_b[0] at {pos_b0}, sess_b[29] at {pos_b29}"
+    );
+    assert!(
+        pos_dev2 <= 2,
+        "dev2's landing waited behind {} of dev's landings (expected at most 1 in the first round-robin turn)",
+        pos_dev2
+    );
+    assert!(
+        pos_b0 <= 3,
+        "dev's second session waited behind {pos_b0} entries before its first turn (session A flooded 90 ahead of it)"
+    );
+    assert!(
+        pos_b29 <= 64,
+        "dev's second session's 30th entry landed at {pos_b29} instead of alternating with session A in the first batch"
+    );
+}
+
+/// Guarantee 2 (S24 part B, BUG-1660, BUG-1661, BUG-1662): every bound
+/// gives a clear, actionable `429 rate_limited` refusal with
+/// `retry_after_ms`, names nothing hidden, and never drops or half-lands
+/// anything:
+/// * per-agent-session token bucket at `Settings::device` rate, under a
+///   per-person bucket at 10× `Settings::device`;
+/// * outstanding landings per agent session (default 100) and per person
+///   (default 1,000, 10× the session bound);
+/// * a refused landing (on `/land`, `/push`, or `/changes`) leaves no row
+///   in `landing_queue`, no half-landed branch in a multi-branch push, and
+///   never drops what was already queued.
+#[test]
+fn every_landing_bound_refuses_clearly_names_nothing_hidden_and_never_half_lands() {
+    // 1. Per-agent-session rate-limit buckets: each agent session has its
+    //    own bucket at `device` rate, under a 10× per-person bucket.
+    {
+        let device = veil_server::limits::bucket::Rate { per_second: 4, per_hour: 100 };
+        let hub = TestHub::start_with_limits(Settings { device, ..TestHub::limits() });
+        let p = setup_project(&hub);
+        let api = hub.api();
+        let dev = p.dev.token();
+        let s1 = agent_session_token(&api, &dev, &p.name, "r1");
+        let s2 = agent_session_token(&api, &dev, &p.name, "r2");
+        let mut s1_refused = None;
+        for _ in 0..12 {
+            let r = api.get(Some(&s1), &tips(&p.name));
+            if r.status == 429 {
+                s1_refused = Some(r);
+                break;
+            }
+            assert_eq!(r.status, 200);
+        }
+        let r = s1_refused.expect("agent session s1 past its burst of 4 is refused");
+        assert_eq!(r.json()["code"], "rate_limited");
+        assert!(r.json()["retry_after_ms"].as_u64().unwrap() >= 1);
+        // Agent session s2 (and the person's own device session) still have
+        // their own buckets while the person is below 10×.
+        assert_eq!(api.get(Some(&s2), &tips(&p.name)).status, 200, "a second agent session has its own bucket");
+        assert_eq!(api.get(Some(&dev), &tips(&p.name)).status, 200, "the person's own session is not drained by one agent session");
+    }
+
+    // 2. Outstanding landings per agent session (100) and per person
+    //    (1,000, or 10× the session bound), and atomicity on refusal.
+    let mut settings = TestHub::limits();
+    settings.max_session_outstanding = 4;
+    settings.max_person_outstanding = 7;
+    let hub = TestHub::start_with_limits(settings);
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    let api = hub.api();
+    let dev = p.dev.token();
+    let fin = p.fin.token();
+    let s1 = agent_session_token(&api, &dev, &p.name, "q1");
+    let s2 = agent_session_token(&api, &dev, &p.name, "q2");
+
+    // Protect a second branch `release` as well so we can test a
+    // multi-branch push where the second branch hits the bound.
+    write_files(&p.dir, &[(".veilrules", "[branches.main]\nprotected = true\n[branches.release]\nprotected = true\n")]);
+    p.admin.commit_main(&p.dir, "protect main and release");
+    p.admin.ok(&p.dir, &["push"]);
+    let admin_tok = p.admin.token();
+    let real_main = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+    assert_eq!(
+        api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &serde_json::json!({"updates": [{"branch": "release", "expected": null, "new": real_main.hex()}]}),
+        )
+        .status,
+        200
+    );
+
+    let base = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    let rel_base = api.tips(Some(&dev), &p.name).unwrap().branches["release"];
+    hold_branch(&hub, pid, "main");
+    hold_branch(&hub, pid, "release");
+
+    // Session s1 queues up to its bound (4).
+    let mut tickets = Vec::new();
+    for i in 0..4 {
+        let r = land_edit(&api, &s1, &p.name, "main", base, &format!("src/s1/f{i}.rs"), "x\n", false);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        tickets.push((s1.clone(), r.json()["ticket"].as_str().unwrap().to_string()));
+    }
+    // The 5th from s1 is refused with 429 rate_limited, naming nothing hidden.
+    let over_s1 = land_edit(&api, &s1, &p.name, "main", base, "src/s1/over.rs", "over\n", false);
+    assert_eq!(over_s1.status, 429, "{}", String::from_utf8_lossy(&over_s1.body));
+    let v = over_s1.json();
+    assert_eq!(v["code"], "rate_limited", "{v}");
+    assert!(v["retry_after_ms"].as_u64().unwrap() >= 1, "{v}");
+    let msg = v["message"].as_str().unwrap();
+    assert!(msg.contains("agent session") && msg.contains("4"), "expected actionable message with bound, got: {msg}");
+    for hidden in restricted_markers() {
+        assert!(!msg.contains(hidden), "{msg}");
+    }
+
+    // Session s2 of the same person can still queue 2 more (bringing the
+    // person to 6 of 7).
+    for i in 0..2 {
+        let r = land_edit(&api, &s2, &p.name, "main", base, &format!("src/s2/f{i}.rs"), "y\n", false);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        tickets.push((s2.clone(), r.json()["ticket"].as_str().unwrap().to_string()));
+    }
+
+    // Now the person has 6 queued, and the person bound is 7.
+    // A single `POST /push` from `dev` updating BOTH `main` and `release`
+    // attempts to insert 2 queue rows in one transaction: the 1st reaches 7,
+    // the 2nd exceeds 7 and refuses the whole push! Neither branch may be
+    // queued or half-landed.
+    let queued_before: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT COUNT(*) FROM landing_queue WHERE project_id = $1 AND state = 'queued'").bind(pid).fetch_one(&hub.hub().db))
+        .unwrap();
+    assert_eq!(queued_before, 6);
+
+    let mut cm = Craft::with(&api, dev.clone(), p.dev.identity(), &p.name, "main");
+    cm.file("src/multi/m.rs", "m\n");
+    let mut sm = veil_core::object::Snapshot {
+        parents: vec![base],
+        change_id: veil_core::ChangeId::random(),
+        tree: cm.root,
+        description: veil_core::object::Text::Plain("on main".into()),
+        author: "dev".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    sm.sign(&p.dev.identity());
+    let id_m = cm.put_object(veil_core::object::Object::Snapshot(sm));
+
+    let mut cr = Craft::with(&api, dev.clone(), p.dev.identity(), &p.name, "release");
+    cr.file("src/multi/r.rs", "r\n");
+    let mut sr = veil_core::object::Snapshot {
+        parents: vec![rel_base],
+        change_id: veil_core::ChangeId::random(),
+        tree: cr.root,
+        description: veil_core::object::Text::Plain("on release".into()),
+        author: "dev".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    sr.sign(&p.dev.identity());
+    let id_r = cr.put_object(veil_core::object::Object::Snapshot(sr));
+
+    let mut all_objs = cm.objects;
+    all_objs.extend(cr.objects);
+    let up = api.upload(&dev, &p.name, &all_objs);
+    assert_eq!(up.status, 200);
+    let receipts = up.json()["receipts"].as_array().unwrap().clone();
+    let rmap: serde_json::Map<String, serde_json::Value> = all_objs.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+    let multi_r = api.post_json(
+        Some(&dev),
+        &format!("/v1/projects/{}/push", p.name),
+        &serde_json::json!({
+            "updates": [
+                {"branch": "main", "expected": base.hex(), "new": id_m.hex()},
+                {"branch": "release", "expected": rel_base.hex(), "new": id_r.hex()}
+            ],
+            "receipts": rmap
+        }),
+    );
+    assert_eq!(multi_r.status, 429, "{}", String::from_utf8_lossy(&multi_r.body));
+    let out = multi_r.json()["message"].as_str().unwrap().to_string();
+    assert!(out.contains("7") && out.contains("waiting"), "expected person bound refusal, got: {out}");
+
+    let queued_after: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT COUNT(*) FROM landing_queue WHERE project_id = $1 AND state = 'queued'").bind(pid).fetch_one(&hub.hub().db))
+        .unwrap();
+    assert_eq!(queued_after, 6, "a refused multi-branch push must not leave the first branch's row queued");
+
+    // 1 more landing from `s2` reaches the person bound (7), and the 8th is
+    // refused even though `s2` only has 3 of its 4 session bound used.
+    let ok7 = land_edit(&api, &s2, &p.name, "main", base, "src/s2/f2.rs", "y2\n", false);
+    assert_eq!(ok7.status, 200, "{}", String::from_utf8_lossy(&ok7.body));
+    tickets.push((s2.clone(), ok7.json()["ticket"].as_str().unwrap().to_string()));
+
+    let over_person = land_edit(&api, &s2, &p.name, "main", base, "src/s2/over_p.rs", "over\n", false);
+    assert_eq!(over_person.status, 429, "{}", String::from_utf8_lossy(&over_person.body));
+    assert!(over_person.json()["message"].as_str().unwrap().contains("7"), "{}", over_person.json());
+
+    // Another person (`fin`) is unaffected by `dev`'s full queue.
+    let fin_base = api.tips(Some(&fin), &p.name).unwrap().branches["main"];
+    let fin_r = land_edit(&api, &fin, &p.name, "main", fin_base, &format!("{BILL_DIR}/ok.txt"), "fin ok\n", false);
+    assert_eq!(fin_r.status, 200, "another person's landing is not refused: {}", String::from_utf8_lossy(&fin_r.body));
+    tickets.push((fin.clone(), fin_r.json()["ticket"].as_str().unwrap().to_string()));
+
+    // Release the lease: every admitted landing lands cleanly, and the
+    // refused ones never landed.
+    release_branch(&hub, pid, "main");
+    release_branch(&hub, pid, "release");
+    for (tok, t) in &tickets {
+        let v = wait_ticket(&api, tok, &p.name, t);
+        assert_eq!(v["state"], "landed", "{v}");
+    }
+    let tree = api.get(Some(&p.admin.token()), &format!("/v1/projects/{}/q/tree?path=src", p.name)).json();
+    let tree_str = tree.to_string();
+    assert!(!tree_str.contains("over.rs") && !tree_str.contains("over_p.rs") && !tree_str.contains("multi"), "nothing refused landed: {tree_str}");
+}
+
+/// Guarantee 3 (S24 part B, BUG-1664): landing counters in the admin-only
+/// health metrics (`GET /v1/projects/{p}/health` and `vl stats`) count
+/// landed changes, batches, conflicts and rejections for the project,
+/// reach admins only, and name no hidden path, person, session or project.
+#[test]
+fn landing_counters_in_health_metrics_reach_admins_only_and_name_nothing_hidden() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let (admin, dev, fin) = (p.admin.token(), p.dev.token(), p.fin.token());
+    let base = api.tips(Some(&fin), &p.name).unwrap().branches["main"];
+
+    // Land a change in the restricted `BILL_DIR/` folder and a conflicting change.
+    let r1 = land_edit(&api, &fin, &p.name, "main", base, &format!("{BILL_DIR}/secret-plan.txt"), "v1\n", true);
+    assert_eq!(r1.status, 200, "{}", String::from_utf8_lossy(&r1.body));
+    assert_eq!(r1.json()["state"], "landed");
+
+    let r2 = land_edit(&api, &fin, &p.name, "main", base, &format!("{BILL_DIR}/secret-plan.txt"), "v2-conflict\n", true);
+    assert_eq!(r2.status, 200, "{}", String::from_utf8_lossy(&r2.body));
+    assert_eq!(r2.json()["state"], "conflict");
+
+    let h = api.get(Some(&admin), &format!("/v1/projects/{}/health", p.name));
+    assert_eq!(h.status, 200, "{}", String::from_utf8_lossy(&h.body));
+    let v = h.json();
+    assert!(v["since_start"]["landings"].as_u64().unwrap() >= 1, "{v}");
+    assert!(v["since_start"]["landing_batches"].as_u64().unwrap() >= 1, "{v}");
+    assert!(v["since_start"]["landing_conflicts"].as_u64().unwrap() >= 1, "{v}");
+    assert_eq!(v["since_start"]["landing_rejected"].as_u64().unwrap(), 0, "{v}");
+    assert_eq!(v.as_object().unwrap().len(), 6, "top-level health schema keys stay fixed: {v}");
+
+    let body = String::from_utf8_lossy(&h.body).to_string();
+    for hidden in restricted_markers()
+        .into_iter()
+        .map(str::to_string)
+        .chain(["secret-plan".to_string(), p.dev.name.clone(), p.fin.name.clone(), p.admin.name.clone()])
+    {
+        assert!(!body.contains(&hidden), "health metrics named {hidden}: {body}");
+    }
+    assert_eq!(api.get(Some(&dev), &format!("/v1/projects/{}/health", p.name)).status, 403);
+    assert_eq!(api.get(Some(&fin), &format!("/v1/projects/{}/health", p.name)).status, 403);
+    let out = p.admin.ok(&p.dir, &["stats"]);
+    assert!(out.contains("landings") && out.contains("conflicts"), "{out}");
+}
+
+/// Guarantee 4 (S24 part B, BUG-1665): outstanding landing bounds hold
+/// across two servers sharing the database (`TestHub::beside`), even when
+/// submissions race concurrently against both servers.
+#[test]
+fn landing_bounds_hold_across_two_servers_sharing_the_database() {
+    let mut settings = TestHub::limits();
+    settings.max_session_outstanding = 6;
+    settings.max_person_outstanding = 10;
+    let hub1 = TestHub::start_with_limits(settings);
+    let hub2 = TestHub::beside(&hub1);
+    let p = setup_project(&hub1);
+    let pid = project_id_of(&hub1, &p.name);
+    let api1 = hub1.api();
+    let api2 = hub2.api();
+    let dev = p.dev.token();
+    let s1 = agent_session_token(&api1, &dev, &p.name, "m1");
+    let s2 = agent_session_token(&api2, &dev, &p.name, "m2");
+    let base = api1.tips(Some(&dev), &p.name).unwrap().branches["main"];
+
+    hold_branch(&hub1, pid, "main");
+
+    // 16 concurrent submissions for session `s1` split across `hub1` and
+    // `hub2`: at most `max_session_outstanding` (6) may be accepted.
+    let statuses: Vec<u16> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let api = if i % 2 == 0 { &api1 } else { &api2 };
+                let s1 = &s1;
+                let name = &p.name;
+                scope.spawn(move || land_edit(api, s1, name, "main", base, &format!("src/m1/f{i:02}.rs"), "m1\n", false).status)
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let ok_s1 = statuses.iter().filter(|&&s| s == 200).count();
+    let lim_s1 = statuses.iter().filter(|&&s| s == 429).count();
+    assert_eq!((ok_s1, lim_s1), (6, 10), "across two servers, session s1 accepted {ok_s1} (bound 6): {statuses:?}");
+
+    // Now 12 concurrent submissions for session `s2` split across `hub1`
+    // and `hub2`: `s2`'s session bound is 6, but the person already has 6
+    // queued and `max_person_outstanding` is 10, so at most 4 more may be
+    // accepted across the two servers.
+    let statuses_p: Vec<u16> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..12)
+            .map(|i| {
+                let api = if i % 2 == 0 { &api1 } else { &api2 };
+                let s2 = &s2;
+                let name = &p.name;
+                scope.spawn(move || land_edit(api, s2, name, "main", base, &format!("src/m2/f{i:02}.rs"), "m2\n", false).status)
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let ok_s2 = statuses_p.iter().filter(|&&s| s == 200).count();
+    let lim_s2 = statuses_p.iter().filter(|&&s| s == 429).count();
+    assert_eq!((ok_s2, lim_s2), (4, 8), "across two servers, person bound of 10 allowed 6 + {ok_s2}: {statuses_p:?}");
+
+    let total_queued: i64 = hub1
+        .rt
+        .block_on(sqlx::query_scalar("SELECT COUNT(*) FROM landing_queue WHERE project_id = $1 AND state = 'queued'").bind(pid).fetch_one(&hub1.hub().db))
+        .unwrap();
+    assert_eq!(total_queued, 10);
+    release_branch(&hub1, pid, "main");
+}
+

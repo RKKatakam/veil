@@ -103,6 +103,9 @@ pub struct Person {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentGrant {
     pub project: i64,
+    /// The session's stored hash (`session_hash`), for its rate-limit bucket
+    /// and its landing queue share and bound (S24 part B).
+    pub session: String,
     /// `--only`: the paths its files are narrowed to (`None`: all its
     /// person sees).
     pub only: Option<Arc<Vec<String>>>,
@@ -418,7 +421,7 @@ impl FromRequestParts<HubState> for Caller {
         .await?;
         match row {
             Some((id, name, device_key, expires_at, person_epoch, project_epoch, agent, agent_project, agent_only)) => {
-                let agent = agent_grant(agent, agent_project, agent_only)?;
+                let agent = agent_grant(agent, agent_project, agent_only, &hash)?;
                 let person = Person { id, name, device_key, agent };
                 hub.caches.put_session(
                     &hash,
@@ -443,7 +446,7 @@ impl FromRequestParts<HubState> for Caller {
 }
 
 /// An agent session's record, as stored; a malformed one fails closed.
-fn agent_grant(agent: Option<String>, project: Option<i64>, only: Option<String>) -> Result<Option<Arc<AgentGrant>>> {
+fn agent_grant(agent: Option<String>, project: Option<i64>, only: Option<String>, session: &str) -> Result<Option<Arc<AgentGrant>>> {
     let Some(agent) = agent else { return Ok(None) };
     let damaged = || Error::unauthorized("this agent session's record is damaged; make a new one");
     let attribution: Attribution = serde_json::from_str(&agent).map_err(|_| damaged())?;
@@ -453,6 +456,7 @@ fn agent_grant(agent: Option<String>, project: Option<i64>, only: Option<String>
     };
     Ok(Some(Arc::new(AgentGrant {
         project: project.ok_or_else(damaged)?,
+        session: session.to_string(),
         only,
         attribution,
     })))

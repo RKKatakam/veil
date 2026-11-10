@@ -297,7 +297,6 @@ fn bug_847_concurrent_sign_ups_all_succeed() {
 /// `pg_stat_statements`, which the shared test database lacks). Run alone:
 /// transaction ids are counted for the whole database server.
 #[test]
-#[ignore = "BUG-1593: 9-13 database commits per landing on integration (gate: 1, the deriver's aside)"]
 fn bug_1593_a_landing_is_one_database_commit() {
     const LANDINGS: usize = 40;
     let hub = TestHub::start();

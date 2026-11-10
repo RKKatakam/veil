@@ -229,6 +229,7 @@ async fn serve() -> anyhow::Result<()> {
             anonymous: a.anonymous_rate,
             max_connections: a.max_connections,
             request_memory: a.request_memory,
+            ..Default::default()
         },
     })
     .await?;

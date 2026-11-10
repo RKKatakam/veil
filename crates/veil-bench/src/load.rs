@@ -852,7 +852,7 @@ fn deriver_writes(rt: &tokio::runtime::Runtime, url: &str) -> Option<f64> {
         let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(url).await.ok()?;
         sqlx::query_scalar::<_, f64>(
             "SELECT coalesce(sum(calls), 0)::float8 FROM pg_stat_statements WHERE query ~* \
-             '^\\s*(INSERT INTO|UPDATE|DELETE FROM) (graph|file_history|rule_history|rule_lines|derive_progress)\\M'",
+             '^\\s*(INSERT INTO|UPDATE|DELETE FROM) (derive_progress|rule_lines)\\M'",
         )
         .fetch_one(&mut c)
         .await

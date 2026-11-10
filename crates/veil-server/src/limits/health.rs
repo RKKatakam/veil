@@ -43,6 +43,12 @@ pub struct Counts {
     pub tips_misses: u64,
     pub permission_hits: u64,
     pub permission_misses: u64,
+    /// The landing service (S17, S24 part B): changes landed, batches
+    /// committed, conflicts and rejections.
+    pub landings: u64,
+    pub landing_batches: u64,
+    pub landing_conflicts: u64,
+    pub landing_rejected: u64,
 }
 
 impl Counts {
@@ -55,6 +61,10 @@ impl Counts {
         self.tips_misses += o.tips_misses;
         self.permission_hits += o.permission_hits;
         self.permission_misses += o.permission_misses;
+        self.landings += o.landings;
+        self.landing_batches += o.landing_batches;
+        self.landing_conflicts += o.landing_conflicts;
+        self.landing_rejected += o.landing_rejected;
     }
 }
 
