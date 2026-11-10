@@ -55,6 +55,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/events", get(crate::events::route))
         .route("/v1/projects/{p}/checks", post(crate::ci::post_check_route).get(crate::ci::list_checks_route))
         .route("/v1/projects/{p}/tested/{branch}", get(crate::ci::tested_route))
+        .route("/v1/projects/{p}/bisect/{branch}", get(crate::bisect::status_route))
         .route("/v1/projects/{p}/access", get(access))
         .route("/v1/projects/{p}/groups", get(list_groups))
         .route("/v1/projects/{p}/groups/{g}", post(create_group).delete(delete_group))

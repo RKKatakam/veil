@@ -23,6 +23,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod bisect;
 pub mod cache;
 pub mod caches;
 pub mod changes;
@@ -242,6 +243,7 @@ pub async fn start(config: Config) -> Result<Running> {
         });
         // Landings queued when a server stopped are landed.
         tokio::spawn(landing::resume(hub.clone()));
+        tokio::spawn(bisect::resume(hub.clone()));
     }
     Ok(Running {
         addr,

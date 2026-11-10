@@ -533,12 +533,13 @@ impl Service {
         })
     }
 
-    /// The ready rows, in order, leaving out those being committed.
+    /// The ready rows, in order (reverts first: `priority DESC`), leaving out
+    /// those being committed.
     async fn ready(&self, exclude: &HashSet<i64>) -> Result<Vec<Row>> {
         type R = (i64, String, i64, String, String, String, i64, i64, i64, i64, Option<String>);
         let rows: Vec<R> = sqlx::query_as(
             "SELECT seq, ticket, person_id, person_name, device_key, stack, lineage, person_epoch, project_epoch, merges, agent_session FROM landing_queue \
-             WHERE project_id = $1 AND branch = $2 AND state = 'queued' ORDER BY created_at, seq LIMIT $3",
+             WHERE project_id = $1 AND branch = $2 AND state = 'queued' ORDER BY priority DESC, created_at, seq LIMIT $3",
         )
         .bind(self.project)
         .bind(&self.branch)
@@ -1165,7 +1166,11 @@ impl Service {
             .zip(results.iter())
             .filter_map(|(m, r)| Some((m.ticket.clone(), r.clone()?)))
             .collect();
+        let has_revert = terminal.iter().any(|(t, _)| t.starts_with("revert-"));
         hub.landing.resolve(terminal);
+        if has_revert {
+            let _ = crate::bisect::sync_revert_outcome(hub, self.project, &self.branch).await;
+        }
         Ok(Committed::Ok)
     }
 }
