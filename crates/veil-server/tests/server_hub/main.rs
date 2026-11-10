@@ -36,3 +36,4 @@ mod thin;
 mod cache;
 mod limits;
 mod workspaces;
+mod embargo;

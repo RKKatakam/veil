@@ -589,6 +589,7 @@ pub async fn submit(
                 }],
                 force: false,
                 receipts: req.receipts,
+                ..Default::default()
             };
             let (pushed, mut landings) = crate::sync::push_with(hub, project, viewer, &who, push, true, req.wait).await?;
             match landings.pop() {
@@ -736,11 +737,12 @@ pub async fn stack(
     let root = crate::sync::root_snapshot_id();
     let pid = project.id;
     let max = veil_core::hub::land::MAX_LAND_STACK;
-    let row: Option<(String, i64)> = sqlx::query_as("SELECT target, lineage FROM branches WHERE project_id = $1 AND name = $2")
-        .bind(pid)
-        .bind(branch)
-        .fetch_optional(&hub.db)
-        .await?;
+    let row: Option<(String, i64)> =
+        sqlx::query_as("SELECT target, lineage FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL")
+            .bind(pid)
+            .bind(branch)
+            .fetch_optional(&hub.db)
+            .await?;
     let Some((tip, lineage)) = row else { return Ok(Ok(Judged { stack: Vec::new(), lineage: 0, branch: false, skipped: Vec::new() })) };
     let tip = ObjectId::from_hex(&tip).map_err(|e| Error::Other(e.into()))?;
     let mut anc = Ancestry::new(hub.clone(), pid, branch, tip, lineage);

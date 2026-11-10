@@ -1438,8 +1438,15 @@ pub fn apply_remote_tags(
         .cloned()
         .collect();
     for key in gone {
-        tx.view.remote_tags.remove(&key);
+        let prev = tx.view.remote_tags.remove(&key);
         let name = &key[prefix.len()..];
+        if let Some(eid) = crate::embargo::embargo_id_of_branch(name) {
+            if tx.repo().keys().embargo_released(eid) || tx.view.tags.get(name).map(|t| t.target) == prev {
+                tx.view.tags.remove(name);
+            }
+            report.remote_tags_removed.push(key);
+            continue;
+        }
         if tx.view.tags.contains_key(name) {
             report.warnings.push(format!(
                 "tag '{name}' was deleted on {remote_name}; your tag '{name}' is kept. Delete it with \
@@ -1481,7 +1488,7 @@ pub fn apply_remote_tags(
             Some(remote) => fetch_annotation(tx.repo().store(), remote, &name, &tag, &mut report.warnings)?,
             None => None,
         };
-        tx.view.remote_tags.insert(format!("{remote_name}/{name}"), tag.target);
+        let prev_remote = tx.view.remote_tags.insert(format!("{remote_name}/{name}"), tag.target);
         match tx.view.tags.get(&name).cloned() {
             None if stay_deleted.contains(&name) => report.tags_kept_deleted.push(name),
             None => {
@@ -1520,7 +1527,9 @@ pub fn apply_remote_tags(
                 report.release_tags_kept.push((name, existing.target, tag.target));
             }
             Some(existing) => {
-                if tx.repo().is_ancestor(&existing.target, &tag.target)? {
+                let is_embargo_rebased = crate::embargo::embargo_id_of_branch(&name).is_some()
+                    && prev_remote == Some(existing.target);
+                if is_embargo_rebased || tx.repo().is_ancestor(&existing.target, &tag.target)? {
                     tx.view.tags.insert(
                         name.clone(),
                         Tag { target: tag.target, annotation: tag.annotation },

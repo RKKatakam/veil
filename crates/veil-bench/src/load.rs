@@ -530,6 +530,7 @@ impl Agent<'_> {
                 }],
                 force: false,
                 receipts,
+                embargoes: Vec::new(),
             };
             let r = self.api.post_json(Some(self.token), &self.path("/push"), &req)?;
             match r.status {
@@ -1010,6 +1011,7 @@ fn create_project(api: &Api, admin: &Identity, admin_token: &str, agent: &str, s
         }],
         force: false,
         receipts,
+        ..Default::default()
     };
     let r = api.post_json(Some(admin_token), &format!("/v1/projects/{name}/push"), &req)?;
     ok(&r, "first push")?;

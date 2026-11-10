@@ -546,7 +546,15 @@ pub(crate) async fn resolve_for(
     if *id == root_snapshot_id() {
         return Ok(Some(*id));
     }
-    let seen = |r: ObjectId| async move { Ok::<bool, Error>(projected(hub, project, viewer, r).await? == *id) };
+    if crate::embargo::is_withheld_from_viewer(hub, project, viewer, id).await? {
+        return Ok(None);
+    }
+    let seen = |r: ObjectId| async move {
+        if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &r).await? {
+            return Ok::<bool, Error>(false);
+        }
+        Ok(projected(hub, project, viewer, r).await? == *id)
+    };
     let mut names: Vec<&str> = branches.to_vec();
     names.push(&project.default_branch);
     let tips: Vec<(String, String)> = sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 AND name = ANY($2)")
@@ -554,6 +562,7 @@ pub(crate) async fn resolve_for(
         .bind(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
         .fetch_all(&hub.db)
         .await?;
+    let tips = crate::embargo::filter_branches(hub, project, viewer, &tips).await?;
     for name in &names {
         if let Some(t) = tips.iter().find(|(n, _)| n == name).and_then(|(_, t)| ObjectId::from_hex(t).ok()) {
             if seen(t).await? {
@@ -698,6 +707,7 @@ pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer) -> Result<
             }
         }
     };
+    let rows = crate::embargo::filter_branches(hub, project, viewer, &rows).await?;
     let mut out = Vec::new();
     for (name, target) in rows.iter() {
         let real = ObjectId::from_hex(target).map_err(|e| Error::Other(e.into()))?;
@@ -721,9 +731,15 @@ pub async fn history(
     let mut starts = Vec::new();
     let mut reals = Vec::new();
     for t in tips {
+        if crate::embargo::is_withheld_from_viewer(hub, project, viewer, t).await? {
+            return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
+        }
         let Some(real) = resolve(hub, project.id, &project.view(viewer).key(), t).await?.into_iter().next() else {
             return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
         };
+        if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await? {
+            return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
+        }
         starts.push(projected(hub, project, viewer, real).await?);
         reals.push(real);
     }
@@ -832,9 +848,15 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
         if reals.contains_key(&snap) {
             continue;
         }
+        if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &snap).await? {
+            return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
+        }
         let Some(real) = resolve(hub, project.id, &project.view(viewer).key(), &snap).await?.into_iter().next() else {
             return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
         };
+        if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await? {
+            return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
+        }
         reals.insert(snap, real);
     }
     let (policy_text, bindings, viewer) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
@@ -1458,12 +1480,12 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, who: &crat
 /// new snapshots it brings join the landing queue, in the push's one
 /// commit, as one stack (`landing`), and with `wait` the push answers once
 /// they landed. Their outcomes come back too.
-pub(crate) async fn push_with(
+    pub(crate) async fn push_with(
     hub: &Arc<Hub>,
     project: &Project,
     viewer: &Viewer,
     who: &crate::landing::Submitter,
-    req: PushRequest,
+    mut req: PushRequest,
     land_all: bool,
     wait: bool,
 ) -> Result<(PushResult, Vec<veil_core::hub::land::LandResult>)> {
@@ -1495,7 +1517,8 @@ pub(crate) async fn push_with(
     };
     // The branches this push moves come first, then the default branch
     // (`resolve_for`: one resolution for a push and an API commit).
-    let moved_names: Vec<&str> = req.updates.iter().map(|u| u.branch.as_str()).collect();
+    let moved_names: Vec<String> = req.updates.iter().map(|u| u.branch.clone()).collect();
+    let moved_refs: Vec<&str> = moved_names.iter().map(|s| s.as_str()).collect();
     // Every update lands through the landing service (its edits on the tip),
     // none moves a branch here.
     let lands_only = !req.force && req.updates.iter().all(|u| land_all || protected.contains(&u.branch));
@@ -1514,7 +1537,7 @@ pub(crate) async fn push_with(
             continue;
         }
         // Grafted only on what its pusher saw (BUG-1467, BUG-1520).
-        if let Some(r) = resolve_for(hub, project, viewer, &id, &moved_names, lands_only).await? {
+        if let Some(r) = resolve_for(hub, project, viewer, &id, &moved_refs, lands_only).await? {
             known.insert(id, vec![r]);
             continue;
         }
@@ -1574,6 +1597,10 @@ pub(crate) async fn push_with(
         let r = reals[0];
         real_of.insert(*id, r);
     }
+    // Validate embargoes (`req.embargoes` and `n.embargo`) and divert embargoed
+    // branch updates to their hidden `embargo/<id>` line (S22).
+    let (embargo_upserts, embargo_releases, embargo_diverted) =
+        crate::embargo::prepare_push(hub, project, viewer, &who.person.device_key, &mut req, &parents_of, &order, &real_of).await?;
     // 2. Complete and check each new snapshot (`uploaded`: a push names
     // nothing else that is not already where it was in a parent, BUG-824).
     let mut completed: Vec<Completed> = Vec::new();
@@ -1581,11 +1608,6 @@ pub(crate) async fn push_with(
     let mut real_parents_of: HashMap<ObjectId, (Vec<ObjectId>, i64)> = HashMap::new();
     for id in &order {
         let n = parents_of[id].clone();
-        if n.embargo.is_some() {
-            return Err(Error::forbidden(
-                "embargoed merges cannot be pushed to the server yet (docs/HUB.md §11)",
-            ));
-        }
         let author = match &n.signature {
             Some(sig) if n.signature_valid() == Some(true) => match signers.get(&sig.key) {
                 Some(&p) => p,
@@ -1644,10 +1666,12 @@ pub(crate) async fn push_with(
             return Err(Error::bad_request(format!("invalid branch name {:?}", u.branch)));
         }
         let cur = current.get(&u.branch).copied();
+        let is_embargo_branch = veil_core::embargo::embargo_id_of_branch(&u.branch).is_some();
         // Landed by the landing service instead of moved here: the new
         // changes on top of whatever base they have (they need not be on
-        // the tip), as one stack.
-        if !req.force && (land_all || protected.contains(&u.branch)) && (cur.is_some() || land_all) {
+        // the tip), as one stack. Hidden embargo lines (`embargo/<id>`) move
+        // directly by CAS and land on their target branch at release.
+        if !is_embargo_branch && !req.force && (land_all || protected.contains(&u.branch)) && (cur.is_some() || land_all) {
             let Some(n) = u.new else {
                 return Err(Error::forbidden(format!("'{}' is protected: only an admin's forced push deletes it", u.branch)));
             };
@@ -1706,7 +1730,7 @@ pub(crate) async fn push_with(
             Some(c) => Some(projected(hub, project, viewer, c).await?),
             None => None,
         };
-        if cur_seen != u.expected && !req.force {
+        if !is_embargo_branch && cur_seen != u.expected && !req.force {
             results.push(BranchResult {
                 branch: u.branch.clone(),
                 ok: false,
@@ -1723,16 +1747,18 @@ pub(crate) async fn push_with(
         if new_real.is_none() && !viewer.admin {
             return Err(Error::forbidden("only admins may delete a branch"));
         }
-        if let (Some(c), Some(n)) = (cur, new_real) {
-            if !req.force && !is_ancestor(hub, project.id, c, n).await? {
-                results.push(BranchResult {
-                    branch: u.branch.clone(),
-                    ok: false,
-                    message: Some("not a fast-forward; pull and merge, then push again".into()),
-                    tip: cur_seen,
-                    ticket: None,
-                });
-                continue;
+        if !is_embargo_branch {
+            if let (Some(c), Some(n)) = (cur, new_real) {
+                if !req.force && !is_ancestor(hub, project.id, c, n).await? {
+                    results.push(BranchResult {
+                        branch: u.branch.clone(),
+                        ok: false,
+                        message: Some("not a fast-forward; pull and merge, then push again".into()),
+                        tip: cur_seen,
+                        ticket: None,
+                    });
+                    continue;
+                }
             }
         }
         // The default branch carries the accepted policy.
@@ -1800,6 +1826,35 @@ pub(crate) async fn push_with(
     let origins: Vec<(String, String)> = completed.iter().filter_map(|c| c.origin.map(|o| (c.real.hex(), o.hex()))).collect();
     let memos: Vec<(String, String, String, bool)> =
         deferred.rows.iter().map(|(k, r, p)| (k.clone(), r.hex(), p.hex(), deferred.collapsed.contains(r))).collect();
+    // Snapshots introduced on hidden embargo lines in this push (real, origin, and projected).
+    let embargo_snaps: Vec<(String, String)> = {
+        let mut out = Vec::new();
+        for (branch, _, new, _) in &plans {
+            let Some(eid) = veil_core::embargo::embargo_id_of_branch(branch) else { continue };
+            let Some(n) = new else { continue };
+            let mut seen = HashSet::new();
+            let mut stack = vec![*n];
+            while let Some(x) = stack.pop() {
+                if let (Some((ps, _)), true) = (real_parents_of.get(&x), seen.insert(x)) {
+                    out.push((x.hex(), eid.to_string()));
+                    for c in &completed {
+                        if c.real == x {
+                            if let Some(orig) = c.origin {
+                                out.push((orig.hex(), eid.to_string()));
+                            }
+                        }
+                    }
+                    for (_, r, p) in &deferred.rows {
+                        if *r == x {
+                            out.push((p.hex(), eid.to_string()));
+                        }
+                    }
+                    stack.extend(ps.iter().copied());
+                }
+            }
+        }
+        out
+    };
     // The changes each moved branch now holds that this push brought, by
     // change id and author (`landed_changes`, BUG-1522, BUG-1527).
     let change_of: HashMap<ObjectId, String> =
@@ -1829,11 +1884,13 @@ pub(crate) async fn push_with(
     let plans2 = plans.clone();
     let force = req.force;
     let (queued2, who2) = (queued.clone(), who.clone());
+    let embargo_upserts2 = embargo_upserts.clone();
+    let embargo_snaps2 = embargo_snaps.clone();
     // Whoever lands here hears at once (registered before the commit).
     let waiters: Vec<crate::landing::Waiter> = queued.iter().map(|q| hub.landing.register(&q.ticket)).collect();
     // Nothing to move (every update refused: the pusher pulls and tries
     // again): no commit, and nothing recorded as history no branch reaches.
-    let (moved, memo_stored) = if plans.is_empty() && queued.is_empty() {
+    let (moved, memo_stored) = if plans.is_empty() && queued.is_empty() && embargo_upserts.is_empty() {
         (Vec::new(), Vec::new())
     } else {
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
@@ -1843,6 +1900,8 @@ pub(crate) async fn push_with(
         let origins = origins.clone();
         let memos = memos.clone();
         let (queued, who) = (queued2.clone(), who2.clone());
+        let embargo_upserts = embargo_upserts2.clone();
+        let embargo_snaps = embargo_snaps2.clone();
         Box::pin(async move {
             for q in &queued {
                 crate::landing::insert(&mut *c, pid, &who, q).await?;
@@ -1901,9 +1960,13 @@ pub(crate) async fn push_with(
                 moved.push(branch);
             }
             for (branch, lineage) in &lineages {
-                if let Some((cs, aus, ls)) = plan_changes.get(branch) {
-                    if !cs.is_empty() {
-                        crate::landing::record_changes(&mut *c, pid, branch, *lineage, cs, aus, ls).await?;
+                // Only record `landed_changes` on non-embargo branches so that
+                // landing at release onto `main` does not skip them!
+                if veil_core::embargo::embargo_id_of_branch(branch).is_none() {
+                    if let Some((cs, aus, ls)) = plan_changes.get(branch) {
+                        if !cs.is_empty() {
+                            crate::landing::record_changes(&mut *c, pid, branch, *lineage, cs, aus, ls).await?;
+                        }
                     }
                 }
             }
@@ -1922,6 +1985,7 @@ pub(crate) async fn push_with(
                     .execute(&mut *c)
                     .await?;
             }
+            crate::embargo::record_in_tx(&mut *c, pid, &embargo_upserts, &embargo_snaps).await?;
             // A row stored first by another request wins (and is not cached
             // here from this push's answer).
             let mut memo_stored = Vec::new();
@@ -1949,7 +2013,7 @@ pub(crate) async fn push_with(
                 .execute(&mut *c)
                 .await?;
             // Delivered at commit, to every server: drop your tips.
-            if notify && !moved.is_empty() {
+            if notify && (!moved.is_empty() || !embargo_upserts.is_empty()) {
                 sqlx::query("SELECT pg_notify($1, $2)")
                     .bind(crate::caches::TIPS_CHANNEL)
                     .bind(pid.to_string())
@@ -1990,20 +2054,33 @@ pub(crate) async fn push_with(
         r.warnings.extend(crate::landing::skipped_warnings(hub, project.id, &q.branch, &skipped).await?);
         landings.push(r);
     }
-    if !moved.is_empty() {
+    if !moved.is_empty() || !embargo_upserts.is_empty() {
         hub.caches.tips_changed(project.id);
         for c in &completed {
             hub.caches.put_committed(project.id, &c.real);
         }
+    }
+    if !embargo_upserts.is_empty() {
+        hub.embargo.wake();
     }
     for ((view_key, real, projected), stored) in deferred.rows.iter().zip(memo_stored) {
         if stored {
             hub.caches.put_memo(project.id, view_key, real, projected);
         }
     }
-    // Derived history data for the branches moved, in the background: the
-    // push never waits.
-    crate::derive::landed(hub, project.id, moved);
+    // Derived history data for the public branches moved, in the background:
+    // hidden embargo branches are derived only once released onto `main`.
+    let public_moved: Vec<String> = moved
+        .into_iter()
+        .filter(|b| veil_core::embargo::embargo_id_of_branch(b).is_none())
+        .collect();
+    if !public_moved.is_empty() {
+        crate::derive::landed(hub, project.id, public_moved);
+    }
+    // Early embargo releases pushed via `vl embargo release <id>` + `vl push`.
+    for (eid, rec) in embargo_releases {
+        crate::embargo::release_one(hub, project.id, &eid, Some(rec)).await?;
+    }
     // The tips as the pusher sees them now (their own snapshots, where the
     // server's projection gives them back).
     let accepted = plans.iter().any(|p| p.3.is_some());
@@ -2025,7 +2102,8 @@ pub(crate) async fn push_with(
             Some(n) => Some(projected(hub, project, viewer, n).await?),
             None => None,
         };
-        results.push(BranchResult { branch, ok: true, message: None, tip, ticket: None });
+        let client_branch = embargo_diverted.get(&branch).cloned().unwrap_or(branch);
+        results.push(BranchResult { branch: client_branch, ok: true, message: None, tip, ticket: None });
     }
     let mut warnings = warnings;
     for (q, l) in queued.iter().zip(&landings) {

@@ -164,6 +164,9 @@ pub async fn resolve(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instant) ->
     };
     let real = match parse_id(rev) {
         Some(id) => {
+            if crate::embargo::is_withheld_for_query(hub, project, &id).await? {
+                return Err(no_revision());
+            }
             if let Some(r) = row_of(id).await? {
                 return if r.withheld() { Err(no_revision()) } else { Ok(id) };
             }
@@ -187,17 +190,23 @@ pub async fn resolve(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instant) ->
                     .fetch_optional(&hub.db)
                     .await?
             };
-            real.and_then(|r| ObjectId::from_hex(&r).ok()).ok_or_else(no_revision)?
+            let r = real.and_then(|r| ObjectId::from_hex(&r).ok()).ok_or_else(no_revision)?;
+            if crate::embargo::is_withheld_for_query(hub, project, &r).await? {
+                return Err(no_revision());
+            }
+            r
         }
         None => {
             if rev.is_empty() || rev.len() > 255 {
                 return Err(no_revision());
             }
-            let target: Option<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2")
-                .bind(project)
-                .bind(rev)
-                .fetch_optional(&hub.db)
-                .await?;
+            let target: Option<String> = sqlx::query_scalar(
+                "SELECT target FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL",
+            )
+            .bind(project)
+            .bind(rev)
+            .fetch_optional(&hub.db)
+            .await?;
             target.and_then(|t| ObjectId::from_hex(&t).ok()).ok_or_else(no_revision)?
         }
     };
@@ -565,7 +574,7 @@ pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, from: &[Obj
         return Ok(empty);
     }
     // The viewer's graph over every branch (filled once, as for any query).
-    let rows: Vec<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1")
+    let rows: Vec<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL")
         .bind(ask.project.id)
         .fetch_all(&hub.db)
         .await?;
@@ -583,8 +592,13 @@ pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, from: &[Obj
     }
     let mut reals = Vec::new();
     for f in from {
+        if crate::embargo::is_withheld_for_query(hub, project, f).await? {
+            continue;
+        }
         if let Some(r) = crate::sync::resolve(hub, project, &vk, f).await?.into_iter().next() {
-            reals.push(r);
+            if !crate::embargo::is_withheld_for_query(hub, project, &r).await? {
+                reals.push(r);
+            }
         }
     }
     if !reals.is_empty() {
@@ -735,7 +749,7 @@ pub async fn generations(hub: &Arc<Hub>, ask: &Ask, snapshots: Vec<ObjectId>, li
     if snapshots.len() > veil_core::hub::wire::MAX_GENERATIONS {
         return Err(Error::bad_request(format!("at most {} snapshots", veil_core::hub::wire::MAX_GENERATIONS)));
     }
-    let rows: Vec<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1")
+    let rows: Vec<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL")
         .bind(ask.project.id)
         .fetch_all(&hub.db)
         .await?;
@@ -766,8 +780,13 @@ pub async fn generations(hub: &Arc<Hub>, ask: &Ask, snapshots: Vec<ObjectId>, li
     };
     let mut reals = Vec::new();
     for id in &unfilled {
+        if crate::embargo::is_withheld_for_query(hub, project, id).await? {
+            continue;
+        }
         if let Some(r) = crate::sync::resolve(hub, project, &vk, id).await?.into_iter().next() {
-            reals.push(r);
+            if !crate::embargo::is_withheld_for_query(hub, project, &r).await? {
+                reals.push(r);
+            }
         }
     }
     if !reals.is_empty() {

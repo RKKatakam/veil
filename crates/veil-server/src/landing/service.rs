@@ -499,11 +499,12 @@ impl Service {
 
     /// The branch's tip, from the database (no view key kept yet).
     async fn load(&self) -> Result<State> {
-        let t: Option<(String, i64)> = sqlx::query_as("SELECT target, lineage FROM branches WHERE project_id = $1 AND name = $2")
-            .bind(self.project)
-            .bind(&self.branch)
-            .fetch_optional(&self.hub.db)
-            .await?;
+        let t: Option<(String, i64)> =
+            sqlx::query_as("SELECT target, lineage FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL")
+                .bind(self.project)
+                .bind(&self.branch)
+                .fetch_optional(&self.hub.db)
+                .await?;
         let lineage = t.as_ref().map_or(0, |t| t.1);
         let tip = t.map(|t| ObjectId::from_hex(&t.0).map_err(|e| Error::Other(e.into()))).transpose()?;
         Ok(State {
@@ -861,21 +862,24 @@ impl Service {
                 // lineage, also when nothing of it moves the branch
                 // (BUG-1304, BUG-1300): else it is built again on the tip.
                 let n = match &old {
-                    Some(_) => sqlx::query("UPDATE branches SET target = $1 WHERE project_id = $2 AND name = $3 AND target = $4 AND lineage = $5")
-                        .bind(&new)
-                        .bind(pid)
-                        .bind(&branch)
-                        .bind(&old)
-                        .bind(lineage)
-                        .execute(&mut *c)
-                        .await?
-                        .rows_affected(),
+                    Some(_) => sqlx::query(
+                        "UPDATE branches SET target = $1 WHERE project_id = $2 AND name = $3 AND target = $4 AND lineage = $5 AND hidden_for_embargo IS NULL",
+                    )
+                    .bind(&new)
+                    .bind(pid)
+                    .bind(&branch)
+                    .bind(&old)
+                    .bind(lineage)
+                    .execute(&mut *c)
+                    .await?
+                    .rows_affected(),
                     None => {
-                        let there: Option<i64> = sqlx::query_scalar("SELECT lineage FROM branches WHERE project_id = $1 AND name = $2")
-                            .bind(pid)
-                            .bind(&branch)
-                            .fetch_optional(&mut *c)
-                            .await?;
+                        let there: Option<i64> =
+                            sqlx::query_scalar("SELECT lineage FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL")
+                                .bind(pid)
+                                .bind(&branch)
+                                .fetch_optional(&mut *c)
+                                .await?;
                         u64::from(there.is_none())
                     }
                 };
@@ -1288,8 +1292,9 @@ fn entry(
         base_trees.push(old);
     }
     // A merge whose base is its first parent (as the submitter saw it):
-    // lands as a merge, on the tip it was made on.
-    let as_merge = |s: &Snapshot, base: ObjectId| s.parents.len() > 1 && !s.parents[1..].contains(&base);
+    // lands as a merge, on the tip it was made on (except an embargoed
+    // merge landing at release, whose edits land on the current tip).
+    let as_merge = |s: &Snapshot, base: ObjectId| s.embargo.is_none() && s.parents.len() > 1 && !s.parents[1..].contains(&base);
     if sets.iter().flatten().any(|c| c.path == POLICY_FILE || c.path == RULES_FILE) {
         if !b.rows.is_empty() {
             return Ok(None);

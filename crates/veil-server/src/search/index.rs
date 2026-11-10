@@ -579,14 +579,20 @@ pub fn landed(hub: &Arc<Hub>, project: i64, branches: Vec<String>) {
     });
 }
 
+/// Update every public branch's search index for `project`.
+pub async fn catch_up_project(hub: &Arc<Hub>, project: i64) -> Result<Stats> {
+    update(hub, project, None).await
+}
+
 /// Update the indexes of `branches` (every branch when `None`) of
 /// `project` to their tips, deriving them first if needed.
 pub async fn update(hub: &Arc<Hub>, project: i64, branches: Option<Vec<String>>) -> Result<Stats> {
     let _permit = permits().acquire().await.map_err(|e| Error::Other(e.into()))?;
-    let targets: Vec<(String, String)> = sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 ORDER BY name")
-        .bind(project)
-        .fetch_all(&hub.derive.db)
-        .await?;
+    let targets: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL ORDER BY name")
+            .bind(project)
+            .fetch_all(&hub.derive.db)
+            .await?;
     let row: Option<(String, String)> = sqlx::query_as("SELECT default_branch, policy_text FROM projects WHERE id = $1")
         .bind(project)
         .fetch_optional(&hub.derive.db)
@@ -601,7 +607,8 @@ pub async fn update(hub: &Arc<Hub>, project: i64, branches: Option<Vec<String>>)
         "SELECT b.name FROM branches b \
          LEFT JOIN search_heads c ON c.project_id = b.project_id AND c.kind = 'code' AND c.branch = b.name \
          LEFT JOIN search_heads w ON w.project_id = b.project_id AND w.kind = 'walk' AND w.branch = b.name \
-         WHERE b.project_id = $1 AND (c.snapshot IS DISTINCT FROM b.target OR c.lines IS DISTINCT FROM $2 OR w.snapshot IS DISTINCT FROM b.target)",
+         WHERE b.project_id = $1 AND b.hidden_for_embargo IS NULL \
+         AND (c.snapshot IS DISTINCT FROM b.target OR c.lines IS DISTINCT FROM $2 OR w.snapshot IS DISTINCT FROM b.target)",
     )
     .bind(project)
     .bind(&ident)

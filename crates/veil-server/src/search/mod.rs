@@ -336,7 +336,12 @@ async fn shards(hub: &Arc<Hub>, ask: &Ask, kind: &'static str, branch: &str) -> 
             Some(w) => w,
             None => head.as_ref().map(|h| h.snapshot.clone()),
         };
-        let target: Option<String> = cx.db(|| sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2").bind(cx.project()).bind(&b).fetch_optional(pool))?;
+        let target: Option<String> = cx.db(|| {
+            sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL")
+                .bind(cx.project())
+                .bind(&b)
+                .fetch_optional(pool)
+        })?;
         Ok((head, covered, target, shards))
     })
     .await?;
