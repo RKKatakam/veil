@@ -590,7 +590,9 @@ pub fn queued(ticket: &str) -> LandResult {
 /// [`MAX_WAITING`] instead: past it, the answer is the row as it is now
 /// (`queued` and its ticket, for `vl land --status`), without a wait.
 pub async fn wait(hub: &Arc<Hub>, project: i64, person: i64, branch: &str, mut w: Waiter, deadline: tokio::time::Instant) -> Result<LandResult> {
-    if hub.landing.waiters.lock().unwrap().len() > MAX_WAITING {
+    // Waiters, not tickets: several may wait on one ticket (an embargo's
+    // release, S22).
+    if hub.landing.waiters.lock().unwrap().values().map(|(txs, _)| txs.len()).sum::<usize>() > MAX_WAITING {
         let out = match read(hub, project, person, &w.ticket).await? {
             Some((_, r)) => r,
             None => queued(&w.ticket),
@@ -604,7 +606,7 @@ pub async fn wait(hub: &Arc<Hub>, project: i64, person: i64, branch: &str, mut w
     }
     if let Some((_, r)) = read(hub, project, person, &w.ticket).await? {
         if r.state != LandState::Queued {
-            hub.landing.forget(&w.ticket);
+            hub.landing.forget(&w.ticket, w.id);
             return Ok(r);
         }
     }

@@ -465,6 +465,10 @@ pub(crate) fn agent_grant(session_hash: String, agent: Option<String>, project: 
     })))
 }
 
+/// An agent session's record: its attribution, project, narrowing and
+/// whether it is a CI runner.
+type AgentRow = (Option<String>, Option<i64>, Option<String>, bool);
+
 /// Load an active agent session (`session_hash`) for `person_id` in
 /// `project_id`, verifying that neither it, its parent session, nor its device
 /// has expired or been revoked.
@@ -475,7 +479,7 @@ pub async fn load_agent_session<'c>(
     project_id: i64,
 ) -> Result<Option<Arc<AgentGrant>>> {
     let now = veil_core::now_millis();
-    let row: Option<(Option<String>, Option<i64>, Option<String>, bool)> = sqlx::query_as(
+    let row: Option<AgentRow> = sqlx::query_as(
         "SELECT s.agent, s.agent_project, s.agent_only, s.agent_runner \
          FROM sessions s \
          JOIN devices d ON d.id = s.device_id \
