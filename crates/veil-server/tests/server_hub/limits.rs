@@ -1206,7 +1206,8 @@ fn every_landing_bound_refuses_clearly_names_nothing_hidden_and_never_half_lands
 
     // Protect a second branch `release` as well so we can test a
     // multi-branch push where the second branch hits the bound.
-    write_files(&p.dir, &[(".veilrules", "[branches.main]\nprotected = true\n[branches.release]\nprotected = true\n")]);
+    // S21: no approvals, so the bounds are what refuse.
+    write_files(&p.dir, &[(".veilrules", "[branches.main]\nprotected = true\n[branches.release]\nprotected = true\n[review]\nnormal = { approvals = 0 }\nhigh = { approvals = 0 }\n")]);
     p.admin.commit_main(&p.dir, "protect main and release");
     p.admin.ok(&p.dir, &["push"]);
     let admin_tok = p.admin.token();
