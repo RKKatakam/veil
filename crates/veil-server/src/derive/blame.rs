@@ -497,7 +497,7 @@ pub fn diff_parent(pt: &Text, text: &Text) -> ParentMap {
 /// The blame of version `me` (introduced by snapshot `me.0` at path
 /// `me.1`), whose text is `text`, from its parent versions in parent
 /// order (`None`: that parent holds no plain-text version); and what the
-/// diffs cost ([`map_cost`]).
+/// diffs cost ([`veil_core::blame::map_cost`]).
 pub fn step(me: &Origin, text: &Text, parents: &[Option<(&Text, &Blame)>]) -> (Blame, u64) {
     let mapped: Vec<Option<(&Blame, ParentMap)>> = parents
         .iter()
@@ -556,7 +556,7 @@ pub fn step_mapped_in_place(
         for &(o, _) in &cur.lines {
             counts[o as usize] += 1;
         }
-        if cur.origins.len() > 1 && counts.iter().any(|&c| c == 0) {
+        if cur.origins.len() > 1 && counts.contains(&0) {
             let mut remap = vec![0u32; cur.origins.len()];
             let mut new_origins = Vec::with_capacity(cur.origins.len());
             let mut new_counts = Vec::with_capacity(cur.origins.len());

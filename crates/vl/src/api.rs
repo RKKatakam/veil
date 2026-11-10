@@ -3385,7 +3385,7 @@ fn thin_query_blame(
         }
     }
     let mut stamped: Vec<(i64, ObjectId, SnapshotRef)> = changes_by_id.into_values().collect();
-    stamped.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+    stamped.sort_by_key(|a| std::cmp::Reverse((a.0, a.1)));
     Ok(Some(BlameDoc {
         schema: BLAME_SCHEMA,
         path: path(p),

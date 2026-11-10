@@ -830,6 +830,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         Ok(out)
     }
 
+    #[allow(clippy::type_complexity)]
     fn run(&mut self, start: &Version) -> Result<Done> {
         self.f.fast_pages.set(self.limits.held >= 4 << 20);
         // Down: the versions to compute, parents before children, each
@@ -1101,9 +1102,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                 let get_text = |idx: usize| -> Option<Arc<Text>> {
                     loop {
                         if let Some(res) = out_meta[idx].get() {
-                            if res.as_ref().ok().and_then(|o| *o).is_none() {
-                                return None;
-                            }
+                            res.as_ref().ok().and_then(|o| *o)?;
                             return out_text[idx].lock().unwrap().clone();
                         }
                         if aborted.load(std::sync::atomic::Ordering::Acquire) {
@@ -1283,7 +1282,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                         if !used_pool {
                             self.f.g.cx.hub().query.blame_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        let should_keep = *v == *start || (b.vd % CHECKPOINT == 0 && b.vd % spacing(computed, b.stored_estimate()) == 0);
+                        let should_keep = *v == *start || (b.vd.is_multiple_of(CHECKPOINT) && b.vd.is_multiple_of(spacing(computed, b.stored_estimate())));
                         if should_keep {
                             if self.limits.held >= 4 << 20 {
                                 pending_keeps.push((v.clone(), b.clone()));
@@ -1342,14 +1341,14 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                 if !needed_ids.is_empty() {
                     let mut db_ids: Vec<String> = Vec::new();
                     for &id in &needed_ids {
-                        if gens.contains_key(&id) {
-                            continue;
-                        } else if id == super::graph::root() {
-                            gens.insert(id, 0);
-                        } else if let Some(g) = self.f.g.cached_generation(&id) {
-                            gens.insert(id, g);
-                        } else {
-                            db_ids.push(id.hex());
+                        if let std::collections::hash_map::Entry::Vacant(e) = gens.entry(id) {
+                            if id == super::graph::root() {
+                                e.insert(0);
+                            } else if let Some(g) = self.f.g.cached_generation(&id) {
+                                e.insert(g);
+                            } else {
+                                db_ids.push(id.hex());
+                            }
                         }
                     }
                     if !db_ids.is_empty() {
@@ -1368,8 +1367,8 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                         }
                     }
                     for &id in &needed_ids {
-                        if !gens.contains_key(&id) {
-                            gens.insert(id, self.f.g.get(&id)?.generation);
+                        if let std::collections::hash_map::Entry::Vacant(e) = gens.entry(id) {
+                            e.insert(self.f.g.get(&id)?.generation);
                         }
                     }
                     if needed_ids.len() <= 2 {
@@ -1693,7 +1692,7 @@ pub enum JobEnd {
 }
 
 impl JobEnd {
-    fn of(r: Result<Option<Option<(Arc<Text>, Arc<Blame>)>>>) -> JobEnd {
+    fn of(r: Result<Option<Done>>) -> JobEnd {
         match r {
             Ok(Some(direct)) => JobEnd::Kept(direct),
             Ok(None) => JobEnd::NoText,
