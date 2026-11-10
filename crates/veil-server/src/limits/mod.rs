@@ -210,6 +210,11 @@ impl Limits {
             None => self.server.load(),
         }
     }
+
+    /// Wait for a place in the server's gate (for tests).
+    pub async fn server_place(&self, class: gate::Class, deadline: tokio::time::Instant) -> Option<gate::Place> {
+        self.server.place(class, deadline).await
+    }
 }
 
 /// The longest one derive run waits for the server to stop shedding.

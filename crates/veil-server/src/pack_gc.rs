@@ -422,7 +422,15 @@ async fn run_with_lock(hub: &Arc<Hub>, project: i64, opts: &Options) -> Result<R
     }
 
     // 4. Sweep `DISCARDED` packs whose `discarded_at` is past `pack_grace_ms`.
-    sweep_discarded(hub, project, now_ms, opts.pack_grace_ms, &mut report).await?;
+    sweep_discarded(
+        hub,
+        project,
+        now_ms,
+        opts.pack_grace_ms,
+        opts.max_packs_per_run.max(256) * 2,
+        &mut report,
+    )
+    .await?;
 
     Ok(report)
 }
@@ -443,11 +451,14 @@ async fn select_batch(
     gc: Option<GcState>,
 ) -> Result<(Vec<PackRow>, HashSet<ObjectId>, Option<RefStamp>)> {
     let max_per_run = opts.max_packs_per_run.max(1);
-    let small: Vec<PackRow> = listed
+    let mut small: Vec<PackRow> = listed
         .iter()
         .filter(|p| p.size <= opts.small_pack_bytes && p.objects <= opts.max_merged_objects / 2)
         .cloned()
         .collect();
+    small.sort_by(|a, b| {
+        (a.objects, a.size, a.created_at, &a.name).cmp(&(b.objects, b.size, b.created_at, &b.name))
+    });
 
     let Some(gc) = gc else {
         if small.len() < opts.min_packs_to_merge {
@@ -786,16 +797,18 @@ async fn sweep_discarded(
     project: i64,
     now_ms: i64,
     pack_grace_ms: i64,
+    max_sweep: usize,
     report: &mut Report,
 ) -> Result<()> {
     let cutoff = now_ms.saturating_sub(pack_grace_ms.max(0));
     let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM packs WHERE project_id = $1 AND state = $2 AND COALESCE(discarded_at, $4) <= $3 ORDER BY name LIMIT 256",
+        "SELECT name FROM packs WHERE project_id = $1 AND state = $2 AND COALESCE(discarded_at, $4) <= $3 ORDER BY name LIMIT $5",
     )
     .bind(project)
     .bind(DISCARDED)
     .bind(cutoff)
     .bind(now_ms)
+    .bind(max_sweep as i64)
     .fetch_all(&hub.db)
     .await?;
 
