@@ -393,7 +393,8 @@ fn path_under(path: &str, prefix: &str) -> bool {
 
 /// Resume any active bisects or pending revert landings on startup (`lib.rs`).
 pub async fn resume(hub: Arc<Hub>) {
-    let rows: std::result::Result<Vec<(i64, String, String, Option<String>)>, _> = sqlx::query_as(
+    type ResumeRow = (i64, String, String, Option<String>);
+    let rows: std::result::Result<Vec<ResumeRow>, _> = sqlx::query_as(
         "SELECT project_id, branch, phase, revert_ticket FROM bisects WHERE phase IN ('searching', 'confirming', 'reverting')",
     )
     .fetch_all(&hub.db)
@@ -883,13 +884,11 @@ async fn drive_bisect(
                                 }
                             }
                         }
-                        CheckState::Fail => {
-                            if idx < b.hi {
-                                b.hi = idx;
-                                b.bad = cand;
-                                progressed = true;
-                                break;
-                            }
+                        CheckState::Fail if idx < b.hi => {
+                            b.hi = idx;
+                            b.bad = cand;
+                            progressed = true;
+                            break;
                         }
                         _ => {}
                     }
@@ -978,9 +977,9 @@ async fn drive_bisect(
         // Consume `latest_report` if it was the report that triggered transition into `confirming`,
         // so that the same single report doesn't count twice!
         if let Some((rep_snap, _, _)) = latest_report {
-            if rep_snap == culprit && b.culprit_fails == 1 {
-                latest_report = None;
-            } else if rep_snap == parent_target && b.parent_passes == 1 {
+            if (rep_snap == culprit && b.culprit_fails == 1)
+                || (rep_snap == parent_target && b.parent_passes == 1)
+            {
                 latest_report = None;
             }
         }
