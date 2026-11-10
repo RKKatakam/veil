@@ -51,8 +51,8 @@ tempfile.workspace = true
 # returns little of it, so the server held 2-3x its data. jemalloc with two
 # arenas and background purging (settings in src/main.rs) measured best.
 tikv-jemallocator = "=0.7.0"
-# `.veilrules` (branch rules, S17): TOML, as `vl` already parses its
-# configuration (the same crate and version).
+# `.veilrules` (branch and review rules, S17, S21): TOML, as `vl` already
+# parses its configuration (the same crate and version).
 toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 # Search (S15): grep's regular expressions run in linear time (no
 # backtracking), and their syntax tree gives the trigrams every match

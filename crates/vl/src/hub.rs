@@ -865,6 +865,12 @@ impl Client {
         self.json("GET", &self.url.project_path("/health"), None::<&()>)
     }
 
+    /// A JSON request under the project (`path` from `/prs…`), for the
+    /// commands whose answers are plain JSON documents (`vl pr`, S21).
+    pub fn project_json(&self, method: &str, path: &str, body: Option<&serde_json::Value>) -> Result<serde_json::Value> {
+        self.json(method, &self.url.project_path(path), body)
+    }
+
     /// A query route (`GET …/q/ROUTE?PARAMS`, `docs/HUB.md` §13.23): its
     /// JSON answer, or the server's error code and message.
     pub fn query(&self, route: &str, params: &[(&str, String)]) -> Result<std::result::Result<serde_json::Value, (String, String)>> {

@@ -1788,7 +1788,7 @@ fn recheck(
         signature: None,
         ..real.clone()
     };
-    let c = match sync::complete(src, &who.project, &who.viewer, &known, &n, parents, &real.attempts, identity) {
+    let c = match sync::complete(src, &who.project, &who.viewer, &known, &n, parents, &real.attempts, identity, &mut sync::PushRows::default()) {
         Ok(c) => c,
         Err(Error::Api { message, code: "forbidden" | "bad_request" | crate::auth::AGENT_SESSION, .. }) => return Ok(Err(message)),
         Err(e) => return Err(e),

@@ -347,6 +347,9 @@ struct Built {
     /// The branch rules (`.veilrules`) of the full tree, to compare with the
     /// default branch's tip's (BUG-1102).
     rules: Option<TreeEntry>,
+    /// The new tip's `.veilrules`, for a move of the default branch (S21:
+    /// the review rules state its landing records, `prs::state`).
+    rules_file: Option<crate::prs::state::RulesFile>,
 }
 
 /// Who asks, as of one attempt: the project with its accepted policy and
@@ -460,7 +463,11 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, who: &Arc<Who>, parent: ObjectI
             false => (None, None),
         };
         let rules = sync::entry_at(src, &real.tree, crate::landing::rules::RULES_FILE)?;
-        Ok(Built { real: real_id, store, mine, accept, policy_text_update, rules })
+        let rules_file = match p.default_branch {
+            true => Some(crate::prs::state::file_at(src, real.tree)?),
+            false => None,
+        };
+        Ok(Built { real: real_id, store, mine, accept, policy_text_update, rules, rules_file })
     })
     .await
 }
@@ -471,7 +478,7 @@ fn complete_signed(src: &Source, who: &Who, known: &HashSet<ObjectId>, mut n: Sn
     n.sign(identity);
     // A change made again keeps its attempts (real ids already).
     let attempts = n.attempts.clone();
-    let c = sync::complete(src, &who.project, &who.viewer, known, &n, &[parent], &attempts, identity)?;
+    let c = sync::complete(src, &who.project, &who.viewer, known, &n, &[parent], &attempts, identity, &mut sync::PushRows::default())?;
     Ok(match c.raw {
         Some(raw) => match Object::decode(&raw)? {
             Object::Snapshot(s) => (c.real, s, raw),
@@ -591,6 +598,11 @@ async fn commit(
     snaps.push((built.real.hex(), built.mine.hex()));
     let moved_refs: Vec<(String, String)> = restacked.iter().map(|(n, o, _)| (n.hex(), o.hex())).collect();
     let (real, cid, accept, policy_text_update) = (built.real.hex(), plan.change_id.to_string(), built.accept.clone(), built.policy_text_update.clone());
+    // A change onto the tip is a fast-forward from it.
+    let rules_landing = match (&built.rules_file, &mv) {
+        (Some(file), Some(m)) => Some(crate::prs::state::Landing { old: Some(m.cur), new: built.real, file: file.clone(), fast_forward: true }),
+        _ => None,
+    };
     let mv = mv.map(|m| (m.branch, m.cur.hex(), m.keep_on_loss));
     let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let committed: Vec<ObjectId> = restacked.iter().map(|(n, _, _)| *n).chain(std::iter::once(built.real)).collect();
@@ -623,6 +635,7 @@ async fn commit(
             land.clone(),
             on_branch.clone(),
         );
+        let rules_landing = rules_landing.clone();
         Box::pin(async move {
             if let Some((w, q)) = &land {
                 crate::landing::insert(&mut *c, pid, w, q).await?;
@@ -656,6 +669,9 @@ async fn commit(
                             .execute(&mut *c)
                             .await?;
                     }
+                }
+                if let (1, Some(l)) = (rows, &rules_landing) {
+                    crate::prs::state::record_landing(&mut *c, pid, l).await?;
                 }
             }
             let mut memos = Vec::new();

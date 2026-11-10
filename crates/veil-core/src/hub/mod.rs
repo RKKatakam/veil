@@ -18,6 +18,8 @@
 //!   (`docs/HUB.md` §13.13).
 //! * [`agent`]: agent sessions and their narrowing (`docs/HUB.md` §13.27).
 //! * [`land`]: the landing service's messages (`docs/HUB.md` §13.19).
+//! * [`pr`]: what a reviewer's device signs for a PR review
+//!   (`docs/HUB.md` §13.24).
 //!
 //! The server is the authority (`docs/VISIBILITY.md`): it decides from its
 //! own records and the accepted policy, never from labels in a snapshot.
@@ -28,5 +30,6 @@ pub mod changes;
 pub mod encoding;
 pub mod grant;
 pub mod land;
+pub mod pr;
 pub mod project;
 pub mod wire;
