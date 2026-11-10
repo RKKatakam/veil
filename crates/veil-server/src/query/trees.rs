@@ -155,14 +155,26 @@ impl<'g, 'a> Trees<'g, 'a> {
                 })
             };
             let (ea, eb) = (get(&a)?, get(&b)?);
-            if i + 1 == parts.len() || ea.is_none() || eb.is_none() {
+            if i + 1 == parts.len() {
                 return Ok(ea != eb);
             }
-            let (ea, eb) = (ea.unwrap(), eb.unwrap());
-            if ea == eb {
-                return Ok(false);
+            match (ea, eb) {
+                (None, None) => return Ok(false),
+                (Some(ea), None) => {
+                    // Only `a` has this ancestor directory: `path` differs
+                    // only if `path` actually exists inside `a`.
+                    return Ok(self.entry_at(ea.id, &parts[i + 1..].join("/"))?.is_some());
+                }
+                (None, Some(eb)) => {
+                    return Ok(self.entry_at(eb.id, &parts[i + 1..].join("/"))?.is_some());
+                }
+                (Some(ea), Some(eb)) => {
+                    if ea == eb {
+                        return Ok(false);
+                    }
+                    (a, b) = (ea.id, eb.id);
+                }
             }
-            (a, b) = (ea.id, eb.id);
         }
         Ok(false)
     }

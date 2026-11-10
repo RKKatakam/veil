@@ -664,6 +664,7 @@ struct GrepPage<'l> {
     files: Vec<Value>,
     want: usize,
     read: usize,
+    sealed: usize,
     read_bytes: u64,
     bytes: usize,
     last: Option<String>,
@@ -752,6 +753,7 @@ pub async fn grep(hub: &Arc<Hub>, ask: &Ask, q: GrepParams, limits: Limits) -> R
             files: Vec::new(),
             want,
             read: 0,
+            sealed: 0,
             read_bytes: 0,
             bytes: 0,
             last: None,
@@ -762,7 +764,7 @@ pub async fn grep(hub: &Arc<Hub>, ask: &Ask, q: GrepParams, limits: Limits) -> R
                 let work = Work { n: Cell::new(0), deadline };
                 let budget = Budget::new(deadline);
                 let code = Opened::open(&cx.src, shards, &budget)?;
-                let searchable = |d: &Doc| d.searchable();
+                let searchable = |d: &Doc| d.searchable() && viewer.within_narrowing(&d.path);
                 let mut cands = Merge::new(&code, &pat.grams, (&dir, &after), &searchable, &budget)?;
                 while let Some(d) = cands.next(&budget)? {
                     if page.stop(d.size) {
@@ -786,11 +788,11 @@ pub async fn grep(hub: &Arc<Hub>, ask: &Ask, q: GrepParams, limits: Limits) -> R
                 if let Some((id, entry)) = start {
                     match entry {
                         Some(e) if e.kind != EntryKind::Dir => {
-                            if after.is_empty() || tree_cmp(&dir, &after) == std::cmp::Ordering::Greater {
+                            if (after.is_empty() || tree_cmp(&dir, &after) == std::cmp::Ordering::Greater) && viewer.within_narrowing(&dir) {
                                 scan_leaf(&t, &dir, &e, &mut page, &pat)?;
                             }
                         }
-                        _ => scan(&t, &dir, id, &after, &mut page, &pat, 0)?,
+                        _ => scan(&t, &viewer, &dir, id, &after, &mut page, &pat, 0)?,
                     }
                 }
                 let w = g.work();
@@ -805,6 +807,8 @@ pub async fn grep(hub: &Arc<Hub>, ask: &Ask, q: GrepParams, limits: Limits) -> R
             "tip_id": resolved.hex(),
             "behind": snapshot != resolved,
             "pattern": pattern_text,
+            "searched": page.read,
+            "sealed": page.sealed,
             "files": page.files,
             "truncated": next.is_some(),
             "next": next,
@@ -824,7 +828,15 @@ fn join(dir: &str, name: &str) -> String {
 }
 
 fn scan_leaf(t: &Trees, path: &str, e: &veil_core::TreeEntry, page: &mut GrepPage, pat: &Pattern) -> Result<()> {
-    if flags_of(e) & TEXT == 0 || page.stop(e.size) {
+    let f = flags_of(e);
+    if f & TEXT == 0 {
+        if f & crate::search::segment::SEALED != 0 {
+            page.read += 1;
+            page.sealed += 1;
+        }
+        return Ok(());
+    }
+    if page.stop(e.size) {
         return Ok(());
     }
     let (blob, bytes) = t.content(&e.id)?;
@@ -834,7 +846,8 @@ fn scan_leaf(t: &Trees, path: &str, e: &veil_core::TreeEntry, page: &mut GrepPag
 
 /// Walk folder `id` at `dir` of the viewer's tree in tree order, after
 /// `after`, examining its text files until the page is full.
-fn scan(t: &Trees, dir: &str, id: ObjectId, after: &str, page: &mut GrepPage, pat: &Pattern, depth: usize) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn scan(t: &Trees, viewer: & crate::perm::Viewer, dir: &str, id: ObjectId, after: &str, page: &mut GrepPage, pat: &Pattern, depth: usize) -> Result<()> {
     if depth > veil_core::tree::MAX_TREE_DEPTH {
         return Ok(());
     }
@@ -849,11 +862,19 @@ fn scan(t: &Trees, dir: &str, id: ObjectId, after: &str, page: &mut GrepPage, pa
         let later = after.is_empty() || tree_cmp(&p, after) == std::cmp::Ordering::Greater;
         if e.kind == EntryKind::Dir {
             // A folder before the cursor is skipped, unless the cursor is
-            // inside it.
-            if later || after.starts_with(&format!("{p}/")) {
-                scan(t, &p, e.id, after, page, pat, depth + 1)?;
+            // inside it. For a narrowed session, skip folders that cannot
+            // overlap any narrowed path.
+            let may_overlap = viewer.only.as_ref().is_none_or(|only| {
+                let prefix = format!("{p}/");
+                only.iter().any(|o| {
+                    let o = o.trim_end_matches('/');
+                    o == p || o.starts_with(&prefix) || p.starts_with(&format!("{o}/"))
+                })
+            });
+            if may_overlap && (later || after.starts_with(&format!("{p}/"))) {
+                scan(t, viewer, &p, e.id, after, page, pat, depth + 1)?;
             }
-        } else if later {
+        } else if later && viewer.within_narrowing(&p) {
             scan_leaf(t, &p, e, page, pat)?;
         }
     }

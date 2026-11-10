@@ -2073,8 +2073,9 @@ fn s16_vl_queries_equal_the_viewers_own_view_without_paging_history() {
     }
 
     // A narrowed agent session of `dev` (narrowed to `src/api/`): sees
-    // `src/api/handler.rs` and never sees `src/other/util.rs` (`OUTSIDE-NARROW-202`)
-    // or any restricted marker.
+    // `src/api/handler.rs` and is refused on `src/other/util.rs` or whole-tree
+    // queries outside its narrowing, never leaking `OUTSIDE-NARROW-202` or any
+    // restricted marker.
     let r = hub.api().post_json(
         Some(&p.dev.token()),
         "/v1/sessions/agent",
@@ -2086,27 +2087,30 @@ fn s16_vl_queries_equal_the_viewers_own_view_without_paging_history() {
     );
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     let agent_tok = r.json()["token"].as_str().unwrap().to_string();
-    let agent_thin = p.dev.dir("s16-agent-thin");
-    p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), agent_thin.to_str().unwrap()]);
+    let dev_thin = p.dev.dir("s16-thin-dev");
     let run_agent = |args: &[&str]| -> (bool, String) {
-        let mut c = p.dev.command(&agent_thin, args);
+        let mut c = p.dev.command(&dev_thin, args);
         c.env("VEIL_TOKEN", &agent_tok);
         let o = c.output().unwrap();
         let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         (o.status.success(), out)
     };
-    let (ok, grep_all) = run_agent(&["grep", "202|101", "-r", "main", "--json"]);
-    assert!(ok, "agent grep failed: {grep_all}");
-    assert!(grep_all.contains("API-TOKEN-101"), "agent grep missed its own path: {grep_all}");
-    assert!(!grep_all.contains("OUTSIDE-NARROW-202") && !grep_all.contains("src/other"), "agent grep leaked outside path: {grep_all}");
-    let (ok_outside, outside_err) = run_agent(&["blame", "src/other/util.rs", "-r", "main"]);
+    let (ok, grep_in) = run_agent(&["--no-snapshot", "grep", "202|101", "-r", "main", "--json", "src/api"]);
+    assert!(ok, "agent grep inside its paths failed: {grep_in}");
+    assert!(grep_in.contains("API-TOKEN-101"), "agent grep missed its own path: {grep_in}");
+    assert!(!grep_in.contains("OUTSIDE-NARROW-202") && !grep_in.contains("src/other"), "agent grep leaked outside path: {grep_in}");
+    let (ok_wide, wide_err) = run_agent(&["--no-snapshot", "grep", "202|101", "-r", "main", "--json"]);
+    assert!(!ok_wide && wide_err.contains("narrowed"), "agent grep without path should be refused: {wide_err}");
+    let (ok_outside, outside_err) = run_agent(&["--no-snapshot", "blame", "src/other/util.rs", "-r", "main"]);
     assert!(!ok_outside && outside_err.contains("narrowed"), "agent blame outside its paths should be refused: {outside_err}");
     let mut agent_forbidden = restricted_markers();
     agent_forbidden.push("OUTSIDE-NARROW-202");
     agent_forbidden.push("util.rs");
-    let mut seen = everything_in(&agent_thin);
-    seen.push(("agent grep".into(), grep_all.into_bytes()));
-    seen.push(("agent blame err".into(), outside_err.into_bytes()));
+    let seen = vec![
+        ("agent grep in".into(), grep_in.into_bytes()),
+        ("agent grep wide err".into(), wide_err.into_bytes()),
+        ("agent blame err".into(), outside_err.into_bytes()),
+    ];
     assert_no_marker(&seen, &agent_forbidden, "narrowed agent");
 }
 
@@ -2131,7 +2135,7 @@ fn s16_unreachable_or_warming_server_is_reported_clearly() {
     });
     hub.rt.block_on(async {
         sqlx::query("DELETE FROM view_graph WHERE project_id = $1").bind(pid).execute(&hub.hub().db).await.unwrap();
-        sqlx::query("INSERT INTO view_fills (project_id, view_key, holder, expires_at) VALUES ($1, '*', 'other-server', $2)")
+        sqlx::query("INSERT INTO view_fills (project_id, view_key, holder, expires_at) VALUES ($1, 'admin', 'other-server', $2)")
             .bind(pid)
             .bind(veil_core::now_millis() + 600_000)
             .execute(&hub.hub().db)

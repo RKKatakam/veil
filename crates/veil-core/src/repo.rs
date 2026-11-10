@@ -16,7 +16,7 @@
 //! ```
 
 use std::{
-    collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::Path,
     sync::Arc,
 };
@@ -1402,44 +1402,11 @@ impl Repo {
 
     // ---- graph queries ---------------------------------------------------
 
-    /// Snapshots reachable from `roots`, children before parents, newest
-    /// first among unrelated snapshots.
+    /// Snapshots reachable from `roots`, newest first by generation (the
+    /// corrected commit date: strictly greater than every parent's, so
+    /// children always come before their parents), ties by id.
     fn topo_children_first(&self, roots: impl IntoIterator<Item = ObjectId>) -> Result<Vec<ObjectId>> {
-        let mut nodes: HashMap<ObjectId, Arc<Snapshot>> = HashMap::new();
-        let mut stack: Vec<ObjectId> = roots.into_iter().collect();
-        while let Some(id) = stack.pop() {
-            if nodes.contains_key(&id) {
-                continue;
-            }
-            // A redacted parent (withheld by an unreleased embargo) is simply
-            // not part of this replica's graph.
-            let Some(s) = self.snapshot_held(&id)? else { continue };
-            stack.extend(s.parents.iter().copied());
-            nodes.insert(id, s);
-        }
-        let mut child_count: HashMap<ObjectId, usize> = HashMap::new();
-        for s in nodes.values() {
-            for p in s.parents.iter().filter(|p| nodes.contains_key(*p)) {
-                *child_count.entry(*p).or_default() += 1;
-            }
-        }
-        let mut heap: BinaryHeap<(i64, ObjectId)> = nodes
-            .iter()
-            .filter(|(id, _)| !child_count.contains_key(*id))
-            .map(|(id, s)| (s.timestamp, *id))
-            .collect();
-        let mut out = Vec::with_capacity(nodes.len());
-        while let Some((_, id)) = heap.pop() {
-            out.push(id);
-            for p in nodes[&id].parents.iter().filter(|p| nodes.contains_key(*p)) {
-                let c = child_count.get_mut(p).unwrap();
-                *c -= 1;
-                if *c == 0 {
-                    heap.push((nodes[p].timestamp, *p));
-                }
-            }
-        }
-        Ok(out)
+        self.graph.topo_iter(self, roots).collect()
     }
 
     fn visible_snapshots(&self) -> Result<Vec<ObjectId>> {

@@ -200,6 +200,10 @@ impl Promisor for HubPromisor {
     fn resolve(&self, prefix: &str, from: &[ObjectId]) -> veil_core::Result<Option<veil_core::hub::wire::Resolved>> {
         self.resolve_direct(prefix, from)
     }
+
+    fn query(&self, route: &str, params: &[(&str, String)]) -> veil_core::Result<std::result::Result<serde_json::Value, (String, String)>> {
+        self.query_direct(route, params)
+    }
 }
 
 impl HubPromisor {
@@ -310,6 +314,34 @@ impl HubPromisor {
                 404 | 405 => return Ok(None),
                 503 if attempt < 19 => std::thread::sleep(std::time::Duration::from_millis(500)),
                 s => return Err(self.refused(s, &out)),
+            }
+        }
+        Err(unavailable(&self.url, "the server kept preparing this history"))
+    }
+
+    /// A query route (`/v1/projects/{p}/q/{route}`, S16, `docs/HUB.md`
+    /// §13.34), retrying `warming` and `deadline` (`503`) up to 20 times
+    /// (or `VEIL_QUERY_RETRIES`).
+    fn query_direct(&self, route: &str, params: &[(&str, String)]) -> veil_core::Result<std::result::Result<serde_json::Value, (String, String)>> {
+        let retries = std::env::var("VEIL_QUERY_RETRIES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(19);
+        for attempt in 0..=retries {
+            let r = {
+                let c = self.client()?;
+                c.as_ref().expect("made").query(route, params).map_err(|e| unavailable(&self.url, format!("{e:#}")))?
+            };
+            match r {
+                Ok(v) => return Ok(Ok(v)),
+                Err((code, msg)) if matches!(code.as_str(), "warming" | "deadline" | "indexing") => {
+                    if attempt < retries {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        continue;
+                    }
+                    return Err(unavailable(&self.url, format!("the server answered {msg} ({code})")));
+                }
+                Err((code, msg)) => return Ok(Err((code, msg))),
             }
         }
         Err(unavailable(&self.url, "the server kept preparing this history"))

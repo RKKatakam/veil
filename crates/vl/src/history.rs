@@ -220,7 +220,15 @@ const PICKAXE_MAX_CHANGES: usize = 100_000;
 impl LogFilterArgs {
     /// The query these flags ask for.
     pub fn query(&self, ctx: &Ctx, limit: Option<usize>) -> Result<api::LogQuery> {
-        let ids = self.revset.as_deref().map(|r| revset::resolve_set(&ctx.repo, r, &ctx.ws)).transpose()?;
+        let mut roots = None;
+        let ids = match self.revset.as_deref().map(str::trim) {
+            Some(r) if ctx.repo.is_partial() && r.starts_with("::") && !r[2..].trim().is_empty() && !r[2..].contains("..") => {
+                roots = Some(vec![revset::resolve(&ctx.repo, r[2..].trim(), &ctx.ws)?]);
+                None
+            }
+            Some(r) => Some(revset::resolve_set(&ctx.repo, r, &ctx.ws)?),
+            None => None,
+        };
         let paths: Vec<VPath> = self.paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
         if self.follow && paths.len() != 1 {
             bail!("--follow follows exactly one file: give one PATH");
@@ -250,7 +258,7 @@ impl LogFilterArgs {
             reader: Reader::Me,
             renames: RenameOptions::default(),
         };
-        Ok(api::LogQuery { limit, ids, filter: Some(filter), show_skipped: self.show_skipped, max_changes })
+        Ok(api::LogQuery { limit, ids, roots, filter: Some(filter), show_skipped: self.show_skipped, max_changes })
     }
 }
 

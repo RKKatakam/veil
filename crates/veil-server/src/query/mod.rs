@@ -493,7 +493,21 @@ pub async fn log(hub: &Arc<Hub>, ask: &Ask, q: LogParams, limits: Limits) -> Res
             }
             out
         }
-        None => vec![resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?],
+        None => {
+            let rev = q.rev.as_deref().unwrap_or(&ask.project.default_branch);
+            let parts: Vec<&str> = rev.split(',').filter(|s| !s.is_empty()).collect();
+            if parts.is_empty() {
+                return Err(no_revision());
+            }
+            if parts.len() > limits.cursor {
+                return Err(Error::bad_request("cursor too long"));
+            }
+            let mut out = Vec::with_capacity(parts.len());
+            for r in parts {
+                out.push(resolve(hub, ask, r, deadline).await?);
+            }
+            out
+        }
     };
     on_graph(hub, ask, deadline, move |g, t| {
         let mut roots = roots;
