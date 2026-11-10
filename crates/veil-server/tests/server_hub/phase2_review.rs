@@ -1563,7 +1563,6 @@ fn bug_1784_narrowed_agent_session_overwrites_persons_out_of_scope_change_id() {
 /// the entire multi-MiB object from storage even when the caller's answer-memory
 /// budget is already exhausted.
 #[test]
-#[ignore = "BUG-1785: GET /v1/objects/{p}/{id} with Range: bytes=0- bypasses limits::answers::prepay, reading full objects from storage when the answer budget is exhausted"]
 fn bug_1785_object_range_zero_dash_bypasses_answers_prepay() {
     use std::sync::atomic::Ordering;
 
@@ -1610,16 +1609,15 @@ fn bug_1785_object_range_zero_dash_bypasses_answers_prepay() {
     let chain = format!("{},{}", root.hex(), src_id.hex());
 
     // 1. Hold one unread 10 MiB response (`stall_id`) open on `hub` so only 6 MiB remains in the 16 MiB quarter.
-    let _stalled = api.get_unread(
+    let stalled = api.get_unread(
         &format!("/v1/objects/{}/{}", p.name, stall_id.hex()),
         &[("veil-grant", &grant), ("veil-chain", &chain)],
     );
     assert!(hub.hub().limits.answers.held_kib() >= 9 << 10, "10 MiB answer holds budget");
 
-    // 2. Compare storage reads (`hub.objects.reads`) for uncached `file_id` (`target.bin`) on plain `GET` vs `Range: bytes=0-`:
-    // - Plain `GET` calls `answers::prepay` BEFORE reading storage -> `503` with `0` storage reads (`BUG-1330`)!
-    // - `Range: bytes=0-` MUST ALSO prepay (or check budget before reading 6 MiB into RAM) -> FAILS today:
-    //   skips `prepay` and reads the entire 6 MiB `target.bin` from storage into RAM before `answers.budget` refuses!
+    // 2. Compare storage reads (`hub.objects.reads`) for uncached `file_id` (`target.bin`) on plain `GET` vs `Range`:
+    // - Plain `GET` calls `answers::prepay` BEFORE reading storage -> `503` with `0` storage reads (`BUG-1330`).
+    // - `Range: bytes=0-` and `Range: bytes=0-7340031` (7 MiB > ~6 MiB left) MUST ALSO prepay and refuse with `0` reads.
     let reads0 = hub.hub().objects.reads.load(Ordering::Relaxed);
     let plain_refused = signed_object_get(&api, &p.name, &grant, &gkey, None, &[root, src_id], &file_id, &[]);
     assert_eq!(plain_refused.status, 503, "plain GET refused when budget full: {}", body(&plain_refused));
@@ -1641,9 +1639,61 @@ fn bug_1785_object_range_zero_dash_bypasses_answers_prepay() {
     assert_eq!(
         reads_after_range,
         reads_after_plain,
-        "Range: bytes=0- bypassed answers::prepay and performed {} storage reads (reading 6 MiB into RAM) while answer budget was exhausted!",
+        "Range: bytes=0- bypassed answers::prepay and performed {} storage reads while answer budget was exhausted!",
         reads_after_range - reads_after_plain
     );
+
+    let subrange_refused = signed_object_get(
+        &api,
+        &p.name,
+        &grant,
+        &gkey,
+        None,
+        &[root, src_id],
+        &file_id,
+        &[("range", "bytes=0-7340031")],
+    );
+    assert_eq!(subrange_refused.status, 503);
+    assert_eq!(
+        hub.hub().objects.reads.load(Ordering::Relaxed),
+        reads_after_plain,
+        "oversized subrange must also fail prepay with 0 storage reads"
+    );
+
+    // 3. A 1 MiB subrange fits within the remaining ~6 MiB budget and succeeds with 206.
+    let small_range = signed_object_get(
+        &api,
+        &p.name,
+        &grant,
+        &gkey,
+        None,
+        &[root, src_id],
+        &file_id,
+        &[("range", "bytes=0-1048575")],
+    );
+    assert_eq!(small_range.status, 206);
+    assert_eq!(small_range.body.len(), 1 << 20);
+
+    // 4. Unsatisfiable range returns 416 and releases all held KiB once `stalled` drops.
+    let bad_range = signed_object_get(
+        &api,
+        &p.name,
+        &grant,
+        &gkey,
+        None,
+        &[root, src_id],
+        &file_id,
+        &[("range", "bytes=99999999-")],
+    );
+    assert_eq!(bad_range.status, 416);
+    drop(stalled);
+    for _ in 0..40 {
+        if hub.hub().limits.answers.held_kib() == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(hub.hub().limits.answers.held_kib(), 0, "all held answer budget must be released");
 }
 
 /// BUG-1786 (non-blocking): S8's workspace sandbox socket (`ws_socket::check_revisions`,

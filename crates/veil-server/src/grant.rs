@@ -431,16 +431,28 @@ pub async fn get_object(
     let Some(&(_, size)) = reached(&hub, project, &grant, vec![(chain, id)]).await?.first() else {
         return Err(not_reached());
     };
+    let total = match sync::builtin(&id) {
+        Some(b) => b.len() as u64,
+        None => hub.objects.read_cost(project, &id, size).await?,
+    };
     let octets = (header::CONTENT_TYPE, "application/octet-stream".to_string());
     let Some((start, end)) = parse_range(&headers) else {
         // Its share of the answers' budget before it is read (S24,
         // BUG-1330): a request refused reads nothing.
-        let paid = crate::limits::answers::prepay(&hub, asker.map(|e| e.0), size).await?;
+        let paid = crate::limits::answers::prepay(&hub, asker.map(|e| e.0), total).await?;
         let raw = read(&hub, project, &id).await?.ok_or_else(not_reached)?;
         let mut resp = ([octets], raw).into_response();
         resp.extensions_mut().insert(paid);
         return Ok(resp);
     };
+    // Ranged object answers prepay their share before reading storage too
+    // (BUG-1785), so `Range: bytes=0-` cannot bypass S24's answer budget.
+    let want = if start < total {
+        (end.min(total - 1) - start).saturating_add(1)
+    } else {
+        0
+    };
+    let paid = crate::limits::answers::prepay(&hub, asker.map(|e| e.0), want).await?;
     let (part, len) = match sync::builtin(&id) {
         Some(b) => (crate::store::slice(&b, start, end), b.len() as u64),
         None => hub.objects.get_range(project, &id, start, end).await?.ok_or_else(not_reached)?,
@@ -449,7 +461,9 @@ pub async fn get_object(
         return Ok((StatusCode::RANGE_NOT_SATISFIABLE, [(header::CONTENT_RANGE, format!("bytes */{len}"))]).into_response());
     }
     let last = start + part.len() as u64 - 1;
-    Ok((StatusCode::PARTIAL_CONTENT, [octets, (header::CONTENT_RANGE, format!("bytes {start}-{last}/{len}"))], part).into_response())
+    let mut resp = (StatusCode::PARTIAL_CONTENT, [octets, (header::CONTENT_RANGE, format!("bytes {start}-{last}/{len}"))], part).into_response();
+    resp.extensions_mut().insert(paid);
+    Ok(resp)
 }
 
 /// `POST /v1/objects/{p}:batch`: the objects of the request its grant
