@@ -232,6 +232,36 @@ pub fn signed_in_servers() -> Result<Vec<(String, String)>> {
 
 // ---- the client -------------------------------------------------------------------------
 
+/// An HTTPS agent's configuration for a server: its certificate as this
+/// Veil home trusts it (`VEIL_HUB_CA`, or the one `vl login --ca`
+/// remembered), else the public CAs.
+fn agent_config(entry: Option<&ServerEntry>) -> Result<ureq::config::ConfigBuilder<ureq::typestate::AgentScope>> {
+    let ca = match std::env::var_os("VEIL_HUB_CA") {
+        Some(p) => Some(std::fs::read_to_string(&p).with_context(|| format!("reading VEIL_HUB_CA {}", Path::new(&p).display()))?),
+        None => entry.and_then(|e| e.ca.clone()),
+    };
+    let mut tls = ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::Rustls);
+    if let Some(pem) = &ca {
+        let certs: Vec<ureq::tls::Certificate<'static>> = ureq::tls::parse_pem(pem.as_bytes())
+            .filter_map(|i| match i {
+                Ok(ureq::tls::PemItem::Certificate(c)) => Some(c),
+                _ => None,
+            })
+            .collect();
+        if certs.is_empty() {
+            bail!("no certificate in the server's CA file");
+        }
+        tls = tls.root_certs(ureq::tls::RootCerts::Specific(Arc::new(certs)));
+    }
+    Ok(ureq::Agent::config_builder().tls_config(tls.build()).http_status_as_error(false))
+}
+
+/// The configuration of an agent for the server at `authority`, trusted as
+/// [`Client`] trusts it, holding no session (the Veil daemon's upstream).
+pub(crate) fn upstream_agent_config(authority: &str) -> Result<ureq::config::ConfigBuilder<ureq::typestate::AgentScope>> {
+    agent_config(load_file()?.servers.get(authority))
+}
+
 pub struct Client {
     agent: ureq::Agent,
     pub url: HubUrl,
@@ -318,32 +348,15 @@ impl Decoded {
 }
 
 impl Client {
+    /// This device's identity.
+    pub(crate) fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
     pub fn new(url: &HubUrl, identity: Identity) -> Result<Client> {
         let file = load_file()?;
         let entry = file.servers.get(&url.authority).cloned();
-        let ca = match std::env::var_os("VEIL_HUB_CA") {
-            Some(p) => Some(std::fs::read_to_string(&p).with_context(|| format!("reading VEIL_HUB_CA {}", Path::new(&p).display()))?),
-            None => entry.as_ref().and_then(|e| e.ca.clone()),
-        };
-        let mut tls = ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::Rustls);
-        if let Some(pem) = &ca {
-            let certs: Vec<ureq::tls::Certificate<'static>> = ureq::tls::parse_pem(pem.as_bytes())
-                .filter_map(|i| match i {
-                    Ok(ureq::tls::PemItem::Certificate(c)) => Some(c),
-                    _ => None,
-                })
-                .collect();
-            if certs.is_empty() {
-                bail!("no certificate in the server's CA file");
-            }
-            tls = tls.root_certs(ureq::tls::RootCerts::Specific(Arc::new(certs)));
-        }
-        let agent = ureq::Agent::config_builder()
-            .tls_config(tls.build())
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(600)))
-            .build()
-            .new_agent();
+        let agent = agent_config(entry.as_ref())?.timeout_global(Some(Duration::from_secs(600))).build().new_agent();
         let token = entry
             .as_ref()
             .filter(|e| e.expires_at > veil_core::now_millis() + 30_000)
@@ -509,6 +522,30 @@ impl Client {
             200 => Ok(Some(serde_json::from_slice(&out)?)),
             404 => Ok(None),
             s => Err(Self::error(s, &out)),
+        }
+    }
+
+    /// One background [`Client::tips`] check without waiting out a rate
+    /// limit (`vl daemon follow`, BUG-1680): returns `(Some(tips), 0)` on
+    /// `200`, `(None, ms)` on `429` or `503` with `retry_after_ms`, and
+    /// `(None, 0)` otherwise.
+    pub(crate) fn tips_once(&self) -> Result<(Option<Tips>, i64)> {
+        if self.token.borrow().is_none() && self.known {
+            self.login(None)?;
+        }
+        let path = self.url.project_path("/tips");
+        let (mut status, mut out) = self.send_once("GET", &path, None, true)?;
+        if status == 401 && self.known {
+            self.login(None)?;
+            (status, out) = self.send_once("GET", &path, None, true)?;
+        }
+        match status {
+            200 => Ok((Some(serde_json::from_slice(&out)?), 0)),
+            429 | 503 => {
+                let ms = serde_json::from_slice::<serde_json::Value>(&out).ok().and_then(|v| v["retry_after_ms"].as_i64()).unwrap_or(5_000).max(5_000);
+                Ok((None, ms))
+            }
+            _ => Ok((None, 0)),
         }
     }
 
@@ -909,6 +946,8 @@ pub fn pull_moving(
     let tips = client
         .tips()?
         .ok_or_else(|| anyhow!("no project '{}' that you can see on {}", client.url.project, client.url.authority))?;
+    // Its grants serve this process's reads through the Veil daemon (S6).
+    crate::thin::remember_grants(&client.url, &tips);
     // A thin clone (S3) takes the new snapshots (a page at most) and the
     // content of the branch it checks out only; the rest is fetched when
     // read.
@@ -1008,7 +1047,89 @@ pub fn pull_moving(
     // A server of revision 1 takes the wants of every snapshot in one
     // request per level; an older one, one request per snapshot.
     let across = tips.revision >= 1;
+    // A thin clone reads through the Veil daemon first (S6): each object's
+    // chain of trees from its snapshot's projected root is what the daemon
+    // checks. Kept as each object's parent (the tree or conflict naming it;
+    // an id is in the frontier once), the chain walked up when asked for.
+    let daemon = thin && crate::thin::daemon_on();
+    let roots: HashMap<ObjectId, ObjectId> = new_snaps.iter().copied().collect();
+    let mut parents: HashMap<ObjectId, ObjectId> = HashMap::new();
+    let chain_of = |parents: &HashMap<ObjectId, ObjectId>, id: &ObjectId| -> Vec<ObjectId> {
+        let mut chain = Vec::new();
+        let mut cur = *id;
+        while let Some(p) = parents.get(&cur).filter(|_| chain.len() <= veil_core::hub::grant::MAX_CHAIN) {
+            chain.push(*p);
+            cur = *p;
+        }
+        chain.reverse();
+        chain
+    };
     while !frontier.is_empty() {
+        let asked: Vec<(ObjectId, Vec<ObjectId>, ObjectId)> = match daemon {
+            true => frontier.iter().filter_map(|(snap, _, id, _)| Some((*roots.get(snap)?, chain_of(&parents, id), *id))).collect(),
+            false => Vec::new(),
+        };
+        let mut next = Vec::new();
+        let mut handle = |snap: ObjectId, w: &Want, raw: Vec<u8>| -> Result<()> {
+            let obj = Object::decode(&raw)?;
+            let mut children = Vec::new();
+            match &obj {
+                Object::Tree(t) => {
+                    for e in &t.entries {
+                        let p = if w.path.is_empty() { e.name.clone() } else { format!("{}/{}", w.path, e.name) };
+                        if !in_scope(only, &p) {
+                            continue;
+                        }
+                        if e.kind == EntryKind::Dir && only.is_some_and(|o| o.len() > p.len()) {
+                            // A directory on the way to `only`: its tree only.
+                            children.push((e.id, p, 0));
+                            continue;
+                        }
+                        let size = if e.kind == EntryKind::Dir { 0 } else { e.size };
+                        children.push((e.id, p, size));
+                    }
+                }
+                Object::Conflict(c) => children.extend(c.referenced_ids().into_iter().map(|i| (i, w.path.clone(), 0))),
+                _ => {}
+            }
+            for (cid, p, size) in children {
+                if !have(&cid) && seen.insert(cid) {
+                    if daemon {
+                        parents.insert(cid, w.id);
+                    }
+                    next.push((snap, p, cid, size));
+                }
+            }
+            content_bytes += raw.len() as u64;
+            if content_bytes > limit {
+                bail!(
+                    "what this thin clone checks out is larger than its object cache ({}); clone again with a larger \
+                     `--cache-size`, or with `--full`",
+                    veil_core::promisor::human(limit)
+                );
+            }
+            let written = match content.as_mut() {
+                Some(c) => c.put(w.id, raw, &w.path)?,
+                None => incoming.put(w.id, raw, &w.path)?,
+            };
+            if written {
+                report.objects_copied += 1;
+            }
+            Ok(())
+        };
+        if !asked.is_empty() {
+            let mut got = crate::thin::via_daemon(&client.url, client.identity(), &asked);
+            if !got.is_empty() {
+                let mut rest = Vec::new();
+                for (snap, path, id, size) in frontier.drain(..) {
+                    match got.remove(&id) {
+                        Some(raw) => handle(snap, &Want { path, id, snapshot: Some(snap) }, raw)?,
+                        None => rest.push((snap, path, id, size)),
+                    }
+                }
+                frontier = rest;
+            }
+        }
         // A snapshot's wants together: each request names few snapshots.
         frontier.sort_by_key(|f| f.0);
         let mut by_snap: HashMap<ObjectId, (Vec<Want>, Vec<u64>)> = HashMap::new();
@@ -1021,53 +1142,10 @@ pub fn pull_moving(
             wants.push(Want { path, id, snapshot: (key != snap).then_some(snap) });
             sizes.push(size);
         }
-        let mut next = Vec::new();
         for (snap, (wants, sizes)) in by_snap {
-            client.fetch_each(snap, &wants, &sizes, |w, raw| {
-                let obj = Object::decode(&raw)?;
-                let mut children = Vec::new();
-                match &obj {
-                    Object::Tree(t) => {
-                        for e in &t.entries {
-                            let p = if w.path.is_empty() { e.name.clone() } else { format!("{}/{}", w.path, e.name) };
-                            if !in_scope(only, &p) {
-                                continue;
-                            }
-                            if e.kind == EntryKind::Dir && only.is_some_and(|o| o.len() > p.len()) {
-                                // A directory on the way to `only`: its tree only.
-                                children.push((e.id, p, 0));
-                                continue;
-                            }
-                            let size = if e.kind == EntryKind::Dir { 0 } else { e.size };
-                            children.push((e.id, p, size));
-                        }
-                    }
-                    Object::Conflict(c) => children.extend(c.referenced_ids().into_iter().map(|i| (i, w.path.clone(), 0))),
-                    _ => {}
-                }
-                for (cid, p, size) in children {
-                    if !have(&cid) && seen.insert(cid) {
-                        next.push((w.snapshot.unwrap_or(snap), p, cid, size));
-                    }
-                }
-                content_bytes += raw.len() as u64;
-                if content_bytes > limit {
-                    bail!(
-                        "what this thin clone checks out is larger than its object cache ({}); clone again with a larger \
-                         `--cache-size`, or with `--full`",
-                        veil_core::promisor::human(limit)
-                    );
-                }
-                let written = match content.as_mut() {
-                    Some(c) => c.put(w.id, raw, &w.path)?,
-                    None => incoming.put(w.id, raw, &w.path)?,
-                };
-                if written {
-                    report.objects_copied += 1;
-                }
-                Ok(())
-            })?;
+            client.fetch_each(snap, &wants, &sizes, |w, raw| handle(w.snapshot.unwrap_or(snap), w, raw))?;
         }
+        drop(handle);
         frontier = next;
     }
     report.packs_written = incoming.finish()?;

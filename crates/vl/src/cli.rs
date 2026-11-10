@@ -709,6 +709,10 @@ pub enum Cmd {
     /// fetching everything (`vl partial full`).
     #[command(subcommand)]
     Partial(crate::thin::PartialCmd),
+    /// The Veil daemon: one object cache shared by every thin clone on this
+    /// machine (it runs by default; `vl daemon stop` turns it off).
+    #[command(subcommand)]
+    Daemon(crate::daemon::DaemonCmd),
 
     /// Hooks run before commits and pushes; repository-suggested ones only
     /// once this device trusts them (not implemented yet).

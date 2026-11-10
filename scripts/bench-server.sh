@@ -9,6 +9,7 @@
 #   scripts/bench-server.sh openscion   # the four OpenScion workloads, 1k and 10k files, Git beside
 #   scripts/bench-server.sh load        # the server's load curves (docs/design/scale/LOAD.md)
 #   scripts/bench-server.sh cache       # reads through a regional cache and straight from the server (S9)
+#   scripts/bench-server.sh daemon      # a fresh workspace and a thin clone with no, a cold and a warm Veil daemon (S6)
 #   scripts/bench-server.sh limits      # S24: quiet pulls (the middleware's cost), and quiet projects beside a flooded one
 #   scripts/bench-server.sh 1g -- --runs 5   # extra veil-bench flags
 #
@@ -33,8 +34,8 @@ if [[ "${1:-}" == "--" ]]; then
 fi
 EXTRA=("$@")
 case "$PROFILE" in
-    tiny|small|1g|5g|openscion|load|cache|limits) ;;
-    *) echo "usage: $0 [tiny|small|1g|5g|openscion|load|cache|limits] [-- veil-bench flags]" >&2; exit 2 ;;
+    tiny|small|1g|5g|openscion|load|cache|daemon|limits) ;;
+    *) echo "usage: $0 [tiny|small|1g|5g|openscion|load|cache|daemon|limits] [-- veil-bench flags]" >&2; exit 2 ;;
 esac
 
 STEP_LIMIT=${STEP_LIMIT:-3600}
@@ -125,6 +126,11 @@ case "$PROFILE" in
             echo "== the same workloads in one process, in memory (as OpenScion measures)"
             run "$BENCH" openscion-memory --out "${OUT%.json}-memory.json" || status=$?
         fi
+        ;;
+    daemon)
+        run "$BENCH" daemon --vl "$ROOT/target/release/vl" "${SERVER_ARGS[@]}" \
+            --dir "$WORK/daemon" --out "$OUT" "${EXTRA[@]}" || status=$?
+        [[ -f "${OUT%.json}.md" ]] && cat "${OUT%.json}.md"
         ;;
     load)
         # Each curve with its own server (and data directory).

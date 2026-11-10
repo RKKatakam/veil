@@ -32,6 +32,79 @@ pub struct HubPromisor {
     identity: Identity,
     client: Mutex<Option<Client>>,
     tips: Vec<ObjectId>,
+    /// Asked the server for grants (its tips) in this process (S6).
+    asked_grants: std::sync::atomic::AtomicBool,
+}
+
+// ---- reads through the Veil daemon (S6, `docs/HUB.md` §13.29) ----------------------
+
+/// Read grants this process received with the tips (`hub::pull`, or asked
+/// for by [`HubPromisor`]), by server and project: the grant key, and each
+/// grant by its projected root.
+struct Grants {
+    key: String,
+    by_root: std::collections::HashMap<ObjectId, String>,
+}
+
+static GRANTS: Mutex<Option<std::collections::HashMap<(String, String), Grants>>> = Mutex::new(None);
+
+/// Remember the grants of `tips` (the server's answer to this person's
+/// device) for reads through the daemon.
+pub fn remember_grants(url: &HubUrl, tips: &veil_core::hub::wire::Tips) {
+    let Some(key) = tips.grant_key.clone() else { return };
+    let mut by_root = std::collections::HashMap::new();
+    for token in tips.grants.values() {
+        if let Some(b) = veil_core::hub::grant::Grant::read_unverified(token) {
+            by_root.insert(b.root, token.clone());
+        }
+    }
+    let mut g = GRANTS.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(Default::default).insert((url.authority.clone(), url.project.clone()), Grants { key, by_root });
+}
+
+/// A grant remembered for projected root `root`, verified under the
+/// server's grant key and valid for at least another 30 s.
+pub(crate) fn grant_for(url: &HubUrl, root: &ObjectId) -> Option<(String, veil_core::hub::grant::Grant)> {
+    let g = GRANTS.lock().unwrap_or_else(|e| e.into_inner());
+    let set = g.as_ref()?.get(&(url.authority.clone(), url.project.clone()))?;
+    let token = set.by_root.get(root)?;
+    let grant = veil_core::hub::grant::Grant::verify(token, &set.key)?;
+    (grant.body.expires > veil_core::now_millis() + 30_000).then(|| (token.clone(), grant))
+}
+
+/// Is the daemon on (not turned off with `vl daemon stop`)?
+pub(crate) fn daemon_on() -> bool {
+    cfg!(unix) && !crate::daemon::paths().off.exists()
+}
+
+/// What the daemon serves of `wants` (each: the projected root it was met
+/// under, its chain from that root, its id): the objects that arrived, each
+/// checked against its id. Only wants under a remembered grant are asked.
+pub(crate) fn via_daemon(url: &HubUrl, identity: &Identity, wants: &[(ObjectId, Vec<ObjectId>, ObjectId)]) -> std::collections::HashMap<ObjectId, Vec<u8>> {
+    let mut by_root: std::collections::BTreeMap<ObjectId, Vec<(Vec<ObjectId>, ObjectId)>> = Default::default();
+    for (root, chain, id) in wants {
+        by_root.entry(*root).or_default().push((chain.clone(), *id));
+    }
+    let mut parts = Vec::new();
+    for (root, ws) in by_root {
+        let Some((token, grant)) = grant_for(url, &root) else { continue };
+        for part in ws.chunks(1_000) {
+            parts.push((token.clone(), grant.clone(), part.to_vec()));
+        }
+    }
+    // Up to 8 requests at once, as a fetch from the server.
+    let mut got = std::collections::HashMap::new();
+    for group in parts.chunks(8) {
+        let answers: Vec<Vec<(ObjectId, Vec<u8>)>> = std::thread::scope(|s| {
+            let hs: Vec<_> = group
+                .iter()
+                .map(|(token, grant, part)| s.spawn(move || crate::daemon::fetch_under(&url.authority, &url.project, identity, grant, token, part.clone())))
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+        });
+        got.extend(answers.into_iter().flatten());
+    }
+    got
 }
 
 /// The engine's error for a server that could not be reached or answered
@@ -63,8 +136,75 @@ impl HubPromisor {
     }
 }
 
+impl HubPromisor {
+    /// The objects of `wants` the daemon serves (by index), under grants of
+    /// the projected roots they were met at; the server's tips are asked
+    /// once per process for grants this process has none of.
+    fn through_daemon(&self, wants: &[Located]) -> Vec<Option<Vec<u8>>> {
+        let mut out = vec![None; wants.len()];
+        if !daemon_on() {
+            return out;
+        }
+        let placed: Vec<(usize, ObjectId, Vec<ObjectId>)> = wants
+            .iter()
+            .enumerate()
+            .filter_map(|(i, w)| w.chain.as_ref().map(|c| (i, c.first().copied().unwrap_or(w.id), c.clone())))
+            .collect();
+        if placed.is_empty() {
+            return out;
+        }
+        if placed.iter().any(|(_, root, _)| grant_for(&self.url, root).is_none()) && !self.asked_grants.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let tips = self.client().ok().and_then(|c| c.as_ref().and_then(|c| c.tips().ok().flatten()));
+            if let Some(t) = tips {
+                remember_grants(&self.url, &t);
+            }
+        }
+        let asked: Vec<(ObjectId, Vec<ObjectId>, ObjectId)> = placed.iter().map(|(i, root, chain)| (*root, chain.clone(), wants[*i].id)).collect();
+        let mut got = via_daemon(&self.url, &self.identity, &asked);
+        for (i, _, _) in placed {
+            out[i] = got.get(&wants[i].id).cloned();
+        }
+        got.clear();
+        out
+    }
+}
+
 impl Promisor for HubPromisor {
+    /// Through the daemon first (S6), then the server for whatever did not
+    /// arrive: only the server's own answer is ever "not there".
     fn fetch(&self, wants: &[Located]) -> veil_core::Result<Vec<Option<Vec<u8>>>> {
+        let mut out = self.through_daemon(wants);
+        let rest: Vec<Located> = wants.iter().zip(&out).filter(|(_, o)| o.is_none()).map(|(w, _)| w.clone()).collect();
+        if rest.is_empty() {
+            return Ok(out);
+        }
+        let mut direct = self.fetch_direct(&rest)?.into_iter();
+        for o in out.iter_mut().filter(|o| o.is_none()) {
+            *o = direct.next().flatten();
+        }
+        Ok(out)
+    }
+
+    fn history(&self, tips: &[ObjectId], limit: usize) -> veil_core::Result<Vec<(ObjectId, Vec<u8>)>> {
+        self.history_direct(tips, limit)
+    }
+
+    fn server_tips(&self) -> Vec<ObjectId> {
+        self.tips.clone()
+    }
+
+    fn generations(&self, snapshots: &[ObjectId]) -> veil_core::Result<Option<Vec<Option<u64>>>> {
+        self.generations_direct(snapshots)
+    }
+
+    fn resolve(&self, prefix: &str, from: &[ObjectId]) -> veil_core::Result<Option<veil_core::hub::wire::Resolved>> {
+        self.resolve_direct(prefix, from)
+    }
+}
+
+impl HubPromisor {
+    /// S1's `fetch` route, straight to the server.
+    fn fetch_direct(&self, wants: &[Located]) -> veil_core::Result<Vec<Option<Vec<u8>>>> {
         let Some(first) = wants.first() else { return Ok(Vec::new()) };
         let req = FetchRequest {
             snapshot: first.snapshot,
@@ -86,12 +226,12 @@ impl Promisor for HubPromisor {
             // this person may see. One want refused refuses the request:
             // each is asked for alone then.
             404 if wants.len() == 1 => Ok(vec![None]),
-            404 => wants.iter().map(|w| Ok(self.fetch(std::slice::from_ref(w))?.pop().flatten())).collect(),
+            404 => wants.iter().map(|w| Ok(self.fetch_direct(std::slice::from_ref(w))?.pop().flatten())).collect(),
             s => Err(self.refused(s, &out)),
         }
     }
 
-    fn history(&self, tips: &[ObjectId], limit: usize) -> veil_core::Result<Vec<(ObjectId, Vec<u8>)>> {
+    fn history_direct(&self, tips: &[ObjectId], limit: usize) -> veil_core::Result<Vec<(ObjectId, Vec<u8>)>> {
         if tips.is_empty() {
             return Ok(Vec::new());
         }
@@ -115,7 +255,7 @@ impl Promisor for HubPromisor {
             404 => {
                 let mut all = Vec::new();
                 for t in tips {
-                    all.extend(self.history(std::slice::from_ref(t), limit)?);
+                    all.extend(self.history_direct(std::slice::from_ref(t), limit)?);
                     if all.len() >= limit {
                         break;
                     }
@@ -126,11 +266,7 @@ impl Promisor for HubPromisor {
         }
     }
 
-    fn server_tips(&self) -> Vec<ObjectId> {
-        self.tips.clone()
-    }
-
-    fn generations(&self, snapshots: &[ObjectId]) -> veil_core::Result<Option<Vec<Option<u64>>>> {
+    fn generations_direct(&self, snapshots: &[ObjectId]) -> veil_core::Result<Option<Vec<Option<u64>>>> {
         let body = serde_json::to_vec(&veil_core::hub::wire::GenerationsRequest { snapshots: snapshots.to_vec() })?;
         for attempt in 0..20 {
             let (status, out) = self.post("/q/generations", body.clone())?;
@@ -151,7 +287,7 @@ impl Promisor for HubPromisor {
         Err(unavailable(&self.url, "the server kept preparing this history"))
     }
 
-    fn resolve(&self, prefix: &str, from: &[ObjectId]) -> veil_core::Result<Option<veil_core::hub::wire::Resolved>> {
+    fn resolve_direct(&self, prefix: &str, from: &[ObjectId]) -> veil_core::Result<Option<veil_core::hub::wire::Resolved>> {
         // Only letters and digits reach the URL (a prefix is hex or k–z).
         if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_alphanumeric()) {
             return Ok(Some(Default::default()));
@@ -188,7 +324,44 @@ pub fn attach(repo: &Repo, identity: &Identity) {
     let Some(Some(Ok(url))) = repo.config().remotes.get(&p.remote).map(|r| HubUrl::parse(&r.url)) else { return };
     let prefix = format!("{}/", p.remote);
     let tips = repo.view().remote_tags.iter().filter(|(k, _)| k.starts_with(&prefix)).map(|(_, v)| *v).collect();
-    repo.store().set_promisor(Arc::new(HubPromisor { url, identity: identity.clone(), client: Mutex::new(None), tips }));
+    // The daemon keeps what the working copies check out (S6): the trees
+    // of each workspace's snapshot and of its parents (on the server).
+    pin_working_copies(repo, &url);
+    repo.store().set_promisor(Arc::new(HubPromisor {
+        url,
+        identity: identity.clone(),
+        client: Mutex::new(None),
+        tips,
+        asked_grants: std::sync::atomic::AtomicBool::new(false),
+    }));
+}
+
+/// Tell a running daemon (it is not started for this) which trees this
+/// clone's working copies check out, so it never evicts them.
+fn pin_working_copies(repo: &Repo, url: &HubUrl) {
+    #[cfg(unix)]
+    {
+        if !daemon_on() || !crate::daemon::paths().socket.exists() {
+            return;
+        }
+        let mut roots = Vec::new();
+        for ws in repo.view().workspaces.values() {
+            let Ok(Some(s)) = repo.held().snapshot(&ws.wc) else { continue };
+            roots.push(s.tree);
+            for p in &s.parents {
+                if let Ok(Some(ps)) = repo.held().snapshot(p) {
+                    roots.push(ps.tree);
+                }
+            }
+        }
+        roots.sort();
+        roots.dedup();
+        roots.truncate(64);
+        let key = blake3::hash(repo.config().repo_id.as_bytes()).to_hex().to_string();
+        crate::daemon::pin(&url.authority, &url.project, &key, roots);
+    }
+    #[cfg(not(unix))]
+    let _ = (repo, url);
 }
 
 /// `vl partial`.
