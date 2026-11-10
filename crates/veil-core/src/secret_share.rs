@@ -42,8 +42,7 @@ pub const MAX_SHARES_PER_SHARER: i64 = 256;
 /// Names of personal private keys: never shared, whatever the policy says
 /// (`docs/VISIBILITY.md`, "Personal private keys never leave your machine").
 pub fn personal_key(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
-    matches!(name.as_str(), "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519")
+    crate::policy::personal_key_name(path).is_some()
 }
 
 /// May the file at `path` be shared under `policy`? Only a secret file the

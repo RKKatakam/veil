@@ -167,6 +167,19 @@ fn spells(name: &str, target: &str) -> bool {
     target.chars().all(|r| folded.next().is_some_and(|c| c.eq_ignore_ascii_case(&r))) && folded.next().is_none()
 }
 
+/// Names of personal private keys (`docs/VISIBILITY.md`, "Personal private
+/// keys never leave your machine"): always `isolated` on this device,
+/// whatever `.veilpolicy` says.
+pub const PERSONAL_KEYS: &[&str] = &["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"];
+
+/// The personal private key (`id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`)
+/// the leaf of `path` spells, if any (in any ASCII case and with
+/// HFS+-ignorable code points).
+pub(crate) fn personal_key_name(path: &str) -> Option<&'static str> {
+    let leaf = path.rsplit('/').next().unwrap_or(path);
+    PERSONAL_KEYS.iter().copied().find(|t| spells(leaf, t))
+}
+
 /// The VCS metadata directory (`.git`, `.jj`, …) `name` spells, if any
 /// (see [`BUILTIN_VCS_DIRS`]).
 pub fn vcs_metadata_name(name: &str) -> Option<&'static str> {
@@ -976,6 +989,35 @@ impl Policy {
         let mut c = Classification::unmatched();
         let name = crate::vpath::nfc(path.as_str());
         let (builtin, builtin_set) = builtin_rules();
+        if !is_dir {
+            if let Some(pk) = personal_key_name(&name) {
+                if let Some(vcs) = vcs_metadata(path, false) {
+                    let mut vc = Classification::unmatched();
+                    vc.mark_vcs(vcs);
+                    let user_offset = builtin.len();
+                    let mut umatched = vec![false; self.rules.len() - user_offset];
+                    for i in self.set.matches(&*name) {
+                        let r = &self.rules[user_offset + i / 2];
+                        if i % 2 == 1 || !r.dir_only {
+                            umatched[i / 2] = true;
+                        }
+                    }
+                    for (r, m) in self.rules[user_offset..].iter().zip(&umatched) {
+                        if *m {
+                            vc.apply(r);
+                        }
+                    }
+                    if vc.builtin_vcs {
+                        return vc;
+                    }
+                }
+                c.builtin_secret = true;
+                c.tier = Tier::Isolated;
+                c.allow_secrets = false;
+                c.rule = Some(pk.to_string());
+                return c;
+            }
+        }
         let hits = builtin_set.matches(&*name).into_iter().chain(self.set.matches(&*name).into_iter().map(|i| i + 2 * builtin.len()));
         let mut matched = vec![false; self.rules.len()];
         for i in hits {
@@ -2189,7 +2231,8 @@ mod tests {
         assert!(!w("s/.env cloak ops\n", "s/.env isolate\n", "s/.env"));
         assert!(w("", "t/ public!\n", "t/a"), "scanning turned off");
         assert!(!w("t/ public!\n", "", "t/a"));
-        assert!(w("k/ ignore\n", "k/ public!\n", "k/id_rsa"), "ignore lifted from a built-in secret");
+        assert!(w("k/ ignore\n", "k/ public!\n", "k/server.pem"), "ignore lifted from a built-in secret");
+        assert!(!w("k/ ignore\n", "k/ public!\n", "k/id_rsa"), "personal keys stay isolated under any rule");
         assert!(!w("build/ ignore\n", "", "build/out.txt"), "ignore lifted from an ordinary file");
         assert!(!w("", "x/.env.example cloak\n", "x/.env.example"), "public → cloaked strengthens");
         assert!(!w("", "x/ cloak\n", "x/a"), "public → isolated (a `cloak` line on what is not a secret) strengthens");
@@ -2437,19 +2480,44 @@ mod tests {
     fn publishing_an_artefact_is_a_weakening() {
         let c = |p: &str, path: &str| Policy::parse(p).classify(&VPath::new(path).unwrap(), false);
         let w = |a: &str, b: &str, path: &str| weakens(&c(a, path), &c(b, path));
-        assert!(!w("", "*.swp public!\n", "deploy/.id_ed25519.swp"), "still isolated through its base");
-        assert!(!w("", "id_ed25519 public!\n", "deploy/.id_ed25519.swp"), "still an ignored scratch file");
-        assert!(w("", "id_ed25519 public!\n*.swp public!\n", "deploy/.id_ed25519.swp"), "published with its base");
+        assert!(!w("", "*.swp public!\n", "deploy/.server.pem.swp"), "still isolated through its base");
+        assert!(!w("", "*.pem public!\n", "deploy/.server.pem.swp"), "still an ignored scratch file");
+        assert!(w("", "*.pem public!\n*.swp public!\n", "deploy/.server.pem.swp"), "published with its base");
+        assert!(!w("", "id_ed25519 public!\n*.swp public!\n", "deploy/.id_ed25519.swp"), "personal key artefact stays isolated");
         assert!(w("", "*.swp public!\n", "src/.main.rs.swp"), "the scratch rule lifted");
-        assert!(w("", "id_ed25519 public!\n", "deploy/id_ed25519.bak"), "its base published");
+        assert!(w("", "*.pem public!\n", "deploy/server.pem.bak"), "its base published");
+        assert!(!w("", "id_ed25519 public!\n", "deploy/id_ed25519.bak"), "personal key backup stays isolated");
         assert!(w("s/ cloak ops\n", "s/ cloak team\n", "s/a.pem.bak"), "another audience");
-        assert!(w("k/ ignore\n", "k/ public!\n", "k/id_rsa.bak"), "ignore lifted from a built-in secret's artefact");
-        assert!(!w("k/ ignore\n", "k/ public!\n", "k/.id_rsa.swp"), "the scratch rule still ignores it");
+        assert!(w("k/ ignore\n", "k/ public!\n", "k/server.pem.bak"), "ignore lifted from a built-in secret's artefact");
+        assert!(!w("k/ ignore\n", "k/ public!\n", "k/.server.pem.swp"), "the scratch rule still ignores it");
         assert!(!w("", "*.swp isolate\n", "src/.main.rs.swp"));
         assert!(!w("", "notes/ isolate\n", "notes/a.md.bak"), "strengthening");
-        let g = Policy::parse("id_ed25519 public!\n*.swp public!\n").guarded_by(Policy::parse(""));
-        let k = g.classify(&VPath::new("deploy/.id_ed25519.swp").unwrap(), false);
+        let g = Policy::parse("*.pem public!\n*.swp public!\n").guarded_by(Policy::parse(""));
+        let k = g.classify(&VPath::new("deploy/.server.pem.swp").unwrap(), false);
         assert_eq!((k.tier, k.held_back), (Tier::Isolated, Some((Tier::Public, true))));
+    }
+
+    #[test]
+    fn personal_private_keys_never_leave_isolated_tier() {
+        for key in ["id_ed25519", "id_rsa", "id_ecdsa", "id_dsa", "ID_ED25519", "id_\u{200c}rsa"] {
+            for prefix in ["", ".ssh/", "deploy/keys/"] {
+                let path = VPath::new(&format!("{prefix}{key}")).unwrap();
+                for line in [
+                    "",
+                    "* cloak team\n",
+                    "** cloak rule\n",
+                    "* public!\n",
+                    "* public\n",
+                    "* ignore\n",
+                    "deploy/ finance\n** cloak rule\n",
+                    "id_ed25519 cloak team\nid_rsa public!\nid_ecdsa ignore\nid_dsa public!\n",
+                ] {
+                    let pol = Policy::parse(line);
+                    assert_eq!(pol.classify(&path, false).tier, Tier::Isolated, "{path} under {line:?}");
+                    assert_eq!(pol.classify_link(&path).tier, Tier::Isolated, "symlink {path} under {line:?}");
+                }
+            }
+        }
     }
 
     #[test]

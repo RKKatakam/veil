@@ -761,6 +761,76 @@ pub(crate) fn push_closure(local: &Repo, tips: &[ObjectId], withheld: &Withheld)
     Ok(Ok(out))
 }
 
+/// Verify that none of the `(tree, parent_trees)` pairs introduces a
+/// personal private key (`id_ed25519`, `id_rsa`, `id_ecdsa`, `id_dsa`).
+/// Returns `Ok(())` when clean, or `Err(reason)` naming the offending path
+/// before any object leaves the repository.
+pub fn check_no_personal_keys(
+    store: &ObjectStore,
+    snaps: &[(ObjectId, Vec<ObjectId>)],
+) -> std::result::Result<(), String> {
+    let mut walked: HashSet<(ObjectId, Vec<ObjectId>)> = HashSet::new();
+    let mut stack: Vec<(ObjectId, Vec<ObjectId>, String, usize)> = Vec::new();
+    for (tree, parents) in snaps {
+        let mut ps = parents.clone();
+        ps.sort();
+        ps.dedup();
+        if !ps.contains(tree) {
+            stack.push((*tree, ps, String::new(), 0));
+        }
+    }
+    while let Some((tree, parents, path, depth)) = stack.pop() {
+        if depth > MAX_TREE_DEPTH {
+            continue;
+        }
+        let key = (tree, parents);
+        if !walked.insert(key.clone()) {
+            continue;
+        }
+        let Ok(raw) = store.get_raw(&tree) else {
+            continue;
+        };
+        if Object::tree_encoding(&raw).is_none() {
+            continue;
+        }
+        let Ok(t) = store.tree_object(&tree) else {
+            continue;
+        };
+        let mut ptrees = Vec::new();
+        for p in &key.1 {
+            if let Ok(r) = store.get_raw(p) {
+                if Object::tree_encoding(&r).is_some() {
+                    if let Ok(pt) = store.tree_object(p) {
+                        ptrees.push(pt);
+                    }
+                }
+            }
+        }
+        for e in &t.entries {
+            let p = if path.is_empty() { e.name.clone() } else { format!("{path}/{}", e.name) };
+            let before: Vec<&crate::object::TreeEntry> = ptrees.iter().filter_map(|pt| pt.get(&e.name)).collect();
+            if e.kind == crate::object::EntryKind::Dir {
+                if before.iter().any(|pe| pe.id == e.id) {
+                    continue;
+                }
+                let mut sub: Vec<ObjectId> = before
+                    .iter()
+                    .filter(|pe| pe.kind == crate::object::EntryKind::Dir)
+                    .map(|pe| pe.id)
+                    .collect();
+                sub.sort();
+                sub.dedup();
+                stack.push((e.id, sub, p, depth + 1));
+            } else if !before.iter().any(|pe| pe.id == e.id && pe.kind == e.kind)
+                && crate::secret_share::personal_key(&p)
+            {
+                return Err(format!("'{p}' is a personal private key: it never leaves your device"));
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---- what a push sends ----------------------------------------------------------
 
 /// Merge key rings and embargo records from `src` into `dst`.
@@ -1037,6 +1107,24 @@ pub fn push(
     let tips: Vec<ObjectId> = selected.iter().map(|(_, t)| t.target).collect();
     let ids = push_closure(local, &tips, &withheld)?
         .map_err(|why| VeilError::repo(format!("push: {why}")))?;
+    {
+        let dst_store = tx.repo().store().clone();
+        let mut new_snaps = Vec::new();
+        for id in &ids {
+            if !dst_store.has(id) {
+                if let Ok(s) = local.store().snapshot(id) {
+                    let parents: Vec<ObjectId> = s
+                        .parents
+                        .iter()
+                        .filter_map(|p| local.store().snapshot(p).ok().map(|ps| ps.tree))
+                        .collect();
+                    new_snaps.push((s.tree, parents));
+                }
+            }
+        }
+        check_no_personal_keys(local.store(), &new_snaps)
+            .map_err(|why| VeilError::repo(format!("push: {why}")))?;
+    }
     report.warnings.extend(withdrawn_warnings(local, &tips)?);
     {
         let dst = tx.repo().store().clone();

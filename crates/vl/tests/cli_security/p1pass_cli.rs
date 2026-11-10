@@ -1234,7 +1234,6 @@ fn bug_1801_access_line_grantee_edits_require_policy_accept_and_hold_back_in_ws_
 }
 
 #[test]
-#[ignore = "BUG-1802: Policy::classify allows cloak rules to override personal_key isolation and vl push uploads personal keys"]
 fn bug_1802_personal_private_keys_stay_isolated_and_never_upload_under_cloak_policy() {
     let env = Env::new();
 
@@ -1263,8 +1262,18 @@ fn bug_1802_personal_private_keys_stay_isolated_and_never_upload_under_cloak_pol
     hub.seed_login(&home, "alice", "TOKEN_1802");
     env.ok("alice", &clone, &["remote", "add", "hub", &hub.url("proj")]);
 
-    write(&clone, "id_ed25519", "PERSONAL_KEY_BYTES_NEVER_LEAVE_1802\n");
+    let key_marker = "PERSONAL_KEY_BYTES_NEVER_LEAVE_1802";
+    write(&clone, "id_ed25519", &format!("{key_marker}\n"));
     write(&clone, "notes.txt", "work\n");
+    let st: serde_json::Value = serde_json::from_str(&env.stdout("alice", &clone, &["status", "--json"])).unwrap();
+    let isolated: Vec<&str> = st["isolated"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v["path"].as_str().or_else(|| v.as_str()))
+        .collect();
+    assert!(isolated.contains(&"id_ed25519"), "vl status must report id_ed25519 as isolated: {st}");
+
     let cm = env.ok("alice", &clone, &["commit", "-m", "commit work"]);
     assert!(cm.contains("Committed"), "{cm}");
     env.ok("alice", &clone, &["tag", "set", "main", "-r", "@-"]);
@@ -1273,15 +1282,98 @@ fn bug_1802_personal_private_keys_stay_isolated_and_never_upload_under_cloak_pol
     let files = env.stdout("alice", &clone, &["files", "-r", "main"]);
     let _ = env.vl("alice", &clone, &["push", "hub"]);
 
-    let uploaded_objects = hub
+    let leaked_in_objects = hub
         .raw_requests()
         .into_iter()
         .filter(|(_, p, _)| p.ends_with("/objects"))
-        .count();
+        .any(|(_, _, body)| {
+            body.windows(b"id_ed25519".len()).any(|w| w == b"id_ed25519")
+                || body.windows(key_marker.len()).any(|w| w == key_marker.as_bytes())
+        });
     assert!(
-        !files.contains("id_ed25519") && uploaded_objects == 0,
-        "personal private key `id_ed25519` was recorded into snapshot (`{files}`) and uploaded ({uploaded_objects} /objects POSTs)"
+        !files.contains("id_ed25519") && !leaked_in_objects,
+        "personal private key `id_ed25519` was recorded into snapshot (`{files}`) or uploaded (`leaked_in_objects={leaked_in_objects}`)"
     );
+}
+
+#[test]
+fn class_1802_personal_private_keys_stay_isolated_under_every_policy_and_crafted_snapshots_never_upload() {
+    let env = Env::new();
+    let proj = env.project("alice", "proj-class-1802", &[("README.md", "hi\n")]);
+
+    let policies = [
+        "* cloak team\n",
+        "** cloak rule\n",
+        "* public!\n",
+        "* public\n",
+        "**/id_* ignore\n",
+        "id_ed25519 public!\nid_rsa cloak team\nid_ecdsa ignore\nid_dsa public\n*.swp public!\n",
+    ];
+    let keys = [
+        ("id_ed25519", "PK_ED25519_MARKER_1802"),
+        (".ssh/id_rsa", "PK_RSA_MARKER_1802"),
+        ("deploy/id_ecdsa", "PK_ECDSA_MARKER_1802"),
+        ("keys/id_dsa", "PK_DSA_MARKER_1802"),
+    ];
+    for (p, marker) in keys {
+        write(&proj, p, &format!("{marker}\n"));
+    }
+    write(&proj, "deploy/.id_ecdsa.swp", "PK_ECDSA_SWAP_1802\n");
+    write(&proj, "deploy/id_ecdsa.bak", "PK_ECDSA_BAK_1802\n");
+
+    for (idx, pol) in policies.iter().enumerate() {
+        write(&proj, ".veilpolicy", pol);
+        env.ok("alice", &proj, &["policy", "accept"]);
+        let st: serde_json::Value = serde_json::from_str(&env.stdout("alice", &proj, &["status", "--json"])).unwrap();
+        let isolated: Vec<&str> = st["isolated"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["path"].as_str().or_else(|| v.as_str()))
+            .collect();
+        for (k, _) in keys {
+            assert!(isolated.contains(&k), "policy #{idx} ({pol:?}) failed to isolate {k}: {st}");
+        }
+        env.ok("alice", &proj, &["commit", "-m", &format!("policy-{idx}")]);
+        let files = env.stdout("alice", &proj, &["files", "-r", "@-"]);
+        for name in ["id_ed25519", "id_rsa", "id_ecdsa", "id_dsa"] {
+            assert!(!files.contains(name), "policy #{idx} ({pol:?}) recorded {name}: {files}");
+        }
+    }
+
+    // Even under `* ignore` (which skips descending into ignored directories), root `id_ed25519`
+    // is listed as isolated in `vl status` and `vl policy check` classifies every personal key as isolated.
+    write(&proj, ".veilpolicy", "* ignore\n");
+    env.ok("alice", &proj, &["policy", "accept"]);
+    let st_ig: serde_json::Value = serde_json::from_str(&env.stdout("alice", &proj, &["status", "--json"])).unwrap();
+    let iso_ig: Vec<&str> = st_ig["isolated"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+    assert!(iso_ig.contains(&"id_ed25519"), "{st_ig}");
+    let chk = env.stdout("alice", &proj, &["policy", "check", "id_ed25519"]);
+    assert!(chk.contains("isolate"), "{chk}");
+
+    // Defense-in-depth: even if a crafted local snapshot tree directly contains `id_ed25519`,
+    // both `vl push` to a Veil server and `vl push` to a path remote refuse BEFORE sending any object.
+    let crafted_bare = env.dir("crafted-bare-1802");
+    evil_remote_on_disk(&crafted_bare, "crafted personal key", &["main"], |r| {
+        let k = blob(r, b"CRAFTED_PERSONAL_KEY_1802\n");
+        raw_tree(r, vec![file("id_ed25519", k)])
+    });
+    let crafted = env.root.join("crafted-1802");
+    env.ok("alice", &env.root, &["clone", crafted_bare.to_str().unwrap(), crafted.to_str().unwrap()]);
+    let hub = MockHub::start(&env, "hub-crafted-1802", &serde_json::json!({ "tips": null }));
+    let home = env.root.join("home-alice");
+    hub.seed_login(&home, "alice", "TOKEN_CRAFTED_1802");
+    env.ok("alice", &crafted, &["remote", "add", "hub", &hub.url("proj")]);
+    let push_hub = env.vl("alice", &crafted, &["push", "hub"]);
+    assert!(!push_hub.status.success() && text(&push_hub).contains("personal private key"), "{}", text(&push_hub));
+    let uploaded = hub.raw_requests().into_iter().filter(|(_, p, _)| p.ends_with("/objects")).count();
+    assert_eq!(uploaded, 0, "crafted personal key snapshot must fail before any /objects upload");
+
+    let bare = env.dir("bare-1802");
+    veil_core::Repo::init_bare(Arc::new(DiskBackend::new(&bare))).unwrap();
+    env.ok("alice", &crafted, &["remote", "add", "disk", bare.to_str().unwrap()]);
+    let push_disk = env.vl("alice", &crafted, &["push", "disk"]);
+    assert!(!push_disk.status.success() && text(&push_disk).contains("personal private key"), "{}", text(&push_disk));
 }
 
 #[cfg(target_os = "linux")]
