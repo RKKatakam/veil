@@ -739,10 +739,8 @@ impl Walk<'_, '_, '_> {
             self.rows.insert(px, row.clone());
             self.fill.add(self.g, self.t, px, &row)?;
             self.pending.push((px, row, ps.change_id));
-            if self.pending.len() >= 16 || self.fill.pending.len() >= 64 {
-                if self.inline_cap {
-                    return Err(bad("inline fill exceeded cap"));
-                }
+            if self.inline_cap && (self.pending.len() >= 16 || self.fill.pending.len() >= 64) {
+                return Err(bad("inline fill exceeded cap"));
             }
             if self.pending.len() >= ROWS_PER_STATEMENT || self.fill.pending.len() >= 4 * ROWS_PER_STATEMENT {
                 self.flush()?;
