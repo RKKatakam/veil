@@ -41,6 +41,7 @@ pub fn default_ws_base(ctx: &mut Ctx) -> Result<Option<ObjectId>> {
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn checks(
     ctx: &mut Ctx,
     rev: Option<&str>,

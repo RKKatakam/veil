@@ -16,7 +16,7 @@
 //! per batch, in one transaction. A change that overlaps is answered
 //! `conflict`, never landed over (content merges are S18).
 //!
-//! **Protected branches** ([`rules`]): only the landing service moves them;
+//! **Protected branches** ([`mod@rules`]): only the landing service moves them;
 //! a push to one lands its new changes instead.
 
 pub mod edits;

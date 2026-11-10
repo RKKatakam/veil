@@ -487,10 +487,8 @@ impl Ctx {
             if !self.repo.view().remote_tags.contains_key(&format!("origin/{branch}@tested")) {
                 if let Ok((client, _)) = crate::hub_cmd::client_for(self, "origin") {
                     if let Ok(Some(t)) = client.tested(branch) {
-                        if !self.repo.store().has(&t.snapshot) {
-                            if self.repo.is_partial() {
-                                let _ = self.repo.deepen(&[t.snapshot], 1);
-                            }
+                        if !self.repo.store().has(&t.snapshot) && self.repo.is_partial() {
+                            let _ = self.repo.deepen(&[t.snapshot], 1);
                         }
                         if self.repo.store().has(&t.snapshot) {
                             let mut cur = t.snapshot;
