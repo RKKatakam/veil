@@ -847,9 +847,12 @@ impl Packs {
         for name in unloaded {
             reads.fetch_add(1, Ordering::Relaxed);
             // Held under its share of the bound while it is read and
-            // searched; then the lookup maps' (BUG-1496).
+            // searched; then the lookup maps' (BUG-1496). If another server
+            // merged and deleted `name` after its grace period (S29), forget
+            // it here and keep searching.
             let Some(held) = read_index(&**store, &key(project, &name), &self.bound).await? else {
-                bail!("listed pack {name} of project {project} is not in the store");
+                self.forget(project, std::slice::from_ref(&name));
+                continue;
             };
             let slot = held.index.get(id);
             self.load(p, project, &name, &held.index);
@@ -894,6 +897,26 @@ impl Packs {
             m.loaded |= loaded;
         }
         self.evict_now(project);
+    }
+
+    /// Drop packs `names` from `project`'s in-memory lookup map (S29: packs
+    /// a merge or garbage-collection pass replaced and turned discarded).
+    pub fn forget(&self, project: i64, names: &[Arc<str>]) {
+        if names.is_empty() {
+            return;
+        }
+        for n in names {
+            self.staged.insert(name_key(project, n), None, 64);
+        }
+        let Some(p) = self.projects.lock().unwrap().get(&project).cloned() else {
+            return;
+        };
+        let mut m = p.map.write().unwrap();
+        for n in names {
+            m.names.remove(n);
+        }
+        let Map { names, packs, .. } = &mut *m;
+        packs.retain(|l| names.contains(&l.name));
     }
 
     fn evict_now(&self, project: i64) {
@@ -967,6 +990,12 @@ impl Packs {
             .bind(LISTED)
             .fetch_all(db)
             .await?;
+        {
+            let mut m = p.map.write().unwrap();
+            let current: HashSet<Arc<str>> = rows.iter().map(|n| Arc::<str>::from(n.as_str())).collect();
+            m.names.retain(|n| current.contains(n));
+            m.packs.retain(|l| current.contains(&l.name));
+        }
         self.load_listed(p, store, project, rows, reads).await?;
         *last = Some(began);
         Ok(())
@@ -1004,7 +1033,7 @@ impl Packs {
             }
             match set.join_next().await {
                 Some(Ok((name, Ok(Some(held))))) => self.load(p, project, &name, &held.index),
-                Some(Ok((name, Ok(None)))) => bail!("listed pack {name} of project {project} is not in the store"),
+                Some(Ok((name, Ok(None)))) => self.forget(project, &[name]),
                 // The rest stay unloaded (the tasks still running stop).
                 Some(Ok((_, Err(e)))) if indexes_full(&e) => break,
                 Some(Ok((_, Err(e)))) => return Err(e),
@@ -1036,6 +1065,12 @@ impl Packs {
     /// Record staged pack `name` of `project`, uploaded by `person`, before
     /// it is written: the database knows every upload in storage.
     pub async fn record_staged(&self, project: i64, person: i64, name: &str, size: u64, objects: usize) -> Result<()> {
+        self.record_staged_by(project, Some(person), name, size, objects).await
+    }
+
+    /// Record staged pack `name` of `project` (`person` `None`: written by
+    /// a merge or garbage-collection pass, S29) before it is written.
+    pub async fn record_staged_by(&self, project: i64, person: Option<i64>, name: &str, size: u64, objects: usize) -> Result<()> {
         let Some(db) = &self.db else { return Ok(()) };
         sqlx::query("INSERT INTO packs (project_id, name, state, person_id, size, objects, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
             .bind(project)
@@ -1188,13 +1223,16 @@ impl Packs {
         let gone: Vec<String> = match &self.db {
             Some(db) => {
                 let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
-                sqlx::query_scalar("UPDATE packs SET state = $3 WHERE project_id = $1 AND name = ANY($2) AND state = $4 RETURNING name")
-                    .bind(project)
-                    .bind(&names)
-                    .bind(DISCARDED)
-                    .bind(STAGED)
-                    .fetch_all(db)
-                    .await?
+                sqlx::query_scalar(
+                    "UPDATE packs SET state = $3, discarded_at = $5 WHERE project_id = $1 AND name = ANY($2) AND state = $4 RETURNING name",
+                )
+                .bind(project)
+                .bind(&names)
+                .bind(DISCARDED)
+                .bind(STAGED)
+                .bind(veil_core::now_millis())
+                .fetch_all(db)
+                .await?
             }
             None => names.iter().map(|n| n.to_string()).collect(),
         };
@@ -2262,6 +2300,7 @@ mod tests {
             landing: Default::default(),
             events: Default::default(),
             embargo: Default::default(),
+            pack_gc: Default::default(),
             limits: crate::limits::Limits::new(Default::default(), 1),
         });
         let all_slots: Vec<(ObjectId, Slot)> = sorted_ids.iter().map(|id| (*id, valid_idx.get(id).unwrap())).collect();
@@ -2452,6 +2491,7 @@ mod tests {
             landing: Default::default(),
             events: Default::default(),
             embargo: Default::default(),
+            pack_gc: Default::default(),
             limits: crate::limits::Limits::new(Default::default(), 1),
         });
         let total_objs = MAX_OBJECTS + 50_000;

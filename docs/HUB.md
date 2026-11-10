@@ -5238,3 +5238,38 @@ migration `0026_bisect_and_revert.sql` (`landing_queue.priority`,
 | 3 | Flaky check immunity (design §6 Threat 14): a single failure or infrastructure flake never reverts anything | `confirming` phase requires `run_count >= 2` failures on `culprit` and a `pass` on `culprit_parent`; a passing re-run or failing parent marks `phase = "flaky"` | `only_confirmed_culprit_is_reverted_and_flaky_check_never_reverts` |
 | 4 | Per-viewer visibility (`docs/VISIBILITY.md`) and embargo safety (design §6 Threat 9): nothing hidden leaks in revert commits, messages, SSE events, or status; embargoed changes never bisect or revert into public branches | `embargo/*` and withheld snapshots are excluded from bisect; `status_route`, `emit_check_requested`, and `emit_reverted` filter by `can_see_check` and `visible_projection` | `nothing_hidden_leaks_in_revert_messages_events_or_status_and_embargo_never_reverts_early` |
 | 5 | Bounded and safe across multiple servers and restarts: one bisect per branch at a time, and a revert lands at most once | `bisect_leases` fences concurrent servers per `(project_id, branch)`; `bisect_reverts` and deterministic `revert-…` tickets guarantee at-most-once revert landing | `bisect_and_revert_are_bounded_and_safe_across_two_servers_and_restarts` |
+
+### 13.37 S29: merging packs and pack garbage collection (`crates/veil-server/src/pack_gc.rs`, `migrations/0027_pack_gc.sql`, built)
+
+Design: [`docs/design/server/storage-and-cost.md` §8](design/server/storage-and-cost.md).
+
+* **Why.** S28 packs every push into one storage object (`veilpack3\n`), read by range. Over thousands of small pushes a project accumulates thousands of small packs (`pack::Packs` searches their indexes newest first), and unreferenced objects—from force-pushes, deleted branches, superseded S15 search segments, and abandoned staged uploads—stay in storage until reclaimed. S29 adds a bounded background compaction and garbage-collection job per project (`pack_gc::run_project`, `pack_gc::maybe_schedule`).
+* **Schema (`migrations/0027_pack_gc.sql`, migration 27).**
+  * `packs.discarded_at BIGINT`: millisecond timestamp set when a pack transitions to `DISCARDED` (`state = 2`), either because an upload was refused/abandoned or because a merge/GC pass replaced a listed pack.
+  * `unreferenced_objects (project_id BIGINT, object_id TEXT, since_ms BIGINT, PRIMARY KEY (project_id, object_id))`: records when an object in `project_id` was first observed to be unreferenced by any live root, enforcing the retention window (`DEFAULT_RETENTION_WINDOW_MS`, 1 hour by default) before deletion so S3 thin clones (which keep no server anchors) and racing pushes never see an object vanish under them.
+* **Crash-safe write-then-switch-then-delete.** A pack is never edited in place:
+  1. **Per-project advisory lock and shedding:** one server at a time runs `pack_gc` on a project (`pg_try_advisory_lock(LOCK_BASE ^ project_id)` on `derive.db`), acquiring a background worker permit (`derive::Workers::permit`) and yielding to landings and pushes via `limits.derive_turn()` (`limits::DERIVE_PAUSE`).
+  2. **Bounded index and object reads:** source pack indexes are read one at a time under `pack::INDEXES_HELD` (`Objects::index_bound`), deduplicating objects across the batch and filtering out any expired-unreferenced objects. Live entries are copied in contiguous range spans (`COPY_SPAN = 2 MiB`) under `store::ReadAhead` (`store::DECODED_IN_FLIGHT`), verifying every entry header (`pack::entry`), and written as new `STAGED` job packs (`person_id IS NULL`, capped at `MAX_MERGED_BYTES = 32 MiB` and `pack::MAX_OBJECTS = 262,144`) via `Objects::put_job_pack` (which inserts the `STAGED` row before writing the storage object).
+  3. **Atomic switch transaction:** in one `READ COMMITTED` transaction (`db::transaction`), the job locks the replaced packs (`SELECT ... FOR UPDATE`), verifies they are still `LISTED` (and, when GC drops unreferenced objects, verifies the project's ref/push stamp `RefStamp` is unchanged), updates the new pack(s) to `LISTED` (`state = 1`), and marks the replaced packs `DISCARDED` (`state = 2`, `discarded_at = now_ms`).
+  4. **Cross-server lookup coherence:** the server that ran the switch calls `Objects::listed_here` and `Objects::forget_packs` (`Packs::forget`). Other servers prune unlisted packs on `Packs::refresh_in`, and if a ranged read (`Objects::try_pack_range`, `Objects::stored`, `Objects::get_blocking`, `Packs::find_paged_in`) encounters a pack that was already merged and swept after its grace window, it forgets that pack and refreshes the project's listing seamlessly without surfacing an error.
+  5. **Grace-period sweep:** once `now_ms - discarded_at >= pack_grace_ms`, `sweep_discarded` deletes the storage object (`store.delete`) and then deletes the `DISCARDED` row from `packs`. Uncommitted job packs from an interrupted run (`state = 0 AND person_id IS NULL`) and abandoned client uploads older than `staged_grace_ms` are discarded and swept by `sweep_staged`.
+* **Garbage collection reachability closure.** `mark_and_sweep_loose` walks the object graph starting from all server roots of the project:
+  * all `branches` (both public branches and hidden embargo branches `embargo/<id>` where `hidden_for_embargo IS NOT NULL`),
+  * `embargo_lines` (`record_json`) and `embargo_snapshots` (S22),
+  * `change_refs` (S10 API commits),
+  * `landing_queue` (`stack` and `result` JSON) and `landings` (S17, S18),
+  * `checks` and `tested` (S19 CI results),
+  * `tags` and `pr_revisions` / `prs` (when present) and `Atag` tag objects,
+  * `Snapshot` trees, parents, predecessors, and S11 `attempts`,
+  * `origins` and `projections` memos for reachable snapshots (and standalone projection memos),
+  * S12 `graph.changed` derived objects and S15 `search_shards.segments` for live branches and the project-wide `names` index,
+  * and every object in an active `STAGED` upload pack (`state = 0`).
+
+| # | Guarantee | Test (`server_hub::pack_gc`) |
+|---|---|---|
+| 1 | Merging never loses or changes an object (`get`, `get_many`, `get_range`, `get_staged`), with concurrent readers across two servers and crashes mid-merge (pre-switch and post-switch) | `guarantee_1_merging_never_loses_or_changes_an_object_across_servers_and_crashes` |
+| 2 | GC deletes only what nothing references (branch, tag, PR, embargo line, landing queue, S11 attempt, S19 CI result, projection memo, S15 search segment, S28 staged upload), respects the retention window, and never deletes an object a racing push is about to reference | `guarantee_2_gc_deletes_only_unreferenced_objects_respects_retention_window_and_racing_push` |
+| 3 | GC never deletes a hidden embargo line's objects before release | `guarantee_3_embargoed_objects_never_deleted_before_release` |
+| 4 | Merge and GC work per run, memory (`INDEXES_HELD`, `DECODED_IN_FLIGHT`) and storage requests are bounded, and yield to landings and pushes (`limits::DERIVE_PAUSE`) | `guarantee_4_merge_and_gc_are_bounded_and_yield_to_landings_and_pushes` |
+| 5 | Storage objects, bytes, and merge storage requests before and after merging 10,000 small pushes | `guarantee_5_cost_of_merging_10000_small_pushes` |
+
