@@ -335,16 +335,23 @@ fn bug_1593_a_landing_is_one_database_commit() {
                         UNION ALL SELECT xmin::text::bigint FROM audit_log WHERE project_id = $1 \
                         UNION ALL SELECT xmin::text::bigint FROM change_refs WHERE project_id = $1 \
                         UNION ALL SELECT xmin::text::bigint FROM projections WHERE project_id = $1 \
-                        UNION ALL SELECT xmin::text::bigint FROM derived_snapshots WHERE project_id = $1 \
-                        UNION ALL SELECT xmin::text::bigint FROM derived_branch_rules WHERE project_id = $1 \
-                        UNION ALL SELECT xmin::text::bigint FROM derived_graph WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM graph WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM file_history WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM rule_history WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM rule_lines WHERE project_id = $1 \
                         UNION ALL SELECT xmin::text::bigint FROM derive_progress WHERE project_id = $1 \
                         UNION ALL SELECT xmin::text::bigint FROM view_file_history WHERE project_id = $1 \
                         UNION ALL SELECT xmin::text::bigint FROM view_graph WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM view_fills WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM view_changes WHERE project_id = $1 \
                         UNION ALL SELECT xmin::text::bigint FROM view_access WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM search_heads WHERE project_id = $1 \
                         UNION ALL SELECT xmin::text::bigint FROM search_shards WHERE project_id = $1 \
                         UNION ALL SELECT xmin::text::bigint FROM landing_queue WHERE project_id = $1 \
                         UNION ALL SELECT xmin::text::bigint FROM landing_leases WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM landings WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM landed_from WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM landed_changes WHERE project_id = $1 \
                         UNION ALL SELECT xmin::text::bigint FROM access_epochs WHERE project_id = $1 \
                     ) t WHERE x >= $2",
                 )
