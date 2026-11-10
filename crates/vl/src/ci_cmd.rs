@@ -16,9 +16,15 @@ use crate::{
 };
 
 /// Default base for `vl ws new` when `-r` is not specified: `main@tested`
-/// from `origin` (or the local `origin/main@tested` remote tag) when a tested
-/// snapshot exists, else `None` (caller falls back to `@-`).
+/// from the local `origin/main@tested` remote tag (or `origin` when not yet
+/// pulled locally) when a tested snapshot exists, else `None` (caller falls
+/// back to `@-`).
 pub fn default_ws_base(ctx: &mut Ctx) -> Result<Option<ObjectId>> {
+    if let Some(&tested_id) = ctx.repo.view().remote_tags.get("origin/main@tested") {
+        if ctx.repo.store().has(&tested_id) {
+            return Ok(Some(tested_id));
+        }
+    }
     if let Ok((client, cfg)) = client_for(ctx, "origin") {
         if let Ok(Some(tips)) = client.tips() {
             let branch = &tips.default_branch;
@@ -30,11 +36,6 @@ pub fn default_ws_base(ctx: &mut Ctx) -> Result<Option<ObjectId>> {
                     return Ok(Some(tested_id));
                 }
             }
-        }
-    }
-    if let Some(&tested_id) = ctx.repo.view().remote_tags.get("origin/main@tested") {
-        if ctx.repo.store().has(&tested_id) {
-            return Ok(Some(tested_id));
         }
     }
     Ok(None)
