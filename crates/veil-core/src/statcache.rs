@@ -334,23 +334,40 @@ impl StatCache {
     /// Start a build: drop everything if the key changed, then hand the
     /// records to a [`CacheRun`]. Finish with [`StatCache::end_run`].
     pub(crate) fn begin_run(&mut self, key: CacheKey, clock: StatClock) -> CacheRun {
-        if self.key.as_ref() != Some(&key) {
+        let key_changed = self.key.as_ref() != Some(&key);
+        if key_changed {
             self.records.clear();
             self.key = Some(key);
             self.dirty = true;
         }
         let old = std::mem::take(&mut self.records);
         CacheRun {
-            new: HashMap::with_capacity(old.len()),
+            new: HashMap::new(),
             old_len: old.len(),
             old,
             verified_at: clock.now,
             exact: clock.exact,
             changed: false,
+            key_changed,
+            visited_dirs: None,
         }
     }
 
-    pub(crate) fn end_run(&mut self, run: CacheRun) {
+    pub(crate) fn end_run(&mut self, mut run: CacheRun) {
+        if let Some((visited, deleted_prefixes)) = run.visited_dirs.take() {
+            if visited.is_empty() && deleted_prefixes.is_empty() && run.new.is_empty() && !run.changed {
+                self.records = run.old;
+                return;
+            }
+            run.old.retain(|path, _| {
+                let dir = path.parent().unwrap_or_else(VPath::root);
+                !visited.contains(&dir) && !deleted_prefixes.iter().any(|p| path.starts_with(p))
+            });
+            run.old.extend(run.new);
+            self.dirty |= run.changed || run.old.len() != run.old_len;
+            self.records = run.old;
+            return;
+        }
         self.dirty |= run.changed || run.new.len() != run.old_len;
         self.records = run.new;
     }
@@ -367,6 +384,11 @@ pub(crate) struct CacheRun {
     verified_at: i64,
     exact: bool,
     changed: bool,
+    pub(crate) key_changed: bool,
+    /// When set (a watched partial build): the directories actually listed
+    /// during this run, and the directory prefixes deleted from the tree.
+    /// Records in `old` outside these directories are kept untouched.
+    pub(crate) visited_dirs: Option<(std::collections::HashSet<VPath>, Vec<VPath>)>,
 }
 
 impl CacheRun {
@@ -374,6 +396,22 @@ impl CacheRun {
     #[cfg(feature = "os")]
     pub(crate) fn len(&self) -> usize {
         self.old_len
+    }
+
+    pub(crate) fn enable_partial(&mut self) {
+        self.visited_dirs = Some((std::collections::HashSet::new(), Vec::new()));
+    }
+
+    pub(crate) fn note_visited_dir(&mut self, dir: &VPath) {
+        if let Some((visited, _)) = &mut self.visited_dirs {
+            visited.insert(dir.clone());
+        }
+    }
+
+    pub(crate) fn note_deleted_dir(&mut self, dir: VPath) {
+        if let Some((_, deleted)) = &mut self.visited_dirs {
+            deleted.push(dir);
+        }
     }
 
     /// [`CacheRun::trusted`], moved out of the last run's records: carried

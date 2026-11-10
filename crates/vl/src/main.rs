@@ -366,6 +366,9 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             print_files(&ctx.repo, &ctx.repo.snapshot(&id)?.tree)?;
         }
         Cmd::Ls { paths, rev, all, out } => {
+            if *all && !cli.no_snapshot {
+                ctx.ensure_full_report()?;
+            }
             let ls = api::ls(ctx, rev, paths, *all, !cli.no_snapshot)?;
             match out.json {
                 true => api::emit_json(&ls)?,

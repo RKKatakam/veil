@@ -27,6 +27,8 @@ pub mod proto;
 mod serve;
 #[cfg(unix)]
 pub mod store;
+#[cfg(unix)]
+pub mod watch;
 
 use std::path::{Path, PathBuf};
 
@@ -410,16 +412,20 @@ mod client {
         }
         let mut seen = std::collections::HashSet::new();
         let mut since_object = Instant::now();
+        let step_wait = match req {
+            Request::Batch { .. } => BETWEEN_OBJECTS,
+            _ => Duration::from_secs(2),
+        };
         let failed = |got| {
             give_up();
             (got, None)
         };
         loop {
-            if since_object.elapsed() > BETWEEN_OBJECTS {
+            if since_object.elapsed() > step_wait {
                 return failed(got);
             }
             let Ok((kind, len)) = proto::read_head(&mut r, MAX_OBJECT + 32) else { return failed(got) };
-            let Ok(payload) = proto::read_object(&mut r, len, since_object + BETWEEN_OBJECTS) else { return failed(got) };
+            let Ok(payload) = proto::read_object(&mut r, len, since_object + step_wait) else { return failed(got) };
             match kind {
                 proto::P => {}
                 proto::O => {
@@ -449,6 +455,23 @@ mod client {
         let wanted: std::collections::HashSet<ObjectId> = batch.wants.iter().map(|w| w.id).collect();
         let req = Request::Batch { upstream: authority.to_string(), project: project.to_string(), batch };
         request(s, &req, &|id| wanted.contains(id)).0
+    }
+
+    /// Ask the daemon (starting it if needed, unless turned off with `vl
+    /// daemon stop`) to watch working copy `root` and report what changed
+    /// since `token`.
+    pub fn watch(root: & std::path::Path, token: Option<&str>) -> Option<super::watch::WatchReply> {
+        let s = connect_or_start()?;
+        let max_dirs = std::env::var("VEIL_WATCH_MAX_DIRS").ok().and_then(|v| v.parse().ok());
+        let max_dirty_paths = std::env::var("VEIL_WATCH_MAX_DIRTY").ok().and_then(|v| v.parse().ok());
+        let req = Request::Watch {
+            root: root.to_path_buf(),
+            token: token.map(str::to_string),
+            max_dirs,
+            max_dirty_paths,
+        };
+        let body = request(s, &req, &|_| false).1?.body?;
+        serde_json::from_value(body).ok()
     }
 
     /// Ask the running daemon (never started for this) to pin `roots` for
@@ -582,6 +605,8 @@ fn print_status(p: &Paths) {
     let ups: Vec<String> = s["upstreams"].as_array().map(|a| a.iter().filter_map(|u| u.as_str().map(|x| crate::render::safe(x).to_string())).collect()).unwrap_or_default();
     println!("  servers   {}", if ups.is_empty() { "none yet".into() } else { ups.join(", ") });
     println!("  following {} project(s); access confirmed for {} grant(s)", n(&s["follows"]), n(&s["confirmed"]));
+    let watched_wcs = s["watching"].as_array().map_or(0, Vec::len);
+    println!("  watching  {} working cop(ies), {} director(ies)", watched_wcs, n(&s["watched_dirs"]));
     println!("  {}", dim("objects only: tips, grants, history and pushes always go to the server"));
 }
 
