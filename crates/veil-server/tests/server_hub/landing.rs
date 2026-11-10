@@ -5626,5 +5626,493 @@ fn merge_attempts_cap_at_three_and_veilattributes_govern_content_merge() {
     assert_eq!(capped["merges"], veil_server::landing::merge::MAX_MERGES, "{capped}");
 }
 
+// ---- S18 review (s18r1): guarantees 1–6 and BUG-1682..BUG-1684 ------------------------------
 
+/// S18 Guarantee 3 across merge retries, server restart (`landing::resume`),
+/// and two servers (`TestHub::beside`): a change that is content-merged across
+/// retries, interrupted in `state = 'merging'` across a server restart, and
+/// served beside a second server still lands on `main` at most once.
+#[test]
+fn a_requeued_change_lands_at_most_once_across_retries_restarts_and_two_servers() {
+    let hub = TestHub::start();
+    let beside = TestHub::beside(&hub);
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let api2 = beside.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
 
+    let initial = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n";
+    let base0 = tip_for(&hub, &admin_tok, &p.name);
+    let s = land(&api, &admin_tok, &p.name, base0, json!([put("src/lib.rs", initial)]), true).json();
+    assert_eq!(s["state"], "landed", "{s}");
+    let main0 = real_tip(&hub, pid);
+
+    let admin_base = tip_for(&hub, &admin_tok, &p.name);
+    let dev_base = tip_for(&hub, &dev_tok, &p.name);
+    let a1 = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        admin_base,
+        json!([put("src/lib.rs", "A1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n")]),
+        true,
+    )
+    .json();
+    assert_eq!(a1["state"], "landed", "{a1}");
+
+    // Hold the lease so we can simulate a server crash while the entry is in
+    // `state = 'merging'`, then call `landing::resume` on both servers and let
+    // them race to merge and land it.
+    hold(&hub, pid);
+    let mut d = Craft::new(&api2, &p.dev, &p.name, "main");
+    d.tip = dev_base;
+    d.root = d.tree_of(dev_base);
+    d.file("src/lib.rs", "l1\nl2\nl3\nl4\nl5\nl6\nl7\nDEV8\n");
+    let cid = veil_core::ChangeId::random();
+    let snap = snap_at(&mut d, dev_base, cid, "dev line 8", veil_core::now_millis(), vec![]);
+    let up = d.api.upload(&d.token, &d.project, &d.objects);
+    assert_eq!(up.status, 200);
+    let receipts = up.json()["receipts"].as_array().unwrap().clone();
+    let map: serde_json::Map<String, Value> = d.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+
+    let q = api2
+        .post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/land", p.name),
+            &json!({"onto": "main", "snapshot": snap.hex(), "receipts": map, "wait": false}),
+        )
+        .json();
+    assert_eq!(q["state"], "queued", "{q}");
+    let ticket = q["ticket"].as_str().unwrap().to_string();
+
+    // Simulate a server crash after transitioning the row to `merging` on merge retry 1,
+    // while another non-overlapping line of `src/lib.rs` moves on `main`.
+    let h1 = hub.hub();
+    let h2 = beside.hub();
+    hub.rt.block_on(async {
+        sqlx::query("UPDATE landing_queue SET state = 'merging', merges = 1 WHERE project_id = $1 AND ticket = $2")
+            .bind(pid)
+            .bind(&ticket)
+            .execute(&h1.db)
+            .await
+            .unwrap();
+    });
+    let mut c2 = Craft::new(&api, &p.admin, &p.name, "main");
+    c2.file("src/lib.rs", "A1\nA2\nl3\nl4\nl5\nl6\nl7\nl8\n");
+    let pr = c2.push("main", "admin line 2");
+    assert_eq!(pr.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&pr.body));
+
+    release(&hub, pid);
+    hub.rt.block_on(async {
+        veil_server::landing::resume(h1).await;
+        veil_server::landing::resume(h2).await;
+    });
+
+    let out = outcome(&api2, &dev_tok, &p.name, &ticket);
+    assert_eq!(out["state"], "landed", "resumed entry across two servers should merge and land: {out}");
+    assert_eq!(out["merges"], 2, "entry should record 2 merges (1 before restart + 1 after): {out}");
+    assert_eq!(
+        real_file(&hub, pid, "src/lib.rs").as_deref(),
+        Some(&b"A1\nA2\nl3\nl4\nl5\nl6\nl7\nDEV8\n"[..]),
+    );
+
+    let landed_cids: Vec<_> = chain(&hub, pid, main0).into_iter().map(|(_, s)| s.change_id).collect();
+    assert_eq!(
+        landed_cids.iter().filter(|c| **c == cid).count(),
+        1,
+        "change must land at most once across retries, restart, and two servers: {landed_cids:?}"
+    );
+
+    // Submitting a rebased/amended revision with the same `change_id` and further edits
+    // is refused as already landed and never lands a second time.
+    let mut d2 = Craft::new(&api, &p.dev, &p.name, "main");
+    d2.tip = dev_base;
+    d2.root = d2.tree_of(dev_base);
+    d2.file("src/lib.rs", "l1\nl2\nl3\nl4\nl5\nl6\nl7\nDEV8\n");
+    d2.file("src/extra.rs", "extra\n");
+    let snap2 = snap_at(&mut d2, dev_base, cid, "dev line 8 amended", veil_core::now_millis() + 1, vec![snap]);
+    let up2 = d2.api.upload(&d2.token, &d2.project, &d2.objects);
+    assert_eq!(up2.status, 200);
+    let rec2 = up2.json()["receipts"].as_array().unwrap().clone();
+    let map2: serde_json::Map<String, Value> = d2.objects.iter().zip(rec2).map(|((id, _), r)| (id.hex(), r)).collect();
+    let r2 = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "snapshot": snap2.hex(), "receipts": map2, "wait": true}),
+    );
+    assert_eq!(r2.status, 400, "amended revision of landed content-merged change must be refused: {}", String::from_utf8_lossy(&r2.body));
+}
+
+/// S18 Guarantee 4 (`limits::leave_gates`): Open SSE event streams release their
+/// bulkhead places before waiting, so open streams never fill the project's
+/// bulkhead gate or block other requests.
+#[test]
+fn open_event_streams_hold_no_bulkhead_place_while_waiting() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let dev_tok = p.dev.token();
+    let fin_tok = p.fin.token();
+    let admin_tok = p.admin.token();
+    let h = hub.hub();
+
+    let mut streams = Vec::new();
+    for tok in [&dev_tok, &fin_tok, &admin_tok] {
+        for _ in 0..4 {
+            let resp = api.get_unread(
+                &format!("/v1/projects/{}/events", p.name),
+                &[("authorization", &format!("Bearer {tok}"))],
+            );
+            assert_eq!(resp.status().as_u16(), 200);
+            streams.push(resp);
+        }
+    }
+    assert_eq!(h.events.open_total(), 12, "12 event streams should be open");
+
+    // Because `events::open` calls `limits::leave_gates()`, the 12 open streams
+    // hold 0 places in the server and project bulkhead gates.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while h.limits.load(Some(&p.name)) != (0, 0) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        h.limits.load(Some(&p.name)),
+        (0, 0),
+        "open SSE streams must hold no bulkhead place while waiting"
+    );
+
+    // Ordinary reads and landings on the project still succeed immediately while 12 streams wait.
+    let base = tip_for(&hub, &admin_tok, &p.name);
+    let r = land(&api, &admin_tok, &p.name, base, json!([put("src/gate-ok.rs", "ok\n")]), true).json();
+    assert_eq!(r["state"], "landed", "{r}");
+    drop(streams);
+}
+
+/// S18 Guarantee 5: Events reach only their submitter, or people who could see
+/// the submission, checked against the access epochs at send time. Removing a
+/// subscriber's access takes effect on the very next event emitted.
+#[test]
+fn events_reach_only_authorized_viewers_and_respect_access_epochs_at_send_time() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+    let fin_tok = p.fin.token();
+
+    // Grant `dev` temporary access to `finance` and open SSE streams for `dev` and `fin`.
+    p.admin.ok(&p.dir, &["group", "add", "finance", &p.dev.name]);
+    let dev_stream = api.get_unread(
+        &format!("/v1/projects/{}/events", p.name),
+        &[("authorization", &format!("Bearer {dev_tok}"))],
+    );
+    assert_eq!(dev_stream.status().as_u16(), 200);
+    let fin_stream = api.get_unread(
+        &format!("/v1/projects/{}/events", p.name),
+        &[("authorization", &format!("Bearer {fin_tok}"))],
+    );
+    assert_eq!(fin_stream.status().as_u16(), 200);
+
+    // While `dev` is in `finance`, a billing-only landing emits `main.moved` to `dev`.
+    let invoice = format!("{BILL_DIR}/acme/epoch-1.txt");
+    let fin_base1 = tip_for(&hub, &fin_tok, &p.name);
+    let l1 = land(&api, &fin_tok, &p.name, fin_base1, json!([put(&invoice, "v1\n")]), true).json();
+    assert_eq!(l1["state"], "landed", "{l1}");
+    let ev1 = read_sse_events(dev_stream, 1, Duration::from_secs(3));
+    assert_eq!(ev1.len(), 1, "dev in finance should receive main.moved: {ev1:?}");
+    assert_eq!(ev1[0].0, "main.moved");
+
+    // Re-open `dev`'s stream while still in `finance`, then immediately remove `dev`
+    // from `finance` BEFORE the next billing-only landing happens.
+    let dev_stream2 = api.get_unread(
+        &format!("/v1/projects/{}/events", p.name),
+        &[("authorization", &format!("Bearer {dev_tok}"))],
+    );
+    assert_eq!(dev_stream2.status().as_u16(), 200);
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.dev.name]);
+
+    // Next billing-only landing by `fin` (which also emits `land.landed` for `fin`'s ticket
+    // and `main.moved` for the branch). Neither must reach `dev_stream2`!
+    let invoice2 = format!("{BILL_DIR}/acme/epoch-2.txt");
+    let fin_base2 = tip_for(&hub, &fin_tok, &p.name);
+    let l2 = land(&api, &fin_tok, &p.name, fin_base2, json!([put(&invoice2, "v2\n")]), true).json();
+    assert_eq!(l2["state"], "landed", "{l2}");
+
+    // Follow with a visible `src/` landing by admin so `dev_stream2` receives ONLY the visible move.
+    let admin_base = tip_for(&hub, &admin_tok, &p.name);
+    let l3 = land(&api, &admin_tok, &p.name, admin_base, json!([put("src/after-revoke.rs", "vis\n")]), true).json();
+    assert_eq!(l3["state"], "landed", "{l3}");
+    let dev_tip_after = tip_for(&hub, &dev_tok, &p.name);
+
+    let dev_events = read_sse_events(dev_stream2, 2, Duration::from_millis(800));
+    assert_eq!(
+        dev_events.len(),
+        1,
+        "dev must not receive fin's ticket event or the hidden billing move after removal from finance: {dev_events:?}"
+    );
+    assert_eq!(dev_events[0].0, "main.moved");
+    assert_eq!(dev_events[0].1["onto"], json!(dev_tip_after.hex()));
+
+    // Meanwhile `fin_stream` received its own `land.landed` ticket event as well as `main.moved`.
+    let fin_events = read_sse_events(fin_stream, 4, Duration::from_secs(3));
+    assert!(
+        fin_events.iter().any(|(name, d)| name == "land.landed" && d["ticket"] == l2["ticket"]),
+        "fin should receive its own land.landed ticket event: {fin_events:?}"
+    );
+}
+
+/// BUG-1682: `landing::seen` clears `paths` and `conflicts` and sets `message`
+/// to `"conflicts with changes you can't see"` when the viewer's access to a
+/// conflicting path was revoked after the conflict report was recorded, but
+/// forgets to clear `landed_since` (unlike `build_conflict`, which sets
+/// `landed_since` to empty on a hidden conflict).
+#[test]
+#[ignore = "BUG-1682: landing::seen leaves landed_since populated when redacting a conflict after access revocation"]
+fn bug_1682_seen_clears_landed_since_when_access_to_conflicting_path_is_revoked() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+
+    // Grant `dev` access to `finance` and let `dev` read the base tip.
+    p.admin.ok(&p.dir, &["group", "add", "finance", &p.dev.name]);
+    let dev_base = tip_for(&hub, &dev_tok, &p.name);
+    let invoice = format!("{BILL_DIR}/acme/invoice.txt");
+
+    // Admin lands a change touching both `src/vis.rs` (visible to dev) and
+    // `billing/acme/invoice.txt`.
+    let admin_base = tip_for(&hub, &admin_tok, &p.name);
+    let a = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        admin_base,
+        json!([
+            put("src/vis.rs", "visible edit\n"),
+            put(&invoice, "admin invoice v1\n\x00binary")
+        ]),
+        true,
+    )
+    .json();
+    assert_eq!(a["state"], "landed", "{a}");
+
+    // While `dev` is still in `finance`, `dev` lands a conflicting binary edit
+    // to `billing/acme/invoice.txt` on `dev_base`, producing a stored conflict report.
+    let c = land(
+        &api,
+        &dev_tok,
+        &p.name,
+        dev_base,
+        json!([put(&invoice, "dev invoice v2\n\x00binary")]),
+        true,
+    )
+    .json();
+    assert_eq!(c["state"], "conflict", "{c}");
+    let ticket = c["ticket"].as_str().unwrap().to_string();
+
+    // Now remove `dev` from `finance` and read the ticket again via `GET …/land/{ticket}`
+    // (and `GET …/events?ticket={ticket}`). Because `dev` can no longer read `billing/`,
+    // `landing::seen` redacts the report to `"conflicts with changes you can't see"` and
+    // must also clear `landed_since` just like `build_conflict` does!
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.dev.name]);
+    let after = outcome(&api, &dev_tok, &p.name, &ticket);
+    assert_eq!(after["state"], "conflict", "{after}");
+    assert_eq!(
+        after["message"].as_str(),
+        Some("conflicts with changes you can't see"),
+        "{after}"
+    );
+    assert!(after["paths"].as_array().is_none_or(|a| a.is_empty()), "{after}");
+    assert!(after["conflicts"].as_array().is_none_or(|a| a.is_empty()), "{after}");
+    assert!(
+        after["landed_since"].as_array().is_none_or(|a| a.is_empty()),
+        "redacted hidden conflict report must not list landed_since: {after}"
+    );
+}
+
+/// BUG-1683: `ServerAttrSource::read_attributes` skips `!self.view.read(&rel)`
+/// when `dir.is_root()`, so a root `.veilattributes` that the submitter cannot
+/// read (private to admins because `.veilpolicy` grants only `src/`) still
+/// governs the submitter's content merges and reveals its rules (`-merge` vs
+/// default text merge) on `src/` files.
+#[test]
+#[ignore = "BUG-1683: ServerAttrSource::read_attributes bypasses view.read on root .veilattributes"]
+fn bug_1683_unreadable_root_veilattributes_does_not_govern_non_admin_merge() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+
+    // In `setup_project`, `.veilpolicy` grants `src/ public devs` and `billing/ finance`.
+    // The root `.veilattributes` is NOT granted to `devs`, so `dev` cannot read it
+    // (it is absent from `dev`'s projection).
+    let base0 = tip_for(&hub, &admin_tok, &p.name);
+    let s = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        base0,
+        json!([
+            put(".veilattributes", "src/secret-target.rs -merge\n"),
+            put("src/secret-target.rs", "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n"),
+        ]),
+        true,
+    )
+    .json();
+    assert_eq!(s["state"], "landed", "{s}");
+
+    // Confirm `dev` cannot read `.veilattributes` at all.
+    let dev_clone = p.dev.dir("attr-check");
+    p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), dev_clone.to_str().unwrap()]);
+    assert!(
+        !dev_clone.join(".veilattributes").exists(),
+        "root .veilattributes is private and must not be visible to dev"
+    );
+
+    // Admin edits line 1 of `src/secret-target.rs`; `dev` edits line 6 on the same base.
+    // Because `dev` cannot read root `.veilattributes`, `ServerAttrSource` ("restricted
+    // to directories `view` can read") must treat root `.veilattributes` as absent for
+    // `dev`, so `src/secret-target.rs` merges cleanly as ordinary text instead of
+    // leaking that the hidden root `.veilattributes` named `src/secret-target.rs -merge`.
+    let admin_base = tip_for(&hub, &admin_tok, &p.name);
+    let dev_base = tip_for(&hub, &dev_tok, &p.name);
+    let a = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        admin_base,
+        json!([put("src/secret-target.rs", "ADMIN 1\nline 2\nline 3\nline 4\nline 5\nline 6\n")]),
+        true,
+    )
+    .json();
+    assert_eq!(a["state"], "landed", "{a}");
+    let b = land(
+        &api,
+        &dev_tok,
+        &p.name,
+        dev_base,
+        json!([put("src/secret-target.rs", "line 1\nline 2\nline 3\nline 4\nline 5\nDEV 6\n")]),
+        true,
+    )
+    .json();
+    assert_eq!(
+        b["state"], "landed",
+        "unreadable root .veilattributes must count as absent for dev and not block content merge: {b}"
+    );
+}
+
+/// BUG-1684: `can_merge_entries` and `merge_entry_bytes` load, decode, and
+/// three-way merge arbitrarily large blobs in memory without a file-size cap
+/// (unlike `MAX_FILE = 1 MiB` on `.veilattributes` or `MAX_TEXT_BYTES = 1 MiB`
+/// in `query::trees` and `search`), and `merge_stack` holds all merged blobs
+/// and trees of a 64-change stack in `src.pending` and `objects` without
+/// flushing at `BATCH_BYTES` (8 MiB, BUG-1272).
+#[test]
+#[ignore = "BUG-1684: content merge has no per-file size bound and merge_stack never flushes at BATCH_BYTES"]
+fn bug_1684_large_files_and_stacks_in_content_merge_stay_bounded_in_memory() {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "landing::large_file_merge_in_a_child",
+            "--exact",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env("VEIL_S18_CHILD", "1")
+        .env("MALLOC_ARENA_MAX", "2")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && text.contains("1 passed"), "{}", &text[text.len().saturating_sub(1500)..]);
+}
+
+#[test]
+#[ignore = "helper of bug_1684 (run in a child process)"]
+fn large_file_merge_in_a_child() {
+    if std::env::var_os("VEIL_S18_CHILD").is_none() {
+        return;
+    }
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+
+    // A 12 MiB text file (well past the 1 MiB `MAX_TEXT_BYTES` / `MAX_FILE` cap
+    // and past `BATCH_BYTES = 8 MiB`).
+    let mut body = String::with_capacity(12 << 20);
+    body.push_str("header line\n");
+    for i in 0..200_000 {
+        body.push_str(&format!("line {i:06}: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"));
+    }
+    body.push_str("footer line\n");
+
+    let mut c0 = Craft::new(&api, &p.admin, &p.name, "main");
+    c0.file("src/huge.txt", &body);
+    let r0 = c0.push("main", "seed huge.txt");
+    assert_eq!(r0.json()["results"][0]["ok"], true);
+
+    let admin_base = tip_for(&hub, &admin_tok, &p.name);
+    let dev_base = tip_for(&hub, &dev_tok, &p.name);
+
+    let mut admin_body = body.replacen("header line\n", "ADMIN HEADER\n", 1);
+    let mut c1 = Craft::new(&api, &p.admin, &p.name, "main");
+    c1.tip = admin_base;
+    c1.root = c1.tree_of(admin_base);
+    c1.file("src/huge.txt", &admin_body);
+    let r1 = c1.push("main", "admin edits huge.txt header");
+    assert_eq!(r1.json()["results"][0]["ok"], true);
+    admin_body = String::new();
+    drop(admin_body);
+
+    let mut dev_body = body;
+    let footer_pos = dev_body.rfind("footer line\n").unwrap();
+    dev_body.replace_range(footer_pos.., "DEV FOOTER\n");
+    let mut c2 = Craft::new(&api, &p.dev, &p.name, "main");
+    c2.tip = dev_base;
+    c2.root = c2.tree_of(dev_base);
+    c2.file("src/huge.txt", &dev_body);
+    drop(dev_body);
+    let cid = veil_core::ChangeId::random();
+    let snap = snap_at(&mut c2, dev_base, cid, "dev edits huge.txt footer", veil_core::now_millis(), vec![]);
+    let up = c2.api.upload(&c2.token, &c2.project, &c2.objects);
+    assert_eq!(up.status, 200);
+    let receipts = up.json()["receipts"].as_array().unwrap().clone();
+    let map: serde_json::Map<String, Value> = c2.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+    c2.objects.clear();
+    c2.objects.shrink_to_fit();
+
+    extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    unsafe { malloc_trim(0) };
+    std::fs::write("/proc/self/clear_refs", "5").unwrap();
+    let (start, _) = rss();
+
+    let res = api
+        .post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/land", p.name),
+            &json!({"onto": "main", "snapshot": snap.hex(), "receipts": map, "wait": true}),
+        )
+        .json();
+    let (_, peak) = rss();
+    let grew_mib = peak.saturating_sub(start) >> 20;
+    let _ = pid;
+    // A 12 MiB file should either be refused for content-merge as a conflict
+    // without reading/decoding all three 12 MiB blobs twice, or keep peak growth
+    // within `BATCH_BYTES` (8 MiB). Instead `can_merge` + `merge_entry_bytes`
+    // read, decode, diff, and clone the 12 MiB blobs, growing RSS by > 60 MiB
+    // for a single file!
+    assert!(
+        res["state"] == "conflict" && grew_mib <= 16,
+        "12 MiB file merge grew RSS by {grew_mib} MiB (state={}): {res}",
+        res["state"]
+    );
+}
