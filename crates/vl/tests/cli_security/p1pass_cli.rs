@@ -1165,7 +1165,6 @@ fn bug_1800_change_new_must_use_accepted_policy_and_refuse_personal_keys() {
 }
 
 #[test]
-#[ignore = "BUG-1801: Rule::to_line omits access-line grantees, bypassing accepted-policy pin and ws exec command_policy"]
 fn bug_1801_access_line_grantee_edits_require_policy_accept_and_hold_back_in_ws_exec() {
     let env = Env::new();
     let upstream = env.dir("upstream-1801");
@@ -1231,6 +1230,66 @@ fn bug_1801_access_line_grantee_edits_require_policy_accept_and_hold_back_in_ws_
         env_scope == "team" && accepted_pin.contains("src/ public") && recorded_policy.contains("billing/ finance"),
         "access-line grantee edits bypassed accepted-policy pin (accepted_pin={accepted_pin:?}, src/.env sealed to {env_scope:?} instead of \"team\" without `vl policy accept`) and ws exec command_policy (agent .veilpolicy={recorded_policy:?}; {ws_out})"
     );
+}
+
+#[test]
+fn class_1801_any_grantee_change_needs_policy_accept_and_never_widens_in_ws_exec() {
+    let env = Env::new();
+    let upstream = env.dir("upstream-class-1801");
+    veil_core::Repo::init_bare(Arc::new(DiskBackend::new(&upstream))).unwrap();
+
+    let proj = env.project("alice", "proj-class-1801", &[("src/app.rs", "pub fn run() {}\n")]);
+    for p in ["src", "src/secret", "billing"] {
+        env.ok("alice", &proj, &["scope", "create", &rule_scope_of(p)]);
+    }
+
+    let initial = "src/ public\nsrc/secret/ ops\nbilling/ finance\n** cloak rule\n";
+    write(&proj, ".veilpolicy", initial);
+    env.ok("alice", &proj, &["policy", "accept"]);
+    env.ok("alice", &proj, &["commit", "-m", "initial"]);
+    env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
+    env.ok("alice", &proj, &["remote", "add", "upstream", upstream.to_str().unwrap()]);
+    env.ok("alice", &proj, &["push", "upstream"]);
+    env.ok("alice", &proj, &["ws", "new", "agent", "-r", "@-"]);
+
+    // Every confined command attempt that adds grantees, swaps grantees, adds writers to a public
+    // folder, or drops an inner restricting rule must be held back in `agent@`.
+    for attempt in [
+        "src/ public devs\nsrc/secret/ ops\nbilling/ finance\n** cloak rule\n",
+        "src/ public\nsrc/secret/ ops\nbilling/ finance eng\n** cloak rule\n",
+        "src/ public\nsrc/secret/ ops\nbilling/ eng\n** cloak rule\n",
+        "src/ public\nbilling/ finance\n** cloak rule\n",
+    ] {
+        let cmd = format!("printf %s {attempt:?} > .veilpolicy");
+        let _ = env.ok("alice", &proj, &["ws", "exec", "agent", "--unconfined", "--", "sh", "-c", &cmd]);
+        let recorded = env.stdout("alice", &proj, &["ws", "cat", "agent", ".veilpolicy"]);
+        assert_eq!(recorded, initial, "confined command widened access with {attempt:?}: {recorded:?}");
+    }
+
+    // Pulling grantee changes (`billing/ finance` -> `billing/ finance carol` or `src/ public devs`)
+    // never overwrites `.veil/local/accepted-policy` until `vl policy accept`.
+    let bob = env.root.join("bob-class-1801");
+    env.ok("bob", &env.root, &["clone", upstream.to_str().unwrap(), bob.to_str().unwrap()]);
+    for (idx, remote_pol) in [
+        "src/ public devs\nsrc/secret/ ops\nbilling/ finance\n** cloak rule\n",
+        "src/ public\nsrc/secret/ ops\nbilling/ finance carol\n** cloak rule\n",
+    ]
+    .iter()
+    .enumerate()
+    {
+        write(&bob, ".veilpolicy", remote_pol);
+        env.ok("bob", &bob, &["commit", "-m", &format!("remote-{idx}")]);
+        env.ok("bob", &bob, &["tag", "set", "main", "-r", "@-"]);
+        env.ok("bob", &bob, &["push", "origin"]);
+
+        env.ok("alice", &proj, &["pull", "upstream"]);
+        env.ok("alice", &proj, &["new", "main"]);
+        let _ = env.stdout("alice", &proj, &["status", "--json"]);
+        let pin = read(&proj, ".veil/local/accepted-policy");
+        assert_eq!(pin, initial, "pull #{idx} overwrote accepted-policy pin without accept: {pin:?}");
+    }
+    env.ok("alice", &proj, &["policy", "accept"]);
+    assert!(read(&proj, ".veil/local/accepted-policy").contains("billing/ finance carol"));
 }
 
 #[test]

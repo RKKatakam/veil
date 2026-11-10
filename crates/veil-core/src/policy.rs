@@ -621,7 +621,11 @@ impl Rule {
     }
 
     pub fn to_line(&self) -> String {
-        format_rule(&self.pattern, &self.tier, self.force)
+        if self.grantees.is_empty() {
+            format_rule(&self.pattern, &self.tier, self.force)
+        } else {
+            format!("{:<24} {}", self.pattern, self.grantees.join(" "))
+        }
     }
 }
 
@@ -780,10 +784,7 @@ impl Policy {
                 None => invalid("expected '<pattern> <tier>'".into()),
                 // An access line: plain text here, access decided by the server.
                 Some(_) if is_access_line(&parts) => {
-                    // Naming `public` publishes the folder, as a `public` rule does.
-                    if !parts[1..].iter().any(|n| n == "public") {
-                        grantees = parts[1..].to_vec();
-                    }
+                    grantees = parts[1..].to_vec();
                     (Tier::Public, false)
                 }
                 Some("public") => (Tier::Public, false),
@@ -898,6 +899,11 @@ impl Policy {
         self
     }
 
+    /// This policy's parsed server access rules.
+    pub fn access_policy(&self) -> &crate::hub::access::AccessPolicy {
+        &self.access
+    }
+
     /// The user rules, normalised (comments and spacing do not count).
     fn rule_lines(&self) -> Vec<String> {
         self.rules.iter().filter(|r| !r.builtin).map(Rule::to_line).collect()
@@ -906,14 +912,18 @@ impl Policy {
     /// Do both policies have the same user rules (spacing and comments
     /// aside)?
     pub fn same_rules(&self, other: &Policy) -> bool {
-        self.rule_lines() == other.rule_lines()
+        self.rule_lines() == other.rule_lines() && self.access.same_rules(&other.access)
     }
 
     /// Is this policy `accepted` without some of its `public!` rules, plus
     /// appended rules that only isolate or ignore? Neither can weaken any
     /// path's protection (see [`weakens`]): a path a removed `public!` rule
-    /// decided was as exposed as it gets, and falls back to an earlier rule.
+    /// decided was as exposed as it gets, and falls back to an earlier rule,
+    /// provided no enclosing access rule gains scope or redirects `cloak rule`.
     pub fn only_adds_protection_to(&self, accepted: &Policy) -> bool {
+        if access_widens_or_rescopes(&accepted.access, &self.access) {
+            return false;
+        }
         let mine: Vec<&Rule> = self.rules.iter().filter(|r| !r.builtin).collect();
         let mut i = 0;
         for r in accepted.rules.iter().filter(|r| !r.builtin) {
@@ -1373,7 +1383,7 @@ impl Classification {
         // access line naming only groups and people publishes nothing, so it
         // settles an earlier ignored `public` rule without a warning of its own.
         if r.tier == Tier::Public && self.builtin_secret && !r.force {
-            self.blocked_exposure = r.grantees.is_empty();
+            self.blocked_exposure = r.grantees.is_empty() || r.grantees.iter().any(|g| g == "public");
             return false;
         }
         self.tier = r.tier.clone();
@@ -1556,8 +1566,50 @@ type Applied = (Option<usize>, Classification);
 /// An editor or backup artefact then takes its base's protection where that
 /// is stronger ([`Classification::inherit`]); the check covers the base and
 /// the artefact's own rules, each on its own.
+fn access_grant<'a>(ap: &'a crate::hub::access::AccessPolicy, path: &str) -> (bool, &'a [String]) {
+    ap.deciding(path)
+        .map_or((false, &[][..]), |i| (ap.rules[i].public, ap.rules[i].names.as_slice()))
+}
+
+/// Does `next` widen server access or change `rule_scope` relative to `base`
+/// at any path? Checked over the exact finite witness set `{""} ∪ {r.path}`.
+fn access_widens_or_rescopes(base: &crate::hub::access::AccessPolicy, next: &crate::hub::access::AccessPolicy) -> bool {
+    let mut regions: Vec<&str> = vec![""];
+    for r in base.rules.iter().chain(&next.rules) {
+        if !regions.contains(&r.path.as_str()) {
+            regions.push(&r.path);
+        }
+    }
+    regions.into_iter().any(|path| {
+        let (b_pub, b_names) = access_grant(base, path);
+        let (n_pub, n_names) = access_grant(next, path);
+        (n_pub && !b_pub)
+            || n_names.iter().any(|n| !b_names.contains(n))
+            || rule_scope(base, path) != rule_scope(next, path)
+    })
+}
+
 fn verify_fold(accepted: &Policy, current: &Policy, folded: &Policy) -> std::result::Result<(), String> {
     let policies = [accepted, current, folded];
+    let mut regions: Vec<&str> = vec![""];
+    for p in &policies {
+        for r in &p.access.rules {
+            if !regions.contains(&r.path.as_str()) {
+                regions.push(&r.path);
+            }
+        }
+    }
+    for &region in &regions {
+        let (a_pub, a_names) = access_grant(&accepted.access, region);
+        let (c_pub, c_names) = access_grant(&current.access, region);
+        let (f_pub, f_names) = access_grant(&folded.access, region);
+        if (f_pub && !a_pub && !c_pub) || f_names.iter().any(|n| !a_names.contains(n) && !c_names.contains(n)) {
+            let where_at = if region.is_empty() { "the repository root" } else { region };
+            return Err(format!(
+                "next to the rules you accepted, your edit would widen access on '{where_at}' beyond both that policy and your own file"
+            ));
+        }
+    }
     // Rules with the same pattern that match case the same way match the
     // same paths (`notes/ isolate` and `notes/ cloak`): one atom, matched
     // or not together. Any other two rules are taken as independent (an
@@ -1583,6 +1635,8 @@ fn verify_fold(accepted: &Policy, current: &Policy, folded: &Policy) -> std::res
                 .collect()
         })
         .collect();
+    let uses_rule_scope = lists.iter().flatten().any(|(_, r)| r.tier == Tier::Cloaked(RULE_SCOPE.to_string()));
+    let scope_regions: &[&str] = if uses_rule_scope { &regions } else { &regions[..1] };
     let bangs: Vec<usize> = (0..universe.len()).filter(|i| has_bang[*i]).collect();
     let others: Vec<usize> = (0..universe.len()).filter(|i| !has_bang[*i]).collect();
     // Per policy: no atom, or one of its own atoms without a `public!` rule
@@ -1602,13 +1656,17 @@ fn verify_fold(accepted: &Policy, current: &Policy, folded: &Policy) -> std::res
     // policy per rule to precompute the single-rule classifications.
     let per_set = candidates.iter().map(Vec::len).product::<usize>() + 3 * (others.len() + 1) * (longest + 1) * (longest + 1);
     let sets = 1usize.checked_shl(bangs.len() as u32).filter(|_| bangs.len() < 24);
-    match sets.and_then(|n| n.checked_mul(5)).and_then(|n| n.checked_mul(per_set)) {
+    match sets
+        .and_then(|n| n.checked_mul(5))
+        .and_then(|n| n.checked_mul(per_set))
+        .and_then(|n| n.checked_mul(scope_regions.len()))
+    {
         Some(work) if work <= FOLD_BUDGET => {}
         _ => return Err("the policies have too many rules to check".into()),
     }
     // The classification of `list` for a path matching the rules in
     // `member`, with the position of the last rule applied.
-    let classify = |list: &[(usize, &Rule)], member: &[bool], secret: bool, vcs: bool, scratch: bool| {
+    let classify = |k: usize, list: &[(usize, &Rule)], member: &[bool], secret: bool, vcs: bool, scratch: bool, region: &str| {
         let mut c = Classification::unmatched();
         if secret {
             c.tier = Tier::Isolated;
@@ -1626,51 +1684,60 @@ fn verify_fold(accepted: &Policy, current: &Policy, folded: &Policy) -> std::res
                 last = Some(pos);
             }
         }
+        if c.tier == Tier::Cloaked(RULE_SCOPE.to_string()) {
+            c.tier = Tier::Cloaked(rule_scope(&policies[k].access, region));
+        }
         (last, c)
     };
     let mut member = vec![false; universe.len()];
-    for state in 0..8u8 {
-        let (secret, vcs, scratch) = (state & 1 != 0, state & 2 != 0, state & 4 != 0);
-        // The scratch rule only applies where the other two do not.
-        if scratch && (secret || vcs) {
-            continue;
-        }
-        for set in 0..sets.unwrap_or(0) {
-            for (bit, &i) in bangs.iter().enumerate() {
-                member[i] = set & (1 << bit) != 0;
+    for &region in scope_regions {
+        for state in 0..8u8 {
+            let (secret, vcs, scratch) = (state & 1 != 0, state & 2 != 0, state & 4 != 0);
+            // The scratch rule only applies where the other two do not.
+            if scratch && (secret || vcs) {
+                continue;
             }
-            // single[policy][rule]: the classification with that one rule
-            // (other than `public!`) added; `none[policy]` with none.
-            let none: Vec<_> = lists.iter().map(|l| classify(l, &member, secret, vcs, scratch)).collect();
-            let mut single: Vec<Vec<Option<Applied>>> = vec![vec![None; universe.len()]; 3];
-            for &e in &others {
-                member[e] = true;
-                for (k, l) in lists.iter().enumerate() {
-                    single[k][e] = Some(classify(l, &member, secret, vcs, scratch));
+            for set in 0..sets.unwrap_or(0) {
+                for (bit, &i) in bangs.iter().enumerate() {
+                    member[i] = set & (1 << bit) != 0;
                 }
-                member[e] = false;
-            }
-            let pick = |k: usize, rules: [Option<usize>; 3]| -> &Classification {
-                let mut best = &none[k];
-                for e in rules.into_iter().flatten() {
-                    let s = single[k][e].as_ref().expect("computed for every atom without public!");
-                    if s.0 > best.0 {
-                        best = s;
+                // single[policy][rule]: the classification with that one rule
+                // (other than `public!`) added; `none[policy]` with none.
+                let none: Vec<_> = lists
+                    .iter()
+                    .enumerate()
+                    .map(|(k, l)| classify(k, l, &member, secret, vcs, scratch, region))
+                    .collect();
+                let mut single: Vec<Vec<Option<Applied>>> = vec![vec![None; universe.len()]; 3];
+                for &e in &others {
+                    member[e] = true;
+                    for (k, l) in lists.iter().enumerate() {
+                        single[k][e] = Some(classify(k, l, &member, secret, vcs, scratch, region));
                     }
+                    member[e] = false;
                 }
-                &best.1
-            };
-            for &a in &candidates[0] {
-                for &c in &candidates[1] {
-                    for &f in &candidates[2] {
-                        let rules = [a, c, f];
-                        let x = pick(2, rules);
-                        if weakens(pick(0, rules), x) && weakens(pick(1, rules), x) {
-                            let rule = x.rule.as_deref().map_or_else(|| "no rule".to_string(), |r| format!("rule '{r}'"));
-                            return Err(format!(
-                                "next to the rules you accepted, your edit would leave {rule} deciding some paths more weakly \
-                                 than both that policy and your own file do"
-                            ));
+                let pick = |k: usize, rules: [Option<usize>; 3]| -> &Classification {
+                    let mut best = &none[k];
+                    for e in rules.into_iter().flatten() {
+                        let s = single[k][e].as_ref().expect("computed for every atom without public!");
+                        if s.0 > best.0 {
+                            best = s;
+                        }
+                    }
+                    &best.1
+                };
+                for &a in &candidates[0] {
+                    for &c in &candidates[1] {
+                        for &f in &candidates[2] {
+                            let rules = [a, c, f];
+                            let x = pick(2, rules);
+                            if weakens(pick(0, rules), x) && weakens(pick(1, rules), x) {
+                                let rule = x.rule.as_deref().map_or_else(|| "no rule".to_string(), |r| format!("rule '{r}'"));
+                                return Err(format!(
+                                    "next to the rules you accepted, your edit would leave {rule} deciding some paths more weakly \
+                                     than both that policy and your own file do"
+                                ));
+                            }
                         }
                     }
                 }
@@ -1723,7 +1790,8 @@ pub fn command_edit(recorded: &Policy, edited: &Policy) -> CommandEdit {
             break;
         }
     }
-    only_inserts &= rec[i.min(rec.len())..].iter().all(|r| r.tier == Tier::Public && r.force);
+    only_inserts &= rec[i.min(rec.len())..].iter().all(|r| r.tier == Tier::Public && r.force)
+        && !access_widens_or_rescopes(&recorded.access, &edited.access);
     if verify_fold(recorded, recorded, edited).is_ok() {
         return CommandEdit::Strengthens;
     }
@@ -2152,6 +2220,42 @@ mod tests {
             "target/ ignore\nsecret/ cloak team\nsecret/a.md public\ndocs/x.md public!\n",
         ] {
             assert_eq!(kind(text), CommandEdit::Weakens, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn access_line_grantees_decide_equality_and_command_edits() {
+        let forms = [
+            "src/ public\n",
+            "src/ public devs\n",
+            "src/ public devs ops\n",
+            "src/ finance\n",
+            "src/ finance carol\n",
+            "src/ carol finance\n",
+            "src/ eng\n",
+        ];
+        for (i, a) in forms.iter().enumerate() {
+            let pa = Policy::parse(a);
+            assert!(pa.same_rules(&Policy::parse(&format!("  {}  # spacing\n", a.trim()))));
+            for (j, b) in forms.iter().enumerate() {
+                if i != j {
+                    assert!(!pa.same_rules(&Policy::parse(b)), "{a:?} vs {b:?}");
+                }
+            }
+        }
+
+        let base = Policy::parse("src/ public\nsrc/secret/ ops\nbilling/ finance\nbilling/open/ public!\n** cloak rule\n");
+        for wider in [
+            "src/ public\nsrc/secret/ ops\nbilling/ public\nbilling/open/ public!\n** cloak rule\n",
+            "src/ public\nsrc/secret/ ops\nbilling/ finance eng\nbilling/open/ public!\n** cloak rule\n",
+            "src/ public devs\nsrc/secret/ ops\nbilling/ finance\nbilling/open/ public!\n** cloak rule\n",
+            "src/ public\nbilling/ finance\nbilling/open/ public!\n** cloak rule\n",
+            "src/ public\nsrc/secret/ ops\nbilling/ finance\n** cloak rule\n",
+            "src/ finance\nsrc/secret/ ops\nbilling/ finance\nbilling/open/ public!\n** cloak rule\n",
+        ] {
+            let pw = Policy::parse(wider);
+            assert!(!pw.only_adds_protection_to(&base), "only_adds_protection_to allowed {wider:?}");
+            assert_eq!(command_edit(&base, &pw), CommandEdit::Weakens, "command_edit allowed {wider:?}");
         }
     }
 
