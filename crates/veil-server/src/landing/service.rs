@@ -150,6 +150,17 @@ struct Row {
     /// The branch's lineage its stack was judged under.
     lineage: i64,
     epochs: (i64, i64),
+    merges: u32,
+}
+
+/// Metadata of a row in a built batch.
+#[derive(Clone)]
+struct RowMeta {
+    seq: i64,
+    ticket: String,
+    person_id: i64,
+    merges: u32,
+    change_id: Option<veil_core::ChangeId>,
 }
 
 /// Someone a projection is made for, now.
@@ -231,13 +242,16 @@ struct Record {
 enum Outcome {
     /// Where each change of the stack landed (real snapshots).
     Landed { reals: Vec<ObjectId> },
-    Conflict { paths: Vec<String> },
+    /// Handed to a merge worker (`state = 'merging'`, S18).
+    Merging(super::merge::Job),
+    /// Could not be content-merged: conflict report (S18).
+    Conflict(super::merge::ConflictReport),
     Rejected(String),
 }
 
 /// A batch built in memory.
 struct Built {
-    rows: Vec<(i64, String)>,
+    rows: Vec<RowMeta>,
     outcomes: Vec<Outcome>,
     objects: Vec<(ObjectId, Bytes)>,
     bytes: usize,
@@ -425,7 +439,7 @@ impl Service {
                 continue;
             }
             renewed = Instant::now();
-            let seqs = built.rows.iter().map(|r| r.0).collect();
+            let seqs = built.rows.iter().map(|r| r.seq).collect();
             let (alone, after) = (built.alone, built.after.clone());
             let s = Arc::new(self.clone_handle());
             let task = tokio::spawn(async move {
@@ -454,7 +468,7 @@ impl Service {
         let before = veil_core::now_millis() - KEEP_DONE_MS;
         sqlx::query(
             "DELETE FROM landing_queue WHERE (project_id, branch, seq) IN (SELECT project_id, branch, seq FROM landing_queue \
-             WHERE project_id = $1 AND done_at < $2 AND state <> 'queued' LIMIT $3)",
+             WHERE project_id = $1 AND done_at < $2 AND state NOT IN ('queued', 'merging') LIMIT $3)",
         )
         .bind(self.project)
         .bind(before)
@@ -516,9 +530,9 @@ impl Service {
 
     /// The ready rows, in order, leaving out those being committed.
     async fn ready(&self, exclude: &HashSet<i64>) -> Result<Vec<Row>> {
-        type R = (i64, String, i64, String, String, String, i64, i64, i64);
+        type R = (i64, String, i64, String, String, String, i64, i64, i64, i64);
         let rows: Vec<R> = sqlx::query_as(
-            "SELECT seq, ticket, person_id, person_name, device_key, stack, lineage, person_epoch, project_epoch FROM landing_queue \
+            "SELECT seq, ticket, person_id, person_name, device_key, stack, lineage, person_epoch, project_epoch, merges FROM landing_queue \
              WHERE project_id = $1 AND branch = $2 AND state = 'queued' ORDER BY created_at, seq LIMIT $3",
         )
         .bind(self.project)
@@ -527,7 +541,7 @@ impl Service {
         .fetch_all(&self.hub.db)
         .await?;
         let mut out = Vec::new();
-        for (seq, ticket, id, name, device_key, stack, lineage, pe, je) in rows {
+        for (seq, ticket, id, name, device_key, stack, lineage, pe, je, merges) in rows {
             if exclude.contains(&seq) {
                 continue;
             }
@@ -542,6 +556,7 @@ impl Service {
                 stack: super::decode_stack(&stack)?,
                 lineage,
                 epochs: (pe, je),
+                merges: merges.max(0) as u32,
             });
             if out.len() == MAX_BATCH {
                 break;
@@ -738,12 +753,12 @@ impl Service {
         // (No origins: a projection equal to a pusher's own snapshot is
         // that pusher's view key's, whose memo the push stored.)
         let origins = HashMap::new();
-        // Stack changes another stack landed already, in the branch's
-        // lineage (BUG-1270, BUG-1300).
-        let landed: HashMap<ObjectId, Record> = if stacks.is_empty() {
+        // Stack changes (or their pre-merge predecessors) another stack
+        // landed already, in the branch's lineage (BUG-1270, BUG-1300).
+        let landed: HashMap<ObjectId, Record> = if ids.is_empty() {
             HashMap::new()
         } else {
-            let hex: Vec<String> = stacks.iter().map(ObjectId::hex).collect();
+            let hex: Vec<String> = ids.iter().map(ObjectId::hex).collect();
             let rows: Vec<(String, String)> = sqlx::query_as(
                 "SELECT submitted, landed FROM landings WHERE project_id = $1 AND branch = $3 AND lineage = $4 AND submitted = ANY($2)",
             )
@@ -767,42 +782,38 @@ impl Service {
     }
 
     /// Commit the batch (its objects stored already) in one transaction;
-    /// then tell the waiters here.
+    /// then tell the waiters here, spawn merge workers, and emit events.
     async fn commit(&self, b: Built) -> Result<Committed> {
         let t = Instant::now();
         let hub = &self.hub;
         let moved = b.after.tip != b.old_tip;
-        let results: Vec<LandResult> = b
+        let results: Vec<Option<LandResult>> = b
             .rows
             .iter()
             .zip(&b.outcomes)
-            .map(|((_, ticket), o)| {
-                let mut r = super::queued(ticket);
-                match o {
-                    Outcome::Landed { reals } => {
-                        r.state = LandState::Landed;
-                        r.landed = reals.clone();
-                    }
-                    Outcome::Conflict { paths } => {
-                        r.state = LandState::Conflict;
-                        r.message = Some(format!(
-                            "a path this change edits changed on '{}' since its base: get the branch's new tip, redo the change on it, and land it again",
-                            self.branch
-                        ));
-                        r.paths = paths.clone();
-                    }
-                    Outcome::Rejected(why) => {
-                        r.state = LandState::Rejected;
-                        r.message = Some(why.clone());
-                    }
+            .map(|(meta, o)| match o {
+                Outcome::Merging(_) => None,
+                Outcome::Landed { reals } => {
+                    let mut r = super::queued(&meta.ticket);
+                    r.state = LandState::Landed;
+                    r.landed = reals.clone();
+                    r.merges = meta.merges;
+                    Some(r)
                 }
-                r
+                Outcome::Conflict(report) => Some(report.clone().into_result(&meta.ticket, &self.branch)),
+                Outcome::Rejected(why) => {
+                    let mut r = super::queued(&meta.ticket);
+                    r.state = LandState::Rejected;
+                    r.message = Some(why.clone());
+                    r.merges = meta.merges;
+                    Some(r)
+                }
             })
             .collect();
         let (pid, branch, holder, epoch, name) = (self.project, self.branch.clone(), hub.landing.holder.clone(), self.epoch, self.name.clone());
         let old = b.old_tip.map(|t| t.hex());
         let new = b.after.tip.map(|t| t.hex());
-        let seqs: Vec<i64> = b.rows.iter().map(|r| r.0).collect();
+        let seqs: Vec<i64> = b.rows.iter().map(|r| r.seq).collect();
         let snapshots: Vec<String> = b.snapshots.iter().map(ObjectId::hex).collect();
         // The tip this batch moves from is on the branch too: recorded as
         // landed as itself, so a submit on any tip an agent read since the
@@ -902,16 +913,27 @@ impl Service {
                     // entries are checked against it.
                     crate::perm::accept_policy(&mut *c, pid, text).await?;
                     if let Some(p) = crate::perm::load_project(&mut *c, &name).await? {
-                        for r in results.iter_mut().filter(|r| r.state == LandState::Landed) {
+                        for r in results.iter_mut().flatten().filter(|r| r.state == LandState::Landed) {
                             r.warnings = crate::perm::accepted_listing(&p);
                         }
                     }
                 }
-                let states: Vec<String> = results.iter().map(|r| state_name(r.state).to_string()).collect();
-                let texts: Vec<String> = results.iter().map(|r| serde_json::to_string(r).unwrap_or_default()).collect();
+                let now_ms = veil_core::now_millis();
+                let states: Vec<String> = results
+                    .iter()
+                    .map(|r| match r {
+                        Some(r) => state_name(r.state).to_string(),
+                        None => "merging".to_string(),
+                    })
+                    .collect();
+                let texts: Vec<Option<String>> = results
+                    .iter()
+                    .map(|r| r.as_ref().map(|x| serde_json::to_string(x).unwrap_or_default()))
+                    .collect();
+                let dones: Vec<Option<i64>> = results.iter().map(|r| r.as_ref().map(|_| now_ms)).collect();
                 let n = sqlx::query(
-                    "UPDATE landing_queue AS q SET state = v.state, result = v.result, done_at = $6 \
-                     FROM unnest($3::BIGINT[], $4::TEXT[], $5::TEXT[]) AS v(seq, state, result) \
+                    "UPDATE landing_queue AS q SET state = v.state, result = v.result, done_at = v.done_at \
+                     FROM unnest($3::BIGINT[], $4::TEXT[], $5::TEXT[], $6::BIGINT[]) AS v(seq, state, result, done_at) \
                      WHERE q.project_id = $1 AND q.branch = $2 AND q.seq = v.seq AND q.state = 'queued'",
                 )
                 .bind(pid)
@@ -919,7 +941,7 @@ impl Service {
                 .bind(&seqs)
                 .bind(&states)
                 .bind(&texts)
-                .bind(veil_core::now_millis())
+                .bind(&dones)
                 .execute(&mut *c)
                 .await?
                 .rows_affected();
@@ -1049,10 +1071,44 @@ impl Service {
         st.kept.store(b.after.keys.len() as u64, Ordering::Relaxed);
         st.batches.fetch_add(1, Ordering::Relaxed);
         st.landed.fetch_add(landed as u64, Ordering::Relaxed);
-        st.conflicts.fetch_add(b.outcomes.iter().filter(|o| matches!(o, Outcome::Conflict { .. })).count() as u64, Ordering::Relaxed);
+        st.conflicts.fetch_add(b.outcomes.iter().filter(|o| matches!(o, Outcome::Conflict(_))).count() as u64, Ordering::Relaxed);
         st.rejected.fetch_add(b.outcomes.iter().filter(|o| matches!(o, Outcome::Rejected(_))).count() as u64, Ordering::Relaxed);
         st.commit_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-        hub.landing.resolve(b.rows.iter().map(|r| r.1.clone()).zip(results));
+        for outcome in &b.outcomes {
+            if let Outcome::Merging(job) = outcome {
+                super::merge::spawn(hub, job.clone());
+            }
+        }
+        for (meta, res) in b.rows.iter().zip(results.iter()) {
+            if let Some(r) = res {
+                let (ev, st_str) = match r.state {
+                    LandState::Landed => ("land.landed", "landed"),
+                    LandState::Conflict => ("land.conflict", "conflict"),
+                    LandState::Rejected => ("land.rejected", "rejected"),
+                    LandState::Queued => ("land.queued", "queued"),
+                };
+                let mut ev_r = r.clone();
+                if ev_r.change_id.is_none() {
+                    ev_r.change_id = meta.change_id;
+                }
+                if ev_r.state == LandState::Landed && ev_r.onto.is_none() {
+                    ev_r.onto = ev_r.landed.last().copied().or(b.after.tip);
+                }
+                crate::events::emit_ticket(hub, self.project, &self.branch, meta.person_id, ev, st_str, ev_r).await;
+            }
+        }
+        if moved {
+            if let Some(new_tip) = b.after.tip {
+                crate::events::emit_moved(hub, self.project, &self.branch, b.old_tip, new_tip, &b.snapshots).await;
+            }
+        }
+        let terminal: Vec<(String, LandResult)> = b
+            .rows
+            .iter()
+            .zip(results.iter())
+            .filter_map(|(m, r)| Some((m.ticket.clone(), r.clone()?)))
+            .collect();
+        hub.landing.resolve(terminal);
         Ok(Committed::Ok)
     }
 }
@@ -1232,7 +1288,14 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
             break;
         }
         let mark = (b.objects.len(), b.bytes, b.snapshots.len(), b.memos.len(), b.landings.len(), b.flushes);
-        let row = (p.row.seq, p.row.ticket.clone());
+        let last_cid = p.row.stack.last().and_then(|e| src.snapshot(&e.id).ok().map(|s| s.change_id));
+        let row = RowMeta {
+            seq: p.row.seq,
+            ticket: p.row.ticket.clone(),
+            person_id: p.row.person.id,
+            merges: p.row.merges,
+            change_id: last_cid,
+        };
         let outcome = match entry(&hub, &mut src, branch, &p, &mut b, &mut memo, &origins, &landed, on.made_bytes) {
             Ok(Some(o)) => o,
             // It changes access or rules and others come before it: it lands
@@ -1320,14 +1383,19 @@ fn entry(
         }
         b.alone = true;
     }
-    // Access changed since the submit: it decides first, whatever happened
-    // on the tip since, so the answer to someone who may no longer write a
-    // path never says whether it changed (BUG-1104). (A merge's paths taken
-    // from another parent are the push's checks', below.)
-    if p.recheck {
-        let view = who.project.view(&who.viewer);
+    // Access changed since the submit (or after a re-queued merge): it
+    // decides first, whatever happened on the tip since, so the answer to
+    // someone who may no longer see or write a path never says whether it
+    // changed or leaks a hidden path name (BUG-1104, S18 Guarantee 1).
+    let view = who.project.view(&who.viewer);
+    if p.recheck || p.row.merges > 0 {
         for ((s, set), e) in snaps.iter().zip(&sets).zip(&p.row.stack) {
             if !as_merge(s, e.base) {
+                if !who.viewer.admin && set.iter().any(|c| !view.read(&c.path)) {
+                    return Ok(Some(Outcome::Rejected(
+                        "your access changed since this change was submitted, and it holds edits you cannot see: make it again".into(),
+                    )));
+                }
                 if let Some(c) = set.iter().find(|c| !view.write(&c.path)) {
                     return Ok(Some(Outcome::Rejected(format!("you may not write '{}'", c.path))));
                 }
@@ -1344,17 +1412,31 @@ fn entry(
     // Where each change of the stack is on the branch (a change another
     // stack landed already counts there, BUG-1270).
     let mut reals: Vec<ObjectId> = Vec::new();
+    let last_cid = snaps.last().map(|s| s.change_id);
     for (i, s) in snaps.iter().enumerate() {
         let e = &p.row.stack[i];
         let sid = e.id;
         let set = &sets[i];
-        let earlier = b.landings.iter().rev().find(|l| l.0 == sid).map(|l| l.1.clone()).or_else(|| landed_before.get(&sid).cloned());
+        let earlier = b
+            .landings
+            .iter()
+            .rev()
+            .find(|l| l.0 == sid || (p.row.merges > 0 && s.predecessors.contains(&l.0)))
+            .map(|l| l.1.clone())
+            .or_else(|| {
+                landed_before
+                    .get(&sid)
+                    .cloned()
+                    .or_else(|| (p.row.merges > 0).then(|| s.predecessors.iter().find_map(|pr| landed_before.get(pr).cloned())).flatten())
+            });
         if let Some(r) = earlier {
-            // Its edits are on the branch already (another stack's).
+            // Its edits are on the branch already (another stack's, or a
+            // prior landing of the same re-queued change).
             reals.push(r.landed);
             continue;
         }
         let parent_tree = base_trees[i];
+        let against = if s.parents.get(1..).is_some_and(|o| o.contains(&e.base)) { e.base } else { s.parents[0] };
         let merge = as_merge(s, e.base);
         if merge && e.base != chain {
             return Ok(Some(Outcome::Rejected(
@@ -1362,19 +1444,50 @@ fn entry(
             )));
         }
         if edits::fast_path(src, parent_tree, chain_tree, set)?.is_some() {
-            // Every path of the change that moved (all its own paths).
-            let mut paths = Vec::new();
-            for c in set {
-                if edits::fast_path(src, parent_tree, chain_tree, std::slice::from_ref(c))?.is_some() {
-                    paths.push(c.path.clone());
-                }
+            if super::merge::can_merge(src, &view, p.row.merges, &snaps[i..], &sets[i..], &base_trees[i..], chain_tree)? {
+                return Ok(Some(Outcome::Merging(super::merge::Job {
+                    project: src.project,
+                    project_name: who.project.name.clone(),
+                    branch: branch.to_string(),
+                    seq: p.row.seq,
+                    ticket: p.row.ticket.clone(),
+                    person: p.row.person.clone(),
+                    stack: p.row.stack[i..].to_vec(),
+                    lineage: p.row.lineage,
+                    merges: p.row.merges,
+                    tip: chain,
+                })));
             }
-            return Ok(Some(Outcome::Conflict { paths }));
+            let report = super::merge::build_conflict(
+                src,
+                &view,
+                against,
+                parent_tree,
+                chain,
+                chain_tree,
+                set,
+                p.row.merges,
+                last_cid,
+            )?;
+            return Ok(Some(Outcome::Conflict(report)));
         }
         let mut made = HashMap::new();
         let tree = match edits::apply(src, chain_tree, set, &mut made)? {
             Ok(t) => t,
-            Err(edits::Blocked(path)) => return Ok(Some(Outcome::Conflict { paths: vec![path] })),
+            Err(edits::Blocked(_)) => {
+                let report = super::merge::build_conflict(
+                    src,
+                    &view,
+                    against,
+                    parent_tree,
+                    chain,
+                    chain_tree,
+                    set,
+                    p.row.merges,
+                    last_cid,
+                )?;
+                return Ok(Some(Outcome::Conflict(report)));
+            }
         };
         for (id, (raw, _)) in made {
             b.object(src, id, Bytes::from(raw));
@@ -1397,6 +1510,14 @@ fn entry(
         if merge {
             parents.extend(s.parents[1..].iter().copied());
         }
+        let mut preds = vec![sid];
+        if p.row.merges > 0 {
+            for pr in &s.predecessors {
+                if !preds.contains(pr) {
+                    preds.push(*pr);
+                }
+            }
+        }
         let mut n = Snapshot {
             parents: parents.clone(),
             change_id: s.change_id,
@@ -1404,7 +1525,7 @@ fn entry(
             description: s.description.clone(),
             author: s.author.clone(),
             timestamp: s.timestamp,
-            predecessors: vec![sid],
+            predecessors: preds,
             conflicts: vec![],
             embargo: None,
             // A landed snapshot keeps the submitted snapshot's own agent
@@ -1420,12 +1541,34 @@ fn entry(
         b.object(src, id, raw);
         b.snapshots.push(id);
         b.landings.push((sid, Record { landed: id, change: Some(s.change_id.to_string()) }));
+        if p.row.merges > 0 {
+            for pr in &s.predecessors {
+                b.landings.push((*pr, Record { landed: id, change: Some(s.change_id.to_string()) }));
+            }
+        }
         let snap = Arc::new(n);
         // The push's checks again, on the new parents, when what they read
         // may have changed: access (epochs), or the policy file the
         // classification reads; and always for a merge (every parent).
         let policy_moved = sync::entry_at(src, &parent_tree, POLICY_FILE)? != sync::entry_at(src, &chain_tree, POLICY_FILE)?;
         if p.recheck || policy_moved || merge {
+            if policy_moved && !who.viewer.admin {
+                let tip_policy = AccessPolicy::parse(&sync::policy_text(src, &chain_tree)?);
+                let tip_proj = Project {
+                    id: who.project.id,
+                    name: who.project.name.clone(),
+                    default_branch: who.project.default_branch.clone(),
+                    policy: tip_policy,
+                    policy_text: String::new(),
+                    bindings: who.project.bindings.clone(),
+                };
+                let tip_view = tip_proj.view(&who.viewer);
+                if set.iter().any(|c| !tip_view.read(&c.path)) {
+                    return Ok(Some(Outcome::Rejected(
+                        "your access changed since this change was submitted, and it holds edits you cannot see: make it again".into(),
+                    )));
+                }
+            }
             hub.landing.stats.rechecked.fetch_add(1, Ordering::Relaxed);
             if let Err(why) = recheck(src, &who, &snap, &parents, set, &hub.identity)? {
                 return Ok(Some(Outcome::Rejected(why)));
@@ -1503,6 +1646,24 @@ fn entry(
     }
     b.after.tip = Some(chain);
     Ok(Some(Outcome::Landed { reals }))
+}
+
+/// [`recheck`] exposed for `landing::merge`.
+pub(super) fn recheck_merged(
+    src: &mut Source,
+    project: &Arc<Project>,
+    viewer: &Viewer,
+    real: &Snapshot,
+    parents: &[ObjectId],
+    set: &[Change],
+    identity: &veil_core::Identity,
+) -> Result<std::result::Result<(), String>> {
+    let who = As {
+        project: project.clone(),
+        viewer: viewer.clone(),
+        key: (!viewer.admin).then(|| project.view(viewer).key()),
+    };
+    recheck(src, &who, real, parents, set, identity)
 }
 
 /// The push's checks (`sync::complete`) for candidate `real` (a real

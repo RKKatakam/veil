@@ -12,7 +12,8 @@
 //! | [`changes`] | commits through the API: edits on a revision, the push's checks, one commit |
 //! | [`grant`] | read grants, the object routes, the access-epoch feed |
 //! | [`cache`] | the regional cache (`veil-server cache`, S9), and the epoch feed it polls |
-//! | [`landing`] | the landing service: the queue, leases, batches, the fast path, protected branches (S17) |
+//! | [`landing`] | the landing service: the queue, leases, batches, the fast path, content merges, protected branches (S17, S18) |
+//! | [`events`] | the project event stream: SSE outcomes and branch moves per viewer (S18) |
 //! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
 //! | [`query`] | the query API: history answered per viewer (S13) |
 //! | [`limits`] | rate limits, request bodies under a budget, per-project bulkheads, shedding, health metrics (S24) |
@@ -28,6 +29,7 @@ pub mod changes;
 pub mod db;
 pub mod derive;
 pub mod error;
+pub mod events;
 pub mod grant;
 pub mod landing;
 pub mod limits;
@@ -84,6 +86,8 @@ pub struct Hub {
     pub query: query::graph::State,
     /// The landing services running here, and the submitters waiting here.
     pub landing: landing::Services,
+    /// Active SSE streams (`GET …/events`, S18).
+    pub events: events::Events,
     /// Rate limits, the request budget, bulkheads and health (S24).
     pub limits: limits::Limits,
 }
@@ -208,6 +212,7 @@ pub async fn start(config: Config) -> Result<Running> {
         derive: derive::Workers::new(derive_db),
         query: query::graph::State::default(),
         landing: landing::Services::default(),
+        events: events::Events::default(),
         limits: limits::Limits::new(config.limits, config.db_connections),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
