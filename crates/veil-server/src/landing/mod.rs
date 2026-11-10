@@ -607,7 +607,8 @@ pub async fn submit(
                 )),
             }
         }
-        (None, Some(base)) => {
+        (None, base) if base.is_some() || !req.edits.is_empty() => {
+            let base = base.unwrap_or(ObjectId([0; 32]));
             let q = Queued {
                 ticket: ticket(),
                 branch: req.onto.clone(),

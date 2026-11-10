@@ -498,6 +498,11 @@ async fn resolve_snapshot_for_write(
     if *id == sync::root_snapshot_id() {
         return Ok(Some(*id));
     }
+    if let Some(tip) = branch_tip(hub, project.id, &project.default_branch).await? {
+        if sync::projected(hub, project, viewer, tip).await? == *id {
+            return Ok(Some(tip));
+        }
+    }
     let has_real: Option<String> = sqlx::query_scalar("SELECT id FROM snapshots WHERE project_id = $1 AND id = $2")
         .bind(project.id)
         .bind(id.hex())
@@ -596,6 +601,10 @@ async fn branch_tip(hub: &Arc<Hub>, project: i64, branch: &str) -> Result<Option
     Ok(target.and_then(|t| ObjectId::from_hex(&t).ok()))
 }
 
+/// Most first-parent steps walked above `<branch>@tested` (or the root) when
+/// evaluating `<branch>@tested`.
+const MAX_TESTED_WALK: usize = 1024;
+
 /// Re-evaluate `<branch>@tested` for every branch of `project`, advancing
 /// `tested` monotonically to the newest snapshot on the branch's
 /// first-parent chain whose required checks have all passed.
@@ -647,6 +656,9 @@ pub async fn advance_tested(hub: &Arc<Hub>, project: &Project) -> Result<()> {
                 }
                 if cur == root {
                     base_depth = Some(0);
+                    break;
+                }
+                if above.len() >= MAX_TESTED_WALK {
                     break;
                 }
                 let Ok(snap) = src.snapshot(&cur) else { break };

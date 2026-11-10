@@ -25,7 +25,7 @@ use veil_core::{
 
 use crate::support::*;
 
-const RUNNER_REFUSAL: &str = "a CI runner session may only read what its grant allows and report check results";
+const RUNNER_REFUSAL: &str = "a CI runner session writes only check results: it cannot upload objects, push, commit or land changes";
 
 fn body(r: &Reply) -> String {
     String::from_utf8_lossy(&r.body).into_owned()
@@ -181,7 +181,7 @@ fn runner_sees_only_its_grant_and_results_respect_visibility_and_runner_cannot_w
         &hub,
         &src_runner,
         &p.name,
-        &json!({"branch": "main", "changes": []}),
+        &json!({"onto": "main", "base": tip1.hex(), "edits": [{"path": "src/lib.rs", "put": {"text": "hacked"}}]}),
     );
     assert_eq!(
         (r_land.status, r_land.json()["code"].clone(), r_land.json()["message"].clone()),
@@ -193,7 +193,7 @@ fn runner_sees_only_its_grant_and_results_respect_visibility_and_runner_cannot_w
     let r_push = hub.api().post_json(
         Some(&src_runner),
         &format!("/v1/projects/{}/push", p.name),
-        &json!({"snapshots": [], "branches": [{"name": "main", "old": tip1.hex(), "new": tip1.hex()}]}),
+        &json!({"updates": [{"branch": "main", "expected": tip1.hex(), "new": tip1.hex()}]}),
     );
     assert_eq!(
         (r_push.status, r_push.json()["code"].clone(), r_push.json()["message"].clone()),
@@ -453,9 +453,9 @@ fn main_at_tested_moves_only_forward_when_required_checks_pass_across_servers_an
         // Query API resolves `main@tested` too.
         let qr = h
             .api()
-            .get(Some(&admin), &format!("/v1/projects/{}/q/resolve?rev=main@tested", p.name));
+            .get(Some(&admin), &format!("/v1/projects/{}/q/show?rev=main@tested", p.name));
         assert_eq!(qr.status, 200, "{}", body(&qr));
-        assert_eq!(qr.json()["id"], s3.hex());
+        assert_eq!(qr.json()["snapshot_id"], s3.hex());
     }
 }
 
@@ -486,21 +486,22 @@ fn failing_or_absent_runner_never_blocks_landings_and_tested_stays_put() {
     let dev_s1 = tip(&hub, &dev, &p.name);
     assert_eq!(get_tested(&hub, Some(&dev), &p.name, "main").json()["snapshot"], dev_s1.hex());
 
-    // Land change 1 via `/changes` onto protected `main`, and report `ci/test = fail` on it.
-    let c1 = change(
+    // Land change 1 via `/land` onto protected `main`, and report `ci/test = fail` on it.
+    let c1 = land(
         &hub,
         &dev,
         &p.name,
         &json!({
+            "onto": "main",
             "base": dev_s1.hex(),
             "description": "landing 1 (breaks ci)",
-            "onto": {"branch": "main", "expected": "rebase"},
-            "edits": [{"path": "src/a.rs", "put": {"text": "pub fn a() {}\n"}}]
+            "edits": [{"path": "src/a.rs", "put": {"text": "pub fn a() {}\n"}}],
+            "wait": true
         }),
     );
     assert_eq!(c1.status, 200, "{}", body(&c1));
-    assert_eq!(c1.json()["branch"]["status"], "ok", "{}", body(&c1));
-    let dev_s2 = ObjectId::from_hex(c1.json()["snapshot"].as_str().unwrap()).unwrap();
+    assert_eq!(c1.json()["state"], "landed", "{}", body(&c1));
+    let dev_s2 = ObjectId::from_hex(c1.json()["landed"][0].as_str().unwrap()).unwrap();
 
     let rf = post_check(
         &hub,
@@ -512,20 +513,21 @@ fn failing_or_absent_runner_never_blocks_landings_and_tested_stays_put() {
 
     // Even with `ci/test` failing on `main`'s tip and no runner reporting on
     // subsequent commits, landings continue to succeed without waiting for CI!
-    let c2 = change(
+    let c2 = land(
         &hub,
         &dev,
         &p.name,
         &json!({
+            "onto": "main",
             "base": dev_s2.hex(),
             "description": "landing 2 (runner absent)",
-            "onto": {"branch": "main", "expected": "rebase"},
-            "edits": [{"path": "src/b.rs", "put": {"text": "pub fn b() {}\n"}}]
+            "edits": [{"path": "src/b.rs", "put": {"text": "pub fn b() {}\n"}}],
+            "wait": true
         }),
     );
     assert_eq!(c2.status, 200, "{}", body(&c2));
-    assert_eq!(c2.json()["branch"]["status"], "ok", "{}", body(&c2));
-    let dev_s3 = ObjectId::from_hex(c2.json()["snapshot"].as_str().unwrap()).unwrap();
+    assert_eq!(c2.json()["state"], "landed", "{}", body(&c2));
+    let dev_s3 = ObjectId::from_hex(c2.json()["landed"][0].as_str().unwrap()).unwrap();
 
     // `main` moved forward to `dev_s3`, while `main@tested` stayed put at `dev_s1`.
     assert_eq!(tip(&hub, &dev, &p.name), dev_s3);
@@ -614,7 +616,11 @@ fn agents_and_workspaces_start_from_main_at_tested_by_default_and_person_can_cho
         .api()
         .get(Some(&dev), &format!("/v1/projects/{}/q/show?rev={agent_snap}", p.name));
     assert_eq!(show.status, 200, "{}", body(&show));
-    assert_eq!(show.json()["parents"], json!([dev_s2.hex()]), "agent change parent is main@tested");
+    assert_eq!(
+        show.json()["parents"][0]["snapshot_id"],
+        json!(dev_s2.hex()),
+        "agent change parent is main@tested"
+    );
 
     // 4c. In a local clone (`dev_dir`), `vl clone` / `vl pull` fetches `main` (`dev_s3`)
     // and records `origin/main@tested` (`dev_s2`).

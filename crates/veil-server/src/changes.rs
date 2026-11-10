@@ -898,6 +898,11 @@ pub(crate) async fn create_with(
     };
     let target = onto.as_ref().map(|o| o.branch.clone()).or_else(|| land.as_ref().map(|(_, q)| q.branch.clone()));
     let base_real = resolve_base(hub, project, viewer, req.base, target.as_deref(), land.is_some()).await?;
+    let base_proj = if req.base == ObjectId([0; 32]) {
+        sync::projected(hub, project, viewer, base_real).await?
+    } else {
+        req.base
+    };
     // A new revision of one of the caller's own changes, or a new change.
     let (change_id, predecessors) = match req.change_id {
         Some(cid) => {
@@ -954,7 +959,7 @@ pub(crate) async fn create_with(
             rejected = Some(format!("'{}' is protected: land the change instead (`vl land`, `POST …/land`)", o.branch));
         }
     }
-    let (mut parent, mut pparent) = (base_real, req.base);
+    let (mut parent, mut pparent) = (base_real, base_proj);
     let mut restacked = Vec::new();
     if let (Some(o), Some(c)) = (&onto, cur) {
         if let Expected::Tip(t) = o.expected {
