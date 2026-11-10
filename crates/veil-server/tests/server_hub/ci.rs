@@ -472,7 +472,7 @@ fn failing_or_absent_runner_never_blocks_landings_and_tested_stays_put() {
     let s1 = set_rules(
         &hub,
         &p,
-        "[branches.main]\nprotected = true\nrequired_checks = [\"ci/test\"]\n\n[checks.\"ci/test\"]\npaths = [\"src/\"]\n",
+        "[branches.main]\nprotected = true\nrequired_checks = [\"ci/test\"]\n\n[checks.\"ci/test\"]\npaths = [\"src/\"]\n\n[review]\nnormal = { approvals = 0 }\nhigh = { approvals = 0 }\n",
     );
 
     // Mark S1 as passing `ci/test` so `main@tested` starts at S1.

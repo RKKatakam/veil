@@ -16,6 +16,7 @@
 //! | [`events`] | the project event stream: SSE outcomes and branch moves per viewer (S18) |
 //! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
 //! | [`query`] | the query API: history answered per viewer (S13) |
+//! | [`prs`] | PRs and review: visibility classes, revisions, threads, approvals (S21) |
 //! | [`limits`] | rate limits, request bodies under a budget, per-project bulkheads, shedding, health metrics (S24) |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
 //! | [`store`] | object storage: local directory or S3 |
@@ -38,6 +39,7 @@ pub mod landing;
 pub mod limits;
 pub mod pack;
 pub mod perm;
+pub mod prs;
 pub mod query;
 pub mod search;
 pub mod shares;

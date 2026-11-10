@@ -207,7 +207,11 @@ impl<'g, 'a> Trees<'g, 'a> {
     /// under `under`, sorted by path.
     pub fn changes(&self, old: ObjectId, new: ObjectId, under: &str) -> Result<Vec<Change>> {
         if under.is_empty() {
-            return Ok(changes::diff(self, old, new)?.0);
+            let mut out = changes::diff(self, old, new)?.0;
+            if self.view.is_narrowed() {
+                out.retain(|c| self.view.within_narrowing(&c.path));
+            }
+            return Ok(out);
         }
         let (o, n) = (self.entry_at(old, under)?, self.entry_at(new, under)?);
         let subtree = |e: &Option<TreeEntry>| -> Result<Option<ObjectId>> {
@@ -235,6 +239,9 @@ impl<'g, 'a> Trees<'g, 'a> {
                 old: ol,
                 new: nl,
             });
+        }
+        if self.view.is_narrowed() {
+            out.retain(|c| self.view.within_narrowing(&c.path));
         }
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
