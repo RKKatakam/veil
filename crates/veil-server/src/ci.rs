@@ -302,7 +302,21 @@ pub async fn list_checks_route(
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     let rev = q.rev.as_deref().unwrap_or(&project.default_branch);
     let (proj_id, reals) = resolve_rev_for_read(&hub, &project, &viewer, rev).await?;
+    let checks = checks_for(&hub, &project, &viewer, proj_id, &reals).await?;
+    Ok(Json(ChecksResponse {
+        snapshot: proj_id,
+        checks,
+    }))
+}
 
+/// The check results on `reals` (projected as `proj_id`) that `viewer` may see.
+pub async fn checks_for(
+    hub: &Hub,
+    project: &Project,
+    viewer: &Viewer,
+    proj_id: ObjectId,
+    reals: &[ObjectId],
+) -> Result<Vec<CheckResult>> {
     type Row = (String, String, String, Option<String>, Option<String>, String, String, bool, i64);
     let hexes: Vec<String> = reals.iter().map(ObjectId::hex).collect();
     let rows: Vec<Row> = sqlx::query_as(
@@ -323,7 +337,7 @@ pub async fn list_checks_route(
         }
         let Some(state) = CheckState::parse(&state_s) else { continue };
         let session_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-        if !can_see_check(&project, &viewer, &session_paths, admin_only) {
+        if !can_see_check(project, viewer, &session_paths, admin_only) {
             continue;
         }
         checks.push(CheckResult {
@@ -337,10 +351,7 @@ pub async fn list_checks_route(
             updated_at,
         });
     }
-    Ok(Json(ChecksResponse {
-        snapshot: proj_id,
-        checks,
-    }))
+    Ok(checks)
 }
 
 /// `GET /v1/projects/{p}/tested/{branch}`: the newest snapshot on `branch`

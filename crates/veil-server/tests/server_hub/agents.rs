@@ -1645,6 +1645,17 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         // S22: embargo release lands the hidden line onto its target branch
         // through `landing::agent_stack` (merge of S22).
         ("/v1/projects/{p}/embargoes/{id}/release", "write"),
+        // S21: PRs and review (visibility classes, risk, approvals; narrowed in `prs`).
+        ("/v1/projects/{p}/prs", "narrowed"),
+        ("/v1/projects/{p}/prs/{id}", "narrowed"),
+        ("/v1/projects/{p}/prs/{id}/diff", "narrowed"),
+        ("/v1/projects/{p}/prs/{id}/revisions", "narrowed"),
+        ("/v1/projects/{p}/prs/{id}/close", "narrowed"),
+        ("/v1/projects/{p}/prs/{id}/threads", "narrowed"),
+        ("/v1/projects/{p}/prs/{id}/threads/{t}", "narrowed"),
+        ("/v1/projects/{p}/prs/{id}/reviews", "narrowed"),
+        ("/v1/projects/{p}/prs/{id}/reviews/dismiss", "person"),
+        ("/v1/projects/{p}/prs/{id}/land", "narrowed"),
     ];
     let routes: Vec<&str> = API.split(".route(\"").skip(1).map(|s| s.split('"').next().unwrap()).collect();
     assert!(routes.len() >= 40, "the router was not read: {routes:?}");
@@ -1686,6 +1697,12 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
     }
     assert!(SYNC.contains("narrowing_gate(src, &view, n.tree, &ptrees)?;\n    let mut g = Graft::new"), "complete does not run the narrowing gate on the pushed tree before the graft");
     assert!(body_of(CHANGES, "create").contains("within_narrowing"), "an API commit's edits are not narrowed");
+    const PRS: &str = include_str!("../../src/prs/mod.rs");
+    assert!(PRS.contains("let p = caller.not_runner()?;"), "prs::participant does not refuse CI runner sessions");
+    for f in ["create", "add_revision", "close", "new_thread", "update_thread", "add_review", "dismiss", "land"] {
+        let b = body_of(PRS, f);
+        assert!(b.contains("participant(ask, caller)?") || b.contains("caller.not_runner()?"), "PR write handler {f} does not refuse CI runner sessions");
+    }
 }
 
 /// Rule 2, the kinds the cycle-4 test leaves out: a rename into or out of

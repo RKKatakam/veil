@@ -1399,7 +1399,10 @@ fn a_push_of_a_stack_with_attempts_across_windows_keeps_every_attempt_and_lands_
     // 3. Protected branch (S17 landing service): protect `guarded` and push 40 changes
     //    with attempts (80 snapshots > GUESS_WINDOW = 64) with `wait: true`.
     let mut rules_c = Craft::new(&api, &p.admin, &p.name, "main");
-    rules_c.file(".veilrules", "[branches.guarded]\nprotected = true\n");
+    rules_c.file(
+        ".veilrules",
+        "[branches.guarded]\nprotected = true\n[review]\nnormal = { approvals = 0 }\nhigh = { approvals = 0 }\n",
+    );
     let r_rules = rules_c.push("main", "protect guarded");
     assert_eq!(r_rules.status, 200, "{}", String::from_utf8_lossy(&r_rules.body));
     let main_tip = api.tips(Some(&p.admin.token()), &p.name).unwrap().branches["main"];

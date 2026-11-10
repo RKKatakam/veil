@@ -275,6 +275,8 @@ struct Built {
     alone: bool,
     /// The default branch's new access lines, for its one entry.
     accept: Option<String>,
+    /// The default branch's `.veilrules` at the new tip (S21).
+    rules_file: Option<crate::prs::state::RulesFile>,
 }
 
 impl Built {
@@ -866,6 +868,15 @@ impl Service {
         let mp: Vec<String> = b.memos.iter().map(|m| m.2.hex()).collect();
         let mc: Vec<bool> = b.memos.iter().map(|m| m.3).collect();
         let accept = b.accept.clone();
+        let rules_landing = match (moved, b.after.tip, b.rules_file.clone()) {
+            (true, Some(new), Some(file)) => Some(crate::prs::state::Landing {
+                old: b.old_tip,
+                new,
+                file,
+                fast_forward: true,
+            }),
+            _ => None,
+        };
         let landed = b.outcomes.iter().filter(|o| matches!(o, Outcome::Landed { .. })).count();
         let notify = hub.caches.notices.load(Ordering::SeqCst);
         let active_agents: Vec<(i64, String, (i64, i64))> = b
@@ -879,7 +890,7 @@ impl Service {
             .collect();
         let tx_results = results.clone();
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-            let (ls, ll, mc, cc, ca, cl, snapshot_authors, active_agents) = (
+            let (ls, ll, mc, cc, ca, cl, snapshot_authors, active_agents, rules_landing) = (
                 ls.clone(),
                 ll.clone(),
                 mc.clone(),
@@ -888,6 +899,7 @@ impl Service {
                 cl.clone(),
                 snapshot_authors.clone(),
                 active_agents.clone(),
+                rules_landing.clone(),
             );
             let (branch, holder, old, new, seqs, snapshots, mk, mr, mp, accept, name, mut results) = (
                 branch.clone(),
@@ -965,6 +977,9 @@ impl Service {
                 };
                 if n != 1 {
                     return Err(Error::conflict(MOVED));
+                }
+                if let Some(l) = &rules_landing {
+                    crate::prs::state::record_landing(&mut *c, pid, l).await?;
                 }
                 if let Some(text) = &accept {
                     // Bumps the project's access epoch (a trigger): later
@@ -1299,6 +1314,7 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
         after: on.clone(),
         alone: false,
         accept: None,
+        rules_file: None,
     };
     // Attached keys: projected from their memo over what came after it.
     for (k, who, at, m) in attach {
@@ -1689,6 +1705,7 @@ fn entry(
         if !who.viewer.admin && sync::entry_at(src, &chain_tree, RULES_FILE)? != sync::entry_at(src, &tip_tree, RULES_FILE)? {
             return Ok(Some(Outcome::Rejected("only admins may change the branch rules (.veilrules)".into())));
         }
+        b.rules_file = Some(crate::prs::state::file_at(src, chain_tree)?);
     }
     // Projections of every new snapshot for every kept view key, onto its
     // last memo.
@@ -1799,7 +1816,7 @@ fn recheck(
         signature: None,
         ..real.clone()
     };
-    let c = match sync::complete(src, &who.project, &who.viewer, &known, &n, parents, &real.attempts, identity) {
+    let c = match sync::complete(src, &who.project, &who.viewer, &known, &n, parents, &real.attempts, identity, &mut sync::PushRows::default()) {
         Ok(c) => c,
         Err(Error::Api { message, code: "forbidden" | "bad_request" | crate::auth::AGENT_SESSION, .. }) => return Ok(Err(message)),
         Err(e) => return Err(e),

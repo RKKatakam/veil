@@ -33,6 +33,7 @@ mod grants;
 mod caches;
 mod adversarial_s4;
 mod landing;
+mod prs;
 mod thin;
 mod cache;
 mod agents;

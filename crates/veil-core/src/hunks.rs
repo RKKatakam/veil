@@ -181,6 +181,40 @@ pub fn diff_text(old: &str, new: &str) -> TextDiff {
     TextDiff { hunks }
 }
 
+/// The blocks of [`diff_text`] as positions only, `(old_at, old_len,
+/// new_at, new_len)`, 0-based, in order, without copying a line: what
+/// mapping lines from `old` to `new` needs (the server's PR anchors).
+pub fn blocks(old: &str, new: &str) -> Vec<(usize, usize, usize, usize)> {
+    let mut scratch = String::new();
+    let patch = crate::textmerge::create_patch(old, new, &mut scratch);
+    let mut out = Vec::new();
+    for h in patch.hunks() {
+        let (or, nr) = (h.old_range(), h.new_range());
+        let mut old_idx = if !or.is_empty() { or.start() - 1 } else { or.start() };
+        let mut new_idx = if !nr.is_empty() { nr.start() - 1 } else { nr.start() };
+        let mut open: Option<(usize, usize, usize, usize)> = None;
+        for l in h.lines() {
+            match l {
+                diffy::Line::Context(_) => {
+                    out.extend(open.take());
+                    old_idx += 1;
+                    new_idx += 1;
+                }
+                diffy::Line::Delete(_) => {
+                    open.get_or_insert((old_idx, 0, new_idx, 0)).1 += 1;
+                    old_idx += 1;
+                }
+                diffy::Line::Insert(_) => {
+                    open.get_or_insert((old_idx, 0, new_idx, 0)).3 += 1;
+                    new_idx += 1;
+                }
+            }
+        }
+        out.extend(open);
+    }
+    out
+}
+
 /// `old` with the blocks `take` chooses applied (see the module
 /// documentation). `diff` must be [`diff_text`] of `old` and some new text.
 pub fn apply(old: &str, diff: &TextDiff, take: impl Fn(BlockId) -> bool) -> String {
@@ -238,6 +272,16 @@ pub fn block_view(hunk: &Hunk, b: usize) -> (String, &[Line]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn blocks_are_diff_texts_positions() {
+        let cases = [("a\nb\nc\n", "a\nB\nc\nd\n"), ("", "x\n"), ("x\ny\n", ""), ("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n", "A\nb\nc\nd\ne\nf\ng\nh\ni\nJ\nk\n")];
+        for (old, new) in cases {
+            let want: Vec<(usize, usize, usize, usize)> =
+                diff_text(old, new).hunks.iter().flat_map(|h| h.blocks.iter().map(|b| (b.old_at, b.old_len, b.new_at, b.added.len()))).collect();
+            assert_eq!(super::blocks(old, new), want, "{old:?} -> {new:?}");
+        }
+    }
+
     use super::*;
 
     fn all(d: &TextDiff) -> impl Fn(BlockId) -> bool + '_ {
