@@ -985,11 +985,11 @@ fn agent_session_token(api: &Api, token: &str, project: &str, run: &str) -> Stri
     r.json()["token"].as_str().unwrap().to_string()
 }
 
-fn land_edit(api: &Api, token: &str, project: &str, branch: &str, base: veil_core::ObjectId, path: &str, text: &str, wait: bool) -> Reply {
+fn land_edit(api: &Api, token: &str, project: &str, base: veil_core::ObjectId, path: &str, text: &str, wait: bool) -> Reply {
     api.post_json(
         Some(token),
         &format!("/v1/projects/{project}/land"),
-        &serde_json::json!({"onto": branch, "base": base.hex(), "edits": [{"path": path, "put": {"text": text}}], "description": format!("land {path}"), "wait": wait}),
+        &serde_json::json!({"onto": "main", "base": base.hex(), "edits": [{"path": path, "put": {"text": text}}], "description": format!("land {path}"), "wait": wait}),
     )
 }
 
@@ -1070,19 +1070,19 @@ fn a_flood_of_landings_from_one_person_or_session_never_delays_another_beyond_th
     hold_branch(&hub, pid, "main");
     let mut flood_a = Vec::new();
     for i in 0..90 {
-        let r = land_edit(&api, &sess_a, &p.name, "main", base, &format!("src/flood/a/{i:03}.rs"), &format!("a {i}\n"), false);
+        let r = land_edit(&api, &sess_a, &p.name, base, &format!("src/flood/a/{i:03}.rs"), &format!("a {i}\n"), false);
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
         flood_a.push(r.json()["ticket"].as_str().unwrap().to_string());
     }
     let mut flood_b = Vec::new();
     for i in 0..30 {
-        let r = land_edit(&api, &sess_b, &p.name, "main", base, &format!("src/flood/b/{i:03}.rs"), &format!("b {i}\n"), false);
+        let r = land_edit(&api, &sess_b, &p.name, base, &format!("src/flood/b/{i:03}.rs"), &format!("b {i}\n"), false);
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
         flood_b.push(r.json()["ticket"].as_str().unwrap().to_string());
     }
     // A second person (`admin`) arrives after all 120 queued entries from `dev`.
     let fair_path = "src/fair.rs";
-    let r2 = land_edit(&api, &admin_tok, &p.name, "main", real_base, fair_path, "admin fair\n", false);
+    let r2 = land_edit(&api, &admin_tok, &p.name, real_base, fair_path, "admin fair\n", false);
     assert_eq!(r2.status, 200, "{}", String::from_utf8_lossy(&r2.body));
     let t_dev2 = r2.json()["ticket"].as_str().unwrap().to_string();
 
@@ -1227,12 +1227,12 @@ fn every_landing_bound_refuses_clearly_names_nothing_hidden_and_never_half_lands
     // Session s1 queues up to its bound (4).
     let mut tickets = Vec::new();
     for i in 0..4 {
-        let r = land_edit(&api, &s1, &p.name, "main", base, &format!("src/s1/f{i}.rs"), "x\n", false);
+        let r = land_edit(&api, &s1, &p.name, base, &format!("src/s1/f{i}.rs"), "x\n", false);
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
         tickets.push((s1.clone(), r.json()["ticket"].as_str().unwrap().to_string()));
     }
     // The 5th from s1 is refused with 429 rate_limited, naming nothing hidden.
-    let over_s1 = land_edit(&api, &s1, &p.name, "main", base, "src/s1/over.rs", "over\n", false);
+    let over_s1 = land_edit(&api, &s1, &p.name, base, "src/s1/over.rs", "over\n", false);
     assert_eq!(over_s1.status, 429, "{}", String::from_utf8_lossy(&over_s1.body));
     let v = over_s1.json();
     assert_eq!(v["code"], "rate_limited", "{v}");
@@ -1246,7 +1246,7 @@ fn every_landing_bound_refuses_clearly_names_nothing_hidden_and_never_half_lands
     // Session s2 of the same person can still queue 2 more (bringing the
     // person to 6 of 7).
     for i in 0..2 {
-        let r = land_edit(&api, &s2, &p.name, "main", base, &format!("src/s2/f{i}.rs"), "y\n", false);
+        let r = land_edit(&api, &s2, &p.name, base, &format!("src/s2/f{i}.rs"), "y\n", false);
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
         tickets.push((s2.clone(), r.json()["ticket"].as_str().unwrap().to_string()));
     }
@@ -1331,17 +1331,17 @@ fn every_landing_bound_refuses_clearly_names_nothing_hidden_and_never_half_lands
 
     // 1 more landing from `s2` reaches the person bound (7), and the 8th is
     // refused even though `s2` only has 3 of its 4 session bound used.
-    let ok7 = land_edit(&api, &s2, &p.name, "main", base, "src/s2/f2.rs", "y2\n", false);
+    let ok7 = land_edit(&api, &s2, &p.name, base, "src/s2/f2.rs", "y2\n", false);
     assert_eq!(ok7.status, 200, "{}", String::from_utf8_lossy(&ok7.body));
     tickets.push((s2.clone(), ok7.json()["ticket"].as_str().unwrap().to_string()));
 
-    let over_person = land_edit(&api, &s2, &p.name, "main", base, "src/s2/over_p.rs", "over\n", false);
+    let over_person = land_edit(&api, &s2, &p.name, base, "src/s2/over_p.rs", "over\n", false);
     assert_eq!(over_person.status, 429, "{}", String::from_utf8_lossy(&over_person.body));
     assert!(over_person.json()["message"].as_str().unwrap().contains("7"), "{}", over_person.json());
 
     // Another person (`fin`) is unaffected by `dev`'s full queue.
     let fin_base = api.tips(Some(&fin), &p.name).unwrap().branches["main"];
-    let fin_r = land_edit(&api, &fin, &p.name, "main", fin_base, &format!("{BILL_DIR}/ok.txt"), "fin ok\n", false);
+    let fin_r = land_edit(&api, &fin, &p.name, fin_base, &format!("{BILL_DIR}/ok.txt"), "fin ok\n", false);
     assert_eq!(fin_r.status, 200, "another person's landing is not refused: {}", String::from_utf8_lossy(&fin_r.body));
     tickets.push((fin.clone(), fin_r.json()["ticket"].as_str().unwrap().to_string()));
 
@@ -1371,11 +1371,11 @@ fn landing_counters_in_health_metrics_reach_admins_only_and_name_nothing_hidden(
     let base = api.tips(Some(&fin), &p.name).unwrap().branches["main"];
 
     // Land a change in the restricted `BILL_DIR/` folder and a conflicting change.
-    let r1 = land_edit(&api, &fin, &p.name, "main", base, &format!("{BILL_DIR}/secret-plan.txt"), "v1\n", true);
+    let r1 = land_edit(&api, &fin, &p.name, base, &format!("{BILL_DIR}/secret-plan.txt"), "v1\n", true);
     assert_eq!(r1.status, 200, "{}", String::from_utf8_lossy(&r1.body));
     assert_eq!(r1.json()["state"], "landed");
 
-    let r2 = land_edit(&api, &fin, &p.name, "main", base, &format!("{BILL_DIR}/secret-plan.txt"), "v2-conflict\n", true);
+    let r2 = land_edit(&api, &fin, &p.name, base, &format!("{BILL_DIR}/secret-plan.txt"), "v2-conflict\n", true);
     assert_eq!(r2.status, 200, "{}", String::from_utf8_lossy(&r2.body));
     assert_eq!(r2.json()["state"], "conflict");
 
@@ -1431,7 +1431,7 @@ fn landing_bounds_hold_across_two_servers_sharing_the_database() {
                 let api = if i % 2 == 0 { &api1 } else { &api2 };
                 let s1 = &s1;
                 let name = &p.name;
-                scope.spawn(move || land_edit(api, s1, name, "main", base, &format!("src/m1/f{i:02}.rs"), "m1\n", false).status)
+                scope.spawn(move || land_edit(api, s1, name, base, &format!("src/m1/f{i:02}.rs"), "m1\n", false).status)
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -1450,7 +1450,7 @@ fn landing_bounds_hold_across_two_servers_sharing_the_database() {
                 let api = if i % 2 == 0 { &api1 } else { &api2 };
                 let s2 = &s2;
                 let name = &p.name;
-                scope.spawn(move || land_edit(api, s2, name, "main", base, &format!("src/m2/f{i:02}.rs"), "m2\n", false).status)
+                scope.spawn(move || land_edit(api, s2, name, base, &format!("src/m2/f{i:02}.rs"), "m2\n", false).status)
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
