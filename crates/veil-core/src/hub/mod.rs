@@ -25,6 +25,7 @@
 pub mod access;
 pub mod agent;
 pub mod changes;
+pub mod ci;
 pub mod encoding;
 pub mod grant;
 pub mod land;

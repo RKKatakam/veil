@@ -26,11 +26,17 @@ pub const MAX_INLINE_TEXT: usize = 64 << 20;
 /// (`"expected": "rebase"`) before it answers `rejected`.
 pub const MAX_REBASES: u32 = 5;
 
+fn default_base() -> ObjectId {
+    ObjectId([0; 32])
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeRequest {
     /// The snapshot the edits are on: a projected id the caller may see
-    /// (a branch tip, or a change this API returned).
+    /// (a branch tip, or a change this API returned). When omitted in JSON,
+    /// the server uses `main@tested` (or the target branch's tip).
+    #[serde(default = "default_base")]
     pub base: ObjectId,
     /// A new revision of a change of the caller's that this API made;
     /// absent: a new change.

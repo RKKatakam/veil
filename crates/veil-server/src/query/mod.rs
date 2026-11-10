@@ -222,11 +222,25 @@ pub async fn resolve(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instant) ->
             if rev.is_empty() || rev.len() > 255 {
                 return Err(no_revision());
             }
-            let target: Option<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2")
-                .bind(project)
-                .bind(rev)
-                .fetch_optional(&hub.db)
-                .await?;
+            let target: Option<String> = match rev.strip_suffix("@tested") {
+                Some(branch) if !branch.is_empty() => {
+                    sqlx::query_scalar(
+                        "SELECT t.snapshot FROM tested t JOIN branches b ON b.project_id = t.project_id AND b.name = t.branch \
+                         WHERE t.project_id = $1 AND t.branch = $2 AND t.lineage = b.lineage",
+                    )
+                    .bind(project)
+                    .bind(branch)
+                    .fetch_optional(&hub.db)
+                    .await?
+                }
+                _ => {
+                    sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2")
+                        .bind(project)
+                        .bind(rev)
+                        .fetch_optional(&hub.db)
+                        .await?
+                }
+            };
             target.and_then(|t| ObjectId::from_hex(&t).ok()).ok_or_else(no_revision)?
         }
     };

@@ -129,6 +129,10 @@ pub struct Tips {
     /// The server's grant key (hex): what caches check grants against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant_key: Option<String>,
+    /// Branch → newest snapshot on the branch whose required checks all
+    /// passed (`<branch>@tested`), as this viewer sees it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tested: BTreeMap<String, ObjectId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

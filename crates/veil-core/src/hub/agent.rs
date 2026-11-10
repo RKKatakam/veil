@@ -51,6 +51,10 @@ pub struct AgentSessionRequest {
     /// past the person's own session).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seconds: Option<i64>,
+    /// A CI runner session: reads only what its grant allows and writes only
+    /// check results (cannot push, create changes or land).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub runner: bool,
 }
 
 /// The answer: the session's token (shown once, kept only as a hash by the
@@ -64,6 +68,12 @@ pub struct AgentSession {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub only: Vec<String>,
     pub attribution: Attribution,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub runner: bool,
+    /// The project's `main@tested` snapshot in the caller's view, when one
+    /// exists: where new agent work starts by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tested: Option<crate::id::ObjectId>,
 }
 
 /// `only` normalised: root-relative folder or file paths, no glob, no

@@ -878,6 +878,35 @@ impl Client {
             Err(_) => Err(Self::error(status, &out)),
         }
     }
+
+    /// Issue a narrowed CI runner session (`POST /v1/sessions/ci`, S19).
+    pub fn ci_session(&self, req: &veil_core::hub::ci::CiSessionRequest) -> Result<veil_core::hub::agent::AgentSession> {
+        self.json("POST", "/v1/sessions/ci", Some(req))
+    }
+
+    /// Record a CI check result (`POST /v1/projects/{p}/checks`, S19).
+    pub fn post_check(&self, req: &veil_core::hub::ci::CheckRequest) -> Result<veil_core::hub::ci::CheckResult> {
+        self.json("POST", &self.url.project_path("/checks"), Some(req))
+    }
+
+    /// List CI checks on a revision (`GET /v1/projects/{p}/checks`, S19).
+    pub fn checks(&self, rev: Option<&str>) -> Result<veil_core::hub::ci::ChecksResponse> {
+        let path = match rev {
+            Some(r) => self.url.project_path(&format!("/checks?rev={}", percent(r))),
+            None => self.url.project_path("/checks"),
+        };
+        self.json("GET", &path, None::<&()>)
+    }
+
+    /// The newest tested snapshot on `branch` (`GET /v1/projects/{p}/tested/{branch}`, S19).
+    pub fn tested(&self, branch: &str) -> Result<Option<veil_core::hub::ci::TestedTip>> {
+        let (status, out) = self.call("GET", &self.url.project_path(&format!("/tested/{}", percent(branch))), None)?;
+        match status {
+            200 => Ok(Some(serde_json::from_slice(&out)?)),
+            404 => Ok(None),
+            s => Err(Self::error(s, &out)),
+        }
+    }
 }
 
 /// `s` percent-encoded for a query string.
@@ -991,7 +1020,13 @@ pub fn pull_moving(
     // another remote) asks for every tip, held or not: what a held tip
     // reaches may be in the cache only, or nowhere (BUG-1318). `have` then
     // skips, object by object, what the main store holds.
-    let mut want_tips: Vec<ObjectId> = tips.branches.values().copied().filter(|t| main_only || !store.has(t)).collect();
+    let mut want_tips: Vec<ObjectId> = tips
+        .branches
+        .values()
+        .chain(tips.tested.values())
+        .copied()
+        .filter(|t| main_only || !store.has(t))
+        .collect();
     want_tips.sort();
     want_tips.dedup();
     // A repository made for this clone holds only the root snapshot and
@@ -1038,7 +1073,7 @@ pub fn pull_moving(
             if s.signature_valid() != Some(true) && !held {
                 report.warnings.push(format!("snapshot {} carries no valid signature", id.short()));
             }
-            if !thin || Some(id) == checked_out {
+            if !thin || Some(id) == checked_out || tips.tested.values().any(|t| *t == id) {
                 new_snaps.push((id, s.tree));
             }
             if !held && incoming.put(id, raw, "")? {
@@ -1192,6 +1227,12 @@ pub fn pull_moving(
         .collect();
     let old_tips: Vec<ObjectId> = tx.view.remote_tags.iter().filter(|(k, _)| k.starts_with(&prefix)).map(|(_, v)| *v).collect();
     apply_remote_tags(&mut tx, remote, tags, None, &mut report)?;
+    tx.view.remote_tags.retain(|k, _| !(k.starts_with(&prefix) && k.ends_with("@tested")));
+    for (n, id) in &tips.tested {
+        if store.has(id) {
+            tx.view.remote_tags.insert(format!("{remote}/{n}@tested"), *id);
+        }
+    }
     // The person's view changed since this clone last pulled: a tip it had
     // is named under another id now (BUG-1509).
     let moving = thin

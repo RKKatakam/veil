@@ -4082,3 +4082,122 @@ are unchanged, the daemon's store is a cache (delete `~/.cache/veil/daemon`
 or `$VEIL_HOME/daemon`), and the server's `GET /v1/grant-key` is additive.
 Stop running daemons first (`vl daemon stop`), or they exit when their
 socket is removed.
+
+---
+
+### 13.35 S19: CI through the API, land first / test after, and `main@tested`
+
+Design: [`docs/design/server/phase-4-agent-scale.md`](design/server/phase-4-agent-scale.md)
+§4.6 ("CI through the API, not through a clone"), §4.7 ("Agents start from
+`main@tested`"), §5.2 ("Checks, after landing"), §6 Threat 10 ("A compromised
+CI runner").
+
+#### What it builds
+
+* **Migration `0025_ci_and_tested.sql`** (version 25):
+  * `sessions.agent_runner BOOLEAN NOT NULL DEFAULT FALSE`: marks a session
+    as a narrow CI runner session.
+  * `checks (project_id, snapshot, name, state, summary, url, log, runner_id, runner_name, session_paths, admin_only, updated_at)`,
+    primary key `(project_id, snapshot, name)` with index `checks_by_runner
+    (runner_name, updated_at)`.
+  * `tested (project_id, branch, lineage, snapshot, depth, updated_at)`,
+    primary key `(project_id, branch)`.
+* **`.veilrules` check configuration (`crates/veil-server/src/landing/rules.rs`):**
+  * `[branches.<name>] required_checks = ["ci/build", "ci/test", ...]`
+    declares which checks must pass on a snapshot for `<name>@tested` to
+    advance to it (up to 64 checks per branch).
+  * `[checks.<name>] paths = ["src/", ...]` declares the default path
+    prefix grant for a runner minted for `<name>`.
+* **Narrow CI runner sessions (`POST /v1/sessions/ci`, `vl session ci`):**
+  * Mints a short-lived (default 1 hour, max 24 hours) runner session with
+    `agent_runner = true`.
+  * When `check` is named and `only` is omitted, the server reads `.veilrules`
+    on the default branch and narrows `only` to `[checks.<check>].paths`.
+  * The minting caller must be able to read every path in `only` (and an
+    un-narrowed runner session requires project admin or full-view access).
+  * A runner session (`Caller::is_runner()`) is refused on `POST /objects`,
+    `POST /push`, `POST /land`, and `POST /changes` with `403 agent_session`:
+    it can only read what its narrowed grant allows and report check results.
+* **Reporting and reading check results (`POST /v1/projects/{p}/checks`, `GET /v1/projects/{p}/checks`, `vl checks`):**
+  * `POST /v1/projects/{p}/checks` accepts `{snapshot, name, state, summary, url, log}`.
+    The caller's `snapshot` id (real or projected) is resolved to the
+    canonical `commits.snapshot` on `main` (or any project branch), verified
+    against the caller's view, and stored with the runner's readable path
+    footprint (`session_paths`, `admin_only`).
+  * `GET /v1/projects/{p}/checks?rev=<rev>` resolves `rev` (default `main`)
+    through the reader's view, filters stored checks so a reader only sees a
+    check if the reader's `View` can see every path the runner could read
+    (admin-only checks are visible only to admins; path-narrowed checks require
+    `view.sees_under(prefix)` for every prefix in `session_paths`), and
+    projects `CheckResult.snapshot` into the reader's view.
+* **Land first, test after, and `<branch>@tested` (`GET /v1/projects/{p}/tested/{branch}`, `vl tested`):**
+  * Landings (`POST /land`, `POST /changes`, `POST /push`) never wait for CI
+    runners; failing or absent checks never block a landing.
+  * Whenever a check passes on snapshot `S`, `advance_tested` checks each
+    branch whose tip reaches `S` along first-parent ancestry (up to 1,024
+    commits). If `[branches.<branch>].required_checks` is non-empty and every
+    required check has `state = 'pass'` on `S` (under the `.veilrules` at the
+    branch tip), `tested` is updated in a serializable transaction:
+    * Only advances forward: if the existing `tested.snapshot` is on the same
+      first-parent lineage and has `depth <= new_depth` (closer to the tip), a
+      late pass on an older ancestor never moves `<branch>@tested` backwards.
+  * `<branch>@tested` is served in `GET /v1/projects/{p}/tips` (`Tips.tested`,
+    projected per reader), resolved by the server query API
+    (`/q/resolve?rev=main@tested`) and local revset parser (`main@tested`,
+    stored as `origin/main@tested` in `remote_tags` on `vl pull`), and shown
+    by `vl tested`.
+* **Agents and workspaces start from `main@tested` by default:**
+  * `POST /v1/sessions/agent` returns `tested: Option<ObjectId>` (the caller's
+    projected `main@tested`).
+  * `POST /v1/projects/{p}/changes` with `base` omitted (or all-zero) defaults
+    to `<onto.branch>@tested` (falling back to the branch tip when no tested
+    tip is recorded yet).
+  * `vl ws new <name>` (when `-r` is omitted) and `vl change new` (when
+    `--base` is omitted) start from `main@tested` if present in `remote_tags`,
+    while a person can still pass `-r main` or `--base <rev>`.
+
+#### Bounds
+
+* **Per check result:** `name` ≤ 64 bytes (`MAX_CHECK_NAME`, ASCII graphic, no
+  `..`, no control characters); `summary` ≤ 512 bytes (`MAX_SUMMARY_BYTES`, no
+  control characters); `url` ≤ 1,024 bytes (`MAX_URL_BYTES`, `http://` or
+  `https://` only); `log` ≤ 64 KiB (`MAX_LOG_BYTES`, no NUL bytes).
+* **Per snapshot (`MAX_CHECKS_PER_SNAPSHOT = 64`, `MAX_TIP_LOG_BYTES = 256 KiB`):**
+  at most 64 distinct check names per snapshot and at most 32 checks per
+  runner on a single snapshot (`MAX_RUNNER_CHECKS_PER_SNAPSHOT = 32`); when a
+  snapshot's total logs exceed 256 KiB, the oldest check logs on that snapshot
+  are trimmed (`log = NULL`).
+* **Per runner (`MAX_RUNNER_CHECKS = 256`, `MAX_RUNNER_LOG_BYTES = 1 MiB`):**
+  across all snapshots, a runner retains at most 256 check results (oldest
+  evicted) and at most 1 MiB of logs (oldest logs trimmed to `NULL`).
+
+#### Guarantees and their tests (`server_hub::ci`)
+
+| # | Guarantee | Test |
+|---|---|---|
+| 1 | A CI runner sees only what its grant allows. A result names nothing its readers can't see. A runner can't move any branch or land anything. | `runner_sees_only_its_grant_and_results_respect_visibility_and_runner_cannot_write_code`, `agents::every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed` |
+| 2 | `main@tested` only ever moves to a tip whose required checks all passed, never backwards, and correctly across two servers and restarts. | `main_at_tested_moves_only_forward_when_required_checks_pass_across_servers_and_restarts` |
+| 3 | A failing or absent runner never blocks landings; `main@tested` just stays put. | `failing_or_absent_runner_never_blocks_landings_and_tested_stays_put` |
+| 4 | Agents start from `main@tested` by default, and a person can still choose another base. | `agents_and_workspaces_start_from_main_at_tested_by_default_and_person_can_choose_base` |
+| 5 | Results and their logs are bounded per tip and per runner. | `check_results_and_logs_are_bounded_per_tip_and_per_runner` |
+
+#### Threat review (design §6 Threat 10, plus visibility and DoS)
+
+| # | Attacker | Tries | Result | Test |
+|---|---|---|---|---|
+| 1 | A compromised CI runner (`POST /v1/sessions/ci`) | reads paths outside its `[checks.<name>].paths` or `only` grant | refused with `403` on every path-taking route and projected out of every snapshot/tree | guarantee 1 |
+| 2 | A compromised CI runner | pushes objects, moves a branch, lands a change, or creates a server-side change | refused with `403 agent_session` (`Caller::not_runner`) before touching objects or branches | guarantee 1 |
+| 3 | A non-admin user (`dev` without `billing/`) | mints a CI runner session for `ci/billing` (`paths = ["billing/"]`) | refused with `403`: caller cannot delegate paths their own view cannot see | guarantee 1 |
+| 4 | A check runner for a restricted area (`billing/` or admin-only) | writes restricted file contents or paths into `summary`, `url`, or `log` | `GET /checks` filters results by the reader's `View` against the runner's readable footprint (`session_paths`, `admin_only`) and projects `snapshot` into the reader's view | guarantee 1 |
+| 5 | An out-of-order or replayed runner | reports `pass` on an older ancestor after `main@tested` already moved to a newer snapshot, or reports `pass` on only a subset of `required_checks` | `tested` tracks `(lineage, depth)` in Postgres under `SERIALIZABLE` and never moves to a deeper (older) ancestor or an incomplete check set | guarantee 2 |
+| 6 | A dead, slow, or failing CI runner | stalls or reports `fail` on `main` | landings proceed immediately without waiting on CI; `main@tested` remains at the last passing snapshot and agents branch from `main@tested` | guarantee 3, guarantee 4 |
+| 7 | A noisy or hostile runner | floods `POST /checks` with huge logs, control sequences, `javascript:` URLs, or thousands of check names | validated (`MAX_CHECK_NAME`, `MAX_SUMMARY_BYTES`, `MAX_URL_BYTES`, `MAX_LOG_BYTES`) and bounded per snapshot (`64` checks, `256 KiB` logs) and per runner (`256` checks, `1 MiB` logs) | guarantee 5 |
+
+#### Reverting
+
+Revert the merge commit. The new tables (`checks`, `tested`) and column
+(`sessions.agent_runner`) in migration `0025` are ignored by older server
+binaries; `Tips.tested`, `AgentSession.runner`, and `AgentSession.tested` use
+`#[serde(default)]`; and `<branch>@tested` tags in `remote_tags` are ordinary
+remote tag entries.
+

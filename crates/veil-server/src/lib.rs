@@ -25,6 +25,7 @@ pub mod auth;
 pub mod cache;
 pub mod caches;
 pub mod changes;
+pub mod ci;
 pub mod db;
 pub mod derive;
 pub mod error;

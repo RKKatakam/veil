@@ -107,6 +107,9 @@ pub struct AgentGrant {
     /// person sees).
     pub only: Option<Arc<Vec<String>>>,
     pub attribution: Attribution,
+    /// A CI runner session: reads what its grant allows and writes only
+    /// check results.
+    pub runner: bool,
 }
 
 /// The code of the refusal of what an agent session may not do.
@@ -400,12 +403,12 @@ impl FromRequestParts<HubState> for Caller {
         stats.session_misses.fetch_add(1, Ordering::Relaxed);
         // The session and the person's epoch in one statement: the entry is
         // never tagged with an epoch newer than what it was read with.
-        type Row = (i64, String, String, i64, i64, i64, Option<String>, Option<i64>, Option<String>);
+        type Row = (i64, String, String, i64, i64, i64, Option<String>, Option<i64>, Option<String>, bool);
         let row: Option<Row> = sqlx::query_as(
             "SELECT p.id, p.name, d.signing_key, s.expires_at, \
              COALESCE((SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = p.id), 0), \
              COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $3 AND person_id = 0), 0), \
-             s.agent, s.agent_project, s.agent_only \
+             s.agent, s.agent_project, s.agent_only, s.agent_runner \
              FROM sessions s JOIN devices d ON d.id = s.device_id JOIN people p ON p.id = s.person_id \
              WHERE s.token_hash = $1 AND s.expires_at > $2 AND d.removed_at IS NULL AND NOT d.pending \
              AND (s.agent IS NOT NULL) = $4",
@@ -417,8 +420,8 @@ impl FromRequestParts<HubState> for Caller {
         .fetch_optional(&hub.db)
         .await?;
         match row {
-            Some((id, name, device_key, expires_at, person_epoch, project_epoch, agent, agent_project, agent_only)) => {
-                let agent = agent_grant(agent, agent_project, agent_only)?;
+            Some((id, name, device_key, expires_at, person_epoch, project_epoch, agent, agent_project, agent_only, agent_runner)) => {
+                let agent = agent_grant(agent, agent_project, agent_only, agent_runner)?;
                 let person = Person { id, name, device_key, agent };
                 hub.caches.put_session(
                     &hash,
@@ -443,7 +446,7 @@ impl FromRequestParts<HubState> for Caller {
 }
 
 /// An agent session's record, as stored; a malformed one fails closed.
-fn agent_grant(agent: Option<String>, project: Option<i64>, only: Option<String>) -> Result<Option<Arc<AgentGrant>>> {
+fn agent_grant(agent: Option<String>, project: Option<i64>, only: Option<String>, runner: bool) -> Result<Option<Arc<AgentGrant>>> {
     let Some(agent) = agent else { return Ok(None) };
     let damaged = || Error::unauthorized("this agent session's record is damaged; make a new one");
     let attribution: Attribution = serde_json::from_str(&agent).map_err(|_| damaged())?;
@@ -455,12 +458,28 @@ fn agent_grant(agent: Option<String>, project: Option<i64>, only: Option<String>
         project: project.ok_or_else(damaged)?,
         only,
         attribution,
+        runner,
     })))
 }
 
 impl Caller {
     pub fn signed_in(&self) -> Result<&Person> {
         self.person.as_ref().ok_or_else(|| Error::unauthorized("sign in first (`vl login`)"))
+    }
+
+    /// [`Caller::signed_in`], refusing a CI runner session: a runner reads
+    /// what it tests and writes only check results, never objects, branches,
+    /// changes or landings.
+    pub fn not_runner(&self) -> Result<&Person> {
+        let p = self.signed_in()?;
+        if p.agent.as_ref().is_some_and(|a| a.runner) {
+            return Err(Error::new(
+                axum::http::StatusCode::FORBIDDEN,
+                AGENT_SESSION,
+                "a CI runner session writes only check results: it cannot upload objects, push, commit or land changes",
+            ));
+        }
+        Ok(p)
     }
 
     /// [`Caller::signed_in`], refusing an agent session: changes of who
@@ -499,7 +518,23 @@ pub async fn agent_session(
     let me = caller.person_only()?.clone();
     req.attribution.validate().map_err(Error::bad_request)?;
     let only = normalize_only(&req.only).map_err(Error::bad_request)?;
-    let (project, _viewer) = crate::perm::open(&hub, &req.project, &caller).await?;
+    let (project, viewer) = crate::perm::open(&hub, &req.project, &caller).await?;
+    let mut narrowed_viewer = viewer.clone();
+    if !only.is_empty() {
+        narrowed_viewer.only = Some(Arc::new(only.clone()));
+    }
+    narrowed_viewer.agent = true;
+    if !project.view(&narrowed_viewer).sees_anything() && !project.participant(&narrowed_viewer) {
+        return Err(Error::forbidden("this narrowing can see nothing in this project"));
+    }
+    if req.runner {
+        let view = project.view(&viewer);
+        for p in &only {
+            if !view.sees_under(p) {
+                return Err(Error::forbidden("a CI runner cannot be granted a path you cannot read"));
+            }
+        }
+    }
     let parent = headers
         .get("authorization")
         .and_then(|a| a.to_str().ok())
@@ -518,10 +553,10 @@ pub async fn agent_session(
     // The parent's device and expiry are read in the insert itself: a
     // parent that ended (its device removed) makes nothing.
     let expires_at: Option<i64> = sqlx::query_scalar(
-        "INSERT INTO sessions (token_hash, device_id, person_id, expires_at, agent, agent_project, agent_only, parent_hash) \
-         SELECT $1, s.device_id, s.person_id, LEAST(s.expires_at, $2), $3, $4, $5, s.token_hash \
+        "INSERT INTO sessions (token_hash, device_id, person_id, expires_at, agent, agent_project, agent_only, agent_runner, parent_hash) \
+         SELECT $1, s.device_id, s.person_id, LEAST(s.expires_at, $2), $3, $4, $5, $6, s.token_hash \
          FROM sessions s JOIN devices d ON d.id = s.device_id \
-         WHERE s.token_hash = $6 AND s.person_id = $7 AND s.agent IS NULL AND s.expires_at > $8 \
+         WHERE s.token_hash = $7 AND s.person_id = $8 AND s.agent IS NULL AND s.expires_at > $9 \
          AND d.removed_at IS NULL AND NOT d.pending \
          RETURNING expires_at",
     )
@@ -530,12 +565,14 @@ pub async fn agent_session(
     .bind(&attribution)
     .bind(project.id)
     .bind(&only_json)
+    .bind(req.runner)
     .bind(&parent)
     .bind(me.id)
     .bind(now)
     .fetch_optional(&hub.db)
     .await?;
     let expires_at = expires_at.ok_or_else(|| Error::unauthorized("session expired or unknown; sign in again"))?;
+    let tested = crate::ci::tested_for(&hub, &project, &viewer, &project.default_branch).await?;
     crate::audit(&hub.db, Some(project.id), Some(me.id), "agent session", &format!("for {}", req.attribution.agent.escape_debug())).await;
     Ok(Json(AgentSession {
         token,
@@ -544,5 +581,7 @@ pub async fn agent_session(
         expires_at,
         only,
         attribution: req.attribution,
+        runner: req.runner,
+        tested,
     }))
 }
