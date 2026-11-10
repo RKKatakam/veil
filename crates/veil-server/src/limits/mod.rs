@@ -230,11 +230,13 @@ impl Limits {
 /// The longest one derive run waits for the server to stop shedding.
 pub const DERIVE_PAUSE: Duration = Duration::from_secs(10);
 
+type Places = Arc<Mutex<Option<(Option<gate::Place>, gate::Place)>>>;
+
 tokio::task_local! {
     /// The bulkhead places held by the request being served: dropped when
     /// the route answers, or sooner ([`leave_gates`]) before a wait for
     /// something other than the request's own work (BUG-1635).
-    static PLACES: std::cell::RefCell<Option<(Option<gate::Place>, gate::Place)>>;
+    static PLACES: Places;
     /// The landing queue bounds (`(max_session_outstanding, max_person_outstanding)`)
     /// of the server handling the current request.
     pub(crate) static BOUNDS: std::cell::Cell<(usize, usize)>;
@@ -245,8 +247,19 @@ tokio::task_local! {
 /// ticket, BUG-1635; nothing outside a request).
 pub fn leave_gates() {
     let _ = PLACES.try_with(|p| {
-        p.borrow_mut().take();
+        p.lock().unwrap().take();
     });
+}
+
+/// Carry the current request's landing bounds and bulkhead places into a
+/// spawned task that finishes the request's own work (`sync::push_with`,
+/// BUG-1668).
+pub fn in_request<F: std::future::Future>(hub: &crate::Hub, f: F) -> impl std::future::Future<Output = F::Output> {
+    let bounds = BOUNDS
+        .try_with(|b| b.get())
+        .unwrap_or_else(|_| landing::settings_bounds(&hub.limits.settings));
+    let places = PLACES.try_with(|p| p.clone()).unwrap_or_default();
+    BOUNDS.scope(std::cell::Cell::new(bounds), PLACES.scope(places, f))
 }
 
 /// `s` percent-decoded, as the routes' `Path` decodes it; `None` if it does
@@ -534,7 +547,7 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
         .scope(
             std::cell::Cell::new(bounds),
             PLACES.scope(
-                std::cell::RefCell::new(Some((project_place, server_place))),
+                Arc::new(Mutex::new(Some((project_place, server_place)))),
                 health::LAYERS.scope(std::cell::Cell::new(health::Counts::default()), async {
                     let r = next.run(req).await;
                     (r, health::LAYERS.with(|c| c.get()))

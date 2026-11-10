@@ -2025,11 +2025,12 @@ pub(crate) async fn push_with(
     // own scope, so the storage writes it makes are counted as its own
     // (BUG-1398; what it spawns, the deriver and the indexer, are not).
     let (hub2, project, viewer, who) = (hub.clone(), project.clone(), viewer.clone(), who.clone());
-    tokio::spawn(crate::store::own(async move {
+    let fut = crate::limits::in_request(hub, crate::store::own(async move {
         push_to_its_end(&hub2, &project, &viewer, &who, req, land_all, wait).await
-    }))
-    .await
-    .map_err(|e| Error::Other(e.into()))?
+    }));
+    tokio::spawn(fut)
+        .await
+        .map_err(|e| Error::Other(e.into()))?
 }
 
 /// [`push`], to its end.
