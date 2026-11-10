@@ -1526,6 +1526,11 @@ pub async fn status_route(
         return Err(Error::not_found(format!("no bisect on branch '{branch}'")));
     }
 
+    if crate::embargo::is_withheld_from_viewer(&hub, &project, &viewer, &b.good).await?
+        || crate::embargo::is_withheld_from_viewer(&hub, &project, &viewer, &b.bad).await?
+    {
+        return Err(Error::not_found(format!("no bisect on branch '{branch}'")));
+    }
     let p_good = sync::projected(&hub, &project, &viewer, b.good).await?;
     let p_bad = sync::projected(&hub, &project, &viewer, b.bad).await?;
     if p_good == p_bad && !sees_check {

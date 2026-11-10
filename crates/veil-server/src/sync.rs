@@ -711,6 +711,31 @@ pub(crate) async fn resolve_for(
     branches: &[&str],
     landing: bool,
 ) -> Result<Option<ObjectId>> {
+    resolve_for_mode(hub, project, viewer, id, branches, landing, false).await
+}
+
+/// As [`resolve_for`], preferring the uncollapsed commit `id` stands for over a
+/// hidden commit collapsed above it (once past the default branch's tip), so CI
+/// checks and bisect probes attach to the visible commit itself while keeping
+/// S22 embargo withholding in the single resolver (BUG-1783).
+pub(crate) async fn resolve_exact_for(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    id: &ObjectId,
+) -> Result<Option<ObjectId>> {
+    resolve_for_mode(hub, project, viewer, id, &[], true, true).await
+}
+
+async fn resolve_for_mode(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    id: &ObjectId,
+    branches: &[&str],
+    landing: bool,
+    prefer_own: bool,
+) -> Result<Option<ObjectId>> {
     if *id == root_snapshot_id() {
         return Ok(Some(*id));
     }
@@ -778,6 +803,8 @@ pub(crate) async fn resolve_for(
         None
     } else if rows.len() > NEWEST_BOUND {
         own().await?
+    } else if let Some(o) = if prefer_own { own().await? } else { None } {
+        Some(o)
     } else {
         // Their first parents: the derived graph's, else the objects'.
         let mut cands: Vec<(ObjectId, Option<ObjectId>)> = Vec::new();

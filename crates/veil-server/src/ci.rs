@@ -63,8 +63,8 @@ pub async fn ci_session(
     let mut only = req.only;
     if only.is_empty() {
         if let Some(check) = &req.check {
-            let (project, _) = perm::open(&hub, &req.project, &caller).await?;
-            let default_tip = branch_tip(&hub, project.id, &project.default_branch).await?;
+            let (project, viewer) = perm::open(&hub, &req.project, &caller).await?;
+            let default_tip = branch_tip(&hub, &project, &viewer, &project.default_branch).await?;
             let rules = sync::blocking(&hub, project.id, move |src| crate::landing::rules(src, default_tip)).await?;
             if let Some(paths) = rules.checks.get(check) {
                 only = paths.clone();
@@ -113,13 +113,10 @@ pub async fn post_check_route(
         validate_log(l).map_err(Error::bad_request)?;
     }
 
-    let Some(real_id) = resolve_snapshot_for_write(&hub, &project, &viewer, &req.snapshot).await? else {
+    let Some(real_id) = resolve_snapshot(&hub, &project, &viewer, &req.snapshot).await? else {
         return Err(Error::not_found("no such snapshot in your view of this project"));
     };
-    let proj_id = sync::projected(&hub, &project, &viewer, real_id).await?;
-    if proj_id != req.snapshot {
-        return Err(Error::not_found("no such snapshot in your view of this project"));
-    }
+    let proj_id = req.snapshot;
 
     let (session_paths, admin_only) = readable_footprint(&hub, &project, &viewer, real_id, &req.name).await?;
 
@@ -368,19 +365,30 @@ pub async fn tested_route(
     Ok(Json(TestedTip { branch, snapshot }))
 }
 
-/// `<branch>@tested` as `viewer` sees it (`None` when the branch does not
-/// exist or has no tested snapshot in its current lineage).
-pub async fn tested_for(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, branch: &str) -> Result<Option<ObjectId>> {
+async fn tested_real(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, branch: &str) -> Result<Option<ObjectId>> {
     let row: Option<String> = sqlx::query_scalar(
         "SELECT t.snapshot FROM tested t JOIN branches b ON b.project_id = t.project_id AND b.name = t.branch \
-         WHERE t.project_id = $1 AND t.branch = $2 AND t.lineage = b.lineage",
+         WHERE t.project_id = $1 AND t.branch = $2 AND t.lineage = b.lineage AND b.hidden_for_embargo IS NULL",
     )
     .bind(project.id)
     .bind(branch)
     .fetch_optional(&hub.db)
     .await?;
-    let Some(hex) = row else { return Ok(None) };
-    let Ok(real) = ObjectId::from_hex(&hex) else { return Ok(None) };
+    let Some(real) = row.and_then(|h| ObjectId::from_hex(&h).ok()) else {
+        return Ok(None);
+    };
+    if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await? {
+        return Ok(None);
+    }
+    Ok(Some(real))
+}
+
+/// `<branch>@tested` as `viewer` sees it (`None` when the branch does not
+/// exist or has no tested snapshot in its current lineage).
+pub async fn tested_for(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, branch: &str) -> Result<Option<ObjectId>> {
+    let Some(real) = tested_real(hub, project, viewer, branch).await? else {
+        return Ok(None);
+    };
     let proj = sync::projected(hub, project, viewer, real).await?;
     Ok(Some(proj))
 }
@@ -390,7 +398,7 @@ pub async fn tested_for(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, bran
 pub async fn all_tested_for(hub: &Arc<Hub>, project: &Project, viewer: &Viewer) -> Result<BTreeMap<String, ObjectId>> {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT t.branch, t.snapshot FROM tested t JOIN branches b ON b.project_id = t.project_id AND b.name = t.branch \
-         WHERE t.project_id = $1 AND t.lineage = b.lineage ORDER BY t.branch",
+         WHERE t.project_id = $1 AND t.lineage = b.lineage AND b.hidden_for_embargo IS NULL ORDER BY t.branch",
     )
     .bind(project.id)
     .fetch_all(&hub.db)
@@ -398,6 +406,9 @@ pub async fn all_tested_for(hub: &Arc<Hub>, project: &Project, viewer: &Viewer) 
     let mut out = BTreeMap::new();
     for (branch, hex) in rows {
         if let Ok(real) = ObjectId::from_hex(&hex) {
+            if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await? {
+                continue;
+            }
             let proj = sync::projected(hub, project, viewer, real).await?;
             out.insert(branch, proj);
         }
@@ -418,7 +429,7 @@ async fn readable_footprint(
     let view = project.view(viewer);
     let mut effective_only: Option<Vec<String>> = viewer.only.as_ref().map(|o| (**o).clone());
     if effective_only.is_none() {
-        let default_tip = branch_tip(hub, project.id, &project.default_branch).await?;
+        let default_tip = branch_tip(hub, project, viewer, &project.default_branch).await?;
         let rules = sync::blocking(hub, project.id, move |src| crate::landing::rules(src, default_tip)).await?;
         if let Some(paths) = rules.checks.get(check_name) {
             if !paths.is_empty() {
@@ -509,47 +520,22 @@ pub(crate) fn can_see_check(project: &Project, viewer: &Viewer, session_paths: &
     session_paths.iter().all(|p| view.read(p) && viewer.within_narrowing(p))
 }
 
-/// Resolve the snapshot `id` a check writer names to a real snapshot in
-/// `project`. Prefers the exact committed snapshot or uncollapsed
-/// projection `id` stands for (so a check posted on an older commit `S1`
-/// attaches to `S1`, never to a hidden commit `S2` above it).
-async fn resolve_snapshot_for_write(
+/// Resolve a projected snapshot `id` in `viewer`'s view to a real snapshot via
+/// [`sync::resolve_exact_for`], enforcing S22 embargo withholding on reads and
+/// writes while attaching historical checks to the uncollapsed commit `id` stands for.
+async fn resolve_snapshot(
     hub: &Arc<Hub>,
     project: &Project,
     viewer: &Viewer,
     id: &ObjectId,
 ) -> Result<Option<ObjectId>> {
-    if *id == sync::root_snapshot_id() {
-        return Ok(Some(*id));
+    let Some(real) = sync::resolve_exact_for(hub, project, viewer, id).await? else {
+        return Ok(None);
+    };
+    if sync::projected(hub, project, viewer, real).await? != *id {
+        return Ok(None);
     }
-    if let Some(tip) = branch_tip(hub, project.id, &project.default_branch).await? {
-        if sync::projected(hub, project, viewer, tip).await? == *id {
-            return Ok(Some(tip));
-        }
-    }
-    let has_real: Option<String> = sqlx::query_scalar("SELECT id FROM snapshots WHERE project_id = $1 AND id = $2")
-        .bind(project.id)
-        .bind(id.hex())
-        .fetch_optional(&hub.db)
-        .await?;
-    if has_real.is_some() && sync::projected(hub, project, viewer, *id).await? == *id {
-        return Ok(Some(*id));
-    }
-    let key = project.view(viewer).key();
-    let own: Option<String> = sqlx::query_scalar(
-        "SELECT real_id FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed ORDER BY real_id LIMIT 1",
-    )
-    .bind(project.id)
-    .bind(&key)
-    .bind(id.hex())
-    .fetch_optional(&hub.db)
-    .await?;
-    if let Some(real) = own.and_then(|h| ObjectId::from_hex(&h).ok()) {
-        if sync::projected(hub, project, viewer, real).await? == *id {
-            return Ok(Some(real));
-        }
-    }
-    sync::resolve_for(hub, project, viewer, id, &[], true).await
+    Ok(Some(real))
 }
 
 /// Resolve `rev` (a branch name, `<branch>@tested`, or a 64-hex snapshot id
@@ -565,20 +551,12 @@ async fn resolve_rev_for_read(
         return Err(Error::not_found("no such revision that you can see"));
     }
     if let Some(branch) = rev.strip_suffix("@tested") {
-        let row: Option<String> = sqlx::query_scalar(
-            "SELECT t.snapshot FROM tested t JOIN branches b ON b.project_id = t.project_id AND b.name = t.branch \
-             WHERE t.project_id = $1 AND t.branch = $2 AND t.lineage = b.lineage",
-        )
-        .bind(project.id)
-        .bind(branch)
-        .fetch_optional(&hub.db)
-        .await?;
-        let Some(real) = row.and_then(|h| ObjectId::from_hex(&h).ok()) else {
+        let Some(real) = tested_real(hub, project, viewer, branch).await? else {
             return Err(Error::not_found(format!("branch '{branch}' has no tested snapshot yet")));
         };
         let proj_id = sync::projected(hub, project, viewer, real).await?;
         let mut out = vec![real];
-        if let Some(r) = resolve_snapshot_for_write(hub, project, viewer, &proj_id).await? {
+        if let Some(r) = resolve_snapshot(hub, project, viewer, &proj_id).await? {
             if !out.contains(&r) {
                 out.push(r);
             }
@@ -587,28 +565,24 @@ async fn resolve_rev_for_read(
     }
     if rev.len() == 64 {
         if let Ok(id) = ObjectId::from_hex(rev) {
-            let Some(real) = resolve_snapshot_for_write(hub, project, viewer, &id).await? else {
+            let Some(real) = resolve_snapshot(hub, project, viewer, &id).await? else {
                 return Err(Error::not_found("no such revision that you can see"));
             };
-            let proj_id = sync::projected(hub, project, viewer, real).await?;
-            if proj_id != id {
-                return Err(Error::not_found("no such revision that you can see"));
-            }
             let mut out = vec![real];
-            if let Some(tip) = branch_tip(hub, project.id, &project.default_branch).await? {
-                if !out.contains(&tip) && sync::projected(hub, project, viewer, tip).await? == proj_id {
+            if let Some(tip) = branch_tip(hub, project, viewer, &project.default_branch).await? {
+                if !out.contains(&tip) && sync::projected(hub, project, viewer, tip).await? == id {
                     out.push(tip);
                 }
             }
-            return Ok((proj_id, out));
+            return Ok((id, out));
         }
     }
-    let Some(tip) = branch_tip(hub, project.id, rev).await? else {
+    let Some(tip) = branch_tip(hub, project, viewer, rev).await? else {
         return Err(Error::not_found("no such revision that you can see"));
     };
     let proj_id = sync::projected(hub, project, viewer, tip).await?;
     let mut out = vec![tip];
-    if let Some(r) = resolve_snapshot_for_write(hub, project, viewer, &proj_id).await? {
+    if let Some(r) = resolve_snapshot(hub, project, viewer, &proj_id).await? {
         if !out.contains(&r) {
             out.push(r);
         }
@@ -616,13 +590,21 @@ async fn resolve_rev_for_read(
     Ok((proj_id, out))
 }
 
-async fn branch_tip(hub: &Arc<Hub>, project: i64, branch: &str) -> Result<Option<ObjectId>> {
-    let target: Option<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL")
-        .bind(project)
-        .bind(branch)
-        .fetch_optional(&hub.db)
-        .await?;
-    Ok(target.and_then(|t| ObjectId::from_hex(&t).ok()))
+async fn branch_tip(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, branch: &str) -> Result<Option<ObjectId>> {
+    let target: Option<String> = sqlx::query_scalar(
+        "SELECT target FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL",
+    )
+    .bind(project.id)
+    .bind(branch)
+    .fetch_optional(&hub.db)
+    .await?;
+    let Some(real) = target.and_then(|t| ObjectId::from_hex(&t).ok()) else {
+        return Ok(None);
+    };
+    if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await? {
+        return Ok(None);
+    }
+    Ok(Some(real))
 }
 
 /// Most first-parent steps walked above `<branch>@tested` (or the root) when

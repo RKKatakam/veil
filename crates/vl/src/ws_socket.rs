@@ -138,21 +138,32 @@ fn check_revisions(ctx: &Ctx, cli: &Cli) -> Result<()> {
             }
             Ok(())
         }
-        // `::B`, `A..B`, `..B`: ancestors of B; `X`: X. (`parse_command`
-        // makes a plain `vl log` `::@`.)
+        // `::B`, `A..B`, `..B`: ancestors of B (and A, when given); `X`: X.
+        // (`parse_command` makes a plain `vl log` `::@`; `agent(…)` walks all
+        // refs and is refused in favour of `--agent`.)
         Cmd::Log { filter, .. } => {
             let spec = filter.revset.as_deref().unwrap_or("::@").trim();
-            let upper = match spec.strip_prefix("::") {
-                Some(b) => b,
-                None => match spec.split_once("..") {
-                    Some((_, "")) => bail!(
-                        "inside a sandbox, `vl log -r A..` is not available (it names snapshots outside the workspace's history): use `A..@` or `::@`"
-                    ),
-                    Some((_, b)) => b,
-                    None => spec,
-                },
-            };
-            within(upper, "log")
+            if spec.strip_prefix("agent(").and_then(|r| r.strip_suffix(')')).is_some() {
+                bail!(
+                    "inside a sandbox, `vl log -r agent(…)` is not available (it searches outside the workspace's history): use `vl log --agent PATTERN`"
+                );
+            }
+            if let Some(b) = spec.strip_prefix("::") {
+                return within(b, "log");
+            }
+            match spec.split_once("..") {
+                None => within(spec, "log"),
+                Some((_, b)) if b.contains("..") => bail!("'{}': one `..` per range", safe(spec)),
+                Some((_, b)) if b.trim().is_empty() => bail!(
+                    "inside a sandbox, `vl log -r A..` is not available (it names snapshots outside the workspace's history): use `A..@` or `::@`"
+                ),
+                Some((a, b)) => {
+                    if !a.trim().is_empty() {
+                        within(a, "log")?;
+                    }
+                    within(b, "log")
+                }
+            }
         }
         Cmd::Describe { rev, .. } => match ctx.rev(rev)? == wc {
             true => Ok(()),
