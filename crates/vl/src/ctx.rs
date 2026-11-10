@@ -711,7 +711,7 @@ impl Ctx {
         #[cfg(unix)]
         let (watch_plan, next_token) = if description.is_none() && !policy_incoming && carried.is_empty() {
             let prev = (self.checkout.snapshot == view_wc)
-                .then(|| self.checkout.watch.as_ref())
+                .then_some(self.checkout.watch.as_ref())
                 .flatten();
             match crate::daemon::watch(&self.root, prev.map(|w| w.token.as_str())) {
                 Some(reply) => {

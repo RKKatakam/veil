@@ -21,6 +21,8 @@
 //!   strings. Past a bound, the working copy is marked overflowed, its
 //!   watches are dropped, and `vl` warns and falls back to scanning.
 
+#![allow(clippy::unnecessary_cast)]
+
 use std::{
     collections::HashMap,
     ffi::CString,
