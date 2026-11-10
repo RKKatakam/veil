@@ -12,11 +12,14 @@
 //! | [`changes`] | commits through the API: edits on a revision, the push's checks, one commit |
 //! | [`grant`] | read grants, the object routes, the access-epoch feed |
 //! | [`cache`] | the regional cache (`veil-server cache`, S9), and the epoch feed it polls |
+//! | [`landing`] | the landing service: the queue, leases, batches, the fast path, content merges, protected branches (S17, S18) |
+//! | [`events`] | the project event stream: SSE outcomes and branch moves per viewer (S18) |
 //! | [`mod@derive`] | derived history data: commit graph, changed paths, per-rule lists (S12) |
 //! | [`query`] | the query API: history answered per viewer (S13) |
 //! | [`limits`] | rate limits, request bodies under a budget, per-project bulkheads, shedding, health metrics (S24) |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
 //! | [`store`] | object storage: local directory or S3 |
+//! | [`pack`] | packs: a push's objects in one storage object, read by range (S28) |
 //! | [`tls`] | TLS configuration |
 
 pub mod api;
@@ -24,11 +27,16 @@ pub mod auth;
 pub mod cache;
 pub mod caches;
 pub mod changes;
+pub mod ci;
 pub mod db;
 pub mod derive;
+pub mod embargo;
 pub mod error;
+pub mod events;
 pub mod grant;
+pub mod landing;
 pub mod limits;
+pub mod pack;
 pub mod perm;
 pub mod query;
 pub mod search;
@@ -80,6 +88,12 @@ pub struct Hub {
     /// The query API's caches and the viewer-graph fills running here
     /// (`query::graph`).
     pub query: query::graph::State,
+    /// The landing services running here, and the submitters waiting here.
+    pub landing: landing::Services,
+    /// Active SSE streams (`GET …/events`, S18).
+    pub events: events::Events,
+    /// The embargo release service state (S22).
+    pub embargo: embargo::State,
     /// Rate limits, the request budget, bulkheads and health (S24).
     pub limits: limits::Limits,
 }
@@ -112,8 +126,10 @@ pub struct Config {
     /// `derive::DERIVE_CONNECTIONS` more.
     pub db_connections: u32,
     /// Derive, in the background once serving, every branch a landing left
-    /// underived (`derive::resume`). Servers do; tests that count
-    /// their own derive runs turn it off.
+    /// underived (`derive::resume`), and start the landing services of
+    /// every branch with queued landings (`landing::resume`). Servers do;
+    /// tests that count their own derive runs, or share a database between
+    /// servers with separate object stores, turn it off.
     pub catch_up_at_start: bool,
     /// Rate limits, connections and the request budget (S24).
     pub limits: limits::Settings,
@@ -189,8 +205,8 @@ pub async fn start(config: Config) -> Result<Running> {
         }
     };
     let hub = Arc::new(Hub {
-        db,
-        objects: Arc::new(store::Objects::new(blob, 256 << 20)),
+        db: db.clone(),
+        objects: Arc::new(store::Objects::with_db(blob, 256 << 20, Some(db.clone()))),
         trees: LruCache::new(256 << 20),
         identity,
         receipt_key,
@@ -201,6 +217,9 @@ pub async fn start(config: Config) -> Result<Running> {
         caches: caches::Caches::default(),
         derive: derive::Workers::new(derive_db),
         query: query::graph::State::default(),
+        landing: landing::Services::default(),
+        events: events::Events::default(),
+        embargo: embargo::State::default(),
         limits: limits::Limits::new(config.limits, config.db_connections),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -209,6 +228,8 @@ pub async fn start(config: Config) -> Result<Running> {
     let app = api::router(hub.clone());
     // Push notices drop other servers' cached tips (`caches::listen`).
     tokio::spawn(caches::listen(hub.clone(), rx.clone()));
+    // Scheduled embargo releases (S22).
+    tokio::spawn(embargo::run_loop(hub.clone(), rx.clone()));
     let pace = cache::deadline::Pace { stall: ANSWER_STALL, grace: ANSWER_STALL, min_rate: limits::body::MIN_RATE };
     let connections = ConnectionLimits { pace, max_connections: config.limits.max_connections, buffer: HTTP_BUFFER };
     let task = tokio::spawn(serve(listener, tls, app, rx, Some(connections), Some(hub.limits.connections.clone())));
@@ -221,6 +242,8 @@ pub async fn start(config: Config) -> Result<Running> {
                 crate::search::index::resume(hub, None).await;
             }
         });
+        // Landings queued when a server stopped are landed.
+        tokio::spawn(landing::resume(hub.clone()));
     }
     Ok(Running {
         addr,

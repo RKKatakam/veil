@@ -469,6 +469,7 @@ impl Ctx {
             return Ok(());
         }
         self.checkout.materialised.mark_lost(paths.iter().cloned());
+        self.checkout.watch = None;
         save_checkout(&self.fs, &self.checkout)
     }
 
@@ -480,11 +481,33 @@ impl Ctx {
     }
 
     pub fn rev(&self, spec: &str) -> Result<ObjectId> {
+        let trimmed = spec.trim();
+        let base_spec = trimmed.trim_end_matches('-');
+        if let Some(branch) = base_spec.strip_suffix("@tested") {
+            let branch = branch.strip_prefix("origin/").unwrap_or(branch);
+            if !self.repo.view().remote_tags.contains_key(&format!("origin/{branch}@tested")) {
+                if let Ok((client, _)) = crate::hub_cmd::client_for(self, "origin") {
+                    if let Ok(Some(t)) = client.tested(branch) {
+                        if !self.repo.store().has(&t.snapshot) && self.repo.is_partial() {
+                            let _ = self.repo.deepen(&[t.snapshot], 1);
+                        }
+                        if self.repo.store().has(&t.snapshot) {
+                            let mut cur = t.snapshot;
+                            for _ in 0..(trimmed.len() - base_spec.len()) {
+                                let s = self.repo.snapshot(&cur)?;
+                                cur = *s.parents.first().ok_or_else(|| anyhow!("snapshot {} has no parent", cur.short()))?;
+                            }
+                            return Ok(cur);
+                        }
+                    }
+                }
+            }
+        }
         // A thin clone: a full snapshot id it does not hold is asked of the
         // server, and a walk that reaches beyond what it holds goes on
         // through the server's history pages.
         if self.repo.is_partial() {
-            if let Ok(id) = veil_core::ObjectId::from_hex(spec.trim().trim_end_matches('-')) {
+            if let Ok(id) = veil_core::ObjectId::from_hex(base_spec) {
                 if !self.repo.store().has(&id) {
                     self.repo.deepen(&[id], 1)?;
                 }
@@ -628,6 +651,7 @@ impl Ctx {
         // change taken out of the directory (BUG-361, BUG-362).
         if stale && self.directory_holds(view_wc)? {
             self.checkout.snapshot = view_wc;
+            self.checkout.watch = None;
             save_checkout(&self.fs, &self.checkout)?;
             stale = false;
         }
@@ -706,6 +730,37 @@ impl Ctx {
             self.save_cache();
             return Ok(true);
         }
+        #[cfg(unix)]
+        let (watch_plan, next_token) = if description.is_none() && !policy_incoming && carried.is_empty() {
+            let prev = (self.checkout.snapshot == view_wc)
+                .then_some(self.checkout.watch.as_ref())
+                .flatten();
+            match crate::daemon::watch(&self.root, prev.map(|w| w.token.as_str())) {
+                Some(reply) => {
+                    if let Some(msg) = &reply.notice {
+                        warn(msg);
+                    }
+                    let plan = match (reply.known, prev) {
+                        (true, Some(w)) => Some(veil_core::builder::WatchPlan::new(
+                            reply.dirty_dirs,
+                            reply.dirty_subtrees,
+                            w.recheck.iter().cloned(),
+                        )),
+                        _ => None,
+                    };
+                    (plan, reply.token)
+                }
+                None => (None, None),
+            }
+        } else {
+            let reply = crate::daemon::watch(&self.root, None);
+            if let Some(msg) = reply.as_ref().and_then(|r| r.notice.as_deref()) {
+                warn(msg);
+            }
+            (None, reply.and_then(|r| r.token))
+        };
+        #[cfg(not(unix))]
+        let (watch_plan, next_token): (Option<veil_core::builder::WatchPlan>, Option<String>) = (None, None);
         let out = self.repo.snapshot_workspace_with(
             &self.ws,
             fs,
@@ -717,6 +772,7 @@ impl Ctx {
                 expected_wc: Some(view_wc),
                 carried,
                 commit,
+                watch: watch_plan.as_ref(),
                 ..Default::default()
             },
         )?;
@@ -728,9 +784,14 @@ impl Ctx {
         self.repo.capture_local_files(fs, &out.report)?;
         render::print_build_warnings(&out.report);
         print_working_copy_warnings(&out.report);
+        let new_watch = next_token.map(|token| veil_core::working_copy::WatchRecord {
+            token,
+            recheck: out.report.recheck_dirs(),
+        });
         self.report = out.report;
-        if self.checkout.snapshot != out.snapshot {
+        if self.checkout.snapshot != out.snapshot || self.checkout.watch != new_watch {
             self.checkout.snapshot = out.snapshot;
+            self.checkout.watch = new_watch;
             save_checkout(&self.fs, &self.checkout)?;
         }
         Ok(true)
@@ -766,11 +827,32 @@ impl Ctx {
         }
         self.save_cache();
         self.repo.capture_local_files(fs, &out.report)?;
-        if self.checkout.snapshot != out.snapshot {
+        if self.checkout.snapshot != out.snapshot || self.checkout.watch.is_some() {
             self.checkout.snapshot = out.snapshot;
+            self.checkout.watch = None;
             save_checkout(&self.fs, &self.checkout)?;
         }
         Ok(out.report)
+    }
+
+    /// Populate `self.report` with a full scan of the working copy (for
+    /// `vl ls --all`, which lists ignored paths across the whole tree).
+    pub fn ensure_full_report(&mut self) -> Result<()> {
+        if self.bare || self.detached {
+            return Ok(());
+        }
+        let wc = self.wc()?;
+        let tree = self.repo.snapshot(&wc)?.tree;
+        let disk = self.fs.clone();
+        let (_, report) = self.repo.build_from_recorded(
+            &*disk,
+            Some(tree),
+            Some(&mut self.cache),
+            Some(&self.checkout.materialised),
+        )?;
+        self.save_cache();
+        self.report = report;
+        Ok(())
     }
 
     /// Does the directory already hold every change from the snapshot it
@@ -868,8 +950,11 @@ impl Ctx {
         let co = self
             .repo
             .fill_in_materialised(&*self.fs, &tree, &mut record, Some(&mut self.cache))?;
-        if record != self.checkout.materialised {
+        if record != self.checkout.materialised || co.written + co.removed > 0 {
             self.checkout.materialised = record;
+            if co.written + co.removed > 0 {
+                self.checkout.watch = None;
+            }
             save_checkout(&self.fs, &self.checkout)?;
             self.save_cache();
         }
@@ -1042,8 +1127,11 @@ impl Ctx {
     pub fn restore(&mut self, from: &ObjectId, to: &ObjectId, wanted: &dyn Fn(&VPath) -> bool) -> Result<CheckoutReport> {
         let mut record = self.checkout.materialised.clone();
         let r = veil_core::checkout::restore_paths(self.repo.store(), &*self.fs, from, to, wanted, &mut record, Some(&mut self.cache))?;
-        if record != self.checkout.materialised {
+        if record != self.checkout.materialised || r.written + r.removed > 0 {
             self.checkout.materialised = record;
+            if r.written + r.removed > 0 {
+                self.checkout.watch = None;
+            }
             save_checkout(&self.fs, &self.checkout)?;
         }
         self.save_cache();

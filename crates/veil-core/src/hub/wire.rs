@@ -129,6 +129,14 @@ pub struct Tips {
     /// The server's grant key (hex): what caches check grants against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant_key: Option<String>,
+    /// Branch → newest snapshot on the branch whose required checks all
+    /// passed (`<branch>@tested`), as this viewer sees it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tested: BTreeMap<String, ObjectId>,
+    /// Embargo records of embargoes this caller is in (or an admin of the
+    /// project): never sent to anyone outside (`docs/HUB.md` §13.31).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub embargoes: Vec<crate::keychain::EmbargoRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -218,7 +226,7 @@ pub struct BranchUpdate {
     pub new: Option<ObjectId>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PushRequest {
     pub updates: Vec<BranchUpdate>,
     #[serde(default)]
@@ -228,6 +236,10 @@ pub struct PushRequest {
     /// same path in one of the snapshot's parents (BUG-824).
     #[serde(default)]
     pub receipts: BTreeMap<ObjectId, String>,
+    /// Embargo records of embargoed merges this push introduces, or whose
+    /// release it publishes (`docs/HUB.md` §13.31).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub embargoes: Vec<crate::keychain::EmbargoRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -239,6 +251,11 @@ pub struct BranchResult {
     /// The branch's tip afterwards, as the pusher sees it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tip: Option<ObjectId>,
+    /// The branch is protected: the push's new changes were submitted to
+    /// the landing service under this ticket (`docs/HUB.md` §13.19). `ok`
+    /// says whether they landed; `tip` is then where.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

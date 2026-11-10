@@ -17,6 +17,7 @@
 //! * [`changes`]: the messages of commits through the API
 //!   (`docs/HUB.md` §13.13).
 //! * [`agent`]: agent sessions and their narrowing (`docs/HUB.md` §13.27).
+//! * [`land`]: the landing service's messages (`docs/HUB.md` §13.19).
 //!
 //! The server is the authority (`docs/VISIBILITY.md`): it decides from its
 //! own records and the accepted policy, never from labels in a snapshot.
@@ -24,7 +25,9 @@
 pub mod access;
 pub mod agent;
 pub mod changes;
+pub mod ci;
 pub mod encoding;
 pub mod grant;
+pub mod land;
 pub mod project;
 pub mod wire;

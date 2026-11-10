@@ -290,6 +290,7 @@ pub struct Daemon {
     upstreams: Mutex<HashMap<String, Arc<Upstream>>>,
     confirms: Mutex<HashMap<EpochKey, Confirm>>,
     follows: Mutex<BTreeMap<(String, String), i64>>,
+    watcher: super::watch::Watcher,
     requests: Budget,
     trees: Budget,
     answers: Budget,
@@ -381,6 +382,7 @@ impl Daemon {
             upstreams: Mutex::new(HashMap::new()),
             confirms: Mutex::new(HashMap::new()),
             follows: Mutex::new(follows),
+            watcher: super::watch::Watcher::new(),
             requests: Budget::new(REQUESTS),
             trees: Budget::new(TREES),
             answers: Budget::new(ANSWERS),
@@ -611,6 +613,20 @@ impl Daemon {
                 };
                 w.end(&Head { status, body: None, ..Default::default() })?;
             }
+            Request::Watch {
+                root,
+                token,
+                max_dirs,
+                max_dirty_paths,
+            } => {
+                self.last_used.store(now(), Ordering::Relaxed);
+                let reply = self.watcher.query(&root, token.as_deref(), max_dirs, max_dirty_paths);
+                w.end(&Head {
+                    status: None,
+                    body: Some(serde_json::to_value(reply)?),
+                    ..Default::default()
+                })?;
+            }
             Request::Follows => {
                 let f: Vec<(String, String)> = self
                     .follows
@@ -634,11 +650,16 @@ impl Daemon {
     }
 
     pub fn status(&self) -> serde_json::Value {
+        if let Some(limit) = super::configured_limit(&self.paths) {
+            self.store.set_limit(limit);
+        }
         let u = self.store.usage();
         let s = &self.stats;
         let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let t = now();
         let confirmed = self.confirms().values().filter(|c| !c.void && c.confirmed > 0 && t - c.confirmed <= STALE_MS).count();
+        let watching = self.watcher.status();
+        let watched_dirs: usize = watching.iter().map(|w| w.dirs).sum();
         json!({
             "pid": std::process::id(),
             "protocol": proto::PROTOCOL,
@@ -654,6 +675,8 @@ impl Daemon {
             "confirmed": confirmed,
             "upstreams": self.upstreams.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect::<Vec<_>>(),
             "follows": self.follows.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            "watching": watching,
+            "watched_dirs": watched_dirs,
             "memory": { "budget": MEMORY, "free": self.requests.left() + self.trees.left() + self.answers.left() },
             "peak_connections": self.peak_connections.load(Ordering::Relaxed),
         })
@@ -841,6 +864,8 @@ impl Daemon {
     fn background(self: Arc<Self>) {
         let mut follower: Option<std::process::Child> = None;
         let mut spawned: Option<Instant> = None;
+        let mut last_poll = Instant::now() - POLL;
+        let step = Duration::from_millis(100);
         loop {
             let tick = Instant::now();
             if self.gone() {
@@ -854,12 +879,16 @@ impl Daemon {
                 self.shutdown();
                 std::process::exit(0);
             }
-            if let Some(limit) = super::configured_limit(&self.paths) {
-                self.store.set_limit(limit);
+            self.watcher.tick();
+            if last_poll.elapsed() >= POLL {
+                last_poll = Instant::now();
+                if let Some(limit) = super::configured_limit(&self.paths) {
+                    self.store.set_limit(limit);
+                }
+                self.renew();
+                self.tend_follows(&mut follower, &mut spawned);
             }
-            self.renew();
-            self.tend_follows(&mut follower, &mut spawned);
-            std::thread::sleep(POLL.saturating_sub(tick.elapsed()));
+            std::thread::sleep(step.saturating_sub(tick.elapsed()));
         }
     }
 

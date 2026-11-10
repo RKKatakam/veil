@@ -16,13 +16,13 @@ Each of those is also time on the request path. So every item here makes Veil **
 
 | | Today | Target |
 |---|---|---|
-| Storage writes per push | about 6 (one per new object) | **2 or fewer** (one pack, one index) |
+| Storage writes per push | about 6 (one per new object) | **2 or fewer** (one pack, one index): **built** (S28: 1 for a `vl` push, one per 8 MiB upload request; 2 when the server completes the snapshot) |
 | Database commits per push (landing) | about 8 | **1** |
 | Database statements per pull | about 46 | **a handful**, most answered from memory |
 | Landings/s across 100 projects, MinIO | 376 (bound by the object store) | 4,000 (phase 2 gate) |
 | Landings/s into one `main` | about 20 | 100 (phase 2), 1,000 (phase 4, by batching) |
 | Bytes stored and sent | uncompressed | compressed (zstd): **built in S27** (`HUB.md` §13.15) |
-| Server memory, 1 GB project | push 2.4 GB, clone 2.9 GB peak (BUG-864: allocator arenas; fixed with jemalloc, 2026-11-07: push 0.98 GB, clone 1.58 GB, BUG-1000) | under 1 GB |
+| Server memory, 1 GB project | push 2.4 GB, clone 2.9 GB peak (BUG-864: allocator arenas; fixed with jemalloc, 2026-11-07: push 0.98 GB, clone 1.58 GB, BUG-1000; S27 raised the push to 1.36 GB, BUG-1089) | under 1 GB: **built** (S28: push 0.89 GB, clone 0.96 GB on `bench-server.sh 1g`; BUG-1000 and BUG-1089 fixed, `HUB.md` §13.20) |
 
 ## 3. One database commit per push (S4)
 
@@ -74,6 +74,8 @@ In each API server's memory, never in the database:
 
 ## 7. Packs: one storage write per push (S28)
 
+> **Built** (S28, `HUB.md` §13.20), with two changes from the text below: (1) **an upload request's objects, large ones included, go up as one pack** (staged: nobody reads it until the push that names it lists it, and a refused push deletes it, BUG-930), so a `vl` push's uploads cost one write per upload request (about 8 MiB) and the push lists them as they are, with no copy; a large object in a pack is read with one ranged `GET`, as a loose one is read with one `GET`. S29 merges only small packs. (2) The index is inside the pack, at its front (one write, never apart from its pack), and each entry starts with its object's id and the length of its encoding, which every read checks against the entry's slot (`veilpack3`, BUG-1497). (3) The database has a row for every pack: an upload's is recorded *staged* before it is written (one commit per upload request, apart from the push's one), and the push's transaction lists it. (4) Upgrading to S28 is not rolling: every server stops, migrates and starts on S28.
+
 **Change from the earlier design:** `OVERVIEW.md` said each file is stored once with no repacking. Packs bring back a background job (§8). In exchange, storage write requests per push fall from about 6 to 1–2. At object-storage prices, per-request charges dominate with millions of small files, and the object store is today's limit across projects (376 landings/s on MinIO).
 
 - **What is packed:** a push uploads **one pack** holding its new *small* objects (folder listings, and files under 64 KiB), plus **a small index** of object id → offset and length.
@@ -90,6 +92,8 @@ In each API server's memory, never in the database:
 - Once a project has many small packs, a lookup has to check many indexes. A **background job per project** merges small packs into larger ones when the pack count passes a limit (start at 64), as Git hosting compacts.
 - **Garbage collection** uses the same job. Removing an object (gc, or a secret deleted from history by an admin) means rewriting the packs that hold it. A pack is never edited in place: the job writes the new pack and its index, switches the database rows in one transaction, and deletes the old pack only after a grace period, so readers mid-request still find their objects.
 - **Crash safety:** a crash at any point leaves either the old packs or the new ones listed, never neither (the same write-then-switch-then-delete order as the client's G2 maintenance).
+- **Discarded packs** (S28 cycle 4, BUG-1498): a *discarded* row's pack may still be in storage: its delete failed past the store's retries (`Packs::discard` tries every delete and reports the failures), or the server stopped between the row's update and the delete. The job deletes **the packs of discarded rows, then the rows**, as it deletes staged rows older than its grace and their packs; a listed pack is never deleted, and a pack is deleted only after its row says discarded (the row is the authority, so the job never races a push that lists it).
+- **Dropping a pack from servers' lookup maps** (the hook S29 needs): each server keeps, per project, the listed packs it knows and their indexes (`pack::Packs`, `HUB.md` §13.20). When the job replaces listed packs with a merged one, or drops one, it must (1) list the new pack and unlist the old ones in one transaction, then (2) tell every server to drop the old packs' entries from the project's map: a `Packs::forget(project, names)` the job's server calls directly, and the others reach through the listing (`Packs::refresh` reads the project's listed packs; a pack no longer listed is removed from the map then, and a lookup that read a dropped pack's slot meanwhile gets "not in the store", reads the listing again and finds the object in the new pack). The old packs are deleted only after the grace period, so a reader mid-request still finds its slot. A server's staged-index cache is untouched: it names staged packs, which the job never merges.
 
 ## 9. Cost gates in every benchmark run (S4, then each milestone)
 
@@ -104,7 +108,7 @@ In each API server's memory, never in the database:
 
 | Measure | Gate |
 |---|---|
-| Storage writes per push | 2 or fewer (once S28 is in; 1 per new object before) |
+| Storage writes per push | 2 or fewer (once S28 is in; 1 per new object before): gated by `veil-bench load` for landings (the deriver's background writes aside, `storage_push_writes_per_op`) |
 | Database commits per push | 1 (once S4 is in) |
 | Database statements per pull, warm caches | 5 or fewer |
 | Server peak memory, 1 GB profile | under 1 GB |
@@ -118,12 +122,12 @@ Found by the benchmarks of 2026-11-06. Each is a small fix round, not a mileston
 | Item | What | Where it's tracked |
 |---|---|---|
 | Server memory arenas | Done: glibc kept one memory arena per thread (2.4 GB push peak). `veil-server` now uses jemalloc with two arenas (push 984 MiB; measurements in `BASELINE.md`, "The server's allocator"). | BUG-864 (fixed) |
-| Server memory during a clone | A full clone of the 1 GB profile still adds about 0.7 GB beyond the caches, under every allocator (peak 1.58 GB). Profile the fetch path and bound it. | BUG-1000 |
-| Push checks one snapshot at a time | The 1 GB project's first push takes about 330 s. Check snapshots in parallel, bounded by memory. | BUG-865 |
+| Server memory during a clone | Done (S28): objects read from S3 were cached as slices of the HTTP client's read buffers, each pinning a whole buffer; now copied. The full clone peaks at 0.94 GB. | BUG-1000 (fixed) |
+| Push checks one snapshot at a time | Done (S28): up to 8 at once on a guess that a wrong answer undoes. The 1 GB project's first push: 253 → 99 s (`bench-server.sh 1g`). | BUG-865 (fixed) |
 | Commit one file | Still 3–4× slower than Git: the scan of every file. Use the stat cache to skip unchanged files (performance round 3); the daemon's file watcher (S7) removes the scan entirely. | `OPENSCION.md` |
 | Clone one folder | About 60 forced disk writes in sequence. Use one durability barrier, as the full clone already does. | `OPENSCION.md` |
 | Merge base of distant branches | 0.7 s at 20,000 snapshots apart. Memoise merge bases, or use a better walk. | S13 |
-| One busy `main` | About 20 landings/s. Batch landings. | S17 |
+| One busy `main` | About 20 landings/s. Batch landings: **built** (S17, `HUB.md` §13.19; numbers in `LOAD.md`, "The landing service"). | S17 |
 
 ## 11. Open technical questions
 

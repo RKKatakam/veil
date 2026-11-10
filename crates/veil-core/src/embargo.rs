@@ -337,3 +337,217 @@ pub fn policy_rekeys(store: &ObjectStore, tree: &ObjectId, old: &Policy, new: &P
     }
     Ok(out)
 }
+
+// ---- hidden embargo lines & `vl embargo follow` (milestone S22) ------------
+
+/// Prefix of hidden server branches that hold an unreleased embargo's line
+/// (`docs/HUB.md` §13.31, phase-4 decision 8).
+pub const EMBARGO_BRANCH_PREFIX: &str = "embargo/";
+
+/// The hidden branch name for embargo `id`.
+pub fn embargo_branch(id: &str) -> String {
+    format!("{EMBARGO_BRANCH_PREFIX}{id}")
+}
+
+/// If `branch` is a hidden embargo branch (`embargo/<id>`), its embargo id.
+pub fn embargo_id_of_branch(branch: &str) -> Option<&str> {
+    branch.strip_prefix(EMBARGO_BRANCH_PREFIX).filter(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// What [`follow`] did for one embargo.
+#[derive(Debug, Clone)]
+pub struct FollowResult {
+    pub id: String,
+    pub scope: String,
+    pub until: Option<i64>,
+    pub tip: ObjectId,
+    pub wc: ObjectId,
+    pub rebased: bool,
+    pub conflicts: Vec<String>,
+}
+
+/// Unreleased, non-withdrawn embargo ids that have a line in `repo`.
+pub fn active_embargoes(repo: &crate::repo::Repo) -> Result<Vec<String>> {
+    let withdrawn = crate::remote::withdrawn_embargoes(repo)?;
+    let visible_merges = repo.exact().visible_embargoed()?;
+    let mut ids = std::collections::BTreeSet::new();
+    for r in repo.keys().embargoes()? {
+        if !repo.keys().embargo_released(&r.id) && !withdrawn.contains(&r.id) {
+            ids.insert(r.id);
+        }
+    }
+    for name in repo.view().tags.keys() {
+        if let Some(id) = embargo_id_of_branch(name) {
+            if !repo.keys().embargo_released(id) && !withdrawn.iter().any(|w| w == id) {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    for key in repo.view().remote_tags.keys() {
+        if let Some((_, name)) = key.split_once('/') {
+            if let Some(id) = embargo_id_of_branch(name) {
+                if !repo.keys().embargo_released(id) && !withdrawn.iter().any(|w| w == id) {
+                    ids.insert(id.to_string());
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for id in ids {
+        let branch = embargo_branch(&id);
+        let has_tag = repo.view().tags.contains_key(&branch)
+            || repo.view().remote_tags.keys().any(|k| k.ends_with(&format!("/{branch}")));
+        let has_merge = visible_merges.iter().any(|m| {
+            repo.snapshot(m).ok().and_then(|s| s.embargo.clone()).as_deref() == Some(id.as_str())
+        });
+        if has_tag || has_merge {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// Follow embargo `id`: rebase its hidden line (`embargo/<id>`) onto the
+/// newest tip of `target_branch` when `target_branch` moved ahead of the
+/// embargoed merge's first parent, and (when `switch_wc` is true) attach
+/// workspace `ws` to the embargo line.
+pub fn follow(
+    repo: &mut crate::repo::Repo,
+    ws: &str,
+    id: &str,
+    target_branch: &str,
+    switch_wc: bool,
+) -> Result<FollowResult> {
+    use crate::oplog::Tag;
+
+    if repo.keys().embargo_released(id) {
+        return Err(VeilError::Policy(format!("embargo {id} is already released")));
+    }
+    let branch = embargo_branch(id);
+    let tip = if let Some(t) = repo.view().tags.get(&branch) {
+        t.target
+    } else if let Some(t) = repo
+        .view()
+        .remote_tags
+        .iter()
+        .find_map(|(k, v)| k.ends_with(&format!("/{branch}")).then_some(*v))
+    {
+        t
+    } else {
+        let mut found = None;
+        for m in repo.exact().visible_embargoed()? {
+            if repo.snapshot(&m)?.embargo.as_deref() == Some(id) {
+                found = Some(m);
+                break;
+            }
+        }
+        let m = found.ok_or_else(|| VeilError::NotFound(format!("embargo '{id}'")))?;
+        match repo.view().tags.get(target_branch) {
+            Some(t) if t.target == m || repo.is_ancestor(&m, &t.target)? => t.target,
+            _ => m,
+        }
+    };
+    let mut cur = tip;
+    let merge_id = loop {
+        let s = repo.snapshot(&cur)?;
+        if s.embargo.as_deref() == Some(id) {
+            break cur;
+        }
+        match s.parents.first() {
+            Some(p) if *p != repo.root_id() => cur = *p,
+            _ => {
+                let mut found = None;
+                for cand in repo.exact().embargoed_among([tip])? {
+                    if repo.snapshot(&cand)?.embargo.as_deref() == Some(id) {
+                        found = Some(cand);
+                        break;
+                    }
+                }
+                break found.ok_or_else(|| VeilError::NotFound(format!("embargo '{id}'")))?;
+            }
+        }
+    };
+    let merge_snap = repo.snapshot(&merge_id)?;
+    let old_base = *merge_snap
+        .parents
+        .first()
+        .ok_or_else(|| VeilError::Corrupt(merge_id.hex(), "embargoed merge has no parents".into()))?;
+    let remote_main = repo.view().remote_tags.get(&format!("origin/{target_branch}")).copied();
+    let local_main = repo.view().tags.get(target_branch).map(|t| t.target);
+    let mut main_tip = old_base;
+    for cand in [remote_main, local_main].into_iter().flatten() {
+        if repo.carried_embargo(&cand)?.is_none()
+            && (cand == main_tip || repo.is_ancestor(&main_tip, &cand)?)
+        {
+            main_tip = cand;
+        }
+    }
+    let rec = repo.keys().load_embargo(id)?.unwrap_or(crate::keychain::EmbargoRecord {
+        format: crate::keychain::EMBARGO_FORMAT,
+        id: id.to_string(),
+        scope: "team".to_string(),
+        until: None,
+        released_at: None,
+        created: merge_snap.timestamp,
+    });
+
+    let mut tx = repo.transaction(format!("follow embargo {id}"))?;
+    tx.view.tags.insert(branch.clone(), Tag { target: tip, annotation: None });
+    if let Some(lm) = local_main {
+        if tx.repo().carried_embargo(&lm)?.as_deref() == Some(id) && tx.repo().carried_embargo(&main_tip)?.is_none() {
+            tx.view.tags.insert(target_branch.to_string(), Tag { target: main_tip, annotation: None });
+        }
+    }
+    let mut rebased = false;
+    let mut new_merge_id = merge_id;
+    if main_tip != old_base && tx.repo().is_ancestor(&old_base, &main_tip)? {
+        let mut new_parents = vec![main_tip];
+        new_parents.extend_from_slice(&merge_snap.parents[1..]);
+        let out = tx.repo().rebase_tree(&merge_snap.parents, &new_parents, merge_snap.tree)?;
+        let mut ns = (*merge_snap).clone();
+        ns.parents = new_parents;
+        ns.tree = out.tree;
+        ns.predecessors = vec![merge_id];
+        ns.conflicts.extend(out.conflicts.iter().map(|p| p.to_string()));
+        ns.conflicts.sort();
+        ns.conflicts.dedup();
+        new_merge_id = tx.rewrite(merge_id, ns)?;
+        tx.rebase_now()?;
+        rebased = new_merge_id != merge_id;
+    }
+    let new_tip = tx.view.tags.get(&branch).map(|t| t.target).unwrap_or(new_merge_id);
+    let mut conflicts = tx.repo().snapshot(&new_merge_id)?.conflicts.clone();
+    for c in &tx.repo().snapshot(&new_tip)?.conflicts {
+        if !conflicts.contains(c) {
+            conflicts.push(c.clone());
+        }
+    }
+    let wc = if switch_wc {
+        if !conflicts.is_empty() {
+            tx.set_workspace_wc(ws, new_merge_id)?;
+            new_merge_id
+        } else {
+            let cur_wc = tx.view.workspace(ws)?.wc;
+            let cur_s = tx.repo().snapshot(&cur_wc)?;
+            if cur_s.parents == [new_tip] && tx.repo().is_empty_change(&cur_wc)? {
+                cur_wc
+            } else {
+                let wc = tx.new_change(vec![new_tip], "")?;
+                tx.set_workspace_wc(ws, wc)?;
+                wc
+            }
+        }
+    } else {
+        tx.view.workspace(ws)?.wc
+    };
+    tx.commit()?;
+    Ok(FollowResult {
+        id: id.to_string(),
+        scope: rec.scope,
+        until: rec.until,
+        tip: new_tip,
+        wc,
+        rebased,
+        conflicts,
+    })
+}

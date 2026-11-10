@@ -706,6 +706,18 @@ impl Client {
         }
     }
 
+    /// Submit a landing (`POST …/land`, `docs/HUB.md` §13.19).
+    pub fn land(&self, req: &veil_core::hub::land::LandRequest) -> Result<veil_core::hub::land::LandResult> {
+        self.json("POST", &self.url.project_path("/land"), Some(req))
+    }
+
+    pub fn land_status(&self, ticket: &str, wait: bool) -> Result<veil_core::hub::land::LandResult> {
+        if ticket.is_empty() || !ticket.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            bail!("not a landing ticket: {}", crate::render::safe(ticket));
+        }
+        self.json("GET", &self.url.project_path(&format!("/land/{ticket}?wait={wait}")), None::<&()>)
+    }
+
     /// A commit through the API (`POST …/changes`).
     /// `POST /v1/sessions/agent` (`docs/HUB.md` §13.27).
     pub fn agent_session(&self, req: &veil_core::hub::agent::AgentSessionRequest) -> Result<veil_core::hub::agent::AgentSession> {
@@ -870,6 +882,35 @@ impl Client {
             Err(_) => Err(Self::error(status, &out)),
         }
     }
+
+    /// Issue a narrowed CI runner session (`POST /v1/sessions/ci`, S19).
+    pub fn ci_session(&self, req: &veil_core::hub::ci::CiSessionRequest) -> Result<veil_core::hub::agent::AgentSession> {
+        self.json("POST", "/v1/sessions/ci", Some(req))
+    }
+
+    /// Record a CI check result (`POST /v1/projects/{p}/checks`, S19).
+    pub fn post_check(&self, req: &veil_core::hub::ci::CheckRequest) -> Result<veil_core::hub::ci::CheckResult> {
+        self.json("POST", &self.url.project_path("/checks"), Some(req))
+    }
+
+    /// List CI checks on a revision (`GET /v1/projects/{p}/checks`, S19).
+    pub fn checks(&self, rev: Option<&str>) -> Result<veil_core::hub::ci::ChecksResponse> {
+        let path = match rev {
+            Some(r) => self.url.project_path(&format!("/checks?rev={}", percent(r))),
+            None => self.url.project_path("/checks"),
+        };
+        self.json("GET", &path, None::<&()>)
+    }
+
+    /// The newest tested snapshot on `branch` (`GET /v1/projects/{p}/tested/{branch}`, S19).
+    pub fn tested(&self, branch: &str) -> Result<Option<veil_core::hub::ci::TestedTip>> {
+        let (status, out) = self.call("GET", &self.url.project_path(&format!("/tested/{}", percent(branch))), None)?;
+        match status {
+            200 => Ok(Some(serde_json::from_slice(&out)?)),
+            404 => Ok(None),
+            s => Err(Self::error(s, &out)),
+        }
+    }
 }
 
 /// `s` percent-encoded for a query string.
@@ -899,6 +940,7 @@ pub fn checkout_branch(tips: &Tips) -> Option<String> {
         .into_iter()
         .find(|b| tips.branches.contains_key(*b))
         .map(str::to_string)
+        .or_else(|| tips.branches.keys().find(|b| veil_core::embargo::embargo_id_of_branch(b).is_none()).cloned())
         .or_else(|| tips.branches.keys().next().cloned())
 }
 
@@ -983,7 +1025,13 @@ pub fn pull_moving(
     // another remote) asks for every tip, held or not: what a held tip
     // reaches may be in the cache only, or nowhere (BUG-1318). `have` then
     // skips, object by object, what the main store holds.
-    let mut want_tips: Vec<ObjectId> = tips.branches.values().copied().filter(|t| main_only || !store.has(t)).collect();
+    let mut want_tips: Vec<ObjectId> = tips
+        .branches
+        .values()
+        .chain(tips.tested.values())
+        .copied()
+        .filter(|t| main_only || !store.has(t))
+        .collect();
     want_tips.sort();
     want_tips.dedup();
     // A repository made for this clone holds only the root snapshot and
@@ -1030,7 +1078,7 @@ pub fn pull_moving(
             if s.signature_valid() != Some(true) && !held {
                 report.warnings.push(format!("snapshot {} carries no valid signature", id.short()));
             }
-            if !thin || Some(id) == checked_out {
+            if !thin || Some(id) == checked_out || tips.tested.values().any(|t| *t == id) {
                 new_snaps.push((id, s.tree));
             }
             if !held && incoming.put(id, raw, "")? {
@@ -1172,6 +1220,9 @@ pub fn pull_moving(
             tx.repo().keys().invalidate();
         }
     }
+    for rec in &tips.embargoes {
+        tx.repo().keys().merge_embargo(rec)?;
+    }
     let tags: Vec<(String, Tag)> = tips
         .branches
         .iter()
@@ -1184,6 +1235,12 @@ pub fn pull_moving(
         .collect();
     let old_tips: Vec<ObjectId> = tx.view.remote_tags.iter().filter(|(k, _)| k.starts_with(&prefix)).map(|(_, v)| *v).collect();
     apply_remote_tags(&mut tx, remote, tags, None, &mut report)?;
+    tx.view.remote_tags.retain(|k, _| !(k.starts_with(&prefix) && k.ends_with("@tested")));
+    for (n, id) in &tips.tested {
+        if store.has(id) {
+            tx.view.remote_tags.insert(format!("{remote}/{n}@tested"), *id);
+        }
+    }
     // The person's view changed since this clone last pulled: a tip it had
     // is named under another id now (BUG-1509).
     let moving = thin
@@ -1437,6 +1494,9 @@ impl Uploads<'_> {
 pub struct PushOutcome {
     pub warnings: Vec<String>,
     pub moved: Vec<(String, ObjectId)>,
+    /// Of `moved`: protected branches, where the server's landing service
+    /// landed the pushed changes (`docs/HUB.md` §13.19).
+    pub landed: Vec<String>,
     pub rejected: Vec<(String, String)>,
     pub uploaded: usize,
     pub created: bool,
@@ -1455,6 +1515,8 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             tips.revision
         }
     };
+    let release_warnings = repo.take_back_releases_out_of_force()?;
+    let newly_released = repo.keys().publish_staged_releases()?;
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -1480,83 +1542,102 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                 bail!("no tag '{t}' here");
             }
         }
-        // Nothing an unreleased embargo withholds is uploaded: a tag that
-        // would publish it is not pushed (it reaches no remote by any route).
+        // Nothing an unreleased embargo withholds is uploaded on an unembargoed
+        // branch (`fix`); an embargoed merge line itself (`carried_embargo`) goes
+        // to the server's hidden `embargo/<id>` line with its signed record when
+        // its groups exist on the server.
         let targets: Vec<ObjectId> = updates.iter().filter_map(|u| u.new).collect();
         let blocks = veil_core::remote::embargo_blocks(repo, &targets)?;
+        let mut server_groups: Option<HashSet<String>> = None;
         let mut withheld = Vec::new();
         let mut kept = Vec::new();
+        let mut embargoes: BTreeMap<String, veil_core::keychain::EmbargoRecord> = BTreeMap::new();
+        let mut embargo_targets: BTreeMap<String, (String, ObjectId)> = BTreeMap::new();
         for (u, why) in updates.into_iter().zip(blocks) {
             match why {
-                Some(why) => withheld.push((u.branch, why)),
+                Some(why) => {
+                    let carried = u.new.and_then(|t| repo.carried_embargo(&t).ok().flatten());
+                    let rec = carried.and_then(|id| repo.keys().load_embargo(&id).ok().flatten());
+                    if let (Some(target), Some(rec)) = (u.new, rec) {
+                        // A local embargo for the default `team` scope stays local
+                        // unless the server actually has a `team` group; named
+                        // scopes (`--embargo-for`) go to the server to validate.
+                        let send_to_server = if rec.scope == "team" {
+                            let gs = match &server_groups {
+                                Some(gs) => gs,
+                                None => server_groups.insert(
+                                    client
+                                        .groups()
+                                        .unwrap_or_default()
+                                        .into_iter()
+                                        .map(|g| g.name)
+                                        .collect(),
+                                ),
+                            };
+                            gs.contains("team")
+                        } else {
+                            true
+                        };
+                        if send_to_server {
+                            embargo_targets.insert(rec.id.clone(), (u.branch.clone(), target));
+                            embargoes.insert(rec.id.clone(), rec);
+                            kept.push(u);
+                            continue;
+                        }
+                    }
+                    withheld.push((u.branch, why));
+                }
                 None => kept.push(u),
             }
         }
         let updates = kept;
+        for id in &newly_released {
+            if let Ok(Some(rec)) = repo.keys().load_embargo(id) {
+                embargoes.insert(rec.id.clone(), rec);
+            }
+        }
+        if let Ok(all) = repo.keys().embargoes() {
+            for rec in all {
+                if rec.released_at.is_some()
+                    && view
+                        .remote_tags
+                        .contains_key(&format!("{prefix}{}", veil_core::embargo::embargo_branch(&rec.id)))
+                {
+                    embargoes.insert(rec.id.clone(), rec);
+                }
+            }
+        }
         let sent: Vec<ObjectId> = updates.iter().filter_map(|u| u.new).collect();
-        let withdrawn = veil_core::remote::withdrawn_warnings(repo, &sent)?;
-        if updates.is_empty() {
+        let withdrawn: Vec<String> = release_warnings
+            .iter()
+            .cloned()
+            .chain(veil_core::remote::withdrawn_warnings(repo, &sent)?)
+            .collect();
+        if updates.is_empty() && embargoes.is_empty() {
             return Ok(PushOutcome {
-                warnings: vec![],
+                warnings: release_warnings,
                 moved: vec![],
+                landed: vec![],
                 rejected: withheld,
                 uploaded: 0,
                 created,
             });
         }
-        // What the server has: everything the remote tags reach, as held
-        // (beyond a thin clone's boundary it is the server's anyway).
-        let store = repo.store().clone();
-        let held = repo.held();
-        let mut known: HashSet<ObjectId> = HashSet::new();
-        let mut stack: Vec<ObjectId> = view
-            .remote_tags
-            .iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(_, v)| *v)
-            .collect();
-        stack.push(repo.root_id());
-        while let Some(id) = stack.pop() {
-            if !known.insert(id) {
-                continue;
-            }
-            if let Ok(Some(s)) = held.snapshot(&id) {
-                // Attempts (format 10) go with their version.
-                stack.extend(s.parents.iter().chain(&s.attempts).copied());
-            }
-        }
-        let mut new = Vec::new();
-        let mut stack: Vec<ObjectId> = updates.iter().filter_map(|u| u.new).collect();
-        let mut seen_snaps = HashSet::new();
-        while let Some(id) = stack.pop() {
-            if known.contains(&id) || !seen_snaps.insert(id) {
-                continue;
-            }
-            let s = held.snapshot(&id)?.ok_or(veil_core::VeilError::Missing(id))?;
-            // Its attempts (format 10) go with it.
-            stack.extend(s.parents.iter().chain(&s.attempts).copied());
-            new.push((id, s));
-        }
-        // Upload what the push introduces as the walk finds it, 8 MiB per
-        // request (BUG-858).
-        // A server of revision 2 reads compressed objects.
-        let mut up = Uploads { client, compress: revision >= 2, frames: Vec::new(), ids: Vec::new(), receipts: BTreeMap::new() };
-        let mut walk = Introduced::new(&store, |id, raw| up.add(&id, &raw));
-        for (id, s) in &new {
-            let parents: Vec<ObjectId> = s.parents.iter().filter_map(|p| held.snapshot(p).ok().flatten().map(|ps| ps.tree)).collect();
-            walk.snapshot(*id, s.tree, parents)?;
-        }
-        drop(walk);
-        up.flush()?;
-        let (uploaded, receipts) = (up.receipts.len(), up.receipts);
-        // Key rings (secret scopes) first, so new members can open what lands
-        // (`team` first of them: it names the project the others belong to).
-        for ring in repo.keys().rings()? {
-            if let Err(e) = client.post_ring(&ring) {
-                crate::render::warn(&format!("key ring '{}' not sent: {e:#}", ring.scope));
-            }
-        }
-        let Some(result) = client.push(&PushRequest { updates, force, receipts })? else {
+        let targets: Vec<ObjectId> = updates.iter().filter_map(|u| u.new).collect();
+        let (uploaded, receipts) = if targets.is_empty() {
+            (0, BTreeMap::new())
+        } else {
+            upload_new(repo, remote, client, &targets, revision >= 2)?
+        };
+        let pushed: HashMap<String, ObjectId> = updates.iter().filter_map(|u| Some((u.branch.clone(), u.new?))).collect();
+        let req_embargoes: Vec<veil_core::keychain::EmbargoRecord> = embargoes.into_values().collect();
+        let Some(result) = client.push(&PushRequest {
+            updates,
+            force,
+            receipts,
+            embargoes: req_embargoes,
+        })?
+        else {
             if attempt < 5 {
                 std::thread::sleep(Duration::from_millis(50 * attempt));
                 continue;
@@ -1566,6 +1647,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         let mut out = PushOutcome {
             warnings: withdrawn.iter().cloned().chain(result.warnings.iter().cloned()).collect(),
             moved: vec![],
+            landed: vec![],
             rejected: withheld,
             uploaded,
             created,
@@ -1573,13 +1655,43 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         let mut tx = repo.transaction(format!("push to {remote}"))?;
         tx.repository_wide();
         let mut missing = false;
+        let mut landed = Vec::new();
         for r in result.results {
             match (r.ok, r.tip) {
                 (true, Some(tip)) => {
-                    if tx.repo().store().has(&tip) {
-                        tx.view.remote_tags.insert(format!("{prefix}{}", r.branch), tip);
+                    let diverted_eid = embargo_targets
+                        .iter()
+                        .find_map(|(eid, (b, _))| (b == &r.branch).then_some(eid.clone()));
+                    if let Some(eid) = diverted_eid {
+                        let ebranch = veil_core::embargo::embargo_branch(&eid);
+                        if tx.repo().store().has(&tip) {
+                            tx.view.remote_tags.insert(format!("{prefix}{ebranch}"), tip);
+                            tx.view.tags.insert(ebranch, Tag { target: tip, annotation: None });
+                        } else {
+                            missing = true;
+                        }
+                        if let Some((orig_branch, orig_target)) = embargo_targets.get(&eid) {
+                            if tx.view.tags.get(orig_branch).is_some_and(|t| t.target == *orig_target && t.annotation.is_none()) {
+                                if let Some(pub_tip) = tx.view.remote_tags.get(&format!("{prefix}{orig_branch}")).copied() {
+                                    tx.view.tags.insert(orig_branch.clone(), Tag { target: pub_tip, annotation: None });
+                                }
+                            }
+                        }
                     } else {
-                        missing = true;
+                        if tx.repo().store().has(&tip) {
+                            tx.view.remote_tags.insert(format!("{prefix}{}", r.branch), tip);
+                        } else {
+                            missing = true;
+                        }
+                        if veil_core::embargo::embargo_id_of_branch(&r.branch).is_some() && tx.repo().store().has(&tip) {
+                            tx.view.tags.insert(r.branch.clone(), Tag { target: tip, annotation: None });
+                        }
+                    }
+                    if r.ticket.is_some() {
+                        out.landed.push(r.branch.clone());
+                        if let Some(n) = pushed.get(&r.branch) {
+                            landed.push((r.branch.clone(), *n, tip));
+                        }
                     }
                     out.moved.push((r.branch, tip));
                 }
@@ -1589,12 +1701,136 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                 (false, _) => out.rejected.push((r.branch, r.message.unwrap_or_default())),
             }
         }
+        for id in &newly_released {
+            let eb = veil_core::embargo::embargo_branch(id);
+            tx.view.remote_tags.remove(&format!("{prefix}{eb}"));
+            if tx.view.tags.get(&eb).is_some_and(|t| t.annotation.is_none()) {
+                tx.view.tags.remove(&eb);
+            }
+        }
         tx.commit()?;
         if missing {
             pull(repo, remote, client, None)?;
         }
+        follow_landed(repo, remote, &landed)?;
         return Ok(out);
     }
+}
+
+/// Upload what the snapshots `targets` reach that the server lacks (what
+/// the remote tags of `remote` do not reach), 8 MiB per request (BUG-858),
+/// then the key rings (secret scopes), so new members can open what lands
+/// (`team` first of them: it names the project the others belong to). The
+/// objects sent, and their receipts.
+/// `compress`: a server of revision 2 reads compressed objects.
+fn upload_new(repo: &Repo, remote: &str, client: &Client, targets: &[ObjectId], compress: bool) -> Result<(usize, BTreeMap<ObjectId, String>)> {
+    let prefix = format!("{remote}/");
+    let view = repo.view().clone();
+    // What the server has: everything the remote tags reach, as held
+    // (beyond a thin clone's boundary it is the server's anyway).
+    let store = repo.store().clone();
+    let held = repo.held();
+    let mut known: HashSet<ObjectId> = HashSet::new();
+    let mut stack: Vec<ObjectId> = view
+        .remote_tags
+        .iter()
+        .filter(|(k, _)| k.starts_with(&prefix))
+        .map(|(_, v)| *v)
+        .collect();
+    stack.push(repo.root_id());
+    while let Some(id) = stack.pop() {
+        if !known.insert(id) {
+            continue;
+        }
+        if let Ok(Some(s)) = held.snapshot(&id) {
+            // Attempts (format 10) go with their version.
+            stack.extend(s.parents.iter().chain(&s.attempts).copied());
+        }
+    }
+    let mut new = Vec::new();
+    let mut stack: Vec<ObjectId> = targets.to_vec();
+    let mut seen_snaps = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if known.contains(&id) || !seen_snaps.insert(id) {
+            continue;
+        }
+        let s = held.snapshot(&id)?.ok_or(veil_core::VeilError::Missing(id))?;
+        // Its attempts (format 10) go with it.
+        stack.extend(s.parents.iter().chain(&s.attempts).copied());
+        new.push((id, s));
+    }
+    // Upload what the push introduces as the walk finds it.
+    let mut up = Uploads { client, compress, frames: Vec::new(), ids: Vec::new(), receipts: BTreeMap::new() };
+    let mut walk = Introduced::new(&store, |id, raw| up.add(&id, &raw));
+    for (id, s) in &new {
+        let parents: Vec<ObjectId> = s.parents.iter().filter_map(|p| held.snapshot(p).ok().flatten().map(|ps| ps.tree)).collect();
+        walk.snapshot(*id, s.tree, parents)?;
+    }
+    drop(walk);
+    up.flush()?;
+    for ring in repo.keys().rings()? {
+        if let Err(e) = client.post_ring(&ring) {
+            crate::render::warn(&format!("key ring '{}' not sent: {e:#}", ring.scope));
+        }
+    }
+    Ok((up.receipts.len(), up.receipts))
+}
+
+/// After a landing: a local tag still where the landed change was (`from`,
+/// or below it) follows it to where it landed (`to`, pulled already). The
+/// server may have made the change again on a newer tip.
+fn follow_landed(repo: &mut Repo, remote: &str, landed: &[(String, ObjectId, ObjectId)]) -> Result<()> {
+    if landed.is_empty() {
+        return Ok(());
+    }
+    let mut tx = repo.transaction(format!("landed on {remote}"))?;
+    tx.repository_wide();
+    for (branch, from, to) in landed {
+        if !tx.repo().store().has(to) {
+            continue;
+        }
+        let follow = match tx.view.tags.get(branch) {
+            None => true,
+            Some(t) if t.annotation.is_some() => false,
+            Some(t) => t.target == *from || tx.repo().is_ancestor(&t.target, from)?,
+        };
+        if follow {
+            tx.view.tags.insert(branch.clone(), Tag { target: *to, annotation: None });
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// What `vl land` came to.
+pub struct LandOutcome {
+    pub result: veil_core::hub::land::LandResult,
+    pub uploaded: usize,
+}
+
+/// `vl land`: upload `rev` and the changes under it the server lacks, submit
+/// them to land on `onto`, and (with `wait`) once they landed, pull and move
+/// the local tag `onto` to where they landed when it was at `rev` or below.
+pub fn land(repo: &mut Repo, remote: &str, client: &Client, rev: ObjectId, onto: &str, wait: bool) -> Result<LandOutcome> {
+    if veil_core::remote::embargo_blocks(repo, &[rev])?.into_iter().flatten().next().is_some() {
+        bail!("this change is under an embargo: it lands only at its release");
+    }
+    let revision = client.tips()?.map_or(0, |t| t.revision);
+    let (uploaded, receipts) = upload_new(repo, remote, client, &[rev], revision >= 2)?;
+    let result = client.land(&veil_core::hub::land::LandRequest {
+        onto: onto.to_string(),
+        snapshot: Some(rev),
+        receipts,
+        wait,
+        ..Default::default()
+    })?;
+    if result.state == veil_core::hub::land::LandState::Landed {
+        if let Some(tip) = result.landed.last() {
+            pull(repo, remote, client, None)?;
+            follow_landed(repo, remote, &[(onto.to_string(), rev, *tip)])?;
+        }
+    }
+    Ok(LandOutcome { result, uploaded })
 }
 
 #[cfg(test)]

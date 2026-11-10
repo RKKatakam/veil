@@ -51,7 +51,7 @@ Options:
 
 | | |
 |---|---|
-| `-r, --rev <REV>` | Base revision (default: the parents of @, like a fresh checkout) |
+| `-r, --rev <REV>` | Base revision (default: `main@tested` when origin has one, else the parents of @) |
 
 ## `vl workspace switch`
 

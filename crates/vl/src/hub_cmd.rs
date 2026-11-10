@@ -403,7 +403,8 @@ pub fn push(ctx: &mut Ctx, remote: &str, tags: &[String], force: bool, verify: &
         println!("Created project {} on {}: you are its admin, and everything is private", client.url.project, client.url.authority);
     }
     for (b, tip) in &out.moved {
-        println!("  {} {} → {}", green("pushed"), cyan(&safe(b)), tip.short());
+        let what = if out.landed.contains(b) { "landed" } else { "pushed" };
+        println!("  {} {} → {}", green(what), cyan(&safe(b)), tip.short());
     }
     for w in &out.warnings {
         println!("  {} {}", dim("note:"), safe(w));
@@ -417,6 +418,49 @@ pub fn push(ctx: &mut Ctx, remote: &str, tags: &[String], force: bool, verify: &
         println!("Sent {} object(s) to {remote}", out.uploaded);
     }
     Ok(if out.rejected.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) })
+}
+
+/// `vl land` (`docs/HUB.md` §13.19).
+pub fn land(ctx: &mut Ctx, remote: &str, rev: Option<&str>, onto: Option<&str>, wait: bool, status: Option<&str>) -> Result<ExitCode> {
+    use veil_core::hub::land::LandState;
+    let (client, _) = client_for(ctx, remote)?;
+    let (result, uploaded) = match status {
+        Some(ticket) => (client.land_status(ticket, wait)?, None),
+        None => {
+            let id = ctx.rev(rev.unwrap_or("@-"))?;
+            let onto = match onto {
+                Some(b) => b.to_string(),
+                None => client.tips()?.ok_or_else(|| anyhow!("no project '{}' that you can see", client.url.project))?.default_branch,
+            };
+            let out = hub::land(&mut ctx.repo, remote, &client, id, &onto, wait)?;
+            (out.result, Some((out.uploaded, onto)))
+        }
+    };
+    let onto = uploaded.as_ref().map(|(_, b)| b.as_str()).unwrap_or("the branch");
+    match result.state {
+        LandState::Landed => {
+            let tip = result.landed.last().map(|t| t.short()).unwrap_or_default();
+            println!("  {} {} → {} ({} change(s))", green("landed"), cyan(&safe(onto)), tip, result.landed.len());
+            for w in &result.warnings {
+                println!("  {} {}", dim("note:"), safe(w));
+            }
+        }
+        LandState::Queued => println!("  {} as {} (`vl land --status {}`)", yellow("queued"), bold(&result.ticket), result.ticket),
+        LandState::Conflict => {
+            println!("  {} {}", yellow("conflict"), safe(result.message.as_deref().unwrap_or("")));
+            for p in &result.paths {
+                println!("    {}", safe(p));
+            }
+        }
+        LandState::Rejected => println!("  {} {}", yellow("rejected"), safe(result.message.as_deref().unwrap_or(""))),
+    }
+    if let Some((n, _)) = uploaded {
+        println!("Sent {n} object(s) to {remote}");
+    }
+    Ok(match result.state {
+        LandState::Landed | LandState::Queued => ExitCode::SUCCESS,
+        _ => ExitCode::from(1),
+    })
 }
 
 pub fn group(ctx: &mut Ctx, c: &GroupCmd) -> Result<()> {
@@ -631,11 +675,28 @@ pub fn change(repository: Option<&Path>, cmd: &crate::cli::ChangeCmd) -> Result<
         }
     }
     let base = match base {
-        Some(b) => ObjectId::from_hex(b).map_err(|_| anyhow!("--base takes a snapshot id (hex)"))?,
+        Some(b) => match ObjectId::from_hex(b) {
+            Ok(id) => id,
+            Err(_) => {
+                let tips = client.tips()?.ok_or_else(|| anyhow!("no project {} that you can see", safe(&url.project)))?;
+                if let Some(branch) = b.strip_suffix("@tested") {
+                    *tips.tested.get(branch).ok_or_else(|| anyhow!("no tested snapshot on '{branch}' yet"))?
+                } else {
+                    *tips
+                        .branches
+                        .get(b.as_str())
+                        .ok_or_else(|| anyhow!("--base takes a snapshot id (hex), a branch name, or <branch>@tested"))?
+                }
+            }
+        },
         None => {
             let tips = client.tips()?.ok_or_else(|| anyhow!("no project {} that you can see", safe(&url.project)))?;
             let branch = onto.clone().unwrap_or(tips.default_branch.clone());
-            *tips.branches.get(&branch).ok_or_else(|| anyhow!("no branch '{}' to start from: give --base", safe(&branch)))?
+            tips.tested
+                .get(&branch)
+                .or_else(|| tips.branches.get(&branch))
+                .copied()
+                .ok_or_else(|| anyhow!("no branch '{}' to start from: give --base", safe(&branch)))?
         }
     };
     let req = ChangeRequest {

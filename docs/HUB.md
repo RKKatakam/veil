@@ -970,9 +970,10 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 | `GET /v1/projects/{p}/tips` | branches → tips as the caller sees them (projections); the branch rows may be up to 100 ms old (§13.14) |
 | `POST …/history {tips, stop}` | the caller's projected snapshots from `tips` down to `stop`, as object frames (`id ‖ len u32be ‖ object`); to a caller that accepts encoded frames, each object as stored, compressed or not (§13.15) |
 | `POST …/fetch {snapshot, objects: [{path, id, snapshot?}]}` | objects by id, each with the path where the client met it under that snapshot (its own `snapshot`, or the request's); the server walks the viewer's projection of that snapshot to that path and serves the object only if it is there (as stored, to a caller that accepts encoded frames: §13.15). No list of what the client has; each request names an immutable object, so a per-viewer cache can serve it |
-| `POST …/objects` | upload object frames, plain or encoded (§13.15): decoded (bounded), re-hashed, canonically decoded, format-checked, stored compressed when that is smaller; invisible until a push reaches them. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id) |
+| `POST …/objects` | upload object frames, plain or encoded (§13.15): decoded (bounded), re-hashed, canonically decoded, format-checked, compressed when that is smaller, and **staged** as one pack (S28, §13.20): nobody's until a push of the same person lists it, deleted if the push refuses it. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id ‖ pack, then the pack's name) |
 | `POST …/push {updates: [{branch, expected, new}], force, receipts}` | complete and check every new snapshot, then move the branches in **one serialisable transaction of compare-and-swaps** (`UPDATE branches SET target = new WHERE … AND target = expected`); one lost race rejects the whole push with 409 and `vl` retries |
 | `POST …/changes {base, edits, onto?, change_id?, receipts}` | a commit through the API, without a checkout (S10, §13.13) |
+| `POST …/land {onto, snapshot \| base+edits, receipts, wait}`, `GET …/land/{ticket}` | submit a landing to the landing service, and its outcome (S17, §13.19) |
 | `GET …/access?path=` | the deciding line and who it names; only for a path the caller may read |
 | `…/groups`, `GET|POST …/rings/{scope}`, `GET /v1/people/{name}/devices` | groups; key rings of secret scopes; a person's devices (active, the newest pending, removed), the vouches and invite joins the server stores, which devices check before sharing a key (§13.11, §13.12) |
 | `POST /v1/devices/vouch {device, signature}` | the signed-in device vouches for another device of its person; a pending one becomes active |
@@ -1032,8 +1033,9 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
   per request (BUG-858).
 * **The default branch's move accepts its policy** in the same
   transaction, admins only.
-* **Objects first, then the branch move:** a crash leaves only
-  unreferenced objects.
+* **Objects first, then the branch move:** the push's packs are written
+  before its transaction and listed in it (S28, §13.20), so a crash leaves
+  only packs no transaction listed, which no read finds.
 
 ### 13.6 Secrets (§6): the server is trusted with code, never with secrets
 
@@ -2435,6 +2437,573 @@ cache (S3), the Veil daemon (S6), the public CDN URLs of design §4.3.
 
 older snapshots, caches, `vl` reading through these routes (S3, S6).
 
+### 13.19 S17: the landing service (as built)
+
+Milestone S17 (`docs/design/server/phase-4-agent-scale.md` §4.1–4.6, §8).
+Code: `crates/veil-server/src/landing/` (`mod.rs`: submit, waiters, the
+services a server runs; `service.rs`: one branch's service; `edits.rs`:
+edit sets, the fast path, the landing check; `rules.rs`: `.veilrules`),
+`migrations/0011_landing.sql`, `vl land` (`crates/vl/src/hub.rs`,
+`hub_cmd.rs`), the messages in `veil_core::hub::land`.
+
+```text
+POST /v1/projects/{p}/land
+{ "onto": "main",
+  "snapshot": "<id, as a push names it>"            // uploaded first, with receipts
+  | "base": "<id as the caller sees it>", "edits": [...], "description", "change_id"?,
+  "receipts": {...}, "wait": true }
+→ { "ticket", "state": "queued" | "landed" | "conflict" | "rejected",
+    "change_id"?, "landed": ["<each change's snapshot, as the caller sees it>"],
+    "message"?, "paths": ["<the change's own paths that moved>"], "warnings": [...] }
+GET /v1/projects/{p}/land/{ticket}[?wait=false]     // its submitter's only; anyone else: 404
+```
+
+**Submitting** (one request, one database commit). The change is built and
+checked by the code a push or an API commit runs, never a copy of it: an
+uploaded snapshot goes through `sync::push` (signatures, `sync::complete`:
+the graft, write access, access lines and `.veilrules` changed only by
+admins, closure, personal keys, secrets as ciphertext, check 9), and edits
+through `changes::create` (the same `complete`, inline text held in memory
+until the checks pass). Instead of a branch's compare-and-swap, the
+request's transaction inserts one **queue row**: the stack (oldest first,
+at most 64 changes), the submitter, the access epochs its checks ran under,
+and the branch's **lineage** its stack was judged under (below).
+
+**The stack is the submitter's own history** (`landing::stack`, for every
+route: a pushed or uploaded snapshot, and edits on a `base`; S17 cycle 3,
+simplified after its review). **A submitter lands only the changes they
+see whole** (`docs/VISIBILITY.md`: a change they cannot see does not exist
+for them):
+
+* The submitted snapshot's real first-parent line is read down to the first
+  snapshot on the branch (below). Of the changes held there (another
+  branch's, an API commit, a landing answered `conflict`), one whose own
+  edits (against its first parent) are all at paths the submitter can read
+  is theirs to land; one hidden from them, or seen only in part, is left
+  unlanded for someone who sees it whole (its author, an admin), and is not
+  in the stack. A held change with unresolved conflicts the submitter can
+  see is refused (naming no path); one they cannot see does not count.
+* **Each change lands as its own edits**: its diff against its first parent
+  (a merge with a parent on the branch, which ends the stack: against that
+  parent, BUG-1271). As every change landed is seen whole, that real diff is
+  exactly what the submitter saw of it. Its **base** in the stack is the
+  change below it that lands, or where the line stops: a merge lands only on
+  the tip it was made on as the submitter sees it.
+* Every change lands as a new snapshot on the tip, signed by the server,
+  predecessor the submitted one, never the submitted snapshot itself (a
+  merge keeps its other parents). So changes hidden from the submitter
+  below or between theirs never change an answer: its state, the paths a
+  conflict names (the change's own, all readable by the submitter), and the
+  snapshots it lists (as the submitter sees them) are those of the same
+  changes with nothing hidden there. **What an answer does tell** (BUG-1406,
+  decided: `docs/VISIBILITY.md`): whether a change the submitter sees also
+  touched folders they cannot see, as it is left for someone who sees it
+  whole (it is not in what lands, "nothing to land … or holds edits you
+  cannot see"); never which folders, which paths, how many, or what.
+* **The line is read change by change, as the submitter sees it**
+  (`landing::stack`): a held change on the branch ends it, as soon as it is
+  met; a change whose edits are on the branch already is skipped, and the
+  line read on below it (what is below it may not be: a change left out by
+  someone who could not see it, BUG-1311); a run of changes hidden from
+  the submitter is stepped over in one step (their projection of the first
+  one; of that view's memos with that projection, the one that did not
+  collapse into its parent's: one row of a partial index, however long the
+  run, BUG-1468), counting toward nothing (BUG-1409).
+* **"Already landed" is asked by change id and author, of changes the
+  submitter sees whole** (BUG-1408, BUG-1465, BUG-1466, BUG-1522, BUG-1526,
+  BUG-1527, BUG-1547, BUG-1548, BUG-1579, BUG-1580; one seen in part is left
+  out, never judged by edits they cannot see): a `landings` row is a fast
+  path whose absence means nothing; the question is the branch's record of
+  its changes in its lineage (`landed_changes`, keyed by `(project, branch,
+  lineage, change_id, author)` and indexed by `(project, branch, change_id,
+  author)`: one row per change and author landed there, written by every
+  route that moves a branch, the landing service, a push of new snapshots
+  and an API commit `onto`; one lookup no bound limits), the landed
+  revision then asked of the bounded ancestry below (yes, no, or `warming`;
+  never "no" from a truncated search). The author is the person whose
+  signature is on the change, and on the landed revision (its device key,
+  its `origins` row, or its `change_refs` creator); **no predecessor list is
+  read at all**, and a row with the same change id by another author is
+  ignored completely. A rebase or rewrite keeps the change id and author,
+  not the snapshot: a revision whose edits are all the landed revision's
+  (the same change, or one rebased on a tip that holds it) is skipped; one
+  that brings further edits is refused ("this change already landed … with
+  other edits: make a new change for the further edits"), never applied
+  again. Every answer, including "nothing to land", names every change left
+  out as landed already ("change … already landed on … with the same edits:
+  not landed again", BUG-1549): never silent.
+* At most 64 changes the submitter sees land, counted as they are found;
+  at most 4,096 they see are read, then `warming`; changes they cannot see
+  count toward neither.
+
+**"On the branch" is the branch's real ancestry**, with a **lineage guard**
+(BUG-1300): `branches.lineage` is a new value (a sequence) at every
+creation, every forced update and every deletion (a branch made again
+starts a new lineage); fast-forward pushes, API commits and the service
+keep it. `landings` and `landed_changes` rows carry the lineage they were
+made under, and only rows of the branch's current lineage count; a queue row
+lands only under the lineage its stack was judged under (else it is
+`rejected`: "the branch was reset since this change was submitted: submit it
+again"); the service's compare-and-swap is on tip and lineage. Stale rows
+can never make a change count as landed.
+
+**Is a snapshot on the branch** (`landing::Ancestry`, one per submit),
+cheapest first: the tip itself; `landings` of the current lineage (an
+agent's base is its own last landing, or a tip it read; batches record the
+tip they move from); the derived commit graph when it holds the tip (its
+jump table, bounded by generation), never waiting for the deriver; else a
+walk down from the tip shared by the whole stack: while the line is read,
+at most 256 snapshots (a base a few landings below a tip the deriver has
+not reached yet: BUG-1405), and once it is read, for what was left
+undecided, at most 4,096, whose frontier the derived graph then answers
+for. Past that, `warming` (503: try again).
+
+**What a submit costs at most, whatever the hidden history**: one
+statement for the branch, and for each change the submitter sees on the
+line (at most 4,096): a `landings` lookup, a graph lookup or the shared
+walk (at most 4,096 snapshots a submit in all), their projection and one
+row of `projections_own` for the run below it, one `landed_changes` lookup
+by `(project, branch, lineage, change_id, author)` (asked of the same
+bounded ancestry), and one diff of its own edits. A hidden run costs one
+row, however long; when its memos do not say which change it stands for
+(memos older than the column, or two changes alike for the view), the run is
+read and diffed, at most 4,096 changes, then `warming` (the deriver is asked
+to catch up). An agent's landing on its own last one costs the branch's row
+and one `landings` lookup.
+
+**Which real snapshot a projected id names** (BUG-1314, BUG-1407,
+BUG-1467, BUG-1520, BUG-1521): several changes hidden from a viewer can
+share one projection. **One resolution for every route** (`sync::resolve_for`:
+an API commit's `base`, a push's parents, a landing's), each answer checked
+to project to the name for its caller: the tip of the branch the change
+goes to (a push's branches, an API commit's `onto` or the landing's
+branch), then the default branch's, that they see as the name (also when
+the name is a snapshot they see whole under a change hidden from them at
+the tip, BUG-1525); else committed history named by its own id, if they see
+it so; else, of their own view's
+real snapshots with that projection (never another view's, never by when a
+memo was stored), the newest when they are one line, and when lines
+diverge (two branches' hidden work on one change they see) or there are
+more than 4,096, the change they all stand on (the one memo that did not
+collapse: `projections_own`), which carries no line's hidden work (with no
+such one change, two alike for them on two lines: a landing takes the
+lowest id of their ends, its edits the same on the tip; anything that moves
+a branch to it is refused); else their own change's latest revision (a
+name from before an access change).
+No bound answers `warming` for ever. A push names as new only what its
+pusher uploaded (their receipts): any other name it cannot resolve is
+"snapshot … was not uploaded", the same for a snapshot that does not exist
+and one they cannot see (BUG-1523). A landing of edits takes the server's
+memory of the caller's view first, checked the same way.
+
+The snapshots become committed history in the submit's commit (they
+resolve and project like any other). With `wait` (the default) the request
+answers once the outcome is known, up to 30 s, else at `queued`.
+
+**The landing service.** One per branch, on whichever server holds the
+branch's **lease** (`landing_leases`: a holder, a fencing epoch bumped at
+every takeover, an expiry on the database's clock, 2 s unless renewed). A
+submit wakes the service on its own server, starting one if no other
+server holds the lease; a waiting submitter hears from the service on its
+server as soon as the batch commits; one poller per branch and server
+answers the others from the rows of the branch finished since it last
+looked (every 250 ms while another server holds the lease, every 5 s as a
+fallback while this one does: a cost that follows the landings, never the
+number of waiters), and keeps a service running; a starting server resumes
+every branch with queued rows. A service with nothing to do
+for 5 s gives the lease back. Its loop:
+
+* **Batch:** every ready row not in the batch being committed, in queue
+  order (the database's clock at submit), at most 64 (larger batches cost
+  more per landing here: `LOAD.md`); no entry joins a batch that made
+  8 MiB of new objects with the batch being committed (`BATCH_BYTES`), and
+  the build stores what it holds as soon as it passes that, so no entry and
+  no batch, its first entry included, holds more. An entry whose edits touch `.veilpolicy` or
+  `.veilrules` ends the batch before it and **lands alone**; nothing is
+  built after it until it is committed.
+* **For each change of an entry's stack:** landed already by another
+  stack (`landings` of the current lineage, or this batch), it is skipped.
+  Otherwise **the fast path**: every path of its edits (above) must be, on the tip, what it was in its base: the same
+  entry (kind, content, mode, label), absent in both, or under the same
+  non-folder in both. Exact per path: nothing else on the tip matters. Then
+  its edits are applied (only the folder listings on the way are rewritten;
+  folders are made where needed and dropped once empty) and a **new
+  snapshot** is signed by the server: parent the tip (a merge: and its other
+  parents), the change's id, description, author and time, predecessor the
+  submitted snapshot. A merge lands only on the tip it was made on, and the
+  push's checks run again on it (every parent). A path that moved:
+  **`conflict`**, naming the change's own paths that moved (never landed
+  over; content merges are S18). A stack lands all or nothing.
+* **The landing check:** each new snapshot's diff against its parent must be
+  exactly the change's edit set, path for path; a mismatch rejects the
+  entry (and logs a bug, with ids only), never lands it.
+* **Checks again when what they read changed:** while the submitter's and
+  the project's access epochs (§13.14) are those the submit recorded, and
+  the tip's `.veilpolicy` is the base's, the submit's checks still hold.
+  Otherwise (someone removed from a group, a device barred, an access
+  change landed, a policy file moved) the push's checks run again on the
+  new parents (every real parent of a merge), as the submitter is now:
+  their projection of the new snapshot is grafted back by `sync::complete`
+  and must give exactly its tree. When access changed, write access to
+  each path is decided **before** the fast path reads the tip: someone who
+  may no longer write a path is `rejected`, never told whether it changed.
+  Someone no longer in the project is refused. A change of who has access
+  on the default branch is accepted in the batch's transaction (an admin's
+  only), which bumps the project's epoch: every later entry is checked
+  against it. **The branch rules** are judged the same way: a landing on
+  the default branch that changes `.veilrules` against its tip is an
+  admin's only (so is a push or an API commit that moves it), never "the
+  same as one of its parents'".
+* **Projections per viewer, never a walk:** the service keeps every view
+  key of the project's people and of anyone on Earth (at most 64; re-read
+  when the project's access epoch changes) with its projection of the tip,
+  and projects each new snapshot onto it (`sync::project_one`, from stored
+  memos only). A key it does not keep is attached from its newest memo on
+  the branch's recent first-parent line (the last 1,024 snapshots it knows;
+  S12's deriver keeps tips memoised for every key), projecting only what
+  came after, within 256 projections a batch (`ATTACH_BUDGET`); a key with
+  no memo there, or past the budget, is handed to S13's background fill
+  (`query::graph::prefill`). Each projection is held as soon as it is made
+  (the next one reads it). Every projection made is stored in the batch's
+  commit, and a stored memo wins: one written meanwhile with another value
+  rolls the batch back (it is built again). Outcomes hold real snapshots;
+  each answer is projected for its asker (from the memo, else in their own
+  request, as a pull would).
+* **Pipelined:** while batch *n* is stored and committed, batch *n+1* is
+  built on the tip *n* leaves. If *n* loses (the branch moved under it: an
+  admin's forced push; or the lease was lost), *n+1* is discarded and built
+  again from the database.
+* **One commit per batch:** the new objects are stored first, then one
+  transaction: the lease (its holder and epoch: **fencing**), the branch's
+  compare-and-swap, an accepted policy, the queue rows (each must still be
+  `queued`, else nothing commits: an entry never lands twice), the
+  snapshot, `landings` and memo rows, an audit row and the tips notice.
+  A batch that lands nothing still compares the tip and lineage it judged
+  on (BUG-1304): if the branch moved by another route, its entries are built
+  again on the database's tip.
+* **Retention, also while busy** (BUG-1303): every 5 s the service deletes
+  finished queue rows and `landings` rows older than an hour (each by an
+  index on its project and time, so a pass with nothing to delete reads
+  nothing), at most 20,000 of each a pass (4,000 a second, four times what 1,000 landings a
+  second add). At 1,000 landings a second a branch's tables hold about
+  3.6 million rows each in steady state (an hour); a ticket's outcome is
+  readable for that hour, and a base older than it is found by the graph or
+  the walk above.
+
+**Protected branches.** `.veilrules` at the project root (TOML;
+`[branches.NAME] protected = true`; other tables are left to later
+milestones, an unknown key under a branch is refused). Only admins change
+it, on any branch (`sync::complete`), and an admin's must parse, so the
+default branch's current file is always an admin's. A protected branch is
+moved only by its landing service: a push of it **lands instead** (its new
+snapshots, as one stack, need not be on the tip; `vl push` waits and
+reports `landed`); a commit through the API with `onto` it is kept but
+`rejected`; deleting it needs an admin's `--force`; an admin's
+`vl push --force` still moves it (audited). Product decision 9 (protected
+`main` by default for new projects) is not applied yet: protection is
+opt-in.
+
+**`vl land [REV] [--onto BRANCH] [--no-wait] [--status TICKET]`** uploads
+REV (default `@-`) and what the server lacks under it, submits it, and on
+`landed` pulls and moves the local tag of the branch to where the change
+landed if it was at REV or below. The working copy stays on REV, a
+predecessor of the landed snapshot with the same content at every path it
+edits; the next change made on it lands the same way.
+
+**Measured** (`docs/design/scale/LOAD.md`, "The landing service", after the
+cycle-3 redesign): into one `main`, **993 landings/s with 1,000 agents at a
+1,000/s target, p50 79 ms and p99 327 ms**, 1.14 database commits, about 16
+statements and 14 storage writes per landing; **943/s with 10,000 agents,
+p50 270 ms, p99 1.01 s**; 1,208/s at most. No collisions. (Re-measured after the
+redesign's reviews on a machine that was never quiet: the same cost per
+landing, the latencies of a loaded object store; `LOAD.md`.) The object
+store's synced writes are the limit (packs, S28).
+
+**Limits.** When S21 merges, its `prs::state::record_landing` joins the batch's transaction (right after the branch's compare-and-swap) for every move of the default branch, so the review rules in force never lag a landing, and landing onto a protected branch meets S21's review rules by every route (S21's follow-up wires both). Fair share between people and sessions is FIFO here (S24); a
+submitter whose view key no service keeps (a new one after an access
+change) waits, in their own request, for their view's first projection;
+the batch-tip memos for other viewers are S12's.
+
+Threat review (phase 4 §6, rows 1–4, and what S17 adds), tests in
+`server_hub` `landing` and `veil-server` `landing::edits`:
+
+| # | Attacker | Capability | Harm | Mitigation | Test |
+|---|---|---|---|---|---|
+| 1 | An agent with access to `src/` only | submits edits touching `billing/`, the root, `.veilrules`, a secret in a file | writes where it may not | the push's checks at submit (nothing is queued); again at landing when access changed | `access_is_checked_at_submit_and_again_when_an_entry_lands` |
+| 2 | An admin and an agent at once | a revoking policy change queued between two writes of the revoked path | the second lands under rules that no longer allow it | policy and rules changes land alone; the epoch they bump re-runs later entries' checks; no batch is built before they commit | same: the second write is `rejected` |
+| 3 | — (failover) | two servers both run a branch's service | `main` moved twice from one tip, a lost or doubled change | the lease's epoch checked in the batch's transaction; queue rows must still be `queued`; the branch's compare-and-swap | `only_the_lease_holder_lands_and_every_ticket_lands_once_across_servers` (two servers, the lease stolen every 30 ms: every change on `main` exactly once) |
+| 4 | — (a bug) | the fast path rewrites a tree wrongly | a change lost or altered | the landing check before the commit; property test against applying each change's edits by hand | `batched_landings_equal_sequential_edits`, `non_overlapping_changes_land_in_batches_each_once_with_exactly_its_edits` |
+| 5 | A submitter | reads a conflict or a ticket | learns about hidden folders | a conflict names only the change's own paths; tickets are random and their submitter's only (404 for anyone else) | `hostile_landing_requests_are_refused` |
+| 6 | Any participant | a stale clone pushes a protected `main` | moves it over others' work | a push of a protected branch lands instead (fast path or `conflict`) | `protected_branches_move_only_by_landing_and_push_lands_instead` |
+| 7 | A non-admin, even one given `.veilrules` | unprotects `main` | bypasses the landing service | `.veilrules` changes are admins' only, on any branch | same |
+| 8 | Hostile API client | bad branch names, both or neither of `snapshot` and `edits`, unknown fields, missing objects, a branch that does not exist | a corrupt queue or a crash | the request's shape checked first; refusals before anything is queued | `hostile_landing_requests_are_refused` |
+| 9 | A member who lost access while a change waits | reads the answer | learns whether a hidden path changed | access decided before the fast path | `bug_1104_a_submitter_who_lost_access_is_told_nothing_of_what_changed_since` |
+| 10 | A non-admin who may read `.veilrules` | a merge keeping an older side's rules | unprotects `main` | the rules judged against the default branch's tip at every move | `bug_1102_a_merge_never_lets_a_non_admin_change_the_branch_rules` |
+| 11 | A pusher | pushes a change on one the server holds off the branch | a change dropped, `landed` said | the stack is every change between the tip and the pushed one | `bug_1103_a_landed_stack_brings_every_change_the_branch_lacks` |
+| 12 | Any participant | lands after a pause, or with a view the service does not keep | stalls every landing on the branch | no walk in the service: incremental projections, background fills | `bug_1106_…`, `bug_1100_…` |
+| 13 | Ordinary agents | many one-line changes in a 30,000-file folder | the server out of memory | batches bounded in bytes | `bug_1107_…` (in a child process) |
+
+### 13.20 S28: packs, staged uploads, checks several at once (built)
+
+Design: `docs/design/server/storage-and-cost.md` §7 (and §8, which S29
+builds on it). Code: `crates/veil-server/src/pack.rs` (the format, each
+server's lookup maps, discarding), `store.rs` (`Objects`: reads through
+packs, staging), `sync.rs` (`upload`, `push`), `migrations/0013_packs.sql`.
+Nothing changes for `vl` or on the wire.
+
+* **Upgrading to S28 is not rolling** (decision, 2026-11-08, BUG-1158):
+  stop every server, run `veil-server migrate`, start them all on S28. A
+  server before S28 reads objects only under their own keys and cannot read
+  packs, so beside an S28 server it would answer "missing object" for
+  everything S28 stored (no leak, no loss: S28 servers serve it). No cheap
+  sign tells an S28 server that an older one still runs, so this is the
+  deployment rule, not a check. Receipts without a pack (from servers
+  before S28) are not accepted.
+* **A pack** is one storage object, `p/<project>/pack/<name>` (`name`: 128
+  random bits in hex), never edited in place:
+  `"veilpack3\n" ‖ count u32be ‖ index ‖ entries`. The index, at the front,
+  is `count × (id 32 ‖ offset u64be ‖ len u32be)`, sorted by id; **each
+  entry is the object's id, the length of its encoding (u32be), then its
+  S27 encoding**, and the slot spans all three. Object ids stay the BLAKE3
+  of the canonical encoding. The index is read with one ranged `GET` of
+  the first 64 KiB (a second for a larger index); an object with a ranged
+  `GET` of its slot. **Every read checks the id and the length the entry
+  starts with against its slot before it uses a byte of it**, a `Range`
+  read too (`pack::entry`; a range far into a large object reads the
+  entry's head first, then the range): the id ties the slot's start to the
+  object, the stated length its end, so a wrong slot (a damaged index, a
+  merger's mistake, a boundary moved between two neighbours) is an error,
+  never another object's bytes (BUG-1154, BUG-1394, BUG-1497); a whole
+  read is also decoded and checked against the id. **The slots must tile
+  the pack exactly** (`pack::parse_index`: by offset, each starts where
+  the one before ends, the first at the index's end, the last at the
+  pack's end), and each entry's stated length says where that boundary
+  must be, so a read never leaves its slot. `veilpack2` (S28 before cycle
+  4: entries without their length; never deployed) is not a pack to this
+  reader. S29 merges packs by reading indexes and copying entries, and
+  drops an object by writing a pack without it.
+* **The `packs` table** (migration 13) has a row for every pack in storage:
+  *staged* (an upload's, with its uploader), *listed* (its objects are the
+  project's) or *discarded* (its storage object is deleted after the row
+  says so). A staged row turns listed or discarded once: the push's
+  transaction updates it (locking the row) and a discard updates only a
+  staged row, so a listed pack is never deleted and a discarded one never
+  listed.
+* **Uploads are staged and recorded** (BUG-930, BUG-1157). `POST …/objects`
+  checks each frame as before (S27's decoding bounds, the hash, canonical
+  decoding, the format), writes a *staged* row for each pack of the request
+  (at most `pack::MAX_OBJECTS`, 262,144 objects a pack, with the uploader;
+  one database commit per pack, so one per `vl` upload request, apart from
+  the push's one), then the pack: one storage write per pack (one per `vl`
+  upload request).
+  Each receipt is `MAC(project ‖ person ‖ id ‖ pack) ‖ "." ‖ pack`. A staged
+  pack is nobody's: its objects are read only by a push or API commit of
+  that person that shows its receipts, through `Objects::get_staged`, and
+  cached under keys of their own (`Objects::staged_key`, in the object and
+  tree caches), so no read of the project ever answers a staged object.
+  **An upload of objects that a pack the same person staged on this server
+  holds all of** (a push that lost a race, uploaded again by `vl`'s next
+  try) gets that pack's receipts, with no new pack and no commit.
+* **What counts as uploaded** (BUG-1155): only an object its receipt's
+  pack holds, where that pack is the pusher's and staged or listed (one
+  statement: the rows). A receipt of a discarded upload is worth nothing,
+  and a staged object is read from its pack only, never looked for in the
+  project's store instead, so naming a guess of hidden content with an old
+  receipt gets the answer a wrong guess gets.
+* **A push** reads the staged packs its receipts name (their indexes, from
+  memory on the server that took the upload, or by bisecting the sorted
+  index in storage with 64 KiB ranged reads), checks every new snapshot as
+  before, and then, when something lands:
+  * lists a staged pack **as it is** if its checks read every object in it
+    (what a `vl` push uploads is exactly what the checks read: §13.5);
+  * puts the objects the checks read from any other staged pack, and the
+    objects the server made (the graft's trees, completed snapshots, the
+    pusher's signed projections), into **one pack of its own** (split at
+    `pack::MAX_OBJECTS`, 262,144 objects a pack);
+  * lists them in its one transaction (one statement more), and refuses
+    with 409 if a pack it names was discarded first (`vl` uploads again);
+  * discards every staged pack it did not list (every delete tried,
+    whatever another answers: BUG-1498).
+  **A push its checks refuse** (a secret in plain text, a path the pusher
+  may not write, anything answered before its transaction) discards its
+  staged packs and deletes its own, so **a refused upload stays in the
+  store only for the push that refuses it**. **A push that only lost a
+  race** (409, or every update not on the tip) passed every check: its
+  uploads stay staged for the next try (above), and its own pack, if it
+  wrote one, is deleted once the database shows its transaction did not
+  list it.
+* **A push's own pack is recorded too** (staged, the pusher's) before it
+  is written, and its transaction lists it, so **every pack in storage has
+  a row**, whatever stops the request (BUG-1399): one database commit more
+  per own pack for a push that writes a pack of its own (the server
+  completed its snapshots or made projections), apart from its one
+  transaction. **A push runs to its end in a task of its own**: a client
+  that goes away (a stopped `vl push`, a dropped connection) stops the
+  request, not the push, whose clean-up then discards what it did not list.
+* **What storage holds that no push listed** (until S29's job removes the
+  staged rows older than its grace, and their packs, and the packs of
+  discarded rows that a failed delete or a stopped server left in storage:
+  BUG-1498, `storage-and-cost.md` §8): staged packs, each
+  with its row: of each push that lost every race since (one per upload
+  request, reused by its retries on the same server; one per server a
+  retry reaches), of uploads no push followed, and those of a request run
+  again after a database or store error (`db::retry_requests`). That is at
+  most what each person uploaded, as before S28, and S24's per-person
+  limits bound it.
+* **An API commit** (S10) reads the objects its receipts name from their
+  staged packs, at most 1 GiB, **holding a share of the server-wide bound
+  on decoded bytes** (`store::DECODED_IN_FLIGHT`, 256 MiB for every request
+  together; a commit naming more takes all of it, so such commits run one
+  at a time: BUG-1156), **taken before it reads them**: what they decode to
+  comes from each entry's first bytes, then the share, then the objects one
+  at a time (BUG-1397); it stores what it keeps loose once every check
+  passed, as before, and discards the staged packs when it is answered
+  (not after a lost race: the caller may try again with the same receipts).
+* **Reads.** `Objects` finds a project's object in its cache, then in the
+  indexes of the listed packs this server holds (per project, newest pack
+  first, each a sorted array of 48 bytes a slot, searched by bisection;
+  **128 MiB for every project together, by their real memory**, each
+  project's entry and each pack it names counted). Past the budget the
+  indexes used least recently are unloaded, those of the project in use
+  too, and then the entries of projects used least recently, never the one
+  in use: a lookup that needs an unloaded index reads it again from storage
+  (`pack::Packs::find_paged`), so **a project of any size always reads**
+  (BUG-1395, BUG-1396). Weights are read from the maps under one lock, so
+  eviction and additions never miscount. Such a lookup searches the loaded
+  indexes and names the unloaded ones **under one read of the map**, then
+  reads those from storage, so together they cover every listed pack and
+  **no lookup answers "missing" for a stored object**, whatever other
+  lookups page in or out meanwhile (BUG-1495). **Every pack index held in
+  memory outside the lookup maps holds a share of one server-wide bound**
+  (`pack::INDEXES_HELD`, 96 MiB for every request together, of which the
+  staged-index cache may hold 32 MiB), taken before the first bytes are
+  read or the index is built and covering all memory the operation holds
+  (the index bytes, the parsed index and the parse's working copy for
+  `read_index`; the index bytes and parsed index for `write_pack`, with
+  `pack::MAX_OBJECTS` at 262,144 so a full pack's index takes at most 27
+  MiB to read, 23 MiB to build and 12 MiB to hold, never clamped:
+  BUG-1621): one being read for a lookup or a listing, the pack a push
+  writes (its share released as soon as `listed()` enters the index in the
+  lookup map, before `projected()`), and a push's staged uploads' (when not
+  in the staged-index cache, `pack::Packs::staged_slots` bisects the sorted
+  stored index by 64 KiB ranged reads under one 64 KiB share and keeps only
+  the slots its receipts name and the object count, never reading the whole
+  index; each project also has its own fair share of the active bound so
+  one project's load can never starve another's: BUG-1620). A listing loads
+  each index as it is read and leaves the rest unloaded when the bound is
+  full (a lookup reads them later); a request that gets no share within
+  10 s is answered 503 `busy` with `retry_after_ms` (and `Retry-After`)
+  across every reader (`sync::Source`, projections, viewer-graph fills,
+  queries, search), never 500 and never with an index held outside the
+  bound (BUG-1496, BUG-1622). Then
+  loose (objects from
+  before S28, and what grants, API commits, the deriver and the search
+  index store). After a miss in both it reads the project's listing again
+  (one statement, unless a listing began after the miss: it holds every
+  pack listed before) and the indexes of packs it does not know, so a
+  server reads what another server's push listed. A push's own packs join
+  the map at its commit. `Range` (S5) is of the object: a plain packed
+  object is read for those bytes only (and its id); a compressed one
+  decoded whole, as before.
+* **Neighbours read together** (BUG-1152). Before it answers, a `fetch`
+  reads the packed objects it will send that are not cached, per pack and
+  by offset, slots at most 64 KiB apart in one ranged request of at most
+  2 MiB (8 at once, each holding a share of the bound on bytes read ahead,
+  or not prefetched), and caches them, each entry's id and each object
+  checked, **each object's decoding holding a share for what it declares**
+  (or not read ahead: BUG-1159).
+* **What a push stores is counted where it is stored** (BUG-1398): a push
+  and an upload run in a scope of their own (`store::own`), and the writes
+  made in it are theirs (`Objects::own_writes`, `storage_push_writes` for
+  `veil-bench load`); the work they spawn (the deriver, the search index)
+  and every other request (pulls' projections, grants' trees) are not. A clone asks a level of many snapshots at once, whose objects
+  lie in upload order in the same packs.
+* **Permissions are unchanged and per object.** Packs change where objects
+  are stored, never who may read them: every route reads one object at a
+  time through `Objects` after the same checks (S1's path walk, S5's grant
+  and chain), a pack is never sent, and "not found" stays the answer for
+  objects that are not reachable, packed or not.
+* **Checks several at once** (BUG-865). A push checks up to 8 new snapshots
+  at once, 64 ahead at a time, on the guess that each new parent is
+  completed to itself (an admin's, or anyone's who sees all it changes): a
+  right guess has exactly the inputs of checking one at a time, so the same
+  answer; a wrong one is checked again in order; results and the first
+  error are taken in order. When most guesses of a window are wrong (a
+  pusher the server completes every snapshot for), the rest is checked one
+  at a time.
+
+#### Threat review
+
+Attackers outside the trust boundary (§3.1): a participant crafting
+uploads, receipts and pushes; a reader without access to a folder; another
+participant racing them. The server, its database and its object store are
+trusted (with code; never with secrets' plaintext).
+
+| # | Threat | Defence | Test |
+|---|---|---|---|
+| 1 | A pack hands a reader objects of folders they cannot see | no route sends a pack; every object is read one at a time after its path or chain check | `grants::object_routes_serve_only_what_a_grant_reaches`, `leaks::…`, `sync::…` (all on packed objects now) |
+| 2 | Pack membership confirms a hidden object (one in the same pack as a visible one) | lookups answer only what the route's check reached; a hidden object of the same pack gets the answer a random id gets | `grants::object_routes_serve_only_what_a_grant_reaches` |
+| 3 | A refused plain-text secret stays stored (BUG-930) | uploads are staged; the refusing push discards them; a landing push discards what it did not list | `packs::a_refused_push_deletes_its_staged_upload`, `packs::an_unread_plain_text_secret_beside_a_landing_push_is_not_kept`, `changes::bug_930_…` |
+| 4 | Another person's staged upload read or claimed, or a discarded upload's receipt used to confirm a guess of hidden content (BUG-824's class, BUG-1155) | receipts bind person and pack; an object counts as uploaded only if its receipt's pack, the pusher's and not discarded, holds it; staged objects are read only from their pack and never cached as the project's | `packs::receipts_hold_only_for_their_person_and_pack`, `packs::bug_1155_…` (a push and an API commit) |
+| 5 | A receipt moved to another pack, or a crafted pack name (`../`) | the MAC covers the pack; names are 32 lowercase hex digits | same |
+| 6 | A race lists a pack another push of the same person discards, or deletes a listed one | the primary key decides; discard deletes only after its row won; a push deletes its own pack directly only if its transaction never began | `pack::…`, `packs::a_refused_push_deletes_its_staged_upload` |
+| 7 | An object a push's checks never read kept in the store (an upload a push names but never checks) | only what the checks read is listed or copied | `packs::a_push_is_one_storage_write_and_reads_come_from_its_pack` (crafted pushes upload superseded trees) |
+| 8 | A damaged or hostile index (counts, offsets past the end, unsorted, overflow, a slot naming another object's entry) | parsed with every bound checked; every read, ranged ones too, checks the id its entry starts with; whole reads are checked against the id | `pack::tests::…`, `store::tests::bug_1154_a_wrong_slot_never_serves_another_objects_range` |
+| 11 | API commits naming large uploads exhaust memory (BUG-1156) | held under the server-wide bound on decoded bytes | `packs::bug_1156_…` (six at once) |
+| 12 | Push attempts that lose races fill storage with copies (BUG-1157) | retries get the earlier upload's receipts; every staged pack recorded | `packs::bug_1157_…` |
+| 9 | Checks run on a guess answer differently from one at a time | a guess is used only when its inputs are the real ones; results and errors in order | `packs::bug_865_…` (an admin's 70 snapshots, every guess right; a developer's 70, every guess wrong), the whole `server_hub` suite |
+| 10 | A server serves a stale "not found" for an object another server just listed | after a miss, the listing is read again | `packs::a_push_is_one_storage_write_and_reads_come_from_its_pack` (a second server) |
+
+#### Measured
+
+`scripts/bench-server.sh 1g` through `bench-quiet.sh` (PostgreSQL 17 and
+MinIO in Docker, release builds, the same `vl` and `veil-bench`; the base
+server through `SERVER_BIN`), one run each, back to back on a quiet
+machine (load 13 → 9 and 9 → 11), 2026-11-08; memory is the server's
+`VmHWM`. Storage writes and load: the earlier harness and `veil-bench load`
+(one project, 10 agents, 15 s).
+
+| | `integration` @ `6fa552c4` | S28 (`891ef104`) |
+|---|---:|---:|
+| push, initial (10,022 snapshots, 327,017 objects): time | 252.7 s | **99.3 s** |
+| push, initial: server peak | 1,254 MiB ⛔ | **888 MiB** |
+| push, initial: storage writes | 327,017 (one per object) | **110** (one per 8 MiB upload request) |
+| clone, full: time | 68.5 s | **59.8 s** |
+| clone, full: server peak | 1,786 MiB ⛔ | **964 MiB** |
+| clone of one directory: time / server peak | 4.7 s / 1,343 MiB ⛔ | 8.0 s / 895 MiB (BUG-1152) |
+| load, own branches: storage writes per landing (the push's own) | 9.0 | 3.0 (**2.0**) |
+| load, into one `main` (about 9 lost races per landing): per landing (per push) | 66.5 | 15.4 (**1.5**) |
+| load: database commits per landing, own branches / one `main` (the push's own) | 1.58 / 5.2 | 1.38 / 5.0 |
+| load: storage reads per landing | 0 | 0 |
+
+After S28's cycle 3 (the read and push paths changed: tiled slots, paged
+indexes, the push in a task of its own), `bench-server.sh 1g` @ `7ebc199c`,
+on a busy machine (load 103 → 21, so times are noisy): push 87.8 s and
+890 MiB, full clone 54.5 s and 929 MiB, clone of one directory 8.7 s and
+895 MiB; every case under the gates. After cycle 4 (`veilpack3` entry lengths,
+held indexes bounded under `pack::INDEXES_HELD`), on an isolated 8-vCPU, 16 GB
+Boat machine: push 157.5 s and 905 MiB, thin clone 21.5 s and 853 MiB, full
+clone 98.6 s and 904 MiB, clone of one directory 16.4 s and 840 MiB; every case
+under the gates.
+
+**BUG-1089 and BUG-1000** (bisected: `31639c3` 972 MiB, `d8cf2b2` 967 MiB,
+`b2478b5` 1,356 MiB): objects read from S3 were cached as slices of the HTTP
+client's read buffers, each small object pinning a whole buffer while the
+cache weighed only its bytes; S27's smaller encodings put about 2.5 times
+as many objects in the cache. A heap profile at the push's peak put 678 MB
+of 1.41 GB live there. `Objects` now copies what the store answers before
+caching it (`store::owned`).
+
+#### Reverting
+
+Revert the merge **only if no server ran it on real data**: a server
+before S28 cannot read packed objects (it finds no loose object), and it
+would read receipts with a pack as invalid (and the upgrade is not
+rolling, above). Once a server has listed packs,
+going back needs every listed pack's objects written out loose first; no
+tool does that yet. Migration 13 only adds a table (harmless to an older
+server).
+
 ### 13.21 S3: thin clones, fetch on demand (as built)
 
 Milestone S3 of `docs/design/server/phase-2-thin-clients.md` (§4.2, §5.4,
@@ -3775,3 +4344,422 @@ are unchanged, the daemon's store is a cache (delete `~/.cache/veil/daemon`
 or `$VEIL_HOME/daemon`), and the server's `GET /v1/grant-key` is additive.
 Stop running daemons first (`vl daemon stop`), or they exit when their
 socket is removed.
+
+### 13.30 S18: content merges, conflict reports and the event stream (as built)
+
+Milestone S18 of `docs/design/server/phase-4-agent-scale.md` (§4.3, §5.1–5.2,
+§6, §8): content merges by worker pool, bounded re-queue (`merges` in
+`0022_landing_merge.sql`), visibility-redacted conflict reports, and the
+project event stream (`GET /v1/projects/{p}/events`). Code:
+`crates/veil-server/src/landing/merge.rs`, `crates/veil-server/src/events.rs`,
+and `crates/veil-core/src/hub/land.rs`.
+
+#### The design as built
+
+* **Merge workers (`landing/merge.rs`):** when a queued change cannot take
+  S17's fast path (`edits::fast_path`), `merge::can_merge` checks whether the
+  entry has `merges < MAX_MERGES` (`3`) and its overlapping paths can all be
+  content-merged cleanly:
+  * **Visibility gate first:** every path of the change must be readable and
+    writable by the submitter, and every overlapping edit on the branch since
+    the base (`paths_overlap`) must also be readable by the submitter. A
+    submission touching `.veilpolicy` or `.veilrules`, an already-merged commit
+    (`parents.len() > 1`), or a path failing the visibility gate is never handed
+    to a merge worker.
+  * **State transition (`queued -> merging`):** the batch's commit transitions
+    eligible rows to `state = 'merging'` inside the batch transaction (guarded
+    by `AND state = 'queued'`) and only spawns a background merge worker on a
+    bounded semaphore (`MAX_WORKERS = 8`) after the batch commits.
+  * **3-way content merge (`run_worker` / `merge_stack`):** the worker reads the
+    submitter's current access epochs from `access_epochs` and the tip's
+    `.veilpolicy`, verifies the submitter may still read and write every edit of
+    the change whole on both the current view and the tip's policy (refusing
+    without naming any hidden path if access changed), loads `.veilattributes`
+    from the tip (`ServerAttrSource`, restricted to public regular files the
+    submitter may read), and runs a 3-way merge per overlapping path
+    (`merge_entry_bytes`):
+    * paths matched by `-merge` or `binary` (`MergeAttr::Binary`) in
+      `.veilattributes`, binary blobs (`looks_binary`), non-files, non-`Public`
+      entries, or newly added files with different content (unless `merge=union`)
+      fail the content merge and produce a conflict report;
+    * paths matched by `merge=union` (`MergeAttr::Union`) merge via
+      `veil_core::attributes::union_merge`;
+    * all other plain-text files merge via `veil_core::textmerge::merge`.
+  * **Landing check, push re-check and re-queue (`merging -> queued`):** when
+    every overlapping path merges cleanly, the worker applies the merged edit set
+    to the tip tree (`edits::apply`), verifies the landing check
+    (`edits::same_edits`) and whole-change visibility on the resulting diff,
+    signs the new snapshot (recording the prior submitted snapshot IDs in
+    `predecessors`), runs `service::recheck_merged` (`sync::complete` on the new
+    parent), stores the objects, and atomically updates the queue row
+    (`SET state = 'queued', stack = $4, merges = merges + 1, created_at = …
+    WHERE project_id = $1 AND branch = $2 AND seq = $3 AND state = 'merging'
+    AND merges < $5`), emits a `land.requeued` event on the submitter's stream,
+    and wakes the branch's landing service. At most `MAX_MERGES` (`3`) merge
+    passes run per ticket; a fourth overlap finishes as `conflict`.
+* **Conflict reports (`ConflictReport`, `ConflictReport::into_result`):** when
+  `can_merge` is false or a merge worker finds an unmergeable overlap,
+  `merge::build_conflict` builds a visibility-checked report (which
+  `landing::seen` then projects for the caller):
+  * **Hidden-path redaction:** if any overlapping path of the submission or any
+    overlapping change on the branch (`paths_overlap`) is not readable by the
+    submitter (`hidden = true`), the report collapses to
+    `message: Some("conflicts with changes you can't see")` (`HIDDEN_CONFLICT`),
+    `paths: []`, `conflicts: []`, and `landed_since: []` (with `onto` and `base`
+    projected for the submitter by `landing::seen`). No hidden path, name,
+    count, or content is ever placed in the database outcome, HTTP response, or
+    event stream.
+  * **Visible conflict details:** when every overlapping path is readable by the
+    submitter, the report populates `paths`, `onto` (projected tip), `base`
+    (projected base), `conflicts` (`Vec<ConflictPath { path, base, main, yours }>`
+    with public file object IDs from the base, tip, and submitted edits), and
+    `landed_since` (`collect_landed_since`: up to 256 first-parent commits on
+    the branch since the base that touched the overlapping paths and have at
+    least one readable edit, projected for the submitter by `landing::seen` so
+    commits touching only hidden paths are omitted).
+* **The event stream (`GET /v1/projects/{p}/events`, `events.rs`):** an SSE
+  (`text/event-stream`) endpoint for signed-in project participants (with
+  optional `?ticket=`, `?branch=`, and `?types=` filters):
+  * **Events:** `land.requeued`, `land.landed`, `land.conflict`, and
+    `land.rejected` are routed only to streams owned by that ticket's
+    submitter (`emit_ticket`), passing the outcome through `landing::seen` for
+    the receiver's current view; `main.moved` is broadcast to connected project
+    streams (`emit_moved`), projecting `(old_tip, new_tip)` and the batch's
+    snapshots per viewer and skipping any viewer for whom `p_old == Some(p_new)`
+    (a move whose edits were entirely in paths hidden from that viewer). Every
+    emission reads current access epochs (`caches::read_epochs`) before
+    opening the subscriber's `Viewer`, so permission revocations take effect on
+    the very next emitted event and never populate the viewer cache with stale
+    zero epochs.
+  * **Bounds per connection and per person:** each `(ip, device_key)` connection
+    key may hold at most `MAX_STREAMS_PER_CONNECTION` (`8`) concurrent streams,
+    and each person may hold at most `MAX_STREAMS_PER_PERSON` (`8`) concurrent
+    streams; a 9th open returns `429 Too Many Requests` (`rate_limited`).
+    `StreamBody::drop` calls `Events::evict` to release the slot when closed.
+  * **Slow or absent readers evicted immediately:** each stream holds an
+    in-memory queue (`SubQueue`) of at most `MAX_QUEUE_PER_STREAM` (`64`) frames
+    and at most `MAX_BYTES_PER_STREAM` (`64 KiB`), tracked in `total_bytes`
+    (`Events::held_bytes`). `push_frame` checks both bounds before queueing; if
+    a reader's queue is full or would exceed `64 KiB`, `Events::evict` removes
+    the subscriber, clears and shrinks its frame buffer, decrements `total_bytes`
+    to zero, and marks the stream closed without blocking landing or merge
+    workers.
+* **Agent sessions across queuing, content merges, conflict reports and events
+  (BUG-1685):** `landing_queue.agent_session` (`0022_landing_merge.sql`) records
+  the submitting agent session's `token_hash`. `service::prepare`,
+  `service::commit`, `merge::run_worker`, and `events::emit_ticket` /
+  `events::emit_moved` reload and verify the session via
+  `auth::load_agent_session` (checking that the session, its parent session, and
+  its device have not expired or been revoked), rejecting or evicting at once if
+  gone; `merge::merge_stack` and `service::entry` enforce `sync::agent_tip` and
+  `veil_core::hub::agent::decides_access` on every original and merged snapshot
+  against the base it lands on while preserving `agent` attribution and
+  `attempts`; and `merge::build_conflict`, `merge::collect_landed_since`, and
+  `landing::seen` require `view.within_narrowing(path)` so a narrowed session's
+  conflict reports and SSE events name nothing outside its paths.
+
+#### Threat review (phase 4 §6 and S18 guarantees)
+
+| # | Threat | Mitigation | Test |
+|---|---|---|---|
+| 1 | A content merge lands a change whose submitter cannot see every edit whole | `merge_stack` checks read/write access on current permissions and the tip's `.veilpolicy` before and after applying the merged edit set, and runs `recheck_merged` (`sync::complete`) | `server_hub` `landing::a_merge_never_lands_anything_its_submitter_could_not_see_whole` |
+| 2 | A conflict report or SSE event leaks a hidden path, name, count, file ID, or hidden commit on `main` | Any unreadable overlapping edit sets `hidden = true`, collapsing the report to `"conflicts with changes you can't see"` with empty `paths`, `conflicts`, and `landed_since`; `main.moved` skips viewers whose projection did not change | `server_hub` `landing::no_event_or_report_reveals_hidden_paths_names_counts_or_content` |
+| 3 | A re-queued change lands twice under concurrent workers or batches | State transitions (`queued -> merging -> queued -> landed`) are guarded by atomic `WHERE state = …` clauses in Postgres; `predecessors` and `landings` record the pre-merge snapshot IDs in the branch lineage | `server_hub` `landing::a_requeued_change_lands_at_most_once` |
+| 4 | A client opens unbounded SSE streams to exhaust file descriptors or hub slots | `MAX_STREAMS_PER_CONNECTION = 8` and `MAX_STREAMS_PER_PERSON = 8` enforced atomically on open; `StreamBody::drop` evicts on close | `server_hub` `landing::the_event_stream_is_bounded_per_connection_and_per_person` |
+| 5 | A slow or stalled SSE reader buffers unbounded events in server memory | Per-stream queue bounded at 64 frames and 64 KiB (`MAX_BYTES_PER_STREAM`); overflow calls `Events::evict` immediately on emit and frees held bytes to 0 | `server_hub` `landing::a_slow_or_absent_reader_never_holds_server_memory` |
+| 6 | Repeatedly conflicting changes loop between the queue and merge workers forever, or ignore `.veilattributes` | `merges` column capped at `MAX_MERGES = 3`; `.veilattributes` (`merge=union`, `-merge`, `binary`) loaded from the tip via `ServerAttrSource` and honoured by workers | `server_hub` `landing::merge_attempts_cap_at_three_and_veilattributes_govern_content_merge` |
+| 7 | A queued or re-queued agent-session change escapes its session narrowing, touches an access/review file, lands after the session is revoked, loses its attribution/attempts on content merge, or learns paths outside its narrowing via conflict reports or SSE events (BUG-1685) | `landing_queue.agent_session` persisted and verified at prepare, merge, re-queue, and commit (`auth::load_agent_session`); `merge_stack` and `service::entry` enforce `sync::agent_tip` and `decides_access` and preserve `agent`/`attempts`; `build_conflict`, `collect_landed_since`, and `landing::seen` redact anything outside `within_narrowing` | `server_hub` `landing::a_narrowed_agent_sessions_change_that_needs_a_content_merge_lands_within_its_paths`, `landing::a_narrowed_agent_sessions_change_whose_merge_touches_outside_its_paths_or_an_access_file_is_refused`, `landing::a_session_revoked_while_its_change_waits_in_the_queue_never_lands`, `landing::a_landed_merged_snapshot_keeps_the_sessions_attribution_and_attempts`, `landing::a_narrowed_sessions_events_and_conflict_reports_name_nothing_outside_its_paths` |
+
+### 13.33 S7: the Veil daemon's file watcher (built)
+
+Design: `docs/design/server/phase-2-thin-clients.md` §4.7, the S7 row of §9,
+and product decision 5 (the daemon runs by default and watches working
+copies, with `vl daemon stop` and `watch = false` in `.veil/local/config.toml`
+or `$VEIL_HOME/config.toml` as off switches). Code: `crates/vl/src/daemon/watch.rs`
+(the watcher, `openat(..., O_NOFOLLOW | O_DIRECTORY)` tree walk, inotify
+event draining, tokens and bounds), `crates/vl/src/daemon/{mod,proto,serve}.rs`
+(`Request::Watch`, `config.toml` `watch` settings, `vl daemon status`),
+`crates/vl/src/doctor.rs`, `crates/vl/src/ctx.rs` (watcher queries in
+`record_once` and full-scan fallback for `vl ls --all`), and
+`crates/veil-core/src/{builder,statcache,working_copy,workspace}.rs`
+(`WatchPlan`, `build_tree_watched`, partial `StatCache` updates, and
+`WatchRecord` in `.veil/local/checkout.json`). `veil-core` stays portable to
+`wasm32-unknown-unknown`.
+
+* **Advisory, never authoritative.** The watcher only narrows which
+  directories `build_tree_watched` opens and lists; every inspected path
+  still goes through the stat cache, racy-mtime window, secret scanner and
+  sealing checks (`verify_sealing`, `protect_moves`). Directories that
+  produced warnings, quarantined/isolated files or held-back edits in the
+  previous snapshot are recorded in `checkout.json` (`WatchRecord::recheck`)
+  and re-inspected on the next build so `BuildReport` and `vl status` match
+  a full scan.
+* **When the watcher cannot vouch, `vl` scans.** The daemon answers
+  `known: false` on the first command in a working copy, after a daemon
+  restart or working-copy move (`st_dev`/`st_ino` mismatch), on an unknown
+  or stale token, on kernel queue overflow (`IN_Q_OVERFLOW`) or unmount
+  (`IN_UNMOUNT`), when `.veilpolicy` or `.veilattributes` is modified, or
+  when a directory or dirty-path bound is exceeded. `vl` also bypasses the
+  watcher plan whenever `.veilpolicy` or keys changed, an unaccepted policy
+  guards the working copy, or a command rewrites the working copy (`vl
+  restore`, `vl ws switch`, `vl renormalize`, `vl ls --all`).
+* **Confined to the working copy.** Every watched directory is opened step
+  by step from the working copy root with `openat(..., O_RDONLY |
+  O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)`, verified with `fstat` to belong
+  to the OS user (`st_uid == geteuid()`) and stay on the root filesystem
+  (`st_dev == root_dev`), checked not to hold `.veil`, and registered via
+  `/proc/self/fd/{fd}`. Symlinks and mount boundaries are never followed.
+* **Bounded.** One daemon watches at most 64 working copies (LRU-evicted);
+  each working copy watches at most `max_dirs` directories (default 65,536)
+  and buffers at most `max_dirty_paths` dirty paths (default 16,384) and
+  1 MiB of path strings. Past any bound, the working copy's watches are
+  dropped, the daemon returns a notice, and `vl` warns and falls back to
+  full scanning.
+
+#### Guarantees and tests (`crates/vl/tests/cli_basic/working_copy_cli.rs`)
+
+| # | Guarantee | Test |
+|---|---|---|
+| 1 | `vl status` and `vl commit` give the exact same answer with the watcher as with a full scan across edits, adds, deletes, renames, mode changes, racy-window commits, daemon restarts, tampered tokens, and `.veilpolicy` edits | `working_copy_cli::s7_watcher::s7_g1_status_and_commit_with_watcher_match_full_scan_across_all_changes_and_restarts` |
+| 2 | Never reads or reports anything outside the working copy, never follows symlinks out of it, and never descends into nested `.veil` repositories | `working_copy_cli::s7_watcher::s7_g2_watcher_never_follows_symlinks_or_escapes_working_copy`, `s7_hostile_watch_inputs_never_escape_or_crash_daemon` |
+| 3 | Bounded watched directories and dirty paths per working copy; past them it drops watches, warns, and falls back to scanning | `working_copy_cli::s7_watcher::s7_g3_watcher_bounds_fall_back_to_scanning_and_warn` |
+| 4 | Off when the daemon is stopped (`vl daemon stop`) or `watch = false` in `config.toml`, and `vl` works identically without it | `working_copy_cli::s7_watcher::s7_g4_watcher_is_off_when_daemon_stopped_or_disabled_in_config` |
+| 5 | Secret files (`.env.*`) are sealed and secret leaks in plain files are quarantined on commit with the watcher active exactly as with a scan | `working_copy_cli::s7_watcher::s7_g5_secrets_are_sealed_and_leaks_quarantined_with_watcher` |
+
+#### Measured (20,500 files, 1,202 directories)
+
+`bash ~/.cache/veil-orch/bench-quiet.sh cargo test --release -p vl --test cli_bench -- --ignored --nocapture bench_status::status_on_20k_files`
+(release build, 10 runs each, machine load 14.77 before, 14.95 after):
+
+| Case (20,500 files) | Without watcher (scan) | With watcher (daemon) | Speedup |
+|---|---:|---:|---:|
+| `vl status`, unchanged tree | 41.3 ms (min 29.5) | **11.0 ms** (min 10.1) | **3.8×** |
+| `vl status`, 1 public file edited | 48.1 ms (min 41.7) | **27.2 ms** (min 14.8) | **1.8×** |
+| `vl status`, 1 restricted file edited | 54.7 ms (min 42.8) | **25.6 ms** (min 17.4) | **2.1×** |
+| `vl commit`, 1 public file edited | 54.6 ms (min 47.6) | **32.5 ms** (min 19.9) | **1.7×** |
+
+#### Reverting
+
+Revert the merge commit. The `watch` field in `.veil/local/checkout.json` is
+optional (`#[serde(default)]`) and ignored by older `vl` builds; `Request::Watch`
+is additive on the daemon socket.
+
+---
+
+### 13.35 S19: CI through the API, land first / test after, and `main@tested`
+
+Design: [`docs/design/server/phase-4-agent-scale.md`](design/server/phase-4-agent-scale.md)
+§4.6 ("CI through the API, not through a clone"), §4.7 ("Agents start from
+`main@tested`"), §5.2 ("Checks, after landing"), §6 Threat 10 ("A compromised
+CI runner").
+
+#### What it builds
+
+* **Migration `0025_ci_and_tested.sql`** (version 25):
+  * `sessions.agent_runner BOOLEAN NOT NULL DEFAULT FALSE`: marks a session
+    as a narrow CI runner session.
+  * `checks (project_id, snapshot, name, state, summary, url, log, runner_id, runner_name, session_paths, admin_only, updated_at)`,
+    primary key `(project_id, snapshot, name)` with index `checks_by_runner
+    (runner_name, updated_at)`.
+  * `tested (project_id, branch, lineage, snapshot, depth, updated_at)`,
+    primary key `(project_id, branch)`.
+* **`.veilrules` check configuration (`crates/veil-server/src/landing/rules.rs`):**
+  * `[branches.<name>] required_checks = ["ci/build", "ci/test", ...]`
+    declares which checks must pass on a snapshot for `<name>@tested` to
+    advance to it (up to 64 checks per branch).
+  * `[checks.<name>] paths = ["src/", ...]` declares the default path
+    prefix grant for a runner minted for `<name>`.
+* **Narrow CI runner sessions (`POST /v1/sessions/ci`, `vl session ci`):**
+  * Mints a short-lived (default 1 hour, max 24 hours) runner session with
+    `agent_runner = true`.
+  * When `check` is named and `only` is omitted, the server reads `.veilrules`
+    on the default branch and narrows `only` to `[checks.<check>].paths`.
+  * The minting caller must be able to read every path in `only` (and an
+    un-narrowed runner session requires project admin or full-view access).
+  * A runner session (`Caller::is_runner()`) is refused on `POST /objects`,
+    `POST /push`, `POST /land`, and `POST /changes` with `403 agent_session`:
+    it can only read what its narrowed grant allows and report check results.
+* **Reporting and reading check results (`POST /v1/projects/{p}/checks`, `GET /v1/projects/{p}/checks`, `vl checks`):**
+  * `POST /v1/projects/{p}/checks` accepts `{snapshot, name, state, summary, url, log}`.
+    The caller's `snapshot` id (real or projected) is resolved to the
+    canonical `commits.snapshot` on `main` (or any project branch), verified
+    against the caller's view, and stored with the runner's readable path
+    footprint (`session_paths`, `admin_only`).
+  * `GET /v1/projects/{p}/checks?rev=<rev>` resolves `rev` (default `main`)
+    through the reader's view, filters stored checks so a reader only sees a
+    check if the reader's `View` can see every path the runner could read
+    (admin-only checks are visible only to admins; path-narrowed checks require
+    `view.sees_under(prefix)` for every prefix in `session_paths`), and
+    projects `CheckResult.snapshot` into the reader's view.
+* **Land first, test after, and `<branch>@tested` (`GET /v1/projects/{p}/tested/{branch}`, `vl tested`):**
+  * Landings (`POST /land`, `POST /changes`, `POST /push`) never wait for CI
+    runners; failing or absent checks never block a landing.
+  * Whenever a check passes on snapshot `S`, `advance_tested` checks each
+    branch whose tip reaches `S` along first-parent ancestry (up to 1,024
+    commits). If `[branches.<branch>].required_checks` is non-empty and every
+    required check has `state = 'pass'` on `S` (under the `.veilrules` at the
+    branch tip), `tested` is updated in a serializable transaction:
+    * Only advances forward: if the existing `tested.snapshot` is on the same
+      first-parent lineage and has `depth <= new_depth` (closer to the tip), a
+      late pass on an older ancestor never moves `<branch>@tested` backwards.
+  * `<branch>@tested` is served in `GET /v1/projects/{p}/tips` (`Tips.tested`,
+    projected per reader), resolved by the server query API
+    (`/q/resolve?rev=main@tested`) and local revset parser (`main@tested`,
+    stored as `origin/main@tested` in `remote_tags` on `vl pull`), and shown
+    by `vl tested`.
+* **Agents and workspaces start from `main@tested` by default:**
+  * `POST /v1/sessions/agent` returns `tested: Option<ObjectId>` (the caller's
+    projected `main@tested`).
+  * `POST /v1/projects/{p}/changes` with `base` omitted (or all-zero) defaults
+    to `<onto.branch>@tested` (falling back to the branch tip when no tested
+    tip is recorded yet).
+  * `vl ws new <name>` (when `-r` is omitted) and `vl change new` (when
+    `--base` is omitted) start from `main@tested` if present in `remote_tags`,
+    while a person can still pass `-r main` or `--base <rev>`.
+
+#### Bounds
+
+* **Per check result:** `name` ≤ 64 bytes (`MAX_CHECK_NAME`, ASCII graphic, no
+  `..`, no control characters); `summary` ≤ 512 bytes (`MAX_SUMMARY_BYTES`, no
+  control characters); `url` ≤ 1,024 bytes (`MAX_URL_BYTES`, `http://` or
+  `https://` only); `log` ≤ 64 KiB (`MAX_LOG_BYTES`, no NUL bytes).
+* **Per snapshot (`MAX_CHECKS_PER_SNAPSHOT = 64`, `MAX_TIP_LOG_BYTES = 256 KiB`):**
+  at most 64 distinct check names per snapshot and at most 32 checks per
+  runner on a single snapshot (`MAX_RUNNER_CHECKS_PER_SNAPSHOT = 32`); when a
+  snapshot's total logs exceed 256 KiB, the oldest check logs on that snapshot
+  are trimmed (`log = NULL`).
+* **Per runner (`MAX_RUNNER_CHECKS = 256`, `MAX_RUNNER_LOG_BYTES = 1 MiB`):**
+  across all snapshots, a runner retains at most 256 check results (oldest
+  evicted) and at most 1 MiB of logs (oldest logs trimmed to `NULL`).
+
+#### Guarantees and their tests (`server_hub::ci`)
+
+| # | Guarantee | Test |
+|---|---|---|
+| 1 | A CI runner sees only what its grant allows. A result names nothing its readers can't see. A runner can't move any branch or land anything. | `runner_sees_only_its_grant_and_results_respect_visibility_and_runner_cannot_write_code`, `agents::every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed` |
+| 2 | `main@tested` only ever moves to a tip whose required checks all passed, never backwards, and correctly across two servers and restarts. | `main_at_tested_moves_only_forward_when_required_checks_pass_across_servers_and_restarts` |
+| 3 | A failing or absent runner never blocks landings; `main@tested` just stays put. | `failing_or_absent_runner_never_blocks_landings_and_tested_stays_put` |
+| 4 | Agents start from `main@tested` by default, and a person can still choose another base. | `agents_and_workspaces_start_from_main_at_tested_by_default_and_person_can_choose_base` |
+| 5 | Results and their logs are bounded per tip and per runner. | `check_results_and_logs_are_bounded_per_tip_and_per_runner` |
+
+#### Threat review (design §6 Threat 10, plus visibility and DoS)
+
+| # | Attacker | Tries | Result | Test |
+|---|---|---|---|---|
+| 1 | A compromised CI runner (`POST /v1/sessions/ci`) | reads paths outside its `[checks.<name>].paths` or `only` grant | refused with `403` on every path-taking route and projected out of every snapshot/tree | guarantee 1 |
+| 2 | A compromised CI runner | pushes objects, moves a branch, lands a change, or creates a server-side change | refused with `403 agent_session` (`Caller::not_runner`) before touching objects or branches | guarantee 1 |
+| 3 | A non-admin user (`dev` without `billing/`) | mints a CI runner session for `ci/billing` (`paths = ["billing/"]`) | refused with `403`: caller cannot delegate paths their own view cannot see | guarantee 1 |
+| 4 | A check runner for a restricted area (`billing/` or admin-only) | writes restricted file contents or paths into `summary`, `url`, or `log` | `GET /checks` filters results by the reader's `View` against the runner's readable footprint (`session_paths`, `admin_only`) and projects `snapshot` into the reader's view | guarantee 1 |
+| 5 | An out-of-order or replayed runner | reports `pass` on an older ancestor after `main@tested` already moved to a newer snapshot, or reports `pass` on only a subset of `required_checks` | `tested` tracks `(lineage, depth)` in Postgres under `SERIALIZABLE` and never moves to a deeper (older) ancestor or an incomplete check set | guarantee 2 |
+| 6 | A dead, slow, or failing CI runner | stalls or reports `fail` on `main` | landings proceed immediately without waiting on CI; `main@tested` remains at the last passing snapshot and agents branch from `main@tested` | guarantee 3, guarantee 4 |
+| 7 | A noisy or hostile runner | floods `POST /checks` with huge logs, control sequences, `javascript:` URLs, or thousands of check names | validated (`MAX_CHECK_NAME`, `MAX_SUMMARY_BYTES`, `MAX_URL_BYTES`, `MAX_LOG_BYTES`) and bounded per snapshot (`64` checks, `256 KiB` logs) and per runner (`256` checks, `1 MiB` logs) | guarantee 5 |
+
+#### Reverting
+
+Revert the merge commit. The new tables (`checks`, `tested`) and column
+(`sessions.agent_runner`) in migration `0025` are ignored by older server
+binaries; `Tips.tested`, `AgentSession.runner`, and `AgentSession.tested` use
+`#[serde(default)]`; and `<branch>@tested` tags in `remote_tags` are ordinary
+remote tag entries.
+
+### 13.31 S22: embargoes through the server, and the release service (built)
+
+Milestone S22 of `docs/design/server/phase-4-agent-scale.md` (§4.8, decisions 8
+and 9, §6 rows 8–12, §8). Code: `crates/veil-server/src/embargo.rs` (push
+validation and recording, visibility checks, `release_due` and `release_one`,
+`release_route`), migration `0023_embargoes.sql` (`branches.hidden_for_embargo`,
+`embargo_lines`, `embargo_snapshots`), minimal wiring in `sync.rs`, `api.rs`,
+`landing/`, `changes.rs`, `query/mod.rs`, `search/` and `derive/mod.rs`,
+`veil-core/src/embargo.rs` (`embargo_branch`, `embargo_id_of_branch`,
+`active_embargoes`, `follow`), `veil-core/src/hub/wire.rs` (`PushRequest.embargoes`,
+`Tips.embargoes`), and `crates/vl/src/hub.rs` (`vl merge --embargo-for`,
+`vl push`, `vl pull`, `vl embargo follow`, `vl embargo release`). Nothing new
+is encrypted: embargoes are server-enforced permissions that turn public at a
+deadline.
+
+```text
+vl merge SOURCE --embargo UNTIL [--embargo-for GROUP...] [-m MSG]
+vl embargo follow [ID]
+vl embargo release ID
+```
+
+#### The design as built
+
+* **Hidden embargo lines (`embargo/<id>`).** When an embargoed merge into a
+  branch (`main`) is pushed and its scope's groups exist on the server, `vl push`
+  sends the `EmbargoRecord` in `PushRequest.embargoes` and directs the branch
+  update to `embargo/<id>`. The server (`embargo::prepare_push`) checks that the
+  caller is a member of one of the embargo's groups (or an admin) and that every
+  named group exists on the project, diverts any push of `main` carrying an
+  unreleased embargo onto `embargo/<id>`, stores the branch with
+  `branches.hidden_for_embargo = <id>`, records `(project_id, embargo_id,
+  group_names, target_branch, embargo_branch, until_ms, released_at,
+  record_json, created_by, created_at)` in `embargo_lines`, and tags every
+  snapshot on the line (real, origin, and projected) in `embargo_snapshots`.
+  The target branch (`main`) does not move until release.
+* **Visibility before release.** While `embargo_lines.released_at` is `NULL`:
+  * Only members of `embargo_lines.group_names` and project admins see
+    `embargo/<id>` in `GET /v1/projects/{p}/tips` (along with its `EmbargoRecord`
+    in `Tips.embargoes`) and in `POST /v1/projects/{p}/history`.
+  * `embargo_snapshots` rows for an unreleased embargo are invisible to
+    everyone outside the embargo by every route: `sync::resolve_for`,
+    `sync::history`, `sync::fetch`, `POST /v1/projects/{p}/land`,
+    `POST /v1/projects/{p}/changes`, `GET /v1/projects/{p}/q/…`, and
+    `GET /v1/projects/{p}/q/search` and `grep`. Every refusal uses the exact
+    same status code and message as a non-existent revision or branch (`404`, or
+    `400 snapshot … was not uploaded`).
+  * S12's deriver (`derive::catch_up`) and S15's search indexer (`search::index`)
+    skip `branches WHERE hidden_for_embargo IS NOT NULL`, so embargoed snapshots
+    never enter the derived commit graph, viewer graphs or search shards before
+    release, and neither `policy_version` nor any public branch tip changes when
+    an embargo is pushed.
+* **`vl embargo follow [ID]`.** Pulls from `origin` (receiving `Tips.embargoes`
+  and `origin/embargo/<id>` tags for the embargoes the caller is in), saves each
+  `EmbargoRecord` into the local keychain, rebases `embargo/<id>` onto the
+  newest tip of `main` when `main` moved ahead, pushes the rebased embargo line,
+  and checks out the hidden line (when one unreleased embargo is active or `ID`
+  is given) or lists the caller's active embargoes. Someone outside the embargo
+  receives neither the branch nor the record, and `vl embargo follow <id>` fails
+  with the same message as for an unknown id.
+* **Scheduled release and landing at release.** Every server runs a background
+  release task (`embargo::run_loop`) that calls `embargo::release_due`:
+  * **Database clock and idempotent landing:** deadlines are compared solely
+    against PostgreSQL's `clock_timestamp()` (`until_ms <= (extract(epoch FROM
+    clock_timestamp()) * 1000)::BIGINT`), never a client's or an application
+    server's local clock.
+  * **Landing onto the target branch:** for each due embargo whose hidden
+    branch still exists, `release_one` queues a deterministic landing ticket
+    (`embargo-<project_id>-<embargo_id>`) onto `target_branch` (`main`) with
+    `ON CONFLICT (ticket) DO NOTHING` and waits for S17's fenced landing service
+    to land the embargoed stack onto `target_branch` once, recording each
+    server-signed snapshot's author in `snapshots.author` (BUG-1581).
+  * **Clearing the embargo:** in one transaction after the landing succeeds,
+    `release_one` sets `embargo_lines.released_at` and updates
+    `record_json.released_at`, deletes `branches WHERE name = 'embargo/<id>'`,
+    deletes the embargo's `embargo_snapshots` rows, notifies `pg_notify` on
+    `TIPS_CHANNEL`, and wakes `derive::landed` so derived history and search
+    catch up on `main`.
+  * **Retries and conflicts:** if a release attempt fails before finalizing or
+    hits a content conflict on `target_branch`, `released_at` remains `NULL`, so
+    a transient failure is retried on the next tick and a conflicted line is
+    kept on `embargo/<id>` for a member to rebase and push again.
+  * **Early release (`vl embargo release <id>` and `POST …/embargoes/{id}/release`):**
+    when a member of the embargo (or an admin) pushes an `EmbargoRecord` with
+    `released_at` set or calls `release_route` (which drops bulkhead gates via
+    `limits::leave_gates` before waiting, BUG-1635), `embargo::release_one`
+    lands the embargo on `target_branch` and releases it immediately.
+
+#### Guarantees and threat review (phase 4 §6 rows 8–12, and S22's 5 guarantees)
+
+| # | Guarantee / Threat | Mitigation | Test (`server_hub::embargo`) |
+|---|---|---|---|
+| 1 | Embargoed content is invisible to everyone outside the embargo until release, by every route | `embargo/<id>` filtered from `tips` and `history`; `embargo_snapshots` refused identically to unknown ids in `fetch`, `land`, `changes`, `q/…`, `q/search`, `q/grep`; skipped by `derive` and `search::index` | `guarantee_1_embargoed_content_is_invisible_outside_the_embargo_by_every_route` |
+| 2 | Release happens at the deadline and never before (clock skew, restarts, several servers, failed release job retried) | Deadlines judged by PostgreSQL `clock_timestamp()`; deterministic ticket `embargo-<project>-<id>`; failed release leaves `released_at IS NULL` and retries on the next tick | `guarantee_2_release_happens_at_the_deadline_and_never_before` |
+| 3 | Landing at release puts exactly the embargoed changes on `main`, once | `release_one` queues and lands the hidden line's stack onto `main` through S17's fenced landing service before `released_at` commits, recording `snapshots.author` | `guarantee_3_landing_at_release_puts_exactly_the_embargoed_changes_on_main_once` |
+| 4 | `vl embargo follow` shows a member only what they're in | `Tips.embargoes` and `embargo/<id>` branches are filtered by the caller's group memberships (or admin); `vl embargo follow` pulls, rebases, and checks out only visible embargoes | `guarantee_4_vl_embargo_follow_shows_a_member_only_what_they_are_in` |
+| 5 | Nobody outside the embargo learns that it exists, beyond what decision 8 allows | `main` and `policy_version` do not move when an embargo is pushed; probing `embargo/<id>` or its snapshots returns the exact same `404`/`400` as a random non-existent name | `guarantee_5_nobody_outside_the_embargo_learns_that_it_exists` |
+| 6 | S14: `q/blame` and `q/history` (with `follow` across renames) never show embargoed content, paths or versions outside the embargo | `query::resolve_rev` and `query::history` cursors check `embargo::is_withheld_for`; hidden `embargo/<id>` branches are excluded from `derive`, so embargoed paths on `main` answer byte-for-byte as missing paths (`404`) | `s14_blame_and_file_history_never_show_embargoed_content_paths_or_versions` |
+| 7 | S11: an agent session sees and lands embargoed work only if its person is in the embargo; narrowed sessions stay within their paths; release landing checks `landing::agent_stack` | `/v1/projects/{p}/embargoes/{id}/release` classified in `agents::every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed`; `embargo::release_one` enforces `landing::agent_stack` when an agent session asks for release | `s11_agent_sessions_and_narrowing_on_embargoes_and_release_landing` |
+| 8 | S6: the Veil daemon never serves an embargoed object to a client outside the embargo | Outsiders receive grants only for projections without the embargo; their root trees never reach embargoed trees or blobs in the daemon's warm store | `s6_daemon_never_serves_an_embargoed_object_outside_the_embargo` |
+| 9 | S17: the release landing records `snapshots.author`, gives back its bulkhead places before waiting (`limits::leave_gates`), and lands once across two servers | `release_one` drops bulkhead gates before `landing::wait`, `Services::waiters` fans out deterministic ticket outcomes to all concurrent waiters, and `landing::service` records each change's author in `snapshots.author` | `s17_release_landing_records_author_leaves_bulkhead_gates_and_lands_once_across_two_servers` |
+

@@ -819,7 +819,7 @@ fn an_agent_session_never_lands_someone_elses_change_of_an_access_file_by_moving
     let policy = std::fs::read_to_string(p.dir.join(".veilpolicy")).unwrap();
     let mut own = Craft::new(&api, &p.admin, &p.name, "main");
     own.file(".veilpolicy", &format!("{policy}src/api/generated/  ignore\n"));
-    own.file(".veilrules", "main  2 approvals\n");
+    own.file(".veilrules", "[review]\nmain = 2\n");
     let r = own.push_to("policy-draft-3e", None);
     assert_eq!(r.status, 200, "{}", body(&r));
     assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", body(&r));
@@ -1102,7 +1102,7 @@ fn an_agent_session_never_creates_the_default_branch_at_a_change_of_an_access_fi
     let policy = std::fs::read_to_string(p.dir.join(".veilpolicy")).unwrap();
     let mut own = Craft::new(&api, &p.admin, &p.name, "main");
     own.file(".veilpolicy", &format!("{policy}src/api/generated/  ignore\n"));
-    own.file(".veilrules", "main  2 approvals\n");
+    own.file(".veilrules", "[review]\nmain = 2\n");
     let r = own.push_to("policy-draft-9f", None);
     assert_eq!(r.status, 200, "{}", body(&r));
     assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", body(&r));
@@ -1599,6 +1599,9 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         ("/v1/projects/{p}/objects", "none"),
         ("/v1/projects/{p}/push", "write"),
         ("/v1/projects/{p}/changes", "write"),
+        ("/v1/projects/{p}/land", "write"),
+        ("/v1/projects/{p}/land/{ticket}", "narrowed"),
+        ("/v1/projects/{p}/events", "narrowed"),
         ("/v1/projects/{p}/access", "narrowed"),
         ("/v1/projects/{p}/groups", "none"),
         ("/v1/projects/{p}/groups/{g}", "person"),
@@ -1621,6 +1624,8 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         ("/v1/projects/{p}/q/ancestry", "rev"),
         ("/v1/projects/{p}/q/resolve", "rev"),
         ("/v1/projects/{p}/q/generations", "rev"),
+        ("/v1/projects/{p}/q/blame", "path"),
+        ("/v1/projects/{p}/q/history", "path"),
         ("/v1/projects/{p}/q/search", "path"),
         ("/v1/projects/{p}/q/grep", "path"),
         // S14: blame and file history take a path (BUG-1690).
@@ -1631,6 +1636,13 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         // S6: the server's public key that grants verify under, for the Veil
         // daemon; no path or revision (merge of S6).
         ("/v1/grant-key", "none"),
+        // S19: CI runner sessions, check results, and `<branch>@tested`.
+        ("/v1/sessions/ci", "person"),
+        ("/v1/projects/{p}/checks", "rev"),
+        ("/v1/projects/{p}/tested/{branch}", "rev"),
+        // S22: embargo release lands the hidden line onto its target branch
+        // through `landing::agent_stack` (merge of S22).
+        ("/v1/projects/{p}/embargoes/{id}/release", "write"),
     ];
     let routes: Vec<&str> = API.split(".route(\"").skip(1).map(|s| s.split('"').next().unwrap()).collect();
     assert!(routes.len() >= 40, "the router was not read: {routes:?}");
@@ -1684,15 +1696,14 @@ fn a_narrowed_sessions_renames_mode_changes_and_merges_outside_get_the_one_refus
     let p = setup_project(&hub);
     with_api_folder(&hub, &p);
     let api = hub.api();
-    let atok = p.admin.token();
     // The admin's draft of a file outside the narrowing.
     let mut d = Craft::new(&api, &p.admin, &p.name, "main");
     d.file("src/other.rs", "fn o() {} // the admin's draft");
     let r = d.push_to("draft-r4", None);
     assert_eq!(r.status, 200, "{}", body(&r));
     assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", body(&r));
-    let draft = api.tips(Some(&atok), &p.name).unwrap().branches["draft-r4"];
     let narrow = agent_token(&hub, &p.dev.token(), &p.name, &["src/api"]);
+    let draft = api.tips(Some(&narrow), &p.name).unwrap().branches["draft-r4"];
     let craft = || Craft::with(&api, narrow.clone(), p.dev.identity(), &p.name, "main");
     let theirs = Craft::with(&api, narrow.clone(), p.dev.identity(), &p.name, "draft-r4").entry("src/other.rs").expect("the draft's entry");
     let mut answers = Vec::new();
@@ -1760,9 +1771,10 @@ fn a_narrowed_session_never_merges_a_parent_whose_changes_lie_outside_its_paths(
     assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", body(&r));
     let draft = api.tips(Some(&atok), &p.name).unwrap().branches["draft-r4b"];
     let narrow = agent_token(&hub, &p.dev.token(), &p.name, &["src/api"]);
+    let draft_seen = api.tips(Some(&narrow), &p.name).unwrap().branches["draft-r4b"];
     let mut c = Craft::with(&api, narrow.clone(), p.dev.identity(), &p.name, "main");
     c.file("src/api/m.rs", "m");
-    let r = c.push_merge("main", &[draft]);
+    let r = c.push_merge("main", &[draft_seen]);
     assert_agent_refusal(&r, NARROWED, "the narrowed session's merge of the draft");
     let main = tip(&hub, &atok, &p.name);
     let r = hub.api().post_json(Some(&atok), &format!("/v1/projects/{}/q/ancestry", p.name), &json!({"pairs": [[draft.hex(), main.hex()]]}));
@@ -1912,7 +1924,7 @@ fn a_narrowed_sessions_merge_of_a_parent_differing_outside_in_any_way_gets_the_o
     let p = setup_project(&hub);
     with_api_folder(&hub, &p);
     let api = hub.api();
-    let (atok, dev) = (p.admin.token(), p.dev.token());
+    let dev = p.dev.token();
     let narrow = agent_token(&hub, &dev, &p.name, &["src/api"]);
     let main0 = tip(&hub, &dev, &p.name);
     // `src/other.rs`'s content (`with_api_folder`).
@@ -1924,7 +1936,7 @@ fn a_narrowed_sessions_merge_of_a_parent_differing_outside_in_any_way_gets_the_o
         let r = d.push_to(name, None);
         assert_eq!(r.status, 200, "{}", body(&r));
         assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{name}: {}", body(&r));
-        api.tips(Some(&atok), &p.name).unwrap().branches[name]
+        api.tips(Some(&dev), &p.name).unwrap().branches[name]
     };
     let kinds: Vec<(&str, ObjectId)> = vec![
         ("added", draft("d-added-r5", &|d| d.file("src/added-r5.rs", "fn a() {}"))),

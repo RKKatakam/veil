@@ -288,7 +288,7 @@ fn entries(src: &Source, pr: &Projector, edits: &[Edit], uploaded: &HashSet<Obje
 /// projected; `pr` projects nothing itself): the
 /// folders on the way (the root's id first, then each folder's, as far as
 /// they are folders) and the entry at the end.
-fn walk(pr: &Projector, root: ObjectId, parts: &[String]) -> Result<(Vec<ObjectId>, Option<TreeEntry>)> {
+pub(crate) fn walk(pr: &Projector, root: ObjectId, parts: &[String]) -> Result<(Vec<ObjectId>, Option<TreeEntry>)> {
     let mut dirs = vec![root];
     let mut cur = root;
     for (i, part) in parts.iter().enumerate() {
@@ -344,6 +344,9 @@ struct Built {
     /// The default branch's new `.veilpolicy` text when only non-access lines
     /// changed.
     policy_text_update: Option<String>,
+    /// The branch rules (`.veilrules`) of the full tree, to compare with the
+    /// default branch's tip's (BUG-1102).
+    rules: Option<TreeEntry>,
 }
 
 /// Who asks, as of one attempt: the project with its accepted policy and
@@ -456,7 +459,8 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, who: &Arc<Who>, parent: ObjectI
             }
             false => (None, None),
         };
-        Ok(Built { real: real_id, store, mine, accept, policy_text_update })
+        let rules = sync::entry_at(src, &real.tree, crate::landing::rules::RULES_FILE)?;
+        Ok(Built { real: real_id, store, mine, accept, policy_text_update, rules })
     })
     .await
 }
@@ -567,6 +571,7 @@ struct Move {
 /// `restacked` under it. `Ok(Some(moved))` with a move,
 /// `Ok(None)` without; `Err(conflict)` when the tip moved and the change is
 /// not kept.
+#[allow(clippy::too_many_arguments)]
 async fn commit(
     hub: &Arc<Hub>,
     plan: &Arc<Plan>,
@@ -575,8 +580,12 @@ async fn commit(
     restacked: &[(ObjectId, ObjectId, ObjectId)],
     person: i64,
     mv: Option<Move>,
+    land: Option<&(crate::landing::Submitter, crate::landing::Queued)>,
 ) -> Result<Option<bool>> {
     let pid = who.project.id;
+    // A landing: the change (and what it stacks on: `landing::stack`) joins
+    // the queue in this same commit.
+    let land = land.cloned();
     let view_key = (!who.viewer.admin).then(|| who.project.view(&who.viewer).key());
     let mut snaps: Vec<(String, String)> = restacked.iter().map(|(n, _, m)| (n.hex(), m.hex())).collect();
     snaps.push((built.real.hex(), built.mine.hex()));
@@ -585,23 +594,56 @@ async fn commit(
     let mv = mv.map(|m| (m.branch, m.cur.hex(), m.keep_on_loss));
     let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let committed: Vec<ObjectId> = restacked.iter().map(|(n, _, _)| *n).chain(std::iter::once(built.real)).collect();
+    // What a move puts on the branch, by change id and author
+    // (`landed_changes`, BUG-1522, BUG-1527): the caller's restacked changes
+    // and this one.
+    let on_branch: (Vec<String>, Vec<i64>, Vec<String>) = match &mv {
+        None => (Vec::new(), Vec::new(), Vec::new()),
+        Some(_) => {
+            let ids = committed.clone();
+            let mut cs: Vec<String> = sync::blocking(hub, pid, move |src| {
+                ids.iter().take(ids.len() - 1).map(|n| Ok(src.snapshot(n)?.change_id.to_string())).collect::<Result<Vec<_>>>()
+            })
+            .await?;
+            cs.push(cid.clone());
+            let aus = vec![person; cs.len()];
+            (cs, aus, committed.iter().map(ObjectId::hex).collect())
+        }
+    };
     let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-        let (real, cid, accept, policy_text_update, mv, view_key, snaps, moved_refs) =
-            (real.clone(), cid.clone(), accept.clone(), policy_text_update.clone(), mv.clone(), view_key.clone(), snaps.clone(), moved_refs.clone());
+        let (real, cid, accept, policy_text_update, mv, view_key, snaps, moved_refs, land, on_branch) = (
+            real.clone(),
+            cid.clone(),
+            accept.clone(),
+            policy_text_update.clone(),
+            mv.clone(),
+            view_key.clone(),
+            snaps.clone(),
+            moved_refs.clone(),
+            land.clone(),
+            on_branch.clone(),
+        );
         Box::pin(async move {
+            if let Some((w, q)) = &land {
+                crate::landing::insert(&mut *c, pid, w, q).await?;
+            }
             let now = veil_core::now_millis();
             let mut moved = None;
             if let Some((branch, cur, keep)) = &mv {
-                let rows = sqlx::query("UPDATE branches SET target = $1 WHERE project_id = $2 AND name = $3 AND target = $4")
-                    .bind(&real)
-                    .bind(pid)
-                    .bind(branch)
-                    .bind(cur)
-                    .execute(&mut *c)
-                    .await?
-                    .rows_affected();
+                let lineage: Option<i64> =
+                    sqlx::query_scalar("UPDATE branches SET target = $1 WHERE project_id = $2 AND name = $3 AND target = $4 RETURNING lineage")
+                        .bind(&real)
+                        .bind(pid)
+                        .bind(branch)
+                        .bind(cur)
+                        .fetch_optional(&mut *c)
+                        .await?;
+                let rows = u64::from(lineage.is_some());
                 if rows != 1 && !keep {
                     return Err(Error::conflict(format!("branch '{branch}' moved")));
+                }
+                if let Some(lineage) = lineage {
+                    crate::landing::record_changes(&mut *c, pid, branch, lineage, &on_branch.0, &on_branch.1, &on_branch.2).await?;
                 }
                 moved = Some(rows == 1);
                 if rows == 1 {
@@ -616,15 +658,18 @@ async fn commit(
                     }
                 }
             }
+            let mut memos = Vec::new();
             for (snap, mine) in &snaps {
-                sqlx::query("INSERT INTO snapshots (project_id, id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+                sqlx::query("INSERT INTO snapshots (project_id, id, author) VALUES ($1, $2, $3) ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0")
                     .bind(pid)
                     .bind(snap)
+                    .bind(person)
                     .execute(&mut *c)
                     .await?;
                 if let Some(key) = &view_key {
-                    sqlx::query(
-                        "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at) VALUES ($1, $2, $3, $4, $5) \
+                    let n = sqlx::query(
+                        // The caller's own changes: in their history (never collapsed).
+                        "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) VALUES ($1, $2, $3, $4, $5, false) \
                          ON CONFLICT DO NOTHING",
                     )
                     .bind(pid)
@@ -633,7 +678,12 @@ async fn commit(
                     .bind(mine)
                     .bind(now)
                     .execute(&mut *c)
-                    .await?;
+                    .await?
+                    .rows_affected();
+                    // Cached once committed, if it is the row stored.
+                    if n == 1 {
+                        memos.push((key.clone(), snap.clone(), mine.clone()));
+                    }
                 }
             }
             // The caller's changes made again under this one keep their refs.
@@ -682,12 +732,18 @@ async fn commit(
                     .execute(&mut *c)
                     .await?;
             }
-            Ok(moved)
+            Ok((moved, memos))
         })
     })
     .await?;
+    let (r, memos) = r;
     for id in &committed {
         hub.caches.put_committed(pid, id);
+    }
+    for (k, real, mine) in memos {
+        if let (Ok(real), Ok(mine)) = (ObjectId::from_hex(&real), ObjectId::from_hex(&mine)) {
+            hub.caches.put_memo(pid, &k, &real, &mine);
+        }
     }
     if r == Some(true) {
         hub.caches.tips_changed(pid);
@@ -697,11 +753,12 @@ async fn commit(
 
 /// The real tip of `branch`, if it exists.
 async fn tip(hub: &Hub, project: i64, branch: &str) -> Result<Option<ObjectId>> {
-    let t: Option<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2")
-        .bind(project)
-        .bind(branch)
-        .fetch_optional(&hub.db)
-        .await?;
+    let t: Option<String> =
+        sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL")
+            .bind(project)
+            .bind(branch)
+            .fetch_optional(&hub.db)
+            .await?;
     t.map(|t| ObjectId::from_hex(&t).map_err(|e| Error::Other(e.into()))).transpose()
 }
 
@@ -709,24 +766,34 @@ async fn tip(hub: &Hub, project: i64, branch: &str) -> Result<Option<ObjectId>> 
 /// see it as `base`, else the newest real snapshot that is `base` for
 /// them. Anything else is not found, as for every snapshot they may not
 /// see (a real id of a snapshot they see only part of included).
-async fn resolve_base(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, base: ObjectId, cur: Option<ObjectId>) -> Result<ObjectId> {
-    if base == sync::root_snapshot_id() {
-        return Ok(base);
-    }
-    if let Some(c) = cur {
-        if sync::projected(hub, project, viewer, c).await? == base {
-            return Ok(c);
+async fn resolve_base(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, mut base: ObjectId, onto: Option<&str>, landing: bool) -> Result<ObjectId> {
+    if base == ObjectId([0; 32]) {
+        let branch = onto.unwrap_or(&project.default_branch);
+        if let Some(tested) = crate::ci::tested_for(hub, project, viewer, branch).await? {
+            base = tested;
+        } else if let Some(t) = tip(hub, project.id, branch).await? {
+            base = sync::projected(hub, project, viewer, t).await?;
+        } else {
+            return Err(Error::not_found(format!("no branch '{branch}' that you can see")));
         }
     }
-    // A projection many hidden-only changes share stands for each of them;
-    // the newest few are enough (they differ only in what the caller
-    // cannot see).
-    for r in sync::resolve(hub, project.id, &project.view(viewer).key(), &base).await?.into_iter().take(16) {
-        if sync::projected(hub, project, viewer, r).await? == base {
-            return Ok(r);
+    // A landing lands its edits on the tip, never its parent's hidden
+    // files, and any snapshot they see as `base` gives the same edits: the
+    // server's memory of their view answers first, checked.
+    if landing {
+        if let Some(r) = hub.caches.resolved(project.id, &project.view(viewer).key(), &base) {
+            if sync::projected(hub, project, viewer, r).await? == base {
+                return Ok(r);
+            }
         }
     }
-    Err(Error::not_found(format!("no snapshot {} that you can see", base.short())))
+    // As a push resolves its parents (one function: BUG-1520): the branch
+    // the change goes to first, then the default branch.
+    let branches: Vec<&str> = onto.into_iter().collect();
+    match sync::resolve_for(hub, project, viewer, &base, &branches, landing).await? {
+        Some(r) => Ok(r),
+        None => Err(Error::not_found(format!("no snapshot {} that you can see", base.short()))),
+    }
 }
 
 /// Most of the caller's own unlanded changes a change may be stacked on
@@ -794,7 +861,23 @@ const NOT_ON_TIP: &str = "not a fast-forward: the change is not on the branch's 
 
 /// `POST /v1/projects/{p}/changes`.
 pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: &Caller, req: ChangeRequest) -> Result<ChangeResult> {
-    let person = caller.signed_in()?.clone();
+    create_with(hub, project, viewer, caller, req, None).await
+}
+
+/// [`create`]; with `land`, the change (made on `base`, never moving a
+/// branch) also joins the landing queue in its one commit (`landing`).
+pub(crate) async fn create_with(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    caller: &Caller,
+    req: ChangeRequest,
+    mut land: Option<(crate::landing::Submitter, crate::landing::Queued)>,
+) -> Result<ChangeResult> {
+    let person = caller.not_runner()?.clone();
+    if land.is_some() && req.onto.is_some() {
+        return Err(bad("a landing names its branch once (`onto` of the landing)"));
+    }
     if !project.participant(viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
@@ -805,6 +888,12 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
     if req.edits.iter().any(|e| !viewer.within_narrowing(&e.path)) {
         return Err(sync::agent_refusal(sync::NARROWED_WRITE));
     }
+    // Uploads are staged (S28): read into memory with what the change makes,
+    // stored only once every check passed (BUG-930).
+    // Held decoded under the server-wide bound while the commit runs
+    // (BUG-1156).
+    let (uploaded, staged, _held) = sync::take_uploads(hub, project.id, person.id, &req.receipts).await?;
+    pending.extend(staged);
     let onto = req.onto.clone();
     let mut who = Arc::new(Who {
         project: project.clone(),
@@ -814,7 +903,13 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
         Some(o) => Some(tip(hub, project.id, &o.branch).await?.ok_or_else(|| bad(format!("no branch '{}'", o.branch)))?),
         None => None,
     };
-    let base_real = resolve_base(hub, project, viewer, req.base, cur).await?;
+    let target = onto.as_ref().map(|o| o.branch.clone()).or_else(|| land.as_ref().map(|(_, q)| q.branch.clone()));
+    let base_real = resolve_base(hub, project, viewer, req.base, target.as_deref(), land.is_some()).await?;
+    let base_proj = if req.base == ObjectId([0; 32]) {
+        sync::projected(hub, project, viewer, base_real).await?
+    } else {
+        req.base
+    };
     // A new revision of one of the caller's own changes, or a new change.
     let (change_id, predecessors) = match req.change_id {
         Some(cid) => {
@@ -844,7 +939,7 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
         base.tree
     };
     let plan = Arc::new(Plan {
-        uploaded: sync::receipted(hub, project.id, person.id, &req.receipts),
+        uploaded,
         pending,
         change_id,
         description: req.description.clone(),
@@ -863,7 +958,15 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
     // stack of the caller's own unlanded changes on it); the change is
     // still made and kept on its ref. All judged on the caller's view.
     let mut rejected: Option<String> = None;
-    let (mut parent, mut pparent) = (base_real, req.base);
+    // Only the landing service moves a protected branch (S17).
+    if let Some(o) = &onto {
+        let default_tip = tip(hub, project.id, &project.default_branch).await?;
+        let protected = sync::blocking(hub, project.id, move |src| crate::landing::protected(src, default_tip)).await?;
+        if protected.contains(&o.branch) {
+            rejected = Some(format!("'{}' is protected: land the change instead (`vl land`, `POST …/land`)", o.branch));
+        }
+    }
+    let (mut parent, mut pparent) = (base_real, base_proj);
     let mut restacked = Vec::new();
     if let (Some(o), Some(c)) = (&onto, cur) {
         if let Expected::Tip(t) = o.expected {
@@ -924,6 +1027,50 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
             }
             _ => None,
         };
+        // Stored before anything reads them (a landing's stack may).
+        sync::put_all(hub, project.id, built.store.clone()).await?;
+        // A landing of edits: the stack is the submitter's history from the
+        // branch up to this one, as for a pushed snapshot (BUG-1112).
+        if let Some((_, q)) = land.as_mut() {
+            let fresh = HashMap::from([(built.real, (vec![parent], person.id))]);
+            let judged = match crate::landing::stack(hub, &who.project, &who.viewer, &q.branch, built.real, &fresh, None).await? {
+                Ok(j) if j.branch => j,
+                // No branch: the service answers so (unless `agent_stack`
+                // refuses creating the default branch first).
+                Ok(j) => crate::landing::Judged {
+                    stack: vec![crate::landing::Entry::plain(built.real, parent)],
+                    ..j
+                },
+                Err(why) => return Err(bad(why)),
+            };
+            // S11's agent rule (`agent_tip`) on the stack's edits before the
+            // landing is queued (BUG-1636).
+            crate::landing::agent_stack(hub, &who.project, &who.viewer, &q.branch, &judged, built.real, false, None).await?;
+            *q.skipped.lock().unwrap() = judged.skipped;
+            (q.stack, q.lineage) = (judged.stack, judged.lineage);
+            if q.stack.is_empty() {
+                let skipped = q.skipped.lock().unwrap().clone();
+                let mut msg = "nothing to land: this change is on the branch already".to_string();
+                let named = crate::landing::skipped_warnings(hub, project.id, &q.branch, &skipped).await?;
+                if !named.is_empty() {
+                    msg = format!("{msg}; {}", named.join("; "));
+                }
+                return Err(bad(msg));
+            }
+        }
+        // The branch rules: a move of the default branch changes them only
+        // for an admin, judged against its tip (BUG-1102).
+        let rules_moved = match cur {
+            Some(c) if plan.default_branch && !who.viewer.admin && rejected.is_none() => {
+                let tip = sync::blocking(hub, project.id, move |src| sync::entry_at(src, &src.snapshot(&c)?.tree, crate::landing::rules::RULES_FILE)).await?;
+                match (&built.rules, &tip) {
+                    (None, None) => false,
+                    (Some(a), Some(b)) => !a.same_content(b),
+                    _ => true,
+                }
+            }
+            _ => false,
+        };
         let mv = match (&onto, cur, &rejected) {
             (Some(_), Some(_), None) if tip_refused.is_some() => {
                 rejected = Some(match tip_refused {
@@ -942,6 +1089,10 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
                 });
                 None
             }
+            (Some(_), Some(_), None) if rules_moved => {
+                rejected = Some("only admins may change the branch rules (.veilrules)".into());
+                None
+            }
             (Some(o), Some(c), None) => Some(Move {
                 branch: o.branch.clone(),
                 cur: c,
@@ -950,8 +1101,7 @@ pub async fn create(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, caller: 
             }),
             _ => None,
         };
-        sync::put_all(hub, project.id, built.store.clone()).await?;
-        match commit(hub, &plan, &who, &built, &restacked, person.id, mv).await {
+        match commit(hub, &plan, &who, &built, &restacked, person.id, mv, land.as_ref()).await {
             Ok(m) => break (built, m),
             // The tip moved during the request: try again on the new one,
             // with the access as it is now (BUG-1051).

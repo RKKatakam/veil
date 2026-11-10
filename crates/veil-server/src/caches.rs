@@ -481,10 +481,13 @@ pub async fn listen(hub: Arc<crate::Hub>, mut stop: tokio::sync::watch::Receiver
             _ = stop.changed() => return,
         };
         match n {
-            Ok(Some(n)) => match n.payload().parse::<i64>() {
-                Ok(p) => hub.caches.tips_changed(p),
-                Err(_) => hub.caches.drop_all_tips(),
-            },
+            Ok(Some(n)) => {
+                hub.embargo.wake();
+                match n.payload().parse::<i64>() {
+                    Ok(p) => hub.caches.tips_changed(p),
+                    Err(_) => hub.caches.drop_all_tips(),
+                }
+            }
             // The connection was lost: notices may be missing until it is
             // back (try_recv reconnects and listens again).
             Ok(None) => hub.caches.drop_all_tips(),

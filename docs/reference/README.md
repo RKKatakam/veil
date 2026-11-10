@@ -85,7 +85,10 @@ Global options (accepted by every command):
 | [`vl serve`](serve.md) | Serve this repository to editors and agents over a local socket |
 | [`vl remote`](remote.md) | Manage remotes: the Veil server projects this repository syncs with |
 | [`vl push`](push.md) | Send tags and their history to the Veil server, which moves each branch only if nobody moved it meanwhile (and checks your access) |
+| [`vl land`](land.md) | Land a change on a branch through the server's landing service: the server puts it on the branch's newest tip when no path it edits changed there since its base, so you need not pull first |
 | [`vl pull`](pull.md) | Fetch tags and history from the Veil server: what you may see |
+| [`vl checks`](checks.md) | Show or record CI check results on a snapshot (`POST / GET …/checks`) |
+| [`vl tested`](tested.md) | Print the newest tested snapshot on a branch (`<branch>@tested`) |
 | [`vl partial`](partial.md) | A thin clone: what it holds, the bound of its object cache, and fetching everything (`vl partial full`) |
 | [`vl daemon`](daemon.md) | The Veil daemon: one object cache shared by every thin clone on this machine (it runs by default; `vl daemon stop` turns it off) |
 | [`vl hooks`](hooks.md) | Hooks run before commits and pushes; repository-suggested ones only once this device trusts them (not implemented yet) |

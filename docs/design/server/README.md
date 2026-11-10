@@ -39,7 +39,7 @@ S1 is built. **S2** (secrets at scale: keys per access rule, background wrapping
 | S10 | 2 | Commits through the API (with the server-side secret scan): **built** (`HUB.md` §13.13) | S1 |
 | S11 | 2 | Agent sessions and attribution; attempts (recorded dead ends) on change records | S10, S8 |
 | S27 | 2 | Compressed objects (zstd) in storage and transport (`storage-and-cost.md` §6). **Built** (`HUB.md` §13.15) | S1 |
-| S28 | 2 | Packs: one storage write per push for small objects, index, range reads (`storage-and-cost.md` §7) | S5, S27 |
+| S28 | 2 | Packs: one storage write per push for small objects, index, range reads (`storage-and-cost.md` §7). **Built** (`HUB.md` §13.20), with staged uploads (BUG-930) and checks several at once (BUG-865) | S5, S27 |
 | S29 | 2 | Merging packs and pack garbage collection (`storage-and-cost.md` §8) | S28 |
 | G2 | 2 | Phase 2 gate run | S3–S11, S27–S29 |
 | S12 | 3 | Derived-data framework, commit graph, changed paths, per-rule lists, eager projection memos at each branch move | S1 |
@@ -90,10 +90,10 @@ The owner's goal: every milestone of phases 1–4 built, reviewed and merged, th
 
 | State | Milestones |
 |---|---|
-| **Merged into `integration`** | S1, S2 (phase 1); S3, S4, S5, S8, S9, S10, S11, S27 (phase 2); S12, S13, S15 (phase 3); S24 part A (phase 4) |
-| **Built, in final review or fixing** | S6, S28 (phase 2); S14 (phase 3); S17, S21 (phase 4); the deployment kit |
-| **Being built** | S18, S22 (phase 4, on S17's branch; S25 part A paused) |
-| **Not started** | S7, S29 (phase 2); S16 (phase 3); S19, S20, S23, S24 part B, S26 (phase 4); the gate runs G2, G3 (in S16), G4 |
+| **Merged into `integration`** | S1, S2 (phase 1); S3, S4, S5, S6, S7, S8, S9, S10, S11, S27 (phase 2); S12, S13, S14, S15 (phase 3); S17, S18, S19, S22, S24 part A (phase 4); the deployment kit |
+| **Built, in final review or fixing** | S28 (phase 2, merging with S11's attempts); S21 (phase 4, merging) |
+| **Being built** | S16 with G3 (phase 3); S24 part B, S20 (phase 4) |
+| **Not started** | S29 (phase 2); S23, S25, S26 (phase 4); the gate runs G2, G4; phase 1's security pass; a deep security review after phase 2 and after phase 4 (owner, 2026-11-10: one quick review per milestone, one deep review per phase) |
 
 ### Remaining waves
 

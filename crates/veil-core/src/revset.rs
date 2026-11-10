@@ -157,6 +157,17 @@ fn resolve_base(repo: &Repo, base: &str, ws: &str) -> Result<ObjectId> {
     if let Some(t) = view.remote_tags.get(base) {
         return Ok(*t);
     }
+    if let Some(branch) = base.strip_suffix("@tested") {
+        if !branch.is_empty() {
+            if let Some(t) = view.remote_tags.get(&format!("origin/{branch}@tested")) {
+                return Ok(*t);
+            }
+            if let Some((_, t)) = view.remote_tags.iter().find(|(k, _)| k.ends_with(&format!("/{branch}@tested"))) {
+                return Ok(*t);
+            }
+            return Err(VeilError::Revset(format!("branch '{branch}' has no tested snapshot yet")));
+        }
+    }
     // Release tags (format 5): `tag:<name>` names a release tag.
     if let Some(rest) = base.strip_prefix("tag:") {
         return match view.tags.get(rest).filter(|t| t.annotation.is_some()) {

@@ -215,6 +215,22 @@ impl Limits {
 /// The longest one derive run waits for the server to stop shedding.
 pub const DERIVE_PAUSE: Duration = Duration::from_secs(10);
 
+tokio::task_local! {
+    /// The bulkhead places held by the request being served: dropped when
+    /// the route answers, or sooner ([`leave_gates`]) before a wait for
+    /// something other than the request's own work (BUG-1635).
+    static PLACES: std::cell::RefCell<Option<(Option<gate::Place>, gate::Place)>>;
+}
+
+/// Give back the bulkhead places of the request being served before it
+/// waits for something other than its own work (a landing's outcome, a
+/// ticket, BUG-1635; nothing outside a request).
+pub fn leave_gates() {
+    let _ = PLACES.try_with(|p| {
+        p.borrow_mut().take();
+    });
+}
+
 /// `s` percent-decoded, as the routes' `Path` decodes it; `None` if it does
 /// not decode to UTF-8.
 fn decoded(s: &str) -> Option<String> {
@@ -260,7 +276,7 @@ fn route(method: &Method, path: &str) -> (Option<String>, Class) {
 /// An answer refusing a request: `status`, `code`, a message naming nothing
 /// but the caller's own wait, and when to come back. The connection is
 /// closed when the body was not read.
-fn refuse(status: StatusCode, code: &str, message: &str, retry: Option<Duration>, close: bool) -> Response {
+pub(crate) fn refuse(status: StatusCode, code: &str, message: &str, retry: Option<Duration>, close: bool) -> Response {
     let mut v = serde_json::json!({ "code": code, "message": message });
     if let Some(r) = retry {
         v["retry_after_ms"] = (r.as_millis().max(1) as u64).into();
@@ -281,7 +297,7 @@ fn rate_limited(wait: Duration) -> Response {
 }
 
 /// A wait of about a second, jittered, for a request shed under load.
-fn shed_wait() -> Duration {
+pub(crate) fn shed_wait() -> Duration {
     let j = u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % 1000;
     Duration::from_millis(500 + j)
 }
@@ -473,14 +489,14 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
         Some(_) => None,
         None => Some(gate::Key::Server),
     };
-    let _project_place = match gate_key {
+    let project_place = match gate_key {
         Some(k) => match limits.projects.place(k, class, deadline).await {
             Some(p) => Some(p),
             None => return finish(&hub, busy(false)),
         },
         None => None,
     };
-    let Some(_server_place) = limits.server.place(class, deadline).await else {
+    let Some(server_place) = limits.server.place(class, deadline).await else {
         return finish(&hub, busy(false));
     };
 
@@ -488,11 +504,14 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
     // under the answers' budget.
     let mut req = Request::from_parts(parts, Body::from(bytes));
     req.extensions_mut().insert(answers::For(body_key));
-    let (resp, layers) = health::LAYERS
-        .scope(std::cell::Cell::new(health::Counts::default()), async {
-            let r = next.run(req).await;
-            (r, health::LAYERS.with(|c| c.get()))
-        })
+    let (resp, layers) = PLACES
+        .scope(
+            std::cell::RefCell::new(Some((project_place, server_place))),
+            health::LAYERS.scope(std::cell::Cell::new(health::Counts::default()), async {
+                let r = next.run(req).await;
+                (r, health::LAYERS.with(|c| c.get()))
+            }),
+        )
         .await;
     let resp = match limits.answers.budget(body_key, resp, class != Class::Write).await {
         Some(r) => r,

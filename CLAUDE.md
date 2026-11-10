@@ -8,7 +8,7 @@ Crates:
 - `crates/veil-server`: the Veil server (axum, sqlx for PostgreSQL/YugabyteDB, S3), not a default workspace member;
 - `crates/veil-bench`: the scale benchmark and the OpenScion speed gates, not a default workspace member.
 
-Read `docs/OVERVIEW.md`, `docs/VISIBILITY.md`, `docs/HUB.md` (the server design), `docs/ARCHITECTURE.md` (its "Threat model" section has the trust boundary), `docs/FORMAT.md` and `docs/BUGS.md`.
+Read `docs/OVERVIEW.md`, `docs/VISIBILITY.md`, `docs/HUB.md` (the server design), `docs/ARCHITECTURE.md` (its "Threat model" section has the trust boundary), `docs/FORMAT.md` and `docs/BUGS.md`. **`docs/BUGS.md` (over 1 MB) and `docs/HUB.md` (about 300 KB) are too large to read whole: `grep` them for the rows or section you need and read that range.**
 
 ## Who can see what
 **`docs/VISIBILITY.md` is the source of truth. Keep it simple; it's the ordinary permission model:**

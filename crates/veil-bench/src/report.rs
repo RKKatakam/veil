@@ -17,10 +17,8 @@ pub const SERVER_GATE_MIB: f64 = 1024.0;
 /// Cases over the server gate because of a known, filed bug: still marked
 /// ⛔ with "known: BUG-NNN", but they do not fail the run. Remove an entry
 /// when its bug is fixed.
-pub const SERVER_GATE_KNOWN: &[(&str, &str)] = &[
-    ("clone, full", "BUG-1000"),
-    ("clone, one directory (--only docs)", "BUG-1000"),
-];
+/// (BUG-1000's two clone cases were here until S28 fixed it.)
+pub const SERVER_GATE_KNOWN: &[(&str, &str)] = &[];
 
 /// The bug that excuses `case` over the server gate, if any.
 fn known_over_gate(case: &str) -> Option<&'static str> {
@@ -213,12 +211,12 @@ mod tests {
             })
         };
         let (failing, known) = server_over_gate(&r("1g"));
-        assert_eq!(failing, vec!["push, initial (all tags): 1100 MiB".to_string()]);
-        assert_eq!(known, vec!["clone, full: 1579 MiB (known: BUG-1000)".to_string()]);
+        assert_eq!(failing, vec!["push, initial (all tags): 1100 MiB".to_string(), "clone, full: 1579 MiB".to_string()]);
+        assert!(known.is_empty(), "BUG-1000 is fixed: no case is excused");
         assert_eq!(server_over_gate(&r("5g")), (vec![], vec![]));
         let md = markdown(&r("1g"));
         assert!(md.contains("→ 1100 MiB ⛔ |"), "{md}");
-        assert!(md.contains("→ 1579 MiB ⛔ (known: BUG-1000) |"), "{md}");
+        assert!(md.contains("→ 1579 MiB ⛔ |"), "{md}");
         assert!(!md.contains("900 MiB ⛔"), "{md}");
         assert!(!markdown(&r("5g")).contains("MiB ⛔"));
     }

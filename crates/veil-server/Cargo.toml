@@ -51,6 +51,9 @@ tempfile.workspace = true
 # returns little of it, so the server held 2-3x its data. jemalloc with two
 # arenas and background purging (settings in src/main.rs) measured best.
 tikv-jemallocator = "=0.7.0"
+# `.veilrules` (branch rules, S17): TOML, as `vl` already parses its
+# configuration (the same crate and version).
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 # Search (S15): grep's regular expressions run in linear time (no
 # backtracking), and their syntax tree gives the trigrams every match
 # holds. Both are in the tree already (veil-core's scanner).
@@ -63,8 +66,9 @@ regex-syntax = "0.8"
 containers = []
 
 [dev-dependencies]
+# The landing service's property test (`landing::edits`).
+proptest = "1"
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 # A paused clock for the unit tests of the body time limits (S24): no new
 # crate, a feature of the runtime above.
 tokio = { version = "1.47", features = ["test-util"] }
-proptest = "1"

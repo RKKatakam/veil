@@ -446,3 +446,7 @@ and only secret files are encrypted ([OVERVIEW.md](docs/OVERVIEW.md)). See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#limitations-and-roadmap) for
 known limitations. The engine also builds for WebAssembly
 ([docs/guide/embedding.md](docs/guide/embedding.md)).
+
+## Credits
+
+Thanks to okpom, who helped with the idea for Veil.

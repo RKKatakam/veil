@@ -193,6 +193,9 @@ pub async fn resolve(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instant) ->
     };
     let real = match parse_id(rev) {
         Some(id) => {
+            if crate::embargo::is_withheld_for_query(hub, project, &id).await? {
+                return Err(no_revision());
+            }
             if let Some(r) = graph::cached_row(hub, project, &vk, &id) {
                 return if r.withheld() { Err(no_revision()) } else { Ok(id) };
             }
@@ -219,17 +222,35 @@ pub async fn resolve(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instant) ->
                     .fetch_optional(&hub.db)
                     .await?
             };
-            real.and_then(|r| ObjectId::from_hex(&r).ok()).ok_or_else(no_revision)?
+            let r = real.and_then(|r| ObjectId::from_hex(&r).ok()).ok_or_else(no_revision)?;
+            if crate::embargo::is_withheld_for_query(hub, project, &r).await? {
+                return Err(no_revision());
+            }
+            r
         }
         None => {
             if rev.is_empty() || rev.len() > 255 {
                 return Err(no_revision());
             }
-            let target: Option<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2")
-                .bind(project)
-                .bind(rev)
-                .fetch_optional(&hub.db)
-                .await?;
+            let target: Option<String> = match rev.strip_suffix("@tested") {
+                Some(branch) if !branch.is_empty() => {
+                    sqlx::query_scalar(
+                        "SELECT t.snapshot FROM tested t JOIN branches b ON b.project_id = t.project_id AND b.name = t.branch \
+                         WHERE t.project_id = $1 AND t.branch = $2 AND t.lineage = b.lineage AND b.hidden_for_embargo IS NULL",
+                    )
+                    .bind(project)
+                    .bind(branch)
+                    .fetch_optional(&hub.db)
+                    .await?
+                }
+                _ => {
+                    sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL")
+                        .bind(project)
+                        .bind(rev)
+                        .fetch_optional(&hub.db)
+                        .await?
+                }
+            };
             target.and_then(|t| ObjectId::from_hex(&t).ok()).ok_or_else(no_revision)?
         }
     };
@@ -260,7 +281,11 @@ async fn on_graph(
         let view = project.view(&viewer);
         let g = G::new(cx, &vk, Some(deadline));
         let t = Trees::new(&g, &view);
-        let mut v = f(&g, &t).map_err(|e| if Instant::now() > deadline { graph::too_slow() } else { e })?;
+        let mut v = f(&g, &t).map_err(|e| match &e {
+            Error::Other(a) if crate::pack::indexes_full(a) => e,
+            _ if Instant::now() > deadline => graph::too_slow(),
+            _ => e,
+        })?;
         v["policy_version"] = json!(version);
         v["work"] = json!(g.work());
         Ok(v)
@@ -656,7 +681,7 @@ pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, from: &[Obj
         return Ok(empty);
     }
     // The viewer's graph over every branch (filled once, as for any query).
-    let rows: Vec<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1")
+    let rows: Vec<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL")
         .bind(ask.project.id)
         .fetch_all(&hub.db)
         .await?;
@@ -674,8 +699,13 @@ pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, from: &[Obj
     }
     let mut reals = Vec::new();
     for f in from {
+        if crate::embargo::is_withheld_for_query(hub, project, f).await? {
+            continue;
+        }
         if let Some(r) = crate::sync::resolve(hub, project, &vk, f).await?.into_iter().next() {
-            reals.push(r);
+            if !crate::embargo::is_withheld_for_query(hub, project, &r).await? {
+                reals.push(r);
+            }
         }
     }
     if !reals.is_empty() {
@@ -826,7 +856,7 @@ pub async fn generations(hub: &Arc<Hub>, ask: &Ask, snapshots: Vec<ObjectId>, li
     if snapshots.len() > veil_core::hub::wire::MAX_GENERATIONS {
         return Err(Error::bad_request(format!("at most {} snapshots", veil_core::hub::wire::MAX_GENERATIONS)));
     }
-    let rows: Vec<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1")
+    let rows: Vec<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL")
         .bind(ask.project.id)
         .fetch_all(&hub.db)
         .await?;
@@ -857,8 +887,13 @@ pub async fn generations(hub: &Arc<Hub>, ask: &Ask, snapshots: Vec<ObjectId>, li
     };
     let mut reals = Vec::new();
     for id in &unfilled {
+        if crate::embargo::is_withheld_for_query(hub, project, id).await? {
+            continue;
+        }
         if let Some(r) = crate::sync::resolve(hub, project, &vk, id).await?.into_iter().next() {
-            reals.push(r);
+            if !crate::embargo::is_withheld_for_query(hub, project, &r).await? {
+                reals.push(r);
+            }
         }
     }
     if !reals.is_empty() {
@@ -1222,6 +1257,7 @@ pub async fn history(hub: &Arc<Hub>, ask: &Ask, q: HistoryParams, limits: Limits
             Ok((resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?, path))
         }
     };
+    let viewer = ask.viewer.clone();
     on_graph(hub, ask, deadline, move |g, t| {
         let f = files::Files::new(g);
         let starts = match start {
@@ -1240,6 +1276,7 @@ pub async fn history(hub: &Arc<Hub>, ask: &Ask, q: HistoryParams, limits: Limits
                 };
                 let mut out = Vec::new();
                 for (id, path) in nodes {
+                    viewer.narrowed_to(&path)?;
                     // A cursor names versions of the viewer's own graph.
                     let r = match g.row(&id)? {
                         Some(r) if !r.withheld() => r,
