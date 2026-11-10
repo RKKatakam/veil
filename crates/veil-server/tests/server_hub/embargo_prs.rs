@@ -171,6 +171,7 @@ fn set_main_file(hub: &TestHub, p: &Project, path: &str, text: &str, desc: &str)
 
 /// Push an embargoed commit touching `files` onto `embargo/<id>` for `group`,
 /// returning `(embargo_id, fix_snap, merge_snap, work_dir)`.
+#[allow(clippy::too_many_arguments)]
 fn push_embargo(
     hub: &TestHub,
     project: &str,

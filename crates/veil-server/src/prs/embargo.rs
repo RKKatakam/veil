@@ -209,10 +209,10 @@ async fn real_for_viewer(
         .bind(id.hex())
         .fetch_optional(&hub.db)
         .await?;
-    if is_real.is_some() {
-        if viewer.admin || crate::sync::projected(hub, project, viewer, id).await? == id {
-            return Ok(Some(id));
-        }
+    if is_real.is_some()
+        && (viewer.admin || crate::sync::projected(hub, project, viewer, id).await? == id)
+    {
+        return Ok(Some(id));
     }
     let proj_real: Option<String> = sqlx::query_scalar(
         "SELECT real_id FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed ORDER BY real_id LIMIT 1",
@@ -303,11 +303,10 @@ pub async fn compute(
         while !is_onto_anc(x)? {
             g.tick()?;
             let s = cx.src.snapshot(&x)?;
-            let parent = if s.parents.len() == 1 {
-                s.parents[0]
-            } else if s.embargo.as_deref() == Some(eid.as_str())
-                && !s.parents.is_empty()
-                && is_onto_anc(s.parents[0])?
+            let parent = if s.parents.len() == 1
+                || (s.embargo.as_deref() == Some(eid.as_str())
+                    && !s.parents.is_empty()
+                    && is_onto_anc(s.parents[0])?)
             {
                 s.parents[0]
             } else {
