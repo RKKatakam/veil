@@ -237,8 +237,7 @@ pub async fn project_overview_route(
         }
         body.push_str("</ul></div></div>");
     } else if !branches.is_empty() {
-        let mut lim = query::Limits::default();
-        lim.list = 25;
+        let lim = query::Limits { list: 25, ..Default::default() };
         if let Ok(tr) = query::tree(
             &hub,
             &ask,
@@ -401,8 +400,7 @@ pub async fn tree_path_route(
 async fn tree_common(hub: HubState, caller: Caller, p: String, raw_path: String, q: RevQuery) -> Result<Response> {
     let ask = Ask::open(&hub, &p, &caller).await?;
     let csrf = current_csrf();
-    let mut lim = query::Limits::default();
-    lim.list = WEB_TREE_PAGE;
+    let lim = query::Limits { list: WEB_TREE_PAGE, ..Default::default() };
     let tr = query::tree(
         &hub,
         &ask,

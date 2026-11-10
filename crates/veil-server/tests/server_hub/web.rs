@@ -822,7 +822,7 @@ fn guarantee_2_secrets_never_reach_browser_on_any_route() {
     let web_tips = web.get(&format!("/v1/projects/{proj}/tips"));
     assert_eq!(web_tips.status, 200);
     assert!(
-        web_tips.json()["grants"].as_object().map_or(true, |m| m.is_empty()),
+        web_tips.json()["grants"].as_object().is_none_or(|m| m.is_empty()),
         "web tips must omit read grants: {}",
         web_tips.text()
     );
