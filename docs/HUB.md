@@ -3608,17 +3608,18 @@ reverted `vl` reads as before.
 
 ### 13.31 S22: embargoes through the server, and the release service (built)
 
-Milestone S22 of `docs/design/server/phase-4-agent-scale.md` (§4.9, decisions 8
-and 9, §6 rows 9–12, §8). Code: `crates/veil-server/src/embargo.rs` (push
+Milestone S22 of `docs/design/server/phase-4-agent-scale.md` (§4.8, decisions 8
+and 9, §6 rows 8–12, §8). Code: `crates/veil-server/src/embargo.rs` (push
 validation and recording, visibility checks, `release_due` and `release_one`,
-landing at release), migration `0023_embargoes.sql` (`branches.hidden_for_embargo`,
+`release_route`), migration `0023_embargoes.sql` (`branches.hidden_for_embargo`,
 `embargo_lines`, `embargo_snapshots`), minimal wiring in `sync.rs`, `api.rs`,
 `landing/`, `changes.rs`, `query/mod.rs`, `search/` and `derive/mod.rs`,
-`veil-core/src/embargo.rs` (`parse_scope`, `scope_groups`, `withheld_by_id`),
-`veil-core/src/hub/wire.rs` (`PushRequest.embargoes`, `Tips.embargoes`), and
-`crates/vl/src/hub.rs` (`vl merge --embargo-for`, `vl push`, `vl pull`,
-`vl embargo follow`, `vl embargo release`). Nothing new is encrypted: embargoes
-are server-enforced permissions that turn public at a deadline.
+`veil-core/src/embargo.rs` (`embargo_branch`, `embargo_id_of_branch`,
+`active_embargoes`, `follow`), `veil-core/src/hub/wire.rs` (`PushRequest.embargoes`,
+`Tips.embargoes`), and `crates/vl/src/hub.rs` (`vl merge --embargo-for`,
+`vl push`, `vl pull`, `vl embargo follow`, `vl embargo release`). Nothing new
+is encrypted: embargoes are server-enforced permissions that turn public at a
+deadline.
 
 ```text
 vl merge SOURCE --embargo UNTIL [--embargo-for GROUP...] [-m MSG]
@@ -3630,23 +3631,23 @@ vl embargo release ID
 
 * **Hidden embargo lines (`embargo/<id>`).** When an embargoed merge into a
   branch (`main`) is pushed and its scope's groups exist on the server, `vl push`
-  sends the signed `EmbargoRecord` in `PushRequest.embargoes` and directs the
-  branch update to `embargo/<id>` with `embargo_targets: {id: ("main", base)}`.
-  The server checks that the caller is a member of one of the embargo's groups
-  (or an admin), that every named group exists on the project, that the deadline
-  `until` is in the future on the database's clock, and that the record matches
-   any existing `embargo_lines` row for `<id>`. It stores the branch with
-  `branches.hidden_for_embargo = <id>`, records `(project_id, id, target_branch,
-  scope_groups, until_ms, record_json, created_by)` in `embargo_lines`, and tags
-  every snapshot on the line that is not yet on a public branch in
-  `embargo_snapshots`. The target branch (`main`) does not move until release.
+  sends the `EmbargoRecord` in `PushRequest.embargoes` and directs the branch
+  update to `embargo/<id>`. The server (`embargo::prepare_push`) checks that the
+  caller is a member of one of the embargo's groups (or an admin) and that every
+  named group exists on the project, diverts any push of `main` carrying an
+  unreleased embargo onto `embargo/<id>`, stores the branch with
+  `branches.hidden_for_embargo = <id>`, records `(project_id, embargo_id,
+  group_names, target_branch, embargo_branch, until_ms, released_at,
+  record_json, created_by, created_at)` in `embargo_lines`, and tags every
+  snapshot on the line (real, origin, and projected) in `embargo_snapshots`.
+  The target branch (`main`) does not move until release.
 * **Visibility before release.** While `embargo_lines.released_at` is `NULL`:
-  * Only members of `embargo_lines.scope_groups` and project admins see
+  * Only members of `embargo_lines.group_names` and project admins see
     `embargo/<id>` in `GET /v1/projects/{p}/tips` (along with its `EmbargoRecord`
     in `Tips.embargoes`) and in `POST /v1/projects/{p}/history`.
-  * `embargo_snapshots` rows that no public branch reaches are invisible to
-    everyone outside the embargo by every route: `sync::resolve`, `sync::fetch`,
-    `POST /v1/projects/{p}/objects/batch`, `POST /v1/projects/{p}/land`,
+  * `embargo_snapshots` rows for an unreleased embargo are invisible to
+    everyone outside the embargo by every route: `sync::resolve_for`,
+    `sync::history`, `sync::fetch`, `POST /v1/projects/{p}/land`,
     `POST /v1/projects/{p}/changes`, `GET /v1/projects/{p}/q/…`, and
     `GET /v1/projects/{p}/q/search` and `grep`. Every refusal uses the exact
     same status code and message as a non-existent revision or branch (`404`, or
@@ -3658,51 +3659,47 @@ vl embargo release ID
     an embargo is pushed.
 * **`vl embargo follow [ID]`.** Pulls from `origin` (receiving `Tips.embargoes`
   and `origin/embargo/<id>` tags for the embargoes the caller is in), saves each
-  `EmbargoRecord` into the local keychain, and checks out the hidden line (when
-  one unreleased embargo is active or `ID` is given) or lists the caller's active
-  embargoes. Someone outside the embargo receives neither the branch nor the
-  record, and `vl embargo follow <id>` fails with the same message as for an
-  unknown id.
+  `EmbargoRecord` into the local keychain, rebases `embargo/<id>` onto the
+  newest tip of `main` when `main` moved ahead, pushes the rebased embargo line,
+  and checks out the hidden line (when one unreleased embargo is active or `ID`
+  is given) or lists the caller's active embargoes. Someone outside the embargo
+  receives neither the branch nor the record, and `vl embargo follow <id>` fails
+  with the same message as for an unknown id.
 * **Scheduled release and landing at release.** Every server runs a background
-  release task (`embargo::spawn`, ticking every 200 ms) that calls
-  `embargo::release_due`:
-  * **Database clock and locking:** deadlines are compared solely against
-    PostgreSQL's `clock_timestamp()` (`until_ms <= (EXTRACT(EPOCH FROM
+  release task (`embargo::run_loop`) that calls `embargo::release_due`:
+  * **Database clock and idempotent landing:** deadlines are compared solely
+    against PostgreSQL's `clock_timestamp()` (`until_ms <= (extract(epoch FROM
     clock_timestamp()) * 1000)::BIGINT`), never a client's or an application
-    server's clock. Due rows are claimed with `SELECT … FROM embargo_lines WHERE
-    released_at IS NULL AND … ORDER BY until_ms ASC LIMIT 1 FOR UPDATE SKIP
-    LOCKED`, so concurrent servers and restarts never double-release or race.
-  * **Landing onto the target branch:** for each claimed embargo whose hidden
-    branch still exists and is not yet an ancestor of `target_branch`,
-    `release_due` submits the embargo tip to S17's `landing::land_embargo_release`
-    under the creator's identity (with `allow_embargo_id = Some(id)` so the
-    embargo line's own snapshots resolve). The landing service rebases the
-    embargoed changes cleanly onto the busy `target_branch` (`main`) and commits
-    them once.
-  * **Clearing the embargo:** in one transaction after the landing succeeds (or
-    immediately if the tip is already on `target_branch`), `release_due` sets
-    `embargo_lines.released_at` and updates `record_json.released_at`, clears
-    `branches.hidden_for_embargo = NULL`, deletes the embargo's
-    `embargo_snapshots` rows, deletes `branches WHERE name = 'embargo/<id>'`,
-    bumps the project's access epoch, records an `embargo.release` audit event,
-    and wakes `derive::landed` so derived history and search catch up on `main`.
-  * **Retries and conflicts:** if a release attempt fails partway or hits a true
-    content conflict on `target_branch`, `released_at` remains `NULL` (or the
-    conflict is recorded in `release_error` without deleting `embargo/<id>`), so
+    server's local clock.
+  * **Landing onto the target branch:** for each due embargo whose hidden
+    branch still exists, `release_one` queues a deterministic landing ticket
+    (`embargo-<project_id>-<embargo_id>`) onto `target_branch` (`main`) with
+    `ON CONFLICT (ticket) DO NOTHING` and waits for S17's fenced landing service
+    to land the embargoed stack onto `target_branch` once, recording each
+    server-signed snapshot's author in `snapshots.author` (BUG-1581).
+  * **Clearing the embargo:** in one transaction after the landing succeeds,
+    `release_one` sets `embargo_lines.released_at` and updates
+    `record_json.released_at`, deletes `branches WHERE name = 'embargo/<id>'`,
+    deletes the embargo's `embargo_snapshots` rows, notifies `pg_notify` on
+    `TIPS_CHANNEL`, and wakes `derive::landed` so derived history and search
+    catch up on `main`.
+  * **Retries and conflicts:** if a release attempt fails before finalizing or
+    hits a content conflict on `target_branch`, `released_at` remains `NULL`, so
     a transient failure is retried on the next tick and a conflicted line is
     kept on `embargo/<id>` for a member to rebase and push again.
-  * **Early release (`vl embargo release <id>`):** when a member of the embargo
-    (or an admin) pushes an `EmbargoRecord` with `released_at` set, `sync::push`
-    calls `embargo::release_one` inside the push request, landing the embargo on
-    `target_branch` and releasing it immediately.
+  * **Early release (`vl embargo release <id>` and `POST …/embargoes/{id}/release`):**
+    when a member of the embargo (or an admin) pushes an `EmbargoRecord` with
+    `released_at` set or calls `release_route` (which drops bulkhead gates via
+    `limits::leave_gates` before waiting, BUG-1635), `embargo::release_one`
+    lands the embargo on `target_branch` and releases it immediately.
 
-#### Guarantees and threat review (phase 4 §6 rows 9–12, and S22's 5 guarantees)
+#### Guarantees and threat review (phase 4 §6 rows 8–12, and S22's 5 guarantees)
 
-| # | Guarantee / Threat | Mitigation | Test (`server_hub::embargo`, unit tests in `veil-core::embargo`) |
+| # | Guarantee / Threat | Mitigation | Test (`server_hub::embargo`) |
 |---|---|---|---|
-| 1 | Embargoed content is invisible to everyone outside the embargo until release, by every route | `embargo/<id>` filtered from `tips` and `history`; `embargo_snapshots` refused identically to unknown ids in `fetch`, `objects/batch`, `land`, `changes`, `q/…`, `q/search`, `q/grep`; skipped by `derive` and `search::index` | `guarantee_1_embargoed_content_is_invisible_outside_the_embargo_by_every_route` |
-| 2 | Release happens at the deadline and never before (clock skew, restarts, several servers, failed release job retried) | Deadlines judged by PostgreSQL `clock_timestamp()`; rows claimed with `FOR UPDATE SKIP LOCKED`; failed landing leaves `released_at IS NULL` and retries on the next tick | `guarantee_2_release_happens_at_the_deadline_and_never_before` |
-| 3 | Landing at release puts exactly the embargoed changes on `main`, once | `landing::land_embargo_release` lands the hidden line's stack onto `main` through S17's fenced landing service before `released_at` commits | `guarantee_3_landing_at_release_puts_exactly_the_embargoed_changes_on_main_once` |
-| 4 | `vl embargo follow` shows a member only what they're in | `Tips.embargoes` and `embargo/<id>` branches are filtered by the caller's group memberships (or admin); `vl embargo follow` pulls and checks out only visible embargoes | `guarantee_4_vl_embargo_follow_shows_a_member_only_what_they_are_in` |
+| 1 | Embargoed content is invisible to everyone outside the embargo until release, by every route | `embargo/<id>` filtered from `tips` and `history`; `embargo_snapshots` refused identically to unknown ids in `fetch`, `land`, `changes`, `q/…`, `q/search`, `q/grep`; skipped by `derive` and `search::index` | `guarantee_1_embargoed_content_is_invisible_outside_the_embargo_by_every_route` |
+| 2 | Release happens at the deadline and never before (clock skew, restarts, several servers, failed release job retried) | Deadlines judged by PostgreSQL `clock_timestamp()`; deterministic ticket `embargo-<project>-<id>`; failed release leaves `released_at IS NULL` and retries on the next tick | `guarantee_2_release_happens_at_the_deadline_and_never_before` |
+| 3 | Landing at release puts exactly the embargoed changes on `main`, once | `release_one` queues and lands the hidden line's stack onto `main` through S17's fenced landing service before `released_at` commits, recording `snapshots.author` | `guarantee_3_landing_at_release_puts_exactly_the_embargoed_changes_on_main_once` |
+| 4 | `vl embargo follow` shows a member only what they're in | `Tips.embargoes` and `embargo/<id>` branches are filtered by the caller's group memberships (or admin); `vl embargo follow` pulls, rebases, and checks out only visible embargoes | `guarantee_4_vl_embargo_follow_shows_a_member_only_what_they_are_in` |
 | 5 | Nobody outside the embargo learns that it exists, beyond what decision 8 allows | `main` and `policy_version` do not move when an embargo is pushed; probing `embargo/<id>` or its snapshots returns the exact same `404`/`400` as a random non-existent name | `guarantee_5_nobody_outside_the_embargo_learns_that_it_exists` |
 

@@ -7,13 +7,13 @@
 -- through the landing service once `until_ms` arrives (or when released early).
 
 ALTER TABLE branches
-    ADD COLUMN hidden_for_embargo TEXT;
+    ADD COLUMN IF NOT EXISTS hidden_for_embargo TEXT;
 
-CREATE INDEX branches_hidden_embargo
+CREATE INDEX IF NOT EXISTS branches_hidden_embargo
     ON branches (project_id, hidden_for_embargo)
     WHERE hidden_for_embargo IS NOT NULL;
 
-CREATE TABLE embargo_lines (
+CREATE TABLE IF NOT EXISTS embargo_lines (
     project_id      BIGINT  NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     embargo_id      TEXT    NOT NULL,
     group_names     TEXT[]  NOT NULL,
@@ -27,16 +27,16 @@ CREATE TABLE embargo_lines (
     PRIMARY KEY (project_id, embargo_id)
 );
 
-CREATE INDEX embargo_lines_due
+CREATE INDEX IF NOT EXISTS embargo_lines_due
     ON embargo_lines (until_ms)
     WHERE released_at IS NULL AND until_ms IS NOT NULL;
 
-CREATE TABLE embargo_snapshots (
+CREATE TABLE IF NOT EXISTS embargo_snapshots (
     project_id  BIGINT  NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     snapshot    TEXT    NOT NULL,
     embargo_id  TEXT    NOT NULL,
     PRIMARY KEY (project_id, snapshot)
 );
 
-CREATE INDEX embargo_snapshots_by_embargo
+CREATE INDEX IF NOT EXISTS embargo_snapshots_by_embargo
     ON embargo_snapshots (project_id, embargo_id);

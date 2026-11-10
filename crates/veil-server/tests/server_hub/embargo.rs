@@ -71,6 +71,17 @@ fn catch_up(hub: &TestHub, project: &str) {
         .unwrap();
     hub.rt.block_on(veil_server::derive::catch_up_project(&h, pid)).unwrap();
     hub.rt.block_on(veil_server::search::index::catch_up_project(&h, pid)).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let active: i64 = hub
+            .rt
+            .block_on(sqlx::query_scalar("SELECT COUNT(*) FROM view_fills WHERE project_id = $1").bind(pid).fetch_one(&h.db))
+            .unwrap();
+        if active == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Wait for an embargo to be marked released in `embargo_lines` and landed on `main`.
@@ -94,6 +105,7 @@ fn wait_released(hub: &TestHub, project: &str, embargo_id: &str, timeout: Durati
             .unwrap()
             .flatten();
         if released.is_some() {
+            catch_up(hub, project);
             return true;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -190,6 +202,8 @@ fn guarantee_1_embargoed_content_is_invisible_outside_the_embargo_by_every_route
         assert_eq!(gen.json()["generations"], json!([null, null]), "{who} generations leaked embargo");
         for route in [
             "log?rev=main".to_string(),
+            "log?rev=main&path=src/lib.rs".to_string(),
+            "log?rev=main&path=src/embargo_fix.rs".to_string(),
             "tree?rev=main&path=src".to_string(),
             "file?rev=main&path=src/lib.rs".to_string(),
             format!("resolve?prefix={}", &merge_id.hex()[..8]),
@@ -199,20 +213,34 @@ fn guarantee_1_embargoed_content_is_invisible_outside_the_embargo_by_every_route
             assert_eq!(r.status, 200, "{who} q/{route}: {}", String::from_utf8_lossy(&r.body));
             assert_no_str(&String::from_utf8_lossy(&r.body), &[FIX_MARK, MSG_MARK, "embargo_fix.rs", &eid], who);
         }
+        let log_embargo_file = api.get(tok, &format!("/v1/projects/{}/q/log?rev=main&path=src/embargo_fix.rs", p.name));
+        assert_eq!(log_embargo_file.status, 200);
+        assert_no_str(&String::from_utf8_lossy(&log_embargo_file.body), &[FIX_MARK, MSG_MARK, "embargo_fix.rs", &eid], who);
         for rev in [&embargo_branch, &merge_id.hex(), &fix_id.hex()] {
             for kind in ["log", "show", "tree"] {
                 let r = api.get(tok, &format!("/v1/projects/{}/q/{kind}?rev={rev}", p.name));
                 assert_eq!(r.status, 404, "{who} q/{kind}?rev={rev}: {}", String::from_utf8_lossy(&r.body));
                 assert_no_str(&String::from_utf8_lossy(&r.body), &[FIX_MARK, MSG_MARK], who);
             }
+            let rf = api.get(tok, &format!("/v1/projects/{}/q/file?rev={rev}&path=src/lib.rs", p.name));
+            assert_eq!(rf.status, 404, "{who} q/file?rev={rev}: {}", String::from_utf8_lossy(&rf.body));
+            assert_no_str(&String::from_utf8_lossy(&rf.body), &[FIX_MARK, MSG_MARK], who);
+            let rd = api.get(tok, &format!("/v1/projects/{}/q/diff?from=main&to={rev}", p.name));
+            assert_eq!(rd.status, 404, "{who} q/diff?to={rev}: {}", String::from_utf8_lossy(&rd.body));
+            assert_no_str(&String::from_utf8_lossy(&rd.body), &[FIX_MARK, MSG_MARK], who);
+            let ra = api.post_json(tok, &format!("/v1/projects/{}/q/ancestry", p.name), &json!({"pairs": [["main", rev]]}));
+            assert_eq!(ra.status, 404, "{who} q/ancestry {rev}: {}", String::from_utf8_lossy(&ra.body));
+            assert_no_str(&String::from_utf8_lossy(&ra.body), &[FIX_MARK, MSG_MARK], who);
         }
 
         // Search and grep: nothing of the embargoed fix or message is indexed or found.
         for q in ["EMBARGO-SECRET", "EMBARGO-COMMIT", "embargo_fix"] {
-            let s = api.get(tok, &format!("/v1/projects/{}/q/search?q={q}&kind=code", p.name));
-            assert_eq!(s.status, 200, "{who} search {q}: {}", String::from_utf8_lossy(&s.body));
-            assert_eq!(s.json()["results"].as_array().unwrap().len(), 0, "{who} search results for {q}");
-            assert_no_str(&String::from_utf8_lossy(&s.body), &[FIX_MARK, MSG_MARK], who);
+            for kind in ["code", "path"] {
+                let s = api.get(tok, &format!("/v1/projects/{}/q/search?q={q}&kind={kind}", p.name));
+                assert_eq!(s.status, 200, "{who} search {q} ({kind}): {}", String::from_utf8_lossy(&s.body));
+                assert_eq!(s.json()["results"].as_array().unwrap().len(), 0, "{who} search results for {q} ({kind})");
+                assert_no_str(&String::from_utf8_lossy(&s.body), &[FIX_MARK, MSG_MARK], who);
+            }
 
             let g = api.get(tok, &format!("/v1/projects/{}/q/grep?pattern={q}", p.name));
             assert_eq!(g.status, 200, "{who} grep {q}: {}", String::from_utf8_lossy(&g.body));
@@ -226,17 +254,21 @@ fn guarantee_1_embargoed_content_is_invisible_outside_the_embargo_by_every_route
         assert_no_str(&String::from_utf8_lossy(&rel.body), &[FIX_MARK, MSG_MARK], who);
     }
 
-    // 3. Blame (`vl blame`) in both a full clone and a thin clone of `dev`:
+    // 3. Blame (`vl blame`) and file history (`vl log`) in both a full clone and a thin clone of `dev`:
     let dev_full = p.dev.dir("full");
     p.dev.ok(p.dev.home.path(), &["clone", "--full", &hub.url(&p.name), dev_full.to_str().unwrap()]);
     let blame_full = p.dev.ok(&dev_full, &["blame", "src/lib.rs"]);
     assert_no_str(&blame_full, &[FIX_MARK, MSG_MARK, &eid, &p.sec.name], "dev full blame");
+    let fhist_full = p.dev.ok(&dev_full, &["log", "src/lib.rs"]);
+    assert_no_str(&fhist_full, &[FIX_MARK, MSG_MARK, &eid, &p.sec.name], "dev full file history");
     assert_no_marker(&everything_in(&dev_full), &[FIX_MARK, MSG_MARK, &eid], "dev full clone");
 
     let dev_thin = p.dev.dir("thin");
     p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), dev_thin.to_str().unwrap()]);
     let blame_thin = p.dev.ok(&dev_thin, &["blame", "src/lib.rs"]);
     assert_no_str(&blame_thin, &[FIX_MARK, MSG_MARK, &eid, &p.sec.name], "dev thin blame");
+    let fhist_thin = p.dev.ok(&dev_thin, &["log", "src/lib.rs"]);
+    assert_no_str(&fhist_thin, &[FIX_MARK, MSG_MARK, &eid, &p.sec.name], "dev thin file history");
     assert_no_marker(&everything_in(&dev_thin), &[FIX_MARK, MSG_MARK, &eid], "dev thin clone");
 
     // 4. Landing answers: `dev` lands a change on `main` (even touching `src/lib.rs`,
@@ -314,7 +346,15 @@ fn guarantee_2_release_happens_at_the_deadline_and_never_before() {
     assert!(!anon_dir.join("src/manual.rs").exists(), "manual embargo released automatically!");
 
     // 3. Restart the server before the deadline: state survives restart and still does not release early.
-    hub = hub.restart(|_| {});
+    catch_up(&hub, &p.name);
+    hub = hub.restart(|url| {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let db = veil_server::db::connect(url, 1).await.unwrap();
+            let _ = sqlx::query("DELETE FROM view_fills").execute(&db).await;
+            db.close().await;
+        });
+    });
     hub.rt.block_on(veil_server::embargo::release_due(&hub.hub())).unwrap();
     let anon_dir2 = hub.anyone().dir("after-restart-before-deadline");
     hub.anyone().ok(hub.anyone().home.path(), &["clone", &hub.url(&p.name), anon_dir2.to_str().unwrap()]);
@@ -338,8 +378,10 @@ fn guarantee_2_release_happens_at_the_deadline_and_never_before() {
         .unwrap();
     });
 
-    let _ = hub.rt.block_on(veil_server::embargo::release_due(&hub.hub()));
-    let _ = hub.rt.block_on(veil_server::embargo::release_due(&hub.hub()));
+    let r1 = hub.rt.block_on(veil_server::embargo::release_due(&hub.hub()));
+    assert!(r1.is_err(), "injected release failure 1 must return Err");
+    let r2 = hub.rt.block_on(veil_server::embargo::release_due(&hub.hub()));
+    assert!(r2.is_err(), "injected release failure 2 must return Err");
     assert!(hub.hub().embargo.retried_failures() >= 2, "expected at least 2 failed attempts before retry succeeded");
 
     let hub2 = TestHub::beside(&hub);
@@ -411,23 +453,32 @@ fn guarantee_3_landing_at_release_puts_exactly_the_embargoed_changes_on_main_onc
     assert_eq!(std::fs::read_to_string(check_dir.join("src/b.rs")).unwrap(), FIX_B);
     assert_eq!(std::fs::read_to_string(check_dir.join("src/c.rs")).unwrap(), FIX_C);
 
-    // Walk `main` down to `initial_main`: check that each change landed on `main` once.
-    let log_json: Value = serde_json::from_str(&p.admin.ok(&p.dir, &["pull"])).unwrap_or(Value::Null);
-    let _ = log_json;
-    let log_str = p.admin.ok(&p.dir, &["log", "-r", "origin/main", "--json"]);
-    let log_val: Value = serde_json::from_str(&log_str).unwrap();
-    let entries = log_val["entries"].as_array().unwrap();
+    // Walk `main` down to `initial_main`: check that each change landed on `main` once,
+    // and that every snapshot signed at release records its author in `snapshots.author` (BUG-1581).
+    catch_up(&hub, &p.name);
+    let qlog = hub.api().get(Some(&p.admin.token()), &format!("/v1/projects/{}/q/log?rev=main&n=20", p.name));
+    assert_eq!(qlog.status, 200);
+    let entries = qlog.json()["entries"].as_array().unwrap().clone();
     let since_init: Vec<&Value> = entries
         .iter()
         .take_while(|it| it["snapshot_id"].as_str().unwrap() != initial_main.hex())
         .collect();
-    assert!(
-        !since_init.is_empty() && since_init.len() <= 4,
-        "expected embargoed changes landed once on main since initial_main, got: {since_init:#?}"
+    assert_eq!(
+        since_init.len(),
+        3,
+        "expected concurrent work + 2 embargoed changes landed once on main since initial_main, got: {since_init:#?}"
     );
+    let h = hub.hub();
+    for entry in &since_init {
+        let sid = entry["snapshot_id"].as_str().unwrap();
+        let author_id: i64 = hub
+            .rt
+            .block_on(sqlx::query_scalar("SELECT author FROM snapshots WHERE id = $1").bind(sid).fetch_one(&h.db))
+            .unwrap();
+        assert!(author_id > 0, "snapshot {sid} landed at release must record snapshots.author > 0");
+    }
 
     // And derived queries & search now see the released changes on `main`.
-    catch_up(&hub, &p.name);
     let s = hub.api().get(None, &format!("/v1/projects/{}/q/search?q=EMBARGO-LAND-A-3301&kind=code", p.name));
     assert_eq!(s.status, 200);
     assert_eq!(s.json()["results"].as_array().unwrap().len(), 1);
@@ -594,17 +645,48 @@ fn guarantee_5_nobody_outside_the_embargo_learns_that_it_exists() {
     for real_snap in [merge_id, fix_id] {
         let h_real = api.post_json(Some(&dev_with), &format!("/v1/projects/{}/history", p_with.name), &json!({"tips": [real_snap.hex()], "stop": []}));
         let h_fake = api.post_json(Some(&dev_with), &format!("/v1/projects/{}/history", p_with.name), &json!({"tips": [fake_snap.hex()], "stop": []}));
+        assert_eq!(h_real.status, 404);
         assert_eq!(h_real.status, h_fake.status);
         assert_eq!(norm(&String::from_utf8_lossy(&h_real.body)), norm(&String::from_utf8_lossy(&h_fake.body)));
 
         let f_real = api.post_json(Some(&dev_with), &format!("/v1/projects/{}/fetch", p_with.name), &json!({"snapshot": real_snap.hex(), "objects": []}));
         let f_fake = api.post_json(Some(&dev_with), &format!("/v1/projects/{}/fetch", p_with.name), &json!({"snapshot": fake_snap.hex(), "objects": []}));
+        assert_eq!(f_real.status, 404);
         assert_eq!(f_real.status, f_fake.status);
         assert_eq!(norm(&String::from_utf8_lossy(&f_real.body)), norm(&String::from_utf8_lossy(&f_fake.body)));
+
+        let c_real = api.post_json(
+            Some(&dev_with),
+            &format!("/v1/projects/{}/changes", p_with.name),
+            &json!({"base": real_snap.hex(), "edits": [{"path": "src/x.rs", "put": {"text": "x"}}], "description": "probe"}),
+        );
+        let c_fake = api.post_json(
+            Some(&dev_with),
+            &format!("/v1/projects/{}/changes", p_with.name),
+            &json!({"base": fake_snap.hex(), "edits": [{"path": "src/x.rs", "put": {"text": "x"}}], "description": "probe"}),
+        );
+        assert_eq!(c_real.status, 404);
+        assert_eq!(c_real.status, c_fake.status);
+        assert_eq!(norm(&String::from_utf8_lossy(&c_real.body)), norm(&String::from_utf8_lossy(&c_fake.body)));
+
+        let l_real = api.post_json(
+            Some(&dev_with),
+            &format!("/v1/projects/{}/land", p_with.name),
+            &json!({"onto": "main", "base": real_snap.hex(), "edits": [{"path": "src/x.rs", "put": {"text": "x"}}], "description": "probe", "wait": true}),
+        );
+        let l_fake = api.post_json(
+            Some(&dev_with),
+            &format!("/v1/projects/{}/land", p_with.name),
+            &json!({"onto": "main", "base": fake_snap.hex(), "edits": [{"path": "src/x.rs", "put": {"text": "x"}}], "description": "probe", "wait": true}),
+        );
+        assert_eq!(l_real.status, 404);
+        assert_eq!(l_real.status, l_fake.status);
+        assert_eq!(norm(&String::from_utf8_lossy(&l_real.body)), norm(&String::from_utf8_lossy(&l_fake.body)));
     }
 
     let rel_real = api.post_json(Some(&dev_with), &format!("/v1/projects/{}/embargoes/{eid}/release", p_with.name), &json!({}));
     let rel_fake = api.post_json(Some(&dev_with), &format!("/v1/projects/{}/embargoes/{fake_eid}/release", p_with.name), &json!({}));
+    assert_eq!(rel_real.status, 404);
     assert_eq!(rel_real.status, rel_fake.status);
     assert_eq!(norm(&String::from_utf8_lossy(&rel_real.body)), norm(&String::from_utf8_lossy(&rel_fake.body)));
 }

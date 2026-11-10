@@ -282,18 +282,24 @@ pub(crate) async fn prepare_push(
     // 2. Check new snapshots in topological order (`order`) for `n.embargo` or
     //    ancestry from an active embargo line.
     let mut snap_embargo: HashMap<ObjectId, String> = HashMap::new();
-    for (pushed, real) in real_of {
-        let eid: Option<String> = sqlx::query_scalar(
-            "SELECT s.embargo_id FROM embargo_snapshots s \
+    if !real_of.is_empty() {
+        let reals: Vec<String> = real_of.values().map(|r| r.hex()).collect();
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT s.snapshot, s.embargo_id FROM embargo_snapshots s \
              JOIN embargo_lines l ON l.project_id = s.project_id AND l.embargo_id = s.embargo_id \
-             WHERE s.project_id = $1 AND s.snapshot = $2 AND l.released_at IS NULL LIMIT 1",
+             WHERE s.project_id = $1 AND s.snapshot = ANY($2) AND l.released_at IS NULL",
         )
         .bind(project.id)
-        .bind(real.hex())
-        .fetch_optional(&hub.db)
+        .bind(&reals)
+        .fetch_all(&hub.db)
         .await?;
-        if let Some(eid) = eid {
-            snap_embargo.insert(*pushed, eid);
+        if !rows.is_empty() {
+            let by_real: HashMap<String, String> = rows.into_iter().collect();
+            for (pushed, real) in real_of {
+                if let Some(eid) = by_real.get(&real.hex()) {
+                    snap_embargo.insert(*pushed, eid.clone());
+                }
+            }
         }
     }
 
@@ -807,6 +813,7 @@ pub async fn release_route(
     if !can_see(&hub, &project, &viewer, &id).await? {
         return Err(not_found());
     }
+    crate::limits::leave_gates();
     release_one(&hub, project.id, &id, None).await?;
     Ok(Json(serde_json::json!({ "id": id, "released": true })))
 }
