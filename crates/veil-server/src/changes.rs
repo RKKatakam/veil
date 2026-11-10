@@ -888,6 +888,12 @@ pub(crate) async fn create_with(
     if req.edits.iter().any(|e| !viewer.within_narrowing(&e.path)) {
         return Err(sync::agent_refusal(sync::NARROWED_WRITE));
     }
+    // Uploads are staged (S28): read into memory with what the change makes,
+    // stored only once every check passed (BUG-930).
+    // Held decoded under the server-wide bound while the commit runs
+    // (BUG-1156).
+    let (uploaded, staged, _held) = sync::take_uploads(hub, project.id, person.id, &req.receipts).await?;
+    pending.extend(staged);
     let onto = req.onto.clone();
     let mut who = Arc::new(Who {
         project: project.clone(),
@@ -933,7 +939,7 @@ pub(crate) async fn create_with(
         base.tree
     };
     let plan = Arc::new(Plan {
-        uploaded: sync::receipted(hub, project.id, person.id, &req.receipts),
+        uploaded,
         pending,
         change_id,
         description: req.description.clone(),
@@ -1027,7 +1033,7 @@ pub(crate) async fn create_with(
         // branch up to this one, as for a pushed snapshot (BUG-1112).
         if let Some((_, q)) = land.as_mut() {
             let fresh = HashMap::from([(built.real, (vec![parent], person.id))]);
-            let judged = match crate::landing::stack(hub, &who.project, &who.viewer, &q.branch, built.real, &fresh).await? {
+            let judged = match crate::landing::stack(hub, &who.project, &who.viewer, &q.branch, built.real, &fresh, None).await? {
                 Ok(j) if j.branch => j,
                 // No branch: the service answers so (unless `agent_stack`
                 // refuses creating the default branch first).
@@ -1039,7 +1045,7 @@ pub(crate) async fn create_with(
             };
             // S11's agent rule (`agent_tip`) on the stack's edits before the
             // landing is queued (BUG-1636).
-            crate::landing::agent_stack(hub, &who.project, &who.viewer, &q.branch, &judged, built.real, false).await?;
+            crate::landing::agent_stack(hub, &who.project, &who.viewer, &q.branch, &judged, built.real, false, None).await?;
             *q.skipped.lock().unwrap() = judged.skipped;
             (q.stack, q.lineage) = (judged.stack, judged.lineage);
             if q.stack.is_empty() {

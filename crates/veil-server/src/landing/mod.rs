@@ -740,6 +740,7 @@ pub async fn submit(
                 skipped: Default::default(),
             };
             let w = hub.landing.register(&q.ticket);
+            let receipts = req.receipts.clone();
             let change = ChangeRequest {
                 base,
                 change_id: req.change_id,
@@ -748,7 +749,9 @@ pub async fn submit(
                 onto: None,
                 receipts: req.receipts,
             };
-            let made = match crate::changes::create_with(hub, project, viewer, caller, change, Some((who.clone(), q.clone()))).await {
+            let r = crate::changes::create_with(hub, project, viewer, caller, change, Some((who.clone(), q.clone()))).await;
+            crate::sync::settle_uploads(hub, project.id, who.person.id, &receipts, &r).await;
+            let made = match r {
                 Ok(m) => m,
                 Err(e) => {
                     abandon(hub, w);
@@ -863,6 +866,7 @@ pub async fn stack(
     branch: &str,
     new: ObjectId,
     fresh: &HashMap<ObjectId, (Vec<ObjectId>, i64)>,
+    staged: Option<Arc<crate::sync::Staged>>,
 ) -> Result<std::result::Result<Judged, String>> {
     let root = crate::sync::root_snapshot_id();
     let pid = project.id;
@@ -875,7 +879,7 @@ pub async fn stack(
             .await?;
     let Some((tip, lineage)) = row else { return Ok(Ok(Judged { stack: Vec::new(), lineage: 0, branch: false, skipped: Vec::new() })) };
     let tip = ObjectId::from_hex(&tip).map_err(|e| Error::Other(e.into()))?;
-    let mut anc = Ancestry::new(hub.clone(), pid, branch, tip, lineage);
+    let mut anc = Ancestry::new_staged(hub.clone(), pid, branch, tip, lineage, staged);
     let too_many = || Ok(Err(format!("more than {max} changes between the branch's tip and this one: land them in parts, or have an admin push with --force")));
     let key = (!viewer.admin).then(|| project.view(viewer).key());
     let mut line: Vec<Link> = Vec::new();
@@ -1034,6 +1038,7 @@ pub async fn stack(
 /// refusal comes back as `Ok(Some(NARROWED_MOVE))` for the branch's
 /// `BranchResult`; on `POST …/land` (`per_branch == false`), every refusal is
 /// `403 agent_session`, matching `sync::agent_tip_of` and `changes`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn agent_stack(
     hub: &Arc<Hub>,
     project: &crate::perm::Project,
@@ -1042,6 +1047,7 @@ pub(crate) async fn agent_stack(
     judged: &Judged,
     to: ObjectId,
     per_branch: bool,
+    staged: Option<Arc<crate::sync::Staged>>,
 ) -> Result<Option<&'static str>> {
     if !viewer.agent {
         return Ok(None);
@@ -1054,7 +1060,7 @@ pub(crate) async fn agent_stack(
         judged.branch,
         judged.stack.clone(),
     );
-    let refused = crate::sync::blocking(hub, project.id, move |src| {
+    let refused = crate::sync::blocking_staged(hub, project.id, staged, move |src| {
         let base = if !j_branch && default {
             None
         } else if let Some(e) = entries.first() {
@@ -1160,6 +1166,7 @@ pub(crate) struct Ancestry {
     /// Does the derived graph hold the tip (asked once)?
     graph: Option<bool>,
     walk: Option<Walk>,
+    staged: Option<Arc<crate::sync::Staged>>,
 }
 
 /// The walk down from the tip: what it found, what is left to read.
@@ -1171,7 +1178,14 @@ struct Walk {
 }
 
 impl Ancestry {
-    pub(crate) fn new(hub: Arc<Hub>, project: i64, branch: &str, tip: ObjectId, lineage: i64) -> Ancestry {
+    pub(crate) fn new_staged(
+        hub: Arc<Hub>,
+        project: i64,
+        branch: &str,
+        tip: ObjectId,
+        lineage: i64,
+        staged: Option<Arc<crate::sync::Staged>>,
+    ) -> Ancestry {
         Ancestry {
             hub,
             project,
@@ -1181,6 +1195,7 @@ impl Ancestry {
             known: HashMap::new(),
             graph: None,
             walk: None,
+            staged,
         }
     }
 
@@ -1274,7 +1289,7 @@ impl Ancestry {
             return Ok(Landed::Same);
         }
         let Some(author) = snapshot_author(&self.hub, self.project, x, fresh).await? else { return Ok(Landed::No) };
-        let cid = crate::sync::blocking(&self.hub, self.project, move |src| Ok(src.snapshot(&x)?.change_id.to_string())).await?;
+        let cid = crate::sync::blocking_staged(&self.hub, self.project, self.staged.clone(), move |src| Ok(src.snapshot(&x)?.change_id.to_string())).await?;
         let row: Option<String> = sqlx::query_scalar(
             "SELECT landed FROM landed_changes WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND change_id = $4 AND author = $5",
         )
@@ -1295,7 +1310,7 @@ impl Ancestry {
         // Nothing beyond the landed revision's edits (paths and what they
         // become), whatever the base: the same change, or one rebased on a
         // tip that holds it already (no edits of its own).
-        let same = crate::sync::blocking(&self.hub, self.project, move |src| {
+        let same = crate::sync::blocking_staged(&self.hub, self.project, self.staged.clone(), move |src| {
             let own = |id: ObjectId| -> Result<Vec<(String, Option<veil_core::TreeEntry>)>> {
                 let s = src.snapshot(&id)?;
                 let base = s.parents.first().copied().unwrap_or_else(crate::sync::root_snapshot_id);

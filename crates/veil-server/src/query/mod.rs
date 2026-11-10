@@ -271,7 +271,11 @@ async fn on_graph(
         let view = project.view(&viewer);
         let g = G::new(cx, &vk, Some(deadline));
         let t = Trees::new(&g, &view);
-        let mut v = f(&g, &t).map_err(|e| if Instant::now() > deadline { graph::too_slow() } else { e })?;
+        let mut v = f(&g, &t).map_err(|e| match &e {
+            Error::Other(a) if crate::pack::indexes_full(a) => e,
+            _ if Instant::now() > deadline => graph::too_slow(),
+            _ => e,
+        })?;
         v["policy_version"] = json!(version);
         v["work"] = json!(g.work());
         Ok(v)

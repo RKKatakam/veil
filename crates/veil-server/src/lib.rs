@@ -19,6 +19,7 @@
 //! | [`limits`] | rate limits, request bodies under a budget, per-project bulkheads, shedding, health metrics (S24) |
 //! | [`db`] | PostgreSQL / YugabyteDB, migrations, serialisable retries |
 //! | [`store`] | object storage: local directory or S3 |
+//! | [`pack`] | packs: a push's objects in one storage object, read by range (S28) |
 //! | [`tls`] | TLS configuration |
 
 pub mod api;
@@ -35,6 +36,7 @@ pub mod events;
 pub mod grant;
 pub mod landing;
 pub mod limits;
+pub mod pack;
 pub mod perm;
 pub mod query;
 pub mod search;
@@ -203,8 +205,8 @@ pub async fn start(config: Config) -> Result<Running> {
         }
     };
     let hub = Arc::new(Hub {
-        db,
-        objects: Arc::new(store::Objects::new(blob, 256 << 20)),
+        db: db.clone(),
+        objects: Arc::new(store::Objects::with_db(blob, 256 << 20, Some(db.clone()))),
         trees: LruCache::new(256 << 20),
         identity,
         receipt_key,

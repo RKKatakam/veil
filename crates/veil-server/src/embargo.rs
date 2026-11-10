@@ -668,13 +668,13 @@ pub async fn release_one(
         let existing_outcome = crate::landing::read(hub, project_id, person_id, &ticket).await?;
         let need_queue = existing_outcome.is_none();
         if need_queue || agent_viewer.is_some_and(|v| v.agent) {
-            let judged = match crate::landing::stack(hub, &project, &admin_viewer, &target_branch, etip_id, &HashMap::new()).await? {
+            let judged = match crate::landing::stack(hub, &project, &admin_viewer, &target_branch, etip_id, &HashMap::new(), None).await? {
                 Ok(j) => j,
                 Err(why) => return Err(Error::conflict(why)),
             };
             // S11's agent rule (`agent_stack`) applies when an agent session asks for release.
             if let Some(v) = agent_viewer {
-                crate::landing::agent_stack(hub, &project, v, &target_branch, &judged, etip_id, false).await?;
+                crate::landing::agent_stack(hub, &project, v, &target_branch, &judged, etip_id, false, None).await?;
             }
             if need_queue && !judged.stack.is_empty() {
                 let (_, _, epochs) = perm::open_at(

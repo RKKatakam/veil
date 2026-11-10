@@ -731,6 +731,7 @@ fn merge_stack(
         project: job.project,
         rt,
         pending: HashMap::new(),
+        staged: None,
     };
     let view = project.view(&viewer);
     let tip_tree = src.snapshot(&tip)?.tree;

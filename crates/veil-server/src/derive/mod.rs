@@ -270,6 +270,7 @@ fn cx(hub: &Arc<Hub>, project: i64) -> Cx {
             project,
             rt: tokio::runtime::Handle::current(),
             pending: Default::default(),
+            staged: None,
         },
     }
 }

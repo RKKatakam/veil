@@ -504,7 +504,7 @@ fn bench_object_routes() {
     }
     println!("   grant and request signature checks (µs): {:.0}", t.elapsed().as_secs_f64() * 1e6 / 1000.0);
     // The chain check alone, against the server's store and tree cache.
-    let src = veil_server::sync::Source { hub: state.clone(), project: project_id(&hub, &p.name), rt: hub.rt.handle().clone(), pending: Default::default() };
+    let src = veil_server::sync::Source { hub: state.clone(), project: project_id(&hub, &p.name), rt: hub.rt.handle().clone(), pending: Default::default(), staged: None };
     let mut cold = Vec::new();
     for (chain, id) in &many {
         let t = Instant::now();
