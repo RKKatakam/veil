@@ -352,15 +352,15 @@ pub async fn projected(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, real:
 /// its new snapshots are worked out before its transaction and written in it
 /// (one commit per push, `storage-and-cost.md` §3).
 #[derive(Default)]
-struct Deferred {
+pub(crate) struct Deferred {
     /// The push's new real snapshots, each with the pusher's own snapshot
     /// the server completed it from.
-    fresh: HashMap<ObjectId, Option<ObjectId>>,
+    pub(crate) fresh: HashMap<ObjectId, Option<ObjectId>>,
     /// Memo rows `(view key, real, projected)` for the push's transaction.
-    rows: Vec<(String, ObjectId, ObjectId)>,
+    pub(crate) rows: Vec<(String, ObjectId, ObjectId)>,
     /// Those of them whose real snapshot collapsed into its first parent's
     /// projection (a change hidden from that view).
-    collapsed: HashSet<ObjectId>,
+    pub(crate) collapsed: HashSet<ObjectId>,
     /// The push's uploads and made objects (its new snapshots are there).
     staged: Option<Arc<Staged>>,
     /// The projections it signed, among the made objects, for its pack.
@@ -416,7 +416,7 @@ async fn projected_predecessors(
     Ok(out)
 }
 
-async fn projected_inner(
+pub(crate) async fn projected_inner(
     hub: &Arc<Hub>,
     project: &Project,
     viewer: &Viewer,
@@ -2213,11 +2213,12 @@ pub(crate) async fn push_with(
     // own scope, so the storage writes it makes are counted as its own
     // (BUG-1398; what it spawns, the deriver and the indexer, are not).
     let (hub2, project, viewer, who) = (hub.clone(), project.clone(), viewer.clone(), who.clone());
-    tokio::spawn(crate::store::own(async move {
+    let fut = crate::limits::in_request(hub, crate::store::own(async move {
         push_to_its_end(&hub2, &project, &viewer, &who, req, land_all, wait).await
-    }))
-    .await
-    .map_err(|e| Error::Other(e.into()))?
+    }));
+    tokio::spawn(fut)
+        .await
+        .map_err(|e| Error::Other(e.into()))?
 }
 
 /// [`push`], to its end.

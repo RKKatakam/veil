@@ -617,7 +617,7 @@ async fn resolve_rev_for_read(
 }
 
 async fn branch_tip(hub: &Arc<Hub>, project: i64, branch: &str) -> Result<Option<ObjectId>> {
-    let target: Option<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2")
+    let target: Option<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL")
         .bind(project)
         .bind(branch)
         .fetch_optional(&hub.db)
@@ -634,7 +634,7 @@ const MAX_TESTED_WALK: usize = 1024;
 /// first-parent chain whose required checks have all passed.
 pub async fn advance_tested(hub: &Arc<Hub>, project: &Project) -> Result<()> {
     let branches: Vec<(String, String, i64)> =
-        sqlx::query_as("SELECT name, target, lineage FROM branches WHERE project_id = $1 ORDER BY name")
+        sqlx::query_as("SELECT name, target, lineage FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL ORDER BY name")
             .bind(project.id)
             .fetch_all(&hub.db)
             .await?;

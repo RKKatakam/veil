@@ -104,6 +104,9 @@ pub struct Person {
 pub struct AgentGrant {
     pub session_hash: String,
     pub project: i64,
+    /// The session's stored hash (`session_hash`), for its rate-limit bucket
+    /// and its landing queue share and bound (S24 part B).
+    pub session: String,
     /// `--only`: the paths its files are narrowed to (`None`: all its
     /// person sees).
     pub only: Option<Arc<Vec<String>>>,
@@ -456,9 +459,11 @@ pub(crate) fn agent_grant(session_hash: String, agent: Option<String>, project: 
         Some(o) => Some(Arc::new(serde_json::from_str::<Vec<String>>(&o).map_err(|_| damaged())?)),
         None => None,
     };
+    let session = session_hash.clone();
     Ok(Some(Arc::new(AgentGrant {
         session_hash,
         project: project.ok_or_else(damaged)?,
+        session,
         only,
         attribution,
         runner,

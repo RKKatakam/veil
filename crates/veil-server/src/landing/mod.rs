@@ -127,27 +127,9 @@ pub fn ticket() -> String {
 }
 
 /// Insert `q` for `who` into the queue of `project`, in the caller's
-/// transaction.
+/// transaction, under `who`'s outstanding-landing bounds (`limits::landing`).
 pub async fn insert(c: &mut PgConnection, project: i64, who: &Submitter, q: &Queued) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, person_epoch, \
-         project_epoch, agent_session, state, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'queued', \
-         (extract(epoch FROM clock_timestamp()) * 1000000)::BIGINT)",
-    )
-    .bind(project)
-    .bind(&q.branch)
-    .bind(&q.ticket)
-    .bind(who.person.id)
-    .bind(&who.person.name)
-    .bind(&who.person.device_key)
-    .bind(encode_stack(&q.stack))
-    .bind(q.lineage)
-    .bind(who.epochs.person)
-    .bind(who.epochs.project.map_or(0, |(_, e)| e))
-    .bind(who.person.agent.as_ref().map(|a| a.session_hash.as_str()))
-    .execute(&mut *c)
-    .await?;
-    Ok(())
+    crate::limits::landing::admit_queue(c, project, who, q).await
 }
 
 /// Record, in the caller's transaction, that the changes `changes` (their

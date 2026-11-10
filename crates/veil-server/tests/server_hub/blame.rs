@@ -3411,3 +3411,108 @@ mod s14rd3_review {
         assert_eq!(recorded, 0, "no too_wide record written when a blame of the reached path was kept since the job's window");
     }
 }
+
+/// Review 2 (S24 part B × S14): file history and blame memos written in the
+/// consolidated background transaction (`derive::landing` ->
+/// `query::graph::prepare_memo` / `write_prepared_memo`) equal what they were
+/// before (`query::graph::ensure` on a fresh project copy and the independent
+/// projected-files model).
+#[test]
+fn consolidated_landing_pass_file_history_and_blame_memos_match_projected_files() {
+    let th = TestHub::start();
+    let carol = 720_999;
+    let (policy_text, bindings) = policy(carol);
+    let mut h = Hist::new(&th, &policy_text, &bindings);
+    let mut rng = Rng::new(309);
+    // 10 commits with ≤ 64 file changes total so `derive::landing` takes the
+    // inline consolidated transaction path (`prepare_memo` + `write_prepared_memo`)
+    // rather than falling back to `prefill`.
+    random_history(&th, &mut h, &mut rng, 10);
+    let all_viewers: Vec<(&str, Viewer)> = viewers(carol).into_iter().chain([("admin", admin())]).collect();
+    // Register the test groups (`900_001..=900_003`) and members (`700_001..=700_005`) in
+    // `people`, `groups` and `group_members` so `derive::landing`'s `viewers_of` enumerates
+    // every viewer's view key and writes their `projections`, `view_file_history`, and
+    // `view_graph` rows inside the single consolidated transaction!
+    th.rt.block_on(async {
+        for (gid, gname) in [(900_001_i64, "devs"), (900_002, "security"), (900_003, "finance")] {
+            sqlx::query("INSERT INTO groups (id, project_id, name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+                .bind(gid)
+                .bind(h.id)
+                .bind(gname)
+                .execute(&h.hub.db)
+                .await
+                .unwrap();
+        }
+        for (who, v) in &all_viewers {
+            if let Some(pid) = v.person {
+                sqlx::query("INSERT INTO people (id, name, created_at) VALUES ($1, $2, 0) ON CONFLICT DO NOTHING")
+                    .bind(pid)
+                    .bind(format!("test-viewer-{who}-{pid}"))
+                    .execute(&h.hub.db)
+                    .await
+                    .unwrap();
+                for &gid in &v.groups {
+                    sqlx::query("INSERT INTO group_members (group_id, person_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+                        .bind(gid)
+                        .bind(pid)
+                        .execute(&h.hub.db)
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+    });
+    let stats = th.rt.block_on(veil_server::derive::landing(&h.hub, h.id, vec!["main".into(), "side".into()])).unwrap();
+    assert!(!stats.branches.is_empty(), "derive::landing must derive the branches: {stats:?}");
+
+    let project = h.project(&th);
+    for (who, viewer) in &all_viewers {
+        let vk = project.view(viewer).key();
+        let vg_cnt: i64 = th.rt.block_on(async {
+            sqlx::query_scalar("SELECT COUNT(*) FROM view_graph WHERE project_id = $1 AND view_key = $2")
+                .bind(h.id)
+                .bind(&vk)
+                .fetch_one(&h.hub.db)
+                .await
+                .unwrap()
+        });
+        assert!(vg_cnt > 0, "consolidated derive::landing transaction must write view_graph rows for {who} ({vk})");
+    }
+
+    let all: BTreeSet<String> = h.files.values().flat_map(|f| f.keys().filter(|k| !k.ends_with('/')).cloned()).collect();
+    let (mut blamed, mut listed) = (0usize, 0usize);
+    for (who, viewer) in all_viewers {
+        let p = projections(&th, &h, &project, &viewer);
+        let view = project.view(&viewer);
+        let m = model(&h, &p, &view);
+        let copy = copy_for(&th, &h, &project, &viewer, &p);
+        let a = ask(&th, &h, &viewer);
+        for (rev, t) in &h.branches {
+            let x = p[t];
+            let order: Vec<ObjectId> = model_log(&th, &copy, x).iter().map(|s| ObjectId::from_hex(s).unwrap()).collect();
+            let mut bmemo = HashMap::new();
+            for path in &all {
+                let readable = view.read(path);
+                let got = blame_all(&th, &h, &a, rev, path, false, Limits::default());
+                match m.files[&x].get(path) {
+                    Some(_) if readable => {
+                        let (lines, _) = got.unwrap_or_else(|e| panic!("{who}: blame {path}@{rev}: {e}"));
+                        assert_eq!(lines, model_blame(&m, x, path, &mut bmemo), "{who}: blame {path}@{rev}");
+                        blamed += 1;
+                    }
+                    _ => {}
+                }
+                let got_h = history_all(&th, &h, &a, rev, path, false, 2);
+                let want_h = model_history(&m, x, path);
+                if !want_h.is_empty() {
+                    let got_h = got_h.unwrap_or_else(|e| panic!("{who}: history {path}@{rev}: {e}"));
+                    let want_ids: Vec<String> = order.iter().filter(|s| want_h.contains(s)).map(|s| s.hex()).collect();
+                    assert_eq!(got_h.iter().map(|e| e.0.clone()).collect::<Vec<_>>(), want_ids, "{who}: history {path}@{rev}");
+                    listed += got_h.len();
+                }
+            }
+        }
+    }
+    assert!(blamed > 20 && listed > 40, "expected >20 blames and >40 history entries, got {blamed} and {listed}");
+}
+

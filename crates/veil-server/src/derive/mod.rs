@@ -326,23 +326,217 @@ pub fn landed(hub: &Arc<Hub>, project: i64, branches: Vec<String>) {
 /// memoise their tips' projections for every view key.
 pub async fn landing(hub: &Arc<Hub>, project: i64, branches: Vec<String>) -> Result<Stats> {
     let moved = branches.clone();
-    let stats = catch_up(hub, project, Scope::Branches(branches)).await?;
+    let hub2 = hub.clone();
+    let stats = tokio::spawn(async move { locked_landing(&hub2, project, branches).await })
+        .await
+        .map_err(|e| Error::Other(e.into()))??;
     // The project's record of its last valid `.veilrules` (S21, BUG-1259),
     // kept current at each landing on the default branch; a failure here is
     // only a longer walk at the next PR request.
     if let Err(e) = crate::prs::landed(hub, project, &moved).await {
         eprintln!("veil-server: recording the review rules of project {project}: {e:?}");
     }
-    // Memoising runs on the requests' pool, so under a permit too: at most
-    // [`DERIVERS`] of its connections at once (BUG-911).
-    // Derive work is shed second under load (S24): it waits a little.
-    hub.limits.derive_turn().await;
-    let permit = hub.derive.permit().await?;
-    memo_tips(hub, project, &stats.branches).await?;
-    drop(permit);
-    // The search index (S15) follows the derived branches, in its own task.
-    crate::search::index::landed(hub, project, stats.branches.clone());
     Ok(stats)
+}
+
+async fn locked_landing(hub: &Arc<Hub>, project: i64, branches: Vec<String>) -> Result<Stats> {
+    let key = LOCK_BASE ^ project;
+    let deadline = tokio::time::Instant::now() + LOCK_WAIT;
+    let (permit, mut c) = loop {
+        hub.limits.derive_turn().await;
+        let permit = hub.derive.permit().await?;
+        let mut c = hub.derive.db.acquire().await?;
+        let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)").bind(key).fetch_one(&mut *c).await?;
+        if got {
+            break (permit, c);
+        }
+        drop((c, permit));
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(Stats {
+                skipped: true,
+                ..Stats::default()
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let cx = cx(hub, project);
+    let scope = Scope::Branches(branches);
+    let prep = tokio::task::spawn_blocking(move || deriving(|| prepare_landing_run(&cx, scope)))
+        .await
+        .map_err(|e| Error::Other(e.into()));
+    let r = match prep {
+        Ok(Ok(p)) => finish_landing_run(hub, project, p).await,
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(e),
+    };
+    let unlocked = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)").bind(key).fetch_one(&mut *c).await;
+    if !matches!(unlocked, Ok(true)) {
+        let _ = sqlx::Connection::close(c.detach()).await;
+    }
+    drop(permit);
+    r
+}
+
+struct PreparedLanding {
+    writes: Writes,
+    names: Vec<String>,
+    through: Vec<String>,
+    tip_oids: Vec<ObjectId>,
+    stats: Stats,
+    search: Option<Vec<crate::search::index::PreparedWrite>>,
+}
+
+fn prepare_landing_run(cx: &Cx, scope: Scope) -> Result<PreparedLanding> {
+    let pool = cx.pool();
+    let mut b = Batch::new(cx)?;
+    b.prepare_lists()?;
+    let rows: Vec<(String, String)> = match &scope {
+        Scope::Snapshot(_) => Vec::new(),
+        Scope::All => cx.db(|| {
+            sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL")
+                .bind(cx.project())
+                .fetch_all(pool)
+        })?,
+        Scope::Branches(names) => cx.db(|| {
+            sqlx::query_as(
+                "SELECT b.name, b.target FROM branches b LEFT JOIN derive_progress d \
+                 ON d.project_id = b.project_id AND d.index_name = $3 AND d.index_version = $4 AND d.branch = b.name \
+                 WHERE b.project_id = $1 AND b.hidden_for_embargo IS NULL \
+                 AND (b.name = ANY($2) OR d.through_snapshot IS DISTINCT FROM b.target)",
+            )
+            .bind(cx.project())
+            .bind(names)
+            .bind(INDEX.0)
+            .bind(INDEX.1)
+            .fetch_all(pool)
+        })?,
+    };
+    let tips: Vec<(String, ObjectId)> = rows.into_iter().filter_map(|(n, t)| ObjectId::from_hex(&t).ok().map(|t| (n, t))).collect();
+    let roots: Vec<ObjectId> = tips.iter().map(|(_, t)| *t).collect();
+    b.derive_from(&roots)?;
+    let mut names = Vec::new();
+    let mut through = Vec::new();
+    let mut tip_oids = Vec::new();
+    let mut reached_tips = Vec::new();
+    for (name, tip) in &tips {
+        if b.graph.row(tip)?.is_some() {
+            names.push(name.clone());
+            through.push(tip.hex());
+            tip_oids.push(*tip);
+            reached_tips.push((name.clone(), *tip));
+        }
+    }
+    b.stats.branches = names.clone();
+    // Upload derived changed-path objects before opening the transaction.
+    let mut writes = std::mem::take(&mut b.writes);
+    let objects = std::mem::take(&mut writes.objects);
+    upload_objects(&cx.src.rt, cx.hub(), cx.project(), objects)?;
+    // Prepare the search index update while `b.graph.pending` holds the newly
+    // derived rows, unless this run derived a large batch (such as a 60,000-file
+    // initial push), which is indexed in the background without holding the
+    // deriver lock.
+    let search = if writes.history.len() <= 64 && writes.graph.len() <= 16 {
+        crate::search::index::prepare_for_landing(cx, &b.graph, &b.lines, &reached_tips).unwrap_or(None)
+    } else {
+        None
+    };
+    Ok(PreparedLanding {
+        writes,
+        names,
+        through,
+        tip_oids,
+        stats: b.stats,
+        search,
+    })
+}
+
+async fn finish_landing_run(hub: &Arc<Hub>, project: i64, p: PreparedLanding) -> Result<Stats> {
+    let view_info = viewers_of(hub, project).await?;
+    let small = p.writes.history.len() <= 64 && p.writes.graph.len() <= 16;
+    let memo = match (&view_info, small) {
+        (Some((proj, viewers)), true) => crate::query::graph::prepare_memo(hub, proj, viewers.clone(), &p.tip_oids).await?,
+        (Some((_, viewers)), false) => crate::query::graph::PreparedMemo {
+            keys: Vec::new(),
+            fallback: viewers.clone(),
+        },
+        _ => crate::query::graph::PreparedMemo::default(),
+    };
+    let access_info = crate::query::files::current_view_access(hub, project).await?;
+    let has_derive_writes =
+        !p.writes.history.is_empty() || !p.writes.rules.is_empty() || !p.writes.graph.is_empty() || !p.names.is_empty();
+    let has_memo_writes = memo
+        .keys
+        .iter()
+        .any(|k| !k.projections.is_empty() || !k.files.is_empty() || !k.graph.is_empty());
+    let has_search_writes = p.search.as_ref().is_some_and(|s| !s.is_empty());
+    let need_access_init = access_info.as_ref().is_some_and(|(_, rec)| rec.is_none());
+    let mut tx_fallback = Vec::new();
+    let mut skip_vks = HashSet::new();
+    let mut search_done = p.search.as_ref().is_some_and(|s| s.is_empty());
+    if has_derive_writes || has_memo_writes || has_search_writes || need_access_init {
+        let deadline = tokio::time::Instant::now() + STATEMENT_DEADLINE;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let res: Result<(Vec<crate::perm::Viewer>, HashSet<String>, bool)> = async {
+                let mut tx = hub.derive.db.begin().await?;
+                write_derive_tx(&mut tx, project, &p.writes, Some((&p.names, &p.through))).await?;
+                let (fb, sk) = crate::query::graph::write_prepared_memo(&mut tx, project, &memo).await?;
+                if let Some((access, None)) = &access_info {
+                    sqlx::query("INSERT INTO view_access (project_id, access, changed_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+                        .bind(project)
+                        .bind(access)
+                        .bind(veil_core::now_millis())
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                let mut s_done = p.search.as_ref().is_some_and(|s| s.is_empty());
+                if let Some(sw) = &p.search {
+                    let mut all_ok = true;
+                    for w in sw {
+                        if !crate::search::index::apply_write(&mut tx, project, w).await? {
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                    s_done = all_ok;
+                }
+                tx.commit().await?;
+                Ok((fb, sk, s_done))
+            }
+            .await;
+            match res {
+                Ok((fb, sk, s_done)) => {
+                    tx_fallback = fb;
+                    skip_vks = sk;
+                    search_done = s_done;
+                    break;
+                }
+                Err(e) => {
+                    if !e.is_retryable() || tokio::time::Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(Duration::from_millis(5 << attempt.min(6))).await;
+                }
+            }
+        }
+    }
+    cache_derive_rows(hub, project, &p.writes);
+    crate::query::graph::cache_prepared_memo(hub, project, &memo, &skip_vks);
+    if let Some((proj, _)) = &view_info {
+        for v in memo.fallback.into_iter().chain(tx_fallback) {
+            let _ = crate::query::graph::prefill(hub, proj, &v, &p.tip_oids).await;
+        }
+    }
+    if let Some((access, Some(rec))) = &access_info {
+        if access != rec {
+            let _ = crate::query::files::sweep_keys(hub, project).await;
+        }
+    }
+    if !search_done {
+        crate::search::index::landed(hub, project, p.stats.branches.clone());
+    }
+    Ok(p.stats)
 }
 
 /// At start-up: resume every project (or only `project`) with a branch
@@ -381,7 +575,7 @@ pub async fn ensure(hub: &Arc<Hub>, project: i64, snapshot: ObjectId) -> Result<
             .bind(snapshot.hex())
             .fetch_optional(&hub.db)
             .await?;
-        if known.is_none() {
+        if known.is_none() || crate::embargo::is_withheld_for_query(hub, project, &snapshot).await? {
             return Err(Error::not_found("no such snapshot"));
         }
     }
@@ -547,7 +741,6 @@ fn run(cx: &Cx, scope: Scope) -> Result<Stats> {
         _ => tips.iter().map(|(_, t)| *t).collect(),
     };
     b.derive_from(&roots)?;
-    b.flush()?;
     let mut names = Vec::new();
     let mut through = Vec::new();
     for (name, tip) in &tips {
@@ -556,21 +749,7 @@ fn run(cx: &Cx, scope: Scope) -> Result<Stats> {
             through.push(tip.hex());
         }
     }
-    if !names.is_empty() {
-        cx.db(|| {
-            sqlx::query(
-                "INSERT INTO derive_progress (project_id, index_name, index_version, branch, through_snapshot) \
-                 SELECT $1, $2, $3, * FROM UNNEST($4::text[], $5::text[]) \
-                 ON CONFLICT (project_id, index_name, index_version, branch) DO UPDATE SET through_snapshot = EXCLUDED.through_snapshot",
-            )
-            .bind(cx.project())
-            .bind(INDEX.0)
-            .bind(INDEX.1)
-            .bind(&names)
-            .bind(&through)
-            .execute(pool)
-        })?;
-    }
+    b.flush_with_progress(Some((&names, &through)))?;
     b.stats.branches = names;
     Ok(b.stats)
 }
@@ -905,80 +1084,132 @@ impl<'a> Batch<'a> {
     /// Write what is queued: objects, file history and list rows, then the
     /// graph rows that mark the snapshots derived.
     fn flush(&mut self) -> Result<()> {
+        self.flush_with_progress(None)
+    }
+
+    fn flush_with_progress(&mut self, progress: Option<(&[String], &[String])>) -> Result<()> {
         let cx = self.cx;
-        let w = std::mem::take(&mut self.writes);
-        let hub = cx.hub().clone();
-        let project = cx.project();
-        cx.src.rt.block_on(async {
-            let mut set = tokio::task::JoinSet::new();
-            let mut it = w.objects.into_iter();
-            loop {
-                while set.len() < 32 {
-                    let Some((id, raw)) = it.next() else { break };
-                    let h = hub.clone();
-                    set.spawn(async move { h.objects.put(project, &id, raw).await });
-                }
-                match set.join_next().await {
-                    Some(r) => r.map_err(|e| Error::Other(e.into()))?.map_err(Error::Other)?,
-                    None => break,
-                }
-            }
-            Ok::<(), Error>(())
-        })?;
+        let mut w = std::mem::take(&mut self.writes);
+        let objects = std::mem::take(&mut w.objects);
+        upload_objects(&cx.src.rt, cx.hub(), cx.project(), objects)?;
         let pool = cx.pool();
-        for (sql, rows) in [
-            (
-                "INSERT INTO file_history (project_id, path_key, depth, snapshot) SELECT $1, * FROM UNNEST($2::text[], $3::bigint[], $4::text[]) \
-                 ON CONFLICT DO NOTHING",
-                &w.history,
-            ),
-            (
-                "INSERT INTO rule_history (project_id, line_key, generation, snapshot) SELECT $1, * FROM UNNEST($2::text[], $3::bigint[], $4::text[]) \
-                 ON CONFLICT DO NOTHING",
-                &w.rules,
-            ),
-        ] {
-            for chunk in rows.chunks(ROWS_PER_STATEMENT) {
-                let a: Vec<&str> = chunk.iter().map(|r| r.0.as_str()).collect();
-                let b: Vec<i64> = chunk.iter().map(|r| r.1).collect();
-                let c: Vec<&str> = chunk.iter().map(|r| r.2.as_str()).collect();
-                cx.db(|| sqlx::query(sql).bind(project).bind(&a).bind(&b).bind(&c).execute(pool))?;
-            }
-        }
-        for chunk in w.graph.chunks(ROWS_PER_STATEMENT) {
-            let ids: Vec<String> = chunk.iter().map(|(id, _)| id.hex()).collect();
-            let gens: Vec<i64> = chunk.iter().map(|(_, r)| r.generation).collect();
-            let depths: Vec<i64> = chunk.iter().map(|(_, r)| r.depth).collect();
-            let parents: Vec<String> = chunk.iter().map(|(_, r)| serde_json::to_string(&r.parents).unwrap()).collect();
-            let change_ids: Vec<&str> = chunk.iter().map(|(_, r)| r.change_id.as_str()).collect();
-            let flags: Vec<i32> = chunk.iter().map(|(_, r)| r.flags).collect();
-            let skips: Vec<String> = chunk.iter().map(|(_, r)| serde_json::to_string(&r.skip).unwrap()).collect();
-            let changed: Vec<Option<&str>> = chunk.iter().map(|(_, r)| r.changed.as_deref()).collect();
-            cx.db(|| {
-                sqlx::query(
-                    "INSERT INTO graph (project_id, snapshot, generation, depth, parents, change_id, flags, skip, changed) \
-                     SELECT $1, * FROM UNNEST($2::text[], $3::bigint[], $4::bigint[], $5::text[], $6::text[], $7::int[], $8::text[], $9::text[]) \
-                     ON CONFLICT DO NOTHING",
-                )
-                .bind(project)
-                .bind(&ids)
-                .bind(&gens)
-                .bind(&depths)
-                .bind(&parents)
-                .bind(&change_ids)
-                .bind(&flags)
-                .bind(&skips)
-                .bind(&changed)
-                .execute(pool)
+        let project = cx.project();
+        let has_rows = !w.history.is_empty()
+            || !w.rules.is_empty()
+            || !w.graph.is_empty()
+            || progress.is_some_and(|(n, _)| !n.is_empty());
+        if has_rows {
+            cx.db(|| async {
+                let mut tx = pool.begin().await?;
+                write_derive_tx(&mut tx, project, &w, progress).await?;
+                tx.commit().await?;
+                Ok(())
             })?;
-            for (id, r) in chunk {
-                cx.hub().derive.rows.insert(row_key(project, id), r.clone(), 256);
-            }
         }
+        cache_derive_rows(cx.hub(), project, &w);
         // Written rows are read from the cache or the database from now on.
         self.graph.pending.clear();
         self.history.clear();
         Ok(())
+    }
+}
+
+fn upload_objects(rt: &tokio::runtime::Handle, hub: &Arc<Hub>, project: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<()> {
+    if objects.is_empty() {
+        return Ok(());
+    }
+    let hub = hub.clone();
+    rt.block_on(async {
+        let mut set = tokio::task::JoinSet::new();
+        let mut it = objects.into_iter();
+        loop {
+            while set.len() < 32 {
+                let Some((id, raw)) = it.next() else { break };
+                let h = hub.clone();
+                set.spawn(async move { h.objects.put(project, &id, raw).await });
+            }
+            match set.join_next().await {
+                Some(r) => r.map_err(|e| Error::Other(e.into()))?.map_err(Error::Other)?,
+                None => break,
+            }
+        }
+        Ok::<(), Error>(())
+    })
+}
+
+async fn write_derive_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    project: i64,
+    w: &Writes,
+    progress: Option<(&[String], &[String])>,
+) -> std::result::Result<(), sqlx::Error> {
+    for (sql, rows) in [
+        (
+            "INSERT INTO file_history (project_id, path_key, depth, snapshot) SELECT $1, * FROM UNNEST($2::text[], $3::bigint[], $4::text[]) \
+             ON CONFLICT DO NOTHING",
+            &w.history,
+        ),
+        (
+            "INSERT INTO rule_history (project_id, line_key, generation, snapshot) SELECT $1, * FROM UNNEST($2::text[], $3::bigint[], $4::text[]) \
+             ON CONFLICT DO NOTHING",
+            &w.rules,
+        ),
+    ] {
+        for chunk in rows.chunks(ROWS_PER_STATEMENT) {
+            let a: Vec<&str> = chunk.iter().map(|r| r.0.as_str()).collect();
+            let b: Vec<i64> = chunk.iter().map(|r| r.1).collect();
+            let c: Vec<&str> = chunk.iter().map(|r| r.2.as_str()).collect();
+            sqlx::query(sql).bind(project).bind(&a).bind(&b).bind(&c).execute(&mut **tx).await?;
+        }
+    }
+    for chunk in w.graph.chunks(ROWS_PER_STATEMENT) {
+        let ids: Vec<String> = chunk.iter().map(|(id, _)| id.hex()).collect();
+        let gens: Vec<i64> = chunk.iter().map(|(_, r)| r.generation).collect();
+        let depths: Vec<i64> = chunk.iter().map(|(_, r)| r.depth).collect();
+        let parents: Vec<String> = chunk.iter().map(|(_, r)| serde_json::to_string(&r.parents).unwrap()).collect();
+        let change_ids: Vec<&str> = chunk.iter().map(|(_, r)| r.change_id.as_str()).collect();
+        let flags: Vec<i32> = chunk.iter().map(|(_, r)| r.flags).collect();
+        let skips: Vec<String> = chunk.iter().map(|(_, r)| serde_json::to_string(&r.skip).unwrap()).collect();
+        let changed: Vec<Option<&str>> = chunk.iter().map(|(_, r)| r.changed.as_deref()).collect();
+        sqlx::query(
+            "INSERT INTO graph (project_id, snapshot, generation, depth, parents, change_id, flags, skip, changed) \
+             SELECT $1, * FROM UNNEST($2::text[], $3::bigint[], $4::bigint[], $5::text[], $6::text[], $7::int[], $8::text[], $9::text[]) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(project)
+        .bind(&ids)
+        .bind(&gens)
+        .bind(&depths)
+        .bind(&parents)
+        .bind(&change_ids)
+        .bind(&flags)
+        .bind(&skips)
+        .bind(&changed)
+        .execute(&mut **tx)
+        .await?;
+    }
+    if let Some((names, through)) = progress {
+        if !names.is_empty() {
+            sqlx::query(
+                "INSERT INTO derive_progress (project_id, index_name, index_version, branch, through_snapshot) \
+                 SELECT $1, $2, $3, * FROM UNNEST($4::text[], $5::text[]) \
+                 ON CONFLICT (project_id, index_name, index_version, branch) DO UPDATE SET through_snapshot = EXCLUDED.through_snapshot",
+            )
+            .bind(project)
+            .bind(INDEX.0)
+            .bind(INDEX.1)
+            .bind(names)
+            .bind(through)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+fn cache_derive_rows(hub: &Hub, project: i64, w: &Writes) {
+    for (id, r) in &w.graph {
+        hub.derive.rows.insert(row_key(project, id), r.clone(), 256);
     }
 }
 

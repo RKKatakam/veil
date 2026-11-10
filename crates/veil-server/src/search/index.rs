@@ -208,108 +208,127 @@ pub fn read_state(cx: &Cx, pool: &PgPool, kind: &str, branch: &str, keys: Option
     Err(Error::busy())
 }
 
-/// One committed write: the head of `(kind, branch)` moves to `snapshot`
-/// under `lines` if its version is still `expect` (or it is absent), with
-/// `shards` written and `removed` deleted (of `shard_branch`), and `walk`
-/// recorded (a branch's walked tip). False if another writer got there
-/// first.
-#[allow(clippy::too_many_arguments)]
-fn commit(
-    cx: &Cx,
-    pool: &PgPool,
-    kind: &str,
-    branch: &str,
-    expect: Option<i64>,
-    snapshot: &str,
-    lines: &str,
-    shard_branch: &str,
-    shards: &BTreeMap<String, Shard>,
-    removed: &[String],
-    walk: Option<(&str, &str)>,
-) -> Result<bool> {
-    let project = cx.project();
-    let rows: Vec<(String, String, i64, i64, i64, i64)> = shards
-        .iter()
-        .map(|(k, s)| (k.clone(), serde_json::to_string(&s.segments).unwrap(), s.docs, s.text_docs, s.text_bytes, s.dead))
-        .collect();
-    cx.db(|| async {
-        let mut tx = pool.begin().await?;
-        let moved = match expect {
-            Some(v) => sqlx::query(
-                "UPDATE search_heads SET snapshot = $4, lines = $5, version = version + 1 \
-                 WHERE project_id = $1 AND kind = $2 AND branch = $3 AND version = $6",
-            )
-            .bind(project)
-            .bind(kind)
-            .bind(branch)
-            .bind(snapshot)
-            .bind(lines)
-            .bind(v)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected(),
-            None => sqlx::query(
-                "INSERT INTO search_heads (project_id, kind, branch, snapshot, lines, version) VALUES ($1, $2, $3, $4, $5, 1) \
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(project)
-            .bind(kind)
-            .bind(branch)
-            .bind(snapshot)
-            .bind(lines)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected(),
-        };
-        if moved != 1 {
-            tx.rollback().await?;
-            return Ok(false);
+pub(crate) struct PreparedWrite {
+    pub kind: &'static str,
+    pub branch: String,
+    pub expect: Option<i64>,
+    pub snapshot: String,
+    pub lines: String,
+    pub shard_branch: String,
+    pub rows: Vec<(String, String, i64, i64, i64, i64)>,
+    pub removed: Vec<String>,
+    pub walk: Option<(String, String)>,
+}
+
+impl PreparedWrite {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        kind: &'static str,
+        branch: &str,
+        expect: Option<i64>,
+        snapshot: &str,
+        lines: &str,
+        shard_branch: &str,
+        shards: &BTreeMap<String, Shard>,
+        removed: Vec<String>,
+        walk: Option<(&str, &str)>,
+    ) -> Self {
+        let rows = shards
+            .iter()
+            .map(|(k, s)| (k.clone(), serde_json::to_string(&s.segments).unwrap(), s.docs, s.text_docs, s.text_bytes, s.dead))
+            .collect();
+        PreparedWrite {
+            kind,
+            branch: branch.to_string(),
+            expect,
+            snapshot: snapshot.to_string(),
+            lines: lines.to_string(),
+            shard_branch: shard_branch.to_string(),
+            rows,
+            removed,
+            walk: walk.map(|(b, s)| (b.to_string(), s.to_string())),
         }
-        for (k, segs, docs, text_docs, text_bytes, dead) in &rows {
-            sqlx::query(
-                "INSERT INTO search_shards (project_id, kind, branch, line_key, segments, docs, text_docs, text_bytes, dead) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-                 ON CONFLICT (project_id, kind, branch, line_key) DO UPDATE SET segments = EXCLUDED.segments, docs = EXCLUDED.docs, \
-                 text_docs = EXCLUDED.text_docs, text_bytes = EXCLUDED.text_bytes, dead = EXCLUDED.dead",
-            )
+    }
+}
+
+pub(crate) async fn apply_write(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    project: i64,
+    w: &PreparedWrite,
+) -> std::result::Result<bool, sqlx::Error> {
+    let moved = match w.expect {
+        Some(v) => sqlx::query(
+            "UPDATE search_heads SET snapshot = $4, lines = $5, version = version + 1 \
+             WHERE project_id = $1 AND kind = $2 AND branch = $3 AND version = $6",
+        )
+        .bind(project)
+        .bind(w.kind)
+        .bind(&w.branch)
+        .bind(&w.snapshot)
+        .bind(&w.lines)
+        .bind(v)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected(),
+        None => sqlx::query(
+            "INSERT INTO search_heads (project_id, kind, branch, snapshot, lines, version) VALUES ($1, $2, $3, $4, $5, 1) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(project)
+        .bind(w.kind)
+        .bind(&w.branch)
+        .bind(&w.snapshot)
+        .bind(&w.lines)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected(),
+    };
+    if moved != 1 {
+        return Ok(false);
+    }
+    for (k, segs, docs, text_docs, text_bytes, dead) in &w.rows {
+        sqlx::query(
+            "INSERT INTO search_shards (project_id, kind, branch, line_key, segments, docs, text_docs, text_bytes, dead) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (project_id, kind, branch, line_key) DO UPDATE SET segments = EXCLUDED.segments, docs = EXCLUDED.docs, \
+             text_docs = EXCLUDED.text_docs, text_bytes = EXCLUDED.text_bytes, dead = EXCLUDED.dead",
+        )
+        .bind(project)
+        .bind(w.kind)
+        .bind(&w.shard_branch)
+        .bind(k)
+        .bind(segs)
+        .bind(docs)
+        .bind(text_docs)
+        .bind(text_bytes)
+        .bind(dead)
+        .execute(&mut **tx)
+        .await?;
+    }
+    if !w.removed.is_empty() {
+        sqlx::query("DELETE FROM search_shards WHERE project_id = $1 AND kind = $2 AND branch = $3 AND line_key = ANY($4)")
             .bind(project)
-            .bind(kind)
-            .bind(shard_branch)
-            .bind(k)
-            .bind(segs)
-            .bind(docs)
-            .bind(text_docs)
-            .bind(text_bytes)
-            .bind(dead)
-            .execute(&mut *tx)
+            .bind(w.kind)
+            .bind(&w.shard_branch)
+            .bind(&w.removed)
+            .execute(&mut **tx)
             .await?;
-        }
-        if !removed.is_empty() {
-            sqlx::query("DELETE FROM search_shards WHERE project_id = $1 AND kind = $2 AND branch = $3 AND line_key = ANY($4)")
-                .bind(project)
-                .bind(kind)
-                .bind(shard_branch)
-                .bind(removed)
-                .execute(&mut *tx)
-                .await?;
-        }
-        if let Some((b, s)) = walk {
-            sqlx::query(
-                "INSERT INTO search_heads (project_id, kind, branch, snapshot, lines, version) VALUES ($1, $2, $3, $4, $5, 1) \
-                 ON CONFLICT (project_id, kind, branch) DO UPDATE SET snapshot = EXCLUDED.snapshot, lines = EXCLUDED.lines, \
-                 version = search_heads.version + 1",
-            )
-            .bind(project)
-            .bind(WALK)
-            .bind(b)
-            .bind(s)
-            .bind(lines)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(true)
-    })
+    }
+    if let Some((b, s)) = &w.walk {
+        sqlx::query(
+            "INSERT INTO search_heads (project_id, kind, branch, snapshot, lines, version) VALUES ($1, $2, $3, $4, $5, 1) \
+             ON CONFLICT (project_id, kind, branch) DO UPDATE SET snapshot = EXCLUDED.snapshot, lines = EXCLUDED.lines, \
+             version = search_heads.version + 1",
+        )
+        .bind(project)
+        .bind(WALK)
+        .bind(b)
+        .bind(s)
+        .bind(&w.lines)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(true)
 }
 
 // ---- segments ----------------------------------------------------------------------
@@ -674,7 +693,7 @@ pub async fn resume(hub: Arc<Hub>, project: Option<i64>) {
         "SELECT DISTINCT b.project_id FROM branches b \
          LEFT JOIN search_heads c ON c.project_id = b.project_id AND c.kind = 'code' AND c.branch = b.name \
          LEFT JOIN search_heads w ON w.project_id = b.project_id AND w.kind = 'walk' AND w.branch = b.name \
-         WHERE (c.snapshot IS DISTINCT FROM b.target OR w.snapshot IS DISTINCT FROM b.target) AND ($1::bigint IS NULL OR b.project_id = $1)",
+         WHERE b.hidden_for_embargo IS NULL AND (c.snapshot IS DISTINCT FROM b.target OR w.snapshot IS DISTINCT FROM b.target) AND ($1::bigint IS NULL OR b.project_id = $1)",
     )
     .bind(project)
     .fetch_all(&hub.derive.db)
@@ -721,118 +740,145 @@ fn textlike(e: &TreeEntry) -> (i64, i64) {
 
 /// Move `branch`'s code index to `tip`.
 fn code(cx: &Cx, lines: &Lines, branch: &str, tip: ObjectId, default: &str, stats: &mut Stats) -> Result<()> {
-    let src = &cx.src;
     let pool = &cx.hub().derive.db;
     let g = Graph::new(cx);
-    if withheld(&g, &tip)? {
-        return Ok(());
-    }
-    let ident = identity(lines);
-    let all: BTreeSet<String> = lines.all().into_iter().collect();
     for _ in 0..8 {
-        let (head, old) = read_state(cx, pool, CODE, branch, None)?;
-        if head.as_ref().is_some_and(|h| h.snapshot == tip.hex() && h.lines == ident) {
+        let Some(w) = prepare_code(cx, &g, lines, branch, tip, default, stats)? else {
             return Ok(());
-        }
-        // Where to start: this branch's index under the same lines, else
-        // the default branch's, else nothing; under other lines, the
-        // shards whose keys are kept (the rest are built from the tip).
-        let (mut shards, base, fresh, removed): (BTreeMap<String, Shard>, Option<ObjectId>, BTreeSet<String>, Vec<String>) = match &head {
-            Some(h) if h.lines == ident => (old, Some(oid(&h.snapshot)?), BTreeSet::new(), Vec::new()),
-            Some(h) => {
-                let removed: Vec<String> = old.keys().filter(|k| !all.contains(*k)).cloned().collect();
-                let kept: BTreeMap<String, Shard> = old.into_iter().filter(|(k, _)| all.contains(k)).collect();
-                let fresh = all.iter().filter(|k| !kept.contains_key(*k)).cloned().collect();
-                (kept, Some(oid(&h.snapshot)?), fresh, removed)
-            }
-            None => {
-                let from_default = if branch != default {
-                    let (dh, ds) = read_state(cx, pool, CODE, default, None)?;
-                    dh.filter(|h| h.lines == ident).map(|h| (h, ds))
-                } else {
-                    None
-                };
-                match from_default {
-                    Some((dh, ds)) => (ds, Some(oid(&dh.snapshot)?), BTreeSet::new(), Vec::new()),
-                    None => (BTreeMap::new(), None, all.clone(), Vec::new()),
-                }
-            }
         };
-        let tip_tree = tree_of(src, &tip)?;
-        let mut plans: BTreeMap<String, Plan> = BTreeMap::new();
-        if let Some(b) = base {
-            let base_tree = tree_of(src, &b)?;
-            for c in changes::diff(src, base_tree, tip_tree)?.0 {
-                let ko = c.old.as_ref().map(|e| lines.key_of(&c.path, e).to_string()).filter(|k| !fresh.contains(k));
-                let kn = c.new.as_ref().map(|e| lines.key_of(&c.path, e).to_string()).filter(|k| !fresh.contains(k));
-                if let (Some(k), Some(e)) = (&ko, &c.old) {
-                    let p = plans.entry(k.clone()).or_default();
-                    let (t, b) = textlike(e);
-                    p.docs -= 1;
-                    p.text_docs -= t;
-                    p.text_bytes -= b;
-                    p.replaced += 1;
-                    if kn.as_ref() != Some(k) {
-                        p.dead.push(c.path.clone());
-                    }
-                }
-                if let (Some(k), Some(e)) = (&kn, &c.new) {
-                    let p = plans.entry(k.clone()).or_default();
-                    let (t, b) = textlike(e);
-                    p.docs += 1;
-                    p.text_docs += t;
-                    p.text_bytes += b;
-                    p.adds.push((c.path.clone(), e.clone()));
-                }
+        let ok = cx.db(|| async {
+            let mut tx = pool.begin().await?;
+            if !apply_write(&mut tx, cx.project(), &w).await? {
+                tx.rollback().await?;
+                return Ok(false);
             }
-        }
-        if !fresh.is_empty() {
-            for k in &fresh {
-                shards.remove(k);
-            }
-            for c in changes::diff(src, empty_tree_id(), tip_tree)?.0 {
-                let Some(e) = &c.new else { continue };
-                let k = lines.key_of(&c.path, e);
-                if fresh.contains(k) {
-                    let p = plans.entry(k.to_string()).or_default();
-                    let (t, b) = textlike(e);
-                    p.docs += 1;
-                    p.text_docs += t;
-                    p.text_bytes += b;
-                    p.adds.push((c.path.clone(), e.clone()));
-                }
-            }
-        }
-        // A new branch takes the default branch's shards as its own.
-        let mut touched: BTreeSet<String> = if head.is_none() { shards.keys().cloned().collect() } else { BTreeSet::new() };
-        for (k, mut p) in plans {
-            p.adds.sort_by(|a, b| tree_cmp(&a.0, &b.0));
-            let segs = code_segments(src, &p.adds, p.dead, stats)?;
-            let s = shards.entry(k.clone()).or_default();
-            s.segments.extend(segs);
-            s.docs += p.docs;
-            s.text_docs += p.text_docs;
-            s.text_bytes += p.text_bytes;
-            s.dead += p.replaced;
-            compact(src, s, true, stats)?;
-            touched.insert(k);
-        }
-        let mut removed = removed;
-        let write: BTreeMap<String, Shard> = touched
-            .into_iter()
-            .filter_map(|k| match shards.get(&k) {
-                Some(s) if !s.segments.is_empty() => Some((k, s.clone())),
-                _ => {
-                    removed.push(k);
-                    None
-                }
-            })
-            .collect();
-        if commit(cx, pool, CODE, branch, head.as_ref().map(|h| h.version), &tip.hex(), &ident, branch, &write, &removed, None)? {
+            tx.commit().await?;
+            Ok(true)
+        })?;
+        if ok {
             return Ok(());
         }
     }
     Err(Error::busy())
+}
+
+fn prepare_code(cx: &Cx, g: &Graph, lines: &Lines, branch: &str, tip: ObjectId, default: &str, stats: &mut Stats) -> Result<Option<PreparedWrite>> {
+    let src = &cx.src;
+    let pool = &cx.hub().derive.db;
+    if withheld(g, &tip)? {
+        return Ok(None);
+    }
+    let ident = identity(lines);
+    let all: BTreeSet<String> = lines.all().into_iter().collect();
+    let (head, old) = read_state(cx, pool, CODE, branch, None)?;
+    if head.as_ref().is_some_and(|h| h.snapshot == tip.hex() && h.lines == ident) {
+        return Ok(None);
+    }
+    // Where to start: this branch's index under the same lines, else
+    // the default branch's, else nothing; under other lines, the
+    // shards whose keys are kept (the rest are built from the tip).
+    let (mut shards, base, fresh, removed): (BTreeMap<String, Shard>, Option<ObjectId>, BTreeSet<String>, Vec<String>) = match &head {
+        Some(h) if h.lines == ident => (old, Some(oid(&h.snapshot)?), BTreeSet::new(), Vec::new()),
+        Some(h) => {
+            let removed: Vec<String> = old.keys().filter(|k| !all.contains(*k)).cloned().collect();
+            let kept: BTreeMap<String, Shard> = old.into_iter().filter(|(k, _)| all.contains(k)).collect();
+            let fresh = all.iter().filter(|k| !kept.contains_key(*k)).cloned().collect();
+            (kept, Some(oid(&h.snapshot)?), fresh, removed)
+        }
+        None => {
+            let from_default = if branch != default {
+                let (dh, ds) = read_state(cx, pool, CODE, default, None)?;
+                dh.filter(|h| h.lines == ident).map(|h| (h, ds))
+            } else {
+                None
+            };
+            match from_default {
+                Some((dh, ds)) => (ds, Some(oid(&dh.snapshot)?), BTreeSet::new(), Vec::new()),
+                None => (BTreeMap::new(), None, all.clone(), Vec::new()),
+            }
+        }
+    };
+    let tip_tree = tree_of(src, &tip)?;
+    let mut plans: BTreeMap<String, Plan> = BTreeMap::new();
+    if let Some(b) = base {
+        let base_tree = tree_of(src, &b)?;
+        for c in changes::diff(src, base_tree, tip_tree)?.0 {
+            let ko = c.old.as_ref().map(|e| lines.key_of(&c.path, e).to_string()).filter(|k| !fresh.contains(k));
+            let kn = c.new.as_ref().map(|e| lines.key_of(&c.path, e).to_string()).filter(|k| !fresh.contains(k));
+            if let (Some(k), Some(e)) = (&ko, &c.old) {
+                let p = plans.entry(k.clone()).or_default();
+                let (t, b) = textlike(e);
+                p.docs -= 1;
+                p.text_docs -= t;
+                p.text_bytes -= b;
+                p.replaced += 1;
+                if kn.as_ref() != Some(k) {
+                    p.dead.push(c.path.clone());
+                }
+            }
+            if let (Some(k), Some(e)) = (&kn, &c.new) {
+                let p = plans.entry(k.clone()).or_default();
+                let (t, b) = textlike(e);
+                p.docs += 1;
+                p.text_docs += t;
+                p.text_bytes += b;
+                p.adds.push((c.path.clone(), e.clone()));
+            }
+        }
+    }
+    if !fresh.is_empty() {
+        for k in &fresh {
+            shards.remove(k);
+        }
+        for c in changes::diff(src, empty_tree_id(), tip_tree)?.0 {
+            let Some(e) = &c.new else { continue };
+            let k = lines.key_of(&c.path, e);
+            if fresh.contains(k) {
+                let p = plans.entry(k.to_string()).or_default();
+                let (t, b) = textlike(e);
+                p.docs += 1;
+                p.text_docs += t;
+                p.text_bytes += b;
+                p.adds.push((c.path.clone(), e.clone()));
+            }
+        }
+    }
+    // A new branch takes the default branch's shards as its own.
+    let mut touched: BTreeSet<String> = if head.is_none() { shards.keys().cloned().collect() } else { BTreeSet::new() };
+    for (k, mut p) in plans {
+        p.adds.sort_by(|a, b| tree_cmp(&a.0, &b.0));
+        let segs = code_segments(src, &p.adds, p.dead, stats)?;
+        let s = shards.entry(k.clone()).or_default();
+        s.segments.extend(segs);
+        s.docs += p.docs;
+        s.text_docs += p.text_docs;
+        s.text_bytes += p.text_bytes;
+        s.dead += p.replaced;
+        compact(src, s, true, stats)?;
+        touched.insert(k);
+    }
+    let mut removed = removed;
+    let write: BTreeMap<String, Shard> = touched
+        .into_iter()
+        .filter_map(|k| match shards.get(&k) {
+            Some(s) if !s.segments.is_empty() => Some((k, s.clone())),
+            _ => {
+                removed.push(k);
+                None
+            }
+        })
+        .collect();
+    Ok(Some(PreparedWrite::new(
+        CODE,
+        branch,
+        head.as_ref().map(|h| h.version),
+        &tip.hex(),
+        &ident,
+        branch,
+        &write,
+        removed,
+        None,
+    )))
 }
 
 /// The snapshots below `tip` (itself included) that are not below any of
@@ -907,78 +953,56 @@ fn introduced(cx: &Cx, g: &Graph, s: &ObjectId) -> Result<Vec<(String, TreeEntry
 
 /// Add to the names index every path the snapshots `tip` brought hold.
 fn names(cx: &Cx, lines: &Lines, branch: &str, tip: ObjectId, default: &str, stats: &mut Stats) -> Result<()> {
-    let src = &cx.src;
     let pool = &cx.hub().derive.db;
     let g = Graph::new(cx);
-    if withheld(&g, &tip)? {
-        return Ok(());
+    for _ in 0..8 {
+        let Some(w) = prepare_names(cx, &g, lines, branch, tip, default, stats)? else {
+            return Ok(());
+        };
+        let ok = cx.db(|| async {
+            let mut tx = pool.begin().await?;
+            if !apply_write(&mut tx, cx.project(), &w).await? {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            tx.commit().await?;
+            Ok(true)
+        })?;
+        if ok {
+            return Ok(());
+        }
+    }
+    Err(Error::busy())
+}
+
+fn prepare_names(cx: &Cx, g: &Graph, lines: &Lines, branch: &str, tip: ObjectId, default: &str, stats: &mut Stats) -> Result<Option<PreparedWrite>> {
+    let src = &cx.src;
+    let pool = &cx.hub().derive.db;
+    if withheld(g, &tip)? {
+        return Ok(None);
     }
     let ident = identity(lines);
     let all: BTreeSet<String> = lines.all().into_iter().collect();
-    for _ in 0..8 {
-        let (head, old) = read_state(cx, pool, NAMES, "", None)?;
-        let walked = read_head(cx, pool, WALK, branch)?;
-        if head.as_ref().is_some_and(|h| h.lines == ident) && walked.as_ref().is_some_and(|w| w.snapshot == tip.hex()) {
-            return Ok(());
-        }
-        let mut shards = old.clone();
-        let mut touched: BTreeSet<String> = BTreeSet::new();
-        let mut removed: Vec<String> = Vec::new();
-        if head.as_ref().is_some_and(|h| h.lines != ident) {
-            // A new policy: shards of kept keys stay; new keys are built
-            // from every old name.
-            removed = old.keys().filter(|k| !all.contains(*k)).cloned().collect();
-            shards.retain(|k, _| all.contains(k));
-            let fresh: BTreeSet<String> = all.iter().filter(|k| !shards.contains_key(*k)).cloned().collect();
-            // Written every NAMES_HELD names, as the walk is, and one old
-            // segment loaded at a time.
-            let mut moved: BTreeMap<String, BTreeMap<String, u8>> = BTreeMap::new();
-            let mut held = 0usize;
-            let write = |moved: &mut BTreeMap<String, BTreeMap<String, u8>>, shards: &mut BTreeMap<String, Shard>, touched: &mut BTreeSet<String>, stats: &mut Stats| -> Result<()> {
-                for (k, m) in std::mem::take(moved) {
-                    let segs = name_segments(src, &m, stats)?;
-                    let s = shards.entry(k.clone()).or_default();
-                    s.docs += m.len() as i64;
-                    s.segments.extend(segs);
-                    compact(src, s, false, stats)?;
-                    touched.insert(k);
-                }
-                Ok(())
-            };
-            for s in old.values() {
-                for r in &s.segments {
-                    let seg = segment::load(src, &oid(&r.id)?)?;
-                    for d in &seg.docs {
-                        let k = lines.key_of(&d.path, &entry_of(d)).to_string();
-                        if fresh.contains(&k) && moved.entry(k).or_default().insert(d.path.clone(), d.flags).is_none() {
-                            held += 1;
-                        }
-                    }
-                    if held >= NAMES_HELD {
-                        write(&mut moved, &mut shards, &mut touched, stats)?;
-                        held = 0;
-                    }
-                }
-            }
-            write(&mut moved, &mut shards, &mut touched, stats)?;
-        }
-        let mut stops: Vec<ObjectId> = Vec::new();
-        if head.is_some() {
-            if let Some(w) = &walked {
-                stops.push(oid(&w.snapshot)?);
-            }
-            if branch != default {
-                if let Some(w) = read_head(cx, pool, WALK, default)? {
-                    stops.push(oid(&w.snapshot)?);
-                }
-            }
-        }
-        let new = rev_list(&g, tip, &stops)?;
-        stats.walked += new.len();
-        let mut gathered: BTreeMap<String, BTreeMap<String, u8>> = BTreeMap::new();
+    let (head, old) = read_state(cx, pool, NAMES, "", None)?;
+    let walked = read_head(cx, pool, WALK, branch)?;
+    if head.as_ref().is_some_and(|h| h.lines == ident) && walked.as_ref().is_some_and(|w| w.snapshot == tip.hex()) {
+        return Ok(None);
+    }
+    let mut shards = old.clone();
+    let mut touched: BTreeSet<String> = BTreeSet::new();
+    let mut removed: Vec<String> = Vec::new();
+    if head.as_ref().is_some_and(|h| h.lines != ident) {
+        // A new policy: shards of kept keys stay; new keys are built
+        // from every old name.
+        removed = old.keys().filter(|k| !all.contains(*k)).cloned().collect();
+        shards.retain(|k, _| all.contains(k));
+        let fresh: BTreeSet<String> = all.iter().filter(|k| !shards.contains_key(*k)).cloned().collect();
+        // Written every NAMES_HELD names, as the walk is, and one old
+        // segment loaded at a time.
+        let mut moved: BTreeMap<String, BTreeMap<String, u8>> = BTreeMap::new();
         let mut held = 0usize;
-        let flush = |gathered: &mut BTreeMap<String, BTreeMap<String, u8>>, shards: &mut BTreeMap<String, Shard>, touched: &mut BTreeSet<String>, stats: &mut Stats| -> Result<()> {
-            for (k, m) in std::mem::take(gathered) {
+        let write = |moved: &mut BTreeMap<String, BTreeMap<String, u8>>, shards: &mut BTreeMap<String, Shard>, touched: &mut BTreeSet<String>, stats: &mut Stats| -> Result<()> {
+            for (k, m) in std::mem::take(moved) {
                 let segs = name_segments(src, &m, stats)?;
                 let s = shards.entry(k.clone()).or_default();
                 s.docs += m.len() as i64;
@@ -988,29 +1012,128 @@ fn names(cx: &Cx, lines: &Lines, branch: &str, tip: ObjectId, default: &str, sta
             }
             Ok(())
         };
-        for s in &new {
-            if *s == root_snapshot_id() || g.get(s)?.flags & FLAG_EMBARGO_LINE != 0 {
-                continue;
-            }
-            for (path, e) in introduced(cx, &g, s)? {
-                let k = lines.key_of(&path, &e).to_string();
-                if gathered.entry(k).or_default().insert(path, flags_of(&e)).is_none() {
-                    held += 1;
+        for s in old.values() {
+            for r in &s.segments {
+                let seg = segment::load(src, &oid(&r.id)?)?;
+                for d in &seg.docs {
+                    let k = lines.key_of(&d.path, &entry_of(d)).to_string();
+                    if fresh.contains(&k) && moved.entry(k).or_default().insert(d.path.clone(), d.flags).is_none() {
+                        held += 1;
+                    }
+                }
+                if held >= NAMES_HELD {
+                    write(&mut moved, &mut shards, &mut touched, stats)?;
+                    held = 0;
                 }
             }
-            if held >= NAMES_HELD {
-                flush(&mut gathered, &mut shards, &mut touched, stats)?;
-                held = 0;
+        }
+        write(&mut moved, &mut shards, &mut touched, stats)?;
+    }
+    let mut stops: Vec<ObjectId> = Vec::new();
+    if head.is_some() {
+        if let Some(w) = &walked {
+            stops.push(oid(&w.snapshot)?);
+        }
+        if branch != default {
+            if let Some(w) = read_head(cx, pool, WALK, default)? {
+                stops.push(oid(&w.snapshot)?);
             }
         }
-        flush(&mut gathered, &mut shards, &mut touched, stats)?;
-        let write: BTreeMap<String, Shard> = touched.iter().filter_map(|k| shards.get(k).map(|s| (k.clone(), s.clone()))).collect();
-        let tip_hex = tip.hex();
-        if commit(cx, pool, NAMES, "", head.as_ref().map(|h| h.version), "", &ident, "", &write, &removed, Some((branch, &tip_hex)))? {
-            return Ok(());
+    }
+    let new = rev_list(g, tip, &stops)?;
+    stats.walked += new.len();
+    let mut gathered: BTreeMap<String, BTreeMap<String, u8>> = BTreeMap::new();
+    let mut held = 0usize;
+    let flush = |gathered: &mut BTreeMap<String, BTreeMap<String, u8>>, shards: &mut BTreeMap<String, Shard>, touched: &mut BTreeSet<String>, stats: &mut Stats| -> Result<()> {
+        for (k, m) in std::mem::take(gathered) {
+            let segs = name_segments(src, &m, stats)?;
+            let s = shards.entry(k.clone()).or_default();
+            s.docs += m.len() as i64;
+            s.segments.extend(segs);
+            compact(src, s, false, stats)?;
+            touched.insert(k);
+        }
+        Ok(())
+    };
+    for s in &new {
+        if *s == root_snapshot_id() || g.get(s)?.flags & FLAG_EMBARGO_LINE != 0 {
+            continue;
+        }
+        for (path, e) in introduced(cx, g, s)? {
+            let k = lines.key_of(&path, &e).to_string();
+            if gathered.entry(k).or_default().insert(path, flags_of(&e)).is_none() {
+                held += 1;
+            }
+        }
+        if held >= NAMES_HELD {
+            flush(&mut gathered, &mut shards, &mut touched, stats)?;
+            held = 0;
         }
     }
-    Err(Error::busy())
+    flush(&mut gathered, &mut shards, &mut touched, stats)?;
+    let write: BTreeMap<String, Shard> = touched.iter().filter_map(|k| shards.get(k).map(|s| (k.clone(), s.clone()))).collect();
+    let tip_hex = tip.hex();
+    Ok(Some(PreparedWrite::new(
+        NAMES,
+        "",
+        head.as_ref().map(|h| h.version),
+        "",
+        &ident,
+        "",
+        &write,
+        removed,
+        Some((branch, &tip_hex)),
+    )))
+}
+
+/// Prepare search index updates for a single-branch landing so they can commit
+/// in the deriver's single database transaction (BUG-1593). Returns `Ok(None)`
+/// if another branch is lagging or if multiple branches were moved, falling back
+/// to [`landed`].
+pub(crate) fn prepare_for_landing(
+    cx: &Cx,
+    g: &Graph,
+    lines: &Lines,
+    tips: &[(String, ObjectId)],
+) -> Result<Option<Vec<PreparedWrite>>> {
+    if tips.len() != 1 {
+        return Ok(None);
+    }
+    let (branch, tip) = &tips[0];
+    let pool = &cx.hub().derive.db;
+    let project = cx.project();
+    let ident = identity(lines);
+    let default: String = cx
+        .db(|| sqlx::query_scalar::<_, String>("SELECT default_branch FROM projects WHERE id = $1").bind(project).fetch_optional(pool))?
+        .unwrap_or_else(|| "main".into());
+    // If any OTHER branch is lagging or if the default branch is not yet indexed
+    // and we are landing on a non-default branch, fall back to `landed`.
+    let other_lagging: Option<String> = cx.db(|| {
+        sqlx::query_scalar(
+            "SELECT b.name FROM branches b \
+             LEFT JOIN search_heads c ON c.project_id = b.project_id AND c.kind = 'code' AND c.branch = b.name \
+             LEFT JOIN search_heads w ON w.project_id = b.project_id AND w.kind = 'walk' AND w.branch = b.name \
+             WHERE b.project_id = $1 AND b.name <> $2 AND b.hidden_for_embargo IS NULL \
+             AND (c.snapshot IS DISTINCT FROM b.target OR c.lines IS DISTINCT FROM $3 OR w.snapshot IS DISTINCT FROM b.target) \
+             LIMIT 1",
+        )
+        .bind(project)
+        .bind(branch)
+        .bind(&ident)
+        .fetch_optional(pool)
+    })?;
+    if other_lagging.is_some() {
+        return Ok(None);
+    }
+    let mut stats = Stats::default();
+    let mut out = Vec::with_capacity(2);
+    if let Some(w) = prepare_code(cx, g, lines, branch, *tip, &default, &mut stats)? {
+        out.push(w);
+    }
+    if let Some(w) = prepare_names(cx, g, lines, branch, *tip, &default, &mut stats)? {
+        out.push(w);
+    }
+    Ok(Some(out))
 }
 
 /// A tree entry standing for document `d` (its kind and whether it is

@@ -37,6 +37,7 @@ pub mod body;
 pub mod bucket;
 pub mod gate;
 pub mod health;
+pub mod landing;
 
 use std::{
     collections::HashMap,
@@ -71,6 +72,10 @@ pub struct Settings {
     /// Most bytes of request bodies held at once, and as many of answers
     /// being written.
     pub request_memory: u64,
+    /// Most queued landings waiting at once for one agent session.
+    pub max_session_outstanding: usize,
+    /// Most queued landings waiting at once for one person.
+    pub max_person_outstanding: usize,
 }
 
 impl Default for Settings {
@@ -82,6 +87,8 @@ impl Default for Settings {
             anonymous: Rate { per_second: 20, per_hour: 1000 },
             max_connections: 1024,
             request_memory: 512 << 20,
+            max_session_outstanding: landing::MAX_SESSION_OUTSTANDING,
+            max_person_outstanding: landing::MAX_PERSON_OUTSTANDING,
         }
     }
 }
@@ -152,6 +159,9 @@ impl Drop for Slot {
 pub struct Limits {
     pub settings: Settings,
     devices: Buckets,
+    /// Per-person umbrella bucket at ten times [`Settings::device`]'s rate
+    /// (`docs/HUB.md` §13.25, §13.32).
+    people: Buckets,
     addresses: Buckets,
     /// Session lookups per address (tokens this server does not know yet),
     /// at the device rate: a restarted server's people behind one address
@@ -173,9 +183,14 @@ impl Limits {
     /// connections.
     pub fn new(settings: Settings, db_connections: u32) -> Limits {
         let n = db_connections.max(2) as usize;
+        let person_rate = Rate {
+            per_second: settings.device.per_second.saturating_mul(10),
+            per_hour: settings.device.per_hour.saturating_mul(10),
+        };
         Limits {
             settings,
             devices: Buckets::new(settings.device),
+            people: Buckets::new(person_rate),
             addresses: Buckets::new(settings.anonymous),
             lookups: Buckets::new(settings.device),
             bodies: body::Pools::new(settings.request_memory),
@@ -220,11 +235,16 @@ impl Limits {
 /// The longest one derive run waits for the server to stop shedding.
 pub const DERIVE_PAUSE: Duration = Duration::from_secs(10);
 
+type Places = Arc<Mutex<Option<(Option<gate::Place>, gate::Place)>>>;
+
 tokio::task_local! {
     /// The bulkhead places held by the request being served: dropped when
     /// the route answers, or sooner ([`leave_gates`]) before a wait for
     /// something other than the request's own work (BUG-1635).
-    static PLACES: std::cell::RefCell<Option<(Option<gate::Place>, gate::Place)>>;
+    static PLACES: Places;
+    /// The landing queue bounds (`(max_session_outstanding, max_person_outstanding)`)
+    /// of the server handling the current request.
+    pub(crate) static BOUNDS: std::cell::Cell<(usize, usize)>;
 }
 
 /// Give back the bulkhead places of the request being served before it
@@ -232,8 +252,19 @@ tokio::task_local! {
 /// ticket, BUG-1635; nothing outside a request).
 pub fn leave_gates() {
     let _ = PLACES.try_with(|p| {
-        p.borrow_mut().take();
+        p.lock().unwrap().take();
     });
+}
+
+/// Carry the current request's landing bounds and bulkhead places into a
+/// spawned task that finishes the request's own work (`sync::push_with`,
+/// BUG-1668).
+pub fn in_request<F: std::future::Future>(hub: &crate::Hub, f: F) -> impl std::future::Future<Output = F::Output> {
+    let bounds = BOUNDS
+        .try_with(|b| b.get())
+        .unwrap_or_else(|_| landing::settings_bounds(&hub.limits.settings));
+    let places = PLACES.try_with(|p| p.clone()).unwrap_or_default();
+    BOUNDS.scope(std::cell::Cell::new(bounds), PLACES.scope(places, f))
 }
 
 /// `s` percent-decoded, as the routes' `Path` decodes it; `None` if it does
@@ -337,42 +368,49 @@ fn grant(hub: &HubState, token: &str) -> Option<(Option<Key>, String)> {
 /// once the body is read.
 async fn who(hub: &HubState, parts: &mut axum::http::request::Parts, address: Key, deferred: bool, free: bool) -> Result<Who, Duration> {
     let limits = &hub.limits;
-    let charge = |device: Option<Key>| -> Result<(), Duration> {
+    let charge = |device: Option<Key>, person: Option<i64>| -> Result<(), Duration> {
         match (free, device) {
             (true, _) => Ok(()),
-            (false, Some(d)) => limits.devices.take(d),
+            (false, Some(d)) => {
+                limits.devices.take(d)?;
+                if let Some(pid) = person {
+                    limits.people.take(Key::Person(pid))?;
+                }
+                Ok(())
+            }
             (false, None) => limits.addresses.take(address),
         }
     };
     if let Some(token) = parts.headers.get(header::AUTHORIZATION).and_then(|a| a.to_str().ok()).and_then(|a| a.strip_prefix("Bearer ")) {
         let now = veil_core::now_millis();
-        if let Some(e) = hub.caches.session(&crate::auth::token_hash(token)).filter(|e| e.expires_at > now) {
-            if let Some(d) = Key::device(&e.person.device_key) {
-                charge(Some(d))?;
+        if let Some(e) = hub.caches.session(&crate::auth::session_hash(token)).filter(|e| e.expires_at > now) {
+            if let Some(d) = Key::of_person(&e.person) {
+                charge(Some(d), Some(e.person.id))?;
                 return Ok(Who { device: Some(d), person: Some((e.person.clone(), e.epoch)), grant: None });
             }
         }
         // Not known here yet (another server's, a restart, an evicted entry,
         // or not a session): looked up as the route would (which caches it),
         // under the address's rate of lookups; a session found pays its
-        // device, anything else the address (BUG-1338).
+        // device (or agent session) and person, anything else the address (BUG-1338).
         limits.lookups.take(address)?;
         let found = <crate::auth::Caller as axum::extract::FromRequestParts<HubState>>::from_request_parts(parts, hub).await.ok();
         let person = found.and_then(|c| c.person.map(|p| (p, c.epochs.person)));
-        let device = person.as_ref().and_then(|(p, _)| Key::device(&p.device_key));
-        charge(device)?;
+        let device = person.as_ref().and_then(|(p, _)| Key::of_person(p));
+        let pid = person.as_ref().map(|(p, _)| p.id);
+        charge(device, pid)?;
         return Ok(Who { device, person: person.filter(|_| device.is_some()), grant: None });
     }
     if let Some(g) = parts.headers.get("veil-grant").and_then(|g| g.to_str().ok()) {
         if let Some((device, project)) = grant(hub, g) {
-            charge(device)?;
+            charge(device, None)?;
             return Ok(Who { device, person: None, grant: Some(project) });
         }
     }
     if deferred {
         return Ok(Who::default());
     }
-    charge(None)?;
+    charge(None, None)?;
     Ok(Who::default())
 }
 
@@ -509,13 +547,17 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
     // under the answers' budget.
     let mut req = Request::from_parts(parts, Body::from(bytes));
     req.extensions_mut().insert(answers::For(body_key));
-    let (resp, layers) = PLACES
+    let bounds = landing::settings_bounds(&limits.settings);
+    let (resp, layers) = BOUNDS
         .scope(
-            std::cell::RefCell::new(Some((project_place, server_place))),
-            health::LAYERS.scope(std::cell::Cell::new(health::Counts::default()), async {
-                let r = next.run(req).await;
-                (r, health::LAYERS.with(|c| c.get()))
-            }),
+            std::cell::Cell::new(bounds),
+            PLACES.scope(
+                Arc::new(Mutex::new(Some((project_place, server_place)))),
+                health::LAYERS.scope(std::cell::Cell::new(health::Counts::default()), async {
+                    let r = next.run(req).await;
+                    (r, health::LAYERS.with(|c| c.get()))
+                }),
+            ),
         )
         .await;
     let resp = match limits.answers.budget(body_key, resp, class != Class::Write).await {

@@ -39,7 +39,16 @@ pub fn stats(ctx: &mut Ctx, a: &StatsArgs) -> Result<ExitCode> {
     };
     println!("{}", bold(&safe(v["project"].as_str().unwrap_or(""))));
     println!("{}", dim("on this server, since it started (last whole minute)"));
-    for (label, k) in [("requests", "requests"), ("rate-limited", "rate_limited"), ("busy (shed)", "busy"), ("timed out", "timeouts")] {
+    for (label, k) in [
+        ("requests", "requests"),
+        ("rate-limited", "rate_limited"),
+        ("busy (shed)", "busy"),
+        ("timed out", "timeouts"),
+        ("landings", "landings"),
+        ("batches", "landing_batches"),
+        ("conflicts", "landing_conflicts"),
+        ("rejected", "landing_rejected"),
+    ] {
         println!("  {label:<16} {:>10}  ({})", n("since_start", k), n("last_minute", k));
     }
     println!("  {:<16} {:>10}", "tips cache", rate("tips_hits", "tips_misses"));

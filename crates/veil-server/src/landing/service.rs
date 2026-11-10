@@ -145,6 +145,7 @@ struct Row {
     seq: i64,
     ticket: String,
     person: Person,
+    session: String,
     /// Each change with its base (`landing::stack`).
     stack: Vec<Entry>,
     /// The branch's lineage its stack was judged under.
@@ -164,6 +165,22 @@ struct RowMeta {
     change_id: Option<veil_core::ChangeId>,
     agent_session: Option<String>,
     epochs: (i64, i64),
+}
+
+impl crate::limits::landing::QueuedEntry for Row {
+    fn seq(&self) -> i64 {
+        self.seq
+    }
+    fn person_id(&self) -> i64 {
+        self.person.id
+    }
+    fn session_key(&self) -> &str {
+        if self.session.is_empty() {
+            &self.person.device_key
+        } else {
+            &self.session
+        }
+    }
 }
 
 /// Someone a projection is made for, now.
@@ -535,39 +552,40 @@ impl Service {
         })
     }
 
-    /// The ready rows, in order (reverts first: `priority DESC`), leaving out
-    /// those being committed.
+    /// The ready rows, leaving out those being committed: reverts first
+    /// (S20, `priority > 0`, in their order), then the rest in fair-share
+    /// order (`limits::landing::fair_batch`, S24 part B).
     async fn ready(&self, exclude: &HashSet<i64>) -> Result<Vec<Row>> {
-        type R = (i64, String, i64, String, String, String, i64, i64, i64, i64, Option<String>);
+        type R = (i64, String, i64, String, String, String, String, i64, i64, i64, i64, Option<String>, bool);
         let rows: Vec<R> = sqlx::query_as(
-            "SELECT seq, ticket, person_id, person_name, device_key, stack, lineage, person_epoch, project_epoch, merges, agent_session FROM landing_queue \
-             WHERE project_id = $1 AND branch = $2 AND state = 'queued' ORDER BY priority DESC, created_at, seq LIMIT $3",
+            "SELECT seq, ticket, person_id, person_name, device_key, session, stack, lineage, person_epoch, project_epoch, merges, agent_session, priority > 0 FROM landing_queue \
+             WHERE project_id = $1 AND branch = $2 AND state = 'queued' ORDER BY priority DESC, created_at, seq",
         )
         .bind(self.project)
         .bind(&self.branch)
-        .bind((MAX_BATCH + exclude.len()) as i64)
         .fetch_all(&self.hub.db)
         .await?;
-        let mut out = Vec::new();
-        for (seq, ticket, id, name, device_key, stack, lineage, pe, je, merges, agent_session) in rows {
-            if exclude.contains(&seq) {
-                continue;
-            }
-            out.push(Row {
+        let (mut reverts, mut all) = (Vec::new(), Vec::with_capacity(rows.len()));
+        for (seq, ticket, id, name, device_key, session, stack, lineage, pe, je, merges, agent_session, revert) in rows {
+            let into = if revert { &mut reverts } else { &mut all };
+            into.push(Row {
                 seq,
                 ticket,
                 person: Person { id, name, device_key, agent: None },
+                session,
                 stack: super::decode_stack(&stack)?,
                 lineage,
                 epochs: (pe, je),
                 merges: merges.max(0) as u32,
                 agent_session,
             });
-            if out.len() == MAX_BATCH {
-                break;
-            }
         }
-        Ok(out)
+        // Reverts are never held back by fair sharing (S20).
+        reverts.retain(|r| !exclude.contains(&r.seq));
+        reverts.truncate(MAX_BATCH);
+        let rest = MAX_BATCH - reverts.len();
+        reverts.extend(crate::limits::landing::fair_batch(all, exclude, rest));
+        Ok(reverts)
     }
 
     /// The project's view keys (what `derive::memo_tips` keeps warm): each
@@ -1141,12 +1159,24 @@ impl Service {
             crate::derive::landed(hub, self.project, vec![self.branch.clone()]);
         }
         let st = &hub.landing.stats;
+        let conflicts = b.outcomes.iter().filter(|o| matches!(o, Outcome::Conflict(_))).count() as u64;
+        let rejected = b.outcomes.iter().filter(|o| matches!(o, Outcome::Rejected(_))).count() as u64;
         st.kept.store(b.after.keys.len() as u64, Ordering::Relaxed);
         st.batches.fetch_add(1, Ordering::Relaxed);
         st.landed.fetch_add(landed as u64, Ordering::Relaxed);
-        st.conflicts.fetch_add(b.outcomes.iter().filter(|o| matches!(o, Outcome::Conflict(_))).count() as u64, Ordering::Relaxed);
-        st.rejected.fetch_add(b.outcomes.iter().filter(|o| matches!(o, Outcome::Rejected(_))).count() as u64, Ordering::Relaxed);
+        st.conflicts.fetch_add(conflicts, Ordering::Relaxed);
+        st.rejected.fetch_add(rejected, Ordering::Relaxed);
         st.commit_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        hub.limits.health.record(
+            self.project,
+            &crate::limits::health::Counts {
+                landings: landed as u64,
+                landing_batches: 1,
+                landing_conflicts: conflicts,
+                landing_rejected: rejected,
+                ..Default::default()
+            },
+        );
         for outcome in &b.outcomes {
             if let Outcome::Merging(job) = outcome {
                 super::merge::spawn(hub, job.clone());
