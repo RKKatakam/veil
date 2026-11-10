@@ -1051,6 +1051,11 @@ pub(crate) async fn create_with(
                 }
                 return Err(bad(msg));
             }
+            let default_tip = tip(hub, project.id, &project.default_branch).await?;
+            let protected = sync::blocking(hub, project.id, move |src| crate::landing::protected(src, default_tip)).await?;
+            if protected.contains(&q.branch) {
+                crate::prs::check_landing_review(hub, &who.project, &who.viewer, &q.branch, &q.stack).await?;
+            }
         }
         // The branch rules: a move of the default branch changes them only
         // for an admin, judged against its tip (BUG-1102).

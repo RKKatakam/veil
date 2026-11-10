@@ -588,7 +588,6 @@ fn pr_reviews_and_the_gate() {
     let v = review(&p.admin, 1, &patch1, "approve", sign(&p.admin, 1, &patch1, "approve")).unwrap();
     assert_eq!(v["review"]["approvals"], 1);
     assert_eq!(v["review"]["ready"], true);
-    assert!(matches!(land(&p.dev), Err(Error::Api { code: "landing_unavailable", .. })), "ready; S17 lands it");
     // Revision 2 adds a change that changes the file again: the approval
     // is dismissed (threat 15).
     write_files(&dev_dir, &[("src/review-me.rs", "fn review_me() { changed() }\n")]);
@@ -635,7 +634,8 @@ fn pr_reviews_and_the_gate() {
     let v = th.rt.block_on(prs::show(&hub, &ask_of(&p.dev), &id)).unwrap();
     assert_eq!(v["review"]["approvals"], 0, "an agent's approval does not count for normal risk: {v}");
     review(&p.admin, 2, &patch2, "approve", sign(&p.admin, 2, &patch2, "approve")).unwrap();
-    assert!(matches!(land(&p.dev), Err(Error::Api { code: "landing_unavailable", .. })));
+    let v = th.rt.block_on(prs::show(&hub, &ask_of(&p.dev), &id)).unwrap();
+    assert_eq!(v["review"]["ready"], true);
     // The same PR at high risk: the agent's approval no longer counts.
     set_risk("high");
     let v = th.rt.block_on(prs::show(&hub, &ask_of(&p.dev), &id)).unwrap();
@@ -779,12 +779,12 @@ fn vl_pr_commands() {
     // The admin reviews from their own clone (their device signs it).
     let r = p.admin.fails(&p.dir, &["pr", "land", &id]);
     assert!(r.contains("not ready") || r.contains("not_ready"), "{r}");
-    p.admin.ok(&p.dir, &["pr", "review", &id, "--approve", "-m", "good"]);
-    let r = p.admin.fails(&p.dir, &["pr", "land", &id]);
-    assert!(r.contains("landing service"), "{r}");
     // The author cannot approve their own.
     let r = p.dev.fails(&dev_dir, &["pr", "review", &id, "--approve"]);
     assert!(r.contains("someone else"), "{r}");
+    p.admin.ok(&p.dir, &["pr", "review", &id, "--approve", "-m", "good"]);
+    let landed = p.admin.ok(&p.dir, &["pr", "land", &id]);
+    assert!(landed.contains("Landed") && landed.contains(&id), "{landed}");
     // A PR touching billing too: finance and admins see it; the dev's list,
     // count and search do not hold it, and its id is no PR for them.
     write_files(&p.dir, &[("src/both.rs", "fn both() {}\n"), (&format!("{BILL_DIR}/both.txt"), "billing side\n")]);
@@ -3527,11 +3527,9 @@ mod s21_redesign_cycle3 {
         }
     }
 
-    /// Guarantee 5: landing is S17's, and nothing half-built is reachable.
-    /// A ready PR (checks-only, as the admins list `docs/**`) answers
-    /// `landing_unavailable` to its author and to an admin; the target does
-    /// not move and the PR stays open. A held or unapproved PR answers
-    /// `not_ready`.
+    /// Guarantee 5: landing goes through S17's landing service. A held or
+    /// unapproved PR answers `not_ready`, while a ready PR lands onto the
+    /// target branch and marks the PR `landed`.
     #[test]
     fn a_ready_pr_lands_nothing_until_s17() {
         let th = TestHub::start();
@@ -3551,23 +3549,21 @@ mod s21_redesign_cycle3 {
         let s2 = h.commit(&th, &[b], f, [3; 16], 3_000, None);
         h.set_branch(&th, "code", s2);
         let (author, name) = person_row(&th, "author");
+        th.rt.block_on(sqlx::query("INSERT INTO project_admins (project_id, person_id) VALUES ($1, $2)").bind(h.id).bind(author).execute(&h.hub.db)).unwrap();
         let a = ask_as(&th, &h, &admin_of(author));
         let me = caller(author, &name);
         let v = th.rt.block_on(prs::create(&h.hub, &a, &me, CreatePr { head: "docs".into(), title: "docs".into(), ..Default::default() })).unwrap();
         let id = pr_id(v.clone());
         assert_eq!((v["risk"].as_str(), v["review"]["ready"].as_bool()), (Some("checks-only"), Some(true)), "{v}");
-        let (other, other_name) = person_row(&th, "admin");
-        for (ask, who) in [(&a, &me), (&ask_as(&th, &h, &admin_of(other)), &caller(other, &other_name))] {
-            let r = th.rt.block_on(prs::land(&h.hub, ask, who, &id));
-            assert!(matches!(r, Err(Error::Api { code: "landing_unavailable", .. })), "ready, and nothing lands it yet: {r:?}");
-        }
-        let tip: String = th.rt.block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'main'").bind(h.id).fetch_one(&h.hub.db)).unwrap();
-        assert_eq!(tip, b.hex(), "main did not move");
-        let v = th.rt.block_on(prs::show(&h.hub, &a, &id)).unwrap();
-        assert_eq!(v["state"], "open", "{v}");
         let code = pr_id(th.rt.block_on(prs::create(&h.hub, &a, &me, CreatePr { head: "code".into(), title: "code".into(), ..Default::default() })).unwrap());
         let r = th.rt.block_on(prs::land(&h.hub, &a, &me, &code));
         assert!(matches!(r, Err(Error::Api { code: "not_ready", .. })), "normal risk with no approval: {r:?}");
+        let tip: String = th.rt.block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'main'").bind(h.id).fetch_one(&h.hub.db)).unwrap();
+        assert_eq!(tip, b.hex(), "main did not move on not_ready");
+        let landed = th.rt.block_on(prs::land(&h.hub, &a, &me, &id)).unwrap();
+        assert_eq!(landed["state"], "landed", "{landed}");
+        let tip: String = th.rt.block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'main'").bind(h.id).fetch_one(&h.hub.db)).unwrap();
+        assert_ne!(tip, b.hex(), "main moved when the ready PR landed");
     }
 
     /// Guarantee 2: a request for changes given after an approval holds the
@@ -4037,9 +4033,9 @@ mod s21_c4 {
         let me = caller(author, &name);
         let a = ask_as(&th, &h, &admin_of(author));
         let id = pr_id(th.rt.block_on(prs::create(&h.hub, &a, &me, CreatePr { head: "docs".into(), title: "searchable-7f3a".into(), ..Default::default() })).unwrap());
-        // Under lenient rules, rev 1 is checks-only and `land` reaches landing_unavailable.
-        let r = th.rt.block_on(prs::land(&h.hub, &a, &me, &id));
-        assert!(matches!(r, Err(Error::Api { code: "landing_unavailable", .. })), "ready under lenient rules: {r:?}");
+        // Under lenient rules, rev 1 is checks-only and ready.
+        let v1 = th.rt.block_on(prs::show(&h.hub, &a, &id)).unwrap();
+        assert_eq!((v1["risk"].as_str(), v1["review"]["ready"].as_bool()), (Some("checks-only"), Some(true)), "{v1}");
         // Add revision 2 (touches docs/guide.md and pub/auth/login.rs: normal under lenient rules).
         let v = th.rt.block_on(prs::add_revision(&h.hub, &a, &me, &id, RevisionRequest { head: s2.hex() })).unwrap();
         assert_eq!((v["risk"].as_str(), v["revisions"][0]["risk"].as_str(), v["revisions"][1]["risk"].as_str()), (Some("normal"), Some("checks-only"), Some("normal")));
@@ -4111,7 +4107,8 @@ mod s21_c4 {
     /// answered `busy` (503) and the branch does not move.
     #[test]
     fn merge_check_past_underived_bound_answers_busy() {
-        let th = TestHub::start();
+        let url = std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL");
+        let th = TestHub::start_with_s3(&url, std::time::Duration::from_secs(3600), None);
         let p = setup_project(&th);
         let api = th.api();
         let mut f = Craft::new(&api, &p.dev, &p.name, "main");
@@ -4124,29 +4121,24 @@ mod s21_c4 {
         let line = first_parents(&api, &token, &p.name, tip, 2);
         let t = line[0].0;
         let t_tree = line[0].1.tree;
+        let c0 = line[1].0;
         let atoken = p.admin.token();
         let atip = api.tips(Some(&atoken), &p.name).unwrap().branches["main"];
         let aline = first_parents(&api, &atoken, &p.name, atip, 2);
         let (a0, a0_tree) = (aline[1].0, aline[1].1.tree);
         let hub = th.hub();
         let pid: i64 = th.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hub.db)).unwrap();
-        // A dense DAG of 6,260 snapshots above `a0`, each naming the 16
-        // previous snapshots as parents, with no `commit_graph` rows yet:
-        // DFS pushes 16 `(p, None)` entries per expanded node before any
-        // ancestor gets its row, so ~6,251 nodes reach 100,001 `rows.read`
-        // visits while creating only 6,260 objects.
-        let mut dag = vec![a0];
-        let mut objects = Vec::with_capacity(6_260);
-        let mut ids = Vec::with_capacity(6_260);
-        for i in 0..6_260u64 {
-            // Order parents oldest-first so `stack.extend(s.parents)` places
-            // `dag[i]` on top of the stack: DFS expands `dag[6259]`, `dag[6258]`,
-            // ... in descending order, pushing 16 `(p, None)` entries per node
-            // before any ancestor reaches `Some(s)`. ~6,251 nodes reach 100,001
-            // `rows.read` visits in ~1 second.
-            let parents: Vec<ObjectId> = dag.iter().rev().take(16).copied().rev().collect();
+        // A chain of 100,015 snapshots above `a0` with no `commit_graph` rows
+        // yet: `u_small` (depth 10) is well within `UNDERIVED_ROWS` (100,000),
+        // while `u_past_bound` (depth 100,015) leaves > 100,000 underived
+        // snapshots even after `u_small` is derived.
+        let total = 100_015usize;
+        let mut dag = Vec::with_capacity(total + 1);
+        dag.push(a0);
+        let mut objects = Vec::with_capacity(total);
+        for i in 0..total {
             let s = Snapshot {
-                parents,
+                parents: vec![*dag.last().unwrap()],
                 change_id: veil_core::ChangeId::random(),
                 tree: a0_tree,
                 description: Text::Plain(format!("u{i}")),
@@ -4162,20 +4154,52 @@ mod s21_c4 {
             };
             let raw = Object::Snapshot(s).encode();
             let id = ObjectId::hash(&raw);
-            objects.push((id, bytes::Bytes::from(raw)));
-            ids.push(id.hex());
+            objects.push((id, raw));
             dag.push(id);
         }
+        let obj_root = th._dir.path().join("objects");
+        for b in 0..=255u8 {
+            std::fs::create_dir_all(obj_root.join(format!("p/{pid}/{b:02x}"))).unwrap();
+        }
+        std::thread::scope(|s| {
+            for chunk in objects.chunks(objects.len().div_ceil(8)) {
+                let obj_root = &obj_root;
+                let hub = &hub;
+                let rt = th.rt.handle();
+                s.spawn(move || {
+                    for (id, raw) in chunk {
+                        std::fs::write(obj_root.join(veil_server::store::object_key(pid, id)), raw).unwrap();
+                        hub.objects.get_blocking(rt, pid, id).unwrap();
+                    }
+                });
+            }
+        });
         let u_small = dag[10];
         let u_past_bound = *dag.last().unwrap();
+        let small_ids: Vec<String> = dag[1..=10].iter().map(|id| id.hex()).collect();
         th.rt.block_on(async {
-            veil_server::sync::put_all(&hub, pid, objects).await.unwrap();
             sqlx::query("INSERT INTO snapshots (project_id, id) SELECT $1, x FROM UNNEST($2::text[]) AS x ON CONFLICT DO NOTHING")
                 .bind(pid)
-                .bind(&ids)
+                .bind(&small_ids)
                 .execute(&hub.db)
                 .await
                 .unwrap();
+            let vk: String = sqlx::query_scalar("SELECT view_key FROM projections WHERE project_id = $1 AND projected_id = $2 LIMIT 1")
+                .bind(pid)
+                .bind(c0.hex())
+                .fetch_one(&hub.db)
+                .await
+                .unwrap();
+            for (r, p) in dag[1..=10].iter().map(|u| (*u, *u)).chain([(u_past_bound, u_past_bound)]) {
+                sqlx::query("INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) VALUES ($1, $2, $3, $4, 0, false) ON CONFLICT DO NOTHING")
+                    .bind(pid)
+                    .bind(&vk)
+                    .bind(r.hex())
+                    .bind(p.hex())
+                    .execute(&hub.db)
+                    .await
+                    .unwrap();
+            }
         });
         // Merge of `t` and `u_small` (well within UNDERIVED_ROWS) keeping `t`'s tree: accepted.
         let mut c = Craft::new(&api, &p.carol, &p.name, "main");
@@ -4202,5 +4226,448 @@ mod s21_c4 {
     fn bug_1426_pr_speed_uses_dropped_prs_risk_column() {
         super::pr_speed();
     }
-}
 
+    fn put(path: &str, text: &str) -> Value {
+        json!({"path": path, "put": {"text": text}})
+    }
+
+    /// Guarantee 1 (S11): every PR route (open, update, comment, approve,
+    /// list, show, diff, search) is classified and narrowed: a narrowed agent
+    /// session sees and changes PRs only within its paths, and an agent
+    /// session never approves.
+    #[test]
+    fn s11_narrowed_agent_session_sees_and_changes_prs_only_within_its_paths_and_never_approves() {
+        let th = TestHub::start();
+        let p = setup_project(&th);
+        let api = th.api();
+        let dev_tok = p.dev.token();
+        let admin_tok = p.admin.token();
+
+        let make_agent = |tok: &str, only: Option<&[&str]>| -> String {
+            let mut body = json!({
+                "project": p.name,
+                "attribution": {"agent": "claude-code/2.3", "task": "S21-S11"},
+            });
+            if let Some(o) = only {
+                body["only"] = json!(o);
+            }
+            let r = api.post_json(Some(tok), "/v1/sessions/agent", &body);
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            r.json()["token"].as_str().unwrap().to_string()
+        };
+
+        let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+        let commit_branch = |branch: &str, path: &str, content: &str| -> ObjectId {
+            let r = api.post_json(
+                Some(&dev_tok),
+                &format!("/v1/projects/{}/changes", p.name),
+                &json!({"base": base.hex(), "edits": [put(path, content)]}),
+            );
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            let snap: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+            let pr = api.post_json(
+                Some(&dev_tok),
+                &format!("/v1/projects/{}/push", p.name),
+                &json!({"updates": [{"branch": branch, "expected": null, "new": snap.hex()}], "force": false}),
+            );
+            assert_eq!(pr.status, 200, "{}", String::from_utf8_lossy(&pr.body));
+            assert_eq!(pr.json()["results"][0]["ok"], true);
+            snap
+        };
+
+        commit_branch("in-scope", "src/allowed/mod.rs", "pub fn allowed() -> i32 { 1 }\n");
+        commit_branch("in-scope-v2", "src/allowed/mod.rs", "pub fn allowed() -> i32 { 2 }\n");
+        commit_branch("out-scope", "src/other/mod.rs", "pub fn other() -> i32 { 1 }\n");
+
+        let narrowed_dev = make_agent(&dev_tok, Some(&["src/allowed"]));
+        let narrowed_admin = make_agent(&admin_tok, Some(&["src/allowed"]));
+        let unnarrowed_admin = make_agent(&admin_tok, None);
+
+        // 1. Open PR within narrowed paths succeeds; outside narrowed paths is refused with 403 agent_session.
+        let r = api.post_json(
+            Some(&narrowed_dev),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "in-scope", "title": "searchable-allowed-pr"}),
+        );
+        assert_eq!(r.status, 200, "narrowed agent opens PR inside its paths: {}", String::from_utf8_lossy(&r.body));
+        let in_id = r.json()["id"].as_str().unwrap().to_string();
+
+        let r = api.post_json(
+            Some(&narrowed_dev),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "out-scope", "title": "searchable-outside-pr"}),
+        );
+        assert_eq!(r.status, 403, "narrowed agent cannot open PR outside its paths: {}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["code"], "agent_session");
+
+        // Person opens the out-of-scope PR so we can verify visibility on show, list, search, diff, comment, update, review, close, land.
+        let r = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "out-scope", "title": "searchable-outside-pr"}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let out_id = r.json()["id"].as_str().unwrap().to_string();
+
+        // 2. List and search: person sees both; narrowed agent sees only `in_id`.
+        let full_list = api.get(Some(&dev_tok), &format!("/v1/projects/{}/prs", p.name)).json();
+        assert_eq!(full_list["count"], 2, "{full_list}");
+        let nar_list = api.get(Some(&narrowed_dev), &format!("/v1/projects/{}/prs", p.name)).json();
+        assert_eq!(nar_list["count"], 1, "narrowed list hides out-of-scope PR: {nar_list}");
+        assert_eq!(nar_list["prs"][0]["id"], in_id);
+
+        let nar_search = api.get(Some(&narrowed_dev), &format!("/v1/projects/{}/prs?q=searchable", p.name)).json();
+        assert_eq!(nar_search["count"], 1, "narrowed search hides out-of-scope PR: {nar_search}");
+        assert_eq!(nar_search["prs"][0]["id"], in_id);
+
+        // 3. Show and diff: narrowed agent sees `in_id` and gets 404 on `out_id`.
+        let r = api.get(Some(&narrowed_dev), &format!("/v1/projects/{}/prs/{in_id}", p.name));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let r = api.get(Some(&narrowed_dev), &format!("/v1/projects/{}/prs/{in_id}/diff", p.name));
+        assert_eq!(r.status, 200, "narrowed diff succeeds on in-scope PR: {}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["files"][0]["path"], "src/allowed/mod.rs");
+
+        assert_eq!(api.get(Some(&narrowed_dev), &format!("/v1/projects/{}/prs/{out_id}", p.name)).status, 404);
+        assert_eq!(api.get(Some(&narrowed_dev), &format!("/v1/projects/{}/prs/{out_id}/diff", p.name)).status, 404);
+
+        // 4. Comment: narrowed agent comments on `in_id` (and on an in-scope line), refused on an out-of-scope path or `out_id`.
+        let r = api.post_json(
+            Some(&narrowed_dev),
+            &format!("/v1/projects/{}/prs/{in_id}/threads", p.name),
+            &json!({"body": "looks good", "anchor": {"path": "src/allowed/mod.rs", "start": 1, "end": 1, "side": "new"}}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let tid = r.json()["id"].as_str().unwrap().to_string();
+        let r = api.post_json(
+            Some(&narrowed_dev),
+            &format!("/v1/projects/{}/prs/{in_id}/threads/{tid}", p.name),
+            &json!({"body": "reply", "state": "resolved"}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+
+        let r = api.post_json(
+            Some(&narrowed_dev),
+            &format!("/v1/projects/{}/prs/{in_id}/threads", p.name),
+            &json!({"body": "outside path", "anchor": {"path": "src/other/mod.rs", "start": 1, "end": 1, "side": "new"}}),
+        );
+        assert_eq!(r.status, 403, "anchor outside narrowing refused: {}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["code"], "agent_session");
+        assert_eq!(
+            api.post_json(Some(&narrowed_dev), &format!("/v1/projects/{}/prs/{out_id}/threads", p.name), &json!({"body": "hi"})).status,
+            404
+        );
+
+        // 5. Update (add revision): narrowed agent updates `in_id` to `in-scope-v2`, refused if updating to `out-scope` or updating `out_id`.
+        let r = api.post_json(
+            Some(&narrowed_dev),
+            &format!("/v1/projects/{}/prs/{in_id}/revisions", p.name),
+            &json!({"head": "in-scope-v2"}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["revision"], 2);
+        let patch = r.json()["patch"].as_str().unwrap().to_string();
+
+        let r = api.post_json(
+            Some(&narrowed_dev),
+            &format!("/v1/projects/{}/prs/{in_id}/revisions", p.name),
+            &json!({"head": "out-scope"}),
+        );
+        assert_eq!(r.status, 403, "adding revision outside narrowing refused: {}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["code"], "agent_session");
+        assert_eq!(
+            api.post_json(Some(&narrowed_dev), &format!("/v1/projects/{}/prs/{out_id}/revisions", p.name), &json!({"head": "in-scope"})).status,
+            404
+        );
+
+        // 6. Review & approve: an agent session (narrowed or unnarrowed) NEVER approves, but may request-changes on an in-scope PR.
+        let sign_admin = |pr: &str, patch: &str, verdict: &str| -> String {
+            let msg = review_message(&p.name, pr, patch, verdict);
+            p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &msg)
+        };
+        for tok in [&narrowed_admin, &unnarrowed_admin] {
+            let sig = sign_admin(&in_id, &patch, "approve");
+            let r = api.post_json(
+                Some(tok),
+                &format!("/v1/projects/{}/prs/{in_id}/reviews", p.name),
+                &json!({"patch": patch, "verdict": "approve", "signature": sig}),
+            );
+            assert_eq!(r.status, 403, "agent session never approves: {}", String::from_utf8_lossy(&r.body));
+            assert_eq!(r.json()["code"], "agent_session");
+        }
+        // Request-changes from a narrowed agent session succeeds on `in_id` and records `agent: true`, and 404s on `out_id`.
+        let sig_rc = sign_admin(&in_id, &patch, "request-changes");
+        let r = api.post_json(
+            Some(&narrowed_admin),
+            &format!("/v1/projects/{}/prs/{in_id}/reviews", p.name),
+            &json!({"patch": patch, "verdict": "request-changes", "body": "fix edge case", "signature": sig_rc}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["review"]["reviews"][0]["agent"], true);
+
+        // Dismiss is person-only (`403 agent_session` for any agent session, `200` for the admin person).
+        let r = api.post_json(
+            Some(&unnarrowed_admin),
+            &format!("/v1/projects/{}/prs/{in_id}/reviews/dismiss", p.name),
+            &json!({"person": p.admin.name}),
+        );
+        assert_eq!(r.status, 403);
+        assert_eq!(r.json()["code"], "agent_session");
+        let r = api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/prs/{in_id}/reviews/dismiss", p.name),
+            &json!({"person": p.admin.name}),
+        );
+        assert_eq!(r.status, 200, "person admin dismisses: {}", String::from_utf8_lossy(&r.body));
+    }
+
+    /// Guarantee 2 (S17): a PR lands through the landing service (`vl pr land`
+    /// → S17), never by moving a branch itself, with `landing::agent_stack`'s
+    /// agent rules; and landing onto a protected branch meets the review rules
+    /// by every route: push, `POST …/land`, API commit with land, and PR land.
+    #[test]
+    fn s17_pr_lands_through_landing_service_and_protected_branch_meets_review_rules_by_every_route() {
+        let th = TestHub::start();
+        let p = setup_project(&th);
+        let api = th.api();
+        let dev_tok = p.dev.token();
+        let admin_tok = p.admin.token();
+
+        // Protect `main` with default review rules (normal risk needs 1 approval).
+        write_files(&p.dir, &[(".veilrules", "[branches.main]\nprotected = true\n")]);
+        p.admin.commit_main(&p.dir, "protect main with review rules");
+        p.admin.ok(&p.dir, &["push"]);
+
+        let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+        let r = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base.hex(), "edits": [put("src/feature.rs", "pub fn feat() {}\n")]}),
+        );
+        assert_eq!(r.status, 200);
+        let feat_snap: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+        let r = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "feat", "expected": null, "new": feat_snap.hex()}], "force": false}),
+        );
+        assert_eq!(r.json()["results"][0]["ok"], true);
+
+        // Open a PR for `feat` onto `main` (unapproved yet).
+        let pr = api
+            .post_json(
+                Some(&dev_tok),
+                &format!("/v1/projects/{}/prs", p.name),
+                &json!({"head": "feat", "title": "add feat"}),
+            )
+            .json();
+        let pr_id = pr["id"].as_str().unwrap().to_string();
+        let patch = pr["patch"].as_str().unwrap().to_string();
+        assert_eq!(pr["review"]["ready"], false);
+
+        // Before approval, landing onto protected `main` is refused on all 4 routes:
+        // Route 1: push onto `main`
+        let res = api
+            .post_json(
+                Some(&dev_tok),
+                &format!("/v1/projects/{}/push", p.name),
+                &json!({"updates": [{"branch": "main", "expected": base.hex(), "new": feat_snap.hex()}], "force": false}),
+            )
+            .json();
+        assert_eq!(res["results"][0]["ok"], false, "unapproved push to protected main refused: {res}");
+        assert!(res["results"][0]["message"].as_str().unwrap_or("").contains("not ready to land"), "{res}");
+
+        // Route 2: `POST …/land` with snapshot
+        let r = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/land", p.name),
+            &json!({"onto": "main", "snapshot": feat_snap.hex(), "wait": true}),
+        );
+        assert_eq!(r.status, 409, "unapproved POST /land snapshot refused: {}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["code"], "not_ready");
+
+        // Route 3: `POST …/land` with API commit edits
+        let r = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/land", p.name),
+            &json!({"onto": "main", "base": base.hex(), "edits": [put("src/direct.rs", "pub fn d() {}\n")], "wait": true}),
+        );
+        assert_eq!(r.status, 409, "unapproved POST /land edits refused: {}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["code"], "not_ready");
+
+        // Route 4: `POST …/prs/{id}/land`
+        let r = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_id}/land", p.name), &json!({}));
+        assert_eq!(r.status, 409, "unapproved PR land refused: {}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["code"], "not_ready");
+
+        assert_eq!(api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"], base, "main did not move");
+
+        // Admin approves the PR.
+        let sig = p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, &pr_id, &patch, "approve"));
+        let r = api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+            &json!({"patch": patch, "verdict": "approve", "signature": sig}),
+        );
+        assert_eq!(r.status, 200);
+        assert_eq!(r.json()["review"]["ready"], true);
+
+        // `landing::agent_stack` rules apply on `prs::land`: an agent session narrowed to `src/other` is refused.
+        let bad_agent = api
+            .post_json(
+                Some(&dev_tok),
+                "/v1/sessions/agent",
+                &json!({"project": p.name, "attribution": {"agent": "claude-code/2.3", "task": "S17-AGENT"}, "only": ["src/other"]}),
+            )
+            .json()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let r = api.post_json(Some(&bad_agent), &format!("/v1/projects/{}/prs/{pr_id}/land", p.name), &json!({}));
+        assert_eq!(r.status, 404, "narrowed agent outside PR paths cannot see or land it");
+
+        // Now `POST …/prs/{id}/land` (`vl pr land`) lands the PR through the landing service!
+        let batches_before = th.hub().landing.stats.batches.load(std::sync::atomic::Ordering::Relaxed);
+        let r = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_id}/land", p.name), &json!({}));
+        assert_eq!(r.status, 200, "approved PR lands via S17: {}", String::from_utf8_lossy(&r.body));
+        let landed = r.json();
+        assert_eq!(landed["state"], "landed", "{landed}");
+        assert_eq!(landed["landing"]["state"], "landed", "{landed}");
+        let batches_after = th.hub().landing.stats.batches.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(batches_after > batches_before, "PR landed through the S17 landing service");
+        let new_tip = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+        assert_ne!(new_tip, base, "main moved to the landed snapshot");
+    }
+
+    /// Guarantee 3 (S14 & S18): a PR's diff, blame, or conflict report never
+    /// names a path its viewer can't see.
+    #[test]
+    fn s14_s18_pr_diff_blame_and_conflict_report_never_name_a_hidden_path() {
+        let th = TestHub::start();
+        let p = setup_project(&th);
+        let api = th.api();
+        let dev_tok = p.dev.token();
+        let admin_tok = p.admin.token();
+
+        let secret_path = format!("{BILL_DIR}/secret-plan.txt");
+        write_files(&p.dir, &[(&secret_path, "top secret line\n"), ("src/shared.rs", "fn shared() { 0 }\n")]);
+        p.admin.commit_main(&p.dir, "seed secret and shared");
+        p.admin.ok(&p.dir, &["push"]);
+
+        // Dev edits `src/shared.rs` on branch `dev-pr` and opens a PR.
+        let base_dev = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+        let r = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base_dev.hex(), "edits": [put("src/shared.rs", "fn shared() { 1 }\n")]}),
+        );
+        assert_eq!(r.status, 200);
+        let dev_snap: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+        let r = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "dev-pr", "expected": null, "new": dev_snap.hex()}], "force": false}),
+        );
+        assert_eq!(r.json()["results"][0]["ok"], true);
+
+        let pr = api
+            .post_json(
+                Some(&dev_tok),
+                &format!("/v1/projects/{}/prs", p.name),
+                &json!({"head": "dev-pr", "title": "dev shared edit"}),
+            )
+            .json();
+        let pr_id = pr["id"].as_str().unwrap().to_string();
+        let patch = pr["patch"].as_str().unwrap().to_string();
+
+        // Diff and blame on the PR's head for `dev` succeed on `src/shared.rs` and never name `secret_path`.
+        let diff = api.get(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_id}/diff", p.name)).json();
+        assert_eq!(diff["files"].as_array().unwrap().len(), 1);
+        assert!(!diff.to_string().contains(&secret_path), "diff leaked hidden path: {diff}");
+
+        let blame = api.get(Some(&dev_tok), &format!("/v1/projects/{}/q/blame?rev=dev-pr&path=src/shared.rs", p.name));
+        assert_eq!(blame.status, 200, "{}", String::from_utf8_lossy(&blame.body));
+        assert!(!String::from_utf8_lossy(&blame.body).contains(&secret_path));
+        let hidden_blame = api.get(Some(&dev_tok), &format!("/v1/projects/{}/q/blame?rev=dev-pr&path={secret_path}", p.name));
+        assert_eq!(hidden_blame.status, 404, "blame on hidden path is 404");
+
+        // Now advance `main` with a conflicting edit to `src/shared.rs` AND an edit to `secret_path`,
+        // approve `dev`'s PR, and land it: the conflict report never names `secret_path`.
+        write_files(&p.dir, &[(&secret_path, "top secret v2\n"), ("src/shared.rs", "fn shared() { 2 }\n")]);
+        p.admin.commit_main(&p.dir, "conflicting main edit");
+        p.admin.ok(&p.dir, &["push"]);
+
+        let sig = p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, &pr_id, &patch, "approve"));
+        let r = api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+            &json!({"patch": patch, "verdict": "approve", "signature": sig}),
+        );
+        assert_eq!(r.status, 200);
+
+        let r = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_id}/land", p.name), &json!({}));
+        assert_eq!(r.status, 409, "conflicting PR land returns 409 conflict: {}", String::from_utf8_lossy(&r.body));
+        let body = String::from_utf8_lossy(&r.body);
+        assert!(!body.contains(&secret_path), "conflict report leaked hidden path: {body}");
+    }
+
+    /// Guarantee 4 (S24): PR routes that wait call `limits::leave_gates`, and
+    /// are bounded per person.
+    #[test]
+    fn s24_pr_land_wait_leaves_gates_and_is_bounded_per_person() {
+        let th = TestHub::start();
+        let hub = th.hub();
+        let p = setup_project(&th);
+        let pid: i64 = th.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hub.db)).unwrap();
+        let (dev_id, _) = person_row(&th, &p.dev.name);
+
+        // Enter `landing::wait` (which `prs::land` calls): verify `limits::leave_gates()`
+        // releases gates while waiting, and `MAX_WAITING_PER_PERSON` bounds waiters per person.
+        th.rt.block_on(async {
+            let mut waiters = Vec::new();
+            for i in 0..(veil_server::landing::MAX_WAITING_PER_PERSON + 2) {
+                let t = format!("t-s24-{i}");
+                waiters.push(hub.landing.register(&t));
+            }
+            let start = tokio::time::Instant::now();
+            let deadline = start + std::time::Duration::from_millis(200);
+            let mut handles = Vec::new();
+            for w in waiters {
+                let h = hub.clone();
+                handles.push(tokio::spawn(async move {
+                    let r = veil_server::landing::wait(&h, pid, dev_id, "main", w, deadline).await.unwrap();
+                    (r, start.elapsed())
+                }));
+            }
+            let mut results = Vec::new();
+            for h in handles {
+                let (r, elapsed) = h.await.unwrap();
+                assert_eq!(r.state, veil_core::hub::land::LandState::Queued);
+                results.push(elapsed);
+            }
+            let fast = results.iter().filter(|d| **d < std::time::Duration::from_millis(100)).count();
+            assert_eq!(fast, 2, "exactly the 2 waiters past MAX_WAITING_PER_PERSON answered immediately: {results:?}");
+        });
+    }
+
+    /// BUG-1730: `vl pr land` does not accept `--json` and in text mode prints
+    /// the raw `veil.pr/1` JSON object inside parentheses (`Landed <id> ({...})`).
+    #[test]
+    #[ignore = "BUG-1730: vl pr land prints raw JSON in text mode and lacks --json"]
+    fn bug_1730_vl_pr_land_prints_raw_json_and_lacks_json_flag() {
+        let th = TestHub::start();
+        let p = setup_project(&th);
+        let dev_dir = p.dev.dir("clone");
+        p.dev.clone_trusting(&th.url(&p.name), &dev_dir, &p.fp);
+        write_files(&dev_dir, &[("src/f.rs", "fn f() {}\n")]);
+        p.dev.ok(&dev_dir, &["commit", "--no-advance", "-m", "f"]);
+        p.dev.ok(&dev_dir, &["tag", "set", "f-b1", "-r", "@-"]);
+        p.dev.ok(&dev_dir, &["push"]);
+        let out = p.dev.ok(&dev_dir, &["pr", "create", "f-b1", "--title", "F", "--json"]);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let id = v["id"].as_str().unwrap();
+        p.admin.ok(&p.dir, &["pr", "review", id, "--approve"]);
+        let json_out = p.admin.ok(&p.dir, &["pr", "land", id, "--json"]);
+        let landed: Value = serde_json::from_str(&json_out).expect("vl pr land --json should emit valid JSON");
+        assert_eq!(landed["state"], "landed");
+    }
+}

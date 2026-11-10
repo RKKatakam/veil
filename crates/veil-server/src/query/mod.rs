@@ -1050,6 +1050,24 @@ pub async fn diff(hub: &Arc<Hub>, ask: &Ask, q: DiffParams, limits: Limits) -> R
     .await
 }
 
+/// The diff from `from` directly to `to` (projected ids of a PR revision or
+/// change whose paths the caller has already been checked to see).
+pub async fn diff_pr(hub: &Arc<Hub>, ask: &Ask, from: ObjectId, to: ObjectId, stat: Option<bool>, limits: Limits) -> Result<Value> {
+    let deadline = Instant::now() + limits.deadline;
+    let content = !stat.unwrap_or(false);
+    on_graph(hub, ask, deadline, move |g, t| {
+        let (old, new) = (t.root_of(&*g.get(&from)?)?, t.root_of(&*g.get(&to)?)?);
+        let mut v = t.diff(old, new, "", content, limits.diff)?;
+        v["schema"] = json!("veil.diff/2");
+        v["from"] = json!(from.hex());
+        v["to"] = json!(to.hex());
+        v["base"] = json!(from.hex());
+        v["merge_bases"] = json!(vec![from.hex()]);
+        Ok(v)
+    })
+    .await
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct AncestryRequest {
     pub pairs: Vec<(String, String)>,

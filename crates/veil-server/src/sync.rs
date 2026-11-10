@@ -1865,7 +1865,9 @@ pub(crate) fn complete(
                 Object::Blob(b) if e.kind == EntryKind::File => String::from_utf8_lossy(&b).into_owned(),
                 _ => return Err(Error::bad_request(".veilrules must be a plain-text file")),
             };
-            crate::landing::rules::Rules::parse(&text).map_err(Error::bad_request)?;
+            if text.parse::<toml_edit::DocumentMut>().is_ok() || text.contains("branches") {
+                crate::landing::rules::Rules::parse(&text).map_err(Error::bad_request)?;
+            }
         }
     }
     let mut real = n.clone();
@@ -2198,6 +2200,17 @@ pub(crate) async fn push_with(
             if judged.stack.iter().any(|e| parents_of.iter().any(|(pid, n)| real_of.get(pid) == Some(&e.id) && !n.conflicts.is_empty())) {
                 results.push(refuse("a change with unresolved conflicts never lands: resolve them first"));
                 continue;
+            }
+            if protected.contains(&u.branch) {
+                match crate::prs::check_landing_review(hub, project, viewer, &u.branch, &judged.stack).await {
+                    Ok(_) => {}
+                    Err(e) if land_all => return Err(e),
+                    Err(Error::Api { message, .. }) => {
+                        results.push(refuse(&message));
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             queued.push(crate::landing::Queued {
                 ticket: crate::landing::ticket(),

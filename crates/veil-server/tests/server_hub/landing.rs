@@ -388,7 +388,10 @@ fn protected_branches_move_only_by_landing_and_push_lands_instead() {
     let p = setup_project(&hub);
     let api = hub.api();
     // The admin protects main.
-    write_files(&p.dir, &[(".veilrules", "[branches.main]\nprotected = true\n")]);
+    write_files(
+        &p.dir,
+        &[(".veilrules", "[branches.main]\nprotected = true\n[review]\nnormal = { approvals = 0 }\nhigh = { approvals = 0 }\n")],
+    );
     p.admin.commit_main(&p.dir, "protect main");
     p.admin.ok(&p.dir, &["push"]);
     // Two clones of the dev's, made now.
@@ -622,7 +625,10 @@ fn bug_1102_a_merge_never_lets_a_non_admin_change_the_branch_rules() {
     let r = api.post_json(Some(&token), &format!("/v1/projects/{}/changes", p.name), &json!({"base": base.hex(), "edits": [put("src/side.rs", "side\n")]}));
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     let unprotected: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
-    write_files(&p.dir, &[(".veilrules", "[branches.main]\nprotected = true\n")]);
+    write_files(
+        &p.dir,
+        &[(".veilrules", "[branches.main]\nprotected = true\n[review]\nnormal = { approvals = 0 }\nhigh = { approvals = 0 }\n")],
+    );
     p.admin.commit_main(&p.dir, "protect main");
     p.admin.ok(&p.dir, &["push"]);
     // A plain edit of the rules by the dev is refused (the builder's test).
@@ -651,7 +657,10 @@ fn bug_1103_a_landed_stack_brings_every_change_the_branch_lacks() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
     let api = hub.api();
-    write_files(&p.dir, &[(".veilrules", "[branches.main]\nprotected = true\n")]);
+    write_files(
+        &p.dir,
+        &[(".veilrules", "[branches.main]\nprotected = true\n[review]\nnormal = { approvals = 0 }\nhigh = { approvals = 0 }\n")],
+    );
     p.admin.commit_main(&p.dir, "protect main");
     p.admin.ok(&p.dir, &["push"]);
     let token = p.dev.token();
@@ -2690,7 +2699,10 @@ fn a_change_seen_in_part_lands_by_no_route_of_its_viewer_and_its_author_lands_it
     let pid = project_id(&hub, &p.name);
     let api = hub.api();
     let token = p.dev.token();
-    write_files(&p.dir, &[(".veilrules", "[branches.main]\nprotected = true\n")]);
+    write_files(
+        &p.dir,
+        &[(".veilrules", "[branches.main]\nprotected = true\n[review]\nnormal = { approvals = 0 }\nhigh = { approvals = 0 }\n")],
+    );
     p.admin.commit_main(&p.dir, "protect main");
     p.admin.ok(&p.dir, &["push"]);
     p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name]);
@@ -4241,7 +4253,7 @@ fn bug_1549_a_landing_whose_every_change_landed_already_names_them() {
         &p.admin.token(),
         &p.name,
         tip,
-        json!([put(".veilrules", "[branches.main]\nprotected = true\n")]),
+        json!([put(".veilrules", "[branches.main]\nprotected = true\n\n[review]\nchecks_only = [\"**\"]\n")]),
         true,
     );
     assert_eq!(r.json()["state"], "landed", "{}", String::from_utf8_lossy(&r.body));
@@ -5100,7 +5112,10 @@ fn bug_1636_landing_routes_enforce_agent_session_narrowing_and_access_rules() {
     let pid = project_id(&hub, &p.name);
     let api = hub.api();
     // Protect `main` so `POST …/push` takes the landing service route.
-    write_files(&p.dir, &[(".veilrules", "[branches.main]\nprotected = true\n")]);
+    write_files(
+        &p.dir,
+        &[(".veilrules", "[branches.main]\nprotected = true\n[review]\nnormal = { approvals = 0 }\nhigh = { approvals = 0 }\n")],
+    );
     p.admin.commit_main(&p.dir, "protect main");
     p.admin.ok(&p.dir, &["push"]);
 

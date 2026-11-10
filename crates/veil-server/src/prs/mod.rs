@@ -75,7 +75,7 @@ use crate::{
     query::{
         self,
         graph::{blocking, ensure, G},
-        Ask, DiffParams, Limits,
+        Ask, Limits,
     },
     Hub, HubState,
 };
@@ -165,6 +165,12 @@ pub async fn visible(hub: &Hub, ask: &Ask, id: &str) -> Result<PrRow> {
     let lines: BTreeSet<String> = serde_json::from_str(&lines).unwrap_or_else(|_| BTreeSet::from([String::new()]));
     if !class::satisfies(&ask.project.view(&ask.viewer), &lines, &embargo) {
         return Err(no_pr());
+    }
+    if ask.viewer.only.is_some() {
+        let paths = review::paths_of(hub, ask.project.id, id).await?;
+        if paths.iter().any(|p| !ask.viewer.within_narrowing(p)) {
+            return Err(no_pr());
+        }
     }
     Ok(PrRow {
         id: id.to_string(),
@@ -579,6 +585,12 @@ pub async fn create(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr) -> 
     let (_, head) = query::resolve_real(hub, ask, &q.head, deadline).await?;
     let r = compute(hub, ask, head, onto_tip).await?;
     readable_by(ask, &r.touched)?;
+    if ask.viewer.only.is_some() && r.touched.iter().any(|p| !ask.viewer.within_narrowing(p)) {
+        return Err(crate::sync::agent_refusal(crate::sync::NARROWED_MOVE));
+    }
+    if ask.viewer.agent && r.touched.iter().any(|p| veil_core::hub::agent::decides_access(p)) {
+        return Err(crate::sync::agent_refusal(crate::sync::AGENT_ACCESS_MOVE));
+    }
     let key = class::policy_key(&ask.project.policy);
     let lines = class::lines_of(&ask.project.policy, r.touched.iter().map(String::as_str));
     let (project, r) = (ask.project.id, Arc::new(r));
@@ -665,6 +677,8 @@ pub async fn list(hub: &Arc<Hub>, ask: &Ask, q: ListParams) -> Result<Value> {
     class::reclassify(hub, &ask.project).await?;
     let classes = class::satisfied(hub, &ask.project, &ask.viewer).await?;
     let states: Vec<String> = if state.is_empty() { vec!["open".into(), "closed".into(), "landed".into()] } else { vec![state] };
+    let narrowed = ask.viewer.only.is_some();
+    let only: Vec<String> = ask.viewer.only.as_deref().cloned().unwrap_or_default();
     // Each PR's current revision's risk as last rated, with the key of the
     // rules it was rated under: rated again under the rules in force where
     // they differ (BUG-1424).
@@ -677,6 +691,8 @@ pub async fn list(hub: &Arc<Hub>, ask: &Ask, q: ListParams) -> Result<Value> {
              FROM UNNEST($2::text[]) AS c(class_id) CROSS JOIN UNNEST($3::text[]) AS s(state), \
              LATERAL (SELECT * FROM prs q WHERE q.project_id = $1 AND q.class_id = c.class_id AND q.state = s.state \
                       AND ($4::BIGINT IS NULL OR q.created_at < $4 OR (q.created_at = $4 AND q.id < $5)) \
+                      AND (NOT $7 OR NOT EXISTS (SELECT 1 FROM pr_paths pp WHERE pp.project_id = q.project_id AND pp.pr = q.id \
+                           AND NOT EXISTS (SELECT 1 FROM UNNEST($8::text[]) AS o(p) WHERE pp.path = o.p OR LEFT(pp.path, CHAR_LENGTH(o.p) + 1) = o.p || '/'))) \
                       ORDER BY q.created_at DESC, q.id DESC LIMIT $6) p \
              JOIN pr_revisions r ON r.project_id = p.project_id AND r.pr = p.id AND r.n = p.revision \
              JOIN people pe ON pe.id = p.author \
@@ -688,14 +704,22 @@ pub async fn list(hub: &Arc<Hub>, ask: &Ask, q: ListParams) -> Result<Value> {
         .bind(after_at)
         .bind(&after_id)
         .bind(n + 1)
+        .bind(narrowed)
+        .bind(&only)
         .fetch_all(&hub.db)
         .await?;
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM prs WHERE project_id = $1 AND class_id = ANY($2) AND state = ANY($3)")
-            .bind(ask.project.id)
-            .bind(&classes)
-            .bind(&states)
-            .fetch_one(&hub.db)
-            .await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM prs q WHERE q.project_id = $1 AND q.class_id = ANY($2) AND q.state = ANY($3) \
+             AND (NOT $4 OR NOT EXISTS (SELECT 1 FROM pr_paths pp WHERE pp.project_id = q.project_id AND pp.pr = q.id \
+                  AND NOT EXISTS (SELECT 1 FROM UNNEST($5::text[]) AS o(p) WHERE pp.path = o.p OR LEFT(pp.path, CHAR_LENGTH(o.p) + 1) = o.p || '/')))",
+        )
+        .bind(ask.project.id)
+        .bind(&classes)
+        .bind(&states)
+        .bind(narrowed)
+        .bind(&only)
+        .fetch_one(&hub.db)
+        .await?;
         (rows, count)
     } else {
         // A search reads every PR of the satisfied classes once: the page
@@ -706,7 +730,9 @@ pub async fn list(hub: &Arc<Hub>, ask: &Ask, q: ListParams) -> Result<Value> {
                  SELECT q.*, COUNT(*) OVER () AS total, \
                         ($4::BIGINT IS NULL OR q.created_at < $4 OR (q.created_at = $4 AND q.id < $5)) AS after_cursor \
                  FROM prs q WHERE q.project_id = $1 AND q.class_id = ANY($2) AND q.state = ANY($3) \
-                 AND (q.title ILIKE $7 OR q.body ILIKE $7)) p \
+                 AND (q.title ILIKE $7 OR q.body ILIKE $7) \
+                 AND (NOT $8 OR NOT EXISTS (SELECT 1 FROM pr_paths pp WHERE pp.project_id = q.project_id AND pp.pr = q.id \
+                      AND NOT EXISTS (SELECT 1 FROM UNNEST($9::text[]) AS o(p) WHERE pp.path = o.p OR LEFT(pp.path, CHAR_LENGTH(o.p) + 1) = o.p || '/')))) p \
              JOIN pr_revisions r ON r.project_id = p.project_id AND r.pr = p.id AND r.n = p.revision \
              JOIN people pe ON pe.id = p.author WHERE p.after_cursor \
              ORDER BY p.created_at DESC, p.id DESC LIMIT $6",
@@ -718,18 +744,24 @@ pub async fn list(hub: &Arc<Hub>, ask: &Ask, q: ListParams) -> Result<Value> {
         .bind(&after_id)
         .bind(n + 1)
         .bind(&like)
+        .bind(narrowed)
+        .bind(&only)
         .fetch_all(&hub.db)
         .await?;
         let count = match rows.first() {
             Some(r) => r.10,
             // An empty page (past the end) still counts every match.
             None => sqlx::query_scalar(
-                "SELECT COUNT(*) FROM prs WHERE project_id = $1 AND class_id = ANY($2) AND state = ANY($3) AND (title ILIKE $4 OR body ILIKE $4)",
+                "SELECT COUNT(*) FROM prs q WHERE q.project_id = $1 AND q.class_id = ANY($2) AND q.state = ANY($3) AND (q.title ILIKE $4 OR q.body ILIKE $4) \
+                 AND (NOT $5 OR NOT EXISTS (SELECT 1 FROM pr_paths pp WHERE pp.project_id = q.project_id AND pp.pr = q.id \
+                      AND NOT EXISTS (SELECT 1 FROM UNNEST($6::text[]) AS o(p) WHERE pp.path = o.p OR LEFT(pp.path, CHAR_LENGTH(o.p) + 1) = o.p || '/')))",
             )
             .bind(ask.project.id)
             .bind(&classes)
             .bind(&states)
             .bind(&like)
+            .bind(narrowed)
+            .bind(&only)
             .fetch_one(&hub.db)
             .await?,
         };
@@ -784,19 +816,7 @@ pub async fn diff(hub: &Arc<Hub>, ask: &Ask, id: &str, q: PrDiffParams) -> Resul
         }
     };
     let p = projected(hub, ask, &[from, to]).await?;
-    let mut v = query::diff(
-        hub,
-        ask,
-        DiffParams {
-            from: p[&from].hex(),
-            to: Some(p[&to].hex()),
-            base: Some("from".into()),
-            path: None,
-            stat: q.stat,
-        },
-        Limits::default(),
-    )
-    .await?;
+    let mut v = query::diff_pr(hub, ask, p[&from], p[&to], q.stat, Limits::default()).await?;
     v["pr"] = json!(pr.id);
     v["revision"] = json!(n);
     Ok(v)
@@ -848,6 +868,12 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
     // Visibility first, then the bound (the union's size counts paths the
     // caller may not see).
     readable_by(ask, &all)?;
+    if ask.viewer.only.is_some() && all.iter().any(|p| !ask.viewer.within_narrowing(p)) {
+        return Err(crate::sync::agent_refusal(crate::sync::NARROWED_MOVE));
+    }
+    if ask.viewer.agent && r.touched.iter().any(|p| veil_core::hub::agent::decides_access(p)) {
+        return Err(crate::sync::agent_refusal(crate::sync::AGENT_ACCESS_MOVE));
+    }
     if all.len() > revision::MAX_PATHS {
         return Err(Error::bad_request(format!("a PR touches at most {} paths over all its revisions; open a new one", revision::MAX_PATHS)));
     }
@@ -1157,6 +1183,7 @@ pub async fn new_thread(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q:
     let (anchor, at) = match q.anchor {
         None => (None, None),
         Some(a) => {
+            ask.file_path(Some(&a.path))?;
             let revs = revisions(hub, ask.project.id, &pr.id).await?;
             let current = revs.into_iter().find(|r| r.n == pr.revision).ok_or_else(|| Error::Other(anyhow::anyhow!("the PR's revision is missing")))?;
             let n = pr.revision as u32;
@@ -1309,6 +1336,12 @@ pub async fn add_review(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q:
     if !VERDICTS.contains(&q.verdict.as_str()) {
         return Err(Error::bad_request("a verdict is approve or request-changes"));
     }
+    let agent = caller.agent().is_some() || ask.viewer.agent;
+    if agent && q.verdict == "approve" {
+        return Err(crate::sync::agent_refusal(
+            "an agent session never approves a PR: review and approve from a person's session",
+        ));
+    }
     if pr.author == me {
         return Err(Error::forbidden("you wrote this PR: someone else reviews it"));
     }
@@ -1327,8 +1360,6 @@ pub async fn add_review(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q:
     if !verify_signature(&person.device_key, SIG_CONTEXT_HUB_PR_REVIEW, &msg, &q.signature) {
         return Err(Error::unauthorized("the review's signature is not this device's over this revision"));
     }
-    // Agent sessions (S11) set `agent`; every session today is a person's.
-    let agent = false;
     let stored = review::put_verdict(hub, ask.project.id, &pr.id, pr.revision, me, &q.verdict, &current.patch, agent, &person.device_key, &q.signature, &body, true).await?;
     if !stored {
         return Err(Error::conflict("the PR changed meanwhile: look at it again"));
@@ -1344,6 +1375,7 @@ pub struct DismissRequest {
 
 /// An admin dismisses a reviewer's requests for changes (BUG-1259).
 pub async fn dismiss(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: DismissRequest) -> Result<Value> {
+    caller.person_only()?;
     participant(ask, caller)?;
     let pr = visible(hub, ask, id).await?;
     if !ask.viewer.admin {
@@ -1367,26 +1399,254 @@ pub async fn dismiss_route(
     Ok(Json(dismiss(&hub, &ask, &caller, &id, q).await?))
 }
 
-/// The review gate. Submitting the stack to the landing service (S17's
-/// `POST …/land`, one change at a time, bottom first, onto the target) is
-/// the follow-up once S17 is merged; until then a ready PR is answered as
-/// such, and nothing moves.
+/// Check the review rules in force for a landing `stack` onto a protected
+/// `branch` (S17 + S21, `docs/HUB.md` §13.24): every landing onto a protected
+/// branch meets the review rules by every route (push, `POST …/land`, API
+/// commit with land, and `POST …/prs/{id}/land`). If an open PR on `branch`
+/// has `stack`'s patch as its current revision (and covers its paths), its
+/// gate decides (and its id is returned so it is marked `landed` when the
+/// landing commits); otherwise `stack` is rated directly under the rules in
+/// force with 0 approvals.
+pub async fn check_landing_review(
+    hub: &Arc<Hub>,
+    project: &crate::perm::Project,
+    viewer: &Viewer,
+    branch: &str,
+    stack: &[crate::landing::Entry],
+) -> Result<Option<String>> {
+    if stack.is_empty() {
+        return Ok(None);
+    }
+    let rules = state::rules_in_force(hub, project, &project.default_branch).await?;
+    let entries = stack.to_vec();
+    let r2 = rules.clone();
+    let (touched, risk, patch) = crate::sync::blocking(hub, project.id, move |src| {
+        let mut touched = BTreeSet::new();
+        let mut files: std::collections::BTreeMap<String, rules::FileChange> = std::collections::BTreeMap::new();
+        let mut patch = blake3::Hasher::new_derive_key("veil 2026 hub pr patch v1");
+        for e in &entries {
+            let s = src.snapshot(&e.id)?;
+            let parent = if s.parents.get(1..).is_some_and(|o| o.contains(&e.base)) {
+                e.base
+            } else {
+                s.parents.first().copied().unwrap_or_else(crate::sync::root_snapshot_id)
+            };
+            let ptree = src.snapshot(&parent)?.tree;
+            let (leaves, dirs) = crate::derive::changes::diff(src, ptree, s.tree)?;
+            if !leaves.is_empty() {
+                patch.update(&s.change_id.0);
+                patch.update(&(leaves.len() as u64).to_le_bytes());
+            }
+            for c in &leaves {
+                patch.update(&(c.path.len() as u64).to_le_bytes());
+                patch.update(c.path.as_bytes());
+                revision::entry_bytes(&mut patch, c.old.as_ref());
+                revision::entry_bytes(&mut patch, c.new.as_ref());
+                let secret = [&c.old, &c.new].iter().any(|e| e.as_ref().is_some_and(|e| !e.visibility.is_public()));
+                let executable = c.new.as_ref().is_some_and(|e| e.executable);
+                let regular = [&c.old, &c.new].iter().all(|e| e.as_ref().is_none_or(|e| e.kind == veil_core::object::EntryKind::File));
+                let f = files.entry(c.path.clone()).or_insert(rules::FileChange {
+                    path: c.path.clone(),
+                    secret,
+                    executable,
+                    regular,
+                });
+                f.secret |= secret;
+                f.executable |= executable;
+                f.regular &= regular;
+                touched.insert(c.path.clone());
+            }
+            touched.extend(dirs.into_iter().filter(|d| !d.is_empty()));
+        }
+        let files: Vec<rules::FileChange> = files.into_values().collect();
+        let (risk, _) = classify(&files, &r2);
+        Ok((touched, risk, patch.finalize().to_hex().to_string()))
+    })
+    .await?;
+
+    type Cand = (String, i64, String, String, String, i32, i64, i64);
+    let cands: Vec<Cand> = sqlx::query_as(
+        "SELECT p.id, p.author, pe.name, p.title, p.body, p.revision, p.created_at, p.updated_at \
+         FROM prs p JOIN pr_revisions r ON r.project_id = p.project_id AND r.pr = p.id AND r.n = p.revision \
+         JOIN people pe ON pe.id = p.author \
+         WHERE p.project_id = $1 AND p.target = $2 AND p.state = 'open' AND r.patch = $3 \
+         ORDER BY p.updated_at DESC, p.id DESC",
+    )
+    .bind(project.id)
+    .bind(branch)
+    .bind(&patch)
+    .fetch_all(&hub.db)
+    .await?;
+    let mut not_ready_reasons: Option<Vec<String>> = None;
+    for (id, author, author_name, title, body, revision, created_at, updated_at) in cands {
+        let pr_paths: BTreeSet<String> = review::paths_of(hub, project.id, &id).await?.into_iter().collect();
+        if !touched.is_subset(&pr_paths) {
+            continue;
+        }
+        let pr = PrRow {
+            id: id.clone(),
+            target: branch.to_string(),
+            author,
+            author_name,
+            title,
+            body,
+            state: "open".into(),
+            revision,
+            created_at,
+            updated_at,
+        };
+        let revs = rated(hub, project.id, &pr.id, &rules).await?;
+        let pr_risk = revs
+            .iter()
+            .find(|r| r.n == pr.revision)
+            .map(|r| Risk::parse(&r.risk))
+            .unwrap_or(risk);
+        let gate = review::gate(hub, project, viewer, &pr, &patch, pr_risk, &rules).await?;
+        if gate.ready {
+            return Ok(Some(pr.id));
+        }
+        if not_ready_reasons.is_none() {
+            not_ready_reasons = Some(gate.reasons);
+        }
+    }
+    if let Some(reasons) = not_ready_reasons {
+        return Err(Error::new(
+            StatusCode::CONFLICT,
+            "not_ready",
+            format!("not ready to land: {}", reasons.join("; ")),
+        ));
+    }
+    let need = rules.need(risk);
+    let paths: Vec<String> = touched.into_iter().collect();
+    let held: Vec<String> = review::holds_on(hub, project.id, &paths).await?.into_iter().map(|(_, n, _)| n).collect();
+    if need.approvals == 0 && held.is_empty() {
+        return Ok(None);
+    }
+    let mut reasons: Vec<String> = if project.view(viewer).admin {
+        rules.warnings.clone()
+    } else if rules.warnings.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!("the project's review rules ({}) need an admin's attention", rules::RULES_FILE)]
+    };
+    if need.approvals > 0 {
+        reasons.push(format!(
+            "{} risk needs {} approval{}{}; it has 0",
+            risk.name(),
+            need.approvals,
+            if need.approvals == 1 { "" } else { "s" },
+            if need.people_only { " from people (not agents)" } else { "" },
+        ));
+    }
+    for h in &held {
+        reasons.push(format!("{h} asked for changes"));
+    }
+    Err(Error::new(
+        StatusCode::CONFLICT,
+        "not_ready",
+        format!("not ready to land: {}", reasons.join("; ")),
+    ))
+}
+
+/// Land `pr` through the landing service (S17), after checking its review
+/// gate (S21) and S11's agent rules (`landing::agent_stack`).
 pub async fn land(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Result<Value> {
     let me = participant(ask, caller)?;
+    let person = signed_in(caller)?.clone();
     let pr = visible(hub, ask, id).await?;
     let paths = review::paths_of(hub, ask.project.id, &pr.id).await?;
     if pr.author != me && !review::writes_all(&ask.project, &ask.viewer, &paths) {
         return Err(Error::forbidden("only the author, or someone who may write every file of this PR, lands it"));
     }
-    let (_, gate) = gate(hub, ask, &pr).await?;
-    if !gate.ready {
-        return Err(Error::new(StatusCode::CONFLICT, "not_ready", format!("not ready to land: {}", gate.reasons.join("; "))));
+    let (revs, g) = gate(hub, ask, &pr).await?;
+    if !g.ready {
+        return Err(Error::new(StatusCode::CONFLICT, "not_ready", format!("not ready to land: {}", g.reasons.join("; "))));
     }
-    Err(Error::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "landing_unavailable",
-        "the review rules are met, but this server has no landing service yet (milestone S17)",
-    ))
+    let current = revs.iter().find(|r| r.n == pr.revision).ok_or_else(|| Error::Other(anyhow::anyhow!("the PR's revision is missing")))?;
+    let judged = match crate::landing::stack(hub, &ask.project, &ask.viewer, &pr.target, current.head, &HashMap::new()).await? {
+        Ok(s) if !s.branch => return Err(Error::conflict(format!("the target {} no longer exists", pr.target))),
+        Ok(s) => s,
+        Err(why) => return Err(Error::bad_request(why)),
+    };
+    crate::landing::agent_stack(hub, &ask.project, &ask.viewer, &pr.target, &judged, current.head, false).await?;
+    // Re-check the gate right before queueing so an access, rule, or hold
+    // change during stack computation is never missed.
+    let (_, g) = gate(hub, ask, &pr).await?;
+    if !g.ready {
+        return Err(Error::new(StatusCode::CONFLICT, "not_ready", format!("not ready to land: {}", g.reasons.join("; "))));
+    }
+    if judged.stack.is_empty() {
+        let now = veil_core::now_millis();
+        sqlx::query("UPDATE prs SET state = 'landed', updated_at = $1 WHERE project_id = $2 AND id = $3 AND state = 'open'")
+            .bind(now)
+            .bind(ask.project.id)
+            .bind(&pr.id)
+            .execute(&hub.db)
+            .await?;
+        return show(hub, ask, id).await;
+    }
+    let who = crate::landing::Submitter {
+        person,
+        epochs: caller.epochs,
+    };
+    let q = crate::landing::Queued {
+        ticket: crate::landing::ticket(),
+        branch: pr.target.clone(),
+        stack: judged.stack,
+        lineage: judged.lineage,
+        skipped: Arc::new(std::sync::Mutex::new(judged.skipped)),
+    };
+    let w = hub.landing.register(&q.ticket);
+    let pid = ask.project.id;
+    let q2 = q.clone();
+    let who2 = who.clone();
+    let r = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
+        let (q, who) = (q2.clone(), who2.clone());
+        Box::pin(async move { crate::landing::insert(&mut *c, pid, &who, &q).await })
+    })
+    .await;
+    if let Err(e) = r {
+        crate::landing::abandon(hub, w);
+        return Err(e);
+    }
+    crate::landing::ensure(hub, ask.project.id, &q.branch);
+    let deadline = tokio::time::Instant::now() + crate::landing::WAIT;
+    let r = crate::landing::wait(hub, ask.project.id, me, &q.branch, w, deadline).await?;
+    let mut r = crate::landing::seen(hub, &ask.project, &ask.viewer, r).await?;
+    let skipped = q.skipped.lock().unwrap().clone();
+    r.warnings.extend(crate::landing::skipped_warnings(hub, ask.project.id, &q.branch, &skipped).await?);
+    use veil_core::hub::land::LandState;
+    match r.state {
+        LandState::Landed => {
+            let now = veil_core::now_millis();
+            sqlx::query("UPDATE prs SET state = 'landed', updated_at = $1 WHERE project_id = $2 AND id = $3 AND state = 'open'")
+                .bind(now)
+                .bind(ask.project.id)
+                .bind(&pr.id)
+                .execute(&hub.db)
+                .await?;
+            let mut v = show(hub, ask, id).await?;
+            v["landing"] = serde_json::to_value(&r).unwrap_or_default();
+            Ok(v)
+        }
+        LandState::Conflict => {
+            let msg = r.message.clone().unwrap_or_else(|| {
+                format!(
+                    "conflict: {} changed on '{}' since this PR's base; rebase it onto '{}' and update the PR",
+                    r.paths.join(", "),
+                    pr.target,
+                    pr.target
+                )
+            });
+            Err(Error::new(StatusCode::CONFLICT, "conflict", msg))
+        }
+        LandState::Rejected => Err(Error::bad_request(r.message.unwrap_or_else(|| "landing rejected".into()))),
+        LandState::Queued => {
+            let mut v = show(hub, ask, id).await?;
+            v["landing"] = serde_json::to_value(&r).unwrap_or_default();
+            Ok(v)
+        }
+    }
 }
 
 // ---- routes ------------------------------------------------------------------------

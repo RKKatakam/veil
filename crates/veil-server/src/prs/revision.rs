@@ -116,7 +116,7 @@ pub fn text_of(cx: &Cx, e: &TreeEntry) -> Result<Option<String>> {
     Ok(String::from_utf8(bytes).ok())
 }
 
-fn entry_bytes(h: &mut blake3::Hasher, e: Option<&TreeEntry>) {
+pub(super) fn entry_bytes(h: &mut blake3::Hasher, e: Option<&TreeEntry>) {
     match e {
         None => {
             h.update(&[0]);
