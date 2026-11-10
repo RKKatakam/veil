@@ -43,6 +43,12 @@ pub struct Counts {
     pub tips_misses: u64,
     pub permission_hits: u64,
     pub permission_misses: u64,
+    /// The landing service (S17, S24 part B): changes landed, batches
+    /// committed, conflicts and rejections.
+    pub landings: u64,
+    pub landing_batches: u64,
+    pub landing_conflicts: u64,
+    pub landing_rejected: u64,
 }
 
 impl Counts {
@@ -55,6 +61,10 @@ impl Counts {
         self.tips_misses += o.tips_misses;
         self.permission_hits += o.permission_hits;
         self.permission_misses += o.permission_misses;
+        self.landings += o.landings;
+        self.landing_batches += o.landing_batches;
+        self.landing_conflicts += o.landing_conflicts;
+        self.landing_rejected += o.landing_rejected;
     }
 }
 
@@ -182,7 +192,7 @@ pub async fn route(State(hub): State<HubState>, caller: Caller, Path(p): Path<St
     let (branches, branches_behind): (i64, i64) = sqlx::query_as(
         "SELECT COUNT(*), COUNT(*) FILTER (WHERE d.through_snapshot IS DISTINCT FROM b.target) FROM branches b \
          LEFT JOIN derive_progress d ON d.project_id = b.project_id AND d.branch = b.name AND d.index_name = $2 AND d.index_version = $3 \
-         WHERE b.project_id = $1",
+         WHERE b.project_id = $1 AND b.hidden_for_embargo IS NULL",
     )
     .bind(project.id)
     .bind(crate::derive::INDEX.0)

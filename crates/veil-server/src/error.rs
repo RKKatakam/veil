@@ -49,6 +49,9 @@ impl Error {
     pub fn conflict(m: impl Into<String>) -> Error {
         Error::new(StatusCode::CONFLICT, "conflict", m)
     }
+    pub fn rate_limited(m: impl Into<String>, _retry_after_ms: u64) -> Error {
+        Error::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", m)
+    }
 
     /// A transaction that lost a serialisation race (PostgreSQL and
     /// YugabyteDB report 40001; deadlocks 40P01): run it again.
@@ -131,6 +134,20 @@ impl IntoResponse for Error {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error".to_string())
             }
         };
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let mut resp = (
+                status,
+                Json(serde_json::json!({
+                    "code": code,
+                    "message": message,
+                    "retry_after_ms": 1_000u64,
+                })),
+            )
+                .into_response();
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));
+            return resp;
+        }
         (status, Json(ErrorBody { code: code.into(), message })).into_response()
     }
 }
