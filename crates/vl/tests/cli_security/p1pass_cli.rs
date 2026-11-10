@@ -1082,7 +1082,6 @@ fn p1pass_g6_formats_8_to_10_upgrade_or_refuse_clearly_without_silent_loss() {
 // ---- Ignored Bug Reproductions (BUG-1800, BUG-1801, BUG-1802, BUG-1804) -----------
 
 #[test]
-#[ignore = "BUG-1800: vl change new reads unaccepted .veilpolicy and skips personal_key check, sending .env and id_ed25519 in plaintext"]
 fn bug_1800_change_new_must_use_accepted_policy_and_refuse_personal_keys() {
     let env = Env::new();
     let upstream = env.dir("upstream-1800");
@@ -1162,6 +1161,177 @@ fn bug_1800_change_new_must_use_accepted_policy_and_refuse_personal_keys() {
         out.status,
         text(&out)
     );
+}
+
+#[test]
+fn class_1800_every_outbound_route_uses_accepted_policy_seals_secrets_and_refuses_personal_keys() {
+    let env = Env::new();
+    let upstream = env.dir("upstream-class-1800");
+    veil_core::Repo::init_bare(std::sync::Arc::new(veil_core::DiskBackend::new(&upstream))).unwrap();
+
+    // Alice initializes the project (holding the `team` key) and isolates `notes.secret`.
+    let proj = env.project("alice", "alice-class-1800", &[("README.md", "hi\n")]);
+    let base_policy = read(&proj, ".veilpolicy");
+    write(&proj, ".veilpolicy", &format!("{base_policy}\nnotes.secret isolate\n"));
+    env.ok("alice", &proj, &["commit", "-m", "isolate notes"]);
+    env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
+    env.ok("alice", &proj, &["remote", "add", "origin", upstream.to_str().unwrap()]);
+    env.ok("alice", &proj, &["push", "origin"]);
+
+    // Bob clones and pushes an unaccepted `.veilpolicy` widening `.env`, `notes.secret`, and `id_rsa` to `public!`.
+    let bob = env.root.join("bob-class-1800");
+    env.ok("bob", &env.root, &["clone", upstream.to_str().unwrap(), bob.to_str().unwrap()]);
+    write(&bob, ".veilpolicy", ".env public!\nnotes.secret public!\nid_rsa public!\n");
+    env.ok("bob", &bob, &["commit", "-m", "hostile widen"]);
+    env.ok("bob", &bob, &["tag", "set", "main", "-r", "@-"]);
+    env.ok("bob", &bob, &["push", "origin"]);
+
+    // Alice pulls WITHOUT running `vl policy accept`.
+    env.ok("alice", &proj, &["pull", "origin"]);
+    env.ok("alice", &proj, &["new", "main"]);
+
+    let hub = MockHub::start(
+        &env,
+        "hub-class-1800",
+        &serde_json::json!({
+            "tips": {
+                "branches": { "main": "22".repeat(32) },
+                "default_branch": "main",
+                "you": "alice",
+                "admin": true,
+                "revision": 1
+            }
+        }),
+    );
+    let home = env.root.join("home-alice");
+    hub.seed_login(&home, "alice", "TOKEN_CLASS_1800");
+    env.ok("alice", &proj, &["remote", "rm", "origin"]);
+    env.ok("alice", &proj, &["remote", "add", "origin", &hub.url("proj")]);
+
+    let has_marker = |marker: &str| {
+        hub.raw_requests()
+            .into_iter()
+            .any(|(_, _, body)| body.windows(marker.len()).any(|w| w == marker.as_bytes()))
+    };
+
+    // 1. `vl change new` on `.env` classifies with Alice's accepted policy (`cloak team`),
+    // sealing `.env` into `/objects` and sending `put.object` (never `put.text`) to `/changes`.
+    let api_env_secret = "API_SEALED_ENV_SECRET_CLASS_1800";
+    let env_edit = env.root.join("edit-env.json");
+    std::fs::write(
+        &env_edit,
+        serde_json::to_vec(&serde_json::json!([
+            { "path": ".env", "put": { "text": format!("SECRET={api_env_secret}\n") } }
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    env.ok(
+        "alice",
+        &proj,
+        &["change", "new", "--edits", env_edit.to_str().unwrap(), "--base", &"22".repeat(32), "-m", "sealed env"],
+    );
+    assert!(!has_marker(api_env_secret), "vl change new sent .env plaintext instead of sealing under accepted policy");
+    let change_reqs: Vec<serde_json::Value> = hub
+        .raw_requests()
+        .into_iter()
+        .filter(|(m, p, _)| m == "POST" && p.ends_with("/changes"))
+        .map(|(_, _, b)| serde_json::from_slice(&b).unwrap())
+        .collect();
+    assert_eq!(change_reqs.len(), 1);
+    assert!(
+        change_reqs[0]["edits"][0]["put"]["object"].is_string() && change_reqs[0]["edits"][0]["put"].get("text").is_none(),
+        "expected sealed put.object on /changes, got: {}",
+        change_reqs[0]
+    );
+
+    // 2. `vl change new` refuses personal keys, custom isolated files (even when unaccepted `.veilpolicy` says `public!`),
+    // unsealed local `put.object` on `.env`, and `.env` outside any clone.
+    let plain_readme_id = {
+        let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&proj)), None, "alice").unwrap();
+        let wc = repo.workspace_wc("default").unwrap();
+        let tree = repo.snapshot(&wc).unwrap().tree;
+        repo.store().tree(&tree).unwrap().get("README.md").unwrap().id.hex()
+    };
+    for (label, cwd, extra_args, edit_json, marker) in [
+        (
+            "personal key text",
+            &proj,
+            vec![],
+            serde_json::json!([{ "path": "id_rsa", "put": { "text": "KEY_TEXT_CLASS_1800\n" } }]),
+            Some("KEY_TEXT_CLASS_1800"),
+        ),
+        (
+            "personal key object",
+            &proj,
+            vec![],
+            serde_json::json!([{ "path": ".ssh/id_ed25519", "put": { "object": plain_readme_id } }]),
+            None,
+        ),
+        (
+            "accepted-isolated file text",
+            &proj,
+            vec![],
+            serde_json::json!([{ "path": "notes.secret", "put": { "text": "ISOLATED_TEXT_CLASS_1800\n" } }]),
+            Some("ISOLATED_TEXT_CLASS_1800"),
+        ),
+        (
+            "accepted-isolated file object",
+            &proj,
+            vec![],
+            serde_json::json!([{ "path": "notes.secret", "put": { "object": plain_readme_id } }]),
+            None,
+        ),
+        (
+            "unsealed object on cloaked .env",
+            &proj,
+            vec![],
+            serde_json::json!([{ "path": ".env", "put": { "object": plain_readme_id } }]),
+            None,
+        ),
+        (
+            "cloneless .env object",
+            &env.root,
+            vec!["-p"],
+            serde_json::json!([{ "path": ".env", "put": { "object": "33".repeat(32) } }]),
+            None,
+        ),
+    ] {
+        let p = env.root.join(format!("bad-{}.json", label.replace(' ', "-")));
+        std::fs::write(&p, serde_json::to_vec(&edit_json).unwrap()).unwrap();
+        let proj_url = hub.url("proj");
+        let base_hex = "22".repeat(32);
+        let mut args = vec!["change", "new"];
+        if extra_args == vec!["-p"] {
+            args.extend(["-p", proj_url.as_str()]);
+        } else {
+            args.extend(extra_args);
+        }
+        args.extend(["--edits", p.to_str().unwrap(), "--base", base_hex.as_str(), "-m", "bad"]);
+        let out = env.vl("alice", cwd, &args);
+        assert!(!out.status.success(), "{label} must be refused: {}", text(&out));
+        if let Some(m) = marker {
+            assert!(!has_marker(m), "{label} leaked {m}");
+        }
+    }
+
+    // 3. `vl upgrade --rule-keys` refuses to read/rewrite while `.veilpolicy` has unaccepted changes.
+    let upg = env.vl("alice", &proj, &["upgrade", "--rule-keys"]);
+    assert!(!upg.status.success() && text(&upg).contains("unaccepted"), "{}", text(&upg));
+
+    // 4. Working-copy snapshot + `vl push` seals `.env` under accepted policy and omits `notes.secret` and `id_ed25519`.
+    let push_env = "PUSH_SEALED_ENV_CLASS_1800";
+    let push_note = "PUSH_ISOLATED_NOTE_CLASS_1800";
+    let push_key = "PUSH_PERSONAL_KEY_CLASS_1800";
+    write(&proj, ".env", &format!("SECRET={push_env}\n"));
+    write(&proj, "notes.secret", &format!("{push_note}\n"));
+    write(&proj, "id_ed25519", &format!("{push_key}\n"));
+    env.ok("alice", &proj, &["commit", "-m", "wc commit under accepted policy"]);
+    env.ok("alice", &proj, &["tag", "set", "main", "-r", "@-"]);
+    env.ok("alice", &proj, &["push", "origin"]);
+    for secret in [push_env, push_note, push_key] {
+        assert!(!has_marker(secret), "vl push leaked {secret}");
+    }
 }
 
 #[test]

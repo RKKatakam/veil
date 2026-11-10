@@ -2558,6 +2558,11 @@ fn cmd_sync_secrets(ctx: &mut Ctx, dry_run: bool) -> Result<ExitCode> {
     use veil_core::policy::{Policy, Tier, SYNCED_SECRETS_POLICY};
     // Rewrites `.veilpolicy` in the directory (BUG-1125).
     let _wc = ctx.lock_dir(None)?;
+    if ctx.repo.effective_policy(&*ctx.fs)?.accepted().is_some() {
+        bail!(
+            "{POLICY_FILE} has unaccepted changes (`vl policy show`): run `vl policy accept` or restore {POLICY_FILE} before upgrading"
+        );
+    }
     let file = VPath::new(POLICY_FILE)?;
     let text = String::from_utf8_lossy(&ctx.fs.read(&file).unwrap_or_default()).into_owned();
     let current = Policy::parse(&text);
