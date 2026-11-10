@@ -418,8 +418,14 @@ fn prepare_landing_run(cx: &Cx, scope: Scope) -> Result<PreparedLanding> {
     let objects = std::mem::take(&mut writes.objects);
     upload_objects(&cx.src.rt, cx.hub(), cx.project(), objects)?;
     // Prepare the search index update while `b.graph.pending` holds the newly
-    // derived rows.
-    let search = crate::search::index::prepare_for_landing(cx, &b.graph, &b.lines, &reached_tips).unwrap_or(None);
+    // derived rows, unless this run derived a large batch (such as a 60,000-file
+    // initial push), which is indexed in the background without holding the
+    // deriver lock.
+    let search = if writes.history.len() <= 64 && writes.graph.len() <= 16 {
+        crate::search::index::prepare_for_landing(cx, &b.graph, &b.lines, &reached_tips).unwrap_or(None)
+    } else {
+        None
+    };
     Ok(PreparedLanding {
         writes,
         names,
@@ -432,9 +438,14 @@ fn prepare_landing_run(cx: &Cx, scope: Scope) -> Result<PreparedLanding> {
 
 async fn finish_landing_run(hub: &Arc<Hub>, project: i64, p: PreparedLanding) -> Result<Stats> {
     let view_info = viewers_of(hub, project).await?;
-    let memo = match &view_info {
-        Some((proj, viewers)) => crate::query::graph::prepare_memo(hub, proj, viewers.clone(), &p.tip_oids).await?,
-        None => crate::query::graph::PreparedMemo::default(),
+    let small = p.writes.history.len() <= 64 && p.writes.graph.len() <= 16;
+    let memo = match (&view_info, small) {
+        (Some((proj, viewers)), true) => crate::query::graph::prepare_memo(hub, proj, viewers.clone(), &p.tip_oids).await?,
+        (Some((_, viewers)), false) => crate::query::graph::PreparedMemo {
+            keys: Vec::new(),
+            fallback: viewers.clone(),
+        },
+        _ => crate::query::graph::PreparedMemo::default(),
     };
     let access_info = crate::query::files::current_view_access(hub, project).await?;
     let has_derive_writes =
