@@ -276,7 +276,7 @@ fn route(method: &Method, path: &str) -> (Option<String>, Class) {
 /// An answer refusing a request: `status`, `code`, a message naming nothing
 /// but the caller's own wait, and when to come back. The connection is
 /// closed when the body was not read.
-fn refuse(status: StatusCode, code: &str, message: &str, retry: Option<Duration>, close: bool) -> Response {
+pub(crate) fn refuse(status: StatusCode, code: &str, message: &str, retry: Option<Duration>, close: bool) -> Response {
     let mut v = serde_json::json!({ "code": code, "message": message });
     if let Some(r) = retry {
         v["retry_after_ms"] = (r.as_millis().max(1) as u64).into();
@@ -297,7 +297,7 @@ fn rate_limited(wait: Duration) -> Response {
 }
 
 /// A wait of about a second, jittered, for a request shed under load.
-fn shed_wait() -> Duration {
+pub(crate) fn shed_wait() -> Duration {
     let j = u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % 1000;
     Duration::from_millis(500 + j)
 }

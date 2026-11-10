@@ -39,7 +39,7 @@ S1 is built. **S2** (secrets at scale: keys per access rule, background wrapping
 | S10 | 2 | Commits through the API (with the server-side secret scan): **built** (`HUB.md` §13.13) | S1 |
 | S11 | 2 | Agent sessions and attribution; attempts (recorded dead ends) on change records | S10, S8 |
 | S27 | 2 | Compressed objects (zstd) in storage and transport (`storage-and-cost.md` §6). **Built** (`HUB.md` §13.15) | S1 |
-| S28 | 2 | Packs: one storage write per push for small objects, index, range reads (`storage-and-cost.md` §7) | S5, S27 |
+| S28 | 2 | Packs: one storage write per push for small objects, index, range reads (`storage-and-cost.md` §7). **Built** (`HUB.md` §13.20), with staged uploads (BUG-930) and checks several at once (BUG-865) | S5, S27 |
 | S29 | 2 | Merging packs and pack garbage collection (`storage-and-cost.md` §8) | S28 |
 | G2 | 2 | Phase 2 gate run | S3–S11, S27–S29 |
 | S12 | 3 | Derived-data framework, commit graph, changed paths, per-rule lists, eager projection memos at each branch move | S1 |

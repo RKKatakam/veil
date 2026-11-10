@@ -381,7 +381,7 @@ fn put(src: &Source, raw: Vec<u8>, stats: &mut Stats) -> Result<SegRef> {
     stats.segment_bytes += bytes;
     src.rt
         .block_on(src.hub.objects.put(src.project, &id, Bytes::from(raw)))
-        .map_err(|e| Error::Other(anyhow::anyhow!("storing a search segment: {e}")))?;
+        .map_err(|e| Error::Other(e.context("storing a search segment")))?;
     Ok(SegRef { id: id.hex(), bytes })
 }
 
@@ -631,6 +631,7 @@ pub async fn update(hub: &Arc<Hub>, project: i64, branches: Option<Vec<String>>)
             project,
             rt: tokio::runtime::Handle::current(),
             pending: Default::default(),
+            staged: None,
         },
     };
     tokio::task::spawn_blocking(move || {

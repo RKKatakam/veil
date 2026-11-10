@@ -44,6 +44,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (9, "secret_shares", include_str!("../migrations/0009_secret_shares.sql")),
     (10, "view_graph", include_str!("../migrations/0010_view_graph.sql")),
     (11, "landing", include_str!("../migrations/0011_landing.sql")),
+    (13, "packs", include_str!("../migrations/0013_packs.sql")),
     (15, "file_history_and_blame", include_str!("../migrations/0015_file_history_and_blame.sql")),
     (16, "search", include_str!("../migrations/0016_search.sql")),
     (20, "agent_sessions", include_str!("../migrations/0020_agent_sessions.sql")),

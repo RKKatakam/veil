@@ -1164,6 +1164,7 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
         project,
         rt,
         pending: (*on.made).clone(),
+        staged: None,
     };
     let Inputs { entries, attach, mut memo, origins, landed } = inputs;
     let mut b = Built {

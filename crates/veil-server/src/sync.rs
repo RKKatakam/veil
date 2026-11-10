@@ -29,7 +29,7 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use bytes::Bytes;
@@ -48,6 +48,7 @@ use veil_core::{
 
 use crate::{
     error::{Error, Result},
+    pack::{Held, Slot, StagedSlots},
     perm::{Project, Viewer},
     Hub,
 };
@@ -92,6 +93,87 @@ pub struct Source {
     /// stored yet (stored only once every check passed, so a refused
     /// plain-text secret is never stored; `changes`).
     pub pending: HashMap<ObjectId, Bytes>,
+    /// A push's uploads and what it made (S28), read before the store.
+    pub staged: Option<Arc<Staged>>,
+}
+
+/// A staged pack a push's receipts name: its name, and what the push
+/// keeps of its index (BUG-1496): how many objects it holds, its length
+/// and the slots of the objects the receipts name.
+type StagedPack = (Arc<str>, StagedSlots);
+
+/// A pack a landing push lists: its name, its length and, for the pack
+/// it wrote itself, its index (held under its share of the server's bound
+/// on indexes until it joins the lookup maps: BUG-1496). A staged pack
+/// listed as it is has no index in hand: the lookup maps take the
+/// staged-index cache's, or read it when a lookup needs it.
+pub(crate) struct ListedPack {
+    pub(crate) name: Arc<str>,
+    pub(crate) size: u64,
+    /// How many objects it holds.
+    pub(crate) objects: usize,
+    pub(crate) held: Option<Held>,
+}
+
+/// What a push's receipts name in staged packs, and the objects the server
+/// made for it (S28). None of it is the project's until the push's
+/// transaction lists it: staged objects are read only through this (under
+/// cache keys of their own), so a refused upload is never answered as the
+/// project's, and it is discarded with its pack (BUG-930).
+pub struct Staged {
+    /// Each receipted object in a staged pack: the pack and its slot.
+    at: Arc<HashMap<ObjectId, (Arc<str>, Slot)>>,
+    /// The staged packs: what the push keeps of each index.
+    packs: Arc<Vec<StagedPack>>,
+    /// Objects the server made for the push (canonical encodings).
+    made: Arc<Mutex<HashMap<ObjectId, Bytes>>>,
+    /// The staged objects read through this one: what the checks read.
+    touched: Mutex<HashSet<ObjectId>>,
+}
+
+impl Staged {
+    #[cfg(test)]
+    pub(crate) fn from_packs(packs: Vec<StagedPack>, made: HashMap<ObjectId, Bytes>) -> Staged {
+        let at = packs
+            .iter()
+            .flat_map(|(n, sp)| sp.slots.iter().map(move |(id, s)| (*id, (n.clone(), *s))))
+            .collect();
+        Staged {
+            at: Arc::new(at),
+            packs: Arc::new(packs),
+            made: Arc::new(Mutex::new(made)),
+            touched: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// The same uploads and made objects, with reads counted apart (one
+    /// snapshot's completion).
+    fn child(&self) -> Arc<Staged> {
+        Arc::new(Staged {
+            at: self.at.clone(),
+            packs: self.packs.clone(),
+            made: self.made.clone(),
+            touched: Mutex::new(HashSet::new()),
+        })
+    }
+
+    fn touched(&self) -> HashSet<ObjectId> {
+        std::mem::take(&mut *self.touched.lock().unwrap())
+    }
+
+    /// The staged packs' names.
+    fn names(&self) -> Vec<Arc<str>> {
+        self.packs.iter().map(|p| p.0.clone()).collect()
+    }
+
+    /// A staged or made object's key in [`Hub::trees`]: never the
+    /// project's.
+    fn tree_key(&self, project: i64, id: &ObjectId) -> Option<ObjectId> {
+        if self.made.lock().unwrap().contains_key(id) {
+            return Some(crate::store::Objects::staged_key(project, "made", id, true));
+        }
+        self.at.get(id).map(|(n, _)| crate::store::Objects::staged_key(project, n, id, true))
+    }
 }
 
 impl Source {
@@ -102,10 +184,26 @@ impl Source {
         if let Some(b) = builtin(id) {
             return Ok(b);
         }
+        if let Some(st) = &self.staged {
+            if let Some(raw) = st.made.lock().unwrap().get(id) {
+                return Ok(raw.clone());
+            }
+            if let Some((name, slot)) = st.at.get(id) {
+                // From its staged pack only, never from the project's store
+                // (BUG-1155: that would answer for what the pusher did not
+                // upload).
+                let got = self.rt.block_on(self.hub.objects.get_staged(self.project, name, *slot, id));
+                let Some((_, raw)) = got.map_err(store_err)? else {
+                    return Err(VeilError::Missing(*id));
+                };
+                st.touched.lock().unwrap().insert(*id);
+                return Ok(raw);
+            }
+        }
         self.hub
             .objects
             .get_blocking(&self.rt, self.project, id)
-            .map_err(|e| VeilError::Repo(format!("object store: {e}")))?
+            .map_err(store_err)?
             .ok_or(VeilError::Missing(*id))
     }
 
@@ -116,7 +214,7 @@ impl Source {
         }
         self.rt
             .block_on(self.hub.objects.get_encoded(self.project, id))
-            .map_err(|e| VeilError::Repo(format!("object store: {e}")))?
+            .map_err(store_err)?
             .ok_or(VeilError::Missing(*id))
     }
 
@@ -128,10 +226,36 @@ impl Source {
     }
 }
 
+/// Keep a store error's cause (`pack::IndexesFull` included: BUG-1622)
+/// through [`VeilError`].
+fn store_err(e: anyhow::Error) -> VeilError {
+    VeilError::Io {
+        path: "object store".into(),
+        source: match e.downcast::<crate::pack::IndexesFull>() {
+            Ok(full) => std::io::Error::other(full),
+            Err(e) => match e.downcast::<std::io::Error>() {
+                Ok(io) => io,
+                Err(e) => std::io::Error::other(e),
+            },
+        },
+    }
+}
+
 impl TreeSource for Source {
     fn node(&self, id: &ObjectId) -> veil_core::Result<Node> {
-        let ck = crate::store::Objects::tree_key(self.project, id);
+        // A push's uploads and made trees are cached under keys of their
+        // own, never as the project's.
+        let staged = self.staged.as_ref().and_then(|st| st.tree_key(self.project, id).map(|k| (st, k)));
+        let ck = match &staged {
+            Some((_, k)) => *k,
+            None => crate::store::Objects::tree_key(self.project, id),
+        };
         if let Some(t) = self.hub.trees.get(&ck) {
+            if let Some((st, _)) = &staged {
+                if st.at.contains_key(id) {
+                    st.touched.lock().unwrap().insert(*id);
+                }
+            }
             return Ok(Node::Tree(t.0, t.1));
         }
         let raw = self.raw(id)?;
@@ -172,11 +296,32 @@ pub async fn blocking_with<T: Send + 'static>(
     pending: HashMap<ObjectId, Bytes>,
     f: impl FnOnce(&Source) -> Result<T> + Send + 'static,
 ) -> Result<T> {
+    blocking_in(hub, project, pending, None, f).await
+}
+
+/// [`blocking`], reading a push's `staged` objects before the store.
+pub(crate) async fn blocking_staged<T: Send + 'static>(
+    hub: &Arc<Hub>,
+    project: i64,
+    staged: Option<Arc<Staged>>,
+    f: impl FnOnce(&Source) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    blocking_in(hub, project, HashMap::new(), staged, f).await
+}
+
+async fn blocking_in<T: Send + 'static>(
+    hub: &Arc<Hub>,
+    project: i64,
+    pending: HashMap<ObjectId, Bytes>,
+    staged: Option<Arc<Staged>>,
+    f: impl FnOnce(&Source) -> Result<T> + Send + 'static,
+) -> Result<T> {
     let src = Source {
         hub: hub.clone(),
         project,
         rt: Handle::current(),
         pending,
+        staged,
     };
     tokio::task::spawn_blocking(move || f(&src)).await.map_err(|e| Error::Other(e.into()))?
 }
@@ -196,7 +341,7 @@ pub async fn projected(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, real:
     // repeat: its only writes are memo rows, `ON CONFLICT DO NOTHING`.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
     loop {
-        match Box::pin(projected_inner(hub, project, viewer, real, None)).await {
+        match crate::store::not_own(Box::pin(projected_inner(hub, project, viewer, real, None))).await {
             Err(e) if e.is_retryable() && std::time::Instant::now() < deadline => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
             r => return r,
         }
@@ -216,6 +361,10 @@ struct Deferred {
     /// Those of them whose real snapshot collapsed into its first parent's
     /// projection (a change hidden from that view).
     collapsed: HashSet<ObjectId>,
+    /// The push's uploads and made objects (its new snapshots are there).
+    staged: Option<Arc<Staged>>,
+    /// The projections it signed, among the made objects, for its pack.
+    made: Vec<ObjectId>,
 }
 
 /// Is `id` committed history of `project` (a `snapshots` row; never deleted,
@@ -258,7 +407,8 @@ async fn projected_predecessors(
         }
         let pp = Box::pin(projected_inner(hub, project, viewer, *p, deferred.as_deref_mut())).await?;
         let (p, pp2) = (*p, pp);
-        let same = blocking(hub, project.id, move |src| Ok(src.snapshot(&pp2)?.change_id == src.snapshot(&p)?.change_id)).await?;
+        let staged = deferred.as_ref().and_then(|d| d.staged.clone());
+        let same = blocking_staged(hub, project.id, staged, move |src| Ok(src.snapshot(&pp2)?.change_id == src.snapshot(&p)?.change_id)).await?;
         if same && !out.contains(&pp) {
             out.push(pp);
         }
@@ -278,6 +428,7 @@ async fn projected_inner(
     }
     let view_key = project.view(viewer).key();
     let root = root_snapshot_id();
+    let staged = deferred.as_ref().and_then(|d| d.staged.clone());
     let mut done: HashMap<ObjectId, ObjectId> = HashMap::new();
     let mut stack = vec![(real, false)];
     let mut snaps: HashMap<ObjectId, Arc<Snapshot>> = HashMap::new();
@@ -319,7 +470,7 @@ async fn projected_inner(
                 done.insert(x, p);
                 continue;
             }
-            let s = blocking(hub, project.id, move |src| Ok(src.snapshot(&x)?)).await?;
+            let s = blocking_staged(hub, project.id, staged.clone(), move |src| Ok(src.snapshot(&x)?)).await?;
             stack.push((x, true));
             // Attempts (format 10) are projected like any version, first.
             for p in s.parents.iter().chain(&s.attempts).rev() {
@@ -357,7 +508,7 @@ async fn projected_inner(
         let (proj_text, bindings, viewer2) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
         let hub2 = hub.clone();
         let first_pp = (s.parents.len() == 1).then(|| pparents.first().copied()).flatten();
-        let (result, new_obj) = blocking(hub, project.id, move |src| {
+        let (result, new_obj) = blocking_staged(hub, project.id, staged.clone(), move |src| {
             let policy = AccessPolicy::parse(&proj_text);
             let p = Project {
                 id: src.project,
@@ -370,14 +521,21 @@ async fn projected_inner(
             project_one(src, &p.view(&viewer2), x, &s, pparents, ppreds, pattempts, origin, &hub2.identity)
         })
         .await?;
-        if let Some(raw) = new_obj {
-            hub.objects.put(project.id, &result, raw).await?;
-        }
         // A change hidden from this view: it collapsed into its parent's
         // projection (`projections.collapsed`, BUG-1468).
         let collapsed = first_pp == Some(result);
         let result = match deferred.as_deref_mut() {
             Some(d) => {
+                // Stored with the push's pack (S28).
+                if let Some(raw) = new_obj {
+                    match &d.staged {
+                        Some(st) => {
+                            st.made.lock().unwrap().insert(result, raw);
+                            d.made.push(result);
+                        }
+                        None => hub.objects.put(project.id, &result, raw).await?,
+                    }
+                }
                 d.rows.push((view_key.clone(), x, result));
                 if collapsed {
                     d.collapsed.insert(x);
@@ -385,6 +543,9 @@ async fn projected_inner(
                 result
             }
             None => {
+                if let Some(raw) = new_obj {
+                    hub.objects.put(project.id, &result, raw).await?;
+                }
                 let inserted = sqlx::query(
                     "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) VALUES ($1, $2, $3, $4, $5, $6) \
                      ON CONFLICT DO NOTHING",
@@ -642,6 +803,15 @@ pub(crate) async fn resolve_for(
             true => Ok(Some(r)),
             false => Err(crate::query::graph::warming()),
         };
+    }
+    let has_projection: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM projections WHERE project_id = $1 AND projected_id = $2 LIMIT 1")
+            .bind(project.id)
+            .bind(id.hex())
+            .fetch_optional(&hub.db)
+            .await?;
+    if has_projection.is_none() {
+        return Ok(None);
     }
     let named = *id;
     let cid = blocking(hub, project.id, move |src| match src.snapshot(&named) {
@@ -901,6 +1071,11 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
         check_wants(src, &view, snapshot, &reals, &w2)
     })
     .await?;
+    // Packed objects the answer needs, neighbours read together (BUG-1152).
+    {
+        let ids: Vec<ObjectId> = wants.iter().map(|w| w.id).filter(|id| !created.contains_key(id) && builtin(id).is_none()).collect();
+        hub.objects.prefetch(project.id, &ids).await;
+    }
     // The answer: objects read concurrently (a remote store's latency would
     // otherwise add up one object at a time), at most `FETCH_WINDOW` of
     // them and about `FETCH_WINDOW_BYTES` ahead of the one sent next, each
@@ -1325,12 +1500,26 @@ pub(crate) async fn agent_tip_of(
     to: ObjectId,
     pending: HashMap<ObjectId, Bytes>,
 ) -> Result<Option<AgentTip>> {
+    agent_tip_of_in(hub, project, viewer, branch, cur, to, pending, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn agent_tip_of_in(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    branch: &str,
+    cur: Option<ObjectId>,
+    to: ObjectId,
+    pending: HashMap<ObjectId, Bytes>,
+    staged: Option<Arc<Staged>>,
+) -> Result<Option<AgentTip>> {
     if !viewer.agent {
         return Ok(None);
     }
     let (v, text, bindings) = (viewer.clone(), project.policy_text.clone(), project.bindings.clone());
     let default = branch == project.default_branch;
-    blocking_with(hub, project.id, pending, move |src| {
+    blocking_in(hub, project.id, pending, staged, move |src| {
         let p = Project {
             id: src.project,
             name: String::new(),
@@ -1675,9 +1864,17 @@ pub(crate) fn complete(
     }
     let mut trees: Vec<(ObjectId, Vec<u8>)> = g.created.drain().collect();
     trees.sort();
-    // Store the trees the graft built before checking (the check reads them).
-    for (id, raw) in &trees {
-        src.rt.block_on(src.hub.objects.put(src.project, id, Bytes::from(raw.clone())))?;
+    // The trees the graft built, readable before checking (the check reads
+    // them): a push's go into its pack once every check passed (S28);
+    // anyone else's are stored now.
+    let made: Vec<ObjectId> = trees.iter().map(|(id, _)| *id).collect();
+    for (id, raw) in trees {
+        match &src.staged {
+            Some(st) => {
+                st.made.lock().unwrap().insert(id, Bytes::from(raw));
+            }
+            None => src.rt.block_on(src.hub.objects.put(src.project, &id, Bytes::from(raw)))?,
+        }
     }
     // Every object a changed path names (its object and conflict
     // terms) was uploaded by the pusher, or is named by the
@@ -1743,6 +1940,7 @@ pub(crate) fn complete(
             real: ObjectId::hash(&Object::Snapshot(real).encode()),
             raw: None,
             origin: None,
+            made,
         });
     }
     real.sign(identity);
@@ -1751,6 +1949,7 @@ pub(crate) fn complete(
         real: ObjectId::hash(&raw),
         raw: Some(Bytes::from(raw)),
         origin: None,
+        made,
     })
 }
 
@@ -1760,14 +1959,27 @@ pub(crate) struct Completed {
     pub raw: Option<Bytes>,
     /// The pusher's own snapshot, when the server completed it.
     pub origin: Option<ObjectId>,
+    /// The trees the graft built (stored already, unless the source was a
+    /// push's: then in its made objects).
+    pub made: Vec<ObjectId>,
 }
 
 /// Handle a push (`docs/HUB.md` §4.5): complete and check every new
-/// snapshot, store what the server built, then move every branch in one
-/// transaction of compare-and-swaps, which also writes the snapshot,
-/// origin, projection memo and audit rows: **one database commit per push**
-/// (`storage-and-cost.md` §3). Other viewers' projections are worked out when
-/// they first ask, as before.
+/// snapshot, then move every branch in one transaction of
+/// compare-and-swaps, which also lists the packs holding what the push
+/// stored and writes the snapshot, origin, projection memo and audit rows:
+/// **one database commit per push** (`storage-and-cost.md` §3). Other
+/// viewers' projections are worked out when they first ask, as before.
+///
+/// **What it stores** (S28): the uploads its receipts name are staged packs
+/// ([`upload`]). A staged pack every object of which the checks read is
+/// listed as it is; the objects the checks read from any other, and the
+/// objects the server made (the graft's trees, completed snapshots, the
+/// pusher's signed projections), go into one pack of the push's own. So a
+/// push costs at most one storage write of its own, and none for a `vl`
+/// push's uploads. Staged packs it does not list are discarded once it is
+/// answered, landed or refused (BUG-930), except after an error the request
+/// may be run again for (a database or store error).
 pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, who: &crate::landing::Submitter, req: PushRequest) -> Result<PushResult> {
     Ok(push_with(hub, project, viewer, who, req, false, true).await?.0)
 }
@@ -1786,6 +1998,95 @@ pub(crate) async fn push_with(
     land_all: bool,
     wait: bool,
 ) -> Result<(PushResult, Vec<veil_core::hub::land::LandResult>)> {
+    // In a task of its own: a client that goes away stops the request, not
+    // the push, so its clean-up always runs (BUG-1399); and in the push's
+    // own scope, so the storage writes it makes are counted as its own
+    // (BUG-1398; what it spawns, the deriver and the indexer, are not).
+    let (hub2, project, viewer, who) = (hub.clone(), project.clone(), viewer.clone(), who.clone());
+    tokio::spawn(crate::store::own(async move {
+        push_to_its_end(&hub2, &project, &viewer, &who, req, land_all, wait).await
+    }))
+    .await
+    .map_err(|e| Error::Other(e.into()))?
+}
+
+/// [`push`], to its end.
+async fn push_to_its_end(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    who: &crate::landing::Submitter,
+    mut req: PushRequest,
+    land_all: bool,
+    wait: bool,
+) -> Result<(PushResult, Vec<veil_core::hub::land::LandResult>)> {
+    let person = who.person.id;
+    // The receipts (a long history's are tens of megabytes) are not held
+    // through the checks once read.
+    let receipts = std::mem::take(&mut req.receipts);
+    let staged = receipted(hub, project.id, person, &receipts);
+    drop(receipts);
+    let st = Arc::new(staging(hub, project.id, person, &staged).await?);
+    drop(staged);
+    let uploaded: HashSet<ObjectId> = st.at.keys().copied().collect();
+    let progress = Mutex::new(Progress::default());
+    let r = push_staged(hub, project, viewer, who, req, land_all, wait, uploaded, st.clone(), &progress).await;
+    let p = progress.into_inner().unwrap();
+    let (staged_gone, own_gone): (Vec<Arc<str>>, Vec<Arc<str>>) = match &r {
+        // Landed: every upload it did not list (one its checks did not read
+        // all of: what they read was copied into its own pack).
+        Ok((_, _, Some(kept))) => (st.names().into_iter().filter(|n| !kept.contains(n)).collect(), Vec::new()),
+        // Every update lost a race (not on the tip): every check passed, and
+        // the uploads stay for the next try, which gets their receipts again
+        // (BUG-1157). Nothing written, nothing committed (BUG-910).
+        Ok((_, _, None)) => (Vec::new(), Vec::new()),
+        // Refused by its checks, before its transaction: what it was
+        // refused for is deleted (BUG-930).
+        Err(Error::Api { .. }) if !p.transaction => (st.names(), p.written),
+        // A lost race in its transaction (409), or an error the request may
+        // be run again for: the uploads stay (as above); its own pack goes
+        // (it was recorded staged before it was written: a discard leaves
+        // it alone if its transaction listed it after all).
+        Err(_) => (Vec::new(), p.written),
+    };
+    let gone: Vec<Arc<str>> = staged_gone.into_iter().chain(own_gone).collect();
+    if let Err(e) = hub.objects.discard(project.id, &gone).await {
+        eprintln!("veil-server: discarding what a push did not list: {e:#}");
+    }
+    r.map(|(res, landings, _)| (res, landings))
+}
+
+/// What a push wrote, and whether its transaction began.
+#[derive(Default)]
+pub(crate) struct Progress {
+    /// Its own packs (fresh names, in no receipt).
+    pub(crate) written: Vec<Arc<str>>,
+    pub(crate) transaction: bool,
+}
+
+/// One new snapshot completed, and what its checks read of the uploads.
+type Checked = (Completed, HashSet<ObjectId>);
+
+/// How many new snapshots a push checks at once (BUG-865).
+const CHECKS_AT_ONCE: usize = 8;
+/// How many it checks ahead on a guess, a window at a time.
+const GUESS_WINDOW: usize = 64;
+
+/// [`push`] with its uploads read: the result and the packs it listed
+/// (`None` if nothing landed). `progress`: what it wrote, how far it got.
+#[allow(clippy::too_many_arguments)]
+async fn push_staged(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    who: &crate::landing::Submitter,
+    req: PushRequest,
+    land_all: bool,
+    wait: bool,
+    uploaded: HashSet<ObjectId>,
+    st: Arc<Staged>,
+    progress: &Mutex<Progress>,
+) -> Result<(PushResult, Vec<veil_core::hub::land::LandResult>, Option<HashSet<Arc<str>>>)> {
     let person = who.person.id;
     if !project.participant(viewer) {
         return Err(Error::forbidden("you are not in this project"));
@@ -1828,10 +2129,16 @@ pub(crate) async fn push_with(
     // Every update lands through the landing service (its edits on the tip),
     // none moves a branch here.
     let lands_only = !req.force && req.updates.iter().all(|u| land_all || protected.contains(&u.branch));
+    let mut tip_projection: HashMap<ObjectId, ObjectId> = HashMap::new();
+    for name in moved_names.iter().copied().chain(std::iter::once(project.default_branch.as_str())) {
+        if let Some(t) = current.get(name) {
+            let p = projected(hub, project, viewer, *t).await?;
+            tip_projection.entry(p).or_insert(*t);
+        }
+    }
     // What this pusher uploaded (BUG-824): only that may be new here; any
     // other name is "not uploaded", whether or not the server holds a
     // snapshot by it they cannot see (BUG-1523).
-    let uploaded = Arc::new(receipted(hub, project.id, person, &req.receipts));
     // 1. The new snapshots: everything the new tips reach that the server
     //    does not hold as history or as a projection.
     let mut known: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
@@ -1843,14 +2150,24 @@ pub(crate) async fn push_with(
             continue;
         }
         // Grafted only on what its pusher saw (BUG-1467, BUG-1520).
-        if let Some(r) = resolve_for(hub, project, viewer, &id, &moved_names, lands_only).await? {
-            known.insert(id, vec![r]);
+        if id == root {
+            known.insert(id, vec![root]);
             continue;
+        }
+        if let Some(&t) = tip_projection.get(&id) {
+            known.insert(id, vec![t]);
+            continue;
+        }
+        if !resolve_stored(hub, project.id, &id).await?.is_empty() {
+            if let Some(r) = resolve_for(hub, project, viewer, &id, &moved_names, lands_only).await? {
+                known.insert(id, vec![r]);
+                continue;
+            }
         }
         if !uploaded.contains(&id) {
             return Err(Error::bad_request(format!("snapshot {} was not uploaded", id.short())));
         }
-        let s = blocking(hub, project.id, move |src| match src.snapshot(&id) {
+        let s = blocking_staged(hub, project.id, Some(st.clone()), move |src| match src.snapshot(&id) {
             Err(VeilError::Missing(_)) => Err(Error::bad_request(format!("snapshot {} was not uploaded", id.short()))),
             r => Ok(r?),
         })
@@ -1867,8 +2184,8 @@ pub(crate) async fn push_with(
     let mut order = Vec::new();
     {
         let mut placed = HashSet::new();
-        let mut st: Vec<(ObjectId, bool)> = new.iter().map(|id| (*id, false)).collect();
-        while let Some((id, expanded)) = st.pop() {
+        let mut todo: Vec<(ObjectId, bool)> = new.iter().map(|id| (*id, false)).collect();
+        while let Some((id, expanded)) = todo.pop() {
             if placed.contains(&id) || !parents_of.contains_key(&id) {
                 continue;
             }
@@ -1876,9 +2193,9 @@ pub(crate) async fn push_with(
                 placed.insert(id);
                 order.push(id);
             } else {
-                st.push((id, true));
+                todo.push((id, true));
                 for p in parents_of[&id].parents.iter().chain(&parents_of[&id].attempts) {
-                    st.push((*p, false));
+                    todo.push((*p, false));
                 }
             }
         }
@@ -1904,68 +2221,101 @@ pub(crate) async fn push_with(
         let r = reals[0];
         real_of.insert(*id, r);
     }
-    // 2. Complete and check each new snapshot (`uploaded`: a push names
-    // nothing else that is not already where it was in a parent, BUG-824).
+    // What this pusher uploaded (BUG-824): a push names nothing else that
+    // is not already where it was in a parent.
+    let uploaded = Arc::new(uploaded);
+    // What the walk read of the uploads (the new snapshots).
+    let mut touched = st.touched();
+    // 2. Complete and check each new snapshot, parents first. BUG-865:
+    //    several at once, on the guess that each new parent is completed to
+    //    itself (its real id is its own): a right guess gives exactly the
+    //    answer of checking one at a time (the same inputs), and a wrong one
+    //    is checked again, in order. Results and the first error are taken
+    //    in order, as one at a time.
     let mut completed: Vec<Completed> = Vec::new();
     // Each new real snapshot's real parents and signer (`people.id`).
     let mut real_parents_of: HashMap<ObjectId, (Vec<ObjectId>, i64)> = HashMap::new();
     let mut real_attempts_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
-    for id in &order {
-        let n = parents_of[id].clone();
-        if n.embargo.is_some() {
-            return Err(Error::forbidden(
-                "embargoed merges cannot be pushed to the server yet (docs/HUB.md §11)",
-            ));
-        }
-        let author = match &n.signature {
-            Some(sig) if n.signature_valid() == Some(true) => match signers.get(&sig.key) {
-                Some(&p) => p,
-                None => {
-                    return Err(Error::forbidden(format!(
-                        "snapshot {} is signed by a key no device here is registered with",
-                        id.short()
-                    )))
+    let mut made: Vec<ObjectId> = Vec::new();
+    type Guess = (Vec<ObjectId>, Vec<ObjectId>, Result<Checked>);
+    let mut guessing = true;
+    for window in order.chunks(GUESS_WINDOW) {
+        let mut guesses: HashMap<ObjectId, Guess> = HashMap::new();
+        if guessing && window.len() > 1 {
+            let mut set = tokio::task::JoinSet::new();
+            let mut it = window.iter();
+            loop {
+                while set.len() < CHECKS_AT_ONCE {
+                    let Some(id) = it.next() else { break };
+                    let n = parents_of[id].clone();
+                    if precheck(id, &n, &signers).is_err() {
+                        continue;
+                    }
+                    let rp: Vec<ObjectId> = n.parents.iter().map(|p| real_of.get(p).copied().unwrap_or(*p)).collect();
+                    let ra: Vec<ObjectId> = n.attempts.iter().map(|a| real_of.get(a).copied().unwrap_or(*a)).collect();
+                    let job = complete_one(hub.clone(), project.clone(), viewer.clone(), uploaded.clone(), st.child(), n, rp.clone(), ra.clone());
+                    let id = *id;
+                    set.spawn(async move { (id, rp, ra, job.await) });
                 }
-            },
-            _ => return Err(Error::forbidden(format!("snapshot {} is unsigned or its signature is invalid", id.short()))),
-        };
-        if n.parents.is_empty() {
-            return Err(Error::bad_request("a snapshot without parents (only the root has none)"));
+                match set.join_next().await {
+                    Some(Ok((id, rp, ra, r))) => {
+                        guesses.insert(id, (rp, ra, r));
+                    }
+                    Some(Err(e)) => return Err(Error::Other(e.into())),
+                    None => break,
+                }
+            }
         }
-        let real_parents: Vec<ObjectId> = n.parents.iter().map(|p| real_of[p]).collect();
-        let real_attempts: Vec<ObjectId> =
-            n.attempts.iter().map(|a| real_of.get(a).copied().ok_or_else(|| Error::bad_request("an attempt is not a snapshot of this project"))).collect::<Result<_>>()?;
-        let (policy_text_acc, bindings, viewer2, n2) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone(), n.clone());
-        let hub2 = hub.clone();
-        let rp = real_parents.clone();
-        let ra = real_attempts.clone();
-        let uploaded = uploaded.clone();
-        let c = blocking(hub, project.id, move |src| {
-            let p = Project {
-                id: src.project,
-                name: String::new(),
-                default_branch: String::new(),
-                policy: AccessPolicy::parse(&policy_text_acc),
-                policy_text: policy_text_acc,
-                bindings,
+        let mut wrong = 0;
+        for id in window {
+            let n = parents_of[id].clone();
+            let author = precheck(id, &n, &signers)?;
+            let real_parents: Vec<ObjectId> = n.parents.iter().map(|p| real_of[p]).collect();
+            let real_attempts: Vec<ObjectId> = n
+                .attempts
+                .iter()
+                .map(|a| real_of.get(a).copied().ok_or_else(|| Error::bad_request("an attempt is not a snapshot of this project")))
+                .collect::<Result<_>>()?;
+            let (c, read) = match guesses.remove(id) {
+                Some((rp, ra, r)) if rp == real_parents && ra == real_attempts => r?,
+                g => {
+                    wrong += usize::from(g.is_some());
+                    complete_one(
+                        hub.clone(),
+                        project.clone(),
+                        viewer.clone(),
+                        uploaded.clone(),
+                        st.child(),
+                        n,
+                        real_parents.clone(),
+                        real_attempts.clone(),
+                    )
+                    .await?
+                }
             };
-            complete(src, &p, &viewer2, &uploaded, &n2, &rp, &ra, &hub2.identity)
-        })
-        .await?;
-        let c = Completed {
-            origin: c.raw.as_ref().map(|_| *id),
-            ..c
-        };
-        if let Some(raw) = &c.raw {
-            hub.objects.put(project.id, &c.real, raw.clone()).await?;
+            let c = Completed {
+                origin: c.raw.as_ref().map(|_| *id),
+                ..c
+            };
+            touched.extend(read);
+            made.extend(c.made.iter().copied());
+            if let Some(raw) = &c.raw {
+                st.made.lock().unwrap().insert(c.real, raw.clone());
+                made.push(c.real);
+            }
+            real_of.insert(*id, c.real);
+            // What its landing records: its parents and author (S17, BUG-1581);
+            // its attempts (S11) are recorded with it, but are no branch's
+            // history: kept apart, so that no attempt counts as landed.
+            real_parents_of.insert(c.real, (real_parents, author));
+            real_attempts_of.insert(c.real, real_attempts);
+            completed.push(c);
         }
-        real_of.insert(*id, c.real);
-        // What its landing records: its parents and author (S17, BUG-1581);
-        // its attempts (S11) are recorded with it, but are no branch's
-        // history: kept apart, so that no attempt counts as landed.
-        real_parents_of.insert(c.real, (real_parents, author));
-        real_attempts_of.insert(c.real, real_attempts);
-        completed.push(c);
+        // Mostly wrong (a pusher who cannot see everything: the server
+        // completes each snapshot): one at a time from here.
+        if wrong * 2 > window.len() {
+            guessing = false;
+        }
     }
     // 3. Move the branches: one serialisable transaction of compare-and-swaps.
     let mut plans = Vec::new();
@@ -1988,7 +2338,7 @@ pub(crate) async fn push_with(
         };
         if let Some(n) = new_real {
             // An attempt never lands (`Snapshot::abandoned`).
-            if blocking(hub, project.id, move |src| Ok(src.snapshot(&n)?.abandoned.is_some())).await? {
+            if blocking_staged(hub, project.id, Some(st.clone()), move |src| Ok(src.snapshot(&n)?.abandoned.is_some())).await? {
                 return Err(Error::bad_request(format!("branch '{}': an abandoned attempt is never a branch's tip", u.branch)));
             }
         }
@@ -2016,7 +2366,7 @@ pub(crate) async fn push_with(
             }
             // Every change between the branch's tip and the pushed one: what
             // this push brought, and what the server already held (BUG-1103).
-            let judged = match crate::landing::stack(hub, project, viewer, &u.branch, new_real, &real_parents_of).await? {
+            let judged = match crate::landing::stack(hub, project, viewer, &u.branch, new_real, &real_parents_of, Some(st.clone())).await? {
                 Ok(s) if !s.branch => {
                     results.push(refuse(&format!("there is no branch '{}' to land on", u.branch)));
                     continue;
@@ -2029,7 +2379,7 @@ pub(crate) async fn push_with(
             };
             // S11's agent rule (`agent_tip`) on the stack's edits before the
             // landing is queued (BUG-1636).
-            if let Some(msg) = crate::landing::agent_stack(hub, project, viewer, &u.branch, &judged, new_real, !land_all).await? {
+            if let Some(msg) = crate::landing::agent_stack(hub, project, viewer, &u.branch, &judged, new_real, !land_all, Some(st.clone())).await? {
                 let cur_seen = match cur {
                     Some(c) => Some(projected(hub, project, viewer, c).await?),
                     None => None,
@@ -2089,7 +2439,7 @@ pub(crate) async fn push_with(
         // first, for a narrowed one, anything outside its paths; then the
         // files that decide access or review, a new default branch included.
         if let Some(n) = new_real {
-            match agent_tip_of(hub, project, viewer, &u.branch, cur, n, HashMap::new()).await? {
+            match agent_tip_of_in(hub, project, viewer, &u.branch, cur, n, HashMap::new(), Some(st.clone())).await? {
                 Some(AgentTip::Narrowed) => {
                     results.push(BranchResult {
                         branch: u.branch.clone(),
@@ -2106,7 +2456,7 @@ pub(crate) async fn push_with(
             }
         }
         if let (Some(c), Some(n)) = (cur, new_real) {
-            if !req.force && !is_ancestor(hub, project.id, c, n).await? {
+            if !req.force && !is_ancestor_in(hub, project.id, Some(st.clone()), c, n).await? {
                 results.push(BranchResult {
                     branch: u.branch.clone(),
                     ok: false,
@@ -2121,7 +2471,7 @@ pub(crate) async fn push_with(
         let (mut accept, mut policy_text_update) = (None, None);
         if u.branch == project.default_branch {
             if let Some(n) = new_real {
-                let text = blocking(hub, project.id, move |src| policy_text(src, &src.snapshot(&n)?.tree)).await?;
+                let text = blocking_staged(hub, project.id, Some(st.clone()), move |src| policy_text(src, &src.snapshot(&n)?.tree)).await?;
                 let incoming = AccessPolicy::parse(&text);
                 if !incoming.same_rules(&project.policy) {
                     if !viewer.admin {
@@ -2136,7 +2486,7 @@ pub(crate) async fn push_with(
                 }
                 // The branch rules likewise: against the tip, never a
                 // parent's (BUG-1102).
-                let changed = blocking(hub, project.id, move |src| {
+                let changed = blocking_staged(hub, project.id, Some(st.clone()), move |src| {
                     let t = match cur {
                         Some(c) => Some(src.snapshot(&c)?.tree),
                         None => None,
@@ -2157,6 +2507,8 @@ pub(crate) async fn push_with(
         fresh: completed.iter().map(|c| (c.real, c.origin)).collect(),
         rows: Vec::new(),
         collapsed: HashSet::new(),
+        staged: Some(st.clone()),
+        made: Vec::new(),
     };
     for (_, _, new, _, _) in &plans {
         if let Some(n) = new {
@@ -2166,6 +2518,8 @@ pub(crate) async fn push_with(
     for q in &queued {
         Box::pin(projected_inner(hub, project, viewer, q.stack.last().expect("a stack is never empty").id, Some(&mut deferred))).await?;
     }
+    touched.extend(st.touched());
+    made.extend(deferred.made.iter().copied());
     // Only the snapshots this push made (known ones are recorded already:
     // rewriting their rows made every racing pusher write the same row),
     // and of those only what the updates that land reach: a refused
@@ -2183,6 +2537,14 @@ pub(crate) async fn push_with(
         seen
     };
     completed.retain(|c| landing.contains(&c.real));
+    // What it stores (S28), when something lands: staged packs whose every
+    // object the checks read, as they are; the rest of what they read, and
+    // what the server made, in one pack of the push's own.
+    let commits = !plans.is_empty() || !queued.is_empty();
+    let listed = match commits {
+        false => Vec::new(),
+        true => packs_to_list(hub, project.id, person, &st, &touched, &made, progress).await?,
+    };
     let new_reals: Vec<(String, i64)> = completed
         .iter()
         .map(|c| (c.real.hex(), real_parents_of.get(&c.real).map_or(0, |(_, a)| *a)))
@@ -2221,9 +2583,15 @@ pub(crate) async fn push_with(
     let (queued2, who2) = (queued.clone(), who.clone());
     // Whoever lands here hears at once (registered before the commit).
     let waiters: Vec<crate::landing::Waiter> = queued.iter().map(|q| hub.landing.register(&q.ticket)).collect();
+    let packs: (Vec<String>, Vec<i64>, Vec<i64>) = (
+        listed.iter().map(|p| p.name.to_string()).collect(),
+        listed.iter().map(|p| p.size as i64).collect(),
+        listed.iter().map(|p| p.objects as i64).collect(),
+    );
     // Nothing to move (every update refused: the pusher pulls and tries
     // again): no commit, and nothing recorded as history no branch reaches.
-    let (moved, memo_stored) = if plans.is_empty() && queued.is_empty() {
+    progress.lock().unwrap().transaction = commits;
+    let (moved, memo_stored) = if !commits {
         (Vec::new(), Vec::new())
     } else {
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
@@ -2233,6 +2601,7 @@ pub(crate) async fn push_with(
         let origins = origins.clone();
         let memos = memos.clone();
         let (queued, who) = (queued2.clone(), who2.clone());
+        let packs = packs.clone();
         Box::pin(async move {
             for q in &queued {
                 crate::landing::insert(&mut *c, pid, &who, q).await?;
@@ -2303,6 +2672,33 @@ pub(crate) async fn push_with(
                     }
                 }
             }
+            // The packs that hold what this push stored (S28): an upload's
+            // staged pack, or the push's own. A pack a refused push of the
+            // same person discarded first cannot be listed: nothing lands,
+            // and `vl` uploads again.
+            if !packs.0.is_empty() {
+                // A staged row turns listed (locked by the update: a racing
+                // discard waits, then finds it listed); the push's own pack
+                // gets its row here; a discarded one stays discarded.
+                let states: Vec<i16> = sqlx::query_scalar(
+                    "INSERT INTO packs (project_id, name, state, size, objects, created_at) \
+                     SELECT $1, n, $6, s, o, $5 FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]) AS t(n, s, o) \
+                     ON CONFLICT (project_id, name) DO UPDATE \
+                     SET state = CASE WHEN packs.state = $7 THEN packs.state ELSE $6 END RETURNING state",
+                )
+                .bind(pid)
+                .bind(&packs.0)
+                .bind(&packs.1)
+                .bind(&packs.2)
+                .bind(veil_core::now_millis())
+                .bind(crate::pack::LISTED)
+                .bind(crate::pack::DISCARDED)
+                .fetch_all(&mut *c)
+                .await?;
+                if states.contains(&crate::pack::DISCARDED) {
+                    return Err(Error::conflict("an upload this push names was discarded; push again"));
+                }
+            }
             for (r, author) in &new_reals {
                 sqlx::query("INSERT INTO snapshots (project_id, id, author) VALUES ($1, $2, $3) ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0")
                     .bind(pid)
@@ -2367,6 +2763,30 @@ pub(crate) async fn push_with(
             }
         }
     };
+    let kept = if commits {
+        // Before anything reads what it stored; the push's share of the
+        // index bound goes back as soon as its index enters the lookup map.
+        let (for_cache, names): (Vec<_>, HashSet<_>) = listed
+            .into_iter()
+            .map(|p| ((p.name.clone(), p.held.map(|h| h.index)), p.name))
+            .unzip();
+        hub.objects.listed(project.id, for_cache);
+        if !moved.is_empty() {
+            hub.caches.tips_changed(project.id);
+        }
+        for c in &completed {
+            hub.caches.put_committed(project.id, &c.real);
+        }
+        Some(names)
+    } else {
+        drop(listed);
+        None
+    };
+    for ((view_key, real, projected), stored) in deferred.rows.iter().zip(memo_stored) {
+        if stored {
+            hub.caches.put_memo(project.id, view_key, real, projected);
+        }
+    }
     // The landings: their services wake, and with `wait` the push answers
     // once they are decided.
     let deadline = tokio::time::Instant::now() + crate::landing::WAIT;
@@ -2387,17 +2807,6 @@ pub(crate) async fn push_with(
         r.warnings.extend(crate::landing::skipped_warnings(hub, project.id, &q.branch, &skipped).await?);
         landings.push(r);
     }
-    if !moved.is_empty() {
-        hub.caches.tips_changed(project.id);
-        for c in &completed {
-            hub.caches.put_committed(project.id, &c.real);
-        }
-    }
-    for ((view_key, real, projected), stored) in deferred.rows.iter().zip(memo_stored) {
-        if stored {
-            hub.caches.put_memo(project.id, view_key, real, projected);
-        }
-    }
     // Derived history data for the branches moved, in the background: the
     // push never waits.
     crate::derive::landed(hub, project.id, moved);
@@ -2413,7 +2822,7 @@ pub(crate) async fn push_with(
     } else {
         project
     };
-    let warnings = match accepted {
+    let mut warnings = match accepted {
         true => crate::perm::accepted_listing(project),
         false => Vec::new(),
     };
@@ -2424,7 +2833,6 @@ pub(crate) async fn push_with(
         };
         results.push(BranchResult { branch, ok: true, message: None, tip, ticket: None });
     }
-    let mut warnings = warnings;
     for (q, l) in queued.iter().zip(&landings) {
         use veil_core::hub::land::LandState;
         warnings.extend(l.warnings.iter().cloned());
@@ -2445,12 +2853,131 @@ pub(crate) async fn push_with(
             ticket: Some(q.ticket.clone()),
         });
     }
-    Ok((PushResult { results, warnings }, landings))
+    Ok((PushResult { results, warnings }, landings, kept))
 }
 
-/// Is `a` an ancestor of (or equal to) `b` in the real history?
-pub(crate) async fn is_ancestor(hub: &Arc<Hub>, project: i64, a: ObjectId, b: ObjectId) -> Result<bool> {
-    blocking(hub, project, move |src| {
+/// The checks of new snapshot `id` (`n`) that need nothing but itself:
+/// no embargo, signed by a registered device (`signers`), parents.
+/// Returns the signer's `people.id`.
+fn precheck(id: &ObjectId, n: &Snapshot, signers: &HashMap<String, i64>) -> Result<i64> {
+    if n.embargo.is_some() {
+        return Err(Error::forbidden(
+            "embargoed merges cannot be pushed to the server yet (docs/HUB.md §11)",
+        ));
+    }
+    let author = match &n.signature {
+        Some(sig) if n.signature_valid() == Some(true) => match signers.get(&sig.key) {
+            Some(&p) => p,
+            None => {
+                return Err(Error::forbidden(format!(
+                    "snapshot {} is signed by a key no device here is registered with",
+                    id.short()
+                )))
+            }
+        },
+        _ => return Err(Error::forbidden(format!("snapshot {} is unsigned or its signature is invalid", id.short()))),
+    };
+    if n.parents.is_empty() {
+        return Err(Error::bad_request("a snapshot without parents (only the root has none)"));
+    }
+    Ok(author)
+}
+
+/// [`complete`] new snapshot `n` on real parents `rp` and real attempts `ra`,
+/// reading the push's uploads through `staged` (one completion's own): the
+/// result, and what it read of the uploads.
+#[allow(clippy::too_many_arguments)]
+async fn complete_one(
+    hub: Arc<Hub>,
+    project: Project,
+    viewer: Viewer,
+    uploaded: Arc<HashSet<ObjectId>>,
+    staged: Arc<Staged>,
+    n: Arc<Snapshot>,
+    rp: Vec<ObjectId>,
+    ra: Vec<ObjectId>,
+) -> Result<Checked> {
+    let st = staged.clone();
+    let hub2 = hub.clone();
+    let c = blocking_staged(&hub, project.id, Some(staged), move |src| {
+        complete(src, &project, &viewer, &uploaded, &n, &rp, &ra, &hub2.identity)
+    })
+    .await?;
+    Ok((c, st.touched()))
+}
+
+/// The packs a landing push lists (S28): each staged pack every object of
+/// which its checks read (`touched`), as it is; and, if anything is left,
+/// one pack of its own (written now, named in `written`) with the objects
+/// it read from any other staged pack and those the server made for it
+/// (`made`). Nothing a check did not read is kept. `progress` records the
+/// pack it writes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn packs_to_list(
+    hub: &Arc<Hub>,
+    project: i64,
+    person: i64,
+    st: &Staged,
+    touched: &HashSet<ObjectId>,
+    made: &[ObjectId],
+    progress: &Mutex<Progress>,
+) -> Result<Vec<ListedPack>> {
+    let mut listed = Vec::new();
+    let mut kept: HashSet<ObjectId> = HashSet::new();
+    for (name, sp) in st.packs.iter() {
+        // Every object of the pack: one the receipts name here, and read.
+        if sp.objects > 0 && sp.slots.len() == sp.objects && sp.slots.iter().all(|(id, _)| touched.contains(id)) {
+            if hub.objects.staged_index(project, name).await.map_err(Error::Other)?.is_none() {
+                return Err(Error::conflict("an upload this push names was discarded; push again"));
+            }
+            kept.extend(sp.slots.iter().map(|(id, _)| *id));
+            listed.push(ListedPack { name: name.clone(), size: sp.size, objects: sp.objects, held: None });
+        }
+    }
+    let mut own: Vec<(ObjectId, Bytes)> = Vec::new();
+    for (name, sp) in st.packs.iter() {
+        for (id, slot) in sp.slots.iter() {
+            if touched.contains(id) && kept.insert(*id) {
+                let (enc, _) = hub
+                    .objects
+                    .get_staged(project, name, *slot, id)
+                    .await
+                    .map_err(Error::Other)?
+                    .ok_or_else(|| Error::conflict("an upload this push names was discarded; push again"))?;
+                own.push((*id, enc));
+            }
+        }
+    }
+    let made_objects: Vec<(ObjectId, Bytes)> = {
+        let m = st.made.lock().unwrap();
+        made.iter().filter(|id| !kept.contains(*id)).filter_map(|id| Some((*id, m.get(id)?.clone()))).collect()
+    };
+    if !made_objects.is_empty() {
+        // Compressed on a blocking thread (the server's own encoding).
+        let enc = tokio::task::spawn_blocking(move || made_objects.into_iter().map(|(id, raw)| (id, crate::store::encode(raw))).collect::<Vec<_>>())
+            .await
+            .map_err(|e| Error::Other(e.into()))?;
+        own.extend(enc);
+    }
+    while !own.is_empty() {
+        let rest = if own.len() > crate::pack::MAX_OBJECTS {
+            own.split_off(crate::pack::MAX_OBJECTS)
+        } else {
+            Vec::new()
+        };
+        let (name, mut held) = hub.objects.put_pack(project, person, own).await.map_err(Error::Other)?;
+        held.unproject();
+        progress.lock().unwrap().written.push(name.clone());
+        listed.push(ListedPack { name, size: held.size, objects: held.index.len(), held: Some(held) });
+        own = rest;
+    }
+    Ok(listed)
+}
+
+/// Is `a` an ancestor of (or equal to) `b` in the real history (a push's
+/// `staged` snapshots read first)?
+async fn is_ancestor_in(hub: &Arc<Hub>, project: i64, staged: Option<Arc<Staged>>, a: ObjectId, b: ObjectId) -> Result<bool> {
+    blocking_staged(hub, project, staged, move |src| {
         let mut seen = HashSet::new();
         let mut stack = vec![b];
         while let Some(x) = stack.pop() {
@@ -2467,46 +2994,200 @@ pub(crate) async fn is_ancestor(hub: &Arc<Hub>, project: i64, a: ObjectId, b: Ob
     .await
 }
 
-/// The receipt for `person` uploading object `id` to `project`: a MAC only
-/// the server can make. A push shows it for each object it introduces.
-pub fn receipt(hub: &Hub, project: i64, person: i64, id: &ObjectId) -> String {
+/// The receipt for `person` uploading object `id` to `project` in staged
+/// pack `pack` (S28): a MAC only the server can make, then the pack's name.
+/// A push shows it for each object it introduces; the server reads the
+/// object from that pack, and only for that person.
+pub fn receipt(hub: &Hub, project: i64, person: i64, id: &ObjectId, pack: &str) -> String {
+    format!("{}.{pack}", mac(hub, project, person, id, pack))
+}
+
+fn mac(hub: &Hub, project: i64, person: i64, id: &ObjectId, pack: &str) -> String {
     let mut h = blake3::Hasher::new_keyed(&hub.receipt_key);
     h.update(&project.to_le_bytes());
     h.update(&person.to_le_bytes());
     h.update(&id.0);
+    h.update(b"staged in");
+    h.update(pack.as_bytes());
     hex::encode(&h.finalize().as_bytes()[..16])
 }
 
-/// The objects whose receipts in `receipts` are `person`'s (compared in
-/// constant time).
-pub(crate) fn receipted(hub: &Hub, project: i64, person: i64, receipts: &std::collections::BTreeMap<ObjectId, String>) -> HashSet<ObjectId> {
-    receipts
-        .iter()
-        .filter(|(id, r)| {
-            let want = receipt(hub, project, person, id);
-            r.len() == want.len() && r.bytes().zip(want.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
-        })
-        .map(|(id, _)| *id)
-        .collect()
+/// Compared in constant time.
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Store uploaded objects (`docs/HUB.md` §4.5). Each frame, plain or
-/// compressed (`docs/HUB.md` §13.15), is decoded (bounded: at most the
-/// object size limit each, at most `limit` bytes for the whole request, a
-/// compressed one only if it expands at most [`encoding::MAX_RATIO`] times
-/// its size, and at most [`DECODING_IN_FLIGHT`] bytes across the server at
-/// once: BUG-1009), re-hashed against its id, and must decode canonically
-/// (safe names, sorted trees) at a repository format the server serves.
-/// It is stored as the server's own encoding of it, never as the client
-/// sent it, so no client chooses the stored bytes of an object others
-/// share (BUG-1008). Nothing uploaded is visible until a push makes a
-/// branch reach it. Returns a receipt per object, in order (stored whether
-/// or not the project held it already, so the answer is the same either
-/// way).
+/// The staged pack of each object whose receipt in `receipts` is
+/// `person`'s. A receipt is only a claim: what was uploaded is what
+/// [`staging`] finds in those packs. (Receipts without a pack, from servers
+/// before S28, are not accepted: the upgrade to S28 is not rolling,
+/// BUG-1158.)
+pub(crate) fn receipted(hub: &Hub, project: i64, person: i64, receipts: &std::collections::BTreeMap<ObjectId, String>) -> HashMap<ObjectId, Arc<str>> {
+    let mut staged = HashMap::new();
+    let mut names: HashMap<&str, Arc<str>> = HashMap::new();
+    for (id, r) in receipts {
+        let Some((m, p)) = r.split_once('.') else { continue };
+        if !crate::pack::valid_name(p) || !same(m, &mac(hub, project, person, id, p)) {
+            continue;
+        }
+        staged.insert(*id, names.entry(p).or_insert_with(|| Arc::from(p)).clone());
+    }
+    staged
+}
+
+/// The staged packs `staged` names (from [`receipted`]) that `person`
+/// uploaded and nobody discarded (the database's rows: BUG-1155), what
+/// the push keeps of each one's index (its object count, its length and
+/// the slots of the objects the receipts name in it: the index itself is
+/// held, under its share of the server's bound on indexes, only while it
+/// is read, BUG-1496), and where each object is. **An object counts as
+/// uploaded only if its receipt's pack holds it** ([`Staged::uploaded`]):
+/// a receipt of a discarded upload, or of another pack, is worth nothing,
+/// and the object is never looked for in the project's store instead.
+async fn staging(hub: &Arc<Hub>, project: i64, person: i64, staged: &HashMap<ObjectId, Arc<str>>) -> Result<Staged> {
+    let mut by_pack: HashMap<Arc<str>, Vec<ObjectId>> = HashMap::new();
+    for (id, n) in staged {
+        by_pack.entry(n.clone()).or_default().push(*id);
+    }
+    let mut names: Vec<Arc<str>> = by_pack.keys().cloned().collect();
+    names.sort();
+    let usable = hub.objects.usable(project, person, &names).await.map_err(Error::Other)?;
+    let mut packs: Vec<StagedPack> = Vec::new();
+    let mut set = tokio::task::JoinSet::new();
+    let mut it = names.into_iter().filter(|n| usable.contains(n));
+    loop {
+        while set.len() < 16 {
+            let Some(n) = it.next() else { break };
+            let h = hub.clone();
+            let ids = by_pack.remove(&n).unwrap_or_default();
+            set.spawn(async move {
+                let r = h.objects.staged_slots(project, &n, &ids).await;
+                (n, r)
+            });
+        }
+        match set.join_next().await {
+            Some(Ok((n, Ok(Some(slots))))) => packs.push((n, slots)),
+            Some(Ok((_, Ok(None)))) => {}
+            Some(Ok((_, Err(e)))) => return Err(Error::Other(e)),
+            Some(Err(e)) => return Err(Error::Other(e.into())),
+            None => break,
+        }
+    }
+    let at = packs
+        .iter()
+        .flat_map(|(n, sp)| sp.slots.iter().map(move |(id, s)| (*id, (n.clone(), *s))))
+        .collect();
+    Ok(Staged {
+        at: Arc::new(at),
+        packs: Arc::new(packs),
+        made: Default::default(),
+        touched: Mutex::new(HashSet::new()),
+    })
+}
+
+/// Most bytes of uploaded objects one API commit may name. They are held
+/// decoded for its checks under [`DECODING_IN_FLIGHT`] for every request
+/// together (BUG-1156): a commit naming more than that takes all of it, so
+/// one at a time.
+pub const MAX_API_UPLOADS: u64 = MAX_FRAME_OBJECT as u64;
+
+/// The objects an API commit's `receipts` name in its staged packs (S28),
+/// read into memory for its checks (`changes`: what the commit keeps is
+/// stored once every check passed), at most [`MAX_API_UPLOADS`] bytes of
+/// them decoded, held under the server-wide bound on decoded bytes (the
+/// share returned: keep it while the objects are held, BUG-1156); and the
+/// objects uploaded. [`settle_uploads`] discards the packs when the commit
+/// is answered.
+pub(crate) async fn take_uploads(
+    hub: &Arc<Hub>,
+    project: i64,
+    person: i64,
+    receipts: &std::collections::BTreeMap<ObjectId, String>,
+) -> Result<(HashSet<ObjectId>, HashMap<ObjectId, Bytes>, Option<crate::store::ReadAhead>)> {
+    let staged = receipted(hub, project, person, receipts);
+    let st = staging(hub, project, person, &staged).await?;
+    // What they decode to, from their first bytes, before anything is read
+    // whole: the share is taken first (BUG-1397).
+    let mut total = 0u64;
+    let mut wanted = Vec::new();
+    for (id, (name, slot)) in st.at.iter() {
+        let Some(declared) = hub.objects.staged_declared(project, name, *slot, id).await.map_err(Error::Other)? else { continue };
+        total = total.saturating_add(declared);
+        if total > MAX_API_UPLOADS {
+            return Err(Error::bad_request(format!(
+                "a commit through the API names at most {} MiB of uploaded objects: push larger changes with `vl push`",
+                MAX_API_UPLOADS >> 20
+            )));
+        }
+        wanted.push((*id, name.clone(), *slot));
+    }
+    let held = match total {
+        0 => None,
+        n => Some(crate::store::ReadAhead::wait(n).await),
+    };
+    // Then one at a time: read, decode (within what it declared), keep.
+    let mut out = HashMap::new();
+    for (id, name, slot) in wanted {
+        let Some(enc) = hub.objects.staged_encoding(project, &name, slot, &id).await.map_err(Error::Other)? else { continue };
+        let raw = tokio::task::spawn_blocking(move || -> veil_core::Result<Bytes> {
+            Ok(match encoding::decode(&id, &enc, MAX_API_UPLOADS)? {
+                Cow::Owned(v) => Bytes::from(v),
+                Cow::Borrowed(_) => enc.clone(),
+            })
+        })
+        .await
+        .map_err(|e| Error::Other(e.into()))??;
+        out.insert(id, raw);
+    }
+    Ok((out.keys().copied().collect(), out, held))
+}
+
+/// After an API commit with `receipts` was answered with `outcome`: its
+/// staged packs are discarded when it landed (what it kept was stored) or
+/// its checks refused it (BUG-930); not after a lost race (409: every check
+/// passed, and the caller may try again with the same receipts) or a
+/// database error the request is run again for (`db::retry_requests`
+/// reads them again).
+pub(crate) async fn settle_uploads<T>(
+    hub: &Arc<Hub>,
+    project: i64,
+    person: i64,
+    receipts: &std::collections::BTreeMap<ObjectId, String>,
+    outcome: &Result<T>,
+) {
+    match outcome {
+        Ok(_) => {}
+        Err(Error::Api { status, .. }) if *status != axum::http::StatusCode::CONFLICT => {}
+        Err(_) => return,
+    }
+    let mut names: Vec<Arc<str>> = receipted(hub, project, person, receipts).into_values().collect();
+    names.sort();
+    names.dedup();
+    if let Err(e) = hub.objects.discard(project, &names).await {
+        eprintln!("veil-server: discarding staged uploads: {e:#}");
+    }
+}
+
+/// Check uploaded objects (`docs/HUB.md` §4.5) and stage them (S28). Each
+/// frame, plain or compressed (`docs/HUB.md` §13.15), is decoded (bounded:
+/// at most the object size limit each, at most `limit` bytes for the whole
+/// request, a compressed one only if it expands at most
+/// [`encoding::MAX_RATIO`] times its size, and at most
+/// [`DECODING_IN_FLIGHT`] bytes across the server at once: BUG-1009),
+/// re-hashed against its id, and must decode canonically (safe names,
+/// sorted trees) at a repository format the server serves. It is kept as
+/// the server's own encoding of it, never as the client sent it, so no
+/// client chooses the stored bytes of an object others share (BUG-1008).
+/// The request's objects are written as **one staged pack** (one storage
+/// write), which nobody reads but a push or API commit of the same person
+/// that shows its receipts; a push that lands lists it, a refused one
+/// deletes it (BUG-930). Returns a receipt per object, in order (made
+/// whether or not the project held it already, so the answer is the same
+/// either way).
 pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limit: u64) -> Result<Vec<String>> {
     // The checks, decoding and compressing on a blocking thread.
     let rt = Handle::current();
-    let frames: Vec<(ObjectId, Bytes)> = tokio::task::spawn_blocking(move || -> Result<Vec<(ObjectId, Bytes)>> {
+    let mut frames: Vec<(ObjectId, Bytes)> = tokio::task::spawn_blocking(move || -> Result<Vec<(ObjectId, Bytes)>> {
         let mut left = limit;
         let mut out = Vec::new();
         for (id, enc) in encoding::split_frames(&body)? {
@@ -2553,9 +3234,22 @@ pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limi
     })
     .await
     .map_err(|e| Error::Other(e.into()))??;
-    let receipts = frames.iter().map(|(id, _)| receipt(hub, project, person, id)).collect();
-    // Encodings, checked above: stored as they are, never encoded again.
-    put_many(hub, project, frames, true).await?;
+    if frames.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut receipts = Vec::with_capacity(frames.len());
+    while !frames.is_empty() {
+        let rest = if frames.len() > crate::pack::MAX_OBJECTS {
+            frames.split_off(crate::pack::MAX_OBJECTS)
+        } else {
+            Vec::new()
+        };
+        let ids: Vec<ObjectId> = frames.iter().map(|(id, _)| *id).collect();
+        // Encodings, checked above: staged as they are, never encoded again.
+        let pack = crate::store::own(hub.objects.stage(project, person, frames)).await.map_err(Error::Other)?;
+        receipts.extend(ids.iter().map(|id| receipt(hub, project, person, id, &pack)));
+        frames = rest;
+    }
     Ok(receipts)
 }
 
@@ -2563,24 +3257,13 @@ pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limi
 /// `project`, at most [`PUTS_AT_ONCE`] at a time (an object store answers a
 /// flood with "slow down": BUG-1053).
 pub async fn put_all(hub: &Arc<Hub>, project: i64, objects: impl IntoIterator<Item = (ObjectId, Bytes)>) -> Result<()> {
-    put_many(hub, project, objects, false).await
-}
-
-/// [`put_all`] of canonical encodings, or (`encoded`) of checked encodings
-/// stored as they are ([`crate::store::Objects::put_encoded`]).
-async fn put_many(hub: &Arc<Hub>, project: i64, objects: impl IntoIterator<Item = (ObjectId, Bytes)>, encoded: bool) -> Result<()> {
     let mut set = tokio::task::JoinSet::new();
     let mut it = objects.into_iter();
     loop {
         while set.len() < PUTS_AT_ONCE {
             let Some((id, b)) = it.next() else { break };
             let h = hub.clone();
-            set.spawn(async move {
-                match encoded {
-                    true => h.objects.put_encoded(project, &id, b).await,
-                    false => h.objects.put(project, &id, b).await,
-                }
-            });
+            set.spawn(async move { h.objects.put(project, &id, b).await });
         }
         match set.join_next().await {
             Some(r) => r.map_err(|e| Error::Other(e.into()))??,

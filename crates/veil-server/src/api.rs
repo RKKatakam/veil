@@ -713,9 +713,13 @@ async fn changes(
     Path(p): Path<String>,
     Json(req): Json<veil_core::hub::changes::ChangeRequest>,
 ) -> Result<Json<veil_core::hub::changes::ChangeResult>> {
-    caller.signed_in()?;
+    let me = caller.signed_in()?.id;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
-    Ok(Json(crate::changes::create(&hub, &project, &viewer, &caller, req).await?))
+    // Its staged uploads are discarded once it is answered (S28, BUG-930).
+    let receipts = req.receipts.clone();
+    let r = crate::changes::create(&hub, &project, &viewer, &caller, req).await;
+    sync::settle_uploads(&hub, project.id, me, &receipts, &r).await;
+    Ok(Json(r?))
 }
 
 #[derive(Deserialize)]

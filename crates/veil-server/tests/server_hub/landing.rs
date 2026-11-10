@@ -96,6 +96,7 @@ fn source(hub: &TestHub, project: i64) -> veil_server::sync::Source {
         project,
         rt: hub.rt.handle().clone(),
         pending: Default::default(),
+        staged: None,
     }
 }
 
@@ -361,9 +362,9 @@ fn only_the_lease_holder_lands_and_every_ticket_lands_once_across_servers() {
                 })
             })
             .collect();
-        let out = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let out: Vec<_> = handles.into_iter().map(|h| h.join()).collect();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        out
+        out.into_iter().map(|r| r.unwrap()).collect()
     });
     let api = a.api();
     let mut landed = 0;

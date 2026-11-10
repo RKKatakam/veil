@@ -116,6 +116,13 @@ pub const GATE_COMMITS_PER_PUSH: f64 = 1.0;
 /// the submit's, and its share of its batch's.
 pub const GATE_COMMITS_PER_LANDING: f64 = 1.5;
 pub const GATE_STATEMENTS_PER_WARM_PULL: f64 = 5.0;
+/// Storage writes of a push's own requests (S28: its upload's pack, and
+/// the push's own pack when the server completes it), per push attempt (a
+/// landing that lost races pushed, and uploaded, once per try), as the
+/// server counts them in their requests (nothing else: the deriver, the
+/// search index, pulls).
+pub const GATE_STORAGE_WRITES_PER_PUSH: f64 = 2.0;
+
 /// `objects` through a regional cache: the share of objects it serves from
 /// its store, and its peak memory (it runs with the default `--memory 128M` and
 /// 1,024 connections: a bound of about 480 MiB, `docs/HUB.md` §13.18).
@@ -901,6 +908,17 @@ pub fn missed_gates(r: &serde_json::Value, background: f64) -> Vec<String> {
         if let Some(c) = r["db_push_commits_per_op"].as_f64().filter(|c| over(*c)) {
             out.push(format!("{mode}: {c:.2} database commits per landing, the deriver's aside (gate: {GATE_COMMITS_PER_PUSH})"));
         }
+        // Pushes only: an API commit stores its objects loose (S10).
+        if mode != "api" {
+            let tries = 1.0 + r["collisions_per_op"].as_f64().unwrap_or(0.0);
+            let over = |w: f64| w * ops > GATE_STORAGE_WRITES_PER_PUSH * tries * ops * 1.02 + 20.0;
+            if let Some(w) = r["storage_push_writes_per_op"].as_f64().filter(|w| over(*w)) {
+                out.push(format!(
+                    "{mode}: {:.2} storage writes per push ({w:.2} per landing of {tries:.2} pushes), the deriver's aside (gate: {GATE_STORAGE_WRITES_PER_PUSH})",
+                    w / tries
+                ));
+            }
+        }
     }
     if mode == "objects" && r["via"] == "cache" {
         match r["cache_hit_share"].as_f64() {
@@ -1334,8 +1352,14 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
             "db_per_request": stmts.map(|(n, _)| if requests > 0 { n / requests as f64 } else { f64::NAN }),
             "db_commits_per_op": writes.map(per_op),
             "db_deriver_writes_per_op": deriver.map(per_op),
-            "db_push_commits_per_op": writes.zip(deriver).map(|(w, d)| per_op((w - d).max(0.0))),
+            // The push's transaction: the deriver's aside, and the rows that
+            // record packs before they are written (uploads', and a push's
+            // own: S28, counted by the server).
+            "db_push_commits_per_op": writes.zip(deriver).map(|(w, d)| per_op((w - d - stat("pack_row_commits").unwrap_or(0.0)).max(0.0))),
+            "db_pack_row_commits_per_op": stat("pack_row_commits").map(per_op),
             "storage_writes_per_op": stat("storage_writes").map(per_op),
+            // Counted by the server where they are made (BUG-1398).
+            "storage_push_writes_per_op": stat("storage_own_writes").map(per_op),
             "storage_written_bytes_per_op": stat("storage_written_bytes").map(per_op),
             "storage_reads_per_op": stat("storage_reads").map(per_op),
             "session_hit_share": stat("session_hits").zip(stat("session_misses")).map(|(h, m)| h / (h + m)),
@@ -1550,7 +1574,7 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
         }
     }
     out.push_str(
-        "\n| Mode | Projects | Clients | Target rate (/s) | DB commits per op (the deriver's aside) | DB statements per op | DB statements per request | Storage writes per op | Storage reads per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates missed |\n\
+        "\n| Mode | Projects | Clients | Target rate (/s) | DB commits per op (the push's own: the deriver's and uploads' aside) | DB statements per op | DB statements per request | Storage writes per op (the deriver's aside) | Storage reads per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates missed |\n\
          |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|\n",
     );
     let pct = |x: &serde_json::Value| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{:.0} %", v * 100.0)).unwrap_or_else(|| "–".into());
@@ -1558,7 +1582,7 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
     for r in v["runs"].as_array().ok_or_else(|| anyhow!("no runs"))? {
         let missed = r["gates_missed"].as_array().map(|m| m.len()).unwrap_or(0);
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {} | {} | {} / {} / {} | {} |\n",
+            "| {} | {} | {} | {} | {} ({}) | {} | {} | {} ({}) | {} | {} | {} | {} | {} / {} / {} | {} |\n",
             r["mode"].as_str().unwrap_or(""),
             r["projects"],
             r["clients"],
@@ -1568,6 +1592,7 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             f(&r["db_per_op"], 1),
             f(&r["db_per_request"], 2),
             f(&r["storage_writes_per_op"], 1),
+            f(&r["storage_push_writes_per_op"], 1),
             f(&r["storage_reads_per_op"], 1),
             kib(&r["storage_written_bytes_per_op"]),
             kib(&r["bytes_sent_per_op"]),
@@ -1625,4 +1650,25 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S28's gate: a landing's own storage writes (the deriver's aside), for
+    /// pushes; an API commit's are reported only.
+    #[test]
+    fn storage_writes_per_push_are_gated() {
+        let run = |mode: &str, push_writes: f64| json!({"mode": mode, "ops": 1000.0, "storage_push_writes_per_op": push_writes});
+        assert!(missed_gates(&run("branches", 1.0), 0.0).is_empty());
+        assert!(missed_gates(&run("land", 2.0), 0.0).is_empty());
+        assert_eq!(missed_gates(&run("land", 6.0), 0.0).len(), 1);
+        assert_eq!(missed_gates(&run("branches", 2.5), 0.0).len(), 1);
+        assert!(missed_gates(&run("api", 6.0), 0.0).is_empty());
+        // Per push: a landing that lost 4 races pushed 5 times.
+        let raced = |w: f64| json!({"mode": "land", "ops": 1000.0, "collisions_per_op": 4.0, "storage_push_writes_per_op": w});
+        assert!(missed_gates(&raced(9.0), 0.0).is_empty());
+        assert_eq!(missed_gates(&raced(12.0), 0.0).len(), 1);
+    }
 }

@@ -38,4 +38,5 @@ mod cache;
 mod agents;
 mod daemon;
 mod limits;
+mod packs;
 mod workspaces;

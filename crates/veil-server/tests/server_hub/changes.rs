@@ -422,8 +422,10 @@ fn vl_change_new_seals_secrets_and_lands_without_a_checkout() {
     assert_eq!(std::fs::read_to_string(p.dir.join(&env)).unwrap(), format!("KEY={mark}\n"));
 }
 
+/// BUG-930 (fixed by S28): uploads are staged, and a refused push deletes
+/// them (`packs::a_refused_push_deletes_its_staged_upload` checks the store
+/// itself).
 #[test]
-#[ignore = "BUG-930: an uploaded object is stored before any check, so a refused plain-text secret stays in the object store"]
 fn bug_930_a_refused_upload_leaves_no_plain_text_secret_stored() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
