@@ -93,6 +93,7 @@ fn iso_utc(ms: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
 
+#[allow(dead_code)]
 fn parse_embargo_id(out: &str) -> String {
     for word in out.split_whitespace() {
         let clean = word.trim_end_matches(':');
@@ -211,6 +212,7 @@ impl Drop for DaemonGuard<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn signed_object_get(
     via: &Api,
     project: &str,
