@@ -1101,7 +1101,7 @@ fn file_entry(g: &G, t: &Trees, id: &ObjectId, path: &str) -> Result<Option<veil
 /// ([`files::Blamer`]), a page of lines at a time.
 pub async fn blame(hub: &Arc<Hub>, ask: &Ask, q: BlameParams, limits: Limits) -> Result<Value> {
     let deadline = Instant::now() + limits.deadline;
-    let path = clean_path(&q.path)?;
+    let path = ask.file_path(Some(&q.path))?;
     if path.is_empty() {
         return Err(no_path());
     }
@@ -1166,13 +1166,14 @@ pub async fn history(hub: &Arc<Hub>, ask: &Ask, q: HistoryParams, limits: Limits
         Some(a) if a.starts_with(STORED_CURSOR) => Err(None),
         Some(a) => Err(Some(files::parse_cursor(a, limits.cursor)?)),
         None => {
-            let path = clean_path(q.path.as_deref().unwrap_or(""))?;
+            let path = ask.file_path(q.path.as_deref())?;
             if path.is_empty() {
                 return Err(no_path());
             }
             Ok((resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?, path))
         }
     };
+    let viewer = ask.viewer.clone();
     on_graph(hub, ask, deadline, move |g, t| {
         let f = files::Files::new(g);
         let starts = match start {
@@ -1191,6 +1192,7 @@ pub async fn history(hub: &Arc<Hub>, ask: &Ask, q: HistoryParams, limits: Limits
                 };
                 let mut out = Vec::new();
                 for (id, path) in nodes {
+                    viewer.narrowed_to(&path)?;
                     // A cursor names versions of the viewer's own graph.
                     let r = match g.row(&id)? {
                         Some(r) if !r.withheld() => r,

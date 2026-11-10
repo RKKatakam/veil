@@ -1011,15 +1011,21 @@ pub(crate) async fn create_with(
         // branch up to this one, as for a pushed snapshot (BUG-1112).
         if let Some((_, q)) = land.as_mut() {
             let fresh = HashMap::from([(built.real, (vec![parent], person.id))]);
-            (q.stack, q.lineage) = match crate::landing::stack(hub, &who.project, &who.viewer, &q.branch, built.real, &fresh).await? {
-                Ok(j) if j.branch => {
-                    *q.skipped.lock().unwrap() = j.skipped;
-                    (j.stack, j.lineage)
-                }
-                // No branch: the service answers so.
-                Ok(_) => (vec![crate::landing::Entry::plain(built.real, parent)], 0),
+            let judged = match crate::landing::stack(hub, &who.project, &who.viewer, &q.branch, built.real, &fresh).await? {
+                Ok(j) if j.branch => j,
+                // No branch: the service answers so (unless `agent_stack`
+                // refuses creating the default branch first).
+                Ok(j) => crate::landing::Judged {
+                    stack: vec![crate::landing::Entry::plain(built.real, parent)],
+                    ..j
+                },
                 Err(why) => return Err(bad(why)),
             };
+            // S11's agent rule (`agent_tip`) on the stack's edits before the
+            // landing is queued (BUG-1636).
+            crate::landing::agent_stack(hub, &who.project, &who.viewer, &q.branch, &judged, built.real, false).await?;
+            *q.skipped.lock().unwrap() = judged.skipped;
+            (q.stack, q.lineage) = (judged.stack, judged.lineage);
             if q.stack.is_empty() {
                 let skipped = q.skipped.lock().unwrap().clone();
                 let mut msg = "nothing to land: this change is on the branch already".to_string();

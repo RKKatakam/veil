@@ -1982,14 +1982,23 @@ pub(crate) async fn push_with(
             return Err(Error::bad_request(format!("invalid branch name {:?}", u.branch)));
         }
         let cur = current.get(&u.branch).copied();
+        let new_real = match u.new {
+            Some(n) => Some(*real_of.get(&n).ok_or_else(|| Error::bad_request("unknown new tip"))?),
+            None => None,
+        };
+        if let Some(n) = new_real {
+            // An attempt never lands (`Snapshot::abandoned`).
+            if blocking(hub, project.id, move |src| Ok(src.snapshot(&n)?.abandoned.is_some())).await? {
+                return Err(Error::bad_request(format!("branch '{}': an abandoned attempt is never a branch's tip", u.branch)));
+            }
+        }
         // Landed by the landing service instead of moved here: the new
         // changes on top of whatever base they have (they need not be on
         // the tip), as one stack.
         if !req.force && (land_all || protected.contains(&u.branch)) && (cur.is_some() || land_all) {
-            let Some(n) = u.new else {
+            let Some(new_real) = new_real else {
                 return Err(Error::forbidden(format!("'{}' is protected: only an admin's forced push deletes it", u.branch)));
             };
-            let new_real = *real_of.get(&n).ok_or_else(|| Error::bad_request("unknown new tip"))?;
             let refuse = |m: &str| BranchResult {
                 branch: u.branch.clone(),
                 ok: false,
@@ -2018,6 +2027,22 @@ pub(crate) async fn push_with(
                     continue;
                 }
             };
+            // S11's agent rule (`agent_tip`) on the stack's edits before the
+            // landing is queued (BUG-1636).
+            if let Some(msg) = crate::landing::agent_stack(hub, project, viewer, &u.branch, &judged, new_real, !land_all).await? {
+                let cur_seen = match cur {
+                    Some(c) => Some(projected(hub, project, viewer, c).await?),
+                    None => None,
+                };
+                results.push(BranchResult {
+                    branch: u.branch.clone(),
+                    ok: false,
+                    message: Some(msg.into()),
+                    tip: cur_seen,
+                    ticket: None,
+                });
+                continue;
+            }
             if judged.stack.is_empty() {
                 let mut msg = crate::landing::NOTHING_TO_LAND.to_string();
                 let skipped = crate::landing::skipped_warnings(hub, project.id, &u.branch, &judged.skipped).await?;
@@ -2054,16 +2079,6 @@ pub(crate) async fn push_with(
             });
             continue;
         }
-        let new_real = match u.new {
-            Some(n) => Some(*real_of.get(&n).ok_or_else(|| Error::bad_request("unknown new tip"))?),
-            None => None,
-        };
-        if let Some(n) = new_real {
-            // An attempt never lands (`Snapshot::abandoned`).
-            if blocking(hub, project.id, move |src| Ok(src.snapshot(&n)?.abandoned.is_some())).await? {
-                return Err(Error::bad_request(format!("branch '{}': an abandoned attempt is never a branch's tip", u.branch)));
-            }
-        }
         if new_real.is_none() && !viewer.admin {
             return Err(Error::forbidden("only admins may delete a branch"));
         }
@@ -2081,6 +2096,7 @@ pub(crate) async fn push_with(
                         ok: false,
                         message: Some(NARROWED_MOVE.into()),
                         tip: cur_seen,
+                        ticket: None,
                     });
                     continue;
                 }

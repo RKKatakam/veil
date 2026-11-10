@@ -534,7 +534,11 @@ impl Service {
             out.push(Row {
                 seq,
                 ticket,
-                person: Person { id, name, device_key },
+                // The landing service never acts for a session: session rules
+                // (narrowing, agent restrictions) are decided in the submitter's
+                // request before a landing is queued, and each landed snapshot
+                // keeps the submitted snapshot's own `agent` attribution.
+                person: Person { id, name, device_key, agent: None },
                 stack: super::decode_stack(&stack)?,
                 lineage,
                 epochs: (pe, je),
@@ -575,10 +579,16 @@ impl Service {
         }
         let project = Arc::new(project);
         let mut viewers = vec![Viewer::default()];
+        // The service never acts for a session: a session's view key is its
+        // person's (`View::key`), and `recheck` re-evaluates only whether the
+        // person's access or `.veilpolicy` changed since submit (session
+        // narrowing and agent rules were already enforced before queueing).
         viewers.extend(people.into_iter().filter(|(p, _)| !admins.contains(p)).map(|(p, groups)| Viewer {
             person: Some(p),
             admin: false,
             groups,
+            only: None,
+            agent: false,
         }));
         known.views.clear();
         for v in viewers {
@@ -712,6 +722,7 @@ impl Service {
                 let Ok(s) = src.snapshot(x) else { continue };
                 ids.extend(s.parents.iter().skip(1).copied());
                 ids.extend(s.predecessors.iter().copied());
+                ids.extend(s.attempts.iter().copied());
             }
             Ok(ids)
         })
@@ -1134,8 +1145,13 @@ fn project_onto(
             }
         }
     }
+    let mut pattempts = Vec::with_capacity(s.attempts.len());
+    for a in &s.attempts {
+        let Some(q) = memo.get(&(k.to_string(), *a)) else { return Ok(None) };
+        pattempts.push(*q);
+    }
     let view = who.project.view(&who.viewer);
-    let (px, raw) = sync::project_one(src, &view, x, &s, pparents, ppreds, origins.get(&x).copied(), identity)?;
+    let (px, raw) = sync::project_one(src, &view, x, &s, pparents, ppreds, pattempts, origins.get(&x).copied(), identity)?;
     Ok(Some((px, raw, true)))
 }
 
@@ -1391,6 +1407,11 @@ fn entry(
             predecessors: vec![sid],
             conflicts: vec![],
             embargo: None,
+            // A landed snapshot keeps the submitted snapshot's own agent
+            // attribution and attempts; an abandoned attempt never lands.
+            agent: s.agent.clone(),
+            abandoned: None,
+            attempts: s.attempts.clone(),
             signature: None,
         };
         n.sign(&hub.identity);
@@ -1523,7 +1544,7 @@ fn recheck(
         signature: None,
         ..real.clone()
     };
-    let c = match sync::complete(src, &who.project, &who.viewer, &known, &n, parents, identity) {
+    let c = match sync::complete(src, &who.project, &who.viewer, &known, &n, parents, &real.attempts, identity) {
         Ok(c) => c,
         Err(Error::Api { message, code: "forbidden" | "bad_request", .. }) => return Ok(Err(message)),
         Err(e) => return Err(e),

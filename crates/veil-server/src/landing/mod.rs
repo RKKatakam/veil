@@ -895,6 +895,67 @@ pub async fn stack(
     Ok(Ok(Judged { stack, lineage, branch: true, skipped }))
 }
 
+/// The one rule of every tip an agent session sets (`sync::agent_tip`), for a
+/// landing stack `judged` up to real `to` on `branch` (BUG-1636): judged from
+/// the stack's base (the parent of its first change, which the service diffs
+/// against to apply the stack on the tip) to `to`, before the landing is
+/// queued. With `per_branch` (a push to a protected branch), a narrowing
+/// refusal comes back as `Ok(Some(NARROWED_MOVE))` for the branch's
+/// `BranchResult`; on `POST …/land` (`per_branch == false`), every refusal is
+/// `403 agent_session`, matching `sync::agent_tip_of` and `changes`.
+pub(crate) async fn agent_stack(
+    hub: &Arc<Hub>,
+    project: &crate::perm::Project,
+    viewer: &crate::perm::Viewer,
+    branch: &str,
+    judged: &Judged,
+    to: ObjectId,
+    per_branch: bool,
+) -> Result<Option<&'static str>> {
+    if !viewer.agent {
+        return Ok(None);
+    }
+    let default = branch == project.default_branch;
+    let (view_policy, view_bindings, v, j_branch, first) = (
+        project.policy_text.clone(),
+        project.bindings.clone(),
+        viewer.clone(),
+        judged.branch,
+        judged.stack.first().cloned(),
+    );
+    let refused = crate::sync::blocking(hub, project.id, move |src| {
+        let base = if !j_branch && default {
+            None
+        } else if let Some(e) = first {
+            let s = src.snapshot(&e.id)?;
+            Some(if s.parents.get(1..).is_some_and(|o| o.contains(&e.base)) {
+                e.base
+            } else {
+                s.parents.first().copied().unwrap_or_else(crate::sync::root_snapshot_id)
+            })
+        } else {
+            return Ok(None);
+        };
+        let p = crate::perm::Project {
+            id: src.project,
+            name: String::new(),
+            default_branch: String::new(),
+            policy: veil_core::hub::access::AccessPolicy::parse(&view_policy),
+            policy_text: view_policy,
+            bindings: view_bindings,
+        };
+        crate::sync::agent_tip(src, &p.view(&v), default, base, to)
+    })
+    .await?;
+    match refused {
+        Some(crate::sync::AgentTip::Narrowed) if per_branch => Ok(Some(crate::sync::NARROWED_MOVE)),
+        Some(crate::sync::AgentTip::Narrowed) => Err(crate::sync::agent_refusal(crate::sync::NARROWED_MOVE)),
+        Some(crate::sync::AgentTip::Access) => Err(crate::sync::agent_refusal(crate::sync::AGENT_ACCESS_MOVE)),
+        Some(crate::sync::AgentTip::DefaultBranch) => Err(crate::sync::agent_refusal(crate::sync::AGENT_DEFAULT_BRANCH)),
+        None => Ok(None),
+    }
+}
+
 /// What held change `x` is to `viewer`: its own edits against `against`
 /// (its first parent, or the base a merge lands on). `Err` to refuse it
 /// (conflicts they can see).
