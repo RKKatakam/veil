@@ -1101,12 +1101,15 @@ fn file_entry(g: &G, t: &Trees, id: &ObjectId, path: &str) -> Result<Option<veil
 /// ([`files::Blamer`]), a page of lines at a time.
 pub async fn blame(hub: &Arc<Hub>, ask: &Ask, q: BlameParams, limits: Limits) -> Result<Value> {
     let deadline = Instant::now() + limits.deadline;
-    let path = clean_path(&q.path)?;
+    // Narrowed as every file route is (BUG-1690).
+    let path = ask.file_path(Some(&q.path))?;
     if path.is_empty() {
         return Err(no_path());
     }
     let id = resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?;
-    let follow = q.follow.unwrap_or(false);
+    // A narrowed session never follows a rename: the path it came from may
+    // be outside its paths (BUG-1690).
+    let follow = q.follow.unwrap_or(false) && ask.viewer.only.is_none();
     let (after, n) = (q.after.unwrap_or(0), q.n.unwrap_or(limits.blame.lines).min(limits.blame.lines));
     let not_text = || Error::bad_request("not a plain-text file of at most 1 MiB: nothing to blame line by line");
     // The answer from the kept blame of the version asked for; else the
@@ -1161,12 +1164,15 @@ pub struct HistoryParams {
 pub async fn history(hub: &Arc<Hub>, ask: &Ask, q: HistoryParams, limits: Limits) -> Result<Value> {
     let deadline = Instant::now() + limits.deadline;
     let n = q.n.unwrap_or(50).min(limits.page);
-    let follow = q.follow.unwrap_or(false);
+    // A narrowed session never follows a rename: the path it came from may
+    // be outside its paths (BUG-1690).
+    let follow = q.follow.unwrap_or(false) && ask.viewer.only.is_none();
     let start = match &q.after {
         Some(a) if a.starts_with(STORED_CURSOR) => Err(None),
         Some(a) => Err(Some(files::parse_cursor(a, limits.cursor)?)),
         None => {
-            let path = clean_path(q.path.as_deref().unwrap_or(""))?;
+            // Narrowed as every file route is (BUG-1690).
+            let path = ask.file_path(q.path.as_deref())?;
             if path.is_empty() {
                 return Err(no_path());
             }

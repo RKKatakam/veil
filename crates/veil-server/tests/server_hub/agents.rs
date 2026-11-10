@@ -1414,6 +1414,50 @@ fn a_narrowed_sessions_access_route_answers_one_way_outside_its_paths() {
     }
 }
 
+/// BUG-1690: blame and file history (S14) took their path without the
+/// narrowing, and followed renames out of it. A narrowed session gets the
+/// query routes' one refusal for a path outside its paths, and a file
+/// renamed into its paths never names the path it came from, though its
+/// person's own session does.
+#[test]
+fn a_narrowed_sessions_blame_and_history_stay_inside_its_paths() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    with_api_folder(&hub, &p);
+    let token = p.dev.token();
+    let base = tip(&hub, &token, &p.name);
+    let r = change(
+        &hub,
+        &token,
+        &p.name,
+        &json!({"base": base.hex(), "description": "move it in", "onto": {"branch": "main", "expected": base.hex()},
+                "edits": [{"path": "src/other.rs", "delete": true},
+                          {"path": "src/api/moved.rs", "put": {"text": "fn o() {} // MARKER-OUTSIDE-2d"}}]}),
+    );
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["branch"]["status"], "ok", "{}", body(&r));
+    let narrow = agent_token(&hub, &token, &p.name, &["src/api"]);
+    // Outside its paths: the one refusal, for blame and history alike.
+    let refusal = q(&hub, Some(&narrow), &p.name, "file", "path=src/other.rs");
+    assert_agent_refusal(&refusal, NARROWED_READ, "q/file");
+    for route in ["blame", "history"] {
+        for path in ["src/other.rs", "src/no-such-path-6f.rs", BILL_DIR] {
+            let r = q(&hub, Some(&narrow), &p.name, route, &format!("path={path}"));
+            assert_eq!((r.status, body(&r)), (refusal.status, body(&refusal)), "{route}?path={path}");
+        }
+    }
+    // Control: the person's own session follows the rename out of src/api.
+    let full = q(&hub, Some(&token), &p.name, "history", "path=src/api/moved.rs&follow=true");
+    assert_eq!(full.status, 200, "{}", body(&full));
+    assert!(body(&full).contains("src/other.rs"), "the control follows the rename: {}", body(&full));
+    // The narrowed session's answers never name it.
+    for route in ["history", "blame"] {
+        let r = q(&hub, Some(&narrow), &p.name, route, "path=src/api/moved.rs&follow=true");
+        assert_eq!(r.status, 200, "{route}: {}", body(&r));
+        assert!(!body(&r).contains("src/other.rs"), "{route} named the path outside: {}", body(&r));
+    }
+}
+
 /// Rule 3, the accepted text: an agent session recreating a deleted default
 /// branch never sets a `.veilpolicy` other than the one the branch last
 /// carried. The accepted text is updated only when access lines change, so
@@ -1579,6 +1623,9 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         ("/v1/projects/{p}/q/generations", "rev"),
         ("/v1/projects/{p}/q/search", "path"),
         ("/v1/projects/{p}/q/grep", "path"),
+        // S14: blame and file history take a path (BUG-1690).
+        ("/v1/projects/{p}/q/blame", "path"),
+        ("/v1/projects/{p}/q/history", "path"),
         // S24: counts for the project's admins, no path or revision (merge s11r6).
         ("/v1/projects/{p}/health", "none"),
     ];
@@ -1597,7 +1644,7 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         let end = ["\npub async fn ", "\nasync fn ", "\npub fn ", "\nfn ", "\n#[derive"].iter().filter_map(|m| rest.find(m)).min().unwrap_or(rest.len());
         &rest[..end]
     };
-    for (f, src) in [("log", QUERY), ("show", QUERY), ("tree", QUERY), ("file", QUERY), ("diff", QUERY), ("search", SEARCH), ("grep", SEARCH)] {
+    for (f, src) in [("log", QUERY), ("show", QUERY), ("tree", QUERY), ("file", QUERY), ("diff", QUERY), ("blame", QUERY), ("history", QUERY), ("search", SEARCH), ("grep", SEARCH)] {
         let b = body_of(src, f);
         assert!(b.contains("ask.file_path(") || b.contains("ask.log_path("), "query route {f} takes its path without Ask::file_path");
     }
