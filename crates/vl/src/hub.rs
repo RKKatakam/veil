@@ -907,6 +907,7 @@ pub fn checkout_branch(tips: &Tips) -> Option<String> {
         .into_iter()
         .find(|b| tips.branches.contains_key(*b))
         .map(str::to_string)
+        .or_else(|| tips.branches.keys().find(|b| veil_core::embargo::embargo_id_of_branch(b).is_none()).cloned())
         .or_else(|| tips.branches.keys().next().cloned())
 }
 
@@ -1179,6 +1180,9 @@ pub fn pull_moving(
             report.warnings.extend(crate::hub_keys::merge_server_rings(tx.repo().keys(), &client.url, rings)?);
             tx.repo().keys().invalidate();
         }
+    }
+    for rec in &tips.embargoes {
+        tx.repo().keys().merge_embargo(rec)?;
     }
     let tags: Vec<(String, Tag)> = tips
         .branches
@@ -1466,6 +1470,8 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             tips.revision
         }
     };
+    let release_warnings = repo.take_back_releases_out_of_force()?;
+    let newly_released = repo.keys().publish_staged_releases()?;
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -1491,24 +1497,80 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                 bail!("no tag '{t}' here");
             }
         }
-        // Nothing an unreleased embargo withholds is uploaded: a tag that
-        // would publish it is not pushed (it reaches no remote by any route).
+        // Nothing an unreleased embargo withholds is uploaded on an unembargoed
+        // branch (`fix`); an embargoed merge line itself (`carried_embargo`) goes
+        // to the server's hidden `embargo/<id>` line with its signed record when
+        // its groups exist on the server.
         let targets: Vec<ObjectId> = updates.iter().filter_map(|u| u.new).collect();
         let blocks = veil_core::remote::embargo_blocks(repo, &targets)?;
+        let mut server_groups: Option<HashSet<String>> = None;
         let mut withheld = Vec::new();
         let mut kept = Vec::new();
+        let mut embargoes: BTreeMap<String, veil_core::keychain::EmbargoRecord> = BTreeMap::new();
+        let mut embargo_targets: BTreeMap<String, (String, ObjectId)> = BTreeMap::new();
         for (u, why) in updates.into_iter().zip(blocks) {
             match why {
-                Some(why) => withheld.push((u.branch, why)),
+                Some(why) => {
+                    let carried = u.new.and_then(|t| repo.carried_embargo(&t).ok().flatten());
+                    let rec = carried.and_then(|id| repo.keys().load_embargo(&id).ok().flatten());
+                    if let (Some(target), Some(rec)) = (u.new, rec) {
+                        // A local embargo for the default `team` scope stays local
+                        // unless the server actually has a `team` group; named
+                        // scopes (`--embargo-for`) go to the server to validate.
+                        let send_to_server = if rec.scope == "team" {
+                            let gs = match &server_groups {
+                                Some(gs) => gs,
+                                None => server_groups.insert(
+                                    client
+                                        .groups()
+                                        .unwrap_or_default()
+                                        .into_iter()
+                                        .map(|g| g.name)
+                                        .collect(),
+                                ),
+                            };
+                            gs.contains("team")
+                        } else {
+                            true
+                        };
+                        if send_to_server {
+                            embargo_targets.insert(rec.id.clone(), (u.branch.clone(), target));
+                            embargoes.insert(rec.id.clone(), rec);
+                            kept.push(u);
+                            continue;
+                        }
+                    }
+                    withheld.push((u.branch, why));
+                }
                 None => kept.push(u),
             }
         }
         let updates = kept;
+        for id in &newly_released {
+            if let Ok(Some(rec)) = repo.keys().load_embargo(id) {
+                embargoes.insert(rec.id.clone(), rec);
+            }
+        }
+        if let Ok(all) = repo.keys().embargoes() {
+            for rec in all {
+                if rec.released_at.is_some()
+                    && view
+                        .remote_tags
+                        .contains_key(&format!("{prefix}{}", veil_core::embargo::embargo_branch(&rec.id)))
+                {
+                    embargoes.insert(rec.id.clone(), rec);
+                }
+            }
+        }
         let sent: Vec<ObjectId> = updates.iter().filter_map(|u| u.new).collect();
-        let withdrawn = veil_core::remote::withdrawn_warnings(repo, &sent)?;
-        if updates.is_empty() {
+        let withdrawn: Vec<String> = release_warnings
+            .iter()
+            .cloned()
+            .chain(veil_core::remote::withdrawn_warnings(repo, &sent)?)
+            .collect();
+        if updates.is_empty() && embargoes.is_empty() {
             return Ok(PushOutcome {
-                warnings: vec![],
+                warnings: release_warnings,
                 moved: vec![],
                 landed: vec![],
                 rejected: withheld,
@@ -1517,9 +1579,20 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             });
         }
         let targets: Vec<ObjectId> = updates.iter().filter_map(|u| u.new).collect();
-        let (uploaded, receipts) = upload_new(repo, remote, client, &targets, revision >= 2)?;
+        let (uploaded, receipts) = if targets.is_empty() {
+            (0, BTreeMap::new())
+        } else {
+            upload_new(repo, remote, client, &targets, revision >= 2)?
+        };
         let pushed: HashMap<String, ObjectId> = updates.iter().filter_map(|u| Some((u.branch.clone(), u.new?))).collect();
-        let Some(result) = client.push(&PushRequest { updates, force, receipts })? else {
+        let req_embargoes: Vec<veil_core::keychain::EmbargoRecord> = embargoes.into_values().collect();
+        let Some(result) = client.push(&PushRequest {
+            updates,
+            force,
+            receipts,
+            embargoes: req_embargoes,
+        })?
+        else {
             if attempt < 5 {
                 std::thread::sleep(Duration::from_millis(50 * attempt));
                 continue;
@@ -1541,10 +1614,33 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         for r in result.results {
             match (r.ok, r.tip) {
                 (true, Some(tip)) => {
-                    if tx.repo().store().has(&tip) {
-                        tx.view.remote_tags.insert(format!("{prefix}{}", r.branch), tip);
+                    let diverted_eid = embargo_targets
+                        .iter()
+                        .find_map(|(eid, (b, _))| (b == &r.branch).then_some(eid.clone()));
+                    if let Some(eid) = diverted_eid {
+                        let ebranch = veil_core::embargo::embargo_branch(&eid);
+                        if tx.repo().store().has(&tip) {
+                            tx.view.remote_tags.insert(format!("{prefix}{ebranch}"), tip);
+                            tx.view.tags.insert(ebranch, Tag { target: tip, annotation: None });
+                        } else {
+                            missing = true;
+                        }
+                        if let Some((orig_branch, orig_target)) = embargo_targets.get(&eid) {
+                            if tx.view.tags.get(orig_branch).is_some_and(|t| t.target == *orig_target && t.annotation.is_none()) {
+                                if let Some(pub_tip) = tx.view.remote_tags.get(&format!("{prefix}{orig_branch}")).copied() {
+                                    tx.view.tags.insert(orig_branch.clone(), Tag { target: pub_tip, annotation: None });
+                                }
+                            }
+                        }
                     } else {
-                        missing = true;
+                        if tx.repo().store().has(&tip) {
+                            tx.view.remote_tags.insert(format!("{prefix}{}", r.branch), tip);
+                        } else {
+                            missing = true;
+                        }
+                        if veil_core::embargo::embargo_id_of_branch(&r.branch).is_some() && tx.repo().store().has(&tip) {
+                            tx.view.tags.insert(r.branch.clone(), Tag { target: tip, annotation: None });
+                        }
                     }
                     if r.ticket.is_some() {
                         out.landed.push(r.branch.clone());
@@ -1558,6 +1654,13 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                     tx.view.remote_tags.remove(&format!("{prefix}{}", r.branch));
                 }
                 (false, _) => out.rejected.push((r.branch, r.message.unwrap_or_default())),
+            }
+        }
+        for id in &newly_released {
+            let eb = veil_core::embargo::embargo_branch(id);
+            tx.view.remote_tags.remove(&format!("{prefix}{eb}"));
+            if tx.view.tags.get(&eb).is_some_and(|t| t.annotation.is_none()) {
+                tx.view.tags.remove(&eb);
             }
         }
         tx.commit()?;

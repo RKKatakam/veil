@@ -129,6 +129,10 @@ pub struct Tips {
     /// The server's grant key (hex): what caches check grants against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant_key: Option<String>,
+    /// Embargo records of embargoes this caller is in (or an admin of the
+    /// project): never sent to anyone outside (`docs/HUB.md` §13.31).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub embargoes: Vec<crate::keychain::EmbargoRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -218,7 +222,7 @@ pub struct BranchUpdate {
     pub new: Option<ObjectId>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PushRequest {
     pub updates: Vec<BranchUpdate>,
     #[serde(default)]
@@ -228,6 +232,10 @@ pub struct PushRequest {
     /// same path in one of the snapshot's parents (BUG-824).
     #[serde(default)]
     pub receipts: BTreeMap<ObjectId, String>,
+    /// Embargo records of embargoed merges this push introduces, or whose
+    /// release it publishes (`docs/HUB.md` §13.31).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub embargoes: Vec<crate::keychain::EmbargoRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -27,6 +27,7 @@ pub mod caches;
 pub mod changes;
 pub mod db;
 pub mod derive;
+pub mod embargo;
 pub mod error;
 pub mod grant;
 pub mod landing;
@@ -84,6 +85,8 @@ pub struct Hub {
     pub query: query::graph::State,
     /// The landing services running here, and the submitters waiting here.
     pub landing: landing::Services,
+    /// The embargo release service state (S22).
+    pub embargo: embargo::State,
     /// Rate limits, the request budget, bulkheads and health (S24).
     pub limits: limits::Limits,
 }
@@ -208,6 +211,7 @@ pub async fn start(config: Config) -> Result<Running> {
         derive: derive::Workers::new(derive_db),
         query: query::graph::State::default(),
         landing: landing::Services::default(),
+        embargo: embargo::State::default(),
         limits: limits::Limits::new(config.limits, config.db_connections),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -216,6 +220,8 @@ pub async fn start(config: Config) -> Result<Running> {
     let app = api::router(hub.clone());
     // Push notices drop other servers' cached tips (`caches::listen`).
     tokio::spawn(caches::listen(hub.clone(), rx.clone()));
+    // Scheduled embargo releases (S22).
+    tokio::spawn(embargo::run_loop(hub.clone(), rx.clone()));
     let pace = cache::deadline::Pace { stall: ANSWER_STALL, grace: ANSWER_STALL, min_rate: limits::body::MIN_RATE };
     let connections = ConnectionLimits { pace, max_connections: config.limits.max_connections, buffer: HTTP_BUFFER };
     let task = tokio::spawn(serve(listener, tls, app, rx, Some(connections), Some(hub.limits.connections.clone())));

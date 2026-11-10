@@ -66,9 +66,9 @@ regex-syntax = "0.8"
 containers = []
 
 [dev-dependencies]
+# The landing service's property test (`landing::edits`).
+proptest = "1"
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 # A paused clock for the unit tests of the body time limits (S24): no new
 # crate, a feature of the runtime above.
 tokio = { version = "1.47", features = ["test-util"] }
-# The landing service's property test (`landing::edits`).
-proptest = "1"

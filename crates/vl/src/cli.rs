@@ -513,6 +513,10 @@ pub enum Cmd {
         /// Scope that can see the embargoed changes before release.
         #[arg(long, default_value = "team")]
         scope: String,
+        /// Server groups that can see the embargoed changes before release
+        /// (implies `--embargo`).
+        #[arg(long = "embargo-for", value_name = "GROUP", num_args = 1..)]
+        embargo_for: Vec<String>,
     },
     /// Manage embargoes created by delayed-visibility merges.
     #[command(subcommand)]
@@ -922,6 +926,13 @@ pub enum EmbargoCmd {
         /// Do not ask for confirmation (required when stdin is not a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
+    },
+    /// Switch to an embargo's hidden line (`embargo/<id>`), rebasing it onto
+    /// the newest tip of `main` first; with no ID, list and update the
+    /// embargoes you are in.
+    Follow {
+        /// Embargo id, from `vl embargo list`.
+        id: Option<String>,
     },
 }
 
