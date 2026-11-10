@@ -106,6 +106,15 @@ pub struct Hub {
 
 pub type HubState = Arc<Hub>;
 
+impl Hub {
+    /// Synchronize in-memory object, pack, tree, and snapshot caches with the
+    /// database's GC epoch (`access_epochs (project, -1)`).
+    pub fn observe_gc_epoch(&self, project: i64, epoch: i64) {
+        self.objects.set_gc_epoch(project, epoch);
+        self.caches.set_gc_epoch(project, epoch);
+    }
+}
+
 /// Where objects are stored.
 #[derive(Clone, Debug)]
 pub enum Storage {

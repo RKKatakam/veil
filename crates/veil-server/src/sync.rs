@@ -248,7 +248,7 @@ impl TreeSource for Source {
         let staged = self.staged.as_ref().and_then(|st| st.tree_key(self.project, id).map(|k| (st, k)));
         let ck = match &staged {
             Some((_, k)) => *k,
-            None => crate::store::Objects::tree_key(self.project, id),
+            None => self.hub.objects.tree_key(self.project, id),
         };
         if let Some(t) = self.hub.trees.get(&ck) {
             if let Some((st, _)) = &staged {
@@ -367,19 +367,19 @@ pub(crate) struct Deferred {
     made: Vec<ObjectId>,
 }
 
-/// Is `id` committed history of `project` (a `snapshots` row; never deleted,
-/// so a yes is cached)?
+/// Is `id` committed history of `project` (`snapshots`, keyed by GC epoch)?
 async fn committed(hub: &Hub, project: i64, id: &ObjectId) -> Result<bool> {
     if hub.caches.committed(project, id) {
         return Ok(true);
     }
+    let gce = hub.caches.gc_epoch(project);
     let stored: Option<String> = sqlx::query_scalar("SELECT id FROM snapshots WHERE project_id = $1 AND id = $2")
         .bind(project)
         .bind(id.hex())
         .fetch_optional(&hub.db)
         .await?;
     if stored.is_some() {
-        hub.caches.put_committed(project, id);
+        hub.caches.put_committed_at(project, gce, id);
     }
     Ok(stored.is_some())
 }
@@ -451,6 +451,7 @@ pub(crate) async fn projected_inner(
                 None => match hub.caches.memo(project.id, &view_key, &x) {
                     Some(p) => Some(p),
                     None => {
+                        let gce = hub.caches.gc_epoch(project.id);
                         let m: Option<String> =
                             sqlx::query_scalar("SELECT projected_id FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
                                 .bind(project.id)
@@ -460,7 +461,7 @@ pub(crate) async fn projected_inner(
                                 .await?;
                         let m = m.map(|p| ObjectId::from_hex(&p).map_err(|e| Error::Other(e.into()))).transpose()?;
                         if let Some(p) = &m {
-                            hub.caches.put_memo(project.id, &view_key, &x, p);
+                            hub.caches.put_memo_at(project.id, gce, &view_key, &x, p);
                         }
                         m
                     }
@@ -658,6 +659,7 @@ async fn resolve_stored(hub: &Hub, project: i64, id: &ObjectId) -> Result<Vec<Ob
     if *id == root_snapshot_id() || hub.caches.committed(project, id) {
         return Ok(vec![*id]);
     }
+    let gce = hub.caches.gc_epoch(project);
     let rows: Vec<(String, i32, i64)> = sqlx::query_as(
         "SELECT id, 0, 0::BIGINT FROM snapshots WHERE project_id = $1 AND id = $2 \
          UNION ALL SELECT real_id, 1, created_at FROM projections WHERE project_id = $1 AND projected_id = $2 \
@@ -668,7 +670,7 @@ async fn resolve_stored(hub: &Hub, project: i64, id: &ObjectId) -> Result<Vec<Ob
     .fetch_all(&hub.db)
     .await?;
     if rows.first().is_some_and(|r| r.1 == 0) {
-        hub.caches.put_committed(project, id);
+        hub.caches.put_committed_at(project, gce, id);
         return Ok(vec![*id]);
     }
     Ok(rows.iter().filter_map(|r| ObjectId::from_hex(&r.0).ok()).collect())

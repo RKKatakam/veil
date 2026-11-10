@@ -154,10 +154,11 @@ pub fn too_slow() -> Error {
     )
 }
 
-fn cache_key(project: i64, vk: &str, id: &ObjectId) -> ObjectId {
+fn cache_key(project: i64, gc_epoch: i64, vk: &str, id: &ObjectId) -> ObjectId {
     let mut h = blake3::Hasher::new();
     h.update(b"view-graph");
     h.update(&project.to_le_bytes());
+    h.update(&gc_epoch.to_le_bytes());
     h.update(&(vk.len() as u64).to_le_bytes());
     h.update(vk.as_bytes());
     h.update(&id.0);
@@ -208,7 +209,7 @@ impl<'a> G<'a> {
             return Ok(Some(r.clone()));
         }
         let hub = self.cx.hub();
-        let k = cache_key(self.cx.project(), self.vk, id);
+        let k = cache_key(self.cx.project(), hub.caches.gc_epoch(self.cx.project()), self.vk, id);
         if let Some(r) = hub.query.rows.get(&k) {
             self.local.borrow_mut().insert(*id, r.clone());
             return Ok(Some(r));
@@ -955,7 +956,9 @@ pub(crate) fn cache_prepared_memo(hub: &Hub, project_id: i64, memo: &PreparedMem
             hub.caches.put_memo(project_id, &k.vk, r, p);
         }
         for (id, row, _) in &k.graph {
-            hub.query.rows.insert(cache_key(project_id, &k.vk, id), row.clone(), 320);
+            hub.query
+                .rows
+                .insert(cache_key(project_id, hub.caches.gc_epoch(project_id), &k.vk, id), row.clone(), 320);
         }
     }
 }
@@ -1100,7 +1103,7 @@ async fn warm(hub: &Arc<Hub>, project: i64, vk: &str, admin: bool, tips: &[Objec
                 None => return Ok(None),
             }
         };
-        let cached = p == root() || hub.query.rows.get(&cache_key(project, vk, &p)).is_some();
+        let cached = p == root() || hub.query.rows.get(&cache_key(project, hub.caches.gc_epoch(project), vk, &p)).is_some();
         if !cached {
             let found: Option<String> = sqlx::query_scalar("SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = $3 AND files IS TRUE")
                 .bind(project)

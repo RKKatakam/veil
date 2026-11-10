@@ -919,6 +919,14 @@ impl Packs {
         packs.retain(|l| names.contains(&l.name));
     }
 
+    /// Drop `project`'s cached pack listing when a cross-server GC epoch
+    /// changes so the next lookup refreshes `LISTED` packs from the database.
+    pub fn invalidate_project(&self, project: i64) {
+        if self.db.is_some() {
+            self.projects.lock().unwrap().remove(&project);
+        }
+    }
+
     fn evict_now(&self, project: i64) {
         let mut g = self.projects.lock().unwrap();
         Self::evict(&mut g, project, self.budget);

@@ -202,27 +202,40 @@ pub async fn open_at(hub: &Hub, name: &str, caller: &Caller) -> Result<(Project,
     let cached = hub.caches.project(name);
     // The project's epoch as this request read it (the session check reads it
     // when the project was cached), or now, before anything it is used for.
-    let project_epoch = match (&cached, caller.epochs.project) {
-        (Some(e), Some((id, epoch))) if e.project.id == id => Some(epoch),
+    let (project_epoch, mut gc_epoch) = match (&cached, caller.epochs.project) {
+        (Some(e), Some((id, epoch))) if e.project.id == id => {
+            let ge = caller.epochs.gc.filter(|(gid, _)| *gid == id).map(|(_, g)| g);
+            if let Some(g) = ge {
+                hub.observe_gc_epoch(id, g);
+            }
+            (Some(epoch), ge)
+        }
         (Some(e), _) => {
             let p = caller.person.as_ref().map_or(0, |p| p.id);
-            crate::caches::read_epochs(&hub.db, p, Some(e.project.id)).await?.project.map(|(_, epoch)| epoch)
+            let r = crate::caches::read_epochs(&hub.db, p, Some(e.project.id)).await?;
+            if let Some((gid, g)) = r.gc {
+                hub.observe_gc_epoch(gid, g);
+            }
+            (r.project.map(|(_, epoch)| epoch), r.gc.map(|(_, g)| g))
         }
-        (None, _) => None,
+        (None, _) => (None, None),
     };
     let entry = match (cached, project_epoch) {
         (Some(e), Some(epoch)) if e.epoch == epoch => e,
         _ => {
-            // The row and its epoch in one statement.
-            let row: Option<(i64, String, String, String, String, i64)> = sqlx::query_as(
+            // The row and its epochs in one statement.
+            let row: Option<(i64, String, String, String, String, i64, i64)> = sqlx::query_as(
                 "SELECT id, name, default_branch, policy_text, policy_bindings, \
-                 COALESCE((SELECT epoch FROM access_epochs e WHERE e.project_id = projects.id AND e.person_id = 0), 0) \
+                 COALESCE((SELECT epoch FROM access_epochs e WHERE e.project_id = projects.id AND e.person_id = 0), 0), \
+                 COALESCE((SELECT epoch FROM access_epochs e WHERE e.project_id = projects.id AND e.person_id = -1), 0) \
                  FROM projects WHERE name = $1",
             )
             .bind(name)
             .fetch_optional(&hub.db)
             .await?;
-            let (id, name, default_branch, policy_text, bindings, epoch) = row.ok_or_else(not_found)?;
+            let (id, name, default_branch, policy_text, bindings, epoch, ge) = row.ok_or_else(not_found)?;
+            hub.observe_gc_epoch(id, ge);
+            gc_epoch = Some(ge);
             let e = crate::caches::ProjectEntry {
                 project: Project {
                     id,
@@ -291,6 +304,7 @@ pub async fn open_at(hub: &Hub, name: &str, caller: &Caller) -> Result<(Project,
     let epochs = crate::caches::Epochs {
         person: person_epoch,
         project: Some((project.id, entry.epoch)),
+        gc: gc_epoch.map(|ge| (project.id, ge)),
     };
     Ok((project, viewer, epochs))
 }

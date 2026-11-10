@@ -101,9 +101,14 @@ impl Grants {
     /// no such project, or the device is no longer an active one. A grant
     /// names neither id (BUG-1088).
     pub async fn current(&self, db: &sqlx::PgPool, project: &str, device: Option<&str>) -> Result<Option<(i64, i64, i64)>> {
-        let row: Option<(i64, i64, Option<i64>)> = sqlx::query_as(
+        Ok(self.current_with_gc(db, project, device).await?.map(|(id, epoch, person_epoch, _)| (id, epoch, person_epoch)))
+    }
+
+    pub(crate) async fn current_with_gc(&self, db: &sqlx::PgPool, project: &str, device: Option<&str>) -> Result<Option<(i64, i64, i64, i64)>> {
+        let row: Option<(i64, i64, i64, Option<i64>)> = sqlx::query_as(
             "SELECT p.id, \
              COALESCE((SELECT epoch FROM access_epochs WHERE project_id = p.id AND person_id = 0), 0), \
+             COALESCE((SELECT epoch FROM access_epochs WHERE project_id = p.id AND person_id = -1), 0), \
              (SELECT COALESCE((SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = d.person_id), 0) \
               FROM devices d WHERE d.signing_key = $2 AND d.removed_at IS NULL AND NOT d.pending) \
              FROM projects p WHERE p.name = $1",
@@ -113,8 +118,8 @@ impl Grants {
         .fetch_optional(db)
         .await?;
         Ok(match (row, device) {
-            (Some((id, epoch, _)), None) => Some((id, epoch, 0)),
-            (Some((id, epoch, Some(person_epoch))), Some(_)) => Some((id, epoch, person_epoch)),
+            (Some((id, epoch, gc_epoch, _)), None) => Some((id, epoch, 0, gc_epoch)),
+            (Some((id, epoch, gc_epoch, Some(person_epoch))), Some(_)) => Some((id, epoch, person_epoch, gc_epoch)),
             _ => None,
         })
     }
@@ -172,8 +177,11 @@ async fn grant_root(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snap: Ob
     if viewer.admin {
         return Ok(Some(root));
     }
+    let gce = hub.objects.gc_epoch(project.id);
     let memo = {
-        let mut m = project.id.to_le_bytes().to_vec();
+        let mut m = Vec::with_capacity(16 + root.0.len());
+        m.extend_from_slice(&project.id.to_le_bytes());
+        m.extend_from_slice(&gce.to_le_bytes());
         m.extend_from_slice(&root.0);
         ObjectId::hash(&m)
     };
@@ -252,7 +260,9 @@ async fn check(hub: &Hub, project: &str, token: &str, ts: i64, signature: Option
     if !g.usable(project, now, g.body.epoch, g.body.person_epoch) || !request_signed(&g, ts, ids, signature, now) {
         return Err(grant_invalid());
     }
-    let (id, epoch, person_epoch) = hub.grants.current(&hub.db, project, g.body.device.as_deref()).await?.ok_or_else(grant_invalid)?;
+    let (id, epoch, person_epoch, gc_epoch) =
+        hub.grants.current_with_gc(&hub.db, project, g.body.device.as_deref()).await?.ok_or_else(grant_invalid)?;
+    hub.observe_gc_epoch(id, gc_epoch);
     if !g.usable(project, now, epoch, person_epoch) {
         return Err(grant_invalid());
     }

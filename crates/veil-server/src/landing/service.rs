@@ -659,13 +659,15 @@ impl Service {
         };
         let epochs: Vec<(i64, i64, i64)> = sqlx::query_as(
             "SELECT project_id, person_id, epoch FROM access_epochs WHERE (project_id = 0 AND person_id = ANY($1)) \
-             OR (project_id = $2 AND person_id = 0)",
+             OR (project_id = $2 AND person_id IN (0, -1))",
         )
         .bind(&people)
         .bind(self.project)
         .fetch_all(&hub.db)
         .await?;
-        let project_epoch = epochs.iter().find(|e| e.0 == self.project).map_or(0, |e| e.2);
+        let project_epoch = epochs.iter().find(|e| e.0 == self.project && e.1 == 0).map_or(0, |e| e.2);
+        let gc_epoch = epochs.iter().find(|e| e.0 == self.project && e.1 == -1).map_or(0, |e| e.2);
+        hub.observe_gc_epoch(self.project, gc_epoch);
         let person_epoch = |p: i64| epochs.iter().find(|e| e.0 == 0 && e.1 == p).map_or(0, |e| e.2);
         if known.epoch != Some(project_epoch) {
             self.enumerate(known).await?;
@@ -692,6 +694,7 @@ impl Service {
                         epochs: Epochs {
                             person: person_epoch(row.person.id),
                             project: Some((self.project, project_epoch)),
+                            gc: Some((self.project, gc_epoch)),
                         },
                     };
                     match crate::perm::open(hub, &self.name, &caller).await {
@@ -1238,6 +1241,7 @@ async fn memos(hub: &Hub, project: i64, keys: &[String], reals: &[ObjectId]) -> 
     if !missing {
         return Ok(out);
     }
+    let gce = hub.caches.gc_epoch(project);
     let hex: Vec<String> = reals.iter().map(ObjectId::hex).collect();
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT view_key, real_id, projected_id FROM projections WHERE project_id = $1 AND view_key = ANY($2) AND real_id = ANY($3)",
@@ -1249,7 +1253,7 @@ async fn memos(hub: &Hub, project: i64, keys: &[String], reals: &[ObjectId]) -> 
     .await?;
     for (k, r, p) in rows {
         if let (Ok(r), Ok(p)) = (ObjectId::from_hex(&r), ObjectId::from_hex(&p)) {
-            hub.caches.put_memo(project, &k, &r, &p);
+            hub.caches.put_memo_at(project, gce, &k, &r, &p);
             out.insert((k, r), p);
         }
     }

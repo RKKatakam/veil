@@ -1051,7 +1051,6 @@ fn run_full_gc(hub: &TestHub, pid: i64) -> pack_gc::Report {
 /// storage objects — causing every read/clone/query of the branch to fail with
 /// `500 Internal Server Error`.
 #[test]
-#[ignore = "BUG-1780: pack_gc deletes snapshot/tree/blob objects while leaving snapshots/projections rows and S4 caches intact, discarding re-uploads and leaving branches dangling (500)"]
 fn bug_1780_pack_gc_leaves_stale_db_and_s4_caches_causing_repush_data_loss_and_500() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1122,7 +1121,6 @@ fn bug_1780_pack_gc_leaves_stale_db_and_s4_caches_causing_repush_data_loss_and_5
 /// grant whose `root` is missing from storage — breaking S3/S5/S6/S8/S9 object
 /// reads (`404`) for non-admin viewers.
 #[test]
-#[ignore = "BUG-1781: hub.grants.stored caches projected root tree existence across pack_gc, issuing grants whose root tree was deleted (404 on object reads)"]
 fn bug_1781_grants_stored_cache_outlives_pack_gc_breaking_object_reads() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1185,7 +1183,6 @@ fn bug_1781_grants_stored_cache_outlives_pack_gc_breaking_object_reads() {
 /// `pack_gc` deletes those snapshots from storage — losing the S20 revert and
 /// causing `GET /v1/projects/{p}/bisect/{branch}` to fail with `500`.
 #[test]
-#[ignore = "BUG-1782: pack_gc ignores bisects and bisect_reverts tables, deleting bisect candidates and revert_snapshot objects and breaking GET .../bisect/{branch} (500)"]
 fn bug_1782_pack_gc_deletes_bisect_revert_and_candidate_snapshots() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
