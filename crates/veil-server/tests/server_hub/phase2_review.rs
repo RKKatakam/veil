@@ -1275,7 +1275,6 @@ fn bug_1782_pack_gc_deletes_bisect_revert_and_candidate_snapshots() {
 /// embargo's CI check summaries, logs, and URLs, and outsiders in `devs` can
 /// overwrite the unreleased embargo's check results!
 #[test]
-#[ignore = "BUG-1783: GET and POST /v1/projects/{p}/checks bypass S22 embargo withholding, leaking unreleased embargo CI checks to outsiders/anonymous and allowing outsider check writes"]
 fn bug_1783_checks_routes_bypass_embargo_withholding_leaking_unreleased_checks_and_allowing_outsider_writes() {
     const SECRET_CHECK_LOG: &str = "EMBARGO-CVE-ZERO-DAY-DETAILS-1783";
 
@@ -1301,12 +1300,28 @@ fn bug_1783_checks_routes_bypass_embargo_withholding_leaking_unreleased_checks_a
 
     let sec_tok = p.sec.token();
     let dev_tok = p.dev.token();
+    let emb_branch_and_tip: Option<(String, ObjectId)> = api
+        .tips(Some(&sec_tok), &p.name)
+        .unwrap()
+        .branches
+        .into_iter()
+        .find(|(b, _)| b.starts_with("embargo/"));
+    let (emb_branch, emb_tip) = emb_branch_and_tip.expect("insider sees hidden embargo branch");
 
     // Confirm `fix_id` IS withheld from `dev` and `anon` on `/history` (`404`).
     for tok in [Some(dev_tok.as_str()), None] {
         let h = api.post_json(tok, &format!("/v1/projects/{}/history", p.name), &json!({"tips": [fix_id.hex()]}));
         assert_eq!(h.status, 404, "history withholds embargo snapshot: {}", body(&h));
     }
+
+    // Insider `p.sec` pages `/history` with `limit` to warm `caches.resolved` and `view_graph`
+    // for their shared `view_key` (`src public devs`).
+    let warm = api.post_json(
+        Some(&sec_tok),
+        &format!("/v1/projects/{}/history", p.name),
+        &json!({"tips": [fix_id.hex(), emb_tip.hex()], "limit": 5}),
+    );
+    assert_eq!(warm.status, 200, "insider pages embargo history: {}", body(&warm));
 
     // A CI runner narrowed to `["src"]` (minted by `p.sec` inside `security`) records a check on `fix_id` (`200 OK`).
     let sec_runner = ci_token(&hub, &sec_tok, &p.name, &["src"]);
@@ -1322,22 +1337,66 @@ fn bug_1783_checks_routes_bypass_embargo_withholding_leaking_unreleased_checks_a
         }),
     );
     assert_eq!(post_sec.status, 200, "security CI runner records check: {}", body(&post_sec));
+    let sec_read = api.get(Some(&sec_tok), &format!("/v1/projects/{}/checks?rev={}", p.name, fix_id.hex()));
+    assert_eq!(sec_read.status, 200, "insider reads embargo checks: {}", body(&sec_read));
+    assert!(body(&sec_read).contains(SECRET_CHECK_LOG));
 
-    // Outsider (`dev`) and anonymous (`None`) query `GET .../checks?rev=<fix_id>`:
-    // MUST return `404` and leak nothing — FAILS today with `200 OK` containing `SECRET_CHECK_LOG`!
+    // Outsider (`dev`) and anonymous (`None`) query `GET .../checks` on `fix_id`, `emb_tip`, and `emb_branch`:
+    // MUST return `404`, identical to a missing snapshot, and leak nothing!
+    let missing_hex = "ff".repeat(32);
     for (who, tok) in [("dev", Some(dev_tok.as_str())), ("anon", None)] {
-        let r = api.get(tok, &format!("/v1/projects/{}/checks?rev={}", p.name, fix_id.hex()));
-        assert_eq!(r.status, 404, "{who} read unreleased embargo checks ({}): {}", r.status, body(&r));
-        assert!(!body(&r).contains(SECRET_CHECK_LOG), "{who} leaked {SECRET_CHECK_LOG}");
+        let missing_get = api.get(tok, &format!("/v1/projects/{}/checks?rev={missing_hex}", p.name));
+        assert_eq!(missing_get.status, 404);
+        for rev in [fix_id.hex(), emb_tip.hex(), emb_branch.clone()] {
+            let r = api.get(tok, &format!("/v1/projects/{}/checks?rev={rev}", p.name));
+            assert_eq!(r.status, 404, "{who} read unreleased embargo checks on {rev} ({}): {}", r.status, body(&r));
+            assert_eq!(body(&r), body(&missing_get), "{who} response on {rev} differs from missing revision");
+            assert!(!body(&r).contains(SECRET_CHECK_LOG), "{who} leaked {SECRET_CHECK_LOG}");
+        }
     }
 
-    // Outsider `dev` tries to overwrite `sec-audit` on `fix_id`: MUST return `404`!
-    let overwrite = api.post_json(
+    // Outsider `dev` tries to overwrite `sec-audit` on `fix_id` or `emb_tip`: MUST return `404`,
+    // identical to posting on a missing snapshot!
+    let missing_post = api.post_json(
         Some(&dev_tok),
         &format!("/v1/projects/{}/checks", p.name),
-        &json!({"snapshot": fix_id.hex(), "name": "sec-audit", "state": "pass", "summary": "spoofed"}),
+        &json!({"snapshot": missing_hex, "name": "sec-audit", "state": "pass", "summary": "spoofed"}),
     );
-    assert_eq!(overwrite.status, 404, "outsider dev overwrote unreleased embargo check: {}", body(&overwrite));
+    assert_eq!(missing_post.status, 404);
+    for snap in [fix_id, emb_tip] {
+        let overwrite = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/checks", p.name),
+            &json!({"snapshot": snap.hex(), "name": "sec-audit", "state": "pass", "summary": "spoofed"}),
+        );
+        assert_eq!(overwrite.status, 404, "outsider dev overwrote unreleased embargo check: {}", body(&overwrite));
+        assert_eq!(body(&overwrite), body(&missing_post), "outsider write refusal differs from missing snapshot");
+    }
+
+    // Cross-route shortcut checks (`land` via `changes::resolve_base`, `q/show` via `query::resolve_real`,
+    // and `q/generations` via `view_graph` after `sec` warmed shared `view_key` caches):
+    let land_emb = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({
+            "onto": "main",
+            "base": fix_id.hex(),
+            "edits": [{"path": "src/extra.rs", "put": {"text": "// x\n"}}],
+        }),
+    );
+    assert_eq!(land_emb.status, 404, "outsider landed on unreleased embargo base via caches.resolved: {}", body(&land_emb));
+
+    for rev in [fix_id.hex(), emb_tip.hex()] {
+        let qs = api.get(Some(&dev_tok), &format!("/v1/projects/{}/q/show?rev={rev}", p.name));
+        assert_eq!(qs.status, 404, "query show leaked cached view_graph embargo row {rev}: {}", body(&qs));
+    }
+    let qg = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/q/generations", p.name),
+        &json!({"snapshots": [fix_id.hex(), emb_tip.hex()]}),
+    );
+    assert_eq!(qg.status, 200, "{}", body(&qg));
+    assert_eq!(qg.json()["generations"], json!([null, null]), "q/generations leaked embargo generations: {}", body(&qg));
 }
 
 /// BUG-1784 (blocking): `changes::create_with` (`resolve_change`, `changes.rs:930-947`)

@@ -205,7 +205,10 @@ pub async fn resolve_real(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instan
                 return Err(no_revision());
             }
             if let Some(r) = row_of(id).await? {
-                return if r.withheld() { Err(no_revision()) } else { Ok((id, r.real)) };
+                if r.withheld() || crate::embargo::is_withheld_for_query(hub, project, &r.real).await? {
+                    return Err(no_revision());
+                }
+                return Ok((id, r.real));
             }
             let real: Option<String> = if ask.viewer.admin {
                 if id == root() {
@@ -256,12 +259,22 @@ pub async fn resolve_real(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instan
                         .await?
                 }
             };
-            target.and_then(|t| ObjectId::from_hex(&t).ok()).ok_or_else(no_revision)?
+            let r = target.and_then(|t| ObjectId::from_hex(&t).ok()).ok_or_else(no_revision)?;
+            if crate::embargo::is_withheld_for_query(hub, project, &r).await? {
+                return Err(no_revision());
+            }
+            r
         }
     };
     let p = ensure(hub, &ask.project, &ask.viewer, &[real], Some(deadline)).await?[0];
     match row_of(p).await? {
-        Some(r) if !r.withheld() && (parse_id(rev).is_none() || parse_id(rev) == Some(p)) => Ok((p, r.real)),
+        Some(r)
+            if !r.withheld()
+                && (parse_id(rev).is_none() || parse_id(rev) == Some(p))
+                && !crate::embargo::is_withheld_for_query(hub, project, &r.real).await? =>
+        {
+            Ok((p, r.real))
+        }
         _ => Err(no_revision()),
     }
 }
@@ -883,15 +896,31 @@ pub async fn generations(hub: &Arc<Hub>, ask: &Ask, snapshots: Vec<ObjectId>, li
     if !reals.is_empty() {
         ensure(hub, &ask.project, &ask.viewer, &reals, Some(deadline)).await?;
     }
-    blocking(hub, project, move |cx| {
+    let snaps_for_rows = snapshots.clone();
+    let rows: Vec<Option<(ObjectId, u64)>> = blocking(hub, project, move |cx| {
         let g = G::new(cx, &vk, Some(deadline));
         let mut out = Vec::new();
-        for id in &snapshots {
-            out.push(g.row(id)?.filter(|r| !r.withheld()).map(|r| r.generation.max(0) as u64));
+        for id in &snaps_for_rows {
+            out.push(g.row(id)?.filter(|r| !r.withheld()).map(|r| (r.real, r.generation.max(0) as u64)));
         }
-        Ok(json!({ "generations": out }))
+        Ok(out)
     })
-    .await
+    .await?;
+    let mut out = Vec::with_capacity(snapshots.len());
+    for (id, row) in snapshots.iter().zip(rows) {
+        let Some((real, gen)) = row else {
+            out.push(None);
+            continue;
+        };
+        if crate::embargo::is_withheld_for_query(hub, project, id).await?
+            || crate::embargo::is_withheld_for_query(hub, project, &real).await?
+        {
+            out.push(None);
+        } else {
+            out.push(Some(gen));
+        }
+    }
+    Ok(json!({ "generations": out }))
 }
 
 pub async fn generations_route(

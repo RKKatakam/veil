@@ -788,19 +788,12 @@ async fn resolve_base(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, mut ba
         if let Some(tested) = crate::ci::tested_for(hub, project, viewer, branch).await? {
             base = tested;
         } else if let Some(t) = tip(hub, project.id, branch).await? {
+            if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &t).await? {
+                return Err(Error::not_found(format!("no branch '{branch}' that you can see")));
+            }
             base = sync::projected(hub, project, viewer, t).await?;
         } else {
             return Err(Error::not_found(format!("no branch '{branch}' that you can see")));
-        }
-    }
-    // A landing lands its edits on the tip, never its parent's hidden
-    // files, and any snapshot they see as `base` gives the same edits: the
-    // server's memory of their view answers first, checked.
-    if landing {
-        if let Some(r) = hub.caches.resolved(project.id, &project.view(viewer).key(), &base) {
-            if sync::projected(hub, project, viewer, r).await? == base {
-                return Ok(r);
-            }
         }
     }
     // As a push resolves its parents (one function: BUG-1520): the branch
