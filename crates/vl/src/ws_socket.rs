@@ -116,9 +116,33 @@ fn command_name(cmd: &Cmd) -> String {
 /// neither moves the workspace to another tree, nor rewrites a change some
 /// other workspace may hold. One exhaustive match, for every command the
 /// socket runs; anything else is refused here too.
-fn check_revisions(ctx: &Ctx, cli: &Cli) -> Result<()> {
+/// The check reads only what this replica holds (BUG-1803): a thin clone
+/// never asks its server to place a revision a sandboxed command named, so
+/// a name it cannot place locally is refused, and `--no-network` holds for
+/// the check too. Another workspace's revisions (`name@`) are refused by
+/// name, whatever their place in the history.
+fn check_revisions(ctx: &Ctx, ws: &str, cli: &Cli) -> Result<()> {
+    let store = ctx.repo.store().clone();
+    store.without_fetching(|| check_revisions_here(ctx, ws, cli))
+}
+
+/// Names another workspace's revision (`name@`, `name@-`, …): any `@`
+/// preceded by a name other than `ws`.
+fn names_other_workspace(spec: &str, ws: &str) -> bool {
+    let b = spec.as_bytes();
+    (0..b.len()).filter(|&i| b[i] == b'@').any(|i| {
+        let start = spec[..i].rfind(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))).map_or(0, |j| j + 1);
+        let name = &spec[start..i];
+        !name.is_empty() && name != ws
+    })
+}
+
+fn check_revisions_here(ctx: &Ctx, ws: &str, cli: &Cli) -> Result<()> {
     let wc = ctx.wc()?;
     let within = |spec: &str, what: &str| -> Result<()> {
+        if names_other_workspace(spec, ws) {
+            bail!("inside a sandbox, `vl {what}` reads this workspace's own history only: {} names another workspace", safe(spec));
+        }
         let id = ctx.rev(spec)?;
         if id == wc || ctx.repo.is_ancestor(&id, &wc)? {
             return Ok(());
@@ -519,6 +543,6 @@ pub fn parse_command(args: Vec<OsString>) -> Result<(PathBuf, String, Cli)> {
 /// Open the repository for `cli` through the socket: workspace `ws` only.
 pub fn open(root: &Path, ws: &str, cli: &Cli) -> Result<Ctx> {
     let ctx = Ctx::open_for_workspace(root, ws)?;
-    check_revisions(&ctx, cli)?;
+    check_revisions(&ctx, ws, cli)?;
     Ok(ctx)
 }

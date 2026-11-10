@@ -306,7 +306,6 @@ print(json.dumps(checks))
 }
 
 #[test]
-#[ignore = "BUG-1803: ws_socket check_revisions lets vl log revsets reach outside workspace history and trigger thin-clone network fetches under --no-network"]
 fn bug_1803_ws_socket_log_revsets_stay_within_workspace_and_offline_under_no_network() {
     let env = Env::new();
     let _daemon = DaemonStop { env: &env, user: "alice" };
