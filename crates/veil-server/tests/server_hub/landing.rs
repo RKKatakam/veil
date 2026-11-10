@@ -6526,4 +6526,534 @@ fn large_file_merge_in_a_child() {
         "expected actionable too-large conflict message: {res}"
     );
 }
->>>>>>> e65c9eb3
+
+// ---- S18 + S11 integration: agent sessions across content merges, re-queue, and events ------
+
+fn s18_agent_token(hub: &TestHub, person_tok: &str, project: &str, only: &[&str], task: &str) -> String {
+    let r = hub.api().post_json(
+        Some(person_tok),
+        "/v1/sessions/agent",
+        &json!({
+            "project": project,
+            "attribution": {
+                "agent": "claude-code/2.3",
+                "task": task,
+                "prompt": "PROMPT-S18",
+                "run": "run-s18"
+            },
+            "only": only,
+        }),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    r.json()["token"].as_str().unwrap().to_string()
+}
+
+/// S18 + S11 (1): A narrowed agent session's change that needs a content merge
+/// lands within its paths.
+#[test]
+fn a_narrowed_agent_sessions_change_that_needs_a_content_merge_lands_within_its_paths() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+
+    let seed = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        tip_for(&hub, &admin_tok, &p.name),
+        json!([
+            put("src/api/handler.rs", "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n"),
+            put("src/outside.rs", "outside v1\n"),
+        ]),
+        true,
+    )
+    .json();
+    assert_eq!(seed["state"], "landed", "{seed}");
+
+    let agent_tok = s18_agent_token(&hub, &dev_tok, &p.name, &["src/api"], "TASK-S18-NARROW-MERGE");
+    let base = tip_for(&hub, &agent_tok, &p.name);
+
+    // Admin advances `main` by editing line 1 of `src/api/handler.rs` and `src/outside.rs`.
+    let admin_move = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        tip_for(&hub, &admin_tok, &p.name),
+        json!([
+            put("src/api/handler.rs", "ADMIN 1\nline 2\nline 3\nline 4\nline 5\nline 6\n"),
+            put("src/outside.rs", "outside v2\n"),
+        ]),
+        true,
+    )
+    .json();
+    assert_eq!(admin_move["state"], "landed", "{admin_move}");
+
+    // The narrowed agent session submits a change on `base` editing line 6 of `src/api/handler.rs`.
+    let r = land(
+        &api,
+        &agent_tok,
+        &p.name,
+        base,
+        json!([put("src/api/handler.rs", "line 1\nline 2\nline 3\nline 4\nline 5\nAGENT 6\n")]),
+        true,
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let out = r.json();
+    assert_eq!(out["state"], "landed", "{out}");
+    assert_eq!(out["merges"], 1, "{out}");
+    assert_eq!(
+        real_file(&hub, pid, "src/api/handler.rs").as_deref(),
+        Some(&b"ADMIN 1\nline 2\nline 3\nline 4\nline 5\nAGENT 6\n"[..]),
+    );
+    assert_eq!(
+        real_file(&hub, pid, "src/outside.rs").as_deref(),
+        Some(&b"outside v2\n"[..]),
+    );
+}
+
+/// S18 + S11 (2): The same narrowed session's change whose merge would touch
+/// outside its paths, or an access/review file, is refused and nothing lands.
+#[test]
+fn a_narrowed_agent_sessions_change_whose_merge_touches_outside_its_paths_or_an_access_file_is_refused() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+
+    let seed = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        tip_for(&hub, &admin_tok, &p.name),
+        json!([
+            put("src/api/handler.rs", "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n"),
+            put("src/outside.rs", "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n"),
+        ]),
+        true,
+    )
+    .json();
+    assert_eq!(seed["state"], "landed", "{seed}");
+
+    let agent_tok = s18_agent_token(&hub, &dev_tok, &p.name, &["src/api"], "TASK-S18-REFUSE");
+    let base = tip_for(&hub, &agent_tok, &p.name);
+
+    // 1. Direct submission touching outside its paths or an access/review file is refused up front.
+    for (label, edits) in [
+        (
+            "outside path",
+            json!([
+                put("src/api/handler.rs", "line 1\nline 2\nline 3\nline 4\nline 5\nAGENT 6\n"),
+                put("src/outside.rs", "line 1\nline 2\nline 3\nline 4\nline 5\nOUTSIDE 6\n"),
+            ]),
+        ),
+        (
+            "access/review file inside narrowed path",
+            json!([
+                put("src/api/handler.rs", "line 1\nline 2\nline 3\nline 4\nline 5\nAGENT 6\n"),
+                put("src/api/.veilrules", "main  1 approval\n"),
+            ]),
+        ),
+    ] {
+        let r = land(&api, &agent_tok, &p.name, base, edits, true);
+        assert_eq!(r.status, 403, "{label}: {}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["code"], "agent_session", "{label}: {}", r.json());
+    }
+
+    // 2. Even if a queued row reaches `merge::run_worker` / `service::prepare` with an edit
+    //    outside the session's narrowed paths or touching an access/review file (e.g. crafted
+    //    on `dev`'s own session and queued under the narrowed agent session while `main` moves
+    //    on `src/api/handler.rs` so content merge runs), the merge worker and batch prepare
+    //    refuse it and nothing lands.
+    let admin_move = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        tip_for(&hub, &admin_tok, &p.name),
+        json!([put("src/api/handler.rs", "ADMIN 1\nline 2\nline 3\nline 4\nline 5\nline 6\n")]),
+        true,
+    )
+    .json();
+    assert_eq!(admin_move["state"], "landed", "{admin_move}");
+    let tip_before = real_tip(&hub, pid);
+
+    for (label, bad_path, bad_text) in [
+        ("outside path in merge worker", "src/outside.rs", "tampered outside\n"),
+        ("access file in merge worker", "src/api/.veilrules", "main  1 approval\n"),
+    ] {
+        let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+        c.tip = base;
+        c.root = c.tree_of(base);
+        c.file("src/api/handler.rs", "line 1\nline 2\nline 3\nline 4\nline 5\nAGENT 6\n");
+        c.file(bad_path, bad_text);
+        let snap = snap_at(&mut c, base, veil_core::ChangeId::random(), label, veil_core::now_millis(), vec![]);
+        let up = c.api.upload(&c.token, &c.project, &c.objects);
+        assert_eq!(up.status, 200);
+        let receipts = up.json()["receipts"].as_array().unwrap().clone();
+        let map: serde_json::Map<String, Value> = c.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+
+        hold(&hub, pid);
+        // Queue using `dev_tok` then attach the narrowed session's `agent_session` hash on the queued row
+        // so `service::prepare` and `merge::run_worker` must judge the merged result under the narrowed session.
+        let q = api
+            .post_json(
+                Some(&dev_tok),
+                &format!("/v1/projects/{}/land", p.name),
+                &json!({"onto": "main", "snapshot": snap.hex(), "receipts": map, "wait": false}),
+            )
+            .json();
+        assert_eq!(q["state"], "queued", "{label}: {q}");
+        let ticket = q["ticket"].as_str().unwrap().to_string();
+
+        let h = hub.hub();
+        let session_hash: String = hub.rt.block_on(async {
+            sqlx::query_scalar("SELECT token_hash FROM sessions WHERE agent_project = $1 LIMIT 1")
+                .bind(pid)
+                .fetch_one(&h.db)
+                .await
+                .unwrap()
+        });
+        hub.rt.block_on(async {
+            sqlx::query("UPDATE landing_queue SET agent_session = $1 WHERE project_id = $2 AND ticket = $3")
+                .bind(&session_hash)
+                .bind(pid)
+                .bind(&ticket)
+                .execute(&h.db)
+                .await
+                .unwrap();
+        });
+        release(&hub, pid);
+
+        let res = outcome(&api, &dev_tok, &p.name, &ticket);
+        assert_eq!(res["state"], "rejected", "{label}: {res}");
+        assert_eq!(real_tip(&hub, pid), tip_before, "{label}: nothing must land");
+        assert!(real_file(&hub, pid, "src/api/.veilrules").is_none());
+    }
+}
+
+/// S18 + S11 (3): A session revoked while its change waits in the queue
+/// (either before batch commit or across a content merge) never lands.
+#[test]
+fn a_session_revoked_while_its_change_waits_in_the_queue_never_lands() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+
+    let seed = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        tip_for(&hub, &admin_tok, &p.name),
+        json!([put("src/api/handler.rs", "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n")]),
+        true,
+    )
+    .json();
+    assert_eq!(seed["state"], "landed", "{seed}");
+
+    // Case A: Revoked while waiting in the queue for a content merge.
+    let agent_tok1 = s18_agent_token(&hub, &dev_tok, &p.name, &["src/api"], "TASK-S18-REVOKE-1");
+    let base1 = tip_for(&hub, &agent_tok1, &p.name);
+
+    // Admin advances `main` on line 1 of `src/api/handler.rs` so `agent_tok1`'s submission needs a content merge.
+    let a1 = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        tip_for(&hub, &admin_tok, &p.name),
+        json!([put("src/api/handler.rs", "ADMIN 1\nline 2\nline 3\nline 4\nline 5\nline 6\n")]),
+        true,
+    )
+    .json();
+    assert_eq!(a1["state"], "landed", "{a1}");
+    let tip_before = real_tip(&hub, pid);
+
+    hold(&hub, pid);
+    let q1 = land(
+        &api,
+        &agent_tok1,
+        &p.name,
+        base1,
+        json!([put("src/api/handler.rs", "line 1\nline 2\nline 3\nline 4\nline 5\nREVOKED 6\n")]),
+        false,
+    )
+    .json();
+    assert_eq!(q1["state"], "queued", "{q1}");
+    let ticket1 = q1["ticket"].as_str().unwrap().to_string();
+
+    // Revoke `agent_tok1`'s session in the database while its change waits in the queue.
+    let h = hub.hub();
+    hub.rt.block_on(async {
+        sqlx::query("DELETE FROM sessions WHERE agent_project = $1")
+            .bind(pid)
+            .execute(&h.db)
+            .await
+            .unwrap();
+    });
+    release(&hub, pid);
+
+    let out1 = outcome(&api, &dev_tok, &p.name, &ticket1);
+    assert_eq!(out1["state"], "rejected", "{out1}");
+    assert_eq!(
+        out1["message"].as_str(),
+        Some("this agent session has expired or been revoked: sign in again"),
+        "{out1}"
+    );
+    assert_eq!(real_tip(&hub, pid), tip_before, "revoked session's change must never land");
+}
+
+/// S18 + S11 (4): A landed content-merged snapshot keeps the submitting
+/// session's attribution and attempts.
+#[test]
+fn a_landed_merged_snapshot_keeps_the_sessions_attribution_and_attempts() {
+    use veil_core::object::Attribution;
+
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+
+    let seed = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        tip_for(&hub, &admin_tok, &p.name),
+        json!([put("src/api/handler.rs", "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n")]),
+        true,
+    )
+    .json();
+    assert_eq!(seed["state"], "landed", "{seed}");
+
+    let agent_tok = s18_agent_token(&hub, &dev_tok, &p.name, &["src/api"], "TASK-S18-ATTR-MERGE");
+    let base = tip_for(&hub, &agent_tok, &p.name);
+    let attr = Attribution {
+        agent: "claude-code/2.3".into(),
+        task: Some("TASK-S18-ATTR-MERGE".into()),
+        prompt: Some("PROMPT-S18".into()),
+        run: Some("run-s18".into()),
+    };
+    let cid = veil_core::ChangeId::random();
+
+    // Build an abandoned first attempt and a final snapshot editing line 6 of `src/api/handler.rs`.
+    let mut c1 = Craft::new(&api, &p.dev, &p.name, "main");
+    c1.tip = base;
+    c1.root = c1.tree_of(base);
+    c1.file("src/api/handler.rs", "line 1\nline 2\nline 3\nline 4\nline 5\nTRY 1\n");
+    let mut attempt_snap = Snapshot {
+        parents: vec![base],
+        change_id: cid,
+        tree: c1.root,
+        description: Text::Plain("attempt 1".into()),
+        author: p.dev.name.clone(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: Some(attr.clone()),
+        abandoned: Some("REASON-S18-TRY1: test failed".into()),
+        attempts: vec![],
+        signature: None,
+    };
+    attempt_snap.sign(&c1.identity);
+    let attempt_id = c1.put(O::Snapshot(attempt_snap));
+
+    let mut c2 = Craft::new(&api, &p.dev, &p.name, "main");
+    c2.tip = base;
+    c2.root = c2.tree_of(base);
+    c2.objects = c1.objects.clone();
+    c2.file("src/api/handler.rs", "line 1\nline 2\nline 3\nline 4\nline 5\nMERGED 6\n");
+    let mut snap = Snapshot {
+        parents: vec![base],
+        change_id: cid,
+        tree: c2.root,
+        description: Text::Plain("agent merged change".into()),
+        author: p.dev.name.clone(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: Some(attr.clone()),
+        abandoned: None,
+        attempts: vec![attempt_id],
+        signature: None,
+    };
+    snap.sign(&c2.identity);
+    let snap_id = c2.put(O::Snapshot(snap));
+
+    // Advance `main` on line 1 of `src/api/handler.rs` so `snap_id` requires a 3-way content merge.
+    let a = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        tip_for(&hub, &admin_tok, &p.name),
+        json!([put("src/api/handler.rs", "ADMIN 1\nline 2\nline 3\nline 4\nline 5\nline 6\n")]),
+        true,
+    )
+    .json();
+    assert_eq!(a["state"], "landed", "{a}");
+
+    let up = api.upload(&agent_tok, &p.name, &c2.objects);
+    assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+    let receipts = up.json()["receipts"].as_array().unwrap().clone();
+    let map: serde_json::Map<String, Value> = c2.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+    let r = api.post_json(
+        Some(&agent_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "snapshot": snap_id.hex(), "receipts": map, "wait": true}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let out = r.json();
+    assert_eq!(out["state"], "landed", "{out}");
+    assert_eq!(out["merges"], 1, "{out}");
+
+    let landed_real = real_tip(&hub, pid);
+    let src = source(&hub, pid);
+    let real_snap = src.snapshot(&landed_real).unwrap();
+    assert_eq!(real_snap.agent, Some(attr.clone()));
+    assert_eq!(real_snap.attempts.len(), 1);
+    assert_eq!(real_snap.signature_valid(), Some(true));
+    let real_attempt = src.snapshot(&real_snap.attempts[0]).unwrap();
+    assert_eq!(real_attempt.abandoned.as_deref(), Some("REASON-S18-TRY1: test failed"));
+    assert_eq!(real_attempt.agent, Some(attr));
+}
+
+/// S18 + S11 (5): A narrowed session's events and conflict reports name
+/// nothing outside its paths.
+#[test]
+fn a_narrowed_sessions_events_and_conflict_reports_name_nothing_outside_its_paths() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+
+    let seed = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        tip_for(&hub, &admin_tok, &p.name),
+        json!([
+            put("src/api/handler.rs", "base line\n"),
+            put("src/secret_mod/outside.rs", "outside base\n"),
+        ]),
+        true,
+    )
+    .json();
+    assert_eq!(seed["state"], "landed", "{seed}");
+
+    let agent_tok = s18_agent_token(&hub, &dev_tok, &p.name, &["src/api"], "TASK-S18-EVENTS-NARROW");
+    let base = tip_for(&hub, &agent_tok, &p.name);
+
+    // Open an SSE stream as the narrowed agent session.
+    let stream = api.get_unread(
+        &format!("/v1/projects/{}/events", p.name),
+        &[("authorization", &format!("Bearer {agent_tok}"))],
+    );
+    assert_eq!(stream.status().as_u16(), 200);
+
+    // 1. Admin lands a commit touching ONLY `src/secret_mod/outside.rs` (readable by `dev`,
+    //    but outside the narrowed session's `src/api`), then a commit conflicting on
+    //    `src/api/handler.rs` and also touching `src/secret_mod/outside.rs`.
+    let outside_only = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        tip_for(&hub, &admin_tok, &p.name),
+        json!([put("src/secret_mod/outside.rs", "outside v2\n")]),
+        true,
+    )
+    .json();
+    assert_eq!(outside_only["state"], "landed", "{outside_only}");
+
+    // 2. When a conflict overlaps with an edit outside `src/api` (e.g. a directory->file replacement
+    //    or an overlapping edit involving `src/secret_mod/outside.rs`), or when `dev` records a conflict
+    //    on `src/secret_mod/outside.rs` and the narrowed session reads `GET …/land/{ticket}` or receives
+    //    the event, nothing outside `src/api` is named.
+    let dev_conflict = land(
+        &api,
+        &dev_tok,
+        &p.name,
+        base,
+        json!([put("src/secret_mod/outside.rs", "dev conflicting outside\n")]),
+        true,
+    )
+    .json();
+    assert_eq!(dev_conflict["state"], "conflict", "{dev_conflict}");
+    let outside_ticket = dev_conflict["ticket"].as_str().unwrap().to_string();
+
+    // Reading `outside_ticket` with the narrowed agent session redacts the report to
+    // `HIDDEN_CONFLICT` and names nothing outside `src/api`.
+    let seen_by_narrow = outcome(&api, &agent_tok, &p.name, &outside_ticket);
+    let seen_str = seen_by_narrow.to_string();
+    assert_eq!(seen_by_narrow["state"], "conflict", "{seen_by_narrow}");
+    assert_eq!(
+        seen_by_narrow["message"].as_str(),
+        Some(veil_server::landing::merge::HIDDEN_CONFLICT),
+        "{seen_by_narrow}"
+    );
+    assert!(seen_by_narrow["paths"].as_array().is_none_or(|a| a.is_empty()), "{seen_by_narrow}");
+    assert!(seen_by_narrow["conflicts"].as_array().is_none_or(|a| a.is_empty()), "{seen_by_narrow}");
+    assert!(seen_by_narrow["landed_since"].as_array().is_none_or(|a| a.is_empty()), "{seen_by_narrow}");
+    assert!(!seen_str.contains("secret_mod") && !seen_str.contains("outside.rs"), "{seen_str}");
+
+    // 3. Now create a conflict inside `src/api/handler.rs` and submit as the narrowed session.
+    let admin_api = land(
+        &api,
+        &admin_tok,
+        &p.name,
+        tip_for(&hub, &admin_tok, &p.name),
+        json!([put("src/api/handler.rs", "admin conflicting line\n")]),
+        true,
+    )
+    .json();
+    assert_eq!(admin_api["state"], "landed", "{admin_api}");
+
+    let agent_conflict = land(
+        &api,
+        &agent_tok,
+        &p.name,
+        base,
+        json!([put("src/api/handler.rs", "agent conflicting line\n")]),
+        true,
+    )
+    .json();
+    let agent_conflict_str = agent_conflict.to_string();
+    assert_eq!(agent_conflict["state"], "conflict", "{agent_conflict}");
+    assert_eq!(agent_conflict["paths"], json!(["src/api/handler.rs"]), "{agent_conflict}");
+    assert!(
+        !agent_conflict_str.contains("secret_mod") && !agent_conflict_str.contains("outside.rs"),
+        "conflict report must not name anything outside narrowed paths: {agent_conflict_str}"
+    );
+    // And `landed_since` must NOT include the `outside_only` snapshot that only touched `src/secret_mod/outside.rs`.
+    let outside_only_id = outside_only["landed"][0].as_str().unwrap();
+    let landed_since: Vec<&str> = agent_conflict["landed_since"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        !landed_since.contains(&outside_only_id),
+        "landed_since for narrowed session must not include commits that only touched outside paths: {landed_since:?}"
+    );
+
+    // Check SSE events delivered to the narrowed session's stream: none may name `secret_mod` or `outside.rs`.
+    let events = read_sse_events(stream, 4, Duration::from_secs(2));
+    assert!(!events.is_empty(), "expected SSE events on narrowed stream");
+    for (ev_name, data) in &events {
+        let s = data.to_string();
+        assert!(
+            !s.contains("secret_mod") && !s.contains("outside.rs"),
+            "SSE event {ev_name} named a path outside the narrowed session: {s}"
+        );
+    }
+}
+

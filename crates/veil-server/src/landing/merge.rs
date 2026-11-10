@@ -143,6 +143,7 @@ pub struct Job {
     pub seq: i64,
     pub ticket: String,
     pub person: Person,
+    pub agent_session: Option<String>,
     pub stack: Vec<Entry>,
     pub lineage: i64,
     pub merges: u32,
@@ -217,18 +218,19 @@ pub fn build_conflict(
     let mut overlapping_edits = Vec::new();
     let mut hidden = false;
     let mut too_large = false;
+    let can_see = |p: &str| view.read(p) && view.within_narrowing(p);
 
     for c in set {
         if edits::fast_path(src, parent_tree, chain_tree, std::slice::from_ref(c))?.is_none() {
             continue;
         }
         overlapping_edits.push(c.clone());
-        if !view.read(&c.path) {
+        if !can_see(&c.path) {
             hidden = true;
             continue;
         }
         let main_touching: Vec<&Change> = main_edits.iter().filter(|m| paths_overlap(&c.path, &m.path)).collect();
-        if main_touching.iter().any(|m| !view.read(&m.path)) {
+        if main_touching.iter().any(|m| !can_see(&m.path)) {
             hidden = true;
             continue;
         }
@@ -266,7 +268,7 @@ pub fn build_conflict(
     if paths.is_empty() && !hidden {
         // Blocked by a folder/file collision detected during `edits::apply`.
         for c in set {
-            if !view.read(&c.path) || main_edits.iter().any(|m| paths_overlap(&c.path, &m.path) && !view.read(&m.path)) {
+            if !can_see(&c.path) || main_edits.iter().any(|m| paths_overlap(&c.path, &m.path) && !can_see(&m.path)) {
                 hidden = true;
             } else {
                 paths.push(c.path.clone());
@@ -327,7 +329,7 @@ fn collect_landed_since(
             continue;
         };
         let step_edits = edits::edit_set(src, tree, ps.tree)?;
-        if !step_edits.iter().any(|c| view.read(&c.path)) {
+        if !step_edits.iter().any(|c| view.read(&c.path) && view.within_narrowing(&c.path)) {
             continue;
         }
         if overlapping.is_empty() || edits::fast_path(src, ps.tree, tree, overlapping)?.is_some() {
@@ -362,7 +364,13 @@ pub fn can_merge(
         if s.parents.len() > 1 {
             return Ok(false);
         }
-        if set.iter().any(|c| c.path == POLICY_FILE || c.path == RULES_FILE || !view.read(&c.path) || !view.write(&c.path)) {
+        if set.iter().any(|c| {
+            veil_core::hub::agent::decides_access(&c.path)
+                || c.path == POLICY_FILE
+                || c.path == RULES_FILE
+                || !view.read(&c.path)
+                || !view.write(&c.path)
+        }) {
             return Ok(false);
         }
         if edits::fast_path(src, *parent_tree, chain_tree, set)?.is_none() {
@@ -381,7 +389,10 @@ pub fn can_merge(
             if edits::fast_path(src, *parent_tree, chain_tree, std::slice::from_ref(c))?.is_none() {
                 continue;
             }
-            if main_edits.iter().any(|m| paths_overlap(&c.path, &m.path) && !view.read(&m.path)) {
+            if main_edits
+                .iter()
+                .any(|m| paths_overlap(&c.path, &m.path) && (!view.read(&m.path) || !view.within_narrowing(&m.path)))
+            {
                 return Ok(false);
             }
             let Some(te) = &c.new else { return Ok(false) };
@@ -456,9 +467,21 @@ enum WorkerOutcome {
     Rejected(String, Option<ChangeId>),
 }
 
-async fn run_worker(hub: &Arc<Hub>, job: Job) -> Result<()> {
-    // 1. Re-open the project and viewer as the submitter is *now* (current
-    //    access epochs), so revoked access is caught before any merge lands.
+async fn run_worker(hub: &Arc<Hub>, mut job: Job) -> Result<()> {
+    // 1. Re-open the project, viewer and submitting agent session as the
+    //    submitter is *now* (current access epochs), so revoked access or an
+    //    expired/revoked agent session is caught before any merge lands.
+    let session_gone = if let Some(sh) = &job.agent_session {
+        match crate::auth::load_agent_session(&hub.db, sh, job.person.id, job.project).await? {
+            Some(grant) => {
+                job.person.agent = Some(grant);
+                false
+            }
+            None => true,
+        }
+    } else {
+        false
+    };
     let epochs_rows: Vec<(i64, i64, i64)> = sqlx::query_as(
         "SELECT project_id, person_id, epoch FROM access_epochs WHERE (project_id = 0 AND person_id = $1) OR (project_id = $2 AND person_id = 0)",
     )
@@ -475,11 +498,15 @@ async fn run_worker(hub: &Arc<Hub>, job: Job) -> Result<()> {
             project: Some((job.project, project_epoch)),
         },
     };
-    let who = match crate::perm::open(hub, &job.project_name, &caller).await {
-        Ok((p, v)) if p.participant(&v) => Ok((Arc::new(p), v)),
-        Ok(_) | Err(Error::Api { code: "not_found", .. }) => Err("you are no longer in this project".to_string()),
-        Err(Error::Api { message, code: "forbidden", .. }) => Err(message),
-        Err(e) => return Err(e),
+    let who = if session_gone {
+        Err("this agent session has expired or been revoked: sign in again".to_string())
+    } else {
+        match crate::perm::open(hub, &job.project_name, &caller).await {
+            Ok((p, v)) if p.participant(&v) => Ok((Arc::new(p), v)),
+            Ok(_) | Err(Error::Api { code: "not_found", .. }) => Err("you are no longer in this project".to_string()),
+            Err(Error::Api { message, code: "forbidden", .. }) => Err(message),
+            Err(e) => return Err(e),
+        }
     };
 
     // Read the current tip and lineage of the branch from the database.
@@ -532,78 +559,98 @@ async fn run_worker(hub: &Arc<Hub>, job: Job) -> Result<()> {
             let orig_src: Vec<String> = origins.iter().map(|(_, o)| o.hex()).collect();
             let encoded = super::encode_stack(&stack);
             let pid = job.project;
+            let person_id = job.person.id;
+            let agent_session = job.agent_session.clone();
             let branch = job.branch.clone();
             let seq = job.seq;
             let max_merges = i64::from(MAX_MERGES);
-            let new_merges: Option<i64> = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-                let (snap_hex, snap_authors, orig_real, orig_src, encoded, branch) = (
-                    snap_hex.clone(),
-                    snap_authors.clone(),
-                    orig_real.clone(),
-                    orig_src.clone(),
-                    encoded.clone(),
-                    branch.clone(),
-                );
-                Box::pin(async move {
-                    if !snap_hex.is_empty() {
-                        sqlx::query(
-                            "INSERT INTO snapshots (project_id, id, author) SELECT $1, s, a FROM unnest($2::TEXT[], $3::BIGINT[]) AS v(s, a) \
-                             ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0",
+            let requeue_out: std::result::Result<Option<i64>, String> =
+                crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+                    let (snap_hex, snap_authors, orig_real, orig_src, encoded, branch, agent_session) = (
+                        snap_hex.clone(),
+                        snap_authors.clone(),
+                        orig_real.clone(),
+                        orig_src.clone(),
+                        encoded.clone(),
+                        branch.clone(),
+                        agent_session.clone(),
+                    );
+                    Box::pin(async move {
+                        if let Some(sh) = &agent_session {
+                            if crate::auth::load_agent_session(&mut *c, sh, person_id, pid).await?.is_none() {
+                                return Ok(Err("this agent session has expired or been revoked: sign in again".to_string()));
+                            }
+                        }
+                        if !snap_hex.is_empty() {
+                            sqlx::query(
+                                "INSERT INTO snapshots (project_id, id, author) SELECT $1, s, a FROM unnest($2::TEXT[], $3::BIGINT[]) AS v(s, a) \
+                                 ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0",
+                            )
+                            .bind(pid)
+                            .bind(&snap_hex)
+                            .bind(&snap_authors)
+                            .execute(&mut *c)
+                            .await?;
+                        }
+                        if !orig_real.is_empty() {
+                            sqlx::query(
+                                "INSERT INTO origins (project_id, real_id, origin_id) \
+                                 SELECT $1, r, o FROM unnest($2::TEXT[], $3::TEXT[]) AS v(r, o) ON CONFLICT DO NOTHING",
+                            )
+                            .bind(pid)
+                            .bind(&orig_real)
+                            .bind(&orig_src)
+                            .execute(&mut *c)
+                            .await?;
+                        }
+                        let m: Option<i64> = sqlx::query_scalar(
+                            "UPDATE landing_queue SET state = 'queued', stack = $4, merges = merges + 1, \
+                             created_at = (extract(epoch FROM clock_timestamp()) * 1000000)::BIGINT \
+                             WHERE project_id = $1 AND branch = $2 AND seq = $3 AND state = 'merging' AND merges < $5 \
+                             RETURNING merges",
                         )
                         .bind(pid)
-                        .bind(&snap_hex)
-                        .bind(&snap_authors)
-                        .execute(&mut *c)
+                        .bind(&branch)
+                        .bind(seq)
+                        .bind(&encoded)
+                        .bind(max_merges)
+                        .fetch_optional(&mut *c)
                         .await?;
-                    }
-                    if !orig_real.is_empty() {
-                        sqlx::query(
-                            "INSERT INTO origins (project_id, real_id, origin_id) \
-                             SELECT $1, r, o FROM unnest($2::TEXT[], $3::TEXT[]) AS v(r, o) ON CONFLICT DO NOTHING",
-                        )
-                        .bind(pid)
-                        .bind(&orig_real)
-                        .bind(&orig_src)
-                        .execute(&mut *c)
-                        .await?;
-                    }
-                    let m: Option<i64> = sqlx::query_scalar(
-                        "UPDATE landing_queue SET state = 'queued', stack = $4, merges = merges + 1, \
-                         created_at = (extract(epoch FROM clock_timestamp()) * 1000000)::BIGINT \
-                         WHERE project_id = $1 AND branch = $2 AND seq = $3 AND state = 'merging' AND merges < $5 \
-                         RETURNING merges",
-                    )
-                    .bind(pid)
-                    .bind(&branch)
-                    .bind(seq)
-                    .bind(&encoded)
-                    .bind(max_merges)
-                    .fetch_optional(&mut *c)
-                    .await?;
-                    Ok(m)
+                        Ok(Ok(m))
+                    })
                 })
-            })
-            .await?;
+                .await?;
 
             for s in &snapshots {
                 hub.caches.put_committed(job.project, s);
             }
-            if let Some(m) = new_merges {
-                let mut r = super::queued(&job.ticket);
-                r.change_id = change_id;
-                r.onto = Some(onto);
-                r.merges = m as u32;
-                crate::events::emit_ticket(
-                    hub,
-                    job.project,
-                    &job.branch,
-                    job.person.id,
-                    "land.requeued",
-                    "requeued",
-                    r,
-                )
-                .await;
-                super::ensure(hub, job.project, &job.branch);
+            match requeue_out {
+                Ok(Some(m)) => {
+                    let mut r = super::queued(&job.ticket);
+                    r.change_id = change_id;
+                    r.onto = Some(onto);
+                    r.merges = m as u32;
+                    crate::events::emit_ticket(
+                        hub,
+                        job.project,
+                        &job.branch,
+                        job.person.id,
+                        "land.requeued",
+                        "requeued",
+                        r,
+                    )
+                    .await;
+                    super::ensure(hub, job.project, &job.branch);
+                }
+                Ok(None) => {}
+                Err(why) => {
+                    let mut res = super::queued(&job.ticket);
+                    res.state = LandState::Rejected;
+                    res.change_id = change_id;
+                    res.message = Some(why);
+                    res.merges = job.merges;
+                    finish_terminal(hub, &job, "rejected", "land.rejected", res).await?;
+                }
             }
         }
         WorkerOutcome::Conflict(report) => {
@@ -725,20 +772,49 @@ fn merge_stack(
         let parent_tree = src.snapshot(&against)?.tree;
         let set = edits::edit_set(&src, s.tree, parent_tree)?;
 
+        if viewer.agent {
+            let default = job.branch == project.default_branch;
+            for v in [&view, &tip_view] {
+                match sync::agent_tip(&src, v, default, Some(against), sid)? {
+                    Some(sync::AgentTip::Narrowed) => return Ok(WorkerOutcome::Rejected(sync::NARROWED_MOVE.into(), last_cid)),
+                    Some(sync::AgentTip::Access) => return Ok(WorkerOutcome::Rejected(sync::AGENT_ACCESS_MOVE.into(), last_cid)),
+                    Some(sync::AgentTip::DefaultBranch) => return Ok(WorkerOutcome::Rejected(sync::AGENT_DEFAULT_BRANCH.into(), last_cid)),
+                    None => {}
+                }
+            }
+        }
+
         // Guarantee 1: A merge never lands anything its submitter couldn't
         // see whole. Every edit of the change must be readable and writable
         // by the submitter under both current permissions and the tip's
         // policy; a hidden edit is refused without naming its path.
-        if !viewer.admin {
-            if set.iter().any(|c| !view.read(&c.path) || !tip_view.read(&c.path)) {
-                return Ok(WorkerOutcome::Rejected(
-                    "your access changed since this change was submitted, and it holds edits you cannot see: make it again".into(),
-                    last_cid,
-                ));
-            }
-            if let Some(c) = set.iter().find(|c| !view.write(&c.path) || !tip_view.write(&c.path)) {
-                return Ok(WorkerOutcome::Rejected(format!("you may not write '{}'", c.path), last_cid));
-            }
+        if (!viewer.admin || view.is_narrowed() || tip_view.is_narrowed())
+            && set.iter().any(|c| {
+                !view.read(&c.path)
+                    || !tip_view.read(&c.path)
+                    || !view.within_narrowing(&c.path)
+                    || !tip_view.within_narrowing(&c.path)
+            })
+        {
+            let msg = if view.is_narrowed() || tip_view.is_narrowed() {
+                sync::NARROWED_MOVE.into()
+            } else {
+                "your access changed since this change was submitted, and it holds edits you cannot see: make it again".into()
+            };
+            return Ok(WorkerOutcome::Rejected(msg, last_cid));
+        }
+        if let Some(c) = set
+            .iter()
+            .find(|c| (!viewer.admin || viewer.agent) && (!view.write(&c.path) || !tip_view.write(&c.path)))
+        {
+            let msg = if viewer.agent && veil_core::hub::agent::decides_access(&c.path) {
+                format!("an agent session never changes '{}', which decides access or review", c.path)
+            } else if !view.within_narrowing(&c.path) || !tip_view.within_narrowing(&c.path) {
+                sync::NARROWED_MOVE.to_string()
+            } else {
+                format!("you may not write '{}'", c.path)
+            };
+            return Ok(WorkerOutcome::Rejected(msg, last_cid));
         }
         if s.parents.len() > 1 {
             return Ok(WorkerOutcome::Rejected(
@@ -767,7 +843,13 @@ fn merge_stack(
                         merged_set.push(c.clone());
                         continue;
                     }
-                    if main_edits.iter().any(|m| paths_overlap(&c.path, &m.path) && (!view.read(&m.path) || !tip_view.read(&m.path))) {
+                    if main_edits.iter().any(|m| {
+                        paths_overlap(&c.path, &m.path)
+                            && (!view.read(&m.path)
+                                || !tip_view.read(&m.path)
+                                || !view.within_narrowing(&m.path)
+                                || !tip_view.within_narrowing(&m.path))
+                    }) {
                         let report = build_conflict(&src, &view, against, parent_tree, chain, chain_tree, &set, job.merges, last_cid)?;
                         return Ok(WorkerOutcome::Conflict(report));
                     }
@@ -829,11 +911,28 @@ fn merge_stack(
             ));
         }
         // Guarantee 1: verify that the submitter sees the resulting diff whole.
-        if !viewer.admin && actual_diff.iter().any(|c| !view.read(&c.path) || !view.write(&c.path) || !tip_view.read(&c.path) || !tip_view.write(&c.path)) {
-            return Ok(WorkerOutcome::Rejected(
-                "your access changed since this change was submitted, and it no longer lands as it was made: make it again".into(),
-                last_cid,
-            ));
+        if (!viewer.admin || viewer.agent)
+            && actual_diff.iter().any(|c| {
+                !view.read(&c.path)
+                    || !view.write(&c.path)
+                    || !tip_view.read(&c.path)
+                    || !tip_view.write(&c.path)
+            })
+        {
+            let msg = if let Some(c) = actual_diff
+                .iter()
+                .find(|c| viewer.agent && veil_core::hub::agent::decides_access(&c.path))
+            {
+                format!("an agent session never changes '{}', which decides access or review", c.path)
+            } else if actual_diff
+                .iter()
+                .any(|c| !view.within_narrowing(&c.path) || !tip_view.within_narrowing(&c.path))
+            {
+                sync::NARROWED_MOVE.to_string()
+            } else {
+                "your access changed since this change was submitted, and it no longer lands as it was made: make it again".into()
+            };
+            return Ok(WorkerOutcome::Rejected(msg, last_cid));
         }
 
         let mut preds = vec![sid];
@@ -851,6 +950,9 @@ fn merge_stack(
             tree,
             description: s.description.clone(),
             author: s.author.clone(),
+            agent: s.agent.clone(),
+            abandoned: None,
+            attempts: s.attempts.clone(),
             timestamp: s.timestamp,
             predecessors: preds,
             conflicts: vec![],
@@ -865,6 +967,18 @@ fn merge_stack(
         objects.push((id, raw));
         snapshots.push(id);
         origins.push((id, sid));
+
+        if viewer.agent {
+            let default = job.branch == project.default_branch;
+            for v in [&view, &tip_view] {
+                match sync::agent_tip(&src, v, default, Some(chain), id)? {
+                    Some(sync::AgentTip::Narrowed) => return Ok(WorkerOutcome::Rejected(sync::NARROWED_MOVE.into(), last_cid)),
+                    Some(sync::AgentTip::Access) => return Ok(WorkerOutcome::Rejected(sync::AGENT_ACCESS_MOVE.into(), last_cid)),
+                    Some(sync::AgentTip::DefaultBranch) => return Ok(WorkerOutcome::Rejected(sync::AGENT_DEFAULT_BRANCH.into(), last_cid)),
+                    None => {}
+                }
+            }
+        }
 
         // Full push check (`sync::complete`) on the new parent so secret scan,
         // session narrowing and graft equivalence hold on the merged snapshot.

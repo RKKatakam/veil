@@ -4182,6 +4182,19 @@ and `crates/veil-core/src/hub/land.rs`.
     the subscriber, clears and shrinks its frame buffer, decrements `total_bytes`
     to zero, and marks the stream closed without blocking landing or merge
     workers.
+* **Agent sessions across queuing, content merges, conflict reports and events
+  (BUG-1685):** `landing_queue.agent_session` (`0022_landing_merge.sql`) records
+  the submitting agent session's `token_hash`. `service::prepare`,
+  `service::commit`, `merge::run_worker`, and `events::emit_ticket` /
+  `events::emit_moved` reload and verify the session via
+  `auth::load_agent_session` (checking that the session, its parent session, and
+  its device have not expired or been revoked), rejecting or evicting at once if
+  gone; `merge::merge_stack` and `service::entry` enforce `sync::agent_tip` and
+  `veil_core::hub::agent::decides_access` on every original and merged snapshot
+  against the base it lands on while preserving `agent` attribution and
+  `attempts`; and `merge::build_conflict`, `merge::collect_landed_since`, and
+  `landing::seen` require `view.within_narrowing(path)` so a narrowed session's
+  conflict reports and SSE events name nothing outside its paths.
 
 #### Threat review (phase 4 §6 and S18 guarantees)
 
@@ -4193,3 +4206,4 @@ and `crates/veil-core/src/hub/land.rs`.
 | 4 | A client opens unbounded SSE streams to exhaust file descriptors or hub slots | `MAX_STREAMS_PER_CONNECTION = 8` and `MAX_STREAMS_PER_PERSON = 8` enforced atomically on open; `StreamBody::drop` evicts on close | `server_hub` `landing::the_event_stream_is_bounded_per_connection_and_per_person` |
 | 5 | A slow or stalled SSE reader buffers unbounded events in server memory | Per-stream queue bounded at 64 frames and 64 KiB (`MAX_BYTES_PER_STREAM`); overflow calls `Events::evict` immediately on emit and frees held bytes to 0 | `server_hub` `landing::a_slow_or_absent_reader_never_holds_server_memory` |
 | 6 | Repeatedly conflicting changes loop between the queue and merge workers forever, or ignore `.veilattributes` | `merges` column capped at `MAX_MERGES = 3`; `.veilattributes` (`merge=union`, `-merge`, `binary`) loaded from the tip via `ServerAttrSource` and honoured by workers | `server_hub` `landing::merge_attempts_cap_at_three_and_veilattributes_govern_content_merge` |
+| 7 | A queued or re-queued agent-session change escapes its session narrowing, touches an access/review file, lands after the session is revoked, loses its attribution/attempts on content merge, or learns paths outside its narrowing via conflict reports or SSE events (BUG-1685) | `landing_queue.agent_session` persisted and verified at prepare, merge, re-queue, and commit (`auth::load_agent_session`); `merge_stack` and `service::entry` enforce `sync::agent_tip` and `decides_access` and preserve `agent`/`attempts`; `build_conflict`, `collect_landed_since`, and `landing::seen` redact anything outside `within_narrowing` | `server_hub` `landing::a_narrowed_agent_sessions_change_that_needs_a_content_merge_lands_within_its_paths`, `landing::a_narrowed_agent_sessions_change_whose_merge_touches_outside_its_paths_or_an_access_file_is_refused`, `landing::a_session_revoked_while_its_change_waits_in_the_queue_never_lands`, `landing::a_landed_merged_snapshot_keeps_the_sessions_attribution_and_attempts`, `landing::a_narrowed_sessions_events_and_conflict_reports_name_nothing_outside_its_paths` |

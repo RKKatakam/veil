@@ -131,7 +131,7 @@ pub fn ticket() -> String {
 pub async fn insert(c: &mut PgConnection, project: i64, who: &Submitter, q: &Queued) -> Result<()> {
     sqlx::query(
         "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, person_epoch, \
-         project_epoch, state, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued', \
+         project_epoch, agent_session, state, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'queued', \
          (extract(epoch FROM clock_timestamp()) * 1000000)::BIGINT)",
     )
     .bind(project)
@@ -144,6 +144,7 @@ pub async fn insert(c: &mut PgConnection, project: i64, who: &Submitter, q: &Que
     .bind(q.lineage)
     .bind(who.epochs.person)
     .bind(who.epochs.project.map_or(0, |(_, e)| e))
+    .bind(who.person.agent.as_ref().map(|a| a.session_hash.as_str()))
     .execute(&mut *c)
     .await?;
     Ok(())
@@ -440,13 +441,65 @@ pub async fn seen(hub: &Arc<Hub>, project: &crate::perm::Project, viewer: &crate
     if let Some(base) = r.base {
         r.base = Some(crate::sync::projected(hub, project, viewer, base).await?);
     }
+    let view = project.view(viewer);
+    let can_see = |p: &str| view.read(p) && view.within_narrowing(p);
+    if (!viewer.admin || view.is_narrowed())
+        && (r.paths.iter().any(|p| !can_see(p)) || r.conflicts.iter().any(|c| !can_see(&c.path)))
+    {
+        r.paths.clear();
+        r.conflicts.clear();
+        r.landed_since.clear();
+        r.message = Some(merge::HIDDEN_CONFLICT.to_string());
+    }
+    if view.is_narrowed() && r.state == LandState::Rejected {
+        if let Some(msg) = &r.message {
+            let mut rest = msg.as_str();
+            let mut outside = false;
+            while let Some(i) = rest.find('\'') {
+                rest = &rest[i + 1..];
+                let Some(j) = rest.find('\'') else { break };
+                let quoted = &rest[..j];
+                rest = &rest[j + 1..];
+                if (quoted.contains('/') || quoted.starts_with('.')) && !view.within_narrowing(quoted) {
+                    outside = true;
+                    break;
+                }
+            }
+            if outside {
+                r.message = Some(crate::sync::NARROWED_MOVE.to_string());
+            }
+        }
+    }
     if !r.landed_since.is_empty() {
         let mut since = Vec::with_capacity(r.landed_since.len());
         for x in &r.landed_since {
             let px = crate::sync::projected(hub, project, viewer, *x).await?;
-            if !viewer.admin {
+            if !viewer.admin || view.is_narrowed() {
                 let y = *x;
-                let p0 = crate::sync::blocking(hub, project.id, move |src| Ok(src.snapshot(&y)?.parents.first().copied())).await?;
+                let (p0, touches_visible) = crate::sync::blocking(hub, project.id, {
+                    let (policy_text, bindings, v) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
+                    move |src| {
+                        let s = src.snapshot(&y)?;
+                        let Some(p0) = s.parents.first().copied() else { return Ok((None, false)) };
+                        let ps = src.snapshot(&p0)?;
+                        let p = crate::perm::Project {
+                            id: src.project,
+                            name: String::new(),
+                            default_branch: String::new(),
+                            policy: veil_core::hub::access::AccessPolicy::parse(&policy_text),
+                            policy_text,
+                            bindings,
+                        };
+                        let view = p.view(&v);
+                        let step = edits::edit_set(src, s.tree, ps.tree)?;
+                        let vis = step.iter().any(|c| view.read(&c.path) && view.within_narrowing(&c.path));
+                        Ok((Some(p0), vis))
+                    }
+                })
+                .await?;
+                if !touches_visible {
+                    continue;
+                }
                 if let Some(p0) = p0 {
                     let pp0 = crate::sync::projected(hub, project, viewer, p0).await?;
                     if px == pp0 {
@@ -459,15 +512,6 @@ pub async fn seen(hub: &Arc<Hub>, project: &crate::perm::Project, viewer: &crate
             }
         }
         r.landed_since = since;
-    }
-    if !viewer.admin {
-        let view = project.view(viewer);
-        if r.paths.iter().any(|p| !view.read(p)) || r.conflicts.iter().any(|c| !view.read(&c.path)) {
-            r.paths.clear();
-            r.conflicts.clear();
-            r.landed_since.clear();
-            r.message = Some(merge::HIDDEN_CONFLICT.to_string());
-        }
     }
     Ok(r)
 }
@@ -974,17 +1018,17 @@ pub(crate) async fn agent_stack(
         return Ok(None);
     }
     let default = branch == project.default_branch;
-    let (view_policy, view_bindings, v, j_branch, first) = (
+    let (view_policy, view_bindings, v, j_branch, entries) = (
         project.policy_text.clone(),
         project.bindings.clone(),
         viewer.clone(),
         judged.branch,
-        judged.stack.first().cloned(),
+        judged.stack.clone(),
     );
     let refused = crate::sync::blocking(hub, project.id, move |src| {
         let base = if !j_branch && default {
             None
-        } else if let Some(e) = first {
+        } else if let Some(e) = entries.first() {
             let s = src.snapshot(&e.id)?;
             Some(if s.parents.get(1..).is_some_and(|o| o.contains(&e.base)) {
                 e.base
@@ -1002,7 +1046,22 @@ pub(crate) async fn agent_stack(
             policy_text: view_policy,
             bindings: view_bindings,
         };
-        crate::sync::agent_tip(src, &p.view(&v), default, base, to)
+        let view = p.view(&v);
+        if let Some(r) = crate::sync::agent_tip(src, &view, default, base, to)? {
+            return Ok(Some(r));
+        }
+        for e in &entries {
+            let s = src.snapshot(&e.id)?;
+            let against = if s.parents.get(1..).is_some_and(|o| o.contains(&e.base)) {
+                e.base
+            } else {
+                s.parents.first().copied().unwrap_or_else(crate::sync::root_snapshot_id)
+            };
+            if let Some(r) = crate::sync::agent_tip(src, &view, default, Some(against), e.id)? {
+                return Ok(Some(r));
+            }
+        }
+        Ok(None)
     })
     .await?;
     match refused {

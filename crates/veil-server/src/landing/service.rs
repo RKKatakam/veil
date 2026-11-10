@@ -151,6 +151,7 @@ struct Row {
     lineage: i64,
     epochs: (i64, i64),
     merges: u32,
+    agent_session: Option<String>,
 }
 
 /// Metadata of a row in a built batch.
@@ -161,6 +162,8 @@ struct RowMeta {
     person_id: i64,
     merges: u32,
     change_id: Option<veil_core::ChangeId>,
+    agent_session: Option<String>,
+    epochs: (i64, i64),
 }
 
 /// Someone a projection is made for, now.
@@ -213,6 +216,7 @@ struct Prepared {
     /// Access changed since it was submitted: write access is decided first,
     /// and the push's checks run again.
     recheck: bool,
+    epochs: (i64, i64),
 }
 
 /// A batch's inputs, read before it is built.
@@ -530,9 +534,9 @@ impl Service {
 
     /// The ready rows, in order, leaving out those being committed.
     async fn ready(&self, exclude: &HashSet<i64>) -> Result<Vec<Row>> {
-        type R = (i64, String, i64, String, String, String, i64, i64, i64, i64);
+        type R = (i64, String, i64, String, String, String, i64, i64, i64, i64, Option<String>);
         let rows: Vec<R> = sqlx::query_as(
-            "SELECT seq, ticket, person_id, person_name, device_key, stack, lineage, person_epoch, project_epoch, merges FROM landing_queue \
+            "SELECT seq, ticket, person_id, person_name, device_key, stack, lineage, person_epoch, project_epoch, merges, agent_session FROM landing_queue \
              WHERE project_id = $1 AND branch = $2 AND state = 'queued' ORDER BY created_at, seq LIMIT $3",
         )
         .bind(self.project)
@@ -541,22 +545,19 @@ impl Service {
         .fetch_all(&self.hub.db)
         .await?;
         let mut out = Vec::new();
-        for (seq, ticket, id, name, device_key, stack, lineage, pe, je, merges) in rows {
+        for (seq, ticket, id, name, device_key, stack, lineage, pe, je, merges, agent_session) in rows {
             if exclude.contains(&seq) {
                 continue;
             }
             out.push(Row {
                 seq,
                 ticket,
-                // The landing service never acts for a session: session rules
-                // (narrowing, agent restrictions) are decided in the submitter's
-                // request before a landing is queued, and each landed snapshot
-                // keeps the submitted snapshot's own `agent` attribution.
                 person: Person { id, name, device_key, agent: None },
                 stack: super::decode_stack(&stack)?,
                 lineage,
                 epochs: (pe, je),
                 merges: merges.max(0) as u32,
+                agent_session,
             });
             if out.len() == MAX_BATCH {
                 break;
@@ -648,40 +649,56 @@ impl Service {
             self.enumerate(known).await?;
             known.epoch = Some(project_epoch);
         }
-        let mut who: HashMap<(i64, String), Result<As, String>> = HashMap::new();
+        let mut who: HashMap<(i64, String, Option<String>), Result<As, String>> = HashMap::new();
+        let mut grants: HashMap<String, Option<Arc<crate::auth::AgentGrant>>> = HashMap::new();
         let mut entries = Vec::new();
-        for row in rows {
-            let k = (row.person.id, row.person.device_key.clone());
+        for mut row in rows {
+            if let Some(sh) = &row.agent_session {
+                if !grants.contains_key(sh) {
+                    let g = crate::auth::load_agent_session(&hub.db, sh, row.person.id, self.project).await?;
+                    grants.insert(sh.clone(), g);
+                }
+                row.person.agent = grants.get(sh).cloned().flatten();
+            }
+            let k = (row.person.id, row.person.device_key.clone(), row.agent_session.clone());
             if !who.contains_key(&k) {
-                let caller = Caller {
-                    person: Some(row.person.clone()),
-                    epochs: Epochs {
-                        person: person_epoch(row.person.id),
-                        project: Some((self.project, project_epoch)),
-                    },
-                };
-                let w = match crate::perm::open(hub, &self.name, &caller).await {
-                    Ok((p, v)) if p.participant(&v) => {
-                        let key = (!v.admin).then(|| p.view(&v).key());
-                        Ok(As { project: Arc::new(p), viewer: v, key })
+                let w = if row.agent_session.is_some() && row.person.agent.is_none() {
+                    Err("this agent session has expired or been revoked: sign in again".to_string())
+                } else {
+                    let caller = Caller {
+                        person: Some(row.person.clone()),
+                        epochs: Epochs {
+                            person: person_epoch(row.person.id),
+                            project: Some((self.project, project_epoch)),
+                        },
+                    };
+                    match crate::perm::open(hub, &self.name, &caller).await {
+                        Ok((p, v)) if p.participant(&v) => {
+                            let key = (!v.admin).then(|| p.view(&v).key());
+                            Ok(As { project: Arc::new(p), viewer: v, key })
+                        }
+                        Ok(_) => Err("you are no longer in this project".to_string()),
+                        Err(Error::Api { code: "not_found", .. }) => Err("you are no longer in this project".to_string()),
+                        Err(Error::Api { message, code: "forbidden", .. }) => Err(message),
+                        Err(e) => return Err(e),
                     }
-                    Ok(_) => Err("you are no longer in this project".to_string()),
-                    Err(Error::Api { code: "not_found", .. }) => Err("you are no longer in this project".to_string()),
-                    Err(Error::Api { message, code: "forbidden", .. }) => Err(message),
-                    Err(e) => return Err(e),
                 };
                 if let Ok(a) = &w {
                     if let Some(key) = &a.key {
                         if known.views.len() < MAX_KEYS || known.views.contains_key(key) {
-                            known.views.entry(key.clone()).or_insert_with(|| a.clone());
+                            let mut unnarrowed = a.clone();
+                            unnarrowed.viewer.only = None;
+                            unnarrowed.viewer.agent = false;
+                            known.views.entry(key.clone()).or_insert(unnarrowed);
                         }
                     }
                 }
                 who.insert(k.clone(), w);
             }
             let w = who[&k].clone();
-            let recheck = row.epochs != (person_epoch(row.person.id), project_epoch);
-            entries.push(Prepared { row, who: w, recheck });
+            let cur_epochs = (person_epoch(row.person.id), project_epoch);
+            let recheck = row.epochs != cur_epochs;
+            entries.push(Prepared { row, who: w, recheck, epochs: cur_epochs });
         }
         // View keys known and not kept: attached from their newest memo on
         // the recent line, or handed to the background fill.
@@ -849,10 +866,27 @@ impl Service {
         let accept = b.accept.clone();
         let landed = b.outcomes.iter().filter(|o| matches!(o, Outcome::Landed { .. })).count();
         let notify = hub.caches.notices.load(Ordering::SeqCst);
+        let active_agents: Vec<(i64, String, (i64, i64))> = b
+            .rows
+            .iter()
+            .zip(&b.outcomes)
+            .filter_map(|(meta, o)| match (o, &meta.agent_session) {
+                (Outcome::Landed { .. } | Outcome::Merging(_), Some(sh)) => Some((meta.person_id, sh.clone(), meta.epochs)),
+                _ => None,
+            })
+            .collect();
         let tx_results = results.clone();
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-            let (ls, ll, mc, cc, ca, cl, snapshot_authors) =
-                (ls.clone(), ll.clone(), mc.clone(), cc.clone(), ca.clone(), cl.clone(), snapshot_authors.clone());
+            let (ls, ll, mc, cc, ca, cl, snapshot_authors, active_agents) = (
+                ls.clone(),
+                ll.clone(),
+                mc.clone(),
+                cc.clone(),
+                ca.clone(),
+                cl.clone(),
+                snapshot_authors.clone(),
+                active_agents.clone(),
+            );
             let (branch, holder, old, new, seqs, snapshots, mk, mr, mp, accept, name, mut results) = (
                 branch.clone(),
                 holder.clone(),
@@ -882,6 +916,25 @@ impl Service {
                 .rows_affected();
                 if held != 1 {
                     return Err(Error::conflict(LEASE_LOST));
+                }
+                // Any submitting agent session whose entry lands or merges in
+                // this batch must still be active and at the epochs it was
+                // prepared under: if it expired or was revoked meanwhile, rebuild.
+                for (person_id, sh, expected_epochs) in &active_agents {
+                    if crate::auth::load_agent_session(&mut *c, sh, *person_id, pid).await?.is_none() {
+                        return Err(Error::conflict(MOVED));
+                    }
+                    let cur: (i64, i64) = sqlx::query_as(
+                        "SELECT COALESCE((SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1), 0), \
+                         COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $2 AND person_id = 0), 0)",
+                    )
+                    .bind(person_id)
+                    .bind(pid)
+                    .fetch_one(&mut *c)
+                    .await?;
+                    if cur != *expected_epochs {
+                        return Err(Error::conflict(MOVED));
+                    }
                 }
                 // The branch is where the batch was judged, in the same
                 // lineage, also when nothing of it moves the branch
@@ -1295,6 +1348,8 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
             person_id: p.row.person.id,
             merges: p.row.merges,
             change_id: last_cid,
+            agent_session: p.row.agent_session.clone(),
+            epochs: p.epochs,
         };
         let outcome = match entry(&hub, &mut src, branch, &p, &mut b, &mut memo, &origins, &landed, on.made_bytes) {
             Ok(Some(o)) => o,
@@ -1388,8 +1443,24 @@ fn entry(
     // someone who may no longer see or write a path never says whether it
     // changed or leaks a hidden path name (BUG-1104, S18 Guarantee 1).
     let view = who.project.view(&who.viewer);
-    if p.recheck || p.row.merges > 0 {
+    let default = branch == who.project.default_branch;
+    if p.recheck || p.row.merges > 0 || view.is_agent() {
         for ((s, set), e) in snaps.iter().zip(&sets).zip(&p.row.stack) {
+            let against = if s.parents.get(1..).is_some_and(|o| o.contains(&e.base)) { e.base } else { s.parents[0] };
+            if view.is_agent() {
+                match sync::agent_tip(src, &view, default, Some(against), e.id)? {
+                    Some(sync::AgentTip::Narrowed) => return Ok(Some(Outcome::Rejected(sync::NARROWED_MOVE.into()))),
+                    Some(sync::AgentTip::Access) => return Ok(Some(Outcome::Rejected(sync::AGENT_ACCESS_MOVE.into()))),
+                    Some(sync::AgentTip::DefaultBranch) => return Ok(Some(Outcome::Rejected(sync::AGENT_DEFAULT_BRANCH.into()))),
+                    None => {}
+                }
+                if let Some(c) = set.iter().find(|c| veil_core::hub::agent::decides_access(&c.path)) {
+                    return Ok(Some(Outcome::Rejected(format!(
+                        "an agent session never changes '{}', which decides access or review",
+                        c.path
+                    ))));
+                }
+            }
             if !as_merge(s, e.base) {
                 if !who.viewer.admin && set.iter().any(|c| !view.read(&c.path)) {
                     return Ok(Some(Outcome::Rejected(
@@ -1397,6 +1468,9 @@ fn entry(
                     )));
                 }
                 if let Some(c) = set.iter().find(|c| !view.write(&c.path)) {
+                    if !view.within_narrowing(&c.path) {
+                        return Ok(Some(Outcome::Rejected(sync::NARROWED_MOVE.into())));
+                    }
                     return Ok(Some(Outcome::Rejected(format!("you may not write '{}'", c.path))));
                 }
             }
@@ -1452,6 +1526,7 @@ fn entry(
                     seq: p.row.seq,
                     ticket: p.row.ticket.clone(),
                     person: p.row.person.clone(),
+                    agent_session: p.row.agent_session.clone(),
                     stack: p.row.stack[i..].to_vec(),
                     lineage: p.row.lineage,
                     merges: p.row.merges,
@@ -1547,11 +1622,19 @@ fn entry(
             }
         }
         let snap = Arc::new(n);
+        if view.is_agent() {
+            match sync::agent_tip(src, &view, default, Some(chain), id)? {
+                Some(sync::AgentTip::Narrowed) => return Ok(Some(Outcome::Rejected(sync::NARROWED_MOVE.into()))),
+                Some(sync::AgentTip::Access) => return Ok(Some(Outcome::Rejected(sync::AGENT_ACCESS_MOVE.into()))),
+                Some(sync::AgentTip::DefaultBranch) => return Ok(Some(Outcome::Rejected(sync::AGENT_DEFAULT_BRANCH.into()))),
+                None => {}
+            }
+        }
         // The push's checks again, on the new parents, when what they read
         // may have changed: access (epochs), or the policy file the
         // classification reads; and always for a merge (every parent).
         let policy_moved = sync::entry_at(src, &parent_tree, POLICY_FILE)? != sync::entry_at(src, &chain_tree, POLICY_FILE)?;
-        if p.recheck || policy_moved || merge {
+        if p.recheck || p.row.merges > 0 || policy_moved || merge {
             if policy_moved && !who.viewer.admin {
                 let tip_policy = AccessPolicy::parse(&sync::policy_text(src, &chain_tree)?);
                 let tip_proj = Project {
@@ -1707,7 +1790,7 @@ fn recheck(
     };
     let c = match sync::complete(src, &who.project, &who.viewer, &known, &n, parents, &real.attempts, identity) {
         Ok(c) => c,
-        Err(Error::Api { message, code: "forbidden" | "bad_request", .. }) => return Ok(Err(message)),
+        Err(Error::Api { message, code: "forbidden" | "bad_request" | crate::auth::AGENT_SESSION, .. }) => return Ok(Err(message)),
         Err(e) => return Err(e),
     };
     let tree = match &c.raw {

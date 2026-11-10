@@ -391,6 +391,16 @@ pub async fn emit_ticket(
         return;
     }
     for sub in subs {
+        if let Some(a) = &sub.person.agent {
+            match crate::auth::load_agent_session(&hub.db, &a.session_hash, sub.person.id, project_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    hub.events.evict(&sub);
+                    continue;
+                }
+                Err(_) => continue,
+            }
+        }
         // Read current access epochs from the database before opening the
         // subscriber's view so permission changes are seen at once and never
         // poison the viewer cache with epoch 0.
@@ -444,6 +454,16 @@ pub async fn emit_moved(
         return;
     }
     for sub in subs {
+        if let Some(a) = &sub.person.agent {
+            match crate::auth::load_agent_session(&hub.db, &a.session_hash, sub.person.id, project_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    hub.events.evict(&sub);
+                    continue;
+                }
+                Err(_) => continue,
+            }
+        }
         let Ok(epochs) = crate::caches::read_epochs(&hub.db, sub.person.id, Some(project_id)).await else {
             continue;
         };
