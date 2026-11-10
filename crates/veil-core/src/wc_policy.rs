@@ -151,6 +151,14 @@ impl Repo {
         Ok(self.snapshot_policy(fs, None)?.policy)
     }
 
+    /// [`Repo::effective_policy`] when `fs` was checked out from
+    /// `checked_out_from` (so an edit made on disk since `checked_out_from` is
+    /// folded as the member's own edit, while any unaccepted incoming change in
+    /// `checked_out_from` stays held back).
+    pub fn effective_policy_from(&self, fs: &dyn StorageBackend, checked_out_from: Option<&ObjectId>) -> Result<Policy> {
+        Ok(self.snapshot_policy(fs, checked_out_from)?.policy)
+    }
+
     /// Files of working copy `fs` kept under the accepted policy because its
     /// `.veilpolicy` would weaken their protection, and directories the
     /// accepted policy ignores that it would not (as a whole, as snapshots

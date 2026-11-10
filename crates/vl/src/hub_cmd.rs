@@ -554,7 +554,6 @@ pub fn access(ctx: &mut Ctx, path: &str, who: &[String]) -> Result<()> {
     out.push('\n');
     ctx.fs.write(&file, out.as_bytes())?;
     drop(wc_lock);
-    ctx.snapshot()?;
     println!("{} .veilpolicy: {}", if replaced { "Updated" } else { "Added to" }, safe(&new_line));
     println!("  Push it to apply (only admins may change access; the last matching line wins).");
     // The line's secrets get their own key (docs/HUB.md §13.12).
@@ -626,7 +625,14 @@ pub fn change(repository: Option<&Path>, cmd: &crate::cli::ChangeCmd) -> Result<
     let mut list: Vec<Edit> = serde_json::from_str(&text).context("the edits: a JSON list of {\"path\", \"put\": {\"text\"}} or {\"path\", \"delete\": true}")?;
     let client = Client::new(&url, load_identity()?)?;
     let policy = match &clone {
-        Some(c) => c.repo.effective_policy(&*c.fs)?,
+        Some(c) => {
+            let checked_out_from = c
+                .wc()
+                .ok()
+                .and_then(|wc| c.repo.snapshot(&wc).ok())
+                .map(|s| s.tree);
+            c.repo.effective_policy_from(&*c.fs, checked_out_from.as_ref())?
+        }
         None => Policy::builtin(),
     };
     let mut frames = Vec::new();

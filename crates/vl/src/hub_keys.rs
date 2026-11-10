@@ -68,10 +68,16 @@ fn raw_policy_text(ctx: &Ctx) -> String {
     String::from_utf8_lossy(&ctx.fs.read(&VPath::new(POLICY_FILE).unwrap()).unwrap_or_default()).into_owned()
 }
 
-/// The accepted policy of this clone (`Repo::effective_policy`'s accepted pin
-/// when an unaccepted `.veilpolicy` edit is held back).
+/// The accepted policy of this clone (`Repo::effective_policy_from`'s accepted
+/// pin when an unaccepted `.veilpolicy` edit is held back, with the member's
+/// own uncommitted `.veilpolicy` edit folded in).
 fn accepted_policy(ctx: &Ctx) -> Result<Policy> {
-    let eff = ctx.repo.effective_policy(&*ctx.fs)?;
+    let checked_out_from = ctx
+        .wc()
+        .ok()
+        .and_then(|wc| ctx.repo.snapshot(&wc).ok())
+        .map(|s| s.tree);
+    let eff = ctx.repo.effective_policy_from(&*ctx.fs, checked_out_from.as_ref())?;
     Ok(eff.accepted().cloned().unwrap_or(eff))
 }
 
@@ -1382,11 +1388,8 @@ pub fn upgrade_rule_keys(ctx: &mut Ctx, dry_run: bool) -> Result<std::process::E
     }
     if !already {
         ctx.fs.write(&VPath::new(POLICY_FILE)?, new_text.as_bytes())?;
-        drop(wc);
-        ctx.snapshot()?;
-    } else {
-        drop(wc);
     }
+    drop(wc);
     let people: Vec<String> = rings.iter().flat_map(|r| targets(r, &groups, &admins).0).collect::<BTreeSet<_>>().into_iter().collect();
     let devices = person_devices(ctx, &client, &people, &[])?;
     for ring in &rings {
