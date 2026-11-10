@@ -1640,6 +1640,8 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         ("/v1/sessions/ci", "person"),
         ("/v1/projects/{p}/checks", "rev"),
         ("/v1/projects/{p}/tested/{branch}", "rev"),
+        // S20: automatic bisect and revert status.
+        ("/v1/projects/{p}/bisect/{branch}", "rev"),
         // S22: embargo release lands the hidden line onto its target branch
         // through `landing::agent_stack` (merge of S22).
         ("/v1/projects/{p}/embargoes/{id}/release", "write"),

@@ -4763,3 +4763,90 @@ vl embargo release ID
 | 8 | S6: the Veil daemon never serves an embargoed object to a client outside the embargo | Outsiders receive grants only for projections without the embargo; their root trees never reach embargoed trees or blobs in the daemon's warm store | `s6_daemon_never_serves_an_embargoed_object_outside_the_embargo` |
 | 9 | S17: the release landing records `snapshots.author`, gives back its bulkhead places before waiting (`limits::leave_gates`), and lands once across two servers | `release_one` drops bulkhead gates before `landing::wait`, `Services::waiters` fans out deterministic ticket outcomes to all concurrent waiters, and `landing::service` records each change's author in `snapshots.author` | `s17_release_landing_records_author_leaves_bulkhead_gates_and_lands_once_across_two_servers` |
 
+### 13.36 S20: automatic bisect and revert (built)
+
+Milestone S20 of `docs/design/server/phase-4-agent-scale.md` (§4.8, §4.9,
+decision 11, §6 rows 9 and 14, §8). Code: `crates/veil-server/src/bisect.rs`,
+migration `0026_bisect_and_revert.sql` (`landing_queue.priority`,
+`bisect_leases`, `bisects`, `bisect_reverts`), and minimal hooks in `ci.rs`,
+`landing/rules.rs`, `landing/service.rs`, `landing/merge.rs`, `events.rs`,
+`api.rs`, and `lib.rs`.
+
+#### The design as built
+
+* **Trigger (`bisect::on_check_recorded`).** Whenever `POST /v1/projects/{p}/checks`
+  records a `pass` or `fail` result on a real snapshot `S`, `on_check_recorded`
+  inspects every protected branch of the project where:
+  * `branches.hidden_for_embargo IS NULL` and `!branch.starts_with("embargo/")`
+    (embargo lines are never bisected or auto-reverted into public branches);
+  * the branch's `.veilrules` has `protected = true`, `auto_revert` not `false`
+    (default `true` on protected branches, product decision 11), and lists the
+    check in `required_checks`.
+* **Candidate narrowing (`collect_candidates`).** When a required check fails on
+  a snapshot strictly ahead of `<branch>@tested` along the branch's first-parent
+  chain (bounded at `MAX_BISECT_LANDINGS = 1,024`), the server acquires the
+  branch's `bisect_leases` lock and walks `(tested..=bad]` in chronological
+  first-parent order. A landing is included in `candidates` only if:
+  1. it is not withheld by an unreleased embargo (`embargo::is_withheld_for_query`);
+  2. its first-parent edit set (`edits::edit_set`) touches at least one path
+     matching `[checks.<name>].paths` (if configured in `.veilrules`); and
+  3. its edit set touches at least one path inside the reporting runner's
+     readable footprint (`session_paths`), so bisect never asks a narrowed
+     runner to test a snapshot whose edits collapsed out of the runner's view.
+* **Bounded $k$-way midpoint search (`drive_bisect`, `probe_indices`).**
+  * Using S19's `checks` table, any candidate with an existing `pass` advances
+    the lower bound (`lo = i + 1`) and any candidate with an existing `fail`
+    tightens the upper bound (`hi = i`).
+  * While `lo < hi`, the server picks up to `k` evenly-spaced interior indices
+    in `(lo..hi)` where `k = [checks.<name>].parallel` (`1..=8`, default `1`),
+    persists `probes` in `bisects`, and emits `check.requested` SSE events
+    (`reason: "bisect"`) to runners and viewers permitted to see both the check
+    and the projected probe snapshot.
+  * Bisect finishes searching in at most $\lceil \log_{k+1}(N) \rceil$ rounds.
+* **Flake-immune confirmation (`confirming` phase, Threat 14).**
+  * Once `lo == hi`, candidate `C = candidates[lo]` and its first parent `P`
+    enter `phase = "confirming"`.
+  * Before reverting `C`, the server requires two independent failing runs on
+    `C` (`checks.run_count >= 2` with `state = 'fail'`) and a passing run on
+    `P` (`state = 'pass'`). Missing confirmations emit `check.requested` SSE
+    events with `reason: "confirm"` (for `C`) and `reason: "confirm-parent"`
+    (for `P`).
+  * If `C` passes on its confirmation re-run or `P` fails, bisect transitions to
+    `phase = "flaky"` and never reverts anything.
+* **Priority-lane server revert via S17 and S18 (`revert_confirmed_culprit`).**
+  * When `C` is confirmed (`culprit_fails >= 2` and `parent_passes >= 1`), the
+    server constructs a revert snapshot signed by `hub.identity` with
+    `parents = [C]`, `tree = P.tree`, `author = "server"`,
+    `description = "revert <C.change_id>"`, and
+    `agent = Attribution { agent: "server/bisect", task: Some("revert:<C.change_id>"), .. }`.
+  * The server records `(project_id, branch, lineage, culprit)` in
+    `bisect_reverts` (`ON CONFLICT DO NOTHING`) and enqueues
+    `Entry::plain(revert_snap_id, C)` in `landing_queue` under a deterministic
+    ticket (`revert-<project>-<branch>-<lineage>-<culprit_prefix>`) with
+    `priority = 1`.
+  * `Service::ready` orders queued entries by `priority DESC, created_at, seq`,
+    so the revert lands ahead of ordinary queued changes (`priority = 0`).
+  * S17 computes the edit set of `revert_snap` against `C` (`P.tree` vs
+    `C.tree`, the exact inverse of `C`'s edits) and either fast-paths it onto
+    the current branch tip or spawns an S18 3-way content merge (`base = C.tree`,
+    `ours = tip.tree`, `theirs = P.tree`), surgically reversing only `C`'s edits
+    while preserving later changes' edits. If a later change modified the same
+    lines as `C`, S18 reports a conflict and bisect records `phase = "conflict"`.
+* **Visibility (`docs/VISIBILITY.md`) and routes (`GET /v1/projects/{p}/bisect/{branch}`).**
+  * `events::emit_check_requested`, `events::emit_reverted`, and
+    `bisect::status_route` project every snapshot (`good`, `bad`, `candidates`,
+    `probes`, `culprit`, `revert`) into each viewer's `View`, omitting snapshots
+    that collapsed into their parent's projection or are withheld by an embargo,
+    and hiding `check` whenever `!ci::can_see_check(...)`. If neither the check
+    nor the culprit/revert is visible to a viewer, `GET …/bisect/{branch}`
+    returns `404`.
+
+#### Guarantees and threat review
+
+| # | Guarantee / Threat | Mitigation | Test (`server_hub::bisect`) |
+|---|---|---|---|
+| 1 | Bisect finds the first failing landing in bounded steps ($\le \lceil \log_{k+1}(N) \rceil$) and never asks a runner for a check result outside its footprint | `collect_candidates` filters `(tested..=bad]` by `[checks.<name>].paths` and runner `session_paths`; `probe_indices` probes $k$ midpoints per round | `bisect_finds_first_failing_landing_in_bounded_steps_and_respects_runner_footprint` |
+| 2 | A confirmed culprit is reverted via S17's priority lane (`priority = 1`), server-attributed, surgical (preserving subsequent commits' files and lines via S18), and only on protected branches allowing `auto_revert` | `revert_confirmed_culprit` signs as `"server"` / `"server/bisect"`, queues `Entry::plain(rev, culprit)` at `priority = 1`, and checks `Rules::allows_auto_revert` | `confirmed_culprit_is_reverted_through_s17_priority_lane_server_attributed_and_surgical` |
+| 3 | Flaky check immunity (design §6 Threat 14): a single failure or infrastructure flake never reverts anything | `confirming` phase requires `run_count >= 2` failures on `culprit` and a `pass` on `culprit_parent`; a passing re-run or failing parent marks `phase = "flaky"` | `only_confirmed_culprit_is_reverted_and_flaky_check_never_reverts` |
+| 4 | Per-viewer visibility (`docs/VISIBILITY.md`) and embargo safety (design §6 Threat 9): nothing hidden leaks in revert commits, messages, SSE events, or status; embargoed changes never bisect or revert into public branches | `embargo/*` and withheld snapshots are excluded from bisect; `status_route`, `emit_check_requested`, and `emit_reverted` filter by `can_see_check` and `visible_projection` | `nothing_hidden_leaks_in_revert_messages_events_or_status_and_embargo_never_reverts_early` |
+| 5 | Bounded and safe across multiple servers and restarts: one bisect per branch at a time, and a revert lands at most once | `bisect_leases` fences concurrent servers per `(project_id, branch)`; `bisect_reverts` and deterministic `revert-…` tickets guarantee at-most-once revert landing | `bisect_and_revert_are_bounded_and_safe_across_two_servers_and_restarts` |

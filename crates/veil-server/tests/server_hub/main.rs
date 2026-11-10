@@ -42,3 +42,5 @@ mod packs;
 mod workspaces;
 mod ci;
 mod embargo;
+mod bisect;
+
