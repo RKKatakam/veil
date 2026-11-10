@@ -56,7 +56,14 @@ fn tip(hub: &TestHub, token: &str, project: &str) -> ObjectId {
 
 fn set_rules(hub: &TestHub, p: &Project, rules_toml: &str) -> ObjectId {
     let admin = p.admin.token();
-    land_edit(hub, p, &admin, ".veilrules", rules_toml, "configure .veilrules").0
+    // S21: a protected branch needs a person's approval to land by default;
+    // these tests land their fixtures directly, so they need none (the
+    // server's own reverts are queued by the server and never wait on one).
+    let rules = match rules_toml.contains("[review]") {
+        true => rules_toml.to_string(),
+        false => format!("{rules_toml}\n[review]\nnormal = {{ approvals = 0 }}\nhigh = {{ approvals = 0 }}\n"),
+    };
+    land_edit(hub, p, &admin, ".veilrules", &rules, "configure .veilrules").0
 }
 
 fn land_edit(hub: &TestHub, p: &Project, token: &str, path: &str, text: &str, desc: &str) -> (ObjectId, String) {

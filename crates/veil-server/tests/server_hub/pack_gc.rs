@@ -620,16 +620,16 @@ fn guarantee_2_gc_deletes_only_unreferenced_objects_respects_retention_window_an
                 .await
                 .unwrap();
 
-            sqlx::query("CREATE TABLE IF NOT EXISTS pr_revisions (project_id BIGINT NOT NULL, pr_number BIGINT NOT NULL, head TEXT NOT NULL, PRIMARY KEY (project_id, pr_number))")
-                .execute(&h.db)
-                .await
-                .unwrap();
-            sqlx::query("INSERT INTO pr_revisions (project_id, pr_number, head) VALUES ($1, 1, $2)")
-                .bind(pid)
-                .bind(pr_blob_id.hex())
-                .execute(&h.db)
-                .await
-                .unwrap();
+            // S21's table (migration 17): a PR revision's head is a root.
+            sqlx::query(
+                "INSERT INTO pr_revisions (project_id, pr, n, base, head, changes, patch, files, risk, reasons, rules_key, files_count, pushed_by, at) \
+                 VALUES ($1, 'pr-gc-test', 1, $2, $2, '[]', '', '[]', 'normal', '[]', '', 0, 1, 0)",
+            )
+            .bind(pid)
+            .bind(pr_blob_id.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
 
             sqlx::query(
                 "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, person_epoch, project_epoch, state, created_at) \
