@@ -598,6 +598,21 @@ impl Objects {
         ObjectId(*h.finalize().as_bytes())
     }
 
+    /// Underlying blob store.
+    pub fn blob_store(&self) -> &Arc<dyn BlobStore> {
+        &self.store
+    }
+
+    /// Underlying pack lookup state.
+    pub fn packs(&self) -> &crate::pack::Packs {
+        &self.packs
+    }
+
+    /// Drop packs `names` from `project`'s in-memory lookup map (S29).
+    pub fn forget_packs(&self, project: i64, names: &[Arc<str>]) {
+        self.packs.forget(project, names);
+    }
+
     /// Where object `id` of `project` is: a listed pack whose index this
     /// server holds; or (`again`, after a miss everywhere since `since`) one
     /// listed since, or one whose index it unloaded past its budget (read
@@ -611,8 +626,10 @@ impl Objects {
     /// pack `name` (clamped), read with a range request, **after the head
     /// the entry starts with is checked against the slot** (its id and its
     /// length: BUG-1154, BUG-1497): with the bytes asked for when they start
-    /// near the entry's start (one request), else apart.
-    async fn pack_range(&self, project: i64, name: &str, id: &ObjectId, s: Slot, start: u64, end: u64) -> Result<Bytes> {
+    /// near the entry's start (one request), else apart; `Ok(None)` if
+    /// `name` is no longer in the store (merged and swept after grace on
+    /// another server: S29).
+    async fn try_pack_range(&self, project: i64, name: &Arc<str>, id: &ObjectId, s: Slot, start: u64, end: u64) -> Result<Option<Bytes>> {
         const ONE_READ: u64 = 1 << 20;
         const HEAD: u64 = crate::pack::ENTRY_HEAD;
         let len = s.encoding_len();
@@ -621,23 +638,46 @@ impl Objects {
         let key = &key;
         let read = |from: u64, to: u64| async move {
             bump(&self.reads);
-            let (b, _) = self.store.get_range(key, from, to).await?.ok_or_else(|| anyhow!("listed pack {name} is not in the store"))?;
+            let Some((b, _)) = self.store.get_range(key, from, to).await? else {
+                return Ok(None);
+            };
             if b.len() as u64 != to - from + 1 {
                 bail!("pack {name} is shorter than its index");
             }
-            Ok::<Bytes, anyhow::Error>(b)
+            Ok::<Option<Bytes>, anyhow::Error>(Some(b))
         };
         if start > last || len == 0 {
-            crate::pack::entry(id, s, &read(s.offset, s.offset + HEAD - 1).await?)?;
-            return Ok(Bytes::new());
+            let Some(b) = read(s.offset, s.offset + HEAD - 1).await? else {
+                self.packs.forget(project, std::slice::from_ref(name));
+                return Ok(None);
+            };
+            crate::pack::entry(id, s, &b)?;
+            return Ok(Some(Bytes::new()));
         }
         if start <= ONE_READ {
-            let b = read(s.offset, s.offset + HEAD + last).await?;
+            let Some(b) = read(s.offset, s.offset + HEAD + last).await? else {
+                self.packs.forget(project, std::slice::from_ref(name));
+                return Ok(None);
+            };
             crate::pack::entry(id, s, &b)?;
-            return Ok(b.slice((HEAD + start) as usize..));
+            return Ok(Some(b.slice((HEAD + start) as usize..)));
         }
-        crate::pack::entry(id, s, &read(s.offset, s.offset + HEAD - 1).await?)?;
-        read(s.offset + HEAD + start, s.offset + HEAD + last).await
+        let Some(b) = read(s.offset, s.offset + HEAD - 1).await? else {
+            self.packs.forget(project, std::slice::from_ref(name));
+            return Ok(None);
+        };
+        crate::pack::entry(id, s, &b)?;
+        let Some(body) = read(s.offset + HEAD + start, s.offset + HEAD + last).await? else {
+            self.packs.forget(project, std::slice::from_ref(name));
+            return Ok(None);
+        };
+        Ok(Some(body))
+    }
+
+    async fn pack_range(&self, project: i64, name: &Arc<str>, id: &ObjectId, s: Slot, start: u64, end: u64) -> Result<Bytes> {
+        self.try_pack_range(project, name, id, s, start, end)
+            .await?
+            .ok_or_else(|| anyhow!("listed pack {name} is not in the store"))
     }
 
     /// The encoding of `id` of `project` from the store, unchecked: from a
@@ -646,7 +686,9 @@ impl Objects {
     async fn load_encoding(&self, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
         let since = Instant::now();
         if let Some((n, s)) = self.in_pack(project, id, false, since).await? {
-            return self.pack_range(project, &n, id, s, 0, u64::MAX).await.map(Some);
+            if let Some(b) = self.try_pack_range(project, &n, id, s, 0, u64::MAX).await? {
+                return Ok(Some(b));
+            }
         }
         bump(&self.reads);
         if let Some(enc) = self.store.get(&object_key(project, id)).await? {
@@ -661,8 +703,11 @@ impl Objects {
     /// Is `id` of `project` stored (in a listed pack, or loose)?
     async fn stored(&self, project: i64, id: &ObjectId) -> Result<bool> {
         let since = Instant::now();
-        if self.in_pack(project, id, false, since).await?.is_some() {
-            return Ok(true);
+        if let Some((n, _)) = self.in_pack(project, id, false, since).await? {
+            if self.store.exists(&crate::pack::key(project, &n)).await? {
+                return Ok(true);
+            }
+            self.packs.forget(project, &[n]);
         }
         bump(&self.reads);
         if self.store.exists(&object_key(project, id)).await? {
@@ -681,6 +726,17 @@ impl Objects {
                 self.load(project, id, enc)
             }
         }
+    }
+
+    /// The objects of `ids` of `project` (their canonical encodings),
+    /// prefetched in ranged batches and checked against their ids.
+    pub async fn get_many(&self, project: i64, ids: &[ObjectId]) -> Result<Vec<Option<Bytes>>> {
+        self.prefetch(project, ids).await;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(self.get(project, id).await?);
+        }
+        Ok(out)
     }
 
     /// The encoding of object `id` of `project`, as stored (and sent to a
@@ -716,14 +772,21 @@ impl Objects {
             return decoded(id, &enc).map(Some);
         }
         let direct = match self.packs.find(project, id) {
-            Found::At(n, s) => self.store.get_range_blocking(&crate::pack::key(project, &n), s.offset, s.last()).map(|r| {
-                r.and_then(|got| match got {
-                    Some((b, _)) if b.len() == s.len as usize => {
-                        crate::pack::entry(id, s, &b)?;
-                        Ok(Some(b.slice(crate::pack::ENTRY_HEAD as usize..)))
+            Found::At(n, s) => self.store.get_range_blocking(&crate::pack::key(project, &n), s.offset, s.last()).and_then(|r| {
+                match r {
+                    Ok(Some((b, _))) if b.len() == s.len as usize => Some({
+                        let r = crate::pack::entry(id, s, &b).map(|_| Some(b.slice(crate::pack::ENTRY_HEAD as usize..)));
+                        r
+                    }),
+                    // Merged and deleted after grace on another server:
+                    // forget and fall back to the async path.
+                    Ok(None) => {
+                        self.packs.forget(project, &[n]);
+                        None
                     }
-                    _ => Err(anyhow!("pack {n} is shorter than its index")),
-                })
+                    Ok(Some(_)) => Some(Err(anyhow!("pack {n} is shorter than its index"))),
+                    Err(e) => Some(Err(e)),
+                }
             }),
             Found::Absent => self.store.get_blocking(&object_key(project, id)).and_then(|r| match r {
                 // A miss may be a pack listed since: the async path.
@@ -764,12 +827,19 @@ impl Objects {
     /// after (BUG-1399). Its index is held under a share of the server's
     /// bound on indexes (BUG-1496), taken before it is built.
     pub async fn put_pack(&self, project: i64, person: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<(Arc<str>, Held)> {
-        self.write_pack(project, objects, Some(person)).await
+        self.write_pack(project, objects, true, Some(person)).await
     }
 
-    /// [`Objects::put_pack`]; with `staged_by`, the pack is recorded staged
-    /// for that person before it is written (without, only in tests).
-    async fn write_pack(&self, project: i64, objects: Vec<(ObjectId, Bytes)>, staged_by: Option<i64>) -> Result<(Arc<str>, Held)> {
+    /// Write `objects` as one staged pack of `project` for a merge or
+    /// garbage-collection pass (`person_id` `None`, S29), recorded in `packs`
+    /// before its storage object is written.
+    pub async fn put_job_pack(&self, project: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<(Arc<str>, Held)> {
+        self.write_pack(project, objects, true, None).await
+    }
+
+    /// [`Objects::put_pack`]; when `record` is set, the pack is recorded
+    /// staged before it is written.
+    async fn write_pack(&self, project: i64, objects: Vec<(ObjectId, Bytes)>, record: bool, staged_by: Option<i64>) -> Result<(Arc<str>, Held)> {
         let share = self.packs.bound().take_for(Some(project), Index::write_weight_of(objects.len()) as u64).await?;
         let name: Arc<str> = crate::pack::new_name().into();
         for (id, enc) in &objects {
@@ -777,8 +847,8 @@ impl Objects {
         }
         let (bytes, index) = crate::pack::build(objects)?;
         let size = bytes.len() as u64;
-        if let Some(person) = staged_by {
-            self.packs.record_staged(project, person, &name, size, index.len()).await?;
+        if record {
+            self.packs.record_staged_by(project, staged_by, &name, size, index.len()).await?;
             bump(&self.pack_rows);
         }
         count_write(self, size as usize);
@@ -796,7 +866,7 @@ impl Objects {
         if let Some(name) = self.packs.staged_holding(project, person, &ids).await? {
             return Ok(name);
         }
-        let (name, held) = self.write_pack(project, objects, Some(person)).await?;
+        let (name, held) = self.write_pack(project, objects, true, Some(person)).await?;
         self.packs.staged_here(project, person, &name, held);
         Ok(name)
     }
@@ -896,10 +966,21 @@ impl Objects {
                 bump(&self.reads);
                 let key = crate::pack::key(project, &name);
                 let store = self.store.clone();
-                set.spawn(async move { (run, start, store.get_range(&key, start, end).await, held) });
+                set.spawn(async move { (name, run, start, store.get_range(&key, start, end).await, held) });
             }
             let Some(done) = set.join_next().await else { break };
-            let Ok((run, start, Ok(Some((bytes, _))), _held)) = done else { continue };
+            let (name, run, start, res, _held) = match done {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let bytes = match res {
+                Ok(Some((bytes, _))) => bytes,
+                Ok(None) => {
+                    self.packs.forget(project, &[name]);
+                    continue;
+                }
+                Err(_) => continue,
+            };
             for (id, s) in run {
                 let (from, to) = ((s.offset - start) as usize, (s.last() - start) as usize);
                 if to >= bytes.len() {
@@ -1004,7 +1085,12 @@ impl Objects {
             match self.head(project, id).await? {
                 None => return Ok(None),
                 Some((head, Place::Pack(n, s))) if !encoding::is_compressed(&head) => {
-                    return Ok(Some((self.pack_range(project, &n, id, s, start, end).await?, s.encoding_len())));
+                    if let Some(b) = self.try_pack_range(project, &n, id, s, start, end).await? {
+                        return Ok(Some((b, s.encoding_len())));
+                    }
+                    if let Some((n, s)) = self.in_pack(project, id, true, Instant::now()).await? {
+                        return Ok(Some((self.pack_range(project, &n, id, s, start, end).await?, s.encoding_len())));
+                    }
                 }
                 Some((head, Place::Loose(_))) if !encoding::is_compressed(&head) => {
                     bump(&self.reads);
@@ -1025,7 +1111,9 @@ impl Objects {
         let since = Instant::now();
         let h = encoding::HEADER as u64 - 1;
         if let Some((n, s)) = self.in_pack(project, id, false, since).await? {
-            return Ok(Some((self.pack_range(project, &n, id, s, 0, h).await?, Place::Pack(n, s))));
+            if let Some(head) = self.try_pack_range(project, &n, id, s, 0, h).await? {
+                return Ok(Some((head, Place::Pack(n, s))));
+            }
         }
         bump(&self.reads);
         if let Some((head, len)) = self.store.get_range(&object_key(project, id), 0, h).await? {
@@ -1885,6 +1973,7 @@ mod tests {
             landing: Default::default(),
             events: Default::default(),
             embargo: Default::default(),
+            pack_gc: Default::default(),
             limits: crate::limits::Limits::new(Default::default(), 1),
         });
         let bound = objects.packs.bound();

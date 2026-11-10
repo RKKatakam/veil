@@ -121,7 +121,7 @@ impl Workers {
         }
     }
 
-    async fn permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
+    pub(crate) async fn permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
         self.permits.acquire().await.map_err(|e| Error::Other(e.into()))
     }
 

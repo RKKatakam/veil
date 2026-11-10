@@ -37,6 +37,7 @@ pub mod grant;
 pub mod landing;
 pub mod limits;
 pub mod pack;
+pub mod pack_gc;
 pub mod perm;
 pub mod query;
 pub mod search;
@@ -94,6 +95,8 @@ pub struct Hub {
     pub events: events::Events,
     /// The embargo release service state (S22).
     pub embargo: embargo::State,
+    /// Pack compaction and garbage collection state (S29).
+    pub pack_gc: pack_gc::State,
     /// Rate limits, the request budget, bulkheads and health (S24).
     pub limits: limits::Limits,
 }
@@ -220,6 +223,7 @@ pub async fn start(config: Config) -> Result<Running> {
         landing: landing::Services::default(),
         events: events::Events::default(),
         embargo: embargo::State::default(),
+        pack_gc: pack_gc::State::default(),
         limits: limits::Limits::new(config.limits, config.db_connections),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
