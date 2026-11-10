@@ -36,6 +36,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/auth/login", post(auth::login))
         .route("/v1/sessions/agent", post(auth::agent_session))
         .route("/v1/sessions/ci", post(crate::ci::ci_session))
+        .route("/v1/sessions/web", post(auth::web_session))
         .route("/v1/people/{name}/devices", get(devices))
         .route("/v1/people/{name}/pending/{fingerprint}", get(pending_device))
         .route("/v1/devices/vouch", post(vouch))
@@ -76,7 +77,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/q/log", get(crate::query::log_route))
         .route("/v1/projects/{p}/q/show", get(crate::query::show_route))
         .route("/v1/projects/{p}/q/tree", get(crate::query::tree_route))
-        .route("/v1/projects/{p}/q/file", get(crate::query::file_route))
+        .route("/v1/projects/{p}/q/file", get(crate::web::guarded_file_route))
         .route("/v1/projects/{p}/q/diff", get(crate::query::diff_route))
         .route("/v1/projects/{p}/q/ancestry", post(crate::query::ancestry_route))
         .route("/v1/projects/{p}/q/blame", get(crate::query::blame_route))
@@ -98,8 +99,37 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/q/grep", get(crate::search::grep_route))
         // Health metrics, for the project's admins (S24).
         .route("/v1/projects/{p}/health", get(crate::limits::health::route))
+        // The web client, first version, with no secrets (S25, docs/HUB.md §13.39).
+        .route("/", get(crate::web::home_route))
+        .route("/about", get(crate::web::about_route))
+        .route("/login", get(crate::web::login_page_route))
+        .route("/static/{asset}", get(crate::web::static_route))
+        .route("/web/session", post(crate::web::adopt_session_route))
+        .route("/web/login", post(crate::web::device_login_route))
+        .route("/web/logout", post(crate::web::logout_route))
+        .route("/p/{p}", get(crate::web::project_overview_route))
+        .route("/p/{p}/tree", get(crate::web::tree_root_route))
+        .route("/p/{p}/tree/{*path}", get(crate::web::tree_path_route))
+        .route("/p/{p}/file/{*path}", get(crate::web::file_route))
+        .route("/p/{p}/blame/{*path}", get(crate::web::blame_route))
+        .route("/p/{p}/history/{*path}", get(crate::web::file_history_route))
+        .route("/p/{p}/log", get(crate::web::log_route))
+        .route("/p/{p}/commit/{rev}", get(crate::web::commit_route))
+        .route("/p/{p}/search", get(crate::web::search_route))
+        .route("/p/{p}/prs", get(crate::web::prs_list_route).post(crate::web::prs_create_route))
+        .route("/p/{p}/prs/{id}", get(crate::web::pr_show_route))
+        .route("/p/{p}/prs/{id}/threads", post(crate::web::pr_new_thread_route))
+        .route("/p/{p}/prs/{id}/threads/{t}", post(crate::web::pr_thread_update_route))
+        .route("/p/{p}/prs/{id}/close", post(crate::web::pr_close_route))
+        .route("/p/{p}/prs/{id}/land", post(crate::web::pr_land_route))
+        .route("/p/{p}/prs/{id}/dismiss", post(crate::web::pr_dismiss_route))
+        .route("/p/{p}/admin", get(crate::web::admin_route))
+        .route("/p/{p}/admin/groups", post(crate::web::admin_create_group_route))
+        .route("/p/{p}/admin/groups/{g}/delete", post(crate::web::admin_delete_group_route))
+        .route("/p/{p}/admin/groups/{g}/members", post(crate::web::admin_members_route))
         .layer(DefaultBodyLimit::max(crate::db::body_limit("")))
         .layer(axum::middleware::from_fn(crate::db::retry_requests))
+        .layer(axum::middleware::from_fn(crate::web::layer))
         // Rate limits, bodies under the budget, bulkheads (S24): before
         // anything else runs.
         .layer(axum::middleware::from_fn_with_state(hub.clone(), crate::limits::admit))
@@ -272,6 +302,7 @@ const MAX_INVITE_MS: i64 = 30 * 24 * 3600 * 1000;
 /// their devices, vouches, joins and removed devices (participants only).
 /// A hint: the device that shares decides from the key rings.
 async fn pending_keys(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Json<Vec<Devices>>> {
+    caller.not_web()?;
     caller.person_only()?;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
@@ -303,6 +334,7 @@ async fn pending_keys(State(hub): State<HubState>, caller: Caller, Path(p): Path
 /// admin does reaches the person's other projects. Key rings revoke it on
 /// the devices that hold them (`vl identity remove`, and in the background).
 async fn remove_device(State(hub): State<HubState>, caller: Caller, Json(req): Json<RemoveDevice>) -> Result<Json<Devices>> {
+    caller.not_web()?;
     let me = caller.person_only()?.clone();
     let admin_of = match &req.project {
         Some(p) => {
@@ -376,6 +408,7 @@ async fn remove_device(State(hub): State<HubState>, caller: Caller, Json(req): J
 /// An admin records an invite: its public key, for whom, into which group,
 /// until when. The invite's secret is never sent (`docs/HUB.md` §13.12).
 async fn create_invite(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<InviteRequest>) -> Result<Json<InviteRequest>> {
+    caller.not_web()?;
     let me = caller.person_only()?.id;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     require_admin(&viewer)?;
@@ -422,6 +455,7 @@ async fn create_invite(State(hub): State<HubState>, caller: Caller, Path(p): Pat
 /// for the invited person only. The server checks the join's signature too,
 /// but key rings decide keys (`docs/HUB.md` §13.12).
 async fn join(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<JoinRequest>) -> Result<Json<Joined>> {
+    caller.not_web()?;
     let me = caller.person_only()?.clone();
     let mut c = hub.db.acquire().await?;
     let project = perm::load_project(&mut c, &p).await?.ok_or_else(|| Error::not_found("no such invite"))?;
@@ -499,6 +533,7 @@ async fn join(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>
 /// The signed-in device vouches for another device of its person: the
 /// device becomes active (a pending one may then sign in).
 async fn vouch(State(hub): State<HubState>, caller: Caller, Json(req): Json<VouchRequest>) -> Result<Json<Devices>> {
+    caller.not_web()?;
     let me = caller.person_only()?.clone();
     let v = Vouch {
         device: req.device.clone(),
@@ -640,6 +675,7 @@ async fn history(
     headers: HeaderMap,
     Json(req): Json<HistoryRequest>,
 ) -> Result<Response> {
+    caller.not_web()?;
     let encoded = reads_encoded(&headers);
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     let body = sync::history(&hub, &project, &viewer, &req.tips, &req.stop, req.limit, encoded, reads_format(&headers)).await?;
@@ -647,6 +683,7 @@ async fn history(
 }
 
 async fn fetch(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, headers: HeaderMap, Json(req): Json<FetchRequest>) -> Result<Response> {
+    caller.not_web()?;
     if req.objects.len() > MAX_WANTS {
         return Err(Error::bad_request(format!("at most {MAX_WANTS} objects per request")));
     }
@@ -662,6 +699,7 @@ async fn objects(
     Path(p): Path<String>,
     body: Bytes,
 ) -> Result<Json<veil_core::hub::wire::Uploaded>> {
+    caller.not_web()?;
     let me = caller.not_runner()?.id;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
@@ -675,6 +713,7 @@ async fn objects(
 }
 
 async fn push(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<PushRequest>) -> Result<Json<PushResult>> {
+    caller.not_web()?;
     let person = caller.not_runner()?.clone();
     let (project, viewer, epochs) = perm::open_at(&hub, &p, &caller).await?;
     let who = crate::landing::Submitter { person, epochs };
@@ -814,7 +853,7 @@ async fn group_info(c: &mut PgConnection, project: i64, name: &str) -> Result<Gr
     })
 }
 
-async fn list_groups(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Json<Vec<GroupInfo>>> {
+pub async fn list_groups(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Json<Vec<GroupInfo>>> {
     let me = caller.signed_in()?.id;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     let mut c = hub.db.acquire().await?;
@@ -843,7 +882,7 @@ fn require_admin(viewer: &Viewer) -> Result<()> {
     }
 }
 
-async fn create_group(State(hub): State<HubState>, caller: Caller, Path((p, g)): Path<(String, String)>) -> Result<Json<GroupInfo>> {
+pub async fn create_group(State(hub): State<HubState>, caller: Caller, Path((p, g)): Path<(String, String)>) -> Result<Json<GroupInfo>> {
     let me = caller.person_only()?.id;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     require_admin(&viewer)?;
@@ -895,7 +934,7 @@ async fn create_group(State(hub): State<HubState>, caller: Caller, Path((p, g)):
     Ok(Json(info))
 }
 
-async fn delete_group(State(hub): State<HubState>, caller: Caller, Path((p, g)): Path<(String, String)>) -> Result<Json<GroupInfo>> {
+pub async fn delete_group(State(hub): State<HubState>, caller: Caller, Path((p, g)): Path<(String, String)>) -> Result<Json<GroupInfo>> {
     let me = caller.person_only()?.id;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     require_admin(&viewer)?;
@@ -1012,15 +1051,15 @@ async fn change_group(hub: HubState, caller: Caller, p: String, g: String, op: O
     Ok(Json(info))
 }
 
-async fn add_members(State(hub): State<HubState>, caller: Caller, Path((p, g)): Path<(String, String)>, Json(req): Json<GroupChange>) -> Result<Json<GroupInfo>> {
+pub async fn add_members(State(hub): State<HubState>, caller: Caller, Path((p, g)): Path<(String, String)>, Json(req): Json<GroupChange>) -> Result<Json<GroupInfo>> {
     change_group(hub, caller, p, g, Op::AddMember, req).await
 }
 
-async fn remove_members(State(hub): State<HubState>, caller: Caller, Path((p, g)): Path<(String, String)>, Json(req): Json<GroupChange>) -> Result<Json<GroupInfo>> {
+pub async fn remove_members(State(hub): State<HubState>, caller: Caller, Path((p, g)): Path<(String, String)>, Json(req): Json<GroupChange>) -> Result<Json<GroupInfo>> {
     change_group(hub, caller, p, g, Op::RemoveMember, req).await
 }
 
-async fn add_managers(State(hub): State<HubState>, caller: Caller, Path((p, g)): Path<(String, String)>, Json(req): Json<GroupChange>) -> Result<Json<GroupInfo>> {
+pub async fn add_managers(State(hub): State<HubState>, caller: Caller, Path((p, g)): Path<(String, String)>, Json(req): Json<GroupChange>) -> Result<Json<GroupInfo>> {
     change_group(hub, caller, p, g, Op::AddManager, req).await
 }
 
@@ -1029,6 +1068,7 @@ async fn add_managers(State(hub): State<HubState>, caller: Caller, Path((p, g)):
 /// authority: each change is signed by a ring admin's device and verified
 /// by every reader; the server only keeps the longest log that verifies.
 async fn get_rings(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Json<Vec<serde_json::Value>>> {
+    caller.not_web()?;
     caller.signed_in()?;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
@@ -1049,6 +1089,7 @@ async fn get_rings(State(hub): State<HubState>, caller: Caller, Path(p): Path<St
 }
 
 async fn get_ring(State(hub): State<HubState>, caller: Caller, Path((p, scope)): Path<(String, String)>) -> Result<Json<serde_json::Value>> {
+    caller.not_web()?;
     caller.signed_in()?;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
@@ -1072,6 +1113,7 @@ async fn post_ring(
     Path((p, scope)): Path<(String, String)>,
     Json(ring): Json<KeyRing>,
 ) -> Result<Json<serde_json::Value>> {
+    caller.not_web()?;
     caller.person_only()?;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {

@@ -388,18 +388,16 @@ fn guarantee_1_web_shows_exact_api_view_and_hides_private_embargoed_and_other_pr
     alice.ok(&adir, &["push"]);
 
     alice.ok(&adir, &["group", "create", "finance"]);
-    alice.ok(&adir, &["group", "add", "finance", &bob.name]);
+    alice.ok(&adir, &["group", "add", "finance", &bob.name, "--confirm", &bob.fingerprint()]);
     alice.ok(&adir, &["group", "create", "security"]);
-    alice.ok(&adir, &["group", "add", "security", &sec.name]);
+    alice.ok(&adir, &["group", "add", "security", &sec.name, "--confirm", &sec.fingerprint()]);
     alice.ok(&adir, &["group", "create", "ops_grp"]);
 
+    alice.ok(&adir, &["access", "public/", "public", "security"]);
+    alice.ok(&adir, &["access", "billing/", "finance"]);
     write_files(
         &adir,
         &[
-            (
-                ".veilpolicy",
-                "public/ access public\nbilling/ access finance\npublic/ write security\n",
-            ),
             ("billing/invoice.txt", &format!("invoice: {FIN_MARK}\n")),
             ("ops/runbook.txt", &format!("runbook: {OPS_MARK}\n")),
         ],
@@ -407,50 +405,54 @@ fn guarantee_1_web_shows_exact_api_view_and_hides_private_embargoed_and_other_pr
     alice.commit_main(&adir, "add policy, billing, and ops");
     alice.ok(&adir, &["push"]);
 
-    // Create two branches + PRs: one public PR, one finance-only PR.
+    let fp = alice.project_fingerprint(&adir);
+    bob.trust_project(&hub, &proj, &fp);
+    sec.trust_project(&hub, &proj, &fp);
+
+    // Create two changes + PRs: one public PR, one finance-only PR.
     let api = hub.api();
     let main_tip = api.tips(Some(&alice.token()), &proj).unwrap().branches["main"];
     let pub_chg = api.post_json(
         Some(&alice.token()),
         &format!("/v1/projects/{proj}/changes"),
         &json!({
-            "parent": main_tip,
-            "branch": "pub-feat",
-            "message": "public improvement",
-            "edits": [{ "op": "put", "path": "public/feature.txt", "content": "PUB_PR_CONTENT\n" }]
+            "base": main_tip,
+            "description": "public improvement",
+            "edits": [{ "path": "public/feature.txt", "put": { "text": "PUB_PR_CONTENT\n" } }]
         }),
     );
-    assert_eq!(pub_chg.status, 200);
+    assert_eq!(pub_chg.status, 200, "{}", String::from_utf8_lossy(&pub_chg.body));
+    let pub_snap = pub_chg.json()["snapshot"].as_str().unwrap().to_string();
     let pub_pr_res = api.post_json(
         Some(&alice.token()),
         &format!("/v1/projects/{proj}/prs"),
-        &json!({ "head": "pub-feat", "onto": "main", "title": "Public feature PR", "body": "Visible to public" }),
+        &json!({ "head": pub_snap, "onto": "main", "title": "Public feature PR", "body": "Visible to public" }),
     );
-    assert_eq!(pub_pr_res.status, 200);
+    assert_eq!(pub_pr_res.status, 200, "{}", String::from_utf8_lossy(&pub_pr_res.body));
     let pub_pr_id = pub_pr_res.json()["id"].as_str().unwrap().to_string();
 
     let fin_chg = api.post_json(
         Some(&alice.token()),
         &format!("/v1/projects/{proj}/changes"),
         &json!({
-            "parent": main_tip,
-            "branch": "fin-feat",
-            "message": "billing adjustment",
-            "edits": [{ "op": "put", "path": "billing/q4.txt", "content": "FIN_PR_ONLY_777\n" }]
+            "base": main_tip,
+            "description": "billing adjustment",
+            "edits": [{ "path": "billing/q4.txt", "put": { "text": "FIN_PR_ONLY_777\n" } }]
         }),
     );
-    assert_eq!(fin_chg.status, 200);
+    assert_eq!(fin_chg.status, 200, "{}", String::from_utf8_lossy(&fin_chg.body));
+    let fin_snap = fin_chg.json()["snapshot"].as_str().unwrap().to_string();
     let fin_pr_res = api.post_json(
         Some(&alice.token()),
         &format!("/v1/projects/{proj}/prs"),
-        &json!({ "head": "fin-feat", "onto": "main", "title": "Confidential Q4 Billing PR", "body": "Finance eyes only" }),
+        &json!({ "head": fin_snap, "onto": "main", "title": "Confidential Q4 Billing PR", "body": "Finance eyes only" }),
     );
-    assert_eq!(fin_pr_res.status, 200);
+    assert_eq!(fin_pr_res.status, 200, "{}", String::from_utf8_lossy(&fin_pr_res.body));
     let fin_pr_id = fin_pr_res.json()["id"].as_str().unwrap().to_string();
 
     // `sec` pushes an embargoed fix for `security`.
     let sdir = sec.dir("s");
-    sec.ok(sec.home.path(), &["clone", &hub.url(&proj), sdir.to_str().unwrap()]);
+    sec.clone_trusting(&hub.url(&proj), &sdir, &fp);
     write_files(&sdir, &[("public/embargo_patch.rs", &format!("pub const E: &str = \"{EMB_MARK}\";\n"))]);
     sec.ok(&sdir, &["commit", "--no-advance", "-m", EMB_MSG]);
     let until = iso_utc(veil_core::now_millis() + 3_600_000);
@@ -498,7 +500,7 @@ fn guarantee_1_web_shows_exact_api_view_and_hides_private_embargoed_and_other_pr
     let anon_search = anon.get(&format!("/p/{proj}/search?q={PUB_MARK}"));
     assert_eq!(anon_search.status, 200);
     assert!(anon_search.text().contains("public/readme.md"));
-    let anon_secret_search = anon.get(&format!("/p/{proj}/search?q={FIN_MARK}"));
+    let anon_secret_search = anon.get(&format!("/p/{proj}/search?q=FINANCE_MARKER"));
     assert_eq!(anon_secret_search.status, 200);
     assert_absent(&anon_secret_search.text(), &["billing", FIN_MARK], "anon search hidden");
 
@@ -614,14 +616,14 @@ fn guarantee_2_secrets_never_reach_browser_on_any_route() {
     std::fs::create_dir_all(&dir).unwrap();
     alice.ok(&dir, &["init"]);
     alice.ok(&dir, &["remote", "add", "origin", &hub.url(&proj)]);
+    write_files(&dir, &[("public/open.txt", "PLAIN_PUBLIC_OK\n")]);
+    alice.commit_main(&dir, "initial open");
+    alice.ok(&dir, &["push"]);
+
+    alice.ok(&dir, &["access", "public/", "public"]);
     write_files(
         &dir,
         &[
-            (
-                ".veilpolicy",
-                "public/ access public\npublic/secrets/ cloak pub_sec\nprivate_sec/ cloak priv_sec\n",
-            ),
-            ("public/open.txt", "PLAIN_PUBLIC_OK\n"),
             ("public/secrets/.env", &format!("API_KEY={SEC_BETA}\n")),
             ("private_sec/.env", &format!("DB_PASS={SEC_ALPHA}\n")),
         ],
@@ -629,31 +631,36 @@ fn guarantee_2_secrets_never_reach_browser_on_any_route() {
     alice.commit_main(&dir, "commit sealed secrets");
     alice.ok(&dir, &["push"]);
 
-    // Also craft and push a snapshot with a forged `Visibility::Public` tree entry
-    // whose object id is actually an `Object::Sealed` envelope (object authority test).
+    // Create a branch `sec-branch` with an updated sealed `.env` file and open a PR for it.
+    write_files(&dir, &[("public/secrets/.env", &format!("API_KEY={SEC_BETA}_V2\n"))]);
+    alice.ok(&dir, &["commit", "--no-advance", "-m", "rotate sealed secret"]);
+    alice.ok(&dir, &["tag", "set", "sec-branch", "-r", "@-"]);
+    alice.ok(&dir, &["push"]);
+
     let api = hub.api();
     let main_tip = api.tips(Some(&alice.token()), &proj).unwrap().branches["main"];
+
+    let pr_res = api.post_json(
+        Some(&alice.token()),
+        &format!("/v1/projects/{proj}/prs"),
+        &json!({ "head": "sec-branch", "onto": "main", "title": "PR with sealed object", "body": "check diff" }),
+    );
+    assert_eq!(pr_res.status, 200, "{}", String::from_utf8_lossy(&pr_res.body));
+    let pr_id = pr_res.json()["id"].as_str().unwrap().to_string();
+
+    // Also test defense-in-depth when storage itself holds a snapshot with a forged
+    // `Visibility::Public` tree entry pointing to an `Object::Sealed` envelope.
     let env = Envelope::seal_deterministic(&[42u8; 32], "forged#0102030405060708", FORGED_SEC.as_bytes()).unwrap();
     let raw_sealed = Object::Sealed(env).encode();
     let sealed_id = ObjectId::hash(&raw_sealed);
     let cipher_marker = hex::encode(&raw_sealed[raw_sealed.len().saturating_sub(16)..]);
 
-    // Fetch current root tree so we keep `.veilpolicy` and existing entries while adding `public/forged.txt`.
-    let hist = api.history(&alice.token(), &proj, &[main_tip]);
-    let frames = hist.frames();
-    let tip_snap = match Object::decode(&frames.iter().find(|(id, _)| *id == main_tip).unwrap().1).unwrap() {
-        Object::Snapshot(s) => s,
-        other => panic!("expected snapshot, got {other:?}"),
-    };
-    let root_tree = match Object::decode(&frames.iter().find(|(id, _)| *id == tip_snap.tree).unwrap().1).unwrap() {
-        Object::Tree(t) => t,
-        other => panic!("expected tree, got {other:?}"),
-    };
+    let local_repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&dir)), None, "test").unwrap();
+    let local_main = local_repo.view().tags["main"].target;
+    let tip_snap = local_repo.snapshot(&local_main).unwrap();
+    let root_tree = local_repo.store().tree(&tip_snap.tree).unwrap();
     let pub_entry = root_tree.entries.iter().find(|e| e.name == "public").unwrap().clone();
-    let mut pub_tree = match Object::decode(&frames.iter().find(|(id, _)| *id == pub_entry.id).unwrap().1).unwrap() {
-        Object::Tree(t) => t,
-        other => panic!("expected public tree, got {other:?}"),
-    };
+    let mut pub_tree = (*local_repo.store().tree(&pub_entry.id).unwrap()).clone();
     pub_tree.entries.push(TreeEntry {
         name: "forged.txt".into(),
         kind: EntryKind::File,
@@ -666,7 +673,7 @@ fn guarantee_2_secrets_never_reach_browser_on_any_route() {
     let raw_pub_tree = Object::Tree(pub_tree).encode();
     let new_pub_id = ObjectId::hash(&raw_pub_tree);
 
-    let mut new_root_entries = root_tree.entries;
+    let mut new_root_entries = root_tree.entries.clone();
     for e in &mut new_root_entries {
         if e.name == "public" {
             e.id = new_pub_id;
@@ -680,33 +687,44 @@ fn guarantee_2_secrets_never_reach_browser_on_any_route() {
     forged_snap.author = alice.name.clone();
     forged_snap.description = veil_core::object::Text::Plain("forged public entry to sealed blob".into());
     forged_snap.timestamp = veil_core::now_millis();
-    forged_snap.sign(&alice.identity());
+    forged_snap.sign(&hub.hub().identity);
     let raw_forged_snap = Object::Snapshot(forged_snap).encode();
     let forged_snap_id = ObjectId::hash(&raw_forged_snap);
 
-    let objects = [
-        (sealed_id, raw_sealed.clone()),
-        (new_pub_id, raw_pub_tree),
-        (new_root_id, raw_root_tree),
-        (forged_snap_id, raw_forged_snap),
-    ];
-    assert_eq!(api.upload(&alice.token(), &proj, &objects).status, 200);
-    let push_res = api.post_json(
-        Some(&alice.token()),
-        &format!("/v1/projects/{proj}/push"),
-        &json!({
-            "updates": [{ "branch": "forged-branch", "old": main_tip.hex(), "new": forged_snap_id.hex() }]
-        }),
-    );
-    assert_eq!(push_res.status, 200, "{}", String::from_utf8_lossy(&push_res.body));
-
-    let pr_res = api.post_json(
-        Some(&alice.token()),
-        &format!("/v1/projects/{proj}/prs"),
-        &json!({ "head": "forged-branch", "onto": "main", "title": "PR with sealed object", "body": "check diff" }),
-    );
-    assert_eq!(pr_res.status, 200);
-    let pr_id = pr_res.json()["id"].as_str().unwrap().to_string();
+    let h = hub.hub();
+    hub.rt.block_on(async {
+        let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
+            .bind(&proj)
+            .fetch_one(&h.db)
+            .await
+            .unwrap();
+        let aid: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = $1")
+            .bind(&alice.name)
+            .fetch_one(&h.db)
+            .await
+            .unwrap();
+        for (oid, raw) in [
+            (sealed_id, raw_sealed.clone()),
+            (new_pub_id, raw_pub_tree),
+            (new_root_id, raw_root_tree),
+            (forged_snap_id, raw_forged_snap),
+        ] {
+            h.objects.put(pid, &oid, bytes::Bytes::from(raw)).await.unwrap();
+        }
+        sqlx::query("INSERT INTO snapshots (project_id, id, author) VALUES ($1, $2, $3)")
+            .bind(pid)
+            .bind(forged_snap_id.hex())
+            .bind(aid)
+            .execute(&h.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO branches (project_id, name, target) VALUES ($1, 'forged-branch', $2)")
+            .bind(pid)
+            .bind(forged_snap_id.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+    });
 
     catch_up(&hub, &proj);
 
@@ -885,16 +903,18 @@ fn guarantee_3_session_safety_csrf_cookies_csp_and_xss_escaping() {
     write_files(
         &dir,
         &[
-            (".veilpolicy", "public/ access public\n"),
             ("public/evil.html", &format!("<!doctype html>{XSS_SCRIPT}{XSS_IMG}\n")),
             ("public/icon.svg", &format!("{XSS_SVG}\n")),
             ("public/notes.md", &format!("# Notes\n{XSS_TEXTAREA}\n")),
         ],
     );
-    alice.ok(&dir, &["commit", "-m", &format!("commit {XSS_SCRIPT} & {XSS_IMG}")]);
+    alice.commit_main(&dir, &format!("commit {XSS_SCRIPT} & {XSS_IMG}"));
     alice.ok(&dir, &["push"]);
     alice.ok(&dir, &["group", "create", "devs"]);
-    alice.ok(&dir, &["group", "add", "devs", &bob.name]);
+    alice.ok(&dir, &["group", "add", "devs", &bob.name, "--confirm", &bob.fingerprint()]);
+    alice.ok(&dir, &["access", "public/", "public", "devs"]);
+    alice.commit_main(&dir, "grant devs access to public");
+    alice.ok(&dir, &["push"]);
 
     catch_up(&hub, &proj);
 
@@ -934,27 +954,29 @@ fn guarantee_3_session_safety_csrf_cookies_csp_and_xss_escaping() {
     bob_web.sign_in_derived(&hub, &bob);
     let bob_csrf = bob_web.csrf.clone().unwrap();
 
-    // Create a branch so we can test PR creation, commenting, review, and landing with CSRF.
+    // Create a change so we can test PR creation, commenting, review, and landing with CSRF.
     let api = hub.api();
     let main_tip = api.tips(Some(&alice.token()), &proj).unwrap().branches["main"];
     let chg = api.post_json(
         Some(&alice.token()),
         &format!("/v1/projects/{proj}/changes"),
         &json!({
-            "parent": main_tip,
-            "branch": "xss-pr",
-            "message": format!("branch {XSS_SVG}"),
-            "edits": [{ "op": "put", "path": "public/pr.txt", "content": format!("line {XSS_SCRIPT}\n") }]
+            "base": main_tip,
+            "description": format!("branch {XSS_SVG}"),
+            "edits": [{ "path": "public/pr.txt", "put": { "text": format!("line {XSS_SCRIPT}\n") } }]
         }),
     );
-    assert_eq!(chg.status, 200);
+    assert_eq!(chg.status, 200, "{}", String::from_utf8_lossy(&chg.body));
+    let xss_head = chg.json()["snapshot"].as_str().unwrap().to_string();
 
     // 4. State-changing requests without CSRF, with another user's CSRF, or with cross-site Origin MUST fail (`403 csrf_failed`).
+    let title_str = format!("Title {XSS_SVG} {XSS_IMG}");
+    let body_str = format!("Body {XSS_TEXTAREA} {XSS_SCRIPT}");
     let pr_fields = [
-        ("head", "xss-pr"),
+        ("head", xss_head.as_str()),
         ("onto", "main"),
-        ("title", &format!("Title {XSS_SVG} {XSS_IMG}")),
-        ("body", &format!("Body {XSS_TEXTAREA} {XSS_SCRIPT}")),
+        ("title", title_str.as_str()),
+        ("body", body_str.as_str()),
     ];
     let no_csrf = alice_web.post_form(&format!("/p/{proj}/prs"), &pr_fields, false, Some(&orig), Some("same-origin"));
     assert_eq!(no_csrf.status, 403);
@@ -962,7 +984,7 @@ fn guarantee_3_session_safety_csrf_cookies_csp_and_xss_escaping() {
 
     let wrong_csrf = alice_web.post_json_web(
         &format!("/v1/projects/{proj}/prs"),
-        &json!({ "head": "xss-pr", "onto": "main", "title": "bad csrf" }),
+        &json!({ "head": xss_head, "onto": "main", "title": "bad csrf" }),
         Some(&bob_csrf),
         Some(&orig),
         Some("same-origin"),
@@ -1061,6 +1083,7 @@ fn guarantee_3_session_safety_csrf_cookies_csp_and_xss_escaping() {
 
     let logout = alice_web.post_form("/web/logout", &[], true, Some(&orig), Some("same-origin"));
     assert_eq!(logout.status, 303, "logout failed: {}", logout.text());
+    alice_web.capture_cookie(&logout);
     assert!(alice_web.cookie.is_none(), "logout must clear cookie");
 
     // Replaying the old cookie on server A OR server B is refused (`401`), never downgraded to anonymous!
@@ -1068,17 +1091,22 @@ fn guarantee_3_session_safety_csrf_cookies_csp_and_xss_escaping() {
     assert_eq!(alice_on_b.get(&format!("/v1/projects/{proj}/tips")).status, 401);
     assert_eq!(alice_on_b.get(&format!("/p/{proj}")).status, 401);
 
-    // 9. Removing a parent device invalidates derived web sessions immediately.
+    // 9. Removing a parent device invalidates derived web sessions immediately across servers.
     let dev2 = hub.new_device_of(&alice);
-    let mut dev2_web = WebClient::new(&hub);
+    alice.ok(alice.home.path(), &["identity", "confirm", &dev2.fingerprint()]);
+    dev2.ok(
+        dev2.home.path(),
+        &["login", &format!("veil://{}", hub.authority()), "--ca", hub.ca.to_str().unwrap()],
+    );
+    let mut dev2_web = WebClient::new(&hub_b);
     dev2_web.sign_in_derived(&hub, &dev2);
     assert_eq!(dev2_web.get(&format!("/p/{proj}")).status, 200);
     let rm = api.post_json(
         Some(&alice.token()),
         "/v1/devices/remove",
-        &json!({ "device": dev2.identity().verifying_hex() }),
+        &json!({ "device": dev2.identity().public_id() }),
     );
-    assert_eq!(rm.status, 200);
+    assert_eq!(rm.status, 200, "{}", String::from_utf8_lossy(&rm.body));
     assert_eq!(dev2_web.get(&format!("/p/{proj}")).status, 401);
 }
 
@@ -1115,18 +1143,18 @@ fn guarantee_4_narrowed_agent_and_ci_runner_sessions_respect_limits_on_web() {
         Some(&alice.token()),
         &format!("/v1/projects/{proj}/changes"),
         &json!({
-            "parent": main_tip,
-            "branch": "in-scope",
-            "message": "api tweak",
-            "edits": [{ "op": "put", "path": "src/api/v2.rs", "content": "pub fn v2() {}\n" }]
+            "base": main_tip,
+            "description": "api tweak",
+            "edits": [{ "path": "src/api/v2.rs", "put": { "text": "pub fn v2() {}\n" } }]
         }),
     );
-    assert_eq!(in_chg.status, 200);
+    assert_eq!(in_chg.status, 200, "{}", String::from_utf8_lossy(&in_chg.body));
+    let in_snap = in_chg.json()["snapshot"].as_str().unwrap().to_string();
     let in_pr = api
         .post_json(
             Some(&alice.token()),
             &format!("/v1/projects/{proj}/prs"),
-            &json!({ "head": "in-scope", "onto": "main", "title": "In-scope API PR" }),
+            &json!({ "head": in_snap, "onto": "main", "title": "In-scope API PR" }),
         )
         .json()["id"]
         .as_str()
@@ -1137,18 +1165,18 @@ fn guarantee_4_narrowed_agent_and_ci_runner_sessions_respect_limits_on_web() {
         Some(&alice.token()),
         &format!("/v1/projects/{proj}/changes"),
         &json!({
-            "parent": main_tip,
-            "branch": "out-scope",
-            "message": "engine tweak",
-            "edits": [{ "op": "put", "path": "src/other/v2.rs", "content": "OUTSIDE_PR_DIFF_333\n" }]
+            "base": main_tip,
+            "description": "engine tweak",
+            "edits": [{ "path": "src/other/v2.rs", "put": { "text": "OUTSIDE_PR_DIFF_333\n" } }]
         }),
     );
-    assert_eq!(out_chg.status, 200);
+    assert_eq!(out_chg.status, 200, "{}", String::from_utf8_lossy(&out_chg.body));
+    let out_snap = out_chg.json()["snapshot"].as_str().unwrap().to_string();
     let out_pr = api
         .post_json(
             Some(&alice.token()),
             &format!("/v1/projects/{proj}/prs"),
-            &json!({ "head": "out-scope", "onto": "main", "title": "Out-of-scope Engine PR" }),
+            &json!({ "head": out_snap, "onto": "main", "title": "Out-of-scope Engine PR" }),
         )
         .json()["id"]
         .as_str()
@@ -1198,20 +1226,27 @@ fn guarantee_4_narrowed_agent_and_ci_runner_sessions_respect_limits_on_web() {
     assert_eq!(ag_web.get(&format!("/p/{proj}/search?q={ALLOWED_MARK}&path=src/api")).status, 200);
     assert_eq!(ag_web.get(&format!("/p/{proj}/prs/{in_pr}")).status, 200);
 
-    // Refused outside `src/api` (`404`, no leak):
-    for outside_url in [
-        format!("/p/{proj}/tree"),
-        format!("/p/{proj}/tree/src/other"),
-        format!("/p/{proj}/file/src/other/engine.rs"),
-        format!("/p/{proj}/blame/src/other/engine.rs"),
-        format!("/p/{proj}/history/src/other/engine.rs"),
-        format!("/p/{proj}/search?q={OUTSIDE_MARK}&path=src/other"),
-        format!("/p/{proj}/prs/{out_pr}"),
+    // Refused outside `src/api` with exact API parity (`403` from `Viewer::narrowed_to`
+    // regardless of whether the path exists, `404` from `prs::show`, zero content leak):
+    for (outside_url, expected_status) in [
+        (format!("/p/{proj}/tree"), 403),
+        (format!("/p/{proj}/tree/src/other"), 403),
+        (format!("/p/{proj}/file/src/other/engine.rs"), 403),
+        (format!("/p/{proj}/file/src/nonexistent/ghost.rs"), 403),
+        (format!("/p/{proj}/blame/src/other/engine.rs"), 403),
+        (format!("/p/{proj}/history/src/other/engine.rs"), 403),
+        (format!("/p/{proj}/search?q=OUTSIDE_ENGINE&path=src/other"), 403),
+        (format!("/p/{proj}/prs/{out_pr}"), 404),
     ] {
         let r = ag_web.get(&outside_url);
-        assert_eq!(r.status, 404, "narrowed agent must get 404 on {outside_url}, got {}: {}", r.status, r.text());
+        assert_eq!(r.status, expected_status, "narrowed agent expected {expected_status} on {outside_url}, got {}: {}", r.status, r.text());
         assert_absent(&r.text(), &[OUTSIDE_MARK, "OUTSIDE_PR_DIFF_333", "Out-of-scope Engine PR"], &outside_url);
     }
+    assert_eq!(
+        ag_web.get(&format!("/p/{proj}/file/src/other/engine.rs")).text(),
+        ag_web.get(&format!("/p/{proj}/file/src/nonexistent/ghost.rs")).text(),
+        "narrowed agent refusal must be identical for existing and non-existing paths"
+    );
 
     // Refused person-only web routes (`403 agent_session`):
     let adm_get = ag_web.get(&format!("/p/{proj}/admin"));
@@ -1246,13 +1281,13 @@ fn guarantee_4_narrowed_agent_and_ci_runner_sessions_respect_limits_on_web() {
     ci_web.cookie = Some(ci_tok);
     ci_web.csrf = Some(veil_core::hub::web::csrf_for_session(&ci_hash));
 
-    // CI runner reads within `src/api`, gets 404 outside:
+    // CI runner reads within `src/api`, refused (`403`) outside:
     assert_eq!(ci_web.get(&format!("/p/{proj}/file/src/api/handler.rs")).status, 200);
-    assert_eq!(ci_web.get(&format!("/p/{proj}/file/src/other/engine.rs")).status, 404);
+    assert_eq!(ci_web.get(&format!("/p/{proj}/file/src/other/engine.rs")).status, 403);
 
     // CI runner is refused (`403`) on EVERY write action in the web client:
     for (write_url, fields) in [
-        (format!("/p/{proj}/prs"), vec![("head", "in-scope"), ("onto", "main"), ("title", "ci pr")]),
+        (format!("/p/{proj}/prs"), vec![("head", in_snap.as_str()), ("onto", "main"), ("title", "ci pr")]),
         (format!("/p/{proj}/prs/{in_pr}/threads"), vec![("body", "ci comment")]),
         (format!("/p/{proj}/prs/{in_pr}/close"), vec![]),
         (format!("/p/{proj}/prs/{in_pr}/land"), vec![]),
@@ -1281,7 +1316,7 @@ fn guarantee_5_web_pages_large_files_and_long_histories_are_bounded_and_paged() 
     for i in 1..=650 {
         big.push_str(&format!("LINE_MARKER_{i:04}: the quick brown fox jumps over the lazy dog\n"));
     }
-    write_files(&dir, &[(".veilpolicy", "public/ access public\n"), ("public/big.txt", &big)]);
+    write_files(&dir, &[(".veilpolicy", "public/ public\n"), ("public/big.txt", &big)]);
     let mut many_files = Vec::new();
     for i in 1..=135 {
         many_files.push((format!("public/many/f_{i:03}.txt"), format!("MANY_GREP_ITEM_{i:03}\n")));
@@ -1294,7 +1329,7 @@ fn guarantee_5_web_pages_large_files_and_long_histories_are_bounded_and_paged() 
     alice.commit_main(&dir, "COMMIT_SEQ_001");
     alice.ok(&dir, &["push"]);
 
-    // 2. 64 more commits via `/changes` + `/push` onto `main` so commit log & file history have 65 entries.
+    // 2. 64 more commits via `/changes` onto `main` so commit log & file history have 65 entries.
     let api = hub.api();
     let mut tip = api.tips(Some(&alice.token()), &proj).unwrap().branches["main"];
     for seq in 2..=65 {
@@ -1302,36 +1337,35 @@ fn guarantee_5_web_pages_large_files_and_long_histories_are_bounded_and_paged() 
             Some(&alice.token()),
             &format!("/v1/projects/{proj}/changes"),
             &json!({
-                "parent": tip,
-                "branch": "main",
-                "message": format!("COMMIT_SEQ_{seq:03}"),
-                "edits": [{ "op": "put", "path": "public/tracked.txt", "content": format!("v{seq}\n") }]
+                "base": tip,
+                "description": format!("COMMIT_SEQ_{seq:03}"),
+                "edits": [{ "path": "public/tracked.txt", "put": { "text": format!("v{seq}\n") } }],
+                "onto": { "branch": "main", "expected": tip }
             }),
         );
         assert_eq!(chg.status, 200, "change {seq} failed: {}", String::from_utf8_lossy(&chg.body));
-        tip = ObjectId::from_hex(chg.json()["snapshot_id"].as_str().unwrap()).unwrap();
+        tip = ObjectId::from_hex(chg.json()["snapshot"].as_str().unwrap()).unwrap();
     }
 
     // 3. 30 open PRs.
     for pseq in 1..=30 {
-        let br = format!("pr-br-{pseq:02}");
         let chg = api.post_json(
             Some(&alice.token()),
             &format!("/v1/projects/{proj}/changes"),
             &json!({
-                "parent": tip,
-                "branch": br,
-                "message": format!("pr commit {pseq}"),
-                "edits": [{ "op": "put", "path": format!("public/pr_{pseq:02}.txt"), "content": "x\n" }]
+                "base": tip,
+                "description": format!("pr commit {pseq}"),
+                "edits": [{ "path": format!("public/pr_{pseq:02}.txt"), "put": { "text": "x\n" } }]
             }),
         );
-        assert_eq!(chg.status, 200);
+        assert_eq!(chg.status, 200, "{}", String::from_utf8_lossy(&chg.body));
+        let pr_snap = chg.json()["snapshot"].as_str().unwrap().to_string();
         let pr = api.post_json(
             Some(&alice.token()),
             &format!("/v1/projects/{proj}/prs"),
-            &json!({ "head": br, "onto": "main", "title": format!("PR_SEQ_{pseq:02}") }),
+            &json!({ "head": pr_snap, "onto": "main", "title": format!("PR_SEQ_{pseq:02}") }),
         );
-        assert_eq!(pr.status, 200);
+        assert_eq!(pr.status, 200, "{}", String::from_utf8_lossy(&pr.body));
     }
 
     catch_up(&hub, &proj);

@@ -259,7 +259,18 @@ fn decoded(s: &str) -> Option<String> {
 /// for a name that is not one), and what the route does.
 fn route(method: &Method, path: &str) -> (Option<String>, Class) {
     let mut seg = path.split('/').skip(1);
-    let (v1, kind, name) = (seg.next(), seg.next(), seg.next().and_then(decoded));
+    let first = seg.next();
+    if first == Some("p") {
+        let project = seg.next().and_then(decoded).filter(|p| crate::perm::valid_project_name(p));
+        let rest = seg.collect::<Vec<_>>();
+        let class = match (method, project.is_some(), rest.as_slice()) {
+            (&Method::GET, true, ["search"]) => Class::Search,
+            (&Method::GET, _, _) => Class::Read,
+            _ => Class::Write,
+        };
+        return (project, class);
+    }
+    let (v1, kind, name) = (first, seg.next(), seg.next().and_then(decoded));
     let batch = kind == Some("objects") && name.as_deref().is_some_and(|n| n.ends_with(":batch"));
     let project = match (v1, kind, name) {
         (Some("v1"), Some("projects"), Some(p)) => Some(p),
@@ -344,9 +355,15 @@ async fn who(hub: &HubState, parts: &mut axum::http::request::Parts, address: Ke
             (false, None) => limits.addresses.take(address),
         }
     };
-    if let Some(token) = parts.headers.get(header::AUTHORIZATION).and_then(|a| a.to_str().ok()).and_then(|a| a.strip_prefix("Bearer ")) {
+    let bearer_or_cookie = parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|a| a.to_str().ok())
+        .and_then(|a| a.strip_prefix("Bearer "))
+        .or_else(|| crate::auth::cookie_token(&parts.headers));
+    if let Some(token) = bearer_or_cookie {
         let now = veil_core::now_millis();
-        if let Some(e) = hub.caches.session(&crate::auth::token_hash(token)).filter(|e| e.expires_at > now) {
+        if let Some(e) = hub.caches.session(&crate::auth::session_hash(token)).filter(|e| e.expires_at > now) {
             if let Some(d) = Key::device(&e.person.device_key) {
                 charge(Some(d))?;
                 return Ok(Who { device: Some(d), person: Some((e.person.clone(), e.epoch)), grant: None });
@@ -357,7 +374,7 @@ async fn who(hub: &HubState, parts: &mut axum::http::request::Parts, address: Ke
         // under the address's rate of lookups; a session found pays its
         // device, anything else the address (BUG-1338).
         limits.lookups.take(address)?;
-        let found = <crate::auth::Caller as axum::extract::FromRequestParts<HubState>>::from_request_parts(parts, hub).await.ok();
+        let found = crate::auth::authenticate_parts(parts, hub, false).await.ok();
         let person = found.and_then(|c| c.person.map(|p| (p, c.epochs.person)));
         let device = person.as_ref().and_then(|(p, _)| Key::device(&p.device_key));
         charge(device)?;
@@ -559,6 +576,9 @@ mod tests {
         assert_eq!(r(&p, "/v1/projects/a"), (a.clone(), Class::Write));
         assert_eq!(r(&p, "/v1/auth/login"), (None, Class::Write));
         assert_eq!(r(&g, "/v1/epochs"), (None, Class::Read));
+        assert_eq!(r(&g, "/p/a/search"), (a.clone(), Class::Search));
+        assert_eq!(r(&g, "/p/a/tree"), (a.clone(), Class::Read));
+        assert_eq!(r(&p, "/p/a/prs"), (a, Class::Write));
     }
 
     /// BUG-1335: a project's name is keyed as the route decodes it, in any
@@ -566,12 +586,18 @@ mod tests {
     #[test]
     fn project_names_are_keyed_as_the_route_decodes_them() {
         let g = Method::GET;
-        for path in ["/v1/projects/lim1/groups", "/v1/projects/%6Cim1/groups", "/v1/projects/%6c%69%6D1/groups"] {
+        for path in [
+            "/v1/projects/lim1/groups",
+            "/v1/projects/%6Cim1/groups",
+            "/v1/projects/%6c%69%6D1/groups",
+            "/p/lim1/tree",
+            "/p/%6Cim1/tree",
+        ] {
             assert_eq!(route(&g, path).0.as_deref(), Some("lim1"), "{path}");
         }
         assert_eq!(route(&Method::POST, "/v1/objects/%6Cim1%3Abatch").0.as_deref(), Some("lim1"));
         assert_eq!(route(&Method::POST, "/v1/objects/%6Cim1%3Abatch").1, Class::Read);
-        for bad in ["/v1/projects/%zz/tips", "/v1/projects/%ff/tips", "/v1/projects/A%20B/tips", "/v1/projects/%/tips"] {
+        for bad in ["/v1/projects/%zz/tips", "/v1/projects/%ff/tips", "/v1/projects/A%20B/tips", "/v1/projects/%/tips", "/p/%zz/tree"] {
             assert_eq!(route(&g, bad).0, None, "{bad}");
         }
     }
