@@ -427,6 +427,7 @@ impl WatcherInner {
             unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(&buf)) };
         let mut overflowed_all = false;
         let mut new_subdirs: Vec<(PathBuf, VPath)> = Vec::new();
+        let mut nested_checks: Vec<(PathBuf, VPath)> = Vec::new();
 
         loop {
             // SAFETY: `inotify_fd` is valid and `byte_buf` is writable.
@@ -479,18 +480,11 @@ impl WatcherInner {
                     continue;
                 }
 
-                // Ignore temporary atomic-write staging files if they are pure temp debris,
-                // EXCEPT that `.checkout.json.vltmp*` is inside `.veil` (which isn't watched
-                // anyway). Wait: if a user creates a file via atomic rename, the rename onto
-                // the real name fires `IN_MOVED_TO` for the real name! Still, only skip
-                // reserved `.veil` so we never miss anything in the working copy.
-                if name_bytes == b".veil" {
-                    continue;
-                }
                 let name_str = std::str::from_utf8(name_bytes).ok();
-                if name_str.is_some_and(|s| is_reserved_name(s) || is_temp_name(s)) {
+                if name_str.is_some_and(is_temp_name) {
                     continue;
                 }
+                let reserved = name_bytes == b".veil" || name_str.is_some_and(is_reserved_name);
 
                 let Some(wc) = self.wcs.get_mut(&root) else {
                     continue;
@@ -501,6 +495,22 @@ impl WatcherInner {
                 let Some(dir) = wc.wds.get(&ev.wd).cloned() else {
                     continue;
                 };
+
+                // Root `.veil` is this repository's own metadata; nested `.veil`
+                // turns `dir` into (or back from) a nested Veil repository (BUG-1804).
+                if reserved {
+                    if !dir.is_root() {
+                        let seq = wc.bump_seq();
+                        wc.mark_dirty_dir(dir.parent().unwrap_or_else(VPath::root), seq);
+                        wc.mark_dirty_subtree(dir.clone(), seq);
+                        if ev.mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 {
+                            nested_checks.push((root.clone(), dir));
+                        } else if ev.mask & (libc::IN_DELETE | libc::IN_MOVED_FROM) != 0 {
+                            new_subdirs.push((root.clone(), dir));
+                        }
+                    }
+                    continue;
+                }
                 let seq = wc.bump_seq();
 
                 // Any change to `.veilpolicy` or `.veilattributes` (at any depth)
@@ -556,6 +566,13 @@ impl WatcherInner {
             self.watch_new_subdir(&root, &sub);
         }
 
+        // Drop watches strictly beneath any directory that just became a nested
+        // Veil repository, while keeping the watch on `dir` itself so removing
+        // `.veil` later is observed.
+        for (root, dir) in nested_checks {
+            self.prune_if_nested_repo(&root, &dir);
+        }
+
         // Drop watches for any working copy that overflowed its dirty-path bound.
         let overflowed: Vec<PathBuf> = self
             .wcs
@@ -570,6 +587,43 @@ impl WatcherInner {
 
     #[cfg(not(target_os = "linux"))]
     fn drain_events(&mut self) {}
+
+    #[cfg(target_os = "linux")]
+    fn prune_if_nested_repo(&mut self, root: &Path, dir: &VPath) {
+        if dir.is_root() {
+            return;
+        }
+        let Some(inotify_fd) = self.inotify.as_ref().map(AsRawFd::as_raw_fd) else {
+            return;
+        };
+        let Ok((root_fd, root_st)) = open_verified_root(root) else {
+            return;
+        };
+        let Some(wc) = self.wcs.get_mut(root) else {
+            return;
+        };
+        if wc.overflow.is_some() || wc.root_dev != root_st.st_dev as u64 || wc.root_ino != root_st.st_ino {
+            return;
+        }
+        let Some(dir_fd) = open_subdir_nofollow(&root_fd, dir, wc.root_dev) else {
+            return;
+        };
+        if !scan_dir_children(&dir_fd).0 {
+            return;
+        }
+        let drop_paths: Vec<(VPath, i32)> = wc
+            .paths
+            .iter()
+            .filter(|(p, _)| *p != dir && p.starts_with(dir))
+            .map(|(p, &wd)| (p.clone(), wd))
+            .collect();
+        for (p, wd) in drop_paths {
+            wc.paths.remove(&p);
+            wc.wds.remove(&wd);
+            self.wd_to_root.remove(&wd);
+            rm_watch(inotify_fd, wd);
+        }
+    }
 
     fn watch_new_subdir(&mut self, root: &Path, sub: &VPath) {
         let Some(inotify_fd) = self.ensure_inotify() else {
@@ -792,11 +846,12 @@ fn fstat_fd(fd: RawFd) -> io::Result<libc::stat> {
 }
 
 /// Open `sub` relative to `root_fd`, stepping one component at a time with
-/// `O_NOFOLLOW | O_DIRECTORY` and verifying `st_dev == root_dev` and nested
-/// `.veil` absence at every step.
+/// `O_NOFOLLOW | O_DIRECTORY` and verifying `st_dev == root_dev` at every step
+/// and nested `.veil` absence on every intermediate ancestor.
 fn open_subdir_nofollow(root_fd: &OwnedFd, sub: &VPath, root_dev: u64) -> Option<OwnedFd> {
     let mut cur = root_fd.try_clone().ok()?;
-    for comp in sub.components() {
+    let comps: Vec<&str> = sub.components().collect();
+    for (idx, comp) in comps.iter().copied().enumerate() {
         if is_reserved_name(comp) {
             return None;
         }
@@ -815,7 +870,8 @@ fn open_subdir_nofollow(root_fd: &OwnedFd, sub: &VPath, root_dev: u64) -> Option
         // SAFETY: `next` is a new descriptor we own.
         let next_owned = unsafe { OwnedFd::from_raw_fd(next) };
         let st = fstat_fd(next_owned.as_raw_fd()).ok()?;
-        if st.st_dev as u64 != root_dev || has_dot_veil(next_owned.as_raw_fd()) {
+        let intermediate = idx + 1 < comps.len();
+        if st.st_dev as u64 != root_dev || (intermediate && scan_dir_children(&next_owned).0) {
             return None;
         }
         cur = next_owned;
@@ -823,17 +879,22 @@ fn open_subdir_nofollow(root_fd: &OwnedFd, sub: &VPath, root_dev: u64) -> Option
     Some(cur)
 }
 
-/// Does directory `fd` contain a `.veil` entry (a nested repository)?
-fn has_dot_veil(fd: RawFd) -> bool {
+/// Does directory `fd` contain a non-file `.veil` entry (fallback when `dup` fails)?
+fn has_nonfile_dot_veil(fd: RawFd) -> bool {
     let veil_c = CString::new(".veil").expect("valid");
     // SAFETY: `st` is writable.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    unsafe { libc::fstatat(fd, veil_c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0 }
+    unsafe {
+        libc::fstatat(fd, veil_c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0
+            && (st.st_mode & libc::S_IFMT) != libc::S_IFREG
+    }
 }
 
 /// Walk `start_dir` (opened as `start_fd`) and its subdirectories iteratively
 /// without following symlinks or crossing mount points, adding an inotify
-/// watch for each directory.
+/// watch for each directory. A nested Veil repository directory itself is
+/// watched (so removing `.veil` later fires an event), while its children are
+/// never descended into.
 fn watch_subtree(
     inotify_fd: RawFd,
     start_fd: OwnedFd,
@@ -877,7 +938,10 @@ fn watch_subtree(
             continue;
         }
 
-        let children = list_subdir_names(&dir_fd);
+        let (holds_repo, children) = scan_dir_children(&dir_fd);
+        if !dir_path.is_root() && holds_repo {
+            continue;
+        }
         for name in children {
             let c = match CString::new(name.as_str()) {
                 Ok(c) => c,
@@ -899,9 +963,8 @@ fn watch_subtree(
             let Ok(st) = fstat_fd(child_owned.as_raw_fd()) else {
                 continue;
             };
-            // Never cross a mount boundary, and never descend into a nested
-            // Veil repository.
-            if st.st_dev as u64 != root_dev || has_dot_veil(child_owned.as_raw_fd()) {
+            // Never cross a mount boundary.
+            if st.st_dev as u64 != root_dev {
                 continue;
             }
             stack.push((child_owned, dir_path.join(&name)));
@@ -945,13 +1008,13 @@ fn rm_watch(inotify_fd: RawFd, wd: i32) {
 #[cfg(not(target_os = "linux"))]
 fn rm_watch(_inotify_fd: RawFd, _wd: i32) {}
 
-/// Read candidate subdirectory names in `dir_fd` using `fdopendir`/`readdir`.
-/// Entries whose `d_type` is known to be a regular file, symlink, FIFO,
-/// socket or device are skipped without an `openat` syscall; `DT_DIR` and
-/// `DT_UNKNOWN` are returned and verified by `openat(O_DIRECTORY | O_NOFOLLOW)`.
-fn list_subdir_names(dir_fd: &OwnedFd) -> Vec<String> {
+/// Read candidate subdirectory names in `dir_fd` using `fdopendir`/`readdir`,
+/// and check whether `dir_fd` holds a nested Veil repository (matching
+/// [`veil_core::vfs::holds_repository`]: any reserved `.veil` entry that is
+/// not a regular file).
+fn scan_dir_children(dir_fd: &OwnedFd) -> (bool, Vec<String>) {
     let Ok(dup) = dir_fd.try_clone() else {
-        return Vec::new();
+        return (has_nonfile_dot_veil(dir_fd.as_raw_fd()), Vec::new());
     };
     let raw = std::os::fd::IntoRawFd::into_raw_fd(dup);
     // SAFETY: `raw` is a directory descriptor we own; `fdopendir` takes ownership.
@@ -959,8 +1022,9 @@ fn list_subdir_names(dir_fd: &OwnedFd) -> Vec<String> {
     if d.is_null() {
         // SAFETY: `fdopendir` failed, so `raw` is still ours.
         unsafe { libc::close(raw) };
-        return Vec::new();
+        return (has_nonfile_dot_veil(dir_fd.as_raw_fd()), Vec::new());
     }
+    let mut holds_repo = false;
     let mut out = Vec::new();
     loop {
         // SAFETY: `d` is a valid DIR stream.
@@ -968,25 +1032,45 @@ fn list_subdir_names(dir_fd: &OwnedFd) -> Vec<String> {
         if ent.is_null() {
             break;
         }
+        // SAFETY: `d_name` is NUL-terminated.
+        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) }.to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
         let d_type = unsafe { (*ent).d_type };
+        let s_opt = std::str::from_utf8(name).ok();
+        if name == b".veil" || s_opt.is_some_and(is_reserved_name) {
+            let non_file = match d_type {
+                libc::DT_REG => false,
+                libc::DT_UNKNOWN => {
+                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                    let rc = unsafe {
+                        libc::fstatat(
+                            dir_fd.as_raw_fd(),
+                            (*ent).d_name.as_ptr(),
+                            &mut st,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    };
+                    rc == 0 && (st.st_mode & libc::S_IFMT) != libc::S_IFREG
+                }
+                _ => true,
+            };
+            if non_file {
+                holds_repo = true;
+            }
+            continue;
+        }
         if d_type != libc::DT_DIR && d_type != libc::DT_UNKNOWN {
             continue;
         }
-        // SAFETY: `d_name` is NUL-terminated.
-        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) }.to_bytes();
-        if name == b"." || name == b".." || name == b".veil" {
-            continue;
-        }
-        let Ok(s) = std::str::from_utf8(name) else {
+        let Some(s) = s_opt.filter(|s| valid_component(s)) else {
             continue;
         };
-        if !valid_component(s) || is_reserved_name(s) {
-            continue;
-        }
         out.push(s.to_string());
     }
     // SAFETY: `d` came from `fdopendir`.
     unsafe { libc::closedir(d) };
     out.sort();
-    out
+    (holds_repo, out)
 }

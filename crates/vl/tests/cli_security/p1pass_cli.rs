@@ -1607,7 +1607,6 @@ fn class_1802_personal_private_keys_stay_isolated_under_every_policy_and_crafted
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "BUG-1804: daemon watcher skips nested .veil directory events, diverging from full scan"]
 fn bug_1804_watcher_tracks_nested_dot_veil_creation_and_removal_like_full_scan() {
     let env = Env::new();
     let _daemon = DaemonStop { env: &env, user: "alice" };
@@ -1642,4 +1641,87 @@ fn bug_1804_watcher_tracks_nested_dot_veil_creation_and_removal_like_full_scan()
         st_w["changes"], st_s["changes"],
         "watched status missed nested sub/.veil creation:\nwatched: {st_w}\nscanned: {st_s}"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn class_1804_watcher_matches_full_scan_across_nested_dot_veil_transitions() {
+    let env = Env::new();
+    let _daemon = DaemonStop { env: &env, user: "alice" };
+
+    let watched = env.dir("watched-class-1804");
+    let scanned = env.dir("scanned-class-1804");
+    for p in [&watched, &scanned] {
+        write(p, "sub/hello.txt", "v1\n");
+        write(p, "sub/deep/world.txt", "deep-v1\n");
+        write(p, "a/b/leaf.txt", "leaf\n");
+        write(p, "sym/file.txt", "sym\n");
+        write(p, "reg/keep.txt", "keep\n");
+        // `pre/` starts out as a nested repository BEFORE watcher registration.
+        write(p, "pre/.veil/repo.json", "{}\n");
+        write(p, "pre/deep/item.txt", "pre-item\n");
+        env.ok("alice", p, &["init"]);
+    }
+    write(&scanned, ".veil/local/config.toml", "watch = false\n");
+    for p in [&watched, &scanned] {
+        env.ok("alice", p, &["commit", "-m", "initial"]);
+    }
+
+    let assert_parity = |step: &str| {
+        let st_w: serde_json::Value = serde_json::from_str(&env.stdout("alice", &watched, &["status", "--json"])).unwrap();
+        let st_s: serde_json::Value = serde_json::from_str(&env.stdout("alice", &scanned, &["status", "--json"])).unwrap();
+        assert_eq!(
+            st_w["changes"], st_s["changes"],
+            "step '{step}': watched vs scanned diverged:\nwatched: {st_w}\nscanned: {st_s}"
+        );
+        st_w
+    };
+
+    // Prime watcher registration.
+    assert_parity("initial registration");
+    let ck: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(watched.join(".veil/local/checkout.json")).unwrap()).unwrap();
+    assert!(ck.get("watch").is_some(), "watcher must record a watch token on Linux: {ck}");
+
+    // 1. Removing `.veil` from pre-existing nested repo `pre/` exposes `pre/deep/item.txt`,
+    // and subsequent edits inside `pre/deep/` are tracked by newly attached child watches.
+    for p in [&watched, &scanned] {
+        std::fs::remove_dir_all(p.join("pre/.veil")).unwrap();
+    }
+    let st = assert_parity("remove pre/.veil");
+    assert!(!st["changes"].as_array().unwrap().is_empty(), "{st}");
+    for p in [&watched, &scanned] {
+        env.ok("alice", p, &["commit", "-m", "track pre"]);
+        let _ = env.stdout("alice", p, &["status", "--json"]);
+    }
+    for p in [&watched, &scanned] {
+        write(p, "pre/deep/item.txt", "pre-item-v2\n");
+    }
+    assert_parity("edit pre/deep/item.txt after un-nesting");
+
+    // 2. Creating `sub/.veil`, committing deletion, then removing `sub/.veil` and editing `sub/deep/world.txt`.
+    for p in [&watched, &scanned] {
+        write(p, "sub/.veil/repo.json", "{}\n");
+    }
+    assert_parity("create sub/.veil");
+    for p in [&watched, &scanned] {
+        env.ok("alice", p, &["commit", "-m", "nested sub"]);
+        let _ = env.stdout("alice", p, &["status", "--json"]);
+    }
+    for p in [&watched, &scanned] {
+        std::fs::remove_dir_all(p.join("sub/.veil")).unwrap();
+    }
+    assert_parity("remove sub/.veil");
+    for p in [&watched, &scanned] {
+        write(p, "sub/deep/world.txt", "deep-v2\n");
+    }
+    assert_parity("edit sub/deep/world.txt after removing sub/.veil");
+
+    // 3. Case-variant `a/b/.VEIL`, symlink `sym/.veil`, and regular file `reg/.veil` (not a repo).
+    for p in [&watched, &scanned] {
+        std::fs::create_dir_all(p.join("a/b/.VEIL")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent-veil-dir", p.join("sym/.veil")).unwrap();
+        write(p, "reg/.veil", "plain file, not a repo\n");
+    }
+    assert_parity("case .VEIL, symlink .veil, and regular file .veil");
 }
