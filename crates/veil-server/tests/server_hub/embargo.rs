@@ -1410,3 +1410,201 @@ fn s17_release_landing_records_author_leaves_bulkhead_gates_and_lands_once_acros
     assert_eq!(older_author, sec_pid, "older landed snapshot must record sec's author id");
 }
 
+/// Review 5 (S24 part B × S22): the consolidated background transaction
+/// (`derive::landing`) never derives, memoizes or indexes a hidden embargo
+/// branch or its snapshots before release (`hidden_for_embargo IS NULL` in
+/// every derive, memo and search query, and `is_withheld_for_query` in
+/// `derive::ensure`), even when public landings trigger `derive::landing`
+/// alongside the embargo. After release they are derived once.
+#[test]
+fn s24b_consolidated_derive_pass_never_derives_memoizes_or_indexes_hidden_embargo_before_release_and_derives_once_after() {
+    const EMB_CODE: &str = "EMBARGO-S24B-SECRET-TOKEN-9942";
+    const EMB_PATH: &str = "src/embargo_s24b_secret.rs";
+
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    let h = hub.hub();
+    let pid: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&h.db))
+        .unwrap();
+
+    // 1. `p.sec` pushes an embargoed change to `embargo/<eid>`.
+    let sec_dir = p.sec.dir("sec-s24b");
+    p.sec.ok(p.sec.home.path(), &["clone", &hub.url(&p.name), sec_dir.to_str().unwrap()]);
+    write_files(&sec_dir, &[(EMB_PATH, &format!("pub const S24B: &str = \"{EMB_CODE}\";\n"))]);
+    p.sec.ok(&sec_dir, &["commit", "--no-advance", "-m", "embargoed s24b fix"]);
+    let fix_hex = p.sec.ok(&sec_dir, &["log", "-r", "@-", "-n", "1", "--json"]);
+    let fix_id = ObjectId::from_hex(
+        serde_json::from_str::<Value>(&fix_hex).unwrap()["entries"][0]["snapshot_id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let until = iso_utc(veil_core::now_millis() + 3_600_000);
+    let merge_out = p.sec.ok(
+        &sec_dir,
+        &["merge", "@-", "--into", "main", "--embargo-for", "security", "--until", &until, "-m", "embargo s24b merge"],
+    );
+    let eid = parse_embargo_id(&merge_out);
+    let merge_hex = p.sec.ok(&sec_dir, &["log", "-r", "main", "-n", "1", "--json"]);
+    let merge_id = ObjectId::from_hex(
+        serde_json::from_str::<Value>(&merge_hex).unwrap()["entries"][0]["snapshot_id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    p.sec.ok(&sec_dir, &["push"]);
+    let ebranch = format!("embargo/{eid}");
+
+    // 2. Now `p.dev` lands a normal public change on `main`, triggering S24b's
+    //    consolidated `derive::landing` pass (`prepare_landing_run` + `finish_landing_run`),
+    //    and we also invoke `derive::landing`, `derive::resume`, `search::index::resume`,
+    //    and `derive::ensure` directly.
+    let api = hub.api();
+    let dev_tok = p.dev.token();
+    let main_base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let r_pub = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({
+            "onto": "main",
+            "base": main_base.hex(),
+            "description": "public change alongside embargo",
+            "edits": [{"path": "src/public_s24b.rs", "put": {"text": "pub const PUB: u32 = 1;\n"}}],
+            "wait": true
+        }),
+    );
+    assert_eq!(r_pub.status, 200, "{}", String::from_utf8_lossy(&r_pub.body));
+    assert_eq!(r_pub.json()["state"], "landed");
+
+    let stats = hub.rt.block_on(veil_server::derive::landing(&h, pid, vec!["main".into(), ebranch.clone()])).unwrap();
+    assert!(!stats.branches.contains(&ebranch), "derive::landing must skip hidden embargo branch: {stats:?}");
+    hub.rt.block_on(veil_server::derive::resume(h.clone(), Some(pid)));
+    hub.rt.block_on(veil_server::search::index::resume(h.clone(), Some(pid)));
+
+    // Calling `derive::ensure` on an unreleased embargo snapshot is refused as not_found.
+    for embargo_snap in [fix_id, merge_id] {
+        let err = hub.rt.block_on(veil_server::derive::ensure(&h, pid, embargo_snap)).unwrap_err();
+        assert!(format!("{err:?}").contains("no such snapshot"), "derive::ensure must refuse embargo snapshot: {err:?}");
+    }
+
+    // 3. Verify that in the database, `graph`, `derive_progress`, `file_history`,
+    //    `view_graph`, `view_file_history`, and `search_heads` have ZERO rows for
+    //    `embargo/<eid>` or its snapshots (`fix_id`, `merge_id`), and `health` does
+    //    not count `embargo/<eid>` in `derive.branches` or `derive.branches_behind`.
+    let emb_snaps: Vec<String> = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT snapshot FROM embargo_snapshots WHERE project_id = $1 AND embargo_id = $2")
+                .bind(pid)
+                .bind(&eid)
+                .fetch_all(&h.db),
+        )
+        .unwrap();
+    assert!(!emb_snaps.is_empty(), "embargo_snapshots must record embargoed snapshots");
+
+    let graph_cnt: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT COUNT(*) FROM graph WHERE project_id = $1 AND snapshot = ANY($2)")
+                .bind(pid)
+                .bind(&emb_snaps)
+                .fetch_one(&h.db),
+        )
+        .unwrap();
+    assert_eq!(graph_cnt, 0, "no embargo snapshot may be in graph before release");
+
+    let fh_cnt: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT COUNT(*) FROM file_history WHERE project_id = $1 AND snapshot = ANY($2)")
+                .bind(pid)
+                .bind(&emb_snaps)
+                .fetch_one(&h.db),
+        )
+        .unwrap();
+    assert_eq!(fh_cnt, 0, "no embargo snapshot may be in file_history before release");
+
+    let dp_cnt: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT COUNT(*) FROM derive_progress WHERE project_id = $1 AND branch = $2")
+                .bind(pid)
+                .bind(&ebranch)
+                .fetch_one(&h.db),
+        )
+        .unwrap();
+    assert_eq!(dp_cnt, 0, "hidden embargo branch must not appear in derive_progress");
+
+    let vg_cnt: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT COUNT(*) FROM view_graph WHERE project_id = $1 AND snapshot = ANY($2)")
+                .bind(pid)
+                .bind(&emb_snaps)
+                .fetch_one(&h.db),
+        )
+        .unwrap();
+    assert_eq!(vg_cnt, 0, "no embargo snapshot may be memoized in view_graph before release");
+
+    let vfh_cnt: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT COUNT(*) FROM view_file_history WHERE project_id = $1 AND snapshot = ANY($2)")
+                .bind(pid)
+                .bind(&emb_snaps)
+                .fetch_one(&h.db),
+        )
+        .unwrap();
+    assert_eq!(vfh_cnt, 0, "no embargo snapshot may be memoized in view_file_history before release");
+
+    let sh_cnt: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT COUNT(*) FROM search_heads WHERE project_id = $1 AND branch = $2")
+                .bind(pid)
+                .bind(&ebranch)
+                .fetch_one(&h.db),
+        )
+        .unwrap();
+    assert_eq!(sh_cnt, 0, "hidden embargo branch must not appear in search_heads");
+
+    // Search for `EMB_CODE` and `embargo_s24b_secret` returns 0 hits even for admin before release.
+    let admin_tok = p.admin.token();
+    let g_res = api.get(Some(&admin_tok), &format!("/v1/projects/{}/q/grep?pattern={EMB_CODE}", p.name));
+    assert_eq!(g_res.status, 200, "{}", String::from_utf8_lossy(&g_res.body));
+    assert_eq!(g_res.json()["files"].as_array().unwrap().len(), 0);
+    let s_res = api.get(Some(&admin_tok), &format!("/v1/projects/{}/q/search?q=embargo_s24b_secret&kind=path", p.name));
+    assert_eq!(s_res.status, 200, "{}", String::from_utf8_lossy(&s_res.body));
+    assert_eq!(s_res.json()["results"].as_array().unwrap().len(), 0);
+
+    // Health endpoint reports `branches_behind == 0` (the hidden embargo branch is excluded).
+    let health = api.get(Some(&admin_tok), &format!("/v1/projects/{}/health", p.name));
+    assert_eq!(health.status, 200);
+    assert_eq!(health.json()["derive"]["branches_behind"], 0, "{}", health.json());
+
+    // 4. Release the embargo: the changes land on `main`, and the consolidated
+    //    background pass (`derive::landing`) derives, memoizes and indexes them once.
+    let rel = api.post_json(
+        Some(&p.sec.token()),
+        &format!("/v1/projects/{}/embargoes/{eid}/release", p.name),
+        &json!({}),
+    );
+    assert_eq!(rel.status, 200, "{}", String::from_utf8_lossy(&rel.body));
+    assert_eq!(rel.json()["released"], true);
+
+    let stats_after = hub.rt.block_on(veil_server::derive::landing(&h, pid, vec!["main".into()])).unwrap();
+    let stats_second = hub.rt.block_on(veil_server::derive::landing(&h, pid, vec!["main".into()])).unwrap();
+    assert_eq!(stats_second.snapshots, 0, "after release, a second derive pass derives 0 new snapshots (derived once): {stats_after:?}, {stats_second:?}");
+
+    let g_after = api.get(Some(&dev_tok), &format!("/v1/projects/{}/q/grep?pattern={EMB_CODE}", p.name));
+    assert_eq!(g_after.status, 200, "{}", String::from_utf8_lossy(&g_after.body));
+    assert_eq!(g_after.json()["files"].as_array().unwrap().len(), 1, "after release, grep finds the landed embargo code");
+    let s_after = api.get(Some(&dev_tok), &format!("/v1/projects/{}/q/search?q=embargo_s24b_secret&kind=path", p.name));
+    assert_eq!(s_after.status, 200, "{}", String::from_utf8_lossy(&s_after.body));
+    assert_eq!(s_after.json()["results"].as_array().unwrap().len(), 1, "after release, filename search finds the landed embargo file");
+}
+
+

@@ -286,8 +286,12 @@ impl<'a> G<'a> {
     /// written again by the next fill. A row without the `files` mark (an
     /// S13 server's, which writes graph rows only: BUG-1210) is not read as
     /// present; filling it again marks it.
-    fn add(&self, rows: &[(ObjectId, Arc<VRow>, ChangeId)]) -> Result<()> {
-        let hub = self.cx.hub();
+    pub(crate) async fn write_rows_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        project: i64,
+        vk: &str,
+        rows: &[(ObjectId, Arc<VRow>, ChangeId)],
+    ) -> std::result::Result<(), sqlx::Error> {
         for chunk in rows.chunks(ROWS_PER_STATEMENT) {
             let ids: Vec<String> = chunk.iter().map(|(i, _, _)| i.hex()).collect();
             let gens: Vec<i64> = chunk.iter().map(|(_, r, _)| r.generation).collect();
@@ -298,37 +302,35 @@ impl<'a> G<'a> {
             let downs: Vec<String> = chunk.iter().map(|(_, r, _)| r.down.hex()).collect();
             let reals: Vec<String> = chunk.iter().map(|(_, r, _)| r.real.hex()).collect();
             let changes: Vec<String> = chunk.iter().map(|(_, _, c)| hex::encode(c.0)).collect();
-            self.cx.db(|| {
-                sqlx::query(
-                    "INSERT INTO view_changes (project_id, view_key, change_id, snapshot, flags) \
-                     SELECT $1, $2, * FROM UNNEST($3::text[], $4::text[], $5::int[]) \
-                     ON CONFLICT DO NOTHING",
-                )
-                .bind(self.cx.project())
-                .bind(self.vk)
-                .bind(&changes)
-                .bind(&ids)
-                .bind(&flags)
-                .execute(&hub.db)
-            })?;
-            self.cx.db(|| {
-                sqlx::query(
-                    "INSERT INTO view_graph (project_id, view_key, snapshot, generation, depth, parents, flags, skip, down_id, real_id, files) \
-                     SELECT $1, $2, *, TRUE FROM UNNEST($3::text[], $4::bigint[], $5::bigint[], $6::text[], $7::int[], $8::text[], $9::text[], $10::text[]) \
-                     ON CONFLICT (project_id, view_key, snapshot) DO UPDATE SET files = TRUE WHERE view_graph.files IS NOT TRUE",
-                )
-                .bind(self.cx.project())
-                .bind(self.vk)
-                .bind(&ids)
-                .bind(&gens)
-                .bind(&depths)
-                .bind(&parents)
-                .bind(&flags)
-                .bind(&skips)
-                .bind(&downs)
-                .bind(&reals)
-                .execute(&hub.db)
-            })?;
+            sqlx::query(
+                "INSERT INTO view_changes (project_id, view_key, change_id, snapshot, flags) \
+                 SELECT $1, $2, * FROM UNNEST($3::text[], $4::text[], $5::int[]) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(project)
+            .bind(vk)
+            .bind(&changes)
+            .bind(&ids)
+            .bind(&flags)
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO view_graph (project_id, view_key, snapshot, generation, depth, parents, flags, skip, down_id, real_id, files) \
+                 SELECT $1, $2, *, TRUE FROM UNNEST($3::text[], $4::bigint[], $5::bigint[], $6::text[], $7::int[], $8::text[], $9::text[], $10::text[]) \
+                 ON CONFLICT (project_id, view_key, snapshot) DO UPDATE SET files = TRUE WHERE view_graph.files IS NOT TRUE",
+            )
+            .bind(project)
+            .bind(vk)
+            .bind(&ids)
+            .bind(&gens)
+            .bind(&depths)
+            .bind(&parents)
+            .bind(&flags)
+            .bind(&skips)
+            .bind(&downs)
+            .bind(&reals)
+            .execute(&mut **tx)
+            .await?;
         }
         Ok(())
     }
@@ -589,6 +591,7 @@ pub async fn extend(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[
             absent: HashSet::new(),
             rows: HashMap::new(),
             pending: Vec::new(),
+            inline_cap: false,
         };
         let r = (|| {
             for (t, p) in &pairs {
@@ -623,6 +626,7 @@ struct Walk<'w, 'g, 'a> {
     rows: HashMap<ObjectId, Arc<VRow>>,
     /// Rows not written yet, parents first, with their change ids.
     pending: Vec<(ObjectId, Arc<VRow>, ChangeId)>,
+    inline_cap: bool,
 }
 
 impl Walk<'_, '_, '_> {
@@ -736,6 +740,9 @@ impl Walk<'_, '_, '_> {
             self.rows.insert(px, row.clone());
             self.fill.add(self.g, self.t, px, &row)?;
             self.pending.push((px, row, ps.change_id));
+            if self.inline_cap && (self.pending.len() >= 16 || self.fill.pending.len() >= 64) {
+                return Err(bad("inline fill exceeded cap"));
+            }
             if self.pending.len() >= ROWS_PER_STATEMENT || self.fill.pending.len() >= 4 * ROWS_PER_STATEMENT {
                 self.flush()?;
             }
@@ -747,12 +754,209 @@ impl Walk<'_, '_, '_> {
         if self.pending.is_empty() {
             return Ok(());
         }
+        let cx = self.g.cx;
+        let hub = cx.hub();
+        let project = cx.project();
+        let vk = self.g.vk;
+        let files = std::mem::take(&mut self.fill.pending);
+        let graph = std::mem::take(&mut self.pending);
+        self.fill.forget_if_large();
         // File history first: a graph row's presence means its file
         // history is there.
-        self.fill.flush(self.g)?;
-        self.g.add(&self.pending)?;
-        self.pending.clear();
-        Ok(())
+        cx.db(|| async {
+            let mut tx = hub.db.begin().await?;
+            FileFill::write_rows_tx(&mut tx, project, vk, &files).await?;
+            G::write_rows_tx(&mut tx, project, vk, &graph).await?;
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+}
+
+/// Prepared projection memos and viewer-graph rows for a landing's
+/// background derive transaction (BUG-1593).
+pub(crate) struct PreparedViewKey {
+    pub viewer: Viewer,
+    pub vk: String,
+    pub projections: Vec<(ObjectId, ObjectId, bool)>,
+    pub files: Vec<(String, i64, ObjectId, String)>,
+    pub graph: Vec<(ObjectId, Arc<VRow>, ChangeId)>,
+}
+
+#[derive(Default)]
+pub(crate) struct PreparedMemo {
+    pub keys: Vec<PreparedViewKey>,
+    pub fallback: Vec<Viewer>,
+}
+
+pub(crate) async fn prepare_memo(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewers: Vec<Viewer>,
+    tips: &[ObjectId],
+) -> Result<PreparedMemo> {
+    let mut out = PreparedMemo::default();
+    if tips.is_empty() {
+        return Ok(out);
+    }
+    let now = veil_core::now_millis();
+    let leased: HashSet<String> = sqlx::query_scalar("SELECT view_key FROM view_fills WHERE project_id = $1 AND expires_at >= $2")
+        .bind(project.id)
+        .bind(now)
+        .fetch_all(&hub.db)
+        .await?
+        .into_iter()
+        .collect();
+    let mut seen_keys = HashSet::new();
+    for viewer in viewers {
+        let view = project.view(&viewer);
+        if !view.sees_anything() {
+            continue;
+        }
+        let vk = view.key();
+        if !seen_keys.insert(vk.clone()) {
+            continue;
+        }
+        let running = hub.query.fills.lock().unwrap().contains_key(&(project.id, vk.clone()));
+        if running || leased.contains(&vk) {
+            out.fallback.push(viewer);
+            continue;
+        }
+        if warm(hub, project.id, &vk, viewer.admin, tips).await?.is_some() {
+            continue;
+        }
+        let mut deferred = sync::Deferred::default();
+        let mut ps = Vec::with_capacity(tips.len());
+        let mut proj_ok = true;
+        for t in tips {
+            match sync::projected_inner(hub, project, &viewer, *t, Some(&mut deferred)).await {
+                Ok(p) => ps.push(p),
+                Err(_) => {
+                    proj_ok = false;
+                    break;
+                }
+            }
+        }
+        if !proj_ok {
+            out.fallback.push(viewer);
+            continue;
+        }
+        let mut projections = Vec::with_capacity(deferred.rows.len());
+        let mut pmap = HashMap::from([(root(), root())]);
+        for (_, r, p) in &deferred.rows {
+            pmap.insert(*r, *p);
+            projections.push((*r, *p, deferred.collapsed.contains(r)));
+        }
+        for (t, p) in tips.iter().copied().zip(ps.iter().copied()) {
+            pmap.insert(t, p);
+        }
+        let admin = viewer.admin;
+        let vk2 = vk.clone();
+        let (project2, viewer2, tips2) = (project.clone(), viewer.clone(), tips.to_vec());
+        let walked = blocking(hub, project.id, move |cx| {
+            let g = G::new(cx, &vk2, None);
+            let view = project2.view(&viewer2);
+            let t = Trees::new(&g, &view);
+            let mut w = Walk {
+                g: &g,
+                t: &t,
+                fill: FileFill::default(),
+                admin,
+                pmap,
+                present: HashSet::new(),
+                absent: HashSet::new(),
+                rows: HashMap::new(),
+                pending: Vec::new(),
+                inline_cap: true,
+            };
+            for tip in &tips2 {
+                w.walk(*tip)?;
+            }
+            Ok((w.fill.pending, w.pending))
+        })
+        .await;
+        match walked {
+            Ok((files, graph)) => {
+                out.keys.push(PreparedViewKey {
+                    viewer,
+                    vk,
+                    projections,
+                    files,
+                    graph,
+                });
+            }
+            Err(_) => {
+                out.fallback.push(viewer);
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) async fn write_prepared_memo(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    project_id: i64,
+    memo: &PreparedMemo,
+) -> Result<(Vec<Viewer>, HashSet<String>)> {
+    let mut fallback = Vec::new();
+    let mut skip_vks = HashSet::new();
+    let now = veil_core::now_millis();
+    for k in &memo.keys {
+        if !k.projections.is_empty() {
+            let vks: Vec<&str> = k.projections.iter().map(|_| k.vk.as_str()).collect();
+            let reals: Vec<String> = k.projections.iter().map(|(r, _, _)| r.hex()).collect();
+            let projs: Vec<String> = k.projections.iter().map(|(_, p, _)| p.hex()).collect();
+            let collapsed: Vec<bool> = k.projections.iter().map(|(_, _, c)| *c).collect();
+            let stored: Vec<(String, String)> = sqlx::query_as(
+                "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) \
+                 SELECT $1, $2, r, p, $5, c FROM UNNEST($3::text[], $4::text[], $6::bool[]) AS t(r, p, c) \
+                 ON CONFLICT (project_id, view_key, real_id) DO UPDATE SET created_at = projections.created_at \
+                 RETURNING real_id, projected_id",
+            )
+            .bind(project_id)
+            .bind(&k.vk)
+            .bind(&reals)
+            .bind(&projs)
+            .bind(now)
+            .bind(&collapsed)
+            .fetch_all(&mut **tx)
+            .await?;
+            let _ = vks;
+            let mut mismatch = false;
+            let want: HashMap<&str, &str> = reals.iter().map(String::as_str).zip(projs.iter().map(String::as_str)).collect();
+            for (r, p) in &stored {
+                if want.get(r.as_str()).copied() != Some(p.as_str()) {
+                    mismatch = true;
+                    break;
+                }
+            }
+            if mismatch {
+                skip_vks.insert(k.vk.clone());
+                fallback.push(k.viewer.clone());
+                continue;
+            }
+        }
+        if !k.files.is_empty() {
+            FileFill::write_rows_tx(tx, project_id, &k.vk, &k.files).await?;
+        }
+        if !k.graph.is_empty() {
+            G::write_rows_tx(tx, project_id, &k.vk, &k.graph).await?;
+        }
+    }
+    Ok((fallback, skip_vks))
+}
+
+pub(crate) fn cache_prepared_memo(hub: &Hub, project_id: i64, memo: &PreparedMemo, skip_vks: &HashSet<String>) {
+    for k in &memo.keys {
+        if skip_vks.contains(&k.vk) {
+            continue;
+        }
+        for (r, p, _) in &k.projections {
+            hub.caches.put_memo(project_id, &k.vk, r, p);
+        }
+        for (id, row, _) in &k.graph {
+            hub.query.rows.insert(cache_key(project_id, &k.vk, id), row.clone(), 320);
+        }
     }
 }
 

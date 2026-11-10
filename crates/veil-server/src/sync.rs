@@ -352,15 +352,15 @@ pub async fn projected(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, real:
 /// its new snapshots are worked out before its transaction and written in it
 /// (one commit per push, `storage-and-cost.md` §3).
 #[derive(Default)]
-struct Deferred {
+pub(crate) struct Deferred {
     /// The push's new real snapshots, each with the pusher's own snapshot
     /// the server completed it from.
-    fresh: HashMap<ObjectId, Option<ObjectId>>,
+    pub(crate) fresh: HashMap<ObjectId, Option<ObjectId>>,
     /// Memo rows `(view key, real, projected)` for the push's transaction.
-    rows: Vec<(String, ObjectId, ObjectId)>,
+    pub(crate) rows: Vec<(String, ObjectId, ObjectId)>,
     /// Those of them whose real snapshot collapsed into its first parent's
     /// projection (a change hidden from that view).
-    collapsed: HashSet<ObjectId>,
+    pub(crate) collapsed: HashSet<ObjectId>,
     /// The push's uploads and made objects (its new snapshots are there).
     staged: Option<Arc<Staged>>,
     /// The projections it signed, among the made objects, for its pack.
@@ -416,7 +416,7 @@ async fn projected_predecessors(
     Ok(out)
 }
 
-async fn projected_inner(
+pub(crate) async fn projected_inner(
     hub: &Arc<Hub>,
     project: &Project,
     viewer: &Viewer,

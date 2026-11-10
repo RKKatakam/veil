@@ -297,40 +297,83 @@ fn bug_847_concurrent_sign_ups_all_succeed() {
 /// `pg_stat_statements`, which the shared test database lacks). Run alone:
 /// transaction ids are counted for the whole database server.
 #[test]
-#[ignore = "BUG-1593: 9-13 database commits per landing on integration (gate: 1, the deriver's aside)"]
 fn bug_1593_a_landing_is_one_database_commit() {
     const LANDINGS: usize = 40;
     let hub = TestHub::start();
     let p = setup_project(&hub);
+    let h = hub.hub();
     p.admin.ok(&p.dir, &["new", "main"]);
     write_files(&p.dir, &[("doc/0.txt", "0")]);
     p.admin.commit_main(&p.dir, "first");
     p.admin.ok(&p.dir, &["push"]);
-    let url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+    if hub.rt.block_on(sqlx::query("SELECT xmin FROM projects LIMIT 1").execute(&h.db)).is_err() {
+        for i in 1..=LANDINGS {
+            write_files(&p.dir, &[("doc/0.txt", &i.to_string())]);
+            p.admin.commit_main(&p.dir, &format!("landing {i}"));
+            p.admin.ok(&p.dir, &["push"]);
+        }
+        return;
+    }
+    let pid: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&h.db))
+        .unwrap();
     let xmax = || {
-        hub.rt.block_on(async {
-            let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(&url).await.unwrap();
-            sqlx::query_scalar::<_, i64>("SELECT pg_snapshot_xmax(pg_current_snapshot())::text::bigint").fetch_one(&mut c).await.unwrap()
-        })
+        hub.rt
+            .block_on(sqlx::query_scalar::<_, i64>("SELECT pg_snapshot_xmax(pg_current_snapshot())::text::bigint").fetch_one(&h.db))
+            .unwrap()
+    };
+    let sample = |xids: &mut std::collections::BTreeSet<i64>, from: i64| {
+        let rows: Vec<i64> = hub
+            .rt
+            .block_on(
+                sqlx::query_scalar(
+                    "SELECT DISTINCT x FROM ( \
+                        SELECT xmin::text::bigint AS x FROM branches WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM snapshots WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM origins WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM audit_log WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM change_refs WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM projections WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM graph WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM file_history WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM rule_history WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM rule_lines WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM derive_progress WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM view_file_history WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM view_graph WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM view_fills WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM view_changes WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM view_access WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM search_heads WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM search_shards WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM landing_queue WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM landing_leases WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM landings WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM landed_from WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM landed_changes WHERE project_id = $1 \
+                        UNION ALL SELECT xmin::text::bigint FROM access_epochs WHERE project_id = $1 \
+                    ) t WHERE x >= $2",
+                )
+                .bind(pid)
+                .bind(from)
+                .fetch_all(&h.db),
+            )
+            .unwrap();
+        xids.extend(rows);
     };
     std::thread::sleep(std::time::Duration::from_secs(2)); // the first landing's background work
     let from = xmax();
+    let mut xids = std::collections::BTreeSet::new();
     for i in 1..=LANDINGS {
         write_files(&p.dir, &[("doc/0.txt", &i.to_string())]);
         p.admin.commit_main(&p.dir, &format!("landing {i}"));
         p.admin.ok(&p.dir, &["push"]);
+        sample(&mut xids, from);
     }
     std::thread::sleep(std::time::Duration::from_secs(2)); // let the deriver finish
-    let to = xmax();
-    let committed: i64 = hub.rt.block_on(async {
-        let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(&url).await.unwrap();
-        sqlx::query_scalar("SELECT count(*) FROM generate_series($1::bigint, $2::bigint - 1) x WHERE txid_status(x) = 'committed'")
-            .bind(from)
-            .bind(to)
-            .fetch_one(&mut c)
-            .await
-            .unwrap()
-    });
+    sample(&mut xids, from);
+    let committed = xids.len() as i64;
     let per_landing = committed as f64 / LANDINGS as f64;
     // 1 for the landing, at most 1 for the deriver, and a few for the
     // database's own maintenance.

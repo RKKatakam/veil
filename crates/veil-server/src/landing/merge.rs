@@ -694,9 +694,23 @@ async fn finish_terminal(
         match res.state {
             LandState::Conflict => {
                 hub.landing.stats.conflicts.fetch_add(1, Ordering::Relaxed);
+                hub.limits.health.record(
+                    job.project,
+                    &crate::limits::health::Counts {
+                        landing_conflicts: 1,
+                        ..Default::default()
+                    },
+                );
             }
             LandState::Rejected => {
                 hub.landing.stats.rejected.fetch_add(1, Ordering::Relaxed);
+                hub.limits.health.record(
+                    job.project,
+                    &crate::limits::health::Counts {
+                        landing_rejected: 1,
+                        ..Default::default()
+                    },
+                );
             }
             _ => {}
         }

@@ -170,30 +170,50 @@ impl Fill {
     pub fn flush(&mut self, g: &G) -> Result<()> {
         let cx = g.cx;
         let pool = &cx.hub().db;
-        for chunk in self.pending.chunks(ROWS_PER_STATEMENT) {
-            let keys: Vec<&str> = chunk.iter().map(|r| r.0.as_str()).collect();
-            let depths: Vec<i64> = chunk.iter().map(|r| r.1).collect();
-            let ids: Vec<String> = chunk.iter().map(|r| r.2.hex()).collect();
-            let changes: Vec<&str> = chunk.iter().map(|r| r.3.as_str()).collect();
-            cx.db(|| {
-                sqlx::query(
-                    "INSERT INTO view_file_history (project_id, view_key, path_key, depth, snapshot, change) \
-                     SELECT $1, $2, * FROM UNNEST($3::text[], $4::bigint[], $5::text[], $6::text[]) ON CONFLICT DO NOTHING",
-                )
-                .bind(cx.project())
-                .bind(g.vk)
-                .bind(&keys)
-                .bind(&depths)
-                .bind(&ids)
-                .bind(&changes)
-                .execute(pool)
+        let pending = std::mem::take(&mut self.pending);
+        if !pending.is_empty() {
+            cx.db(|| async {
+                let mut tx = pool.begin().await?;
+                Self::write_rows_tx(&mut tx, cx.project(), g.vk, &pending).await?;
+                tx.commit().await?;
+                Ok(())
             })?;
         }
-        self.pending.clear();
+        self.forget_if_large();
+        Ok(())
+    }
+
+    pub(crate) fn forget_if_large(&mut self) {
         if self.known_rows > KNOWN_ROWS {
             self.known.clear();
             self.known_rows = 0;
             self.fresh.clear();
+        }
+    }
+
+    pub(crate) async fn write_rows_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        project: i64,
+        vk: &str,
+        rows: &[(String, i64, ObjectId, String)],
+    ) -> std::result::Result<(), sqlx::Error> {
+        for chunk in rows.chunks(ROWS_PER_STATEMENT) {
+            let keys: Vec<&str> = chunk.iter().map(|r| r.0.as_str()).collect();
+            let depths: Vec<i64> = chunk.iter().map(|r| r.1).collect();
+            let ids: Vec<String> = chunk.iter().map(|r| r.2.hex()).collect();
+            let changes: Vec<&str> = chunk.iter().map(|r| r.3.as_str()).collect();
+            sqlx::query(
+                "INSERT INTO view_file_history (project_id, view_key, path_key, depth, snapshot, change) \
+                 SELECT $1, $2, * FROM UNNEST($3::text[], $4::bigint[], $5::text[], $6::text[]) ON CONFLICT DO NOTHING",
+            )
+            .bind(project)
+            .bind(vk)
+            .bind(&keys)
+            .bind(&depths)
+            .bind(&ids)
+            .bind(&changes)
+            .execute(&mut **tx)
+            .await?;
         }
         Ok(())
     }
@@ -1417,8 +1437,8 @@ async fn record_too_wide(hub: &crate::Hub, key: &JobKey, limits: BlameLimits, re
 /// key out of use (a request that loaded its viewer before the change) is
 /// dropped at the next change. Run after every write of such rows and at
 /// every landing (`derive::memo_tips`).
-pub async fn sweep_keys(hub: &crate::Hub, project: i64) -> Result<()> {
-    let row: Option<(String, Option<String>)> = sqlx::query_as(
+pub(crate) async fn current_view_access(hub: &crate::Hub, project: i64) -> Result<Option<(String, Option<String>)>> {
+    sqlx::query_as(
         "SELECT md5(p.policy_text || '|' || p.policy_bindings || '|' || \
              COALESCE((SELECT string_agg(a.person_id::text, ',' ORDER BY a.person_id) FROM project_admins a WHERE a.project_id = p.id), '') || '|' || \
              COALESCE((SELECT string_agg(m.person_id::text || ':' || m.group_id::text, ',' ORDER BY m.person_id, m.group_id) \
@@ -1428,8 +1448,12 @@ pub async fn sweep_keys(hub: &crate::Hub, project: i64) -> Result<()> {
     )
     .bind(project)
     .fetch_optional(&hub.db)
-    .await?;
-    let Some((access, recorded)) = row else { return Ok(()) };
+    .await
+    .map_err(Error::from)
+}
+
+pub async fn sweep_keys(hub: &crate::Hub, project: i64) -> Result<()> {
+    let Some((access, recorded)) = current_view_access(hub, project).await? else { return Ok(()) };
     if recorded.as_deref() == Some(access.as_str()) {
         return Ok(());
     }
