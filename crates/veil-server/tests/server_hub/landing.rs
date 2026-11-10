@@ -5556,7 +5556,7 @@ fn merge_attempts_cap_at_three_and_veilattributes_govern_content_merge() {
         &p.name,
         base0,
         json!([
-            put(".veilattributes", "*.lock -merge\nCHANGELOG.md merge=union\n"),
+            put("src/.veilattributes", "*.lock -merge\nCHANGELOG.md merge=union\n"),
             put("src/app.lock", "dep-a = 1\ndep-b = 1\ndep-c = 1\ndep-d = 1\ndep-e = 1\n"),
             put("src/CHANGELOG.md", "v1\n"),
         ]),
@@ -5865,11 +5865,9 @@ fn events_reach_only_authorized_viewers_and_respect_access_epochs_at_send_time()
 
 /// BUG-1682: `landing::seen` clears `paths` and `conflicts` and sets `message`
 /// to `"conflicts with changes you can't see"` when the viewer's access to a
-/// conflicting path was revoked after the conflict report was recorded, but
-/// forgets to clear `landed_since` (unlike `build_conflict`, which sets
-/// `landed_since` to empty on a hidden conflict).
+/// conflicting path was revoked after the conflict report was recorded, and
+/// also clears `landed_since` (just like `build_conflict` does).
 #[test]
-#[ignore = "BUG-1682: landing::seen leaves landed_since populated when redacting a conflict after access revocation"]
 fn bug_1682_seen_clears_landed_since_when_access_to_conflicting_path_is_revoked() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -5933,13 +5931,12 @@ fn bug_1682_seen_clears_landed_since_when_access_to_conflicting_path_is_revoked(
     );
 }
 
-/// BUG-1683: `ServerAttrSource::read_attributes` skips `!self.view.read(&rel)`
-/// when `dir.is_root()`, so a root `.veilattributes` that the submitter cannot
-/// read (private to admins because `.veilpolicy` grants only `src/`) still
-/// governs the submitter's content merges and reveals its rules (`-merge` vs
-/// default text merge) on `src/` files.
+/// BUG-1683: `ServerAttrSource::read_attributes` enforces `self.view.read(&rel)`
+/// at the root as well as in subdirectories, so a root `.veilattributes` that
+/// the submitter cannot read (private to admins because `.veilpolicy` grants
+/// only `src/`) does not govern the submitter's content merges or reveal its
+/// rules (`-merge` vs default text merge) on `src/` files.
 #[test]
-#[ignore = "BUG-1683: ServerAttrSource::read_attributes bypasses view.read on root .veilattributes"]
 fn bug_1683_unreadable_root_veilattributes_does_not_govern_non_admin_merge() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -6005,14 +6002,10 @@ fn bug_1683_unreadable_root_veilattributes_does_not_govern_non_admin_merge() {
     );
 }
 
-/// BUG-1684: `can_merge_entries` and `merge_entry_bytes` load, decode, and
-/// three-way merge arbitrarily large blobs in memory without a file-size cap
-/// (unlike `MAX_FILE = 1 MiB` on `.veilattributes` or `MAX_TEXT_BYTES = 1 MiB`
-/// in `query::trees` and `search`), and `merge_stack` holds all merged blobs
-/// and trees of a 64-change stack in `src.pending` and `objects` without
-/// flushing at `BATCH_BYTES` (8 MiB, BUG-1272).
+/// BUG-1684: `can_merge_entries` and `merge_entry_bytes` cap mergeable blobs at
+/// `MAX_MERGE_FILE_BYTES` (1 MiB) before loading/decoding, and `merge_stack`
+/// flushes held objects at `BATCH_BYTES` (8 MiB, BUG-1272).
 #[test]
-#[ignore = "BUG-1684: content merge has no per-file size bound and merge_stack never flushes at BATCH_BYTES"]
 fn bug_1684_large_files_and_stacks_in_content_merge_stay_bounded_in_memory() {
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -6088,6 +6081,17 @@ fn large_file_merge_in_a_child() {
     c2.objects.clear();
     c2.objects.shrink_to_fit();
 
+    hold(&hub, pid);
+    let q = api
+        .post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/land", p.name),
+            &json!({"onto": "main", "snapshot": snap.hex(), "receipts": map, "wait": false}),
+        )
+        .json();
+    assert_eq!(q["state"], "queued", "{q}");
+    let ticket = q["ticket"].as_str().unwrap().to_string();
+
     extern "C" {
         fn malloc_trim(pad: usize) -> i32;
     }
@@ -6095,16 +6099,10 @@ fn large_file_merge_in_a_child() {
     std::fs::write("/proc/self/clear_refs", "5").unwrap();
     let (start, _) = rss();
 
-    let res = api
-        .post_json(
-            Some(&dev_tok),
-            &format!("/v1/projects/{}/land", p.name),
-            &json!({"onto": "main", "snapshot": snap.hex(), "receipts": map, "wait": true}),
-        )
-        .json();
+    release(&hub, pid);
+    let res = outcome(&api, &dev_tok, &p.name, &ticket);
     let (_, peak) = rss();
     let grew_mib = peak.saturating_sub(start) >> 20;
-    let _ = pid;
     // A 12 MiB file should either be refused for content-merge as a conflict
     // without reading/decoding all three 12 MiB blobs twice, or keep peak growth
     // within `BATCH_BYTES` (8 MiB). Instead `can_merge` + `merge_entry_bytes`
@@ -6114,5 +6112,9 @@ fn large_file_merge_in_a_child() {
         res["state"] == "conflict" && grew_mib <= 16,
         "12 MiB file merge grew RSS by {grew_mib} MiB (state={}): {res}",
         res["state"]
+    );
+    assert!(
+        res["message"].as_str().is_some_and(|m| m.contains("too large to merge on the server")),
+        "expected actionable too-large conflict message: {res}"
     );
 }

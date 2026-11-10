@@ -465,6 +465,7 @@ pub async fn seen(hub: &Arc<Hub>, project: &crate::perm::Project, viewer: &crate
         if r.paths.iter().any(|p| !view.read(p)) || r.conflicts.iter().any(|c| !view.read(&c.path)) {
             r.paths.clear();
             r.conflicts.clear();
+            r.landed_since.clear();
             r.message = Some(merge::HIDDEN_CONFLICT.to_string());
         }
     }

@@ -68,6 +68,10 @@ pub const MAX_MERGES: u32 = 3;
 /// Most merge workers running at once on one server.
 pub const MAX_WORKERS: usize = 8;
 
+/// Largest plain-text file (in bytes) that the server content-merges; above
+/// this, an overlapping edit is answered `conflict` so the client merges it.
+pub const MAX_MERGE_FILE_BYTES: u64 = 1 << 20;
+
 /// The sole message when a conflict involves a path the receiver cannot read.
 pub const HIDDEN_CONFLICT: &str = "conflicts with changes you can't see";
 
@@ -94,6 +98,7 @@ pub struct ConflictReport {
     pub conflicts: Vec<ConflictPath>,
     pub landed_since: Vec<ObjectId>,
     pub hidden: bool,
+    pub too_large: bool,
     pub merges: u32,
     pub change_id: Option<ChangeId>,
 }
@@ -102,6 +107,11 @@ impl ConflictReport {
     pub fn into_result(self, ticket: &str, branch: &str) -> LandResult {
         let message = if self.hidden {
             Some(HIDDEN_CONFLICT.to_string())
+        } else if self.too_large {
+            Some(format!(
+                "a path this change edits changed on '{branch}' since its base and is too large to merge on the server (over {} MiB): get the branch's new tip, redo the change on it, and land it again",
+                MAX_MERGE_FILE_BYTES >> 20
+            ))
         } else {
             Some(format!(
                 "a path this change edits changed on '{branch}' since its base: get the branch's new tip, redo the change on it, and land it again"
@@ -154,7 +164,7 @@ impl AttrSource for ServerAttrSource<'_> {
         } else {
             format!("{}/{ATTRIBUTES_FILE}", dir.as_str())
         };
-        if !dir.is_root() && !self.view.read(&rel) {
+        if !self.view.read(&rel) {
             return Ok(None);
         }
         let e = match sync::entry_at(self.src, &self.tree, &rel) {
@@ -206,6 +216,7 @@ pub fn build_conflict(
     let mut conflicts = Vec::new();
     let mut overlapping_edits = Vec::new();
     let mut hidden = false;
+    let mut too_large = false;
 
     for c in set {
         if edits::fast_path(src, parent_tree, chain_tree, std::slice::from_ref(c))?.is_none() {
@@ -221,12 +232,28 @@ pub fn build_conflict(
             hidden = true;
             continue;
         }
+        let be = sync::entry_at(src, &parent_tree, &c.path)?;
+        let oe = sync::entry_at(src, &chain_tree, &c.path)?;
+        let te = c.new.clone();
+        if let (Some(oe), Some(te)) = (&oe, &te) {
+            if oe.kind == EntryKind::File
+                && te.kind == EntryKind::File
+                && oe.visibility == Visibility::Public
+                && te.visibility == Visibility::Public
+                && be.as_ref().is_none_or(|b| b.kind == EntryKind::File && b.visibility == Visibility::Public)
+                && (oe.size > MAX_MERGE_FILE_BYTES
+                    || te.size > MAX_MERGE_FILE_BYTES
+                    || be.as_ref().is_some_and(|b| b.size > MAX_MERGE_FILE_BYTES))
+            {
+                too_large = true;
+            }
+        }
         let leaf_id = |e: Option<TreeEntry>| -> Option<ObjectId> {
             e.filter(|x| x.kind != EntryKind::Dir && x.visibility == Visibility::Public).map(|x| x.id)
         };
-        let base_id = leaf_id(sync::entry_at(src, &parent_tree, &c.path)?);
-        let main_id = leaf_id(sync::entry_at(src, &chain_tree, &c.path)?);
-        let yours_id = leaf_id(c.new.clone());
+        let base_id = leaf_id(be);
+        let main_id = leaf_id(oe);
+        let yours_id = leaf_id(te);
         paths.push(c.path.clone());
         conflicts.push(ConflictPath {
             path: c.path.clone(),
@@ -260,6 +287,7 @@ pub fn build_conflict(
         conflicts,
         landed_since,
         hidden,
+        too_large: too_large && !hidden,
         merges,
         change_id,
     })
@@ -315,7 +343,8 @@ fn collect_landed_since(
 /// Returns `Ok(true)` if a merge worker should be spawned for it, or
 /// `Ok(false)` if it is definitely a conflict (e.g. `merges >= MAX_MERGES`,
 /// a merge commit, touches policy/rules, has a hidden conflict, or an
-/// overlapping path is not a plain-text `Public` file on both sides).
+/// overlapping path is not a plain-text `Public` file within
+/// [`MAX_MERGE_FILE_BYTES`] on both sides).
 #[allow(clippy::too_many_arguments)]
 pub fn can_merge(
     src: &Source,
@@ -358,7 +387,7 @@ pub fn can_merge(
             let Some(te) = &c.new else { return Ok(false) };
             let Some(oe) = sync::entry_at(src, &chain_tree, &c.path)? else { return Ok(false) };
             let be = sync::entry_at(src, parent_tree, &c.path)?;
-            if !can_merge_entries(src, &attrs, &c.path, be.as_ref(), &oe, te)? {
+            if !can_merge_entries(&attrs, &c.path, be.as_ref(), &oe, te) {
                 return Ok(false);
             }
         }
@@ -367,59 +396,40 @@ pub fn can_merge(
 }
 
 fn can_merge_entries(
-    src: &Source,
     attrs: &Attrs<'_>,
     path: &str,
     be: Option<&TreeEntry>,
     oe: &TreeEntry,
     te: &TreeEntry,
-) -> Result<bool> {
+) -> bool {
     if oe.kind != EntryKind::File || te.kind != EntryKind::File {
-        return Ok(false);
+        return false;
     }
     if oe.visibility != Visibility::Public || te.visibility != Visibility::Public {
-        return Ok(false);
+        return false;
+    }
+    if oe.size > MAX_MERGE_FILE_BYTES || te.size > MAX_MERGE_FILE_BYTES {
+        return false;
     }
     if let Some(b) = be {
-        if b.kind != EntryKind::File || b.visibility != Visibility::Public {
-            return Ok(false);
+        if b.kind != EntryKind::File || b.visibility != Visibility::Public || b.size > MAX_MERGE_FILE_BYTES {
+            return false;
         }
     }
-    let Ok(vp) = VPath::new(path) else { return Ok(false) };
+    let Ok(vp) = VPath::new(path) else { return false };
     let how = attrs.for_path(&vp).merge;
     if how == MergeAttr::Binary {
-        return Ok(false);
+        return false;
     }
-    let read_blob = |e: &TreeEntry| -> Result<Option<Vec<u8>>> {
-        Ok(match Object::decode(&src.raw(&e.id)?)? {
-            Object::Blob(b) => Some(b),
-            _ => None,
-        })
-    };
-    let Some(ours) = read_blob(oe)? else { return Ok(false) };
-    let Some(theirs) = read_blob(te)? else { return Ok(false) };
-    let base = match be {
-        Some(b) => match read_blob(b)? {
-            Some(d) => d,
-            None => return Ok(false),
-        },
-        None => Vec::new(),
-    };
-    if looks_binary(&base) || looks_binary(&ours) || looks_binary(&theirs) {
-        return Ok(false);
-    }
-    if ours == theirs {
-        return Ok(true);
+    if oe.id == te.id {
+        return true;
     }
     if how == MergeAttr::Union {
-        return Ok(true);
+        return true;
     }
     // Without a common base file, two different newly added files conflict
     // unless `merge=union` is set.
-    if be.is_none() {
-        return Ok(false);
-    }
-    Ok(veil_core::textmerge::merge(&base, &ours, &theirs, 7, veil_core::textmerge::Style::Diff3).is_ok())
+    be.is_some()
 }
 
 /// Spawn a merge worker for `job`.
@@ -705,6 +715,7 @@ fn merge_stack(
     let mut chain_tree = tip_tree;
     let mut new_stack = Vec::with_capacity(job.stack.len());
     let mut objects: Vec<(ObjectId, Bytes)> = Vec::new();
+    let mut held_bytes: usize = 0;
     let mut snapshots: Vec<ObjectId> = Vec::new();
     let mut origins: Vec<(ObjectId, ObjectId)> = Vec::new();
 
@@ -788,6 +799,7 @@ fn merge_stack(
                 }
             }
             for (bid, braw) in new_blobs {
+                held_bytes += braw.len();
                 src.pending.insert(bid, braw.clone());
                 objects.push((bid, braw));
             }
@@ -803,6 +815,7 @@ fn merge_stack(
         };
         for (id, (raw, _)) in made {
             let b = Bytes::from(raw);
+            held_bytes += b.len();
             src.pending.insert(id, b.clone());
             objects.push((id, b));
         }
@@ -847,6 +860,7 @@ fn merge_stack(
         n.sign(&hub.identity);
         let raw = Bytes::from(Object::Snapshot(n.clone()).encode());
         let id = ObjectId::hash(&raw);
+        held_bytes += raw.len();
         src.pending.insert(id, raw.clone());
         objects.push((id, raw));
         snapshots.push(id);
@@ -856,6 +870,15 @@ fn merge_stack(
         // session narrowing and graft equivalence hold on the merged snapshot.
         if let Err(why) = super::service::recheck_merged(&mut src, &project, &viewer, &n, &parents, &merged_set, &hub.identity)? {
             return Ok(WorkerOutcome::Rejected(why, last_cid));
+        }
+
+        if held_bytes >= super::service::BATCH_BYTES && !objects.is_empty() {
+            let batch = std::mem::take(&mut objects);
+            for (oid, _) in &batch {
+                src.pending.remove(oid);
+            }
+            src.rt.block_on(sync::put_all(&hub, src.project, batch))?;
+            held_bytes = 0;
         }
 
         new_stack.push(Entry::plain(id, chain));
@@ -883,25 +906,14 @@ fn merge_entry_bytes(
     oe: &TreeEntry,
     te: &TreeEntry,
 ) -> Result<Option<MergedEntry>> {
-    if oe.kind != EntryKind::File || te.kind != EntryKind::File {
+    if !can_merge_entries(attrs, path, be, oe, te) {
         return Ok(None);
-    }
-    if oe.visibility != Visibility::Public || te.visibility != Visibility::Public {
-        return Ok(None);
-    }
-    if let Some(b) = be {
-        if b.kind != EntryKind::File || b.visibility != Visibility::Public {
-            return Ok(None);
-        }
     }
     let Ok(vp) = VPath::new(path) else { return Ok(None) };
     let how = attrs.for_path(&vp).merge;
-    if how == MergeAttr::Binary {
-        return Ok(None);
-    }
     let read_blob = |e: &TreeEntry| -> Result<Option<Vec<u8>>> {
         Ok(match Object::decode(&src.raw(&e.id)?)? {
-            Object::Blob(b) => Some(b),
+            Object::Blob(b) if b.len() as u64 <= MAX_MERGE_FILE_BYTES => Some(b),
             _ => None,
         })
     };
@@ -942,14 +954,15 @@ fn merge_entry_bytes(
             Err(_) => return Ok(None),
         }
     };
-    let raw = Bytes::from(Object::Blob(merged.clone()).encode());
+    let size = merged.len() as u64;
+    let raw = Bytes::from(Object::Blob(merged).encode());
     let id = ObjectId::hash(&raw);
     Ok(Some((
         TreeEntry {
             name: oe.name.clone(),
             kind: EntryKind::File,
             id,
-            size: merged.len() as u64,
+            size,
             executable,
             visibility: Visibility::Public,
         },
