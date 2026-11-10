@@ -378,10 +378,214 @@ late in a run, at load 49: noise.)
 push 5–15 ms later in the tests. YugabyteDB 2025.2 does not by default, and
 the server falls back to the 100 ms expiry.
 
+## The landing service (S17, 2026-11-07)
+
+`scripts/bench-server.sh landing` (`veil-bench load --mode landing`): one
+project's `main`, open loop, each agent landing one new file in its own
+folder through `POST …/land` on the snapshot it last saw (its own last
+landing: nobody pulls), waiting for the outcome; the agents are one person's
+(one view key). Release builds, PostgreSQL 17 in Docker, objects in a local
+directory (each object written with `fsync`), 15 s per point after a 3 s
+warm-up, through `~/.cache/veil-orch/bench-quiet.sh`. Latency is from the
+scheduled time, so a backlog shows. Phase 4's gates (§7): **1,000/s
+sustained, p50 under 150 ms, p99 under 1 s, at most 1.5 database commits per
+landing.**
+
+**Quiet machine** (load average 7 before, 76 after; `bench4`):
+
+| Agents | Target (/s) | Landed (/s) | p50 (ms) | p99 (ms) | Landings per batch | Build CPU (ms/landing) | Store objects (ms/batch) | Transaction (ms/batch) | DB commits per landing (the deriver's aside) | DB statements per landing | Storage writes per landing | Server CPU (ms/landing) | Refused |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,000 | 1,000 | **1,084** | 196 | 1,785 | 14.7 | 0.27 | 13.3 | 4.2 | **1.06** | 11.5 | 13.7 | 6.6 | 0 |
+| 1,000 | 2,000 | **1,353** | 4,167 | 6,417 | 332.9 | 0.30 | 296.1 | 44.9 | 1.00 | 11.1 | 13.3 | 7.2 | 0 |
+
+**10,000 agents** (load average 19 before, 3 after; `bench5`; agents start
+from the tips, without a clone):
+
+| Agents | Target (/s) | Landed (/s) | p50 (ms) | p99 (ms) | Agents that landed | Landings per batch | Build CPU (ms/landing) | Store objects (ms/batch) | Transaction (ms/batch) | DB commits per landing | DB statements per landing | Storage writes per landing | Refused |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10,000 | 1,000 | **995** | 152 | 1,596 | 9,975 | 26.6 | 0.36 | 23.8 | 9.8 | **1.06** | 11.1 | 14.0 | 0 |
+
+**The whole curve, on a busier machine** (load 16 at the start, up to 199
+during the later points as other agents built; `bench3`):
+
+| Agents | Target (/s) | Landed (/s) | p50 (ms) | p99 (ms) | DB commits per landing | DB statements per landing | Refused |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 50 | 100 | 100 | 9.0 | 165 | 5.6 (2.0 without the deriver: one landing per batch) | 35 | 0 |
+| 50 | 1,000 | 865 | 570 | 2,585 | 1.16 | 11.1 | 0 |
+| 50 | 2,000 | 876 | 5,223 | 9,982 | 1.17 | 11.1 | 0 |
+| 1,000 | 100 | 100 | 10.7 | 190 | 5.5 (2.0) | 35 | 0 |
+| 1,000 | 1,000 | 841 | 2,033 | 3,083 | 1.02 | 12.8 | 0 |
+| 1,000 | 2,000 | 524 | 7,351 | 12,289 | 1.10 | 16.5 | 0 |
+
+* **1,000 landings/s into one `main`: reached on a quiet machine** (1,084/s
+  at the 1,000/s target with 1,000 agents, 1,353/s at most; 995/s with
+  10,000 agents), with no collision and no agent
+  ever pulling: one `main` was bent at 20–40/s before (§3), 35/s through
+  the API (S10). Every change is its own snapshot; `main` moved 74 times a
+  second at 1,000/s (14.7 changes per move) and 4 times a second at the
+  limit (333 per move).
+* **Cost:** 1.0–1.06 database commits per landing (the submit's one, plus
+  its share of its batch's): the gate (1.5) is met wherever batches fill.
+  At 100/s each landing has its batch to itself, so it costs two; S12's
+  deriver adds about 4 per batch in the background, as for a push.
+  About 11 statements per landing.
+* **p50 152–196 ms and p99 1.6–1.8 s at 1,000/s: the latency targets
+  (150 ms, 1 s) are missed** (p50 by a little, p99 by about 0.7 s). Where the time goes: a landing waits for its submit (an API
+  commit's checks and objects: about 6 ms of CPU and 7–9 objects written)
+  and then for one to two batch cycles. **The object store is the limit**:
+  13.3 storage writes per landing (about 7 at the submit, the new trees and
+  snapshot and the submitter's projection in the batch), each a file written
+  and synced on its own (`FsStore`), so 1,084 landings/s is about 14,500
+  synced writes a second. At the limit a batch of 333 spends 296 ms storing
+  its objects, 45 ms in its transaction and 0.3 ms of CPU per landing to
+  build; the landing service itself (one core) is far from busy. **Packs
+  (S28: one storage write per push or batch) are what raise it**; the
+  landing service needs no change for that. With MinIO the same store limit
+  is lower (376 landings/s across projects, §"Re-measured").
+* **50 agents cannot keep 1,000/s:** each has one landing in flight, so 50
+  agents land at most 50 per request time; the design's point is for
+  thousands of agents.
+* **Fairness:** every agent landed in every point (1,000 of 1,000 at
+  1,000/s; 993–997 of 1,000 at 100/s and 9,975 of 10,000 at 1,000/s, where
+  some had no turn in 15 s).
+
+Raw results (not committed): `.scratch/bench-results/server-landing-d8cf2b2-20261107T143547Z*` (quiet), `…T150318Z*` (10,000 agents) and the `bench3` log.
+
+**After the S17 review's fixes** (2026-11-07, on `integration` @ `9cddf93`
+with S13's background fills; `docs/BUGS.md` BUG-1100 to 1109). The landing
+service now keeps every view key of the project and never walks history,
+bounds batches in bytes (8 MiB) and in changes (64), and its waiters stop
+polling while it runs here (BUG-1108). The machine was shared and loaded
+(load average 10–15 at the start of each point, often 80–260 during it),
+so read the shape:
+
+| Agents | Target (/s) | Landed (/s) | p50 (ms) | p99 (ms) | Landings per batch | Prepare (ms/batch) | Store objects (ms/batch) | Transaction (ms/batch) | DB commits per landing | DB statements per landing |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,000 | 800 | 800 | 82 | 1,122 | 12.9 | 0.7 | 14.0 | 8.4 | 1.31 | 14.6 |
+| 1,000 | 1,000 | **1,023** | 191 | **718** | 25.2 | 0.6 | 26.7 | 8.7 | **1.03** | 11.7 |
+| 1,000 | 2,000 | 1,212 (the most) | 4,664 | 7,050 | 64.0 | 1.6 | 55.4 | 20.6 | 1.03 | 12.3 |
+| 10,000 | 1,000 | 820 | 962 | 2,716 | 56.7 | 2.3 | 73.2 | 26.7 | 1.25 | 13.6 |
+
+* **1,000/s into one `main` with 1,000 agents, p99 718 ms: under the 1 s
+  target for the first time**, at 1.03 commits per landing.
+* **Old and new side by side** (the server before the fixes, `76f337c`,
+  run interleaved with the new one): their costs per landing are the same
+  (build 0.27–0.4 ms of CPU, about 1 ms of object writes, 12–15
+  statements), but which of two regimes a run settles in decides its p50:
+  small batches (tens of ms) or, once behind, large ones (seconds). The old
+  server too fell into the large one on a loaded machine (702/s, p50
+  1.96 s at 800/s). Batches of at most 64 keep the service in the small
+  regime (BUG-1109); at 10,000 agents, with the load rising to 115 during
+  the run, it did not stay there.
+* **The limit is still the object store** (about 14 synced writes per
+  landing); packs (S28) are next.
+
+**After the S17 review's second cycle** (2026-11-08, on `integration` @
+`c446dd1`; `docs/BUGS.md` BUG-1110 to 1112, 1270 to 1275; load average 14
+before each point, 24 before the 10,000-agent one, 8 after; `bench16`):
+
+| Agents | Target (/s) | Landed (/s) | p50 (ms) | p99 (ms) | Agents that landed | Landings per batch | Prepare (ms/batch) | Build CPU (ms/landing) | Store objects (ms/batch) | Transaction (ms/batch) | DB commits per landing | DB statements per landing |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,000 | 1,000 | **954** | 184 | **632** | 1,000 | 30.3 | 7.1 | 0.29 | 28.7 | 14.2 | **1.12** | 16.1 |
+| 1,000 | 2,000 | 1,348 (the most) | 3,496 | 5,746 | 1,000 | 64.0 | 4.2 | 0.32 | 51.5 | 14.0 | 1.03 | 12.6 |
+| 10,000 | 1,000 | **927** | 840 | 1,466 | 9,971 | 49.4 | 7.7 | 0.40 | 54.8 | 18.1 | **1.13** | 16.0 |
+
+* **The first re-measurement after the cycle-2 fixes fell to 191/s with
+  1,000 agents and 17/s with 10,000 (BUG-1275).** Every submit of edits now
+  builds its stack (BUG-1112), and asked whether its base is on the branch
+  through the derived graph (waiting for the deriver) or a walk. With
+  10,000 agents on the setup tip and the deriver behind, each first submit
+  queued a database read and a walk on the blocking pool, and starved the
+  service's object writes (982 ms a batch) and the deriver. Now `landings`
+  records each tip a batch moved from too, and a submit's base is found
+  there in one indexed lookup; the graph and the walk are for other bases.
+* **10,000 agents: 927/s at p99 1.47 s, against 820/s at 2.7 s after
+  cycle 1;** 1,000 agents as before (954/s, p99 632 ms). About 4 more
+  statements per landing than cycle 1 (the stack's lookup, the `landings`
+  rows, the already-landed check). The 1 s p99 target is met at 1,000
+  agents, missed at 10,000: batches of about 50 spend 55 ms storing their
+  objects, so the object store is still the limit (packs, S28).
+
+Raw results (not committed): `.scratch/bench-results/server-landing-9f1573e5-20261108T004444Z*` and `…T004755Z*`; the regressed run `…T002111Z*`, `…T002436Z*`.
+
+**After the S17 review's third cycle: the redesign** (2026-11-08, on
+`integration` @ `6fa552c`; `docs/BUGS.md` BUG-1300 to 1305; `HUB.md`
+§13.19: the stack is the submitter's own history, every change lands as a
+new snapshot, "on the branch" within the branch's lineage, a bounded base
+lookup, retention while busy; load average 11 before the first point, 16
+before the 10,000-agent one, 35 after; `bench18`):
+
+| Agents | Target (/s) | Landed (/s) | p50 (ms) | p99 (ms) | Agents that landed | Landings per batch | Prepare (ms/batch) | Build CPU (ms/landing) | Store objects (ms/batch) | Transaction (ms/batch) | DB commits per landing | DB statements per landing | Storage writes per landing |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,000 | 1,000 | **993** | **79** | **327** | 1,000 | 20.5 | 6.4 | 0.27 | 15.4 | 10.2 | **1.14** | 16.2 | 14.1 |
+| 1,000 | 2,000 | 1,208 (the most) | 4,310 | 6,727 | 1,000 | 64.0 | 5.0 | 0.31 | 60.1 | 16.0 | 1.02 | 12.7 | 13.7 |
+| 10,000 | 1,000 | **943** | 270 | 1,012 | 9,969 | 36.8 | 8.4 | 0.39 | 33.1 | 15.1 | **1.13** | 16.2 | 14.5 |
+
+* **1,000 agents: 993/s at p50 79 ms and p99 327 ms, every target met**;
+  10,000 agents: 943/s, p50 270 ms, p99 1.01 s (the 1 s target missed by
+  12 ms). The same statements per landing as cycle 2 (16): the submit
+  reads the branch's tip and lineage and looks its base up in `landings`
+  (2 statements), the batch compares tip and lineage even when nothing
+  moves, and retention adds 2 statements a branch every 5 s.
+* **Caught here first:** an earlier run of the redesign stored each edits
+  submit's objects twice (once before its stack was built, once before its
+  commit): 20.8 storage writes a landing instead of 14, and at the
+  2,000/s target the service fell into the large-batch regime (644/s,
+  `bench17`). Fixed before commit: the objects are stored once, before the
+  stack reads them.
+
+Raw results (not committed): `.scratch/bench-results/server-landing-b1b10f37-20261108T064028Z*` and `…T064348Z*` (the label is the base commit; the binaries were the working tree), the double store `…T061236Z*`, `…T061440Z*`.
+
+**After the redesign's review (the simplified rule, 2026-11-08,** on
+`integration` @ `6b65ed6`; `docs/BUGS.md` BUG-1311 to 1315): the machine
+never got quiet (load 15 at the start of each run, 30–160 during them), so
+the redesign was measured against the commit before it (`b1509930`),
+interleaved, two rounds:
+
+| Agents | Target (/s) | Round 1: before → after (/s) | Round 2: before → after (/s) | Round 2 p99 (ms): before → after | DB statements per landing (round 2) |
+|---:|---:|---:|---:|---:|---:|
+| 1,000 | 1,000 | 964 → 870 | 941 → **1,052** | 1,280 → 1,290 | 14.5 → 15.0 |
+| 10,000 | 1,000 | 707 → 328 | 846 → **888** | 2,774 → 2,029 | 17.0 → 16.9 |
+
+* The cost per landing is unchanged (15–17 statements, about 14 storage
+  writes, 1.0–1.2 commits). Every point is noisier than any run above: the
+  object store took 50–90 ms a batch (15 ms when quiet), and two of the
+  runs fell into the large-batch regime.
+* **Round 1 at 10,000 agents (328/s, 2.7 commits per landing, half the
+  agents finished) is not explained**: it ran at load 47, and the same
+  build gave 888/s (1.16 commits) in round 2 and 905/s in a run before. A
+  quiet re-measurement is owed.
+
+Raw results (not committed): `.scratch/bench-ab7.log`, `.scratch/bench19.log`, `.scratch/bench20.log`.
+
+**After the redesign's second review** (2026-11-08; BUG-1405 to 1409: the
+line read as the submitter sees it, hidden runs stepped over by the graph,
+"already landed" from the history; `bench21`). **The machine was not
+quiet**: `bench-quiet.sh` waited 520 s for a load below 16, and the load
+rose to 88 during the 10,000-agent point.
+
+| Agents | Target (/s) | Landed (/s) | p50 (ms) | p99 (ms) | Agents that landed | DB commits per landing | DB statements per landing | Storage writes per landing |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,000 | 1,000 | 853 | 1,592 | 2,297 | 1,000 | 1.11 | 14.2 | 14.4 |
+| 1,000 | 2,000 | 1,092 | 4,596 | 8,063 | 1,000 | 1.02 | 15.7 | 13.7 |
+| 10,000 | 1,000 | 508 | 3,219 | 8,149 | 7,553 | 2.00 | 23.1 | 20.6 |
+
+* At 1,000 agents the cost per landing is that of every run above (14–16
+  statements, 14 storage writes); the latencies follow the object store,
+  66 ms a batch here against 15 ms when quiet.
+* The 10,000-agent point has the overloaded signature seen before with
+  both builds (`bench-ab7`: the earlier build gave 1.46 commits per
+  landing at load 58): requests that time out are submitted again (2.0
+  commits and 20.6 storage writes per landing; a quarter of the agents
+  never finished). The quiet measurement is still owed.
+
+Raw results (not committed): `.scratch/bench21.log`, `.scratch/bench-results/server-landing-e56f4848-20261108T142211Z*`, `…T142409Z*`.
+
+
 ## What would raise each ceiling (not built)
 
 | Ceiling | Bound by | What raises it |
 |---|---|---|
 | Pulls, about 2,500/s here | CPU per pull: 46 statements, mostly per-request permission lookups and per-snapshot resolution | **built (S4):** permission, session and resolution caches; 1 statement per request. Next: fewer requests per pull (S3) |
 | Merges across projects, about 2,000/s here | the database's WAL: about 8 commits per landing | **built (S4):** 1 commit for the push; S12's deriver adds about 4 in the background, and holds the pool at 100 projects (BUG-911) |
-| One project's `main`, 20–30/s with many agents | collisions: a catch-up pull is longer than the gap between landings | batched landing (phase 4); cheaper catch-up pulls |
+| One project's `main`, 20–30/s with many agents | collisions: a catch-up pull is longer than the gap between landings | **built (S17):** batched landing, 1,084/s here (above); next: packs (S28), since the object store's synced writes are its limit |

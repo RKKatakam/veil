@@ -3094,6 +3094,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tokio-rustls",
+ "toml_edit",
  "tower",
  "ureq",
  "veil-core",

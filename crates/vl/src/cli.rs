@@ -699,6 +699,34 @@ pub enum Cmd {
         #[command(flatten)]
         hooks: hooks::NoVerifyArgs,
     },
+    /// Land a change on a branch through the server's landing service:
+    /// the server puts it on the branch's newest tip when no path it edits
+    /// changed there since its base, so you need not pull first.
+    ///
+    /// REV and the changes under it that the server does not hold yet land
+    /// in order, all or none, each as its own snapshot. A protected branch
+    /// (`.veilrules`: `[branches.main] protected = true`) moves only this
+    /// way, and `vl push` to one lands instead. Waits for the outcome:
+    /// landed (your tag follows the change), conflict (the paths that
+    /// changed meanwhile: pull, redo the change on the new tip, land again)
+    /// or rejected.
+    Land {
+        /// The change to land (default: `@-`, the change you last committed).
+        rev: Option<String>,
+        /// The branch to land on (default: the server's default branch).
+        #[arg(long, value_name = "BRANCH")]
+        onto: Option<String>,
+        /// The remote.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Answer with the ticket at once, without waiting.
+        #[arg(long)]
+        no_wait: bool,
+        /// Show a submitted landing's outcome (waiting for it, unless
+        /// --no-wait).
+        #[arg(long, value_name = "TICKET", conflicts_with_all = ["rev", "onto"])]
+        status: Option<String>,
+    },
     /// Fetch tags and history from the Veil server: what you may see.
     Pull {
         /// Remote to pull from.

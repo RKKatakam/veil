@@ -239,6 +239,11 @@ pub struct BranchResult {
     /// The branch's tip afterwards, as the pusher sees it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tip: Option<ObjectId>,
+    /// The branch is protected: the push's new changes were submitted to
+    /// the landing service under this ticket (`docs/HUB.md` §13.19). `ok`
+    /// says whether they landed; `tip` is then where.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

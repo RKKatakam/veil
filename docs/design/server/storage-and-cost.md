@@ -123,7 +123,7 @@ Found by the benchmarks of 2026-11-06. Each is a small fix round, not a mileston
 | Commit one file | Still 3–4× slower than Git: the scan of every file. Use the stat cache to skip unchanged files (performance round 3); the daemon's file watcher (S7) removes the scan entirely. | `OPENSCION.md` |
 | Clone one folder | About 60 forced disk writes in sequence. Use one durability barrier, as the full clone already does. | `OPENSCION.md` |
 | Merge base of distant branches | 0.7 s at 20,000 snapshots apart. Memoise merge bases, or use a better walk. | S13 |
-| One busy `main` | About 20 landings/s. Batch landings. | S17 |
+| One busy `main` | About 20 landings/s. Batch landings: **built** (S17, `HUB.md` §13.19; numbers in `LOAD.md`, "The landing service"). | S17 |
 
 ## 11. Open technical questions
 

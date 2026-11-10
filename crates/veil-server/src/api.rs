@@ -49,6 +49,8 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/objects", post(objects).layer(DefaultBodyLimit::max(crate::db::body_limit("/objects"))))
         .route("/v1/projects/{p}/push", post(push))
         .route("/v1/projects/{p}/changes", post(changes))
+        .route("/v1/projects/{p}/land", post(land))
+        .route("/v1/projects/{p}/land/{ticket}", get(land_status))
         .route("/v1/projects/{p}/access", get(access))
         .route("/v1/projects/{p}/groups", get(list_groups))
         .route("/v1/projects/{p}/groups/{g}", post(create_group).delete(delete_group))
@@ -652,9 +654,56 @@ async fn objects(
 }
 
 async fn push(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<PushRequest>) -> Result<Json<PushResult>> {
+    let person = caller.signed_in()?.clone();
+    let (project, viewer, epochs) = perm::open_at(&hub, &p, &caller).await?;
+    let who = crate::landing::Submitter { person, epochs };
+    Ok(Json(sync::push(&hub, &project, &viewer, &who, req).await?))
+}
+
+/// Submit a landing (`landing`).
+async fn land(
+    State(hub): State<HubState>,
+    caller: Caller,
+    Path(p): Path<String>,
+    Json(req): Json<veil_core::hub::land::LandRequest>,
+) -> Result<Json<veil_core::hub::land::LandResult>> {
+    let person = caller.signed_in()?.clone();
+    let (project, viewer, epochs) = perm::open_at(&hub, &p, &caller).await?;
+    let who = crate::landing::Submitter { person, epochs };
+    Ok(Json(crate::landing::submit(&hub, &project, &viewer, &caller, who, req).await?))
+}
+
+#[derive(Deserialize)]
+struct WaitQuery {
+    #[serde(default)]
+    wait: Option<bool>,
+}
+
+/// A landing's outcome; with `?wait=true` (the default), once it is known
+/// (up to about 30 s). Only its submitter has it: anyone else's ticket is
+/// not found.
+async fn land_status(
+    State(hub): State<HubState>,
+    caller: Caller,
+    Path((p, ticket)): Path<(String, String)>,
+    Query(q): Query<WaitQuery>,
+) -> Result<Json<veil_core::hub::land::LandResult>> {
     let me = caller.signed_in()?.id;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
-    Ok(Json(sync::push(&hub, &project, &viewer, me, req).await?))
+    // Its submitter's only: anyone else's ticket is not found, before any
+    // waiter is registered under it.
+    let Some((branch, r)) = crate::landing::read(&hub, project.id, me, &ticket).await? else {
+        return Err(Error::not_found("no landing of yours with that ticket"));
+    };
+    let r = if r.state != veil_core::hub::land::LandState::Queued || q.wait == Some(false) {
+        r
+    } else {
+        let w = hub.landing.register(&ticket);
+        crate::landing::ensure(&hub, project.id, &branch);
+        let deadline = tokio::time::Instant::now() + crate::landing::WAIT;
+        crate::landing::wait(&hub, project.id, me, &branch, w, deadline).await?
+    };
+    Ok(Json(crate::landing::seen(&hub, &project, &viewer, r).await?))
 }
 
 /// A commit through the API (`changes`).

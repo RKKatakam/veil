@@ -1179,6 +1179,7 @@ pub async fn history(hub: &Arc<Hub>, ask: &Ask, q: HistoryParams, limits: Limits
             Ok((resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?, path))
         }
     };
+    let viewer = ask.viewer.clone();
     on_graph(hub, ask, deadline, move |g, t| {
         let f = files::Files::new(g);
         let starts = match start {
@@ -1197,6 +1198,7 @@ pub async fn history(hub: &Arc<Hub>, ask: &Ask, q: HistoryParams, limits: Limits
                 };
                 let mut out = Vec::new();
                 for (id, path) in nodes {
+                    viewer.narrowed_to(&path)?;
                     // A cursor names versions of the viewer's own graph.
                     let r = match g.row(&id)? {
                         Some(r) if !r.withheld() => r,
