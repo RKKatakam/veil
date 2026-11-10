@@ -42,6 +42,7 @@
 //!     segments (`search_shards.segments`, S15),
 //!   - and every object in an active `STAGED` upload pack (so a racing push
 //!     can never lose an object it uploaded or is about to reference).
+//!
 //!   Any stored object (in a listed pack or loose in `p/<project>/…`,
 //!   including superseded S15 search segments) not in the reachable set gets a
 //!   `since_ms` timestamp in `unreferenced_objects` when first seen
