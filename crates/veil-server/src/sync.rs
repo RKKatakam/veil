@@ -1822,7 +1822,10 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, who: &crat
         seen
     };
     completed.retain(|c| landing.contains(&c.real));
-    let new_reals: Vec<String> = completed.iter().map(|c| c.real.hex()).collect();
+    let new_reals: Vec<(String, i64)> = completed
+        .iter()
+        .map(|c| (c.real.hex(), real_parents_of.get(&c.real).map_or(0, |(_, a)| *a)))
+        .collect();
     let origins: Vec<(String, String)> = completed.iter().filter_map(|c| c.origin.map(|o| (c.real.hex(), o.hex()))).collect();
     let memos: Vec<(String, String, String, bool)> =
         deferred.rows.iter().map(|(k, r, p)| (k.clone(), r.hex(), p.hex(), deferred.collapsed.contains(r))).collect();
@@ -1970,10 +1973,11 @@ pub async fn push(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, who: &crat
                     }
                 }
             }
-            for r in &new_reals {
-                sqlx::query("INSERT INTO snapshots (project_id, id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+            for (r, author) in &new_reals {
+                sqlx::query("INSERT INTO snapshots (project_id, id, author) VALUES ($1, $2, $3) ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0")
                     .bind(pid)
                     .bind(r)
+                    .bind(*author)
                     .execute(&mut *c)
                     .await?;
             }

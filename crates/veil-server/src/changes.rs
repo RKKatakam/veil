@@ -624,9 +624,10 @@ async fn commit(
             }
             let mut memos = Vec::new();
             for (snap, mine) in &snaps {
-                sqlx::query("INSERT INTO snapshots (project_id, id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+                sqlx::query("INSERT INTO snapshots (project_id, id, author) VALUES ($1, $2, $3) ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0")
                     .bind(pid)
                     .bind(snap)
+                    .bind(person)
                     .execute(&mut *c)
                     .await?;
                 if let Some(key) = &view_key {
