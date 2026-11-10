@@ -4670,4 +4670,501 @@ mod s21_c4 {
         let landed: Value = serde_json::from_str(&json_out).expect("vl pr land --json should emit valid JSON");
         assert_eq!(landed["state"], "landed");
     }
+
+    /// S19 + S21 Guarantee 1: every PR write route (open, update/new revision,
+    /// close, review, dismiss, thread, comment, land) refuses a CI runner
+    /// session with `caller.not_runner()`, while a person (or regular agent
+    /// where allowed) succeeds on each action.
+    #[test]
+    fn s19_every_pr_write_route_refuses_ci_runner_session() {
+        const RUNNER_REFUSAL: &str = "a CI runner session writes only check results: it cannot upload objects, push, commit or land changes";
+        let th = TestHub::start();
+        let p = setup_project(&th);
+        let api = th.api();
+        let dev_tok = p.dev.token();
+        let admin_tok = p.admin.token();
+
+        let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+        let make_branch = |branch: &str, content: &str| {
+            let r = api.post_json(
+                Some(&dev_tok),
+                &format!("/v1/projects/{}/changes", p.name),
+                &json!({"base": base.hex(), "edits": [put("src/runner_pr.rs", content)]}),
+            );
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            let snap: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+            let push_r = api.post_json(
+                Some(&dev_tok),
+                &format!("/v1/projects/{}/push", p.name),
+                &json!({"updates": [{"branch": branch, "expected": null, "new": snap.hex()}], "force": false}),
+            );
+            assert_eq!(push_r.status, 200, "{}", String::from_utf8_lossy(&push_r.body));
+            assert_eq!(push_r.json()["results"][0]["ok"], true);
+        };
+        make_branch("pr-v1", "pub fn v() -> i32 { 1 }\n");
+        make_branch("pr-v2", "pub fn v() -> i32 { 2 }\n");
+
+        // Mint CI runner sessions for dev and admin.
+        let r_dev_sess = api.post_json(Some(&dev_tok), "/v1/sessions/ci", &json!({"project": p.name, "only": ["src"]}));
+        assert_eq!(r_dev_sess.status, 200, "{}", String::from_utf8_lossy(&r_dev_sess.body));
+        let dev_runner = r_dev_sess.json()["token"].as_str().unwrap().to_string();
+
+        let r_adm_sess = api.post_json(Some(&admin_tok), "/v1/sessions/ci", &json!({"project": p.name}));
+        assert_eq!(r_adm_sess.status, 200, "{}", String::from_utf8_lossy(&r_adm_sess.body));
+        let admin_runner = r_adm_sess.json()["token"].as_str().unwrap().to_string();
+
+        let assert_runner_refused = |r: &crate::support::Reply, route_label: &str| {
+            assert_eq!(
+                (r.status, r.json()["code"].clone(), r.json()["message"].clone()),
+                (403, json!("agent_session"), json!(RUNNER_REFUSAL)),
+                "{route_label}: {}",
+                String::from_utf8_lossy(&r.body)
+            );
+        };
+
+        // 1. Open (`POST /prs`): runner refused; person succeeds.
+        let r = api.post_json(
+            Some(&dev_runner),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "pr-v1", "title": "runner open attempt"}),
+        );
+        assert_runner_refused(&r, "open (POST /prs)");
+
+        let open_ok = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "pr-v1", "title": "person open ok"}),
+        );
+        assert_eq!(open_ok.status, 200, "{}", String::from_utf8_lossy(&open_ok.body));
+        let pr_id = open_ok.json()["id"].as_str().unwrap().to_string();
+
+        // Runner can read the PR (`GET /prs`, `GET /prs/{id}`, `GET /prs/{id}/diff`).
+        let r_get = api.get(Some(&dev_runner), &format!("/v1/projects/{}/prs/{pr_id}", p.name));
+        assert_eq!(r_get.status, 200, "{}", String::from_utf8_lossy(&r_get.body));
+
+        // 2. New revision (`POST /prs/{id}/revisions`): runner refused; person succeeds.
+        let r = api.post_json(
+            Some(&dev_runner),
+            &format!("/v1/projects/{}/prs/{pr_id}/revisions", p.name),
+            &json!({"head": "pr-v2"}),
+        );
+        assert_runner_refused(&r, "new revision (POST /prs/{id}/revisions)");
+
+        let rev_ok = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs/{pr_id}/revisions", p.name),
+            &json!({"head": "pr-v2"}),
+        );
+        assert_eq!(rev_ok.status, 200, "{}", String::from_utf8_lossy(&rev_ok.body));
+        assert_eq!(rev_ok.json()["revision"], 2);
+        let patch = rev_ok.json()["patch"].as_str().unwrap().to_string();
+
+        // 3. New thread (`POST /prs/{id}/threads`): runner refused; person succeeds.
+        let r = api.post_json(
+            Some(&dev_runner),
+            &format!("/v1/projects/{}/prs/{pr_id}/threads", p.name),
+            &json!({"body": "runner thread"}),
+        );
+        assert_runner_refused(&r, "thread (POST /prs/{id}/threads)");
+
+        let th_ok = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs/{pr_id}/threads", p.name),
+            &json!({"body": "person thread"}),
+        );
+        assert_eq!(th_ok.status, 200, "{}", String::from_utf8_lossy(&th_ok.body));
+        let tid = th_ok.json()["id"].as_str().unwrap().to_string();
+
+        // 4. Reply / resolve comment (`POST /prs/{id}/threads/{t}`): runner refused; person succeeds.
+        let r = api.post_json(
+            Some(&dev_runner),
+            &format!("/v1/projects/{}/prs/{pr_id}/threads/{tid}", p.name),
+            &json!({"body": "runner reply", "state": "resolved"}),
+        );
+        assert_runner_refused(&r, "comment/update thread (POST /prs/{id}/threads/{t})");
+
+        let cm_ok = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs/{pr_id}/threads/{tid}", p.name),
+            &json!({"body": "person reply", "state": "resolved"}),
+        );
+        assert_eq!(cm_ok.status, 200, "{}", String::from_utf8_lossy(&cm_ok.body));
+
+        // 5. Review (`POST /prs/{id}/reviews`): runner refused (both request-changes and approve); admin person succeeds.
+        for verdict in ["request-changes", "approve"] {
+            let sig = p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, &pr_id, &patch, verdict));
+            let r = api.post_json(
+                Some(&admin_runner),
+                &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+                &json!({"patch": patch, "verdict": verdict, "signature": sig}),
+            );
+            assert_runner_refused(&r, &format!("review {verdict} (POST /prs/{{id}}/reviews)"));
+        }
+
+        let sig_rc = p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, &pr_id, &patch, "request-changes"));
+        let rev_rc_ok = api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+            &json!({"patch": patch, "verdict": "request-changes", "body": "hold", "signature": sig_rc}),
+        );
+        assert_eq!(rev_rc_ok.status, 200, "{}", String::from_utf8_lossy(&rev_rc_ok.body));
+
+        // 6. Dismiss (`POST /prs/{id}/reviews/dismiss`): runner refused; admin person succeeds.
+        let r = api.post_json(
+            Some(&admin_runner),
+            &format!("/v1/projects/{}/prs/{pr_id}/reviews/dismiss", p.name),
+            &json!({"person": p.admin.name}),
+        );
+        assert_runner_refused(&r, "dismiss (POST /prs/{id}/reviews/dismiss)");
+
+        let dis_ok = api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/prs/{pr_id}/reviews/dismiss", p.name),
+            &json!({"person": p.admin.name}),
+        );
+        assert_eq!(dis_ok.status, 200, "{}", String::from_utf8_lossy(&dis_ok.body));
+
+        // Approve so the PR is ready to land.
+        let sig_ap = p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, &pr_id, &patch, "approve"));
+        let rev_ap_ok = api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+            &json!({"patch": patch, "verdict": "approve", "signature": sig_ap}),
+        );
+        assert_eq!(rev_ap_ok.status, 200, "{}", String::from_utf8_lossy(&rev_ap_ok.body));
+        assert_eq!(rev_ap_ok.json()["review"]["ready"], true);
+
+        // 7. Close (`POST /prs/{id}/close`) and Land (`POST /prs/{id}/land`): runner refused; person succeeds.
+        let r = api.post_json(
+            Some(&dev_runner),
+            &format!("/v1/projects/{}/prs/{pr_id}/close", p.name),
+            &json!({}),
+        );
+        assert_runner_refused(&r, "close (POST /prs/{id}/close)");
+
+        let r = api.post_json(
+            Some(&dev_runner),
+            &format!("/v1/projects/{}/prs/{pr_id}/land", p.name),
+            &json!({}),
+        );
+        assert_runner_refused(&r, "land (POST /prs/{id}/land)");
+
+        let land_ok = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs/{pr_id}/land", p.name),
+            &json!({}),
+        );
+        assert_eq!(land_ok.status, 200, "{}", String::from_utf8_lossy(&land_ok.body));
+        assert_eq!(land_ok.json()["state"], "landed");
+    }
+
+    /// S22 + S21 Guarantee 2: a PR can't be opened from or onto a hidden
+    /// `embargo/<id>` branch by anyone outside the embargo (identical to 404
+    /// for a missing branch), and a PR's diff, revisions, threads and list
+    /// never show an embargoed snapshot or path to anyone outside the embargo.
+    #[test]
+    fn s22_embargo_branches_and_snapshots_never_leak_through_prs() {
+        const FIX_MARK: &str = "EMBARGO-PR-SECRET-7744";
+        const FIX_PATH: &str = "src/embargo_pr_secret.rs";
+        let th = TestHub::start();
+        let p = setup_project(&th);
+        p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+        let api = th.api();
+        let dev_tok = p.dev.token();
+        let fin_tok = p.fin.token();
+
+        // `p.sec` creates an embargoed fix for `security` and pushes it, creating `embargo/<eid>`.
+        let sec_dir = p.sec.dir("work");
+        p.sec.ok(p.sec.home.path(), &["clone", &th.url(&p.name), sec_dir.to_str().unwrap()]);
+        write_files(
+            &sec_dir,
+            &[
+                ("src/lib.rs", &format!("{PUBLIC_MARK}\n{FIX_MARK}\n")),
+                (FIX_PATH, &format!("pub const S: &str = \"{FIX_MARK}\";\n")),
+            ],
+        );
+        p.sec.ok(&sec_dir, &["commit", "--no-advance", "-m", FIX_MARK]);
+        let fix_hex = p.sec.ok(&sec_dir, &["log", "-r", "@-", "-n", "1", "--json"]);
+        let fix_id = ObjectId::from_hex(
+            serde_json::from_str::<Value>(&fix_hex).unwrap()["entries"][0]["snapshot_id"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let merge_out = p.sec.ok(
+            &sec_dir,
+            &["merge", "@-", "--into", "main", "--embargo-for", "security", "-m", FIX_MARK],
+        );
+        let eid = merge_out
+            .split_whitespace()
+            .map(|w| w.trim_end_matches(':'))
+            .find(|w| w.len() == 10 && w.bytes().all(|b| b.is_ascii_hexdigit()))
+            .expect("embargo id")
+            .to_string();
+        let merge_hex = p.sec.ok(&sec_dir, &["log", "-r", "main", "-n", "1", "--json"]);
+        let merge_id = ObjectId::from_hex(
+            serde_json::from_str::<Value>(&merge_hex).unwrap()["entries"][0]["snapshot_id"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        p.sec.ok(&sec_dir, &["push"]);
+        let embargo_branch = format!("embargo/{eid}");
+
+        // `dev` pushes a normal branch `dev-work` touching `src/normal.rs`.
+        let base_main = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+        let r = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base_main.hex(), "edits": [put("src/normal.rs", "pub fn normal() {}\n")]}),
+        );
+        assert_eq!(r.status, 200);
+        let dev_snap: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+        let r = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "dev-work", "expected": null, "new": dev_snap.hex()}], "force": false}),
+        );
+        assert_eq!(r.status, 200);
+        assert_eq!(r.json()["results"][0]["ok"], true);
+
+        // Reference 404 response for a nonexistent branch.
+        let missing_from = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "no-such-branch-xyz", "title": "missing"}),
+        );
+        assert_eq!(missing_from.status, 404, "{}", String::from_utf8_lossy(&missing_from.body));
+        let missing_onto = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "dev-work", "onto": "no-such-branch-xyz", "title": "missing onto"}),
+        );
+        assert_eq!(missing_onto.status, 404, "{}", String::from_utf8_lossy(&missing_onto.body));
+
+        // 1. Outsider (`dev` or `fin`) trying to open a PR from `embargo/<id>`, `fix_id`, or `merge_id`,
+        // or onto `embargo/<id>`, gets the exact same 404 as a missing branch/revision.
+        for tok in [&dev_tok, &fin_tok] {
+            for head in [embargo_branch.as_str(), &fix_id.hex(), &merge_id.hex()] {
+                let r = api.post_json(
+                    Some(tok),
+                    &format!("/v1/projects/{}/prs", p.name),
+                    &json!({"head": head, "title": "probe from embargo"}),
+                );
+                assert_eq!(
+                    (r.status, r.body.clone()),
+                    (404, missing_from.body.clone()),
+                    "head={head}: {}",
+                    String::from_utf8_lossy(&r.body)
+                );
+            }
+            let r = api.post_json(
+                Some(tok),
+                &format!("/v1/projects/{}/prs", p.name),
+                &json!({"head": "dev-work", "onto": &embargo_branch, "title": "probe onto embargo"}),
+            );
+            assert_eq!(
+                (r.status, r.body.clone()),
+                (404, missing_onto.body.clone()),
+                "onto={embargo_branch}: {}",
+                String::from_utf8_lossy(&r.body)
+            );
+        }
+
+        // 2. Open a valid PR on `dev-work`, add a thread on `src/normal.rs`, and verify that
+        // diff, revisions, threads, show, and list never show any embargoed snapshot or path,
+        // and that updating the PR to `embargo/<id>`, `fix_id`, or `merge_id` is refused with 404.
+        let pr_ok = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "dev-work", "title": "normal PR"}),
+        );
+        assert_eq!(pr_ok.status, 200, "{}", String::from_utf8_lossy(&pr_ok.body));
+        let pr_id = pr_ok.json()["id"].as_str().unwrap().to_string();
+
+        let th_ok = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs/{pr_id}/threads", p.name),
+            &json!({"body": "comment on normal", "anchor": {"path": "src/normal.rs", "start": 1, "end": 1, "side": "new"}}),
+        );
+        assert_eq!(th_ok.status, 200, "{}", String::from_utf8_lossy(&th_ok.body));
+
+        let missing_rev_update = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs/{pr_id}/revisions", p.name),
+            &json!({"head": "no-such-branch-xyz"}),
+        );
+        assert_eq!(missing_rev_update.status, 404);
+
+        for head in [embargo_branch.as_str(), &fix_id.hex(), &merge_id.hex()] {
+            let r = api.post_json(
+                Some(&dev_tok),
+                &format!("/v1/projects/{}/prs/{pr_id}/revisions", p.name),
+                &json!({"head": head}),
+            );
+            assert_eq!(
+                (r.status, r.body.clone()),
+                (404, missing_rev_update.body.clone()),
+                "update head={head}: {}",
+                String::from_utf8_lossy(&r.body)
+            );
+        }
+
+        // Anchor on the embargoed file path `FIX_PATH` is refused (file is not in the PR).
+        let bad_anchor = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs/{pr_id}/threads", p.name),
+            &json!({"body": "probe", "anchor": {"path": FIX_PATH, "start": 1, "end": 1, "side": "new"}}),
+        );
+        assert_eq!(bad_anchor.status, 400);
+
+        for tok in [Some(dev_tok.as_str()), Some(fin_tok.as_str()), None] {
+            for ep in [
+                format!("/v1/projects/{}/prs", p.name),
+                format!("/v1/projects/{}/prs/{pr_id}", p.name),
+                format!("/v1/projects/{}/prs/{pr_id}/diff", p.name),
+                format!("/v1/projects/{}/prs/{pr_id}/threads", p.name),
+            ] {
+                let r = api.get(tok, &ep);
+                assert_eq!(r.status, 200, "{ep}: {}", String::from_utf8_lossy(&r.body));
+                let text = String::from_utf8_lossy(&r.body);
+                for forbidden in [FIX_MARK, FIX_PATH, &eid, &fix_id.hex(), &merge_id.hex()] {
+                    assert!(!text.contains(forbidden), "{ep} leaked {forbidden:?}: {text}");
+                }
+            }
+        }
+    }
+
+    /// S19 + S21 Guarantee 3: a PR's checks come from S19's `check_results`,
+    /// and are visible only as S19's rules allow (a viewer sees a check on a
+    /// PR iff they can read every path the runner's session could read, and
+    /// with the viewer's projected snapshot id).
+    #[test]
+    fn s19_pr_checks_come_from_check_results_and_follow_s19_visibility_rules() {
+        let th = TestHub::start();
+        let p = setup_project(&th);
+        let api = th.api();
+        let admin_tok = p.admin.token();
+        let dev_tok = p.dev.token();
+        let fin_tok = p.fin.token();
+
+        // Configure `.veilrules` with `ci/src` (`src/`) and `ci/billing` (`BILL_DIR/`).
+        let bill_rule = format!("{BILL_DIR}/");
+        let rules_toml = format!(
+            "[checks.\"ci/src\"]\npaths = [\"src/\"]\n\n[checks.\"ci/billing\"]\npaths = [\"{bill_rule}\"]\n"
+        );
+        write_files(&p.dir, &[(".veilrules", &rules_toml)]);
+        p.admin.commit_main(&p.dir, "configure checks in .veilrules");
+        p.admin.ok(&p.dir, &["push"]);
+
+        // Dev creates a branch `pr-checked` touching `src/lib.rs` and opens a PR.
+        let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+        let r = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base.hex(), "edits": [put("src/lib.rs", "pub fn checked() -> bool { true }\n")]}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let dev_head: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+        let r = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "pr-checked", "expected": null, "new": dev_head.hex()}], "force": false}),
+        );
+        assert_eq!(r.status, 200);
+        assert_eq!(r.json()["results"][0]["ok"], true);
+
+        let pr_res = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "pr-checked", "title": "PR with CI checks"}),
+        );
+        assert_eq!(pr_res.status, 200, "{}", String::from_utf8_lossy(&pr_res.body));
+        let pr_id = pr_res.json()["id"].as_str().unwrap().to_string();
+        assert_eq!(pr_res.json()["checks"], json!([]), "initially no checks on PR");
+
+        // Mint 3 CI runner sessions:
+        // 1. `ci/src` (narrowed to `src/`)
+        // 2. `ci/billing` (narrowed to `BILL_DIR/`)
+        // 3. `ci/admin` (unnarrowed admin runner -> `admin_only = true`)
+        let src_runner = api
+            .post_json(Some(&dev_tok), "/v1/sessions/ci", &json!({"project": p.name, "check": "ci/src"}))
+            .json()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let bill_runner = api
+            .post_json(Some(&fin_tok), "/v1/sessions/ci", &json!({"project": p.name, "check": "ci/billing"}))
+            .json()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let admin_runner = api
+            .post_json(Some(&admin_tok), "/v1/sessions/ci", &json!({"project": p.name, "check": "ci/admin"}))
+            .json()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Each runner posts a check result on the PR head (in their own view of `pr-checked`).
+        let admin_head = api.tips(Some(&admin_tok), &p.name).unwrap().branches["pr-checked"];
+        let fin_head = api.tips(Some(&fin_tok), &p.name).unwrap().branches["pr-checked"];
+
+        let c_src = api.post_json(
+            Some(&src_runner),
+            &format!("/v1/projects/{}/checks", p.name),
+            &json!({"snapshot": dev_head.hex(), "name": "ci/src", "state": "pass", "summary": "src tests ok"}),
+        );
+        assert_eq!(c_src.status, 200, "{}", String::from_utf8_lossy(&c_src.body));
+
+        let c_bill = api.post_json(
+            Some(&bill_runner),
+            &format!("/v1/projects/{}/checks", p.name),
+            &json!({"snapshot": fin_head.hex(), "name": "ci/billing", "state": "fail", "summary": "BILLING-SECRET-CHECK-99", "log": "billing invoice mismatch"}),
+        );
+        assert_eq!(c_bill.status, 200, "{}", String::from_utf8_lossy(&c_bill.body));
+
+        let c_adm = api.post_json(
+            Some(&admin_runner),
+            &format!("/v1/projects/{}/checks", p.name),
+            &json!({"snapshot": admin_head.hex(), "name": "ci/admin", "state": "pending", "summary": "ADMIN-ONLY-CHECK-88"}),
+        );
+        assert_eq!(c_adm.status, 200, "{}", String::from_utf8_lossy(&c_adm.body));
+
+        // Check what each viewer sees on `GET /prs/{pr_id}`:
+        // - `admin` sees all 3 checks (`ci/admin`, `ci/billing`, `ci/src`), with `snapshot == admin_head`.
+        let pr_admin = api.get(Some(&admin_tok), &format!("/v1/projects/{}/prs/{pr_id}", p.name));
+        assert_eq!(pr_admin.status, 200, "{}", String::from_utf8_lossy(&pr_admin.body));
+        let adm_checks = pr_admin.json()["checks"].as_array().unwrap().clone();
+        let adm_names: Vec<&str> = adm_checks.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(adm_names, vec!["ci/admin", "ci/billing", "ci/src"]);
+        for c in &adm_checks {
+            assert_eq!(c["snapshot"], json!(admin_head.hex()));
+        }
+
+        // - `fin` (reads `public` `src/` and `BILL_DIR/`) sees `ci/billing` and `ci/src`, never `ci/admin`, with `snapshot == fin_head`.
+        let pr_fin = api.get(Some(&fin_tok), &format!("/v1/projects/{}/prs/{pr_id}", p.name));
+        assert_eq!(pr_fin.status, 200, "{}", String::from_utf8_lossy(&pr_fin.body));
+        let fin_checks = pr_fin.json()["checks"].as_array().unwrap().clone();
+        let fin_names: Vec<&str> = fin_checks.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(fin_names, vec!["ci/billing", "ci/src"]);
+        for c in &fin_checks {
+            assert_eq!(c["snapshot"], json!(fin_head.hex()));
+        }
+        assert!(!String::from_utf8_lossy(&pr_fin.body).contains("ADMIN-ONLY-CHECK-88"));
+
+        // - `dev` (reads `src/`, cannot read `BILL_DIR/`) and anonymous see ONLY `ci/src`, with `snapshot == dev_head`.
+        for (who, tok) in [("dev", Some(dev_tok.as_str())), ("anon", None)] {
+            let pr_v = api.get(tok, &format!("/v1/projects/{}/prs/{pr_id}", p.name));
+            assert_eq!(pr_v.status, 200, "{who}: {}", String::from_utf8_lossy(&pr_v.body));
+            let v_checks = pr_v.json()["checks"].as_array().unwrap().clone();
+            let v_names: Vec<&str> = v_checks.iter().map(|c| c["name"].as_str().unwrap()).collect();
+            assert_eq!(v_names, vec!["ci/src"], "{who} checks");
+            assert_eq!(v_checks[0]["snapshot"], json!(dev_head.hex()));
+            assert_eq!(v_checks[0]["state"], json!("pass"));
+            let raw = String::from_utf8_lossy(&pr_v.body);
+            assert!(!raw.contains("BILLING-SECRET-CHECK-99") && !raw.contains("billing invoice") && !raw.contains("ADMIN-ONLY-CHECK-88"), "{who}: {raw}");
+        }
+    }
 }
+

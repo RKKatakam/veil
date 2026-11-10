@@ -283,9 +283,9 @@ async fn names(hub: &Hub, ids: &[i64]) -> Result<HashMap<i64, String>> {
     Ok(rows.into_iter().collect())
 }
 
-/// The real tip of `branch`, if it exists.
+/// The real tip of `branch`, if it exists and is not a hidden embargo line.
 async fn tip(hub: &Hub, project: i64, branch: &str) -> Result<Option<ObjectId>> {
-    let t: Option<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2")
+    let t: Option<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL")
         .bind(project)
         .bind(branch)
         .fetch_optional(&hub.db)
@@ -360,12 +360,12 @@ fn not_a_pr() -> Error {
 }
 
 fn signed_in(caller: &Caller) -> Result<&crate::auth::Person> {
-    caller.person.as_ref().ok_or_else(|| Error::unauthorized("sign in first (`vl login`)"))
+    caller.not_runner()
 }
 
-/// Writes need a person of the project.
+/// Writes need a person of the project (and never a CI runner session, S19).
 fn participant(ask: &Ask, caller: &Caller) -> Result<i64> {
-    let p = signed_in(caller)?;
+    let p = caller.not_runner()?;
     if !ask.project.participant(&ask.viewer) {
         return Err(Error::forbidden("only the project's people may do that"));
     }
@@ -520,6 +520,14 @@ pub async fn pr_json(hub: &Arc<Hub>, ask: &Ask, pr: &PrRow) -> Result<Value> {
         .bind(&pr.id)
         .fetch_one(&hub.db)
         .await?;
+    let current_head_proj = p[&current.head];
+    let mut current_reals = vec![current.head];
+    for r in &revs {
+        if p[&r.head] == current_head_proj && !current_reals.contains(&r.head) {
+            current_reals.push(r.head);
+        }
+    }
+    let checks = crate::ci::checks_for(hub, &ask.project, &ask.viewer, current_head_proj, &current_reals).await?;
     // One entry per revision as the viewer numbers them: the first real
     // revision of each run (the later ones are the same to them).
     let mut shown = Vec::new();
@@ -557,6 +565,7 @@ pub async fn pr_json(hub: &Arc<Hub>, ask: &Ask, pr: &PrRow) -> Result<Value> {
         "created_at": pr.created_at,
         "open_threads": threads,
         "review": review,
+        "checks": checks,
         "revisions": shown,
         "policy_version": ask.policy_version,
     }))
@@ -1375,6 +1384,7 @@ pub struct DismissRequest {
 
 /// An admin dismisses a reviewer's requests for changes (BUG-1259).
 pub async fn dismiss(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: DismissRequest) -> Result<Value> {
+    caller.not_runner()?;
     caller.person_only()?;
     participant(ask, caller)?;
     let pr = visible(hub, ask, id).await?;

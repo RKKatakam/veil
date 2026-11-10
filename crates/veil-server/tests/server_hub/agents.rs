@@ -1695,6 +1695,12 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
     }
     assert!(SYNC.contains("narrowing_gate(src, &view, n.tree, &ptrees)?;\n    let mut g = Graft::new"), "complete does not run the narrowing gate on the pushed tree before the graft");
     assert!(body_of(CHANGES, "create").contains("within_narrowing"), "an API commit's edits are not narrowed");
+    const PRS: &str = include_str!("../../src/prs/mod.rs");
+    assert!(PRS.contains("let p = caller.not_runner()?;"), "prs::participant does not refuse CI runner sessions");
+    for f in ["create", "add_revision", "close", "new_thread", "update_thread", "add_review", "dismiss", "land"] {
+        let b = body_of(PRS, f);
+        assert!(b.contains("participant(ask, caller)?") || b.contains("caller.not_runner()?"), "PR write handler {f} does not refuse CI runner sessions");
+    }
 }
 
 /// Rule 2, the kinds the cycle-4 test leaves out: a rename into or out of
