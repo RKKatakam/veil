@@ -930,7 +930,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                 return Ok(None);
             }
             let e = e.as_ref().unwrap();
-            let raw = src.raw(&e.id)?;
+            let raw = src.raw_ephemeral(&e.id)?;
             if !veil_core::object::Object::is_blob_raw(&raw) {
                 return Ok(None);
             }
@@ -953,7 +953,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             generation: 0,
         });
         let mut pending_keeps: Vec<(Version, Arc<Blame>)> = Vec::new();
-        let max_chunk = if self.limits.held >= 4 << 20 { CHUNK } else { 512 };
+        let max_chunk = if self.limits.held >= 32 << 20 { 5000 } else if self.limits.held >= 4 << 20 { CHUNK } else { 512 };
         let mut idx = 0usize;
         let mut chain_last: Option<Version> = None;
         let mut chain_counts: Vec<u32> = Vec::new();
@@ -1216,7 +1216,9 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             }
             // 2. Propagate blames sequentially in topological order and maintain exact held accounting.
             for (vi, v) in slice.iter().enumerate() {
-                self.stopped()?;
+                if vi & 15 == 0 {
+                    self.stopped()?;
+                }
                 let parents = nodes[v].parents.clone();
                 // If `v` has a single parent `p` whose blame is ready to be
                 // consumed (`pn.left == 1 && p != start`), take `p` from `done`
@@ -1243,7 +1245,6 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                         None
                     }
                     Some((text_id, n_lines, opt_text)) => {
-                        self.stopped()?;
                         if parents.len() != 1 || parents[0].as_ref() != chain_last.as_ref() {
                             chain_counts.clear();
                         }

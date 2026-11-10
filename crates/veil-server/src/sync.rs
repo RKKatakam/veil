@@ -219,6 +219,23 @@ impl Source {
             .ok_or(VeilError::Missing(*id))
     }
 
+    pub fn raw_ephemeral(&self, id: &ObjectId) -> veil_core::Result<Bytes> {
+        if let Some(raw) = self.pending.get(id) {
+            return Ok(raw.clone());
+        }
+        if let Some(b) = builtin(id) {
+            return Ok(b);
+        }
+        if self.staged.is_some() {
+            return self.raw(id);
+        }
+        self.hub
+            .objects
+            .get_ephemeral_blocking(&self.rt, self.project, id)
+            .map_err(store_err)?
+            .ok_or(VeilError::Missing(*id))
+    }
+
     /// Object `id` as stored ([`crate::store::Objects::get_encoded`]).
     pub fn encoded(&self, id: &ObjectId) -> veil_core::Result<Bytes> {
         if let Some(b) = builtin(id) {

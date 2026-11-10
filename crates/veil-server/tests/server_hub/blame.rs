@@ -2598,14 +2598,15 @@ mod s14rd2_review {
         let (policy_text, bindings) = policy(1);
         let mut h = Hist::new(&th, &policy_text, &bindings);
         let path = "pub/f/long.txt";
-        let n = 1200usize;
-        let lines = 2400usize;
+        let n = if cfg!(debug_assertions) { 1200usize } else { 2500usize };
+        let lines = if cfg!(debug_assertions) { 2400usize } else { 6000usize };
+        let edits = lines / 4;
         let mut f = Files::new();
         let mut body: Vec<String> = (0..lines).map(|i| format!("line {i} of a long file\n")).collect();
         let mut tip = root_snapshot_id();
         let mut snaps = Vec::new();
         for i in 0..n {
-            for k in 0..600 {
+            for k in 0..edits {
                 body[(i + k * 4) % lines] = format!("edited at change {i} slot {k}\n");
             }
             f.insert(path.to_string(), body.concat().into_bytes());
@@ -2618,7 +2619,8 @@ mod s14rd2_review {
         let viewer = Viewer::default();
         warm_up(&th, &h, &viewer);
         let a = ask(&th, &h, &viewer);
-        let l = limits(50, BlameLimits { lease: Duration::from_secs(2), ..BlameLimits::default() });
+        let lease_dur = if cfg!(debug_assertions) { Duration::from_secs(2) } else { Duration::from_millis(240) };
+        let l = limits(50, BlameLimits { lease: lease_dur, ..BlameLimits::default() });
         let q = || BlameParams { path: path.into(), n: Some(1000), ..Default::default() };
         let (s0, j0) = (steps(&[&h.hub]), jobs_started(&h.hub));
         while jobs_started(&h.hub) == j0 {

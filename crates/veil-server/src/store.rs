@@ -237,28 +237,44 @@ const S3_MOST_WAIT: Duration = Duration::from_secs(1);
 /// every request the store sends is idempotent (GET, HEAD, DELETE, and PUT
 /// of a key that names its content or a pack's fresh random name).
 async fn s3_send(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, Bytes)> {
-    s3_send_with_headers(make).await.map(|(status, _, body)| (status, body))
+    s3_send_inner(make, false).await.map(|(status, _, body)| (status, body))
 }
 
 /// [`s3_send`], with the answer's headers.
 async fn s3_send_with_headers(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, reqwest::header::HeaderMap, Bytes)> {
-    let deadline = tokio::time::Instant::now() + S3_RETRY_FOR;
+    s3_send_inner(make, true).await
+}
+
+async fn s3_send_inner(make: impl Fn() -> reqwest::RequestBuilder, need_headers: bool) -> Result<(u16, reqwest::header::HeaderMap, Bytes)> {
+    let mut deadline: Option<tokio::time::Instant> = None;
     let mut wait = S3_FIRST_WAIT;
     for tries in 1.. {
         let answer = match make().send().await {
             Ok(resp) => {
-                let (status, headers) = (resp.status(), resp.headers().clone());
+                let status = resp.status();
+                let headers = if need_headers { resp.headers().clone() } else { reqwest::header::HeaderMap::new() };
                 resp.bytes().await.map(|body| (status, headers, body))
             }
             Err(e) => Err(e),
         };
+        if let Ok((status, headers, body)) = answer {
+            if !(status.is_server_error() || status.as_u16() == 429) {
+                return Ok((status.as_u16(), headers, body));
+            }
+            let dl = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + S3_RETRY_FOR);
+            let jitter = Duration::from_millis(u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1));
+            if tokio::time::Instant::now() + wait + jitter >= dl {
+                return Ok((status.as_u16(), headers, body));
+            }
+            tokio::time::sleep(wait + jitter).await;
+            wait = (wait * 2).min(S3_MOST_WAIT);
+            continue;
+        }
+        let e = answer.unwrap_err();
+        let dl = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + S3_RETRY_FOR);
         let jitter = Duration::from_millis(u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1));
-        let last = tokio::time::Instant::now() + wait + jitter >= deadline;
-        match answer {
-            // 429: the store asks for fewer requests (BUG-1005, BUG-1053).
-            Ok((status, headers, body)) if !(status.is_server_error() || status.as_u16() == 429) || last => return Ok((status.as_u16(), headers, body)),
-            Err(e) if last || e.is_builder() => return Err(anyhow::Error::new(e).context(format!("S3 request failed {tries} times"))),
-            _ => {}
+        if tokio::time::Instant::now() + wait + jitter >= dl || e.is_builder() {
+            return Err(anyhow::Error::new(e).context(format!("S3 request failed {tries} times")));
         }
         tokio::time::sleep(wait + jitter).await;
         wait = (wait * 2).min(S3_MOST_WAIT);
@@ -790,6 +806,45 @@ impl Objects {
         };
         bump(&self.reads);
         self.load(project, id, r?)
+    }
+
+    /// Read and verify object `id` from a blocking thread without inserting
+    /// into the shared LRU caches on a miss, so a sequential history scan
+    /// (such as a cold blame job) neither evicts warm snapshots/trees nor
+    /// thrashes the cache before reaching recent versions.
+    pub fn get_ephemeral_blocking(&self, rt: &tokio::runtime::Handle, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
+        let ck = Self::cache_key(project, id);
+        if let Some(raw) = self.raw_cache.get(&ck) {
+            return Ok(Some(raw));
+        }
+        if let Some(enc) = self.cache.get(&ck) {
+            return Ok(Some(decoded_cached(id, &enc)?));
+        }
+        let direct = match self.packs.find(project, id) {
+            Found::At(n, s) => self.store.get_range_blocking(&crate::pack::key(project, &n), s.offset, s.last()).map(|r| {
+                r.and_then(|got| match got {
+                    Some((b, _)) if b.len() == s.len as usize => {
+                        crate::pack::entry(id, s, &b)?;
+                        Ok(Some(b.slice(crate::pack::ENTRY_HEAD as usize..)))
+                    }
+                    _ => Err(anyhow!("pack {n} is shorter than its index")),
+                })
+            }),
+            Found::Absent => self.store.get_blocking(&object_key(project, id)).and_then(|r| match r {
+                Ok(None) => None,
+                r => Some(r),
+            }),
+            Found::Paged | Found::Unloaded => None,
+        };
+        let enc = match direct {
+            Some(r) => {
+                bump(&self.reads);
+                r?
+            }
+            None => rt.block_on(self.load_encoding(project, id))?,
+        };
+        let Some(enc) = enc else { return Ok(None) };
+        Ok(Some(decoded(id, &enc)?))
     }
 
     /// Store object `id` (its canonical encoding `raw`) loose, compressed
