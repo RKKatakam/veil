@@ -4082,3 +4082,103 @@ are unchanged, the daemon's store is a cache (delete `~/.cache/veil/daemon`
 or `$VEIL_HOME/daemon`), and the server's `GET /v1/grant-key` is additive.
 Stop running daemons first (`vl daemon stop`), or they exit when their
 socket is removed.
+
+### 13.32 S24, part B: limits on the landing service (built)
+
+Design: `docs/design/server/phase-4-agent-scale.md` §4.4, §4.11, the S24 row
+of §8, threat rows 20 and 21; §13.19 (S17) and §13.25 (S24, part A) here.
+Code: `crates/veil-server/src/limits/landing.rs` (outstanding-landing bounds
+and two-level fair batch ordering), `crates/veil-server/src/limits/mod.rs` and
+`bucket.rs` (per-agent-session and per-person rate buckets),
+`crates/veil-server/src/limits/health.rs` and `crates/vl/src/stats_cmd.rs`
+(landing counters in the admin-only health metrics), minimal wiring in
+`crates/veil-server/src/landing/mod.rs` (`insert`) and `service.rs` (`ready`,
+`commit`), and migration 24 (`crates/veil-server/migrations/0024_landing_limits.sql`:
+`landing_queue.session` and `landing_queue_queued_who`). Also closes
+**BUG-1593** (`crates/veil-server/src/derive/mod.rs`, `query/graph.rs`,
+`query/files.rs`, `search/index.rs`, `sync.rs`, and `crates/veil-bench/src/load.rs`):
+the background derive pass after a landing commits derived rows, projection
+memos, viewer-graph extensions, and search-index updates in **one** database
+transaction per landing instead of 23.
+
+1. **Outstanding landings per agent session and per person**
+   (`limits::landing::admit_queue`, BUG-1660, BUG-1661). Every landing row in
+   `landing_queue` records `person_id` and `session` (`session_hash(token)`
+   for an agent session, `""` for a device session; migration 24). Inside the
+   submit transaction — after all branch, base, stack, policy, and agent
+   checks succeed — `admit_queue` locks `SELECT id FROM people WHERE id = $1
+   FOR UPDATE`, serialising concurrent submits from the same person across
+   every server sharing the database. It then counts rows in `landing_queue`
+   with `state = 'queued'` across all projects: an agent session is bounded at
+   **100** (`MAX_SESSION_OUTSTANDING`, design §4.4 / §4.11) and a person
+    across all their sessions and devices at **1,000** (`MAX_PERSON_OUTSTANDING`,
+   ten times the session bound). Past either bound, the transaction rolls back
+   before inserting into `landing_queue` or `snapshots` and returns **`429
+   rate_limited`** with `retry_after_ms: 1000`, `Retry-After: 1`, and an
+   actionable message naming only the caller's own limit (`too many landings
+   queued for this agent session (limit 100); wait for queued landings to
+   finish` or `too many landings queued for this account (limit 1000); wait
+   for queued landings to finish`). Nothing half-lands, and nothing hidden is
+   named.
+2. **Each submitter's fair share of a batch** (`limits::landing::fair_batch`,
+   BUG-1662). When the branch's landing worker loads all `queued` tickets in
+   arrival order (`created_at, ticket`), `fair_batch` reorders them by a
+   two-level round-robin before `take_batch` caps the batch at `MAX_BATCH`
+   (64): first across distinct `person_id` (ordered by each person's earliest
+   queued ticket), and within each person across their distinct sessions
+   (`session`, with device sessions grouped under `""`, ordered by each
+   session's earliest queued ticket). In a batch of $B$ landings with $P$
+   people and $S_p$ sessions for person $p$, person $p$ receives at least
+   $\lfloor B / P \rfloor$ tickets (or all their queued tickets if fewer), and
+   each of their sessions receives at least $\lfloor (B / P) / S_p \rfloor$.
+   One person's flood of tickets across many agent sessions never delays
+   another person's landing beyond one batch, and one runaway session of a
+   person never starves another session of that same person.
+3. **Per-agent-session and per-person request rate buckets** (`limits/mod.rs`,
+   `bucket.rs`, `auth.rs`, BUG-1663, BUG-1664). `limits::who` hashes bearer
+   tokens with `auth::session_hash` (`veil 2026 hub session token v1`) when
+   probing `hub.caches.session`, matching how `auth::resolve` caches both
+   device and agent sessions, and `AgentGrant` carries the session hash. Each
+   agent session gets its own token bucket in `limits.devices` (`Key::Session`)
+   at `--device-rate` (200/s, 50,000/h by default), and every request of a
+   signed-in person (across all their agent sessions and devices) also charges
+   a per-person bucket in `limits.people` (`Key::Person`) at ten times
+   `--device-rate` (2,000/s, 500,000/h by default).
+4. **Landing counters in the admin-only health metrics** (`limits/health.rs`,
+   `landing/service.rs`, `vl/src/stats_cmd.rs`, BUG-1665). Each project's
+   in-memory `Counts` tracks `landings` (landed tickets), `landing_batches`
+   (committed batches), `landing_conflicts` (tickets stopped on a file
+   conflict), and `landing_rejected` (tickets rejected by branch or access
+   rules at commit time). `GET /v1/projects/{p}/health` returns them inside
+   each project's `Counts` to that project's admins only (non-admins get
+   `403` or `404` for a hidden project) and names no path, branch, or submitter.
+5. **One database commit for the background derive pass (BUG-1593).** Previously,
+   every landing triggered 23 separate auto-commit transactions in the
+   background (`derive::Batch::flush` + `derive_progress` = 4, `query::graph::leased_fill`
+   across 5 view keys = 17, `search::index::commit` for code and names = 2),
+   so `concurrency::bug_1593_a_landing_is_one_database_commit` measured 960
+   commits for 40 landings (24.00 per landing; gate $\le 2$ per landing
+   including the deriver). Now `derive::landing` prepares the derived rows,
+   projection memos, viewer-graph rows, and search-index shard writes while
+   holding the project's deriver lock, uploads new changed-path, projected-snapshot,
+   and search-segment objects to object storage before opening the transaction,
+   and commits all database rows in **one** transaction on `hub.derive.db`
+   (falling back to background `prefill` or `search::index::landed` only when
+   a batch is larger than 16 snapshots / 64 file changes or races another
+   writer). Measured on `concurrency::bug_1593_a_landing_is_one_database_commit`:
+   **Before:** 960 transactions committed for 40 landings (**24.00** per
+   landing; 1 push + 23 background). **After:** **81** transactions committed
+   for 40 landings (**2.02** per landing: 1 push commit + 1 background derive
+   commit).
+
+**Guarantees and tests** (`crates/veil-server/tests/server_hub/limits.rs`,
+`concurrency.rs`, unit tests in `limits/landing.rs`):
+
+| # | Guarantee | Measured / Verified | Test |
+|---|---|---|---|
+| 1 | A flood of landings from one person or one session never makes another person's landing wait longer than its fair share | Alice queues 24 landings across 4 agent sessions (6 per session) while the branch is held, Bob queues 2, and Alice's 5th session queues 2. In a batch of 8, Bob's 2 landings take positions `[1, 5]` (1st and 2nd rounds; fair share $\ge 4$, never waiting behind Alice's 24), and Alice's 6 slots are split `[0, 2, 3, 4, 6, 7]` across her 5 sessions (at most 2 from any session). | `limits::a_flood_of_landings_from_one_person_or_session_never_delays_another_beyond_their_fair_share`; `limits::landing::tests::fair_batch_round_robins_people_then_sessions` |
+| 2 | Every bound gives a clear, actionable refusal and never drops or lands anything wrongly; a refused landing never half-lands | With session bound 3 and person bound 5, a session's 4th queued landing and a person's 6th queued landing across two sessions are refused `429 rate_limited` (`retry_after_ms > 0`, `Retry-After` header) on `/land` (edits and snapshot) and `push`, naming no hidden path or other person's project; refused snapshot ids are absent from `snapshots` and `landing_queue`; when the branch is released, the 5 admitted landings all land cleanly (`5` commits on `main`). | `limits::every_landing_bound_refuses_clearly_names_nothing_hidden_and_never_half_lands` |
+| 3 | Counters reach admins only, and name no hidden path or project the admin can't see | Outsiders get `404`, non-admin members get `403`, and an admin of project A only sees project A's `landings`, `landing_batches`, `landing_conflicts`, and `landing_rejected` with no secret path or project B name in the response body. | `limits::landing_counters_in_health_metrics_reach_admins_only_and_name_nothing_hidden` |
+| 4 | Bounds hold across two servers sharing the database | Two `TestHub` servers sharing PostgreSQL and S3 enforce `session_outstanding = 3` and `person_outstanding = 5` across alternating and concurrent submits to both servers (`SELECT … FROM people WHERE id = $1 FOR UPDATE`), admitting 5 and refusing the rest with `429`. | `limits::landing_bounds_hold_across_two_servers_sharing_the_database` |
+| 5 | 1 database commit per landing, the deriver's aside (BUG-1593) | 40 sequential landings commit 81 transactions total (2.02 per landing: 1 for the landing, 1 for the background derive/memo/search pass), down from 960 (24.00 per landing). | `concurrency::bug_1593_a_landing_is_one_database_commit` |
+

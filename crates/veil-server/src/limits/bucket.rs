@@ -40,7 +40,7 @@ pub enum Key {
     /// came with.
     Device([u8; 32]),
     /// An agent session (S11, `docs/HUB.md` §13.32): its stored session
-    /// hash, at [`Settings::device`]'s rate.
+    /// hash, at [`super::Settings::device`]'s rate.
     Session([u8; 32]),
     /// A signed-in person (`people.id`): the 10× umbrella bucket over all
     /// of their devices and agent sessions.
