@@ -481,11 +481,33 @@ impl Ctx {
     }
 
     pub fn rev(&self, spec: &str) -> Result<ObjectId> {
+        let trimmed = spec.trim();
+        let base_spec = trimmed.trim_end_matches('-');
+        if let Some(branch) = base_spec.strip_suffix("@tested") {
+            let branch = branch.strip_prefix("origin/").unwrap_or(branch);
+            if !self.repo.view().remote_tags.contains_key(&format!("origin/{branch}@tested")) {
+                if let Ok((client, _)) = crate::hub_cmd::client_for(self, "origin") {
+                    if let Ok(Some(t)) = client.tested(branch) {
+                        if !self.repo.store().has(&t.snapshot) && self.repo.is_partial() {
+                            let _ = self.repo.deepen(&[t.snapshot], 1);
+                        }
+                        if self.repo.store().has(&t.snapshot) {
+                            let mut cur = t.snapshot;
+                            for _ in 0..(trimmed.len() - base_spec.len()) {
+                                let s = self.repo.snapshot(&cur)?;
+                                cur = *s.parents.first().ok_or_else(|| anyhow!("snapshot {} has no parent", cur.short()))?;
+                            }
+                            return Ok(cur);
+                        }
+                    }
+                }
+            }
+        }
         // A thin clone: a full snapshot id it does not hold is asked of the
         // server, and a walk that reaches beyond what it holds goes on
         // through the server's history pages.
         if self.repo.is_partial() {
-            if let Ok(id) = veil_core::ObjectId::from_hex(spec.trim().trim_end_matches('-')) {
+            if let Ok(id) = veil_core::ObjectId::from_hex(base_spec) {
                 if !self.repo.store().has(&id) {
                     self.repo.deepen(&[id], 1)?;
                 }

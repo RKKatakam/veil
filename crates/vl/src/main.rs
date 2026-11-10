@@ -23,6 +23,7 @@ mod agent;
 mod api;
 mod attr_cmd;
 mod auto_gc;
+mod ci_cmd;
 mod cli;
 mod confine;
 mod ctx;
@@ -468,6 +469,9 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             println!("Recorded attempt {}; the change starts again: {}", out.attempt.short(), one_line(&ctx.repo, &out.change));
         }
         Cmd::Session(SessionCmd::Agent { only, attribution }) => return session_cmd::agent(ctx, only, attribution),
+        Cmd::Session(SessionCmd::Ci { check, only, attribution }) => {
+            return session_cmd::ci(ctx, check.as_deref(), only, attribution)
+        }
         Cmd::Rebase { source, destination } => {
             let src = ctx.rev(source)?;
             let dest = destination.iter().map(|d| ctx.rev(d)).collect::<Result<Vec<_>>>()?;
@@ -531,7 +535,14 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             embargo,
             until,
             scope,
-        } => cmd_merge(ctx, revs, into.as_deref(), message.as_deref(), *embargo, until.as_deref(), scope)?,
+            embargo_for,
+        } => {
+            let (embargo, scope) = match embargo_for.is_empty() {
+                true => (*embargo, scope.clone()),
+                false => (true, embargo_for.join(",")),
+            };
+            cmd_merge(ctx, revs, into.as_deref(), message.as_deref(), embargo, until.as_deref(), &scope)?;
+        }
         Cmd::Embargo(c) => cmd_embargo(ctx, c)?,
         Cmd::Tag(c) => cmd_tag(ctx, c)?,
         Cmd::Cloak { patterns, scope } => {
@@ -700,6 +711,27 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         #[cfg(debug_assertions)]
         Cmd::Pull { remote } if test_remotes::is_path_remote(ctx, remote) => test_remotes::pull(ctx, remote)?,
         Cmd::Pull { remote } => hub_cmd::pull(ctx, remote)?,
+        Cmd::Checks {
+            rev,
+            name,
+            state,
+            summary,
+            url,
+            log,
+            out,
+        } => {
+            return ci_cmd::checks(
+                ctx,
+                rev.as_deref(),
+                name.as_deref(),
+                state.as_deref(),
+                summary.as_deref(),
+                url.as_deref(),
+                log.as_deref(),
+                out.json,
+            )
+        }
+        Cmd::Tested { branch, out } => return ci_cmd::tested(ctx, branch, out.json),
         Cmd::Partial(c) => thin::run(ctx, c)?,
         Cmd::Hooks(c) => return hooks::run(ctx, c),
         Cmd::Gc {
@@ -1310,6 +1342,61 @@ fn cmd_embargo(ctx: &mut Ctx, c: &EmbargoCmd) -> Result<()> {
             }
         }
         EmbargoCmd::Release { id, yes } => cmd_embargo_release(ctx, id, *yes)?,
+        EmbargoCmd::Follow { id } => cmd_embargo_follow(ctx, id.as_deref())?,
+    }
+    Ok(())
+}
+
+fn cmd_embargo_follow(ctx: &mut Ctx, id: Option<&str>) -> Result<()> {
+    if ctx.repo.config().remotes.contains_key("origin") {
+        if let Ok((client, cfg)) = hub_cmd::client_for(ctx, "origin") {
+            let _ = hub::pull(&mut ctx.repo, "origin", &client, cfg.only.as_deref())?;
+        }
+    }
+    let print_followed = |repo: &Repo, r: &veil_core::embargo::FollowResult| {
+        let until = match r.until {
+            Some(u) => format!("until {}", fmt_deadline(u)),
+            None => "manual release".to_string(),
+        };
+        println!(
+            "{}  scope:{}  {}  → {}",
+            bold(&safe(&r.id)),
+            safe(&r.scope),
+            yellow(&until),
+            one_line(repo, &r.tip)
+        );
+        if !r.conflicts.is_empty() {
+            warn_untrusted(&format!("conflicts in: {}", r.conflicts.join(", ")));
+        }
+    };
+    let push_if_rebased = |ctx: &mut Ctx, r: &veil_core::embargo::FollowResult| {
+        if r.rebased && r.conflicts.is_empty() && ctx.repo.config().remotes.contains_key("origin") {
+            if let Ok((client, _)) = hub_cmd::client_for(ctx, "origin") {
+                let branch = veil_core::embargo::embargo_branch(&r.id);
+                let _ = hub::push(&mut ctx.repo, "origin", &client, &[branch], false);
+            }
+        }
+    };
+    let ws = ctx.ws.clone();
+    match id {
+        Some(id) => {
+            let r = veil_core::embargo::follow(&mut ctx.repo, &ws, id, "main", true)?;
+            push_if_rebased(ctx, &r);
+            print_followed(&ctx.repo, &r);
+        }
+        None => {
+            let ids = veil_core::embargo::active_embargoes(&ctx.repo)?;
+            if ids.is_empty() {
+                println!("No active embargoes.");
+                return Ok(());
+            }
+            let single = ids.len() == 1;
+            for eid in ids {
+                let r = veil_core::embargo::follow(&mut ctx.repo, &ws, &eid, "main", single)?;
+                push_if_rebased(ctx, &r);
+                print_followed(&ctx.repo, &r);
+            }
+        }
     }
     Ok(())
 }
@@ -2184,7 +2271,10 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
         WsCmd::New { name, rev } => {
             let bases = match rev {
                 Some(r) => vec![ctx.rev(r)?],
-                None => ctx.repo.snapshot(&ctx.wc()?)?.parents.clone(),
+                None => match ci_cmd::default_ws_base(ctx)? {
+                    Some(tested) => vec![tested],
+                    None => ctx.repo.snapshot(&ctx.wc()?)?.parents.clone(),
+                },
             };
             let wc = ctx.repo.create_workspace(name, bases)?;
             println!("Created virtual workspace {} at {}", bold(name), one_line(&ctx.repo, &wc));

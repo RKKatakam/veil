@@ -4281,3 +4281,223 @@ event draining, tokens and bounds), `crates/vl/src/daemon/{mod,proto,serve}.rs`
 Revert the merge commit. The `watch` field in `.veil/local/checkout.json` is
 optional (`#[serde(default)]`) and ignored by older `vl` builds; `Request::Watch`
 is additive on the daemon socket.
+
+---
+
+### 13.35 S19: CI through the API, land first / test after, and `main@tested`
+
+Design: [`docs/design/server/phase-4-agent-scale.md`](design/server/phase-4-agent-scale.md)
+§4.6 ("CI through the API, not through a clone"), §4.7 ("Agents start from
+`main@tested`"), §5.2 ("Checks, after landing"), §6 Threat 10 ("A compromised
+CI runner").
+
+#### What it builds
+
+* **Migration `0025_ci_and_tested.sql`** (version 25):
+  * `sessions.agent_runner BOOLEAN NOT NULL DEFAULT FALSE`: marks a session
+    as a narrow CI runner session.
+  * `checks (project_id, snapshot, name, state, summary, url, log, runner_id, runner_name, session_paths, admin_only, updated_at)`,
+    primary key `(project_id, snapshot, name)` with index `checks_by_runner
+    (runner_name, updated_at)`.
+  * `tested (project_id, branch, lineage, snapshot, depth, updated_at)`,
+    primary key `(project_id, branch)`.
+* **`.veilrules` check configuration (`crates/veil-server/src/landing/rules.rs`):**
+  * `[branches.<name>] required_checks = ["ci/build", "ci/test", ...]`
+    declares which checks must pass on a snapshot for `<name>@tested` to
+    advance to it (up to 64 checks per branch).
+  * `[checks.<name>] paths = ["src/", ...]` declares the default path
+    prefix grant for a runner minted for `<name>`.
+* **Narrow CI runner sessions (`POST /v1/sessions/ci`, `vl session ci`):**
+  * Mints a short-lived (default 1 hour, max 24 hours) runner session with
+    `agent_runner = true`.
+  * When `check` is named and `only` is omitted, the server reads `.veilrules`
+    on the default branch and narrows `only` to `[checks.<check>].paths`.
+  * The minting caller must be able to read every path in `only` (and an
+    un-narrowed runner session requires project admin or full-view access).
+  * A runner session (`Caller::is_runner()`) is refused on `POST /objects`,
+    `POST /push`, `POST /land`, and `POST /changes` with `403 agent_session`:
+    it can only read what its narrowed grant allows and report check results.
+* **Reporting and reading check results (`POST /v1/projects/{p}/checks`, `GET /v1/projects/{p}/checks`, `vl checks`):**
+  * `POST /v1/projects/{p}/checks` accepts `{snapshot, name, state, summary, url, log}`.
+    The caller's `snapshot` id (real or projected) is resolved to the
+    canonical `commits.snapshot` on `main` (or any project branch), verified
+    against the caller's view, and stored with the runner's readable path
+    footprint (`session_paths`, `admin_only`).
+  * `GET /v1/projects/{p}/checks?rev=<rev>` resolves `rev` (default `main`)
+    through the reader's view, filters stored checks so a reader only sees a
+    check if the reader's `View` can see every path the runner could read
+    (admin-only checks are visible only to admins; path-narrowed checks require
+    `view.sees_under(prefix)` for every prefix in `session_paths`), and
+    projects `CheckResult.snapshot` into the reader's view.
+* **Land first, test after, and `<branch>@tested` (`GET /v1/projects/{p}/tested/{branch}`, `vl tested`):**
+  * Landings (`POST /land`, `POST /changes`, `POST /push`) never wait for CI
+    runners; failing or absent checks never block a landing.
+  * Whenever a check passes on snapshot `S`, `advance_tested` checks each
+    branch whose tip reaches `S` along first-parent ancestry (up to 1,024
+    commits). If `[branches.<branch>].required_checks` is non-empty and every
+    required check has `state = 'pass'` on `S` (under the `.veilrules` at the
+    branch tip), `tested` is updated in a serializable transaction:
+    * Only advances forward: if the existing `tested.snapshot` is on the same
+      first-parent lineage and has `depth <= new_depth` (closer to the tip), a
+      late pass on an older ancestor never moves `<branch>@tested` backwards.
+  * `<branch>@tested` is served in `GET /v1/projects/{p}/tips` (`Tips.tested`,
+    projected per reader), resolved by the server query API
+    (`/q/resolve?rev=main@tested`) and local revset parser (`main@tested`,
+    stored as `origin/main@tested` in `remote_tags` on `vl pull`), and shown
+    by `vl tested`.
+* **Agents and workspaces start from `main@tested` by default:**
+  * `POST /v1/sessions/agent` returns `tested: Option<ObjectId>` (the caller's
+    projected `main@tested`).
+  * `POST /v1/projects/{p}/changes` with `base` omitted (or all-zero) defaults
+    to `<onto.branch>@tested` (falling back to the branch tip when no tested
+    tip is recorded yet).
+  * `vl ws new <name>` (when `-r` is omitted) and `vl change new` (when
+    `--base` is omitted) start from `main@tested` if present in `remote_tags`,
+    while a person can still pass `-r main` or `--base <rev>`.
+
+#### Bounds
+
+* **Per check result:** `name` ≤ 64 bytes (`MAX_CHECK_NAME`, ASCII graphic, no
+  `..`, no control characters); `summary` ≤ 512 bytes (`MAX_SUMMARY_BYTES`, no
+  control characters); `url` ≤ 1,024 bytes (`MAX_URL_BYTES`, `http://` or
+  `https://` only); `log` ≤ 64 KiB (`MAX_LOG_BYTES`, no NUL bytes).
+* **Per snapshot (`MAX_CHECKS_PER_SNAPSHOT = 64`, `MAX_TIP_LOG_BYTES = 256 KiB`):**
+  at most 64 distinct check names per snapshot and at most 32 checks per
+  runner on a single snapshot (`MAX_RUNNER_CHECKS_PER_SNAPSHOT = 32`); when a
+  snapshot's total logs exceed 256 KiB, the oldest check logs on that snapshot
+  are trimmed (`log = NULL`).
+* **Per runner (`MAX_RUNNER_CHECKS = 256`, `MAX_RUNNER_LOG_BYTES = 1 MiB`):**
+  across all snapshots, a runner retains at most 256 check results (oldest
+  evicted) and at most 1 MiB of logs (oldest logs trimmed to `NULL`).
+
+#### Guarantees and their tests (`server_hub::ci`)
+
+| # | Guarantee | Test |
+|---|---|---|
+| 1 | A CI runner sees only what its grant allows. A result names nothing its readers can't see. A runner can't move any branch or land anything. | `runner_sees_only_its_grant_and_results_respect_visibility_and_runner_cannot_write_code`, `agents::every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed` |
+| 2 | `main@tested` only ever moves to a tip whose required checks all passed, never backwards, and correctly across two servers and restarts. | `main_at_tested_moves_only_forward_when_required_checks_pass_across_servers_and_restarts` |
+| 3 | A failing or absent runner never blocks landings; `main@tested` just stays put. | `failing_or_absent_runner_never_blocks_landings_and_tested_stays_put` |
+| 4 | Agents start from `main@tested` by default, and a person can still choose another base. | `agents_and_workspaces_start_from_main_at_tested_by_default_and_person_can_choose_base` |
+| 5 | Results and their logs are bounded per tip and per runner. | `check_results_and_logs_are_bounded_per_tip_and_per_runner` |
+
+#### Threat review (design §6 Threat 10, plus visibility and DoS)
+
+| # | Attacker | Tries | Result | Test |
+|---|---|---|---|---|
+| 1 | A compromised CI runner (`POST /v1/sessions/ci`) | reads paths outside its `[checks.<name>].paths` or `only` grant | refused with `403` on every path-taking route and projected out of every snapshot/tree | guarantee 1 |
+| 2 | A compromised CI runner | pushes objects, moves a branch, lands a change, or creates a server-side change | refused with `403 agent_session` (`Caller::not_runner`) before touching objects or branches | guarantee 1 |
+| 3 | A non-admin user (`dev` without `billing/`) | mints a CI runner session for `ci/billing` (`paths = ["billing/"]`) | refused with `403`: caller cannot delegate paths their own view cannot see | guarantee 1 |
+| 4 | A check runner for a restricted area (`billing/` or admin-only) | writes restricted file contents or paths into `summary`, `url`, or `log` | `GET /checks` filters results by the reader's `View` against the runner's readable footprint (`session_paths`, `admin_only`) and projects `snapshot` into the reader's view | guarantee 1 |
+| 5 | An out-of-order or replayed runner | reports `pass` on an older ancestor after `main@tested` already moved to a newer snapshot, or reports `pass` on only a subset of `required_checks` | `tested` tracks `(lineage, depth)` in Postgres under `SERIALIZABLE` and never moves to a deeper (older) ancestor or an incomplete check set | guarantee 2 |
+| 6 | A dead, slow, or failing CI runner | stalls or reports `fail` on `main` | landings proceed immediately without waiting on CI; `main@tested` remains at the last passing snapshot and agents branch from `main@tested` | guarantee 3, guarantee 4 |
+| 7 | A noisy or hostile runner | floods `POST /checks` with huge logs, control sequences, `javascript:` URLs, or thousands of check names | validated (`MAX_CHECK_NAME`, `MAX_SUMMARY_BYTES`, `MAX_URL_BYTES`, `MAX_LOG_BYTES`) and bounded per snapshot (`64` checks, `256 KiB` logs) and per runner (`256` checks, `1 MiB` logs) | guarantee 5 |
+
+#### Reverting
+
+Revert the merge commit. The new tables (`checks`, `tested`) and column
+(`sessions.agent_runner`) in migration `0025` are ignored by older server
+binaries; `Tips.tested`, `AgentSession.runner`, and `AgentSession.tested` use
+`#[serde(default)]`; and `<branch>@tested` tags in `remote_tags` are ordinary
+remote tag entries.
+
+### 13.31 S22: embargoes through the server, and the release service (built)
+
+Milestone S22 of `docs/design/server/phase-4-agent-scale.md` (§4.8, decisions 8
+and 9, §6 rows 8–12, §8). Code: `crates/veil-server/src/embargo.rs` (push
+validation and recording, visibility checks, `release_due` and `release_one`,
+`release_route`), migration `0023_embargoes.sql` (`branches.hidden_for_embargo`,
+`embargo_lines`, `embargo_snapshots`), minimal wiring in `sync.rs`, `api.rs`,
+`landing/`, `changes.rs`, `query/mod.rs`, `search/` and `derive/mod.rs`,
+`veil-core/src/embargo.rs` (`embargo_branch`, `embargo_id_of_branch`,
+`active_embargoes`, `follow`), `veil-core/src/hub/wire.rs` (`PushRequest.embargoes`,
+`Tips.embargoes`), and `crates/vl/src/hub.rs` (`vl merge --embargo-for`,
+`vl push`, `vl pull`, `vl embargo follow`, `vl embargo release`). Nothing new
+is encrypted: embargoes are server-enforced permissions that turn public at a
+deadline.
+
+```text
+vl merge SOURCE --embargo UNTIL [--embargo-for GROUP...] [-m MSG]
+vl embargo follow [ID]
+vl embargo release ID
+```
+
+#### The design as built
+
+* **Hidden embargo lines (`embargo/<id>`).** When an embargoed merge into a
+  branch (`main`) is pushed and its scope's groups exist on the server, `vl push`
+  sends the `EmbargoRecord` in `PushRequest.embargoes` and directs the branch
+  update to `embargo/<id>`. The server (`embargo::prepare_push`) checks that the
+  caller is a member of one of the embargo's groups (or an admin) and that every
+  named group exists on the project, diverts any push of `main` carrying an
+  unreleased embargo onto `embargo/<id>`, stores the branch with
+  `branches.hidden_for_embargo = <id>`, records `(project_id, embargo_id,
+  group_names, target_branch, embargo_branch, until_ms, released_at,
+  record_json, created_by, created_at)` in `embargo_lines`, and tags every
+  snapshot on the line (real, origin, and projected) in `embargo_snapshots`.
+  The target branch (`main`) does not move until release.
+* **Visibility before release.** While `embargo_lines.released_at` is `NULL`:
+  * Only members of `embargo_lines.group_names` and project admins see
+    `embargo/<id>` in `GET /v1/projects/{p}/tips` (along with its `EmbargoRecord`
+    in `Tips.embargoes`) and in `POST /v1/projects/{p}/history`.
+  * `embargo_snapshots` rows for an unreleased embargo are invisible to
+    everyone outside the embargo by every route: `sync::resolve_for`,
+    `sync::history`, `sync::fetch`, `POST /v1/projects/{p}/land`,
+    `POST /v1/projects/{p}/changes`, `GET /v1/projects/{p}/q/…`, and
+    `GET /v1/projects/{p}/q/search` and `grep`. Every refusal uses the exact
+    same status code and message as a non-existent revision or branch (`404`, or
+    `400 snapshot … was not uploaded`).
+  * S12's deriver (`derive::catch_up`) and S15's search indexer (`search::index`)
+    skip `branches WHERE hidden_for_embargo IS NOT NULL`, so embargoed snapshots
+    never enter the derived commit graph, viewer graphs or search shards before
+    release, and neither `policy_version` nor any public branch tip changes when
+    an embargo is pushed.
+* **`vl embargo follow [ID]`.** Pulls from `origin` (receiving `Tips.embargoes`
+  and `origin/embargo/<id>` tags for the embargoes the caller is in), saves each
+  `EmbargoRecord` into the local keychain, rebases `embargo/<id>` onto the
+  newest tip of `main` when `main` moved ahead, pushes the rebased embargo line,
+  and checks out the hidden line (when one unreleased embargo is active or `ID`
+  is given) or lists the caller's active embargoes. Someone outside the embargo
+  receives neither the branch nor the record, and `vl embargo follow <id>` fails
+  with the same message as for an unknown id.
+* **Scheduled release and landing at release.** Every server runs a background
+  release task (`embargo::run_loop`) that calls `embargo::release_due`:
+  * **Database clock and idempotent landing:** deadlines are compared solely
+    against PostgreSQL's `clock_timestamp()` (`until_ms <= (extract(epoch FROM
+    clock_timestamp()) * 1000)::BIGINT`), never a client's or an application
+    server's local clock.
+  * **Landing onto the target branch:** for each due embargo whose hidden
+    branch still exists, `release_one` queues a deterministic landing ticket
+    (`embargo-<project_id>-<embargo_id>`) onto `target_branch` (`main`) with
+    `ON CONFLICT (ticket) DO NOTHING` and waits for S17's fenced landing service
+    to land the embargoed stack onto `target_branch` once, recording each
+    server-signed snapshot's author in `snapshots.author` (BUG-1581).
+  * **Clearing the embargo:** in one transaction after the landing succeeds,
+    `release_one` sets `embargo_lines.released_at` and updates
+    `record_json.released_at`, deletes `branches WHERE name = 'embargo/<id>'`,
+    deletes the embargo's `embargo_snapshots` rows, notifies `pg_notify` on
+    `TIPS_CHANNEL`, and wakes `derive::landed` so derived history and search
+    catch up on `main`.
+  * **Retries and conflicts:** if a release attempt fails before finalizing or
+    hits a content conflict on `target_branch`, `released_at` remains `NULL`, so
+    a transient failure is retried on the next tick and a conflicted line is
+    kept on `embargo/<id>` for a member to rebase and push again.
+  * **Early release (`vl embargo release <id>` and `POST …/embargoes/{id}/release`):**
+    when a member of the embargo (or an admin) pushes an `EmbargoRecord` with
+    `released_at` set or calls `release_route` (which drops bulkhead gates via
+    `limits::leave_gates` before waiting, BUG-1635), `embargo::release_one`
+    lands the embargo on `target_branch` and releases it immediately.
+
+#### Guarantees and threat review (phase 4 §6 rows 8–12, and S22's 5 guarantees)
+
+| # | Guarantee / Threat | Mitigation | Test (`server_hub::embargo`) |
+|---|---|---|---|
+| 1 | Embargoed content is invisible to everyone outside the embargo until release, by every route | `embargo/<id>` filtered from `tips` and `history`; `embargo_snapshots` refused identically to unknown ids in `fetch`, `land`, `changes`, `q/…`, `q/search`, `q/grep`; skipped by `derive` and `search::index` | `guarantee_1_embargoed_content_is_invisible_outside_the_embargo_by_every_route` |
+| 2 | Release happens at the deadline and never before (clock skew, restarts, several servers, failed release job retried) | Deadlines judged by PostgreSQL `clock_timestamp()`; deterministic ticket `embargo-<project>-<id>`; failed release leaves `released_at IS NULL` and retries on the next tick | `guarantee_2_release_happens_at_the_deadline_and_never_before` |
+| 3 | Landing at release puts exactly the embargoed changes on `main`, once | `release_one` queues and lands the hidden line's stack onto `main` through S17's fenced landing service before `released_at` commits, recording `snapshots.author` | `guarantee_3_landing_at_release_puts_exactly_the_embargoed_changes_on_main_once` |
+| 4 | `vl embargo follow` shows a member only what they're in | `Tips.embargoes` and `embargo/<id>` branches are filtered by the caller's group memberships (or admin); `vl embargo follow` pulls, rebases, and checks out only visible embargoes | `guarantee_4_vl_embargo_follow_shows_a_member_only_what_they_are_in` |
+| 5 | Nobody outside the embargo learns that it exists, beyond what decision 8 allows | `main` and `policy_version` do not move when an embargo is pushed; probing `embargo/<id>` or its snapshots returns the exact same `404`/`400` as a random non-existent name | `guarantee_5_nobody_outside_the_embargo_learns_that_it_exists` |
+| 6 | S14: `q/blame` and `q/history` (with `follow` across renames) never show embargoed content, paths or versions outside the embargo | `query::resolve_rev` and `query::history` cursors check `embargo::is_withheld_for`; hidden `embargo/<id>` branches are excluded from `derive`, so embargoed paths on `main` answer byte-for-byte as missing paths (`404`) | `s14_blame_and_file_history_never_show_embargoed_content_paths_or_versions` |
+| 7 | S11: an agent session sees and lands embargoed work only if its person is in the embargo; narrowed sessions stay within their paths; release landing checks `landing::agent_stack` | `/v1/projects/{p}/embargoes/{id}/release` classified in `agents::every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed`; `embargo::release_one` enforces `landing::agent_stack` when an agent session asks for release | `s11_agent_sessions_and_narrowing_on_embargoes_and_release_landing` |
+| 8 | S6: the Veil daemon never serves an embargoed object to a client outside the embargo | Outsiders receive grants only for projections without the embargo; their root trees never reach embargoed trees or blobs in the daemon's warm store | `s6_daemon_never_serves_an_embargoed_object_outside_the_embargo` |
+| 9 | S17: the release landing records `snapshots.author`, gives back its bulkhead places before waiting (`limits::leave_gates`), and lands once across two servers | `release_one` drops bulkhead gates before `landing::wait`, `Services::waiters` fans out deterministic ticket outcomes to all concurrent waiters, and `landing::service` records each change's author in `snapshots.author` | `s17_release_landing_records_author_leaves_bulkhead_gates_and_lands_once_across_two_servers` |
+

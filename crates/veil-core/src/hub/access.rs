@@ -252,6 +252,17 @@ impl<'a> View<'a> {
         self.admin || self.read.iter().any(|r| *r)
     }
 
+    /// Does this viewer see `path` or anything below it?
+    pub fn sees_under(&self, path: &str) -> bool {
+        if self.admin || self.read(path) {
+            return true;
+        }
+        let path = crate::vpath::nfc(path);
+        self.policy.rules.iter().zip(&self.read).any(|(r, &read)| {
+            read && (r.path.len() > path.len() && r.path.starts_with(&*path) && r.path.as_bytes()[path.len()] == b'/')
+        })
+    }
+
     /// A key that is equal for two viewers exactly when they read the same
     /// paths: projections are cached under it. A narrowing does not change
     /// it: an agent session's history is its person's projection. Server-side only: it hashes

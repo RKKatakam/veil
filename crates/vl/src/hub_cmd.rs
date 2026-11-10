@@ -675,11 +675,28 @@ pub fn change(repository: Option<&Path>, cmd: &crate::cli::ChangeCmd) -> Result<
         }
     }
     let base = match base {
-        Some(b) => ObjectId::from_hex(b).map_err(|_| anyhow!("--base takes a snapshot id (hex)"))?,
+        Some(b) => match ObjectId::from_hex(b) {
+            Ok(id) => id,
+            Err(_) => {
+                let tips = client.tips()?.ok_or_else(|| anyhow!("no project {} that you can see", safe(&url.project)))?;
+                if let Some(branch) = b.strip_suffix("@tested") {
+                    *tips.tested.get(branch).ok_or_else(|| anyhow!("no tested snapshot on '{branch}' yet"))?
+                } else {
+                    *tips
+                        .branches
+                        .get(b.as_str())
+                        .ok_or_else(|| anyhow!("--base takes a snapshot id (hex), a branch name, or <branch>@tested"))?
+                }
+            }
+        },
         None => {
             let tips = client.tips()?.ok_or_else(|| anyhow!("no project {} that you can see", safe(&url.project)))?;
             let branch = onto.clone().unwrap_or(tips.default_branch.clone());
-            *tips.branches.get(&branch).ok_or_else(|| anyhow!("no branch '{}' to start from: give --base", safe(&branch)))?
+            tips.tested
+                .get(&branch)
+                .or_else(|| tips.branches.get(&branch))
+                .copied()
+                .ok_or_else(|| anyhow!("no branch '{}' to start from: give --base", safe(&branch)))?
         }
     };
     let req = ChangeRequest {

@@ -39,3 +39,5 @@ mod agents;
 mod daemon;
 mod limits;
 mod workspaces;
+mod ci;
+mod embargo;

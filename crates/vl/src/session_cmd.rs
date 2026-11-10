@@ -30,7 +30,38 @@ pub fn agent(ctx: &mut Ctx, only: &[String], a: &AgentArgs) -> Result<ExitCode> 
         attribution,
         only,
         seconds: None,
+        runner: false,
     })?;
     println!("{}", serde_json::to_string_pretty(&session)?);
     Ok(ExitCode::SUCCESS)
 }
+
+pub fn ci(ctx: &mut Ctx, check: Option<&str>, only: &[String], a: &AgentArgs) -> Result<ExitCode> {
+    let attribution = match a.agent.clone().or_else(|| check.map(str::to_string)) {
+        Some(agent) => {
+            let attr = Attribution {
+                agent,
+                task: a.task.clone(),
+                prompt: a.prompt_ref.clone(),
+                run: a.run.clone(),
+            };
+            if let Err(why) = attr.validate() {
+                bail!("--agent: {why}");
+            }
+            Some(attr)
+        }
+        None => None,
+    };
+    let only: Vec<String> = only.iter().map(|p| p.trim_start_matches("./").to_string()).collect();
+    let (client, _) = client_for(ctx, "origin")?;
+    let session = client.ci_session(&veil_core::hub::ci::CiSessionRequest {
+        project: client.url.project.clone(),
+        check: check.map(str::to_string),
+        only,
+        attribution,
+        seconds: None,
+    })?;
+    println!("{}", serde_json::to_string_pretty(&session)?);
+    Ok(ExitCode::SUCCESS)
+}
+

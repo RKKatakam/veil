@@ -513,6 +513,10 @@ pub enum Cmd {
         /// Scope that can see the embargoed changes before release.
         #[arg(long, default_value = "team")]
         scope: String,
+        /// Server groups that can see the embargoed changes before release
+        /// (implies `--embargo`).
+        #[arg(long = "embargo-for", value_name = "GROUP", num_args = 1..)]
+        embargo_for: Vec<String>,
     },
     /// Manage embargoes created by delayed-visibility merges.
     #[command(subcommand)]
@@ -733,6 +737,43 @@ pub enum Cmd {
         #[arg(default_value = "origin")]
         remote: String,
     },
+    /// Show or record CI check results on a snapshot (`POST / GET …/checks`).
+    ///
+    /// Without `--state`, lists the checks on REV (default: the server's
+    /// default branch) that you can see. With `--name` and `--state`, records
+    /// a check result on REV.
+    Checks {
+        /// Snapshot or revision to inspect or record a check on (default: the
+        /// server's default branch).
+        #[arg(short, long)]
+        rev: Option<String>,
+        /// Check name (`ci/build`, `ci/test`), when recording a result.
+        #[arg(long, value_name = "CHECK")]
+        name: Option<String>,
+        /// Check state (`pending`, `pass`, `fail`, or `error`), when recording
+        /// a result.
+        #[arg(long, value_name = "STATE")]
+        state: Option<String>,
+        /// Short summary of the check result (at most 1 KiB).
+        #[arg(long)]
+        summary: Option<String>,
+        /// URL to the check run (at most 1 KiB).
+        #[arg(long)]
+        url: Option<String>,
+        /// Log excerpt of the check run (at most 64 KiB).
+        #[arg(long)]
+        log: Option<String>,
+        #[command(flatten)]
+        out: JsonOut,
+    },
+    /// Print the newest tested snapshot on a branch (`<branch>@tested`).
+    Tested {
+        /// Branch name.
+        #[arg(default_value = "main")]
+        branch: String,
+        #[command(flatten)]
+        out: JsonOut,
+    },
     /// A thin clone: what it holds, the bound of its object cache, and
     /// fetching everything (`vl partial full`).
     #[command(subcommand)]
@@ -858,6 +899,8 @@ impl Cmd {
             | Cmd::Stats(stats_cmd::StatsArgs { out })
             | Cmd::Duplicate(rewrite_cmd::DuplicateArgs { out, .. })
             | Cmd::CherryPick(rewrite_cmd::CherryPickArgs { out, .. })
+            | Cmd::Checks { out, .. }
+            | Cmd::Tested { out, .. }
             | Cmd::Attr(attr_cmd::AttrArgs { cmd: attr_cmd::AttrCmd::Check { out, .. } }) => out,
             _ => return false,
         };
@@ -922,6 +965,13 @@ pub enum EmbargoCmd {
         /// Do not ask for confirmation (required when stdin is not a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
+    },
+    /// Switch to an embargo's hidden line (`embargo/<id>`), rebasing it onto
+    /// the newest tip of `main` first; with no ID, list and update the
+    /// embargoes you are in.
+    Follow {
+        /// Embargo id, from `vl embargo list`.
+        id: Option<String>,
     },
 }
 
@@ -1293,6 +1343,24 @@ pub enum SessionCmd {
         #[command(flatten)]
         attribution: crate::agent::AgentArgs,
     },
+    /// Make a CI runner session on the project's server (origin), and print
+    /// it as JSON.
+    ///
+    /// A runner session reads only what its grant allows (narrowed by `--only`
+    /// or `[checks.<name>].paths` in `.veilrules`) and writes only CI check
+    /// results (`POST /v1/projects/{p}/checks`); it cannot upload objects,
+    /// push, create changes, or land anything.
+    Ci {
+        /// Check name (`ci/build`, `ci/test`); when `--only` is omitted,
+        /// narrows to `[checks.<name>].paths` from `.veilrules`.
+        #[arg(long, value_name = "CHECK")]
+        check: Option<String>,
+        /// Narrow the session to these folders or files (from the project root).
+        #[arg(long, value_name = "PATH", num_args = 1..)]
+        only: Vec<String>,
+        #[command(flatten)]
+        attribution: crate::agent::AgentArgs,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1306,7 +1374,7 @@ pub enum WsCmd {
     New {
         /// Workspace name.
         name: String,
-        /// Base revision (default: the parents of @, like a fresh checkout).
+        /// Base revision (default: `main@tested` when origin has one, else the parents of @).
         #[arg(short, long)]
         rev: Option<String>,
     },

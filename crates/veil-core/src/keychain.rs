@@ -927,6 +927,16 @@ impl EmbargoRecord {
         self.released_at.is_some() || self.until.is_some_and(|u| u <= crate::now_millis())
     }
 
+    /// The groups that may see the embargoed work before release.
+    pub fn groups(&self) -> Vec<String> {
+        self.scope
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
     /// The fields fixed at creation (a record received with other ones is
     /// another embargo under the same id, and is refused).
     fn body(&self) -> (&str, &str, Option<i64>, i64) {
@@ -2092,15 +2102,22 @@ impl Keychain {
         }
     }
 
-    /// A new embargo for the group `scope`, released at `until` (or by
+    /// A new embargo for the group(s) `scope`, released at `until` (or by
     /// hand). Plain text: who may see the work is a permission.
     pub fn create_embargo(&self, scope: &str, until: Option<i64>) -> Result<String> {
-        validate_scope_name(scope)?;
+        let groups: Vec<&str> = scope.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        if groups.is_empty() {
+            validate_scope_name(scope)?;
+        }
+        for g in &groups {
+            validate_scope_name(g)?;
+        }
+        let scope = groups.join(",");
         let id = hex::encode(random_bytes::<5>());
         let rec = EmbargoRecord {
             format: EMBARGO_FORMAT,
             id: id.clone(),
-            scope: scope.to_string(),
+            scope,
             until,
             released_at: None,
             created: crate::now_millis(),
@@ -2242,7 +2259,8 @@ impl Keychain {
     pub fn merge_embargo(&self, incoming: &EmbargoRecord) -> Result<Option<String>> {
         let _lock = self.lock_meta()?;
         let id = &incoming.id;
-        if Self::embargo_path(id).is_err() || validate_scope_name(&incoming.scope).is_err() {
+        let groups = incoming.groups();
+        if Self::embargo_path(id).is_err() || groups.is_empty() || groups.iter().any(|g| validate_scope_name(g).is_err()) {
             return Ok(Some(format!("embargo record with invalid id or scope '{id}' rejected")));
         }
         let Some(mut local) = self.load_embargo(id)? else {

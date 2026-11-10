@@ -1636,6 +1636,13 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         // S6: the server's public key that grants verify under, for the Veil
         // daemon; no path or revision (merge of S6).
         ("/v1/grant-key", "none"),
+        // S19: CI runner sessions, check results, and `<branch>@tested`.
+        ("/v1/sessions/ci", "person"),
+        ("/v1/projects/{p}/checks", "rev"),
+        ("/v1/projects/{p}/tested/{branch}", "rev"),
+        // S22: embargo release lands the hidden line onto its target branch
+        // through `landing::agent_stack` (merge of S22).
+        ("/v1/projects/{p}/embargoes/{id}/release", "write"),
     ];
     let routes: Vec<&str> = API.split(".route(\"").skip(1).map(|s| s.split('"').next().unwrap()).collect();
     assert!(routes.len() >= 40, "the router was not read: {routes:?}");

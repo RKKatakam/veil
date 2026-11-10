@@ -344,7 +344,7 @@ pub async fn resume(hub: Arc<Hub>, project: Option<i64>) {
     let projects: Result<Vec<i64>> = sqlx::query_scalar(
         "SELECT DISTINCT b.project_id FROM branches b LEFT JOIN derive_progress d \
          ON d.project_id = b.project_id AND d.index_name = $1 AND d.index_version = $2 AND d.branch = b.name \
-         WHERE d.through_snapshot IS DISTINCT FROM b.target AND ($3::bigint IS NULL OR b.project_id = $3)",
+         WHERE b.hidden_for_embargo IS NULL AND d.through_snapshot IS DISTINCT FROM b.target AND ($3::bigint IS NULL OR b.project_id = $3)",
     )
     .bind(INDEX.0)
     .bind(INDEX.1)
@@ -405,6 +405,15 @@ pub enum Scope {
     Branches(Vec<String>),
     /// One snapshot of committed history and what is below it (on demand).
     Snapshot(ObjectId),
+}
+
+/// Derive every public branch of `project` and prefill viewer graphs.
+pub async fn catch_up_project(hub: &Arc<Hub>, project: i64) -> Result<Stats> {
+    let stats = catch_up(hub, project, Scope::All).await?;
+    if !stats.branches.is_empty() {
+        memo_tips(hub, project, &stats.branches).await?;
+    }
+    Ok(stats)
 }
 
 /// Derive what `scope` reaches and is not derived yet, under the project's
@@ -505,12 +514,17 @@ fn run(cx: &Cx, scope: Scope) -> Result<Stats> {
     b.prepare_lists()?;
     let rows: Vec<(String, String)> = match &scope {
         Scope::Snapshot(_) => Vec::new(),
-        Scope::All => cx.db(|| sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1").bind(cx.project()).fetch_all(pool))?,
+        Scope::All => cx.db(|| {
+            sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL")
+                .bind(cx.project())
+                .fetch_all(pool)
+        })?,
         Scope::Branches(names) => cx.db(|| {
             sqlx::query_as(
                 "SELECT b.name, b.target FROM branches b LEFT JOIN derive_progress d \
                  ON d.project_id = b.project_id AND d.index_name = $3 AND d.index_version = $4 AND d.branch = b.name \
-                 WHERE b.project_id = $1 AND (b.name = ANY($2) OR d.through_snapshot IS DISTINCT FROM b.target)",
+                 WHERE b.project_id = $1 AND b.hidden_for_embargo IS NULL \
+                 AND (b.name = ANY($2) OR d.through_snapshot IS DISTINCT FROM b.target)",
             )
             .bind(cx.project())
             .bind(names)
@@ -968,11 +982,12 @@ impl<'a> Batch<'a> {
 /// the branches named (a landing's) are touched (BUG-870).
 pub async fn memo_tips(hub: &Arc<Hub>, project_id: i64, branches: &[String]) -> Result<()> {
     let Some((project, viewers)) = viewers_of(hub, project_id).await? else { return Ok(()) };
-    let branches: Vec<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = ANY($2)")
-        .bind(project_id)
-        .bind(branches)
-        .fetch_all(&hub.db)
-        .await?;
+    let branches: Vec<String> =
+        sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = ANY($2) AND hidden_for_embargo IS NULL")
+            .bind(project_id)
+            .bind(branches)
+            .fetch_all(&hub.db)
+            .await?;
     let tips: Vec<ObjectId> = branches.iter().map(|t| ObjectId::from_hex(t).map_err(bad)).collect::<Result<_>>()?;
     let mut keys = HashSet::new();
     let mut failed = Ok(());
