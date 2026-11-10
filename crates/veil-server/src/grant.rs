@@ -177,8 +177,11 @@ async fn grant_root(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snap: Ob
     if viewer.admin {
         return Ok(Some(root));
     }
+    let gce = hub.objects.gc_epoch(project.id);
     let memo = {
-        let mut m = project.id.to_le_bytes().to_vec();
+        let mut m = Vec::with_capacity(16 + root.0.len());
+        m.extend_from_slice(&project.id.to_le_bytes());
+        m.extend_from_slice(&gce.to_le_bytes());
         m.extend_from_slice(&root.0);
         ObjectId::hash(&m)
     };

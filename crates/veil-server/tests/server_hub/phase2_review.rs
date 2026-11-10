@@ -1119,7 +1119,6 @@ fn bug_1780_pack_gc_leaves_stale_db_and_s4_caches_causing_repush_data_loss_and_5
 /// grant whose `root` is missing from storage — breaking S3/S5/S6/S8/S9 object
 /// reads (`404`) for non-admin viewers.
 #[test]
-#[ignore = "BUG-1781: hub.grants.stored caches projected root tree existence across pack_gc, issuing grants whose root tree was deleted (404 on object reads)"]
 fn bug_1781_grants_stored_cache_outlives_pack_gc_breaking_object_reads() {
     let hub = TestHub::start();
     let p = setup_project(&hub);

@@ -1279,3 +1279,96 @@ fn bug_1780_cross_server_repush_and_retained_snapshot_closure() {
     }
 }
 
+/// BUG-1781: Peer server (`hub2`) with BOTH `hub2.grants.stored` AND
+/// `hub2.objects` (`Objects::cache`) warmed before GC on `hub` never skips
+/// re-writing loose projected trees (`t_proj`) after GC deletes them, nor
+/// serves a deleted `t_proj` after branch deletion.
+#[test]
+fn bug_1781_peer_server_grants_stored_and_object_cache_invalidated_on_gc() {
+    use veil_core::hub::grant::{sign_request, Grant};
+
+    let signed_get = |via: &Api, project: &str, grant: &str, grant_key: &str, signer: &veil_core::Identity, id: &ObjectId| {
+        let ts = veil_core::now_millis();
+        let g = Grant::verify(grant, grant_key).unwrap();
+        let sig = format!("{ts}.{}", sign_request(signer, &g, ts, &[*id]));
+        via.get_with(
+            &format!("/v1/objects/{project}/{}", id.hex()),
+            &[("veil-grant", grant), ("veil-chain", ""), ("veil-signature", &sig)],
+        )
+    };
+
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let hub2 = TestHub::beside(&hub);
+    let api1 = hub.api();
+    let api2 = hub2.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+    let dev_id = p.dev.identity();
+
+    // 1. Admin creates `b1` touching `src/sub/vis.txt` and hidden `BILL_DIR/h1.txt`.
+    let mut c1 = Craft::new(&api1, &p.admin, &p.name, "main");
+    c1.file("src/sub/vis.txt", "VISIBLE-PEER-1781\n");
+    c1.file(&format!("{BILL_DIR}/h1.txt"), "HIDDEN-PEER-V1\n");
+    let (_cs1, r1) = c1.push_edited("b1", None, |_| {});
+    assert_eq!(r1.status, 200);
+    assert_eq!(r1.json()["results"][0]["ok"], json!(true));
+    let b1_tip = ObjectId::from_hex(r1.json()["results"][0]["tip"].as_str().unwrap()).unwrap();
+
+    // 2. Warm `hub2.grants.stored` AND `hub2.objects` (`Objects::cache`) by
+    // requesting `tips` and reading `t_proj` directly from `hub2`.
+    let tips1 = api2.tips(Some(&dev_tok), &p.name).unwrap();
+    let g1 = tips1.grants.get("b1").expect("dev grant for b1 on hub2");
+    let gkey = tips1.grant_key.as_ref().unwrap();
+    let t_proj = Grant::read_unverified(g1).unwrap().root;
+    let read1 = signed_get(&api2, &p.name, g1, gkey, &dev_id, &t_proj);
+    assert_eq!(read1.status, 200, "hub2 serves projected root before GC");
+
+    // 3. Delete `b1` on `hub` and run GC on `hub` past retention window.
+    let del = api1.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "b1", "expected": b1_tip.hex(), "new": null}], "force": true}),
+    );
+    assert_eq!(del.status, 200);
+    for off in [0i64, 120_000, 120_001] {
+        hub.rt
+            .block_on(pack_gc::run_project(
+                &hub.hub(),
+                pid,
+                &Options {
+                    min_packs_to_merge: 1,
+                    run_gc: true,
+                    retention_window_ms: 60_000,
+                    pack_grace_ms: 0,
+                    now_offset_ms: off,
+                    ..Options::default()
+                },
+            ))
+            .unwrap();
+    }
+
+    // Old grant `g1` must NOT read deleted `t_proj` from `hub2`'s `Objects::cache`!
+    let stale_read = signed_get(&api2, &p.name, g1, gkey, &dev_id, &t_proj);
+    assert_eq!(stale_read.status, 404, "peer server must not serve GC-deleted projected root from Objects::cache");
+
+    // 4. Push `b2` with the same visible tree and different hidden content, then
+    // ask `hub2` (which had BOTH `grants.stored` and `Objects::cache` warmed!)
+    // to issue the grant and re-store `t_proj`.
+    let mut c2 = Craft::new(&api1, &p.admin, &p.name, "main");
+    c2.file("src/sub/vis.txt", "VISIBLE-PEER-1781\n");
+    c2.file(&format!("{BILL_DIR}/h2.txt"), "HIDDEN-PEER-V2\n");
+    let (_cs2, r2) = c2.push_edited("b2", None, |_| {});
+    assert_eq!(r2.status, 200);
+    assert_eq!(r2.json()["results"][0]["ok"], json!(true));
+
+    let tips2 = api2.tips(Some(&dev_tok), &p.name).unwrap();
+    let g2 = tips2.grants.get("b2").expect("dev grant for b2 on hub2");
+    assert_eq!(Grant::read_unverified(g2).unwrap().root, t_proj);
+
+    // 5. A brand-new peer server `hub3` reads `t_proj` from shared storage (`200 OK`).
+    let hub3 = TestHub::beside(&hub);
+    let read3 = signed_get(&hub3.api(), &p.name, g2, gkey, &dev_id, &t_proj);
+    assert_eq!(read3.status, 200, "hub2 re-wrote t_proj to shared storage so hub3 serves it");
+}
