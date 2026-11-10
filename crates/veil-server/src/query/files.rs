@@ -59,7 +59,7 @@ use super::{
 };
 use crate::{
     derive::{
-        blame::{step, Blame, Meta, Origin, Text},
+        blame::{Blame, Meta, Origin, Text},
         changes::{self, path_key},
     },
     error::{Error, Result},
@@ -76,7 +76,7 @@ pub const CHECKPOINT: u64 = 32;
 const MAX_LINES: usize = MAX_TEXT_BYTES as usize;
 /// Rows of one path read per statement: few first (the version asked for
 /// is usually near), then more.
-const PAGES: [i64; 4] = [8, 64, 512, 1000];
+const PAGES: [i64; 3] = [64, 512, 1000];
 /// Rows per insert statement.
 const ROWS_PER_STATEMENT: usize = 500;
 /// Rows a fill remembers before it forgets them (they are written by
@@ -702,7 +702,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         }
         let e = e.as_ref().unwrap();
         let (blob, bytes) = self.t.content(&e.id)?;
-        if !blob || bytes.len() as u64 > MAX_TEXT_BYTES || bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
+        if !blob || bytes.len() as u64 > MAX_TEXT_BYTES || std::ffi::CStr::from_bytes_until_nul(&bytes).is_ok() || std::str::from_utf8(&bytes).is_err() {
             return Ok(None);
         }
         Ok(Some(Text::new(e.id, bytes)))
@@ -785,56 +785,242 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         // version above it is computed; kept as it goes.
         let mut done: HashMap<Version, Done> = HashMap::new();
         let computed = nodes.values().filter(|n| !n.kept).count() as u64;
-        for v in order {
-            let (change, parents, kept) = {
-                let n = &nodes[&v];
-                (n.change.clone(), n.parents.clone(), n.kept)
-            };
-            let out: Done = if kept {
-                match (self.kept_blame(&v)?, self.text(&change.new)?) {
-                    (Some(b), Some(t)) if t.lines.len() == b.lines.len() => Some((t, Arc::new(b))),
-                    (Some(_), Some(_)) => return Err(bad("a kept blame does not match its version")),
-                    (_, None) => None,
-                    // Dropped since (the view key's cap): computed again,
-                    // from scratch below it.
-                    (None, Some(_)) => return Err(Error::new(StatusCode::SERVICE_UNAVAILABLE, "warming", "this blame is being prepared; try again in a few seconds")),
-                }
-            } else {
-                match self.text(&change.new)? {
-                    None => None,
-                    Some(text) => {
-                        let inputs: Vec<Option<(&Text, &Blame)>> =
-                            parents.iter().map(|p| p.as_ref().and_then(|p| done.get(p)).and_then(|d| d.as_ref()).map(|(t, b)| (&**t, &**b))).collect();
-                        self.stopped()?;
-                        let me: Origin = (v.id, self.intern(&v.path), self.meta(&v.id)?);
-                        let (b, _) = step(&me, &text, &inputs);
-                        self.f.g.cx.hub().query.blame_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let b = Arc::new(b);
-                        if (b.vd % spacing(computed, b.stored_estimate()) == 0 || v == *start) && !self.keep(&v, &b) && v == *start {
-                            return Err(too_large());
-                        }
-                        Some((text, b))
-                    }
-                }
+        // First load the kept blames at the bottom of the walk.
+        for v in &order {
+            let n = &nodes[v];
+            if !n.kept {
+                continue;
+            }
+            let out: Done = match (self.kept_blame(v)?, self.text(&n.change.new)?) {
+                (Some(b), Some(t)) if t.lines.len() == b.lines.len() => Some((t, Arc::new(b))),
+                (Some(_), Some(_)) => return Err(bad("a kept blame does not match its version")),
+                (_, None) => None,
+                // Dropped since (the view key's cap): computed again,
+                // from scratch below it.
+                (None, Some(_)) => return Err(Error::new(StatusCode::SERVICE_UNAVAILABLE, "warming", "this blame is being prepared; try again in a few seconds")),
             };
             if let Some((t, b)) = &out {
                 held += t.weight() + b.weight();
-            }
-            for p in parents.iter().flatten() {
-                let pn = nodes.get_mut(p).unwrap();
-                pn.left -= 1;
-                if pn.left == 0 && p != start {
-                    if let Some(Some((t, b))) = done.remove(p) {
-                        held -= t.weight() + b.weight();
-                    }
-                }
             }
             done.insert(v.clone(), out);
             if held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes() > self.limits.held {
                 return Err(too_wide());
             }
-            if self.writes.len() >= BATCH_BLAMES || self.pending_bytes >= self.batch_bytes() {
-                self.write()?;
+        }
+        // Process unkept versions in chunks so texts, snapshot metadata, and
+        // parent-to-child line diffs are computed in parallel across a bounded
+        // pool while keeping memory strictly within `self.limits.held`.
+        let unkept: Vec<Version> = order.into_iter().filter(|v| !nodes[v].kept).collect();
+        const CHUNK: usize = 128;
+        const WORKERS: usize = 8;
+        let src = &self.t.g.cx.src;
+        let load_text = |e: &Option<TreeEntry>| -> Result<Option<Arc<Text>>> {
+            if !texty(e) {
+                return Ok(None);
+            }
+            let e = e.as_ref().unwrap();
+            let raw = src.raw(&e.id)?;
+            if !veil_core::object::Object::is_blob_raw(&raw) {
+                return Ok(None);
+            }
+            let veil_core::object::Object::Blob(bytes) = veil_core::object::Object::decode(&raw)? else {
+                return Ok(None);
+            };
+            if bytes.len() as u64 > MAX_TEXT_BYTES || std::ffi::CStr::from_bytes_until_nul(&bytes).is_ok() || std::str::from_utf8(&bytes).is_err() {
+                return Ok(None);
+            }
+            Ok(Some(Text::new(e.id, bytes)))
+        };
+        let mut idx = 0usize;
+        while idx < unkept.len() {
+            self.stopped()?;
+            // Take up to CHUNK versions whose texts fit well within the remaining held budget.
+            let mut end = idx;
+            let mut chunk_text_est = 0usize;
+            while end < unkept.len() && end - idx < CHUNK {
+                let sz = nodes[&unkept[end]].change.new.as_ref().map_or(0, |e| e.size as usize * 2 + 256);
+                let budget_used = held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes();
+                if end > idx && budget_used + chunk_text_est + sz > self.limits.held.saturating_sub(self.limits.held / 8) {
+                    break;
+                }
+                chunk_text_est += sz;
+                end += 1;
+            }
+            let slice = &unkept[idx..end];
+            idx = end;
+            // 1. Load texts and snapshot metadata for all versions in `slice` in parallel.
+            self.f.g.tick()?;
+            let mut missing_metas: Vec<ObjectId> = slice
+                .iter()
+                .map(|v| v.id)
+                .filter(|id| !self.metas.contains_key(id))
+                .collect();
+            missing_metas.sort_unstable();
+            missing_metas.dedup();
+            let mut gens: HashMap<ObjectId, i64> = HashMap::with_capacity(missing_metas.len());
+            let mut db_ids: Vec<String> = Vec::new();
+            for &id in &missing_metas {
+                if id == super::graph::root() {
+                    gens.insert(id, 0);
+                } else {
+                    db_ids.push(id.hex());
+                }
+            }
+            if !db_ids.is_empty() {
+                let cx = self.f.g.cx;
+                let rows: Vec<(String, i64)> = cx.db(|| {
+                    sqlx::query_as("SELECT snapshot, generation FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = ANY($3)")
+                        .bind(cx.project())
+                        .bind(self.f.g.vk)
+                        .bind(&db_ids)
+                        .fetch_all(&cx.hub().db)
+                })?;
+                for (s, g) in rows {
+                    if let Ok(id) = ObjectId::from_hex(&s) {
+                        gens.insert(id, g);
+                    }
+                }
+            }
+            let entries: Vec<Option<TreeEntry>> = slice.iter().map(|v| nodes[v].change.new.clone()).collect();
+            let (loaded_texts, loaded_snaps): (Vec<Result<Option<Arc<Text>>>>, Vec<Result<(ObjectId, Arc<veil_core::object::Snapshot>)>>) =
+                if slice.len() <= 2 && missing_metas.len() <= 2 {
+                    (
+                        entries.iter().map(&load_text).collect(),
+                        missing_metas.iter().map(|&id| Ok((id, src.snapshot(&id)?))).collect(),
+                    )
+                } else {
+                    let next_t = std::sync::atomic::AtomicUsize::new(0);
+                    let next_s = std::sync::atomic::AtomicUsize::new(0);
+                    let out_t: Vec<std::sync::Mutex<Option<Result<Option<Arc<Text>>>>>> = (0..slice.len()).map(|_| std::sync::Mutex::new(None)).collect();
+                    let out_s: Vec<std::sync::Mutex<Option<Result<(ObjectId, Arc<veil_core::object::Snapshot>)>>>> =
+                        (0..missing_metas.len()).map(|_| std::sync::Mutex::new(None)).collect();
+                    std::thread::scope(|s| {
+                        for _ in 0..WORKERS.min(slice.len() + missing_metas.len()) {
+                            s.spawn(|| {
+                                loop {
+                                    let i = next_t.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if i >= entries.len() {
+                                        break;
+                                    }
+                                    let r = load_text(&entries[i]);
+                                    *out_t[i].lock().unwrap() = Some(r);
+                                }
+                                loop {
+                                    let j = next_s.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if j >= missing_metas.len() {
+                                        break;
+                                    }
+                                    let id = missing_metas[j];
+                                    let r = src.snapshot(&id).map(|sn| (id, sn)).map_err(Error::from);
+                                    *out_s[j].lock().unwrap() = Some(r);
+                                }
+                            });
+                        }
+                    });
+                    (
+                        out_t.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect(),
+                        out_s.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect(),
+                    )
+                };
+            for r in loaded_snaps {
+                let (id, sn) = r?;
+                let gen = match gens.get(&id).copied() {
+                    Some(g) => g,
+                    None => self.f.g.get(&id)?.generation,
+                };
+                self.metas.insert(id, Arc::new(Meta::of(&sn, gen)));
+            }
+            let mut chunk_texts: HashMap<Version, Option<Arc<Text>>> = HashMap::with_capacity(slice.len());
+            for (v, r) in slice.iter().zip(loaded_texts) {
+                chunk_texts.insert(v.clone(), r?);
+            }
+            // 2. Precompute parent-to-child line diffs in parallel for all versions in `slice`.
+            let mut diff_jobs: Vec<(Version, usize, Arc<Text>, Arc<Text>)> = Vec::new();
+            for v in slice {
+                let Some(Some(text)) = chunk_texts.get(v) else { continue };
+                for (pi, p) in nodes[v].parents.iter().enumerate() {
+                    let Some(p) = p else { continue };
+                    let pt = chunk_texts
+                        .get(p)
+                        .and_then(|t| t.as_ref())
+                        .or_else(|| done.get(p).and_then(|d| d.as_ref().map(|(t, _)| t)));
+                    if let Some(pt) = pt {
+                        diff_jobs.push((v.clone(), pi, pt.clone(), text.clone()));
+                    }
+                }
+            }
+            let mut pre_maps: HashMap<(Version, usize), crate::derive::blame::ParentMap> = HashMap::with_capacity(diff_jobs.len());
+            if diff_jobs.len() <= 1 {
+                for (v, pi, pt, text) in diff_jobs {
+                    pre_maps.insert((v, pi), crate::derive::blame::diff_parent(&pt, &text));
+                }
+            } else {
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let out: Vec<std::sync::Mutex<Option<crate::derive::blame::ParentMap>>> = (0..diff_jobs.len()).map(|_| std::sync::Mutex::new(None)).collect();
+                std::thread::scope(|s| {
+                    for _ in 0..WORKERS.min(diff_jobs.len()) {
+                        s.spawn(|| loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= diff_jobs.len() {
+                                break;
+                            }
+                            let (_, _, ref pt, ref text) = diff_jobs[i];
+                            let m = crate::derive::blame::diff_parent(pt, text);
+                            *out[i].lock().unwrap() = Some(m);
+                        });
+                    }
+                });
+                for ((v, pi, _, _), m) in diff_jobs.into_iter().zip(out) {
+                    pre_maps.insert((v, pi), m.into_inner().unwrap().unwrap());
+                }
+            }
+            // 3. Propagate blames sequentially in topological order and maintain exact held accounting.
+            for v in slice {
+                let parents = nodes[v].parents.clone();
+                let out: Done = match chunk_texts.remove(v).flatten() {
+                    None => None,
+                    Some(text) => {
+                        self.stopped()?;
+                        let inputs: Vec<Option<(&Blame, crate::derive::blame::ParentMap)>> = parents
+                            .iter()
+                            .enumerate()
+                            .map(|(pi, p)| {
+                                let p = p.as_ref()?;
+                                let (_, pb) = done.get(p)?.as_ref()?;
+                                let pm = pre_maps.remove(&(v.clone(), pi))?;
+                                Some((&**pb, pm))
+                            })
+                            .collect();
+                        let me: Origin = (v.id, self.intern(&v.path), self.meta(&v.id)?);
+                        let (b, _) = crate::derive::blame::step_mapped(&me, text.lines.len(), &inputs);
+                        self.f.g.cx.hub().query.blame_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let b = Arc::new(b);
+                        let should_keep = *v == *start || (b.vd % CHECKPOINT == 0 && b.vd % spacing(computed, b.stored_estimate()) == 0);
+                        if should_keep && !self.keep(v, &b) && *v == *start {
+                            return Err(too_large());
+                        }
+                        Some((text, b))
+                    }
+                };
+                if let Some((t, b)) = &out {
+                    held += t.weight() + b.weight();
+                }
+                for p in parents.iter().flatten() {
+                    let pn = nodes.get_mut(p).unwrap();
+                    pn.left -= 1;
+                    if pn.left == 0 && p != start {
+                        if let Some(Some((t, b))) = done.remove(p) {
+                            held -= t.weight() + b.weight();
+                        }
+                    }
+                }
+                done.insert(v.clone(), out);
+                if held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes() > self.limits.held {
+                    return Err(too_wide());
+                }
+                if self.writes.len() >= BATCH_BLAMES || self.pending_bytes >= self.batch_bytes() {
+                    self.write()?;
+                }
             }
         }
         Ok(done.remove(start).flatten())

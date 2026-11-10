@@ -21,10 +21,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
-use veil_core::{
-    blame::{line_ranges, map_cost, map_lines},
-    ObjectId,
-};
+use veil_core::{blame::line_ranges, ObjectId};
 
 use crate::error::{Error, Result};
 
@@ -234,20 +231,216 @@ impl Text {
     }
 }
 
+/// Precomputed line mapping between a parent version's text `pt` and `text`.
+#[derive(Clone, Debug)]
+pub enum ParentMap {
+    /// Both versions have identical bytes.
+    Same,
+    /// Same line count `len`, differing only at a few isolated line indices `diffs`.
+    Replaced {
+        len: usize,
+        diffs: Vec<usize>,
+        cost: u64,
+    },
+    /// `p` shared lines at the start, `mid` for the differing middle, `s` shared
+    /// lines at the end (referencing the end of `pt`, which has `old_len` lines),
+    /// plus `(coarse, cost)`.
+    Trimmed {
+        old_len: usize,
+        p: usize,
+        mid: Vec<Option<u32>>,
+        s: usize,
+        coarse: bool,
+        cost: u64,
+    },
+}
+
+impl ParentMap {
+    pub fn coarse(&self) -> bool {
+        match self {
+            ParentMap::Same | ParentMap::Replaced { .. } => false,
+            ParentMap::Trimmed { coarse, .. } => *coarse,
+        }
+    }
+
+    pub fn cost(&self) -> u64 {
+        match self {
+            ParentMap::Same => 0,
+            ParentMap::Replaced { cost, .. } | ParentMap::Trimmed { cost, .. } => *cost,
+        }
+    }
+}
+
+/// Compute the line mapping from parent `pt` to `text`.
+pub fn diff_parent(pt: &Text, text: &Text) -> ParentMap {
+    let same = pt.id == text.id || pt.data == text.data;
+    if same {
+        return ParentMap::Same;
+    }
+    let m = pt.lines.len();
+    let n = text.lines.len();
+    if m == n {
+        if let Some(diffs) = veil_core::blame::isolated_replacements(&pt.data, &pt.lines, &text.data, &text.lines) {
+            if diffs.is_empty() {
+                return ParentMap::Same;
+            }
+            let lines = (m + n) as u64;
+            let d = (2 * diffs.len()) as u64;
+            let cost = lines.saturating_add(d.saturating_mul(d));
+            return ParentMap::Replaced { len: n, diffs, cost };
+        }
+    }
+    let (p, mid, s, coarse) = veil_core::blame::map_lines_trimmed(&pt.data, &pt.lines, &text.data, &text.lines);
+    let lines = (m + n) as u64;
+    let search = if coarse {
+        veil_core::textmerge::work_limit(lines as usize)
+    } else {
+        let kept = (p + s + mid.iter().filter(|x| x.is_some()).count()) as u64;
+        let d = lines.saturating_sub(2 * kept);
+        d.saturating_mul(d)
+    };
+    let cost = lines.saturating_add(search);
+    ParentMap::Trimmed {
+        old_len: m,
+        p,
+        mid,
+        s,
+        coarse,
+        cost,
+    }
+}
+
 /// The blame of version `me` (introduced by snapshot `me.0` at path
 /// `me.1`), whose text is `text`, from its parent versions in parent
 /// order (`None`: that parent holds no plain-text version); and what the
 /// diffs cost ([`map_cost`]).
 pub fn step(me: &Origin, text: &Text, parents: &[Option<(&Text, &Blame)>]) -> (Blame, u64) {
-    let n = text.lines.len();
+    let mapped: Vec<Option<(&Blame, ParentMap)>> = parents
+        .iter()
+        .map(|p| p.map(|(pt, pb)| (pb, diff_parent(pt, text))))
+        .collect();
+    step_mapped(me, text.lines.len(), &mapped)
+}
+
+/// Compact `out.origins` if any of the origins in `candidates` (which lost at
+/// least one line) are no longer referenced by `out.lines`.
+fn compact_origins_if_needed(out: &mut Blame, candidates: &[u32]) {
+    if candidates.is_empty() || out.origins.len() <= 1 {
+        return;
+    }
+    let any_dead = candidates.iter().any(|&cand| !out.lines.iter().any(|&(o, _)| o == cand));
+    if !any_dead {
+        return;
+    }
+    let mut used = vec![false; out.origins.len()];
+    for &(o, _) in &out.lines {
+        used[o as usize] = true;
+    }
+    let mut remap = vec![0u32; out.origins.len()];
+    let mut new_origins = Vec::with_capacity(out.origins.len());
+    for (old_o, orig) in std::mem::take(&mut out.origins).into_iter().enumerate() {
+        if used[old_o] {
+            remap[old_o] = new_origins.len() as u32;
+            new_origins.push(orig);
+        }
+    }
+    for (o, _) in &mut out.lines {
+        *o = remap[*o as usize];
+    }
+    out.origins = new_origins;
+}
+
+/// [`step`] when each parent's [`ParentMap`] has already been computed.
+pub fn step_mapped(me: &Origin, n: usize, parents: &[Option<(&Blame, ParentMap)>]) -> (Blame, u64) {
+    // Fast path for the overwhelmingly common single-parent edit case:
+    // copy the parent's blame and patch only the differing lines!
+    if parents.len() == 1 {
+        if let Some((pb, pm)) = &parents[0] {
+            match pm {
+                ParentMap::Same if pb.lines.len() == n => {
+                    let mut out = (*pb).clone();
+                    out.vd = pb.vd + 1;
+                    return (out, 0);
+                }
+                ParentMap::Replaced { len, diffs, cost } if *len == pb.lines.len() && *len == n => {
+                    let mut out = Blame {
+                        vd: pb.vd + 1,
+                        coarse: pb.coarse,
+                        origins: pb.origins.clone(),
+                        lines: pb.lines.clone(),
+                    };
+                    let o = if let Some(pos) = out.origins.iter().position(|x| x.0 == me.0 && Arc::ptr_eq(&x.1, &me.1)) {
+                        pos as u32
+                    } else {
+                        let idx = out.origins.len() as u32;
+                        out.origins.push(me.clone());
+                        idx
+                    };
+                    let mut replaced_origins: Vec<u32> = Vec::with_capacity(diffs.len());
+                    for &d in diffs {
+                        let old_o = out.lines[d].0;
+                        if !replaced_origins.contains(&old_o) {
+                            replaced_origins.push(old_o);
+                        }
+                        out.lines[d] = (o, d as u32 + 1);
+                    }
+                    compact_origins_if_needed(&mut out, &replaced_origins);
+                    return (out, *cost);
+                }
+                ParentMap::Trimmed { old_len, p, mid, s, coarse, cost } if *old_len == pb.lines.len() => {
+                    let mut out = Blame {
+                        vd: pb.vd + 1,
+                        coarse: pb.coarse || *coarse,
+                        origins: pb.origins.clone(),
+                        lines: Vec::with_capacity(n),
+                    };
+                    // 1. Prefix `0..p` comes straight from `pb.lines[0..p]`.
+                    out.lines.extend_from_slice(&pb.lines[..*p]);
+                    // 2. Middle `p..n - s`:
+                    let mut me_idx: Option<u32> = None;
+                    for (i, &mapped_j) in mid.iter().enumerate() {
+                        match mapped_j {
+                            Some(j) if (j as usize) < pb.lines.len() => {
+                                out.lines.push(pb.lines[j as usize]);
+                            }
+                            _ => {
+                                let o = *me_idx.get_or_insert_with(|| {
+                                    if let Some(pos) = out.origins.iter().position(|x| x.0 == me.0 && Arc::ptr_eq(&x.1, &me.1)) {
+                                        pos as u32
+                                    } else {
+                                        let idx = out.origins.len() as u32;
+                                        out.origins.push(me.clone());
+                                        idx
+                                    }
+                                });
+                                out.lines.push((o, (*p + i) as u32 + 1));
+                            }
+                        }
+                    }
+                    // 3. Suffix `n - s..n` comes straight from `pb.lines[old_len - s..old_len]`.
+                    out.lines.extend_from_slice(&pb.lines[*old_len - *s..]);
+                    // Check if any origin present in the old middle `pb.lines[p..old_len - s]` became unused.
+                    if *old_len - *p - *s > 0 && out.origins.len() > 1 {
+                        let mut candidates: Vec<u32> = Vec::new();
+                        for &(old_o, _) in &pb.lines[*p..*old_len - *s] {
+                            if !candidates.contains(&old_o) {
+                                candidates.push(old_o);
+                            }
+                        }
+                        compact_origins_if_needed(&mut out, &candidates);
+                    }
+                    return (out, *cost);
+                }
+                _ => {}
+            }
+        }
+    }
     let mut out = Blame {
-        vd: 1 + parents.iter().flatten().map(|(_, b)| b.vd).max().unwrap_or(0),
-        coarse: parents.iter().flatten().any(|(_, b)| b.coarse),
+        vd: 1 + parents.iter().flatten().map(|(b, _)| b.vd).max().unwrap_or(0),
+        coarse: parents.iter().flatten().any(|(b, pm)| b.coarse || pm.coarse()),
         origins: Vec::new(),
         lines: vec![(u32::MAX, 0); n],
     };
-    // By snapshot and the path's pointer: paths are interned once per job,
-    // so nothing is cloned or hashed but a pointer (S14 cycle 3).
     let mut index: HashMap<(ObjectId, usize), u32> = HashMap::new();
     let mut intern = |out: &mut Blame, o: &Origin| -> u32 {
         let key = (o.0, Arc::as_ptr(&o.1) as *const u8 as usize);
@@ -261,25 +454,32 @@ pub fn step(me: &Origin, text: &Text, parents: &[Option<(&Text, &Blame)>]) -> (B
     };
     let mut cost = 0u64;
     let mut open: Vec<usize> = (0..n).collect();
-    for (pt, pb) in parents.iter().flatten() {
+    for (pb, pm) in parents.iter().flatten() {
         if open.is_empty() {
             break;
         }
-        let same = pt.id == text.id || pt.data == text.data;
-        let map = if same {
-            None
-        } else {
-            let (map, coarse) = map_lines(&pt.data, &text.data, n);
-            cost = cost.saturating_add(map_cost(pt.lines.len(), &map, coarse));
-            out.coarse |= coarse;
-            Some(map)
-        };
-        // The parent's origins as this blame's, interned once each.
+        cost = cost.saturating_add(pm.cost());
+        out.coarse |= pm.coarse();
         let mut mine: Vec<Option<u32>> = vec![None; pb.origins.len()];
         open.retain(|&i| {
-            let j = match &map {
-                None => Some(i as u32),
-                Some(m) => m[i],
+            let j = match pm {
+                ParentMap::Same => Some(i as u32),
+                ParentMap::Replaced { diffs, .. } => {
+                    if diffs.contains(&i) {
+                        None
+                    } else {
+                        Some(i as u32)
+                    }
+                }
+                ParentMap::Trimmed { old_len, p, mid, s, .. } => {
+                    if i < *p {
+                        Some(i as u32)
+                    } else if i >= n - *s {
+                        Some((*old_len - (n - i)) as u32)
+                    } else {
+                        mid[i - *p]
+                    }
+                }
             };
             match j {
                 Some(j) if (j as usize) < pb.lines.len() => {

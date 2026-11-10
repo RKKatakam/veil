@@ -718,7 +718,6 @@ fn blame_speed() {
 /// allows (1 s for 10,000 versions of a 5,000-line file: 0.1 ms a version).
 /// Here: 300 versions of a 5,000-line file, one job from nothing, timed.
 #[test]
-#[ignore = "BUG-1214: a first blame's job costs about 2 ms a version of a 5,000-line file, against the gate's 0.1 ms (1 s at 10,000 versions)"]
 fn bug_1214_a_first_blame_costs_more_than_its_gate() {
     let th = TestHub::start();
     let (policy_text, bindings) = policy(1);
