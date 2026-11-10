@@ -33,4 +33,5 @@ pub mod grant;
 pub mod land;
 pub mod pr;
 pub mod project;
+pub mod web;
 pub mod wire;

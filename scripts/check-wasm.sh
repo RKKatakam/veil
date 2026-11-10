@@ -36,6 +36,7 @@ cargo build $LOCKED -p veil-core --target "$TARGET" --no-default-features --feat
 step "the WASM feature set on the host: portable tests and the example"
 cargo test $LOCKED -p veil-core --no-default-features --features wasm --test portable
 cargo run $LOCKED -q -p veil-core --no-default-features --features wasm --example wasm_smoke >/dev/null
+cargo run $LOCKED -q -p veil-core --no-default-features --features wasm --example web_wasm >/dev/null
 
 step "native vl opens a repository the portable engine wrote"
 export_dir=$(mktemp -d)
@@ -73,11 +74,14 @@ step "the example on $TARGET under node"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/wasm-smoke"
 RUSTFLAGS='--cfg getrandom_backend="custom"' \
     cargo build $LOCKED -p veil-core --release --target "$TARGET" \
-    --no-default-features --features ruzstd --example wasm_smoke
+    --no-default-features --features ruzstd --example wasm_smoke --example web_wasm
 wasm="$CARGO_TARGET_DIR/$TARGET/release/examples/wasm_smoke.wasm"
+web_wasm="$CARGO_TARGET_DIR/$TARGET/release/examples/web_wasm.wasm"
 printf 'wasm_smoke.wasm: %s bytes\n' "$(wc -c <"$wasm" | tr -d ' ')"
+printf 'web_wasm.wasm: %s bytes\n' "$(wc -c <"$web_wasm" | tr -d ' ')"
 if command -v node >/dev/null; then
     node scripts/wasm-smoke.mjs "$wasm"
+    node scripts/web-wasm.mjs "$web_wasm"
 else
     echo "node not found: built for $TARGET but not run (install node to run it)"
 fi
