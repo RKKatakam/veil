@@ -90,10 +90,10 @@ The owner's goal: every milestone of phases 1–4 built, reviewed and merged, th
 
 | State | Milestones |
 |---|---|
-| **Merged into `integration`** | S1, S2 (phase 1); S3, S4, S5, S6, S8, S9, S10, S11, S27 (phase 2); S12, S13, S14, S15 (phase 3); S17, S24 part A (phase 4); the deployment kit |
-| **Built, in final review or fixing** | S28 (phase 2, being merged with S11's attempts); S18, S21, S22 (phase 4) |
-| **Being built** | S7 (phase 2); S16 with G3 (phase 3); S19, S24 part B (phase 4) |
-| **Not started** | S29 (phase 2); S20, S23, S25, S26 (phase 4); the gate runs G2, G4; phase 1's security pass; a deep security review after phase 2 and after phase 4 (owner, 2026-11-10: one quick review per milestone, one deep review per phase) |
+| **Merged into `integration`** | S1, S2 (phase 1); S3, S4, S5, S6, S7, S8, S9, S10, S11, S27 (phase 2); S12, S13, S14, S15 (phase 3); S17, S18, S19, S22, S24 part A (phase 4); the deployment kit |
+| **Built, in final review or fixing** | S28 (phase 2, merging with S11's attempts); S21 (phase 4, merging) |
+| **Being built** | S16 with G3 (phase 3); S24 part B, S20 (phase 4) |
+| **Not started** | S29 (phase 2); S23, S25, S26 (phase 4); the gate runs G2, G4; phase 1's security pass; a deep security review after phase 2 and after phase 4 (owner, 2026-11-10: one quick review per milestone, one deep review per phase) |
 
 ### Remaining waves
 
