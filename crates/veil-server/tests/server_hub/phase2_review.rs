@@ -1569,12 +1569,10 @@ fn bug_1785_object_range_zero_dash_bypasses_answers_prepay() {
     let hub = TestHub::start_with_limits(Settings { request_memory: 64 << 20, ..TestHub::limits() });
     let p = setup_project(&hub);
 
-    // Push two distinct 10 MiB incompressible public files in two commits via `hub_writer`
-    // (10 MiB + 10 MiB = 20 MiB > 16 MiB per-address answer quarter, while `hub`'s
-    // `Objects::cache` stays completely cold for `target.bin`!).
-    let hub_writer = TestHub::beside(&hub);
-    let w_api = hub_writer.api();
-    let _ = w_api.tips(Some(&p.admin.token()), &p.name).unwrap();
+    // Push two distinct 10 MiB incompressible public files (10 MiB + 10 MiB = 20 MiB >
+    // 16 MiB per-address answer quarter), then restart `hub` (`catch_up_at_start: false`)
+    // so `Objects::cache` is completely cold and no background derive/index task reads
+    // objects concurrently under heavy test-suite load.
     let make_ascii = |mut x: u64| {
         let mut s = String::with_capacity(10 << 20);
         for _ in 0..(10 << 20) {
@@ -1585,12 +1583,16 @@ fn bug_1785_object_range_zero_dash_bypasses_answers_prepay() {
         }
         s
     };
-    let mut cw = Craft::new(&w_api, &p.admin, &p.name, "main");
-    cw.file("src/stall.bin", &make_ascii(0x9e37_79b9_7f4a_7c15));
-    cw.file("src/target.bin", &make_ascii(0x517c_c1b7_2722_0a95));
-    let (_s, pr) = cw.push_edited("b-1785", None, |_| {});
-    assert_eq!(pr.status, 200, "push b-1785: {}", body(&pr));
-    assert_eq!(pr.json()["results"][0]["ok"], json!(true));
+    {
+        let w_api = hub.api();
+        let mut cw = Craft::new(&w_api, &p.admin, &p.name, "main");
+        cw.file("src/stall.bin", &make_ascii(0x9e37_79b9_7f4a_7c15));
+        cw.file("src/target.bin", &make_ascii(0x517c_c1b7_2722_0a95));
+        let (_s, pr) = cw.push_edited("b-1785", None, |_| {});
+        assert_eq!(pr.status, 200, "push b-1785: {}", body(&pr));
+        assert_eq!(pr.json()["results"][0]["ok"], json!(true));
+    }
+    let hub = hub.restart(|_| {});
 
     let api = hub.api();
     let tips = api.tips(None, &p.name).unwrap();
