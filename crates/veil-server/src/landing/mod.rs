@@ -292,8 +292,8 @@ pub struct Stats {
     pub walks: AtomicU64,
 }
 
-/// A waiting ticket's answer channel, and the branch it waits on.
-type Waiting = (oneshot::Sender<LandResult>, Option<(i64, String)>);
+/// A waiting ticket's answer channels, and the branch it waits on.
+type Waiting = (Vec<(u64, oneshot::Sender<LandResult>)>, Option<(i64, String)>);
 
 struct Running {
     wake: Arc<Notify>,
@@ -307,9 +307,10 @@ pub struct Services {
     /// When a service here last failed to take a branch's lease (another
     /// server holds it): not tried again sooner than [`RETRY_LEASE`].
     held_elsewhere: Mutex<HashMap<(i64, String), Instant>>,
-    /// Each waiting ticket: where its answer goes, and (once its request
+    /// Each waiting ticket: where its answers go, and (once its request
     /// waits) the branch it lands on, for that branch's poller.
     waiters: Mutex<HashMap<String, Waiting>>,
+    next_waiter: AtomicU64,
     /// The branches whose waiters here a poller answers (`poll`).
     pollers: Mutex<std::collections::HashSet<(i64, String)>>,
     /// Content merge workers running on this server (S18).
@@ -326,6 +327,7 @@ impl Default for Services {
             running: Mutex::new(HashMap::new()),
             held_elsewhere: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
+            next_waiter: AtomicU64::new(1),
             pollers: Mutex::new(Default::default()),
             merges: merge::Workers::default(),
             stats: Stats::default(),
@@ -340,6 +342,7 @@ pub const MAX_WAITING: usize = 10_000;
 /// A submitter's wait for its ticket, registered before the submit commits
 /// so that the outcome is never missed.
 pub struct Waiter {
+    id: u64,
     ticket: String,
     rx: oneshot::Receiver<LandResult>,
 }
@@ -348,20 +351,35 @@ impl Services {
     /// Wait here for `ticket`'s outcome.
     pub fn register(&self, ticket: &str) -> Waiter {
         let (tx, rx) = oneshot::channel();
-        self.waiters.lock().unwrap().insert(ticket.to_string(), (tx, None));
-        Waiter { ticket: ticket.to_string(), rx }
+        let id = self.next_waiter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.waiters
+            .lock()
+            .unwrap()
+            .entry(ticket.to_string())
+            .or_insert_with(|| (Vec::new(), None))
+            .0
+            .push((id, tx));
+        Waiter { id, ticket: ticket.to_string(), rx }
     }
 
-    fn forget(&self, ticket: &str) {
-        self.waiters.lock().unwrap().remove(ticket);
+    fn forget(&self, ticket: &str, id: u64) {
+        let mut w = self.waiters.lock().unwrap();
+        if let Some((txs, _)) = w.get_mut(ticket) {
+            txs.retain(|(i, _)| *i != id);
+            if txs.is_empty() {
+                w.remove(ticket);
+            }
+        }
     }
 
     /// Give each waiter here its outcome.
     fn resolve(&self, outcomes: impl IntoIterator<Item = (String, LandResult)>) {
         let mut w = self.waiters.lock().unwrap();
         for (t, r) in outcomes {
-            if let Some((tx, _)) = w.remove(&t) {
-                let _ = tx.send(r);
+            if let Some((txs, _)) = w.remove(&t) {
+                for (_, tx) in txs {
+                    let _ = tx.send(r.clone());
+                }
             }
         }
     }
@@ -577,7 +595,7 @@ pub async fn wait(hub: &Arc<Hub>, project: i64, person: i64, branch: &str, mut w
             Some((_, r)) => r,
             None => queued(&w.ticket),
         };
-        hub.landing.forget(&w.ticket);
+        hub.landing.forget(&w.ticket, w.id);
         return Ok(out);
     }
     crate::limits::leave_gates();
@@ -599,7 +617,7 @@ pub async fn wait(hub: &Arc<Hub>, project: i64, person: i64, branch: &str, mut w
             None => queued(&w.ticket),
         },
     };
-    hub.landing.forget(&w.ticket);
+    hub.landing.forget(&w.ticket, w.id);
     Ok(out)
 }
 
@@ -665,7 +683,7 @@ fn poll(hub: &Arc<Hub>, project: i64, branch: &str) {
 
 /// Unregister a waiter whose submit failed.
 pub fn abandon(hub: &Hub, w: Waiter) {
-    hub.landing.forget(&w.ticket);
+    hub.landing.forget(&w.ticket, w.id);
 }
 
 /// `POST …/land`: build and check the change as a push (an uploaded
@@ -698,6 +716,7 @@ pub async fn submit(
                 }],
                 force: false,
                 receipts: req.receipts,
+                ..Default::default()
             };
             let (pushed, mut landings) = crate::sync::push_with(hub, project, viewer, &who, push, true, req.wait).await?;
             match landings.pop() {
@@ -846,11 +865,12 @@ pub async fn stack(
     let root = crate::sync::root_snapshot_id();
     let pid = project.id;
     let max = veil_core::hub::land::MAX_LAND_STACK;
-    let row: Option<(String, i64)> = sqlx::query_as("SELECT target, lineage FROM branches WHERE project_id = $1 AND name = $2")
-        .bind(pid)
-        .bind(branch)
-        .fetch_optional(&hub.db)
-        .await?;
+    let row: Option<(String, i64)> =
+        sqlx::query_as("SELECT target, lineage FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL")
+            .bind(pid)
+            .bind(branch)
+            .fetch_optional(&hub.db)
+            .await?;
     let Some((tip, lineage)) = row else { return Ok(Ok(Judged { stack: Vec::new(), lineage: 0, branch: false, skipped: Vec::new() })) };
     let tip = ObjectId::from_hex(&tip).map_err(|e| Error::Other(e.into()))?;
     let mut anc = Ancestry::new(hub.clone(), pid, branch, tip, lineage);

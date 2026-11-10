@@ -24,6 +24,7 @@ Options:
 | `--embargo` | Delayed-visibility merge: the server keeps the merge and the history it brings in from anyone outside SCOPE until released (a permission; nothing is encrypted) |
 | `--until <TIME>` | Release automatically at TIME (RFC 3339, YYYY-MM-DD, or +7d/+12h/+30m) |
 | `--scope <SCOPE>` | Scope that can see the embargoed changes before release (default: `team`) |
+| `--embargo-for <GROUP>` | Server groups that can see the embargoed changes before release (implies `--embargo`) |
 
 ---
 

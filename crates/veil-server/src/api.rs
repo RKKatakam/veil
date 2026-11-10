@@ -65,6 +65,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/rings/{scope}", post(post_ring).get(get_ring))
         .route("/v1/projects/{p}/shares", get(crate::shares::list).post(crate::shares::put))
         .route("/v1/projects/{p}/shares/remove", post(crate::shares::remove))
+        .route("/v1/projects/{p}/embargoes/{id}/release", post(crate::embargo::release_route))
         .route("/v1/objects/{p}/{id}", get(crate::grant::get_object))
         .route("/v1/objects/{target}", post(crate::grant::batch))
         .route("/v1/epochs", get(crate::grant::epochs))
@@ -575,6 +576,7 @@ async fn tips(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>
     let (project, viewer, epochs) = perm::open_at(&hub, &p, &caller).await?;
     let branches = sync::tips(&hub, &project, &viewer).await?.into_iter().collect();
     let tested = crate::ci::all_tested_for(&hub, &project, &viewer).await?;
+    let embargoes = crate::embargo::embargoes_for(&hub, &project, &viewer).await?;
     let grants = crate::grant::for_tips(&hub, &project, &viewer, &caller, epochs, &branches).await?;
     Ok(Json(Tips {
         grants,
@@ -585,6 +587,7 @@ async fn tips(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>
         you: caller.person.map(|p| p.name),
         admin: viewer.admin,
         revision: veil_core::hub::wire::REVISION,
+        embargoes,
     }))
 }
 

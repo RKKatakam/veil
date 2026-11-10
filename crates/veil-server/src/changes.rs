@@ -753,11 +753,12 @@ async fn commit(
 
 /// The real tip of `branch`, if it exists.
 async fn tip(hub: &Hub, project: i64, branch: &str) -> Result<Option<ObjectId>> {
-    let t: Option<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2")
-        .bind(project)
-        .bind(branch)
-        .fetch_optional(&hub.db)
-        .await?;
+    let t: Option<String> =
+        sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL")
+            .bind(project)
+            .bind(branch)
+            .fetch_optional(&hub.db)
+            .await?;
     t.map(|t| ObjectId::from_hex(&t).map_err(|e| Error::Other(e.into()))).transpose()
 }
 
