@@ -58,6 +58,24 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// One conflicting path in a conflict report (`docs/HUB.md` §13.30): the
+/// path, and the object id on each side (`base`, `main`, `yours`) when
+/// present.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictPath {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yours: Option<ObjectId>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LandState {
@@ -87,6 +105,23 @@ pub struct LandResult {
     /// its base.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
+    /// `conflict`: the branch's tip as the caller sees it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onto: Option<ObjectId>,
+    /// `conflict`: the change's base as the caller sees it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<ObjectId>,
+    /// `conflict`: per-path object ids (`base`, `main`, `yours`) for each
+    /// conflicting path the caller may read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<ConflictPath>,
+    /// `conflict`: the changes that landed on the branch since `base` that
+    /// the caller sees (oldest first).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub landed_since: Vec<ObjectId>,
+    /// How many times a merge worker cleanly merged and re-queued this ticket.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub merges: u32,
     /// What an admin's change of access lines made visible to whom.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
@@ -111,6 +146,11 @@ mod tests {
             landed: vec![],
             message: None,
             paths: vec!["a".into()],
+            onto: None,
+            base: None,
+            conflicts: vec![],
+            landed_since: vec![],
+            merges: 0,
             warnings: vec![],
         };
         let v = serde_json::to_value(&out).unwrap();

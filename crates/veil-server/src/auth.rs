@@ -102,6 +102,7 @@ pub struct Person {
 /// API carry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentGrant {
+    pub session_hash: String,
     pub project: i64,
     /// `--only`: the paths its files are narrowed to (`None`: all its
     /// person sees).
@@ -407,8 +408,9 @@ impl FromRequestParts<HubState> for Caller {
              COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $3 AND person_id = 0), 0), \
              s.agent, s.agent_project, s.agent_only \
              FROM sessions s JOIN devices d ON d.id = s.device_id JOIN people p ON p.id = s.person_id \
+             LEFT JOIN sessions par ON par.token_hash = s.parent_hash \
              WHERE s.token_hash = $1 AND s.expires_at > $2 AND d.removed_at IS NULL AND NOT d.pending \
-             AND (s.agent IS NOT NULL) = $4",
+             AND (s.agent IS NOT NULL) = $4 AND (s.parent_hash IS NULL OR par.expires_at > $2)",
         )
         .bind(&hash)
         .bind(now)
@@ -418,7 +420,7 @@ impl FromRequestParts<HubState> for Caller {
         .await?;
         match row {
             Some((id, name, device_key, expires_at, person_epoch, project_epoch, agent, agent_project, agent_only)) => {
-                let agent = agent_grant(agent, agent_project, agent_only)?;
+                let agent = agent_grant(hash.clone(), agent, agent_project, agent_only)?;
                 let person = Person { id, name, device_key, agent };
                 hub.caches.put_session(
                     &hash,
@@ -443,7 +445,7 @@ impl FromRequestParts<HubState> for Caller {
 }
 
 /// An agent session's record, as stored; a malformed one fails closed.
-fn agent_grant(agent: Option<String>, project: Option<i64>, only: Option<String>) -> Result<Option<Arc<AgentGrant>>> {
+pub(crate) fn agent_grant(session_hash: String, agent: Option<String>, project: Option<i64>, only: Option<String>) -> Result<Option<Arc<AgentGrant>>> {
     let Some(agent) = agent else { return Ok(None) };
     let damaged = || Error::unauthorized("this agent session's record is damaged; make a new one");
     let attribution: Attribution = serde_json::from_str(&agent).map_err(|_| damaged())?;
@@ -452,10 +454,43 @@ fn agent_grant(agent: Option<String>, project: Option<i64>, only: Option<String>
         None => None,
     };
     Ok(Some(Arc::new(AgentGrant {
+        session_hash,
         project: project.ok_or_else(damaged)?,
         only,
         attribution,
     })))
+}
+
+/// Load an active agent session (`session_hash`) for `person_id` in
+/// `project_id`, verifying that neither it, its parent session, nor its device
+/// has expired or been revoked.
+pub async fn load_agent_session<'c>(
+    c: impl sqlx::PgExecutor<'c>,
+    session_hash: &str,
+    person_id: i64,
+    project_id: i64,
+) -> Result<Option<Arc<AgentGrant>>> {
+    let now = veil_core::now_millis();
+    let row: Option<(Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT s.agent, s.agent_project, s.agent_only \
+         FROM sessions s \
+         JOIN devices d ON d.id = s.device_id \
+         LEFT JOIN sessions par ON par.token_hash = s.parent_hash \
+         WHERE s.token_hash = $1 AND s.person_id = $2 AND s.agent IS NOT NULL \
+         AND s.agent_project = $3 AND s.expires_at > $4 \
+         AND d.removed_at IS NULL AND NOT d.pending \
+         AND (s.parent_hash IS NULL OR par.expires_at > $4)",
+    )
+    .bind(session_hash)
+    .bind(person_id)
+    .bind(project_id)
+    .bind(now)
+    .fetch_optional(c)
+    .await?;
+    match row {
+        Some((agent, project, only)) => Ok(agent_grant(session_hash.to_string(), agent, project, only).ok().flatten()),
+        None => Ok(None),
+    }
 }
 
 impl Caller {

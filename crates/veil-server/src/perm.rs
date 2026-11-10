@@ -157,7 +157,8 @@ pub async fn load_project(c: &mut PgConnection, name: &str) -> Result<Option<Pro
 pub async fn load_viewer(c: &mut PgConnection, project: i64, person: &Person) -> Result<(Viewer, bool)> {
     let (admin, barred, groups): (bool, bool, Vec<i64>) = sqlx::query_as(
         "SELECT EXISTS (SELECT 1 FROM project_admins WHERE project_id = $1 AND person_id = $2), \
-         EXISTS (SELECT 1 FROM device_bars b JOIN devices d ON d.id = b.device_id WHERE b.project_id = $1 AND d.signing_key = $3), \
+         EXISTS (SELECT 1 FROM device_bars b JOIN devices d ON d.id = b.device_id WHERE b.project_id = $1 AND d.signing_key = $3) \
+         OR EXISTS (SELECT 1 FROM devices d WHERE d.signing_key = $3 AND (d.removed_at IS NOT NULL OR d.pending)), \
          ARRAY(SELECT g.id FROM groups g JOIN group_members m ON m.group_id = g.id WHERE g.project_id = $1 AND m.person_id = $2)",
     )
     .bind(project)
