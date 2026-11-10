@@ -438,13 +438,16 @@ pub async fn on_check_recorded(
     let rules = sync::blocking(hub, project.id, move |src| crate::landing::rules(src, default_tip)).await?;
 
     for (branch, target_hex, lineage) in branches {
+        if branch.starts_with("embargo/") {
+            continue;
+        }
         let Ok(target) = ObjectId::from_hex(&target_hex) else { continue };
-        // Check if this branch has an active bisect or if this check is a required check on this branch.
+        // Check if this branch allows automatic revert and lists this check in `required_checks`.
         let is_required = rules
             .required_checks
             .get(&branch)
             .is_some_and(|reqs| reqs.iter().any(|r| r == check_name));
-        if !is_required {
+        if !is_required || !rules.allows_auto_revert(&branch) {
             continue;
         }
         step_branch(
@@ -537,6 +540,35 @@ async fn step_branch_leased(
 
     let mut cur = load_bisect(hub, project.id, branch).await?;
 
+    // If there is an active bisect (`searching` or `confirming`) in the current lineage
+    // and this check report is for one of its probes/candidates/culprit/parent, advance it first
+    // (even if a passing re-run on `b.bad` just caused `advance_tested` to advance `tested_snap`
+    // to `b.bad`, so `b` transitions cleanly to `flaky`).
+    if let Some(b) = &mut cur {
+        if b.lineage == lineage
+            && matches!(b.phase.as_str(), "searching" | "confirming")
+            && b.check_name == check_name
+            && (b.probes.contains(&reported_snap)
+                || b.candidates.contains(&reported_snap)
+                || b.culprit == Some(reported_snap)
+                || b.culprit_parent == Some(reported_snap))
+        {
+            advance_active_bisect(
+                hub,
+                project,
+                rules,
+                b,
+                reported_snap,
+                state,
+                recorded_at,
+                holder,
+                epoch,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
     // If there is an existing bisect on this branch from an older lineage, or whose
     // `bad` is now at or behind `<branch>@tested` (because `<branch>@tested` advanced past it),
     // retire it.
@@ -556,23 +588,9 @@ async fn step_branch_leased(
         }
     }
 
-    // If there is an active bisect (`searching` or `confirming`) for this check, advance it.
-    if let Some(mut b) = cur {
+    // If there is still an active bisect (`searching` or `confirming`) on this branch, wait for it.
+    if let Some(b) = cur {
         if matches!(b.phase.as_str(), "searching" | "confirming") {
-            if b.check_name == check_name {
-                advance_active_bisect(
-                    hub,
-                    project,
-                    rules,
-                    &mut b,
-                    reported_snap,
-                    state,
-                    recorded_at,
-                    holder,
-                    epoch,
-                )
-                .await?;
-            }
             return Ok(());
         }
     }
@@ -1312,7 +1330,7 @@ async fn revert_confirmed_culprit(
     if let Some((_, cur)) = crate::landing::read(hub, project.id, admin_id, &ticket).await? {
         let outcome = if cur.state == LandState::Queued {
             crate::landing::ensure(hub, project.id, &b.branch);
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1_500);
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(6_000);
             crate::landing::wait(hub, project.id, admin_id, &b.branch, w, deadline).await?
         } else {
             crate::landing::abandon(hub, w);
@@ -1413,12 +1431,18 @@ pub async fn sync_revert_outcome(hub: &Arc<Hub>, project_id: i64, branch: &str) 
     .bind(&ticket)
     .fetch_optional(&hub.db)
     .await?;
-    let Some((state, Some(res_json))) = row else {
+    let Some((state, res_opt)) = row else {
         return Ok(());
     };
     if state == "queued" || state == "merging" {
+        if state == "queued" {
+            crate::landing::ensure(hub, project_id, branch);
+        }
         return Ok(());
     }
+    let Some(res_json) = res_opt else {
+        return Ok(());
+    };
     let Ok(outcome) = serde_json::from_str::<veil_core::hub::land::LandResult>(&res_json) else {
         return Ok(());
     };

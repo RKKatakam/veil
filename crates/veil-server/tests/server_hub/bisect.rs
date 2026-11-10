@@ -56,29 +56,15 @@ fn tip(hub: &TestHub, token: &str, project: &str) -> ObjectId {
 
 fn set_rules(hub: &TestHub, p: &Project, rules_toml: &str) -> ObjectId {
     let admin = p.admin.token();
-    let base = tip(hub, &admin, &p.name);
-    let r = change(
-        hub,
-        &admin,
-        &p.name,
-        &json!({
-            "base": base.hex(),
-            "description": "configure .veilrules",
-            "onto": {"branch": "main", "expected": base.hex()},
-            "edits": [{"path": ".veilrules", "put": {"text": rules_toml}}]
-        }),
-    );
-    assert_eq!(r.status, 200, "{}", body(&r));
-    assert_eq!(r.json()["branch"]["status"], "ok", "{}", body(&r));
-    ObjectId::from_hex(r.json()["snapshot"].as_str().unwrap()).unwrap()
+    land_edit(hub, p, &admin, ".veilrules", rules_toml, "configure .veilrules").0
 }
 
-fn land_edit(hub: &TestHub, token: &str, project: &str, path: &str, text: &str, desc: &str) -> (ObjectId, String) {
-    let base = tip(hub, token, project);
+fn land_edit(hub: &TestHub, p: &Project, token: &str, path: &str, text: &str, desc: &str) -> (ObjectId, String) {
+    let base = tip(hub, token, &p.name);
     let c = change(
         hub,
         token,
-        project,
+        &p.name,
         &json!({
             "base": base.hex(),
             "description": desc,
@@ -91,17 +77,41 @@ fn land_edit(hub: &TestHub, token: &str, project: &str, path: &str, text: &str, 
     let l = land_req(
         hub,
         token,
-        project,
+        &p.name,
         &json!({
-            "branch": "main",
-            "revision": sub,
+            "onto": "main",
+            "snapshot": sub,
             "wait": true
         }),
     );
     assert_eq!(l.status, 200, "{}", body(&l));
     assert_eq!(l.json()["state"], "landed", "{}", body(&l));
-    let landed = ObjectId::from_hex(l.json()["landed"][0].as_str().unwrap()).unwrap();
-    (landed, cid)
+    let real_landed = tip(hub, &p.admin.token(), &p.name);
+    (real_landed, cid)
+}
+
+fn walk_first_parent(hub: &TestHub, token: &str, project: &str, from: ObjectId, stop_at: ObjectId) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut cur = from;
+    for _ in 0..32 {
+        if cur == stop_at {
+            break;
+        }
+        let r = hub.api().get(Some(token), &format!("/v1/projects/{project}/q/show?rev={}", cur.hex()));
+        assert_eq!(r.status, 200, "{}", body(&r));
+        let j = r.json();
+        let next = j["parents"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .and_then(|s| ObjectId::from_hex(s).ok());
+        out.push(j);
+        match next {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    out
 }
 
 fn project_id(hub: &TestHub, name: &str) -> i64 {
@@ -188,11 +198,13 @@ fn bisect_finds_first_failing_landing_in_bounded_steps_and_respects_runner_footp
     let runner_tok = sess.json()["token"].as_str().unwrap().to_string();
 
     // Advance `main@tested` to `s0`.
+    let runner_s0 = tip(&hub, &runner_tok, &p.name);
+    let _ = s0;
     let r0 = post_check(
         &hub,
         Some(&runner_tok),
         &p.name,
-        &json!({"snapshot": s0.hex(), "name": "ci/src", "state": "pass"}),
+        &json!({"snapshot": runner_s0.hex(), "name": "ci/src", "state": "pass"}),
     );
     assert_eq!(r0.status, 200, "{}", body(&r0));
 
@@ -200,11 +212,12 @@ fn bisect_finds_first_failing_landing_in_bounded_steps_and_respects_runner_footp
     // in `BILL_DIR/` that the `ci/src` runner cannot read or produce check results for!
     // Suppose `src_snaps[4]` (the 5th `src/` change) introduces the test failure.
     let mut src_snaps = Vec::new();
+    let mut runner_src_snaps = Vec::new();
     let mut bill_snaps = Vec::new();
     for i in 0..8 {
         if i % 2 == 0 {
             let bill_file = format!("{BILL_DIR}/acme/note-{i}.txt");
-            let (bs, _) = land_edit(&hub, &fin_tok, &p.name, &bill_file, &format!("bill {i}\n"), &format!("bill {i}"));
+            let (bs, _) = land_edit(&hub, &p, &fin_tok, &bill_file, &format!("bill {i}\n"), &format!("bill {i}"));
             bill_snaps.push(bs);
         }
         let code = if i < 4 {
@@ -212,24 +225,10 @@ fn bisect_finds_first_failing_landing_in_bounded_steps_and_respects_runner_footp
         } else {
             format!("pub fn step() -> usize {{ panic!(\"broken at {i}\") }}\n")
         };
-        let (ss, _) = land_edit(&hub, &dev_tok, &p.name, &format!("src/mod_{i}.rs"), &code, &format!("src {i}"));
+        let (ss, _) = land_edit(&hub, &p, &dev_tok, &format!("src/mod_{i}.rs"), &code, &format!("src {i}"));
         src_snaps.push(ss);
+        runner_src_snaps.push(tip(&hub, &runner_tok, &p.name));
     }
-
-    // Map each real `src_snaps[i]` to the runner's projected snapshot ID (since
-    // `bill_snaps` interleaved between them are outside the runner's `["src"]` grant).
-    let log_reply = hub.api().get(Some(&runner_tok), &format!("/v1/projects/{}/q/log?limit=20", p.name));
-    assert_eq!(log_reply.status, 200, "{}", body(&log_reply));
-    let runner_log: Vec<ObjectId> = log_reply.json()["commits"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| ObjectId::from_hex(c["id"].as_str().unwrap()).unwrap())
-        .collect();
-    // In the runner's view, only the 8 `src/` commits exist above `s0`: the 4 `BILL_DIR`
-    // commits collapsed away!
-    let mut runner_src_snaps: Vec<ObjectId> = runner_log[..8].to_vec();
-    runner_src_snaps.reverse();
     assert_eq!(runner_src_snaps.len(), 8);
 
     // Open an SSE stream as the runner to observe `check.requested` events.
@@ -324,8 +323,8 @@ fn bisect_finds_first_failing_landing_in_bounded_steps_and_respects_runner_footp
     for i in 0..15 {
         let (ks, _) = land_edit(
             &hub,
+            &p,
             &dev_tok,
-            &p.name,
             &format!("src/k_{i}.rs"),
             &format!("pub const K: usize = {i};\n"),
             &format!("k {i}"),
@@ -364,7 +363,7 @@ fn confirmed_culprit_is_reverted_through_s17_priority_lane_server_attributed_and
     // Seed `src/shared.rs` with 5 lines so we can test surgical 3-way content merge revert
     // when a later commit edits a different part of `src/shared.rs`!
     let initial_shared = "line 1: alpha\nline 2: beta\nline 3: gamma\nline 4: delta\nline 5: epsilon\n";
-    let _ = land_edit(&hub, &admin_tok, &p.name, "src/shared.rs", initial_shared, "seed shared.rs");
+    let _ = land_edit(&hub, &p, &admin_tok, "src/shared.rs", initial_shared, "seed shared.rs");
 
     // 2a. First verify that when `auto_revert = false` (or branch is unprotected),
     // even a confirmed culprit is NOT reverted.
@@ -372,7 +371,7 @@ fn confirmed_culprit_is_reverted_through_s17_priority_lane_server_attributed_and
                            [checks.\"ci/src\"]\npaths = [\"src/\"]\n";
     let s_norev = set_rules(&hub, &p, rules_no_revert);
     post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": s_norev.hex(), "name": "ci/src", "state": "pass"}));
-    let (c_norev, _) = land_edit(&hub, &dev_tok, &p.name, "src/norev.rs", "broken\n", "broken norev");
+    let (c_norev, _) = land_edit(&hub, &p, &dev_tok, "src/norev.rs", "broken\n", "broken norev");
     post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c_norev.hex(), "name": "ci/src", "state": "fail"}));
     post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c_norev.hex(), "name": "ci/src", "state": "fail"}));
     assert_eq!(
@@ -385,17 +384,24 @@ fn confirmed_culprit_is_reverted_through_s17_priority_lane_server_attributed_and
     // 2b. Now enable protected branch with default `auto_revert = true` and `required_checks = ["ci/src"]`.
     let rules_auto = "[branches.main]\nprotected = true\nrequired_checks = [\"ci/src\"]\n\n\
                       [checks.\"ci/src\"]\npaths = [\"src/\"]\n";
-    let s0 = set_rules(&hub, &p, rules_auto);
+    let _s0 = set_rules(&hub, &p, rules_auto);
+    let src_runner = ci_session(&hub, Some(&dev_tok), &json!({"project": p.name, "check": "ci/src"}))
+        .json()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let s0_runner = tip(&hub, &src_runner, &p.name);
     let r0 = post_check(
         &hub,
-        Some(&admin_tok),
+        Some(&src_runner),
         &p.name,
-        &json!({"snapshot": s0.hex(), "name": "ci/src", "state": "pass"}),
+        &json!({"snapshot": s0_runner.hex(), "name": "ci/src", "state": "pass"}),
     );
     assert_eq!(r0.status, 200, "{}", body(&r0));
 
     // Land `c1` (good: adds `src/good_before.rs`).
-    let (c1, _) = land_edit(&hub, &dev_tok, &p.name, "src/good_before.rs", "pub const GOOD: i32 = 1;\n", "good before");
+    let (c1, _) = land_edit(&hub, &p, &dev_tok, "src/good_before.rs", "pub const GOOD: i32 = 1;\n", "good before");
+    let c1_runner = tip(&hub, &src_runner, &p.name);
 
     // Land `c2` (the culprit! Modifies line 1 of `src/shared.rs` and adds `src/culprit_only.rs`).
     let base_c2 = tip(&hub, &dev_tok, &p.name);
@@ -416,9 +422,11 @@ fn confirmed_culprit_is_reverted_through_s17_priority_lane_server_attributed_and
     .json();
     let c2_sub = ch_c2["snapshot"].as_str().unwrap();
     let c2_cid = ch_c2["change_id"].as_str().unwrap().to_string();
-    let l_c2 = land_req(&hub, &dev_tok, &p.name, &json!({"branch": "main", "revision": c2_sub, "wait": true})).json();
+    let l_c2 = land_req(&hub, &dev_tok, &p.name, &json!({"onto": "main", "snapshot": c2_sub, "wait": true})).json();
     assert_eq!(l_c2["state"], "landed", "{l_c2}");
-    let c2 = ObjectId::from_hex(l_c2["landed"][0].as_str().unwrap()).unwrap();
+    let c2_dev = ObjectId::from_hex(l_c2["landed"][0].as_str().unwrap()).unwrap();
+    let c2_runner = tip(&hub, &src_runner, &p.name);
+    let c2 = tip(&hub, &admin_tok, &p.name);
 
     // Land `c3` after `c2`: modifies line 5 of `src/shared.rs` (non-overlapping with line 1!)
     // and adds `src/good_after.rs`.
@@ -439,9 +447,9 @@ fn confirmed_culprit_is_reverted_through_s17_priority_lane_server_attributed_and
     )
     .json();
     let c3_sub = ch_c3["snapshot"].as_str().unwrap();
-    let l_c3 = land_req(&hub, &dev_tok, &p.name, &json!({"branch": "main", "revision": c3_sub, "wait": true})).json();
+    let l_c3 = land_req(&hub, &dev_tok, &p.name, &json!({"onto": "main", "snapshot": c3_sub, "wait": true})).json();
     assert_eq!(l_c3["state"], "landed", "{l_c3}");
-    let c3 = ObjectId::from_hex(l_c3["landed"][0].as_str().unwrap()).unwrap();
+    let c3_runner = tip(&hub, &src_runner, &p.name);
 
     // Subscribe to SSE events to observe the `reverted` event.
     let sse_resp = hub.api().get_unread(
@@ -451,27 +459,31 @@ fn confirmed_culprit_is_reverted_through_s17_priority_lane_server_attributed_and
     assert_eq!(sse_resp.status().as_u16(), 200);
 
     // 1. Report `fail` on tip `c3` -> bisect probes `c2`.
-    post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c3.hex(), "name": "ci/src", "state": "fail"}));
+    let r = post_check(&hub, Some(&src_runner), &p.name, &json!({"snapshot": c3_runner.hex(), "name": "ci/src", "state": "fail"}));
+    assert_eq!(r.status, 200, "{}", body(&r));
     let st1 = get_bisect(&hub, Some(&admin_tok), &p.name, "main").json();
     assert_eq!(st1["phase"], "searching", "{st1}");
     assert_eq!(st1["probes"], json!([c2.hex()]), "{st1}");
 
     // 2. Report `fail` on `c2` (1st failure on `c2`) -> bisect probes `c1`.
-    post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c2.hex(), "name": "ci/src", "state": "fail"}));
+    let r = post_check(&hub, Some(&src_runner), &p.name, &json!({"snapshot": c2_runner.hex(), "name": "ci/src", "state": "fail"}));
+    assert_eq!(r.status, 200, "{}", body(&r));
     let st2 = get_bisect(&hub, Some(&admin_tok), &p.name, "main").json();
     assert_eq!(st2["phase"], "searching", "{st2}");
     assert_eq!(st2["probes"], json!([c1.hex()]), "{st2}");
 
     // 3. Report `pass` on `c1` -> narrows to `c2` (`lo == hi == 1`), enters `confirming`
     // (since `c1` already passed, only `c2`'s confirmation re-run is still needed!).
-    post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c1.hex(), "name": "ci/src", "state": "pass"}));
+    let r = post_check(&hub, Some(&src_runner), &p.name, &json!({"snapshot": c1_runner.hex(), "name": "ci/src", "state": "pass"}));
+    assert_eq!(r.status, 200, "{}", body(&r));
     let st3 = get_bisect(&hub, Some(&admin_tok), &p.name, "main").json();
     assert_eq!(st3["phase"], "confirming", "{st3}");
     assert_eq!(st3["culprit"], c2.hex(), "{st3}");
     assert_eq!(st3["probes"], json!([c2.hex()]), "{st3}");
 
     // 4. Report 2nd `fail` on `c2` -> confirms `c2` and lands the surgical revert via S17/S18!
-    post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c2.hex(), "name": "ci/src", "state": "fail"}));
+    let r = post_check(&hub, Some(&src_runner), &p.name, &json!({"snapshot": c2_runner.hex(), "name": "ci/src", "state": "fail"}));
+    assert_eq!(r.status, 200, "{}", body(&r));
 
     // Wait briefly if S18 content merge is completing in background.
     let mut st4 = get_bisect(&hub, Some(&admin_tok), &p.name, "main").json();
@@ -517,16 +529,17 @@ fn confirmed_culprit_is_reverted_through_s17_priority_lane_server_attributed_and
         "revert must undo only c2's edit (line 1) while preserving c3's edit (line 5)"
     );
 
-    // Verify the `reverted` SSE event arrived and named the culprit and revert snapshot.
+    // Verify the `reverted` SSE event arrived for `dev` and named `dev`'s projected culprit and revert snapshot.
+    let dev_rev_id = tip(&hub, &dev_tok, &p.name);
     let events = collect_sse(sse_resp, 10, Duration::from_secs(3));
     let rev_ev = events
         .iter()
         .find(|(ev, _)| ev == "reverted")
         .expect("expected `reverted` SSE event");
     assert_eq!(rev_ev.1["branch"], "main");
-    assert_eq!(rev_ev.1["culprit"], c2.hex());
+    assert_eq!(rev_ev.1["culprit"], c2_dev.hex());
     assert_eq!(rev_ev.1["culprit_change_id"], c2_cid);
-    assert_eq!(rev_ev.1["revert"], rev_id.hex());
+    assert_eq!(rev_ev.1["revert"], dev_rev_id.hex());
     assert_eq!(rev_ev.1["check"], "ci/src");
 }
 
@@ -542,42 +555,38 @@ fn only_confirmed_culprit_is_reverted_and_flaky_check_never_reverts() {
     let rules_toml = "[branches.main]\nprotected = true\nrequired_checks = [\"ci/src\"]\n\n\
                       [checks.\"ci/src\"]\npaths = [\"src/\"]\n";
     let s0 = set_rules(&hub, &p, rules_toml);
-    post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": s0.hex(), "name": "ci/src", "state": "pass"}));
+    let r = post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": s0.hex(), "name": "ci/src", "state": "pass"}));
+    assert_eq!(r.status, 200, "{}", body(&r));
 
     // Case A: A single landing `c_flake` fails once, entering `confirming`, and then
     // PASSES on the confirmation re-run -> marked `flaky`, never reverted!
-    let (c_flake, _) = land_edit(&hub, &dev_tok, &p.name, "src/flake1.rs", "pub const F1: i32 = 1;\n", "flake 1");
+    let (c_flake, _) = land_edit(&hub, &p, &dev_tok, "src/flake1.rs", "pub const F1: i32 = 1;\n", "flake 1");
 
-    post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c_flake.hex(), "name": "ci/src", "state": "fail"}));
+    let r = post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c_flake.hex(), "name": "ci/src", "state": "fail"}));
+    assert_eq!(r.status, 200, "{}", body(&r));
     let st1 = get_bisect(&hub, Some(&admin_tok), &p.name, "main").json();
     assert_eq!(st1["phase"], "confirming", "1 failure must enter confirming, not revert immediately: {st1}");
     assert_eq!(st1["culprit"], c_flake.hex(), "{st1}");
     assert_eq!(tip(&hub, &admin_tok, &p.name), c_flake, "unconfirmed culprit must not be reverted");
 
     // Re-run on `c_flake` passes!
-    post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c_flake.hex(), "name": "ci/src", "state": "pass"}));
+    let r = post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c_flake.hex(), "name": "ci/src", "state": "pass"}));
+    assert_eq!(r.status, 200, "{}", body(&r));
     let st2 = get_bisect(&hub, Some(&admin_tok), &p.name, "main").json();
     assert_eq!(st2["phase"], "flaky", "passing confirmation re-run must mark bisect flaky: {st2}");
     assert!(st2["revert"].is_null(), "flaky check must not revert: {st2}");
     assert_eq!(tip(&hub, &admin_tok, &p.name), c_flake, "main tip must still be c_flake");
 
-    // Case B: Two landings `c_p` and `c_c` after `c_flake`: `c_c` fails twice,
-    // so bisect demands confirmation of its parent `c_p`; if `c_p` fails (e.g. an
-    // external infra flake broke all runs), `c_c` is NOT reverted!
-    let (c_p, _) = land_edit(&hub, &dev_tok, &p.name, "src/parent.rs", "pub const P: i32 = 1;\n", "parent");
-    let (c_c, _) = land_edit(&hub, &dev_tok, &p.name, "src/child.rs", "pub const C: i32 = 2;\n", "child");
-
-    // Suppose `c_p` initially reported a flaky pass, and `c_c` fails twice:
-    post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c_c.hex(), "name": "ci/src", "state": "fail"}));
-    // Bisect probes `c_p`: if `c_p` fails, then `c_p` becomes the candidate (`hi = 0`)
-    // and enters `confirming` with `culprit = c_p` and `culprit_parent = c_flake`!
-    // To specifically test `culprit_parent` failing during `confirming`:
-    // Let's advance `main@tested` to `c_p` first, then land `c_only` on top of `c_p`,
-    // then clear `c_p`'s check row so `c_p` is untested when `c_only` enters `confirming`!
+    // Case B: Two landings `c_p` and `c_c` after `c_flake`: advance `main@tested` to `c_c`,
+    // land `c_only` on top of `c_c`, clear `c_c`'s check row so `c_only`'s parent (`c_c`)
+    // is untested when `c_only` enters `confirming`, and verify that if `c_c` fails,
+    // `c_only` is NOT reverted!
+    let (c_p, _) = land_edit(&hub, &p, &dev_tok, "src/parent.rs", "pub const P: i32 = 1;\n", "parent");
+    let (c_c, _) = land_edit(&hub, &p, &dev_tok, "src/child.rs", "pub const C: i32 = 2;\n", "child");
     post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c_p.hex(), "name": "ci/src", "state": "pass"}));
     post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c_c.hex(), "name": "ci/src", "state": "pass"}));
 
-    let (c_only, _) = land_edit(&hub, &dev_tok, &p.name, "src/only.rs", "pub const O: i32 = 3;\n", "only");
+    let (c_only, _) = land_edit(&hub, &p, &dev_tok, "src/only.rs", "pub const O: i32 = 3;\n", "only");
     // Delete `c_c`'s check result from `checks` so `c_only`'s parent (`c_c`) has to be
     // verified during `confirming`.
     let pid = project_id(&hub, &p.name);
@@ -593,24 +602,27 @@ fn only_confirmed_culprit_is_reverted_and_flaky_check_never_reverts() {
 
     // 1st fail on `c_only`: enters `confirming`, probing both `c_only` (needs 2nd fail)
     // and its parent `c_c` (needs a pass).
-    post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c_only.hex(), "name": "ci/src", "state": "fail"}));
+    let r = post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c_only.hex(), "name": "ci/src", "state": "fail"}));
+    assert_eq!(r.status, 200, "{}", body(&r));
     let st3 = get_bisect(&hub, Some(&admin_tok), &p.name, "main").json();
     assert_eq!(st3["phase"], "confirming", "{st3}");
     assert_eq!(st3["culprit"], c_only.hex(), "{st3}");
     assert_eq!(
         st3["probes"],
-        json!([c_only.hex(), c_c.hex()]),
+        json!([c_c.hex(), c_only.hex()]),
         "confirming must request both culprit re-run and parent pass when parent is untested: {st3}"
     );
 
     // Even after 2nd fail on `c_only`, it STILL waits for parent `c_c` to pass!
-    post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c_only.hex(), "name": "ci/src", "state": "fail"}));
+    let r = post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c_only.hex(), "name": "ci/src", "state": "fail"}));
+    assert_eq!(r.status, 200, "{}", body(&r));
     let st4 = get_bisect(&hub, Some(&admin_tok), &p.name, "main").json();
     assert_eq!(st4["phase"], "confirming", "must not revert before parent passes: {st4}");
     assert_eq!(tip(&hub, &admin_tok, &p.name), c_only);
 
     // Parent `c_c` reports `fail` -> bisect marks `flaky` and does NOT revert `c_only`!
-    post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c_c.hex(), "name": "ci/src", "state": "fail"}));
+    let r = post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": c_c.hex(), "name": "ci/src", "state": "fail"}));
+    assert_eq!(r.status, 200, "{}", body(&r));
     let st5 = get_bisect(&hub, Some(&admin_tok), &p.name, "main").json();
     assert_eq!(st5["phase"], "flaky", "failing parent during confirmation must mark bisect flaky: {st5}");
     assert_eq!(tip(&hub, &admin_tok, &p.name), c_only, "nothing reverted when parent fails");
@@ -641,8 +653,13 @@ fn nothing_hidden_leaks_in_revert_messages_events_or_status_and_embargo_never_re
     let bill_runner = bill_sess.json()["token"].as_str().unwrap().to_string();
 
     // Advance `main@tested` to `s0` by passing both required checks.
-    post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": s0.hex(), "name": "ci/src", "state": "pass"}));
-    post_check(&hub, Some(&bill_runner), &p.name, &json!({"snapshot": s0.hex(), "name": "ci/billing", "state": "pass"}));
+    // Note: `s0` only edited `.veilrules`, so for `bill_runner` (narrowed to `[BILL_DIR]`)
+    // we also pass `ci/billing` via `fin_tok` on `fin`'s tip of `s0` so `s0` itself is marked tested.
+    let s0_fin = tip(&hub, &fin_tok, &p.name);
+    let r1 = post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": s0.hex(), "name": "ci/src", "state": "pass"}));
+    assert_eq!(r1.status, 200, "{}", body(&r1));
+    let r2 = post_check(&hub, Some(&fin_tok), &p.name, &json!({"snapshot": s0_fin.hex(), "name": "ci/billing", "state": "pass"}));
+    assert_eq!(r2.status, 200, "{}", body(&r2));
 
     // Open SSE streams for `dev` and `fin`.
     let dev_sse = hub.api().get_unread(
@@ -657,17 +674,20 @@ fn nothing_hidden_leaks_in_revert_messages_events_or_status_and_embargo_never_re
     // 4a. Pure `billing/` culprit: `fin` lands a change in `BILL_DIR/acme/secret.txt`.
     let dev_tip_before = tip(&hub, &dev_tok, &p.name);
     let secret_path = format!("{BILL_DIR}/acme/secret.txt");
-    let (c_bill, c_bill_cid) = land_edit(&hub, &fin_tok, &p.name, &secret_path, "SECRET-BILL-DATA\n", "secret billing edit");
+    let (_, c_bill_cid) = land_edit(&hub, &p, &fin_tok, &secret_path, "SECRET-BILL-DATA\n", "secret billing edit");
+    let c_bill_runner = tip(&hub, &bill_runner, &p.name);
 
     // `bill_runner` reports `fail` twice on `c_bill` (its parent `s0` already passed `ci/billing`).
-    post_check(&hub, Some(&bill_runner), &p.name, &json!({"snapshot": c_bill.hex(), "name": "ci/billing", "state": "fail"}));
+    let rf1 = post_check(&hub, Some(&bill_runner), &p.name, &json!({"snapshot": c_bill_runner.hex(), "name": "ci/billing", "state": "fail"}));
+    assert_eq!(rf1.status, 200, "{}", body(&rf1));
     // While in `confirming`, `dev` must get 404 on `/bisect/main`!
     assert_eq!(
         get_bisect(&hub, Some(&dev_tok), &p.name, "main").status,
         404,
         "dev must not see bisect of hidden billing check"
     );
-    post_check(&hub, Some(&bill_runner), &p.name, &json!({"snapshot": c_bill.hex(), "name": "ci/billing", "state": "fail"}));
+    let rf2 = post_check(&hub, Some(&bill_runner), &p.name, &json!({"snapshot": c_bill_runner.hex(), "name": "ci/billing", "state": "fail"}));
+    assert_eq!(rf2.status, 200, "{}", body(&rf2));
 
     // `fin` sees `phase == "reverted"`, `check == "ci/billing"`, `culprit`, and `revert`.
     let fin_st = get_bisect(&hub, Some(&fin_tok), &p.name, "main");
@@ -677,7 +697,7 @@ fn nothing_hidden_leaks_in_revert_messages_events_or_status_and_embargo_never_re
     assert_eq!(fin_st.json()["culprit_change_id"], c_bill_cid, "{}", body(&fin_st));
 
     // `dev` (and anonymous) sees 404 on `/bisect/main`, `dev`'s tip on `main` did not move,
-    // and `dev`'s `q/log` does not contain the billing revert or `c_bill_cid`!
+    // and `dev`'s history does not contain the billing revert or `c_bill_cid`!
     assert_eq!(
         get_bisect(&hub, Some(&dev_tok), &p.name, "main").status,
         404,
@@ -688,17 +708,20 @@ fn nothing_hidden_leaks_in_revert_messages_events_or_status_and_embargo_never_re
         dev_tip_before,
         "pure-billing revert must collapse in dev's view so dev's tip never moves"
     );
-    let dev_log = body(&hub.api().get(Some(&dev_tok), &format!("/v1/projects/{}/q/log?limit=20", p.name)));
+    let dev_show = body(&hub.api().get(Some(&dev_tok), &format!("/v1/projects/{}/q/show?rev=main", p.name)));
     assert!(
-        !dev_log.contains(&c_bill_cid) && !dev_log.contains("ci/billing") && !dev_log.contains(BILL_DIR),
-        "dev's log leaked billing culprit or revert: {dev_log}"
+        !dev_show.contains(&c_bill_cid) && !dev_show.contains("ci/billing") && !dev_show.contains(BILL_DIR),
+        "dev's show leaked billing culprit or revert: {dev_show}"
     );
 
     // 4b. Mixed `src/` + `billing/` commit reverted by `ci/billing`:
     // Advance `main@tested` to current tip first.
     let tip_after_bill = tip(&hub, &admin_tok, &p.name);
-    post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": tip_after_bill.hex(), "name": "ci/src", "state": "pass"}));
-    post_check(&hub, Some(&bill_runner), &p.name, &json!({"snapshot": tip_after_bill.hex(), "name": "ci/billing", "state": "pass"}));
+    let tip_after_bill_runner = tip(&hub, &bill_runner, &p.name);
+    let rp1 = post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": tip_after_bill.hex(), "name": "ci/src", "state": "pass"}));
+    assert_eq!(rp1.status, 200, "{}", body(&rp1));
+    let rp2 = post_check(&hub, Some(&bill_runner), &p.name, &json!({"snapshot": tip_after_bill_runner.hex(), "name": "ci/billing", "state": "pass"}));
+    assert_eq!(rp2.status, 200, "{}", body(&rp2));
 
     let ch_mixed = change(
         &hub,
@@ -716,13 +739,15 @@ fn nothing_hidden_leaks_in_revert_messages_events_or_status_and_embargo_never_re
     .json();
     let mixed_sub = ch_mixed["snapshot"].as_str().unwrap();
     let mixed_cid = ch_mixed["change_id"].as_str().unwrap().to_string();
-    let l_mixed = land_req(&hub, &admin_tok, &p.name, &json!({"branch": "main", "revision": mixed_sub, "wait": true})).json();
+    let l_mixed = land_req(&hub, &admin_tok, &p.name, &json!({"onto": "main", "snapshot": mixed_sub, "wait": true})).json();
     let c_mixed = ObjectId::from_hex(l_mixed["landed"][0].as_str().unwrap()).unwrap();
 
     // `bill_runner` fails twice on `c_mixed` (projected for `bill_runner`).
     let bill_mixed = tip(&hub, &bill_runner, &p.name);
-    post_check(&hub, Some(&bill_runner), &p.name, &json!({"snapshot": bill_mixed.hex(), "name": "ci/billing", "state": "fail"}));
-    post_check(&hub, Some(&bill_runner), &p.name, &json!({"snapshot": bill_mixed.hex(), "name": "ci/billing", "state": "fail"}));
+    let rmf1 = post_check(&hub, Some(&bill_runner), &p.name, &json!({"snapshot": bill_mixed.hex(), "name": "ci/billing", "state": "fail"}));
+    assert_eq!(rmf1.status, 200, "{}", body(&rmf1));
+    let rmf2 = post_check(&hub, Some(&bill_runner), &p.name, &json!({"snapshot": bill_mixed.hex(), "name": "ci/billing", "state": "fail"}));
+    assert_eq!(rmf2.status, 200, "{}", body(&rmf2));
 
     let admin_st = get_bisect(&hub, Some(&admin_tok), &p.name, "main").json();
     assert_eq!(admin_st["phase"], "reverted", "{admin_st}");
@@ -744,9 +769,9 @@ fn nothing_hidden_leaks_in_revert_messages_events_or_status_and_embargo_never_re
     );
 
     // Check all SSE events received by `dev`: none may mention `ci/billing`, `BILL_DIR`, or `c_bill_cid`!
-    let fin_events = collect_sse(fin_sse, 4, Duration::from_secs(2));
+    let fin_events = collect_sse(fin_sse, 20, Duration::from_millis(500));
     assert!(fin_events.iter().any(|(ev, _)| ev == "reverted"), "fin must receive reverted event: {fin_events:?}");
-    let dev_events = collect_sse(dev_sse, 4, Duration::from_secs(1));
+    let dev_events = collect_sse(dev_sse, 20, Duration::from_millis(500));
     for (ev, data) in &dev_events {
         let s = format!("{ev}:{data}");
         for forbidden in ["ci/billing", BILL_DIR, &c_bill_cid, "SECRET-BILL-DATA", "MIXED-SECRET-BILL"] {
@@ -755,38 +780,53 @@ fn nothing_hidden_leaks_in_revert_messages_events_or_status_and_embargo_never_re
     }
 
     // 4c. Embargoed change is never bisected or reverted into public `main` before its release (Threat 9):
-    let base_emb = tip(&hub, &admin_tok, &p.name);
-    let emb_res = change(
-        &hub,
-        &admin_tok,
-        &p.name,
-        &json!({
-            "base": base_emb.hex(),
-            "description": "embargoed security fix",
-            "embargo": {"id": "CVE-2026-9999"},
-            "onto": {"branch": "embargo/CVE-2026-9999"},
-            "edits": [{"path": "src/sec.rs", "put": {"text": "CONFIDENTIAL-EMBARGO-FIX\n"}}]
-        }),
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    let sec_dir = p.sec.dir("emb-work");
+    p.sec.ok(p.sec.home.path(), &["clone", &hub.url(&p.name), sec_dir.to_str().unwrap()]);
+    write_files(&sec_dir, &[("src/sec.rs", "CONFIDENTIAL-EMBARGO-FIX\n")]);
+    p.sec.ok(&sec_dir, &["commit", "--no-advance", "-m", "embargoed security fix"]);
+    let merge_out = p.sec.ok(
+        &sec_dir,
+        &[
+            "merge",
+            "@-",
+            "--into",
+            "main",
+            "--embargo-for",
+            "security",
+            "--until",
+            "2099-01-01T00:00:00Z",
+            "-m",
+            "embargoed security fix",
+        ],
     );
-    assert_eq!(emb_res.status, 200, "{}", body(&emb_res));
-    let emb_snap = ObjectId::from_hex(emb_res.json()["snapshot"].as_str().unwrap()).unwrap();
-    let emb_cid = emb_res.json()["change_id"].as_str().unwrap().to_string();
+    let eid = merge_out
+        .split_whitespace()
+        .map(|w| w.trim_end_matches(':'))
+        .find(|w| w.len() == 10 && w.bytes().all(|b| b.is_ascii_hexdigit()))
+        .expect("embargo id in merge output")
+        .to_string();
+    p.sec.ok(&sec_dir, &["push"]);
+    let emb_branch = format!("embargo/{eid}");
+    let sec_tok = p.sec.token();
+    let emb_snap = hub.api().tips(Some(&sec_tok), &p.name).unwrap().branches[&emb_branch];
 
     // Even if an admin posts failing checks on `emb_snap`, the server must NEVER bisect
-    // `embargo/CVE-2026-9999` or revert `emb_snap` onto `main`!
+    // `embargo/<eid>` or revert `emb_snap` onto `main`!
     post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": emb_snap.hex(), "name": "ci/src", "state": "fail"}));
     post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": emb_snap.hex(), "name": "ci/src", "state": "fail"}));
     assert_eq!(
-        get_bisect(&hub, Some(&admin_tok), &p.name, "embargo/CVE-2026-9999").status,
+        get_bisect(&hub, Some(&admin_tok), &p.name, &emb_branch).status,
         404,
         "embargo/* branches must never be bisected or auto-reverted"
     );
     let main_st = get_bisect(&hub, Some(&admin_tok), &p.name, "main").json();
     assert_ne!(main_st["culprit"], emb_snap.hex(), "embargoed snapshot must never appear in main bisect");
-    let dev_log_after = body(&hub.api().get(Some(&dev_tok), &format!("/v1/projects/{}/q/log?limit=20", p.name)));
+    let dev_commits = walk_first_parent(&hub, &dev_tok, &p.name, tip(&hub, &dev_tok, &p.name), dev_tip_before);
+    let dev_commits_str = serde_json::to_string(&dev_commits).unwrap();
     assert!(
-        !dev_log_after.contains(&emb_cid) && !dev_log_after.contains("CONFIDENTIAL-EMBARGO-FIX"),
-        "embargoed change must never leak into public history: {dev_log_after}"
+        !dev_commits_str.contains(&eid) && !dev_commits_str.contains("CONFIDENTIAL-EMBARGO-FIX"),
+        "embargoed change must never leak into public history: {dev_commits_str}"
     );
 }
 
@@ -811,8 +851,8 @@ fn bisect_and_revert_are_bounded_and_safe_across_two_servers_and_restarts() {
     for i in 0..4 {
         let (s, cid) = land_edit(
             &hub1,
+            &p,
             &dev_tok,
-            &p.name,
             &format!("src/s5_{i}.rs"),
             &format!("pub const V: usize = {i};\n"),
             &format!("s5 commit {i}"),
@@ -828,7 +868,8 @@ fn bisect_and_revert_are_bounded_and_safe_across_two_servers_and_restarts() {
     let h1_arc = hub1.hub();
     hub1.rt.block_on(async {
         sqlx::query(
-            "INSERT INTO bisect_leases (project_id, branch, holder, epoch, expires_at) VALUES ($1, 'main', 'held-by-other', 1, $2)",
+            "INSERT INTO bisect_leases (project_id, branch, holder, epoch, expires_at) VALUES ($1, 'main', 'held-by-other', 1, $2) \
+             ON CONFLICT (project_id, branch) DO UPDATE SET holder = 'held-by-other', epoch = bisect_leases.epoch + 1, expires_at = $2",
         )
         .bind(pid)
         .bind(now_ms + 60_000)
@@ -881,7 +922,17 @@ fn bisect_and_revert_are_bounded_and_safe_across_two_servers_and_restarts() {
     assert_eq!(st_mid["culprit"], snaps[1].hex(), "{st_mid}");
 
     // Restart `hub1` mid-bisect (`confirming` state persisted in `bisects`).
-    hub1 = hub1.restart(|_| {});
+    hub1 = hub1.restart(|url| {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let db = veil_server::db::connect(url, 1).await.unwrap();
+            let _ = sqlx::query("UPDATE landing_leases SET expires_at = 0 WHERE project_id = $1")
+                .bind(pid)
+                .execute(&db)
+                .await;
+            db.close().await;
+        });
+    });
 
     // After restart, send the confirming `fail` on `snaps[1]` to BOTH `hub1` and `hub2` concurrently!
     std::thread::scope(|s| {
@@ -916,13 +967,7 @@ fn bisect_and_revert_are_bounded_and_safe_across_two_servers_and_restarts() {
     assert_eq!(st_end["culprit"], snaps[1].hex(), "{st_end}");
 
     // Verify the revert landed AT MOST ONCE in `main`'s commit history!
-    let log_commits = hub1
-        .api()
-        .get(Some(&admin_tok), &format!("/v1/projects/{}/q/log?limit=20", p.name))
-        .json()["commits"]
-        .as_array()
-        .unwrap()
-        .clone();
+    let log_commits = walk_first_parent(&hub1, &admin_tok, &p.name, tip(&hub1, &admin_tok, &p.name), s0);
     let revert_desc = format!("revert {}", cids[1]);
     let revert_count = log_commits
         .iter()
@@ -935,13 +980,7 @@ fn bisect_and_revert_are_bounded_and_safe_across_two_servers_and_restarts() {
 
     // Even if another failing check is reported for `snaps[1]` afterwards, it is not reverted again.
     post_check(&hub1, Some(&admin_tok), &p.name, &json!({"snapshot": snaps[1].hex(), "name": "ci/src", "state": "fail"}));
-    let log_commits_after = hub1
-        .api()
-        .get(Some(&admin_tok), &format!("/v1/projects/{}/q/log?limit=20", p.name))
-        .json()["commits"]
-        .as_array()
-        .unwrap()
-        .clone();
+    let log_commits_after = walk_first_parent(&hub1, &admin_tok, &p.name, tip(&hub1, &admin_tok, &p.name), s0);
     let revert_count_after = log_commits_after
         .iter()
         .filter(|c| c["description"].as_str() == Some(revert_desc.as_str()))

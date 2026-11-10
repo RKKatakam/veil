@@ -576,7 +576,9 @@ pub async fn emit_check_requested(
         let Ok(p_snap) = crate::sync::projected(hub, &project, &viewer, real_snapshot).await else {
             continue;
         };
-        if !viewer.admin && real_snapshot != crate::sync::root_snapshot_id() {
+        if (!viewer.admin || project.view(&viewer).is_narrowed())
+            && real_snapshot != crate::sync::root_snapshot_id()
+        {
             let parent = crate::sync::blocking(hub, project.id, move |src| {
                 Ok(src.snapshot(&real_snapshot)?.parents.first().copied())
             })
@@ -595,6 +597,7 @@ pub async fn emit_check_requested(
             "branch": branch,
             "snapshot": p_snap.hex(),
             "check": check_name,
+            "name": check_name,
             "reason": reason,
         });
         let frame = Bytes::from(format!("event: check.requested\ndata: {data}\n\n"));
@@ -714,6 +717,7 @@ pub async fn emit_reverted(
         obj.insert("branch".into(), serde_json::Value::String(branch.into()));
         obj.insert("culprit".into(), serde_json::Value::String(p_culprit.hex()));
         obj.insert("change_id".into(), serde_json::Value::String(culprit_change_id.into()));
+        obj.insert("culprit_change_id".into(), serde_json::Value::String(culprit_change_id.into()));
         obj.insert("revert".into(), serde_json::Value::String(p_revert.hex()));
         if crate::ci::can_see_check(&project, &viewer, session_paths, admin_only) {
             obj.insert("check".into(), serde_json::Value::String(check_name.into()));
