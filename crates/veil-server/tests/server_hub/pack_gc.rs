@@ -1117,3 +1117,165 @@ fn guarantee_5_cost_of_merging_10000_small_pushes() {
         assert_eq!(&got, expected);
     }
 }
+
+/// BUG-1780: Cross-server cache invalidation (`hub2` warm before GC, re-push on
+/// `hub2` while discarded pack is still inside `pack_grace_ms`, both admin and
+/// restricted viewer read whole) AND retention-window closure preservation (an
+/// unreferenced snapshot still inside `retention_window_ms` keeps its older
+/// shared blobs/ancestors alive until its own window expires).
+#[test]
+fn bug_1780_cross_server_repush_and_retained_snapshot_closure() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let hub2 = TestHub::beside(&hub);
+    let api1 = hub.api();
+    let api2 = hub2.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+
+    // 1. Push `s1` on `b_early` with shared blob `src/shared.txt`, and warm
+    // BOTH `hub` and `hub2` for both `admin` and `dev` (restricted viewer).
+    let mut c1 = Craft::new(&api1, &p.admin, &p.name, "main");
+    c1.file("src/shared.txt", "SHARED-BLOB-1780\n");
+    c1.file(&format!("{BILL_DIR}/secret.txt"), "BILLING-1780\n");
+    let mut saved_s1 = c1.objects.clone();
+    let (_cs1, push1) = c1.push_edited("b_early", None, |_| {});
+    assert_eq!(push1.status, 200);
+    assert_eq!(push1.json()["results"][0]["ok"], json!(true));
+    let s1 = ObjectId::from_hex(push1.json()["results"][0]["tip"].as_str().unwrap()).unwrap();
+    let (_, s1_raw) = api1.history(&admin_tok, &p.name, &[s1]).frames().into_iter().find(|(id, _)| *id == s1).unwrap();
+    saved_s1.push((s1, s1_raw));
+
+    for a in [&api1, &api2] {
+        for tok in [&admin_tok, &dev_tok] {
+            let r = a.get(Some(tok), &format!("/v1/projects/{}/q/file?rev=b_early&path=src/shared.txt", p.name));
+            assert_eq!(r.status, 200);
+            assert!(String::from_utf8_lossy(&r.body).contains("SHARED-BLOB-1780"));
+        }
+    }
+
+    // 2. Delete `b_early` at t=0 and mark `s1` + `src/shared.txt` unreferenced at t=0.
+    let del1 = api1.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "b_early", "expected": s1.hex(), "new": null}], "force": true}),
+    );
+    assert_eq!(del1.status, 200);
+    hub.rt
+        .block_on(pack_gc::run_project(
+            &hub.hub(),
+            pid,
+            &Options {
+                min_packs_to_merge: 1,
+                run_gc: true,
+                retention_window_ms: 60_000,
+                now_offset_ms: 0,
+                ..Options::default()
+            },
+        ))
+        .unwrap();
+
+    // 3. Push `s2` on `b_late` referencing the SAME `src/shared.txt` content, then
+    // delete `b_late` and run GC at t=40_000 (`b_late` unreferenced at t=40_000),
+    // then run GC at t=70_000: `s1` (since=0) is expired, `s2` (since=40_000) is
+    // STILL inside its 60s retention window, so `src/shared.txt` MUST NOT be
+    // deleted yet while `s2` remains in `snapshots`!
+    let mut c2 = Craft::new(&api1, &p.admin, &p.name, "main");
+    c2.file("src/shared.txt", "SHARED-BLOB-1780\n");
+    c2.file("src/only_s2.txt", "ONLY-S2-1780\n");
+    let (_cs2, push_s2) = c2.push_edited("b_late", None, |_| {});
+    assert_eq!(push_s2.status, 200);
+    let s2 = ObjectId::from_hex(push_s2.json()["results"][0]["tip"].as_str().unwrap()).unwrap();
+    let del2 = api1.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "b_late", "expected": s2.hex(), "new": null}], "force": true}),
+    );
+    assert_eq!(del2.status, 200);
+
+    for off in [40_000i64, 70_000] {
+        hub.rt
+            .block_on(pack_gc::run_project(
+                &hub.hub(),
+                pid,
+                &Options {
+                    min_packs_to_merge: 1,
+                    run_gc: true,
+                    retention_window_ms: 60_000,
+                    pack_grace_ms: 300_000,
+                    now_offset_ms: off,
+                    ..Options::default()
+                },
+            ))
+            .unwrap();
+    }
+    let (shared_blob_id, _) = make_blob("SHARED-BLOB-1780\n");
+    assert!(
+        hub.rt.block_on(hub.hub().objects.exists(pid, &shared_blob_id)).unwrap(),
+        "shared blob referenced by retained snapshot s2 must remain stored until s2 expires"
+    );
+
+    // 4. Advance past `s2`'s retention window too (t=120_000), keeping `pack_grace_ms = 300_000`
+    // so discarded packs still sit in storage while `hub2` did NOT run GC itself.
+    let rep_exp = hub
+        .rt
+        .block_on(pack_gc::run_project(
+            &hub.hub(),
+            pid,
+            &Options {
+                min_packs_to_merge: 1,
+                run_gc: true,
+                retention_window_ms: 60_000,
+                pack_grace_ms: 300_000,
+                now_offset_ms: 120_000,
+                ..Options::default()
+            },
+        ))
+        .unwrap();
+    assert!(rep_exp.packed_objects_deleted >= 1, "expired objects dropped from packs: {rep_exp:?}");
+
+    // 5. Re-upload `saved_s1` and push `revived_on_peer` directly against `hub2`!
+    // Even if `hub2` had warm `committed` / `memo` / `resolved` / `Objects::cache` / `Packs`,
+    // `hub2` observes the bumped `gc_epoch`, stores `saved_s1` again, and serves it whole
+    // even after `DISCARDED` packs are swept!
+    let reup = api2.upload(&admin_tok, &p.name, &saved_s1);
+    assert_eq!(reup.status, 200);
+    let receipts = reup.json()["receipts"].as_array().unwrap().clone();
+    let rmap: serde_json::Map<String, Value> = saved_s1.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+    let push_rev = api2.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [{"branch": "revived_on_peer", "expected": null, "new": s1.hex()}],
+            "receipts": rmap,
+        }),
+    );
+    assert_eq!(push_rev.status, 200);
+    assert_eq!(push_rev.json()["results"][0]["ok"], json!(true), "re-push on peer server ok: {}", String::from_utf8_lossy(&push_rev.body));
+
+    // Sweep discarded packs (`pack_grace_ms: 0`) so nothing from before GC survives on disk.
+    hub.rt
+        .block_on(pack_gc::run_project(
+            &hub.hub(),
+            pid,
+            &Options {
+                min_packs_to_merge: 2,
+                run_gc: false,
+                pack_grace_ms: 0,
+                now_offset_ms: 500_000,
+                ..Options::default()
+            },
+        ))
+        .unwrap();
+
+    let hub3 = TestHub::beside(&hub);
+    for a in [&api1, &api2, &hub3.api()] {
+        for tok in [&admin_tok, &dev_tok] {
+            let r = a.get(Some(tok), &format!("/v1/projects/{}/q/file?rev=revived_on_peer&path=src/shared.txt", p.name));
+            assert_eq!(r.status, 200, "revived_on_peer readable across all servers and views: {}", String::from_utf8_lossy(&r.body));
+            assert!(String::from_utf8_lossy(&r.body).contains("SHARED-BLOB-1780"));
+        }
+    }
+}
+

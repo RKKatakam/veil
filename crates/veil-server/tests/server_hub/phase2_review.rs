@@ -1049,7 +1049,6 @@ fn run_full_gc(hub: &TestHub, pid: i64) -> pack_gc::Report {
 /// storage objects — causing every read/clone/query of the branch to fail with
 /// `500 Internal Server Error`.
 #[test]
-#[ignore = "BUG-1780: pack_gc deletes snapshot/tree/blob objects while leaving snapshots/projections rows and S4 caches intact, discarding re-uploads and leaving branches dangling (500)"]
 fn bug_1780_pack_gc_leaves_stale_db_and_s4_caches_causing_repush_data_loss_and_500() {
     let hub = TestHub::start();
     let p = setup_project(&hub);

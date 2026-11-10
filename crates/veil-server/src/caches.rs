@@ -41,7 +41,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     time::{Duration, Instant},
 };
@@ -67,6 +67,8 @@ pub struct Epochs {
     pub person: i64,
     /// The project the request names, and its epoch, when it was read.
     pub project: Option<(i64, i64)>,
+    /// The project's GC epoch (`access_epochs (project, -1)`), when read.
+    pub gc: Option<(i64, i64)>,
 }
 
 pub struct SessionEntry {
@@ -230,6 +232,9 @@ pub struct Caches {
     viewers: LruCache<Arc<ViewerEntry>>,
     /// Committed snapshots, projection memos and resolutions, by [`key`].
     snapshots: LruCache<ObjectId>,
+    /// Per-project GC epochs (`access_epochs (project, -1)`), so deleted
+    /// snapshots and projections never answer from memory after GC.
+    gc_epochs: RwLock<HashMap<i64, i64>>,
     tips: Mutex<Tips>,
     /// Whether the database delivers this server's notices (checked when the
     /// listener starts); without them, tips expire after [`TIPS_TTL`] only.
@@ -268,6 +273,7 @@ impl Default for Caches {
             projects: LruCache::new(PROJECTS_BUDGET),
             viewers: LruCache::new(VIEWERS_BUDGET),
             snapshots: LruCache::new(SNAPSHOTS_BUDGET),
+            gc_epochs: RwLock::new(HashMap::new()),
             tips: Mutex::new(Tips::default()),
             notices: AtomicBool::new(false),
             stats: Stats::default(),
@@ -276,6 +282,20 @@ impl Default for Caches {
 }
 
 impl Caches {
+    pub fn gc_epoch(&self, project: i64) -> i64 {
+        self.gc_epochs.read().unwrap().get(&project).copied().unwrap_or(0)
+    }
+
+    pub fn set_gc_epoch(&self, project: i64, epoch: i64) {
+        if self.gc_epoch(project) == epoch {
+            return;
+        }
+        let prev = self.gc_epochs.write().unwrap().insert(project, epoch);
+        if prev != Some(epoch) {
+            self.tips_changed(project);
+        }
+    }
+
     // ---- sessions and permissions: checked against the epochs -----------------
 
     pub fn session(&self, token_hash: &str) -> Option<Arc<SessionEntry>> {
@@ -309,28 +329,64 @@ impl Caches {
         e
     }
 
-    // ---- snapshot resolution: facts that never change ---------------------------
+    // ---- snapshot resolution: keyed by project GC epoch -----------------------
 
     /// Is `id` committed history of `project` (known to this server)?
     pub fn committed(&self, project: i64, id: &ObjectId) -> bool {
-        self.snapshots.get(&key("committed", &[&project.to_le_bytes(), &id.0])).is_some()
+        let gce = self.gc_epoch(project);
+        self.snapshots
+            .get(&key("committed", &[&project.to_le_bytes(), &gce.to_le_bytes(), &id.0]))
+            .is_some()
     }
 
     pub fn put_committed(&self, project: i64, id: &ObjectId) {
-        self.snapshots.insert(key("committed", &[&project.to_le_bytes(), &id.0]), *id, SNAPSHOT_ENTRY);
+        self.put_committed_at(project, self.gc_epoch(project), id);
+    }
+
+    pub fn put_committed_at(&self, project: i64, gc_epoch: i64, id: &ObjectId) {
+        self.snapshots.insert(
+            key("committed", &[&project.to_le_bytes(), &gc_epoch.to_le_bytes(), &id.0]),
+            *id,
+            SNAPSHOT_ENTRY,
+        );
     }
 
     /// The projection of real snapshot `real` under `view_key`, if known.
     pub fn memo(&self, project: i64, view_key: &str, real: &ObjectId) -> Option<ObjectId> {
-        self.snapshots.get(&key("memo", &[&project.to_le_bytes(), view_key.as_bytes(), &real.0]))
+        let gce = self.gc_epoch(project);
+        self.snapshots.get(&key(
+            "memo",
+            &[&project.to_le_bytes(), &gce.to_le_bytes(), view_key.as_bytes(), &real.0],
+        ))
     }
 
     /// Record that `real` projects to `projected` under `view_key` (a row of
     /// `projections` as stored), and so that, for that view, `projected`
     /// stands for `real`.
     pub fn put_memo(&self, project: i64, view_key: &str, real: &ObjectId, projected: &ObjectId) {
-        self.snapshots.insert(key("memo", &[&project.to_le_bytes(), view_key.as_bytes(), &real.0]), *projected, SNAPSHOT_ENTRY);
-        self.snapshots.insert(key("resolved", &[&project.to_le_bytes(), view_key.as_bytes(), &projected.0]), *real, SNAPSHOT_ENTRY);
+        self.put_memo_at(project, self.gc_epoch(project), view_key, real, projected);
+    }
+
+    pub fn put_memo_at(
+        &self,
+        project: i64,
+        gc_epoch: i64,
+        view_key: &str,
+        real: &ObjectId,
+        projected: &ObjectId,
+    ) {
+        let p = project.to_le_bytes();
+        let g = gc_epoch.to_le_bytes();
+        self.snapshots.insert(
+            key("memo", &[&p, &g, view_key.as_bytes(), &real.0]),
+            *projected,
+            SNAPSHOT_ENTRY,
+        );
+        self.snapshots.insert(
+            key("resolved", &[&p, &g, view_key.as_bytes(), &projected.0]),
+            *real,
+            SNAPSHOT_ENTRY,
+        );
     }
 
     /// A real snapshot that projects to `id` under `view_key` (`sync::resolve`):
@@ -338,7 +394,11 @@ impl Caches {
     /// history. Never another view's (BUG-915): the same projected id can
     /// stand for other real snapshots in another view.
     pub fn resolved(&self, project: i64, view_key: &str, id: &ObjectId) -> Option<ObjectId> {
-        self.snapshots.get(&key("resolved", &[&project.to_le_bytes(), view_key.as_bytes(), &id.0]))
+        let gce = self.gc_epoch(project);
+        self.snapshots.get(&key(
+            "resolved",
+            &[&project.to_le_bytes(), &gce.to_le_bytes(), view_key.as_bytes(), &id.0],
+        ))
     }
 
     // ---- branch tips: dropped on notice, expire after TIPS_TTL ------------------
@@ -445,12 +505,14 @@ fn viewer_key(project: i64, person: &Person) -> ObjectId {
     key("viewer", &[&project.to_le_bytes(), &person.id.to_le_bytes(), person.device_key.as_bytes()])
 }
 
-/// The access epochs of `person` (0: anyone on Earth) and of `project`, in
-/// one statement. Rows that do not exist yet read as 0.
+/// The access epochs of `person` (0: anyone on Earth) and of `project`
+/// (including its GC epoch at `person_id = -1`), in one statement. Rows that
+/// do not exist yet read as 0.
 pub async fn read_epochs(db: &sqlx::PgPool, person: i64, project: Option<i64>) -> Result<Epochs> {
-    let (pe, je): (i64, i64) = sqlx::query_as(
+    let (pe, je, ge): (i64, i64, i64) = sqlx::query_as(
         "SELECT COALESCE((SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1), 0), \
-         COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $2 AND person_id = 0), 0)",
+         COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $2 AND person_id = 0), 0), \
+         COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $2 AND person_id = -1), 0)",
     )
     .bind(person)
     .bind(project.unwrap_or(-1))
@@ -459,6 +521,7 @@ pub async fn read_epochs(db: &sqlx::PgPool, person: i64, project: Option<i64>) -
     Ok(Epochs {
         person: pe,
         project: project.map(|p| (p, je)),
+        gc: project.map(|p| (p, ge)),
     })
 }
 
@@ -483,9 +546,19 @@ pub async fn listen(hub: Arc<crate::Hub>, mut stop: tokio::sync::watch::Receiver
         match n {
             Ok(Some(n)) => {
                 hub.embargo.wake();
-                match n.payload().parse::<i64>() {
-                    Ok(p) => hub.caches.tips_changed(p),
-                    Err(_) => hub.caches.drop_all_tips(),
+                if let Some(rest) = n.payload().strip_prefix("gc:") {
+                    if let Some((ps, es)) = rest.split_once(':') {
+                        if let (Ok(p), Ok(e)) = (ps.parse::<i64>(), es.parse::<i64>()) {
+                            hub.observe_gc_epoch(p, e);
+                            continue;
+                        }
+                    }
+                    hub.caches.drop_all_tips();
+                } else {
+                    match n.payload().parse::<i64>() {
+                        Ok(p) => hub.caches.tips_changed(p),
+                        Err(_) => hub.caches.drop_all_tips(),
+                    }
                 }
             }
             // The connection was lost: notices may be missing until it is
@@ -538,6 +611,13 @@ mod tests {
         c.put_memo(1, "devs", &real, &id);
         assert_eq!(c.resolved(1, "devs", &id), Some(real));
         assert_eq!(c.resolved(1, "finance", &id), None, "another view's real snapshot is never answered");
+        // Advancing a project's GC epoch invalidates only that project's entries (BUG-1780).
+        c.put_committed(2, &id);
+        c.set_gc_epoch(1, 42);
+        assert!(!c.committed(1, &id));
+        assert_eq!(c.memo(1, "devs", &real), None);
+        assert_eq!(c.resolved(1, "devs", &id), None);
+        assert!(c.committed(2, &id), "other projects retain their cached entries");
     }
 
     #[test]

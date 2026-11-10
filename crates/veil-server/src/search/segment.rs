@@ -597,17 +597,18 @@ fn cache() -> &'static LruCache<Arc<Segment>> {
     CACHE.get_or_init(|| LruCache::new(256 << 20))
 }
 
-fn cache_key(project: i64, id: &ObjectId) -> ObjectId {
+fn cache_key(project: i64, gc_epoch: i64, id: &ObjectId) -> ObjectId {
     let mut h = blake3::Hasher::new();
     h.update(b"search-segment");
     h.update(&project.to_le_bytes());
+    h.update(&gc_epoch.to_le_bytes());
     h.update(&id.0);
     ObjectId(*h.finalize().as_bytes())
 }
 
 /// Segment `id` of `project`, from the cache or the store.
 pub fn load(src: &crate::sync::Source, id: &ObjectId) -> Result<Arc<Segment>> {
-    let k = cache_key(src.project, id);
+    let k = cache_key(src.project, src.hub.objects.gc_epoch(src.project), id);
     if let Some(s) = cache().get(&k) {
         return Ok(s);
     }

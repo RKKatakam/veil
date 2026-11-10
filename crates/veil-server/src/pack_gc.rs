@@ -362,6 +362,14 @@ async fn run_with_lock(hub: &Arc<Hub>, project: i64, opts: &Options) -> Result<R
     let mut report = Report::default();
     let now_ms = opts.now_ms();
 
+    let cur_gce: i64 = sqlx::query_scalar(
+        "SELECT COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1), 0)",
+    )
+    .bind(project)
+    .fetch_one(&hub.db)
+    .await?;
+    hub.observe_gc_epoch(project, cur_gce);
+
     // 1. Clean up any leftover uncommitted job packs (`state = STAGED AND person_id IS NULL`)
     // from an earlier crashed merge/GC run on this project, and discard stale
     // client upload packs (`state = STAGED AND person_id IS NOT NULL`) older
@@ -403,7 +411,8 @@ async fn run_with_lock(hub: &Arc<Hub>, project: i64, opts: &Options) -> Result<R
     // - plus, when `run_gc` is true, any pack that holds at least one
     //   expired-unreferenced object (or duplicate object already held by
     //   another pack in the batch).
-    let (batch, expired_unreferenced, ref_stamp) = select_batch(hub, project, &listed, opts, gc_state).await?;
+    let (batch, expired_unreferenced, ref_stamp, complete_dead_sweep) =
+        select_batch(hub, project, &listed, opts, gc_state).await?;
 
     if !batch.is_empty() {
         let crashed = compact_batch(
@@ -412,6 +421,7 @@ async fn run_with_lock(hub: &Arc<Hub>, project: i64, opts: &Options) -> Result<R
             &batch,
             &expired_unreferenced,
             ref_stamp.as_ref(),
+            complete_dead_sweep,
             opts,
             now_ms,
             &mut report,
@@ -450,7 +460,7 @@ async fn select_batch(
     listed: &[PackRow],
     opts: &Options,
     gc: Option<GcState>,
-) -> Result<(Vec<PackRow>, HashSet<ObjectId>, Option<RefStamp>)> {
+) -> Result<(Vec<PackRow>, HashSet<ObjectId>, Option<RefStamp>, bool)> {
     let max_per_run = opts.max_packs_per_run.max(1);
     let mut small: Vec<PackRow> = listed
         .iter()
@@ -463,10 +473,10 @@ async fn select_batch(
 
     let Some(gc) = gc else {
         if small.len() < opts.min_packs_to_merge {
-            return Ok((Vec::new(), HashSet::new(), None));
+            return Ok((Vec::new(), HashSet::new(), None, false));
         }
         let batch = small.into_iter().take(max_per_run).collect();
-        return Ok((batch, HashSet::new(), None));
+        return Ok((batch, HashSet::new(), None, false));
     };
 
     let mut chosen: Vec<PackRow> = Vec::new();
@@ -481,15 +491,17 @@ async fn select_batch(
 
     // If GC found expired unreferenced objects, check which listed packs hold
     // any of them (or are not yet in `chosen`), up to `max_per_run`.
-    if !gc.expired_unreferenced.is_empty() && chosen.len() < max_per_run {
+    let mut complete_dead_sweep = true;
+    if !gc.expired_unreferenced.is_empty() {
         let store = hub.objects.blob_store();
         let bound = hub.objects.index_bound();
         for p in listed {
-            if chosen.len() >= max_per_run {
-                break;
-            }
             if chosen_names.contains(&p.name) {
                 continue;
+            }
+            if chosen.len() >= max_per_run {
+                complete_dead_sweep = false;
+                break;
             }
             hub.limits.derive_turn().await;
             let k = pack::key(project, &p.name);
@@ -506,7 +518,7 @@ async fn select_batch(
         }
     }
 
-    Ok((chosen, gc.expired_unreferenced, Some(gc.stamp)))
+    Ok((chosen, gc.expired_unreferenced, Some(gc.stamp), complete_dead_sweep))
 }
 
 /// Merge and/or GC-filter `batch` of listed packs into one or more replacement
@@ -518,6 +530,7 @@ async fn compact_batch(
     batch: &[PackRow],
     expired_unreferenced: &HashSet<ObjectId>,
     expected_stamp: Option<&RefStamp>,
+    complete_dead_sweep: bool,
     opts: &Options,
     now_ms: i64,
     report: &mut Report,
@@ -531,6 +544,7 @@ async fn compact_batch(
     // seen).
     let mut seen: HashSet<ObjectId> = HashSet::new();
     let mut dead_count = 0usize;
+    let mut dead_ids: HashSet<ObjectId> = HashSet::new();
     // Per pack in `batch` (newest first so newest copy wins if duplicated, then
     // reversed back to chronological pack order): `(PackRow, Vec<(ObjectId, Slot)>)`.
     let mut plan: Vec<(PackRow, Vec<(ObjectId, Slot)>)> = Vec::with_capacity(batch.len());
@@ -547,6 +561,7 @@ async fn compact_batch(
         for (id, slot) in held.index.iter() {
             if expired_unreferenced.contains(id) {
                 dead_count += 1;
+                dead_ids.insert(*id);
                 continue;
             }
             if seen.insert(*id) {
@@ -661,78 +676,84 @@ async fn compact_batch(
     let new_names: Vec<String> = written_packs.iter().map(|(n, _, _, _)| n.to_string()).collect();
     let newest_created_at = batch.iter().map(|p| p.created_at).max().unwrap_or(now_ms);
     let check_stamp = if dead_count > 0 { expected_stamp.cloned() } else { None };
-    let expired_hexes: Vec<String> = if dead_count > 0 {
-        expired_unreferenced.iter().map(|id| id.hex()).collect()
+    let dead_hexes: Vec<String> = if dead_count > 0 && complete_dead_sweep {
+        dead_ids.iter().map(ObjectId::hex).collect()
     } else {
         Vec::new()
     };
 
-    let switched = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, |c| {
-        let old_names = old_names.clone();
-        let new_names = new_names.clone();
-        let check_stamp = check_stamp.clone();
-        let expired_hexes = expired_hexes.clone();
-        Box::pin(async move {
-            if let Some(expected) = &check_stamp {
-                let cur = read_ref_stamp(c, project).await?;
-                if &cur != expected {
-                    return Ok(false);
+    let switched: Option<Option<i64>> =
+        crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, |c| {
+            let old_names = old_names.clone();
+            let new_names = new_names.clone();
+            let check_stamp = check_stamp.clone();
+            let dead_hexes = dead_hexes.clone();
+            Box::pin(async move {
+                if let Some(expected) = &check_stamp {
+                    let cur = read_ref_stamp(c, project).await?;
+                    if &cur != expected {
+                        return Ok(None);
+                    }
                 }
-            }
-            let locked: Vec<String> = sqlx::query_scalar(
-                "SELECT name FROM packs WHERE project_id = $1 AND name = ANY($2) AND state = $3 FOR UPDATE",
-            )
-            .bind(project)
-            .bind(&old_names)
-            .bind(LISTED)
-            .fetch_all(&mut *c)
-            .await?;
-            if locked.len() != old_names.len() {
-                return Ok(false);
-            }
-            if !new_names.is_empty() {
-                sqlx::query(
-                    "UPDATE packs SET state = $3, created_at = $4 WHERE project_id = $1 AND name = ANY($2) AND state = $5",
+                let locked: Vec<String> = sqlx::query_scalar(
+                    "SELECT name FROM packs WHERE project_id = $1 AND name = ANY($2) AND state = $3 FOR UPDATE",
                 )
                 .bind(project)
-                .bind(&new_names)
+                .bind(&old_names)
                 .bind(LISTED)
-                .bind(newest_created_at)
-                .bind(STAGED)
-                .execute(&mut *c)
+                .fetch_all(&mut *c)
                 .await?;
-            }
-            sqlx::query(
-                "UPDATE packs SET state = $3, discarded_at = $4 WHERE project_id = $1 AND name = ANY($2) AND state = $5",
-            )
-            .bind(project)
-            .bind(&old_names)
-            .bind(DISCARDED)
-            .bind(now_ms)
-            .bind(LISTED)
-            .execute(&mut *c)
-            .await?;
-            if !expired_hexes.is_empty() {
+                if locked.len() != old_names.len() {
+                    return Ok(None);
+                }
+                if !new_names.is_empty() {
+                    sqlx::query(
+                        "UPDATE packs SET state = $3, created_at = $4 WHERE project_id = $1 AND name = ANY($2) AND state = $5",
+                    )
+                    .bind(project)
+                    .bind(&new_names)
+                    .bind(LISTED)
+                    .bind(newest_created_at)
+                    .bind(STAGED)
+                    .execute(&mut *c)
+                    .await?;
+                }
                 sqlx::query(
-                    "DELETE FROM unreferenced_objects WHERE project_id = $1 AND object_id = ANY($2)",
+                    "UPDATE packs SET state = $3, discarded_at = $4 WHERE project_id = $1 AND name = ANY($2) AND state = $5",
                 )
                 .bind(project)
-                .bind(&expired_hexes)
+                .bind(&old_names)
+                .bind(DISCARDED)
+                .bind(now_ms)
+                .bind(LISTED)
                 .execute(&mut *c)
                 .await?;
-            }
-            Ok(true)
+                for chunk in dead_hexes.chunks(500) {
+                    sqlx::query(
+                        "DELETE FROM unreferenced_objects WHERE project_id = $1 AND object_id = ANY($2)",
+                    )
+                    .bind(project)
+                    .bind(chunk)
+                    .execute(&mut *c)
+                    .await?;
+                }
+                let new_gce = if dead_count > 0 {
+                    Some(bump_gc_epoch_tx(c, project).await?)
+                } else {
+                    None
+                };
+                Ok(Some(new_gce))
+            })
         })
-    })
-    .await?;
+        .await?;
 
-    if !switched {
+    let Some(switched_gce) = switched else {
         // A racing push or another state change intervened; discard the staged
         // replacement packs we wrote.
         let discard_names: Vec<Arc<str>> = written_packs.into_iter().map(|(n, _, _, _)| n).collect();
         hub.objects.discard(project, &discard_names).await.map_err(Error::Other)?;
         return Ok(false);
-    }
+    };
 
     report.packs_merged += batch.len();
     report.packs_written += written_packs.len();
@@ -743,6 +764,10 @@ async fn compact_batch(
     // `listed_here` / `forget_packs` or storage deletion runs.
     if opts.crash == Some(CrashPoint::AfterSwitchBeforeDelete) {
         return Ok(true);
+    }
+
+    if let Some(gce) = switched_gce {
+        notify_gc_epoch(hub, project, gce).await;
     }
 
     let for_listed: Vec<(Arc<str>, Arc<Index>)> = written_packs
@@ -854,7 +879,7 @@ async fn mark_and_sweep_loose(
     report: &mut Report,
 ) -> Result<GcState> {
     let mut conn = hub.db.acquire().await?;
-    let stamp = read_ref_stamp(&mut conn, project).await?;
+    let mut stamp = read_ref_stamp(&mut conn, project).await?;
     let roots = collect_db_roots(&mut conn, project).await?;
     drop(conn);
 
@@ -885,6 +910,7 @@ async fn mark_and_sweep_loose(
     .fetch_all(&hub.db)
     .await?;
 
+    let mut packed_stored: HashSet<ObjectId> = HashSet::new();
     let mut all_stored: HashSet<ObjectId> = HashSet::new();
     for name in &listed_names {
         hub.limits.derive_turn().await;
@@ -892,6 +918,7 @@ async fn mark_and_sweep_loose(
         hub.objects.reads.fetch_add(1, Ordering::Relaxed);
         if let Some(held) = pack::read_index(&**store, &k, bound).await.map_err(Error::Other)? {
             for (id, _) in held.index.iter() {
+                packed_stored.insert(*id);
                 all_stored.insert(*id);
             }
         }
@@ -973,10 +1000,64 @@ async fn mark_and_sweep_loose(
     }
 
     let cutoff = now_ms.saturating_sub(opts.retention_window_ms.max(0));
-    let expired_unreferenced: HashSet<ObjectId> = unref_map
+    let mut expired_unreferenced: HashSet<ObjectId> = unref_map
         .into_iter()
         .filter_map(|(id, since)| (since <= cutoff).then_some(id))
         .collect();
+
+    // Any unreferenced `snapshots` row whose snapshot object is already absent
+    // from storage must also be purged; conversely, any unreferenced `snapshots`
+    // row still inside its retention window retains its full object closure so
+    // the server never holds a `snapshots` row with missing objects (BUG-1780).
+    let mut retained_snaps: Vec<ObjectId> = Vec::new();
+    for &s in &roots.known_snapshots {
+        if reachable.contains(&s) {
+            continue;
+        }
+        if !all_stored.contains(&s) {
+            expired_unreferenced.insert(s);
+        } else if !expired_unreferenced.contains(&s) {
+            retained_snaps.push(s);
+        }
+    }
+    if !retained_snaps.is_empty() && !expired_unreferenced.is_empty() {
+        let retained_closure = walk_from_roots(hub, project, retained_snaps, HashSet::new(), &roots).await?;
+        for id in retained_closure {
+            expired_unreferenced.remove(&id);
+        }
+    }
+
+    // Purge all DB history/memo/derived records naming expired unreferenced
+    // objects and bump the project's GC epoch so no server treats an about-to-be
+    // deleted snapshot or projection as already held (BUG-1780, BUG-1781).
+    if !expired_unreferenced.is_empty() {
+        let expired_hexes: Vec<String> = expired_unreferenced.iter().map(ObjectId::hex).collect();
+        let purged: Result<(RefStamp, Option<i64>)> =
+            crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, |c| {
+                let stamp = stamp.clone();
+                let expired_hexes = expired_hexes.clone();
+                Box::pin(async move {
+                    let cur = read_ref_stamp(c, project).await?;
+                    if cur != stamp {
+                        return Ok((cur, None));
+                    }
+                    purge_expired_db_records(c, project, &expired_hexes).await?;
+                    let gce = bump_gc_epoch_tx(c, project).await?;
+                    let refreshed = read_ref_stamp(c, project).await?;
+                    Ok((refreshed, Some(gce)))
+                })
+            })
+            .await;
+        let (next_stamp, maybe_gce) = purged?;
+        let Some(gce) = maybe_gce else {
+            return Ok(GcState {
+                expired_unreferenced: HashSet::new(),
+                stamp: next_stamp,
+            });
+        };
+        stamp = next_stamp;
+        notify_gc_epoch(hub, project, gce).await;
+    }
 
     // Delete expired unreferenced loose objects (after verifying `read_ref_stamp`
     // is unchanged so no racing push referenced them).
@@ -986,25 +1067,37 @@ async fn mark_and_sweep_loose(
             read_ref_stamp(&mut conn, project).await?
         };
         if cur_stamp == stamp {
-            let mut deleted_hexes = Vec::new();
+            let mut deleted_any_loose = false;
+            let mut deleted_loose_only_hexes = Vec::new();
             for id in loose_ids {
                 if expired_unreferenced.contains(&id) {
                     hub.limits.derive_turn().await;
                     store.delete(&object_key(project, &id)).await.map_err(Error::Other)?;
-                    deleted_hexes.push(id.hex());
+                    deleted_any_loose = true;
+                    if !packed_stored.contains(&id) {
+                        deleted_loose_only_hexes.push(id.hex());
+                    }
                     report.loose_objects_deleted += 1;
                 }
             }
-            if !deleted_hexes.is_empty() {
-                for chunk in deleted_hexes.chunks(500) {
-                    sqlx::query(
-                        "DELETE FROM unreferenced_objects WHERE project_id = $1 AND object_id = ANY($2)",
-                    )
-                    .bind(project)
-                    .bind(chunk)
-                    .execute(&hub.db)
-                    .await?;
-                }
+            if deleted_any_loose {
+                let gce = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, |c| {
+                    let deleted_loose_only_hexes = deleted_loose_only_hexes.clone();
+                    Box::pin(async move {
+                        for chunk in deleted_loose_only_hexes.chunks(500) {
+                            sqlx::query(
+                                "DELETE FROM unreferenced_objects WHERE project_id = $1 AND object_id = ANY($2)",
+                            )
+                            .bind(project)
+                            .bind(chunk)
+                            .execute(&mut *c)
+                            .await?;
+                        }
+                        bump_gc_epoch_tx(c, project).await
+                    })
+                })
+                .await?;
+                notify_gc_epoch(hub, project, gce).await;
             }
         }
     }
@@ -1013,6 +1106,83 @@ async fn mark_and_sweep_loose(
         expired_unreferenced,
         stamp,
     })
+}
+
+async fn bump_gc_epoch_tx(c: &mut PgConnection, project: i64) -> Result<i64> {
+    sqlx::query("SELECT veil_bump_epoch($1, -1)")
+        .bind(project)
+        .execute(&mut *c)
+        .await?;
+    let epoch: i64 = sqlx::query_scalar(
+        "SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1",
+    )
+    .bind(project)
+    .fetch_one(&mut *c)
+    .await?;
+    Ok(epoch)
+}
+
+async fn notify_gc_epoch(hub: &Hub, project: i64, epoch: i64) {
+    hub.observe_gc_epoch(project, epoch);
+    if hub.caches.notices.load(Ordering::Relaxed) {
+        let payload = format!("gc:{project}:{epoch}");
+        let _ = sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(crate::caches::TIPS_CHANNEL)
+            .bind(payload)
+            .execute(&hub.db)
+            .await;
+    }
+}
+
+async fn purge_expired_db_records(
+    c: &mut PgConnection,
+    project: i64,
+    expired_hexes: &[String],
+) -> Result<()> {
+    for chunk in expired_hexes.chunks(500) {
+        for q in [
+            "DELETE FROM snapshots WHERE project_id = $1 AND id = ANY($2)",
+            "DELETE FROM origins WHERE project_id = $1 AND (real_id = ANY($2) OR origin_id = ANY($2))",
+            "DELETE FROM projections WHERE project_id = $1 AND (real_id = ANY($2) OR projected_id = ANY($2))",
+            "DELETE FROM landed_from WHERE project_id = $1 AND (source = ANY($2) OR landed = ANY($2))",
+            "DELETE FROM landed_changes WHERE project_id = $1 AND landed = ANY($2)",
+            "DELETE FROM graph WHERE project_id = $1 AND (snapshot = ANY($2) OR changed = ANY($2))",
+            "DELETE FROM file_history WHERE project_id = $1 AND snapshot = ANY($2)",
+            "DELETE FROM rule_history WHERE project_id = $1 AND snapshot = ANY($2)",
+            "DELETE FROM derive_progress WHERE project_id = $1 AND through_snapshot = ANY($2)",
+            "DELETE FROM view_graph WHERE project_id = $1 AND (snapshot = ANY($2) OR real_id = ANY($2))",
+            "DELETE FROM view_changes WHERE project_id = $1 AND snapshot = ANY($2)",
+            "DELETE FROM view_file_history WHERE project_id = $1 AND snapshot = ANY($2)",
+            "DELETE FROM blame_memo WHERE project_id = $1 AND snapshot = ANY($2)",
+            "DELETE FROM blame_ends WHERE project_id = $1 AND snapshot = ANY($2)",
+            "DELETE FROM blame_jobs WHERE project_id = $1 AND snapshot = ANY($2)",
+            "DELETE FROM search_heads WHERE project_id = $1 AND branch <> '' AND snapshot = ANY($2)",
+        ] {
+            sqlx::query(q).bind(project).bind(chunk).execute(&mut *c).await?;
+        }
+    }
+    sqlx::query(
+        "DELETE FROM derive_progress WHERE project_id = $1 AND branch <> '' \
+         AND branch NOT IN (SELECT name FROM branches WHERE project_id = $1)",
+    )
+    .bind(project)
+    .execute(&mut *c)
+    .await?;
+    sqlx::query(
+        "DELETE FROM search_heads WHERE project_id = $1 AND branch <> '' \
+         AND branch NOT IN (SELECT name FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL)",
+    )
+    .bind(project)
+    .execute(&mut *c)
+    .await?;
+    sqlx::query(
+        "DELETE FROM search_shards WHERE project_id = $1 AND branch <> '' \
+         AND branch NOT IN (SELECT name FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL)",
+    )
+    .bind(project)
+    .execute(&mut *c)
+    .await?;
+    Ok(())
 }
 
 /// Roots collected from the database before walking the object graph.
@@ -1260,8 +1430,24 @@ fn collect_hex_ids_from_json(s: &str, out: &mut HashSet<ObjectId>) {
 /// `projections`, S12 `graph.changed`), trees (subtrees, blobs, sealed blobs,
 /// conflicts), and annotated tags (`Atag`).
 async fn walk_reachable(hub: &Arc<Hub>, project: i64, roots: &DbRoots) -> Result<HashSet<ObjectId>> {
-    let mut reachable: HashSet<ObjectId> = roots.leaf_objects.clone();
-    let mut queue: VecDeque<ObjectId> = roots.walk_objects.iter().copied().collect();
+    walk_from_roots(
+        hub,
+        project,
+        roots.walk_objects.iter().copied(),
+        roots.leaf_objects.clone(),
+        roots,
+    )
+    .await
+}
+
+async fn walk_from_roots(
+    hub: &Arc<Hub>,
+    project: i64,
+    initial: impl IntoIterator<Item = ObjectId>,
+    mut reachable: HashSet<ObjectId>,
+    roots: &DbRoots,
+) -> Result<HashSet<ObjectId>> {
+    let mut queue: VecDeque<ObjectId> = initial.into_iter().collect();
 
     while let Some(id) = queue.pop_front() {
         if builtin(&id).is_some() || !reachable.insert(id) {

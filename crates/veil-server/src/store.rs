@@ -455,6 +455,8 @@ pub struct Objects {
     cache: LruCache<Bytes>,
     /// The listed packs of every project, as this server knows them.
     packs: crate::pack::Packs,
+    /// Per-project GC epoch observed from `access_epochs (project_id, -1)`.
+    gc_epochs: std::sync::RwLock<std::collections::HashMap<i64, i64>>,
     /// Requests to the store, for the benchmarks' cost gates
     /// (`storage-and-cost.md` §9): writes, bytes written, reads; of the
     /// writes, a push's and an upload's own (`own_writes`: those made in
@@ -558,11 +560,29 @@ impl Objects {
             store,
             cache: LruCache::new(cache_bytes),
             packs: crate::pack::Packs::new(db),
+            gc_epochs: Default::default(),
             writes: Default::default(),
             written_bytes: Default::default(),
             reads: Default::default(),
             own_writes: Default::default(),
             pack_rows: Default::default(),
+        }
+    }
+
+    pub fn gc_epoch(&self, project: i64) -> i64 {
+        self.gc_epochs.read().unwrap().get(&project).copied().unwrap_or(0)
+    }
+
+    pub fn set_gc_epoch(&self, project: i64, epoch: i64) {
+        if self.gc_epoch(project) == epoch {
+            return;
+        }
+        let changed = {
+            let mut g = self.gc_epochs.write().unwrap();
+            g.insert(project, epoch) != Some(epoch)
+        };
+        if changed {
+            self.packs.invalidate_project(project);
         }
     }
 
@@ -572,19 +592,25 @@ impl Objects {
     }
 
     /// Key of decoded tree `id` of `project` in [`crate::Hub::trees`].
-    pub fn tree_key(project: i64, id: &ObjectId) -> ObjectId {
+    pub fn tree_key(&self, project: i64, id: &ObjectId) -> ObjectId {
         let mut h = blake3::Hasher::new();
         h.update(b"tree");
         h.update(&project.to_le_bytes());
+        h.update(&self.gc_epoch(project).to_le_bytes());
         h.update(&id.0);
         ObjectId(*h.finalize().as_bytes())
     }
 
-    fn cache_key(project: i64, id: &ObjectId) -> ObjectId {
+    fn cache_key_at(project: i64, gc_epoch: i64, id: &ObjectId) -> ObjectId {
         let mut h = blake3::Hasher::new();
         h.update(&project.to_le_bytes());
+        h.update(&gc_epoch.to_le_bytes());
         h.update(&id.0);
         ObjectId(*h.finalize().as_bytes())
+    }
+
+    fn cache_key(&self, project: i64, id: &ObjectId) -> ObjectId {
+        Self::cache_key_at(project, self.gc_epoch(project), id)
     }
 
     /// Key of object `id` of staged pack `name` of `project`, in the object
@@ -719,11 +745,12 @@ impl Objects {
     /// The object `id` of `project` (its canonical encoding), checked
     /// against its id.
     pub async fn get(&self, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
-        match self.cache.get(&Self::cache_key(project, id)) {
+        let ck = self.cache_key(project, id);
+        match self.cache.get(&ck) {
             Some(enc) => decoded(id, &enc).map(Some),
             None => {
                 let enc = self.load_encoding(project, id).await?;
-                self.load(project, id, enc)
+                self.load(ck, id, enc)
             }
         }
     }
@@ -742,7 +769,7 @@ impl Objects {
     /// The encoding of object `id` of `project`, as stored (and sent to a
     /// client that reads encoded frames), checked against its id.
     pub async fn get_encoded(&self, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
-        let ck = Self::cache_key(project, id);
+        let ck = self.cache_key(project, id);
         if let Some(enc) = self.cache.get(&ck) {
             return Ok(Some(enc));
         }
@@ -756,11 +783,11 @@ impl Objects {
     }
 
     /// Check and cache the encoding the store answered; the object decoded.
-    fn load(&self, project: i64, id: &ObjectId, enc: Option<Bytes>) -> Result<Option<Bytes>> {
+    fn load(&self, ck: ObjectId, id: &ObjectId, enc: Option<Bytes>) -> Result<Option<Bytes>> {
         let Some(enc) = enc else { return Ok(None) };
         let enc = owned(&enc);
         let raw = decoded(id, &enc)?;
-        self.cache.insert(Self::cache_key(project, id), enc.clone(), enc.len());
+        self.cache.insert(ck, enc.clone(), enc.len());
         Ok(Some(raw))
     }
 
@@ -768,7 +795,8 @@ impl Objects {
     /// directly where this server knows where the object is; any other
     /// through `rt`.
     pub fn get_blocking(&self, rt: &tokio::runtime::Handle, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
-        if let Some(enc) = self.cache.get(&Self::cache_key(project, id)) {
+        let ck = self.cache_key(project, id);
+        if let Some(enc) = self.cache.get(&ck) {
             return decoded(id, &enc).map(Some);
         }
         let direct = match self.packs.find(project, id) {
@@ -799,7 +827,7 @@ impl Objects {
             return rt.block_on(self.get(project, id));
         };
         bump(&self.reads);
-        self.load(project, id, r?)
+        self.load(ck, id, r?)
     }
 
     /// Store object `id` (its canonical encoding `raw`) loose, compressed
@@ -812,7 +840,7 @@ impl Objects {
     pub async fn put_encoded(&self, project: i64, id: &ObjectId, enc: Bytes) -> Result<()> {
         count_write(self, enc.len());
         self.store.put(&object_key(project, id), enc.clone()).await?;
-        self.cache.insert(Self::cache_key(project, id), enc.clone(), enc.len());
+        self.cache.insert(self.cache_key(project, id), enc.clone(), enc.len());
         Ok(())
     }
 
@@ -925,10 +953,11 @@ impl Objects {
     /// [`DECODED_IN_FLIGHT`] (shares taken without waiting: without one,
     /// nothing is read ahead).
     pub async fn prefetch(&self, project: i64, ids: &[ObjectId]) {
+        let gce = self.gc_epoch(project);
         let mut by_pack: std::collections::HashMap<Arc<str>, Run> = Default::default();
         let mut seen = std::collections::HashSet::new();
         for id in ids {
-            if !seen.insert(*id) || self.cache.get(&Self::cache_key(project, id)).is_some() {
+            if !seen.insert(*id) || self.cache.get(&Self::cache_key_at(project, gce, id)).is_some() {
                 continue;
             }
             if let Found::At(n, s) = self.packs.find(project, id) {
@@ -994,7 +1023,7 @@ impl Objects {
                 let Some(_decoding) = ReadAhead::try_take(declared) else { continue };
                 let enc = Bytes::copy_from_slice(enc);
                 if decoded(&id, &enc).is_ok() {
-                    self.cache.insert(Self::cache_key(project, &id), enc.clone(), enc.len());
+                    self.cache.insert(Self::cache_key_at(project, gce, &id), enc.clone(), enc.len());
                 }
             }
         }
@@ -1045,6 +1074,7 @@ impl Objects {
     /// staged-index cache's if that holds it, else read when a lookup needs
     /// it.
     pub fn listed(&self, project: i64, packs: Vec<(Arc<str>, Option<Arc<Index>>)>) {
+        let gce = self.gc_epoch(project);
         let packs: Vec<(Arc<str>, Option<Arc<Index>>)> = packs
             .into_iter()
             .map(|(name, index)| {
@@ -1055,7 +1085,7 @@ impl Objects {
         for (name, index) in &packs {
             for (id, _) in index.iter().flat_map(|i| i.iter()) {
                 if let Some(enc) = self.cache.get(&Self::staged_key(project, name, id, false)) {
-                    self.cache.insert(Self::cache_key(project, id), enc.clone(), enc.len());
+                    self.cache.insert(Self::cache_key_at(project, gce, id), enc.clone(), enc.len());
                 }
             }
         }
@@ -1077,7 +1107,7 @@ impl Objects {
     /// held), then sliced. A part of a plain object cannot be checked
     /// against the id: the client checks the object it puts together.
     pub async fn get_range(&self, project: i64, id: &ObjectId, start: u64, end: u64) -> Result<Option<(Bytes, u64)>> {
-        if let Some(enc) = self.cache.get(&Self::cache_key(project, id)) {
+        if let Some(enc) = self.cache.get(&self.cache_key(project, id)) {
             if !encoding::is_compressed(&enc) {
                 return Ok(Some((slice(&enc, start, end), enc.len() as u64)));
             }
@@ -1135,7 +1165,7 @@ impl Objects {
         if recorded > 0 {
             return Ok(recorded.saturating_add(SIZE_SLACK));
         }
-        let declared = match self.cache.get(&Self::cache_key(project, id)) {
+        let declared = match self.cache.get(&self.cache_key(project, id)) {
             Some(enc) => encoding::declared_len(&enc[..enc.len().min(encoding::HEADER)], enc.len() as u64),
             None => match self.head(project, id).await? {
                 Some((head, Place::Pack(_, s))) => encoding::declared_len(&head, s.encoding_len()),
@@ -1148,7 +1178,7 @@ impl Objects {
     }
 
     pub async fn exists(&self, project: i64, id: &ObjectId) -> Result<bool> {
-        if self.cache.get(&Self::cache_key(project, id)).is_some() {
+        if self.cache.get(&self.cache_key(project, id)).is_some() {
             return Ok(true);
         }
         self.stored(project, id).await
@@ -1461,7 +1491,7 @@ mod tests {
         fresh.listed_here(1, vec![(name, index)]);
         fresh.prefetch(1, &ids).await;
         assert_eq!(fresh.reads.load(Ordering::Relaxed), 1, "one ranged request for the three");
-        let cached = |id: &ObjectId| fresh.cache.get(&Objects::cache_key(1, id)).is_some();
+        let cached = |id: &ObjectId| fresh.cache.get(&fresh.cache_key(1, id)).is_some();
         assert!(cached(&ids[0]) && cached(&ids[2]) && !cached(&ids[1]), "the intact neighbours are cached, the damaged one is not");
         assert_eq!(fresh.get(1, &ids[0]).await.unwrap(), Some(raws[0].clone()));
         assert_eq!(fresh.get(1, &ids[2]).await.unwrap(), Some(raws[2].clone()));
@@ -1530,7 +1560,7 @@ mod tests {
                 }
                 let grew = vm("VmHWM:").saturating_sub(before);
                 let reads = fresh.reads.load(Ordering::Relaxed);
-                assert!(fresh.cache.get(&Objects::cache_key(1, &ids[0])).is_some(), "the prefetches read the objects");
+                assert!(fresh.cache.get(&fresh.cache_key(1, &ids[0])).is_some(), "the prefetches read the objects");
                 println!("PREFETCH grew={grew} reads={reads}");
             });
             return;

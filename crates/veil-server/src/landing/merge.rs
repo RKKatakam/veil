@@ -483,19 +483,22 @@ async fn run_worker(hub: &Arc<Hub>, mut job: Job) -> Result<()> {
         false
     };
     let epochs_rows: Vec<(i64, i64, i64)> = sqlx::query_as(
-        "SELECT project_id, person_id, epoch FROM access_epochs WHERE (project_id = 0 AND person_id = $1) OR (project_id = $2 AND person_id = 0)",
+        "SELECT project_id, person_id, epoch FROM access_epochs WHERE (project_id = 0 AND person_id = $1) OR (project_id = $2 AND person_id IN (0, -1))",
     )
     .bind(job.person.id)
     .bind(job.project)
     .fetch_all(&hub.db)
     .await?;
     let person_epoch = epochs_rows.iter().find(|e| e.0 == 0 && e.1 == job.person.id).map_or(0, |e| e.2);
-    let project_epoch = epochs_rows.iter().find(|e| e.0 == job.project).map_or(0, |e| e.2);
+    let project_epoch = epochs_rows.iter().find(|e| e.0 == job.project && e.1 == 0).map_or(0, |e| e.2);
+    let gc_epoch = epochs_rows.iter().find(|e| e.0 == job.project && e.1 == -1).map_or(0, |e| e.2);
+    hub.observe_gc_epoch(job.project, gc_epoch);
     let caller = Caller {
         person: Some(job.person.clone()),
         epochs: Epochs {
             person: person_epoch,
             project: Some((job.project, project_epoch)),
+            gc: Some((job.project, gc_epoch)),
         },
     };
     let who = if session_gone {
