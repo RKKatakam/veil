@@ -1703,7 +1703,6 @@ fn bug_1785_object_range_zero_dash_bypasses_answers_prepay() {
 /// resolve `A` across the entire repository instead of refusing revisions outside
 /// `@` and its ancestors (`BUG-1361`).
 #[test]
-#[ignore = "BUG-1786: ws_socket check_revisions checks only B in vl log -r A..B, letting a sandbox resolve other workspaces and tags outside @'s history"]
 fn bug_1786_sandbox_socket_vl_log_range_resolves_revisions_outside_workspace_history() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1720,11 +1719,17 @@ fn bug_1786_sandbox_socket_vl_log_range_resolves_revisions_outside_workspace_his
     let ctl = p.dev.run(&clone, &["ws", "exec", "agent", "--", "vl", "show", "secretws@"]);
     assert!(!ctl.status.success(), "control: vl show secretws@ must fail");
 
-    // Bug: `vl log -r secretws@..@` and `vl log -r secrettag..@` inside `agent`'s sandbox MUST ALSO be refused!
-    let r_ws = p.dev.run(&clone, &["ws", "exec", "agent", "--", "vl", "log", "-r", "secretws@..@"]);
-    let out_ws = format!("{}{}", String::from_utf8_lossy(&r_ws.stdout), String::from_utf8_lossy(&r_ws.stderr));
-    assert!(
-        !r_ws.status.success(),
-        "sandbox `vl log -r secretws@..@` resolved another workspace outside @'s history:\n{out_ws}"
-    );
+    // Every revision in a range or revset outside `@` and its ancestors must be refused.
+    for revset in ["secretws@..@", "secrettag..@", "@..secretws@", "..secretws@", "agent(*)"] {
+        let r = p.dev.run(&clone, &["ws", "exec", "agent", "--", "vl", "log", "-r", revset]);
+        let out = format!("{}{}", String::from_utf8_lossy(&r.stdout), String::from_utf8_lossy(&r.stderr));
+        assert!(
+            !r.status.success() && out.contains("inside a sandbox"),
+            "sandbox `vl log -r {revset}` must be refused:\n{out}"
+        );
+    }
+
+    // Valid ranges within `@`'s own history continue to work.
+    let ok = p.dev.run(&clone, &["ws", "exec", "agent", "--", "vl", "log", "-r", "@-..@"]);
+    assert!(ok.status.success(), "valid range @-..@ failed: {}", String::from_utf8_lossy(&ok.stderr));
 }

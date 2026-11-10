@@ -471,3 +471,40 @@ fn the_next_run_records_and_names_what_a_killed_mounted_run_left() {
     let mounted = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
     assert!(!mounted.contains(t.runtime().to_str().unwrap()), "the killed run's mount is still mounted");
 }
+
+/// BUG-1786: `vl log -r` inside a sandbox checks every revision in a range or
+/// revset (`A..B`, `..B`, `::B`, `agent(…)`), not only the upper bound `B`.
+#[test]
+fn bug_1786_sandbox_vl_log_checks_every_revision_in_ranges_and_revsets() {
+    let t = T::new();
+    let o = t
+        .cmd(&["ws", "exec", "other", "--agent", "secret-bot", "-m", "OTHER-DESCRIPTION-91fe", "--", "bash", "-c", "echo x > w.txt && vl commit -m OTHER-COMMIT-91fe"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    t.env.ok("alice", &t.proj, &["tag", "set", "secrettag", "-r", "other@-"]);
+    let show_json: serde_json::Value = serde_json::from_str(&t.env.ok("alice", &t.proj, &["show", "other@-", "--json"])).unwrap();
+    let other_cid = show_json["change_id"].as_str().unwrap().to_string();
+
+    for flags in [&[][..], &["--mount"]] {
+        let out = t.ok(flags, "vl log -r '@-..@'; vl log -r '..@'; vl log -r 'root()..@'; vl log --agent '*'");
+        assert!(!out.contains("OTHER-DESCRIPTION-91fe") && !out.contains("OTHER-COMMIT-91fe"), "{flags:?}: {out}");
+
+        for r in [
+            "other@..@",
+            "secrettag..@",
+            &format!("{other_cid}..@"),
+            "@..other@",
+            "..other@",
+            "::other@",
+            "other@..",
+            "..",
+            "agent(*)",
+        ] {
+            let o = t.exec(flags, &format!("vl log -r '{r}'"));
+            let all = text(&o);
+            assert!(!o.status.success() && all.contains("inside a sandbox"), "{flags:?} log -r {r}: {all}");
+            assert!(!all.contains("OTHER-DESCRIPTION-91fe") && !all.contains("OTHER-COMMIT-91fe"), "{all}");
+        }
+    }
+}
