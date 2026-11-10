@@ -139,6 +139,21 @@ pub struct Options {
     pub now_offset_ms: i64,
     /// Crash injection hook for tests.
     pub crash: Option<CrashPoint>,
+    /// Optional hook invoked right before GC verifies `RefStamp` and switches
+    /// packs / deletes loose objects (for deterministic race tests).
+    pub before_switch: Option<SwitchHook>,
+}
+
+/// Async callback invoked right before GC verifies `RefStamp` and commits a switch.
+#[derive(Clone)]
+pub struct SwitchHook(
+    pub Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>,
+);
+
+impl std::fmt::Debug for SwitchHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SwitchHook(..)")
+    }
 }
 
 impl Default for Options {
@@ -155,6 +170,7 @@ impl Default for Options {
             staged_grace_ms: DEFAULT_STAGED_GRACE_MS,
             now_offset_ms: 0,
             crash: None,
+            before_switch: None,
         }
     }
 }
@@ -293,31 +309,67 @@ struct PackRow {
     created_at: i64,
 }
 
-/// Fingerprint of the project's refs and history so GC can detect any push,
-/// API commit, landing, or staged upload that arrived while reachability was
-/// being walked.
+/// Content fingerprint of every table that names GC roots or staged uploads for
+/// a project (`BUG-1782`), so GC detects any concurrent insert, delete, or
+/// in-place update (`change_refs` amend, `pr_revisions` push, `bisects` step,
+/// `bisect_reverts` record, landing rewrite, staged upload, etc.) while
+/// reachability was walked or replacement packs were written.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct RefStamp {
-    branches: Vec<(String, String, i64, Option<String>)>,
-    snapshots_count: i64,
+pub struct RefStamp {
+    digests: Vec<(String, i64, i64, i64, i64)>,
     staged_packs: Vec<String>,
-    change_refs_count: i64,
-    landing_queue_max: Option<i64>,
-    embargo_count: i64,
-    checks_max: Option<i64>,
-    tested_max: Option<i64>,
+}
+
+/// `(table_name, row_expr, extra_where)` stamped by [`read_ref_stamp`].
+const STAMP_TABLES: &[(&str, &str, &str)] = &[
+    ("branches", "concat_ws(chr(31), name, target, lineage::text, COALESCE(hidden_for_embargo, ''))", ""),
+    ("snapshots", "concat_ws(chr(31), id, author::text)", ""),
+    ("packs", "concat_ws(chr(31), name, person_id::text, size::text, objects::text)", " AND state = $2 AND person_id IS NOT NULL"),
+    ("change_refs", "concat_ws(chr(31), change_id, snapshot, created_by::text, created_at::text)", ""),
+    ("landing_queue", "concat_ws(chr(31), seq::text, branch, state, stack, COALESCE(result, ''))", ""),
+    ("landings", "concat_ws(chr(31), branch, lineage::text, submitted, landed, at::text)", ""),
+    ("embargo_snapshots", "concat_ws(chr(31), snapshot, embargo_id)", ""),
+    ("embargo_lines", "concat_ws(chr(31), embargo_id, target_branch, embargo_branch, COALESCE(released_at::text, ''), record_json)", ""),
+    ("checks", "concat_ws(chr(31), snapshot, name, state, updated_at::text)", ""),
+    ("tested", "concat_ws(chr(31), branch, lineage::text, snapshot, depth::text, updated_at::text)", ""),
+    ("pr_revisions", "concat_ws(chr(31), pr, n::text, base, head, changes)", ""),
+    ("bisects", "concat_ws(chr(31), branch, lineage::text, check_name, phase, good, bad, candidates, probes, COALESCE(culprit, ''), COALESCE(culprit_parent, ''), COALESCE(revert_snapshot, ''), updated_at::text)", ""),
+    ("bisect_reverts", "concat_ws(chr(31), branch, lineage::text, culprit, check_name, ticket, COALESCE(revert_snapshot, ''), state)", ""),
+];
+
+/// Names of all tables fingerprinted by [`project_ref_stamp`].
+pub fn stamped_root_tables() -> Vec<&'static str> {
+    STAMP_TABLES.iter().map(|&(t, _, _)| t).collect()
+}
+
+/// Read the current [`RefStamp`] of `project` from `db` (exposed for tests).
+pub async fn project_ref_stamp(db: &sqlx::PgPool, project: i64) -> Result<RefStamp> {
+    let mut conn = db.acquire().await?;
+    read_ref_stamp(&mut conn, project).await
 }
 
 async fn read_ref_stamp(c: &mut PgConnection, project: i64) -> Result<RefStamp> {
-    let branches: Vec<(String, String, i64, Option<String>)> = sqlx::query_as(
-        "SELECT name, target, lineage, hidden_for_embargo FROM branches WHERE project_id = $1 ORDER BY name",
-    )
-    .bind(project)
-    .fetch_all(&mut *c)
-    .await?;
-    let snapshots_count: i64 = sqlx::query_scalar("SELECT count(*) FROM snapshots WHERE project_id = $1")
+    let arms: Vec<String> = STAMP_TABLES
+        .iter()
+        .enumerate()
+        .map(|(idx, &(table, expr, extra))| {
+            format!(
+                "SELECT {idx}::int AS ord, '{table}'::text AS tbl, count(*)::bigint, \
+                 COALESCE(bit_xor(('x' || substr(md5(e), 1, 16))::bit(64)::bigint), 0) AS coalesce, \
+                 COALESCE(bit_xor(('x' || substr(md5(e), 17, 16))::bit(64)::bigint), 0) AS coalesce_2, \
+                 COALESCE(mod(sum(('x' || substr(md5('s:' || e), 1, 15))::bit(60)::bigint), 1152921504606846976), 0)::bigint AS coalesce_3 \
+                 FROM (SELECT {expr} AS e FROM {table} WHERE project_id = $1{extra}) s"
+            )
+        })
+        .collect();
+    let sql = format!(
+        "SELECT tbl, count, coalesce, coalesce_2, coalesce_3 FROM ({}) u ORDER BY ord",
+        arms.join(" UNION ALL ")
+    );
+    let mut digests: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(&sql)
         .bind(project)
-        .fetch_one(&mut *c)
+        .bind(STAGED)
+        .fetch_all(&mut *c)
         .await?;
     let staged_packs: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM packs WHERE project_id = $1 AND state = $2 AND person_id IS NOT NULL ORDER BY name",
@@ -326,36 +378,23 @@ async fn read_ref_stamp(c: &mut PgConnection, project: i64) -> Result<RefStamp> 
     .bind(STAGED)
     .fetch_all(&mut *c)
     .await?;
-    let change_refs_count: i64 = sqlx::query_scalar("SELECT count(*) FROM change_refs WHERE project_id = $1")
+
+    // Also stamp optional dynamic `tags` table if present.
+    if table_has_column(c, "tags", "project_id").await? {
+        let tag_row: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT count(*)::bigint, \
+             COALESCE(bit_xor(('x' || substr(md5(e), 1, 16))::bit(64)::bigint), 0), \
+             COALESCE(bit_xor(('x' || substr(md5(e), 17, 16))::bit(64)::bigint), 0), \
+             COALESCE(mod(sum(('x' || substr(md5('s:' || e), 1, 15))::bit(60)::bigint), 1152921504606846976), 0)::bigint \
+             FROM (SELECT row_to_json(t)::text AS e FROM tags t WHERE project_id = $1) s",
+        )
         .bind(project)
         .fetch_one(&mut *c)
         .await?;
-    let landing_queue_max: Option<i64> = sqlx::query_scalar("SELECT max(seq) FROM landing_queue WHERE project_id = $1")
-        .bind(project)
-        .fetch_one(&mut *c)
-        .await?;
-    let embargo_count: i64 = sqlx::query_scalar("SELECT count(*) FROM embargo_snapshots WHERE project_id = $1")
-        .bind(project)
-        .fetch_one(&mut *c)
-        .await?;
-    let checks_max: Option<i64> = sqlx::query_scalar("SELECT max(updated_at) FROM checks WHERE project_id = $1")
-        .bind(project)
-        .fetch_one(&mut *c)
-        .await?;
-    let tested_max: Option<i64> = sqlx::query_scalar("SELECT max(updated_at) FROM tested WHERE project_id = $1")
-        .bind(project)
-        .fetch_one(&mut *c)
-        .await?;
-    Ok(RefStamp {
-        branches,
-        snapshots_count,
-        staged_packs,
-        change_refs_count,
-        landing_queue_max,
-        embargo_count,
-        checks_max,
-        tested_max,
-    })
+        digests.push(("tags".to_string(), tag_row.0, tag_row.1, tag_row.2, tag_row.3));
+    }
+
+    Ok(RefStamp { digests, staged_packs })
 }
 
 async fn run_with_lock(hub: &Arc<Hub>, project: i64, opts: &Options) -> Result<Report> {
@@ -429,6 +468,40 @@ async fn run_with_lock(hub: &Arc<Hub>, project: i64, opts: &Options) -> Result<R
         .await?;
         if crashed {
             return Ok(report);
+        }
+    } else if !expired_unreferenced.is_empty() {
+        if let Some(expected) = &ref_stamp {
+            if let Some(hook) = &opts.before_switch {
+                (hook.0)().await;
+            }
+            let expired_hexes: Vec<String> = expired_unreferenced.iter().map(ObjectId::hex).collect();
+            let maybe_gce: Option<i64> =
+                crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, |c| {
+                    let expected = expected.clone();
+                    let expired_hexes = expired_hexes.clone();
+                    Box::pin(async move {
+                        let cur = read_ref_stamp(c, project).await?;
+                        if cur != expected {
+                            return Ok(None);
+                        }
+                        purge_expired_db_records(c, project, &expired_hexes).await?;
+                        for chunk in expired_hexes.chunks(500) {
+                            sqlx::query(
+                                "DELETE FROM unreferenced_objects WHERE project_id = $1 AND object_id = ANY($2)",
+                            )
+                            .bind(project)
+                            .bind(chunk)
+                            .execute(&mut *c)
+                            .await?;
+                        }
+                        let gce = bump_gc_epoch_tx(c, project).await?;
+                        Ok(Some(gce))
+                    })
+                })
+                .await?;
+            if let Some(gce) = maybe_gce {
+                notify_gc_epoch(hub, project, gce).await;
+            }
         }
     }
 
@@ -664,6 +737,10 @@ async fn compact_batch(
         return Ok(true);
     }
 
+    if let Some(hook) = &opts.before_switch {
+        (hook.0)().await;
+    }
+
     // 3. Switch the database rows in a single transaction:
     // - verify every pack in `batch` is still `LISTED` (locking the rows);
     // - if `expected_stamp` is Some (a GC run that drops unreferenced objects),
@@ -676,6 +753,11 @@ async fn compact_batch(
     let new_names: Vec<String> = written_packs.iter().map(|(n, _, _, _)| n.to_string()).collect();
     let newest_created_at = batch.iter().map(|p| p.created_at).max().unwrap_or(now_ms);
     let check_stamp = if dead_count > 0 { expected_stamp.cloned() } else { None };
+    let all_expired_hexes: Vec<String> = if dead_count > 0 {
+        expired_unreferenced.iter().map(ObjectId::hex).collect()
+    } else {
+        Vec::new()
+    };
     let dead_hexes: Vec<String> = if dead_count > 0 && complete_dead_sweep {
         dead_ids.iter().map(ObjectId::hex).collect()
     } else {
@@ -687,6 +769,7 @@ async fn compact_batch(
             let old_names = old_names.clone();
             let new_names = new_names.clone();
             let check_stamp = check_stamp.clone();
+            let all_expired_hexes = all_expired_hexes.clone();
             let dead_hexes = dead_hexes.clone();
             Box::pin(async move {
                 if let Some(expected) = &check_stamp {
@@ -705,6 +788,9 @@ async fn compact_batch(
                 .await?;
                 if locked.len() != old_names.len() {
                     return Ok(None);
+                }
+                if !all_expired_hexes.is_empty() {
+                    purge_expired_db_records(c, project, &all_expired_hexes).await?;
                 }
                 if !new_names.is_empty() {
                     sqlx::query(
@@ -1027,10 +1113,15 @@ async fn mark_and_sweep_loose(
         }
     }
 
-    // Purge all DB history/memo/derived records naming expired unreferenced
-    // objects and bump the project's GC epoch so no server treats an about-to-be
-    // deleted snapshot or projection as already held (BUG-1780, BUG-1781).
-    if !expired_unreferenced.is_empty() {
+    // Delete expired unreferenced loose objects (after verifying `read_ref_stamp`
+    // is unchanged so no racing push, PR, change_ref, or bisect referenced them,
+    // and purging DB records in the same step).
+    let has_loose_expired =
+        !expired_unreferenced.is_empty() && loose_ids.iter().any(|id| expired_unreferenced.contains(id));
+    if has_loose_expired {
+        if let Some(hook) = &opts.before_switch {
+            (hook.0)().await;
+        }
         let expired_hexes: Vec<String> = expired_unreferenced.iter().map(ObjectId::hex).collect();
         let purged: Result<(RefStamp, Option<i64>)> =
             crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, |c| {
@@ -1057,48 +1148,38 @@ async fn mark_and_sweep_loose(
         };
         stamp = next_stamp;
         notify_gc_epoch(hub, project, gce).await;
-    }
 
-    // Delete expired unreferenced loose objects (after verifying `read_ref_stamp`
-    // is unchanged so no racing push referenced them).
-    if !loose_ids.is_empty() && !expired_unreferenced.is_empty() {
-        let cur_stamp = {
-            let mut conn = hub.db.acquire().await?;
-            read_ref_stamp(&mut conn, project).await?
-        };
-        if cur_stamp == stamp {
-            let mut deleted_any_loose = false;
-            let mut deleted_loose_only_hexes = Vec::new();
-            for id in loose_ids {
-                if expired_unreferenced.contains(&id) {
-                    hub.limits.derive_turn().await;
-                    store.delete(&object_key(project, &id)).await.map_err(Error::Other)?;
-                    deleted_any_loose = true;
-                    if !packed_stored.contains(&id) {
-                        deleted_loose_only_hexes.push(id.hex());
-                    }
-                    report.loose_objects_deleted += 1;
+        let mut deleted_any_loose = false;
+        let mut deleted_loose_only_hexes = Vec::new();
+        for id in loose_ids {
+            if expired_unreferenced.contains(&id) {
+                hub.limits.derive_turn().await;
+                store.delete(&object_key(project, &id)).await.map_err(Error::Other)?;
+                deleted_any_loose = true;
+                if !packed_stored.contains(&id) {
+                    deleted_loose_only_hexes.push(id.hex());
                 }
+                report.loose_objects_deleted += 1;
             }
-            if deleted_any_loose {
-                let gce = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, |c| {
-                    let deleted_loose_only_hexes = deleted_loose_only_hexes.clone();
-                    Box::pin(async move {
-                        for chunk in deleted_loose_only_hexes.chunks(500) {
-                            sqlx::query(
-                                "DELETE FROM unreferenced_objects WHERE project_id = $1 AND object_id = ANY($2)",
-                            )
-                            .bind(project)
-                            .bind(chunk)
-                            .execute(&mut *c)
-                            .await?;
-                        }
-                        bump_gc_epoch_tx(c, project).await
-                    })
+        }
+        if deleted_any_loose {
+            let gce2 = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, |c| {
+                let deleted_loose_only_hexes = deleted_loose_only_hexes.clone();
+                Box::pin(async move {
+                    for chunk in deleted_loose_only_hexes.chunks(500) {
+                        sqlx::query(
+                            "DELETE FROM unreferenced_objects WHERE project_id = $1 AND object_id = ANY($2)",
+                        )
+                        .bind(project)
+                        .bind(chunk)
+                        .execute(&mut *c)
+                        .await?;
+                    }
+                    bump_gc_epoch_tx(c, project).await
                 })
-                .await?;
-                notify_gc_epoch(hub, project, gce).await;
-            }
+            })
+            .await?;
+            notify_gc_epoch(hub, project, gce2).await;
         }
     }
 
@@ -1209,98 +1290,270 @@ fn insert_hex(set: &mut HashSet<ObjectId>, hex: &str) {
     }
 }
 
+/// Role of a database column in `public` with respect to S29 pack garbage
+/// collection (`BUG-1782`). Every `(table, column)` in the schema must be
+/// registered in [`OBJECT_SCHEMA_COLUMNS`] or [`NON_OBJECT_SCHEMA_COLUMNS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaColumnRole {
+    /// Authoritative `ObjectId` root (plain 64-hex or JSON containing 64-hex
+    /// IDs) whose reachable closure is retained by `collect_db_roots`, and
+    /// whose table is fingerprinted in `read_ref_stamp`.
+    GcRoot,
+    /// Conditional leaf `ObjectId` root (`search_shards.segments` for live
+    /// non-embargo branches and `branch = ''`), retained without graph walk and
+    /// fingerprinted in `read_ref_stamp`.
+    GcConditionalLeafRoot,
+    /// Conditional graph attachment or retained history (`snapshots.id` within
+    /// `retention_window_ms`, `origins`, `projections`, `graph.changed`),
+    /// retained while its owning snapshot is live/retained and purged when
+    /// expired.
+    GcAttachmentOrRetainedHistory,
+    /// Derived index, history row, or ephemeral pagination cursor referencing
+    /// `ObjectId`s (`landed_from`, `landed_changes`, `graph`, `file_history`,
+    /// `rule_history`, `derive_progress`, `view_graph`, `view_changes`,
+    /// `view_file_history`, `blame_memo`, `blame_ends`, `blame_jobs`,
+    /// `search_heads`, `log_cursors`), purged or invalidated when expired.
+    DerivedOrEphemeralObjectRef,
+    /// GC's own unreferenced-object age table (`unreferenced_objects.object_id`).
+    GcBookkeeping,
+    /// Column never holds content-addressed `ObjectId`s.
+    NonObject,
+}
+
+/// Every schema column that holds (or may hold) content-addressed `ObjectId`s.
+pub const OBJECT_SCHEMA_COLUMNS: &[(&str, &str, SchemaColumnRole)] = &[
+    // Authoritative GC roots (`GcRoot`) — automatically queried by `collect_db_roots`:
+    ("branches", "target", SchemaColumnRole::GcRoot),
+    ("embargo_snapshots", "snapshot", SchemaColumnRole::GcRoot),
+    ("embargo_lines", "record_json", SchemaColumnRole::GcRoot),
+    ("change_refs", "snapshot", SchemaColumnRole::GcRoot),
+    ("landing_queue", "stack", SchemaColumnRole::GcRoot),
+    ("landing_queue", "result", SchemaColumnRole::GcRoot),
+    ("landings", "submitted", SchemaColumnRole::GcRoot),
+    ("landings", "landed", SchemaColumnRole::GcRoot),
+    ("checks", "snapshot", SchemaColumnRole::GcRoot),
+    ("tested", "snapshot", SchemaColumnRole::GcRoot),
+    ("pr_revisions", "base", SchemaColumnRole::GcRoot),
+    ("pr_revisions", "head", SchemaColumnRole::GcRoot),
+    ("pr_revisions", "changes", SchemaColumnRole::GcRoot),
+    ("pr_review_rules", "checked", SchemaColumnRole::GcRoot),
+    ("bisects", "good", SchemaColumnRole::GcRoot),
+    ("bisects", "bad", SchemaColumnRole::GcRoot),
+    ("bisects", "candidates", SchemaColumnRole::GcRoot),
+    ("bisects", "probes", SchemaColumnRole::GcRoot),
+    ("bisects", "culprit", SchemaColumnRole::GcRoot),
+    ("bisects", "culprit_parent", SchemaColumnRole::GcRoot),
+    ("bisects", "revert_snapshot", SchemaColumnRole::GcRoot),
+    ("bisect_reverts", "culprit", SchemaColumnRole::GcRoot),
+    ("bisect_reverts", "revert_snapshot", SchemaColumnRole::GcRoot),
+    // Conditional leaf roots (`GcConditionalLeafRoot`):
+    ("search_shards", "segments", SchemaColumnRole::GcConditionalLeafRoot),
+    // Conditional attachments and retained snapshot history (`GcAttachmentOrRetainedHistory`):
+    ("snapshots", "id", SchemaColumnRole::GcAttachmentOrRetainedHistory),
+    ("origins", "real_id", SchemaColumnRole::GcAttachmentOrRetainedHistory),
+    ("origins", "origin_id", SchemaColumnRole::GcAttachmentOrRetainedHistory),
+    ("projections", "real_id", SchemaColumnRole::GcAttachmentOrRetainedHistory),
+    ("projections", "projected_id", SchemaColumnRole::GcAttachmentOrRetainedHistory),
+    ("graph", "changed", SchemaColumnRole::GcAttachmentOrRetainedHistory),
+    // Derived indexes, history tables, and ephemeral cursors (`DerivedOrEphemeralObjectRef`):
+    ("blame_ends", "snapshot", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("blame_jobs", "snapshot", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("blame_memo", "snapshot", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("derive_progress", "through_snapshot", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("file_history", "snapshot", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("graph", "snapshot", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("graph", "parents", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("graph", "skip", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("landed_changes", "landed", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("landed_from", "source", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("landed_from", "landed", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("log_cursors", "frontier", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("rule_history", "snapshot", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("search_heads", "snapshot", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("view_changes", "snapshot", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("view_file_history", "snapshot", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("view_file_history", "change", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("view_graph", "snapshot", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("view_graph", "parents", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("view_graph", "skip", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("view_graph", "down_id", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    ("view_graph", "real_id", SchemaColumnRole::DerivedOrEphemeralObjectRef),
+    // GC bookkeeping (`GcBookkeeping`):
+    ("unreferenced_objects", "object_id", SchemaColumnRole::GcBookkeeping),
+];
+
+/// Non-object columns across every table in `public`.
+pub const NON_OBJECT_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
+    ("access_epochs", &["project_id", "person_id", "epoch", "changed_at"]),
+    ("audit_log", &["id", "project_id", "at", "actor", "action", "details"]),
+    ("bisect_leases", &["project_id", "branch", "holder", "epoch", "expires_at"]),
+    ("bisect_reverts", &["project_id", "branch", "lineage", "check_name", "ticket", "state", "created_at"]),
+    ("bisects", &["project_id", "branch", "lineage", "check_name", "lo", "hi", "phase", "culprit_fails", "parent_passes", "confirm_requested_at", "session_paths", "admin_only", "revert_ticket", "created_at", "updated_at"]),
+    ("blame_ends", &["project_id", "view_key", "path_key", "follow", "held", "kept_bytes", "path_keys", "created_at"]),
+    ("blame_jobs", &["project_id", "view_key", "path_key", "follow", "holder", "expires_at"]),
+    ("blame_memo", &["project_id", "view_key", "path_key", "follow", "body", "bytes", "created_at", "path_keys"]),
+    ("blame_paths", &["project_id", "path_key", "path"]),
+    ("branches", &["project_id", "name", "lineage", "hidden_for_embargo"]),
+    ("challenges", &["challenge", "signing_key", "expires_at"]),
+    ("change_refs", &["project_id", "change_id", "created_by", "created_at"]),
+    ("checks", &["project_id", "name", "state", "summary", "url", "log", "runner_id", "runner_name", "session_paths", "admin_only", "updated_at"]),
+    ("derive_progress", &["project_id", "index_name", "index_version", "branch"]),
+    ("device_bars", &["project_id", "device_id", "created_at"]),
+    ("device_expected", &["person_id", "fingerprint", "expires_at"]),
+    ("device_vouches", &["device_id", "voucher_key", "signature", "created_at"]),
+    ("devices", &["id", "person_id", "signing_key", "public_identity", "created_at", "removed_at", "pending", "fingerprint"]),
+    ("embargo_lines", &["project_id", "embargo_id", "group_names", "target_branch", "embargo_branch", "until_ms", "released_at", "created_by", "created_at"]),
+    ("embargo_snapshots", &["project_id", "embargo_id"]),
+    ("file_history", &["project_id", "path_key", "depth"]),
+    ("graph", &["project_id", "generation", "depth", "change_id", "flags"]),
+    ("group_managers", &["group_id", "person_id"]),
+    ("group_members", &["group_id", "person_id"]),
+    ("groups", &["id", "project_id", "name"]),
+    ("invites", &["project_id", "invite_key", "person", "group_id", "expires_at", "created_by", "created_at", "used_at", "device_id", "signature"]),
+    ("key_requests", &["project_id", "person_id", "created_at"]),
+    ("landed_changes", &["project_id", "branch", "lineage", "change_id", "author"]),
+    ("landed_from", &["project_id"]),
+    ("landing_leases", &["project_id", "branch", "holder", "epoch", "expires_at"]),
+    ("landing_queue", &["project_id", "branch", "seq", "ticket", "person_id", "person_name", "device_key", "lineage", "person_epoch", "project_epoch", "state", "created_at", "done_at", "merges", "agent_session", "session", "priority"]),
+    ("landings", &["project_id", "branch", "lineage", "at"]),
+    ("log_cursors", &["project_id", "view_key", "id", "created_at"]),
+    ("origins", &["project_id"]),
+    ("packs", &["project_id", "name", "state", "person_id", "size", "objects", "created_at", "discarded_at"]),
+    ("people", &["id", "name", "created_at"]),
+    ("pr_classes", &["project_id", "class_id", "policy_key", "lines", "embargo"]),
+    ("pr_comments", &["project_id", "pr", "thread", "id", "author", "body", "at"]),
+    ("pr_holds", &["project_id", "person", "path", "pr", "at"]),
+    ("pr_paths", &["project_id", "pr", "path"]),
+    ("pr_review_rules", &["project_id", "state"]),
+    ("pr_reviews", &["project_id", "pr", "revision", "person", "verdict", "patch", "agent", "device", "signature", "body", "at"]),
+    ("pr_revisions", &["project_id", "pr", "n", "patch", "files", "risk", "reasons", "rules_key", "files_count", "pushed_by", "at"]),
+    ("pr_threads", &["project_id", "pr", "id", "anchor", "now_at", "state", "author", "created_at"]),
+    ("project_admins", &["project_id", "person_id"]),
+    ("projections", &["project_id", "view_key", "created_at", "collapsed"]),
+    ("projects", &["id", "name", "created_by", "created_at", "default_branch", "policy_text", "policy_bindings", "policy_version"]),
+    ("prs", &["project_id", "id", "class_id", "policy_key", "target", "author", "title", "body", "state", "revision", "created_at", "updated_at"]),
+    ("rings", &["project_id", "scope", "body"]),
+    ("rule_history", &["project_id", "line_key", "generation"]),
+    ("rule_lines", &["project_id", "line_key", "ready"]),
+    ("schema_migrations", &["version", "name", "applied_at"]),
+    ("search_heads", &["project_id", "kind", "branch", "lines", "version"]),
+    ("search_shards", &["project_id", "kind", "branch", "line_key", "docs", "text_docs", "text_bytes", "dead"]),
+    ("secret_share_quota", &["project_id", "sharer_id", "used"]),
+    ("secret_shares", &["project_id", "path", "sharer_id", "recipient_id", "version", "created_at", "updated_at", "unshared_at", "body"]),
+    ("sessions", &["token_hash", "device_id", "person_id", "expires_at", "agent", "agent_project", "agent_only", "parent_hash", "agent_runner"]),
+    ("snapshots", &["project_id", "author"]),
+    ("tested", &["project_id", "branch", "lineage", "depth", "updated_at"]),
+    ("unreferenced_objects", &["project_id", "since_ms"]),
+    ("view_access", &["project_id", "access", "changed_at"]),
+    ("view_changes", &["project_id", "view_key", "change_id", "flags"]),
+    ("view_file_history", &["project_id", "view_key", "path_key", "depth"]),
+    ("view_fills", &["project_id", "view_key", "holder", "expires_at"]),
+    ("view_graph", &["project_id", "view_key", "generation", "depth", "flags", "files"]),
+];
+
+/// Look up the registered [`SchemaColumnRole`] of `(table, column)` in `public`.
+pub fn classify_schema_column(table: &str, column: &str) -> Option<SchemaColumnRole> {
+    for &(t, c, role) in OBJECT_SCHEMA_COLUMNS {
+        if t == table && c == column {
+            return Some(role);
+        }
+    }
+    for &(t, cols) in NON_OBJECT_SCHEMA_COLUMNS {
+        if t == table && cols.contains(&column) {
+            return Some(SchemaColumnRole::NonObject);
+        }
+    }
+    None
+}
+
+/// Compare `information_schema.columns` (`table_schema = 'public'`) against
+/// `pack_gc`'s registered schema columns, returning `(unregistered_in_db,
+/// missing_from_db)`.
+pub async fn audit_schema_columns(
+    c: &mut PgConnection,
+) -> Result<(Vec<(String, String, String)>, Vec<(String, String)>)> {
+    let actual: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT table_name::text, column_name::text, data_type::text \
+         FROM information_schema.columns \
+         WHERE table_schema = 'public' \
+         ORDER BY table_name, column_name",
+    )
+    .fetch_all(&mut *c)
+    .await?;
+
+    let mut actual_set: HashSet<(&str, &str)> = HashSet::with_capacity(actual.len());
+    let mut unregistered = Vec::new();
+    for (t, col, dt) in &actual {
+        actual_set.insert((t.as_str(), col.as_str()));
+        if classify_schema_column(t, col).is_none() {
+            unregistered.push((t.clone(), col.clone(), dt.clone()));
+        }
+    }
+
+    let mut missing = Vec::new();
+    let mut seen_reg = HashSet::new();
+    for &(t, col, _) in OBJECT_SCHEMA_COLUMNS {
+        if !seen_reg.insert((t, col)) || !actual_set.contains(&(t, col)) {
+            missing.push((t.to_string(), col.to_string()));
+        }
+    }
+    for &(t, cols) in NON_OBJECT_SCHEMA_COLUMNS {
+        for &col in cols {
+            if !seen_reg.insert((t, col)) || !actual_set.contains(&(t, col)) {
+                missing.push((t.to_string(), col.to_string()));
+            }
+        }
+    }
+    Ok((unregistered, missing))
+}
+
 async fn collect_db_roots(c: &mut PgConnection, project: i64) -> Result<DbRoots> {
     let mut r = DbRoots::default();
 
-    // 1. All branches (public AND hidden embargo branches `hidden_for_embargo IS NOT NULL`).
-    let branch_targets: Vec<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1")
-        .bind(project)
-        .fetch_all(&mut *c)
-        .await?;
-    for t in branch_targets {
-        insert_hex(&mut r.walk_objects, &t);
-    }
-
-    // 2. Embargo lines and embargo snapshots (S22).
-    let embargo_snaps: Vec<String> = sqlx::query_scalar("SELECT snapshot FROM embargo_snapshots WHERE project_id = $1")
-        .bind(project)
-        .fetch_all(&mut *c)
-        .await?;
-    for s in embargo_snaps {
-        insert_hex(&mut r.walk_objects, &s);
-    }
-    let embargo_records: Vec<String> = sqlx::query_scalar("SELECT record_json FROM embargo_lines WHERE project_id = $1")
-        .bind(project)
-        .fetch_all(&mut *c)
-        .await?;
-    for rec in embargo_records {
-        collect_hex_ids_from_json(&rec, &mut r.walk_objects);
-    }
-
-    // 3. Change refs (S10 API changes).
-    let change_snaps: Vec<String> = sqlx::query_scalar("SELECT snapshot FROM change_refs WHERE project_id = $1")
-        .bind(project)
-        .fetch_all(&mut *c)
-        .await?;
-    for s in change_snaps {
-        insert_hex(&mut r.walk_objects, &s);
-    }
-
-    // 4. Landing queue entries (S17, S18): `stack` JSON and `result` JSON, plus
-    // active `landings` rows.
-    let queue_rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT stack, result FROM landing_queue WHERE project_id = $1",
-    )
-    .bind(project)
-    .fetch_all(&mut *c)
-    .await?;
-    for (stack, result) in queue_rows {
-        collect_hex_ids_from_json(&stack, &mut r.walk_objects);
-        if let Some(res) = result {
-            collect_hex_ids_from_json(&res, &mut r.walk_objects);
+    // 1. All registered `SchemaColumnRole::GcRoot` columns across every table
+    // (`branches`, `embargo_snapshots`, `embargo_lines`, `change_refs`,
+    // `landing_queue`, `landings`, `checks`, `tested`, `pr_revisions`,
+    // `pr_review_rules`, `bisects`, `bisect_reverts`, and any future table
+    // registered as `GcRoot`), grouped per table in one UNION ALL query.
+    let mut root_tables: Vec<(&str, Vec<&str>)> = Vec::new();
+    for &(table, col, role) in OBJECT_SCHEMA_COLUMNS {
+        if role == SchemaColumnRole::GcRoot {
+            if let Some((_, cols)) = root_tables.iter_mut().find(|(t, _)| *t == table) {
+                cols.push(col);
+            } else {
+                root_tables.push((table, vec![col]));
+            }
         }
     }
-    let landing_rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT submitted, landed FROM landings WHERE project_id = $1",
-    )
-    .bind(project)
-    .fetch_all(&mut *c)
-    .await?;
-    for (sub, landed) in landing_rows {
-        insert_hex(&mut r.walk_objects, &sub);
-        insert_hex(&mut r.walk_objects, &landed);
-    }
-
-    // 5. CI results (S19): `checks` and `tested`.
-    let check_snaps: Vec<String> = sqlx::query_scalar("SELECT DISTINCT snapshot FROM checks WHERE project_id = $1")
+    let union_arms: Vec<String> = root_tables
+        .iter()
+        .map(|(table, cols)| {
+            let expr = if cols.len() == 1 {
+                format!("{}::text", cols[0])
+            } else {
+                let cast_cols: Vec<String> = cols.iter().map(|c| format!("{c}::text")).collect();
+                format!("concat_ws(' ', {})", cast_cols.join(", "))
+            };
+            let non_null: Vec<String> = cols.iter().map(|c| format!("{c} IS NOT NULL")).collect();
+            format!(
+                "SELECT {expr} FROM {table} WHERE project_id = $1 AND ({})",
+                non_null.join(" OR ")
+            )
+        })
+        .collect();
+    let root_sql = union_arms.join(" UNION ALL ");
+    let root_vals: Vec<String> = sqlx::query_scalar(&root_sql)
         .bind(project)
         .fetch_all(&mut *c)
         .await?;
-    for s in check_snaps {
-        insert_hex(&mut r.walk_objects, &s);
-    }
-    let tested_snaps: Vec<String> = sqlx::query_scalar("SELECT snapshot FROM tested WHERE project_id = $1")
-        .bind(project)
-        .fetch_all(&mut *c)
-        .await?;
-    for s in tested_snaps {
-        insert_hex(&mut r.walk_objects, &s);
+    for val in root_vals {
+        collect_hex_ids_from_json(&val, &mut r.walk_objects);
     }
 
-    // 6. Optional tables (`tags`, `prs`, `pr_revisions`) if created by another
-    // milestone or test.
-    for (table, col) in [
-        ("tags", "target"),
-        ("tags", "snapshot"),
-        ("tags", "atag"),
-        ("pr_revisions", "head"),
-        ("pr_revisions", "base"),
-        ("pr_revisions", "changes"),
-        ("prs", "head"),
-        ("prs", "base"),
-    ] {
-        if table_has_column(c, table, col).await? {
-            let query = format!("SELECT {col}::text FROM {table} WHERE project_id = $1 AND {col} IS NOT NULL");
+    // 2. Optional dynamic `tags` table if created by a test or future feature.
+    for col in ["target", "snapshot", "atag"] {
+        if table_has_column(c, "tags", col).await? {
+            let query = format!("SELECT {col}::text FROM tags WHERE project_id = $1 AND {col} IS NOT NULL");
             let vals: Vec<String> = sqlx::query_scalar(&query).bind(project).fetch_all(&mut *c).await?;
             for v in vals {
                 collect_hex_ids_from_json(&v, &mut r.walk_objects);
@@ -1308,7 +1561,7 @@ async fn collect_db_roots(c: &mut PgConnection, project: i64) -> Result<DbRoots>
         }
     }
 
-    // 7. Known snapshots, origins, and projection memos.
+    // 3. Known snapshots, origins, and projection memos.
     let snaps: Vec<String> = sqlx::query_scalar("SELECT id FROM snapshots WHERE project_id = $1")
         .bind(project)
         .fetch_all(&mut *c)
@@ -1345,7 +1598,7 @@ async fn collect_db_roots(c: &mut PgConnection, project: i64) -> Result<DbRoots>
         }
     }
 
-    // 8. S12 `graph.changed` objects for reachable snapshots.
+    // 4. S12 `graph.changed` objects for reachable snapshots.
     let changed_rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT snapshot, changed FROM graph WHERE project_id = $1 AND changed IS NOT NULL",
     )
@@ -1358,7 +1611,7 @@ async fn collect_db_roots(c: &mut PgConnection, project: i64) -> Result<DbRoots>
         }
     }
 
-    // 9. S15 `search_shards.segments` for live branches and the project-wide
+    // 5. S15 `search_shards.segments` for live branches and the project-wide
     // `names` index (`branch = ''`).
     let live_branches: HashSet<String> = sqlx::query_scalar(
         "SELECT name FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL",

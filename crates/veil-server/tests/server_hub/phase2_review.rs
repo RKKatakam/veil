@@ -93,6 +93,7 @@ fn iso_utc(ms: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
 
+#[allow(dead_code)]
 fn parse_embargo_id(out: &str) -> String {
     for word in out.split_whitespace() {
         let clean = word.trim_end_matches(':');
@@ -211,6 +212,7 @@ impl Drop for DaemonGuard<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn signed_object_get(
     via: &Api,
     project: &str,
@@ -1181,7 +1183,6 @@ fn bug_1781_grants_stored_cache_outlives_pack_gc_breaking_object_reads() {
 /// `pack_gc` deletes those snapshots from storage — losing the S20 revert and
 /// causing `GET /v1/projects/{p}/bisect/{branch}` to fail with `500`.
 #[test]
-#[ignore = "BUG-1782: pack_gc ignores bisects and bisect_reverts tables, deleting bisect candidates and revert_snapshot objects and breaking GET .../bisect/{branch} (500)"]
 fn bug_1782_pack_gc_deletes_bisect_revert_and_candidate_snapshots() {
     let hub = TestHub::start();
     let p = setup_project(&hub);

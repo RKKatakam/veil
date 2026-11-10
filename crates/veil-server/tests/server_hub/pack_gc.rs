@@ -1372,3 +1372,340 @@ fn bug_1781_peer_server_grants_stored_and_object_cache_invalidated_on_gc() {
     let read3 = signed_get(&hub3.api(), &p.name, g2, gkey, &dev_id, &t_proj);
     assert_eq!(read3.status, 200, "hub2 re-wrote t_proj to shared storage so hub3 serves it");
 }
+
+/// BUG-1782: Every `(table, column)` in the migrated PostgreSQL schema must be
+/// registered in `pack_gc`, every root-bearing table must be stamped in
+/// `read_ref_stamp`, and adding an unregistered table or column naming objects
+/// immediately fails `pack_gc::audit_schema_columns`.
+#[test]
+fn bug_1782_every_schema_column_is_registered_and_root_tables_are_stamped() {
+    use veil_server::pack_gc::{
+        audit_schema_columns, stamped_root_tables, SchemaColumnRole, OBJECT_SCHEMA_COLUMNS,
+    };
+
+    let hub = TestHub::start();
+    let db = hub.hub().db.clone();
+
+    // 1. Live migrated schema matches `pack_gc`'s column registry 1-to-1.
+    let (unregistered, missing) = hub
+        .rt
+        .block_on(async {
+            let mut conn = db.acquire().await.unwrap();
+            audit_schema_columns(&mut conn).await
+        })
+        .unwrap();
+    assert!(
+        unregistered.is_empty(),
+        "unregistered schema columns found — register their GC role in pack_gc::OBJECT_SCHEMA_COLUMNS or NON_OBJECT_SCHEMA_COLUMNS: {unregistered:?}"
+    );
+    assert!(
+        missing.is_empty(),
+        "stale or duplicate registered schema columns not present in information_schema.columns: {missing:?}"
+    );
+
+    // 2. Every authoritative `GcRoot` table (except `pr_review_rules`, whose
+    // `checked` tip is lazily filled from `branches.target` / `landings.landed`)
+    // plus `snapshots` and staged `packs` is fingerprinted by `read_ref_stamp`.
+    let stamped: HashSet<&str> = stamped_root_tables().into_iter().collect();
+    assert!(stamped.contains("packs"), "staged packs must be in read_ref_stamp");
+    assert!(stamped.contains("snapshots"), "snapshots must be in read_ref_stamp");
+    for &(table, col, role) in OBJECT_SCHEMA_COLUMNS {
+        if role == SchemaColumnRole::GcRoot && table != "pr_review_rules" {
+            assert!(
+                stamped.contains(table),
+                "table `{table}` (holding root column `{col}`) must be included in pack_gc::STAMP_TABLES"
+            );
+        }
+    }
+
+    // 3. Negative meta-test: adding a new table or column naming objects without
+    // registering it in `pack_gc` is immediately caught by `audit_schema_columns`.
+    let (unreg_after_ddl, _) = hub
+        .rt
+        .block_on(async {
+            let mut tx = db.begin().await.unwrap();
+            sqlx::query(
+                "CREATE TABLE unregistered_future_feature (project_id BIGINT NOT NULL, target_snapshot TEXT NOT NULL)",
+            )
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlx::query("ALTER TABLE bisects ADD COLUMN unregistered_extra_snapshot TEXT")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            let res = audit_schema_columns(&mut tx).await.unwrap();
+            tx.rollback().await.unwrap();
+            res
+        });
+    assert!(
+        unreg_after_ddl
+            .iter()
+            .any(|(t, c, _)| t == "unregistered_future_feature" && c == "target_snapshot"),
+        "audit_schema_columns must fail when an unregistered table naming objects is added: {unreg_after_ddl:?}"
+    );
+    assert!(
+        unreg_after_ddl
+            .iter()
+            .any(|(t, c, _)| t == "bisects" && c == "unregistered_extra_snapshot"),
+        "audit_schema_columns must fail when an unregistered column is added to an existing table: {unreg_after_ddl:?}"
+    );
+}
+
+/// BUG-1782: Concurrent in-place `change_refs` target updates (`COUNT(*)`
+/// unchanged), `pr_revisions` inserts/updates, and `bisects` / `bisect_reverts`
+/// writes during a GC switch are detected by `read_ref_stamp`, aborting the
+/// stale switch without deleting objects or purging DB rows, and subsequent GC
+/// passes retain all `bisects`, `bisect_reverts`, `pr_revisions`, and
+/// `change_refs` roots.
+#[test]
+fn bug_1782_concurrent_change_refs_pr_revisions_and_bisects_abort_gc_switch_and_preserve_roots() {
+    use veil_server::pack_gc::{project_ref_stamp, SwitchHook};
+
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let h = hub.hub();
+
+    let main0 = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+
+    // Helper: create a branch snapshot with unique blob content, then delete the
+    // branch and mark the snapshot's closure expired in `unreferenced_objects`
+    // (simulating an expiring snapshot right as a concurrent feature references it).
+    let make_expiring_branch_snap = |branch: &str, tag: &str| -> (ObjectId, ObjectId) {
+        let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+        let content = format!("EXPIRING-1782-{tag}\n");
+        let (blob_id, _) = make_blob(&content);
+        c.file(&format!("src/{branch}.txt"), &content);
+        let (_cs, r) = c.push_edited(branch, None, |_| {});
+        assert_eq!(r.status, 200);
+        let snap = ObjectId::from_hex(r.json()["results"][0]["tip"].as_str().unwrap()).unwrap();
+        let del = api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": branch, "expected": snap.hex(), "new": null}], "force": true}),
+        );
+        assert_eq!(del.status, 200);
+        // Mark unreferenced at t=0 so the next pass at offset +120_000 sees it as expired.
+        hub.rt
+            .block_on(pack_gc::run_project(
+                &h,
+                pid,
+                &Options {
+                    min_packs_to_merge: 99,
+                    run_gc: true,
+                    retention_window_ms: 60_000,
+                    now_offset_ms: 0,
+                    ..Options::default()
+                },
+            ))
+            .unwrap();
+        (snap, blob_id)
+    };
+
+    // --- 1. In-place `change_refs` snapshot amend (`COUNT(*)` stays 1!) ---
+    // Seed one `change_refs` row pointing at `main0` so `COUNT(*)` is already 1.
+    let admin_pid: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT created_by FROM projects WHERE id = $1").bind(pid).fetch_one(&h.db))
+        .unwrap();
+    hub.rt
+        .block_on(
+            sqlx::query(
+                "INSERT INTO change_refs (project_id, change_id, snapshot, created_by, created_at) \
+                 VALUES ($1, 'chg-1782-amend', $2, $3, 1000)",
+            )
+            .bind(pid)
+            .bind(main0.hex())
+            .bind(admin_pid)
+            .execute(&h.db),
+        )
+        .unwrap();
+
+    let (snap_amend, blob_amend) = make_expiring_branch_snap("tmp-amend", "AMEND");
+    let stamp_before = hub.rt.block_on(project_ref_stamp(&h.db, pid)).unwrap();
+    let db_for_hook = h.db.clone();
+    let snap_amend_hex = snap_amend.hex();
+    let rep_amend = hub
+        .rt
+        .block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options {
+                min_packs_to_merge: 1,
+                run_gc: true,
+                retention_window_ms: 60_000,
+                pack_grace_ms: 0,
+                now_offset_ms: 120_000,
+                before_switch: Some(SwitchHook(Arc::new(move || {
+                    let db = db_for_hook.clone();
+                    let hex = snap_amend_hex.clone();
+                    Box::pin(async move {
+                        sqlx::query(
+                            "UPDATE change_refs SET snapshot = $2 WHERE project_id = $1 AND change_id = 'chg-1782-amend'",
+                        )
+                        .bind(pid)
+                        .bind(&hex)
+                        .execute(&db)
+                        .await
+                        .unwrap();
+                    })
+                }))),
+                ..Options::default()
+            },
+        ))
+        .unwrap();
+    let stamp_after = hub.rt.block_on(project_ref_stamp(&h.db, pid)).unwrap();
+    assert_ne!(stamp_before, stamp_after, "in-place change_refs update must change RefStamp");
+    assert_eq!(rep_amend.packed_objects_deleted, 0, "racing change_refs amend must abort GC pack switch");
+
+    // --- 2. Concurrent `pr_revisions` write during GC switch ---
+    let (snap_pr, blob_pr) = make_expiring_branch_snap("tmp-pr", "PR-REV");
+    let db_for_pr = h.db.clone();
+    let snap_pr_hex = snap_pr.hex();
+    let main0_hex = main0.hex();
+    let rep_pr = hub
+        .rt
+        .block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options {
+                min_packs_to_merge: 1,
+                run_gc: true,
+                retention_window_ms: 60_000,
+                pack_grace_ms: 0,
+                now_offset_ms: 240_000,
+                before_switch: Some(SwitchHook(Arc::new(move || {
+                    let db = db_for_pr.clone();
+                    let head_hex = snap_pr_hex.clone();
+                    let base_hex = main0_hex.clone();
+                    Box::pin(async move {
+                        sqlx::query(
+                            "INSERT INTO pr_revisions (project_id, pr, n, base, head, changes, patch, files, risk, reasons, rules_key, files_count, pushed_by, at) \
+                             VALUES ($1, 'pr-1782', 1, $2, $3, $4, 'p', '[]', 'low', '[]', 'rk', 1, $5, 2000) \
+                             ON CONFLICT DO NOTHING",
+                        )
+                        .bind(pid)
+                        .bind(&base_hex)
+                        .bind(&head_hex)
+                        .bind(json!([{"change": "c1", "snapshot": head_hex, "parent": base_hex}]).to_string())
+                        .bind(admin_pid)
+                        .execute(&db)
+                        .await
+                        .unwrap();
+                    })
+                }))),
+                ..Options::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(rep_pr.packed_objects_deleted, 0, "racing pr_revisions insert must abort GC pack switch");
+
+    // Verify an in-place update to `pr_revisions` also changes `RefStamp`.
+    let pr_stamp_1 = hub.rt.block_on(project_ref_stamp(&h.db, pid)).unwrap();
+    hub.rt
+        .block_on(
+            sqlx::query("UPDATE pr_revisions SET changes = $2 WHERE project_id = $1 AND pr = 'pr-1782' AND n = 1")
+                .bind(pid)
+                .bind(json!([{"change": "c1-updated", "snapshot": snap_pr.hex(), "parent": main0.hex()}]).to_string())
+                .execute(&h.db),
+        )
+        .unwrap();
+    let pr_stamp_2 = hub.rt.block_on(project_ref_stamp(&h.db, pid)).unwrap();
+    assert_ne!(pr_stamp_1, pr_stamp_2, "in-place pr_revisions update must change RefStamp");
+
+    // --- 3. Concurrent `bisects` (`probes`, `candidates`) & `bisect_reverts` write during GC switch ---
+    let (snap_probe, blob_probe) = make_expiring_branch_snap("tmp-probe", "BISECT-PROBE");
+    let (snap_rev, blob_rev) = make_expiring_branch_snap("tmp-rev", "BISECT-REVERT");
+    let db_for_bisect = h.db.clone();
+    let probe_hex = snap_probe.hex();
+    let rev_hex = snap_rev.hex();
+    let main0_hex2 = main0.hex();
+    let rep_bisect = hub
+        .rt
+        .block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options {
+                min_packs_to_merge: 1,
+                run_gc: true,
+                retention_window_ms: 60_000,
+                pack_grace_ms: 0,
+                now_offset_ms: 360_000,
+                before_switch: Some(SwitchHook(Arc::new(move || {
+                    let db = db_for_bisect.clone();
+                    let probe_h = probe_hex.clone();
+                    let rev_h = rev_hex.clone();
+                    let good_h = main0_hex2.clone();
+                    Box::pin(async move {
+                        sqlx::query(
+                            "INSERT INTO bisects (project_id, branch, lineage, check_name, good, bad, candidates, lo, hi, phase, probes, culprit, culprit_parent, session_paths, revert_snapshot, created_at, updated_at) \
+                             VALUES ($1, 'main', 0, 'ci/test', $2, $3, $4, 0, 0, 'searching', $5, NULL, NULL, '[]', NULL, 3000, 3000) \
+                             ON CONFLICT DO NOTHING",
+                        )
+                        .bind(pid)
+                        .bind(&good_h)
+                        .bind(&probe_h)
+                        .bind(json!([probe_h]).to_string())
+                        .bind(json!([probe_h]).to_string())
+                        .execute(&db)
+                        .await
+                        .unwrap();
+                        sqlx::query(
+                            "INSERT INTO bisect_reverts (project_id, branch, lineage, culprit, check_name, ticket, revert_snapshot, state, created_at) \
+                             VALUES ($1, 'main', 0, $2, 'ci/test', 'tkt-r', $3, 'reverted', 3000) \
+                             ON CONFLICT DO NOTHING",
+                        )
+                        .bind(pid)
+                        .bind(&probe_h)
+                        .bind(&rev_h)
+                        .execute(&db)
+                        .await
+                        .unwrap();
+                    })
+                }))),
+                ..Options::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(rep_bisect.packed_objects_deleted, 0, "racing bisects/bisect_reverts write must abort GC pack switch");
+
+    // --- 4. Run full unhooked GC passes past retention window and verify ALL
+    // roots (`change_refs`, `pr_revisions`, `bisects`, `bisect_reverts`) and
+    // their blob closures remain stored! ---
+    for off in [480_000i64, 600_000, 600_001] {
+        hub.rt
+            .block_on(pack_gc::run_project(
+                &h,
+                pid,
+                &Options {
+                    min_packs_to_merge: 1,
+                    run_gc: true,
+                    retention_window_ms: 60_000,
+                    pack_grace_ms: 0,
+                    now_offset_ms: off,
+                    ..Options::default()
+                },
+            ))
+            .unwrap();
+    }
+
+    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
+    for (label, id) in [
+        ("change_refs snap", snap_amend),
+        ("change_refs blob", blob_amend),
+        ("pr_revisions snap", snap_pr),
+        ("pr_revisions blob", blob_pr),
+        ("bisects probe snap", snap_probe),
+        ("bisects probe blob", blob_probe),
+        ("bisect_reverts snap", snap_rev),
+        ("bisect_reverts blob", blob_rev),
+    ] {
+        assert!(
+            hub.rt.block_on(fresh.exists(pid, &id)).unwrap(),
+            "{label} ({id}) must be retained by pack_gc"
+        );
+    }
+}
