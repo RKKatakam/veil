@@ -550,21 +550,23 @@ impl Service {
         })
     }
 
-    /// The ready rows, in fair-share order (`limits::landing::fair_batch`),
-    /// leaving out those being committed.
+    /// The ready rows, leaving out those being committed: reverts first
+    /// (S20, `priority > 0`, in their order), then the rest in fair-share
+    /// order (`limits::landing::fair_batch`, S24 part B).
     async fn ready(&self, exclude: &HashSet<i64>) -> Result<Vec<Row>> {
-        type R = (i64, String, i64, String, String, String, String, i64, i64, i64, i64, Option<String>);
+        type R = (i64, String, i64, String, String, String, String, i64, i64, i64, i64, Option<String>, bool);
         let rows: Vec<R> = sqlx::query_as(
-            "SELECT seq, ticket, person_id, person_name, device_key, session, stack, lineage, person_epoch, project_epoch, merges, agent_session FROM landing_queue \
-             WHERE project_id = $1 AND branch = $2 AND state = 'queued' ORDER BY created_at, seq",
+            "SELECT seq, ticket, person_id, person_name, device_key, session, stack, lineage, person_epoch, project_epoch, merges, agent_session, priority > 0 FROM landing_queue \
+             WHERE project_id = $1 AND branch = $2 AND state = 'queued' ORDER BY priority DESC, created_at, seq",
         )
         .bind(self.project)
         .bind(&self.branch)
         .fetch_all(&self.hub.db)
         .await?;
-        let mut all = Vec::with_capacity(rows.len());
-        for (seq, ticket, id, name, device_key, session, stack, lineage, pe, je, merges, agent_session) in rows {
-            all.push(Row {
+        let (mut reverts, mut all) = (Vec::new(), Vec::with_capacity(rows.len()));
+        for (seq, ticket, id, name, device_key, session, stack, lineage, pe, je, merges, agent_session, revert) in rows {
+            let into = if revert { &mut reverts } else { &mut all };
+            into.push(Row {
                 seq,
                 ticket,
                 person: Person { id, name, device_key, agent: None },
@@ -576,7 +578,12 @@ impl Service {
                 agent_session,
             });
         }
-        Ok(crate::limits::landing::fair_batch(all, exclude, MAX_BATCH))
+        // Reverts are never held back by fair sharing (S20).
+        reverts.retain(|r| !exclude.contains(&r.seq));
+        reverts.truncate(MAX_BATCH);
+        let rest = MAX_BATCH - reverts.len();
+        reverts.extend(crate::limits::landing::fair_batch(all, exclude, rest));
+        Ok(reverts)
     }
 
     /// The project's view keys (what `derive::memo_tips` keeps warm): each
@@ -1189,7 +1196,11 @@ impl Service {
             .zip(results.iter())
             .filter_map(|(m, r)| Some((m.ticket.clone(), r.clone()?)))
             .collect();
+        let has_revert = terminal.iter().any(|(t, _)| t.starts_with("revert-"));
         hub.landing.resolve(terminal);
+        if has_revert {
+            let _ = crate::bisect::sync_revert_outcome(hub, self.project, &self.branch).await;
+        }
         Ok(Committed::Ok)
     }
 }

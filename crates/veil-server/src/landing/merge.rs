@@ -724,7 +724,11 @@ async fn finish_terminal(
             res.clone(),
         )
         .await;
+        let is_revert = job.ticket.starts_with("revert-");
         hub.landing.resolve([(job.ticket.clone(), res)]);
+        if is_revert {
+            let _ = crate::bisect::sync_revert_outcome(hub, job.project, &job.branch).await;
+        }
     }
     Ok(())
 }

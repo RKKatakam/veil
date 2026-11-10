@@ -25,15 +25,26 @@ pub const RULES_FILE: &str = ".veilrules";
 pub struct Rules {
     /// The protected branches.
     pub protected: BTreeSet<String>,
+    /// Protected branches where automatic revert is disabled (`auto_revert = false`).
+    pub no_auto_revert: BTreeSet<String>,
     /// Branch → the check names that must pass before `<branch>@tested`
     /// moves to a tip (`[branches.<name>] required_checks = [...]`).
     pub required_checks: BTreeMap<String, Vec<String>>,
     /// Check name → the paths its runner reads (`[checks.<name>] paths = [...]`),
     /// normalised with [`veil_core::hub::agent::normalize_only`].
     pub checks: BTreeMap<String, Vec<String>>,
+    /// Check name → number of parallel bisect probes (`[checks.<name>] parallel = k`, 1..=8).
+    pub check_parallel: BTreeMap<String, usize>,
 }
 
 impl Rules {
+    /// Does `branch` allow automatic revert of a confirmed culprit?
+    /// True when `branch` is protected and `auto_revert` is not set to `false`
+    /// (product decision 11).
+    pub fn allows_auto_revert(&self, branch: &str) -> bool {
+        self.protected.contains(branch) && !self.no_auto_revert.contains(branch)
+    }
+
     /// Parse `.veilrules`; the error says what is wrong (never echoing more
     /// than the key it names).
     pub fn parse(text: &str) -> Result<Rules, String> {
@@ -52,6 +63,15 @@ impl Rules {
                             }
                             Some(false) => {}
                             None => return Err(format!("{RULES_FILE}: `branches.{name}.protected` is true or false")),
+                        },
+                        "auto_revert" | "revert" => match value.as_bool() {
+                            Some(true) => {
+                                out.no_auto_revert.remove(name);
+                            }
+                            Some(false) => {
+                                out.no_auto_revert.insert(name.to_string());
+                            }
+                            None => return Err(format!("{RULES_FILE}: `branches.{name}.{key}` is true or false")),
                         },
                         "required_checks" => {
                             let arr = value
@@ -77,7 +97,7 @@ impl Rules {
                                 out.required_checks.insert(name.to_string(), names);
                             }
                         }
-                        _ => return Err(format!("{RULES_FILE}: unknown rule `branches.{name}.{key}` (known: protected, required_checks)")),
+                        _ => return Err(format!("{RULES_FILE}: unknown rule `branches.{name}.{key}` (known: protected, required_checks, auto_revert)")),
                     }
                 }
             }
@@ -104,7 +124,14 @@ impl Rules {
                                 .map_err(|e| format!("{RULES_FILE}: `checks.{name}.paths`: {e}"))?;
                             out.checks.insert(name.to_string(), norm);
                         }
-                        _ => return Err(format!("{RULES_FILE}: unknown rule `checks.{name}.{key}` (known: paths)")),
+                        "parallel" => {
+                            let n = value
+                                .as_integer()
+                                .filter(|&n| (1..=8).contains(&n))
+                                .ok_or_else(|| format!("{RULES_FILE}: `checks.{name}.parallel` must be an integer between 1 and 8"))?;
+                            out.check_parallel.insert(name.to_string(), n as usize);
+                        }
+                        _ => return Err(format!("{RULES_FILE}: unknown rule `checks.{name}.{key}` (known: paths, parallel)")),
                     }
                 }
             }
@@ -122,18 +149,25 @@ mod tests {
         let r = Rules::parse(
             "# rules\n[branches.main]\nprotected = true\nrequired_checks = [\"ci/build\", \"ci/test\"]\n\
              [branches.release]\nprotected = false\n\
-             [checks.\"ci/test\"]\npaths = [\"src/api/\", \"Cargo.lock\"]\n\
+             [branches.staging]\nprotected = true\nauto_revert = false\n\
+             [checks.\"ci/test\"]\npaths = [\"src/api/\", \"Cargo.lock\"]\nparallel = 3\n\
              [review]\nlow = 0\n",
         )
         .unwrap();
-        assert_eq!(r.protected.iter().map(String::as_str).collect::<Vec<_>>(), ["main"]);
+        assert_eq!(r.protected.iter().map(String::as_str).collect::<Vec<_>>(), ["main", "staging"]);
+        assert!(r.allows_auto_revert("main"));
+        assert!(!r.allows_auto_revert("staging"));
+        assert!(!r.allows_auto_revert("release"));
         assert_eq!(r.required_checks["main"], vec!["ci/build", "ci/test"]);
         assert_eq!(r.checks["ci/test"], vec!["Cargo.lock", "src/api"]);
+        assert_eq!(r.check_parallel["ci/test"], 3);
         assert_eq!(Rules::parse("").unwrap(), Rules::default());
         assert!(Rules::parse("[branches.main]\nprotcted = true\n").unwrap_err().contains("unknown rule"));
         assert!(Rules::parse("[branches.main]\nprotected = \"yes\"\n").is_err());
+        assert!(Rules::parse("[branches.main]\nauto_revert = \"yes\"\n").is_err());
         assert!(Rules::parse("[branches.main]\nrequired_checks = [\"bad name\"]\n").is_err());
         assert!(Rules::parse("[checks.test]\npaths = [\"..\"]\n").is_err());
+        assert!(Rules::parse("[checks.test]\nparallel = 0\n").is_err());
         assert!(Rules::parse("[checks.test]\nunknown = 1\n").is_err());
         assert!(Rules::parse("[branches]\nmain = 1\n").is_err());
         assert!(Rules::parse("[branches.\"a b\"]\nprotected = true\n").is_err());

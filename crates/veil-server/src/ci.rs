@@ -259,6 +259,19 @@ pub async fn post_check_route(
     if req.state == CheckState::Pass {
         advance_tested(&hub, &project).await?;
     }
+    if matches!(req.state, CheckState::Pass | CheckState::Fail) {
+        crate::bisect::on_check_recorded(
+            &hub,
+            &project,
+            real_id,
+            &req.name,
+            req.state,
+            &session_paths,
+            admin_only,
+            now,
+        )
+        .await?;
+    }
 
     Ok(Json(CheckResult {
         snapshot: proj_id,
@@ -474,7 +487,7 @@ fn same_access(project: &Project, a: &str, b: &str) -> bool {
 
 /// May `viewer` see a check result posted by a session whose readable paths
 /// were `(session_paths, admin_only)`?
-fn can_see_check(project: &Project, viewer: &Viewer, session_paths: &[String], admin_only: bool) -> bool {
+pub(crate) fn can_see_check(project: &Project, viewer: &Viewer, session_paths: &[String], admin_only: bool) -> bool {
     if admin_only {
         return viewer.admin && viewer.only.is_none();
     }
