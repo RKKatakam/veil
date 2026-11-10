@@ -521,14 +521,15 @@ pub(crate) fn can_see_check(project: &Project, viewer: &Viewer, session_paths: &
 }
 
 /// Resolve a projected snapshot `id` in `viewer`'s view to a real snapshot via
-/// [`sync::resolve_for`], enforcing S22 embargo withholding on reads and writes.
+/// [`sync::resolve_exact_for`], enforcing S22 embargo withholding on reads and
+/// writes while attaching historical checks to the uncollapsed commit `id` stands for.
 async fn resolve_snapshot(
     hub: &Arc<Hub>,
     project: &Project,
     viewer: &Viewer,
     id: &ObjectId,
 ) -> Result<Option<ObjectId>> {
-    let Some(real) = sync::resolve_for(hub, project, viewer, id, &[], true).await? else {
+    let Some(real) = sync::resolve_exact_for(hub, project, viewer, id).await? else {
         return Ok(None);
     };
     if sync::projected(hub, project, viewer, real).await? != *id {
