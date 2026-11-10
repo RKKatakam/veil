@@ -88,7 +88,8 @@ start_services() {
     --tserver_flags=memory_limit_hard_bytes=3221225472,ysql_num_shards_per_tserver=1,enable_ysql_operation_lease=false \
     --master_flags=memory_limit_hard_bytes=1073741824,enforce_tablet_replica_limits=false,enable_ysql_operation_lease=false >/dev/null || return 1; }
   PG_PORT=$(port "$PG" 5432) S3_PORT=$(port "$S3" 9000) YB_PORT=$(port "$YB" 5433)
-  for i in $(seq 120); do D exec "$PG" pg_isready -U veil >/dev/null 2>&1 && break; sleep 1; done
+  # Over TCP: a new container first runs a set-up server on its socket only.
+  for i in $(seq 120); do D exec "$PG" pg_isready -h 127.0.0.1 -U veil >/dev/null 2>&1 && break; sleep 1; done
   for i in $(seq 120); do curl -sf "http://127.0.0.1:$S3_PORT/minio/health/live" >/dev/null && break; sleep 1; done
   for i in $(seq 180); do ysql "select 1" >/dev/null 2>&1 && break; sleep 2; done
 }
