@@ -320,3 +320,41 @@ fn bug_1931_a_sandbox_edit_of_a_file_that_already_held_a_sealed_files_value_is_r
     }
     assert!(lost.is_empty(), "{lost:#?}");
 }
+
+/// Re-check of BUG-1840's fix (`rc-client`): a sealed secret's value
+/// written to another file in a sandbox is never recorded, also when the
+/// secret is in conflict. The sandbox then holds every version of it in
+/// plain text, between conflict markers, for the command to resolve.
+#[test]
+#[ignore = "BUG-1932: the values of a sealed secret that is in conflict are outside the sandbox's guard"]
+fn bug_1932_the_values_of_a_conflicted_sealed_secret_copied_in_a_sandbox_are_never_recorded() {
+    const KEYS: [&str; 3] = ["Xk29vLq8sPzQw7LmTr4Bn6Yc", "Qm83nRt5wZx1cVb7yHj2kLp9", "Ty64gFd2sAq9oPi3uLk8mNb5"];
+    let t = T::new(&[("a.txt", "a\n"), (".env", &format!("API_KEY={}\n", KEYS[0]))]);
+    // Two changes set the key differently; one rebased onto the other
+    // conflicts, and the agent's workspace stands on the conflicted change.
+    std::fs::write(t.proj.join(".env"), format!("API_KEY={}\n", KEYS[1])).unwrap();
+    t.ok(&["commit", "-m", "key one"]);
+    t.ok(&["tag", "set", "side-a", "-r", "@-"]);
+    t.ok(&["new", "side-a-"]);
+    std::fs::write(t.proj.join(".env"), format!("API_KEY={}\n", KEYS[2])).unwrap();
+    t.ok(&["commit", "-m", "key two"]);
+    t.ok(&["tag", "set", "side-b", "-r", "@-"]);
+    let out = t.ok(&["rebase", "-s", "side-b", "-d", "side-a"]);
+    assert!(out.contains("conflicts in: .env"), "control: the rebase conflicts:\n{out}");
+    t.ok(&["rebase", "-s", "agent@", "-d", "side-b"]);
+    let ls = t.ok(&["ls", "-r", "agent@"]);
+    assert!(ls.lines().any(|l| l.contains("cloaked") && l.contains(".env") && l.contains("conflict")), "control: the sandbox's .env is a sealed secret in conflict:\n{ls}");
+
+    let o = t.exec(&["-m", "agent: list the keys"], r#"set -e; grep -q '^<<<<<<<' .env; grep '^API_KEY' .env | cut -d= -f2 > vals.txt; test "$(wc -l < vals.txt)" = 3"#);
+    assert!(o.status.success(), "the run itself works (the sandbox holds the conflict's versions in plain text):\n{}", text(&o));
+
+    let listed = t.ok(&["ls", "-r", "agent@"]);
+    let show = t.ok(&["diff", "--from", "side-b", "--to", "agent@"]);
+    let recorded: Vec<&str> = KEYS.iter().copied().filter(|k| show.contains(k)).collect();
+    assert!(
+        recorded.is_empty() && !listed.lines().any(|l| l.ends_with("vals.txt")),
+        "the sealed secret's values were recorded in plain text (and would be pushed): {recorded:?}\nfiles:\n{listed}\nrun:\n{}",
+        text(&o)
+    );
+    assert!(!t.proj.join(".veil/local/sandboxes/agent/files/vals.txt").exists(), "vals.txt holds the secret's values and must be taken out of the sandbox after the run");
+}
