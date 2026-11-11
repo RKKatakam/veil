@@ -1338,6 +1338,13 @@ fn cmd_embargo(ctx: &mut Ctx, c: &EmbargoCmd) -> Result<()> {
                     ReleaseState::Unreleased if withdrawn.contains(&r.id) => {
                         yellow("withdrawn (its embargoed merge was undone or abandoned: nothing holds the fix back)")
                     }
+                    ReleaseState::Unreleased if r.state.is_some() => {
+                        let st = safe(r.state.as_deref().unwrap_or_default());
+                        match &r.reason {
+                            Some(why) => yellow(&format!("{st}: {}", safe(why))),
+                            None => yellow(&st),
+                        }
+                    }
                     ReleaseState::Unreleased => pending(),
                 };
                 println!("{}  scope:{}  {state}", bold(&safe(&r.id)), safe(&r.scope));

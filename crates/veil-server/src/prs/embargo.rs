@@ -755,6 +755,8 @@ pub async fn release_embargo_prs(
         .await?;
     let mut rec: EmbargoRecord = serde_json::from_str(record_json).map_err(|e| Error::Other(e.into()))?;
     rec.released_at = Some(pushed_record.and_then(|r| r.released_at).unwrap_or(now_ms));
+    rec.state = None;
+    rec.reason = None;
     let new_json = serde_json::to_string(&rec).unwrap_or_else(|_| record_json.to_string());
     let pid = project.id;
     let policy = project.policy.clone();

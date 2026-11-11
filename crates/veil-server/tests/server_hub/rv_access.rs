@@ -691,7 +691,6 @@ impl Drop for NoDeadline<'_> {
 /// any project on the server is released at its deadline**. Anyone can make
 /// one: a project of their own, an embargo, a conflicting change on `main`.
 #[test]
-#[ignore = "BUG-1857: one embargo whose release conflicts stops the deadline service for every later embargo of every project: they are never released at their deadline"]
 fn bug_1857_one_projects_conflicted_embargo_does_not_keep_another_projects_from_its_deadline() {
     let hub = TestHub::start();
     // Someone's own project, with an embargo whose release will conflict:
@@ -718,8 +717,19 @@ fn bug_1857_one_projects_conflicted_embargo_does_not_keep_another_projects_from_
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     let at_its_deadline = released_at(&hub, ours_id, &due).is_some();
-    // Control: the first embargo is the conflicted one, kept for its members.
+    // Control: the first embargo is the conflicted one, kept for its members,
+    // with its failure state and reason recorded on that embargo and shown to its groups (never outsiders).
     assert_eq!(released_at(&hub, theirs_id, &stuck), None, "control: the conflicted embargo is not released ({last})");
+    let sec_embs = hub.api().tips(Some(&theirs.sec.token()), &theirs.name).unwrap().embargoes;
+    let stuck_rec = sec_embs.iter().find(|r| r.id == stuck).expect("member sees stuck embargo record");
+    assert_eq!(stuck_rec.state.as_deref(), Some("failed"), "stuck embargo records failed state: {stuck_rec:?}");
+    assert!(
+        stuck_rec.reason.as_deref().is_some_and(|m| !m.is_empty()),
+        "stuck embargo records failure reason: {stuck_rec:?}"
+    );
+    let dev_embs = hub.api().tips(Some(&theirs.dev.token()), &theirs.name).unwrap().embargoes;
+    assert!(dev_embs.is_empty(), "outsiders never see the conflicted embargo or its reason: {dev_embs:?}");
+
     // Control: nothing is wrong with ours. With the conflicted one out of
     // the deadline service, the same service releases it at once.
     set_deadline(&hub, theirs_id, &stuck, None);
