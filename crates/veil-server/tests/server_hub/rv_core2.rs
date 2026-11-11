@@ -137,17 +137,24 @@ impl Drop for TxGuard<'_> {
 /// ... EXCLUSIVE`), locks `access_epochs (pid, -1) FOR UPDATE` as soon as the
 /// row enters `merging` so `run_worker`'s `guard_root_write` (`FOR SHARE`) waits
 /// while `renew_task` keeps renewing `landing_queue`.
+///
+/// On YugabyteDB the worker may commit before the lock is taken (seen under
+/// a full suite's load): that entry has landed, and `submit` is asked for
+/// another, with the next `round`. It must submit a new change each round
+/// ([`submit_a_change_to_merge`]): the same change submitted again is
+/// refused as landed already (BUG-1524), which is what failed these tests
+/// now and then.
 fn hold_worker_in_merging<'a>(
     rt: &'a tokio::runtime::Runtime,
     db: &sqlx::PgPool,
     pid: i64,
-    mut submit: impl FnMut() -> String,
+    mut submit: impl FnMut(usize) -> String,
 ) -> (String, TxGuard<'a>) {
     if !rt.block_on(is_yugabyte(db)) {
         let mut lock = rt.block_on(db.begin()).unwrap();
         rt.block_on(sqlx::query("LOCK TABLE origins IN EXCLUSIVE MODE").execute(&mut *lock)).unwrap();
         let guard = TxGuard(rt, Some(lock));
-        let ticket = submit();
+        let ticket = submit(0);
         let until = Instant::now() + Duration::from_secs(30);
         loop {
             let st: String = rt
@@ -173,8 +180,12 @@ fn hold_worker_in_merging<'a>(
             .execute(db),
     )
     .unwrap();
+    let state = |ticket: &str| -> String {
+        rt.block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(ticket).fetch_one(db))
+            .unwrap()
+    };
     for attempt in 0..5 {
-        let ticket = submit();
+        let ticket = submit(attempt);
         let until = Instant::now() + Duration::from_secs(30);
         loop {
             let st: String = rt
@@ -205,8 +216,63 @@ fn hold_worker_in_merging<'a>(
             }
             std::thread::sleep(Duration::from_millis(2));
         }
+        // The worker was not held: its entry lands, and the next round's
+        // change is made on it.
+        let until = Instant::now() + Duration::from_secs(60);
+        while matches!(state(&ticket).as_str(), "queued" | "merging") && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(state(&ticket), "landed", "round {attempt}: the entry whose worker was not held");
     }
     panic!("could not trap worker in merging on YugabyteDB");
+}
+
+/// Queue a change of dev's that needs a content merge to land, and return
+/// its ticket: dev edits line 2 of `file` on `main`'s tip, the admin lands
+/// an edit of line 28 first, then dev's change is submitted (`wait: false`,
+/// answered `queued`). Each `round` makes new edits, on what the round
+/// before left on `main` (both of its changes landed).
+fn submit_a_change_to_merge(api: &Api, admin_tok: &str, dev_tok: &str, project: &str, file: &str, round: usize) -> String {
+    // The file with line 2 as dev's `two`th round left it and line 28 as
+    // the admin's `last`th did (`None`: as first written).
+    let text = |two: Option<usize>, last: Option<usize>| {
+        let mut lines: Vec<String> = (0..30).map(|i| format!("line {i} of {file}")).collect();
+        lines[2] = two.map_or("two".to_string(), |r| format!("TWO BY DEV {r}"));
+        lines[28] = last.map_or("twenty-eight".to_string(), |r| format!("TWENTY-EIGHT BY ADMIN {r}"));
+        lines.join("\n") + "\n"
+    };
+    let land_as_admin = |content: String| {
+        let base = api.tips(Some(admin_tok), project).unwrap().branches["main"];
+        let r = api.post_json(
+            Some(admin_tok),
+            &format!("/v1/projects/{project}/land"),
+            &json!({"onto": "main", "base": base.hex(), "edits": [put(file, &content)], "wait": true}),
+        );
+        assert_eq!(r.status, 200, "round {round}: {}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["state"], "landed", "round {round}: {}", r.json());
+    };
+    let before = round.checked_sub(1);
+    if round == 0 {
+        land_as_admin(text(None, None));
+    }
+    // dev changes line 2 on that tip; the admin lands a change of line 28 first.
+    let base = api.tips(Some(dev_tok), project).unwrap().branches["main"];
+    let r = api.post_json(
+        Some(dev_tok),
+        &format!("/v1/projects/{project}/changes"),
+        &json!({"base": base.hex(), "edits": [put(file, &text(Some(round), before))]}),
+    );
+    assert_eq!(r.status, 200, "round {round}: {}", String::from_utf8_lossy(&r.body));
+    let change: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+    land_as_admin(text(before, Some(round)));
+    let r = api.post_json(
+        Some(dev_tok),
+        &format!("/v1/projects/{project}/land"),
+        &json!({"onto": "main", "snapshot": change.hex(), "wait": false}),
+    );
+    assert_eq!(r.status, 200, "round {round}: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["state"], "queued", "round {round}: {}", r.json());
+    r.json()["ticket"].as_str().unwrap().to_string()
 }
 
 /// `docs/HUB.md` §13.24: every landing onto a protected branch meets the
@@ -1198,47 +1264,10 @@ fn bug_1883_a_merging_entry_of_a_server_that_went_away_is_never_answered() {
     let pid = project_id(&a, &p.name);
     let (dev_tok, admin_tok) = (p.dev.token(), p.admin.token());
     let db = b.hub().db.clone();
-    const FILE: &str = "src/merge-1883.txt";
-    let text = |second: &str, last: &str| {
-        let mut lines: Vec<String> = (0..30).map(|i| format!("line {i} of bug 1883")).collect();
-        lines[2] = second.to_string();
-        lines[28] = last.to_string();
-        lines.join("\n") + "\n"
-    };
-    let land_as_admin = |content: String| {
-        let base = api_a.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
-        let r = api_a.post_json(
-            Some(&admin_tok),
-            &format!("/v1/projects/{}/land", p.name),
-            &json!({"onto": "main", "base": base.hex(), "edits": [put(FILE, &content)], "wait": true}),
-        );
-        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-        assert_eq!(r.json()["state"], "landed", "{}", r.json());
-    };
-    land_as_admin(text("two", "twenty-eight"));
-    // dev changes line 2 on that tip; the admin lands a change of line 28 first.
-    let base = api_a.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
-    let r = api_a.post_json(
-        Some(&dev_tok),
-        &format!("/v1/projects/{}/changes", p.name),
-        &json!({"base": base.hex(), "edits": [put(FILE, &text("TWO BY DEV", "twenty-eight"))]}),
-    );
-    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    let change: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
-    land_as_admin(text("two", "TWENTY-EIGHT BY ADMIN"));
-
     // The merge worker's commit waits, so that the server stops while the
     // entry is `merging`.
-    let (ticket, lock) = hold_worker_in_merging(&b.rt, &db, pid, || {
-        let r = api_a.post_json(
-            Some(&dev_tok),
-            &format!("/v1/projects/{}/land", p.name),
-            &json!({"onto": "main", "snapshot": change.hex(), "wait": false}),
-        );
-        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-        assert_eq!(r.json()["state"], "queued", "{}", r.json());
-        r.json()["ticket"].as_str().unwrap().to_string()
-    });
+    let (ticket, lock) =
+        hold_worker_in_merging(&b.rt, &db, pid, |round| submit_a_change_to_merge(&api_a, &admin_tok, &dev_tok, &p.name, "src/merge-1883.txt", round));
     let state = || -> String {
         b.rt.block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(&db)).unwrap()
     };
@@ -1274,44 +1303,9 @@ fn bug_1883_peer_resume_preserves_live_merge_claims() {
     let pid = project_id(&a, &p.name);
     let (dev_tok, admin_tok) = (p.dev.token(), p.admin.token());
     let db = a.hub().db.clone();
-    const FILE: &str = "src/merge-1883-peer.txt";
-    let text = |second: &str, last: &str| {
-        let mut lines: Vec<String> = (0..30).map(|i| format!("line {i} of bug 1883 peer")).collect();
-        lines[2] = second.to_string();
-        lines[28] = last.to_string();
-        lines.join("\n") + "\n"
-    };
-    let land_as_admin = |content: String| {
-        let base = api_a.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
-        let r = api_a.post_json(
-            Some(&admin_tok),
-            &format!("/v1/projects/{}/land", p.name),
-            &json!({"onto": "main", "base": base.hex(), "edits": [put(FILE, &content)], "wait": true}),
-        );
-        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-        assert_eq!(r.json()["state"], "landed", "{}", r.json());
-    };
-    land_as_admin(text("two", "twenty-eight"));
-    let base = api_a.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
-    let r = api_a.post_json(
-        Some(&dev_tok),
-        &format!("/v1/projects/{}/changes", p.name),
-        &json!({"base": base.hex(), "edits": [put(FILE, &text("TWO BY DEV", "twenty-eight"))]}),
-    );
-    assert_eq!(r.status, 200);
-    let change: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
-    land_as_admin(text("two", "TWENTY-EIGHT BY ADMIN"));
-
     // Hold the merge worker's commit so `a` stays in `merging` with a live claim.
-    let (ticket, lock) = hold_worker_in_merging(&a.rt, &db, pid, || {
-        let r = api_a.post_json(
-            Some(&dev_tok),
-            &format!("/v1/projects/{}/land", p.name),
-            &json!({"onto": "main", "snapshot": change.hex(), "wait": false}),
-        );
-        assert_eq!(r.status, 200);
-        r.json()["ticket"].as_str().unwrap().to_string()
-    });
+    let (ticket, lock) =
+        hold_worker_in_merging(&a.rt, &db, pid, |round| submit_a_change_to_merge(&api_a, &admin_tok, &dev_tok, &p.name, "src/merge-1883-peer.txt", round));
 
     // Peer `b` runs `landing::resume`: `a`'s live claim must NOT be reset to `queued`.
     b.rt.block_on(veil_server::landing::resume(b.hub()));
