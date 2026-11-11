@@ -286,6 +286,73 @@ fn bug_1890_people_a_project_vouches_for_keep_their_rate_behind_a_spent_address(
     assert!(refused >= 80, "a new person behind the spent address is still refused: {refused} of 100: {answers:?}");
 }
 
+/// BUG-1892 (open; the gap BUG-1890's fix left). A person someone else
+/// vouches for counts alone, and anyone can vouch: people who sign up from
+/// one address name each other in their own projects' rules (or groups),
+/// and each then has a whole rate of their own, as every sign-up had before
+/// BUG-1890. Here 27 sign-ups from one address: one's project names the
+/// other 26 in a rule, and another's names the first. Expected, as for
+/// sign-ups nobody vouches for: together they are served what one person
+/// is (ten device rates). Actual: each their own, about 27 device rates.
+/// Whichever way the owner closes it (a per-address bound over vouched
+/// people too, or an operator's setting), the bound asserted here follows.
+#[test]
+#[ignore = "BUG-1892: people who sign up from one address and vouch for each other each count alone, so the address is served a multiple of one person's rate"]
+fn bug_1892_sign_ups_from_one_address_that_vouch_for_each_other_stay_within_a_persons_rate() {
+    let device = Rate { per_second: 100_000, per_hour: 300 };
+    let hub = TestHub::start_with_limits(Settings { device, ..TestHub::limits() });
+    let api = hub.api();
+    let ring: Vec<(String, String)> = (0..25)
+        .map(|_| {
+            let name = unique("ring");
+            let token = api.login(&Identity::generate("rvgaps"), Some(&name)).expect("signs up");
+            (name, token)
+        })
+        .collect();
+    let (first, second) = (hub.person("ringa"), hub.person("ringb"));
+    // A project of `who`'s own, whose rule for `notes/` names `named`.
+    let project_naming = |who: &Person, named: &[&str]| {
+        let (name, dir) = (unique("ring"), who.dir("proj"));
+        std::fs::create_dir_all(&dir).unwrap();
+        who.ok(&dir, &["init"]);
+        write_files(&dir, &[("notes/a.txt", "a\n")]);
+        who.ok(&dir, &["remote", "add", "origin", &hub.url(&name)]);
+        who.commit_main(&dir, "import");
+        let out = who.ok(&dir, &["push"]);
+        assert!(out.contains("Created project"), "{out}");
+        who.ok(&dir, &[&["access", "notes/"], named].concat());
+        who.commit_main(&dir, "access");
+        who.ok(&dir, &["push"]);
+        name
+    };
+    let mut named: Vec<&str> = ring.iter().map(|(name, _)| name.as_str()).collect();
+    named.push(&second.name);
+    let (firsts, seconds) = (project_naming(&first, &named), project_naming(&second, &[&first.name]));
+    // Everyone is now named by a project they do not administer, and the
+    // server meets each of them there (BUG-1890's second test does the same).
+    let mut everyone: Vec<(String, String, &str)> = ring.iter().map(|(name, token)| (name.clone(), token.clone(), firsts.as_str())).collect();
+    everyone.push((second.name.clone(), second.token(), &firsts));
+    everyone.push((first.name.clone(), first.token(), &seconds));
+    for (who, token, project) in &everyone {
+        for _ in 0..2 {
+            assert_eq!(api.get(Some(token), &format!("/v1/projects/{project}/tips")).status, 200, "{who} reads the tips of {project}, which names them");
+        }
+    }
+    let umbrella = 10 * device.per_hour as usize;
+    let started = std::time::Instant::now();
+    let served: Vec<usize> = everyone
+        .iter()
+        .map(|(_, token, _)| (0..device.per_hour).take_while(|_| api.get(Some(token), "/v1/projects/no-such-project/tips").status != 429).count())
+        .collect();
+    let total: usize = served.iter().sum();
+    let refilled = (started.elapsed().as_secs_f64() * umbrella as f64 / 3600.0).ceil() as usize;
+    assert!(served[0] >= device.per_hour as usize / 2, "the first of them has their own rate: {served:?}");
+    assert!(
+        total <= umbrella + refilled,
+        "one address's 27 sign-ups, vouching for each other, were served {total} signed-in requests; a person's devices together get {umbrella} an hour: {served:?}"
+    );
+}
+
 /// BUG-1890's second instance: a request under a read grant paid the
 /// grant's device alone, never the person's umbrella, so the object routes
 /// gave a person each device's whole rate again. dev's agent sessions (ten,
