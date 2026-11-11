@@ -1,6 +1,6 @@
 # Embargoes: fixing a security issue in private
 
-> The Veil server refuses embargoed merges until it enforces embargoes as permissions ([HUB.md](../HUB.md) §13.8, §13.9). Until then an embargoed merge stays on the device where it was made; the rules below are what the engine enforces on every transfer between repositories.
+> The Veil server enforces embargoes as permissions ([HUB.md](../HUB.md) §13.31): an embargoed merge made with `--embargo-for GROUPS` is pushed to a hidden line (`embargo/<id>`) that only those groups and the project's admins see, and `main` on the server moves at the release. The rules below are what the client enforces on every push as well.
 
 An **embargoed merge** lands a fix on `main` now and publishes it later.
 An embargo is a **permission, not encryption** ([VISIBILITY.md](../VISIBILITY.md),
@@ -11,7 +11,7 @@ Until the release, the embargoed merge and the history it brings in are
 them. After the release, the same snapshots are pushed, with nothing
 rewritten.
 
-> **With the server**, an embargo goes to chosen groups now and becomes public later (planned: `vl merge fix --into main --embargo-for <groups…> --until <date>`), and an embargoed PR doesn't exist for anyone else. The commands below are today's client, where the audience is named with `--embargo --scope S`.
+> **With the server**, an embargo goes to chosen groups now and becomes public later (`vl merge fix --into main --embargo-for <groups…> --until <date>`, then `vl push`; the groups must exist on the server, `vl group create`), and an embargoed PR doesn't exist for anyone else. The transcripts below name the audience with `--embargo --scope S`; `--embargo-for` works the same way.
 
 1. [The workflow](#the-workflow)
 2. [Deadlines and release](#deadlines-and-release)
@@ -74,8 +74,8 @@ $ vl embargo list
 **4. Push.** Before the release, the merge, the fix's history and anything
 built on them are withheld from every receiver: a tag whose history reaches
 them (here `main`) is skipped, with the reason, and receivers keep the
-`main` they had. (Today the Veil server refuses a push that reaches an
-embargoed merge at all: see the note at the top.)
+`main` they had. (With `--embargo-for GROUPS`, the push sends the merge to the
+server's hidden line `embargo/<id>` instead: see the note at the top.)
 
 **5. Release** when the advisory goes out (or let the deadline do it), and
 push again. `vl embargo release` first shows what becomes public and asks:
@@ -196,7 +196,9 @@ Nothing is recorded when this happens. Your options:
 
 ## Limitations today
 
-* **The server does not take embargoed merges yet** (the note at the top).
+* **The server takes an embargoed merge only for groups it knows**
+  (`--embargo-for GROUPS`, the note at the top); one made with `--scope`
+  alone stays on the device until its release.
 * **One embargo per line** (above).
 * **A pushed release is final.** Only an unpushed release can be undone
   (above).

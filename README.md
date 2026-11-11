@@ -210,7 +210,7 @@ Groups, folder access, thin clones, pull requests and the web client are in
 
 ## A tour
 
-> Folders are restricted by the server's access rules ([VISIBILITY.md](docs/VISIBILITY.md)); only secret files are encrypted. Embargoed merges cannot be pushed to the server yet ([HUB.md](docs/HUB.md) §13.8), so they stay on the device until released.
+> Folders are restricted by the server's access rules ([VISIBILITY.md](docs/VISIBILITY.md)); only secret files are encrypted. An embargoed merge is pushed to a hidden line on the server, which only the groups it names see until its release ([Embargoes](docs/guide/embargoes.md), [HUB.md](docs/HUB.md) §13.31).
 
 ```sh
 # Secrets: nothing to configure.
@@ -232,11 +232,15 @@ vl push               # a new project: you are its admin, everything is private
 vl access src/ public # who may see what (push it to apply)
 
 # Delayed-visibility merge (e.g. a security fix): a permission, not encryption.
+vl group create security && vl group add security alice   # who sees the fix before its release
 vl ws new fix-cve -r main                         # or any change not on `main`
-vl merge fix-cve@ --into main --embargo --until +7d -m "Fix CVE-…"
+vl merge fix-cve@ --into main --embargo-for security --until +7d -m "Fix CVE-…"
+vl push                   # to a hidden line on the server (`embargo/<id>`): only `security` and admins see it
 vl embargo release <id>   # (or automatically after 7 days)
-# Until release, the merge and the history it brings in stay here: no push sends
-# them, nor a tag or commit built on them, and copies out of the embargo are refused.
+vl push                   # tells the server, which puts the fix on `main` (`vl pull` shows it there)
+# Until release, `main` on the server stays where it was, and the merge and the
+# history it brings in exist for nobody outside the group: no clone, pull, log,
+# search or pull request shows them, and copies out of the embargo are refused.
 # Veil keeps one unreleased embargo per line: a second `--embargo` merge into
 # (or of) a line that still carries one is refused, and so is merging or rebasing
 # two embargoed lines together. Release the earlier embargo first, then merge.
