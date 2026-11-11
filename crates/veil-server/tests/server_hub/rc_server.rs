@@ -244,3 +244,116 @@ fn bug_1922_a_change_below_an_api_commit_that_moved_the_branch_is_not_landed_aga
     assert_eq!(l.status, 400, "{answered}");
     assert!(body(&l).contains(REFUSAL), "{answered}");
 }
+
+/// One round of GC's switch against a root writer (BUG-1881's order): a
+/// change on a branch that is then deleted is unreferenced; GC marks it;
+/// two minutes later (past retention) GC runs again, and right before its
+/// switch a writer commits a row naming the change's snapshot as a root
+/// (`row`: SQL with `$1` the project, `$2` a key, `$3` the snapshot's hex),
+/// as every root writer does: its transaction first locks the project's GC
+/// epoch row `FOR SHARE` and finds the epoch it read before. Answers whether
+/// the snapshot is still stored after GC.
+fn snapshot_survives_a_root_written_before_the_switch(th: &TestHub, p: &Project, round: i64, row: &'static str) -> bool {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use veil_server::pack_gc::{self, Options, SwitchHook};
+    let api = th.api();
+    let h = th.hub();
+    let pid: i64 = th.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&h.db)).unwrap();
+    let admin = p.admin.token();
+    let branch = format!("tmp-rc-{round}");
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file(&format!("src/rc-gc-{round}.txt"), &format!("RC-SERVER-GC-ROOT-{round}-7c41d09e\n"));
+    let (snap, r) = c.push_edited(&branch, None, |_| {});
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", body(&r));
+    let r = api.post_json(
+        Some(&admin),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": branch, "expected": snap.hex(), "new": null}], "force": true}),
+    );
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", body(&r));
+    assert!(th.rt.block_on(h.objects.exists(pid, &snap)).unwrap(), "the change is stored");
+
+    let gc = |offset: i64, hook: Option<SwitchHook>| {
+        th.rt.block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options {
+                min_packs_to_merge: 1,
+                run_gc: true,
+                retention_window_ms: 60_000,
+                pack_grace_ms: 0,
+                now_offset_ms: offset,
+                before_switch: hook,
+                ..Options::default()
+            },
+        ))
+    };
+    // Each round is two minutes after the one before: GC sees the change
+    // unreferenced, and two minutes later it is past retention.
+    gc(round * 240_000, None).unwrap();
+    let wrote = Arc::new(AtomicBool::new(false));
+    let hook = {
+        let (db, wrote, hex) = (h.db.clone(), wrote.clone(), snap.hex());
+        SwitchHook(Arc::new(move || {
+            let (db, wrote, hex) = (db.clone(), wrote.clone(), hex.clone());
+            Box::pin(async move {
+                if wrote.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let epoch = "SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1";
+                let before: i64 = sqlx::query_scalar(epoch).bind(pid).fetch_one(&db).await.unwrap();
+                let mut tx = db.begin().await.unwrap();
+                let now: i64 = sqlx::query_scalar(&format!("{epoch} FOR SHARE")).bind(pid).fetch_one(&mut *tx).await.unwrap();
+                assert_eq!(now, before, "the writer's guard: the GC epoch it read before its checks");
+                let n = sqlx::query(row).bind(pid).bind(format!("rc-{round}")).bind(&hex).execute(&mut *tx).await.unwrap().rows_affected();
+                assert_eq!(n, 1, "the writer's row");
+                tx.commit().await.unwrap();
+            })
+        }))
+    };
+    gc(round * 240_000 + 120_000, Some(hook)).unwrap();
+    assert!(wrote.load(Ordering::SeqCst), "GC reached its switch, and the writer committed before it");
+    th.rt.block_on(h.objects.exists(pid, &snap)).unwrap()
+}
+
+/// BUG-1881's guarantee ("every writer that adds a root takes the GC guard
+/// first", so that GC never deletes what a writer's commit names), for the
+/// search index's writer (`search::index::apply_write`, in the fix's list).
+///
+/// The guard orders a writer and GC's switch; what makes the switch give
+/// way to a writer that committed **before** it (after GC computed what is
+/// reachable) is the reference stamp, read again in the switch
+/// (`pack_gc.rs`, `read_ref_stamp`). The stamp fingerprints `STAMP_TABLES`,
+/// which leave out two tables whose columns GC roots: `search_shards`
+/// (`segments`: registered `GcConditionalLeafRoot`, "fingerprinted in
+/// `read_ref_stamp`" by its own comment) and `pr_review_rules`. A shard row
+/// committed in that window, naming an object unreferenced past retention
+/// (a segment whose content the index wrote before: segments are
+/// content-addressed), is not noticed: GC switches and deletes the object.
+///
+/// The control is the same writer with a row in a stamped table.
+#[test]
+#[ignore = "BUG-1923: GC's reference stamp leaves out search_shards: a segment named right before the switch is deleted"]
+fn bug_1923_gc_gives_way_to_a_search_shard_written_right_before_its_switch() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let kept = snapshot_survives_a_root_written_before_the_switch(
+        &th,
+        &p,
+        0,
+        "INSERT INTO change_refs (project_id, change_id, snapshot, created_by, created_at) \
+         SELECT $1, $2, $3, created_by, 0 FROM projects WHERE id = $1",
+    );
+    assert!(kept, "control: GC gives way to a change ref written right before its switch");
+    let kept = snapshot_survives_a_root_written_before_the_switch(
+        &th,
+        &p,
+        1,
+        "INSERT INTO search_shards (project_id, kind, branch, line_key, segments, docs, text_docs, text_bytes, dead) \
+         VALUES ($1, 'names', '', $2, '[\"' || $3 || '\"]', 0, 0, 0, 0)",
+    );
+    assert!(kept, "GC deleted an object that a search shard, committed before its switch under the writer's guard, names");
+}
