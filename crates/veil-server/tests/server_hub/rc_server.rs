@@ -357,3 +357,125 @@ fn bug_1923_gc_gives_way_to_a_search_shard_written_right_before_its_switch() {
     );
     assert!(kept, "GC deleted an object that a search shard, committed before its switch under the writer's guard, names");
 }
+
+/// BUG-1885's second part ("landing a PR left its source branch": the
+/// branch is deleted "when `prs::land` marks the PR landed"), and the PR's
+/// own state, when the landing outlasts its request.
+///
+/// `prs::land` marks the PR `landed` and deletes its source branch only in
+/// the request that asked, after `landing::wait`. A landing that is still
+/// queued when the wait ends (30 s: behind another server's lease here; in
+/// use behind a long queue, a slow batch or merges) is answered `queued`,
+/// lands afterwards, and nothing then marks the PR or cleans its branch:
+/// the PR stays `open` with its change on `main`, and its branch stays,
+/// until someone asks to land it again.
+#[test]
+#[ignore = "BUG-1924: a PR whose landing outlasts its request stays open, and its source branch is left"]
+fn bug_1924_a_pr_that_lands_after_its_request_was_answered_queued_is_landed() {
+    use std::time::{Duration, Instant};
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let db = th.hub().db.clone();
+    let pid: i64 = th.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&db)).unwrap();
+    let dev = p.dev.token();
+    // `main` is protected; `src/docs/**` needs checks only (no approval).
+    write_files(&p.dir, &[(".veilrules", "[branches.main]\nprotected = true\n\n[review]\nchecks_only = [\"src/docs/**\"]\n")]);
+    p.admin.commit_main(&p.dir, "protect main, docs need no approval");
+    p.admin.ok(&p.dir, &["push"]);
+
+    let base = main_tip(&th, Some(&dev), &p.name);
+    let c = change(&th, &dev, &p.name, &json!({"base": base.hex(), "description": "a doc", "edits": [{"path": "src/docs/late.md", "put": {"text": "late\n"}}]}));
+    assert_eq!(c.status, 200, "{}", body(&c));
+    let snap = c.json()["snapshot"].as_str().unwrap().to_string();
+    let made = api.post_json(Some(&dev), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "topic-late", "expected": null, "new": snap}]}));
+    assert_eq!(made.json()["results"][0]["ok"], true, "{}", body(&made));
+    let pr = api.post_json(Some(&dev), &format!("/v1/projects/{}/prs", p.name), &json!({"head": "topic-late", "title": "a doc"}));
+    assert_eq!(pr.status, 200, "{}", body(&pr));
+    let id = pr.json()["id"].as_str().unwrap().to_string();
+
+    // Another server holds main's landing lease: the PR's landing waits.
+    th.rt
+        .block_on(
+            sqlx::query(
+                "INSERT INTO landing_leases (project_id, branch, holder, epoch, expires_at) \
+                 VALUES ($1, 'main', 'rc-server-another-server', 1, (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + 600000) \
+                 ON CONFLICT (project_id, branch) DO UPDATE SET holder = EXCLUDED.holder, epoch = landing_leases.epoch + 1, expires_at = EXCLUDED.expires_at",
+            )
+            .bind(pid)
+            .execute(&db),
+        )
+        .unwrap();
+    let asked = api.post_json(Some(&dev), &format!("/v1/projects/{}/prs/{id}/land", p.name), &json!({}));
+    assert_eq!(asked.status, 200, "{}", body(&asked));
+    assert_eq!(asked.json()["landing"]["state"], "queued", "the request's wait ended with the landing queued: {}", body(&asked));
+    let ticket = asked.json()["landing"]["ticket"].as_str().unwrap().to_string();
+
+    // The lease ends, and the landing lands.
+    th.rt
+        .block_on(sqlx::query("DELETE FROM landing_leases WHERE project_id = $1 AND branch = 'main' AND holder = 'rc-server-another-server'").bind(pid).execute(&db))
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(60);
+    let landed = loop {
+        let r = api.get(Some(&dev), &format!("/v1/projects/{}/land/{ticket}", p.name));
+        assert_eq!(r.status, 200, "{}", body(&r));
+        if r.json()["state"] != "queued" || Instant::now() > until {
+            break r.json();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(landed["state"], "landed", "{landed}");
+    let file = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?path=src/docs/late.md", p.name));
+    assert_eq!(file.status, 200, "the PR's change is on main: {}", body(&file));
+
+    // The PR is landed, and its source branch is cleaned up, as when the
+    // landing ends within the request (`rv_core2::bug_1885_pr_landing_…`).
+    std::thread::sleep(Duration::from_secs(2));
+    let shown = api.get(Some(&dev), &format!("/v1/projects/{}/prs/{id}", p.name));
+    assert_eq!(shown.status, 200, "{}", body(&shown));
+    assert_eq!(shown.json()["state"], "landed", "the PR's change is on main and the PR is still {}", shown.json()["state"]);
+    let tips = api.tips(Some(&dev), &p.name).unwrap();
+    assert!(!tips.branches.contains_key("topic-late"), "the landed PR's source branch is left");
+}
+
+/// BUG-1852's rule ("a result counts only when its poster may write every
+/// path the check covers … other results are stored and shown, and decide
+/// nothing"), against the bound on a snapshot's checks.
+///
+/// A snapshot keeps at most 64 distinct checks, 32 of one person, and the
+/// bound is asked before a new name is stored whoever posts it. Two people
+/// who take part in the project and may write nothing the check covers
+/// (`fin` and `carol`: neither may write `src/`) post 32 names each on
+/// `main`'s tip. The required check's own result, from the admin, is then
+/// refused (`400 a snapshot keeps at most 64 distinct checks`): the results
+/// that "decide nothing" decide that `main@tested` never reaches this tip
+/// and that no bisect of it starts.
+#[test]
+#[ignore = "BUG-1925: results that count for nothing fill a snapshot's 64 checks, and the required check's result is refused"]
+fn bug_1925_results_that_do_not_count_never_keep_out_the_required_checks_result() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let (admin, fin, carol) = (p.admin.token(), p.fin.token(), p.carol.token());
+    let rules = "[branches.main]\nprotected = true\nrequired_checks = [\"ci/src\"]\n\n[checks.\"ci/src\"]\npaths = [\"src/\"]\n";
+    let (l0, _) = land_new_change(&hub, &admin, &p.name, ".veilrules", rules);
+    assert_eq!(l0.status, 200, "{}", body(&l0));
+    assert_eq!(l0.json()["state"], "landed", "{}", body(&l0));
+    let tip = main_tip(&hub, Some(&admin), &p.name);
+
+    // Neither of them may report the required check itself.
+    for (who, token) in [("fin", &fin), ("carol", &carol)] {
+        let seen = main_tip(&hub, Some(token), &p.name);
+        let r = post_check(&hub, token, &p.name, seen, "ci/src", "fail");
+        assert_eq!(r.status, 403, "control: {who} may not report ci/src: {}", body(&r));
+        for i in 0..32 {
+            let r = post_check(&hub, token, &p.name, seen, &format!("other/{who}-{i}"), "pass");
+            assert_eq!(r.status, 200, "{who}'s result {i}: {}", body(&r));
+        }
+    }
+
+    let r = post_check(&hub, &admin, &p.name, tip, "ci/src", "pass");
+    assert_eq!(r.status, 200, "the required check's result, from someone who may write what it covers: {}", body(&r));
+    let tested = hub.api().get(Some(&admin), &format!("/v1/projects/{}/tested/main", p.name));
+    assert_eq!(tested.status, 200, "{}", body(&tested));
+    assert!(body(&tested).contains(&tip.hex()), "main@tested is the tip whose required check passed: {}", body(&tested));
+}
