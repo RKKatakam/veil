@@ -71,7 +71,6 @@ impl T {
 /// constant in code: nothing the pattern scanner knows) must not get that
 /// file recorded: it would be stored unencrypted and pushed.
 #[test]
-#[ignore = "BUG-1840: a sandboxed command's copy of a sealed secret's value is recorded as a plain public file"]
 fn bug_1840_the_value_of_a_sealed_secret_written_to_another_file_in_a_sandbox_is_never_recorded() {
     const SECRET: &str = "Xk29vLq8sPzQw7LmTr4Bn6Yc";
     let t = T::new(&[("a.txt", "a\n"), ("src/lib.rs", "pub fn f() {}\n"), (".env", &format!("API_KEY={SECRET}\n"))]);
@@ -99,6 +98,50 @@ fn bug_1840_the_value_of_a_sealed_secret_written_to_another_file_in_a_sandbox_is
         assert!(
             !t.proj.join(".veil/local/sandboxes/agent/files").join(f).exists(),
             "{f} holds the secret's value and must be taken out of the sandbox after the run"
+        );
+    }
+}
+
+#[test]
+fn bug_1840_sealed_secret_guard_covers_mounts_socket_commits_and_allows_in_place_sealed_edits() {
+    const SECRET: &str = "Xk29vLq8sPzQw7LmTr4Bn6Yc";
+    // Both a checked-out sandbox and `--mount`, including mid-run `vl commit`
+    // through the workspace socket, refuse and remove copies while recording
+    // clean edits and in-place edits of the sealed `.env` itself.
+    for flags in [&[][..], &["--mount"]] {
+        let t = T::new(&[("a.txt", "a\n"), ("src/lib.rs", "pub fn f() {}\n"), (".env", &format!("API_KEY={SECRET}\n"))]);
+        let o = t.exec(
+            flags,
+            r#"set -e
+               v=$(cut -d= -f2 .env); test -n "$v"
+               printf '%s\n' "$v" > val.txt
+               printf '// %s\n' "$v" >> src/lib.rs
+               echo 'clean' >> a.txt
+               printf 'PORT=8080\n' >> .env
+               vl commit -m 'mid-run commit'"#,
+        );
+        assert!(o.status.success(), "{flags:?}: run failed:\n{}", text(&o));
+
+        let show = t.ok(&["diff", "--from", "main", "--to", "agent@-"]);
+        let listed = t.ok(&["ls", "-r", "agent@-"]);
+        assert!(listed.lines().any(|l| l.ends_with("a.txt")), "{flags:?}: {listed}");
+        assert!(show.contains("+clean"), "{flags:?}: clean edit was committed:\n{show}");
+        assert!(
+            listed.lines().any(|l| l.contains("cloaked") && l.ends_with(".env")),
+            "{flags:?}: in-place edit of sealed .env stays cloaked:\n{listed}"
+        );
+        assert!(!listed.lines().any(|l| l.ends_with("val.txt")), "{flags:?}: val.txt must not be recorded:\n{listed}");
+        let lib = t.ok(&["ws", "cat", "agent", "src/lib.rs"]);
+        assert_eq!(lib, "pub fn f() {}\n", "{flags:?}: tainted tracked edit was held back");
+        let env_cat = t.ok(&["ws", "cat", "agent", ".env"]);
+        assert!(env_cat.contains("PORT=8080"), "{flags:?}: in-place .env edit recorded: {env_cat}");
+        assert!(
+            !t.proj.join(".veil/local/sandboxes/agent/files/val.txt").exists(),
+            "{flags:?}: val.txt removed from sandbox"
+        );
+        assert!(
+            !t.proj.join(".veil/local/mounts/agent/upper/val.txt").exists(),
+            "{flags:?}: val.txt removed from mount overlay"
         );
     }
 }

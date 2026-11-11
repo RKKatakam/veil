@@ -930,6 +930,15 @@ impl Guard {
         }
     }
 
+    /// Merge another guard's entries into this one.
+    pub fn merge(&mut self, other: &Guard) {
+        for e in &other.files {
+            if !self.files.contains(e) {
+                self.files.push(e.clone());
+            }
+        }
+    }
+
     /// The guard as the builder applies it.
     pub fn secrets(&self) -> InjectedSecrets {
         let files: Vec<(&str, Vec<u8>)> = self
@@ -939,6 +948,81 @@ impl Guard {
             .collect();
         InjectedSecrets::from_files(files.iter().map(|(p, d)| (*p, d.as_slice())))
     }
+}
+
+/// Every sealed (`Cloaked`) file in `root` that `store` holds locally and can
+/// decrypt (falling back to `fallback_fs` when given, for an unchanged file
+/// already checked out into a sandbox whose thin-clone cache evicted the
+/// blob). Never fetches from the server: in a thin clone over a mount, an
+/// unfetched subtree or blob was never read by the command.
+pub fn sealed_files_in_tree(
+    store: &ObjectStore,
+    root: &ObjectId,
+    fallback_fs: Option<&dyn StorageBackend>,
+) -> Vec<(String, Vec<u8>)> {
+    store.without_fetching(|| {
+        let mut out = Vec::new();
+        let Ok(top) = store.tree(root) else { return out };
+        let mut stack: Vec<(VPath, std::sync::Arc<crate::object::Tree>, usize)> = vec![(VPath::root(), top, 0)];
+        while let Some((dir, tree, i)) = stack.last_mut() {
+            let Some(e) = tree.entries.get(*i).cloned() else {
+                stack.pop();
+                continue;
+            };
+            *i += 1;
+            let p = dir.join(&e.name);
+            match e.kind {
+                EntryKind::Dir => {
+                    if let Ok(child) = store.tree(&e.id) {
+                        stack.push((p, child, 0));
+                    }
+                }
+                EntryKind::File | EntryKind::Conflict if !e.visibility.is_public() => {
+                    let data = crate::conflict::read_file_like(store, &e).ok().or_else(|| {
+                        let fs = fallback_fs?;
+                        if behind_special(fs, &p).unwrap_or(true) {
+                            return None;
+                        }
+                        fs.read(&p).ok()
+                    });
+                    if let Some(d) = data {
+                        out.push((p.as_str().to_string(), d));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    })
+}
+
+/// Every sealed (`Cloaked`) leaf path in `root` held locally by `store`.
+pub fn sealed_paths_in_tree(store: &ObjectStore, root: &ObjectId) -> Vec<VPath> {
+    store.without_fetching(|| {
+        let mut out = Vec::new();
+        let Ok(top) = store.tree(root) else { return out };
+        let mut stack: Vec<(VPath, std::sync::Arc<crate::object::Tree>, usize)> = vec![(VPath::root(), top, 0)];
+        while let Some((dir, tree, i)) = stack.last_mut() {
+            let Some(e) = tree.entries.get(*i).cloned() else {
+                stack.pop();
+                continue;
+            };
+            *i += 1;
+            let p = dir.join(&e.name);
+            match e.kind {
+                EntryKind::Dir => {
+                    if let Ok(child) = store.tree(&e.id) {
+                        stack.push((p, child, 0));
+                    }
+                }
+                EntryKind::File | EntryKind::Conflict if !e.visibility.is_public() => {
+                    out.push(p);
+                }
+                _ => {}
+            }
+        }
+        out
+    })
 }
 
 impl SandboxPaths {
@@ -1093,7 +1177,9 @@ pub fn clean_copies(
                 };
                 if let Some(e) = entry.filter(|e| e.kind == EntryKind::File) {
                     if let Ok(data) = store.read_entry(&e) {
-                        if fs.read(vp).is_ok_and(|have| have == data) || secrets.find(&data).is_some() {
+                        if fs.read(vp).is_ok_and(|have| have == data)
+                            || (e.visibility.is_public() && secrets.find(&data).is_some())
+                        {
                             return Ok(());
                         }
                         fs.write(vp, &data)?;

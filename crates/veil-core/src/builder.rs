@@ -179,12 +179,12 @@ const CONFLICT_COPY: &str = ":conflict";
 /// together at most [`MAX_WINDOWS`].
 #[derive(Debug, Default, Clone)]
 pub struct InjectedSecrets {
-    /// (needle, the injected file it came from)
-    needles: Vec<(Vec<u8>, String)>,
+    /// (needle, the secret files it came from)
+    needles: Vec<(Vec<u8>, Vec<String>)>,
     matcher: Option<regex::bytes::Regex>,
-    /// Whole contents of binary injected files (and DER decoded from PEM),
+    /// Whole contents of binary secret files (and DER decoded from PEM),
     /// matched as raw bytes.
-    raw: Vec<(Vec<u8>, String)>,
+    raw: Vec<(Vec<u8>, Vec<String>)>,
     windows: WindowIndex,
 }
 
@@ -253,7 +253,7 @@ impl WindowIndex {
         let arr: [u8; WINDOW] = w.try_into().expect("window length");
         let h = window_hash(&arr);
         let bucket = self.by_hash.entry(h).or_default();
-        if bucket.iter().any(|&i| self.windows[i as usize].0 == arr) {
+        if bucket.iter().any(|&i| self.windows[i as usize].0 == arr && self.windows[i as usize].1 == src) {
             return true;
         }
         bucket.push(self.windows.len() as u32);
@@ -314,8 +314,9 @@ impl WindowIndex {
         }
     }
 
-    /// Position and window index of the first window found in `data`.
-    fn find(&self, data: &[u8]) -> Option<(usize, u32)> {
+    /// Position and window index of the first window found in `data`,
+    /// ignoring windows that belong to `allow_source`.
+    fn find_for(&self, allow_source: Option<&str>, data: &[u8]) -> Option<(usize, u32)> {
         if self.windows.is_empty() || data.len() < WINDOW {
             return None;
         }
@@ -325,8 +326,16 @@ impl WindowIndex {
             let (i, bit) = filter_slot(h);
             if self.filter[i] & bit != 0 {
                 if let Some(b) = self.by_hash.get(&h) {
-                    if let Some(&w) = b.iter().find(|&&w| self.windows[w as usize].0[..] == data[at..at + WINDOW]) {
-                        return Some((at, w));
+                    let allowed_here = allow_source.is_some_and(|a| {
+                        b.iter().any(|&w| {
+                            let (ref arr, src, _) = self.windows[w as usize];
+                            arr[..] == data[at..at + WINDOW] && self.sources[src as usize] == a
+                        })
+                    });
+                    if !allowed_here {
+                        if let Some(&w) = b.iter().find(|&&w| self.windows[w as usize].0[..] == data[at..at + WINDOW]) {
+                            return Some((at, w));
+                        }
                     }
                 }
             }
@@ -406,13 +415,20 @@ fn base64_decode(text: &[u8]) -> Option<Vec<u8>> {
 
 impl InjectedSecrets {
     pub fn from_files<'a>(files: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> InjectedSecrets {
-        let mut needles: Vec<(Vec<u8>, String)> = Vec::new();
-        let mut raw: Vec<(Vec<u8>, String)> = Vec::new();
+        let mut needles: Vec<(Vec<u8>, Vec<String>)> = Vec::new();
+        let mut raw: Vec<(Vec<u8>, Vec<String>)> = Vec::new();
         let mut windows = WindowIndex::default();
         let mut add = |v: &str, src: &str| {
             let v = v.trim();
-            if secret_like(v) && !needles.iter().any(|(n, _)| n == v.as_bytes()) {
-                needles.push((v.as_bytes().to_vec(), src.to_string()));
+            if !secret_like(v) {
+                return;
+            }
+            if let Some((_, srcs)) = needles.iter_mut().find(|(n, _)| n == v.as_bytes()) {
+                if !srcs.iter().any(|s| s == src) {
+                    srcs.push(src.to_string());
+                }
+            } else {
+                needles.push((v.as_bytes().to_vec(), vec![src.to_string()]));
             }
         };
         for (src, data) in files {
@@ -444,8 +460,12 @@ impl InjectedSecrets {
                 windows.sources.push(src.to_string());
                 let id = (windows.sources.len() - 1) as u32;
                 windows.add_source(&b, id);
-                if !raw.iter().any(|(n, _)| *n == b) {
-                    raw.push((b, src.to_string()));
+                if let Some((_, srcs)) = raw.iter_mut().find(|(n, _)| *n == b) {
+                    if !srcs.iter().any(|s| s == src) {
+                        srcs.push(src.to_string());
+                    }
+                } else {
+                    raw.push((b, vec![src.to_string()]));
                 }
             }
         }
@@ -476,30 +496,45 @@ impl InjectedSecrets {
         self.needles.is_empty() && self.raw.is_empty() && self.windows.len() == 0
     }
 
-    /// The first injected value contained in `data`, as a printable finding.
+    /// The first secret value contained in `data`, as a printable finding.
     pub fn find(&self, data: &[u8]) -> Option<Finding> {
+        self.find_for(None, data)
+    }
+
+    /// Like [`InjectedSecrets::find`], ignoring values that belong to
+    /// `allow_source` (an existing sealed secret file edited in place under
+    /// its own scope).
+    pub fn find_for(&self, allow_source: Option<&str>, data: &[u8]) -> Option<Finding> {
         let found = |start: usize, excerpt: String| Finding {
             rule: INJECTED_RULE,
             line: data[..start].iter().filter(|&&b| b == b'\n').count() + 1,
             excerpt,
         };
-        let text = match &self.matcher {
-            Some(re) => re
+        let excluded = |srcs: &[String]| allow_source.is_some_and(|a| srcs.iter().any(|s| s == a));
+        let text = match (&self.matcher, allow_source) {
+            (Some(re), None) => re
                 .find(data)
                 .and_then(|m| Some((m.start(), self.needles.iter().find(|(n, _)| n == m.as_bytes())?))),
-            // Pattern too large for the regex engine: plain substring search.
-            None => self
+            // Pattern too large for the regex engine, or filtering out one
+            // sealed file's own needles: plain substring search.
+            _ => self
                 .needles
                 .iter()
+                .filter(|(_, srcs)| !excluded(srcs))
                 .find_map(|n| memchr::memmem::find(data, &n.0).map(|i| (i, n))),
         };
-        if let Some((start, needle)) = text {
-            return Some(found(start, format!("content of {} injected into the sandbox", needle.1)));
+        if let Some((start, (_, srcs))) = text {
+            return Some(found(start, format!("content of {} injected into the sandbox", srcs[0])));
         }
-        if let Some((start, (_, src))) = self.raw.iter().find_map(|n| memchr::memmem::find(data, &n.0).map(|i| (i, n))) {
-            return Some(found(start, format!("content of {src} injected into the sandbox")));
+        if let Some((start, (_, srcs))) = self
+            .raw
+            .iter()
+            .filter(|(_, srcs)| !excluded(srcs))
+            .find_map(|n| memchr::memmem::find(data, &n.0).map(|i| (i, n)))
+        {
+            return Some(found(start, format!("content of {} injected into the sandbox", srcs[0])));
         }
-        let (start, w) = self.windows.find(data)?;
+        let (start, w) = self.windows.find_for(allow_source, data)?;
         let (_, src, enc) = &self.windows.windows[w as usize];
         let how = match enc {
             Encoding::Raw => "part of the content",
@@ -2149,16 +2184,19 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // Content the engine injected (e.g. `.env` in a sandbox) never
-        // enters history under another name, whatever the tier. Unchanged
-        // tracked content predates the injection and is left alone.
+        // Secrets the sandbox was given (sealed `.env` files, injected
+        // isolated files) never enter history in another file, whatever the
+        // tier. Unchanged tracked content predates the run and is left
+        // alone, and an existing sealed file edited under its own scope may
+        // keep its own values.
         if let Some(inj) = self.opts.injected {
             let unchanged = match parent_file {
                 Some(pe) => pe.executable == executable && self.store.matches_encoding(&pe.id, &data)?,
                 None => false,
             };
             if !unchanged {
-                if let Some(f) = inj.find(&data) {
+                let own_sealed = (!desired.is_public() && parent_file.is_some_and(|pe| pe.visibility == desired)).then_some(path.as_str());
+                if let Some(f) = inj.find_for(own_sealed, &data) {
                     return self.quarantine(path, vec![f], parent_file);
                 }
             }

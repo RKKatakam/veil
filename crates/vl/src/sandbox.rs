@@ -427,8 +427,30 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
         let _umask = PrivateUmask::set();
         private_dir(&paths.files)?;
         prefetch_sync(&ctx.repo, m.tree.as_ref(), &synced, set.as_ref())?;
+        let synced_slice = match &set {
+            Some(s) => restrict_tree(ctx.repo.store(), &synced, s)?,
+            None => synced,
+        };
+        let sealed = core::sealed_files_in_tree(ctx.repo.store(), &synced_slice, None);
+        if !sealed.is_empty() {
+            let mut guard = paths.load_guard(&ctx.repo)?.unwrap_or_default();
+            let prev = guard.files.len();
+            guard.add(&sealed);
+            if guard.files.len() != prev {
+                paths.save_guard(&ctx.repo, &guard)?;
+            }
+        }
         let co = core::sync_to(&ctx.repo, &fs, &mut m, &synced, set.as_ref(), &mut cache)?;
         core::vouch_written(ctx.repo.store(), &fs, &synced, &co, &mut cache, core::VouchWait::IfCheaper)?;
+        let sealed_fs = core::sealed_files_in_tree(ctx.repo.store(), &synced_slice, Some(&fs));
+        if !sealed_fs.is_empty() {
+            let mut guard = paths.load_guard(&ctx.repo)?.unwrap_or_default();
+            let prev = guard.files.len();
+            guard.add(&sealed_fs);
+            if guard.files.len() != prev {
+                paths.save_guard(&ctx.repo, &guard)?;
+            }
+        }
         if let SetAside::Reimport {
             from,
             paths: keep,
@@ -574,10 +596,23 @@ impl crate::ws_socket::Around for MidRun {
         let store = ctx.repo.store().clone();
         let synced = m.tree.ok_or_else(|| anyhow!("the sandbox's manifest names no tree"))?;
         let set = m.only_set()?;
-        let guard = paths.load_guard(&ctx.repo)?;
+        let mut guard = paths.load_guard(&ctx.repo)?;
+        let fs = SandboxFs::new(&paths.files, None, false).with_forbidden_targets(std::iter::once(self.root.clone()).chain(crate::ctx::veil_private_dirs()));
+        let synced_slice = match &set {
+            Some(s) => restrict_tree(&store, &synced, s)?,
+            None => synced,
+        };
+        let sealed = core::sealed_files_in_tree(&store, &synced_slice, Some(&fs));
+        if !sealed.is_empty() {
+            let g = guard.get_or_insert_with(core::Guard::default);
+            let prev = g.files.len();
+            g.add(&sealed);
+            if g.files.len() != prev {
+                paths.save_guard(&ctx.repo, g)?;
+            }
+        }
         let secrets = guard.as_ref().map(core::Guard::secrets);
         let mut cache = paths.load_cache();
-        let fs = SandboxFs::new(&paths.files, None, false).with_forbidden_targets(std::iter::once(self.root.clone()).chain(crate::ctx::veil_private_dirs()));
         let pin = core::PolicyPin::new(&fs, &store, &synced)?;
         let view = set.as_ref().map(|s| SparseView::new(&pin, store.clone(), synced, s));
         let recorded_fs: &dyn StorageBackend = match &view {
@@ -605,6 +640,19 @@ impl crate::ws_socket::Around for MidRun {
         print_build_warnings(&out.report);
         print_working_copy_warnings(&out.report);
         let tree = ctx.repo.snapshot(&out.snapshot)?.tree;
+        let recorded_slice = match &set {
+            Some(s) => restrict_tree(&store, &tree, s)?,
+            None => tree,
+        };
+        let new_sealed = core::sealed_files_in_tree(&store, &recorded_slice, Some(&fs));
+        if !new_sealed.is_empty() {
+            let g = guard.get_or_insert_with(core::Guard::default);
+            let prev = g.files.len();
+            g.add(&new_sealed);
+            if g.files.len() != prev {
+                paths.save_guard(&ctx.repo, g)?;
+            }
+        }
         if let Some(pp) = &mut m.pending {
             pp.base = out.snapshot;
         }
@@ -716,7 +764,20 @@ fn finish_recording(
     let synced = m.tree.ok_or_else(|| anyhow!("the sandbox's manifest names no tree"))?;
     let set = m.only_set()?;
     let mut guard = paths.load_guard(&ctx.repo).map_err(|e| not_recorded(name, paths, e))?;
-    let secrets = guard.as_ref().map(core::Guard::secrets);
+    let synced_slice = match &set {
+        Some(s) => restrict_tree(&store, &synced, s)?,
+        None => synced,
+    };
+    let sealed = core::sealed_files_in_tree(&store, &synced_slice, Some(fs));
+    if !sealed.is_empty() {
+        let g = guard.get_or_insert_with(core::Guard::default);
+        let prev = g.files.len();
+        g.add(&sealed);
+        if g.files.len() != prev {
+            paths.save_guard(&ctx.repo, g).map_err(|e| not_recorded(name, paths, e))?;
+        }
+    }
+    let mut secrets = guard.as_ref().map(core::Guard::secrets);
 
     let pin = core::PolicyPin::new(fs, &store, &synced)?;
     let (recorded, recorded_tree, report, outcome) = {
@@ -802,6 +863,21 @@ fn finish_recording(
                 cache.invalidate(&vp);
                 eprintln!("  {} {POLICY_FILE} in the sandbox", yellow("put back"));
             }
+        }
+    }
+
+    let recorded_slice = match &set {
+        Some(s) => restrict_tree(&store, &recorded_tree, s)?,
+        None => recorded_tree,
+    };
+    let new_sealed = core::sealed_files_in_tree(&store, &recorded_slice, Some(fs));
+    if !new_sealed.is_empty() {
+        let g = guard.get_or_insert_with(core::Guard::default);
+        let prev = g.files.len();
+        g.add(&new_sealed);
+        if g.files.len() != prev {
+            paths.save_guard(&ctx.repo, g)?;
+            secrets = Some(g.secrets());
         }
     }
 
@@ -912,7 +988,21 @@ fn finish_recording(
                 safe(&q.to_string_lossy())
             ));
         }
-        copies.extend(found.found.iter().map(|q| safe(&q.to_string_lossy()).into_owned()));
+        copies.extend(
+            c.removed
+                .iter()
+                .chain(&c.restored)
+                .map(|q| safe(q.as_str()).into_owned()),
+        );
+        for q in &found.found {
+            let is_vp = q
+                .to_str()
+                .and_then(|s| VPath::new(&s.replace(std::path::MAIN_SEPARATOR, "/")).ok())
+                .is_some();
+            if !is_vp && !fs.root().join(q).exists() {
+                copies.push(safe(&q.to_string_lossy()).into_owned());
+            }
+        }
         copies.sort();
         copies.dedup();
         if !copies.is_empty() {
@@ -1237,18 +1327,19 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>, confine: Option<&Confine>) -> Res
         let mut record = veil_core::checkout::Materialised::default();
         let checked_out = ctx.repo.checkout_tree_recorded(&sandbox, None, &to, &mut record, None)?;
         crate::ctx::print_failed(&checked_out.failed);
-        let mut injected = None;
+        let mut guard_files = core::sealed_files_in_tree(ctx.repo.store(), &to, Some(&sandbox));
         if a.with_isolated {
             let files = vault_files(&ctx.repo)?;
             for (p, data) in &files {
                 sandbox.write(&VPath::new(p)?, data)?;
             }
-            // Whatever the command does with these, they must not be
-            // recorded under another name.
-            injected = Some(veil_core::builder::InjectedSecrets::from_files(
-                files.iter().map(|(p, d)| (p.as_str(), d.as_slice())),
-            ));
+            guard_files.extend(files);
         }
+        // Whatever the command does with these, they must not be recorded
+        // in another file.
+        let injected = (!guard_files.is_empty()).then(|| {
+            veil_core::builder::InjectedSecrets::from_files(guard_files.iter().map(|(p, d)| (p.as_str(), d.as_slice())))
+        });
         sb.make_private()?;
         print_running(a.command, &dir, confine);
         let code = run_command(&dir, &dir, a.command, confine, None, None)?;

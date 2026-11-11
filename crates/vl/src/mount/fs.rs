@@ -1991,6 +1991,35 @@ impl MountFs {
         Ok(())
     }
 
+    /// Drop `drop` from the upper layer over `lower` (restoring tracked
+    /// paths to `lower`'s version and removing untracked ones, along with
+    /// any directories they left empty).
+    pub fn drop_upper(&self, lower: Arc<dyn Lower>, drop: &[VPath]) -> FsResult<()> {
+        self.switch_lower(lower, &[], drop)?;
+        let mut g = self.lock();
+        let upper = g.overlay.upper().clone();
+        let whiteouts = g.overlay.whiteouts();
+        let mut pruned = Vec::new();
+        for p in drop {
+            let mut dir = p.parent();
+            while let Some(d) = dir.filter(|d| !d.is_root()) {
+                let has_whiteout = whiteouts.iter().any(|w| w.starts_with(&d));
+                let empty = upper.list_dir(&d).is_ok_and(|l| l.is_empty());
+                if !has_whiteout && empty {
+                    let _ = upper.remove_dir_all(&d);
+                    pruned.push(d.clone());
+                    dir = d.parent();
+                } else {
+                    break;
+                }
+            }
+        }
+        if !pruned.is_empty() {
+            g.changed(&pruned);
+        }
+        Ok(())
+    }
+
     /// After the overlay was recorded as `lower`'s tree: put it over
     /// `lower`, keeping only what still differs from it (files the
     /// recording left out: isolated, ignored, quarantined or held-back
