@@ -59,7 +59,6 @@ const LOG_MARK: &str = "MARKER-CI-LOG-OF-A-FULL-VIEW-63b0f2aa";
 /// `docs`, counts as covered, and the result's readers are those of
 /// `docs/guide/`: everyone on Earth.
 #[test]
-#[ignore = "BUG-1850: a check result posted from an admin's whole view is shown to everyone who reads the folders that have access lines, when the admin-only files sit beside them below the root"]
 fn bug_1850_a_check_posted_from_an_admins_whole_view_is_not_shown_to_public_readers() {
     let hub = TestHub::start();
     let (project, admin) = project_with(
@@ -352,7 +351,6 @@ fn bug_1853_key_rings_of_folders_a_participant_cannot_read_are_not_handed_to_the
 /// word for word ("a job session with `billing/` posts on a public change:
 /// invisible to public viewers").
 #[test]
-#[ignore = "BUG-1850: a result posted by a session that reads billing/, under a check name whose .veilrules paths are src/, is shown to everyone who reads src/"]
 fn bug_1850_a_check_posted_by_a_session_that_reads_billing_is_not_shown_to_public_readers() {
     const BILLING_LOG: &str = "MARKER-BILLING-TEST-OUTPUT-0c9e1f57";
     let hub = TestHub::start();

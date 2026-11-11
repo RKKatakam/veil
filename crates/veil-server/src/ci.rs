@@ -132,7 +132,7 @@ pub async fn post_check_route(
         ));
     }
 
-    let (session_paths, admin_only) = readable_footprint(&hub, &project, &viewer, real_id, &req.name).await?;
+    let (session_paths, admin_only) = readable_footprint(&project, &viewer)?;
 
     let now = veil_core::now_millis();
     let pid = project.id;
@@ -369,12 +369,12 @@ pub async fn checks_for(
     let mut checks = Vec::new();
     let mut seen_names = HashSet::new();
     for (name, state_s, summary, url, log, runner, paths_json, admin_only, updated_at) in rows {
-        if !seen_names.insert(name.clone()) {
-            continue;
-        }
         let Some(state) = CheckState::parse(&state_s) else { continue };
         let session_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
         if !can_see_check(project, viewer, &session_paths, admin_only) {
+            continue;
+        }
+        if !seen_names.insert(name.clone()) {
             continue;
         }
         checks.push(CheckResult {
@@ -456,28 +456,12 @@ pub async fn all_tested_for(hub: &Arc<Hub>, project: &Project, viewer: &Viewer) 
     Ok(out)
 }
 
-/// What paths `viewer`'s session could read in `project` on `real_id`. A
-/// check result is shown only to readers whose view can read every one of
-/// these paths (and who are admins when `admin_only` is true).
-async fn readable_footprint(
-    hub: &Arc<Hub>,
-    project: &Project,
-    viewer: &Viewer,
-    real_id: ObjectId,
-    check_name: &str,
-) -> Result<(Vec<String>, bool)> {
+/// What paths `viewer`'s session could read in `project`. A check result is
+/// shown only to readers whose view can read every one of these paths (and
+/// who are unnarrowed admins when `admin_only` is true).
+fn readable_footprint(project: &Project, viewer: &Viewer) -> Result<(Vec<String>, bool)> {
     let view = project.view(viewer);
-    let mut effective_only: Option<Vec<String>> = viewer.only.as_ref().map(|o| (**o).clone());
-    if effective_only.is_none() {
-        let default_tip = branch_tip(hub, project, viewer, &project.default_branch).await?;
-        let rules = sync::blocking(hub, project.id, move |src| crate::landing::rules(src, default_tip)).await?;
-        if let Some(paths) = rules.checks.get(check_name) {
-            if !paths.is_empty() {
-                effective_only = Some(paths.clone());
-            }
-        }
-    }
-    if let Some(only) = &effective_only {
+    if let Some(only) = &viewer.only {
         let mut paths = Vec::new();
         for p in only.iter() {
             if !view.sees_under(p) {
@@ -501,31 +485,7 @@ async fn readable_footprint(
         }
         Ok((paths, false))
     } else if viewer.admin {
-        let rule_paths: Vec<String> = project.policy.rules.iter().map(|r| r.path.clone()).collect();
-        let (present, has_private_root) = sync::blocking(hub, project.id, move |src| {
-            let tree_id = src.snapshot(&real_id)?.tree;
-            let mut present = Vec::new();
-            for rp in &rule_paths {
-                if crate::sync::entry_at(src, &tree_id, rp)?.is_some() {
-                    present.push(rp.clone());
-                }
-            }
-            let root_tree = match veil_core::object::Object::decode(&src.raw(&tree_id)?)? {
-                veil_core::object::Object::Tree(t) => t,
-                _ => veil_core::object::Tree { entries: Vec::new() },
-            };
-            let has_private_root = root_tree.entries.iter().any(|e| {
-                !veil_core::hub::agent::decides_access(&e.name)
-                    && !rule_paths.iter().any(|rp| rp == &e.name || rp.starts_with(&format!("{}/", e.name)))
-            });
-            Ok((present, has_private_root))
-        })
-        .await?;
-        if has_private_root || present.is_empty() {
-            Ok((present, true))
-        } else {
-            Ok((present, false))
-        }
+        Ok((Vec::new(), true))
     } else {
         let mut paths: Vec<String> = project
             .policy
