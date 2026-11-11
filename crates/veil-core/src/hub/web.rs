@@ -7,17 +7,20 @@
 //! `Sealed` ("open with `vl`") and their bytes are never opened.
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::{
-    crypto::domains::{HUB_WEB_CSRF, HUB_WEB_SESSION, SIG_CONTEXT_HUB_LOGIN, SIG_CONTEXT_HUB_PR_REVIEW},
+    crypto::{
+        domains::{HUB_WEB_CSRF, HUB_WEB_ENROLL, HUB_WEB_PRF_KEY, HUB_WEB_SESSION, WEB_DEVICE_IDENTITY_LABEL_PREFIX},
+        Envelope,
+    },
     error::{Result, VeilError},
     hub::{
         grant::{Grant, GrantBody},
-        pr::{review_message, VERDICTS},
-        wire::{login_message, LoginRequest},
+        wire::device_fingerprint,
     },
     hunks::diff_text,
-    identity::Identity,
+    identity::{parse_public_identity, Identity},
     object::{EntryKind, Object},
     ObjectId,
 };
@@ -25,11 +28,20 @@ use crate::{
 /// Prefix of every short-lived web session token (`web-<64 hex>`).
 pub const WEB_TOKEN_PREFIX: &str = "web-";
 
+/// Prefix of every single-use browser enrollment token (`web-enroll-<48 hex>`).
+pub const WEB_ENROLL_PREFIX: &str = "web-enroll-";
+
 /// Default lifetime of a web session: 1 hour.
 pub const DEFAULT_WEB_SESSION_MS: i64 = 3600 * 1000;
 
 /// Maximum lifetime of a web session: 4 hours.
 pub const MAX_WEB_SESSION_MS: i64 = 4 * 3600 * 1000;
+
+/// Default lifetime of a single-use `vl web` enrollment code: 10 minutes.
+pub const DEFAULT_WEB_ENROLL_MS: i64 = 10 * 60 * 1000;
+
+/// Maximum lifetime of a single-use `vl web` enrollment code: 15 minutes.
+pub const MAX_WEB_ENROLL_MS: i64 = 15 * 60 * 1000;
 
 /// Maximum plain-text bytes `diff_text_bounded` diffs in one file version.
 pub const MAX_WEB_DIFF_BYTES: usize = 1 << 20;
@@ -52,11 +64,40 @@ pub struct WebSession {
     pub expires_at: i64,
 }
 
+/// `POST /v1/sessions/web-enroll`: mint a short-lived single-use browser
+/// enrollment code from a person's confirmed `vl` device (`docs/HUB.md` §13.40).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebEnrollRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Answer of `POST /v1/sessions/web-enroll`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WebEnrollResponse {
+    pub code: String,
+    pub person: String,
+    pub expires_at: i64,
+}
+
 /// Stored `token_hash` of a `web-` token, domain-separated under
 /// [`HUB_WEB_SESSION`] so pre-S25 servers never match it.
 pub fn web_token_hash(token: &str) -> String {
     blake3::Hasher::new_derive_key(HUB_WEB_SESSION)
         .update(token.as_bytes())
+        .finalize()
+        .to_hex()
+        .to_string()
+}
+
+/// Stored `code_hash` of a `web-enroll-` token, domain-separated under
+/// [`HUB_WEB_ENROLL`].
+pub fn web_enroll_hash(code: &str) -> String {
+    blake3::Hasher::new_derive_key(HUB_WEB_ENROLL)
+        .update(code.as_bytes())
         .finalize()
         .to_hex()
         .to_string()
@@ -185,7 +226,7 @@ pub struct WebTreeItem {
 
 /// Decode and verify an object without ever decrypting or exposing sealed payloads.
 pub fn inspect_object_no_secrets(raw: &[u8]) -> Result<WebObjectSummary> {
-    if raw.starts_with(b"veil:seal\n") || raw.starts_with(b"veil:siv2\n") {
+    if raw.starts_with(b"veil:seal\n") || raw.starts_with(b"veil:sea2\n") || raw.starts_with(b"veil:siv2\n") {
         return Ok(WebObjectSummary::Sealed);
     }
     let id = ObjectId::hash(raw).hex();
@@ -273,34 +314,63 @@ pub fn diff_text_bounded(old: &str, new: &str, max_bytes: usize) -> WebDiff {
     WebDiff { binary: false, too_large: false, hunks }
 }
 
-/// Sign a single-use login challenge (`hub-login`) in memory without exposing
-/// private keys.
-pub fn sign_web_login(identity_json: &str, hub: &str, challenge_hex: &str, name: Option<&str>) -> Result<LoginRequest> {
-    let id = Identity::from_json(identity_json)?;
-    if challenge_hex.len() != 64 || !challenge_hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-        return Err(VeilError::Corrupt("challenge".into(), "challenge must be 32 bytes in lowercase hex".into()));
-    }
-    let msg = login_message(hub, challenge_hex);
-    let signature = id.sign(SIG_CONTEXT_HUB_LOGIN, &msg);
-    Ok(LoginRequest {
-        key: id.verifying_hex(),
-        challenge: challenge_hex.to_string(),
-        hub: hub.to_string(),
-        signature,
-        identity: id.public_id(),
-        name: name.map(str::to_string),
-    })
+/// Public browser device registration material plus the passkey-PRF-encrypted
+/// identity record stored in IndexedDB (`docs/HUB.md` §13.40). Plain private
+/// keys never cross the WASM or Worker boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserDeviceBundle {
+    pub public_identity: String,
+    pub signing_key: String,
+    pub member_id: String,
+    pub fingerprint: String,
+    pub sealed_identity_hex: String,
 }
 
-/// Sign a PR review verdict (`hub-pr-review`) in memory without exposing
-/// private keys.
-pub fn sign_web_pr_review(identity_json: &str, project: &str, pr_id: &str, patch: &str, verdict: &str) -> Result<String> {
-    if !VERDICTS.contains(&verdict) {
-        return Err(VeilError::Policy("verdict must be approve or request-changes".into()));
+/// Validate a 32-byte WebAuthn PRF output and derive its domain-separated
+/// wrapping key.
+pub(crate) fn derive_prf_wrapping_key(prf_output: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+    if prf_output.len() != 32 {
+        return Err(VeilError::Crypto("WebAuthn PRF output must be 32 bytes".into()));
     }
-    let id = Identity::from_json(identity_json)?;
-    let msg = review_message(project, pr_id, patch, verdict);
-    Ok(id.sign(SIG_CONTEXT_HUB_PR_REVIEW, &msg))
+    if prf_output.iter().all(|&b| b == 0) {
+        return Err(VeilError::Crypto("WebAuthn PRF output must not be all zeros".into()));
+    }
+    Ok(Zeroizing::new(blake3::derive_key(HUB_WEB_PRF_KEY, prf_output)))
+}
+
+/// Associated-data label binding a sealed browser device record in IndexedDB
+/// to a single passkey credential id.
+pub fn browser_device_label(credential_id: &str) -> Result<String> {
+    let trimmed = credential_id.trim();
+    if trimmed.is_empty() || trimmed.len() > 512 {
+        return Err(VeilError::Corrupt("credential-id".into(), "invalid WebAuthn credential id".into()));
+    }
+    Ok(format!("{WEB_DEVICE_IDENTITY_LABEL_PREFIX}{trimmed}"))
+}
+
+/// Generate a fresh browser device `Identity` inside WASM memory and seal its
+/// private keys under a key derived from the passkey's 32-byte WebAuthn PRF
+/// output (`HUB_WEB_PRF_KEY`). Returns only the public device identity,
+/// fingerprint, and encrypted IndexedDB blob — never plain private keys.
+pub fn seal_new_browser_device(person: &str, credential_id: &str, prf_output: &[u8]) -> Result<BrowserDeviceBundle> {
+    let wrap_key = derive_prf_wrapping_key(prf_output)?;
+    let label = browser_device_label(credential_id)?;
+    let id = Identity::generate(person);
+    let public_identity = id.public_id();
+    let pub_parsed = parse_public_identity(&public_identity)?;
+    let fingerprint = device_fingerprint(&pub_parsed)
+        .ok_or_else(|| VeilError::Corrupt("browser-device".into(), "invalid public identity".into()))?;
+    let signing_key = id.verifying_hex();
+    let member_id = id.public_hex();
+    let plain_json = Zeroizing::new(id.to_json());
+    let env = Envelope::seal_random(&wrap_key, &label, plain_json.as_bytes())?;
+    Ok(BrowserDeviceBundle {
+        public_identity,
+        signing_key,
+        member_id,
+        fingerprint,
+        sealed_identity_hex: hex::encode(env.to_bytes()),
+    })
 }
 
 #[cfg(test)]
@@ -309,7 +379,6 @@ mod tests {
     use crate::{
         crypto::Envelope,
         hub::project::empty_tree_id,
-        identity::verify_signature,
         object::Snapshot,
     };
 
@@ -331,6 +400,9 @@ mod tests {
         assert!(csrf_matches(&web_h, &csrf));
         assert!(!csrf_matches(&web_h, "wrong"));
         assert!(!csrf_matches(&plain_h, &csrf));
+
+        let enroll = format!("{WEB_ENROLL_PREFIX}{}", "cd".repeat(24));
+        assert_ne!(web_enroll_hash(&enroll), web_token_hash(&enroll));
     }
 
     #[test]
@@ -349,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_verification_and_device_signing_work_in_memory() {
+    fn snapshot_verification_and_prf_sealed_browser_device_never_expose_private_keys() {
         let alice = Identity::generate("alice");
         let mut snap = Snapshot::root(empty_tree_id());
         snap.author = "alice".into();
@@ -365,21 +437,14 @@ mod tests {
             other => panic!("unexpected summary: {other:?}"),
         }
 
-        let chal = "11".repeat(32);
-        let login = sign_web_login(&alice.to_json(), "veil.example:443", &chal, Some("alice")).unwrap();
-        assert!(verify_signature(
-            &login.key,
-            SIG_CONTEXT_HUB_LOGIN,
-            &login_message("veil.example:443", &chal),
-            &login.signature
-        ));
-
-        let sig = sign_web_pr_review(&alice.to_json(), "acme", "pr-1234abcd", "patch-hash", "approve").unwrap();
-        assert!(verify_signature(
-            &alice.verifying_hex(),
-            SIG_CONTEXT_HUB_PR_REVIEW,
-            &review_message("acme", "pr-1234abcd", "patch-hash", "approve"),
-            &sig
-        ));
+        let prf = [0x5au8; 32];
+        let bundle = seal_new_browser_device("alice", "cred-abc123", &prf).unwrap();
+        assert!(bundle.public_identity.starts_with("veil1"));
+        assert_ne!(bundle.signing_key, alice.verifying_hex(), "browser device must be a distinct device");
+        assert_eq!(bundle.fingerprint.len(), 24);
+        assert!(!bundle.sealed_identity_hex.contains("signing_seed"));
+        assert!(!bundle.sealed_identity_hex.contains("secret"));
+        assert!(seal_new_browser_device("alice", "cred-abc123", &[0u8; 32]).is_err());
+        assert!(seal_new_browser_device("alice", "cred-abc123", &[1u8; 16]).is_err());
     }
 }

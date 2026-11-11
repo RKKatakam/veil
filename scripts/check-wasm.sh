@@ -37,6 +37,7 @@ step "the WASM feature set on the host: portable tests and the example"
 cargo test $LOCKED -p veil-core --no-default-features --features wasm --test portable
 cargo run $LOCKED -q -p veil-core --no-default-features --features wasm --example wasm_smoke >/dev/null
 cargo run $LOCKED -q -p veil-core --no-default-features --features wasm --example web_wasm >/dev/null
+cargo run $LOCKED -q -p veil-core --no-default-features --features wasm --example web_secret_worker >/dev/null
 
 step "native vl opens a repository the portable engine wrote"
 export_dir=$(mktemp -d)
@@ -69,19 +70,23 @@ cargo clippy $LOCKED -p veil-core --target "$TARGET" --no-default-features --fea
 cargo clippy $LOCKED -p veil-core --features ruzstd --lib --tests --examples -- -D warnings
 
 step "the example on $TARGET under node"
+cargo run $LOCKED -q -p veil-core --no-default-features --features wasm --example web_secret_worker -- --fixture >"$export_dir/worker_fixture.json"
 # A separate target directory: the RUSTFLAGS would otherwise invalidate
 # the main build's cache.
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/wasm-smoke"
 RUSTFLAGS='--cfg getrandom_backend="custom"' \
     cargo build $LOCKED -p veil-core --release --target "$TARGET" \
-    --no-default-features --features ruzstd --example wasm_smoke --example web_wasm
+    --no-default-features --features ruzstd --example wasm_smoke --example web_wasm --example web_secret_worker
 wasm="$CARGO_TARGET_DIR/$TARGET/release/examples/wasm_smoke.wasm"
 web_wasm="$CARGO_TARGET_DIR/$TARGET/release/examples/web_wasm.wasm"
+web_secret_worker="$CARGO_TARGET_DIR/$TARGET/release/examples/web_secret_worker.wasm"
 printf 'wasm_smoke.wasm: %s bytes\n' "$(wc -c <"$wasm" | tr -d ' ')"
 printf 'web_wasm.wasm: %s bytes\n' "$(wc -c <"$web_wasm" | tr -d ' ')"
+printf 'web_secret_worker.wasm: %s bytes\n' "$(wc -c <"$web_secret_worker" | tr -d ' ')"
 if command -v node >/dev/null; then
     node scripts/wasm-smoke.mjs "$wasm"
     node scripts/web-wasm.mjs "$web_wasm"
+    node scripts/web-secret-worker.mjs "$web_secret_worker" "$export_dir/worker_fixture.json"
 else
     echo "node not found: built for $TARGET but not run (install node to run it)"
 fi

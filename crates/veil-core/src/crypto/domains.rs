@@ -170,6 +170,11 @@ pub const VAULT_LABEL_PREFIX: &str = "vault:";
 /// (HPKE aad `wrap:share:…`, which no scope name can spell: scope names
 /// have no `:`).
 pub const SHARE_LABEL_PREFIX: &str = "share:";
+/// `web-device:<credential-id>`: a browser device's private identity keys
+/// sealed in a Web Worker under a key derived from the passkey's WebAuthn
+/// PRF output (`docs/HUB.md` §13.40, milestone S26) before storing in
+/// IndexedDB.
+pub const WEB_DEVICE_IDENTITY_LABEL_PREFIX: &str = "web-device:";
 /// `local`: the device-local vault and isolated files.
 pub const LOCAL_LABEL: &str = "local";
 /// Separator of `<scope>#<key-id>` generation labels.
@@ -235,6 +240,16 @@ pub const HUB_WEB_SESSION: &str = "veil 2026 hub web-session v1";
 /// stored `session_hash` (`docs/HUB.md` §13.39).
 pub const HUB_WEB_CSRF: &str = "veil 2026 hub web-csrf v1";
 
+/// BLAKE3 `derive_key` context deriving the symmetric wrapping key that
+/// seals a browser device's private identity keys in IndexedDB from the
+/// 32-byte WebAuthn PRF output (`docs/HUB.md` §13.40, milestone S26).
+pub const HUB_WEB_PRF_KEY: &str = "veil 2026 hub web-prf-key v1";
+
+/// BLAKE3 `derive_key` context of the hash under which a Veil server keeps
+/// a short-lived single-use `vl web` browser enrollment token (`docs/HUB.md`
+/// §13.40, milestone S26).
+pub const HUB_WEB_ENROLL: &str = "veil 2026 hub web-enroll v1";
+
 /// Every BLAKE3 `derive_key` context, for the uniqueness test.
 pub const BLAKE3_CONTEXTS: &[&str] = &[
     LEGACY_SIV_NONCE,
@@ -255,6 +270,8 @@ pub const BLAKE3_CONTEXTS: &[&str] = &[
     HUB_AGENT_SESSION,
     HUB_WEB_SESSION,
     HUB_WEB_CSRF,
+    HUB_WEB_PRF_KEY,
+    HUB_WEB_ENROLL,
 ];
 
 #[cfg(test)]
@@ -281,7 +298,9 @@ mod tests {
                 "veil 2026 hub share-id v1",
                 "veil 2026 hub agent-session v1",
                 "veil 2026 hub web-session v1",
-                "veil 2026 hub web-csrf v1"
+                "veil 2026 hub web-csrf v1",
+                "veil 2026 hub web-prf-key v1",
+                "veil 2026 hub web-enroll v1"
             ],
             "a context changed or was reordered"
         );
@@ -312,6 +331,7 @@ mod tests {
             EMBARGO_LABEL_PREFIX,
             VAULT_LABEL_PREFIX,
             SHARE_LABEL_PREFIX,
+            WEB_DEVICE_IDENTITY_LABEL_PREFIX,
         ];
         for (i, a) in labels.iter().enumerate() {
             for b in &labels[i + 1..] {
