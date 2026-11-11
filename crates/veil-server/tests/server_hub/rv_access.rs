@@ -312,7 +312,6 @@ fn ring_scopes(r: &Reply) -> Vec<String> {
 /// folder only, confirms that a folder called `bill-…` has an access line,
 /// and reads which devices hold its key.
 #[test]
-#[ignore = "BUG-1853: every participant receives every key ring, named by an unkeyed hash of its access line's path: a guess of a hidden folder's name is confirmed, and who holds its key is listed"]
 fn bug_1853_key_rings_of_folders_a_participant_cannot_read_are_not_handed_to_them() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -340,6 +339,23 @@ fn bug_1853_key_rings_of_folders_a_participant_cannot_read_are_not_handed_to_the
     );
     let one = api.get(Some(&carol_tok), &format!("{rings}/{hidden}"));
     assert_eq!(one.status, 404, "asked by its name, the ring answers carol: {}", body(&one));
+
+    let absent = "rule-00000000000000000000";
+    let mem = std::sync::Arc::new(veil_core::MemoryBackend::new());
+    let kc = veil_core::keychain::Keychain::new(mem, Some(p.carol.identity()), "carol".into());
+    kc.set_format(veil_core::repo::REPO_FORMAT);
+    kc.create_scope(&hidden).unwrap();
+    kc.create_scope(absent).unwrap();
+    let probe_hidden = serde_json::to_value(kc.load_ring(&hidden).unwrap().unwrap()).unwrap();
+    let probe_absent = serde_json::to_value(kc.load_ring(absent).unwrap().unwrap()).unwrap();
+    let post_hidden = api.post_json(Some(&carol_tok), &format!("{rings}/{hidden}"), &probe_hidden);
+    let post_absent = api.post_json(Some(&carol_tok), &format!("{rings}/{absent}"), &probe_absent);
+    assert_eq!(post_hidden.status, 403, "{}", body(&post_hidden));
+    assert_eq!(
+        (post_hidden.status, body(&post_hidden).replace(&hidden, "S")),
+        (post_absent.status, body(&post_absent).replace(absent, "S")),
+        "posting to a hidden ring must not tell it from an absent one"
+    );
 }
 
 /// BUG-1850's class, second way in: the session's **own** view is replaced

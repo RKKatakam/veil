@@ -1024,6 +1024,54 @@ async fn add_managers(State(hub): State<HubState>, caller: Caller, Path((p, g)):
     change_group(hub, caller, p, g, Op::AddManager, req).await
 }
 
+/// Scopes of key rings `viewer` may read in `project` (`None`: all of them,
+/// for an unnarrowed admin): `team`, scopes sealing paths `viewer` reads, and
+/// scopes of active secret shares made to `viewer` (so the recipient device
+/// verifies the sharer's signature against the folder's ring).
+async fn readable_ring_scopes(
+    hub: &HubState,
+    project: &Project,
+    viewer: &Viewer,
+    narrowed: Option<std::collections::HashSet<String>>,
+) -> Result<Option<std::collections::HashSet<String>>> {
+    if viewer.admin {
+        return Ok(narrowed);
+    }
+    let policy = veil_core::policy::Policy::parse(&project.policy_text);
+    let view = project.view(viewer);
+    let mut scopes = policy.scopes_for_view(&view, viewer.only.as_deref().map(Vec::as_slice));
+    if let Some(me) = viewer.person {
+        let shared: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT path, sharer_id FROM secret_shares WHERE project_id = $1 AND recipient_id = $2 AND unshared_at IS NULL",
+        )
+        .bind(project.id)
+        .bind(me)
+        .fetch_all(&hub.db)
+        .await?;
+        let mut sharers = std::collections::HashMap::new();
+        for (path, sid) in shared {
+            if !viewer.within_narrowing(&path) {
+                continue;
+            }
+            if let std::collections::hash_map::Entry::Vacant(e) = sharers.entry(sid) {
+                e.insert(crate::shares::viewer_of(&hub.db, project.id, sid).await?);
+            }
+            if !project.view(&sharers[&sid]).read(&path) {
+                continue;
+            }
+            if let Ok(vp) = VPath::new(&path) {
+                if let veil_core::policy::Tier::Cloaked(scope) = policy.classify(&vp, false).tier {
+                    scopes.insert(scope);
+                }
+            }
+        }
+    }
+    if let Some(n) = narrowed {
+        scopes.retain(|s| n.contains(s));
+    }
+    Ok(Some(scopes))
+}
+
 /// Key rings of secret scopes. Only participants read them (they name the
 /// scope's members). The server cannot open them and is not their
 /// authority: each change is signed by a ring admin's device and verified
@@ -1039,7 +1087,8 @@ async fn get_rings(State(hub): State<HubState>, caller: Caller, Path(p): Path<St
         .fetch_all(&hub.db)
         .await?;
     // A narrowed session: only the rings of the secrets in its paths (BUG-1537).
-    let scopes = viewer.narrowed_scopes(&project);
+    let narrowed = viewer.narrowed_scopes(&project);
+    let scopes = readable_ring_scopes(&hub, &project, &viewer, narrowed).await?;
     Ok(Json(
         rows.iter()
             .filter(|(scope, _)| scopes.as_ref().is_none_or(|s| s.contains(scope)))
@@ -1054,8 +1103,10 @@ async fn get_ring(State(hub): State<HubState>, caller: Caller, Path((p, scope)):
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
-    let body: Option<String> = match viewer.narrowed_scopes(&project) {
-        // Outside a narrowed session's paths: as a ring that does not exist.
+    let narrowed = viewer.narrowed_scopes(&project);
+    let scopes = readable_ring_scopes(&hub, &project, &viewer, narrowed).await?;
+    let body: Option<String> = match scopes {
+        // Outside the viewer's readable paths (or narrowing): as a ring that does not exist.
         Some(s) if !s.contains(&scope) => None,
         _ => sqlx::query_scalar("SELECT body FROM rings WHERE project_id = $1 AND scope = $2")
             .bind(project.id)
@@ -1080,6 +1131,16 @@ async fn post_ring(
     validate_scope_name(&scope).map_err(|e| Error::bad_request(e.to_string()))?;
     if ring.scope != scope {
         return Err(Error::bad_request("the ring is for another scope"));
+    }
+    if !viewer.admin {
+        if let Err(why) = ring.verify() {
+            return Err(Error::conflict(why));
+        }
+        let own_scopes = veil_core::policy::Policy::parse(&project.policy_text)
+            .scopes_for_view(&project.view(&viewer), viewer.only.as_deref().map(Vec::as_slice));
+        if !own_scopes.contains(&scope) {
+            return Err(Error::forbidden(format!("only an admin of this project starts a key ring (scope '{scope}')")));
+        }
     }
     // Whoever starts a ring is its admin and holds its key: only an admin
     // of the project starts one. Later changes verify against the ring's

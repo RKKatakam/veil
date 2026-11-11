@@ -36,7 +36,7 @@ use crate::{
 
 /// Another person's standing in `project` (admin, groups): who a share is
 /// for, or whether its sharer may still read its path.
-async fn viewer_of(db: &sqlx::PgPool, project: i64, person: i64) -> Result<Viewer> {
+pub(crate) async fn viewer_of(db: &sqlx::PgPool, project: i64, person: i64) -> Result<Viewer> {
     let admin: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM project_admins WHERE project_id = $1 AND person_id = $2)")
         .bind(project)
         .bind(person)
