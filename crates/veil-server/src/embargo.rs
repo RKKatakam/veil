@@ -193,13 +193,16 @@ pub async fn embargoes_for(hub: &Hub, project: &Project, viewer: &Viewer) -> Res
 /// Used by the query API to withhold unreleased embargo snapshots from every
 /// viewer (including admins) until release.
 pub async fn is_withheld_for_query(hub: &Hub, project: i64, snapshot: &ObjectId) -> Result<bool> {
+    let hex = snapshot.hex();
     let eid: Option<String> = sqlx::query_scalar(
         "SELECT s.embargo_id FROM embargo_snapshots s \
          JOIN embargo_lines l ON l.project_id = s.project_id AND l.embargo_id = s.embargo_id \
-         WHERE s.project_id = $1 AND s.snapshot = $2 AND l.released_at IS NULL LIMIT 1",
+         WHERE s.project_id = $1 \
+           AND (s.snapshot = $2 OR s.snapshot IN (SELECT real_id FROM projections WHERE project_id = $1 AND projected_id = $2)) \
+           AND l.released_at IS NULL LIMIT 1",
     )
     .bind(project)
-    .bind(snapshot.hex())
+    .bind(&hex)
     .fetch_optional(&hub.db)
     .await?;
     Ok(eid.is_some())
@@ -212,13 +215,16 @@ pub async fn is_withheld_from_viewer(hub: &Hub, project: &Project, viewer: &View
     if viewer.admin {
         return Ok(false);
     }
+    let hex = snapshot.hex();
     let groups: Option<Vec<String>> = sqlx::query_scalar(
         "SELECT l.group_names FROM embargo_snapshots s \
          JOIN embargo_lines l ON l.project_id = s.project_id AND l.embargo_id = s.embargo_id \
-         WHERE s.project_id = $1 AND s.snapshot = $2 AND l.released_at IS NULL LIMIT 1",
+         WHERE s.project_id = $1 \
+           AND (s.snapshot = $2 OR s.snapshot IN (SELECT real_id FROM projections WHERE project_id = $1 AND projected_id = $2)) \
+           AND l.released_at IS NULL LIMIT 1",
     )
     .bind(project.id)
-    .bind(snapshot.hex())
+    .bind(&hex)
     .fetch_optional(&hub.db)
     .await?;
     let Some(groups) = groups else {
@@ -227,10 +233,121 @@ pub async fn is_withheld_from_viewer(hub: &Hub, project: &Project, viewer: &View
     Ok(!can_see_groups(hub, project, viewer, &groups).await?)
 }
 
+/// Return every unreleased `embargo_id` in `project_id` carried by any real
+/// snapshot in `starts` or its ancestors (decided from the content's ancestry,
+/// regardless of which route created the snapshot).
+pub async fn active_embargoes_of(
+    hub: &Arc<Hub>,
+    project_id: i64,
+    starts: &[ObjectId],
+    fresh: &HashMap<ObjectId, (Vec<ObjectId>, i64)>,
+    staged: Option<Arc<crate::sync::Staged>>,
+) -> Result<std::collections::BTreeSet<String>> {
+    use std::collections::BTreeSet;
+    if starts.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let active_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT embargo_id FROM embargo_lines WHERE project_id = $1 AND released_at IS NULL",
+    )
+    .bind(project_id)
+    .fetch_all(&hub.db)
+    .await?;
+    if active_ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let active_set: HashSet<String> = active_ids.into_iter().collect();
+
+    let snap_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT s.snapshot, s.embargo_id FROM embargo_snapshots s \
+         JOIN embargo_lines l ON l.project_id = s.project_id AND l.embargo_id = s.embargo_id \
+         WHERE s.project_id = $1 AND l.released_at IS NULL",
+    )
+    .bind(project_id)
+    .fetch_all(&hub.db)
+    .await?;
+    let mut tagged: HashMap<ObjectId, Vec<String>> = HashMap::new();
+    for (s_hex, eid) in snap_rows {
+        if let Ok(oid) = ObjectId::from_hex(&s_hex) {
+            tagged.entry(oid).or_default().push(eid);
+        }
+    }
+
+    let branch_rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT target, hidden_for_embargo FROM branches WHERE project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_all(&hub.db)
+    .await?;
+    let mut public_tips: Vec<ObjectId> = Vec::new();
+    for (t_hex, hidden) in branch_rows {
+        let Ok(oid) = ObjectId::from_hex(&t_hex) else { continue };
+        match hidden {
+            Some(eid) if active_set.contains(&eid) => {
+                let v = tagged.entry(oid).or_default();
+                if !v.contains(&eid) {
+                    v.push(eid);
+                }
+            }
+            None => public_tips.push(oid),
+            _ => {}
+        }
+    }
+
+    let root = crate::sync::root_snapshot_id();
+    let starts_vec = starts.to_vec();
+    let fresh_map: HashMap<ObjectId, Vec<ObjectId>> =
+        fresh.iter().map(|(k, (ps, _))| (*k, ps.clone())).collect();
+
+    crate::sync::blocking_staged(hub, project_id, staged, move |src| {
+        let mut public_ancs: HashSet<ObjectId> = HashSet::new();
+        let mut p_stack = public_tips;
+        while let Some(cur) = p_stack.pop() {
+            if cur == root || public_ancs.len() >= 512 || tagged.contains_key(&cur) {
+                continue;
+            }
+            let Ok(s) = src.snapshot(&cur) else { continue };
+            if s.embargo.as_ref().is_some_and(|e| active_set.contains(e)) {
+                continue;
+            }
+            if public_ancs.insert(cur) {
+                p_stack.extend(s.parents.iter().copied());
+            }
+        }
+
+        let mut found: BTreeSet<String> = BTreeSet::new();
+        let mut visited: HashSet<ObjectId> = HashSet::new();
+        let mut stack = starts_vec;
+        while let Some(cur) = stack.pop() {
+            if cur == root || !visited.insert(cur) || visited.len() > 8_192 {
+                continue;
+            }
+            if let Some(eids) = tagged.get(&cur) {
+                found.extend(eids.iter().cloned());
+            }
+            if public_ancs.contains(&cur) {
+                continue;
+            }
+            if let Some(ps) = fresh_map.get(&cur) {
+                stack.extend(ps.iter().copied());
+            } else if let Ok(s) = src.snapshot(&cur) {
+                if let Some(eid) = &s.embargo {
+                    if active_set.contains(eid) {
+                        found.insert(eid.clone());
+                    }
+                }
+                stack.extend(s.parents.iter().copied());
+            }
+        }
+        Ok(found)
+    })
+    .await
+}
+
 /// Validate `req.embargoes` and any embargoed snapshots in `parents_of`,
-/// rewrite `req.updates` so pushes of embargoed merges onto `main` divert to
-/// `embargo/<id>`, and return `(upserts, releases)` to apply in / after the
-/// push transaction.
+/// rewrite `req.updates` (when `divert_branches` is true) so pushes of
+/// embargoed changes divert to `embargo/<id>`, and return `(upserts, releases, diverted)`
+/// to apply in / after the push transaction.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_push(
     hub: &Arc<Hub>,
@@ -241,6 +358,8 @@ pub(crate) async fn prepare_push(
     parents_of: &HashMap<ObjectId, Arc<Snapshot>>,
     order: &[ObjectId],
     real_of: &HashMap<ObjectId, ObjectId>,
+    staged: Option<Arc<crate::sync::Staged>>,
+    divert_branches: bool,
 ) -> Result<(Vec<LineUpsert>, Vec<(String, EmbargoRecord)>, HashMap<String, String>)> {
     let mut records_by_id: HashMap<String, EmbargoRecord> = HashMap::new();
     let mut releases: Vec<(String, EmbargoRecord)> = Vec::new();
@@ -322,35 +441,48 @@ pub(crate) async fn prepare_push(
         }
     }
 
-    // 2. Check new snapshots in topological order (`order`) for `n.embargo` or
+    // 2. Check known (`real_of`) and new (`order`) snapshots for `n.embargo` or
     //    ancestry from an active embargo line.
     let mut snap_embargo: HashMap<ObjectId, String> = HashMap::new();
-    if !real_of.is_empty() {
-        let reals: Vec<String> = real_of.values().map(|r| r.hex()).collect();
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT s.snapshot, s.embargo_id FROM embargo_snapshots s \
-             JOIN embargo_lines l ON l.project_id = s.project_id AND l.embargo_id = s.embargo_id \
-             WHERE s.project_id = $1 AND s.snapshot = ANY($2) AND l.released_at IS NULL",
-        )
-        .bind(project.id)
-        .bind(&reals)
-        .fetch_all(&hub.db)
-        .await?;
-        if !rows.is_empty() {
-            let by_real: HashMap<String, String> = rows.into_iter().collect();
-            for (pushed, real) in real_of {
-                if let Some(eid) = by_real.get(&real.hex()) {
-                    snap_embargo.insert(*pushed, eid.clone());
-                }
+    let root = crate::sync::root_snapshot_id();
+    for (pushed, real) in real_of {
+        if *real == root {
+            continue;
+        }
+        let eids = active_embargoes_of(hub, project.id, &[*real], &HashMap::new(), staged.clone()).await?;
+        if eids.len() > 1 {
+            return Err(Error::bad_request("a snapshot cannot combine multiple active embargoes"));
+        }
+        if let Some(eid) = eids.into_iter().next() {
+            if !can_see(hub, project, viewer, &eid).await? {
+                return Err(Error::bad_request(format!("snapshot {} was not uploaded", pushed.short())));
             }
+            snap_embargo.insert(*pushed, eid);
         }
     }
 
     for id in order {
         let n = &parents_of[id];
+        let mut parent_eid: Option<String> = None;
+        for p in &n.parents {
+            if let Some(pe) = snap_embargo.get(p) {
+                if let Some(prev) = &parent_eid {
+                    if prev != pe {
+                        return Err(Error::bad_request("a snapshot cannot combine multiple active embargoes"));
+                    }
+                } else {
+                    parent_eid = Some(pe.clone());
+                }
+            }
+        }
         if let Some(eid) = &n.embargo {
             if eid.len() != 10 || !eid.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
                 return Err(Error::bad_request("invalid embargo id on snapshot"));
+            }
+            if let Some(pe) = &parent_eid {
+                if pe != eid {
+                    return Err(Error::bad_request("a snapshot cannot combine multiple active embargoes"));
+                }
             }
             // Must have a matching record validated in step 1 or already in `embargo_lines`
             // whose stored groups include the pusher.
@@ -375,24 +507,27 @@ pub(crate) async fn prepare_push(
                 }
             }
             snap_embargo.insert(*id, eid.clone());
-        } else {
-            for p in &n.parents {
-                if let Some(eid) = snap_embargo.get(p).cloned() {
-                    snap_embargo.insert(*id, eid);
-                    break;
-                }
-            }
+        } else if let Some(eid) = parent_eid {
+            snap_embargo.insert(*id, eid);
         }
     }
 
     // 3. Divert branch updates whose new tip is on an unreleased embargo line
     //    to `embargo/<id>`, and record the `LineUpsert` for each active embargo line.
-    //    Also track `diverted: HashMap<embargo_branch, original_branch>` so the
-    //    PushResult reports the branch name the client pushed (`main`) when diverted!
+    //    When `divert_branches` is false (`POST …/land`), ordinary branch names
+    //    are not diverted here so `landing::stack` refuses them cleanly.
     let mut diverted: HashMap<String, String> = HashMap::new();
     for u in &mut req.updates {
         let explicit_eid = embargo_id_of_branch(&u.branch).map(|s| s.to_string());
         let tip_eid = u.new.and_then(|n| snap_embargo.get(&n).cloned());
+        if let (Some(ex), Some(te)) = (&explicit_eid, &tip_eid) {
+            if ex != te {
+                return Err(Error::bad_request("a snapshot cannot combine multiple active embargoes"));
+            }
+        }
+        if explicit_eid.is_none() && !divert_branches {
+            continue;
+        }
         let Some(eid) = explicit_eid.clone().or(tip_eid) else {
             continue;
         };
@@ -699,7 +834,7 @@ pub async fn release_one(
         let existing_outcome = crate::landing::read(hub, project_id, person_id, &ticket).await?;
         let need_queue = existing_outcome.is_none();
         if need_queue || agent_viewer.is_some_and(|v| v.agent) {
-            let judged = match crate::landing::stack(hub, &project, &admin_viewer, &target_branch, etip_id, &HashMap::new(), None).await? {
+            let judged = match crate::landing::stack_for_embargo(hub, &project, &admin_viewer, &target_branch, etip_id, &HashMap::new(), None, Some(embargo_id)).await? {
                 Ok(j) => j,
                 Err(why) => return Err(Error::conflict(why)),
             };

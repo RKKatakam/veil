@@ -2489,7 +2489,7 @@ async fn push_staged(
     // Validate embargoes (`req.embargoes` and `n.embargo`) and divert embargoed
     // branch updates to their hidden `embargo/<id>` line (S22).
     let (embargo_upserts, embargo_releases, embargo_diverted) =
-        crate::embargo::prepare_push(hub, project, viewer, &who.person.device_key, &mut req, &parents_of, &order, &real_of).await?;
+        crate::embargo::prepare_push(hub, project, viewer, &who.person.device_key, &mut req, &parents_of, &order, &real_of, Some(st.clone()), !land_all).await?;
     // What this pusher uploaded (BUG-824): a push names nothing else that
     // is not already where it was in a parent.
     let uploaded = Arc::new(uploaded);
@@ -2824,6 +2824,21 @@ async fn push_staged(
                 }
             }
         }
+        if !is_embargo_branch {
+            if let Some(n) = new_real {
+                let eids = crate::embargo::active_embargoes_of(hub, project.id, &[n], &real_parents_of, Some(st.clone())).await?;
+                if let Some(eid) = eids.into_iter().next() {
+                    results.push(BranchResult {
+                        branch: u.branch.clone(),
+                        ok: false,
+                        message: Some(format!("cannot move '{}' to work built on unreleased embargo {eid}", u.branch)),
+                        tip: cur_seen,
+                        ticket: None,
+                    });
+                    continue;
+                }
+            }
+        }
         plans.push((u.branch.clone(), cur, new_real, accept, policy_text_update));
     }
     // The pusher's projections of what this push moves branches to, worked
@@ -2883,6 +2898,12 @@ async fn push_staged(
         for (branch, _, new, ..) in &plans {
             let Some(eid) = veil_core::embargo::embargo_id_of_branch(branch) else { continue };
             let Some(n) = new else { continue };
+            out.push((n.hex(), eid.to_string()));
+            for (_, r, p) in &deferred.rows {
+                if *r == *n {
+                    out.push((p.hex(), eid.to_string()));
+                }
+            }
             let mut seen = HashSet::new();
             let mut stack = vec![*n];
             while let Some(x) = stack.pop() {

@@ -193,6 +193,16 @@ pub async fn resolve_head(
 
     // 3. Ordinary revision resolution (which withholds unreleased embargo snapshots as 404).
     let (_, real) = query::resolve_real(hub, ask, head_spec, deadline).await?;
+    let eids = crate::embargo::active_embargoes_of(hub, ask.project.id, &[real], &HashMap::new(), None).await?;
+    if eids.len() > 1 {
+        return Err(Error::bad_request("a pull request cannot combine multiple active embargoes"));
+    }
+    if let Some(eid) = eids.into_iter().next() {
+        if !crate::embargo::can_see(hub, &ask.project, &ask.viewer, &eid).await? {
+            return Err(not_found());
+        }
+        return Ok((real, Some(eid)));
+    }
     Ok((real, None))
 }
 
@@ -635,7 +645,7 @@ pub async fn release_embargo_prs(
         let existing_outcome = crate::landing::read(hub, project.id, person_id, &ticket).await?;
         let need_queue = existing_outcome.is_none();
         if need_queue || agent_viewer.is_some_and(|v| v.agent) {
-            let judged = match crate::landing::stack(
+            let judged = match crate::landing::stack_for_embargo(
                 hub,
                 project,
                 &admin_viewer,
@@ -643,6 +653,7 @@ pub async fn release_embargo_prs(
                 current.head,
                 &HashMap::new(),
                 None,
+                Some(embargo_id),
             )
             .await?
             {

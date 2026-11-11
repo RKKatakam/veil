@@ -889,8 +889,32 @@ pub async fn stack(
     fresh: &HashMap<ObjectId, (Vec<ObjectId>, i64)>,
     staged: Option<Arc<crate::sync::Staged>>,
 ) -> Result<std::result::Result<Judged, String>> {
+    stack_for_embargo(hub, project, viewer, branch, new, fresh, staged, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn stack_for_embargo(
+    hub: &Arc<Hub>,
+    project: &crate::perm::Project,
+    viewer: &crate::perm::Viewer,
+    branch: &str,
+    new: ObjectId,
+    fresh: &HashMap<ObjectId, (Vec<ObjectId>, i64)>,
+    staged: Option<Arc<crate::sync::Staged>>,
+    releasing_embargo: Option<&str>,
+) -> Result<std::result::Result<Judged, String>> {
     let root = crate::sync::root_snapshot_id();
     let pid = project.id;
+    let active_eids = crate::embargo::active_embargoes_of(hub, pid, &[new], fresh, staged.clone()).await?;
+    for eid in active_eids {
+        if releasing_embargo != Some(eid.as_str())
+            && veil_core::embargo::embargo_id_of_branch(branch) != Some(eid.as_str())
+        {
+            return Ok(Err(format!(
+                "cannot land work built on unreleased embargo {eid} onto '{branch}'"
+            )));
+        }
+    }
     let max = veil_core::hub::land::MAX_LAND_STACK;
     let row: Option<(String, i64)> =
         sqlx::query_as("SELECT target, lineage FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL")
