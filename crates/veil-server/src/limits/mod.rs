@@ -410,12 +410,23 @@ fn busy(close: bool) -> Response {
 /// Who a request counts against.
 #[derive(Default)]
 struct Who {
-    /// The device, if any (else the address counts).
+    /// The device or agent session, if any (else the address counts).
     device: Option<Key>,
+    /// The person behind `device` (from a session or a verified read grant).
+    person_id: Option<i64>,
     /// The person and the person's access epoch, for a session.
     person: Option<(crate::auth::Person, i64)>,
     /// The project a verified read grant is for.
     grant: Option<String>,
+}
+
+impl Who {
+    /// Key for per-caller request-body and answer memory shares (BUG-1882):
+    /// the person when known, so one person's devices and agent sessions
+    /// share one quarter of the pool.
+    fn budget_key(&self, address: Key) -> Key {
+        self.person_id.map(Key::Person).or(self.device).unwrap_or(address)
+    }
 }
 
 /// The device a read grant was issued to (if any) and its project, if its
@@ -426,6 +437,27 @@ fn grant(hub: &HubState, token: &str) -> Option<(Option<Key>, String)> {
         return None;
     }
     Some((g.body.device.as_deref().and_then(Key::device), g.body.project))
+}
+
+/// The person owning `device` (`Key::Device`), from the request cache or the
+/// database (cached once found). Used for verified read grants, which carry
+/// the server's signature over the device's signing key.
+async fn device_person(hub: &HubState, device: Option<Key>) -> Option<i64> {
+    let Some(Key::Device(k)) = device else { return None };
+    if let Some(pid) = hub.caches.device_person(&k) {
+        return Some(pid);
+    }
+    let hex_key = hex::encode(k);
+    let pid: Option<i64> = sqlx::query_scalar("SELECT person_id FROM devices WHERE signing_key = $1 AND NOT pending")
+        .bind(&hex_key)
+        .fetch_optional(&hub.db)
+        .await
+        .ok()
+        .flatten();
+    if let Some(pid) = pid {
+        hub.caches.put_device_person(k, pid);
+    }
+    pid
 }
 
 /// Who `parts` counts against, its rate taken (`address`: the client's).
@@ -451,7 +483,12 @@ async fn who(hub: &HubState, parts: &mut axum::http::request::Parts, address: Ke
         if let Some(e) = hub.caches.session(&crate::auth::session_hash(token)).filter(|e| e.expires_at > now) {
             if let Some(d) = Key::of_person(&e.person) {
                 charge(Some(d), Some(e.person.id))?;
-                return Ok(Who { device: Some(d), person: Some((e.person.clone(), e.epoch)), grant: None });
+                return Ok(Who {
+                    device: Some(d),
+                    person_id: Some(e.person.id),
+                    person: Some((e.person.clone(), e.epoch)),
+                    grant: None,
+                });
             }
         }
         // Not known here yet (another server's, a restart, an evicted entry,
@@ -462,14 +499,16 @@ async fn who(hub: &HubState, parts: &mut axum::http::request::Parts, address: Ke
         let found = <crate::auth::Caller as axum::extract::FromRequestParts<HubState>>::from_request_parts(parts, hub).await.ok();
         let person = found.and_then(|c| c.person.map(|p| (p, c.epochs.person)));
         let device = person.as_ref().and_then(|(p, _)| Key::of_person(p));
+        let person = person.filter(|_| device.is_some());
         let pid = person.as_ref().map(|(p, _)| p.id);
         charge(device, pid)?;
-        return Ok(Who { device, person: person.filter(|_| device.is_some()), grant: None });
+        return Ok(Who { device, person_id: pid, person, grant: None });
     }
     if let Some(g) = parts.headers.get("veil-grant").and_then(|g| g.to_str().ok()) {
         if let Some((device, project)) = grant(hub, g) {
-            charge(device, None)?;
-            return Ok(Who { device, person: None, grant: Some(project) });
+            let pid = device_person(hub, device).await;
+            charge(device, pid)?;
+            return Ok(Who { device, person_id: pid, person: None, grant: Some(project) });
         }
     }
     if deferred {
@@ -550,7 +589,7 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
     // 3: the body, under the budget.
     let declared = hyper::body::Body::size_hint(&body).exact();
     let limit = crate::db::body_limit(parts.uri.path()) as u64;
-    let body_key = who.device.unwrap_or(address);
+    let body_key = who.budget_key(address);
     let mut body = body;
     let (bytes, _share) = match limits.bodies.read(body_key, who.device.is_some(), &mut body, declared, limit).await {
         Ok(b) => b,
@@ -576,8 +615,15 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
             grant: String,
         }
         let found = serde_json::from_slice::<Batch>(&bytes).ok().and_then(|b| grant(&hub, &b.grant));
+        let pid = match &found {
+            Some((device, _)) => device_person(&hub, *device).await,
+            None => None,
+        };
         let taken = match &found {
-            Some((Some(d), _)) => limits.devices.take(*d),
+            Some((Some(d), _)) => limits.devices.take(*d).and_then(|()| match pid {
+                Some(p) => limits.people.take(Key::Person(p)),
+                None => Ok(()),
+            }),
             _ => limits.addresses.take(address),
         };
         if let Err(wait) = taken {
@@ -585,6 +631,7 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
         }
         if let Some((device, project)) = found {
             who.device = device;
+            who.person_id = pid;
             who.grant = Some(project);
         }
     }
@@ -610,8 +657,9 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
 
     // 5: the route, its cache hits counted for its project, its answer
     // under the answers' budget.
+    let answer_key = who.budget_key(address);
     let mut req = Request::from_parts(parts, Body::from(bytes));
-    req.extensions_mut().insert(answers::For(body_key));
+    req.extensions_mut().insert(answers::For(answer_key));
     let bounds = landing::settings_bounds(&limits.settings);
     let mut ctx = current_request();
     ctx.bounds = Some(bounds);
@@ -620,7 +668,7 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
     ctx.layers = Some(layer_counts.clone());
     let resp = REQUEST.scope(ctx, next.run(req)).await;
     let layers = layer_counts.snapshot();
-    let resp = match limits.answers.budget(body_key, resp, class != Class::Write).await {
+    let resp = match limits.answers.budget(answer_key, resp, class != Class::Write).await {
         Some(r) => r,
         None => busy(false),
     };

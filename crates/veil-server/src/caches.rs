@@ -167,6 +167,7 @@ const MAX_TIP_PROJECTS: usize = 100_000;
 /// Byte budgets of the caches (BUG-913: every entry is weighed by what it
 /// holds, never counted as one, since its size is the asker's to choose).
 pub const SESSIONS_BUDGET: usize = 16 << 20;
+pub const DEVICES_BUDGET: usize = 4 << 20;
 pub const PROJECTS_BUDGET: usize = 32 << 20;
 pub const VIEWERS_BUDGET: usize = 32 << 20;
 pub const SNAPSHOTS_BUDGET: usize = 64 << 20;
@@ -228,6 +229,8 @@ fn rows_bytes(rows: &[(String, String)]) -> usize {
 
 pub struct Caches {
     sessions: LruCache<Arc<SessionEntry>>,
+    /// Immutable `devices.signing_key` (32 bytes) -> `person_id` for non-pending devices.
+    devices: LruCache<i64>,
     projects: LruCache<Arc<ProjectEntry>>,
     viewers: LruCache<Arc<ViewerEntry>>,
     /// Committed snapshots, projection memos and resolutions, by [`key`].
@@ -270,6 +273,7 @@ impl Default for Caches {
     fn default() -> Self {
         Caches {
             sessions: LruCache::new(SESSIONS_BUDGET),
+            devices: LruCache::new(DEVICES_BUDGET),
             projects: LruCache::new(PROJECTS_BUDGET),
             viewers: LruCache::new(VIEWERS_BUDGET),
             snapshots: LruCache::new(SNAPSHOTS_BUDGET),
@@ -303,8 +307,20 @@ impl Caches {
     }
 
     pub fn put_session(&self, token_hash: &str, e: SessionEntry) {
+        let mut dev = [0u8; 32];
+        if hex::decode_to_slice(&e.person.device_key, &mut dev).is_ok() {
+            self.put_device_person(dev, e.person.id);
+        }
         let weight = session_bytes(&e);
         self.sessions.insert(key("session", &[token_hash.as_bytes()]), Arc::new(e), weight);
+    }
+
+    pub fn device_person(&self, signing_key: &[u8; 32]) -> Option<i64> {
+        self.devices.get(&key("device", &[signing_key]))
+    }
+
+    pub fn put_device_person(&self, signing_key: [u8; 32], person_id: i64) {
+        self.devices.insert(key("device", &[&signing_key]), person_id, ENTRY + 8);
     }
 
     pub fn project(&self, name: &str) -> Option<Arc<ProjectEntry>> {
