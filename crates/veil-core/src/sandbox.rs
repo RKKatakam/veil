@@ -978,8 +978,7 @@ pub fn sealed_leaf(store: &ObjectStore, e: &TreeEntry) -> Option<bool> {
     match e.kind {
         EntryKind::Conflict => {
             let c = store.conflict(&e.id).ok()?;
-            let sealed = c.interleaved().flatten().any(|t| !t.visibility.is_public());
-            Some(sealed)
+            Some(c.adds.iter().chain(&c.removes).flatten().any(|t| !t.visibility.is_public()))
         }
         _ => Some(!e.visibility.is_public()),
     }
@@ -1031,7 +1030,7 @@ pub fn sealed_files_in_tree(
                         out.push((p.as_str().to_string(), d));
                     }
                     if let (EntryKind::Conflict, Ok(c)) = (e.kind, store.conflict(&e.id)) {
-                        for t in c.interleaved().flatten() {
+                        for t in c.adds.iter().chain(&c.removes).flatten() {
                             if let Ok(d) = store.read_entry(&t.entry(&e.name)) {
                                 out.push((p.as_str().to_string(), d));
                             }
