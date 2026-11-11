@@ -736,10 +736,25 @@ impl Objects {
         Ok(Some(body))
     }
 
-    async fn pack_range(&self, project: i64, name: &Arc<str>, id: &ObjectId, s: Slot, start: u64, end: u64) -> Result<Bytes> {
-        self.try_pack_range(project, name, id, s, start, end)
-            .await?
-            .ok_or_else(|| anyhow!("listed pack {name} is not in the store"))
+    /// [`Objects::try_pack_range`] of `id` from the pack a listing read
+    /// now names (after a miss in the packs this server knew, and loose),
+    /// with that pack and the slot; `Ok(None)` if no listed pack holds it.
+    /// A pack found gone here was merged and swept since that listing (a
+    /// second merge within one read): it is forgotten, which makes the next
+    /// lookup list again (BUG-1898: every read asks a fresh listing before
+    /// it answers "missing", and never fails on a pack that was replaced).
+    async fn pack_range_again(&self, project: i64, id: &ObjectId, since: Instant, start: u64, end: u64) -> Result<Option<(Bytes, Arc<str>, Slot)>> {
+        let mut gone = None;
+        for _ in 0..3 {
+            let Some((n, s)) = self.in_pack(project, id, true, since).await? else {
+                return Ok(None);
+            };
+            if let Some(b) = self.try_pack_range(project, &n, id, s, start, end).await? {
+                return Ok(Some((b, n, s)));
+            }
+            gone = Some(n);
+        }
+        Err(anyhow!("listed pack {} is not in the store", gone.as_deref().unwrap_or("")))
     }
 
     /// The encoding of `id` of `project` from the store, unchecked: from a
@@ -756,10 +771,7 @@ impl Objects {
         if let Some(enc) = self.store.get(&object_key(project, id)).await? {
             return Ok(Some(enc));
         }
-        match self.in_pack(project, id, true, since).await? {
-            Some((n, s)) => self.pack_range(project, &n, id, s, 0, u64::MAX).await.map(Some),
-            None => Ok(None),
-        }
+        Ok(self.pack_range_again(project, id, since, 0, u64::MAX).await?.map(|(b, _, _)| b))
     }
 
     /// Is `id` of `project` stored (in a listed pack, or loose)?
@@ -1225,8 +1237,8 @@ impl Objects {
                     if let Some(b) = self.try_pack_range(project, &n, id, s, start, end).await? {
                         return Ok(Some((b, s.encoding_len())));
                     }
-                    if let Some((n, s)) = self.in_pack(project, id, true, Instant::now()).await? {
-                        return Ok(Some((self.pack_range(project, &n, id, s, start, end).await?, s.encoding_len())));
+                    if let Some((b, _, s)) = self.pack_range_again(project, id, Instant::now(), start, end).await? {
+                        return Ok(Some((b, s.encoding_len())));
                     }
                 }
                 Some((head, Place::Loose(_))) if !encoding::is_compressed(&head) => {
@@ -1256,10 +1268,7 @@ impl Objects {
         if let Some((head, len)) = self.store.get_range(&object_key(project, id), 0, h).await? {
             return Ok(Some((head, Place::Loose(len))));
         }
-        match self.in_pack(project, id, true, since).await? {
-            Some((n, s)) => Ok(Some((self.pack_range(project, &n, id, s, 0, h).await?, Place::Pack(n, s)))),
-            None => Ok(None),
-        }
+        Ok(self.pack_range_again(project, id, since, 0, h).await?.map(|(head, n, s)| (head, Place::Pack(n, s))))
     }
 
     /// What reading object `id` may hold, decoded: by the size its entry
