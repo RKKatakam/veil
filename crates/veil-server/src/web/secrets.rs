@@ -185,7 +185,7 @@ fn member_of(id: &str, signing_key: Option<&String>, name: &str) -> Option<(Stri
 /// 1. No ring ever wraps a key to an unconfirmed (`pending`) device or unvouched browser device.
 /// 2. When `projects.web_secrets` is `false`, no ring wraps a key to a browser device.
 ///
-/// Both are about the members' own devices ([`member_devices`]). A member
+/// Both are about the members' own devices (`member_devices`). A member
 /// without a signing key is no device of this server's: a browser device's
 /// identity always has one, and the server hands a browser session no ring
 /// that [`sync_browser_rings_for_scope`] did not store for its device.

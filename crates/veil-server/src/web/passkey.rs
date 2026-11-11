@@ -76,7 +76,7 @@ fn request_origin_and_rp_id(headers: &HeaderMap) -> Result<(String, String)> {
 const MAX_ORIGIN_LEN: usize = 300;
 
 /// Sign-ins one address may have started and not finished (BUG-1902). A
-/// challenge lasts [`WEBAUTHN_CHALLENGE_TTL_MS`], and expired ones are
+/// challenge lasts two minutes (`WEBAUTHN_CHALLENGE_TTL_MS`), and expired ones are
 /// deleted by every ceremony that starts, so `webauthn_challenges` holds at
 /// most this many rows per address that asked within that time.
 pub const MAX_PENDING_LOGINS_PER_ADDRESS: i64 = 32;

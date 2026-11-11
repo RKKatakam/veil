@@ -79,7 +79,7 @@ fn set_request_authority(req: &mut Request) {
 }
 
 /// Verify that a state-changing browser request comes from the same origin
-/// (the request's authority: [`set_request_authority`]).
+/// (the request's authority: `set_request_authority`).
 ///
 /// `Sec-Fetch-Site`, when the browser sends it, must be `same-origin`; an
 /// `Origin` must name the request's authority. **`Origin: null` beside
