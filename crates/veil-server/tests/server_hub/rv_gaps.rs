@@ -332,3 +332,66 @@ fn rvgaps_search_never_answers_from_the_index_of_the_policy_before() {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
+
+// ---- right after a revocation ---------------------------------------------------------------
+
+/// Guarantee (S3, S5, S6 with a revocation): a thin clone made while its
+/// person read a folder holds ids of the history they saw then. Once they
+/// are removed, neither the server nor the machine's daemon (whose store
+/// another clone of theirs filled while they still had access) gives that
+/// clone a file of the folder it never fetched, by any of those ids; and
+/// the query routes answer an id of the view they had as an id nobody made.
+#[test]
+fn rvgaps_a_revoked_persons_thin_clone_and_old_ids_read_nothing_of_the_folder() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    more_history(&p);
+    let api = hub.api();
+    p.admin.ok(&p.dir, &["group", "add", "finance", &p.dev.name]);
+    let url = hub.url(&p.name);
+    let (first, second) = (p.dev.dir("thin-1"), p.dev.dir("thin-2"));
+    for d in [&first, &second] {
+        p.dev.ok(p.dev.home.path(), &["clone", &url, d.to_str().unwrap()]);
+    }
+    let log = p.dev.ok(&first, &["log", "--json", "-r", "main"]);
+    let seen: String = serde_json::from_str::<serde_json::Value>(log.trim()).unwrap()["entries"][0]["snapshot_id"].as_str().unwrap().to_string();
+    // Three changes back, billing's invoice held the marker: the second
+    // clone reads it while dev has access (through the daemon they share).
+    let old = format!("{seen}---");
+    let invoice = format!("{BILL_DIR}/acme/invoice.txt");
+    let out = p.dev.ok(&second, &["cat", "-r", &old, &invoice]);
+    assert!(out.contains(BILL_MARK), "while in finance, dev reads the old invoice: {out}");
+    let base = format!("/v1/projects/{}/q", p.name);
+    let dev = p.dev.token();
+    let shown = api.get(Some(&dev), &format!("{base}/file?rev={seen}&path={BILL_DIR}/out.txt"));
+    assert_eq!(shown.status, 200, "while in finance, the id resolves: {}", String::from_utf8_lossy(&shown.body));
+
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.dev.name]);
+    // The first clone never fetched the old invoice.
+    let o = p.dev.run(&first, &["cat", "-r", &old, &invoice]);
+    let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(!o.status.success() && !text.contains(BILL_MARK), "removed from finance, a thin clone still read the old invoice:\n{text}");
+    let o = p.dev.run(&first, &["pull"]);
+    assert!(o.status.success(), "pull after the removal: {}", String::from_utf8_lossy(&o.stderr));
+    let o = p.dev.run(&first, &["cat", "-r", &old, &invoice]);
+    let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(!o.status.success() && !text.contains(BILL_MARK), "after a pull, a thin clone still read the old invoice:\n{text}");
+    // The query routes: the id of the view dev had answers as an id nobody made.
+    let nobody = "ab".repeat(32);
+    for q in [
+        "show?rev=ID".to_string(),
+        "log?rev=ID".to_string(),
+        "tree?rev=ID".to_string(),
+        format!("tree?rev=ID&path={BILL_DIR}"),
+        format!("file?rev=ID&path={BILL_DIR}/out.txt"),
+        "grep?rev=ID&pattern=going".to_string(),
+        "blame?rev=ID&path=src/moved.txt&follow=true".to_string(),
+        "history?rev=ID&path=src/moved.txt&follow=true".to_string(),
+        "diff?from=ID&to=main".to_string(),
+    ] {
+        let got = api.get(Some(&dev), &format!("{base}/{}", q.replace("ID", &seen)));
+        let none = api.get(Some(&dev), &format!("{base}/{}", q.replace("ID", &nobody)));
+        let body = String::from_utf8_lossy(&got.body).replace(&seen, &nobody);
+        assert_eq!((got.status, body.as_str()), (none.status, String::from_utf8_lossy(&none.body).as_ref()), "{q}");
+    }
+}
