@@ -2,7 +2,7 @@
 //! 2026-11-10): each test shows one guarantee failing, and is ignored under
 //! its `docs/BUGS.md` row until the bug is fixed.
 
-use veil_core::{policy::Policy, policy::Tier, ObjectId, Repo, StorageBackend};
+use veil_core::{object::Visibility, policy::Policy, policy::Tier, ObjectId, Repo, StorageBackend};
 
 use crate::adversarial_support::*;
 
@@ -93,4 +93,31 @@ fn bug_1831_a_file_under_a_dot_slash_rule_is_not_recorded() {
         file_entry(&repo, &out.snapshot, "private/notes.txt").is_none() || !out.report.policy_warnings.is_empty(),
         "private/notes.txt was recorded as plain text, with no warning"
     );
+}
+
+/// Secrets are only ever stored encrypted: a secret that moves to a path no
+/// rule names stays sealed, and its plain text is never written to the
+/// object store on the way.
+#[test]
+#[ignore = "BUG-1832: a moved secret is first stored as a plain-text blob, which stays in the object store"]
+fn bug_1832_a_moved_secret_is_never_stored_as_plain_text() {
+    // Not token-shaped: the scanner has nothing to say about it (a moved
+    // file it flags is quarantined, never recorded).
+    const SECRET: &str = "REGION=review-marker-of-a-moved-secret-0001\nTIER=review-marker-of-a-moved-secret-0002\n";
+    let (mut repo, fs, _) = new_repo("alice");
+    commit_files(&mut repo, &*fs, &[(".veilpolicy", ".env cloak team\n"), (".env", SECRET)], "base");
+    let hits = |fs: &veil_core::MemoryBackend| -> Vec<String> {
+        backend_contains(fs, b"review-marker-of-a-moved-secret-0001").into_iter().filter(|f| f.starts_with(".veil/")).collect()
+    };
+    assert_eq!(hits(&fs), Vec::<String>::new(), "the committed secret is stored sealed only");
+
+    // `mv .env conf/settings.txt`.
+    fs.remove_file(&p(".env")).unwrap();
+    fs.write(&p("conf/settings.txt"), SECRET.as_bytes()).unwrap();
+    let wc = snap(&mut repo, &*fs);
+    let e = file_entry(&repo, &wc, "conf/settings.txt").expect("the moved file is recorded");
+    assert_eq!(e.visibility, Visibility::Cloaked { scope: "team".into() }, "protection followed the content");
+    assert_eq!(repo.store().read_entry(&e).unwrap(), SECRET.as_bytes());
+
+    assert_eq!(hits(&fs), Vec::<String>::new(), "the secret's plain text is in the object store");
 }
