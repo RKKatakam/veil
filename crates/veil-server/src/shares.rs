@@ -76,6 +76,7 @@ type Row = (String, String, String, i64, i64, i64, Option<i64>, Option<String>, 
 /// receive. A share's record (ciphertext) goes only to its sharer and its
 /// recipient, and only while it is active.
 pub async fn list(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Json<Vec<ShareInfo>>> {
+    caller.not_web()?;
     let me = caller.signed_in()?.clone();
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
@@ -151,6 +152,7 @@ async fn stored(db: &sqlx::PgPool, project: i64, path: &str, sharer: i64, recipi
 /// secret file the caller may read, for another participant, and follow the
 /// version stored (`expect`).
 pub async fn put(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<SharePut>) -> Result<Json<ShareInfo>> {
+    caller.not_web()?;
     let me = caller.person_only()?.clone();
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !project.participant(&viewer) {
@@ -277,6 +279,7 @@ pub async fn put(State(hub): State<HubState>, caller: Caller, Path(p): Path<Stri
 /// stays for the audit, without the record; its version moves on, so no
 /// update built before brings it back.
 pub async fn remove(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<ShareRemove>) -> Result<Json<ShareInfo>> {
+    caller.not_web()?;
     let me = caller.person_only()?.clone();
     let (project, _) = perm::open(&hub, &p, &caller).await?;
     let gone = || Error::not_found(format!("you share no secret '{}' with '{}' here", req.path, req.recipient));

@@ -118,6 +118,12 @@ pub struct AgentGrant {
 
 /// The code of the refusal of what an agent session may not do.
 pub const AGENT_SESSION: &str = "agent_session";
+/// The code of the refusal of what a browser/web session may not do.
+pub const WEB_SESSION: &str = "web_session";
+/// The code of a failed CSRF or same-origin check on a browser request.
+pub const CSRF_FAILED: &str = "csrf_failed";
+/// The `__Host-` session cookie set by the web client (`HttpOnly; Secure; SameSite=Strict; Path=/`).
+pub const SESSION_COOKIE: &str = "__Host-veil_session";
 
 fn valid_key(key: &str) -> bool {
     key.len() == 64 && key.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -132,17 +138,57 @@ pub const AGENT_TOKEN_PREFIX: &str = "agent-";
 
 /// The hash a session is kept under: a person's under [`token_hash`], an
 /// agent session's (its token starts with [`AGENT_TOKEN_PREFIX`]) under a
-/// derived key of its own, which a server that predates agent sessions
-/// never computes, so it never finds one (BUG-1376).
+/// derived key of its own, and a web session's (`web-`) under
+/// `HUB_WEB_SESSION`, which a server that predates that milestone never
+/// computes, so it never finds one (BUG-1376).
 pub fn session_hash(token: &str) -> String {
-    match token.starts_with(AGENT_TOKEN_PREFIX) {
-        true => blake3::Hasher::new_derive_key(veil_core::crypto::domains::HUB_AGENT_SESSION)
+    if token.starts_with(AGENT_TOKEN_PREFIX) {
+        blake3::Hasher::new_derive_key(veil_core::crypto::domains::HUB_AGENT_SESSION)
             .update(token.as_bytes())
             .finalize()
             .to_hex()
-            .to_string(),
-        false => token_hash(token),
+            .to_string()
+    } else if token.starts_with(veil_core::hub::web::WEB_TOKEN_PREFIX) {
+        veil_core::hub::web::web_token_hash(token)
+    } else {
+        token_hash(token)
     }
+}
+
+/// Extract `__Host-veil_session` from `Cookie` request headers, if present and non-empty.
+pub fn cookie_token(headers: &HeaderMap) -> Option<&str> {
+    let prefix = format!("{SESSION_COOKIE}=");
+    for val in headers.get_all(axum::http::header::COOKIE) {
+        let Ok(s) = val.to_str() else { continue };
+        for part in s.split(';') {
+            if let Some(tok) = part.trim().strip_prefix(&prefix) {
+                if !tok.is_empty() {
+                    return Some(tok);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// True when `headers` carry browser fetch metadata, `Origin`, `Cookie`, or `X-Veil-Web`.
+pub fn has_browser_headers(headers: &HeaderMap) -> bool {
+    headers.contains_key("sec-fetch-dest")
+        || headers.contains_key("sec-fetch-mode")
+        || headers.contains_key("sec-fetch-site")
+        || headers.contains_key(axum::http::header::ORIGIN)
+        || headers.contains_key(axum::http::header::COOKIE)
+        || headers.contains_key("x-veil-web")
+}
+
+/// True when `headers` carry browser headers or a `Bearer web-...` session token.
+pub fn has_browser_or_web_headers(headers: &HeaderMap) -> bool {
+    has_browser_headers(headers)
+        || headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|a| a.strip_prefix("Bearer "))
+            .is_some_and(|t| t.starts_with(veil_core::hub::web::WEB_TOKEN_PREFIX))
 }
 
 pub async fn challenge(State(hub): State<HubState>, Json(req): Json<ChallengeRequest>) -> Result<Json<Challenge>> {
@@ -170,6 +216,45 @@ fn normal_host(h: &str) -> String {
 }
 
 pub async fn login(State(hub): State<HubState>, headers: HeaderMap, Json(req): Json<LoginRequest>) -> Result<Json<Session>> {
+    let token = hex::encode(veil_core::crypto::random_bytes::<32>());
+    let session = token_hash(&token);
+    let (person_name, expires_at) = finish_login(&hub, &headers, req, session, hub.session_ttl_ms, "login").await?;
+    Ok(Json(Session {
+        token,
+        person: person_name,
+        expires_at,
+        hub_key: hub.identity.verifying_hex(),
+    }))
+}
+
+/// Verify a single-use `hub-login` challenge-response and mint a short-lived
+/// `web-` session directly for browser sign-in (`POST /web/login`).
+pub(crate) async fn login_web_direct(
+    hub: &HubState,
+    headers: &HeaderMap,
+    req: LoginRequest,
+    ttl_ms: i64,
+) -> Result<(String, String, i64, String)> {
+    let token = format!(
+        "{}{}",
+        veil_core::hub::web::WEB_TOKEN_PREFIX,
+        hex::encode(veil_core::crypto::random_bytes::<32>())
+    );
+    let hash = veil_core::hub::web::web_token_hash(&token);
+    let csrf = veil_core::hub::web::csrf_for_session(&hash);
+    let ttl = ttl_ms.min(hub.session_ttl_ms);
+    let (person_name, expires_at) = finish_login(hub, headers, req, hash, ttl, "web login").await?;
+    Ok((token, person_name, expires_at, csrf))
+}
+
+async fn finish_login(
+    hub: &HubState,
+    headers: &HeaderMap,
+    req: LoginRequest,
+    session: String,
+    ttl_ms: i64,
+    audit_action: &str,
+) -> Result<(String, i64)> {
     if !valid_key(&req.key) {
         return Err(Error::bad_request("key must be an Ed25519 public key in lowercase hex"));
     }
@@ -201,9 +286,7 @@ pub async fn login(State(hub): State<HubState>, headers: HeaderMap, Json(req): J
     let fingerprint = veil_core::hub::wire::device_fingerprint(&ident).unwrap_or_default();
     let key = req.key.clone();
     let name = req.name.clone();
-    let token = hex::encode(veil_core::crypto::random_bytes::<32>());
-    let expires_at = now + hub.session_ttl_ms;
-    let session = token_hash(&token);
+    let expires_at = now + ttl_ms;
     // The session is written in the same transaction as the device: a
     // request that committed is never run again (`db::retry_requests`),
     // and its challenge is spent.
@@ -252,13 +335,8 @@ pub async fn login(State(hub): State<HubState>, headers: HeaderMap, Json(req): J
         prune_pending(&hub.db, name).await;
     }
     let (device, person, person_name) = outcome.map_err(|name| pending(&name))?;
-    crate::audit(&hub.db, None, Some(person), "login", &format!("device {device}")).await;
-    Ok(Json(Session {
-        token,
-        person: person_name,
-        expires_at,
-        hub_key: hub.identity.verifying_hex(),
-    }))
+    crate::audit(&hub.db, None, Some(person), audit_action, &format!("device {device}")).await;
+    Ok((person_name, expires_at))
 }
 
 /// The device signing in with `key` (registering `name` for a new person,
@@ -374,32 +452,44 @@ impl FromRequestParts<HubState> for Caller {
     /// path names a project this server knows): a session ended or a device
     /// removed on any server is refused here (`caches`).
     async fn from_request_parts(parts: &mut Parts, hub: &HubState) -> Result<Caller> {
-        let project = match axum::extract::RawPathParams::from_request_parts(parts, hub).await {
-            Ok(params) => params.iter().find(|(k, _)| *k == "p").and_then(|(_, v)| hub.caches.project(v)).map(|e| e.project.id),
-            Err(_) => None,
-        };
-        let Some(auth) = parts.headers.get("authorization") else {
-            let epochs = match project {
-                Some(p) => {
-                    let e = crate::caches::read_epochs(&hub.db, 0, Some(p)).await?;
-                    if let Some((pid, ge)) = e.gc {
-                        hub.observe_gc_epoch(pid, ge);
-                    }
-                    e
-                }
-                None => Epochs::default(),
-            };
-            return Ok(Caller { person: None, epochs });
-        };
-        let token = auth
+        authenticate_parts(parts, hub, true).await
+    }
+}
+
+pub(crate) async fn authenticate_parts(parts: &mut Parts, hub: &HubState, enforce_api_csrf: bool) -> Result<Caller> {
+    let project = match axum::extract::RawPathParams::from_request_parts(parts, hub).await {
+        Ok(params) => params.iter().find(|(k, _)| *k == "p").and_then(|(_, v)| hub.caches.project(v)).map(|e| e.project.id),
+        Err(_) => None,
+    };
+    let (token, from_cookie) = if let Some(auth) = parts.headers.get("authorization") {
+        let tok = auth
             .to_str()
             .ok()
             .and_then(|a| a.strip_prefix("Bearer "))
             .ok_or_else(|| Error::unauthorized("expected a bearer token"))?;
-        let hash = session_hash(token);
-        let agent_token = token.starts_with(AGENT_TOKEN_PREFIX);
-        let now = veil_core::now_millis();
-        let stats = &hub.caches.stats;
+        (tok, false)
+    } else if let Some(tok) = cookie_token(&parts.headers) {
+        (tok, true)
+    } else {
+        let epochs = match project {
+            Some(p) => {
+                let e = crate::caches::read_epochs(&hub.db, 0, Some(p)).await?;
+                if let Some((pid, ge)) = e.gc {
+                    hub.observe_gc_epoch(pid, ge);
+                }
+                e
+            }
+            None => Epochs::default(),
+        };
+        return Ok(Caller { person: None, epochs });
+    };
+    let hash = session_hash(token);
+    let agent_token = token.starts_with(AGENT_TOKEN_PREFIX);
+    let web_token = token.starts_with(veil_core::hub::web::WEB_TOKEN_PREFIX);
+    let now = veil_core::now_millis();
+    let stats = &hub.caches.stats;
+
+    let caller = 'lookup: {
         if let Some(e) = hub.caches.session(&hash).filter(|e| e.expires_at > now) {
             let epochs = crate::caches::read_epochs(&hub.db, e.person.id, project).await?;
             if let Some((pid, ge)) = epochs.gc {
@@ -407,10 +497,10 @@ impl FromRequestParts<HubState> for Caller {
             }
             if epochs.person == e.epoch {
                 stats.session_hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(Caller {
+                break 'lookup Caller {
                     person: Some(e.person.clone()),
                     epochs,
-                });
+                };
             }
         }
         stats.session_misses.fetch_add(1, Ordering::Relaxed);
@@ -449,19 +539,29 @@ impl FromRequestParts<HubState> for Caller {
                         epoch: person_epoch,
                     },
                 );
-                Ok(Caller {
+                Caller {
                     person: Some(person),
                     epochs: Epochs {
                         person: person_epoch,
                         project: project.map(|p| (p, project_epoch)),
                         gc: project.map(|p| (p, gc_epoch)),
                     },
-                })
+                }
             }
             // Never downgraded to anonymous: the client signs in again.
-            None => Err(Error::unauthorized("session expired or unknown; sign in again")),
+            None => return Err(Error::unauthorized("session expired or unknown; sign in again")),
         }
+    };
+
+    crate::web::record_session(hash.clone(), from_cookie, web_token);
+    if enforce_api_csrf
+        && from_cookie
+        && !matches!(parts.method, axum::http::Method::GET | axum::http::Method::HEAD)
+        && parts.uri.path().starts_with("/v1/")
+    {
+        crate::web::require_csrf(&parts.headers, Some(&hash), None)?;
     }
+    Ok(caller)
 }
 
 /// An agent session's record, as stored; a malformed one fails closed.
@@ -525,6 +625,26 @@ impl Caller {
         self.person.as_ref().ok_or_else(|| Error::unauthorized("sign in first (`vl login`)"))
     }
 
+    /// True when the request is a browser/web request (web UI route, cookie
+    /// auth, browser fetch/origin headers, or a `web-` session token).
+    pub fn is_web(&self) -> bool {
+        crate::web::current_is_web()
+    }
+
+    /// Refuse an action that S25's no-secrets web client may never perform
+    /// (secret key rings, secret shares, raw object streams, device/invite
+    /// management, or minting child sessions).
+    pub fn not_web(&self) -> Result<()> {
+        if self.is_web() {
+            return Err(Error::new(
+                axum::http::StatusCode::FORBIDDEN,
+                WEB_SESSION,
+                "this route is not available to a browser or web session; use vl",
+            ));
+        }
+        Ok(())
+    }
+
     /// [`Caller::signed_in`], refusing a CI runner session: a runner reads
     /// what it tests and writes only check results, never objects, branches,
     /// changes or landings.
@@ -573,6 +693,7 @@ pub async fn agent_session(
     caller: Caller,
     Json(req): Json<AgentSessionRequest>,
 ) -> Result<Json<AgentSession>> {
+    caller.not_web()?;
     let me = caller.person_only()?.clone();
     req.attribution.validate().map_err(Error::bad_request)?;
     let only = normalize_only(&req.only).map_err(Error::bad_request)?;
@@ -641,5 +762,66 @@ pub async fn agent_session(
         attribution: req.attribution,
         runner: req.runner,
         tested,
+    }))
+}
+
+/// `POST /v1/sessions/web`: mint a short-lived `web-` session derived from a
+/// person's device session (`docs/HUB.md` §13.39). Lasts at most 4 hours and
+/// never past its parent session; ending the parent session or removing the
+/// device ends it immediately across all servers.
+pub async fn web_session(
+    State(hub): State<HubState>,
+    headers: HeaderMap,
+    caller: Caller,
+    body: axum::body::Bytes,
+) -> Result<Json<veil_core::hub::web::WebSession>> {
+    caller.not_web()?;
+    let me = caller.person_only()?.clone();
+    let req: veil_core::hub::web::WebSessionRequest = if body.is_empty() {
+        veil_core::hub::web::WebSessionRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| Error::bad_request(format!("invalid web session request: {e}")))?
+    };
+    let parent = headers
+        .get("authorization")
+        .and_then(|a| a.to_str().ok())
+        .and_then(|a| a.strip_prefix("Bearer "))
+        .map(token_hash)
+        .ok_or_else(|| Error::unauthorized("expected a bearer token"))?;
+    let now = veil_core::now_millis();
+    let want = match req.seconds {
+        None => veil_core::hub::web::DEFAULT_WEB_SESSION_MS,
+        Some(s) if s > 0 => s.saturating_mul(1000).min(veil_core::hub::web::MAX_WEB_SESSION_MS),
+        Some(_) => return Err(Error::bad_request("seconds must be positive")),
+    };
+    let token = format!(
+        "{}{}",
+        veil_core::hub::web::WEB_TOKEN_PREFIX,
+        hex::encode(veil_core::crypto::random_bytes::<32>())
+    );
+    let hash = veil_core::hub::web::web_token_hash(&token);
+    let csrf = veil_core::hub::web::csrf_for_session(&hash);
+    let expires_at: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO sessions (token_hash, device_id, person_id, expires_at, parent_hash) \
+         SELECT $1, s.device_id, s.person_id, LEAST(s.expires_at, $2), s.token_hash \
+         FROM sessions s JOIN devices d ON d.id = s.device_id \
+         WHERE s.token_hash = $3 AND s.person_id = $4 AND s.agent IS NULL AND s.parent_hash IS NULL \
+         AND s.expires_at > $5 AND d.removed_at IS NULL AND NOT d.pending \
+         RETURNING expires_at",
+    )
+    .bind(&hash)
+    .bind(now + want)
+    .bind(&parent)
+    .bind(me.id)
+    .bind(now)
+    .fetch_optional(&hub.db)
+    .await?;
+    let expires_at = expires_at.ok_or_else(|| Error::unauthorized("session expired or unknown; sign in again"))?;
+    crate::audit(&hub.db, None, Some(me.id), "web session", "derived").await;
+    Ok(Json(veil_core::hub::web::WebSession {
+        token,
+        person: me.name,
+        csrf,
+        expires_at,
     }))
 }

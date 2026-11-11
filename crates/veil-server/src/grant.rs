@@ -140,7 +140,7 @@ pub async fn for_tips(
     // A narrowed agent session gets no grant: a grant reaches everything
     // below its root, wider than the narrowing. It reads through `fetch`
     // and the query API, which narrow (`docs/HUB.md` §13.27).
-    if viewer.only.is_some() {
+    if viewer.only.is_some() || caller.is_web() {
         return Ok(BTreeMap::new());
     }
     let person = caller.person.as_ref().map(|p| p.id);
@@ -433,6 +433,13 @@ pub async fn get_object(
     headers: HeaderMap,
     asker: Option<axum::Extension<crate::limits::answers::For>>,
 ) -> Result<Response> {
+    if crate::web::current_is_web() || crate::auth::has_browser_or_web_headers(&headers) {
+        return Err(Error::new(
+            StatusCode::FORBIDDEN,
+            crate::auth::WEB_SESSION,
+            "raw object routes are not available to the web client; open with vl",
+        ));
+    }
     let token = header(&headers, "veil-grant").ok_or_else(grant_invalid)?;
     let id = ObjectId::from_hex(&id).map_err(|_| Error::bad_request("an object id is 64 hex digits"))?;
     let chain = parse_chain(&headers)?;
@@ -480,6 +487,13 @@ pub async fn get_object(
 /// reaches, as object frames; the others are left out, alike whether they
 /// exist or not.
 pub async fn batch(State(hub): State<HubState>, Path(target): Path<String>, body: Bytes) -> Result<Response> {
+    if crate::web::current_is_web() {
+        return Err(Error::new(
+            StatusCode::FORBIDDEN,
+            crate::auth::WEB_SESSION,
+            "raw object routes are not available to the web client; open with vl",
+        ));
+    }
     let Some(p) = target.strip_suffix(":batch") else {
         return Err(Error::not_found("no such route"));
     };

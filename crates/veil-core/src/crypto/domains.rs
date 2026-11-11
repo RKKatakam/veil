@@ -225,6 +225,16 @@ pub const HUB_SHARE_ID: &str = "veil 2026 hub share-id v1";
 /// row, so it never takes one for its person's own session (BUG-1376).
 pub const HUB_AGENT_SESSION: &str = "veil 2026 hub agent-session v1";
 
+/// BLAKE3 `derive_key` context of the hash under which a Veil server keeps
+/// a short-lived web session's token (`docs/HUB.md` §13.39). Kept apart from
+/// ordinary sessions so a server that predates S25 never finds a `web-`
+/// session row or serves secret file bytes to it.
+pub const HUB_WEB_SESSION: &str = "veil 2026 hub web-session v1";
+
+/// BLAKE3 `derive_key` context deriving a web session's CSRF token from its
+/// stored `session_hash` (`docs/HUB.md` §13.39).
+pub const HUB_WEB_CSRF: &str = "veil 2026 hub web-csrf v1";
+
 /// Every BLAKE3 `derive_key` context, for the uniqueness test.
 pub const BLAKE3_CONTEXTS: &[&str] = &[
     LEGACY_SIV_NONCE,
@@ -243,6 +253,8 @@ pub const BLAKE3_CONTEXTS: &[&str] = &[
     HUB_PROJECT_FINGERPRINT,
     HUB_SHARE_ID,
     HUB_AGENT_SESSION,
+    HUB_WEB_SESSION,
+    HUB_WEB_CSRF,
 ];
 
 #[cfg(test)]
@@ -267,7 +279,9 @@ mod tests {
                 "veil 2026 policy rule-scope v1",
                 "veil 2026 hub project-fingerprint v1",
                 "veil 2026 hub share-id v1",
-                "veil 2026 hub agent-session v1"
+                "veil 2026 hub agent-session v1",
+                "veil 2026 hub web-session v1",
+                "veil 2026 hub web-csrf v1"
             ],
             "a context changed or was reordered"
         );

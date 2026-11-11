@@ -56,6 +56,7 @@ pub async fn ci_session(
     caller: Caller,
     Json(req): Json<CiSessionRequest>,
 ) -> Result<Json<AgentSession>> {
+    caller.not_web()?;
     caller.person_only()?;
     if let Some(check) = &req.check {
         validate_check_name(check).map_err(Error::bad_request)?;

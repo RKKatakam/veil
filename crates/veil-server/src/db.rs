@@ -292,6 +292,8 @@ pub struct Retryable;
 pub fn body_limit(path: &str) -> usize {
     if path.ends_with("/objects") {
         2 << 30
+    } else if !path.is_empty() && !path.starts_with("/v1/") {
+        256 << 10
     } else {
         64 << 20
     }

@@ -1048,3 +1048,95 @@ fn merging_eight_heads_with_the_clock_set_back_reads_a_few_operations_per_head()
     }
     eprintln!("eight heads: the merge read {merge_reads}, the log {log_reads}");
 }
+
+#[test]
+fn web_client_portable_helpers_have_no_secret_decryption_and_verify_signatures() {
+    use veil_core::{
+        crypto::{domains, Envelope},
+        hub::{
+            grant::{Grant, GrantBody},
+            pr::review_message,
+            project::empty_tree_id,
+            web::{
+                classify_file_meta, diff_text_bounded, inspect_object_no_secrets, sign_web_login, sign_web_pr_review, verify_grant_token,
+                WebFileState, WebObjectSummary,
+            },
+            wire::login_message,
+        },
+        identity::{verify_signature, SeedSigner},
+        object::{Object, Snapshot},
+    };
+
+    let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clock::set_clock(Arc::new(|| 1_750_000_000_000i64));
+    let alice = Identity::generate("alice");
+
+    // 1. Sealed objects and sealed/non-content metadata are strictly Sealed and never leak markers.
+    let marker = b"PORTABLE_WEB_SECRET_CANARY_99887766";
+    let env = Envelope::seal_deterministic(&[9u8; 32], "team#0102030405060708", marker).unwrap();
+    let raw_sealed = Object::Sealed(env).encode();
+    let summary = inspect_object_no_secrets(&raw_sealed).unwrap();
+    assert_eq!(summary, WebObjectSummary::Sealed);
+    let json = serde_json::to_string(&summary).unwrap();
+    assert!(!json.contains("PORTABLE_WEB_SECRET_CANARY_99887766"));
+    assert_eq!(classify_file_meta(r#"{"sealed":true,"encoding":"object","kind":"file"}"#).unwrap(), WebFileState::Sealed);
+    assert_eq!(classify_file_meta(r#"{"sealed":false,"encoding":"object","kind":"file"}"#).unwrap(), WebFileState::Sealed);
+
+    // 2. Signed snapshots verify, tampered snapshots fail signature_valid.
+    let mut snap = Snapshot::root(empty_tree_id());
+    snap.author = "alice".into();
+    snap.timestamp = 1_750_000_000_000;
+    snap.sign(&alice);
+    let raw_snap = Object::Snapshot(snap.clone()).encode();
+    match inspect_object_no_secrets(&raw_snap).unwrap() {
+        WebObjectSummary::Snapshot { signature_valid, .. } => assert_eq!(signature_valid, Some(true)),
+        other => panic!("expected Snapshot summary, got {other:?}"),
+    }
+    let mut tampered = snap;
+    tampered.author = "mallory".into();
+    let raw_tampered = Object::Snapshot(tampered).encode();
+    match inspect_object_no_secrets(&raw_tampered).unwrap() {
+        WebObjectSummary::Snapshot { signature_valid, .. } => assert_eq!(signature_valid, Some(false)),
+        other => panic!("expected Snapshot summary, got {other:?}"),
+    }
+
+    // 3. Grant verification and bounded diffing.
+    let signer = SeedSigner::from_seed(&[3u8; 32]);
+    let grant = Grant::issue(
+        &signer,
+        &GrantBody {
+            project: "acme".into(),
+            device: Some(alice.verifying_hex()),
+            root: empty_tree_id(),
+            epoch: 1,
+            person_epoch: 2,
+            expires: 2_000_000_000_000,
+        },
+    );
+    assert!(verify_grant_token(&grant, &signer.verifying_hex(), 1_750_000_000_000).is_some());
+    assert!(verify_grant_token(&grant, &signer.verifying_hex(), 2_000_000_000_000).is_none());
+
+    let diff = diff_text_bounded("line 1\nold\n", "line 1\nnew\n", 1024);
+    assert!(!diff.binary && !diff.too_large);
+    assert_eq!(diff.hunks.len(), 1);
+    assert!(diff_text_bounded("a\0b", "a\0c", 1024).binary);
+    assert!(diff_text_bounded("1234567890", "1234567899", 4).too_large);
+
+    // 4. Device-signed login and PR review signatures verify.
+    let chal = "cd".repeat(32);
+    let login = sign_web_login(&alice.to_json(), "hub.local:443", &chal, None).unwrap();
+    assert!(verify_signature(
+        &login.key,
+        domains::SIG_CONTEXT_HUB_LOGIN,
+        &login_message("hub.local:443", &chal),
+        &login.signature
+    ));
+    let rev_sig = sign_web_pr_review(&alice.to_json(), "acme", "pr-11223344", "patch-a", "request-changes").unwrap();
+    assert!(verify_signature(
+        &alice.verifying_hex(),
+        domains::SIG_CONTEXT_HUB_PR_REVIEW,
+        &review_message("acme", "pr-11223344", "patch-a", "request-changes"),
+        &rev_sig
+    ));
+    clock::reset_clock();
+}

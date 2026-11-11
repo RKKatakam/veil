@@ -47,3 +47,4 @@ mod embargo_prs;
 mod bisect;
 mod pack_gc;
 mod phase2_review;
+mod web;

@@ -48,6 +48,7 @@ pub mod shares;
 pub mod store;
 pub mod sync;
 pub mod tls;
+pub mod web;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
