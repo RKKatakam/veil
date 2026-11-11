@@ -2192,6 +2192,14 @@ fn check_changes(
 /// [`veil_core::policy::sealed_secret`] for sealed content labelled
 /// `visibility` at changed path `c`, among `changes` (relative to the first
 /// of real `parents`).
+///
+/// "A parent holds a sealed file at the path" is read as `vl` reads it
+/// (`Transaction::reconcile_sealing`, `Builder::protect_moves`,
+/// `upgrade::sealed_entries`): a parent's conflict there with a sealed
+/// version counts. A conflict entry's own label is always public; its
+/// versions carry theirs, each checked by this rule when the conflict was
+/// accepted. Otherwise the resolution of a conflict in a renamed secret,
+/// recorded as a change of its own, is refused for good (BUG-1930).
 fn sealed_secret_here(src: &Source, c: &Change, changes: &[Change], parents: &[ObjectId], visibility: &Visibility) -> Result<bool> {
     let Visibility::Cloaked { scope } = visibility else { return Ok(false) };
     veil_core::policy::sealed_secret(
@@ -2200,7 +2208,15 @@ fn sealed_secret_here(src: &Source, c: &Change, changes: &[Change], parents: &[O
         false,
         |path| {
             for p in parents {
-                if entry_at(src, &src.snapshot(p)?.tree, path)?.is_some_and(|e| !e.visibility.is_public()) {
+                let Some(e) = entry_at(src, &src.snapshot(p)?.tree, path)? else { continue };
+                let sealed = match e.kind {
+                    EntryKind::Conflict => match Object::decode(&src.raw(&e.id)?)? {
+                        Object::Conflict(cf) => cf.adds.iter().chain(&cf.removes).flatten().any(|t| !t.visibility.is_public()),
+                        _ => false,
+                    },
+                    _ => !e.visibility.is_public(),
+                };
+                if sealed {
                     return Ok(true);
                 }
             }

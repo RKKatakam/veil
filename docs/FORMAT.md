@@ -517,7 +517,9 @@ signed records) and folders. Format 8 removes all of it.
   and an encrypted file or conflict side whose path no built-in secret rule
   names, such as a file under a cloaked folder, unless its lineage shows it
   is a secret: its object was a secret's in an earlier snapshot, a parent
-  held a secret at that path, or a parent's secret of the same access left
+  held a secret at that path (a file, or a version of a conflict there;
+  the server's push check reads it the same way, BUG-1930), or a parent's
+  secret of the same access left
   its path in this snapshot, a renamed secret that format 8 keeps sealed), the view of every retained operation
   (cloaked tags and workspaces, which an undo could bring back) and every
   embargo record (one holding a key). If it finds nothing, the upgrade

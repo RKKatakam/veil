@@ -1,4 +1,6 @@
 target/
+# Scratch work of agents and reviews: never tracked.
+.scratch/
 # Deployment kit: certificates, secrets, state and results of a run are never committed.
 deploy/compose/.tls/
 deploy/compose/.env

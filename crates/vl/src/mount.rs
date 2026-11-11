@@ -60,7 +60,7 @@ use veil_core::{
     builder::{BuildReport, InjectedSecrets, INJECTED_RULE},
     checkout::Materialised,
     object::EntryKind,
-    sandbox::{dir_name, sealed_files_in_tree, workspace_of, Guard, SandboxPaths},
+    sandbox::{dir_name, sealed_files_in_tree, sealed_leaf, workspace_of, Guard, SandboxPaths},
     tree::{diff_trees, lookup},
     vfs::{private_dir, remove_tree, walk_files, DiskBackend, NodeKind, SandboxLock, StorageBackend},
     workspace::{mount_record_op_description, SnapshotOptions},
@@ -653,15 +653,19 @@ impl Recorder {
                 drop.push(p);
                 continue;
             }
-            let own_sealed = lookup(repo.store(), &wc_tree, &p)
-                .ok()
-                .flatten()
-                .filter(|e| !e.visibility.is_public())
-                .map(|_| p.as_str());
-            let hit = self
-                .fs
-                .with_view(|ov| ov.read(&p))
-                .is_ok_and(|data| secrets.find_for(own_sealed, &data).is_some());
+            let recorded = lookup(repo.store(), &wc_tree, &p).ok().flatten();
+            let own_sealed = recorded.as_ref().filter(|e| sealed_leaf(repo.store(), e) != Some(false)).map(|_| p.as_str());
+            let hit = self.fs.with_view(|ov| ov.read(&p)).is_ok_and(|data| {
+                secrets.find_for(own_sealed, &data).is_some() && {
+                    // The builder's rule (BUG-1931): a value the path's
+                    // recorded public version holds is not a copy made in
+                    // the mount. (Read only for a file that holds a value.)
+                    let prior = recorded
+                        .filter(|e| e.kind == veil_core::EntryKind::File && e.visibility.is_public())
+                        .and_then(|e| repo.store().read_entry(&e).ok());
+                    prior.is_none_or(|prior| secrets.find_new(own_sealed, &data, &prior).is_some())
+                }
+            });
             if hit {
                 drop.push(p);
             }

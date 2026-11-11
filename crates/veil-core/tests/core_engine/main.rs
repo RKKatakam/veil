@@ -23,6 +23,7 @@ mod history_tools;
 mod mount_recording;
 mod refused_folder;
 mod rename_merge;
+mod rc_client;
 mod review_core;
 mod sandbox;
 mod split_squash;

@@ -169,3 +169,42 @@ fn needles_are_bounded_for_large_binary_files() {
     assert!(inj.find(&big[at..at + 2 * stride + 64]).is_some());
     assert!(t.elapsed() < std::time::Duration::from_secs(30), "took {:?}", t.elapsed());
 }
+
+/// BUG-1931: `find_new` lets through a value the recorded version of the
+/// same path already held, and nothing else, value by value: another value
+/// of the secret in the same file is still found, and so is everything in
+/// a file whose recorded version held nothing (`find`'s answer).
+#[test]
+fn bug_1931_find_new_lets_through_only_what_the_recorded_version_held() {
+    const URL: &str = "http://localhost:3000/app";
+    const KEY: &str = "Xk29vLq8sPzQw7LmTr4Bn6Yc";
+    const OTHER: &str = "Qm83nRt5wZx1cVb7yHj2kLp9";
+    let env = format!("APP_URL={URL}\nAPI_KEY={KEY}\nOTHER_KEY={OTHER}\n");
+    let inj = InjectedSecrets::from_files([(".env", env.as_bytes())]);
+    let readme = format!("Run at {URL}.\n");
+    let edited = format!("Run at {URL}.\nMore docs.\n");
+    assert!(inj.find(edited.as_bytes()).is_some(), "control: the whole-file search finds the URL");
+    assert!(inj.find_new(None, edited.as_bytes(), readme.as_bytes()).is_none(), "the URL was there before");
+    assert!(inj.find_new(None, edited.as_bytes(), b"").is_some(), "the URL is new to a file that held nothing");
+    assert!(inj.find_new(None, edited.as_bytes(), b"Run it.\n").is_some(), "the URL is new to a file that did not hold it");
+    // Another value of the sealed file is still the command's copy.
+    let f = inj.find_new(None, format!("Run at {URL}.\nkey {KEY}\n").as_bytes(), readme.as_bytes()).expect("the key is new");
+    assert_eq!((f.rule, f.line), (INJECTED_RULE, 2));
+    assert!(inj.find_new(None, env.as_bytes(), readme.as_bytes()).is_some(), "a whole copy of the sealed file");
+    // A file that held one secret value is not free to take another.
+    let leaked = format!("old {KEY}\n");
+    assert!(inj.find_new(None, format!("old {KEY}\nedited\n").as_bytes(), leaked.as_bytes()).is_none());
+    assert!(inj.find_new(None, format!("old {KEY}\nnew {OTHER}\n").as_bytes(), leaked.as_bytes()).is_some());
+
+    // Binary secrets (windows): a part the recorded version held, and
+    // another part.
+    let der = synthetic_der(1);
+    let inj = InjectedSecrets::from_files([("deploy.der", &der[..])]);
+    let mid = der.len() / 2;
+    let (held, fresh) = (hex::encode(&der[mid..mid + 40]), hex::encode(&der[mid + 200..mid + 240]));
+    let before = format!("fingerprint {held}\n");
+    assert!(inj.find(before.as_bytes()).is_some(), "control: a slice of the key is found");
+    assert!(inj.find_new(None, format!("fingerprint {held}\nnote\n").as_bytes(), before.as_bytes()).is_none(), "the slice was there before");
+    assert!(inj.find_new(None, format!("fingerprint {held}\n{fresh}\n").as_bytes(), before.as_bytes()).is_some(), "another slice is new");
+    assert!(inj.find_new(None, &der, before.as_bytes()).is_some(), "the whole key is new");
+}

@@ -319,9 +319,9 @@ impl WindowIndex {
         }
     }
 
-    /// Position and window index of the first window found in `data`,
-    /// ignoring windows that belong to `allow_source`.
-    fn find_for(&self, allow_source: Option<&str>, data: &[u8]) -> Option<(usize, u32)> {
+    /// Every place of `data` where a window may be: `at(position, the
+    /// windows with that hash)`, until it answers.
+    fn each_candidate<T>(&self, data: &[u8], mut at_candidate: impl FnMut(usize, &[u32]) -> Option<T>) -> Option<T> {
         if self.windows.is_empty() || data.len() < WINDOW {
             return None;
         }
@@ -330,18 +330,8 @@ impl WindowIndex {
         loop {
             let (i, bit) = filter_slot(h);
             if self.filter[i] & bit != 0 {
-                if let Some(b) = self.by_hash.get(&h) {
-                    let allowed_here = allow_source.is_some_and(|a| {
-                        b.iter().any(|&w| {
-                            let (ref arr, src, _) = self.windows[w as usize];
-                            arr[..] == data[at..at + WINDOW] && self.sources[src as usize] == a
-                        })
-                    });
-                    if !allowed_here {
-                        if let Some(&w) = b.iter().find(|&&w| self.windows[w as usize].0[..] == data[at..at + WINDOW]) {
-                            return Some((at, w));
-                        }
-                    }
+                if let Some(found) = self.by_hash.get(&h).and_then(|b| at_candidate(at, b)) {
+                    return Some(found);
                 }
             }
             if at + WINDOW >= data.len() {
@@ -354,6 +344,35 @@ impl WindowIndex {
                 .wrapping_add(inp);
             at += 1;
         }
+    }
+
+    /// Position and window index of the first window found in `data`,
+    /// ignoring windows that belong to `allow_source` and windows that
+    /// `prior` holds too.
+    fn find_for(&self, allow_source: Option<&str>, data: &[u8], prior: Option<&[u8]>) -> Option<(usize, u32)> {
+        let mut held: HashSet<&[u8]> = HashSet::new();
+        if let Some(prior) = prior {
+            self.each_candidate(prior, |at, b| -> Option<()> {
+                let here = &prior[at..at + WINDOW];
+                if b.iter().any(|&w| self.windows[w as usize].0[..] == *here) {
+                    held.insert(here);
+                }
+                None
+            });
+        }
+        self.each_candidate(data, |at, b| {
+            let here = &data[at..at + WINDOW];
+            let allowed_here = allow_source.is_some_and(|a| {
+                b.iter().any(|&w| {
+                    let (ref arr, src, _) = self.windows[w as usize];
+                    arr[..] == *here && self.sources[src as usize] == a
+                })
+            });
+            if allowed_here || held.contains(here) {
+                return None;
+            }
+            b.iter().find(|&&w| self.windows[w as usize].0[..] == *here).map(|&w| (at, w))
+        })
     }
 }
 
@@ -510,22 +529,41 @@ impl InjectedSecrets {
     /// `allow_source` (an existing sealed secret file edited in place under
     /// its own scope).
     pub fn find_for(&self, allow_source: Option<&str>, data: &[u8]) -> Option<Finding> {
+        self.find_in(allow_source, data, None)
+    }
+
+    /// Like [`InjectedSecrets::find_for`], for the new content `data` of a
+    /// path whose recorded version, `prior`, is plain in history: a value
+    /// `prior` holds was there before the command ran, so it is not the
+    /// command's copy (BUG-1931: a README that gives the `APP_URL` which
+    /// the sealed `.env` also sets can still be edited). Value by value:
+    /// any other value of a secret, in the same file, is still found.
+    pub fn find_new(&self, allow_source: Option<&str>, data: &[u8], prior: &[u8]) -> Option<Finding> {
+        // Nothing at all (nearly every file): one pass, no per-value search.
+        self.find_in(allow_source, data, None)?;
+        self.find_in(allow_source, data, Some(prior))
+    }
+
+    fn find_in(&self, allow_source: Option<&str>, data: &[u8], prior: Option<&[u8]>) -> Option<Finding> {
         let found = |start: usize, excerpt: String| Finding {
             rule: INJECTED_RULE,
             line: data[..start].iter().filter(|&&b| b == b'\n').count() + 1,
             excerpt,
         };
-        let excluded = |srcs: &[String]| allow_source.is_some_and(|a| srcs.iter().any(|s| s == a));
-        let text = match (&self.matcher, allow_source) {
-            (Some(re), None) => re
+        let excluded = |n: &(Vec<u8>, Vec<String>)| {
+            allow_source.is_some_and(|a| n.1.iter().any(|s| s == a)) || prior.is_some_and(|p| memchr::memmem::find(p, &n.0).is_some())
+        };
+        let text = match (&self.matcher, allow_source, prior) {
+            (Some(re), None, None) => re
                 .find(data)
                 .and_then(|m| Some((m.start(), self.needles.iter().find(|(n, _)| n == m.as_bytes())?))),
             // Pattern too large for the regex engine, or filtering out one
-            // sealed file's own needles: plain substring search.
+            // sealed file's own needles or the values the recorded version
+            // held: plain substring search.
             _ => self
                 .needles
                 .iter()
-                .filter(|(_, srcs)| !excluded(srcs))
+                .filter(|n| !excluded(n))
                 .find_map(|n| memchr::memmem::find(data, &n.0).map(|i| (i, n))),
         };
         if let Some((start, (_, srcs))) = text {
@@ -534,12 +572,12 @@ impl InjectedSecrets {
         if let Some((start, (_, srcs))) = self
             .raw
             .iter()
-            .filter(|(_, srcs)| !excluded(srcs))
+            .filter(|n| !excluded(n))
             .find_map(|n| memchr::memmem::find(data, &n.0).map(|i| (i, n)))
         {
             return Some(found(start, format!("content of {} injected into the sandbox", srcs[0])));
         }
-        let (start, w) = self.windows.find_for(allow_source, data)?;
+        let (start, w) = self.windows.find_for(allow_source, data, prior)?;
         let (_, src, enc) = &self.windows.windows[w as usize];
         let how = match enc {
             Encoding::Raw => "part of the content",
@@ -973,6 +1011,10 @@ struct Builder<'a> {
     /// What was learnt of the leaf about to be built as its directory was
     /// listed (used instead of asking again, for that path only).
     listed: Option<Listed>,
+    /// For the resolution about to be built of a conflict whose rendering
+    /// is public: that rendering, the path's recorded version for the
+    /// injected-secret guard (BUG-1931).
+    conflict_copy: Option<Vec<u8>>,
     /// When set, the daemon's file watcher vouches that only these
     /// directories changed since `parent_tree`.
     watch: Option<&'a WatchPlan>,
@@ -1102,6 +1144,7 @@ pub fn build_tree_watched(
         attrs: None,
         eol_now: None,
         listed: None,
+        conflict_copy: None,
         watch,
         #[cfg(feature = "os")]
         prefetch: prefetch.as_ref().map(|(p, _)| p),
@@ -2150,6 +2193,9 @@ impl<'a> Builder<'a> {
         });
         let held = |r: &BuildReport| (r.cloak_failures.len(), r.quarantined.len(), r.unreadable.len());
         let before = held(&self.report);
+        // A public rendering is in history as it is (no side it shows is
+        // sealed): what it held, the resolution may keep (BUG-1931).
+        self.conflict_copy = (self.opts.injected.is_some() && m.visibility.is_public()).then(|| m.content.clone());
         let resolved = self.plain_file_entry(path, name, pseudo.as_ref(), EntryKind::File)?;
         if held(&self.report) != before {
             // The edit was held back: the conflict stays recorded.
@@ -2209,6 +2255,7 @@ impl<'a> Builder<'a> {
     /// the reverse) is a new leaf, its old version kept in history.
     fn plain_file_entry(&mut self, path: &VPath, name: &str, parent_entry: Option<&TreeEntry>, kind: EntryKind) -> Result<Option<TreeEntry>> {
         self.eol_now = None;
+        let conflict_copy = self.conflict_copy.take();
         let parent_file = parent_entry.filter(|e| e.kind == kind);
         let (listed, listed_class) = match self.listed.take().filter(|l| l.path == *path) {
             Some(l) => (l.meta, l.class),
@@ -2408,7 +2455,25 @@ impl<'a> Builder<'a> {
             if !unchanged {
                 let own_sealed = (!desired.is_public() && parent_file.is_some_and(|pe| pe.visibility == desired)).then_some(path.as_str());
                 if let Some(f) = inj.find_for(own_sealed, &data) {
-                    return self.quarantine(path, vec![f], parent_file);
+                    // A value this path's recorded version already held, in
+                    // plain text, predates the run as well: the command did
+                    // not copy it here (BUG-1931). Only a public version
+                    // counts (its sealing verified above, or a conflict's
+                    // public rendering), and only for the values it holds:
+                    // any other value is the command's copy, as in a new
+                    // file.
+                    let prior = match (conflict_copy, parent_file) {
+                        (Some(copy), _) => Some(copy),
+                        (None, Some(pe)) if pe.visibility.is_public() => self.store.read_entry(pe).ok(),
+                        _ => None,
+                    };
+                    let f = match prior {
+                        Some(prior) => inj.find_new(own_sealed, &data, &prior),
+                        None => Some(f),
+                    };
+                    if let Some(f) = f {
+                        return self.quarantine(path, vec![f], parent_file);
+                    }
                 }
             }
         }

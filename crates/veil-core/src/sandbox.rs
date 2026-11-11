@@ -872,17 +872,15 @@ fn clean_one(
         out.restored.push(p.clone());
         return Ok(());
     }
-    if let Some(e) = now.filter(|e| e.kind == EntryKind::File) {
-        if let Ok(data) = store.read_entry(&e) {
-            if e.visibility.is_public() {
-                fs.write(p, &data)?;
-                fs.set_executable(p, e.executable)?;
-            } else {
-                fs.write_secret(p, &data, e.executable)?;
-            }
-            out.restored.push(p.clone());
-            return Ok(());
+    if let Some((data, executable, secret)) = now.and_then(|e| as_checked_out(store, &e)) {
+        if secret {
+            fs.write_secret(p, &data, executable)?;
+        } else {
+            fs.write(p, &data)?;
+            fs.set_executable(p, executable)?;
         }
+        out.restored.push(p.clone());
+        return Ok(());
     }
     if current.is_some() {
         fs.remove_file(p)?;
@@ -899,6 +897,23 @@ fn clean_one(
         }
     }
     Ok(())
+}
+
+/// The recorded file or conflict `e` as checkout writes it into a sandbox:
+/// its content (a conflict's rendering, markers and all), whether it is
+/// executable, and whether it is a secret's (owner-only). A conflicted
+/// file is put back as its conflict, never removed (BUG-1932: the guard
+/// holds a conflicted secret's versions, so the scrub meets its copy).
+/// `None` for anything else, or what this reader cannot read.
+fn as_checked_out(store: &ObjectStore, e: &TreeEntry) -> Option<(Vec<u8>, bool, bool)> {
+    match e.kind {
+        EntryKind::File => Some((store.read_entry(e).ok()?, e.executable, !e.visibility.is_public())),
+        EntryKind::Conflict if !store.conflict(&e.id).ok()?.has_special_terms() => {
+            let i = crate::conflict::inspect_entry(store, e, crate::conflict::Audience::Reader).ok()?;
+            Some((crate::conflict::read_file_like(store, e).ok()?, i.executable, !i.visibility.is_public()))
+        }
+        _ => None,
+    }
 }
 
 // ---- the injected-secret guard -------------------------------------------------
@@ -954,11 +969,33 @@ impl Guard {
     }
 }
 
+/// Is the leaf `e` sealed: a file whose label is not public, or a conflict
+/// with a sealed version? A conflict entry's own label is always public (it
+/// "carries nothing but its name and object id"): its terms say what its
+/// versions are sealed for (BUG-1932). `None`: a conflict that `store` does
+/// not hold, so nothing says.
+pub fn sealed_leaf(store: &ObjectStore, e: &TreeEntry) -> Option<bool> {
+    match e.kind {
+        EntryKind::Conflict => {
+            let c = store.conflict(&e.id).ok()?;
+            Some(c.adds.iter().chain(&c.removes).flatten().any(|t| !t.visibility.is_public()))
+        }
+        _ => Some(!e.visibility.is_public()),
+    }
+}
+
 /// Every sealed (`Cloaked`) file in `root` that `store` holds locally and can
 /// decrypt (falling back to `fallback_fs` when given, for an unchanged file
 /// already checked out into a sandbox whose thin-clone cache evicted the
 /// blob). Never fetches from the server: in a thin clone over a mount, an
 /// unfetched subtree or blob was never read by the command.
+///
+/// A conflict with a sealed version (BUG-1932) gives what the sandbox holds
+/// there, the rendering with every shown version between markers, and each
+/// readable version whole (the plain ones too: the file they are versions
+/// of is a secret), all under the conflict's path, so the path's own
+/// resolution may keep them and no other file may. A conflict the store
+/// does not hold cannot be judged: the sandbox's copy is taken.
 pub fn sealed_files_in_tree(
     store: &ObjectStore,
     root: &ObjectId,
@@ -981,7 +1018,7 @@ pub fn sealed_files_in_tree(
                         stack.push((p, child, 0));
                     }
                 }
-                EntryKind::File | EntryKind::Conflict if !e.visibility.is_public() => {
+                EntryKind::File | EntryKind::Conflict if sealed_leaf(store, &e) != Some(false) => {
                     let data = crate::conflict::read_file_like(store, &e).ok().or_else(|| {
                         let fs = fallback_fs?;
                         if behind_special(fs, &p).unwrap_or(true) {
@@ -991,6 +1028,13 @@ pub fn sealed_files_in_tree(
                     });
                     if let Some(d) = data {
                         out.push((p.as_str().to_string(), d));
+                    }
+                    if let (EntryKind::Conflict, Ok(c)) = (e.kind, store.conflict(&e.id)) {
+                        for t in c.adds.iter().chain(&c.removes).flatten() {
+                            if let Ok(d) = store.read_entry(&t.entry(&e.name)) {
+                                out.push((p.as_str().to_string(), d));
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -1019,7 +1063,7 @@ pub fn sealed_paths_in_tree(store: &ObjectStore, root: &ObjectId) -> Vec<VPath> 
                         stack.push((p, child, 0));
                     }
                 }
-                EntryKind::File | EntryKind::Conflict if !e.visibility.is_public() => {
+                EntryKind::File | EntryKind::Conflict if sealed_leaf(store, &e) != Some(false) => {
                     out.push(p);
                 }
                 _ => {}
@@ -1154,8 +1198,9 @@ pub fn scrub(fs: &SandboxFs, since: i64, secrets: &InjectedSecrets, cache: &Stat
 /// Take the files [`scrub`] found out of the sandbox: a file `recorded`
 /// (the tree the sandbox was just recorded as) has gets its recorded
 /// version back, any other is removed. A file whose recorded version is
-/// this very content, or holds an injected value itself, is left (history
-/// has it already).
+/// this very content, or is public and holds every injected value the file
+/// does, is left (history has them already, at that path: the builder's
+/// rule, BUG-1931).
 pub fn clean_copies(
     store: &ObjectStore,
     fs: &SandboxFs,
@@ -1179,22 +1224,18 @@ pub fn clean_copies(
                     Err(e) if e.is_unreadable() => None,
                     Err(e) => return Err(e),
                 };
-                if let Some(e) = entry.filter(|e| e.kind == EntryKind::File) {
-                    if let Ok(data) = store.read_entry(&e) {
-                        if fs.read(vp).is_ok_and(|have| have == data)
-                            || (e.visibility.is_public() && secrets.find(&data).is_some())
-                        {
-                            return Ok(());
-                        }
-                        if e.visibility.is_public() {
-                            fs.write(vp, &data)?;
-                            fs.set_executable(vp, e.executable)?;
-                        } else {
-                            fs.write_secret(vp, &data, e.executable)?;
-                        }
-                        out.restored.push(vp.clone());
+                if let Some((data, executable, secret)) = entry.and_then(|e| as_checked_out(store, &e)) {
+                    if fs.read(vp).is_ok_and(|have| have == data || (!secret && secrets.find_new(None, &have, &data).is_none())) {
                         return Ok(());
                     }
+                    if secret {
+                        fs.write_secret(vp, &data, executable)?;
+                    } else {
+                        fs.write(vp, &data)?;
+                        fs.set_executable(vp, executable)?;
+                    }
+                    out.restored.push(vp.clone());
+                    return Ok(());
                 }
                 fs.remove_file(vp)?;
                 out.removed.push(vp.clone());

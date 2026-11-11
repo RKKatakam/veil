@@ -57,3 +57,4 @@ mod web_secrets;
 mod rv_s26;
 mod browser;
 mod rc_server;
+mod rc_client;
