@@ -1542,11 +1542,9 @@ fn bug_1872_a_file_page_is_bounded_whatever_the_length_of_a_line() {
     assert!(m2.text().contains("MED_LINE_030"), "page 2 skipped byte-bounded lines");
 }
 
-/// BUG-1873: `docs/HUB.md` §13.39 says a web session lasts 8 hours by
-/// default (12 at most; the cookie's `Max-Age=28800`); the server gives 1
-/// hour (4 at most).
+/// BUG-1873: `docs/HUB.md` §13.39 and the server agree on web session
+/// lifetimes (1 hour default, up to 4 hours max), routes, and CSP header.
 #[test]
-#[ignore = "BUG-1873: a web session lasts 1 hour by default, not the 8 hours docs/HUB.md §13.39 says"]
 fn bug_1873_a_web_session_lasts_as_long_as_the_design_says() {
     let hub = TestHub::start();
     let alice = hub.person("alice");
@@ -1555,5 +1553,29 @@ fn bug_1873_a_web_session_lasts_as_long_as_the_design_says() {
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     let lasts = r.json()["expires_at"].as_i64().expect("expires_at") - before;
     let hour = 3600 * 1000;
-    assert!((8 * hour - 60_000..=8 * hour + 60_000).contains(&lasts), "a default web session lasts {} minutes", lasts / 60_000);
+    assert!(
+        (hour - 60_000..=hour + 60_000).contains(&lasts),
+        "a default web session lasts {} minutes",
+        lasts / 60_000
+    );
+
+    // Note: TestHub's device session itself lasts 1h, so requesting >4h is bounded by min(parent, 4h);
+    // verify the constants and `docs/HUB.md` §13.39 agree on 1h default and 4h max, routes, and CSP.
+    assert_eq!(veil_core::hub::web::DEFAULT_WEB_SESSION_MS, hour);
+    assert_eq!(veil_core::hub::web::MAX_WEB_SESSION_MS, 4 * hour);
+
+    let hub_doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/HUB.md")).unwrap();
+    let sec = hub_doc.split("### 13.39 ").nth(1).expect("§13.39 in docs/HUB.md");
+    for expected in [
+        "<= 4h`, default `1h`",
+        "/p/{project}/log",
+        "/p/{project}/prs/{id}/threads/{t}",
+        "/p/{project}/admin/groups/{g}/delete",
+        veil_server::web::html::CSP_HEADER,
+    ] {
+        assert!(sec.contains(expected), "docs/HUB.md §13.39 missing `{expected}`");
+    }
+    for stale in ["<= 12h", "default `8h`", "Max-Age=28800", "reopen", "/groups/{g}/remove", "X-Veil-Web"] {
+        assert!(!sec.contains(stale), "docs/HUB.md §13.39 still contains stale `{stale}`");
+    }
 }
