@@ -125,7 +125,7 @@ fn escape_name(name: &std::ffi::OsStr) -> String {
 impl DiskBackend {
     /// [`StorageBackend::write_unsynced`] below `.veil/`; with `names`, the
     /// next barrier also syncs the directories the name was created in.
-    fn write_own_unsynced(&self, path: &VPath, data: &[u8], names: bool) -> Result<()> {
+    fn write_own_unsynced(&self, path: &VPath, data: &[u8], secret: Option<bool>, names: bool) -> Result<()> {
         self.refuse_symlinked_parent(path)?;
         let full = self.full_path(path);
         let parent = full.parent().expect("non-root path has a parent");
@@ -139,14 +139,12 @@ impl DiskBackend {
         }
         let tmp = temp_path(parent, path);
         let res = (|| {
-            fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?
-                .write_all(data)?;
+            create_new_file(&tmp, secret)?.write_all(data)?;
             #[cfg(unix)]
-            if let Ok(old) = fs::metadata(&full) {
-                fs::set_permissions(&tmp, old.permissions())?;
+            if secret.is_none() {
+                if let Ok(old) = fs::metadata(&full) {
+                    fs::set_permissions(&tmp, old.permissions())?;
+                }
             }
             fs::rename(&tmp, &full)
         })();
@@ -276,13 +274,13 @@ impl DiskBackend {
     /// directory too, when `durable`). The parent directories created on
     /// the way are returned.
     #[cfg(unix)]
-    fn write_beneath(&self, path: &VPath, data: &[u8], durable: bool) -> Result<Vec<PathBuf>> {
+    fn write_beneath(&self, path: &VPath, data: &[u8], secret: Option<bool>, durable: bool) -> Result<Vec<PathBuf>> {
         let mut created = Vec::new();
         let dir = super::beneath::open_parent(&self.root, path, true, durable, &mut created).map_err(|e| self.write_walk_err(path, e))?;
         let name = path.file_name();
         let tmp = temp_name(path);
         let full = self.full_path(path);
-        let res = super::beneath::write_temp(&dir, &tmp, name, data, durable)
+        let res = super::beneath::write_temp(&dir, &tmp, name, data, secret, durable)
             .and_then(|()| dir.rename(&tmp, name))
             .and_then(|()| if durable { dir.sync() } else { Ok(()) });
         if let Err(e) = res {
@@ -290,6 +288,142 @@ impl DiskBackend {
             return Err(io_err(&full, e));
         }
         Ok(created)
+    }
+
+    fn write_file(&self, path: &VPath, data: &[u8], secret: Option<bool>) -> Result<()> {
+        if path.is_root() {
+            return Err(VeilError::InvalidPath("cannot write to the root".into()));
+        }
+        #[cfg(unix)]
+        if !Self::own_path(path) {
+            return self.write_beneath(path, data, secret, true).map(drop);
+        }
+        self.refuse_symlinked_parent(path)?;
+        let full = self.full_path(path);
+        let parent = full.parent().expect("non-root path has a parent");
+        create_dir_all_durable(parent).map_err(|e| io_err(parent, e))?;
+        let tmp = temp_path(parent, path);
+        let res = (|| {
+            write_synced(&tmp, data, secret)?;
+            #[cfg(unix)]
+            if secret.is_none() {
+                if let Ok(old) = fs::metadata(&full) {
+                    fs::set_permissions(&tmp, old.permissions())?;
+                }
+            }
+            fs::rename(&tmp, &full)?;
+            // The rename is only durable once the directory entry is.
+            sync_dir(parent)
+        })();
+        if let Err(e) = res {
+            let _ = fs::remove_file(&tmp);
+            return Err(io_err(&full, e));
+        }
+        Ok(())
+    }
+
+    fn write_file_unsynced(&self, path: &VPath, data: &[u8], secret: Option<bool>) -> Result<()> {
+        if path.is_root() {
+            return Err(VeilError::InvalidPath("cannot write to the root".into()));
+        }
+        #[cfg(unix)]
+        if !Self::own_path(path) {
+            let created = self.write_beneath(path, data, secret, false)?;
+            let full = self.full_path(path);
+            let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
+            u.dirs.extend(created.iter().filter_map(|d| d.parent().map(Path::to_path_buf)));
+            u.dirs.insert(full.parent().expect("non-root path has a parent").to_path_buf());
+            u.files.push(full);
+            return Ok(());
+        }
+        self.write_own_unsynced(path, data, secret, true)
+    }
+
+    #[cfg(unix)]
+    fn write_file_staged(&self, path: &VPath, data: &[u8], secret: Option<bool>) -> Result<VPath> {
+        if path.is_root() || Self::own_path(path) {
+            self.write_file_unsynced(path, data, secret)?;
+            return Ok(path.clone());
+        }
+        let full = self.full_path(path);
+        let mut created = Vec::new();
+        let dir = super::beneath::open_parent(&self.root, path, true, false, &mut created).map_err(|e| self.write_walk_err(path, e))?;
+        let parent = full.parent().expect("non-root path has a parent").to_path_buf();
+        {
+            let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
+            u.dirs.extend(created.iter().filter_map(|d| d.parent().map(Path::to_path_buf)));
+        }
+        let tmp = temp_name(path);
+        if let Err(e) = super::beneath::write_temp(&dir, &tmp, path.file_name(), data, secret, false) {
+            let _ = dir.unlink(&tmp, false);
+            return Err(io_err(&full, e));
+        }
+        // Only the content: the temp's name never has to be durable (the
+        // rename's directory is synced by the barrier after it).
+        self.unsynced.lock().unwrap_or_else(|e| e.into_inner()).files.push(parent.join(&tmp));
+        Ok(path.parent().expect("non-root path has a parent").join(&tmp))
+    }
+
+    fn create_new_file_at(&self, path: &VPath, data: &[u8], secret: Option<bool>) -> Result<bool> {
+        if path.is_root() {
+            return Err(VeilError::InvalidPath("cannot write to the root".into()));
+        }
+        #[cfg(unix)]
+        if !Self::own_path(path) {
+            let full = self.full_path(path);
+            let dir = super::beneath::open_parent(&self.root, path, true, true, &mut Vec::new()).map_err(|e| self.write_walk_err(path, e))?;
+            let (name, tmp) = (path.file_name(), temp_name(path));
+            if let Err(e) = super::beneath::write_temp(&dir, &tmp, &tmp, data, secret, true) {
+                let _ = dir.unlink(&tmp, false);
+                return Err(io_err(&full, e));
+            }
+            let linked = dir.hard_link(&tmp, name);
+            let _ = dir.unlink(&tmp, false);
+            return match linked {
+                Ok(()) => dir.sync().map(|()| true).map_err(|e| io_err(&full, e)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+                // No hard links here: `O_EXCL` (a crash can leave a short
+                // file, which the lock treats as garbage).
+                Err(_) => {
+                    let create_mode = match secret {
+                        Some(exec) => super::secret_file_mode(exec) as libc::mode_t,
+                        None => 0o666,
+                    };
+                    let mut f = match dir.open_file(name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, create_mode) {
+                        Ok(f) => f,
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+                        Err(e) => return Err(io_err(&full, e)),
+                    };
+                    if let Err(e) = f.write_all(data).and_then(|_| full_sync(&f)) {
+                        drop(f);
+                        let _ = dir.unlink(name, false);
+                        return Err(io_err(&full, e));
+                    }
+                    dir.sync().map(|()| true).map_err(|e| io_err(&full, e))
+                }
+            };
+        }
+        self.refuse_symlinked_parent(path)?;
+        let full = self.full_path(path);
+        let parent = full.parent().expect("non-root path has a parent");
+        create_dir_all_durable(parent).map_err(|e| io_err(parent, e))?;
+        let tmp = temp_path(parent, path);
+        if let Err(e) = write_synced(&tmp, data, secret) {
+            let _ = fs::remove_file(&tmp);
+            return Err(io_err(&full, e));
+        }
+        let linked = fs::hard_link(&tmp, &full);
+        let _ = fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => {
+                sync_dir(parent).map_err(|e| io_err(&full, e))?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            // Filesystems without hard links: fall back to O_EXCL. A crash
+            // here can leave a short file, which the lock treats as garbage.
+            Err(_) => create_exclusive(&full, data, secret).map_err(|e| io_err(&full, e)),
+        }
     }
 }
 
@@ -381,9 +515,22 @@ impl Drop for DiskStream {
     }
 }
 
+fn create_new_file(path: &Path, secret: Option<bool>) -> io::Result<fs::File> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    if let Some(exec) = secret {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(super::secret_file_mode(exec));
+    }
+    #[cfg(not(unix))]
+    let _ = secret;
+    opts.open(path)
+}
+
 /// Create `path` with `data`, flushed to stable storage.
-fn write_synced(path: &Path, data: &[u8]) -> io::Result<()> {
-    let mut f = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+fn write_synced(path: &Path, data: &[u8], secret: Option<bool>) -> io::Result<()> {
+    let mut f = create_new_file(path, secret)?;
     f.write_all(data)?;
     full_sync(&f)
 }
@@ -511,8 +658,8 @@ fn device_of(dir: &Path) -> Option<u64> {
     }
 }
 
-fn create_exclusive(full: &Path, data: &[u8]) -> io::Result<bool> {
-    let mut f = match fs::OpenOptions::new().write(true).create_new(true).open(full) {
+fn create_exclusive(full: &Path, data: &[u8], secret: Option<bool>) -> io::Result<bool> {
+    let mut f = match create_new_file(full, secret) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
         Err(e) => return Err(e),
@@ -862,57 +1009,26 @@ impl StorageBackend for DiskBackend {
     }
 
     fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
-        if path.is_root() {
-            return Err(VeilError::InvalidPath("cannot write to the root".into()));
-        }
-        #[cfg(unix)]
-        if !Self::own_path(path) {
-            return self.write_beneath(path, data, true).map(drop);
-        }
-        self.refuse_symlinked_parent(path)?;
-        let full = self.full_path(path);
-        let parent = full.parent().expect("non-root path has a parent");
-        create_dir_all_durable(parent).map_err(|e| io_err(parent, e))?;
-        let tmp = temp_path(parent, path);
-        let res = (|| {
-            write_synced(&tmp, data)?;
-            #[cfg(unix)]
-            if let Ok(old) = fs::metadata(&full) {
-                fs::set_permissions(&tmp, old.permissions())?;
-            }
-            fs::rename(&tmp, &full)?;
-            // The rename is only durable once the directory entry is.
-            sync_dir(parent)
-        })();
-        if let Err(e) = res {
-            let _ = fs::remove_file(&tmp);
-            return Err(io_err(&full, e));
-        }
-        Ok(())
+        self.write_file(path, data, None)
+    }
+
+    fn write_secret(&self, path: &VPath, data: &[u8], executable: bool) -> Result<()> {
+        self.write_file(path, data, Some(executable))
     }
 
     fn write_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
-        if path.is_root() {
-            return Err(VeilError::InvalidPath("cannot write to the root".into()));
-        }
-        #[cfg(unix)]
-        if !Self::own_path(path) {
-            let created = self.write_beneath(path, data, false)?;
-            let full = self.full_path(path);
-            let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
-            u.dirs.extend(created.iter().filter_map(|d| d.parent().map(Path::to_path_buf)));
-            u.dirs.insert(full.parent().expect("non-root path has a parent").to_path_buf());
-            u.files.push(full);
-            return Ok(());
-        }
-        self.write_own_unsynced(path, data, true)
+        self.write_file_unsynced(path, data, None)
+    }
+
+    fn write_secret_unsynced(&self, path: &VPath, data: &[u8], executable: bool) -> Result<()> {
+        self.write_file_unsynced(path, data, Some(executable))
     }
 
     /// Below `.veil/` only, the staging directory's files: their names
     /// are never synced (see [`StorageBackend::stage_unsynced`]).
     fn stage_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
         match Self::own_path(path) && !path.is_root() {
-            true => self.write_own_unsynced(path, data, false),
+            true => self.write_own_unsynced(path, data, None, false),
             false => self.write_unsynced(path, data),
         }
     }
@@ -929,27 +1045,12 @@ impl StorageBackend for DiskBackend {
     /// moves it into place. `.veil/` keeps the default.
     #[cfg(unix)]
     fn write_staged(&self, path: &VPath, data: &[u8]) -> Result<VPath> {
-        if path.is_root() || Self::own_path(path) {
-            self.write_unsynced(path, data)?;
-            return Ok(path.clone());
-        }
-        let full = self.full_path(path);
-        let mut created = Vec::new();
-        let dir = super::beneath::open_parent(&self.root, path, true, false, &mut created).map_err(|e| self.write_walk_err(path, e))?;
-        let parent = full.parent().expect("non-root path has a parent").to_path_buf();
-        {
-            let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
-            u.dirs.extend(created.iter().filter_map(|d| d.parent().map(Path::to_path_buf)));
-        }
-        let tmp = temp_name(path);
-        if let Err(e) = super::beneath::write_temp(&dir, &tmp, path.file_name(), data, false) {
-            let _ = dir.unlink(&tmp, false);
-            return Err(io_err(&full, e));
-        }
-        // Only the content: the temp's name never has to be durable (the
-        // rename's directory is synced by the barrier after it).
-        self.unsynced.lock().unwrap_or_else(|e| e.into_inner()).files.push(parent.join(&tmp));
-        Ok(path.parent().expect("non-root path has a parent").join(&tmp))
+        self.write_file_staged(path, data, None)
+    }
+
+    #[cfg(unix)]
+    fn write_secret_staged(&self, path: &VPath, data: &[u8], executable: bool) -> Result<VPath> {
+        self.write_file_staged(path, data, Some(executable))
     }
 
     fn rename_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
@@ -1097,61 +1198,11 @@ impl StorageBackend for DiskBackend {
     /// hard-linked into place (`link` fails if the target exists). Readers,
     /// such as lock contenders, therefore always see the complete content.
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
-        if path.is_root() {
-            return Err(VeilError::InvalidPath("cannot write to the root".into()));
-        }
-        #[cfg(unix)]
-        if !Self::own_path(path) {
-            let full = self.full_path(path);
-            let dir = super::beneath::open_parent(&self.root, path, true, true, &mut Vec::new()).map_err(|e| self.write_walk_err(path, e))?;
-            let (name, tmp) = (path.file_name(), temp_name(path));
-            if let Err(e) = super::beneath::write_temp(&dir, &tmp, &tmp, data, true) {
-                let _ = dir.unlink(&tmp, false);
-                return Err(io_err(&full, e));
-            }
-            let linked = dir.hard_link(&tmp, name);
-            let _ = dir.unlink(&tmp, false);
-            return match linked {
-                Ok(()) => dir.sync().map(|()| true).map_err(|e| io_err(&full, e)),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-                // No hard links here: `O_EXCL` (a crash can leave a short
-                // file, which the lock treats as garbage).
-                Err(_) => {
-                    let mut f = match dir.open_file(name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o666) {
-                        Ok(f) => f,
-                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
-                        Err(e) => return Err(io_err(&full, e)),
-                    };
-                    if let Err(e) = f.write_all(data).and_then(|_| full_sync(&f)) {
-                        drop(f);
-                        let _ = dir.unlink(name, false);
-                        return Err(io_err(&full, e));
-                    }
-                    dir.sync().map(|()| true).map_err(|e| io_err(&full, e))
-                }
-            };
-        }
-        self.refuse_symlinked_parent(path)?;
-        let full = self.full_path(path);
-        let parent = full.parent().expect("non-root path has a parent");
-        create_dir_all_durable(parent).map_err(|e| io_err(parent, e))?;
-        let tmp = temp_path(parent, path);
-        if let Err(e) = write_synced(&tmp, data) {
-            let _ = fs::remove_file(&tmp);
-            return Err(io_err(&full, e));
-        }
-        let linked = fs::hard_link(&tmp, &full);
-        let _ = fs::remove_file(&tmp);
-        match linked {
-            Ok(()) => {
-                sync_dir(parent).map_err(|e| io_err(&full, e))?;
-                Ok(true)
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-            // Filesystems without hard links: fall back to O_EXCL. A crash
-            // here can leave a short file, which the lock treats as garbage.
-            Err(_) => create_exclusive(&full, data).map_err(|e| io_err(&full, e)),
-        }
+        self.create_new_file_at(path, data, None)
+    }
+
+    fn create_new_secret(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        self.create_new_file_at(path, data, Some(false))
     }
 
     /// Inside `.veil/` only (the history index); elsewhere it is

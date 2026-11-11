@@ -723,7 +723,7 @@ pub fn write_injection(fs: &SandboxFs, inj: &mut Injection, files: &[(String, Ve
     let planned = std::mem::take(&mut inj.paths);
     for vp in planned {
         let Some((p, data)) = files.iter().find(|(p, _)| VPath::new(p).is_ok_and(|q| q == vp)) else { continue };
-        match fs.write(&vp, data) {
+        match fs.write_secret(&vp, data, false) {
             Ok(()) => inj.paths.push(vp),
             Err(e) => {
                 // Put back what was there, if the write got that far.
@@ -874,8 +874,12 @@ fn clean_one(
     }
     if let Some(e) = now.filter(|e| e.kind == EntryKind::File) {
         if let Ok(data) = store.read_entry(&e) {
-            fs.write(p, &data)?;
-            fs.set_executable(p, e.executable)?;
+            if e.visibility.is_public() {
+                fs.write(p, &data)?;
+                fs.set_executable(p, e.executable)?;
+            } else {
+                fs.write_secret(p, &data, e.executable)?;
+            }
             out.restored.push(p.clone());
             return Ok(());
         }
@@ -1182,8 +1186,12 @@ pub fn clean_copies(
                         {
                             return Ok(());
                         }
-                        fs.write(vp, &data)?;
-                        fs.set_executable(vp, e.executable)?;
+                        if e.visibility.is_public() {
+                            fs.write(vp, &data)?;
+                            fs.set_executable(vp, e.executable)?;
+                        } else {
+                            fs.write_secret(vp, &data, e.executable)?;
+                        }
                         out.restored.push(vp.clone());
                         return Ok(());
                     }
@@ -1362,9 +1370,19 @@ impl StorageBackend for PolicyPin<'_> {
         self.inner.write(path, data)
     }
 
+    fn write_secret(&self, path: &VPath, data: &[u8], executable: bool) -> Result<()> {
+        self.refuse(path)?;
+        self.inner.write_secret(path, data, executable)
+    }
+
     fn write_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
         self.refuse(path)?;
         self.inner.write_unsynced(path, data)
+    }
+
+    fn write_secret_unsynced(&self, path: &VPath, data: &[u8], executable: bool) -> Result<()> {
+        self.refuse(path)?;
+        self.inner.write_secret_unsynced(path, data, executable)
     }
 
     fn sync_barrier(&self) -> Result<()> {
@@ -1374,6 +1392,11 @@ impl StorageBackend for PolicyPin<'_> {
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
         self.refuse(path)?;
         self.inner.create_new(path, data)
+    }
+
+    fn create_new_secret(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        self.refuse(path)?;
+        self.inner.create_new_secret(path, data)
     }
 
     fn remove_file(&self, path: &VPath) -> Result<()> {

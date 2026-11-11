@@ -1331,7 +1331,7 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>, confine: Option<&Confine>) -> Res
         if a.with_isolated {
             let files = vault_files(&ctx.repo)?;
             for (p, data) in &files {
-                sandbox.write(&VPath::new(p)?, data)?;
+                sandbox.write_secret(&VPath::new(p)?, data, false)?;
             }
             guard_files.extend(files);
         }

@@ -1281,24 +1281,27 @@ fn stage_one(store: &ObjectStore, fs: &dyn StorageBackend, j: &Job<'_>) -> Stagi
     if j.local_edit && fs.read(&c.path).map_or(true, |d| d != data) {
         return Staging1::KeptLocal;
     }
-    let executable = match new.kind {
+    let (executable, secret) = match new.kind {
         EntryKind::Conflict => match crate::conflict::inspect_entry(store, new, crate::conflict::Audience::Reader) {
-            Ok(i) => i.executable,
+            Ok(i) => (i.executable, !i.visibility.is_public()),
             Err(e) => return Staging1::Fatal(e),
         },
-        _ => new.executable,
+        _ => (new.executable, !new.visibility.is_public()),
     };
     // The mode is set on the staged copy, so the barrier makes it durable
-    // with the content.
-    let staged = fs.write_staged(&c.path, &data).and_then(|at| match fs.set_executable(&at, executable) {
-        Ok(()) => Ok(at),
-        Err(e) => {
-            if at != c.path {
-                let _ = fs.remove_file(&at);
+    // with the content; decrypted secrets are created owner-only (0600/0700).
+    let staged = match secret {
+        true => fs.write_secret_staged(&c.path, &data, executable),
+        false => fs.write_staged(&c.path, &data).and_then(|at| match fs.set_executable(&at, executable) {
+            Ok(()) => Ok(at),
+            Err(e) => {
+                if at != c.path {
+                    let _ = fs.remove_file(&at);
+                }
+                Err(e)
             }
-            Err(e)
-        }
-    });
+        }),
+    };
     match staged {
         Ok(at) => Staging1::Staged(Staged {
             at,

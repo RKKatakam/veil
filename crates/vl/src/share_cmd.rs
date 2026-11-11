@@ -687,7 +687,7 @@ fn receive(ctx: &Ctx, me: &str, shares: &[ShareInfo]) -> Vec<String> {
                 ));
                 continue;
             }
-            if let Err(e) = ctx.fs.write(&vp, &content) {
+            if let Err(e) = ctx.fs.write_secret(&vp, &content, false) {
                 out.push(format!("{from}: not written ({e})"));
                 continue;
             }
@@ -755,7 +755,7 @@ pub fn hold_back_received(ctx: &Ctx) {
                     0 => format!("{HELD_DIR}/{id}"),
                     _ => format!("{HELD_DIR}/{id}-{n}"),
                 };
-                if ctx.fs.create_new(&VPath::new(&held)?, &data)? {
+                if ctx.fs.create_new_secret(&VPath::new(&held)?, &data)? {
                     break;
                 }
                 n += 1;

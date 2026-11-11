@@ -787,7 +787,7 @@ fn run_on(ctx: &Ctx, candidate: &ObjectId, with_isolated: bool, command: &[Strin
     if with_isolated {
         // The vault copies of local-only files (`ws exec --with-isolated`).
         for (p, hexdata) in ctx.repo.vault_load()?.files {
-            fs.write(&VPath::new(&p)?, &hex::decode(hexdata)?)?;
+            fs.write_secret(&VPath::new(&p)?, &hex::decode(hexdata)?, false)?;
         }
     }
     sb.make_private()?;

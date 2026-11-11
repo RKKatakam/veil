@@ -322,8 +322,27 @@ impl StorageBackend for SandboxFs {
         Ok(())
     }
 
+    fn write_secret(&self, path: &VPath, data: &[u8], executable: bool) -> Result<()> {
+        self.disk.write_secret_unsynced(path, data, executable)?;
+        if self.log.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            let written = WrittenFile {
+                content: Object::blob_id(data),
+                sealed: None,
+                meta: self.disk.metadata(path)?,
+            };
+            self.logged(|log| {
+                log.insert(path.clone(), written);
+            });
+        }
+        Ok(())
+    }
+
     fn write_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
         self.write(path, data)
+    }
+
+    fn write_secret_unsynced(&self, path: &VPath, data: &[u8], executable: bool) -> Result<()> {
+        self.write_secret(path, data, executable)
     }
 
     /// Nothing to do: sandbox writes are never made durable.
@@ -333,6 +352,10 @@ impl StorageBackend for SandboxFs {
 
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
         self.disk.create_new(path, data)
+    }
+
+    fn create_new_secret(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        self.disk.create_new_secret(path, data)
     }
 
     fn remove_file(&self, path: &VPath) -> Result<()> {

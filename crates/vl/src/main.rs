@@ -1134,13 +1134,18 @@ fn cmd_restore(ctx: &mut Ctx, paths: &[String], from: Option<&str>) -> Result<()
                 if restored_as_recorded(&ctx.repo, &e)? {
                     carry = Some((p.clone(), e.clone()));
                 }
-                let exec = match e.kind {
+                let (exec, secret) = match e.kind {
                     veil_core::EntryKind::Conflict => {
-                        veil_core::conflict::materialize_entry(ctx.repo.store(), &e, veil_core::conflict::Audience::Reader)?.executable
+                        let m = veil_core::conflict::materialize_entry(ctx.repo.store(), &e, veil_core::conflict::Audience::Reader)?;
+                        (m.executable, !m.visibility.is_public())
                     }
-                    _ => e.executable,
+                    _ => (e.executable, !e.visibility.is_public()),
                 };
-                ctx.fs.write(&p, &data).and_then(|_| ctx.fs.set_executable(&p, exec))
+                if secret {
+                    ctx.fs.write_secret(&p, &data, exec)
+                } else {
+                    ctx.fs.write(&p, &data).and_then(|_| ctx.fs.set_executable(&p, exec))
+                }
             }
             // A quarantined link (a token in its target) put back.
             Some(e) if e.kind == veil_core::EntryKind::Symlink => {
