@@ -65,6 +65,14 @@ pub enum NodeKind {
     Symlink,
 }
 
+/// Unix file-creation mode for the plain text of a decrypted secret:
+/// owner-only (`0600`, or `0700` when executable), never readable by other
+/// OS users regardless of `umask`.
+#[cfg(unix)]
+pub const fn secret_file_mode(executable: bool) -> u32 {
+    if executable { 0o700 } else { 0o600 }
+}
+
 /// Longest symlink target Veil records or writes, in bytes (`PATH_MAX` on
 /// Linux and macOS, including the terminating NUL that is not stored).
 pub const MAX_LINK_TARGET: usize = 4095;
@@ -282,6 +290,17 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     /// Write a file, creating parent directories as needed.
     fn write(&self, path: &VPath, data: &[u8]) -> Result<()>;
 
+    /// Write the plain text of a decrypted secret (sealed or isolated) at
+    /// `path`, creating the file owner-only (`0600`, or `0700` when
+    /// `executable`) from creation rather than changing its mode afterwards.
+    fn write_secret(&self, path: &VPath, data: &[u8], executable: bool) -> Result<()> {
+        self.write(path, data)?;
+        if executable {
+            self.set_executable(path, true)?;
+        }
+        Ok(())
+    }
+
     /// Like [`StorageBackend::write`] (atomic, immediately visible), except
     /// that the data only has to be durable once a later
     /// [`StorageBackend::sync_barrier`] returns. Until then a power loss may
@@ -292,6 +311,13 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     /// are always durable (or never are) keep the default.
     fn write_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
         self.write(path, data)
+    }
+
+    /// [`StorageBackend::write_unsynced`] for the plain text of a decrypted
+    /// secret: created owner-only (`0600`, or `0700` when `executable`) from
+    /// creation.
+    fn write_secret_unsynced(&self, path: &VPath, data: &[u8], executable: bool) -> Result<()> {
+        self.write_secret(path, data, executable)
     }
 
     /// Write `data` for `path` so that no crash can ever leave `path`
@@ -310,6 +336,14 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     /// unsynced writes can be torn under their final name must override it.
     fn write_staged(&self, path: &VPath, data: &[u8]) -> Result<VPath> {
         self.write_unsynced(path, data)?;
+        Ok(path.clone())
+    }
+
+    /// [`StorageBackend::write_staged`] for the plain text of a decrypted
+    /// secret: created owner-only (`0600`, or `0700` when `executable`) from
+    /// creation.
+    fn write_secret_staged(&self, path: &VPath, data: &[u8], executable: bool) -> Result<VPath> {
+        self.write_secret_unsynced(path, data, executable)?;
         Ok(path.clone())
     }
 
@@ -382,6 +416,12 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     /// Atomically create a file only if it does not exist. Returns `false`
     /// when the path already exists. Used for repository locks.
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool>;
+
+    /// [`StorageBackend::create_new`] for the plain text of a decrypted
+    /// secret: created owner-only (`0600`) from creation.
+    fn create_new_secret(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        self.create_new(path, data)
+    }
 
     /// [`StorageBackend::create_new`], never made durable: a power loss
     /// may leave the file missing, empty or torn under its name. Only for

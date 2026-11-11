@@ -109,14 +109,23 @@ impl StorageBackend for FoldingBackend {
     fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
         self.inner.write(&self.resolve(path), data)
     }
+    fn write_secret(&self, path: &VPath, data: &[u8], executable: bool) -> Result<()> {
+        self.inner.write_secret(&self.resolve(path), data, executable)
+    }
     fn write_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
         self.inner.write_unsynced(&self.resolve(path), data)
+    }
+    fn write_secret_unsynced(&self, path: &VPath, data: &[u8], executable: bool) -> Result<()> {
+        self.inner.write_secret_unsynced(&self.resolve(path), data, executable)
     }
     fn sync_barrier(&self) -> Result<()> {
         self.inner.sync_barrier()
     }
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
         self.inner.create_new(&self.resolve(path), data)
+    }
+    fn create_new_secret(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        self.inner.create_new_secret(&self.resolve(path), data)
     }
     fn remove_file(&self, path: &VPath) -> Result<()> {
         self.inner.remove_file(&self.resolve(path))

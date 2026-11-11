@@ -769,8 +769,8 @@ runs each command as you, on that workspace only:
 
 | Through the socket | |
 |---|---|
-| **Runs** | `status`, `diff`, `log`, `show`, `blame`, of `@` and its ancestors only; `commit` (moving no tag: `--no-advance`); `describe` of `@`; `new` on top of `@` |
-| **Refused** | everything else: access, groups, identity, other workspaces (their changes too, `vl show other@`), the project directory's (`default@`), `push`, `pull`, `undo`, `-R` |
+| **Runs** | `status`, `diff`, `log`, `show`, `blame`, of `@` and its ancestors only (with `--only`, restricted to the sandbox's paths); `commit` (moving no tag: `--no-advance`); `describe` of `@`; `new` on top of `@` |
+| **Refused** | everything else: access, groups, identity, other workspaces (their changes too, `vl show other@`), the project directory's (`default@`), paths outside `--only`, `push`, `pull`, `undo`, `-R` |
 
 A plain `vl log` inside shows the workspace's own history (`::@`).
 

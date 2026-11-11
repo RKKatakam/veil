@@ -257,6 +257,7 @@ impl LogFilterArgs {
             follow: self.follow,
             reader: Reader::Me,
             renames: RenameOptions::default(),
+            within: ctx.only.clone(),
         };
         Ok(api::LogQuery { limit, ids, roots, filter: Some(filter), show_skipped: self.show_skipped, max_changes })
     }
@@ -795,7 +796,7 @@ fn run_on(ctx: &Ctx, candidate: &ObjectId, with_isolated: bool, command: &[Strin
     if with_isolated {
         // The vault copies of local-only files (`ws exec --with-isolated`).
         for (p, hexdata) in ctx.repo.vault_load()?.files {
-            fs.write(&VPath::new(&p)?, &hex::decode(hexdata)?)?;
+            fs.write_secret(&VPath::new(&p)?, &hex::decode(hexdata)?, false)?;
         }
     }
     sb.make_private()?;

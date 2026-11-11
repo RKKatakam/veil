@@ -723,7 +723,7 @@ pub fn write_injection(fs: &SandboxFs, inj: &mut Injection, files: &[(String, Ve
     let planned = std::mem::take(&mut inj.paths);
     for vp in planned {
         let Some((p, data)) = files.iter().find(|(p, _)| VPath::new(p).is_ok_and(|q| q == vp)) else { continue };
-        match fs.write(&vp, data) {
+        match fs.write_secret(&vp, data, false) {
             Ok(()) => inj.paths.push(vp),
             Err(e) => {
                 // Put back what was there, if the write got that far.
@@ -874,8 +874,12 @@ fn clean_one(
     }
     if let Some(e) = now.filter(|e| e.kind == EntryKind::File) {
         if let Ok(data) = store.read_entry(&e) {
-            fs.write(p, &data)?;
-            fs.set_executable(p, e.executable)?;
+            if e.visibility.is_public() {
+                fs.write(p, &data)?;
+                fs.set_executable(p, e.executable)?;
+            } else {
+                fs.write_secret(p, &data, e.executable)?;
+            }
             out.restored.push(p.clone());
             return Ok(());
         }
@@ -930,6 +934,15 @@ impl Guard {
         }
     }
 
+    /// Merge another guard's entries into this one.
+    pub fn merge(&mut self, other: &Guard) {
+        for e in &other.files {
+            if !self.files.contains(e) {
+                self.files.push(e.clone());
+            }
+        }
+    }
+
     /// The guard as the builder applies it.
     pub fn secrets(&self) -> InjectedSecrets {
         let files: Vec<(&str, Vec<u8>)> = self
@@ -939,6 +952,81 @@ impl Guard {
             .collect();
         InjectedSecrets::from_files(files.iter().map(|(p, d)| (*p, d.as_slice())))
     }
+}
+
+/// Every sealed (`Cloaked`) file in `root` that `store` holds locally and can
+/// decrypt (falling back to `fallback_fs` when given, for an unchanged file
+/// already checked out into a sandbox whose thin-clone cache evicted the
+/// blob). Never fetches from the server: in a thin clone over a mount, an
+/// unfetched subtree or blob was never read by the command.
+pub fn sealed_files_in_tree(
+    store: &ObjectStore,
+    root: &ObjectId,
+    fallback_fs: Option<&dyn StorageBackend>,
+) -> Vec<(String, Vec<u8>)> {
+    store.without_fetching(|| {
+        let mut out = Vec::new();
+        let Ok(top) = store.tree(root) else { return out };
+        let mut stack: Vec<(VPath, std::sync::Arc<crate::object::Tree>, usize)> = vec![(VPath::root(), top, 0)];
+        while let Some((dir, tree, i)) = stack.last_mut() {
+            let Some(e) = tree.entries.get(*i).cloned() else {
+                stack.pop();
+                continue;
+            };
+            *i += 1;
+            let p = dir.join(&e.name);
+            match e.kind {
+                EntryKind::Dir => {
+                    if let Ok(child) = store.tree(&e.id) {
+                        stack.push((p, child, 0));
+                    }
+                }
+                EntryKind::File | EntryKind::Conflict if !e.visibility.is_public() => {
+                    let data = crate::conflict::read_file_like(store, &e).ok().or_else(|| {
+                        let fs = fallback_fs?;
+                        if behind_special(fs, &p).unwrap_or(true) {
+                            return None;
+                        }
+                        fs.read(&p).ok()
+                    });
+                    if let Some(d) = data {
+                        out.push((p.as_str().to_string(), d));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    })
+}
+
+/// Every sealed (`Cloaked`) leaf path in `root` held locally by `store`.
+pub fn sealed_paths_in_tree(store: &ObjectStore, root: &ObjectId) -> Vec<VPath> {
+    store.without_fetching(|| {
+        let mut out = Vec::new();
+        let Ok(top) = store.tree(root) else { return out };
+        let mut stack: Vec<(VPath, std::sync::Arc<crate::object::Tree>, usize)> = vec![(VPath::root(), top, 0)];
+        while let Some((dir, tree, i)) = stack.last_mut() {
+            let Some(e) = tree.entries.get(*i).cloned() else {
+                stack.pop();
+                continue;
+            };
+            *i += 1;
+            let p = dir.join(&e.name);
+            match e.kind {
+                EntryKind::Dir => {
+                    if let Ok(child) = store.tree(&e.id) {
+                        stack.push((p, child, 0));
+                    }
+                }
+                EntryKind::File | EntryKind::Conflict if !e.visibility.is_public() => {
+                    out.push(p);
+                }
+                _ => {}
+            }
+        }
+        out
+    })
 }
 
 impl SandboxPaths {
@@ -1093,11 +1181,17 @@ pub fn clean_copies(
                 };
                 if let Some(e) = entry.filter(|e| e.kind == EntryKind::File) {
                     if let Ok(data) = store.read_entry(&e) {
-                        if fs.read(vp).is_ok_and(|have| have == data) || secrets.find(&data).is_some() {
+                        if fs.read(vp).is_ok_and(|have| have == data)
+                            || (e.visibility.is_public() && secrets.find(&data).is_some())
+                        {
                             return Ok(());
                         }
-                        fs.write(vp, &data)?;
-                        fs.set_executable(vp, e.executable)?;
+                        if e.visibility.is_public() {
+                            fs.write(vp, &data)?;
+                            fs.set_executable(vp, e.executable)?;
+                        } else {
+                            fs.write_secret(vp, &data, e.executable)?;
+                        }
                         out.restored.push(vp.clone());
                         return Ok(());
                     }
@@ -1276,9 +1370,19 @@ impl StorageBackend for PolicyPin<'_> {
         self.inner.write(path, data)
     }
 
+    fn write_secret(&self, path: &VPath, data: &[u8], executable: bool) -> Result<()> {
+        self.refuse(path)?;
+        self.inner.write_secret(path, data, executable)
+    }
+
     fn write_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
         self.refuse(path)?;
         self.inner.write_unsynced(path, data)
+    }
+
+    fn write_secret_unsynced(&self, path: &VPath, data: &[u8], executable: bool) -> Result<()> {
+        self.refuse(path)?;
+        self.inner.write_secret_unsynced(path, data, executable)
     }
 
     fn sync_barrier(&self) -> Result<()> {
@@ -1288,6 +1392,11 @@ impl StorageBackend for PolicyPin<'_> {
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
         self.refuse(path)?;
         self.inner.create_new(path, data)
+    }
+
+    fn create_new_secret(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        self.refuse(path)?;
+        self.inner.create_new_secret(path, data)
     }
 
     fn remove_file(&self, path: &VPath) -> Result<()> {

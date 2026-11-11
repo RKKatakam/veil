@@ -880,6 +880,9 @@ pub struct BlameOptions {
     pub lines: Option<(usize, usize)>,
     /// Rename detection for `follow`.
     pub renames: RenameOptions,
+    /// Restrict tree reads and rename detection to this sparse set (for a
+    /// `--only` sandbox's workspace socket).
+    pub within: Option<crate::vfs::SparseSet>,
 }
 
 impl Default for BlameOptions {
@@ -891,6 +894,7 @@ impl Default for BlameOptions {
             work_budget: DEFAULT_WORK_BUDGET,
             lines: None,
             renames: RenameOptions::default(),
+            within: None,
         }
     }
 }
@@ -1054,9 +1058,16 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
         )));
     }
     let store = repo.store();
+    let restrict = |tree: ObjectId| -> Result<ObjectId> {
+        match &o.within {
+            Some(set) => crate::vfs::restrict(store, &tree, set),
+            None => Ok(tree),
+        }
+    };
     let mut stats = ReadStats::default();
     let top = repo.snapshot(rev)?;
-    let entry = match lookup_to_read(store, &top.tree, path)? {
+    let top_tree = restrict(top.tree)?;
+    let entry = match lookup_to_read(store, &top_tree, path)? {
         Some(e) if e.kind.is_file_like() => e,
         Some(_) => return Err(VeilError::NotFound(format!("{path} is a directory in {}", rev.short()))),
         None => return Err(VeilError::NotFound(format!("{path} does not exist in {}", rev.short()))),
@@ -1105,22 +1116,24 @@ pub fn blame(repo: &Repo, rev: &ObjectId, path: &VPath, o: &BlameOptions) -> Res
             // clone) is not part of this replica's history.
             let Some(ps) = repo.exact().snapshot(parent)? else { continue };
             let Some(prank) = rank.of(parent)? else { continue };
+            let ps_tree = restrict(ps.tree)?;
             let mut ppath = q.path.clone();
             let mut pv = match pending.get(&(*parent, ppath.clone())) {
                 Some(p) => Some(Ok(p.version.clone())),
-                None => version_at(store, &ps.tree, &ppath, o.reader, &mut result.stats)?,
+                None => version_at(store, &ps_tree, &ppath, o.reader, &mut result.stats)?,
             };
             if pv.is_none() && o.follow {
                 // Where did the file come from? Renames in this step only.
-                let (changes, _) = diff_trees_hiding(store, Some(&ps.tree), Some(&snap.tree))?;
+                let snap_tree = restrict(snap.tree)?;
+                let (changes, _) = diff_trees_hiding(store, Some(&ps_tree), Some(&snap_tree))?;
                 if changes.iter().any(|c| c.path == q.path && c.old.is_none()) {
-                    let d = rename::detect(store, Some(&ps.tree), Some(&snap.tree), &changes, o.reader, &o.renames)?;
+                    let d = rename::detect(store, Some(&ps_tree), Some(&snap_tree), &changes, o.reader, &o.renames)?;
                     result.stats.add(&d.stats);
                     if let Some(pair) = d.pairs.iter().find(|p| p.to == q.path && !p.copy) {
                         ppath = pair.from.clone();
                         pv = match pending.get(&(*parent, ppath.clone())) {
                             Some(p) => Some(Ok(p.version.clone())),
-                            None => version_at(store, &ps.tree, &ppath, o.reader, &mut result.stats)?,
+                            None => version_at(store, &ps_tree, &ppath, o.reader, &mut result.stats)?,
                         };
                     }
                 }

@@ -380,19 +380,34 @@ pub(super) fn read_file(dir: &Dir, name: &str) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
-/// Write `data` to a new temp file `tmp` of `dir`, flushed if `durable`,
-/// with the permissions of the regular file `name` it will replace (if
-/// any).
-pub(super) fn write_temp(dir: &Dir, tmp: &str, name: &str, data: &[u8], durable: bool) -> io::Result<()> {
-    let mut f = dir.open_file(tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o666)?;
+/// Write `data` to a new temp file `tmp` of `dir`, flushed if `durable`.
+/// When `secret` is `Some(executable)`, `tmp` is created owner-only (`0600`
+/// or `0700`) in `openat` and never copies permissions from `name`;
+/// otherwise `tmp` is created `0666` (`& ~umask`) with the permissions of
+/// the regular file `name` it will replace (if any).
+pub(super) fn write_temp(
+    dir: &Dir,
+    tmp: &str,
+    name: &str,
+    data: &[u8],
+    secret: Option<bool>,
+    durable: bool,
+) -> io::Result<()> {
+    let create_mode = match secret {
+        Some(exec) => super::secret_file_mode(exec) as libc::mode_t,
+        None => 0o666,
+    };
+    let mut f = dir.open_file(tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, create_mode)?;
     f.write_all(data)?;
-    if let Ok(st) = dir.stat(name) {
-        if st.st_mode & libc::S_IFMT == libc::S_IFREG {
-            use std::os::unix::fs::PermissionsExt;
-            // `mode_t` is `u16` on macOS.
-            #[allow(clippy::useless_conversion)]
-            let mode = u32::from(st.st_mode) & 0o7777;
-            f.set_permissions(fs::Permissions::from_mode(mode))?;
+    if secret.is_none() {
+        if let Ok(st) = dir.stat(name) {
+            if st.st_mode & libc::S_IFMT == libc::S_IFREG {
+                use std::os::unix::fs::PermissionsExt;
+                // `mode_t` is `u16` on macOS.
+                #[allow(clippy::useless_conversion)]
+                let mode = u32::from(st.st_mode) & 0o7777;
+                f.set_permissions(fs::Permissions::from_mode(mode))?;
+            }
         }
     }
     if durable {

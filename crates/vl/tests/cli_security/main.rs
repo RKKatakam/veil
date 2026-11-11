@@ -23,4 +23,5 @@ mod p1pass_cli;
 mod policy_cli;
 mod policy_round4_cli;
 mod policy_routes_cli;
+mod rv_client_cli;
 mod team_vault_cli;

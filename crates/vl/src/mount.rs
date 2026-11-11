@@ -57,10 +57,10 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use veil_core::{
-    builder::BuildReport,
+    builder::{BuildReport, InjectedSecrets, INJECTED_RULE},
     checkout::Materialised,
     object::EntryKind,
-    sandbox::{dir_name, workspace_of},
+    sandbox::{dir_name, sealed_files_in_tree, workspace_of, Guard, SandboxPaths},
     tree::{diff_trees, lookup},
     vfs::{private_dir, remove_tree, walk_files, DiskBackend, NodeKind, SandboxLock, StorageBackend},
     workspace::{mount_record_op_description, SnapshotOptions},
@@ -102,6 +102,7 @@ pub struct Paths {
 }
 
 const STATE_FILE: &str = "state.json";
+const GUARD_FILE: &str = "guard.bin";
 
 impl Paths {
     pub fn new(root: &Path, ws: &str) -> Paths {
@@ -141,6 +142,28 @@ impl Paths {
     /// Durably (temp file, fsync, rename).
     fn save_state(&self, st: &State) -> Result<()> {
         self.backend().write(&VPath::new(STATE_FILE)?, &serde_json::to_vec_pretty(st)?)?;
+        Ok(())
+    }
+
+    /// The mount's secret guard, if it has shown sealed secrets.
+    pub fn load_guard(&self, repo: &Repo) -> Result<Option<Guard>> {
+        let Some(raw) = self.backend().read_opt(&VPath::new(GUARD_FILE)?)? else {
+            return Ok(None);
+        };
+        let key = repo.keys().require(veil_core::keychain::LOCAL_SCOPE)?;
+        let plain = veil_core::crypto::Envelope::from_bytes(&raw)
+            .and_then(|e| e.open(&key))
+            .map_err(|_| anyhow!("the secret guard of the mount ({}) cannot be opened with this identity's key", self.dir.join(GUARD_FILE).display()))?;
+        Ok(Some(serde_json::from_slice(&plain)?))
+    }
+
+    fn save_guard(&self, repo: &Repo, g: &Guard) -> Result<()> {
+        if g.files.is_empty() {
+            return Ok(());
+        }
+        let key = repo.keys().require(veil_core::keychain::LOCAL_SCOPE)?;
+        let env = veil_core::crypto::Envelope::seal(&key, veil_core::keychain::LOCAL_SCOPE, &serde_json::to_vec(g)?, false)?;
+        self.backend().write(&VPath::new(GUARD_FILE)?, &env.to_bytes())?;
         Ok(())
     }
 
@@ -327,6 +350,8 @@ struct Recorder {
     said: String,
     /// What the last recording left out.
     report: BuildReport,
+    /// Secrets shown by this mount (and any sandbox guard of the workspace).
+    guard: Guard,
     /// The workspace is gone: the overlay was saved, the mount should go.
     orphaned: bool,
 }
@@ -359,13 +384,24 @@ impl Recorder {
             bail!("{} belongs to workspace '{}'", paths.dir.display(), safe(&state.workspace));
         }
         let base = state.base()?;
-        let lower: Arc<dyn Lower> = match lower_of(&repo, &base) {
-            Ok(l) => l,
+        let (shown_snap, lower): (ObjectId, Arc<dyn Lower>) = match lower_of(&repo, &base) {
+            Ok(l) => (base, l),
             // The snapshot is gone (gc after the workspace moved on): the
             // overlay goes over the workspace as it is now, keeping all of
             // its edits.
-            Err(_) => lower_of(&repo, &repo.workspace_wc(ws)?)?,
+            Err(_) => {
+                let wc = repo.workspace_wc(ws)?;
+                (wc, lower_of(&repo, &wc)?)
+            }
         };
+        let mut guard = SandboxPaths::new(root, ws).load_guard(&repo)?.unwrap_or_default();
+        if let Some(mg) = paths.load_guard(&repo)? {
+            guard.merge(&mg);
+        }
+        if let Ok(snap) = repo.snapshot(&shown_snap) {
+            guard.add(&sealed_files_in_tree(repo.store(), &snap.tree, None));
+        }
+        let _ = paths.save_guard(&repo, &guard);
         let upper: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(&paths.upper));
         // Large open files' content: anonymous files here, never in memory
         // (BUG-1365).
@@ -388,6 +424,7 @@ impl Recorder {
             recorded_gen: None,
             said: String::new(),
             report: BuildReport::default(),
+            guard,
             orphaned: false,
         })
     }
@@ -399,6 +436,19 @@ impl Recorder {
     fn set_base(&mut self, id: ObjectId) -> Result<()> {
         self.state.base = id.hex();
         self.paths.save_state(&self.state)
+    }
+
+    /// Secrets the mount has shown (plus any sandbox guard of the workspace),
+    /// refreshed from `snapshot` (what `repo`'s store holds locally).
+    fn secrets(&mut self, repo: &Repo, snapshot: &ObjectId) -> Result<Option<InjectedSecrets>> {
+        if let Some(g) = SandboxPaths::new(&self.root, &self.ws).load_guard(repo)? {
+            self.guard.merge(&g);
+        }
+        if let Ok(snap) = repo.snapshot(snapshot) {
+            self.guard.add(&sealed_files_in_tree(repo.store(), &snap.tree, None));
+        }
+        let _ = self.paths.save_guard(repo, &self.guard);
+        Ok((!self.guard.files.is_empty()).then(|| self.guard.secrets()))
     }
 
     /// Read the overlay's base again with `repo`'s keys: a grant or an
@@ -453,7 +503,8 @@ impl Recorder {
             self.fs.persist_all().map_err(fs_err)?;
             let desc = format!("edits made in the mount of workspace {} (they conflicted with a change to the workspace)", self.ws);
             let shown = self.shown(repo, &old)?;
-            let (id, _) = self.fs.with_view(|ov| repo.commit_fs_as_child_with(old, ov, &desc, None, Some(&shown), &[], true))?;
+            let secrets = self.secrets(repo, &old)?;
+            let (id, _) = self.fs.with_view(|ov| repo.commit_fs_as_child_with(old, ov, &desc, secrets.as_ref(), Some(&shown), &[], true))?;
             let change = repo.snapshot(&id)?.change_id.short();
             // Give up only what the saved change holds: an upper file it
             // left out (quarantined, held back) stays, over the new tree.
@@ -488,6 +539,7 @@ impl Recorder {
                 ));
             }
         }
+        let _ = self.secrets(repo, &wc);
         self.fs.switch_lower(lower_of(repo, &wc)?, &changed, &drop).map_err(fs_err)?;
         self.set_base(wc)
     }
@@ -520,6 +572,7 @@ impl Recorder {
             self.fs.persist_all().map_err(fs_err)?;
             let ws = self.ws.clone();
             let shown = self.shown(&repo, &wc)?;
+            let secrets = self.secrets(&repo, &wc)?;
             // Recorded and reconciled with requests waiting throughout.
             let out = self.fs.record_with(|ov| {
                 let out = repo.snapshot_workspace_with(
@@ -527,6 +580,7 @@ impl Recorder {
                     ov,
                     SnapshotOptions {
                         expected_wc: Some(wc),
+                        injected: secrets.as_ref(),
                         // Never a command of the user's: `vl undo` skips it
                         // and keeps what it recorded (BUG-538).
                         description: Some(mount_record_op_description(&ws)),
@@ -549,6 +603,7 @@ impl Recorder {
                 // finds the overlay agreeing with it and saves nothing
                 // (BUG-539).
                 self.set_base(out.snapshot)?;
+                let _ = self.secrets(&repo, &out.snapshot);
                 notes.push(format!("Recorded {}", one_line(&repo, &out.snapshot)));
             }
             self.left_out(&out.report, &mut notes);
@@ -557,6 +612,71 @@ impl Recorder {
             return Ok(notes);
         }
         bail!("workspace '{}' kept moving while its mount was being recorded; try again", self.ws)
+    }
+
+    /// Record the overlay after a `vl ws exec --mount` run and remove any
+    /// unrecorded files holding a secret value from the mount (`VISIBILITY.md`).
+    fn record_exec(&mut self) -> Result<Vec<String>> {
+        let mut notes = self.record()?;
+        let cleaned = self.clean_secret_copies()?;
+        if !cleaned.is_empty() {
+            notes.push(format!(
+                "cleaned {} (they held a secret; taken out of the mount)",
+                cleaned.join(", ")
+            ));
+        }
+        Ok(notes)
+    }
+
+    /// Remove files in the upper layer that hold a secret value given to the
+    /// mount (restoring tracked files to their recorded version).
+    fn clean_secret_copies(&mut self) -> Result<Vec<String>> {
+        if self.orphaned || self.fs.is_clean() {
+            return Ok(Vec::new());
+        }
+        self.fs.persist_all().map_err(fs_err)?;
+        let repo = open_repo(&self.root)?;
+        let wc = self.base()?;
+        let Some(secrets) = self.secrets(&repo, &wc)? else { return Ok(Vec::new()) };
+        if secrets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wc_tree = repo.snapshot(&wc)?.tree;
+        let mut drop = Vec::new();
+        for p in self.fs.upper_files() {
+            let quarantined_injected = self
+                .report
+                .quarantined
+                .iter()
+                .any(|(q, f)| q == &p && f.iter().any(|f| f.rule == INJECTED_RULE));
+            if quarantined_injected {
+                drop.push(p);
+                continue;
+            }
+            let own_sealed = lookup(repo.store(), &wc_tree, &p)
+                .ok()
+                .flatten()
+                .filter(|e| !e.visibility.is_public())
+                .map(|_| p.as_str());
+            let hit = self
+                .fs
+                .with_view(|ov| ov.read(&p))
+                .is_ok_and(|data| secrets.find_for(own_sealed, &data).is_some());
+            if hit {
+                drop.push(p);
+            }
+        }
+        if drop.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.fs.drop_upper(lower_of(&repo, &wc)?, &drop).map_err(fs_err)?;
+        self.report.quarantined.retain(|(p, _)| !drop.contains(p));
+        self.said.clear();
+        self.recorded_gen = Some(self.fs.generation());
+        let mut names: Vec<String> = drop.iter().map(|p| safe(p.as_str()).into_owned()).collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
     }
 
     /// Say (once) what the recording left out.
@@ -592,7 +712,8 @@ impl Recorder {
                 let base = self.base()?;
                 self.refresh(repo)?;
                 let shown = self.shown(repo, &base)?;
-                let (id, _) = self.fs.with_view(|ov| repo.commit_fs_as_child_with(base, ov, &desc, None, Some(&shown), &[], true))?;
+                let secrets = self.secrets(repo, &base)?;
+                let (id, _) = self.fs.with_view(|ov| repo.commit_fs_as_child_with(base, ov, &desc, secrets.as_ref(), Some(&shown), &[], true))?;
                 Ok(repo.snapshot(&id)?.change_id.short())
             })();
             notes.push(match saved {
@@ -1193,10 +1314,10 @@ pub fn for_exec(root: &Path, ws: &str) -> Result<ExecMount> {
 }
 
 impl ExecMount {
-    /// Have the mount record what it holds now.
+    /// Have the mount record what it holds now (and clean secret copies).
     pub fn record(&self) -> Result<()> {
         let st = Paths::new(&self.root, &self.ws).load_state()?.ok_or_else(|| anyhow!("the mount of workspace '{}' has no state", safe(&self.ws)))?;
-        let r = request(&st, "record", Duration::from_secs(600)).ok_or_else(|| anyhow!("the mount process does not answer"))??;
+        let r = request(&st, "record-exec", Duration::from_secs(600)).ok_or_else(|| anyhow!("the mount process does not answer"))??;
         match r.error {
             Some(e) => bail!(e),
             None => Ok(()),
@@ -1204,12 +1325,13 @@ impl ExecMount {
     }
 
     /// After the run: the mount records what it holds into the workspace
-    /// (its notes); one this run mounted is then unmounted.
+    /// (its notes), removes any copies of secrets, and one this run mounted
+    /// is then unmounted.
     pub fn finish(self) -> Result<Vec<String>> {
         let paths = Paths::new(&self.root, &self.ws);
         let st = paths.load_state()?.ok_or_else(|| anyhow!("the mount of workspace '{}' has no state", safe(&self.ws)))?;
         let lost = || anyhow!("the mount process does not answer; `vl ws unmount {}` records what the command wrote", safe(&self.ws));
-        let r = request(&st, "record", Duration::from_secs(600)).ok_or_else(lost)??;
+        let r = request(&st, "record-exec", Duration::from_secs(600)).ok_or_else(lost)??;
         if let Some(e) = r.error {
             bail!("the command's output was not recorded: {e}. It stays in the mount; `vl ws unmount {}` records it", safe(&self.ws));
         }
@@ -1327,6 +1449,14 @@ fn serve(root: &Path, ws: &str, dir: &Path, record_every: u64, banner: bool) -> 
                 }
                 "record" => {
                     let r = match rec.record() {
+                        Ok(n) => Reply { ok: true, notes: n, error: None },
+                        Err(e) => Reply { ok: false, notes: Vec::new(), error: Some(format!("{e:#}")) },
+                    };
+                    last_record = Instant::now();
+                    reply.send(r);
+                }
+                "record-exec" => {
+                    let r = match rec.record_exec() {
                         Ok(n) => Reply { ok: true, notes: n, error: None },
                         Err(e) => Reply { ok: false, notes: Vec::new(), error: Some(format!("{e:#}")) },
                     };
@@ -1553,7 +1683,10 @@ pub fn cmd_unmount(ctx: &mut Ctx, ws: &str) -> Result<()> {
         let _ = std::fs::remove_file(sock);
     }
     let mut rec = Recorder::open(&ctx.root, ws)?;
-    let mut notes = rec.record()?;
+    let from_exec = mp
+        .parent()
+        .is_some_and(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(EXEC_PREFIX)));
+    let mut notes = if from_exec { rec.record_exec()? } else { rec.record()? };
     rec.finish(&mut notes)?;
     for n in &notes {
         eprintln!("{n}");

@@ -234,11 +234,32 @@ impl StorageBackend for OverlayBackend {
         Ok(())
     }
 
+    fn write_secret(&self, path: &VPath, data: &[u8], executable: bool) -> Result<()> {
+        if self.upper.metadata(path)?.is_some_and(|m| m.kind == NodeKind::Dir) && !path.is_root() {
+            return Err(VeilError::InvalidPath(format!("{path} is a directory")));
+        }
+        let upper_has = self.upper.metadata(path)?.is_some();
+        let lower = self.lower_meta(path)?.filter(|_| !upper_has);
+        if lower.as_ref().is_some_and(|m| m.kind == NodeKind::Dir) {
+            return Err(VeilError::InvalidPath(format!("{path} is a directory")));
+        }
+        self.check_parents(path)?;
+        self.upper.write_secret(path, data, executable)
+    }
+
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
         if self.metadata(path)?.is_some() {
             return Ok(false);
         }
         self.write(path, data)?;
+        Ok(true)
+    }
+
+    fn create_new_secret(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        if self.metadata(path)?.is_some() {
+            return Ok(false);
+        }
+        self.write_secret(path, data, false)?;
         Ok(true)
     }
 

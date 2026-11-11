@@ -256,7 +256,7 @@ impl Repo {
             )));
         }
         let data = hex::decode(hexdata).map_err(|e| VeilError::Corrupt(VAULT_PATH.into(), e.to_string()))?;
-        fs.write(path, &data)?;
+        fs.write_secret(path, &data, false)?;
         Ok(true)
     }
 }

@@ -295,9 +295,34 @@ impl StorageBackend for SparseView<'_> {
         self.inner.write(path, data)
     }
 
+    fn write_secret(&self, path: &VPath, data: &[u8], executable: bool) -> Result<()> {
+        self.writable(path)?;
+        self.inner.write_secret(path, data, executable)
+    }
+
     fn write_unsynced(&self, path: &VPath, data: &[u8]) -> Result<()> {
         self.writable(path)?;
         self.inner.write_unsynced(path, data)
+    }
+
+    fn write_secret_unsynced(&self, path: &VPath, data: &[u8], executable: bool) -> Result<()> {
+        self.writable(path)?;
+        self.inner.write_secret_unsynced(path, data, executable)
+    }
+
+    fn write_staged(&self, path: &VPath, data: &[u8]) -> Result<VPath> {
+        self.writable(path)?;
+        self.inner.write_staged(path, data)
+    }
+
+    fn write_secret_staged(&self, path: &VPath, data: &[u8], executable: bool) -> Result<VPath> {
+        self.writable(path)?;
+        self.inner.write_secret_staged(path, data, executable)
+    }
+
+    fn rename_unsynced(&self, from: &VPath, to: &VPath) -> Result<()> {
+        self.writable(to)?;
+        self.inner.rename_unsynced(from, to)
     }
 
     fn sync_barrier(&self) -> Result<()> {
@@ -307,6 +332,11 @@ impl StorageBackend for SparseView<'_> {
     fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
         self.writable(path)?;
         self.inner.create_new(path, data)
+    }
+
+    fn create_new_secret(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        self.writable(path)?;
+        self.inner.create_new_secret(path, data)
     }
 
     fn remove_file(&self, path: &VPath) -> Result<()> {
