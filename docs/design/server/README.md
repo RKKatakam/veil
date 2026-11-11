@@ -56,7 +56,7 @@ S1 is built. **S2** (secrets at scale: keys per access rule, background wrapping
 | S23 | 4 | Embargoed PRs | S21, S22 |
 | S24 | 4 | Rate limits, health metrics, failure isolation | S17 |
 | S25 | 4 | Web client, first version (no secrets) | S13, S21 |
-| S26 | 4 | Secrets in the browser (only if the owner approves) | S25, S2 |
+| S26 | 4 | Secrets in the browser (approved by the owner, 2026-11-11) | S25, S2 |
 | G4 | 4 | Phase 4 gate run | S17–S24 |
 
 **Phases overlap.** The dependencies are between milestones, not phases: phase 3's derived data (S12) and phase 4's landing service (S17) do not wait for the whole of phase 2.
@@ -82,20 +82,24 @@ The owner allows many agents at once. Each wave's milestones touch different fil
 
 **Memory on the build machine:** each agent's builds take several GB. The owner asked to watch RAM: run at most as many building agents as the machine's memory allows (use `bash ~/.cache/veil-orch/verify-fast.sh`, which deletes `target/` when done), and start the rest when one finishes.
 
-## Plan to the DigitalOcean test (as of 2026-11-08)
+## Plan to the DigitalOcean test (as of 2026-11-11)
 
-The owner's goal: every milestone of phases 1–4 built, reviewed and merged, then one test on DigitalOcean (budget under $100, asked for before anything is rented). Each tier-A milestone goes through the review loop of `.claude/skills/veil-review/SKILL.md` (at most three cycles, then the approach is re-evaluated, as S3's names and fetching were).
+The owner's goal: every milestone of phases 1–4 built, reviewed and merged, then one test on DigitalOcean (budget under $100, asked for before anything is rented). Each tier-A milestone went through the review loop of `.claude/skills/veil-review/SKILL.md` (at most three cycles, then the approach is re-evaluated, as S3's names and fetching were).
 
 ### Where each milestone stands
 
-| State | Milestones |
-|---|---|
-| **Merged into `integration`** | S1, S2 (phase 1); S3–S11, S27, S28, S29 (phase 2: all); S12, S13, S14, S15 (phase 3); S17, S18, S19, S20, S21, S22, S24 (phase 4); the deployment kit |
-| **Built, in final review or fixing** | S16 with G3 (phase 3: its gate run) |
-| **Being built** | S23, S25 (phase 4) |
-| **Not started** | S26 (owner's approval); the gate runs G2, G4; phase 1's security pass; a deep security review after phase 2 and after phase 4 (owner, 2026-11-10: one quick review per milestone, one deep review per phase) |
+**Every milestone is built and merged.** What is left is measuring, and the test itself.
 
-### Remaining waves
+| State | What |
+|---|---|
+| **Built and merged** | S1, S2 (phase 1); S3–S11, S27, S28, S29 (phase 2); S12–S16 (phase 3); S17–S26 (phase 4), **S26 included**: secrets in the browser, which the owner approved on 2026-11-11; the deployment kit (`deploy/`, `docs/DEPLOY.md`) |
+| **Reviewed** | Each milestone by its own review loop; phase 1's client security pass (BUG-1800 to 1804) and the deep review after phase 2 (BUG-1780 to 1786); then **one review of the whole code base, in eight passes** (2026-11-10 and 11), which filed BUG-1830 to BUG-1908. All of those are fixed and merged but two, which are open in `docs/BUGS.md`: BUG-1886 (an approval withdrawn while the landing batch commits) and BUG-1892 (sign-ups from one address that vouch for each other; its fix waits for the owner's choice) |
+| **Left: gate runs** | **G2** (phase 2: Git beside Veil on the 1 GB profile, on a quiet machine); **G4** (phase 4: landing, then bisect); **the blame speed gate again** (part of G3, S16: a first blame of 10,000 versions within 1 s), because the server's blame line maps changed after it was measured (BUG-1893, BUG-1895, BUG-1896) |
+| **Left: the DigitalOcean test** | The gate benchmarks at the real scale, with the deployment kit. **Nothing is rented before the owner approves it** (product decision 17) |
+
+Bugs still open are the rows of `docs/BUGS.md` whose first cell says open.
+
+### The waves, as they were built (all merged; G2 and G4 are still to run)
 
 | Wave | Starts when | Milestones | What each carries beyond its row |
 |---|---|---|---|
@@ -111,11 +115,11 @@ The owner's goal: every milestone of phases 1–4 built, reviewed and merged, th
 | **C** | S14, S19 | **S20** | |
 | **C** | phase 2 in | **G2** | Git beside Veil on the 1 GB profile (thin and full clone, status, log), on a quiet machine |
 | **D** | S17, S18, S24 (landing), S20 (bisect) | **G4** | |
-| — | owner approves | S26 | not in the first web client unless approved (product decision 13) |
+| — | owner approves | S26 | approved by the owner on 2026-11-11, built and merged (product decision 13) |
 
 ### Also on the plan (not milestones)
 
-* **Phase 1's final security pass** over the client, after S3 merges (thin clones change the client's trust surface most).
+* **Phase 1's final security pass** over the client, after S3 merges (thin clones change the client's trust surface most) Done: BUG-1800 to BUG-1804.
 * **The test sweep** (tests that pass when their action fails, the `CLAUDE.md` rule of 2026-11-08): run once over all tests, then held by review.
 * **Guide recipe: fork and race** (`vl ws new try-a -r @` … `vl ws exec` in parallel; keep the winner, record the rest as attempts).
 * **Clean-ups filed during reviews:** the search index resumed twice for one project at start (S15 cycle 2 note); the landing batch limit (64) re-measured once packs (S28) land.
@@ -139,7 +143,7 @@ Each document lists its own with the reasoning; in short:
 | 10 | PRs named by short random ids, not numbers | yes | phase 4 §11.3 |
 | 11 | Automatic revert of a confirmed culprit without asking | yes on protected `main` | phase 4 §11.4 |
 | 12 | Which risks need a person's approval; whether agents' approvals count | low: checks only; normal: one approval; high: one person | phase 4 §11.5 |
-| 13 | Secrets in the browser | not in the first web client | phase 4 §11.6 |
+| 13 | Secrets in the browser | not in the first web client (**decided: the owner approved S26 on 2026-11-11, and it is built**) | phase 4 §11.6 |
 | 14 | Review and branch rules in a tracked `.veilrules`, changed only by admins | yes | phase 4 §11.7 |
 | 15 | Protected `main` by default; `vl push` lands instead | yes | phase 4 §11.9 |
 | 16 | Health metrics for admins only | yes | phase 4 §11.10 |
