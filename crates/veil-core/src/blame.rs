@@ -400,8 +400,12 @@ pub fn plain_text_line_ranges_from_parent(
     let parent_suf_start = parent.len() - eq_suf;
     let mut s_idx = p_lines + bsearch_start_lt(&parent_lines[p_lines..], parent_suf_start);
     while s_idx < parent_lines.len() {
-        let (a, _) = parent_lines[s_idx];
-        if a == 0 || (a > pre_byte && data[data.len() - (parent.len() - a) - 1] == b'\n') {
+        // Where that line of the shared end starts in `data`: a line of
+        // `data` only at its start or after a newline (BUG-1893: taken for
+        // one at the start of `parent`, whatever `data` had before it; and
+        // the byte before the start of `data` was read).
+        let at = data.len() - (parent.len() - parent_lines[s_idx].0);
+        if at == 0 || data[at - 1] == b'\n' {
             break;
         }
         s_idx += 1;
@@ -1439,6 +1443,69 @@ mod tests {
             }
         }
         assert!(one > 1_000 && several > 1_000, "isolated_replacements answered: {one} times with one line, {several} with several");
+    }
+
+    /// BUG-1893's class, for the lines themselves: line ranges reused from
+    /// a parent version ([`plain_text_line_ranges_from_parent`], the
+    /// server's blame jobs) are the text's own, whether or not either text
+    /// ends with a newline, on long texts of repeated lines (it reuses
+    /// nothing below 4,096 bytes or 64 lines).
+    #[test]
+    fn bug_1893_line_ranges_reused_from_a_parent_are_the_texts_own() {
+        let mut seed = 0x1893_11e5_0f7e_47a1u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        // A first line removed (the byte before the text's start was read:
+        // a panic), and one with something put before it (taken for the
+        // parent's first line, and what was put before it for a line).
+        let rest = "a line of fifty bytes or thereabouts, to be long\n".repeat(100);
+        let parent = format!("the first line\n{rest}");
+        let own = |data: &str| assert_eq!(plain_text_line_ranges_from_parent(data.as_bytes(), parent.as_bytes(), &line_ranges(parent.as_bytes())), Some(line_ranges(data.as_bytes())), "{:?}…", &data[..30]);
+        own(&rest);
+        own(&format!("// {parent}"));
+        own(&format!("first\n{parent}"));
+        own(&format!("{parent}last"));
+        own(parent.trim_end());
+        let mut reused = 0;
+        for case in 0..3_000 {
+            let k = 2 + rnd() % 30;
+            let line = |r: usize| format!("{}\n", "line of some length ".repeat(1 + r % k % 4) + &(r % k).to_string());
+            let mut lines: Vec<String> = (0..64 + rnd() % 200).map(|_| line(rnd())).collect();
+            let mut parent = lines.concat();
+            if case % 3 == 0 {
+                parent.pop();
+            }
+            for _ in 0..rnd() % 4 {
+                let at = rnd() % lines.len();
+                match rnd() % 4 {
+                    0 => lines.insert(at, line(rnd())),
+                    1 => drop(lines.remove(at)),
+                    2 => lines[at] = line(rnd()),
+                    _ => {
+                        let within = rnd() % lines[at].len();
+                        lines[at].insert(within, 'x');
+                    }
+                }
+            }
+            let mut data = lines.concat();
+            match case % 7 {
+                0 => drop(data.pop()),
+                1 => data.push_str("more"),
+                2 => data.truncate(rnd() % (data.len() + 1)),
+                3 => data = format!("{parent}\n"),
+                4 => data = format!("{parent}{}", &line(rnd())[..3]),
+                _ => {}
+            }
+            let got = plain_text_line_ranges_from_parent(data.as_bytes(), parent.as_bytes(), &line_ranges(parent.as_bytes()));
+            assert_eq!(got, Some(line_ranges(data.as_bytes())), "case {case}");
+            assert_eq!(got, plain_text_line_ranges(data.as_bytes()), "case {case}");
+            reused += usize::from(data.len() >= 4096);
+        }
+        assert!(reused > 2_000, "{reused} texts long enough to reuse a parent's lines");
     }
 
     /// S14 cycle 2 (review): `map_lines` with its trimmed ends answers
