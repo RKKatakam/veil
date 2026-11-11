@@ -41,9 +41,9 @@ const LISTED: i64 = 200;
 pub async fn devices_page_route(State(hub): State<HubState>, caller: Caller) -> Result<Response> {
     let me = caller.person_only()?.clone();
     let csrf = current_csrf();
-    type Row = (String, Option<String>, bool, bool, bool, Option<String>, Option<String>, Option<i64>);
+    type Row = (String, Option<String>, bool, bool, bool, Option<String>, Option<String>, Option<i64>, String);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT d.signing_key, d.fingerprint, d.browser, d.prf_supported, d.pending, w.credential_id, w.label, w.created_at \
+        "SELECT d.signing_key, d.fingerprint, d.browser, d.prf_supported, d.pending, w.credential_id, w.label, w.created_at, d.public_identity \
          FROM devices d LEFT JOIN webauthn_credentials w ON w.device_id = d.id \
          WHERE d.person_id = $1 AND d.removed_at IS NULL AND (d.browser OR NOT d.pending) ORDER BY d.browser DESC, d.id LIMIT $2",
     )
@@ -70,7 +70,7 @@ pub async fn devices_page_route(State(hub): State<HubState>, caller: Caller) -> 
         body.push_str("<p class=\"muted\">No browser is enrolled. Run <code>vl web</code> on a computer where you are signed in.</p>");
     } else {
         body.push_str("<table class=\"listing\"><tbody>");
-        for (key, fingerprint, _, prf, pending, credential, label, enrolled) in browsers {
+        for (key, fingerprint, _, prf, pending, credential, label, enrolled, _) in browsers {
             let fp = fingerprint.as_deref().unwrap_or_default();
             let this = *key == me.device_key;
             let state = match (prf, pending) {
@@ -102,7 +102,9 @@ pub async fn devices_page_route(State(hub): State<HubState>, caller: Caller) -> 
     }
 
     body.push_str("<h3><code>vl</code> devices</h3><table class=\"listing\"><tbody>");
-    for (key, fingerprint, ..) in rows.iter().filter(|r| !r.2) {
+    for (key, .., identity) in rows.iter().filter(|r| !r.2) {
+        // (The stored fingerprint is only of devices that waited to be confirmed.)
+        let fingerprint = veil_core::identity::parse_public_identity(identity).ok().and_then(|i| veil_core::hub::wire::device_fingerprint(&i));
         let _ = write!(
             body,
             "<tr><td><code>{}</code>{}</td><td class=\"muted\">signed in with <code>vl login</code></td></tr>",

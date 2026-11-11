@@ -389,7 +389,7 @@ impl VirtualPasskey {
 
 /// `vl web`'s request: an enrollment code, asked for with the device's
 /// signature over a challenge of the server (under `context`).
-pub(crate) fn signed_enroll_request(hub: &TestHub, signer: &Identity, context: &str) -> Value {
+pub(crate) fn signed_enroll_request(hub: &TestHub, signer: &veil_core::Identity, context: &str) -> Value {
     let ch = hub.api().post_json(None, "/v1/auth/challenge", &json!({ "key": signer.verifying_hex() }));
     assert_eq!(ch.status, 200, "{}", String::from_utf8_lossy(&ch.body));
     let challenge = ch.json()["challenge"].as_str().expect("challenge").to_string();
@@ -552,7 +552,7 @@ fn guarantee_1_no_route_ever_returns_a_plain_secret() {
         assert_no_canary_bytes(&r.body, &all_canaries, &api_route);
     }
     let q_blame = web.get_api(&format!("/v1/projects/{proj}/q/blame?rev=main&path=.env"));
-    assert!(q_blame.status == 400 || q_blame.status == 403, "blame on sealed file must fail: {}", q_blame.status);
+    assert_eq!(q_blame.status, 400, "blame on sealed file must fail: {}", q_blame.text());
     assert_no_canary_bytes(&q_blame.body, &all_canaries, "/q/blame .env");
 
     // `/web/ciphertext` returns ONLY encrypted `Object::Sealed` bytes (never plain secrets, and refuses plain files!).
@@ -1137,23 +1137,40 @@ fn guarantee_5_browser_private_keys_are_never_in_a_request_body() {
     let reg = pk.enroll(&mut web, &alice.name, &code);
     let fp = reg["fingerprint"].as_str().unwrap().to_string();
     alice.ok(&dir, &["identity", "confirm", &fp]);
-    let _ = web.post_json(&format!("/v1/projects/{proj}/web-secrets"), &json!({ "enabled": true }), true);
+    let on = web.post_json(&format!("/v1/projects/{proj}/web-secrets"), &json!({ "enabled": true }), true);
+    assert_eq!(on.status, 200, "turning browser secrets on: {}", on.text());
     alice.ok(&dir, &["share-keys"]);
-    let _ = pk.sign_in(&mut web, Some(&alice.name));
-    let _ = web.get_api(&format!("/v1/projects/{proj}/web/rings"));
-    let _ = web.get_api(&format!("/v1/projects/{proj}/web/ciphertext?rev=main&path=.env"));
+    let signed_in = pk.sign_in(&mut web, Some(&alice.name));
+    assert_eq!(signed_in["confirmed"], true, "{signed_in}");
+    let rings = web.get_api(&format!("/v1/projects/{proj}/web/rings"));
+    assert_eq!(rings.status, 200, "{}", rings.text());
+    assert!(!rings.json()["rings"].as_object().expect("rings").is_empty(), "the confirmed browser device got no ring: {}", rings.text());
+    let ciphertext = web.get_api(&format!("/v1/projects/{proj}/web/ciphertext?rev=main&path=.env"));
+    assert_eq!(ciphertext.status, 200, "{}", ciphertext.text());
 
     // 1. Inspect every request body sent during enrollment, sign-in, settings, ring fetch, and ciphertext fetch:
     //    none ever contains `signing_seed`, `sealed_identity_hex`, PRF bytes, or Alice's `vl` private keys!
     let alice_id_json: Value = serde_json::from_str(&alice.identity().to_json()).unwrap();
-    let alice_seed = alice_id_json["signing_seed"].as_str().unwrap_or("NONE");
-    let alice_x25519_sec = alice_id_json["secret"].as_str().unwrap_or("NONE");
+    // (The identity file's private fields: `signing_secret` and `encryption_secret`.)
+    let alice_seed = alice_id_json["signing_secret"].as_str().expect("the identity file's signing secret");
+    let alice_x25519_sec = alice_id_json["encryption_secret"].as_str().expect("the identity file's encryption secret");
+    assert!(alice_seed.len() == 64 && alice_x25519_sec.len() == 64);
     let bundle = pk.bundle.as_ref().unwrap();
+    let prf = pk.prf_eval(reg["prf_salt"].as_str().expect("prf_salt")).expect("a PRF output");
 
-    for (path, body) in web.sent_bodies.lock().unwrap().iter() {
+    // Every ceremony above was sent and logged: the loop below reads them.
+    let sent: Vec<(String, Vec<u8>)> = web.sent_bodies.lock().unwrap().clone();
+    for path in ["/web/passkey/register/begin", "/web/passkey/register/finish", "/web/passkey/login/begin", "/web/passkey/login/finish"] {
+        assert!(sent.iter().any(|(p, b)| p == path && !b.is_empty()), "no request body to {path} was recorded");
+    }
+    assert!(sent.iter().any(|(p, _)| p.ends_with("/web-secrets")), "the setting's request was not recorded");
+    for (path, body) in &sent {
         let s = String::from_utf8_lossy(body);
-        assert!(!s.contains("signing_seed"), "private signing_seed sent in {path}");
+        for private in ["signing_seed", "signing_secret", "encryption_secret"] {
+            assert!(!s.contains(private), "a private key field ({private}) sent in {path}");
+        }
         assert!(!s.contains(&bundle.sealed_identity_hex), "IndexedDB sealed identity sent in {path}");
+        assert!(!s.contains(&hex::encode(prf)) && !s.contains(&b64url_encode(&prf)), "the passkey's PRF output sent in {path}");
         assert!(!s.contains(alice_seed), "vl signing_seed sent in {path}");
         assert!(!s.contains(alice_x25519_sec), "vl x25519 secret sent in {path}");
     }
@@ -1161,7 +1178,9 @@ fn guarantee_5_browser_private_keys_are_never_in_a_request_body() {
     // 2. Server-side defense in depth: if a buggy client ever tries to include `signing_seed` or a private
     //    `Identity` JSON in registration, the server rejects it with `400`.
     let code_bad = mint_enroll_code(&hub, &alice);
-    let begin_bad = web.post_json("/web/passkey/register/begin", &json!({ "code": code_bad }), false).json();
+    let begin_bad = web.post_json("/web/passkey/register/begin", &json!({ "code": code_bad }), false);
+    assert_eq!(begin_bad.status, 200, "{}", begin_bad.text());
+    let begin_bad = begin_bad.json();
     let cd_bad = serde_json::to_vec(&json!({
         "type": "webauthn.create",
         "challenge": begin_bad["challenge"],
@@ -1183,11 +1202,14 @@ fn guarantee_5_browser_private_keys_are_never_in_a_request_body() {
         }),
         false,
     );
-    assert_eq!(bad_finish.status, 400, "server must reject private Identity JSON in public_identity");
+    assert_eq!(bad_finish.status, 400, "server must reject private Identity JSON in public_identity: {}", bad_finish.text());
+    assert!(bad_finish.text().contains("private device key material"), "refused for another reason: {}", bad_finish.text());
 
     // 3. Also refuse reusing an existing `vl` device's public_identity as a browser device!
     let code_copy = mint_enroll_code(&hub, &alice);
-    let begin_copy = web.post_json("/web/passkey/register/begin", &json!({ "code": code_copy }), false).json();
+    let begin_copy = web.post_json("/web/passkey/register/begin", &json!({ "code": code_copy }), false);
+    assert_eq!(begin_copy.status, 200, "{}", begin_copy.text());
+    let begin_copy = begin_copy.json();
     let cd_copy = serde_json::to_vec(&json!({
         "type": "webauthn.create",
         "challenge": begin_copy["challenge"],
@@ -1209,11 +1231,24 @@ fn guarantee_5_browser_private_keys_are_never_in_a_request_body() {
         }),
         false,
     );
-    assert!(
-        copy_finish.status == 400 || copy_finish.status == 409,
+    assert_eq!(
+        copy_finish.status,
+        409,
         "server must refuse registering a copy of a vl device key as a browser device: {}",
         copy_finish.text()
     );
+    assert!(copy_finish.text().contains("already registered"), "refused for another reason: {}", copy_finish.text());
+    // Neither refused registration left a device or a passkey behind.
+    let db = hub.hub().db.clone();
+    let devices: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT count(*) FROM devices d JOIN people p ON p.id = d.person_id WHERE p.name = $1 AND d.browser")
+                .bind(&alice.name)
+                .fetch_one(&db),
+        )
+        .expect("count");
+    assert_eq!(devices, 1, "a refused registration made a browser device");
 }
 
 // ---------------------------------------------------------------------------
@@ -1388,7 +1423,7 @@ fn guarantee_6_web_approvals_count_only_under_s21_rules() {
         &format!("/v1/projects/{proj}/prs/{pr_id}/reviews"),
         &json!({ "patch": patch_mixed, "verdict": "approve" }),
     );
-    assert!(agt_try.status == 401 || agt_try.status == 403, "agent must not submit web review without device sig");
+    assert_eq!(agt_try.status, 403, "agent must not submit web review without device sig: {}", String::from_utf8_lossy(&agt_try.body));
     let ci = api
         .post_json(
             Some(&carol.token()),
@@ -1402,7 +1437,7 @@ fn guarantee_6_web_approvals_count_only_under_s21_rules() {
         &format!("/v1/projects/{proj}/prs/{pr_id}/reviews"),
         &json!({ "patch": patch_mixed, "verdict": "approve" }),
     );
-    assert!(ci_try.status == 401 || ci_try.status == 403, "CI runner session must never approve PRs");
+    assert_eq!(ci_try.status, 403, "CI runner session must never approve PRs: {}", String::from_utf8_lossy(&ci_try.body));
 
     // Rule 4: Stale patch hash is refused (`409`).
     let stale = carol_web.post_json(
@@ -1483,7 +1518,7 @@ fn guarantee_6_web_approvals_count_only_under_s21_rules() {
     assert_eq!(upd3["review"]["ready"], false, "file change must dismiss web approval");
 
     let land_blocked = alice_web.post_form(&format!("/p/{proj}/prs/{pr_id}/land"), &[], true);
-    assert!(land_blocked.status == 403 || land_blocked.status == 409 || land_blocked.status == 422);
+    assert_eq!(land_blocked.status, 409, "landing without a current approval: {}", land_blocked.text());
 
     let carol_v3 = carol_web.post_form(
         &format!("/p/{proj}/prs/{pr_id}/reviews"),
@@ -1499,6 +1534,13 @@ fn guarantee_6_web_approvals_count_only_under_s21_rules() {
 // Guarantee 7 (and BUG-1871 end-to-end): `vl web` passkey enrollment, single-use
 // codes, WebAuthn origin/rpId/signCount checks, and removal of `/web/login`.
 // ---------------------------------------------------------------------------
+/// A sign-in started for `person`: the answer of `login/begin`.
+fn begin_login(web: &BrowserClient, person: &str) -> Value {
+    let r = web.post_json("/web/passkey/login/begin", &json!({ "person": person }), false);
+    assert_eq!(r.status, 200, "login/begin: {}", r.text());
+    r.json()
+}
+
 #[test]
 fn guarantee_7_passkey_enrollment_via_vl_web_replaces_identity_file_sign_in() {
     let hub = TestHub::start();
@@ -1516,7 +1558,7 @@ fn guarantee_7_passkey_enrollment_via_vl_web_replaces_identity_file_sign_in() {
     // 1. Old `/web/login` (`identity.json` challenge endpoint) is gone (`404` / `405`).
     let mut web = BrowserClient::new(&hub);
     let old_login = web.post_json("/web/login", &json!({}), false);
-    assert!(old_login.status == 404 || old_login.status == 405, "old /web/login must be removed");
+    assert_eq!(old_login.status, 404, "old /web/login must be removed: {}", old_login.text());
 
     // 2. Run actual `vl web --json` CLI command!
     let out = alice.ok(&dir, &["web", "--json"]);
@@ -1531,33 +1573,39 @@ fn guarantee_7_passkey_enrollment_via_vl_web_replaces_identity_file_sign_in() {
     let fp = reg["fingerprint"].as_str().unwrap().to_string();
 
     let replay_begin = web.post_json("/web/passkey/register/begin", &json!({ "code": code }), false);
-    assert!(replay_begin.status == 400 || replay_begin.status == 401, "single-use enrollment code must not replay");
+    assert_eq!(replay_begin.status, 401, "single-use enrollment code must not replay: {}", replay_begin.text());
 
     // 4. WebAuthn phishing & replay defenses: wrong `origin`, wrong `rpIdHash`, and cloned/replayed `signCount` all fail!
-    let b1 = web.post_json("/web/passkey/login/begin", &json!({ "person": alice.name }), false).json();
+    let b1 = begin_login(&web, &alice.name);
     let bad_origin = pk.assert_with(&web, b1["challenge"].as_str().unwrap(), "https://phishing.example", &web.rp_id, 10);
-    assert!(bad_origin.status == 400 || bad_origin.status == 401 || bad_origin.status == 403);
+    assert_eq!(bad_origin.status, 401, "an assertion made for another origin: {}", bad_origin.text());
+    assert!(bad_origin.text().contains("origin mismatch"), "refused for another reason: {}", bad_origin.text());
 
-    let b2 = web.post_json("/web/passkey/login/begin", &json!({ "person": alice.name }), false).json();
+    let b2 = begin_login(&web, &alice.name);
     let bad_rp = pk.assert_with(&web, b2["challenge"].as_str().unwrap(), &web.origin, "phishing.example", 10);
-    assert!(bad_rp.status == 400 || bad_rp.status == 401);
+    assert_eq!(bad_rp.status, 401, "an assertion made for another relying party: {}", bad_rp.text());
+    assert!(bad_rp.text().contains("rpIdHash mismatch"), "refused for another reason: {}", bad_rp.text());
 
     // Valid sign-in advances `sign_count` to 5; replaying `sign_count = 5` on next challenge fails!
-    let b3 = web.post_json("/web/passkey/login/begin", &json!({ "person": alice.name }), false).json();
+    let b3 = begin_login(&web, &alice.name);
     let ok_login = pk.assert_with(&web, b3["challenge"].as_str().unwrap(), &web.origin, &web.rp_id, 5);
-    assert_eq!(ok_login.status, 200);
+    assert_eq!(ok_login.status, 200, "{}", ok_login.text());
     web.capture_cookie(&ok_login);
     web.csrf = ok_login.json()["csrf"].as_str().map(str::to_string);
 
-    let b4 = web.post_json("/web/passkey/login/begin", &json!({ "person": alice.name }), false).json();
+    let b4 = begin_login(&web, &alice.name);
     let stale_cnt = pk.assert_with(&web, b4["challenge"].as_str().unwrap(), &web.origin, &web.rp_id, 5);
-    assert_eq!(stale_cnt.status, 401, "non-increasing WebAuthn signCount must be rejected");
+    assert_eq!(stale_cnt.status, 401, "non-increasing WebAuthn signCount must be rejected: {}", stale_cnt.text());
+    assert!(stale_cnt.text().contains("signCount did not advance"), "refused for another reason: {}", stale_cnt.text());
 
     // 5. Confirm browser device via `vl identity confirm <fp>` after enabling `web_secrets` -> immediate key sharing!
-    let _ = web.post_json(&format!("/v1/projects/{proj}/web-secrets"), &json!({ "enabled": true }), true);
+    let on = web.post_json(&format!("/v1/projects/{proj}/web-secrets"), &json!({ "enabled": true }), true);
+    assert_eq!(on.status, 200, "turning browser secrets on: {}", on.text());
     alice.ok(&dir, &["identity", "confirm", &fp]);
 
-    let rings = web.get_api(&format!("/v1/projects/{proj}/web/rings")).json();
+    let rings = web.get_api(&format!("/v1/projects/{proj}/web/rings"));
+    assert_eq!(rings.status, 200, "{}", rings.text());
+    let rings = rings.json();
     let proj_fp = rings["project_fingerprint"].as_str().unwrap();
     let ct = web.get_api(&format!("/v1/projects/{proj}/web/ciphertext?rev=main&path=.env"));
     assert_eq!(ct.status, 200, "{}", ct.text());
