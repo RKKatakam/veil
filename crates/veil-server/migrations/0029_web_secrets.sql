@@ -32,8 +32,12 @@ CREATE TABLE IF NOT EXISTS webauthn_challenges (
     prf_salt TEXT,
     origin TEXT NOT NULL,
     rp_id TEXT NOT NULL,
-    expires_at BIGINT NOT NULL
+    expires_at BIGINT NOT NULL,
+    -- The address that asked (the anonymous rate's key, `limits::Address`):
+    -- an address holds a bounded number of pending sign-ins (BUG-1902).
+    address TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS webauthn_challenges_by_address ON webauthn_challenges (address);
 
 CREATE TABLE IF NOT EXISTS webauthn_credentials (
     credential_id TEXT PRIMARY KEY,
@@ -43,7 +47,9 @@ CREATE TABLE IF NOT EXISTS webauthn_credentials (
     public_key BYTEA NOT NULL,
     sign_count BIGINT NOT NULL DEFAULT 0,
     prf_salt TEXT NOT NULL,
-    created_at BIGINT NOT NULL
+    created_at BIGINT NOT NULL,
+    -- `vl web --label`: what the person called this browser (BUG-1901).
+    label TEXT
 );
 
 CREATE INDEX IF NOT EXISTS webauthn_credentials_by_person ON webauthn_credentials (person_id);

@@ -387,10 +387,22 @@ impl VirtualPasskey {
     }
 }
 
+/// `vl web`'s request: an enrollment code, asked for with the device's
+/// signature over a challenge of the server (under `context`).
+pub(crate) fn signed_enroll_request(hub: &TestHub, signer: &Identity, context: &str) -> Value {
+    let ch = hub.api().post_json(None, "/v1/auth/challenge", &json!({ "key": signer.verifying_hex() }));
+    assert_eq!(ch.status, 200, "{}", String::from_utf8_lossy(&ch.body));
+    let challenge = ch.json()["challenge"].as_str().expect("challenge").to_string();
+    json!({
+        "hub": hub.authority(),
+        "signature": signer.sign(context, &veil_core::hub::wire::login_message(&hub.authority(), &challenge)),
+        "challenge": challenge,
+    })
+}
+
 pub(crate) fn mint_enroll_code(hub: &TestHub, person: &Person) -> String {
-    let r = hub
-        .api()
-        .post_json(Some(&person.token()), "/v1/sessions/web-enroll", &json!({}));
+    let req = signed_enroll_request(hub, &person.identity(), veil_core::crypto::domains::SIG_CONTEXT_HUB_WEB_ENROLL);
+    let r = hub.api().post_json(Some(&person.token()), "/v1/sessions/web-enroll", &req);
     assert_eq!(r.status, 200, "mint web-enroll failed: {}", String::from_utf8_lossy(&r.body));
     let code = r.json()["code"].as_str().expect("code").to_string();
     assert!(code.starts_with(WEB_ENROLL_PREFIX));
@@ -1014,7 +1026,7 @@ fn guarantee_4_browser_device_sees_only_readable_folder_rings_and_removal_delete
     catch_up(&hub, &proj);
 
     // Enroll & confirm browser #2 so we can fetch the post-removal ring & ciphertext, then verify browser #1 CANNOT open it,
-    // AND verify `POST /web/logout` on browser #2 ALSO revokes browser #2 and rotates keys!
+    // AND verify "Remove this browser" (`POST /web/devices/remove`) on browser #2 revokes browser #2 and rotates keys!
     let code2 = mint_enroll_code(&hub, &bob);
     let mut bob_web2 = BrowserClient::new(&hub);
     let mut bob_pk2 = VirtualPasskey::new_with_prf(6);
@@ -1044,12 +1056,17 @@ fn guarantee_4_browser_device_sees_only_readable_folder_rings_and_removal_delete
         "removed browser device #1 must not open secrets sealed after key rotation"
     );
 
-    // Signing out browser #2 (`POST /web/logout`) revokes browser #2 like device removal:
-    // its passkey credential & rings are deleted, and `vl` rotates keys for new secrets!
-    let logout2 = bob_web2.post_form("/web/logout", &[], true);
-    assert_eq!(logout2.status, 303, "logout failed: {}", logout2.text());
-    let relogin2 = bob_pk2.assert_with(&bob_web2, "deadbeef", &bob_web2.origin, &bob_web2.rp_id, 99);
-    assert!(relogin2.status == 400 || relogin2.status == 401, "revoked passkey must never sign in again");
+    // "Remove this browser" on browser #2 (`POST /web/devices/remove`, BUG-1905: never
+    // "Sign out") revokes browser #2 like device removal: its passkey credential & rings
+    // are deleted, and `vl` rotates keys for new secrets!
+    let remove2 = bob_web2.post_form("/web/devices/remove", &[("fingerprint", &fp2)], true);
+    assert_eq!(remove2.status, 303, "removing this browser failed: {}", remove2.text());
+    assert_eq!(remove2.header("location"), Some("/login"));
+    assert_eq!(bob_web2.get_api(&format!("/v1/projects/{proj}/web/rings")).status, 401, "the removed browser's session ended");
+    let begin2 = bob_web2.post_json("/web/passkey/login/begin", &json!({}), false);
+    assert_eq!(begin2.status, 200, "{}", begin2.text());
+    let relogin2 = bob_pk2.assert_with(&bob_web2, begin2.json()["challenge"].as_str().unwrap(), &bob_web2.origin, &bob_web2.rp_id, 99);
+    assert_eq!(relogin2.status, 401, "revoked passkey must never sign in again: {}", relogin2.text());
 
     let devs_after_logout = hub
         .api()
@@ -1064,7 +1081,7 @@ fn guarantee_4_browser_device_sees_only_readable_folder_rings_and_removal_delete
     let bundle2 = bob_pk2.bundle.as_ref().unwrap();
     assert!(
         removed_list.contains(&bundle2.public_identity.as_str()),
-        "signed-out browser device must be marked removed so vl rotates keys"
+        "a removed browser device must be marked removed so vl rotates keys"
     );
 
     // 4. Project-admin bar (`POST /v1/devices/remove` with `project`) deletes that project's

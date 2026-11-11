@@ -109,6 +109,12 @@ pub const SIG_CONTEXT_HUB_REQUEST: &str = "hub-request";
 /// (`hub::pr::review_message`, `docs/HUB.md` §13.24).
 pub const SIG_CONTEXT_HUB_PR_REVIEW: &str = "hub-pr-review";
 
+/// Signature context: a device asking its server for a browser enrollment
+/// code (`vl web`, `docs/HUB.md` §13.40), over `hub ‖ 0x00 ‖ challenge` as
+/// [`SIG_CONTEXT_HUB_LOGIN`] is: a passkey is enrolled only for a device
+/// that proves its identity key, never for a session token alone.
+pub const SIG_CONTEXT_HUB_WEB_ENROLL: &str = "hub-web-enroll";
+
 /// Every signature context, for the uniqueness test.
 pub const SIG_CONTEXTS: &[&str] = &[
     SIG_CONTEXT_SNAPSHOT,
@@ -125,6 +131,7 @@ pub const SIG_CONTEXTS: &[&str] = &[
     SIG_CONTEXT_HUB_GRANT,
     SIG_CONTEXT_HUB_REQUEST,
     SIG_CONTEXT_HUB_PR_REVIEW,
+    SIG_CONTEXT_HUB_WEB_ENROLL,
 ];
 
 // ---- key rings and embargoes (keychain.rs) --------------------------------

@@ -1313,7 +1313,19 @@ pub enum IdentityCmd {
         #[arg(long)]
         server: Option<String>,
     },
-    /// Remove a device on a Veil server: a lost laptop, say. Run it on
+    /// List what signs in as you on a Veil server: your `vl` devices, the
+    /// devices that wait for you to confirm them, and your passkeys of the
+    /// web client (the browsers you enrolled with `vl web`). Remove any of
+    /// them with `vl identity remove`.
+    List {
+        /// The server (`veil://host[:port]`); default: this clone's, or the
+        /// one this device is signed in to.
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Remove a device on a Veil server: a lost laptop, say, or a browser
+    /// you enrolled with `vl web` (its passkey: `vl identity list` shows
+    /// them). Run it on
     /// another of your devices to remove it everywhere; an admin may remove
     /// anyone's device from their project only (run it in a clone of the
     /// project).
@@ -1325,8 +1337,8 @@ pub enum IdentityCmd {
     /// project, and that project's keys rotate away from it; only its person
     /// removes it everywhere. It keeps what it already had.
     Remove {
-        /// The device's fingerprint (`vl identity show` on it, or the one
-        /// `vl group add` showed).
+        /// The device's fingerprint (`vl identity show` on it, the one
+        /// `vl group add` showed, or a passkey's in `vl identity list`).
         fingerprint: String,
         /// The server (`veil://host[:port]`); default: this clone's, or the
         /// one this device is signed in to.

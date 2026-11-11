@@ -769,10 +769,21 @@ impl Client {
     }
 
     /// Mint a short-lived single-use browser passkey enrollment code (`vl web`).
+    ///
+    /// Signed by this device's identity key over a challenge of the server,
+    /// as a sign-in is: the passkey it enrolls outlives this session.
     pub fn web_enroll(&self, label: Option<&str>) -> Result<veil_core::hub::web::WebEnrollResponse> {
+        let ch: Challenge = self.json("POST", "/v1/auth/challenge", Some(&ChallengeRequest { key: self.identity.verifying_hex() }))?;
+        let hub = self.url.authority.clone();
         let req = veil_core::hub::web::WebEnrollRequest {
             label: label.map(str::to_string),
             seconds: None,
+            signature: self.identity.sign(
+                veil_core::crypto::domains::SIG_CONTEXT_HUB_WEB_ENROLL,
+                &veil_core::hub::wire::login_message(&hub, &ch.challenge),
+            ),
+            challenge: ch.challenge,
+            hub,
         };
         self.json("POST", "/v1/sessions/web-enroll", Some(&req))
     }

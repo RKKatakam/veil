@@ -66,6 +66,13 @@ pub struct WebSession {
 
 /// `POST /v1/sessions/web-enroll`: mint a short-lived single-use browser
 /// enrollment code from a person's confirmed `vl` device (`docs/HUB.md` §13.40).
+///
+/// **Signed by the device's identity key**, as `vl login` is: a passkey
+/// outlives the `vl` session that made its code, so a session token alone
+/// (copied from the device, say) never mints one. The device answers a
+/// single-use challenge of `POST /v1/auth/challenge` under the context
+/// [`crate::crypto::domains::SIG_CONTEXT_HUB_WEB_ENROLL`], over
+/// [`crate::hub::wire::login_message`]`(hub, challenge)`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebEnrollRequest {
@@ -73,6 +80,15 @@ pub struct WebEnrollRequest {
     pub seconds: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The server's name as the device dialled it.
+    #[serde(default)]
+    pub hub: String,
+    /// The single-use challenge the server issued for the device's key.
+    #[serde(default)]
+    pub challenge: String,
+    /// The device's signature (hex).
+    #[serde(default)]
+    pub signature: String,
 }
 
 /// Answer of `POST /v1/sessions/web-enroll`.

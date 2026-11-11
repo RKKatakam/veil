@@ -6,6 +6,7 @@
 //! bytes never reach the browser by any route.
 
 pub mod assets;
+pub mod devices;
 pub mod html;
 pub mod passkey;
 pub mod secrets;
@@ -535,11 +536,12 @@ pub async fn file_route(
                     let rev_attr = q.rev.as_deref().unwrap_or(&ask.project.default_branch);
                     let _ = writeln!(
                         body,
-                        "<p><span class=\"badge badge-sealed\">sealed</span> <strong>Sealed secret file</strong></p><p class=\"muted\">{}</p><div class=\"form-row\"><button id=\"veil-show-secret\" type=\"button\" data-project=\"{}\" data-path=\"{}\" data-rev=\"{}\">Show secret</button><button id=\"veil-hide-secret\" type=\"button\" hidden>Hide</button><span id=\"veil-secret-status\" class=\"muted\"></span></div><pre id=\"veil-secret-plaintext\" hidden></pre><script src=\"/p/{up}/web/secrets.js\" defer></script>",
+                        "<p><span class=\"badge badge-sealed\">sealed</span> <strong>Sealed secret file</strong></p><p class=\"muted\">{}</p><div class=\"form-row\"><button id=\"veil-show-secret\" type=\"button\" data-project=\"{}\" data-path=\"{}\" data-rev=\"{}\" data-credential=\"{}\">Show secret</button><button id=\"veil-hide-secret\" type=\"button\" hidden>Hide</button><span id=\"veil-secret-status\" class=\"muted\"></span></div><pre id=\"veil-secret-plaintext\" hidden></pre><script src=\"/p/{up}/web/secrets.js\" defer></script>",
                         esc(secrets::HONEST_LIMIT_NOTICE),
                         esc(pname),
                         esc(&clean),
-                        esc(rev_attr)
+                        esc(rev_attr),
+                        esc(st.credential_id.as_deref().unwrap_or_default())
                     );
                 }
                 _ => {

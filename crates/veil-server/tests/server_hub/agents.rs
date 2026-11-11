@@ -1672,6 +1672,8 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         ("/web/passkey/login/begin", "none"),
         ("/web/passkey/login/finish", "none"),
         ("/web/logout", "none"),
+        ("/devices", "person"),
+        ("/web/devices/remove", "person"),
         ("/p/{p}", "narrowed"),
         ("/p/{p}/tree", "path"),
         ("/p/{p}/tree/{*path}", "path"),
@@ -1730,6 +1732,7 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
     const SHARES: &str = include_str!("../../src/shares.rs");
     const SECRETS: &str = include_str!("../../src/web/secrets.rs");
     const WEB: &str = include_str!("../../src/web/mod.rs");
+    const DEVICES: &str = include_str!("../../src/web/devices.rs");
     for (src, f, call) in [
         (API, "access", "viewer.narrowed_to(&path)?"),
         (API, "get_rings", "viewer.narrowed_scopes(&project)"),
@@ -1742,6 +1745,8 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         (SECRETS, "web_ciphertext_route", "query::file(&hub, &ask,"),
         (SECRETS, "guard_project_worker_asset", "caller.person_only()?"),
         (WEB, "pr_review_route", "caller.person_only()?"),
+        (DEVICES, "devices_page_route", "caller.person_only()?"),
+        (DEVICES, "remove_browser_route", "caller.person_only()?"),
     ] {
         assert!(handler(src, f).contains(call), "route handler {f} is not narrowed ({call})");
     }

@@ -65,7 +65,42 @@ fn request_origin_and_rp_id(headers: &HeaderMap) -> Result<(String, String)> {
         Some(o) if !o.trim().is_empty() => o.trim().to_string(),
         _ => format!("https://{host_raw}"),
     };
+    // Both are stored with the challenge: no longer than a name can be.
+    if origin.len() > MAX_ORIGIN_LEN || rp_id.len() > MAX_ORIGIN_LEN {
+        return Err(Error::bad_request("the request's origin is too long"));
+    }
     Ok((origin, rp_id))
+}
+
+/// A host name is at most 253 bytes; with the scheme and a port.
+const MAX_ORIGIN_LEN: usize = 300;
+
+/// Sign-ins one address may have started and not finished (BUG-1902). A
+/// challenge lasts [`WEBAUTHN_CHALLENGE_TTL_MS`], and expired ones are
+/// deleted by every ceremony that starts, so `webauthn_challenges` holds at
+/// most this many rows per address that asked within that time.
+pub const MAX_PENDING_LOGINS_PER_ADDRESS: i64 = 32;
+
+/// The user-present and user-verified flags of authenticator data. The pages
+/// ask for `userVerification: 'required'`; the server checks it (BUG-1903): a
+/// passkey is the web client's only factor, and a touch of a security key
+/// without its PIN or biometric is not its owner.
+const FLAGS_PRESENT_AND_VERIFIED: u8 = 0x01 | 0x04;
+
+fn require_user_verified(flags: u8) -> Result<()> {
+    if flags & FLAGS_PRESENT_AND_VERIFIED != FLAGS_PRESENT_AND_VERIFIED {
+        return Err(Error::unauthorized(
+            "the passkey did not verify its user (PIN or biometric): WebAuthn user-present and user-verified flags are required",
+        ));
+    }
+    Ok(())
+}
+
+/// Every ceremony that starts deletes the challenges that expired, whoever
+/// started them (as `/v1/auth/challenge` does for `vl login`'s).
+async fn delete_expired_challenges(db: &sqlx::PgPool, now: i64) -> Result<()> {
+    sqlx::query("DELETE FROM webauthn_challenges WHERE expires_at < $1").bind(now).execute(db).await?;
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -134,6 +169,7 @@ pub async fn register_begin_route(
         return Err(Error::unauthorized("enrollment code expired, unknown, or already used"));
     };
 
+    delete_expired_challenges(&hub.db, now).await?;
     let challenge = b64url_encode(&veil_core::crypto::random_bytes::<32>());
     let prf_salt = b64url_encode(&veil_core::crypto::random_bytes::<32>());
     sqlx::query(
@@ -149,11 +185,6 @@ pub async fn register_begin_route(
     .bind(now + WEBAUTHN_CHALLENGE_TTL_MS)
     .execute(&hub.db)
     .await?;
-
-    let _ = sqlx::query("DELETE FROM webauthn_challenges WHERE expires_at < $1")
-        .bind(now)
-        .execute(&hub.db)
-        .await;
 
     Ok(Json(json!({
         "challenge": challenge,
@@ -217,9 +248,7 @@ pub async fn register_finish_route(
     if parsed_att.rp_id_hash != sha256(expected_rp_id.as_bytes()) {
         return Err(Error::unauthorized("WebAuthn rpIdHash mismatch"));
     }
-    if parsed_att.flags & 0x01 == 0 {
-        return Err(Error::unauthorized("WebAuthn user-present flag not set"));
-    }
+    require_user_verified(parsed_att.flags)?;
     if b64url_encode(&parsed_att.credential_id) != req.credential_id {
         return Err(Error::bad_request("attestation credential_id mismatch"));
     }
@@ -252,8 +281,10 @@ pub async fn register_finish_route(
         if req.public_identity.as_deref().is_some_and(|s| !s.trim().is_empty()) {
             return Err(Error::bad_request("non-PRF browser registration cannot carry a secret-capable public_identity"));
         }
+        // No device keys: the passkey is still a device its person lists
+        // and removes, by the fingerprint of its credential id (BUG-1901).
         let sk = format!("web-noprf:{}", hex::encode(sha256(req.credential_id.as_bytes())));
-        (sk, String::new(), None, false)
+        (sk, String::new(), Some(veil_core::hub::wire::passkey_fingerprint(&req.credential_id)), false)
     };
 
     let token = format!("{WEB_TOKEN_PREFIX}{}", hex::encode(veil_core::crypto::random_bytes::<32>()));
@@ -282,19 +313,18 @@ pub async fn register_finish_route(
         let pub_key = pub_key_bytes.clone();
         let sh = sh_clone.clone();
         Box::pin(async move {
-            let consumed = sqlx::query(
+            let consumed: Option<(Option<String>,)> = sqlx::query_as(
                 "UPDATE web_enrollments SET used_at = $1 \
-                 WHERE code_hash = $2 AND person_id = $3 AND used_at IS NULL AND expires_at > $1",
+                 WHERE code_hash = $2 AND person_id = $3 AND used_at IS NULL AND expires_at > $1 RETURNING label",
             )
             .bind(now)
             .bind(&code_hash)
             .bind(person_id)
-            .execute(&mut *c)
-            .await?
-            .rows_affected();
-            if consumed != 1 {
+            .fetch_optional(&mut *c)
+            .await?;
+            let Some((label,)) = consumed else {
                 return Err(Error::unauthorized("enrollment code expired or already used"));
-            }
+            };
 
             // Refuse reusing any existing device's signing key or public identity (never copy a `vl` device key).
             let dup: Option<i64> = sqlx::query_scalar(
@@ -331,8 +361,8 @@ pub async fn register_finish_route(
             .await?;
 
             sqlx::query(
-                "INSERT INTO webauthn_credentials (credential_id, person_id, device_id, alg, public_key, sign_count, prf_salt, created_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                "INSERT INTO webauthn_credentials (credential_id, person_id, device_id, alg, public_key, sign_count, prf_salt, created_at, label) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             )
             .bind(&cred_id)
             .bind(person_id)
@@ -342,6 +372,7 @@ pub async fn register_finish_route(
             .bind(sign_count)
             .bind(&prf_salt)
             .bind(now)
+            .bind(&label)
             .execute(&mut *c)
             .await?;
 
@@ -369,7 +400,11 @@ pub async fn register_finish_route(
         None,
         Some(person_id),
         "passkey enroll",
-        if req.prf_supported { "prf browser device (pending confirmation)" } else { "non-prf browser passkey" },
+        &format!(
+            "{} {}",
+            if req.prf_supported { "prf browser device (pending confirmation)" } else { "non-prf browser passkey" },
+            fingerprint.as_deref().unwrap_or_default()
+        ),
     )
     .await;
 
@@ -404,6 +439,7 @@ pub async fn register_finish_route(
 /// `POST /web/passkey/login/begin`: issue a single-use WebAuthn assertion challenge.
 pub async fn login_begin_route(
     State(hub): State<HubState>,
+    address: Option<axum::Extension<crate::limits::Address>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>> {
@@ -439,17 +475,32 @@ pub async fn login_begin_route(
         }
     }
 
-    sqlx::query(
-        "INSERT INTO webauthn_challenges (challenge, kind, person_id, origin, rp_id, expires_at) \
-         VALUES ($1, 'login', $2, $3, $4, $5)",
+    // Anyone starts a sign-in (the anonymous rate, S24, is all that admits
+    // it): expired challenges go first, and an address holds a bounded number
+    // of pending ones (BUG-1902).
+    delete_expired_challenges(&hub.db, now).await?;
+    let address = address.map(|a| format!("{:032x}", a.0 .0)).unwrap_or_default();
+    let stored = sqlx::query(
+        "INSERT INTO webauthn_challenges (challenge, kind, person_id, origin, rp_id, expires_at, address) \
+         SELECT $1, 'login', $2, $3, $4, $5, $6 \
+         WHERE (SELECT count(*) FROM webauthn_challenges WHERE kind = 'login' AND address = $6) < $7",
     )
     .bind(&challenge)
     .bind(person_id)
     .bind(&origin)
     .bind(&rp_id)
     .bind(now + WEBAUTHN_CHALLENGE_TTL_MS)
+    .bind(&address)
+    .bind(MAX_PENDING_LOGINS_PER_ADDRESS)
     .execute(&hub.db)
-    .await?;
+    .await?
+    .rows_affected();
+    if stored != 1 {
+        return Err(Error::rate_limited(
+            "too many sign-ins started from this address and not finished; try again in two minutes",
+            WEBAUTHN_CHALLENGE_TTL_MS as u64,
+        ));
+    }
 
     Ok(Json(json!({
         "challenge": challenge,
@@ -502,9 +553,7 @@ pub async fn login_finish_route(
     if auth_data[..32] != sha256(expected_rp_id.as_bytes()) {
         return Err(Error::unauthorized("WebAuthn rpIdHash mismatch"));
     }
-    if auth_data[32] & 0x01 == 0 {
-        return Err(Error::unauthorized("WebAuthn user-present flag not set"));
-    }
+    require_user_verified(auth_data[32])?;
     let new_sign_count = u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]) as i64;
 
     type CredRow = (i64, String, i64, i32, Vec<u8>, i64, String, bool, bool, Option<String>);
@@ -560,6 +609,17 @@ pub async fn login_finish_route(
         .bind(expires_at)
         .execute(&hub.db)
         .await?;
+
+    // A pending device lasts a day unless it signs in again (`auth.rs`,
+    // `PENDING_TTL_MS`): a passkey sign-in is the browser device's sign-in,
+    // so `vl identity confirm` finds it for a day more (BUG-1904).
+    if pending {
+        sqlx::query("UPDATE devices SET created_at = $1 WHERE id = $2 AND pending AND removed_at IS NULL")
+            .bind(now)
+            .bind(device_id)
+            .execute(&hub.db)
+            .await?;
+    }
 
     crate::audit(&hub.db, None, Some(person_id), "passkey login", "web session").await;
 

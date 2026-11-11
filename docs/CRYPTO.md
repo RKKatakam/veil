@@ -251,7 +251,8 @@ Read forever; written only into format-1/2 repositories.
 
 `Ed25519(signing_key, SIG_PREFIX ‖ context ‖ 0x00 ‖ payload)`, contexts
 `snapshot`, `ring-change`, `member-binding`, `vault-entry`, `tag`,
-`hub-login`, `hub-device`, `hub-invite`, `hub-grant`, `hub-request`, and the
+`hub-login`, `hub-device`, `hub-invite`, `hub-grant`, `hub-request`,
+`hub-web-enroll`, and the
 retired `embargo` and `embargo-release` (signed embargo records, formats 7
 and earlier; reserved, never reused) (see the
 domains table). Payloads are fixed encodings (FORMAT.md §2, "signed bodies never
@@ -553,6 +554,7 @@ are distinct and pins their exact bytes.
 | `SIG_CONTEXT_HUB_DEVICE` | `hub-device` | Ed25519 context (a device vouching for another device of its person, over X25519 ‖ Ed25519 public keys, HUB.md §13.11) | C5, C13 |
 | `SIG_CONTEXT_HUB_INVITE` | `hub-invite` | Ed25519 context (a join under an invite, by the invite's key, over `person ‖ 0 ‖ X25519 ‖ Ed25519` of the joining device, HUB.md §13.12) | C5, C13 |
 | `SIG_CONTEXT_HUB_SHARE` | `hub-share` | Ed25519 context (one version of a person-to-person secret share, by the sharing device, over `ShareRecord::signing_body`, HUB.md §13.17) | C5, C14 |
+| `SIG_CONTEXT_HUB_WEB_ENROLL` | `hub-web-enroll` | Ed25519 context (a device asking for a browser enrollment code with `vl web`, over `hub ‖ 0 ‖ challenge` as `hub-login`, HUB.md §13.40) | C5 |
 | `HUB_VIEW_KEY` | `veil 2026 hub view-key v1` | BLAKE3 `derive_key` mode as a hash | server: projection cache key (not secret) |
 
 | `SIG_CONTEXT_HUB_GRANT` | `hub-grant` | Ed25519 context (a server's read grant, by its grant key, over the grant's JSON body as sent, HUB.md §13.16) | C5 |

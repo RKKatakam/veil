@@ -26,7 +26,7 @@
 use rcgen::SigningKey as _;
 use serde_json::{json, Value};
 use veil_core::{
-    crypto::domains::{SIG_CONTEXT_HUB_LOGIN, SIG_CONTEXT_MEMBER_BINDING},
+    crypto::domains::{SIG_CONTEXT_HUB_LOGIN, SIG_CONTEXT_HUB_WEB_ENROLL, SIG_CONTEXT_MEMBER_BINDING},
     hub::{
         web::{b64url_encode, sha256},
         wire::login_message,
@@ -38,7 +38,7 @@ use veil_core::{
 
 use crate::{
     support::*,
-    web_secrets::{catch_up, mint_enroll_code, BrowserClient, VirtualPasskey, WebReply},
+    web_secrets::{catch_up, mint_enroll_code, signed_enroll_request, BrowserClient, VirtualPasskey, WebReply},
 };
 
 /// A project of `admin`'s with one public file and one secret (`.env`).
@@ -169,7 +169,6 @@ fn exec(hub: &TestHub, sql: &str, bind: &str) -> u64 {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "BUG-1900: a stranger's pending device that names an admin's encryption key makes the server refuse every key ring that holds the admin"]
 fn bug_1900_a_strangers_pending_device_never_blocks_a_key_ring_update() {
     let hub = TestHub::start();
     let alice = hub.person("alice");
@@ -213,7 +212,6 @@ fn bug_1900_a_strangers_pending_device_never_blocks_a_key_ring_update() {
 }
 
 #[test]
-#[ignore = "BUG-1900: another person's browser device that names an admin's encryption key makes the server refuse every key ring that holds the admin, in every project with browser secrets off"]
 fn bug_1900_another_persons_browser_device_never_blocks_a_key_ring_update() {
     let hub = TestHub::start();
     let alice = hub.person("alice");
@@ -251,7 +249,6 @@ fn bug_1900_another_persons_browser_device_never_blocks_a_key_ring_update() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "BUG-1901: a passkey enrolled without PRF is in no device list and no route removes it: it signs in for ever"]
 fn bug_1901_a_person_can_remove_a_passkey_enrolled_without_prf() {
     let hub = TestHub::start();
     let bob = hub.person("bob");
@@ -272,12 +269,28 @@ fn bug_1901_a_person_can_remove_a_passkey_enrolled_without_prf() {
     let listed = hub.api().get(Some(&token), &format!("/v1/people/{}/devices", bob.name));
     assert_eq!(listed.status, 200);
     let listed = listed.json();
-    let others: Vec<String> = ["identities", "pending"]
+    // (His devices as identities, his passkeys by their fingerprints.)
+    let mut others: Vec<String> = ["identities", "pending"]
         .iter()
         .flat_map(|k| listed[*k].as_array().cloned().unwrap_or_default())
         .filter_map(|v| v.as_str().map(str::to_string))
         .filter(|id| *id != mine)
         .collect();
+    let passkeys = listed["passkeys"].as_array().cloned().unwrap_or_default();
+    assert_eq!(passkeys.len(), 1, "the passkey is listed to its person: {listed}");
+    assert_eq!(passkeys[0]["fingerprint"], veil_core::hub::wire::passkey_fingerprint(&pk.cred_id_b64).as_str());
+    assert_eq!(passkeys[0]["opens_secrets"], false);
+    others.extend(passkeys.iter().filter_map(|p| p["fingerprint"].as_str().map(str::to_string)));
+    // To nobody else: another person's list of Bob's devices has no passkeys.
+    let carol = hub.person("carol");
+    let seen = hub.api().get(Some(&carol.token()), &format!("/v1/people/{}/devices", bob.name));
+    assert_eq!(seen.status, 200);
+    assert!(seen.json().get("passkeys").is_none(), "{}", seen.json());
+    // Nor can she remove it by its fingerprint.
+    for id in &others {
+        let r = hub.api().post_json(Some(&carol.token()), "/v1/devices/remove", &json!({ "device": id }));
+        assert_eq!(r.status, 404, "someone else removing {id}: {}", String::from_utf8_lossy(&r.body));
+    }
     for id in &others {
         let r = hub.api().post_json(Some(&token), "/v1/devices/remove", &json!({ "device": id }));
         assert_eq!(r.status, 200, "removing {id}: {}", String::from_utf8_lossy(&r.body));
@@ -300,7 +313,6 @@ fn bug_1901_a_person_can_remove_a_passkey_enrolled_without_prf() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "BUG-1902: /web/passkey/login/begin stores a row for anyone and never deletes expired ones"]
 fn bug_1902_expired_login_challenges_are_deleted() {
     let hub = TestHub::start();
     let web = BrowserClient::new(&hub);
@@ -326,7 +338,6 @@ fn bug_1902_expired_login_challenges_are_deleted() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "BUG-1903: a passkey assertion without user verification signs in (the pages ask for userVerification: 'required')"]
 fn bug_1903_a_passkey_assertion_without_user_verification_is_refused() {
     let hub = TestHub::start();
     let alice = hub.person("alice");
@@ -347,7 +358,6 @@ fn bug_1903_a_passkey_assertion_without_user_verification_is_refused() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "BUG-1904: a browser device enrolled more than a day ago is never found by `vl identity confirm`, and signing in with the passkey does not renew it"]
 fn bug_1904_a_browser_device_is_confirmed_a_day_after_it_enrolled() {
     let hub = TestHub::start();
     let alice = hub.person("alice");
@@ -610,7 +620,6 @@ fn turning_the_setting_off_rotates_keys_away_from_the_browser_device() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "BUG-1905: signing out of the web client deletes the browser's passkey and device: the next visit cannot sign in (the guide: \"later visits sign in with that passkey\")"]
 fn bug_1905_a_passkey_signs_in_again_after_signing_out() {
     let hub = TestHub::start();
     let alice = hub.person("alice");
@@ -619,13 +628,117 @@ fn bug_1905_a_passkey_signs_in_again_after_signing_out() {
     pk.enroll(&mut web, &alice.name, &mint_enroll_code(&hub, &alice));
     assert_eq!(web.get("/").status, 200);
     let out = web.post_form("/web/logout", &[], true);
-    assert!(out.status == 303 || out.status == 200, "signing out: {} {}", out.status, out.text());
+    assert_eq!(out.status, 303, "signing out: {}", out.text());
     // The session is over.
     let cookie = web.cookie.clone().expect("the old session's cookie");
     assert_eq!(hub.api().get(Some(&cookie), "/v1/epochs").status, 401, "the signed-out session still works");
     // The next visit: the passkey the browser still holds.
     let again = assert_with_flags(&pk, &web, &login_challenge(&web, None), 0x05, 2);
     assert_eq!(again.status, 200, "the passkey no longer signs in after a sign-out: {}", again.text());
+    // And nothing was removed or rotated: the device is still Alice's.
+    assert_eq!(count(&hub, "SELECT count(*) FROM devices d JOIN people p ON p.id = d.person_id WHERE p.name = $1 AND d.browser AND d.removed_at IS NULL", &alice.name), 1);
+    assert_eq!(count(&hub, "SELECT count(*) FROM audit_log WHERE action = $1", "remove browser device"), 0);
+}
+
+/// "Your devices" in the web client lists every passkey of the person with
+/// their `vl` devices, and removes a browser: another one ("Remove"), or the
+/// one the session is in ("Remove this browser"), which is a separate action
+/// from "Sign out" (BUG-1901, BUG-1905). `vl identity list` shows the same
+/// passkeys and `vl identity remove` removes one. Nobody removes another
+/// person's, and never across sites.
+#[test]
+fn your_devices_lists_every_passkey_and_removes_a_browser() {
+    let hub = TestHub::start();
+    let alice = hub.person("alice");
+    let bob = hub.person("bob");
+    // Alice enrolls two browsers: a phone without PRF, a laptop with.
+    let (mut phone, mut laptop) = (BrowserClient::new(&hub), BrowserClient::new(&hub));
+    let mut phone_pk = VirtualPasskey::new_without_prf(71);
+    let labelled = alice.run(alice.home.path(), &["web", "--label", "Alice's phone", "--json"]);
+    assert!(labelled.status.success(), "{}", String::from_utf8_lossy(&labelled.stderr));
+    let code: Value = serde_json::from_slice(&labelled.stdout).unwrap();
+    phone_pk.enroll(&mut phone, &alice.name, code["code"].as_str().unwrap());
+    let phone_fp = veil_core::hub::wire::passkey_fingerprint(&phone_pk.cred_id_b64);
+    let mut laptop_pk = VirtualPasskey::new_with_prf(72);
+    let reg = laptop_pk.enroll(&mut laptop, &alice.name, &mint_enroll_code(&hub, &alice));
+    let laptop_fp = reg["fingerprint"].as_str().expect("a fingerprint").to_string();
+    // Bob enrolls one.
+    let mut bobs = BrowserClient::new(&hub);
+    let mut bob_pk = VirtualPasskey::new_without_prf(73);
+    bob_pk.enroll(&mut bobs, &bob.name, &mint_enroll_code(&hub, &bob));
+    let bob_fp = veil_core::hub::wire::passkey_fingerprint(&bob_pk.cred_id_b64);
+
+    // The page, from the laptop: both browsers, the label, her `vl` device;
+    // not Bob's.
+    let page = laptop.get("/devices");
+    assert_eq!(page.status, 200, "{}", page.text());
+    let text = page.text();
+    let vl_fp = veil_core::hub::wire::device_fingerprint(&parse_public_identity(&alice.identity().public_id()).unwrap()).unwrap();
+    for shown in [phone_fp.as_str(), laptop_fp.as_str(), vl_fp.as_str(), "Alice&#x27;s phone", "Remove this browser"] {
+        assert!(text.contains(shown), "`{shown}` is not on the page: {text}");
+    }
+    assert!(!text.contains(&bob_fp), "another person's passkey is listed");
+    assert_eq!(text.matches("Remove this browser").count(), 1);
+    // Signed out, there is no page.
+    assert_eq!(BrowserClient::new(&hub).get("/devices").status, 401);
+
+    // `vl identity list` shows them too.
+    let listed = alice.run(alice.home.path(), &["identity", "list"]);
+    assert!(listed.status.success(), "{}", String::from_utf8_lossy(&listed.stderr));
+    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+    for shown in [phone_fp.as_str(), laptop_fp.as_str(), vl_fp.as_str(), "Alice's phone"] {
+        assert!(listed.contains(shown), "`{shown}` is not in `vl identity list`: {listed}");
+    }
+
+    // Nobody removes another person's browser; no other site removes one;
+    // a form without the session's token removes nothing.
+    let devices = "SELECT count(*) FROM devices d JOIN people p ON p.id = d.person_id WHERE p.name = $1 AND d.browser AND d.removed_at IS NULL";
+    let by_bob = bobs.post_form("/web/devices/remove", &[("fingerprint", &phone_fp)], true);
+    assert_eq!(by_bob.status, 404, "{}", by_bob.text());
+    let no_token = laptop.post_form("/web/devices/remove", &[("fingerprint", &phone_fp)], false);
+    assert_eq!(no_token.status, 403, "{}", no_token.text());
+    let csrf = laptop.csrf.clone().unwrap();
+    let cross = laptop.send(
+        "POST",
+        "/web/devices/remove",
+        &[("content-type", "application/x-www-form-urlencoded"), ("origin", "https://evil.example"), ("sec-fetch-site", "cross-site")],
+        Some(format!("fingerprint={phone_fp}&_csrf={csrf}").as_bytes()),
+    );
+    assert_eq!(cross.status, 403, "{}", cross.text());
+    assert_eq!(count(&hub, devices, &alice.name), 2);
+
+    // From the laptop, Alice removes the phone she lost: it no longer signs
+    // in, its session is over, and the laptop's goes on.
+    assert_eq!(phone.get("/devices").status, 200);
+    let removed = laptop.post_form("/web/devices/remove", &[("fingerprint", &phone_fp)], true);
+    assert_eq!(removed.status, 303, "{}", removed.text());
+    assert_eq!(removed.header("location"), Some("/devices"));
+    assert_eq!(phone.get("/devices").status, 401, "the removed browser's session still works");
+    let again = assert_with_flags(&phone_pk, &phone, &login_challenge(&phone, None), 0x05, 2);
+    assert_eq!(again.status, 401, "the removed passkey still signs in: {}", again.text());
+    let after = laptop.get("/devices");
+    assert_eq!(after.status, 200);
+    assert!(!after.text().contains(&phone_fp) && after.text().contains(&laptop_fp), "{}", after.text());
+    assert_eq!(count(&hub, devices, &alice.name), 1);
+
+    // "Remove this browser": the laptop removes itself. Its cookie is
+    // cleared, its session is over, and its passkey no longer signs in.
+    let own = laptop.post_form("/web/devices/remove", &[("fingerprint", &laptop_fp)], true);
+    assert_eq!(own.status, 303, "{}", own.text());
+    assert_eq!(own.header("location"), Some("/login"));
+    assert!(own.set_cookies().iter().any(|c| c.starts_with("__Host-veil_session=;") && c.contains("Max-Age=0")), "{:?}", own.set_cookies());
+    assert_eq!(laptop.get("/devices").status, 401);
+    let again = assert_with_flags(&laptop_pk, &laptop, &login_challenge(&laptop, None), 0x05, 2);
+    assert_eq!(again.status, 401, "the removed browser's passkey still signs in: {}", again.text());
+    assert_eq!(count(&hub, devices, &alice.name), 0);
+    assert_eq!(count(&hub, "SELECT count(*) FROM audit_log WHERE action = $1", "remove browser device"), 2);
+    // Bob's is untouched, and `vl identity remove` removes it.
+    assert_eq!(count(&hub, devices, &bob.name), 1);
+    let out = bob.run(bob.home.path(), &["identity", "remove", &bob_fp]);
+    assert!(out.status.success(), "vl identity remove: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(count(&hub, devices, &bob.name), 0);
+    let again = assert_with_flags(&bob_pk, &bobs, &login_challenge(&bobs, None), 0x05, 2);
+    assert_eq!(again.status, 401, "{}", again.text());
 }
 
 /// Right after an admin gives a folder to another group, the browser device
@@ -799,7 +912,8 @@ fn agent_and_runner_sessions_use_no_route_of_s26() {
     for (token, who) in sessions(&alice).iter().zip(["the admin's agent", "the admin's runner"]) {
         refused(as_browser(token, Some(&json!({ "enabled": true })), &format!("/v1/projects/{proj}/web-secrets")), &format!("{who}, the setting"));
         // (An enrollment code is `vl`'s to ask for: no browser headers.)
-        refused(api.post_json(Some(token), "/v1/sessions/web-enroll", &json!({})), &format!("{who}, an enrollment code"));
+        let signed = signed_enroll_request(&hub, &alice.identity(), SIG_CONTEXT_HUB_WEB_ENROLL);
+        refused(api.post_json(Some(token), "/v1/sessions/web-enroll", &signed), &format!("{who}, an enrollment code"));
         for path in [
             format!("/v1/projects/{proj}/web/rings"),
             format!("/v1/projects/{proj}/web/ciphertext?rev=main&path=.env"),
@@ -814,6 +928,56 @@ fn agent_and_runner_sessions_use_no_route_of_s26() {
     // The action: the admin's own session turns the setting on.
     let on = api.post_json(Some(&alice.token()), &format!("/v1/projects/{proj}/web-secrets"), &json!({ "enabled": true }));
     assert_eq!(on.status, 200);
+}
+
+/// An enrollment code is asked for with the device's signature, as a sign-in
+/// is: a passkey outlives the `vl` session that made its code, so a session
+/// token alone (copied from the device) enrolls no browser. The signature is
+/// the device's own, under `vl web`'s context, over a challenge of this
+/// server, used once.
+#[test]
+fn an_enrollment_code_needs_the_signature_of_the_devices_identity_key() {
+    let hub = TestHub::start();
+    let alice = hub.person("alice");
+    let token = alice.token();
+    let api = hub.api();
+    let enrollments = "SELECT count(*) FROM web_enrollments e JOIN people p ON p.id = e.person_id WHERE p.name = $1";
+    let ask = |req: &Value| api.post_json(Some(&token), "/v1/sessions/web-enroll", req);
+    let refused = |r: Reply, what: &str| {
+        assert_eq!(r.status, 401, "{what}: {}", String::from_utf8_lossy(&r.body));
+        assert_eq!(count(&hub, enrollments, &alice.name), 0, "{what}: a code was stored");
+    };
+
+    // The session token alone: no code.
+    refused(ask(&json!({})), "no signature");
+    refused(ask(&json!({ "label": "a phone" })), "no signature, a label");
+    // A signature of another device's key (whoever copied the token has
+    // their own keys, not this device's).
+    refused(ask(&signed_enroll_request(&hub, &Identity::generate("mallory"), SIG_CONTEXT_HUB_WEB_ENROLL)), "another key's signature");
+    // A sign-in's signature is no enrollment's (another context).
+    refused(ask(&signed_enroll_request(&hub, &alice.identity(), SIG_CONTEXT_HUB_LOGIN)), "a sign-in's signature");
+    // A signature that names another server.
+    let mut elsewhere = signed_enroll_request(&hub, &alice.identity(), SIG_CONTEXT_HUB_WEB_ENROLL);
+    let challenge = elsewhere["challenge"].as_str().unwrap().to_string();
+    elsewhere["hub"] = json!("other.example");
+    elsewhere["signature"] = json!(alice.identity().sign(SIG_CONTEXT_HUB_WEB_ENROLL, &login_message("other.example", &challenge)));
+    refused(ask(&elsewhere), "a signature for another server");
+
+    // The device's own signature: a code, and the challenge is used up.
+    let signed = signed_enroll_request(&hub, &alice.identity(), SIG_CONTEXT_HUB_WEB_ENROLL);
+    let ok = ask(&signed);
+    assert_eq!(ok.status, 200, "{}", String::from_utf8_lossy(&ok.body));
+    assert!(ok.json()["code"].as_str().is_some_and(|c| c.starts_with("web-enroll-")), "{}", String::from_utf8_lossy(&ok.body));
+    assert_eq!(count(&hub, enrollments, &alice.name), 1);
+    let replay = ask(&signed);
+    assert_eq!(replay.status, 401, "the same signed request again: {}", String::from_utf8_lossy(&replay.body));
+    assert_eq!(count(&hub, enrollments, &alice.name), 1, "a replayed request stored a code");
+
+    // `vl web` asks that way.
+    let out = alice.run(alice.home.path(), &["web", "--json"]);
+    assert!(out.status.success(), "vl web: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("web-enroll-"), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(count(&hub, enrollments, &alice.name), 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -960,5 +1124,5 @@ fn bug_1906_a_browser_enrolls_signs_in_and_signs_out_over_http2() {
     let cookie = format!("__Host-veil_session={token}");
     let form = [("origin", origin.as_str()), ("sec-fetch-site", "same-origin"), ("content-type", "application/x-www-form-urlencoded"), ("accept", "application/json"), ("cookie", cookie.as_str())];
     let (status, answer) = over_http2(&hub, "POST", "/web/logout", &form, format!("_csrf={csrf}").as_bytes());
-    assert!(status == 303 || status == 200, "signing out over HTTP/2: {status} {answer}");
+    assert_eq!(status, 303, "signing out over HTTP/2: {answer}");
 }

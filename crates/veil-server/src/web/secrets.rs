@@ -136,55 +136,86 @@ pub fn readable_scopes(project: &Project, viewer: &Viewer) -> HashSet<String> {
     out
 }
 
+/// A device that **is** a ring member: the member's own person's device, with
+/// the member's signing key and encryption key.
+struct MemberDevice {
+    id: i64,
+    browser: bool,
+    pending: bool,
+    prf_supported: bool,
+    vouched: bool,
+}
+
+/// The devices that are members of a ring, each `(member id, signing key,
+/// person)`. A ring member is matched to a device by all three (BUG-1900):
+/// the signing key is unique to one device, the encryption key (the member
+/// id) is not, since anyone can register a device whose identity names
+/// someone else's encryption key under their own signing key, and a sign-in
+/// under a taken name is a pending device of that name. So a pending device
+/// or another person's device that only shares a member's encryption key is
+/// not that member, and is never looked at.
+async fn member_devices(db: &sqlx::PgPool, members: &HashSet<(String, String, String)>) -> Result<Vec<MemberDevice>> {
+    if members.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys: Vec<String> = members.iter().map(|(_, key, _)| key.clone()).collect();
+    type Row = (i64, String, String, String, bool, bool, bool, bool);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT d.id, LEFT(d.public_identity, 69), d.signing_key, p.name, d.browser, d.pending, d.prf_supported, \
+                EXISTS (SELECT 1 FROM device_vouches v WHERE v.device_id = d.id) \
+         FROM devices d JOIN people p ON p.id = d.person_id \
+         WHERE d.removed_at IS NULL AND d.public_identity <> '' AND d.signing_key = ANY($1)",
+    )
+    .bind(&keys)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, member, key, person, browser, pending, prf_supported, vouched)| {
+            members.contains(&(member, key, person)).then_some(MemberDevice { id, browser, pending, prf_supported, vouched })
+        })
+        .collect())
+}
+
+fn member_of(id: &str, signing_key: Option<&String>, name: &str) -> Option<(String, String, String)> {
+    Some((id.to_string(), signing_key?.clone(), name.to_string()))
+}
+
 /// Enforce S26's two server-side ring-upload invariants on `POST /v1/projects/{p}/rings/{scope}`:
 /// 1. No ring ever wraps a key to an unconfirmed (`pending`) device or unvouched browser device.
 /// 2. When `projects.web_secrets` is `false`, no ring wraps a key to a browser device.
+///
+/// Both are about the members' own devices ([`member_devices`]). A member
+/// without a signing key is no device of this server's: a browser device's
+/// identity always has one, and the server hands a browser session no ring
+/// that [`sync_browser_rings_for_scope`] did not store for its device.
 pub async fn validate_ring_browser_members(
     db: &sqlx::PgPool,
     project_id: i64,
     ring: &KeyRing,
 ) -> Result<bool> {
     let web_secrets = is_project_web_secrets_enabled(db, project_id).await?;
-    let mut member_ids: HashSet<String> = HashSet::new();
+    let mut members: HashSet<(String, String, String)> = HashSet::new();
     if let Ok(st) = ring.verify() {
-        member_ids.extend(st.members.keys().cloned());
+        members.extend(st.members.iter().filter_map(|(id, m)| member_of(id, m.signing_key.as_ref(), &m.name)));
     } else {
         for entry in &ring.log {
             match &entry.op {
-                RingOp::Genesis { members, .. } => {
-                    for m in members {
-                        member_ids.insert(m.id.clone());
-                    }
+                RingOp::Genesis { members: first, .. } => {
+                    members.extend(first.iter().filter_map(|m| member_of(&m.id, m.signing_key.as_ref(), &m.name)));
                 }
                 RingOp::Grant { member } | RingOp::Share { member, .. } => {
-                    member_ids.insert(member.id.clone());
+                    members.extend(member_of(&member.id, member.signing_key.as_ref(), &member.name));
                 }
                 _ => {}
             }
         }
     }
-    member_ids.extend(ring.members.keys().cloned());
-    if member_ids.is_empty() {
-        return Ok(web_secrets);
+    let devices = member_devices(db, &members).await?;
+    if devices.iter().any(|d| d.pending || (d.browser && !d.vouched)) {
+        return Err(unconfirmed_browser_device_err());
     }
-
-    let ids: Vec<String> = member_ids.into_iter().collect();
-    type DevRow = (bool, bool, bool);
-    let rows: Vec<DevRow> = sqlx::query_as(
-        "SELECT d.browser, d.pending, EXISTS (SELECT 1 FROM device_vouches v WHERE v.device_id = d.id) \
-         FROM devices d \
-         WHERE d.removed_at IS NULL AND d.public_identity <> '' AND LEFT(d.public_identity, 69) = ANY($1)",
-    )
-    .bind(&ids)
-    .fetch_all(db)
-    .await?;
-
-    for (browser, pending, has_vouch) in &rows {
-        if *pending || (*browser && !*has_vouch) {
-            return Err(unconfirmed_browser_device_err());
-        }
-    }
-    if !web_secrets && rows.iter().any(|(browser, _, _)| *browser) {
+    if !web_secrets && devices.iter().any(|d| d.browser) {
         return Err(web_secrets_disabled_err());
     }
     Ok(web_secrets)
@@ -203,34 +234,27 @@ pub async fn sync_browser_rings_for_scope(
     let Ok(state) = ring.verify() else {
         return Ok(());
     };
-    let active_members: Vec<String> = state.members.keys().cloned().collect();
+    let members: HashSet<(String, String, String)> =
+        state.members.iter().filter_map(|(id, m)| member_of(id, m.signing_key.as_ref(), &m.name)).collect();
     sqlx::query("DELETE FROM browser_device_rings WHERE project_id = $1 AND scope = $2")
         .bind(project_id)
         .bind(scope)
         .execute(db)
         .await?;
-    if active_members.is_empty() {
-        return Ok(());
-    }
-    let dev_ids: Vec<i64> = sqlx::query_scalar(
-        "SELECT d.id FROM devices d \
-         WHERE d.browser AND d.prf_supported AND NOT d.pending AND d.removed_at IS NULL \
-         AND d.public_identity <> '' AND LEFT(d.public_identity, 69) = ANY($1) \
-         AND EXISTS (SELECT 1 FROM device_vouches v WHERE v.device_id = d.id) \
-         AND NOT EXISTS (SELECT 1 FROM device_bars b WHERE b.project_id = $2 AND b.device_id = d.id)",
-    )
-    .bind(&active_members)
-    .bind(project_id)
-    .fetch_all(db)
-    .await?;
-
-    for dev_id in dev_ids {
+    let barred: Vec<i64> = sqlx::query_scalar("SELECT device_id FROM device_bars WHERE project_id = $1")
+        .bind(project_id)
+        .fetch_all(db)
+        .await?;
+    for d in member_devices(db, &members).await? {
+        if !(d.browser && d.prf_supported && !d.pending && d.vouched) || barred.contains(&d.id) {
+            continue;
+        }
         sqlx::query(
             "INSERT INTO browser_device_rings (device_id, project_id, scope, body) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT (device_id, project_id, scope) DO UPDATE SET body = EXCLUDED.body",
         )
-        .bind(dev_id)
+        .bind(d.id)
         .bind(project_id)
         .bind(scope)
         .bind(body)
@@ -355,6 +379,9 @@ pub struct BrowserDeviceStatus {
     pub barred: bool,
     pub confirmed: bool,
     pub fingerprint: Option<String>,
+    /// The id of the passkey this session's browser device was enrolled
+    /// with: what names the device's sealed key in the browser's store.
+    pub credential_id: Option<String>,
 }
 
 pub async fn caller_browser_device_status(
@@ -365,23 +392,25 @@ pub async fn caller_browser_device_status(
     let Some(me) = &caller.person else {
         return Ok(None);
     };
-    type Row = (bool, bool, bool, Option<String>, bool, bool);
+    type Row = (bool, bool, bool, Option<String>, bool, bool, Option<String>);
     let row: Option<Row> = sqlx::query_as(
         "SELECT d.browser, d.prf_supported, d.pending, d.fingerprint, \
          EXISTS (SELECT 1 FROM device_vouches v WHERE v.device_id = d.id), \
-         EXISTS (SELECT 1 FROM device_bars b WHERE b.project_id = $2 AND b.device_id = d.id) \
+         EXISTS (SELECT 1 FROM device_bars b WHERE b.project_id = $2 AND b.device_id = d.id), \
+         (SELECT w.credential_id FROM webauthn_credentials w WHERE w.device_id = d.id ORDER BY w.created_at LIMIT 1) \
          FROM devices d WHERE d.signing_key = $1 AND d.removed_at IS NULL",
     )
     .bind(&me.device_key)
     .bind(project_id)
     .fetch_optional(db)
     .await?;
-    Ok(row.map(|(browser, prf_supported, pending, fingerprint, has_vouch, barred)| BrowserDeviceStatus {
+    Ok(row.map(|(browser, prf_supported, pending, fingerprint, has_vouch, barred, credential_id)| BrowserDeviceStatus {
         browser,
         prf_supported,
         barred,
         confirmed: browser && prf_supported && !pending && has_vouch && !barred,
         fingerprint,
+        credential_id,
     }))
 }
 
@@ -627,6 +656,9 @@ const SECRETS_PAGE_JS: &str = r#"'use strict';
   var proj = btn.getAttribute('data-project') || '';
   var path = btn.getAttribute('data-path') || '';
   var rev = btn.getAttribute('data-rev') || '';
+  // The passkey this session signed in with: its record, and no other, is
+  // the device key this page opens secrets with.
+  var sessionCred = btn.getAttribute('data-credential') || '';
   var statusEl = document.getElementById('veil-secret-status');
   var boxEl = document.getElementById('veil-secret-plaintext');
   var hideBtn = document.getElementById('veil-hide-secret');
@@ -661,12 +693,11 @@ const SECRETS_PAGE_JS: &str = r#"'use strict';
       req.onsuccess = function () {
         var db = req.result;
         var tx = db.transaction('devices', 'readonly');
-        var all = tx.objectStore('devices').getAll();
-        all.onerror = function () { reject(new Error('Cannot read browser device store')); };
-        all.onsuccess = function () {
-          var list = all.result || [];
-          if (!list.length) return reject(new Error('No enrolled passkey device in this browser'));
-          resolve(list[list.length - 1]);
+        var one = tx.objectStore('devices').get(sessionCred);
+        one.onerror = function () { reject(new Error('Cannot read browser device store')); };
+        one.onsuccess = function () {
+          if (!one.result) return reject(new Error("This browser holds no device key for the passkey you signed in with. Enroll it again with vl web."));
+          resolve(one.result);
         };
       };
     });

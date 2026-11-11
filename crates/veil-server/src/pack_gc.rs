@@ -1451,8 +1451,8 @@ pub const NON_OBJECT_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
     ("view_file_history", &["project_id", "view_key", "path_key", "depth"]),
     ("view_fills", &["project_id", "view_key", "holder", "expires_at"]),
     ("view_graph", &["project_id", "view_key", "generation", "depth", "flags", "files"]),    ("web_enrollments", &["code_hash", "person_id", "label", "created_at", "expires_at", "used_at"]),
-    ("webauthn_challenges", &["challenge", "kind", "person_id", "code_hash", "prf_salt", "origin", "rp_id", "expires_at"]),
-    ("webauthn_credentials", &["credential_id", "person_id", "device_id", "alg", "public_key", "sign_count", "prf_salt", "created_at"]),
+    ("webauthn_challenges", &["challenge", "kind", "person_id", "code_hash", "prf_salt", "origin", "rp_id", "expires_at", "address"]),
+    ("webauthn_credentials", &["credential_id", "person_id", "device_id", "alg", "public_key", "sign_count", "prf_salt", "created_at", "label"]),
 ];
 
 /// Look up the registered [`SchemaColumnRole`] of `(table, column)` in `public`.

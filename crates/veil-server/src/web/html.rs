@@ -114,6 +114,7 @@ pub fn page_shell(ctx: PageCtx<'_>, body_html: &str) -> Response {
     match ctx.you {
         Some(me) => {
             let _ = writeln!(doc, "<span class=\"muted\">Signed in as <strong>{}</strong></span>", esc(me));
+            doc.push_str("<a href=\"/devices\">Your devices</a>\n");
             if let Some(csrf) = ctx.csrf {
                 let _ = writeln!(
                     doc,

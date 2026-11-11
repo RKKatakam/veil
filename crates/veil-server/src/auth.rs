@@ -227,6 +227,32 @@ pub async fn login(State(hub): State<HubState>, headers: HeaderMap, Json(req): J
     }))
 }
 
+/// The device `key` answered a single-use challenge of this server (named
+/// `named`, as the device dialled it) under `context`: what proves a request
+/// comes from the holder of a device's identity key (`vl login`, and `vl
+/// web`'s enrollment code).
+async fn answered_challenge(hub: &HubState, headers: &HeaderMap, key: &str, context: &str, named: &str, challenge: &str, signature: &str) -> Result<()> {
+    let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or_default();
+    if normal_host(host) != normal_host(named) || !crate::tls::names(&hub.certificate, named) {
+        return Err(Error::unauthorized("the signature names another server"));
+    }
+    // Single use: the challenge is gone whatever happens next.
+    let found: Option<String> =
+        sqlx::query_scalar("DELETE FROM challenges WHERE challenge = $1 AND signing_key = $2 AND expires_at > $3 RETURNING challenge")
+            .bind(challenge)
+            .bind(key)
+            .bind(veil_core::now_millis())
+            .fetch_optional(&hub.db)
+            .await?;
+    if found.is_none() {
+        return Err(Error::unauthorized("unknown, used or expired challenge"));
+    }
+    if !verify_signature(key, context, &login_message(named, challenge), signature) {
+        return Err(Error::unauthorized("bad signature"));
+    }
+    Ok(())
+}
+
 async fn finish_login(
     hub: &HubState,
     headers: &HeaderMap,
@@ -238,25 +264,8 @@ async fn finish_login(
     if !valid_key(&req.key) {
         return Err(Error::bad_request("key must be an Ed25519 public key in lowercase hex"));
     }
-    let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or_default();
-    if normal_host(host) != normal_host(&req.hub) || !crate::tls::names(&hub.certificate, &req.hub) {
-        return Err(Error::unauthorized("the signature names another server"));
-    }
+    answered_challenge(hub, headers, &req.key, SIG_CONTEXT_HUB_LOGIN, &req.hub, &req.challenge, &req.signature).await?;
     let now = veil_core::now_millis();
-    // Single use: the challenge is gone whatever happens next.
-    let found: Option<String> =
-        sqlx::query_scalar("DELETE FROM challenges WHERE challenge = $1 AND signing_key = $2 AND expires_at > $3 RETURNING challenge")
-            .bind(&req.challenge)
-            .bind(&req.key)
-            .bind(now)
-            .fetch_optional(&hub.db)
-            .await?;
-    if found.is_none() {
-        return Err(Error::unauthorized("unknown, used or expired challenge"));
-    }
-    if !verify_signature(&req.key, SIG_CONTEXT_HUB_LOGIN, &login_message(&req.hub, &req.challenge), &req.signature) {
-        return Err(Error::unauthorized("bad signature"));
-    }
     // The full identity must be this key's, with a valid binding.
     let ident = veil_core::identity::parse_public_identity(&req.identity).map_err(|_| Error::bad_request("invalid public identity"))?;
     if ident.signing_hex().as_deref() != Some(req.key.as_str()) || ident.is_unbound() {
@@ -838,6 +847,21 @@ pub async fn web_enroll_session(
         .and_then(|a| a.strip_prefix("Bearer "))
         .map(token_hash)
         .ok_or_else(|| Error::unauthorized("expected a bearer token"))?;
+    // A passkey outlives this session: the device's identity key signs for
+    // it, as it does to sign in. A session token alone mints no code.
+    if req.signature.is_empty() || req.challenge.is_empty() {
+        return Err(Error::unauthorized("an enrollment code is asked for with the device's signature (`vl web`)"));
+    }
+    answered_challenge(
+        &hub,
+        &headers,
+        &me.device_key,
+        veil_core::crypto::domains::SIG_CONTEXT_HUB_WEB_ENROLL,
+        &req.hub,
+        &req.challenge,
+        &req.signature,
+    )
+    .await?;
     let now = veil_core::now_millis();
     let want = match req.seconds {
         None => veil_core::hub::web::DEFAULT_WEB_ENROLL_MS,

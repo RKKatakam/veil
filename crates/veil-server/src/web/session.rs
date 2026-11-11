@@ -357,48 +357,14 @@ pub async fn logout_route(State(hub): State<HubState>, headers: HeaderMap, body:
     let form = parse_form(&body);
     require_csrf(&headers, Some(&hash), form.get("_csrf").map(String::as_str))?;
 
-    let dev_row: Option<(i64, i64, bool)> = sqlx::query_as(
-        "SELECT d.id, s.person_id, d.browser \
-         FROM sessions s JOIN devices d ON d.id = s.device_id \
-         WHERE s.token_hash = $1",
-    )
-    .bind(&hash)
-    .fetch_optional(&hub.db)
-    .await?;
-
-    if let Some((device_id, person_id, true)) = dev_row {
-        let now = veil_core::now_millis();
-        crate::db::serializable(&hub.db, move |c| {
-            Box::pin(async move {
-                sqlx::query("UPDATE devices SET removed_at = $1, pending = FALSE WHERE id = $2")
-                    .bind(now)
-                    .bind(device_id)
-                    .execute(&mut *c)
-                    .await?;
-                sqlx::query("DELETE FROM sessions WHERE device_id = $1")
-                    .bind(device_id)
-                    .execute(&mut *c)
-                    .await?;
-                sqlx::query("DELETE FROM webauthn_credentials WHERE device_id = $1")
-                    .bind(device_id)
-                    .execute(&mut *c)
-                    .await?;
-                sqlx::query("DELETE FROM browser_device_rings WHERE device_id = $1")
-                    .bind(device_id)
-                    .execute(&mut *c)
-                    .await?;
-                Ok(())
-            })
-        })
+    // Signing out ends this session and nothing else (BUG-1905): the
+    // browser device and its passkey stay, so the next visit signs in with
+    // the passkey. Removing the browser is its own action ("Remove this
+    // browser", `web::devices`).
+    sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
+        .bind(&hash)
+        .execute(&hub.db)
         .await?;
-        crate::api::queue_key_requests_for_person(&hub.db, person_id).await?;
-        crate::audit(&hub.db, None, Some(person_id), "sign out browser device", "revoked").await;
-    } else {
-        sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
-            .bind(&hash)
-            .execute(&hub.db)
-            .await?;
-    }
 
     let mut resp = redirect_see_other("/");
     resp.headers_mut().append(

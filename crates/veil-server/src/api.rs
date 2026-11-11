@@ -115,6 +115,8 @@ pub fn router(hub: HubState) -> Router {
         .route("/web/passkey/login/begin", post(crate::web::passkey::login_begin_route))
         .route("/web/passkey/login/finish", post(crate::web::passkey::login_finish_route))
         .route("/web/logout", post(crate::web::logout_route))
+        .route("/devices", get(crate::web::devices::devices_page_route))
+        .route("/web/devices/remove", post(crate::web::devices::remove_browser_route))
         .route("/p/{p}", get(crate::web::project_overview_route))
         .route("/p/{p}/tree", get(crate::web::tree_root_route))
         .route("/p/{p}/tree/{*path}", get(crate::web::tree_path_route))
@@ -160,7 +162,7 @@ async fn devices(
     Path(name): Path<String>,
     Query(params): Query<DevicesParams>,
 ) -> Result<Json<Devices>> {
-    caller.signed_in()?;
+    let me = caller.signed_in()?.clone();
     let pid = match &params.project {
         Some(p) if !p.is_empty() => {
             let (project, viewer) = perm::open(&hub, p, &caller).await?;
@@ -171,7 +173,44 @@ async fn devices(
         }
         _ => None,
     };
-    device_list(&hub, &name, pid).await
+    let mut list = device_list(&hub, &name, pid).await?;
+    // A person's passkeys are listed to that person only (BUG-1901).
+    if me.name == name && me.agent.is_none() {
+        list.0.passkeys = passkeys_of(&hub.db, me.id).await?;
+    }
+    Ok(list)
+}
+
+/// A person's passkeys of the web client: every browser device of theirs
+/// that is not removed, with or without device keys (BUG-1901), oldest
+/// first.
+pub(crate) async fn passkeys_of(db: &sqlx::PgPool, person: i64) -> Result<Vec<veil_core::hub::wire::Passkey>> {
+    let rows: Vec<(Option<String>, Option<String>, i64, bool, bool)> = sqlx::query_as(
+        "SELECT d.fingerprint, w.label, w.created_at, d.prf_supported, d.pending FROM webauthn_credentials w \
+         JOIN devices d ON d.id = w.device_id WHERE d.person_id = $1 AND d.browser AND d.removed_at IS NULL ORDER BY d.id",
+    )
+    .bind(person)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(fingerprint, label, enrolled_at, opens_secrets, pending)| {
+            Some(veil_core::hub::wire::Passkey { fingerprint: fingerprint?, label, enrolled_at, opens_secrets, confirmed: !pending })
+        })
+        .collect())
+}
+
+/// Remove one of a person's own devices everywhere: it no longer signs in
+/// (its sessions end, and a browser device's passkey is deleted), and the
+/// server keeps no wrapped key for it. The caller then queues the key
+/// rotation ([`queue_key_requests_for_person`]). One place for `vl identity
+/// remove` and the web client's "Remove this browser".
+pub(crate) async fn remove_own_device(c: &mut sqlx::PgConnection, id: i64) -> Result<()> {
+    sqlx::query("UPDATE devices SET removed_at = $1 WHERE id = $2").bind(veil_core::now_millis()).bind(id).execute(&mut *c).await?;
+    sqlx::query("DELETE FROM sessions WHERE device_id = $1").bind(id).execute(&mut *c).await?;
+    sqlx::query("DELETE FROM webauthn_credentials WHERE device_id = $1").bind(id).execute(&mut *c).await?;
+    sqlx::query("DELETE FROM browser_device_rings WHERE device_id = $1").bind(id).execute(&mut *c).await?;
+    Ok(())
 }
 
 /// A person's devices with the vouches the server stores. The server's
@@ -244,6 +283,8 @@ async fn device_list(hub: &HubState, name: &str, project: Option<i64>) -> Result
         vouches: vouches.into_iter().map(|(device, by, signature)| Vouch { device, by, signature }).collect(),
         joins: joins.into_iter().map(|(key, device, signature)| Join { key, device, signature }).collect(),
         removed,
+        // To the person only: filled by the routes that know who asks.
+        passkeys: Vec::new(),
     }))
 }
 
@@ -397,11 +438,17 @@ async fn remove_device(State(hub): State<HubState>, caller: Caller, Json(req): J
         let device = device.clone();
         let me = me.clone();
         Box::pin(async move {
+            // By its full public identity; or, one of the caller's own
+            // passkeys, by its fingerprint (a browser without device keys
+            // has no identity: an empty one names no device, BUG-1901).
             let row: Option<(i64, i64, String, String)> = sqlx::query_as(
                 "SELECT d.id, d.person_id, d.signing_key, p.name FROM devices d JOIN people p ON p.id = d.person_id \
-                 WHERE d.public_identity = $1 AND d.removed_at IS NULL",
+                 WHERE d.removed_at IS NULL AND (($1 <> '' AND d.public_identity = $1) \
+                 OR (d.browser AND d.person_id = $2 AND d.fingerprint = $3)) ORDER BY d.id LIMIT 1",
             )
             .bind(&device)
+            .bind(me.id)
+            .bind(veil_core::hub::wire::normalize_fingerprint(&device))
             .fetch_optional(&mut *c)
             .await?;
             let Some((id, person, key, name)) = row else {
@@ -429,10 +476,7 @@ async fn remove_device(State(hub): State<HubState>, caller: Caller, Json(req): J
                 return Err(Error::bad_request("this is the device you are using: remove it from another of your devices"));
             }
             if person == me.id {
-                sqlx::query("UPDATE devices SET removed_at = $1 WHERE id = $2").bind(veil_core::now_millis()).bind(id).execute(&mut *c).await?;
-                sqlx::query("DELETE FROM sessions WHERE device_id = $1").bind(id).execute(&mut *c).await?;
-                sqlx::query("DELETE FROM webauthn_credentials WHERE device_id = $1").bind(id).execute(&mut *c).await?;
-                sqlx::query("DELETE FROM browser_device_rings WHERE device_id = $1").bind(id).execute(&mut *c).await?;
+                remove_own_device(c, id).await?;
             } else {
                 let project = admin_of.expect("allowed only as an admin of the project");
                 sqlx::query("INSERT INTO device_bars (project_id, device_id, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
@@ -458,7 +502,11 @@ async fn remove_device(State(hub): State<HubState>, caller: Caller, Json(req): J
     }
     let what = if own { "remove device" } else { "remove device from project" };
     crate::audit(&hub.db, admin_of, Some(caller.person_only()?.id), what, &format!("{name} ({person}): {}", &req.device[..req.device.len().min(69)])).await;
-    device_list(&hub, &name, if own { None } else { admin_of }).await
+    let mut list = device_list(&hub, &name, if own { None } else { admin_of }).await?;
+    if own {
+        list.0.passkeys = passkeys_of(&hub.db, person).await?;
+    }
+    Ok(list)
 }
 
 /// An admin records an invite: its public key, for whom, into which group,

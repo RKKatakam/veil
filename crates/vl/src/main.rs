@@ -844,6 +844,7 @@ fn cmd_identity(c: &IdentityCmd) -> Result<ExitCode> {
             }
         }
         IdentityCmd::Confirm { fingerprint, server } => hub_cmd::confirm_device(fingerprint, server.as_deref())?,
+        IdentityCmd::List { server } => hub_keys::list_devices(server.as_deref())?,
         IdentityCmd::Remove { fingerprint, server } => hub_keys::remove_device(fingerprint, server.as_deref())?,
         IdentityCmd::RecoverAdmin { from, revoke_old } => {
             use veil_core::keychain::AdminRecovery;

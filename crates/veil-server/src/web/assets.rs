@@ -193,11 +193,26 @@ pub const APP_JS: &str = r#"'use strict';
     });
   }
 
-  var logoutForms = document.querySelectorAll('form[action="/web/logout"]');
-  for (var li = 0; li < logoutForms.length; li++) {
-    logoutForms[li].addEventListener('submit', function () {
+  // "Sign out" ends the session only: the browser device's sealed key stays
+  // in IndexedDB for the next sign-in. Removing a browser ("Your devices")
+  // deletes the sealed key this browser holds for that passkey, if any.
+  var removeForms = document.querySelectorAll('form.veil-remove-browser');
+  for (var ri = 0; ri < removeForms.length; ri++) {
+    removeForms[ri].addEventListener('submit', function (ev) {
+      var cred = ev.currentTarget.getAttribute('data-credential') || '';
+      if (!cred || !window.indexedDB) return;
       try {
-        if (window.indexedDB) indexedDB.deleteDatabase('veil_web_devices');
+        var open = indexedDB.open('veil_web_devices', 1);
+        open.onupgradeneeded = function () {
+          if (!open.result.objectStoreNames.contains('devices')) {
+            open.result.createObjectStore('devices', { keyPath: 'credential_id' });
+          }
+        };
+        open.onsuccess = function () {
+          try {
+            open.result.transaction('devices', 'readwrite').objectStore('devices').delete(cred);
+          } catch (_) {}
+        };
       } catch (_) {}
     });
   }
