@@ -18,7 +18,6 @@ fn change_on(repo: &mut Repo, base: ObjectId, file: &str) -> ObjectId {
 /// No change is lost: moving a change elsewhere leaves the change it stood
 /// on in the history, as abandoning it would.
 #[test]
-#[ignore = "BUG-1830: `vl rebase` of a change's only child drops the change from the view"]
 fn bug_1830_a_change_stays_visible_when_its_only_child_is_rebased_away() {
     let (mut repo, _fs, _) = new_repo("alice");
     let root = repo.root_id();
@@ -37,12 +36,20 @@ fn bug_1830_a_change_stays_visible_when_its_only_child_is_rebased_away() {
         visible.contains(&a),
         "change A (a.txt) left the view: nothing but `vl undo` shows it again, and gc removes it once the operation is pruned"
     );
+
+    // When A still has another descendant D, A stays visible through D without
+    // lingering as a redundant head beside D.
+    let d1 = change_on(&mut repo, a, "d1.txt");
+    let d2 = change_on(&mut repo, a, "d2.txt");
+    let d1_moved = repo.rebase(d1, vec![c]).unwrap();
+    assert!(repo.held().visible().unwrap().contains(&a));
+    assert!(!repo.view().heads.contains(&a), "A has child d2, so A is not a maximal head");
+    assert!(repo.view().heads.contains(&d2) && repo.view().heads.contains(&d1_moved));
 }
 
 /// The same through a working copy, as `vl commit`, `vl commit`, `vl rebase
-/// -s B -d C` records it.
+/// -s B -d C` (and `vl rebase -s @ -d C`) records it.
 #[test]
-#[ignore = "BUG-1830: `vl rebase` of a change's only child drops the change from the view"]
 fn bug_1830_a_committed_change_stays_visible_when_the_working_copy_line_moves_off_it() {
     let (mut repo, fs, _) = new_repo("alice");
     let a = commit_files(&mut repo, &*fs, &[("a.txt", "a\n")], "A");
@@ -56,6 +63,17 @@ fn bug_1830_a_committed_change_stays_visible_when_the_working_copy_line_moves_of
     assert_eq!(repo.snapshot(&wc).unwrap().parents, vec![moved], "the working copy followed B");
 
     assert!(repo.held().visible().unwrap().contains(&a), "change A (a.txt) left the view");
+
+    // Moving `@` itself off `moved` (`vl rebase -d A`) leaves `moved` visible too.
+    let wc_moved = repo.rebase(wc, vec![a]).unwrap();
+    assert_eq!(repo.workspace_wc(WS).unwrap(), wc_moved);
+    assert!(repo.held().visible().unwrap().contains(&moved), "committed change B left the view when @ moved off it");
+
+    // Abandoning `moved` still removes `moved` itself while keeping its parent C visible.
+    repo.abandon(moved).unwrap();
+    let vis = repo.held().visible().unwrap();
+    assert!(!vis.contains(&moved), "abandoned change B left the view");
+    assert!(vis.contains(&c), "its parent C stayed visible");
 }
 
 /// Invalid rules fail safe: a protective rule that can match no path is

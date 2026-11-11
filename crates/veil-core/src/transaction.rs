@@ -472,6 +472,41 @@ impl<'r> Transaction<'r> {
         self.write_snapshot(&snap)
     }
 
+    /// Make each parent in `old_parents` that `new_parents` no longer keeps a
+    /// head, unless it is missing (hidden) or an abandoned attempt. Ancestor
+    /// heads that still have another visible descendant are dropped at commit.
+    fn release_parents(&mut self, old_parents: &[ObjectId], new_parents: &[ObjectId]) -> Result<()> {
+        for p in old_parents {
+            if !new_parents.contains(p) && self.repo.exact().snapshot(p)?.is_some_and(|s| s.abandoned.is_none()) {
+                self.view.heads.insert(*p);
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop any head in `self.view.heads` that another head already descends
+    /// from, keeping `heads` the maximal tips of the visible DAG.
+    fn drop_ancestor_heads(&mut self) -> Result<()> {
+        if self.view.heads.len() <= 1 {
+            return Ok(());
+        }
+        let candidates: HashSet<ObjectId> = self.view.heads.iter().copied().collect();
+        let mut parent_roots = Vec::new();
+        for h in &self.view.heads {
+            if let Some(s) = self.repo.held().snapshot(h)? {
+                parent_roots.extend(s.parents.iter().copied());
+            }
+        }
+        if parent_roots.is_empty() {
+            return Ok(());
+        }
+        let redundant = self.repo.held().reachable_among(parent_roots, &candidates)?;
+        for h in redundant {
+            self.view.heads.remove(&h);
+        }
+        Ok(())
+    }
+
     /// Replace `old` with `new` (same change, new content/metadata).
     pub fn rewrite(&mut self, old: ObjectId, new: Snapshot) -> Result<ObjectId> {
         if old == self.repo.root_id {
@@ -495,6 +530,7 @@ impl<'r> Transaction<'r> {
         let id = self.repo.store.put_snapshot(&self.sign(&new))?;
         self.rewritten.insert(old, Rewrite::Replaced(id));
         self.view.heads.remove(&old);
+        self.release_parents(&prev.parents, &new.parents)?;
         self.add_head(id)?;
         Ok(id)
     }
@@ -700,9 +736,7 @@ impl<'r> Transaction<'r> {
         let s = self.repo.snapshot(&id)?;
         self.rewritten.insert(id, Rewrite::Abandoned(s.parents.clone()));
         self.view.heads.remove(&id);
-        for p in &s.parents {
-            self.view.heads.insert(*p);
-        }
+        self.release_parents(&s.parents, &[])?;
         Ok(())
     }
 
@@ -930,6 +964,7 @@ impl<'r> Transaction<'r> {
             };
             self.view.workspaces.get_mut(&name).unwrap().wc = new_wc;
         }
+        self.drop_ancestor_heads()?;
         Ok(())
     }
 
@@ -1212,6 +1247,12 @@ impl<'r> Transaction<'r> {
             self.rewritten = union.clone();
             self.merge.as_mut().expect("a merge").held.clear();
             for (k, v) in &reversals {
+                if let Rewrite::Replaced(to) = v {
+                    if let (Some(ks), Some(ts)) = (self.repo.held().snapshot(k)?, self.repo.held().snapshot(to)?) {
+                        let (kp, tp) = (ks.parents.clone(), ts.parents.clone());
+                        self.release_parents(&kp, &tp)?;
+                    }
+                }
                 self.rewritten.insert(*k, v.clone());
             }
             if !self.rewritten.is_empty() {
