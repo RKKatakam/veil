@@ -21,6 +21,10 @@ thin clients, and landing done by the server. Veil takes that design and
 tries to make it something any team can run, from one laptop up. It isn't
 affiliated with or endorsed by either.
 
+**Contact:** [@kittu_gamer](https://x.com/kittu_gamer) on X, or
+[kittu.krish695@gmail.com](mailto:kittu.krish695@gmail.com). Questions,
+ideas and bug reports are all welcome.
+
 ## Why it's built for agents
 
 | What goes wrong with Git | What Veil does |
@@ -535,6 +539,12 @@ every known bug, open or fixed, is in [docs/BUGS.md](docs/BUGS.md). The
 checks are `cargo test` for the client and engine and
 `scripts/verify-server.sh` for the server. The engine also builds for
 WebAssembly ([docs/guide/embedding.md](docs/guide/embedding.md)).
+
+## Contact
+
+Veil is built by kittu. Reach me on X at
+[@kittu_gamer](https://x.com/kittu_gamer), or by email at
+[kittu.krish695@gmail.com](mailto:kittu.krish695@gmail.com).
 
 ## Credits
 
