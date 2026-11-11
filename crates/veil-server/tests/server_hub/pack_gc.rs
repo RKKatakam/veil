@@ -1407,19 +1407,24 @@ fn bug_1782_every_schema_column_is_registered_and_root_tables_are_stamped() {
         "stale or duplicate registered schema columns not present in information_schema.columns: {missing:?}"
     );
 
-    // 2. Every authoritative `GcRoot` table (except `pr_review_rules`, whose
-    // `checked` tip is lazily filled from `branches.target` / `landings.landed`)
-    // plus `snapshots` and staged `packs` is fingerprinted by `read_ref_stamp`.
+    // 2. Every table GC takes roots from (`GcRoot`, `GcConditionalLeafRoot`:
+    // none excepted, BUG-1923), with each of its root columns, plus
+    // `snapshots` and staged `packs`, is fingerprinted by `read_ref_stamp`.
     let stamped: HashSet<&str> = stamped_root_tables().into_iter().collect();
     assert!(stamped.contains("packs"), "staged packs must be in read_ref_stamp");
     assert!(stamped.contains("snapshots"), "snapshots must be in read_ref_stamp");
-    for &(table, col, role) in OBJECT_SCHEMA_COLUMNS {
-        if role == SchemaColumnRole::GcRoot && table != "pr_review_rules" {
-            assert!(
-                stamped.contains(table),
-                "table `{table}` (holding root column `{col}`) must be included in pack_gc::STAMP_TABLES"
-            );
-        }
+    let roots = OBJECT_SCHEMA_COLUMNS
+        .iter()
+        .filter(|(_, _, role)| matches!(role, SchemaColumnRole::GcRoot | SchemaColumnRole::GcConditionalLeafRoot))
+        .count();
+    assert!(roots >= 24, "the registry lists the root columns: {roots}");
+    assert_eq!(
+        veil_server::pack_gc::unstamped_root_columns(),
+        Vec::<(&str, &str)>::new(),
+        "root columns of the registry that pack_gc::STAMP_TABLES does not read"
+    );
+    for table in ["search_shards", "pr_review_rules"] {
+        assert!(stamped.contains(table), "`{table}` must be in read_ref_stamp");
     }
 
     // 3. Negative meta-test: adding a new table or column naming objects without

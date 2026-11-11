@@ -561,7 +561,6 @@ fn snapshot_survives_a_root_written_before_the_switch(th: &TestHub, p: &Project,
 ///
 /// The control is the same writer with a row in a stamped table.
 #[test]
-#[ignore = "BUG-1923: GC's reference stamp leaves out search_shards: a segment named right before the switch is deleted"]
 fn bug_1923_gc_gives_way_to_a_search_shard_written_right_before_its_switch() {
     let th = TestHub::start();
     let p = setup_project(&th);
@@ -581,6 +580,16 @@ fn bug_1923_gc_gives_way_to_a_search_shard_written_right_before_its_switch() {
          VALUES ($1, 'names', '', $2, '[\"' || $3 || '\"]', 0, 0, 0, 0)",
     );
     assert!(kept, "GC deleted an object that a search shard, committed before its switch under the writer's guard, names");
+    // The other root table the stamp left out (its `checked` is the
+    // default branch's tip in use; the stamp reads it all the same).
+    let kept = snapshot_survives_a_root_written_before_the_switch(
+        &th,
+        &p,
+        2,
+        "INSERT INTO pr_review_rules (project_id, checked, state) VALUES ($1, $3, $2) \
+         ON CONFLICT (project_id) DO UPDATE SET checked = EXCLUDED.checked",
+    );
+    assert!(kept, "GC deleted an object that the review rules' row, committed before its switch under the writer's guard, names");
 }
 
 /// BUG-1885's second part ("landing a PR left its source branch": the
@@ -595,7 +604,6 @@ fn bug_1923_gc_gives_way_to_a_search_shard_written_right_before_its_switch() {
 /// the PR stays `open` with its change on `main`, and its branch stays,
 /// until someone asks to land it again.
 #[test]
-#[ignore = "BUG-1924: a PR whose landing outlasts its request stays open, and its source branch is left"]
 fn bug_1924_a_pr_that_lands_after_its_request_was_answered_queued_is_landed() {
     use std::time::{Duration, Instant};
     let th = TestHub::start();
