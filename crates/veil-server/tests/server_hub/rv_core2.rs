@@ -389,3 +389,97 @@ fn bug_1882_one_persons_agent_sessions_take_the_whole_signed_in_body_pool() {
     );
     assert!(held <= 10 << 10, "one person holds at most a quarter of the signed-in pool: {held} KiB");
 }
+
+/// Every queued entry lands once or is refused, whatever servers stop. A
+/// `merging` row has no owner: only a server's start gives it back to the
+/// queue (`landing::resume`, which resets every server's). When the server
+/// whose worker held it goes away while the others keep running, nothing
+/// ever answers it: the ticket stays `queued`, and counts against its
+/// person's outstanding landings.
+#[test]
+#[ignore = "BUG-1883: a merging entry of a server that went away is never answered"]
+fn bug_1883_a_merging_entry_of_a_server_that_went_away_is_never_answered() {
+    let a = TestHub::start();
+    let p = setup_project(&a);
+    let b = TestHub::beside(&a);
+    let (api_a, api_b) = (a.api(), b.api());
+    let pid = project_id(&a, &p.name);
+    let (dev_tok, admin_tok) = (p.dev.token(), p.admin.token());
+    let db = b.hub().db.clone();
+    const FILE: &str = "src/merge-1883.txt";
+    let text = |second: &str, last: &str| {
+        let mut lines: Vec<String> = (0..30).map(|i| format!("line {i} of bug 1883")).collect();
+        lines[2] = second.to_string();
+        lines[28] = last.to_string();
+        lines.join("\n") + "\n"
+    };
+    let land_as_admin = |content: String| {
+        let base = api_a.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+        let r = api_a.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/land", p.name),
+            &json!({"onto": "main", "base": base.hex(), "edits": [put(FILE, &content)], "wait": true}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["state"], "landed", "{}", r.json());
+    };
+    land_as_admin(text("two", "twenty-eight"));
+    // dev changes line 2 on that tip; the admin lands a change of line 28 first.
+    let base = api_a.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let r = api_a.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({"base": base.hex(), "edits": [put(FILE, &text("TWO BY DEV", "twenty-eight"))]}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let change: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+    land_as_admin(text("two", "TWENTY-EIGHT BY ADMIN"));
+
+    // The merge worker's commit waits (its insert into `origins`), so that the
+    // server stops while the entry is `merging`.
+    let mut lock = b.rt.block_on(db.begin()).unwrap();
+    b.rt.block_on(sqlx::query("LOCK TABLE origins IN EXCLUSIVE MODE").execute(&mut *lock)).unwrap();
+    let r = api_a.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "snapshot": change.hex(), "wait": false}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["state"], "queued", "{}", r.json());
+    let ticket = r.json()["ticket"].as_str().unwrap().to_string();
+    let state = || -> String {
+        b.rt.block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(&db)).unwrap()
+    };
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        let waiting: i64 = b
+            .rt
+            .block_on(
+                sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'INSERT INTO origins%'")
+                    .fetch_one(&db),
+            )
+            .unwrap();
+        if state() == "merging" && waiting > 0 {
+            break;
+        }
+        assert!(Instant::now() < until, "the entry was handed to a merge worker: {}", state());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The server with the worker goes away; the other keeps running.
+    drop(api_a);
+    drop(a);
+    b.rt.block_on(lock.rollback()).unwrap();
+    assert_eq!(state(), "merging", "the worker's commit went with its server");
+
+    // The entry's submitter asks the server that is left.
+    let until = Instant::now() + Duration::from_secs(45);
+    let done = loop {
+        let r = api_b.get(Some(&dev_tok), &format!("/v1/projects/{}/land/{ticket}", p.name));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let v = r.json();
+        if v["state"] != "queued" || Instant::now() > until {
+            break v;
+        }
+    };
+    assert_eq!(done["state"], "landed", "45 s after its server went away the entry is still `{}` in the queue: {done}", state());
+}
