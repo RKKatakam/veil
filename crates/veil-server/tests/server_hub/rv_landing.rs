@@ -285,9 +285,11 @@ fn bug_1863_what_a_push_committed_in_its_own_task_is_never_run_again() {
         db::transaction(&hub.db, db::Isolation::ReadCommitted, move |c| {
             let key = key.clone();
             Box::pin(async move {
-                sqlx::query("INSERT INTO challenges (challenge, signing_key, expires_at) VALUES ($1, $2, 0)")
+                // (Not expired: every sign-in deletes the expired ones.)
+                sqlx::query("INSERT INTO challenges (challenge, signing_key, expires_at) VALUES ($1, $2, $3)")
                     .bind(format!("{key}-{n}"))
                     .bind(&key)
+                    .bind(veil_core::now_millis() + 3_600_000)
                     .execute(&mut *c)
                     .await?;
                 Ok(())
