@@ -2070,3 +2070,88 @@ fn bug_1875_the_collector_keeps_a_held_embargos_fix_until_it_lands() {
     assert_eq!(f.status, 200, "{}", body_str(&f));
     assert!(body_str(&f).contains("GC_KEEPS_HELD_FIX_1875"), "{}", body_str(&f));
 }
+
+/// BUG-1875: a release's landing ticket is of one tip of the line. A ticket
+/// that landed (a release that landed and did not finish; made here by
+/// renaming two landed tickets of the project: to the ticket's name before
+/// the fix, and to the first tip's) never stands in for commits pushed to
+/// the line since: the release lands them too, and only then retires the
+/// line.
+#[test]
+fn bug_1875_a_ticket_that_landed_an_earlier_tip_never_retires_later_commits_unlanded() {
+    const FIX: &str = "FIRST_TIP_FIX_1875";
+    const MORE: &str = "PUSHED_SINCE_1875";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    let api = hub.api();
+    let (sec, dev) = (p.sec.token(), p.dev.token());
+    let h = hub.hub();
+    let pid: i64 = hub.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&h.db)).unwrap();
+    // Two ordinary landings: their tickets are renamed below.
+    set_main_file(&hub, &p, "docs/a_1875.md", "a\n", "an ordinary landing");
+    set_main_file(&hub, &p, "docs/b_1875.md", "b\n", "another");
+    let (eid, _, _, _) = push_embargo(
+        &hub,
+        &p.name,
+        &p.sec,
+        "ticket-1875",
+        "security",
+        Some(veil_core::now_millis() + 3_600_000),
+        &[("src/first_tip_1875.rs", &format!("pub const FIX: &str = \"{FIX}\";\n"))],
+        "an embargoed fix",
+    );
+    let line = format!("embargo/{eid}");
+    let tip1 = api.tips(Some(&sec), &p.name).unwrap().branches[&line];
+    let real_tip1: String = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2").bind(pid).bind(&line).fetch_one(&h.db))
+        .unwrap();
+    let landed: Vec<String> = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT ticket FROM landing_queue WHERE project_id = $1 AND state = 'landed' ORDER BY created_at DESC LIMIT 2")
+                .bind(pid)
+                .fetch_all(&h.db),
+        )
+        .unwrap();
+    assert_eq!(landed.len(), 2, "{landed:?}");
+    for (old, new) in landed.iter().zip([format!("embargo-{pid}-{eid}"), format!("embargo-{pid}-{eid}-{}", &real_tip1[..16])]) {
+        let n = hub
+            .rt
+            .block_on(sqlx::query("UPDATE landing_queue SET ticket = $1 WHERE project_id = $2 AND ticket = $3").bind(&new).bind(pid).bind(old).execute(&h.db))
+            .unwrap()
+            .rows_affected();
+        assert_eq!(n, 1, "{old} -> {new}");
+    }
+
+    // More work, pushed onto the line since.
+    let more = api.post_json(
+        Some(&sec),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": tip1.hex(),
+            "description": "more of the fix",
+            "edits": [{"path": "src/pushed_since_1875.rs", "put": {"text": format!("pub const MORE: &str = \"{MORE}\";\n")}}],
+        }),
+    );
+    assert_eq!(more.status, 200, "{}", body_str(&more));
+    let more_snap = more.json()["snapshot"].as_str().unwrap().to_string();
+    let pushed = api.post_json(
+        Some(&sec),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": line, "expected": tip1.hex(), "new": more_snap}]}),
+    );
+    assert_eq!(pushed.status, 200, "{}", body_str(&pushed));
+    assert_eq!(api.tips(Some(&sec), &p.name).unwrap().branches[&line].hex(), more_snap, "{}", body_str(&pushed));
+
+    // The release lands the whole line.
+    let rel = api.post_json(Some(&sec), &format!("/v1/projects/{}/embargoes/{eid}/release", p.name), &json!({}));
+    assert_eq!(rel.status, 200, "{}", body_str(&rel));
+    assert!(released_at(&hub, &eid).is_some(), "released");
+    for (path, mark) in [("src/first_tip_1875.rs", FIX), ("src/pushed_since_1875.rs", MORE)] {
+        let f = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev=main&path={path}", p.name));
+        assert_eq!(f.status, 200, "{path} is on no branch after the release: {}", body_str(&f));
+        assert!(body_str(&f).contains(mark), "{}", body_str(&f));
+    }
+}

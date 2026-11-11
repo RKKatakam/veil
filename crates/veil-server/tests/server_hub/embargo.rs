@@ -1300,7 +1300,8 @@ fn s17_release_landing_records_author_leaves_bulkhead_gates_and_lands_once_acros
 
     let sec_tok = p.sec.token();
     let dev_tok = p.dev.token();
-    let ticket = format!("embargo-{pid}-{eid}");
+    // (The release's ticket: one per tip of the line.)
+    let ticket = format!("embargo-{pid}-{eid}-%");
 
     std::thread::scope(|s| {
         let mut waiters = Vec::new();
@@ -1326,7 +1327,7 @@ fn s17_release_landing_records_author_leaves_bulkhead_gates_and_lands_once_acros
             let queued: i64 = hub
                 .rt
                 .block_on(
-                    sqlx::query_scalar("SELECT COUNT(*) FROM landing_queue WHERE project_id = $1 AND ticket = $2 AND state = 'queued'")
+                    sqlx::query_scalar("SELECT COUNT(*) FROM landing_queue WHERE project_id = $1 AND ticket LIKE $2 AND state = 'queued'")
                         .bind(pid)
                         .bind(&ticket)
                         .fetch_one(&h.db),

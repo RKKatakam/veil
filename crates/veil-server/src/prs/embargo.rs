@@ -569,7 +569,7 @@ pub async fn agent_may_release(hub: &Arc<Hub>, project: &Project, embargo_id: &s
 ///      never retargeted to land changes under a review that did not cover
 ///      them;
 ///    * armed (`land_at_release`) and ready under S21's rules: it lands,
-///      under the deterministic ticket `embargo-pr-<project>-<pr>`;
+///      under the deterministic ticket `embargo-pr-<project>-<pr>-<head>`;
 ///    * otherwise it becomes an ordinary open PR.
 ///
 ///    Nothing here stops the release: the line has landed, so it finishes.
@@ -698,7 +698,8 @@ pub async fn finish_release(
             }
         }
         let (_, who) = crate::embargo::choose_submitter(hub, project, &judged.stack, creator, submitter).await?;
-        let ticket = format!("embargo-pr-{}-{id}", project.id);
+        // (Per revision: a ticket that landed an earlier head never stands in for this one.)
+        let ticket = format!("embargo-pr-{}-{id}-{}", project.id, &current.head.hex()[..16]);
         let outcome = crate::embargo::queue_and_wait_embargo_landing(
             hub,
             project,

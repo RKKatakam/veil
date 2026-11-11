@@ -646,12 +646,13 @@ pub(crate) async fn record_in_tx(
                         }
                     }
                 }
-                let ticket = format!("embargo-{project_id}-{}", u.embargo_id);
+                // (The embargo's release tickets, of whatever tip: ids are hex, no LIKE wildcard.)
+                let tickets = format!("embargo-{project_id}-{}-%", u.embargo_id);
                 sqlx::query(
-                    "DELETE FROM landing_queue WHERE project_id = $1 AND ticket = $2 AND state NOT IN ('queued', 'merging', 'landed')",
+                    "DELETE FROM landing_queue WHERE project_id = $1 AND ticket LIKE $2 AND state NOT IN ('queued', 'merging', 'landed')",
                 )
                 .bind(project_id)
-                .bind(ticket)
+                .bind(tickets)
                 .execute(&mut *c)
                 .await?;
             }
@@ -1223,8 +1224,9 @@ async fn release_pending(hub: &Arc<Hub>, stuck: bool) -> Result<usize> {
 ///
 /// 1. **Land the line.** The changes on `embargo/<id>` land on
 ///    `target_branch` through the landing service (S17), under one
-///    deterministic ticket, whatever PRs the embargo has and whatever their
-///    state (BUG-1875: the line is never dropped without landing). Onto a
+///    deterministic ticket per tip of the line, whatever PRs the embargo has
+///    and whatever their state (BUG-1875: the line is never dropped without
+///    landing). Onto a
 ///    protected branch the landing meets S21's review rules like every
 ///    landing, and the approvals of the embargo's own PR count (BUG-1861):
 ///    unapproved, the release is **held** (`hold_embargo_for_approval`) and
@@ -1370,7 +1372,10 @@ pub async fn release_one(
                     ));
                 }
             }
-            let ticket = format!("embargo-{project_id}-{embargo_id}");
+            // One ticket per tip of the line: servers and retries that land the
+            // same tip share it, and a ticket that landed an earlier tip never
+            // stands in for commits pushed to the line since (BUG-1875).
+            let ticket = format!("embargo-{project_id}-{embargo_id}-{}", &etip_hex[..16]);
             let outcome =
                 queue_and_wait_embargo_landing(hub, &project, embargo_id, &ticket, &target_branch, judged, &who, manual).await?;
             if outcome.state != LandState::Landed {
