@@ -102,6 +102,72 @@ fn rvgaps_thin_clone_of_a_partial_viewer_answers_as_their_full_clone() {
     assert!(all.is_empty(), "{}", all.join("\n\n"));
 }
 
+/// The description of the change each line of `file` at `rev` is from, as
+/// `vl blame --json` in `dir` says (which must succeed).
+fn blamed(who: &Person, dir: &Path, file: &str, rev: &str) -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_str(&who.ok(dir, &["blame", file, "-r", rev, "--json"])).expect("blame --json");
+    let lines = v["lines"].as_array().expect("lines");
+    let changes = v["changes"].as_array().expect("changes");
+    lines
+        .iter()
+        .map(|l| {
+            let c = changes.iter().find(|c| c["change_id"] == l["change"]).unwrap_or_else(|| panic!("line {} names a change the answer lists", l["line"]));
+            c["description"].as_str().expect("a description").to_string()
+        })
+        .collect()
+}
+
+/// BUG-1893: the server's blame (a thin clone's and the web client's
+/// answer) gives each line to the change a full clone's does, for the admin
+/// and for people who see part of the project, where its line maps differed
+/// from the engine's `map_lines`:
+/// - a last line that gains its newline (with lines after it, or alone) or
+///   goes on is that change's line (`src/lib.rs` starts without a newline:
+///   the server left its first line with "initial import");
+/// - a changed line equal to an unchanged one further on pairs with it as
+///   in the engine's diff (`src/pairs.txt`);
+/// - a long file whose first line is removed, or has something put before
+///   it, has its own lines (`src/long.txt`: the blame job read the byte
+///   before the text and panicked, or split the new first line in two).
+#[test]
+fn bug_1893_the_servers_blame_is_a_full_clones_at_a_last_line_without_its_newline() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let long: String = (0..100).map(|i| format!("line {i} of a file long enough for its lines to be reused\n")).collect();
+    for (desc, lib, long, pairs) in [
+        ("step one", format!("{PUBLIC_MARK}\nsecond"), format!("the first line\n{long}"), "x\ny\nb\n"),
+        ("step two", format!("{PUBLIC_MARK}\nsecond line"), long.clone(), "b\nz\nb\n"),
+        ("step three", format!("{PUBLIC_MARK}\nsecond line\n"), format!("// {long}"), "b\nz\nb\nc"),
+    ] {
+        write_files(&p.dir, &[("src/lib.rs", &lib), ("src/long.txt", &long), ("src/pairs.txt", pairs)]);
+        p.admin.commit_main(&p.dir, desc);
+    }
+    p.admin.ok(&p.dir, &["push"]);
+    let mut long_lines = vec!["step three"];
+    long_lines.resize(100, "step one");
+    for (who, name) in [(&p.admin, "admin"), (&p.dev, "dev"), (&p.fin, "fin"), (&p.sec, "sec")] {
+        let full = who.dir("full-1893");
+        who.ok(who.home.path(), &["clone", "--full", &hub.url(&p.name), full.to_str().unwrap()]);
+        let thin = who.dir("thin-1893");
+        who.ok(who.home.path(), &["clone", &hub.url(&p.name), thin.to_str().unwrap()]);
+        for (clone, dir) in [("full", &full), ("thin", &thin)] {
+            assert_eq!(blamed(who, dir, "src/lib.rs", "main"), ["step one", "step three"], "{name}, {clone} clone");
+            assert_eq!(blamed(who, dir, "src/lib.rs", "main-"), ["step one", "step two"], "{name}, {clone} clone");
+            assert_eq!(blamed(who, dir, "src/lib.rs", "main--"), ["step one", "step one"], "{name}, {clone} clone");
+            assert_eq!(blamed(who, dir, "src/pairs.txt", "main-"), ["step one", "step two", "step two"], "{name}, {clone} clone");
+            assert_eq!(blamed(who, dir, "src/pairs.txt", "main"), ["step one", "step two", "step two", "step three"], "{name}, {clone} clone");
+            assert_eq!(blamed(who, dir, "src/long.txt", "main-"), vec!["step one"; 100], "{name}, {clone} clone");
+            assert_eq!(blamed(who, dir, "src/long.txt", "main"), long_lines, "{name}, {clone} clone");
+        }
+        for file in ["src/lib.rs", "src/pairs.txt", "src/long.txt"] {
+            for rev in ["main", "main-", "main--"] {
+                let args = ["blame", file, "-r", rev, "--json"];
+                assert_eq!(who.ok(&thin, &args), who.ok(&full, &args), "{name}: vl blame {file} -r {rev}");
+            }
+        }
+    }
+}
+
 /// A new person signed in through the API: their session token.
 fn signed_up(api: &Api) -> String {
     api.login(&Identity::generate("rvgaps"), Some(&unique("rvg"))).expect("signs up")

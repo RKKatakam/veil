@@ -392,7 +392,9 @@ fn s3r_blame_in_a_thin_clone_is_the_full_clones() {
     let mut text = String::new();
     for i in 0..4 {
         text.push_str(&format!("line {i}\n"));
-        write_files(&dir, &[("notes.txt", &text)]);
+        // `bare.txt`: the same without its last newline, so each change
+        // gives the last line its newline and adds a line (BUG-1893).
+        write_files(&dir, &[("notes.txt", &text), ("bare.txt", text.trim_end())]);
         admin.commit_main(&dir, &format!("line {i}"));
     }
     admin.ok(&dir, &["push"]);
@@ -403,6 +405,19 @@ fn s3r_blame_in_a_thin_clone_is_the_full_clones() {
     let want = admin.ok(&full, &["blame", "notes.txt", "-r", "main", "--json"]);
     let got = admin.ok(&thin, &["blame", "notes.txt", "-r", "main", "--json"]);
     assert_eq!(got, want);
+    let want = admin.ok(&full, &["blame", "bare.txt", "-r", "main", "--json"]);
+    let got = admin.ok(&thin, &["blame", "bare.txt", "-r", "main", "--json"]);
+    assert_eq!(got, want);
+    // Each line but the last is from the change after the one that added
+    // it, which gave it its newline.
+    let v: serde_json::Value = serde_json::from_str(&got).unwrap();
+    let described: Vec<&str> = v["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| v["changes"].as_array().unwrap().iter().find(|c| c["change_id"] == l["change"]).expect("the line's change")["description"].as_str().unwrap())
+        .collect();
+    assert_eq!(described, ["line 1", "line 2", "line 3", "line 3"]);
 }
 
 /// A merge whose second parent the thin clone does not hold: `vl show`
