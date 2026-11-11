@@ -11,7 +11,7 @@
 //!   it is answered `503 busy` instead, and its bytes are let go at once. An
 //!   answer that streams (frames read as they go) takes a share for each
 //!   piece before it is handed on, holding nothing while it waits.
-//! * One client (a device, or an address) holds at most a quarter of the
+//! * One client (a person, or an address) holds at most a quarter of the
 //!   budget, except one answer larger than that while it holds nothing else
 //!   (up to the whole budget): a client that does not read holds what its
 //!   connection was handed, nothing more, until the write deadline closes it.

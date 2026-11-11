@@ -1188,19 +1188,50 @@ impl Policy {
     /// narrowing paths, [`crate::hub::agent::within`]), decided by
     /// [`Policy::classify`] itself so the two cannot disagree (BUG-1567).
     pub fn scopes_within(&self, only: &[String]) -> std::collections::HashSet<String> {
+        self.scopes_matching(only, |c| crate::hub::agent::within(only, c))
+    }
+
+    /// Every scope that seals a secret at a path `view` may read (within
+    /// `only`, if any), plus `team` and the `rule-…` scopes of readable access
+    /// lines when `only` is `None` (BUG-1853).
+    pub fn scopes_for_view(
+        &self,
+        view: &crate::hub::access::View<'_>,
+        only: Option<&[String]>,
+    ) -> std::collections::HashSet<String> {
+        let roots: Vec<String> = match only {
+            Some(o) => o.to_vec(),
+            None => self.access.rules.iter().filter(|r| view.read(&r.path)).map(|r| r.path.clone()).collect(),
+        };
+        let mut out = self.scopes_matching(&roots, |c| view.read(c) && view.within_narrowing(c));
+        if only.is_none() {
+            out.insert(DEFAULT_SCOPE.to_string());
+            for r in &self.access.rules {
+                if !r.names.is_empty() && view.read(&r.path) {
+                    out.insert(rule_scope_of(&r.path));
+                }
+            }
+        }
+        out
+    }
+
+    fn scopes_matching(&self, roots: &[String], allow: impl Fn(&str) -> bool) -> std::collections::HashSet<String> {
         let mut out = std::collections::HashSet::new();
+        if roots.is_empty() {
+            return out;
+        }
         let mut names: Vec<String> = BUILTIN_SECRETS
             .iter()
             .chain(BUILTIN_PUBLIC_EXCEPTIONS)
             .flat_map(|p| sample_patterns(p))
             .collect();
-        let mut dirs: Vec<String> = only.iter().filter(|o| !seals_secret(o)).cloned().collect();
+        let mut dirs: Vec<String> = roots.iter().filter(|o| !seals_secret(o)).cloned().collect();
         for r in &self.access.rules {
-            if crate::hub::agent::within(only, &r.path) && !dirs.contains(&r.path) {
+            if crate::hub::agent::within(roots, &r.path) && !dirs.contains(&r.path) {
                 dirs.push(r.path.clone());
             }
         }
-        let mut candidates: Vec<String> = only.to_vec();
+        let mut candidates: Vec<String> = roots.to_vec();
         for r in self.rules.iter().filter(|r| !r.builtin) {
             let mut pats = sample_patterns(&r.pattern);
             let raw = r.pattern.trim().trim_matches('/').to_string();
@@ -1215,19 +1246,19 @@ impl Policy {
                 }
                 let parts: Vec<&str> = sp.split('/').filter(|s| !s.is_empty()).collect();
                 let mut paths = vec![sp.clone()];
-                for o in only.iter().filter(|o| !seals_secret(o)) {
+                for o in roots.iter().filter(|o| !seals_secret(o)) {
                     for k in 0..parts.len() {
                         paths.push(format!("{o}/{}", parts[k..].join("/")));
                     }
                 }
                 for p in paths {
                     if r.dir_only {
-                        if crate::hub::agent::within(only, &p) && !dirs.contains(&p) {
+                        if crate::hub::agent::within(roots, &p) && !dirs.contains(&p) {
                             dirs.push(p);
                         }
                     } else {
                         if let Some((parent, _)) = p.rsplit_once('/') {
-                            if crate::hub::agent::within(only, parent) && !dirs.iter().any(|d| d == parent) {
+                            if crate::hub::agent::within(roots, parent) && !dirs.iter().any(|d| d == parent) {
                                 dirs.push(parent.to_string());
                             }
                         }
@@ -1242,7 +1273,7 @@ impl Policy {
             }
         }
         for c in candidates {
-            if !crate::hub::agent::within(only, &c) {
+            if !allow(&c) {
                 continue;
             }
             let Ok(vp) = VPath::new(&c) else { continue };

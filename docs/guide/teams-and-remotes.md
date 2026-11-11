@@ -77,9 +77,11 @@ your working copy**: `vl rebase -d main` after pulling.
 Everything about people is on the server ([The Veil server](the-server.md)):
 a teammate signs in with `vl login`, an admin adds them to a group
 (`vl group add finance bob`, confirming their device's fingerprint the first
-time), and they clone with `vl clone veil://hub.example.com/acme`. Removing
-someone from their last group (`vl group remove finance bob`) takes effect on
-their next request and rotates the secret key away from their devices.
+time) or makes another admin (`vl admin add bob`), and they clone with
+`vl clone veil://hub.example.com/acme`. Removing someone from their last group
+(`vl group remove finance bob`) or as an admin (`vl admin remove bob`, never
+the last admin) takes effect on their next request and rotates the secret key
+away from their devices.
 
 **Use `vl clone`, not `vl init` and a pull.** `vl init` creates a **new**
 `team` key ring with you as its only member; a later pull of a project that

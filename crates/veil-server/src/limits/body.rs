@@ -16,11 +16,11 @@
 //!   double), so a client that sends a head and nothing holds nothing.
 //!   Growth is refused `busy` the moment its pool, or its client's part of
 //!   it, has no more.
-//! * **One client** (a device, or an address) holds at most a quarter of
+//! * **One client** (a person, or an address) holds at most a quarter of
 //!   each pool, so one cannot refuse the others. An anonymous body is at
 //!   most a quarter of the anonymous pool (32 MiB by default). A signed-in
 //!   body larger than that (a large file's upload, up to the route's 2 GiB)
-//!   may grow past its quarter while it is all its device holds, up to the
+//!   may grow past its quarter while it is all its person holds, up to the
 //!   whole signed-in pool; past the pool its bytes are not counted (one
 //!   such body at a time).
 //! * **A body must keep arriving** (`Arrival`): after a grace of 20 s,

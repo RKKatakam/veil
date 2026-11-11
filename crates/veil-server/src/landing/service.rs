@@ -802,7 +802,9 @@ impl Service {
         } else {
             let hex: Vec<String> = ids.iter().map(ObjectId::hex).collect();
             let rows: Vec<(String, String)> = sqlx::query_as(
-                "SELECT submitted, landed FROM landings WHERE project_id = $1 AND branch = $3 AND lineage = $4 AND submitted = ANY($2)",
+                "SELECT l.submitted, l.landed FROM landings l \
+                 WHERE l.project_id = $1 AND l.branch = $3 AND l.lineage = $4 AND l.submitted = ANY($2) \
+                 AND NOT EXISTS (SELECT 1 FROM bisect_reverts br WHERE br.project_id = l.project_id AND br.branch = l.branch AND br.lineage = l.lineage AND br.culprit = l.landed AND br.state = 'reverted')",
             )
             .bind(self.project)
             .bind(&hex)

@@ -470,11 +470,13 @@ fn may_grant(how: &How, ever: bool) -> bool {
 /// revoke every member whose name is not a target and cancel their
 /// invites. `only`: touch these people only. Returns `None` when this
 /// device is not the ring's admin.
+#[allow(clippy::too_many_arguments)]
 fn admin_sync(
     ctx: &mut Ctx,
     client: &Client,
     ring: &SecretRing,
     targets: &BTreeSet<String>,
+    admins: &[String],
     devices: &[PersonDevices],
     only: Option<&[String]>,
     revoke: bool,
@@ -497,10 +499,18 @@ fn admin_sync(
             return Ok(false);
         }
         for pd in devices.iter().filter(|d| targets.contains(&d.person) && touch(&d.person)) {
+            let role = if admins.iter().any(|a| a == &pd.person) { Role::Admin } else { Role::Member };
             for (id, how) in &pd.confirmed {
                 let pk = parse_public_identity(id)?;
                 let member = pk.member_id();
-                if st.members.contains_key(&member) {
+                if let Some(existing) = st.members.get(&member) {
+                    if existing.role == role || member == me.public_hex() {
+                        continue;
+                    }
+                    w.grant_role(&ring.scope, id, &pd.person, role)?;
+                    out.granted.insert(pd.person.clone());
+                    changed = true;
+                    st = w.ring_state(&ring.scope)?.unwrap().map_err(|e| anyhow!(e))?;
                     continue;
                 }
                 let ever = st.ever_members.contains(&member) || pk.signing_hex().is_some_and(|k| st.ever_signers.contains_key(&k));
@@ -508,8 +518,8 @@ fn admin_sync(
                     out.held_before.insert((pd.person.clone(), hub::fingerprint(id).unwrap_or_default()));
                     continue;
                 }
-                match how {
-                    How::Invite(key, signature) if st.invites.get(key).is_some_and(|i| !i.used && i.person == pd.person) => {
+                match (role, how) {
+                    (Role::Member, How::Invite(key, signature)) if st.invites.get(key).is_some_and(|i| !i.used && i.person == pd.person) => {
                         let proof = ShareProof::Invite {
                             key: key.clone(),
                             signature: signature.clone(),
@@ -519,7 +529,7 @@ fn admin_sync(
                             continue;
                         }
                     }
-                    _ => w.grant_role(&ring.scope, id, &pd.person, Role::Member)?,
+                    _ => w.grant_role(&ring.scope, id, &pd.person, role)?,
                 }
                 out.granted.insert(pd.person.clone());
                 changed = true;
@@ -536,6 +546,23 @@ fn admin_sync(
             for (id, name) in gone {
                 w.revoke(&ring.scope, &id)?;
                 out.revoked.insert(name);
+                changed = true;
+            }
+            let st = w.ring_state(&ring.scope)?.unwrap().map_err(|e| anyhow!(e))?;
+            let demote: Vec<(String, String)> = st
+                .members
+                .iter()
+                .filter(|(id, m)| {
+                    **id != me.public_hex()
+                        && targets.contains(&m.name)
+                        && touch(&m.name)
+                        && m.role == Role::Admin
+                        && !admins.iter().any(|a| a == &m.name)
+                })
+                .map(|(id, m)| (id.clone(), m.name.clone()))
+                .collect();
+            for (id, name) in demote {
+                w.grant_role(&ring.scope, &id, &name, Role::Member)?;
                 changed = true;
             }
             let invites: Vec<String> = st
@@ -563,10 +590,16 @@ fn targets(ring: &SecretRing, groups: &[GroupInfo], admins: &[String]) -> (BTree
 }
 
 fn admins(client: &Client) -> Result<Vec<String>> {
-    Ok(client.access(POLICY_FILE)?.admins)
+    Ok(client.admins_list()?.admins)
 }
 
-fn print_unconfirmed(group: Option<&str>, devices: &[PersonDevices], only: Option<&[String]>) {
+enum UnconfirmedCmd<'a> {
+    Group(&'a str),
+    Admin,
+    Access,
+}
+
+fn print_unconfirmed(cmd: UnconfirmedCmd<'_>, devices: &[PersonDevices], only: Option<&[String]>) {
     for pd in devices.iter().filter(|d| only.is_none_or(|o| o.contains(&d.person))) {
         for id in &pd.devices.identities {
             if pd.confirmed.iter().any(|(i, _)| i == id) {
@@ -574,8 +607,8 @@ fn print_unconfirmed(group: Option<&str>, devices: &[PersonDevices], only: Optio
             }
             let fp = hub::fingerprint(id).unwrap_or_else(|| "(no signing key)".into());
             println!("  {} confirm {}'s device: {}", yellow("keys:"), safe(&pd.person), bold(&fp));
-            match group {
-                Some(g) => println!(
+            match cmd {
+                UnconfirmedCmd::Group(g) => println!(
                     "        compare it with `vl identity show` on their device, then: vl group add {} {} --confirm {fp}\n        \
                      (or send them an invite: vl invite {} --to {})",
                     safe(g),
@@ -583,7 +616,13 @@ fn print_unconfirmed(group: Option<&str>, devices: &[PersonDevices], only: Optio
                     safe(&pd.person),
                     safe(g)
                 ),
-                None => println!("        compare it with `vl identity show` on their device, then confirm it with `vl group add … --confirm {fp}`"),
+                UnconfirmedCmd::Admin => println!(
+                    "        compare it with `vl identity show` on their device, then: vl admin add {} --confirm {fp}",
+                    safe(&pd.person)
+                ),
+                UnconfirmedCmd::Access => {
+                    println!("        compare it with `vl identity show` on their device, then confirm it with `vl group add … --confirm {fp}`")
+                }
             }
         }
     }
@@ -619,22 +658,22 @@ pub fn group_added(ctx: &mut Ctx, client: &Client, group: &str, people: &[String
     let devices = person_devices(ctx, client, people, confirm)?;
     let mut any_admin = false;
     let admin = is_admin(client);
+    let admins = if admin { admins(client).unwrap_or_default() } else { Vec::new() };
     if per_rule_policy(&policy) && admin {
         let groups = client.groups()?;
-        let admins = admins(client).unwrap_or_default();
         for ring in rule_rings(policy.access_policy()) {
             let Some(rule) = &ring.rule else { continue };
             if !rule.names.iter().any(|n| n == group) {
                 continue;
             }
             let (t, _) = targets(&ring, &groups, &admins);
-            if let Some(o) = admin_sync(ctx, client, &ring, &t, &devices, Some(people), false)? {
+            if let Some(o) = admin_sync(ctx, client, &ring, &t, &admins, &devices, Some(people), false)? {
                 any_admin = true;
                 print_outcome(&ring, &o);
             }
         }
     }
-    any_admin |= legacy_grant(ctx, client, &policy, &devices, true)?;
+    any_admin |= legacy_grant(ctx, client, &policy, &admins, &devices, true)?;
     // Their device takes the project's key rings only once it knows the
     // project's fingerprint (BUG-845): the same comparison, the other way.
     if !confirm.is_empty() {
@@ -649,10 +688,10 @@ pub fn group_added(ctx: &mut Ctx, client: &Client, group: &str, people: &[String
         }
     }
     if any_admin {
-        print_unconfirmed(Some(group), &devices, None);
+        print_unconfirmed(UnconfirmedCmd::Group(group), &devices, None);
     } else if admin {
         println!("  {} no access line names {} yet: its people get the keys of its folders' secrets with `vl access`", dim("keys:"), safe(group));
-        print_unconfirmed(Some(group), &devices, None);
+        print_unconfirmed(UnconfirmedCmd::Group(group), &devices, None);
     } else {
         warn(
             "they get the keys of the folder's secrets (.env and the like) only when an admin's device grants them: \
@@ -673,9 +712,9 @@ fn is_admin(client: &Client) -> bool {
 pub fn group_removed(ctx: &mut Ctx, client: &Client, group: &str, people: &[String]) -> Result<()> {
     let policy = accepted_policy(ctx)?;
     let groups = client.groups()?;
+    let admins = admins(client).unwrap_or_default();
     let mut any_admin = false;
     if per_rule_policy(&policy) && is_admin(client) {
-        let admins = admins(client).unwrap_or_default();
         for ring in rule_rings(policy.access_policy()) {
             let Some(rule) = &ring.rule else { continue };
             if !rule.names.iter().any(|n| n == group) {
@@ -694,16 +733,20 @@ pub fn group_removed(ctx: &mut Ctx, client: &Client, group: &str, people: &[Stri
                     safe(&through.join(", "))
                 );
             }
-            if let Some(o) = admin_sync(ctx, client, &ring, &t, &[], Some(people), true)? {
+            if let Some(o) = admin_sync(ctx, client, &ring, &t, &admins, &[], Some(people), true)? {
                 any_admin = true;
                 print_outcome(&ring, &o);
             }
         }
     }
-    // S1's scopes: rotated away from people now in no group at all.
-    let gone: Vec<String> = people.iter().filter(|p| !groups.iter().any(|g| g.members.contains(p))).cloned().collect();
+    // S1's scopes: rotated away from people now in no group at all (and not admins).
+    let gone: Vec<String> =
+        people.iter().filter(|p| !admins.contains(p) && !groups.iter().any(|g| g.members.contains(p))).cloned().collect();
     for person in people.iter().filter(|p| !gone.contains(p)) {
-        let other: Vec<&str> = groups.iter().filter(|g| g.members.contains(person)).map(|g| g.name.as_str()).collect();
+        let mut other: Vec<&str> = groups.iter().filter(|g| g.members.contains(person)).map(|g| g.name.as_str()).collect();
+        if admins.contains(person) {
+            other.push("admins");
+        }
         if !cloak_scopes_policy(&policy).is_empty() {
             println!(
                 "  {} {} is still in {}: the secret key was not rotated away from them",
@@ -715,7 +758,7 @@ pub fn group_removed(ctx: &mut Ctx, client: &Client, group: &str, people: &[Stri
     }
     if !gone.is_empty() {
         let devices = person_devices(ctx, client, &gone, &[])?;
-        any_admin |= legacy_grant(ctx, client, &policy, &devices, false)?;
+        any_admin |= legacy_grant(ctx, client, &policy, &admins, &devices, false)?;
     }
     // A manager's clone may not read `.veilpolicy`: the server's rings say
     // whether the project has secret keys at all.
@@ -729,10 +772,113 @@ pub fn group_removed(ctx: &mut Ctx, client: &Client, group: &str, people: &[Stri
     Ok(())
 }
 
+/// After `vl admin add PEOPLE`: a ring admin's device grants the keys of
+/// every scope in the project to the new admins' confirmed devices as ring
+/// admins (`Role::Admin`).
+pub fn admin_added(ctx: &mut Ctx, client: &Client, people: &[String], confirm: &[String]) -> Result<()> {
+    let policy = accepted_policy(ctx)?;
+    let devices = person_devices(ctx, client, people, confirm)?;
+    let admins = admins(client).unwrap_or_default();
+    let mut any_admin = false;
+    if per_rule_policy(&policy) {
+        let groups = client.groups()?;
+        for ring in rule_rings(policy.access_policy()) {
+            let (t, _) = targets(&ring, &groups, &admins);
+            if let Some(o) = admin_sync(ctx, client, &ring, &t, &admins, &devices, Some(people), false)? {
+                any_admin = true;
+                print_outcome(&ring, &o);
+            }
+        }
+    }
+    any_admin |= legacy_grant(ctx, client, &policy, &admins, &devices, true)?;
+    if !confirm.is_empty() {
+        if let Some(p) = ctx.repo.keys().project_id() {
+            let pfp = project_fingerprint(&p);
+            println!(
+                "  {} tell {} this project's fingerprint too: {} (they run `vl identity confirm {pfp}` in their clone)",
+                dim("keys:"),
+                safe(&people.join(", ")),
+                bold(&pfp)
+            );
+        }
+    }
+    if any_admin {
+        print_unconfirmed(UnconfirmedCmd::Admin, &devices, None);
+    } else if client.rings().is_ok_and(|r| !r.is_empty()) {
+        warn(
+            "this device does not administer the project's secret keys yet: ask an admin device that holds them \
+             to run `vl admin add` so the new admin's confirmed devices receive them",
+        );
+    }
+    Ok(())
+}
+
+/// After `vl admin remove PEOPLE`: a ring admin's device rotates away the
+/// keys the removed admins no longer keep through a group or access line,
+/// and demotes them to ordinary members on any ring they keep.
+pub fn admin_removed(ctx: &mut Ctx, client: &Client, people: &[String]) -> Result<()> {
+    let policy = accepted_policy(ctx)?;
+    let groups = client.groups()?;
+    let admins = admins(client).unwrap_or_default();
+    let mut any_admin = false;
+    if per_rule_policy(&policy) && is_admin(client) {
+        for ring in rule_rings(policy.access_policy()) {
+            let (t, why) = targets(&ring, &groups, &admins);
+            for p in people.iter().filter(|p| t.contains(*p)) {
+                let through = why.get(p).cloned().unwrap_or_else(|| vec!["admins".into()]);
+                println!(
+                    "  {} {} keeps the secret key of {} through {}: it was not rotated away from them",
+                    yellow("keys:"),
+                    safe(p),
+                    safe(&ring.label()),
+                    safe(&through.join(", "))
+                );
+            }
+            if let Some(o) = admin_sync(ctx, client, &ring, &t, &admins, &[], Some(people), true)? {
+                any_admin = true;
+                print_outcome(&ring, &o);
+            }
+        }
+    }
+    let gone: Vec<String> =
+        people.iter().filter(|p| !admins.contains(p) && !groups.iter().any(|g| g.members.contains(p))).cloned().collect();
+    for person in people.iter().filter(|p| !gone.contains(p)) {
+        let other: Vec<&str> = groups.iter().filter(|g| g.members.contains(person)).map(|g| g.name.as_str()).collect();
+        if !cloak_scopes_policy(&policy).is_empty() && !other.is_empty() {
+            println!(
+                "  {} {} is still in {}: the secret key was not rotated away from them",
+                yellow("keys:"),
+                safe(person),
+                safe(&other.join(", "))
+            );
+        }
+    }
+    if is_admin(client) && !cloak_scopes_policy(&policy).is_empty() {
+        let kept: Vec<String> = people.iter().filter(|p| !gone.contains(p) && !admins.contains(p)).cloned().collect();
+        if !gone.is_empty() {
+            let devices = person_devices(ctx, client, &gone, &[])?;
+            any_admin |= legacy_grant(ctx, client, &policy, &admins, &devices, false)?;
+        }
+        if !kept.is_empty() {
+            let devices = person_devices(ctx, client, &kept, &[])?;
+            any_admin |= legacy_grant(ctx, client, &policy, &admins, &devices, true)?;
+        }
+    }
+    if !any_admin && client.rings().is_ok_and(|r| !r.is_empty()) {
+        warn(&format!(
+            "the secret keys were not rotated: only a remaining admin's device rotates them. Until then {} can open new secrets \
+             if they get them; ask a project admin to run `vl admin remove {}` too",
+            people.join(", "),
+            people.join(" ")
+        ));
+    }
+    Ok(())
+}
+
 /// Milestone S1's scopes (`cloak SCOPE` lines): granted to every person an
 /// admin adds to a group, revoked (by ring member names) from people in no
 /// group. `true` if this device administers one of them.
-fn legacy_grant(ctx: &mut Ctx, client: &Client, policy: &Policy, devices: &[PersonDevices], grant: bool) -> Result<bool> {
+fn legacy_grant(ctx: &mut Ctx, client: &Client, policy: &Policy, admins: &[String], devices: &[PersonDevices], grant: bool) -> Result<bool> {
     let me = load_identity()?;
     let mut any = false;
     for scope in cloak_scopes_policy(policy) {
@@ -745,27 +891,37 @@ fn legacy_grant(ctx: &mut Ctx, client: &Client, policy: &Policy, devices: &[Pers
         let mut o = Outcome::default();
         ring_update(ctx, client, &scope, |w| {
             o = Outcome::default();
-            let st = w.ring_state(&scope)?.unwrap().map_err(|e| anyhow!(e))?;
+            let mut st = w.ring_state(&scope)?.unwrap().map_err(|e| anyhow!(e))?;
             let mut changed = false;
             for pd in devices {
                 if grant {
+                    let role = if admins.iter().any(|a| a == &pd.person) { Role::Admin } else { Role::Member };
                     for (id, how) in &pd.confirmed {
                         let pk = parse_public_identity(id)?;
-                        if st.members.contains_key(&pk.member_id()) {
+                        let member = pk.member_id();
+                        if let Some(existing) = st.members.get(&member) {
+                            if existing.role == role || member == me.public_hex() {
+                                continue;
+                            }
+                            w.grant_role(&scope, id, &pd.person, role)?;
+                            o.granted.insert(pd.person.clone());
+                            changed = true;
+                            st = w.ring_state(&scope)?.unwrap().map_err(|e| anyhow!(e))?;
                             continue;
                         }
-                        let ever = st.ever_members.contains(&pk.member_id()) || pk.signing_hex().is_some_and(|k| st.ever_signers.contains_key(&k));
+                        let ever = st.ever_members.contains(&member) || pk.signing_hex().is_some_and(|k| st.ever_signers.contains_key(&k));
                         if !may_grant(how, ever) {
                             o.held_before.insert((pd.person.clone(), hub::fingerprint(id).unwrap_or_default()));
                             continue;
                         }
-                        w.grant_role(&scope, id, &pd.person, Role::Member)?;
+                        w.grant_role(&scope, id, &pd.person, role)?;
                         o.granted.insert(pd.person.clone());
                         changed = true;
+                        st = w.ring_state(&scope)?.unwrap().map_err(|e| anyhow!(e))?;
                     }
                 } else {
-                    for id in st.members.iter().filter(|(id, m)| m.name == pd.person && **id != me.public_hex()).map(|(id, _)| id) {
-                        w.revoke(&scope, id)?;
+                    for id in st.members.iter().filter(|(id, m)| m.name == pd.person && **id != me.public_hex()).map(|(id, _)| id.clone()).collect::<Vec<_>>() {
+                        w.revoke(&scope, &id)?;
                         o.revoked.insert(pd.person.clone());
                         changed = true;
                     }
@@ -817,9 +973,9 @@ pub fn access_changed(ctx: &mut Ctx, client: Option<&Client>, path: &str) -> Res
     let (t, _) = targets(&ring, &groups, &admins);
     let people: Vec<String> = t.iter().cloned().collect();
     let devices = person_devices(ctx, client, &people, &[])?;
-    if let Some(o) = admin_sync(ctx, client, &ring, &t, &devices, None, true)? {
+    if let Some(o) = admin_sync(ctx, client, &ring, &t, &admins, &devices, None, true)? {
         print_outcome(&ring, &o);
-        print_unconfirmed(None, &devices, None);
+        print_unconfirmed(UnconfirmedCmd::Access, &devices, None);
     }
     Ok(())
 }
@@ -859,7 +1015,7 @@ pub fn invite(ctx: &mut Ctx, client: &Client, person: &str, group: &str) -> Resu
             continue;
         }
         let (t, _) = targets(&ring, &groups, &admins);
-        admin_sync(ctx, client, &ring, &t, &[], Some(&[]), false)?;
+        admin_sync(ctx, client, &ring, &t, &admins, &[], Some(&[]), false)?;
         ring_update(ctx, client, &ring.scope, |w| {
             let st = w.ring_state(&ring.scope)?.ok_or_else(|| anyhow!("no ring"))?.map_err(|e| anyhow!(e))?;
             if st.invites.contains_key(&public) || !me_admin(&st, w) {
@@ -1394,11 +1550,11 @@ pub fn upgrade_rule_keys(ctx: &mut Ctx, dry_run: bool) -> Result<std::process::E
     let devices = person_devices(ctx, &client, &people, &[])?;
     for ring in &rings {
         let (t, _) = targets(ring, &groups, &admins);
-        if let Some(o) = admin_sync(ctx, &client, ring, &t, &devices, None, true)? {
+        if let Some(o) = admin_sync(ctx, &client, ring, &t, &admins, &devices, None, true)? {
             print_outcome(ring, &o);
         }
     }
-    print_unconfirmed(None, &devices, None);
+    print_unconfirmed(UnconfirmedCmd::Access, &devices, None);
     if already {
         println!("The keys of every folder are up to date. Commit and push any secret not yet re-sealed under its folder's key.");
         return Ok(std::process::ExitCode::SUCCESS);

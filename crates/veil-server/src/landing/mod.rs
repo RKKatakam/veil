@@ -150,7 +150,11 @@ pub async fn record_changes(
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO landed_changes (project_id, branch, lineage, change_id, author, landed) \
-         SELECT $1, $2, $3, c, a, l FROM unnest($4::TEXT[], $5::BIGINT[], $6::TEXT[]) AS v(c, a, l) ON CONFLICT DO NOTHING",
+         SELECT DISTINCT ON (c, a) $1, $2, $3, c, a, l \
+         FROM unnest($4::TEXT[], $5::BIGINT[], $6::TEXT[]) WITH ORDINALITY AS v(c, a, l, ord) \
+         ORDER BY c, a, ord \
+         ON CONFLICT (project_id, branch, lineage, change_id, author) DO UPDATE SET landed = EXCLUDED.landed \
+         WHERE EXISTS (SELECT 1 FROM bisect_reverts br WHERE br.project_id = landed_changes.project_id AND br.branch = landed_changes.branch AND br.lineage = landed_changes.lineage AND br.culprit = landed_changes.landed AND br.state = 'reverted')",
     )
     .bind(project)
     .bind(branch)
@@ -1298,13 +1302,17 @@ impl Ancestry {
         let n: Option<i32> = if !held {
             None
         } else {
-            sqlx::query_scalar("SELECT 1 FROM landings WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND submitted = $4 LIMIT 1")
-                .bind(self.project)
-                .bind(&self.branch)
-                .bind(self.lineage)
-                .bind(x.hex())
-                .fetch_optional(&self.hub.db)
-                .await?
+            sqlx::query_scalar(
+                "SELECT 1 FROM landings l WHERE l.project_id = $1 AND l.branch = $2 AND l.lineage = $3 AND l.submitted = $4 \
+                 AND NOT EXISTS (SELECT 1 FROM bisect_reverts br WHERE br.project_id = l.project_id AND br.branch = l.branch AND br.lineage = l.lineage AND br.culprit = l.landed AND br.state = 'reverted') \
+                 LIMIT 1",
+            )
+            .bind(self.project)
+            .bind(&self.branch)
+            .bind(self.lineage)
+            .bind(x.hex())
+            .fetch_optional(&self.hub.db)
+            .await?
         };
         if n.is_some() {
             return Ok(Landed::Same);
@@ -1312,7 +1320,9 @@ impl Ancestry {
         let Some(author) = snapshot_author(&self.hub, self.project, x, fresh).await? else { return Ok(Landed::No) };
         let cid = crate::sync::blocking_staged(&self.hub, self.project, self.staged.clone(), move |src| Ok(src.snapshot(&x)?.change_id.to_string())).await?;
         let row: Option<String> = sqlx::query_scalar(
-            "SELECT landed FROM landed_changes WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND change_id = $4 AND author = $5",
+            "SELECT lc.landed FROM landed_changes lc \
+             WHERE lc.project_id = $1 AND lc.branch = $2 AND lc.lineage = $3 AND lc.change_id = $4 AND lc.author = $5 \
+             AND NOT EXISTS (SELECT 1 FROM bisect_reverts br WHERE br.project_id = lc.project_id AND br.branch = lc.branch AND br.lineage = lc.lineage AND br.culprit = lc.landed AND br.state = 'reverted')",
         )
         .bind(self.project)
         .bind(&self.branch)

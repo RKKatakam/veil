@@ -15,7 +15,9 @@
 //!    the address of the cache's client, never the cache's.
 //! 2. **Rate** ([`bucket`]): a token from the device's or the address's
 //!    buckets, else `429 rate_limited` with `retry_after_ms`, naming
-//!    nothing.
+//!    nothing. A signed-in request, under a session or a grant, also pays
+//!    its person's umbrella, and a person nobody else vouches for their
+//!    address's (`vouched`, BUG-1890).
 //! 3. **The body** ([`body`]): read under a share of the memory budget that
 //!    grows as it arrives, at a minimum rate.
 //! 4. **Bulkheads** ([`gate`]): a place in the project's gate, for callers
@@ -42,7 +44,10 @@ pub mod landing;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -67,7 +72,7 @@ pub struct Settings {
     /// `public` folders, sign-in.
     pub anonymous: Rate,
     /// Most connections open at once; an address (an IPv4 address, an IPv6
-    /// /64) has at most an eighth of them.
+    /// /56) has at most an eighth of them.
     pub max_connections: usize,
     /// Most bytes of request bodies held at once, and as many of answers
     /// being written.
@@ -107,7 +112,7 @@ pub const CLIENT_ADDRESS: &str = "veil-client-address";
 const TRUSTED_FOR: Duration = Duration::from_secs(300);
 
 /// Connections open per address ([`Key::ip`]: an IPv4 address, an IPv6
-/// /64, BUG-1336), for the listener: at most an eighth of the cap from one,
+/// /56, BUG-1336, BUG-1891), for the listener: at most an eighth of the cap from one,
 /// except a regional cache's (an address that sent the caches' token in the
 /// last 5 minutes), which serves many clients.
 pub struct Connections {
@@ -163,6 +168,10 @@ pub struct Limits {
     /// (`docs/HUB.md` §13.25, §13.32).
     people: Buckets,
     addresses: Buckets,
+    /// The signed-in people behind one address whom nobody else vouches
+    /// for ([`vouched`]), together: one person's umbrella, so signing up
+    /// again and again from one address gains nothing (BUG-1890).
+    newcomers: Buckets,
     /// Session lookups per address (tokens this server does not know yet),
     /// at the device rate: a restarted server's people behind one address
     /// are looked up, made-up tokens are not looked up past it (BUG-1338).
@@ -192,6 +201,7 @@ impl Limits {
             devices: Buckets::new(settings.device),
             people: Buckets::new(person_rate),
             addresses: Buckets::new(settings.anonymous),
+            newcomers: Buckets::new(person_rate),
             lookups: Buckets::new(settings.device),
             bodies: body::Pools::new(settings.request_memory),
             answers: answers::Answers::new(settings.request_memory),
@@ -237,34 +247,96 @@ pub const DERIVE_PAUSE: Duration = Duration::from_secs(10);
 
 type Places = Arc<Mutex<Option<(Option<gate::Place>, gate::Place)>>>;
 
-tokio::task_local! {
+/// Every task-local value a request carries: kept in one struct so
+/// [`in_request`] clones all of them together and a newly added field cannot
+/// be missed across `tokio::spawn` (BUG-1668, BUG-1863).
+#[derive(Clone, Default)]
+pub(crate) struct RequestLocals {
+    /// Set when a [`crate::db::transaction`] of the current request attempt
+    /// committed (or tried to): from then on [`crate::db::retry_requests`]
+    /// does not run the request again.
+    pub committed: Option<Arc<AtomicBool>>,
+    /// The landing queue bounds (`(max_session_outstanding, max_person_outstanding)`)
+    /// of the server handling the current request.
+    pub bounds: Option<(usize, usize)>,
     /// The bulkhead places held by the request being served: dropped when
     /// the route answers, or sooner ([`leave_gates`]) before a wait for
     /// something other than the request's own work (BUG-1635).
-    static PLACES: Places;
-    /// The landing queue bounds (`(max_session_outstanding, max_person_outstanding)`)
-    /// of the server handling the current request.
-    pub(crate) static BOUNDS: std::cell::Cell<(usize, usize)>;
+    pub places: Places,
+    /// Cache hits and misses of the request being served.
+    pub layers: Option<Arc<health::LayerCounts>>,
+    /// Whether storage writes made here count in [`crate::store::Objects::own_writes`].
+    pub own_writes: bool,
+}
+
+tokio::task_local! {
+    pub(crate) static REQUEST: RequestLocals;
+}
+
+pub(crate) fn current_request() -> RequestLocals {
+    REQUEST.try_with(Clone::clone).unwrap_or_default()
+}
+
+pub(crate) fn with_committed<F: std::future::Future>(
+    committed: Arc<AtomicBool>,
+    f: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let mut ctx = current_request();
+    ctx.committed = Some(committed);
+    REQUEST.scope(ctx, f)
+}
+
+pub(crate) fn mark_committed() {
+    let _ = REQUEST.try_with(|r| {
+        if let Some(c) = &r.committed {
+            c.store(true, Ordering::Release);
+        }
+    });
+}
+
+pub(crate) fn with_own_writes<F: std::future::Future>(
+    own_writes: bool,
+    f: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let mut ctx = current_request();
+    ctx.own_writes = own_writes;
+    REQUEST.scope(ctx, f)
+}
+
+pub(crate) fn is_own_write() -> bool {
+    REQUEST.try_with(|r| r.own_writes).unwrap_or(false)
+}
+
+pub(crate) fn record_layer_hit(layer: health::Layer, hit: bool) {
+    let _ = REQUEST.try_with(|r| {
+        if let Some(l) = &r.layers {
+            l.hit(layer, hit);
+        }
+    });
+}
+
+pub(crate) fn request_bounds() -> Option<(usize, usize)> {
+    REQUEST.try_with(|r| r.bounds).ok().flatten()
 }
 
 /// Give back the bulkhead places of the request being served before it
 /// waits for something other than its own work (a landing's outcome, a
 /// ticket, BUG-1635; nothing outside a request).
 pub fn leave_gates() {
-    let _ = PLACES.try_with(|p| {
-        p.lock().unwrap().take();
+    let _ = REQUEST.try_with(|r| {
+        r.places.lock().unwrap().take();
     });
 }
 
-/// Carry the current request's landing bounds and bulkhead places into a
-/// spawned task that finishes the request's own work (`sync::push_with`,
-/// BUG-1668).
+/// Carry every request task-local (`RequestLocals`) into a spawned task
+/// that finishes the request's own work (`sync::push_with`, BUG-1668,
+/// BUG-1863).
 pub fn in_request<F: std::future::Future>(hub: &crate::Hub, f: F) -> impl std::future::Future<Output = F::Output> {
-    let bounds = BOUNDS
-        .try_with(|b| b.get())
-        .unwrap_or_else(|_| landing::settings_bounds(&hub.limits.settings));
-    let places = PLACES.try_with(|p| p.clone()).unwrap_or_default();
-    BOUNDS.scope(std::cell::Cell::new(bounds), PLACES.scope(places, f))
+    let mut ctx = current_request();
+    if ctx.bounds.is_none() {
+        ctx.bounds = Some(landing::settings_bounds(&hub.limits.settings));
+    }
+    REQUEST.scope(ctx, f)
 }
 
 /// `s` percent-decoded, as the routes' `Path` decodes it; `None` if it does
@@ -356,12 +428,23 @@ fn busy(close: bool) -> Response {
 /// Who a request counts against.
 #[derive(Default)]
 struct Who {
-    /// The device, if any (else the address counts).
+    /// The device or agent session, if any (else the address counts).
     device: Option<Key>,
+    /// The person behind `device` (from a session or a verified read grant).
+    person_id: Option<i64>,
     /// The person and the person's access epoch, for a session.
     person: Option<(crate::auth::Person, i64)>,
     /// The project a verified read grant is for.
     grant: Option<String>,
+}
+
+impl Who {
+    /// Key for per-caller request-body and answer memory shares (BUG-1882):
+    /// the person when known, so one person's devices and agent sessions
+    /// share one quarter of the pool.
+    fn budget_key(&self, address: Key) -> Key {
+        self.person_id.map(Key::Person).or(self.device).unwrap_or(address)
+    }
 }
 
 /// The device a read grant was issued to (if any) and its project, if its
@@ -372,6 +455,27 @@ fn grant(hub: &HubState, token: &str) -> Option<(Option<Key>, String)> {
         return None;
     }
     Some((g.body.device.as_deref().and_then(Key::device), g.body.project))
+}
+
+/// The person owning `device` (`Key::Device`), from the request cache or the
+/// database (cached once found). Used for verified read grants, which carry
+/// the server's signature over the device's signing key.
+async fn device_person(hub: &HubState, device: Option<Key>) -> Option<i64> {
+    let Some(Key::Device(k)) = device else { return None };
+    if let Some(pid) = hub.caches.device_person(&k) {
+        return Some(pid);
+    }
+    let hex_key = hex::encode(k);
+    let pid: Option<i64> = sqlx::query_scalar("SELECT person_id FROM devices WHERE signing_key = $1 AND NOT pending")
+        .bind(&hex_key)
+        .fetch_optional(&hub.db)
+        .await
+        .ok()
+        .flatten();
+    if let Some(pid) = pid {
+        hub.caches.put_device_person(k, pid);
+    }
+    pid
 }
 
 /// Who `parts` counts against, its rate taken (`address`: the client's).
@@ -403,7 +507,12 @@ async fn who(hub: &HubState, parts: &mut axum::http::request::Parts, address: Ke
         if let Some(e) = hub.caches.session(&crate::auth::session_hash(token)).filter(|e| e.expires_at > now) {
             if let Some(d) = Key::of_person(&e.person) {
                 charge(Some(d), Some(e.person.id))?;
-                return Ok(Who { device: Some(d), person: Some((e.person.clone(), e.epoch)), grant: None });
+                return Ok(Who {
+                    device: Some(d),
+                    person_id: Some(e.person.id),
+                    person: Some((e.person.clone(), e.epoch)),
+                    grant: None,
+                });
             }
         }
         // Not known here yet (another server's, a restart, an evicted entry,
@@ -414,14 +523,16 @@ async fn who(hub: &HubState, parts: &mut axum::http::request::Parts, address: Ke
         let found = crate::auth::authenticate_parts(parts, hub, false).await.ok();
         let person = found.and_then(|c| c.person.map(|p| (p, c.epochs.person)));
         let device = person.as_ref().and_then(|(p, _)| Key::of_person(p));
+        let person = person.filter(|_| device.is_some());
         let pid = person.as_ref().map(|(p, _)| p.id);
         charge(device, pid)?;
-        return Ok(Who { device, person: person.filter(|_| device.is_some()), grant: None });
+        return Ok(Who { device, person_id: pid, person, grant: None });
     }
     if let Some(g) = parts.headers.get("veil-grant").and_then(|g| g.to_str().ok()) {
         if let Some((device, project)) = grant(hub, g) {
-            charge(device, None)?;
-            return Ok(Who { device, person: None, grant: Some(project) });
+            let pid = device_person(hub, device).await;
+            charge(device, pid)?;
+            return Ok(Who { device, person_id: pid, person: None, grant: Some(project) });
         }
     }
     if deferred {
@@ -429,6 +540,46 @@ async fn who(hub: &HubState, parts: &mut axum::http::request::Parts, address: Ke
     }
     charge(None, None)?;
     Ok(Who::default())
+}
+
+/// Whether someone else vouches for the request's person, as far as this
+/// server's memory says: they are in a group of, or named by a rule of, a
+/// project they do not administer (seen now, in the permissions cached for
+/// the project the request names, or at an earlier request). Anyone can
+/// sign up, any number of times, and a new person's own buckets start
+/// full: so a person nobody vouches for also pays their address's
+/// [`Limits::newcomers`] bucket, and one address's sign-ups are served
+/// together what one person is (BUG-1890). Someone vouched for counts
+/// alone, however many colleagues share their address. A person's first
+/// request to a server (nothing cached yet) pays the address too.
+fn vouched(hub: &HubState, name: Option<&str>, who: &Who) -> bool {
+    let Some(id) = who.person_id else { return false };
+    if hub.caches.vouched(id) {
+        return true;
+    }
+    let (Some(entry), Some((person, epoch))) = (name.and_then(|n| hub.caches.project(n)), &who.person) else { return false };
+    let project = &entry.project;
+    let member = hub.caches.viewer(project.id, person).is_some_and(|v| {
+        !v.barred
+            && v.project_epoch == entry.epoch
+            && v.person_epoch == *epoch
+            && !v.viewer.admin
+            && (!v.viewer.groups.is_empty() || project.bindings.values().any(|b| *b == crate::perm::Binding::Person(id)))
+    });
+    if member {
+        hub.caches.put_vouched(id);
+    }
+    member
+}
+
+/// The address's share of a signed-in request ([`vouched`]): taken after
+/// the device's and the person's own, so a caller past their own rate
+/// takes nothing from the others behind their address.
+fn newcomer(hub: &HubState, name: Option<&str>, who: &Who, address: Key) -> Result<(), Duration> {
+    match who.person_id {
+        Some(_) if !vouched(hub, name, who) => hub.limits.newcomers.take(address),
+        _ => Ok(()),
+    }
 }
 
 /// Whether this server already knows, from memory alone, that the caller
@@ -497,12 +648,15 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
         Ok(w) => w,
         Err(wait) => return finish(&hub, rate_limited(wait)),
     };
+    if let Err(wait) = newcomer(&hub, name.as_deref(), &who, address) {
+        return finish(&hub, rate_limited(wait));
+    }
     let deferred = batch && who.device.is_none() && who.person.is_none() && who.grant.is_none();
 
     // 3: the body, under the budget.
     let declared = hyper::body::Body::size_hint(&body).exact();
     let limit = crate::db::body_limit(parts.uri.path()) as u64;
-    let body_key = who.device.unwrap_or(address);
+    let body_key = who.budget_key(address);
     let mut body = body;
     let (bytes, _share) = match limits.bodies.read(body_key, who.device.is_some(), &mut body, declared, limit).await {
         Ok(b) => b,
@@ -528,8 +682,15 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
             grant: String,
         }
         let found = serde_json::from_slice::<Batch>(&bytes).ok().and_then(|b| grant(&hub, &b.grant));
+        let pid = match &found {
+            Some((device, _)) => device_person(&hub, *device).await,
+            None => None,
+        };
         let taken = match &found {
-            Some((Some(d), _)) => limits.devices.take(*d),
+            Some((Some(d), _)) => limits.devices.take(*d).and_then(|()| match pid {
+                Some(p) => limits.people.take(Key::Person(p)),
+                None => Ok(()),
+            }),
             _ => limits.addresses.take(address),
         };
         if let Err(wait) = taken {
@@ -537,7 +698,11 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
         }
         if let Some((device, project)) = found {
             who.device = device;
+            who.person_id = pid;
             who.grant = Some(project);
+        }
+        if let Err(wait) = newcomer(&hub, name.as_deref(), &who, address) {
+            return finish(&hub, rate_limited(wait));
         }
     }
 
@@ -562,22 +727,18 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
 
     // 5: the route, its cache hits counted for its project, its answer
     // under the answers' budget.
+    let answer_key = who.budget_key(address);
     let mut req = Request::from_parts(parts, Body::from(bytes));
-    req.extensions_mut().insert(answers::For(body_key));
+    req.extensions_mut().insert(answers::For(answer_key));
     let bounds = landing::settings_bounds(&limits.settings);
-    let (resp, layers) = BOUNDS
-        .scope(
-            std::cell::Cell::new(bounds),
-            PLACES.scope(
-                Arc::new(Mutex::new(Some((project_place, server_place)))),
-                health::LAYERS.scope(std::cell::Cell::new(health::Counts::default()), async {
-                    let r = next.run(req).await;
-                    (r, health::LAYERS.with(|c| c.get()))
-                }),
-            ),
-        )
-        .await;
-    let resp = match limits.answers.budget(body_key, resp, class != Class::Write).await {
+    let mut ctx = current_request();
+    ctx.bounds = Some(bounds);
+    ctx.places = Arc::new(Mutex::new(Some((project_place, server_place))));
+    let layer_counts = Arc::new(health::LayerCounts::default());
+    ctx.layers = Some(layer_counts.clone());
+    let resp = REQUEST.scope(ctx, next.run(req)).await;
+    let layers = layer_counts.snapshot();
+    let resp = match limits.answers.budget(answer_key, resp, class != Class::Write).await {
         Some(r) => r,
         None => busy(false),
     };
@@ -644,20 +805,43 @@ mod tests {
         }
     }
 
-    /// BUG-1336: an IPv6 /64 is one address for the connection share, as
-    /// for the rates; a regional cache's address has no share.
+    /// BUG-1336, BUG-1891: an IPv6 /56 is one address for the connection
+    /// share, as for the rates; a regional cache's address has no share.
     #[test]
     fn the_connection_share_groups_addresses_as_the_rates_do() {
         let c = Connections::new(16);
         let a: IpAddr = "2001:db8::1".parse().unwrap();
         let b: IpAddr = "2001:db8::2".parse().unwrap();
-        let other: IpAddr = "2001:db8:0:1::1".parse().unwrap();
+        let near: IpAddr = "2001:db8:0:1::1".parse().unwrap();
+        let other: IpAddr = "2001:db8:0:100::1".parse().unwrap();
         let held = [c.open(a).unwrap(), c.open(a).unwrap()];
         assert!(c.open(b).is_none(), "the same /64");
-        assert!(c.open(other).is_some());
+        assert!(c.open(near).is_none(), "another /64 of the same /56");
+        assert!(c.open(other).is_some(), "another /56");
         c.trust(b);
-        assert!(c.open(a).is_some(), "a cache's /64 has no share");
+        assert!(c.open(a).is_some(), "a cache's /56 has no share");
         drop(held);
+    }
+
+    /// BUG-1891: the /64s of one delegated prefix are one caller's. A home
+    /// line's /56 (RFC 6177) is 256 of them: with `--max-connections 16`,
+    /// two connections from each of eight /64s of one /56 were every
+    /// connection of the server; the /56 now has the one share.
+    #[test]
+    fn bug_1891_one_delegated_ipv6_prefix_opens_every_connection() {
+        let c = Connections::new(16);
+        let held: Vec<Option<Slot>> = (0..8u16)
+            .flat_map(|n| {
+                let ip: IpAddr = format!("2001:db8:0:{n:x}::1").parse().unwrap();
+                [c.open(ip), c.open(ip)]
+            })
+            .collect();
+        assert!(held[0].is_some() && held[1].is_some(), "the first /64 opens its share");
+        let open = held.iter().flatten().count();
+        assert!(open < 16, "eight /64s of one /56 opened all {open} of the server's 16 connections");
+        assert_eq!(open, 2, "the /56 has one address's share (an eighth of 16)");
+        let other: IpAddr = "2001:db8:0:100::1".parse().unwrap();
+        assert!(c.open(other).is_some(), "another /56 still connects");
     }
 
     /// A refusal names nothing but the wait, in the body and the header.

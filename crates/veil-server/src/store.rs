@@ -530,29 +530,23 @@ pub fn encode(raw: Bytes) -> Bytes {
     }
 }
 
-tokio::task_local! {
-    /// Set while a push or an upload runs (not in what it spawns: the
-    /// deriver, the search index, viewer graphs).
-    static OWN: bool;
-}
-
 /// Run `f` as a push's or an upload's own work: the storage writes made in
 /// it count in [`Objects::own_writes`] (BUG-1398: attributed where they are
 /// made, not by subtracting known kinds of other work).
 pub async fn own<F: std::future::Future>(f: F) -> F::Output {
-    OWN.scope(true, f).await
+    crate::limits::with_own_writes(true, f).await
 }
 
 /// Run `f` outside a push's or an upload's own storage-write count
 /// (BUG-1624: lazy projections of already-committed history).
 pub async fn not_own<F: std::future::Future>(f: F) -> F::Output {
-    OWN.scope(false, f).await
+    crate::limits::with_own_writes(false, f).await
 }
 
 fn count_write(o: &Objects, bytes: usize) {
     bump(&o.writes);
     o.written_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
-    if OWN.try_with(|own| *own).unwrap_or(false) {
+    if crate::limits::is_own_write() {
         bump(&o.own_writes);
     }
 }

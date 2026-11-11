@@ -3866,7 +3866,8 @@ Every request passes through `limits::admit` before any route, in this order:
    session it finds pays its device, anything else the address
    (BUG-1338). The device of a read grant whose signature verifies (the
    object routes: the `Veil-Grant` header, or a batch's body). Anyone else
-   by address (IPv4, or the IPv6 /64). **A regional cache's requests**
+   by address (IPv4, or the IPv6 /56: a subscriber's usual delegated
+   prefix, every /64 of which is the one caller's, BUG-1891). **A regional cache's requests**
    carry the caches' token and its client's address (set by the cache's
    listener, replacing any the client sent): the server counts them
    against the grant's device or that client's address, never the
@@ -3880,7 +3881,22 @@ Every request passes through `limits::admit` before any route, in this order:
    next token, the same for every project, hidden or not, naming nothing.
    `vl` waits it out (and a `503 busy`'s), at most 8 times and 2 minutes in
    all (BUG-1331). Idle buckets (full ones) are forgotten; a shard keeps at
-   most 16,384 keys.
+   most 16,384 keys. **Every signed-in request also pays its person's
+   umbrella** (ten times a device's rate, over all of the person's devices
+   and agent sessions), under a session or under a read grant, whose
+   device names its person (BUG-1890). **A person nobody else vouches for
+   also pays their address's bucket, itself one person's umbrella**
+   (BUG-1890): anyone can sign up, any number of times, and a new person's
+   own buckets start full, so the people one address signs up are served
+   together what one person is. Someone vouches for a person when a
+   project they do not administer has them in a group or names them in a
+   rule: the server learns it from the permissions it caches for the
+   project a request names (memory only; a person's first request to a
+   server pays the address too), and from then on that person counts
+   alone, however many colleagues share their address. The address's
+   bucket is taken last, so a caller past their own rate takes nothing
+   from the others behind their address. People who vouch for each other
+   from one address (one's project naming the other) are not held by it.
 3. **The body, under a memory budget** (`body.rs`, BUG-1187, BUG-1333).
    Every byte of a request body is counted, in KiB, against one of three
    pools of `--request-memory`: **the reserve** (an eighth) for small bodies
@@ -3944,7 +3960,7 @@ Every request passes through `limits::admit` before any route, in this order:
 **The listener** (`serve`): at most `--max-connections` (1,024) open, the
 next waiting in the listener's queue; **an address opens at most an eighth
 of them** (past that a connection is closed at once), an address being an
-IPv4 address or an IPv6 /64, as for the rates (BUG-1336); an address that
+IPv4 address or an IPv6 /56, as for the rates (BUG-1336, BUG-1891); an address that
 sent the caches' token in the last 5 minutes is a regional cache's and has
 no share. The TLS handshake and a request's head within 20 s; **a
 connection with no request in flight for 20 s is closed**, HTTP/1.1 or
@@ -4057,16 +4073,24 @@ cycle 1 review's findings in rows 13 to 21):
 | 13 | Someone outside a busy private project | times or counts `busy` for its name against a missing one (BUG-1334) | not in its gate: `404` in about the same time as a missing name | `bug_1334_a_busy_private_project_is_told_apart_from_a_missing_one` |
 | 14 | One signed-in person, or four addresses | a slow large upload; heads that declare lengths and send nothing (BUG-1333) | a body holds what has arrived, and only while it keeps arriving; small bodies (sign-in, a small push) have a reserve | `bug_1333_one_slow_large_upload_refuses_every_other_signed_in_body`, `bug_1333_four_addresses_holding_bodies_refuse_every_sign_in`, `a_push_of_one_file_larger_than_the_signed_in_pool_lands`; `body::tests::a_head_without_its_body_holds_nothing`, `…::small_bodies_have_a_reserve` |
 | 15 | A member, or anyone on Earth for a public project | names the project in percent-encoded spellings (BUG-1335) | one gate for every spelling | `bug_1335_a_project_named_in_other_spellings_runs_past_its_bulkhead`; `limits::tests::project_names_are_keyed_as_the_route_decodes_them` |
-| 16 | One host with an IPv6 /64 | opens connections from many of its addresses (BUG-1336) | one share for the /64 | `limits::tests::the_connection_share_groups_addresses_as_the_rates_do` (`bug_1336_…` needs two global IPv6 addresses of one /64 on the machine) |
+| 16 | One host with an IPv6 /64, or a subscriber with a delegated /56 | opens connections from many of its addresses (BUG-1336) or from each of its /64s (BUG-1891) | one share for the /56 | `limits::tests::the_connection_share_groups_addresses_as_the_rates_do`, `limits::tests::bug_1891_one_delegated_ipv6_prefix_opens_every_connection` (`bug_1336_…` needs two global IPv6 addresses of one /64 on the machine) |
 | 17 | Anyone on Earth | HTTP/2 connections that answer pings and send nothing (BUG-1337) | closed after 20 s without a request | `bug_1337_an_idle_http2_connection_keeps_its_slot_for_ever` |
 | 18 | — (people behind one address) | their first requests to a server new to their sessions (BUG-1338) | each pays its device | `bug_1338_signed_in_people_behind_one_address_are_refused_on_a_server_new_to_them` |
 | 19 | — (one person's agents) | 6 agents on one device, cloning, committing, pushing, pulling (BUG-1339) | within the device's rate | `bug_1339_an_agent_fleet_on_one_device_is_refused_at_the_defaults` |
 | 20 | — (readers behind a regional cache) | 40 cold reads of one signed-in reader through a cache (BUG-1332) | each counts against the reader's device; the cache's address keeps its own rate | `cache::bug_1332_a_caches_forwarded_reads_count_against_its_address` |
 | 21 | Anyone on Earth | 8 clients that ask for a 24 MiB file and never read (BUG-1330) | one answer held at a time for the address; the others `busy` before the object is read (RSS +27 MiB, +196 before) | `bug_1330_answers_to_clients_that_do_not_read_are_not_bounded_by_a_budget`; `answers::tests::*` |
 | 22 | A client within its limits, past a burst | `vl` refused `429` or shed `503` (BUG-1331) | waits `retry_after_ms` and tries again | `bug_1331_vl_waits_out_a_rate_limit` |
+| 23 | Anyone on Earth, one address, no account | signs up person after person, each with a new device's whole rate (BUG-1890) | the people nobody else vouches for pay their address's bucket too: together one person's umbrella; a new person past it is refused from their first request | `rv_gaps::bug_1890_one_address_signing_up_new_people_stays_within_a_persons_rate` |
+| 24 | — (colleagues behind one address) | someone else signs up again and again from their address (BUG-1890's fix) | a person a project's admin put in a group or named in a rule counts alone and keeps their rate | `rv_gaps::bug_1890_people_a_project_vouches_for_keep_their_rate_behind_a_spent_address` |
+| 25 | One person | reads under a read grant after their devices and agent sessions used their umbrella (BUG-1890) | a request under a grant pays the person's umbrella as one under a session does | `rv_gaps::bug_1890_requests_under_a_read_grant_pay_the_persons_umbrella` |
 
 **Residual:** people behind one address share its anonymous rate and an
-eighth of the connections; a person whose access was removed may wait in
+eighth of the connections, and those of them nobody else vouches for (a
+project's own admin among them) share one person's umbrella; people who
+vouch for each other from one address (each one's project naming the
+next) count alone again, as one person's sign-ups did before BUG-1890's
+fix; an IPv6 caller with a prefix shorter than a /56 (a host's or a tunnel
+broker's /48) is 256 addresses (BUG-1891's fix keys the /56); a person whose access was removed may wait in
 the project's gate (not see anything) until this server's cached
 permissions are renewed; a grant's device is charged on its verified grant,
 not on the request's own signature (a copy of a grant, which only its
@@ -5322,6 +5346,22 @@ migration `0026_bisect_and_revert.sql` (`landing_queue.priority`,
     `ours = tip.tree`, `theirs = P.tree`), surgically reversing only `C`'s edits
     while preserving later changes' edits. If a later change modified the same
     lines as `C`, S18 reports a conflict and bisect records `phase = "conflict"`.
+* **No automatic revert loops (`BUG-1884`, migration `0030_bisect_revert_change_id.sql`).**
+  * The server never reverts a revert it made itself (`bisect::server_revert_origin`
+    matches `bisect_reverts.revert_snapshot`). When bisect confirms a server-made
+    revert as the culprit (for instance, after a later landing built on the
+    reverted change), bisect stops at `phase = "needs a person"` without queueing
+    a revert and emits `bisect.needs_person` (`events::emit_needs_person`,
+    visibility-filtered per viewer) naming both the culprit revert and the
+    original change.
+  * `bisect_reverts` also records `culprit_change_id`. Once a `change_id` has
+    been reverted twice by the server (`bisect::any_reverted_twice`), landing
+    that `change_id` again—even rebased or rewritten—requires at least one
+    person's approval of the exact patch through S21 (`prs::review::gate`,
+    `prs::check_landing_review`) as if high risk (`people_only = true`,
+    refusal `reverted twice: needs a person's approval`), regardless of the
+    branch's rules, and the count is never reset. First-time culprits still
+    revert immediately as before.
 * **Visibility (`docs/VISIBILITY.md`) and routes (`GET /v1/projects/{p}/bisect/{branch}`).**
   * `events::emit_check_requested`, `events::emit_reverted`, and
     `bisect::status_route` project every snapshot (`good`, `bad`, `candidates`,

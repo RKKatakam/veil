@@ -113,8 +113,9 @@ Sent 8 object(s) to origin
 
 ## Groups and folder access
 
-Admins create groups, add people, and choose managers; a group's managers
-add and remove other people in it, never themselves:
+Admins create groups, add people, choose managers, and add or remove other
+admins (never the last admin); a group's managers add and remove other people
+in it, never themselves:
 
 ```sh
 vl group create finance
@@ -122,6 +123,8 @@ vl invite alice --to finance       # someone new, or a remote teammate
 vl group add finance bob           # someone whose device is confirmed already
 vl group manager finance carol
 vl group list
+vl admin add dave                  # make dave an admin too (--confirm FINGERPRINT first time)
+vl admin list
 ```
 
 **An invite** is the easy way to bring someone in:
@@ -573,6 +576,11 @@ vl stats --json      # the server's answer (veil.health/1)
 Each device may send a burst of 200 requests a second within 50,000 an
 hour (your agents on that device share it); requests without a session
 (anyone on Earth, sign-in) 20 a second within 1,000 an hour per address.
+All of your devices and agent sessions together have ten times a device's
+rate. So have, together, the people at one address whom no project but
+their own names: signing up again from the same address gains nothing.
+Once another project's admin puts you in a group or names you in a rule,
+you count alone, however many colleagues share your address.
 Past it the server answers `429` and says when to come back, and `vl` waits
 and tries again. One busy project leaves the others room: it runs at most
 three quarters of the server's database connections at once.

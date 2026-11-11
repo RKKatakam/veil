@@ -607,6 +607,10 @@ pub async fn release_embargo_prs(
         let Some(current) = revs.iter().find(|r| r.n == pr_row.revision) else {
             continue;
         };
+        // BUG-1884: a change the server reverted twice needs a person's
+        // approval here too, as on every other route that lands a PR.
+        let cids: Vec<String> = current.changes.iter().map(|c| c.change.clone()).collect();
+        let rev_twice = crate::bisect::any_reverted_twice(hub, project.id, &cids).await?;
         let gate = review::gate(
             hub,
             project,
@@ -615,6 +619,7 @@ pub async fn release_embargo_prs(
             &current.patch,
             Risk::parse(&current.risk),
             &rules,
+            rev_twice,
         )
         .await?;
         if !gate.ready {

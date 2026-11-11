@@ -299,11 +299,30 @@ impl Gate {
     }
 }
 
+/// Refusal reason when a `change_id` has been automatically reverted twice by
+/// the server (BUG-1884).
+pub const REVERTED_TWICE_REASON: &str = "reverted twice: needs a person's approval";
+
 /// The review gate of `pr`, whose current revision has `patch` and risk
 /// `risk` (rated under `rules`, the rules in force: BUG-1424), as
 /// `viewer` is shown it. Every route asks through [`super::gate`].
-pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, patch: &str, risk: Risk, rules: &Review) -> Result<Gate> {
-    let need = rules.need(risk);
+#[allow(clippy::too_many_arguments)]
+pub async fn gate(
+    hub: &Hub,
+    project: &Project,
+    viewer: &Viewer,
+    pr: &PrRow,
+    patch: &str,
+    risk: Risk,
+    rules: &Review,
+    reverted_twice: bool,
+) -> Result<Gate> {
+    let risk = if reverted_twice { Risk::High } else { risk };
+    let mut need = rules.need(risk);
+    if reverted_twice {
+        need.approvals = need.approvals.max(1);
+        need.people_only = true;
+    }
     let paths = paths_of(hub, project.id, &pr.id).await?;
     let mut reviews = Vec::new();
     let mut approvals = 0u32;
@@ -359,13 +378,17 @@ pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, pat
         reasons.push(format!("the PR is {}", pr.state));
     }
     if approvals < need.approvals {
-        reasons.push(format!(
-            "{} risk needs {} approval{}{}; it has {approvals}",
-            risk.name(),
-            need.approvals,
-            if need.approvals == 1 { "" } else { "s" },
-            if need.people_only { " from people (not agents)" } else { "" },
-        ));
+        if reverted_twice && approvals == 0 {
+            reasons.push(REVERTED_TWICE_REASON.to_string());
+        } else {
+            reasons.push(format!(
+                "{} risk needs {} approval{}{}; it has {approvals}",
+                risk.name(),
+                need.approvals,
+                if need.approvals == 1 { "" } else { "s" },
+                if need.people_only { " from people (not agents)" } else { "" },
+            ));
+        }
     }
     for h in &held {
         reasons.push(format!("{h} asked for changes"));

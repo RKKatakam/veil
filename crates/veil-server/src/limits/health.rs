@@ -9,9 +9,11 @@
 //! depth, conflicts) join [`Counts`] with the landing service (S17).
 
 use std::{
-    cell::Cell,
     collections::HashMap,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -140,25 +142,40 @@ pub enum Layer {
     Permissions,
 }
 
-tokio::task_local! {
-    /// The cache hits and misses of the request being served: the middleware
-    /// adds them to its project's counts.
-    pub(crate) static LAYERS: Cell<Counts>;
+/// Shareable per-request cache hit/miss counters carried by [`super::REQUEST`].
+#[derive(Default)]
+pub(crate) struct LayerCounts {
+    tips_hits: AtomicU64,
+    tips_misses: AtomicU64,
+    permission_hits: AtomicU64,
+    permission_misses: AtomicU64,
+}
+
+impl LayerCounts {
+    pub(crate) fn hit(&self, layer: Layer, hit: bool) {
+        match (layer, hit) {
+            (Layer::Tips, true) => self.tips_hits.fetch_add(1, Ordering::Relaxed),
+            (Layer::Tips, false) => self.tips_misses.fetch_add(1, Ordering::Relaxed),
+            (Layer::Permissions, true) => self.permission_hits.fetch_add(1, Ordering::Relaxed),
+            (Layer::Permissions, false) => self.permission_misses.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    pub(crate) fn snapshot(&self) -> Counts {
+        Counts {
+            tips_hits: self.tips_hits.load(Ordering::Relaxed),
+            tips_misses: self.tips_misses.load(Ordering::Relaxed),
+            permission_hits: self.permission_hits.load(Ordering::Relaxed),
+            permission_misses: self.permission_misses.load(Ordering::Relaxed),
+            ..Default::default()
+        }
+    }
 }
 
 /// Count a hit or a miss of `layer` for the request being served (nothing
 /// outside a request).
 pub fn hit(layer: Layer, hit: bool) {
-    let _ = LAYERS.try_with(|c| {
-        let mut v = c.get();
-        match (layer, hit) {
-            (Layer::Tips, true) => v.tips_hits += 1,
-            (Layer::Tips, false) => v.tips_misses += 1,
-            (Layer::Permissions, true) => v.permission_hits += 1,
-            (Layer::Permissions, false) => v.permission_misses += 1,
-        }
-        c.set(v);
-    });
+    super::record_layer_hit(layer, hit);
 }
 
 #[derive(Serialize)]

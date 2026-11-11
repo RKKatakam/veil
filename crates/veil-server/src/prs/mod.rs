@@ -288,7 +288,9 @@ pub async fn gate(hub: &Arc<Hub>, ask: &Ask, pr: &PrRow) -> Result<(Vec<RevRow>,
     let rules = rules(hub, ask).await?;
     let revs = rated(hub, ask.project.id, &pr.id, &rules).await?;
     let current = revs.iter().find(|r| r.n == pr.revision).ok_or_else(|| Error::Other(anyhow::anyhow!("the PR's revision is missing")))?;
-    let gate = review::gate(hub, &ask.project, &ask.viewer, pr, &current.patch, Risk::parse(&current.risk), &rules).await?;
+    let cids: Vec<String> = current.changes.iter().map(|c| c.change.clone()).collect();
+    let rev_twice = crate::bisect::any_reverted_twice(hub, ask.project.id, &cids).await?;
+    let gate = review::gate(hub, &ask.project, &ask.viewer, pr, &current.patch, Risk::parse(&current.risk), &rules, rev_twice).await?;
     Ok((revs, gate))
 }
 
@@ -1530,6 +1532,7 @@ pub async fn check_landing_review(
     branch: &str,
     stack: &[crate::landing::Entry],
     staged: Option<Arc<crate::sync::Staged>>,
+    branch_protected: bool,
 ) -> Result<Option<String>> {
     if stack.is_empty() {
         return Ok(None);
@@ -1537,12 +1540,14 @@ pub async fn check_landing_review(
     let rules = state::rules_in_force(hub, project, &project.default_branch).await?;
     let entries = stack.to_vec();
     let r2 = rules.clone();
-    let (touched, risk, patch) = crate::sync::blocking_staged(hub, project.id, staged, move |src| {
+    let (cids, touched, risk, patch) = crate::sync::blocking_staged(hub, project.id, staged, move |src| {
+        let mut cids = Vec::with_capacity(entries.len());
         let mut touched = BTreeSet::new();
         let mut files: std::collections::BTreeMap<String, rules::FileChange> = std::collections::BTreeMap::new();
         let mut patch = blake3::Hasher::new_derive_key("veil 2026 hub pr patch v1");
         for e in &entries {
             let s = src.snapshot(&e.id)?;
+            cids.push(s.change_id.to_string());
             let parent = if s.parents.get(1..).is_some_and(|o| o.contains(&e.base)) {
                 e.base
             } else {
@@ -1577,9 +1582,14 @@ pub async fn check_landing_review(
         }
         let files: Vec<rules::FileChange> = files.into_values().collect();
         let (risk, _) = classify(&files, &r2);
-        Ok((touched, risk, patch.finalize().to_hex().to_string()))
+        Ok((cids, touched, risk, patch.finalize().to_hex().to_string()))
     })
     .await?;
+
+    let rev_twice = crate::bisect::any_reverted_twice(hub, project.id, &cids).await?;
+    if !branch_protected && !rev_twice {
+        return Ok(None);
+    }
 
     type Cand = (String, i64, String, String, String, i32, i64, i64);
     let cands: Vec<Cand> = sqlx::query_as(
@@ -1620,7 +1630,7 @@ pub async fn check_landing_review(
             .find(|r| r.n == pr.revision)
             .map(|r| Risk::parse(&r.risk))
             .unwrap_or(risk);
-        let gate = review::gate(hub, project, viewer, &pr, &patch, pr_risk, &rules).await?;
+        let gate = review::gate(hub, project, viewer, &pr, &patch, pr_risk, &rules, rev_twice).await?;
         if gate.ready {
             return Ok(Some(pr.id));
         }
@@ -1635,13 +1645,28 @@ pub async fn check_landing_review(
             format!("not ready to land: {}", reasons.join("; ")),
         ));
     }
-    let need = rules.need(risk);
+    let risk = if rev_twice { Risk::High } else { risk };
+    let mut need = if branch_protected {
+        rules.need(risk)
+    } else {
+        rules::Need { approvals: 1, people_only: true }
+    };
+    if rev_twice {
+        need.approvals = need.approvals.max(1);
+        need.people_only = true;
+    }
     let paths: Vec<String> = touched.into_iter().collect();
-    let held: Vec<String> = review::holds_on(hub, project.id, &paths).await?.into_iter().map(|(_, n, _)| n).collect();
+    let held: Vec<String> = if branch_protected {
+        review::holds_on(hub, project.id, &paths).await?.into_iter().map(|(_, n, _)| n).collect()
+    } else {
+        Vec::new()
+    };
     if need.approvals == 0 && held.is_empty() {
         return Ok(None);
     }
-    let mut reasons: Vec<String> = if project.view(viewer).admin {
+    let mut reasons: Vec<String> = if !branch_protected {
+        Vec::new()
+    } else if project.view(viewer).admin {
         rules.warnings.clone()
     } else if rules.warnings.is_empty() {
         Vec::new()
@@ -1649,13 +1674,17 @@ pub async fn check_landing_review(
         vec![format!("the project's review rules ({}) need an admin's attention", rules::RULES_FILE)]
     };
     if need.approvals > 0 {
-        reasons.push(format!(
-            "{} risk needs {} approval{}{}; it has 0",
-            risk.name(),
-            need.approvals,
-            if need.approvals == 1 { "" } else { "s" },
-            if need.people_only { " from people (not agents)" } else { "" },
-        ));
+        if rev_twice {
+            reasons.push(review::REVERTED_TWICE_REASON.to_string());
+        } else {
+            reasons.push(format!(
+                "{} risk needs {} approval{}{}; it has 0",
+                risk.name(),
+                need.approvals,
+                if need.approvals == 1 { "" } else { "s" },
+                if need.people_only { " from people (not agents)" } else { "" },
+            ));
+        }
     }
     for h in &held {
         reasons.push(format!("{h} asked for changes"));

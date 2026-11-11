@@ -1187,9 +1187,16 @@ pub(crate) async fn create_with(
             }
             let default_tip = tip(hub, project.id, &project.default_branch).await?;
             let protected = sync::blocking(hub, project.id, move |src| crate::landing::protected(src, default_tip)).await?;
-            if protected.contains(&q.branch) {
-                crate::prs::check_landing_review(hub, &who.project, &who.viewer, &q.branch, &q.stack, None).await?;
-            }
+            crate::prs::check_landing_review(
+                hub,
+                &who.project,
+                &who.viewer,
+                &q.branch,
+                &q.stack,
+                None,
+                protected.contains(&q.branch),
+            )
+            .await?;
         }
         // The branch rules: a move of the default branch changes them only
         // for an admin, judged against its tip (BUG-1102).
@@ -1204,6 +1211,16 @@ pub(crate) async fn create_with(
             }
             _ => false,
         };
+        if let (None, Some(o), Some(c), None) = (&land, &onto, cur, &rejected) {
+            if crate::bisect::branch_has_reverted_twice(hub, project.id, &o.branch).await? {
+                let stack = [crate::landing::Entry::plain(built.real, c)];
+                if let Err(Error::Api { message, .. }) =
+                    crate::prs::check_landing_review(hub, &who.project, &who.viewer, &o.branch, &stack, None, false).await
+                {
+                    rejected = Some(message);
+                }
+            }
+        }
         let mv = match (&onto, cur, &rejected) {
             (Some(_), Some(_), None) if tip_refused.is_some() => {
                 rejected = Some(match tip_refused {
@@ -1226,12 +1243,22 @@ pub(crate) async fn create_with(
                 rejected = Some("only admins may change the branch rules (.veilrules)".into());
                 None
             }
-            (Some(o), Some(c), None) => Some(Move {
-                branch: o.branch.clone(),
-                cur: c,
-                // A tip that moves away and back must not keep it trying.
-                keep_on_loss: !rebase || rebased >= MAX_REBASES || attempts > MAX_REBASES,
-            }),
+            (Some(o), Some(c), None) => match if c != parent || attempts > 1 {
+                sync::branch_move_write_refusal(hub, &who.project, &who.viewer, c, built.real, None).await?
+            } else {
+                None
+            } {
+                Some(msg) => {
+                    rejected = Some(msg);
+                    None
+                }
+                None => Some(Move {
+                    branch: o.branch.clone(),
+                    cur: c,
+                    // A tip that moves away and back must not keep it trying.
+                    keep_on_loss: !rebase || rebased >= MAX_REBASES || attempts > MAX_REBASES,
+                }),
+            },
             _ => None,
         };
         match commit(hub, &plan, &who, &built, &restacked, person.id, mv, land.as_ref()).await {

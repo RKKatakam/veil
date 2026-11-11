@@ -1538,6 +1538,65 @@ fn differs_in_access_files(src: &Source, from: ObjectId, to: ObjectId) -> Result
     })
 }
 
+/// Check write access for every path changed between an existing branch tip
+/// `cur` and the unchecked snapshot `anchor` that a branch move brings onto
+/// it (BUG-1858). Never names a path `viewer` cannot read.
+pub(crate) async fn branch_move_write_refusal(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    cur: ObjectId,
+    anchor: ObjectId,
+    staged: Option<Arc<Staged>>,
+) -> Result<Option<String>> {
+    if (viewer.admin && viewer.only.is_none() && !viewer.agent) || cur == anchor {
+        return Ok(None);
+    }
+    let (v, text, bindings) = (viewer.clone(), project.policy_text.clone(), project.bindings.clone());
+    blocking_in(hub, project.id, HashMap::new(), staged, move |src| {
+        let p = Project {
+            id: src.project,
+            name: String::new(),
+            default_branch: String::new(),
+            policy: AccessPolicy::parse(&text),
+            policy_text: String::new(),
+            bindings,
+        };
+        let view = p.view(&v);
+        let from = src.snapshot(&cur)?.tree;
+        let to = src.snapshot(&anchor)?.tree;
+        if from == to {
+            return Ok(None);
+        }
+        let refusal = std::cell::RefCell::new(None);
+        differs_where(&|id| stored_tree(src, id), Some(from), to, &|path, x, y| {
+            let is_dir = |e: Option<&veil_core::TreeEntry>| e.is_some_and(|e| e.kind == EntryKind::Dir);
+            let is_file = |e: Option<&veil_core::TreeEntry>| e.is_some_and(|e| e.kind != EntryKind::Dir);
+            if is_file(x) || is_file(y) {
+                if !view.within_narrowing(path) {
+                    *refusal.borrow_mut() = Some(NARROWED_MOVE.to_string());
+                    return Visit::Found;
+                }
+                if !view.read(path) {
+                    *refusal.borrow_mut() = Some("you may not move this branch across changes outside your view".to_string());
+                    return Visit::Found;
+                }
+                if !view.write(path) {
+                    *refusal.borrow_mut() = Some(format!("you may not write '{path}'"));
+                    return Visit::Found;
+                }
+            }
+            if is_dir(x) || is_dir(y) {
+                Visit::Descend
+            } else {
+                Visit::Skip
+            }
+        })?;
+        Ok(refusal.into_inner())
+    })
+    .await
+}
+
 /// Why an agent session may not set a branch's tip ([`agent_tip`]).
 pub(crate) enum AgentTip {
     /// The tip would change files outside a narrowed session's paths
@@ -2647,11 +2706,17 @@ async fn push_staged(
             }
         }
         let is_embargo_branch = veil_core::embargo::embargo_id_of_branch(&u.branch).is_some();
+        let rev_twice_branch = !is_embargo_branch
+            && !req.force
+            && !land_all
+            && !protected.contains(&u.branch)
+            && cur.is_some()
+            && crate::bisect::branch_has_reverted_twice(hub, project.id, &u.branch).await?;
         // Landed by the landing service instead of moved here: the new
         // changes on top of whatever base they have (they need not be on
         // the tip), as one stack. Hidden embargo lines (`embargo/<id>`) move
         // directly by CAS and land on their target branch at release.
-        if !is_embargo_branch && !req.force && (land_all || protected.contains(&u.branch)) && (cur.is_some() || land_all) {
+        if !is_embargo_branch && !req.force && (land_all || protected.contains(&u.branch) || rev_twice_branch) && (cur.is_some() || land_all) {
             let Some(new_real) = new_real else {
                 return Err(Error::forbidden(format!("'{}' is protected: only an admin's forced push deletes it", u.branch)));
             };
@@ -2712,16 +2777,24 @@ async fn push_staged(
                 results.push(refuse("a change with unresolved conflicts never lands: resolve them first"));
                 continue;
             }
-            if protected.contains(&u.branch) {
-                match crate::prs::check_landing_review(hub, project, viewer, &u.branch, &judged.stack, Some(st.clone())).await {
-                    Ok(_) => {}
-                    Err(e) if land_all => return Err(e),
-                    Err(Error::Api { message, .. }) => {
-                        results.push(refuse(&message));
-                        continue;
-                    }
-                    Err(e) => return Err(e),
+            match crate::prs::check_landing_review(
+                hub,
+                project,
+                viewer,
+                &u.branch,
+                &judged.stack,
+                Some(st.clone()),
+                protected.contains(&u.branch),
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(e) if land_all => return Err(e),
+                Err(Error::Api { message, .. }) => {
+                    results.push(refuse(&message));
+                    continue;
                 }
+                Err(e) => return Err(e),
             }
             queued.push(crate::landing::Queued {
                 ticket: crate::landing::ticket(),
@@ -2783,6 +2856,26 @@ async fn push_staged(
                         ticket: None,
                     });
                     continue;
+                }
+                if !(viewer.admin && viewer.only.is_none() && !viewer.agent) {
+                    let mut x = n;
+                    let mut checked_from_cur = false;
+                    for _ in 0..=completed.len() {
+                        let Some((parents, _)) = real_parents_of.get(&x) else { break };
+                        if parents.contains(&c) {
+                            checked_from_cur = true;
+                            break;
+                        }
+                        match parents.first().copied() {
+                            Some(p) => x = p,
+                            None => break,
+                        }
+                    }
+                    if !checked_from_cur {
+                        if let Some(msg) = branch_move_write_refusal(hub, project, viewer, c, x, Some(st.clone())).await? {
+                            return Err(Error::forbidden(msg));
+                        }
+                    }
                 }
             }
         }

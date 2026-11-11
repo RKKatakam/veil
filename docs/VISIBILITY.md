@@ -19,6 +19,7 @@ vl init                               # you are the admin; everything is private
 vl group create finance
 vl group add finance alice bob
 vl group manager finance carol        # carol may add people to finance
+vl admin add dave                     # dave is an admin too
 vl access billing/ finance            # finance can see billing/
 vl access src/ public                 # everyone on Earth can see src/
 vl access billing/                    # show who can see billing/, and why
@@ -48,7 +49,7 @@ The secret scanner also stops anything that looks like a password or token from 
 
 | Role | Can |
 |---|---|
-| **Admin** (the creator, and anyone they make admin) | See everything; create and delete groups; choose group managers; give and take away access to any folder; make things public; add admins |
+| **Admin** (the creator, and anyone they make admin) | See everything; create and delete groups; choose group managers; give and take away access to any folder; make things public; add and remove admins (never the last) |
 | **Group manager** | Add and remove people in the groups they manage |
 | **Member of a group** | See the folders their groups were given (plus anything public) |
 | **Anyone on Earth** | See `public` folders only |
@@ -124,6 +125,7 @@ What the server and `vl` do today; `docs/HUB.md` §13 has the details.
   vl access billing/ finance      # writes the line; push it (admins only)
   vl access billing/              # asks the server who can see billing/, and which line decides
   vl group create finance; vl group add finance alice; vl group manager finance carol
+  vl admin add dave; vl admin remove alice; vl admin list
   ```
 - **Folder access means read and write; `public` means read for everyone on Earth.** Writing a public folder needs a named group or person (`src/  public devs`).
 - **Folders under access lines are plain text** in snapshots and on the server. The server's check is what protects them, on every request: clone, pull, the fetch API and every listing. Nobody receives a file, or a name, from a folder they cannot see.
