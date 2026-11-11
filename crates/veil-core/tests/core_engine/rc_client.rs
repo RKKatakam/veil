@@ -21,8 +21,10 @@ fn team() -> Visibility {
 /// (`veil-server` `sync.rs`, `check_changes` and `sealed_secret_here`): for
 /// every path that differs from the first parent's, each sealed file, link
 /// or conflict term there must be at a secret's path, or at a path where a
-/// parent's *entry* is sealed, or the snapshot must move a secret of that
-/// scope away (`policy::sealed_secret` with `known = false`).
+/// parent holds a sealed file or a conflict with a sealed version (BUG-1930:
+/// a conflict entry's own label is always public), or the snapshot must
+/// move a secret of that scope away (`policy::sealed_secret` with `known =
+/// false`).
 fn refused_by_the_push_check(repo: &Repo, id: &ObjectId) -> Vec<String> {
     let s = repo.snapshot(id).unwrap();
     let parents: Vec<ObjectId> = s.parents.iter().map(|p| repo.snapshot(p).unwrap().tree).collect();
@@ -45,9 +47,15 @@ fn refused_by_the_push_check(repo: &Repo, id: &ObjectId) -> Vec<String> {
                 scope,
                 false,
                 |_| {
-                    Ok(parents
-                        .iter()
-                        .any(|t| veil_core::tree::lookup(repo.store(), t, &c.path).unwrap().is_some_and(|e| !e.visibility.is_public())))
+                    Ok(parents.iter().any(|t| {
+                        veil_core::tree::lookup(repo.store(), t, &c.path).unwrap().is_some_and(|e| match e.kind {
+                            EntryKind::Conflict => {
+                                let cf = repo.store().conflict(&e.id).unwrap();
+                                cf.adds.iter().chain(&cf.removes).flatten().any(|t| !t.visibility.is_public())
+                            }
+                            _ => !e.visibility.is_public(),
+                        })
+                    }))
                 },
                 |scope| {
                     Ok(changes
@@ -93,10 +101,13 @@ fn edit_on(repo: &mut Repo, base: ObjectId, path: &str, text: &str, msg: &str) -
 /// working copy committed on it). The resolution is recorded sealed, as
 /// the secret's content it is; its parent holds a *conflict* at the path,
 /// which `vl` counts as "a parent holds a sealed file there" (the conflict's
-/// versions are sealed) and the server does not (a conflict entry's own
-/// label is public), so the server refuses that push and every later one.
+/// versions are sealed) and the server did not (a conflict entry's own
+/// label is public), so the server refused that push and every later one.
+/// Fixed on the server (recording the resolution plain would publish an
+/// edit of a secret): its check reads a parent's conflict as `vl` does.
+/// And nothing wider: on a parent whose conflict has no sealed version, the
+/// engine records the resolution plain.
 #[test]
-#[ignore = "BUG-1930: a conflict in a renamed secret, resolved in a change of its own, is recorded sealed where the push check refuses it"]
 fn bug_1930_a_conflict_in_a_renamed_secret_resolved_in_its_own_change_is_what_the_push_check_takes() {
     let (mut repo, fs, _base, rename) = renamed_secret();
     let x = edit_on(&mut repo, rename, "settings.txt", "REGION=two\n", "x");
@@ -132,4 +143,16 @@ fn bug_1930_a_conflict_in_a_renamed_secret_resolved_in_its_own_change_is_what_th
         (Vec::<String>::new(), Vec::<String>::new()),
         "vl recorded a resolution the server's push check refuses (in a sandbox; in the working copy)"
     );
+
+    // Nothing wider: the resolution of an ordinary file's conflict (no
+    // version sealed) is recorded plain, and taken.
+    let a = edit_on(&mut repo, rename, "README.md", "one\n", "a");
+    let b = edit_on(&mut repo, rename, "README.md", "two\n", "b");
+    let b2 = repo.rebase(b, vec![a]).unwrap();
+    let e = veil_core::tree::lookup(repo.store(), &repo.snapshot(&b2).unwrap().tree, &VPath::new("README.md").unwrap()).unwrap().unwrap();
+    assert_eq!(e.kind, EntryKind::Conflict, "control: the rebase conflicts");
+    let r = edit_on(&mut repo, b2, "README.md", "three\n", "resolve");
+    let e = file_entry(&repo, &r, "README.md").unwrap();
+    assert_eq!((e.kind, e.visibility.clone(), read_at(&repo, &r, "README.md")), (EntryKind::File, Visibility::Public, b"three\n".to_vec()));
+    assert_eq!(refused_by_the_push_check(&repo, &r), Vec::<String>::new());
 }

@@ -3,6 +3,8 @@
 //! that is incomplete or that another fix broke, and is ignored under its
 //! `docs/BUGS.md` row until the bug is fixed.
 
+use veil_core::object::{Conflict, ConflictTerm, EntryKind, Object as O, Visibility};
+
 use crate::support::*;
 
 /// `vl` writes nothing the server refuses for good (BUG-1833's guarantee):
@@ -16,7 +18,6 @@ use crate::support::*;
 /// own label is public): "'settings-staging.txt' is not a secret file: only
 /// secret files are encrypted", for that push and every later one.
 #[test]
-#[ignore = "BUG-1930: the push check refuses the resolution of a conflict in a renamed secret"]
 fn bug_1930_a_resolved_conflict_in_a_renamed_secret_is_accepted() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -45,4 +46,44 @@ fn bug_1930_a_resolved_conflict_in_a_renamed_secret_is_accepted() {
     let out = p.admin.run(&p.dir, &["push"]);
     let all = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success(), "the push of what vl itself recorded was refused: {all}");
+}
+
+/// BUG-1930's fix widens nothing else: "only secret files are encrypted".
+/// A parent's conflict explains a sealed file at its path only if one of
+/// its versions is sealed. On a parent that holds an ordinary conflict
+/// there (every version plain), a sealed file at an ordinary path is still
+/// refused, and so is one beside a parent's conflict at another path.
+#[test]
+fn bug_1930_a_sealed_file_on_an_ordinary_conflict_is_still_refused() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let token = p.dev.token();
+    // An ordinary conflict at an ordinary path, accepted.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    let term = |c: &mut Craft, t: &str| {
+        let id = c.put(O::Blob(t.as_bytes().to_vec()));
+        Some(ConflictTerm { kind: Default::default(), id, size: t.len() as u64, executable: false, visibility: Visibility::Public })
+    };
+    let (a, b, base) = (term(&mut c, "ours\n"), term(&mut c, "theirs\n"), term(&mut c, "base\n"));
+    c.set_kind("src/notes.txt", O::Conflict(Conflict { adds: vec![a, b], removes: vec![base] }), EntryKind::Conflict, Visibility::Public);
+    let r = c.push("main", "an ordinary conflict");
+    assert_eq!(r.status, 200, "control: the ordinary conflict is accepted: {}", String::from_utf8_lossy(&r.body));
+    let tip = || api.tips(Some(&token), &p.name).unwrap().branches["main"];
+    let conflicted = tip();
+
+    let env = veil_core::crypto::Envelope::seal_random(&[7u8; 32], "team#k1", b"fn hidden() {}").unwrap();
+    for path in ["src/notes.txt", "src/other.txt"] {
+        let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+        assert_eq!(c.tip, conflicted, "control: built on the conflicted snapshot");
+        c.set(path, O::Sealed(env.clone()), Visibility::Cloaked { scope: "team".into() });
+        let r = c.push("main", "sealed code where a conflict was");
+        assert_eq!(r.status, 403, "{path}: {}", String::from_utf8_lossy(&r.body));
+        assert!(
+            String::from_utf8_lossy(&r.body).contains(&format!("'{path}' is not a secret file: only secret files are encrypted")),
+            "{path}: {}",
+            String::from_utf8_lossy(&r.body)
+        );
+    }
+    assert_eq!(tip(), conflicted);
 }
