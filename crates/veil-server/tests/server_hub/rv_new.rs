@@ -25,7 +25,6 @@ fn fold_view_key(id: &mut [u8; 32], view_key: &str) {
 /// asker, so only paths they read: but of a snapshot that is not theirs to
 /// name, and past the embargo check, which looks at the id sent).
 #[test]
-#[ignore = "BUG-1870: an id made from another view's cached row resolves for a viewer it was never given to"]
 fn bug_1870_an_id_made_from_another_views_row_resolves_for_nobody_else() {
     const POLICY: &str = "public/ public\n";
     let hub = TestHub::start();
