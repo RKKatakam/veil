@@ -147,28 +147,66 @@ Maintainers: [docs/RELEASING.md](docs/RELEASING.md) explains how releases are cu
 
 ## Quick start
 
-> Today's client, before the server; this changes when the server lands (see [OVERVIEW.md](docs/OVERVIEW.md) and [VISIBILITY.md](docs/VISIBILITY.md)).
+### On your own, with no server
 
 ```sh
 cd my-project
 vl init                        # creates .veil/, a default .veilpolicy, your identity and a `team` scope
 vl status                      # no `add`: the working copy is already snapshotted
 vl commit -m "first change"    # describe @ and start a new change on top
-vl tag set main -r @-          # name it: tags are what `vl push` sends (`@-` is the parent of @)
 vl log
 ```
 
 ```text
-@  mqqtumlp alice ✓ 2026-11-04 05:01:21 default@ aa203cdf (empty)
+@  kquxsrzp alice ✓ 2026-11-11 14:28:42 default@ 38841d55 (empty)
 │  (no description set)
-○  syplqsok alice ✓ 2026-11-04 05:01:21 main 814bccc1
+○  krqtmlnx alice ✓ 2026-11-11 14:28:42 5294985a
 │  first change
 ◆  zzzzzzzz 72edc798
    root()
 ```
 
-Change ids (`syplqsok`, letters k–z) are stable across rewrites; snapshot ids
-(`814bccc1`, hex) are BLAKE3 content addresses. `✓` marks a good signature.
+Change ids (`krqtmlnx`, letters k–z) are stable across rewrites; snapshot ids
+(`5294985a`, hex) are BLAKE3 content addresses. `✓` marks a good signature.
+More in [Getting started](docs/guide/getting-started.md).
+
+### With a server on your own machine
+
+The Veil server keeps projects and decides who sees what
+([VISIBILITY.md](docs/VISIBILITY.md)). It needs PostgreSQL; here that runs in
+Docker, and `veil-server` is built from this repository
+(`cargo build --release --locked -p veil-server`, then
+`target/release/veil-server`):
+
+```sh
+docker run -d --name veil-pg -e POSTGRES_USER=veil -e POSTGRES_PASSWORD=veil -e POSTGRES_DB=veil -p 127.0.0.1:5432:5432 postgres:17-alpine
+veil-server --database-url postgres://veil:veil@127.0.0.1:5432/veil --data ~/veil-hub --listen 127.0.0.1:8443
+```
+
+It makes a self-signed certificate in `~/veil-hub` and keeps running. In
+another terminal, in `my-project`:
+
+```sh
+vl login veil://127.0.0.1:8443 --name alice --ca ~/veil-hub/self-signed-cert.pem
+vl remote add origin veil://127.0.0.1:8443/acme
+vl tag set main -r @-          # name the change: tags are what `vl push` sends (`@-` is the parent of @)
+vl push                        # creates the project acme: you are its admin, and everything is private
+echo "more" >> notes.txt       # any edit
+vl commit -m "second change"
+vl land                        # the server puts the change on the newest main
+```
+
+```text
+Created project acme on 127.0.0.1:8443: you are its admin, and everything is private
+  pushed main → 5294985a
+Sent 4 object(s) to origin
+…
+  landed main → 6a1c8c53 (1 change(s))
+Sent 3 object(s) to origin
+```
+
+Groups, folder access, thin clones, pull requests and the web client are in
+[The Veil server](docs/guide/the-server.md).
 
 ## A tour
 
