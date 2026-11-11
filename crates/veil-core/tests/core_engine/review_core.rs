@@ -159,7 +159,6 @@ fn bug_1832_a_moved_secret_is_never_stored_as_plain_text() {
 /// patch tool's backup of a secret (`.envrc.orig` beside `.envrc`) takes
 /// its secret's protection, so `vl` seals it, in format 7 as now.
 #[test]
-#[ignore = "BUG-1834: `vl upgrade` refuses a format-6 or -7 repository that holds a sealed backup of a secret (`.envrc.orig`)"]
 fn bug_1834_a_sealed_backup_of_a_secret_does_not_block_the_upgrade() {
     use veil_core::upgrade::{upgrade, UpgradeOptions};
     let (mut repo, fs, alice) = new_repo("alice");
@@ -167,15 +166,21 @@ fn bug_1834_a_sealed_backup_of_a_secret_does_not_block_the_upgrade() {
         &mut repo,
         &*fs,
         &[
-            (".veilpolicy", ".envrc cloak team\n"),
+            (".veilpolicy", ".envrc cloak team\n.npmrc cloak team\n*.pem cloak team\n*~\tpublic!\n"),
             (".envrc", "export REGION=review-marker-backup-new\n"),
             (".envrc.orig", "export REGION=review-marker-backup-old\n"),
+            (".npmrc.bak", "registry=https://example.invalid/\n"),
+            ("db.pem.old", "CERT-PLACEHOLDER\n"),
+            (".envrc.bak~", "export REGION=review-marker-backup-twice\n"),
         ],
         "first",
     );
     let team = Visibility::Cloaked { scope: "team".into() };
-    assert_eq!(file_entry(&repo, &c, ".envrc").unwrap().visibility, team);
-    assert_eq!(file_entry(&repo, &c, ".envrc.orig").unwrap().visibility, team, "control: vl seals the backup as it seals the secret");
+    for path in [".envrc", ".envrc.orig", ".npmrc.bak", "db.pem.old", ".envrc.bak~"] {
+        assert_eq!(file_entry(&repo, &c, path).unwrap().visibility, team, "control: vl seals {path}");
+    }
+    assert!(!veil_core::policy::seals_secret("notes.txt.orig"));
+    assert!(!veil_core::policy::seals_secret(".veilpolicy.orig"));
     drop(repo);
     // The same objects in a repository marked format 7 (as
     // `format_compat::a_renamed_secret_does_not_block_the_upgrade` does).

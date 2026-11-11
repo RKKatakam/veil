@@ -768,6 +768,9 @@ pub struct Classification {
     /// isolated instead (only secret files are sealed). An editor or backup
     /// artefact of a sealed secret still takes the secret's scope.
     cloak_demoted: bool,
+    /// May this path be sealed by its own name (a built-in secret file, or an
+    /// editor/backup artefact of one, outside VCS metadata)?
+    sealable: bool,
 }
 
 impl Classification {
@@ -1169,11 +1172,12 @@ impl Policy {
         if c.tier == Tier::Cloaked(RULE_SCOPE.to_string()) {
             c.tier = Tier::Cloaked(rule_scope(&self.access, &name));
         }
+        c.sealable = secret_file && !c.builtin_vcs && !is_dir;
         // Only secret files are ever sealed: a `cloak` line keeps any other
         // file on the device, failing safe (its parse warned). A directory
         // is not demoted: the secret files under it are sealed, the rest is
         // isolated file by file (what walks directories descends into it).
-        if matches!(c.tier, Tier::Cloaked(_)) && !secret_file && !is_dir {
+        if matches!(c.tier, Tier::Cloaked(_)) && !c.sealable && !is_dir {
             c.tier = Tier::Isolated;
             c.cloak_demoted = true;
         }
@@ -1190,7 +1194,7 @@ impl Policy {
             .chain(BUILTIN_PUBLIC_EXCEPTIONS)
             .flat_map(|p| sample_patterns(p))
             .collect();
-        let mut dirs: Vec<String> = only.iter().filter(|o| !names_secret(o)).cloned().collect();
+        let mut dirs: Vec<String> = only.iter().filter(|o| !seals_secret(o)).cloned().collect();
         for r in &self.access.rules {
             if crate::hub::agent::within(only, &r.path) && !dirs.contains(&r.path) {
                 dirs.push(r.path.clone());
@@ -1211,7 +1215,7 @@ impl Policy {
                 }
                 let parts: Vec<&str> = sp.split('/').filter(|s| !s.is_empty()).collect();
                 let mut paths = vec![sp.clone()];
-                for o in only.iter().filter(|o| !names_secret(o)) {
+                for o in only.iter().filter(|o| !seals_secret(o)) {
                     for k in 0..parts.len() {
                         paths.push(format!("{o}/{}", parts[k..].join("/")));
                     }
@@ -1389,9 +1393,17 @@ pub fn names_secret(pattern: &str) -> bool {
 }
 
 /// May `path` be sealed by its own name (without descending from a parent's
-/// secret)?
+/// secret)? Decided by [`Policy::classify`] itself (built-in secret files and
+/// their [`editor_artefact`] copies) so the sealing rule and `vl upgrade`
+/// cannot disagree (BUG-1834).
 pub fn seals_secret(path: &str) -> bool {
-    names_secret(path)
+    static BUILTIN: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
+    let name = path.trim().trim_end_matches('/');
+    let (name, _) = strip_root_prefix(name);
+    match VPath::new(name) {
+        Ok(p) => BUILTIN.get_or_init(Policy::builtin).classify(&p, false).sealable,
+        Err(_) => names_secret(path),
+    }
 }
 
 /// Is a sealed file at `path`, under `scope`, one format 8 itself seals
@@ -1428,6 +1440,7 @@ impl Classification {
             artefact_of: None,
             held_back: None,
             cloak_demoted: false,
+            sealable: false,
         }
     }
 
@@ -1460,6 +1473,7 @@ impl Classification {
     /// rule of the artefact's own can undo this: only a change of the base's
     /// classification does.
     fn inherit(&mut self, base: &Classification, base_path: &VPath) {
+        self.sealable |= base.sealable;
         let stronger = match (&self.tier, &base.tier) {
             (Tier::Isolated, Tier::Cloaked(_)) if self.cloak_demoted => true,
             (_, Tier::Public) | (Tier::Isolated, _) => false,
