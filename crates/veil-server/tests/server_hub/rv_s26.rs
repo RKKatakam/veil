@@ -1,5 +1,5 @@
 //! Review `rv-s26` of milestone S26, secrets in the browser (`docs/HUB.md`
-//! §13.40): reproductions of BUG-1900 to BUG-1905 (`docs/BUGS.md`), and the
+//! §13.40): reproductions of BUG-1900 to BUG-1906 (`docs/BUGS.md`), and the
 //! guarantees `web_secrets::guarantee_1…7` leave unproven:
 //!
 //! * a browser session, confirmed or not, setting on or off, gets no wrapped
@@ -814,4 +814,151 @@ fn agent_and_runner_sessions_use_no_route_of_s26() {
     // The action: the admin's own session turns the setting on.
     let on = api.post_json(Some(&alice.token()), &format!("/v1/projects/{proj}/web-secrets"), &json!({ "enabled": true }));
     assert_eq!(on.status, 200);
+}
+
+// ---------------------------------------------------------------------------
+// BUG-1906: over HTTP/2 a request has no `Host` header.
+// ---------------------------------------------------------------------------
+
+/// One request over HTTP/2, which is what every browser speaks to this
+/// server (its TLS offers `h2` first): the status and the body of the
+/// answer. As a browser sends it: `:authority`, and no `host` header.
+fn over_http2(hub: &TestHub, method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> (u16, String) {
+    use crate::limits::raw;
+    use std::io::{Read, Write};
+    fn int(out: &mut Vec<u8>, n: usize) {
+        // A string's length (HPACK, 7-bit prefix, no Huffman).
+        if n < 127 {
+            out.push(n as u8);
+        } else {
+            out.push(127);
+            let mut rest = n - 127;
+            while rest >= 128 {
+                out.push((rest % 128) as u8 | 0x80);
+                rest /= 128;
+            }
+            out.push(rest as u8);
+        }
+    }
+    fn digits(value: &[u8], huffman: bool) -> u16 {
+        if !huffman {
+            return std::str::from_utf8(value).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        }
+        // HPACK's Huffman codes of the digits: '0'..'2' are 5 bits (00000..00010), '3'..'9' are 6 (011001..011111).
+        let bits: Vec<u8> = value.iter().flat_map(|b| (0..8).rev().map(move |i| (b >> i) & 1)).collect();
+        let (mut at, mut n, mut read) = (0, 0u16, 0);
+        while read < 3 && at + 5 <= bits.len() {
+            let five = bits[at..at + 5].iter().fold(0u8, |a, b| (a << 1) | b);
+            if five <= 2 {
+                n = n * 10 + five as u16;
+                at += 5;
+            } else if at + 6 <= bits.len() {
+                let six = bits[at..at + 6].iter().fold(0u8, |a, b| (a << 1) | b);
+                if !(0b011001..=0b011111).contains(&six) {
+                    return 0;
+                }
+                n = n * 10 + (six - 0b011001 + 3) as u16;
+                at += 6;
+            } else {
+                return 0;
+            }
+            read += 1;
+        }
+        n
+    }
+    let authority = hub.authority();
+    let mut block = Vec::new();
+    let pseudo = [(":method", method), (":scheme", "https"), (":authority", authority.as_str()), (":path", path)];
+    for (name, value) in pseudo.iter().chain(headers) {
+        block.push(0x00); // a literal field, not indexed, a new name
+        int(&mut block, name.len());
+        block.extend(name.as_bytes());
+        int(&mut block, value.len());
+        block.extend(value.as_bytes());
+    }
+    let mut s = raw::tls(raw::tcp("127.0.0.1".parse().unwrap(), authority.parse().unwrap()));
+    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").unwrap();
+    s.write_all(&raw::frame(4, 0, 0, &[])).unwrap();
+    s.write_all(&raw::frame(1, if body.is_empty() { 0x5 } else { 0x4 }, 1, &block)).unwrap();
+    if !body.is_empty() {
+        s.write_all(&raw::frame(0, 0x1, 1, body)).unwrap();
+    }
+    s.flush().unwrap();
+    s.sock.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+    let (mut buf, mut status, mut answer, mut done) = (Vec::new(), 0u16, Vec::new(), false);
+    while !done {
+        while buf.len() >= 9 && !done {
+            let len = u32::from_be_bytes([0, buf[0], buf[1], buf[2]]) as usize;
+            if buf.len() < 9 + len {
+                break;
+            }
+            let (kind, flags, stream, payload) = (buf[3], buf[4], u32::from_be_bytes([buf[5] & 0x7f, buf[6], buf[7], buf[8]]), buf[9..9 + len].to_vec());
+            buf.drain(..9 + len);
+            match (kind, stream) {
+                (4, 0) if flags & 1 == 0 => {
+                    s.write_all(&raw::frame(4, 1, 0, &[])).unwrap();
+                    s.flush().unwrap();
+                }
+                (1, 1) => {
+                    // `:status` is the answer's first field.
+                    status = match payload.first().copied() {
+                        Some(b) if b & 0x80 != 0 => [200, 204, 206, 304, 400, 404, 500].get((b & 0x7f).wrapping_sub(8) as usize).copied().unwrap_or(0),
+                        Some(b) if matches!(b, 0x48 | 0x08 | 0x18) && payload.len() > 1 => {
+                            let n = (payload[1] & 0x7f) as usize;
+                            payload.get(2..2 + n).map_or(0, |v| digits(v, payload[1] & 0x80 != 0))
+                        }
+                        _ => 0,
+                    };
+                    done = flags & 1 != 0;
+                }
+                (0, 1) => {
+                    answer.extend(&payload);
+                    done = flags & 1 != 0;
+                }
+                (3, 1) | (7, _) => done = true,
+                _ => {}
+            }
+        }
+        if done {
+            break;
+        }
+        let mut chunk = [0u8; 4096];
+        match s.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend(&chunk[..n]),
+        }
+    }
+    (status, String::from_utf8_lossy(&answer).into_owned())
+}
+
+#[test]
+#[ignore = "BUG-1906: over HTTP/2, which every browser speaks to the server, there is no Host header: a passkey ceremony is refused (400) and so is every form of the web client (403)"]
+fn bug_1906_a_browser_enrolls_signs_in_and_signs_out_over_http2() {
+    let hub = TestHub::start();
+    let alice = hub.person("alice");
+    let origin = format!("https://{}", hub.authority());
+    let browser = [("origin", origin.as_str()), ("sec-fetch-site", "same-origin"), ("content-type", "application/json"), ("accept", "application/json")];
+    // The helper speaks HTTP/2 to this server: a page.
+    let (status, page) = over_http2(&hub, "GET", "/login", &[("accept", "text/html")], b"");
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains("veil-passkey-login-form"), "{page}");
+
+    // A sign-in starts, over HTTP/1.1 and over HTTP/2.
+    login_challenge(&BrowserClient::new(&hub), None);
+    let (status, answer) = over_http2(&hub, "POST", "/web/passkey/login/begin", &browser, b"{}");
+    assert_eq!(status, 200, "a passkey sign-in over HTTP/2: {answer}");
+    assert!(answer.contains("\"challenge\""), "{answer}");
+    // An enrollment starts.
+    let body = serde_json::to_vec(&json!({ "code": mint_enroll_code(&hub, &alice) })).unwrap();
+    let (status, answer) = over_http2(&hub, "POST", "/web/passkey/register/begin", &browser, &body);
+    assert_eq!(status, 200, "a passkey enrollment over HTTP/2: {answer}");
+
+    // S25's forms: a session made by `vl`, adopted and then signed out.
+    let web = hub.api().post_json(Some(&alice.token()), "/v1/sessions/web", &json!({}));
+    assert_eq!(web.status, 200, "{}", String::from_utf8_lossy(&web.body));
+    let (token, csrf) = (web.json()["token"].as_str().unwrap().to_string(), web.json()["csrf"].as_str().unwrap().to_string());
+    let cookie = format!("__Host-veil_session={token}");
+    let form = [("origin", origin.as_str()), ("sec-fetch-site", "same-origin"), ("content-type", "application/x-www-form-urlencoded"), ("accept", "application/json"), ("cookie", cookie.as_str())];
+    let (status, answer) = over_http2(&hub, "POST", "/web/logout", &form, format!("_csrf={csrf}").as_bytes());
+    assert!(status == 303 || status == 200, "signing out over HTTP/2: {status} {answer}");
 }
