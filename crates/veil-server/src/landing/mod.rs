@@ -944,6 +944,125 @@ enum Landed {
     Same,
     /// A revision with other edits: refused.
     Other,
+    /// More than [`MAX_REVISIONS`] revisions of it to look through: refused.
+    Many,
+}
+
+/// Most snapshots the server already held that one move of a branch may
+/// bring for their changes to be written to `landed_changes` at the move
+/// ([`reached`]); a move that reaches more leaves the branch's
+/// `changes_recorded` false (BUG-1524).
+pub const REACH_BUDGET: usize = 256;
+
+/// Most revisions of one change by one author the derived graph is asked
+/// about, on a branch whose changes are not all recorded
+/// ([`Ancestry::revision_on_branch`]).
+pub const MAX_REVISIONS: usize = 256;
+
+/// The changes a move of `branch` brings with snapshots the server already
+/// held (BUG-1524: a fast-forward to another branch's snapshots, a merge of
+/// another line), as [`record_changes`] takes them: `(change ids, authors,
+/// snapshots)`, with the branch's lineage they were read under. `starts`
+/// are the held snapshots the move reaches first (the new tip, or the held
+/// parents of the new snapshots); `stop` is the tip it moves from. Each
+/// snapshot below them is brought until one the branch's rows say is on it
+/// already (`landed_changes.landed`, in its lineage), `stop`, or the root.
+///
+/// `None`, with nothing read, when the branch's changes are not all recorded
+/// (`branches.changes_recorded`); `None` as well when the move reaches more
+/// than [`REACH_BUDGET`] held snapshots: the caller then turns
+/// `changes_recorded` off with the move, and "already landed" asks the
+/// derived graph instead ([`Ancestry::revision_on_branch`]). At most
+/// [`REACH_BUDGET`] snapshots are read, in one pass (breadth first, so a
+/// start that is on the branch already spends some of it), and three
+/// statements run however long the history (one more for each snapshot
+/// whose author only its signature tells).
+pub(crate) async fn reached(
+    hub: &Arc<Hub>,
+    project: i64,
+    branch: &str,
+    starts: Vec<ObjectId>,
+    stop: Option<ObjectId>,
+) -> Result<Option<(i64, (Vec<String>, Vec<i64>, Vec<String>))>> {
+    let row: Option<(i64, bool)> = sqlx::query_as("SELECT lineage, changes_recorded FROM branches WHERE project_id = $1 AND name = $2")
+        .bind(project)
+        .bind(branch)
+        .fetch_optional(&hub.db)
+        .await?;
+    let Some((lineage, true)) = row else { return Ok(None) };
+    let root = crate::sync::root_snapshot_id();
+    let ends = move |y: &ObjectId| *y == root || Some(*y) == stop;
+    // Breadth first from the starts, whatever is on the branch already.
+    let from = starts.clone();
+    let read: HashMap<ObjectId, (String, Vec<ObjectId>)> = crate::sync::blocking(hub, project, move |src| {
+        let mut out = HashMap::new();
+        let mut seen: std::collections::HashSet<ObjectId> = from.iter().copied().collect();
+        let mut todo: std::collections::VecDeque<ObjectId> = from.into();
+        while let Some(y) = todo.pop_front() {
+            if ends(&y) {
+                continue;
+            }
+            if out.len() == REACH_BUDGET {
+                break;
+            }
+            let s = src.snapshot(&y)?;
+            todo.extend(s.parents.iter().filter(|p| seen.insert(**p)).copied());
+            out.insert(y, (s.change_id.to_string(), s.parents.clone()));
+        }
+        Ok(out)
+    })
+    .await?;
+    // Those the branch's rows hold as themselves are on it: nothing below
+    // them is brought.
+    let ids: Vec<String> = read.keys().map(ObjectId::hex).collect();
+    let cids: Vec<String> = read.values().map(|(c, _)| c.clone()).collect();
+    let on: Vec<String> = sqlx::query_scalar(
+        "SELECT landed FROM landed_changes WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND change_id = ANY($4) AND landed = ANY($5)",
+    )
+    .bind(project)
+    .bind(branch)
+    .bind(lineage)
+    .bind(&cids)
+    .bind(&ids)
+    .fetch_all(&hub.db)
+    .await?;
+    let on: std::collections::HashSet<ObjectId> = on.iter().filter_map(|l| ObjectId::from_hex(l).ok()).collect();
+    let mut brought: Vec<ObjectId> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut todo = starts;
+    while let Some(y) = todo.pop() {
+        if ends(&y) || on.contains(&y) || !seen.insert(y) {
+            continue;
+        }
+        // Past what was read: the move brings more than the budget.
+        let Some((_, parents)) = read.get(&y) else { return Ok(None) };
+        brought.push(y);
+        todo.extend(parents.iter().copied());
+    }
+    // Whose each is: `snapshots.author`, one statement for all of them, else
+    // its signature's (`snapshot_author`); one with no known author has no
+    // row, as on every other route.
+    let ids: Vec<String> = brought.iter().map(ObjectId::hex).collect();
+    let authors: Vec<(String, i64)> = sqlx::query_as("SELECT id, author FROM snapshots WHERE project_id = $1 AND id = ANY($2) AND author <> 0")
+        .bind(project)
+        .bind(&ids)
+        .fetch_all(&hub.db)
+        .await?;
+    let authors: HashMap<String, i64> = authors.into_iter().collect();
+    let none = HashMap::new();
+    let (mut cs, mut aus, mut ls) = (Vec::new(), Vec::new(), Vec::new());
+    for y in brought {
+        let a = match authors.get(&y.hex()) {
+            Some(a) => Some(*a),
+            None => snapshot_author(hub, project, y, &none).await?,
+        };
+        if let Some(a) = a {
+            cs.push(read[&y].0.clone());
+            aus.push(a);
+            ls.push(y.hex());
+        }
+    }
+    Ok(Some((lineage, (cs, aus, ls))))
 }
 
 /// A stack, and the branch's lineage it was judged under (`branch`:
@@ -1042,15 +1161,17 @@ pub async fn stack_for_embargo(
         }
     }
     let max = veil_core::hub::land::MAX_LAND_STACK;
-    let row: Option<(String, i64)> =
-        sqlx::query_as("SELECT target, lineage FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL")
-            .bind(pid)
-            .bind(branch)
-            .fetch_optional(&hub.db)
-            .await?;
-    let Some((tip, lineage)) = row else { return Ok(Ok(Judged { stack: Vec::new(), lineage: 0, branch: false, skipped: Vec::new() })) };
+    let row: Option<(String, i64, bool)> = sqlx::query_as(
+        "SELECT target, lineage, changes_recorded FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL",
+    )
+    .bind(pid)
+    .bind(branch)
+    .fetch_optional(&hub.db)
+    .await?;
+    let Some((tip, lineage, recorded)) = row else { return Ok(Ok(Judged { stack: Vec::new(), lineage: 0, branch: false, skipped: Vec::new() })) };
     let tip = ObjectId::from_hex(&tip).map_err(|e| Error::Other(e.into()))?;
     let mut anc = Ancestry::new_staged(hub.clone(), pid, branch, tip, lineage, staged);
+    anc.recorded = recorded;
     let too_many = || Ok(Err(format!("more than {max} changes between the branch's tip and this one: land them in parts, or have an admin push with --force")));
     let key = (!viewer.admin).then(|| project.view(viewer).key());
     let mut line: Vec<Link> = Vec::new();
@@ -1158,6 +1279,11 @@ pub async fn stack_for_embargo(
                 Landed::Other => {
                     return Ok(Err(format!(
                         "this change already landed on '{branch}' with other edits: make a new change for the further edits"
+                    )))
+                }
+                Landed::Many => {
+                    return Ok(Err(format!(
+                        "this change has more than {MAX_REVISIONS} revisions on the server, too many to tell whether one of them landed on '{branch}' already: make a new change for these edits"
                     )))
                 }
             };
@@ -1338,7 +1464,14 @@ pub(crate) struct Ancestry {
     graph: Option<bool>,
     walk: Option<Walk>,
     staged: Option<Arc<crate::sync::Staged>>,
+    /// `branches.changes_recorded`: every change on the branch has its
+    /// `landed_changes` row (BUG-1524); else [`Ancestry::landed`] also asks
+    /// the derived graph.
+    recorded: bool,
 }
+
+/// More than [`MAX_REVISIONS`] revisions of a change to look through.
+struct TooMany;
 
 /// The walk down from the tip: what it found, what is left to read.
 struct Walk {
@@ -1346,6 +1479,8 @@ struct Walk {
     todo: std::collections::VecDeque<ObjectId>,
     read: usize,
     done: bool,
+    /// The change of each snapshot read.
+    changes: Vec<(ObjectId, veil_core::ChangeId)>,
 }
 
 impl Ancestry {
@@ -1367,6 +1502,7 @@ impl Ancestry {
             graph: None,
             walk: None,
             staged,
+            recorded: true,
         }
     }
 
@@ -1464,7 +1600,8 @@ impl Ancestry {
             return Ok(Landed::Same);
         }
         let Some(author) = snapshot_author(&self.hub, self.project, x, fresh).await? else { return Ok(Landed::No) };
-        let cid = crate::sync::blocking_staged(&self.hub, self.project, self.staged.clone(), move |src| Ok(src.snapshot(&x)?.change_id.to_string())).await?;
+        let change = crate::sync::blocking_staged(&self.hub, self.project, self.staged.clone(), move |src| Ok(src.snapshot(&x)?.change_id)).await?;
+        let cid = change.to_string();
         let row: Option<String> = sqlx::query_scalar(
             "SELECT lc.landed FROM landed_changes lc \
              WHERE lc.project_id = $1 AND lc.branch = $2 AND lc.lineage = $3 AND lc.change_id = $4 AND lc.author = $5 \
@@ -1477,7 +1614,16 @@ impl Ancestry {
         .bind(author)
         .fetch_optional(&self.hub.db)
         .await?;
-        let Some(r) = row.and_then(|r| ObjectId::from_hex(&r).ok()) else { return Ok(Landed::No) };
+        let r = match row.and_then(|r| ObjectId::from_hex(&r).ok()) {
+            Some(r) => r,
+            None if self.recorded => return Ok(Landed::No),
+            // Not every change on the branch has a row (BUG-1524).
+            None => match self.revision_on_branch(x, change, author, fresh).await? {
+                Ok(Some(r)) => r,
+                Ok(None) => return Ok(Landed::No),
+                Err(TooMany) => return Ok(Landed::Many),
+            },
+        };
         if r == x {
             return Ok(Landed::Same);
         }
@@ -1507,6 +1653,103 @@ impl Ancestry {
         })
         .await?;
         Ok(if same { Landed::Same } else { Landed::Other })
+    }
+
+    /// A revision of `change` by `author`, other than `x`, on a branch
+    /// whose changes are not all in `landed_changes` (BUG-1524:
+    /// `branches.changes_recorded` is false after a move that reached more
+    /// held snapshots than are read at a move: a new branch on held
+    /// history, a forced move, a long fast-forward). The derived graph
+    /// lists the change's revisions (`graph_by_change`, at most
+    /// [`MAX_REVISIONS`] by this author, else `Err(TooMany)`); where the
+    /// graph does not hold the tip yet, the part of the branch above what
+    /// it holds is read too (the shared walk, `warming` past its budget).
+    /// A revision by someone else is never one (as a `landed_changes` row
+    /// with another author is not), nor is one reverted on the branch, nor
+    /// one on an unreleased embargo line (never on a branch, and never
+    /// counted: the answer says nothing of an embargo).
+    /// The oldest on the branch is the answer ([`Ancestry::has`]).
+    async fn revision_on_branch(
+        &mut self,
+        x: ObjectId,
+        change: veil_core::ChangeId,
+        author: i64,
+        fresh: &HashMap<ObjectId, (Vec<ObjectId>, i64)>,
+    ) -> Result<std::result::Result<Option<ObjectId>, TooMany>> {
+        let mut revisions: Vec<ObjectId> = Vec::new();
+        if self.tip == crate::sync::root_snapshot_id() {
+            return Ok(Ok(None));
+        }
+        if !self.graph().await? {
+            // Down from the tip until it ends or its frontier is derived:
+            // every revision on the branch is then one read here or one the
+            // graph holds.
+            let (_, done) = self.walk_until(crate::sync::root_snapshot_id(), WALK_BUDGET).await?;
+            if !done && !self.frontier_derived().await? {
+                return Err(crate::query::graph::warming());
+            }
+            let read = self.walk.as_ref().map(|w| w.changes.as_slice()).unwrap_or_default();
+            revisions.extend(read.iter().rev().filter(|(_, c)| *c == change).map(|(y, _)| *y));
+        }
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT g.snapshot FROM graph g LEFT JOIN snapshots s ON s.project_id = g.project_id AND s.id = g.snapshot \
+             WHERE g.project_id = $1 AND g.change_id = $2 AND g.snapshot <> $3 AND COALESCE(s.author, 0) IN (0, $4) \
+             AND g.changed IS DISTINCT FROM $6 \
+             ORDER BY g.generation, g.snapshot LIMIT $5",
+        )
+        .bind(self.project)
+        .bind(hex::encode(change.0))
+        .bind(x.hex())
+        .bind(author)
+        .bind(MAX_REVISIONS as i64 + 1)
+        .bind(crate::derive::changes::WITHHELD)
+        .fetch_all(&self.hub.db)
+        .await?;
+        if rows.len() > MAX_REVISIONS {
+            return Ok(Err(TooMany));
+        }
+        for r in rows.iter().filter_map(|r| ObjectId::from_hex(r).ok()) {
+            if !revisions.contains(&r) {
+                revisions.push(r);
+            }
+        }
+        for r in revisions {
+            if r == x || snapshot_author(&self.hub, self.project, r, fresh).await? != Some(author) {
+                continue;
+            }
+            let reverted: Option<i32> = sqlx::query_scalar(
+                "SELECT 1 FROM bisect_reverts WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND culprit = $4 AND state = 'reverted' LIMIT 1",
+            )
+            .bind(self.project)
+            .bind(&self.branch)
+            .bind(self.lineage)
+            .bind(r.hex())
+            .fetch_optional(&self.hub.db)
+            .await?;
+            if reverted.is_none() && self.has(r).await? {
+                return Ok(Ok(Some(r)));
+            }
+        }
+        Ok(Ok(None))
+    }
+
+    /// Does the derived graph hold every snapshot the shared walk has still
+    /// to read (at most [`FRONTIER_LIMIT`] are asked about)? Then it holds
+    /// everything below them.
+    async fn frontier_derived(&self) -> Result<bool> {
+        let frontier: Vec<ObjectId> = self.walk.as_ref().map(|w| w.todo.iter().copied().collect()).unwrap_or_default();
+        if frontier.len() > FRONTIER_LIMIT {
+            return Ok(false);
+        }
+        crate::derive::read(&self.hub, self.project, move |g| {
+            for f in &frontier {
+                if g.row(f)?.is_none() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })
+        .await
     }
 
     /// The change of `viewer`'s history that held `x` stands for (view key
@@ -1557,6 +1800,7 @@ impl Ancestry {
             todo: std::collections::VecDeque::from([self.tip]),
             read: 0,
             done: false,
+            changes: Vec::new(),
         });
         let w = crate::sync::blocking(&self.hub, self.project, move |src| {
             let mut w = w;
@@ -1566,7 +1810,9 @@ impl Ancestry {
                     break;
                 };
                 w.read += 1;
-                for p in &src.snapshot(&y)?.parents {
+                let s = src.snapshot(&y)?;
+                w.changes.push((y, s.change_id));
+                for p in &s.parents {
                     if *p != root && w.seen.insert(*p) {
                         w.todo.push_back(*p);
                     }

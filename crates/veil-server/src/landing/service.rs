@@ -309,6 +309,9 @@ struct Built {
     /// what decides whether another entry joins it.
     made: usize,
     snapshots: Vec<ObjectId>,
+    /// The other parents of the merges landed: the lines they bring onto
+    /// the branch, of snapshots the server already held (BUG-1524).
+    merged: Vec<ObjectId>,
     /// Stack changes landed: `(submitted, landed, record)`.
     landings: Vec<(ObjectId, Record)>,
     /// New memo rows `(view key, real, projected)`.
@@ -1054,6 +1057,21 @@ impl Service {
         }
         let snapshot_authors: Vec<i64> = b.snapshots.iter().map(|s| snap_authors.get(s).copied().unwrap_or(0)).collect();
         let lineage = b.after.lineage;
+        // What the merges of the batch bring from other lines: changes of
+        // snapshots the server already held, recorded with the batch's own
+        // (`landing::reached`, bounded); past the bound the branch's changes
+        // are no longer all recorded (BUG-1524).
+        let mut recorded = true;
+        if moved && !b.merged.is_empty() {
+            match super::reached(hub, self.project, &self.branch, b.merged.clone(), b.old_tip).await? {
+                Some((l, (c, a, s))) if l == lineage => {
+                    cc.extend(c);
+                    ca.extend(a);
+                    cl.extend(s);
+                }
+                _ => recorded = false,
+            }
+        }
         let mk: Vec<String> = b.memos.iter().map(|m| m.0.clone()).collect();
         let mr: Vec<String> = b.memos.iter().map(|m| m.1.hex()).collect();
         let mp: Vec<String> = b.memos.iter().map(|m| m.2.hex()).collect();
@@ -1166,13 +1184,15 @@ impl Service {
                 // (BUG-1304, BUG-1300): else it is built again on the tip.
                 let n = match &old {
                     Some(_) => sqlx::query(
-                        "UPDATE branches SET target = $1 WHERE project_id = $2 AND name = $3 AND target = $4 AND lineage = $5 AND hidden_for_embargo IS NULL",
+                        "UPDATE branches SET target = $1, changes_recorded = changes_recorded AND $6 \
+                         WHERE project_id = $2 AND name = $3 AND target = $4 AND lineage = $5 AND hidden_for_embargo IS NULL",
                     )
                     .bind(&new)
                     .bind(pid)
                     .bind(&branch)
                     .bind(&old)
                     .bind(lineage)
+                    .bind(recorded)
                     .execute(&mut *c)
                     .await?
                     .rows_affected(),
@@ -1585,6 +1605,7 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
         flushes: 0,
         made: 0,
         snapshots: Vec::new(),
+        merged: Vec::new(),
         landings: Vec::new(),
         memos: Vec::new(),
         old_tip: on.tip,
@@ -1645,6 +1666,7 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
             break;
         }
         let mark = (b.objects.len(), b.bytes, b.snapshots.len(), b.memos.len(), b.landings.len(), b.flushes);
+        let merged = b.merged.len();
         let last_cid = p.row.stack.last().and_then(|e| src.snapshot(&e.id).ok().map(|s| s.change_id));
         let user_entry = !p.row.ticket.starts_with("revert-");
         let row = RowMeta {
@@ -1678,6 +1700,7 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
                 b.bytes = 0;
             }
             b.snapshots.truncate(mark.2);
+            b.merged.truncate(merged);
             b.memos.truncate(mark.3);
             b.landings.truncate(mark.4);
             if b.alone && b.rows.is_empty() {
@@ -1896,6 +1919,7 @@ fn entry(
         let mut parents = vec![chain];
         if merge {
             parents.extend(s.parents[1..].iter().copied());
+            b.merged.extend(s.parents[1..].iter().copied());
         }
         let mut preds = vec![sid];
         if p.row.merges > 0 {

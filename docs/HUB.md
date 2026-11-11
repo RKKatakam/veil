@@ -2535,7 +2535,24 @@ for them):
   route that moves a branch, the landing service, a push of new snapshots
   and an API commit `onto`; one lookup no bound limits), the landed
   revision then asked of the bounded ancestry below (yes, no, or `warming`;
-  never "no" from a truncated search). The author is the person whose
+  never "no" from a truncated search). **A move also records the snapshots
+  it reaches that the server already held** (BUG-1524: a fast-forward to
+  another branch's tip, a merge of another line, pushed or landed):
+  `landing::reached` reads them where the branch moves, at most 256
+  (`REACH_BUDGET`), down to the first the branch's rows hold already, and
+  their rows are written in the move's transaction. `branches.changes_recorded`
+  (migration 34) says whether every change on the branch has its row: true
+  for a branch made of new snapshots only and kept by every move that
+  records all it brings; false after a move that reached more than the
+  bound, for a new branch made on held history, after a forced move (a new
+  lineage has no rows) and for every branch from before the column. On such
+  a branch a change with no row is also asked of the derived graph: its
+  revisions by the same author (`graph_by_change`, at most 256,
+  `MAX_REVISIONS`, else the submit is refused, saying so; none on an
+  unreleased embargo line), none reverted there, the first that is on the
+  branch being the landed revision; while the graph has not reached the tip,
+  the branch is read down to what it holds (the same walk and budget, then
+  `warming`). The author is the person whose
   signature is on the change, and on the landed revision (its device key,
   its `origins` row, or its `change_refs` creator); **no predecessor list is
   read at all**, and a row with the same change id by another author is

@@ -3090,7 +3090,7 @@ async fn push_staged(
     // change id and author (`landed_changes`, BUG-1522, BUG-1527).
     let change_of: HashMap<ObjectId, String> =
         real_of.iter().filter_map(|(pushed, real)| parents_of.get(pushed).map(|s| (*real, s.change_id.to_string()))).collect();
-    let plan_changes: HashMap<_, _> = plans
+    let mut plan_changes: HashMap<_, _> = plans
         .iter()
         .filter_map(|(branch, _, new, _, _)| new.map(|n| (branch.clone(), n)))
         .map(|(branch, n)| {
@@ -3110,6 +3110,51 @@ async fn push_staged(
             (branch, (cs, aus, ls))
         })
         .collect();
+    // What each moved branch now holds that this push did not bring
+    // (BUG-1524): snapshots the server already held (another branch's, a
+    // merged line's), below the new tip and not below the tip it moves
+    // from. A fast-forward's are read here and recorded with the push's own
+    // (`landing::reached`, bounded); a move that reaches more, a new branch
+    // on held history and a forced move (a new lineage, with no rows) leave
+    // the branch's `changes_recorded` false, and "already landed" then asks
+    // the derived graph. Per branch: whether its changes are all recorded
+    // after the move, and the lineage that was read under.
+    let mut plan_recorded: HashMap<String, (bool, Option<i64>)> = HashMap::new();
+    for (branch, cur, new, _, _) in &plans {
+        let Some(n) = *new else { continue };
+        let mut held = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack = vec![n];
+        while let Some(x) = stack.pop() {
+            if seen.insert(x) {
+                match real_parents_of.get(&x) {
+                    Some((ps, _)) => stack.extend(ps.iter().copied()),
+                    None => held.push(x),
+                }
+            }
+        }
+        held.retain(|x| *x != root_snapshot_id() && (req.force || Some(*x) != *cur));
+        let recorded = if veil_core::embargo::embargo_id_of_branch(branch).is_some() {
+            // An embargo line's changes are never recorded (below).
+            (false, None)
+        } else if held.is_empty() {
+            (true, None)
+        } else if req.force || cur.is_none() {
+            (false, None)
+        } else {
+            match crate::landing::reached(hub, project.id, branch, held, *cur).await? {
+                Some((lineage, (cs, aus, ls))) => {
+                    let rows = plan_changes.entry(branch.clone()).or_default();
+                    rows.0.extend(cs);
+                    rows.1.extend(aus);
+                    rows.2.extend(ls);
+                    (true, Some(lineage))
+                }
+                None => (false, None),
+            }
+        };
+        plan_recorded.insert(branch.clone(), recorded);
+    }
     let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let pid = project.id;
     let plans2 = plans.clone();
@@ -3138,6 +3183,7 @@ async fn push_staged(
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let plans = plans2.clone();
         let plan_changes = plan_changes.clone();
+        let plan_recorded = plan_recorded.clone();
         let (rules_landing, default_branch) = (rules_landing.clone(), default_branch.clone());
         let new_reals = new_reals.clone();
         let origins = origins.clone();
@@ -3154,11 +3200,16 @@ async fn push_staged(
             let mut moved = Vec::new();
             let mut lineages: Vec<(String, i64)> = Vec::new();
             for (branch, cur, new, accept, policy_text_update) in plans {
+                let (recorded, read_under) = plan_recorded.get(&branch).copied().unwrap_or((false, None));
                 let rows = match (cur, new) {
                     // A forced update starts a new lineage (BUG-1300): what the
                     // landing service recorded of the branch no longer counts.
+                    // The branch's changes stay all recorded (BUG-1524) only
+                    // when this move's are (in a new lineage: the whole
+                    // history), in the lineage the held ones were read under.
                     (Some(c0), Some(n)) => sqlx::query_scalar::<_, i64>(
-                        "UPDATE branches SET target = $1, lineage = CASE WHEN $5 THEN nextval('branch_lineages') ELSE lineage END \
+                        "UPDATE branches SET target = $1, lineage = CASE WHEN $5 THEN nextval('branch_lineages') ELSE lineage END, \
+                         changes_recorded = $6 AND ($5 OR (changes_recorded AND ($7::BIGINT IS NULL OR lineage = $7))) \
                          WHERE project_id = $2 AND name = $3 AND target = $4 RETURNING lineage",
                     )
                         .bind(n.hex())
@@ -3166,6 +3217,8 @@ async fn push_staged(
                         .bind(&branch)
                         .bind(c0.hex())
                         .bind(force)
+                        .bind(recorded)
+                        .bind(read_under)
                         .fetch_optional(&mut *c)
                         .await?
                         .map_or(0, |lineage| {
@@ -3173,11 +3226,12 @@ async fn push_staged(
                             1
                         }),
                     (None, Some(n)) => sqlx::query_scalar::<_, i64>(
-                        "INSERT INTO branches (project_id, name, target) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING lineage",
+                        "INSERT INTO branches (project_id, name, target, changes_recorded) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING RETURNING lineage",
                     )
                         .bind(pid)
                         .bind(&branch)
                         .bind(n.hex())
+                        .bind(recorded)
                         .fetch_optional(&mut *c)
                         .await?
                         .map_or(0, |lineage| {

@@ -1517,7 +1517,7 @@ pub const NON_OBJECT_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
     ("blame_jobs", &["project_id", "view_key", "path_key", "follow", "holder", "expires_at"]),
     ("blame_memo", &["project_id", "view_key", "path_key", "follow", "body", "bytes", "created_at", "path_keys"]),
     ("blame_paths", &["project_id", "path_key", "path"]),
-    ("branches", &["project_id", "name", "lineage", "hidden_for_embargo"]),
+    ("branches", &["project_id", "name", "lineage", "hidden_for_embargo", "changes_recorded"]),
     ("browser_device_rings", &["device_id", "project_id", "scope", "body"]),
     ("challenges", &["challenge", "signing_key", "expires_at"]),
     ("change_refs", &["project_id", "change_id", "created_by", "created_at"]),
