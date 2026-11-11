@@ -77,9 +77,8 @@ fn bug_1830_a_committed_change_stays_visible_when_the_working_copy_line_moves_of
 }
 
 /// Invalid rules fail safe: a protective rule that can match no path is
-/// never accepted in silence.
+/// never accepted in silence, while a leading BOM and `./` normalise cleanly.
 #[test]
-#[ignore = "BUG-1831: a protective `.veilpolicy` rule spelled `./dir/`, or behind a byte order mark, protects nothing and warns of nothing"]
 fn bug_1831_a_protective_rule_that_can_match_nothing_fails_safe() {
     for (what, text) in [
         ("a byte order mark before the first rule", "\u{feff}private/ isolate\n"),
@@ -88,18 +87,34 @@ fn bug_1831_a_protective_rule_that_can_match_nothing_fails_safe() {
     ] {
         let policy = Policy::parse(text);
         let class = policy.classify(&p("private/notes.txt"), false);
-        assert!(
-            class.tier == Tier::Isolated || !policy.warnings.is_empty(),
-            "{what}: `private/notes.txt` is {:?} and the policy has no warning",
-            class.tier
-        );
+        assert_eq!(class.tier, Tier::Isolated, "{what}: `private/notes.txt` was not isolated");
+        assert!(policy.warnings.is_empty(), "{what}: unexpected warning {:?}", policy.warnings);
+    }
+    // `./` means the project root, not every directory of that name.
+    let anchored = Policy::parse("./private/ isolate\n");
+    assert_eq!(anchored.classify(&p("sub/private/notes.txt"), false).tier, Tier::Public);
+
+    for (what, text) in [
+        ("zero-width space before pattern", "\u{200b}private/ isolate\n"),
+        ("byte order mark on a later line", "README.md public\n\u{feff}private/ isolate\n"),
+        ("double-quoted pattern", "\"private/\" isolate\n"),
+        ("single-quoted pattern", "'private/' isolate\n"),
+        ("trailing dot component", "private/. isolate\n"),
+        ("interior dot component", "private/./notes.txt isolate\n"),
+        ("parent-dir component", "../private/ isolate\n"),
+        ("empty slash component", "private//notes.txt isolate\n"),
+        ("bare dot-slash", "./ isolate\n"),
+    ] {
+        let policy = Policy::parse(text);
+        let class = policy.classify(&p("private/notes.txt"), false);
+        assert_eq!(class.tier, Tier::Isolated, "{what}: did not isolate `private/notes.txt`");
+        assert!(!policy.warnings.is_empty(), "{what}: accepted in silence with no warning");
     }
 }
 
 /// The same end to end: what the member's rule keeps on the device is not
 /// recorded.
 #[test]
-#[ignore = "BUG-1831: a protective `.veilpolicy` rule spelled `./dir/`, or behind a byte order mark, protects nothing and warns of nothing"]
 fn bug_1831_a_file_under_a_dot_slash_rule_is_not_recorded() {
     let (mut repo, fs, _) = new_repo("alice");
     fs.write(&p(".veilpolicy"), b"./private/ isolate\n").unwrap();
@@ -108,8 +123,8 @@ fn bug_1831_a_file_under_a_dot_slash_rule_is_not_recorded() {
     let out = repo.snapshot_workspace(WS, &*fs).unwrap();
     assert!(file_entry(&repo, &out.snapshot, "README.md").is_some(), "the snapshot recorded the working copy");
     assert!(
-        file_entry(&repo, &out.snapshot, "private/notes.txt").is_none() || !out.report.policy_warnings.is_empty(),
-        "private/notes.txt was recorded as plain text, with no warning"
+        file_entry(&repo, &out.snapshot, "private/notes.txt").is_none(),
+        "private/notes.txt was recorded despite `./private/ isolate`"
     );
 }
 

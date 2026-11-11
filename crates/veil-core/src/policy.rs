@@ -565,6 +565,86 @@ fn case_insensitive(builtin: bool, secret: bool, tier: &Tier) -> bool {
     (builtin && secret) || (!builtin && matches!(tier, Tier::Cloaked(_) | Tier::Isolated))
 }
 
+/// Strip leading `/` and `./` prefixes (reading `./` as the root), returning
+/// the remainder and whether a root anchor (`/` or `./`) was present.
+fn strip_root_prefix(s: &str) -> (&str, bool) {
+    let mut anchored = s.starts_with('/');
+    let mut p = s.trim_start_matches('/');
+    while let Some(rest) = p.strip_prefix("./") {
+        anchored = true;
+        p = rest.trim_start_matches('/');
+    }
+    (p, anchored)
+}
+
+/// Unicode Default_Ignorable_Code_Point or control characters that editors or
+/// copy-paste can insert without `char::is_whitespace` splitting them.
+fn is_default_ignorable(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x034F
+            | 0x061C
+            | 0x115F..=0x1160
+            | 0x17B4..=0x17B5
+            | 0x180B..=0x180F
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0x3164
+            | 0xFE00..=0xFE0F
+            | 0xFEFF
+            | 0xFFA0
+            | 0xFFF0..=0xFFF8
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0000..=0xE0FFF
+    ) || c.is_control()
+}
+
+fn has_unescaped_quote(s: &str) -> bool {
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            chars.next();
+            continue;
+        }
+        if matches!(c, '"' | '\'') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Strip quotes, invisible characters and `.`/`..`/empty components so an
+/// invalid protective rule still isolates what it appeared to name (or `**`).
+fn clean_protective_pattern(raw: &str) -> String {
+    let stripped: String = raw
+        .chars()
+        .filter(|c| !is_default_ignorable(*c) && !matches!(c, '"' | '\''))
+        .collect();
+    let dir_only = stripped.trim().ends_with('/');
+    let parts: Vec<&str> = stripped
+        .trim()
+        .split('/')
+        .filter(|c| !matches!(*c, "" | "." | ".."))
+        .collect();
+    if parts.is_empty() {
+        "**".to_string()
+    } else if dir_only {
+        format!("{}/", parts.join("/"))
+    } else {
+        parts.join("/")
+    }
+}
+
+fn rule_matches_sample(r: &Rule) -> bool {
+    sample_patterns(&r.pattern)
+        .into_iter()
+        .filter_map(|s| VPath::new(&s).ok().filter(|vp| !vp.is_root()))
+        .any(|vp| r.matches(&vp, r.dir_only) || r.matches(&vp, false))
+}
+
 impl Rule {
     fn new(pattern: &str, tier: Tier, force: bool, builtin: bool, secret: bool) -> Result<Rule, String> {
         // Protective rules match case-insensitively (see the module docs).
@@ -573,14 +653,25 @@ impl Rule {
         // Unicode normalisation form matches a name recorded in the other
         // (macOS file names often come back in NFD).
         let mut p = crate::vpath::nfc(pattern.trim()).into_owned();
+        if !builtin {
+            if let Some(c) = p.chars().find(|c| is_default_ignorable(*c)) {
+                return Err(format!("pattern contains invisible or control character U+{:04X}", c as u32));
+            }
+            if has_unescaped_quote(&p) {
+                return Err(format!("quoted pattern '{pattern}' (do not quote patterns in {POLICY_FILE})"));
+            }
+        }
         let dir_only = p.ends_with('/');
         while p.ends_with('/') {
             p.pop();
         }
-        let anchored = p.starts_with('/');
-        let p = p.trim_start_matches('/').to_string();
+        let (stripped, anchored) = strip_root_prefix(&p);
+        let p = stripped.to_string();
         if p.is_empty() {
             return Err(format!("empty pattern '{pattern}'"));
+        }
+        if !builtin && p.split('/').any(|c| matches!(c, "" | "." | "..")) {
+            return Err(format!("invalid path component in pattern '{pattern}'"));
         }
         let base = if anchored || p.contains('/') || p.starts_with("**") {
             p.clone()
@@ -767,6 +858,7 @@ impl Policy {
     }
 
     pub fn parse(text: &str) -> Policy {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let mut policy = Self::builtin();
         for (n, line) in text.lines().enumerate() {
             let parts = fields(line);
@@ -810,22 +902,39 @@ impl Policy {
                     parts[0]
                 ));
             }
+            let isolate_cleaned = |policy: &mut Policy, why: &str| {
+                let cleaned = clean_protective_pattern(&parts[0]);
+                let mut r = Rule::new(&cleaned, Tier::Isolated, false, false, false)
+                    .or_else(|_| Rule::new(&escape_literal(&cleaned), Tier::Isolated, false, false, false))
+                    .unwrap_or_else(|_| Rule::new("**", Tier::Isolated, false, false, false).unwrap());
+                policy.warnings.push(format!("{at}: {why}; treating '{cleaned}' as isolate"));
+                r.pattern = cleaned;
+                policy.rules.push(r);
+            };
             match Rule::new(&parts[0], tier.clone(), force, false, false) {
+                Ok(r) if tier != Tier::Public && !rule_matches_sample(&r) => {
+                    isolate_cleaned(&mut policy, &format!("pattern '{}' matches no valid path", parts[0]));
+                }
                 Ok(mut r) => {
                     r.grantees = grantees;
                     policy.rules.push(r)
                 }
                 // Not a valid glob. A protective rule falls back to the
-                // literal name (`config[prod.yml`), so it still protects
-                // what it names; an exposing one is dropped.
+                // literal name (`config[prod.yml`), or to its cleaned path
+                // when quotes, invisible characters or `.`/`..` components
+                // prevented matching, so it still protects what it names; an
+                // exposing one is dropped.
                 Err(e) if tier != Tier::Public => {
-                    match Rule::new(&escape_literal(&parts[0]), tier, force, false, false) {
-                        Ok(mut r) => {
+                    let literal = (!parts[0].chars().any(is_default_ignorable) && !has_unescaped_quote(&parts[0]))
+                        .then(|| Rule::new(&escape_literal(&parts[0]), tier, force, false, false).ok())
+                        .flatten();
+                    match literal {
+                        Some(mut r) => {
                             policy.warnings.push(format!("{at}: {e}; matching '{}' as a literal name", parts[0]));
                             r.pattern = parts[0].clone();
                             policy.rules.push(r);
                         }
-                        Err(_) => policy.warnings.push(format!("{at}: {e}")),
+                        None => isolate_cleaned(&mut policy, &e),
                     }
                 }
                 Err(e) => policy.warnings.push(format!("{at}: {e}")),
@@ -1144,7 +1253,8 @@ impl Policy {
 /// Concrete path strings matching glob pattern `pat` (trimmed of leading and
 /// trailing `/`), for [`Policy::scopes_within`].
 fn sample_patterns(pat: &str) -> Vec<String> {
-    let pat = pat.trim().trim_matches('/');
+    let (pat, _) = strip_root_prefix(pat.trim());
+    let pat = pat.trim_end_matches('/');
     let mut out = Vec::new();
     for b in expand_braces(pat) {
         for empty_star in [false, true] {
@@ -1273,8 +1383,9 @@ fn sample_glob(pat: &str, empty_star: bool) -> String {
 /// (`.env`, `*.pem`, …)? A `cloak` line whose pattern does not is warned
 /// about (and `vl cloak` refuses it): it seals nothing.
 pub fn names_secret(pattern: &str) -> bool {
-    let name = crate::vpath::nfc(pattern.trim_end_matches('/'));
-    builtin_rules().1.is_match(&*name)
+    let name = crate::vpath::nfc(pattern.trim().trim_end_matches('/'));
+    let (name, _) = strip_root_prefix(&name);
+    builtin_rules().1.is_match(name)
 }
 
 /// Is a sealed file at `path`, under `scope`, one format 8 itself seals
